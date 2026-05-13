@@ -905,33 +905,40 @@ where
     ///
     /// Returns `None` when no node hosts `child` or the
     /// hosting node carries no fork-of declaration.
-    /// Multi-chain hosts — a node with several `causal:` tags
-    /// alongside several `fork-of:` tags — are a Phase C
-    /// ambiguity: the first fork-of tag in iteration order
-    /// wins.
+    ///
+    /// Multi-chain hosts — a node with several `fork-of:` tags
+    /// — are a Phase C ambiguity. Since `caps.tags` is a
+    /// `HashSet` whose iteration order is RNG-dependent, we
+    /// collect every fork-of candidate, sort numerically, and
+    /// take the smallest. That keeps both the plan AND the
+    /// load-bearing cache key (locked decision #4) byte-stable
+    /// across runs.
     fn parent_of(&self, child: u64) -> Option<u64> {
         for node_id in self.capability_index.all_nodes() {
             let Some(caps) = self.capability_index.get(node_id) else {
                 continue;
             };
             let mut hosts_child = false;
-            let mut parent: Option<u64> = None;
+            let mut fork_candidates: Vec<u64> = Vec::new();
             for tag in &caps.tags {
                 let Tag::Reserved { prefix, body } = tag else {
                     continue;
                 };
-                match (prefix.as_str(), parent) {
-                    ("causal:", _) if parse_causal_body(body) == Some(child) => {
+                match prefix.as_str() {
+                    "causal:" if parse_causal_body(body) == Some(child) => {
                         hosts_child = true;
                     }
-                    ("fork-of:", None) => {
-                        parent = parse_fork_body(body);
+                    "fork-of:" => {
+                        if let Some(p) = parse_fork_body(body) {
+                            fork_candidates.push(p);
+                        }
                     }
                     _ => {}
                 }
             }
             if hosts_child {
-                return parent;
+                fork_candidates.sort_unstable();
+                return fork_candidates.first().copied();
             }
         }
         None
@@ -941,6 +948,12 @@ where
     /// the direct descendants. Scans every node in the
     /// capability index; the result is sorted by caller (BFS
     /// needs deterministic order).
+    ///
+    /// Multi-chain hosts — a node with several `causal:` tags
+    /// — are a Phase C ambiguity. `caps.tags` is a `HashSet`,
+    /// so we collect every causal body, sort numerically, and
+    /// pick the smallest to keep the plan + cache key
+    /// deterministic across runs.
     fn children_of(&self, parent: u64) -> Vec<u64> {
         let mut out = Vec::new();
         for node_id in self.capability_index.all_nodes() {
@@ -948,7 +961,7 @@ where
                 continue;
             };
             let mut has_fork_to_parent = false;
-            let mut owned_chain: Option<u64> = None;
+            let mut causal_candidates: Vec<u64> = Vec::new();
             for tag in &caps.tags {
                 let Tag::Reserved { prefix, body } = tag else {
                     continue;
@@ -958,17 +971,16 @@ where
                         has_fork_to_parent = true;
                     }
                     "causal:" => {
-                        // First causal tag wins (multi-chain
-                        // hosts are a Phase C ambiguity).
                         if let Some(origin) = parse_causal_body(body) {
-                            owned_chain.get_or_insert(origin);
+                            causal_candidates.push(origin);
                         }
                     }
                     _ => {}
                 }
             }
             if has_fork_to_parent {
-                if let Some(chain) = owned_chain {
+                causal_candidates.sort_unstable();
+                if let Some(&chain) = causal_candidates.first() {
                     if chain != parent {
                         out.push(chain);
                     }
@@ -998,11 +1010,7 @@ where
     /// the stored `PredicateWire`, calls
     /// [`CapabilityQuery::filter`] on the capability index,
     /// then walks each matched node's `causal:<hex>` tags to
-    /// extract origin hashes. Returns the **first** origin
-    /// hash (lex-sorted for determinism) when multiple match.
-    /// Multi-origin discovery (implicit `Union` over all
-    /// matched origins) lands in Phase B when the executor
-    /// learns to fan out across chains.
+    /// extract origin hashes.
     ///
     /// Errors:
     /// - `PlannerError` if the stored `PredicateWire` fails
@@ -1010,6 +1018,12 @@ where
     /// - `NoCapableHolder` if the predicate matches zero
     ///   nodes OR every matched node's caps carry no
     ///   `causal:` tag.
+    /// - `AmbiguousDiscovery` if the predicate resolves to
+    ///   more than one origin. Until Phase B's fan-out
+    ///   lands the planner refuses rather than silently
+    ///   truncating to the first match — the caller should
+    ///   either tighten the predicate or wait for the
+    ///   implicit-Union resolution path.
     fn resolve_origin(&self, origin: &ChainRef) -> Result<u64, MeshError> {
         match origin {
             ChainRef::OriginHash(h) => Ok(*h),
@@ -1023,7 +1037,8 @@ where
                 let candidates = self.capability_index.filter(&predicate);
                 // Walk every matched node's caps + extract
                 // origins from `causal:<hex>*` tags. Dedupe +
-                // sort lex for determinism. Take the first.
+                // sort lex for determinism (BTreeSet is
+                // already iterated in sorted order).
                 let mut origins: std::collections::BTreeSet<u64> =
                     std::collections::BTreeSet::new();
                 for (_node_id, caps) in &candidates {
@@ -1033,13 +1048,17 @@ where
                         }
                     }
                 }
-                origins
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| MeshError::NoCapableHolder {
+                match origins.len() {
+                    0 => Err(MeshError::NoCapableHolder {
                         origin: 0,
                         requirement: format!("{:?}", predicate),
-                    })
+                    }),
+                    1 => Ok(*origins.iter().next().expect("len == 1")),
+                    _ => Err(MeshError::AmbiguousDiscovery {
+                        matches: origins.into_iter().collect(),
+                        requirement: format!("{:?}", predicate),
+                    }),
+                }
             }
         }
     }
@@ -1064,14 +1083,23 @@ where
             // variants for the same chain (presence + tip +
             // range during transitions). Pick the most
             // specific one — range > tip > presence — so
-            // the planner gets the tightest claim.
+            // the planner gets the tightest claim. Tie-break
+            // on the claim itself so two Range or two Tip
+            // claims on the same node resolve deterministically
+            // (caps.tags is a HashSet whose iteration order
+            // is RNG-dependent; the cache key per locked
+            // decision #4 needs byte-stable plans).
             let claim = self
                 .capability_index
                 .with_caps(node_id, |caps| {
                     caps.tags
                         .iter()
                         .filter_map(|t| parse_causal_claim(t, &hex))
-                        .max_by_key(specificity_rank)
+                        .max_by(|a, b| {
+                            specificity_rank(a)
+                                .cmp(&specificity_rank(b))
+                                .then_with(|| claim_cmp_key(a).cmp(&claim_cmp_key(b)))
+                        })
                 })
                 .unwrap_or(None);
             if let Some(claim) = claim {
@@ -1327,6 +1355,22 @@ fn specificity_rank(claim: &CausalClaim) -> u8 {
         CausalClaim::Range { .. } => 2,
         CausalClaim::Tip { .. } => 1,
         CausalClaim::Presence => 0,
+    }
+}
+
+/// Total-order tie-break key for `CausalClaim`. Used to pick
+/// a canonical winner when two claims share the same
+/// `specificity_rank` — `caps.tags` is a `HashSet`, so the
+/// "natural" iteration order is RNG-dependent. The key is
+/// shaped so that within each rank the smaller starting seq
+/// (and smaller end on a tie) wins; the variant tag is
+/// included only as a final tiebreaker so the function is
+/// total across all variants.
+fn claim_cmp_key(claim: &CausalClaim) -> (u64, u64, u8) {
+    match claim {
+        CausalClaim::Range { start, end } => (start.0, end.0, 2),
+        CausalClaim::Tip { tip_seq } => (0, tip_seq.0, 1),
+        CausalClaim::Presence => (u64::MAX, u64::MAX, 0),
     }
 }
 
@@ -2213,6 +2257,45 @@ mod tests {
     }
 
     #[test]
+    fn plan_chainref_discovered_multiple_origins_surfaces_ambiguous_error() {
+        // Regression: previously resolve_origin silently took
+        // the lex-smallest match when the predicate hit more
+        // than one origin. Until Phase B's fan-out lands, that
+        // returns wrong rows; we now surface AmbiguousDiscovery
+        // and let the caller tighten the predicate.
+        use crate::adapter::net::behavior::predicate::Predicate;
+        use crate::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
+
+        let origin_a = 0x0000_AAAA_AAAA_AAAA_u64;
+        let origin_b = 0x0000_BBBB_BBBB_BBBB_u64;
+        let mut caps_a = CapabilitySet::new().add_tag("dataforts.blob.storage");
+        caps_a.tags.insert(causal_tag(chain_hex(origin_a)));
+        let mut caps_b = CapabilitySet::new().add_tag("dataforts.blob.storage");
+        caps_b.tags.insert(causal_tag(chain_hex(origin_b)));
+        let index = index_with(vec![(1, caps_a), (2, caps_b)]);
+        let pred = Predicate::Exists {
+            key: TagKey {
+                axis: TaxonomyAxis::Dataforts,
+                key: "blob.storage".to_string(),
+            },
+        };
+        let planner = MeshQueryPlanner::new(&index, rtt_none);
+        let err = planner
+            .plan(&MeshQuery::V1(QueryV1::Latest {
+                origin: ChainRef::Discovered(pred.to_wire()),
+            }))
+            .expect_err("two-origin discovery should surface AmbiguousDiscovery");
+        match err {
+            MeshError::AmbiguousDiscovery { matches, .. } => {
+                assert_eq!(matches.len(), 2);
+                assert!(matches.contains(&origin_a));
+                assert!(matches.contains(&origin_b));
+            }
+            other => panic!("expected AmbiguousDiscovery; got {other:?}"),
+        }
+    }
+
+    #[test]
     fn plan_chainref_discovered_match_with_no_causal_tag_surfaces_no_capable_holder() {
         use crate::adapter::net::behavior::predicate::Predicate;
         use crate::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
@@ -2279,6 +2362,50 @@ mod tests {
         let e1 = postcard::to_allocvec(&p1).unwrap();
         let e2 = postcard::to_allocvec(&p2).unwrap();
         assert_eq!(e1, e2, "plan must be deterministic byte-by-byte");
+    }
+
+    #[test]
+    fn lineage_back_with_multiple_fork_of_tags_is_deterministic() {
+        // Regression: caps.tags is a HashSet. A node carrying
+        // several `fork-of:` tags previously surfaced "first
+        // in iteration order" which varies run-to-run. The
+        // planner now sorts the candidates numerically. Build
+        // a host that lists three forks and assert the BFS
+        // plan + cache key are byte-stable across 32 fresh
+        // planners.
+        let child = 0x0000_0000_0000_00CC_u64;
+        let parent_a = 0x0000_0000_0000_0001_u64;
+        let parent_b = 0x0000_0000_0000_0002_u64;
+        let parent_c = 0x0000_0000_0000_0003_u64;
+        let mut caps = CapabilitySet::new();
+        caps.tags.insert(causal_tag(chain_hex(child)));
+        caps.tags.insert(fork_tag(parent_a));
+        caps.tags.insert(fork_tag(parent_b));
+        caps.tags.insert(fork_tag(parent_c));
+        // Root nodes for each candidate parent so the BFS
+        // resolves a parent regardless of which one wins.
+        let index = index_with(vec![
+            (1, caps),
+            (2, caps_chain_only(parent_a)),
+            (3, caps_chain_only(parent_b)),
+            (4, caps_chain_only(parent_c)),
+        ]);
+
+        let mut last_encoding: Option<Vec<u8>> = None;
+        for _ in 0..32 {
+            let planner = MeshQueryPlanner::new(&index, rtt_none);
+            let plan = planner
+                .plan(&MeshQuery::V1(QueryV1::LineageBack {
+                    origin: ChainRef::OriginHash(child),
+                    max_depth: 1,
+                }))
+                .unwrap();
+            let bytes = postcard::to_allocvec(&plan).unwrap();
+            if let Some(prev) = &last_encoding {
+                assert_eq!(prev, &bytes, "BFS plan must not depend on HashSet iter order");
+            }
+            last_encoding = Some(bytes);
+        }
     }
 
     #[test]

@@ -139,6 +139,20 @@ pub enum MeshError {
         requirement: String,
     },
 
+    /// `ChainRef::Discovered` matched more than one origin.
+    /// Until Phase B's fan-out lands, the planner refuses
+    /// rather than silently truncating to the first match.
+    /// Callers should tighten their predicate or, once Phase
+    /// B ships, switch to a multi-origin union query.
+    #[error("discovered predicate is ambiguous ({} origins match): {requirement}", matches.len())]
+    AmbiguousDiscovery {
+        /// The origin hashes that matched the predicate.
+        matches: Vec<u64>,
+        /// Rendered predicate or requirement string for
+        /// diagnostics.
+        requirement: String,
+    },
+
     /// Query cancelled via `MeshQueryExecutor::cancel`.
     /// Distinct from `ExecutorError` so callers can route
     /// cancellations differently (they're not failures).

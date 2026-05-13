@@ -125,6 +125,7 @@ fn mesh_error_kind(err: &MeshError) -> &'static str {
         MeshError::PlannerError { .. } => "planner_error",
         MeshError::ExecutorError { .. } => "executor_error",
         MeshError::NoCapableHolder { .. } => "no_capable_holder",
+        MeshError::AmbiguousDiscovery { .. } => "ambiguous_discovery",
         MeshError::QueryCancelled => "query_cancelled",
         _ => "unknown",
     }
