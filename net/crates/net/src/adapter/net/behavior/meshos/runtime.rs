@@ -198,6 +198,14 @@ impl MeshOsRuntime {
                 .stats
                 .dispatch_retries
                 .load(std::sync::atomic::Ordering::Relaxed),
+            cluster_backpressure_asserts: self
+                .stats
+                .cluster_backpressure_asserts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            cluster_backpressure_releases: self
+                .stats
+                .cluster_backpressure_releases
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -260,6 +268,14 @@ impl MeshOsRuntime {
                 dispatch_retries: self
                     .stats
                     .dispatch_retries
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                cluster_backpressure_asserts: self
+                    .stats
+                    .cluster_backpressure_asserts
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                cluster_backpressure_releases: self
+                    .stats
+                    .cluster_backpressure_releases
                     .load(std::sync::atomic::Ordering::Relaxed),
             },
         })

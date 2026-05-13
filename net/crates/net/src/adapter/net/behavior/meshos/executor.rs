@@ -32,7 +32,9 @@ use tokio::sync::mpsc;
 use tokio::time::sleep_until;
 
 use super::action::{MeshOsAction, PendingAction};
-use super::backpressure::{AdmissionResult, BackpressureState};
+use super::backpressure::{
+    AdmissionResult, BackpressureState, ClusterBackpressureChange,
+};
 use super::chain::{
     append_dispatched, append_failed, append_gated, ActionChainAppender,
     NoOpActionChainAppender,
@@ -56,6 +58,17 @@ pub trait ActionDispatcher: Send + Sync + 'static {
         &'a self,
         action: MeshOsAction,
     ) -> BoxFuture<'a, Result<(), DispatchError>>;
+
+    /// Cluster-wide backpressure flag transitioned. The executor
+    /// invokes this once per edge crossing — `Asserted` when the
+    /// action-queue depth crosses the high-water mark, `Released`
+    /// when it drops below the low-water mark. Production
+    /// dispatchers fan `DaemonControl::BackpressureOn { level }` /
+    /// `DaemonControl::BackpressureOff` out to supervised daemons
+    /// so they can shed optional work. Default impl is a no-op —
+    /// dispatchers that don't supervise daemons (e.g. the test
+    /// logger) can ignore the hook.
+    fn on_cluster_backpressure(&self, _change: ClusterBackpressureChange) {}
 }
 
 /// Dispatch error surface. Carries the operator-readable reason
@@ -99,6 +112,7 @@ impl DispatchError {
 pub struct LoggingDispatcher {
     log: Mutex<Vec<MeshOsAction>>,
     fail_next: Mutex<Option<DispatchError>>,
+    backpressure_log: Mutex<Vec<ClusterBackpressureChange>>,
 }
 
 impl LoggingDispatcher {
@@ -117,6 +131,12 @@ impl LoggingDispatcher {
     pub fn fail_next(&self, err: DispatchError) {
         *self.fail_next.lock() = Some(err);
     }
+
+    /// Snapshot of the cluster-backpressure transitions the
+    /// executor has surfaced through `on_cluster_backpressure`.
+    pub fn backpressure_log(&self) -> Vec<ClusterBackpressureChange> {
+        self.backpressure_log.lock().clone()
+    }
 }
 
 impl ActionDispatcher for LoggingDispatcher {
@@ -131,6 +151,10 @@ impl ActionDispatcher for LoggingDispatcher {
             self.log.lock().push(action);
             Ok(())
         })
+    }
+
+    fn on_cluster_backpressure(&self, change: ClusterBackpressureChange) {
+        self.backpressure_log.lock().push(change);
     }
 }
 
@@ -153,6 +177,12 @@ pub struct ExecutorStats {
     /// Total actions retried via a dispatch error's
     /// `retry_after` hint.
     pub dispatch_retries: AtomicU64,
+    /// Number of cluster-backpressure assert transitions
+    /// surfaced to the dispatcher.
+    pub cluster_backpressure_asserts: AtomicU64,
+    /// Number of cluster-backpressure release transitions
+    /// surfaced to the dispatcher.
+    pub cluster_backpressure_releases: AtomicU64,
 }
 
 impl ExecutorStats {
@@ -280,6 +310,26 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
     async fn handle_one(&mut self, action: PendingAction) {
         let now = Instant::now();
         self.backpressure.tick(now);
+        // Compute live queue depth (channel + deferred heap) and
+        // run hysteresis; surface edge crossings to the
+        // dispatcher so it can broadcast
+        // `DaemonControl::BackpressureOn`/`Off` to supervised
+        // daemons.
+        let depth = self.actions_rx.len() + self.deferred.len() + 1;
+        let change = self
+            .backpressure
+            .update_cluster_backpressure(depth, &self.config.backpressure);
+        match change {
+            ClusterBackpressureChange::Asserted => {
+                ExecutorStats::inc(&self.stats.cluster_backpressure_asserts);
+                self.dispatcher.on_cluster_backpressure(change);
+            }
+            ClusterBackpressureChange::Released => {
+                ExecutorStats::inc(&self.stats.cluster_backpressure_releases);
+                self.dispatcher.on_cluster_backpressure(change);
+            }
+            ClusterBackpressureChange::Steady => {}
+        }
         match self
             .backpressure
             .admit(&action.action, now, &self.config.backpressure)
@@ -387,6 +437,14 @@ impl ExecutorHandle {
             deferred: self.stats.deferred.load(Ordering::Relaxed),
             gated: self.stats.gated.load(Ordering::Relaxed),
             dispatch_retries: self.stats.dispatch_retries.load(Ordering::Relaxed),
+            cluster_backpressure_asserts: self
+                .stats
+                .cluster_backpressure_asserts
+                .load(Ordering::Relaxed),
+            cluster_backpressure_releases: self
+                .stats
+                .cluster_backpressure_releases
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -405,6 +463,10 @@ pub struct ExecutorStatsSnapshot {
     pub gated: u64,
     /// Total dispatch errors retried via `retry_after`.
     pub dispatch_retries: u64,
+    /// Number of cluster-backpressure assert edges surfaced.
+    pub cluster_backpressure_asserts: u64,
+    /// Number of cluster-backpressure release edges surfaced.
+    pub cluster_backpressure_releases: u64,
 }
 
 async fn sleep_until_opt(deadline: Option<Instant>) {
@@ -626,6 +688,52 @@ mod tests {
             .expect("executor did not exit after sender dropped")
             .expect("join");
         assert_eq!(stats.dispatched.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_backpressure_edges_surface_through_dispatcher_hook() {
+        // Set high-water = 3, low-water = 1 so the channel-only
+        // depth crosses the threshold quickly. The executor pushes
+        // four actions into a buffered channel before draining;
+        // depth at first admit reaches 4 (rx.len() == 3 + 1 in
+        // flight) crossing the high mark, then drops as actions
+        // drain.
+        let mut cfg = MeshOsConfig::default();
+        cfg.backpressure.cluster_backpressure_threshold = 3;
+        cfg.backpressure.cluster_backpressure_release = 1;
+        let cfg = Arc::new(cfg);
+        let (tx, rx) = mpsc::channel(8);
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let exec = ActionExecutor::new(rx, cfg, Arc::clone(&dispatcher));
+        // Buffer four actions before letting the executor start
+        // (cargo holds the spawn until we `.await`).
+        for i in 1..=4u64 {
+            tx.send(pending(
+                i,
+                MeshOsAction::CommitMaintenanceTransition {
+                    node: 1,
+                    target: MaintenanceTransition::Active,
+                },
+            ))
+            .await
+            .unwrap();
+        }
+        let task = tokio::spawn(exec.run());
+        // Let everything drain.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(tx);
+        let stats = task.await.expect("join");
+        assert!(
+            stats.cluster_backpressure_asserts.load(Ordering::Relaxed) >= 1,
+            "depth crossed the high-water mark at least once",
+        );
+        assert!(
+            stats.cluster_backpressure_releases.load(Ordering::Relaxed) >= 1,
+            "depth dropped below the low-water mark at least once",
+        );
+        let log = dispatcher.backpressure_log();
+        assert!(matches!(log.first(), Some(ClusterBackpressureChange::Asserted)));
+        assert!(matches!(log.last(), Some(ClusterBackpressureChange::Released)));
     }
 
     #[tokio::test]
