@@ -181,10 +181,12 @@ extern MeshDbIter* net_meshdb_runner_execute_with(
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"unsafe"
 )
@@ -523,12 +525,17 @@ func pumpIterRowsContext(ctx context.Context, iter *C.MeshDbIter, ch chan<- Mesh
 		status := C.net_meshdb_iter_next(iter, &origin, &seq, &payloadPtr, &payloadLen)
 		switch status {
 		case C.NET_MESHDB_OK:
+			payload, copyErr := copyFFIPayload(payloadPtr, payloadLen)
+			C.net_meshdb_payload_free(payloadPtr, payloadLen)
+			if copyErr != nil {
+				trySend(ctx, ch, MeshDBResult{Err: copyErr})
+				return
+			}
 			row := MeshDBResultRow{
 				Origin:  uint64(origin),
 				Seq:     uint64(seq),
-				Payload: C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen)),
+				Payload: payload,
 			}
-			C.net_meshdb_payload_free(payloadPtr, payloadLen)
 			if !trySend(ctx, ch, MeshDBResult{Row: row}) {
 				return
 			}
@@ -542,6 +549,29 @@ func pumpIterRowsContext(ctx context.Context, iter *C.MeshDbIter, ch chan<- Mesh
 			return
 		}
 	}
+}
+
+// copyFFIPayload turns a `(ptr, size_t len)` pair from the FFI
+// into an owned `[]byte`. `C.size_t` is 64-bit on a 64-bit host,
+// `C.int` is 32-bit signed — `C.GoBytes` silently truncates /
+// sign-flips lengths past `math.MaxInt32`. We refuse oversized
+// payloads explicitly with `ErrMeshDBRuntime` rather than risk a
+// truncated Go-side buffer.
+//
+// Empty payloads (`len == 0` and / or null `ptr`) yield a nil
+// slice, matching the FFI's "no body" semantics.
+func copyFFIPayload(ptr *C.uint8_t, length C.size_t) ([]byte, error) {
+	if length == 0 || ptr == nil {
+		return nil, nil
+	}
+	if uint64(length) > uint64(math.MaxInt) {
+		return nil, ErrMeshDBRuntime
+	}
+	// unsafe.Slice handles the size_t -> int conversion via a
+	// platform-int-sized argument; bytes.Clone copies it into a
+	// Go-owned slice so the caller can free the FFI buffer.
+	view := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), int(length))
+	return bytes.Clone(view), nil
 }
 
 // trySend forwards `res` to `ch`, but selects on `ctx.Done()` so
