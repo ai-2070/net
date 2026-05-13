@@ -106,9 +106,10 @@ pub use protocol::{
     ContinuationToken, MeshDbFrame, MeshDbRequest, MeshDbResponse, ResultBatch, SUBPROTOCOL_MESHDB,
 };
 pub use query::{
-    AggregateFn, AggregateRowPayload, AggregateValue, ChainRef, Expr, GroupKey, JoinKey, JoinKind,
-    JoinedRowPayload, MeshQuery, NumericAggregateKind, NumericReductionKind, OrderDir, OrderKey,
-    QueryV1, ResultRow, SeqNum, WindowBoundary, WindowSpec,
+    clamp_join_watermark_secs, AggregateFn, AggregateRowPayload, AggregateValue, ChainRef,
+    Expr, GroupKey, JoinKey, JoinKind, JoinedRowPayload, MeshQuery, NumericAggregateKind,
+    NumericReductionKind, OrderDir, OrderKey, QueryV1, ResultRow, SeqNum, WindowBoundary,
+    WindowSpec, DEFAULT_JOIN_WATERMARK_SECS,
 };
 pub use transport::{
     enable_meshdb_on_mesh, MeshDbInboundRouter, MeshDbRouteError, MeshDbServer,

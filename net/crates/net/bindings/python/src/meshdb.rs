@@ -67,8 +67,9 @@ use net::adapter::net::behavior::meshdb::{
         OperatorPlan,
     },
     query::{
-        AggregateRowPayload, AggregateValue, GroupKey, JoinKind, JoinedRowPayload,
-        NumericAggregateKind, NumericReductionKind, ResultRow, WindowBoundary, WindowSpec,
+        clamp_join_watermark_secs, AggregateRowPayload, AggregateValue, GroupKey, JoinKind,
+        JoinedRowPayload, NumericAggregateKind, NumericReductionKind, ResultRow,
+        WindowBoundary, WindowSpec,
     },
     ExecutionPlan, SeqNum,
 };
@@ -858,11 +859,7 @@ impl PyMeshQuery {
             "origin,seq" => JoinKeyMode::OriginSeq,
             other => JoinKeyMode::Field(other.to_string()),
         };
-        let watermark = if watermark_secs.is_finite() && watermark_secs >= 0.0 {
-            std::time::Duration::from_secs_f64(watermark_secs)
-        } else {
-            std::time::Duration::from_secs(5)
-        };
+        let watermark = clamp_join_watermark_secs(Some(watermark_secs));
         let op = OperatorPlan::HashJoin {
             left: Box::new(left.plan.root.clone()),
             right: Box::new(right.plan.root.clone()),

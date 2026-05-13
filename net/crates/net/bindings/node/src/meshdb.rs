@@ -56,10 +56,11 @@ use net::adapter::net::behavior::meshdb::{
         LineageEntry as InnerLineageEntry, OperatorNode, OperatorPlan,
     },
     query::{
-        AggregateRowPayload as InnerAggregateRowPayload, AggregateValue as InnerAggregateValue,
-        GroupKey as InnerGroupKey, JoinKind as InnerJoinKind,
-        JoinedRowPayload as InnerJoinedRowPayload, NumericAggregateKind, NumericReductionKind,
-        ResultRow as InnerResultRow, WindowBoundary as InnerWindowBoundary, WindowSpec,
+        clamp_join_watermark_secs, AggregateRowPayload as InnerAggregateRowPayload,
+        AggregateValue as InnerAggregateValue, GroupKey as InnerGroupKey,
+        JoinKind as InnerJoinKind, JoinedRowPayload as InnerJoinedRowPayload,
+        NumericAggregateKind, NumericReductionKind, ResultRow as InnerResultRow,
+        WindowBoundary as InnerWindowBoundary, WindowSpec,
     },
     ExecutionPlan, SeqNum,
 };
@@ -562,14 +563,7 @@ impl MeshQuery {
             "origin,seq" => JoinKeyMode::OriginSeq,
             other => JoinKeyMode::Field(other.to_string()),
         };
-        let watermark = {
-            let secs = watermark_secs.unwrap_or(5.0);
-            if secs.is_finite() && secs >= 0.0 {
-                std::time::Duration::from_secs_f64(secs)
-            } else {
-                std::time::Duration::from_secs(5)
-            }
-        };
+        let watermark = clamp_join_watermark_secs(watermark_secs);
         Ok(Self {
             plan: plan_of(OperatorPlan::HashJoin {
                 left: Box::new(left.plan.root.clone()),

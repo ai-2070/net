@@ -560,6 +560,28 @@ pub struct JoinedRowPayload {
     pub right: Option<ResultRow>,
 }
 
+/// Default late-arrival watermark for join operators in seconds
+/// (5 s — locked decision #2 mirror).
+pub const DEFAULT_JOIN_WATERMARK_SECS: u64 = 5;
+
+/// Shared clamp used by every SDK shim (Python / Node / Go FFI)
+/// when accepting a caller-supplied join watermark as `f64`
+/// seconds. `None`, NaN, +/-infinity, and negative values all
+/// fall through to [`DEFAULT_JOIN_WATERMARK_SECS`]. Any finite
+/// non-negative value passes through as
+/// `Duration::from_secs_f64(secs)`.
+///
+/// Centralized here so the contract has one definition + one
+/// substrate-side test surface; the SDK tests can then assert
+/// row count / smoke and rely on the substrate suite to pin
+/// clamp behavior. Re-exported through the meshdb module root.
+pub fn clamp_join_watermark_secs(secs: Option<f64>) -> Duration {
+    match secs {
+        Some(s) if s.is_finite() && s >= 0.0 => Duration::from_secs_f64(s),
+        _ => Duration::from_secs(DEFAULT_JOIN_WATERMARK_SECS),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +761,45 @@ mod tests {
         let bytes = postcard::to_allocvec(&row).unwrap();
         let back: ResultRow = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, row);
+    }
+
+    #[test]
+    fn clamp_join_watermark_passes_through_finite_non_negative_seconds() {
+        assert_eq!(clamp_join_watermark_secs(Some(0.0)), Duration::from_secs(0));
+        assert_eq!(clamp_join_watermark_secs(Some(2.5)), Duration::from_secs_f64(2.5));
+        assert_eq!(
+            clamp_join_watermark_secs(Some(300.0)),
+            Duration::from_secs(300),
+        );
+    }
+
+    #[test]
+    fn clamp_join_watermark_falls_back_to_default_on_none() {
+        assert_eq!(
+            clamp_join_watermark_secs(None),
+            Duration::from_secs(DEFAULT_JOIN_WATERMARK_SECS),
+        );
+    }
+
+    #[test]
+    fn clamp_join_watermark_falls_back_to_default_on_non_finite() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                clamp_join_watermark_secs(Some(bad)),
+                Duration::from_secs(DEFAULT_JOIN_WATERMARK_SECS),
+                "bad input {bad:?} should clamp to default",
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_join_watermark_falls_back_to_default_on_negative() {
+        for bad in [-0.001_f64, -1.0, -1e9] {
+            assert_eq!(
+                clamp_join_watermark_secs(Some(bad)),
+                Duration::from_secs(DEFAULT_JOIN_WATERMARK_SECS),
+                "negative {bad} should clamp to default",
+            );
+        }
     }
 }

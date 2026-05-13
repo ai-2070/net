@@ -415,7 +415,7 @@ use net::adapter::net::behavior::meshdb::planner::{
     JoinKeyMode, JoinStrategy, LineageDirection, LineageEntry,
 };
 use net::adapter::net::behavior::meshdb::query::{
-    JoinKind, NumericAggregateKind, NumericReductionKind, WindowSpec,
+    clamp_join_watermark_secs, JoinKind, NumericAggregateKind, NumericReductionKind, WindowSpec,
 };
 use net::adapter::net::behavior::predicate::Predicate;
 use net::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
@@ -674,18 +674,14 @@ pub unsafe extern "C" fn net_meshdb_query_join(
             "origin,seq" => JoinKeyMode::OriginSeq,
             other => JoinKeyMode::Field(other.to_string()),
         };
-        let watermark_secs = if watermark_secs.is_finite() && watermark_secs >= 0.0 {
-            watermark_secs
-        } else {
-            5.0
-        };
+        let watermark = clamp_join_watermark_secs(Some(watermark_secs));
         let plan = plan_of(OperatorPlan::HashJoin {
             left: Box::new((&*left).plan.root.clone()),
             right: Box::new((&*right).plan.root.clone()),
             key_mode,
             kind,
             strategy,
-            watermark: std::time::Duration::from_secs_f64(watermark_secs),
+            watermark,
         });
         Box::into_raw(Box::new(MeshDbQuery { plan }))
     })
