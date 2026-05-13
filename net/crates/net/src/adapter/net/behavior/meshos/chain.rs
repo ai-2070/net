@@ -141,22 +141,50 @@ impl ActionChainAppender for NoOpActionChainAppender {
     }
 }
 
-/// Buffering appender — collects records in an internal `Vec`
-/// for tests to inspect.
-#[derive(Debug, Default)]
+/// Default cap on [`BufferingActionChainAppender`] — bounds the
+/// buffer so a runaway test under `tokio::time::pause` can't OOM
+/// the process. Past the cap, oldest records are dropped FIFO.
+pub const DEFAULT_BUFFERING_APPENDER_CAPACITY: usize = 4096;
+
+/// Buffering appender — collects records in an internal
+/// `VecDeque` for tests to inspect. Bounded by
+/// [`Self::with_capacity`] (default
+/// [`DEFAULT_BUFFERING_APPENDER_CAPACITY`]); past the cap,
+/// oldest records are dropped FIFO and the drop counter
+/// increments.
+#[derive(Debug)]
 pub struct BufferingActionChainAppender {
-    records: parking_lot::Mutex<Vec<ActionChainRecord>>,
+    records: parking_lot::Mutex<std::collections::VecDeque<ActionChainRecord>>,
+    capacity: usize,
+    dropped: std::sync::atomic::AtomicU64,
+}
+
+impl Default for BufferingActionChainAppender {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_BUFFERING_APPENDER_CAPACITY)
+    }
 }
 
 impl BufferingActionChainAppender {
-    /// Construct an empty buffer.
+    /// Construct an empty buffer with the default capacity.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Snapshot the buffered records.
+    /// Construct an empty buffer capped at `capacity` records.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            records: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
+                capacity.min(64),
+            )),
+            capacity,
+            dropped: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot the buffered records (oldest first).
     pub fn records(&self) -> Vec<ActionChainRecord> {
-        self.records.lock().clone()
+        self.records.lock().iter().cloned().collect()
     }
 
     /// Count of buffered records.
@@ -168,11 +196,23 @@ impl BufferingActionChainAppender {
     pub fn is_empty(&self) -> bool {
         self.records.lock().is_empty()
     }
+
+    /// Count of records the buffer dropped because it was at
+    /// `capacity`. Increments on every FIFO eviction.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl ActionChainAppender for BufferingActionChainAppender {
     fn append(&self, record: ActionChainRecord) -> Result<(), AppendError> {
-        self.records.lock().push(record);
+        let mut guard = self.records.lock();
+        if guard.len() >= self.capacity {
+            guard.pop_front();
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        guard.push_back(record);
         Ok(())
     }
 }
@@ -318,6 +358,24 @@ mod tests {
             },
             payload: bytes::Bytes::from(payload),
         }
+    }
+
+    #[test]
+    fn buffering_appender_drops_oldest_when_at_capacity() {
+        // Regression for I9: BufferingActionChainAppender used
+        // an unbounded Vec — a runaway retry storm OOM'd. It is
+        // now a bounded ring buffer with a drop counter.
+        let appender = BufferingActionChainAppender::with_capacity(3);
+        for i in 0..5 {
+            appender
+                .append(record(i, "test", ActionDisposition::Dispatched))
+                .unwrap();
+        }
+        assert_eq!(appender.len(), 3, "buffer capped at capacity");
+        assert_eq!(appender.dropped_count(), 2, "two oldest evicted");
+        // The kept records are the most recent ones (ids 2, 3, 4).
+        let ids: Vec<u64> = appender.records().iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![2, 3, 4]);
     }
 
     #[test]
