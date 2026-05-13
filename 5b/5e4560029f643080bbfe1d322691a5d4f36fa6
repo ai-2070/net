@@ -1,0 +1,22 @@
+net/crates/net/tests/meshos_pipeline.rs
+  s_3bbc444b3ef3e5::t_6a115116256d0f 21-24
+  s_3bbc444b3ef3e5::t_c67aa70a9c753d 26-28,30-32
+  s_3bbc444b3ef3e5::t_67df28a9a3a5df 294-441
+  s_3bbc444b3ef3e5::t_4efeecf2c3b78b 18-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "5b5e4560029f643080bbfe1d322691a5d4f36fa6",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
