@@ -373,6 +373,16 @@ impl MeshQuery {
         })
     }
 
+    /// Start a fluent builder. Equivalent to constructing a
+    /// fresh [`QueryBuilder`]; chainable methods (`at`,
+    /// `between`, `latest`, `filter`, `count`, `sum`, `avg`,
+    /// `min`, `max`, `percentile`, `distinctCount`, `window`,
+    /// `join`) compose into a final `MeshQuery` via `.build()`.
+    #[napi(factory)]
+    pub fn builder() -> QueryBuilder {
+        QueryBuilder { state: None }
+    }
+
     /// Filter `inner`'s rows by `predicate`. The executor builds
     /// a synthetic per-row tag view (origin / seq / flat JSON
     /// payload fields) and evaluates the predicate; rows whose
@@ -620,6 +630,187 @@ fn parse_join_kind(s: &str) -> Result<InnerJoinKind> {
         other => Err(mesh_err(format!(
             "join kind '{other}' not recognised; expected inner / left_outer / right_outer / full_outer"
         ))),
+    }
+}
+
+/// Fluent builder for the common-ops query shape. Each
+/// chainable method returns a fresh builder so callers can
+/// write
+///
+/// ```ts
+/// const q = MeshQuery.builder()
+///   .between(0xCDn, 0n, 100n)
+///   .filter(predicateEquals('severity', 'high'))
+///   .count(null)
+///   .build();
+/// ```
+///
+/// Source operators (`at` / `between` / `latest`) seed the
+/// pipeline; pipeline operators require a seeded state and
+/// surface a `MeshDbError` when called on an empty builder.
+/// `.build()` consumes the builder into a `MeshQuery`.
+#[napi]
+#[derive(Clone)]
+pub struct QueryBuilder {
+    state: Option<MeshQuery>,
+}
+
+#[napi]
+impl QueryBuilder {
+    /// Source: read a single event. Resets any prior state.
+    #[napi]
+    pub fn at(&self, origin_hash: BigInt, seq: BigInt) -> Result<Self> {
+        Ok(Self {
+            state: Some(MeshQuery::at(origin_hash, seq)?),
+        })
+    }
+
+    /// Source: read events in the half-open seq range. Resets
+    /// any prior state.
+    #[napi]
+    pub fn between(&self, origin_hash: BigInt, start: BigInt, end: BigInt) -> Result<Self> {
+        Ok(Self {
+            state: Some(MeshQuery::between(origin_hash, start, end)?),
+        })
+    }
+
+    /// Source: read the tip event. Resets any prior state.
+    #[napi]
+    pub fn latest(&self, origin_hash: BigInt) -> Result<Self> {
+        Ok(Self {
+            state: Some(MeshQuery::latest(origin_hash)?),
+        })
+    }
+
+    /// Filter the current pipeline's rows.
+    #[napi]
+    pub fn filter(&self, predicate: Predicate) -> Result<Self> {
+        let inner = self.require_state("filter")?;
+        Ok(Self {
+            state: Some(MeshQuery::filter(&inner, predicate)?),
+        })
+    }
+
+    /// Count rows in the current pipeline.
+    #[napi]
+    pub fn count(&self, group_by: Option<Vec<String>>) -> Result<Self> {
+        let inner = self.require_state("count")?;
+        Ok(Self {
+            state: Some(MeshQuery::count(&inner, group_by)?),
+        })
+    }
+
+    /// Sum of a numeric field.
+    #[napi]
+    pub fn sum(&self, field: String, group_by: Option<Vec<String>>) -> Result<Self> {
+        let inner = self.require_state("sum")?;
+        Ok(Self {
+            state: Some(MeshQuery::sum(&inner, field, group_by)?),
+        })
+    }
+
+    /// Arithmetic mean of a numeric field.
+    #[napi]
+    pub fn avg(&self, field: String, group_by: Option<Vec<String>>) -> Result<Self> {
+        let inner = self.require_state("avg")?;
+        Ok(Self {
+            state: Some(MeshQuery::avg(&inner, field, group_by)?),
+        })
+    }
+
+    /// Min over a numeric field.
+    #[napi]
+    pub fn min(&self, field: String, group_by: Option<Vec<String>>) -> Result<Self> {
+        let inner = self.require_state("min")?;
+        Ok(Self {
+            state: Some(MeshQuery::min(&inner, field, group_by)?),
+        })
+    }
+
+    /// Max over a numeric field.
+    #[napi]
+    pub fn max(&self, field: String, group_by: Option<Vec<String>>) -> Result<Self> {
+        let inner = self.require_state("max")?;
+        Ok(Self {
+            state: Some(MeshQuery::max(&inner, field, group_by)?),
+        })
+    }
+
+    /// Nearest-rank percentile.
+    #[napi]
+    pub fn percentile(
+        &self,
+        field: String,
+        p: f64,
+        group_by: Option<Vec<String>>,
+    ) -> Result<Self> {
+        let inner = self.require_state("percentile")?;
+        Ok(Self {
+            state: Some(MeshQuery::percentile(&inner, field, p, group_by)?),
+        })
+    }
+
+    /// Exact distinct count.
+    #[napi(js_name = "distinctCount")]
+    pub fn distinct_count(
+        &self,
+        field: String,
+        group_by: Option<Vec<String>>,
+    ) -> Result<Self> {
+        let inner = self.require_state("distinctCount")?;
+        Ok(Self {
+            state: Some(MeshQuery::distinct_count(&inner, field, group_by)?),
+        })
+    }
+
+    /// Tumbling window on `seq` with the given bucket `size`.
+    #[napi]
+    pub fn window(&self, size: BigInt) -> Result<Self> {
+        let inner = self.require_state("window")?;
+        Ok(Self {
+            state: Some(MeshQuery::window(&inner, size)?),
+        })
+    }
+
+    /// Join the current pipeline with `right`. See
+    /// [`MeshQuery::join`] for full parameter docs.
+    #[napi]
+    pub fn join(
+        &self,
+        right: &MeshQuery,
+        kind: String,
+        key: String,
+        strategy: Option<String>,
+        watermark_secs: Option<f64>,
+    ) -> Result<Self> {
+        let inner = self.require_state("join")?;
+        Ok(Self {
+            state: Some(MeshQuery::join(
+                &inner,
+                right,
+                kind,
+                key,
+                strategy,
+                watermark_secs,
+            )?),
+        })
+    }
+
+    /// Terminal: consume the builder into a `MeshQuery`.
+    /// Surfaces `MeshDbError` when the builder has no source.
+    #[napi]
+    pub fn build(&self) -> Result<MeshQuery> {
+        self.require_state("build")
+    }
+}
+
+impl QueryBuilder {
+    fn require_state(&self, op: &str) -> Result<MeshQuery> {
+        self.state.clone().ok_or_else(|| {
+            mesh_err(format!(
+                "{op}: builder has no source — call .at(...), .between(...), or .latest(...) first"
+            ))
+        })
     }
 }
 

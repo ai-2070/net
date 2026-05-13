@@ -689,3 +689,132 @@ d('MeshDB Filter + Predicate (slice 3)', () => {
     expect(decodeAggregateFn!(rows[0])).toMatchObject({ kind: 'count', count: 3n });
   });
 });
+
+// ---------------------------------------------------------------------
+// Slice 4: fluent QueryBuilder.
+// ---------------------------------------------------------------------
+
+d('MeshDB QueryBuilder (slice 4)', () => {
+  const {
+    MeshQuery,
+    MeshQueryRunner,
+    InMemoryChainReader,
+    predicateEquals,
+  } = symbols as {
+    MeshQuery: typeof import('../index').MeshQuery;
+    MeshQueryRunner: typeof import('../index').MeshQueryRunner;
+    InMemoryChainReader: typeof import('../index').InMemoryChainReader;
+    predicateEquals: (field: string, value: string) => unknown;
+  };
+
+  const decodeAggregate = decodeAggregateFn as (row: unknown) => {
+    kind: string;
+    count: bigint | null;
+  } | null;
+
+  const seed = (
+    rows: ReadonlyArray<readonly [bigint, bigint, Uint8Array]>,
+  ): InstanceType<typeof InMemoryChainReader> => {
+    const r = new InMemoryChainReader();
+    for (const [origin, seq, payload] of rows) {
+      r.append(origin, seq, Buffer.from(payload));
+    }
+    return r;
+  };
+
+  it('builder() returns a chainable builder; empty .build() rejects', () => {
+    const b = MeshQuery.builder();
+    expect(b).toBeDefined();
+    expect(() => b.build()).toThrow(/no source/);
+  });
+
+  it('count on empty builder rejects', () => {
+    expect(() => MeshQuery.builder().count(null)).toThrow(/no source/);
+  });
+
+  it('.at().build() round-trips through the runner', async () => {
+    const reader = seed([[0xabn, 7n, Buffer.from('v')]]);
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.builder().at(0xabn, 7n).build();
+    const rows = await (await runner.execute(q)).toArray();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].seq).toBe(7n);
+  });
+
+  it('.between().filter().count().build() end-to-end', async () => {
+    const chain = 0xc0den;
+    const reader = seed([
+      [chain, 1n, Buffer.from('{"severity":"high"}')],
+      [chain, 2n, Buffer.from('{"severity":"low"}')],
+      [chain, 3n, Buffer.from('{"severity":"high"}')],
+      [chain, 4n, Buffer.from('{"severity":"high"}')],
+      [chain, 5n, Buffer.from('{"severity":"low"}')],
+    ]);
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.builder()
+      .between(chain, 1n, 10n)
+      .filter(predicateEquals('severity', 'high') as never)
+      .count(null)
+      .build();
+    const rows = await (await runner.execute(q)).toArray();
+    expect(decodeAggregate(rows[0])).toMatchObject({ kind: 'count', count: 3n });
+  });
+
+  it('.between().window(size).build() emits buckets', async () => {
+    const chain = 0xaan;
+    const reader = seed(
+      [1, 2, 3, 4, 5, 6, 7].map((s) => [chain, BigInt(s), Buffer.from('')]),
+    );
+    const runner = new MeshQueryRunner(reader);
+    const q = MeshQuery.builder().between(chain, 1n, 20n).window(3n).build();
+    const rows = await (await runner.execute(q)).toArray();
+    expect(rows).toHaveLength(3);
+  });
+
+  it('builder methods are per-step immutable (aliased builders diverge)', () => {
+    const base = MeshQuery.builder().between(0xaan, 1n, 10n);
+    const a = base.count(null);
+    const b = base.filter(predicateEquals('seq', '1') as never);
+    // base should still build as a between query.
+    expect(() => base.build()).not.toThrow();
+    expect(() => a.build()).not.toThrow();
+    expect(() => b.build()).not.toThrow();
+  });
+
+  it('builder.join with prebuilt right side', async () => {
+    const a = 0x111n;
+    const b = 0x222n;
+    const reader = seed([
+      [a, 1n, Buffer.from('a-1')],
+      [a, 2n, Buffer.from('a-2')],
+      [b, 1n, Buffer.from('b-1')],
+      [b, 2n, Buffer.from('b-2')],
+    ]);
+    const runner = new MeshQueryRunner(reader);
+    const rightSide = MeshQuery.builder().between(b, 1n, 10n).build();
+    const q = MeshQuery.builder()
+      .between(a, 1n, 10n)
+      .join(rightSide, 'inner', 'seq', null, null)
+      .build();
+    const rows = await (await runner.execute(q)).toArray();
+    expect(rows).toHaveLength(2);
+  });
+
+  it('source methods reset prior pipeline state', async () => {
+    const chain = 0xaan;
+    const reader = seed([
+      [chain, 1n, Buffer.from('v')],
+      [chain, 2n, Buffer.from('v')],
+    ]);
+    const runner = new MeshQueryRunner(reader);
+    // .at(99) sets a nonexistent source; switching to .between
+    // resets and the count picks up cleanly.
+    const q = MeshQuery.builder()
+      .at(chain, 99n)
+      .between(chain, 1n, 5n)
+      .count(null)
+      .build();
+    const rows = await (await runner.execute(q)).toArray();
+    expect(decodeAggregate(rows[0])).toMatchObject({ kind: 'count', count: 2n });
+  });
+});
