@@ -499,9 +499,11 @@ jobs:
       # Both end up in `net/crates/net/target/release/`.
       #
       # Features:
-      #   - `ai2070-net` needs `netdb,dataforts,redex-disk,nat-traversal`
-      #     for the mesh + cortex + blob + NAT FFI surfaces exercised by
-      #     the Go test suite.
+      #   - `ai2070-net` needs `netdb,dataforts,redex-disk,nat-traversal,redis`
+      #     for the mesh + cortex + blob + NAT + redis-dedup FFI surfaces
+      #     exercised by the Go test suite. `redis` only gates the
+      #     `RedisStreamDedup` symbol export — the dedup helper itself is
+      #     an in-memory LRU and does not need a Redis server at runtime.
       #   - `net-compute-ffi` needs `test-helpers` so the FFI symbol
       #     `net_compute_test_inject_synthetic_peer` (referenced by
       #     `groups_testhelpers.go`) is exported.
@@ -513,7 +515,7 @@ jobs:
         run: >
           cargo build --release
           -p ai2070-net -p net-compute-ffi
-          --features "ai2070-net/netdb,ai2070-net/dataforts,ai2070-net/redex-disk,ai2070-net/nat-traversal,net-compute-ffi/test-helpers"
+          --features "ai2070-net/netdb,ai2070-net/dataforts,ai2070-net/redex-disk,ai2070-net/nat-traversal,ai2070-net/redis,net-compute-ffi/test-helpers"
 
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
       # so local developers can run quick unit-style passes without the
