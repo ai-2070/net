@@ -37,13 +37,13 @@ use std::sync::Arc;
 
 use tokio::runtime::Runtime;
 
+use net::adapter::net::behavior::meshdb::MeshError;
 use net::adapter::net::behavior::meshdb::{
     executor::{ChainReader, ExecuteOptions, LocalMeshQueryExecutor, MeshQueryExecutor},
     planner::{CostEstimate, OperatorNode, OperatorPlan},
     query::ResultRow,
     ExecutionPlan, SeqNum,
 };
-use net::adapter::net::behavior::meshdb::MeshError;
 
 /// Status code: function returned successfully.
 pub const NET_MESHDB_OK: c_int = 0;
@@ -213,11 +213,7 @@ pub extern "C" fn net_meshdb_query_at(origin: u64, seq: u64) -> *mut MeshDbQuery
 /// Construct a `Between(origin, start, end)` query (half-open).
 /// Returns null when `start >= end`.
 #[no_mangle]
-pub extern "C" fn net_meshdb_query_between(
-    origin: u64,
-    start: u64,
-    end: u64,
-) -> *mut MeshDbQuery {
+pub extern "C" fn net_meshdb_query_between(origin: u64, start: u64, end: u64) -> *mut MeshDbQuery {
     if start >= end {
         return ptr::null_mut();
     }
@@ -245,7 +241,9 @@ pub extern "C" fn net_meshdb_query_latest(origin: u64) -> *mut MeshDbQuery {
 // `"seq"`, `"origin,seq"` map to the typed `JoinKeyMode`. Other
 // values surface as null (caller treats as invalid args).
 
-use net::adapter::net::behavior::meshdb::planner::{JoinKeyMode, JoinStrategy};
+use net::adapter::net::behavior::meshdb::planner::{
+    JoinKeyMode, JoinStrategy, LineageDirection, LineageEntry,
+};
 use net::adapter::net::behavior::meshdb::query::{
     JoinKind, NumericAggregateKind, NumericReductionKind, WindowSpec,
 };
@@ -258,7 +256,9 @@ unsafe fn parse_group_by_cstr(
     if group_by.is_null() {
         return Ok(None);
     }
-    let s = std::ffi::CStr::from_ptr(group_by).to_str().map_err(|_| ())?;
+    let s = std::ffi::CStr::from_ptr(group_by)
+        .to_str()
+        .map_err(|_| ())?;
     if s.is_empty() {
         return Ok(None);
     }
@@ -274,7 +274,10 @@ unsafe fn cstr_to_string(s: *const std::ffi::c_char) -> Option<String> {
     if s.is_null() {
         return None;
     }
-    std::ffi::CStr::from_ptr(s).to_str().ok().map(|x| x.to_string())
+    std::ffi::CStr::from_ptr(s)
+        .to_str()
+        .ok()
+        .map(|x| x.to_string())
 }
 
 /// `Window(inner, size)` — tumbling on seq. Returns null when
@@ -475,6 +478,76 @@ pub unsafe extern "C" fn net_meshdb_query_join(
     Box::into_raw(Box::new(MeshDbQuery { plan }))
 }
 
+/// `LineageEmit(origin, entries, direction)`. Emits one row per
+/// pre-walked entry; the SDK doesn't itself walk the fork-of:
+/// graph. `entries_json` is a JSON array of
+/// `{"origin":N,"depth":N,"tip_seq":N|null}` objects in walk
+/// order. `direction` is `"back"` or `"forward"`. Returns null
+/// on JSON parse error or invalid direction.
+///
+/// # Safety
+/// `entries_json` and `direction` must be valid UTF-8 C-strings.
+#[no_mangle]
+pub unsafe extern "C" fn net_meshdb_query_lineage_emit(
+    origin: u64,
+    entries_json: *const std::ffi::c_char,
+    direction: *const std::ffi::c_char,
+) -> *mut MeshDbQuery {
+    if entries_json.is_null() || direction.is_null() {
+        return ptr::null_mut();
+    }
+    let Ok(json) = std::ffi::CStr::from_ptr(entries_json).to_str() else {
+        return ptr::null_mut();
+    };
+    let Ok(dir_str) = std::ffi::CStr::from_ptr(direction).to_str() else {
+        return ptr::null_mut();
+    };
+    let direction = match dir_str {
+        "back" => LineageDirection::Back,
+        "forward" => LineageDirection::Forward,
+        _ => return ptr::null_mut(),
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return ptr::null_mut();
+    };
+    let Some(arr) = value.as_array() else {
+        return ptr::null_mut();
+    };
+    let mut entries = Vec::with_capacity(arr.len());
+    for e in arr {
+        let Some(obj) = e.as_object() else {
+            return ptr::null_mut();
+        };
+        let Some(entry_origin) = obj.get("origin").and_then(|x| x.as_u64()) else {
+            return ptr::null_mut();
+        };
+        let Some(depth) = obj.get("depth").and_then(|x| x.as_u64()) else {
+            return ptr::null_mut();
+        };
+        let Ok(depth) = u32::try_from(depth) else {
+            return ptr::null_mut();
+        };
+        let tip_seq = match obj.get("tip_seq") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => match v.as_u64() {
+                Some(s) => Some(SeqNum(s)),
+                None => return ptr::null_mut(),
+            },
+        };
+        entries.push(LineageEntry {
+            origin: entry_origin,
+            depth,
+            tip_seq,
+        });
+    }
+    let plan = plan_of(OperatorPlan::LineageEmit {
+        origin,
+        direction,
+        entries,
+    });
+    Box::into_raw(Box::new(MeshDbQuery { plan }))
+}
+
 // =====================================================================
 // Slice 3: Filter + Predicate (JSON-encoded predicate)
 // =====================================================================
@@ -547,7 +620,9 @@ fn parse_predicate_value(v: &serde_json::Value) -> std::result::Result<Predicate
         })
     };
     match kind {
-        "exists" => Ok(Predicate::Exists { key: field("field")? }),
+        "exists" => Ok(Predicate::Exists {
+            key: field("field")?,
+        }),
         "equals" => {
             let value = obj.get("value").and_then(|x| x.as_str()).ok_or(())?;
             Ok(Predicate::Equals {
@@ -731,11 +806,13 @@ fn aggregate_value_to_json(
         AV::Percentile(opt) => ("percentile", *opt, None),
         _ => ("unknown", None, None),
     };
-    let value_json = value.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
-    let count_json = count.map(|c| c.to_string()).unwrap_or_else(|| "null".to_string());
-    format!(
-        r#"{{"kind":"{kind}","value":{value_json},"count":{count_json}}}"#
-    )
+    let value_json = value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let count_json = count
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    format!(r#"{{"kind":"{kind}","value":{value_json},"count":{count_json}}}"#)
 }
 
 fn aggregate_to_json(
@@ -748,9 +825,7 @@ fn aggregate_to_json(
     )
 }
 
-fn joined_to_json(
-    p: &net::adapter::net::behavior::meshdb::query::JoinedRowPayload,
-) -> String {
+fn joined_to_json(p: &net::adapter::net::behavior::meshdb::query::JoinedRowPayload) -> String {
     let left = p
         .left
         .as_ref()
@@ -764,9 +839,7 @@ fn joined_to_json(
     format!(r#"{{"kind":"joined","left":{left},"right":{right}}}"#)
 }
 
-fn window_to_json(
-    b: &net::adapter::net::behavior::meshdb::query::WindowBoundary,
-) -> String {
+fn window_to_json(b: &net::adapter::net::behavior::meshdb::query::WindowBoundary) -> String {
     let rows: Vec<String> = b.rows.iter().map(row_to_json_value).collect();
     format!(
         r#"{{"kind":"window","start":{},"end":{},"rows":[{}]}}"#,
@@ -805,9 +878,7 @@ pub unsafe extern "C" fn net_meshdb_query_free(query: *mut MeshDbQuery) {
 /// `reader` must be a valid pointer returned by
 /// `net_meshdb_reader_new`, or null (which yields null).
 #[no_mangle]
-pub unsafe extern "C" fn net_meshdb_runner_new(
-    reader: *mut MeshDbReader,
-) -> *mut MeshDbRunner {
+pub unsafe extern "C" fn net_meshdb_runner_new(reader: *mut MeshDbReader) -> *mut MeshDbRunner {
     if reader.is_null() {
         return ptr::null_mut();
     }
@@ -816,8 +887,7 @@ pub unsafe extern "C" fn net_meshdb_runner_new(
         Ok(rt) => Arc::new(rt),
         Err(_) => return ptr::null_mut(),
     };
-    let executor: LocalMeshQueryExecutor<InMemoryStore> =
-        LocalMeshQueryExecutor::new(store);
+    let executor: LocalMeshQueryExecutor<InMemoryStore> = LocalMeshQueryExecutor::new(store);
     let runner = MeshDbRunner {
         runtime,
         executor: Arc::new(executor),
@@ -848,9 +918,8 @@ pub unsafe extern "C" fn net_meshdb_runner_new_cached(
         Ok(rt) => Arc::new(rt),
         Err(_) => return ptr::null_mut(),
     };
-    let cache: Arc<dyn net::adapter::net::behavior::meshdb::cache::ResultCache> = Arc::new(
-        net::adapter::net::behavior::meshdb::cache::LruResultCache::default(),
-    );
+    let cache: Arc<dyn net::adapter::net::behavior::meshdb::cache::ResultCache> =
+        Arc::new(net::adapter::net::behavior::meshdb::cache::LruResultCache::default());
     let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 0);
     let executor: LocalMeshQueryExecutor<InMemoryStore> =
         LocalMeshQueryExecutor::with_cache(store, cache, version_fn);
@@ -1237,8 +1306,7 @@ mod tests {
     fn decode_plain_row_returns_null() {
         unsafe {
             let bytes = b"plain event bytes";
-            let json_ptr =
-                net_meshdb_decode_payload_json(bytes.as_ptr(), bytes.len());
+            let json_ptr = net_meshdb_decode_payload_json(bytes.as_ptr(), bytes.len());
             assert!(json_ptr.is_null());
         }
     }
@@ -1256,10 +1324,8 @@ mod tests {
             let runner = net_meshdb_runner_new(reader);
             let between = net_meshdb_query_between(0xAB, 1, 10);
             let predicate_json =
-                std::ffi::CString::new(r#"{"kind":"equals","field":"seq","value":"2"}"#)
-                    .unwrap();
-            let filter =
-                net_meshdb_query_filter_json(between, predicate_json.as_ptr());
+                std::ffi::CString::new(r#"{"kind":"equals","field":"seq","value":"2"}"#).unwrap();
+            let filter = net_meshdb_query_filter_json(between, predicate_json.as_ptr());
             assert!(!filter.is_null());
             let iter = net_meshdb_runner_execute(runner, filter);
 
@@ -1293,8 +1359,7 @@ mod tests {
     fn ffi_filter_with_bad_json_returns_null() {
         unsafe {
             let inner = net_meshdb_query_latest(0x01);
-            let bad =
-                std::ffi::CString::new(r#"{"kind":"unknown","field":"x"}"#).unwrap();
+            let bad = std::ffi::CString::new(r#"{"kind":"unknown","field":"x"}"#).unwrap();
             let filter = net_meshdb_query_filter_json(inner, bad.as_ptr());
             assert!(filter.is_null());
             net_meshdb_query_free(inner);
@@ -1361,25 +1426,15 @@ mod tests {
             let query = net_meshdb_query_at(0x01, 1);
 
             // Execute with Permanent policy.
-            let iter1 = net_meshdb_runner_execute_with(
-                runner,
-                query,
-                0,
-                NET_MESHDB_CACHE_PERMANENT,
-                0.0,
-            );
+            let iter1 =
+                net_meshdb_runner_execute_with(runner, query, 0, NET_MESHDB_CACHE_PERMANENT, 0.0);
             assert!(!iter1.is_null());
             net_meshdb_iter_free(iter1);
 
             // Re-execute — should also succeed (cached hit
             // path doesn't change observable result).
-            let iter2 = net_meshdb_runner_execute_with(
-                runner,
-                query,
-                0,
-                NET_MESHDB_CACHE_PERMANENT,
-                0.0,
-            );
+            let iter2 =
+                net_meshdb_runner_execute_with(runner, query, 0, NET_MESHDB_CACHE_PERMANENT, 0.0);
             assert!(!iter2.is_null());
             net_meshdb_iter_free(iter2);
 
@@ -1437,6 +1492,66 @@ mod tests {
             net_meshdb_query_free(between);
             net_meshdb_runner_free(runner);
             net_meshdb_reader_free(reader);
+        }
+    }
+
+    #[test]
+    fn ffi_lineage_emit_yields_one_row_per_entry() {
+        unsafe {
+            let reader = net_meshdb_reader_new();
+            let runner = net_meshdb_runner_new(reader);
+            let entries =
+                std::ffi::CString::new(r#"[{"origin":170,"depth":0,"tip_seq":5},{"origin":187,"depth":1,"tip_seq":3},{"origin":204,"depth":2,"tip_seq":null}]"#)
+                    .unwrap();
+            let direction = std::ffi::CString::new("back").unwrap();
+            let query = net_meshdb_query_lineage_emit(0xAA, entries.as_ptr(), direction.as_ptr());
+            assert!(!query.is_null());
+            let iter = net_meshdb_runner_execute(runner, query);
+
+            let mut seen: Vec<(u64, u64)> = Vec::new();
+            loop {
+                let mut origin: u64 = 0;
+                let mut seq: u64 = 0;
+                let mut p_ptr: *mut u8 = ptr::null_mut();
+                let mut p_len: usize = 0;
+                let status =
+                    net_meshdb_iter_next(iter, &mut origin, &mut seq, &mut p_ptr, &mut p_len);
+                if status == NET_MESHDB_END {
+                    break;
+                }
+                assert_eq!(status, NET_MESHDB_OK);
+                seen.push((origin, seq));
+                assert_eq!(p_len, 0);
+                if !p_ptr.is_null() {
+                    net_meshdb_payload_free(p_ptr, p_len);
+                }
+            }
+            assert_eq!(seen, vec![(170, 5), (187, 3), (204, 0)]);
+
+            net_meshdb_iter_free(iter);
+            net_meshdb_query_free(query);
+            net_meshdb_runner_free(runner);
+            net_meshdb_reader_free(reader);
+        }
+    }
+
+    #[test]
+    fn ffi_lineage_emit_rejects_unknown_direction() {
+        unsafe {
+            let entries = std::ffi::CString::new("[]").unwrap();
+            let bad = std::ffi::CString::new("sideways").unwrap();
+            let q = net_meshdb_query_lineage_emit(0xAA, entries.as_ptr(), bad.as_ptr());
+            assert!(q.is_null());
+        }
+    }
+
+    #[test]
+    fn ffi_lineage_emit_rejects_malformed_json() {
+        unsafe {
+            let bad = std::ffi::CString::new("not json").unwrap();
+            let dir = std::ffi::CString::new("back").unwrap();
+            let q = net_meshdb_query_lineage_emit(0xAA, bad.as_ptr(), dir.as_ptr());
+            assert!(q.is_null());
         }
     }
 }

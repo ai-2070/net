@@ -820,6 +820,96 @@ d('MeshDB QueryBuilder (slice 4)', () => {
 });
 
 // ---------------------------------------------------------------------
+// Lineage emit: pre-walked entries form. The SDK doesn't itself walk
+// the fork-of: graph; callers hand in entries in walk order.
+// ---------------------------------------------------------------------
+
+d('MeshDB lineage_emit', () => {
+  const { MeshQuery, MeshQueryRunner, InMemoryChainReader } = symbols as {
+    MeshQuery: typeof import('../index').MeshQuery;
+    MeshQueryRunner: typeof import('../index').MeshQueryRunner;
+    InMemoryChainReader: typeof import('../index').InMemoryChainReader;
+  };
+
+  it('emits one row per entry in walk order', async () => {
+    const runner = new MeshQueryRunner(new InMemoryChainReader());
+    const q = (
+      MeshQuery as unknown as {
+        lineageEmit: (
+          origin: bigint,
+          entries: Array<{ originHash: bigint; depth: number; tipSeq?: bigint | null }>,
+          direction: string,
+        ) => InstanceType<typeof MeshQuery>;
+      }
+    ).lineageEmit(
+      0xaan,
+      [
+        { originHash: 0xaan, depth: 0, tipSeq: 5n },
+        { originHash: 0xbbn, depth: 1, tipSeq: 3n },
+        { originHash: 0xccn, depth: 2 },
+      ],
+      'back',
+    );
+    const stream = await runner.execute(q);
+    const rows = await stream.toArray();
+    expect(rows.map((r: { originHash: bigint; seq: bigint }) => [r.originHash, r.seq])).toEqual([
+      [0xaan, 5n],
+      [0xbbn, 3n],
+      [0xccn, 0n],
+    ]);
+    expect(rows.every((r: { payload: Uint8Array }) => r.payload.length === 0)).toBe(true);
+  });
+
+  it('accepts forward direction', async () => {
+    const runner = new MeshQueryRunner(new InMemoryChainReader());
+    const q = (
+      MeshQuery as unknown as {
+        lineageEmit: (
+          origin: bigint,
+          entries: Array<{ originHash: bigint; depth: number; tipSeq?: bigint | null }>,
+          direction: string,
+        ) => InstanceType<typeof MeshQuery>;
+      }
+    ).lineageEmit(0xaan, [{ originHash: 0xaan, depth: 0, tipSeq: 1n }], 'forward');
+    const stream = await runner.execute(q);
+    const rows = await stream.toArray();
+    expect(rows.map((r: { originHash: bigint; seq: bigint }) => [r.originHash, r.seq])).toEqual([
+      [0xaan, 1n],
+    ]);
+  });
+
+  it('rejects an unknown direction', () => {
+    expect(() =>
+      (
+        MeshQuery as unknown as {
+          lineageEmit: (
+            origin: bigint,
+            entries: Array<{ originHash: bigint; depth: number }>,
+            direction: string,
+          ) => unknown;
+        }
+      ).lineageEmit(0xaan, [{ originHash: 0xaan, depth: 0 }], 'sideways'),
+    ).toThrow();
+  });
+
+  it('empty entries yield an empty stream', async () => {
+    const runner = new MeshQueryRunner(new InMemoryChainReader());
+    const q = (
+      MeshQuery as unknown as {
+        lineageEmit: (
+          origin: bigint,
+          entries: Array<{ originHash: bigint; depth: number }>,
+          direction: string,
+        ) => InstanceType<typeof MeshQuery>;
+      }
+    ).lineageEmit(0xaan, [], 'back');
+    const stream = await runner.execute(q);
+    const rows = await stream.toArray();
+    expect(rows).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------
 // AsyncIterable shim: `for await (const row of stream) { ... }`.
 // ---------------------------------------------------------------------
 

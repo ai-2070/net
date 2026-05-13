@@ -58,17 +58,20 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use tokio::runtime::Runtime;
 
+use net::adapter::net::behavior::meshdb::MeshError;
 use net::adapter::net::behavior::meshdb::{
     cache::{CachePolicy, LruResultCache},
     executor::{ChainReader, ExecuteOptions, LocalMeshQueryExecutor, MeshQueryExecutor},
-    planner::{CostEstimate, JoinKeyMode, JoinStrategy, OperatorNode, OperatorPlan},
+    planner::{
+        CostEstimate, JoinKeyMode, JoinStrategy, LineageDirection, LineageEntry, OperatorNode,
+        OperatorPlan,
+    },
     query::{
         AggregateRowPayload, AggregateValue, GroupKey, JoinKind, JoinedRowPayload,
         NumericAggregateKind, NumericReductionKind, ResultRow, WindowBoundary, WindowSpec,
     },
     ExecutionPlan, SeqNum,
 };
-use net::adapter::net::behavior::meshdb::MeshError;
 use net::adapter::net::behavior::predicate::Predicate;
 use net::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
 
@@ -413,9 +416,7 @@ impl PyExecuteOptions {
         Self {
             inner: ExecuteOptions {
                 bypass_cache,
-                cache_policy: cache_policy
-                    .map(|p| p.inner)
-                    .unwrap_or_default(),
+                cache_policy: cache_policy.map(|p| p.inner).unwrap_or_default(),
             },
         }
     }
@@ -628,9 +629,7 @@ impl PyMeshQuery {
             origin,
             seq: SeqNum(seq),
         };
-        Self {
-            plan: plan_of(op),
-        }
+        Self { plan: plan_of(op) }
     }
 
     /// Read events in the half-open seq range `[start, end)`
@@ -647,18 +646,14 @@ impl PyMeshQuery {
             start: SeqNum(start),
             end: SeqNum(end),
         };
-        Ok(Self {
-            plan: plan_of(op),
-        })
+        Ok(Self { plan: plan_of(op) })
     }
 
     /// Read the tip event from chain `origin`.
     #[staticmethod]
     fn latest(origin: u64) -> Self {
         let op = OperatorPlan::LatestRead { origin };
-        Self {
-            plan: plan_of(op),
-        }
+        Self { plan: plan_of(op) }
     }
 
     /// Start a fluent builder. Equivalent to constructing a
@@ -686,9 +681,7 @@ impl PyMeshQuery {
             input: Box::new(inner.plan.root.clone()),
             predicate: predicate.inner.to_wire(),
         };
-        Self {
-            plan: plan_of(op),
-        }
+        Self { plan: plan_of(op) }
     }
 
     /// Tumbling window on `seq` with the given bucket `size`.
@@ -705,9 +698,7 @@ impl PyMeshQuery {
             input: Box::new(inner.plan.root.clone()),
             spec: WindowSpec::TumblingSeq { size },
         };
-        Ok(Self {
-            plan: plan_of(op),
-        })
+        Ok(Self { plan: plan_of(op) })
     }
 
     /// Count rows. `group_by` is an optional list of row-
@@ -722,9 +713,7 @@ impl PyMeshQuery {
             input: Box::new(inner.plan.root.clone()),
             group_by,
         };
-        Ok(Self {
-            plan: plan_of(op),
-        })
+        Ok(Self { plan: plan_of(op) })
     }
 
     /// Sum of a numeric field across rows. `field` is a row-
@@ -775,7 +764,12 @@ impl PyMeshQuery {
                 "percentile: p must be in [0.0, 1.0], got {p}"
             )));
         }
-        Self::reduction(inner, field, NumericReductionKind::Percentile { p }, group_by)
+        Self::reduction(
+            inner,
+            field,
+            NumericReductionKind::Percentile { p },
+            group_by,
+        )
     }
 
     /// Exact distinct count over the canonical string
@@ -794,9 +788,7 @@ impl PyMeshQuery {
             group_by,
             field_path: field,
         };
-        Ok(Self {
-            plan: plan_of(op),
-        })
+        Ok(Self { plan: plan_of(op) })
     }
 
     /// Inner / outer hash-join over row-intrinsic or JSON
@@ -807,6 +799,39 @@ impl PyMeshQuery {
     /// (`origin` / `seq` / `origin,seq`); anything else is
     /// treated as a JSON payload path. `strategy` is
     /// `"hash_broadcast"` (default) or `"sort_merge"`.
+    /// Emit a pre-walked lineage as one ResultRow per entry.
+    /// `entries` is a list of `LineageEntry` describing the
+    /// chains reached during the walk (typically: index 0 is
+    /// the start origin with `depth = 0`, ancestors / descendants
+    /// follow). `direction` is `"back"` or `"forward"`.
+    ///
+    /// The walk itself is the caller's responsibility (SDK
+    /// consumers maintain their own fork-of: graph view, or
+    /// call into a future SDK-side walker). The executor just
+    /// emits rows; each `entry` produces a `ResultRow` with
+    /// `origin = entry.origin`, `seq = entry.tip_seq or 0`,
+    /// payload empty. Callers compose with `at` / `between`
+    /// to fetch event content for each ancestor.
+    #[staticmethod]
+    #[pyo3(signature = (origin, entries, direction))]
+    fn lineage_emit(origin: u64, entries: Vec<PyLineageEntry>, direction: &str) -> PyResult<Self> {
+        let direction = parse_lineage_direction(direction)?;
+        let entries: Vec<LineageEntry> = entries
+            .into_iter()
+            .map(|e| LineageEntry {
+                origin: e.origin,
+                depth: e.depth,
+                tip_seq: e.tip_seq.map(SeqNum),
+            })
+            .collect();
+        let op = OperatorPlan::LineageEmit {
+            origin,
+            direction,
+            entries,
+        };
+        Ok(Self { plan: plan_of(op) })
+    }
+
     /// `watermark_secs` is informational under snapshot
     /// semantics; kept on the operator for wire round-trip.
     #[staticmethod]
@@ -840,9 +865,7 @@ impl PyMeshQuery {
             strategy,
             watermark,
         };
-        Ok(Self {
-            plan: plan_of(op),
-        })
+        Ok(Self { plan: plan_of(op) })
     }
 
     fn __repr__(&self) -> String {
@@ -881,6 +904,14 @@ impl PyMeshQuery {
             OperatorPlan::HashJoin { kind, .. } => {
                 format!("MeshQuery.join(kind={kind:?})")
             }
+            OperatorPlan::LineageEmit {
+                origin,
+                direction,
+                entries,
+            } => format!(
+                "MeshQuery.lineage_emit(origin={origin:#x}, direction={direction:?}, entries=<{} entries>)",
+                entries.len()
+            ),
             OperatorPlan::Filter { .. } => "MeshQuery.filter(...)".to_string(),
             // Slice 2 doesn't yet expose factories for these
             // (Filter needs a Predicate surface; LineageBack /
@@ -907,9 +938,7 @@ impl PyMeshQuery {
             field_path: field,
             kind,
         };
-        Ok(Self {
-            plan: plan_of(op),
-        })
+        Ok(Self { plan: plan_of(op) })
     }
 
     fn reduction(
@@ -925,9 +954,7 @@ impl PyMeshQuery {
             field_path: field,
             kind,
         };
-        Ok(Self {
-            plan: plan_of(op),
-        })
+        Ok(Self { plan: plan_of(op) })
     }
 }
 
@@ -1086,12 +1113,7 @@ impl PyQueryBuilder {
     }
 
     #[pyo3(signature = (field, p, group_by=None))]
-    fn percentile(
-        &self,
-        field: String,
-        p: f64,
-        group_by: Option<Vec<String>>,
-    ) -> PyResult<Self> {
+    fn percentile(&self, field: String, p: f64, group_by: Option<Vec<String>>) -> PyResult<Self> {
         let inner = self.require_state("percentile")?;
         Ok(Self {
             state: Some(PyMeshQuery::percentile(&inner, field, p, group_by)?),
@@ -1099,11 +1121,7 @@ impl PyQueryBuilder {
     }
 
     #[pyo3(signature = (field, group_by=None))]
-    fn distinct_count(
-        &self,
-        field: String,
-        group_by: Option<Vec<String>>,
-    ) -> PyResult<Self> {
+    fn distinct_count(&self, field: String, group_by: Option<Vec<String>>) -> PyResult<Self> {
         let inner = self.require_state("distinct_count")?;
         Ok(Self {
             state: Some(PyMeshQuery::distinct_count(&inner, field, group_by)?),
@@ -1167,6 +1185,65 @@ impl PyQueryBuilder {
                 "{op}: builder has no source — call .at(...), .between(...), or .latest(...) first"
             ))
         })
+    }
+}
+
+/// One chain reached during a lineage walk. Pre-walked by the
+/// caller and handed to `MeshQuery.lineage_emit(...)`. The SDK
+/// doesn't itself walk the `fork-of:` graph — that needs a
+/// `CapabilityIndex`, which isn't plumbed through the Python
+/// runner yet. Callers maintain their own graph view and emit
+/// entries in walk order: index 0 is the start origin with
+/// `depth = 0`, ancestors / descendants follow.
+#[pyclass(name = "LineageEntry", module = "net._net", frozen, from_py_object)]
+#[derive(Clone)]
+pub struct PyLineageEntry {
+    /// Chain origin hash (substrate `u64`).
+    #[pyo3(get)]
+    pub origin: u64,
+    /// Hops from the walk's start. `0` for the start origin.
+    #[pyo3(get)]
+    pub depth: u32,
+    /// Best-known tip seq for this chain, if any. Surfaces in
+    /// the emitted row's `seq` field (defaults to `0` when
+    /// `None`).
+    #[pyo3(get)]
+    pub tip_seq: Option<u64>,
+}
+
+#[pymethods]
+impl PyLineageEntry {
+    #[new]
+    #[pyo3(signature = (origin, depth, tip_seq=None))]
+    fn new(origin: u64, depth: u32, tip_seq: Option<u64>) -> Self {
+        Self {
+            origin,
+            depth,
+            tip_seq,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        match self.tip_seq {
+            None => format!(
+                "LineageEntry(origin={:#x}, depth={})",
+                self.origin, self.depth
+            ),
+            Some(t) => format!(
+                "LineageEntry(origin={:#x}, depth={}, tip_seq={})",
+                self.origin, self.depth, t
+            ),
+        }
+    }
+}
+
+fn parse_lineage_direction(s: &str) -> PyResult<LineageDirection> {
+    match s {
+        "back" => Ok(LineageDirection::Back),
+        "forward" => Ok(LineageDirection::Forward),
+        other => Err(MeshDbError::new_err(format!(
+            "lineage direction '{other}' not recognised; expected 'back' or 'forward'"
+        ))),
     }
 }
 
@@ -1277,9 +1354,8 @@ impl PyMeshQueryRunner {
     #[new]
     #[pyo3(signature = (reader, enable_cache=false))]
     fn new(reader: &PyInMemoryChainReader, enable_cache: bool) -> PyResult<Self> {
-        let runtime = Runtime::new().map_err(|e| {
-            MeshDbError::new_err(format!("failed to construct tokio runtime: {e}"))
-        })?;
+        let runtime = Runtime::new()
+            .map_err(|e| MeshDbError::new_err(format!("failed to construct tokio runtime: {e}")))?;
         let store = reader.inner.clone();
         let executor: LocalMeshQueryExecutor<InMemoryStore> = if enable_cache {
             let cache: Arc<dyn net::adapter::net::behavior::meshdb::cache::ResultCache> =

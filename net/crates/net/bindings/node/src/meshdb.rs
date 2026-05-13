@@ -51,14 +51,14 @@ use net::adapter::net::behavior::meshdb::{
         LocalMeshQueryExecutor, MeshQueryExecutor,
     },
     planner::{
-        CostEstimate, JoinKeyMode, JoinStrategy, OperatorNode, OperatorPlan,
+        CostEstimate, JoinKeyMode, JoinStrategy, LineageDirection,
+        LineageEntry as InnerLineageEntry, OperatorNode, OperatorPlan,
     },
     query::{
-        AggregateRowPayload as InnerAggregateRowPayload,
-        AggregateValue as InnerAggregateValue, GroupKey as InnerGroupKey,
-        JoinKind as InnerJoinKind, JoinedRowPayload as InnerJoinedRowPayload,
-        NumericAggregateKind, NumericReductionKind, ResultRow as InnerResultRow,
-        WindowBoundary as InnerWindowBoundary, WindowSpec,
+        AggregateRowPayload as InnerAggregateRowPayload, AggregateValue as InnerAggregateValue,
+        GroupKey as InnerGroupKey, JoinKind as InnerJoinKind,
+        JoinedRowPayload as InnerJoinedRowPayload, NumericAggregateKind, NumericReductionKind,
+        ResultRow as InnerResultRow, WindowBoundary as InnerWindowBoundary, WindowSpec,
     },
     ExecutionPlan, SeqNum,
 };
@@ -157,6 +157,27 @@ pub struct WindowBoundary {
     pub start: BigInt,
     pub end: BigInt,
     pub rows: Vec<ResultRow>,
+}
+
+/// One chain reached during a lineage walk. Pre-walked by the
+/// caller and handed to `MeshQuery.lineageEmit(...)`. The SDK
+/// doesn't itself walk the `fork-of:` graph — that needs a
+/// `CapabilityIndex`, which isn't plumbed through the Node
+/// runner yet. Callers maintain their own graph view and emit
+/// entries in walk order: index 0 is the start origin with
+/// `depth = 0`; ancestors / descendants follow.
+#[napi(object)]
+pub struct LineageEntry {
+    /// Chain origin hash (substrate `u64`).
+    #[napi(js_name = "originHash")]
+    pub origin_hash: BigInt,
+    /// Hops from the walk's start. `0` for the start origin.
+    pub depth: u32,
+    /// Best-known tip seq for this chain, if any. Surfaces in
+    /// the emitted row's `seq` field (defaults to `0` when
+    /// absent).
+    #[napi(js_name = "tipSeq")]
+    pub tip_seq: Option<BigInt>,
 }
 
 fn aggregate_result_from(p: InnerAggregateRowPayload) -> AggregateResult {
@@ -338,9 +359,7 @@ impl MeshQuery {
             origin,
             seq: SeqNum(seq),
         };
-        Ok(Self {
-            plan: plan_of(op),
-        })
+        Ok(Self { plan: plan_of(op) })
     }
 
     /// Read events in the half-open seq range `[start, end)`.
@@ -359,9 +378,7 @@ impl MeshQuery {
             start: SeqNum(start),
             end: SeqNum(end),
         };
-        Ok(Self {
-            plan: plan_of(op),
-        })
+        Ok(Self { plan: plan_of(op) })
     }
 
     /// Read the tip event from chain `originHash`.
@@ -436,42 +453,26 @@ impl MeshQuery {
     /// Sum of a numeric field across rows. `field` is a row-
     /// intrinsic name (`origin` / `seq`) or a dotted JSON path.
     #[napi(factory)]
-    pub fn sum(
-        inner: &MeshQuery,
-        field: String,
-        group_by: Option<Vec<String>>,
-    ) -> Result<Self> {
+    pub fn sum(inner: &MeshQuery, field: String, group_by: Option<Vec<String>>) -> Result<Self> {
         Self::numeric_agg(inner, field, NumericAggregateKind::Sum, group_by)
     }
 
     /// Arithmetic mean. Rows where the field is missing /
     /// non-numeric are excluded from both numerator + denom.
     #[napi(factory)]
-    pub fn avg(
-        inner: &MeshQuery,
-        field: String,
-        group_by: Option<Vec<String>>,
-    ) -> Result<Self> {
+    pub fn avg(inner: &MeshQuery, field: String, group_by: Option<Vec<String>>) -> Result<Self> {
         Self::numeric_agg(inner, field, NumericAggregateKind::Avg, group_by)
     }
 
     /// Minimum value of a numeric field.
     #[napi(factory)]
-    pub fn min(
-        inner: &MeshQuery,
-        field: String,
-        group_by: Option<Vec<String>>,
-    ) -> Result<Self> {
+    pub fn min(inner: &MeshQuery, field: String, group_by: Option<Vec<String>>) -> Result<Self> {
         Self::reduction(inner, field, NumericReductionKind::Min, group_by)
     }
 
     /// Maximum value of a numeric field.
     #[napi(factory)]
-    pub fn max(
-        inner: &MeshQuery,
-        field: String,
-        group_by: Option<Vec<String>>,
-    ) -> Result<Self> {
+    pub fn max(inner: &MeshQuery, field: String, group_by: Option<Vec<String>>) -> Result<Self> {
         Self::reduction(inner, field, NumericReductionKind::Max, group_by)
     }
 
@@ -489,7 +490,12 @@ impl MeshQuery {
                 "percentile: p must be in [0.0, 1.0], got {p}"
             )));
         }
-        Self::reduction(inner, field, NumericReductionKind::Percentile { p }, group_by)
+        Self::reduction(
+            inner,
+            field,
+            NumericReductionKind::Percentile { p },
+            group_by,
+        )
     }
 
     /// Exact distinct count over the canonical string
@@ -552,6 +558,41 @@ impl MeshQuery {
                 kind,
                 strategy,
                 watermark,
+            }),
+        })
+    }
+
+    /// Emit a pre-walked lineage as one row per entry. `entries`
+    /// is a list of `LineageEntry` in walk order; `direction` is
+    /// `"back"` or `"forward"`. Each entry emits a `ResultRow`
+    /// with `originHash = entry.originHash`, `seq = entry.tipSeq
+    /// ?? 0`, payload empty. Compose with `at` / `between` to
+    /// fetch event content for each chain.
+    #[napi(factory, js_name = "lineageEmit")]
+    pub fn lineage_emit(
+        origin_hash: BigInt,
+        entries: Vec<LineageEntry>,
+        direction: String,
+    ) -> Result<Self> {
+        let origin = bigint_u64(origin_hash)?;
+        let direction = parse_lineage_direction(&direction)?;
+        let entries = entries
+            .into_iter()
+            .map(|e| -> Result<InnerLineageEntry> {
+                let entry_origin = bigint_u64(e.origin_hash)?;
+                let tip_seq = e.tip_seq.map(bigint_u64).transpose()?.map(SeqNum);
+                Ok(InnerLineageEntry {
+                    origin: entry_origin,
+                    depth: e.depth,
+                    tip_seq,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            plan: plan_of(OperatorPlan::LineageEmit {
+                origin,
+                direction,
+                entries,
             }),
         })
     }
@@ -738,12 +779,7 @@ impl QueryBuilder {
 
     /// Nearest-rank percentile.
     #[napi]
-    pub fn percentile(
-        &self,
-        field: String,
-        p: f64,
-        group_by: Option<Vec<String>>,
-    ) -> Result<Self> {
+    pub fn percentile(&self, field: String, p: f64, group_by: Option<Vec<String>>) -> Result<Self> {
         let inner = self.require_state("percentile")?;
         Ok(Self {
             state: Some(MeshQuery::percentile(&inner, field, p, group_by)?),
@@ -752,11 +788,7 @@ impl QueryBuilder {
 
     /// Exact distinct count.
     #[napi(js_name = "distinctCount")]
-    pub fn distinct_count(
-        &self,
-        field: String,
-        group_by: Option<Vec<String>>,
-    ) -> Result<Self> {
+    pub fn distinct_count(&self, field: String, group_by: Option<Vec<String>>) -> Result<Self> {
         let inner = self.require_state("distinctCount")?;
         Ok(Self {
             state: Some(MeshQuery::distinct_count(&inner, field, group_by)?),
@@ -820,6 +852,16 @@ fn parse_join_strategy(s: Option<&str>) -> Result<JoinStrategy> {
         Some("sort_merge") => Ok(JoinStrategy::SortMerge),
         Some(other) => Err(mesh_err(format!(
             "join strategy '{other}' not recognised; expected hash_broadcast / sort_merge"
+        ))),
+    }
+}
+
+fn parse_lineage_direction(s: &str) -> Result<LineageDirection> {
+    match s {
+        "back" => Ok(LineageDirection::Back),
+        "forward" => Ok(LineageDirection::Forward),
+        other => Err(mesh_err(format!(
+            "lineage direction '{other}' not recognised; expected 'back' or 'forward'"
         ))),
     }
 }
@@ -1011,11 +1053,9 @@ fn tag_key(field: &str) -> TagKey {
 
 fn predicate_to_inner(p: Predicate) -> Result<InnerPredicate> {
     let need_field = |p: &Predicate, kind: &str| {
-        p.field.clone().ok_or_else(|| {
-            mesh_err(format!(
-                "predicate '{kind}' requires `field`",
-            ))
-        })
+        p.field
+            .clone()
+            .ok_or_else(|| mesh_err(format!("predicate '{kind}' requires `field`",)))
     };
     match p.kind.as_str() {
         "exists" => Ok(InnerPredicate::Exists {
@@ -1046,19 +1086,18 @@ fn predicate_to_inner(p: Predicate) -> Result<InnerPredicate> {
         }),
         "numeric_in_range" => Ok(InnerPredicate::NumericInRange {
             key: tag_key(&need_field(&p, "numeric_in_range")?),
-            min: p
-                .min
-                .ok_or_else(|| mesh_err("predicate 'numeric_in_range' requires `min`".to_string()))?,
-            max: p
-                .max
-                .ok_or_else(|| mesh_err("predicate 'numeric_in_range' requires `max`".to_string()))?,
+            min: p.min.ok_or_else(|| {
+                mesh_err("predicate 'numeric_in_range' requires `min`".to_string())
+            })?,
+            max: p.max.ok_or_else(|| {
+                mesh_err("predicate 'numeric_in_range' requires `max`".to_string())
+            })?,
         }),
         "string_prefix" => Ok(InnerPredicate::StringPrefix {
             key: tag_key(&need_field(&p, "string_prefix")?),
-            prefix: p
-                .prefix
-                .clone()
-                .ok_or_else(|| mesh_err("predicate 'string_prefix' requires `prefix`".to_string()))?,
+            prefix: p.prefix.clone().ok_or_else(|| {
+                mesh_err("predicate 'string_prefix' requires `prefix`".to_string())
+            })?,
         }),
         "string_matches" => Ok(InnerPredicate::StringMatches {
             key: tag_key(&need_field(&p, "string_matches")?),
@@ -1100,9 +1139,7 @@ fn predicate_to_inner(p: Predicate) -> Result<InnerPredicate> {
                 children.remove(0),
             )?)))
         }
-        other => Err(mesh_err(format!(
-            "unknown predicate kind '{other}'"
-        ))),
+        other => Err(mesh_err(format!("unknown predicate kind '{other}'"))),
     }
 }
 

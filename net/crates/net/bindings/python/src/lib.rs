@@ -2334,6 +2334,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<meshdb::PyGroupKey>()?;
         m.add_class::<meshdb::PyJoinedRow>()?;
         m.add_class::<meshdb::PyWindowBoundary>()?;
+        m.add_class::<meshdb::PyLineageEntry>()?;
         m.add_class::<meshdb::PyPredicate>()?;
         m.add_class::<meshdb::PyQueryBuilder>()?;
         m.add("MeshDbError", m.py().get_type::<meshdb::MeshDbError>())?;

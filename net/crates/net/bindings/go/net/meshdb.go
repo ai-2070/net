@@ -128,6 +128,15 @@ extern MeshDbQuery* net_meshdb_query_join(
     double watermark_secs
 );
 
+// LineageEmit: pre-walked entries form. `entries_json` is a JSON
+// array of {"origin":N,"depth":N,"tip_seq":N|null}; `direction` is
+// "back" or "forward". Returns null on parse error or invalid args.
+extern MeshDbQuery* net_meshdb_query_lineage_emit(
+    uint64_t origin,
+    const char* entries_json,
+    const char* direction
+);
+
 // Slice 2: payload decoder (JSON intermediate). Returns null
 // when the payload isn't a postcard-encoded aggregate / joined /
 // window envelope.
@@ -652,6 +661,66 @@ func MeshDBQueryJoin(
 	if ptr == nil {
 		return nil, fmt.Errorf(
 			"join: factory returned null (check kind / key / strategy): %w",
+			ErrMeshDBInvalidArg,
+		)
+	}
+	q := &MeshDBQuery{ptr: ptr}
+	runtime.SetFinalizer(q, func(q *MeshDBQuery) { q.Free() })
+	return q, nil
+}
+
+// MeshDBLineageEntry describes one chain reached during a
+// lineage walk. Pre-walked by the caller and handed to
+// `MeshDBQueryLineageEmit(...)`. The SDK doesn't itself walk
+// the fork-of: graph; callers maintain their own graph view
+// and emit entries in walk order: index 0 is the start origin
+// with Depth = 0; ancestors / descendants follow.
+//
+// `TipSeq == nil` means "no known tip" — the emitted row's
+// Seq defaults to 0 in that case.
+type MeshDBLineageEntry struct {
+	Origin uint64
+	Depth  uint32
+	TipSeq *uint64
+}
+
+// MeshDBQueryLineageEmit constructs a `LineageEmit(origin,
+// entries, direction)` query. `direction` is "back" or
+// "forward". Each entry produces one ResultRow with origin =
+// entry.Origin, seq = entry.TipSeq (or 0), payload empty.
+// Compose with At / Between to fetch event content per chain.
+func MeshDBQueryLineageEmit(
+	origin uint64,
+	entries []MeshDBLineageEntry,
+	direction string,
+) (*MeshDBQuery, error) {
+	if direction != "back" && direction != "forward" {
+		return nil, fmt.Errorf(
+			"lineage_emit: direction %q not recognised (want 'back' or 'forward'): %w",
+			direction, ErrMeshDBInvalidArg,
+		)
+	}
+	type wireEntry struct {
+		Origin uint64  `json:"origin"`
+		Depth  uint32  `json:"depth"`
+		TipSeq *uint64 `json:"tip_seq"`
+	}
+	wire := make([]wireEntry, 0, len(entries))
+	for _, e := range entries {
+		wire = append(wire, wireEntry{Origin: e.Origin, Depth: e.Depth, TipSeq: e.TipSeq})
+	}
+	jsonBytes, err := json.Marshal(wire)
+	if err != nil {
+		return nil, fmt.Errorf("lineage_emit: marshal entries: %w", ErrMeshDBInvalidArg)
+	}
+	entriesC := C.CString(string(jsonBytes))
+	defer C.free(unsafe.Pointer(entriesC))
+	dirC := C.CString(direction)
+	defer C.free(unsafe.Pointer(dirC))
+	ptr := C.net_meshdb_query_lineage_emit(C.uint64_t(origin), entriesC, dirC)
+	if ptr == nil {
+		return nil, fmt.Errorf(
+			"lineage_emit: factory returned null (check entries JSON): %w",
 			ErrMeshDBInvalidArg,
 		)
 	}

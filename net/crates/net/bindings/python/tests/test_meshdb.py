@@ -16,6 +16,7 @@ try:
         GroupKey,
         InMemoryChainReader,
         JoinedRow,
+        LineageEntry,
         MeshDbError,
         MeshQuery,
         MeshQueryRunner,
@@ -807,3 +808,59 @@ def test_builder_repr_reflects_current_state() -> None:
     assert "between" in repr(b2)
     b3 = b2.count()
     assert "count" in repr(b3)
+
+
+def test_lineage_entry_constructor_and_repr() -> None:
+    e = LineageEntry(0xAA, 0)
+    assert e.origin == 0xAA
+    assert e.depth == 0
+    assert e.tip_seq is None
+    assert "LineageEntry" in repr(e) and "depth=0" in repr(e)
+    e2 = LineageEntry(0xBB, 1, 7)
+    assert e2.tip_seq == 7
+    assert "tip_seq=7" in repr(e2)
+
+
+def test_lineage_emit_yields_one_row_per_entry() -> None:
+    runner = MeshQueryRunner(InMemoryChainReader())
+    q = MeshQuery.lineage_emit(
+        0xAA,
+        [
+            LineageEntry(0xAA, 0, 5),
+            LineageEntry(0xBB, 1, 3),
+            LineageEntry(0xCC, 2),
+        ],
+        "back",
+    )
+    rows = runner.execute(q)
+    assert [(r.origin, r.seq) for r in rows] == [(0xAA, 5), (0xBB, 3), (0xCC, 0)]
+    assert all(r.payload == b"" for r in rows)
+
+
+def test_lineage_emit_forward_direction_accepted() -> None:
+    runner = MeshQueryRunner(InMemoryChainReader())
+    q = MeshQuery.lineage_emit(0xAA, [LineageEntry(0xAA, 0, 1)], "forward")
+    rows = runner.execute(q)
+    assert [(r.origin, r.seq) for r in rows] == [(0xAA, 1)]
+
+
+def test_lineage_emit_rejects_unknown_direction() -> None:
+    with pytest.raises(MeshDbError):
+        MeshQuery.lineage_emit(0xAA, [LineageEntry(0xAA, 0)], "sideways")
+
+
+def test_lineage_emit_empty_entries_returns_no_rows() -> None:
+    runner = MeshQueryRunner(InMemoryChainReader())
+    q = MeshQuery.lineage_emit(0xAA, [], "back")
+    assert runner.execute(q) == []
+
+
+def test_lineage_emit_repr_includes_entry_count() -> None:
+    q = MeshQuery.lineage_emit(
+        0xAA,
+        [LineageEntry(0xAA, 0), LineageEntry(0xBB, 1)],
+        "back",
+    )
+    rep = repr(q)
+    assert "lineage_emit" in rep
+    assert "2 entries" in rep
