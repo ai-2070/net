@@ -10,13 +10,17 @@ import pytest
 
 try:
     from net import (
+        AggregateResult,
         CachePolicy,
         ExecuteOptions,
+        GroupKey,
         InMemoryChainReader,
+        JoinedRow,
         MeshDbError,
         MeshQuery,
         MeshQueryRunner,
         ResultRow,
+        WindowBoundary,
     )
 except ImportError:
     pytest.skip(
@@ -135,3 +139,271 @@ def test_result_row_payload_is_bytes() -> None:
     rows = runner.execute(MeshQuery.at(0x01, 1))
     assert isinstance(rows[0].payload, (bytes, bytearray))
     assert bytes(rows[0].payload) == b"\x00\x01\x02"
+
+
+# ---------------------------------------------------------------------
+# Slice 2: composite-operator factories + result decoders.
+# ---------------------------------------------------------------------
+
+
+def test_count_no_group_by_returns_single_aggregate_row() -> None:
+    chain = 0xABCD
+    reader = _reader_with([(chain, s, b"") for s in range(1, 6)])
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.count(MeshQuery.between(chain, 1, 10))
+    rows = runner.execute(q)
+    assert len(rows) == 1
+    agg = rows[0].decode_aggregate()
+    assert agg is not None
+    assert agg.group is None
+    assert agg.kind == "count"
+    assert agg.count == 5
+    assert agg.value == 5.0
+
+
+def test_count_group_by_origin_returns_one_row_per_origin() -> None:
+    reader = _reader_with(
+        [
+            (0xAA, 1, b""),
+            (0xAA, 2, b""),
+            (0xBB, 1, b""),
+            (0xBB, 2, b""),
+            (0xBB, 3, b""),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    # Window over both chains, then count grouped by origin.
+    # (Slice 2 doesn't ship Union; we test the group_by path by
+    # feeding both chains through a `between` over a single
+    # origin at a time and verifying single-bucket behavior is
+    # consistent.)
+    q = MeshQuery.count(MeshQuery.between(0xBB, 1, 10), group_by=["origin"])
+    rows = runner.execute(q)
+    decoded = [r.decode_aggregate() for r in rows]
+    assert len(decoded) == 1
+    assert decoded[0].kind == "count"
+    assert decoded[0].group is not None
+    assert decoded[0].group.kind == "origin"
+    assert decoded[0].group.origin == 0xBB
+    assert decoded[0].count == 3
+
+
+def test_sum_avg_min_max_on_seq() -> None:
+    chain = 0xAB
+    reader = _reader_with([(chain, s, b"") for s in (1, 3, 7, 11)])
+    runner = MeshQueryRunner(reader)
+    base = MeshQuery.between(chain, 1, 20)
+    rows_sum = runner.execute(MeshQuery.sum(base, "seq"))
+    rows_avg = runner.execute(MeshQuery.avg(base, "seq"))
+    rows_min = runner.execute(MeshQuery.min(base, "seq"))
+    rows_max = runner.execute(MeshQuery.max(base, "seq"))
+    assert rows_sum[0].decode_aggregate().value == 22.0
+    assert rows_avg[0].decode_aggregate().value == pytest.approx(5.5)
+    assert rows_min[0].decode_aggregate().value == 1.0
+    assert rows_max[0].decode_aggregate().value == 11.0
+
+
+def test_percentile_nearest_rank_on_seq() -> None:
+    chain = 0xAB
+    reader = _reader_with([(chain, s, b"") for s in range(1, 11)])
+    runner = MeshQueryRunner(reader)
+    # p=0.9 → floor(0.9 * 9) = 8 → 9th element (0-indexed) = 9
+    q = MeshQuery.percentile(MeshQuery.between(chain, 1, 20), "seq", 0.9)
+    rows = runner.execute(q)
+    assert rows[0].decode_aggregate().value == 9.0
+
+
+def test_percentile_rejects_out_of_range_p() -> None:
+    base = MeshQuery.latest(0xAA)
+    with pytest.raises(MeshDbError):
+        MeshQuery.percentile(base, "seq", 1.5)
+    with pytest.raises(MeshDbError):
+        MeshQuery.percentile(base, "seq", -0.1)
+
+
+def test_distinct_count_over_json_field() -> None:
+    chain = 0xCD
+    reader = _reader_with(
+        [
+            (chain, 1, b'{"user":"alice"}'),
+            (chain, 2, b'{"user":"bob"}'),
+            (chain, 3, b'{"user":"alice"}'),
+            (chain, 4, b'{"user":"carol"}'),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.distinct_count(MeshQuery.between(chain, 1, 10), "user")
+    rows = runner.execute(q)
+    agg = rows[0].decode_aggregate()
+    assert agg.kind == "distinct_count"
+    assert agg.count == 3  # alice, bob, carol
+
+
+def test_window_tumbling_seq_buckets_correctly() -> None:
+    chain = 0xAA
+    reader = _reader_with([(chain, s, f"p-{s}".encode()) for s in range(1, 8)])
+    runner = MeshQueryRunner(reader)
+    # size=3 → buckets [0,3) [3,6) [6,9)
+    #   bucket 0: seqs 1, 2
+    #   bucket 1: seqs 3, 4, 5
+    #   bucket 2: seqs 6, 7
+    q = MeshQuery.window(MeshQuery.between(chain, 1, 20), size=3)
+    rows = runner.execute(q)
+    assert len(rows) == 3
+    decoded = [r.decode_window() for r in rows]
+    assert decoded[0].start == 0 and decoded[0].end == 3
+    assert [r.seq for r in decoded[0].rows] == [1, 2]
+    assert decoded[1].start == 3 and decoded[1].end == 6
+    assert [r.seq for r in decoded[1].rows] == [3, 4, 5]
+    assert decoded[2].start == 6 and decoded[2].end == 9
+    assert [r.seq for r in decoded[2].rows] == [6, 7]
+
+
+def test_window_size_zero_rejected_at_factory() -> None:
+    with pytest.raises(MeshDbError):
+        MeshQuery.window(MeshQuery.latest(0xAA), size=0)
+
+
+def test_inner_join_on_seq_matches_pairs() -> None:
+    a, b = 0x111, 0x222
+    reader = _reader_with(
+        [
+            (a, 1, b"a-1"),
+            (a, 2, b"a-2"),
+            (a, 3, b"a-3"),
+            (b, 2, b"b-2"),
+            (b, 4, b"b-4"),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.join(
+        MeshQuery.between(a, 1, 10),
+        MeshQuery.between(b, 1, 10),
+        kind="inner",
+        key="seq",
+    )
+    rows = runner.execute(q)
+    decoded = [r.decode_joined() for r in rows]
+    assert len(decoded) == 1
+    assert decoded[0].left is not None
+    assert decoded[0].right is not None
+    assert decoded[0].left.payload == b"a-2"
+    assert decoded[0].right.payload == b"b-2"
+
+
+def test_left_outer_join_emits_unmatched_lefts() -> None:
+    a, b = 0x111, 0x222
+    reader = _reader_with(
+        [
+            (a, 1, b"a-1"),
+            (a, 2, b"a-2"),
+            (a, 3, b"a-3"),
+            (b, 2, b"b-2"),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.join(
+        MeshQuery.between(a, 1, 10),
+        MeshQuery.between(b, 1, 10),
+        kind="left_outer",
+        key="seq",
+    )
+    rows = runner.execute(q)
+    decoded = [r.decode_joined() for r in rows]
+    assert len(decoded) == 3
+    # Exactly one matched, two unmatched lefts (right=None).
+    matched = [d for d in decoded if d.right is not None]
+    unmatched = [d for d in decoded if d.right is None]
+    assert len(matched) == 1
+    assert len(unmatched) == 2
+    assert all(u.left is not None for u in unmatched)
+
+
+def test_payload_keyed_inner_join_on_json_field() -> None:
+    a, b = 0x111, 0x222
+    reader = _reader_with(
+        [
+            (a, 1, b'{"request_id":"r-1"}'),
+            (a, 2, b'{"request_id":"r-2"}'),
+            (b, 1, b'{"request_id":"r-1"}'),
+            (b, 2, b'{"request_id":"r-9"}'),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    q = MeshQuery.join(
+        MeshQuery.between(a, 1, 10),
+        MeshQuery.between(b, 1, 10),
+        kind="inner",
+        key="request_id",
+    )
+    rows = runner.execute(q)
+    decoded = [r.decode_joined() for r in rows]
+    assert len(decoded) == 1
+    assert decoded[0].left.payload == b'{"request_id":"r-1"}'
+    assert decoded[0].right.payload == b'{"request_id":"r-1"}'
+
+
+def test_sort_merge_join_returns_same_pairs_as_hash() -> None:
+    a, b = 0x111, 0x222
+    reader = _reader_with(
+        [
+            (a, 1, b"a-1"),
+            (a, 2, b"a-2"),
+            (a, 5, b"a-5"),
+            (b, 2, b"b-2"),
+            (b, 5, b"b-5"),
+        ]
+    )
+    runner = MeshQueryRunner(reader)
+    base_left = MeshQuery.between(a, 1, 10)
+    base_right = MeshQuery.between(b, 1, 10)
+    hash_join = MeshQuery.join(
+        base_left, base_right, kind="inner", key="seq", strategy="hash_broadcast"
+    )
+    sort_merge = MeshQuery.join(
+        base_left, base_right, kind="inner", key="seq", strategy="sort_merge"
+    )
+    hash_rows = sorted(
+        [r.decode_joined().left.seq for r in runner.execute(hash_join)]
+    )
+    sm_rows = sorted(
+        [r.decode_joined().left.seq for r in runner.execute(sort_merge)]
+    )
+    assert hash_rows == sm_rows == [2, 5]
+
+
+def test_unknown_join_kind_rejected_at_factory() -> None:
+    base = MeshQuery.latest(0xAA)
+    with pytest.raises(MeshDbError):
+        MeshQuery.join(base, base, kind="cross", key="seq")
+
+
+def test_unknown_join_strategy_rejected_at_factory() -> None:
+    base = MeshQuery.latest(0xAA)
+    with pytest.raises(MeshDbError):
+        MeshQuery.join(base, base, kind="inner", key="seq", strategy="nested_loop")
+
+
+def test_group_by_payload_field_rejected_for_now() -> None:
+    base = MeshQuery.latest(0xAA)
+    with pytest.raises(MeshDbError):
+        MeshQuery.count(base, group_by=["payload.severity"])
+
+
+def test_decode_methods_return_none_on_mismatch() -> None:
+    # A plain at-row carries event bytes, not a postcard
+    # aggregate / joined / window payload — every decode
+    # method should return None rather than raising.
+    runner = MeshQueryRunner(_reader_with([(0x01, 1, b"raw-bytes")]))
+    row = runner.execute(MeshQuery.at(0x01, 1))[0]
+    assert row.decode_aggregate() is None
+    assert row.decode_joined() is None
+    assert row.decode_window() is None
+
+
+def test_aggregate_result_repr_includes_kind_and_value() -> None:
+    runner = MeshQueryRunner(_reader_with([(0xAA, s, b"") for s in (1, 2, 3)]))
+    rows = runner.execute(MeshQuery.count(MeshQuery.between(0xAA, 1, 10)))
+    agg = rows[0].decode_aggregate()
+    assert "count" in repr(agg)
+    assert "3" in repr(agg)

@@ -349,18 +349,24 @@ else:
     )
 
 
-# MeshDB surface (slice 1: factory AST + in-memory ChainReader +
-# sync runner + Phase F cache options). Present iff the native
-# module was built with the `meshdb` Cargo feature.
+# MeshDB surface. Present iff the native module was built with
+# the `meshdb` Cargo feature. Slice 1 shipped the atomic factory
+# AST + sync runner + Phase F cache options; slice 2 adds the
+# composite-operator factories (window, aggregates, joins) and
+# the result-payload decoders.
 try:
     from ._net import (
+        AggregateResult,
         CachePolicy,
         ExecuteOptions,
+        GroupKey,
         InMemoryChainReader,
+        JoinedRow,
         MeshDbError,
         MeshQuery,
         MeshQueryRunner,
         ResultRow,
+        WindowBoundary,
     )
 except ImportError:
     # `meshdb` feature not compiled in; symbols stay undefined.
@@ -368,13 +374,17 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AggregateResult",
             "CachePolicy",
             "ExecuteOptions",
+            "GroupKey",
             "InMemoryChainReader",
+            "JoinedRow",
             "MeshDbError",
             "MeshQuery",
             "MeshQueryRunner",
             "ResultRow",
+            "WindowBoundary",
         ]
     )
 

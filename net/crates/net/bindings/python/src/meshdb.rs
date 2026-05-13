@@ -48,8 +48,11 @@ use tokio::runtime::Runtime;
 use net::adapter::net::behavior::meshdb::{
     cache::{CachePolicy, LruResultCache},
     executor::{ChainReader, ExecuteOptions, LocalMeshQueryExecutor, MeshQueryExecutor},
-    planner::{CostEstimate, OperatorNode, OperatorPlan},
-    query::ResultRow,
+    planner::{CostEstimate, JoinKeyMode, JoinStrategy, OperatorNode, OperatorPlan},
+    query::{
+        AggregateRowPayload, AggregateValue, GroupKey, JoinKind, JoinedRowPayload,
+        NumericAggregateKind, NumericReductionKind, ResultRow, WindowBoundary, WindowSpec,
+    },
     ExecutionPlan, SeqNum,
 };
 use net::adapter::net::behavior::meshdb::MeshError;
@@ -91,6 +94,31 @@ impl PyResultRow {
             self.payload.len()
         )
     }
+
+    /// Try to decode this row's payload as an aggregate
+    /// payload. Returns `None` for rows that aren't aggregate
+    /// sentinels (e.g. raw At/Between/Latest rows whose
+    /// payload is event data, or join / window sentinels).
+    fn decode_aggregate(&self) -> Option<PyAggregateResult> {
+        let payload: AggregateRowPayload = postcard::from_bytes(&self.payload).ok()?;
+        Some(PyAggregateResult::from(payload))
+    }
+
+    /// Try to decode this row's payload as a joined-row
+    /// payload. Returns `None` when the bytes don't
+    /// deserialize as a JoinedRow.
+    fn decode_joined(&self) -> Option<PyJoinedRow> {
+        let payload: JoinedRowPayload = postcard::from_bytes(&self.payload).ok()?;
+        Some(PyJoinedRow::from(payload))
+    }
+
+    /// Try to decode this row's payload as a window bucket.
+    /// Returns `None` when the bytes don't deserialize as a
+    /// WindowBoundary.
+    fn decode_window(&self) -> Option<PyWindowBoundary> {
+        let boundary: WindowBoundary = postcard::from_bytes(&self.payload).ok()?;
+        Some(PyWindowBoundary::from(boundary))
+    }
 }
 
 impl From<ResultRow> for PyResultRow {
@@ -99,6 +127,204 @@ impl From<ResultRow> for PyResultRow {
             origin: r.origin,
             seq: r.seq.0,
             payload: r.payload,
+        }
+    }
+}
+
+/// Decoded aggregate-row payload. `group` is `None` for
+/// single-bucket aggregates; otherwise it identifies the
+/// group via origin / seq / both. `kind` names which
+/// aggregate function ran (`"count"` / `"sum"` / `"avg"` /
+/// `"min"` / `"max"` / `"distinct_count"` / `"percentile"`);
+/// `value` is the numeric output (always set for count /
+/// distinct_count; `None` for the others when the group held
+/// no numeric rows). `count` mirrors `value` as an integer
+/// for the count-flavored kinds — convenience accessor so
+/// Python callers don't have to coerce floats.
+#[pyclass(name = "AggregateResult", module = "net._net", frozen, from_py_object)]
+#[derive(Clone)]
+pub struct PyAggregateResult {
+    #[pyo3(get)]
+    group: Option<PyGroupKey>,
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    value: Option<f64>,
+    #[pyo3(get)]
+    count: Option<u64>,
+}
+
+#[pymethods]
+impl PyAggregateResult {
+    fn __repr__(&self) -> String {
+        let group = self
+            .group
+            .as_ref()
+            .map(|g| g.__repr__())
+            .unwrap_or_else(|| "None".to_string());
+        let value_str = match (self.value, self.count) {
+            (None, Some(c)) => c.to_string(),
+            (Some(v), None) => format!("{v}"),
+            (Some(v), Some(_)) => format!("{v}"),
+            (None, None) => "None".to_string(),
+        };
+        format!(
+            "AggregateResult(kind={:?}, group={group}, value={value_str})",
+            self.kind
+        )
+    }
+}
+
+impl From<AggregateRowPayload> for PyAggregateResult {
+    fn from(p: AggregateRowPayload) -> Self {
+        let group = p.group.map(PyGroupKey::from);
+        let (kind, value, count) = match p.value {
+            AggregateValue::Count(c) => ("count".to_string(), Some(c as f64), Some(c)),
+            AggregateValue::Sum(s) => ("sum".to_string(), Some(s), None),
+            AggregateValue::Avg(opt) => ("avg".to_string(), opt, None),
+            AggregateValue::Min(opt) => ("min".to_string(), opt, None),
+            AggregateValue::Max(opt) => ("max".to_string(), opt, None),
+            AggregateValue::DistinctCount(c) => {
+                ("distinct_count".to_string(), Some(c as f64), Some(c))
+            }
+            AggregateValue::Percentile(opt) => ("percentile".to_string(), opt, None),
+            // AggregateValue is #[non_exhaustive]; any future
+            // variant surfaces as an "unknown" kind so the
+            // wire round-trip still works.
+            _ => ("unknown".to_string(), None, None),
+        };
+        Self {
+            group,
+            kind,
+            value,
+            count,
+        }
+    }
+}
+
+/// Decoded group-key identifier carried inside an
+/// [`PyAggregateResult`]. `kind` is `"origin"` / `"seq"` /
+/// `"origin_seq"`; the populated field(s) match the kind.
+#[pyclass(name = "GroupKey", module = "net._net", frozen, from_py_object)]
+#[derive(Clone)]
+pub struct PyGroupKey {
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    origin: Option<u64>,
+    #[pyo3(get)]
+    seq: Option<u64>,
+}
+
+#[pymethods]
+impl PyGroupKey {
+    fn __repr__(&self) -> String {
+        match self.kind.as_str() {
+            "origin" => format!("GroupKey(origin={:#x})", self.origin.unwrap_or(0)),
+            "seq" => format!("GroupKey(seq={})", self.seq.unwrap_or(0)),
+            "origin_seq" => format!(
+                "GroupKey(origin={:#x}, seq={})",
+                self.origin.unwrap_or(0),
+                self.seq.unwrap_or(0)
+            ),
+            other => format!("GroupKey(<{other}>)"),
+        }
+    }
+}
+
+impl From<GroupKey> for PyGroupKey {
+    fn from(g: GroupKey) -> Self {
+        match g {
+            GroupKey::Origin(o) => Self {
+                kind: "origin".to_string(),
+                origin: Some(o),
+                seq: None,
+            },
+            GroupKey::Seq(s) => Self {
+                kind: "seq".to_string(),
+                origin: None,
+                seq: Some(s.0),
+            },
+            GroupKey::OriginSeq { origin, seq } => Self {
+                kind: "origin_seq".to_string(),
+                origin: Some(origin),
+                seq: Some(seq.0),
+            },
+        }
+    }
+}
+
+/// Decoded join-row payload. `left` / `right` are the source
+/// rows from each side of the join; either side is `None` for
+/// outer-join unmatched rows. Inner-join rows always have both
+/// `Some`.
+#[pyclass(name = "JoinedRow", module = "net._net", frozen, from_py_object)]
+#[derive(Clone)]
+pub struct PyJoinedRow {
+    #[pyo3(get)]
+    left: Option<PyResultRow>,
+    #[pyo3(get)]
+    right: Option<PyResultRow>,
+}
+
+#[pymethods]
+impl PyJoinedRow {
+    fn __repr__(&self) -> String {
+        let l = self
+            .left
+            .as_ref()
+            .map(|r| r.__repr__())
+            .unwrap_or_else(|| "None".to_string());
+        let r = self
+            .right
+            .as_ref()
+            .map(|r| r.__repr__())
+            .unwrap_or_else(|| "None".to_string());
+        format!("JoinedRow(left={l}, right={r})")
+    }
+}
+
+impl From<JoinedRowPayload> for PyJoinedRow {
+    fn from(p: JoinedRowPayload) -> Self {
+        Self {
+            left: p.left.map(PyResultRow::from),
+            right: p.right.map(PyResultRow::from),
+        }
+    }
+}
+
+/// Decoded window-bucket payload. `start` and `end` are the
+/// bucket's seq bounds (half-open); `rows` is the list of
+/// rows that landed in the bucket, in seq-asc order.
+#[pyclass(name = "WindowBoundary", module = "net._net", frozen, from_py_object)]
+#[derive(Clone)]
+pub struct PyWindowBoundary {
+    #[pyo3(get)]
+    start: u64,
+    #[pyo3(get)]
+    end: u64,
+    #[pyo3(get)]
+    rows: Vec<PyResultRow>,
+}
+
+#[pymethods]
+impl PyWindowBoundary {
+    fn __repr__(&self) -> String {
+        format!(
+            "WindowBoundary(start={}, end={}, rows=<{} rows>)",
+            self.start,
+            self.end,
+            self.rows.len()
+        )
+    }
+}
+
+impl From<WindowBoundary> for PyWindowBoundary {
+    fn from(b: WindowBoundary) -> Self {
+        Self {
+            start: b.start.0,
+            end: b.end.0,
+            rows: b.rows.into_iter().map(PyResultRow::from).collect(),
         }
     }
 }
@@ -256,6 +482,160 @@ impl PyMeshQuery {
         }
     }
 
+    /// Tumbling window on `seq` with the given bucket `size`.
+    /// Emits one sentinel row per non-empty bucket; decode the
+    /// payload with `ResultRow.decode_window()`.
+    #[staticmethod]
+    fn window(inner: &PyMeshQuery, size: u64) -> PyResult<Self> {
+        if size == 0 {
+            return Err(MeshDbError::new_err(
+                "window: size must be >= 1".to_string(),
+            ));
+        }
+        let op = OperatorPlan::Window {
+            input: Box::new(inner.plan.root.clone()),
+            spec: WindowSpec::TumblingSeq { size },
+        };
+        Ok(Self {
+            plan: plan_of(op),
+        })
+    }
+
+    /// Count rows. `group_by` is an optional list of row-
+    /// intrinsic field names: `None` / `[]` = single bucket;
+    /// `["origin"]`, `["seq"]`, or `["origin", "seq"]` for
+    /// per-group counts.
+    #[staticmethod]
+    #[pyo3(signature = (inner, group_by=None))]
+    fn count(inner: &PyMeshQuery, group_by: Option<Vec<String>>) -> PyResult<Self> {
+        let group_by = parse_group_by(group_by)?;
+        let op = OperatorPlan::AggregateCount {
+            input: Box::new(inner.plan.root.clone()),
+            group_by,
+        };
+        Ok(Self {
+            plan: plan_of(op),
+        })
+    }
+
+    /// Sum of a numeric field across rows. `field` is a row-
+    /// intrinsic name (`"origin"` / `"seq"`) or a dotted JSON
+    /// path; see `MeshDB row::extract_numeric`.
+    #[staticmethod]
+    #[pyo3(signature = (inner, field, group_by=None))]
+    fn sum(inner: &PyMeshQuery, field: String, group_by: Option<Vec<String>>) -> PyResult<Self> {
+        Self::numeric_agg(inner, field, NumericAggregateKind::Sum, group_by)
+    }
+
+    /// Arithmetic mean across rows whose field resolves to a
+    /// number. Rows where the field is missing / non-numeric
+    /// are excluded from both numerator and denominator.
+    #[staticmethod]
+    #[pyo3(signature = (inner, field, group_by=None))]
+    fn avg(inner: &PyMeshQuery, field: String, group_by: Option<Vec<String>>) -> PyResult<Self> {
+        Self::numeric_agg(inner, field, NumericAggregateKind::Avg, group_by)
+    }
+
+    /// Min / Max / nearest-rank exact percentile. See
+    /// [`MeshQuery.percentile`] for the percentile-with-`p`
+    /// helper.
+    #[staticmethod]
+    #[pyo3(signature = (inner, field, group_by=None))]
+    fn min(inner: &PyMeshQuery, field: String, group_by: Option<Vec<String>>) -> PyResult<Self> {
+        Self::reduction(inner, field, NumericReductionKind::Min, group_by)
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (inner, field, group_by=None))]
+    fn max(inner: &PyMeshQuery, field: String, group_by: Option<Vec<String>>) -> PyResult<Self> {
+        Self::reduction(inner, field, NumericReductionKind::Max, group_by)
+    }
+
+    /// Nearest-rank exact percentile at `p ∈ [0.0, 1.0]`. Same
+    /// field-extraction semantics as the numeric aggregates.
+    #[staticmethod]
+    #[pyo3(signature = (inner, field, p, group_by=None))]
+    fn percentile(
+        inner: &PyMeshQuery,
+        field: String,
+        p: f64,
+        group_by: Option<Vec<String>>,
+    ) -> PyResult<Self> {
+        if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+            return Err(MeshDbError::new_err(format!(
+                "percentile: p must be in [0.0, 1.0], got {p}"
+            )));
+        }
+        Self::reduction(inner, field, NumericReductionKind::Percentile { p }, group_by)
+    }
+
+    /// Exact distinct count over the canonical string
+    /// projection of a row-intrinsic / JSON field. Bounded by
+    /// the executor's per-query memory budget.
+    #[staticmethod]
+    #[pyo3(signature = (inner, field, group_by=None))]
+    fn distinct_count(
+        inner: &PyMeshQuery,
+        field: String,
+        group_by: Option<Vec<String>>,
+    ) -> PyResult<Self> {
+        let group_by = parse_group_by(group_by)?;
+        let op = OperatorPlan::AggregateDistinct {
+            input: Box::new(inner.plan.root.clone()),
+            group_by,
+            field_path: field,
+        };
+        Ok(Self {
+            plan: plan_of(op),
+        })
+    }
+
+    /// Inner / outer hash-join over row-intrinsic or JSON
+    /// payload keys. `kind` is one of `"inner"`,
+    /// `"left_outer"`, `"right_outer"`, `"full_outer"`.
+    /// `key` is the field name both sides share — row-
+    /// intrinsic names map to the typed enum
+    /// (`origin` / `seq` / `origin,seq`); anything else is
+    /// treated as a JSON payload path. `strategy` is
+    /// `"hash_broadcast"` (default) or `"sort_merge"`.
+    /// `watermark_secs` is informational under snapshot
+    /// semantics; kept on the operator for wire round-trip.
+    #[staticmethod]
+    #[pyo3(signature = (left, right, kind, key, strategy=None, watermark_secs=5.0))]
+    fn join(
+        left: &PyMeshQuery,
+        right: &PyMeshQuery,
+        kind: &str,
+        key: &str,
+        strategy: Option<&str>,
+        watermark_secs: f64,
+    ) -> PyResult<Self> {
+        let kind = parse_join_kind(kind)?;
+        let strategy = parse_join_strategy(strategy)?;
+        let key_mode = match key {
+            "origin" => JoinKeyMode::Origin,
+            "seq" => JoinKeyMode::Seq,
+            "origin,seq" | "origin+seq" => JoinKeyMode::OriginSeq,
+            other => JoinKeyMode::Field(other.to_string()),
+        };
+        let watermark = if watermark_secs.is_finite() && watermark_secs >= 0.0 {
+            std::time::Duration::from_secs_f64(watermark_secs)
+        } else {
+            std::time::Duration::from_secs(5)
+        };
+        let op = OperatorPlan::HashJoin {
+            left: Box::new(left.plan.root.clone()),
+            right: Box::new(right.plan.root.clone()),
+            key_mode,
+            kind,
+            strategy,
+            watermark,
+        };
+        Ok(Self {
+            plan: plan_of(op),
+        })
+    }
+
     fn __repr__(&self) -> String {
         match &self.plan.root.operator {
             OperatorPlan::AtRead { origin, seq } => {
@@ -268,11 +648,132 @@ impl PyMeshQuery {
             OperatorPlan::LatestRead { origin } => {
                 format!("MeshQuery.latest(origin={origin:#018x})")
             }
-            // Slice 1 only exposes the three atomic operators
-            // above; other variants are unreachable via the
-            // current factory surface.
+            OperatorPlan::Window { spec, .. } => match spec {
+                WindowSpec::TumblingSeq { size } => format!("MeshQuery.window(size={size})"),
+                _ => "MeshQuery.window(<unknown>)".to_string(),
+            },
+            OperatorPlan::AggregateCount { .. } => "MeshQuery.count(...)".to_string(),
+            OperatorPlan::AggregateNumeric { kind, field_path, .. } => match kind {
+                NumericAggregateKind::Sum => format!("MeshQuery.sum(field={field_path:?})"),
+                NumericAggregateKind::Avg => format!("MeshQuery.avg(field={field_path:?})"),
+            },
+            OperatorPlan::AggregateReduction {
+                kind, field_path, ..
+            } => match kind {
+                NumericReductionKind::Min => format!("MeshQuery.min(field={field_path:?})"),
+                NumericReductionKind::Max => format!("MeshQuery.max(field={field_path:?})"),
+                NumericReductionKind::Percentile { p } => {
+                    format!("MeshQuery.percentile(field={field_path:?}, p={p})")
+                }
+            },
+            OperatorPlan::AggregateDistinct { field_path, .. } => {
+                format!("MeshQuery.distinct_count(field={field_path:?})")
+            }
+            OperatorPlan::HashJoin { kind, .. } => {
+                format!("MeshQuery.join(kind={kind:?})")
+            }
+            // Slice 2 doesn't yet expose factories for these
+            // (Filter needs a Predicate surface; LineageBack /
+            // LineageForward need a CapabilityIndex). The
+            // variants are reachable via wire round-trip / the
+            // builder API in slice 3 / 4 but the factory
+            // surface above doesn't produce them yet.
             other => format!("MeshQuery(<{other:?}>)"),
         }
+    }
+}
+
+impl PyMeshQuery {
+    fn numeric_agg(
+        inner: &PyMeshQuery,
+        field: String,
+        kind: NumericAggregateKind,
+        group_by: Option<Vec<String>>,
+    ) -> PyResult<Self> {
+        let group_by = parse_group_by(group_by)?;
+        let op = OperatorPlan::AggregateNumeric {
+            input: Box::new(inner.plan.root.clone()),
+            group_by,
+            field_path: field,
+            kind,
+        };
+        Ok(Self {
+            plan: plan_of(op),
+        })
+    }
+
+    fn reduction(
+        inner: &PyMeshQuery,
+        field: String,
+        kind: NumericReductionKind,
+        group_by: Option<Vec<String>>,
+    ) -> PyResult<Self> {
+        let group_by = parse_group_by(group_by)?;
+        let op = OperatorPlan::AggregateReduction {
+            input: Box::new(inner.plan.root.clone()),
+            group_by,
+            field_path: field,
+            kind,
+        };
+        Ok(Self {
+            plan: plan_of(op),
+        })
+    }
+}
+
+/// Parse a Python `group_by: list[str] | None` into the
+/// planner's `Option<JoinKeyMode>`. `None` / `[]` → `None`
+/// (single-bucket); `["origin"]` → `Origin`; `["seq"]` →
+/// `Seq`; `["origin", "seq"]` (any order) → `OriginSeq`.
+/// Other shapes raise a `MeshDbError` with the same Phase E-1
+/// message the planner would surface.
+fn parse_group_by(group_by: Option<Vec<String>>) -> PyResult<Option<JoinKeyMode>> {
+    let Some(group_by) = group_by else {
+        return Ok(None);
+    };
+    if group_by.is_empty() {
+        return Ok(None);
+    }
+    if group_by.len() == 1 {
+        return match group_by[0].as_str() {
+            "origin" => Ok(Some(JoinKeyMode::Origin)),
+            "seq" => Ok(Some(JoinKeyMode::Seq)),
+            other => Err(MeshDbError::new_err(format!(
+                "group_by field '{other}' is not a row-intrinsic key; only 'origin' / 'seq' supported"
+            ))),
+        };
+    }
+    if group_by.len() == 2 {
+        let mut pair = [group_by[0].as_str(), group_by[1].as_str()];
+        pair.sort();
+        if pair == ["origin", "seq"] {
+            return Ok(Some(JoinKeyMode::OriginSeq));
+        }
+    }
+    Err(MeshDbError::new_err(format!(
+        "group_by shape {group_by:?} not supported; use [], ['origin'], ['seq'], or ['origin', 'seq']"
+    )))
+}
+
+fn parse_join_kind(s: &str) -> PyResult<JoinKind> {
+    match s {
+        "inner" => Ok(JoinKind::Inner),
+        "left_outer" => Ok(JoinKind::LeftOuter),
+        "right_outer" => Ok(JoinKind::RightOuter),
+        "full_outer" => Ok(JoinKind::FullOuter),
+        other => Err(MeshDbError::new_err(format!(
+            "join kind '{other}' not recognised; expected one of: inner, left_outer, right_outer, full_outer"
+        ))),
+    }
+}
+
+fn parse_join_strategy(s: Option<&str>) -> PyResult<JoinStrategy> {
+    match s {
+        None | Some("hash_broadcast") => Ok(JoinStrategy::HashBroadcast),
+        Some("sort_merge") => Ok(JoinStrategy::SortMerge),
+        Some(other) => Err(MeshDbError::new_err(format!(
+            "join strategy '{other}' not recognised; expected one of: hash_broadcast, sort_merge"
+        ))),
     }
 }
 
