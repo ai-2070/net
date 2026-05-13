@@ -4,7 +4,7 @@
 
 ## Status
 
-**Phases A through E shipped behind the `meshdb` Cargo feature.** Only Phase F (result caching + the programmatic-only language surface refinements + bindings) and HLL / T-Digest sketch implementations remain. Everything else — AST, planner, local + federated executors, wire protocol, lineage walks, hash + sort-merge joins (row-intrinsic + payload-keyed, all four kinds), Count / Sum / Avg / Min / Max / DistinctCountExact / PercentileExact aggregates, Filter via synthetic-tag PredicateWire eval, tumbling-on-seq windowing — is in code.
+**All phases (A through F) shipped behind the `meshdb` Cargo feature.** AST, planner, local + federated executors, wire protocol, lineage walks, hash + sort-merge joins (row-intrinsic + payload-keyed, all four kinds), Count / Sum / Avg / Min / Max / DistinctCountExact / PercentileExact aggregates, Filter via synthetic-tag PredicateWire eval, tumbling-on-seq windowing, and the single-node LRU result cache with pull-based capability-version invalidation are all in code. Remaining open items are bounded follow-ups, not phases: HLL p=14 / T-Digest c=100 sketch implementations behind `DistinctCountHll` / `PercentileTDigest`, the wire-subprotocol dispatch hookup that registers `SUBPROTOCOL_MESHDB` on `MeshNode` (moves the federated executor out of test-only loopback), and language bindings.
 
 **Shipped surface** (gated behind `#[cfg(feature = "meshdb")]` at `src/adapter/net/behavior/meshdb/`):
 
@@ -19,6 +19,12 @@
   - **E-3 Sum / Avg.** `OperatorPlan::AggregateNumeric` over `row::extract_numeric` (JSON path → `f64`). Rows whose field fails to resolve are skipped; `Avg(None)` covers the empty-group case.
   - **E-4 Min / Max / DistinctCountExact / PercentileExact.** `OperatorPlan::AggregateReduction` (Min / Max / nearest-rank percentile via `f64::total_cmp`) + `OperatorPlan::AggregateDistinct` (canonical-string projection into a per-group `BTreeSet`). The HLL p=14 / T-Digest c=100 sketch variants remain `PlannerError` until a consumer drives the algorithmic complexity; the exact variants are the recommended path.
   - **E-5 Window.** `QueryV1::Window { inner, spec: WindowSpec::TumblingSeq { size } }` buckets rows into fixed-size half-open intervals on `seq`; the executor emits one sentinel `ResultRow` per non-empty bucket with a postcard-encoded `WindowBoundary { start, end, rows }`. Sliding + session windows extend cleanly via additional `WindowSpec` variants when a consumer drives the shape.
+- **Phase F — Single-node LRU result cache.** Ships per the locked Phase F decisions:
+  - **Global cache version, no query-shape classification.** `CapabilityIndex` carries an `AtomicU64 mutation_version` that bumps on every `index` / `remove` / `gc` mutation. The MeshDB cache pull-invalidates: lookups encode the live version into the key (`CacheKey { plan_hash, capability_version }`); any divergence misses. Aggressive invalidation by design — softening it is not the answer to churn, the bypass flag is.
+  - **Default `CachePolicy::TimeBound { ttl: 5s }`** — mirrors the locked-decision-#2 join watermark. `Permanent` is the explicit-opt-in policy for queries over closed substrate ranges (`At`, bounded `Between`).
+  - **`ExecuteOptions::bypass_cache`** skips both lookup and writeback (Deck operator-view authoritative reads; Hermes skill-routing under churn; diagnostics).
+  - **Hand-rolled LRU** — `HashMap` + intrusive doubly-linked list over a `Vec<Node>`. Defaults: `LRU_MAX_ENTRIES = 1024`, `LRU_MAX_BYTES = 256 MiB`; either bound trips eviction of the LRU end. SipHash via `DefaultHasher` over postcard-encoded plan bytes; no new external dependency.
+  - **Top-level only.** Sub-plan executes inside the federated path bypass the cache; recursive caching at HashJoin sides / Aggregate inner is a follow-up if profiling justifies the bookkeeping.
 - **Spec correction during B-1.** `ChainRef::OriginHash` + `ResultRow.origin` are `u64` (16-char hex), not `[u8; 32]` — the original plan was wrong about origin width; substrate uses `u64` throughout.
 
 **Substrate prereqs** (unchanged — all in code):
@@ -27,7 +33,7 @@
 - **`REDEX_DISTRIBUTED_PLAN.md`** — all phases shipped; replication makes time-travel queries tractable today.
 - **`CORTEX_ADAPTER_PLAN.md`** — shipped and exceeds spec; `CortexAdapter<State>` + `RedexFold<State>` + `watch` / `snapshot_and_watch` / `changes_with_lag()` all in code.
 
-**Remaining work** is consumer-driven: Phase F (single-node LRU result cache + the programmatic-only language surface + bindings), HLL p=14 / T-Digest c=100 sketch implementations behind `DistinctCountHll` / `PercentileTDigest`, and the wire-subprotocol dispatch hookup (registering `SUBPROTOCOL_MESHDB` on `MeshNode`) that moves the federated executor out of test-only loopback. Net-new surfaces (push-down fold-on-relay; streaming activation of the watermark on Window-joined sub-trees) come with their respective consumers.
+**Remaining work** is bounded follow-ups, all consumer-driven: HLL p=14 / T-Digest c=100 sketch implementations behind `DistinctCountHll` / `PercentileTDigest` (the exact variants ship today); the wire-subprotocol dispatch hookup that registers `SUBPROTOCOL_MESHDB` on `MeshNode` (the federated executor exists; only the wire-side framing remains to move it out of test-only loopback); language bindings beyond Rust. Net-new surfaces (push-down fold-on-relay; streaming activation of the watermark on Window-joined sub-trees; sub-plan caching) come with their respective consumers.
 
 ## Frame
 
