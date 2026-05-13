@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/behavior/meshdb/transport.rs
+  s_ced434e69396ed::t_279382cc614a30 190-193
+  s_ced434e69396ed::t_82bf7874adccfa 1056-1086
+  s_ced434e69396ed::t_11f814a533a7bc 152-155
+  s_ced434e69396ed::t_a876fe1dae52cd 293-295
+  s_ced434e69396ed::t_dde896d4eeb26d 109-122
+net/crates/net/src/adapter/net/behavior/meshdb/mod.rs
+  s_ced434e69396ed::t_f134ce63281690 117-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "9f836d3902a5082518e8e645c993b2f8569bc53b",
+  "prompts": {},
+  "sessions": {
+    "s_ced434e69396ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "110b7060-6c04-4234-8a8c-573745ed066d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
