@@ -13,8 +13,35 @@ messages" feedback rule).
 
 ## Status
 
-**Open.** Punch list captured below; fixes land in subsequent
-commits with per-item regression coverage where reasonable.
+**Closed.** Every Critical / Important / Nit was fixed in-tree
+with per-item regression coverage where reasonable. Tests added
+under the `meshos` feature: `BackpressureState::release_failed_admit_*`
+(3), `executor::cluster_backpressure_edges_surface_through_dispatcher_hook`,
+`executor::dispatch_failure_with_retry_releases_pull_cooldown`,
+`executor::dispatcher_panic_does_not_kill_executor`,
+`executor::dispatch_retry_drops_after_exceeding_max_defer_count`,
+`event_loop::snapshot_reader_does_not_stall_under_concurrent_reads`,
+`event_loop::dropped_actions_counter_increments_when_action_queue_is_full`,
+`event_loop::panicking_probe_does_not_kill_the_loop`,
+`event_loop::publish_timeout_returns_queue_full_when_loop_is_wedged`,
+`event_loop::shutdown_event_short_circuits_pending_events_after_it`
+(re-pinned to actually assert),
+`reconcile::scheduler_eviction_is_idempotent_when_loop_writes_back_last_rebalance`,
+`reconcile::phase_c_overcount_eviction_suppresses_phase_d1_eviction_for_same_chain`,
+`reconcile::apply_backoff_is_not_re_emitted_after_the_loop_records_it`,
+`state::enter_maintenance_since_is_anchored_on_last_tick_for_replay_determinism`,
+`runtime::dropping_runtime_without_shutdown_aborts_tasks`,
+`chain::buffering_appender_drops_oldest_when_at_capacity`,
+`chain::decode_rejects_payload_with_unknown_wire_version`,
+`chain::decode_rejects_empty_payload`,
+`chain::encode_decode_round_trip_preserves_record`,
+`snapshot::failure_record_age_ms_derives_from_recorded_at_ms`,
+`sources::leader_lost_event_clears_replica_leader_via_none_update`.
+
+`cargo clippy --features meshos --lib --tests -- -D warnings`
+clean. `RUSTDOCFLAGS="-D warnings" cargo doc --features meshos
+--no-deps --lib` clean. 172 meshos unit tests + 11 pipeline
+integration tests pass.
 
 ## Critical
 
