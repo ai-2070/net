@@ -857,6 +857,7 @@ where
         start: u64,
         max_depth: u32,
     ) -> Result<Vec<LineageEntry>, MeshError> {
+        use std::collections::VecDeque;
         let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
         visited.insert(start);
         let mut entries = vec![LineageEntry {
@@ -864,11 +865,14 @@ where
             depth: 0,
             tip_seq: self.best_tip(start),
         }];
-        let mut frontier: Vec<(u64, u32)> = vec![(start, 0)];
-        while let Some((current, depth)) = frontier.first().copied() {
-            frontier.remove(0);
+        let mut frontier: VecDeque<(u64, u32)> = VecDeque::new();
+        frontier.push_back((start, 0));
+        while let Some((current, depth)) = frontier.pop_front() {
+            // Compute children once per dequeue — previous
+            // implementation did it twice (depth check + walk).
+            let mut children = self.children_of(current);
             if depth >= max_depth {
-                if !self.children_of(current).is_empty() {
+                if !children.is_empty() {
                     return Err(MeshError::LineageMaxDepthExceeded {
                         origin: start,
                         depth: max_depth,
@@ -876,7 +880,6 @@ where
                 }
                 continue;
             }
-            let mut children = self.children_of(current);
             children.sort_unstable();
             for child in children {
                 if !visited.insert(child) {
@@ -892,7 +895,7 @@ where
                     depth: depth + 1,
                     tip_seq: self.best_tip(child),
                 });
-                frontier.push((child, depth + 1));
+                frontier.push_back((child, depth + 1));
             }
         }
         Ok(entries)
