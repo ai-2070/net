@@ -19,7 +19,7 @@ ai2070-net-sdk = "0.17.0"
 
 The crate publishes as `ai2070-net-sdk` on crates.io but imports as `use net_sdk::...` (the in-source crate name is preserved via package aliasing).
 
-Features: `redis`, `jetstream`, `net` (mesh transport), `nat-traversal` (classifier + `connect_direct`, opt-in), `port-mapping` (NAT-PMP + UPnP, opt-in), `cortex` (event-sourced tasks/memories + NetDb), `compute` (daemons + migration), `groups` (replica / fork / standby), `local` (bundles `net` + `cortex` + `compute` + `groups`), `full` (bundles `local` + `redis` + `jetstream`). NAT features stay opt-in — they are *not* pulled in by `full`.
+Features: `redis`, `jetstream`, `net` (mesh transport), `nat-traversal` (classifier + `connect_direct`, opt-in), `port-mapping` (NAT-PMP + UPnP, opt-in), `cortex` (event-sourced tasks/memories + NetDb), `compute` (daemons + migration), `groups` (replica / fork / standby), `meshos` (cluster-behavior engine + daemon supervision SDK; implies `compute`), `deck` (operator command surface; implies `meshos`), `local` (bundles `net` + `cortex` + `compute` + `groups`), `full` (bundles `local` + `redis` + `jetstream` + `meshos` + `deck`). NAT features stay opt-in — they are *not* pulled in by `full`.
 
 ```bash
 cargo add ai2070-net-sdk --features full        # everything bundled
@@ -1555,6 +1555,218 @@ Full staging, wire formats, and rationale:
 [`docs/SDK_GROUPS_SURFACE_PLAN.md`](../docs/SDK_GROUPS_SURFACE_PLAN.md).
 Core semantics (placement spread, health aggregation, failure
 domains) live in [`../README.md#daemons`](../README.md#daemons).
+
+## MeshOS (daemon supervision SDK)
+
+Enable the `meshos` feature (implies `compute`) to author
+daemons that participate in MeshOS — the cluster-behavior
+engine that supervises daemons, enforces replica placement,
+applies operator intent, and folds the result into a snapshot
+the operator UI renders. The SDK is **daemon-side only**: a
+daemon written against this surface receives control events
+and publishes capabilities, but it cannot mutate the cluster's
+view of itself. Operator-facing surfaces (drain, cordon, ICE)
+live in the [`deck`](#deck-operator-sdk) SDK.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use net_sdk::meshos::{
+    CapabilitySet, DaemonControl, DaemonHealth, EntityKeypair, MeshDaemon,
+    MeshOsConfig, MeshOsDaemonSdk,
+};
+
+struct TelemetryDaemon;
+impl MeshDaemon for TelemetryDaemon {
+    fn name(&self) -> &str { "telemetry" }
+    fn requirements(&self) -> _ { Default::default() }
+    fn process(&mut self, _event: &_) -> _ { Ok(vec![]) }
+    fn health(&self) -> DaemonHealth { DaemonHealth::Healthy }
+}
+
+# async fn run(dispatcher: Arc<impl _>) -> Result<(), Box<dyn std::error::Error>> {
+let sdk = MeshOsDaemonSdk::start(MeshOsConfig::default(), dispatcher);
+let mut handle = sdk.register_daemon(
+    Box::new(TelemetryDaemon),
+    EntityKeypair::generate(),
+)?;
+
+// Drain control events. The substrate fans `Shutdown`,
+// `DrainStart { deadline }`, `BackpressureOn { level }`, etc.
+// through this channel; delivery is at-most-once (locked
+// decision #8) so the daemon must consume promptly.
+while let Some(ev) = handle.next_control().await {
+    match ev {
+        DaemonControl::Shutdown { .. } => break,
+        DaemonControl::BackpressureOn { level } => { /* throttle */ }
+        _ => {}
+    }
+}
+
+handle.graceful_shutdown(Duration::from_secs(5)).await?;
+sdk.shutdown().await?;
+# Ok(())
+# }
+```
+
+The `daemon_main!` macro collapses the lifecycle boilerplate
+into one block — register, drain control events, graceful-
+shutdown on `Shutdown` / `DrainFinish`:
+
+```rust,ignore
+net_sdk::daemon_main! {
+    daemon: TelemetryDaemon,
+    keypair: EntityKeypair::generate(),
+    config: MeshOsConfig::default(),
+    dispatcher: my_dispatcher,
+}
+```
+
+### Locked decisions (daemon-side only)
+
+The SDK refuses every operator-side action by design — these
+are non-goals, not deferred work:
+
+🚫 No placement / replica / scheduler APIs. Daemons advertise
+capabilities; MeshOS scores them. The daemon never sees the
+score and cannot request a placement.
+
+🚫 No admin-event issuance. Drain / cordon / maintenance /
+ICE force-operations are operator-signed chain commits — the
+SDK has no path to emit them, in any language.
+
+🚫 No "control MeshOS" surfaces. Avoid lists, backpressure
+flags, drift signals, maintenance transitions, action
+admission — all opaque. The daemon receives
+`BackpressureOn { level }`; it cannot read the queue depth
+that triggered it or override the threshold.
+
+The full plan, including the cross-binding contract that
+keeps every language SDK on the same trait shape, lives at
+[`docs/plans/MESHOS_SDK_PLAN.md`](../docs/plans/MESHOS_SDK_PLAN.md).
+
+## Deck (operator SDK)
+
+Enable the `deck` feature (implies `meshos`) for the operator-
+facing surface — what the Deck binary (the terminal-UI
+cyberdeck) and tenant operator tooling import. Every cluster-
+control action lives here, gated by operator-key signing +
+channel-auth verification + admin-chain commit.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use net_sdk::deck::{
+    AdminEvent, DeckClient, IceActionProposal, OperatorIdentity,
+};
+use net_sdk::meshos::{
+    EntityKeypair, MeshOsConfig, MeshOsRuntime,
+};
+
+# async fn example(runtime: Arc<MeshOsRuntime>) -> Result<(), Box<dyn std::error::Error>> {
+let identity = OperatorIdentity::from_keypair(EntityKeypair::generate());
+let deck = DeckClient::from_runtime(&runtime, identity);
+
+// Ordinary admin commits — one method per `AdminEvent` variant,
+// signed with the operator key, committed to the admin chain.
+let commit = deck.admin().drain(/* node = */ 42, /* deadline = */ _).await?;
+println!("commit id = {}", commit.commit_id());
+
+// Live snapshot stream — Stream<Item = Result<MeshOsSnapshot, _>>.
+// `subscribe_logs` and `subscribe_failures` follow the same
+// tail-with-seq-watermark pattern; pass the last-seen seq to
+// resume across restarts.
+let mut snapshots = deck.snapshots();
+// while let Some(snap) = snapshots.next().await { /* render */ }
+
+// Audit query — fluent filters over the admin audit ring.
+// Newest-first; cheap (one snapshot read + iterator pass).
+let recent_ice = deck
+    .audit()
+    .force_only()
+    .recent(50)
+    .collect();
+# Ok(())
+# }
+```
+
+### ICE (break-glass surface)
+
+ICE force-operations (`ForceDrain`, `ForceEvictReplica`,
+`ForceRestartDaemon`, `ForceCutover`, `KillMigration`,
+`FreezeCluster { ttl }`, `ThawCluster`, `FlushAvoidLists`) go
+through the `IceProposal` discipline: `simulate()` returns a
+[`BlastRadius`] preview against the local snapshot;
+`commit(signatures)` enforces an M-of-N operator-signature
+threshold substrate-side. Sub-threshold bundles surface
+`IceError::InsufficientSignatures` without folding the
+inner `AdminEvent`.
+
+```rust
+let proposal = deck.ice().freeze_cluster(Duration::from_secs(30));
+
+// 1. Pre-execution preview. Reports affected nodes, replicas,
+//    daemons + warnings (e.g. `ForcedEvictionBypassesCooldown`).
+let blast = proposal.simulate().await?;
+println!(
+    "freeze would touch {} peers, {} warnings",
+    blast.affected_nodes.len(),
+    blast.warnings.len(),
+);
+
+// 2. Collect operator signatures (one per operator, signing
+//    the proposal's canonical payload).
+let sig_a = deck.identity().sign_proposal(proposal.action());
+// let sig_b = peer_operator.sign_proposal(proposal.action());
+
+// 3. Commit. Substrate-side verification enforces M-of-N;
+//    sub-threshold bundles return InsufficientSignatures.
+let commit = proposal.commit(&[sig_a /*, sig_b */]).await?;
+```
+
+### Runtime wiring (production extensions)
+
+Operator deployments wire the chain seams + dispatcher seams
+through one constructor — every extension is `Option<Arc<dyn ...>>`
+so test + bootstrap callers leave them `None`:
+
+```rust,ignore
+use net_sdk::meshos::{
+    MeshOsRuntime, OrchestratorMigrationAborter, OrchestratorMigrationSnapshotSource,
+    RedexAdminAuditAppender, RedexFailureAppender, RedexLogAppender,
+};
+
+let runtime = MeshOsRuntime::start_with_full_extensions(
+    config,
+    dispatcher,
+    probes,
+    scheduler,
+    daemon_registry,
+    /* control_sink */ Some(control_sink),
+    /* admin_verifier */ Some(admin_verifier),
+    /* admin_audit_appender */ Some(Arc::new(RedexAdminAuditAppender::new(audit_file))),
+    /* log_appender */        Some(Arc::new(RedexLogAppender::new(log_file))),
+    /* failure_appender */    Some(Arc::new(RedexFailureAppender::new(failure_file))),
+    /* migration_aborter */   Some(Arc::new(OrchestratorMigrationAborter::new(orchestrator.clone()))),
+    /* migration_snapshot_source */
+        Some(Arc::new(OrchestratorMigrationSnapshotSource::new(orchestrator))),
+);
+```
+
+| Seam | Purpose |
+|---|---|
+| `RedexAdminAuditAppender` | Dual-write `AdminAuditRecord` to a `TypedRedexFile` so security review replays every admin commit |
+| `RedexLogAppender` | Dual-write `LogRecord` to a `TypedRedexFile` for cluster-lifetime log replay |
+| `RedexFailureAppender` | Dual-write `FailureRecord` for cluster-lifetime failure replay |
+| `OrchestratorMigrationAborter` | Routes `KillMigration` commits to `MigrationOrchestrator::abort_migration` |
+| `OrchestratorMigrationSnapshotSource` | Embeds the local orchestrator's in-flight migrations in every published snapshot so the ICE simulator can enumerate affected daemons |
+
+The error surface uses the `<<deck-sdk-kind:KIND>>MSG`
+discriminator format every cross-language SDK shares — parse
+once, route on `KIND`. The full plan (including the
+intentional non-goals — no topology/identity management, no
+chain-mutation outside signed admin commits, no UI rendering)
+lives at [`docs/plans/DECK_SDK_PLAN.md`](../docs/plans/DECK_SDK_PLAN.md).
 
 ## API
 
