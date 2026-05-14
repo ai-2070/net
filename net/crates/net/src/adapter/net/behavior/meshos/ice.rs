@@ -126,6 +126,9 @@ impl IceActionProposal {
         }
     }
 
+    /// Translate the proposal to its corresponding
+    /// [`AdminEvent`]. The substrate folds the `AdminEvent`;
+    /// the proposal is the SDK-side builder + signing form.
     pub fn to_admin_event(&self) -> AdminEvent {
         match self {
             IceActionProposal::FreezeCluster { ttl } => AdminEvent::FreezeCluster { ttl: *ttl },

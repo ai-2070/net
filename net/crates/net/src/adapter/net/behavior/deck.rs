@@ -1287,8 +1287,14 @@ impl<'a> AuditQuery<'a> {
     }
 
     /// Cap the result at the most-recent `limit` entries.
-    /// `limit = 0` returns an empty result; chain order in the
-    /// returned vec is newest-first.
+    /// Returned order is newest-first.
+    ///
+    /// `limit = 0` returns an empty result by design — useful
+    /// in higher-level builder flows that compute the cap from
+    /// runtime config (operator typed 0, no records wanted).
+    /// Callers that want "as many as the ring holds" should
+    /// omit `recent()` entirely; the builder's default returns
+    /// every entry.
     pub fn recent(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
         self
@@ -1325,6 +1331,15 @@ impl<'a> AuditQuery<'a> {
     /// [`Self::stream`] the value seeds the stream's
     /// watermark — the stream tails from `since_seq + 1`
     /// onward rather than from "first new record after now".
+    ///
+    /// `since(0)` means "from the beginning of what's still in
+    /// the ring" — equivalent to omitting `since()` entirely
+    /// in terms of what records are returned. To tail only
+    /// records that arrive after subscribe time, pair this
+    /// with [`super::DeckClient::audit_head_seq`]: read the
+    /// head once, then `since(head)`. The same convention
+    /// applies to [`LogFilter::since`] and
+    /// [`super::DeckClient::subscribe_failures`].
     pub fn since(mut self, since_seq: u64) -> Self {
         self.since_seq = Some(since_seq);
         self
@@ -1555,10 +1570,12 @@ impl LogFilter {
     }
 
     /// Seed the stream's watermark to `since_seq`. The first
-    /// record yielded has `seq > since_seq`. Pair with the
-    /// `seq` value the consumer persisted at shutdown to
-    /// resume without missing or duplicating records across
-    /// restarts.
+    /// record yielded has `seq > since_seq`. `since(0)` means
+    /// "from the beginning of what's still in the ring" —
+    /// to tail only post-subscribe records pair with
+    /// [`super::DeckClient::log_head_seq`]: read the head
+    /// once, then `since(head)`. Same convention as
+    /// [`AuditQuery::since`].
     pub fn since(mut self, since_seq: u64) -> Self {
         self.since_seq = Some(since_seq);
         self

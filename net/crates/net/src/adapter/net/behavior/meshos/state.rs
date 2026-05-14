@@ -93,23 +93,12 @@ pub struct MeshOsState {
     /// bypassing the placement scorer; the loop drains the
     /// list after each pass.
     pub(crate) forced_placements: Vec<(ChainId, NodeId)>,
-    /// Ring buffer of admin-commit outcomes — every admin
-    /// commit the loop observes (signed ICE bundle or unsigned
-    /// `MeshOsEvent::AdminEvent(...)`) lands here, regardless
-    /// of whether a verifier accepted, rejected, or skipped
-    /// it. Bounded to
-    /// [`super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS`]; the
-    /// loop drops the oldest entry FIFO when the cap is
-    /// exceeded. Snapshot exports this verbatim for the Deck
-    /// SDK's `audit()` query path.
-    pub(crate) admin_audit: std::collections::VecDeque<super::ice::AdminAuditRecord>,
-    /// Ring buffer of log records — every
-    /// `MeshOsEvent::LogLine` daemons or source converters
-    /// publish lands here. Bounded to
-    /// [`super::logs::DEFAULT_MAX_LOG_RING_RECORDS`]; older
-    /// entries drop FIFO. The Deck SDK's `subscribe_logs`
-    /// reads the ring through the snapshot.
-    pub(crate) log_ring: std::collections::VecDeque<super::logs::LogRecord>,
+    // admin_audit and log_ring rings live on MeshOsLoop now,
+    // not MeshOsState — they're append-only output buffers
+    // that don't participate in fold convergence, and keeping
+    // them off the state struct removes the need for the
+    // dead `_ => {}` arms on SignedIceCommit / LogLine in the
+    // apply path.
 }
 
 /// Per-daemon observed status. Phase B fleshes out the fields

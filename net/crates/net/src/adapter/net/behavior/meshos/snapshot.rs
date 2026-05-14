@@ -404,6 +404,8 @@ impl MeshOsSnapshot {
         pending: &[PendingAction],
         recent_failures: &[FailureRecord],
         in_flight_migrations: Vec<MigrationSnapshot>,
+        admin_audit_ring: &std::collections::VecDeque<super::ice::AdminAuditRecord>,
+        log_ring: &std::collections::VecDeque<super::logs::LogRecord>,
     ) -> Self {
         let now = actual.last_tick.unwrap_or_else(std::time::Instant::now);
 
@@ -550,8 +552,8 @@ impl MeshOsSnapshot {
             .freeze_until
             .map(|until| until.saturating_duration_since(now).as_millis() as u64);
         let admin_audit: Vec<super::ice::AdminAuditRecord> =
-            actual.admin_audit.iter().cloned().collect();
-        let log_ring: Vec<super::logs::LogRecord> = actual.log_ring.iter().cloned().collect();
+            admin_audit_ring.iter().cloned().collect();
+        let log_ring: Vec<super::logs::LogRecord> = log_ring.iter().cloned().collect();
 
         Self {
             daemons,
@@ -689,7 +691,15 @@ mod tests {
         status.saturation = 0.42;
         actual.daemons.insert(d.clone(), status);
         let desired = DesiredState::default();
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[], Vec::new());
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &desired,
+            &[],
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+        );
         let daemon = snap.daemons.get(&1).expect("daemon present");
         assert_eq!(daemon.name, "telemetry");
         assert_eq!(daemon.lifecycle, DaemonLifecycleSnapshot::Running);
@@ -710,7 +720,15 @@ mod tests {
         actual.replica_leader.insert(0xAA, 1);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(0xAA, 5);
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[], Vec::new());
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &desired,
+            &[],
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+        );
         let r = snap.replicas.get(&0xAA).expect("replica present");
         assert_eq!(r.holders, vec![1, 2, 3]);
         assert_eq!(r.desired_count, Some(5));
@@ -722,7 +740,15 @@ mod tests {
         let actual = MeshOsState::default();
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(0xBB, 3);
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[], Vec::new());
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &desired,
+            &[],
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+        );
         let r = snap
             .replicas
             .get(&0xBB)
@@ -776,7 +802,15 @@ mod tests {
             emitted_at: base,
         }];
 
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &pending, &[], Vec::new());
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &desired,
+            &pending,
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+        );
         let bytes = postcard::to_allocvec(&snap).expect("encode");
         let back: MeshOsSnapshot = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(snap, back);

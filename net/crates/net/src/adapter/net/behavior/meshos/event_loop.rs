@@ -115,6 +115,26 @@ pub struct MeshOsLoop {
     /// dedup'ing via `seq` values pair each watermark with this
     /// value — when the snapshot's epoch flips, they reset.
     runtime_epoch_id: u64,
+    /// Ring buffer of admin-commit outcomes — every admin
+    /// commit the loop observes (signed ICE bundle or unsigned
+    /// `MeshOsEvent::AdminEvent(...)`) lands here, regardless
+    /// of whether a verifier accepted, rejected, or skipped
+    /// it. Bounded to
+    /// [`super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS`]; the
+    /// loop drops the oldest entry FIFO when the cap is
+    /// exceeded. Lives on the loop rather than `MeshOsState`
+    /// because it's an append-only output buffer, not fold
+    /// state — `state.rs` had explicit dead arms for
+    /// `SignedIceCommit` / `SignedAdminCommit` precisely
+    /// because they don't fold.
+    admin_audit_ring: VecDeque<super::ice::AdminAuditRecord>,
+    /// Ring buffer of log records — every
+    /// `MeshOsEvent::LogLine` daemons or source converters
+    /// publish lands here. Bounded to
+    /// [`super::logs::DEFAULT_MAX_LOG_RING_RECORDS`]; older
+    /// entries drop FIFO. Lives on the loop rather than
+    /// `MeshOsState` because log lines don't fold.
+    log_ring: VecDeque<super::logs::LogRecord>,
 
     /// Actions reconcile emitted that the action-queue
     /// `try_send` rejected because the executor was at
@@ -450,6 +470,10 @@ impl MeshOsLoop {
             admin_audit_seq: 0,
             log_seq: 0,
             runtime_epoch_id,
+            admin_audit_ring: VecDeque::with_capacity(
+                super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS,
+            ),
+            log_ring: VecDeque::with_capacity(super::logs::DEFAULT_MAX_LOG_RING_RECORDS),
             dropped_actions: Arc::new(AtomicU64::new(0)),
             executor_failures: None,
             executor_failure_seq: None,
@@ -973,9 +997,9 @@ impl MeshOsLoop {
                 "admin-audit-chain append failed — record kept on in-memory ring only",
             );
         }
-        self.actual.admin_audit.push_back(record);
-        while self.actual.admin_audit.len() > super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS {
-            self.actual.admin_audit.pop_front();
+        self.admin_audit_ring.push_back(record);
+        while self.admin_audit_ring.len() > super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS {
+            self.admin_audit_ring.pop_front();
         }
     }
 
@@ -1008,9 +1032,9 @@ impl MeshOsLoop {
                 "log-chain append failed — record kept on in-memory ring only",
             );
         }
-        self.actual.log_ring.push_back(record);
-        while self.actual.log_ring.len() > super::logs::DEFAULT_MAX_LOG_RING_RECORDS {
-            self.actual.log_ring.pop_front();
+        self.log_ring.push_back(record);
+        while self.log_ring.len() > super::logs::DEFAULT_MAX_LOG_RING_RECORDS {
+            self.log_ring.pop_front();
         }
     }
 
@@ -1269,6 +1293,8 @@ impl MeshOsLoop {
             &self.recent_emissions,
             &failures,
             in_flight_migrations,
+            &self.admin_audit_ring,
+            &self.log_ring,
         );
         snap.runtime_epoch_id = self.runtime_epoch_id;
         self.snapshot.store(Arc::new(snap));
