@@ -853,7 +853,7 @@ function MeshAutoform() {
           <span className="font-mono" style={{ color: "rgb(212, 220, 208)" }}>
             ◇
           </span>
-          daemon
+          replica
         </span>
         <span className="flex items-center gap-2">
           <span className="font-mono text-ink">■</span> datafort · gravity well
@@ -862,7 +862,7 @@ function MeshAutoform() {
           <span className="font-mono" style={{ color: "rgb(61, 240, 255)" }}>
             ◆
           </span>
-          mikoshi · in transit
+          daemon / mikoshi · in transit
         </span>
       </div>
     </div>
