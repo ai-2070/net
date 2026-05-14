@@ -22,7 +22,7 @@ export function MikoshiSection() {
             their original hardware.
           </p>
           <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
-            Mikoshi in Net is how daemons move between machines. A running
+            Mikoshi in NET is how daemons move between machines. A running
             program on one node becomes a running program on another without
             losing its history, its pending work, or its place in the
             conversation. The source packages its state, the target unpacks it,

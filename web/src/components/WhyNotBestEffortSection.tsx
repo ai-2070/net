@@ -43,9 +43,9 @@ export function WhyNotBestEffortSection() {
           <div>
             <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
               <strong className="text-ink font-medium">
-                Net inverts the default.
+                NET inverts the default.
               </strong>{" "}
-              TCP starts with trust and detects abuse. Net starts with zero
+              TCP starts with trust and detects abuse. NET starts with zero
               assumptions and lets trust emerge from consistent behavior.
             </p>
             <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">

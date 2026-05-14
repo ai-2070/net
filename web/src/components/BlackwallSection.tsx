@@ -48,7 +48,7 @@ export function BlackwallSection() {
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
         In Cyberpunk, the Blackwall isn&apos;t a wall around the threats —
-        it&apos;s a wall around the safe zone. Net works the same way. The
+        it&apos;s a wall around the safe zone. NET works the same way. The
         &quot;safe mesh&quot; is the part you can observe: nodes that respond
         within heartbeat intervals, honor their capability announcements,
         don&apos;t flood, respect TTL.

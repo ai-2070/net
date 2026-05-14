@@ -17,13 +17,13 @@ export function ClosingSection() {
             Cloud infrastructure solves the wrong problem. It moves compute
             closer to a central provider.{" "}
             <strong className="text-ink font-medium">
-              Net decouples storage and compute from hardware and location.
+              NET decouples storage and compute from hardware and location.
             </strong>
           </p>
           <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
             Cloud adds a trusted intermediary by definition.{" "}
             <strong className="text-ink font-medium">
-              Net has no intermediaries.
+              NET has no intermediaries.
             </strong>{" "}
             Relay nodes forward encrypted bytes they cannot read. There is no
             Cloudflare, no AWS, no Azure in the path because the path is yours.
@@ -39,7 +39,7 @@ export function ClosingSection() {
             should reflect that.
           </p>
           <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
-            A manufacturing plant running on Net doesn&apos;t route sensor data
+            A manufacturing plant running on NET doesn&apos;t route sensor data
             to AWS us-east-1 and back. The sensor talks directly to the decision
             system on the factory floor.{" "}
             <strong className="text-ink font-medium">
@@ -62,7 +62,7 @@ export function ClosingSection() {
           href="#install"
           className="btn-primary inline-flex items-center gap-2.5 px-5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline border border-accent bg-accent text-bg transition-all mt-5"
         >
-          ↓ Join the Net <span className="text-sm">→</span>
+          ↓ Join the NET <span className="text-sm">→</span>
         </a>
       </div>
     </section>

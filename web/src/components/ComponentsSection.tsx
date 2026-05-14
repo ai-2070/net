@@ -61,7 +61,7 @@ const COMPONENTS: readonly ComponentSpec[] = [
   },
   {
     num: "▸ component.04",
-    name: "NetDB",
+    name: "NETDB",
     tagline: "// unified query façade",
     body: (
       <>

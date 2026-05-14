@@ -714,7 +714,7 @@ export function HeroSection() {
             A latency-first encrypted mesh where every computer, app and device
             is a first-class node. Existing networks operate in milliseconds{" "}
             <em className="not-italic text-accent bg-accent/10 px-1">(10⁻³)</em>
-            . Net operates in nanoseconds{" "}
+            . NET operates in nanoseconds{" "}
             <em className="not-italic text-accent bg-accent/10 px-1">(10⁻⁹)</em>
             .
           </p>
@@ -729,7 +729,7 @@ export function HeroSection() {
               href="#install"
               className="btn-primary inline-flex items-center gap-2.5 px-5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline border border-accent bg-accent text-bg transition-all"
             >
-              ↓ Install Net <span className="text-sm">→</span>
+              ↓ Install NET <span className="text-sm">→</span>
             </a>
             <a
               href="#bench"

@@ -210,7 +210,7 @@ export function LatencySpectrum() {
       <p className="text-[10px] text-ink-faint mt-4 leading-[1.6] tracking-[0.04em] font-mono">
         * forward 0.20 ns · cap check 1.78 ns · pingwave 0.65 ns · header
         serialize 1.31 ns (i9-14900K)
-        <br />† real-time guarantees only on dedicated hardware. Net hits the
+        <br />† real-time guarantees only on dedicated hardware. NET hits the
         nanosecond range on commodity wire.
       </p>
     </div>

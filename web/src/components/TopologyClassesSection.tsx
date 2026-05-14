@@ -53,7 +53,7 @@ export function TopologyClassesSection() {
       <DisplayHeading>a new class of system.</DisplayHeading>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
-        Existing networking falls into two categories. Net is neither.
+        Existing networking falls into two categories. NET is neither.
       </p>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 border border-line border-b-0">

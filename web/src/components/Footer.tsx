@@ -105,7 +105,7 @@ export function Footer() {
       <div className="border-t border-line pt-6 flex justify-between text-[10px] text-ink-dim tracking-[0.1em] flex-wrap gap-4">
         <span>© {ET_YEAR} — NET // PROTOCOL.0x4E45·54</span>
         <span>
-          <span className="text-accent">▸</span> Net status:{" "}
+          <span className="text-accent">▸</span> NET status:{" "}
           <span className="text-accent">ONLINE</span>
         </span>
         <span className="shimmer-2070">// AI 2070</span>

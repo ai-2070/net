@@ -42,7 +42,7 @@ export function ComputeRuntimeSection() {
       </div>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
-        A program on Net is called a{" "}
+        A program on NET is called a{" "}
         <em className="not-italic text-accent bg-accent/[0.08] px-1">daemon</em>
         . Its identity is a public key — an{" "}
         <code className="text-accent bg-accent/[0.06] px-1.5 py-0.5 font-mono">

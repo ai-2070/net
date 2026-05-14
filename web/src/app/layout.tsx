@@ -19,9 +19,9 @@ const majorMonoDisplay = Major_Mono_Display({
 });
 
 export const metadata: Metadata = {
-  title: "Net — Network Event Transport. A latency-first encrypted mesh.",
+  title: "NET — Network Event Transport. A latency-first encrypted mesh.",
   description:
-    "Net is a latency-first encrypted mesh runtime. Every device is a first-class node on a flat, encrypted topology. Nanosecond scheduling, zero-copy forwarding, capability-based routing. ~1.92 MB deployed binary.",
+    "NET is a latency-first encrypted mesh runtime. Every device is a first-class node on a flat, encrypted topology. Nanosecond scheduling, zero-copy forwarding, capability-based routing. ~1.92 MB deployed binary.",
 };
 
 export default async function RootLayout({
