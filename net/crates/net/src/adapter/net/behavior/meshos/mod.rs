@@ -57,6 +57,7 @@ pub mod control;
 pub mod event;
 pub mod event_loop;
 pub mod executor;
+pub mod ice;
 pub mod maintenance;
 pub mod probes;
 pub mod reconcile;
@@ -90,6 +91,7 @@ pub use executor::{
     ActionDispatcher, ActionExecutor, DispatchError, ExecutorHandle, ExecutorStats,
     ExecutorStatsSnapshot, LoggingDispatcher,
 };
+pub use ice::{simulate as simulate_ice_proposal, BlastRadius, BlastWarning, IceActionProposal};
 pub use maintenance::MaintenanceState;
 pub use probes::{
     HealthProbe, LocalityProbe, ProximityGraphHealthProbe, ProximityGraphLocalityProbe,

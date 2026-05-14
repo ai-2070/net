@@ -141,7 +141,11 @@ pub enum MeshOsEvent {
 /// Stable handle for a daemon — opaque pair of (registry-local
 /// id, name). The id is the registry's choice (typically a
 /// `u64`); name is the daemon's `MeshDaemon::name()`.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+///
+/// Implements `Serialize` / `Deserialize` so wire forms that
+/// carry daemon references (e.g. ICE [`super::ice::BlastRadius`])
+/// can round-trip postcard / JSON without a per-call projection.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DaemonRef {
     /// Registry-local id.
     pub id: u64,
