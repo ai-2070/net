@@ -262,6 +262,10 @@ impl MeshOsRuntime {
     /// `TypedRedexFile<*>` chains call this directly; the
     /// other `start_with_*` constructors forward with
     /// `None` defaults for the appenders they don't surface.
+    /// To also wire the migration-abort dispatcher (so an ICE
+    /// `KillMigration` commit actually aborts the in-flight
+    /// migration), use
+    /// [`Self::start_with_full_extensions`].
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_all_chains<D: ActionDispatcher>(
         config: MeshOsConfig,
@@ -274,6 +278,43 @@ impl MeshOsRuntime {
         admin_audit_appender: Option<Arc<dyn super::audit_chain::AdminAuditChainAppender>>,
         log_appender: Option<Arc<dyn super::log_chain::LogChainAppender>>,
         failure_appender: Option<Arc<dyn super::failure_chain::FailureChainAppender>>,
+    ) -> Self {
+        Self::start_with_full_extensions(
+            config,
+            dispatcher,
+            probes,
+            scheduler,
+            daemon_registry,
+            control_sink,
+            admin_verifier,
+            admin_audit_appender,
+            log_appender,
+            failure_appender,
+            None,
+        )
+    }
+
+    /// Full-extensions constructor — every chain seam plus the
+    /// migration-abort dispatcher. Production deployments that
+    /// want a `KillMigration` chain commit to actually abort
+    /// the in-flight migration wire an
+    /// [`super::migration_aborter::OrchestratorMigrationAborter`]
+    /// here. Other `start_with_*` constructors forward with
+    /// `None` for this argument; the chain commit still lands
+    /// on the audit ring but the migration runs to completion.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_full_extensions<D: ActionDispatcher>(
+        config: MeshOsConfig,
+        dispatcher: Arc<D>,
+        probes: ProbeRegistry,
+        scheduler: SchedulerRegistry,
+        daemon_registry: Arc<DaemonRegistry>,
+        control_sink: Option<Arc<dyn super::control::ControlSink>>,
+        admin_verifier: Option<Arc<super::ice::AdminVerifier>>,
+        admin_audit_appender: Option<Arc<dyn super::audit_chain::AdminAuditChainAppender>>,
+        log_appender: Option<Arc<dyn super::log_chain::LogChainAppender>>,
+        failure_appender: Option<Arc<dyn super::failure_chain::FailureChainAppender>>,
+        migration_aborter: Option<Arc<dyn super::migration_aborter::MigrationAborter>>,
     ) -> Self {
         let super::event_loop::MeshOsLoopParts {
             mesh_loop,
@@ -311,6 +352,9 @@ impl MeshOsRuntime {
         }
         if let Some(appender) = log_appender {
             mesh_loop = mesh_loop.with_log_appender(appender);
+        }
+        if let Some(aborter) = migration_aborter {
+            mesh_loop = mesh_loop.with_migration_aborter(aborter);
         }
         let dropped_actions = mesh_loop.dropped_actions_counter();
         let loop_task = tokio::spawn(mesh_loop.run());
@@ -782,6 +826,50 @@ mod tests {
         let a = Arc::as_ptr(rt.daemon_registry());
         let b = Arc::as_ptr(rt.daemon_registry());
         assert_eq!(a, b, "daemon_registry() must return the runtime-owned Arc");
+        let _ = rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn start_with_full_extensions_wires_migration_aborter() {
+        use super::super::migration_aborter::{
+            BufferingMigrationAborter, MigrationAborter,
+        };
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let aborter = Arc::new(BufferingMigrationAborter::default());
+        let rt = MeshOsRuntime::start_with_full_extensions(
+            fast_cfg(),
+            Arc::clone(&dispatcher),
+            ProbeRegistry::new(),
+            SchedulerRegistry::new(),
+            Arc::new(DaemonRegistry::new()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(aborter.clone() as Arc<dyn MigrationAborter>),
+        );
+        rt.handle()
+            .publish(MeshOsEvent::AdminEvent(AdminEvent::KillMigration {
+                migration: 0xDEAD,
+            }))
+            .await
+            .unwrap();
+        // Poll for the aborter to see the call.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if !aborter.captured().is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "aborter did not observe KillMigration within 2s; captured={:?}",
+                    aborter.captured(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(aborter.captured(), vec![0xDEAD]);
         let _ = rt.shutdown().await;
     }
 
