@@ -369,6 +369,70 @@ impl DeckClient {
         )
     }
 
+    /// One-shot read of the runtime's latest snapshot.
+    /// Synchronous — one atomic load on the snapshot pointer
+    /// plus a clone of the underlying data. Use for one-off
+    /// reads ("what's the freeze state right now?"); prefer
+    /// [`Self::snapshots`] when iterating over many ticks.
+    pub fn status(&self) -> MeshOsSnapshot {
+        self.snapshot_reader.read()
+    }
+
+    /// Await a snapshot matching `predicate`. Polls the
+    /// snapshot reader at
+    /// [`DeckClientConfig::snapshot_poll_interval`] and resolves
+    /// with the first snapshot for which `predicate` returns
+    /// `true`. If the current snapshot already matches,
+    /// resolves immediately without sleeping.
+    ///
+    /// **Note on wedge risk:** if no snapshot ever matches the
+    /// predicate, this future never resolves. Use
+    /// [`Self::watch_timeout`] for bounded waits.
+    pub async fn watch<F>(&self, mut predicate: F) -> MeshOsSnapshot
+    where
+        F: FnMut(&MeshOsSnapshot) -> bool,
+    {
+        // Check the current snapshot first — many "wait for
+        // state X" calls land on a state that's already true.
+        let snap = self.snapshot_reader.read();
+        if predicate(&snap) {
+            return snap;
+        }
+        let interval = self.config.snapshot_poll_interval.max(Duration::from_millis(1));
+        loop {
+            tokio::time::sleep(interval).await;
+            let snap = self.snapshot_reader.read();
+            if predicate(&snap) {
+                return snap;
+            }
+        }
+    }
+
+    /// Like [`Self::watch`] but with a bounded wait. Returns
+    /// `Ok(snapshot)` on first match, `Err(DeckError)` with
+    /// kind `watch_timeout` when `timeout` elapses without a
+    /// match.
+    pub async fn watch_timeout<F>(
+        &self,
+        predicate: F,
+        timeout: Duration,
+    ) -> Result<MeshOsSnapshot, DeckError>
+    where
+        F: FnMut(&MeshOsSnapshot) -> bool,
+    {
+        tokio::time::timeout(timeout, self.watch(predicate))
+            .await
+            .map_err(|_| {
+                DeckError::new(
+                    "watch_timeout",
+                    format!(
+                        "no snapshot matched the predicate within {} ms",
+                        timeout.as_millis()
+                    ),
+                )
+            })
+    }
+
     fn next_commit_id(&self) -> u64 {
         // Start at 1 so a `0` commit id is recognizable as
         // "unset" downstream.
@@ -1367,6 +1431,111 @@ mod tests {
         let sig = deck.identity().sign_proposal(proposal.action());
         let commit = proposal.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "flush_avoid_lists");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn status_returns_freshest_snapshot_synchronously() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        // Default state — local maintenance is Active.
+        let s = deck.status();
+        assert!(matches!(
+            s.local_maintenance,
+            crate::adapter::net::behavior::meshos::MaintenanceStateSnapshot::Active
+        ));
+
+        // Issue a freeze; subsequent status() should see the
+        // freeze once the loop folds.
+        deck.admin()
+            .freeze_cluster(Duration::from_secs(20))
+            .await
+            .expect("commit");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let s = deck.status();
+        assert!(s.freeze_remaining_ms.is_some());
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn watch_resolves_immediately_when_predicate_already_true() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+        // Default state matches "no freeze in effect" — should
+        // resolve immediately.
+        let snap = tokio::time::timeout(
+            Duration::from_millis(50),
+            deck.watch(|s| s.freeze_remaining_ms.is_none()),
+        )
+        .await
+        .expect("watch should not block when predicate already holds");
+        assert!(snap.freeze_remaining_ms.is_none());
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn watch_resolves_when_predicate_becomes_true_after_admin_commit() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(10),
+                ..DeckClientConfig::default()
+            });
+
+        // Spawn a watcher that waits for a freeze.
+        let deck_handle = deck.snapshot_reader.clone();
+        let watcher = {
+            let identity = deck.identity().clone();
+            let config = deck.config.clone();
+            let handle = deck.handle.clone();
+            // Build a sibling client that shares the same
+            // snapshot reader — `DeckClient` isn't `Clone` and
+            // a real consumer would `Arc::clone` the outer
+            // handle, but spawning shows the watch is non-
+            // blocking on the SDK level.
+            let client =
+                DeckClient::new(handle, deck_handle.clone(), identity, config);
+            tokio::spawn(async move {
+                client
+                    .watch(|s| s.freeze_remaining_ms.is_some())
+                    .await
+            })
+        };
+
+        // Wait a beat so the watcher is in its sleep loop.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        deck.admin()
+            .freeze_cluster(Duration::from_secs(15))
+            .await
+            .expect("commit");
+
+        let snap = tokio::time::timeout(Duration::from_secs(2), watcher)
+            .await
+            .expect("watcher should resolve")
+            .expect("join");
+        assert!(snap.freeze_remaining_ms.is_some());
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn watch_timeout_returns_watch_timeout_error_when_predicate_never_holds() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(10),
+                ..DeckClientConfig::default()
+            });
+
+        let err = deck
+            .watch_timeout(|s| s.freeze_remaining_ms.is_some(), Duration::from_millis(80))
+            .await
+            .expect_err("predicate never holds, should time out");
+        assert_eq!(err.kind, "watch_timeout");
         let _ = runtime.shutdown().await;
     }
 
