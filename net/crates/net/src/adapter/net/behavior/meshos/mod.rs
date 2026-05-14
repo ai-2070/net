@@ -112,8 +112,9 @@ pub use ice::{
     now_ms_since_unix_epoch, simulate as simulate_ice_proposal, AdminAuditRecord, AdminVerifier,
     BlastRadius, BlastRadiusHash, BlastWarning, IceActionProposal, OperatorRegistry,
     OperatorSignature, VerificationOutcome, VerifyError, ADMIN_SIGNING_DOMAIN,
-    BLAST_RADIUS_HASH_LEN, DEFAULT_MAX_ADMIN_AUDIT_RECORDS, DEFAULT_SIGNING_FRESHNESS_WINDOW,
-    DEFAULT_SIGNING_FUTURE_SKEW, ICE_SIGNING_DOMAIN, SIMULATION_REQUIRED_SENTINEL,
+    BLAST_RADIUS_HASH_LEN, DEFAULT_ICE_COOLDOWN_WINDOW, DEFAULT_MAX_ADMIN_AUDIT_RECORDS,
+    DEFAULT_SIGNING_FRESHNESS_WINDOW, DEFAULT_SIGNING_FUTURE_SKEW, ICE_SIGNING_DOMAIN,
+    SIMULATION_REQUIRED_SENTINEL,
 };
 pub use log_chain::{
     BufferingLogChainAppender, LogAppendError, LogChainAppender, NoOpLogChainAppender,

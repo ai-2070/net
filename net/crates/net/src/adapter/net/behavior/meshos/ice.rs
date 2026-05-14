@@ -178,6 +178,14 @@ pub const DEFAULT_SIGNING_FRESHNESS_WINDOW: Duration = Duration::from_secs(300);
 /// staying loose enough to absorb normal NTP drift.
 pub const DEFAULT_SIGNING_FUTURE_SKEW: Duration = Duration::from_secs(30);
 
+/// Plan-default per-target ICE cooldown window. After an ICE
+/// force-operation commits against a node (or cluster-wide), a
+/// subsequent ICE commit against the same target inside this
+/// window fails with [`VerifyError::IceCooldownActive`]. Forces
+/// operators to wait between break-glass operations on the same
+/// node so a typo can't bounce a daemon into a thrash loop.
+pub const DEFAULT_ICE_COOLDOWN_WINDOW: Duration = Duration::from_secs(300);
+
 /// Helper — current wall-clock milliseconds since `UNIX_EPOCH`.
 /// Used as the issuer-side `issued_at_ms` stamp by the SDK and
 /// as the verifier-side `now_ms` reference on the loop. Returns
@@ -513,6 +521,26 @@ pub enum VerifyError {
     /// the signatures' cryptographic validity.
     #[error("ICE commit rejected: simulate() must precede commit() (blast-radius hash is the simulation-required sentinel)")]
     SimulationRequired,
+    /// An ICE commit landed inside the cooldown window of a
+    /// previous ICE commit against the same target. Forces a
+    /// pause between break-glass operations on the same node so
+    /// an operator can't bounce a daemon into a thrash loop.
+    /// `node` is the target whose cooldown is active; `None`
+    /// means a cluster-wide cooldown (the most recent ICE was
+    /// cluster-scope like `FreezeCluster`).
+    #[error(
+        "ICE cooldown active: target {node:?} blocked until {expires_at_ms} ms (verifier observed {now_ms} ms)"
+    )]
+    IceCooldownActive {
+        /// Target node whose cooldown is active, or `None` for
+        /// the cluster-wide cooldown.
+        node: Option<NodeId>,
+        /// When the cooldown lifts (milliseconds since
+        /// `UNIX_EPOCH`).
+        expires_at_ms: u64,
+        /// Verifier-observed milliseconds since `UNIX_EPOCH`.
+        now_ms: u64,
+    },
 }
 
 impl VerifyError {
@@ -526,8 +554,60 @@ impl VerifyError {
             VerifyError::EnvelopeExpired { .. } => "envelope_expired",
             VerifyError::EnvelopeFromFuture { .. } => "envelope_from_future",
             VerifyError::SimulationRequired => "simulation_required",
+            VerifyError::IceCooldownActive { .. } => "ice_cooldown_active",
         }
     }
+}
+
+/// Per-target cooldown state the [`AdminVerifier`] tracks
+/// between successful ICE commits. Each verifier instance has
+/// its own state (per-node — every node's loop runs its own
+/// verifier). The cooldown applies between ICE commits *only*;
+/// ordinary signed-admin commits don't trigger it.
+#[derive(Debug, Default)]
+struct IceCooldownState {
+    /// `node_id → expires_at_ms`. Cooldowns expire by
+    /// wall-clock; entries past `now_ms` are pruned lazily on
+    /// each check.
+    per_node: std::collections::BTreeMap<NodeId, u64>,
+    /// Active cluster-wide cooldown (e.g. after
+    /// `FreezeCluster`). `None` when no cluster-wide cooldown
+    /// is in effect.
+    cluster_wide_until_ms: Option<u64>,
+}
+
+/// Target enumeration the cooldown gate uses to decide which
+/// cooldown bucket to check / write. Cluster-wide proposals
+/// share a single bucket; per-node proposals use the
+/// `per_node` map.
+fn cooldown_targets(proposal: &IceActionProposal) -> CooldownTargets {
+    match proposal {
+        IceActionProposal::FreezeCluster { .. } | IceActionProposal::ThawCluster => {
+            CooldownTargets::ClusterWide
+        }
+        IceActionProposal::FlushAvoidLists { scope } => match scope {
+            AvoidScope::Local { node } => CooldownTargets::PerNode(vec![*node]),
+            AvoidScope::OnPeer { peer } => CooldownTargets::PerNode(vec![*peer]),
+            AvoidScope::Global => CooldownTargets::ClusterWide,
+        },
+        IceActionProposal::ForceEvictReplica { victim, .. } => {
+            CooldownTargets::PerNode(vec![*victim])
+        }
+        IceActionProposal::ForceCutover { target, .. } => {
+            CooldownTargets::PerNode(vec![*target])
+        }
+        // Daemon-id and migration-id proposals don't carry a
+        // node binding; treat as cluster-wide so a thrash-loop
+        // operator still hits the gate.
+        IceActionProposal::ForceRestartDaemon { .. }
+        | IceActionProposal::KillMigration { .. } => CooldownTargets::ClusterWide,
+    }
+}
+
+#[derive(Debug)]
+enum CooldownTargets {
+    ClusterWide,
+    PerNode(Vec<NodeId>),
 }
 
 /// Default cap on the per-node admin audit ring. Records older
@@ -618,13 +698,16 @@ pub struct AdminVerifier {
     threshold: usize,
     freshness_window: Duration,
     future_skew: Duration,
+    ice_cooldown: Duration,
+    ice_state: std::sync::Arc<std::sync::Mutex<IceCooldownState>>,
 }
 
 impl AdminVerifier {
     /// Build a verifier with `threshold` minimum signatures and
     /// the default freshness window
     /// ([`DEFAULT_SIGNING_FRESHNESS_WINDOW`]) /
-    /// future-skew tolerance ([`DEFAULT_SIGNING_FUTURE_SKEW`]).
+    /// future-skew tolerance ([`DEFAULT_SIGNING_FUTURE_SKEW`]) /
+    /// ICE cooldown ([`DEFAULT_ICE_COOLDOWN_WINDOW`]).
     /// `threshold = 0` is clamped to `1` — no admin path should
     /// ever accept an empty signature bundle.
     pub fn new(registry: std::sync::Arc<OperatorRegistry>, threshold: usize) -> Self {
@@ -637,22 +720,42 @@ impl AdminVerifier {
     }
 
     /// Build a verifier with explicit freshness + future-skew
-    /// windows. The defaults from [`Self::new`] match
-    /// [`DEFAULT_SIGNING_FRESHNESS_WINDOW`] /
-    /// [`DEFAULT_SIGNING_FUTURE_SKEW`]; clusters with longer
-    /// multi-operator signature-collection workflows (or
-    /// known-large clock skew) can widen via this constructor.
+    /// windows and the default ICE cooldown. Clusters with
+    /// longer multi-operator signature-collection workflows
+    /// (or known-large clock skew) can widen via this
+    /// constructor.
     pub fn with_freshness(
         registry: std::sync::Arc<OperatorRegistry>,
         threshold: usize,
         freshness_window: Duration,
         future_skew: Duration,
     ) -> Self {
+        Self::with_full_policy(
+            registry,
+            threshold,
+            freshness_window,
+            future_skew,
+            DEFAULT_ICE_COOLDOWN_WINDOW,
+        )
+    }
+
+    /// Build a verifier with every policy knob explicit.
+    /// Primarily for tests that need a short cooldown window;
+    /// production callers should prefer [`Self::new`].
+    pub fn with_full_policy(
+        registry: std::sync::Arc<OperatorRegistry>,
+        threshold: usize,
+        freshness_window: Duration,
+        future_skew: Duration,
+        ice_cooldown: Duration,
+    ) -> Self {
         Self {
             registry,
             threshold: threshold.max(1),
             freshness_window,
             future_skew,
+            ice_cooldown,
+            ice_state: std::sync::Arc::new(std::sync::Mutex::new(IceCooldownState::default())),
         }
     }
 
@@ -678,17 +781,27 @@ impl AdminVerifier {
         self.future_skew
     }
 
+    /// Configured ICE cooldown window.
+    pub fn ice_cooldown(&self) -> Duration {
+        self.ice_cooldown
+    }
+
     /// Verify a `SignedIceCommit`-style bundle against
     /// `proposal` stamped at `issued_at_ms` and bound to
     /// `blast_hash`. Rejects the
     /// [`SIMULATION_REQUIRED_SENTINEL`] hash before any
     /// signature math (substrate enforcement of locked
     /// decision #4), checks freshness relative to `now_ms`,
-    /// then verifies every signature in the bundle against the
-    /// domain-tagged signing payload, and finally checks the
+    /// checks per-target ICE cooldown, then verifies every
+    /// signature in the bundle against the domain-tagged
+    /// signing payload, and finally checks the
     /// distinct-operator count against the configured
-    /// threshold. Computes the signing payload internally so
-    /// the loop never needs to recompute it on the hot path.
+    /// threshold. On success, advances the cooldown clock for
+    /// each affected target so subsequent ICE commits inside
+    /// the window fail with
+    /// [`VerifyError::IceCooldownActive`]. Computes the
+    /// signing payload internally so the loop never needs to
+    /// recompute it on the hot path.
     pub fn verify_commit(
         &self,
         proposal: &IceActionProposal,
@@ -701,9 +814,83 @@ impl AdminVerifier {
             return Err(VerifyError::SimulationRequired);
         }
         self.check_freshness(issued_at_ms, now_ms)?;
+        let targets = cooldown_targets(proposal);
+        self.check_ice_cooldown(&targets, now_ms)?;
         let payload = ice_proposal_signing_payload(proposal, issued_at_ms, blast_hash);
         self.registry
-            .verify_bundle(signatures, &payload, self.threshold)
+            .verify_bundle(signatures, &payload, self.threshold)?;
+        self.record_ice_cooldown(&targets, now_ms);
+        Ok(())
+    }
+
+    fn check_ice_cooldown(
+        &self,
+        targets: &CooldownTargets,
+        now_ms: u64,
+    ) -> Result<(), VerifyError> {
+        // Lock failures here mean a previous holder panicked
+        // mid-update — treat poison as "no active cooldown" so
+        // the verifier doesn't wedge after a panic; the
+        // recover-from-poison branch overwrites with fresh
+        // state on the next successful commit.
+        let state = match self.ice_state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match targets {
+            CooldownTargets::ClusterWide => {
+                if let Some(expires_at_ms) = state.cluster_wide_until_ms {
+                    if expires_at_ms > now_ms {
+                        return Err(VerifyError::IceCooldownActive {
+                            node: None,
+                            expires_at_ms,
+                            now_ms,
+                        });
+                    }
+                }
+            }
+            CooldownTargets::PerNode(nodes) => {
+                for node in nodes {
+                    if let Some(expires_at_ms) = state.per_node.get(node) {
+                        if *expires_at_ms > now_ms {
+                            return Err(VerifyError::IceCooldownActive {
+                                node: Some(*node),
+                                expires_at_ms: *expires_at_ms,
+                                now_ms,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_ice_cooldown(&self, targets: &CooldownTargets, now_ms: u64) {
+        let expires_at_ms = now_ms.saturating_add(self.ice_cooldown.as_millis() as u64);
+        let mut state = match self.ice_state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match targets {
+            CooldownTargets::ClusterWide => {
+                state.cluster_wide_until_ms = Some(expires_at_ms);
+            }
+            CooldownTargets::PerNode(nodes) => {
+                for node in nodes {
+                    state.per_node.insert(*node, expires_at_ms);
+                }
+            }
+        }
+        // Prune entries that have already expired so the map
+        // doesn't grow unbounded with stale nodes the operator
+        // never targets again.
+        state.per_node.retain(|_, expires_at_ms| *expires_at_ms > now_ms);
+        if let Some(cluster_expires) = state.cluster_wide_until_ms {
+            if cluster_expires <= now_ms {
+                state.cluster_wide_until_ms = None;
+            }
+        }
     }
 
     /// Verify a single-signature ordinary-admin commit against
@@ -2035,6 +2222,164 @@ mod tests {
         verifier
             .verify_commit(&proposal, &[sig], issued_at_ms, &blast_hash, now_ms)
             .expect("envelope inside freshness window should verify");
+    }
+
+    #[test]
+    fn ice_cooldown_blocks_second_commit_against_same_target_inside_window() {
+        // Per-node cooldown: ForceCutover against node 42
+        // imposes a cooldown on node 42; a subsequent ICE
+        // commit against node 42 inside the window fails.
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let verifier = AdminVerifier::with_full_policy(
+            std::sync::Arc::new(registry),
+            1,
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let proposal = IceActionProposal::ForceCutover {
+            chain: 100,
+            target: 42,
+        };
+        let issued_at_ms = 1_000_000u64;
+        let now_ms = issued_at_ms;
+        let blast = simulate(&MeshOsSnapshot::default(), &proposal);
+        let blast_hash = blast_radius_hash(&blast);
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms, &blast_hash);
+
+        // First commit succeeds and arms the cooldown.
+        verifier
+            .verify_commit(&proposal, &[sig.clone()], issued_at_ms, &blast_hash, now_ms)
+            .expect("first commit should succeed");
+
+        // Second commit inside the window — fails.
+        let issued_at_ms2 = issued_at_ms + 30_000; // 30s later; cooldown is 60s
+        let now_ms2 = issued_at_ms2;
+        let sig2 = OperatorSignature::sign(&kp, &proposal, issued_at_ms2, &blast_hash);
+        let err = verifier
+            .verify_commit(&proposal, &[sig2], issued_at_ms2, &blast_hash, now_ms2)
+            .unwrap_err();
+        assert_eq!(err.kind(), "ice_cooldown_active");
+        if let VerifyError::IceCooldownActive { node, .. } = err {
+            assert_eq!(node, Some(42));
+        } else {
+            panic!("expected IceCooldownActive {{ node: Some(42), .. }}");
+        }
+    }
+
+    #[test]
+    fn ice_cooldown_releases_after_window_expires() {
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let verifier = AdminVerifier::with_full_policy(
+            std::sync::Arc::new(registry),
+            1,
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let proposal = IceActionProposal::ForceCutover {
+            chain: 100,
+            target: 42,
+        };
+        let issued_at_ms = 1_000_000u64;
+        let blast = simulate(&MeshOsSnapshot::default(), &proposal);
+        let blast_hash = blast_radius_hash(&blast);
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms, &blast_hash);
+        verifier
+            .verify_commit(&proposal, &[sig], issued_at_ms, &blast_hash, issued_at_ms)
+            .expect("first commit should succeed");
+
+        // Past the cooldown window — should succeed again.
+        let later_ms = issued_at_ms + 61_000; // 61s later; cooldown is 60s
+        let sig2 = OperatorSignature::sign(&kp, &proposal, later_ms, &blast_hash);
+        verifier
+            .verify_commit(&proposal, &[sig2], later_ms, &blast_hash, later_ms)
+            .expect("commit after cooldown window should succeed");
+    }
+
+    #[test]
+    fn ice_cooldown_isolates_different_target_nodes() {
+        // A cooldown on node 42 should not block a commit
+        // against node 99 — the per-node bucket isolates
+        // targets.
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let verifier = AdminVerifier::with_full_policy(
+            std::sync::Arc::new(registry),
+            1,
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let issued_at_ms = 1_000_000u64;
+        let proposal_a = IceActionProposal::ForceCutover {
+            chain: 100,
+            target: 42,
+        };
+        let blast_a = simulate(&MeshOsSnapshot::default(), &proposal_a);
+        let hash_a = blast_radius_hash(&blast_a);
+        let sig_a = OperatorSignature::sign(&kp, &proposal_a, issued_at_ms, &hash_a);
+        verifier
+            .verify_commit(&proposal_a, &[sig_a], issued_at_ms, &hash_a, issued_at_ms)
+            .expect("commit against node 42");
+
+        // Different node — should not be in cooldown.
+        let proposal_b = IceActionProposal::ForceCutover {
+            chain: 200,
+            target: 99,
+        };
+        let blast_b = simulate(&MeshOsSnapshot::default(), &proposal_b);
+        let hash_b = blast_radius_hash(&blast_b);
+        let sig_b = OperatorSignature::sign(&kp, &proposal_b, issued_at_ms, &hash_b);
+        verifier
+            .verify_commit(&proposal_b, &[sig_b], issued_at_ms, &hash_b, issued_at_ms)
+            .expect("different node should not be in cooldown");
+    }
+
+    #[test]
+    fn ice_cooldown_freeze_cluster_blocks_subsequent_cluster_wide_commits() {
+        // Cluster-wide cooldown: FreezeCluster blocks the next
+        // ThawCluster inside the window. Subsequent per-node
+        // ICE commits are unaffected because they hit a
+        // different cooldown bucket.
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let verifier = AdminVerifier::with_full_policy(
+            std::sync::Arc::new(registry),
+            1,
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let issued_at_ms = 1_000_000u64;
+        let freeze = IceActionProposal::FreezeCluster {
+            ttl: Duration::from_secs(120),
+        };
+        let blast = simulate(&MeshOsSnapshot::default(), &freeze);
+        let hash = blast_radius_hash(&blast);
+        let sig = OperatorSignature::sign(&kp, &freeze, issued_at_ms, &hash);
+        verifier
+            .verify_commit(&freeze, &[sig], issued_at_ms, &hash, issued_at_ms)
+            .expect("first freeze should succeed");
+
+        let thaw = IceActionProposal::ThawCluster;
+        let later_ms = issued_at_ms + 5_000; // 5s later
+        let thaw_blast = simulate(&MeshOsSnapshot::default(), &thaw);
+        let thaw_hash = blast_radius_hash(&thaw_blast);
+        let thaw_sig = OperatorSignature::sign(&kp, &thaw, later_ms, &thaw_hash);
+        let err = verifier
+            .verify_commit(&thaw, &[thaw_sig], later_ms, &thaw_hash, later_ms)
+            .unwrap_err();
+        assert_eq!(err.kind(), "ice_cooldown_active");
+        if let VerifyError::IceCooldownActive { node, .. } = err {
+            assert_eq!(node, None, "FreezeCluster cooldown is cluster-wide");
+        }
     }
 
     #[test]
