@@ -244,6 +244,77 @@ impl Default for DeckClientConfig {
     }
 }
 
+/// Compact at-a-glance rollup of the runtime's latest snapshot.
+/// Built by [`DeckClient::status_summary`]; designed for the
+/// operator UI's "is everything OK?" header — one pass over
+/// the snapshot to count each cohort, plus the two cluster-
+/// wide flags ([`Self::freeze_remaining_ms`] and
+/// [`Self::local_maintenance_active`]) operators care most
+/// about at first glance.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StatusSummary {
+    /// Per-health-class peer counts.
+    pub peers: PeerCounts,
+    /// Per-lifecycle-and-restart-state daemon counts.
+    pub daemons: DaemonCounts,
+    /// Number of replica chains the snapshot tracks.
+    pub replica_chains: usize,
+    /// Number of avoid-list entries on this node.
+    pub avoid_list_entries: usize,
+    /// Pending action queue depth (reconcile emitted, executor
+    /// hasn't drained yet).
+    pub pending_action_queue_depth: usize,
+    /// Executor failure ring depth.
+    pub recent_failure_count: usize,
+    /// Admin audit ring depth (signed ICE bundles + unsigned
+    /// admin events).
+    pub admin_audit_ring_depth: usize,
+    /// Milliseconds remaining on the cluster-wide ICE freeze.
+    /// `None` if no freeze is in effect.
+    pub freeze_remaining_ms: Option<u64>,
+    /// `true` iff this node's local maintenance state is
+    /// anything other than `Active`. Operators read this for
+    /// "is this node in maintenance right now?".
+    pub local_maintenance_active: bool,
+}
+
+/// Peer-health counts within a [`StatusSummary`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PeerCounts {
+    /// Peers responding within the heartbeat window.
+    pub healthy: usize,
+    /// Peers responding but slow.
+    pub degraded: usize,
+    /// Peers unreachable.
+    pub unreachable: usize,
+    /// Peers without a health sample yet.
+    pub unknown: usize,
+}
+
+/// Daemon counts within a [`StatusSummary`]. Lifecycle
+/// counts are disjoint partitions of the registered set;
+/// `crash_looping` / `backing_off` are orthogonal restart-
+/// state markers that overlap with lifecycle (a `Stopped`
+/// daemon can also be `BackingOff`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DaemonCounts {
+    /// Currently running.
+    pub running: usize,
+    /// Start requested; awaiting confirmation.
+    pub starting: usize,
+    /// Stop requested; awaiting confirmation.
+    pub stopping: usize,
+    /// Not currently running.
+    pub stopped: usize,
+    /// In supervisor's BackingOff window. Orthogonal to
+    /// lifecycle — a daemon in this state is typically also
+    /// `Stopped`.
+    pub backing_off: usize,
+    /// In supervisor's CrashLooping window — has crossed the
+    /// crash-loop threshold and is parked for a longer cooldown.
+    pub crash_looping: usize,
+}
+
 /// Operator-facing client. Composes a [`MeshOsHandle`] +
 /// [`MeshOsSnapshotReader`] + [`OperatorIdentity`] into the
 /// surface Deck-the-binary (and other operator tools) bind
@@ -374,6 +445,84 @@ impl DeckClient {
     /// [`Self::snapshots`] when iterating over many ticks.
     pub fn status(&self) -> MeshOsSnapshot {
         self.snapshot_reader.read()
+    }
+
+    /// Roll the snapshot up into a compact at-a-glance status
+    /// summary — daemon-health counts, peer-health counts,
+    /// freeze / maintenance flags, queue depths. Useful for
+    /// the operator UI's "is everything OK?" header. One
+    /// snapshot load + a single iterator pass; no full clone.
+    pub fn status_summary(&self) -> StatusSummary {
+        let snap = self.snapshot_reader.load();
+        let mut peers = PeerCounts::default();
+        for (_, peer) in snap.peers.iter() {
+            match peer.health {
+                Some(super::meshos::PeerHealthSnapshot::Healthy) => peers.healthy += 1,
+                Some(super::meshos::PeerHealthSnapshot::Degraded) => peers.degraded += 1,
+                Some(super::meshos::PeerHealthSnapshot::Unreachable) => peers.unreachable += 1,
+                None => peers.unknown += 1,
+            }
+        }
+        let mut daemons = DaemonCounts::default();
+        for (_, d) in snap.daemons.iter() {
+            match d.lifecycle {
+                super::meshos::DaemonLifecycleSnapshot::Running => daemons.running += 1,
+                super::meshos::DaemonLifecycleSnapshot::Starting => daemons.starting += 1,
+                super::meshos::DaemonLifecycleSnapshot::Stopping => daemons.stopping += 1,
+                super::meshos::DaemonLifecycleSnapshot::Stopped => daemons.stopped += 1,
+            }
+            match d.restart_state {
+                super::meshos::RestartStateSnapshot::Idle => {}
+                super::meshos::RestartStateSnapshot::BackingOff { .. } => daemons.backing_off += 1,
+                super::meshos::RestartStateSnapshot::CrashLooping { .. } => {
+                    daemons.crash_looping += 1
+                }
+            }
+        }
+        let maintenance_active = !matches!(
+            snap.local_maintenance,
+            super::meshos::MaintenanceStateSnapshot::Active
+        );
+        StatusSummary {
+            peers,
+            daemons,
+            replica_chains: snap.replicas.len(),
+            avoid_list_entries: snap.avoid_list.len(),
+            pending_action_queue_depth: snap.pending.len(),
+            recent_failure_count: snap.recent_failures.len(),
+            admin_audit_ring_depth: snap.admin_audit.len(),
+            freeze_remaining_ms: snap.freeze_remaining_ms,
+            local_maintenance_active: maintenance_active,
+        }
+    }
+
+    /// Borrow the latest peer summary. One snapshot load + a
+    /// clone of just the peers map.
+    pub fn peers(&self) -> std::collections::BTreeMap<NodeId, super::meshos::PeerSnapshot> {
+        self.snapshot_reader.load().peers.clone()
+    }
+
+    /// Borrow the latest daemon summary keyed by daemon id.
+    pub fn daemons(&self) -> std::collections::BTreeMap<u64, super::meshos::DaemonSnapshot> {
+        self.snapshot_reader.load().daemons.clone()
+    }
+
+    /// Borrow the latest replica summary keyed by chain id.
+    pub fn replicas(
+        &self,
+    ) -> std::collections::BTreeMap<ChainId, super::meshos::ReplicaSnapshot> {
+        self.snapshot_reader.load().replicas.clone()
+    }
+
+    /// Read this node's local maintenance state.
+    pub fn local_maintenance(&self) -> super::meshos::MaintenanceStateSnapshot {
+        self.snapshot_reader.load().local_maintenance.clone()
+    }
+
+    /// Read the cluster-wide ICE freeze remaining time. `None`
+    /// when no freeze is in effect.
+    pub fn freeze_remaining_ms(&self) -> Option<u64> {
+        self.snapshot_reader.load().freeze_remaining_ms
     }
 
     /// Await a snapshot matching `predicate`. Polls the
@@ -1446,6 +1595,72 @@ mod tests {
         let sig = deck.identity().sign_proposal(proposal.action());
         let commit = proposal.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "flush_avoid_lists");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn status_summary_reflects_steady_state_idle_cluster() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+        let summary = deck.status_summary();
+        assert_eq!(summary.peers, PeerCounts::default());
+        assert_eq!(summary.daemons, DaemonCounts::default());
+        assert_eq!(summary.replica_chains, 0);
+        assert_eq!(summary.pending_action_queue_depth, 0);
+        assert!(summary.freeze_remaining_ms.is_none());
+        assert!(!summary.local_maintenance_active);
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn status_summary_flags_freeze_after_freeze_cluster_commit() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+        deck.admin()
+            .freeze_cluster(Duration::from_secs(30))
+            .await
+            .expect("freeze");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let summary = deck.status_summary();
+        assert!(summary.freeze_remaining_ms.is_some());
+        // Audit ring should have at least one entry now.
+        assert!(summary.admin_audit_ring_depth >= 1);
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn status_summary_flags_local_maintenance_after_enter_maintenance() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+        // `fast_config` pins this_node = 42; target the same.
+        deck.admin()
+            .enter_maintenance(42, None)
+            .await
+            .expect("commit");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let summary = deck.status_summary();
+        assert!(
+            summary.local_maintenance_active,
+            "local_maintenance_active should flip on after enter_maintenance",
+        );
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn per_field_accessors_match_full_snapshot_contents() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        let snap = deck.status();
+        assert_eq!(deck.peers(), snap.peers);
+        assert_eq!(deck.daemons(), snap.daemons);
+        assert_eq!(deck.replicas(), snap.replicas);
+        assert_eq!(deck.local_maintenance(), snap.local_maintenance);
+        assert_eq!(deck.freeze_remaining_ms(), snap.freeze_remaining_ms);
         let _ = runtime.shutdown().await;
     }
 
