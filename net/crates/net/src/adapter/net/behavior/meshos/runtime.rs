@@ -167,6 +167,30 @@ impl MeshOsRuntime {
         daemon_registry: Arc<DaemonRegistry>,
         control_sink: Option<Arc<dyn super::control::ControlSink>>,
     ) -> Self {
+        Self::start_with_all(
+            config,
+            dispatcher,
+            probes,
+            scheduler,
+            daemon_registry,
+            control_sink,
+            None,
+        )
+    }
+
+    /// Maximum-control constructor — accepts every optional
+    /// extension the loop supports, including the ICE admin
+    /// verifier that gates `MeshOsEvent::SignedIceCommit`
+    /// folding on multi-operator signature verification.
+    pub fn start_with_all<D: ActionDispatcher>(
+        config: MeshOsConfig,
+        dispatcher: Arc<D>,
+        probes: ProbeRegistry,
+        scheduler: SchedulerRegistry,
+        daemon_registry: Arc<DaemonRegistry>,
+        control_sink: Option<Arc<dyn super::control::ControlSink>>,
+        admin_verifier: Option<Arc<super::ice::AdminVerifier>>,
+    ) -> Self {
         let super::event_loop::MeshOsLoopParts {
             mesh_loop,
             handle,
@@ -191,6 +215,9 @@ impl MeshOsRuntime {
             .with_executor_failures(exec.recent_failures_handle());
         if let Some(sink) = control_sink {
             mesh_loop = mesh_loop.with_control_sink(sink);
+        }
+        if let Some(verifier) = admin_verifier {
+            mesh_loop = mesh_loop.with_admin_verifier(verifier);
         }
         let dropped_actions = mesh_loop.dropped_actions_counter();
         let loop_task = tokio::spawn(mesh_loop.run());

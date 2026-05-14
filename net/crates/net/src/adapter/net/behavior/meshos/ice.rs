@@ -40,8 +40,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::event::{ChainId, DaemonRef, NodeId};
+use super::event::{AdminEvent, ChainId, DaemonRef, NodeId};
 use super::snapshot::MeshOsSnapshot;
+use crate::adapter::net::identity::{EntityId, EntityKeypair};
 
 /// Substrate-stable enumeration of ICE proposals the simulator
 /// understands. The Deck SDK's `IceCommands` builder produces
@@ -62,6 +63,251 @@ pub enum IceActionProposal {
     /// Cancel an in-effect freeze. Maps to
     /// [`super::event::AdminEvent::ThawCluster`].
     ThawCluster,
+}
+
+impl IceActionProposal {
+    /// Translate the proposal to its corresponding
+    /// [`AdminEvent`]. The substrate folds the [`AdminEvent`];
+    /// the proposal is the SDK-side builder + signing form.
+    pub fn to_admin_event(&self) -> AdminEvent {
+        match self {
+            IceActionProposal::FreezeCluster { ttl } => AdminEvent::FreezeCluster { ttl: *ttl },
+            IceActionProposal::ThawCluster => AdminEvent::ThawCluster,
+        }
+    }
+}
+
+/// Operator signature over an [`IceActionProposal`]. Carries
+/// the issuing operator's id plus a 64-byte ed25519 signature
+/// over [`ice_proposal_signing_payload`]'s deterministic
+/// postcard encoding. The substrate verifier
+/// ([`OperatorRegistry::verify`]) re-checks the bundle on the
+/// loop side of every [`super::event::MeshOsEvent::SignedIceCommit`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperatorSignature {
+    /// Issuing operator's id (Deck SDK's
+    /// `OperatorIdentity::operator_id`).
+    pub operator_id: u64,
+    /// 64-byte ed25519 signature over
+    /// [`ice_proposal_signing_payload`].
+    pub signature: Vec<u8>,
+}
+
+/// Deterministic encoding the signing + verifying paths both
+/// use. Pinned via the [`IceActionProposal`] postcard form so
+/// every binding signs over the same bytes.
+pub fn ice_proposal_signing_payload(proposal: &IceActionProposal) -> Vec<u8> {
+    postcard::to_allocvec(proposal).expect("postcard encoding of IceActionProposal is infallible")
+}
+
+impl OperatorSignature {
+    /// Sign `proposal` with `keypair`'s ed25519 secret. The
+    /// 64-byte signature covers
+    /// [`ice_proposal_signing_payload`], so two operators
+    /// signing the same proposal produce bit-identical inputs
+    /// the verifier can re-check.
+    ///
+    /// Panics on a public-only keypair — callers that may hold
+    /// one should guard with `EntityKeypair::is_read_only`.
+    pub fn sign(keypair: &EntityKeypair, proposal: &IceActionProposal) -> Self {
+        let payload = ice_proposal_signing_payload(proposal);
+        let sig = keypair.sign(&payload);
+        Self {
+            operator_id: keypair.origin_hash(),
+            signature: sig.to_bytes().to_vec(),
+        }
+    }
+}
+
+/// Operator-key registry. Maps each operator id to the public
+/// key the substrate uses to validate that operator's
+/// signatures. Shared between the SDK-side gate (Deck SDK's
+/// `IceProposal::commit`) and the substrate-side loop verifier
+/// (`MeshOsLoop::with_admin_verifier`) so a malicious SDK can't
+/// bypass verification.
+#[derive(Clone, Debug, Default)]
+pub struct OperatorRegistry {
+    keys: std::collections::BTreeMap<u64, EntityId>,
+}
+
+impl OperatorRegistry {
+    /// Empty registry. Every verify against this registry
+    /// returns `not_authorized` until at least one operator is
+    /// inserted.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register an operator's public key. Subsequent
+    /// [`Self::verify`] calls for `operator_id` resolve against
+    /// this entry.
+    pub fn insert(&mut self, operator_id: u64, public_key: EntityId) {
+        self.keys.insert(operator_id, public_key);
+    }
+
+    /// Convenience: register `keypair`'s public key under its
+    /// derived operator id (the keypair's `origin_hash`).
+    pub fn register(&mut self, keypair: &EntityKeypair) {
+        self.insert(keypair.origin_hash(), keypair.entity_id().clone());
+    }
+
+    /// `true` iff `operator_id` is registered.
+    pub fn contains(&self, operator_id: u64) -> bool {
+        self.keys.contains_key(&operator_id)
+    }
+
+    /// Number of registered operators.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// `true` iff no operators are registered.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Verify `signature` against the registered public key for
+    /// `signature.operator_id` over `payload`. Returns
+    /// [`VerifyError::NotAuthorized`] for an unknown operator,
+    /// [`VerifyError::InvalidSignature`] for a malformed or
+    /// tampered signature.
+    pub fn verify(
+        &self,
+        signature: &OperatorSignature,
+        payload: &[u8],
+    ) -> Result<(), VerifyError> {
+        let entity_id = self
+            .keys
+            .get(&signature.operator_id)
+            .ok_or(VerifyError::NotAuthorized {
+                operator_id: signature.operator_id,
+            })?;
+        let sig_bytes: &[u8; 64] = signature.signature.as_slice().try_into().map_err(|_| {
+            VerifyError::InvalidSignature {
+                operator_id: signature.operator_id,
+                reason: format!("signature is not 64 bytes (got {})", signature.signature.len()),
+            }
+        })?;
+        let ed_sig = ed25519_dalek::Signature::from_bytes(sig_bytes);
+        entity_id
+            .verify(payload, &ed_sig)
+            .map_err(|_| VerifyError::InvalidSignature {
+                operator_id: signature.operator_id,
+                reason: "signature failed verification against the registered public key".into(),
+            })
+    }
+
+    /// Verify every signature in `signatures` against `payload`
+    /// and confirm there are at least `threshold` valid bundles.
+    /// Fails fast on the first verification error.
+    pub fn verify_bundle(
+        &self,
+        signatures: &[OperatorSignature],
+        payload: &[u8],
+        threshold: usize,
+    ) -> Result<(), VerifyError> {
+        if signatures.len() < threshold {
+            return Err(VerifyError::InsufficientSignatures {
+                got: signatures.len(),
+                required: threshold,
+            });
+        }
+        for sig in signatures {
+            self.verify(sig, payload)?;
+        }
+        Ok(())
+    }
+}
+
+/// Substrate-side ICE verification error. The Deck SDK maps each
+/// variant to its `<<deck-sdk-kind:KIND>>MSG` envelope.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum VerifyError {
+    /// The operator id on the signature isn't registered with
+    /// the cluster's operator policy.
+    #[error("operator {operator_id} is not registered in the cluster's operator policy")]
+    NotAuthorized {
+        /// Issuing operator id from the rejected signature.
+        operator_id: u64,
+    },
+    /// The signature is malformed, tampered, or signed a
+    /// different payload than the one verified.
+    #[error("operator {operator_id} signature invalid: {reason}")]
+    InvalidSignature {
+        /// Issuing operator id from the rejected signature.
+        operator_id: u64,
+        /// Diagnostic detail.
+        reason: String,
+    },
+    /// The bundle carried fewer signatures than the cluster's
+    /// configured threshold.
+    #[error("insufficient signatures: got {got}, required {required}")]
+    InsufficientSignatures {
+        /// Number of signatures supplied.
+        got: usize,
+        /// Minimum required by the cluster's policy.
+        required: usize,
+    },
+}
+
+impl VerifyError {
+    /// Stable lowercase kind discriminator the Deck SDK +
+    /// cross-language consumers branch on.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            VerifyError::NotAuthorized { .. } => "not_authorized",
+            VerifyError::InvalidSignature { .. } => "signature_invalid",
+            VerifyError::InsufficientSignatures { .. } => "insufficient_signatures",
+        }
+    }
+}
+
+/// Substrate-side ICE admin verifier — bundles a shared
+/// [`OperatorRegistry`] with the cluster's signature threshold.
+/// Installed on [`super::event_loop::MeshOsLoop`] via
+/// `with_admin_verifier`; the loop runs every
+/// [`super::event::MeshOsEvent::SignedIceCommit`] through
+/// [`Self::verify_commit`] before folding the inner
+/// [`AdminEvent`].
+#[derive(Clone, Debug)]
+pub struct AdminVerifier {
+    registry: std::sync::Arc<OperatorRegistry>,
+    threshold: usize,
+}
+
+impl AdminVerifier {
+    /// Build a verifier with `threshold` minimum signatures.
+    /// `threshold = 0` is clamped to `1` — no admin path should
+    /// ever accept an empty signature bundle.
+    pub fn new(registry: std::sync::Arc<OperatorRegistry>, threshold: usize) -> Self {
+        Self {
+            registry,
+            threshold: threshold.max(1),
+        }
+    }
+
+    /// Borrow the underlying registry.
+    pub fn registry(&self) -> &OperatorRegistry {
+        &self.registry
+    }
+
+    /// Configured minimum-signature threshold.
+    pub fn threshold(&self) -> usize {
+        self.threshold
+    }
+
+    /// Verify a `SignedIceCommit`-style bundle against
+    /// `proposal`. Computes the signing payload internally so
+    /// the loop never needs to recompute it on the hot path.
+    pub fn verify_commit(
+        &self,
+        proposal: &IceActionProposal,
+        signatures: &[OperatorSignature],
+    ) -> Result<(), VerifyError> {
+        let payload = ice_proposal_signing_payload(proposal);
+        self.registry
+            .verify_bundle(signatures, &payload, self.threshold)
+    }
 }
 
 /// Pre-execution preview of an ICE action's effect. The Deck
@@ -284,5 +530,71 @@ mod tests {
             let decoded: IceActionProposal = postcard::from_bytes(&bytes).expect("decode");
             assert_eq!(decoded, proposal);
         }
+    }
+
+    #[test]
+    fn operator_signature_signs_and_verifies_round_trip() {
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let proposal = IceActionProposal::FreezeCluster {
+            ttl: Duration::from_secs(30),
+        };
+        let sig = OperatorSignature::sign(&kp, &proposal);
+        let payload = ice_proposal_signing_payload(&proposal);
+        registry.verify(&sig, &payload).expect("valid signature");
+    }
+
+    #[test]
+    fn operator_registry_rejects_unknown_operator_via_substrate_path() {
+        let kp = EntityKeypair::generate();
+        let registry = OperatorRegistry::new(); // empty
+        let proposal = IceActionProposal::ThawCluster;
+        let sig = OperatorSignature::sign(&kp, &proposal);
+        let payload = ice_proposal_signing_payload(&proposal);
+        let err = registry.verify(&sig, &payload).unwrap_err();
+        assert!(matches!(err, VerifyError::NotAuthorized { .. }));
+        assert_eq!(err.kind(), "not_authorized");
+    }
+
+    #[test]
+    fn admin_verifier_clamps_zero_threshold_to_one() {
+        let registry = std::sync::Arc::new(OperatorRegistry::new());
+        let verifier = AdminVerifier::new(registry, 0);
+        assert_eq!(verifier.threshold(), 1);
+    }
+
+    #[test]
+    fn admin_verifier_returns_insufficient_signatures_for_empty_bundle() {
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 2);
+        let proposal = IceActionProposal::ThawCluster;
+        let sig = OperatorSignature::sign(&kp, &proposal);
+        let err = verifier.verify_commit(&proposal, &[sig]).unwrap_err();
+        assert!(matches!(
+            err,
+            VerifyError::InsufficientSignatures { got: 1, required: 2 }
+        ));
+    }
+
+    #[test]
+    fn ice_proposal_to_admin_event_maps_freeze_cluster() {
+        let proposal = IceActionProposal::FreezeCluster {
+            ttl: Duration::from_secs(45),
+        };
+        assert!(matches!(
+            proposal.to_admin_event(),
+            AdminEvent::FreezeCluster { ttl } if ttl == Duration::from_secs(45)
+        ));
+    }
+
+    #[test]
+    fn ice_proposal_to_admin_event_maps_thaw_cluster() {
+        assert!(matches!(
+            IceActionProposal::ThawCluster.to_admin_event(),
+            AdminEvent::ThawCluster
+        ));
     }
 }

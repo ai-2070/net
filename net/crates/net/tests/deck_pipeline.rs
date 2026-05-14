@@ -17,10 +17,12 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use net::adapter::net::behavior::deck::{
-    AdminError, DeckClient, DeckClientConfig, OperatorIdentity, OperatorSignature,
+    AdminError, DeckClient, DeckClientConfig, OperatorIdentity, OperatorRegistry,
+    OperatorSignature,
 };
 use net::adapter::net::behavior::meshos::{
-    BlastWarning, LoggingDispatcher, MaintenanceStateSnapshot, MeshOsConfig, MeshOsRuntime,
+    ice_proposal_signing_payload, AdminVerifier, BlastWarning, IceActionProposal,
+    LoggingDispatcher, MaintenanceStateSnapshot, MeshOsConfig, MeshOsEvent, MeshOsRuntime,
 };
 
 const THIS_NODE: u64 = 200;
@@ -199,7 +201,7 @@ async fn ice_proposal_simulate_then_commit_lands_freeze_through_pipeline() {
         .iter()
         .any(|w| matches!(w, BlastWarning::ClusterFreezeBlocksOperatorActions)));
 
-    let sig = OperatorSignature::sign(deck.identity(), proposal.action());
+    let sig = deck.identity().sign_proposal(proposal.action());
     let commit = proposal.commit(&[sig]).await.expect("commit");
     assert_eq!(commit.event_kind(), "freeze_cluster");
 
@@ -229,7 +231,7 @@ async fn ice_proposal_commit_without_simulate_is_rejected_before_publish() {
     let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
 
     let proposal = deck.ice().freeze_cluster(Duration::from_secs(10));
-    let sig = OperatorSignature::sign(deck.identity(), proposal.action());
+    let sig = deck.identity().sign_proposal(proposal.action());
     let err = proposal
         .commit(&[sig])
         .await
@@ -241,5 +243,102 @@ async fn ice_proposal_commit_without_simulate_is_rejected_before_publish() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let snap = runtime.snapshot();
     assert!(snap.freeze_remaining_ms.is_none());
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn substrate_admin_verifier_rejects_tampered_signed_ice_commit() {
+    // A malicious SDK that bypasses its own gate but submits a
+    // tampered signature bundle must be rejected by the loop's
+    // verifier — the inner AdminEvent must not fold.
+    use std::sync::Arc as SArc;
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let op = OperatorIdentity::generate();
+    let mut registry = OperatorRegistry::new();
+    registry.register(op.keypair());
+    let verifier = SArc::new(AdminVerifier::new(SArc::new(registry), 1));
+    let runtime = MeshOsRuntime::start_with_all(
+        fast_config(),
+        dispatcher,
+        Default::default(),
+        Default::default(),
+        SArc::new(net::adapter::net::compute::DaemonRegistry::new()),
+        None,
+        Some(verifier),
+    );
+
+    // Bypass the SDK and publish a tampered SignedIceCommit
+    // directly via the handle.
+    let proposal = IceActionProposal::FreezeCluster {
+        ttl: Duration::from_secs(20),
+    };
+    let mut sig = OperatorSignature::sign(op.keypair(), &proposal);
+    sig.signature[5] ^= 0xAA; // tamper
+
+    runtime
+        .handle()
+        .publish(MeshOsEvent::SignedIceCommit {
+            proposal: proposal.clone(),
+            signatures: vec![sig],
+        })
+        .await
+        .unwrap();
+
+    // Give the loop time to process + reject.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let snap = runtime.snapshot();
+    assert!(
+        snap.freeze_remaining_ms.is_none(),
+        "loop verifier should have rejected the tampered bundle; freeze should not be in effect",
+    );
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn substrate_admin_verifier_accepts_a_valid_signed_ice_commit_and_folds_it() {
+    // The valid bundle path: a properly signed proposal folds
+    // into state via the loop's verifier just like an unsigned
+    // AdminEvent would.
+    use std::sync::Arc as SArc;
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let op = OperatorIdentity::generate();
+    let mut registry = OperatorRegistry::new();
+    registry.register(op.keypair());
+    let verifier = SArc::new(AdminVerifier::new(SArc::new(registry), 1));
+    let runtime = MeshOsRuntime::start_with_all(
+        fast_config(),
+        dispatcher,
+        Default::default(),
+        Default::default(),
+        SArc::new(net::adapter::net::compute::DaemonRegistry::new()),
+        None,
+        Some(verifier),
+    );
+
+    let proposal = IceActionProposal::FreezeCluster {
+        ttl: Duration::from_secs(30),
+    };
+    let payload = ice_proposal_signing_payload(&proposal);
+    let sig = OperatorSignature::sign(op.keypair(), &proposal);
+    // Sanity: payload + signature match what the SDK would
+    // produce.
+    assert_eq!(sig.operator_id, op.operator_id());
+    assert!(!payload.is_empty());
+
+    runtime
+        .handle()
+        .publish(MeshOsEvent::SignedIceCommit {
+            proposal: proposal.clone(),
+            signatures: vec![sig],
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let snap = runtime.snapshot();
+    assert!(
+        snap.freeze_remaining_ms.is_some(),
+        "verified SignedIceCommit should fold its inner FreezeCluster admin event",
+    );
     let _ = runtime.shutdown().await;
 }

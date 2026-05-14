@@ -73,6 +73,26 @@ pub enum MeshOsEvent {
     /// (Phase D): the admin chain fold.
     AdminEvent(AdminEvent),
 
+    /// A multi-operator-signed ICE proposal arrived from the
+    /// Deck SDK. The loop's optional admin verifier checks every
+    /// signature in the bundle against the cluster's registered
+    /// operator policy before folding the inner
+    /// [`AdminEvent`]; if verification fails the event drops and
+    /// the failure is recorded for operator visibility.
+    SignedIceCommit {
+        /// The proposal that the bundle signed over. The loop
+        /// verifies each signature against
+        /// [`super::ice::ice_proposal_signing_payload`].
+        proposal: super::ice::IceActionProposal,
+        /// Operator signatures collected for this proposal. Per
+        /// the plan's locked decision #3 the substrate verifier
+        /// requires the bundle to meet the cluster's configured
+        /// `ice_signature_threshold`; the SDK-side gate also
+        /// enforces this so under-threshold bundles fail before
+        /// they reach the loop.
+        signatures: Vec<super::ice::OperatorSignature>,
+    },
+
     /// A blob was announced / removed. Source (Phase E): the
     /// Dataforts capability fold.
     BlobAnnouncement(BlobAnnouncement),

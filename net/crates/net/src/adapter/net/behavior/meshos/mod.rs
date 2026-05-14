@@ -91,7 +91,10 @@ pub use executor::{
     ActionDispatcher, ActionExecutor, DispatchError, ExecutorHandle, ExecutorStats,
     ExecutorStatsSnapshot, LoggingDispatcher,
 };
-pub use ice::{simulate as simulate_ice_proposal, BlastRadius, BlastWarning, IceActionProposal};
+pub use ice::{
+    ice_proposal_signing_payload, simulate as simulate_ice_proposal, AdminVerifier, BlastRadius,
+    BlastWarning, IceActionProposal, OperatorRegistry, OperatorSignature, VerifyError,
+};
 pub use maintenance::MaintenanceState;
 pub use probes::{
     HealthProbe, LocalityProbe, ProximityGraphHealthProbe, ProximityGraphLocalityProbe,

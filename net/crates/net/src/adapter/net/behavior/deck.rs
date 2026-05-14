@@ -81,8 +81,9 @@ use futures::Stream;
 use tokio::time::{interval, Interval};
 
 use super::meshos::{
-    simulate_ice_proposal, AdminEvent, BlastRadius, ChainId, IceActionProposal, MeshOsEvent,
-    MeshOsHandle, MeshOsHandleError, MeshOsRuntime, MeshOsSnapshot, MeshOsSnapshotReader, NodeId,
+    ice_proposal_signing_payload, simulate_ice_proposal, AdminEvent, BlastRadius, ChainId,
+    IceActionProposal, MeshOsEvent, MeshOsHandle, MeshOsHandleError, MeshOsRuntime, MeshOsSnapshot,
+    MeshOsSnapshotReader, NodeId,
 };
 use crate::adapter::net::identity::EntityKeypair;
 
@@ -378,6 +379,27 @@ impl DeckClient {
             committed_at: SystemTime::now(),
         })
     }
+
+    async fn publish_signed_ice(
+        &self,
+        proposal: IceActionProposal,
+        signatures: Vec<OperatorSignature>,
+        kind: &'static str,
+    ) -> Result<ChainCommit, IceError> {
+        self.handle
+            .publish(MeshOsEvent::SignedIceCommit {
+                proposal,
+                signatures,
+            })
+            .await
+            .map_err(IceError::from)?;
+        Ok(ChainCommit {
+            commit_id: self.next_commit_id(),
+            operator_id: self.identity.operator_id,
+            event_kind: kind,
+            committed_at: SystemTime::now(),
+        })
+    }
 }
 
 /// Typed admin-command surface. Constructed via
@@ -525,130 +547,27 @@ impl AdminCommands<'_> {
     }
 }
 
-/// Operator signature over an [`IceActionProposal`]. Carries
-/// the issuing operator's id plus a real ed25519 signature over
-/// the proposal's deterministic postcard encoding. The shape is
-/// what the substrate-side verifier will accept once the
-/// multi-operator channel-auth slice lands; until then the SDK
-/// verifies signatures locally when an [`OperatorRegistry`] is
-/// installed on the [`DeckClient`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OperatorSignature {
-    /// Issuing operator's id (from [`OperatorIdentity::operator_id`]).
-    pub operator_id: u64,
-    /// 64-byte ed25519 signature over the postcard encoding of
-    /// the [`IceActionProposal`]. The encoding is deterministic
-    /// so two operators signing the same proposal produce
-    /// bit-identical inputs for the substrate verifier to
-    /// re-check.
-    pub signature: Vec<u8>,
-}
+/// Re-export the substrate-side signing types so the SDK
+/// surface stays under `behavior::deck::*` for backwards
+/// compatibility with the previous slice. The implementations
+/// live alongside the rest of ICE in `behavior::meshos::ice`.
+pub use super::meshos::{OperatorRegistry, OperatorSignature, VerifyError};
 
-/// Deterministic encoding the signing + verifying paths both
-/// use. Pinned via the [`IceActionProposal`] postcard form.
-pub(crate) fn ice_proposal_signing_payload(proposal: &IceActionProposal) -> Vec<u8> {
-    postcard::to_allocvec(proposal).expect("postcard encoding of IceActionProposal is infallible")
-}
-
-impl OperatorSignature {
-    /// Sign `proposal` with `identity`'s ed25519 key. Panics on
-    /// a public-only identity — callers that may hold one should
-    /// guard with [`OperatorIdentity::keypair`]'s `is_read_only`.
-    pub fn sign(identity: &OperatorIdentity, proposal: &IceActionProposal) -> Self {
-        let payload = ice_proposal_signing_payload(proposal);
-        let sig = identity.keypair().sign(&payload);
-        Self {
-            operator_id: identity.operator_id(),
-            signature: sig.to_bytes().to_vec(),
-        }
+impl OperatorIdentity {
+    /// Sign `proposal` with this operator's ed25519 key. Thin
+    /// SDK-ergonomic wrapper over the substrate's
+    /// [`OperatorSignature::sign`] constructor.
+    pub fn sign_proposal(&self, proposal: &IceActionProposal) -> OperatorSignature {
+        OperatorSignature::sign(self.keypair(), proposal)
     }
 }
 
-/// Operator-key registry. Maps each operator id to the public
-/// key the SDK (and, eventually, the substrate verifier) uses
-/// to validate that operator's signatures.
-///
-/// Phase 3b: SDK-side only. Install one on a [`DeckClient`] via
-/// [`DeckClient::with_operator_registry`] to gate every ICE
-/// commit on signature verification. When the substrate-side
-/// multi-operator channel-auth slice lands, the same wire
-/// shape (operator id + 64-byte ed25519 signature over the
-/// postcard-encoded [`IceActionProposal`]) becomes the
-/// canonical verification path.
-#[derive(Clone, Debug, Default)]
-pub struct OperatorRegistry {
-    keys: std::collections::BTreeMap<u64, crate::adapter::net::identity::EntityId>,
-}
-
-impl OperatorRegistry {
-    /// Empty registry. Every commit against a client configured
-    /// with this registry fails `not_authorized` until at least
-    /// one operator is registered.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register an operator's public key. Subsequent
-    /// [`Self::verify`] calls for `operator_id` resolve against
-    /// this entry.
-    pub fn insert(
-        &mut self,
-        operator_id: u64,
-        public_key: crate::adapter::net::identity::EntityId,
-    ) {
-        self.keys.insert(operator_id, public_key);
-    }
-
-    /// Convenience: register an [`OperatorIdentity`]'s public
-    /// key under its derived operator id.
-    pub fn register(&mut self, identity: &OperatorIdentity) {
-        self.insert(identity.operator_id(), identity.keypair().entity_id().clone());
-    }
-
-    /// `true` iff `operator_id` is registered.
-    pub fn contains(&self, operator_id: u64) -> bool {
-        self.keys.contains_key(&operator_id)
-    }
-
-    /// Verify `signature` against the registered public key for
-    /// `signature.operator_id` over `payload`. Returns
-    /// `not_authorized` for an unknown operator,
-    /// `signature_invalid` for a malformed or tampered signature.
-    pub fn verify(
-        &self,
-        signature: &OperatorSignature,
-        payload: &[u8],
-    ) -> Result<(), DeckError> {
-        let entity_id = self.keys.get(&signature.operator_id).ok_or_else(|| {
-            DeckError::new(
-                "not_authorized",
-                format!(
-                    "operator {} is not registered in the cluster's operator policy",
-                    signature.operator_id
-                ),
-            )
-        })?;
-        let sig_bytes: &[u8; 64] = signature.signature.as_slice().try_into().map_err(|_| {
-            DeckError::new(
-                "signature_invalid",
-                format!(
-                    "operator {}'s signature is not 64 bytes (got {})",
-                    signature.operator_id,
-                    signature.signature.len()
-                ),
-            )
-        })?;
-        let ed_sig = ed25519_dalek::Signature::from_bytes(sig_bytes);
-        entity_id.verify(payload, &ed_sig).map_err(|_| {
-            DeckError::new(
-                "signature_invalid",
-                format!(
-                    "operator {}'s signature failed verification against the registered public key",
-                    signature.operator_id
-                ),
-            )
-        })
-    }
+/// SDK-side translation of substrate
+/// [`VerifyError`] to the `<<deck-sdk-kind:KIND>>MSG` envelope
+/// the SDK's [`IceProposal::commit`] returns.
+fn verify_error_to_ice(err: VerifyError) -> IceError {
+    let kind = err.kind();
+    IceError::new(kind, err.to_string())
 }
 
 /// Break-glass operator surface. Constructed via
@@ -745,22 +664,39 @@ impl<'a> IceProposal<'a> {
             ));
         }
         if let Some(registry) = self.client.operator_registry.as_ref() {
-            // Verify each signature against the registered public
-            // key. Duplicate operator ids in the bundle don't get
-            // de-duped here — the threshold check above is purely
-            // "did the operator collect enough sigs"; the verifier
-            // is a per-signature gate. Cluster-side policy can
-            // require distinct operator ids, but that lives on
-            // the substrate side (with the operator-policy chain).
+            // SDK-side gate: verify locally before publishing so
+            // a malformed bundle fails fast with the right error
+            // kind. The substrate-side verifier on the loop runs
+            // the same check on every `SignedIceCommit` for the
+            // belt-and-suspenders property: even an SDK that
+            // skipped this gate gets rejected by the loop.
             let payload = ice_proposal_signing_payload(&self.action);
             for sig in signatures {
-                registry.verify(sig, &payload)?;
+                registry.verify(sig, &payload).map_err(verify_error_to_ice)?;
             }
-        }
-        let admin = self.client.admin();
-        match self.action {
-            IceActionProposal::FreezeCluster { ttl } => admin.freeze_cluster(ttl).await,
-            IceActionProposal::ThawCluster => admin.thaw_cluster().await,
+            // Route via SignedIceCommit so the substrate verifier
+            // sees the bundle. The inner AdminEvent folds only
+            // after the loop's own verification passes. The
+            // event_kind on the returned ChainCommit mirrors the
+            // unsigned path so consumers see one stable
+            // discriminator regardless of whether verification
+            // was wired.
+            let kind = match self.action {
+                IceActionProposal::FreezeCluster { .. } => "freeze_cluster",
+                IceActionProposal::ThawCluster => "thaw_cluster",
+            };
+            self.client
+                .publish_signed_ice(self.action, signatures.to_vec(), kind)
+                .await
+        } else {
+            // No registry installed — route via the unsigned
+            // admin path. Useful for in-process tests where the
+            // SDK isn't gating on identity at all.
+            let admin = self.client.admin();
+            match self.action {
+                IceActionProposal::FreezeCluster { ttl } => admin.freeze_cluster(ttl).await,
+                IceActionProposal::ThawCluster => admin.thaw_cluster().await,
+            }
         }
     }
 }
@@ -992,7 +928,7 @@ mod tests {
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
 
         let proposal = deck.ice().freeze_cluster(Duration::from_secs(10));
-        let sig = OperatorSignature::sign(deck.identity(), proposal.action());
+        let sig = deck.identity().sign_proposal(proposal.action());
         let err = proposal
             .commit(&[sig])
             .await
@@ -1013,7 +949,7 @@ mod tests {
             });
         let proposal = deck.ice().freeze_cluster(Duration::from_secs(10));
         let _blast = proposal.simulate().await.expect("simulate");
-        let sig = OperatorSignature::sign(deck.identity(), proposal.action());
+        let sig = deck.identity().sign_proposal(proposal.action());
         let err = proposal
             .commit(&[sig])
             .await
@@ -1032,7 +968,7 @@ mod tests {
         let blast = proposal.simulate().await.expect("simulate");
         // FreezeCluster sets the drain delay to the requested TTL.
         assert_eq!(blast.estimated_drain_delay, Some(Duration::from_secs(30)));
-        let sig = OperatorSignature::sign(deck.identity(), proposal.action());
+        let sig = deck.identity().sign_proposal(proposal.action());
         let commit = proposal.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "freeze_cluster");
 
@@ -1072,7 +1008,7 @@ mod tests {
         let proposal = IceActionProposal::FreezeCluster {
             ttl: Duration::from_secs(60),
         };
-        let sig = OperatorSignature::sign(&identity, &proposal);
+        let sig = identity.sign_proposal(&proposal);
         assert_eq!(sig.operator_id, identity.operator_id());
         // ed25519 signatures are 64 bytes.
         assert_eq!(sig.signature.len(), 64);
@@ -1082,12 +1018,12 @@ mod tests {
     async fn operator_registry_verifies_a_well_formed_signature() {
         let identity = OperatorIdentity::generate();
         let mut registry = OperatorRegistry::new();
-        registry.register(&identity);
+        registry.register(identity.keypair());
 
         let proposal = IceActionProposal::FreezeCluster {
             ttl: Duration::from_secs(60),
         };
-        let sig = OperatorSignature::sign(&identity, &proposal);
+        let sig = identity.sign_proposal(&proposal);
         let payload = ice_proposal_signing_payload(&proposal);
         registry.verify(&sig, &payload).expect("valid signature");
     }
@@ -1097,31 +1033,31 @@ mod tests {
         let registry = OperatorRegistry::new();
         let identity = OperatorIdentity::generate();
         let proposal = IceActionProposal::ThawCluster;
-        let sig = OperatorSignature::sign(&identity, &proposal);
+        let sig = identity.sign_proposal(&proposal);
         let payload = ice_proposal_signing_payload(&proposal);
         let err = registry
             .verify(&sig, &payload)
             .expect_err("unregistered operator should not verify");
-        assert_eq!(err.kind, "not_authorized");
+        assert_eq!(err.kind(), "not_authorized");
     }
 
     #[tokio::test]
     async fn operator_registry_rejects_tampered_signature_bytes() {
         let identity = OperatorIdentity::generate();
         let mut registry = OperatorRegistry::new();
-        registry.register(&identity);
+        registry.register(identity.keypair());
 
         let proposal = IceActionProposal::FreezeCluster {
             ttl: Duration::from_secs(10),
         };
-        let mut sig = OperatorSignature::sign(&identity, &proposal);
+        let mut sig = identity.sign_proposal(&proposal);
         // Flip one byte in the signature.
         sig.signature[0] ^= 0x01;
         let payload = ice_proposal_signing_payload(&proposal);
         let err = registry
             .verify(&sig, &payload)
             .expect_err("tampered signature should not verify");
-        assert_eq!(err.kind, "signature_invalid");
+        assert_eq!(err.kind(), "signature_invalid");
     }
 
     #[tokio::test]
@@ -1132,7 +1068,7 @@ mod tests {
         // on to reject signature reuse across proposals.
         let identity = OperatorIdentity::generate();
         let mut registry = OperatorRegistry::new();
-        registry.register(&identity);
+        registry.register(identity.keypair());
 
         let signed_proposal = IceActionProposal::FreezeCluster {
             ttl: Duration::from_secs(10),
@@ -1140,19 +1076,19 @@ mod tests {
         let other_proposal = IceActionProposal::FreezeCluster {
             ttl: Duration::from_secs(60),
         };
-        let sig = OperatorSignature::sign(&identity, &signed_proposal);
+        let sig = identity.sign_proposal(&signed_proposal);
         let payload = ice_proposal_signing_payload(&other_proposal);
         let err = registry
             .verify(&sig, &payload)
             .expect_err("cross-proposal signature should not verify");
-        assert_eq!(err.kind, "signature_invalid");
+        assert_eq!(err.kind(), "signature_invalid");
     }
 
     #[tokio::test]
     async fn operator_registry_rejects_wrong_length_signature() {
         let identity = OperatorIdentity::generate();
         let mut registry = OperatorRegistry::new();
-        registry.register(&identity);
+        registry.register(identity.keypair());
 
         let proposal = IceActionProposal::ThawCluster;
         let sig = OperatorSignature {
@@ -1163,7 +1099,7 @@ mod tests {
         let err = registry
             .verify(&sig, &payload)
             .expect_err("wrong-length signature should not verify");
-        assert_eq!(err.kind, "signature_invalid");
+        assert_eq!(err.kind(), "signature_invalid");
     }
 
     #[tokio::test]
@@ -1176,8 +1112,8 @@ mod tests {
         let op_a = OperatorIdentity::generate();
         let op_b = OperatorIdentity::generate();
         let mut registry = OperatorRegistry::new();
-        registry.register(&op_a);
-        registry.register(&op_b);
+        registry.register(op_a.keypair());
+        registry.register(op_b.keypair());
         let deck = DeckClient::new(
             runtime.handle_clone(),
             runtime.snapshot_reader().clone(),
@@ -1191,8 +1127,8 @@ mod tests {
 
         let proposal = deck.ice().freeze_cluster(Duration::from_secs(15));
         let _ = proposal.simulate().await.expect("simulate");
-        let sig_a = OperatorSignature::sign(&op_a, proposal.action());
-        let mut sig_b = OperatorSignature::sign(&op_b, proposal.action());
+        let sig_a = op_a.sign_proposal(proposal.action());
+        let mut sig_b = op_b.sign_proposal(proposal.action());
         sig_b.signature[3] ^= 0xFF; // tamper
 
         let err = proposal
@@ -1210,8 +1146,8 @@ mod tests {
         let op_a = OperatorIdentity::generate();
         let op_b = OperatorIdentity::generate();
         let mut registry = OperatorRegistry::new();
-        registry.register(&op_a);
-        registry.register(&op_b);
+        registry.register(op_a.keypair());
+        registry.register(op_b.keypair());
         let deck = DeckClient::new(
             runtime.handle_clone(),
             runtime.snapshot_reader().clone(),
@@ -1225,8 +1161,8 @@ mod tests {
 
         let proposal = deck.ice().freeze_cluster(Duration::from_secs(15));
         let _ = proposal.simulate().await.expect("simulate");
-        let sig_a = OperatorSignature::sign(&op_a, proposal.action());
-        let sig_b = OperatorSignature::sign(&op_b, proposal.action());
+        let sig_a = op_a.sign_proposal(proposal.action());
+        let sig_b = op_b.sign_proposal(proposal.action());
         let commit = proposal
             .commit(&[sig_a, sig_b])
             .await

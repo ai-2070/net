@@ -124,6 +124,14 @@ pub struct MeshOsLoop {
     /// `MaintenanceTransitionObserved` (chain replay) surface
     /// uniformly.
     last_local_maintenance: MaintenanceDiscriminant,
+    /// Optional ICE-commit verifier. When installed, every
+    /// `MeshOsEvent::SignedIceCommit` is run through this gate
+    /// before the inner `AdminEvent` folds into state. When
+    /// absent, signed commits fold their inner event without
+    /// verification — useful for in-process tests where the
+    /// SDK side already gates. The substrate slice that ships
+    /// the operator-policy chain wires a registry in by default.
+    admin_verifier: Option<Arc<super::ice::AdminVerifier>>,
 }
 
 /// Cheap-to-compare snapshot of [`MaintenanceState`]'s variant
@@ -359,6 +367,7 @@ impl MeshOsLoop {
             executor_failures: None,
             control_sink: None,
             last_local_maintenance: MaintenanceDiscriminant::Active,
+            admin_verifier: None,
         };
         MeshOsLoopParts {
             mesh_loop: me,
@@ -417,6 +426,20 @@ impl MeshOsLoop {
     /// unset.
     pub fn with_control_sink(mut self, sink: Arc<dyn ControlSink>) -> Self {
         self.control_sink = Some(sink);
+        self
+    }
+
+    /// Attach an [`super::ice::AdminVerifier`]. When set, every
+    /// [`MeshOsEvent::SignedIceCommit`] is gated on signature
+    /// verification + the cluster's signature threshold before
+    /// folding the inner [`super::event::AdminEvent`]. Verified
+    /// commits fold normally; rejected commits drop + emit a
+    /// failure record so operators see the rejection in the
+    /// snapshot's `recent_failures` ring (substrate slice that
+    /// wires the failure pipe lands alongside the SDK surface
+    /// upgrade).
+    pub fn with_admin_verifier(mut self, verifier: Arc<super::ice::AdminVerifier>) -> Self {
+        self.admin_verifier = Some(verifier);
         self
     }
 
@@ -547,6 +570,35 @@ impl MeshOsLoop {
     }
 
     fn apply(&mut self, event: &MeshOsEvent) {
+        // ICE-signed commits get their own gate: verify the
+        // bundle before folding the inner AdminEvent.
+        if let MeshOsEvent::SignedIceCommit {
+            proposal,
+            signatures,
+        } = event
+        {
+            if let Some(verifier) = self.admin_verifier.as_ref() {
+                if let Err(err) = verifier.verify_commit(proposal, signatures) {
+                    tracing::warn!(
+                        target: "meshos",
+                        kind = err.kind(),
+                        error = %err,
+                        "rejected SignedIceCommit — signature verification failed",
+                    );
+                    return;
+                }
+            }
+            // Verification passed (or no verifier installed —
+            // tests / dev mode). Fold as if the inner AdminEvent
+            // arrived directly.
+            let admin = proposal.to_admin_event();
+            self.desired
+                .apply_admin(&admin, self.config.this_node);
+            let unwrapped = MeshOsEvent::AdminEvent(admin);
+            self.actual.apply(&unwrapped, self.config.this_node);
+            self.emit_maintenance_transitions();
+            return;
+        }
         match event {
             MeshOsEvent::PlacementIntent(intent) => self.desired.apply(intent),
             MeshOsEvent::DaemonIntentUpdate(update) => self.desired.apply_daemon_intent(update),
