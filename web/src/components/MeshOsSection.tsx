@@ -847,7 +847,7 @@ function MeshAutoform() {
           <span className="font-mono" style={{ color: "rgb(61, 240, 255)" }}>
             ◉
           </span>
-          region
+          storage
         </span>
         <span className="flex items-center gap-2">
           <span className="font-mono" style={{ color: "rgb(212, 220, 208)" }}>
