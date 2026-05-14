@@ -58,6 +58,7 @@ pub mod control;
 pub mod event;
 pub mod event_loop;
 pub mod executor;
+pub mod failure_chain;
 pub mod ice;
 pub mod log_chain;
 pub mod logs;
@@ -94,6 +95,10 @@ pub use event_loop::{
 pub use executor::{
     ActionDispatcher, ActionExecutor, DispatchError, ExecutorHandle, ExecutorStats,
     ExecutorStatsSnapshot, LoggingDispatcher,
+};
+pub use failure_chain::{
+    BufferingFailureChainAppender, FailureAppendError, FailureChainAppender,
+    NoOpFailureChainAppender, DEFAULT_FAILURE_BUFFERING_APPENDER_CAPACITY,
 };
 pub use audit_chain::{
     AdminAuditAppendError, AdminAuditChainAppender, BufferingAdminAuditChainAppender,

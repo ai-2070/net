@@ -242,6 +242,39 @@ impl MeshOsRuntime {
         admin_audit_appender: Option<Arc<dyn super::audit_chain::AdminAuditChainAppender>>,
         log_appender: Option<Arc<dyn super::log_chain::LogChainAppender>>,
     ) -> Self {
+        Self::start_with_all_chains(
+            config,
+            dispatcher,
+            probes,
+            scheduler,
+            daemon_registry,
+            control_sink,
+            admin_verifier,
+            admin_audit_appender,
+            log_appender,
+            None,
+        )
+    }
+
+    /// Maximal-options constructor — accepts every chain
+    /// seam the substrate exposes (admin audit, log,
+    /// failure). Production deployments wiring all three
+    /// `TypedRedexFile<*>` chains call this directly; the
+    /// other `start_with_*` constructors forward with
+    /// `None` defaults for the appenders they don't surface.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_all_chains<D: ActionDispatcher>(
+        config: MeshOsConfig,
+        dispatcher: Arc<D>,
+        probes: ProbeRegistry,
+        scheduler: SchedulerRegistry,
+        daemon_registry: Arc<DaemonRegistry>,
+        control_sink: Option<Arc<dyn super::control::ControlSink>>,
+        admin_verifier: Option<Arc<super::ice::AdminVerifier>>,
+        admin_audit_appender: Option<Arc<dyn super::audit_chain::AdminAuditChainAppender>>,
+        log_appender: Option<Arc<dyn super::log_chain::LogChainAppender>>,
+        failure_appender: Option<Arc<dyn super::failure_chain::FailureChainAppender>>,
+    ) -> Self {
         let super::event_loop::MeshOsLoopParts {
             mesh_loop,
             handle,
@@ -254,7 +287,10 @@ impl MeshOsRuntime {
         // registry).
         let _prior = attach_to_daemon_registry(&daemon_registry, handle.clone());
         let cfg_arc = Arc::new(config);
-        let exec = ActionExecutor::new(actions_rx, cfg_arc, dispatcher);
+        let mut exec = ActionExecutor::new(actions_rx, cfg_arc, dispatcher);
+        if let Some(appender) = failure_appender {
+            exec = exec.with_failure_appender(appender);
+        }
         let stats = exec.stats_arc();
         // Share the executor's failures ring with the loop so
         // the snapshot publish path copies executor-side

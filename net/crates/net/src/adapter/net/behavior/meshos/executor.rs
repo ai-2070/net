@@ -240,6 +240,13 @@ pub struct ActionExecutor<D: ActionDispatcher> {
     /// admin audit ring's seq — the Deck SDK's
     /// `subscribe_failures` stream uses it.
     failure_seq: u64,
+    /// Failure chain appender. Production deployments wire a
+    /// `TypedRedexFile<FailureRecord>` here so the failure
+    /// ring's bounded history extends to cluster-lifetime
+    /// replay. Default is `NoOpFailureChainAppender` — only
+    /// the in-memory ring is observable when no chain is
+    /// wired.
+    failure_appender: Arc<dyn super::failure_chain::FailureChainAppender>,
     stats: Arc<ExecutorStats>,
     /// Optional action-chain appender. Each admit/dispatch
     /// outcome appends an [`super::chain::ActionChainRecord`].
@@ -266,9 +273,23 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                 RECENT_FAILURES_CAPACITY,
             ))),
             failure_seq: 0,
+            failure_appender: super::failure_chain::no_op_arc(),
             stats: Arc::new(ExecutorStats::default()),
             chain_appender: Arc::new(NoOpActionChainAppender),
         }
+    }
+
+    /// Attach a [`super::failure_chain::FailureChainAppender`].
+    /// The executor's `record_failure` path dual-writes every
+    /// failure to both the in-memory ring (snapshot readable)
+    /// and this appender (chain-backed history). Without an
+    /// explicit appender the executor uses the no-op default.
+    pub fn with_failure_appender(
+        mut self,
+        appender: Arc<dyn super::failure_chain::FailureChainAppender>,
+    ) -> Self {
+        self.failure_appender = appender;
+        self
     }
 
     /// Clone the shared recent-failures ring. The runtime hands
@@ -483,17 +504,28 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         self.failure_seq += 1;
-        let seq = self.failure_seq;
+        let record = FailureRecord {
+            seq: self.failure_seq,
+            source,
+            reason,
+            recorded_at_ms,
+        };
+        // Dual-write: chain first, ring second. The chain
+        // append is non-fatal — a hiccup there must never
+        // wedge the executor's dispatch loop.
+        if let Err(err) = self.failure_appender.append(&record) {
+            tracing::warn!(
+                target: "meshos",
+                seq = record.seq,
+                error = %err,
+                "failure-chain append failed — record kept on in-memory ring only",
+            );
+        }
         let mut ring = self.recent_failures.write();
         if ring.len() >= RECENT_FAILURES_CAPACITY {
             ring.pop_front();
         }
-        ring.push_back(FailureRecord {
-            seq,
-            source,
-            reason,
-            recorded_at_ms,
-        });
+        ring.push_back(record);
     }
 }
 
@@ -720,6 +752,46 @@ mod tests {
         let stats = task.await.expect("join");
         assert_eq!(stats.dispatched.load(Ordering::Relaxed), 0);
         assert_eq!(stats.failed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn failure_chain_appender_receives_every_recorded_failure() {
+        use super::super::failure_chain::BufferingFailureChainAppender;
+        let (tx, rx) = mpsc::channel(8);
+        let cfg = fast_cfg();
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        dispatcher.fail_next(DispatchError::drop("first boom"));
+        let appender = Arc::new(BufferingFailureChainAppender::default());
+        let exec = ActionExecutor::new(rx, cfg, Arc::clone(&dispatcher)).with_failure_appender(
+            appender.clone() as Arc<dyn super::super::failure_chain::FailureChainAppender>,
+        );
+        // Capture the failure ring handle BEFORE moving `exec`
+        // into the spawned task.
+        let ring_handle = exec.recent_failures_handle();
+        let task = tokio::spawn(exec.run());
+
+        tx.send(pending(
+            1,
+            MeshOsAction::CommitMaintenanceTransition {
+                node: 1,
+                target: MaintenanceTransition::Active,
+            },
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        let _ = task.await.expect("join");
+
+        let captured = appender.captured();
+        assert_eq!(captured.len(), 1, "appender should see one record");
+        assert!(captured[0].reason.contains("first boom"));
+        assert!(captured[0].seq > 0);
+
+        // Appender + executor ring see the SAME record.
+        let ring: Vec<FailureRecord> = ring_handle.read().iter().cloned().collect();
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring[0].seq, captured[0].seq);
+        assert_eq!(ring[0].reason, captured[0].reason);
     }
 
     #[tokio::test]
