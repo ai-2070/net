@@ -89,6 +89,17 @@ pub struct MeshOsSnapshot {
     /// this to enumerate the affected daemon when the
     /// operator targets a migration this node hosts.
     pub in_flight_migrations: Vec<MigrationSnapshot>,
+    /// Boot-time identifier the MeshOsLoop stamped when it
+    /// started. Stays constant for the lifetime of the loop
+    /// task and changes on every restart. SDK consumers
+    /// dedup'ing via `seq` values (audit / log / failure
+    /// rings) pair every watermark with this value — when
+    /// the snapshot's `runtime_epoch_id` doesn't match the
+    /// consumer's last-seen epoch, the seq counter reset and
+    /// the consumer must reset its watermark to 0 rather than
+    /// silently filter out post-restart records as
+    /// "smaller than my last seq."
+    pub runtime_epoch_id: u64,
 }
 
 /// Wire-form summary of one in-flight migration. Drawn from
@@ -551,6 +562,11 @@ impl MeshOsSnapshot {
             admin_audit,
             log_ring,
             in_flight_migrations,
+            // Set to `0` here; the loop's publish_snapshot
+            // overwrites with the per-runtime epoch stamp
+            // immediately after construction so chain-fold
+            // callers don't have to care about the value.
+            runtime_epoch_id: 0,
         }
     }
 }

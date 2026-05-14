@@ -519,6 +519,31 @@ async fn admin_audit_ring_records_accepted_and_rejected_attempts() {
 }
 
 #[tokio::test]
+async fn runtime_epoch_id_changes_across_two_runtime_instances() {
+    // SDK consumers that dedup against `since(seq)` watermarks
+    // must be able to detect a runtime restart so they can
+    // reset their watermark — otherwise post-restart records
+    // (seq=1, 2, …) silently filter out as "smaller than my
+    // last seq." Two MeshOsRuntime instances stamp distinct
+    // `runtime_epoch_id` values on their snapshots.
+    let dispatcher_a = Arc::new(LoggingDispatcher::new());
+    let rt_a = MeshOsRuntime::start(fast_config(), dispatcher_a);
+    let epoch_a = rt_a.snapshot().runtime_epoch_id;
+    assert_ne!(epoch_a, 0, "runtime_epoch_id should be stamped non-zero");
+
+    let dispatcher_b = Arc::new(LoggingDispatcher::new());
+    let rt_b = MeshOsRuntime::start(fast_config(), dispatcher_b);
+    let epoch_b = rt_b.snapshot().runtime_epoch_id;
+    assert_ne!(
+        epoch_a, epoch_b,
+        "two distinct runtimes should stamp distinct runtime_epoch_id values",
+    );
+
+    let _ = rt_a.shutdown().await;
+    let _ = rt_b.shutdown().await;
+}
+
+#[tokio::test]
 async fn kill_migration_with_no_op_aborter_and_verifier_records_failure() {
     // Production-partial config detection: an admin verifier
     // is wired (operator-policy chain installed) but the

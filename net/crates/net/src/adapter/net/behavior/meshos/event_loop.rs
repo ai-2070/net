@@ -109,6 +109,12 @@ pub struct MeshOsLoop {
     /// `admin_audit_seq`; the Deck SDK's log-tail stream
     /// dedups against this.
     log_seq: u64,
+    /// Boot-time identifier this loop stamps on every
+    /// published snapshot via
+    /// [`MeshOsSnapshot::runtime_epoch_id`]. SDK consumers
+    /// dedup'ing via `seq` values pair each watermark with this
+    /// value — when the snapshot's epoch flips, they reset.
+    runtime_epoch_id: u64,
 
     /// Actions reconcile emitted that the action-queue
     /// `try_send` rejected because the executor was at
@@ -409,7 +415,23 @@ impl MeshOsLoop {
         let (events_tx, events_rx) = mpsc::channel(config.event_queue_capacity);
         let (actions_tx, actions_rx) = mpsc::channel(config.action_queue_capacity);
         let handle = MeshOsHandle { events: events_tx };
-        let snapshot = Arc::new(ArcSwap::from_pointee(MeshOsSnapshot::default()));
+        // Stamp a unique runtime epoch id at construction.
+        // Wall-clock nanoseconds + a static counter is the
+        // cheapest source of monotonic-enough uniqueness —
+        // even back-to-back runtimes spawned in the same
+        // nanosecond (e.g. test parallelism) get distinct
+        // ids. SDK consumers read this off
+        // `MeshOsSnapshot::runtime_epoch_id` and reset their
+        // `since(seq)` watermarks on observed change.
+        static RUNTIME_EPOCH_COUNTER: AtomicU64 = AtomicU64::new(1);
+        let runtime_epoch_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            ^ RUNTIME_EPOCH_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let mut initial_snapshot = MeshOsSnapshot::default();
+        initial_snapshot.runtime_epoch_id = runtime_epoch_id;
+        let snapshot = Arc::new(ArcSwap::from_pointee(initial_snapshot));
         let reader = MeshOsSnapshotReader {
             snapshot: Arc::clone(&snapshot),
         };
@@ -427,6 +449,7 @@ impl MeshOsLoop {
             reconcile_count: 0,
             admin_audit_seq: 0,
             log_seq: 0,
+            runtime_epoch_id,
             dropped_actions: Arc::new(AtomicU64::new(0)),
             executor_failures: None,
             executor_failure_seq: None,
@@ -1240,13 +1263,14 @@ impl MeshOsLoop {
             None => Vec::new(),
         };
         let in_flight_migrations = self.migration_snapshot_source.list();
-        let snap = MeshOsSnapshot::from_state(
+        let mut snap = MeshOsSnapshot::from_state(
             &self.actual,
             &self.desired,
             &self.recent_emissions,
             &failures,
             in_flight_migrations,
         );
+        snap.runtime_epoch_id = self.runtime_epoch_id;
         self.snapshot.store(Arc::new(snap));
     }
 }
