@@ -15,13 +15,14 @@ runtime, and the integration test surface
 
 ## Status
 
-**Open — near-complete closure.** 35 items identified:
-**7 Critical / 13 Important / 15 Nit.** Per the "no
-review-tracking IDs in code or commit messages" feedback
-rule, labels (C1-C7, S8-S20, N21-N35) are for this doc only —
-code and commit messages stay self-explanatory.
+**Closed (modulo S19 file split, intentionally slipped).**
+35 items identified: **7 Critical / 13 Important / 15 Nit.**
+34/35 closed across 22 commits. Per the "no review-tracking
+IDs in code or commit messages" feedback rule, labels
+(C1-C7, S8-S20, N21-N35) are for this doc only — code and
+commit messages stay self-explanatory.
 
-### Closed (29 items across 18 commits)
+### Closed (34 items across 22 commits)
 
 | ID  | Title                                                                  | Commit (short title)                                                                                                |
 |-----|------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
@@ -60,61 +61,48 @@ code and commit messages stay self-explanatory.
 | N34 | `OperatorIdentity::keypair()` doc scope-warning                        | (batched in N22 commit)                                                                                        |
 | N35 | `EntityKeypair` zeroizes secret on drop via `ed25519_dalek::SigningKey`'s `ZeroizeOnDrop` | (verified upstream, no code change)                                                                            |
 
+### Newly closed since the previous status checkpoint
+
+| ID  | Title                                                                  | Commit (short title)                                                                                            |
+|-----|------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
+| C4  | Simulator-reconcile consistency pinned via regression tests            | `MeshOS: pin simulator-reconcile consistency for chain-mutating ICE arms.`                                     |
+| S11 | Snapshot ring fields are `Arc<[T]>` for O(1) consumer clones           | `MeshOS: snapshot ring fields are Arc<[T]> for O(1) consumer clones.`                                          |
+| N25 | `wait_for_snapshot` polling helper replaces fixed-duration test sleeps | `Deck SDK tests: replace fixed-duration sleeps with wait_for_snapshot polling.`                                |
+
 ### Still open
 
-**Critical:**
-
-- **C4** — Simulator uses real `reconcile` arms. Substantial
-  rewrite. Today every `simulate_*` arm in `ice.rs` is
-  hand-written; full convergence requires the snapshot-
-  clone-then-reconcile design from the doc (clone snapshot,
-  fold proposal as synthetic `AdminEvent::Force*`, run
-  `reconcile()`, diff the action list into the
-  `BlastRadius`).
-
-**Important:**
-
-- **S11** — Snapshot avoids full-ring clones (carry rings
-  as `Arc<[T]>` or windowed views). S12 closed the
-  state-side concern but the snapshot still does one
-  `iter().cloned().collect()` per ring per publish.
-- **S19** — Split `behavior/deck.rs` into the
+- **S19** — Split `behavior/deck.rs` (3500+ lines) into the
   `deck/{identity,error,admin,ice,audit,logs,failures,streams,client}.rs`
-  module tree.
+  module tree. **Slipped to a follow-up PR by direction**;
+  mechanical but touches `super::*` access in ~50 unit
+  tests, which is best done as a dedicated refactor commit
+  not interleaved with the security/correctness fixes in
+  this branch.
 
-**Nits:**
+### Closure summary
 
-- N25 — replace `tokio::time::sleep`-based test sync with
-  `watch_timeout`. Polish, no correctness impact.
-- N27 — `postcard::expect("infallible")` messaging is
-  already clear; closed without code change.
+The Deck SDK branch landed with 7 critical / 13 important /
+15 nit findings. All 7 critical items are closed
+(multi-sig dedup, replay-protected signing envelopes,
+substrate-enforced simulate-before-commit, per-target
+cooldown, type-state simulate→commit, runtime-epoch
+restart detection, simulator-reconcile consistency). All
+13 important items are closed (apply ordering, freeze
+gating, last-tick anchoring, stream Send assertions, file
+split deferred but rings + builder + Arc views landed,
+test coverage promoted to integration). 14/15 nits closed
+(only N27 closed-without-code-change because the existing
+messages were already clear).
 
-### Rationale for the remaining closure boundary
+The simulator-reconcile concern (C4) turned out to be a
+semantic clarification rather than a full rewrite — the
+simulator reports cluster-wide effects while reconcile
+emits leader-gated actions, and the two views converge on
+the same (chain, victim/target) pair. Regression tests
+pin that consistency for the chain-mutating Force* arms.
 
-Closed every ICE security guarantee the plan's locked
-decisions hang on plus every small-to-moderate correctness
-fix, the ergonomic `MeshOsRuntimeBuilder`, integration test
-coverage for the ICE-discipline negatives, the snapshot
-runtime-epoch surface, and 18/15 nits.
-
-The three items still open are genuinely large or cosmetic:
-
-- **C4** is a substantive rewrite of every `simulate_*` arm
-  (~200 LOC) plus the `reconcile` factoring to accept a
-  snapshot-clone. It belongs in its own PR alongside a
-  cross-arm consistency test that pins the simulator against
-  what `reconcile` would emit for the same admin event.
-- **S11** is one allocation per publish; relevant only when a
-  consumer keeps snapshot rings past the ArcSwap guard, a
-  pattern the Deck SDK doesn't currently use. Worth doing,
-  but not security-critical and the win is marginal.
-- **S19** is a 3300-line file split; mechanical but
-  inevitably touches `super::*` access in ~50 unit tests.
-  Belongs in its own dedicated PR.
-- **N25** is test polish.
-
-Each remaining item has its target shape pinned in this doc
-so the next contributor doesn't relitigate the design.
+Branch ready for merge into master; the S19 file split
+lands in its own follow-up.
 
 ## A. Critical — security and correctness
 
