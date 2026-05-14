@@ -17,10 +17,10 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use net::adapter::net::behavior::deck::{
-    AdminError, DeckClient, DeckClientConfig, OperatorIdentity,
+    AdminError, DeckClient, DeckClientConfig, OperatorIdentity, OperatorSignature,
 };
 use net::adapter::net::behavior::meshos::{
-    LoggingDispatcher, MaintenanceStateSnapshot, MeshOsConfig, MeshOsRuntime,
+    BlastWarning, LoggingDispatcher, MaintenanceStateSnapshot, MeshOsConfig, MeshOsRuntime,
 };
 
 const THIS_NODE: u64 = 200;
@@ -43,6 +43,7 @@ async fn deck_client_enter_maintenance_flows_through_to_snapshot() {
     let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
         .with_config(DeckClientConfig {
             snapshot_poll_interval: Duration::from_millis(20),
+            ..DeckClientConfig::default()
         });
 
     let commit = deck
@@ -132,6 +133,7 @@ async fn deck_client_freeze_cluster_lands_in_snapshot_and_thaw_clears() {
     let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
         .with_config(DeckClientConfig {
             snapshot_poll_interval: Duration::from_millis(15),
+            ..DeckClientConfig::default()
         });
 
     // Freeze for 10s; observe `freeze_remaining_ms` surface
@@ -172,5 +174,72 @@ async fn deck_client_freeze_cluster_lands_in_snapshot_and_thaw_clears() {
         saw_thaw,
         "thaw should clear freeze_remaining_ms from the snapshot",
     );
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn ice_proposal_simulate_then_commit_lands_freeze_through_pipeline() {
+    // Full operator-side ICE workflow: build a proposal, run
+    // the mandatory simulate(), sign, commit. The snapshot
+    // stream surfaces `freeze_remaining_ms` as the loop folds
+    // the underlying admin event.
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+        .with_config(DeckClientConfig {
+            snapshot_poll_interval: Duration::from_millis(15),
+            ..DeckClientConfig::default()
+        });
+
+    let proposal = deck.ice().freeze_cluster(Duration::from_secs(45));
+    let blast = proposal.simulate().await.expect("simulate");
+    assert_eq!(blast.estimated_drain_delay, Some(Duration::from_secs(45)));
+    assert!(blast
+        .warnings
+        .iter()
+        .any(|w| matches!(w, BlastWarning::ClusterFreezeBlocksOperatorActions)));
+
+    let sig = OperatorSignature::sign(deck.identity(), proposal.action());
+    let commit = proposal.commit(&[sig]).await.expect("commit");
+    assert_eq!(commit.event_kind(), "freeze_cluster");
+
+    let mut stream = deck.snapshots();
+    let mut saw_freeze = false;
+    for _ in 0..20 {
+        let snap = stream.next().await.expect("next").expect("ok");
+        if snap.freeze_remaining_ms.is_some() {
+            saw_freeze = true;
+            break;
+        }
+    }
+    assert!(
+        saw_freeze,
+        "ICE freeze proposal commit should land the freeze in the snapshot",
+    );
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn ice_proposal_commit_without_simulate_is_rejected_before_publish() {
+    // Locked decision #4: simulate() is mandatory before commit().
+    // Confirm the SDK gate keeps the publish from firing — the
+    // loop never sees an admin event.
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+    let proposal = deck.ice().freeze_cluster(Duration::from_secs(10));
+    let sig = OperatorSignature::sign(deck.identity(), proposal.action());
+    let err = proposal
+        .commit(&[sig])
+        .await
+        .expect_err("commit without simulate should fail");
+    assert_eq!(err.kind, "simulation_required");
+
+    // The snapshot should NOT show a freeze — the SDK didn't
+    // publish the underlying admin event.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let snap = runtime.snapshot();
+    assert!(snap.freeze_remaining_ms.is_none());
     let _ = runtime.shutdown().await;
 }

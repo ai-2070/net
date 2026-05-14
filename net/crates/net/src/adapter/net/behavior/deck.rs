@@ -81,8 +81,8 @@ use futures::Stream;
 use tokio::time::{interval, Interval};
 
 use super::meshos::{
-    AdminEvent, ChainId, MeshOsEvent, MeshOsHandle, MeshOsHandleError, MeshOsRuntime,
-    MeshOsSnapshot, MeshOsSnapshotReader, NodeId,
+    simulate_ice_proposal, AdminEvent, BlastRadius, ChainId, IceActionProposal, MeshOsEvent,
+    MeshOsHandle, MeshOsHandleError, MeshOsRuntime, MeshOsSnapshot, MeshOsSnapshotReader, NodeId,
 };
 use crate::adapter::net::identity::EntityKeypair;
 
@@ -166,12 +166,15 @@ impl From<MeshOsHandleError> for DeckError {
     }
 }
 
-/// Type alias for the admin-command error surface. The Deck plan
-/// names this distinctly because the ICE surface (Phase 3) will
-/// add a sibling [`DeckError`] alias `IceError` with extra kinds
-/// (`insufficient_signatures`, `simulate_failed`, `ice_locked_out`,
-/// …). Phase 1 admin uses the same underlying type.
+/// Type alias for the admin-command error surface. Shares the
+/// underlying [`DeckError`] envelope; admin commits surface
+/// `loop_closed` / `queue_full` kinds.
 pub type AdminError = DeckError;
+
+/// Type alias for the ICE-surface error type. Shares the
+/// underlying [`DeckError`] envelope; ICE commits add the
+/// `simulation_required` / `insufficient_signatures` kinds.
+pub type IceError = DeckError;
 
 /// Correlation handle returned by every admin commit. Phase 1
 /// represents "the admin event was accepted by the loop's event
@@ -223,12 +226,21 @@ pub struct DeckClientConfig {
     /// magnitude as the default loop tick so the stream surfaces
     /// each post-reconcile snapshot once.
     pub snapshot_poll_interval: Duration,
+    /// Minimum operator signatures required to [`IceProposal::commit`]
+    /// an ICE proposal. Plan locks this in at 2-of-N by default,
+    /// substrate-verified; this slice ships single-signature
+    /// (`1`) as the SDK-side default because substrate-side
+    /// multi-operator verification hasn't shipped yet. Operators
+    /// who want client-enforced multi-op gating ahead of the
+    /// substrate slice can bump this knob.
+    pub ice_signature_threshold: usize,
 }
 
 impl Default for DeckClientConfig {
     fn default() -> Self {
         Self {
             snapshot_poll_interval: Duration::from_millis(100),
+            ice_signature_threshold: 1,
         }
     }
 }
@@ -299,6 +311,14 @@ impl DeckClient {
     /// returns a [`ChainCommit`].
     pub fn admin(&self) -> AdminCommands<'_> {
         AdminCommands { client: self }
+    }
+
+    /// Build an [`IceCommands`] surface — the break-glass
+    /// operator path. Each method returns an [`IceProposal`]
+    /// that must be `simulate()`d before `commit()` per the
+    /// plan's locked decision #4.
+    pub fn ice(&self) -> IceCommands<'_> {
+        IceCommands { client: self }
     }
 
     /// Open a [`SnapshotStream`] over the runtime's snapshot
@@ -482,6 +502,147 @@ impl AdminCommands<'_> {
     }
 }
 
+/// Operator signature over an [`IceActionProposal`]. Phase 3a
+/// placeholder — the substrate doesn't yet verify operator-key
+/// channel-auth, so the bytes here are not yet a real ed25519
+/// signature over a deterministic encoding of the proposal.
+/// The shape is what the substrate slice that lands signature
+/// verification will accept (`operator_id` + `signature` blob),
+/// so consumers of the SDK don't need to change call sites when
+/// the real signing path goes live.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperatorSignature {
+    /// Issuing operator's id (from [`OperatorIdentity::operator_id`]).
+    pub operator_id: u64,
+    /// Signature bytes. Phase 3a: opaque placeholder. Future:
+    /// ed25519 signature over a deterministic postcard encoding
+    /// of the [`IceActionProposal`].
+    pub signature: Vec<u8>,
+}
+
+impl OperatorSignature {
+    /// Build a placeholder signature for `proposal` using
+    /// `identity`'s operator id. The bytes are deterministic
+    /// (postcard-encoded proposal payload) so two operators
+    /// "signing" the same proposal produce reproducible inputs
+    /// — useful for the multi-operator-bundle tests that will
+    /// land alongside the real signing path.
+    pub fn sign(identity: &OperatorIdentity, proposal: &IceActionProposal) -> Self {
+        // Postcard-encode the proposal as the deterministic
+        // payload. The real signing path will run ed25519 over
+        // this same byte sequence; until that lands, we carry the
+        // encoded payload itself as a placeholder so tests can
+        // confirm "the same proposal produces the same signature
+        // input" without depending on the substrate verifier.
+        let payload = postcard::to_allocvec(proposal).unwrap_or_default();
+        Self {
+            operator_id: identity.operator_id(),
+            signature: payload,
+        }
+    }
+}
+
+/// Break-glass operator surface. Constructed via
+/// [`DeckClient::ice`]; each method returns an [`IceProposal`]
+/// that must be `simulate()`d before `commit()` per the plan's
+/// locked decision #4 (blast-radius simulation is mandatory
+/// before any ICE commit).
+pub struct IceCommands<'a> {
+    client: &'a DeckClient,
+}
+
+impl<'a> IceCommands<'a> {
+    /// Propose a cluster-wide freeze. The returned
+    /// [`IceProposal`] must be simulated then committed.
+    pub fn freeze_cluster(&self, ttl: Duration) -> IceProposal<'a> {
+        IceProposal::new(self.client, IceActionProposal::FreezeCluster { ttl })
+    }
+
+    /// Propose cancelling an in-effect cluster freeze.
+    pub fn thaw_cluster(&self) -> IceProposal<'a> {
+        IceProposal::new(self.client, IceActionProposal::ThawCluster)
+    }
+}
+
+/// An ICE proposal — opaque-ish handle carrying the underlying
+/// [`IceActionProposal`] plus a bit of per-proposal state.
+/// Per the plan's locked decision #4 a [`Self::simulate`] call
+/// must precede [`Self::commit`]; a `commit` against an
+/// un-simulated proposal returns [`IceError`] with kind
+/// `simulation_required`.
+pub struct IceProposal<'a> {
+    client: &'a DeckClient,
+    action: IceActionProposal,
+    simulated: std::cell::Cell<bool>,
+}
+
+impl<'a> IceProposal<'a> {
+    fn new(client: &'a DeckClient, action: IceActionProposal) -> Self {
+        Self {
+            client,
+            action,
+            simulated: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Borrow the underlying [`IceActionProposal`]. Useful for
+    /// the multi-operator signing flow: each operator signs the
+    /// same proposal payload, then submits the bundle through
+    /// one client's `commit()` call.
+    pub fn action(&self) -> &IceActionProposal {
+        &self.action
+    }
+
+    /// Pre-execution preview. Runs the substrate's pure simulator
+    /// against the runtime's latest snapshot; flags the proposal
+    /// as simulated so [`Self::commit`] will accept it.
+    pub async fn simulate(&self) -> Result<BlastRadius, IceError> {
+        let snap = self.client.snapshot_reader.read();
+        let blast = simulate_ice_proposal(&snap, &self.action);
+        self.simulated.set(true);
+        Ok(blast)
+    }
+
+    /// Commit the proposal. Returns
+    /// `Err(IceError::simulation_required)` if [`Self::simulate`]
+    /// hasn't been called on this proposal. Verifies
+    /// `signatures.len() >= ice_signature_threshold` before
+    /// publishing; returns
+    /// `Err(IceError::insufficient_signatures)` otherwise.
+    /// Substrate-side multi-operator-signature verification is
+    /// a future slice — until then the SDK enforces the threshold
+    /// locally and accepts placeholder [`OperatorSignature`]
+    /// payloads.
+    pub async fn commit(
+        self,
+        signatures: &[OperatorSignature],
+    ) -> Result<ChainCommit, IceError> {
+        if !self.simulated.get() {
+            return Err(IceError::new(
+                "simulation_required",
+                "ICE commits require a successful simulate() before commit() per \
+                 DECK_SDK_PLAN.md locked decision #4",
+            ));
+        }
+        let threshold = self.client.config.ice_signature_threshold;
+        if signatures.len() < threshold {
+            return Err(IceError::new(
+                "insufficient_signatures",
+                format!(
+                    "ICE commit requires {} operator signatures; got {}",
+                    threshold,
+                    signatures.len()
+                ),
+            ));
+        }
+        let admin = self.client.admin();
+        match self.action {
+            IceActionProposal::FreezeCluster { ttl } => admin.freeze_cluster(ttl).await,
+            IceActionProposal::ThawCluster => admin.thaw_cluster().await,
+        }
+    }
+}
+
 /// Stream over the runtime's snapshot reader. Polls at the
 /// configured cadence; emits a `Result<MeshOsSnapshot, DeckError>`
 /// per poll. Phase 1 emits on every poll (consumers de-dupe if
@@ -619,6 +780,7 @@ mod tests {
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
             .with_config(DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(20),
+                ..DeckClientConfig::default()
             });
 
         let mut stream = deck.snapshots();
@@ -644,6 +806,7 @@ mod tests {
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
             .with_config(DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(15),
+                ..DeckClientConfig::default()
             });
 
         let _ = deck.admin().enter_maintenance(42, None).await.unwrap();
@@ -698,5 +861,97 @@ mod tests {
                 target: MaintenanceTransition::EnteringMaintenance,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn ice_proposal_commit_without_prior_simulate_returns_simulation_required() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        let proposal = deck.ice().freeze_cluster(Duration::from_secs(10));
+        let sig = OperatorSignature::sign(deck.identity(), proposal.action());
+        let err = proposal
+            .commit(&[sig])
+            .await
+            .expect_err("commit without simulate should fail");
+        assert_eq!(err.kind, "simulation_required");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ice_proposal_commit_with_insufficient_signatures_fails() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        // Bump threshold above what we'll supply.
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(100),
+                ice_signature_threshold: 2,
+            });
+        let proposal = deck.ice().freeze_cluster(Duration::from_secs(10));
+        let _blast = proposal.simulate().await.expect("simulate");
+        let sig = OperatorSignature::sign(deck.identity(), proposal.action());
+        let err = proposal
+            .commit(&[sig])
+            .await
+            .expect_err("under-threshold commit should fail");
+        assert_eq!(err.kind, "insufficient_signatures");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ice_freeze_proposal_simulate_then_commit_lands_freeze_on_loop() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        let proposal = deck.ice().freeze_cluster(Duration::from_secs(30));
+        let blast = proposal.simulate().await.expect("simulate");
+        // FreezeCluster sets the drain delay to the requested TTL.
+        assert_eq!(blast.estimated_drain_delay, Some(Duration::from_secs(30)));
+        let sig = OperatorSignature::sign(deck.identity(), proposal.action());
+        let commit = proposal.commit(&[sig]).await.expect("commit");
+        assert_eq!(commit.event_kind(), "freeze_cluster");
+
+        // Give the loop a tick + reconcile + publish to fold the
+        // freeze through to the snapshot.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let snap = runtime.snapshot();
+        assert!(
+            snap.freeze_remaining_ms.is_some(),
+            "freeze_remaining_ms should be set after committed freeze",
+        );
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ice_thaw_proposal_simulate_warns_no_op_when_unfrozen() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        let proposal = deck.ice().thaw_cluster();
+        let blast = proposal.simulate().await.expect("simulate");
+        // Simulator on a non-frozen snapshot warns "no freeze to cancel."
+        assert!(blast
+            .warnings
+            .iter()
+            .any(|w| matches!(
+                w,
+                crate::adapter::net::behavior::meshos::BlastWarning::ThawHasNoFreezeToCancel
+            )));
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn operator_signature_carries_issuing_operator_id() {
+        let identity = OperatorIdentity::generate();
+        let proposal = IceActionProposal::FreezeCluster {
+            ttl: Duration::from_secs(60),
+        };
+        let sig = OperatorSignature::sign(&identity, &proposal);
+        assert_eq!(sig.operator_id, identity.operator_id());
+        assert!(!sig.signature.is_empty(), "signature payload should encode the proposal");
     }
 }
