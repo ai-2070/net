@@ -445,8 +445,22 @@ impl DeckClient {
         event: AdminEvent,
         kind: &'static str,
     ) -> Result<ChainCommit, AdminError> {
+        // When an operator registry is installed, sign the
+        // admin event and route through SignedAdminCommit so
+        // the substrate verifier sees the operator's signature.
+        // Otherwise (in-process tests, dev mode) fall back to
+        // the unsigned admin path. Per the plan's locked
+        // decision #2 every Deck commit is signed in
+        // production deployments — the substrate verifier is
+        // the source of truth.
+        let wire_event = if self.operator_registry.is_some() {
+            let signature = self.identity.sign_admin_event(&event);
+            MeshOsEvent::SignedAdminCommit { event, signature }
+        } else {
+            MeshOsEvent::AdminEvent(event)
+        };
         self.handle
-            .publish(MeshOsEvent::AdminEvent(event))
+            .publish(wire_event)
             .await
             .map_err(AdminError::from)?;
         Ok(ChainCommit {
@@ -627,6 +641,20 @@ impl OperatorIdentity {
     /// [`OperatorSignature::sign`] constructor.
     pub fn sign_proposal(&self, proposal: &IceActionProposal) -> OperatorSignature {
         OperatorSignature::sign(self.keypair(), proposal)
+    }
+
+    /// Sign an ordinary `AdminEvent` for the single-signature
+    /// `SignedAdminCommit` path. The signature covers the
+    /// substrate's
+    /// [`super::meshos::admin_event_signing_payload`] so the
+    /// loop verifier and the SDK agree on the byte sequence.
+    pub fn sign_admin_event(&self, event: &AdminEvent) -> OperatorSignature {
+        let payload = super::meshos::admin_event_signing_payload(event);
+        let sig = self.keypair().sign(&payload);
+        OperatorSignature {
+            operator_id: self.operator_id(),
+            signature: sig.to_bytes().to_vec(),
+        }
     }
 }
 
@@ -1629,6 +1657,73 @@ mod tests {
         let force_only = deck.audit().force_only().collect();
         assert_eq!(force_only.len(), 1, "force_only should drop Cordon");
         assert!(force_only[0].event.is_ice());
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn admin_commit_routes_through_signed_path_when_registry_installed() {
+        // With an OperatorRegistry installed, the SDK's
+        // AdminCommands signs every admin event and routes via
+        // SignedAdminCommit; the substrate verifier accepts +
+        // the audit ring shows the operator + Accepted outcome.
+        use std::sync::Arc as SArc;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let identity = OperatorIdentity::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(identity.keypair());
+        let verifier = SArc::new(
+            crate::adapter::net::behavior::meshos::AdminVerifier::new(
+                SArc::new(registry.clone()),
+                1,
+            ),
+        );
+        let runtime = MeshOsRuntime::start_with_all(
+            fast_config(),
+            dispatcher,
+            Default::default(),
+            Default::default(),
+            SArc::new(crate::adapter::net::compute::DaemonRegistry::new()),
+            None,
+            Some(verifier),
+        );
+        let deck = DeckClient::from_runtime(&runtime, identity.clone())
+            .with_operator_registry(registry);
+
+        let commit = deck.admin().cordon(42).await.expect("commit");
+        assert_eq!(commit.event_kind(), "cordon");
+
+        // Audit ring should show the commit with Accepted
+        // outcome + the issuing operator id.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let entries = deck.audit().collect();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].outcome,
+            crate::adapter::net::behavior::meshos::VerificationOutcome::Accepted
+        ));
+        assert_eq!(entries[0].operator_ids, vec![identity.operator_id()]);
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn admin_commit_falls_back_to_unsigned_when_no_registry_installed() {
+        // Without a registry the SDK routes through the
+        // legacy unsigned admin path. Audit ring still records
+        // the commit but with Unverified outcome.
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        deck.admin().cordon(42).await.expect("commit");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let entries = deck.audit().collect();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].outcome,
+            crate::adapter::net::behavior::meshos::VerificationOutcome::Unverified
+        ));
+        assert!(entries[0].operator_ids.is_empty());
         let _ = runtime.shutdown().await;
     }
 

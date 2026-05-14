@@ -342,6 +342,58 @@ async fn substrate_admin_verifier_accepts_a_valid_signed_ice_commit_and_folds_it
 }
 
 #[tokio::test]
+async fn substrate_admin_verifier_rejects_tampered_signed_admin_commit() {
+    // Malicious SDK bypasses any local gate and publishes a
+    // tampered SignedAdminCommit. The loop's verifier must
+    // reject; the inner event must NOT fold (cordon would
+    // otherwise show up downstream).
+    use net::adapter::net::behavior::meshos::{admin_event_signing_payload, AdminEvent};
+    use std::sync::Arc as SArc;
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let op = OperatorIdentity::generate();
+    let mut registry = OperatorRegistry::new();
+    registry.register(op.keypair());
+    let verifier = SArc::new(AdminVerifier::new(SArc::new(registry), 1));
+    let runtime = MeshOsRuntime::start_with_all(
+        fast_config(),
+        dispatcher,
+        Default::default(),
+        Default::default(),
+        SArc::new(net::adapter::net::compute::DaemonRegistry::new()),
+        None,
+        Some(verifier),
+    );
+
+    let event = AdminEvent::Cordon { node: THIS_NODE };
+    let payload = admin_event_signing_payload(&event);
+    let sig_bytes = op.keypair().sign(&payload);
+    let mut signature = OperatorSignature {
+        operator_id: op.operator_id(),
+        signature: sig_bytes.to_bytes().to_vec(),
+    };
+    signature.signature[3] ^= 0xAA; // tamper
+
+    runtime
+        .handle()
+        .publish(MeshOsEvent::SignedAdminCommit {
+            event: event.clone(),
+            signature,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Audit ring should record the rejected attempt.
+    let snap = runtime.snapshot();
+    assert_eq!(snap.admin_audit.len(), 1);
+    assert!(matches!(
+        snap.admin_audit[0].outcome,
+        net::adapter::net::behavior::meshos::VerificationOutcome::Rejected { .. }
+    ));
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn admin_audit_ring_records_accepted_and_rejected_attempts() {
     // The substrate verifier records every SignedIceCommit it
     // sees — accepted AND rejected — on the snapshot's

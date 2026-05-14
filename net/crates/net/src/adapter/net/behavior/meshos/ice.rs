@@ -135,6 +135,18 @@ pub fn ice_proposal_signing_payload(proposal: &IceActionProposal) -> Vec<u8> {
     postcard::to_allocvec(proposal).expect("postcard encoding of IceActionProposal is infallible")
 }
 
+/// Deterministic encoding for single-signature admin commits.
+/// Sign over the postcard encoding of the
+/// [`super::event::AdminEvent`] wire form so the substrate
+/// verifier and the SDK signer agree on the byte sequence
+/// exactly. Same shape as
+/// [`ice_proposal_signing_payload`] but for ordinary admin
+/// commits, which carry one signature rather than a multi-op
+/// bundle.
+pub fn admin_event_signing_payload(event: &AdminEvent) -> Vec<u8> {
+    postcard::to_allocvec(event).expect("postcard encoding of AdminEvent is infallible")
+}
+
 impl OperatorSignature {
     /// Sign `proposal` with `keypair`'s ed25519 secret. The
     /// 64-byte signature covers
@@ -408,6 +420,22 @@ impl AdminVerifier {
         let payload = ice_proposal_signing_payload(proposal);
         self.registry
             .verify_bundle(signatures, &payload, self.threshold)
+    }
+
+    /// Verify a single-signature ordinary-admin commit against
+    /// `event`. Single-operator path — `signature.operator_id`
+    /// must be registered, and the signature must cover
+    /// [`admin_event_signing_payload`] for `event`. The ICE
+    /// `threshold` doesn't apply here because ordinary admin
+    /// commits are single-operator by design; only the ICE
+    /// surface uses the M-of-N threshold.
+    pub fn verify_admin_commit(
+        &self,
+        event: &AdminEvent,
+        signature: &OperatorSignature,
+    ) -> Result<(), VerifyError> {
+        let payload = admin_event_signing_payload(event);
+        self.registry.verify(signature, &payload)
     }
 }
 
@@ -1171,6 +1199,79 @@ mod tests {
         let json = serde_json::to_string(&record).expect("encode");
         let decoded: AdminAuditRecord = serde_json::from_str(&json).expect("decode");
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn admin_event_signing_payload_round_trips_through_postcard() {
+        // The signing payload must decode back to the same
+        // AdminEvent — the substrate verifier hashes / verifies
+        // over this exact byte sequence.
+        let event = AdminEvent::EnterMaintenance {
+            node: 42,
+            drain_for: Some(Duration::from_secs(120)),
+        };
+        let payload = admin_event_signing_payload(&event);
+        let decoded: AdminEvent = postcard::from_bytes(&payload).expect("decode");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn admin_verifier_accepts_a_valid_single_signature_admin_commit() {
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 1);
+
+        let event = AdminEvent::Cordon { node: 42 };
+        let payload = admin_event_signing_payload(&event);
+        let sig_bytes = kp.sign(&payload);
+        let signature = OperatorSignature {
+            operator_id: kp.origin_hash(),
+            signature: sig_bytes.to_bytes().to_vec(),
+        };
+        verifier
+            .verify_admin_commit(&event, &signature)
+            .expect("valid single-sig commit");
+    }
+
+    #[test]
+    fn admin_verifier_rejects_tampered_single_signature_admin_commit() {
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 1);
+
+        let event = AdminEvent::Cordon { node: 42 };
+        let payload = admin_event_signing_payload(&event);
+        let sig_bytes = kp.sign(&payload);
+        let mut signature = OperatorSignature {
+            operator_id: kp.origin_hash(),
+            signature: sig_bytes.to_bytes().to_vec(),
+        };
+        signature.signature[0] ^= 0x01;
+        let err = verifier
+            .verify_admin_commit(&event, &signature)
+            .unwrap_err();
+        assert_eq!(err.kind(), "signature_invalid");
+    }
+
+    #[test]
+    fn admin_verifier_rejects_admin_commit_from_unknown_operator() {
+        let kp = EntityKeypair::generate();
+        // Registry is empty — operator not known.
+        let verifier = AdminVerifier::new(std::sync::Arc::new(OperatorRegistry::new()), 1);
+
+        let event = AdminEvent::Cordon { node: 42 };
+        let payload = admin_event_signing_payload(&event);
+        let sig_bytes = kp.sign(&payload);
+        let signature = OperatorSignature {
+            operator_id: kp.origin_hash(),
+            signature: sig_bytes.to_bytes().to_vec(),
+        };
+        let err = verifier
+            .verify_admin_commit(&event, &signature)
+            .unwrap_err();
+        assert_eq!(err.kind(), "not_authorized");
     }
 
     #[test]

@@ -240,11 +240,11 @@ impl MeshOsState {
             MeshOsEvent::MaintenanceTransitionObserved { node, state } => {
                 self.apply_maintenance_transition(*node, state.clone(), this_node);
             }
-            MeshOsEvent::SignedIceCommit { .. } => {
-                // The loop unwraps verified `SignedIceCommit`
-                // events into their inner `AdminEvent` and calls
-                // back into this fold with the unwrapped form,
-                // so this arm is dead in production. Kept
+            MeshOsEvent::SignedIceCommit { .. } | MeshOsEvent::SignedAdminCommit { .. } => {
+                // The loop unwraps verified signed-commit events
+                // into their inner `AdminEvent` and calls back
+                // into this fold with the unwrapped form, so
+                // these arms are dead in production. Kept
                 // explicit so future MeshOsEvent additions
                 // can't silently skip the fold.
             }

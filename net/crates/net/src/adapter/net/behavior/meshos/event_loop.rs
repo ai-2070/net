@@ -612,6 +612,46 @@ impl MeshOsLoop {
             self.emit_maintenance_transitions();
             return;
         }
+        // Single-signature signed-admin commits mirror the ICE
+        // path: verify, audit, fold on success. The signature
+        // covers `admin_event_signing_payload(event)` so the
+        // SDK and substrate agree on the byte sequence.
+        if let MeshOsEvent::SignedAdminCommit {
+            event: admin_event,
+            signature,
+        } = event
+        {
+            let outcome = match self.admin_verifier.as_ref() {
+                Some(verifier) => match verifier.verify_admin_commit(admin_event, signature) {
+                    Ok(()) => super::ice::VerificationOutcome::Accepted,
+                    Err(err) => super::ice::VerificationOutcome::Rejected {
+                        kind: err.kind().to_string(),
+                        message: err.to_string(),
+                    },
+                },
+                None => super::ice::VerificationOutcome::Unverified,
+            };
+            self.record_admin_audit(
+                admin_event,
+                vec![signature.operator_id],
+                outcome.clone(),
+            );
+            if let super::ice::VerificationOutcome::Rejected { kind, message } = &outcome {
+                tracing::warn!(
+                    target: "meshos",
+                    kind = %kind,
+                    error = %message,
+                    "rejected SignedAdminCommit — signature verification failed",
+                );
+                return;
+            }
+            self.desired
+                .apply_admin(admin_event, self.config.this_node);
+            let unwrapped = MeshOsEvent::AdminEvent(admin_event.clone());
+            self.actual.apply(&unwrapped, self.config.this_node);
+            self.emit_maintenance_transitions();
+            return;
+        }
         match event {
             MeshOsEvent::PlacementIntent(intent) => self.desired.apply(intent),
             MeshOsEvent::DaemonIntentUpdate(update) => self.desired.apply_daemon_intent(update),

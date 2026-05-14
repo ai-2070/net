@@ -93,6 +93,26 @@ pub enum MeshOsEvent {
         signatures: Vec<super::ice::OperatorSignature>,
     },
 
+    /// A single-operator-signed ordinary admin commit arrived
+    /// from the Deck SDK. Like `SignedIceCommit` but for non-
+    /// ICE admin events (drain, cordon, drop_replicas, …) —
+    /// these are single-operator by design, so one signature
+    /// per commit rather than a bundle. The loop's optional
+    /// admin verifier checks the signature against the
+    /// cluster's registered operator policy before folding the
+    /// inner [`AdminEvent`]; failed verifications land on the
+    /// audit ring with `VerificationOutcome::Rejected` and the
+    /// inner event drops.
+    SignedAdminCommit {
+        /// The admin event the signature covers. The loop
+        /// verifies via
+        /// [`super::ice::admin_event_signing_payload`].
+        event: AdminEvent,
+        /// Issuing operator's signature over the event's
+        /// signing payload.
+        signature: super::ice::OperatorSignature,
+    },
+
     /// A blob was announced / removed. Source (Phase E): the
     /// Dataforts capability fold.
     BlobAnnouncement(BlobAnnouncement),
