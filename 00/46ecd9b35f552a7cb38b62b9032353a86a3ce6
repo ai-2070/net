@@ -1,0 +1,42 @@
+net/crates/net/src/adapter/net/behavior/meshos/logs.rs
+  s_3bbc444b3ef3e5::t_0c6485bdc935ec 1-170
+net/crates/net/src/adapter/net/behavior/meshos/state.rs
+  s_3bbc444b3ef3e5::t_fe8769212d9ec1 106-112
+  s_3bbc444b3ef3e5::t_1785508cd76639 266-273
+net/crates/net/sdk/src/deck.rs
+  s_3bbc444b3ef3e5::t_9e9b4e53d6f316 44-46
+  s_3bbc444b3ef3e5::t_9b3ef166711888 54-56
+net/crates/net/src/adapter/net/behavior/deck.rs
+  s_3bbc444b3ef3e5::t_0d87098e35d4bb 1292-1420
+  s_3bbc444b3ef3e5::t_cc936f06fdfb13 429-445
+  s_3bbc444b3ef3e5::t_730d47e973b60a 2053-2172
+net/crates/net/src/adapter/net/behavior/meshos/mod.rs
+  s_3bbc444b3ef3e5::t_dce4af12e5f5f3 101
+  s_3bbc444b3ef3e5::t_0b99af291077ad 61
+net/crates/net/src/adapter/net/behavior/meshos/event.rs
+  s_3bbc444b3ef3e5::t_4b5ca3cfb83a7c 116-123
+net/crates/net/src/adapter/net/behavior/meshos/event_loop.rs
+  s_3bbc444b3ef3e5::t_1a9d279f95542d 669-674
+  s_3bbc444b3ef3e5::t_9b3ab10cbfb3a4 107-112
+  s_3bbc444b3ef3e5::t_aa8e2178bd968f 730-753
+  s_3bbc444b3ef3e5::t_c7163cb745c16d 379
+net/crates/net/src/adapter/net/behavior/meshos/snapshot.rs
+  s_3bbc444b3ef3e5::t_aa896d5cf9d29f 75-81
+  s_3bbc444b3ef3e5::t_463f01a278fa3a 470,482
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "0046ecd9b35f552a7cb38b62b9032353a86a3ce6",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
