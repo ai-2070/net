@@ -199,7 +199,7 @@ async fn ice_proposal_simulate_then_commit_lands_freeze_through_pipeline() {
         .iter()
         .any(|w| matches!(w, BlastWarning::ClusterFreezeBlocksOperatorActions)));
 
-    let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms());
+    let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
     let commit = proposal.commit(&[sig]).await.expect("commit");
     assert_eq!(commit.event_kind(), "freeze_cluster");
 
@@ -229,7 +229,7 @@ async fn ice_proposal_commit_without_simulate_is_rejected_before_publish() {
     let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
 
     let proposal = deck.ice().freeze_cluster(Duration::from_secs(10));
-    let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms());
+    let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
     let err = proposal
         .commit(&[sig])
         .await
@@ -271,7 +271,13 @@ async fn substrate_admin_verifier_rejects_tampered_signed_ice_commit() {
         ttl: Duration::from_secs(20),
     };
     let issued_at_ms = net::adapter::net::behavior::meshos::now_ms_since_unix_epoch();
-    let mut sig = OperatorSignature::sign(op.keypair(), &proposal, issued_at_ms);
+    let blast = net::adapter::net::behavior::meshos::simulate_ice_proposal(
+        &runtime.snapshot(),
+        &proposal,
+    );
+    let blast_hash = net::adapter::net::behavior::meshos::blast_radius_hash(&blast);
+    let mut sig =
+        OperatorSignature::sign(op.keypair(), &proposal, issued_at_ms, &blast_hash);
     sig.signature[5] ^= 0xAA; // tamper
 
     runtime
@@ -280,6 +286,7 @@ async fn substrate_admin_verifier_rejects_tampered_signed_ice_commit() {
             proposal: proposal.clone(),
             signatures: vec![sig],
             issued_at_ms,
+            blast_hash,
         })
         .await
         .unwrap();
@@ -319,8 +326,13 @@ async fn substrate_admin_verifier_accepts_a_valid_signed_ice_commit_and_folds_it
         ttl: Duration::from_secs(30),
     };
     let issued_at_ms = net::adapter::net::behavior::meshos::now_ms_since_unix_epoch();
-    let payload = ice_proposal_signing_payload(&proposal, issued_at_ms);
-    let sig = OperatorSignature::sign(op.keypair(), &proposal, issued_at_ms);
+    let blast = net::adapter::net::behavior::meshos::simulate_ice_proposal(
+        &runtime.snapshot(),
+        &proposal,
+    );
+    let blast_hash = net::adapter::net::behavior::meshos::blast_radius_hash(&blast);
+    let payload = ice_proposal_signing_payload(&proposal, issued_at_ms, &blast_hash);
+    let sig = OperatorSignature::sign(op.keypair(), &proposal, issued_at_ms, &blast_hash);
     // Sanity: payload + signature match what the SDK would
     // produce.
     assert_eq!(sig.operator_id, op.operator_id());
@@ -332,6 +344,7 @@ async fn substrate_admin_verifier_accepts_a_valid_signed_ice_commit_and_folds_it
             proposal: proposal.clone(),
             signatures: vec![sig],
             issued_at_ms,
+            blast_hash,
         })
         .await
         .unwrap();
@@ -422,13 +435,19 @@ async fn admin_audit_ring_records_accepted_and_rejected_attempts() {
         ttl: Duration::from_secs(30),
     };
     let good_ts = net::adapter::net::behavior::meshos::now_ms_since_unix_epoch();
-    let good_sig = OperatorSignature::sign(op.keypair(), &good, good_ts);
+    let good_blast = net::adapter::net::behavior::meshos::simulate_ice_proposal(
+        &runtime.snapshot(),
+        &good,
+    );
+    let good_hash = net::adapter::net::behavior::meshos::blast_radius_hash(&good_blast);
+    let good_sig = OperatorSignature::sign(op.keypair(), &good, good_ts, &good_hash);
     runtime
         .handle()
         .publish(MeshOsEvent::SignedIceCommit {
             proposal: good.clone(),
             signatures: vec![good_sig],
             issued_at_ms: good_ts,
+            blast_hash: good_hash,
         })
         .await
         .unwrap();
@@ -436,7 +455,12 @@ async fn admin_audit_ring_records_accepted_and_rejected_attempts() {
     // One rejected commit (tampered signature bytes).
     let bad = IceActionProposal::ThawCluster;
     let bad_ts = net::adapter::net::behavior::meshos::now_ms_since_unix_epoch();
-    let mut bad_sig = OperatorSignature::sign(op.keypair(), &bad, bad_ts);
+    let bad_blast = net::adapter::net::behavior::meshos::simulate_ice_proposal(
+        &runtime.snapshot(),
+        &bad,
+    );
+    let bad_hash = net::adapter::net::behavior::meshos::blast_radius_hash(&bad_blast);
+    let mut bad_sig = OperatorSignature::sign(op.keypair(), &bad, bad_ts, &bad_hash);
     bad_sig.signature[0] ^= 0xFF;
     runtime
         .handle()
@@ -444,6 +468,7 @@ async fn admin_audit_ring_records_accepted_and_rejected_attempts() {
             proposal: bad.clone(),
             signatures: vec![bad_sig],
             issued_at_ms: bad_ts,
+            blast_hash: bad_hash,
         })
         .await
         .unwrap();

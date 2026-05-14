@@ -82,7 +82,7 @@ pub enum MeshOsEvent {
     SignedIceCommit {
         /// The proposal that the bundle signed over. The loop
         /// verifies each signature against
-        /// [`super::ice::ice_proposal_signing_payload(proposal, issued_at_ms)`].
+        /// [`super::ice::ice_proposal_signing_payload(proposal, issued_at_ms, &blast_hash)`].
         proposal: super::ice::IceActionProposal,
         /// Operator signatures collected for this proposal. Per
         /// the plan's locked decision #3 the substrate verifier
@@ -102,6 +102,18 @@ pub enum MeshOsEvent {
         /// from multiple operators must share this value across
         /// the bundle.
         issued_at_ms: u64,
+        /// Blake3 digest of the [`super::ice::BlastRadius`] the
+        /// SDK observed during the mandatory `simulate()` call.
+        /// The signatures cover this hash, so the substrate
+        /// verifier enforces locked decision #4 at the
+        /// cryptographic layer: a commit constructed without
+        /// prior simulation either carries the
+        /// [`super::ice::SIMULATION_REQUIRED_SENTINEL`] hash
+        /// (rejected with `simulation_required`) or fabricates
+        /// a hash with no matching simulation (rejected with
+        /// `signature_invalid` when the SDK's verification
+        /// gate rebuilds the payload).
+        blast_hash: super::ice::BlastRadiusHash,
     },
 
     /// A single-operator-signed ordinary admin commit arrived

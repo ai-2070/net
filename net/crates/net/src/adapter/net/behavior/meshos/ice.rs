@@ -191,11 +191,53 @@ pub fn now_ms_since_unix_epoch() -> u64 {
         .unwrap_or(0)
 }
 
+/// Length of a [`BlastRadiusHash`] — blake3's standard 32-byte
+/// digest width. Pinned so cross-language bindings agree on the
+/// wire shape without depending on the blake3 crate exporting
+/// the constant.
+pub const BLAST_RADIUS_HASH_LEN: usize = 32;
+
+/// Fixed-width digest of a [`BlastRadius`] the SDK observed
+/// during `simulate()`. The signing envelope binds the bundle's
+/// signatures to this hash so a commit constructed without a
+/// prior simulation has no valid hash to sign over — the
+/// substrate's enforcement of locked decision #4
+/// ("simulate before commit") at the cryptographic layer
+/// instead of the honor-system gate the SDK alone provides.
+pub type BlastRadiusHash = [u8; BLAST_RADIUS_HASH_LEN];
+
+/// Sentinel hash that means "no simulation was performed."
+/// `IceProposal::commit` refuses to construct a signing
+/// envelope with this hash, and the substrate verifier rejects
+/// any `SignedIceCommit` whose `blast_hash` equals this value
+/// with [`VerifyError::SimulationRequired`]. Distinguishes
+/// "simulation skipped" from "simulation produced a valid but
+/// empty blast radius" — even a no-op proposal hashes to
+/// something non-zero because the postcard encoding carries
+/// type tags.
+pub const SIMULATION_REQUIRED_SENTINEL: BlastRadiusHash = [0u8; BLAST_RADIUS_HASH_LEN];
+
+/// Hash a [`BlastRadius`] for inclusion in the ICE signing
+/// envelope. Deterministic over the postcard encoding so the
+/// SDK signer and the substrate verifier produce identical
+/// bytes for any equal `BlastRadius`. Returns
+/// [`SIMULATION_REQUIRED_SENTINEL`] only for the unreachable
+/// case of a postcard encoding failure (the enums are
+/// composed of types whose encoding is infallible).
+pub fn blast_radius_hash(blast: &BlastRadius) -> BlastRadiusHash {
+    let bytes = postcard::to_allocvec(blast)
+        .expect("postcard encoding of BlastRadius is infallible");
+    blake3::hash(&bytes).into()
+}
+
 /// Deterministic signing payload for an ICE proposal envelope.
 /// Layout: `ICE_SIGNING_DOMAIN || issued_at_ms (little-endian
-/// u64) || postcard(proposal)`. The domain tag isolates the
-/// signature domain; `issued_at_ms` binds the signature to a
-/// freshness window the verifier enforces.
+/// u64) || blast_hash (32 bytes) || postcard(proposal)`. The
+/// domain tag isolates the signature domain; `issued_at_ms`
+/// binds the signature to a freshness window the verifier
+/// enforces; `blast_hash` binds the signature to the
+/// simulator's pre-execution preview so a commit without prior
+/// simulation has no valid hash to sign over.
 ///
 /// Every binding (Rust today; Python / Node / Go / C in
 /// follow-up slices) reproduces this exact byte sequence — the
@@ -204,12 +246,16 @@ pub fn now_ms_since_unix_epoch() -> u64 {
 pub fn ice_proposal_signing_payload(
     proposal: &IceActionProposal,
     issued_at_ms: u64,
+    blast_hash: &BlastRadiusHash,
 ) -> Vec<u8> {
     let inner = postcard::to_allocvec(proposal)
         .expect("postcard encoding of IceActionProposal is infallible");
-    let mut buf = Vec::with_capacity(ICE_SIGNING_DOMAIN.len() + 8 + inner.len());
+    let mut buf = Vec::with_capacity(
+        ICE_SIGNING_DOMAIN.len() + 8 + BLAST_RADIUS_HASH_LEN + inner.len(),
+    );
     buf.extend_from_slice(ICE_SIGNING_DOMAIN);
     buf.extend_from_slice(&issued_at_ms.to_le_bytes());
+    buf.extend_from_slice(blast_hash);
     buf.extend_from_slice(&inner);
     buf
 }
@@ -232,25 +278,34 @@ pub fn admin_event_signing_payload(event: &AdminEvent, issued_at_ms: u64) -> Vec
 
 impl OperatorSignature {
     /// Sign `proposal` with `keypair`'s ed25519 secret, stamped
-    /// at `issued_at_ms` (milliseconds since `UNIX_EPOCH`). The
-    /// 64-byte signature covers
-    /// [`ice_proposal_signing_payload(proposal, issued_at_ms)`],
+    /// at `issued_at_ms` (milliseconds since `UNIX_EPOCH`), and
+    /// bound to the simulator's pre-execution preview hash
+    /// `blast_hash`. The 64-byte signature covers
+    /// [`ice_proposal_signing_payload(proposal, issued_at_ms, blast_hash)`],
     /// so every collaborating operator signing the same
-    /// `(proposal, issued_at_ms)` pair produces bit-identical
-    /// inputs the substrate verifier can re-check.
+    /// `(proposal, issued_at_ms, blast_hash)` triple produces
+    /// bit-identical inputs the substrate verifier can re-check.
     ///
-    /// The `issued_at_ms` binding gives the substrate a
-    /// freshness gate — see
-    /// [`DEFAULT_SIGNING_FRESHNESS_WINDOW`]. Coordinators
-    /// collecting signatures from multiple operators MUST share
-    /// the same `issued_at_ms` across the bundle, otherwise the
-    /// per-operator payloads diverge and the bundle fails
-    /// verification.
+    /// The `blast_hash` binding gives the substrate enforcement
+    /// of locked decision #4 — a commit without a prior
+    /// simulation has no valid hash to sign over, so the
+    /// signatures fail verification. Callers obtain the hash
+    /// via [`blast_radius_hash`] applied to the
+    /// [`BlastRadius`] returned by `IceProposal::simulate`.
+    /// Coordinators collecting signatures from multiple
+    /// operators MUST share the same `(issued_at_ms, blast_hash)`
+    /// pair across the bundle, otherwise the per-operator
+    /// payloads diverge.
     ///
     /// Panics on a public-only keypair — callers that may hold
     /// one should guard with `EntityKeypair::is_read_only`.
-    pub fn sign(keypair: &EntityKeypair, proposal: &IceActionProposal, issued_at_ms: u64) -> Self {
-        let payload = ice_proposal_signing_payload(proposal, issued_at_ms);
+    pub fn sign(
+        keypair: &EntityKeypair,
+        proposal: &IceActionProposal,
+        issued_at_ms: u64,
+        blast_hash: &BlastRadiusHash,
+    ) -> Self {
+        let payload = ice_proposal_signing_payload(proposal, issued_at_ms, blast_hash);
         let sig = keypair.sign(&payload);
         Self {
             operator_id: keypair.origin_hash(),
@@ -449,6 +504,15 @@ pub enum VerifyError {
         /// Configured future-skew tolerance in milliseconds.
         future_skew_ms: u64,
     },
+    /// The signed envelope carried the
+    /// [`SIMULATION_REQUIRED_SENTINEL`] blast-radius hash,
+    /// indicating no [`simulate`] preview ran before the
+    /// commit. Substrate enforcement of locked decision #4 — a
+    /// commit constructed without prior simulation has no valid
+    /// hash to sign over, so the verifier rejects regardless of
+    /// the signatures' cryptographic validity.
+    #[error("ICE commit rejected: simulate() must precede commit() (blast-radius hash is the simulation-required sentinel)")]
+    SimulationRequired,
 }
 
 impl VerifyError {
@@ -461,6 +525,7 @@ impl VerifyError {
             VerifyError::InsufficientSignatures { .. } => "insufficient_signatures",
             VerifyError::EnvelopeExpired { .. } => "envelope_expired",
             VerifyError::EnvelopeFromFuture { .. } => "envelope_from_future",
+            VerifyError::SimulationRequired => "simulation_required",
         }
     }
 }
@@ -614,22 +679,29 @@ impl AdminVerifier {
     }
 
     /// Verify a `SignedIceCommit`-style bundle against
-    /// `proposal` stamped at `issued_at_ms`. Checks freshness
-    /// relative to `now_ms`, then verifies every signature in
-    /// the bundle against the domain-tagged signing payload, and
-    /// finally checks the distinct-operator count against the
-    /// configured threshold. Computes the signing payload
-    /// internally so the loop never needs to recompute it on the
-    /// hot path.
+    /// `proposal` stamped at `issued_at_ms` and bound to
+    /// `blast_hash`. Rejects the
+    /// [`SIMULATION_REQUIRED_SENTINEL`] hash before any
+    /// signature math (substrate enforcement of locked
+    /// decision #4), checks freshness relative to `now_ms`,
+    /// then verifies every signature in the bundle against the
+    /// domain-tagged signing payload, and finally checks the
+    /// distinct-operator count against the configured
+    /// threshold. Computes the signing payload internally so
+    /// the loop never needs to recompute it on the hot path.
     pub fn verify_commit(
         &self,
         proposal: &IceActionProposal,
         signatures: &[OperatorSignature],
         issued_at_ms: u64,
+        blast_hash: &BlastRadiusHash,
         now_ms: u64,
     ) -> Result<(), VerifyError> {
+        if *blast_hash == SIMULATION_REQUIRED_SENTINEL {
+            return Err(VerifyError::SimulationRequired);
+        }
         self.check_freshness(issued_at_ms, now_ms)?;
-        let payload = ice_proposal_signing_payload(proposal, issued_at_ms);
+        let payload = ice_proposal_signing_payload(proposal, issued_at_ms, blast_hash);
         self.registry
             .verify_bundle(signatures, &payload, self.threshold)
     }
@@ -1191,8 +1263,10 @@ mod tests {
             ttl: Duration::from_secs(30),
         };
         let issued_at_ms = now_ms_since_unix_epoch();
-        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
-        let payload = ice_proposal_signing_payload(&proposal, issued_at_ms);
+        let blast = simulate(&MeshOsSnapshot::default(), &proposal);
+        let blast_hash = blast_radius_hash(&blast);
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms, &blast_hash);
+        let payload = ice_proposal_signing_payload(&proposal, issued_at_ms, &blast_hash);
         registry.verify(&sig, &payload).expect("valid signature");
     }
 
@@ -1202,8 +1276,9 @@ mod tests {
         let registry = OperatorRegistry::new(); // empty
         let proposal = IceActionProposal::ThawCluster;
         let issued_at_ms = now_ms_since_unix_epoch();
-        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
-        let payload = ice_proposal_signing_payload(&proposal, issued_at_ms);
+        let blast_hash: BlastRadiusHash = [1u8; BLAST_RADIUS_HASH_LEN];
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms, &blast_hash);
+        let payload = ice_proposal_signing_payload(&proposal, issued_at_ms, &blast_hash);
         let err = registry.verify(&sig, &payload).unwrap_err();
         assert!(matches!(err, VerifyError::NotAuthorized { .. }));
         assert_eq!(err.kind(), "not_authorized");
@@ -1224,9 +1299,10 @@ mod tests {
         let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 2);
         let proposal = IceActionProposal::ThawCluster;
         let issued_at_ms = now_ms_since_unix_epoch();
-        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
+        let blast_hash: BlastRadiusHash = [1u8; BLAST_RADIUS_HASH_LEN];
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms, &blast_hash);
         let err = verifier
-            .verify_commit(&proposal, &[sig], issued_at_ms, issued_at_ms)
+            .verify_commit(&proposal, &[sig], issued_at_ms, &blast_hash, issued_at_ms)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -1250,10 +1326,11 @@ mod tests {
         let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 2);
         let proposal = IceActionProposal::ThawCluster;
         let issued_at_ms = now_ms_since_unix_epoch();
-        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
+        let blast_hash: BlastRadiusHash = [1u8; BLAST_RADIUS_HASH_LEN];
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms, &blast_hash);
         let bundle = [sig.clone(), sig];
         let err = verifier
-            .verify_commit(&proposal, &bundle, issued_at_ms, issued_at_ms)
+            .verify_commit(&proposal, &bundle, issued_at_ms, &blast_hash, issued_at_ms)
             .unwrap_err();
         assert!(
             matches!(
@@ -1279,13 +1356,63 @@ mod tests {
         let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 2);
         let proposal = IceActionProposal::ThawCluster;
         let issued_at_ms = now_ms_since_unix_epoch();
+        let blast_hash: BlastRadiusHash = [1u8; BLAST_RADIUS_HASH_LEN];
         let bundle = [
-            OperatorSignature::sign(&kp_a, &proposal, issued_at_ms),
-            OperatorSignature::sign(&kp_b, &proposal, issued_at_ms),
+            OperatorSignature::sign(&kp_a, &proposal, issued_at_ms, &blast_hash),
+            OperatorSignature::sign(&kp_b, &proposal, issued_at_ms, &blast_hash),
         ];
         verifier
-            .verify_commit(&proposal, &bundle, issued_at_ms, issued_at_ms)
+            .verify_commit(&proposal, &bundle, issued_at_ms, &blast_hash, issued_at_ms)
             .expect("two distinct operators with valid signatures should satisfy threshold = 2");
+    }
+
+    #[test]
+    fn admin_verifier_rejects_simulation_required_sentinel_blast_hash() {
+        // Substrate enforcement of locked decision #4: a commit
+        // carrying the SIMULATION_REQUIRED_SENTINEL hash means
+        // the SDK skipped simulate(). The verifier rejects
+        // BEFORE checking signatures so a commit without a real
+        // simulation can never succeed regardless of how many
+        // operators co-signed the sentinel.
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 1);
+        let proposal = IceActionProposal::ThawCluster;
+        let issued_at_ms = now_ms_since_unix_epoch();
+        let sentinel = SIMULATION_REQUIRED_SENTINEL;
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms, &sentinel);
+        let err = verifier
+            .verify_commit(&proposal, &[sig], issued_at_ms, &sentinel, issued_at_ms)
+            .unwrap_err();
+        assert_eq!(err.kind(), "simulation_required");
+    }
+
+    #[test]
+    fn blast_radius_hash_is_deterministic_across_equal_inputs() {
+        // Multi-operator signing requires every operator to
+        // compute the same hash from the same BlastRadius — the
+        // signing payload bytes diverge otherwise. Confirms the
+        // hash is stable over equal inputs.
+        let blast_a = BlastRadius {
+            affected_nodes: vec![1, 2, 3],
+            affected_replicas: vec![10],
+            affected_daemons: Vec::new(),
+            estimated_drain_delay: Some(Duration::from_secs(15)),
+            placement_stability_delta: 0.5,
+            warnings: vec![BlastWarning::ClusterFreezeBlocksOperatorActions],
+        };
+        let blast_b = blast_a.clone();
+        assert_eq!(blast_radius_hash(&blast_a), blast_radius_hash(&blast_b));
+        // Different inputs must produce different hashes.
+        let blast_c = BlastRadius {
+            affected_nodes: vec![4, 5, 6],
+            ..blast_a
+        };
+        assert_ne!(blast_radius_hash(&blast_b), blast_radius_hash(&blast_c));
+        // The deterministic encoding never produces the
+        // simulation-required sentinel by accident.
+        assert_ne!(blast_radius_hash(&blast_b), SIMULATION_REQUIRED_SENTINEL);
     }
 
     #[test]
@@ -1788,8 +1915,9 @@ mod tests {
         let event = AdminEvent::ThawCluster;
         let proposal = IceActionProposal::ThawCluster;
         let ts = 1u64;
+        let blast_hash: BlastRadiusHash = [1u8; BLAST_RADIUS_HASH_LEN];
         let admin_payload = admin_event_signing_payload(&event, ts);
-        let ice_payload = ice_proposal_signing_payload(&proposal, ts);
+        let ice_payload = ice_proposal_signing_payload(&proposal, ts, &blast_hash);
         assert_ne!(admin_payload, ice_payload);
     }
 
@@ -1858,9 +1986,10 @@ mod tests {
         let proposal = IceActionProposal::ThawCluster;
         let issued_at_ms = 1_000_000u64;
         let now_ms = issued_at_ms + 120_000; // 120s old; window is 60s
-        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
+        let blast_hash: BlastRadiusHash = [1u8; BLAST_RADIUS_HASH_LEN];
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms, &blast_hash);
         let err = verifier
-            .verify_commit(&proposal, &[sig], issued_at_ms, now_ms)
+            .verify_commit(&proposal, &[sig], issued_at_ms, &blast_hash, now_ms)
             .unwrap_err();
         assert_eq!(err.kind(), "envelope_expired");
     }
@@ -1879,9 +2008,10 @@ mod tests {
         let proposal = IceActionProposal::ThawCluster;
         let now_ms = 1_000_000u64;
         let issued_at_ms = now_ms + 60_000; // 60s ahead of verifier clock; skew tolerance is 5s
-        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
+        let blast_hash: BlastRadiusHash = [1u8; BLAST_RADIUS_HASH_LEN];
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms, &blast_hash);
         let err = verifier
-            .verify_commit(&proposal, &[sig], issued_at_ms, now_ms)
+            .verify_commit(&proposal, &[sig], issued_at_ms, &blast_hash, now_ms)
             .unwrap_err();
         assert_eq!(err.kind(), "envelope_from_future");
     }
@@ -1900,9 +2030,10 @@ mod tests {
         let proposal = IceActionProposal::ThawCluster;
         let issued_at_ms = 1_000_000u64;
         let now_ms = issued_at_ms + 30_000; // 30s old; well within 60s window
-        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
+        let blast_hash: BlastRadiusHash = [1u8; BLAST_RADIUS_HASH_LEN];
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms, &blast_hash);
         verifier
-            .verify_commit(&proposal, &[sig], issued_at_ms, now_ms)
+            .verify_commit(&proposal, &[sig], issued_at_ms, &blast_hash, now_ms)
             .expect("envelope inside freshness window should verify");
     }
 
@@ -1918,7 +2049,8 @@ mod tests {
         registry.register(&kp);
         let issued_at_ms = now_ms_since_unix_epoch();
         let proposal = IceActionProposal::ThawCluster;
-        let ice_sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
+        let blast_hash: BlastRadiusHash = [1u8; BLAST_RADIUS_HASH_LEN];
+        let ice_sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms, &blast_hash);
         // Attempt to verify the ICE signature as if it were an
         // admin commit over the same logical action.
         let event = AdminEvent::ThawCluster;

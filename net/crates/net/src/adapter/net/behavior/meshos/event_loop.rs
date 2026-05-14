@@ -695,12 +695,19 @@ impl MeshOsLoop {
             proposal,
             signatures,
             issued_at_ms,
+            blast_hash,
         } = event
         {
             let outcome = match self.admin_verifier.as_ref() {
                 Some(verifier) => {
                     let now_ms = super::ice::now_ms_since_unix_epoch();
-                    match verifier.verify_commit(proposal, signatures, *issued_at_ms, now_ms) {
+                    match verifier.verify_commit(
+                        proposal,
+                        signatures,
+                        *issued_at_ms,
+                        blast_hash,
+                        now_ms,
+                    ) {
                         Ok(()) => super::ice::VerificationOutcome::Accepted,
                         Err(err) => super::ice::VerificationOutcome::Rejected {
                             kind: err.kind().to_string(),
