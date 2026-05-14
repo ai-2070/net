@@ -519,6 +519,301 @@ async fn admin_audit_ring_records_accepted_and_rejected_attempts() {
 }
 
 #[tokio::test]
+async fn substrate_admin_verifier_rejects_under_threshold_bundle() {
+    // Plan's ICE-discipline contract through the integration
+    // pipeline: a SignedIceCommit with fewer distinct operator
+    // signatures than the cluster's threshold must be rejected
+    // by the loop-side verifier.
+    use net::adapter::net::behavior::deck::DeckClientConfig;
+    use net::adapter::net::behavior::meshos::DEFAULT_ICE_COOLDOWN_WINDOW;
+    use std::sync::Arc as SArc;
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let op_a = OperatorIdentity::generate();
+    let op_b = OperatorIdentity::generate();
+    let mut registry = OperatorRegistry::new();
+    registry.register(op_a.keypair());
+    registry.register(op_b.keypair());
+    // Threshold = 2. Avoid the cooldown gate so the rejection
+    // is unambiguously "insufficient_signatures" rather than
+    // "ice_cooldown_active."
+    let verifier = SArc::new(
+        net::adapter::net::behavior::meshos::AdminVerifier::with_full_policy(
+            SArc::new(registry),
+            2,
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+            DEFAULT_ICE_COOLDOWN_WINDOW,
+        ),
+    );
+    let runtime = MeshOsRuntime::start_with_all(
+        fast_config(),
+        dispatcher,
+        Default::default(),
+        Default::default(),
+        SArc::new(net::adapter::net::compute::DaemonRegistry::new()),
+        None,
+        Some(verifier),
+    );
+
+    // Bypass the SDK's local threshold gate by setting
+    // ice_signature_threshold = 1, then submit a 1-sig bundle
+    // that the loop's verifier (threshold = 2) must reject.
+    let mut sdk_registry = OperatorRegistry::new();
+    sdk_registry.register(op_a.keypair());
+    sdk_registry.register(op_b.keypair());
+    let deck = DeckClient::from_runtime(&runtime, op_a.clone())
+        .with_operator_registry(sdk_registry)
+        .with_config(DeckClientConfig {
+            ice_signature_threshold: 1,
+            ..DeckClientConfig::default()
+        });
+
+    let proposal = deck
+        .ice()
+        .freeze_cluster(Duration::from_secs(30))
+        .simulate()
+        .await
+        .expect("simulate");
+    let sig_a = op_a.sign_proposal(
+        proposal.action(),
+        proposal.issued_at_ms(),
+        &proposal.blast_hash(),
+    );
+    let _ = proposal.commit(&[sig_a]).await.expect("publish");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // The audit ring records the rejected attempt with kind
+    // "insufficient_signatures"; the inner FreezeCluster must
+    // NOT have folded — freeze_remaining_ms stays None.
+    let snap = runtime.snapshot();
+    assert!(
+        snap.freeze_remaining_ms.is_none(),
+        "under-threshold bundle should not fold the inner FreezeCluster",
+    );
+    let kind = snap
+        .admin_audit
+        .iter()
+        .find_map(|r| match &r.outcome {
+            net::adapter::net::behavior::meshos::VerificationOutcome::Rejected { kind, .. } => {
+                Some(kind.clone())
+            }
+            _ => None,
+        })
+        .expect("audit ring should record the rejection");
+    assert_eq!(kind, "insufficient_signatures");
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn substrate_admin_verifier_rejects_duplicate_signatures_from_same_operator() {
+    // Distinct-operator dedup at the integration boundary:
+    // `[sig_A, sig_A]` against threshold = 2 fails even
+    // though both signatures cryptographically verify.
+    use std::sync::Arc as SArc;
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let op = OperatorIdentity::generate();
+    let mut registry = OperatorRegistry::new();
+    registry.register(op.keypair());
+    let verifier =
+        SArc::new(net::adapter::net::behavior::meshos::AdminVerifier::new(SArc::new(registry), 2));
+    let runtime = MeshOsRuntime::start_with_all(
+        fast_config(),
+        dispatcher,
+        Default::default(),
+        Default::default(),
+        SArc::new(net::adapter::net::compute::DaemonRegistry::new()),
+        None,
+        Some(verifier),
+    );
+
+    let proposal = IceActionProposal::FreezeCluster {
+        ttl: Duration::from_secs(30),
+    };
+    let issued_at_ms = net::adapter::net::behavior::meshos::now_ms_since_unix_epoch();
+    let blast = net::adapter::net::behavior::meshos::simulate_ice_proposal(
+        &runtime.snapshot(),
+        &proposal,
+    );
+    let blast_hash = net::adapter::net::behavior::meshos::blast_radius_hash(&blast);
+    let sig = OperatorSignature::sign(op.keypair(), &proposal, issued_at_ms, &blast_hash);
+    runtime
+        .handle()
+        .publish(MeshOsEvent::SignedIceCommit {
+            proposal: proposal.clone(),
+            signatures: vec![sig.clone(), sig], // same operator twice
+            issued_at_ms,
+            blast_hash,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let snap = runtime.snapshot();
+    assert!(
+        snap.freeze_remaining_ms.is_none(),
+        "duplicate-signature bundle must not fold",
+    );
+    let kind = snap
+        .admin_audit
+        .iter()
+        .find_map(|r| match &r.outcome {
+            net::adapter::net::behavior::meshos::VerificationOutcome::Rejected { kind, .. } => {
+                Some(kind.clone())
+            }
+            _ => None,
+        })
+        .expect("audit should record the rejection");
+    assert_eq!(kind, "insufficient_signatures");
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn substrate_admin_verifier_arms_ice_cooldown_after_successful_commit() {
+    // ICE cooldown contract end-to-end: a successful
+    // ForceCutover against node N arms the cooldown; a second
+    // ForceCutover against N inside the window fails with
+    // kind="ice_cooldown_active". Use a short cooldown (1s)
+    // so the test stays fast.
+    use std::sync::Arc as SArc;
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let op = OperatorIdentity::generate();
+    let mut registry = OperatorRegistry::new();
+    registry.register(op.keypair());
+    let verifier = SArc::new(
+        net::adapter::net::behavior::meshos::AdminVerifier::with_full_policy(
+            SArc::new(registry),
+            1,
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        ),
+    );
+    let runtime = MeshOsRuntime::start_with_all(
+        fast_config(),
+        dispatcher,
+        Default::default(),
+        Default::default(),
+        SArc::new(net::adapter::net::compute::DaemonRegistry::new()),
+        None,
+        Some(verifier),
+    );
+
+    let proposal = IceActionProposal::ForceCutover {
+        chain: 100,
+        target: 42,
+    };
+    let issued_at_ms = net::adapter::net::behavior::meshos::now_ms_since_unix_epoch();
+    let blast = net::adapter::net::behavior::meshos::simulate_ice_proposal(
+        &runtime.snapshot(),
+        &proposal,
+    );
+    let blast_hash = net::adapter::net::behavior::meshos::blast_radius_hash(&blast);
+    let sig = OperatorSignature::sign(op.keypair(), &proposal, issued_at_ms, &blast_hash);
+    runtime
+        .handle()
+        .publish(MeshOsEvent::SignedIceCommit {
+            proposal: proposal.clone(),
+            signatures: vec![sig.clone()],
+            issued_at_ms,
+            blast_hash,
+        })
+        .await
+        .unwrap();
+
+    // Second commit against the same target inside the
+    // cooldown window must be rejected.
+    let issued_at_ms2 = issued_at_ms + 50;
+    let sig2 = OperatorSignature::sign(op.keypair(), &proposal, issued_at_ms2, &blast_hash);
+    runtime
+        .handle()
+        .publish(MeshOsEvent::SignedIceCommit {
+            proposal,
+            signatures: vec![sig2],
+            issued_at_ms: issued_at_ms2,
+            blast_hash,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let snap = runtime.snapshot();
+    let cooldown_rejected = snap
+        .admin_audit
+        .iter()
+        .any(|r| match &r.outcome {
+            net::adapter::net::behavior::meshos::VerificationOutcome::Rejected { kind, .. } => {
+                kind == "ice_cooldown_active"
+            }
+            _ => false,
+        });
+    assert!(
+        cooldown_rejected,
+        "second ICE commit inside the cooldown window should be audited as ice_cooldown_active; got {:?}",
+        snap.admin_audit
+    );
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn substrate_admin_verifier_rejects_simulation_required_sentinel() {
+    // Cryptographic enforcement of simulate-before-commit:
+    // a SignedIceCommit carrying SIMULATION_REQUIRED_SENTINEL
+    // must be rejected before any signature math. Locked
+    // decision #4.
+    use net::adapter::net::behavior::meshos::SIMULATION_REQUIRED_SENTINEL;
+    use std::sync::Arc as SArc;
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let op = OperatorIdentity::generate();
+    let mut registry = OperatorRegistry::new();
+    registry.register(op.keypair());
+    let verifier =
+        SArc::new(net::adapter::net::behavior::meshos::AdminVerifier::new(SArc::new(registry), 1));
+    let runtime = MeshOsRuntime::start_with_all(
+        fast_config(),
+        dispatcher,
+        Default::default(),
+        Default::default(),
+        SArc::new(net::adapter::net::compute::DaemonRegistry::new()),
+        None,
+        Some(verifier),
+    );
+
+    let proposal = IceActionProposal::ThawCluster;
+    let issued_at_ms = net::adapter::net::behavior::meshos::now_ms_since_unix_epoch();
+    let sig = OperatorSignature::sign(
+        op.keypair(),
+        &proposal,
+        issued_at_ms,
+        &SIMULATION_REQUIRED_SENTINEL,
+    );
+    runtime
+        .handle()
+        .publish(MeshOsEvent::SignedIceCommit {
+            proposal,
+            signatures: vec![sig],
+            issued_at_ms,
+            blast_hash: SIMULATION_REQUIRED_SENTINEL,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let snap = runtime.snapshot();
+    let kind = snap
+        .admin_audit
+        .iter()
+        .find_map(|r| match &r.outcome {
+            net::adapter::net::behavior::meshos::VerificationOutcome::Rejected { kind, .. } => {
+                Some(kind.clone())
+            }
+            _ => None,
+        })
+        .expect("audit should record the rejection");
+    assert_eq!(kind, "simulation_required");
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn runtime_epoch_id_changes_across_two_runtime_instances() {
     // SDK consumers that dedup against `since(seq)` watermarks
     // must be able to detect a runtime restart so they can
