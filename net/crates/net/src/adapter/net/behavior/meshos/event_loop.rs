@@ -788,6 +788,12 @@ impl MeshOsLoop {
         if !self.actual.forced_evictions.is_empty() {
             self.actual.forced_evictions.clear();
         }
+        // Same pattern for force-cutovers — every node drains
+        // unconditionally so non-leader observers don't
+        // accumulate stale entries.
+        if !self.actual.forced_placements.is_empty() {
+            self.actual.forced_placements.clear();
+        }
         self.reconcile_count += 1;
         let mut dropped_this_tick: u64 = 0;
         let mut first_dropped_kind: Option<&'static str> = None;

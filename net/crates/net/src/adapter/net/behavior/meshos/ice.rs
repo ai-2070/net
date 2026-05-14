@@ -86,6 +86,14 @@ pub enum IceActionProposal {
         /// The daemon whose backoff to clear.
         daemon: DaemonRef,
     },
+    /// Pin `chain` to be placed on `target`. Maps to
+    /// [`super::event::AdminEvent::ForceCutover`].
+    ForceCutover {
+        /// Chain to pin.
+        chain: ChainId,
+        /// Operator-preferred holder.
+        target: NodeId,
+    },
 }
 
 impl IceActionProposal {
@@ -107,6 +115,10 @@ impl IceActionProposal {
             }
             IceActionProposal::ForceRestartDaemon { daemon } => AdminEvent::ForceRestartDaemon {
                 daemon: daemon.clone(),
+            },
+            IceActionProposal::ForceCutover { chain, target } => AdminEvent::ForceCutover {
+                chain: *chain,
+                target: *target,
             },
         }
     }
@@ -559,6 +571,34 @@ pub enum BlastWarning {
         /// The targeted daemon's id.
         daemon_id: u64,
     },
+    /// `ForceCutover` bypasses the placement scorer for the
+    /// targeted chain. The chain ends up pinned to the target;
+    /// the count-driven arm may rebalance if the chain is
+    /// now over-replicated.
+    ForcedCutoverBypassesPlacementScorer {
+        /// Chain the cutover pins.
+        chain: ChainId,
+        /// Operator's preferred holder.
+        target: NodeId,
+    },
+    /// `ForceCutover` targeted a chain that doesn't appear in
+    /// the snapshot. The commit folds but no node will fire
+    /// the leader-side placement because the leader entry is
+    /// missing.
+    ForcedCutoverTargetsUnknownChain {
+        /// Chain id the operator targeted.
+        chain: ChainId,
+    },
+    /// `ForceCutover`'s target is already a holder of the
+    /// chain — the commit folds and the leader emits a
+    /// placement action, but the holder set is unchanged. The
+    /// action becomes a dispatcher-side no-op.
+    ForcedCutoverTargetAlreadyHolder {
+        /// Chain id the operator targeted.
+        chain: ChainId,
+        /// Target that's already a holder.
+        target: NodeId,
+    },
 }
 
 /// Pure simulator: snapshot + proposal → blast radius. No I/O;
@@ -577,6 +617,9 @@ pub fn simulate(snapshot: &MeshOsSnapshot, proposal: &IceActionProposal) -> Blas
         }
         IceActionProposal::ForceRestartDaemon { daemon } => {
             simulate_force_restart_daemon(snapshot, daemon)
+        }
+        IceActionProposal::ForceCutover { chain, target } => {
+            simulate_force_cutover(snapshot, *chain, *target)
         }
     }
 }
@@ -693,6 +736,32 @@ fn simulate_force_restart_daemon(snapshot: &MeshOsSnapshot, daemon: &DaemonRef) 
         affected_daemons: vec![daemon.clone()],
         estimated_drain_delay: None,
         placement_stability_delta: 0.0,
+        warnings,
+    }
+}
+
+fn simulate_force_cutover(
+    snapshot: &MeshOsSnapshot,
+    chain: ChainId,
+    target: NodeId,
+) -> BlastRadius {
+    let mut warnings = vec![BlastWarning::ForcedCutoverBypassesPlacementScorer { chain, target }];
+    match snapshot.replicas.get(&chain) {
+        None => warnings.push(BlastWarning::ForcedCutoverTargetsUnknownChain { chain }),
+        Some(snap) => {
+            if snap.holders.contains(&target) {
+                warnings.push(BlastWarning::ForcedCutoverTargetAlreadyHolder { chain, target });
+            }
+        }
+    }
+    BlastRadius {
+        affected_nodes: vec![target],
+        affected_replicas: vec![chain],
+        affected_daemons: Vec::new(),
+        estimated_drain_delay: None,
+        // Pinning a holder changes placement; surface a non-
+        // zero signal so the operator UI flags the change.
+        placement_stability_delta: 0.15,
         warnings,
     }
 }
@@ -1146,6 +1215,94 @@ mod tests {
         match proposal.to_admin_event() {
             AdminEvent::ForceRestartDaemon { daemon: out } => assert_eq!(out, daemon),
             other => panic!("expected ForceRestartDaemon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn simulate_force_cutover_reports_chain_and_target() {
+        let mut snap = MeshOsSnapshot::default();
+        snap.replicas.insert(
+            100,
+            super::super::snapshot::ReplicaSnapshot {
+                holders: vec![1, 2, 3],
+                desired_count: Some(3),
+                leader: Some(1),
+            },
+        );
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::ForceCutover {
+                chain: 100,
+                target: 99,
+            },
+        );
+        assert_eq!(blast.affected_replicas, vec![100]);
+        assert_eq!(blast.affected_nodes, vec![99]);
+        assert!(blast.warnings.iter().any(|w| matches!(
+            w,
+            BlastWarning::ForcedCutoverBypassesPlacementScorer {
+                chain: 100,
+                target: 99
+            }
+        )));
+        assert!(blast.placement_stability_delta > 0.0);
+    }
+
+    #[test]
+    fn simulate_force_cutover_warns_on_unknown_chain() {
+        let snap = MeshOsSnapshot::default();
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::ForceCutover {
+                chain: 100,
+                target: 7,
+            },
+        );
+        assert!(blast.warnings.iter().any(|w| matches!(
+            w,
+            BlastWarning::ForcedCutoverTargetsUnknownChain { chain: 100 }
+        )));
+    }
+
+    #[test]
+    fn simulate_force_cutover_warns_when_target_already_holder() {
+        let mut snap = MeshOsSnapshot::default();
+        snap.replicas.insert(
+            100,
+            super::super::snapshot::ReplicaSnapshot {
+                holders: vec![7, 8, 9],
+                desired_count: Some(3),
+                leader: Some(7),
+            },
+        );
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::ForceCutover {
+                chain: 100,
+                target: 8,
+            },
+        );
+        assert!(blast.warnings.iter().any(|w| matches!(
+            w,
+            BlastWarning::ForcedCutoverTargetAlreadyHolder {
+                chain: 100,
+                target: 8
+            }
+        )));
+    }
+
+    #[test]
+    fn ice_proposal_to_admin_event_maps_force_cutover() {
+        let proposal = IceActionProposal::ForceCutover {
+            chain: 100,
+            target: 7,
+        };
+        match proposal.to_admin_event() {
+            AdminEvent::ForceCutover { chain, target } => {
+                assert_eq!(chain, 100);
+                assert_eq!(target, 7);
+            }
+            other => panic!("expected ForceCutover, got {other:?}"),
         }
     }
 

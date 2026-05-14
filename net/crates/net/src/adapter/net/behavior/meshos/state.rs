@@ -85,6 +85,14 @@ pub struct MeshOsState {
     /// reconcile pass so a single admin commit fires exactly
     /// one eviction.
     pub(crate) forced_evictions: Vec<(ChainId, NodeId)>,
+    /// Operator-issued force-cutovers pending leader-side
+    /// emission. Same pattern as `forced_evictions`: fold
+    /// appends `(chain, target)` on every
+    /// `AdminEvent::ForceCutover`; the leader's reconcile arm
+    /// emits a `RequestPlacement { target: Some(target), .. }`
+    /// bypassing the placement scorer; the loop drains the
+    /// list after each pass.
+    pub(crate) forced_placements: Vec<(ChainId, NodeId)>,
     /// Ring buffer of admin-commit outcomes — every admin
     /// commit the loop observes (signed ICE bundle or unsigned
     /// `MeshOsEvent::AdminEvent(...)`) lands here, regardless
@@ -429,6 +437,12 @@ impl MeshOsState {
                     status.backoff.force_release();
                 }
                 self.applied_backoffs.remove(daemon);
+            }
+            AdminEvent::ForceCutover { chain, target } => {
+                // Cluster-wide signal: every node folds; only
+                // the chain's elected leader emits the resulting
+                // `RequestPlacement` action with target pinned.
+                self.forced_placements.push((*chain, *target));
             }
             _ => {}
         }
@@ -1028,6 +1042,27 @@ mod tests {
         ));
         // Applied-backoffs record should be cleared too.
         assert!(!state.applied_backoffs.contains_key(&d));
+    }
+
+    #[test]
+    fn force_cutover_admin_event_appends_to_forced_placements() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ForceCutover {
+                chain: 100,
+                target: 7,
+            }),
+            THIS_NODE,
+        );
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ForceCutover {
+                chain: 200,
+                target: 9,
+            }),
+            THIS_NODE,
+        );
+        assert_eq!(state.forced_placements, vec![(100u64, 7u64), (200u64, 9u64)]);
     }
 
     #[test]

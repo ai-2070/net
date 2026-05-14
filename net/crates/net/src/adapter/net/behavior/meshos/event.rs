@@ -414,6 +414,20 @@ pub enum AdminEvent {
         /// The daemon whose backoff should be cleared.
         daemon: DaemonRef,
     },
+    /// ICE break-glass: force `chain` to be placed on `target`,
+    /// bypassing the placement scorer. The chain's elected
+    /// leader emits the resulting
+    /// `RequestPlacement { target: Some(target), .. }` action
+    /// (other nodes fold the admin event but don't emit). The
+    /// dispatcher honors `target` directly; the count-driven
+    /// arm will rebalance if the chain ends up over-replicated.
+    /// No-op if `target` is already a holder.
+    ForceCutover {
+        /// Chain to pin.
+        chain: ChainId,
+        /// Node operator wants as a holder.
+        target: NodeId,
+    },
 }
 
 /// Scope discriminator for [`AdminEvent::FlushAvoidLists`].
@@ -531,6 +545,7 @@ impl AdminEvent {
                 | AdminEvent::FlushAvoidLists { .. }
                 | AdminEvent::ForceEvictReplica { .. }
                 | AdminEvent::ForceRestartDaemon { .. }
+                | AdminEvent::ForceCutover { .. }
         )
     }
 }
@@ -591,6 +606,10 @@ mod tests {
                     id: 7,
                     name: "telemetry".into(),
                 },
+            },
+            AdminEvent::ForceCutover {
+                chain: 100,
+                target: 42,
             },
         ];
         for ev in cases {

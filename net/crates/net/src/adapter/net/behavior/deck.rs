@@ -711,6 +711,18 @@ impl<'a> IceCommands<'a> {
         )
     }
 
+    /// Propose force-placing `chain` on `target`, bypassing
+    /// the placement scorer. Only the chain's elected leader
+    /// emits the resulting `RequestPlacement` action with
+    /// `target: Some(target)`; non-leader nodes fold silently.
+    /// No-op if `target` is already a holder.
+    pub fn force_cutover(&self, chain: ChainId, target: NodeId) -> IceProposal<'a> {
+        IceProposal::new(
+            self.client,
+            IceActionProposal::ForceCutover { chain, target },
+        )
+    }
+
     /// Propose cancelling an in-effect cluster freeze.
     pub fn thaw_cluster(&self) -> IceProposal<'a> {
         IceProposal::new(self.client, IceActionProposal::ThawCluster)
@@ -811,6 +823,7 @@ impl<'a> IceProposal<'a> {
                 IceActionProposal::FlushAvoidLists { .. } => "flush_avoid_lists",
                 IceActionProposal::ForceEvictReplica { .. } => "force_evict_replica",
                 IceActionProposal::ForceRestartDaemon { .. } => "force_restart_daemon",
+                IceActionProposal::ForceCutover { .. } => "force_cutover",
             };
             self.client
                 .publish_signed_ice(self.action, signatures.to_vec(), kind)
@@ -841,6 +854,14 @@ impl<'a> IceProposal<'a> {
                         .publish_admin(
                             AdminEvent::ForceRestartDaemon { daemon },
                             "force_restart_daemon",
+                        )
+                        .await
+                }
+                IceActionProposal::ForceCutover { chain, target } => {
+                    self.client
+                        .publish_admin(
+                            AdminEvent::ForceCutover { chain, target },
+                            "force_cutover",
                         )
                         .await
                 }
@@ -1805,6 +1826,21 @@ mod tests {
         let sig = deck.identity().sign_proposal(proposal.action());
         let commit = proposal.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "force_restart_daemon");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ice_force_cutover_proposal_round_trips() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+        let proposal = deck.ice().force_cutover(100, 42);
+        let blast = proposal.simulate().await.expect("simulate");
+        assert_eq!(blast.affected_replicas, vec![100]);
+        assert_eq!(blast.affected_nodes, vec![42]);
+        let sig = deck.identity().sign_proposal(proposal.action());
+        let commit = proposal.commit(&[sig]).await.expect("commit");
+        assert_eq!(commit.event_kind(), "force_cutover");
         let _ = runtime.shutdown().await;
     }
 

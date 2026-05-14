@@ -79,6 +79,7 @@ pub fn reconcile(
     // and skip emitting their own (possibly different-victim)
     // eviction for it.
     diff_forced_evictions(actual, this_node, &mut evicted_this_tick, &mut actions);
+    diff_forced_placements(actual, this_node, &mut actions);
     diff_replicas(
         actual,
         desired,
@@ -220,6 +221,7 @@ fn diff_replicas(
                 exclude: holders
                     .map(|hs| hs.iter().copied().collect())
                     .unwrap_or_default(),
+                target: None,
             });
         } else if actual_count > desired_count {
             // Pick the lex-smallest holder as the victim;
@@ -280,6 +282,39 @@ fn diff_forced_evictions(
             victim: *victim,
         });
         evicted.insert(*chain);
+    }
+}
+
+/// ICE arm — drain `actual.forced_placements` and emit
+/// `RequestPlacement` for each `(chain, target)` pair where
+/// `this_node` is the chain's elected leader. The action's
+/// `target` field carries the operator's pin so the
+/// dispatcher places the replica on the requested node
+/// directly, bypassing the placement scorer.
+///
+/// Idempotent against "target is already a holder": the leader
+/// still emits the action; the dispatcher's placement code
+/// can treat target-already-present as a no-op.
+fn diff_forced_placements(
+    actual: &MeshOsState,
+    this_node: NodeId,
+    out: &mut Vec<MeshOsAction>,
+) {
+    for (chain, target) in &actual.forced_placements {
+        let leader = actual.replica_leader.get(chain).copied();
+        if leader != Some(this_node) {
+            continue;
+        }
+        let exclude: Vec<NodeId> = actual
+            .replicas
+            .get(chain)
+            .map(|hs| hs.iter().copied().filter(|n| n != target).collect())
+            .unwrap_or_default();
+        out.push(MeshOsAction::RequestPlacement {
+            chain: *chain,
+            exclude,
+            target: Some(*target),
+        });
     }
 }
 
@@ -1087,6 +1122,7 @@ mod tests {
             vec![MeshOsAction::RequestPlacement {
                 chain: CHAIN_A,
                 exclude: vec![1, 2],
+                target: None,
             }],
         );
     }
@@ -2057,6 +2093,72 @@ mod tests {
         assert!(
             frozen.is_empty(),
             "freeze should suppress reconcile output, got {frozen:?}",
+        );
+    }
+
+    #[test]
+    fn forced_placement_emits_request_placement_with_target_pinned_on_leader() {
+        const CHAIN: ChainId = 0xC0FFEE;
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        actual.replicas.insert(
+            CHAIN,
+            ::std::collections::BTreeSet::from([THIS_NODE, 99]),
+        );
+        actual.replica_leader.insert(CHAIN, THIS_NODE);
+        actual.forced_placements.push((CHAIN, 42));
+        let actions = reconcile(
+            &actual,
+            &DesiredState::default(),
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        let mut placements: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, MeshOsAction::RequestPlacement { .. }))
+            .collect();
+        assert_eq!(placements.len(), 1);
+        let placement = placements.remove(0);
+        match placement {
+            MeshOsAction::RequestPlacement {
+                chain,
+                exclude,
+                target,
+            } => {
+                assert_eq!(*chain, CHAIN);
+                assert_eq!(*target, Some(42));
+                // Current holders THIS_NODE + 99 should be
+                // excluded (none of them is the target).
+                assert!(exclude.contains(&THIS_NODE));
+                assert!(exclude.contains(&99));
+                assert!(!exclude.contains(&42));
+            }
+            other => panic!("expected RequestPlacement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forced_placement_does_not_emit_on_non_leader_nodes() {
+        const CHAIN: ChainId = 0xCAFE;
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        actual.replica_leader.insert(CHAIN, 999);
+        actual.forced_placements.push((CHAIN, 7));
+        let actions = reconcile(
+            &actual,
+            &DesiredState::default(),
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, MeshOsAction::RequestPlacement { .. })),
+            "non-leader should not emit forced placement, got {actions:?}",
         );
     }
 
