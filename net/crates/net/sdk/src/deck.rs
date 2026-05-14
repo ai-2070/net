@@ -41,7 +41,7 @@
 // `net_sdk::deck::*` path.
 pub use net::adapter::net::behavior::deck::{
     AdminCommands, AdminError, ChainCommit, DeckClient, DeckClientConfig, DeckError, IceCommands,
-    IceError, IceProposal, OperatorIdentity, OperatorSignature, SnapshotStream,
+    IceError, IceProposal, OperatorIdentity, OperatorRegistry, OperatorSignature, SnapshotStream,
 };
 
 // Supporting types operators need from the MeshOS surface to
