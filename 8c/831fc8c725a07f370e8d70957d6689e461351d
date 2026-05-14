@@ -1,0 +1,47 @@
+web/src/components/ComputeRuntimeSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 5
+web/src/components/MikoshiSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 1
+web/src/components/ClosingSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 1
+web/src/components/ReleasesSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 2
+web/src/app/page.tsx
+  s_e461293ef945b9::t_94d631d1d18af8 11
+web/src/components/BenchmarksSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 2
+web/src/components/BlackwallSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 2
+web/src/components/WhyNotBestEffortSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 3
+web/src/components/DatafortsSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 1
+web/src/components/MeshOsSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 4
+web/src/components/TopologyClassesSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 3
+web/src/components/ComponentsSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 1
+web/src/components/InstallSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 2
+web/src/components/PropertiesSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 4
+web/src/components/ApplicationsSection.tsx
+  s_e461293ef945b9::t_8982df48a22747 1-86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "8c831fc8c725a07f370e8d70957d6689e461351d",
+  "prompts": {},
+  "sessions": {
+    "s_e461293ef945b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b86f732-4bc6-49f3-a4d3-0c57194c40f4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
