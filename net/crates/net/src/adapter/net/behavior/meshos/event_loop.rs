@@ -218,8 +218,7 @@ pub struct MeshOsLoop {
     /// [`super::migration_snapshot_source::OrchestratorMigrationSnapshotSource`]
     /// adapter; bootstrap + tests use the no-op default and
     /// the snapshot's `in_flight_migrations` reads empty.
-    migration_snapshot_source:
-        Arc<dyn super::migration_snapshot_source::MigrationSnapshotSource>,
+    migration_snapshot_source: Arc<dyn super::migration_snapshot_source::MigrationSnapshotSource>,
 }
 
 /// Cheap-to-compare snapshot of [`MaintenanceState`]'s variant
@@ -470,9 +469,7 @@ impl MeshOsLoop {
             admin_audit_seq: 0,
             log_seq: 0,
             runtime_epoch_id,
-            admin_audit_ring: VecDeque::with_capacity(
-                super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS,
-            ),
+            admin_audit_ring: VecDeque::with_capacity(super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS),
             log_ring: VecDeque::with_capacity(super::logs::DEFAULT_MAX_LOG_RING_RECORDS),
             dropped_actions: Arc::new(AtomicU64::new(0)),
             executor_failures: None,
@@ -878,11 +875,7 @@ impl MeshOsLoop {
                 }
                 None => super::ice::VerificationOutcome::Unverified,
             };
-            self.record_admin_audit(
-                admin_event,
-                vec![signature.operator_id],
-                outcome.clone(),
-            );
+            self.record_admin_audit(admin_event, vec![signature.operator_id], outcome.clone());
             if let super::ice::VerificationOutcome::Rejected { kind, message } = &outcome {
                 tracing::warn!(
                     target: "meshos",
@@ -892,8 +885,7 @@ impl MeshOsLoop {
                 );
                 return;
             }
-            self.desired
-                .apply_admin(admin_event, self.config.this_node);
+            self.desired.apply_admin(admin_event, self.config.this_node);
             let unwrapped = MeshOsEvent::AdminEvent(admin_event.clone());
             self.actual.apply(&unwrapped, self.config.this_node);
             self.dispatch_kill_migration_if_applicable(admin_event);
@@ -1045,10 +1037,7 @@ impl MeshOsLoop {
     /// callers can invoke this unconditionally after fold without
     /// re-pattern-matching. Errors are logged + swallowed; a
     /// dispatcher hiccup must never wedge the loop.
-    fn dispatch_kill_migration_if_applicable(
-        &self,
-        admin: &super::event::AdminEvent,
-    ) {
+    fn dispatch_kill_migration_if_applicable(&self, admin: &super::event::AdminEvent) {
         let super::event::AdminEvent::KillMigration { migration } = admin else {
             return;
         };
@@ -1995,8 +1984,9 @@ mod tests {
             actions_rx: _,
             reader,
         } = MeshOsLoop::new(fast_test_config());
-        let loop_ = loop_
-            .with_admin_audit_appender(appender.clone() as Arc<dyn super::super::audit_chain::AdminAuditChainAppender>);
+        let loop_ = loop_.with_admin_audit_appender(
+            appender.clone() as Arc<dyn super::super::audit_chain::AdminAuditChainAppender>
+        );
         let task = tokio::spawn(loop_.run());
 
         // Publish an unsigned admin event — fold records it on
@@ -2010,10 +2000,7 @@ mod tests {
 
         let captured = appender.captured();
         assert_eq!(captured.len(), 1, "appender should see one record");
-        assert_eq!(
-            captured[0].event,
-            AdminEvent::Cordon { node: 42 }
-        );
+        assert_eq!(captured[0].event, AdminEvent::Cordon { node: 42 });
 
         let snap = reader.read();
         assert_eq!(snap.admin_audit.len(), 1, "ring should hold one record");
@@ -2028,9 +2015,7 @@ mod tests {
     #[tokio::test]
     async fn kill_migration_dispatches_to_installed_aborter() {
         use super::super::event::AdminEvent;
-        use super::super::migration_aborter::{
-            BufferingMigrationAborter, MigrationAborter,
-        };
+        use super::super::migration_aborter::{BufferingMigrationAborter, MigrationAborter};
         let aborter = Arc::new(BufferingMigrationAborter::default());
         let MeshOsLoopParts {
             mesh_loop: loop_,
@@ -2038,8 +2023,7 @@ mod tests {
             actions_rx: _,
             reader: _,
         } = MeshOsLoop::new(fast_test_config());
-        let loop_ = loop_
-            .with_migration_aborter(aborter.clone() as Arc<dyn MigrationAborter>);
+        let loop_ = loop_.with_migration_aborter(aborter.clone() as Arc<dyn MigrationAborter>);
         let task = tokio::spawn(loop_.run());
 
         handle
@@ -2059,9 +2043,7 @@ mod tests {
     #[tokio::test]
     async fn non_kill_admin_events_do_not_invoke_aborter() {
         use super::super::event::AdminEvent;
-        use super::super::migration_aborter::{
-            BufferingMigrationAborter, MigrationAborter,
-        };
+        use super::super::migration_aborter::{BufferingMigrationAborter, MigrationAborter};
         let aborter = Arc::new(BufferingMigrationAborter::default());
         let MeshOsLoopParts {
             mesh_loop: loop_,
@@ -2069,8 +2051,7 @@ mod tests {
             actions_rx: _,
             reader: _,
         } = MeshOsLoop::new(fast_test_config());
-        let loop_ = loop_
-            .with_migration_aborter(aborter.clone() as Arc<dyn MigrationAborter>);
+        let loop_ = loop_.with_migration_aborter(aborter.clone() as Arc<dyn MigrationAborter>);
         let task = tokio::spawn(loop_.run());
 
         handle

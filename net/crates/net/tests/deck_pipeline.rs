@@ -181,15 +181,10 @@ async fn deck_client_freeze_cluster_lands_in_snapshot_and_thaw_clears() {
         .simulate()
         .await
         .expect("simulate");
-    let freeze_sig = deck.identity().sign_proposal(
-        freeze.action(),
-        freeze.issued_at_ms(),
-        &freeze.blast_hash(),
-    );
-    let commit = freeze
-        .commit(&[freeze_sig])
-        .await
-        .expect("freeze commit");
+    let freeze_sig =
+        deck.identity()
+            .sign_proposal(freeze.action(), freeze.issued_at_ms(), &freeze.blast_hash());
+    let commit = freeze.commit(&[freeze_sig]).await.expect("freeze commit");
     assert_eq!(commit.event_kind(), "freeze_cluster");
 
     let mut stream = deck.snapshots();
@@ -321,13 +316,10 @@ async fn substrate_admin_verifier_rejects_tampered_signed_ice_commit() {
         ttl: Duration::from_secs(20),
     };
     let issued_at_ms = net::adapter::net::behavior::meshos::now_ms_since_unix_epoch();
-    let blast = net::adapter::net::behavior::meshos::simulate_ice_proposal(
-        &runtime.snapshot(),
-        &proposal,
-    );
+    let blast =
+        net::adapter::net::behavior::meshos::simulate_ice_proposal(&runtime.snapshot(), &proposal);
     let blast_hash = net::adapter::net::behavior::meshos::blast_radius_hash(&blast);
-    let mut sig =
-        OperatorSignature::sign(op.keypair(), &proposal, issued_at_ms, &blast_hash);
+    let mut sig = OperatorSignature::sign(op.keypair(), &proposal, issued_at_ms, &blast_hash);
     sig.signature[5] ^= 0xAA; // tamper
 
     runtime
@@ -376,10 +368,8 @@ async fn substrate_admin_verifier_accepts_a_valid_signed_ice_commit_and_folds_it
         ttl: Duration::from_secs(30),
     };
     let issued_at_ms = net::adapter::net::behavior::meshos::now_ms_since_unix_epoch();
-    let blast = net::adapter::net::behavior::meshos::simulate_ice_proposal(
-        &runtime.snapshot(),
-        &proposal,
-    );
+    let blast =
+        net::adapter::net::behavior::meshos::simulate_ice_proposal(&runtime.snapshot(), &proposal);
     let blast_hash = net::adapter::net::behavior::meshos::blast_radius_hash(&blast);
     let payload = ice_proposal_signing_payload(&proposal, issued_at_ms, &blast_hash);
     let sig = OperatorSignature::sign(op.keypair(), &proposal, issued_at_ms, &blast_hash);
@@ -486,10 +476,8 @@ async fn admin_audit_ring_records_accepted_and_rejected_attempts() {
         ttl: Duration::from_secs(30),
     };
     let good_ts = net::adapter::net::behavior::meshos::now_ms_since_unix_epoch();
-    let good_blast = net::adapter::net::behavior::meshos::simulate_ice_proposal(
-        &runtime.snapshot(),
-        &good,
-    );
+    let good_blast =
+        net::adapter::net::behavior::meshos::simulate_ice_proposal(&runtime.snapshot(), &good);
     let good_hash = net::adapter::net::behavior::meshos::blast_radius_hash(&good_blast);
     let good_sig = OperatorSignature::sign(op.keypair(), &good, good_ts, &good_hash);
     runtime
@@ -506,10 +494,8 @@ async fn admin_audit_ring_records_accepted_and_rejected_attempts() {
     // One rejected commit (tampered signature bytes).
     let bad = IceActionProposal::ThawCluster;
     let bad_ts = net::adapter::net::behavior::meshos::now_ms_since_unix_epoch();
-    let bad_blast = net::adapter::net::behavior::meshos::simulate_ice_proposal(
-        &runtime.snapshot(),
-        &bad,
-    );
+    let bad_blast =
+        net::adapter::net::behavior::meshos::simulate_ice_proposal(&runtime.snapshot(), &bad);
     let bad_hash = net::adapter::net::behavior::meshos::blast_radius_hash(&bad_blast);
     let mut bad_sig = OperatorSignature::sign(op.keypair(), &bad, bad_ts, &bad_hash);
     bad_sig.signature[0] ^= 0xFF;
@@ -529,12 +515,7 @@ async fn admin_audit_ring_records_accepted_and_rejected_attempts() {
     })
     .await
     .expect("every SignedIceCommit should land on the audit ring");
-    assert_eq!(
-        snap.admin_audit.len(),
-        2,
-        "got {}",
-        snap.admin_audit.len(),
-    );
+    assert_eq!(snap.admin_audit.len(), 2, "got {}", snap.admin_audit.len(),);
     let accepted = snap
         .admin_audit
         .iter()
@@ -654,8 +635,10 @@ async fn substrate_admin_verifier_rejects_duplicate_signatures_from_same_operato
     let op = OperatorIdentity::generate();
     let mut registry = OperatorRegistry::new();
     registry.register(op.keypair());
-    let verifier =
-        SArc::new(net::adapter::net::behavior::meshos::AdminVerifier::new(SArc::new(registry), 2));
+    let verifier = SArc::new(net::adapter::net::behavior::meshos::AdminVerifier::new(
+        SArc::new(registry),
+        2,
+    ));
     let runtime = MeshOsRuntime::start_with_all(
         fast_config(),
         dispatcher,
@@ -670,10 +653,8 @@ async fn substrate_admin_verifier_rejects_duplicate_signatures_from_same_operato
         ttl: Duration::from_secs(30),
     };
     let issued_at_ms = net::adapter::net::behavior::meshos::now_ms_since_unix_epoch();
-    let blast = net::adapter::net::behavior::meshos::simulate_ice_proposal(
-        &runtime.snapshot(),
-        &proposal,
-    );
+    let blast =
+        net::adapter::net::behavior::meshos::simulate_ice_proposal(&runtime.snapshot(), &proposal);
     let blast_hash = net::adapter::net::behavior::meshos::blast_radius_hash(&blast);
     let sig = OperatorSignature::sign(op.keypair(), &proposal, issued_at_ms, &blast_hash);
     runtime
@@ -743,10 +724,8 @@ async fn substrate_admin_verifier_arms_ice_cooldown_after_successful_commit() {
         target: 42,
     };
     let issued_at_ms = net::adapter::net::behavior::meshos::now_ms_since_unix_epoch();
-    let blast = net::adapter::net::behavior::meshos::simulate_ice_proposal(
-        &runtime.snapshot(),
-        &proposal,
-    );
+    let blast =
+        net::adapter::net::behavior::meshos::simulate_ice_proposal(&runtime.snapshot(), &proposal);
     let blast_hash = net::adapter::net::behavior::meshos::blast_radius_hash(&blast);
     let sig = OperatorSignature::sign(op.keypair(), &proposal, issued_at_ms, &blast_hash);
     runtime
@@ -775,26 +754,21 @@ async fn substrate_admin_verifier_arms_ice_cooldown_after_successful_commit() {
         .await
         .unwrap();
     let snap = wait_for_snapshot(&runtime, Duration::from_secs(2), |s| {
-        s.admin_audit
-            .iter()
-            .any(|r| match &r.outcome {
-                net::adapter::net::behavior::meshos::VerificationOutcome::Rejected { kind, .. } => {
-                    kind == "ice_cooldown_active"
-                }
-                _ => false,
-            })
-    })
-    .await
-    .expect("second ICE commit should be audited as ice_cooldown_active");
-    let cooldown_rejected = snap
-        .admin_audit
-        .iter()
-        .any(|r| match &r.outcome {
+        s.admin_audit.iter().any(|r| match &r.outcome {
             net::adapter::net::behavior::meshos::VerificationOutcome::Rejected { kind, .. } => {
                 kind == "ice_cooldown_active"
             }
             _ => false,
-        });
+        })
+    })
+    .await
+    .expect("second ICE commit should be audited as ice_cooldown_active");
+    let cooldown_rejected = snap.admin_audit.iter().any(|r| match &r.outcome {
+        net::adapter::net::behavior::meshos::VerificationOutcome::Rejected { kind, .. } => {
+            kind == "ice_cooldown_active"
+        }
+        _ => false,
+    });
     assert!(
         cooldown_rejected,
         "second ICE commit inside the cooldown window should be audited as ice_cooldown_active; got {:?}",
@@ -815,8 +789,10 @@ async fn substrate_admin_verifier_rejects_simulation_required_sentinel() {
     let op = OperatorIdentity::generate();
     let mut registry = OperatorRegistry::new();
     registry.register(op.keypair());
-    let verifier =
-        SArc::new(net::adapter::net::behavior::meshos::AdminVerifier::new(SArc::new(registry), 1));
+    let verifier = SArc::new(net::adapter::net::behavior::meshos::AdminVerifier::new(
+        SArc::new(registry),
+        1,
+    ));
     let runtime = MeshOsRuntime::start_with_all(
         fast_config(),
         dispatcher,
@@ -917,8 +893,7 @@ async fn kill_migration_with_no_op_aborter_and_verifier_records_failure() {
     // on a fresh registry installed on the client.
     let mut sdk_registry = OperatorRegistry::new();
     sdk_registry.register(op.keypair());
-    let deck =
-        DeckClient::from_runtime(&runtime, op.clone()).with_operator_registry(sdk_registry);
+    let deck = DeckClient::from_runtime(&runtime, op.clone()).with_operator_registry(sdk_registry);
 
     let mut failures: FailureStream = deck.subscribe_failures(0);
     let kill = deck
@@ -927,11 +902,9 @@ async fn kill_migration_with_no_op_aborter_and_verifier_records_failure() {
         .simulate()
         .await
         .expect("simulate");
-    let sig = deck.identity().sign_proposal(
-        kill.action(),
-        kill.issued_at_ms(),
-        &kill.blast_hash(),
-    );
+    let sig = deck
+        .identity()
+        .sign_proposal(kill.action(), kill.issued_at_ms(), &kill.blast_hash());
     kill.commit(&[sig]).await.expect("commit");
 
     let record = tokio::time::timeout(Duration::from_secs(2), failures.next())
@@ -945,8 +918,7 @@ async fn kill_migration_with_no_op_aborter_and_verifier_records_failure() {
         record.source
     );
     assert!(
-        record.reason.contains("no-op")
-            || record.reason.contains("aborter"),
+        record.reason.contains("no-op") || record.reason.contains("aborter"),
         "expected reason to mention the no-op aborter, got {}",
         record.reason
     );
@@ -972,11 +944,9 @@ async fn ordinary_admin_commits_are_rejected_during_cluster_freeze() {
         .simulate()
         .await
         .expect("simulate");
-    let freeze_sig = deck.identity().sign_proposal(
-        freeze.action(),
-        freeze.issued_at_ms(),
-        &freeze.blast_hash(),
-    );
+    let freeze_sig =
+        deck.identity()
+            .sign_proposal(freeze.action(), freeze.issued_at_ms(), &freeze.blast_hash());
     freeze.commit(&[freeze_sig]).await.expect("freeze commit");
     wait_for_snapshot(&runtime, Duration::from_secs(2), |s| {
         s.freeze_remaining_ms.is_some()

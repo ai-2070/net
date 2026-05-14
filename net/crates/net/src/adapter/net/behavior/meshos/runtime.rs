@@ -1044,9 +1044,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_with_full_extensions_wires_migration_aborter() {
-        use super::super::migration_aborter::{
-            BufferingMigrationAborter, MigrationAborter,
-        };
+        use super::super::migration_aborter::{BufferingMigrationAborter, MigrationAborter};
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let aborter = Arc::new(BufferingMigrationAborter::default());
         let rt = MeshOsRuntime::start_with_full_extensions(
@@ -1131,9 +1129,7 @@ mod tests {
                 break;
             }
             if Instant::now() >= deadline {
-                panic!(
-                    "snapshot did not pick up the source's in-flight migrations within 2s",
-                );
+                panic!("snapshot did not pick up the source's in-flight migrations within 2s",);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

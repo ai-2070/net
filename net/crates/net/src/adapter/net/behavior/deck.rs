@@ -346,9 +346,7 @@ fn build_status_summary(snap: &MeshOsSnapshot) -> StatusSummary {
         match d.restart_state {
             super::meshos::RestartStateSnapshot::Idle => {}
             super::meshos::RestartStateSnapshot::BackingOff { .. } => daemons.backing_off += 1,
-            super::meshos::RestartStateSnapshot::CrashLooping { .. } => {
-                daemons.crash_looping += 1
-            }
+            super::meshos::RestartStateSnapshot::CrashLooping { .. } => daemons.crash_looping += 1,
         }
     }
     let maintenance_active = !matches!(
@@ -547,7 +545,10 @@ impl DeckClient {
     /// "render only when something is different." The first
     /// summary always emits.
     pub fn status_summary_stream(&self) -> StatusSummaryStream {
-        StatusSummaryStream::new(self.snapshot_reader.clone(), self.config.snapshot_poll_interval)
+        StatusSummaryStream::new(
+            self.snapshot_reader.clone(),
+            self.config.snapshot_poll_interval,
+        )
     }
 
     /// Roll the snapshot up into a compact at-a-glance status
@@ -571,9 +572,7 @@ impl DeckClient {
     }
 
     /// Borrow the latest replica summary keyed by chain id.
-    pub fn replicas(
-        &self,
-    ) -> std::collections::BTreeMap<ChainId, super::meshos::ReplicaSnapshot> {
+    pub fn replicas(&self) -> std::collections::BTreeMap<ChainId, super::meshos::ReplicaSnapshot> {
         self.snapshot_reader.load().replicas.clone()
     }
 
@@ -594,7 +593,12 @@ impl DeckClient {
     /// the action dispatcher rejected recently. One snapshot
     /// load + a clone of just the failure ring.
     pub fn recent_failures(&self) -> Vec<super::meshos::FailureRecord> {
-        self.snapshot_reader.load().recent_failures.iter().cloned().collect()
+        self.snapshot_reader
+            .load()
+            .recent_failures
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Runtime-epoch identifier this MeshOsLoop stamped at
@@ -658,10 +662,7 @@ impl DeckClient {
     /// missed if they were added between polls. The proper
     /// seq-based stream lands once [`super::meshos::FailureRecord`]
     /// gains a monotonic seq field (next substrate slice).
-    pub fn recent_failures_since(
-        &self,
-        since_ms: u64,
-    ) -> Vec<super::meshos::FailureRecord> {
+    pub fn recent_failures_since(&self, since_ms: u64) -> Vec<super::meshos::FailureRecord> {
         self.snapshot_reader
             .load()
             .recent_failures
@@ -905,7 +906,6 @@ impl AdminCommands<'_> {
             .publish_admin(AdminEvent::ClearAvoidList { node }, "clear_avoid_list")
             .await
     }
-
 }
 
 /// Re-export the substrate-side signing types so the SDK
@@ -945,11 +945,7 @@ impl OperatorIdentity {
     /// [`super::meshos::admin_event_signing_payload(event, issued_at_ms)`]
     /// so the loop verifier and the SDK agree on the byte
     /// sequence.
-    pub fn sign_admin_event(
-        &self,
-        event: &AdminEvent,
-        issued_at_ms: u64,
-    ) -> OperatorSignature {
+    pub fn sign_admin_event(&self, event: &AdminEvent, issued_at_ms: u64) -> OperatorSignature {
         OperatorSignature::sign_admin(self.keypair(), event, issued_at_ms)
     }
 }
@@ -1026,14 +1022,8 @@ impl<'a> IceCommands<'a> {
     /// until that lands the proposal commits without
     /// actually halting the migration. The audit trail tracks
     /// the operator's intent regardless.
-    pub fn kill_migration(
-        &self,
-        migration: super::meshos::MigrationId,
-    ) -> IceProposal<'a> {
-        IceProposal::new(
-            self.client,
-            IceActionProposal::KillMigration { migration },
-        )
+    pub fn kill_migration(&self, migration: super::meshos::MigrationId) -> IceProposal<'a> {
+        IceProposal::new(self.client, IceActionProposal::KillMigration { migration })
     }
 
     /// Propose cancelling an in-effect cluster freeze.
@@ -1480,10 +1470,7 @@ impl AuditStream {
 impl Stream for AuditStream {
     type Item = Result<super::meshos::AdminAuditRecord, DeckError>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Drain any queued records first so the consumer sees
         // every record from a multi-record poll individually.
         if let Some(record) = self.queued.pop_front() {
@@ -1635,10 +1622,7 @@ impl LogStream {
 impl Stream for LogStream {
     type Item = Result<super::meshos::LogRecord, DeckError>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Some(record) = self.queued.pop_front() {
             return Poll::Ready(Some(Ok(record)));
         }
@@ -1708,10 +1692,7 @@ impl FailureStream {
 impl Stream for FailureStream {
     type Item = Result<super::meshos::FailureRecord, DeckError>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Some(record) = self.queued.pop_front() {
             return Poll::Ready(Some(Ok(record)));
         }
@@ -2311,11 +2292,12 @@ mod tests {
         use futures::StreamExt;
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(10),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
         let mut stream = deck.status_summary_stream();
         let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await
@@ -2333,11 +2315,12 @@ mod tests {
         use futures::StreamExt;
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(10),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
         let mut stream = deck.status_summary_stream();
         // First emission lands.
         let _ = tokio::time::timeout(Duration::from_secs(2), stream.next())
@@ -2347,7 +2330,10 @@ mod tests {
             .expect("ok");
         // No state change — the stream should park (dedup).
         let second = tokio::time::timeout(Duration::from_millis(80), stream.next()).await;
-        assert!(second.is_err(), "stream should not re-emit unchanged summary");
+        assert!(
+            second.is_err(),
+            "stream should not re-emit unchanged summary"
+        );
         let _ = runtime.shutdown().await;
     }
 
@@ -2356,11 +2342,12 @@ mod tests {
         use futures::StreamExt;
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(10),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
         let mut stream = deck.status_summary_stream();
         let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await
@@ -2378,11 +2365,9 @@ mod tests {
             .simulate()
             .await
             .expect("simulate");
-        let sig = deck.identity().sign_proposal(
-            p.action(),
-            p.issued_at_ms(),
-            &p.blast_hash(),
-        );
+        let sig = deck
+            .identity()
+            .sign_proposal(p.action(), p.issued_at_ms(), &p.blast_hash());
         p.commit(&[sig]).await.expect("freeze");
         let after_freeze = tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await
@@ -2420,11 +2405,9 @@ mod tests {
             .simulate()
             .await
             .expect("simulate");
-        let sig = deck.identity().sign_proposal(
-            p.action(),
-            p.issued_at_ms(),
-            &p.blast_hash(),
-        );
+        let sig = deck
+            .identity()
+            .sign_proposal(p.action(), p.issued_at_ms(), &p.blast_hash());
         p.commit(&[sig]).await.expect("freeze");
         tokio::time::sleep(Duration::from_millis(60)).await;
         let summary = deck.status_summary();
@@ -2460,11 +2443,12 @@ mod tests {
         let dispatcher = Arc::new(LoggingDispatcher::new());
         dispatcher.fail_next(DispatchError::drop("first"));
         let runtime = MeshOsRuntime::start(fast_config(), Arc::clone(&dispatcher));
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(15),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
         let mut stream = deck.subscribe_failures(0);
 
         deck.admin().enter_maintenance(42, None).await.unwrap();
@@ -2488,11 +2472,12 @@ mod tests {
         let dispatcher = Arc::new(LoggingDispatcher::new());
         dispatcher.fail_next(DispatchError::drop("first"));
         let runtime = MeshOsRuntime::start(fast_config(), Arc::clone(&dispatcher));
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(15),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
 
         deck.admin().enter_maintenance(42, None).await.unwrap();
         // Wait for the first failure to land on the ring.
@@ -2623,11 +2608,9 @@ mod tests {
             .simulate()
             .await
             .expect("simulate");
-        let sig = deck.identity().sign_proposal(
-            p.action(),
-            p.issued_at_ms(),
-            &p.blast_hash(),
-        );
+        let sig = deck
+            .identity()
+            .sign_proposal(p.action(), p.issued_at_ms(), &p.blast_hash());
         p.commit(&[sig]).await.expect("commit");
         tokio::time::sleep(Duration::from_millis(60)).await;
         let s = deck.status();
@@ -2686,11 +2669,9 @@ mod tests {
             .simulate()
             .await
             .expect("simulate");
-        let sig = deck.identity().sign_proposal(
-            p.action(),
-            p.issued_at_ms(),
-            &p.blast_hash(),
-        );
+        let sig = deck
+            .identity()
+            .sign_proposal(p.action(), p.issued_at_ms(), &p.blast_hash());
         p.commit(&[sig]).await.expect("commit");
 
         let snap = tokio::time::timeout(Duration::from_secs(2), watcher)
@@ -2751,11 +2732,12 @@ mod tests {
         use futures::StreamExt;
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(15),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
 
         // Land three commits before subscribing.
         deck.admin().cordon(42).await.unwrap();
@@ -2778,7 +2760,10 @@ mod tests {
         assert!(next.seq > middle_seq);
         // No more records — stream parks.
         let parked = tokio::time::timeout(Duration::from_millis(40), stream.next()).await;
-        assert!(parked.is_err(), "stream should park after watermark catches up");
+        assert!(
+            parked.is_err(),
+            "stream should park after watermark catches up"
+        );
         let _ = runtime.shutdown().await;
     }
 
@@ -2788,17 +2773,21 @@ mod tests {
         use futures::StreamExt;
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(15),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
 
         // Publish three lines and snapshot the middle seq.
         for i in 0..3 {
             runtime
                 .handle()
-                .publish(MeshOsEvent::LogLine(LogLine::info(None, format!("msg {i}"))))
+                .publish(MeshOsEvent::LogLine(LogLine::info(
+                    None,
+                    format!("msg {i}"),
+                )))
                 .await
                 .unwrap();
         }
@@ -2827,11 +2816,12 @@ mod tests {
         use futures::StreamExt;
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(15),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
 
         let mut stream = deck.subscribe_logs(LogFilter::new());
         for (i, level) in [LogLevel::Info, LogLevel::Warn, LogLevel::Error]
@@ -2880,11 +2870,12 @@ mod tests {
         use futures::StreamExt;
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(15),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
 
         let mut stream = deck.subscribe_logs(LogFilter::new().min_level(LogLevel::Warn));
         runtime
@@ -2914,21 +2905,28 @@ mod tests {
         use futures::StreamExt;
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(15),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
 
         let mut stream = deck.subscribe_logs(LogFilter::new().with_daemon(7));
         runtime
             .handle()
-            .publish(MeshOsEvent::LogLine(LogLine::info(Some(99), "other daemon")))
+            .publish(MeshOsEvent::LogLine(LogLine::info(
+                Some(99),
+                "other daemon",
+            )))
             .await
             .unwrap();
         runtime
             .handle()
-            .publish(MeshOsEvent::LogLine(LogLine::info(Some(7), "target daemon")))
+            .publish(MeshOsEvent::LogLine(LogLine::info(
+                Some(7),
+                "target daemon",
+            )))
             .await
             .unwrap();
 
@@ -2947,20 +2945,17 @@ mod tests {
         use futures::StreamExt;
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(15),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
 
         let mut stream = deck.audit().stream();
         // No commits yet — the stream should yield nothing for
         // at least one tick.
-        let first_attempt = tokio::time::timeout(
-            Duration::from_millis(40),
-            stream.next(),
-        )
-        .await;
+        let first_attempt = tokio::time::timeout(Duration::from_millis(40), stream.next()).await;
         assert!(first_attempt.is_err(), "stream should park when no records");
 
         // Issue three commits; the stream should yield three
@@ -3001,11 +2996,12 @@ mod tests {
         use futures::StreamExt;
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(10),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
 
         deck.admin().cordon(42).await.unwrap();
         let mut stream = deck.audit().stream();
@@ -3017,12 +3013,11 @@ mod tests {
 
         // No new commits — the stream should park (not
         // re-emit `first`).
-        let second_attempt = tokio::time::timeout(
-            Duration::from_millis(50),
-            stream.next(),
-        )
-        .await;
-        assert!(second_attempt.is_err(), "stream should not re-emit seen record");
+        let second_attempt = tokio::time::timeout(Duration::from_millis(50), stream.next()).await;
+        assert!(
+            second_attempt.is_err(),
+            "stream should not re-emit seen record"
+        );
 
         // Issue another commit; only the new one shows up.
         deck.admin().uncordon(42).await.unwrap();
@@ -3042,11 +3037,12 @@ mod tests {
         use futures::StreamExt;
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(10),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
 
         let mut stream = deck.audit().force_only().stream();
         deck.admin().cordon(42).await.unwrap();
@@ -3056,11 +3052,9 @@ mod tests {
             .simulate()
             .await
             .expect("simulate");
-        let sig = deck.identity().sign_proposal(
-            thaw.action(),
-            thaw.issued_at_ms(),
-            &thaw.blast_hash(),
-        );
+        let sig =
+            deck.identity()
+                .sign_proposal(thaw.action(), thaw.issued_at_ms(), &thaw.blast_hash());
         thaw.commit(&[sig]).await.unwrap();
 
         let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
@@ -3148,8 +3142,7 @@ mod tests {
             ttl: Duration::from_secs(10),
         };
         let ts_a = super::super::meshos::now_ms_since_unix_epoch();
-        let sig_a =
-            OperatorSignature::sign(op_a.keypair(), &proposal_a, ts_a, &TEST_BLAST_HASH);
+        let sig_a = OperatorSignature::sign(op_a.keypair(), &proposal_a, ts_a, &TEST_BLAST_HASH);
         runtime
             .handle()
             .publish(MeshOsEvent::SignedIceCommit {
@@ -3163,8 +3156,7 @@ mod tests {
         // Commit from op_b.
         let proposal_b = IceActionProposal::ThawCluster;
         let ts_b = super::super::meshos::now_ms_since_unix_epoch();
-        let sig_b =
-            OperatorSignature::sign(op_b.keypair(), &proposal_b, ts_b, &TEST_BLAST_HASH);
+        let sig_b = OperatorSignature::sign(op_b.keypair(), &proposal_b, ts_b, &TEST_BLAST_HASH);
         runtime
             .handle()
             .publish(MeshOsEvent::SignedIceCommit {
@@ -3201,11 +3193,9 @@ mod tests {
             .simulate()
             .await
             .expect("simulate");
-        let sig = deck.identity().sign_proposal(
-            thaw.action(),
-            thaw.issued_at_ms(),
-            &thaw.blast_hash(),
-        );
+        let sig =
+            deck.identity()
+                .sign_proposal(thaw.action(), thaw.issued_at_ms(), &thaw.blast_hash());
         thaw.commit(&[sig]).await.expect("thaw");
         tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -3232,12 +3222,10 @@ mod tests {
         let identity = OperatorIdentity::generate();
         let mut registry = OperatorRegistry::new();
         registry.register(identity.keypair());
-        let verifier = SArc::new(
-            crate::adapter::net::behavior::meshos::AdminVerifier::new(
-                SArc::new(registry.clone()),
-                1,
-            ),
-        );
+        let verifier = SArc::new(crate::adapter::net::behavior::meshos::AdminVerifier::new(
+            SArc::new(registry.clone()),
+            1,
+        ));
         let runtime = MeshOsRuntime::start_with_all(
             fast_config(),
             dispatcher,
@@ -3247,8 +3235,8 @@ mod tests {
             None,
             Some(verifier),
         );
-        let deck = DeckClient::from_runtime(&runtime, identity.clone())
-            .with_operator_registry(registry);
+        let deck =
+            DeckClient::from_runtime(&runtime, identity.clone()).with_operator_registry(registry);
 
         let commit = deck.admin().cordon(42).await.expect("commit");
         assert_eq!(commit.event_kind(), "cordon");
@@ -3394,10 +3382,9 @@ mod tests {
         // though the dispatcher integration is pending.
         tokio::time::sleep(Duration::from_millis(60)).await;
         let entries = deck.audit().force_only().collect();
-        assert!(entries.iter().any(|r| matches!(
-            r.event,
-            AdminEvent::KillMigration { migration: 123 }
-        )));
+        assert!(entries
+            .iter()
+            .any(|r| matches!(r.event, AdminEvent::KillMigration { migration: 123 })));
         let _ = runtime.shutdown().await;
     }
 

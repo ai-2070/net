@@ -1066,7 +1066,10 @@ mod tests {
             }),
             THIS_NODE,
         );
-        assert_eq!(state.forced_placements, vec![(100u64, 7u64), (200u64, 9u64)]);
+        assert_eq!(
+            state.forced_placements,
+            vec![(100u64, 7u64), (200u64, 9u64)]
+        );
     }
 
     #[test]

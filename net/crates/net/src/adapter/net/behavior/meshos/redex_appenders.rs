@@ -69,9 +69,11 @@ impl RedexAdminAuditAppender {
 
 impl AdminAuditChainAppender for RedexAdminAuditAppender {
     fn append(&self, record: &AdminAuditRecord) -> Result<(), AdminAuditAppendError> {
-        self.file.append(record).map_err(|e| AdminAuditAppendError {
-            reason: e.to_string(),
-        })?;
+        self.file
+            .append(record)
+            .map_err(|e| AdminAuditAppendError {
+                reason: e.to_string(),
+            })?;
         Ok(())
     }
 }
@@ -128,8 +130,8 @@ impl FailureChainAppender for RedexFailureAppender {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ice::VerificationOutcome;
     use super::super::event::AdminEvent;
+    use super::super::ice::VerificationOutcome;
     use super::super::logs::LogLevel;
     use super::*;
     use crate::adapter::net::channel::ChannelName;
@@ -165,8 +167,7 @@ mod tests {
 
         let read = reader.file().read_range(0, 1);
         assert_eq!(read.len(), 1);
-        let decoded: AdminAuditRecord =
-            postcard::from_bytes(&read[0].payload).expect("decode");
+        let decoded: AdminAuditRecord = postcard::from_bytes(&read[0].payload).expect("decode");
         assert_eq!(decoded, record);
     }
 
@@ -208,8 +209,7 @@ mod tests {
 
         let read = reader.file().read_range(0, 1);
         assert_eq!(read.len(), 1);
-        let decoded: FailureRecord =
-            postcard::from_bytes(&read[0].payload).expect("decode");
+        let decoded: FailureRecord = postcard::from_bytes(&read[0].payload).expect("decode");
         assert_eq!(decoded, record);
     }
 }

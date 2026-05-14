@@ -320,9 +320,7 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
     /// [`super::event_loop::MeshOsLoop::record_runtime_failure`]
     /// so the durable chain history covers loop-side failures
     /// too, not just executor-side dispatch failures.
-    pub fn failure_appender_handle(
-        &self,
-    ) -> Arc<dyn super::failure_chain::FailureChainAppender> {
+    pub fn failure_appender_handle(&self) -> Arc<dyn super::failure_chain::FailureChainAppender> {
         Arc::clone(&self.failure_appender)
     }
 

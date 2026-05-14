@@ -897,7 +897,10 @@ mod tests {
         let handle = sdk.register_daemon(Box::new(daemon), kp).unwrap();
 
         handle
-            .publish_log(super::super::logs::LogLevel::Warn, "throttling: queue depth high")
+            .publish_log(
+                super::super::logs::LogLevel::Warn,
+                "throttling: queue depth high",
+            )
             .expect("publish_log");
 
         // Give the loop a tick + reconcile + snapshot publish.

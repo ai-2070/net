@@ -133,9 +133,9 @@ pub(crate) fn no_op_arc() -> Arc<dyn AdminAuditChainAppender> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::ice::VerificationOutcome;
     use super::super::event::AdminEvent;
+    use super::super::ice::VerificationOutcome;
+    use super::*;
     use std::time::Duration;
 
     fn fixture(seq: u64) -> AdminAuditRecord {

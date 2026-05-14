@@ -256,8 +256,8 @@ pub const SIMULATION_REQUIRED_SENTINEL: BlastRadiusHash = [0u8; BLAST_RADIUS_HAS
 /// case of a postcard encoding failure (the enums are
 /// composed of types whose encoding is infallible).
 pub fn blast_radius_hash(blast: &BlastRadius) -> BlastRadiusHash {
-    let bytes = postcard::to_allocvec(blast)
-        .expect("postcard encoding of BlastRadius is infallible");
+    let bytes =
+        postcard::to_allocvec(blast).expect("postcard encoding of BlastRadius is infallible");
     blake3::hash(&bytes).into()
 }
 
@@ -281,9 +281,8 @@ pub fn ice_proposal_signing_payload(
 ) -> Vec<u8> {
     let inner = postcard::to_allocvec(proposal)
         .expect("postcard encoding of IceActionProposal is infallible");
-    let mut buf = Vec::with_capacity(
-        ICE_SIGNING_DOMAIN.len() + 8 + BLAST_RADIUS_HASH_LEN + inner.len(),
-    );
+    let mut buf =
+        Vec::with_capacity(ICE_SIGNING_DOMAIN.len() + 8 + BLAST_RADIUS_HASH_LEN + inner.len());
     buf.extend_from_slice(ICE_SIGNING_DOMAIN);
     buf.extend_from_slice(&issued_at_ms.to_le_bytes());
     buf.extend_from_slice(blast_hash);
@@ -298,8 +297,8 @@ pub fn ice_proposal_signing_payload(
 /// inner [`AdminEvent`]. The distinct domain tag is what stops
 /// an ICE signature from cross-validating as an admin commit.
 pub fn admin_event_signing_payload(event: &AdminEvent, issued_at_ms: u64) -> Vec<u8> {
-    let inner = postcard::to_allocvec(event)
-        .expect("postcard encoding of AdminEvent is infallible");
+    let inner =
+        postcard::to_allocvec(event).expect("postcard encoding of AdminEvent is infallible");
     let mut buf = Vec::with_capacity(ADMIN_SIGNING_DOMAIN.len() + 8 + inner.len());
     buf.extend_from_slice(ADMIN_SIGNING_DOMAIN);
     buf.extend_from_slice(&issued_at_ms.to_le_bytes());
@@ -648,14 +647,13 @@ fn cooldown_targets(proposal: &IceActionProposal) -> CooldownTargets {
         IceActionProposal::ForceEvictReplica { victim, .. } => {
             CooldownTargets::PerNode(vec![*victim])
         }
-        IceActionProposal::ForceCutover { target, .. } => {
-            CooldownTargets::PerNode(vec![*target])
-        }
+        IceActionProposal::ForceCutover { target, .. } => CooldownTargets::PerNode(vec![*target]),
         // Daemon-id and migration-id proposals don't carry a
         // node binding; treat as cluster-wide so a thrash-loop
         // operator still hits the gate.
-        IceActionProposal::ForceRestartDaemon { .. }
-        | IceActionProposal::KillMigration { .. } => CooldownTargets::ClusterWide,
+        IceActionProposal::ForceRestartDaemon { .. } | IceActionProposal::KillMigration { .. } => {
+            CooldownTargets::ClusterWide
+        }
     }
 }
 
@@ -940,7 +938,9 @@ impl AdminVerifier {
         // Prune entries that have already expired so the map
         // doesn't grow unbounded with stale nodes the operator
         // never targets again.
-        state.per_node.retain(|_, expires_at_ms| *expires_at_ms > now_ms);
+        state
+            .per_node
+            .retain(|_, expires_at_ms| *expires_at_ms > now_ms);
         if let Some(cluster_expires) = state.cluster_wide_until_ms {
             if cluster_expires <= now_ms {
                 state.cluster_wide_until_ms = None;
@@ -1872,9 +1872,7 @@ mod tests {
         let placement = actions
             .iter()
             .find_map(|a| match a {
-                MeshOsAction::RequestPlacement { chain, target, .. } => {
-                    Some((*chain, *target))
-                }
+                MeshOsAction::RequestPlacement { chain, target, .. } => Some((*chain, *target)),
                 _ => None,
             })
             .expect("leader's reconcile should emit one RequestPlacement");
@@ -2154,10 +2152,7 @@ mod tests {
     #[test]
     fn simulate_kill_migration_with_empty_snapshot_reports_no_daemons() {
         let snap = MeshOsSnapshot::default();
-        let blast = simulate(
-            &snap,
-            &IceActionProposal::KillMigration { migration: 7 },
-        );
+        let blast = simulate(&snap, &IceActionProposal::KillMigration { migration: 7 });
         // Snapshot has no in-flight migrations to enumerate; the
         // simulator emits zero affected daemons and the
         // cross-node-visibility warning.

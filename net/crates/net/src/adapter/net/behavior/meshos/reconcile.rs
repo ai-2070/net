@@ -295,11 +295,7 @@ fn diff_forced_evictions(
 /// Idempotent against "target is already a holder": the leader
 /// still emits the action; the dispatcher's placement code
 /// can treat target-already-present as a no-op.
-fn diff_forced_placements(
-    actual: &MeshOsState,
-    this_node: NodeId,
-    out: &mut Vec<MeshOsAction>,
-) {
+fn diff_forced_placements(actual: &MeshOsState, this_node: NodeId, out: &mut Vec<MeshOsAction>) {
     for (chain, target) in &actual.forced_placements {
         let leader = actual.replica_leader.get(chain).copied();
         if leader != Some(this_node) {
@@ -2101,10 +2097,9 @@ mod tests {
         const CHAIN: ChainId = 0xC0FFEE;
         let mut actual = MeshOsState::default();
         actual.last_tick = Some(Instant::now());
-        actual.replicas.insert(
-            CHAIN,
-            ::std::collections::BTreeSet::from([THIS_NODE, 99]),
-        );
+        actual
+            .replicas
+            .insert(CHAIN, ::std::collections::BTreeSet::from([THIS_NODE, 99]));
         actual.replica_leader.insert(CHAIN, THIS_NODE);
         actual.forced_placements.push((CHAIN, 42));
         let actions = reconcile(
@@ -2157,7 +2152,9 @@ mod tests {
             None,
         );
         assert!(
-            !actions.iter().any(|a| matches!(a, MeshOsAction::RequestPlacement { .. })),
+            !actions
+                .iter()
+                .any(|a| matches!(a, MeshOsAction::RequestPlacement { .. })),
             "non-leader should not emit forced placement, got {actions:?}",
         );
     }

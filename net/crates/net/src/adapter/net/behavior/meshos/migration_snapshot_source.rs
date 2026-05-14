@@ -54,9 +54,7 @@ pub struct OrchestratorMigrationSnapshotSource {
 
 impl OrchestratorMigrationSnapshotSource {
     /// Wrap an orchestrator.
-    pub fn new(
-        orchestrator: Arc<crate::adapter::net::compute::MigrationOrchestrator>,
-    ) -> Self {
+    pub fn new(orchestrator: Arc<crate::adapter::net::compute::MigrationOrchestrator>) -> Self {
         Self { orchestrator }
     }
 }

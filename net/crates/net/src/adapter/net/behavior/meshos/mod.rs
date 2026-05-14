@@ -77,6 +77,10 @@ pub mod state;
 pub mod supervision;
 
 pub use action::{ActionId, AllocateActionId, MaintenanceTransition, MeshOsAction, PendingAction};
+pub use audit_chain::{
+    AdminAuditAppendError, AdminAuditChainAppender, BufferingAdminAuditChainAppender,
+    NoOpAdminAuditChainAppender, DEFAULT_AUDIT_BUFFERING_APPENDER_CAPACITY,
+};
 pub use backpressure::{admit, AdmissionResult, BackpressureState, ClusterBackpressureChange};
 pub use chain::{
     append_dispatched, append_failed, append_gated, record_from, ActionChainAppender,
@@ -103,10 +107,6 @@ pub use failure_chain::{
     BufferingFailureChainAppender, FailureAppendError, FailureChainAppender,
     NoOpFailureChainAppender, DEFAULT_FAILURE_BUFFERING_APPENDER_CAPACITY,
 };
-pub use audit_chain::{
-    AdminAuditAppendError, AdminAuditChainAppender, BufferingAdminAuditChainAppender,
-    NoOpAdminAuditChainAppender, DEFAULT_AUDIT_BUFFERING_APPENDER_CAPACITY,
-};
 pub use ice::{
     admin_event_signing_payload, blast_radius_hash, ice_proposal_signing_payload,
     now_ms_since_unix_epoch, simulate as simulate_ice_proposal, AdminAuditRecord, AdminVerifier,
@@ -121,6 +121,7 @@ pub use log_chain::{
     DEFAULT_LOG_BUFFERING_APPENDER_CAPACITY,
 };
 pub use logs::{LogLevel, LogLine, LogRecord, DEFAULT_MAX_LOG_RING_RECORDS};
+pub use maintenance::MaintenanceState;
 pub use migration_aborter::{
     BufferingMigrationAborter, MigrationAbortError, MigrationAborter, NoOpMigrationAborter,
     OrchestratorMigrationAborter, DEFAULT_MIGRATION_ABORT_BUFFERING_CAPACITY,
@@ -128,12 +129,11 @@ pub use migration_aborter::{
 pub use migration_snapshot_source::{
     MigrationSnapshotSource, NoOpMigrationSnapshotSource, OrchestratorMigrationSnapshotSource,
 };
-pub use redex_appenders::{RedexAdminAuditAppender, RedexFailureAppender, RedexLogAppender};
-pub use maintenance::MaintenanceState;
 pub use probes::{
     HealthProbe, LocalityProbe, ProximityGraphHealthProbe, ProximityGraphLocalityProbe,
 };
 pub use reconcile::{reconcile, STOP_GRACE_PERIOD};
+pub use redex_appenders::{RedexAdminAuditAppender, RedexFailureAppender, RedexLogAppender};
 pub use runtime::{MeshOsRuntime, MeshOsRuntimeBuilder, RuntimeShutdownError, RuntimeStats};
 pub use scheduler::{PlacementScorer, SchedulerConfig, SchedulerRegistry};
 pub use sdk::{
