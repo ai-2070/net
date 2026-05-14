@@ -192,15 +192,23 @@ async fn ice_proposal_simulate_then_commit_lands_freeze_through_pipeline() {
     );
 
     let proposal = deck.ice().freeze_cluster(Duration::from_secs(45));
-    let blast = proposal.simulate().await.expect("simulate");
-    assert_eq!(blast.estimated_drain_delay, Some(Duration::from_secs(45)));
-    assert!(blast
+    let simulated = proposal.simulate().await.expect("simulate");
+    assert_eq!(
+        simulated.blast_radius().estimated_drain_delay,
+        Some(Duration::from_secs(45))
+    );
+    assert!(simulated
+        .blast_radius()
         .warnings
         .iter()
         .any(|w| matches!(w, BlastWarning::ClusterFreezeBlocksOperatorActions)));
 
-    let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
-    let commit = proposal.commit(&[sig]).await.expect("commit");
+    let sig = deck.identity().sign_proposal(
+        simulated.action(),
+        simulated.issued_at_ms(),
+        &simulated.blast_hash(),
+    );
+    let commit = simulated.commit(&[sig]).await.expect("commit");
     assert_eq!(commit.event_kind(), "freeze_cluster");
 
     let mut stream = deck.snapshots();
@@ -219,30 +227,15 @@ async fn ice_proposal_simulate_then_commit_lands_freeze_through_pipeline() {
     let _ = runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn ice_proposal_commit_without_simulate_is_rejected_before_publish() {
-    // Locked decision #4: simulate() is mandatory before commit().
-    // Confirm the SDK gate keeps the publish from firing — the
-    // loop never sees an admin event.
-    let dispatcher = Arc::new(LoggingDispatcher::new());
-    let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
-
-    let proposal = deck.ice().freeze_cluster(Duration::from_secs(10));
-    let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
-    let err = proposal
-        .commit(&[sig])
-        .await
-        .expect_err("commit without simulate should fail");
-    assert_eq!(err.kind, "simulation_required");
-
-    // The snapshot should NOT show a freeze — the SDK didn't
-    // publish the underlying admin event.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let snap = runtime.snapshot();
-    assert!(snap.freeze_remaining_ms.is_none());
-    let _ = runtime.shutdown().await;
-}
+// Locked decision #4: simulate() must precede commit(). The
+// SDK-side enforcement is now type-state — `IceProposal` does
+// not expose `commit`, only the `SimulatedIceProposal`
+// returned from `IceProposal::simulate` does. A runtime gate
+// no longer exists to test; the type system rejects
+// commit-without-simulate at compile time. The substrate-side
+// gate (blast_hash == SIMULATION_REQUIRED_SENTINEL) still
+// exists for adversarial direct-publish, exercised by the
+// substrate verifier unit tests.
 
 #[tokio::test]
 async fn substrate_admin_verifier_rejects_tampered_signed_ice_commit() {

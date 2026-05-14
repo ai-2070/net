@@ -1004,31 +1004,25 @@ impl<'a> IceCommands<'a> {
     }
 }
 
-/// An ICE proposal — opaque-ish handle carrying the underlying
-/// [`IceActionProposal`] plus a bit of per-proposal state.
-/// Per the plan's locked decision #4 a [`Self::simulate`] call
-/// must precede [`Self::commit`]; the substrate enforces this
-/// cryptographically by binding the signing envelope to the
-/// simulator's blast-radius hash. A commit against an
-/// un-simulated proposal carries the
-/// [`super::meshos::SIMULATION_REQUIRED_SENTINEL`] hash, which
-/// the substrate verifier rejects with `simulation_required`;
-/// the SDK also short-circuits before publishing.
+/// An ICE proposal — pre-simulation handle carrying the
+/// underlying [`IceActionProposal`] plus the `issued_at_ms`
+/// stamp pinned at construction.
 ///
-/// Each proposal is stamped with `issued_at_ms` at construction.
-/// Every operator participating in the multi-signature workflow
-/// must sign over the same `(action, issued_at_ms, blast_hash)`
-/// triple — fetch the stamp via [`Self::issued_at_ms`] and the
-/// hash via [`Self::blast_hash`] after running
-/// [`Self::simulate`]. The substrate verifier rejects bundles
-/// outside the freshness window pinned at the time of stamping,
-/// which closes the replay window the raw signature would
-/// otherwise leave open until operator-key rotation.
+/// Per the plan's locked decision #4 a [`Self::simulate`] call
+/// must precede commit. The type-state split enforces this at
+/// compile time: `IceProposal` does **not** expose `commit`;
+/// only a successful `simulate()` returns a
+/// [`SimulatedIceProposal`] whose `commit` is callable. A
+/// caller that wants to commit must thread the proposal through
+/// `simulate()` first — the type system rejects the alternative.
+///
+/// Both `IceProposal` and `SimulatedIceProposal` are `Send + Sync`
+/// (no `Cell` / `RefCell` interior mutability), so callers can
+/// move them across `tokio::spawn` boundaries freely.
 pub struct IceProposal<'a> {
     client: &'a DeckClient,
     action: IceActionProposal,
     issued_at_ms: u64,
-    simulated_blast: std::cell::RefCell<Option<BlastRadius>>,
 }
 
 impl<'a> IceProposal<'a> {
@@ -1037,59 +1031,87 @@ impl<'a> IceProposal<'a> {
             client,
             action,
             issued_at_ms: super::meshos::now_ms_since_unix_epoch(),
-            simulated_blast: std::cell::RefCell::new(None),
         }
     }
 
-    /// Borrow the underlying [`IceActionProposal`]. Useful for
-    /// the multi-operator signing flow: each operator signs the
-    /// same proposal payload, then submits the bundle through
-    /// one client's `commit()` call.
+    /// Borrow the underlying [`IceActionProposal`].
     pub fn action(&self) -> &IceActionProposal {
         &self.action
     }
 
-    /// Milliseconds-since-`UNIX_EPOCH` stamp pinned at proposal
-    /// construction. Every signature submitted to [`Self::commit`]
-    /// must cover this exact value (paired with [`Self::action`]
-    /// and [`Self::blast_hash`]) or the substrate verifier
-    /// rejects the bundle. The plain
-    /// `OperatorIdentity::sign_proposal(action, issued_at_ms, &blast_hash)`
-    /// helper handles the encoding.
+    /// Milliseconds-since-`UNIX_EPOCH` stamp pinned at
+    /// construction. Operators participating in the multi-sig
+    /// flow read this from the [`SimulatedIceProposal`] (after
+    /// simulating); the value is identical because `simulate()`
+    /// preserves it.
     pub fn issued_at_ms(&self) -> u64 {
         self.issued_at_ms
     }
 
-    /// Blake3 digest of the [`BlastRadius`] the simulator
-    /// produced for this proposal. Returns
-    /// [`super::meshos::SIMULATION_REQUIRED_SENTINEL`] until
-    /// [`Self::simulate`] runs successfully; that sentinel is
-    /// the magic value the substrate verifier rejects so a
-    /// commit without prior simulation has no valid hash to
-    /// sign over. Every operator in a multi-sig bundle must
-    /// fetch this value AFTER simulating and sign over the
-    /// same hash.
-    pub fn blast_hash(&self) -> super::meshos::BlastRadiusHash {
-        match self.simulated_blast.borrow().as_ref() {
-            Some(blast) => super::meshos::blast_radius_hash(blast),
-            None => super::meshos::SIMULATION_REQUIRED_SENTINEL,
-        }
-    }
-
-    /// Pre-execution preview. Runs the substrate's pure simulator
-    /// against the runtime's latest snapshot; stores the result
-    /// so subsequent [`Self::blast_hash`] / [`Self::commit`]
-    /// calls bind to it.
-    pub async fn simulate(&self) -> Result<BlastRadius, IceError> {
+    /// Pre-execution preview. Runs the substrate's pure
+    /// simulator against the runtime's latest snapshot and
+    /// returns a [`SimulatedIceProposal`] holding the result.
+    /// The returned type is the only place [`Self::commit`]
+    /// can be called — the type-state pattern enforces locked
+    /// decision #4 at compile time.
+    pub async fn simulate(self) -> Result<SimulatedIceProposal<'a>, IceError> {
         let snap = self.client.snapshot_reader.read();
         let blast = simulate_ice_proposal(&snap, &self.action);
-        *self.simulated_blast.borrow_mut() = Some(blast.clone());
-        Ok(blast)
+        Ok(SimulatedIceProposal {
+            client: self.client,
+            action: self.action,
+            issued_at_ms: self.issued_at_ms,
+            blast,
+        })
+    }
+}
+
+/// An ICE proposal that has run [`IceProposal::simulate`] and
+/// is ready for the operator signing + commit workflow.
+/// Carries the simulator's [`BlastRadius`] output so the
+/// Deck-the-binary UI can render the preview before the
+/// operator approves; [`Self::commit`] hashes the
+/// `BlastRadius` and signs the envelope with the operator key.
+///
+/// Every operator participating in the multi-signature
+/// workflow must sign over the same
+/// `(action, issued_at_ms, blast_hash)` triple — fetch via
+/// [`Self::action`] / [`Self::issued_at_ms`] /
+/// [`Self::blast_hash`].
+pub struct SimulatedIceProposal<'a> {
+    client: &'a DeckClient,
+    action: IceActionProposal,
+    issued_at_ms: u64,
+    blast: BlastRadius,
+}
+
+impl<'a> SimulatedIceProposal<'a> {
+    /// Borrow the simulator's pre-execution preview.
+    pub fn blast_radius(&self) -> &BlastRadius {
+        &self.blast
     }
 
-    /// Commit the proposal. Returns
-    /// `Err(IceError::simulation_required)` if [`Self::simulate`]
-    /// hasn't been called on this proposal. Verifies
+    /// Borrow the underlying [`IceActionProposal`].
+    pub fn action(&self) -> &IceActionProposal {
+        &self.action
+    }
+
+    /// Milliseconds-since-`UNIX_EPOCH` stamp pinned at the
+    /// original [`IceProposal`]'s construction; signatures
+    /// must cover this exact value.
+    pub fn issued_at_ms(&self) -> u64 {
+        self.issued_at_ms
+    }
+
+    /// Blake3 digest of the simulator's [`BlastRadius`].
+    /// Signatures must cover this hash; the substrate verifier
+    /// rebuilds the same payload and rejects bundles whose
+    /// signatures don't bind to it.
+    pub fn blast_hash(&self) -> super::meshos::BlastRadiusHash {
+        super::meshos::blast_radius_hash(&self.blast)
+    }
+
+    /// Commit the proposal. Verifies
     /// `signatures.len() >= ice_signature_threshold` before
     /// publishing; returns
     /// `Err(IceError::insufficient_signatures)` otherwise.
@@ -1100,13 +1122,6 @@ impl<'a> IceProposal<'a> {
     /// `(action, issued_at_ms, blast_hash)` triple.
     pub async fn commit(self, signatures: &[OperatorSignature]) -> Result<ChainCommit, IceError> {
         let blast_hash = self.blast_hash();
-        if blast_hash == super::meshos::SIMULATION_REQUIRED_SENTINEL {
-            return Err(IceError::new(
-                "simulation_required",
-                "ICE commits require a successful simulate() before commit() per \
-                 DECK_SDK_PLAN.md locked decision #4",
-            ));
-        }
         let threshold = self.client.config.ice_signature_threshold;
         if signatures.len() < threshold {
             return Err(IceError::new(
@@ -1986,21 +2001,12 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn ice_proposal_commit_without_prior_simulate_returns_simulation_required() {
-        let dispatcher = Arc::new(LoggingDispatcher::new());
-        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
-
-        let proposal = deck.ice().freeze_cluster(Duration::from_secs(10));
-        let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
-        let err = proposal
-            .commit(&[sig])
-            .await
-            .expect_err("commit without simulate should fail");
-        assert_eq!(err.kind, "simulation_required");
-        let _ = runtime.shutdown().await;
-    }
+    // Note: a "commit without simulate" test would not compile —
+    // `IceProposal` does not expose `commit`; only the
+    // `SimulatedIceProposal` returned from `IceProposal::simulate`
+    // does. The type-state split enforces locked decision #4 at
+    // compile time, so no runtime simulation-required gate exists
+    // to test.
 
     #[tokio::test]
     async fn ice_proposal_commit_with_insufficient_signatures_fails() {
@@ -2014,9 +2020,13 @@ mod tests {
             },
         );
         let proposal = deck.ice().freeze_cluster(Duration::from_secs(10));
-        let _blast = proposal.simulate().await.expect("simulate");
-        let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
-        let err = proposal
+        let simulated = proposal.simulate().await.expect("simulate");
+        let sig = deck.identity().sign_proposal(
+            simulated.action(),
+            simulated.issued_at_ms(),
+            &simulated.blast_hash(),
+        );
+        let err = simulated
             .commit(&[sig])
             .await
             .expect_err("under-threshold commit should fail");
@@ -2031,11 +2041,18 @@ mod tests {
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
 
         let proposal = deck.ice().freeze_cluster(Duration::from_secs(30));
-        let blast = proposal.simulate().await.expect("simulate");
+        let simulated = proposal.simulate().await.expect("simulate");
         // FreezeCluster sets the drain delay to the requested TTL.
-        assert_eq!(blast.estimated_drain_delay, Some(Duration::from_secs(30)));
-        let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
-        let commit = proposal.commit(&[sig]).await.expect("commit");
+        assert_eq!(
+            simulated.blast_radius().estimated_drain_delay,
+            Some(Duration::from_secs(30))
+        );
+        let sig = deck.identity().sign_proposal(
+            simulated.action(),
+            simulated.issued_at_ms(),
+            &simulated.blast_hash(),
+        );
+        let commit = simulated.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "freeze_cluster");
 
         // Give the loop a tick + reconcile + publish to fold the
@@ -2056,9 +2073,9 @@ mod tests {
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
 
         let proposal = deck.ice().thaw_cluster();
-        let blast = proposal.simulate().await.expect("simulate");
+        let simulated = proposal.simulate().await.expect("simulate");
         // Simulator on a non-frozen snapshot warns "no freeze to cancel."
-        assert!(blast.warnings.iter().any(|w| matches!(
+        assert!(simulated.blast_radius().warnings.iter().any(|w| matches!(
             w,
             crate::adapter::net::behavior::meshos::BlastWarning::ThawHasNoFreezeToCancel
         )));
@@ -2071,6 +2088,18 @@ mod tests {
     /// gate).
     const TEST_BLAST_HASH: super::super::meshos::BlastRadiusHash =
         [1u8; super::super::meshos::BLAST_RADIUS_HASH_LEN];
+
+    /// Static assertion: both ICE proposal types must be
+    /// `Send + Sync` so callers can move them across
+    /// `tokio::spawn` boundaries. The type-state split
+    /// eliminated the `Cell<bool>` runtime gate that broke
+    /// these bounds — pinning the property here prevents a
+    /// future change from regressing.
+    fn _assert_proposal_send_sync_static_check() {
+        fn _assert_send_sync<T: Send + Sync>() {}
+        _assert_send_sync::<IceProposal<'static>>();
+        _assert_send_sync::<SimulatedIceProposal<'static>>();
+    }
 
     #[tokio::test]
     async fn operator_signature_carries_issuing_operator_id() {
@@ -2208,12 +2237,20 @@ mod tests {
         .with_operator_registry(registry);
 
         let proposal = deck.ice().freeze_cluster(Duration::from_secs(15));
-        let _ = proposal.simulate().await.expect("simulate");
-        let sig_a = op_a.sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
-        let mut sig_b = op_b.sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
+        let simulated = proposal.simulate().await.expect("simulate");
+        let sig_a = op_a.sign_proposal(
+            simulated.action(),
+            simulated.issued_at_ms(),
+            &simulated.blast_hash(),
+        );
+        let mut sig_b = op_b.sign_proposal(
+            simulated.action(),
+            simulated.issued_at_ms(),
+            &simulated.blast_hash(),
+        );
         sig_b.signature[3] ^= 0xFF; // tamper
 
-        let err = proposal
+        let err = simulated
             .commit(&[sig_a, sig_b])
             .await
             .expect_err("commit with tampered sig should fail");
@@ -2228,17 +2265,21 @@ mod tests {
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
         let proposal = deck.ice().flush_avoid_lists(AvoidScope::OnPeer { peer: 5 });
-        let blast = proposal.simulate().await.expect("simulate");
+        let simulated = proposal.simulate().await.expect("simulate");
         // OnPeer scope flushes everywhere; without registered
         // peers in the snapshot the affected_nodes list is
         // empty but the warning still fires.
-        assert!(blast.warnings.iter().any(|w| matches!(
+        assert!(simulated.blast_radius().warnings.iter().any(|w| matches!(
             w,
             crate::adapter::net::behavior::meshos::BlastWarning::AvoidFlushRecoversPeer { peer: 5 }
         )));
         // commit through the unsigned path (no registry installed).
-        let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
-        let commit = proposal.commit(&[sig]).await.expect("commit");
+        let sig = deck.identity().sign_proposal(
+            simulated.action(),
+            simulated.issued_at_ms(),
+            &simulated.blast_hash(),
+        );
+        let commit = simulated.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "flush_avoid_lists");
         let _ = runtime.shutdown().await;
     }
@@ -3246,10 +3287,14 @@ mod tests {
             name: "telemetry".into(),
         };
         let proposal = deck.ice().force_restart_daemon(daemon.clone());
-        let blast = proposal.simulate().await.expect("simulate");
-        assert_eq!(blast.affected_daemons, vec![daemon]);
-        let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
-        let commit = proposal.commit(&[sig]).await.expect("commit");
+        let simulated = proposal.simulate().await.expect("simulate");
+        assert_eq!(simulated.blast_radius().affected_daemons, vec![daemon]);
+        let sig = deck.identity().sign_proposal(
+            simulated.action(),
+            simulated.issued_at_ms(),
+            &simulated.blast_hash(),
+        );
+        let commit = simulated.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "force_restart_daemon");
         let _ = runtime.shutdown().await;
     }
@@ -3260,9 +3305,13 @@ mod tests {
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
         let proposal = deck.ice().kill_migration(123);
-        let _ = proposal.simulate().await.expect("simulate");
-        let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
-        let commit = proposal.commit(&[sig]).await.expect("commit");
+        let simulated = proposal.simulate().await.expect("simulate");
+        let sig = deck.identity().sign_proposal(
+            simulated.action(),
+            simulated.issued_at_ms(),
+            &simulated.blast_hash(),
+        );
+        let commit = simulated.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "kill_migration");
 
         // Confirms the commit lands on the audit ring even
@@ -3282,11 +3331,15 @@ mod tests {
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
         let proposal = deck.ice().force_cutover(100, 42);
-        let blast = proposal.simulate().await.expect("simulate");
-        assert_eq!(blast.affected_replicas, vec![100]);
-        assert_eq!(blast.affected_nodes, vec![42]);
-        let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
-        let commit = proposal.commit(&[sig]).await.expect("commit");
+        let simulated = proposal.simulate().await.expect("simulate");
+        assert_eq!(simulated.blast_radius().affected_replicas, vec![100]);
+        assert_eq!(simulated.blast_radius().affected_nodes, vec![42]);
+        let sig = deck.identity().sign_proposal(
+            simulated.action(),
+            simulated.issued_at_ms(),
+            &simulated.blast_hash(),
+        );
+        let commit = simulated.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "force_cutover");
         let _ = runtime.shutdown().await;
     }
@@ -3297,11 +3350,15 @@ mod tests {
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
         let proposal = deck.ice().force_evict_replica(100, 7);
-        let blast = proposal.simulate().await.expect("simulate");
-        assert_eq!(blast.affected_replicas, vec![100]);
-        assert_eq!(blast.affected_nodes, vec![7]);
-        let sig = deck.identity().sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
-        let commit = proposal.commit(&[sig]).await.expect("commit");
+        let simulated = proposal.simulate().await.expect("simulate");
+        assert_eq!(simulated.blast_radius().affected_replicas, vec![100]);
+        assert_eq!(simulated.blast_radius().affected_nodes, vec![7]);
+        let sig = deck.identity().sign_proposal(
+            simulated.action(),
+            simulated.issued_at_ms(),
+            &simulated.blast_hash(),
+        );
+        let commit = simulated.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "force_evict_replica");
         let _ = runtime.shutdown().await;
     }
@@ -3327,10 +3384,18 @@ mod tests {
         .with_operator_registry(registry);
 
         let proposal = deck.ice().freeze_cluster(Duration::from_secs(15));
-        let _ = proposal.simulate().await.expect("simulate");
-        let sig_a = op_a.sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
-        let sig_b = op_b.sign_proposal(proposal.action(), proposal.issued_at_ms(), &proposal.blast_hash());
-        let commit = proposal
+        let simulated = proposal.simulate().await.expect("simulate");
+        let sig_a = op_a.sign_proposal(
+            simulated.action(),
+            simulated.issued_at_ms(),
+            &simulated.blast_hash(),
+        );
+        let sig_b = op_b.sign_proposal(
+            simulated.action(),
+            simulated.issued_at_ms(),
+            &simulated.blast_hash(),
+        );
+        let commit = simulated
             .commit(&[sig_a, sig_b])
             .await
             .expect("valid multi-op bundle should commit");
