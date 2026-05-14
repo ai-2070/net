@@ -1,0 +1,16 @@
+[package]
+name = "deck"
+version = "0.1.0"
+edition = "2021"
+description = "Operator cyberdeck — terminal UI for the Net mesh"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "deck"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+color-eyre = "0.6"
