@@ -50,6 +50,7 @@
 //!   body. `MeshOsHandle::publish` is the source-side fan-in API.
 
 pub mod action;
+pub mod audit_chain;
 pub mod backpressure;
 pub mod chain;
 pub mod config;
@@ -92,6 +93,10 @@ pub use event_loop::{
 pub use executor::{
     ActionDispatcher, ActionExecutor, DispatchError, ExecutorHandle, ExecutorStats,
     ExecutorStatsSnapshot, LoggingDispatcher,
+};
+pub use audit_chain::{
+    AdminAuditAppendError, AdminAuditChainAppender, BufferingAdminAuditChainAppender,
+    NoOpAdminAuditChainAppender, DEFAULT_AUDIT_BUFFERING_APPENDER_CAPACITY,
 };
 pub use ice::{
     admin_event_signing_payload, ice_proposal_signing_payload, simulate as simulate_ice_proposal,

@@ -144,6 +144,15 @@ pub struct MeshOsLoop {
     /// SDK side already gates. The substrate slice that ships
     /// the operator-policy chain wires a registry in by default.
     admin_verifier: Option<Arc<super::ice::AdminVerifier>>,
+
+    /// Admin audit chain appender. Production deployments
+    /// wire a `TypedRedexFile<AdminAuditRecord>` here so
+    /// security review can replay every admin commit across
+    /// the cluster's lifetime. Default is
+    /// `NoOpAdminAuditChainAppender` — the in-memory ring on
+    /// `MeshOsState.admin_audit` is the only readable surface
+    /// when no chain is wired.
+    admin_audit_appender: Arc<dyn super::audit_chain::AdminAuditChainAppender>,
 }
 
 /// Cheap-to-compare snapshot of [`MaintenanceState`]'s variant
@@ -382,6 +391,7 @@ impl MeshOsLoop {
             control_sink: None,
             last_local_maintenance: MaintenanceDiscriminant::Active,
             admin_verifier: None,
+            admin_audit_appender: super::audit_chain::no_op_arc(),
         };
         MeshOsLoopParts {
             mesh_loop: me,
@@ -454,6 +464,20 @@ impl MeshOsLoop {
     /// upgrade).
     pub fn with_admin_verifier(mut self, verifier: Arc<super::ice::AdminVerifier>) -> Self {
         self.admin_verifier = Some(verifier);
+        self
+    }
+
+    /// Attach a [`super::audit_chain::AdminAuditChainAppender`].
+    /// The loop's `record_admin_audit` path dual-writes every
+    /// admin commit to both the in-memory ring (snapshot
+    /// readable) and this appender (chain-backed history).
+    /// Without an explicit appender the loop uses the no-op
+    /// default; only the in-memory ring is observable.
+    pub fn with_admin_audit_appender(
+        mut self,
+        appender: Arc<dyn super::audit_chain::AdminAuditChainAppender>,
+    ) -> Self {
+        self.admin_audit_appender = appender;
         self
     }
 
@@ -721,6 +745,17 @@ impl MeshOsLoop {
             operator_ids,
             outcome,
         };
+        // Dual-write: chain first, ring second. The chain
+        // append is non-fatal — a hiccup there must never
+        // wedge the in-memory audit surface. Log + continue.
+        if let Err(err) = self.admin_audit_appender.append(&record) {
+            tracing::warn!(
+                target: "meshos",
+                seq = record.seq,
+                error = %err,
+                "admin-audit-chain append failed — record kept on in-memory ring only",
+            );
+        }
         self.actual.admin_audit.push_back(record);
         while self.actual.admin_audit.len() > super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS {
             self.actual.admin_audit.pop_front();
@@ -1538,5 +1573,49 @@ mod tests {
              age_ms == 0 (anchored on last_tick); pending = {:?}",
             snap.pending,
         );
+    }
+
+    #[tokio::test]
+    async fn admin_audit_chain_appender_receives_every_recorded_commit() {
+        // Wire a buffering appender into the loop; drive an
+        // admin event through; the appender + the snapshot
+        // ring should each carry one record with the same seq.
+        use super::super::audit_chain::BufferingAdminAuditChainAppender;
+        use super::super::event::AdminEvent;
+        let appender = Arc::new(BufferingAdminAuditChainAppender::default());
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader,
+        } = MeshOsLoop::new(fast_test_config());
+        let loop_ = loop_
+            .with_admin_audit_appender(appender.clone() as Arc<dyn super::super::audit_chain::AdminAuditChainAppender>);
+        let task = tokio::spawn(loop_.run());
+
+        // Publish an unsigned admin event — fold records it on
+        // the ring with Unverified outcome AND fires the
+        // appender.
+        handle
+            .publish(MeshOsEvent::AdminEvent(AdminEvent::Cordon { node: 42 }))
+            .await
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(60)).await;
+
+        let captured = appender.captured();
+        assert_eq!(captured.len(), 1, "appender should see one record");
+        assert_eq!(
+            captured[0].event,
+            AdminEvent::Cordon { node: 42 }
+        );
+
+        let snap = reader.read();
+        assert_eq!(snap.admin_audit.len(), 1, "ring should hold one record");
+        // The appender + ring see the SAME record (seq + content match).
+        assert_eq!(snap.admin_audit[0].seq, captured[0].seq);
+
+        // Tidy.
+        drop(handle);
+        let _ = tokio::time::timeout(StdDuration::from_secs(1), task).await;
     }
 }

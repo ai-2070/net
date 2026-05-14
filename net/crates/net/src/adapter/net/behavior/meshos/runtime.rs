@@ -184,6 +184,36 @@ impl MeshOsRuntime {
         control_sink: Option<Arc<dyn super::control::ControlSink>>,
         admin_verifier: Option<Arc<super::ice::AdminVerifier>>,
     ) -> Self {
+        Self::start_with_audit_chain(
+            config,
+            dispatcher,
+            probes,
+            scheduler,
+            daemon_registry,
+            control_sink,
+            admin_verifier,
+            None,
+        )
+    }
+
+    /// Like [`Self::start_with_all`] but also accepts an
+    /// optional [`super::audit_chain::AdminAuditChainAppender`].
+    /// Production deployments wire a chain-backed appender
+    /// here so the audit ring's bounded history extends to
+    /// cluster-lifetime replay. Test + in-process callers
+    /// leave it `None` and read the in-memory ring through
+    /// the snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_audit_chain<D: ActionDispatcher>(
+        config: MeshOsConfig,
+        dispatcher: Arc<D>,
+        probes: ProbeRegistry,
+        scheduler: SchedulerRegistry,
+        daemon_registry: Arc<DaemonRegistry>,
+        control_sink: Option<Arc<dyn super::control::ControlSink>>,
+        admin_verifier: Option<Arc<super::ice::AdminVerifier>>,
+        admin_audit_appender: Option<Arc<dyn super::audit_chain::AdminAuditChainAppender>>,
+    ) -> Self {
         let super::event_loop::MeshOsLoopParts {
             mesh_loop,
             handle,
@@ -211,6 +241,9 @@ impl MeshOsRuntime {
         }
         if let Some(verifier) = admin_verifier {
             mesh_loop = mesh_loop.with_admin_verifier(verifier);
+        }
+        if let Some(appender) = admin_audit_appender {
+            mesh_loop = mesh_loop.with_admin_audit_appender(appender);
         }
         let dropped_actions = mesh_loop.dropped_actions_counter();
         let loop_task = tokio::spawn(mesh_loop.run());

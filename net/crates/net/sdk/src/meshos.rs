@@ -65,7 +65,7 @@
 //!
 //! # Macro convenience
 //!
-//! The substrate re-exports a [`daemon_main!`] macro that
+//! The substrate re-exports a `daemon_main!` macro that
 //! collapses the boilerplate into a single block — see the
 //! macro's own documentation in
 //! `net::adapter::net::behavior::meshos::sdk::daemon_main`.
