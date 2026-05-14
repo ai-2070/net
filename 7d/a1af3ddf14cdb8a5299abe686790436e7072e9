@@ -1,0 +1,27 @@
+web/src/components/AsciiCycle.tsx
+  s_e461293ef945b9::t_06243d2bc0b434 1-2
+web/src/components/PacketRain.tsx
+  s_e461293ef945b9::t_bd489d15a9891b 1-2
+web/src/components/SuperPositionViz.tsx
+  s_e461293ef945b9::t_9a6f18bb47c9ca 1
+web/src/components/DatafortsConsole.tsx
+  s_e461293ef945b9::t_a387045409c29a 1-2
+web/src/components/PropertiesSection.tsx
+  s_e461293ef945b9::t_bd489d15a9891b 1-2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "7da1af3ddf14cdb8a5299abe686790436e7072e9",
+  "prompts": {},
+  "sessions": {
+    "s_e461293ef945b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b86f732-4bc6-49f3-a4d3-0c57194c40f4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
