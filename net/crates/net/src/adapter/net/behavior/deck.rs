@@ -232,8 +232,9 @@ pub struct DeckClientConfig {
     /// magnitude as the default loop tick so the stream surfaces
     /// each post-reconcile snapshot once.
     pub snapshot_poll_interval: Duration,
-    /// Minimum operator signatures required to [`IceProposal::commit`]
-    /// an ICE proposal. Plan locks this in at 2-of-N by default,
+    /// Minimum operator signatures required to commit an ICE
+    /// proposal (see [`SimulatedIceProposal::commit`]). Plan
+    /// locks this in at 2-of-N by default,
     /// substrate-verified; this slice ships single-signature
     /// (`1`) as the SDK-side default because substrate-side
     /// multi-operator verification hasn't shipped yet. Operators
@@ -1079,9 +1080,10 @@ impl<'a> IceProposal<'a> {
     /// Pre-execution preview. Runs the substrate's pure
     /// simulator against the runtime's latest snapshot and
     /// returns a [`SimulatedIceProposal`] holding the result.
-    /// The returned type is the only place [`Self::commit`]
-    /// can be called — the type-state pattern enforces locked
-    /// decision #4 at compile time.
+    /// The returned type is the only place
+    /// [`SimulatedIceProposal::commit`] can be called — the
+    /// type-state pattern enforces locked decision #4 at
+    /// compile time.
     pub async fn simulate(self) -> Result<SimulatedIceProposal<'a>, IceError> {
         let snap = self.client.snapshot_reader.read();
         let blast = simulate_ice_proposal(&snap, &self.action);
@@ -1326,10 +1328,10 @@ impl<'a> AuditQuery<'a> {
     /// the ring" — equivalent to omitting `since()` entirely
     /// in terms of what records are returned. To tail only
     /// records that arrive after subscribe time, pair this
-    /// with [`super::DeckClient::audit_head_seq`]: read the
-    /// head once, then `since(head)`. The same convention
-    /// applies to [`LogFilter::since`] and
-    /// [`super::DeckClient::subscribe_failures`].
+    /// with [`DeckClient::audit_head_seq`]: read the head
+    /// once, then `since(head)`. The same convention applies
+    /// to [`LogFilter::since`] and
+    /// [`DeckClient::subscribe_failures`].
     pub fn since(mut self, since_seq: u64) -> Self {
         self.since_seq = Some(since_seq);
         self
@@ -1561,8 +1563,8 @@ impl LogFilter {
     /// record yielded has `seq > since_seq`. `since(0)` means
     /// "from the beginning of what's still in the ring" —
     /// to tail only post-subscribe records pair with
-    /// [`super::DeckClient::log_head_seq`]: read the head
-    /// once, then `since(head)`. Same convention as
+    /// [`DeckClient::log_head_seq`]: read the head once,
+    /// then `since(head)`. Same convention as
     /// [`AuditQuery::since`].
     pub fn since(mut self, since_seq: u64) -> Self {
         self.since_seq = Some(since_seq);

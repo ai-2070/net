@@ -539,8 +539,9 @@ impl MeshOsLoop {
     /// the same monotonic sequence + durable chain dual-write
     /// the executor uses. Pair this with
     /// [`Self::with_executor_failures`]; together the trio
-    /// makes [`Self::record_runtime_failure`] a complete dual
-    /// write into the snapshot ring + the chain.
+    /// makes the loop's internal `record_runtime_failure`
+    /// helper a complete dual write into the snapshot ring +
+    /// the chain.
     pub fn with_executor_failure_writer(
         mut self,
         seq: Arc<AtomicU64>,
