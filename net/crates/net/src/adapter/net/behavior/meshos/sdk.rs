@@ -371,6 +371,10 @@ pub struct MeshOsDaemonHandle {
     router: DaemonControlRouter,
     metadata: MetadataView,
     runtime_snapshot_reader: super::event_loop::MeshOsSnapshotReader,
+    /// Mesh-loop publish handle. Used for daemon-author
+    /// surfaces that need to push events into the loop (log
+    /// emission, future capability announcements).
+    mesh_handle: super::event_loop::MeshOsHandle,
     this_node: NodeId,
     /// Becomes `true` after `unregister` runs — guards against
     /// double-unregister on `Drop` + `graceful_shutdown`.
@@ -459,6 +463,42 @@ impl MeshOsDaemonHandle {
         // TODO: when the capability-chain commit path lands,
         // wire through to `CapabilityIndex::announce_set(...)`.
         Ok(())
+    }
+
+    /// Publish a log line tagged with this daemon's id. The
+    /// loop stamps the seq + wall-clock timestamp + this
+    /// node's id before pushing onto the per-node log ring;
+    /// operators reading through Deck SDK's
+    /// `subscribe_logs(LogFilter::new().with_daemon(id))` see
+    /// the line.
+    ///
+    /// Non-blocking — uses `MeshOsHandle::try_publish` so a
+    /// saturated event queue surfaces as `SdkError` with kind
+    /// `queue_full` rather than parking the caller. Daemons in
+    /// hot loops can drop log lines on backpressure without
+    /// stalling.
+    pub fn publish_log(
+        &self,
+        level: super::logs::LogLevel,
+        message: impl Into<String>,
+    ) -> Result<(), SdkError> {
+        let line = super::logs::LogLine {
+            level,
+            daemon_id: Some(self.daemon_id),
+            message: message.into(),
+        };
+        self.mesh_handle
+            .try_publish(super::event::MeshOsEvent::LogLine(line))
+            .map_err(|e| match e {
+                super::event_loop::MeshOsHandleError::LoopClosed => SdkError::new(
+                    "loop_closed",
+                    "MeshOS loop has exited; daemon log line dropped",
+                ),
+                super::event_loop::MeshOsHandleError::QueueFull => SdkError::new(
+                    "queue_full",
+                    "MeshOS event queue at capacity; daemon log line dropped",
+                ),
+            })
     }
 
     /// Drive a graceful shutdown. Sends
@@ -608,6 +648,7 @@ impl MeshOsDaemonSdk {
             router: self.router.clone(),
             metadata,
             runtime_snapshot_reader: self.runtime.snapshot_reader().clone(),
+            mesh_handle: self.runtime.handle_clone(),
             this_node: self.runtime_this_node(),
             unregistered: false,
         })
@@ -840,6 +881,52 @@ mod tests {
         // no drop counter increment (the slot is gone).
         router.route(7, DaemonControl::Shutdown { grace_period_ms: 1 });
         assert_eq!(router.total_dropped(), 0);
+    }
+
+    #[tokio::test]
+    async fn publish_log_lands_on_runtime_log_ring_tagged_with_daemon_id() {
+        // Daemon-author surface: a registered daemon emits a
+        // log line via the handle; the line shows up on the
+        // runtime's log ring tagged with the daemon's id, ready
+        // for Deck SDK's `subscribe_logs` to pick up.
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let sdk = MeshOsDaemonSdk::start(fast_config(), dispatcher);
+        let (daemon, _) = NoopDaemon::new("logger");
+        let kp = EntityKeypair::generate();
+        let daemon_id = kp.origin_hash();
+        let handle = sdk.register_daemon(Box::new(daemon), kp).unwrap();
+
+        handle
+            .publish_log(super::super::logs::LogLevel::Warn, "throttling: queue depth high")
+            .expect("publish_log");
+
+        // Give the loop a tick + reconcile + snapshot publish.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let snap = sdk.runtime().snapshot();
+        let matching: Vec<_> = snap
+            .log_ring
+            .iter()
+            .filter(|r| r.daemon_id == Some(daemon_id))
+            .collect();
+        assert_eq!(matching.len(), 1, "expected one log line for this daemon");
+        let record = matching[0];
+        assert_eq!(record.level, super::super::logs::LogLevel::Warn);
+        assert_eq!(record.message, "throttling: queue depth high");
+        let _ = sdk.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn publish_log_after_runtime_shutdown_returns_loop_closed() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let sdk = MeshOsDaemonSdk::start(fast_config(), dispatcher);
+        let (daemon, _) = NoopDaemon::new("logger");
+        let kp = EntityKeypair::generate();
+        let handle = sdk.register_daemon(Box::new(daemon), kp).unwrap();
+        let _ = sdk.shutdown().await;
+        let err = handle
+            .publish_log(super::super::logs::LogLevel::Info, "after shutdown")
+            .expect_err("publish after shutdown should fail");
+        assert_eq!(err.kind, "loop_closed");
     }
 
     #[tokio::test]

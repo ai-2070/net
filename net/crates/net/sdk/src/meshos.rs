@@ -96,8 +96,8 @@ pub use net::adapter::net::behavior::meshos::{
 // Supporting types daemon authors need.
 pub use net::adapter::net::behavior::capability::CapabilitySet;
 pub use net::adapter::net::behavior::meshos::{
-    ActionDispatcher, DispatchError, MeshOsConfig, MeshOsRuntime, RuntimeShutdownError,
-    RuntimeStats,
+    ActionDispatcher, DispatchError, LogLevel, LogLine, MeshOsConfig, MeshOsRuntime,
+    RuntimeShutdownError, RuntimeStats,
 };
 pub use net::adapter::net::compute::{
     DaemonControl, DaemonError, DaemonHealth, DaemonHostConfig, MeshDaemon,
