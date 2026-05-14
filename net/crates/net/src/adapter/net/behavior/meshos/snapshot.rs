@@ -79,6 +79,67 @@ pub struct MeshOsSnapshot {
     /// the future per-daemon RedEX-tail integration swaps the
     /// backing store without changing the snapshot shape.
     pub log_ring: Vec<super::logs::LogRecord>,
+    /// In-flight daemon migrations this node is hosting. Empty
+    /// unless the runtime wired a
+    /// [`super::migration_snapshot_source::MigrationSnapshotSource`]
+    /// (the production
+    /// [`super::migration_snapshot_source::OrchestratorMigrationSnapshotSource`]
+    /// wraps a `MigrationOrchestrator`). The ICE
+    /// `simulate_kill_migration` blast-radius preview reads
+    /// this to enumerate the affected daemon when the
+    /// operator targets a migration this node hosts.
+    pub in_flight_migrations: Vec<MigrationSnapshot>,
+}
+
+/// Wire-form summary of one in-flight migration. Drawn from
+/// `MigrationOrchestrator::list_migrations()` by the
+/// [`super::migration_snapshot_source::MigrationSnapshotSource`]
+/// adapter and embedded in the snapshot on every publish tick.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationSnapshot {
+    /// `MigrationId` (== daemon origin hash). Matches
+    /// [`super::event::MigrationId`] so the ICE simulator can
+    /// look up by the same key the operator targets.
+    pub daemon_origin: u64,
+    /// Phase the orchestrator reports for this migration.
+    pub phase: MigrationPhaseSnapshot,
+    /// Milliseconds since the migration began on this node.
+    pub elapsed_ms: u64,
+}
+
+/// Wire form of [`crate::adapter::net::compute::MigrationPhase`].
+/// Defaults to `Snapshot` (first phase) for round-trip stability
+/// when an older decoder meets a newer encoder.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MigrationPhaseSnapshot {
+    /// Source-side snapshot in progress.
+    #[default]
+    Snapshot,
+    /// Transferring the snapshot to the target node.
+    Transfer,
+    /// Target-side restore + event buffering.
+    Restore,
+    /// Replaying buffered events on the target.
+    Replay,
+    /// Atomic routing cutover.
+    Cutover,
+    /// Cleanup on source.
+    Complete,
+}
+
+impl From<crate::adapter::net::compute::MigrationPhase> for MigrationPhaseSnapshot {
+    fn from(p: crate::adapter::net::compute::MigrationPhase) -> Self {
+        use crate::adapter::net::compute::MigrationPhase;
+        match p {
+            MigrationPhase::Snapshot => Self::Snapshot,
+            MigrationPhase::Transfer => Self::Transfer,
+            MigrationPhase::Restore => Self::Restore,
+            MigrationPhase::Replay => Self::Replay,
+            MigrationPhase::Cutover => Self::Cutover,
+            MigrationPhase::Complete => Self::Complete,
+        }
+    }
 }
 
 /// Per-daemon Deck-renderable summary.
@@ -328,6 +389,7 @@ impl MeshOsSnapshot {
         desired: &DesiredState,
         pending: &[PendingAction],
         recent_failures: &[FailureRecord],
+        in_flight_migrations: Vec<MigrationSnapshot>,
     ) -> Self {
         let now = actual.last_tick.unwrap_or_else(std::time::Instant::now);
 
@@ -488,6 +550,7 @@ impl MeshOsSnapshot {
             freeze_remaining_ms,
             admin_audit,
             log_ring,
+            in_flight_migrations,
         }
     }
 }
@@ -607,7 +670,7 @@ mod tests {
         status.saturation = 0.42;
         actual.daemons.insert(d.clone(), status);
         let desired = DesiredState::default();
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[]);
+        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[], Vec::new());
         let daemon = snap.daemons.get(&1).expect("daemon present");
         assert_eq!(daemon.name, "telemetry");
         assert_eq!(daemon.lifecycle, DaemonLifecycleSnapshot::Running);
@@ -628,7 +691,7 @@ mod tests {
         actual.replica_leader.insert(0xAA, 1);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(0xAA, 5);
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[]);
+        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[], Vec::new());
         let r = snap.replicas.get(&0xAA).expect("replica present");
         assert_eq!(r.holders, vec![1, 2, 3]);
         assert_eq!(r.desired_count, Some(5));
@@ -640,7 +703,7 @@ mod tests {
         let actual = MeshOsState::default();
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(0xBB, 3);
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[]);
+        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[], Vec::new());
         let r = snap
             .replicas
             .get(&0xBB)
@@ -694,7 +757,7 @@ mod tests {
             emitted_at: base,
         }];
 
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &pending, &[]);
+        let snap = MeshOsSnapshot::from_state(&actual, &desired, &pending, &[], Vec::new());
         let bytes = postcard::to_allocvec(&snap).expect("encode");
         let back: MeshOsSnapshot = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(snap, back);

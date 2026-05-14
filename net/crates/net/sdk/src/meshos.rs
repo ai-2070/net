@@ -119,3 +119,13 @@ pub use net::adapter::net::behavior::meshos::{
 pub use net::adapter::net::behavior::meshos::{
     MigrationAbortError, MigrationAborter, OrchestratorMigrationAborter,
 };
+
+// Migration-snapshot source seam. Operators wire the
+// `OrchestratorMigrationSnapshotSource` so the snapshot's
+// `in_flight_migrations` field reflects the local
+// `MigrationOrchestrator`'s state, letting the ICE blast-radius
+// preview enumerate the daemon a `KillMigration` would affect.
+pub use net::adapter::net::behavior::meshos::{
+    MigrationPhaseSnapshot, MigrationSnapshot, MigrationSnapshotSource,
+    OrchestratorMigrationSnapshotSource,
+};

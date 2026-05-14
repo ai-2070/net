@@ -172,6 +172,17 @@ pub struct MeshOsLoop {
     /// `NoOpMigrationAborter` default and the commit remains
     /// audit-only.
     migration_aborter: Arc<dyn super::migration_aborter::MigrationAborter>,
+
+    /// Migration-snapshot source. The loop calls this on every
+    /// snapshot publish and embeds the result in the
+    /// snapshot's `in_flight_migrations` field, so the ICE
+    /// simulator can enumerate which daemon a `KillMigration`
+    /// target would affect. Production deployments wire the
+    /// [`super::migration_snapshot_source::OrchestratorMigrationSnapshotSource`]
+    /// adapter; bootstrap + tests use the no-op default and
+    /// the snapshot's `in_flight_migrations` reads empty.
+    migration_snapshot_source:
+        Arc<dyn super::migration_snapshot_source::MigrationSnapshotSource>,
 }
 
 /// Cheap-to-compare snapshot of [`MaintenanceState`]'s variant
@@ -413,6 +424,7 @@ impl MeshOsLoop {
             admin_audit_appender: super::audit_chain::no_op_arc(),
             log_appender: super::log_chain::no_op_arc(),
             migration_aborter: super::migration_aborter::no_op_arc(),
+            migration_snapshot_source: super::migration_snapshot_source::no_op_arc(),
         };
         MeshOsLoopParts {
             mesh_loop: me,
@@ -529,6 +541,21 @@ impl MeshOsLoop {
         aborter: Arc<dyn super::migration_aborter::MigrationAborter>,
     ) -> Self {
         self.migration_aborter = aborter;
+        self
+    }
+
+    /// Attach a
+    /// [`super::migration_snapshot_source::MigrationSnapshotSource`].
+    /// The loop reads this on every snapshot publish and
+    /// embeds the result in the snapshot's
+    /// `in_flight_migrations` field — the ICE simulator
+    /// reads it to enumerate which daemon a `KillMigration`
+    /// target would affect.
+    pub fn with_migration_snapshot_source(
+        mut self,
+        source: Arc<dyn super::migration_snapshot_source::MigrationSnapshotSource>,
+    ) -> Self {
+        self.migration_snapshot_source = source;
         self
     }
 
@@ -1020,11 +1047,13 @@ impl MeshOsLoop {
             Some(ring) => ring.read().iter().cloned().collect(),
             None => Vec::new(),
         };
+        let in_flight_migrations = self.migration_snapshot_source.list();
         let snap = MeshOsSnapshot::from_state(
             &self.actual,
             &self.desired,
             &self.recent_emissions,
             &failures,
+            in_flight_migrations,
         );
         self.snapshot.store(Arc::new(snap));
     }

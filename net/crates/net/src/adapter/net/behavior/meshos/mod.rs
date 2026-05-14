@@ -64,6 +64,7 @@ pub mod log_chain;
 pub mod logs;
 pub mod maintenance;
 pub mod migration_aborter;
+pub mod migration_snapshot_source;
 pub mod probes;
 pub mod reconcile;
 pub mod redex_appenders;
@@ -121,6 +122,9 @@ pub use migration_aborter::{
     BufferingMigrationAborter, MigrationAbortError, MigrationAborter, NoOpMigrationAborter,
     OrchestratorMigrationAborter, DEFAULT_MIGRATION_ABORT_BUFFERING_CAPACITY,
 };
+pub use migration_snapshot_source::{
+    MigrationSnapshotSource, NoOpMigrationSnapshotSource, OrchestratorMigrationSnapshotSource,
+};
 pub use redex_appenders::{RedexAdminAuditAppender, RedexFailureAppender, RedexLogAppender};
 pub use maintenance::MaintenanceState;
 pub use probes::{
@@ -136,8 +140,8 @@ pub use sdk::{
 pub use snapshot::{
     action_kind_str, AvoidEntrySnapshot, DaemonHealthSnapshot, DaemonLifecycleSnapshot,
     DaemonSnapshot, FailureRecord, MaintenanceMirrorSnapshot, MaintenanceStateSnapshot,
-    MeshOsSnapshot, PeerHealthSnapshot, PeerSnapshot, PendingActionSnapshot, ReplicaSnapshot,
-    RestartStateSnapshot, RECENT_FAILURES_CAPACITY,
+    MeshOsSnapshot, MigrationPhaseSnapshot, MigrationSnapshot, PeerHealthSnapshot, PeerSnapshot,
+    PendingActionSnapshot, ReplicaSnapshot, RestartStateSnapshot, RECENT_FAILURES_CAPACITY,
 };
 pub use sources::{
     attach_to_daemon_registry, attach_to_replication_coordinator, MeshOsDaemonLifecycleSink,

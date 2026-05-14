@@ -52,6 +52,6 @@ pub use net::adapter::net::behavior::meshos::{
     AdminAuditRecord, AdminEvent, AdminVerifier, AvoidScope, BlastRadius, BlastWarning, ChainId,
     DaemonHealthSnapshot, DaemonLifecycleSnapshot, DaemonSnapshot, FailureRecord,
     IceActionProposal, LogLevel, LogLine, LogRecord, MaintenanceStateSnapshot, MeshOsSnapshot,
-    MigrationId, NodeId, PeerHealthSnapshot, PeerSnapshot, ReplicaSnapshot, RestartStateSnapshot,
-    VerificationOutcome, VerifyError,
+    MigrationId, MigrationPhaseSnapshot, MigrationSnapshot, NodeId, PeerHealthSnapshot,
+    PeerSnapshot, ReplicaSnapshot, RestartStateSnapshot, VerificationOutcome, VerifyError,
 };

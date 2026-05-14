@@ -615,12 +615,15 @@ pub enum BlastWarning {
         /// Target that's already a holder.
         target: NodeId,
     },
-    /// `KillMigration` records the operator's intent on the
-    /// audit ring but the dispatcher hookup that actually
-    /// stops the migration is future substrate work. Surfaces
-    /// here so the operator UI flags "the commit will land,
-    /// but the migration may still complete until the
-    /// dispatcher integration ships."
+    /// `KillMigration` simulation is best-effort across the
+    /// cluster: every node folds the chain commit but only the
+    /// node hosting the migration's
+    /// [`super::migration_aborter::MigrationAborter`] actually
+    /// aborts. The simulator only sees the local snapshot's
+    /// `in_flight_migrations`, so it can't tell whether the
+    /// targeted migration exists on another node — the warning
+    /// stays so the operator UI flags the cross-node visibility
+    /// limit.
     KillMigrationDispatcherIntegrationPending {
         /// The migration id the operator targeted.
         migration: MigrationId,
@@ -647,7 +650,9 @@ pub fn simulate(snapshot: &MeshOsSnapshot, proposal: &IceActionProposal) -> Blas
         IceActionProposal::ForceCutover { chain, target } => {
             simulate_force_cutover(snapshot, *chain, *target)
         }
-        IceActionProposal::KillMigration { migration } => simulate_kill_migration(*migration),
+        IceActionProposal::KillMigration { migration } => {
+            simulate_kill_migration(snapshot, *migration)
+        }
     }
 }
 
@@ -793,15 +798,33 @@ fn simulate_force_cutover(
     }
 }
 
-fn simulate_kill_migration(migration: MigrationId) -> BlastRadius {
-    // The snapshot doesn't yet expose in-flight migrations,
-    // so the simulator can't enumerate affected daemons /
-    // chains. It surfaces the dispatcher-integration pending
-    // warning so the operator UI flags the limitation.
+fn simulate_kill_migration(snapshot: &MeshOsSnapshot, migration: MigrationId) -> BlastRadius {
+    // The simulator runs against the local snapshot, so it
+    // can only enumerate migrations this node hosts. The
+    // warning stays in place because every node folds the
+    // chain commit but only the migration's host node
+    // actually aborts — the simulator can't see other
+    // nodes' orchestrators.
+    // The orchestrator's list returns the daemon_origin (which
+    // is the MigrationId by construction) but doesn't carry the
+    // daemon's name, so the simulator emits a DaemonRef with an
+    // empty name. Deck-the-binary's preview UI joins against the
+    // snapshot's `daemons` map by id to fill the label.
+    let affected_daemons = match snapshot
+        .in_flight_migrations
+        .iter()
+        .find(|m| m.daemon_origin == migration)
+    {
+        Some(_) => vec![super::event::DaemonRef {
+            id: migration,
+            name: String::new(),
+        }],
+        None => Vec::new(),
+    };
     BlastRadius {
         affected_nodes: Vec::new(),
         affected_replicas: Vec::new(),
-        affected_daemons: Vec::new(),
+        affected_daemons,
         estimated_drain_delay: None,
         placement_stability_delta: 0.0,
         warnings: vec![BlastWarning::KillMigrationDispatcherIntegrationPending { migration }],
@@ -1334,19 +1357,50 @@ mod tests {
     }
 
     #[test]
-    fn simulate_kill_migration_reports_pending_dispatcher_integration() {
+    fn simulate_kill_migration_with_empty_snapshot_reports_no_daemons() {
         let snap = MeshOsSnapshot::default();
         let blast = simulate(
             &snap,
             &IceActionProposal::KillMigration { migration: 7 },
         );
-        // No registry to read from yet; affected sets are empty.
+        // Snapshot has no in-flight migrations to enumerate; the
+        // simulator emits zero affected daemons and the
+        // cross-node-visibility warning.
         assert!(blast.affected_nodes.is_empty());
         assert!(blast.affected_replicas.is_empty());
         assert!(blast.affected_daemons.is_empty());
         assert!(blast.warnings.iter().any(|w| matches!(
             w,
             BlastWarning::KillMigrationDispatcherIntegrationPending { migration: 7 }
+        )));
+    }
+
+    #[test]
+    fn simulate_kill_migration_enumerates_local_in_flight_migration() {
+        use super::super::snapshot::{MigrationPhaseSnapshot, MigrationSnapshot};
+        let mut snap = MeshOsSnapshot::default();
+        snap.in_flight_migrations.push(MigrationSnapshot {
+            daemon_origin: 0xCAFE,
+            phase: MigrationPhaseSnapshot::Transfer,
+            elapsed_ms: 250,
+        });
+        // A noise migration that should not match the target.
+        snap.in_flight_migrations.push(MigrationSnapshot {
+            daemon_origin: 0xBEEF,
+            phase: MigrationPhaseSnapshot::Replay,
+            elapsed_ms: 50,
+        });
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::KillMigration { migration: 0xCAFE },
+        );
+        assert_eq!(blast.affected_daemons.len(), 1);
+        assert_eq!(blast.affected_daemons[0].id, 0xCAFE);
+        // The cross-node-visibility warning stays — the local
+        // snapshot can't see other nodes' orchestrators.
+        assert!(blast.warnings.iter().any(|w| matches!(
+            w,
+            BlastWarning::KillMigrationDispatcherIntegrationPending { migration: 0xCAFE }
         )));
     }
 
