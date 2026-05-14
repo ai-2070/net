@@ -265,22 +265,33 @@ impl OperatorRegistry {
     }
 
     /// Verify every signature in `signatures` against `payload`
-    /// and confirm there are at least `threshold` valid bundles.
-    /// Fails fast on the first verification error.
+    /// and confirm at least `threshold` *distinct* operator ids
+    /// signed it. Fails fast on the first verification error.
+    ///
+    /// The distinct-operator check is the load-bearing
+    /// guarantee of the M-of-N gate: a bundle of `[sig_A, sig_A]`
+    /// from a single operator must not satisfy a threshold of 2
+    /// even though both signatures verify. `got` on the
+    /// `InsufficientSignatures` error reports the number of
+    /// unique operators, not the raw signature count, so the
+    /// operator UI surfaces the actual shortfall.
     pub fn verify_bundle(
         &self,
         signatures: &[OperatorSignature],
         payload: &[u8],
         threshold: usize,
     ) -> Result<(), VerifyError> {
-        if signatures.len() < threshold {
-            return Err(VerifyError::InsufficientSignatures {
-                got: signatures.len(),
-                required: threshold,
-            });
-        }
+        let mut unique_operators: std::collections::BTreeSet<u64> =
+            std::collections::BTreeSet::new();
         for sig in signatures {
             self.verify(sig, payload)?;
+            unique_operators.insert(sig.operator_id);
+        }
+        if unique_operators.len() < threshold {
+            return Err(VerifyError::InsufficientSignatures {
+                got: unique_operators.len(),
+                required: threshold,
+            });
         }
         Ok(())
     }
@@ -306,11 +317,15 @@ pub enum VerifyError {
         /// Diagnostic detail.
         reason: String,
     },
-    /// The bundle carried fewer signatures than the cluster's
-    /// configured threshold.
+    /// The bundle carried fewer *distinct operators* than the
+    /// cluster's configured threshold. `got` reports unique
+    /// signers, not raw signature count — a bundle of
+    /// `[sig_A, sig_A]` against a `threshold = 2` registers
+    /// `got = 1`.
     #[error("insufficient signatures: got {got}, required {required}")]
     InsufficientSignatures {
-        /// Number of signatures supplied.
+        /// Number of *distinct* operator ids whose signatures
+        /// verified.
         got: usize,
         /// Minimum required by the cluster's policy.
         required: usize,
@@ -1019,6 +1034,53 @@ mod tests {
                 required: 2
             }
         ));
+    }
+
+    #[test]
+    fn admin_verifier_rejects_duplicate_signatures_from_same_operator() {
+        // A single operator signing the same proposal twice
+        // must not satisfy a multi-op threshold even though
+        // both signatures verify. Without operator-id dedup
+        // this would silently pass M-of-N — the headline
+        // guarantee of the entire ICE surface.
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 2);
+        let proposal = IceActionProposal::ThawCluster;
+        let sig = OperatorSignature::sign(&kp, &proposal);
+        let bundle = [sig.clone(), sig];
+        let err = verifier.verify_commit(&proposal, &bundle).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VerifyError::InsufficientSignatures {
+                    got: 1,
+                    required: 2
+                }
+            ),
+            "expected InsufficientSignatures {{ got: 1, required: 2 }}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn admin_verifier_accepts_two_distinct_operators_at_threshold_two() {
+        // The positive counterpart of the dedup test — two
+        // distinct operators clear the threshold.
+        let kp_a = EntityKeypair::generate();
+        let kp_b = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp_a);
+        registry.register(&kp_b);
+        let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 2);
+        let proposal = IceActionProposal::ThawCluster;
+        let bundle = [
+            OperatorSignature::sign(&kp_a, &proposal),
+            OperatorSignature::sign(&kp_b, &proposal),
+        ];
+        verifier.verify_commit(&proposal, &bundle).expect(
+            "two distinct operators with valid signatures should satisfy threshold = 2",
+        );
     }
 
     #[test]
