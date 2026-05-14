@@ -214,6 +214,34 @@ impl MeshOsRuntime {
         admin_verifier: Option<Arc<super::ice::AdminVerifier>>,
         admin_audit_appender: Option<Arc<dyn super::audit_chain::AdminAuditChainAppender>>,
     ) -> Self {
+        Self::start_with_chains(
+            config,
+            dispatcher,
+            probes,
+            scheduler,
+            daemon_registry,
+            control_sink,
+            admin_verifier,
+            admin_audit_appender,
+            None,
+        )
+    }
+
+    /// Like [`Self::start_with_audit_chain`] but also accepts
+    /// an optional [`super::log_chain::LogChainAppender`] for
+    /// per-node log-chain history.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_chains<D: ActionDispatcher>(
+        config: MeshOsConfig,
+        dispatcher: Arc<D>,
+        probes: ProbeRegistry,
+        scheduler: SchedulerRegistry,
+        daemon_registry: Arc<DaemonRegistry>,
+        control_sink: Option<Arc<dyn super::control::ControlSink>>,
+        admin_verifier: Option<Arc<super::ice::AdminVerifier>>,
+        admin_audit_appender: Option<Arc<dyn super::audit_chain::AdminAuditChainAppender>>,
+        log_appender: Option<Arc<dyn super::log_chain::LogChainAppender>>,
+    ) -> Self {
         let super::event_loop::MeshOsLoopParts {
             mesh_loop,
             handle,
@@ -244,6 +272,9 @@ impl MeshOsRuntime {
         }
         if let Some(appender) = admin_audit_appender {
             mesh_loop = mesh_loop.with_admin_audit_appender(appender);
+        }
+        if let Some(appender) = log_appender {
+            mesh_loop = mesh_loop.with_log_appender(appender);
         }
         let dropped_actions = mesh_loop.dropped_actions_counter();
         let loop_task = tokio::spawn(mesh_loop.run());

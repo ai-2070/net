@@ -153,6 +153,14 @@ pub struct MeshOsLoop {
     /// `MeshOsState.admin_audit` is the only readable surface
     /// when no chain is wired.
     admin_audit_appender: Arc<dyn super::audit_chain::AdminAuditChainAppender>,
+
+    /// Log chain appender. Production deployments wire a
+    /// `TypedRedexFile<LogRecord>` here so the per-daemon log
+    /// view extends to cluster-lifetime replay. Default is
+    /// `NoOpLogChainAppender` — only the in-memory ring on
+    /// `MeshOsState.log_ring` is observable when no chain is
+    /// wired.
+    log_appender: Arc<dyn super::log_chain::LogChainAppender>,
 }
 
 /// Cheap-to-compare snapshot of [`MaintenanceState`]'s variant
@@ -392,6 +400,7 @@ impl MeshOsLoop {
             last_local_maintenance: MaintenanceDiscriminant::Active,
             admin_verifier: None,
             admin_audit_appender: super::audit_chain::no_op_arc(),
+            log_appender: super::log_chain::no_op_arc(),
         };
         MeshOsLoopParts {
             mesh_loop: me,
@@ -478,6 +487,19 @@ impl MeshOsLoop {
         appender: Arc<dyn super::audit_chain::AdminAuditChainAppender>,
     ) -> Self {
         self.admin_audit_appender = appender;
+        self
+    }
+
+    /// Attach a [`super::log_chain::LogChainAppender`]. The
+    /// loop's `record_log_line` path dual-writes every log
+    /// line to both the in-memory ring (snapshot readable)
+    /// and this appender (chain-backed history). Without an
+    /// explicit appender the loop uses the no-op default.
+    pub fn with_log_appender(
+        mut self,
+        appender: Arc<dyn super::log_chain::LogChainAppender>,
+    ) -> Self {
+        self.log_appender = appender;
         self
     }
 
@@ -780,6 +802,17 @@ impl MeshOsLoop {
             node_id: Some(self.config.this_node),
             message: line.message.clone(),
         };
+        // Dual-write: chain first, ring second. The chain
+        // append is non-fatal — a hiccup there must never
+        // wedge the in-memory log surface.
+        if let Err(err) = self.log_appender.append(&record) {
+            tracing::warn!(
+                target: "meshos",
+                seq = record.seq,
+                error = %err,
+                "log-chain append failed — record kept on in-memory ring only",
+            );
+        }
         self.actual.log_ring.push_back(record);
         while self.actual.log_ring.len() > super::logs::DEFAULT_MAX_LOG_RING_RECORDS {
             self.actual.log_ring.pop_front();
@@ -1573,6 +1606,52 @@ mod tests {
              age_ms == 0 (anchored on last_tick); pending = {:?}",
             snap.pending,
         );
+    }
+
+    #[tokio::test]
+    async fn log_chain_appender_receives_every_published_log_line() {
+        use super::super::log_chain::BufferingLogChainAppender;
+        use super::super::logs::{LogLevel, LogLine};
+        let appender = Arc::new(BufferingLogChainAppender::default());
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader,
+        } = MeshOsLoop::new(fast_test_config());
+        let loop_ = loop_.with_log_appender(
+            appender.clone() as Arc<dyn super::super::log_chain::LogChainAppender>
+        );
+        let task = tokio::spawn(loop_.run());
+
+        for (i, level) in [LogLevel::Info, LogLevel::Warn, LogLevel::Error]
+            .into_iter()
+            .enumerate()
+        {
+            handle
+                .publish(MeshOsEvent::LogLine(LogLine {
+                    level,
+                    daemon_id: Some(7),
+                    message: format!("msg {i}"),
+                }))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(StdDuration::from_millis(60)).await;
+
+        let captured = appender.captured();
+        assert_eq!(captured.len(), 3, "appender should see three records");
+        let snap = reader.read();
+        assert_eq!(snap.log_ring.len(), 3, "ring should hold three records");
+        // Appender + ring see the SAME records (seq + content match
+        // for each).
+        for (i, captured_record) in captured.iter().enumerate().take(3) {
+            assert_eq!(snap.log_ring[i].seq, captured_record.seq);
+            assert_eq!(snap.log_ring[i].message, captured_record.message);
+        }
+
+        drop(handle);
+        let _ = tokio::time::timeout(StdDuration::from_secs(1), task).await;
     }
 
     #[tokio::test]

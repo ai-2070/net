@@ -59,6 +59,7 @@ pub mod event;
 pub mod event_loop;
 pub mod executor;
 pub mod ice;
+pub mod log_chain;
 pub mod logs;
 pub mod maintenance;
 pub mod probes;
@@ -103,6 +104,10 @@ pub use ice::{
     AdminAuditRecord, AdminVerifier, BlastRadius, BlastWarning, IceActionProposal,
     OperatorRegistry, OperatorSignature, VerificationOutcome, VerifyError,
     DEFAULT_MAX_ADMIN_AUDIT_RECORDS,
+};
+pub use log_chain::{
+    BufferingLogChainAppender, LogAppendError, LogChainAppender, NoOpLogChainAppender,
+    DEFAULT_LOG_BUFFERING_APPENDER_CAPACITY,
 };
 pub use logs::{LogLevel, LogLine, LogRecord, DEFAULT_MAX_LOG_RING_RECORDS};
 pub use maintenance::MaintenanceState;
