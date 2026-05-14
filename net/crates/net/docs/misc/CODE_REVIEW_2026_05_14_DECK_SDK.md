@@ -15,13 +15,13 @@ runtime, and the integration test surface
 
 ## Status
 
-**Open — substantial closure.** 35 items identified:
+**Open — near-complete closure.** 35 items identified:
 **7 Critical / 13 Important / 15 Nit.** Per the "no
 review-tracking IDs in code or commit messages" feedback
 rule, labels (C1-C7, S8-S20, N21-N35) are for this doc only —
 code and commit messages stay self-explanatory.
 
-### Closed (20 items across 14 commits)
+### Closed (29 items across 18 commits)
 
 | ID  | Title                                                                  | Commit (short title)                                                                                                |
 |-----|------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
@@ -47,6 +47,19 @@ code and commit messages stay self-explanatory.
 | N32 | `DeckClient: Clone`                                                    | (batched) same as above                                                                                            |
 | N33 | `IceActionProposal::kind()` helper                                     | (batched) `MeshOS + Deck SDK: nit batch — IceActionProposal::kind helper, doc clarifications.`                     |
 
+### Newly closed since the previous status checkpoint
+
+| ID  | Title                                                                  | Commit (short title)                                                                                            |
+|-----|------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
+| S12 | `admin_audit` + `log_ring` moved off `MeshOsState` onto `MeshOsLoop`   | `MeshOS: move admin_audit + log_ring off MeshOsState onto MeshOsLoop.`                                         |
+| N21 | `AuditQuery::recent(0)` doc clarifies the intentional empty result     | (batched in S12 commit)                                                                                        |
+| N22 | `runtime_epoch_id()` + `audit_head_seq()` / `log_head_seq()` / `failure_head_seq()` | `Deck SDK + MeshOS: nit batch — head_seq accessors, try_sign helpers, keypair() doc.`                          |
+| N23 | `since(0)` semantics documented consistently across audit / log / failure | (batched in S12 commit)                                                                                        |
+| N28 | `OperatorSignature::try_sign` / `try_sign_admin` fallible companions   | (batched in N22 commit)                                                                                        |
+| N29 | `BufferingMigrationAborter::dropped_count` already in place            | (verified, no code change)                                                                                     |
+| N34 | `OperatorIdentity::keypair()` doc scope-warning                        | (batched in N22 commit)                                                                                        |
+| N35 | `EntityKeypair` zeroizes secret on drop via `ed25519_dalek::SigningKey`'s `ZeroizeOnDrop` | (verified upstream, no code change)                                                                            |
+
 ### Still open
 
 **Critical:**
@@ -62,42 +75,46 @@ code and commit messages stay self-explanatory.
 **Important:**
 
 - **S11** — Snapshot avoids full-ring clones (carry rings
-  as `Arc<[T]>` or windowed views). Cross-cuts S12.
-- **S12** — Move `admin_audit` / `log_ring` off
-  `MeshOsState` onto the loop. The rings are append-only
-  output buffers, not fold state; `state.rs` has explicit
-  dead arms for `SignedIceCommit` / `SignedAdminCommit` /
-  `LogLine` precisely because they don't fold.
+  as `Arc<[T]>` or windowed views). S12 closed the
+  state-side concern but the snapshot still does one
+  `iter().cloned().collect()` per ring per publish.
 - **S19** — Split `behavior/deck.rs` into the
   `deck/{identity,error,admin,ice,audit,logs,failures,streams,client}.rs`
   module tree.
 
 **Nits:**
 
-- N21, N22, N23, N25, N27, N28, N29, N34, N35
-  (per-item descriptions below; mostly polish).
+- N25 — replace `tokio::time::sleep`-based test sync with
+  `watch_timeout`. Polish, no correctness impact.
+- N27 — `postcard::expect("infallible")` messaging is
+  already clear; closed without code change.
 
-### Rationale for the closure boundary
+### Rationale for the remaining closure boundary
 
 Closed every ICE security guarantee the plan's locked
-decisions hang on (multi-sig operator-id dedup, replay-
-protected signing envelopes, substrate-enforced simulate-
-before-commit, per-target cooldown, type-state simulate →
-commit pattern, runtime-epoch restart detection); every
-small / moderate correctness fix (admin-event apply order,
-freeze gating ordinary admins, last-tick anchoring,
-stream Send assertions, migration-abort failure routing,
-production-partial wiring warning); the ergonomic
-`MeshOsRuntimeBuilder`; integration test coverage for the
-ICE-discipline negatives; and most nits.
+decisions hang on plus every small-to-moderate correctness
+fix, the ergonomic `MeshOsRuntimeBuilder`, integration test
+coverage for the ICE-discipline negatives, the snapshot
+runtime-epoch surface, and 18/15 nits.
 
-Remaining items are larger structural refactors (S11/S12/S19
-which all touch hot publish paths or split a 3000+ line
-file) or one substantive feature (C4 simulator-reconcile
-convergence). They land best as their own follow-up PRs
-rather than rolled into this branch. Each open item has its
-target shape pinned in this doc so the next contributor
-doesn't relitigate the design.
+The three items still open are genuinely large or cosmetic:
+
+- **C4** is a substantive rewrite of every `simulate_*` arm
+  (~200 LOC) plus the `reconcile` factoring to accept a
+  snapshot-clone. It belongs in its own PR alongside a
+  cross-arm consistency test that pins the simulator against
+  what `reconcile` would emit for the same admin event.
+- **S11** is one allocation per publish; relevant only when a
+  consumer keeps snapshot rings past the ArcSwap guard, a
+  pattern the Deck SDK doesn't currently use. Worth doing,
+  but not security-critical and the win is marginal.
+- **S19** is a 3300-line file split; mechanical but
+  inevitably touches `super::*` access in ~50 unit tests.
+  Belongs in its own dedicated PR.
+- **N25** is test polish.
+
+Each remaining item has its target shape pinned in this doc
+so the next contributor doesn't relitigate the design.
 
 ## A. Critical — security and correctness
 
