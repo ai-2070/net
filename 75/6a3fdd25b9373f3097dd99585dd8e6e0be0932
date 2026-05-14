@@ -1,0 +1,36 @@
+net/crates/net/src/adapter/net/behavior/meshos/ice.rs
+  s_6ba469f1921974::t_5730fd2f21565c 129-131
+net/crates/net/src/adapter/net/behavior/meshos/event_loop.rs
+  s_6ba469f1921974::t_272c0103bcf842 1035-1037
+  s_6ba469f1921974::t_d6909159fff155 1296-1297
+  s_6ba469f1921974::t_5ea57ea5878a4a 118-137
+  s_6ba469f1921974::t_da0906e6f54481 1000-1002
+  s_6ba469f1921974::t_ce3f6eedc4874c 473-476
+net/crates/net/src/adapter/net/behavior/meshos/state.rs
+  s_6ba469f1921974::t_53e8e076c69f60 96-101
+net/crates/net/src/adapter/net/behavior/meshos/snapshot.rs
+  s_6ba469f1921974::t_3a6e23d32b4266 407-408
+  s_6ba469f1921974::t_ceaca98993d34c 694-702,723-731,743-751
+  s_6ba469f1921974::t_90991d1c003c7b 805-813
+  s_6ba469f1921974::t_049f07a88f83e8 555-556
+net/crates/net/src/adapter/net/behavior/deck.rs
+  s_6ba469f1921974::t_294acfef58dbfb 1334-1342
+  s_6ba469f1921974::t_33bc69f470820b 1573-1578
+  s_6ba469f1921974::t_0d07165b0565b1 1290-1297
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "756a3fdd25b9373f3097dd99585dd8e6e0be0932",
+  "prompts": {},
+  "sessions": {
+    "s_6ba469f1921974": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3f6b48b8-94c5-47fd-9837-8991a8b4646e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
