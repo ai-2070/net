@@ -103,3 +103,11 @@ pub use net::adapter::net::compute::{
     DaemonControl, DaemonError, DaemonHealth, DaemonHostConfig, MeshDaemon,
 };
 pub use net::adapter::net::EntityKeypair;
+
+// Production RedEX-backed chain appenders. Operators wire
+// these when constructing a runtime via
+// `MeshOsRuntime::start_with_all_chains(...)` to persist admin
+// audit, log, and failure history to cluster-lifetime storage.
+pub use net::adapter::net::behavior::meshos::{
+    RedexAdminAuditAppender, RedexFailureAppender, RedexLogAppender,
+};

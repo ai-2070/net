@@ -65,6 +65,7 @@ pub mod logs;
 pub mod maintenance;
 pub mod probes;
 pub mod reconcile;
+pub mod redex_appenders;
 pub mod runtime;
 pub mod scheduler;
 pub mod sdk;
@@ -115,6 +116,7 @@ pub use log_chain::{
     DEFAULT_LOG_BUFFERING_APPENDER_CAPACITY,
 };
 pub use logs::{LogLevel, LogLine, LogRecord, DEFAULT_MAX_LOG_RING_RECORDS};
+pub use redex_appenders::{RedexAdminAuditAppender, RedexFailureAppender, RedexLogAppender};
 pub use maintenance::MaintenanceState;
 pub use probes::{
     HealthProbe, LocalityProbe, ProximityGraphHealthProbe, ProximityGraphLocalityProbe,
