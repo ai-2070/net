@@ -731,12 +731,15 @@ impl MeshOsLoop {
             }
             // Verification passed (or no verifier installed —
             // tests / dev mode). Fold as if the inner AdminEvent
-            // arrived directly.
+            // arrived directly. Dispatch fires AFTER actual.apply
+            // so the dispatcher observes post-fold state — the
+            // ordering invariant the loop preserves for every
+            // chain-committed admin event.
             self.desired
                 .apply_admin(&admin_event, self.config.this_node);
-            self.dispatch_kill_migration_if_applicable(&admin_event);
-            let unwrapped = MeshOsEvent::AdminEvent(admin_event);
+            let unwrapped = MeshOsEvent::AdminEvent(admin_event.clone());
             self.actual.apply(&unwrapped, self.config.this_node);
+            self.dispatch_kill_migration_if_applicable(&admin_event);
             self.emit_maintenance_transitions();
             return;
         }
@@ -784,9 +787,9 @@ impl MeshOsLoop {
             }
             self.desired
                 .apply_admin(admin_event, self.config.this_node);
-            self.dispatch_kill_migration_if_applicable(admin_event);
             let unwrapped = MeshOsEvent::AdminEvent(admin_event.clone());
             self.actual.apply(&unwrapped, self.config.this_node);
+            self.dispatch_kill_migration_if_applicable(admin_event);
             self.emit_maintenance_transitions();
             return;
         }
@@ -813,11 +816,16 @@ impl MeshOsLoop {
                     super::ice::VerificationOutcome::Unverified,
                 );
                 self.desired.apply_admin(admin, self.config.this_node);
-                self.dispatch_kill_migration_if_applicable(admin);
             }
             _ => {}
         }
         self.actual.apply(event, self.config.this_node);
+        // KillMigration / future dispatchers fire AFTER
+        // actual.apply so they observe post-fold state. Lifted
+        // out of the AdminEvent arm above for that ordering.
+        if let MeshOsEvent::AdminEvent(admin) = event {
+            self.dispatch_kill_migration_if_applicable(admin);
+        }
         self.emit_maintenance_transitions();
     }
 
@@ -937,7 +945,15 @@ impl MeshOsLoop {
         if current == self.last_local_maintenance {
             return;
         }
-        let now = std::time::Instant::now();
+        // Anchor the fall-back deadline on the actual state's
+        // last_tick so loop-replay produces identical deadlines.
+        // Falling back to wall-clock would break the
+        // replay-convergence contract the fold side already
+        // pins on `last_tick`.
+        let anchor = self
+            .actual
+            .last_tick
+            .unwrap_or_else(std::time::Instant::now);
         let event = match (self.last_local_maintenance, current) {
             (_, MaintenanceDiscriminant::EnteringMaintenance) => {
                 // Operator opened a drain. Use the configured
@@ -947,7 +963,7 @@ impl MeshOsLoop {
                     MaintenanceState::EnteringMaintenance {
                         deadline: Some(d), ..
                     } => *d,
-                    _ => now + self.config.maintenance.default_drain_deadline,
+                    _ => anchor + self.config.maintenance.default_drain_deadline,
                 };
                 Some(MeshOsControl::DrainStart { deadline })
             }

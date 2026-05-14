@@ -135,11 +135,23 @@ async fn deck_client_freeze_cluster_lands_in_snapshot_and_thaw_clears() {
         },
     );
 
-    // Freeze for 10s; observe `freeze_remaining_ms` surface
-    // through the snapshot stream.
-    let commit = deck
-        .admin()
+    // Freeze for 10s through the ICE surface; observe
+    // `freeze_remaining_ms` surface through the snapshot
+    // stream. No operator registry is installed, so the SDK
+    // routes via the unsigned admin path.
+    let freeze = deck
+        .ice()
         .freeze_cluster(Duration::from_secs(10))
+        .simulate()
+        .await
+        .expect("simulate");
+    let freeze_sig = deck.identity().sign_proposal(
+        freeze.action(),
+        freeze.issued_at_ms(),
+        &freeze.blast_hash(),
+    );
+    let commit = freeze
+        .commit(&[freeze_sig])
         .await
         .expect("freeze commit");
     assert_eq!(commit.event_kind(), "freeze_cluster");
@@ -160,7 +172,16 @@ async fn deck_client_freeze_cluster_lands_in_snapshot_and_thaw_clears() {
 
     // Thaw — `freeze_remaining_ms` should clear within a few
     // stream frames.
-    let _ = deck.admin().thaw_cluster().await.expect("thaw commit");
+    let thaw = deck
+        .ice()
+        .thaw_cluster()
+        .simulate()
+        .await
+        .expect("thaw simulate");
+    let thaw_sig =
+        deck.identity()
+            .sign_proposal(thaw.action(), thaw.issued_at_ms(), &thaw.blast_hash());
+    let _ = thaw.commit(&[thaw_sig]).await.expect("thaw commit");
     let mut saw_thaw = false;
     for _ in 0..20 {
         let snap = stream.next().await.expect("next").expect("ok");

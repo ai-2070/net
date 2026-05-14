@@ -843,31 +843,6 @@ impl AdminCommands<'_> {
             .await
     }
 
-    /// Pause reconcile-driven action emission cluster-wide for
-    /// `ttl`. While in effect every node's reconcile pass
-    /// returns an empty action vector; folds + chain commits
-    /// keep running. The freeze auto-clears at `now + ttl`; an
-    /// earlier [`Self::thaw_cluster`] cancels it.
-    ///
-    /// ICE break-glass surface. The Phase 2 substrate slice
-    /// landed the freeze gate; the SDK exposes it on the
-    /// existing [`AdminCommands`] surface for Phase 1 callers.
-    /// Phase 3 lifts this onto a dedicated `IceCommands` surface
-    /// with the proposal / simulate / multi-operator-sign
-    /// discipline the plan locks in.
-    pub async fn freeze_cluster(&self, ttl: Duration) -> Result<ChainCommit, AdminError> {
-        self.client
-            .publish_admin(AdminEvent::FreezeCluster { ttl }, "freeze_cluster")
-            .await
-    }
-
-    /// Cancel an in-effect cluster freeze. Idempotent — no-op
-    /// if no freeze is in effect.
-    pub async fn thaw_cluster(&self) -> Result<ChainCommit, AdminError> {
-        self.client
-            .publish_admin(AdminEvent::ThawCluster, "thaw_cluster")
-            .await
-    }
 }
 
 /// Re-export the substrate-side signing types so the SDK
@@ -1192,10 +1167,25 @@ impl<'a> SimulatedIceProposal<'a> {
             // No registry installed — route via the unsigned
             // admin path. Useful for in-process tests where the
             // SDK isn't gating on identity at all.
-            let admin = self.client.admin();
+            // No registry: route via the unsigned admin path.
+            // Useful for in-process tests where the SDK isn't
+            // gating on identity at all. Freeze / thaw go
+            // through the same path; the old `AdminCommands`
+            // surface for those was removed because it
+            // duplicated the ICE ceremony around the
+            // simulate-before-commit gate (plan locked
+            // decision #4).
             match self.action {
-                IceActionProposal::FreezeCluster { ttl } => admin.freeze_cluster(ttl).await,
-                IceActionProposal::ThawCluster => admin.thaw_cluster().await,
+                IceActionProposal::FreezeCluster { ttl } => {
+                    self.client
+                        .publish_admin(AdminEvent::FreezeCluster { ttl }, "freeze_cluster")
+                        .await
+                }
+                IceActionProposal::ThawCluster => {
+                    self.client
+                        .publish_admin(AdminEvent::ThawCluster, "thaw_cluster")
+                        .await
+                }
                 IceActionProposal::FlushAvoidLists { scope } => {
                     self.client
                         .publish_admin(AdminEvent::FlushAvoidLists { scope }, "flush_avoid_lists")
@@ -2089,16 +2079,23 @@ mod tests {
     const TEST_BLAST_HASH: super::super::meshos::BlastRadiusHash =
         [1u8; super::super::meshos::BLAST_RADIUS_HASH_LEN];
 
-    /// Static assertion: both ICE proposal types must be
-    /// `Send + Sync` so callers can move them across
-    /// `tokio::spawn` boundaries. The type-state split
-    /// eliminated the `Cell<bool>` runtime gate that broke
-    /// these bounds — pinning the property here prevents a
-    /// future change from regressing.
+    /// Static assertion: every public stream type returned by
+    /// the SDK must be `Send` so callers can move them across
+    /// `tokio::spawn` boundaries. A future internal-field swap
+    /// to a `!Send` type silently breaks every downstream
+    /// `spawn` consumer; pinning the property here keeps that
+    /// regression out of CI. The ICE proposal type-state pair
+    /// also pins `Send + Sync` for the same reason.
     fn _assert_proposal_send_sync_static_check() {
+        fn _assert_send<T: Send>() {}
         fn _assert_send_sync<T: Send + Sync>() {}
         _assert_send_sync::<IceProposal<'static>>();
         _assert_send_sync::<SimulatedIceProposal<'static>>();
+        _assert_send::<SnapshotStream>();
+        _assert_send::<StatusSummaryStream>();
+        _assert_send::<AuditStream>();
+        _assert_send::<LogStream>();
+        _assert_send::<FailureStream>();
     }
 
     #[tokio::test]
@@ -2350,10 +2347,18 @@ mod tests {
         // Freeze the cluster — the next polled summary will
         // differ (`freeze_remaining_ms` flips to `Some`), so
         // the stream re-emits + the audit ring depth bumps.
-        deck.admin()
+        let p = deck
+            .ice()
             .freeze_cluster(Duration::from_secs(30))
+            .simulate()
             .await
-            .expect("freeze");
+            .expect("simulate");
+        let sig = deck.identity().sign_proposal(
+            p.action(),
+            p.issued_at_ms(),
+            &p.blast_hash(),
+        );
+        p.commit(&[sig]).await.expect("freeze");
         let after_freeze = tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await
             .expect("after_freeze timed out")
@@ -2384,10 +2389,18 @@ mod tests {
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
-        deck.admin()
+        let p = deck
+            .ice()
             .freeze_cluster(Duration::from_secs(30))
+            .simulate()
             .await
-            .expect("freeze");
+            .expect("simulate");
+        let sig = deck.identity().sign_proposal(
+            p.action(),
+            p.issued_at_ms(),
+            &p.blast_hash(),
+        );
+        p.commit(&[sig]).await.expect("freeze");
         tokio::time::sleep(Duration::from_millis(60)).await;
         let summary = deck.status_summary();
         assert!(summary.freeze_remaining_ms.is_some());
@@ -2579,10 +2592,18 @@ mod tests {
 
         // Issue a freeze; subsequent status() should see the
         // freeze once the loop folds.
-        deck.admin()
+        let p = deck
+            .ice()
             .freeze_cluster(Duration::from_secs(20))
+            .simulate()
             .await
-            .expect("commit");
+            .expect("simulate");
+        let sig = deck.identity().sign_proposal(
+            p.action(),
+            p.issued_at_ms(),
+            &p.blast_hash(),
+        );
+        p.commit(&[sig]).await.expect("commit");
         tokio::time::sleep(Duration::from_millis(60)).await;
         let s = deck.status();
         assert!(s.freeze_remaining_ms.is_some());
@@ -2634,10 +2655,18 @@ mod tests {
 
         // Wait a beat so the watcher is in its sleep loop.
         tokio::time::sleep(Duration::from_millis(40)).await;
-        deck.admin()
+        let p = deck
+            .ice()
             .freeze_cluster(Duration::from_secs(15))
+            .simulate()
             .await
-            .expect("commit");
+            .expect("simulate");
+        let sig = deck.identity().sign_proposal(
+            p.action(),
+            p.issued_at_ms(),
+            &p.blast_hash(),
+        );
+        p.commit(&[sig]).await.expect("commit");
 
         let snap = tokio::time::timeout(Duration::from_secs(2), watcher)
             .await
@@ -2996,7 +3025,18 @@ mod tests {
 
         let mut stream = deck.audit().force_only().stream();
         deck.admin().cordon(42).await.unwrap();
-        deck.admin().thaw_cluster().await.unwrap();
+        let thaw = deck
+            .ice()
+            .thaw_cluster()
+            .simulate()
+            .await
+            .expect("simulate");
+        let sig = deck.identity().sign_proposal(
+            thaw.action(),
+            thaw.issued_at_ms(),
+            &thaw.blast_hash(),
+        );
+        thaw.commit(&[sig]).await.unwrap();
 
         let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await
@@ -3130,7 +3170,18 @@ mod tests {
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
 
         deck.admin().cordon(42).await.expect("cordon");
-        deck.admin().thaw_cluster().await.expect("thaw");
+        let thaw = deck
+            .ice()
+            .thaw_cluster()
+            .simulate()
+            .await
+            .expect("simulate");
+        let sig = deck.identity().sign_proposal(
+            thaw.action(),
+            thaw.issued_at_ms(),
+            &thaw.blast_hash(),
+        );
+        thaw.commit(&[sig]).await.expect("thaw");
         tokio::time::sleep(Duration::from_millis(80)).await;
 
         let baseline = deck.audit().collect();
