@@ -517,3 +517,70 @@ async fn admin_audit_ring_records_accepted_and_rejected_attempts() {
     assert_eq!(rej.operator_ids, vec![op.operator_id()]);
     let _ = runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn ordinary_admin_commits_are_rejected_during_cluster_freeze() {
+    // Freeze gate: an ordinary admin commit that lands during
+    // an in-effect cluster freeze must be audited as Rejected
+    // with kind "freeze_in_effect" and the inner event must
+    // NOT fold. ICE commits (force-ops, freeze, thaw) bypass
+    // because operators need to thaw the cluster mid-freeze.
+    use net::adapter::net::behavior::meshos::VerificationOutcome;
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+    // 1. Freeze the cluster via the ICE path.
+    let freeze = deck
+        .ice()
+        .freeze_cluster(Duration::from_secs(60))
+        .simulate()
+        .await
+        .expect("simulate");
+    let freeze_sig = deck.identity().sign_proposal(
+        freeze.action(),
+        freeze.issued_at_ms(),
+        &freeze.blast_hash(),
+    );
+    freeze.commit(&[freeze_sig]).await.expect("freeze commit");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        runtime.snapshot().freeze_remaining_ms.is_some(),
+        "cluster should be frozen after the freeze commit",
+    );
+
+    // 2. Attempt an ordinary Cordon during the freeze. It
+    //    should land on the audit ring as Rejected with kind
+    //    "freeze_in_effect" and NOT take effect on state.
+    let _ = deck.admin().cordon(THIS_NODE).await.expect("publish");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let snap = runtime.snapshot();
+    let rejected_freeze: Vec<_> = snap
+        .admin_audit
+        .iter()
+        .filter(|r| match &r.outcome {
+            VerificationOutcome::Rejected { kind, .. } => kind == "freeze_in_effect",
+            _ => false,
+        })
+        .collect();
+    assert!(
+        !rejected_freeze.is_empty(),
+        "Cordon during freeze should be audited with kind freeze_in_effect; got audit ring {:?}",
+        snap.admin_audit
+    );
+
+    // 3. The ICE Thaw bypasses the freeze gate and unblocks
+    //    ordinary admin commits.
+    let thaw = deck
+        .ice()
+        .thaw_cluster()
+        .simulate()
+        .await
+        .expect("simulate");
+    let thaw_sig =
+        deck.identity()
+            .sign_proposal(thaw.action(), thaw.issued_at_ms(), &thaw.blast_hash());
+    thaw.commit(&[thaw_sig]).await.expect("thaw commit");
+
+    let _ = runtime.shutdown().await;
+}

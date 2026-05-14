@@ -753,6 +753,35 @@ impl MeshOsLoop {
             issued_at_ms,
         } = event
         {
+            // Freeze gate: ordinary admin commits that arrive
+            // during an in-effect cluster freeze land on the
+            // audit ring as Rejected with kind
+            // "freeze_in_effect" and the inner event drops. ICE
+            // commits (the multi-op SignedIceCommit path) bypass
+            // by design — operators must be able to thaw the
+            // cluster mid-freeze.
+            let now = self
+                .actual
+                .last_tick
+                .unwrap_or_else(std::time::Instant::now);
+            if self.actual.is_frozen(now) && !admin_event.is_ice() {
+                self.record_admin_audit(
+                    admin_event,
+                    vec![signature.operator_id],
+                    super::ice::VerificationOutcome::Rejected {
+                        kind: "freeze_in_effect".to_string(),
+                        message: "ordinary admin commits are gated during a cluster freeze; \
+                                  thaw via the ICE surface to unblock"
+                            .to_string(),
+                    },
+                );
+                tracing::warn!(
+                    target: "meshos",
+                    kind = "freeze_in_effect",
+                    "rejected SignedAdminCommit — cluster is frozen and the event is non-ICE",
+                );
+                return;
+            }
             let outcome = match self.admin_verifier.as_ref() {
                 Some(verifier) => {
                     let now_ms = super::ice::now_ms_since_unix_epoch();
@@ -806,6 +835,31 @@ impl MeshOsLoop {
                 self.desired.apply_local_replica_intent(update)
             }
             MeshOsEvent::AdminEvent(admin) => {
+                // Freeze gate, same as the SignedAdminCommit
+                // path: ordinary admin events drop during a
+                // cluster freeze. ICE events bypass.
+                let now = self
+                    .actual
+                    .last_tick
+                    .unwrap_or_else(std::time::Instant::now);
+                if self.actual.is_frozen(now) && !admin.is_ice() {
+                    self.record_admin_audit(
+                        admin,
+                        Vec::new(),
+                        super::ice::VerificationOutcome::Rejected {
+                            kind: "freeze_in_effect".to_string(),
+                            message: "ordinary admin commits are gated during a cluster freeze; \
+                                      thaw via the ICE surface to unblock"
+                                .to_string(),
+                        },
+                    );
+                    tracing::warn!(
+                        target: "meshos",
+                        kind = "freeze_in_effect",
+                        "rejected unsigned AdminEvent — cluster is frozen and the event is non-ICE",
+                    );
+                    return;
+                }
                 // Unsigned admin commits also land on the audit
                 // ring with Unverified outcome — so audit
                 // consumers see every admin attempt the cluster
