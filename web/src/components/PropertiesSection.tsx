@@ -1,3 +1,5 @@
+"use client";
+
 import { DisplayHeading } from "./DisplayHeading";
 import { SectionLabel } from "./SectionHeadings";
 import { useEffect, useState } from "react";

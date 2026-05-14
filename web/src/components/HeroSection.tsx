@@ -1,3 +1,5 @@
+"use client";
+
 import { PacketRain } from "./PacketRain";
 import { useRepoInfo } from "./RepoInfoProvider";
 import { buildQuarter } from "@/lib/utils";

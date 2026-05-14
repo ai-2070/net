@@ -1,3 +1,5 @@
+"use client";
+
 import { useRef, useEffect, useState, useMemo, Fragment } from "react";
 
 interface DaemonCase {

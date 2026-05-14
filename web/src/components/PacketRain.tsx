@@ -1,3 +1,5 @@
+"use client";
+
 import { useEffect, useRef } from "react";
 
 const PACKET_RAIN_TOKENS: readonly string[] = [

@@ -1,3 +1,5 @@
+"use client";
+
 import { useEffect, useState, Fragment } from "react";
 
 export interface AsciiPhase {

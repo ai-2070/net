@@ -1,4 +1,4 @@
-function SuperpositionViz() {
+export function SuperpositionViz() {
   return (
     <div className="mt-7 border border-line bg-bg-2">
       <div className="flex items-center justify-between border-b border-line px-5 py-2.5 text-[10px] tracking-[0.14em] text-ink-dim uppercase">

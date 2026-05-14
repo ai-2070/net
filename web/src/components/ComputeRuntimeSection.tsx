@@ -3,7 +3,7 @@ import { DisplayHeading } from "./DisplayHeading";
 import { GroupCards } from "./GroupCards";
 import { MigrationPipeline } from "./MigrationPipeline";
 import { SectionLabel } from "./SectionHeadings";
-import { SpecStrip } from "./SpecStip";
+import { SpecStrip } from "./SpecStrip";
 
 export function ComputeRuntimeSection() {
   return (

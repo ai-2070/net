@@ -35,7 +35,7 @@ const SPEC_STRIP: ReadonlyArray<{
   },
 ];
 
-function SpecStrip() {
+export function SpecStrip() {
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 border border-line mt-10">
       {SPEC_STRIP.map((s, i) => (
