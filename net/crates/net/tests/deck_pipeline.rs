@@ -519,6 +519,72 @@ async fn admin_audit_ring_records_accepted_and_rejected_attempts() {
 }
 
 #[tokio::test]
+async fn kill_migration_with_no_op_aborter_and_verifier_records_failure() {
+    // Production-partial config detection: an admin verifier
+    // is wired (operator-policy chain installed) but the
+    // migration aborter is still the no-op default. A
+    // KillMigration commit lands on the chain but the
+    // orchestrator never actually aborts; the loop pushes a
+    // FailureRecord so operators reading subscribe_failures
+    // see the gap rather than green status.
+    use net::adapter::net::behavior::deck::FailureStream;
+    use std::sync::Arc as SArc;
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let op = OperatorIdentity::generate();
+    let mut registry = OperatorRegistry::new();
+    registry.register(op.keypair());
+    let verifier = SArc::new(AdminVerifier::new(SArc::new(registry), 1));
+    let runtime = MeshOsRuntime::start_with_all(
+        fast_config(),
+        dispatcher,
+        Default::default(),
+        Default::default(),
+        SArc::new(net::adapter::net::compute::DaemonRegistry::new()),
+        None,
+        Some(verifier),
+    );
+    // The SDK needs to publish via the SignedIceCommit path
+    // so the loop's verifier gate fires; register the op key
+    // on a fresh registry installed on the client.
+    let mut sdk_registry = OperatorRegistry::new();
+    sdk_registry.register(op.keypair());
+    let deck =
+        DeckClient::from_runtime(&runtime, op.clone()).with_operator_registry(sdk_registry);
+
+    let mut failures: FailureStream = deck.subscribe_failures(0);
+    let kill = deck
+        .ice()
+        .kill_migration(0xDEAD_BEEF)
+        .simulate()
+        .await
+        .expect("simulate");
+    let sig = deck.identity().sign_proposal(
+        kill.action(),
+        kill.issued_at_ms(),
+        &kill.blast_hash(),
+    );
+    kill.commit(&[sig]).await.expect("commit");
+
+    let record = tokio::time::timeout(Duration::from_secs(2), failures.next())
+        .await
+        .expect("failure stream timed out")
+        .expect("failure stream closed")
+        .expect("failure record");
+    assert!(
+        record.source.starts_with("kill-migration:"),
+        "expected source kill-migration:* , got {}",
+        record.source
+    );
+    assert!(
+        record.reason.contains("no-op")
+            || record.reason.contains("aborter"),
+        "expected reason to mention the no-op aborter, got {}",
+        record.reason
+    );
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn ordinary_admin_commits_are_rejected_during_cluster_freeze() {
     // Freeze gate: an ordinary admin commit that lands during
     // an in-effect cluster freeze must be audited as Rejected

@@ -238,8 +238,13 @@ pub struct ActionExecutor<D: ActionDispatcher> {
     /// Monotonic counter the executor stamps onto every
     /// `FailureRecord` it pushes. Same dedup primitive as the
     /// admin audit ring's seq — the Deck SDK's
-    /// `subscribe_failures` stream uses it.
-    failure_seq: u64,
+    /// `subscribe_failures` stream uses it. Shared via
+    /// `Arc<AtomicU64>` because the loop also records failures
+    /// (e.g. migration-abort dispatch errors) and needs to
+    /// stamp the same monotonic sequence — without the shared
+    /// counter, loop-recorded failures would collide with
+    /// executor-recorded ones at the SDK dedup gate.
+    failure_seq: Arc<AtomicU64>,
     /// Failure chain appender. Production deployments wire a
     /// `TypedRedexFile<FailureRecord>` here so the failure
     /// ring's bounded history extends to cluster-lifetime
@@ -272,7 +277,7 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
             recent_failures: Arc::new(RwLock::new(VecDeque::with_capacity(
                 RECENT_FAILURES_CAPACITY,
             ))),
-            failure_seq: 0,
+            failure_seq: Arc::new(AtomicU64::new(0)),
             failure_appender: super::failure_chain::no_op_arc(),
             stats: Arc::new(ExecutorStats::default()),
             chain_appender: Arc::new(NoOpActionChainAppender),
@@ -299,6 +304,26 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
     /// surface.
     pub fn recent_failures_handle(&self) -> Arc<RwLock<VecDeque<FailureRecord>>> {
         Arc::clone(&self.recent_failures)
+    }
+
+    /// Clone the shared failure-seq counter. The loop side
+    /// records its own failures (e.g. migration-abort
+    /// dispatcher errors) and needs the same monotonic
+    /// sequence so SDK consumers' dedup gate doesn't see
+    /// colliding `seq` values.
+    pub fn failure_seq_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.failure_seq)
+    }
+
+    /// Clone the shared failure-chain appender. The loop side
+    /// dual-writes records that go via
+    /// [`super::event_loop::MeshOsLoop::record_runtime_failure`]
+    /// so the durable chain history covers loop-side failures
+    /// too, not just executor-side dispatch failures.
+    pub fn failure_appender_handle(
+        &self,
+    ) -> Arc<dyn super::failure_chain::FailureChainAppender> {
+        Arc::clone(&self.failure_appender)
     }
 
     /// Builder: install an action-chain appender. The default
@@ -503,9 +528,9 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        self.failure_seq += 1;
+        let seq = self.failure_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let record = FailureRecord {
-            seq: self.failure_seq,
+            seq,
             source,
             reason,
             recorded_at_ms,

@@ -55,6 +55,17 @@ pub trait MigrationAborter: Send + Sync + 'static {
     /// Abort the migration with the given id. Returning `Err`
     /// is non-fatal — the loop logs and continues.
     fn abort(&self, migration: MigrationId) -> Result<(), MigrationAbortError>;
+
+    /// `true` for implementations that swallow the abort
+    /// without actually doing anything (e.g. the
+    /// [`NoOpMigrationAborter`] default). The loop checks this
+    /// after every `KillMigration` commit so operators get a
+    /// FailureRecord when a no-op aborter is paired with a
+    /// production admin-verifier wiring — a strong signal
+    /// that the orchestrator integration is incomplete.
+    fn is_no_op(&self) -> bool {
+        false
+    }
 }
 
 /// No-op aborter. The default. Returns `Ok(())` for every
@@ -66,6 +77,10 @@ pub struct NoOpMigrationAborter;
 impl MigrationAborter for NoOpMigrationAborter {
     fn abort(&self, _migration: MigrationId) -> Result<(), MigrationAbortError> {
         Ok(())
+    }
+
+    fn is_no_op(&self) -> bool {
+        true
     }
 }
 

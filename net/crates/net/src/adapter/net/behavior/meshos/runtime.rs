@@ -347,10 +347,23 @@ impl MeshOsRuntime {
         let mut mesh_loop = mesh_loop
             .with_probe_registry(probes.clone())
             .with_scheduler_registry(scheduler.clone())
-            .with_executor_failures(exec.recent_failures_handle());
+            .with_executor_failures(exec.recent_failures_handle())
+            .with_executor_failure_writer(
+                exec.failure_seq_handle(),
+                exec.failure_appender_handle(),
+            );
         if let Some(sink) = control_sink {
             mesh_loop = mesh_loop.with_control_sink(sink);
         }
+        // Production-partial config detection: an admin
+        // verifier is wired (production identity-layer is
+        // installed) but the migration_aborter / snapshot
+        // source defaults are still the no-op. A KillMigration
+        // commit would land on the chain but never actually
+        // abort, and the operator would have no visible
+        // signal. Surface once at startup so the operator can
+        // tell on first boot.
+        let verifier_installed = admin_verifier.is_some();
         if let Some(verifier) = admin_verifier {
             mesh_loop = mesh_loop.with_admin_verifier(verifier);
         }
@@ -360,11 +373,24 @@ impl MeshOsRuntime {
         if let Some(appender) = log_appender {
             mesh_loop = mesh_loop.with_log_appender(appender);
         }
+        let aborter_installed = migration_aborter.is_some();
         if let Some(aborter) = migration_aborter {
             mesh_loop = mesh_loop.with_migration_aborter(aborter);
         }
+        let snapshot_source_installed = migration_snapshot_source.is_some();
         if let Some(source) = migration_snapshot_source {
             mesh_loop = mesh_loop.with_migration_snapshot_source(source);
+        }
+        if verifier_installed && (!aborter_installed || !snapshot_source_installed) {
+            tracing::warn!(
+                target: "meshos",
+                aborter_installed,
+                snapshot_source_installed,
+                "MeshOsRuntime: admin verifier is wired but migration-aborter or migration-snapshot \
+                 source is still the no-op default — KillMigration commits will land on the chain \
+                 but won't actually abort the migration on this node. Wire the orchestrator-backed \
+                 adapter before relying on KillMigration in production.",
+            );
         }
         let dropped_actions = mesh_loop.dropped_actions_counter();
         let loop_task = tokio::spawn(mesh_loop.run());

@@ -123,6 +123,17 @@ pub struct MeshOsLoop {
     /// constructed without an executor (e.g. unit tests) still
     /// publishes (with an empty ring).
     executor_failures: Option<Arc<RwLock<VecDeque<FailureRecord>>>>,
+    /// Shared failure-seq counter — same counter the executor
+    /// uses. The loop stamps its own runtime-side failures
+    /// (e.g. migration-abort dispatcher errors) with this so
+    /// SDK consumers' dedup gate sees a single monotonic
+    /// sequence across both writers.
+    executor_failure_seq: Option<Arc<AtomicU64>>,
+    /// Shared failure-chain appender — same instance the
+    /// executor uses. The loop dual-writes runtime-side
+    /// failures to the durable chain via this so chain
+    /// history covers loop-side failures too.
+    executor_failure_appender: Option<Arc<dyn super::failure_chain::FailureChainAppender>>,
     /// Optional control-event sink. When attached, the loop
     /// translates this-node `local_maintenance` transitions and
     /// future backpressure flips into [`MeshOsControl`] events
@@ -418,6 +429,8 @@ impl MeshOsLoop {
             log_seq: 0,
             dropped_actions: Arc::new(AtomicU64::new(0)),
             executor_failures: None,
+            executor_failure_seq: None,
+            executor_failure_appender: None,
             control_sink: None,
             last_local_maintenance: MaintenanceDiscriminant::Active,
             admin_verifier: None,
@@ -471,6 +484,24 @@ impl MeshOsLoop {
         failures: Arc<RwLock<VecDeque<FailureRecord>>>,
     ) -> Self {
         self.executor_failures = Some(failures);
+        self
+    }
+
+    /// Attach the executor's failure-seq counter + chain
+    /// appender so the loop can record its own runtime-side
+    /// failures (e.g. migration-abort dispatcher errors) with
+    /// the same monotonic sequence + durable chain dual-write
+    /// the executor uses. Pair this with
+    /// [`Self::with_executor_failures`]; together the trio
+    /// makes [`Self::record_runtime_failure`] a complete dual
+    /// write into the snapshot ring + the chain.
+    pub fn with_executor_failure_writer(
+        mut self,
+        seq: Arc<AtomicU64>,
+        appender: Arc<dyn super::failure_chain::FailureChainAppender>,
+    ) -> Self {
+        self.executor_failure_seq = Some(seq);
+        self.executor_failure_appender = Some(appender);
         self
     }
 
@@ -974,13 +1005,84 @@ impl MeshOsLoop {
         let super::event::AdminEvent::KillMigration { migration } = admin else {
             return;
         };
+        // No-op aborter installed with a verifier wired — this
+        // is "production-partial" config: the chain commit
+        // landed but the migration runs to completion because
+        // the aborter is a no-op. Surface as a FailureRecord
+        // so operators reading subscribe_failures see it.
+        if self.migration_aborter.is_no_op() && self.admin_verifier.is_some() {
+            self.record_runtime_failure(
+                format!("kill-migration:{}", *migration),
+                "no-op migration aborter installed while admin verifier is wired — \
+                 chain commit landed but KillMigration is a no-op on this node"
+                    .to_string(),
+            );
+            return;
+        }
         if let Err(err) = self.migration_aborter.abort(*migration) {
+            // Dispatch failure: log AND push to the failure
+            // ring so the Deck SDK's subscribe_failures stream
+            // surfaces it. A previous slice swallowed this
+            // failure to a tracing::warn! only.
             tracing::warn!(
                 target: "meshos",
                 migration = migration,
                 error = %err,
                 "migration-abort dispatcher failed — chain commit landed but migration may continue",
             );
+            self.record_runtime_failure(
+                format!("kill-migration:{}", *migration),
+                format!("migration-abort dispatcher error: {err}"),
+            );
+        }
+    }
+
+    /// Push a runtime-side failure onto the executor's failure
+    /// ring + chain. Used by the loop for failures that don't
+    /// originate from an action dispatch — e.g. migration-abort
+    /// dispatcher errors after a `KillMigration` commit. Falls
+    /// back to a `tracing::warn!` when the executor handles
+    /// aren't wired (in-process tests that don't run the
+    /// executor task).
+    fn record_runtime_failure(&self, source: String, reason: String) {
+        let recorded_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let seq = match self.executor_failure_seq.as_ref() {
+            Some(s) => s.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
+            None => {
+                tracing::warn!(
+                    target: "meshos",
+                    source = %source,
+                    reason = %reason,
+                    "runtime-side failure surfaced but executor handles aren't wired",
+                );
+                return;
+            }
+        };
+        let record = FailureRecord {
+            seq,
+            source,
+            reason,
+            recorded_at_ms,
+        };
+        if let Some(appender) = self.executor_failure_appender.as_ref() {
+            if let Err(err) = appender.append(&record) {
+                tracing::warn!(
+                    target: "meshos",
+                    seq = record.seq,
+                    error = %err,
+                    "failure-chain append failed — record kept on in-memory ring only",
+                );
+            }
+        }
+        if let Some(ring) = self.executor_failures.as_ref() {
+            let mut g = ring.write();
+            if g.len() >= super::snapshot::RECENT_FAILURES_CAPACITY {
+                g.pop_front();
+            }
+            g.push_back(record);
         }
     }
 
