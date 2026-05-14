@@ -1,0 +1,23 @@
+net/crates/net/sdk/src/deck.rs
+  s_3bbc444b3ef3e5::t_2ee79b7544eff3 43-45
+net/crates/net/src/adapter/net/behavior/deck.rs
+  s_3bbc444b3ef3e5::t_666a21ed5f3846 785-905
+  s_3bbc444b3ef3e5::t_07bd1c45a4ddc0 348-359
+  s_3bbc444b3ef3e5::t_6baac62e6e6039 1374-1534
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "861c06d25653998a151daa363eeb4f98c63a0a23",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
