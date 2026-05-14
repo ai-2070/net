@@ -1353,7 +1353,7 @@ impl<'a> AuditQuery<'a> {
         let snap = self.client.snapshot_reader.read();
         let mut matched: Vec<super::meshos::AdminAuditRecord> = snap
             .admin_audit
-            .into_iter()
+            .iter()
             .filter(|r| {
                 if let Some(since) = self.since_seq {
                     if r.seq <= since {
@@ -1375,6 +1375,7 @@ impl<'a> AuditQuery<'a> {
                 }
                 true
             })
+            .cloned()
             .collect();
         // Ring order is oldest-first; the natural operator UI
         // shape is newest-first.
@@ -1495,7 +1496,7 @@ impl Stream for AuditStream {
                 let last_seq = self.last_seq;
                 // Ring order is oldest-first; iterate forward.
                 let mut max_seq = last_seq;
-                for record in snap.admin_audit.into_iter() {
+                for record in snap.admin_audit.iter().cloned() {
                     if record.seq <= last_seq {
                         continue;
                     }
@@ -1646,7 +1647,7 @@ impl Stream for LogStream {
                 let snap = self.reader.read();
                 let last_seq = self.last_seq;
                 let mut max_seq = last_seq;
-                for record in snap.log_ring.into_iter() {
+                for record in snap.log_ring.iter().cloned() {
                     if record.seq <= last_seq {
                         continue;
                     }
@@ -1719,7 +1720,7 @@ impl Stream for FailureStream {
                 let snap = self.reader.read();
                 let last_seq = self.last_seq;
                 let mut max_seq = last_seq;
-                for record in snap.recent_failures.into_iter() {
+                for record in snap.recent_failures.iter().cloned() {
                     if record.seq <= last_seq {
                         continue;
                     }

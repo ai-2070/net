@@ -2174,17 +2174,20 @@ mod tests {
     fn simulate_kill_migration_enumerates_local_in_flight_migration() {
         use super::super::snapshot::{MigrationPhaseSnapshot, MigrationSnapshot};
         let mut snap = MeshOsSnapshot::default();
-        snap.in_flight_migrations.push(MigrationSnapshot {
-            daemon_origin: 0xCAFE,
-            phase: MigrationPhaseSnapshot::Transfer,
-            elapsed_ms: 250,
-        });
-        // A noise migration that should not match the target.
-        snap.in_flight_migrations.push(MigrationSnapshot {
-            daemon_origin: 0xBEEF,
-            phase: MigrationPhaseSnapshot::Replay,
-            elapsed_ms: 50,
-        });
+        snap.in_flight_migrations = vec![
+            MigrationSnapshot {
+                daemon_origin: 0xCAFE,
+                phase: MigrationPhaseSnapshot::Transfer,
+                elapsed_ms: 250,
+            },
+            // A noise migration that should not match the target.
+            MigrationSnapshot {
+                daemon_origin: 0xBEEF,
+                phase: MigrationPhaseSnapshot::Replay,
+                elapsed_ms: 50,
+            },
+        ]
+        .into();
         let blast = simulate(
             &snap,
             &IceActionProposal::KillMigration { migration: 0xCAFE },

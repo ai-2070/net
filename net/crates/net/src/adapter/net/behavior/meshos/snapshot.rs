@@ -54,10 +54,15 @@ pub struct MeshOsSnapshot {
     /// This node's own maintenance state.
     pub local_maintenance: MaintenanceStateSnapshot,
     /// Pending actions (reconcile emitted, executor hasn't
-    /// drained yet).
-    pub pending: Vec<PendingActionSnapshot>,
+    /// drained yet). Wrapped in `Arc<[…]>` so consumers
+    /// holding the snapshot past the `ArcSwap` guard can
+    /// clone in O(1) instead of paying a per-element copy.
+    pub pending: std::sync::Arc<[PendingActionSnapshot]>,
     /// Ring buffer of recent failures (daemon crashes, drain
-    /// timeouts, etc.).
+    /// timeouts, etc.). Stays as a `VecDeque` because the
+    /// chain-replay fold mutates this directly (`push_failure`
+    /// in `chain.rs`); switching to `Arc<[…]>` would require
+    /// the fold to thread a mutable working buffer separately.
     pub recent_failures: VecDeque<FailureRecord>,
     /// Milliseconds remaining on the cluster-wide ICE freeze, or
     /// `None` if no freeze is in effect. Driven by the
@@ -71,14 +76,14 @@ pub struct MeshOsSnapshot {
     /// Deck SDK's `audit()` reads this ring;
     /// `audit().force_only()` filters to just the ICE-class
     /// entries (`AdminEvent::is_ice()`).
-    pub admin_audit: Vec<super::ice::AdminAuditRecord>,
+    pub admin_audit: std::sync::Arc<[super::ice::AdminAuditRecord]>,
     /// Log ring — every `MeshOsEvent::LogLine` the loop
     /// observed, ordered oldest-first. Bounded by
     /// [`super::logs::DEFAULT_MAX_LOG_RING_RECORDS`]. The
     /// Deck SDK's `subscribe_logs(filter)` reads this ring;
     /// the future per-daemon RedEX-tail integration swaps the
     /// backing store without changing the snapshot shape.
-    pub log_ring: Vec<super::logs::LogRecord>,
+    pub log_ring: std::sync::Arc<[super::logs::LogRecord]>,
     /// In-flight daemon migrations this node is hosting. Empty
     /// unless the runtime wired a
     /// [`super::migration_snapshot_source::MigrationSnapshotSource`]
@@ -88,7 +93,7 @@ pub struct MeshOsSnapshot {
     /// `simulate_kill_migration` blast-radius preview reads
     /// this to enumerate the affected daemon when the
     /// operator targets a migration this node hosts.
-    pub in_flight_migrations: Vec<MigrationSnapshot>,
+    pub in_flight_migrations: std::sync::Arc<[MigrationSnapshot]>,
     /// Boot-time identifier the MeshOsLoop stamped when it
     /// started. Stays constant for the lifetime of the loop
     /// task and changes on every restart. SDK consumers
@@ -539,22 +544,26 @@ impl MeshOsSnapshot {
             },
         };
 
-        let pending = pending
+        let pending: std::sync::Arc<[PendingActionSnapshot]> = pending
             .iter()
             .map(|p| PendingActionSnapshot {
                 id: p.id.0,
                 kind: action_kind_str(&p.action).to_string(),
                 age_ms: now.saturating_duration_since(p.emitted_at).as_millis() as u64,
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
 
         let freeze_remaining_ms = actual
             .freeze_until
             .map(|until| until.saturating_duration_since(now).as_millis() as u64);
-        let admin_audit: Vec<super::ice::AdminAuditRecord> =
-            admin_audit_ring.iter().cloned().collect();
-        let log_ring: Vec<super::logs::LogRecord> = log_ring.iter().cloned().collect();
+        let admin_audit: std::sync::Arc<[super::ice::AdminAuditRecord]> =
+            admin_audit_ring.iter().cloned().collect::<Vec<_>>().into();
+        let log_ring_arc: std::sync::Arc<[super::logs::LogRecord]> =
+            log_ring.iter().cloned().collect::<Vec<_>>().into();
 
+        let in_flight_migrations_arc: std::sync::Arc<[MigrationSnapshot]> =
+            in_flight_migrations.into();
         Self {
             daemons,
             replicas,
@@ -565,8 +574,8 @@ impl MeshOsSnapshot {
             recent_failures: recent_failures.iter().cloned().collect(),
             freeze_remaining_ms,
             admin_audit,
-            log_ring,
-            in_flight_migrations,
+            log_ring: log_ring_arc,
+            in_flight_migrations: in_flight_migrations_arc,
             // Set to `0` here; the loop's publish_snapshot
             // overwrites with the per-runtime epoch stamp
             // immediately after construction so chain-fold
