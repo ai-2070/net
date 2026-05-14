@@ -50,8 +50,8 @@ pub use net::adapter::net::behavior::deck::{
 // build commands or read snapshots.
 pub use net::adapter::net::behavior::meshos::{
     AdminAuditRecord, AdminEvent, AdminVerifier, AvoidScope, BlastRadius, BlastWarning, ChainId,
-    DaemonHealthSnapshot, DaemonLifecycleSnapshot, DaemonSnapshot, IceActionProposal,
-    LogLevel, LogLine, LogRecord, MaintenanceStateSnapshot, MeshOsSnapshot, MigrationId,
-    NodeId, PeerHealthSnapshot, PeerSnapshot, ReplicaSnapshot, RestartStateSnapshot,
+    DaemonHealthSnapshot, DaemonLifecycleSnapshot, DaemonSnapshot, FailureRecord,
+    IceActionProposal, LogLevel, LogLine, LogRecord, MaintenanceStateSnapshot, MeshOsSnapshot,
+    MigrationId, NodeId, PeerHealthSnapshot, PeerSnapshot, ReplicaSnapshot, RestartStateSnapshot,
     VerificationOutcome, VerifyError,
 };

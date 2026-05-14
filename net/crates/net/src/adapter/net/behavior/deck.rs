@@ -559,6 +559,39 @@ impl DeckClient {
         self.snapshot_reader.load().freeze_remaining_ms
     }
 
+    /// Borrow the latest executor-side failure ring. Bounded
+    /// by [`super::meshos::RECENT_FAILURES_CAPACITY`]; ordered
+    /// oldest-first (FIFO). Operators read this to see what
+    /// the action dispatcher rejected recently. One snapshot
+    /// load + a clone of just the failure ring.
+    pub fn recent_failures(&self) -> Vec<super::meshos::FailureRecord> {
+        self.snapshot_reader.load().recent_failures.iter().cloned().collect()
+    }
+
+    /// Like [`Self::recent_failures`] but keeps only entries
+    /// with `recorded_at_ms > since_ms`. Pagination primitive:
+    /// poll periodically, persist the max `recorded_at_ms`
+    /// observed, and re-query with that value to surface only
+    /// new failures.
+    ///
+    /// Note: same-ms collisions can land on the boundary —
+    /// records sharing the cutoff value's exact ms might be
+    /// missed if they were added between polls. The proper
+    /// seq-based stream lands once [`super::meshos::FailureRecord`]
+    /// gains a monotonic seq field (next substrate slice).
+    pub fn recent_failures_since(
+        &self,
+        since_ms: u64,
+    ) -> Vec<super::meshos::FailureRecord> {
+        self.snapshot_reader
+            .load()
+            .recent_failures
+            .iter()
+            .filter(|r| r.recorded_at_ms > since_ms)
+            .cloned()
+            .collect()
+    }
+
     /// Await a snapshot matching `predicate`. Polls the
     /// snapshot reader at
     /// [`DeckClientConfig::snapshot_poll_interval`] and resolves
@@ -2137,6 +2170,77 @@ mod tests {
             summary.local_maintenance_active,
             "local_maintenance_active should flip on after enter_maintenance",
         );
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn recent_failures_surfaces_dispatcher_rejections() {
+        use crate::adapter::net::behavior::meshos::DispatchError;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        dispatcher.fail_next(DispatchError::drop("synthetic rejection"));
+        let runtime = MeshOsRuntime::start(fast_config(), Arc::clone(&dispatcher));
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        // Drive an admin event whose dispatched action will be
+        // rejected — reconcile emits `CommitMaintenanceTransition`
+        // for an empty-workload enter_maintenance.
+        deck.admin()
+            .enter_maintenance(42, None)
+            .await
+            .expect("commit");
+
+        // Poll up to 2s for the failure to land on the ring.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut got: Vec<crate::adapter::net::behavior::meshos::FailureRecord> = Vec::new();
+        while std::time::Instant::now() < deadline {
+            got = deck.recent_failures();
+            if !got.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !got.is_empty(),
+            "recent_failures should reflect the seeded dispatcher rejection",
+        );
+        assert!(got[0].reason.contains("synthetic rejection"));
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn recent_failures_since_drops_records_at_or_below_cutoff() {
+        use crate::adapter::net::behavior::meshos::DispatchError;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        dispatcher.fail_next(DispatchError::drop("first failure"));
+        let runtime = MeshOsRuntime::start(fast_config(), Arc::clone(&dispatcher));
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        deck.admin()
+            .enter_maintenance(42, None)
+            .await
+            .expect("commit");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut all: Vec<crate::adapter::net::behavior::meshos::FailureRecord> = Vec::new();
+        while std::time::Instant::now() < deadline {
+            all = deck.recent_failures();
+            if !all.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!all.is_empty(), "seed failure should land");
+
+        // Set the watermark to the existing record's ms — the
+        // since filter uses `>` so the same record is dropped.
+        let cutoff = all[0].recorded_at_ms;
+        let after = deck.recent_failures_since(cutoff);
+        assert!(
+            after.iter().all(|r| r.recorded_at_ms > cutoff),
+            "since filter should drop records at the cutoff",
+        );
+        // The seed record itself shouldn't appear (its ms ==
+        // cutoff).
+        assert!(after.iter().all(|r| r.reason != "first failure"));
         let _ = runtime.shutdown().await;
     }
 
