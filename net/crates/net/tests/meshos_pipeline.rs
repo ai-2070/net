@@ -22,8 +22,8 @@ use net::adapter::net::behavior::meshos::{
     attach_to_daemon_registry, ActionExecutor, AdminEvent, ChainId, DaemonIntent,
     DaemonIntentUpdate, DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent,
     LocalReplicaIntentUpdate, LoggingDispatcher, MaintenanceTransition, MeshOsAction, MeshOsConfig,
-    MeshOsDaemonSdk, MeshOsEvent, MeshOsLoop, MeshOsLoopParts, MeshOsRuntime,
-    MeshOsSnapshotReader, NodeId, ReplicaUpdate,
+    MeshOsDaemonSdk, MeshOsEvent, MeshOsLoop, MeshOsLoopParts, MeshOsRuntime, MeshOsSnapshotReader,
+    NodeId, ReplicaUpdate,
 };
 use net::adapter::net::compute::DaemonHost;
 use net::adapter::net::compute::{DaemonError, DaemonHostConfig, DaemonRegistry, MeshDaemon};
@@ -695,9 +695,7 @@ async fn sdk_drives_full_daemon_lifecycle_end_to_end() {
         name: "sdk-e2e".into(),
         process_count: std::sync::Arc::clone(&counter),
     };
-    let mut handle = sdk
-        .register_daemon(Box::new(daemon), kp)
-        .expect("register");
+    let mut handle = sdk.register_daemon(Box::new(daemon), kp).expect("register");
 
     // Emit the admin event that the loop's reconcile will
     // translate to CommitMaintenanceTransition; the routing
@@ -714,9 +712,10 @@ async fn sdk_drives_full_daemon_lifecycle_end_to_end() {
 
     // Wait for the loop tick → reconcile → executor dispatch →
     // SDK router fan-out.
-    let recv =
-        tokio::time::timeout(Duration::from_secs(2), handle.next_control()).await;
-    let ev = recv.expect("control event timed out").expect("control receiver closed");
+    let recv = tokio::time::timeout(Duration::from_secs(2), handle.next_control()).await;
+    let ev = recv
+        .expect("control event timed out")
+        .expect("control receiver closed");
     assert!(
         matches!(
             ev,
@@ -727,12 +726,9 @@ async fn sdk_drives_full_daemon_lifecycle_end_to_end() {
 
     // Capability publish stub returns Ok (chain commit lands in
     // a future slice).
-    let result = handle
-        .publish_capabilities(Default::default());
+    let result = handle.publish_capabilities(Default::default());
     assert!(result.is_ok());
 
-    let _ = handle
-        .graceful_shutdown(Duration::from_millis(50))
-        .await;
+    let _ = handle.graceful_shutdown(Duration::from_millis(50)).await;
     let _ = sdk.shutdown().await;
 }

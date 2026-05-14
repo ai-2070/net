@@ -17,8 +17,7 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use net::adapter::net::behavior::deck::{
-    AdminError, DeckClient, DeckClientConfig, OperatorIdentity, OperatorRegistry,
-    OperatorSignature,
+    AdminError, DeckClient, DeckClientConfig, OperatorIdentity, OperatorRegistry, OperatorSignature,
 };
 use net::adapter::net::behavior::meshos::{
     ice_proposal_signing_payload, AdminVerifier, BlastWarning, IceActionProposal,
@@ -42,11 +41,12 @@ async fn deck_client_enter_maintenance_flows_through_to_snapshot() {
     // the resulting `EnteringMaintenance` (or downstream) state.
     let dispatcher = Arc::new(LoggingDispatcher::new());
     let runtime = MeshOsRuntime::start(fast_config(), Arc::clone(&dispatcher));
-    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-        .with_config(DeckClientConfig {
+    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+        DeckClientConfig {
             snapshot_poll_interval: Duration::from_millis(20),
             ..DeckClientConfig::default()
-        });
+        },
+    );
 
     let commit = deck
         .admin()
@@ -116,11 +116,7 @@ async fn deck_client_two_commits_carry_monotonic_commit_ids() {
 
     let a = deck.admin().cordon(THIS_NODE).await.unwrap();
     let b = deck.admin().uncordon(THIS_NODE).await.unwrap();
-    let c = deck
-        .admin()
-        .invalidate_placement(THIS_NODE)
-        .await
-        .unwrap();
+    let c = deck.admin().invalidate_placement(THIS_NODE).await.unwrap();
 
     assert!(b.commit_id() > a.commit_id());
     assert!(c.commit_id() > b.commit_id());
@@ -132,11 +128,12 @@ async fn deck_client_two_commits_carry_monotonic_commit_ids() {
 async fn deck_client_freeze_cluster_lands_in_snapshot_and_thaw_clears() {
     let dispatcher = Arc::new(LoggingDispatcher::new());
     let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-        .with_config(DeckClientConfig {
+    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+        DeckClientConfig {
             snapshot_poll_interval: Duration::from_millis(15),
             ..DeckClientConfig::default()
-        });
+        },
+    );
 
     // Freeze for 10s; observe `freeze_remaining_ms` surface
     // through the snapshot stream.
@@ -187,11 +184,12 @@ async fn ice_proposal_simulate_then_commit_lands_freeze_through_pipeline() {
     // the underlying admin event.
     let dispatcher = Arc::new(LoggingDispatcher::new());
     let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-        .with_config(DeckClientConfig {
+    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+        DeckClientConfig {
             snapshot_poll_interval: Duration::from_millis(15),
             ..DeckClientConfig::default()
-        });
+        },
+    );
 
     let proposal = deck.ice().freeze_cluster(Duration::from_secs(45));
     let blast = proposal.simulate().await.expect("simulate");

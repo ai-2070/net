@@ -2065,10 +2065,9 @@ mod tests {
         const CHAIN: ChainId = 0xC0FFEE;
         let mut actual = MeshOsState::default();
         actual.last_tick = Some(Instant::now());
-        actual.replicas.insert(
-            CHAIN,
-            ::std::collections::BTreeSet::from([THIS_NODE, 99]),
-        );
+        actual
+            .replicas
+            .insert(CHAIN, ::std::collections::BTreeSet::from([THIS_NODE, 99]));
         actual.replica_leader.insert(CHAIN, THIS_NODE);
         actual.forced_evictions.push((CHAIN, 99));
 
@@ -2095,10 +2094,9 @@ mod tests {
         const CHAIN: ChainId = 0xCAFE;
         let mut actual = MeshOsState::default();
         actual.last_tick = Some(Instant::now());
-        actual.replicas.insert(
-            CHAIN,
-            ::std::collections::BTreeSet::from([THIS_NODE, 7]),
-        );
+        actual
+            .replicas
+            .insert(CHAIN, ::std::collections::BTreeSet::from([THIS_NODE, 7]));
         // Leader is some OTHER node, not this one.
         actual.replica_leader.insert(CHAIN, 999);
         actual.forced_evictions.push((CHAIN, 7));
@@ -2111,7 +2109,10 @@ mod tests {
             &SchedulerConfig::default(),
             None,
         );
-        assert!(actions.is_empty(), "non-leader should not emit, got {actions:?}");
+        assert!(
+            actions.is_empty(),
+            "non-leader should not emit, got {actions:?}"
+        );
     }
 
     #[test]
@@ -2120,7 +2121,9 @@ mod tests {
         let mut actual = MeshOsState::default();
         let now = Instant::now();
         actual.last_tick = Some(now);
-        actual.replicas.insert(CHAIN, ::std::collections::BTreeSet::from([7]));
+        actual
+            .replicas
+            .insert(CHAIN, ::std::collections::BTreeSet::from([7]));
         actual.replica_leader.insert(CHAIN, THIS_NODE);
         // Mark a very recent rebalance — the scheduler arm would
         // skip this chain due to cooldown. Force-evict should

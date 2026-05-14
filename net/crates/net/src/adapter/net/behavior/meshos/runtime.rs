@@ -144,14 +144,7 @@ impl MeshOsRuntime {
         scheduler: SchedulerRegistry,
         daemon_registry: Arc<DaemonRegistry>,
     ) -> Self {
-        Self::start_with_options(
-            config,
-            dispatcher,
-            probes,
-            scheduler,
-            daemon_registry,
-            None,
-        )
+        Self::start_with_options(config, dispatcher, probes, scheduler, daemon_registry, None)
     }
 
     /// Most-general constructor with an optional [`super::control::ControlSink`]

@@ -604,8 +604,7 @@ impl MeshOsLoop {
             // tests / dev mode). Fold as if the inner AdminEvent
             // arrived directly.
             let admin = proposal.to_admin_event();
-            self.desired
-                .apply_admin(&admin, self.config.this_node);
+            self.desired.apply_admin(&admin, self.config.this_node);
             let unwrapped = MeshOsEvent::AdminEvent(admin);
             self.actual.apply(&unwrapped, self.config.this_node);
             self.emit_maintenance_transitions();

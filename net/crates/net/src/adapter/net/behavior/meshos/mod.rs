@@ -104,9 +104,8 @@ pub use reconcile::{reconcile, STOP_GRACE_PERIOD};
 pub use runtime::{MeshOsRuntime, RuntimeShutdownError, RuntimeStats};
 pub use scheduler::{PlacementScorer, SchedulerConfig, SchedulerRegistry};
 pub use sdk::{
-    DaemonControlRouter, MaintenanceStateView, MeshOsDaemonHandle, MeshOsDaemonSdk,
-    MetadataView, SdkError, SdkRoutingDispatcher, DEFAULT_CONTROL_CHANNEL_CAPACITY,
-    DEFAULT_GRACEFUL_SHUTDOWN,
+    DaemonControlRouter, MaintenanceStateView, MeshOsDaemonHandle, MeshOsDaemonSdk, MetadataView,
+    SdkError, SdkRoutingDispatcher, DEFAULT_CONTROL_CHANNEL_CAPACITY, DEFAULT_GRACEFUL_SHUTDOWN,
 };
 pub use snapshot::{
     action_kind_str, AvoidEntrySnapshot, DaemonHealthSnapshot, DaemonLifecycleSnapshot,

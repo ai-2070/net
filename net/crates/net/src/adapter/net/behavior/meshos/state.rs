@@ -838,10 +838,7 @@ mod tests {
             THIS_NODE,
         );
         assert!(state.freeze_until.is_some());
-        state.apply(
-            &MeshOsEvent::AdminEvent(AdminEvent::ThawCluster),
-            THIS_NODE,
-        );
+        state.apply(&MeshOsEvent::AdminEvent(AdminEvent::ThawCluster), THIS_NODE);
         assert!(state.freeze_until.is_none());
     }
 
@@ -880,10 +877,7 @@ mod tests {
     fn thaw_is_idempotent_when_no_freeze_in_effect() {
         const THIS_NODE: NodeId = 42;
         let mut state = MeshOsState::default();
-        state.apply(
-            &MeshOsEvent::AdminEvent(AdminEvent::ThawCluster),
-            THIS_NODE,
-        );
+        state.apply(&MeshOsEvent::AdminEvent(AdminEvent::ThawCluster), THIS_NODE);
         assert!(state.freeze_until.is_none());
     }
 
@@ -913,7 +907,11 @@ mod tests {
             }),
             THIS_NODE,
         );
-        assert_eq!(state.avoid_list.len(), 3, "Local{{other}} should not flush this node");
+        assert_eq!(
+            state.avoid_list.len(),
+            3,
+            "Local{{other}} should not flush this node"
+        );
 
         // Fold on the actual target — clears the list.
         state.apply(
@@ -989,10 +987,7 @@ mod tests {
             }),
             THIS_NODE,
         );
-        assert_eq!(
-            state.forced_evictions,
-            vec![(100u64, 7u64), (200u64, 9u64)]
-        );
+        assert_eq!(state.forced_evictions, vec![(100u64, 7u64), (200u64, 9u64)]);
     }
 
     #[test]

@@ -180,9 +180,8 @@ impl MaintenanceStateView {
             MaintenanceState::EnteringMaintenance { since, deadline } => {
                 Self::EnteringMaintenance {
                     since_ms: now.saturating_duration_since(*since).as_millis() as u64,
-                    deadline_remaining_ms: deadline.map(|d| {
-                        d.saturating_duration_since(now).as_millis() as u64
-                    }),
+                    deadline_remaining_ms: deadline
+                        .map(|d| d.saturating_duration_since(now).as_millis() as u64),
                 }
             }
             MaintenanceState::Maintenance { since } => Self::Maintenance {
@@ -236,11 +235,7 @@ impl DaemonControlRouter {
 
     /// Register a daemon's control channel. Returns the receiver
     /// the SDK hands to the daemon handle.
-    fn register(
-        &self,
-        daemon_id: u64,
-        capacity: usize,
-    ) -> mpsc::Receiver<DaemonControl> {
+    fn register(&self, daemon_id: u64, capacity: usize) -> mpsc::Receiver<DaemonControl> {
         let (tx, rx) = mpsc::channel(capacity);
         let slot = Arc::new(DaemonControlSlot {
             tx,
@@ -257,9 +252,7 @@ impl DaemonControlRouter {
     fn unregister(&self, daemon_id: u64) {
         let removed = self.inner.write().remove(&daemon_id);
         if let Some(removed) = removed {
-            self.broadcast
-                .write()
-                .retain(|s| !Arc::ptr_eq(s, &removed));
+            self.broadcast.write().retain(|s| !Arc::ptr_eq(s, &removed));
         }
     }
 
@@ -320,10 +313,7 @@ impl<D: ActionDispatcher> SdkRoutingDispatcher<D> {
 }
 
 impl<D: ActionDispatcher> ActionDispatcher for SdkRoutingDispatcher<D> {
-    fn dispatch<'a>(
-        &'a self,
-        action: MeshOsAction,
-    ) -> BoxFuture<'a, Result<(), DispatchError>> {
+    fn dispatch<'a>(&'a self, action: MeshOsAction) -> BoxFuture<'a, Result<(), DispatchError>> {
         let router = self.router.clone();
         let action_clone = action.clone();
         let inner = Arc::clone(&self.inner);
@@ -480,8 +470,12 @@ impl MeshOsDaemonHandle {
         // Inject a shutdown event so the daemon's `next_control`
         // loop wakes up.
         let grace_ms = grace.as_millis() as u64;
-        self.router
-            .route(self.daemon_id, DaemonControl::Shutdown { grace_period_ms: grace_ms });
+        self.router.route(
+            self.daemon_id,
+            DaemonControl::Shutdown {
+                grace_period_ms: grace_ms,
+            },
+        );
         // Wait for the grace window; daemons that exit early
         // can drop their handle to short-circuit (Drop runs
         // unregister too).
@@ -532,10 +526,7 @@ impl MeshOsDaemonSdk {
     /// One-call setup. Wraps the user's dispatcher in
     /// [`SdkRoutingDispatcher`]; starts the runtime; retains
     /// the router for per-daemon registration.
-    pub fn start<D: ActionDispatcher>(
-        config: MeshOsConfig,
-        user_dispatcher: Arc<D>,
-    ) -> Self {
+    pub fn start<D: ActionDispatcher>(config: MeshOsConfig, user_dispatcher: Arc<D>) -> Self {
         let router = DaemonControlRouter::new();
         let routed = Arc::new(SdkRoutingDispatcher::new(user_dispatcher, router.clone()));
         let sink: Arc<dyn super::control::ControlSink> =
@@ -742,8 +733,7 @@ mod tests {
             CapabilityFilter::default()
         }
         fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
-            self.process_count
-                .fetch_add(1, Ordering::Relaxed);
+            self.process_count.fetch_add(1, Ordering::Relaxed);
             Ok(Vec::new())
         }
     }
@@ -782,7 +772,9 @@ mod tests {
         let ev = rx.try_recv().expect("event present");
         assert!(matches!(
             ev,
-            DaemonControl::Shutdown { grace_period_ms: 5000 }
+            DaemonControl::Shutdown {
+                grace_period_ms: 5000
+            }
         ));
     }
 
@@ -790,15 +782,9 @@ mod tests {
     async fn control_router_drops_when_channel_full() {
         let router = DaemonControlRouter::new();
         let _rx = router.register(99, 1);
-        router.route(
-            99,
-            DaemonControl::BackpressureOn { level: 0.5 },
-        );
+        router.route(99, DaemonControl::BackpressureOn { level: 0.5 });
         // Second push exceeds capacity 1 → drop.
-        router.route(
-            99,
-            DaemonControl::BackpressureOn { level: 0.8 },
-        );
+        router.route(99, DaemonControl::BackpressureOn { level: 0.8 });
         assert_eq!(router.total_dropped(), 1);
     }
 
@@ -852,10 +838,7 @@ mod tests {
         router.unregister(7);
         // Subsequent dispatch against 7 is a no-op — no panic,
         // no drop counter increment (the slot is gone).
-        router.route(
-            7,
-            DaemonControl::Shutdown { grace_period_ms: 1 },
-        );
+        router.route(7, DaemonControl::Shutdown { grace_period_ms: 1 });
         assert_eq!(router.total_dropped(), 0);
     }
 
@@ -887,22 +870,15 @@ mod tests {
         let mut handle = sdk.register_daemon(Box::new(daemon), kp).unwrap();
         // Spawn a task that consumes one control event, mimicking
         // a real daemon loop.
-        let mut control_rx = std::mem::replace(
-            &mut handle.control_rx,
-            mpsc::channel::<DaemonControl>(1).1,
-        );
+        let mut control_rx =
+            std::mem::replace(&mut handle.control_rx, mpsc::channel::<DaemonControl>(1).1);
         let received = tokio::spawn(async move { control_rx.recv().await });
         // graceful_shutdown injects a Shutdown event + parks for
         // the grace window. Use a short grace to keep the test
         // fast.
-        let _ = handle
-            .graceful_shutdown(Duration::from_millis(50))
-            .await;
+        let _ = handle.graceful_shutdown(Duration::from_millis(50)).await;
         let ev = received.await.unwrap();
-        assert!(matches!(
-            ev,
-            Some(DaemonControl::Shutdown { .. })
-        ));
+        assert!(matches!(ev, Some(DaemonControl::Shutdown { .. })));
         let _ = sdk.shutdown().await;
     }
 

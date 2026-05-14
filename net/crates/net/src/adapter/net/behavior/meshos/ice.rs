@@ -206,21 +206,20 @@ impl OperatorRegistry {
     /// [`VerifyError::NotAuthorized`] for an unknown operator,
     /// [`VerifyError::InvalidSignature`] for a malformed or
     /// tampered signature.
-    pub fn verify(
-        &self,
-        signature: &OperatorSignature,
-        payload: &[u8],
-    ) -> Result<(), VerifyError> {
-        let entity_id = self
-            .keys
-            .get(&signature.operator_id)
-            .ok_or(VerifyError::NotAuthorized {
-                operator_id: signature.operator_id,
-            })?;
+    pub fn verify(&self, signature: &OperatorSignature, payload: &[u8]) -> Result<(), VerifyError> {
+        let entity_id =
+            self.keys
+                .get(&signature.operator_id)
+                .ok_or(VerifyError::NotAuthorized {
+                    operator_id: signature.operator_id,
+                })?;
         let sig_bytes: &[u8; 64] = signature.signature.as_slice().try_into().map_err(|_| {
             VerifyError::InvalidSignature {
                 operator_id: signature.operator_id,
-                reason: format!("signature is not 64 bytes (got {})", signature.signature.len()),
+                reason: format!(
+                    "signature is not 64 bytes (got {})",
+                    signature.signature.len()
+                ),
             }
         })?;
         let ed_sig = ed25519_dalek::Signature::from_bytes(sig_bytes);
@@ -539,7 +538,9 @@ pub fn simulate(snapshot: &MeshOsSnapshot, proposal: &IceActionProposal) -> Blas
     match proposal {
         IceActionProposal::FreezeCluster { ttl } => simulate_freeze(snapshot, *ttl),
         IceActionProposal::ThawCluster => simulate_thaw(snapshot),
-        IceActionProposal::FlushAvoidLists { scope } => simulate_flush_avoid_lists(snapshot, *scope),
+        IceActionProposal::FlushAvoidLists { scope } => {
+            simulate_flush_avoid_lists(snapshot, *scope)
+        }
         IceActionProposal::ForceEvictReplica { chain, victim } => {
             simulate_force_evict_replica(snapshot, *chain, *victim)
         }
@@ -636,10 +637,7 @@ fn simulate_force_evict_replica(
     }
 }
 
-fn simulate_force_restart_daemon(
-    snapshot: &MeshOsSnapshot,
-    daemon: &DaemonRef,
-) -> BlastRadius {
+fn simulate_force_restart_daemon(snapshot: &MeshOsSnapshot, daemon: &DaemonRef) -> BlastRadius {
     let mut warnings = vec![BlastWarning::ForcedRestartBypassesBackoff {
         daemon_id: daemon.id,
     }];
@@ -851,7 +849,10 @@ mod tests {
         let err = verifier.verify_commit(&proposal, &[sig]).unwrap_err();
         assert!(matches!(
             err,
-            VerifyError::InsufficientSignatures { got: 1, required: 2 }
+            VerifyError::InsufficientSignatures {
+                got: 1,
+                required: 2
+            }
         ));
     }
 
@@ -961,16 +962,13 @@ mod tests {
         );
         assert_eq!(blast.affected_replicas, vec![100]);
         assert_eq!(blast.affected_nodes, vec![7]);
-        assert!(blast
-            .warnings
-            .iter()
-            .any(|w| matches!(
-                w,
-                BlastWarning::ForcedEvictionBypassesCooldown {
-                    chain: 100,
-                    victim: 7
-                }
-            )));
+        assert!(blast.warnings.iter().any(|w| matches!(
+            w,
+            BlastWarning::ForcedEvictionBypassesCooldown {
+                chain: 100,
+                victim: 7
+            }
+        )));
         // Non-zero placement disturbance.
         assert!(blast.placement_stability_delta > 0.0);
     }
@@ -1047,23 +1045,17 @@ mod tests {
         assert_eq!(blast.affected_daemons, vec![daemon]);
         assert!(blast.affected_nodes.is_empty());
         assert_eq!(blast.placement_stability_delta, 0.0);
-        assert!(blast
-            .warnings
-            .iter()
-            .any(|w| matches!(
-                w,
-                BlastWarning::ForcedRestartBypassesBackoff { daemon_id: 7 }
-            )));
+        assert!(blast.warnings.iter().any(|w| matches!(
+            w,
+            BlastWarning::ForcedRestartBypassesBackoff { daemon_id: 7 }
+        )));
         // No "unknown" or "not in backoff" warnings — the daemon
         // is observed AND in BackingOff.
-        assert!(blast
-            .warnings
-            .iter()
-            .all(|w| !matches!(
-                w,
-                BlastWarning::ForcedRestartTargetsUnknownDaemon { .. }
-                    | BlastWarning::ForcedRestartDaemonNotInBackoff { .. }
-            )));
+        assert!(blast.warnings.iter().all(|w| !matches!(
+            w,
+            BlastWarning::ForcedRestartTargetsUnknownDaemon { .. }
+                | BlastWarning::ForcedRestartDaemonNotInBackoff { .. }
+        )));
     }
 
     #[test]
@@ -1073,10 +1065,7 @@ mod tests {
             id: 99,
             name: "absent".into(),
         };
-        let blast = simulate(
-            &snap,
-            &IceActionProposal::ForceRestartDaemon { daemon },
-        );
+        let blast = simulate(&snap, &IceActionProposal::ForceRestartDaemon { daemon });
         assert!(blast.warnings.iter().any(|w| matches!(
             w,
             BlastWarning::ForcedRestartTargetsUnknownDaemon { daemon_id: 99 }

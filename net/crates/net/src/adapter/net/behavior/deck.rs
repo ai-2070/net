@@ -156,9 +156,7 @@ impl DeckError {
 impl From<MeshOsHandleError> for DeckError {
     fn from(err: MeshOsHandleError) -> Self {
         match err {
-            MeshOsHandleError::LoopClosed => {
-                Self::new("loop_closed", "MeshOS loop has exited")
-            }
+            MeshOsHandleError::LoopClosed => Self::new("loop_closed", "MeshOS loop has exited"),
             MeshOsHandleError::QueueFull => Self::new(
                 "queue_full",
                 "MeshOS source channel at capacity — back off + retry",
@@ -398,7 +396,10 @@ impl DeckClient {
         if predicate(&snap) {
             return snap;
         }
-        let interval = self.config.snapshot_poll_interval.max(Duration::from_millis(1));
+        let interval = self
+            .config
+            .snapshot_poll_interval
+            .max(Duration::from_millis(1));
         loop {
             tokio::time::sleep(interval).await;
             let snap = self.snapshot_reader.read();
@@ -495,11 +496,7 @@ impl AdminCommands<'_> {
     /// Drain `node`'s workload by `deadline`. Replicas migrate;
     /// daemons drain via [`crate::adapter::net::compute::DaemonControl::DrainStart`]
     /// once the loop sees the resulting `EnteringMaintenance` state.
-    pub async fn drain(
-        &self,
-        node: NodeId,
-        deadline: Instant,
-    ) -> Result<ChainCommit, AdminError> {
+    pub async fn drain(&self, node: NodeId, deadline: Instant) -> Result<ChainCommit, AdminError> {
         self.client
             .publish_admin(AdminEvent::Drain { node, deadline }, "drain")
             .await
@@ -522,10 +519,7 @@ impl AdminCommands<'_> {
     }
 
     /// End a maintenance window for `node`.
-    pub async fn exit_maintenance(
-        &self,
-        node: NodeId,
-    ) -> Result<ChainCommit, AdminError> {
+    pub async fn exit_maintenance(&self, node: NodeId) -> Result<ChainCommit, AdminError> {
         self.client
             .publish_admin(AdminEvent::ExitMaintenance { node }, "exit_maintenance")
             .await
@@ -558,10 +552,7 @@ impl AdminCommands<'_> {
     }
 
     /// Force a placement recompute for `node`.
-    pub async fn invalidate_placement(
-        &self,
-        node: NodeId,
-    ) -> Result<ChainCommit, AdminError> {
+    pub async fn invalidate_placement(&self, node: NodeId) -> Result<ChainCommit, AdminError> {
         self.client
             .publish_admin(
                 AdminEvent::InvalidatePlacement { node },
@@ -571,10 +562,7 @@ impl AdminCommands<'_> {
     }
 
     /// Force-restart every daemon on `node`.
-    pub async fn restart_all_daemons(
-        &self,
-        node: NodeId,
-    ) -> Result<ChainCommit, AdminError> {
+    pub async fn restart_all_daemons(&self, node: NodeId) -> Result<ChainCommit, AdminError> {
         self.client
             .publish_admin(
                 AdminEvent::RestartAllDaemons { node },
@@ -584,10 +572,7 @@ impl AdminCommands<'_> {
     }
 
     /// Clear `node`'s local avoid list.
-    pub async fn clear_avoid_list(
-        &self,
-        node: NodeId,
-    ) -> Result<ChainCommit, AdminError> {
+    pub async fn clear_avoid_list(&self, node: NodeId) -> Result<ChainCommit, AdminError> {
         self.client
             .publish_admin(AdminEvent::ClearAvoidList { node }, "clear_avoid_list")
             .await
@@ -605,10 +590,7 @@ impl AdminCommands<'_> {
     /// Phase 3 lifts this onto a dedicated `IceCommands` surface
     /// with the proposal / simulate / multi-operator-sign
     /// discipline the plan locks in.
-    pub async fn freeze_cluster(
-        &self,
-        ttl: Duration,
-    ) -> Result<ChainCommit, AdminError> {
+    pub async fn freeze_cluster(&self, ttl: Duration) -> Result<ChainCommit, AdminError> {
         self.client
             .publish_admin(AdminEvent::FreezeCluster { ttl }, "freeze_cluster")
             .await
@@ -665,25 +647,15 @@ impl<'a> IceCommands<'a> {
     /// Propose flushing avoid-list entries under `scope`.
     /// See [`super::meshos::ice::IceActionProposal::FlushAvoidLists`]
     /// for the three scope semantics.
-    pub fn flush_avoid_lists(
-        &self,
-        scope: super::meshos::AvoidScope,
-    ) -> IceProposal<'a> {
-        IceProposal::new(
-            self.client,
-            IceActionProposal::FlushAvoidLists { scope },
-        )
+    pub fn flush_avoid_lists(&self, scope: super::meshos::AvoidScope) -> IceProposal<'a> {
+        IceProposal::new(self.client, IceActionProposal::FlushAvoidLists { scope })
     }
 
     /// Propose force-evicting `victim` from `chain` bypassing
     /// the scheduler's rebalance cooldown. Only the chain's
     /// elected leader emits the resulting `RequestEviction`
     /// action; non-leader nodes fold the admin event silently.
-    pub fn force_evict_replica(
-        &self,
-        chain: ChainId,
-        victim: NodeId,
-    ) -> IceProposal<'a> {
+    pub fn force_evict_replica(&self, chain: ChainId, victim: NodeId) -> IceProposal<'a> {
         IceProposal::new(
             self.client,
             IceActionProposal::ForceEvictReplica { chain, victim },
@@ -694,10 +666,7 @@ impl<'a> IceCommands<'a> {
     /// supervisor backoff gate so reconcile fires `StartDaemon`
     /// on the next tick. No-op if the daemon is already in
     /// `Idle` backoff state.
-    pub fn force_restart_daemon(
-        &self,
-        daemon: super::meshos::DaemonRef,
-    ) -> IceProposal<'a> {
+    pub fn force_restart_daemon(&self, daemon: super::meshos::DaemonRef) -> IceProposal<'a> {
         IceProposal::new(
             self.client,
             IceActionProposal::ForceRestartDaemon { daemon },
@@ -759,10 +728,7 @@ impl<'a> IceProposal<'a> {
     /// a future slice — until then the SDK enforces the threshold
     /// locally and accepts placeholder [`OperatorSignature`]
     /// payloads.
-    pub async fn commit(
-        self,
-        signatures: &[OperatorSignature],
-    ) -> Result<ChainCommit, IceError> {
+    pub async fn commit(self, signatures: &[OperatorSignature]) -> Result<ChainCommit, IceError> {
         if !self.simulated.get() {
             return Err(IceError::new(
                 "simulation_required",
@@ -790,7 +756,9 @@ impl<'a> IceProposal<'a> {
             // skipped this gate gets rejected by the loop.
             let payload = ice_proposal_signing_payload(&self.action);
             for sig in signatures {
-                registry.verify(sig, &payload).map_err(verify_error_to_ice)?;
+                registry
+                    .verify(sig, &payload)
+                    .map_err(verify_error_to_ice)?;
             }
             // Route via SignedIceCommit so the substrate verifier
             // sees the bundle. The inner AdminEvent folds only
@@ -819,10 +787,7 @@ impl<'a> IceProposal<'a> {
                 IceActionProposal::ThawCluster => admin.thaw_cluster().await,
                 IceActionProposal::FlushAvoidLists { scope } => {
                     self.client
-                        .publish_admin(
-                            AdminEvent::FlushAvoidLists { scope },
-                            "flush_avoid_lists",
-                        )
+                        .publish_admin(AdminEvent::FlushAvoidLists { scope }, "flush_avoid_lists")
                         .await
                 }
                 IceActionProposal::ForceEvictReplica { chain, victim } => {
@@ -1101,11 +1066,12 @@ mod tests {
         use futures::StreamExt;
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(20),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
 
         let mut stream = deck.snapshots();
         // First tick lands immediately (tokio::time::interval
@@ -1127,11 +1093,12 @@ mod tests {
         use futures::StreamExt;
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(15),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
 
         let _ = deck.admin().enter_maintenance(42, None).await.unwrap();
 
@@ -1208,11 +1175,12 @@ mod tests {
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
         // Bump threshold above what we'll supply.
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(100),
                 ice_signature_threshold: 2,
-            });
+            },
+        );
         let proposal = deck.ice().freeze_cluster(Duration::from_secs(10));
         let _blast = proposal.simulate().await.expect("simulate");
         let sig = deck.identity().sign_proposal(proposal.action());
@@ -1258,13 +1226,10 @@ mod tests {
         let proposal = deck.ice().thaw_cluster();
         let blast = proposal.simulate().await.expect("simulate");
         // Simulator on a non-frozen snapshot warns "no freeze to cancel."
-        assert!(blast
-            .warnings
-            .iter()
-            .any(|w| matches!(
-                w,
-                crate::adapter::net::behavior::meshos::BlastWarning::ThawHasNoFreezeToCancel
-            )));
+        assert!(blast.warnings.iter().any(|w| matches!(
+            w,
+            crate::adapter::net::behavior::meshos::BlastWarning::ThawHasNoFreezeToCancel
+        )));
         let _ = runtime.shutdown().await;
     }
 
@@ -1411,22 +1376,15 @@ mod tests {
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
-        let proposal = deck
-            .ice()
-            .flush_avoid_lists(AvoidScope::OnPeer { peer: 5 });
+        let proposal = deck.ice().flush_avoid_lists(AvoidScope::OnPeer { peer: 5 });
         let blast = proposal.simulate().await.expect("simulate");
         // OnPeer scope flushes everywhere; without registered
         // peers in the snapshot the affected_nodes list is
         // empty but the warning still fires.
-        assert!(blast
-            .warnings
-            .iter()
-            .any(|w| matches!(
-                w,
-                crate::adapter::net::behavior::meshos::BlastWarning::AvoidFlushRecoversPeer {
-                    peer: 5
-                }
-            )));
+        assert!(blast.warnings.iter().any(|w| matches!(
+            w,
+            crate::adapter::net::behavior::meshos::BlastWarning::AvoidFlushRecoversPeer { peer: 5 }
+        )));
         // commit through the unsigned path (no registry installed).
         let sig = deck.identity().sign_proposal(proposal.action());
         let commit = proposal.commit(&[sig]).await.expect("commit");
@@ -1480,11 +1438,12 @@ mod tests {
     async fn watch_resolves_when_predicate_becomes_true_after_admin_commit() {
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(10),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
 
         // Spawn a watcher that waits for a freeze.
         let deck_handle = deck.snapshot_reader.clone();
@@ -1497,13 +1456,8 @@ mod tests {
             // a real consumer would `Arc::clone` the outer
             // handle, but spawning shows the watch is non-
             // blocking on the SDK level.
-            let client =
-                DeckClient::new(handle, deck_handle.clone(), identity, config);
-            tokio::spawn(async move {
-                client
-                    .watch(|s| s.freeze_remaining_ms.is_some())
-                    .await
-            })
+            let client = DeckClient::new(handle, deck_handle.clone(), identity, config);
+            tokio::spawn(async move { client.watch(|s| s.freeze_remaining_ms.is_some()).await })
         };
 
         // Wait a beat so the watcher is in its sleep loop.
@@ -1525,14 +1479,18 @@ mod tests {
     async fn watch_timeout_returns_watch_timeout_error_when_predicate_never_holds() {
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
-        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
-            .with_config(DeckClientConfig {
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
                 snapshot_poll_interval: Duration::from_millis(10),
                 ..DeckClientConfig::default()
-            });
+            },
+        );
 
         let err = deck
-            .watch_timeout(|s| s.freeze_remaining_ms.is_some(), Duration::from_millis(80))
+            .watch_timeout(
+                |s| s.freeze_remaining_ms.is_some(),
+                Duration::from_millis(80),
+            )
             .await
             .expect_err("predicate never holds, should time out");
         assert_eq!(err.kind, "watch_timeout");
@@ -1696,7 +1654,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let around_now = deck.audit().between(now_ms - 10_000, now_ms + 10_000).collect();
+        let around_now = deck
+            .audit()
+            .between(now_ms - 10_000, now_ms + 10_000)
+            .collect();
         assert_eq!(around_now.len(), 1);
         let _ = runtime.shutdown().await;
     }
