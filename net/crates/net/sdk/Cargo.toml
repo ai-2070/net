@@ -83,12 +83,20 @@ groups = ["compute"]
 # `compute` for the `MeshDaemon` trait + `EntityKeypair`,
 # and on `net/meshos` for the actual runtime.
 meshos = ["compute", "net/meshos"]
+# Deck SDK — operator-side surface (the dual of `meshos`).
+# Re-exports `behavior::deck` with `DeckClient`, `AdminCommands`,
+# `SnapshotStream`, and the `OperatorIdentity` newtype. Builds
+# on `meshos` for the runtime + snapshot reader. Phase 1 surface
+# only — `audit()` / `subscribe_logs()` / `ice()` land in later
+# slices as the substrate's signed admin chain + blast-radius
+# simulator come online.
+deck = ["meshos"]
 # Everything that runs locally (mesh + storage/state + security +
 # compute + groups, no external transports). The default shape for
 # a single-node or LAN-only deployment.
 local = ["net", "cortex", "compute", "groups"]
 # Everything — local stack plus external transports.
-full = ["local", "redis", "jetstream", "meshos"]
+full = ["local", "redis", "jetstream", "meshos", "deck"]
 
 # nRPC quickstart — requires net + cortex.
 [[example]]

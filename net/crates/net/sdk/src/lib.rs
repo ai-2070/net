@@ -39,6 +39,8 @@ pub mod compute;
 pub mod config;
 #[cfg(feature = "cortex")]
 pub mod cortex;
+#[cfg(feature = "deck")]
+pub mod deck;
 pub mod error;
 #[cfg(feature = "groups")]
 pub mod groups;

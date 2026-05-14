@@ -1,0 +1,126 @@
+//! End-to-end integration tests for the Deck SDK's Phase 1
+//! surface — `DeckClient` → `AdminCommands` → in-process
+//! `MeshOsRuntime` → snapshot reflects the post-commit state.
+//!
+//! Each test pins one contract on the operator pipeline. The
+//! per-module unit tests in `behavior::deck::tests` cover the
+//! shape of each type; this file pins the cross-component
+//! contract Deck-the-binary will compose against.
+//!
+//! Run: `cargo test --features meshos --test deck_pipeline`
+
+#![cfg(feature = "meshos")]
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::StreamExt;
+
+use net::adapter::net::behavior::deck::{
+    AdminError, DeckClient, DeckClientConfig, OperatorIdentity,
+};
+use net::adapter::net::behavior::meshos::{
+    LoggingDispatcher, MaintenanceStateSnapshot, MeshOsConfig, MeshOsRuntime,
+};
+
+const THIS_NODE: u64 = 200;
+
+fn fast_config() -> MeshOsConfig {
+    MeshOsConfig::default()
+        .with_this_node(THIS_NODE)
+        .with_tick_interval(Duration::from_millis(15))
+        .with_event_queue_capacity(64)
+        .with_action_queue_capacity(64)
+}
+
+#[tokio::test]
+async fn deck_client_enter_maintenance_flows_through_to_snapshot() {
+    // Operator workflow: load identity, build a client, issue
+    // `enter_maintenance`, observe the snapshot stream surface
+    // the resulting `EnteringMaintenance` (or downstream) state.
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let runtime = MeshOsRuntime::start(fast_config(), Arc::clone(&dispatcher));
+    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+        .with_config(DeckClientConfig {
+            snapshot_poll_interval: Duration::from_millis(20),
+        });
+
+    let commit = deck
+        .admin()
+        .enter_maintenance(THIS_NODE, None)
+        .await
+        .expect("admin commit");
+    assert_eq!(commit.event_kind(), "enter_maintenance");
+    assert_eq!(commit.operator_id(), deck.identity().operator_id());
+
+    let mut stream = deck.snapshots();
+    let mut saw_non_active = false;
+    for _ in 0..20 {
+        let snap = stream
+            .next()
+            .await
+            .expect("stream item")
+            .expect("snapshot ok");
+        if !matches!(snap.local_maintenance, MaintenanceStateSnapshot::Active) {
+            saw_non_active = true;
+            break;
+        }
+    }
+    assert!(
+        saw_non_active,
+        "snapshot stream should have surfaced a non-Active local_maintenance",
+    );
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn deck_client_drop_replicas_lands_admin_event_on_loop() {
+    // We don't yet have a chain-side audit of "this admin event
+    // landed"; the loop accepting the event without LoopClosed
+    // is the Phase 1 observable contract.
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+    let commit = deck
+        .admin()
+        .drop_replicas(THIS_NODE, vec![10, 20, 30])
+        .await
+        .expect("commit");
+    assert_eq!(commit.event_kind(), "drop_replicas");
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn deck_client_commit_after_shutdown_surfaces_loop_closed() {
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+    let _ = runtime.shutdown().await;
+    let err: AdminError = deck
+        .admin()
+        .cordon(THIS_NODE)
+        .await
+        .expect_err("post-shutdown publish should fail");
+    assert_eq!(err.kind, "loop_closed");
+}
+
+#[tokio::test]
+async fn deck_client_two_commits_carry_monotonic_commit_ids() {
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+    let a = deck.admin().cordon(THIS_NODE).await.unwrap();
+    let b = deck.admin().uncordon(THIS_NODE).await.unwrap();
+    let c = deck
+        .admin()
+        .invalidate_placement(THIS_NODE)
+        .await
+        .unwrap();
+
+    assert!(b.commit_id() > a.commit_id());
+    assert!(c.commit_id() > b.commit_id());
+    assert_eq!(c.operator_id(), a.operator_id());
+    let _ = runtime.shutdown().await;
+}
