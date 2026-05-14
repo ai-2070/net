@@ -22,8 +22,8 @@ export type DocsOrderConfig = {
 
 // Reorders `items` by the slugs listed in `order`. Listed items come first
 // in the given order; unlisted items keep their incoming (alpha) order and
-// are appended after. Slug comparison is case-insensitive so the config
-// can use any casing.
+// are appended after. Slug comparison is normalized (case-insensitive and
+// `_`/`-` interchangeable) so the config can be authored in either form.
 function applyOrder<T>(
   items: T[],
   order: string[] | undefined,
@@ -31,32 +31,33 @@ function applyOrder<T>(
 ): T[] {
   if (!order || order.length === 0) return items;
   const map = new Map<string, T>();
-  for (const item of items) map.set(key(item).toLowerCase(), item);
+  for (const item of items) map.set(normalizeSlug(key(item)), item);
   const out: T[] = [];
   const used = new Set<string>();
   for (const k of order) {
-    const lower = k.toLowerCase();
-    const item = map.get(lower);
+    const nk = normalizeSlug(k);
+    const item = map.get(nk);
     if (item !== undefined) {
       out.push(item);
-      used.add(lower);
+      used.add(nk);
     }
   }
   for (const item of items) {
-    if (!used.has(key(item).toLowerCase())) out.push(item);
+    if (!used.has(normalizeSlug(key(item)))) out.push(item);
   }
   return out;
 }
 
-// Case-insensitive lookup of a per-folder order list. The config keys are
-// user-authored so we tolerate any casing (`releases` / `Releases` / `RELEASES`
-// all work for the same folder).
+// Normalized lookup of a per-folder order list. Config keys are user-authored
+// so we tolerate any casing and either `_` or `-` as separators (`Releases`,
+// `releases`, `RELEASES`, and `release-notes` vs `release_notes` all match
+// equivalently).
 function folderOrder(folderKey: string): string[] | undefined {
   const cfg = DOCS_ORDER.folders;
   if (!cfg) return undefined;
-  const lower = folderKey.toLowerCase();
+  const target = normalizeSlug(folderKey);
   for (const k of Object.keys(cfg)) {
-    if (k.toLowerCase() === lower) return cfg[k];
+    if (normalizeSlug(k) === target) return cfg[k];
   }
   return undefined;
 }
@@ -64,16 +65,16 @@ function folderOrder(folderKey: string): string[] | undefined {
 function isHidden(slug: string[]): boolean {
   const cfg = DOCS_ORDER.hide;
   if (!cfg || cfg.length === 0) return false;
-  const key = slug.join("/").toLowerCase();
-  return cfg.some((h) => h.toLowerCase() === key);
+  const target = normalizeSlug(slug.join("/"));
+  return cfg.some((h) => normalizeSlug(h) === target);
 }
 
 function customLabel(slug: string[]): string | undefined {
   const cfg = DOCS_ORDER.labels;
   if (!cfg) return undefined;
-  const key = slug.join("/").toLowerCase();
+  const target = normalizeSlug(slug.join("/"));
   for (const k of Object.keys(cfg)) {
-    if (k.toLowerCase() === key) return cfg[k];
+    if (normalizeSlug(k) === target) return cfg[k];
   }
   return undefined;
 }
@@ -113,8 +114,15 @@ function stripMdExt(name: string): string {
   return name.replace(/\.md$/i, "");
 }
 
+// Lowercase + collapse any run of `_` or `-` into a single `-`. This is what
+// appears in URLs under `/docs/...`. Used for both filenames and folder names
+// so the URL form stays consistent regardless of how files were named on disk.
+function normalizeSlug(s: string): string {
+  return s.toLowerCase().replace(/[_-]+/g, "-");
+}
+
 function slugSegment(name: string): string {
-  return stripMdExt(name).toLowerCase();
+  return normalizeSlug(stripMdExt(name));
 }
 
 // "releases" → "Releases", "example-title" → "Example Title",
@@ -142,7 +150,7 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
     const entryPath = join(absPath, entry);
     const stat = statSync(entryPath);
     if (stat.isDirectory()) {
-      const childSlug = [...slugChain, entry.toLowerCase()];
+      const childSlug = [...slugChain, normalizeSlug(entry)];
       if (isHidden(childSlug)) continue;
       folders.push(buildFolder(entryPath, childSlug));
     } else if (stat.isFile() && entry.toLowerCase().endsWith(".md")) {
@@ -192,7 +200,7 @@ export function getDocTree(): DocTree {
     const entryPath = join(DOCS_ROOT, entry);
     const stat = statSync(entryPath);
     if (stat.isDirectory()) {
-      const childSlug = [entry.toLowerCase()];
+      const childSlug = [normalizeSlug(entry)];
       if (isHidden(childSlug)) continue;
       folders.push(buildFolder(entryPath, childSlug));
     } else if (stat.isFile() && entry.toLowerCase().endsWith(".md")) {
@@ -230,13 +238,17 @@ export function resolveDoc(slug: string[]): ResolvedDoc | null {
     return null;
   }
 
+  // Normalize incoming segments so callers can pass either underscore or
+  // dash forms (defensive — static-param-generated URLs are already
+  // normalized).
+  const norm = slug.map(normalizeSlug);
   let folders: DocFolder[] = tree.folders;
   let files: DocFile[] = tree.rootFiles;
   let currentFolder: DocFolder | undefined;
 
-  for (let i = 0; i < slug.length; i++) {
-    const segment = slug[i]!;
-    const isLast = i === slug.length - 1;
+  for (let i = 0; i < norm.length; i++) {
+    const segment = norm[i]!;
+    const isLast = i === norm.length - 1;
 
     if (isLast) {
       const file = files.find((f) => lastSlug(f) === segment);
