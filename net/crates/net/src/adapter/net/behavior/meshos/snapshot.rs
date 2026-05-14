@@ -285,6 +285,14 @@ pub struct PendingActionSnapshot {
 /// [`RECENT_FAILURES_CAPACITY`].
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FailureRecord {
+    /// Monotonic per-runtime sequence number. Strictly
+    /// increasing across the live executor's writes — the
+    /// Deck SDK's failure-tail stream uses this for dedup
+    /// across snapshot polls. Records constructed by the
+    /// chain-replay path (`chain::push_failure`) carry `0`;
+    /// only live executor-produced records have meaningful
+    /// seqs.
+    pub seq: u64,
     /// Source — `"daemon:foo"`, `"drain:node_x"`, etc.
     pub source: String,
     /// Operator-readable reason.
@@ -519,6 +527,7 @@ pub fn failure_record(
         .unwrap_or(0);
     let recorded_at_ms = now_ms.saturating_sub(age.as_millis() as u64);
     FailureRecord {
+        seq: 0,
         source: source.into(),
         reason: reason.into(),
         recorded_at_ms,
@@ -557,6 +566,7 @@ mod tests {
         // `age_ms = 0`. It's now a Unix-epoch timestamp;
         // consumers compute the relative age locally.
         let r = FailureRecord {
+            seq: 1,
             source: "test".into(),
             reason: "boom".into(),
             recorded_at_ms: 1_000,

@@ -472,6 +472,22 @@ impl DeckClient {
         AuditQuery::new(self)
     }
 
+    /// Subscribe to the substrate's executor-failure ring.
+    /// Returns a [`FailureStream`] that tails each
+    /// [`super::meshos::FailureRecord`] as the executor records
+    /// it. Same seq-watermark dedup pattern as
+    /// [`AuditStream`] / [`LogStream`].
+    ///
+    /// `since_seq` seeds the initial watermark; passing `0`
+    /// (the default) tails new failures from "now" onwards.
+    pub fn subscribe_failures(&self, since_seq: u64) -> FailureStream {
+        FailureStream::new(
+            self.snapshot_reader.clone(),
+            self.config.snapshot_poll_interval,
+            since_seq,
+        )
+    }
+
     /// Subscribe to the substrate's per-node log ring with
     /// the given filter. Returns a [`LogStream`] that tails
     /// matching log lines as they arrive — same dedup pattern
@@ -1530,6 +1546,77 @@ impl Stream for LogStream {
     }
 }
 
+/// Failure-tail stream returned by
+/// [`DeckClient::subscribe_failures`]. Yields each new
+/// [`super::meshos::FailureRecord`] the executor records.
+/// Dedups across snapshot polls via the per-runtime
+/// monotonic `FailureRecord::seq` (same pattern as
+/// [`AuditStream`] / [`LogStream`]).
+///
+/// Chain-replay-derived failure records carry `seq = 0`;
+/// they're naturally skipped because the watermark logic
+/// is `seq > last_seq` and the initial watermark defaults
+/// to 0.
+pub struct FailureStream {
+    reader: super::meshos::MeshOsSnapshotReader,
+    interval: Interval,
+    last_seq: u64,
+    queued: std::collections::VecDeque<super::meshos::FailureRecord>,
+}
+
+impl FailureStream {
+    fn new(
+        reader: super::meshos::MeshOsSnapshotReader,
+        poll_interval: Duration,
+        initial_seq_watermark: u64,
+    ) -> Self {
+        let poll_interval = poll_interval.max(Duration::from_millis(1));
+        Self {
+            reader,
+            interval: interval(poll_interval),
+            last_seq: initial_seq_watermark,
+            queued: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl Stream for FailureStream {
+    type Item = Result<super::meshos::FailureRecord, DeckError>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        if let Some(record) = self.queued.pop_front() {
+            return Poll::Ready(Some(Ok(record)));
+        }
+        match self.interval.poll_tick(cx) {
+            Poll::Ready(_) => {
+                let snap = self.reader.read();
+                let last_seq = self.last_seq;
+                let mut max_seq = last_seq;
+                for record in snap.recent_failures.into_iter() {
+                    if record.seq <= last_seq {
+                        continue;
+                    }
+                    if record.seq > max_seq {
+                        max_seq = record.seq;
+                    }
+                    self.queued.push_back(record);
+                }
+                self.last_seq = max_seq;
+                if let Some(record) = self.queued.pop_front() {
+                    Poll::Ready(Some(Ok(record)))
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// Stream over the runtime's snapshot reader. Polls at the
 /// configured cadence; emits a `Result<MeshOsSnapshot, DeckError>`
 /// per poll. Phase 1 emits on every poll (consumers de-dupe if
@@ -2170,6 +2257,69 @@ mod tests {
             summary.local_maintenance_active,
             "local_maintenance_active should flip on after enter_maintenance",
         );
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_failures_yields_seeded_dispatcher_rejection() {
+        use crate::adapter::net::behavior::meshos::DispatchError;
+        use futures::StreamExt;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        dispatcher.fail_next(DispatchError::drop("first"));
+        let runtime = MeshOsRuntime::start(fast_config(), Arc::clone(&dispatcher));
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(15),
+                ..DeckClientConfig::default()
+            });
+        let mut stream = deck.subscribe_failures(0);
+
+        deck.admin().enter_maintenance(42, None).await.unwrap();
+
+        let record = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out")
+            .expect("closed")
+            .expect("ok");
+        // The executor stamps strictly-positive seqs; chain-
+        // replay-derived records carry seq=0.
+        assert!(record.seq > 0);
+        assert!(record.reason.contains("first"));
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_failures_since_seq_drops_already_seen() {
+        use crate::adapter::net::behavior::meshos::DispatchError;
+        use futures::StreamExt;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        dispatcher.fail_next(DispatchError::drop("first"));
+        let runtime = MeshOsRuntime::start(fast_config(), Arc::clone(&dispatcher));
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(15),
+                ..DeckClientConfig::default()
+            });
+
+        deck.admin().enter_maintenance(42, None).await.unwrap();
+        // Wait for the first failure to land on the ring.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut seq_seen = 0u64;
+        while std::time::Instant::now() < deadline {
+            let all = deck.recent_failures();
+            if let Some(r) = all.last() {
+                seq_seen = r.seq;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(seq_seen > 0);
+
+        // Subscribe with the seq already-seen as the
+        // watermark; no new failures => stream parks.
+        let mut stream = deck.subscribe_failures(seq_seen);
+        let parked = tokio::time::timeout(Duration::from_millis(60), stream.next()).await;
+        assert!(parked.is_err(), "no new failures means parked stream");
         let _ = runtime.shutdown().await;
     }
 

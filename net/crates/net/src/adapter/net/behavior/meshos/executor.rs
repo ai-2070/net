@@ -235,6 +235,11 @@ pub struct ActionExecutor<D: ActionDispatcher> {
     /// `ActionChainAppender` to be wired). Writer is the
     /// executor task; reader is the loop task on every publish.
     recent_failures: Arc<RwLock<VecDeque<FailureRecord>>>,
+    /// Monotonic counter the executor stamps onto every
+    /// `FailureRecord` it pushes. Same dedup primitive as the
+    /// admin audit ring's seq — the Deck SDK's
+    /// `subscribe_failures` stream uses it.
+    failure_seq: u64,
     stats: Arc<ExecutorStats>,
     /// Optional action-chain appender. Each admit/dispatch
     /// outcome appends an [`super::chain::ActionChainRecord`].
@@ -260,6 +265,7 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
             recent_failures: Arc::new(RwLock::new(VecDeque::with_capacity(
                 RECENT_FAILURES_CAPACITY,
             ))),
+            failure_seq: 0,
             stats: Arc::new(ExecutorStats::default()),
             chain_appender: Arc::new(NoOpActionChainAppender),
         }
@@ -476,11 +482,14 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        self.failure_seq += 1;
+        let seq = self.failure_seq;
         let mut ring = self.recent_failures.write();
         if ring.len() >= RECENT_FAILURES_CAPACITY {
             ring.pop_front();
         }
         ring.push_back(FailureRecord {
+            seq,
             source,
             reason,
             recorded_at_ms,

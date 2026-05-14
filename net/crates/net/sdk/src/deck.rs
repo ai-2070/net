@@ -41,8 +41,8 @@
 // `net_sdk::deck::*` path.
 pub use net::adapter::net::behavior::deck::{
     AdminCommands, AdminError, AuditQuery, AuditStream, ChainCommit, DaemonCounts, DeckClient,
-    DeckClientConfig, DeckError, IceCommands, IceError, IceProposal, LogFilter, LogStream,
-    OperatorIdentity, OperatorRegistry, OperatorSignature, PeerCounts, SnapshotStream,
+    DeckClientConfig, DeckError, FailureStream, IceCommands, IceError, IceProposal, LogFilter,
+    LogStream, OperatorIdentity, OperatorRegistry, OperatorSignature, PeerCounts, SnapshotStream,
     StatusSummary, StatusSummaryStream,
 };
 
