@@ -4269,7 +4269,12 @@ function DatafortsSection() {
 // toward a new equilibrium. Faint matrix rain falls behind everything.
 // =========================================================================
 
-type MeshCapability = "gpu" | "vram" | "region" | "colo" | "data";
+type MeshCapability =
+  | "device"
+  | "compute"
+  | "region"
+  | "daemon"
+  | "datafort";
 
 interface AutoMeshNode {
   id: number;
@@ -4352,39 +4357,39 @@ function autoMeshLayout(width: number): AutoMeshLayout {
 
 function pickCapability(): MeshCapability {
   const r = Math.random();
-  if (r < 0.18) return "data";
-  if (r < 0.4) return "gpu";
-  if (r < 0.6) return "vram";
+  if (r < 0.18) return "datafort";
+  if (r < 0.4) return "device";
+  if (r < 0.6) return "compute";
   if (r < 0.8) return "region";
-  return "colo";
+  return "daemon";
 }
 
 function capabilityRgb(cap: MeshCapability): string {
   switch (cap) {
-    case "gpu":
+    case "device":
       return "196, 255, 61";
-    case "vram":
+    case "compute":
       return "107, 138, 30";
     case "region":
       return "61, 240, 255";
-    case "colo":
+    case "daemon":
       return "212, 220, 208";
-    case "data":
+    case "datafort":
       return "255, 255, 255";
   }
 }
 
 function nodeGlyph(cap: MeshCapability): string {
   switch (cap) {
-    case "gpu":
+    case "device":
       return "◈";
-    case "vram":
+    case "compute":
       return "▣";
     case "region":
       return "◉";
-    case "colo":
+    case "daemon":
       return "◇";
-    case "data":
+    case "datafort":
       return "■";
   }
 }
@@ -4619,7 +4624,7 @@ function MeshAutoform() {
             const dataNodes: number[] = [];
             for (let i = 0; i < nodes.length; i++) {
               const n = nodes[i]!;
-              if (n.cap === "data" && i !== d.hostIdx) dataNodes.push(i);
+              if (n.cap === "datafort" && i !== d.hostIdx) dataNodes.push(i);
             }
             if (dataNodes.length > 0) {
               target = dataNodes[Math.floor(Math.random() * dataNodes.length)]!;
@@ -4639,8 +4644,8 @@ function MeshAutoform() {
           d.trail = [];
           const fromHex = nodes[d.fromIdx]?.hex ?? "????";
           const toHex = nodes[d.toIdx]?.hex ?? "????";
-          const toCap = nodes[d.toIdx]?.cap ?? "colo";
-          const isGravity = toCap === "data";
+          const toCap = nodes[d.toIdx]?.cap ?? "daemon";
+          const isGravity = toCap === "datafort";
           pushFeed(
             isGravity ? "⤵" : "↗",
             "rgb(61, 240, 255)",
@@ -4734,7 +4739,7 @@ function MeshAutoform() {
       const wellT = now / 1000;
       ctx.font = `${EDGE_FONT_PX}px ${AUTOMESH_MONO_FONT}`;
       for (const n of nodes) {
-        if (n.cap !== "data" || n.age < n.spawnDelay) continue;
+        if (n.cap !== "datafort" || n.age < n.spawnDelay) continue;
         for (let k = 0; k < 3; k++) {
           const phase = (wellT * 0.4 + n.id * 0.21 + k * 0.33) % 1;
           const r = 16 + phase * 64;
@@ -4990,13 +4995,13 @@ function MeshAutoform() {
           <span className="font-mono" style={{ color: "rgb(196, 255, 61)" }}>
             ◈
           </span>
-          gpu
+          device
         </span>
         <span className="flex items-center gap-2">
           <span className="font-mono" style={{ color: "rgb(107, 138, 30)" }}>
             ▣
           </span>
-          vram
+          compute
         </span>
         <span className="flex items-center gap-2">
           <span className="font-mono" style={{ color: "rgb(61, 240, 255)" }}>
@@ -5008,16 +5013,16 @@ function MeshAutoform() {
           <span className="font-mono" style={{ color: "rgb(212, 220, 208)" }}>
             ◇
           </span>
-          colo
+          daemon
         </span>
         <span className="flex items-center gap-2">
-          <span className="font-mono text-ink">■</span> data · gravity well
+          <span className="font-mono text-ink">■</span> datafort · gravity well
         </span>
         <span className="flex items-center gap-2 sm:ml-auto">
           <span className="font-mono" style={{ color: "rgb(61, 240, 255)" }}>
             ◆
           </span>
-          daemon · mikoshi
+          mikoshi · in transit
         </span>
       </div>
     </div>
@@ -5048,7 +5053,7 @@ const MESH_OS_CAPABILITY_STRIP: ReadonlyArray<{
   {
     num: "mesh.os.4",
     name: "Capability Match",
-    body: "nodes advertise what they can do — gpu, vram, region, colocation. MeshOS routes work to nodes that fit.",
+    body: "nodes advertise what they are — device, compute, region, daemon, datafort. MeshOS routes daemons to nodes that fit.",
   },
 ];
 
