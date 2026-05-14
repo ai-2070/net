@@ -291,17 +291,21 @@ impl MeshOsRuntime {
             log_appender,
             failure_appender,
             None,
+            None,
         )
     }
 
     /// Full-extensions constructor — every chain seam plus the
-    /// migration-abort dispatcher. Production deployments that
-    /// want a `KillMigration` chain commit to actually abort
-    /// the in-flight migration wire an
-    /// [`super::migration_aborter::OrchestratorMigrationAborter`]
-    /// here. Other `start_with_*` constructors forward with
-    /// `None` for this argument; the chain commit still lands
-    /// on the audit ring but the migration runs to completion.
+    /// migration-abort dispatcher and the migration-snapshot
+    /// source. Production deployments that want a
+    /// `KillMigration` chain commit to actually abort the
+    /// in-flight migration wire an
+    /// [`super::migration_aborter::OrchestratorMigrationAborter`];
+    /// to let the ICE blast-radius preview enumerate the
+    /// targeted daemon, also wire an
+    /// [`super::migration_snapshot_source::OrchestratorMigrationSnapshotSource`].
+    /// Both wrap the same `Arc<MigrationOrchestrator>` so a
+    /// single orchestrator handle covers both seams.
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_full_extensions<D: ActionDispatcher>(
         config: MeshOsConfig,
@@ -315,6 +319,9 @@ impl MeshOsRuntime {
         log_appender: Option<Arc<dyn super::log_chain::LogChainAppender>>,
         failure_appender: Option<Arc<dyn super::failure_chain::FailureChainAppender>>,
         migration_aborter: Option<Arc<dyn super::migration_aborter::MigrationAborter>>,
+        migration_snapshot_source: Option<
+            Arc<dyn super::migration_snapshot_source::MigrationSnapshotSource>,
+        >,
     ) -> Self {
         let super::event_loop::MeshOsLoopParts {
             mesh_loop,
@@ -355,6 +362,9 @@ impl MeshOsRuntime {
         }
         if let Some(aborter) = migration_aborter {
             mesh_loop = mesh_loop.with_migration_aborter(aborter);
+        }
+        if let Some(source) = migration_snapshot_source {
+            mesh_loop = mesh_loop.with_migration_snapshot_source(source);
         }
         let dropped_actions = mesh_loop.dropped_actions_counter();
         let loop_task = tokio::spawn(mesh_loop.run());
@@ -848,6 +858,7 @@ mod tests {
             None,
             None,
             Some(aborter.clone() as Arc<dyn MigrationAborter>),
+            None,
         );
         rt.handle()
             .publish(MeshOsEvent::AdminEvent(AdminEvent::KillMigration {
@@ -870,6 +881,59 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(aborter.captured(), vec![0xDEAD]);
+        let _ = rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn start_with_full_extensions_wires_migration_snapshot_source() {
+        use super::super::migration_snapshot_source::MigrationSnapshotSource;
+        use super::super::snapshot::{MigrationPhaseSnapshot, MigrationSnapshot};
+
+        struct OneMigrationSource;
+        impl MigrationSnapshotSource for OneMigrationSource {
+            fn list(&self) -> Vec<MigrationSnapshot> {
+                vec![MigrationSnapshot {
+                    daemon_origin: 0xABCD,
+                    phase: MigrationPhaseSnapshot::Cutover,
+                    elapsed_ms: 750,
+                }]
+            }
+        }
+
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let source: Arc<dyn MigrationSnapshotSource> = Arc::new(OneMigrationSource);
+        let rt = MeshOsRuntime::start_with_full_extensions(
+            fast_cfg(),
+            Arc::clone(&dispatcher),
+            ProbeRegistry::new(),
+            SchedulerRegistry::new(),
+            Arc::new(DaemonRegistry::new()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(source),
+        );
+        // Poll until the loop publishes a snapshot reflecting
+        // the source's contents.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = rt.snapshot();
+            if !snap.in_flight_migrations.is_empty() {
+                assert_eq!(snap.in_flight_migrations.len(), 1);
+                assert_eq!(snap.in_flight_migrations[0].daemon_origin, 0xABCD);
+                assert_eq!(snap.in_flight_migrations[0].elapsed_ms, 750);
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "snapshot did not pick up the source's in-flight migrations within 2s",
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let _ = rt.shutdown().await;
     }
 
