@@ -5186,15 +5186,7 @@ function MeshOsSection() {
 
       <MeshAutoform />
 
-      <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] my-12 max-w-[900px]">
-        <p className="text-[18px] text-ink leading-[1.5] font-light">
-          The cluster thinks.{" "}
-          <strong className="text-accent font-medium">The daemons move.</strong>{" "}
-          The work gets done.
-        </p>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 border-t border-l border-line">
+      <div className="mt-12 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 border-t border-l border-line">
         {MESH_OS_CAPABILITY_STRIP.map((c) => (
           <div
             key={c.name}
@@ -5216,6 +5208,15 @@ function MeshOsSection() {
             <p className="text-[11px] text-ink-dim leading-[1.55]">{c.body}</p>
           </div>
         ))}
+      </div>
+
+      <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] mt-12 max-w-[900px]">
+        <p className="text-[18px] text-ink leading-[1.5] font-light">
+          <strong className="text-accent font-medium">
+            MeshOS turns your mesh into a living system.
+          </strong>{" "}
+          The cluster adapts. The daemons move.
+        </p>
       </div>
     </section>
   );
