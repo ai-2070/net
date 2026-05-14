@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/meshos/event_loop.rs
+  s_6ba469f1921974::t_33b2da98ff36a9 756-784
+  s_6ba469f1921974::t_db41f0a9df83c8 838-862
+net/crates/net/tests/deck_pipeline.rs
+  s_6ba469f1921974::t_c4a0db69475be5 520-586
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "3172c591188bde633e04ba20e0518e36e8f34c5a",
+  "prompts": {},
+  "sessions": {
+    "s_6ba469f1921974": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3f6b48b8-94c5-47fd-9837-8991a8b4646e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
