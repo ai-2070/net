@@ -40,8 +40,9 @@
 // Re-export the substrate-side Deck types under a clean
 // `net_sdk::deck::*` path.
 pub use net::adapter::net::behavior::deck::{
-    AdminCommands, AdminError, ChainCommit, DeckClient, DeckClientConfig, DeckError, IceCommands,
-    IceError, IceProposal, OperatorIdentity, OperatorRegistry, OperatorSignature, SnapshotStream,
+    AdminCommands, AdminError, AuditQuery, ChainCommit, DeckClient, DeckClientConfig, DeckError,
+    IceCommands, IceError, IceProposal, OperatorIdentity, OperatorRegistry, OperatorSignature,
+    SnapshotStream,
 };
 
 // Supporting types operators need from the MeshOS surface to

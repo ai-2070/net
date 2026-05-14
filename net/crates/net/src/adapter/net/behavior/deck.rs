@@ -345,6 +345,18 @@ impl DeckClient {
         IceCommands { client: self }
     }
 
+    /// Build an [`AuditQuery`] reading the substrate's ICE
+    /// audit ring (every `SignedIceCommit` the loop's verifier
+    /// observed — accepted or rejected). Fluent builder: chain
+    /// `by_operator`, `between`, `force_only`, `recent` before
+    /// `collect()`. See [`AuditQuery`] for the per-method
+    /// semantics + the current Phase 1 scope (ICE only — the
+    /// non-force admin chain query path lands when the
+    /// substrate's signed admin chain ships).
+    pub fn audit(&self) -> AuditQuery<'_> {
+        AuditQuery::new(self)
+    }
+
     /// Open a [`SnapshotStream`] over the runtime's snapshot
     /// reader. The stream polls at
     /// [`DeckClientConfig::snapshot_poll_interval`] and emits a
@@ -767,6 +779,127 @@ impl<'a> IceProposal<'a> {
                 }
             }
         }
+    }
+}
+
+/// Audit-query builder reading the substrate's ICE audit
+/// ring. Constructed via [`DeckClient::audit`]; chain filter
+/// methods, then call [`Self::collect`] to materialize the
+/// matching entries.
+///
+/// # Scope (Phase 1)
+///
+/// This slice reads the in-memory ICE audit ring exported on
+/// every [`super::meshos::MeshOsSnapshot`]. The ring carries
+/// every `SignedIceCommit` the substrate verifier observed —
+/// accepted or rejected — bounded at
+/// [`super::meshos::DEFAULT_MAX_ICE_AUDIT_RECORDS`]. Ordinary
+/// admin events (`drain`, `enter_maintenance`, …) are NOT yet
+/// audit-queryable; that surface lands when the substrate's
+/// signed admin chain ships (per `DECK_SDK_PLAN.md`'s
+/// "substrate gaps" section).
+///
+/// Per-method semantics:
+///
+/// - [`Self::recent`] — keep the last N entries (newest-first
+///   in the result). When unspecified, returns every entry on
+///   the ring.
+/// - [`Self::by_operator`] — keep entries whose
+///   [`super::meshos::IceAuditRecord::operator_ids`] include
+///   the given id.
+/// - [`Self::between`] — keep entries whose
+///   `committed_at_ms` falls inside `[start_ms, end_ms]`
+///   (inclusive).
+/// - [`Self::force_only`] — a no-op in Phase 1 since the ring
+///   already only carries ICE force operations. The method
+///   exists so consumers can write filter chains that stay
+///   valid when the unified admin-chain path lands.
+pub struct AuditQuery<'a> {
+    client: &'a DeckClient,
+    limit: Option<usize>,
+    operator_filter: Option<u64>,
+    time_range: Option<(u64, u64)>,
+    force_only: bool,
+}
+
+impl<'a> AuditQuery<'a> {
+    fn new(client: &'a DeckClient) -> Self {
+        Self {
+            client,
+            limit: None,
+            operator_filter: None,
+            time_range: None,
+            force_only: false,
+        }
+    }
+
+    /// Cap the result at the most-recent `limit` entries.
+    /// `limit = 0` returns an empty result; chain order in the
+    /// returned vec is newest-first.
+    pub fn recent(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Keep only entries that carry `op_id` in their
+    /// `operator_ids` list. Records where one of several
+    /// operators in a multi-op bundle matches still surface.
+    pub fn by_operator(mut self, op_id: u64) -> Self {
+        self.operator_filter = Some(op_id);
+        self
+    }
+
+    /// Keep only entries whose `committed_at_ms` falls inside
+    /// `[start_ms, end_ms]` (inclusive on both ends).
+    /// Milliseconds since `UNIX_EPOCH`.
+    pub fn between(mut self, start_ms: u64, end_ms: u64) -> Self {
+        self.time_range = Some((start_ms, end_ms));
+        self
+    }
+
+    /// Restrict the result to ICE force operations. No-op in
+    /// Phase 1 (the ring is already ICE-only); preserved for
+    /// forward compatibility with the unified admin-chain
+    /// query path.
+    pub fn force_only(mut self) -> Self {
+        self.force_only = true;
+        self
+    }
+
+    /// Materialize matching entries. Reads the runtime's
+    /// latest snapshot, applies the configured filters, and
+    /// returns the matching entries newest-first. Cheap — one
+    /// snapshot read + a single iterator pass.
+    pub fn collect(self) -> Vec<super::meshos::IceAuditRecord> {
+        let snap = self.client.snapshot_reader.read();
+        let mut matched: Vec<super::meshos::IceAuditRecord> = snap
+            .ice_audit
+            .into_iter()
+            .filter(|r| {
+                if let Some(op_id) = self.operator_filter {
+                    if !r.operator_ids.contains(&op_id) {
+                        return false;
+                    }
+                }
+                if let Some((start, end)) = self.time_range {
+                    if r.committed_at_ms < start || r.committed_at_ms > end {
+                        return false;
+                    }
+                }
+                // `force_only` is structurally implied for the
+                // current ring; the flag stays for API forward-
+                // compat.
+                let _ = self.force_only;
+                true
+            })
+            .collect();
+        // Ring order is oldest-first; the natural operator UI
+        // shape is newest-first.
+        matched.reverse();
+        if let Some(limit) = self.limit {
+            matched.truncate(limit);
+        }
+        matched
     }
 }
 
@@ -1234,6 +1367,168 @@ mod tests {
         let sig = deck.identity().sign_proposal(proposal.action());
         let commit = proposal.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "flush_avoid_lists");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_query_returns_empty_when_no_ice_commits_observed() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+        let results = deck.audit().recent(10).collect();
+        assert!(results.is_empty());
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_query_returns_recent_entries_newest_first() {
+        // Two unsigned commits — they reach the loop via the
+        // unsigned admin path because no registry is installed.
+        // The audit ring only records `SignedIceCommit` events,
+        // so unsigned commits don't appear. We instead publish
+        // `SignedIceCommit` directly (no verifier installed, so
+        // outcome = Unverified — but the ring records every
+        // attempt regardless).
+        use crate::adapter::net::behavior::meshos::{IceActionProposal, MeshOsEvent};
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        for ttl_secs in [10, 20, 30] {
+            runtime
+                .handle()
+                .publish(MeshOsEvent::SignedIceCommit {
+                    proposal: IceActionProposal::FreezeCluster {
+                        ttl: Duration::from_secs(ttl_secs),
+                    },
+                    signatures: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let all = deck.audit().collect();
+        assert_eq!(all.len(), 3, "ring should hold all three entries");
+        // Newest-first ordering: the 30s freeze is the last
+        // commit submitted, so it should be the first result.
+        assert!(matches!(
+            all[0].proposal,
+            IceActionProposal::FreezeCluster { ttl } if ttl == Duration::from_secs(30)
+        ));
+        assert!(matches!(
+            all[2].proposal,
+            IceActionProposal::FreezeCluster { ttl } if ttl == Duration::from_secs(10)
+        ));
+
+        let recent_one = deck.audit().recent(1).collect();
+        assert_eq!(recent_one.len(), 1);
+        assert!(matches!(
+            recent_one[0].proposal,
+            IceActionProposal::FreezeCluster { ttl } if ttl == Duration::from_secs(30)
+        ));
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_query_filters_by_operator_id() {
+        use crate::adapter::net::behavior::meshos::{IceActionProposal, MeshOsEvent};
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let op_a = OperatorIdentity::generate();
+        let op_b = OperatorIdentity::generate();
+        let deck = DeckClient::from_runtime(&runtime, op_a.clone());
+
+        // Commit from op_a.
+        let proposal_a = IceActionProposal::FreezeCluster {
+            ttl: Duration::from_secs(10),
+        };
+        let sig_a = OperatorSignature::sign(op_a.keypair(), &proposal_a);
+        runtime
+            .handle()
+            .publish(MeshOsEvent::SignedIceCommit {
+                proposal: proposal_a,
+                signatures: vec![sig_a],
+            })
+            .await
+            .unwrap();
+        // Commit from op_b.
+        let proposal_b = IceActionProposal::ThawCluster;
+        let sig_b = OperatorSignature::sign(op_b.keypair(), &proposal_b);
+        runtime
+            .handle()
+            .publish(MeshOsEvent::SignedIceCommit {
+                proposal: proposal_b,
+                signatures: vec![sig_b],
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let filtered = deck.audit().by_operator(op_a.operator_id()).collect();
+        assert_eq!(filtered.len(), 1);
+        assert!(matches!(
+            filtered[0].proposal,
+            IceActionProposal::FreezeCluster { .. }
+        ));
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_query_force_only_is_a_passthrough_for_phase_1() {
+        // The ring is already ICE-only, so force_only matches
+        // every entry. Method exists for forward-compat with
+        // the unified admin-chain query.
+        use crate::adapter::net::behavior::meshos::{IceActionProposal, MeshOsEvent};
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        runtime
+            .handle()
+            .publish(MeshOsEvent::SignedIceCommit {
+                proposal: IceActionProposal::ThawCluster,
+                signatures: Vec::new(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let baseline = deck.audit().collect();
+        let force_only = deck.audit().force_only().collect();
+        assert_eq!(baseline, force_only);
+        assert_eq!(baseline.len(), 1);
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_query_between_filters_outside_window() {
+        use crate::adapter::net::behavior::meshos::{IceActionProposal, MeshOsEvent};
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        runtime
+            .handle()
+            .publish(MeshOsEvent::SignedIceCommit {
+                proposal: IceActionProposal::ThawCluster,
+                signatures: Vec::new(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // A window entirely in the past — no entries should
+        // match.
+        let past_only = deck.audit().between(0, 1).collect();
+        assert!(past_only.is_empty());
+
+        // A window covering "now" — should match.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let around_now = deck.audit().between(now_ms - 10_000, now_ms + 10_000).collect();
+        assert_eq!(around_now.len(), 1);
         let _ = runtime.shutdown().await;
     }
 
