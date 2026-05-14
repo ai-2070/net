@@ -4054,7 +4054,7 @@ function DatafortsConsole() {
           </span>
           <span className="text-accent">$</span>
           <span>
-            dataforts-ctl status{" "}
+            net dataforts status{" "}
             <span className="text-ink-faint">--live --pool=mesh</span>
           </span>
         </span>
@@ -4912,7 +4912,7 @@ function MeshAutoform() {
           </span>
           <span className="text-accent">$</span>
           <span>
-            meshos-ctl autoform{" "}
+            net meshos autoform{" "}
             <span className="text-ink-faint normal-case tracking-normal">
               --live --mesh=local --autoform=true
             </span>
