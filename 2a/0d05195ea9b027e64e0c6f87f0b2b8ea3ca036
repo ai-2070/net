@@ -1,0 +1,51 @@
+net/crates/net/src/adapter/net/behavior/meshos/action.rs
+  s_3bbc444b3ef3e5::t_4b98c54df7e367 120-128
+net/crates/net/src/adapter/net/behavior/meshos/state.rs
+  s_3bbc444b3ef3e5::t_42eb6b1be099cd 441-446
+  s_3bbc444b3ef3e5::t_8cb530bb6f54d8 88-95
+  s_3bbc444b3ef3e5::t_a62c4d25859432 1048-1067
+net/crates/net/src/adapter/net/behavior/meshos/reconcile.rs
+  s_3bbc444b3ef3e5::t_b8677c0ee5fa92 82
+  s_3bbc444b3ef3e5::t_692c20c08fbeb1 1125
+  s_3bbc444b3ef3e5::t_e99d96e06cae38 2100-2164
+  s_3bbc444b3ef3e5::t_a2f45751b3122a 288-320
+  s_3bbc444b3ef3e5::t_d8f4c54e500d51 224
+net/crates/net/src/adapter/net/behavior/meshos/backpressure.rs
+  s_3bbc444b3ef3e5::t_d95bee8f7bba9b 597
+net/crates/net/src/adapter/net/behavior/meshos/ice.rs
+  s_3bbc444b3ef3e5::t_1fd5a14d9cc43d 574-601
+  s_3bbc444b3ef3e5::t_35f3f4122137fc 89-96
+  s_3bbc444b3ef3e5::t_ab76633623fd96 621-623
+  s_3bbc444b3ef3e5::t_f3a109e636fcbd 743-768
+  s_3bbc444b3ef3e5::t_821d7579ebc685 1222-1308
+  s_3bbc444b3ef3e5::t_ceba5d7dbd98f2 119-122
+net/crates/net/src/adapter/net/behavior/meshos/event_loop.rs
+  s_3bbc444b3ef3e5::t_6e09292b11e175 791-796
+net/crates/net/src/adapter/net/behavior/meshos/snapshot.rs
+  s_3bbc444b3ef3e5::t_ce2c2685d9898b 713
+net/crates/net/src/adapter/net/behavior/meshos/event.rs
+  s_3bbc444b3ef3e5::t_82bead909557ca 417-430
+  s_3bbc444b3ef3e5::t_77844aafcf5cf8 610-613
+  s_3bbc444b3ef3e5::t_2c4606a9fc818a 548
+net/crates/net/src/adapter/net/behavior/deck.rs
+  s_3bbc444b3ef3e5::t_0f7b1e41a507c5 714-725
+  s_3bbc444b3ef3e5::t_162c3bf96ee219 1833-1846
+  s_3bbc444b3ef3e5::t_9470b61eb70a32 826
+  s_3bbc444b3ef3e5::t_0b337473572497 860-867
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "2a0d05195ea9b027e64e0c6f87f0b2b8ea3ca036",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
