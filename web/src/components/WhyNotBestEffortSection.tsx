@@ -1,6 +1,6 @@
 import { ArpanetMapBg } from "./ArpanetMapBg";
 import { DisplayHeading } from "./DisplayHeading";
-import { SectionLabel } from "./SectionHeadings";
+import { SectionLabel } from "./SectionLabel";
 
 export function WhyNotBestEffortSection() {
   return (

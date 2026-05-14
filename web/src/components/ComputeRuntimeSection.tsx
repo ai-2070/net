@@ -2,7 +2,7 @@ import { DaemonCaseBlock } from "./DaemonCaseBlock";
 import { DisplayHeading } from "./DisplayHeading";
 import { GroupCards } from "./GroupCards";
 import { MigrationPipeline } from "./MigrationPipeline";
-import { SectionLabel } from "./SectionHeadings";
+import { SectionLabel } from "./SectionLabel";
 import { SpecStrip } from "./SpecStrip";
 
 export function ComputeRuntimeSection() {
@@ -59,7 +59,6 @@ export function ComputeRuntimeSection() {
 
       <DaemonCaseBlock />
       <MigrationPipeline />
-      {/*<SuperpositionViz />*/}
       <GroupCards />
       <SpecStrip />
 

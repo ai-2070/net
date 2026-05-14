@@ -8,7 +8,7 @@ import { MikoshiSection } from "@/components/MikoshiSection";
 import { DatafortsSection } from "@/components/DatafortsSection";
 import { ComponentsSection } from "@/components/ComponentsSection";
 import { InstallSection } from "@/components/InstallSection";
-import { ApplicationsSection } from "@/components/ApplicationSection";
+import { ApplicationsSection } from "@/components/ApplicationsSection";
 import { ReleasesSection } from "@/components/ReleasesSection";
 import { ClosingSection } from "@/components/ClosingSection";
 import { FooterDivider } from "@/components/FooterDivider";

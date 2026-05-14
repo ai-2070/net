@@ -1,5 +1,5 @@
 import { DisplayHeading } from "./DisplayHeading";
-import { SectionLabel } from "./SectionHeadings";
+import { SectionLabel } from "./SectionLabel";
 
 interface BenchRow {
   op: string;

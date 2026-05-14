@@ -1,4 +1,4 @@
-import { type ReactNode } from "react";
+import type { ReactNode } from "react";
 
 export function DisplayHeading({ children }: { children: ReactNode }) {
   return (

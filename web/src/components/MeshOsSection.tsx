@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { SectionLabel } from "@/components/SectionHeadings";
+import { SectionLabel } from "@/components/SectionLabel";
 import { DisplayHeading } from "./DisplayHeading";
 
 // =========================================================================

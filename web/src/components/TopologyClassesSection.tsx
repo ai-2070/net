@@ -1,6 +1,6 @@
 import { DisplayHeading } from "./DisplayHeading";
 import { LatencySpectrum } from "./LatencySpectrum";
-import { SectionLabel } from "./SectionHeadings";
+import { SectionLabel } from "./SectionLabel";
 
 interface TopologyClass {
   header: string;

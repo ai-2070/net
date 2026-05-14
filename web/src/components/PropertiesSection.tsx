@@ -1,7 +1,7 @@
 "use client";
 
 import { DisplayHeading } from "./DisplayHeading";
-import { SectionLabel } from "./SectionHeadings";
+import { SectionLabel } from "./SectionLabel";
 import { useEffect, useState } from "react";
 
 interface AxiomCard {

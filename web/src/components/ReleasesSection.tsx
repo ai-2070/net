@@ -1,5 +1,5 @@
 import { useRepoInfo } from "./RepoInfoProvider";
-import { SectionLabel } from "./SectionHeadings";
+import { SectionLabel } from "./SectionLabel";
 import { DisplayHeading } from "./DisplayHeading";
 import { formatReleaseDate } from "@/lib/utils";
 

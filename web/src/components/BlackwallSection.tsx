@@ -1,5 +1,5 @@
 import { BlackwallViz } from "./BlackwallViz";
-import { SectionLabel } from "./SectionHeadings";
+import { SectionLabel } from "./SectionLabel";
 import { DisplayHeading } from "./DisplayHeading";
 
 interface BlackwallItem {
