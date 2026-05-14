@@ -61,6 +61,12 @@ pub fn reconcile(
     // `Instant::now()` for tests that call reconcile without
     // driving Ticks.
     let now = actual.last_tick.unwrap_or_else(Instant::now);
+    // Cluster-wide ICE freeze: suppress all reconcile-driven
+    // action emission while in effect. Folds + chain commits
+    // keep running upstream; only this output is gated.
+    if actual.is_frozen(now) {
+        return actions;
+    }
     // Track which chains already saw a `RequestEviction` this
     // tick so the Phase C count-driven arm and the Phase D-1
     // scheduler arm don't both emit (possibly with different
@@ -1971,5 +1977,71 @@ mod tests {
             }
             other => panic!("expected two RequestPlacement actions in chain order, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn freeze_suppresses_action_emission_that_would_otherwise_fire() {
+        // Stand up a state that would normally emit StartDaemon —
+        // a desired-Run daemon with default (Stopped) lifecycle.
+        // Without freeze, reconcile emits the start. With freeze
+        // in effect, the action vector is empty.
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        let d = daemon("frozen-daemon", 1);
+        actual.daemons.insert(d.clone(), DaemonStatus::default());
+        let mut desired = DesiredState::default();
+        desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
+
+        // Sanity: unfrozen emits the start.
+        let baseline = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert_eq!(baseline, vec![MeshOsAction::StartDaemon { daemon: d }]);
+
+        // Freeze the cluster — reconcile should emit nothing.
+        actual.freeze_until = Some(actual.last_tick.unwrap() + Duration::from_secs(30));
+        let frozen = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert!(
+            frozen.is_empty(),
+            "freeze should suppress reconcile output, got {frozen:?}",
+        );
+    }
+
+    #[test]
+    fn freeze_expired_does_not_suppress_action_emission() {
+        // freeze_until in the past — the gc clears on next tick,
+        // but reconcile's own `is_frozen` check is point-in-time
+        // and also treats past values as not-frozen.
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        actual.freeze_until = Some(actual.last_tick.unwrap() - Duration::from_secs(1));
+        let d = daemon("post-thaw-daemon", 1);
+        actual.daemons.insert(d.clone(), DaemonStatus::default());
+        let mut desired = DesiredState::default();
+        desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert_eq!(actions, vec![MeshOsAction::StartDaemon { daemon: d }]);
     }
 }

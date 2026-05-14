@@ -70,6 +70,13 @@ pub struct MeshOsState {
     pub(crate) applied_backoffs: HashMap<DaemonRef, Instant>,
     /// Last `Tick` we processed — used by tests / diagnostics.
     pub(crate) last_tick: Option<Instant>,
+    /// Cluster-wide reconcile-emission freeze. Some(instant)
+    /// means "freeze in effect until this instant"; reconcile
+    /// returns an empty action vector while `now < until`. The
+    /// tick GC clears the value once it expires. Driven by the
+    /// ICE [`AdminEvent::FreezeCluster`] / [`AdminEvent::ThawCluster`]
+    /// admin events.
+    pub(crate) freeze_until: Option<Instant>,
 }
 
 /// Per-daemon observed status. Phase B fleshes out the fields
@@ -167,6 +174,7 @@ impl MeshOsState {
                 self.last_tick = Some(now);
                 self.gc_avoid_list(now);
                 self.release_elapsed_backoffs(now);
+                self.gc_freeze(now);
             }
             MeshOsEvent::ReplicaUpdate(update) => self.apply_replica(update),
             MeshOsEvent::DaemonLifecycle { daemon, signal } => {
@@ -343,6 +351,14 @@ impl MeshOsState {
                 // RTT is still bad.
                 self.avoid_list.clear();
             }
+            AdminEvent::FreezeCluster { ttl } => {
+                // Cluster-wide signal — every node observes the
+                // same admin event and folds it identically.
+                self.freeze_until = Some(anchor + *ttl);
+            }
+            AdminEvent::ThawCluster => {
+                self.freeze_until = None;
+            }
             _ => {}
         }
     }
@@ -367,6 +383,24 @@ impl MeshOsState {
         for status in self.daemons.values_mut() {
             status.backoff.maybe_release(now);
         }
+    }
+
+    /// Clear an expired cluster-wide freeze. Idempotent — does
+    /// nothing if no freeze is in effect or the freeze still has
+    /// time remaining.
+    fn gc_freeze(&mut self, now: Instant) {
+        if let Some(until) = self.freeze_until {
+            if now >= until {
+                self.freeze_until = None;
+            }
+        }
+    }
+
+    /// `true` iff a cluster-wide reconcile freeze is in effect.
+    /// Reconcile reads this each tick to decide whether to emit
+    /// actions.
+    pub(crate) fn is_frozen(&self, now: Instant) -> bool {
+        self.freeze_until.map(|until| now < until).unwrap_or(false)
     }
 }
 
@@ -432,6 +466,7 @@ impl DesiredState {
 pub use super::supervision::RestartState as DaemonRestartState;
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -704,5 +739,86 @@ mod tests {
             THIS_NODE,
         );
         assert!(matches!(state.local_maintenance, MaintenanceState::Active));
+    }
+
+    #[test]
+    fn freeze_cluster_admin_event_sets_freeze_until_to_anchor_plus_ttl() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        let anchor = Instant::now();
+        state.last_tick = Some(anchor);
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FreezeCluster {
+                ttl: Duration::from_secs(30),
+            }),
+            THIS_NODE,
+        );
+        let until = state.freeze_until.expect("freeze should be set");
+        let delta = until.saturating_duration_since(anchor);
+        assert!(
+            (Duration::from_secs(29)..=Duration::from_secs(31)).contains(&delta),
+            "freeze TTL should anchor on last_tick, got {delta:?}",
+        );
+    }
+
+    #[test]
+    fn thaw_cluster_admin_event_clears_freeze() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        state.last_tick = Some(Instant::now());
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FreezeCluster {
+                ttl: Duration::from_secs(30),
+            }),
+            THIS_NODE,
+        );
+        assert!(state.freeze_until.is_some());
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ThawCluster),
+            THIS_NODE,
+        );
+        assert!(state.freeze_until.is_none());
+    }
+
+    #[test]
+    fn freeze_gc_clears_expired_freeze_on_tick() {
+        let mut state = MeshOsState::default();
+        let past = Instant::now() - Duration::from_secs(1);
+        state.freeze_until = Some(past);
+        // Tick after the freeze expired.
+        state.apply(&MeshOsEvent::Tick, 0);
+        assert!(state.freeze_until.is_none());
+    }
+
+    #[test]
+    fn freeze_gc_preserves_freeze_that_has_time_remaining() {
+        let mut state = MeshOsState::default();
+        let future = Instant::now() + Duration::from_secs(30);
+        state.freeze_until = Some(future);
+        state.apply(&MeshOsEvent::Tick, 0);
+        assert!(state.freeze_until.is_some());
+    }
+
+    #[test]
+    fn is_frozen_returns_true_only_while_freeze_in_effect() {
+        let mut state = MeshOsState::default();
+        let now = Instant::now();
+        assert!(!state.is_frozen(now));
+        state.freeze_until = Some(now + Duration::from_secs(30));
+        assert!(state.is_frozen(now));
+        // After expiration the helper reports false even before
+        // the next tick's GC runs.
+        assert!(!state.is_frozen(now + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn thaw_is_idempotent_when_no_freeze_in_effect() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ThawCluster),
+            THIS_NODE,
+        );
+        assert!(state.freeze_until.is_none());
     }
 }

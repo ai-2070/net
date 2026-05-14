@@ -59,6 +59,11 @@ pub struct MeshOsSnapshot {
     /// Ring buffer of recent failures (daemon crashes, drain
     /// timeouts, etc.).
     pub recent_failures: VecDeque<FailureRecord>,
+    /// Milliseconds remaining on the cluster-wide ICE freeze, or
+    /// `None` if no freeze is in effect. Driven by the
+    /// `AdminEvent::FreezeCluster` / `AdminEvent::ThawCluster`
+    /// admin commits.
+    pub freeze_remaining_ms: Option<u64>,
 }
 
 /// Per-daemon Deck-renderable summary.
@@ -442,6 +447,10 @@ impl MeshOsSnapshot {
             })
             .collect();
 
+        let freeze_remaining_ms = actual
+            .freeze_until
+            .map(|until| until.saturating_duration_since(now).as_millis() as u64);
+
         Self {
             daemons,
             replicas,
@@ -450,6 +459,7 @@ impl MeshOsSnapshot {
             local_maintenance,
             pending,
             recent_failures: recent_failures.iter().cloned().collect(),
+            freeze_remaining_ms,
         }
     }
 }

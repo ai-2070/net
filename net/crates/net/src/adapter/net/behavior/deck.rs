@@ -451,6 +451,35 @@ impl AdminCommands<'_> {
             .publish_admin(AdminEvent::ClearAvoidList { node }, "clear_avoid_list")
             .await
     }
+
+    /// Pause reconcile-driven action emission cluster-wide for
+    /// `ttl`. While in effect every node's reconcile pass
+    /// returns an empty action vector; folds + chain commits
+    /// keep running. The freeze auto-clears at `now + ttl`; an
+    /// earlier [`Self::thaw_cluster`] cancels it.
+    ///
+    /// ICE break-glass surface. The Phase 2 substrate slice
+    /// landed the freeze gate; the SDK exposes it on the
+    /// existing [`AdminCommands`] surface for Phase 1 callers.
+    /// Phase 3 lifts this onto a dedicated `IceCommands` surface
+    /// with the proposal / simulate / multi-operator-sign
+    /// discipline the plan locks in.
+    pub async fn freeze_cluster(
+        &self,
+        ttl: Duration,
+    ) -> Result<ChainCommit, AdminError> {
+        self.client
+            .publish_admin(AdminEvent::FreezeCluster { ttl }, "freeze_cluster")
+            .await
+    }
+
+    /// Cancel an in-effect cluster freeze. Idempotent — no-op
+    /// if no freeze is in effect.
+    pub async fn thaw_cluster(&self) -> Result<ChainCommit, AdminError> {
+        self.client
+            .publish_admin(AdminEvent::ThawCluster, "thaw_cluster")
+            .await
+    }
 }
 
 /// Stream over the runtime's snapshot reader. Polls at the

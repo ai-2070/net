@@ -311,6 +311,23 @@ pub enum AdminEvent {
         /// Node whose placement to invalidate.
         node: NodeId,
     },
+    /// Pause reconcile-driven action emission cluster-wide for
+    /// `ttl`. Folds + chain commits keep running; only the
+    /// reconcile output is suppressed. The freeze auto-expires
+    /// at `now + ttl`; an earlier [`AdminEvent::ThawCluster`]
+    /// clears the freeze immediately.
+    ///
+    /// ICE break-glass surface per `DECK_SDK_PLAN.md`. The
+    /// substrate enforces the freeze; the operator-side
+    /// signing + multi-operator gating lives in the Deck SDK
+    /// once those slices land.
+    FreezeCluster {
+        /// How long the freeze should hold for.
+        ttl: std::time::Duration,
+    },
+    /// Cancel an in-effect freeze early. No-op if no freeze is
+    /// in effect; idempotent.
+    ThawCluster,
 }
 
 /// Blob announcement payload. Phase A skeleton — Phase E fleshes

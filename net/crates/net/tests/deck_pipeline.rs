@@ -124,3 +124,53 @@ async fn deck_client_two_commits_carry_monotonic_commit_ids() {
     assert_eq!(c.operator_id(), a.operator_id());
     let _ = runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn deck_client_freeze_cluster_lands_in_snapshot_and_thaw_clears() {
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+    let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+        .with_config(DeckClientConfig {
+            snapshot_poll_interval: Duration::from_millis(15),
+        });
+
+    // Freeze for 10s; observe `freeze_remaining_ms` surface
+    // through the snapshot stream.
+    let commit = deck
+        .admin()
+        .freeze_cluster(Duration::from_secs(10))
+        .await
+        .expect("freeze commit");
+    assert_eq!(commit.event_kind(), "freeze_cluster");
+
+    let mut stream = deck.snapshots();
+    let mut saw_freeze = false;
+    for _ in 0..20 {
+        let snap = stream.next().await.expect("next").expect("ok");
+        if snap.freeze_remaining_ms.is_some() {
+            saw_freeze = true;
+            break;
+        }
+    }
+    assert!(
+        saw_freeze,
+        "snapshot stream should surface freeze_remaining_ms after freeze_cluster commit",
+    );
+
+    // Thaw — `freeze_remaining_ms` should clear within a few
+    // stream frames.
+    let _ = deck.admin().thaw_cluster().await.expect("thaw commit");
+    let mut saw_thaw = false;
+    for _ in 0..20 {
+        let snap = stream.next().await.expect("next").expect("ok");
+        if snap.freeze_remaining_ms.is_none() {
+            saw_thaw = true;
+            break;
+        }
+    }
+    assert!(
+        saw_thaw,
+        "thaw should clear freeze_remaining_ms from the snapshot",
+    );
+    let _ = runtime.shutdown().await;
+}
