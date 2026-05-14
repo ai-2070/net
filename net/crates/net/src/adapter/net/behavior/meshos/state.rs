@@ -404,6 +404,17 @@ impl MeshOsState {
                 // shape the count-driven and scheduler arms use.
                 self.forced_evictions.push((*chain, *victim));
             }
+            AdminEvent::ForceRestartDaemon { daemon } => {
+                // Clear the daemon's backoff gate so reconcile's
+                // `StartDaemon` arm fires on the next tick. Also
+                // drop any prior `ApplyBackoff` record — a future
+                // crash should produce a fresh emission rather
+                // than ride the previous cooldown's deadline.
+                if let Some(status) = self.daemons.get_mut(daemon) {
+                    status.backoff.force_release();
+                }
+                self.applied_backoffs.remove(daemon);
+            }
             _ => {}
         }
     }
@@ -973,5 +984,55 @@ mod tests {
             state.forced_evictions,
             vec![(100u64, 7u64), (200u64, 9u64)]
         );
+    }
+
+    #[test]
+    fn force_restart_daemon_clears_backoff_gate_and_applied_record() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        let d = DaemonRef {
+            id: 7,
+            name: "telemetry".into(),
+        };
+        let mut status = DaemonStatus::default();
+        // Drive the tracker into BackingOff so the gate is set.
+        let crash_at = Instant::now();
+        status.backoff.observe_crash(crash_at);
+        assert!(!matches!(
+            status.backoff.state(),
+            crate::adapter::net::behavior::meshos::supervision::RestartState::Idle
+        ));
+        state.daemons.insert(d.clone(), status);
+        state.applied_backoffs.insert(d.clone(), crash_at);
+
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ForceRestartDaemon { daemon: d.clone() }),
+            THIS_NODE,
+        );
+
+        // Gate should be cleared.
+        let after = state.daemons.get(&d).unwrap();
+        assert!(matches!(
+            after.backoff.state(),
+            crate::adapter::net::behavior::meshos::supervision::RestartState::Idle
+        ));
+        // Applied-backoffs record should be cleared too.
+        assert!(!state.applied_backoffs.contains_key(&d));
+    }
+
+    #[test]
+    fn force_restart_daemon_is_noop_for_unknown_daemon() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        let d = DaemonRef {
+            id: 999,
+            name: "absent".into(),
+        };
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ForceRestartDaemon { daemon: d }),
+            THIS_NODE,
+        );
+        // No panic, no state added.
+        assert!(state.daemons.is_empty());
     }
 }

@@ -242,6 +242,22 @@ impl BackoffTracker {
         true
     }
 
+    /// Unconditionally release the gate. Resets the rolling
+    /// crash-history window and the current backoff window to
+    /// `initial` so a subsequent crash doesn't immediately
+    /// re-enter the longer cooldown. Used by the ICE
+    /// [`super::event::AdminEvent::ForceRestartDaemon`] arm to
+    /// bypass a `BackingOff` / `CrashLooping` window without
+    /// waiting for the deadline to elapse. Returns `true` when
+    /// the state was non-Idle before the call.
+    pub fn force_release(&mut self) -> bool {
+        let was_gated = !matches!(self.state, RestartState::Idle);
+        self.state = RestartState::Idle;
+        self.next_backoff = self.config.initial;
+        self.crash_history.clear();
+        was_gated
+    }
+
     /// Test-only accessor for the current backoff window.
     #[cfg(test)]
     pub(crate) fn current_window(&self) -> Duration {
@@ -392,5 +408,44 @@ mod tests {
         // After 15 doublings (500ms → 1s → 2s → ... ) the
         // window should be capped at 60 s.
         assert_eq!(bt.current_window(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn force_release_clears_backing_off_gate_and_resets_window() {
+        let mut bt = BackoffTracker::default();
+        // Two close-together crashes bump the window past initial.
+        bt.observe_crash(t(0));
+        bt.observe_crash(t(1));
+        assert!(matches!(bt.state(), RestartState::BackingOff { .. }));
+        assert!(bt.current_window() > BackoffConfig::default().initial);
+
+        let was_gated = bt.force_release();
+        assert!(was_gated);
+        assert!(matches!(bt.state(), RestartState::Idle));
+        // Window should be back to initial.
+        assert_eq!(bt.current_window(), BackoffConfig::default().initial);
+    }
+
+    #[test]
+    fn force_release_returns_false_when_already_idle() {
+        let mut bt = BackoffTracker::default();
+        assert!(!bt.force_release());
+        assert!(matches!(bt.state(), RestartState::Idle));
+    }
+
+    #[test]
+    fn force_release_clears_crash_looping_gate() {
+        let cfg = BackoffConfig {
+            crash_loop_threshold: 3,
+            crash_loop_window: Duration::from_secs(60),
+            ..BackoffConfig::default()
+        };
+        let mut bt = BackoffTracker::new(cfg);
+        bt.observe_crash(t(0));
+        bt.observe_crash(t(1));
+        bt.observe_crash(t(2));
+        assert!(matches!(bt.state(), RestartState::CrashLooping { .. }));
+        assert!(bt.force_release());
+        assert!(matches!(bt.state(), RestartState::Idle));
     }
 }

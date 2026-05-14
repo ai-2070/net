@@ -614,6 +614,20 @@ impl<'a> IceCommands<'a> {
         )
     }
 
+    /// Propose force-restarting `daemon` by resetting its
+    /// supervisor backoff gate so reconcile fires `StartDaemon`
+    /// on the next tick. No-op if the daemon is already in
+    /// `Idle` backoff state.
+    pub fn force_restart_daemon(
+        &self,
+        daemon: super::meshos::DaemonRef,
+    ) -> IceProposal<'a> {
+        IceProposal::new(
+            self.client,
+            IceActionProposal::ForceRestartDaemon { daemon },
+        )
+    }
+
     /// Propose cancelling an in-effect cluster freeze.
     pub fn thaw_cluster(&self) -> IceProposal<'a> {
         IceProposal::new(self.client, IceActionProposal::ThawCluster)
@@ -714,6 +728,7 @@ impl<'a> IceProposal<'a> {
                 IceActionProposal::ThawCluster => "thaw_cluster",
                 IceActionProposal::FlushAvoidLists { .. } => "flush_avoid_lists",
                 IceActionProposal::ForceEvictReplica { .. } => "force_evict_replica",
+                IceActionProposal::ForceRestartDaemon { .. } => "force_restart_daemon",
             };
             self.client
                 .publish_signed_ice(self.action, signatures.to_vec(), kind)
@@ -739,6 +754,14 @@ impl<'a> IceProposal<'a> {
                         .publish_admin(
                             AdminEvent::ForceEvictReplica { chain, victim },
                             "force_evict_replica",
+                        )
+                        .await
+                }
+                IceActionProposal::ForceRestartDaemon { daemon } => {
+                    self.client
+                        .publish_admin(
+                            AdminEvent::ForceRestartDaemon { daemon },
+                            "force_restart_daemon",
                         )
                         .await
                 }
@@ -1211,6 +1234,24 @@ mod tests {
         let sig = deck.identity().sign_proposal(proposal.action());
         let commit = proposal.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "flush_avoid_lists");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ice_force_restart_daemon_proposal_round_trips() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+        let daemon = super::super::meshos::DaemonRef {
+            id: 7,
+            name: "telemetry".into(),
+        };
+        let proposal = deck.ice().force_restart_daemon(daemon.clone());
+        let blast = proposal.simulate().await.expect("simulate");
+        assert_eq!(blast.affected_daemons, vec![daemon]);
+        let sig = deck.identity().sign_proposal(proposal.action());
+        let commit = proposal.commit(&[sig]).await.expect("commit");
+        assert_eq!(commit.event_kind(), "force_restart_daemon");
         let _ = runtime.shutdown().await;
     }
 

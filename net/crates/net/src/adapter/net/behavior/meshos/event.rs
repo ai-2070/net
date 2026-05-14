@@ -376,6 +376,15 @@ pub enum AdminEvent {
         /// removed.
         victim: NodeId,
     },
+    /// ICE break-glass: reset `daemon`'s backoff tracker so the
+    /// supervisor's gate (BackingOff / CrashLooping) no longer
+    /// suppresses `StartDaemon` emission. Use to give a crash-
+    /// looping daemon an immediate retry after operator-side
+    /// recovery. No-op for a daemon already in `Idle` state.
+    ForceRestartDaemon {
+        /// The daemon whose backoff should be cleared.
+        daemon: DaemonRef,
+    },
 }
 
 /// Scope discriminator for [`AdminEvent::FlushAvoidLists`].

@@ -79,6 +79,13 @@ pub enum IceActionProposal {
         /// Holder to remove.
         victim: NodeId,
     },
+    /// Reset `daemon`'s backoff so the supervisor's gate
+    /// no longer suppresses restart. Maps to
+    /// [`super::event::AdminEvent::ForceRestartDaemon`].
+    ForceRestartDaemon {
+        /// The daemon whose backoff to clear.
+        daemon: DaemonRef,
+    },
 }
 
 impl IceActionProposal {
@@ -98,6 +105,9 @@ impl IceActionProposal {
                     victim: *victim,
                 }
             }
+            IceActionProposal::ForceRestartDaemon { daemon } => AdminEvent::ForceRestartDaemon {
+                daemon: daemon.clone(),
+            },
         }
     }
 }
@@ -430,6 +440,31 @@ pub enum BlastWarning {
         /// The holder the operator targeted.
         victim: NodeId,
     },
+    /// `ForceRestartDaemon` bypasses the supervisor's
+    /// `BackingOff` / `CrashLooping` gate so the daemon gets
+    /// an immediate retry. Surface so the operator confirms
+    /// the underlying cause has been addressed before bouncing
+    /// the daemon back into the same crash loop.
+    ForcedRestartBypassesBackoff {
+        /// The targeted daemon's id.
+        daemon_id: u64,
+    },
+    /// `ForceRestartDaemon` referenced a daemon not currently
+    /// observed in the snapshot. The fold still removes any
+    /// stale `applied_backoffs` entry, but reconcile won't
+    /// emit `StartDaemon` because there's no `DaemonStatus`
+    /// entry to track. Operator likely typed the wrong id.
+    ForcedRestartTargetsUnknownDaemon {
+        /// The daemon id the operator targeted.
+        daemon_id: u64,
+    },
+    /// `ForceRestartDaemon` targeted a daemon whose tracker
+    /// is already `Idle`. The commit is a no-op — the operator
+    /// might be confused about the daemon's actual state.
+    ForcedRestartDaemonNotInBackoff {
+        /// The targeted daemon's id.
+        daemon_id: u64,
+    },
 }
 
 /// Pure simulator: snapshot + proposal → blast radius. No I/O;
@@ -443,6 +478,9 @@ pub fn simulate(snapshot: &MeshOsSnapshot, proposal: &IceActionProposal) -> Blas
         IceActionProposal::FlushAvoidLists { scope } => simulate_flush_avoid_lists(snapshot, *scope),
         IceActionProposal::ForceEvictReplica { chain, victim } => {
             simulate_force_evict_replica(snapshot, *chain, *victim)
+        }
+        IceActionProposal::ForceRestartDaemon { daemon } => {
+            simulate_force_restart_daemon(snapshot, daemon)
         }
     }
 }
@@ -530,6 +568,38 @@ fn simulate_force_evict_replica(
         // but visible signal so the operator UI flags the
         // change.
         placement_stability_delta: 0.15,
+        warnings,
+    }
+}
+
+fn simulate_force_restart_daemon(
+    snapshot: &MeshOsSnapshot,
+    daemon: &DaemonRef,
+) -> BlastRadius {
+    let mut warnings = vec![BlastWarning::ForcedRestartBypassesBackoff {
+        daemon_id: daemon.id,
+    }];
+    match snapshot.daemons.get(&daemon.id) {
+        None => warnings.push(BlastWarning::ForcedRestartTargetsUnknownDaemon {
+            daemon_id: daemon.id,
+        }),
+        Some(snap) => {
+            if matches!(
+                snap.restart_state,
+                super::snapshot::RestartStateSnapshot::Idle
+            ) {
+                warnings.push(BlastWarning::ForcedRestartDaemonNotInBackoff {
+                    daemon_id: daemon.id,
+                });
+            }
+        }
+    }
+    BlastRadius {
+        affected_nodes: Vec::new(),
+        affected_replicas: Vec::new(),
+        affected_daemons: vec![daemon.clone()],
+        estimated_drain_delay: None,
+        placement_stability_delta: 0.0,
         warnings,
     }
 }
@@ -882,6 +952,117 @@ mod tests {
                 victim: 999
             }
         )));
+    }
+
+    #[test]
+    fn simulate_force_restart_daemon_targets_only_the_daemon() {
+        use super::super::snapshot::{
+            DaemonLifecycleSnapshot, DaemonSnapshot, RestartStateSnapshot,
+        };
+        let mut snap = MeshOsSnapshot::default();
+        snap.daemons.insert(
+            7,
+            DaemonSnapshot {
+                name: "telemetry".into(),
+                lifecycle: DaemonLifecycleSnapshot::Stopped,
+                health: None,
+                saturation: 0.0,
+                restart_state: RestartStateSnapshot::BackingOff { until_ms: 5_000 },
+            },
+        );
+        let daemon = DaemonRef {
+            id: 7,
+            name: "telemetry".into(),
+        };
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::ForceRestartDaemon {
+                daemon: daemon.clone(),
+            },
+        );
+        assert_eq!(blast.affected_daemons, vec![daemon]);
+        assert!(blast.affected_nodes.is_empty());
+        assert_eq!(blast.placement_stability_delta, 0.0);
+        assert!(blast
+            .warnings
+            .iter()
+            .any(|w| matches!(
+                w,
+                BlastWarning::ForcedRestartBypassesBackoff { daemon_id: 7 }
+            )));
+        // No "unknown" or "not in backoff" warnings — the daemon
+        // is observed AND in BackingOff.
+        assert!(blast
+            .warnings
+            .iter()
+            .all(|w| !matches!(
+                w,
+                BlastWarning::ForcedRestartTargetsUnknownDaemon { .. }
+                    | BlastWarning::ForcedRestartDaemonNotInBackoff { .. }
+            )));
+    }
+
+    #[test]
+    fn simulate_force_restart_daemon_warns_on_unknown_daemon() {
+        let snap = MeshOsSnapshot::default();
+        let daemon = DaemonRef {
+            id: 99,
+            name: "absent".into(),
+        };
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::ForceRestartDaemon { daemon },
+        );
+        assert!(blast.warnings.iter().any(|w| matches!(
+            w,
+            BlastWarning::ForcedRestartTargetsUnknownDaemon { daemon_id: 99 }
+        )));
+    }
+
+    #[test]
+    fn simulate_force_restart_daemon_warns_when_already_idle() {
+        use super::super::snapshot::{
+            DaemonLifecycleSnapshot, DaemonSnapshot, RestartStateSnapshot,
+        };
+        let mut snap = MeshOsSnapshot::default();
+        snap.daemons.insert(
+            7,
+            DaemonSnapshot {
+                name: "telemetry".into(),
+                lifecycle: DaemonLifecycleSnapshot::Running,
+                health: None,
+                saturation: 0.0,
+                restart_state: RestartStateSnapshot::Idle,
+            },
+        );
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::ForceRestartDaemon {
+                daemon: DaemonRef {
+                    id: 7,
+                    name: "telemetry".into(),
+                },
+            },
+        );
+        assert!(blast.warnings.iter().any(|w| matches!(
+            w,
+            BlastWarning::ForcedRestartDaemonNotInBackoff { daemon_id: 7 }
+        )));
+    }
+
+    #[test]
+    fn ice_proposal_to_admin_event_maps_force_restart_daemon() {
+        let daemon = DaemonRef {
+            id: 7,
+            name: "telemetry".into(),
+        };
+        let proposal = IceActionProposal::ForceRestartDaemon {
+            daemon: daemon.clone(),
+        };
+        match proposal.to_admin_event() {
+            AdminEvent::ForceRestartDaemon { daemon: out } => assert_eq!(out, daemon),
+            other => panic!("expected ForceRestartDaemon, got {other:?}"),
+        }
     }
 
     #[test]
