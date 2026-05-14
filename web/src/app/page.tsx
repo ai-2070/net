@@ -4408,7 +4408,7 @@ function autoMeshHex4(): string {
 
 const AUTOMESH_FEED_MAX = 7;
 
-// Rich pool of random capability tags emitted on cap.advertise. Mixes
+// Rich pool of random capability tags emitted on cap.announce. Mixes
 // edge hardware (sensors, mcus, radios), datacenter gear (gpu/cpu/nic),
 // market colos, runtimes, and identity primitives — the breadth of what
 // a heterogeneous mesh actually carries.
@@ -4767,13 +4767,13 @@ function MeshAutoform() {
             "▸",
             "rgb(107, 138, 30)",
             <>
-              cap.advertise 0x{n.hex}{" "}
+              cap.announce 0x{n.hex}{" "}
               <span style={{ color: `rgb(${capabilityRgb(n.cap)})` }}>
                 [{n.cap}]
               </span>{" "}
               <span className="text-accent-dim">{tags.join(" ")}</span>{" "}
               <span className="text-ink-faint">
-                ttl={Math.floor(800 + Math.random() * 2200)}ms
+                capb ann {Math.floor(12 + Math.random() * 39)}ns
               </span>
             </>,
           );
