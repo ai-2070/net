@@ -5021,7 +5021,7 @@ function MeshAutoform() {
         </span>
         <span className="flex items-center gap-1.5 normal-case tracking-normal">
           <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block animate-pulse-dot" />
-          <span className="text-accent">forming</span>
+          <span className="text-accent">monitoring</span>
         </span>
       </div>
 
