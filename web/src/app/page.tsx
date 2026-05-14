@@ -4269,12 +4269,7 @@ function DatafortsSection() {
 // toward a new equilibrium. Faint matrix rain falls behind everything.
 // =========================================================================
 
-type MeshCapability =
-  | "device"
-  | "compute"
-  | "region"
-  | "daemon"
-  | "datafort";
+type MeshCapability = "device" | "compute" | "region" | "daemon" | "datafort";
 
 interface AutoMeshNode {
   id: number;
@@ -4412,6 +4407,105 @@ function autoMeshHex4(): string {
 }
 
 const AUTOMESH_FEED_MAX = 7;
+
+// Rich pool of random capability tags emitted on cap.advertise. Mixes
+// edge hardware (sensors, mcus, radios), datacenter gear (gpu/cpu/nic),
+// market colos, runtimes, and identity primitives — the breadth of what
+// a heterogeneous mesh actually carries.
+const MESH_AD_TAGS: ReadonlyArray<string> = [
+  // gpu / accelerator
+  "gpu:h100",
+  "gpu:h200",
+  "gpu:gb200",
+  "gpu:gb300",
+  "gpu:rtx-5090",
+  "gpu:4090",
+  "npu:hailo-8",
+  // cpu / arm / mcu
+  "cpu:epyc-9654",
+  "cpu:xeon-8480",
+  // memory
+  "vram:24gb",
+  "vram:80gb",
+  "vram:192gb",
+  "ram:64gb",
+  "ram:512gb",
+  "ram:1tb",
+  // storage
+  "nvme:2tb",
+  "nvme:8tb",
+  "nvme:30tb",
+  "cache:hot-tier",
+  "cache:cold-tier",
+  // networking
+  "nic:100gbe",
+  "nic:25gbe",
+  "nic:1gbe",
+  "rdma:roce-v2",
+  "infiniband:hdr-200g",
+  "lat:<200μs",
+  "lat:<1ms",
+  "lat:<50ns",
+  // sensors / actuators / devices
+  "sensor:lidar",
+  "sensor:imu",
+  "sensor:gps",
+  "sensor:thermal",
+  "sensor:radar",
+  "sensor:ph",
+  "sensor:co2",
+  "camera:4k",
+  "camera:depth",
+  "actuator:servo",
+  "actuator:relay",
+  "actuator:valve",
+  // radio
+  "radio:5g-mmwave",
+  "radio:wifi7",
+  "radio:5g",
+  // industrial
+  "plc:siemens-s7",
+  "plc:rockwell",
+  "robot:fanuc-r-30ib",
+  // region / dc / colo
+  "region:eu-west",
+  "region:us-east-1",
+  "region:apac-sg",
+  "region:sa-east",
+  "tag:nyse-colo",
+  "tag:cme-floor",
+  "tag:nikkei-225",
+  "tag:lse-pit",
+  "tag:floor-A",
+  "tag:rack-12",
+  // runtime / os
+  "runtime:wasm",
+  "runtime:cuda-12.4",
+  "runtime:rocm-6.0",
+  "kernel:linux-6.8",
+  "kernel:rtos",
+  "os:ubuntu-24",
+  "os:nixos",
+  // identity / attestation
+  "cert:secure-enclave",
+];
+
+function pickAdTags(): string[] {
+  const count = Math.random() < 0.55 ? 1 : 2;
+  const out: string[] = [];
+  // Dedupe by category prefix — never emit two `nic:`/`os:`/`ram:`/
+  // `kernel:`/`region:`/etc. tags in the same advertisement.
+  const usedCats = new Set<string>();
+  let safety = 12;
+  while (out.length < count && safety-- > 0) {
+    const tag = MESH_AD_TAGS[Math.floor(Math.random() * MESH_AD_TAGS.length)]!;
+    const cat = tag.split(":")[0]!;
+    if (usedCats.has(cat)) continue;
+    usedCats.add(cat);
+    out.push(tag);
+  }
+  return out;
+}
 
 function MeshAutoform() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -4663,11 +4757,12 @@ function MeshAutoform() {
 
       // capability advertisements — periodic flair
       advertiseTimer += dt;
-      if (advertiseTimer > 3.7) {
+      if (advertiseTimer > 2.6) {
         advertiseTimer = 0;
         const live = nodes.filter((n) => n.age >= n.spawnDelay);
         if (live.length > 0) {
           const n = live[Math.floor(Math.random() * live.length)]!;
+          const tags = pickAdTags();
           pushFeed(
             "▸",
             "rgb(107, 138, 30)",
@@ -4676,6 +4771,7 @@ function MeshAutoform() {
               <span style={{ color: `rgb(${capabilityRgb(n.cap)})` }}>
                 [{n.cap}]
               </span>{" "}
+              <span className="text-accent-dim">{tags.join(" ")}</span>{" "}
               <span className="text-ink-faint">
                 ttl={Math.floor(800 + Math.random() * 2200)}ms
               </span>
