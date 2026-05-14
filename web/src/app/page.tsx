@@ -4912,7 +4912,7 @@ function MeshAutoform() {
           </span>
           <span className="text-accent">$</span>
           <span>
-            meshosctl autoform{" "}
+            meshos-ctl autoform{" "}
             <span className="text-ink-faint normal-case tracking-normal">
               --live --mesh=local --autoform=true
             </span>
