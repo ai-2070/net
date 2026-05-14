@@ -13,7 +13,7 @@ import { DisplayHeading } from "./DisplayHeading";
 // toward a new equilibrium. Faint matrix rain falls behind everything.
 // =========================================================================
 
-type MeshCapability = "device" | "compute" | "region" | "daemon" | "datafort";
+type MeshCapability = "device" | "compute" | "storage" | "daemon" | "datafort";
 
 interface AutoMeshNode {
   id: number;
@@ -99,7 +99,7 @@ function pickCapability(): MeshCapability {
   if (r < 0.18) return "datafort";
   if (r < 0.4) return "device";
   if (r < 0.6) return "compute";
-  if (r < 0.8) return "region";
+  if (r < 0.8) return "storage";
   return "daemon";
 }
 
@@ -109,7 +109,7 @@ function capabilityRgb(cap: MeshCapability): string {
       return "196, 255, 61";
     case "compute":
       return "107, 138, 30";
-    case "region":
+    case "storage":
       return "61, 240, 255";
     case "daemon":
       return "212, 220, 208";
@@ -124,7 +124,7 @@ function nodeGlyph(cap: MeshCapability): string {
       return "◈";
     case "compute":
       return "▣";
-    case "region":
+    case "storage":
       return "◉";
     case "daemon":
       return "◇";
@@ -211,11 +211,11 @@ const MESH_AD_TAGS: ReadonlyArray<string> = [
   "plc:siemens-s7",
   "plc:rockwell",
   "robot:fanuc-r-30ib",
-  // region / dc / colo
-  "region:eu-west",
-  "region:us-east-1",
-  "region:apac-sg",
-  "region:sa-east",
+  // storage / dc / colo
+  "storage:eu-west",
+  "storage:us-east-1",
+  "storage:apac-sg",
+  "storage:sa-east",
   "tag:nyse-colo",
   "tag:cme-floor",
   "tag:nikkei-225",
@@ -238,7 +238,7 @@ function pickAdTags(): string[] {
   const count = Math.random() < 0.55 ? 1 : 2;
   const out: string[] = [];
   // Dedupe by category prefix — never emit two `nic:`/`os:`/`ram:`/
-  // `kernel:`/`region:`/etc. tags in the same advertisement.
+  // `kernel:`/`storage:`/etc. tags in the same advertisement.
   const usedCats = new Set<string>();
   let safety = 12;
   while (out.length < count && safety-- > 0) {
@@ -893,7 +893,7 @@ const MESH_OS_CAPABILITY_STRIP: ReadonlyArray<{
   {
     num: "mesh.os.4",
     name: "Capability Match",
-    body: "nodes advertise what they are — device, compute, region, daemon, datafort. MeshOS routes daemons to nodes that fit.",
+    body: "nodes advertise what they are — device, compute, storage, daemon, datafort. MeshOS routes daemons to nodes that fit.",
   },
 ];
 
