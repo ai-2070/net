@@ -1,0 +1,50 @@
+net/crates/net/deck/src/app.rs
+  s_3bbc444b3ef3e5::t_cf15ba78ace9d2 1-137
+net/crates/net/deck/src/widgets/status_bar.rs
+  s_3bbc444b3ef3e5::t_361f0f98ef03e5 1-48
+net/crates/net/deck/src/theme.rs
+  s_3bbc444b3ef3e5::t_bd822a5e9a9369 1-57
+net/crates/net/Cargo.toml
+  s_3bbc444b3ef3e5::t_edc311804406b4 5
+net/crates/net/deck/src/widgets/rule.rs
+  s_3bbc444b3ef3e5::t_29fbf6047eb615 1-11
+net/crates/net/deck/src/tabs/net_map.rs
+  s_3bbc444b3ef3e5::t_c8c88dddbad61f 1-245
+net/crates/net/deck/src/widgets/tab_bar.rs
+  s_3bbc444b3ef3e5::t_a4012310ed4bc6 1-41
+net/crates/net/deck/src/tabs/mod.rs
+  s_3bbc444b3ef3e5::t_1f426319502b5b 1-5
+net/crates/net/deck/src/tabs/list_view.rs
+  s_3bbc444b3ef3e5::t_73571a07242640 4
+  s_3bbc444b3ef3e5::t_bd532ed96fab3f 1-3,5-191
+net/crates/net/deck/src/widgets/mod.rs
+  s_3bbc444b3ef3e5::t_de2a840d002172 1-4
+net/crates/net/deck/src/widgets/footer.rs
+  s_3bbc444b3ef3e5::t_1e6538f3023dcb 1-22
+net/crates/net/deck/src/tabs/dataforts.rs
+  s_3bbc444b3ef3e5::t_3c6adc3c51bf67 1-163
+net/crates/net/deck/src/main.rs
+  s_3bbc444b3ef3e5::t_6e46bce697b598 1-20
+net/crates/net/deck/src/tabs/logs.rs
+  s_3bbc444b3ef3e5::t_09e222c9cd6a6f 1-148
+net/crates/net/deck/Cargo.toml
+  s_3bbc444b3ef3e5::t_8cb0cfc86ec325 1-16
+net/crates/net/deck/src/tabs/daemon.rs
+  s_3bbc444b3ef3e5::t_82f4a7db18eb2e 1-216
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "f2c078cfc9825822d540e50eeebf1d2abe5ef712",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
