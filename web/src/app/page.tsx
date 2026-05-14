@@ -4054,7 +4054,7 @@ function DatafortsConsole() {
           </span>
           <span className="text-accent">$</span>
           <span>
-            datafortsctl status{" "}
+            dataforts-ctl status{" "}
             <span className="text-ink-faint">--live --pool=mesh</span>
           </span>
         </span>
