@@ -342,3 +342,84 @@ async fn substrate_admin_verifier_accepts_a_valid_signed_ice_commit_and_folds_it
     );
     let _ = runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn ice_audit_ring_records_accepted_and_rejected_attempts() {
+    // The substrate verifier records every SignedIceCommit it
+    // sees — accepted AND rejected — on the snapshot's
+    // ice_audit ring. Security review reads this to replay
+    // every break-glass attempt regardless of outcome.
+    use net::adapter::net::behavior::meshos::VerificationOutcome;
+    use std::sync::Arc as SArc;
+    let dispatcher = Arc::new(LoggingDispatcher::new());
+    let op = OperatorIdentity::generate();
+    let mut registry = OperatorRegistry::new();
+    registry.register(op.keypair());
+    let verifier = SArc::new(AdminVerifier::new(SArc::new(registry), 1));
+    let runtime = MeshOsRuntime::start_with_all(
+        fast_config(),
+        dispatcher,
+        Default::default(),
+        Default::default(),
+        SArc::new(net::adapter::net::compute::DaemonRegistry::new()),
+        None,
+        Some(verifier),
+    );
+
+    // One accepted commit.
+    let good = IceActionProposal::FreezeCluster {
+        ttl: Duration::from_secs(30),
+    };
+    let good_sig = OperatorSignature::sign(op.keypair(), &good);
+    runtime
+        .handle()
+        .publish(MeshOsEvent::SignedIceCommit {
+            proposal: good.clone(),
+            signatures: vec![good_sig],
+        })
+        .await
+        .unwrap();
+
+    // One rejected commit (tampered signature bytes).
+    let bad = IceActionProposal::ThawCluster;
+    let mut bad_sig = OperatorSignature::sign(op.keypair(), &bad);
+    bad_sig.signature[0] ^= 0xFF;
+    runtime
+        .handle()
+        .publish(MeshOsEvent::SignedIceCommit {
+            proposal: bad.clone(),
+            signatures: vec![bad_sig],
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let snap = runtime.snapshot();
+    assert_eq!(
+        snap.ice_audit.len(),
+        2,
+        "every SignedIceCommit should land on the audit ring; got {}",
+        snap.ice_audit.len(),
+    );
+    let accepted = snap
+        .ice_audit
+        .iter()
+        .filter(|r| matches!(r.outcome, VerificationOutcome::Accepted))
+        .count();
+    let rejected = snap
+        .ice_audit
+        .iter()
+        .filter(|r| matches!(r.outcome, VerificationOutcome::Rejected { .. }))
+        .count();
+    assert_eq!(accepted, 1, "exactly one accepted commit");
+    assert_eq!(rejected, 1, "exactly one rejected commit");
+    // The rejected entry carries the operator id even though
+    // the signature failed verification.
+    let rej = snap
+        .ice_audit
+        .iter()
+        .find(|r| matches!(r.outcome, VerificationOutcome::Rejected { .. }))
+        .unwrap();
+    assert_eq!(rej.operator_ids, vec![op.operator_id()]);
+    let _ = runtime.shutdown().await;
+}

@@ -48,5 +48,5 @@ pub use net::adapter::net::behavior::deck::{
 // build commands or read snapshots.
 pub use net::adapter::net::behavior::meshos::{
     AdminEvent, AdminVerifier, AvoidScope, BlastRadius, BlastWarning, ChainId, IceActionProposal,
-    MeshOsSnapshot, NodeId, VerifyError,
+    IceAuditRecord, MeshOsSnapshot, NodeId, VerificationOutcome, VerifyError,
 };

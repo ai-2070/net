@@ -571,22 +571,34 @@ impl MeshOsLoop {
 
     fn apply(&mut self, event: &MeshOsEvent) {
         // ICE-signed commits get their own gate: verify the
-        // bundle before folding the inner AdminEvent.
+        // bundle before folding the inner AdminEvent. The
+        // outcome (accepted, rejected, unverified) lands on the
+        // ice_audit ring regardless of verification result so
+        // security review can replay every attempt.
         if let MeshOsEvent::SignedIceCommit {
             proposal,
             signatures,
         } = event
         {
-            if let Some(verifier) = self.admin_verifier.as_ref() {
-                if let Err(err) = verifier.verify_commit(proposal, signatures) {
-                    tracing::warn!(
-                        target: "meshos",
-                        kind = err.kind(),
-                        error = %err,
-                        "rejected SignedIceCommit — signature verification failed",
-                    );
-                    return;
-                }
+            let outcome = match self.admin_verifier.as_ref() {
+                Some(verifier) => match verifier.verify_commit(proposal, signatures) {
+                    Ok(()) => super::ice::VerificationOutcome::Accepted,
+                    Err(err) => super::ice::VerificationOutcome::Rejected {
+                        kind: err.kind().to_string(),
+                        message: err.to_string(),
+                    },
+                },
+                None => super::ice::VerificationOutcome::Unverified,
+            };
+            self.record_ice_audit(proposal, signatures, &outcome);
+            if let super::ice::VerificationOutcome::Rejected { kind, message } = &outcome {
+                tracing::warn!(
+                    target: "meshos",
+                    kind = %kind,
+                    error = %message,
+                    "rejected SignedIceCommit — signature verification failed",
+                );
+                return;
             }
             // Verification passed (or no verifier installed —
             // tests / dev mode). Fold as if the inner AdminEvent
@@ -612,6 +624,32 @@ impl MeshOsLoop {
         }
         self.actual.apply(event, self.config.this_node);
         self.emit_maintenance_transitions();
+    }
+
+    /// Record an ICE-commit outcome on the state's audit ring.
+    /// Bounded by [`super::ice::DEFAULT_MAX_ICE_AUDIT_RECORDS`];
+    /// drops oldest FIFO when the cap is exceeded.
+    fn record_ice_audit(
+        &mut self,
+        proposal: &super::ice::IceActionProposal,
+        signatures: &[super::ice::OperatorSignature],
+        outcome: &super::ice::VerificationOutcome,
+    ) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let committed_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let record = super::ice::IceAuditRecord {
+            committed_at_ms,
+            proposal: proposal.clone(),
+            operator_ids: signatures.iter().map(|s| s.operator_id).collect(),
+            outcome: outcome.clone(),
+        };
+        self.actual.ice_audit.push_back(record);
+        while self.actual.ice_audit.len() > super::ice::DEFAULT_MAX_ICE_AUDIT_RECORDS {
+            self.actual.ice_audit.pop_front();
+        }
     }
 
     /// Detect `local_maintenance` discriminant transitions and

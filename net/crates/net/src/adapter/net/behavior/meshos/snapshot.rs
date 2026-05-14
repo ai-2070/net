@@ -64,6 +64,14 @@ pub struct MeshOsSnapshot {
     /// `AdminEvent::FreezeCluster` / `AdminEvent::ThawCluster`
     /// admin commits.
     pub freeze_remaining_ms: Option<u64>,
+    /// ICE audit ring — every `SignedIceCommit` the loop's
+    /// verifier observed, accepted or rejected, ordered
+    /// oldest-first. Bounded by
+    /// [`super::ice::DEFAULT_MAX_ICE_AUDIT_RECORDS`]. The Deck
+    /// SDK's `audit().force_only()` (forthcoming) reads this
+    /// ring; security review replays it to confirm every
+    /// break-glass attempt was authorized.
+    pub ice_audit: Vec<super::ice::IceAuditRecord>,
 }
 
 /// Per-daemon Deck-renderable summary.
@@ -450,6 +458,7 @@ impl MeshOsSnapshot {
         let freeze_remaining_ms = actual
             .freeze_until
             .map(|until| until.saturating_duration_since(now).as_millis() as u64);
+        let ice_audit: Vec<super::ice::IceAuditRecord> = actual.ice_audit.iter().cloned().collect();
 
         Self {
             daemons,
@@ -460,6 +469,7 @@ impl MeshOsSnapshot {
             pending,
             recent_failures: recent_failures.iter().cloned().collect(),
             freeze_remaining_ms,
+            ice_audit,
         }
     }
 }

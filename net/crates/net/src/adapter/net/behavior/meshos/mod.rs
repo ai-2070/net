@@ -93,7 +93,8 @@ pub use executor::{
 };
 pub use ice::{
     ice_proposal_signing_payload, simulate as simulate_ice_proposal, AdminVerifier, BlastRadius,
-    BlastWarning, IceActionProposal, OperatorRegistry, OperatorSignature, VerifyError,
+    BlastWarning, IceActionProposal, IceAuditRecord, OperatorRegistry, OperatorSignature,
+    VerificationOutcome, VerifyError, DEFAULT_MAX_ICE_AUDIT_RECORDS,
 };
 pub use maintenance::MaintenanceState;
 pub use probes::{

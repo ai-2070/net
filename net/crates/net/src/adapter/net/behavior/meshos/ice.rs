@@ -297,6 +297,70 @@ impl VerifyError {
     }
 }
 
+/// Default cap on the per-node ICE audit ring. Records older
+/// than this drop FIFO so the substrate's audit buffer stays
+/// fixed-overhead under churn. Sized for "a few minutes of
+/// operator activity" rather than "complete history" — the
+/// canonical replay path is the eventual ICE audit subchain;
+/// this ring is the in-memory snapshot-side surface the Deck
+/// SDK reads against until the subchain ships.
+pub const DEFAULT_MAX_ICE_AUDIT_RECORDS: usize = 256;
+
+/// Outcome the substrate verifier recorded for an attempted
+/// ICE commit. Both accepted and rejected attempts surface on
+/// the audit ring so security review can replay every
+/// break-glass attempt — successful or otherwise.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum VerificationOutcome {
+    /// The verifier accepted the bundle; the inner `AdminEvent`
+    /// folded normally.
+    Accepted,
+    /// The verifier rejected the bundle. `kind` carries the
+    /// stable [`VerifyError::kind`] discriminator; `message`
+    /// is the operator-readable detail.
+    Rejected {
+        /// Discriminator the cross-language SDKs branch on
+        /// (`not_authorized`, `signature_invalid`,
+        /// `insufficient_signatures`).
+        kind: String,
+        /// Operator-readable detail.
+        message: String,
+    },
+    /// No verifier was installed when the commit arrived; the
+    /// inner event folded without verification. Only seen in
+    /// in-process tests and dev configs — production loops
+    /// install a verifier.
+    Unverified,
+}
+
+/// One entry on the substrate's ICE audit ring. The
+/// [`super::event_loop::MeshOsLoop`] records one of these per
+/// [`super::event::MeshOsEvent::SignedIceCommit`] regardless of
+/// whether the verifier accepted or rejected the bundle.
+///
+/// Carries the operator ids (not the full 64-byte signature
+/// bytes) because the audit consumer doesn't need the
+/// cryptographic material — just "who claimed authorship of
+/// this commit."
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IceAuditRecord {
+    /// Wall-clock milliseconds since `UNIX_EPOCH` at the
+    /// moment the loop received the commit. Distinct from
+    /// `Instant`-based timing the rest of the loop uses so
+    /// audit consumers don't need a reference instant.
+    pub committed_at_ms: u64,
+    /// The proposal payload the signature bundle covered.
+    pub proposal: IceActionProposal,
+    /// Issuing operator ids from the bundle's signatures. The
+    /// signatures themselves aren't retained — the verifier
+    /// already accepted or rejected them, and the audit ring
+    /// is a footprint surface, not a re-verification surface.
+    pub operator_ids: Vec<u64>,
+    /// The verifier's outcome for this attempt.
+    pub outcome: VerificationOutcome,
+}
+
 /// Substrate-side ICE admin verifier — bundles a shared
 /// [`OperatorRegistry`] with the cluster's signature threshold.
 /// Installed on [`super::event_loop::MeshOsLoop`] via
@@ -1078,6 +1142,43 @@ mod tests {
             }
             other => panic!("expected ForceEvictReplica, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ice_audit_record_postcard_round_trips_each_outcome() {
+        for outcome in [
+            VerificationOutcome::Accepted,
+            VerificationOutcome::Rejected {
+                kind: "signature_invalid".into(),
+                message: "bad sig".into(),
+            },
+            VerificationOutcome::Unverified,
+        ] {
+            let record = IceAuditRecord {
+                committed_at_ms: 12_345,
+                proposal: IceActionProposal::FreezeCluster {
+                    ttl: Duration::from_secs(60),
+                },
+                operator_ids: vec![1, 2, 3],
+                outcome: outcome.clone(),
+            };
+            let bytes = postcard::to_allocvec(&record).expect("encode");
+            let decoded: IceAuditRecord = postcard::from_bytes(&bytes).expect("decode");
+            assert_eq!(decoded, record);
+        }
+    }
+
+    #[test]
+    fn ice_audit_record_json_round_trips_for_audit_query_path() {
+        let record = IceAuditRecord {
+            committed_at_ms: 999,
+            proposal: IceActionProposal::ThawCluster,
+            operator_ids: vec![42],
+            outcome: VerificationOutcome::Accepted,
+        };
+        let json = serde_json::to_string(&record).expect("encode");
+        let decoded: IceAuditRecord = serde_json::from_str(&json).expect("decode");
+        assert_eq!(decoded, record);
     }
 
     #[test]
