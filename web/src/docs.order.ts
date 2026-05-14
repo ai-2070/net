@@ -1,14 +1,19 @@
 import type { DocsOrderConfig } from "@/lib/docs";
 
-// Custom ordering for the /docs sidebar.
+// Custom ordering, hiding, and labelling for the /docs sidebar.
 //
-// - `sections` controls the order of top-level folders (anything missing
-//   appends in alpha order after).
-// - `folders[<slug-path>]` controls the order of a folder's children
-//   (files and nested folders mixed, again alpha-fallback for unlisted).
+// - `sections` orders top-level folders. Missing ones append alpha after.
+// - `folders[<slug-path>]` orders a folder's children (files + nested
+//   folders mixed). Missing ones append alpha after.
+// - `hide` removes entries from the sidebar entirely. Folders cascade —
+//   hiding `misc` also makes everything under `misc/` unreachable.
+// - `labels` overrides the auto-titleized name for any entry, shown in
+//   the sidebar, breadcrumbs, and folder/page headers.
 //
-// Slugs are lowercased filenames-without-`.md` and lowercased folder names.
-// Folder keys use the full slug path: `"releases"`, `"plans/nested"`, etc.
+// Slug paths use lowercased filenames-without-`.md` and lowercased folder
+// names, joined by `/`: `"releases"`, `"plans/nested"`,
+// `"releases/release_v0.17_atomic_playboys"`. All keys are matched
+// case-insensitively — author them however reads best.
 export const DOCS_ORDER: DocsOrderConfig = {
   sections: ["plans", "releases", "misc"],
   folders: {
@@ -26,4 +31,9 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "release_steps",
     ],
   },
+  // hide: ["misc", "plans/draft_notes"],
+  // labels: {
+  //   releases: "Release Notes",
+  //   "releases/release_v0.17_atomic_playboys": "v0.17 — Atomic Playboys",
+  // },
 };

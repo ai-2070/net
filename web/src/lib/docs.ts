@@ -12,6 +12,12 @@ export type DocsOrderConfig = {
   /** Order of children within a folder, keyed by full slug path joined by `/`
    * (e.g. `"releases"`, `"plans/nested"`). Unlisted append alpha after. */
   folders?: Record<string, string[]>;
+  /** Slug paths to omit from the sidebar entirely. Hidden folders cascade —
+   * their children are unreachable too. Matching is case-insensitive. */
+  hide?: string[];
+  /** Custom display labels keyed by slug path. Overrides the auto-titleized
+   * name in the sidebar, breadcrumbs, and page heading. */
+  labels?: Record<string, string>;
 };
 
 // Reorders `items` by the slugs listed in `order`. Listed items come first
@@ -53,6 +59,27 @@ function folderOrder(folderKey: string): string[] | undefined {
     if (k.toLowerCase() === lower) return cfg[k];
   }
   return undefined;
+}
+
+function isHidden(slug: string[]): boolean {
+  const cfg = DOCS_ORDER.hide;
+  if (!cfg || cfg.length === 0) return false;
+  const key = slug.join("/").toLowerCase();
+  return cfg.some((h) => h.toLowerCase() === key);
+}
+
+function customLabel(slug: string[]): string | undefined {
+  const cfg = DOCS_ORDER.labels;
+  if (!cfg) return undefined;
+  const key = slug.join("/").toLowerCase();
+  for (const k of Object.keys(cfg)) {
+    if (k.toLowerCase() === key) return cfg[k];
+  }
+  return undefined;
+}
+
+function resolveTitle(slug: string[], rawName: string): string {
+  return customLabel(slug) ?? titleize(rawName);
 }
 
 export type DocFile = {
@@ -115,12 +142,16 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
     const entryPath = join(absPath, entry);
     const stat = statSync(entryPath);
     if (stat.isDirectory()) {
-      folders.push(buildFolder(entryPath, [...slugChain, entry.toLowerCase()]));
+      const childSlug = [...slugChain, entry.toLowerCase()];
+      if (isHidden(childSlug)) continue;
+      folders.push(buildFolder(entryPath, childSlug));
     } else if (stat.isFile() && entry.toLowerCase().endsWith(".md")) {
+      const childSlug = [...slugChain, slugSegment(entry)];
+      if (isHidden(childSlug)) continue;
       const file: DocFile = {
         kind: "file",
-        slug: [...slugChain, slugSegment(entry)],
-        title: titleize(entry),
+        slug: childSlug,
+        title: resolveTitle(childSlug, entry),
         filePath: entryPath,
       };
       if (isReadme(entry)) readme = file;
@@ -138,7 +169,7 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
   return {
     kind: "folder",
     slug: slugChain,
-    title: titleize(folderName),
+    title: resolveTitle(slugChain, folderName),
     readme,
     children: orderedChildren,
   };
@@ -161,12 +192,16 @@ export function getDocTree(): DocTree {
     const entryPath = join(DOCS_ROOT, entry);
     const stat = statSync(entryPath);
     if (stat.isDirectory()) {
-      folders.push(buildFolder(entryPath, [entry.toLowerCase()]));
+      const childSlug = [entry.toLowerCase()];
+      if (isHidden(childSlug)) continue;
+      folders.push(buildFolder(entryPath, childSlug));
     } else if (stat.isFile() && entry.toLowerCase().endsWith(".md")) {
+      const childSlug = [slugSegment(entry)];
+      if (isHidden(childSlug)) continue;
       const file: DocFile = {
         kind: "file",
-        slug: [slugSegment(entry)],
-        title: titleize(entry),
+        slug: childSlug,
+        title: resolveTitle(childSlug, entry),
         filePath: entryPath,
       };
       if (isReadme(entry)) rootReadme = file;
