@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-
 import type { RepoInfo } from "@/lib/repo-info";
 
 export function TopStatusBar({ version, codename, buildDate, sha }: RepoInfo) {
