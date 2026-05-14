@@ -113,6 +113,14 @@ pub enum MeshOsEvent {
         signature: super::ice::OperatorSignature,
     },
 
+    /// A log line published by a daemon, source converter,
+    /// or substrate-internal component. The loop stamps a
+    /// monotonic seq + wall-clock timestamp + this node's id
+    /// before pushing onto the per-node log ring. The Deck
+    /// SDK's `subscribe_logs` reads the ring through the
+    /// snapshot.
+    LogLine(super::logs::LogLine),
+
     /// A blob was announced / removed. Source (Phase E): the
     /// Dataforts capability fold.
     BlobAnnouncement(BlobAnnouncement),

@@ -104,6 +104,12 @@ pub struct MeshOsLoop {
     /// stream depends on this for dedup across snapshot polls.
     admin_audit_seq: u64,
 
+    /// Monotonic counter the loop stamps onto every
+    /// `LogRecord` it emits. Same pattern as
+    /// `admin_audit_seq`; the Deck SDK's log-tail stream
+    /// dedups against this.
+    log_seq: u64,
+
     /// Actions reconcile emitted that the action-queue
     /// `try_send` rejected because the executor was at
     /// `action_queue_capacity`. Cloneable counter — the runtime
@@ -370,6 +376,7 @@ impl MeshOsLoop {
             scheduler: SchedulerRegistry::new(),
             reconcile_count: 0,
             admin_audit_seq: 0,
+            log_seq: 0,
             dropped_actions: Arc::new(AtomicU64::new(0)),
             executor_failures: None,
             control_sink: None,
@@ -659,6 +666,12 @@ impl MeshOsLoop {
             self.emit_maintenance_transitions();
             return;
         }
+        // Log lines bypass the actual/desired fold entirely;
+        // the loop stamps + pushes onto the log ring directly.
+        if let MeshOsEvent::LogLine(line) = event {
+            self.record_log_line(line);
+            return;
+        }
         match event {
             MeshOsEvent::PlacementIntent(intent) => self.desired.apply(intent),
             MeshOsEvent::DaemonIntentUpdate(update) => self.desired.apply_daemon_intent(update),
@@ -711,6 +724,30 @@ impl MeshOsLoop {
         self.actual.admin_audit.push_back(record);
         while self.actual.admin_audit.len() > super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS {
             self.actual.admin_audit.pop_front();
+        }
+    }
+
+    /// Stamp + push a `LogLine` onto the per-node log ring.
+    /// Bounded by [`super::logs::DEFAULT_MAX_LOG_RING_RECORDS`];
+    /// drops oldest FIFO when the cap is exceeded.
+    fn record_log_line(&mut self, line: &super::logs::LogLine) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.log_seq += 1;
+        let record = super::logs::LogRecord {
+            seq: self.log_seq,
+            ts_ms,
+            level: line.level,
+            daemon_id: line.daemon_id,
+            node_id: Some(self.config.this_node),
+            message: line.message.clone(),
+        };
+        self.actual.log_ring.push_back(record);
+        while self.actual.log_ring.len() > super::logs::DEFAULT_MAX_LOG_RING_RECORDS {
+            self.actual.log_ring.pop_front();
         }
     }
 

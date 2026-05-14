@@ -103,6 +103,13 @@ pub struct MeshOsState {
     /// exceeded. Snapshot exports this verbatim for the Deck
     /// SDK's `audit()` query path.
     pub(crate) admin_audit: std::collections::VecDeque<super::ice::AdminAuditRecord>,
+    /// Ring buffer of log records — every
+    /// `MeshOsEvent::LogLine` daemons or source converters
+    /// publish lands here. Bounded to
+    /// [`super::logs::DEFAULT_MAX_LOG_RING_RECORDS`]; older
+    /// entries drop FIFO. The Deck SDK's `subscribe_logs`
+    /// reads the ring through the snapshot.
+    pub(crate) log_ring: std::collections::VecDeque<super::logs::LogRecord>,
 }
 
 /// Per-daemon observed status. Phase B fleshes out the fields
@@ -255,6 +262,14 @@ impl MeshOsState {
                 // these arms are dead in production. Kept
                 // explicit so future MeshOsEvent additions
                 // can't silently skip the fold.
+            }
+            MeshOsEvent::LogLine(_) => {
+                // The loop's record_log_line path stamps the
+                // record's seq + ts + node id and pushes onto
+                // the log ring directly — this arm is dead in
+                // production but kept explicit so future
+                // MeshOsEvent additions don't silently skip
+                // the fold.
             }
         }
     }

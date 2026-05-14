@@ -426,6 +426,23 @@ impl DeckClient {
         AuditQuery::new(self)
     }
 
+    /// Subscribe to the substrate's per-node log ring with
+    /// the given filter. Returns a [`LogStream`] that tails
+    /// matching log lines as they arrive — same dedup pattern
+    /// as the audit-tail stream (monotonic per-runtime `seq`
+    /// watermark).
+    ///
+    /// `filter` defaults to "everything"; chain
+    /// [`LogFilter::min_level`] / [`LogFilter::with_daemon`]
+    /// / [`LogFilter::with_node`] to narrow the result.
+    pub fn subscribe_logs(&self, filter: LogFilter) -> LogStream {
+        LogStream::new(
+            self.snapshot_reader.clone(),
+            self.config.snapshot_poll_interval,
+            filter,
+        )
+    }
+
     /// Open a [`SnapshotStream`] over the runtime's snapshot
     /// reader. The stream polls at
     /// [`DeckClientConfig::snapshot_poll_interval`] and emits a
@@ -1272,6 +1289,135 @@ impl Stream for AuditStream {
     }
 }
 
+/// Log-stream filter. Default is "everything"; chain the
+/// builder methods to narrow.
+#[derive(Clone, Debug, Default)]
+pub struct LogFilter {
+    /// Minimum severity. Records below this are dropped.
+    /// `None` matches every level.
+    pub min_level: Option<super::meshos::LogLevel>,
+    /// Restrict to a specific daemon. `None` matches every
+    /// daemon (and substrate-level lines with `daemon_id =
+    /// None`).
+    pub daemon_id: Option<u64>,
+    /// Restrict to a specific node. `None` matches every node.
+    /// Future-relevant when remote log lines arrive via the
+    /// per-daemon RedEX-tail integration.
+    pub node_id: Option<NodeId>,
+}
+
+impl LogFilter {
+    /// Empty filter — matches every record on the ring.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Restrict to records at or above `level`.
+    pub fn min_level(mut self, level: super::meshos::LogLevel) -> Self {
+        self.min_level = Some(level);
+        self
+    }
+
+    /// Restrict to records originating from `daemon_id`.
+    pub fn with_daemon(mut self, daemon_id: u64) -> Self {
+        self.daemon_id = Some(daemon_id);
+        self
+    }
+
+    /// Restrict to records originating from `node_id`.
+    pub fn with_node(mut self, node_id: NodeId) -> Self {
+        self.node_id = Some(node_id);
+        self
+    }
+
+    fn matches(&self, record: &super::meshos::LogRecord) -> bool {
+        if let Some(min) = self.min_level {
+            if record.level < min {
+                return false;
+            }
+        }
+        if let Some(id) = self.daemon_id {
+            if record.daemon_id != Some(id) {
+                return false;
+            }
+        }
+        if let Some(node) = self.node_id {
+            if record.node_id != Some(node) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Log-tail stream returned by [`DeckClient::subscribe_logs`].
+/// Yields each matching [`super::meshos::LogRecord`] once.
+/// Dedups across snapshot polls via the per-runtime monotonic
+/// `LogRecord::seq` (same pattern as [`AuditStream`]).
+pub struct LogStream {
+    reader: super::meshos::MeshOsSnapshotReader,
+    interval: Interval,
+    filter: LogFilter,
+    last_seq: u64,
+    queued: std::collections::VecDeque<super::meshos::LogRecord>,
+}
+
+impl LogStream {
+    fn new(
+        reader: super::meshos::MeshOsSnapshotReader,
+        poll_interval: Duration,
+        filter: LogFilter,
+    ) -> Self {
+        let poll_interval = poll_interval.max(Duration::from_millis(1));
+        Self {
+            reader,
+            interval: interval(poll_interval),
+            filter,
+            last_seq: 0,
+            queued: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl Stream for LogStream {
+    type Item = Result<super::meshos::LogRecord, DeckError>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        if let Some(record) = self.queued.pop_front() {
+            return Poll::Ready(Some(Ok(record)));
+        }
+        match self.interval.poll_tick(cx) {
+            Poll::Ready(_) => {
+                let snap = self.reader.read();
+                let last_seq = self.last_seq;
+                let mut max_seq = last_seq;
+                for record in snap.log_ring.into_iter() {
+                    if record.seq <= last_seq {
+                        continue;
+                    }
+                    if record.seq > max_seq {
+                        max_seq = record.seq;
+                    }
+                    if self.filter.matches(&record) {
+                        self.queued.push_back(record);
+                    }
+                }
+                self.last_seq = max_seq;
+                if let Some(record) = self.queued.pop_front() {
+                    Poll::Ready(Some(Ok(record)))
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// Stream over the runtime's snapshot reader. Polls at the
 /// configured cadence; emits a `Result<MeshOsSnapshot, DeckError>`
 /// per poll. Phase 1 emits on every poll (consumers de-dupe if
@@ -1900,6 +2046,127 @@ mod tests {
             .await
             .expect_err("predicate never holds, should time out");
         assert_eq!(err.kind, "watch_timeout");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_logs_yields_published_log_lines_in_seq_order() {
+        use crate::adapter::net::behavior::meshos::{LogLevel, LogLine, MeshOsEvent};
+        use futures::StreamExt;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(15),
+                ..DeckClientConfig::default()
+            });
+
+        let mut stream = deck.subscribe_logs(LogFilter::new());
+        for (i, level) in [LogLevel::Info, LogLevel::Warn, LogLevel::Error]
+            .into_iter()
+            .enumerate()
+        {
+            runtime
+                .handle()
+                .publish(MeshOsEvent::LogLine(LogLine {
+                    level,
+                    daemon_id: Some(7),
+                    message: format!("msg {}", i),
+                }))
+                .await
+                .unwrap();
+        }
+
+        let r1 = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("r1 timed out")
+            .expect("r1 closed")
+            .expect("r1 ok");
+        let r2 = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("r2 timed out")
+            .expect("r2 closed")
+            .expect("r2 ok");
+        let r3 = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("r3 timed out")
+            .expect("r3 closed")
+            .expect("r3 ok");
+        assert!(r1.seq < r2.seq);
+        assert!(r2.seq < r3.seq);
+        assert_eq!(r1.level, LogLevel::Info);
+        assert_eq!(r3.level, LogLevel::Error);
+        // The loop stamps `node_id = Some(this_node)` on every
+        // locally-published line.
+        assert_eq!(r1.node_id, Some(42));
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_logs_min_level_filter_drops_below_threshold() {
+        use crate::adapter::net::behavior::meshos::{LogLevel, LogLine, MeshOsEvent};
+        use futures::StreamExt;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(15),
+                ..DeckClientConfig::default()
+            });
+
+        let mut stream = deck.subscribe_logs(LogFilter::new().min_level(LogLevel::Warn));
+        runtime
+            .handle()
+            .publish(MeshOsEvent::LogLine(LogLine::info(None, "info dropped")))
+            .await
+            .unwrap();
+        runtime
+            .handle()
+            .publish(MeshOsEvent::LogLine(LogLine::warn(None, "warn kept")))
+            .await
+            .unwrap();
+
+        let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("next timed out")
+            .expect("next closed")
+            .expect("next ok");
+        assert_eq!(next.level, LogLevel::Warn);
+        assert_eq!(next.message, "warn kept");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_logs_with_daemon_filter_keeps_only_matching_daemon() {
+        use crate::adapter::net::behavior::meshos::{LogLine, MeshOsEvent};
+        use futures::StreamExt;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(15),
+                ..DeckClientConfig::default()
+            });
+
+        let mut stream = deck.subscribe_logs(LogFilter::new().with_daemon(7));
+        runtime
+            .handle()
+            .publish(MeshOsEvent::LogLine(LogLine::info(Some(99), "other daemon")))
+            .await
+            .unwrap();
+        runtime
+            .handle()
+            .publish(MeshOsEvent::LogLine(LogLine::info(Some(7), "target daemon")))
+            .await
+            .unwrap();
+
+        let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("next timed out")
+            .expect("next closed")
+            .expect("next ok");
+        assert_eq!(next.daemon_id, Some(7));
+        assert_eq!(next.message, "target daemon");
         let _ = runtime.shutdown().await;
     }
 

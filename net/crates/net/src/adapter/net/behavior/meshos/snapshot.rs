@@ -72,6 +72,13 @@ pub struct MeshOsSnapshot {
     /// `audit().force_only()` filters to just the ICE-class
     /// entries (`AdminEvent::is_ice()`).
     pub admin_audit: Vec<super::ice::AdminAuditRecord>,
+    /// Log ring — every `MeshOsEvent::LogLine` the loop
+    /// observed, ordered oldest-first. Bounded by
+    /// [`super::logs::DEFAULT_MAX_LOG_RING_RECORDS`]. The
+    /// Deck SDK's `subscribe_logs(filter)` reads this ring;
+    /// the future per-daemon RedEX-tail integration swaps the
+    /// backing store without changing the snapshot shape.
+    pub log_ring: Vec<super::logs::LogRecord>,
 }
 
 /// Per-daemon Deck-renderable summary.
@@ -460,6 +467,7 @@ impl MeshOsSnapshot {
             .map(|until| until.saturating_duration_since(now).as_millis() as u64);
         let admin_audit: Vec<super::ice::AdminAuditRecord> =
             actual.admin_audit.iter().cloned().collect();
+        let log_ring: Vec<super::logs::LogRecord> = actual.log_ring.iter().cloned().collect();
 
         Self {
             daemons,
@@ -471,6 +479,7 @@ impl MeshOsSnapshot {
             recent_failures: recent_failures.iter().cloned().collect(),
             freeze_remaining_ms,
             admin_audit,
+            log_ring,
         }
     }
 }

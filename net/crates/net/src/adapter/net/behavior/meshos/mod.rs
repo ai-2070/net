@@ -58,6 +58,7 @@ pub mod event;
 pub mod event_loop;
 pub mod executor;
 pub mod ice;
+pub mod logs;
 pub mod maintenance;
 pub mod probes;
 pub mod reconcile;
@@ -97,6 +98,7 @@ pub use ice::{
     OperatorRegistry, OperatorSignature, VerificationOutcome, VerifyError,
     DEFAULT_MAX_ADMIN_AUDIT_RECORDS,
 };
+pub use logs::{LogLevel, LogLine, LogRecord, DEFAULT_MAX_LOG_RING_RECORDS};
 pub use maintenance::MaintenanceState;
 pub use probes::{
     HealthProbe, LocalityProbe, ProximityGraphHealthProbe, ProximityGraphLocalityProbe,
