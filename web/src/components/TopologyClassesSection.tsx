@@ -30,7 +30,7 @@ const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
     title: "CAN / EtherCAT / TSN",
     titleColor: "ink",
     body: "Specialized hardware, optimized for deterministic timing. Fixed topologies. Dedicated hardware. Time-slotted access. Guarantees only because you own the wire.",
-    floor: "microseconds*",
+    floor: "microseconds†",
     floorColor: "ink",
     throughput: "~100K updates/s · dedicated bus",
   },
