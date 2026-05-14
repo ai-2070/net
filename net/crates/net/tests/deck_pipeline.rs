@@ -34,6 +34,42 @@ fn fast_config() -> MeshOsConfig {
         .with_action_queue_capacity(64)
 }
 
+/// Poll the runtime's snapshot at a tight interval until
+/// `predicate` returns true or the timeout expires. Returns
+/// the matching snapshot on success or an error message if the
+/// timeout elapses without the predicate ever holding.
+///
+/// Replaces the previous "`tokio::time::sleep(80ms)` then
+/// assert" pattern, which over-waited on the fast path and
+/// under-waited on slow hosts. The poll cadence
+/// (`5ms`) is much shorter than the loop's tick (15ms), so
+/// the test resolves within one tick after the loop publishes.
+async fn wait_for_snapshot<F>(
+    runtime: &MeshOsRuntime,
+    timeout: Duration,
+    mut predicate: F,
+) -> Result<net::adapter::net::behavior::meshos::MeshOsSnapshot, String>
+where
+    F: FnMut(&net::adapter::net::behavior::meshos::MeshOsSnapshot) -> bool,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let snap = runtime.snapshot();
+        if predicate(&snap) {
+            return Ok(snap);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "predicate never held within {timeout:?}; last snapshot freeze={:?} admin_audit_len={} log_ring_len={}",
+                snap.freeze_remaining_ms,
+                snap.admin_audit.len(),
+                snap.log_ring.len(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 #[tokio::test]
 async fn deck_client_enter_maintenance_flows_through_to_snapshot() {
     // Operator workflow: load identity, build a client, issue
@@ -363,12 +399,11 @@ async fn substrate_admin_verifier_accepts_a_valid_signed_ice_commit_and_folds_it
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    let snap = runtime.snapshot();
-    assert!(
-        snap.freeze_remaining_ms.is_some(),
-        "verified SignedIceCommit should fold its inner FreezeCluster admin event",
-    );
+    wait_for_snapshot(&runtime, Duration::from_secs(2), |s| {
+        s.freeze_remaining_ms.is_some()
+    })
+    .await
+    .expect("verified SignedIceCommit should fold its inner FreezeCluster admin event");
     let _ = runtime.shutdown().await;
 }
 
@@ -409,10 +444,12 @@ async fn substrate_admin_verifier_rejects_tampered_signed_admin_commit() {
         })
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(80)).await;
-
     // Audit ring should record the rejected attempt.
-    let snap = runtime.snapshot();
+    let snap = wait_for_snapshot(&runtime, Duration::from_secs(2), |s| {
+        !s.admin_audit.is_empty()
+    })
+    .await
+    .expect("audit ring should record the rejected attempt");
     assert_eq!(snap.admin_audit.len(), 1);
     assert!(matches!(
         snap.admin_audit[0].outcome,
@@ -487,12 +524,15 @@ async fn admin_audit_ring_records_accepted_and_rejected_attempts() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    let snap = runtime.snapshot();
+    let snap = wait_for_snapshot(&runtime, Duration::from_secs(2), |s| {
+        s.admin_audit.len() >= 2
+    })
+    .await
+    .expect("every SignedIceCommit should land on the audit ring");
     assert_eq!(
         snap.admin_audit.len(),
         2,
-        "every SignedIceCommit should land on the audit ring; got {}",
+        "got {}",
         snap.admin_audit.len(),
     );
     let accepted = snap
@@ -734,9 +774,18 @@ async fn substrate_admin_verifier_arms_ice_cooldown_after_successful_commit() {
         })
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(80)).await;
-
-    let snap = runtime.snapshot();
+    let snap = wait_for_snapshot(&runtime, Duration::from_secs(2), |s| {
+        s.admin_audit
+            .iter()
+            .any(|r| match &r.outcome {
+                net::adapter::net::behavior::meshos::VerificationOutcome::Rejected { kind, .. } => {
+                    kind == "ice_cooldown_active"
+                }
+                _ => false,
+            })
+    })
+    .await
+    .expect("second ICE commit should be audited as ice_cooldown_active");
     let cooldown_rejected = snap
         .admin_audit
         .iter()
@@ -929,18 +978,24 @@ async fn ordinary_admin_commits_are_rejected_during_cluster_freeze() {
         &freeze.blast_hash(),
     );
     freeze.commit(&[freeze_sig]).await.expect("freeze commit");
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    assert!(
-        runtime.snapshot().freeze_remaining_ms.is_some(),
-        "cluster should be frozen after the freeze commit",
-    );
+    wait_for_snapshot(&runtime, Duration::from_secs(2), |s| {
+        s.freeze_remaining_ms.is_some()
+    })
+    .await
+    .expect("cluster should be frozen after the freeze commit");
 
     // 2. Attempt an ordinary Cordon during the freeze. It
     //    should land on the audit ring as Rejected with kind
     //    "freeze_in_effect" and NOT take effect on state.
     let _ = deck.admin().cordon(THIS_NODE).await.expect("publish");
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    let snap = runtime.snapshot();
+    let snap = wait_for_snapshot(&runtime, Duration::from_secs(2), |s| {
+        s.admin_audit.iter().any(|r| match &r.outcome {
+            VerificationOutcome::Rejected { kind, .. } => kind == "freeze_in_effect",
+            _ => false,
+        })
+    })
+    .await
+    .expect("cordon during freeze should be audited with kind freeze_in_effect");
     let rejected_freeze: Vec<_> = snap
         .admin_audit
         .iter()
