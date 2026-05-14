@@ -1,0 +1,20 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_14_DECK_SDK.md
+  s_6ba469f1921974::t_dd0d2127e9e6d9 18-23,25
+  s_6ba469f1921974::t_e6144242da664a 64,66-70,72,74,76-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "9c2d3e9f9ca8c80083fc2ae7e97ea6b206d9e203",
+  "prompts": {},
+  "sessions": {
+    "s_6ba469f1921974": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3f6b48b8-94c5-47fd-9837-8991a8b4646e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

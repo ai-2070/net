@@ -1,0 +1,33 @@
+net/crates/net/tests/deck_pipeline.rs
+  s_6ba469f1921974::t_53ed445fed9025 138-143,145-154,175-184
+net/crates/net/src/adapter/net/behavior/meshos/event_loop.rs
+  s_6ba469f1921974::t_1876fa1530350a 734-737,740,742
+  s_6ba469f1921974::t_b1842d60bb29b8 792
+  s_6ba469f1921974::t_d003822b359624 948-956,966
+  s_6ba469f1921974::t_9e195ff196e73d 823-828
+net/crates/net/src/adapter/net/behavior/deck.rs
+  s_6ba469f1921974::t_8a7179292b055b 1170-1177,1179-1188
+  s_6ba469f1921974::t_90a2ef563e85a8 3173-3184
+  s_6ba469f1921974::t_6c191e6b87b3b9 2392-2393,2395,2397-2403
+  s_6ba469f1921974::t_6cb7fd02dc5114 3028-3039
+  s_6ba469f1921974::t_29688e94792a32 2350-2351,2353,2355-2361
+  s_6ba469f1921974::t_bb85401b0b08d6 2658-2659,2661,2663-2669
+  s_6ba469f1921974::t_10685e25fab1c9 2082-2088,2090,2094-2098
+  s_6ba469f1921974::t_2fd78db8cb29f5 2595-2596,2598,2600-2606
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "18888447cce6789a789a5552468e6e82dc8b81a8",
+  "prompts": {},
+  "sessions": {
+    "s_6ba469f1921974": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3f6b48b8-94c5-47fd-9837-8991a8b4646e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

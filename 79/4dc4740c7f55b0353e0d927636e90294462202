@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/behavior/meshos/ice.rs
+  s_6ba469f1921974::t_10a65462572e61 268-277,284-290,292
+  s_6ba469f1921974::t_0fbd6580680f2f 1040-1085
+  s_6ba469f1921974::t_1bf5332abd9e13 320-324,327-328
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "794dc4740c7f55b0353e0d927636e90294462202",
+  "prompts": {},
+  "sessions": {
+    "s_6ba469f1921974": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3f6b48b8-94c5-47fd-9837-8991a8b4646e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
