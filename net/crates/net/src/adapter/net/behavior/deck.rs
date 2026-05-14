@@ -75,7 +75,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use futures::Stream;
 use tokio::time::{interval, Interval};
@@ -493,26 +493,36 @@ pub struct AdminCommands<'a> {
 }
 
 impl AdminCommands<'_> {
-    /// Drain `node`'s workload by `deadline`. Replicas migrate;
-    /// daemons drain via [`crate::adapter::net::compute::DaemonControl::DrainStart`]
-    /// once the loop sees the resulting `EnteringMaintenance` state.
-    pub async fn drain(&self, node: NodeId, deadline: Instant) -> Result<ChainCommit, AdminError> {
+    /// Drain `node`'s workload over `drain_for`. Replicas
+    /// migrate; daemons drain via
+    /// [`crate::adapter::net::compute::DaemonControl::DrainStart`]
+    /// once the loop sees the resulting `EnteringMaintenance`
+    /// state. The duration is the wait-window from the loop's
+    /// next tick; the substrate computes the absolute deadline
+    /// at fold time so two replays of the same event stream
+    /// produce identical `since` / `deadline` instants.
+    pub async fn drain(
+        &self,
+        node: NodeId,
+        drain_for: Duration,
+    ) -> Result<ChainCommit, AdminError> {
         self.client
-            .publish_admin(AdminEvent::Drain { node, deadline }, "drain")
+            .publish_admin(AdminEvent::Drain { node, drain_for }, "drain")
             .await
     }
 
-    /// Begin a maintenance window for `node`. `deadline` is the
-    /// drain deadline; `None` defers to the cluster's configured
-    /// default.
+    /// Begin a maintenance window for `node`. `drain_for` is
+    /// the drain-window duration; `None` defers to the cluster's
+    /// configured default. The substrate-side fold computes the
+    /// absolute deadline as `last_tick + drain_for`.
     pub async fn enter_maintenance(
         &self,
         node: NodeId,
-        deadline: Option<Instant>,
+        drain_for: Option<Duration>,
     ) -> Result<ChainCommit, AdminError> {
         self.client
             .publish_admin(
-                AdminEvent::EnterMaintenance { node, deadline },
+                AdminEvent::EnterMaintenance { node, drain_for },
                 "enter_maintenance",
             )
             .await

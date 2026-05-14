@@ -266,7 +266,7 @@ async fn maintenance_enter_with_empty_workload_walks_to_steady_state() {
     handle
         .publish(MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
             node: THIS_NODE,
-            deadline: None,
+            drain_for: None,
         }))
         .await
         .unwrap();
@@ -705,7 +705,7 @@ async fn sdk_drives_full_daemon_lifecycle_end_to_end() {
         .handle()
         .publish(MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
             node: THIS_NODE,
-            deadline: None,
+            drain_for: None,
         }))
         .await
         .unwrap();

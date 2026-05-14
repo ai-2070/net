@@ -1408,7 +1408,7 @@ mod tests {
         handle
             .publish(MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
                 node: 1,
-                deadline: None,
+                drain_for: None,
             }))
             .await
             .unwrap();

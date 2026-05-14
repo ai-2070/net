@@ -276,31 +276,40 @@ pub type ChainId = u64;
 /// Admin chain event. Phase D defines the full enum + the
 /// chain-driven signing contract; Phase A carries the smallest
 /// surface that lets the loop accept events through.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum AdminEvent {
     /// Begin a maintenance window for `node`.
     EnterMaintenance {
         /// Node entering maintenance.
         node: NodeId,
-        /// Optional deadline by which the EnteringMaintenance
-        /// transition must complete (replicas drained, daemons
-        /// stopped); past the deadline the node flips to
-        /// DrainFailed.
-        deadline: Option<Instant>,
+        /// Optional drain-window duration measured from the
+        /// loop's anchor instant (last tick); the fold computes
+        /// the absolute deadline as `anchor + drain_for`. `None`
+        /// defers to the cluster's configured default deadline.
+        /// Wire form is a `Duration` (serde-friendly) rather
+        /// than an `Instant` so the admin event signs cleanly
+        /// and round-trips through postcard / the eventual
+        /// admin chain.
+        drain_for: Option<Duration>,
     },
     /// End a maintenance window for `node`.
     ExitMaintenance {
         /// Node leaving maintenance.
         node: NodeId,
     },
-    /// Drain `node`'s workload by `deadline`. Like a maintenance
-    /// window but does not require an explicit Exit.
+    /// Drain `node`'s workload by the configured deadline. Like
+    /// a maintenance window but does not require an explicit
+    /// Exit.
     Drain {
         /// Node to drain.
         node: NodeId,
-        /// Deadline by which the drain must complete.
-        deadline: Instant,
+        /// Drain-window duration measured from the loop's
+        /// anchor instant (last tick); the fold computes the
+        /// absolute deadline as `anchor + drain_for`. Wire form
+        /// is a `Duration` (serde-friendly) so the admin event
+        /// signs cleanly and round-trips through postcard.
+        drain_for: Duration,
     },
     /// Mark `node` ineligible for new placements (existing
     /// workload stays).
@@ -485,4 +494,70 @@ pub struct LocalReplicaIntentUpdate {
     pub chain: ChainId,
     /// New intent.
     pub intent: LocalReplicaIntent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wire-stability pin: every `AdminEvent` variant must
+    /// round-trip through postcard. Locked once the admin chain
+    /// commits to this form; the signed-admin-commit path
+    /// signs over the postcard encoding so any future variant
+    /// addition has to extend this test or break operators.
+    #[test]
+    fn admin_event_postcard_round_trips_every_variant() {
+        let cases = [
+            AdminEvent::EnterMaintenance {
+                node: 42,
+                drain_for: Some(Duration::from_secs(300)),
+            },
+            AdminEvent::EnterMaintenance {
+                node: 42,
+                drain_for: None,
+            },
+            AdminEvent::ExitMaintenance { node: 42 },
+            AdminEvent::Drain {
+                node: 42,
+                drain_for: Duration::from_secs(600),
+            },
+            AdminEvent::Cordon { node: 42 },
+            AdminEvent::Uncordon { node: 42 },
+            AdminEvent::RestartAllDaemons { node: 42 },
+            AdminEvent::ClearAvoidList { node: 42 },
+            AdminEvent::DropReplicas {
+                node: 42,
+                chains: vec![1, 2, 3],
+            },
+            AdminEvent::InvalidatePlacement { node: 42 },
+            AdminEvent::FreezeCluster {
+                ttl: Duration::from_secs(60),
+            },
+            AdminEvent::ThawCluster,
+            AdminEvent::FlushAvoidLists {
+                scope: AvoidScope::Local { node: 42 },
+            },
+            AdminEvent::FlushAvoidLists {
+                scope: AvoidScope::OnPeer { peer: 7 },
+            },
+            AdminEvent::FlushAvoidLists {
+                scope: AvoidScope::Global,
+            },
+            AdminEvent::ForceEvictReplica {
+                chain: 100,
+                victim: 7,
+            },
+            AdminEvent::ForceRestartDaemon {
+                daemon: DaemonRef {
+                    id: 7,
+                    name: "telemetry".into(),
+                },
+            },
+        ];
+        for ev in cases {
+            let bytes = postcard::to_allocvec(&ev).expect("encode");
+            let decoded: AdminEvent = postcard::from_bytes(&bytes).expect("decode");
+            assert_eq!(decoded, ev);
+        }
+    }
 }

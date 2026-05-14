@@ -344,13 +344,18 @@ impl MeshOsState {
         // before the first tick has fired.
         let anchor = self.last_tick.unwrap_or_else(Instant::now);
         match admin {
-            AdminEvent::EnterMaintenance { node, deadline } => {
+            AdminEvent::EnterMaintenance { node, drain_for } => {
                 self.maintenance
                     .insert(*node, MaintenanceMirror::EnteringMaintenance);
                 if *node == this_node {
+                    // The state-side deadline is an Instant
+                    // computed from the loop's anchor + the
+                    // wire-form Duration. Two replays produce
+                    // identical Instants because `anchor` is
+                    // pinned to `last_tick`.
                     self.local_maintenance = MaintenanceState::EnteringMaintenance {
                         since: anchor,
-                        deadline: *deadline,
+                        deadline: drain_for.map(|d| anchor + d),
                     };
                 }
             }
@@ -642,7 +647,7 @@ mod tests {
         state.apply(
             &MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
                 node,
-                deadline: None,
+                drain_for: None,
             }),
             0,
         );
@@ -668,7 +673,7 @@ mod tests {
         state.apply(
             &MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
                 node: THIS_NODE,
-                deadline: None,
+                drain_for: None,
             }),
             THIS_NODE,
         );
@@ -693,7 +698,7 @@ mod tests {
         state.apply(
             &MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
                 node: THIS_NODE,
-                deadline: None,
+                drain_for: None,
             }),
             THIS_NODE,
         );
@@ -715,7 +720,7 @@ mod tests {
         state.apply(
             &MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
                 node: 99,
-                deadline: None,
+                drain_for: None,
             }),
             THIS_NODE,
         );
