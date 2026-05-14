@@ -122,9 +122,16 @@ impl OperatorIdentity {
         self.operator_id
     }
 
-    /// Borrow the underlying keypair. The signing seam reads this
-    /// when the substrate slice that adds operator-signed admin
-    /// commits lands.
+    /// Borrow the underlying keypair. **Use sparingly.** The
+    /// SDK's own signing helpers
+    /// ([`Self::sign_proposal`], [`Self::sign_admin_event`])
+    /// cover the canonical signing flows; reach for this only
+    /// when implementing a cross-language signing seam (e.g. a
+    /// FFI binding that needs to call its own ed25519 lib over
+    /// the same `(domain || issued_at || blast_hash || postcard)`
+    /// payload shape). Calls outside that envelope risk
+    /// drift between the SDK's signing bytes and what the
+    /// substrate verifier rebuilds.
     pub fn keypair(&self) -> &EntityKeypair {
         &self.keypair
     }
@@ -588,6 +595,56 @@ impl DeckClient {
     /// load + a clone of just the failure ring.
     pub fn recent_failures(&self) -> Vec<super::meshos::FailureRecord> {
         self.snapshot_reader.load().recent_failures.iter().cloned().collect()
+    }
+
+    /// Runtime-epoch identifier this MeshOsLoop stamped at
+    /// startup. Stable for the lifetime of the loop task and
+    /// changes on every restart. Consumers dedup'ing with
+    /// `since(seq)` watermarks pair every saved watermark
+    /// with this value — when it flips, reset the watermark
+    /// to 0 rather than silently filtering post-restart
+    /// records as "smaller than my last seq."
+    pub fn runtime_epoch_id(&self) -> u64 {
+        self.snapshot_reader.load().runtime_epoch_id
+    }
+
+    /// Highest `seq` currently visible on the admin-audit
+    /// ring. Returns `0` when the ring is empty. Lets a
+    /// caller's `since(seq)` pagination distinguish "ahead of
+    /// the head" (caller's watermark > head_seq) from "no new
+    /// records yet" (watermark == head_seq) — the audit
+    /// stream itself swallows both cases silently.
+    pub fn audit_head_seq(&self) -> u64 {
+        self.snapshot_reader
+            .load()
+            .admin_audit
+            .last()
+            .map(|r| r.seq)
+            .unwrap_or(0)
+    }
+
+    /// Highest `seq` currently visible on the log ring.
+    /// Returns `0` when the ring is empty. Same purpose as
+    /// [`Self::audit_head_seq`] for the log-stream surface.
+    pub fn log_head_seq(&self) -> u64 {
+        self.snapshot_reader
+            .load()
+            .log_ring
+            .last()
+            .map(|r| r.seq)
+            .unwrap_or(0)
+    }
+
+    /// Highest `seq` currently visible on the failure ring.
+    /// Returns `0` when the ring is empty.
+    pub fn failure_head_seq(&self) -> u64 {
+        self.snapshot_reader
+            .load()
+            .recent_failures
+            .iter()
+            .next_back()
+            .map(|r| r.seq)
+            .unwrap_or(0)
     }
 
     /// Like [`Self::recent_failures`] but keeps only entries

@@ -356,6 +356,38 @@ impl OperatorSignature {
             signature: sig.to_bytes().to_vec(),
         }
     }
+
+    /// Fallible companion to [`Self::sign`]. Returns `None`
+    /// when `keypair` is read-only (public-only). UIs that
+    /// might hold a read-only operator-identity (e.g. a
+    /// secondary client viewing the cluster without the
+    /// authority to sign) should reach for this instead of
+    /// the panicking [`Self::sign`].
+    pub fn try_sign(
+        keypair: &EntityKeypair,
+        proposal: &IceActionProposal,
+        issued_at_ms: u64,
+        blast_hash: &BlastRadiusHash,
+    ) -> Option<Self> {
+        if keypair.is_read_only() {
+            return None;
+        }
+        Some(Self::sign(keypair, proposal, issued_at_ms, blast_hash))
+    }
+
+    /// Fallible companion to [`Self::sign_admin`]. Returns
+    /// `None` on a read-only keypair. Same UX contract as
+    /// [`Self::try_sign`].
+    pub fn try_sign_admin(
+        keypair: &EntityKeypair,
+        event: &AdminEvent,
+        issued_at_ms: u64,
+    ) -> Option<Self> {
+        if keypair.is_read_only() {
+            return None;
+        }
+        Some(Self::sign_admin(keypair, event, issued_at_ms))
+    }
 }
 
 /// Operator-key registry. Maps each operator id to the public
