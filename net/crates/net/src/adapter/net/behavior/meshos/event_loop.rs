@@ -448,8 +448,10 @@ impl MeshOsLoop {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0)
             ^ RUNTIME_EPOCH_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let mut initial_snapshot = MeshOsSnapshot::default();
-        initial_snapshot.runtime_epoch_id = runtime_epoch_id;
+        let initial_snapshot = MeshOsSnapshot {
+            runtime_epoch_id,
+            ..Default::default()
+        };
         let snapshot = Arc::new(ArcSwap::from_pointee(initial_snapshot));
         let reader = MeshOsSnapshotReader {
             snapshot: Arc::clone(&snapshot),

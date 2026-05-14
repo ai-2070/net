@@ -2463,7 +2463,13 @@ mod tests {
 
         // First commit succeeds and arms the cooldown.
         verifier
-            .verify_commit(&proposal, &[sig.clone()], issued_at_ms, &blast_hash, now_ms)
+            .verify_commit(
+                &proposal,
+                std::slice::from_ref(&sig),
+                issued_at_ms,
+                &blast_hash,
+                now_ms,
+            )
             .expect("first commit should succeed");
 
         // Second commit inside the window — fails.

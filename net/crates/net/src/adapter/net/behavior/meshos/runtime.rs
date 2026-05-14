@@ -213,7 +213,7 @@ impl<D: ActionDispatcher> MeshOsRuntimeBuilder<D> {
 
     /// Install a migration-abort dispatcher. Production
     /// deployments wire the orchestrator-backed adapter; tests
-    /// + bootstrap can leave this unset (the no-op default
+    /// and bootstrap can leave this unset (the no-op default
     /// stays in place and a KillMigration commit is
     /// audit-only).
     pub fn with_migration_aborter(
