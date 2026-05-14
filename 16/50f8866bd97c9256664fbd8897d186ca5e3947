@@ -1,0 +1,24 @@
+net/crates/net/tests/deck_pipeline.rs
+  s_6ba469f1921974::t_50d464e62929be 981-985,991-998
+  s_6ba469f1921974::t_1a74d5f74a5d28 448-452
+  s_6ba469f1921974::t_45469e49ff7576 402-406
+  s_6ba469f1921974::t_6f7cab3b9c32ef 777-788
+  s_6ba469f1921974::t_439fa07c8ffa25 37-72
+  s_6ba469f1921974::t_c1cde86c9b2d08 527-531,535
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "1650f8866bd97c9256664fbd8897d186ca5e3947",
+  "prompts": {},
+  "sessions": {
+    "s_6ba469f1921974": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3f6b48b8-94c5-47fd-9837-8991a8b4646e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
