@@ -1,0 +1,23 @@
+web/src/components/SectionHeadings.tsx
+  s_e461293ef945b9::t_9556efa35a74bd 1-9
+web/src/components/MeshOsSection.tsx
+  s_e461293ef945b9::t_cd6e834399fd01 1-3,6-967
+web/src/app/page.tsx
+  s_e461293ef945b9::t_8d88b0ab15a91f 4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "65b19d76a2c4a76aa5b4e537aef8f067bb168a8e",
+  "prompts": {},
+  "sessions": {
+    "s_e461293ef945b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b86f732-4bc6-49f3-a4d3-0c57194c40f4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
