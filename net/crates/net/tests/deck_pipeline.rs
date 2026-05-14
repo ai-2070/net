@@ -342,10 +342,10 @@ async fn substrate_admin_verifier_accepts_a_valid_signed_ice_commit_and_folds_it
 }
 
 #[tokio::test]
-async fn ice_audit_ring_records_accepted_and_rejected_attempts() {
+async fn admin_audit_ring_records_accepted_and_rejected_attempts() {
     // The substrate verifier records every SignedIceCommit it
     // sees — accepted AND rejected — on the snapshot's
-    // ice_audit ring. Security review reads this to replay
+    // admin_audit ring. Security review reads this to replay
     // every break-glass attempt regardless of outcome.
     use net::adapter::net::behavior::meshos::VerificationOutcome;
     use std::sync::Arc as SArc;
@@ -394,18 +394,18 @@ async fn ice_audit_ring_records_accepted_and_rejected_attempts() {
     tokio::time::sleep(Duration::from_millis(80)).await;
     let snap = runtime.snapshot();
     assert_eq!(
-        snap.ice_audit.len(),
+        snap.admin_audit.len(),
         2,
         "every SignedIceCommit should land on the audit ring; got {}",
-        snap.ice_audit.len(),
+        snap.admin_audit.len(),
     );
     let accepted = snap
-        .ice_audit
+        .admin_audit
         .iter()
         .filter(|r| matches!(r.outcome, VerificationOutcome::Accepted))
         .count();
     let rejected = snap
-        .ice_audit
+        .admin_audit
         .iter()
         .filter(|r| matches!(r.outcome, VerificationOutcome::Rejected { .. }))
         .count();
@@ -414,7 +414,7 @@ async fn ice_audit_ring_records_accepted_and_rejected_attempts() {
     // The rejected entry carries the operator id even though
     // the signature failed verification.
     let rej = snap
-        .ice_audit
+        .admin_audit
         .iter()
         .find(|r| matches!(r.outcome, VerificationOutcome::Rejected { .. }))
         .unwrap();

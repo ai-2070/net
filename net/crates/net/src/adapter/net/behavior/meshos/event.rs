@@ -496,6 +496,25 @@ pub struct LocalReplicaIntentUpdate {
     pub intent: LocalReplicaIntent,
 }
 
+impl AdminEvent {
+    /// `true` iff this admin event is an ICE break-glass
+    /// variant (Force* / FreezeCluster / ThawCluster /
+    /// FlushAvoidLists). Used by the Deck SDK's
+    /// `AuditQuery::force_only` filter to project the audit
+    /// ring to just the operator escalations security review
+    /// cares about most.
+    pub fn is_ice(&self) -> bool {
+        matches!(
+            self,
+            AdminEvent::FreezeCluster { .. }
+                | AdminEvent::ThawCluster
+                | AdminEvent::FlushAvoidLists { .. }
+                | AdminEvent::ForceEvictReplica { .. }
+                | AdminEvent::ForceRestartDaemon { .. }
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

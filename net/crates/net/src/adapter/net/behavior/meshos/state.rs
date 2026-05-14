@@ -85,15 +85,16 @@ pub struct MeshOsState {
     /// reconcile pass so a single admin commit fires exactly
     /// one eviction.
     pub(crate) forced_evictions: Vec<(ChainId, NodeId)>,
-    /// Ring buffer of ICE-commit outcomes — every
-    /// `MeshOsEvent::SignedIceCommit` the loop observes lands
-    /// here regardless of whether the verifier accepted or
-    /// rejected it. Bounded to
-    /// [`super::ice::DEFAULT_MAX_ICE_AUDIT_RECORDS`]; the loop
-    /// drops the oldest entry FIFO when the cap is exceeded.
-    /// Snapshot exports this verbatim for the Deck SDK's
-    /// (forthcoming) `audit().force_only()` query path.
-    pub(crate) ice_audit: std::collections::VecDeque<super::ice::IceAuditRecord>,
+    /// Ring buffer of admin-commit outcomes — every admin
+    /// commit the loop observes (signed ICE bundle or unsigned
+    /// `MeshOsEvent::AdminEvent(...)`) lands here, regardless
+    /// of whether a verifier accepted, rejected, or skipped
+    /// it. Bounded to
+    /// [`super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS`]; the
+    /// loop drops the oldest entry FIFO when the cap is
+    /// exceeded. Snapshot exports this verbatim for the Deck
+    /// SDK's `audit()` query path.
+    pub(crate) admin_audit: std::collections::VecDeque<super::ice::AdminAuditRecord>,
 }
 
 /// Per-daemon observed status. Phase B fleshes out the fields

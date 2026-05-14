@@ -821,22 +821,21 @@ impl<'a> IceProposal<'a> {
     }
 }
 
-/// Audit-query builder reading the substrate's ICE audit
+/// Audit-query builder reading the substrate's admin audit
 /// ring. Constructed via [`DeckClient::audit`]; chain filter
 /// methods, then call [`Self::collect`] to materialize the
 /// matching entries.
 ///
-/// # Scope (Phase 1)
+/// # Scope
 ///
-/// This slice reads the in-memory ICE audit ring exported on
-/// every [`super::meshos::MeshOsSnapshot`]. The ring carries
-/// every `SignedIceCommit` the substrate verifier observed —
-/// accepted or rejected — bounded at
-/// [`super::meshos::DEFAULT_MAX_ICE_AUDIT_RECORDS`]. Ordinary
-/// admin events (`drain`, `enter_maintenance`, …) are NOT yet
-/// audit-queryable; that surface lands when the substrate's
-/// signed admin chain ships (per `DECK_SDK_PLAN.md`'s
-/// "substrate gaps" section).
+/// Reads the in-memory admin audit ring exported on every
+/// [`super::meshos::MeshOsSnapshot`]. The ring carries every
+/// admin commit the loop observed — signed ICE bundles AND
+/// unsigned admin events — bounded at
+/// [`super::meshos::DEFAULT_MAX_ADMIN_AUDIT_RECORDS`]. The
+/// unbounded historical replay path is the eventual admin
+/// audit subchain (substrate gap); this in-memory ring is the
+/// near-history surface Deck-the-binary renders against.
 ///
 /// Per-method semantics:
 ///
@@ -844,15 +843,15 @@ impl<'a> IceProposal<'a> {
 ///   in the result). When unspecified, returns every entry on
 ///   the ring.
 /// - [`Self::by_operator`] — keep entries whose
-///   [`super::meshos::IceAuditRecord::operator_ids`] include
+///   [`super::meshos::AdminAuditRecord::operator_ids`] include
 ///   the given id.
 /// - [`Self::between`] — keep entries whose
 ///   `committed_at_ms` falls inside `[start_ms, end_ms]`
 ///   (inclusive).
-/// - [`Self::force_only`] — a no-op in Phase 1 since the ring
-///   already only carries ICE force operations. The method
-///   exists so consumers can write filter chains that stay
-///   valid when the unified admin-chain path lands.
+/// - [`Self::force_only`] — restrict the result to ICE-class
+///   admin events (`AdminEvent::is_ice` returns `true`).
+///   Drops ordinary admin commits (`drain`, `cordon`, …) from
+///   the result.
 pub struct AuditQuery<'a> {
     client: &'a DeckClient,
     limit: Option<usize>,
@@ -909,10 +908,10 @@ impl<'a> AuditQuery<'a> {
     /// latest snapshot, applies the configured filters, and
     /// returns the matching entries newest-first. Cheap — one
     /// snapshot read + a single iterator pass.
-    pub fn collect(self) -> Vec<super::meshos::IceAuditRecord> {
+    pub fn collect(self) -> Vec<super::meshos::AdminAuditRecord> {
         let snap = self.client.snapshot_reader.read();
-        let mut matched: Vec<super::meshos::IceAuditRecord> = snap
-            .ice_audit
+        let mut matched: Vec<super::meshos::AdminAuditRecord> = snap
+            .admin_audit
             .into_iter()
             .filter(|r| {
                 if let Some(op_id) = self.operator_filter {
@@ -925,10 +924,9 @@ impl<'a> AuditQuery<'a> {
                         return false;
                     }
                 }
-                // `force_only` is structurally implied for the
-                // current ring; the flag stays for API forward-
-                // compat.
-                let _ = self.force_only;
+                if self.force_only && !r.event.is_ice() {
+                    return false;
+                }
                 true
             })
             .collect();
@@ -1549,19 +1547,19 @@ mod tests {
         // Newest-first ordering: the 30s freeze is the last
         // commit submitted, so it should be the first result.
         assert!(matches!(
-            all[0].proposal,
-            IceActionProposal::FreezeCluster { ttl } if ttl == Duration::from_secs(30)
+            all[0].event,
+            AdminEvent::FreezeCluster { ttl } if ttl == Duration::from_secs(30)
         ));
         assert!(matches!(
-            all[2].proposal,
-            IceActionProposal::FreezeCluster { ttl } if ttl == Duration::from_secs(10)
+            all[2].event,
+            AdminEvent::FreezeCluster { ttl } if ttl == Duration::from_secs(10)
         ));
 
         let recent_one = deck.audit().recent(1).collect();
         assert_eq!(recent_one.len(), 1);
         assert!(matches!(
-            recent_one[0].proposal,
-            IceActionProposal::FreezeCluster { ttl } if ttl == Duration::from_secs(30)
+            recent_one[0].event,
+            AdminEvent::FreezeCluster { ttl } if ttl == Duration::from_secs(30)
         ));
         let _ = runtime.shutdown().await;
     }
@@ -1604,36 +1602,61 @@ mod tests {
         let filtered = deck.audit().by_operator(op_a.operator_id()).collect();
         assert_eq!(filtered.len(), 1);
         assert!(matches!(
-            filtered[0].proposal,
-            IceActionProposal::FreezeCluster { .. }
+            filtered[0].event,
+            AdminEvent::FreezeCluster { .. }
         ));
         let _ = runtime.shutdown().await;
     }
 
     #[tokio::test]
-    async fn audit_query_force_only_is_a_passthrough_for_phase_1() {
-        // The ring is already ICE-only, so force_only matches
-        // every entry. Method exists for forward-compat with
-        // the unified admin-chain query.
-        use crate::adapter::net::behavior::meshos::{IceActionProposal, MeshOsEvent};
+    async fn audit_query_force_only_drops_ordinary_admin_keeps_ice() {
+        // Mix ordinary admin (Cordon) with ICE (ThawCluster);
+        // force_only() should keep only the ICE entry.
         let dispatcher = Arc::new(LoggingDispatcher::new());
         let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
 
-        runtime
-            .handle()
-            .publish(MeshOsEvent::SignedIceCommit {
-                proposal: IceActionProposal::ThawCluster,
-                signatures: Vec::new(),
-            })
-            .await
-            .unwrap();
+        deck.admin().cordon(42).await.expect("cordon");
+        deck.admin().thaw_cluster().await.expect("thaw");
         tokio::time::sleep(Duration::from_millis(80)).await;
 
         let baseline = deck.audit().collect();
+        assert_eq!(
+            baseline.len(),
+            2,
+            "ring should hold both ordinary and ICE commits"
+        );
         let force_only = deck.audit().force_only().collect();
-        assert_eq!(baseline, force_only);
-        assert_eq!(baseline.len(), 1);
+        assert_eq!(force_only.len(), 1, "force_only should drop Cordon");
+        assert!(force_only[0].event.is_ice());
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_ring_records_unsigned_admin_with_unverified_outcome() {
+        // Locked decision #2: every admin event the loop sees
+        // is on the audit ring. Unsigned ones surface as
+        // Unverified.
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        deck.admin().cordon(42).await.expect("cordon");
+        deck.admin()
+            .drop_replicas(42, vec![1, 2])
+            .await
+            .expect("drop_replicas");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let entries = deck.audit().collect();
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            assert!(matches!(
+                entry.outcome,
+                crate::adapter::net::behavior::meshos::VerificationOutcome::Unverified
+            ));
+            assert!(entry.operator_ids.is_empty());
+        }
         let _ = runtime.shutdown().await;
     }
 

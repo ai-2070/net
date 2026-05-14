@@ -573,7 +573,7 @@ impl MeshOsLoop {
         // ICE-signed commits get their own gate: verify the
         // bundle before folding the inner AdminEvent. The
         // outcome (accepted, rejected, unverified) lands on the
-        // ice_audit ring regardless of verification result so
+        // admin_audit ring regardless of verification result so
         // security review can replay every attempt.
         if let MeshOsEvent::SignedIceCommit {
             proposal,
@@ -590,7 +590,9 @@ impl MeshOsLoop {
                 },
                 None => super::ice::VerificationOutcome::Unverified,
             };
-            self.record_ice_audit(proposal, signatures, &outcome);
+            let admin_event = proposal.to_admin_event();
+            let operator_ids: Vec<u64> = signatures.iter().map(|s| s.operator_id).collect();
+            self.record_admin_audit(&admin_event, operator_ids, outcome.clone());
             if let super::ice::VerificationOutcome::Rejected { kind, message } = &outcome {
                 tracing::warn!(
                     target: "meshos",
@@ -603,9 +605,9 @@ impl MeshOsLoop {
             // Verification passed (or no verifier installed —
             // tests / dev mode). Fold as if the inner AdminEvent
             // arrived directly.
-            let admin = proposal.to_admin_event();
-            self.desired.apply_admin(&admin, self.config.this_node);
-            let unwrapped = MeshOsEvent::AdminEvent(admin);
+            self.desired
+                .apply_admin(&admin_event, self.config.this_node);
+            let unwrapped = MeshOsEvent::AdminEvent(admin_event);
             self.actual.apply(&unwrapped, self.config.this_node);
             self.emit_maintenance_transitions();
             return;
@@ -617,6 +619,15 @@ impl MeshOsLoop {
                 self.desired.apply_local_replica_intent(update)
             }
             MeshOsEvent::AdminEvent(admin) => {
+                // Unsigned admin commits also land on the audit
+                // ring with Unverified outcome — so audit
+                // consumers see every admin attempt the cluster
+                // observed, not just signed ICE bundles.
+                self.record_admin_audit(
+                    admin,
+                    Vec::new(),
+                    super::ice::VerificationOutcome::Unverified,
+                );
                 self.desired.apply_admin(admin, self.config.this_node);
             }
             _ => {}
@@ -625,29 +636,30 @@ impl MeshOsLoop {
         self.emit_maintenance_transitions();
     }
 
-    /// Record an ICE-commit outcome on the state's audit ring.
-    /// Bounded by [`super::ice::DEFAULT_MAX_ICE_AUDIT_RECORDS`];
-    /// drops oldest FIFO when the cap is exceeded.
-    fn record_ice_audit(
+    /// Record an admin-commit outcome on the state's audit
+    /// ring. Bounded by
+    /// [`super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS`]; drops
+    /// oldest FIFO when the cap is exceeded.
+    fn record_admin_audit(
         &mut self,
-        proposal: &super::ice::IceActionProposal,
-        signatures: &[super::ice::OperatorSignature],
-        outcome: &super::ice::VerificationOutcome,
+        event: &super::event::AdminEvent,
+        operator_ids: Vec<u64>,
+        outcome: super::ice::VerificationOutcome,
     ) {
         use std::time::{SystemTime, UNIX_EPOCH};
         let committed_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let record = super::ice::IceAuditRecord {
+        let record = super::ice::AdminAuditRecord {
             committed_at_ms,
-            proposal: proposal.clone(),
-            operator_ids: signatures.iter().map(|s| s.operator_id).collect(),
-            outcome: outcome.clone(),
+            event: event.clone(),
+            operator_ids,
+            outcome,
         };
-        self.actual.ice_audit.push_back(record);
-        while self.actual.ice_audit.len() > super::ice::DEFAULT_MAX_ICE_AUDIT_RECORDS {
-            self.actual.ice_audit.pop_front();
+        self.actual.admin_audit.push_back(record);
+        while self.actual.admin_audit.len() > super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS {
+            self.actual.admin_audit.pop_front();
         }
     }
 

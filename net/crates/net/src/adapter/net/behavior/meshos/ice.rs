@@ -296,24 +296,24 @@ impl VerifyError {
     }
 }
 
-/// Default cap on the per-node ICE audit ring. Records older
+/// Default cap on the per-node admin audit ring. Records older
 /// than this drop FIFO so the substrate's audit buffer stays
 /// fixed-overhead under churn. Sized for "a few minutes of
 /// operator activity" rather than "complete history" — the
-/// canonical replay path is the eventual ICE audit subchain;
+/// canonical replay path is the eventual admin audit subchain;
 /// this ring is the in-memory snapshot-side surface the Deck
 /// SDK reads against until the subchain ships.
-pub const DEFAULT_MAX_ICE_AUDIT_RECORDS: usize = 256;
+pub const DEFAULT_MAX_ADMIN_AUDIT_RECORDS: usize = 256;
 
-/// Outcome the substrate verifier recorded for an attempted
-/// ICE commit. Both accepted and rejected attempts surface on
-/// the audit ring so security review can replay every
-/// break-glass attempt — successful or otherwise.
+/// Outcome the substrate recorded for an attempted admin
+/// commit. Verified attempts (signed ICE bundles or future
+/// signed-ordinary-admin commits) surface as `Accepted` /
+/// `Rejected`; unsigned commits surface as `Unverified`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum VerificationOutcome {
-    /// The verifier accepted the bundle; the inner `AdminEvent`
-    /// folded normally.
+    /// The verifier accepted the signature(s); the inner
+    /// `AdminEvent` folded normally.
     Accepted,
     /// The verifier rejected the bundle. `kind` carries the
     /// stable [`VerifyError::kind`] discriminator; `message`
@@ -326,35 +326,38 @@ pub enum VerificationOutcome {
         /// Operator-readable detail.
         message: String,
     },
-    /// No verifier was installed when the commit arrived; the
-    /// inner event folded without verification. Only seen in
-    /// in-process tests and dev configs — production loops
-    /// install a verifier.
+    /// The commit rode the unsigned path. Either no verifier
+    /// is installed, or the event arrived via the legacy
+    /// `MeshOsEvent::AdminEvent(...)` channel that doesn't
+    /// carry a signature. Surfaces so security review can
+    /// distinguish "verified" from "no verification path
+    /// available."
     Unverified,
 }
 
-/// One entry on the substrate's ICE audit ring. The
+/// One entry on the substrate's admin audit ring. The
 /// [`super::event_loop::MeshOsLoop`] records one of these per
-/// [`super::event::MeshOsEvent::SignedIceCommit`] regardless of
-/// whether the verifier accepted or rejected the bundle.
+/// admin commit it observes — whether the commit rode the
+/// signed [`super::event::MeshOsEvent::SignedIceCommit`] path
+/// or the unsigned `MeshOsEvent::AdminEvent(...)` path.
 ///
 /// Carries the operator ids (not the full 64-byte signature
 /// bytes) because the audit consumer doesn't need the
 /// cryptographic material — just "who claimed authorship of
-/// this commit."
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct IceAuditRecord {
+/// this commit." The list is empty for unsigned commits.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AdminAuditRecord {
     /// Wall-clock milliseconds since `UNIX_EPOCH` at the
     /// moment the loop received the commit. Distinct from
     /// `Instant`-based timing the rest of the loop uses so
     /// audit consumers don't need a reference instant.
     pub committed_at_ms: u64,
-    /// The proposal payload the signature bundle covered.
-    pub proposal: IceActionProposal,
-    /// Issuing operator ids from the bundle's signatures. The
-    /// signatures themselves aren't retained — the verifier
-    /// already accepted or rejected them, and the audit ring
-    /// is a footprint surface, not a re-verification surface.
+    /// The admin event the loop folded (or rejected). Carries
+    /// the full wire form so audit consumers can render the
+    /// specific operator command without a second lookup.
+    pub event: super::event::AdminEvent,
+    /// Issuing operator ids from the commit's signatures.
+    /// Empty for unsigned commits.
     pub operator_ids: Vec<u64>,
     /// The verifier's outcome for this attempt.
     pub outcome: VerificationOutcome,
@@ -1134,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn ice_audit_record_postcard_round_trips_each_outcome() {
+    fn admin_audit_record_postcard_round_trips_each_outcome() {
         for outcome in [
             VerificationOutcome::Accepted,
             VerificationOutcome::Rejected {
@@ -1143,30 +1146,49 @@ mod tests {
             },
             VerificationOutcome::Unverified,
         ] {
-            let record = IceAuditRecord {
+            let record = AdminAuditRecord {
                 committed_at_ms: 12_345,
-                proposal: IceActionProposal::FreezeCluster {
+                event: AdminEvent::FreezeCluster {
                     ttl: Duration::from_secs(60),
                 },
                 operator_ids: vec![1, 2, 3],
                 outcome: outcome.clone(),
             };
             let bytes = postcard::to_allocvec(&record).expect("encode");
-            let decoded: IceAuditRecord = postcard::from_bytes(&bytes).expect("decode");
+            let decoded: AdminAuditRecord = postcard::from_bytes(&bytes).expect("decode");
             assert_eq!(decoded, record);
         }
     }
 
     #[test]
-    fn ice_audit_record_json_round_trips_for_audit_query_path() {
-        let record = IceAuditRecord {
+    fn admin_audit_record_json_round_trips_for_audit_query_path() {
+        let record = AdminAuditRecord {
             committed_at_ms: 999,
-            proposal: IceActionProposal::ThawCluster,
+            event: AdminEvent::ThawCluster,
             operator_ids: vec![42],
             outcome: VerificationOutcome::Accepted,
         };
         let json = serde_json::to_string(&record).expect("encode");
-        let decoded: IceAuditRecord = serde_json::from_str(&json).expect("decode");
+        let decoded: AdminAuditRecord = serde_json::from_str(&json).expect("decode");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn admin_audit_record_can_carry_ordinary_admin_event() {
+        // Verifies the type's expressive scope: ordinary admin
+        // events (no `Force*` discriminator) fit on the same
+        // ring as ICE events.
+        let record = AdminAuditRecord {
+            committed_at_ms: 1_000,
+            event: AdminEvent::EnterMaintenance {
+                node: 42,
+                drain_for: Some(Duration::from_secs(120)),
+            },
+            operator_ids: Vec::new(),
+            outcome: VerificationOutcome::Unverified,
+        };
+        let bytes = postcard::to_allocvec(&record).expect("encode");
+        let decoded: AdminAuditRecord = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(decoded, record);
     }
 
