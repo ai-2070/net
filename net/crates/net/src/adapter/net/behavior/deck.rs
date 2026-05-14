@@ -315,6 +315,52 @@ pub struct DaemonCounts {
     pub crash_looping: usize,
 }
 
+/// Build a [`StatusSummary`] from a snapshot. One pass over
+/// the per-peer and per-daemon maps; the rest of the rollup
+/// is direct field reads.
+fn build_status_summary(snap: &MeshOsSnapshot) -> StatusSummary {
+    let mut peers = PeerCounts::default();
+    for (_, peer) in snap.peers.iter() {
+        match peer.health {
+            Some(super::meshos::PeerHealthSnapshot::Healthy) => peers.healthy += 1,
+            Some(super::meshos::PeerHealthSnapshot::Degraded) => peers.degraded += 1,
+            Some(super::meshos::PeerHealthSnapshot::Unreachable) => peers.unreachable += 1,
+            None => peers.unknown += 1,
+        }
+    }
+    let mut daemons = DaemonCounts::default();
+    for (_, d) in snap.daemons.iter() {
+        match d.lifecycle {
+            super::meshos::DaemonLifecycleSnapshot::Running => daemons.running += 1,
+            super::meshos::DaemonLifecycleSnapshot::Starting => daemons.starting += 1,
+            super::meshos::DaemonLifecycleSnapshot::Stopping => daemons.stopping += 1,
+            super::meshos::DaemonLifecycleSnapshot::Stopped => daemons.stopped += 1,
+        }
+        match d.restart_state {
+            super::meshos::RestartStateSnapshot::Idle => {}
+            super::meshos::RestartStateSnapshot::BackingOff { .. } => daemons.backing_off += 1,
+            super::meshos::RestartStateSnapshot::CrashLooping { .. } => {
+                daemons.crash_looping += 1
+            }
+        }
+    }
+    let maintenance_active = !matches!(
+        snap.local_maintenance,
+        super::meshos::MaintenanceStateSnapshot::Active
+    );
+    StatusSummary {
+        peers,
+        daemons,
+        replica_chains: snap.replicas.len(),
+        avoid_list_entries: snap.avoid_list.len(),
+        pending_action_queue_depth: snap.pending.len(),
+        recent_failure_count: snap.recent_failures.len(),
+        admin_audit_ring_depth: snap.admin_audit.len(),
+        freeze_remaining_ms: snap.freeze_remaining_ms,
+        local_maintenance_active: maintenance_active,
+    }
+}
+
 /// Operator-facing client. Composes a [`MeshOsHandle`] +
 /// [`MeshOsSnapshotReader`] + [`OperatorIdentity`] into the
 /// surface Deck-the-binary (and other operator tools) bind
@@ -464,53 +510,24 @@ impl DeckClient {
         self.snapshot_reader.read()
     }
 
+    /// Live-updating [`StatusSummary`] stream. Polls the
+    /// snapshot reader at
+    /// [`DeckClientConfig::snapshot_poll_interval`] and emits
+    /// a new summary whenever the rollup actually changes
+    /// (PartialEq dedup) — operator dashboards bind here for
+    /// "render only when something is different." The first
+    /// summary always emits.
+    pub fn status_summary_stream(&self) -> StatusSummaryStream {
+        StatusSummaryStream::new(self.snapshot_reader.clone(), self.config.snapshot_poll_interval)
+    }
+
     /// Roll the snapshot up into a compact at-a-glance status
     /// summary — daemon-health counts, peer-health counts,
     /// freeze / maintenance flags, queue depths. Useful for
     /// the operator UI's "is everything OK?" header. One
     /// snapshot load + a single iterator pass; no full clone.
     pub fn status_summary(&self) -> StatusSummary {
-        let snap = self.snapshot_reader.load();
-        let mut peers = PeerCounts::default();
-        for (_, peer) in snap.peers.iter() {
-            match peer.health {
-                Some(super::meshos::PeerHealthSnapshot::Healthy) => peers.healthy += 1,
-                Some(super::meshos::PeerHealthSnapshot::Degraded) => peers.degraded += 1,
-                Some(super::meshos::PeerHealthSnapshot::Unreachable) => peers.unreachable += 1,
-                None => peers.unknown += 1,
-            }
-        }
-        let mut daemons = DaemonCounts::default();
-        for (_, d) in snap.daemons.iter() {
-            match d.lifecycle {
-                super::meshos::DaemonLifecycleSnapshot::Running => daemons.running += 1,
-                super::meshos::DaemonLifecycleSnapshot::Starting => daemons.starting += 1,
-                super::meshos::DaemonLifecycleSnapshot::Stopping => daemons.stopping += 1,
-                super::meshos::DaemonLifecycleSnapshot::Stopped => daemons.stopped += 1,
-            }
-            match d.restart_state {
-                super::meshos::RestartStateSnapshot::Idle => {}
-                super::meshos::RestartStateSnapshot::BackingOff { .. } => daemons.backing_off += 1,
-                super::meshos::RestartStateSnapshot::CrashLooping { .. } => {
-                    daemons.crash_looping += 1
-                }
-            }
-        }
-        let maintenance_active = !matches!(
-            snap.local_maintenance,
-            super::meshos::MaintenanceStateSnapshot::Active
-        );
-        StatusSummary {
-            peers,
-            daemons,
-            replica_chains: snap.replicas.len(),
-            avoid_list_entries: snap.avoid_list.len(),
-            pending_action_queue_depth: snap.pending.len(),
-            recent_failure_count: snap.recent_failures.len(),
-            admin_audit_ring_depth: snap.admin_audit.len(),
-            freeze_remaining_ms: snap.freeze_remaining_ms,
-            local_maintenance_active: maintenance_active,
-        }
+        build_status_summary(&self.snapshot_reader.load())
     }
 
     /// Borrow the latest peer summary. One snapshot load + a
@@ -1487,6 +1504,58 @@ impl Stream for SnapshotStream {
     }
 }
 
+/// Dedup'd [`StatusSummary`] stream. Returned by
+/// [`DeckClient::status_summary_stream`]. Polls the snapshot
+/// reader at the client's configured cadence, builds a fresh
+/// summary, and yields it only when the summary differs from
+/// the last emitted one (`PartialEq` dedup). The first poll
+/// always emits — operators rendering a dashboard see the
+/// initial state immediately, then change-driven updates from
+/// there.
+pub struct StatusSummaryStream {
+    reader: super::meshos::MeshOsSnapshotReader,
+    interval: Interval,
+    last_emitted: Option<StatusSummary>,
+}
+
+impl StatusSummaryStream {
+    fn new(reader: super::meshos::MeshOsSnapshotReader, poll_interval: Duration) -> Self {
+        let poll_interval = poll_interval.max(Duration::from_millis(1));
+        Self {
+            reader,
+            interval: interval(poll_interval),
+            last_emitted: None,
+        }
+    }
+}
+
+impl Stream for StatusSummaryStream {
+    type Item = Result<StatusSummary, DeckError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.interval.poll_tick(cx) {
+            Poll::Ready(_) => {
+                let snap = self.reader.read();
+                let summary = build_status_summary(&snap);
+                let should_emit = match &self.last_emitted {
+                    None => true,
+                    Some(prev) => prev != &summary,
+                };
+                if should_emit {
+                    self.last_emitted = Some(summary.clone());
+                    Poll::Ready(Some(Ok(summary)))
+                } else {
+                    // No change — re-arm the waker so the
+                    // runtime polls us again on the next tick.
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1911,6 +1980,86 @@ mod tests {
         let sig = deck.identity().sign_proposal(proposal.action());
         let commit = proposal.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "flush_avoid_lists");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn status_summary_stream_emits_initial_summary_immediately() {
+        use futures::StreamExt;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(10),
+                ..DeckClientConfig::default()
+            });
+        let mut stream = deck.status_summary_stream();
+        let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("first timed out")
+            .expect("first closed")
+            .expect("first ok");
+        // Steady-state idle cluster — every count is zero.
+        assert!(first.freeze_remaining_ms.is_none());
+        assert!(!first.local_maintenance_active);
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn status_summary_stream_dedups_unchanged_summaries() {
+        use futures::StreamExt;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(10),
+                ..DeckClientConfig::default()
+            });
+        let mut stream = deck.status_summary_stream();
+        // First emission lands.
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("first")
+            .expect("closed")
+            .expect("ok");
+        // No state change — the stream should park (dedup).
+        let second = tokio::time::timeout(Duration::from_millis(80), stream.next()).await;
+        assert!(second.is_err(), "stream should not re-emit unchanged summary");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn status_summary_stream_re_emits_on_freeze_state_change() {
+        use futures::StreamExt;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(10),
+                ..DeckClientConfig::default()
+            });
+        let mut stream = deck.status_summary_stream();
+        let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("first")
+            .expect("closed")
+            .expect("ok");
+        assert!(first.freeze_remaining_ms.is_none());
+
+        // Freeze the cluster — the next polled summary will
+        // differ (`freeze_remaining_ms` flips to `Some`), so
+        // the stream re-emits + the audit ring depth bumps.
+        deck.admin()
+            .freeze_cluster(Duration::from_secs(30))
+            .await
+            .expect("freeze");
+        let after_freeze = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("after_freeze timed out")
+            .expect("after_freeze closed")
+            .expect("after_freeze ok");
+        assert!(after_freeze.freeze_remaining_ms.is_some());
+        assert!(after_freeze.admin_audit_ring_depth >= 1);
         let _ = runtime.shutdown().await;
     }
 
