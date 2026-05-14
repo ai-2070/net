@@ -371,6 +371,13 @@ pub enum VerificationOutcome {
 /// this commit." The list is empty for unsigned commits.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AdminAuditRecord {
+    /// Monotonic per-runtime sequence number. Strictly
+    /// increasing across the runtime's lifetime — the Deck
+    /// SDK's audit-tail stream uses this to dedup across
+    /// snapshot polls without depending on
+    /// `committed_at_ms` (which can collide when two commits
+    /// arrive in the same millisecond).
+    pub seq: u64,
     /// Wall-clock milliseconds since `UNIX_EPOCH` at the
     /// moment the loop received the commit. Distinct from
     /// `Instant`-based timing the rest of the loop uses so
@@ -1332,6 +1339,7 @@ mod tests {
             VerificationOutcome::Unverified,
         ] {
             let record = AdminAuditRecord {
+                seq: 1,
                 committed_at_ms: 12_345,
                 event: AdminEvent::FreezeCluster {
                     ttl: Duration::from_secs(60),
@@ -1348,6 +1356,7 @@ mod tests {
     #[test]
     fn admin_audit_record_json_round_trips_for_audit_query_path() {
         let record = AdminAuditRecord {
+            seq: 42,
             committed_at_ms: 999,
             event: AdminEvent::ThawCluster,
             operator_ids: vec![42],
@@ -1437,6 +1446,7 @@ mod tests {
         // events (no `Force*` discriminator) fit on the same
         // ring as ICE events.
         let record = AdminAuditRecord {
+            seq: 7,
             committed_at_ms: 1_000,
             event: AdminEvent::EnterMaintenance {
                 node: 42,

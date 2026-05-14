@@ -98,6 +98,12 @@ pub struct MeshOsLoop {
     /// confirm reconcile fired exactly once per Tick.
     reconcile_count: u64,
 
+    /// Monotonic counter the loop stamps onto every
+    /// `AdminAuditRecord` it emits. Strictly increasing across
+    /// the runtime's lifetime; the Deck SDK's audit-tail
+    /// stream depends on this for dedup across snapshot polls.
+    admin_audit_seq: u64,
+
     /// Actions reconcile emitted that the action-queue
     /// `try_send` rejected because the executor was at
     /// `action_queue_capacity`. Cloneable counter — the runtime
@@ -363,6 +369,7 @@ impl MeshOsLoop {
             probes: ProbeRegistryInner::default(),
             scheduler: SchedulerRegistry::new(),
             reconcile_count: 0,
+            admin_audit_seq: 0,
             dropped_actions: Arc::new(AtomicU64::new(0)),
             executor_failures: None,
             control_sink: None,
@@ -691,7 +698,11 @@ impl MeshOsLoop {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        // Stamp a monotonic per-runtime seq starting at 1 so a
+        // `0` seq downstream reads as "unset."
+        self.admin_audit_seq += 1;
         let record = super::ice::AdminAuditRecord {
+            seq: self.admin_audit_seq,
             committed_at_ms,
             event: event.clone(),
             operator_ids,

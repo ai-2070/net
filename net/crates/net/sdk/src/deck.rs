@@ -40,7 +40,7 @@
 // Re-export the substrate-side Deck types under a clean
 // `net_sdk::deck::*` path.
 pub use net::adapter::net::behavior::deck::{
-    AdminCommands, AdminError, AuditQuery, ChainCommit, DaemonCounts, DeckClient,
+    AdminCommands, AdminError, AuditQuery, AuditStream, ChainCommit, DaemonCounts, DeckClient,
     DeckClientConfig, DeckError, IceCommands, IceError, IceProposal, OperatorIdentity,
     OperatorRegistry, OperatorSignature, PeerCounts, SnapshotStream, StatusSummary,
 };

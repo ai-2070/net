@@ -1136,6 +1136,140 @@ impl<'a> AuditQuery<'a> {
         }
         matched
     }
+
+    /// Tail mode: convert the query into an async stream that
+    /// yields each matching audit record as it arrives on the
+    /// substrate's ring. Polls the snapshot reader at
+    /// `DeckClientConfig::snapshot_poll_interval`. The
+    /// `recent(limit)` filter is ignored in tail mode — the
+    /// stream emits continuously, not a bounded batch.
+    ///
+    /// Uses [`super::meshos::AdminAuditRecord::seq`] to dedup
+    /// across polls so two commits in the same millisecond
+    /// never collapse.
+    pub fn stream(self) -> AuditStream {
+        AuditStream::new(
+            self.client.snapshot_reader.clone(),
+            self.client.config.snapshot_poll_interval,
+            AuditFilter {
+                operator: self.operator_filter,
+                time_range: self.time_range,
+                force_only: self.force_only,
+            },
+        )
+    }
+}
+
+/// Compiled audit filter the [`AuditStream`] re-applies on
+/// every poll. Internal — exposed as `AuditQuery`'s builder
+/// shape, not directly constructible by SDK consumers.
+#[derive(Clone, Debug)]
+struct AuditFilter {
+    operator: Option<u64>,
+    time_range: Option<(u64, u64)>,
+    force_only: bool,
+}
+
+impl AuditFilter {
+    fn matches(&self, record: &super::meshos::AdminAuditRecord) -> bool {
+        if let Some(op_id) = self.operator {
+            if !record.operator_ids.contains(&op_id) {
+                return false;
+            }
+        }
+        if let Some((start, end)) = self.time_range {
+            if record.committed_at_ms < start || record.committed_at_ms > end {
+                return false;
+            }
+        }
+        if self.force_only && !record.event.is_ice() {
+            return false;
+        }
+        true
+    }
+}
+
+/// Audit-tail stream. Emits each matching
+/// [`super::meshos::AdminAuditRecord`] as it lands on the
+/// substrate's ring. Built via [`AuditQuery::stream`].
+///
+/// Dedup uses the per-runtime monotonic
+/// [`super::meshos::AdminAuditRecord::seq`] field — the
+/// stream tracks the highest seq it's emitted, and on each
+/// poll yields records strictly above that watermark.
+pub struct AuditStream {
+    reader: super::meshos::MeshOsSnapshotReader,
+    interval: Interval,
+    filter: AuditFilter,
+    last_seq: u64,
+    /// Queue of records pending emission. Populated on a poll
+    /// when multiple matching records arrived since the last
+    /// tick; drained one-per-`poll_next` so the consumer sees
+    /// each commit individually.
+    queued: std::collections::VecDeque<super::meshos::AdminAuditRecord>,
+}
+
+impl AuditStream {
+    fn new(
+        reader: super::meshos::MeshOsSnapshotReader,
+        poll_interval: Duration,
+        filter: AuditFilter,
+    ) -> Self {
+        let poll_interval = poll_interval.max(Duration::from_millis(1));
+        Self {
+            reader,
+            interval: interval(poll_interval),
+            filter,
+            last_seq: 0,
+            queued: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl Stream for AuditStream {
+    type Item = Result<super::meshos::AdminAuditRecord, DeckError>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        // Drain any queued records first so the consumer sees
+        // every record from a multi-record poll individually.
+        if let Some(record) = self.queued.pop_front() {
+            return Poll::Ready(Some(Ok(record)));
+        }
+        // Wait for the next poll tick.
+        match self.interval.poll_tick(cx) {
+            Poll::Ready(_) => {
+                let snap = self.reader.read();
+                let last_seq = self.last_seq;
+                // Ring order is oldest-first; iterate forward.
+                let mut max_seq = last_seq;
+                for record in snap.admin_audit.into_iter() {
+                    if record.seq <= last_seq {
+                        continue;
+                    }
+                    if record.seq > max_seq {
+                        max_seq = record.seq;
+                    }
+                    if self.filter.matches(&record) {
+                        self.queued.push_back(record);
+                    }
+                }
+                self.last_seq = max_seq;
+                if let Some(record) = self.queued.pop_front() {
+                    Poll::Ready(Some(Ok(record)))
+                } else {
+                    // Re-schedule — the interval already fired,
+                    // so the runtime needs to know we still
+                    // want a wake-up.
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 /// Stream over the runtime's snapshot reader. Polls at the
@@ -1766,6 +1900,126 @@ mod tests {
             .await
             .expect_err("predicate never holds, should time out");
         assert_eq!(err.kind, "watch_timeout");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_stream_emits_one_record_per_signed_commit_in_order() {
+        use futures::StreamExt;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(15),
+                ..DeckClientConfig::default()
+            });
+
+        let mut stream = deck.audit().stream();
+        // No commits yet — the stream should yield nothing for
+        // at least one tick.
+        let first_attempt = tokio::time::timeout(
+            Duration::from_millis(40),
+            stream.next(),
+        )
+        .await;
+        assert!(first_attempt.is_err(), "stream should park when no records");
+
+        // Issue three commits; the stream should yield three
+        // records in seq order.
+        deck.admin().cordon(42).await.unwrap();
+        deck.admin().uncordon(42).await.unwrap();
+        deck.admin().invalidate_placement(42).await.unwrap();
+
+        let r1 = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("r1 timed out")
+            .expect("r1 closed")
+            .expect("r1 ok");
+        let r2 = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("r2 timed out")
+            .expect("r2 closed")
+            .expect("r2 ok");
+        let r3 = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("r3 timed out")
+            .expect("r3 closed")
+            .expect("r3 ok");
+
+        // Stream emits in seq order (substrate guarantees seq
+        // strictly increases).
+        assert!(r1.seq < r2.seq);
+        assert!(r2.seq < r3.seq);
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_stream_dedups_already_seen_records_across_polls() {
+        // Two consecutive polls on the same snapshot must NOT
+        // re-emit records. The seq-based watermark guarantees
+        // this even when the snapshot ring carries records
+        // older than the stream's watermark.
+        use futures::StreamExt;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(10),
+                ..DeckClientConfig::default()
+            });
+
+        deck.admin().cordon(42).await.unwrap();
+        let mut stream = deck.audit().stream();
+        let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("first timed out")
+            .expect("first closed")
+            .expect("first ok");
+
+        // No new commits — the stream should park (not
+        // re-emit `first`).
+        let second_attempt = tokio::time::timeout(
+            Duration::from_millis(50),
+            stream.next(),
+        )
+        .await;
+        assert!(second_attempt.is_err(), "stream should not re-emit seen record");
+
+        // Issue another commit; only the new one shows up.
+        deck.admin().uncordon(42).await.unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("second timed out")
+            .expect("second closed")
+            .expect("second ok");
+        assert!(second.seq > first.seq);
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_stream_applies_force_only_filter_in_tail_mode() {
+        // Mix ordinary (Cordon) and ICE (ThawCluster). With
+        // force_only(), the stream yields only the ICE entry.
+        use futures::StreamExt;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(10),
+                ..DeckClientConfig::default()
+            });
+
+        let mut stream = deck.audit().force_only().stream();
+        deck.admin().cordon(42).await.unwrap();
+        deck.admin().thaw_cluster().await.unwrap();
+
+        let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("next timed out")
+            .expect("next closed")
+            .expect("next ok");
+        // Only the ThawCluster (ICE) should pass the filter.
+        assert!(next.event.is_ice());
         let _ = runtime.shutdown().await;
     }
 
