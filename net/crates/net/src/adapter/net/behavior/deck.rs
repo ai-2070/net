@@ -369,12 +369,18 @@ fn build_status_summary(snap: &MeshOsSnapshot) -> StatusSummary {
 /// Constructed via [`Self::from_runtime`] (when the caller holds
 /// the live runtime) or [`Self::new`] (when the caller already
 /// has handle + reader and wants to compose explicitly).
+#[derive(Clone)]
 pub struct DeckClient {
     handle: MeshOsHandle,
     snapshot_reader: MeshOsSnapshotReader,
     identity: OperatorIdentity,
     config: DeckClientConfig,
-    commit_seq: AtomicU64,
+    /// Wrapped in `Arc` so clones share the same counter —
+    /// `commit_id`s stay monotonic across every fan-out use of
+    /// a single `DeckClient`. Without this, a clone would
+    /// produce its own counter and two siblings could emit
+    /// colliding `commit_id`s for distinct commits.
+    commit_seq: Arc<AtomicU64>,
     /// Optional operator-key registry. When present, every ICE
     /// commit verifies each [`OperatorSignature`] against the
     /// registered public key before publishing. When absent,
@@ -400,7 +406,7 @@ impl DeckClient {
             snapshot_reader,
             identity,
             config,
-            commit_seq: AtomicU64::new(0),
+            commit_seq: Arc::new(AtomicU64::new(0)),
             operator_registry: None,
         }
     }
@@ -1304,10 +1310,10 @@ impl<'a> AuditQuery<'a> {
         self
     }
 
-    /// Restrict the result to ICE force operations. No-op in
-    /// Phase 1 (the ring is already ICE-only); preserved for
-    /// forward compatibility with the unified admin-chain
-    /// query path.
+    /// Restrict the result to ICE force operations. The audit
+    /// ring now interleaves ordinary signed-admin commits with
+    /// ICE bundles, so this filter actively drops non-ICE
+    /// records via [`super::meshos::AdminEvent::is_ice`].
     pub fn force_only(mut self) -> Self {
         self.force_only = true;
         self
@@ -1489,10 +1495,11 @@ impl Stream for AuditStream {
                 if let Some(record) = self.queued.pop_front() {
                     Poll::Ready(Some(Ok(record)))
                 } else {
-                    // Re-schedule — the interval already fired,
-                    // so the runtime needs to know we still
-                    // want a wake-up.
-                    cx.waker().wake_by_ref();
+                    // The interval consumed its Ready tick on
+                    // this poll; the next poll calls poll_tick
+                    // again, which registers its own waker for
+                    // the next period. No explicit wake_by_ref
+                    // needed.
                     Poll::Pending
                 }
             }
@@ -1791,9 +1798,9 @@ impl Stream for StatusSummaryStream {
                     self.last_emitted = Some(summary.clone());
                     Poll::Ready(Some(Ok(summary)))
                 } else {
-                    // No change — re-arm the waker so the
-                    // runtime polls us again on the next tick.
-                    cx.waker().wake_by_ref();
+                    // The interval consumed its Ready tick on
+                    // this poll; the next poll_tick registers
+                    // its own waker for the next period.
                     Poll::Pending
                 }
             }
