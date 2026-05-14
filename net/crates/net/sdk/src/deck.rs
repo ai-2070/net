@@ -7,27 +7,27 @@
 //! module re-exports the types under a clean `net_sdk::deck::*`
 //! path so consumers don't reach into substrate internals.
 //!
-//! # Surface (Phase 1)
+//! # Surface
 //!
 //! - [`DeckClient`] — composes a live MeshOS runtime with an
 //!   [`OperatorIdentity`] into the operator-facing handle.
 //! - [`AdminCommands`] — typed admin-event surface. One method
 //!   per [`AdminEvent`] variant; each returns a [`ChainCommit`]
 //!   correlation handle.
-//! - [`SnapshotStream`] — `Stream` over the runtime's snapshot
-//!   reader.
-//! - [`DeckError`] / [`AdminError`] — operator-readable error
-//!   surface with the `<<deck-sdk-kind:KIND>>MSG` discriminator
-//!   format every cross-language SDK uses.
-//!
-//! # Deferred to later slices
-//!
-//! - `audit()` — admin-chain query surface. Needs the
-//!   substrate's signed admin chain to query against.
-//! - `subscribe_logs()` — per-daemon / per-node log streams.
-//! - `ice()` — break-glass surface (Phase 3). Depends on the
-//!   substrate's `AdminEvent::Force*` variants + multi-operator
-//!   signing + blast-radius simulator (Phase 2 substrate work).
+//! - [`IceCommands`] / [`IceProposal`] — break-glass surface.
+//!   Each proposal exposes `simulate()` → [`BlastRadius`] and
+//!   `commit(signatures: &[OperatorSignature])` with substrate-
+//!   side M-of-N verification via [`AdminVerifier`].
+//! - [`SnapshotStream`] / [`StatusSummaryStream`] — `Stream`s
+//!   over the runtime's snapshot reader.
+//! - [`AuditQuery`] — fluent admin-chain query builder over the
+//!   in-memory audit ring (with the
+//!   `<<deck-sdk-kind:KIND>>MSG` error discriminator). Filters:
+//!   `recent`, `by_operator`, `between`, `force_only`, `since`.
+//! - [`LogStream`] / [`FailureStream`] — per-daemon / per-node
+//!   log + failure tails with `since(seq)` pagination.
+//! - [`DeckError`] / [`AdminError`] / [`IceError`] — operator-
+//!   readable error surface.
 //!
 //! # Operator-side, not daemon-side
 //!
