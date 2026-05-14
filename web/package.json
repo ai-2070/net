@@ -13,7 +13,6 @@
     "analyze:browser": "npx cross-env BUNDLE_ANALYZE=browser next build"
   },
   "dependencies": {
-    "@next/third-parties": "16.2.6",
     "@phosphor-icons/react": "2.1.10",
     "@posthog/react": "1.9.0",
     "@prisma/adapter-neon": "7.8.0",
@@ -51,7 +50,6 @@
     "@radix-ui/themes": "3.3.0",
     "@sentry/nextjs": "10.53.1",
     "@sentry/profiling-node": "10.53.1",
-    "@stripe/stripe-js": "9.5.0",
     "@t3-oss/env-nextjs": "0.13.11",
     "@tanstack/react-query": "5.100.10",
     "@tanstack/react-table": "8.21.3",
@@ -59,9 +57,6 @@
     "@trpc/next": "11.17.0",
     "@trpc/react-query": "11.17.0",
     "@trpc/server": "11.17.0",
-    "@vercel/analytics": "2.0.1",
-    "@vercel/otel": "2.1.2",
-    "@vercel/speed-insights": "2.0.0",
     "axios": "1.16.1",
     "axios-retry": "4.5.0",
     "better-auth": "1.6.11",
@@ -92,7 +87,6 @@
     "react-fast-marquee": "1.6.5",
     "react-hook-form": "7.75.0",
     "react-icons": "5.6.0",
-    "resend": "6.12.3",
     "server-only": "0.0.1",
     "superjson": "2.2.6",
     "tailwind-merge": "3.6.0",
