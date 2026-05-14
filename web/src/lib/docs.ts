@@ -2,8 +2,58 @@ import "server-only";
 import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import title from "title";
+import { DOCS_ORDER } from "@/docs.order";
 
 const DOCS_ROOT = resolve(process.cwd(), ".docs-mirror");
+
+export type DocsOrderConfig = {
+  /** Order of top-level folders (sections). Unlisted append alpha after. */
+  sections?: string[];
+  /** Order of children within a folder, keyed by full slug path joined by `/`
+   * (e.g. `"releases"`, `"plans/nested"`). Unlisted append alpha after. */
+  folders?: Record<string, string[]>;
+};
+
+// Reorders `items` by the slugs listed in `order`. Listed items come first
+// in the given order; unlisted items keep their incoming (alpha) order and
+// are appended after. Slug comparison is case-insensitive so the config
+// can use any casing.
+function applyOrder<T>(
+  items: T[],
+  order: string[] | undefined,
+  key: (item: T) => string,
+): T[] {
+  if (!order || order.length === 0) return items;
+  const map = new Map<string, T>();
+  for (const item of items) map.set(key(item).toLowerCase(), item);
+  const out: T[] = [];
+  const used = new Set<string>();
+  for (const k of order) {
+    const lower = k.toLowerCase();
+    const item = map.get(lower);
+    if (item !== undefined) {
+      out.push(item);
+      used.add(lower);
+    }
+  }
+  for (const item of items) {
+    if (!used.has(key(item).toLowerCase())) out.push(item);
+  }
+  return out;
+}
+
+// Case-insensitive lookup of a per-folder order list. The config keys are
+// user-authored so we tolerate any casing (`releases` / `Releases` / `RELEASES`
+// all work for the same folder).
+function folderOrder(folderKey: string): string[] | undefined {
+  const cfg = DOCS_ORDER.folders;
+  if (!cfg) return undefined;
+  const lower = folderKey.toLowerCase();
+  for (const k of Object.keys(cfg)) {
+    if (k.toLowerCase() === lower) return cfg[k];
+  }
+  return undefined;
+}
 
 export type DocFile = {
   kind: "file";
@@ -78,12 +128,19 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
     }
   }
 
+  const folderKey = slugChain.join("/");
+  const orderedChildren = applyOrder<DocNode>(
+    [...folders, ...files],
+    folderOrder(folderKey),
+    (n) => n.slug[n.slug.length - 1] ?? "",
+  );
+
   return {
     kind: "folder",
     slug: slugChain,
     title: titleize(folderName),
     readme,
-    children: [...folders, ...files],
+    children: orderedChildren,
   };
 }
 
@@ -117,7 +174,13 @@ export function getDocTree(): DocTree {
     }
   }
 
-  cached = { rootReadme, rootFiles, folders };
+  const orderedFolders = applyOrder(
+    folders,
+    DOCS_ORDER.sections,
+    (f) => f.slug[f.slug.length - 1] ?? "",
+  );
+
+  cached = { rootReadme, rootFiles, folders: orderedFolders };
   return cached;
 }
 
