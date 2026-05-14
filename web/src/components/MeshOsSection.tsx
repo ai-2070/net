@@ -959,7 +959,7 @@ export function MeshOsSection() {
           <strong className="text-accent font-medium">
             MeshOS turns your mesh into a living system.
           </strong>{" "}
-          The cluster adapts. The daemons move.
+          Sensors adapt. Storage flows. The daemons move.
         </p>
       </div>
     </section>
