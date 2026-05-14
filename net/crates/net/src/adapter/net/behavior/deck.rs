@@ -599,6 +599,21 @@ impl<'a> IceCommands<'a> {
         )
     }
 
+    /// Propose force-evicting `victim` from `chain` bypassing
+    /// the scheduler's rebalance cooldown. Only the chain's
+    /// elected leader emits the resulting `RequestEviction`
+    /// action; non-leader nodes fold the admin event silently.
+    pub fn force_evict_replica(
+        &self,
+        chain: ChainId,
+        victim: NodeId,
+    ) -> IceProposal<'a> {
+        IceProposal::new(
+            self.client,
+            IceActionProposal::ForceEvictReplica { chain, victim },
+        )
+    }
+
     /// Propose cancelling an in-effect cluster freeze.
     pub fn thaw_cluster(&self) -> IceProposal<'a> {
         IceProposal::new(self.client, IceActionProposal::ThawCluster)
@@ -698,6 +713,7 @@ impl<'a> IceProposal<'a> {
                 IceActionProposal::FreezeCluster { .. } => "freeze_cluster",
                 IceActionProposal::ThawCluster => "thaw_cluster",
                 IceActionProposal::FlushAvoidLists { .. } => "flush_avoid_lists",
+                IceActionProposal::ForceEvictReplica { .. } => "force_evict_replica",
             };
             self.client
                 .publish_signed_ice(self.action, signatures.to_vec(), kind)
@@ -715,6 +731,14 @@ impl<'a> IceProposal<'a> {
                         .publish_admin(
                             AdminEvent::FlushAvoidLists { scope },
                             "flush_avoid_lists",
+                        )
+                        .await
+                }
+                IceActionProposal::ForceEvictReplica { chain, victim } => {
+                    self.client
+                        .publish_admin(
+                            AdminEvent::ForceEvictReplica { chain, victim },
+                            "force_evict_replica",
                         )
                         .await
                 }
@@ -1187,6 +1211,21 @@ mod tests {
         let sig = deck.identity().sign_proposal(proposal.action());
         let commit = proposal.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "flush_avoid_lists");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ice_force_evict_replica_proposal_round_trips() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+        let proposal = deck.ice().force_evict_replica(100, 7);
+        let blast = proposal.simulate().await.expect("simulate");
+        assert_eq!(blast.affected_replicas, vec![100]);
+        assert_eq!(blast.affected_nodes, vec![7]);
+        let sig = deck.identity().sign_proposal(proposal.action());
+        let commit = proposal.commit(&[sig]).await.expect("commit");
+        assert_eq!(commit.event_kind(), "force_evict_replica");
         let _ = runtime.shutdown().await;
     }
 

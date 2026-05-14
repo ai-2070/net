@@ -692,6 +692,13 @@ impl MeshOsLoop {
                 _ => {}
             }
         }
+        // Drain queued force-evictions: reconcile consumed them
+        // (whether or not this node is the leader for each
+        // chain). Clearing here unconditionally keeps non-leader
+        // observers from accumulating stale entries.
+        if !self.actual.forced_evictions.is_empty() {
+            self.actual.forced_evictions.clear();
+        }
         self.reconcile_count += 1;
         let mut dropped_this_tick: u64 = 0;
         let mut first_dropped_kind: Option<&'static str> = None;

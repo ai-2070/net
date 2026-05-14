@@ -77,6 +77,14 @@ pub struct MeshOsState {
     /// ICE [`AdminEvent::FreezeCluster`] / [`AdminEvent::ThawCluster`]
     /// admin events.
     pub(crate) freeze_until: Option<Instant>,
+    /// Operator-issued force-evictions pending leader-side
+    /// emission. The fold appends `(chain, victim)` on every
+    /// `AdminEvent::ForceEvictReplica`; reconcile reads the
+    /// list to emit `RequestEviction` actions bypassing
+    /// scheduler cooldown; the loop drains the list after each
+    /// reconcile pass so a single admin commit fires exactly
+    /// one eviction.
+    pub(crate) forced_evictions: Vec<(ChainId, NodeId)>,
 }
 
 /// Per-daemon observed status. Phase B fleshes out the fields
@@ -386,6 +394,15 @@ impl MeshOsState {
                         self.avoid_list.clear();
                     }
                 }
+            }
+            AdminEvent::ForceEvictReplica { chain, victim } => {
+                // Cluster-wide signal: every node records the
+                // pending eviction. The chain's elected leader
+                // is the one that actually emits `RequestEviction`
+                // on the next reconcile pass; other nodes drain
+                // the entry without emitting, which is the same
+                // shape the count-driven and scheduler arms use.
+                self.forced_evictions.push((*chain, *victim));
             }
             _ => {}
         }
@@ -932,5 +949,29 @@ mod tests {
             THIS_NODE,
         );
         assert!(state.avoid_list.is_empty());
+    }
+
+    #[test]
+    fn force_evict_replica_admin_event_appends_to_forced_evictions() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ForceEvictReplica {
+                chain: 100,
+                victim: 7,
+            }),
+            THIS_NODE,
+        );
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ForceEvictReplica {
+                chain: 200,
+                victim: 9,
+            }),
+            THIS_NODE,
+        );
+        assert_eq!(
+            state.forced_evictions,
+            vec![(100u64, 7u64), (200u64, 9u64)]
+        );
     }
 }

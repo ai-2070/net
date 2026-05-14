@@ -74,6 +74,11 @@ pub fn reconcile(
     let mut evicted_this_tick: std::collections::HashSet<ChainId> =
         std::collections::HashSet::new();
     diff_daemons(actual, desired, now, &mut actions);
+    // ICE force-eviction arm runs first so the count-driven
+    // and scheduler arms see the chain marked evicted-this-tick
+    // and skip emitting their own (possibly different-victim)
+    // eviction for it.
+    diff_forced_evictions(actual, this_node, &mut evicted_this_tick, &mut actions);
     diff_replicas(
         actual,
         desired,
@@ -244,6 +249,40 @@ fn pick_pull_source(actual: &MeshOsState, chain: ChainId, this_node: NodeId) -> 
 
 /// Phase D — locality diff. For each peer whose latest RTT
 /// exceeds `degraded_rtt_threshold` AND who isn't already on
+/// ICE arm — drain `actual.forced_evictions` and emit
+/// `RequestEviction` for each `(chain, victim)` pair where
+/// `this_node` is the chain's elected leader. Bypasses both
+/// the count-driven hysteresis (the count arm checks
+/// `desired_count`) and the scheduler cooldown (the scheduler
+/// arm checks `last_rebalance`). Per locked decision #6's
+/// leader gate, non-leader nodes still fold the admin event
+/// into state but produce no action — only the leader acts.
+///
+/// The state list itself is drained by the loop after this
+/// reconcile pass completes (see `MeshOsLoop::run_reconcile`),
+/// so a single admin commit fires exactly one eviction.
+fn diff_forced_evictions(
+    actual: &MeshOsState,
+    this_node: NodeId,
+    evicted: &mut std::collections::HashSet<ChainId>,
+    out: &mut Vec<MeshOsAction>,
+) {
+    for (chain, victim) in &actual.forced_evictions {
+        let leader = actual.replica_leader.get(chain).copied();
+        if leader != Some(this_node) {
+            continue;
+        }
+        if evicted.contains(chain) {
+            continue;
+        }
+        out.push(MeshOsAction::RequestEviction {
+            chain: *chain,
+            victim: *victim,
+        });
+        evicted.insert(*chain);
+    }
+}
+
 /// the avoid list, emit `MarkAvoid { peer, reason, ttl }`.
 ///
 /// The "already on the avoid list" gate is what keeps reconcile
@@ -2018,6 +2057,92 @@ mod tests {
         assert!(
             frozen.is_empty(),
             "freeze should suppress reconcile output, got {frozen:?}",
+        );
+    }
+
+    #[test]
+    fn forced_eviction_emits_request_eviction_on_the_leader() {
+        const CHAIN: ChainId = 0xC0FFEE;
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        actual.replicas.insert(
+            CHAIN,
+            ::std::collections::BTreeSet::from([THIS_NODE, 99]),
+        );
+        actual.replica_leader.insert(CHAIN, THIS_NODE);
+        actual.forced_evictions.push((CHAIN, 99));
+
+        let actions = reconcile(
+            &actual,
+            &DesiredState::default(),
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert_eq!(
+            actions,
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN,
+                victim: 99,
+            }],
+        );
+    }
+
+    #[test]
+    fn forced_eviction_does_not_emit_on_non_leader_nodes() {
+        const CHAIN: ChainId = 0xCAFE;
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        actual.replicas.insert(
+            CHAIN,
+            ::std::collections::BTreeSet::from([THIS_NODE, 7]),
+        );
+        // Leader is some OTHER node, not this one.
+        actual.replica_leader.insert(CHAIN, 999);
+        actual.forced_evictions.push((CHAIN, 7));
+        let actions = reconcile(
+            &actual,
+            &DesiredState::default(),
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert!(actions.is_empty(), "non-leader should not emit, got {actions:?}");
+    }
+
+    #[test]
+    fn forced_eviction_bypasses_scheduler_cooldown() {
+        const CHAIN: ChainId = 0xDEAD;
+        let mut actual = MeshOsState::default();
+        let now = Instant::now();
+        actual.last_tick = Some(now);
+        actual.replicas.insert(CHAIN, ::std::collections::BTreeSet::from([7]));
+        actual.replica_leader.insert(CHAIN, THIS_NODE);
+        // Mark a very recent rebalance — the scheduler arm would
+        // skip this chain due to cooldown. Force-evict should
+        // ignore that gate.
+        actual.last_rebalance.insert(CHAIN, now);
+        actual.forced_evictions.push((CHAIN, 7));
+
+        let actions = reconcile(
+            &actual,
+            &DesiredState::default(),
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert_eq!(
+            actions,
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN,
+                victim: 7,
+            }],
         );
     }
 

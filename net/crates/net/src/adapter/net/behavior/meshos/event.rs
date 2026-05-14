@@ -362,6 +362,20 @@ pub enum AdminEvent {
         /// Which entries to flush — see [`AvoidScope`].
         scope: AvoidScope,
     },
+    /// ICE break-glass: force-evict `victim` from `chain`,
+    /// bypassing the scheduler's per-chain rebalance cooldown
+    /// (`SchedulerConfig::cooldown`) and the count-driven
+    /// hysteresis the non-force eviction path respects. Only
+    /// the chain's elected leader actually emits the resulting
+    /// `RequestEviction` action; non-leader observers fold the
+    /// admin event but produce no action.
+    ForceEvictReplica {
+        /// Chain whose replica to evict.
+        chain: ChainId,
+        /// Node currently holding the replica that should be
+        /// removed.
+        victim: NodeId,
+    },
 }
 
 /// Scope discriminator for [`AdminEvent::FlushAvoidLists`].

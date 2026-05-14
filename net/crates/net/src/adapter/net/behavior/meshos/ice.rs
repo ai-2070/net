@@ -70,6 +70,15 @@ pub enum IceActionProposal {
         /// Flush scope — see [`AvoidScope`].
         scope: AvoidScope,
     },
+    /// Force-evict `victim` from `chain` bypassing the
+    /// scheduler's rebalance cooldown. Maps to
+    /// [`super::event::AdminEvent::ForceEvictReplica`].
+    ForceEvictReplica {
+        /// Chain whose replica to evict.
+        chain: ChainId,
+        /// Holder to remove.
+        victim: NodeId,
+    },
 }
 
 impl IceActionProposal {
@@ -82,6 +91,12 @@ impl IceActionProposal {
             IceActionProposal::ThawCluster => AdminEvent::ThawCluster,
             IceActionProposal::FlushAvoidLists { scope } => {
                 AdminEvent::FlushAvoidLists { scope: *scope }
+            }
+            IceActionProposal::ForceEvictReplica { chain, victim } => {
+                AdminEvent::ForceEvictReplica {
+                    chain: *chain,
+                    victim: *victim,
+                }
             }
         }
     }
@@ -385,6 +400,36 @@ pub enum BlastWarning {
         /// The peer the flush is un-avoiding cluster-wide.
         peer: NodeId,
     },
+    /// `ForceEvictReplica` bypasses the scheduler's rebalance
+    /// cooldown for the targeted chain. Operator gets one
+    /// eviction now; the cooldown still applies to subsequent
+    /// scheduler-driven rebalances of the same chain.
+    ForcedEvictionBypassesCooldown {
+        /// Chain the force-evict targets.
+        chain: ChainId,
+        /// Holder being evicted.
+        victim: NodeId,
+    },
+    /// `ForceEvictReplica` referenced a chain that doesn't
+    /// appear in the snapshot — substrate accepts the admin
+    /// commit, but no node will fire a leader-side eviction
+    /// because the leader entry is missing. Surfaces here so
+    /// the operator UI flags "this proposal will be a no-op."
+    ForcedEvictionTargetsUnknownChain {
+        /// The chain id the operator targeted.
+        chain: ChainId,
+    },
+    /// `ForceEvictReplica`'s victim isn't currently observed
+    /// as a holder of the chain. The commit still folds and
+    /// produces a leader-side eviction action, but the holder
+    /// set won't change — the action becomes a no-op at the
+    /// dispatcher.
+    ForcedEvictionTargetsNonHolder {
+        /// The chain id the operator targeted.
+        chain: ChainId,
+        /// The holder the operator targeted.
+        victim: NodeId,
+    },
 }
 
 /// Pure simulator: snapshot + proposal → blast radius. No I/O;
@@ -396,6 +441,9 @@ pub fn simulate(snapshot: &MeshOsSnapshot, proposal: &IceActionProposal) -> Blas
         IceActionProposal::FreezeCluster { ttl } => simulate_freeze(snapshot, *ttl),
         IceActionProposal::ThawCluster => simulate_thaw(snapshot),
         IceActionProposal::FlushAvoidLists { scope } => simulate_flush_avoid_lists(snapshot, *scope),
+        IceActionProposal::ForceEvictReplica { chain, victim } => {
+            simulate_force_evict_replica(snapshot, *chain, *victim)
+        }
     }
 }
 
@@ -456,6 +504,33 @@ fn simulate_flush_avoid_lists(snapshot: &MeshOsSnapshot, scope: AvoidScope) -> B
             placement_stability_delta: 0.1,
             warnings: vec![BlastWarning::GlobalAvoidFlushMayReEmit],
         },
+    }
+}
+
+fn simulate_force_evict_replica(
+    snapshot: &MeshOsSnapshot,
+    chain: ChainId,
+    victim: NodeId,
+) -> BlastRadius {
+    let mut warnings = vec![BlastWarning::ForcedEvictionBypassesCooldown { chain, victim }];
+    let replica = snapshot.replicas.get(&chain);
+    if replica.is_none() {
+        warnings.push(BlastWarning::ForcedEvictionTargetsUnknownChain { chain });
+    } else if let Some(snap) = replica {
+        if !snap.holders.contains(&victim) {
+            warnings.push(BlastWarning::ForcedEvictionTargetsNonHolder { chain, victim });
+        }
+    }
+    BlastRadius {
+        affected_nodes: vec![victim],
+        affected_replicas: vec![chain],
+        affected_daemons: Vec::new(),
+        estimated_drain_delay: None,
+        // Eviction always disturbs placement; surface a small
+        // but visible signal so the operator UI flags the
+        // change.
+        placement_stability_delta: 0.15,
+        warnings,
     }
 }
 
@@ -727,6 +802,100 @@ mod tests {
                 AdminEvent::FlushAvoidLists { scope: out } => assert_eq!(out, scope),
                 other => panic!("expected FlushAvoidLists, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn simulate_force_evict_replica_reports_chain_and_victim() {
+        let mut snap = MeshOsSnapshot::default();
+        // Seed the chain so the simulator can verify victim is
+        // a current holder.
+        snap.replicas.insert(
+            100,
+            super::super::snapshot::ReplicaSnapshot {
+                holders: vec![7, 8, 9],
+                desired_count: Some(3),
+                leader: Some(8),
+            },
+        );
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::ForceEvictReplica {
+                chain: 100,
+                victim: 7,
+            },
+        );
+        assert_eq!(blast.affected_replicas, vec![100]);
+        assert_eq!(blast.affected_nodes, vec![7]);
+        assert!(blast
+            .warnings
+            .iter()
+            .any(|w| matches!(
+                w,
+                BlastWarning::ForcedEvictionBypassesCooldown {
+                    chain: 100,
+                    victim: 7
+                }
+            )));
+        // Non-zero placement disturbance.
+        assert!(blast.placement_stability_delta > 0.0);
+    }
+
+    #[test]
+    fn simulate_force_evict_replica_warns_on_unknown_chain() {
+        let snap = MeshOsSnapshot::default();
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::ForceEvictReplica {
+                chain: 100,
+                victim: 7,
+            },
+        );
+        assert!(blast.warnings.iter().any(|w| matches!(
+            w,
+            BlastWarning::ForcedEvictionTargetsUnknownChain { chain: 100 }
+        )));
+    }
+
+    #[test]
+    fn simulate_force_evict_replica_warns_on_non_holder_victim() {
+        let mut snap = MeshOsSnapshot::default();
+        snap.replicas.insert(
+            100,
+            super::super::snapshot::ReplicaSnapshot {
+                holders: vec![1, 2, 3],
+                desired_count: Some(3),
+                leader: Some(1),
+            },
+        );
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::ForceEvictReplica {
+                chain: 100,
+                victim: 999,
+            },
+        );
+        assert!(blast.warnings.iter().any(|w| matches!(
+            w,
+            BlastWarning::ForcedEvictionTargetsNonHolder {
+                chain: 100,
+                victim: 999
+            }
+        )));
+    }
+
+    #[test]
+    fn ice_proposal_to_admin_event_maps_force_evict_replica() {
+        let proposal = IceActionProposal::ForceEvictReplica {
+            chain: 100,
+            victim: 7,
+        };
+        match proposal.to_admin_event() {
+            AdminEvent::ForceEvictReplica { chain, victim } => {
+                assert_eq!(chain, 100);
+                assert_eq!(victim, 7);
+            }
+            other => panic!("expected ForceEvictReplica, got {other:?}"),
         }
     }
 
