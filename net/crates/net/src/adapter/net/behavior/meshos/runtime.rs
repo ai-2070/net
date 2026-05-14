@@ -90,6 +90,176 @@ pub struct RuntimeStats {
     pub dropped_actions: u64,
 }
 
+/// Builder for [`MeshOsRuntime`]. Replaces the stair-step of
+/// `start_with_*` constructors with one type whose
+/// `with_*` methods toggle individual extensions. The
+/// `start_with_*` constructors stay as backward-compat
+/// forwarders for v0.17 callers; new code should prefer the
+/// builder.
+///
+/// Sensible defaults: empty probe + scheduler registries,
+/// fresh `DaemonRegistry`, no control sink, no admin verifier,
+/// no-op appenders, no-op migration aborter / snapshot source.
+/// At minimum a caller supplies `config` and `dispatcher`; the
+/// rest are opt-in.
+pub struct MeshOsRuntimeBuilder<D: ActionDispatcher> {
+    config: MeshOsConfig,
+    dispatcher: Arc<D>,
+    probes: ProbeRegistry,
+    scheduler: SchedulerRegistry,
+    daemon_registry: Option<Arc<DaemonRegistry>>,
+    control_sink: Option<Arc<dyn super::control::ControlSink>>,
+    admin_verifier: Option<Arc<super::ice::AdminVerifier>>,
+    admin_audit_appender: Option<Arc<dyn super::audit_chain::AdminAuditChainAppender>>,
+    log_appender: Option<Arc<dyn super::log_chain::LogChainAppender>>,
+    failure_appender: Option<Arc<dyn super::failure_chain::FailureChainAppender>>,
+    migration_aborter: Option<Arc<dyn super::migration_aborter::MigrationAborter>>,
+    migration_snapshot_source:
+        Option<Arc<dyn super::migration_snapshot_source::MigrationSnapshotSource>>,
+}
+
+impl<D: ActionDispatcher> MeshOsRuntimeBuilder<D> {
+    /// Start a builder with the two mandatory inputs: a config
+    /// and a dispatcher. Every other extension is opt-in via
+    /// `with_*`.
+    pub fn new(config: MeshOsConfig, dispatcher: Arc<D>) -> Self {
+        Self {
+            config,
+            dispatcher,
+            probes: ProbeRegistry::new(),
+            scheduler: SchedulerRegistry::new(),
+            daemon_registry: None,
+            control_sink: None,
+            admin_verifier: None,
+            admin_audit_appender: None,
+            log_appender: None,
+            failure_appender: None,
+            migration_aborter: None,
+            migration_snapshot_source: None,
+        }
+    }
+
+    /// Pre-populate the probe registry. Equivalent to
+    /// adding probes one-at-a-time after start, but useful
+    /// when the caller already has a fully-populated registry.
+    pub fn with_probe_registry(mut self, probes: ProbeRegistry) -> Self {
+        self.probes = probes;
+        self
+    }
+
+    /// Pre-populate the scheduler registry.
+    pub fn with_scheduler_registry(mut self, scheduler: SchedulerRegistry) -> Self {
+        self.scheduler = scheduler;
+        self
+    }
+
+    /// Share a `DaemonRegistry` with other subsystems instead
+    /// of letting the runtime build its own. Useful when the
+    /// host already holds an `Arc<DaemonRegistry>` and wants
+    /// the runtime to attach to the same instance.
+    pub fn with_daemon_registry(mut self, registry: Arc<DaemonRegistry>) -> Self {
+        self.daemon_registry = Some(registry);
+        self
+    }
+
+    /// Attach a control sink. The SDK installs one that fans
+    /// out MeshOsControl events to per-daemon channels.
+    pub fn with_control_sink(mut self, sink: Arc<dyn super::control::ControlSink>) -> Self {
+        self.control_sink = Some(sink);
+        self
+    }
+
+    /// Install an admin verifier. Required for production
+    /// deployments; absent for in-process tests that don't
+    /// gate on identity.
+    pub fn with_admin_verifier(mut self, verifier: Arc<super::ice::AdminVerifier>) -> Self {
+        self.admin_verifier = Some(verifier);
+        self
+    }
+
+    /// Install an admin-audit chain appender. Production
+    /// deployments wire a `TypedRedexFile<AdminAuditRecord>`
+    /// here so the bounded in-memory audit ring extends to
+    /// cluster-lifetime replay.
+    pub fn with_admin_audit_appender(
+        mut self,
+        appender: Arc<dyn super::audit_chain::AdminAuditChainAppender>,
+    ) -> Self {
+        self.admin_audit_appender = Some(appender);
+        self
+    }
+
+    /// Install a log-chain appender. Production deployments
+    /// wire a `TypedRedexFile<LogRecord>` here so the bounded
+    /// in-memory log ring extends to cluster-lifetime replay.
+    pub fn with_log_appender(
+        mut self,
+        appender: Arc<dyn super::log_chain::LogChainAppender>,
+    ) -> Self {
+        self.log_appender = Some(appender);
+        self
+    }
+
+    /// Install a failure-chain appender. The executor + loop
+    /// dual-write FailureRecords here so the failure ring's
+    /// bounded history extends to cluster-lifetime replay.
+    pub fn with_failure_appender(
+        mut self,
+        appender: Arc<dyn super::failure_chain::FailureChainAppender>,
+    ) -> Self {
+        self.failure_appender = Some(appender);
+        self
+    }
+
+    /// Install a migration-abort dispatcher. Production
+    /// deployments wire the orchestrator-backed adapter; tests
+    /// + bootstrap can leave this unset (the no-op default
+    /// stays in place and a KillMigration commit is
+    /// audit-only).
+    pub fn with_migration_aborter(
+        mut self,
+        aborter: Arc<dyn super::migration_aborter::MigrationAborter>,
+    ) -> Self {
+        self.migration_aborter = Some(aborter);
+        self
+    }
+
+    /// Install a migration-snapshot source. The loop calls
+    /// this on every snapshot publish and embeds the result in
+    /// `MeshOsSnapshot::in_flight_migrations`, so the ICE
+    /// simulator can enumerate which daemon a KillMigration
+    /// target would affect.
+    pub fn with_migration_snapshot_source(
+        mut self,
+        source: Arc<dyn super::migration_snapshot_source::MigrationSnapshotSource>,
+    ) -> Self {
+        self.migration_snapshot_source = Some(source);
+        self
+    }
+
+    /// Build the runtime and spawn the loop + executor tasks.
+    /// Returns a live [`MeshOsRuntime`].
+    pub fn build_and_start(self) -> MeshOsRuntime {
+        let daemon_registry = self
+            .daemon_registry
+            .unwrap_or_else(|| Arc::new(DaemonRegistry::new()));
+        MeshOsRuntime::start_with_full_extensions(
+            self.config,
+            self.dispatcher,
+            self.probes,
+            self.scheduler,
+            daemon_registry,
+            self.control_sink,
+            self.admin_verifier,
+            self.admin_audit_appender,
+            self.log_appender,
+            self.failure_appender,
+            self.migration_aborter,
+            self.migration_snapshot_source,
+        )
+    }
+}
+
 impl MeshOsRuntime {
     /// Spawn the loop + executor and return a live runtime.
     /// The dispatcher is whatever wires the action variants to
@@ -97,6 +267,13 @@ impl MeshOsRuntime {
     /// migration orchestrator, admin chain commits). Tests can
     /// pass an [`super::executor::LoggingDispatcher`] for the
     /// log-only path.
+    ///
+    /// For non-default wiring (admin verifier, chain appenders,
+    /// migration aborter, …) use
+    /// [`MeshOsRuntimeBuilder`] instead — the `start_with_*`
+    /// stair-step constructors below are backward-compat
+    /// forwarders that flatten the builder's `with_*` calls
+    /// into one positional signature.
     pub fn start<D: ActionDispatcher>(config: MeshOsConfig, dispatcher: Arc<D>) -> Self {
         Self::start_with_probes(config, dispatcher, ProbeRegistry::new())
     }

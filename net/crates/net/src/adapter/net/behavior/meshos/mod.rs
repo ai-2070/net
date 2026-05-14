@@ -134,7 +134,7 @@ pub use probes::{
     HealthProbe, LocalityProbe, ProximityGraphHealthProbe, ProximityGraphLocalityProbe,
 };
 pub use reconcile::{reconcile, STOP_GRACE_PERIOD};
-pub use runtime::{MeshOsRuntime, RuntimeShutdownError, RuntimeStats};
+pub use runtime::{MeshOsRuntime, MeshOsRuntimeBuilder, RuntimeShutdownError, RuntimeStats};
 pub use scheduler::{PlacementScorer, SchedulerConfig, SchedulerRegistry};
 pub use sdk::{
     DaemonControlRouter, MaintenanceStateView, MeshOsDaemonHandle, MeshOsDaemonSdk, MetadataView,
