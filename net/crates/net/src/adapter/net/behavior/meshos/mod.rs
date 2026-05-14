@@ -63,6 +63,7 @@ pub mod ice;
 pub mod log_chain;
 pub mod logs;
 pub mod maintenance;
+pub mod migration_aborter;
 pub mod probes;
 pub mod reconcile;
 pub mod redex_appenders;
@@ -116,6 +117,10 @@ pub use log_chain::{
     DEFAULT_LOG_BUFFERING_APPENDER_CAPACITY,
 };
 pub use logs::{LogLevel, LogLine, LogRecord, DEFAULT_MAX_LOG_RING_RECORDS};
+pub use migration_aborter::{
+    BufferingMigrationAborter, MigrationAbortError, MigrationAborter, NoOpMigrationAborter,
+    OrchestratorMigrationAborter, DEFAULT_MIGRATION_ABORT_BUFFERING_CAPACITY,
+};
 pub use redex_appenders::{RedexAdminAuditAppender, RedexFailureAppender, RedexLogAppender};
 pub use maintenance::MaintenanceState;
 pub use probes::{

@@ -111,3 +111,11 @@ pub use net::adapter::net::EntityKeypair;
 pub use net::adapter::net::behavior::meshos::{
     RedexAdminAuditAppender, RedexFailureAppender, RedexLogAppender,
 };
+
+// Migration-abort dispatcher seam. Operators wire the
+// `OrchestratorMigrationAborter` adapter so an
+// `AdminEvent::KillMigration` chain commit actually aborts the
+// in-flight migration on every node hosting it.
+pub use net::adapter::net::behavior::meshos::{
+    MigrationAbortError, MigrationAborter, OrchestratorMigrationAborter,
+};
