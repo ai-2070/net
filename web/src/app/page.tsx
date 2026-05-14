@@ -4803,18 +4803,25 @@ function MeshAutoform() {
       }
 
       // ---- daemons + migration char-trails ----
+      // First pass: advance positions, push new trail dots, age trails,
+      // bucket sitters by host so co-resident daemons render as one
+      // glyph with a "+"-joined label instead of overlapping.
+      const sittingByHost = new Map<number, AutoMeshDaemon[]>();
+      const migratingPositions: Array<{
+        d: AutoMeshDaemon;
+        x: number;
+        y: number;
+      }> = [];
       for (const d of daemons) {
         const from = nodes[d.fromIdx];
         const to = nodes[d.toIdx];
         const host = nodes[d.hostIdx];
         if (!host) continue;
-        let x = host.x;
-        let y = host.y - 18;
         if (d.migrating && from && to) {
           const tt = easeInOut(d.migrateT);
           const arcLift = Math.sin(tt * Math.PI) * 14;
-          x = from.x + (to.x - from.x) * tt;
-          y = from.y + (to.y - from.y) * tt - arcLift;
+          const x = from.x + (to.x - from.x) * tt;
+          const y = from.y + (to.y - from.y) * tt - arcLift;
           if (Math.random() < 0.55) {
             d.trail.push({
               x,
@@ -4823,8 +4830,13 @@ function MeshAutoform() {
               ch: Math.random() < 0.5 ? "▒" : "░",
             });
           }
+          migratingPositions.push({ d, x, y });
+        } else {
+          const list = sittingByHost.get(d.hostIdx);
+          if (list) list.push(d);
+          else sittingByHost.set(d.hostIdx, [d]);
         }
-        // draw + age trail
+        // age + draw trail (trails may linger after arrival)
         ctx.font = `${EDGE_FONT_PX}px ${AUTOMESH_MONO_FONT}`;
         for (const t of d.trail) {
           t.age += dt;
@@ -4834,18 +4846,44 @@ function MeshAutoform() {
           ctx.fillText(t.ch, t.x, t.y);
         }
         d.trail = d.trail.filter((t) => t.age < 0.5);
-        // daemon glyph + halo
+      }
+
+      // Migrating daemons render individually (positions diverge).
+      for (const { d, x, y } of migratingPositions) {
         ctx.fillStyle = "rgba(61, 240, 255, 0.45)";
         ctx.font = `bold 22px ${AUTOMESH_MONO_FONT}`;
         ctx.fillText("◆", x, y);
         ctx.fillStyle = "rgba(255, 255, 255, 0.98)";
         ctx.font = `bold 15px ${AUTOMESH_MONO_FONT}`;
         ctx.fillText("◆", x, y);
-        // tiny hex tag above daemon
         ctx.fillStyle = "rgba(61, 240, 255, 0.7)";
         ctx.font = `${LABEL_FONT_PX - 1}px ${AUTOMESH_MONO_FONT}`;
         ctx.fillText(`d.${d.hex}`, x, y - 14);
       }
+
+      // Sitters: one glyph per host, labels joined with "+".
+      sittingByHost.forEach((group, hostIdx) => {
+        const host = nodes[hostIdx];
+        if (!host) return;
+        const x = host.x;
+        const y = host.y - 18;
+        // halo intensifies subtly when stacked
+        const stackBoost = Math.min(0.25, (group.length - 1) * 0.12);
+        ctx.fillStyle = `rgba(61, 240, 255, ${0.45 + stackBoost})`;
+        ctx.font = `bold 22px ${AUTOMESH_MONO_FONT}`;
+        ctx.fillText("◆", x, y);
+        ctx.fillStyle = "rgba(255, 255, 255, 0.98)";
+        ctx.font = `bold 15px ${AUTOMESH_MONO_FONT}`;
+        ctx.fillText("◆", x, y);
+        const parts = group.map((d) => `d.${d.hex}`);
+        const label =
+          parts.length <= 3
+            ? parts.join("+")
+            : `${parts.slice(0, 2).join("+")}+${parts.length - 2}`;
+        ctx.fillStyle = "rgba(61, 240, 255, 0.7)";
+        ctx.font = `${LABEL_FONT_PX - 1}px ${AUTOMESH_MONO_FONT}`;
+        ctx.fillText(label, x, y - 14);
+      });
 
       rafId = requestAnimationFrame(frame);
     };
