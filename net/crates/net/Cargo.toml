@@ -75,7 +75,7 @@ meshdb = ["cortex"]
 # supervision (B), replica enforcement (C), locality + admin
 # events (D), maintenance state machine (E), behavior snapshot
 # fold (F), and backpressure (G). See `docs/plans/MESHOS_PLAN.md`.
-meshos = ["cortex"]
+meshos = ["cortex", "dep:blake3"]
 # Dataforts (Rebel Yell) — compile the dataforts module surface,
 # which covers every phase the plan calls runtime-toggleable:
 # greedy-LRU caching (Phase 1), data-gravity heat counters

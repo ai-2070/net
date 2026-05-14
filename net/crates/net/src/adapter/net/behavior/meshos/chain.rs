@@ -353,6 +353,9 @@ fn push_failure(state: &mut MeshOsSnapshot, source: String, reason: String, reco
         state.recent_failures.pop_front();
     }
     state.recent_failures.push_back(FailureRecord {
+        // Chain-replay-derived records carry `seq = 0`; only
+        // the live executor's ring assigns meaningful seqs.
+        seq: 0,
         source,
         reason,
         recorded_at_ms,

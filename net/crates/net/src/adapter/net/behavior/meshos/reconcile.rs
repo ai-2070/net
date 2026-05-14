@@ -61,6 +61,12 @@ pub fn reconcile(
     // `Instant::now()` for tests that call reconcile without
     // driving Ticks.
     let now = actual.last_tick.unwrap_or_else(Instant::now);
+    // Cluster-wide ICE freeze: suppress all reconcile-driven
+    // action emission while in effect. Folds + chain commits
+    // keep running upstream; only this output is gated.
+    if actual.is_frozen(now) {
+        return actions;
+    }
     // Track which chains already saw a `RequestEviction` this
     // tick so the Phase C count-driven arm and the Phase D-1
     // scheduler arm don't both emit (possibly with different
@@ -68,6 +74,12 @@ pub fn reconcile(
     let mut evicted_this_tick: std::collections::HashSet<ChainId> =
         std::collections::HashSet::new();
     diff_daemons(actual, desired, now, &mut actions);
+    // ICE force-eviction arm runs first so the count-driven
+    // and scheduler arms see the chain marked evicted-this-tick
+    // and skip emitting their own (possibly different-victim)
+    // eviction for it.
+    diff_forced_evictions(actual, this_node, &mut evicted_this_tick, &mut actions);
+    diff_forced_placements(actual, this_node, &mut actions);
     diff_replicas(
         actual,
         desired,
@@ -209,6 +221,7 @@ fn diff_replicas(
                 exclude: holders
                     .map(|hs| hs.iter().copied().collect())
                     .unwrap_or_default(),
+                target: None,
             });
         } else if actual_count > desired_count {
             // Pick the lex-smallest holder as the victim;
@@ -238,6 +251,69 @@ fn pick_pull_source(actual: &MeshOsState, chain: ChainId, this_node: NodeId) -> 
 
 /// Phase D — locality diff. For each peer whose latest RTT
 /// exceeds `degraded_rtt_threshold` AND who isn't already on
+/// ICE arm — drain `actual.forced_evictions` and emit
+/// `RequestEviction` for each `(chain, victim)` pair where
+/// `this_node` is the chain's elected leader. Bypasses both
+/// the count-driven hysteresis (the count arm checks
+/// `desired_count`) and the scheduler cooldown (the scheduler
+/// arm checks `last_rebalance`). Per locked decision #6's
+/// leader gate, non-leader nodes still fold the admin event
+/// into state but produce no action — only the leader acts.
+///
+/// The state list itself is drained by the loop after this
+/// reconcile pass completes (see `MeshOsLoop::run_reconcile`),
+/// so a single admin commit fires exactly one eviction.
+fn diff_forced_evictions(
+    actual: &MeshOsState,
+    this_node: NodeId,
+    evicted: &mut std::collections::HashSet<ChainId>,
+    out: &mut Vec<MeshOsAction>,
+) {
+    for (chain, victim) in &actual.forced_evictions {
+        let leader = actual.replica_leader.get(chain).copied();
+        if leader != Some(this_node) {
+            continue;
+        }
+        if evicted.contains(chain) {
+            continue;
+        }
+        out.push(MeshOsAction::RequestEviction {
+            chain: *chain,
+            victim: *victim,
+        });
+        evicted.insert(*chain);
+    }
+}
+
+/// ICE arm — drain `actual.forced_placements` and emit
+/// `RequestPlacement` for each `(chain, target)` pair where
+/// `this_node` is the chain's elected leader. The action's
+/// `target` field carries the operator's pin so the
+/// dispatcher places the replica on the requested node
+/// directly, bypassing the placement scorer.
+///
+/// Idempotent against "target is already a holder": the leader
+/// still emits the action; the dispatcher's placement code
+/// can treat target-already-present as a no-op.
+fn diff_forced_placements(actual: &MeshOsState, this_node: NodeId, out: &mut Vec<MeshOsAction>) {
+    for (chain, target) in &actual.forced_placements {
+        let leader = actual.replica_leader.get(chain).copied();
+        if leader != Some(this_node) {
+            continue;
+        }
+        let exclude: Vec<NodeId> = actual
+            .replicas
+            .get(chain)
+            .map(|hs| hs.iter().copied().filter(|n| n != target).collect())
+            .unwrap_or_default();
+        out.push(MeshOsAction::RequestPlacement {
+            chain: *chain,
+            exclude,
+            target: Some(*target),
+        });
+    }
+}
+
 /// the avoid list, emit `MarkAvoid { peer, reason, ttl }`.
 ///
 /// The "already on the avoid list" gate is what keeps reconcile
@@ -1042,6 +1118,7 @@ mod tests {
             vec![MeshOsAction::RequestPlacement {
                 chain: CHAIN_A,
                 exclude: vec![1, 2],
+                target: None,
             }],
         );
     }
@@ -1971,5 +2048,227 @@ mod tests {
             }
             other => panic!("expected two RequestPlacement actions in chain order, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn freeze_suppresses_action_emission_that_would_otherwise_fire() {
+        // Stand up a state that would normally emit StartDaemon —
+        // a desired-Run daemon with default (Stopped) lifecycle.
+        // Without freeze, reconcile emits the start. With freeze
+        // in effect, the action vector is empty.
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        let d = daemon("frozen-daemon", 1);
+        actual.daemons.insert(d.clone(), DaemonStatus::default());
+        let mut desired = DesiredState::default();
+        desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
+
+        // Sanity: unfrozen emits the start.
+        let baseline = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert_eq!(baseline, vec![MeshOsAction::StartDaemon { daemon: d }]);
+
+        // Freeze the cluster — reconcile should emit nothing.
+        actual.freeze_until = Some(actual.last_tick.unwrap() + Duration::from_secs(30));
+        let frozen = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert!(
+            frozen.is_empty(),
+            "freeze should suppress reconcile output, got {frozen:?}",
+        );
+    }
+
+    #[test]
+    fn forced_placement_emits_request_placement_with_target_pinned_on_leader() {
+        const CHAIN: ChainId = 0xC0FFEE;
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        actual
+            .replicas
+            .insert(CHAIN, ::std::collections::BTreeSet::from([THIS_NODE, 99]));
+        actual.replica_leader.insert(CHAIN, THIS_NODE);
+        actual.forced_placements.push((CHAIN, 42));
+        let actions = reconcile(
+            &actual,
+            &DesiredState::default(),
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        let mut placements: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, MeshOsAction::RequestPlacement { .. }))
+            .collect();
+        assert_eq!(placements.len(), 1);
+        let placement = placements.remove(0);
+        match placement {
+            MeshOsAction::RequestPlacement {
+                chain,
+                exclude,
+                target,
+            } => {
+                assert_eq!(*chain, CHAIN);
+                assert_eq!(*target, Some(42));
+                // Current holders THIS_NODE + 99 should be
+                // excluded (none of them is the target).
+                assert!(exclude.contains(&THIS_NODE));
+                assert!(exclude.contains(&99));
+                assert!(!exclude.contains(&42));
+            }
+            other => panic!("expected RequestPlacement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forced_placement_does_not_emit_on_non_leader_nodes() {
+        const CHAIN: ChainId = 0xCAFE;
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        actual.replica_leader.insert(CHAIN, 999);
+        actual.forced_placements.push((CHAIN, 7));
+        let actions = reconcile(
+            &actual,
+            &DesiredState::default(),
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, MeshOsAction::RequestPlacement { .. })),
+            "non-leader should not emit forced placement, got {actions:?}",
+        );
+    }
+
+    #[test]
+    fn forced_eviction_emits_request_eviction_on_the_leader() {
+        const CHAIN: ChainId = 0xC0FFEE;
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        actual
+            .replicas
+            .insert(CHAIN, ::std::collections::BTreeSet::from([THIS_NODE, 99]));
+        actual.replica_leader.insert(CHAIN, THIS_NODE);
+        actual.forced_evictions.push((CHAIN, 99));
+
+        let actions = reconcile(
+            &actual,
+            &DesiredState::default(),
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert_eq!(
+            actions,
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN,
+                victim: 99,
+            }],
+        );
+    }
+
+    #[test]
+    fn forced_eviction_does_not_emit_on_non_leader_nodes() {
+        const CHAIN: ChainId = 0xCAFE;
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        actual
+            .replicas
+            .insert(CHAIN, ::std::collections::BTreeSet::from([THIS_NODE, 7]));
+        // Leader is some OTHER node, not this one.
+        actual.replica_leader.insert(CHAIN, 999);
+        actual.forced_evictions.push((CHAIN, 7));
+        let actions = reconcile(
+            &actual,
+            &DesiredState::default(),
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert!(
+            actions.is_empty(),
+            "non-leader should not emit, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn forced_eviction_bypasses_scheduler_cooldown() {
+        const CHAIN: ChainId = 0xDEAD;
+        let mut actual = MeshOsState::default();
+        let now = Instant::now();
+        actual.last_tick = Some(now);
+        actual
+            .replicas
+            .insert(CHAIN, ::std::collections::BTreeSet::from([7]));
+        actual.replica_leader.insert(CHAIN, THIS_NODE);
+        // Mark a very recent rebalance — the scheduler arm would
+        // skip this chain due to cooldown. Force-evict should
+        // ignore that gate.
+        actual.last_rebalance.insert(CHAIN, now);
+        actual.forced_evictions.push((CHAIN, 7));
+
+        let actions = reconcile(
+            &actual,
+            &DesiredState::default(),
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert_eq!(
+            actions,
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN,
+                victim: 7,
+            }],
+        );
+    }
+
+    #[test]
+    fn freeze_expired_does_not_suppress_action_emission() {
+        // freeze_until in the past — the gc clears on next tick,
+        // but reconcile's own `is_frozen` check is point-in-time
+        // and also treats past values as not-frozen.
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        actual.freeze_until = Some(actual.last_tick.unwrap() - Duration::from_secs(1));
+        let d = daemon("post-thaw-daemon", 1);
+        actual.daemons.insert(d.clone(), DaemonStatus::default());
+        let mut desired = DesiredState::default();
+        desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert_eq!(actions, vec![MeshOsAction::StartDaemon { daemon: d }]);
     }
 }

@@ -66,6 +66,23 @@ pub enum MeshOsControl {
     BackpressureOff,
 }
 
+/// Sink the loop emits [`MeshOsControl`] events into when the
+/// fold observes a state transition that fans out as a daemon
+/// control signal (maintenance enter / exit, backpressure
+/// flips). Installed via
+/// [`super::event_loop::MeshOsLoop::with_control_sink`]; the
+/// SDK plugs one in to route events through its per-daemon
+/// channels.
+///
+/// Sync `emit` because the loop is on the critical path —
+/// implementors must avoid blocking. The SDK's router uses
+/// `mpsc::try_send` (drop on full).
+pub trait ControlSink: Send + Sync + 'static {
+    /// Receive a control event. Called from the loop task; must
+    /// not block, must not panic.
+    fn emit(&self, event: MeshOsControl);
+}
+
 impl MeshOsControl {
     /// Convert this SDK-internal event to the WASM-friendly
     /// [`DaemonControl`] form the daemon's `on_control` method

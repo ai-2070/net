@@ -54,11 +54,111 @@ pub struct MeshOsSnapshot {
     /// This node's own maintenance state.
     pub local_maintenance: MaintenanceStateSnapshot,
     /// Pending actions (reconcile emitted, executor hasn't
-    /// drained yet).
-    pub pending: Vec<PendingActionSnapshot>,
+    /// drained yet). Wrapped in `Arc<[…]>` so consumers
+    /// holding the snapshot past the `ArcSwap` guard can
+    /// clone in O(1) instead of paying a per-element copy.
+    pub pending: std::sync::Arc<[PendingActionSnapshot]>,
     /// Ring buffer of recent failures (daemon crashes, drain
-    /// timeouts, etc.).
+    /// timeouts, etc.). Stays as a `VecDeque` because the
+    /// chain-replay fold mutates this directly (`push_failure`
+    /// in `chain.rs`); switching to `Arc<[…]>` would require
+    /// the fold to thread a mutable working buffer separately.
     pub recent_failures: VecDeque<FailureRecord>,
+    /// Milliseconds remaining on the cluster-wide ICE freeze, or
+    /// `None` if no freeze is in effect. Driven by the
+    /// `AdminEvent::FreezeCluster` / `AdminEvent::ThawCluster`
+    /// admin commits.
+    pub freeze_remaining_ms: Option<u64>,
+    /// Admin audit ring — every admin commit the loop observed
+    /// (signed ICE bundles + unsigned admin events), ordered
+    /// oldest-first. Bounded by
+    /// [`super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS`]. The
+    /// Deck SDK's `audit()` reads this ring;
+    /// `audit().force_only()` filters to just the ICE-class
+    /// entries (`AdminEvent::is_ice()`).
+    pub admin_audit: std::sync::Arc<[super::ice::AdminAuditRecord]>,
+    /// Log ring — every `MeshOsEvent::LogLine` the loop
+    /// observed, ordered oldest-first. Bounded by
+    /// [`super::logs::DEFAULT_MAX_LOG_RING_RECORDS`]. The
+    /// Deck SDK's `subscribe_logs(filter)` reads this ring;
+    /// the future per-daemon RedEX-tail integration swaps the
+    /// backing store without changing the snapshot shape.
+    pub log_ring: std::sync::Arc<[super::logs::LogRecord]>,
+    /// In-flight daemon migrations this node is hosting. Empty
+    /// unless the runtime wired a
+    /// [`super::migration_snapshot_source::MigrationSnapshotSource`]
+    /// (the production
+    /// [`super::migration_snapshot_source::OrchestratorMigrationSnapshotSource`]
+    /// wraps a `MigrationOrchestrator`). The ICE
+    /// `simulate_kill_migration` blast-radius preview reads
+    /// this to enumerate the affected daemon when the
+    /// operator targets a migration this node hosts.
+    pub in_flight_migrations: std::sync::Arc<[MigrationSnapshot]>,
+    /// Boot-time identifier the MeshOsLoop stamped when it
+    /// started. Stays constant for the lifetime of the loop
+    /// task and changes on every restart. SDK consumers
+    /// dedup'ing via `seq` values (audit / log / failure
+    /// rings) pair every watermark with this value — when
+    /// the snapshot's `runtime_epoch_id` doesn't match the
+    /// consumer's last-seen epoch, the seq counter reset and
+    /// the consumer must reset its watermark to 0 rather than
+    /// silently filter out post-restart records as
+    /// "smaller than my last seq."
+    pub runtime_epoch_id: u64,
+}
+
+/// Wire-form summary of one in-flight migration. Drawn from
+/// `MigrationOrchestrator::list_migrations()` by the
+/// [`super::migration_snapshot_source::MigrationSnapshotSource`]
+/// adapter and embedded in the snapshot on every publish tick.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationSnapshot {
+    /// `MigrationId` (== daemon origin hash). Matches
+    /// [`super::event::MigrationId`] so the ICE simulator can
+    /// look up by the same key the operator targets.
+    pub daemon_origin: u64,
+    /// Phase the orchestrator reports for this migration.
+    pub phase: MigrationPhaseSnapshot,
+    /// Milliseconds since the migration began on this node.
+    pub elapsed_ms: u64,
+}
+
+/// Wire form of [`crate::adapter::net::compute::MigrationPhase`].
+/// `Default` is `Snapshot` (the first phase) purely as an
+/// in-memory placeholder for parent structs that need
+/// `Default`; the postcard decoder does **not** fall back to
+/// `Default` for unknown variants — an older decoder hitting a
+/// newer variant from across the wire errors at decode time.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MigrationPhaseSnapshot {
+    /// Source-side snapshot in progress.
+    #[default]
+    Snapshot,
+    /// Transferring the snapshot to the target node.
+    Transfer,
+    /// Target-side restore + event buffering.
+    Restore,
+    /// Replaying buffered events on the target.
+    Replay,
+    /// Atomic routing cutover.
+    Cutover,
+    /// Cleanup on source.
+    Complete,
+}
+
+impl From<crate::adapter::net::compute::MigrationPhase> for MigrationPhaseSnapshot {
+    fn from(p: crate::adapter::net::compute::MigrationPhase) -> Self {
+        use crate::adapter::net::compute::MigrationPhase;
+        match p {
+            MigrationPhase::Snapshot => Self::Snapshot,
+            MigrationPhase::Transfer => Self::Transfer,
+            MigrationPhase::Restore => Self::Restore,
+            MigrationPhase::Replay => Self::Replay,
+            MigrationPhase::Cutover => Self::Cutover,
+            MigrationPhase::Complete => Self::Complete,
+        }
+    }
 }
 
 /// Per-daemon Deck-renderable summary.
@@ -265,6 +365,14 @@ pub struct PendingActionSnapshot {
 /// [`RECENT_FAILURES_CAPACITY`].
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FailureRecord {
+    /// Monotonic per-runtime sequence number. Strictly
+    /// increasing across the live executor's writes — the
+    /// Deck SDK's failure-tail stream uses this for dedup
+    /// across snapshot polls. Records constructed by the
+    /// chain-replay path (`chain::push_failure`) carry `0`;
+    /// only live executor-produced records have meaningful
+    /// seqs.
+    pub seq: u64,
     /// Source — `"daemon:foo"`, `"drain:node_x"`, etc.
     pub source: String,
     /// Operator-readable reason.
@@ -300,6 +408,9 @@ impl MeshOsSnapshot {
         desired: &DesiredState,
         pending: &[PendingAction],
         recent_failures: &[FailureRecord],
+        in_flight_migrations: Vec<MigrationSnapshot>,
+        admin_audit_ring: &std::collections::VecDeque<super::ice::AdminAuditRecord>,
+        log_ring: &std::collections::VecDeque<super::logs::LogRecord>,
     ) -> Self {
         let now = actual.last_tick.unwrap_or_else(std::time::Instant::now);
 
@@ -433,15 +544,26 @@ impl MeshOsSnapshot {
             },
         };
 
-        let pending = pending
+        let pending: std::sync::Arc<[PendingActionSnapshot]> = pending
             .iter()
             .map(|p| PendingActionSnapshot {
                 id: p.id.0,
                 kind: action_kind_str(&p.action).to_string(),
                 age_ms: now.saturating_duration_since(p.emitted_at).as_millis() as u64,
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
 
+        let freeze_remaining_ms = actual
+            .freeze_until
+            .map(|until| until.saturating_duration_since(now).as_millis() as u64);
+        let admin_audit: std::sync::Arc<[super::ice::AdminAuditRecord]> =
+            admin_audit_ring.iter().cloned().collect::<Vec<_>>().into();
+        let log_ring_arc: std::sync::Arc<[super::logs::LogRecord]> =
+            log_ring.iter().cloned().collect::<Vec<_>>().into();
+
+        let in_flight_migrations_arc: std::sync::Arc<[MigrationSnapshot]> =
+            in_flight_migrations.into();
         Self {
             daemons,
             replicas,
@@ -450,6 +572,15 @@ impl MeshOsSnapshot {
             local_maintenance,
             pending,
             recent_failures: recent_failures.iter().cloned().collect(),
+            freeze_remaining_ms,
+            admin_audit,
+            log_ring: log_ring_arc,
+            in_flight_migrations: in_flight_migrations_arc,
+            // Set to `0` here; the loop's publish_snapshot
+            // overwrites with the per-runtime epoch stamp
+            // immediately after construction so chain-fold
+            // callers don't have to care about the value.
+            runtime_epoch_id: 0,
         }
     }
 }
@@ -489,6 +620,7 @@ pub fn failure_record(
         .unwrap_or(0);
     let recorded_at_ms = now_ms.saturating_sub(age.as_millis() as u64);
     FailureRecord {
+        seq: 0,
         source: source.into(),
         reason: reason.into(),
         recorded_at_ms,
@@ -527,6 +659,7 @@ mod tests {
         // `age_ms = 0`. It's now a Unix-epoch timestamp;
         // consumers compute the relative age locally.
         let r = FailureRecord {
+            seq: 1,
             source: "test".into(),
             reason: "boom".into(),
             recorded_at_ms: 1_000,
@@ -567,7 +700,15 @@ mod tests {
         status.saturation = 0.42;
         actual.daemons.insert(d.clone(), status);
         let desired = DesiredState::default();
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[]);
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &desired,
+            &[],
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+        );
         let daemon = snap.daemons.get(&1).expect("daemon present");
         assert_eq!(daemon.name, "telemetry");
         assert_eq!(daemon.lifecycle, DaemonLifecycleSnapshot::Running);
@@ -588,7 +729,15 @@ mod tests {
         actual.replica_leader.insert(0xAA, 1);
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(0xAA, 5);
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[]);
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &desired,
+            &[],
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+        );
         let r = snap.replicas.get(&0xAA).expect("replica present");
         assert_eq!(r.holders, vec![1, 2, 3]);
         assert_eq!(r.desired_count, Some(5));
@@ -600,7 +749,15 @@ mod tests {
         let actual = MeshOsState::default();
         let mut desired = DesiredState::default();
         desired.desired_replicas.insert(0xBB, 3);
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &[], &[]);
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &desired,
+            &[],
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+        );
         let r = snap
             .replicas
             .get(&0xBB)
@@ -654,7 +811,15 @@ mod tests {
             emitted_at: base,
         }];
 
-        let snap = MeshOsSnapshot::from_state(&actual, &desired, &pending, &[]);
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &desired,
+            &pending,
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+        );
         let bytes = postcard::to_allocvec(&snap).expect("encode");
         let back: MeshOsSnapshot = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(snap, back);
@@ -689,6 +854,7 @@ mod tests {
             MeshOsAction::RequestPlacement {
                 chain: 1,
                 exclude: vec![],
+                target: None,
             },
             MeshOsAction::RequestEviction {
                 chain: 1,

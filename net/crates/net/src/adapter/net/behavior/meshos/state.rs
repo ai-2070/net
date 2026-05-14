@@ -14,9 +14,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use super::event::{
-    AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent, DaemonIntentUpdate,
-    DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent, LocalReplicaIntentUpdate, MeshOsEvent,
-    NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
+    AdminEvent, AvoidScope, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent,
+    DaemonIntentUpdate, DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent,
+    LocalReplicaIntentUpdate, MeshOsEvent, NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
 };
 use super::maintenance::MaintenanceState;
 use super::supervision::BackoffTracker;
@@ -70,6 +70,35 @@ pub struct MeshOsState {
     pub(crate) applied_backoffs: HashMap<DaemonRef, Instant>,
     /// Last `Tick` we processed — used by tests / diagnostics.
     pub(crate) last_tick: Option<Instant>,
+    /// Cluster-wide reconcile-emission freeze. Some(instant)
+    /// means "freeze in effect until this instant"; reconcile
+    /// returns an empty action vector while `now < until`. The
+    /// tick GC clears the value once it expires. Driven by the
+    /// ICE [`AdminEvent::FreezeCluster`] / [`AdminEvent::ThawCluster`]
+    /// admin events.
+    pub(crate) freeze_until: Option<Instant>,
+    /// Operator-issued force-evictions pending leader-side
+    /// emission. The fold appends `(chain, victim)` on every
+    /// `AdminEvent::ForceEvictReplica`; reconcile reads the
+    /// list to emit `RequestEviction` actions bypassing
+    /// scheduler cooldown; the loop drains the list after each
+    /// reconcile pass so a single admin commit fires exactly
+    /// one eviction.
+    pub(crate) forced_evictions: Vec<(ChainId, NodeId)>,
+    /// Operator-issued force-cutovers pending leader-side
+    /// emission. Same pattern as `forced_evictions`: fold
+    /// appends `(chain, target)` on every
+    /// `AdminEvent::ForceCutover`; the leader's reconcile arm
+    /// emits a `RequestPlacement { target: Some(target), .. }`
+    /// bypassing the placement scorer; the loop drains the
+    /// list after each pass.
+    pub(crate) forced_placements: Vec<(ChainId, NodeId)>,
+    // admin_audit and log_ring rings live on MeshOsLoop now,
+    // not MeshOsState — they're append-only output buffers
+    // that don't participate in fold convergence, and keeping
+    // them off the state struct removes the need for the
+    // dead `_ => {}` arms on SignedIceCommit / LogLine in the
+    // apply path.
 }
 
 /// Per-daemon observed status. Phase B fleshes out the fields
@@ -167,6 +196,7 @@ impl MeshOsState {
                 self.last_tick = Some(now);
                 self.gc_avoid_list(now);
                 self.release_elapsed_backoffs(now);
+                self.gc_freeze(now);
             }
             MeshOsEvent::ReplicaUpdate(update) => self.apply_replica(update),
             MeshOsEvent::DaemonLifecycle { daemon, signal } => {
@@ -213,6 +243,22 @@ impl MeshOsState {
             }
             MeshOsEvent::MaintenanceTransitionObserved { node, state } => {
                 self.apply_maintenance_transition(*node, state.clone(), this_node);
+            }
+            MeshOsEvent::SignedIceCommit { .. } | MeshOsEvent::SignedAdminCommit { .. } => {
+                // The loop unwraps verified signed-commit events
+                // into their inner `AdminEvent` and calls back
+                // into this fold with the unwrapped form, so
+                // these arms are dead in production. Kept
+                // explicit so future MeshOsEvent additions
+                // can't silently skip the fold.
+            }
+            MeshOsEvent::LogLine(_) => {
+                // The loop's record_log_line path stamps the
+                // record's seq + ts + node id and pushes onto
+                // the log ring directly — this arm is dead in
+                // production but kept explicit so future
+                // MeshOsEvent additions don't silently skip
+                // the fold.
             }
         }
     }
@@ -311,13 +357,18 @@ impl MeshOsState {
         // before the first tick has fired.
         let anchor = self.last_tick.unwrap_or_else(Instant::now);
         match admin {
-            AdminEvent::EnterMaintenance { node, deadline } => {
+            AdminEvent::EnterMaintenance { node, drain_for } => {
                 self.maintenance
                     .insert(*node, MaintenanceMirror::EnteringMaintenance);
                 if *node == this_node {
+                    // The state-side deadline is an Instant
+                    // computed from the loop's anchor + the
+                    // wire-form Duration. Two replays produce
+                    // identical Instants because `anchor` is
+                    // pinned to `last_tick`.
                     self.local_maintenance = MaintenanceState::EnteringMaintenance {
                         since: anchor,
-                        deadline: *deadline,
+                        deadline: drain_for.map(|d| anchor + d),
                     };
                 }
             }
@@ -343,6 +394,60 @@ impl MeshOsState {
                 // RTT is still bad.
                 self.avoid_list.clear();
             }
+            AdminEvent::FreezeCluster { ttl } => {
+                // Cluster-wide signal — every node observes the
+                // same admin event and folds it identically.
+                self.freeze_until = Some(anchor + *ttl);
+            }
+            AdminEvent::ThawCluster => {
+                self.freeze_until = None;
+            }
+            AdminEvent::FlushAvoidLists { scope } => {
+                match scope {
+                    AvoidScope::Local { node } => {
+                        if *node == this_node {
+                            self.avoid_list.clear();
+                        }
+                    }
+                    AvoidScope::OnPeer { peer } => {
+                        // Every node un-avoids the target peer.
+                        self.avoid_list.remove(peer);
+                    }
+                    AvoidScope::Global => {
+                        // Every node flushes its entire avoid
+                        // list. Reconcile will re-emit
+                        // `MarkAvoid` next tick for peers that
+                        // still meet the degraded-RTT threshold.
+                        self.avoid_list.clear();
+                    }
+                }
+            }
+            AdminEvent::ForceEvictReplica { chain, victim } => {
+                // Cluster-wide signal: every node records the
+                // pending eviction. The chain's elected leader
+                // is the one that actually emits `RequestEviction`
+                // on the next reconcile pass; other nodes drain
+                // the entry without emitting, which is the same
+                // shape the count-driven and scheduler arms use.
+                self.forced_evictions.push((*chain, *victim));
+            }
+            AdminEvent::ForceRestartDaemon { daemon } => {
+                // Clear the daemon's backoff gate so reconcile's
+                // `StartDaemon` arm fires on the next tick. Also
+                // drop any prior `ApplyBackoff` record — a future
+                // crash should produce a fresh emission rather
+                // than ride the previous cooldown's deadline.
+                if let Some(status) = self.daemons.get_mut(daemon) {
+                    status.backoff.force_release();
+                }
+                self.applied_backoffs.remove(daemon);
+            }
+            AdminEvent::ForceCutover { chain, target } => {
+                // Cluster-wide signal: every node folds; only
+                // the chain's elected leader emits the resulting
+                // `RequestPlacement` action with target pinned.
+                self.forced_placements.push((*chain, *target));
+            }
             _ => {}
         }
     }
@@ -367,6 +472,24 @@ impl MeshOsState {
         for status in self.daemons.values_mut() {
             status.backoff.maybe_release(now);
         }
+    }
+
+    /// Clear an expired cluster-wide freeze. Idempotent — does
+    /// nothing if no freeze is in effect or the freeze still has
+    /// time remaining.
+    fn gc_freeze(&mut self, now: Instant) {
+        if let Some(until) = self.freeze_until {
+            if now >= until {
+                self.freeze_until = None;
+            }
+        }
+    }
+
+    /// `true` iff a cluster-wide reconcile freeze is in effect.
+    /// Reconcile reads this each tick to decide whether to emit
+    /// actions.
+    pub(crate) fn is_frozen(&self, now: Instant) -> bool {
+        self.freeze_until.map(|until| now < until).unwrap_or(false)
     }
 }
 
@@ -432,6 +555,7 @@ impl DesiredState {
 pub use super::supervision::RestartState as DaemonRestartState;
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -542,7 +666,7 @@ mod tests {
         state.apply(
             &MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
                 node,
-                deadline: None,
+                drain_for: None,
             }),
             0,
         );
@@ -568,7 +692,7 @@ mod tests {
         state.apply(
             &MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
                 node: THIS_NODE,
-                deadline: None,
+                drain_for: None,
             }),
             THIS_NODE,
         );
@@ -593,7 +717,7 @@ mod tests {
         state.apply(
             &MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
                 node: THIS_NODE,
-                deadline: None,
+                drain_for: None,
             }),
             THIS_NODE,
         );
@@ -615,7 +739,7 @@ mod tests {
         state.apply(
             &MeshOsEvent::AdminEvent(AdminEvent::EnterMaintenance {
                 node: 99,
-                deadline: None,
+                drain_for: None,
             }),
             THIS_NODE,
         );
@@ -704,5 +828,263 @@ mod tests {
             THIS_NODE,
         );
         assert!(matches!(state.local_maintenance, MaintenanceState::Active));
+    }
+
+    #[test]
+    fn freeze_cluster_admin_event_sets_freeze_until_to_anchor_plus_ttl() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        let anchor = Instant::now();
+        state.last_tick = Some(anchor);
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FreezeCluster {
+                ttl: Duration::from_secs(30),
+            }),
+            THIS_NODE,
+        );
+        let until = state.freeze_until.expect("freeze should be set");
+        let delta = until.saturating_duration_since(anchor);
+        assert!(
+            (Duration::from_secs(29)..=Duration::from_secs(31)).contains(&delta),
+            "freeze TTL should anchor on last_tick, got {delta:?}",
+        );
+    }
+
+    #[test]
+    fn thaw_cluster_admin_event_clears_freeze() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        state.last_tick = Some(Instant::now());
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FreezeCluster {
+                ttl: Duration::from_secs(30),
+            }),
+            THIS_NODE,
+        );
+        assert!(state.freeze_until.is_some());
+        state.apply(&MeshOsEvent::AdminEvent(AdminEvent::ThawCluster), THIS_NODE);
+        assert!(state.freeze_until.is_none());
+    }
+
+    #[test]
+    fn freeze_gc_clears_expired_freeze_on_tick() {
+        let mut state = MeshOsState::default();
+        let past = Instant::now() - Duration::from_secs(1);
+        state.freeze_until = Some(past);
+        // Tick after the freeze expired.
+        state.apply(&MeshOsEvent::Tick, 0);
+        assert!(state.freeze_until.is_none());
+    }
+
+    #[test]
+    fn freeze_gc_preserves_freeze_that_has_time_remaining() {
+        let mut state = MeshOsState::default();
+        let future = Instant::now() + Duration::from_secs(30);
+        state.freeze_until = Some(future);
+        state.apply(&MeshOsEvent::Tick, 0);
+        assert!(state.freeze_until.is_some());
+    }
+
+    #[test]
+    fn is_frozen_returns_true_only_while_freeze_in_effect() {
+        let mut state = MeshOsState::default();
+        let now = Instant::now();
+        assert!(!state.is_frozen(now));
+        state.freeze_until = Some(now + Duration::from_secs(30));
+        assert!(state.is_frozen(now));
+        // After expiration the helper reports false even before
+        // the next tick's GC runs.
+        assert!(!state.is_frozen(now + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn thaw_is_idempotent_when_no_freeze_in_effect() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        state.apply(&MeshOsEvent::AdminEvent(AdminEvent::ThawCluster), THIS_NODE);
+        assert!(state.freeze_until.is_none());
+    }
+
+    fn seed_avoid_list(state: &mut MeshOsState, peers: &[NodeId]) {
+        for peer in peers {
+            state.avoid_list.insert(
+                *peer,
+                AvoidEntry {
+                    reason: "test".into(),
+                    until: Instant::now() + Duration::from_secs(60),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn flush_avoid_lists_local_clears_only_on_target_node() {
+        const THIS_NODE: NodeId = 42;
+        const OTHER_NODE: NodeId = 99;
+        let mut state = MeshOsState::default();
+        seed_avoid_list(&mut state, &[1, 2, 3]);
+
+        // Fold on a node that ISN'T the target — should be no-op.
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FlushAvoidLists {
+                scope: AvoidScope::Local { node: OTHER_NODE },
+            }),
+            THIS_NODE,
+        );
+        assert_eq!(
+            state.avoid_list.len(),
+            3,
+            "Local{{other}} should not flush this node"
+        );
+
+        // Fold on the actual target — clears the list.
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FlushAvoidLists {
+                scope: AvoidScope::Local { node: THIS_NODE },
+            }),
+            THIS_NODE,
+        );
+        assert!(state.avoid_list.is_empty());
+    }
+
+    #[test]
+    fn flush_avoid_lists_on_peer_removes_only_that_peer_from_every_node() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        seed_avoid_list(&mut state, &[1, 2, 3]);
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FlushAvoidLists {
+                scope: AvoidScope::OnPeer { peer: 2 },
+            }),
+            THIS_NODE,
+        );
+        // Only peer 2 should be removed.
+        assert!(state.avoid_list.contains_key(&1));
+        assert!(!state.avoid_list.contains_key(&2));
+        assert!(state.avoid_list.contains_key(&3));
+    }
+
+    #[test]
+    fn flush_avoid_lists_on_peer_is_idempotent_for_absent_peer() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        seed_avoid_list(&mut state, &[1, 2]);
+        // Flush a peer that isn't on the list — no-op, no panic.
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FlushAvoidLists {
+                scope: AvoidScope::OnPeer { peer: 99 },
+            }),
+            THIS_NODE,
+        );
+        assert_eq!(state.avoid_list.len(), 2);
+    }
+
+    #[test]
+    fn flush_avoid_lists_global_clears_every_entry_on_every_node() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        seed_avoid_list(&mut state, &[1, 2, 3, 4, 5]);
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FlushAvoidLists {
+                scope: AvoidScope::Global,
+            }),
+            THIS_NODE,
+        );
+        assert!(state.avoid_list.is_empty());
+    }
+
+    #[test]
+    fn force_evict_replica_admin_event_appends_to_forced_evictions() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ForceEvictReplica {
+                chain: 100,
+                victim: 7,
+            }),
+            THIS_NODE,
+        );
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ForceEvictReplica {
+                chain: 200,
+                victim: 9,
+            }),
+            THIS_NODE,
+        );
+        assert_eq!(state.forced_evictions, vec![(100u64, 7u64), (200u64, 9u64)]);
+    }
+
+    #[test]
+    fn force_restart_daemon_clears_backoff_gate_and_applied_record() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        let d = DaemonRef {
+            id: 7,
+            name: "telemetry".into(),
+        };
+        let mut status = DaemonStatus::default();
+        // Drive the tracker into BackingOff so the gate is set.
+        let crash_at = Instant::now();
+        status.backoff.observe_crash(crash_at);
+        assert!(!matches!(
+            status.backoff.state(),
+            crate::adapter::net::behavior::meshos::supervision::RestartState::Idle
+        ));
+        state.daemons.insert(d.clone(), status);
+        state.applied_backoffs.insert(d.clone(), crash_at);
+
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ForceRestartDaemon { daemon: d.clone() }),
+            THIS_NODE,
+        );
+
+        // Gate should be cleared.
+        let after = state.daemons.get(&d).unwrap();
+        assert!(matches!(
+            after.backoff.state(),
+            crate::adapter::net::behavior::meshos::supervision::RestartState::Idle
+        ));
+        // Applied-backoffs record should be cleared too.
+        assert!(!state.applied_backoffs.contains_key(&d));
+    }
+
+    #[test]
+    fn force_cutover_admin_event_appends_to_forced_placements() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ForceCutover {
+                chain: 100,
+                target: 7,
+            }),
+            THIS_NODE,
+        );
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ForceCutover {
+                chain: 200,
+                target: 9,
+            }),
+            THIS_NODE,
+        );
+        assert_eq!(
+            state.forced_placements,
+            vec![(100u64, 7u64), (200u64, 9u64)]
+        );
+    }
+
+    #[test]
+    fn force_restart_daemon_is_noop_for_unknown_daemon() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        let d = DaemonRef {
+            id: 999,
+            name: "absent".into(),
+        };
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::ForceRestartDaemon { daemon: d }),
+            THIS_NODE,
+        );
+        // No panic, no state added.
+        assert!(state.daemons.is_empty());
     }
 }

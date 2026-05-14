@@ -594,6 +594,7 @@ mod tests {
             MeshOsAction::RequestPlacement {
                 chain: 1,
                 exclude: vec![],
+                target: None,
             },
             MeshOsAction::RequestEviction {
                 chain: 1,

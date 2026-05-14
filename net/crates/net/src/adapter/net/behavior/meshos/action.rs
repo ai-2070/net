@@ -117,6 +117,15 @@ pub enum MeshOsAction {
         /// Peers that already hold the chain (or are otherwise
         /// not candidates).
         exclude: Vec<NodeId>,
+        /// Operator-pinned placement target. `None` = the
+        /// placement scorer picks. `Some(node)` = the operator
+        /// has requested the placement land on this specific
+        /// node (via the ICE `ForceCutover` admin event); the
+        /// dispatcher should honor it without consulting the
+        /// scorer. The default-emitting count-driven and
+        /// scheduler arms always pass `None`; only the ICE
+        /// forced-placement arm sets a `Some`.
+        target: Option<NodeId>,
     },
 
     /// Phase C — leader-only. Ask a peer to drop a replica it

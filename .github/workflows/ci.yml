@@ -203,13 +203,19 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo nextest run --no-fail-fast --features meshdb --test meshdb_subprotocol_wire
 
-      # === MeshOS =========================================================
-      # `meshos` chains to cortex → redex → net. End-to-end pipeline
-      # test pins the contract between MeshOsLoop reconcile → admit →
-      # ActionDispatcher across phases.
-      - name: MeshOS
+      # === MeshOS + Deck ==================================================
+      # `meshos` chains to cortex → redex → net. The pipeline test pins
+      # the contract between MeshOsLoop reconcile → admit →
+      # ActionDispatcher across phases; the deck test pins the operator
+      # surface (DeckClient → AdminCommands → in-process MeshOsRuntime)
+      # that Deck-the-binary composes against. Both share the same
+      # `meshos` gate and run in one cargo invocation.
+      - name: MeshOS + Deck
         if: ${{ !cancelled() }}
-        run: cargo nextest run --no-fail-fast --features meshos --test meshos_pipeline
+        run: >
+          cargo nextest run --no-fail-fast --features meshos
+          --test meshos_pipeline
+          --test deck_pipeline
 
   loom-tests:
     name: Loom concurrency models

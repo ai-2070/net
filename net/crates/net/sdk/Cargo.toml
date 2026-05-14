@@ -76,12 +76,27 @@ compute = ["net"]
 # `compute` gets single-daemon spawn / snapshot / migration, and
 # `groups` adds the N-member coordination primitives on top.
 groups = ["compute"]
+# MeshOS SDK — daemon-author surface. Re-exports the
+# substrate's `behavior::meshos::sdk` types and adds the
+# `daemon_main!` macro entry point. Daemons that want to be
+# supervised by MeshOS pull this feature on. Builds on
+# `compute` for the `MeshDaemon` trait + `EntityKeypair`,
+# and on `net/meshos` for the actual runtime.
+meshos = ["compute", "net/meshos"]
+# Deck SDK — operator-side surface (the dual of `meshos`).
+# Re-exports `behavior::deck` with `DeckClient`, `AdminCommands`,
+# `SnapshotStream`, and the `OperatorIdentity` newtype. Builds
+# on `meshos` for the runtime + snapshot reader. Phase 1 surface
+# only — `audit()` / `subscribe_logs()` / `ice()` land in later
+# slices as the substrate's signed admin chain + blast-radius
+# simulator come online.
+deck = ["meshos"]
 # Everything that runs locally (mesh + storage/state + security +
 # compute + groups, no external transports). The default shape for
 # a single-node or LAN-only deployment.
 local = ["net", "cortex", "compute", "groups"]
 # Everything — local stack plus external transports.
-full = ["local", "redis", "jetstream"]
+full = ["local", "redis", "jetstream", "meshos", "deck"]
 
 # nRPC quickstart — requires net + cortex.
 [[example]]
