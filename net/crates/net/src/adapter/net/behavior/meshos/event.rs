@@ -82,7 +82,7 @@ pub enum MeshOsEvent {
     SignedIceCommit {
         /// The proposal that the bundle signed over. The loop
         /// verifies each signature against
-        /// [`super::ice::ice_proposal_signing_payload`].
+        /// [`super::ice::ice_proposal_signing_payload(proposal, issued_at_ms)`].
         proposal: super::ice::IceActionProposal,
         /// Operator signatures collected for this proposal. Per
         /// the plan's locked decision #3 the substrate verifier
@@ -91,6 +91,17 @@ pub enum MeshOsEvent {
         /// enforces this so under-threshold bundles fail before
         /// they reach the loop.
         signatures: Vec<super::ice::OperatorSignature>,
+        /// Issuer-stamped milliseconds since `UNIX_EPOCH`. Binds
+        /// the bundle to a freshness window the substrate
+        /// verifier enforces via
+        /// [`super::ice::DEFAULT_SIGNING_FRESHNESS_WINDOW`].
+        /// Captured bundles older than the window fail
+        /// verification regardless of cryptographic validity.
+        /// Every signature in `signatures` covers the same
+        /// `issued_at_ms`; coordinators collecting signatures
+        /// from multiple operators must share this value across
+        /// the bundle.
+        issued_at_ms: u64,
     },
 
     /// A single-operator-signed ordinary admin commit arrived
@@ -106,11 +117,15 @@ pub enum MeshOsEvent {
     SignedAdminCommit {
         /// The admin event the signature covers. The loop
         /// verifies via
-        /// [`super::ice::admin_event_signing_payload`].
+        /// [`super::ice::admin_event_signing_payload(event, issued_at_ms)`].
         event: AdminEvent,
         /// Issuing operator's signature over the event's
         /// signing payload.
         signature: super::ice::OperatorSignature,
+        /// Issuer-stamped milliseconds since `UNIX_EPOCH`. Same
+        /// freshness contract as the ICE variant — the verifier
+        /// rejects envelopes outside its configured window.
+        issued_at_ms: u64,
     },
 
     /// A log line published by a daemon, source converter,

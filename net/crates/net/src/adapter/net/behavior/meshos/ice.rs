@@ -149,36 +149,124 @@ pub struct OperatorSignature {
     pub signature: Vec<u8>,
 }
 
-/// Deterministic encoding the signing + verifying paths both
-/// use. Pinned via the [`IceActionProposal`] postcard form so
-/// every binding signs over the same bytes.
-pub fn ice_proposal_signing_payload(proposal: &IceActionProposal) -> Vec<u8> {
-    postcard::to_allocvec(proposal).expect("postcard encoding of IceActionProposal is infallible")
+/// Domain-separation tag the substrate verifier and the SDK
+/// signer both prepend to ICE-proposal signing payloads. Isolates
+/// the ICE signature domain from every other postcard-encoded
+/// surface in the codebase so a signature captured over an ICE
+/// proposal can't be replayed against a different surface whose
+/// postcard encoding happens to coincide.
+pub const ICE_SIGNING_DOMAIN: &[u8] = b"net.meshos.ice.v1\0";
+
+/// Domain-separation tag for single-signature ordinary-admin
+/// signing payloads. Distinct from [`ICE_SIGNING_DOMAIN`] so a
+/// signature collected for an ICE bundle can't be reused as an
+/// ordinary admin commit and vice versa, even when the inner
+/// `AdminEvent` payloads happen to encode identically.
+pub const ADMIN_SIGNING_DOMAIN: &[u8] = b"net.meshos.admin.v1\0";
+
+/// Maximum acceptable age (issuer-stamped → verifier-observed)
+/// of a signed commit envelope. Bundles older than this window
+/// are rejected with [`VerifyError::EnvelopeExpired`] regardless
+/// of cryptographic validity — closes the replay window the raw
+/// signature otherwise leaves open until operator-key rotation.
+pub const DEFAULT_SIGNING_FRESHNESS_WINDOW: Duration = Duration::from_secs(300);
+
+/// Tolerance for a verifier whose wall-clock lags the issuer's.
+/// Bundles stamped more than this far in the future relative to
+/// the verifier's clock fail with [`VerifyError::EnvelopeFromFuture`].
+/// Defends against accidentally-issued-tomorrow bundles while
+/// staying loose enough to absorb normal NTP drift.
+pub const DEFAULT_SIGNING_FUTURE_SKEW: Duration = Duration::from_secs(30);
+
+/// Helper — current wall-clock milliseconds since `UNIX_EPOCH`.
+/// Used as the issuer-side `issued_at_ms` stamp by the SDK and
+/// as the verifier-side `now_ms` reference on the loop. Returns
+/// `0` if the system clock predates `UNIX_EPOCH`, which is a
+/// pathological case but matches the same fallback the audit
+/// ring uses for `committed_at_ms`.
+pub fn now_ms_since_unix_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
-/// Deterministic encoding for single-signature admin commits.
-/// Sign over the postcard encoding of the
-/// [`super::event::AdminEvent`] wire form so the substrate
-/// verifier and the SDK signer agree on the byte sequence
-/// exactly. Same shape as
-/// [`ice_proposal_signing_payload`] but for ordinary admin
-/// commits, which carry one signature rather than a multi-op
-/// bundle.
-pub fn admin_event_signing_payload(event: &AdminEvent) -> Vec<u8> {
-    postcard::to_allocvec(event).expect("postcard encoding of AdminEvent is infallible")
+/// Deterministic signing payload for an ICE proposal envelope.
+/// Layout: `ICE_SIGNING_DOMAIN || issued_at_ms (little-endian
+/// u64) || postcard(proposal)`. The domain tag isolates the
+/// signature domain; `issued_at_ms` binds the signature to a
+/// freshness window the verifier enforces.
+///
+/// Every binding (Rust today; Python / Node / Go / C in
+/// follow-up slices) reproduces this exact byte sequence — the
+/// substrate verifier rebuilds it locally on every
+/// [`super::event::MeshOsEvent::SignedIceCommit`].
+pub fn ice_proposal_signing_payload(
+    proposal: &IceActionProposal,
+    issued_at_ms: u64,
+) -> Vec<u8> {
+    let inner = postcard::to_allocvec(proposal)
+        .expect("postcard encoding of IceActionProposal is infallible");
+    let mut buf = Vec::with_capacity(ICE_SIGNING_DOMAIN.len() + 8 + inner.len());
+    buf.extend_from_slice(ICE_SIGNING_DOMAIN);
+    buf.extend_from_slice(&issued_at_ms.to_le_bytes());
+    buf.extend_from_slice(&inner);
+    buf
+}
+
+/// Deterministic signing payload for an ordinary-admin
+/// signed-commit envelope. Same shape as
+/// [`ice_proposal_signing_payload`] but with
+/// [`ADMIN_SIGNING_DOMAIN`] and the postcard encoding of the
+/// inner [`AdminEvent`]. The distinct domain tag is what stops
+/// an ICE signature from cross-validating as an admin commit.
+pub fn admin_event_signing_payload(event: &AdminEvent, issued_at_ms: u64) -> Vec<u8> {
+    let inner = postcard::to_allocvec(event)
+        .expect("postcard encoding of AdminEvent is infallible");
+    let mut buf = Vec::with_capacity(ADMIN_SIGNING_DOMAIN.len() + 8 + inner.len());
+    buf.extend_from_slice(ADMIN_SIGNING_DOMAIN);
+    buf.extend_from_slice(&issued_at_ms.to_le_bytes());
+    buf.extend_from_slice(&inner);
+    buf
 }
 
 impl OperatorSignature {
-    /// Sign `proposal` with `keypair`'s ed25519 secret. The
+    /// Sign `proposal` with `keypair`'s ed25519 secret, stamped
+    /// at `issued_at_ms` (milliseconds since `UNIX_EPOCH`). The
     /// 64-byte signature covers
-    /// [`ice_proposal_signing_payload`], so two operators
-    /// signing the same proposal produce bit-identical inputs
-    /// the verifier can re-check.
+    /// [`ice_proposal_signing_payload(proposal, issued_at_ms)`],
+    /// so every collaborating operator signing the same
+    /// `(proposal, issued_at_ms)` pair produces bit-identical
+    /// inputs the substrate verifier can re-check.
+    ///
+    /// The `issued_at_ms` binding gives the substrate a
+    /// freshness gate — see
+    /// [`DEFAULT_SIGNING_FRESHNESS_WINDOW`]. Coordinators
+    /// collecting signatures from multiple operators MUST share
+    /// the same `issued_at_ms` across the bundle, otherwise the
+    /// per-operator payloads diverge and the bundle fails
+    /// verification.
     ///
     /// Panics on a public-only keypair — callers that may hold
     /// one should guard with `EntityKeypair::is_read_only`.
-    pub fn sign(keypair: &EntityKeypair, proposal: &IceActionProposal) -> Self {
-        let payload = ice_proposal_signing_payload(proposal);
+    pub fn sign(keypair: &EntityKeypair, proposal: &IceActionProposal, issued_at_ms: u64) -> Self {
+        let payload = ice_proposal_signing_payload(proposal, issued_at_ms);
+        let sig = keypair.sign(&payload);
+        Self {
+            operator_id: keypair.origin_hash(),
+            signature: sig.to_bytes().to_vec(),
+        }
+    }
+
+    /// Sign an ordinary-admin `event` with `keypair`'s ed25519
+    /// secret stamped at `issued_at_ms`. Covers
+    /// [`admin_event_signing_payload(event, issued_at_ms)`] —
+    /// the admin-side counterpart of [`Self::sign`]. The
+    /// distinct [`ADMIN_SIGNING_DOMAIN`] tag is what stops an
+    /// ICE-signed bundle from cross-validating as an admin
+    /// commit.
+    pub fn sign_admin(keypair: &EntityKeypair, event: &AdminEvent, issued_at_ms: u64) -> Self {
+        let payload = admin_event_signing_payload(event, issued_at_ms);
         let sig = keypair.sign(&payload);
         Self {
             operator_id: keypair.origin_hash(),
@@ -330,6 +418,37 @@ pub enum VerifyError {
         /// Minimum required by the cluster's policy.
         required: usize,
     },
+    /// The signed envelope was stamped earlier than
+    /// `max_age_ms` before the verifier's reference clock. Closes
+    /// the replay window the raw signature alone leaves open:
+    /// captured bundles fail this check once the freshness
+    /// window has rolled past.
+    #[error(
+        "signed envelope expired — issued {issued_at_ms} ms, verified at {now_ms} ms, max age {max_age_ms} ms"
+    )]
+    EnvelopeExpired {
+        /// Issuer-stamped milliseconds since `UNIX_EPOCH`.
+        issued_at_ms: u64,
+        /// Verifier-observed milliseconds since `UNIX_EPOCH`.
+        now_ms: u64,
+        /// Configured freshness window in milliseconds.
+        max_age_ms: u64,
+    },
+    /// The signed envelope was stamped further than
+    /// `future_skew_ms` ahead of the verifier's reference clock.
+    /// Defends against accidentally-issued-tomorrow bundles
+    /// while tolerating normal NTP drift up to the skew window.
+    #[error(
+        "signed envelope is from the future — issued {issued_at_ms} ms, verified at {now_ms} ms, future-skew tolerance {future_skew_ms} ms"
+    )]
+    EnvelopeFromFuture {
+        /// Issuer-stamped milliseconds since `UNIX_EPOCH`.
+        issued_at_ms: u64,
+        /// Verifier-observed milliseconds since `UNIX_EPOCH`.
+        now_ms: u64,
+        /// Configured future-skew tolerance in milliseconds.
+        future_skew_ms: u64,
+    },
 }
 
 impl VerifyError {
@@ -340,6 +459,8 @@ impl VerifyError {
             VerifyError::NotAuthorized { .. } => "not_authorized",
             VerifyError::InvalidSignature { .. } => "signature_invalid",
             VerifyError::InsufficientSignatures { .. } => "insufficient_signatures",
+            VerifyError::EnvelopeExpired { .. } => "envelope_expired",
+            VerifyError::EnvelopeFromFuture { .. } => "envelope_from_future",
         }
     }
 }
@@ -419,7 +540,8 @@ pub struct AdminAuditRecord {
 }
 
 /// Substrate-side ICE admin verifier — bundles a shared
-/// [`OperatorRegistry`] with the cluster's signature threshold.
+/// [`OperatorRegistry`] with the cluster's signature threshold
+/// and the freshness window used to reject stale envelopes.
 /// Installed on [`super::event_loop::MeshOsLoop`] via
 /// `with_admin_verifier`; the loop runs every
 /// [`super::event::MeshOsEvent::SignedIceCommit`] through
@@ -429,16 +551,43 @@ pub struct AdminAuditRecord {
 pub struct AdminVerifier {
     registry: std::sync::Arc<OperatorRegistry>,
     threshold: usize,
+    freshness_window: Duration,
+    future_skew: Duration,
 }
 
 impl AdminVerifier {
-    /// Build a verifier with `threshold` minimum signatures.
+    /// Build a verifier with `threshold` minimum signatures and
+    /// the default freshness window
+    /// ([`DEFAULT_SIGNING_FRESHNESS_WINDOW`]) /
+    /// future-skew tolerance ([`DEFAULT_SIGNING_FUTURE_SKEW`]).
     /// `threshold = 0` is clamped to `1` — no admin path should
     /// ever accept an empty signature bundle.
     pub fn new(registry: std::sync::Arc<OperatorRegistry>, threshold: usize) -> Self {
+        Self::with_freshness(
+            registry,
+            threshold,
+            DEFAULT_SIGNING_FRESHNESS_WINDOW,
+            DEFAULT_SIGNING_FUTURE_SKEW,
+        )
+    }
+
+    /// Build a verifier with explicit freshness + future-skew
+    /// windows. The defaults from [`Self::new`] match
+    /// [`DEFAULT_SIGNING_FRESHNESS_WINDOW`] /
+    /// [`DEFAULT_SIGNING_FUTURE_SKEW`]; clusters with longer
+    /// multi-operator signature-collection workflows (or
+    /// known-large clock skew) can widen via this constructor.
+    pub fn with_freshness(
+        registry: std::sync::Arc<OperatorRegistry>,
+        threshold: usize,
+        freshness_window: Duration,
+        future_skew: Duration,
+    ) -> Self {
         Self {
             registry,
             threshold: threshold.max(1),
+            freshness_window,
+            future_skew,
         }
     }
 
@@ -452,33 +601,80 @@ impl AdminVerifier {
         self.threshold
     }
 
+    /// Configured freshness window. Envelopes stamped earlier
+    /// than `now_ms - freshness_window` fail with
+    /// [`VerifyError::EnvelopeExpired`].
+    pub fn freshness_window(&self) -> Duration {
+        self.freshness_window
+    }
+
+    /// Configured future-skew tolerance.
+    pub fn future_skew(&self) -> Duration {
+        self.future_skew
+    }
+
     /// Verify a `SignedIceCommit`-style bundle against
-    /// `proposal`. Computes the signing payload internally so
-    /// the loop never needs to recompute it on the hot path.
+    /// `proposal` stamped at `issued_at_ms`. Checks freshness
+    /// relative to `now_ms`, then verifies every signature in
+    /// the bundle against the domain-tagged signing payload, and
+    /// finally checks the distinct-operator count against the
+    /// configured threshold. Computes the signing payload
+    /// internally so the loop never needs to recompute it on the
+    /// hot path.
     pub fn verify_commit(
         &self,
         proposal: &IceActionProposal,
         signatures: &[OperatorSignature],
+        issued_at_ms: u64,
+        now_ms: u64,
     ) -> Result<(), VerifyError> {
-        let payload = ice_proposal_signing_payload(proposal);
+        self.check_freshness(issued_at_ms, now_ms)?;
+        let payload = ice_proposal_signing_payload(proposal, issued_at_ms);
         self.registry
             .verify_bundle(signatures, &payload, self.threshold)
     }
 
     /// Verify a single-signature ordinary-admin commit against
-    /// `event`. Single-operator path — `signature.operator_id`
-    /// must be registered, and the signature must cover
-    /// [`admin_event_signing_payload`] for `event`. The ICE
-    /// `threshold` doesn't apply here because ordinary admin
+    /// `event` stamped at `issued_at_ms`. Single-operator path —
+    /// `signature.operator_id` must be registered, and the
+    /// signature must cover
+    /// [`admin_event_signing_payload(event, issued_at_ms)`]. The
+    /// ICE `threshold` doesn't apply here because ordinary admin
     /// commits are single-operator by design; only the ICE
     /// surface uses the M-of-N threshold.
     pub fn verify_admin_commit(
         &self,
         event: &AdminEvent,
         signature: &OperatorSignature,
+        issued_at_ms: u64,
+        now_ms: u64,
     ) -> Result<(), VerifyError> {
-        let payload = admin_event_signing_payload(event);
+        self.check_freshness(issued_at_ms, now_ms)?;
+        let payload = admin_event_signing_payload(event, issued_at_ms);
         self.registry.verify(signature, &payload)
+    }
+
+    fn check_freshness(&self, issued_at_ms: u64, now_ms: u64) -> Result<(), VerifyError> {
+        if issued_at_ms > now_ms {
+            let drift_ms = issued_at_ms - now_ms;
+            if drift_ms > self.future_skew.as_millis() as u64 {
+                return Err(VerifyError::EnvelopeFromFuture {
+                    issued_at_ms,
+                    now_ms,
+                    future_skew_ms: self.future_skew.as_millis() as u64,
+                });
+            }
+            return Ok(());
+        }
+        let age_ms = now_ms - issued_at_ms;
+        if age_ms > self.freshness_window.as_millis() as u64 {
+            return Err(VerifyError::EnvelopeExpired {
+                issued_at_ms,
+                now_ms,
+                max_age_ms: self.freshness_window.as_millis() as u64,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -994,8 +1190,9 @@ mod tests {
         let proposal = IceActionProposal::FreezeCluster {
             ttl: Duration::from_secs(30),
         };
-        let sig = OperatorSignature::sign(&kp, &proposal);
-        let payload = ice_proposal_signing_payload(&proposal);
+        let issued_at_ms = now_ms_since_unix_epoch();
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
+        let payload = ice_proposal_signing_payload(&proposal, issued_at_ms);
         registry.verify(&sig, &payload).expect("valid signature");
     }
 
@@ -1004,8 +1201,9 @@ mod tests {
         let kp = EntityKeypair::generate();
         let registry = OperatorRegistry::new(); // empty
         let proposal = IceActionProposal::ThawCluster;
-        let sig = OperatorSignature::sign(&kp, &proposal);
-        let payload = ice_proposal_signing_payload(&proposal);
+        let issued_at_ms = now_ms_since_unix_epoch();
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
+        let payload = ice_proposal_signing_payload(&proposal, issued_at_ms);
         let err = registry.verify(&sig, &payload).unwrap_err();
         assert!(matches!(err, VerifyError::NotAuthorized { .. }));
         assert_eq!(err.kind(), "not_authorized");
@@ -1025,8 +1223,11 @@ mod tests {
         registry.register(&kp);
         let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 2);
         let proposal = IceActionProposal::ThawCluster;
-        let sig = OperatorSignature::sign(&kp, &proposal);
-        let err = verifier.verify_commit(&proposal, &[sig]).unwrap_err();
+        let issued_at_ms = now_ms_since_unix_epoch();
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
+        let err = verifier
+            .verify_commit(&proposal, &[sig], issued_at_ms, issued_at_ms)
+            .unwrap_err();
         assert!(matches!(
             err,
             VerifyError::InsufficientSignatures {
@@ -1048,9 +1249,12 @@ mod tests {
         registry.register(&kp);
         let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 2);
         let proposal = IceActionProposal::ThawCluster;
-        let sig = OperatorSignature::sign(&kp, &proposal);
+        let issued_at_ms = now_ms_since_unix_epoch();
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
         let bundle = [sig.clone(), sig];
-        let err = verifier.verify_commit(&proposal, &bundle).unwrap_err();
+        let err = verifier
+            .verify_commit(&proposal, &bundle, issued_at_ms, issued_at_ms)
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1074,13 +1278,14 @@ mod tests {
         registry.register(&kp_b);
         let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 2);
         let proposal = IceActionProposal::ThawCluster;
+        let issued_at_ms = now_ms_since_unix_epoch();
         let bundle = [
-            OperatorSignature::sign(&kp_a, &proposal),
-            OperatorSignature::sign(&kp_b, &proposal),
+            OperatorSignature::sign(&kp_a, &proposal, issued_at_ms),
+            OperatorSignature::sign(&kp_b, &proposal, issued_at_ms),
         ];
-        verifier.verify_commit(&proposal, &bundle).expect(
-            "two distinct operators with valid signatures should satisfy threshold = 2",
-        );
+        verifier
+            .verify_commit(&proposal, &bundle, issued_at_ms, issued_at_ms)
+            .expect("two distinct operators with valid signatures should satisfy threshold = 2");
     }
 
     #[test]
@@ -1545,17 +1750,47 @@ mod tests {
     }
 
     #[test]
-    fn admin_event_signing_payload_round_trips_through_postcard() {
-        // The signing payload must decode back to the same
-        // AdminEvent — the substrate verifier hashes / verifies
-        // over this exact byte sequence.
+    fn admin_event_signing_payload_carries_domain_tag_and_issued_at_prefix() {
+        // The payload starts with the ADMIN_SIGNING_DOMAIN tag
+        // then the little-endian issued_at_ms stamp, then the
+        // postcard-encoded inner event. The substrate verifier
+        // rebuilds the same byte sequence and rejects anything
+        // mismatched — this test pins the layout.
         let event = AdminEvent::EnterMaintenance {
             node: 42,
             drain_for: Some(Duration::from_secs(120)),
         };
-        let payload = admin_event_signing_payload(&event);
-        let decoded: AdminEvent = postcard::from_bytes(&payload).expect("decode");
+        let issued_at_ms: u64 = 0x0123_4567_89AB_CDEF;
+        let payload = admin_event_signing_payload(&event, issued_at_ms);
+        assert!(
+            payload.starts_with(ADMIN_SIGNING_DOMAIN),
+            "payload must begin with ADMIN_SIGNING_DOMAIN, got {:?}",
+            &payload[..ADMIN_SIGNING_DOMAIN.len().min(payload.len())]
+        );
+        let inner_start = ADMIN_SIGNING_DOMAIN.len() + 8;
+        assert_eq!(
+            &payload[ADMIN_SIGNING_DOMAIN.len()..inner_start],
+            &issued_at_ms.to_le_bytes(),
+        );
+        let decoded: AdminEvent =
+            postcard::from_bytes(&payload[inner_start..]).expect("decode inner event");
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn ice_and_admin_signing_payloads_use_distinct_domains() {
+        // Cross-domain replay defense: signatures collected over
+        // an ICE proposal must not cross-verify as an admin
+        // commit. The domain tags are the only thing keeping the
+        // two byte sequences from colliding for variants whose
+        // postcard encoding happens to overlap.
+        assert_ne!(ICE_SIGNING_DOMAIN, ADMIN_SIGNING_DOMAIN);
+        let event = AdminEvent::ThawCluster;
+        let proposal = IceActionProposal::ThawCluster;
+        let ts = 1u64;
+        let admin_payload = admin_event_signing_payload(&event, ts);
+        let ice_payload = ice_proposal_signing_payload(&proposal, ts);
+        assert_ne!(admin_payload, ice_payload);
     }
 
     #[test]
@@ -1566,14 +1801,10 @@ mod tests {
         let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 1);
 
         let event = AdminEvent::Cordon { node: 42 };
-        let payload = admin_event_signing_payload(&event);
-        let sig_bytes = kp.sign(&payload);
-        let signature = OperatorSignature {
-            operator_id: kp.origin_hash(),
-            signature: sig_bytes.to_bytes().to_vec(),
-        };
+        let issued_at_ms = now_ms_since_unix_epoch();
+        let signature = OperatorSignature::sign_admin(&kp, &event, issued_at_ms);
         verifier
-            .verify_admin_commit(&event, &signature)
+            .verify_admin_commit(&event, &signature, issued_at_ms, issued_at_ms)
             .expect("valid single-sig commit");
     }
 
@@ -1585,15 +1816,11 @@ mod tests {
         let verifier = AdminVerifier::new(std::sync::Arc::new(registry), 1);
 
         let event = AdminEvent::Cordon { node: 42 };
-        let payload = admin_event_signing_payload(&event);
-        let sig_bytes = kp.sign(&payload);
-        let mut signature = OperatorSignature {
-            operator_id: kp.origin_hash(),
-            signature: sig_bytes.to_bytes().to_vec(),
-        };
+        let issued_at_ms = now_ms_since_unix_epoch();
+        let mut signature = OperatorSignature::sign_admin(&kp, &event, issued_at_ms);
         signature.signature[0] ^= 0x01;
         let err = verifier
-            .verify_admin_commit(&event, &signature)
+            .verify_admin_commit(&event, &signature, issued_at_ms, issued_at_ms)
             .unwrap_err();
         assert_eq!(err.kind(), "signature_invalid");
     }
@@ -1605,16 +1832,99 @@ mod tests {
         let verifier = AdminVerifier::new(std::sync::Arc::new(OperatorRegistry::new()), 1);
 
         let event = AdminEvent::Cordon { node: 42 };
-        let payload = admin_event_signing_payload(&event);
-        let sig_bytes = kp.sign(&payload);
-        let signature = OperatorSignature {
-            operator_id: kp.origin_hash(),
-            signature: sig_bytes.to_bytes().to_vec(),
-        };
+        let issued_at_ms = now_ms_since_unix_epoch();
+        let signature = OperatorSignature::sign_admin(&kp, &event, issued_at_ms);
         let err = verifier
-            .verify_admin_commit(&event, &signature)
+            .verify_admin_commit(&event, &signature, issued_at_ms, issued_at_ms)
             .unwrap_err();
         assert_eq!(err.kind(), "not_authorized");
+    }
+
+    #[test]
+    fn admin_verifier_rejects_expired_ice_envelope() {
+        // Envelopes stamped further in the past than the
+        // freshness window fail with EnvelopeExpired regardless
+        // of cryptographic validity — closes the replay window
+        // the raw signature alone leaves open.
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let verifier = AdminVerifier::with_freshness(
+            std::sync::Arc::new(registry),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        );
+        let proposal = IceActionProposal::ThawCluster;
+        let issued_at_ms = 1_000_000u64;
+        let now_ms = issued_at_ms + 120_000; // 120s old; window is 60s
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
+        let err = verifier
+            .verify_commit(&proposal, &[sig], issued_at_ms, now_ms)
+            .unwrap_err();
+        assert_eq!(err.kind(), "envelope_expired");
+    }
+
+    #[test]
+    fn admin_verifier_rejects_envelope_stamped_too_far_in_future() {
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let verifier = AdminVerifier::with_freshness(
+            std::sync::Arc::new(registry),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        );
+        let proposal = IceActionProposal::ThawCluster;
+        let now_ms = 1_000_000u64;
+        let issued_at_ms = now_ms + 60_000; // 60s ahead of verifier clock; skew tolerance is 5s
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
+        let err = verifier
+            .verify_commit(&proposal, &[sig], issued_at_ms, now_ms)
+            .unwrap_err();
+        assert_eq!(err.kind(), "envelope_from_future");
+    }
+
+    #[test]
+    fn admin_verifier_accepts_envelope_inside_freshness_window() {
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let verifier = AdminVerifier::with_freshness(
+            std::sync::Arc::new(registry),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        );
+        let proposal = IceActionProposal::ThawCluster;
+        let issued_at_ms = 1_000_000u64;
+        let now_ms = issued_at_ms + 30_000; // 30s old; well within 60s window
+        let sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
+        verifier
+            .verify_commit(&proposal, &[sig], issued_at_ms, now_ms)
+            .expect("envelope inside freshness window should verify");
+    }
+
+    #[test]
+    fn cross_domain_replay_fails_verification() {
+        // A signature collected over an ICE proposal must not
+        // cross-validate as an admin commit even when the inner
+        // postcard encodings overlap. The domain tags are the
+        // only thing keeping the two surfaces from sharing a
+        // signature.
+        let kp = EntityKeypair::generate();
+        let mut registry = OperatorRegistry::new();
+        registry.register(&kp);
+        let issued_at_ms = now_ms_since_unix_epoch();
+        let proposal = IceActionProposal::ThawCluster;
+        let ice_sig = OperatorSignature::sign(&kp, &proposal, issued_at_ms);
+        // Attempt to verify the ICE signature as if it were an
+        // admin commit over the same logical action.
+        let event = AdminEvent::ThawCluster;
+        let admin_payload = admin_event_signing_payload(&event, issued_at_ms);
+        let err = registry.verify(&ice_sig, &admin_payload).unwrap_err();
+        assert_eq!(err.kind(), "signature_invalid");
     }
 
     #[test]

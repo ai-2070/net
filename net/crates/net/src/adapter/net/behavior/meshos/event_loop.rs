@@ -694,16 +694,20 @@ impl MeshOsLoop {
         if let MeshOsEvent::SignedIceCommit {
             proposal,
             signatures,
+            issued_at_ms,
         } = event
         {
             let outcome = match self.admin_verifier.as_ref() {
-                Some(verifier) => match verifier.verify_commit(proposal, signatures) {
-                    Ok(()) => super::ice::VerificationOutcome::Accepted,
-                    Err(err) => super::ice::VerificationOutcome::Rejected {
-                        kind: err.kind().to_string(),
-                        message: err.to_string(),
-                    },
-                },
+                Some(verifier) => {
+                    let now_ms = super::ice::now_ms_since_unix_epoch();
+                    match verifier.verify_commit(proposal, signatures, *issued_at_ms, now_ms) {
+                        Ok(()) => super::ice::VerificationOutcome::Accepted,
+                        Err(err) => super::ice::VerificationOutcome::Rejected {
+                            kind: err.kind().to_string(),
+                            message: err.to_string(),
+                        },
+                    }
+                }
                 None => super::ice::VerificationOutcome::Unverified,
             };
             let admin_event = proposal.to_admin_event();
@@ -736,16 +740,25 @@ impl MeshOsLoop {
         if let MeshOsEvent::SignedAdminCommit {
             event: admin_event,
             signature,
+            issued_at_ms,
         } = event
         {
             let outcome = match self.admin_verifier.as_ref() {
-                Some(verifier) => match verifier.verify_admin_commit(admin_event, signature) {
-                    Ok(()) => super::ice::VerificationOutcome::Accepted,
-                    Err(err) => super::ice::VerificationOutcome::Rejected {
-                        kind: err.kind().to_string(),
-                        message: err.to_string(),
-                    },
-                },
+                Some(verifier) => {
+                    let now_ms = super::ice::now_ms_since_unix_epoch();
+                    match verifier.verify_admin_commit(
+                        admin_event,
+                        signature,
+                        *issued_at_ms,
+                        now_ms,
+                    ) {
+                        Ok(()) => super::ice::VerificationOutcome::Accepted,
+                        Err(err) => super::ice::VerificationOutcome::Rejected {
+                            kind: err.kind().to_string(),
+                            message: err.to_string(),
+                        },
+                    }
+                }
                 None => super::ice::VerificationOutcome::Unverified,
             };
             self.record_admin_audit(
