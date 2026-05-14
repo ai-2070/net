@@ -82,7 +82,8 @@ pub use control::{ControlSink, MeshOsControl};
 pub use event::{
     AdminEvent, AvoidScope, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent,
     DaemonIntentUpdate, DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent,
-    LocalReplicaIntentUpdate, MeshOsEvent, NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
+    LocalReplicaIntentUpdate, MeshOsEvent, MigrationId, NodeHealth, NodeId, PlacementIntent,
+    ReplicaUpdate,
 };
 pub use event_loop::{
     MeshOsHandle, MeshOsHandleError, MeshOsLoop, MeshOsLoopParts, MeshOsSnapshotReader,

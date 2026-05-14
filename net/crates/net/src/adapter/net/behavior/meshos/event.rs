@@ -301,6 +301,14 @@ pub enum ReplicaUpdate {
 /// re-exported as a typed alias for the action / event surface.
 pub type ChainId = u64;
 
+/// Stable identifier for a daemon-state-migration the
+/// compute layer's `MigrationOrchestrator` runs. Wire form is
+/// a `u64` so the SDK and substrate agree without exposing
+/// the orchestrator's internal id space. The dispatcher
+/// integration that maps this id to a running migration is
+/// future substrate work.
+pub type MigrationId = u64;
+
 /// Admin chain event. Phase D defines the full enum + the
 /// chain-driven signing contract; Phase A carries the smallest
 /// surface that lets the loop accept events through.
@@ -436,6 +444,19 @@ pub enum AdminEvent {
         /// Node operator wants as a holder.
         target: NodeId,
     },
+    /// ICE break-glass: abort an in-flight migration. Records
+    /// the operator's intent on the audit ring and surfaces it
+    /// to whatever dispatcher integrates with the compute
+    /// layer's `MigrationOrchestrator`. The wire-form
+    /// substrate plumbing lands here; the dispatcher hookup
+    /// that finds the in-flight migration and tells it to
+    /// stop is future substrate work — until that lands the
+    /// commit is observable via the audit ring but doesn't
+    /// itself stop the migration.
+    KillMigration {
+        /// The migration to abort.
+        migration: MigrationId,
+    },
 }
 
 /// Scope discriminator for [`AdminEvent::FlushAvoidLists`].
@@ -554,6 +575,7 @@ impl AdminEvent {
                 | AdminEvent::ForceEvictReplica { .. }
                 | AdminEvent::ForceRestartDaemon { .. }
                 | AdminEvent::ForceCutover { .. }
+                | AdminEvent::KillMigration { .. }
         )
     }
 }
@@ -619,6 +641,7 @@ mod tests {
                 chain: 100,
                 target: 42,
             },
+            AdminEvent::KillMigration { migration: 999 },
         ];
         for ev in cases {
             let bytes = postcard::to_allocvec(&ev).expect("encode");

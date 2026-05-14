@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::event::{AdminEvent, AvoidScope, ChainId, DaemonRef, NodeId};
+use super::event::{AdminEvent, AvoidScope, ChainId, DaemonRef, MigrationId, NodeId};
 use super::snapshot::MeshOsSnapshot;
 use crate::adapter::net::identity::{EntityId, EntityKeypair};
 
@@ -94,6 +94,12 @@ pub enum IceActionProposal {
         /// Operator-preferred holder.
         target: NodeId,
     },
+    /// Abort an in-flight migration. Maps to
+    /// [`super::event::AdminEvent::KillMigration`].
+    KillMigration {
+        /// The migration to abort.
+        migration: MigrationId,
+    },
 }
 
 impl IceActionProposal {
@@ -119,6 +125,9 @@ impl IceActionProposal {
             IceActionProposal::ForceCutover { chain, target } => AdminEvent::ForceCutover {
                 chain: *chain,
                 target: *target,
+            },
+            IceActionProposal::KillMigration { migration } => AdminEvent::KillMigration {
+                migration: *migration,
             },
         }
     }
@@ -606,6 +615,16 @@ pub enum BlastWarning {
         /// Target that's already a holder.
         target: NodeId,
     },
+    /// `KillMigration` records the operator's intent on the
+    /// audit ring but the dispatcher hookup that actually
+    /// stops the migration is future substrate work. Surfaces
+    /// here so the operator UI flags "the commit will land,
+    /// but the migration may still complete until the
+    /// dispatcher integration ships."
+    KillMigrationDispatcherIntegrationPending {
+        /// The migration id the operator targeted.
+        migration: MigrationId,
+    },
 }
 
 /// Pure simulator: snapshot + proposal → blast radius. No I/O;
@@ -628,6 +647,7 @@ pub fn simulate(snapshot: &MeshOsSnapshot, proposal: &IceActionProposal) -> Blas
         IceActionProposal::ForceCutover { chain, target } => {
             simulate_force_cutover(snapshot, *chain, *target)
         }
+        IceActionProposal::KillMigration { migration } => simulate_kill_migration(*migration),
     }
 }
 
@@ -770,6 +790,21 @@ fn simulate_force_cutover(
         // zero signal so the operator UI flags the change.
         placement_stability_delta: 0.15,
         warnings,
+    }
+}
+
+fn simulate_kill_migration(migration: MigrationId) -> BlastRadius {
+    // The snapshot doesn't yet expose in-flight migrations,
+    // so the simulator can't enumerate affected daemons /
+    // chains. It surfaces the dispatcher-integration pending
+    // warning so the operator UI flags the limitation.
+    BlastRadius {
+        affected_nodes: Vec::new(),
+        affected_replicas: Vec::new(),
+        affected_daemons: Vec::new(),
+        estimated_drain_delay: None,
+        placement_stability_delta: 0.0,
+        warnings: vec![BlastWarning::KillMigrationDispatcherIntegrationPending { migration }],
     }
 }
 
@@ -1296,6 +1331,32 @@ mod tests {
                 target: 8
             }
         )));
+    }
+
+    #[test]
+    fn simulate_kill_migration_reports_pending_dispatcher_integration() {
+        let snap = MeshOsSnapshot::default();
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::KillMigration { migration: 7 },
+        );
+        // No registry to read from yet; affected sets are empty.
+        assert!(blast.affected_nodes.is_empty());
+        assert!(blast.affected_replicas.is_empty());
+        assert!(blast.affected_daemons.is_empty());
+        assert!(blast.warnings.iter().any(|w| matches!(
+            w,
+            BlastWarning::KillMigrationDispatcherIntegrationPending { migration: 7 }
+        )));
+    }
+
+    #[test]
+    fn ice_proposal_to_admin_event_maps_kill_migration() {
+        let proposal = IceActionProposal::KillMigration { migration: 42 };
+        match proposal.to_admin_event() {
+            AdminEvent::KillMigration { migration } => assert_eq!(migration, 42),
+            other => panic!("expected KillMigration, got {other:?}"),
+        }
     }
 
     #[test]

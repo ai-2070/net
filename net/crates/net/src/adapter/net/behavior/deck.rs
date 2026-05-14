@@ -906,6 +906,23 @@ impl<'a> IceCommands<'a> {
         )
     }
 
+    /// Propose aborting an in-flight migration. The wire-form
+    /// substrate plumbing records the commit on the audit
+    /// ring; the dispatcher hookup that finds the running
+    /// migration and stops it is future substrate work, so
+    /// until that lands the proposal commits without
+    /// actually halting the migration. The audit trail tracks
+    /// the operator's intent regardless.
+    pub fn kill_migration(
+        &self,
+        migration: super::meshos::MigrationId,
+    ) -> IceProposal<'a> {
+        IceProposal::new(
+            self.client,
+            IceActionProposal::KillMigration { migration },
+        )
+    }
+
     /// Propose cancelling an in-effect cluster freeze.
     pub fn thaw_cluster(&self) -> IceProposal<'a> {
         IceProposal::new(self.client, IceActionProposal::ThawCluster)
@@ -1007,6 +1024,7 @@ impl<'a> IceProposal<'a> {
                 IceActionProposal::ForceEvictReplica { .. } => "force_evict_replica",
                 IceActionProposal::ForceRestartDaemon { .. } => "force_restart_daemon",
                 IceActionProposal::ForceCutover { .. } => "force_cutover",
+                IceActionProposal::KillMigration { .. } => "kill_migration",
             };
             self.client
                 .publish_signed_ice(self.action, signatures.to_vec(), kind)
@@ -1045,6 +1063,14 @@ impl<'a> IceProposal<'a> {
                         .publish_admin(
                             AdminEvent::ForceCutover { chain, target },
                             "force_cutover",
+                        )
+                        .await
+                }
+                IceActionProposal::KillMigration { migration } => {
+                    self.client
+                        .publish_admin(
+                            AdminEvent::KillMigration { migration },
+                            "kill_migration",
                         )
                         .await
                 }
@@ -2845,6 +2871,28 @@ mod tests {
         let sig = deck.identity().sign_proposal(proposal.action());
         let commit = proposal.commit(&[sig]).await.expect("commit");
         assert_eq!(commit.event_kind(), "force_restart_daemon");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ice_kill_migration_proposal_round_trips_and_audits() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+        let proposal = deck.ice().kill_migration(123);
+        let _ = proposal.simulate().await.expect("simulate");
+        let sig = deck.identity().sign_proposal(proposal.action());
+        let commit = proposal.commit(&[sig]).await.expect("commit");
+        assert_eq!(commit.event_kind(), "kill_migration");
+
+        // Confirms the commit lands on the audit ring even
+        // though the dispatcher integration is pending.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let entries = deck.audit().force_only().collect();
+        assert!(entries.iter().any(|r| matches!(
+            r.event,
+            AdminEvent::KillMigration { migration: 123 }
+        )));
         let _ = runtime.shutdown().await;
     }
 
