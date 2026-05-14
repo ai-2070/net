@@ -1073,6 +1073,7 @@ pub struct AuditQuery<'a> {
     operator_filter: Option<u64>,
     time_range: Option<(u64, u64)>,
     force_only: bool,
+    since_seq: Option<u64>,
 }
 
 impl<'a> AuditQuery<'a> {
@@ -1083,6 +1084,7 @@ impl<'a> AuditQuery<'a> {
             operator_filter: None,
             time_range: None,
             force_only: false,
+            since_seq: None,
         }
     }
 
@@ -1119,6 +1121,17 @@ impl<'a> AuditQuery<'a> {
         self
     }
 
+    /// Restrict the result to records with `seq > since_seq`.
+    /// Pagination primitive: consumers persist the last-seen
+    /// `seq` and resume from there across restarts. For
+    /// [`Self::stream`] the value seeds the stream's
+    /// watermark — the stream tails from `since_seq + 1`
+    /// onward rather than from "first new record after now".
+    pub fn since(mut self, since_seq: u64) -> Self {
+        self.since_seq = Some(since_seq);
+        self
+    }
+
     /// Materialize matching entries. Reads the runtime's
     /// latest snapshot, applies the configured filters, and
     /// returns the matching entries newest-first. Cheap — one
@@ -1129,6 +1142,11 @@ impl<'a> AuditQuery<'a> {
             .admin_audit
             .into_iter()
             .filter(|r| {
+                if let Some(since) = self.since_seq {
+                    if r.seq <= since {
+                        return false;
+                    }
+                }
                 if let Some(op_id) = self.operator_filter {
                     if !r.operator_ids.contains(&op_id) {
                         return false;
@@ -1173,6 +1191,7 @@ impl<'a> AuditQuery<'a> {
                 time_range: self.time_range,
                 force_only: self.force_only,
             },
+            self.since_seq.unwrap_or(0),
         )
     }
 }
@@ -1231,13 +1250,14 @@ impl AuditStream {
         reader: super::meshos::MeshOsSnapshotReader,
         poll_interval: Duration,
         filter: AuditFilter,
+        initial_seq_watermark: u64,
     ) -> Self {
         let poll_interval = poll_interval.max(Duration::from_millis(1));
         Self {
             reader,
             interval: interval(poll_interval),
             filter,
-            last_seq: 0,
+            last_seq: initial_seq_watermark,
             queued: std::collections::VecDeque::new(),
         }
     }
@@ -1304,6 +1324,11 @@ pub struct LogFilter {
     /// Future-relevant when remote log lines arrive via the
     /// per-daemon RedEX-tail integration.
     pub node_id: Option<NodeId>,
+    /// Initial seq watermark — the stream tails from
+    /// `since_seq + 1` onward rather than from "first new
+    /// record after subscribe-time." Pagination primitive:
+    /// consumers persist the last-seen seq and resume.
+    pub since_seq: Option<u64>,
 }
 
 impl LogFilter {
@@ -1327,6 +1352,16 @@ impl LogFilter {
     /// Restrict to records originating from `node_id`.
     pub fn with_node(mut self, node_id: NodeId) -> Self {
         self.node_id = Some(node_id);
+        self
+    }
+
+    /// Seed the stream's watermark to `since_seq`. The first
+    /// record yielded has `seq > since_seq`. Pair with the
+    /// `seq` value the consumer persisted at shutdown to
+    /// resume without missing or duplicating records across
+    /// restarts.
+    pub fn since(mut self, since_seq: u64) -> Self {
+        self.since_seq = Some(since_seq);
         self
     }
 
@@ -1369,11 +1404,12 @@ impl LogStream {
         filter: LogFilter,
     ) -> Self {
         let poll_interval = poll_interval.max(Duration::from_millis(1));
+        let last_seq = filter.since_seq.unwrap_or(0);
         Self {
             reader,
             interval: interval(poll_interval),
             filter,
-            last_seq: 0,
+            last_seq,
             queued: std::collections::VecDeque::new(),
         }
     }
@@ -2046,6 +2082,104 @@ mod tests {
             .await
             .expect_err("predicate never holds, should time out");
         assert_eq!(err.kind, "watch_timeout");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_since_filter_drops_records_at_or_below_watermark() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        deck.admin().cordon(42).await.unwrap();
+        deck.admin().uncordon(42).await.unwrap();
+        deck.admin().invalidate_placement(42).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let all = deck.audit().collect();
+        assert_eq!(all.len(), 3);
+        // Pick the middle record's seq as the watermark; only
+        // the newest record (seq strictly greater) should
+        // surface.
+        let middle_seq = all[1].seq;
+        let after_middle = deck.audit().since(middle_seq).collect();
+        assert_eq!(after_middle.len(), 1, "since should keep only seq > middle");
+        assert!(after_middle[0].seq > middle_seq);
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_stream_since_seeds_initial_watermark() {
+        use futures::StreamExt;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(15),
+                ..DeckClientConfig::default()
+            });
+
+        // Land three commits before subscribing.
+        deck.admin().cordon(42).await.unwrap();
+        deck.admin().uncordon(42).await.unwrap();
+        deck.admin().invalidate_placement(42).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let all = deck.audit().collect();
+        assert_eq!(all.len(), 3);
+        // Resume from the middle entry's seq. Stream should
+        // yield only the newest entry (seq strictly above
+        // middle) then park.
+        let middle_seq = all[1].seq;
+        let mut stream = deck.audit().since(middle_seq).stream();
+        let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out")
+            .expect("closed")
+            .expect("ok");
+        assert!(next.seq > middle_seq);
+        // No more records — stream parks.
+        let parked = tokio::time::timeout(Duration::from_millis(40), stream.next()).await;
+        assert!(parked.is_err(), "stream should park after watermark catches up");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn log_filter_since_seeds_stream_watermark() {
+        use crate::adapter::net::behavior::meshos::{LogLine, MeshOsEvent};
+        use futures::StreamExt;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_config(DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(15),
+                ..DeckClientConfig::default()
+            });
+
+        // Publish three lines and snapshot the middle seq.
+        for i in 0..3 {
+            runtime
+                .handle()
+                .publish(MeshOsEvent::LogLine(LogLine::info(None, format!("msg {i}"))))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let snap = runtime.snapshot();
+        assert_eq!(snap.log_ring.len(), 3);
+        let middle_seq = snap.log_ring[1].seq;
+
+        // Subscribe with since() seeded to the middle seq.
+        // Stream should yield only the third line (seq > middle).
+        let mut stream = deck.subscribe_logs(LogFilter::new().since(middle_seq));
+        let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out")
+            .expect("closed")
+            .expect("ok");
+        assert!(next.seq > middle_seq);
+        assert_eq!(next.message, "msg 2");
         let _ = runtime.shutdown().await;
     }
 
