@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/behavior/meshos/mod.rs
+  s_6ba469f1921974::t_8fe33c6d59c4f1 115-117
+net/crates/net/src/adapter/net/behavior/meshos/ice.rs
+  s_6ba469f1921974::t_f1afe9eb3adbba 524-543
+  s_6ba469f1921974::t_50705768a92c06 784-788,795-797,799-804,817-818,821-893
+  s_6ba469f1921974::t_8dd9506853e024 2228-2384
+  s_6ba469f1921974::t_574465f52e33d4 557,562-610
+  s_6ba469f1921974::t_f70f9dd2e538e6 701-702,709-710,723-726,732-750,757-758
+  s_6ba469f1921974::t_510f6ea8bd4c66 181-188
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "2efb2fe12befc5a548ade8876113a5c7068886a6",
+  "prompts": {},
+  "sessions": {
+    "s_6ba469f1921974": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3f6b48b8-94c5-47fd-9837-8991a8b4646e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
