@@ -14,9 +14,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use super::event::{
-    AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent, DaemonIntentUpdate,
-    DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent, LocalReplicaIntentUpdate, MeshOsEvent,
-    NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
+    AdminEvent, AvoidScope, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent,
+    DaemonIntentUpdate, DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent,
+    LocalReplicaIntentUpdate, MeshOsEvent, NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
 };
 use super::maintenance::MaintenanceState;
 use super::supervision::BackoffTracker;
@@ -366,6 +366,26 @@ impl MeshOsState {
             }
             AdminEvent::ThawCluster => {
                 self.freeze_until = None;
+            }
+            AdminEvent::FlushAvoidLists { scope } => {
+                match scope {
+                    AvoidScope::Local { node } => {
+                        if *node == this_node {
+                            self.avoid_list.clear();
+                        }
+                    }
+                    AvoidScope::OnPeer { peer } => {
+                        // Every node un-avoids the target peer.
+                        self.avoid_list.remove(peer);
+                    }
+                    AvoidScope::Global => {
+                        // Every node flushes its entire avoid
+                        // list. Reconcile will re-emit
+                        // `MarkAvoid` next tick for peers that
+                        // still meet the degraded-RTT threshold.
+                        self.avoid_list.clear();
+                    }
+                }
             }
             _ => {}
         }
@@ -828,5 +848,89 @@ mod tests {
             THIS_NODE,
         );
         assert!(state.freeze_until.is_none());
+    }
+
+    fn seed_avoid_list(state: &mut MeshOsState, peers: &[NodeId]) {
+        for peer in peers {
+            state.avoid_list.insert(
+                *peer,
+                AvoidEntry {
+                    reason: "test".into(),
+                    until: Instant::now() + Duration::from_secs(60),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn flush_avoid_lists_local_clears_only_on_target_node() {
+        const THIS_NODE: NodeId = 42;
+        const OTHER_NODE: NodeId = 99;
+        let mut state = MeshOsState::default();
+        seed_avoid_list(&mut state, &[1, 2, 3]);
+
+        // Fold on a node that ISN'T the target — should be no-op.
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FlushAvoidLists {
+                scope: AvoidScope::Local { node: OTHER_NODE },
+            }),
+            THIS_NODE,
+        );
+        assert_eq!(state.avoid_list.len(), 3, "Local{{other}} should not flush this node");
+
+        // Fold on the actual target — clears the list.
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FlushAvoidLists {
+                scope: AvoidScope::Local { node: THIS_NODE },
+            }),
+            THIS_NODE,
+        );
+        assert!(state.avoid_list.is_empty());
+    }
+
+    #[test]
+    fn flush_avoid_lists_on_peer_removes_only_that_peer_from_every_node() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        seed_avoid_list(&mut state, &[1, 2, 3]);
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FlushAvoidLists {
+                scope: AvoidScope::OnPeer { peer: 2 },
+            }),
+            THIS_NODE,
+        );
+        // Only peer 2 should be removed.
+        assert!(state.avoid_list.contains_key(&1));
+        assert!(!state.avoid_list.contains_key(&2));
+        assert!(state.avoid_list.contains_key(&3));
+    }
+
+    #[test]
+    fn flush_avoid_lists_on_peer_is_idempotent_for_absent_peer() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        seed_avoid_list(&mut state, &[1, 2]);
+        // Flush a peer that isn't on the list — no-op, no panic.
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FlushAvoidLists {
+                scope: AvoidScope::OnPeer { peer: 99 },
+            }),
+            THIS_NODE,
+        );
+        assert_eq!(state.avoid_list.len(), 2);
+    }
+
+    #[test]
+    fn flush_avoid_lists_global_clears_every_entry_on_every_node() {
+        const THIS_NODE: NodeId = 42;
+        let mut state = MeshOsState::default();
+        seed_avoid_list(&mut state, &[1, 2, 3, 4, 5]);
+        state.apply(
+            &MeshOsEvent::AdminEvent(AdminEvent::FlushAvoidLists {
+                scope: AvoidScope::Global,
+            }),
+            THIS_NODE,
+        );
+        assert!(state.avoid_list.is_empty());
     }
 }

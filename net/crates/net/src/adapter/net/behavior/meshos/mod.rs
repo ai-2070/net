@@ -79,9 +79,9 @@ pub use chain::{
 pub use config::{BackpressureConfig, LocalityConfig, MaintenanceConfig, MeshOsConfig};
 pub use control::{ControlSink, MeshOsControl};
 pub use event::{
-    AdminEvent, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent, DaemonIntentUpdate,
-    DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent, LocalReplicaIntentUpdate, MeshOsEvent,
-    NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
+    AdminEvent, AvoidScope, BlobAnnouncement, ChainId, DaemonHealth, DaemonIntent,
+    DaemonIntentUpdate, DaemonLifecycleSignal, DaemonRef, LocalReplicaIntent,
+    LocalReplicaIntentUpdate, MeshOsEvent, NodeHealth, NodeId, PlacementIntent, ReplicaUpdate,
 };
 pub use event_loop::{
     MeshOsHandle, MeshOsHandleError, MeshOsLoop, MeshOsLoopParts, MeshOsSnapshotReader,

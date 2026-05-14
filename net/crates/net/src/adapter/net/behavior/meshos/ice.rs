@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::event::{AdminEvent, ChainId, DaemonRef, NodeId};
+use super::event::{AdminEvent, AvoidScope, ChainId, DaemonRef, NodeId};
 use super::snapshot::MeshOsSnapshot;
 use crate::adapter::net::identity::{EntityId, EntityKeypair};
 
@@ -63,6 +63,13 @@ pub enum IceActionProposal {
     /// Cancel an in-effect freeze. Maps to
     /// [`super::event::AdminEvent::ThawCluster`].
     ThawCluster,
+    /// Flush avoid-list entries cluster-wide under the given
+    /// [`AvoidScope`]. Maps to
+    /// [`super::event::AdminEvent::FlushAvoidLists`].
+    FlushAvoidLists {
+        /// Flush scope — see [`AvoidScope`].
+        scope: AvoidScope,
+    },
 }
 
 impl IceActionProposal {
@@ -73,6 +80,9 @@ impl IceActionProposal {
         match self {
             IceActionProposal::FreezeCluster { ttl } => AdminEvent::FreezeCluster { ttl: *ttl },
             IceActionProposal::ThawCluster => AdminEvent::ThawCluster,
+            IceActionProposal::FlushAvoidLists { scope } => {
+                AdminEvent::FlushAvoidLists { scope: *scope }
+            }
         }
     }
 }
@@ -358,6 +368,23 @@ pub enum BlastWarning {
     ThawResumesPendingReconciles,
     /// Thaw issued while no freeze is in effect — no-op.
     ThawHasNoFreezeToCancel,
+    /// `FlushAvoidLists::Global` is the heaviest scope —
+    /// reconcile will re-emit `MarkAvoid` for any peer that
+    /// still meets the degraded-RTT threshold on the next
+    /// tick, so the operator should not expect lasting effect
+    /// without addressing the underlying RTT cause first.
+    GlobalAvoidFlushMayReEmit,
+    /// `FlushAvoidLists::Local` targets the operator's own
+    /// node only; other nodes ignore the event. Surfaces so
+    /// the operator confirms the scope choice matches intent.
+    AvoidFlushLocalToTargetNodeOnly,
+    /// `FlushAvoidLists::OnPeer` un-avoids the targeted peer
+    /// cluster-wide. Carries the peer id so the operator UI
+    /// can render "every node will stop avoiding peer X."
+    AvoidFlushRecoversPeer {
+        /// The peer the flush is un-avoiding cluster-wide.
+        peer: NodeId,
+    },
 }
 
 /// Pure simulator: snapshot + proposal → blast radius. No I/O;
@@ -368,6 +395,7 @@ pub fn simulate(snapshot: &MeshOsSnapshot, proposal: &IceActionProposal) -> Blas
     match proposal {
         IceActionProposal::FreezeCluster { ttl } => simulate_freeze(snapshot, *ttl),
         IceActionProposal::ThawCluster => simulate_thaw(snapshot),
+        IceActionProposal::FlushAvoidLists { scope } => simulate_flush_avoid_lists(snapshot, *scope),
     }
 }
 
@@ -389,6 +417,45 @@ fn simulate_freeze(snapshot: &MeshOsSnapshot, ttl: Duration) -> BlastRadius {
         estimated_drain_delay: Some(ttl),
         placement_stability_delta: 0.0,
         warnings: vec![BlastWarning::ClusterFreezeBlocksOperatorActions],
+    }
+}
+
+fn simulate_flush_avoid_lists(snapshot: &MeshOsSnapshot, scope: AvoidScope) -> BlastRadius {
+    let mut affected_nodes: Vec<NodeId> = snapshot.peers.keys().copied().collect();
+    affected_nodes.sort();
+    match scope {
+        AvoidScope::Local { node } => BlastRadius {
+            // Only the targeted node folds the event; other
+            // nodes see the chain entry but skip the fold.
+            affected_nodes: vec![node],
+            affected_replicas: Vec::new(),
+            affected_daemons: Vec::new(),
+            estimated_drain_delay: None,
+            placement_stability_delta: 0.0,
+            warnings: vec![BlastWarning::AvoidFlushLocalToTargetNodeOnly],
+        },
+        AvoidScope::OnPeer { peer } => BlastRadius {
+            // Every peer in the cluster folds the event (each
+            // removes `peer` from its own avoid list).
+            affected_nodes,
+            affected_replicas: Vec::new(),
+            affected_daemons: Vec::new(),
+            estimated_drain_delay: None,
+            // Un-avoiding a peer changes which nodes reconcile
+            // will consider for placement. Surface as a small
+            // non-zero churn estimate without committing to an
+            // exact value.
+            placement_stability_delta: 0.05,
+            warnings: vec![BlastWarning::AvoidFlushRecoversPeer { peer }],
+        },
+        AvoidScope::Global => BlastRadius {
+            affected_nodes,
+            affected_replicas: Vec::new(),
+            affected_daemons: Vec::new(),
+            estimated_drain_delay: None,
+            placement_stability_delta: 0.1,
+            warnings: vec![BlastWarning::GlobalAvoidFlushMayReEmit],
+        },
     }
 }
 
@@ -596,5 +663,84 @@ mod tests {
             IceActionProposal::ThawCluster.to_admin_event(),
             AdminEvent::ThawCluster
         ));
+    }
+
+    #[test]
+    fn simulate_flush_avoid_lists_local_targets_one_node() {
+        let snap = snapshot_with_peers(&[10, 20, 30]);
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::FlushAvoidLists {
+                scope: AvoidScope::Local { node: 42 },
+            },
+        );
+        assert_eq!(blast.affected_nodes, vec![42]);
+        assert!(blast
+            .warnings
+            .iter()
+            .any(|w| matches!(w, BlastWarning::AvoidFlushLocalToTargetNodeOnly)));
+    }
+
+    #[test]
+    fn simulate_flush_avoid_lists_on_peer_covers_every_peer_with_warning() {
+        let snap = snapshot_with_peers(&[10, 20, 30]);
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::FlushAvoidLists {
+                scope: AvoidScope::OnPeer { peer: 20 },
+            },
+        );
+        assert_eq!(blast.affected_nodes, vec![10, 20, 30]);
+        assert!(blast
+            .warnings
+            .iter()
+            .any(|w| matches!(w, BlastWarning::AvoidFlushRecoversPeer { peer: 20 })));
+        // Small but non-zero churn signal.
+        assert!(blast.placement_stability_delta > 0.0);
+    }
+
+    #[test]
+    fn simulate_flush_avoid_lists_global_carries_re_emit_warning() {
+        let snap = snapshot_with_peers(&[1, 2, 3]);
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::FlushAvoidLists {
+                scope: AvoidScope::Global,
+            },
+        );
+        assert_eq!(blast.affected_nodes, vec![1, 2, 3]);
+        assert!(blast
+            .warnings
+            .iter()
+            .any(|w| matches!(w, BlastWarning::GlobalAvoidFlushMayReEmit)));
+    }
+
+    #[test]
+    fn ice_proposal_to_admin_event_maps_flush_avoid_lists() {
+        for scope in [
+            AvoidScope::Local { node: 42 },
+            AvoidScope::OnPeer { peer: 7 },
+            AvoidScope::Global,
+        ] {
+            let proposal = IceActionProposal::FlushAvoidLists { scope };
+            match proposal.to_admin_event() {
+                AdminEvent::FlushAvoidLists { scope: out } => assert_eq!(out, scope),
+                other => panic!("expected FlushAvoidLists, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn flush_avoid_lists_proposal_postcard_round_trips_for_every_scope() {
+        for scope in [
+            AvoidScope::Local { node: 42 },
+            AvoidScope::OnPeer { peer: 7 },
+            AvoidScope::Global,
+        ] {
+            let proposal = IceActionProposal::FlushAvoidLists { scope };
+            let bytes = postcard::to_allocvec(&proposal).expect("encode");
+            let decoded: IceActionProposal = postcard::from_bytes(&bytes).expect("decode");
+            assert_eq!(decoded, proposal);
+        }
     }
 }

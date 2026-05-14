@@ -47,6 +47,6 @@ pub use net::adapter::net::behavior::deck::{
 // Supporting types operators need from the MeshOS surface to
 // build commands or read snapshots.
 pub use net::adapter::net::behavior::meshos::{
-    AdminEvent, AdminVerifier, BlastRadius, BlastWarning, ChainId, IceActionProposal,
+    AdminEvent, AdminVerifier, AvoidScope, BlastRadius, BlastWarning, ChainId, IceActionProposal,
     MeshOsSnapshot, NodeId, VerifyError,
 };

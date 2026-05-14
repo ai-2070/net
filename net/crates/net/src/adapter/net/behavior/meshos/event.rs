@@ -352,6 +352,46 @@ pub enum AdminEvent {
     /// Cancel an in-effect freeze early. No-op if no freeze is
     /// in effect; idempotent.
     ThawCluster,
+    /// ICE break-glass: flush avoid-list entries cluster-wide
+    /// under the given [`AvoidScope`]. The existing
+    /// [`AdminEvent::ClearAvoidList`] is a global flush
+    /// regardless of its `node` parameter; this variant gives
+    /// the operator the three scoped flushes the plan calls out:
+    /// per-this-node, per-targeted-peer, and full global.
+    FlushAvoidLists {
+        /// Which entries to flush — see [`AvoidScope`].
+        scope: AvoidScope,
+    },
+}
+
+/// Scope discriminator for [`AdminEvent::FlushAvoidLists`].
+/// Each variant produces distinct fold behavior on the
+/// observing node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum AvoidScope {
+    /// Clear this node's entire avoid list, but only if
+    /// `node` is this node. Other nodes are no-ops. Use when
+    /// recovering a single node from a flapping-RTT episode.
+    Local {
+        /// Target node id. Other nodes ignore the event.
+        node: NodeId,
+    },
+    /// Every node removes `peer` from its avoid list. Use to
+    /// reverse a cluster-wide "avoid peer X" pattern after
+    /// operator-side recovery (e.g. routing fix, peer
+    /// restart). Idempotent — no-op for nodes that don't
+    /// have `peer` in their avoid list.
+    OnPeer {
+        /// Peer to un-avoid cluster-wide.
+        peer: NodeId,
+    },
+    /// Every node clears its entire avoid list. Use after a
+    /// network event that produced spurious avoid entries
+    /// across the whole cluster. Heaviest scope — reconcile
+    /// will re-emit `MarkAvoid` on the next tick for any peer
+    /// that still meets the degraded-RTT threshold.
+    Global,
 }
 
 /// Blob announcement payload. Phase A skeleton — Phase E fleshes

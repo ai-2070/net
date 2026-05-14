@@ -586,6 +586,19 @@ impl<'a> IceCommands<'a> {
         IceProposal::new(self.client, IceActionProposal::FreezeCluster { ttl })
     }
 
+    /// Propose flushing avoid-list entries under `scope`.
+    /// See [`super::meshos::ice::IceActionProposal::FlushAvoidLists`]
+    /// for the three scope semantics.
+    pub fn flush_avoid_lists(
+        &self,
+        scope: super::meshos::AvoidScope,
+    ) -> IceProposal<'a> {
+        IceProposal::new(
+            self.client,
+            IceActionProposal::FlushAvoidLists { scope },
+        )
+    }
+
     /// Propose cancelling an in-effect cluster freeze.
     pub fn thaw_cluster(&self) -> IceProposal<'a> {
         IceProposal::new(self.client, IceActionProposal::ThawCluster)
@@ -684,6 +697,7 @@ impl<'a> IceProposal<'a> {
             let kind = match self.action {
                 IceActionProposal::FreezeCluster { .. } => "freeze_cluster",
                 IceActionProposal::ThawCluster => "thaw_cluster",
+                IceActionProposal::FlushAvoidLists { .. } => "flush_avoid_lists",
             };
             self.client
                 .publish_signed_ice(self.action, signatures.to_vec(), kind)
@@ -696,6 +710,14 @@ impl<'a> IceProposal<'a> {
             match self.action {
                 IceActionProposal::FreezeCluster { ttl } => admin.freeze_cluster(ttl).await,
                 IceActionProposal::ThawCluster => admin.thaw_cluster().await,
+                IceActionProposal::FlushAvoidLists { scope } => {
+                    self.client
+                        .publish_admin(
+                            AdminEvent::FlushAvoidLists { scope },
+                            "flush_avoid_lists",
+                        )
+                        .await
+                }
             }
         }
     }
@@ -1136,6 +1158,35 @@ mod tests {
             .await
             .expect_err("commit with tampered sig should fail");
         assert_eq!(err.kind, "signature_invalid");
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ice_flush_avoid_lists_proposal_simulate_and_commit_round_trips() {
+        use super::super::meshos::AvoidScope;
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+        let proposal = deck
+            .ice()
+            .flush_avoid_lists(AvoidScope::OnPeer { peer: 5 });
+        let blast = proposal.simulate().await.expect("simulate");
+        // OnPeer scope flushes everywhere; without registered
+        // peers in the snapshot the affected_nodes list is
+        // empty but the warning still fires.
+        assert!(blast
+            .warnings
+            .iter()
+            .any(|w| matches!(
+                w,
+                crate::adapter::net::behavior::meshos::BlastWarning::AvoidFlushRecoversPeer {
+                    peer: 5
+                }
+            )));
+        // commit through the unsigned path (no registry installed).
+        let sig = deck.identity().sign_proposal(proposal.action());
+        let commit = proposal.commit(&[sig]).await.expect("commit");
+        assert_eq!(commit.event_kind(), "flush_avoid_lists");
         let _ = runtime.shutdown().await;
     }
 
