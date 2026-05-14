@@ -1,0 +1,36 @@
+net/crates/net/src/adapter/net/behavior/meshos/redex_appenders.rs
+  s_3bbc444b3ef3e5::t_14b622bc1c5434 111-112
+  s_3bbc444b3ef3e5::t_01a91b67c1f735 166,168-169
+  s_3bbc444b3ef3e5::t_d9d4e874ad9abc 1-49,51-60,64-85,89-110,114-134,137-138,140,142-165,167,170-188,190,192-208,210,213-215
+  s_3bbc444b3ef3e5::t_0206d252131883 139
+  s_3bbc444b3ef3e5::t_9bf2b9f5cf6168 61-62
+  s_3bbc444b3ef3e5::t_8004abc15c16b7 141
+  s_3bbc444b3ef3e5::t_c3d799cdf04eac 189,191
+  s_3bbc444b3ef3e5::t_f33e9925b81e24 209,211-212
+  s_3bbc444b3ef3e5::t_bf611773dc7edc 50
+  s_3bbc444b3ef3e5::t_6c8d5aa858a153 135
+  s_3bbc444b3ef3e5::t_ede47913903513 86-87
+  s_3bbc444b3ef3e5::t_32b9ba4c25443a 136
+  s_3bbc444b3ef3e5::t_6ee2987136d50a 63,88,113
+net/crates/net/sdk/src/meshos.rs
+  s_3bbc444b3ef3e5::t_5f4a68d25d7d28 106-113
+net/crates/net/src/adapter/net/behavior/meshos/mod.rs
+  s_3bbc444b3ef3e5::t_61b3e78d640e6d 68
+  s_3bbc444b3ef3e5::t_ed42dcba55d4ac 119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "ad8017c1a0c2927c4089f46f3a28649e52f4d725",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
