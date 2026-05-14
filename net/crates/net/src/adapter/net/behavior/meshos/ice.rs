@@ -106,6 +106,26 @@ impl IceActionProposal {
     /// Translate the proposal to its corresponding
     /// [`AdminEvent`]. The substrate folds the [`AdminEvent`];
     /// the proposal is the SDK-side builder + signing form.
+    /// Stable lowercase discriminator the Deck SDK stamps on
+    /// the returned [`super::super::deck::ChainCommit`]'s
+    /// `event_kind` field. Cross-binding consumers branch on
+    /// this string. Matches the corresponding
+    /// [`AdminEvent`] variant's wire kind one-to-one so the
+    /// audit ring's records show the same kind regardless of
+    /// whether the commit rode the ICE proposal path or
+    /// arrived as an unsigned admin event.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            IceActionProposal::FreezeCluster { .. } => "freeze_cluster",
+            IceActionProposal::ThawCluster => "thaw_cluster",
+            IceActionProposal::FlushAvoidLists { .. } => "flush_avoid_lists",
+            IceActionProposal::ForceEvictReplica { .. } => "force_evict_replica",
+            IceActionProposal::ForceRestartDaemon { .. } => "force_restart_daemon",
+            IceActionProposal::ForceCutover { .. } => "force_cutover",
+            IceActionProposal::KillMigration { .. } => "kill_migration",
+        }
+    }
+
     pub fn to_admin_event(&self) -> AdminEvent {
         match self {
             IceActionProposal::FreezeCluster { ttl } => AdminEvent::FreezeCluster { ttl: *ttl },

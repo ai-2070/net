@@ -119,8 +119,11 @@ pub struct MigrationSnapshot {
 }
 
 /// Wire form of [`crate::adapter::net::compute::MigrationPhase`].
-/// Defaults to `Snapshot` (first phase) for round-trip stability
-/// when an older decoder meets a newer encoder.
+/// `Default` is `Snapshot` (the first phase) purely as an
+/// in-memory placeholder for parent structs that need
+/// `Default`; the postcard decoder does **not** fall back to
+/// `Default` for unknown variants — an older decoder hitting a
+/// newer variant from across the wire errors at decode time.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MigrationPhaseSnapshot {

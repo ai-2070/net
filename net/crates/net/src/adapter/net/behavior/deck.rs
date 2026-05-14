@@ -1151,15 +1151,7 @@ impl<'a> SimulatedIceProposal<'a> {
             // unsigned path so consumers see one stable
             // discriminator regardless of whether verification
             // was wired.
-            let kind = match self.action {
-                IceActionProposal::FreezeCluster { .. } => "freeze_cluster",
-                IceActionProposal::ThawCluster => "thaw_cluster",
-                IceActionProposal::FlushAvoidLists { .. } => "flush_avoid_lists",
-                IceActionProposal::ForceEvictReplica { .. } => "force_evict_replica",
-                IceActionProposal::ForceRestartDaemon { .. } => "force_restart_daemon",
-                IceActionProposal::ForceCutover { .. } => "force_cutover",
-                IceActionProposal::KillMigration { .. } => "kill_migration",
-            };
+            let kind = self.action.kind();
             self.client
                 .publish_signed_ice(
                     self.action,
@@ -1170,9 +1162,6 @@ impl<'a> SimulatedIceProposal<'a> {
                 )
                 .await
         } else {
-            // No registry installed — route via the unsigned
-            // admin path. Useful for in-process tests where the
-            // SDK isn't gating on identity at all.
             // No registry: route via the unsigned admin path.
             // Useful for in-process tests where the SDK isn't
             // gating on identity at all. Freeze / thaw go
@@ -1181,55 +1170,9 @@ impl<'a> SimulatedIceProposal<'a> {
             // duplicated the ICE ceremony around the
             // simulate-before-commit gate (plan locked
             // decision #4).
-            match self.action {
-                IceActionProposal::FreezeCluster { ttl } => {
-                    self.client
-                        .publish_admin(AdminEvent::FreezeCluster { ttl }, "freeze_cluster")
-                        .await
-                }
-                IceActionProposal::ThawCluster => {
-                    self.client
-                        .publish_admin(AdminEvent::ThawCluster, "thaw_cluster")
-                        .await
-                }
-                IceActionProposal::FlushAvoidLists { scope } => {
-                    self.client
-                        .publish_admin(AdminEvent::FlushAvoidLists { scope }, "flush_avoid_lists")
-                        .await
-                }
-                IceActionProposal::ForceEvictReplica { chain, victim } => {
-                    self.client
-                        .publish_admin(
-                            AdminEvent::ForceEvictReplica { chain, victim },
-                            "force_evict_replica",
-                        )
-                        .await
-                }
-                IceActionProposal::ForceRestartDaemon { daemon } => {
-                    self.client
-                        .publish_admin(
-                            AdminEvent::ForceRestartDaemon { daemon },
-                            "force_restart_daemon",
-                        )
-                        .await
-                }
-                IceActionProposal::ForceCutover { chain, target } => {
-                    self.client
-                        .publish_admin(
-                            AdminEvent::ForceCutover { chain, target },
-                            "force_cutover",
-                        )
-                        .await
-                }
-                IceActionProposal::KillMigration { migration } => {
-                    self.client
-                        .publish_admin(
-                            AdminEvent::KillMigration { migration },
-                            "kill_migration",
-                        )
-                        .await
-                }
-            }
+            let kind = self.action.kind();
+            let event = self.action.to_admin_event();
+            self.client.publish_admin(event, kind).await
         }
     }
 }
