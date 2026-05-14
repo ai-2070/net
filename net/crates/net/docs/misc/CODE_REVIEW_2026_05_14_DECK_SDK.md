@@ -15,13 +15,13 @@ runtime, and the integration test surface
 
 ## Status
 
-**Open — partial closure.** 35 items identified:
+**Open — substantial closure.** 35 items identified:
 **7 Critical / 13 Important / 15 Nit.** Per the "no
 review-tracking IDs in code or commit messages" feedback
 rule, labels (C1-C7, S8-S20, N21-N35) are for this doc only —
 code and commit messages stay self-explanatory.
 
-### Closed (10 items across 9 commits)
+### Closed (20 items across 14 commits)
 
 | ID  | Title                                                                  | Commit (short title)                                                                                                |
 |-----|------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
@@ -30,67 +30,74 @@ code and commit messages stay self-explanatory.
 | C3  | Substrate-enforced simulate-before-commit (blast-radius hash binding)  | `MeshOS: substrate-enforced simulate-before-commit via blast-radius hash.`                                         |
 | C5  | Per-target ICE cooldown                                                | `MeshOS: per-target ICE cooldown on the admin verifier.`                                                           |
 | C6  | `IceProposal` / `SimulatedIceProposal` type-state split                | `Deck SDK: type-state split for IceProposal / SimulatedIceProposal.`                                               |
+| C7  | `runtime_epoch_id` on snapshot for restart detection                   | `MeshOS: stamp runtime_epoch_id on every snapshot for restart detection.`                                          |
 | S8  | `dispatch_kill_migration_if_applicable` runs after `actual.apply`      | (batched) `MeshOS + Deck SDK: tighten admin-event apply ordering and surface invariants.`                          |
-| S14 | Unsigned `AdminCommands::freeze_cluster` / `thaw_cluster` removed      | (batched) same as above                                                                                            |
+| S9  | Warn on partial extension wiring + FailureRecord for no-op aborter     | `MeshOS: route loop-side runtime failures into the SDK failure ring.`                                              |
+| S10 | Migration-abort failures route to the failure ring                     | (same as S9)                                                                                                       |
+| S13 | `MeshOsRuntimeBuilder` replaces `start_with_*` stair-step              | `MeshOS: MeshOsRuntimeBuilder replaces the start_with_* stair-step.`                                               |
+| S14 | Unsigned `AdminCommands::freeze_cluster` / `thaw_cluster` removed      | (batched) `MeshOS + Deck SDK: tighten admin-event apply ordering and surface invariants.`                          |
 | S16 | Freeze gates ordinary admin commits; ICE bypasses                      | `MeshOS: freeze gates ordinary admin commits; ICE bypasses.`                                                       |
-| S17 | `static_assert` `Send` on every public stream type                     | (batched) same as above                                                                                            |
+| S17 | `static_assert` `Send` on every public stream type                     | (batched) `MeshOS + Deck SDK: tighten admin-event apply ordering and surface invariants.`                          |
 | S18 | `emit_maintenance_transitions` anchors on `last_tick`, not wall-clock  | (batched) same as above                                                                                            |
+| S20 | ICE-discipline negatives promoted into `deck_pipeline.rs`              | `Deck SDK: promote ICE-discipline negatives into deck_pipeline integration tests.`                                 |
 | N24 | Removed redundant `cx.waker().wake_by_ref()` in stream poll bodies     | (batched) `Deck SDK: nit batch — DeckClient: Clone, drop redundant wake_by_ref, fix stale docstring.`              |
-| N31 | `AuditQuery::force_only` docstring updated                             | (batched) same as above                                                                                            |
+| N26 | `MigrationPhaseSnapshot::Default` doc clarifies in-memory placeholder  | (batched) `MeshOS + Deck SDK: nit batch — IceActionProposal::kind helper, doc clarifications.`                     |
+| N30 | `MeshOsHandleError` already `#[non_exhaustive]`                        | (verified, no code change)                                                                                         |
+| N31 | `AuditQuery::force_only` docstring updated                             | (batched) `Deck SDK: nit batch — DeckClient: Clone, drop redundant wake_by_ref, fix stale docstring.`              |
 | N32 | `DeckClient: Clone`                                                    | (batched) same as above                                                                                            |
+| N33 | `IceActionProposal::kind()` helper                                     | (batched) `MeshOS + Deck SDK: nit batch — IceActionProposal::kind helper, doc clarifications.`                     |
 
 ### Still open
 
 **Critical:**
 
 - **C4** — Simulator uses real `reconcile` arms. Substantial
-  rewrite. Pragmatic interim landed via existing
-  `simulate_*` arms; full convergence requires the snapshot-
-  clone-then-reconcile design from the doc.
-- **C7** — Persistent / epoch-tagged seq counters across
-  restarts. Requires `runtime_epoch_id` on
-  `MeshOsSnapshot` and matching SDK-side dedup contract.
+  rewrite. Today every `simulate_*` arm in `ice.rs` is
+  hand-written; full convergence requires the snapshot-
+  clone-then-reconcile design from the doc (clone snapshot,
+  fold proposal as synthetic `AdminEvent::Force*`, run
+  `reconcile()`, diff the action list into the
+  `BlastRadius`).
 
 **Important:**
 
-- **S9** — Warn on partial extension wiring + emit
-  `FailureRecord` when an ICE `KillMigration` lands but the
-  installed aborter is the no-op.
-- **S10** — Migration-abort failures route to the failure
-  ring (currently `tracing::warn!`-and-swallow).
 - **S11** — Snapshot avoids full-ring clones (carry rings
-  as `Arc<[T]>` or windowed views).
+  as `Arc<[T]>` or windowed views). Cross-cuts S12.
 - **S12** — Move `admin_audit` / `log_ring` off
-  `MeshOsState` onto the loop.
-- **S13** — Replace `start_with_*` stair-step with
-  `MeshOsRuntimeBuilder`.
+  `MeshOsState` onto the loop. The rings are append-only
+  output buffers, not fold state; `state.rs` has explicit
+  dead arms for `SignedIceCommit` / `SignedAdminCommit` /
+  `LogLine` precisely because they don't fold.
 - **S19** — Split `behavior/deck.rs` into the
   `deck/{identity,error,admin,ice,audit,logs,failures,streams,client}.rs`
   module tree.
-- **S20** — Promote ICE-discipline negatives + missing
-  surfaces (audit pagination, log-filter, failure
-  subscription, cooldown end-to-end) up into
-  `tests/deck_pipeline.rs`.
 
 **Nits:**
 
-- N21, N22, N23, N25, N26, N27, N28, N29, N30, N33, N34, N35
-  (per-item descriptions below).
+- N21, N22, N23, N25, N27, N28, N29, N34, N35
+  (per-item descriptions below; mostly polish).
 
 ### Rationale for the closure boundary
 
-The closed items are the ICE security guarantees that the
-plan's locked decisions hang on (multi-sig dedup, replay
-defense, simulate-before-commit at the cryptographic layer,
-cooldown, type-state simulate→commit) plus the small
-correctness / ergonomics fixes (apply ordering, freeze
-gating, last-tick anchoring, stream Send assertions, the
-nits batch). The remaining items are larger structural
-refactors (S11/S12/S13/S19) or substantive new features
-(C4 simulator rewrite, C7 epoch tag) — better as their own
-follow-up PRs than rolled into a single mega-commit. Each
-open item has a target shape pinned in this doc so the next
-contributor doesn't need to relitigate the design.
+Closed every ICE security guarantee the plan's locked
+decisions hang on (multi-sig operator-id dedup, replay-
+protected signing envelopes, substrate-enforced simulate-
+before-commit, per-target cooldown, type-state simulate →
+commit pattern, runtime-epoch restart detection); every
+small / moderate correctness fix (admin-event apply order,
+freeze gating ordinary admins, last-tick anchoring,
+stream Send assertions, migration-abort failure routing,
+production-partial wiring warning); the ergonomic
+`MeshOsRuntimeBuilder`; integration test coverage for the
+ICE-discipline negatives; and most nits.
+
+Remaining items are larger structural refactors (S11/S12/S19
+which all touch hot publish paths or split a 3000+ line
+file) or one substantive feature (C4 simulator-reconcile
+convergence). They land best as their own follow-up PRs
+rather than rolled into this branch. Each open item has its
+target shape pinned in this doc so the next contributor
+doesn't relitigate the design.
 
 ## A. Critical — security and correctness
 
