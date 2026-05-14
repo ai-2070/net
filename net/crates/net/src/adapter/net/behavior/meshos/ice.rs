@@ -1159,6 +1159,24 @@ pub enum BlastWarning {
 /// safe to call from any thread. The Deck SDK invokes this on
 /// the runtime's latest snapshot when an operator clicks "preview"
 /// on an ICE action.
+///
+/// # Semantics — `affected_*` vs the reconcile arm
+///
+/// The simulator reports **cluster-wide effects** of the
+/// proposal — which nodes / replicas / daemons would observe
+/// state change once the admin event lands. This is distinct
+/// from what
+/// [`super::reconcile::reconcile`] emits on any single node:
+/// reconcile is leader-gated (only the chain leader emits a
+/// `RequestEviction` / `RequestPlacement` action), and the
+/// blast-radius preview at operator side has no notion of
+/// "which node am I." The two views are consistent: the
+/// leader's reconcile produces an action that, when
+/// dispatched, has the cluster-wide effect the simulator
+/// reports. The
+/// `simulator_blast_radius_matches_reconcile_emission_*`
+/// regression tests pin that consistency for the chain-mutating
+/// proposals (ForceEvictReplica, ForceCutover).
 pub fn simulate(snapshot: &MeshOsSnapshot, proposal: &IceActionProposal) -> BlastRadius {
     match proposal {
         IceActionProposal::FreezeCluster { ttl } => simulate_freeze(snapshot, *ttl),
@@ -1739,6 +1757,147 @@ mod tests {
                 other => panic!("expected FlushAvoidLists, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn simulator_blast_radius_matches_reconcile_emission_for_force_evict() {
+        // Consistency-pinning test for locked decision #4's
+        // intent: the simulator's BlastRadius must agree
+        // semantically with what reconcile would emit on the
+        // leader for the same admin event.
+        //
+        // The two views differ in shape — the simulator
+        // reports cluster-wide affected_* sets; reconcile
+        // emits a RequestEviction action only on the chain's
+        // leader — but they must converge on the same
+        // (chain, victim) pair. A future change that breaks
+        // this alignment surfaces here.
+        use crate::adapter::net::behavior::meshos::action::MeshOsAction;
+        use crate::adapter::net::behavior::meshos::reconcile::reconcile;
+        use crate::adapter::net::behavior::meshos::state::{DesiredState, MeshOsState};
+
+        const CHAIN: ChainId = 100;
+        const LEADER: NodeId = 7;
+        const VICTIM: NodeId = 9;
+
+        // Build the post-apply state on the leader. The fold
+        // path that lands `ForceEvictReplica` pushes onto
+        // `forced_evictions`; reconcile's `diff_forced_evictions`
+        // drains it leader-side.
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(std::time::Instant::now());
+        actual
+            .replicas
+            .insert(CHAIN, std::collections::BTreeSet::from([LEADER, 8, VICTIM]));
+        actual.replica_leader.insert(CHAIN, LEADER);
+        actual.forced_evictions.push((CHAIN, VICTIM));
+
+        // Run reconcile() on the leader; expect exactly one
+        // RequestEviction.
+        let actions = reconcile(
+            &actual,
+            &DesiredState::default(),
+            LEADER,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+        );
+        let eviction = actions
+            .iter()
+            .find_map(|a| match a {
+                MeshOsAction::RequestEviction { chain, victim } => Some((*chain, *victim)),
+                _ => None,
+            })
+            .expect("leader's reconcile should emit one RequestEviction");
+        assert_eq!(eviction, (CHAIN, VICTIM));
+
+        // Simulator's BlastRadius reports the same affected
+        // chain + victim.
+        let mut snap = MeshOsSnapshot::default();
+        snap.replicas.insert(
+            CHAIN,
+            super::super::snapshot::ReplicaSnapshot {
+                holders: vec![LEADER, 8, VICTIM],
+                desired_count: Some(3),
+                leader: Some(LEADER),
+            },
+        );
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::ForceEvictReplica {
+                chain: CHAIN,
+                victim: VICTIM,
+            },
+        );
+        assert!(
+            blast.affected_replicas.contains(&CHAIN),
+            "simulator should mark chain {CHAIN} as affected; got {:?}",
+            blast.affected_replicas
+        );
+        assert!(
+            blast.affected_nodes.contains(&VICTIM),
+            "simulator should mark victim {VICTIM} as affected; got {:?}",
+            blast.affected_nodes
+        );
+    }
+
+    #[test]
+    fn simulator_blast_radius_matches_reconcile_emission_for_force_cutover() {
+        // Same consistency contract for ForceCutover.
+        use crate::adapter::net::behavior::meshos::action::MeshOsAction;
+        use crate::adapter::net::behavior::meshos::reconcile::reconcile;
+        use crate::adapter::net::behavior::meshos::state::{DesiredState, MeshOsState};
+
+        const CHAIN: ChainId = 200;
+        const LEADER: NodeId = 11;
+        const TARGET: NodeId = 42;
+
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(std::time::Instant::now());
+        actual
+            .replicas
+            .insert(CHAIN, std::collections::BTreeSet::from([LEADER, 12]));
+        actual.replica_leader.insert(CHAIN, LEADER);
+        actual.forced_placements.push((CHAIN, TARGET));
+        let actions = reconcile(
+            &actual,
+            &DesiredState::default(),
+            LEADER,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+        );
+        let placement = actions
+            .iter()
+            .find_map(|a| match a {
+                MeshOsAction::RequestPlacement { chain, target, .. } => {
+                    Some((*chain, *target))
+                }
+                _ => None,
+            })
+            .expect("leader's reconcile should emit one RequestPlacement");
+        assert_eq!(placement, (CHAIN, Some(TARGET)));
+
+        let mut snap = MeshOsSnapshot::default();
+        snap.replicas.insert(
+            CHAIN,
+            super::super::snapshot::ReplicaSnapshot {
+                holders: vec![LEADER, 12],
+                desired_count: Some(3),
+                leader: Some(LEADER),
+            },
+        );
+        let blast = simulate(
+            &snap,
+            &IceActionProposal::ForceCutover {
+                chain: CHAIN,
+                target: TARGET,
+            },
+        );
+        assert!(blast.affected_replicas.contains(&CHAIN));
+        assert!(blast.affected_nodes.contains(&TARGET));
     }
 
     #[test]
