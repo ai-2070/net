@@ -5,6 +5,7 @@
 //! site aesthetic (neon-green on pitch black).
 
 mod app;
+mod nodes;
 mod tabs;
 mod theme;
 mod widgets;

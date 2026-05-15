@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::theme;
+use crate::{nodes, theme};
 
 struct Node {
     id: &'static str,
@@ -156,7 +156,14 @@ fn paint_graph(ctx: &mut Context<'_>, tick: u64) {
             NodeKind::Region => theme::GREEN,
             NodeKind::Device => theme::AMBER,
         };
-        ctx.print(n.x, n.y, Line::styled(n.kind.glyph().to_string(), ratatui::style::Style::default().fg(color)));
+        ctx.print(
+            n.x,
+            n.y,
+            Line::styled(n.kind.glyph().to_string(), ratatui::style::Style::default().fg(color)),
+        );
+        // Graph keeps just the id — adding `.label` would crowd
+        // neighbors. The label still appears wherever this node
+        // is referenced in the event tail, list, or detail views.
         ctx.print(n.x + 2.5, n.y - 2.0, Line::styled(n.id, theme::dim()));
     }
 }
@@ -173,48 +180,77 @@ fn render_event_tail(frame: &mut Frame<'_>, area: Rect, tick: u64) {
         .title(header);
 
     let base = tick / 2;
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(fmt_ts(base + 0), theme::chrome()),
-            Span::styled("  ▶ ", theme::green()),
-            Span::styled("cap.announce", theme::cyan()),
-            Span::styled(" 0x3c81 ", theme::text()),
-            Span::styled("[device] ", theme::amber()),
-            Span::styled("lat:<200µs sensor:ph ", theme::text()),
-            Span::styled("capb ann 24ns", theme::chrome()),
-        ]),
-        Line::from(vec![
-            Span::styled(fmt_ts(base + 4), theme::chrome()),
-            Span::styled("  ↗ ", theme::green()),
-            Span::styled("mikoshi   ", theme::green_hi()),
-            Span::styled("daemon.0x69 0x6dfb → 0xbf44 ", theme::text()),
-            Span::styled("[daemon]", theme::cyan()),
-        ]),
-        Line::from(vec![
-            Span::styled(fmt_ts(base + 9), theme::chrome()),
-            Span::styled("  ▶ ", theme::green()),
-            Span::styled("cap.announce", theme::cyan()),
-            Span::styled(" 0xf206 ", theme::text()),
-            Span::styled("[region] ", theme::green()),
-            Span::styled("gpu:gb300 sensor:ph ", theme::text()),
-            Span::styled("capb ann 14ns", theme::chrome()),
-        ]),
-        Line::from(vec![
-            Span::styled(fmt_ts(base + 13), theme::chrome()),
-            Span::styled("  ↘ ", theme::green()),
-            Span::styled("gravity_pull ", theme::green_hi()),
-            Span::styled("daemon.0xc2 0x285e → 0x6dfb ", theme::text()),
-            Span::styled("[datafort]", theme::cyan()),
-        ]),
-        Line::from(vec![
-            Span::styled(fmt_ts(base + 18), theme::chrome()),
-            Span::styled("  ↻ ", theme::amber()),
-            Span::styled("drift_correct ", theme::amber()),
-            Span::styled("nodes(3) ", theme::text()),
-            Span::styled("0x6dfb 0x3c81 0x0fc2 ", theme::chrome()),
-            Span::styled("reflow", theme::cyan()),
-        ]),
+
+    // Helper: build a line line-by-line so we can splice in
+    // `id.label` spans for every node reference.
+    let mut lines: Vec<Line> = Vec::new();
+
+    // cap.announce 0x3c81 …
+    let mut row1 = vec![
+        Span::styled(fmt_ts(base + 0), theme::chrome()),
+        Span::styled("  ▶ ", theme::green()),
+        Span::styled("cap.announce ", theme::cyan()),
     ];
+    row1.extend(nodes::id_spans("0x3c81"));
+    row1.push(Span::styled(" ", theme::chrome()));
+    row1.push(Span::styled("[device] ", theme::amber()));
+    row1.push(Span::styled("lat:<200µs sensor:ph ", theme::text()));
+    row1.push(Span::styled("capb ann 24ns", theme::chrome()));
+    lines.push(Line::from(row1));
+
+    // mikoshi daemon.0x69 0x6dfb → 0xbf44 [daemon]
+    let mut row2 = vec![
+        Span::styled(fmt_ts(base + 4), theme::chrome()),
+        Span::styled("  ↗ ", theme::green()),
+        Span::styled("mikoshi   ", theme::green_hi()),
+        Span::styled("daemon.0x69 ", theme::text()),
+    ];
+    row2.extend(nodes::id_spans("0x6dfb"));
+    row2.push(Span::styled(" → ", theme::chrome()));
+    row2.extend(nodes::id_spans("0xbf44"));
+    row2.push(Span::styled(" [daemon]", theme::cyan()));
+    lines.push(Line::from(row2));
+
+    // cap.announce 0xf206 …
+    let mut row3 = vec![
+        Span::styled(fmt_ts(base + 9), theme::chrome()),
+        Span::styled("  ▶ ", theme::green()),
+        Span::styled("cap.announce ", theme::cyan()),
+    ];
+    row3.extend(nodes::id_spans("0xf206"));
+    row3.push(Span::styled(" ", theme::chrome()));
+    row3.push(Span::styled("[region] ", theme::green()));
+    row3.push(Span::styled("gpu:gb300 sensor:ph ", theme::text()));
+    row3.push(Span::styled("capb ann 14ns", theme::chrome()));
+    lines.push(Line::from(row3));
+
+    // gravity_pull daemon.0xc2 0x285e → 0x6dfb [datafort]
+    let mut row4 = vec![
+        Span::styled(fmt_ts(base + 13), theme::chrome()),
+        Span::styled("  ↘ ", theme::green()),
+        Span::styled("gravity_pull ", theme::green_hi()),
+        Span::styled("daemon.0xc2 ", theme::text()),
+        Span::styled("blob.0x285e → ", theme::chrome()),
+    ];
+    row4.extend(nodes::id_spans("0x6dfb"));
+    row4.push(Span::styled(" [datafort]", theme::cyan()));
+    lines.push(Line::from(row4));
+
+    // drift_correct nodes(3) 0x6dfb 0x3c81 0x0fc2 reflow
+    let mut row5 = vec![
+        Span::styled(fmt_ts(base + 18), theme::chrome()),
+        Span::styled("  ↻ ", theme::amber()),
+        Span::styled("drift_correct ", theme::amber()),
+        Span::styled("nodes(3) ", theme::text()),
+    ];
+    for (i, id) in ["0x6dfb", "0x3c81", "0x0fc2"].iter().enumerate() {
+        if i > 0 {
+            row5.push(Span::styled(" ", theme::chrome()));
+        }
+        row5.extend(nodes::id_spans_styled(id, theme::dim()));
+    }
+    row5.push(Span::styled(" reflow", theme::cyan()));
+    lines.push(Line::from(row5));
 
     let area_inner = block.inner(area);
     frame.render_widget(block, area);

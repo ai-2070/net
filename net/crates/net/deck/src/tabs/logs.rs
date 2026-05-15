@@ -5,7 +5,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::theme;
+use crate::{nodes, theme};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, tick: u64) {
     let rows = Layout::default()
@@ -132,17 +132,20 @@ fn generate_stream(count: usize) -> Vec<Line<'static>> {
             "ERR"  => (theme::red(),   "ERR  "),
             _      => (theme::text(),  "?    "),
         };
-        out.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(ts, theme::chrome()),
             Span::styled("  ", theme::chrome()),
             Span::styled(level_pad.to_string(), level_style),
             Span::styled("  ", theme::chrome()),
-            Span::styled(node.to_string(), theme::text()),
-            Span::styled("/", theme::chrome()),
-            Span::styled(daemon.to_string(), theme::cyan()),
-            Span::styled("  ", theme::chrome()),
-            Span::styled(msg.to_string(), theme::text()),
-        ]));
+        ];
+        // node refs in the source column render as `id.label` so
+        // every log line carries the deployment tag inline.
+        spans.extend(nodes::id_spans(node));
+        spans.push(Span::styled("/", theme::chrome()));
+        spans.push(Span::styled(daemon.to_string(), theme::cyan()));
+        spans.push(Span::styled("  ", theme::chrome()));
+        spans.push(Span::styled(msg.to_string(), theme::text()));
+        out.push(Line::from(spans));
     }
     out
 }

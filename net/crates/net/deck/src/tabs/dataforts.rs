@@ -5,7 +5,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::theme;
+use crate::{nodes, theme};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, tick: u64) {
     let rows = Layout::default()
@@ -74,26 +74,28 @@ fn render_nodes(frame: &mut Frame<'_>, area: Rect) {
         ])
         .split(inner);
 
-    let nodes: [(&str, u16, &str); 5] = [
-        ("node.0x7af3", 76, "evictable"),
-        ("node.0x2c91", 69, "steady"),
-        ("node.0xeb29", 57, "steady"),
-        ("node.0xfbb1", 76, "evictable"),
-        ("node.0x9a3e", 37, "absorbing"),
+    // Storage-pool members from the canonical fixture: the three
+    // datafort-kind nodes plus two compute nodes that absorb
+    // blob overflow.
+    let pool: [(&str, u16, &str); 5] = [
+        ("0xd4ff", 76, "evictable"),
+        ("0x3599", 69, "steady"),
+        ("0xf206", 57, "steady"),
+        ("0xeba8", 76, "evictable"),
+        ("0x82ee", 37, "absorbing"),
     ];
-    for (i, (label, pct, tag)) in nodes.iter().enumerate() {
+    for (i, (id, pct, tag)) in pool.iter().enumerate() {
         let tag_color = match *tag {
             "evictable" => theme::AMBER,
             "absorbing" => theme::CYAN,
             _ => theme::TEXT_DIM,
         };
-        let line = Line::from(vec![
-            Span::styled(format!("{label}  "), theme::dim()),
-            bar(*pct, 40, theme::GREEN_HI),
-            Span::styled(format!("  {pct}%  "), theme::text()),
-            Span::styled(*tag, ratatui::style::Style::default().fg(tag_color)),
-        ]);
-        frame.render_widget(Paragraph::new(line), rows[i]);
+        let mut spans = nodes::id_spans(id);
+        spans.push(Span::styled("  ", theme::chrome()));
+        spans.push(bar(*pct, 32, theme::GREEN_HI));
+        spans.push(Span::styled(format!("  {pct}%  "), theme::text()));
+        spans.push(Span::styled(*tag, ratatui::style::Style::default().fg(tag_color)));
+        frame.render_widget(Paragraph::new(Line::from(spans)), rows[i]);
     }
 }
 
@@ -109,33 +111,51 @@ fn render_events(frame: &mut Frame<'_>, area: Rect, tick: u64) {
     frame.render_widget(block, area);
 
     let base = tick / 2;
-    let entries: [(u64, &str, &str, &str); 7] = [
-        (base + 0,  "cool",   "0x3457", "rate 0.06 · evictable"),
-        (base + 4,  "cool",   "0x8366", "rate 0.11 · evictable"),
-        (base + 8,  "cool",   "0xd93b", "rate 0.09 · evictable"),
-        (base + 13, "cool",   "0xa43f", "rate 0.17 · evictable"),
-        (base + 17, "cool",   "0x4b04", "rate 0.10 · evictable"),
-        (base + 21, "absorb", "0x9a3e", "free 65%  · open"),
-        (base + 25, "pull",   "0xd4ff", "blob 0x29 → 0x7af3"),
+
+    // (kind, subject_kind, subject_id, target_id_or_none, detail)
+    // - cool: a blob cools on a host node
+    // - absorb: a node opens to absorb overflow
+    // - pull: a blob migrates between nodes (target shown)
+    enum Subject {
+        Blob(&'static str),
+        Node(&'static str),
+    }
+    let entries: [(u64, &str, Subject, Option<&str>, &str); 7] = [
+        (base + 0,  "cool",   Subject::Blob("blob.0x3457"), Some("0xd4ff"), "rate 0.06 · evictable"),
+        (base + 4,  "cool",   Subject::Blob("blob.0x8366"), Some("0x3599"), "rate 0.11 · evictable"),
+        (base + 8,  "cool",   Subject::Blob("blob.0xd93b"), Some("0xd4ff"), "rate 0.09 · evictable"),
+        (base + 13, "cool",   Subject::Blob("blob.0xa43f"), Some("0xf206"), "rate 0.17 · evictable"),
+        (base + 17, "cool",   Subject::Blob("blob.0x4b04"), Some("0xeba8"), "rate 0.10 · evictable"),
+        (base + 21, "absorb", Subject::Node("0x82ee"),      None,           "free 65%  · open"),
+        (base + 25, "pull",   Subject::Blob("blob.0x29c1"), Some("0xd4ff"), "→ 0xeba8 delta 2.4KB"),
     ];
+
     let lines: Vec<Line> = entries
         .iter()
-        .map(|(t, kind, blob, detail)| {
+        .map(|(t, kind, subj, host, detail)| {
             let kind_color = match *kind {
                 "cool" => theme::CYAN,
                 "absorb" => theme::GREEN_HI,
                 "pull" => theme::AMBER,
                 _ => theme::TEXT,
             };
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(fmt_ts(*t), theme::chrome()),
                 Span::styled("  [", theme::chrome()),
                 Span::styled(*kind, ratatui::style::Style::default().fg(kind_color)),
                 Span::styled("]  ", theme::chrome()),
-                Span::styled(*blob, theme::text()),
-                Span::styled("  ", theme::chrome()),
-                Span::styled(*detail, theme::dim()),
-            ])
+            ];
+            match subj {
+                Subject::Blob(b) => spans.push(Span::styled(*b, theme::text())),
+                Subject::Node(id) => spans.extend(nodes::id_spans(id)),
+            }
+            if let Some(host_id) = host {
+                spans.push(Span::styled("  @ ", theme::chrome()));
+                spans.extend(nodes::id_spans_styled(host_id, theme::dim()));
+            }
+            spans.push(Span::styled("  ", theme::chrome()));
+            spans.push(Span::styled(*detail, theme::dim()));
+            Line::from(spans)
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
