@@ -1,3 +1,4 @@
+pub mod confirm;
 pub mod empty;
 pub mod footer;
 pub mod rule;

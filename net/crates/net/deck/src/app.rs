@@ -73,6 +73,15 @@ pub struct App {
     /// detail pane on the right reflects whichever member is
     /// pointed to.
     pub daemon_cursor: DaemonCursor,
+    /// Active modal overlay (confirmation prompt, future
+    /// signature collector, future help screen). When `Some`,
+    /// the modal absorbs key input until dismissed.
+    pub modal: Option<Modal>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Modal {
+    Confirm(crate::widgets::confirm::ConfirmAction),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -92,6 +101,7 @@ impl App {
             deck,
             snapshot,
             daemon_cursor: DaemonCursor::default(),
+            modal: None,
         }
     }
 
@@ -122,6 +132,11 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // Modal absorbs all input until dismissed.
+        if self.modal.is_some() {
+            self.on_modal_key(code, mods);
+            return;
+        }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => {
@@ -157,8 +172,75 @@ impl App {
                 self.daemon_cursor.group = self.daemon_cursor.group.saturating_sub(1);
                 self.daemon_cursor.member = 0;
             }
+            // DAEMON tab actions: `r` proposes
+            // restart-all-daemons on the cursored member's
+            // host node. Pops a confirmation modal; Enter on
+            // the modal fires the signed admin commit.
+            KeyCode::Char('r') if self.current == Tab::Daemon => {
+                self.propose_restart_all_daemons();
+            }
             _ => {}
         }
+    }
+
+    fn on_modal_key(&mut self, code: KeyCode, _mods: KeyModifiers) {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.modal = None;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let modal = self.modal.take();
+                if let Some(Modal::Confirm(action)) = modal {
+                    self.dispatch_confirm(action);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Build a restart-all-daemons confirmation for the
+    /// cursored daemon's host node. No-op if no daemon is
+    /// selected (empty snapshot, etc.).
+    fn propose_restart_all_daemons(&mut self) {
+        let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
+        let Some(group) = groups.get(self.daemon_cursor.group) else { return };
+        let Some(member) = group.members.get(self.daemon_cursor.member) else { return };
+        let node = member.daemon.placement;
+        let node_display = format!(
+            "0x{:x}{}",
+            node,
+            crate::nodes::label_of(&format!("0x{node:x}"))
+                .map(|l| format!(".{l}"))
+                .unwrap_or_default(),
+        );
+        let daemon_count = self
+            .snapshot
+            .daemons
+            .values()
+            .filter(|d| d.placement == node)
+            .count();
+        self.modal = Some(Modal::Confirm(
+            crate::widgets::confirm::ConfirmAction::RestartAllDaemons {
+                node,
+                node_display,
+                daemon_count,
+            },
+        ));
+    }
+
+    /// Spawn a tokio task that fires the SDK call corresponding
+    /// to the confirmed action. Fire-and-forget — the result
+    /// surfaces in the snapshot's audit ring on the next tick.
+    fn dispatch_confirm(&self, action: crate::widgets::confirm::ConfirmAction) {
+        let deck = Arc::clone(&self.deck);
+        tokio::spawn(async move {
+            use crate::widgets::confirm::ConfirmAction;
+            match action {
+                ConfirmAction::RestartAllDaemons { node, .. } => {
+                    let _ = deck.admin().restart_all_daemons(node).await;
+                }
+            }
+        });
     }
 
     /// Clamp the daemon cursor against the current snapshot's
@@ -214,5 +296,11 @@ impl App {
             }
         }
         widgets::footer::render(frame, chunks[4]);
+
+        // Modal overlay (renders last so it sits visually on
+        // top of the body).
+        if let Some(Modal::Confirm(action)) = &self.modal {
+            widgets::confirm::render(frame, area, action);
+        }
     }
 }
