@@ -1,0 +1,32 @@
+web/src/app/layout.tsx
+  s_e461293ef945b9::t_04770ec4551ccb 25-30
+  s_e461293ef945b9::t_81b11d2059c25c 2-6
+  s_e461293ef945b9::t_e7010961704762 47
+web/src/app/docs/[...slug]/page.tsx
+  s_e461293ef945b9::t_87b972bb4ae4e1 51-52
+web/src/app/globals.css
+  s_e461293ef945b9::t_d2dd896dcf3cd7 20-22
+web/src/components/DocsContent.tsx
+  s_e461293ef945b9::t_d8ee78fa9e2f95 329-331,334-335,347,357-359,362,368,374,383
+  s_e461293ef945b9::t_39dce2db768fdd 361,363-364
+  s_e461293ef945b9::t_f7f43989b13b09 310
+  s_e461293ef945b9::t_9c3137e30794bf 303,306
+web/src/app/docs/page.tsx
+  s_e461293ef945b9::t_5d45a1669a2781 71-72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "7041f3b27a40310eeab1d21497dc2f2cbae3c2f1",
+  "prompts": {},
+  "sessions": {
+    "s_e461293ef945b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b86f732-4bc6-49f3-a4d3-0c57194c40f4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
