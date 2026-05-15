@@ -337,6 +337,75 @@ function stripInline(s: string): string {
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
 }
 
+// A single page in the linear prev/next reading order.
+export type LinearDoc = {
+  slug: string[]; // URL slug array (empty = /docs)
+  title: string;
+  section?: string; // parent folder title, for context label
+};
+
+// Walk the tree in the order it's displayed in the sidebar (sections-config
+// first, then per-folder order) and produce a flat list of "readable" pages.
+// Auto-generated folder-index pages (folders without a README) are skipped
+// since they're just listings; folder READMEs are included as the section's
+// landing page.
+function flattenForLinearOrder(tree: DocTree): LinearDoc[] {
+  const out: LinearDoc[] = [];
+
+  if (tree.rootReadme) {
+    out.push({ slug: [], title: tree.rootReadme.title });
+  }
+  for (const f of tree.rootFiles) {
+    out.push({ slug: f.slug, title: f.title });
+  }
+  for (const folder of tree.folders) {
+    addFolder(folder, out, folder.title);
+  }
+  return out;
+}
+
+function addFolder(
+  folder: DocFolder,
+  out: LinearDoc[],
+  section: string,
+): void {
+  if (folder.readme) {
+    out.push({ slug: folder.slug, title: folder.title, section });
+  }
+  for (const child of folder.children) {
+    if (child.kind === "file") {
+      if (folder.readme && child === folder.readme) continue;
+      out.push({ slug: child.slug, title: child.title, section });
+    } else {
+      addFolder(child, out, child.title);
+    }
+  }
+}
+
+let cachedLinear: LinearDoc[] | null = null;
+function getLinearDocs(): LinearDoc[] {
+  if (cachedLinear) return cachedLinear;
+  cachedLinear = flattenForLinearOrder(getDocTree());
+  return cachedLinear;
+}
+
+// Look up the previous + next page in the sidebar order for a given slug.
+// `currentSlug` is the URL slug ([] for /docs root, ["foo"] for /docs/foo).
+// Returns nulls when there is no neighbor in that direction.
+export function getPrevNext(currentSlug: string[]): {
+  prev: LinearDoc | null;
+  next: LinearDoc | null;
+} {
+  const list = getLinearDocs();
+  const key = currentSlug.join("/");
+  const idx = list.findIndex((d) => d.slug.join("/") === key);
+  if (idx < 0) return { prev: null, next: null };
+  return {
+    prev: idx > 0 ? (list[idx - 1] ?? null) : null,
+    next: idx < list.length - 1 ? (list[idx + 1] ?? null) : null,
+  };
+}
+
 // Parse h2/h3/h4 headings out of the raw markdown source. Code fences are
 // skipped so `## comments` inside a Rust snippet don't show up. IDs are
 // generated with the same slugger rehype-slug uses, so the TOC anchors

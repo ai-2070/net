@@ -5,11 +5,16 @@ import {
   resolveDoc,
   readDocSource,
   extractToc,
+  getPrevNext,
   type DocFolder,
   type TocEntry,
 } from "@/lib/docs";
 import { DocsContent } from "@/components/DocsContent";
 import { DocsToc } from "@/components/DocsToc";
+import {
+  DocsPrevNextTop,
+  DocsPrevNextBottom,
+} from "@/components/DocsPrevNext";
 
 interface PageProps {
   params: Promise<{ slug: string[] }>;
@@ -96,6 +101,11 @@ export default async function DocPage({ params }: PageProps) {
 
   const source = readDocSource(resolved.file);
   const toc = extractToc(source);
+  // For folder READMEs the URL uses the folder slug ([..., "plans"]) not
+  // the README's own slug ([..., "plans", "readme"]). Pick the right one
+  // so prev/next maps to the same key used by the sidebar order.
+  const lookupSlug = resolved.folder ? resolved.folder.slug : resolved.file.slug;
+  const { prev, next } = getPrevNext(lookupSlug);
   return (
     <>
       <main className="min-w-0 max-w-[740px]">
@@ -115,7 +125,9 @@ export default async function DocPage({ params }: PageProps) {
             );
           })}
         </div>
+        <DocsPrevNextTop prev={prev} next={next} />
         <DocsContent source={source} format={resolved.file.ext} />
+        <DocsPrevNextBottom prev={prev} next={next} />
       </main>
       <TocRail entries={toc} />
     </>

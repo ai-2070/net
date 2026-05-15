@@ -3,11 +3,16 @@ import {
   getDocTree,
   readDocSource,
   extractToc,
+  getPrevNext,
   type DocFolder,
   type TocEntry,
 } from "@/lib/docs";
 import { DocsContent } from "@/components/DocsContent";
 import { DocsToc } from "@/components/DocsToc";
+import {
+  DocsPrevNextTop,
+  DocsPrevNextBottom,
+} from "@/components/DocsPrevNext";
 
 function folderHref(slug: string[]): string {
   return `/docs/${slug.join("/")}`;
@@ -42,10 +47,13 @@ export default function DocsRootPage() {
   if (tree.rootReadme) {
     const source = readDocSource(tree.rootReadme);
     const toc = extractToc(source);
+    const { prev, next } = getPrevNext([]);
     return (
       <>
         <main className="min-w-0 max-w-[740px]">
+          <DocsPrevNextTop prev={prev} next={next} />
           <DocsContent source={source} format={tree.rootReadme.ext} />
+          <DocsPrevNextBottom prev={prev} next={next} />
         </main>
         <TocRail entries={toc} />
       </>
