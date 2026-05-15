@@ -108,6 +108,14 @@ pub struct App {
     /// `[p]` on the LOGS tab. Other tabs keep using the live
     /// snapshot — only the log tail is paused.
     pub logs_paused: Option<Arc<[net_sdk::deck::LogRecord]>>,
+    /// LOGS tab substring filter applied to record messages.
+    /// Empty = no filter. Edited via `[/]`; survives switching
+    /// off the LOGS tab until explicitly cleared.
+    pub logs_search: String,
+    /// When `true`, keystrokes go into `logs_search` instead of
+    /// the normal binding table. Toggled via `[/]` (enter) and
+    /// `Enter`/`Esc` (exit; Esc also clears the buffer).
+    pub logs_search_editing: bool,
     /// Active modal overlay (confirmation prompt, future
     /// signature collector, future help screen). When `Some`,
     /// the modal absorbs key input until dismissed.
@@ -202,6 +210,8 @@ impl App {
             audit_limit: None,
             logs_min_level: net_sdk::deck::LogLevel::Info,
             logs_paused: None,
+            logs_search: String::new(),
+            logs_search_editing: false,
             modal: None,
         }
     }
@@ -236,6 +246,13 @@ impl App {
         // Modal absorbs all input until dismissed.
         if self.modal.is_some() {
             self.on_modal_key(code, mods);
+            return;
+        }
+        // The LOGS search prompt is the second-tier absorber:
+        // while editing, keystrokes go into the query buffer
+        // rather than the normal bindings.
+        if self.logs_search_editing {
+            self.on_logs_search_key(code);
             return;
         }
         match code {
@@ -364,6 +381,12 @@ impl App {
                     Some(_) => None,
                     None => Some(self.snapshot.log_ring.clone()),
                 };
+            }
+            // LOGS: open the substring search prompt. The
+            // existing buffer is preserved so the operator can
+            // refine instead of retyping.
+            KeyCode::Char('/') if self.current == Tab::Logs => {
+                self.logs_search_editing = true;
             }
             KeyCode::Char('n') if self.current == Tab::Audit => {
                 self.audit_limit = match self.audit_limit {
@@ -523,6 +546,26 @@ impl App {
             self.migration_cursor = 0;
         } else if self.migration_cursor >= n {
             self.migration_cursor = n - 1;
+        }
+    }
+
+    /// Absorb a single keypress into the LOGS search buffer.
+    /// `Enter` commits the current buffer (filter stays active),
+    /// `Esc` cancels and clears, `Backspace` pops a char, any
+    /// printable char appends. Non-handled keys are dropped so
+    /// they don't leak into the normal binding table.
+    fn on_logs_search_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => self.logs_search_editing = false,
+            KeyCode::Esc => {
+                self.logs_search_editing = false;
+                self.logs_search.clear();
+            }
+            KeyCode::Backspace => {
+                self.logs_search.pop();
+            }
+            KeyCode::Char(c) => self.logs_search.push(c),
+            _ => {}
         }
     }
 
@@ -968,6 +1011,8 @@ impl App {
                     records,
                     self.logs_min_level,
                     self.logs_paused.is_some(),
+                    &self.logs_search,
+                    self.logs_search_editing,
                 );
             }
             Tab::Audit => tabs::audit::render(

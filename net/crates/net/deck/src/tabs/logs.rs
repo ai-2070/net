@@ -15,17 +15,26 @@ pub fn render(
     records: &[LogRecord],
     min_level: LogLevel,
     paused: bool,
+    search: &str,
+    search_editing: bool,
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
         .split(area);
-    render_filter_bar(frame, rows[0], min_level, paused);
-    render_log_grid(frame, rows[1], tick, records, min_level);
-    render_status(frame, rows[2], records, min_level, paused);
+    render_filter_bar(frame, rows[0], min_level, paused, search, search_editing);
+    render_log_grid(frame, rows[1], tick, records, min_level, search);
+    render_status(frame, rows[2], records, min_level, paused, search);
 }
 
-fn render_filter_bar(frame: &mut Frame<'_>, area: Rect, min_level: LogLevel, paused: bool) {
+fn render_filter_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    min_level: LogLevel,
+    paused: bool,
+    search: &str,
+    search_editing: bool,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -35,6 +44,19 @@ fn render_filter_bar(frame: &mut Frame<'_>, area: Rect, min_level: LogLevel, pau
         ]));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // While editing, the chip row is replaced with the search
+    // prompt — the operator's full attention is on the buffer.
+    if search_editing {
+        let line = Line::from(vec![
+            Span::styled("/ ", theme::amber()),
+            Span::styled(search.to_string(), theme::green_hi()),
+            Span::styled("_", theme::amber()),
+            Span::styled("    [Enter] commit  [Esc] cancel", theme::dim()),
+        ]);
+        frame.render_widget(Paragraph::new(line), inner);
+        return;
+    }
 
     // Active level threshold gets the amber accent when it's
     // suppressing rows; default Info is rendered green to read
@@ -46,18 +68,20 @@ fn render_filter_bar(frame: &mut Frame<'_>, area: Rect, min_level: LogLevel, pau
         ("ON", theme::green_hi())
     };
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled("level ", theme::chrome()),
         Span::styled("[", theme::chrome()),
         Span::styled(level_text, level_style),
         Span::styled("]   ", theme::chrome()),
-        Span::styled("node ", theme::chrome()),
+        Span::styled("match ", theme::chrome()),
         Span::styled("[", theme::chrome()),
-        Span::styled("*", theme::green_hi()),
-        Span::styled("]   ", theme::chrome()),
-        Span::styled("daemon ", theme::chrome()),
-        Span::styled("[", theme::chrome()),
-        Span::styled("*", theme::green_hi()),
+    ];
+    if search.is_empty() {
+        spans.push(Span::styled("*", theme::green_hi()));
+    } else {
+        spans.push(Span::styled(format!("/{search}/"), theme::amber()));
+    }
+    spans.extend([
         Span::styled("]   ", theme::chrome()),
         Span::styled("kind ", theme::chrome()),
         Span::styled("[", theme::chrome()),
@@ -68,7 +92,7 @@ fn render_filter_bar(frame: &mut Frame<'_>, area: Rect, min_level: LogLevel, pau
         Span::styled(follow_text, follow_style),
         Span::styled("]", theme::chrome()),
     ]);
-    frame.render_widget(Paragraph::new(line), inner);
+    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
 fn level_chip(min_level: LogLevel) -> (&'static str, ratatui::style::Style) {
@@ -99,6 +123,7 @@ fn render_log_grid(
     tick: u64,
     records: &[LogRecord],
     min_level: LogLevel,
+    search: &str,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -114,17 +139,24 @@ fn render_log_grid(
     let lines: Vec<Line> = if records.is_empty() {
         Vec::new()
     } else {
-        project_log_records(records, total_rows, min_level)
+        project_log_records(records, total_rows, min_level, search)
     };
 
     if lines.is_empty() {
-        // Distinguish "no logs at all" from "filter is hiding
+        // Distinguish "no logs at all" from "filters hiding
         // everything" — the latter is easy to miss and a common
-        // operator confusion.
+        // operator confusion. When a search is active the hint
+        // points at `[/]` first, because that's usually the
+        // narrowest filter.
         let (head, hint) = if records.is_empty() {
             (
                 "no log lines yet",
                 "publish_log() on any registered daemon will appear here",
+            )
+        } else if !search.is_empty() {
+            (
+                "no log lines match the current filters",
+                "press [/] to edit the search or [f] to lower the level",
             )
         } else {
             (
@@ -147,6 +179,7 @@ fn render_status(
     records: &[LogRecord],
     min_level: LogLevel,
     paused: bool,
+    search: &str,
 ) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -154,9 +187,11 @@ fn render_status(
         .split(area);
 
     let total = records.len();
+    let needle = search.to_ascii_lowercase();
     let shown = records
         .iter()
         .filter(|r| level_rank(r.level) >= level_rank(min_level))
+        .filter(|r| needle.is_empty() || matches_ci(&r.message, &needle))
         .count();
     let (source_text, source_style) = if paused {
         ("frozen snapshot", theme::amber())
@@ -190,10 +225,16 @@ fn project_log_records(
     records: &[LogRecord],
     capacity: usize,
     min_level: LogLevel,
+    search: &str,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line> = Vec::with_capacity(records.len().min(capacity));
     let min = level_rank(min_level);
-    for rec in records.iter().filter(|r| level_rank(r.level) >= min) {
+    let needle = search.to_ascii_lowercase();
+    for rec in records
+        .iter()
+        .filter(|r| level_rank(r.level) >= min)
+        .filter(|r| needle.is_empty() || matches_ci(&r.message, &needle))
+    {
         let (level_style, level_pad) = match rec.level {
             LogLevel::Info  => (theme::dim(),   "INFO "),
             LogLevel::Warn  => (theme::amber(), "WARN "),
@@ -231,6 +272,17 @@ fn project_log_records(
         out.push(Line::from(spans));
     }
     out
+}
+
+/// ASCII case-insensitive substring match. `needle` must
+/// already be lowercased by the caller — we lowercase the
+/// haystack here. Non-ASCII bytes pass through verbatim which
+/// is fine for the operator-facing log messages we render.
+fn matches_ci(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    haystack.to_ascii_lowercase().contains(needle_lower)
 }
 
 fn format_ts_ms(ts_ms: u64) -> String {
