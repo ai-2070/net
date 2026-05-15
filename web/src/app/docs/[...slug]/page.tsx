@@ -48,8 +48,8 @@ function FolderIndex({ folder }: { folder: DocFolder }) {
         ▸ section
       </div>
       <h1
-        className="font-mono text-ink mb-3 leading-[1.15] tracking-[0.005em] font-medium"
-        style={{ fontSize: "clamp(28px, 3.4vw, 38px)" }}
+        className="font-display text-ink mt-1 mb-3 leading-[1.15] tracking-[0.01em]"
+        style={{ fontSize: "clamp(26px, 3vw, 32px)" }}
       >
         {folder.title}
       </h1>

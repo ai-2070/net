@@ -326,31 +326,37 @@ const headingClasses = {
 };
 
 const mdxComponents = {
-  // Mono everywhere, but body weight is light (300) at generous leading so
-  // long-form prose reads cleanly. Headings use medium (500) for hierarchy
-  // without going corporate-bold.
+  // Heading hierarchy
+  // - H1: site's signature display font (Major Mono Display) at a small
+  //       refined size — character without overwhelming. Ties docs to the
+  //       homepage's visual identity.
+  // - H2: mono uppercase tracked + accent left bar — terminal "section
+  //       marker" chrome. The single use of the bar in the content.
+  // - H3: smaller mono medium, lowercase tag-style — clearly subordinate
+  //       to H2 by size, no chrome.
+  // - H4: tiny accent uppercase — tag/label.
   h1: (props: { children?: ReactNode }) => (
     <h1
-      className={`font-mono text-ink mb-8 mt-2 leading-[1.2] tracking-[0.005em] font-medium ${headingClasses.base}`}
-      style={{ fontSize: "clamp(26px, 3.2vw, 34px)" }}
+      className={`font-display text-ink mt-1 mb-10 leading-[1.15] tracking-[0.01em] ${headingClasses.base}`}
+      style={{ fontSize: "clamp(24px, 2.8vw, 30px)" }}
       {...props}
     />
   ),
   h2: (props: { children?: ReactNode }) => (
     <h2
-      className={`font-mono text-ink mt-16 mb-5 leading-tight tracking-[0.04em] uppercase text-[17px] font-semibold border-l-2 border-accent pl-3 scroll-mt-28 ${headingClasses.base}`}
+      className={`font-mono text-ink mt-16 mb-5 leading-tight tracking-[0.04em] uppercase text-[16px] font-semibold border-l-2 border-accent pl-3 scroll-mt-28 ${headingClasses.base}`}
       {...props}
     />
   ),
   h3: (props: { children?: ReactNode }) => (
     <h3
-      className={`font-mono text-ink mt-12 mb-4 leading-snug tracking-[0.01em] text-[17px] font-medium scroll-mt-28 ${headingClasses.base}`}
+      className={`font-mono text-ink mt-10 mb-3 leading-snug tracking-[0.02em] text-[13px] uppercase font-semibold scroll-mt-28 ${headingClasses.base}`}
       {...props}
     />
   ),
   h4: (props: { children?: ReactNode }) => (
     <h4
-      className={`font-mono text-accent mt-9 mb-3 text-[12px] uppercase tracking-[0.14em] font-semibold scroll-mt-28 ${headingClasses.base}`}
+      className={`font-mono text-accent-dim mt-8 mb-2 text-[11px] uppercase tracking-[0.14em] font-semibold scroll-mt-28 ${headingClasses.base}`}
       {...props}
     />
   ),
@@ -365,18 +371,18 @@ const mdxComponents = {
   ),
   ul: (props: { children?: ReactNode }) => (
     <ul
-      className="font-mono font-light list-disc list-outside pl-6 mb-5 text-[13.5px] text-ink-dim leading-[1.85] marker:text-accent space-y-2"
+      className="font-mono font-light list-disc list-outside pl-6 mb-6 text-[14px] text-ink leading-[1.9] marker:text-accent space-y-3 [&_ul]:mt-3 [&_ol]:mt-3 [&_ul]:mb-1 [&_ol]:mb-1"
       {...props}
     />
   ),
   ol: (props: { children?: ReactNode }) => (
     <ol
-      className="font-mono font-light list-decimal list-outside pl-6 mb-5 text-[13.5px] text-ink-dim leading-[1.85] marker:text-accent space-y-2"
+      className="font-mono font-light list-decimal list-outside pl-6 mb-6 text-[14px] text-ink leading-[1.9] marker:text-accent space-y-3 [&_ul]:mt-3 [&_ol]:mt-3 [&_ul]:mb-1 [&_ol]:mb-1"
       {...props}
     />
   ),
   li: (props: { children?: ReactNode }) => (
-    <li className="[&>p]:mb-2 [&>p:last-child]:mb-0" {...props} />
+    <li className="[&>p]:mb-3 [&>p:last-child]:mb-0" {...props} />
   ),
   blockquote: (props: { children?: ReactNode }) => (
     <blockquote
