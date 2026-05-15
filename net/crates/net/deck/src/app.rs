@@ -135,6 +135,15 @@ pub enum Modal {
         purpose: crate::widgets::pick_node::PickNodePurpose,
         cursor: usize,
     },
+    /// Duration-input prompt — operator types a value with
+    /// `s`/`m`/`h` units. `Enter` parses and transitions to a
+    /// `Confirm` modal; parse failures stash an `error` on the
+    /// modal and the operator can keep editing.
+    ParamInput {
+        purpose: crate::widgets::param_input::ParamInputPurpose,
+        buffer: String,
+        error: Option<String>,
+    },
 }
 
 /// Internal helper enum used by `propose_node_action` to
@@ -155,18 +164,6 @@ enum NodeActionKind {
     ClearAvoidList,
     InvalidatePlacement,
 }
-
-/// Default drain window when the operator hits `[d]` without
-/// specifying a deadline. Five minutes is the cluster's typical
-/// `MaintenanceConfig::default_drain_deadline` order of
-/// magnitude — long enough for replicas to evacuate, short
-/// enough that an accidental drain auto-times out.
-pub const DEFAULT_DRAIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Default ICE cluster-freeze TTL when the operator hits `[F]`.
-/// 60 seconds — long enough to investigate, short enough that an
-/// accidental freeze auto-thaws before reconcile drifts.
-pub const DEFAULT_ICE_FREEZE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// ICE commit pipeline shared by every ICE variant: simulate
 /// (binds `issued_at_ms` + `blast_hash`), sign with the
@@ -439,17 +436,14 @@ impl App {
     }
 
     fn propose_ice_freeze(&mut self) {
-        use net_sdk::deck::{simulate_ice_proposal, IceActionProposal};
-        let action = IceActionProposal::FreezeCluster {
-            ttl: DEFAULT_ICE_FREEZE_TTL,
-        };
-        let blast = simulate_ice_proposal(&self.snapshot, &action);
-        self.modal = Some(Modal::Confirm(
-            crate::widgets::confirm::ConfirmAction::IceFreezeCluster {
-                ttl: DEFAULT_ICE_FREEZE_TTL,
-                blast,
-            },
-        ));
+        use crate::widgets::param_input::ParamInputPurpose;
+        let purpose = ParamInputPurpose::IceFreezeTtl;
+        let buffer = purpose.default_buffer().to_string();
+        self.modal = Some(Modal::ParamInput {
+            purpose,
+            buffer,
+            error: None,
+        });
     }
 
     fn propose_ice_thaw(&mut self) {
@@ -684,6 +678,20 @@ impl App {
                 .map(|l| format!(".{l}"))
                 .unwrap_or_default(),
         );
+        // Drain takes an operator-typed window, so it routes
+        // through ParamInput rather than building a Confirm
+        // directly with the hardcoded default.
+        if matches!(kind, NodeActionKind::Drain) {
+            use crate::widgets::param_input::ParamInputPurpose;
+            let purpose = ParamInputPurpose::DrainWindow { node, node_display };
+            let buffer = purpose.default_buffer().to_string();
+            self.modal = Some(Modal::ParamInput {
+                purpose,
+                buffer,
+                error: None,
+            });
+            return;
+        }
         let action = match kind {
             NodeActionKind::Cordon => crate::widgets::confirm::ConfirmAction::Cordon {
                 node,
@@ -693,11 +701,7 @@ impl App {
                 node,
                 node_display,
             },
-            NodeActionKind::Drain => crate::widgets::confirm::ConfirmAction::Drain {
-                node,
-                node_display,
-                drain_for: DEFAULT_DRAIN_WINDOW,
-            },
+            NodeActionKind::Drain => unreachable!("Drain handled above"),
             NodeActionKind::EnterMaintenance => {
                 crate::widgets::confirm::ConfirmAction::EnterMaintenance {
                     node,
@@ -728,6 +732,13 @@ impl App {
     }
 
     fn on_modal_key(&mut self, code: KeyCode, _mods: KeyModifiers) {
+        // ParamInput is a typing surface — every Char (including
+        // `q`) goes into the buffer, so it must be dispatched
+        // before the normal `q`/Esc dismiss logic.
+        if matches!(self.modal, Some(Modal::ParamInput { .. })) {
+            self.on_param_input_key(code);
+            return;
+        }
         match code {
             // Help overlay toggles off on `?` as well as the
             // standard dismiss keys.
@@ -756,10 +767,95 @@ impl App {
                     Some(Modal::PickNode { purpose, cursor }) => {
                         self.commit_pick(purpose, cursor);
                     }
+                    // ParamInput is intercepted earlier in this
+                    // function; reaching here would be a bug.
+                    Some(Modal::ParamInput { .. }) => {}
                     Some(Modal::Help) | None => {}
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Absorb a single keypress into the ParamInput modal's
+    /// buffer. Backspace pops, Enter parses+commits (or stashes
+    /// an error), Esc cancels the whole modal, and any printable
+    /// char extends the buffer.
+    fn on_param_input_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => self.modal = None,
+            KeyCode::Enter => self.commit_param_input(),
+            KeyCode::Backspace => {
+                if let Some(Modal::ParamInput { buffer, error, .. }) = self.modal.as_mut() {
+                    buffer.pop();
+                    *error = None;
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(Modal::ParamInput { buffer, error, .. }) = self.modal.as_mut() {
+                    buffer.push(c);
+                    *error = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Try to parse the current ParamInput buffer; on success,
+    /// transition to a `Confirm` modal carrying the parsed
+    /// value. On failure, restash the modal with an error
+    /// string so the operator can keep editing.
+    fn commit_param_input(&mut self) {
+        use crate::widgets::param_input::{parse_duration, ParamInputPurpose};
+        let modal = self.modal.take();
+        let Some(Modal::ParamInput { purpose, buffer, .. }) = modal else {
+            return;
+        };
+        let parsed = match parse_duration(&buffer) {
+            Ok(d) => d,
+            Err(err) => {
+                self.modal = Some(Modal::ParamInput {
+                    purpose,
+                    buffer,
+                    error: Some(err),
+                });
+                return;
+            }
+        };
+        let (min, max) = purpose.range();
+        if parsed < min || parsed > max {
+            self.modal = Some(Modal::ParamInput {
+                purpose,
+                buffer,
+                error: Some(format!(
+                    "out of range ({}..={})",
+                    crate::widgets::param_input::fmt_duration(min),
+                    crate::widgets::param_input::fmt_duration(max),
+                )),
+            });
+            return;
+        }
+        match purpose {
+            ParamInputPurpose::DrainWindow { node, node_display } => {
+                self.modal = Some(Modal::Confirm(
+                    crate::widgets::confirm::ConfirmAction::Drain {
+                        node,
+                        node_display,
+                        drain_for: parsed,
+                    },
+                ));
+            }
+            ParamInputPurpose::IceFreezeTtl => {
+                use net_sdk::deck::{simulate_ice_proposal, IceActionProposal};
+                let action = IceActionProposal::FreezeCluster { ttl: parsed };
+                let blast = simulate_ice_proposal(&self.snapshot, &action);
+                self.modal = Some(Modal::Confirm(
+                    crate::widgets::confirm::ConfirmAction::IceFreezeCluster {
+                        ttl: parsed,
+                        blast,
+                    },
+                ));
+            }
         }
     }
 
@@ -1051,6 +1147,15 @@ impl App {
                     &self.snapshot,
                     this_node,
                     *cursor,
+                );
+            }
+            Some(Modal::ParamInput { purpose, buffer, error }) => {
+                widgets::param_input::render(
+                    frame,
+                    area,
+                    purpose,
+                    buffer,
+                    error.as_deref(),
                 );
             }
             None => {}

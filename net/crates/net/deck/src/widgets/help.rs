@@ -36,7 +36,7 @@ const NAVIGATION: &[Binding] = &[
 const ADMIN: &[Binding] = &[
     Binding { keys: "c",   desc: "LIST: cordon (cursored node)" },
     Binding { keys: "C",   desc: "LIST: uncordon" },
-    Binding { keys: "d",   desc: "LIST: drain (5min window)" },
+    Binding { keys: "d",   desc: "LIST: drain (prompts for window)" },
     Binding { keys: "m",   desc: "LIST: enter maintenance" },
     Binding { keys: "M",   desc: "LIST: exit maintenance" },
     Binding { keys: "a",   desc: "LIST: clear avoid list" },
@@ -46,7 +46,7 @@ const ADMIN: &[Binding] = &[
 ];
 
 const ICE: &[Binding] = &[
-    Binding { keys: "F",   desc: "LIST: ICE freeze cluster (60s ttl)" },
+    Binding { keys: "F",   desc: "LIST: ICE freeze cluster (prompts for ttl)" },
     Binding { keys: "T",   desc: "LIST: ICE thaw cluster" },
     Binding { keys: "A",   desc: "LIST: ICE flush avoid lists (global)" },
     Binding { keys: "R",   desc: "DAEMON: ICE force-restart (bypass backoff)" },
