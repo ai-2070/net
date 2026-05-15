@@ -893,6 +893,7 @@ dependencies = [
  "bytes",
  "color-eyre",
  "crossterm",
+ "futures",
  "parking_lot",
  "ratatui",
  "tokio",
