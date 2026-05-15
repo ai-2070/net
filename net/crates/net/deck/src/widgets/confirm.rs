@@ -95,6 +95,13 @@ pub enum ConfirmAction {
     /// (`AvoidScope::Global`). Reads from
     /// `ice().flush_avoid_lists(scope)`.
     IceFlushAvoidLists { blast: BlastRadius },
+    /// ICE break-glass: abort an in-flight migration on the
+    /// node that hosts it. Reads from
+    /// `ice().kill_migration(migration)`.
+    IceKillMigration {
+        migration: u64,
+        blast: BlastRadius,
+    },
 }
 
 impl ConfirmAction {
@@ -107,6 +114,7 @@ impl ConfirmAction {
                 | Self::IceThawCluster { .. }
                 | Self::IceForceRestartDaemon { .. }
                 | Self::IceFlushAvoidLists { .. }
+                | Self::IceKillMigration { .. }
         )
     }
 
@@ -118,7 +126,8 @@ impl ConfirmAction {
             Self::IceFreezeCluster { blast, .. }
             | Self::IceThawCluster { blast }
             | Self::IceForceRestartDaemon { blast, .. }
-            | Self::IceFlushAvoidLists { blast } => Some(blast),
+            | Self::IceFlushAvoidLists { blast }
+            | Self::IceKillMigration { blast, .. } => Some(blast),
             _ => None,
         }
     }
@@ -186,6 +195,9 @@ impl ConfirmAction {
             ),
             Self::IceFlushAvoidLists { .. } => {
                 "ICE  flush avoid lists  ·  global scope".to_string()
+            }
+            Self::IceKillMigration { migration, .. } => {
+                format!("ICE  kill migration  ·  0x{migration:x}")
             }
         }
     }
@@ -271,6 +283,12 @@ impl ConfirmAction {
                 "flushes avoid-list entries cluster-wide".to_string(),
                 "every node clears its local avoid list".to_string(),
                 "reconcile may re-add entries on the next tick".to_string(),
+                "ICE — multi-op signed; lands on the admin chain".to_string(),
+            ],
+            Self::IceKillMigration { .. } => vec![
+                "aborts the in-flight migration on its host node".to_string(),
+                "MigrationOrchestrator drops the daemon's record".to_string(),
+                "no-op on nodes that aren't hosting this migration".to_string(),
                 "ICE — multi-op signed; lands on the admin chain".to_string(),
             ],
         }

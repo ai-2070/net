@@ -19,10 +19,11 @@ pub enum Tab {
     Logs,
     Audit,
     Replicas,
+    Migrations,
 }
 
 impl Tab {
-    pub fn all() -> [Tab; 7] {
+    pub fn all() -> [Tab; 8] {
         [
             Tab::NetMap,
             Tab::List,
@@ -31,6 +32,7 @@ impl Tab {
             Tab::Logs,
             Tab::Audit,
             Tab::Replicas,
+            Tab::Migrations,
         ]
     }
 
@@ -43,6 +45,7 @@ impl Tab {
             Tab::Logs => "LOGS",
             Tab::Audit => "AUDIT",
             Tab::Replicas => "REPLICAS",
+            Tab::Migrations => "MIGRATIONS",
         }
     }
 
@@ -88,6 +91,9 @@ pub struct App {
     /// Cursor on the REPLICAS tab — index into the replicas
     /// map's sorted-by-chain order.
     pub replica_cursor: usize,
+    /// Cursor on the MIGRATIONS tab — index into
+    /// `snapshot.in_flight_migrations`.
+    pub migration_cursor: usize,
     /// Active modal overlay (confirmation prompt, future
     /// signature collector, future help screen). When `Some`,
     /// the modal absorbs key input until dismissed.
@@ -170,6 +176,7 @@ impl App {
             daemon_cursor: DaemonCursor::default(),
             list_cursor: 0,
             replica_cursor: 0,
+            migration_cursor: 0,
             modal: None,
         }
     }
@@ -229,6 +236,7 @@ impl App {
             KeyCode::Char('5') => self.current = Tab::Logs,
             KeyCode::Char('6') => self.current = Tab::Audit,
             KeyCode::Char('7') => self.current = Tab::Replicas,
+            KeyCode::Char('8') => self.current = Tab::Migrations,
             // DAEMON tab navigation. `j`/`k` move within the
             // current group's members; `J`/`K` step to the
             // next / previous group. No-op on other tabs.
@@ -275,6 +283,17 @@ impl App {
             }
             KeyCode::Char('k') if self.current == Tab::Replicas => {
                 self.replica_cursor = self.replica_cursor.saturating_sub(1);
+            }
+            KeyCode::Char('j') if self.current == Tab::Migrations => {
+                self.migration_cursor = self.migration_cursor.saturating_add(1);
+                self.clamp_migration_cursor();
+            }
+            KeyCode::Char('k') if self.current == Tab::Migrations => {
+                self.migration_cursor = self.migration_cursor.saturating_sub(1);
+            }
+            // ICE kill-migration on the cursored migration row.
+            KeyCode::Char('K') if self.current == Tab::Migrations => {
+                self.propose_ice_kill_migration();
             }
             // LIST tab actions on the cursored node: `c` cordon,
             // `C` uncordon, `d` drain (5-minute default window).
@@ -419,6 +438,35 @@ impl App {
         } else if self.replica_cursor >= n {
             self.replica_cursor = n - 1;
         }
+    }
+
+    fn clamp_migration_cursor(&mut self) {
+        let n = self.snapshot.in_flight_migrations.len();
+        if n == 0 {
+            self.migration_cursor = 0;
+        } else if self.migration_cursor >= n {
+            self.migration_cursor = n - 1;
+        }
+    }
+
+    fn propose_ice_kill_migration(&mut self) {
+        use net_sdk::deck::{simulate_ice_proposal, IceActionProposal};
+        let Some(m) = self
+            .snapshot
+            .in_flight_migrations
+            .get(self.migration_cursor)
+        else {
+            return;
+        };
+        let migration = m.daemon_origin;
+        let action = IceActionProposal::KillMigration { migration };
+        let blast = simulate_ice_proposal(&self.snapshot, &action);
+        self.modal = Some(Modal::Confirm(
+            crate::widgets::confirm::ConfirmAction::IceKillMigration {
+                migration,
+                blast,
+            },
+        ));
     }
 
     /// Look up the NodeId at the LIST cursor position. Returns
@@ -599,6 +647,10 @@ impl App {
                     );
                     dispatch_ice(&deck, proposal).await;
                 }
+                ConfirmAction::IceKillMigration { migration, .. } => {
+                    let proposal = deck.ice().kill_migration(migration);
+                    dispatch_ice(&deck, proposal).await;
+                }
             }
         });
     }
@@ -665,6 +717,12 @@ impl App {
                 chunks[3],
                 Some(&self.snapshot),
                 self.replica_cursor,
+            ),
+            Tab::Migrations => tabs::migrations::render(
+                frame,
+                chunks[3],
+                Some(&self.snapshot),
+                self.migration_cursor,
             ),
         }
         widgets::footer::render(frame, chunks[4]);
