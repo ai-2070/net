@@ -1,0 +1,23 @@
+web/src/components/DocsSidebar.tsx
+  s_e461293ef945b9::t_1224d2d3af0f61 46,49-50,54-55,58,62,64-65,67,70-71,75,85,89,93,96,99,101-102,104-108,112-113,120,122-123,139,142,146,148,150-151,154-168,173,175-176,182-188,190-193,197-205,207-215,228-297
+web/src/app/docs/layout.tsx
+  s_e461293ef945b9::t_41f3c7f43528f2 25
+web/src/components/DocsDrawer.tsx
+  s_e461293ef945b9::t_77b35418f39850 119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "0d07ec37ef514cc9b19a0c3adf590f40c73025c8",
+  "prompts": {},
+  "sessions": {
+    "s_e461293ef945b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b86f732-4bc6-49f3-a4d3-0c57194c40f4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
