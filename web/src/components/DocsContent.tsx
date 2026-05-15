@@ -21,8 +21,9 @@ const NET_THEME = {
     "editor.background": "#0f1410",
   },
   tokenColors: [
-    // default fg
-    { settings: { foreground: "#d4dcd0" } },
+    // default fg — cool slate so anything unscoped reads as ambient terminal
+    // text rather than full-white prose. Specific scopes below punch through.
+    { settings: { foreground: "#a8b5c0" } },
     // comments
     {
       scope: [
@@ -124,11 +125,12 @@ const NET_THEME = {
       ],
       settings: { foreground: "#e8c44a" },
     },
-    // generic variables — default ink. Specific roles below (parameters,
-    // fields, properties) override via more-specific scopes.
+    // generic variables — cool slate. Distinct from the bright keyword
+    // cyan and sky-blue labels; reads as ambient identifier text.
+    // Specific roles below (parameters, fields, properties) override.
     {
       scope: ["variable", "variable.other"],
-      settings: { foreground: "#d4dcd0" },
+      settings: { foreground: "#a8b5c0" },
     },
     // object keys / struct fields / function parameters / kwargs / attrs
     // — sky blue. These are the "labels" of code (the names of things in
