@@ -1,0 +1,22 @@
+net/crates/net/deck/src/runtime.rs
+  s_3bbc444b3ef3e5::t_2996c7a6ef0a0c 97-99
+  s_3bbc444b3ef3e5::t_c4acd77a07f70f 167-188,193-216
+net/crates/net/sdk/src/meshos.rs
+  s_3bbc444b3ef3e5::t_742a96e4c2e99d 108-117
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "3fadfffa08ba06af8f1e58bf0e0a20f98e46b6cf",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
