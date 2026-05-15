@@ -1,3 +1,18 @@
+//! DATAFORTS tab — renders the live `BlobMetricsSnapshot` from
+//! the local mesh blob adapter. With samples mode the runtime
+//! pre-fills realistic counters; in default mode the adapter
+//! is unhooked and the tab shows an empty state explaining
+//! that.
+//!
+//! Layout:
+//! - status bar: capacity / used / disk-ratio / health-gate
+//! - left column: store + fetch + GC counters
+//! - right column: overflow counter family (per-reason)
+
+use net_sdk::dataforts::{
+    evaluate_health_gate, BlobMetricsSnapshot, HealthGateAction,
+    HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span},
@@ -5,177 +20,188 @@ use ratatui::{
     Frame,
 };
 
-use crate::{nodes, theme};
+use crate::{theme, widgets};
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, tick: u64) {
+pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&BlobMetricsSnapshot>) {
+    let Some(snap) = snapshot else {
+        render_empty(frame, area);
+        return;
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // mock banner
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(area);
-
-    render_mock_banner(frame, rows[0]);
-    render_summary(frame, rows[1]);
-    render_pool(frame, rows[2], tick);
+    render_status(frame, rows[0], snap);
+    render_body(frame, rows[1], snap);
 }
 
-fn render_mock_banner(frame: &mut Frame<'_>, area: Rect) {
-    let line = Line::from(vec![
-        Span::styled("  ⚠ ", theme::amber()),
-        Span::styled("MOCK", theme::amber()),
-        Span::styled(
-            "  ·  Dataforts SDK pending — visuals below are illustrative, not live data",
-            theme::dim(),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-fn render_summary(frame: &mut Frame<'_>, area: Rect) {
+fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
         .title(Line::from(vec![
             Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-            Span::styled("MESH.STORAGE", theme::green_hi()),
+            Span::styled("DATAFORTS", theme::green_hi()),
+            Span::styled("    no adapter wired", theme::chrome()),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    widgets::empty::render(
+        frame,
+        inner,
+        "no blob adapter attached to this runtime",
+        "run with --features samples for a pre-populated fixture, or wire a MeshBlobAdapter",
+    );
+}
+
+fn render_status(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSnapshot) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::rule())
+        .title(Line::from(vec![
+            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+            Span::styled("BLOB.ADAPTER", theme::green_hi()),
         ]));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let used = snap.disk_used_bytes;
+    let cap = snap.disk_capacity_bytes;
+    let ratio = if cap == 0 {
+        0.0
+    } else {
+        used as f64 / cap as f64
+    };
+    let pct = (ratio * 100.0) as u16;
+    let pct_clamped = pct.min(100);
+
+    let (bar_color, bar_label, bar_style) = bar_style_for(ratio);
+    let gate = evaluate_health_gate(used, cap, false);
+    let (gate_text, gate_style) = match gate {
+        HealthGateAction::Emit => ("UNHEALTHY", theme::red()),
+        HealthGateAction::Clear | HealthGateAction::Unchanged => ("healthy", theme::green()),
+    };
+
     let line = Line::from(vec![
-        Span::styled("pressure ", theme::chrome()),
-        bar(63, 30, theme::GREEN_HI),
-        Span::styled("  63% ", theme::green_hi()),
-        Span::styled("· STEADY    ", theme::dim()),
-        Span::styled("watermark ", theme::chrome()),
-        Span::styled("high·85 low·30    ", theme::text()),
-        Span::styled("recall every ", theme::chrome()),
-        Span::styled("1.4s", theme::text()),
+        Span::styled("disk ", theme::chrome()),
+        bar(pct_clamped, 28, bar_color),
+        Span::styled(format!("  {pct_clamped}% "), bar_style),
+        Span::styled(
+            format!("({} / {})    ", fmt_bytes(used), fmt_bytes(cap)),
+            theme::dim(),
+        ),
+        Span::styled("gate ", theme::chrome()),
+        Span::styled(gate_text, gate_style),
+        Span::styled(
+            format!(
+                "    thresholds emit≥{:.0}% clear≤{:.0}%    ",
+                HEALTH_GATE_EMIT_THRESHOLD * 100.0,
+                HEALTH_GATE_CLEAR_THRESHOLD * 100.0
+            ),
+            theme::dim(),
+        ),
+        Span::styled(bar_label, bar_style),
     ]);
     frame.render_widget(Paragraph::new(line), inner);
 }
 
-fn render_pool(frame: &mut Frame<'_>, area: Rect, tick: u64) {
+fn render_body(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSnapshot) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
-    render_nodes(frame, cols[0]);
-    render_events(frame, cols[1], tick);
+    render_io_panel(frame, cols[0], snap);
+    render_overflow_panel(frame, cols[1], snap);
 }
 
-fn render_nodes(frame: &mut Frame<'_>, area: Rect) {
+fn render_io_panel(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSnapshot) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
         .title(Line::from(vec![
             Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-            Span::styled("STORAGE.POOL", theme::green_hi()),
-            Span::styled("    5 nodes · 892 GB cap", theme::chrome()),
+            Span::styled("STORE / FETCH / GC", theme::green_hi()),
         ]));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Min(0),
-        ])
-        .split(inner);
-
-    // Storage-pool members from the canonical fixture: the three
-    // datafort-kind nodes plus two compute nodes that absorb
-    // blob overflow.
-    let pool: [(&str, u16, &str); 5] = [
-        ("0xd4ff", 76, "evictable"),
-        ("0x3599", 69, "steady"),
-        ("0xf206", 57, "steady"),
-        ("0xeba8", 76, "evictable"),
-        ("0x82ee", 37, "absorbing"),
+    let lines = vec![
+        kv("blobs_stored_total", snap.blobs_stored_total),
+        kv("blobs_fetched_total", snap.blobs_fetched_total),
+        kv_bytes("bytes_stored_total", snap.bytes_stored_total),
+        kv("gc_swept_total", snap.gc_swept_total),
     ];
-    for (i, (id, pct, tag)) in pool.iter().enumerate() {
-        let tag_color = match *tag {
-            "evictable" => theme::AMBER,
-            "absorbing" => theme::CYAN,
-            _ => theme::TEXT_DIM,
-        };
-        let mut spans = nodes::id_spans(id);
-        spans.push(Span::styled("  ", theme::chrome()));
-        spans.push(bar(*pct, 32, theme::GREEN_HI));
-        spans.push(Span::styled(format!("  {pct}%  "), theme::text()));
-        spans.push(Span::styled(*tag, ratatui::style::Style::default().fg(tag_color)));
-        frame.render_widget(Paragraph::new(Line::from(spans)), rows[i]);
-    }
-}
-
-fn render_events(frame: &mut Frame<'_>, area: Rect, tick: u64) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::rule())
-        .title(Line::from(vec![
-            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-            Span::styled("RECENT.EVENTS", theme::green_hi()),
-        ]));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let base = tick / 2;
-
-    // (kind, subject_kind, subject_id, target_id_or_none, detail)
-    // - cool: a blob cools on a host node
-    // - absorb: a node opens to absorb overflow
-    // - pull: a blob migrates between nodes (target shown)
-    enum Subject {
-        Blob(&'static str),
-        Node(&'static str),
-    }
-    let entries: [(u64, &str, Subject, Option<&str>, &str); 7] = [
-        (base + 0,  "cool",   Subject::Blob("blob.0x3457"), Some("0xd4ff"), "rate 0.06 · evictable"),
-        (base + 4,  "cool",   Subject::Blob("blob.0x8366"), Some("0x3599"), "rate 0.11 · evictable"),
-        (base + 8,  "cool",   Subject::Blob("blob.0xd93b"), Some("0xd4ff"), "rate 0.09 · evictable"),
-        (base + 13, "cool",   Subject::Blob("blob.0xa43f"), Some("0xf206"), "rate 0.17 · evictable"),
-        (base + 17, "cool",   Subject::Blob("blob.0x4b04"), Some("0xeba8"), "rate 0.10 · evictable"),
-        (base + 21, "absorb", Subject::Node("0x82ee"),      None,           "free 65%  · open"),
-        (base + 25, "pull",   Subject::Blob("blob.0x29c1"), Some("0xd4ff"), "→ 0xeba8 delta 2.4KB"),
-    ];
-
-    let lines: Vec<Line> = entries
-        .iter()
-        .map(|(t, kind, subj, host, detail)| {
-            let kind_color = match *kind {
-                "cool" => theme::CYAN,
-                "absorb" => theme::GREEN_HI,
-                "pull" => theme::AMBER,
-                _ => theme::TEXT,
-            };
-            let mut spans = vec![
-                Span::styled(fmt_ts(*t), theme::chrome()),
-                Span::styled("  [", theme::chrome()),
-                Span::styled(*kind, ratatui::style::Style::default().fg(kind_color)),
-                Span::styled("]  ", theme::chrome()),
-            ];
-            match subj {
-                Subject::Blob(b) => spans.push(Span::styled(*b, theme::text())),
-                Subject::Node(id) => spans.extend(nodes::id_spans(id)),
-            }
-            if let Some(host_id) = host {
-                spans.push(Span::styled("  @ ", theme::chrome()));
-                spans.extend(nodes::id_spans_styled(host_id, theme::dim()));
-            }
-            spans.push(Span::styled("  ", theme::chrome()));
-            spans.push(Span::styled(*detail, theme::dim()));
-            Line::from(spans)
-        })
-        .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_overflow_panel(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSnapshot) {
+    let o = &snap.overflow;
+    let (active_text, active_style) = if o.active {
+        ("ACTIVE", theme::amber())
+    } else {
+        ("idle", theme::dim())
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::rule())
+        .title(Line::from(vec![
+            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+            Span::styled("OVERFLOW", theme::green_hi()),
+            Span::styled("    ", theme::chrome()),
+            Span::styled(active_text, active_style),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = vec![
+        kv("pushes_admitted_total", o.pushes_admitted_total),
+        kv("push_errors_total", o.push_errors_total),
+        kv_bytes("pushed_bytes_total", o.pushed_bytes_total),
+        kv("rejected_no_target", o.rejected_no_target_total),
+        kv("rejected_no_storage_cap", o.rejected_no_storage_cap_total),
+        kv("rejected_not_participating", o.rejected_not_participating_total),
+        kv("rejected_sender_not_overflowing", o.rejected_sender_not_overflowing_total),
+        kv("rejected_unhealthy", o.rejected_unhealthy_total),
+        kv("rejected_scope_mismatch", o.rejected_scope_mismatch_total),
+        kv("rejected_insufficient_disk", o.rejected_insufficient_disk_total),
+        kv("high_water_triggered", o.high_water_triggered_total),
+        kv("low_water_cleared", o.low_water_cleared_total),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn kv(label: &'static str, value: u64) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {label:<32}"), theme::chrome()),
+        Span::styled(format!("{value}"), value_style(value)),
+    ])
+}
+
+fn kv_bytes(label: &'static str, value: u64) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {label:<32}"), theme::chrome()),
+        Span::styled(fmt_bytes(value), value_style(value)),
+    ])
+}
+
+/// Zeros dim; non-zero brighter so the operator's eye lands on
+/// counters that have actual activity behind them.
+fn value_style(value: u64) -> ratatui::style::Style {
+    if value == 0 {
+        theme::dim()
+    } else {
+        theme::text()
+    }
+}
+
+fn bar_style_for(ratio: f64) -> (ratatui::style::Color, &'static str, ratatui::style::Style) {
+    if ratio >= HEALTH_GATE_EMIT_THRESHOLD {
+        (theme::RED, "EMIT", theme::red())
+    } else if ratio >= HEALTH_GATE_CLEAR_THRESHOLD {
+        (theme::AMBER, "WATCH", theme::amber())
+    } else {
+        (theme::GREEN_HI, "STEADY", theme::dim())
+    }
 }
 
 fn bar(pct: u16, width: u16, color: ratatui::style::Color) -> Span<'static> {
@@ -192,9 +218,23 @@ fn bar(pct: u16, width: u16, color: ratatui::style::Color) -> Span<'static> {
     Span::styled(s, ratatui::style::Style::default().fg(color))
 }
 
-fn fmt_ts(t: u64) -> String {
-    let mm = (t / 60) % 60;
-    let ss = t % 60;
-    let ms = (t.wrapping_mul(41)) % 1000;
-    format!("{mm:02}:{ss:02}.{ms:03}")
+/// Human-readable bytes — KB/MB/GB/TB at the closest power of
+/// 1024. Single-decimal precision keeps the column stable
+/// without losing too much resolution.
+fn fmt_bytes(b: u64) -> String {
+    const K: u64 = 1 << 10;
+    const M: u64 = 1 << 20;
+    const G: u64 = 1 << 30;
+    const T: u64 = 1 << 40;
+    if b >= T {
+        format!("{:.1} TB", b as f64 / T as f64)
+    } else if b >= G {
+        format!("{:.1} GB", b as f64 / G as f64)
+    } else if b >= M {
+        format!("{:.1} MB", b as f64 / M as f64)
+    } else if b >= K {
+        format!("{:.1} KB", b as f64 / K as f64)
+    } else {
+        format!("{b} B")
+    }
 }

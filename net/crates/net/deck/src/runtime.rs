@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use net_sdk::dataforts::BlobMetrics;
 use net_sdk::deck::{AdminVerifier, DeckClient, OperatorIdentity, OperatorRegistry};
 use net_sdk::meshos::{EntityKeypair, MeshOsConfig, MeshOsDaemonSdk, MigrationSnapshotSource};
 
@@ -31,11 +32,22 @@ pub struct Harness {
     #[cfg(feature = "samples")]
     _daemons: Vec<net_sdk::meshos::MeshOsDaemonHandle>,
     deck: Arc<DeckClient>,
+    /// Blob-adapter metrics handle. In samples mode this is
+    /// pre-populated with representative values so the
+    /// DATAFORTS tab renders concrete numbers; in default mode
+    /// it stays `None` and the tab shows its "no adapter
+    /// wired" empty state until a real `MeshBlobAdapter` is
+    /// hooked up.
+    blob_metrics: Option<Arc<BlobMetrics>>,
 }
 
 impl Harness {
     pub fn deck(&self) -> Arc<DeckClient> {
         Arc::clone(&self.deck)
+    }
+
+    pub fn blob_metrics(&self) -> Option<Arc<BlobMetrics>> {
+        self.blob_metrics.clone()
     }
 }
 
@@ -86,11 +98,22 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     #[cfg(feature = "samples")]
     let _daemons = samples::install(&sdk)?;
 
+    // BlobMetrics in samples mode: pre-fill with realistic
+    // counters so the DATAFORTS tab paints concrete numbers
+    // out of the box. Default mode leaves it `None` so the
+    // tab's empty state explains it's waiting on adapter
+    // wiring.
+    #[cfg(feature = "samples")]
+    let blob_metrics = Some(samples::install_blob_metrics());
+    #[cfg(not(feature = "samples"))]
+    let blob_metrics: Option<Arc<BlobMetrics>> = None;
+
     Ok(Harness {
         _sdk: sdk,
         #[cfg(feature = "samples")]
         _daemons,
         deck,
+        blob_metrics,
     })
 }
 
@@ -107,12 +130,39 @@ mod samples {
     use bytes::Bytes;
     use net_sdk::capabilities::CapabilityFilter;
     use net_sdk::compute::CausalEvent;
+    use net_sdk::dataforts::BlobMetrics;
     use net_sdk::meshos::{
         ChainId, DaemonError, EntityKeypair, HealthProbe, LocalityProbe, MeshDaemon,
         MeshOsDaemonHandle, MeshOsDaemonSdk, MeshOsEvent, MigrationPhaseSnapshot,
         MigrationSnapshot, MigrationSnapshotSource, NodeHealth, NodeId, PlacementIntent,
         ReplicaUpdate,
     };
+
+    /// Seed a `BlobMetrics` with a realistic-looking steady
+    /// state so the DATAFORTS tab paints concrete numbers in
+    /// samples mode. Numbers are static — no background tick
+    /// bumps them, matching the "samples are a fixture, not
+    /// an event seeder" rule the rest of this module follows.
+    pub fn install_blob_metrics() -> Arc<BlobMetrics> {
+        let m = BlobMetrics::new();
+        // 1 TB cap, ~256 GB used → 0.25 disk ratio (well below
+        // the 0.85 hysteresis-clear floor).
+        let cap_bytes: u64 = 1 << 40;
+        let used_bytes: u64 = 256 * (1 << 30);
+        m.set_disk_capacity_bytes(cap_bytes);
+        m.set_disk_used_bytes(used_bytes);
+        // A few hundred stores + fetches so the rate columns
+        // aren't all zero. `record_store` bumps both
+        // `blobs_stored_total` and `bytes_stored_total`.
+        for size in [4_096u64, 16_384, 65_536, 4_096, 1_048_576, 4_096, 32_768] {
+            m.record_store(size);
+        }
+        for _ in 0..14 {
+            m.record_fetch();
+        }
+        m.record_gc_swept(2);
+        Arc::new(m)
+    }
 
     /// Synthetic migration snapshot source — returns a static
     /// list of in-flight migrations spread across the

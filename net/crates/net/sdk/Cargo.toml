@@ -91,6 +91,12 @@ meshos = ["compute", "net/meshos"]
 # slices as the substrate's signed admin chain + blast-radius
 # simulator come online.
 deck = ["meshos"]
+# Dataforts — mesh-native blob storage adapter. Re-exports
+# `adapter::net::dataforts::*` so operator-facing surfaces
+# (the deck's DATAFORTS tab) can render real `BlobMetrics`
+# instead of a fixture. Pulls in redex + redex-disk + blake3
+# transitively via `net/dataforts`.
+dataforts = ["net/dataforts"]
 # Everything that runs locally (mesh + storage/state + security +
 # compute + groups, no external transports). The default shape for
 # a single-node or LAN-only deployment.

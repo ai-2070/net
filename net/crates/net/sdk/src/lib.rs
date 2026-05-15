@@ -41,6 +41,8 @@ pub mod config;
 pub mod cortex;
 #[cfg(feature = "deck")]
 pub mod deck;
+#[cfg(feature = "dataforts")]
+pub mod dataforts;
 pub mod error;
 #[cfg(feature = "groups")]
 pub mod groups;

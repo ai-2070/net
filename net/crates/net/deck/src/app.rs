@@ -93,6 +93,11 @@ pub struct App {
     /// tab — executor rejections, drain failures, constraint
     /// drops.
     pub failures_tail: crate::streams::FailuresTail,
+    /// Blob-adapter metrics handle. `Some` when a
+    /// `MeshBlobAdapter` is wired (or samples mode pre-fills
+    /// it); `None` when the adapter is unhooked. The DATAFORTS
+    /// tab snapshots from this on each render.
+    pub blob_metrics: Option<Arc<net_sdk::dataforts::BlobMetrics>>,
     /// Cursor on the DAEMON tab's lineage tree. Indices into
     /// the live group list — `j`/`k` move the cursor; the
     /// detail pane on the right reflects whichever member is
@@ -228,6 +233,7 @@ impl App {
         logs_tail: crate::streams::LogsTail,
         audit_tail: crate::streams::AuditTail,
         failures_tail: crate::streams::FailuresTail,
+        blob_metrics: Option<Arc<net_sdk::dataforts::BlobMetrics>>,
     ) -> Self {
         let snapshot = Arc::new(deck.status());
         Self {
@@ -235,6 +241,7 @@ impl App {
             logs_tail,
             audit_tail,
             failures_tail,
+            blob_metrics,
             should_quit: false,
             started: Instant::now(),
             tick: 0,
@@ -1175,7 +1182,10 @@ impl App {
                 Some(&self.snapshot),
                 self.list_cursor,
             ),
-            Tab::Dataforts => tabs::dataforts::render(frame, chunks[3], self.tick),
+            Tab::Dataforts => {
+                let snap = self.blob_metrics.as_ref().map(|m| m.snapshot());
+                tabs::dataforts::render(frame, chunks[3], snap.as_ref());
+            }
             Tab::Daemon => tabs::daemon::render(
                 frame,
                 chunks[3],

@@ -31,6 +31,7 @@ async fn main() -> color_eyre::Result<()> {
 
     let harness = runtime::spawn().await?;
     let deck = harness.deck();
+    let blob_metrics = harness.blob_metrics();
 
     // Phase 4: spawn streaming tails before handing the deck to
     // the App. The handles are kept alive for the App's
@@ -45,7 +46,8 @@ async fn main() -> color_eyre::Result<()> {
         streams::spawn_failures_stream(deck.clone(), failures_tail.clone());
 
     let terminal = ratatui::init();
-    let result = App::new(deck, logs_tail, audit_tail, failures_tail).run(terminal);
+    let result =
+        App::new(deck, logs_tail, audit_tail, failures_tail, blob_metrics).run(terminal);
     ratatui::restore();
 
     // Explicit drop so the harness's tear-down runs before
