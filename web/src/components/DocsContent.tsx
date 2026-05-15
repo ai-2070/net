@@ -436,8 +436,13 @@ const mdxComponents = {
 
   // Pre inside a rehype-pretty-code figure has `data-language` set — CodeBlock
   // already provides the container chrome, so render the pre minimally (just
-  // padding + scroll). Pre WITHOUT data-language is a standalone block (raw
-  // HTML `<pre>`, no fence) — apply full container styling.
+  // padding). Pre WITHOUT data-language is a standalone block (raw HTML
+  // `<pre>`, no fence) — apply full container styling.
+  //
+  // Both variants use `whitespace-pre-wrap break-words` so long lines wrap at
+  // the column edge instead of forcing horizontal scroll. Indentation is
+  // preserved because pre-wrap respects whitespace; break-words handles
+  // unbroken tokens (long hex addresses, urls) that exceed the column.
   pre: (props: {
     children?: ReactNode;
     "data-language"?: string;
@@ -449,13 +454,13 @@ const mdxComponents = {
       return (
         <pre
           {...props}
-          className="overflow-x-auto px-4 py-3 m-0 text-[12.5px] leading-[1.6] font-mono"
+          className="px-4 py-3 m-0 text-[12.5px] leading-[1.6] font-mono whitespace-pre-wrap break-words"
         />
       );
     }
     return (
       <pre
-        className="my-6 border border-line bg-bg-2 px-4 py-3 overflow-x-auto text-[12.5px] leading-[1.6] font-mono"
+        className="my-6 border border-line bg-bg-2 px-4 py-3 text-[12.5px] leading-[1.6] font-mono whitespace-pre-wrap break-words"
         {...props}
       />
     );
