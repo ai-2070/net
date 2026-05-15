@@ -300,14 +300,14 @@ const Callout = ({
   }[variant];
   return (
     <div
-      className={`border-l-2 ${styles.border} ${styles.bg} pl-4 pr-4 py-3 my-5 text-[13px] text-ink leading-[1.65]`}
+      className={`border-l-2 ${styles.border} ${styles.bg} pl-5 pr-5 py-4 my-6 text-[13.5px] text-ink leading-[1.75] font-mono font-light`}
     >
       <div
-        className={`${styles.tag} font-mono text-[10px] tracking-[0.14em] uppercase mb-1.5`}
+        className={`${styles.tag} font-mono text-[10px] tracking-[0.14em] uppercase mb-1.5 font-semibold`}
       >
         {styles.glyph} {label}
       </div>
-      <div className="docs-callout-body">{children}</div>
+      <div className="docs-callout-body [&>p:last-child]:mb-0">{children}</div>
     </div>
   );
 };
@@ -326,10 +326,13 @@ const headingClasses = {
 };
 
 const mdxComponents = {
+  // Mono everywhere, but body weight is light (300) at generous leading so
+  // long-form prose reads cleanly. Headings use medium (500) for hierarchy
+  // without going corporate-bold.
   h1: (props: { children?: ReactNode }) => (
     <h1
-      className={`font-mono text-ink mb-8 mt-2 leading-[1.15] tracking-[0.02em] font-semibold ${headingClasses.base}`}
-      style={{ fontSize: "clamp(26px, 3.2vw, 36px)" }}
+      className={`font-mono text-ink mb-8 mt-2 leading-[1.2] tracking-[0.005em] font-medium ${headingClasses.base}`}
+      style={{ fontSize: "clamp(26px, 3.2vw, 34px)" }}
       {...props}
     />
   ),
@@ -341,7 +344,7 @@ const mdxComponents = {
   ),
   h3: (props: { children?: ReactNode }) => (
     <h3
-      className={`font-mono text-ink mt-12 mb-4 leading-snug tracking-[0.02em] text-[15px] font-semibold scroll-mt-28 ${headingClasses.base}`}
+      className={`font-mono text-ink mt-12 mb-4 leading-snug tracking-[0.01em] text-[17px] font-medium scroll-mt-28 ${headingClasses.base}`}
       {...props}
     />
   ),
@@ -351,18 +354,24 @@ const mdxComponents = {
       {...props}
     />
   ),
+  // Body prose: JetBrains Mono LIGHT (300). The lighter weight breathes
+  // and reads almost like a sans at this size + leading combo, while
+  // keeping the Net mono identity 100%.
   p: (props: { children?: ReactNode }) => (
-    <p className="text-[14.5px] text-ink leading-[1.85] mb-6" {...props} />
+    <p
+      className="font-mono font-light text-[14px] text-ink leading-[1.9] mb-5"
+      {...props}
+    />
   ),
   ul: (props: { children?: ReactNode }) => (
     <ul
-      className="list-disc list-outside pl-6 mb-6 text-[14px] text-ink-dim leading-[1.8] marker:text-accent space-y-2.5"
+      className="font-mono font-light list-disc list-outside pl-6 mb-5 text-[13.5px] text-ink-dim leading-[1.85] marker:text-accent space-y-2"
       {...props}
     />
   ),
   ol: (props: { children?: ReactNode }) => (
     <ol
-      className="list-decimal list-outside pl-6 mb-6 text-[14px] text-ink-dim leading-[1.8] marker:text-accent space-y-2.5"
+      className="font-mono font-light list-decimal list-outside pl-6 mb-5 text-[13.5px] text-ink-dim leading-[1.85] marker:text-accent space-y-2"
       {...props}
     />
   ),
@@ -371,7 +380,7 @@ const mdxComponents = {
   ),
   blockquote: (props: { children?: ReactNode }) => (
     <blockquote
-      className="border-l-2 border-accent bg-accent/[0.04] pl-5 pr-5 py-4 my-7 text-[13.5px] text-ink leading-[1.75] [&>p:last-child]:mb-0"
+      className="font-mono font-light border-l-2 border-accent bg-accent/[0.04] pl-5 pr-5 py-4 my-6 text-[13.5px] text-ink leading-[1.8] [&>p:last-child]:mb-0"
       {...props}
     />
   ),
