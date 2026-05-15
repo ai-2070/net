@@ -18,6 +18,7 @@ mod app;
 mod lineage;
 mod nodes;
 mod runtime;
+mod streams;
 mod tabs;
 mod theme;
 mod widgets;
@@ -31,8 +32,15 @@ async fn main() -> color_eyre::Result<()> {
     let harness = runtime::spawn().await?;
     let deck = harness.deck();
 
+    // Phase 4: spawn streaming tails before handing the deck to
+    // the App. The handle is kept alive for the App's lifetime;
+    // dropping it on shutdown lets the substrate's stream
+    // close cleanly.
+    let logs_tail = streams::LogsTail::new(streams::LOGS_TAIL_CAP);
+    let _logs_stream_task = streams::spawn_logs_stream(deck.clone(), logs_tail.clone());
+
     let terminal = ratatui::init();
-    let result = App::new(deck).run(terminal);
+    let result = App::new(deck, logs_tail).run(terminal);
     ratatui::restore();
 
     // Explicit drop so the harness's tear-down runs before

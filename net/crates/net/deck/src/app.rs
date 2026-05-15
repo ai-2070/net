@@ -77,6 +77,11 @@ pub struct App {
     /// collections are empty to decide between live and
     /// fixture rendering paths.
     pub snapshot: Arc<MeshOsSnapshot>,
+    /// Phase-4 streaming tail for LOGS. Fed by a background
+    /// `subscribe_logs` task; the LOGS render path reads from
+    /// this buffer instead of `snapshot.log_ring`, so the
+    /// operator's session can outlive the substrate ring cap.
+    pub logs_tail: crate::streams::LogsTail,
     /// Cursor on the DAEMON tab's lineage tree. Indices into
     /// the live group list — `j`/`k` move the cursor; the
     /// detail pane on the right reflects whichever member is
@@ -104,10 +109,10 @@ pub struct App {
     /// → Debug → Info.
     pub logs_min_level: net_sdk::deck::LogLevel,
     /// LOGS tab pause: when `Some`, the log grid renders this
-    /// frozen ring instead of `snapshot.log_ring`. Toggled via
+    /// frozen Vec instead of the streaming tail. Toggled via
     /// `[p]` on the LOGS tab. Other tabs keep using the live
     /// snapshot — only the log tail is paused.
-    pub logs_paused: Option<Arc<[net_sdk::deck::LogRecord]>>,
+    pub logs_paused: Option<Vec<net_sdk::deck::LogRecord>>,
     /// LOGS tab substring filter applied to record messages.
     /// Empty = no filter. Edited via `[/]`; survives switching
     /// off the LOGS tab until explicitly cleared.
@@ -197,10 +202,11 @@ pub struct DaemonCursor {
 }
 
 impl App {
-    pub fn new(deck: Arc<DeckClient>) -> Self {
+    pub fn new(deck: Arc<DeckClient>, logs_tail: crate::streams::LogsTail) -> Self {
         let snapshot = Arc::new(deck.status());
         Self {
             current: Tab::NetMap,
+            logs_tail,
             should_quit: false,
             started: Instant::now(),
             tick: 0,
@@ -385,7 +391,7 @@ impl App {
             KeyCode::Char('p') if self.current == Tab::Logs => {
                 self.logs_paused = match self.logs_paused.take() {
                     Some(_) => None,
-                    None => Some(self.snapshot.log_ring.clone()),
+                    None => Some(self.logs_tail.snapshot()),
                 };
             }
             // LOGS: open the substring search prompt. The
@@ -1118,9 +1124,16 @@ impl App {
                 self.daemon_cursor,
             ),
             Tab::Logs => {
+                // Live records come from the streaming tail
+                // (Phase 4); a paused snapshot is a frozen Vec
+                // captured at `[p]`-toggle time.
+                let live;
                 let records: &[net_sdk::deck::LogRecord] = match &self.logs_paused {
                     Some(frozen) => frozen,
-                    None => &self.snapshot.log_ring,
+                    None => {
+                        live = self.logs_tail.snapshot();
+                        &live
+                    }
                 };
                 tabs::logs::render(
                     frame,
