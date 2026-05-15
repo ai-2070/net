@@ -99,6 +99,10 @@ pub struct App {
     /// AUDIT tab filter: cap the visible rows. `None` shows
     /// the full ring; values cycle via `[n]` on the AUDIT tab.
     pub audit_limit: Option<usize>,
+    /// LOGS tab filter: minimum log level to project. Cycled
+    /// via `[f]` on the LOGS tab through Info → Warn → Error
+    /// → Debug → Info.
+    pub logs_min_level: net_sdk::deck::LogLevel,
     /// Active modal overlay (confirmation prompt, future
     /// signature collector, future help screen). When `Some`,
     /// the modal absorbs key input until dismissed.
@@ -191,6 +195,7 @@ impl App {
             migration_cursor: 0,
             audit_force_only: false,
             audit_limit: None,
+            logs_min_level: net_sdk::deck::LogLevel::Info,
             modal: None,
         }
     }
@@ -332,6 +337,17 @@ impl App {
             // the row limit none → 25 → 100 → none.
             KeyCode::Char('f') if self.current == Tab::Audit => {
                 self.audit_force_only = !self.audit_force_only;
+            }
+            // LOGS: cycle the minimum-level threshold.
+            // Info → Warn → Error → Debug → Info.
+            KeyCode::Char('f') if self.current == Tab::Logs => {
+                use net_sdk::deck::LogLevel;
+                self.logs_min_level = match self.logs_min_level {
+                    LogLevel::Info => LogLevel::Warn,
+                    LogLevel::Warn => LogLevel::Error,
+                    LogLevel::Error => LogLevel::Debug,
+                    _ => LogLevel::Info,
+                };
             }
             KeyCode::Char('n') if self.current == Tab::Audit => {
                 self.audit_limit = match self.audit_limit {
@@ -924,9 +940,13 @@ impl App {
                 Some(&self.snapshot),
                 self.daemon_cursor,
             ),
-            Tab::Logs => {
-                tabs::logs::render(frame, chunks[3], self.tick, Some(&self.snapshot))
-            }
+            Tab::Logs => tabs::logs::render(
+                frame,
+                chunks[3],
+                self.tick,
+                Some(&self.snapshot),
+                self.logs_min_level,
+            ),
             Tab::Audit => tabs::audit::render(
                 frame,
                 chunks[3],

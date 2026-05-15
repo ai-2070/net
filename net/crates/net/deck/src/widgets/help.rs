@@ -24,7 +24,7 @@ const NAVIGATION: &[Binding] = &[
     Binding { keys: "j / k",     desc: "cursor down / up" },
     Binding { keys: "g / G",     desc: "cursor to top / bottom" },
     Binding { keys: "J / K",     desc: "DAEMON: next / prev group" },
-    Binding { keys: "f",         desc: "AUDIT: toggle ICE-only filter" },
+    Binding { keys: "f",         desc: "AUDIT/LOGS: cycle filter (ICE-only or min level)" },
     Binding { keys: "n",         desc: "AUDIT: cycle row limit (none/25/100)" },
     Binding { keys: "?",         desc: "toggle this help overlay" },
     Binding { keys: "q / Esc",   desc: "quit (or close modal)" },

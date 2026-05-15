@@ -13,17 +13,18 @@ pub fn render(
     area: Rect,
     tick: u64,
     snapshot: Option<&MeshOsSnapshot>,
+    min_level: LogLevel,
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
         .split(area);
-    render_filter_bar(frame, rows[0]);
-    render_log_grid(frame, rows[1], tick, snapshot);
-    render_status(frame, rows[2], snapshot);
+    render_filter_bar(frame, rows[0], min_level);
+    render_log_grid(frame, rows[1], tick, snapshot, min_level);
+    render_status(frame, rows[2], snapshot, min_level);
 }
 
-fn render_filter_bar(frame: &mut Frame<'_>, area: Rect) {
+fn render_filter_bar(frame: &mut Frame<'_>, area: Rect, min_level: LogLevel) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -34,10 +35,15 @@ fn render_filter_bar(frame: &mut Frame<'_>, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Active level threshold gets the amber accent when it's
+    // suppressing rows; default Info is rendered green to read
+    // as "open / unfiltered."
+    let (level_text, level_style) = level_chip(min_level);
+
     let line = Line::from(vec![
         Span::styled("level ", theme::chrome()),
         Span::styled("[", theme::chrome()),
-        Span::styled("INFO+", theme::green_hi()),
+        Span::styled(level_text, level_style),
         Span::styled("]   ", theme::chrome()),
         Span::styled("node ", theme::chrome()),
         Span::styled("[", theme::chrome()),
@@ -59,11 +65,34 @@ fn render_filter_bar(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Paragraph::new(line), inner);
 }
 
+fn level_chip(min_level: LogLevel) -> (&'static str, ratatui::style::Style) {
+    match min_level {
+        LogLevel::Debug => ("DEBUG+", theme::green_hi()),
+        LogLevel::Info => ("INFO+", theme::green_hi()),
+        LogLevel::Warn => ("WARN+", theme::amber()),
+        LogLevel::Error => ("ERR", theme::red()),
+        _ => ("?", theme::chrome()),
+    }
+}
+
+/// Numeric rank used for "min level" comparisons. Higher means
+/// more severe.
+fn level_rank(l: LogLevel) -> u8 {
+    match l {
+        LogLevel::Debug => 0,
+        LogLevel::Info => 1,
+        LogLevel::Warn => 2,
+        LogLevel::Error => 3,
+        _ => 1,
+    }
+}
+
 fn render_log_grid(
     frame: &mut Frame<'_>,
     area: Rect,
     tick: u64,
     snapshot: Option<&MeshOsSnapshot>,
+    min_level: LogLevel,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -79,18 +108,30 @@ fn render_log_grid(
     let _ = tick;
     let lines: Vec<Line> = match snapshot {
         Some(snap) if !snap.log_ring.is_empty() => {
-            project_live_log_ring(snap, total_rows)
+            project_live_log_ring(snap, total_rows, min_level)
         }
         _ => Vec::new(),
     };
 
     if lines.is_empty() {
-        crate::widgets::empty::render(
-            frame,
-            inner,
-            "no log lines yet",
-            "publish_log() on any registered daemon will appear here",
-        );
+        // Distinguish "no logs at all" from "filter is hiding
+        // everything" — the latter is easy to miss and a common
+        // operator confusion.
+        let any_records = snapshot
+            .map(|s| !s.log_ring.is_empty())
+            .unwrap_or(false);
+        let (head, hint) = if any_records {
+            (
+                "no log lines at this threshold",
+                "press [f] to lower the level filter",
+            )
+        } else {
+            (
+                "no log lines yet",
+                "publish_log() on any registered daemon will appear here",
+            )
+        };
+        crate::widgets::empty::render(frame, inner, head, hint);
         return;
     }
 
@@ -99,15 +140,28 @@ fn render_log_grid(
     frame.render_widget(Paragraph::new(visible.to_vec()), inner);
 }
 
-fn render_status(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeshOsSnapshot>) {
+fn render_status(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: Option<&MeshOsSnapshot>,
+    min_level: LogLevel,
+) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(36)])
         .split(area);
 
-    let count = snapshot.map(|s| s.log_ring.len()).unwrap_or(0);
+    let total = snapshot.map(|s| s.log_ring.len()).unwrap_or(0);
+    let shown = snapshot
+        .map(|s| {
+            s.log_ring
+                .iter()
+                .filter(|r| level_rank(r.level) >= level_rank(min_level))
+                .count()
+        })
+        .unwrap_or(0);
     let left = Line::from(vec![
-        Span::styled(format!("{count} lines  ·  "), theme::chrome()),
+        Span::styled(format!("{shown}/{total} lines  ·  "), theme::chrome()),
         Span::styled("live snapshot", theme::dim()),
         Span::styled("  ·  ", theme::chrome()),
         Span::styled("0 dropped", theme::green_hi()),
@@ -130,9 +184,14 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeshOsSnap
 /// `daemon_id`, `node_id`, `message`. Older entries are at the
 /// front of the ring; we keep that order and let the caller
 /// pick the tail.
-fn project_live_log_ring(snapshot: &MeshOsSnapshot, capacity: usize) -> Vec<Line<'static>> {
+fn project_live_log_ring(
+    snapshot: &MeshOsSnapshot,
+    capacity: usize,
+    min_level: LogLevel,
+) -> Vec<Line<'static>> {
     let mut out: Vec<Line> = Vec::with_capacity(snapshot.log_ring.len().min(capacity));
-    for rec in snapshot.log_ring.iter() {
+    let min = level_rank(min_level);
+    for rec in snapshot.log_ring.iter().filter(|r| level_rank(r.level) >= min) {
         let (level_style, level_pad) = match rec.level {
             LogLevel::Info  => (theme::dim(),   "INFO "),
             LogLevel::Warn  => (theme::amber(), "WARN "),
