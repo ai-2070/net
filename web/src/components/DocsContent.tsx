@@ -299,52 +299,54 @@ const headingClasses = {
 const mdxComponents = {
   h1: (props: { children?: ReactNode }) => (
     <h1
-      className={`font-mono text-ink mb-6 mt-2 leading-[1.15] tracking-[0.02em] font-semibold ${headingClasses.base}`}
+      className={`font-mono text-ink mb-8 mt-2 leading-[1.15] tracking-[0.02em] font-semibold ${headingClasses.base}`}
       style={{ fontSize: "clamp(26px, 3.2vw, 36px)" }}
       {...props}
     />
   ),
   h2: (props: { children?: ReactNode }) => (
     <h2
-      className={`font-mono text-ink mt-12 mb-4 leading-tight tracking-[0.04em] uppercase text-[17px] font-semibold border-l-2 border-accent pl-3 scroll-mt-28 ${headingClasses.base}`}
+      className={`font-mono text-ink mt-16 mb-5 leading-tight tracking-[0.04em] uppercase text-[17px] font-semibold border-l-2 border-accent pl-3 scroll-mt-28 ${headingClasses.base}`}
       {...props}
     />
   ),
   h3: (props: { children?: ReactNode }) => (
     <h3
-      className={`font-mono text-ink mt-8 mb-3 leading-snug tracking-[0.02em] text-[15px] font-semibold scroll-mt-28 ${headingClasses.base}`}
+      className={`font-mono text-ink mt-12 mb-4 leading-snug tracking-[0.02em] text-[15px] font-semibold scroll-mt-28 ${headingClasses.base}`}
       {...props}
     />
   ),
   h4: (props: { children?: ReactNode }) => (
     <h4
-      className={`font-mono text-accent mt-6 mb-2 text-[12px] uppercase tracking-[0.14em] font-semibold scroll-mt-28 ${headingClasses.base}`}
+      className={`font-mono text-accent mt-9 mb-3 text-[12px] uppercase tracking-[0.14em] font-semibold scroll-mt-28 ${headingClasses.base}`}
       {...props}
     />
   ),
   p: (props: { children?: ReactNode }) => (
-    <p className="text-[14.5px] text-ink leading-[1.78] mb-5" {...props} />
+    <p className="text-[14.5px] text-ink leading-[1.85] mb-6" {...props} />
   ),
   ul: (props: { children?: ReactNode }) => (
     <ul
-      className="list-disc list-outside pl-6 mb-5 text-[14px] text-ink-dim leading-[1.75] marker:text-accent space-y-1"
+      className="list-disc list-outside pl-6 mb-6 text-[14px] text-ink-dim leading-[1.8] marker:text-accent space-y-2.5"
       {...props}
     />
   ),
   ol: (props: { children?: ReactNode }) => (
     <ol
-      className="list-decimal list-outside pl-6 mb-5 text-[14px] text-ink-dim leading-[1.75] marker:text-accent space-y-1"
+      className="list-decimal list-outside pl-6 mb-6 text-[14px] text-ink-dim leading-[1.8] marker:text-accent space-y-2.5"
       {...props}
     />
   ),
-  li: (props: { children?: ReactNode }) => <li {...props} />,
+  li: (props: { children?: ReactNode }) => (
+    <li className="[&>p]:mb-2 [&>p:last-child]:mb-0" {...props} />
+  ),
   blockquote: (props: { children?: ReactNode }) => (
     <blockquote
-      className="border-l-2 border-accent bg-accent/[0.04] pl-4 pr-4 py-3 my-6 text-[13px] text-ink leading-[1.65] [&>p:last-child]:mb-0"
+      className="border-l-2 border-accent bg-accent/[0.04] pl-5 pr-5 py-4 my-7 text-[13.5px] text-ink leading-[1.75] [&>p:last-child]:mb-0"
       {...props}
     />
   ),
-  hr: () => <hr className="border-line my-10" />,
+  hr: () => <hr className="border-line my-12" />,
 
   // Inline code only — block code comes through `figure` → `CodeBlock`.
   // Detect block via either `data-language` (rehype-pretty-code) OR

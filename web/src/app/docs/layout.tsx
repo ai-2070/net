@@ -25,7 +25,7 @@ export default function DocsLayout({
           <aside className="hidden lg:block lg:sticky lg:top-24 lg:self-start lg:max-h-[calc(100vh-7rem)] lg:overflow-y-auto pr-3 lg:border-r lg:border-line">
             <DocsSidebar tree={tree} />
           </aside>
-          <main className="min-w-0 max-w-[860px]">{children}</main>
+          <main className="min-w-0 max-w-[740px]">{children}</main>
         </div>
       </div>
     </>
