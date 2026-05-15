@@ -116,7 +116,7 @@ export function DocsDrawer({ tree }: { tree: ClientDocTree }) {
             </button>
           </div>
           <div className="overflow-y-auto px-5 py-5 grow">
-            <DocsSidebar tree={tree} />
+            <DocsSidebar tree={tree} chrome={false} />
           </div>
         </aside>
       </div>

@@ -43,30 +43,36 @@ function countDocs(folder: ClientDocFolder): number {
   return n;
 }
 
-function FileLink({
+function FileRow({
   node,
   active,
+  isLast,
+  depth,
 }: {
   node: ClientDocFile;
   active: string[];
+  isLast: boolean;
+  depth: number;
 }) {
   const on = isActive(node.slug, active);
+  const treeChar = isLast ? "└─" : "├─";
   return (
     <Link
       href={slugHref(node.slug)}
-      className={`group flex items-center gap-2 text-[12px] leading-[1.45] py-[5px] pl-3 pr-2 border-l transition-colors tracking-[0.02em] truncate ${
+      className={`group flex items-center text-[11.5px] leading-[1.55] py-[2px] pr-2 transition-colors ${
         on
-          ? "border-accent text-accent bg-accent/[0.06]"
-          : "border-line text-ink-dim hover:text-ink hover:border-accent-dim hover:bg-bg-2/40"
+          ? "text-accent bg-accent/[0.06]"
+          : "text-ink-dim hover:text-ink hover:bg-bg-2/40"
       }`}
+      style={{ paddingLeft: `${8 + depth * 12}px` }}
     >
       <span
-        className={`shrink-0 transition-opacity ${
-          on ? "text-accent opacity-100" : "opacity-0 group-hover:opacity-60"
+        className={`shrink-0 mr-1.5 transition-colors ${
+          on ? "text-accent" : "text-ink-faint"
         }`}
         aria-hidden
       >
-        ▸
+        {on ? "▸ " : `${treeChar} `}
       </span>
       <span className="truncate">{node.title}</span>
     </Link>
@@ -76,37 +82,45 @@ function FileLink({
 function NestedFolder({
   folder,
   active,
+  depth,
 }: {
   folder: ClientDocFolder;
   active: string[];
+  depth: number;
 }) {
   const within = descendsFrom(folder.slug, active);
   return (
-    <div className="ml-3 mt-2">
+    <div>
       <Link
         href={slugHref(folder.slug)}
-        className={`block text-[10px] tracking-[0.14em] uppercase mb-1 font-mono transition-colors ${
+        className={`block text-[10px] tracking-[0.14em] uppercase mt-1.5 mb-1 transition-colors ${
           within ? "text-accent" : "text-ink-dim hover:text-ink"
         }`}
+        style={{ paddingLeft: `${8 + depth * 12}px` }}
       >
-        {folder.title}
+        ▸ {folder.title}
+        <span className="text-ink-faint">/</span>
       </Link>
-      <div className="space-y-[1px]">
-        {folder.children.map((child) =>
-          child.kind === "file" ? (
-            <FileLink
+      <div>
+        {folder.children.map((child, i, arr) => {
+          const last = i === arr.length - 1;
+          return child.kind === "file" ? (
+            <FileRow
               key={child.slug.join("/")}
               node={child}
               active={active}
+              isLast={last}
+              depth={depth + 1}
             />
           ) : (
             <NestedFolder
               key={child.slug.join("/")}
               folder={child}
               active={active}
+              depth={depth + 1}
             />
-          ),
-        )}
+          );
+        })}
       </div>
     </div>
   );
@@ -122,88 +136,88 @@ function FolderBlock({
   const within = descendsFrom(folder.slug, active);
   const count = countDocs(folder);
   return (
-    <section className="mb-6">
+    <section className="mb-4">
       <Link
         href={slugHref(folder.slug)}
-        className={`group flex items-baseline justify-between mb-2 font-mono transition-colors ${
+        className={`group flex items-baseline justify-between mb-1 pl-2 pr-2 transition-colors ${
           within ? "text-accent" : "text-ink-dim hover:text-ink"
         }`}
       >
-        <span className="text-[10px] tracking-[0.18em] uppercase flex items-center gap-1.5">
+        <span className="text-[10px] tracking-[0.18em] uppercase">
           <span className="text-accent">▸</span> {folder.title}
+          <span className="text-ink-faint">/</span>
         </span>
-        <span className="text-[9px] tracking-[0.1em] text-ink-faint group-hover:text-ink-dim">
-          {count}
+        <span className="text-[9px] text-ink-faint tracking-[0.1em] group-hover:text-ink-dim">
+          [{count}]
         </span>
       </Link>
-      <div className="space-y-[1px]">
-        {folder.children.map((child) =>
-          child.kind === "file" ? (
-            <FileLink
-              key={child.slug.join("/")}
-              node={child}
-              active={active}
-            />
-          ) : (
+      <div>
+        {folder.children.map((child, i, arr) => {
+          const last = i === arr.length - 1;
+          if (child.kind === "file") {
+            return (
+              <FileRow
+                key={child.slug.join("/")}
+                node={child}
+                active={active}
+                isLast={last}
+                depth={1}
+              />
+            );
+          }
+          return (
             <NestedFolder
               key={child.slug.join("/")}
               folder={child}
               active={active}
+              depth={1}
             />
-          ),
-        )}
+          );
+        })}
       </div>
     </section>
   );
 }
 
-export function DocsSidebar({ tree }: { tree: ClientDocTree }) {
-  const pathname = usePathname() ?? "/docs";
-  const active = activeFromPath(pathname);
-  const rootOn = active.length === 0;
-  const totalDocs =
-    tree.rootFiles.length +
-    tree.folders.reduce((sum, f) => sum + countDocs(f), 0) +
-    (tree.hasRootReadme ? 1 : 0);
-
+function SidebarBody({
+  tree,
+  active,
+}: {
+  tree: ClientDocTree;
+  active: string[];
+}) {
   return (
-    <nav className="font-mono" aria-label="Docs navigation">
-      {/* Header chrome — homepage-style section label. */}
-      <div className="mb-6 pb-4 border-b border-dashed border-line">
-        <Link
-          href="/docs"
-          className={`flex items-baseline justify-between mb-1.5 transition-colors ${
-            rootOn ? "text-accent" : "text-ink hover:text-accent"
-          }`}
-        >
-          <span className="text-[11px] tracking-[0.22em] uppercase flex items-center gap-2 font-mono">
-            <span className="text-accent">§</span> net docs
-          </span>
-          <span className="text-[9px] tracking-[0.14em] text-ink-faint uppercase">
-            {totalDocs} pages
-          </span>
-        </Link>
-        <div className="text-[9px] text-ink-faint tracking-[0.06em] flex items-center gap-1.5">
-          <span className="w-1 h-1 rounded-full bg-accent inline-block animate-pulse-dot" />
-          <span>live documentation</span>
-        </div>
+    <>
+      {/* Fake prompt */}
+      <div className="px-2 mb-3 text-[10px] text-ink-faint tracking-[0.06em]">
+        <span className="text-accent">$</span> tree --live
       </div>
 
-      {/* Root files render as an "overview" section, without a folder. */}
       {tree.rootFiles.length > 0 && (
-        <section className="mb-6">
-          <div className="text-[10px] tracking-[0.18em] uppercase text-ink-dim mb-2 font-mono">
-            <span className="text-accent">▸</span> overview
+        <section className="mb-4">
+          <div className="flex items-baseline justify-between mb-1 pl-2 pr-2 text-ink-dim">
+            <span className="text-[10px] tracking-[0.18em] uppercase">
+              <span className="text-accent">▸</span> overview
+              <span className="text-ink-faint">/</span>
+            </span>
+            <span className="text-[9px] text-ink-faint tracking-[0.1em]">
+              [{tree.rootFiles.length}]
+            </span>
           </div>
-          <div className="space-y-[1px]">
-            {tree.rootFiles.map((f) => (
-              <FileLink key={f.slug.join("/")} node={f} active={active} />
+          <div>
+            {tree.rootFiles.map((f, i, arr) => (
+              <FileRow
+                key={f.slug.join("/")}
+                node={f}
+                active={active}
+                isLast={i === arr.length - 1}
+                depth={1}
+              />
             ))}
           </div>
         </section>
       )}
 
-      {/* Top-level folders as sections. */}
       {tree.folders.map((folder) => (
         <FolderBlock
           key={folder.slug.join("/")}
@@ -211,6 +225,76 @@ export function DocsSidebar({ tree }: { tree: ClientDocTree }) {
           active={active}
         />
       ))}
+    </>
+  );
+}
+
+export function DocsSidebar({
+  tree,
+  chrome = true,
+}: {
+  tree: ClientDocTree;
+  chrome?: boolean;
+}) {
+  const pathname = usePathname() ?? "/docs";
+  const active = activeFromPath(pathname);
+  const totalDocs =
+    tree.rootFiles.length +
+    tree.folders.reduce((sum, f) => sum + countDocs(f), 0) +
+    (tree.hasRootReadme ? 1 : 0);
+
+  // Bare-body variant used inside DocsDrawer (the drawer already has its
+  // own terminal chrome, so we don't double-frame).
+  if (!chrome) {
+    return (
+      <nav className="font-mono" aria-label="Docs navigation">
+        <SidebarBody tree={tree} active={active} />
+      </nav>
+    );
+  }
+
+  return (
+    <nav className="font-mono" aria-label="Docs navigation">
+      <div className="border border-line bg-bg-2/30 overflow-hidden">
+        {/* Terminal title bar */}
+        <div className="border-b border-line px-3 py-2 flex items-center justify-between">
+          <span className="flex items-center gap-2.5">
+            <span className="inline-flex gap-1" aria-hidden>
+              <span className="frame-dot-r w-[6px] h-[6px] rounded-full" />
+              <span className="frame-dot-y w-[6px] h-[6px] rounded-full" />
+              <span className="frame-dot-g w-[6px] h-[6px] rounded-full" />
+            </span>
+            <span className="text-accent text-[11px] leading-none">$</span>
+            <Link
+              href="/docs"
+              className="text-[10px] tracking-[0.14em] uppercase text-ink-dim hover:text-accent transition-colors"
+            >
+              net.docs
+            </Link>
+          </span>
+          <span className="text-[9px] tracking-[0.14em] uppercase text-ink-faint">
+            {totalDocs} pages
+          </span>
+        </div>
+
+        {/* Body */}
+        <div className="py-3">
+          <SidebarBody tree={tree} active={active} />
+        </div>
+
+        {/* Status footer */}
+        <div className="border-t border-line px-3 py-1.5 flex items-center justify-between">
+          <span className="flex items-center gap-1.5">
+            <span className="w-1 h-1 rounded-full bg-accent inline-block animate-pulse-dot" />
+            <span className="text-[9px] tracking-[0.18em] uppercase text-accent-dim">
+              live
+            </span>
+          </span>
+          <span className="text-[9px] tracking-[0.14em] uppercase text-ink-faint">
+            v0.17
+          </span>
+        </div>
+      </div>
     </nav>
   );
 }

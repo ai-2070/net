@@ -22,7 +22,7 @@ export default function DocsLayout({
         <div className="grid grid-cols-1 lg:grid-cols-[260px_minmax(0,1fr)] xl:grid-cols-[260px_minmax(0,1fr)_220px] gap-8 lg:gap-10 px-4 sm:px-6 py-8 lg:py-10">
           {/* Inline sidebar — only at lg+. Hidden via display:none on
               smaller breakpoints so the grid collapses to a single column. */}
-          <aside className="hidden lg:block lg:sticky lg:top-24 lg:self-start lg:max-h-[calc(100vh-7rem)] lg:overflow-y-auto pr-3 lg:border-r lg:border-line">
+          <aside className="hidden lg:block lg:sticky lg:top-24 lg:self-start lg:max-h-[calc(100vh-7rem)] lg:overflow-y-auto pr-2">
             <DocsSidebar tree={tree} />
           </aside>
           {/* Page renders <main>…</main> + <aside>TOC</aside>. At lg the
