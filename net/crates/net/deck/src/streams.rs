@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use net_sdk::deck::{AdminAuditRecord, DeckClient, LogFilter, LogRecord};
+use net_sdk::deck::{AdminAuditRecord, DeckClient, FailureRecord, LogFilter, LogRecord};
 use parking_lot::Mutex;
 
 /// Capacity of the LOGS tail. 5000 records × ~256B per record
@@ -29,6 +29,11 @@ pub const LOGS_TAIL_CAP: usize = 5_000;
 /// (operator-driven, never machine-generated), so 2000 covers
 /// a long session with room to spare.
 pub const AUDIT_TAIL_CAP: usize = 2_000;
+
+/// Capacity of the FAILURES tail. Bursty on outages but rarely
+/// chatty enough in steady state to need a deep history;
+/// 2000 records is comfortable for incident triage.
+pub const FAILURES_TAIL_CAP: usize = 2_000;
 
 /// Shared, lock-protected ring of log records. Owned by App;
 /// the streaming task holds a clone of the Arc and pushes new
@@ -127,6 +132,56 @@ impl AuditTail {
 pub fn spawn_audit_stream(deck: Arc<DeckClient>, tail: AuditTail) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut stream = deck.audit().stream();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(record) => tail.push(record),
+                Err(_err) => continue,
+            }
+        }
+    })
+}
+
+/// FAILURES tail mirror of `LogsTail` / `AuditTail`. Holds
+/// executor failure records — dispatcher rejections,
+/// constraint-violation drops, etc. Fed by the failure stream.
+#[derive(Clone)]
+pub struct FailuresTail {
+    pub records: Arc<Mutex<VecDeque<FailureRecord>>>,
+    pub cap: usize,
+}
+
+impl FailuresTail {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            records: Arc::new(Mutex::new(VecDeque::with_capacity(cap.min(512)))),
+            cap,
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<FailureRecord> {
+        let g = self.records.lock();
+        g.iter().cloned().collect()
+    }
+
+    pub fn push(&self, record: FailureRecord) {
+        let mut g = self.records.lock();
+        if g.len() == self.cap {
+            g.pop_front();
+        }
+        g.push_back(record);
+    }
+}
+
+/// Spawn the FAILURES streaming task. `since_seq = 0` replays
+/// everything still on the substrate's ring at subscribe time;
+/// the SDK dedups via per-record `seq` so reconnects don't
+/// double-emit.
+pub fn spawn_failures_stream(
+    deck: Arc<DeckClient>,
+    tail: FailuresTail,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut stream = deck.subscribe_failures(0);
         while let Some(item) = stream.next().await {
             match item {
                 Ok(record) => tail.push(record),

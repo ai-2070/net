@@ -40,9 +40,12 @@ async fn main() -> color_eyre::Result<()> {
     let _logs_stream_task = streams::spawn_logs_stream(deck.clone(), logs_tail.clone());
     let audit_tail = streams::AuditTail::new(streams::AUDIT_TAIL_CAP);
     let _audit_stream_task = streams::spawn_audit_stream(deck.clone(), audit_tail.clone());
+    let failures_tail = streams::FailuresTail::new(streams::FAILURES_TAIL_CAP);
+    let _failures_stream_task =
+        streams::spawn_failures_stream(deck.clone(), failures_tail.clone());
 
     let terminal = ratatui::init();
-    let result = App::new(deck, logs_tail, audit_tail).run(terminal);
+    let result = App::new(deck, logs_tail, audit_tail, failures_tail).run(terminal);
     ratatui::restore();
 
     // Explicit drop so the harness's tear-down runs before

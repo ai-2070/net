@@ -19,7 +19,7 @@ struct Binding {
 
 /// Routine bindings — navigation + cursor + dismissals.
 const NAVIGATION: &[Binding] = &[
-    Binding { keys: "1-8",       desc: "jump to tab" },
+    Binding { keys: "1-9",       desc: "jump to tab" },
     Binding { keys: "Tab / ◂▸",  desc: "cycle tab" },
     Binding { keys: "j / k",     desc: "cursor down / up" },
     Binding { keys: "g / G",     desc: "cursor to top / bottom" },

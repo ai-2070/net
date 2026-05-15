@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod dataforts;
 pub mod daemon;
+pub mod failures;
 pub mod list_view;
 pub mod logs;
 pub mod migrations;

@@ -20,10 +20,11 @@ pub enum Tab {
     Audit,
     Replicas,
     Migrations,
+    Failures,
 }
 
 impl Tab {
-    pub fn all() -> [Tab; 8] {
+    pub fn all() -> [Tab; 9] {
         [
             Tab::NetMap,
             Tab::List,
@@ -33,6 +34,7 @@ impl Tab {
             Tab::Audit,
             Tab::Replicas,
             Tab::Migrations,
+            Tab::Failures,
         ]
     }
 
@@ -46,6 +48,7 @@ impl Tab {
             Tab::Audit => "AUDIT",
             Tab::Replicas => "REPLICAS",
             Tab::Migrations => "MIGRATIONS",
+            Tab::Failures => "FAILURES",
         }
     }
 
@@ -86,6 +89,10 @@ pub struct App {
     /// `logs_tail`; replaces the `snapshot.admin_audit`
     /// dependency on the AUDIT render path.
     pub audit_tail: crate::streams::AuditTail,
+    /// Phase-4 streaming tail for FAILURES. Backs the FAILURES
+    /// tab — executor rejections, drain failures, constraint
+    /// drops.
+    pub failures_tail: crate::streams::FailuresTail,
     /// Cursor on the DAEMON tab's lineage tree. Indices into
     /// the live group list — `j`/`k` move the cursor; the
     /// detail pane on the right reflects whichever member is
@@ -210,12 +217,14 @@ impl App {
         deck: Arc<DeckClient>,
         logs_tail: crate::streams::LogsTail,
         audit_tail: crate::streams::AuditTail,
+        failures_tail: crate::streams::FailuresTail,
     ) -> Self {
         let snapshot = Arc::new(deck.status());
         Self {
             current: Tab::NetMap,
             logs_tail,
             audit_tail,
+            failures_tail,
             should_quit: false,
             started: Instant::now(),
             tick: 0,
@@ -300,6 +309,7 @@ impl App {
             KeyCode::Char('6') => self.current = Tab::Audit,
             KeyCode::Char('7') => self.current = Tab::Replicas,
             KeyCode::Char('8') => self.current = Tab::Migrations,
+            KeyCode::Char('9') => self.current = Tab::Failures,
             // DAEMON tab navigation. `j`/`k` move within the
             // current group's members; `J`/`K` step to the
             // next / previous group. No-op on other tabs.
@@ -1179,6 +1189,10 @@ impl App {
                 Some(&self.snapshot),
                 self.migration_cursor,
             ),
+            Tab::Failures => {
+                let records = self.failures_tail.snapshot();
+                tabs::failures::render(frame, chunks[3], &records);
+            }
         }
         widgets::footer::render(frame, chunks[4]);
 
