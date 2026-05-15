@@ -36,12 +36,14 @@ const ADMIN: &[Binding] = &[
     Binding { keys: "M",   desc: "LIST: exit maintenance" },
     Binding { keys: "a",   desc: "LIST: clear avoid list" },
     Binding { keys: "i",   desc: "LIST: invalidate placement" },
+    Binding { keys: "D",   desc: "LIST: drop all replicas on node" },
     Binding { keys: "r",   desc: "DAEMON: restart all daemons (on host)" },
 ];
 
 const ICE: &[Binding] = &[
     Binding { keys: "F",   desc: "LIST: ICE freeze cluster (60s ttl)" },
     Binding { keys: "T",   desc: "LIST: ICE thaw cluster" },
+    Binding { keys: "A",   desc: "LIST: ICE flush avoid lists (global)" },
     Binding { keys: "R",   desc: "DAEMON: ICE force-restart (bypass backoff)" },
 ];
 
@@ -51,7 +53,7 @@ const MODAL: &[Binding] = &[
 ];
 
 pub fn render(frame: &mut Frame<'_>, area: Rect) {
-    let modal_area = center(area, 78, 32);
+    let modal_area = center(area, 78, 34);
     frame.render_widget(Clear, modal_area);
 
     let block = Block::default()
@@ -75,8 +77,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(10), // navigation
-            Constraint::Length(10), // admin
-            Constraint::Length(5),  // ice
+            Constraint::Length(11), // admin
+            Constraint::Length(6),  // ice
             Constraint::Length(4),  // modal
             Constraint::Min(0),     // footer
         ])

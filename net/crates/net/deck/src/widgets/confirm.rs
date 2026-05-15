@@ -83,6 +83,18 @@ pub enum ConfirmAction {
         daemon_name: String,
         blast: BlastRadius,
     },
+    /// Drop every chain the node currently holds. Reads from
+    /// `admin().drop_replicas(node, chains)`. `chains_count`
+    /// is captured for the modal's blast-radius summary.
+    DropReplicas {
+        node: u64,
+        node_display: String,
+        chains: Vec<u64>,
+    },
+    /// ICE break-glass: flush avoid lists cluster-wide
+    /// (`AvoidScope::Global`). Reads from
+    /// `ice().flush_avoid_lists(scope)`.
+    IceFlushAvoidLists { blast: BlastRadius },
 }
 
 impl ConfirmAction {
@@ -94,6 +106,7 @@ impl ConfirmAction {
             Self::IceFreezeCluster { .. }
                 | Self::IceThawCluster { .. }
                 | Self::IceForceRestartDaemon { .. }
+                | Self::IceFlushAvoidLists { .. }
         )
     }
 
@@ -104,7 +117,8 @@ impl ConfirmAction {
         match self {
             Self::IceFreezeCluster { blast, .. }
             | Self::IceThawCluster { blast }
-            | Self::IceForceRestartDaemon { blast, .. } => Some(blast),
+            | Self::IceForceRestartDaemon { blast, .. }
+            | Self::IceFlushAvoidLists { blast } => Some(blast),
             _ => None,
         }
     }
@@ -162,6 +176,17 @@ impl ConfirmAction {
             } => format!(
                 "ICE  force-restart daemon  ·  0x{daemon_id:x} · {daemon_name}"
             ),
+            Self::DropReplicas {
+                node_display,
+                chains,
+                ..
+            } => format!(
+                "drop {} replica(s) on {node_display}",
+                chains.len()
+            ),
+            Self::IceFlushAvoidLists { .. } => {
+                "ICE  flush avoid lists  ·  global scope".to_string()
+            }
         }
     }
 
@@ -234,6 +259,18 @@ impl ConfirmAction {
                 "force-restarts the daemon, bypassing crash-loop backoff".to_string(),
                 "supervisor's BackingOff / CrashLooping gate is cleared".to_string(),
                 "use after operator-side recovery — not a routine retry".to_string(),
+                "ICE — multi-op signed; lands on the admin chain".to_string(),
+            ],
+            Self::DropReplicas { chains, .. } => vec![
+                format!("evicts {} replica(s) from this node", chains.len()),
+                "desired_local_replicas → Drop; reconcile fires".to_string(),
+                "DropReplica actions; refill happens elsewhere".to_string(),
+                "fires `admin().drop_replicas(node, chains)`".to_string(),
+            ],
+            Self::IceFlushAvoidLists { .. } => vec![
+                "flushes avoid-list entries cluster-wide".to_string(),
+                "every node clears its local avoid list".to_string(),
+                "reconcile may re-add entries on the next tick".to_string(),
                 "ICE — multi-op signed; lands on the admin chain".to_string(),
             ],
         }

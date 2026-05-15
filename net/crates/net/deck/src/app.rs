@@ -284,14 +284,21 @@ impl App {
             KeyCode::Char('i') if self.current == Tab::List => {
                 self.propose_node_action(NodeActionKind::InvalidatePlacement);
             }
-            // ICE break-glass on LIST tab: `F` freeze, `T` thaw.
-            // Cluster-wide; not node-scoped. Capital letters to
-            // distinguish from routine commands.
+            KeyCode::Char('D') if self.current == Tab::List => {
+                self.propose_drop_replicas();
+            }
+            // ICE break-glass on LIST tab: `F` freeze, `T` thaw,
+            // `A` flush avoid lists (global scope). Cluster-wide
+            // except where noted; capital letters distinguish
+            // from routine commands.
             KeyCode::Char('F') if self.current == Tab::List => {
                 self.propose_ice_freeze();
             }
             KeyCode::Char('T') if self.current == Tab::List => {
                 self.propose_ice_thaw();
+            }
+            KeyCode::Char('A') if self.current == Tab::List => {
+                self.propose_ice_flush_avoid_lists();
             }
             _ => {}
         }
@@ -317,6 +324,44 @@ impl App {
         let blast = simulate_ice_proposal(&self.snapshot, &action);
         self.modal = Some(Modal::Confirm(
             crate::widgets::confirm::ConfirmAction::IceThawCluster { blast },
+        ));
+    }
+
+    fn propose_drop_replicas(&mut self) {
+        let Some(node) = self.cursored_node() else { return };
+        // Default: every chain this node currently holds. The
+        // operator confirms before any commit fires.
+        let chains: Vec<u64> = self
+            .snapshot
+            .replicas
+            .iter()
+            .filter(|(_, r)| r.holders.contains(&node))
+            .map(|(chain, _)| *chain)
+            .collect();
+        let node_display = format!(
+            "0x{:x}{}",
+            node,
+            crate::nodes::label_of(&format!("0x{node:x}"))
+                .map(|l| format!(".{l}"))
+                .unwrap_or_default(),
+        );
+        self.modal = Some(Modal::Confirm(
+            crate::widgets::confirm::ConfirmAction::DropReplicas {
+                node,
+                node_display,
+                chains,
+            },
+        ));
+    }
+
+    fn propose_ice_flush_avoid_lists(&mut self) {
+        use net_sdk::deck::{simulate_ice_proposal, AvoidScope, IceActionProposal};
+        let action = IceActionProposal::FlushAvoidLists {
+            scope: AvoidScope::Global,
+        };
+        let blast = simulate_ice_proposal(&self.snapshot, &action);
+        self.modal = Some(Modal::Confirm(
+            crate::widgets::confirm::ConfirmAction::IceFlushAvoidLists { blast },
         ));
     }
 
@@ -519,6 +564,15 @@ impl App {
                         name: daemon_name,
                     };
                     let proposal = deck.ice().force_restart_daemon(daemon_ref);
+                    dispatch_ice(&deck, proposal).await;
+                }
+                ConfirmAction::DropReplicas { node, chains, .. } => {
+                    let _ = deck.admin().drop_replicas(node, chains).await;
+                }
+                ConfirmAction::IceFlushAvoidLists { .. } => {
+                    let proposal = deck.ice().flush_avoid_lists(
+                        net_sdk::deck::AvoidScope::Global,
+                    );
                     dispatch_ice(&deck, proposal).await;
                 }
             }
