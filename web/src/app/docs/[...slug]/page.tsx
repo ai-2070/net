@@ -20,6 +20,13 @@ interface PageProps {
   params: Promise<{ slug: string[] }>;
 }
 
+// Pure SSG. Every doc path is enumerated by `generateStaticParams` and
+// baked at build time. Unknown slugs 404 (not dynamically rendered) and
+// the output is never revalidated — change a doc → ship a new build.
+export const dynamic = "force-static";
+export const dynamicParams = false;
+export const revalidate = false;
+
 export function generateStaticParams(): Array<{ slug: string[] }> {
   return getAllSlugs().map((slug) => ({ slug }));
 }

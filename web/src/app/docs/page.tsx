@@ -14,6 +14,11 @@ import {
   DocsPrevNextBottom,
 } from "@/components/DocsPrevNext";
 
+// Pure SSG — the /docs landing renders the root README or auto-index;
+// content comes from build-time filesystem reads, no runtime work.
+export const dynamic = "force-static";
+export const revalidate = false;
+
 function folderHref(slug: string[]): string {
   return `/docs/${slug.join("/")}`;
 }
