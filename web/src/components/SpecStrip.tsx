@@ -13,7 +13,7 @@ const SPEC_STRIP: ReadonlyArray<{
   {
     label: "// migration phases",
     value: "6",
-    unit: "strict",
+    unit: "phases",
     body: "snapshot → transfer → restore → replay → cutover → complete",
   },
   {
@@ -31,7 +31,7 @@ const SPEC_STRIP: ReadonlyArray<{
     label: "// cycle time",
     value: "~280",
     unit: "ns",
-    body: "full snapshot → activate, faster than a context switch",
+    body: "full snapshot → activate, faster than a kernel context switch",
   },
 ];
 

@@ -22,7 +22,14 @@ export function MikoshiSection() {
             their original hardware.
           </p>
           <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
-            <strong className="text-ink font-medium">Mikoshi in NET lets a deamon hop between machines.</strong>{" "}The machine underneath changes; the daemon keeps its identity, its history, its pending work, and its place in the conversation. The source packages its state, the target unpacks it, and for a brief moment the daemon exists on both nodes, then collapses onto the target as routing cuts over.
+            <strong className="text-ink font-medium">
+              Mikoshi in NET lets a deamon hop between machines.
+            </strong>{" "}
+            The machine underneath changes; the daemon keeps its identity, its
+            history, its pending work, and its place in the conversation. The
+            source packages its state, the target unpacks it, and for a brief
+            moment the daemon exists on both nodes, then collapses onto the
+            target as routing cuts over.
           </p>
         </div>
         <div>
@@ -30,10 +37,8 @@ export function MikoshiSection() {
             <strong className="text-ink font-medium">
               The daemon doesn&apos;t know it moved.
             </strong>{" "}
-            Neither does anything talking to it. Observer nodes watching the
-            stream see the same causal chain continue uninterrupted, the same
-            sequence numbers, the same entity speaking. The hardware underneath
-            shifted. The stream didn&apos;t notice.
+            Neither does anything talking to it. The hardware shifted; the
+            stream didn't notice.
           </p>
           <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
             A factory controller hops from a dying edge box to a healthy one
@@ -48,9 +53,9 @@ export function MikoshiSection() {
 
       <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] my-12 max-w-[900px]">
         <p className="text-[18px] text-ink leading-[1.5] font-light">
-          It doesn&apos;t move a copy.{" "}
+          Mikoshi doesn&apos;t move a copy.{" "}
           <strong className="text-accent font-medium">
-            Mikoshi carries the thing itself across.
+            Mikoshi moves the daemon itself.
           </strong>
         </p>
       </div>

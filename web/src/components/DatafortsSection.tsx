@@ -54,10 +54,10 @@ export function DatafortsSection() {
         <br />
         <br />
         <strong className="text-accent font-medium">
-          Dataforts treats storage as flow.
+          Dataforts treats storage as flow and data as fluid.
         </strong>{" "}
-        When a device approaches capacity, it overflows onto the mesh. The
-        folder stays local. The capacity is the mesh. Reads create gravity. Hot
+        When a device approaches capacity, it overflows onto the mesh. The capacity is the mesh. The
+        folder stays local. Reads create gravity. Hot
         data moves closer. Everything is in motion.
       </p>
 

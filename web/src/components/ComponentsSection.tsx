@@ -13,7 +13,7 @@ const COMPONENTS: readonly ComponentSpec[] = [
   {
     num: "▸ component.01",
     name: "nRPC",
-    tagline: "// typed request/response",
+    tagline: "// native rpc primitive",
     body: (
       <>
         Request/response semantics built from a pair of streams. A server
@@ -29,7 +29,7 @@ const COMPONENTS: readonly ComponentSpec[] = [
   {
     num: "▸ component.02",
     name: "RedEX",
-    tagline: "// append-only event log",
+    tagline: "// stream as state",
     body: (
       <>
         The log unbundled and local. 20-byte index records, optional disk
@@ -43,7 +43,7 @@ const COMPONENTS: readonly ComponentSpec[] = [
   {
     num: "▸ component.03",
     name: "CortEX",
-    tagline: "// RedEX, folded",
+    tagline: "// folded RedEX streams",
     body: (
       <>
         A reactive, queryable projection of the log, updated event-by-event.
