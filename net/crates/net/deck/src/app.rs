@@ -94,6 +94,11 @@ pub struct App {
     /// Cursor on the MIGRATIONS tab — index into
     /// `snapshot.in_flight_migrations`.
     pub migration_cursor: usize,
+    /// AUDIT tab filter: show only ICE force-* records when true.
+    pub audit_force_only: bool,
+    /// AUDIT tab filter: cap the visible rows. `None` shows
+    /// the full ring; values cycle via `[n]` on the AUDIT tab.
+    pub audit_limit: Option<usize>,
     /// Active modal overlay (confirmation prompt, future
     /// signature collector, future help screen). When `Some`,
     /// the modal absorbs key input until dismissed.
@@ -184,6 +189,8 @@ impl App {
             list_cursor: 0,
             replica_cursor: 0,
             migration_cursor: 0,
+            audit_force_only: false,
+            audit_limit: None,
             modal: None,
         }
     }
@@ -315,6 +322,18 @@ impl App {
             // ICE kill-migration on the cursored migration row.
             KeyCode::Char('K') if self.current == Tab::Migrations => {
                 self.propose_ice_kill_migration();
+            }
+            // AUDIT filters. `f` toggles ICE-only; `n` cycles
+            // the row limit none → 25 → 100 → none.
+            KeyCode::Char('f') if self.current == Tab::Audit => {
+                self.audit_force_only = !self.audit_force_only;
+            }
+            KeyCode::Char('n') if self.current == Tab::Audit => {
+                self.audit_limit = match self.audit_limit {
+                    None => Some(25),
+                    Some(25) => Some(100),
+                    _ => None,
+                };
             }
             // LIST tab actions on the cursored node: `c` cordon,
             // `C` uncordon, `d` drain (5-minute default window).
@@ -857,7 +876,13 @@ impl App {
             Tab::Logs => {
                 tabs::logs::render(frame, chunks[3], self.tick, Some(&self.snapshot))
             }
-            Tab::Audit => tabs::audit::render(frame, chunks[3], Some(&self.snapshot)),
+            Tab::Audit => tabs::audit::render(
+                frame,
+                chunks[3],
+                Some(&self.snapshot),
+                self.audit_force_only,
+                self.audit_limit,
+            ),
             Tab::Replicas => tabs::replicas::render(
                 frame,
                 chunks[3],

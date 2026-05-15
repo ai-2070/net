@@ -13,26 +13,34 @@ use ratatui::{
 
 use crate::{nodes, theme, widgets};
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeshOsSnapshot>) {
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: Option<&MeshOsSnapshot>,
+    force_only: bool,
+    limit: Option<usize>,
+) {
     let has_records = snapshot
         .map(|s| !s.admin_audit.is_empty())
         .unwrap_or(false);
     if has_records {
-        render_table(frame, area, snapshot.unwrap());
+        render_table(frame, area, snapshot.unwrap(), force_only, limit);
     } else {
-        render_empty(frame, area);
+        render_empty(frame, area, force_only, limit);
     }
 }
 
-fn render_empty(frame: &mut Frame<'_>, area: Rect) {
+fn render_empty(frame: &mut Frame<'_>, area: Rect, force_only: bool, limit: Option<usize>) {
+    let mut title_spans = vec![
+        Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+        Span::styled("AUDIT", theme::green_hi()),
+        Span::styled("    0 commits", theme::chrome()),
+    ];
+    append_filter_chips(&mut title_spans, force_only, limit);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
-        .title(Line::from(vec![
-            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-            Span::styled("AUDIT", theme::green_hi()),
-            Span::styled("    0 commits", theme::chrome()),
-        ]));
+        .title(Line::from(title_spans));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     widgets::empty::render(
@@ -43,7 +51,13 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot) {
+fn render_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &MeshOsSnapshot,
+    force_only: bool,
+    limit: Option<usize>,
+) {
     let total = snapshot.admin_audit.len();
     let accepted = snapshot
         .admin_audit
@@ -57,7 +71,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot) {
         .count();
     let rejected = total.saturating_sub(accepted + unverified);
 
-    let header_line = Line::from(vec![
+    let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("AUDIT", theme::green_hi()),
         Span::styled(
@@ -66,7 +80,9 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot) {
             ),
             theme::chrome(),
         ),
-    ]);
+    ];
+    append_filter_chips(&mut title_spans, force_only, limit);
+    let header_line = Line::from(title_spans);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -83,10 +99,17 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot) {
     ])
     .height(1);
 
-    // Newest first.
+    // Newest first, with optional ICE-only filter + row cap.
     let now_ms = unix_now_ms();
-    let mut rows: Vec<Row> = Vec::with_capacity(total);
-    for rec in snapshot.admin_audit.iter().rev() {
+    let cap = limit.unwrap_or(usize::MAX);
+    let mut rows: Vec<Row> = Vec::with_capacity(total.min(cap));
+    for rec in snapshot
+        .admin_audit
+        .iter()
+        .rev()
+        .filter(|r| !force_only || r.event.is_ice())
+        .take(cap)
+    {
         let (outcome_style, outcome_text) = outcome_repr(&rec.outcome);
         let (cmd, cmd_style) = command_repr(&rec.event);
         let target_spans = target_spans(&rec.event);
@@ -217,6 +240,19 @@ fn target_spans(e: &AdminEvent) -> Vec<Span<'static>> {
 
 fn cell_dim(s: &'static str) -> Cell<'static> {
     Cell::from(Span::styled(s, theme::chrome()))
+}
+
+/// Append active-filter chips to the title row so an operator
+/// can tell at a glance that they're not looking at the whole
+/// ring. ICE-only is amber (matches the ICE accent); the row
+/// cap is dim.
+fn append_filter_chips(spans: &mut Vec<Span<'static>>, force_only: bool, limit: Option<usize>) {
+    if force_only {
+        spans.push(Span::styled("    [ICE only]", theme::amber()));
+    }
+    if let Some(n) = limit {
+        spans.push(Span::styled(format!("    [limit {n}]"), theme::dim()));
+    }
 }
 
 fn unix_now_ms() -> u64 {
