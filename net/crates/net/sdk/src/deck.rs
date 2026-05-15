@@ -56,7 +56,7 @@ pub use net::adapter::net::behavior::meshos::simulate_ice_proposal;
 // build commands or read snapshots.
 pub use net::adapter::net::behavior::meshos::{
     AdminAuditRecord, AdminEvent, AdminVerifier, AvoidScope, BlastRadius, BlastWarning, ChainId,
-    DaemonHealthSnapshot, DaemonLifecycleSnapshot, DaemonSnapshot, FailureRecord,
+    DaemonHealthSnapshot, DaemonLifecycleSnapshot, DaemonRef, DaemonSnapshot, FailureRecord,
     IceActionProposal, LogLevel, LogLine, LogRecord, MaintenanceMirrorSnapshot,
     MaintenanceStateSnapshot, MeshOsSnapshot, MigrationId, MigrationPhaseSnapshot,
     MigrationSnapshot, NodeId, PeerHealthSnapshot, PeerSnapshot, ReplicaSnapshot,

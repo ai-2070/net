@@ -75,6 +75,14 @@ pub enum ConfirmAction {
     },
     /// ICE break-glass: cancel an in-effect freeze.
     IceThawCluster { blast: BlastRadius },
+    /// ICE break-glass: force-restart a daemon, bypassing the
+    /// supervisor's crash-loop backoff gate. Reads from
+    /// `ice().force_restart_daemon(daemon)`.
+    IceForceRestartDaemon {
+        daemon_id: u64,
+        daemon_name: String,
+        blast: BlastRadius,
+    },
 }
 
 impl ConfirmAction {
@@ -83,7 +91,9 @@ impl ConfirmAction {
     pub fn is_ice(&self) -> bool {
         matches!(
             self,
-            Self::IceFreezeCluster { .. } | Self::IceThawCluster { .. }
+            Self::IceFreezeCluster { .. }
+                | Self::IceThawCluster { .. }
+                | Self::IceForceRestartDaemon { .. }
         )
     }
 
@@ -92,9 +102,9 @@ impl ConfirmAction {
     /// simulator before commit.
     pub fn blast(&self) -> Option<&BlastRadius> {
         match self {
-            Self::IceFreezeCluster { blast, .. } | Self::IceThawCluster { blast } => {
-                Some(blast)
-            }
+            Self::IceFreezeCluster { blast, .. }
+            | Self::IceThawCluster { blast }
+            | Self::IceForceRestartDaemon { blast, .. } => Some(blast),
             _ => None,
         }
     }
@@ -145,6 +155,13 @@ impl ConfirmAction {
                 format!("ICE  freeze cluster  ·  ttl {}s", ttl.as_secs())
             }
             Self::IceThawCluster { .. } => "ICE  thaw cluster".to_string(),
+            Self::IceForceRestartDaemon {
+                daemon_id,
+                daemon_name,
+                ..
+            } => format!(
+                "ICE  force-restart daemon  ·  0x{daemon_id:x} · {daemon_name}"
+            ),
         }
     }
 
@@ -211,6 +228,12 @@ impl ConfirmAction {
                 "cancels an in-effect freeze immediately".to_string(),
                 "reconcile resumes action emission on the next tick".to_string(),
                 "no-op if no freeze is in effect".to_string(),
+                "ICE — multi-op signed; lands on the admin chain".to_string(),
+            ],
+            Self::IceForceRestartDaemon { .. } => vec![
+                "force-restarts the daemon, bypassing crash-loop backoff".to_string(),
+                "supervisor's BackingOff / CrashLooping gate is cleared".to_string(),
+                "use after operator-side recovery — not a routine retry".to_string(),
                 "ICE — multi-op signed; lands on the admin chain".to_string(),
             ],
         }

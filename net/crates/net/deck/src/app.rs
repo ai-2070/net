@@ -239,6 +239,11 @@ impl App {
             KeyCode::Char('r') if self.current == Tab::Daemon => {
                 self.propose_restart_all_daemons();
             }
+            // ICE force-restart on DAEMON tab. Targets the
+            // cursored daemon; bypasses crash-loop backoff.
+            KeyCode::Char('R') if self.current == Tab::Daemon => {
+                self.propose_ice_force_restart_daemon();
+            }
             // LIST tab navigation: `j`/`k` move the cursor
             // through the nodes table (sorted by NodeId).
             KeyCode::Char('j') if self.current == Tab::List => {
@@ -304,6 +309,29 @@ impl App {
         let blast = simulate_ice_proposal(&self.snapshot, &action);
         self.modal = Some(Modal::Confirm(
             crate::widgets::confirm::ConfirmAction::IceThawCluster { blast },
+        ));
+    }
+
+    fn propose_ice_force_restart_daemon(&mut self) {
+        use net_sdk::deck::{simulate_ice_proposal, DaemonRef, IceActionProposal};
+        let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
+        let Some(group) = groups.get(self.daemon_cursor.group) else { return };
+        let Some(member) = group.members.get(self.daemon_cursor.member) else { return };
+        let daemon_id = member.id;
+        let daemon_name = member.daemon.name.clone();
+        let action = IceActionProposal::ForceRestartDaemon {
+            daemon: DaemonRef {
+                id: daemon_id,
+                name: daemon_name.clone(),
+            },
+        };
+        let blast = simulate_ice_proposal(&self.snapshot, &action);
+        self.modal = Some(Modal::Confirm(
+            crate::widgets::confirm::ConfirmAction::IceForceRestartDaemon {
+                daemon_id,
+                daemon_name,
+                blast,
+            },
         ));
     }
 
@@ -465,6 +493,18 @@ impl App {
                 }
                 ConfirmAction::IceThawCluster { .. } => {
                     let proposal = deck.ice().thaw_cluster();
+                    dispatch_ice(&deck, proposal).await;
+                }
+                ConfirmAction::IceForceRestartDaemon {
+                    daemon_id,
+                    daemon_name,
+                    ..
+                } => {
+                    let daemon_ref = net_sdk::deck::DaemonRef {
+                        id: daemon_id,
+                        name: daemon_name,
+                    };
+                    let proposal = deck.ice().force_restart_daemon(daemon_ref);
                     dispatch_ice(&deck, proposal).await;
                 }
             }
