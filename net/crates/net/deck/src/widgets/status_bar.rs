@@ -17,9 +17,22 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let evt_per_s = 8_300_000u64 + ((app.tick.wrapping_mul(11_113)) % 400_000);
     let p50_ns = 35 + (app.tick.wrapping_mul(3) % 8) as u64;
 
+    // First slot reflects whether the binary is wired to a
+    // live runtime ("DEMO" / "LIVE") or running in fixture
+    // mode with no real data behind any tab ("FIXTURE").
+    let (mode_dot_style, mode_text, mode_style) = if app.is_connected() {
+        if cfg!(feature = "demo") {
+            (theme::green(), "DEMO", theme::green_hi())
+        } else {
+            (theme::green(), "LIVE", theme::green_hi())
+        }
+    } else {
+        (theme::amber(), "FIXTURE", theme::amber())
+    };
+
     let left = Line::from(vec![
-        Span::styled("● ", theme::green()),
-        Span::styled("MESH ONLINE", theme::green_hi()),
+        Span::styled("● ", mode_dot_style),
+        Span::styled(mode_text, mode_style),
         Span::raw("   "),
         Span::styled("CODENAME: ", theme::chrome()),
         Span::styled("ATOMIC PLAYBOYS", theme::text()),

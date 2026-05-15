@@ -14,3 +14,17 @@ path = "src/main.rs"
 ratatui = "0.29"
 crossterm = "0.28"
 color-eyre = "0.6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+ai2070-net-sdk = { path = "../sdk", features = ["meshos", "deck"] }
+bytes = "1"
+parking_lot = "0.12"
+
+[features]
+default = []
+# `demo` spawns an in-process MeshOsRuntime, a small set of
+# example daemons, and a tokio task that seeds events so every
+# tab has live snapshot data to render. Without this feature
+# the binary starts in fixture mode (placeholder data only —
+# useful for the visual style work but not connected to any
+# real cluster).
+demo = []

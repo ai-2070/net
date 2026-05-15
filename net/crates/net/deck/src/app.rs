@@ -1,6 +1,8 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use net_sdk::deck::{DeckClient, MeshOsSnapshot};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     DefaultTerminal, Frame,
@@ -56,16 +58,35 @@ pub struct App {
     pub should_quit: bool,
     pub started: Instant,
     pub tick: u64,
+    /// `None` in fixture mode (binary built without
+    /// `feature = "demo"` and not yet connected to a real
+    /// cluster). `Some` when wired to a running runtime.
+    pub deck: Option<Arc<DeckClient>>,
+    /// Latest snapshot refreshed on each tick. Tabs that
+    /// render live data read this; tabs still on fixtures
+    /// ignore it. Wrapped in `Arc` so cloning into per-tab
+    /// scope is one atomic-refcount op.
+    pub snapshot: Option<Arc<MeshOsSnapshot>>,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(deck: Option<Arc<DeckClient>>) -> Self {
+        let snapshot = deck.as_ref().map(|d| Arc::new(d.status()));
         Self {
             current: Tab::NetMap,
             should_quit: false,
             started: Instant::now(),
             tick: 0,
+            deck,
+            snapshot,
         }
+    }
+
+    /// True iff the binary is connected to a live runtime —
+    /// status bar uses this to switch between "DEMO" / "LIVE"
+    /// / "FIXTURE" mode indicators.
+    pub fn is_connected(&self) -> bool {
+        self.deck.is_some()
     }
 
     pub fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
@@ -83,10 +104,17 @@ impl App {
             }
             if last_tick.elapsed() >= tick_rate {
                 self.tick = self.tick.wrapping_add(1);
+                self.refresh_snapshot();
                 last_tick = Instant::now();
             }
         }
         Ok(())
+    }
+
+    fn refresh_snapshot(&mut self) {
+        if let Some(deck) = &self.deck {
+            self.snapshot = Some(Arc::new(deck.status()));
+        }
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -130,7 +158,9 @@ impl App {
             Tab::List => tabs::list_view::render(frame, chunks[3]),
             Tab::Dataforts => tabs::dataforts::render(frame, chunks[3], self.tick),
             Tab::Daemon => tabs::daemon::render(frame, chunks[3]),
-            Tab::Logs => tabs::logs::render(frame, chunks[3], self.tick),
+            Tab::Logs => {
+                tabs::logs::render(frame, chunks[3], self.tick, self.snapshot.as_deref())
+            }
         }
         widgets::footer::render(frame, chunks[4]);
     }
