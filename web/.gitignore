@@ -17,9 +17,6 @@
 /.next/
 /out/
 
-# mirrored docs from net/crates/net/docs (built by scripts/copy-docs.mjs)
-/.docs-mirror/
-
 # production
 /build
 

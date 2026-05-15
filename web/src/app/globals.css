@@ -17,6 +17,9 @@
     var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
   --font-display: var(--font-major-mono-display), "JetBrains Mono", monospace;
   --font-head: var(--font-major-mono-display), "JetBrains Mono", monospace;
+  --font-sans:
+    var(--font-space-grotesk), ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, sans-serif;
 
   --breakpoint-sm: 640px;
   --breakpoint-md: 760px;

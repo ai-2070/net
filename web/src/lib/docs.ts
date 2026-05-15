@@ -2,9 +2,13 @@ import "server-only";
 import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import title from "title";
+import GithubSlugger from "github-slugger";
 import { DOCS_ORDER } from "@/docs.order";
 
-const DOCS_ROOT = resolve(process.cwd(), ".docs-mirror");
+// Docs are co-located with the source tree now (MDX-capable). Both `.md`
+// and `.mdx` files are accepted; the renderer picks parsing mode per file.
+const DOCS_ROOT = resolve(process.cwd(), "src", "content", "docs");
+const DOC_EXT_RE = /\.mdx?$/i;
 
 export type DocsOrderConfig = {
   /** Order of top-level folders (sections). Unlisted append alpha after. */
@@ -88,6 +92,7 @@ export type DocFile = {
   slug: string[];
   title: string;
   filePath: string;
+  ext: "md" | "mdx";
 };
 
 export type DocFolder = {
@@ -111,7 +116,15 @@ export type ResolvedDoc =
   | { kind: "folder-index"; folder: DocFolder };
 
 function stripMdExt(name: string): string {
-  return name.replace(/\.md$/i, "");
+  return name.replace(DOC_EXT_RE, "");
+}
+
+function extOf(name: string): "md" | "mdx" {
+  return /\.mdx$/i.test(name) ? "mdx" : "md";
+}
+
+function isDocFile(name: string): boolean {
+  return DOC_EXT_RE.test(name);
 }
 
 // Lowercase + collapse any run of `_` or `-` into a single `-`. This is what
@@ -136,7 +149,7 @@ export function titleize(name: string): string {
 }
 
 function isReadme(name: string): boolean {
-  return /^readme\.md$/i.test(name);
+  return /^readme\.mdx?$/i.test(name);
 }
 
 function buildFolder(absPath: string, slugChain: string[]): DocFolder {
@@ -153,7 +166,7 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
       const childSlug = [...slugChain, normalizeSlug(entry)];
       if (isHidden(childSlug)) continue;
       folders.push(buildFolder(entryPath, childSlug));
-    } else if (stat.isFile() && entry.toLowerCase().endsWith(".md")) {
+    } else if (stat.isFile() && isDocFile(entry)) {
       const childSlug = [...slugChain, slugSegment(entry)];
       if (isHidden(childSlug)) continue;
       const file: DocFile = {
@@ -161,6 +174,7 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
         slug: childSlug,
         title: resolveTitle(childSlug, entry),
         filePath: entryPath,
+        ext: extOf(entry),
       };
       if (isReadme(entry)) readme = file;
       else files.push(file);
@@ -203,7 +217,7 @@ export function getDocTree(): DocTree {
       const childSlug = [normalizeSlug(entry)];
       if (isHidden(childSlug)) continue;
       folders.push(buildFolder(entryPath, childSlug));
-    } else if (stat.isFile() && entry.toLowerCase().endsWith(".md")) {
+    } else if (stat.isFile() && isDocFile(entry)) {
       const childSlug = [slugSegment(entry)];
       if (isHidden(childSlug)) continue;
       const file: DocFile = {
@@ -211,6 +225,7 @@ export function getDocTree(): DocTree {
         slug: childSlug,
         title: resolveTitle(childSlug, entry),
         filePath: entryPath,
+        ext: extOf(entry),
       };
       if (isReadme(entry)) rootReadme = file;
       else rootFiles.push(file);
@@ -301,6 +316,131 @@ export function getAllSlugs(): string[][] {
 
 export function readDocSource(file: DocFile): string {
   return readFileSync(file.filePath, "utf8");
+}
+
+// Table-of-contents entry for one heading in a doc.
+export type TocEntry = {
+  id: string;
+  title: string;
+  level: number; // 2 | 3 | 4 — h1 is page title, intentionally skipped
+};
+
+// Strip simple markdown formatting from heading text so the TOC label
+// reads cleanly (no asterisks, no backticks, no link syntax).
+function stripInline(s: string): string {
+  return s
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/__(.*?)__/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/_([^_]+)_/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+}
+
+// A single page in the linear prev/next reading order.
+export type LinearDoc = {
+  slug: string[]; // URL slug array (empty = /docs)
+  title: string;
+  section?: string; // parent folder title, for context label
+};
+
+// Walk the tree in the order it's displayed in the sidebar (sections-config
+// first, then per-folder order) and produce a flat list of "readable" pages.
+// Auto-generated folder-index pages (folders without a README) are skipped
+// since they're just listings; folder READMEs are included as the section's
+// landing page.
+function flattenForLinearOrder(tree: DocTree): LinearDoc[] {
+  const out: LinearDoc[] = [];
+
+  if (tree.rootReadme) {
+    out.push({ slug: [], title: tree.rootReadme.title });
+  }
+  for (const f of tree.rootFiles) {
+    out.push({ slug: f.slug, title: f.title });
+  }
+  for (const folder of tree.folders) {
+    addFolder(folder, out, folder.title);
+  }
+  return out;
+}
+
+function addFolder(
+  folder: DocFolder,
+  out: LinearDoc[],
+  section: string,
+): void {
+  if (folder.readme) {
+    out.push({ slug: folder.slug, title: folder.title, section });
+  }
+  for (const child of folder.children) {
+    if (child.kind === "file") {
+      if (folder.readme && child === folder.readme) continue;
+      out.push({ slug: child.slug, title: child.title, section });
+    } else {
+      addFolder(child, out, child.title);
+    }
+  }
+}
+
+let cachedLinear: LinearDoc[] | null = null;
+function getLinearDocs(): LinearDoc[] {
+  if (cachedLinear) return cachedLinear;
+  cachedLinear = flattenForLinearOrder(getDocTree());
+  return cachedLinear;
+}
+
+// Look up the previous + next page in the sidebar order for a given slug.
+// `currentSlug` is the URL slug ([] for /docs root, ["foo"] for /docs/foo).
+// Returns nulls when there is no neighbor in that direction.
+export function getPrevNext(currentSlug: string[]): {
+  prev: LinearDoc | null;
+  next: LinearDoc | null;
+} {
+  const list = getLinearDocs();
+  const key = currentSlug.join("/");
+  const idx = list.findIndex((d) => d.slug.join("/") === key);
+  if (idx < 0) return { prev: null, next: null };
+  return {
+    prev: idx > 0 ? (list[idx - 1] ?? null) : null,
+    next: idx < list.length - 1 ? (list[idx + 1] ?? null) : null,
+  };
+}
+
+// Parse h2/h3/h4 headings out of the raw markdown source. Code fences are
+// skipped so `## comments` inside a Rust snippet don't show up. IDs are
+// generated with the same slugger rehype-slug uses, so the TOC anchors
+// match the rendered DOM IDs exactly.
+export function extractToc(source: string): TocEntry[] {
+  const slugger = new GithubSlugger();
+  const out: TocEntry[] = [];
+  const lines = source.split("\n");
+  let inFence = false;
+  let fenceChar = "";
+
+  for (const line of lines) {
+    const fence = /^(```|~~~)/.exec(line);
+    if (fence) {
+      const ch = fence[1]!;
+      if (!inFence) {
+        inFence = true;
+        fenceChar = ch;
+      } else if (line.startsWith(fenceChar)) {
+        inFence = false;
+        fenceChar = "";
+      }
+      continue;
+    }
+    if (inFence) continue;
+
+    const m = /^(#{2,4})\s+(.+?)\s*#*\s*$/.exec(line);
+    if (!m) continue;
+    const level = m[1]!.length;
+    const text = stripInline(m[2]!.trim());
+    if (!text) continue;
+    const id = slugger.slug(text);
+    out.push({ id, title: text, level });
+  }
+  return out;
 }
 
 // Client-safe view of the tree (no fs paths).
