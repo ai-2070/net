@@ -4,7 +4,10 @@ import { join, resolve } from "node:path";
 import title from "title";
 import { DOCS_ORDER } from "@/docs.order";
 
-const DOCS_ROOT = resolve(process.cwd(), ".docs-mirror");
+// Docs are co-located with the source tree now (MDX-capable). Both `.md`
+// and `.mdx` files are accepted; the renderer picks parsing mode per file.
+const DOCS_ROOT = resolve(process.cwd(), "src", "content", "docs");
+const DOC_EXT_RE = /\.mdx?$/i;
 
 export type DocsOrderConfig = {
   /** Order of top-level folders (sections). Unlisted append alpha after. */
@@ -88,6 +91,7 @@ export type DocFile = {
   slug: string[];
   title: string;
   filePath: string;
+  ext: "md" | "mdx";
 };
 
 export type DocFolder = {
@@ -111,7 +115,15 @@ export type ResolvedDoc =
   | { kind: "folder-index"; folder: DocFolder };
 
 function stripMdExt(name: string): string {
-  return name.replace(/\.md$/i, "");
+  return name.replace(DOC_EXT_RE, "");
+}
+
+function extOf(name: string): "md" | "mdx" {
+  return /\.mdx$/i.test(name) ? "mdx" : "md";
+}
+
+function isDocFile(name: string): boolean {
+  return DOC_EXT_RE.test(name);
 }
 
 // Lowercase + collapse any run of `_` or `-` into a single `-`. This is what
@@ -136,7 +148,7 @@ export function titleize(name: string): string {
 }
 
 function isReadme(name: string): boolean {
-  return /^readme\.md$/i.test(name);
+  return /^readme\.mdx?$/i.test(name);
 }
 
 function buildFolder(absPath: string, slugChain: string[]): DocFolder {
@@ -153,7 +165,7 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
       const childSlug = [...slugChain, normalizeSlug(entry)];
       if (isHidden(childSlug)) continue;
       folders.push(buildFolder(entryPath, childSlug));
-    } else if (stat.isFile() && entry.toLowerCase().endsWith(".md")) {
+    } else if (stat.isFile() && isDocFile(entry)) {
       const childSlug = [...slugChain, slugSegment(entry)];
       if (isHidden(childSlug)) continue;
       const file: DocFile = {
@@ -161,6 +173,7 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
         slug: childSlug,
         title: resolveTitle(childSlug, entry),
         filePath: entryPath,
+        ext: extOf(entry),
       };
       if (isReadme(entry)) readme = file;
       else files.push(file);
@@ -203,7 +216,7 @@ export function getDocTree(): DocTree {
       const childSlug = [normalizeSlug(entry)];
       if (isHidden(childSlug)) continue;
       folders.push(buildFolder(entryPath, childSlug));
-    } else if (stat.isFile() && entry.toLowerCase().endsWith(".md")) {
+    } else if (stat.isFile() && isDocFile(entry)) {
       const childSlug = [slugSegment(entry)];
       if (isHidden(childSlug)) continue;
       const file: DocFile = {
@@ -211,6 +224,7 @@ export function getDocTree(): DocTree {
         slug: childSlug,
         title: resolveTitle(childSlug, entry),
         filePath: entryPath,
+        ext: extOf(entry),
       };
       if (isReadme(entry)) rootReadme = file;
       else rootFiles.push(file);

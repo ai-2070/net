@@ -96,7 +96,7 @@ export default async function DocPage({ params }: PageProps) {
           );
         })}
       </div>
-      <DocsContent source={source} />
+      <DocsContent source={source} format={resolved.file.ext} />
     </div>
   );
 }

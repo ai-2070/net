@@ -24,7 +24,7 @@ export default function DocsRootPage() {
 
   if (tree.rootReadme) {
     const source = readDocSource(tree.rootReadme);
-    return <DocsContent source={source} />;
+    return <DocsContent source={source} format={tree.rootReadme.ext} />;
   }
 
   return (

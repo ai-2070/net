@@ -3,6 +3,49 @@ import { MDXRemote } from "next-mdx-remote/rsc";
 import remarkGfm from "remark-gfm";
 import type { ReactNode, AnchorHTMLAttributes } from "react";
 
+const Callout = ({
+  variant,
+  label,
+  children,
+}: {
+  variant: "note" | "tip" | "warn";
+  label: string;
+  children?: ReactNode;
+}) => {
+  const styles = {
+    note: {
+      border: "border-cyan",
+      bg: "bg-cyan/[0.04]",
+      tag: "text-cyan",
+      glyph: "▸",
+    },
+    tip: {
+      border: "border-accent",
+      bg: "bg-accent/[0.04]",
+      tag: "text-accent",
+      glyph: "★",
+    },
+    warn: {
+      border: "border-warn",
+      bg: "bg-warn/[0.04]",
+      tag: "text-warn",
+      glyph: "▲",
+    },
+  }[variant];
+  return (
+    <div
+      className={`border-l-2 ${styles.border} ${styles.bg} pl-4 pr-4 py-3 my-5 text-[13px] text-ink leading-[1.65]`}
+    >
+      <div
+        className={`${styles.tag} font-mono text-[10px] tracking-[0.14em] uppercase mb-1.5`}
+      >
+        {styles.glyph} {label}
+      </div>
+      <div className="docs-callout-body">{children}</div>
+    </div>
+  );
+};
+
 const mdxComponents = {
   h1: (props: { children?: ReactNode }) => (
     <h1
@@ -44,9 +87,7 @@ const mdxComponents = {
       {...props}
     />
   ),
-  li: (props: { children?: ReactNode }) => (
-    <li className="mb-1" {...props} />
-  ),
+  li: (props: { children?: ReactNode }) => <li className="mb-1" {...props} />,
   blockquote: (props: { children?: ReactNode }) => (
     <blockquote
       className="border-l-2 border-accent bg-accent/[0.04] pl-4 pr-4 py-3 my-5 text-[13px] text-ink leading-[1.65]"
@@ -55,8 +96,7 @@ const mdxComponents = {
   ),
   hr: () => <hr className="border-line my-8" />,
   code: (props: { children?: ReactNode; className?: string }) => {
-    // Fenced code blocks are wrapped in <pre><code class="language-…">.
-    // Inline code lands here without a language class.
+    // Fenced code blocks land with a `language-*` class; inline code has none.
     const isBlock = typeof props.className === "string";
     if (isBlock) {
       return (
@@ -116,10 +156,7 @@ const mdxComponents = {
     />
   ),
   td: (props: { children?: ReactNode }) => (
-    <td
-      className="px-3 py-2 border-b border-line align-top"
-      {...props}
-    />
+    <td className="px-3 py-2 border-b border-line align-top" {...props} />
   ),
   strong: (props: { children?: ReactNode }) => (
     <strong className="text-ink font-semibold" {...props} />
@@ -127,16 +164,64 @@ const mdxComponents = {
   em: (props: { children?: ReactNode }) => (
     <em className="text-cyan not-italic" {...props} />
   ),
+
+  // Custom components, usable in .mdx files without any import:
+  //   <Note>Heads up — …</Note>
+  //   <Tip>Pro tip — …</Tip>
+  //   <Warn>Careful — …</Warn>
+  //   <Demo title="…">…React children…</Demo>
+  Note: ({ children }: { children?: ReactNode }) => (
+    <Callout variant="note" label="note">
+      {children}
+    </Callout>
+  ),
+  Tip: ({ children }: { children?: ReactNode }) => (
+    <Callout variant="tip" label="tip">
+      {children}
+    </Callout>
+  ),
+  Warn: ({ children }: { children?: ReactNode }) => (
+    <Callout variant="warn" label="warning">
+      {children}
+    </Callout>
+  ),
+  Demo: ({
+    title,
+    children,
+  }: {
+    title?: string;
+    children?: ReactNode;
+  }) => (
+    <div className="my-6 border border-line bg-bg-2 overflow-hidden">
+      {title ? (
+        <div className="border-b border-line px-4 py-2 text-[10px] tracking-[0.14em] text-ink-dim uppercase flex items-center gap-2">
+          <span className="text-accent">▸</span> {title}
+        </div>
+      ) : null}
+      <div className="p-5">{children}</div>
+    </div>
+  ),
+  Kbd: ({ children }: { children?: ReactNode }) => (
+    <kbd className="font-mono text-[11px] text-ink bg-bg-2 border border-line px-1.5 py-[2px] mx-[1px]">
+      {children}
+    </kbd>
+  ),
 };
 
-export function DocsContent({ source }: { source: string }) {
+export function DocsContent({
+  source,
+  format = "md",
+}: {
+  source: string;
+  format?: "md" | "mdx";
+}) {
   return (
     <article className="docs-content">
       <MDXRemote
         source={source}
         options={{
           mdxOptions: {
-            format: "md",
+            format,
             remarkPlugins: [remarkGfm],
           },
         }}

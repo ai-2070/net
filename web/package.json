@@ -4,8 +4,6 @@
   "private": true,
   "scripts": {
     "copy-docs": "node scripts/copy-docs.mjs",
-    "prebuild": "npm run copy-docs",
-    "predev": "npm run copy-docs",
     "build": "npx next build",
     "build:vercel": "timeout 15m npm run build",
     "dev": "npx next dev --turbo",
