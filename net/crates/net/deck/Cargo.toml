@@ -21,10 +21,16 @@ parking_lot = "0.12"
 
 [features]
 default = []
-# `demo` spawns an in-process MeshOsRuntime, a small set of
-# example daemons, and a tokio task that seeds events so every
-# tab has live snapshot data to render. Without this feature
-# the binary starts in fixture mode (placeholder data only —
-# useful for the visual style work but not connected to any
-# real cluster).
-demo = []
+# `samples` opts in to a synthetic event seeder:
+# 17 fake peers via Locality/Health probes, 11 daemons
+# across all four lineage groups, and a background tokio
+# task publishing log lines + cordon/uncordon admin
+# events. Useful for screenshots, walkthroughs, and
+# offline visual work on the UI.
+#
+#   cargo run -p deck --features samples
+#
+# Default (no flag) spawns the same in-process runtime
+# but injects nothing — the deck shows the empty cluster
+# view, ready to connect to real cluster sources.
+samples = []

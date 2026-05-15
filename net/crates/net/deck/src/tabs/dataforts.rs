@@ -10,11 +10,28 @@ use crate::{nodes, theme};
 pub fn render(frame: &mut Frame<'_>, area: Rect, tick: u64) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1), // mock banner
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
         .split(area);
 
-    render_summary(frame, rows[0]);
-    render_pool(frame, rows[1], tick);
+    render_mock_banner(frame, rows[0]);
+    render_summary(frame, rows[1]);
+    render_pool(frame, rows[2], tick);
+}
+
+fn render_mock_banner(frame: &mut Frame<'_>, area: Rect) {
+    let line = Line::from(vec![
+        Span::styled("  ⚠ ", theme::amber()),
+        Span::styled("MOCK", theme::amber()),
+        Span::styled(
+            "  ·  Dataforts SDK pending — visuals below are illustrative, not live data",
+            theme::dim(),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_summary(frame: &mut Frame<'_>, area: Rect) {

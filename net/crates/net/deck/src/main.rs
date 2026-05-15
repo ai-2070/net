@@ -5,18 +5,19 @@
 //! site aesthetic (neon-green on pitch black).
 //!
 //! Build modes:
-//! - default: fixture-only mode. Every tab renders hard-coded
-//!   placeholder data. Useful for visual / style work.
-//! - `--features demo`: spawns an in-process `MeshOsRuntime` +
-//!   four demo daemons + a seeder task that publishes log
-//!   lines and signed admin events. Every tab that reads from
-//!   `DeckClient::status()` renders live snapshot data.
+//! - default: live in-process `MeshOsRuntime`, no sample
+//!   data. Every tab reads from the snapshot — empty until
+//!   real cluster sources are wired.
+//! - `--features samples`: adds a static fixture of 17 fake
+//!   peers + 11 daemons across all four lineage groups so
+//!   the deck has something concrete to monitor. No event
+//!   seeders — the deck observes whatever steady state the
+//!   runtime + supervisor produce on their own.
 
 mod app;
-#[cfg(feature = "demo")]
-mod demo;
 mod lineage;
 mod nodes;
+mod runtime;
 mod tabs;
 mod theme;
 mod widgets;
@@ -27,25 +28,16 @@ use app::App;
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
-    // Demo bootstrap. Without the `demo` feature, the harness
-    // doesn't compile in; the app runs in fixture mode.
-    #[cfg(feature = "demo")]
-    let harness = Some(demo::spawn().await?);
-    #[cfg(not(feature = "demo"))]
-    let harness: Option<()> = None;
-
-    #[cfg(feature = "demo")]
-    let deck = harness.as_ref().map(|h| h.deck());
-    #[cfg(not(feature = "demo"))]
-    let deck: Option<std::sync::Arc<net_sdk::deck::DeckClient>> = None;
+    let harness = runtime::spawn().await?;
+    let deck = harness.deck();
 
     let terminal = ratatui::init();
     let result = App::new(deck).run(terminal);
     ratatui::restore();
 
-    // Explicit drop so the demo harness's Drop impl fires
-    // BEFORE we return from main — aborts the seeder task +
-    // shuts the runtime down before the process exits.
-    let _ = harness;
+    // Explicit drop so the harness's tear-down runs before
+    // the process exits — drops the SDK + samples daemons +
+    // backing tokio tasks deterministically.
+    drop(harness);
     result
 }

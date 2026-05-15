@@ -17,22 +17,18 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let evt_per_s = 8_300_000u64 + ((app.tick.wrapping_mul(11_113)) % 400_000);
     let p50_ns = 35 + (app.tick.wrapping_mul(3) % 8) as u64;
 
-    // First slot reflects whether the binary is wired to a
-    // live runtime ("DEMO" / "LIVE") or running in fixture
-    // mode with no real data behind any tab ("FIXTURE").
-    let (mode_dot_style, mode_text, mode_style) = if app.is_connected() {
-        if cfg!(feature = "demo") {
-            (theme::green(), "DEMO", theme::green_hi())
-        } else {
-            (theme::green(), "LIVE", theme::green_hi())
-        }
+    // First slot: the binary always spawns an in-process
+    // runtime now, so the dot is always green. The label
+    // reflects whether the static sample fixture is installed.
+    let mode_text = if cfg!(feature = "samples") {
+        "LIVE +samples"
     } else {
-        (theme::amber(), "FIXTURE", theme::amber())
+        "LIVE"
     };
 
     let left = Line::from(vec![
-        Span::styled("● ", mode_dot_style),
-        Span::styled(mode_text, mode_style),
+        Span::styled("● ", theme::green()),
+        Span::styled(mode_text, theme::green_hi()),
         Span::raw("   "),
         Span::styled("CODENAME: ", theme::chrome()),
         Span::styled("ATOMIC PLAYBOYS", theme::text()),

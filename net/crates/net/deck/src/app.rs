@@ -58,15 +58,16 @@ pub struct App {
     pub should_quit: bool,
     pub started: Instant,
     pub tick: u64,
-    /// `None` in fixture mode (binary built without
-    /// `feature = "demo"` and not yet connected to a real
-    /// cluster). `Some` when wired to a running runtime.
-    pub deck: Option<Arc<DeckClient>>,
-    /// Latest snapshot refreshed on each tick. Tabs that
-    /// render live data read this; tabs still on fixtures
-    /// ignore it. Wrapped in `Arc` so cloning into per-tab
-    /// scope is one atomic-refcount op.
-    pub snapshot: Option<Arc<MeshOsSnapshot>>,
+    /// The deck client. Always present — the binary spawns
+    /// an in-process runtime at startup. Tabs read snapshot
+    /// data through it.
+    pub deck: Arc<DeckClient>,
+    /// Latest snapshot refreshed on each tick. Wrapped in
+    /// `Arc` so cloning into per-tab scope is one
+    /// atomic-refcount op. Tabs check whether the snapshot's
+    /// collections are empty to decide between live and
+    /// fixture rendering paths.
+    pub snapshot: Arc<MeshOsSnapshot>,
     /// Cursor on the DAEMON tab's lineage tree. Indices into
     /// the live group list — `j`/`k` move the cursor; the
     /// detail pane on the right reflects whichever member is
@@ -81,8 +82,8 @@ pub struct DaemonCursor {
 }
 
 impl App {
-    pub fn new(deck: Option<Arc<DeckClient>>) -> Self {
-        let snapshot = deck.as_ref().map(|d| Arc::new(d.status()));
+    pub fn new(deck: Arc<DeckClient>) -> Self {
+        let snapshot = Arc::new(deck.status());
         Self {
             current: Tab::NetMap,
             should_quit: false,
@@ -92,13 +93,6 @@ impl App {
             snapshot,
             daemon_cursor: DaemonCursor::default(),
         }
-    }
-
-    /// True iff the binary is connected to a live runtime —
-    /// status bar uses this to switch between "DEMO" / "LIVE"
-    /// / "FIXTURE" mode indicators.
-    pub fn is_connected(&self) -> bool {
-        self.deck.is_some()
     }
 
     pub fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
@@ -124,9 +118,7 @@ impl App {
     }
 
     fn refresh_snapshot(&mut self) {
-        if let Some(deck) = &self.deck {
-            self.snapshot = Some(Arc::new(deck.status()));
-        }
+        self.snapshot = Arc::new(self.deck.status());
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -170,15 +162,11 @@ impl App {
     }
 
     /// Clamp the daemon cursor against the current snapshot's
-    /// live lineage groups. If the snapshot is empty (fixture
-    /// mode) the cursor is clamped to (0, 0) — the fixture
-    /// tab still uses hardcoded `CURSOR_GROUP` constants.
+    /// live lineage groups. With no daemons in the snapshot
+    /// the cursor is reset to (0, 0) — the fixture tab uses
+    /// hardcoded constants in that case.
     fn clamp_daemon_cursor(&mut self) {
-        let Some(snap) = self.snapshot.as_ref() else {
-            self.daemon_cursor = DaemonCursor::default();
-            return;
-        };
-        let groups = crate::lineage::group_daemons(&snap.daemons);
+        let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
         if groups.is_empty() {
             self.daemon_cursor = DaemonCursor::default();
             return;
@@ -211,20 +199,18 @@ impl App {
         widgets::rule::render(frame, chunks[2]);
         match self.current {
             Tab::NetMap => {
-                tabs::net_map::render(frame, chunks[3], self.tick, self.snapshot.as_deref())
+                tabs::net_map::render(frame, chunks[3], self.tick, Some(&self.snapshot))
             }
-            Tab::List => {
-                tabs::list_view::render(frame, chunks[3], self.snapshot.as_deref())
-            }
+            Tab::List => tabs::list_view::render(frame, chunks[3], Some(&self.snapshot)),
             Tab::Dataforts => tabs::dataforts::render(frame, chunks[3], self.tick),
             Tab::Daemon => tabs::daemon::render(
                 frame,
                 chunks[3],
-                self.snapshot.as_deref(),
+                Some(&self.snapshot),
                 self.daemon_cursor,
             ),
             Tab::Logs => {
-                tabs::logs::render(frame, chunks[3], self.tick, self.snapshot.as_deref())
+                tabs::logs::render(frame, chunks[3], self.tick, Some(&self.snapshot))
             }
         }
         widgets::footer::render(frame, chunks[4]);
