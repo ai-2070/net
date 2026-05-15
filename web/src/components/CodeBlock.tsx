@@ -30,8 +30,8 @@ export function CodeBlock({
   const text = extractText(children).replace(/\n$/, "");
   const hasLang = typeof lang === "string" && lang.length > 0;
   return (
-    <div className="my-6 border border-line bg-bg-2 overflow-hidden">
-      <div className="flex items-center justify-between border-b border-line px-3 py-1.5 bg-bg/40">
+    <div className="my-6 border border-line overflow-hidden bg-[#050706]">
+      <div className="flex items-center justify-between border-b border-line px-3 py-1.5 bg-bg-2/60">
         <span className="font-mono text-[10px] tracking-[0.14em] uppercase text-accent-dim">
           <span className="text-accent">▸</span> {hasLang ? lang : "code"}
         </span>
