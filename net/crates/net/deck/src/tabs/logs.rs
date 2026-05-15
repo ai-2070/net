@@ -191,7 +191,7 @@ fn render_status(
     let shown = records
         .iter()
         .filter(|r| level_rank(r.level) >= level_rank(min_level))
-        .filter(|r| needle.is_empty() || matches_ci(&r.message, &needle))
+        .filter(|r| needle.is_empty() || record_matches(r, &needle))
         .count();
     let (source_text, source_style) = if paused {
         ("frozen snapshot", theme::amber())
@@ -233,7 +233,7 @@ fn project_log_records(
     for rec in records
         .iter()
         .filter(|r| level_rank(r.level) >= min)
-        .filter(|r| needle.is_empty() || matches_ci(&r.message, &needle))
+        .filter(|r| needle.is_empty() || record_matches(r, &needle))
     {
         let (level_style, level_pad) = match rec.level {
             LogLevel::Info  => (theme::dim(),   "INFO "),
@@ -283,6 +283,32 @@ fn matches_ci(haystack: &str, needle_lower: &str) -> bool {
         return true;
     }
     haystack.to_ascii_lowercase().contains(needle_lower)
+}
+
+/// Match a log record against the search needle. Covers the
+/// message column plus the structured `daemon_id` / `node_id`
+/// fields rendered as `0x…` so operators can grep by daemon
+/// hex directly — even when the message text doesn't repeat
+/// the id (e.g. an auto-generated daemon log emitted via
+/// `publish_log` without echoing the id into the message).
+fn record_matches(rec: &LogRecord, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if matches_ci(&rec.message, needle_lower) {
+        return true;
+    }
+    if let Some(d) = rec.daemon_id {
+        if format!("0x{d:x}").contains(needle_lower) {
+            return true;
+        }
+    }
+    if let Some(n) = rec.node_id {
+        if format!("0x{n:x}").contains(needle_lower) {
+            return true;
+        }
+    }
+    false
 }
 
 fn format_ts_ms(ts_ms: u64) -> String {
