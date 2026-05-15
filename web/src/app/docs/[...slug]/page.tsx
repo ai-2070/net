@@ -41,44 +41,165 @@ function TocRail({ entries }: { entries: readonly TocEntry[] }) {
   );
 }
 
+// Stable djb2 hash → deterministic "size" + inode tag per slug.
+function fakeHash(s: string): number {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  }
+  return h;
+}
+
+function fakeSize(slug: string): string {
+  const k = 1 + (fakeHash(slug) % 90) / 10; // 1.0k – 10.0k
+  return `${k.toFixed(1)}k`;
+}
+
+function fakeInode(slug: string): string {
+  return (fakeHash(slug) & 0xffff).toString(16).padStart(4, "0");
+}
+
+// Newest entry "now", each row ~30 days older.
+function fakeMtime(i: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() - i * 30);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 function FolderIndex({ folder }: { folder: DocFolder }) {
+  const childCount = folder.children.length;
+
   return (
     <div>
-      <div className="sec-label text-[10px] tracking-[0.2em] text-accent uppercase mb-3">
-        ▸ section
+      {/* Eyebrow label — homepage-style section marker */}
+      <div className="font-mono text-[10px] tracking-[0.22em] text-accent-dim uppercase mb-3 flex items-baseline justify-between">
+        <span>
+          <span className="text-accent">§</span> section ·{" "}
+          <span className="text-ink-faint">/docs/{folder.slug.join("/")}</span>
+        </span>
+        <span className="text-ink-faint normal-case tracking-normal tabular-nums">
+          {String(childCount).padStart(2, "0")} entries
+        </span>
       </div>
+
+      {/* Letter-spaced display title — record sleeve aesthetic */}
       <h1
-        className="font-display text-ink mt-1 mb-3 leading-[1.15] tracking-[0.01em]"
-        style={{ fontSize: "clamp(26px, 3vw, 32px)" }}
+        className="font-display text-ink mb-2 leading-[1]"
+        style={{
+          fontSize: "clamp(32px, 4.4vw, 56px)",
+          letterSpacing: "0.04em",
+        }}
       >
         {folder.title}
       </h1>
-      <p className="text-[12px] text-ink-faint font-mono tracking-[0.06em] mb-8">
-        /docs/{folder.slug.join("/")}
-      </p>
-      {folder.children.length === 0 ? (
-        <p className="text-ink-dim text-[13px]">
-          No documents in this section.
+      <div
+        aria-hidden
+        className="border-t border-line/60 mb-10"
+        style={{
+          backgroundImage:
+            "linear-gradient(90deg, transparent 0, transparent 60%, var(--color-accent-dim) 60%, var(--color-accent-dim) 62%, transparent 62%)",
+        }}
+      />
+
+      {childCount === 0 ? (
+        <p className="font-mono text-ink-dim text-[13px]">
+          <span className="text-ink-faint">·</span> empty section
         </p>
       ) : (
-        <ul className="border-t border-line">
-          {folder.children.map((child) => (
-            <li key={child.slug.join("/")} className="border-b border-line">
+        <div className="space-y-px">
+          {folder.children.map((child, i) => {
+            const slugKey = child.slug.join("/");
+            const isFolder = child.kind === "folder";
+            const size = fakeSize(slugKey);
+            const mtime = fakeMtime(i);
+            const inode = fakeInode(slugKey);
+            const isNew = i === 0;
+            const num = String(i + 1).padStart(2, "0");
+            return (
               <Link
-                href={`/docs/${child.slug.join("/")}`}
-                className="flex items-center justify-between py-3 group hover:text-accent transition-colors"
+                key={slugKey}
+                href={`/docs/${slugKey}`}
+                className="group relative block border border-line bg-bg-2/30 hover:bg-bg-2/60 hover:border-accent-dim transition-colors"
               >
-                <span className="text-[13px] text-ink-dim group-hover:text-accent">
-                  {child.kind === "folder" ? `▸ ${child.title}` : child.title}
-                </span>
-                <span className="font-mono text-[10px] text-ink-faint tracking-[0.1em]">
-                  {child.kind === "folder" ? "section" : "doc"}
-                </span>
+                <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-4 px-4 py-3.5">
+                  {/* Big index number */}
+                  <span
+                    aria-hidden
+                    className="font-mono font-light text-[28px] leading-none text-accent-dim group-hover:text-accent transition-colors tabular-nums shrink-0"
+                  >
+                    {num}
+                  </span>
+
+                  {/* Codename + meta */}
+                  <div className="min-w-0">
+                    <div
+                      className={`font-mono uppercase text-[15px] leading-tight tracking-[0.04em] truncate transition-colors ${
+                        isFolder
+                          ? "text-cyan group-hover:text-accent"
+                          : "text-ink group-hover:text-accent"
+                      }`}
+                    >
+                      {isFolder ? `▸ ${child.title}` : child.title}
+                    </div>
+                    <div className="font-mono text-[10px] text-ink-faint tracking-[0.06em] tabular-nums mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5">
+                      <span>
+                        <span className="text-accent-dim">·</span> {mtime}
+                      </span>
+                      <span>
+                        <span className="text-accent-dim">·</span> {size}
+                      </span>
+                      <span>
+                        <span className="text-accent-dim">·</span> 0x{inode}
+                      </span>
+                      <span className="hidden sm:inline">
+                        <span className="text-accent-dim">·</span>{" "}
+                        {isFolder ? "section" : "doc"}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Right slot: NEW badge on first row, otherwise an arrow */}
+                  <span className="shrink-0 flex items-center">
+                    {isNew ? (
+                      <span className="font-mono text-[9px] tracking-[0.22em] uppercase bg-accent text-bg px-1.5 py-0.5 font-bold">
+                        new
+                      </span>
+                    ) : (
+                      <span
+                        aria-hidden
+                        className="font-mono text-ink-faint group-hover:text-accent transition-colors"
+                      >
+                        →
+                      </span>
+                    )}
+                  </span>
+                </div>
+                {/* Bottom hairline that lights up on hover */}
+                <span
+                  aria-hidden
+                  className="absolute left-0 right-0 bottom-0 h-px bg-line group-hover:bg-accent/40 transition-colors"
+                />
               </Link>
-            </li>
-          ))}
-        </ul>
+            );
+          })}
+        </div>
       )}
+
+      {/* Status footer — small live indicator + count */}
+      {childCount > 0 ? (
+        <div className="mt-6 flex items-center justify-between text-[9px] tracking-[0.18em] uppercase font-mono">
+          <span className="flex items-center gap-1.5">
+            <span className="w-1 h-1 rounded-full bg-accent inline-block animate-pulse-dot" />
+            <span className="text-accent-dim">live</span>
+          </span>
+          <span className="text-ink-faint tabular-nums">
+            {String(childCount).padStart(2, "0")} / total
+          </span>
+        </div>
+      ) : null}
     </div>
   );
 }
