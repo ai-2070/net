@@ -87,6 +87,13 @@ fn render_list(
     cursor: DaemonCursor,
 ) {
     let total: usize = groups.iter().map(|g| g.members.len()).sum();
+    let n_groups = groups.len();
+    // Daemon cursor is two-level (group + member within group).
+    // Clamp against the live shape so the chip stays coherent
+    // when groups churn under the cursor.
+    let g_pos = cursor.group.min(n_groups.saturating_sub(1));
+    let m_total = groups.get(g_pos).map(|g| g.members.len()).unwrap_or(0);
+    let m_pos = cursor.member.min(m_total.saturating_sub(1));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -94,8 +101,16 @@ fn render_list(
             Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
             Span::styled("DAEMONS", theme::green_hi()),
             Span::styled(
-                format!("   {total} live · {} groups", groups.len()),
+                format!("   {total} live · {n_groups} groups"),
                 theme::chrome(),
+            ),
+            Span::styled(
+                format!(
+                    "    grp {}/{n_groups} · mbr {}/{m_total}",
+                    g_pos + 1,
+                    m_pos + 1
+                ),
+                theme::dim(),
             ),
         ]));
     let inner = block.inner(area);
