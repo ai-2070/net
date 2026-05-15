@@ -1,0 +1,45 @@
+net/crates/net/deck/src/tabs/net_map.rs
+  s_3bbc444b3ef3e5::t_5b47222709379e 164-166
+  s_3bbc444b3ef3e5::t_c57b29e5f49b86 159-163
+  s_3bbc444b3ef3e5::t_3692679d9f7920 12
+  s_3bbc444b3ef3e5::t_202c0ece18b2dd 183-218,220-253
+net/crates/net/deck/src/tabs/list_view.rs
+  s_3bbc444b3ef3e5::t_c402eefab3b277 41-61,66,75,89
+  s_3bbc444b3ef3e5::t_e443d06186cea7 185
+  s_3bbc444b3ef3e5::t_c2b37303a899fe 108-111,122,127,132-153,158,172-180,184,198-200,202-206
+  s_3bbc444b3ef3e5::t_0bacfc9d43888c 8
+  s_3bbc444b3ef3e5::t_5b8eaaaf5e5a19 201
+net/crates/net/deck/src/main.rs
+  s_3bbc444b3ef3e5::t_9b843c14ac9e37 8
+net/crates/net/deck/src/tabs/daemon.rs
+  s_3bbc444b3ef3e5::t_3239830b6342b9 8
+  s_3bbc444b3ef3e5::t_2d2ec6ddf73a67 4,13,19-38,40-111,119,121-177,179-202,204,206-222,225-226,228-231,238-239,248-249,254-257,260-279,285-295,301-338,374,385-386,388-390,399-402,409
+  s_3bbc444b3ef3e5::t_08bd732dab9bd8 39
+  s_3bbc444b3ef3e5::t_169c91c45e9118 280-283,296
+net/crates/net/deck/src/tabs/logs.rs
+  s_3bbc444b3ef3e5::t_cb222e535fed68 135,140-148
+  s_3bbc444b3ef3e5::t_65e239c770c1ab 8
+net/crates/net/deck/src/nodes.rs
+  s_3bbc444b3ef3e5::t_2dc5ebab30f47b 1-5,7-57
+  s_3bbc444b3ef3e5::t_9da75124ba8155 6
+net/crates/net/deck/src/tabs/dataforts.rs
+  s_3bbc444b3ef3e5::t_88479e7c281a3a 77-85,87,93-98
+  s_3bbc444b3ef3e5::t_26b51dcf283360 114-130,132,135,142,147-158
+  s_3bbc444b3ef3e5::t_837b5290322760 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "aac9799b72e21ded16cd35d3114add61ffd175f6",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
