@@ -143,6 +143,12 @@ pub struct App {
     /// When `true`, keystrokes go into `audit_search` instead of
     /// the normal binding table.
     pub audit_search_editing: bool,
+    /// FAILURES tab substring search. Matches against the source
+    /// token and the reason string.
+    pub failures_search: String,
+    /// When `true`, keystrokes go into `failures_search` instead
+    /// of the normal binding table.
+    pub failures_search_editing: bool,
     /// Active modal overlay (confirmation prompt, future
     /// signature collector, future help screen). When `Some`,
     /// the modal absorbs key input until dismissed.
@@ -247,6 +253,8 @@ impl App {
             logs_search_editing: false,
             audit_search: String::new(),
             audit_search_editing: false,
+            failures_search: String::new(),
+            failures_search_editing: false,
             modal: None,
         }
     }
@@ -286,7 +294,7 @@ impl App {
         // Search prompts are the second-tier absorber: while a
         // tab's `_editing` flag is set, keystrokes go into that
         // tab's query buffer rather than the normal bindings.
-        if self.logs_search_editing || self.audit_search_editing {
+        if self.logs_search_editing || self.audit_search_editing || self.failures_search_editing {
             self.on_search_key(code);
             return;
         }
@@ -436,6 +444,10 @@ impl App {
             // and rendered target text.
             KeyCode::Char('/') if self.current == Tab::Audit => {
                 self.audit_search_editing = true;
+            }
+            // FAILURES: substring search across source + reason.
+            KeyCode::Char('/') if self.current == Tab::Failures => {
+                self.failures_search_editing = true;
             }
             KeyCode::Char('n') if self.current == Tab::Audit => {
                 self.audit_limit = match self.audit_limit {
@@ -614,6 +626,8 @@ impl App {
             (&mut self.logs_search, &mut self.logs_search_editing)
         } else if self.audit_search_editing {
             (&mut self.audit_search, &mut self.audit_search_editing)
+        } else if self.failures_search_editing {
+            (&mut self.failures_search, &mut self.failures_search_editing)
         } else {
             return;
         };
@@ -1217,7 +1231,14 @@ impl App {
             ),
             Tab::Failures => {
                 let records = self.failures_tail.snapshot();
-                tabs::failures::render(frame, chunks[3], &records, self.failures_cursor);
+                tabs::failures::render(
+                    frame,
+                    chunks[3],
+                    &records,
+                    self.failures_cursor,
+                    &self.failures_search,
+                    self.failures_search_editing,
+                );
             }
         }
         widgets::footer::render(frame, chunks[4]);

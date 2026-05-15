@@ -14,23 +14,32 @@ use ratatui::{
 
 use crate::{theme, widgets};
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, records: &[FailureRecord], cursor: usize) {
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    records: &[FailureRecord],
+    cursor: usize,
+    search: &str,
+    search_editing: bool,
+) {
     if records.is_empty() {
-        render_empty(frame, area);
+        render_empty(frame, area, search, search_editing);
     } else {
-        render_table(frame, area, records, cursor);
+        render_table(frame, area, records, cursor, search, search_editing);
     }
 }
 
-fn render_empty(frame: &mut Frame<'_>, area: Rect) {
+fn render_empty(frame: &mut Frame<'_>, area: Rect, search: &str, search_editing: bool) {
+    let mut title_spans = vec![
+        Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+        Span::styled("FAILURES", theme::green_hi()),
+        Span::styled("    0 records", theme::chrome()),
+    ];
+    append_search_chip(&mut title_spans, search, search_editing);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
-        .title(Line::from(vec![
-            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-            Span::styled("FAILURES", theme::green_hi()),
-            Span::styled("    0 records", theme::chrome()),
-        ]));
+        .title(Line::from(title_spans));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     widgets::empty::render(
@@ -46,15 +55,32 @@ fn render_table(
     area: Rect,
     records: &[FailureRecord],
     cursor: usize,
+    search: &str,
+    search_editing: bool,
 ) {
+    let needle = search.to_ascii_lowercase();
+    // Project records to the visible (filtered, reversed) set
+    // first, then index the cursor against that. Lets the
+    // cursor stay coherent as the operator types.
+    let visible: Vec<&FailureRecord> = records
+        .iter()
+        .rev()
+        .filter(|r| needle.is_empty() || record_matches(r, &needle))
+        .collect();
     let total = records.len();
-    let pos = cursor.min(total.saturating_sub(1)) + 1;
-    let header_line = Line::from(vec![
+    let shown = visible.len();
+    let pos = cursor.min(shown.saturating_sub(1)) + 1;
+    let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("FAILURES", theme::green_hi()),
-        Span::styled(format!("    {total} records"), theme::chrome()),
-        Span::styled(format!("    {pos}/{total}"), theme::dim()),
-    ]);
+        Span::styled(
+            format!("    {shown}/{total} records"),
+            theme::chrome(),
+        ),
+        Span::styled(format!("    {pos}/{shown}"), theme::dim()),
+    ];
+    append_search_chip(&mut title_spans, search, search_editing);
+    let header_line = Line::from(title_spans);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -71,12 +97,13 @@ fn render_table(
     .height(1);
 
     let now_ms = unix_now_ms();
-    let mut rows: Vec<Row> = Vec::with_capacity(total);
-    // Newest first — failures matter most at the head. Cursor
-    // indexes the visible (post-reverse) order, so cursor=0
-    // points at the freshest record.
-    for (i, rec) in records.iter().rev().enumerate() {
-        let is_cursor = i == cursor;
+    let mut rows: Vec<Row> = Vec::with_capacity(shown);
+    // Clamp the cursor against `visible` for marker placement
+    // so a narrowed search never leaves the row indicator
+    // floating off the bottom of the table.
+    let effective_cursor = cursor.min(shown.saturating_sub(1));
+    for (i, rec) in visible.iter().enumerate() {
+        let is_cursor = i == effective_cursor;
         let marker = if is_cursor { "▶" } else { " " };
         let when = format_relative(rec.recorded_at_ms, now_ms);
         // Replay-derived records carry `seq = 0` and are dim to
@@ -86,13 +113,12 @@ fn render_table(
         } else {
             format!("{:>5}", rec.seq)
         };
-        let source_style = if is_cursor { theme::amber() } else { theme::amber() };
         let reason_style = if is_cursor { theme::green_hi() } else { theme::text() };
         rows.push(Row::new(vec![
             Cell::from(Span::styled(marker, theme::green_hi())),
             Cell::from(Span::styled(seq_text, theme::dim())),
             Cell::from(Span::styled(when, theme::text())),
-            Cell::from(Span::styled(rec.source.clone(), source_style)),
+            Cell::from(Span::styled(rec.source.clone(), theme::amber())),
             Cell::from(Span::styled(rec.reason.clone(), reason_style)),
         ]));
     }
@@ -115,6 +141,39 @@ fn render_table(
 
 fn cell_dim(s: &'static str) -> Cell<'static> {
     Cell::from(Span::styled(s, theme::chrome()))
+}
+
+/// Append the active-search chip / editing prompt to the title
+/// row. While editing, the prompt hijacks the row entirely so
+/// the operator's typing is front-and-center.
+fn append_search_chip(spans: &mut Vec<Span<'static>>, search: &str, search_editing: bool) {
+    if search_editing {
+        spans.push(Span::styled("    / ", theme::amber()));
+        spans.push(Span::styled(search.to_string(), theme::green_hi()));
+        spans.push(Span::styled("_", theme::amber()));
+        spans.push(Span::styled(
+            "    [Enter] commit  [Esc] cancel",
+            theme::dim(),
+        ));
+    } else if !search.is_empty() {
+        spans.push(Span::styled(
+            format!("    [match /{search}/]"),
+            theme::amber(),
+        ));
+    }
+}
+
+/// Substring match across the searchable surface of a failure
+/// record: source token + reason. `needle_lower` must already
+/// be lowercased.
+fn record_matches(rec: &FailureRecord, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if rec.source.to_ascii_lowercase().contains(needle_lower) {
+        return true;
+    }
+    rec.reason.to_ascii_lowercase().contains(needle_lower)
 }
 
 fn unix_now_ms() -> u64 {
