@@ -119,6 +119,29 @@ enum NodeActionKind {
 /// enough that an accidental drain auto-times out.
 pub const DEFAULT_DRAIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Default ICE cluster-freeze TTL when the operator hits `[F]`.
+/// 60 seconds — long enough to investigate, short enough that an
+/// accidental freeze auto-thaws before reconcile drifts.
+pub const DEFAULT_ICE_FREEZE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// ICE commit pipeline shared by every ICE variant: simulate
+/// (binds `issued_at_ms` + `blast_hash`), sign with the
+/// deck's operator identity, commit the signed bundle. Errors
+/// surface in the audit ring as `Rejected` entries; on
+/// success the audit row reads `Accepted`.
+async fn dispatch_ice(deck: &Arc<DeckClient>, proposal: net_sdk::deck::IceProposal<'_>) {
+    let simulated = match proposal.simulate().await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let sig = deck.identity().sign_proposal(
+        simulated.action(),
+        simulated.issued_at_ms(),
+        &simulated.blast_hash(),
+    );
+    let _ = simulated.commit(&[sig]).await;
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DaemonCursor {
     pub group: usize,
@@ -248,8 +271,40 @@ impl App {
             KeyCode::Char('i') if self.current == Tab::List => {
                 self.propose_node_action(NodeActionKind::InvalidatePlacement);
             }
+            // ICE break-glass on LIST tab: `F` freeze, `T` thaw.
+            // Cluster-wide; not node-scoped. Capital letters to
+            // distinguish from routine commands.
+            KeyCode::Char('F') if self.current == Tab::List => {
+                self.propose_ice_freeze();
+            }
+            KeyCode::Char('T') if self.current == Tab::List => {
+                self.propose_ice_thaw();
+            }
             _ => {}
         }
+    }
+
+    fn propose_ice_freeze(&mut self) {
+        use net_sdk::deck::{simulate_ice_proposal, IceActionProposal};
+        let action = IceActionProposal::FreezeCluster {
+            ttl: DEFAULT_ICE_FREEZE_TTL,
+        };
+        let blast = simulate_ice_proposal(&self.snapshot, &action);
+        self.modal = Some(Modal::Confirm(
+            crate::widgets::confirm::ConfirmAction::IceFreezeCluster {
+                ttl: DEFAULT_ICE_FREEZE_TTL,
+                blast,
+            },
+        ));
+    }
+
+    fn propose_ice_thaw(&mut self) {
+        use net_sdk::deck::{simulate_ice_proposal, IceActionProposal};
+        let action = IceActionProposal::ThawCluster;
+        let blast = simulate_ice_proposal(&self.snapshot, &action);
+        self.modal = Some(Modal::Confirm(
+            crate::widgets::confirm::ConfirmAction::IceThawCluster { blast },
+        ));
     }
 
     fn clamp_list_cursor(&mut self) {
@@ -403,6 +458,14 @@ impl App {
                 }
                 ConfirmAction::InvalidatePlacement { node, .. } => {
                     let _ = deck.admin().invalidate_placement(node).await;
+                }
+                ConfirmAction::IceFreezeCluster { ttl, .. } => {
+                    let proposal = deck.ice().freeze_cluster(ttl);
+                    dispatch_ice(&deck, proposal).await;
+                }
+                ConfirmAction::IceThawCluster { .. } => {
+                    let proposal = deck.ice().thaw_cluster();
+                    dispatch_ice(&deck, proposal).await;
                 }
             }
         });

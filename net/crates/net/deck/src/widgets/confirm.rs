@@ -6,6 +6,7 @@
 //! Rendered by `App::draw` after the tab content, so it
 //! visually sits on top.
 
+use net_sdk::deck::BlastRadius;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -65,6 +66,38 @@ pub enum ConfirmAction {
     /// Force a placement recompute for the node. Reads from
     /// `admin().invalidate_placement(node)`.
     InvalidatePlacement { node: u64, node_display: String },
+    /// ICE break-glass: freeze cluster-wide action emission
+    /// for `ttl`. Carries the simulator's blast-radius preview
+    /// computed at modal-open time.
+    IceFreezeCluster {
+        ttl: std::time::Duration,
+        blast: BlastRadius,
+    },
+    /// ICE break-glass: cancel an in-effect freeze.
+    IceThawCluster { blast: BlastRadius },
+}
+
+impl ConfirmAction {
+    /// True iff this is an ICE break-glass action — modal
+    /// renders with a red border + warnings prominent.
+    pub fn is_ice(&self) -> bool {
+        matches!(
+            self,
+            Self::IceFreezeCluster { .. } | Self::IceThawCluster { .. }
+        )
+    }
+
+    /// Optional blast-radius preview attached to ICE actions.
+    /// Routine commands return `None` — they don't run the
+    /// simulator before commit.
+    pub fn blast(&self) -> Option<&BlastRadius> {
+        match self {
+            Self::IceFreezeCluster { blast, .. } | Self::IceThawCluster { blast } => {
+                Some(blast)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl ConfirmAction {
@@ -108,6 +141,10 @@ impl ConfirmAction {
             Self::InvalidatePlacement { node_display, .. } => {
                 format!("invalidate placement on {node_display}")
             }
+            Self::IceFreezeCluster { ttl, .. } => {
+                format!("ICE  freeze cluster  ·  ttl {}s", ttl.as_secs())
+            }
+            Self::IceThawCluster { .. } => "ICE  thaw cluster".to_string(),
         }
     }
 
@@ -164,24 +201,53 @@ impl ConfirmAction {
                 "no replica moves until the scorer re-runs".to_string(),
                 "fires `admin().invalidate_placement(node)`".to_string(),
             ],
+            Self::IceFreezeCluster { ttl, .. } => vec![
+                format!("freezes cluster-wide action emission for {}s", ttl.as_secs()),
+                "reconcile + folds keep running; only outbound actions stop".to_string(),
+                "auto-thaws at the deadline; `[T]` cancels early".to_string(),
+                "ICE — multi-op signed; lands on the admin chain".to_string(),
+            ],
+            Self::IceThawCluster { .. } => vec![
+                "cancels an in-effect freeze immediately".to_string(),
+                "reconcile resumes action emission on the next tick".to_string(),
+                "no-op if no freeze is in effect".to_string(),
+                "ICE — multi-op signed; lands on the admin chain".to_string(),
+            ],
         }
     }
 }
 
 /// Render the modal centered over `area`. The Clear widget
 /// wipes the underlying cells so the modal isn't transparent.
+/// ICE actions render with a red border + an extra
+/// blast-radius section above the bindings row.
 pub fn render(frame: &mut Frame<'_>, area: Rect, action: &ConfirmAction) {
-    let modal_area = center(area, 64, 12);
+    let is_ice = action.is_ice();
+    let modal_height: u16 = if is_ice { 18 } else { 12 };
+    let modal_area = center(area, 72, modal_height);
     frame.render_widget(Clear, modal_area);
+
+    let (border_style, title_glyph, title_text, title_color) = if is_ice {
+        (
+            theme::red(),
+            " ❄ ",
+            "ICE  BREAK-GLASS",
+            theme::RED,
+        )
+    } else {
+        (theme::amber(), " ⚠ ", "CONFIRM", theme::AMBER)
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme::amber())
+        .border_style(border_style)
         .title(Line::from(vec![
-            Span::styled(" ⚠ ", theme::amber()),
+            Span::styled(title_glyph, border_style),
             Span::styled(
-                "CONFIRM",
-                Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+                title_text,
+                Style::default()
+                    .fg(title_color)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
         ]))
@@ -189,19 +255,34 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, action: &ConfirmAction) {
     let inner = block.inner(modal_area);
     frame.render_widget(block, modal_area);
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    let constraints: Vec<Constraint> = if is_ice {
+        vec![
+            Constraint::Length(1), // headline
+            Constraint::Length(1), // spacer
+            Constraint::Length(5), // detail (4 lines + spacer)
+            Constraint::Min(0),    // blast radius
+            Constraint::Length(1), // bindings
+        ]
+    } else {
+        vec![
             Constraint::Length(1), // headline
             Constraint::Length(1), // spacer
             Constraint::Min(0),    // detail
             Constraint::Length(1), // bindings
-        ])
+        ]
+    };
+    let bindings_idx = constraints.len() - 1;
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(inner);
 
-    let headline = Line::from(vec![
-        Span::styled(action.headline(), theme::green_hi()),
-    ]);
+    let headline_style = if is_ice {
+        Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)
+    } else {
+        theme::green_hi()
+    };
+    let headline = Line::from(vec![Span::styled(action.headline(), headline_style)]);
     frame.render_widget(
         Paragraph::new(headline).alignment(Alignment::Center),
         rows[0],
@@ -217,15 +298,66 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, action: &ConfirmAction) {
         rows[2],
     );
 
+    if is_ice {
+        if let Some(blast) = action.blast() {
+            render_blast_radius(frame, rows[3], blast);
+        }
+    }
+
     let bindings = Line::from(vec![
-        Span::styled("[Enter]", theme::green_hi()),
+        Span::styled("[Enter]", if is_ice { theme::red() } else { theme::green_hi() }),
         Span::styled(" confirm    ", theme::dim()),
-        Span::styled("[Esc]", theme::red()),
+        Span::styled("[Esc]", theme::dim()),
         Span::styled(" cancel", theme::dim()),
     ]);
     frame.render_widget(
         Paragraph::new(bindings).alignment(Alignment::Center),
-        rows[3],
+        rows[bindings_idx],
+    );
+}
+
+fn render_blast_radius(frame: &mut Frame<'_>, area: Rect, blast: &BlastRadius) {
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![Span::styled(
+        "── BLAST RADIUS ──",
+        theme::chrome(),
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled("affects  ", theme::chrome()),
+        Span::styled(
+            format!(
+                "{} node(s) · {} replica(s) · {} daemon(s)",
+                blast.affected_nodes.len(),
+                blast.affected_replicas.len(),
+                blast.affected_daemons.len()
+            ),
+            theme::text(),
+        ),
+    ]));
+    if let Some(delay) = blast.estimated_drain_delay {
+        lines.push(Line::from(vec![
+            Span::styled("delay    ", theme::chrome()),
+            Span::styled(format!("~{}s drain", delay.as_secs()), theme::text()),
+        ]));
+    }
+    if blast.placement_stability_delta.abs() > 1e-3 {
+        lines.push(Line::from(vec![
+            Span::styled("stab Δ   ", theme::chrome()),
+            Span::styled(
+                format!("{:+.2}", blast.placement_stability_delta),
+                theme::amber(),
+            ),
+        ]));
+    }
+    for w in blast.warnings.iter().take(3) {
+        lines.push(Line::from(vec![
+            Span::styled("⚠  ", theme::amber()),
+            Span::styled(format!("{w:?}"), theme::amber()),
+        ]));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        area,
     );
 }
 
