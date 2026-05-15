@@ -124,29 +124,56 @@ const NET_THEME = {
       ],
       settings: { foreground: "#e8c44a" },
     },
-    // variables + parameters
+    // generic variables — default ink. Specific roles below (parameters,
+    // fields, properties) override via more-specific scopes.
     {
-      scope: ["variable", "variable.parameter", "variable.other"],
+      scope: ["variable", "variable.other"],
       settings: { foreground: "#d4dcd0" },
     },
-    // object keys / struct fields / kwargs — sky blue so labeled data
-    // ({foo: 1}, kwarg=val, Field: x) stands apart from values
+    // object keys / struct fields / function parameters / kwargs / attrs
+    // — sky blue. These are the "labels" of code (the names of things in
+    // a structure) and were invisible at default ink. Now they read as
+    // their own role distinct from variable references.
     {
       scope: [
+        // JS / TS object-literal keys
         "meta.object-literal.key",
         "meta.object-literal.key string",
         "meta.object.member.key",
         "meta.object.key",
         "string.unquoted.key",
         "support.type.property-name",
+
+        // member / property access (foo.bar.baz)
         "variable.other.property",
         "variable.object.property",
         "variable.other.object.property",
+        "variable.other.member",
+        "variable.other.member.field",
+
+        // function parameters — declarations AND usage inside the body
+        // both light up; call-site positional args stay default
+        "variable.parameter",
+        "variable.parameter.function",
         "variable.parameter.function-call",
+        "meta.function.parameters variable.parameter",
         "meta.function-call.arguments variable.parameter",
+        "meta.function entity.name.parameter",
+
+        // struct / record / enum-variant fields (Rust, Go, TS, etc.)
         "entity.name.field",
         "variable.other.field",
         "variable.other.declaration.field",
+        "variable.other.assignment.field",
+        "meta.struct.field variable.other",
+        "meta.struct.body variable.other",
+        "meta.enum.body variable.other",
+        "meta.struct.variant variable.other",
+
+        // Python kwargs
+        "meta.function-call.python variable.parameter",
+
+        // HTML / JSX / XML attributes
         "entity.other.attribute-name",
       ],
       settings: { foreground: "#7dd3fc" },
