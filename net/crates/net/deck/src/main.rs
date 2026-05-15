@@ -33,14 +33,16 @@ async fn main() -> color_eyre::Result<()> {
     let deck = harness.deck();
 
     // Phase 4: spawn streaming tails before handing the deck to
-    // the App. The handle is kept alive for the App's lifetime;
-    // dropping it on shutdown lets the substrate's stream
-    // close cleanly.
+    // the App. The handles are kept alive for the App's
+    // lifetime; dropping them on shutdown lets the substrate's
+    // streams close cleanly.
     let logs_tail = streams::LogsTail::new(streams::LOGS_TAIL_CAP);
     let _logs_stream_task = streams::spawn_logs_stream(deck.clone(), logs_tail.clone());
+    let audit_tail = streams::AuditTail::new(streams::AUDIT_TAIL_CAP);
+    let _audit_stream_task = streams::spawn_audit_stream(deck.clone(), audit_tail.clone());
 
     let terminal = ratatui::init();
-    let result = App::new(deck, logs_tail).run(terminal);
+    let result = App::new(deck, logs_tail, audit_tail).run(terminal);
     ratatui::restore();
 
     // Explicit drop so the harness's tear-down runs before

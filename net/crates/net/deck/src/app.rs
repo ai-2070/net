@@ -82,6 +82,10 @@ pub struct App {
     /// this buffer instead of `snapshot.log_ring`, so the
     /// operator's session can outlive the substrate ring cap.
     pub logs_tail: crate::streams::LogsTail,
+    /// Phase-4 streaming tail for AUDIT. Same shape as
+    /// `logs_tail`; replaces the `snapshot.admin_audit`
+    /// dependency on the AUDIT render path.
+    pub audit_tail: crate::streams::AuditTail,
     /// Cursor on the DAEMON tab's lineage tree. Indices into
     /// the live group list — `j`/`k` move the cursor; the
     /// detail pane on the right reflects whichever member is
@@ -202,11 +206,16 @@ pub struct DaemonCursor {
 }
 
 impl App {
-    pub fn new(deck: Arc<DeckClient>, logs_tail: crate::streams::LogsTail) -> Self {
+    pub fn new(
+        deck: Arc<DeckClient>,
+        logs_tail: crate::streams::LogsTail,
+        audit_tail: crate::streams::AuditTail,
+    ) -> Self {
         let snapshot = Arc::new(deck.status());
         Self {
             current: Tab::NetMap,
             logs_tail,
+            audit_tail,
             should_quit: false,
             started: Instant::now(),
             tick: 0,
@@ -1146,15 +1155,18 @@ impl App {
                     self.logs_search_editing,
                 );
             }
-            Tab::Audit => tabs::audit::render(
-                frame,
-                chunks[3],
-                Some(&self.snapshot),
-                self.audit_force_only,
-                self.audit_limit,
-                &self.audit_search,
-                self.audit_search_editing,
-            ),
+            Tab::Audit => {
+                let records = self.audit_tail.snapshot();
+                tabs::audit::render(
+                    frame,
+                    chunks[3],
+                    &records,
+                    self.audit_force_only,
+                    self.audit_limit,
+                    &self.audit_search,
+                    self.audit_search_editing,
+                );
+            }
             Tab::Replicas => tabs::replicas::render(
                 frame,
                 chunks[3],

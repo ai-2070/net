@@ -1,9 +1,10 @@
-//! AUDIT tab — renders `snapshot.admin_audit`, the ring of
-//! every admin commit the runtime has observed. Newest first.
-//! Each row carries the seq, wall-clock ts, command kind +
-//! target, operator ids, and the verifier's outcome.
+//! AUDIT tab — renders the streaming audit tail (Phase 4),
+//! the ring of every admin commit the runtime has observed.
+//! Newest first. Each row carries the seq, wall-clock ts,
+//! command kind + target, operator ids, and the verifier's
+//! outcome.
 
-use net_sdk::deck::{AdminAuditRecord, AdminEvent, MeshOsSnapshot, VerificationOutcome};
+use net_sdk::deck::{AdminAuditRecord, AdminEvent, VerificationOutcome};
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
     text::{Line, Span},
@@ -16,27 +17,24 @@ use crate::{nodes, theme, widgets};
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
-    snapshot: Option<&MeshOsSnapshot>,
+    records: &[AdminAuditRecord],
     force_only: bool,
     limit: Option<usize>,
     search: &str,
     search_editing: bool,
 ) {
-    let has_records = snapshot
-        .map(|s| !s.admin_audit.is_empty())
-        .unwrap_or(false);
-    if has_records {
+    if records.is_empty() {
+        render_empty(frame, area, force_only, limit, search, search_editing);
+    } else {
         render_table(
             frame,
             area,
-            snapshot.unwrap(),
+            records,
             force_only,
             limit,
             search,
             search_editing,
         );
-    } else {
-        render_empty(frame, area, force_only, limit, search, search_editing);
     }
 }
 
@@ -71,20 +69,18 @@ fn render_empty(
 fn render_table(
     frame: &mut Frame<'_>,
     area: Rect,
-    snapshot: &MeshOsSnapshot,
+    records: &[AdminAuditRecord],
     force_only: bool,
     limit: Option<usize>,
     search: &str,
     search_editing: bool,
 ) {
-    let total = snapshot.admin_audit.len();
-    let accepted = snapshot
-        .admin_audit
+    let total = records.len();
+    let accepted = records
         .iter()
         .filter(|r| matches!(r.outcome, VerificationOutcome::Accepted))
         .count();
-    let unverified = snapshot
-        .admin_audit
+    let unverified = records
         .iter()
         .filter(|r| matches!(r.outcome, VerificationOutcome::Unverified))
         .count();
@@ -124,8 +120,7 @@ fn render_table(
     let cap = limit.unwrap_or(usize::MAX);
     let needle = search.to_ascii_lowercase();
     let mut rows: Vec<Row> = Vec::with_capacity(total.min(cap));
-    for rec in snapshot
-        .admin_audit
+    for rec in records
         .iter()
         .rev()
         .filter(|r| !force_only || r.event.is_ice())

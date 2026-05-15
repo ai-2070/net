@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use net_sdk::deck::{DeckClient, LogFilter, LogRecord};
+use net_sdk::deck::{AdminAuditRecord, DeckClient, LogFilter, LogRecord};
 use parking_lot::Mutex;
 
 /// Capacity of the LOGS tail. 5000 records × ~256B per record
@@ -24,6 +24,11 @@ use parking_lot::Mutex;
 /// that scrolling back through an incident's worth of lines
 /// rarely runs out.
 pub const LOGS_TAIL_CAP: usize = 5_000;
+
+/// Capacity of the AUDIT tail. Admin commits are sparse
+/// (operator-driven, never machine-generated), so 2000 covers
+/// a long session with room to spare.
+pub const AUDIT_TAIL_CAP: usize = 2_000;
 
 /// Shared, lock-protected ring of log records. Owned by App;
 /// the streaming task holds a clone of the Arc and pushes new
@@ -81,6 +86,51 @@ pub fn spawn_logs_stream(deck: Arc<DeckClient>, tail: LogsTail) -> tokio::task::
                     // the stream will end on its own.
                     continue;
                 }
+            }
+        }
+    })
+}
+
+/// AUDIT tail mirror of `LogsTail`. Same locking + capacity
+/// discipline; different record type. Fed by the audit stream.
+#[derive(Clone)]
+pub struct AuditTail {
+    pub records: Arc<Mutex<VecDeque<AdminAuditRecord>>>,
+    pub cap: usize,
+}
+
+impl AuditTail {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            records: Arc::new(Mutex::new(VecDeque::with_capacity(cap.min(512)))),
+            cap,
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<AdminAuditRecord> {
+        let g = self.records.lock();
+        g.iter().cloned().collect()
+    }
+
+    pub fn push(&self, record: AdminAuditRecord) {
+        let mut g = self.records.lock();
+        if g.len() == self.cap {
+            g.pop_front();
+        }
+        g.push_back(record);
+    }
+}
+
+/// Spawn the AUDIT streaming task. The query is unfiltered —
+/// App-side toggles (`[f]` ICE-only, `[/]` search) apply at
+/// render time so operators can adjust without re-subscribing.
+pub fn spawn_audit_stream(deck: Arc<DeckClient>, tail: AuditTail) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut stream = deck.audit().stream();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(record) => tail.push(record),
+                Err(_err) => continue,
             }
         }
     })
