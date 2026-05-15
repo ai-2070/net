@@ -530,8 +530,12 @@ const mdxComponents = {
       {...props}
     />
   ),
+  // Strong: accent + heavy weight. Mono at small sizes doesn't show weight
+  // jumps cleanly (light → semibold barely reads as bold), so we lean on
+  // both axes — full weight bold AND the accent green so emphasis lights
+  // up against the dim-light body text.
   strong: (props: { children?: ReactNode }) => (
-    <strong className="text-ink font-semibold" {...props} />
+    <strong className="text-accent font-bold" {...props} />
   ),
   em: (props: { children?: ReactNode }) => (
     <em className="text-cyan not-italic" {...props} />
