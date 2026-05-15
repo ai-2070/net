@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod dataforts;
 pub mod daemon;
 pub mod list_view;

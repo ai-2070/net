@@ -17,16 +17,18 @@ pub enum Tab {
     Dataforts,
     Daemon,
     Logs,
+    Audit,
 }
 
 impl Tab {
-    pub fn all() -> [Tab; 5] {
+    pub fn all() -> [Tab; 6] {
         [
             Tab::NetMap,
             Tab::List,
             Tab::Dataforts,
             Tab::Daemon,
             Tab::Logs,
+            Tab::Audit,
         ]
     }
 
@@ -37,6 +39,7 @@ impl Tab {
             Tab::Dataforts => "DATAFORTS",
             Tab::Daemon => "DAEMON",
             Tab::Logs => "LOGS",
+            Tab::Audit => "AUDIT",
         }
     }
 
@@ -168,6 +171,7 @@ impl App {
             KeyCode::Char('3') => self.current = Tab::Dataforts,
             KeyCode::Char('4') => self.current = Tab::Daemon,
             KeyCode::Char('5') => self.current = Tab::Logs,
+            KeyCode::Char('6') => self.current = Tab::Audit,
             // DAEMON tab navigation. `j`/`k` move within the
             // current group's members; `J`/`K` step to the
             // next / previous group. No-op on other tabs.
@@ -378,6 +382,7 @@ impl App {
             Tab::Logs => {
                 tabs::logs::render(frame, chunks[3], self.tick, Some(&self.snapshot))
             }
+            Tab::Audit => tabs::audit::render(frame, chunks[3], Some(&self.snapshot)),
         }
         widgets::footer::render(frame, chunks[4]);
 
