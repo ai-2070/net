@@ -87,7 +87,7 @@
     "posthog-js": "1.373.4",
     "posthog-node": "5.34.1",
     "react": "19.2.6",
-    "react-day-picker": "10.0.0",
+    "react-day-picker": "10.0.1",
     "react-dom": "19.2.6",
     "react-email": "6.1.4",
     "react-fast-marquee": "1.6.5",
