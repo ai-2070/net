@@ -1,0 +1,19 @@
+net/crates/net/deck/src/tabs/daemon.rs
+  s_3bbc444b3ef3e5::t_568f62507faab5 90-96,104,107-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "20168b32d7e33e2ef8ec4fb594f8328b3f070bac",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
