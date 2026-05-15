@@ -1,7 +1,162 @@
 import Link from "next/link";
 import { MDXRemote } from "next-mdx-remote/rsc";
 import remarkGfm from "remark-gfm";
+import rehypePrettyCode, {
+  type Options as PrettyCodeOptions,
+} from "rehype-pretty-code";
+import rehypeSlug from "rehype-slug";
+import rehypeAutolinkHeadings from "rehype-autolink-headings";
 import type { ReactNode, AnchorHTMLAttributes } from "react";
+import { CodeBlock } from "@/components/CodeBlock";
+
+// Custom Shiki theme keyed to the site palette so code blends with the
+// rest of the page (lime strings, cyan keywords, off-white identifiers,
+// dim punctuation) instead of fighting it.
+const NET_THEME = {
+  name: "net",
+  type: "dark",
+  semanticHighlighting: false,
+  colors: {
+    "editor.foreground": "#d4dcd0",
+    "editor.background": "#0f1410",
+  },
+  tokenColors: [
+    // default fg
+    { settings: { foreground: "#d4dcd0" } },
+    // comments
+    {
+      scope: [
+        "comment",
+        "punctuation.definition.comment",
+        "string.quoted.docstring",
+      ],
+      settings: { foreground: "#6b7568", fontStyle: "italic" },
+    },
+    // keywords + storage modifiers
+    {
+      scope: [
+        "keyword",
+        "keyword.control",
+        "keyword.other",
+        "storage",
+        "storage.type",
+        "storage.modifier",
+        "keyword.operator.new",
+        "keyword.operator.expression",
+      ],
+      settings: { foreground: "#3df0ff" },
+    },
+    // strings
+    {
+      scope: [
+        "string",
+        "string.quoted",
+        "string.template",
+        "string.unquoted",
+        "punctuation.definition.string",
+      ],
+      settings: { foreground: "#c4ff3d" },
+    },
+    // embedded expressions inside strings — back to default
+    {
+      scope: ["meta.embedded", "source.groovy.embedded"],
+      settings: { foreground: "#d4dcd0" },
+    },
+    // numbers, booleans, null, escape chars
+    {
+      scope: [
+        "constant.numeric",
+        "constant.language",
+        "constant.character",
+        "constant.character.escape",
+      ],
+      settings: { foreground: "#ff5e3d" },
+    },
+    // types
+    {
+      scope: [
+        "entity.name.type",
+        "entity.name.class",
+        "entity.other.inherited-class",
+        "support.type",
+        "support.class",
+        "meta.type.parameters entity.name.type",
+      ],
+      settings: { foreground: "#9eda20" },
+    },
+    // variables + parameters (default ink, but keep explicit for safety)
+    {
+      scope: ["variable", "variable.parameter", "variable.other"],
+      settings: { foreground: "#d4dcd0" },
+    },
+    // function names — keep neutral so calls don't shout
+    {
+      scope: [
+        "entity.name.function",
+        "support.function",
+        "meta.function-call entity.name.function",
+      ],
+      settings: { foreground: "#d4dcd0" },
+    },
+    // punctuation + operators — fade out
+    {
+      scope: [
+        "punctuation",
+        "punctuation.separator",
+        "punctuation.terminator",
+        "meta.brace",
+        "keyword.operator",
+      ],
+      settings: { foreground: "#6b7568" },
+    },
+    // decorators / attributes (Rust #[derive(...)], TS @decorator, HTML tags)
+    {
+      scope: [
+        "meta.attribute",
+        "punctuation.definition.attribute",
+        "entity.name.tag",
+        "tag.attribute",
+      ],
+      settings: { foreground: "#6b8a1e" },
+    },
+    // markdown
+    {
+      scope: ["markup.heading", "entity.name.section"],
+      settings: { foreground: "#c4ff3d", fontStyle: "bold" },
+    },
+    {
+      scope: ["markup.bold"],
+      settings: { foreground: "#d4dcd0", fontStyle: "bold" },
+    },
+    {
+      scope: ["markup.italic"],
+      settings: { foreground: "#3df0ff", fontStyle: "italic" },
+    },
+    {
+      scope: ["markup.inline.raw", "markup.fenced_code"],
+      settings: { foreground: "#9eda20" },
+    },
+    {
+      scope: ["markup.underline.link"],
+      settings: { foreground: "#3df0ff" },
+    },
+    {
+      scope: ["markup.inserted"],
+      settings: { foreground: "#c4ff3d" },
+    },
+    {
+      scope: ["markup.deleted"],
+      settings: { foreground: "#ff5e3d" },
+    },
+  ],
+} as const;
+
+const prettyCodeOptions: PrettyCodeOptions = {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  theme: NET_THEME as any,
+  keepBackground: false,
+  defaultLang: { block: "text", inline: "text" },
+};
 
 const Callout = ({
   variant,
@@ -46,81 +201,154 @@ const Callout = ({
   );
 };
 
+// Class names rehype-autolink-headings emits get stringified to a space-
+// separated string by the MDX→React bridge; this checks both forms.
+function hasAnchorClass(value: unknown): boolean {
+  if (typeof value === "string") return value.split(/\s+/).includes("anchor");
+  if (Array.isArray(value)) return value.includes("anchor");
+  return false;
+}
+
+const headingClasses = {
+  // hover-reveal the anchor link
+  base: "group [&_.anchor]:opacity-0 hover:[&_.anchor]:opacity-100 focus-within:[&_.anchor]:opacity-100",
+};
+
 const mdxComponents = {
   h1: (props: { children?: ReactNode }) => (
     <h1
-      className="font-display text-ink mb-7 mt-2 leading-[1.05] tracking-[-0.01em]"
-      style={{ fontSize: "clamp(28px, 3.6vw, 42px)" }}
+      className={`font-mono text-ink mb-6 mt-2 leading-[1.15] tracking-[0.02em] font-semibold ${headingClasses.base}`}
+      style={{ fontSize: "clamp(26px, 3.2vw, 36px)" }}
       {...props}
     />
   ),
   h2: (props: { children?: ReactNode }) => (
     <h2
-      className="font-head text-ink mt-10 mb-4 leading-tight tracking-[0.02em] uppercase text-[18px] border-l-2 border-accent pl-3"
+      className={`font-mono text-ink mt-12 mb-4 leading-tight tracking-[0.04em] uppercase text-[17px] font-semibold border-l-2 border-accent pl-3 scroll-mt-28 ${headingClasses.base}`}
       {...props}
     />
   ),
   h3: (props: { children?: ReactNode }) => (
     <h3
-      className="font-head text-ink mt-7 mb-3 leading-tight tracking-[0.02em] lowercase text-[15px]"
+      className={`font-mono text-ink mt-8 mb-3 leading-snug tracking-[0.02em] text-[15px] font-semibold scroll-mt-28 ${headingClasses.base}`}
       {...props}
     />
   ),
   h4: (props: { children?: ReactNode }) => (
     <h4
-      className="font-mono text-accent mt-5 mb-2 text-[12px] uppercase tracking-[0.12em]"
+      className={`font-mono text-accent mt-6 mb-2 text-[12px] uppercase tracking-[0.14em] font-semibold scroll-mt-28 ${headingClasses.base}`}
       {...props}
     />
   ),
   p: (props: { children?: ReactNode }) => (
-    <p className="text-[14px] text-ink leading-[1.75] mb-4" {...props} />
+    <p className="text-[14.5px] text-ink leading-[1.78] mb-5" {...props} />
   ),
   ul: (props: { children?: ReactNode }) => (
     <ul
-      className="list-disc list-outside pl-6 mb-4 text-[14px] text-ink-dim leading-[1.7] marker:text-accent"
+      className="list-disc list-outside pl-6 mb-5 text-[14px] text-ink-dim leading-[1.75] marker:text-accent space-y-1"
       {...props}
     />
   ),
   ol: (props: { children?: ReactNode }) => (
     <ol
-      className="list-decimal list-outside pl-6 mb-4 text-[14px] text-ink-dim leading-[1.7] marker:text-accent"
+      className="list-decimal list-outside pl-6 mb-5 text-[14px] text-ink-dim leading-[1.75] marker:text-accent space-y-1"
       {...props}
     />
   ),
-  li: (props: { children?: ReactNode }) => <li className="mb-1" {...props} />,
+  li: (props: { children?: ReactNode }) => <li {...props} />,
   blockquote: (props: { children?: ReactNode }) => (
     <blockquote
-      className="border-l-2 border-accent bg-accent/[0.04] pl-4 pr-4 py-3 my-5 text-[13px] text-ink leading-[1.65]"
+      className="border-l-2 border-accent bg-accent/[0.04] pl-4 pr-4 py-3 my-6 text-[13px] text-ink leading-[1.65] [&>p:last-child]:mb-0"
       {...props}
     />
   ),
-  hr: () => <hr className="border-line my-8" />,
-  code: (props: { children?: ReactNode; className?: string }) => {
-    // Fenced code blocks land with a `language-*` class; inline code has none.
-    const isBlock = typeof props.className === "string";
+  hr: () => <hr className="border-line my-10" />,
+
+  // Inline code only — block code comes through `figure` → `CodeBlock`.
+  // Detect block via either `data-language` (rehype-pretty-code) OR
+  // `language-foo` className (vanilla fenced markdown). Anything else =
+  // inline `\`backtick\`` code and gets the boxed accent treatment.
+  code: (props: {
+    children?: ReactNode;
+    className?: string;
+    "data-language"?: string;
+  }) => {
+    const isBlock =
+      typeof props["data-language"] === "string" ||
+      (typeof props.className === "string" &&
+        /\blanguage-/.test(props.className));
     if (isBlock) {
-      return (
-        <code
-          className="block font-mono text-[12px] text-accent leading-[1.6] whitespace-pre overflow-x-auto"
-          {...props}
-        />
-      );
+      return <code {...props} />;
     }
     return (
       <code
-        className="font-mono text-[12.5px] text-accent bg-bg-2 px-[5px] py-[1px] border border-line"
+        className="font-mono text-[12.5px] text-accent bg-bg-2 px-[5px] py-[1px] border border-line break-words"
         {...props}
       />
     );
   },
-  pre: (props: { children?: ReactNode }) => (
-    <pre
-      className="border border-line bg-bg-2 p-4 mb-5 overflow-x-auto text-[12px] leading-[1.6]"
-      {...props}
-    />
-  ),
+
+  // rehype-pretty-code wraps fenced code in:
+  //   <figure data-rehype-pretty-code-figure data-language="…"> <pre> <code> … </code> </pre> </figure>
+  // We hijack the figure to render our CodeBlock chrome.
+  figure: ({
+    children,
+    ...rest
+  }: {
+    children?: ReactNode;
+    "data-rehype-pretty-code-figure"?: string | undefined;
+    "data-language"?: string;
+  }) => {
+    if ("data-rehype-pretty-code-figure" in rest) {
+      const lang = (rest as { "data-language"?: string })["data-language"];
+      return <CodeBlock lang={lang}>{children}</CodeBlock>;
+    }
+    return <figure {...rest}>{children}</figure>;
+  },
+
+  // Pre inside a rehype-pretty-code figure has `data-language` set — CodeBlock
+  // already provides the container chrome, so render the pre minimally (just
+  // padding + scroll). Pre WITHOUT data-language is a standalone block (raw
+  // HTML `<pre>`, no fence) — apply full container styling.
+  pre: (props: {
+    children?: ReactNode;
+    "data-language"?: string;
+    "data-theme"?: string;
+    className?: string;
+  }) => {
+    const inFigure = typeof props["data-language"] === "string";
+    if (inFigure) {
+      return (
+        <pre
+          {...props}
+          className="overflow-x-auto px-4 py-3 m-0 text-[12.5px] leading-[1.6] font-mono"
+        />
+      );
+    }
+    return (
+      <pre
+        className="my-6 border border-line bg-bg-2 px-4 py-3 overflow-x-auto text-[12.5px] leading-[1.6] font-mono"
+        {...props}
+      />
+    );
+  },
+
   a: (props: AnchorHTMLAttributes<HTMLAnchorElement>) => {
     const href = props.href ?? "";
+
+    // Heading anchor link from rehype-autolink-headings.
+    if (hasAnchorClass(props.className)) {
+      return (
+        <a
+          {...props}
+          className="anchor ml-2 text-ink-faint hover:text-accent transition-opacity no-underline font-mono align-middle"
+          aria-label="Anchor"
+        >
+          #
+        </a>
+      );
+    }
+
     const isInternal = href.startsWith("/") || href.startsWith("#");
     if (isInternal) {
       return (
@@ -141,8 +369,9 @@ const mdxComponents = {
       />
     );
   },
+
   table: (props: { children?: ReactNode }) => (
-    <div className="overflow-x-auto mb-5 border border-line">
+    <div className="overflow-x-auto my-6 border border-line">
       <table
         className="w-full text-[12.5px] text-ink-dim border-collapse"
         {...props}
@@ -166,10 +395,9 @@ const mdxComponents = {
   ),
 
   // Custom components, usable in .mdx files without any import:
-  //   <Note>Heads up — …</Note>
-  //   <Tip>Pro tip — …</Tip>
-  //   <Warn>Careful — …</Warn>
+  //   <Note>…</Note>  <Tip>…</Tip>  <Warn>…</Warn>
   //   <Demo title="…">…React children…</Demo>
+  //   <Kbd>Ctrl</Kbd>
   Note: ({ children }: { children?: ReactNode }) => (
     <Callout variant="note" label="note">
       {children}
@@ -223,6 +451,21 @@ export function DocsContent({
           mdxOptions: {
             format,
             remarkPlugins: [remarkGfm],
+            rehypePlugins: [
+              rehypeSlug,
+              [rehypePrettyCode, prettyCodeOptions],
+              [
+                rehypeAutolinkHeadings,
+                {
+                  behavior: "append",
+                  properties: {
+                    className: ["anchor"],
+                    ariaHidden: "true",
+                    tabIndex: -1,
+                  },
+                },
+              ],
+            ],
           },
         }}
         components={mdxComponents}
