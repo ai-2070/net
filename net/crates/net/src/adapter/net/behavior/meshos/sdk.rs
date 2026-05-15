@@ -597,6 +597,38 @@ impl MeshOsDaemonSdk {
         }
     }
 
+    /// Like [`Self::start`] but also installs an
+    /// [`super::ice::AdminVerifier`] on the runtime. Required
+    /// for any deployment where the operator's signed admin
+    /// commits should fold with `VerificationOutcome::Accepted`
+    /// instead of `Unverified` — the verifier's
+    /// [`super::ice::OperatorRegistry`] must contain the
+    /// operator key that signs incoming commits.
+    pub fn start_with_verifier<D: ActionDispatcher>(
+        config: MeshOsConfig,
+        user_dispatcher: Arc<D>,
+        verifier: Arc<super::ice::AdminVerifier>,
+    ) -> Self {
+        let router = DaemonControlRouter::new();
+        let routed = Arc::new(SdkRoutingDispatcher::new(user_dispatcher, router.clone()));
+        let sink: Arc<dyn super::control::ControlSink> =
+            Arc::new(RouterControlSink::new(router.clone()));
+        let runtime = MeshOsRuntime::start_with_all(
+            config,
+            routed,
+            super::event_loop::ProbeRegistry::new(),
+            super::scheduler::SchedulerRegistry::new(),
+            Arc::new(DaemonRegistry::new()),
+            Some(sink),
+            Some(verifier),
+        );
+        Self {
+            runtime,
+            router,
+            control_capacity: DEFAULT_CONTROL_CHANNEL_CAPACITY,
+        }
+    }
+
     /// Override the per-daemon control-channel capacity. Default
     /// is [`DEFAULT_CONTROL_CHANNEL_CAPACITY`]. Increase for
     /// daemons that pause `process()` longer than the supervisor's
