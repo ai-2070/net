@@ -609,18 +609,40 @@ impl MeshOsDaemonSdk {
         user_dispatcher: Arc<D>,
         verifier: Arc<super::ice::AdminVerifier>,
     ) -> Self {
+        Self::start_with_options(config, user_dispatcher, Some(verifier), None)
+    }
+
+    /// Kitchen-sink constructor — install any combination of
+    /// optional runtime extensions in one call. Production
+    /// deployments wiring multiple seams (verifier + chain
+    /// appenders + migration source + …) call this directly;
+    /// the other `start_*` constructors forward through here
+    /// with `None` defaults for the slots they don't surface.
+    pub fn start_with_options<D: ActionDispatcher>(
+        config: MeshOsConfig,
+        user_dispatcher: Arc<D>,
+        verifier: Option<Arc<super::ice::AdminVerifier>>,
+        migration_snapshot_source: Option<
+            Arc<dyn super::migration_snapshot_source::MigrationSnapshotSource>,
+        >,
+    ) -> Self {
         let router = DaemonControlRouter::new();
         let routed = Arc::new(SdkRoutingDispatcher::new(user_dispatcher, router.clone()));
         let sink: Arc<dyn super::control::ControlSink> =
             Arc::new(RouterControlSink::new(router.clone()));
-        let runtime = MeshOsRuntime::start_with_all(
+        let runtime = MeshOsRuntime::start_with_full_extensions(
             config,
             routed,
             super::event_loop::ProbeRegistry::new(),
             super::scheduler::SchedulerRegistry::new(),
             Arc::new(DaemonRegistry::new()),
             Some(sink),
-            Some(verifier),
+            verifier,
+            None, // admin audit appender
+            None, // log appender
+            None, // failure appender
+            None, // migration aborter
+            migration_snapshot_source,
         );
         Self {
             runtime,

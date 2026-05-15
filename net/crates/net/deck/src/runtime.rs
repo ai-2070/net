@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net_sdk::deck::{AdminVerifier, DeckClient, OperatorIdentity, OperatorRegistry};
-use net_sdk::meshos::{EntityKeypair, MeshOsConfig, MeshOsDaemonSdk};
+use net_sdk::meshos::{EntityKeypair, MeshOsConfig, MeshOsDaemonSdk, MigrationSnapshotSource};
 
 /// Handle returned by [`spawn`]. Hold for the app lifetime;
 /// dropping it tears the runtime down.
@@ -64,7 +64,21 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     registry.register(&operator_keypair);
     let verifier = Arc::new(AdminVerifier::new(Arc::new(registry), 1));
 
-    let sdk = MeshOsDaemonSdk::start_with_verifier(cfg, dispatcher, verifier);
+    // Synthetic migration source — only installed with the
+    // `samples` feature so the MIGRATIONS tab has live data
+    // to render in demo mode.
+    #[cfg(feature = "samples")]
+    let migration_source: Option<Arc<dyn MigrationSnapshotSource>> =
+        Some(Arc::new(samples::SampleMigrationSnapshotSource));
+    #[cfg(not(feature = "samples"))]
+    let migration_source: Option<Arc<dyn MigrationSnapshotSource>> = None;
+
+    let sdk = MeshOsDaemonSdk::start_with_options(
+        cfg,
+        dispatcher,
+        Some(verifier),
+        migration_source,
+    );
 
     let identity = OperatorIdentity::from_keypair(operator_keypair);
     let deck = Arc::new(DeckClient::from_runtime(sdk.runtime(), identity));
@@ -95,9 +109,43 @@ mod samples {
     use net_sdk::compute::CausalEvent;
     use net_sdk::meshos::{
         ChainId, DaemonError, EntityKeypair, HealthProbe, LocalityProbe, MeshDaemon,
-        MeshOsDaemonHandle, MeshOsDaemonSdk, MeshOsEvent, NodeHealth, NodeId,
-        PlacementIntent, ReplicaUpdate,
+        MeshOsDaemonHandle, MeshOsDaemonSdk, MeshOsEvent, MigrationPhaseSnapshot,
+        MigrationSnapshot, MigrationSnapshotSource, NodeHealth, NodeId, PlacementIntent,
+        ReplicaUpdate,
     };
+
+    /// Synthetic migration snapshot source — returns a static
+    /// list of in-flight migrations spread across the
+    /// migration phases so the MIGRATIONS tab renders
+    /// representative data in samples mode.
+    pub struct SampleMigrationSnapshotSource;
+
+    impl MigrationSnapshotSource for SampleMigrationSnapshotSource {
+        fn list(&self) -> Vec<MigrationSnapshot> {
+            vec![
+                MigrationSnapshot {
+                    daemon_origin: 0xdaee_0001,
+                    phase: MigrationPhaseSnapshot::Snapshot,
+                    elapsed_ms: 380,
+                },
+                MigrationSnapshot {
+                    daemon_origin: 0xdaee_0002,
+                    phase: MigrationPhaseSnapshot::Transfer,
+                    elapsed_ms: 1_240,
+                },
+                MigrationSnapshot {
+                    daemon_origin: 0xdaee_0003,
+                    phase: MigrationPhaseSnapshot::Replay,
+                    elapsed_ms: 4_870,
+                },
+                MigrationSnapshot {
+                    daemon_origin: 0xdaee_0004,
+                    phase: MigrationPhaseSnapshot::Cutover,
+                    elapsed_ms: 12_910,
+                },
+            ]
+        }
+    }
 
     /// Stub daemon — `process` is a no-op; everything else
     /// uses trait defaults (health = Healthy). Just exists
