@@ -46,6 +46,25 @@ pub enum ConfirmAction {
         node_display: String,
         drain_for: std::time::Duration,
     },
+    /// Begin a maintenance window on the node. Unlike drain,
+    /// no auto-exit — requires an explicit `ExitMaintenance`.
+    /// `drain_for: None` defers to the cluster's configured
+    /// default deadline. Reads from
+    /// `admin().enter_maintenance(node, drain_for)`.
+    EnterMaintenance {
+        node: u64,
+        node_display: String,
+        drain_for: Option<std::time::Duration>,
+    },
+    /// End a maintenance window. Reads from
+    /// `admin().exit_maintenance(node)`.
+    ExitMaintenance { node: u64, node_display: String },
+    /// Clear the node's local avoid list. Reads from
+    /// `admin().clear_avoid_list(node)`.
+    ClearAvoidList { node: u64, node_display: String },
+    /// Force a placement recompute for the node. Reads from
+    /// `admin().invalidate_placement(node)`.
+    InvalidatePlacement { node: u64, node_display: String },
 }
 
 impl ConfirmAction {
@@ -68,6 +87,26 @@ impl ConfirmAction {
                     "drain node {node_display}  ·  window {}s",
                     drain_for.as_secs()
                 )
+            }
+            Self::EnterMaintenance {
+                node_display,
+                drain_for,
+                ..
+            } => match drain_for {
+                Some(d) => format!(
+                    "enter maintenance on {node_display}  ·  window {}s",
+                    d.as_secs()
+                ),
+                None => format!("enter maintenance on {node_display}  ·  cluster default"),
+            },
+            Self::ExitMaintenance { node_display, .. } => {
+                format!("exit maintenance on {node_display}")
+            }
+            Self::ClearAvoidList { node_display, .. } => {
+                format!("clear avoid list on {node_display}")
+            }
+            Self::InvalidatePlacement { node_display, .. } => {
+                format!("invalidate placement on {node_display}")
             }
         }
     }
@@ -100,6 +139,30 @@ impl ConfirmAction {
                 "EnteringMaintenance → Maintenance → DrainFailed?".to_string(),
                 "replicas evacuate; daemons receive Shutdown control event".to_string(),
                 "fires `admin().drain(node, drain_for)` — signed, audit-logged".to_string(),
+            ],
+            Self::EnterMaintenance { .. } => vec![
+                "begins an indefinite maintenance window".to_string(),
+                "drain runs to the deadline; node stays Maintenance".to_string(),
+                "no auto-exit — requires `[M]` to release".to_string(),
+                "fires `admin().enter_maintenance(node, drain_for)`".to_string(),
+            ],
+            Self::ExitMaintenance { .. } => vec![
+                "ends an active maintenance window".to_string(),
+                "kicks Maintenance → ExitingMaintenance → Recovery".to_string(),
+                "no-op if the node wasn't in maintenance".to_string(),
+                "fires `admin().exit_maintenance(node)`".to_string(),
+            ],
+            Self::ClearAvoidList { .. } => vec![
+                "wipes this node's local avoid list".to_string(),
+                "previously-avoided peers become eligible immediately".to_string(),
+                "reconcile may re-add entries next tick if RTT still bad".to_string(),
+                "fires `admin().clear_avoid_list(node)`".to_string(),
+            ],
+            Self::InvalidatePlacement { .. } => vec![
+                "forces a placement recompute on the next tick".to_string(),
+                "useful after a capability / topology change".to_string(),
+                "no replica moves until the scorer re-runs".to_string(),
+                "fires `admin().invalidate_placement(node)`".to_string(),
             ],
         }
     }

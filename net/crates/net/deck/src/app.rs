@@ -103,6 +103,13 @@ enum NodeActionKind {
     /// `[D]` "drain with custom window" prompt that takes a
     /// numeric input.
     Drain,
+    /// Indefinite maintenance window — no auto-exit. The
+    /// modal passes `drain_for = None`, deferring to the
+    /// cluster's configured default deadline.
+    EnterMaintenance,
+    ExitMaintenance,
+    ClearAvoidList,
+    InvalidatePlacement,
 }
 
 /// Default drain window when the operator hits `[d]` without
@@ -229,6 +236,18 @@ impl App {
             KeyCode::Char('d') if self.current == Tab::List => {
                 self.propose_node_action(NodeActionKind::Drain);
             }
+            KeyCode::Char('m') if self.current == Tab::List => {
+                self.propose_node_action(NodeActionKind::EnterMaintenance);
+            }
+            KeyCode::Char('M') if self.current == Tab::List => {
+                self.propose_node_action(NodeActionKind::ExitMaintenance);
+            }
+            KeyCode::Char('a') if self.current == Tab::List => {
+                self.propose_node_action(NodeActionKind::ClearAvoidList);
+            }
+            KeyCode::Char('i') if self.current == Tab::List => {
+                self.propose_node_action(NodeActionKind::InvalidatePlacement);
+            }
             _ => {}
         }
     }
@@ -275,6 +294,31 @@ impl App {
                 node_display,
                 drain_for: DEFAULT_DRAIN_WINDOW,
             },
+            NodeActionKind::EnterMaintenance => {
+                crate::widgets::confirm::ConfirmAction::EnterMaintenance {
+                    node,
+                    node_display,
+                    drain_for: None,
+                }
+            }
+            NodeActionKind::ExitMaintenance => {
+                crate::widgets::confirm::ConfirmAction::ExitMaintenance {
+                    node,
+                    node_display,
+                }
+            }
+            NodeActionKind::ClearAvoidList => {
+                crate::widgets::confirm::ConfirmAction::ClearAvoidList {
+                    node,
+                    node_display,
+                }
+            }
+            NodeActionKind::InvalidatePlacement => {
+                crate::widgets::confirm::ConfirmAction::InvalidatePlacement {
+                    node,
+                    node_display,
+                }
+            }
         };
         self.modal = Some(Modal::Confirm(action));
     }
@@ -345,6 +389,20 @@ impl App {
                     node, drain_for, ..
                 } => {
                     let _ = deck.admin().drain(node, drain_for).await;
+                }
+                ConfirmAction::EnterMaintenance {
+                    node, drain_for, ..
+                } => {
+                    let _ = deck.admin().enter_maintenance(node, drain_for).await;
+                }
+                ConfirmAction::ExitMaintenance { node, .. } => {
+                    let _ = deck.admin().exit_maintenance(node).await;
+                }
+                ConfirmAction::ClearAvoidList { node, .. } => {
+                    let _ = deck.admin().clear_avoid_list(node).await;
+                }
+                ConfirmAction::InvalidatePlacement { node, .. } => {
+                    let _ = deck.admin().invalidate_placement(node).await;
                 }
             }
         });
