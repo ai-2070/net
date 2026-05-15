@@ -129,6 +129,28 @@ const NET_THEME = {
       scope: ["variable", "variable.parameter", "variable.other"],
       settings: { foreground: "#d4dcd0" },
     },
+    // object keys / struct fields / kwargs — sky blue so labeled data
+    // ({foo: 1}, kwarg=val, Field: x) stands apart from values
+    {
+      scope: [
+        "meta.object-literal.key",
+        "meta.object-literal.key string",
+        "meta.object.member.key",
+        "meta.object.key",
+        "string.unquoted.key",
+        "support.type.property-name",
+        "variable.other.property",
+        "variable.object.property",
+        "variable.other.object.property",
+        "variable.parameter.function-call",
+        "meta.function-call.arguments variable.parameter",
+        "entity.name.field",
+        "variable.other.field",
+        "variable.other.declaration.field",
+        "entity.other.attribute-name",
+      ],
+      settings: { foreground: "#7dd3fc" },
+    },
     // function & method names — vivid violet. Functions are the verbs of
     // code and deserve their own neon hue against the cyan/lime/orange
     // backdrop. Violet reads as cyberpunk-neon rather than synthwave-pink.
