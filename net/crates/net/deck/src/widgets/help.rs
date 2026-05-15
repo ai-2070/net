@@ -22,6 +22,7 @@ const NAVIGATION: &[Binding] = &[
     Binding { keys: "1-8",       desc: "jump to tab" },
     Binding { keys: "Tab / ◂▸",  desc: "cycle tab" },
     Binding { keys: "j / k",     desc: "cursor down / up" },
+    Binding { keys: "g / G",     desc: "cursor to top / bottom" },
     Binding { keys: "J / K",     desc: "DAEMON: next / prev group" },
     Binding { keys: "f",         desc: "AUDIT: toggle ICE-only filter" },
     Binding { keys: "n",         desc: "AUDIT: cycle row limit (none/25/100)" },
@@ -58,7 +59,7 @@ const MODAL: &[Binding] = &[
 ];
 
 pub fn render(frame: &mut Frame<'_>, area: Rect) {
-    let modal_area = center(area, 78, 37);
+    let modal_area = center(area, 78, 38);
     frame.render_widget(Clear, modal_area);
 
     let block = Block::default()
@@ -81,7 +82,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(10), // navigation
+            Constraint::Length(11), // navigation
             Constraint::Length(11), // admin
             Constraint::Length(9),  // ice
             Constraint::Length(4),  // modal

@@ -298,10 +298,10 @@ impl App {
             KeyCode::Char('k') if self.current == Tab::Replicas => {
                 self.replica_cursor = self.replica_cursor.saturating_sub(1);
             }
-            // ICE force-evict-replica on the cursored chain's
-            // first holder. (Multi-holder picker is a future
-            // UX upgrade; first-holder default is the most
-            // common case for under-replicated chains.)
+            // ICE force-evict-replica on the cursored chain.
+            // Opens a holder picker scoped to the chain's
+            // current holders; the chosen holder drops its
+            // replica on commit.
             KeyCode::Char('E') if self.current == Tab::Replicas => {
                 self.propose_ice_force_evict_replica();
             }
@@ -319,6 +319,11 @@ impl App {
             KeyCode::Char('k') if self.current == Tab::Migrations => {
                 self.migration_cursor = self.migration_cursor.saturating_sub(1);
             }
+            // Vim-style top/bottom on every cursor-driven tab.
+            // `g` jumps to the first row / group / member; `G`
+            // jumps to the last. No-op on tabs without a list.
+            KeyCode::Char('g') => self.cursor_to_top(),
+            KeyCode::Char('G') => self.cursor_to_bottom(),
             // ICE kill-migration on the cursored migration row.
             KeyCode::Char('K') if self.current == Tab::Migrations => {
                 self.propose_ice_kill_migration();
@@ -486,6 +491,42 @@ impl App {
             self.migration_cursor = 0;
         } else if self.migration_cursor >= n {
             self.migration_cursor = n - 1;
+        }
+    }
+
+    fn cursor_to_top(&mut self) {
+        match self.current {
+            Tab::List => self.list_cursor = 0,
+            Tab::Replicas => self.replica_cursor = 0,
+            Tab::Migrations => self.migration_cursor = 0,
+            Tab::Daemon => self.daemon_cursor = DaemonCursor::default(),
+            _ => {}
+        }
+    }
+
+    fn cursor_to_bottom(&mut self) {
+        match self.current {
+            Tab::List => {
+                let n = self.snapshot.peers.len();
+                self.list_cursor = n.saturating_sub(1);
+            }
+            Tab::Replicas => {
+                let n = self.snapshot.replicas.len();
+                self.replica_cursor = n.saturating_sub(1);
+            }
+            Tab::Migrations => {
+                let n = self.snapshot.in_flight_migrations.len();
+                self.migration_cursor = n.saturating_sub(1);
+            }
+            Tab::Daemon => {
+                let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
+                if let Some(last) = groups.len().checked_sub(1) {
+                    self.daemon_cursor.group = last;
+                    self.daemon_cursor.member =
+                        groups[last].members.len().saturating_sub(1);
+                }
+            }
+            _ => {}
         }
     }
 
