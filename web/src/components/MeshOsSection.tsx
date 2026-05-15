@@ -915,7 +915,7 @@ export function MeshOsSection() {
       </DisplayHeading>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.7] font-light mb-12">
-        Programs move between machines without stopping. Daemons migrate
+        Programs move between machines without stopping. Storage autobalances. Daemons migrate
         seamlessly across the mesh while maintaining full state.
         <br />
         <br />
