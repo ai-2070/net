@@ -14,11 +14,11 @@ use ratatui::{
 
 use crate::{theme, widgets};
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, records: &[FailureRecord]) {
+pub fn render(frame: &mut Frame<'_>, area: Rect, records: &[FailureRecord], cursor: usize) {
     if records.is_empty() {
         render_empty(frame, area);
     } else {
-        render_table(frame, area, records);
+        render_table(frame, area, records, cursor);
     }
 }
 
@@ -41,12 +41,19 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_table(frame: &mut Frame<'_>, area: Rect, records: &[FailureRecord]) {
+fn render_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    records: &[FailureRecord],
+    cursor: usize,
+) {
     let total = records.len();
+    let pos = cursor.min(total.saturating_sub(1)) + 1;
     let header_line = Line::from(vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("FAILURES", theme::green_hi()),
         Span::styled(format!("    {total} records"), theme::chrome()),
+        Span::styled(format!("    {pos}/{total}"), theme::dim()),
     ]);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -55,6 +62,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, records: &[FailureRecord]) {
         .title_alignment(Alignment::Left);
 
     let header = Row::new(vec![
+        cell_dim(" "),
         cell_dim("SEQ"),
         cell_dim("WHEN"),
         cell_dim("SOURCE"),
@@ -64,8 +72,12 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, records: &[FailureRecord]) {
 
     let now_ms = unix_now_ms();
     let mut rows: Vec<Row> = Vec::with_capacity(total);
-    // Newest first — failures matter most at the head.
-    for rec in records.iter().rev() {
+    // Newest first — failures matter most at the head. Cursor
+    // indexes the visible (post-reverse) order, so cursor=0
+    // points at the freshest record.
+    for (i, rec) in records.iter().rev().enumerate() {
+        let is_cursor = i == cursor;
+        let marker = if is_cursor { "▶" } else { " " };
         let when = format_relative(rec.recorded_at_ms, now_ms);
         // Replay-derived records carry `seq = 0` and are dim to
         // distinguish them from live executor records.
@@ -74,17 +86,21 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, records: &[FailureRecord]) {
         } else {
             format!("{:>5}", rec.seq)
         };
+        let source_style = if is_cursor { theme::amber() } else { theme::amber() };
+        let reason_style = if is_cursor { theme::green_hi() } else { theme::text() };
         rows.push(Row::new(vec![
+            Cell::from(Span::styled(marker, theme::green_hi())),
             Cell::from(Span::styled(seq_text, theme::dim())),
             Cell::from(Span::styled(when, theme::text())),
-            Cell::from(Span::styled(rec.source.clone(), theme::amber())),
-            Cell::from(Span::styled(rec.reason.clone(), theme::text())),
+            Cell::from(Span::styled(rec.source.clone(), source_style)),
+            Cell::from(Span::styled(rec.reason.clone(), reason_style)),
         ]));
     }
 
     let table = Table::new(
         rows,
         [
+            Constraint::Length(2),  // cursor
             Constraint::Length(5),  // SEQ
             Constraint::Length(9),  // WHEN
             Constraint::Length(24), // SOURCE

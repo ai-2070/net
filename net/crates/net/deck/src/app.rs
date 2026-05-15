@@ -110,6 +110,10 @@ pub struct App {
     /// Cursor on the MIGRATIONS tab — index into
     /// `snapshot.in_flight_migrations`.
     pub migration_cursor: usize,
+    /// Cursor on the FAILURES tab — index into the failures
+    /// tail. 0 = newest record (since the projection reverses
+    /// the buffer for display).
+    pub failures_cursor: usize,
     /// AUDIT tab filter: show only ICE force-* records when true.
     pub audit_force_only: bool,
     /// AUDIT tab filter: cap the visible rows. `None` shows
@@ -234,6 +238,7 @@ impl App {
             list_cursor: 0,
             replica_cursor: 0,
             migration_cursor: 0,
+            failures_cursor: 0,
             audit_force_only: false,
             audit_limit: None,
             logs_min_level: net_sdk::deck::LogLevel::Info,
@@ -377,6 +382,13 @@ impl App {
             }
             KeyCode::Char('k') if self.current == Tab::Migrations => {
                 self.migration_cursor = self.migration_cursor.saturating_sub(1);
+            }
+            KeyCode::Char('j') if self.current == Tab::Failures => {
+                self.failures_cursor = self.failures_cursor.saturating_add(1);
+                self.clamp_failures_cursor();
+            }
+            KeyCode::Char('k') if self.current == Tab::Failures => {
+                self.failures_cursor = self.failures_cursor.saturating_sub(1);
             }
             // Vim-style top/bottom on every cursor-driven tab.
             // `g` jumps to the first row / group / member; `G`
@@ -583,6 +595,15 @@ impl App {
         }
     }
 
+    fn clamp_failures_cursor(&mut self) {
+        let n = self.failures_tail.records.lock().len();
+        if n == 0 {
+            self.failures_cursor = 0;
+        } else if self.failures_cursor >= n {
+            self.failures_cursor = n - 1;
+        }
+    }
+
     /// Absorb a single keypress into the active tab's search
     /// buffer. `Enter` commits (filter stays active), `Esc`
     /// cancels and clears, `Backspace` pops, any printable char
@@ -615,6 +636,7 @@ impl App {
             Tab::List => self.list_cursor = 0,
             Tab::Replicas => self.replica_cursor = 0,
             Tab::Migrations => self.migration_cursor = 0,
+            Tab::Failures => self.failures_cursor = 0,
             Tab::Daemon => self.daemon_cursor = DaemonCursor::default(),
             _ => {}
         }
@@ -633,6 +655,10 @@ impl App {
             Tab::Migrations => {
                 let n = self.snapshot.in_flight_migrations.len();
                 self.migration_cursor = n.saturating_sub(1);
+            }
+            Tab::Failures => {
+                let n = self.failures_tail.records.lock().len();
+                self.failures_cursor = n.saturating_sub(1);
             }
             Tab::Daemon => {
                 let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
@@ -1191,7 +1217,7 @@ impl App {
             ),
             Tab::Failures => {
                 let records = self.failures_tail.snapshot();
-                tabs::failures::render(frame, chunks[3], &records);
+                tabs::failures::render(frame, chunks[3], &records, self.failures_cursor);
             }
         }
         widgets::footer::render(frame, chunks[4]);
