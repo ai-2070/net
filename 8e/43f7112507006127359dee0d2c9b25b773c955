@@ -1,0 +1,28 @@
+web/src/components/CopyButton.tsx
+  s_e461293ef945b9::t_387def2ccbf3a6 1-43
+web/src/components/CodeBlock.tsx
+  s_e461293ef945b9::t_32814026092f0f 19-22,40
+  s_e461293ef945b9::t_598e81d3367658 1-18,23-39,41-43
+web/src/components/DocsContent.tsx
+  s_e461293ef945b9::t_c08fde79df183a 309-320,322,324,329-330
+  s_e461293ef945b9::t_ba838d7b0fecf2 12-153,155-156
+  s_e461293ef945b9::t_4750a9ccc1587c 220-221,227,233,239
+  s_e461293ef945b9::t_b4c151e139e6a2 4-8,10,154,157-159,204-214,244,248,254,258,261,265-267,289-308,335,338-351,372,374,398,400,454-468
+  s_e461293ef945b9::t_282b539acc53bf 268-279,281-288
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "8e43f7112507006127359dee0d2c9b25b773c955",
+  "prompts": {},
+  "sessions": {
+    "s_e461293ef945b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b86f732-4bc6-49f3-a4d3-0c57194c40f4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
