@@ -43,6 +43,15 @@ function countDocs(folder: ClientDocFolder): number {
   return n;
 }
 
+// Stable 4-char hex hash per slug — fake inode tag for cyberpunk flavor.
+function hashHex4(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  }
+  return (h & 0xffff).toString(16).padStart(4, "0");
+}
+
 function FileRow({
   node,
   active,
@@ -56,15 +65,16 @@ function FileRow({
 }) {
   const on = isActive(node.slug, active);
   const treeChar = isLast ? "└─" : "├─";
+  const tag = hashHex4(node.slug.join("/"));
   return (
     <Link
       href={slugHref(node.slug)}
-      className={`group flex items-center text-[11.5px] leading-[1.55] py-[2px] pr-2 transition-colors ${
+      className={`group flex items-center text-[11px] leading-[1.55] py-[2px] pr-2 transition-colors ${
         on
-          ? "text-accent bg-accent/[0.06]"
+          ? "text-accent bg-accent/[0.07]"
           : "text-ink-dim hover:text-ink hover:bg-bg-2/40"
       }`}
-      style={{ paddingLeft: `${8 + depth * 12}px` }}
+      style={{ paddingLeft: `${6 + depth * 12}px` }}
     >
       <span
         className={`shrink-0 mr-1.5 transition-colors ${
@@ -72,9 +82,25 @@ function FileRow({
         }`}
         aria-hidden
       >
-        {on ? "▸ " : `${treeChar} `}
+        {on ? "▸" : treeChar}
       </span>
-      <span className="truncate">{node.title}</span>
+      <span className="truncate flex-1">{node.title}</span>
+      {on ? (
+        <span
+          aria-hidden
+          className="text-accent ml-1 animate-pulse-dot leading-none"
+        >
+          █
+        </span>
+      ) : null}
+      <span
+        className={`shrink-0 ml-2 text-[9px] tracking-[0.04em] tabular-nums transition-colors ${
+          on ? "text-accent-dim" : "text-ink-faint group-hover:text-ink-dim"
+        }`}
+        aria-hidden
+      >
+        ·{tag}
+      </span>
     </Link>
   );
 }
@@ -96,7 +122,7 @@ function NestedFolder({
         className={`block text-[10px] tracking-[0.14em] uppercase mt-1.5 mb-1 transition-colors ${
           within ? "text-accent" : "text-ink-dim hover:text-ink"
         }`}
-        style={{ paddingLeft: `${8 + depth * 12}px` }}
+        style={{ paddingLeft: `${6 + depth * 12}px` }}
       >
         ▸ {folder.title}
         <span className="text-ink-faint">/</span>
@@ -129,9 +155,11 @@ function NestedFolder({
 function FolderBlock({
   folder,
   active,
+  index,
 }: {
   folder: ClientDocFolder;
   active: string[];
+  index: number; // 1-based section number, for the §NN prefix
 }) {
   const within = descendsFrom(folder.slug, active);
   const count = countDocs(folder);
@@ -143,14 +171,25 @@ function FolderBlock({
           within ? "text-accent" : "text-ink-dim hover:text-ink"
         }`}
       >
-        <span className="text-[10px] tracking-[0.18em] uppercase">
-          <span className="text-accent">▸</span> {folder.title}
+        <span className="text-[10px] tracking-[0.18em] uppercase flex items-center gap-1.5">
+          <span className="text-accent-dim group-hover:text-accent">
+            §{String(index).padStart(2, "0")}
+          </span>
+          <span className="text-accent">▸</span>
+          {folder.title}
           <span className="text-ink-faint">/</span>
         </span>
-        <span className="text-[9px] text-ink-faint tracking-[0.1em] group-hover:text-ink-dim">
-          [{count}]
+        <span className="text-[9px] text-ink-faint tracking-[0.1em] group-hover:text-ink-dim tabular-nums">
+          [{String(count).padStart(2, "0")}]
         </span>
       </Link>
+      {/* hard divider under the section header */}
+      <div
+        aria-hidden
+        className="text-[8px] text-line tracking-[0.05em] leading-none px-2 mb-1 select-none overflow-hidden whitespace-nowrap"
+      >
+        ════════════════════════════════════════════
+      </div>
       <div>
         {folder.children.map((child, i, arr) => {
           const last = i === arr.length - 1;
@@ -186,23 +225,33 @@ function SidebarBody({
   tree: ClientDocTree;
   active: string[];
 }) {
+  // Section indexing: §01 = overview (root files), §02..N = top-level folders.
   return (
     <>
       {/* Fake prompt */}
       <div className="px-2 mb-3 text-[10px] text-ink-faint tracking-[0.06em]">
         <span className="text-accent">$</span> tree --live
+        <span className="text-accent ml-1 animate-pulse-dot">█</span>
       </div>
 
       {tree.rootFiles.length > 0 && (
         <section className="mb-4">
           <div className="flex items-baseline justify-between mb-1 pl-2 pr-2 text-ink-dim">
-            <span className="text-[10px] tracking-[0.18em] uppercase">
-              <span className="text-accent">▸</span> overview
+            <span className="text-[10px] tracking-[0.18em] uppercase flex items-center gap-1.5">
+              <span className="text-accent-dim">§01</span>
+              <span className="text-accent">▸</span>
+              overview
               <span className="text-ink-faint">/</span>
             </span>
-            <span className="text-[9px] text-ink-faint tracking-[0.1em]">
-              [{tree.rootFiles.length}]
+            <span className="text-[9px] text-ink-faint tracking-[0.1em] tabular-nums">
+              [{String(tree.rootFiles.length).padStart(2, "0")}]
             </span>
+          </div>
+          <div
+            aria-hidden
+            className="text-[8px] text-line tracking-[0.05em] leading-none px-2 mb-1 select-none overflow-hidden whitespace-nowrap"
+          >
+            ════════════════════════════════════════════
           </div>
           <div>
             {tree.rootFiles.map((f, i, arr) => (
@@ -218,11 +267,12 @@ function SidebarBody({
         </section>
       )}
 
-      {tree.folders.map((folder) => (
+      {tree.folders.map((folder, i) => (
         <FolderBlock
           key={folder.slug.join("/")}
           folder={folder}
           active={active}
+          index={i + 2 /* §01 was overview */}
         />
       ))}
     </>
@@ -243,8 +293,6 @@ export function DocsSidebar({
     tree.folders.reduce((sum, f) => sum + countDocs(f), 0) +
     (tree.hasRootReadme ? 1 : 0);
 
-  // Bare-body variant used inside DocsDrawer (the drawer already has its
-  // own terminal chrome, so we don't double-frame).
   if (!chrome) {
     return (
       <nav className="font-mono" aria-label="Docs navigation">
@@ -256,7 +304,7 @@ export function DocsSidebar({
   return (
     <nav className="font-mono" aria-label="Docs navigation">
       <div className="border border-line bg-bg-2/30 overflow-hidden">
-        {/* Terminal title bar */}
+        {/* Title bar: traffic dots, $ prompt, page count */}
         <div className="border-b border-line px-3 py-2 flex items-center justify-between">
           <span className="flex items-center gap-2.5">
             <span className="inline-flex gap-1" aria-hidden>
@@ -272,8 +320,8 @@ export function DocsSidebar({
               net.docs
             </Link>
           </span>
-          <span className="text-[9px] tracking-[0.14em] uppercase text-ink-faint">
-            {totalDocs} pages
+          <span className="text-[9px] tracking-[0.14em] uppercase text-ink-faint tabular-nums">
+            {String(totalDocs).padStart(2, "0")} pages
           </span>
         </div>
 
@@ -282,17 +330,27 @@ export function DocsSidebar({
           <SidebarBody tree={tree} active={active} />
         </div>
 
-        {/* Status footer */}
-        <div className="border-t border-line px-3 py-1.5 flex items-center justify-between">
-          <span className="flex items-center gap-1.5">
-            <span className="w-1 h-1 rounded-full bg-accent inline-block animate-pulse-dot" />
-            <span className="text-[9px] tracking-[0.18em] uppercase text-accent-dim">
-              live
+        {/* Status footer — vim-like key hints + live + version */}
+        <div className="border-t border-line">
+          <div className="px-3 py-1.5 flex items-center justify-between gap-2">
+            <span className="flex items-center gap-1.5">
+              <span className="w-1 h-1 rounded-full bg-accent inline-block animate-pulse-dot" />
+              <span className="text-[9px] tracking-[0.18em] uppercase text-accent-dim">
+                live
+              </span>
             </span>
-          </span>
-          <span className="text-[9px] tracking-[0.14em] uppercase text-ink-faint">
-            v0.17
-          </span>
+            <span
+              className="text-[9px] tracking-[0.06em] text-ink-faint hidden sm:block"
+              aria-hidden
+            >
+              <span className="text-accent-dim">j</span>↓{" "}
+              <span className="text-accent-dim">k</span>↑{" "}
+              <span className="text-accent-dim">/</span>find
+            </span>
+            <span className="text-[9px] tracking-[0.14em] uppercase text-ink-faint">
+              v0.17
+            </span>
+          </div>
         </div>
       </div>
     </nav>
