@@ -1,0 +1,84 @@
+web/src/content/docs/SUBNETS.md
+  s_e461293ef945b9::t_4adf3646d693be 1-104
+web/src/content/docs/releases/RELEASE_v0.15_REBEL_YELL.md
+  s_e461293ef945b9::t_4adf3646d693be 1-858
+web/src/content/docs/releases/RELEASE_v0.13_CHIPPIN_IN.md
+  s_e461293ef945b9::t_4adf3646d693be 1-308
+web/src/content/docs/releases/RELEASE_v0.16_EYE_OF_THE_TIGER.md
+  s_e461293ef945b9::t_4adf3646d693be 1-458
+web/src/content/docs/IDENTITY.md
+  s_e461293ef945b9::t_4adf3646d693be 1-112
+web/src/content/docs/CAPABILITY_ENHANCEMENTS_USAGE.md
+  s_e461293ef945b9::t_4adf3646d693be 1-414
+web/src/content/docs/CAPABILITY_SYSTEM_MIGRATION.md
+  s_e461293ef945b9::t_4adf3646d693be 1-447
+web/src/content/docs/SUBPROTOCOLS.md
+  s_e461293ef945b9::t_4adf3646d693be 1-137
+web/src/content/docs/releases/RELEASE_STEPS.md
+  s_e461293ef945b9::t_4adf3646d693be 1-38
+web/src/app/docs/page.tsx
+  s_e461293ef945b9::t_bcfd5930408625 27
+web/src/content/docs/CONTINUITY.md
+  s_e461293ef945b9::t_4adf3646d693be 1-159
+web/src/content/docs/COMPUTE.md
+  s_e461293ef945b9::t_4adf3646d693be 1-347
+web/src/content/docs/releases/RELEASE_v0.11_BLACK_DIAMOND.md
+  s_e461293ef945b9::t_4adf3646d693be 1-207
+web/src/content/docs/releases/RELEASE_v0.9_FIRST_BLOOD.md
+  s_e461293ef945b9::t_4adf3646d693be 1-254
+web/src/content/docs/CONFIG_REPLICATION.md
+  s_e461293ef945b9::t_4adf3646d693be 1-286
+web/src/content/docs/releases/RELEASE_v0.12_FIRESTARTER.md
+  s_e461293ef945b9::t_4adf3646d693be 1-164
+web/src/content/docs/BEHAVIOR.md
+  s_e461293ef945b9::t_4adf3646d693be 1-297
+web/src/content/docs/CONTESTED.md
+  s_e461293ef945b9::t_4adf3646d693be 1-140
+web/src/content/docs/CAPABILITIES_SCHEMA.md
+  s_e461293ef945b9::t_4adf3646d693be 1-237
+web/src/content/docs/releases/RELEASE_v0.10_HEX.md
+  s_e461293ef945b9::t_4adf3646d693be 1-338
+web/src/content/docs/releases/RELEASE_v0.14_THE_WARRIORS.md
+  s_e461293ef945b9::t_4adf3646d693be 1-362
+web/src/content/docs/releases/RELEASE_v0.8_KILLING_MOON.md
+  s_e461293ef945b9::t_4adf3646d693be 1-47
+web/src/content/docs/TRANSPORT.md
+  s_e461293ef945b9::t_4adf3646d693be 1-317
+web/src/lib/docs.ts
+  s_e461293ef945b9::t_2f6c711b1c2389 219,227
+  s_e461293ef945b9::t_a0dccb5ae92045 151
+  s_e461293ef945b9::t_1bfb0df6483627 7-10
+  s_e461293ef945b9::t_f467e971680f5e 94
+  s_e461293ef945b9::t_02394182909f89 118-126
+  s_e461293ef945b9::t_36b85fb2c6e0f7 168,176
+web/src/content/docs/STATE.md
+  s_e461293ef945b9::t_4adf3646d693be 1-126
+web/src/content/docs/releases/RELEASE_v0.17_ATOMIC_PLAYBOYS.md
+  s_e461293ef945b9::t_4adf3646d693be 1-438
+web/src/content/docs/releases/RELEASE_v0.8_NOTES.md
+  s_e461293ef945b9::t_4adf3646d693be 1-19
+web/src/content/docs/STORAGE_AND_CORTEX.md
+  s_e461293ef945b9::t_4adf3646d693be 1-286
+web/src/components/DocsContent.tsx
+  s_e461293ef945b9::t_70217ff5c5ec19 6-48,90,99,159,167-208,211-217,224
+web/src/app/docs/[...slug]/page.tsx
+  s_e461293ef945b9::t_ec9f950377e25c 99
+web/src/content/docs/CHANNELS.md
+  s_e461293ef945b9::t_4adf3646d693be 1-150
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "ff0b04eb58ec93b8336546ee8c6aaf88514575bd",
+  "prompts": {},
+  "sessions": {
+    "s_e461293ef945b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b86f732-4bc6-49f3-a4d3-0c57194c40f4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
