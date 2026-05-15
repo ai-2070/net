@@ -94,8 +94,9 @@ mod samples {
     use net_sdk::capabilities::CapabilityFilter;
     use net_sdk::compute::CausalEvent;
     use net_sdk::meshos::{
-        DaemonError, EntityKeypair, HealthProbe, LocalityProbe, MeshDaemon,
-        MeshOsDaemonHandle, MeshOsDaemonSdk, NodeHealth, NodeId,
+        ChainId, DaemonError, EntityKeypair, HealthProbe, LocalityProbe, MeshDaemon,
+        MeshOsDaemonHandle, MeshOsDaemonSdk, MeshOsEvent, NodeHealth, NodeId,
+        PlacementIntent, ReplicaUpdate,
     };
 
     /// Stub daemon — `process` is a no-op; everything else
@@ -163,12 +164,56 @@ mod samples {
         }
     }
 
-    /// Install probes + register 11 grouped daemons. No
-    /// background task — the runtime's tick + supervisor
-    /// drive whatever evolution the snapshot shows.
+    /// Eight synthetic chains spread across the peer fixture
+    /// so the REPLICAS tab has data to render under samples
+    /// mode. Holders are drawn from `PEERS`; chains are sized
+    /// 2–4 to exercise the over/under/ok column tags. The
+    /// last chain is intentionally undersized so the
+    /// summary line reports `1 under`.
+    const CHAINS: &[(ChainId, u32, &[NodeId])] = &[
+        (0xc001, 3, &[0xa96f, 0xe9b8, 0x372b]),
+        (0xc002, 3, &[0xd4ff, 0x3599, 0xf206]),
+        (0xc003, 2, &[0xbdda, 0xe068]),
+        (0xc004, 3, &[0x82ee, 0x6dfb, 0x3c81]),
+        (0xc005, 4, &[0xa96f, 0xe9b8, 0xe685, 0xd4ff]),
+        (0xc006, 3, &[0x372b, 0xeba8, 0xbf44]),
+        (0xc007, 2, &[0xe068, 0xf83d]),
+        (0xc008, 3, &[0x6808, 0x0fc2]), // intentionally under by 1
+    ];
+
+    /// Install probes + register 11 grouped daemons + seed
+    /// the snapshot's `replicas` map by publishing
+    /// `ReplicaUpdate::Added` + `PlacementIntent` events
+    /// through the runtime handle. No background task — once
+    /// the seed events fold, the snapshot is steady-state.
     pub fn install(sdk: &MeshOsDaemonSdk) -> color_eyre::Result<Vec<MeshOsDaemonHandle>> {
         sdk.runtime().add_locality_probe(Arc::new(SampleLocalityProbe));
         sdk.runtime().add_health_probe(Arc::new(SampleHealthProbe));
+
+        // Replica seeding: fire one ReplicaUpdate per (chain,
+        // holder) plus one PlacementIntent per chain. Run in a
+        // background task because publish is async; the task
+        // completes after a handful of awaits and naturally
+        // drops.
+        let handle = sdk.runtime().handle_clone();
+        tokio::spawn(async move {
+            for (chain, desired, holders) in CHAINS {
+                let _ = handle
+                    .publish(MeshOsEvent::PlacementIntent(PlacementIntent {
+                        chain: *chain,
+                        desired_replicas: *desired,
+                    }))
+                    .await;
+                for holder in holders.iter() {
+                    let _ = handle
+                        .publish(MeshOsEvent::ReplicaUpdate(ReplicaUpdate::Added {
+                            chain: *chain,
+                            holder: *holder,
+                        }))
+                        .await;
+                }
+            }
+        });
 
         // 11 daemons across all four lineage groups. The
         // `#suffix` convention in each name is parsed by
