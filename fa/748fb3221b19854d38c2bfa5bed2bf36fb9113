@@ -1,0 +1,49 @@
+net/crates/net/deck/src/widgets/mod.rs
+  s_3bbc444b3ef3e5::t_3f1e8f55ec1bd4 1
+net/crates/net/deck/src/widgets/status_bar.rs
+  s_3bbc444b3ef3e5::t_0779943ac9e6e5 20-24,26,30-31
+net/crates/net/deck/src/main.rs
+  s_3bbc444b3ef3e5::t_0fe0a0c01f9c6b 32
+  s_3bbc444b3ef3e5::t_baf8804518a6bf 8-15,20,31,38-41
+net/crates/net/deck/src/tabs/daemon.rs
+  s_3bbc444b3ef3e5::t_2e36f5c01b2c13 12,26-27,32-35,37-38,42,44-83,109,114,120,142,158,167,172,181-184,186-189,193,206,221-223,229-234,252-254,258-260,263,272-281,304,326,354,370,396-402,408,410
+net/crates/net/deck/src/tabs/dataforts.rs
+  s_3bbc444b3ef3e5::t_ebb6b750ca5a17 13-17,20-34
+net/crates/net/deck/src/tabs/list_view.rs
+  s_3bbc444b3ef3e5::t_7a8b9a6de70827 9,17-19,22-24,28-69,88,181-182
+net/crates/net/deck/Cargo.toml
+  s_3bbc444b3ef3e5::t_25c72ba19cebfa 24-29,31,33-35
+  s_3bbc444b3ef3e5::t_9ccf04d6f634ac 30,32,36
+net/crates/net/deck/src/runtime.rs
+  s_3bbc444b3ef3e5::t_ed385c8ec9bf15 2-5,16-23,25-28,33-41,45-59,61-63,66-69,75-83,85-87,89-90,92-94,96-100,102-112,116-135,138-145,148-152,164,166-168,170-172,174-176,178-180,182-184,186-188,190-192,194-196,198-200,202-204,206-207,209-210
+  s_3bbc444b3ef3e5::t_5b924c9d883c5b 1,6-15,24,29-32,42-44,60,64-65,70-74,84,88,91,95,101,113-115,136-137,146-147,153-163,165,169,173,177,181,185,189,193,197,201,205,208
+net/crates/net/deck/src/tabs/net_map.rs
+  s_3bbc444b3ef3e5::t_b161d5d0162f17 7,13,18,23,28,32,45-68,70,119-120,131-135,150-155
+net/crates/net/deck/src/tabs/logs.rs
+  s_3bbc444b3ef3e5::t_48f292803f5f2f 76-79,84,87-95
+  s_3bbc444b3ef3e5::t_1d4e99e1455e40 108,111
+net/crates/net/deck/src/widgets/empty.rs
+  s_3bbc444b3ef3e5::t_e19af10b1a4797 1-40
+net/crates/net/deck/src/app.rs
+  s_3bbc444b3ef3e5::t_3efb1ebe7bbc01 165-167,169
+  s_3bbc444b3ef3e5::t_8b81cdca89d460 121
+  s_3bbc444b3ef3e5::t_a183e39db8cbfc 85-86
+  s_3bbc444b3ef3e5::t_ddda38d1df6c03 202,204,209,213
+  s_3bbc444b3ef3e5::t_a9bde61546f4a6 61-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "fa748fb3221b19854d38c2bfa5bed2bf36fb9113",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
