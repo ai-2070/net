@@ -13,17 +13,137 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeshOsSnapsho
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
-    render_nodes_table(frame, rows[0]);
-    // Live daemons table when snapshot has daemons; fixture
-    // table otherwise (no cluster, or fresh runtime).
-    let has_live = snapshot
-        .map(|s| !s.daemons.is_empty())
-        .unwrap_or(false);
-    if has_live {
+
+    // Live nodes table when snapshot has peers; fixture
+    // table otherwise (no cluster, fresh runtime, or no
+    // probes installed).
+    let has_live_peers = snapshot.map(|s| !s.peers.is_empty()).unwrap_or(false);
+    if has_live_peers {
+        render_live_nodes_table(frame, rows[0], snapshot.unwrap());
+    } else {
+        render_nodes_table(frame, rows[0]);
+    }
+
+    let has_live_daemons = snapshot.map(|s| !s.daemons.is_empty()).unwrap_or(false);
+    if has_live_daemons {
         render_live_daemons_table(frame, rows[1], snapshot.unwrap());
     } else {
         render_daemons_table(frame, rows[1]);
     }
+}
+
+fn render_live_nodes_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot) {
+    use net_sdk::deck::{MaintenanceMirrorSnapshot, PeerHealthSnapshot};
+
+    let total = snapshot.peers.len();
+    let healthy = snapshot
+        .peers
+        .values()
+        .filter(|p| matches!(p.health, Some(PeerHealthSnapshot::Healthy)))
+        .count();
+    let degraded = snapshot
+        .peers
+        .values()
+        .filter(|p| matches!(p.health, Some(PeerHealthSnapshot::Degraded)))
+        .count();
+    let header_line = Line::from(vec![
+        Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+        Span::styled("NODES", theme::green_hi()),
+        Span::styled(
+            format!(
+                "    {total} live · {healthy} healthy · {degraded} degraded"
+            ),
+            theme::chrome(),
+        ),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::rule())
+        .title(header_line)
+        .title_alignment(Alignment::Left);
+
+    let header = Row::new(vec![
+        cell_dim("NODE"),
+        cell_dim("HEALTH"),
+        cell_dim("RTT"),
+        cell_dim("DAEMONS"),
+        cell_dim("MAINT"),
+    ])
+    .height(1);
+
+    let mut table_rows: Vec<Row> = Vec::with_capacity(snapshot.peers.len());
+    for (peer_id, p) in &snapshot.peers {
+        let (health_style, health_text) = match p.health {
+            Some(PeerHealthSnapshot::Healthy) => (theme::green(), "Healthy"),
+            Some(PeerHealthSnapshot::Degraded) => (theme::amber(), "Degraded"),
+            Some(PeerHealthSnapshot::Unreachable) => (theme::red(), "Unreachable"),
+            None => (theme::chrome(), "—"),
+            _ => (theme::chrome(), "?"),
+        };
+        let rtt_text = match p.rtt_ms {
+            Some(ms) => format!("{ms}ms"),
+            None => "—".to_string(),
+        };
+        // Count daemons on this node.
+        let daemon_count = snapshot
+            .daemons
+            .values()
+            .filter(|d| d.placement == *peer_id)
+            .count();
+        let maint_style;
+        let maint_text = match p.maintenance {
+            Some(MaintenanceMirrorSnapshot::Active) | None => {
+                maint_style = theme::chrome();
+                "—".to_string()
+            }
+            Some(MaintenanceMirrorSnapshot::EnteringMaintenance) => {
+                maint_style = theme::cyan();
+                "drain".to_string()
+            }
+            Some(MaintenanceMirrorSnapshot::Maintenance) => {
+                maint_style = theme::cyan();
+                "maint".to_string()
+            }
+            Some(MaintenanceMirrorSnapshot::ExitingMaintenance) => {
+                maint_style = theme::cyan();
+                "exit".to_string()
+            }
+            Some(MaintenanceMirrorSnapshot::DrainFailed) => {
+                maint_style = theme::red();
+                "failed".to_string()
+            }
+            Some(MaintenanceMirrorSnapshot::Recovery) => {
+                maint_style = theme::cyan();
+                "recovery".to_string()
+            }
+            _ => {
+                maint_style = theme::chrome();
+                "?".to_string()
+            }
+        };
+        table_rows.push(Row::new(vec![
+            Cell::from(Line::from(nodes::id_spans(&format!("0x{peer_id:x}")))),
+            Cell::from(Span::styled(health_text, health_style)),
+            Cell::from(Span::styled(rtt_text, theme::text())),
+            Cell::from(Span::styled(format!("{daemon_count:>3}"), theme::text())),
+            Cell::from(Span::styled(maint_text, maint_style)),
+        ]));
+    }
+
+    let table = Table::new(
+        table_rows,
+        [
+            Constraint::Length(18), // NODE: id.label
+            Constraint::Length(11), // HEALTH
+            Constraint::Length(7),  // RTT
+            Constraint::Length(8),  // DAEMONS
+            Constraint::Length(10), // MAINT
+        ],
+    )
+    .header(header)
+    .block(block)
+    .column_spacing(2);
+    frame.render_widget(table, area);
 }
 
 fn render_live_daemons_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot) {

@@ -210,7 +210,9 @@ impl App {
         widgets::tab_bar::render(frame, chunks[1], self.current);
         widgets::rule::render(frame, chunks[2]);
         match self.current {
-            Tab::NetMap => tabs::net_map::render(frame, chunks[3], self.tick),
+            Tab::NetMap => {
+                tabs::net_map::render(frame, chunks[3], self.tick, self.snapshot.as_deref())
+            }
             Tab::List => {
                 tabs::list_view::render(frame, chunks[3], self.snapshot.as_deref())
             }

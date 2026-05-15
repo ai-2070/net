@@ -96,9 +96,15 @@ pub use net::adapter::net::behavior::meshos::{
 // Supporting types daemon authors need.
 pub use net::adapter::net::behavior::capability::CapabilitySet;
 pub use net::adapter::net::behavior::meshos::{
-    ActionDispatcher, DispatchError, LogLevel, LogLine, LoggingDispatcher, MeshOsConfig,
-    MeshOsRuntime, RuntimeShutdownError, RuntimeStats,
+    ActionDispatcher, DispatchError, HealthProbe, LocalityProbe, LogLevel, LogLine,
+    LoggingDispatcher, MeshOsConfig, MeshOsRuntime, ProbeRegistry, RuntimeShutdownError,
+    RuntimeStats,
 };
+// Event-source supporting types — exposed so test / demo
+// callers can write probes that report `NodeHealth` values
+// and so consumers wiring custom event sources can match
+// against `NodeId` in the public surface.
+pub use net::adapter::net::behavior::meshos::{NodeHealth, NodeId};
 pub use net::adapter::net::compute::{
     DaemonControl, DaemonError, DaemonHealth, DaemonHostConfig, MeshDaemon,
 };

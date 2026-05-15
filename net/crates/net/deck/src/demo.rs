@@ -17,8 +17,8 @@ use net_sdk::capabilities::CapabilityFilter;
 use net_sdk::compute::CausalEvent;
 use net_sdk::deck::{DeckClient, OperatorIdentity};
 use net_sdk::meshos::{
-    DaemonError, EntityKeypair, LogLevel, MeshDaemon, MeshOsConfig, MeshOsDaemonHandle,
-    MeshOsDaemonSdk,
+    DaemonError, EntityKeypair, HealthProbe, LocalityProbe, LogLevel, MeshDaemon, MeshOsConfig,
+    MeshOsDaemonHandle, MeshOsDaemonSdk, NodeHealth, NodeId,
 };
 
 /// Handle to the running demo cluster. Hold for the app's
@@ -80,11 +80,24 @@ pub async fn spawn() -> color_eyre::Result<DemoHarness> {
     // Faster tick than the production default so the snapshot
     // updates feel live during demo. `MeshOsConfig` is
     // `#[non_exhaustive]` so we can't use a struct literal —
-    // mutate a default instead.
+    // mutate a default instead. `this_node` is set to a
+    // synthetic local id (`0x0001`) that doesn't appear in
+    // the deck's `nodes` fixture, so every fixture peer shows
+    // up as a remote in the snapshot.
     let mut cfg = MeshOsConfig::default();
+    cfg.this_node = 0x0001;
     cfg.tick_interval = Duration::from_millis(250);
     let dispatcher = Arc::new(net_sdk::meshos::LoggingDispatcher::new());
     let sdk = MeshOsDaemonSdk::start(cfg, dispatcher);
+
+    // Install synthetic probes so `snapshot.peers` populates
+    // with the 17 fixture peers (matching `nodes::NODES`).
+    // RTTs and health are deterministic per peer so the UI
+    // doesn't flicker each tick.
+    sdk.runtime()
+        .add_locality_probe(Arc::new(DemoLocalityProbe));
+    sdk.runtime()
+        .add_health_probe(Arc::new(DemoHealthProbe));
 
     // Register a mix of group kinds so the deck's lineage
     // inference exercises every flavor. Phase A uses a
@@ -159,6 +172,49 @@ pub async fn spawn() -> color_eyre::Result<DemoHarness> {
         seeder,
         deck,
     })
+}
+
+// ───────────────────────── synthetic probes ─────────────────────────
+
+/// 17 fake peers + per-peer RTT µs + per-peer health. The ids
+/// match the deck's `nodes::NODES` fixture so `id.label`
+/// renders correctly. Most peers are Healthy; a couple are
+/// Degraded so the LIST + NET.MAP views show all three states.
+const PEERS: &[(NodeId, u64, NodeHealth)] = &[
+    (0xa96f,  41, NodeHealth::Healthy),
+    (0xe9b8,  39, NodeHealth::Healthy),
+    (0xe685,  12, NodeHealth::Healthy),
+    (0xd4ff,  44, NodeHealth::Healthy),
+    (0x3599,  47, NodeHealth::Healthy),
+    (0x372b,  88, NodeHealth::Healthy),
+    (0xeba8, 244, NodeHealth::Degraded),
+    (0x82ee,  92, NodeHealth::Healthy),
+    (0xbdda,  85, NodeHealth::Healthy),
+    (0x6dfb,  31, NodeHealth::Healthy),
+    (0x3c81,  18, NodeHealth::Healthy),
+    (0xe068, 162, NodeHealth::Healthy),
+    (0xbf44,  29, NodeHealth::Healthy),
+    (0xf206, 167, NodeHealth::Healthy),
+    (0xf83d, 159, NodeHealth::Healthy),
+    (0x6808, 451, NodeHealth::Degraded),
+    (0x0fc2,  73, NodeHealth::Healthy),
+];
+
+struct DemoLocalityProbe;
+impl LocalityProbe for DemoLocalityProbe {
+    fn rtt_samples(&self) -> Vec<(NodeId, Duration)> {
+        PEERS
+            .iter()
+            .map(|(id, us, _)| (*id, Duration::from_micros(*us)))
+            .collect()
+    }
+}
+
+struct DemoHealthProbe;
+impl HealthProbe for DemoHealthProbe {
+    fn health_samples(&self) -> Vec<(NodeId, NodeHealth)> {
+        PEERS.iter().map(|(id, _, h)| (*id, *h)).collect()
+    }
 }
 
 async fn seed_events(daemons: Vec<MeshOsDaemonHandle>, deck: Arc<DeckClient>) {
