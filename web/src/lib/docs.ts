@@ -2,6 +2,7 @@ import "server-only";
 import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import title from "title";
+import GithubSlugger from "github-slugger";
 import { DOCS_ORDER } from "@/docs.order";
 
 // Docs are co-located with the source tree now (MDX-capable). Both `.md`
@@ -315,6 +316,62 @@ export function getAllSlugs(): string[][] {
 
 export function readDocSource(file: DocFile): string {
   return readFileSync(file.filePath, "utf8");
+}
+
+// Table-of-contents entry for one heading in a doc.
+export type TocEntry = {
+  id: string;
+  title: string;
+  level: number; // 2 | 3 | 4 — h1 is page title, intentionally skipped
+};
+
+// Strip simple markdown formatting from heading text so the TOC label
+// reads cleanly (no asterisks, no backticks, no link syntax).
+function stripInline(s: string): string {
+  return s
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/__(.*?)__/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/_([^_]+)_/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+}
+
+// Parse h2/h3/h4 headings out of the raw markdown source. Code fences are
+// skipped so `## comments` inside a Rust snippet don't show up. IDs are
+// generated with the same slugger rehype-slug uses, so the TOC anchors
+// match the rendered DOM IDs exactly.
+export function extractToc(source: string): TocEntry[] {
+  const slugger = new GithubSlugger();
+  const out: TocEntry[] = [];
+  const lines = source.split("\n");
+  let inFence = false;
+  let fenceChar = "";
+
+  for (const line of lines) {
+    const fence = /^(```|~~~)/.exec(line);
+    if (fence) {
+      const ch = fence[1]!;
+      if (!inFence) {
+        inFence = true;
+        fenceChar = ch;
+      } else if (line.startsWith(fenceChar)) {
+        inFence = false;
+        fenceChar = "";
+      }
+      continue;
+    }
+    if (inFence) continue;
+
+    const m = /^(#{2,4})\s+(.+?)\s*#*\s*$/.exec(line);
+    if (!m) continue;
+    const level = m[1]!.length;
+    const text = stripInline(m[2]!.trim());
+    if (!text) continue;
+    const id = slugger.slug(text);
+    out.push({ id, title: text, level });
+  }
+  return out;
 }
 
 // Client-safe view of the tree (no fs paths).

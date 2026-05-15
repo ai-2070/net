@@ -4,9 +4,12 @@ import {
   getAllSlugs,
   resolveDoc,
   readDocSource,
+  extractToc,
   type DocFolder,
+  type TocEntry,
 } from "@/lib/docs";
 import { DocsContent } from "@/components/DocsContent";
+import { DocsToc } from "@/components/DocsToc";
 
 interface PageProps {
   params: Promise<{ slug: string[] }>;
@@ -25,6 +28,14 @@ export async function generateMetadata({ params }: PageProps) {
   return { title: `${title} · Docs · Net` };
 }
 
+function TocRail({ entries }: { entries: readonly TocEntry[] }) {
+  return (
+    <aside className="hidden xl:block xl:sticky xl:top-24 xl:self-start xl:max-h-[calc(100vh-7rem)] xl:overflow-y-auto pt-1 pr-2">
+      <DocsToc entries={entries} />
+    </aside>
+  );
+}
+
 function FolderIndex({ folder }: { folder: DocFolder }) {
   return (
     <div>
@@ -32,8 +43,8 @@ function FolderIndex({ folder }: { folder: DocFolder }) {
         ▸ section
       </div>
       <h1
-        className="font-display text-ink mb-3 leading-[1.05] tracking-[-0.01em]"
-        style={{ fontSize: "clamp(32px, 4vw, 48px)" }}
+        className="font-mono text-ink mb-3 leading-[1.15] tracking-[0.02em] font-semibold"
+        style={{ fontSize: "clamp(28px, 3.4vw, 40px)" }}
       >
         {folder.title}
       </h1>
@@ -41,14 +52,13 @@ function FolderIndex({ folder }: { folder: DocFolder }) {
         /docs/{folder.slug.join("/")}
       </p>
       {folder.children.length === 0 ? (
-        <p className="text-ink-dim text-[13px]">No documents in this section.</p>
+        <p className="text-ink-dim text-[13px]">
+          No documents in this section.
+        </p>
       ) : (
         <ul className="border-t border-line">
           {folder.children.map((child) => (
-            <li
-              key={child.slug.join("/")}
-              className="border-b border-line"
-            >
+            <li key={child.slug.join("/")} className="border-b border-line">
               <Link
                 href={`/docs/${child.slug.join("/")}`}
                 className="flex items-center justify-between py-3 group hover:text-accent transition-colors"
@@ -74,29 +84,40 @@ export default async function DocPage({ params }: PageProps) {
   if (!resolved) notFound();
 
   if (resolved.kind === "folder-index") {
-    return <FolderIndex folder={resolved.folder} />;
+    return (
+      <>
+        <main className="min-w-0 max-w-[740px]">
+          <FolderIndex folder={resolved.folder} />
+        </main>
+        <TocRail entries={[]} />
+      </>
+    );
   }
 
   const source = readDocSource(resolved.file);
+  const toc = extractToc(source);
   return (
-    <div>
-      <div className="text-[11px] text-ink-faint font-mono mb-4 tracking-[0.06em]">
-        <Link href="/docs" className="hover:text-accent">
-          docs
-        </Link>
-        {resolved.file.slug.slice(0, -1).map((seg, i) => {
-          const path = resolved.file.slug.slice(0, i + 1).join("/");
-          return (
-            <span key={path}>
-              <span className="text-ink-faint mx-1.5">/</span>
-              <Link href={`/docs/${path}`} className="hover:text-accent">
-                {seg}
-              </Link>
-            </span>
-          );
-        })}
-      </div>
-      <DocsContent source={source} format={resolved.file.ext} />
-    </div>
+    <>
+      <main className="min-w-0 max-w-[740px]">
+        <div className="text-[11px] text-ink-faint font-mono mb-4 tracking-[0.06em]">
+          <Link href="/docs" className="hover:text-accent">
+            docs
+          </Link>
+          {resolved.file.slug.slice(0, -1).map((seg, i) => {
+            const path = resolved.file.slug.slice(0, i + 1).join("/");
+            return (
+              <span key={path}>
+                <span className="text-ink-faint mx-1.5">/</span>
+                <Link href={`/docs/${path}`} className="hover:text-accent">
+                  {seg}
+                </Link>
+              </span>
+            );
+          })}
+        </div>
+        <DocsContent source={source} format={resolved.file.ext} />
+      </main>
+      <TocRail entries={toc} />
+    </>
   );
 }
