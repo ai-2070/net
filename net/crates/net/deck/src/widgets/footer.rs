@@ -17,6 +17,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect) {
         Span::styled(" cursor    ", theme::dim()),
         Span::styled("c/C", theme::green()),
         Span::styled(" cordon    ", theme::dim()),
+        Span::styled("d", theme::green()),
+        Span::styled(" drain    ", theme::dim()),
         Span::styled("r", theme::green()),
         Span::styled(" restart    ", theme::dim()),
         Span::styled("q", theme::green()),

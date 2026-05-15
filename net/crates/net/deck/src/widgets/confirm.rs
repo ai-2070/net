@@ -37,6 +37,15 @@ pub enum ConfirmAction {
     /// Reverse a prior cordon. Reads from
     /// `admin().uncordon(node)`.
     Uncordon { node: u64, node_display: String },
+    /// Drain the node's workload by the configured deadline.
+    /// Kicks the maintenance state machine: Active →
+    /// EnteringMaintenance → Maintenance. Reads from
+    /// `admin().drain(node, drain_for)`.
+    Drain {
+        node: u64,
+        node_display: String,
+        drain_for: std::time::Duration,
+    },
 }
 
 impl ConfirmAction {
@@ -49,6 +58,16 @@ impl ConfirmAction {
             Self::Cordon { node_display, .. } => format!("cordon node {node_display}"),
             Self::Uncordon { node_display, .. } => {
                 format!("uncordon node {node_display}")
+            }
+            Self::Drain {
+                node_display,
+                drain_for,
+                ..
+            } => {
+                format!(
+                    "drain node {node_display}  ·  window {}s",
+                    drain_for.as_secs()
+                )
             }
         }
     }
@@ -74,6 +93,13 @@ impl ConfirmAction {
                 "new replicas + daemons may land here on the next pass".to_string(),
                 "no-op if the node was never cordoned".to_string(),
                 "fires `admin().uncordon(node)` — signed, audit-logged".to_string(),
+            ],
+            Self::Drain { drain_for, .. } => vec![
+                format!("drains the node within {}s", drain_for.as_secs()),
+                "kicks the maintenance state machine: Active →".to_string(),
+                "EnteringMaintenance → Maintenance → DrainFailed?".to_string(),
+                "replicas evacuate; daemons receive Shutdown control event".to_string(),
+                "fires `admin().drain(node, drain_for)` — signed, audit-logged".to_string(),
             ],
         }
     }

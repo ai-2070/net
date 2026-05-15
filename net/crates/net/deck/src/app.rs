@@ -99,7 +99,18 @@ pub enum Modal {
 enum NodeActionKind {
     Cordon,
     Uncordon,
+    /// Drain with a fixed 5-minute window. Future UX: a
+    /// `[D]` "drain with custom window" prompt that takes a
+    /// numeric input.
+    Drain,
 }
+
+/// Default drain window when the operator hits `[d]` without
+/// specifying a deadline. Five minutes is the cluster's typical
+/// `MaintenanceConfig::default_drain_deadline` order of
+/// magnitude — long enough for replicas to evacuate, short
+/// enough that an accidental drain auto-times out.
+pub const DEFAULT_DRAIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DaemonCursor {
@@ -207,13 +218,16 @@ impl App {
             KeyCode::Char('k') if self.current == Tab::List => {
                 self.list_cursor = self.list_cursor.saturating_sub(1);
             }
-            // LIST tab actions: `c` cordon, `C` uncordon —
-            // both target the cursored node.
+            // LIST tab actions on the cursored node: `c` cordon,
+            // `C` uncordon, `d` drain (5-minute default window).
             KeyCode::Char('c') if self.current == Tab::List => {
                 self.propose_node_action(NodeActionKind::Cordon);
             }
             KeyCode::Char('C') if self.current == Tab::List => {
                 self.propose_node_action(NodeActionKind::Uncordon);
+            }
+            KeyCode::Char('d') if self.current == Tab::List => {
+                self.propose_node_action(NodeActionKind::Drain);
             }
             _ => {}
         }
@@ -255,6 +269,11 @@ impl App {
             NodeActionKind::Uncordon => crate::widgets::confirm::ConfirmAction::Uncordon {
                 node,
                 node_display,
+            },
+            NodeActionKind::Drain => crate::widgets::confirm::ConfirmAction::Drain {
+                node,
+                node_display,
+                drain_for: DEFAULT_DRAIN_WINDOW,
             },
         };
         self.modal = Some(Modal::Confirm(action));
@@ -321,6 +340,11 @@ impl App {
                 }
                 ConfirmAction::Uncordon { node, .. } => {
                     let _ = deck.admin().uncordon(node).await;
+                }
+                ConfirmAction::Drain {
+                    node, drain_for, ..
+                } => {
+                    let _ = deck.admin().drain(node, drain_for).await;
                 }
             }
         });
