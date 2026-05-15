@@ -195,7 +195,7 @@ const NET_THEME = {
         "variable.other.method",
         "support.function.builtin",
       ],
-      settings: { foreground: "#e02855" },
+      settings: { foreground: "#ff003e" },
     },
     // macros (Rust `assert_eq!`, `vec![]`, `println!`) — dim accent
     {
