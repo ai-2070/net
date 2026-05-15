@@ -111,9 +111,10 @@ const NET_THEME = {
         "storage.type.enum",
         "storage.type.trait",
       ],
-      settings: { foreground: "#dab57f" },
+      settings: { foreground: "#ffae57" },
     },
-    // enum variants / constructors — slightly brighter amber
+    // enum variants / constructors — brighter peach so Some/None/Ok/Err
+    // and friends read as their own family next to types
     {
       scope: [
         "variable.other.enummember",
@@ -121,21 +122,31 @@ const NET_THEME = {
         "entity.name.constant.enum",
         "entity.other.attribute-name.enum",
       ],
-      settings: { foreground: "#e8c896" },
+      settings: { foreground: "#ffd09a" },
     },
     // variables + parameters
     {
       scope: ["variable", "variable.parameter", "variable.other"],
       settings: { foreground: "#d4dcd0" },
     },
-    // function names — keep neutral so calls don't shout
+    // function & method names — hot magenta. Functions are the verbs of
+    // code and deserve their own neon hue against the cyan/lime/orange
+    // synthwave backdrop.
     {
       scope: [
         "entity.name.function",
         "support.function",
+        "entity.name.function.call",
+        "entity.name.function.definition",
         "meta.function-call entity.name.function",
+        "meta.function-call.method entity.name.function",
+        "meta.method-call entity.name.function",
+        "meta.function entity.name",
+        "variable.function",
+        "variable.other.method",
+        "support.function.builtin",
       ],
-      settings: { foreground: "#d4dcd0" },
+      settings: { foreground: "#ff44b8" },
     },
     // macros (Rust `assert_eq!`, `vec![]`, `println!`) — dim accent
     {
