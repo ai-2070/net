@@ -17,7 +17,7 @@ import type { DocsOrderConfig } from "@/lib/docs";
 // `"release_v0.17_atomic_playboys"` and `"release-v0.17-atomic-playboys"`
 // resolve to the same entry. Dashes are the canonical (URL) form.
 export const DOCS_ORDER: DocsOrderConfig = {
-  sections: ["plans", "releases", "misc"],
+  sections: ["releases"],
   folders: {
     // Releases — newest first.
     releases: [
@@ -33,12 +33,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "release-v0.8-killing-moon",
     ],
   },
-  hide: [
-    "misc",
-    "plans",
-    "releases/release-steps",
-    "releases/Release-V0.8-Notes",
-  ],
+  // hide: [],
   labels: {
     "releases/release-v0.17-atomic-playboys": "v0.17 — Atomic Playboys",
     "releases/release-v0.16-eye-of-the-tiger": "v0.16 — Eye of the Tiger",
