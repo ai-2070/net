@@ -7,6 +7,7 @@ const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
   { href: "#apps", label: "APPS" },
   { href: "#install", label: "SDKS" },
   { href: "#wall", label: "BLACKWALL" },
+  { href: "/docs", label: "DOCS" },
 ];
 
 export function NavBar() {
@@ -24,12 +25,12 @@ export function NavBar() {
       <ul className="hidden lg:flex list-none gap-7 ml-auto items-center">
         {NAV_LINKS.map((l) => (
           <li key={l.href}>
-            <a
+            <Link
               href={l.href}
               className="text-ink-dim text-[11px] tracking-[0.08em] uppercase hover:text-accent transition-colors"
             >
               {l.label}
-            </a>
+            </Link>
           </li>
         ))}
         <li>
