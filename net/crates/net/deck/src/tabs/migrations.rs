@@ -56,10 +56,12 @@ fn render_table(
     cursor: usize,
 ) {
     let total = snapshot.in_flight_migrations.len();
+    let pos = cursor.min(total.saturating_sub(1)) + 1;
     let header_line = Line::from(vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("MIGRATIONS", theme::green_hi()),
         Span::styled(format!("    {total} in flight"), theme::chrome()),
+        Span::styled(format!("    {pos}/{total}"), theme::dim()),
     ]);
     let block = Block::default()
         .borders(Borders::ALL)

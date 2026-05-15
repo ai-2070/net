@@ -80,6 +80,7 @@ fn render_table(
         }
     }
 
+    let pos = cursor.min(total.saturating_sub(1)) + 1;
     let header_line = Line::from(vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("REPLICAS", theme::green_hi()),
@@ -89,6 +90,7 @@ fn render_table(
             ),
             theme::chrome(),
         ),
+        Span::styled(format!("    {pos}/{total}"), theme::dim()),
     ]);
     let block = Block::default()
         .borders(Borders::ALL)
