@@ -106,6 +106,13 @@ pub enum Modal {
     /// Help overlay — full binding reference. Dismissed with
     /// `?` (toggle), `Esc`, or `q`.
     Help,
+    /// Node picker — `j/k` to cursor through peers, `Enter`
+    /// transitions to a `Confirm` modal with the cursored
+    /// peer baked into the action.
+    PickNode {
+        purpose: crate::widgets::pick_node::PickNodePurpose,
+        cursor: usize,
+    },
 }
 
 /// Internal helper enum used by `propose_node_action` to
@@ -291,6 +298,13 @@ impl App {
             KeyCode::Char('E') if self.current == Tab::Replicas => {
                 self.propose_ice_force_evict_replica();
             }
+            // ICE force-cutover: opens the node picker for the
+            // cursored chain. Operator picks a target peer →
+            // Confirm modal transitions in with the chain +
+            // target baked in.
+            KeyCode::Char('O') if self.current == Tab::Replicas => {
+                self.propose_ice_force_cutover();
+            }
             KeyCode::Char('j') if self.current == Tab::Migrations => {
                 self.migration_cursor = self.migration_cursor.saturating_add(1);
                 self.clamp_migration_cursor();
@@ -456,6 +470,23 @@ impl App {
         }
     }
 
+    fn propose_ice_force_cutover(&mut self) {
+        let Some((chain, _)) = self
+            .snapshot
+            .replicas
+            .iter()
+            .nth(self.replica_cursor)
+        else {
+            return;
+        };
+        self.modal = Some(Modal::PickNode {
+            purpose: crate::widgets::pick_node::PickNodePurpose::ForceCutoverTarget {
+                chain: *chain,
+            },
+            cursor: 0,
+        });
+    }
+
     fn propose_ice_force_evict_replica(&mut self) {
         use net_sdk::deck::{simulate_ice_proposal, IceActionProposal};
         // Pull the cursored chain by index over the
@@ -583,14 +614,79 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.modal = None;
             }
+            // Cursor navigation inside the PickNode modal.
+            KeyCode::Char('j') if matches!(self.modal, Some(Modal::PickNode { .. })) => {
+                if let Some(Modal::PickNode { cursor, .. }) = self.modal.as_mut() {
+                    *cursor = cursor.saturating_add(1);
+                }
+                self.clamp_pick_cursor();
+            }
+            KeyCode::Char('k') if matches!(self.modal, Some(Modal::PickNode { .. })) => {
+                if let Some(Modal::PickNode { cursor, .. }) = self.modal.as_mut() {
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let modal = self.modal.take();
                 match modal {
                     Some(Modal::Confirm(action)) => self.dispatch_confirm(action),
+                    Some(Modal::PickNode { purpose, cursor }) => {
+                        self.commit_pick(purpose, cursor);
+                    }
                     Some(Modal::Help) | None => {}
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Clamp the picker cursor against the current pickable
+    /// peer count. The list excludes `this_node` per the
+    /// `pick_node::pickable_peers` filter.
+    fn clamp_pick_cursor(&mut self) {
+        let this_node = 0x0001; // matches the demo runtime
+        let n = crate::widgets::pick_node::pickable_peers(&self.snapshot, this_node).len();
+        if let Some(Modal::PickNode { cursor, .. }) = self.modal.as_mut() {
+            if n == 0 {
+                *cursor = 0;
+            } else if *cursor >= n {
+                *cursor = n - 1;
+            }
+        }
+    }
+
+    /// Transition from `PickNode` to `Confirm` once the
+    /// operator presses Enter — bake the cursored peer into
+    /// the appropriate ICE action variant.
+    fn commit_pick(
+        &mut self,
+        purpose: crate::widgets::pick_node::PickNodePurpose,
+        cursor: usize,
+    ) {
+        use net_sdk::deck::{simulate_ice_proposal, IceActionProposal};
+        let this_node = 0x0001;
+        let peers = crate::widgets::pick_node::pickable_peers(&self.snapshot, this_node);
+        let Some(target) = peers.get(cursor).copied() else { return };
+        let target_display = format!(
+            "0x{:x}{}",
+            target,
+            crate::nodes::label_of(&format!("0x{target:x}"))
+                .map(|l| format!(".{l}"))
+                .unwrap_or_default(),
+        );
+        match purpose {
+            crate::widgets::pick_node::PickNodePurpose::ForceCutoverTarget { chain } => {
+                let action = IceActionProposal::ForceCutover { chain, target };
+                let blast = simulate_ice_proposal(&self.snapshot, &action);
+                self.modal = Some(Modal::Confirm(
+                    crate::widgets::confirm::ConfirmAction::IceForceCutover {
+                        chain,
+                        target,
+                        target_display,
+                        blast,
+                    },
+                ));
+            }
         }
     }
 
@@ -697,6 +793,10 @@ impl App {
                     let proposal = deck.ice().force_evict_replica(chain, victim);
                     dispatch_ice(&deck, proposal).await;
                 }
+                ConfirmAction::IceForceCutover { chain, target, .. } => {
+                    let proposal = deck.ice().force_cutover(chain, target);
+                    dispatch_ice(&deck, proposal).await;
+                }
             }
         });
     }
@@ -778,6 +878,17 @@ impl App {
         match &self.modal {
             Some(Modal::Confirm(action)) => widgets::confirm::render(frame, area, action),
             Some(Modal::Help) => widgets::help::render(frame, area),
+            Some(Modal::PickNode { purpose, cursor }) => {
+                let this_node = 0x0001;
+                widgets::pick_node::render(
+                    frame,
+                    area,
+                    purpose,
+                    &self.snapshot,
+                    this_node,
+                    *cursor,
+                );
+            }
             None => {}
         }
     }

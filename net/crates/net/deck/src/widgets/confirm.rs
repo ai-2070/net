@@ -111,6 +111,15 @@ pub enum ConfirmAction {
         victim_display: String,
         blast: BlastRadius,
     },
+    /// ICE break-glass: pin the chain's elected leader to
+    /// `target` on the next reconcile pass. Reads from
+    /// `ice().force_cutover(chain, target)`.
+    IceForceCutover {
+        chain: u64,
+        target: u64,
+        target_display: String,
+        blast: BlastRadius,
+    },
 }
 
 impl ConfirmAction {
@@ -125,6 +134,7 @@ impl ConfirmAction {
                 | Self::IceFlushAvoidLists { .. }
                 | Self::IceKillMigration { .. }
                 | Self::IceForceEvictReplica { .. }
+                | Self::IceForceCutover { .. }
         )
     }
 
@@ -138,7 +148,8 @@ impl ConfirmAction {
             | Self::IceForceRestartDaemon { blast, .. }
             | Self::IceFlushAvoidLists { blast }
             | Self::IceKillMigration { blast, .. }
-            | Self::IceForceEvictReplica { blast, .. } => Some(blast),
+            | Self::IceForceEvictReplica { blast, .. }
+            | Self::IceForceCutover { blast, .. } => Some(blast),
             _ => None,
         }
     }
@@ -216,6 +227,13 @@ impl ConfirmAction {
                 ..
             } => format!(
                 "ICE  force-evict replica  ·  chain.0x{chain:x} from {victim_display}"
+            ),
+            Self::IceForceCutover {
+                chain,
+                target_display,
+                ..
+            } => format!(
+                "ICE  force-cutover  ·  chain.0x{chain:x} → {target_display}"
             ),
         }
     }
@@ -314,6 +332,13 @@ impl ConfirmAction {
                 "cooldown + count-driven hysteresis".to_string(),
                 "elected chain leader emits the RequestEviction".to_string(),
                 "non-leaders fold the event but emit nothing".to_string(),
+                "ICE — multi-op signed; lands on the admin chain".to_string(),
+            ],
+            Self::IceForceCutover { .. } => vec![
+                "pins the chain's next placement to the target".to_string(),
+                "bypasses the placement scorer for one pass".to_string(),
+                "elected chain leader emits the RequestPlacement".to_string(),
+                "no-op if target is already a holder".to_string(),
                 "ICE — multi-op signed; lands on the admin chain".to_string(),
             ],
         }
