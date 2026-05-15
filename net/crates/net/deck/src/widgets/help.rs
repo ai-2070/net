@@ -27,7 +27,7 @@ const NAVIGATION: &[Binding] = &[
     Binding { keys: "f",         desc: "AUDIT/LOGS: cycle filter (ICE-only or min level)" },
     Binding { keys: "n",         desc: "AUDIT: cycle row limit (none/25/100)" },
     Binding { keys: "p",         desc: "LOGS: pause / resume the tail" },
-    Binding { keys: "/",         desc: "LOGS: substring search (Enter commit, Esc clear)" },
+    Binding { keys: "/",         desc: "AUDIT/LOGS: substring search (Enter commit, Esc clear)" },
     Binding { keys: "?",         desc: "toggle this help overlay" },
     Binding { keys: "q / Esc",   desc: "quit (or close modal)" },
     Binding { keys: "Ctrl-C",    desc: "quit" },

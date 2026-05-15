@@ -19,24 +19,41 @@ pub fn render(
     snapshot: Option<&MeshOsSnapshot>,
     force_only: bool,
     limit: Option<usize>,
+    search: &str,
+    search_editing: bool,
 ) {
     let has_records = snapshot
         .map(|s| !s.admin_audit.is_empty())
         .unwrap_or(false);
     if has_records {
-        render_table(frame, area, snapshot.unwrap(), force_only, limit);
+        render_table(
+            frame,
+            area,
+            snapshot.unwrap(),
+            force_only,
+            limit,
+            search,
+            search_editing,
+        );
     } else {
-        render_empty(frame, area, force_only, limit);
+        render_empty(frame, area, force_only, limit, search, search_editing);
     }
 }
 
-fn render_empty(frame: &mut Frame<'_>, area: Rect, force_only: bool, limit: Option<usize>) {
+fn render_empty(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    force_only: bool,
+    limit: Option<usize>,
+    search: &str,
+    search_editing: bool,
+) {
     let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("AUDIT", theme::green_hi()),
         Span::styled("    0 commits", theme::chrome()),
     ];
-    append_filter_chips(&mut title_spans, force_only, limit);
+    append_filter_chips(&mut title_spans, force_only, limit, search, search_editing);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -57,6 +74,8 @@ fn render_table(
     snapshot: &MeshOsSnapshot,
     force_only: bool,
     limit: Option<usize>,
+    search: &str,
+    search_editing: bool,
 ) {
     let total = snapshot.admin_audit.len();
     let accepted = snapshot
@@ -81,7 +100,7 @@ fn render_table(
             theme::chrome(),
         ),
     ];
-    append_filter_chips(&mut title_spans, force_only, limit);
+    append_filter_chips(&mut title_spans, force_only, limit, search, search_editing);
     let header_line = Line::from(title_spans);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -99,15 +118,18 @@ fn render_table(
     ])
     .height(1);
 
-    // Newest first, with optional ICE-only filter + row cap.
+    // Newest first, with optional ICE-only filter + substring
+    // search + row cap.
     let now_ms = unix_now_ms();
     let cap = limit.unwrap_or(usize::MAX);
+    let needle = search.to_ascii_lowercase();
     let mut rows: Vec<Row> = Vec::with_capacity(total.min(cap));
     for rec in snapshot
         .admin_audit
         .iter()
         .rev()
         .filter(|r| !force_only || r.event.is_ice())
+        .filter(|r| needle.is_empty() || record_matches(r, &needle))
         .take(cap)
     {
         let (outcome_style, outcome_text) = outcome_repr(&rec.outcome);
@@ -242,13 +264,62 @@ fn cell_dim(s: &'static str) -> Cell<'static> {
     Cell::from(Span::styled(s, theme::chrome()))
 }
 
+/// Substring match across the searchable surface of an audit
+/// record: command kind, operator IDs (hex), and a flattened
+/// rendition of the target spans. `needle_lower` must already
+/// be lowercased; we lowercase the haystack here once per
+/// record (acceptable at typical audit-ring sizes).
+fn record_matches(rec: &AdminAuditRecord, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    let (cmd, _) = command_repr(&rec.event);
+    if cmd.to_ascii_lowercase().contains(needle_lower) {
+        return true;
+    }
+    for id in &rec.operator_ids {
+        if format!("0x{id:x}").contains(needle_lower) {
+            return true;
+        }
+    }
+    let target_text: String = target_spans(&rec.event)
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    target_text.to_ascii_lowercase().contains(needle_lower)
+}
+
 /// Append active-filter chips to the title row so an operator
 /// can tell at a glance that they're not looking at the whole
 /// ring. ICE-only is amber (matches the ICE accent); the row
-/// cap is dim.
-fn append_filter_chips(spans: &mut Vec<Span<'static>>, force_only: bool, limit: Option<usize>) {
+/// cap is dim. When the search prompt is open, the editing
+/// state hijacks the chip row so the operator's typing is
+/// front-and-center.
+fn append_filter_chips(
+    spans: &mut Vec<Span<'static>>,
+    force_only: bool,
+    limit: Option<usize>,
+    search: &str,
+    search_editing: bool,
+) {
+    if search_editing {
+        spans.push(Span::styled("    / ", theme::amber()));
+        spans.push(Span::styled(search.to_string(), theme::green_hi()));
+        spans.push(Span::styled("_", theme::amber()));
+        spans.push(Span::styled(
+            "    [Enter] commit  [Esc] cancel",
+            theme::dim(),
+        ));
+        return;
+    }
     if force_only {
         spans.push(Span::styled("    [ICE only]", theme::amber()));
+    }
+    if !search.is_empty() {
+        spans.push(Span::styled(
+            format!("    [match /{search}/]"),
+            theme::amber(),
+        ));
     }
     if let Some(n) = limit {
         spans.push(Span::styled(format!("    [limit {n}]"), theme::dim()));
@@ -275,8 +346,3 @@ fn format_relative(committed_at_ms: u64, now_ms: u64) -> String {
     }
 }
 
-// Re-introduce `AdminAuditRecord` to the import use so future
-// extensions (operator name lookup, signature display) keep
-// the type in scope.
-#[allow(dead_code)]
-fn _unused(_: &AdminAuditRecord) {}

@@ -116,6 +116,13 @@ pub struct App {
     /// the normal binding table. Toggled via `[/]` (enter) and
     /// `Enter`/`Esc` (exit; Esc also clears the buffer).
     pub logs_search_editing: bool,
+    /// AUDIT tab substring search. Matches against command name,
+    /// operator IDs, and the rendered target text. Edited via
+    /// `[/]` on the AUDIT tab.
+    pub audit_search: String,
+    /// When `true`, keystrokes go into `audit_search` instead of
+    /// the normal binding table.
+    pub audit_search_editing: bool,
     /// Active modal overlay (confirmation prompt, future
     /// signature collector, future help screen). When `Some`,
     /// the modal absorbs key input until dismissed.
@@ -209,6 +216,8 @@ impl App {
             logs_paused: None,
             logs_search: String::new(),
             logs_search_editing: false,
+            audit_search: String::new(),
+            audit_search_editing: false,
             modal: None,
         }
     }
@@ -245,11 +254,11 @@ impl App {
             self.on_modal_key(code, mods);
             return;
         }
-        // The LOGS search prompt is the second-tier absorber:
-        // while editing, keystrokes go into the query buffer
-        // rather than the normal bindings.
-        if self.logs_search_editing {
-            self.on_logs_search_key(code);
+        // Search prompts are the second-tier absorber: while a
+        // tab's `_editing` flag is set, keystrokes go into that
+        // tab's query buffer rather than the normal bindings.
+        if self.logs_search_editing || self.audit_search_editing {
+            self.on_search_key(code);
             return;
         }
         match code {
@@ -384,6 +393,12 @@ impl App {
             // refine instead of retyping.
             KeyCode::Char('/') if self.current == Tab::Logs => {
                 self.logs_search_editing = true;
+            }
+            // AUDIT: same prompt pattern, scoped to the audit
+            // ring. Matches against command name, operator IDs,
+            // and rendered target text.
+            KeyCode::Char('/') if self.current == Tab::Audit => {
+                self.audit_search_editing = true;
             }
             KeyCode::Char('n') if self.current == Tab::Audit => {
                 self.audit_limit = match self.audit_limit {
@@ -543,22 +558,29 @@ impl App {
         }
     }
 
-    /// Absorb a single keypress into the LOGS search buffer.
-    /// `Enter` commits the current buffer (filter stays active),
-    /// `Esc` cancels and clears, `Backspace` pops a char, any
-    /// printable char appends. Non-handled keys are dropped so
-    /// they don't leak into the normal binding table.
-    fn on_logs_search_key(&mut self, code: KeyCode) {
+    /// Absorb a single keypress into the active tab's search
+    /// buffer. `Enter` commits (filter stays active), `Esc`
+    /// cancels and clears, `Backspace` pops, any printable char
+    /// appends. Non-handled keys are dropped so they don't leak
+    /// to the normal binding table.
+    fn on_search_key(&mut self, code: KeyCode) {
+        let (buffer, editing) = if self.logs_search_editing {
+            (&mut self.logs_search, &mut self.logs_search_editing)
+        } else if self.audit_search_editing {
+            (&mut self.audit_search, &mut self.audit_search_editing)
+        } else {
+            return;
+        };
         match code {
-            KeyCode::Enter => self.logs_search_editing = false,
+            KeyCode::Enter => *editing = false,
             KeyCode::Esc => {
-                self.logs_search_editing = false;
-                self.logs_search.clear();
+                *editing = false;
+                buffer.clear();
             }
             KeyCode::Backspace => {
-                self.logs_search.pop();
+                buffer.pop();
             }
-            KeyCode::Char(c) => self.logs_search.push(c),
+            KeyCode::Char(c) => buffer.push(c),
             _ => {}
         }
     }
@@ -1117,6 +1139,8 @@ impl App {
                 Some(&self.snapshot),
                 self.audit_force_only,
                 self.audit_limit,
+                &self.audit_search,
+                self.audit_search_editing,
             ),
             Tab::Replicas => tabs::replicas::render(
                 frame,
