@@ -86,14 +86,64 @@ pub async fn spawn() -> color_eyre::Result<DemoHarness> {
     let dispatcher = Arc::new(net_sdk::meshos::LoggingDispatcher::new());
     let sdk = MeshOsDaemonSdk::start(cfg, dispatcher);
 
-    // Register four demo daemons. The handles are moved into
-    // the seeder task so they stay alive for the whole demo
-    // session and the seeder can `publish_log` on each one.
+    // Register a mix of group kinds so the deck's lineage
+    // inference exercises every flavor. Phase A uses a
+    // name-suffix convention to encode lineage — see
+    // `src/lineage.rs` for the parser:
+    //
+    //   <kind>             standalone
+    //   <kind>#replica     ReplicaGroup member (one entry per index)
+    //   <kind>#standby     StandbyGroup member (lowest id = active)
+    //   <kind>#fork@<seq>  ForkGroup fork (one entry per index)
     let daemons = vec![
-        sdk.register_daemon(Box::new(DemoDaemon::new("mikoshi")), EntityKeypair::generate())?,
-        sdk.register_daemon(Box::new(DemoDaemon::new("gravity")), EntityKeypair::generate())?,
-        sdk.register_daemon(Box::new(DemoDaemon::new("anti_entr")), EntityKeypair::generate())?,
-        sdk.register_daemon(Box::new(DemoDaemon::new("telemetry")), EntityKeypair::generate())?,
+        // standalone
+        sdk.register_daemon(
+            Box::new(DemoDaemon::new("mikoshi")),
+            EntityKeypair::generate(),
+        )?,
+        sdk.register_daemon(
+            Box::new(DemoDaemon::new("telemetry")),
+            EntityKeypair::generate(),
+        )?,
+        // replica group "gravity" × 3
+        sdk.register_daemon(
+            Box::new(DemoDaemon::new("gravity#replica")),
+            EntityKeypair::generate(),
+        )?,
+        sdk.register_daemon(
+            Box::new(DemoDaemon::new("gravity#replica")),
+            EntityKeypair::generate(),
+        )?,
+        sdk.register_daemon(
+            Box::new(DemoDaemon::new("gravity#replica")),
+            EntityKeypair::generate(),
+        )?,
+        // standby group "anti_entr" × 3 (1 active + 2 warm)
+        sdk.register_daemon(
+            Box::new(DemoDaemon::new("anti_entr#standby")),
+            EntityKeypair::generate(),
+        )?,
+        sdk.register_daemon(
+            Box::new(DemoDaemon::new("anti_entr#standby")),
+            EntityKeypair::generate(),
+        )?,
+        sdk.register_daemon(
+            Box::new(DemoDaemon::new("anti_entr#standby")),
+            EntityKeypair::generate(),
+        )?,
+        // fork group "drift_corr" × 3 forked from parent at seq=42
+        sdk.register_daemon(
+            Box::new(DemoDaemon::new("drift_corr#fork@42")),
+            EntityKeypair::generate(),
+        )?,
+        sdk.register_daemon(
+            Box::new(DemoDaemon::new("drift_corr#fork@42")),
+            EntityKeypair::generate(),
+        )?,
+        sdk.register_daemon(
+            Box::new(DemoDaemon::new("drift_corr#fork@42")),
+            EntityKeypair::generate(),
+        )?,
     ];
 
     // Build a DeckClient against the same runtime. Operator

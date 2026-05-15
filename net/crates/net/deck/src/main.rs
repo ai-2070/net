@@ -15,6 +15,7 @@
 mod app;
 #[cfg(feature = "demo")]
 mod demo;
+mod lineage;
 mod nodes;
 mod tabs;
 mod theme;

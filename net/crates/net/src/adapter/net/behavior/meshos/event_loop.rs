@@ -1287,6 +1287,7 @@ impl MeshOsLoop {
             in_flight_migrations,
             &self.admin_audit_ring,
             &self.log_ring,
+            self.config.this_node,
         );
         snap.runtime_epoch_id = self.runtime_epoch_id;
         self.snapshot.store(Arc::new(snap));

@@ -174,6 +174,19 @@ pub struct DaemonSnapshot {
     pub saturation: f32,
     /// Crash-loop / backoff gate state.
     pub restart_state: RestartStateSnapshot,
+    /// Host node currently running this daemon. The substrate
+    /// folds local-only state, so for a snapshot read off node
+    /// X this is always X — but the field stays on the wire so
+    /// Deck-side aggregations across multiple snapshots can
+    /// still answer "which node hosts daemon 0xNN?" without
+    /// the operator pivoting through a separate lookup.
+    pub placement: NodeId,
+    /// Milliseconds since the most recent `Started` lifecycle
+    /// signal. `0` if the daemon never reported a start (still
+    /// in `Stopped` lifecycle, or freshly registered before the
+    /// supervisor confirmed). Useful for the Deck binary's
+    /// per-daemon age column without leaking wall-clock state.
+    pub age_ms: u64,
 }
 
 /// Wire form of [`DaemonLifecycle`]. Defaults to `Stopped` for
@@ -411,6 +424,7 @@ impl MeshOsSnapshot {
         in_flight_migrations: Vec<MigrationSnapshot>,
         admin_audit_ring: &std::collections::VecDeque<super::ice::AdminAuditRecord>,
         log_ring: &std::collections::VecDeque<super::logs::LogRecord>,
+        this_node: NodeId,
     ) -> Self {
         let now = actual.last_tick.unwrap_or_else(std::time::Instant::now);
 
@@ -421,6 +435,11 @@ impl MeshOsSnapshot {
                 let snapshot = DaemonSnapshot {
                     name: d.name.clone(),
                     lifecycle: status.lifecycle.into(),
+                    placement: this_node,
+                    age_ms: status
+                        .last_started
+                        .map(|t| now.saturating_duration_since(t).as_millis() as u64)
+                        .unwrap_or(0),
                     health: status.health.as_ref().map(|h| match h {
                         super::event::DaemonHealth::Healthy => DaemonHealthSnapshot::Healthy,
                         super::event::DaemonHealth::Degraded { reason } => {
@@ -708,6 +727,7 @@ mod tests {
             Vec::new(),
             &std::collections::VecDeque::new(),
             &std::collections::VecDeque::new(),
+            0,
         );
         let daemon = snap.daemons.get(&1).expect("daemon present");
         assert_eq!(daemon.name, "telemetry");
@@ -737,6 +757,7 @@ mod tests {
             Vec::new(),
             &std::collections::VecDeque::new(),
             &std::collections::VecDeque::new(),
+            0,
         );
         let r = snap.replicas.get(&0xAA).expect("replica present");
         assert_eq!(r.holders, vec![1, 2, 3]);
@@ -757,6 +778,7 @@ mod tests {
             Vec::new(),
             &std::collections::VecDeque::new(),
             &std::collections::VecDeque::new(),
+            0,
         );
         let r = snap
             .replicas
@@ -819,6 +841,7 @@ mod tests {
             Vec::new(),
             &std::collections::VecDeque::new(),
             &std::collections::VecDeque::new(),
+            0,
         );
         let bytes = postcard::to_allocvec(&snap).expect("encode");
         let back: MeshOsSnapshot = postcard::from_bytes(&bytes).expect("decode");

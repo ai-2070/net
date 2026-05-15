@@ -67,6 +67,17 @@ pub struct App {
     /// ignore it. Wrapped in `Arc` so cloning into per-tab
     /// scope is one atomic-refcount op.
     pub snapshot: Option<Arc<MeshOsSnapshot>>,
+    /// Cursor on the DAEMON tab's lineage tree. Indices into
+    /// the live group list — `j`/`k` move the cursor; the
+    /// detail pane on the right reflects whichever member is
+    /// pointed to.
+    pub daemon_cursor: DaemonCursor,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DaemonCursor {
+    pub group: usize,
+    pub member: usize,
 }
 
 impl App {
@@ -79,6 +90,7 @@ impl App {
             tick: 0,
             deck,
             snapshot,
+            daemon_cursor: DaemonCursor::default(),
         }
     }
 
@@ -134,7 +146,51 @@ impl App {
             KeyCode::Char('3') => self.current = Tab::Dataforts,
             KeyCode::Char('4') => self.current = Tab::Daemon,
             KeyCode::Char('5') => self.current = Tab::Logs,
+            // DAEMON tab navigation. `j`/`k` move within the
+            // current group's members; `J`/`K` step to the
+            // next / previous group. No-op on other tabs.
+            KeyCode::Char('j') if self.current == Tab::Daemon => {
+                self.daemon_cursor.member = self.daemon_cursor.member.saturating_add(1);
+                self.clamp_daemon_cursor();
+            }
+            KeyCode::Char('k') if self.current == Tab::Daemon => {
+                self.daemon_cursor.member = self.daemon_cursor.member.saturating_sub(1);
+            }
+            KeyCode::Char('J') if self.current == Tab::Daemon => {
+                self.daemon_cursor.group = self.daemon_cursor.group.saturating_add(1);
+                self.daemon_cursor.member = 0;
+                self.clamp_daemon_cursor();
+            }
+            KeyCode::Char('K') if self.current == Tab::Daemon => {
+                self.daemon_cursor.group = self.daemon_cursor.group.saturating_sub(1);
+                self.daemon_cursor.member = 0;
+            }
             _ => {}
+        }
+    }
+
+    /// Clamp the daemon cursor against the current snapshot's
+    /// live lineage groups. If the snapshot is empty (fixture
+    /// mode) the cursor is clamped to (0, 0) — the fixture
+    /// tab still uses hardcoded `CURSOR_GROUP` constants.
+    fn clamp_daemon_cursor(&mut self) {
+        let Some(snap) = self.snapshot.as_ref() else {
+            self.daemon_cursor = DaemonCursor::default();
+            return;
+        };
+        let groups = crate::lineage::group_daemons(&snap.daemons);
+        if groups.is_empty() {
+            self.daemon_cursor = DaemonCursor::default();
+            return;
+        }
+        if self.daemon_cursor.group >= groups.len() {
+            self.daemon_cursor.group = groups.len() - 1;
+        }
+        let n_members = groups[self.daemon_cursor.group].members.len();
+        if n_members == 0 {
+            self.daemon_cursor.member = 0;
+        } else if self.daemon_cursor.member >= n_members {
+            self.daemon_cursor.member = n_members - 1;
         }
     }
 
@@ -155,9 +211,16 @@ impl App {
         widgets::rule::render(frame, chunks[2]);
         match self.current {
             Tab::NetMap => tabs::net_map::render(frame, chunks[3], self.tick),
-            Tab::List => tabs::list_view::render(frame, chunks[3]),
+            Tab::List => {
+                tabs::list_view::render(frame, chunks[3], self.snapshot.as_deref())
+            }
             Tab::Dataforts => tabs::dataforts::render(frame, chunks[3], self.tick),
-            Tab::Daemon => tabs::daemon::render(frame, chunks[3]),
+            Tab::Daemon => tabs::daemon::render(
+                frame,
+                chunks[3],
+                self.snapshot.as_deref(),
+                self.daemon_cursor,
+            ),
             Tab::Logs => {
                 tabs::logs::render(frame, chunks[3], self.tick, self.snapshot.as_deref())
             }

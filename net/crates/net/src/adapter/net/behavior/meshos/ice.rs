@@ -1988,6 +1988,8 @@ mod tests {
                 health: None,
                 saturation: 0.0,
                 restart_state: RestartStateSnapshot::BackingOff { until_ms: 5_000 },
+                placement: 0,
+                age_ms: 0,
             },
         );
         let daemon = DaemonRef {
@@ -2044,6 +2046,8 @@ mod tests {
                 health: None,
                 saturation: 0.0,
                 restart_state: RestartStateSnapshot::Idle,
+                placement: 0,
+                age_ms: 0,
             },
         );
         let blast = simulate(
