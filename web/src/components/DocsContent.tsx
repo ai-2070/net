@@ -72,19 +72,58 @@ const NET_THEME = {
       ],
       settings: { foreground: "#ff5e3d" },
     },
-    // types
+    // types — warm amber so they stop blending with lime strings.
+    // Be very liberal with scopes: Rust grammar uses `entity.name.type.enum`,
+    // `entity.name.struct`, `entity.name.trait`, etc. for declarations,
+    // and `entity.name.type` for references. TS/JS/Go/C++ have their own.
     {
       scope: [
         "entity.name.type",
+        "entity.name.type.struct",
+        "entity.name.type.enum",
+        "entity.name.type.union",
+        "entity.name.type.trait",
+        "entity.name.type.impl",
+        "entity.name.type.class",
+        "entity.name.type.interface",
+        "entity.name.type.module",
+        "entity.name.type.alias",
+        "entity.name.type-alias",
+        "entity.name.struct",
+        "entity.name.enum",
+        "entity.name.union",
+        "entity.name.trait",
+        "entity.name.impl",
         "entity.name.class",
+        "entity.name.interface",
+        "entity.name.namespace",
         "entity.other.inherited-class",
         "support.type",
         "support.class",
+        "support.type.primitive",
+        "support.type.builtin",
         "meta.type.parameters entity.name.type",
+        "meta.struct entity.name",
+        "meta.enum entity.name",
+        "meta.trait entity.name",
+        "meta.impl entity.name",
+        "storage.type.struct",
+        "storage.type.enum",
+        "storage.type.trait",
       ],
-      settings: { foreground: "#9eda20" },
+      settings: { foreground: "#dab57f" },
     },
-    // variables + parameters (default ink, but keep explicit for safety)
+    // enum variants / constructors — slightly brighter amber
+    {
+      scope: [
+        "variable.other.enummember",
+        "constant.other.enum",
+        "entity.name.constant.enum",
+        "entity.other.attribute-name.enum",
+      ],
+      settings: { foreground: "#e8c896" },
+    },
+    // variables + parameters
     {
       scope: ["variable", "variable.parameter", "variable.other"],
       settings: { foreground: "#d4dcd0" },
@@ -97,6 +136,16 @@ const NET_THEME = {
         "meta.function-call entity.name.function",
       ],
       settings: { foreground: "#d4dcd0" },
+    },
+    // macros (Rust `assert_eq!`, `vec![]`, `println!`) — dim accent
+    {
+      scope: [
+        "entity.name.function.macro",
+        "support.function.macro",
+        "keyword.other.macro",
+        "meta.macro",
+      ],
+      settings: { foreground: "#9eda20" },
     },
     // punctuation + operators — fade out
     {
@@ -371,21 +420,36 @@ const mdxComponents = {
   },
 
   table: (props: { children?: ReactNode }) => (
-    <div className="overflow-x-auto my-6 border border-line">
+    <div className="overflow-x-auto my-6 border border-line bg-bg-2/30">
       <table
         className="w-full text-[12.5px] text-ink-dim border-collapse"
         {...props}
       />
     </div>
   ),
+  thead: (props: { children?: ReactNode }) => (
+    <thead className="bg-bg-2/70 border-b-2 border-accent/40" {...props} />
+  ),
+  tbody: (props: { children?: ReactNode }) => (
+    <tbody
+      className="[&>tr:nth-child(even)]:bg-bg-2/30 [&>tr]:transition-colors [&>tr:hover]:bg-accent/[0.04]"
+      {...props}
+    />
+  ),
+  tr: (props: { children?: ReactNode }) => (
+    <tr className="border-b border-line/50 last:border-b-0" {...props} />
+  ),
   th: (props: { children?: ReactNode }) => (
     <th
-      className="font-mono text-[11px] tracking-[0.1em] uppercase text-accent text-left px-3 py-2 border-b border-line bg-bg-2"
+      className="font-mono text-[11px] tracking-[0.16em] uppercase text-accent text-left px-4 py-3 font-semibold"
       {...props}
     />
   ),
   td: (props: { children?: ReactNode }) => (
-    <td className="px-3 py-2 border-b border-line align-top" {...props} />
+    <td
+      className="px-4 py-2.5 align-top first:text-ink first:relative first:pl-5 first:before:content-['▸'] first:before:absolute first:before:left-1.5 first:before:text-accent/60 first:before:text-[10px] first:before:top-[11px]"
+      {...props}
+    />
   ),
   strong: (props: { children?: ReactNode }) => (
     <strong className="text-ink font-semibold" {...props} />
