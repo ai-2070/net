@@ -66,10 +66,21 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     left.push(Span::styled("UP: ", theme::chrome()));
     left.push(Span::styled(format!("{uptime}s"), theme::text()));
 
+    // Version comes from Cargo at compile time and is always
+    // accurate. The SHA is opt-in via `DECK_GIT_SHA` (set by a
+    // CI build script when shipping); local dev builds show
+    // "dev" so the chip never lies about being a release.
+    let version = concat!("v", env!("CARGO_PKG_VERSION"));
+    let sha = option_env!("DECK_GIT_SHA").unwrap_or("dev");
+    let (sha_label_style, sha_style) = if sha == "dev" {
+        (theme::chrome(), theme::dim())
+    } else {
+        (theme::chrome(), theme::text())
+    };
     let right = Line::from(vec![
-        Span::styled("v0.17.0   ", theme::chrome()),
-        Span::styled("SHA: ", theme::chrome()),
-        Span::styled("f192df9   ", theme::text()),
+        Span::styled(format!("{version}   "), theme::chrome()),
+        Span::styled("SHA: ", sha_label_style),
+        Span::styled(format!("{sha}   "), sha_style),
         Span::styled("?", theme::green_hi()),
         Span::styled(" help", theme::dim()),
     ]);
