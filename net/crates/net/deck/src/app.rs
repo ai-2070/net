@@ -507,9 +507,9 @@ impl App {
     }
 
     fn propose_ice_force_evict_replica(&mut self) {
-        use net_sdk::deck::{simulate_ice_proposal, IceActionProposal};
-        // Pull the cursored chain by index over the
-        // BTreeMap-ordered replicas.
+        // Open a picker over the cursored chain's holders. The
+        // Enter handler transitions into the Confirm modal once
+        // the operator chooses which holder to evict.
         let Some((chain, replica)) = self
             .snapshot
             .replicas
@@ -518,27 +518,15 @@ impl App {
         else {
             return;
         };
-        let Some(victim) = replica.holders.first().copied() else {
+        if replica.holders.is_empty() {
             return; // chain has no holders; nothing to evict
-        };
-        let chain = *chain;
-        let victim_display = format!(
-            "0x{:x}{}",
-            victim,
-            crate::nodes::label_of(&format!("0x{victim:x}"))
-                .map(|l| format!(".{l}"))
-                .unwrap_or_default(),
-        );
-        let action = IceActionProposal::ForceEvictReplica { chain, victim };
-        let blast = simulate_ice_proposal(&self.snapshot, &action);
-        self.modal = Some(Modal::Confirm(
-            crate::widgets::confirm::ConfirmAction::IceForceEvictReplica {
-                chain,
-                victim,
-                victim_display,
-                blast,
+        }
+        self.modal = Some(Modal::PickNode {
+            purpose: crate::widgets::pick_node::PickNodePurpose::ForceEvictHolder {
+                chain: *chain,
             },
-        ));
+            cursor: 0,
+        });
     }
 
     fn propose_ice_kill_migration(&mut self) {
@@ -659,12 +647,16 @@ impl App {
         }
     }
 
-    /// Clamp the picker cursor against the current pickable
-    /// peer count. The list excludes `this_node` per the
-    /// `pick_node::pickable_peers` filter.
+    /// Clamp the picker cursor against the candidate set the
+    /// current `PickNodePurpose` would offer.
     fn clamp_pick_cursor(&mut self) {
         let this_node = 0x0001; // matches the demo runtime
-        let n = crate::widgets::pick_node::pickable_peers(&self.snapshot, this_node).len();
+        let n = match self.modal.as_ref() {
+            Some(Modal::PickNode { purpose, .. }) => {
+                purpose.candidates(&self.snapshot, this_node).len()
+            }
+            _ => return,
+        };
         if let Some(Modal::PickNode { cursor, .. }) = self.modal.as_mut() {
             if n == 0 {
                 *cursor = 0;
@@ -675,8 +667,8 @@ impl App {
     }
 
     /// Transition from `PickNode` to `Confirm` once the
-    /// operator presses Enter — bake the cursored peer into
-    /// the appropriate ICE action variant.
+    /// operator presses Enter — bake the cursored candidate
+    /// into the appropriate ICE action variant.
     fn commit_pick(
         &mut self,
         purpose: crate::widgets::pick_node::PickNodePurpose,
@@ -684,24 +676,42 @@ impl App {
     ) {
         use net_sdk::deck::{simulate_ice_proposal, IceActionProposal};
         let this_node = 0x0001;
-        let peers = crate::widgets::pick_node::pickable_peers(&self.snapshot, this_node);
-        let Some(target) = peers.get(cursor).copied() else { return };
-        let target_display = format!(
+        let candidates = purpose.candidates(&self.snapshot, this_node);
+        let Some(picked) = candidates.get(cursor).copied() else { return };
+        let picked_display = format!(
             "0x{:x}{}",
-            target,
-            crate::nodes::label_of(&format!("0x{target:x}"))
+            picked,
+            crate::nodes::label_of(&format!("0x{picked:x}"))
                 .map(|l| format!(".{l}"))
                 .unwrap_or_default(),
         );
         match purpose {
             crate::widgets::pick_node::PickNodePurpose::ForceCutoverTarget { chain } => {
-                let action = IceActionProposal::ForceCutover { chain, target };
+                let action = IceActionProposal::ForceCutover {
+                    chain,
+                    target: picked,
+                };
                 let blast = simulate_ice_proposal(&self.snapshot, &action);
                 self.modal = Some(Modal::Confirm(
                     crate::widgets::confirm::ConfirmAction::IceForceCutover {
                         chain,
-                        target,
-                        target_display,
+                        target: picked,
+                        target_display: picked_display,
+                        blast,
+                    },
+                ));
+            }
+            crate::widgets::pick_node::PickNodePurpose::ForceEvictHolder { chain } => {
+                let action = IceActionProposal::ForceEvictReplica {
+                    chain,
+                    victim: picked,
+                };
+                let blast = simulate_ice_proposal(&self.snapshot, &action);
+                self.modal = Some(Modal::Confirm(
+                    crate::widgets::confirm::ConfirmAction::IceForceEvictReplica {
+                        chain,
+                        victim: picked,
+                        victim_display: picked_display,
                         blast,
                     },
                 ));

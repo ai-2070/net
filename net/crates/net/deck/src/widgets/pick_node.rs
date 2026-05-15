@@ -31,6 +31,10 @@ pub enum PickNodePurpose {
     /// cursored chain. The chain id is carried through the
     /// modal so the dispatch path has both pieces.
     ForceCutoverTarget { chain: u64 },
+    /// Pick which holder to evict for an ICE force-evict-replica
+    /// on the cursored chain. The candidate set is the chain's
+    /// current holders (not the full peer list).
+    ForceEvictHolder { chain: u64 },
 }
 
 impl PickNodePurpose {
@@ -38,6 +42,9 @@ impl PickNodePurpose {
         match self {
             Self::ForceCutoverTarget { chain } => {
                 format!("ICE  pick cutover target for chain.0x{chain:x}")
+            }
+            Self::ForceEvictHolder { chain } => {
+                format!("ICE  pick holder to evict on chain.0x{chain:x}")
             }
         }
     }
@@ -48,19 +55,31 @@ impl PickNodePurpose {
             Self::ForceCutoverTarget { .. } => {
                 "the chain's elected leader emits RequestPlacement → target on commit"
             }
+            Self::ForceEvictHolder { .. } => {
+                "the picked holder drops its replica; the chain falls under desired_count"
+            }
         }
     }
-}
 
-/// Sorted list of peers, with `this_node` filtered out so the
-/// operator can't accidentally cut over to themselves.
-pub fn pickable_peers(snapshot: &MeshOsSnapshot, this_node: u64) -> Vec<u64> {
-    snapshot
-        .peers
-        .keys()
-        .copied()
-        .filter(|id| *id != this_node)
-        .collect()
+    /// The set of node IDs this picker is willing to surface,
+    /// derived from the snapshot. Cutover offers every peer
+    /// minus `this_node`; evict offers only the chain's current
+    /// holders.
+    pub fn candidates(&self, snapshot: &MeshOsSnapshot, this_node: u64) -> Vec<u64> {
+        match self {
+            Self::ForceCutoverTarget { .. } => snapshot
+                .peers
+                .keys()
+                .copied()
+                .filter(|id| *id != this_node)
+                .collect(),
+            Self::ForceEvictHolder { chain } => snapshot
+                .replicas
+                .get(chain)
+                .map(|r| r.holders.clone())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 pub fn render(
@@ -71,7 +90,7 @@ pub fn render(
     this_node: u64,
     cursor: usize,
 ) {
-    let peers = pickable_peers(snapshot, this_node);
+    let peers = purpose.candidates(snapshot, this_node);
     let modal_area = center(area, 64, 22);
     frame.render_widget(Clear, modal_area);
 
