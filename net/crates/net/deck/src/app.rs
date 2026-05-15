@@ -18,10 +18,11 @@ pub enum Tab {
     Daemon,
     Logs,
     Audit,
+    Replicas,
 }
 
 impl Tab {
-    pub fn all() -> [Tab; 6] {
+    pub fn all() -> [Tab; 7] {
         [
             Tab::NetMap,
             Tab::List,
@@ -29,6 +30,7 @@ impl Tab {
             Tab::Daemon,
             Tab::Logs,
             Tab::Audit,
+            Tab::Replicas,
         ]
     }
 
@@ -40,6 +42,7 @@ impl Tab {
             Tab::Daemon => "DAEMON",
             Tab::Logs => "LOGS",
             Tab::Audit => "AUDIT",
+            Tab::Replicas => "REPLICAS",
         }
     }
 
@@ -82,6 +85,9 @@ pub struct App {
     /// bindings (`c` cordon, `C` uncordon, future drain)
     /// target the cursored node.
     pub list_cursor: usize,
+    /// Cursor on the REPLICAS tab — index into the replicas
+    /// map's sorted-by-chain order.
+    pub replica_cursor: usize,
     /// Active modal overlay (confirmation prompt, future
     /// signature collector, future help screen). When `Some`,
     /// the modal absorbs key input until dismissed.
@@ -163,6 +169,7 @@ impl App {
             snapshot,
             daemon_cursor: DaemonCursor::default(),
             list_cursor: 0,
+            replica_cursor: 0,
             modal: None,
         }
     }
@@ -221,6 +228,7 @@ impl App {
             KeyCode::Char('4') => self.current = Tab::Daemon,
             KeyCode::Char('5') => self.current = Tab::Logs,
             KeyCode::Char('6') => self.current = Tab::Audit,
+            KeyCode::Char('7') => self.current = Tab::Replicas,
             // DAEMON tab navigation. `j`/`k` move within the
             // current group's members; `J`/`K` step to the
             // next / previous group. No-op on other tabs.
@@ -260,6 +268,13 @@ impl App {
             }
             KeyCode::Char('k') if self.current == Tab::List => {
                 self.list_cursor = self.list_cursor.saturating_sub(1);
+            }
+            KeyCode::Char('j') if self.current == Tab::Replicas => {
+                self.replica_cursor = self.replica_cursor.saturating_add(1);
+                self.clamp_replica_cursor();
+            }
+            KeyCode::Char('k') if self.current == Tab::Replicas => {
+                self.replica_cursor = self.replica_cursor.saturating_sub(1);
             }
             // LIST tab actions on the cursored node: `c` cordon,
             // `C` uncordon, `d` drain (5-minute default window).
@@ -394,6 +409,15 @@ impl App {
             self.list_cursor = 0;
         } else if self.list_cursor >= n {
             self.list_cursor = n - 1;
+        }
+    }
+
+    fn clamp_replica_cursor(&mut self) {
+        let n = self.snapshot.replicas.len();
+        if n == 0 {
+            self.replica_cursor = 0;
+        } else if self.replica_cursor >= n {
+            self.replica_cursor = n - 1;
         }
     }
 
@@ -636,6 +660,12 @@ impl App {
                 tabs::logs::render(frame, chunks[3], self.tick, Some(&self.snapshot))
             }
             Tab::Audit => tabs::audit::render(frame, chunks[3], Some(&self.snapshot)),
+            Tab::Replicas => tabs::replicas::render(
+                frame,
+                chunks[3],
+                Some(&self.snapshot),
+                self.replica_cursor,
+            ),
         }
         widgets::footer::render(frame, chunks[4]);
 
