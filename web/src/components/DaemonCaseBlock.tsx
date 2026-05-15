@@ -354,7 +354,7 @@ export function DaemonCaseBlock() {
           // what is a daemon
         </h3>
         <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
-          A daemon is a stateful event processor whose identity is a keypair. It
+          Stateful programs that live on the mesh, not on a machine. It
           holds working state, snapshots periodically, and exposes five trait
           methods. Everything else — placement, migration, durability — is the
           runtime.

@@ -6,32 +6,32 @@ const MIGRATION_PHASES: ReadonlyArray<{
   {
     num: "01",
     name: "snapshot",
-    body: "source serializes daemon state into transferable bytes.",
+    body: "source serializes daemon into a portable bundle.",
   },
   {
     num: "02",
     name: "transfer",
-    body: "snapshot moves source → target over subprotocol 0x0500.",
+    body: "bundle moves source → target.",
   },
   {
     num: "03",
     name: "restore",
-    body: "target reconstructs daemon, identity preserved.",
+    body: "target copies program data from source; maps daemon environment and identity.",
   },
   {
     num: "04",
     name: "replay",
-    body: "target catches up on events between snapshot and now.",
+    body: "target plays back events in order. catches up to where the source left off.",
   },
   {
     num: "05",
     name: "cutover",
-    body: "routing table updates atomically. next packet → target.",
+    body: "source stops accepting work. routing flips atomically. next event goes to target.",
   },
   {
     num: "06",
     name: "complete",
-    body: "source releases daemon. target is sole authority.",
+    body: "source daemon collapses. target becomes sole entity.",
   },
 ];
 

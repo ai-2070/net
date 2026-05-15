@@ -22,25 +22,6 @@ export function ComputeRuntimeSection() {
         </span>
       </DisplayHeading>
 
-      <div className="border border-accent-dim bg-accent/[0.03] px-5 py-4 mb-10 flex items-center gap-[18px] text-[11px] text-ink-dim tracking-[0.05em] flex-wrap">
-        <span className="bg-accent text-bg px-2.5 py-1 font-bold tracking-[0.18em] text-[10px]">
-          NEW
-        </span>
-        <span>
-          <b className="text-ink font-medium">
-            Stateful programs that live on the mesh, not on a machine.
-          </b>{" "}
-          They have cryptographic identity, a verifiable history, and they move
-          between nodes mid-execution without anyone noticing.
-        </span>
-        <span className="ml-auto">
-          subprotocol{" "}
-          <code className="text-accent bg-accent/[0.06] px-1.5 py-0.5 font-mono">
-            0x0500
-          </code>
-        </span>
-      </div>
-
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
         A program on NET is called a{" "}
         <em className="not-italic text-accent bg-accent/[0.08] px-1">daemon</em>

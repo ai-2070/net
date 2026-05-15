@@ -22,13 +22,7 @@ export function MikoshiSection() {
             their original hardware.
           </p>
           <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
-            Mikoshi in NET is how daemons move between machines. A running
-            program on one node becomes a running program on another without
-            losing its history, its pending work, or its place in the
-            conversation. The source packages its state, the target unpacks it,
-            and for a brief moment the entity exists on both nodes at once —
-            spreading, superposed, then collapsed onto the target as routing
-            cuts over.
+            <strong className="text-ink font-medium">Mikoshi in NET lets a deamon hop between machines.</strong>{" "}The machine underneath changes; the daemon keeps its identity, its history, its pending work, and its place in the conversation. The source packages its state, the target unpacks it, and for a brief moment the daemon exists on both nodes, then collapses onto the target as routing cuts over.
           </p>
         </div>
         <div>
@@ -43,8 +37,7 @@ export function MikoshiSection() {
           </p>
           <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
             A factory controller hops from a dying edge box to a healthy one
-            mid-shift. An inference daemon follows its user from laptop to
-            desktop. A trading agent migrates to a node closer to the exchange{" "}
+            mid-shift. A trading agent migrates to a node closer to the exchange{" "}
             <strong className="text-ink font-medium">
               without dropping a single tick
             </strong>

@@ -220,17 +220,12 @@ const GROUP_CARDS: readonly GroupCard[] = [
     ascii: <AsciiCycle phases={STANDBY_PHASES} intervalMs={3500} />,
     body: (
       <>
-        For stateful daemons that need fault tolerance without paying for
-        duplicate compute.{" "}
-        <b className="text-ink font-medium">Only the active processes events</b>{" "}
-        — standbys are warm, not hot. Periodic snapshots track{" "}
-        <code className="font-mono">synced_through</code> for each standby. On
-        active failure, the standby with the highest sync point promotes and
-        replays the gap using{" "}
+        For stateful services that need failover without running duplicate copies.{" "}
+        <b className="text-ink font-medium">One active daemon runs;</b>{" "}
+        warm standbys stay synced. If it fails, the most-recent standby takes over and catches up.{" "}
         <b className="text-ink font-medium">
-          the same replay machinery migration uses
+          Zero duplicate compute.
         </b>
-        .
       </>
     ),
     spec: [

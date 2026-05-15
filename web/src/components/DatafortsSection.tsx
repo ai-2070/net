@@ -21,13 +21,13 @@ const CAPABILITY_STRIP: ReadonlyArray<{
   },
   {
     num: "mesh.storage.3",
-    name: "Read-your-writes",
-    body: "if you wrote it, you can read it. right now. no coordination lag.",
+    name: "Content-Addressed",
+    body: "the hash is the handle. one address gets you the file — wherever it lives.",
   },
   {
     num: "mesh.storage.4",
-    name: "BlobRef",
-    body: "one handle gets you any file. the mesh finds it — wherever it lives.",
+    name: "Durability Tiers",
+    body: "pick your guarantee. fire-and-forget, fsync, or N-peer replicated. one call.",
   },
 ];
 
