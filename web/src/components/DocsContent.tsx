@@ -511,7 +511,7 @@ const mdxComponents = {
   ),
   tbody: (props: { children?: ReactNode }) => (
     <tbody
-      className="[&>tr:nth-child(even)]:bg-bg-2/30 [&>tr]:transition-colors [&>tr:hover]:bg-accent/[0.04]"
+      className="[&>tr]:transition-colors [&>tr:nth-child(even)]:bg-bg-2/30 [&>tr:hover]:bg-accent/[0.07] [&>tr:nth-child(even):hover]:bg-accent/[0.07]"
       {...props}
     />
   ),
