@@ -103,6 +103,11 @@ pub struct App {
     /// via `[f]` on the LOGS tab through Info → Warn → Error
     /// → Debug → Info.
     pub logs_min_level: net_sdk::deck::LogLevel,
+    /// LOGS tab pause: when `Some`, the log grid renders this
+    /// frozen ring instead of `snapshot.log_ring`. Toggled via
+    /// `[p]` on the LOGS tab. Other tabs keep using the live
+    /// snapshot — only the log tail is paused.
+    pub logs_paused: Option<Arc<[net_sdk::deck::LogRecord]>>,
     /// Active modal overlay (confirmation prompt, future
     /// signature collector, future help screen). When `Some`,
     /// the modal absorbs key input until dismissed.
@@ -196,6 +201,7 @@ impl App {
             audit_force_only: false,
             audit_limit: None,
             logs_min_level: net_sdk::deck::LogLevel::Info,
+            logs_paused: None,
             modal: None,
         }
     }
@@ -347,6 +353,16 @@ impl App {
                     LogLevel::Warn => LogLevel::Error,
                     LogLevel::Error => LogLevel::Debug,
                     _ => LogLevel::Info,
+                };
+            }
+            // LOGS: pause the tail. `None` follows live; toggling
+            // captures the current ring so the operator can read
+            // without the tail scrolling out from under them.
+            // Other tabs keep using the live snapshot.
+            KeyCode::Char('p') if self.current == Tab::Logs => {
+                self.logs_paused = match self.logs_paused.take() {
+                    Some(_) => None,
+                    None => Some(self.snapshot.log_ring.clone()),
                 };
             }
             KeyCode::Char('n') if self.current == Tab::Audit => {
@@ -940,13 +956,20 @@ impl App {
                 Some(&self.snapshot),
                 self.daemon_cursor,
             ),
-            Tab::Logs => tabs::logs::render(
-                frame,
-                chunks[3],
-                self.tick,
-                Some(&self.snapshot),
-                self.logs_min_level,
-            ),
+            Tab::Logs => {
+                let records: &[net_sdk::deck::LogRecord] = match &self.logs_paused {
+                    Some(frozen) => frozen,
+                    None => &self.snapshot.log_ring,
+                };
+                tabs::logs::render(
+                    frame,
+                    chunks[3],
+                    self.tick,
+                    records,
+                    self.logs_min_level,
+                    self.logs_paused.is_some(),
+                );
+            }
             Tab::Audit => tabs::audit::render(
                 frame,
                 chunks[3],

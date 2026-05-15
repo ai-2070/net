@@ -1,4 +1,4 @@
-use net_sdk::deck::{LogLevel, MeshOsSnapshot};
+use net_sdk::deck::{LogLevel, LogRecord};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     text::{Line, Span},
@@ -12,19 +12,20 @@ pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
     tick: u64,
-    snapshot: Option<&MeshOsSnapshot>,
+    records: &[LogRecord],
     min_level: LogLevel,
+    paused: bool,
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
         .split(area);
-    render_filter_bar(frame, rows[0], min_level);
-    render_log_grid(frame, rows[1], tick, snapshot, min_level);
-    render_status(frame, rows[2], snapshot, min_level);
+    render_filter_bar(frame, rows[0], min_level, paused);
+    render_log_grid(frame, rows[1], tick, records, min_level);
+    render_status(frame, rows[2], records, min_level, paused);
 }
 
-fn render_filter_bar(frame: &mut Frame<'_>, area: Rect, min_level: LogLevel) {
+fn render_filter_bar(frame: &mut Frame<'_>, area: Rect, min_level: LogLevel, paused: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -39,6 +40,11 @@ fn render_filter_bar(frame: &mut Frame<'_>, area: Rect, min_level: LogLevel) {
     // suppressing rows; default Info is rendered green to read
     // as "open / unfiltered."
     let (level_text, level_style) = level_chip(min_level);
+    let (follow_text, follow_style) = if paused {
+        ("PAUSED", theme::amber())
+    } else {
+        ("ON", theme::green_hi())
+    };
 
     let line = Line::from(vec![
         Span::styled("level ", theme::chrome()),
@@ -59,7 +65,7 @@ fn render_filter_bar(frame: &mut Frame<'_>, area: Rect, min_level: LogLevel) {
         Span::styled("]   ", theme::chrome()),
         Span::styled("follow ", theme::chrome()),
         Span::styled("[", theme::chrome()),
-        Span::styled("ON", theme::green_hi()),
+        Span::styled(follow_text, follow_style),
         Span::styled("]", theme::chrome()),
     ]);
     frame.render_widget(Paragraph::new(line), inner);
@@ -91,7 +97,7 @@ fn render_log_grid(
     frame: &mut Frame<'_>,
     area: Rect,
     tick: u64,
-    snapshot: Option<&MeshOsSnapshot>,
+    records: &[LogRecord],
     min_level: LogLevel,
 ) {
     let block = Block::default()
@@ -101,34 +107,29 @@ fn render_log_grid(
     frame.render_widget(block, area);
 
     let total_rows = inner.height as usize;
-    // Live mode: project the snapshot's log_ring into Lines.
     // Empty ring (fresh runtime, no source publishing yet)
     // surfaces a centered "waiting" placeholder so the user
     // sees the tab is wired but idle.
     let _ = tick;
-    let lines: Vec<Line> = match snapshot {
-        Some(snap) if !snap.log_ring.is_empty() => {
-            project_live_log_ring(snap, total_rows, min_level)
-        }
-        _ => Vec::new(),
+    let lines: Vec<Line> = if records.is_empty() {
+        Vec::new()
+    } else {
+        project_log_records(records, total_rows, min_level)
     };
 
     if lines.is_empty() {
         // Distinguish "no logs at all" from "filter is hiding
         // everything" — the latter is easy to miss and a common
         // operator confusion.
-        let any_records = snapshot
-            .map(|s| !s.log_ring.is_empty())
-            .unwrap_or(false);
-        let (head, hint) = if any_records {
-            (
-                "no log lines at this threshold",
-                "press [f] to lower the level filter",
-            )
-        } else {
+        let (head, hint) = if records.is_empty() {
             (
                 "no log lines yet",
                 "publish_log() on any registered daemon will appear here",
+            )
+        } else {
+            (
+                "no log lines at this threshold",
+                "press [f] to lower the level filter",
             )
         };
         crate::widgets::empty::render(frame, inner, head, hint);
@@ -143,26 +144,28 @@ fn render_log_grid(
 fn render_status(
     frame: &mut Frame<'_>,
     area: Rect,
-    snapshot: Option<&MeshOsSnapshot>,
+    records: &[LogRecord],
     min_level: LogLevel,
+    paused: bool,
 ) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(36)])
         .split(area);
 
-    let total = snapshot.map(|s| s.log_ring.len()).unwrap_or(0);
-    let shown = snapshot
-        .map(|s| {
-            s.log_ring
-                .iter()
-                .filter(|r| level_rank(r.level) >= level_rank(min_level))
-                .count()
-        })
-        .unwrap_or(0);
+    let total = records.len();
+    let shown = records
+        .iter()
+        .filter(|r| level_rank(r.level) >= level_rank(min_level))
+        .count();
+    let (source_text, source_style) = if paused {
+        ("frozen snapshot", theme::amber())
+    } else {
+        ("live snapshot", theme::dim())
+    };
     let left = Line::from(vec![
         Span::styled(format!("{shown}/{total} lines  ·  "), theme::chrome()),
-        Span::styled("live snapshot", theme::dim()),
+        Span::styled(source_text, source_style),
         Span::styled("  ·  ", theme::chrome()),
         Span::styled("0 dropped", theme::green_hi()),
     ]);
@@ -179,19 +182,18 @@ fn render_status(
     frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), cols[1]);
 }
 
-/// Project the live `MeshOsSnapshot.log_ring` into renderable
-/// Lines. Each record carries `seq`, `ts_ms`, `level`,
-/// `daemon_id`, `node_id`, `message`. Older entries are at the
-/// front of the ring; we keep that order and let the caller
-/// pick the tail.
-fn project_live_log_ring(
-    snapshot: &MeshOsSnapshot,
+/// Project a slice of `LogRecord` into renderable Lines.
+/// Each record carries `seq`, `ts_ms`, `level`, `daemon_id`,
+/// `node_id`, `message`. Older entries are at the front of the
+/// slice; we keep that order and let the caller pick the tail.
+fn project_log_records(
+    records: &[LogRecord],
     capacity: usize,
     min_level: LogLevel,
 ) -> Vec<Line<'static>> {
-    let mut out: Vec<Line> = Vec::with_capacity(snapshot.log_ring.len().min(capacity));
+    let mut out: Vec<Line> = Vec::with_capacity(records.len().min(capacity));
     let min = level_rank(min_level);
-    for rec in snapshot.log_ring.iter().filter(|r| level_rank(r.level) >= min) {
+    for rec in records.iter().filter(|r| level_rank(r.level) >= min) {
         let (level_style, level_pad) = match rec.level {
             LogLevel::Info  => (theme::dim(),   "INFO "),
             LogLevel::Warn  => (theme::amber(), "WARN "),
