@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/meshos/sdk.rs
+  s_3bbc444b3ef3e5::t_2eec023ee43820 600-631
+net/crates/net/deck/src/runtime.rs
+  s_3bbc444b3ef3e5::t_40242026d8d2bd 55-69
+  s_3bbc444b3ef3e5::t_92c3dbb80be49e 20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "7fcfb2e2485a0187ab1db4a50581f81538e7482a",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
