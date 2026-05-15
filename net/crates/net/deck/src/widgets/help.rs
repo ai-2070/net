@@ -46,6 +46,7 @@ const ICE: &[Binding] = &[
     Binding { keys: "A",   desc: "LIST: ICE flush avoid lists (global)" },
     Binding { keys: "R",   desc: "DAEMON: ICE force-restart (bypass backoff)" },
     Binding { keys: "K",   desc: "MIGRATIONS: ICE kill migration" },
+    Binding { keys: "E",   desc: "REPLICAS: ICE force-evict first holder" },
 ];
 
 const MODAL: &[Binding] = &[
@@ -54,7 +55,7 @@ const MODAL: &[Binding] = &[
 ];
 
 pub fn render(frame: &mut Frame<'_>, area: Rect) {
-    let modal_area = center(area, 78, 35);
+    let modal_area = center(area, 78, 36);
     frame.render_widget(Clear, modal_area);
 
     let block = Block::default()
@@ -79,7 +80,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect) {
         .constraints([
             Constraint::Length(10), // navigation
             Constraint::Length(11), // admin
-            Constraint::Length(7),  // ice
+            Constraint::Length(8),  // ice
             Constraint::Length(4),  // modal
             Constraint::Min(0),     // footer
         ])

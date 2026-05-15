@@ -284,6 +284,13 @@ impl App {
             KeyCode::Char('k') if self.current == Tab::Replicas => {
                 self.replica_cursor = self.replica_cursor.saturating_sub(1);
             }
+            // ICE force-evict-replica on the cursored chain's
+            // first holder. (Multi-holder picker is a future
+            // UX upgrade; first-holder default is the most
+            // common case for under-replicated chains.)
+            KeyCode::Char('E') if self.current == Tab::Replicas => {
+                self.propose_ice_force_evict_replica();
+            }
             KeyCode::Char('j') if self.current == Tab::Migrations => {
                 self.migration_cursor = self.migration_cursor.saturating_add(1);
                 self.clamp_migration_cursor();
@@ -447,6 +454,41 @@ impl App {
         } else if self.migration_cursor >= n {
             self.migration_cursor = n - 1;
         }
+    }
+
+    fn propose_ice_force_evict_replica(&mut self) {
+        use net_sdk::deck::{simulate_ice_proposal, IceActionProposal};
+        // Pull the cursored chain by index over the
+        // BTreeMap-ordered replicas.
+        let Some((chain, replica)) = self
+            .snapshot
+            .replicas
+            .iter()
+            .nth(self.replica_cursor)
+        else {
+            return;
+        };
+        let Some(victim) = replica.holders.first().copied() else {
+            return; // chain has no holders; nothing to evict
+        };
+        let chain = *chain;
+        let victim_display = format!(
+            "0x{:x}{}",
+            victim,
+            crate::nodes::label_of(&format!("0x{victim:x}"))
+                .map(|l| format!(".{l}"))
+                .unwrap_or_default(),
+        );
+        let action = IceActionProposal::ForceEvictReplica { chain, victim };
+        let blast = simulate_ice_proposal(&self.snapshot, &action);
+        self.modal = Some(Modal::Confirm(
+            crate::widgets::confirm::ConfirmAction::IceForceEvictReplica {
+                chain,
+                victim,
+                victim_display,
+                blast,
+            },
+        ));
     }
 
     fn propose_ice_kill_migration(&mut self) {
@@ -649,6 +691,10 @@ impl App {
                 }
                 ConfirmAction::IceKillMigration { migration, .. } => {
                     let proposal = deck.ice().kill_migration(migration);
+                    dispatch_ice(&deck, proposal).await;
+                }
+                ConfirmAction::IceForceEvictReplica { chain, victim, .. } => {
+                    let proposal = deck.ice().force_evict_replica(chain, victim);
                     dispatch_ice(&deck, proposal).await;
                 }
             }

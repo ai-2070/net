@@ -102,6 +102,15 @@ pub enum ConfirmAction {
         migration: u64,
         blast: BlastRadius,
     },
+    /// ICE break-glass: force-evict a replica holder bypassing
+    /// the scheduler's rebalance cooldown. Reads from
+    /// `ice().force_evict_replica(chain, victim)`.
+    IceForceEvictReplica {
+        chain: u64,
+        victim: u64,
+        victim_display: String,
+        blast: BlastRadius,
+    },
 }
 
 impl ConfirmAction {
@@ -115,6 +124,7 @@ impl ConfirmAction {
                 | Self::IceForceRestartDaemon { .. }
                 | Self::IceFlushAvoidLists { .. }
                 | Self::IceKillMigration { .. }
+                | Self::IceForceEvictReplica { .. }
         )
     }
 
@@ -127,7 +137,8 @@ impl ConfirmAction {
             | Self::IceThawCluster { blast }
             | Self::IceForceRestartDaemon { blast, .. }
             | Self::IceFlushAvoidLists { blast }
-            | Self::IceKillMigration { blast, .. } => Some(blast),
+            | Self::IceKillMigration { blast, .. }
+            | Self::IceForceEvictReplica { blast, .. } => Some(blast),
             _ => None,
         }
     }
@@ -199,6 +210,13 @@ impl ConfirmAction {
             Self::IceKillMigration { migration, .. } => {
                 format!("ICE  kill migration  ·  0x{migration:x}")
             }
+            Self::IceForceEvictReplica {
+                chain,
+                victim_display,
+                ..
+            } => format!(
+                "ICE  force-evict replica  ·  chain.0x{chain:x} from {victim_display}"
+            ),
         }
     }
 
@@ -289,6 +307,13 @@ impl ConfirmAction {
                 "aborts the in-flight migration on its host node".to_string(),
                 "MigrationOrchestrator drops the daemon's record".to_string(),
                 "no-op on nodes that aren't hosting this migration".to_string(),
+                "ICE — multi-op signed; lands on the admin chain".to_string(),
+            ],
+            Self::IceForceEvictReplica { .. } => vec![
+                "evicts the replica holder, bypassing scheduler".to_string(),
+                "cooldown + count-driven hysteresis".to_string(),
+                "elected chain leader emits the RequestEviction".to_string(),
+                "non-leaders fold the event but emit nothing".to_string(),
                 "ICE — multi-op signed; lands on the admin chain".to_string(),
             ],
         }
