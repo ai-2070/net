@@ -8,14 +8,19 @@ use ratatui::{
 
 use crate::{lineage, nodes, theme, widgets};
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeshOsSnapshot>) {
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: Option<&MeshOsSnapshot>,
+    cursor: usize,
+) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
     match snapshot {
-        Some(s) if !s.peers.is_empty() => render_live_nodes_table(frame, rows[0], s),
+        Some(s) if !s.peers.is_empty() => render_live_nodes_table(frame, rows[0], s, cursor),
         _ => render_empty_nodes_table(frame, rows[0]),
     }
 
@@ -67,7 +72,12 @@ fn render_empty_daemons_table(frame: &mut Frame<'_>, area: Rect) {
 
 // ───────────────────────── live render: nodes ─────────────────────────
 
-fn render_live_nodes_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot) {
+fn render_live_nodes_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &MeshOsSnapshot,
+    cursor: usize,
+) {
     use net_sdk::deck::{MaintenanceMirrorSnapshot, PeerHealthSnapshot};
 
     let total = snapshot.peers.len();
@@ -96,6 +106,7 @@ fn render_live_nodes_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsS
         .title_alignment(Alignment::Left);
 
     let header = Row::new(vec![
+        cell_dim(" "),
         cell_dim("NODE"),
         cell_dim("HEALTH"),
         cell_dim("RTT"),
@@ -105,7 +116,14 @@ fn render_live_nodes_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsS
     .height(1);
 
     let mut table_rows: Vec<Row> = Vec::with_capacity(snapshot.peers.len());
-    for (peer_id, p) in &snapshot.peers {
+    for (i, (peer_id, p)) in snapshot.peers.iter().enumerate() {
+        let is_cursor = i == cursor;
+        let marker = if is_cursor { "▶" } else { " " };
+        let id_spans = if is_cursor {
+            nodes::id_spans_styled(&format!("0x{peer_id:x}"), theme::green_hi())
+        } else {
+            nodes::id_spans(&format!("0x{peer_id:x}"))
+        };
         let (health_style, health_text) = match p.health {
             Some(PeerHealthSnapshot::Healthy) => (theme::green(), "Healthy"),
             Some(PeerHealthSnapshot::Degraded) => (theme::amber(), "Degraded"),
@@ -154,7 +172,8 @@ fn render_live_nodes_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsS
             }
         };
         table_rows.push(Row::new(vec![
-            Cell::from(Line::from(nodes::id_spans(&format!("0x{peer_id:x}")))),
+            Cell::from(Span::styled(marker, theme::green_hi())),
+            Cell::from(Line::from(id_spans)),
             Cell::from(Span::styled(health_text, health_style)),
             Cell::from(Span::styled(rtt_text, theme::text())),
             Cell::from(Span::styled(format!("{daemon_count:>3}"), theme::text())),
@@ -165,6 +184,7 @@ fn render_live_nodes_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsS
     let table = Table::new(
         table_rows,
         [
+            Constraint::Length(2),  // cursor marker
             Constraint::Length(18), // NODE: id.label
             Constraint::Length(11), // HEALTH
             Constraint::Length(7),  // RTT

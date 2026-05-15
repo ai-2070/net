@@ -73,6 +73,12 @@ pub struct App {
     /// detail pane on the right reflects whichever member is
     /// pointed to.
     pub daemon_cursor: DaemonCursor,
+    /// Cursor on the LIST tab's nodes table — index into the
+    /// peers map's sorted key order. `j`/`k` moves it; the
+    /// row gets a `▶` marker + brighter id styling. Action
+    /// bindings (`c` cordon, `C` uncordon, future drain)
+    /// target the cursored node.
+    pub list_cursor: usize,
     /// Active modal overlay (confirmation prompt, future
     /// signature collector, future help screen). When `Some`,
     /// the modal absorbs key input until dismissed.
@@ -82,6 +88,14 @@ pub struct App {
 #[derive(Clone, Debug)]
 pub enum Modal {
     Confirm(crate::widgets::confirm::ConfirmAction),
+}
+
+/// Internal helper enum used by `propose_node_action` to
+/// pick which `ConfirmAction` variant to build. Keeps the key
+/// handler short.
+enum NodeActionKind {
+    Cordon,
+    Uncordon,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -101,6 +115,7 @@ impl App {
             deck,
             snapshot,
             daemon_cursor: DaemonCursor::default(),
+            list_cursor: 0,
             modal: None,
         }
     }
@@ -179,8 +194,66 @@ impl App {
             KeyCode::Char('r') if self.current == Tab::Daemon => {
                 self.propose_restart_all_daemons();
             }
+            // LIST tab navigation: `j`/`k` move the cursor
+            // through the nodes table (sorted by NodeId).
+            KeyCode::Char('j') if self.current == Tab::List => {
+                self.list_cursor = self.list_cursor.saturating_add(1);
+                self.clamp_list_cursor();
+            }
+            KeyCode::Char('k') if self.current == Tab::List => {
+                self.list_cursor = self.list_cursor.saturating_sub(1);
+            }
+            // LIST tab actions: `c` cordon, `C` uncordon —
+            // both target the cursored node.
+            KeyCode::Char('c') if self.current == Tab::List => {
+                self.propose_node_action(NodeActionKind::Cordon);
+            }
+            KeyCode::Char('C') if self.current == Tab::List => {
+                self.propose_node_action(NodeActionKind::Uncordon);
+            }
             _ => {}
         }
+    }
+
+    fn clamp_list_cursor(&mut self) {
+        let n = self.snapshot.peers.len();
+        if n == 0 {
+            self.list_cursor = 0;
+        } else if self.list_cursor >= n {
+            self.list_cursor = n - 1;
+        }
+    }
+
+    /// Look up the NodeId at the LIST cursor position. Returns
+    /// `None` if the peers map is empty.
+    pub fn cursored_node(&self) -> Option<u64> {
+        self.snapshot
+            .peers
+            .keys()
+            .nth(self.list_cursor)
+            .copied()
+    }
+
+    fn propose_node_action(&mut self, kind: NodeActionKind) {
+        let Some(node) = self.cursored_node() else { return };
+        let node_display = format!(
+            "0x{:x}{}",
+            node,
+            crate::nodes::label_of(&format!("0x{node:x}"))
+                .map(|l| format!(".{l}"))
+                .unwrap_or_default(),
+        );
+        let action = match kind {
+            NodeActionKind::Cordon => crate::widgets::confirm::ConfirmAction::Cordon {
+                node,
+                node_display,
+            },
+            NodeActionKind::Uncordon => crate::widgets::confirm::ConfirmAction::Uncordon {
+                node,
+                node_display,
+            },
+        };
+        self.modal = Some(Modal::Confirm(action));
     }
 
     fn on_modal_key(&mut self, code: KeyCode, _mods: KeyModifiers) {
@@ -239,6 +312,12 @@ impl App {
                 ConfirmAction::RestartAllDaemons { node, .. } => {
                     let _ = deck.admin().restart_all_daemons(node).await;
                 }
+                ConfirmAction::Cordon { node, .. } => {
+                    let _ = deck.admin().cordon(node).await;
+                }
+                ConfirmAction::Uncordon { node, .. } => {
+                    let _ = deck.admin().uncordon(node).await;
+                }
             }
         });
     }
@@ -283,7 +362,12 @@ impl App {
             Tab::NetMap => {
                 tabs::net_map::render(frame, chunks[3], self.tick, Some(&self.snapshot))
             }
-            Tab::List => tabs::list_view::render(frame, chunks[3], Some(&self.snapshot)),
+            Tab::List => tabs::list_view::render(
+                frame,
+                chunks[3],
+                Some(&self.snapshot),
+                self.list_cursor,
+            ),
             Tab::Dataforts => tabs::dataforts::render(frame, chunks[3], self.tick),
             Tab::Daemon => tabs::daemon::render(
                 frame,

@@ -31,6 +31,12 @@ pub enum ConfirmAction {
         /// node — so the operator sees the blast radius.
         daemon_count: usize,
     },
+    /// Mark the node as not accepting new placements. Reads
+    /// from `admin().cordon(node)`. Reversible via `Uncordon`.
+    Cordon { node: u64, node_display: String },
+    /// Reverse a prior cordon. Reads from
+    /// `admin().uncordon(node)`.
+    Uncordon { node: u64, node_display: String },
 }
 
 impl ConfirmAction {
@@ -39,6 +45,10 @@ impl ConfirmAction {
         match self {
             Self::RestartAllDaemons { node_display, .. } => {
                 format!("restart all daemons on {node_display}")
+            }
+            Self::Cordon { node_display, .. } => format!("cordon node {node_display}"),
+            Self::Uncordon { node_display, .. } => {
+                format!("uncordon node {node_display}")
             }
         }
     }
@@ -52,6 +62,18 @@ impl ConfirmAction {
                 "each daemon is stopped and re-spawned by the supervisor".to_string(),
                 "fires `admin().restart_all_daemons(node)` — signed,".to_string(),
                 "lands on the admin chain with the operator's identity".to_string(),
+            ],
+            Self::Cordon { .. } => vec![
+                "stops new placements from landing on this node".to_string(),
+                "existing daemons + replicas stay; no eviction".to_string(),
+                "reversible via `[C]` (uncordon) without further effect".to_string(),
+                "fires `admin().cordon(node)` — signed, audit-logged".to_string(),
+            ],
+            Self::Uncordon { .. } => vec![
+                "re-admits the node to the placement scorer".to_string(),
+                "new replicas + daemons may land here on the next pass".to_string(),
+                "no-op if the node was never cordoned".to_string(),
+                "fires `admin().uncordon(node)` — signed, audit-logged".to_string(),
             ],
         }
     }
