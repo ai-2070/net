@@ -91,6 +91,9 @@ pub struct App {
 #[derive(Clone, Debug)]
 pub enum Modal {
     Confirm(crate::widgets::confirm::ConfirmAction),
+    /// Help overlay — full binding reference. Dismissed with
+    /// `?` (toggle), `Esc`, or `q`.
+    Help,
 }
 
 /// Internal helper enum used by `propose_node_action` to
@@ -200,6 +203,11 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true
+            }
+            // Help overlay — works on every tab, no cursor
+            // required.
+            KeyCode::Char('?') => {
+                self.modal = Some(Modal::Help);
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 self.current = self.current.next()
@@ -408,13 +416,19 @@ impl App {
 
     fn on_modal_key(&mut self, code: KeyCode, _mods: KeyModifiers) {
         match code {
+            // Help overlay toggles off on `?` as well as the
+            // standard dismiss keys.
+            KeyCode::Char('?') if matches!(self.modal, Some(Modal::Help)) => {
+                self.modal = None;
+            }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.modal = None;
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let modal = self.modal.take();
-                if let Some(Modal::Confirm(action)) = modal {
-                    self.dispatch_confirm(action);
+                match modal {
+                    Some(Modal::Confirm(action)) => self.dispatch_confirm(action),
+                    Some(Modal::Help) | None => {}
                 }
             }
             _ => {}
@@ -573,8 +587,10 @@ impl App {
 
         // Modal overlay (renders last so it sits visually on
         // top of the body).
-        if let Some(Modal::Confirm(action)) = &self.modal {
-            widgets::confirm::render(frame, area, action);
+        match &self.modal {
+            Some(Modal::Confirm(action)) => widgets::confirm::render(frame, area, action),
+            Some(Modal::Help) => widgets::help::render(frame, area),
+            None => {}
         }
     }
 }
