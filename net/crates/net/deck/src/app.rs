@@ -224,6 +224,13 @@ pub enum Modal {
     ClusterPicker {
         cursor: usize,
     },
+    /// Blob detail — opened with `[Enter]` on the BLOBS tab.
+    /// Snapshots the cursored entry into the modal so a
+    /// subsequent inventory refresh under the cursor doesn't
+    /// shift the body. Dismissed with the usual `Esc` / `q`.
+    BlobDetail {
+        entry: net_sdk::dataforts::BlobInventoryEntry,
+    },
 }
 
 /// Internal helper enum used by `propose_node_action` to
@@ -359,6 +366,31 @@ impl App {
     /// toast — the latest action's confirmation always wins.
     pub fn set_toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    /// Snapshot the cursored BLOBS entry into a detail modal.
+    /// The modal owns its copy of the entry so a subsequent
+    /// inventory refresh (~500 ms tick) under the cursor
+    /// doesn't shift the body the operator is reading.
+    fn open_blob_detail(&mut self) {
+        let entries = self.blobs_tail.snapshot();
+        if entries.is_empty() {
+            return;
+        }
+        let needle = self.blobs_search.to_ascii_lowercase();
+        // Apply the same filter the render path uses so the
+        // cursor + modal stay coherent with the visible rows.
+        let visible: Vec<_> = entries
+            .iter()
+            .filter(|e| tabs::blobs::record_matches(e, &needle))
+            .cloned()
+            .collect();
+        let idx = self.blobs_cursor.min(visible.len().saturating_sub(1));
+        if let Some(entry) = visible.get(idx) {
+            self.modal = Some(Modal::BlobDetail {
+                entry: entry.clone(),
+            });
+        }
     }
 
     /// Cluster-picker selection: index 0 is the always-present
@@ -665,6 +697,16 @@ impl App {
             // BLOBS: substring search against the hash hex.
             KeyCode::Char('/') if self.current == Tab::Blobs => {
                 self.blobs_search_editing = true;
+            }
+            // BLOBS: open the detail modal for the cursored
+            // entry. Snapshots the entry so a subsequent
+            // inventory refresh doesn't shift the body.
+            KeyCode::Enter if self.current == Tab::Blobs => self.open_blob_detail(),
+            // DATAFORTS: cross-link to BLOBS. Operators reading
+            // aggregate metrics jump straight to per-chunk
+            // inventory of the same adapter.
+            KeyCode::Char('B') if self.current == Tab::Dataforts => {
+                self.current = Tab::Blobs;
             }
             // Export the current filtered view to a timestamped
             // file in the cwd. Captures only what would render —
@@ -1110,6 +1152,9 @@ impl App {
                     Some(Modal::ClusterPicker { cursor }) => {
                         self.commit_cluster_pick(cursor);
                     }
+                    // BlobDetail is informational — Enter just
+                    // closes (same as Esc / q).
+                    Some(Modal::BlobDetail { .. }) => {}
                     // ParamInput is intercepted earlier in this
                     // function; reaching here would be a bug.
                     Some(Modal::ParamInput { .. }) => {}
@@ -1556,6 +1601,9 @@ impl App {
                     &self.active_cluster,
                     *cursor,
                 );
+            }
+            Some(Modal::BlobDetail { entry }) => {
+                widgets::blob_detail::render(frame, area, entry);
             }
             None => {}
         }

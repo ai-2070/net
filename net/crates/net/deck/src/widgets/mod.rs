@@ -1,3 +1,4 @@
+pub mod blob_detail;
 pub mod cluster_picker;
 pub mod confirm;
 pub mod empty;
