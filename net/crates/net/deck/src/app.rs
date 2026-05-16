@@ -2915,7 +2915,16 @@ impl App {
                 let calls: &[crate::streams::NrpcCall] = match &self.nrpc_paused {
                     Some(frozen) => frozen.as_slice(),
                     None => {
-                        owned = self.nrpc_tail.snapshot();
+                        // Render reads at frame rate; clone only
+                        // the slice the table can show — bounded
+                        // by the body height. The +8 cushion
+                        // covers a redraw racing a resize. The
+                        // pause toggle (rare keystroke) still
+                        // uses the full `snapshot()` so the
+                        // frozen view captures the whole ring.
+                        let body_height = chunks[3].height as usize;
+                        let visible_cap = body_height.saturating_sub(3).saturating_add(8);
+                        owned = self.nrpc_tail.snapshot_tail(visible_cap);
                         owned.as_slice()
                     }
                 };

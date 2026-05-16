@@ -82,6 +82,20 @@ impl NrpcTail {
         g.iter().cloned().collect()
     }
 
+    /// Clone the most recent `n` records (or the full ring if
+    /// fewer exist). Render reads at frame rate; cloning the
+    /// whole 5000-entry ring per frame is wasteful when the
+    /// visible window only needs `area.height - 3` rows.
+    pub fn snapshot_tail(&self, n: usize) -> Vec<NrpcCall> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let g = self.records.lock();
+        let take = n.min(g.len());
+        let start = g.len() - take;
+        g.iter().skip(start).cloned().collect()
+    }
+
     pub fn push(&self, call: NrpcCall) {
         let mut g = self.records.lock();
         if g.len() == self.cap {
