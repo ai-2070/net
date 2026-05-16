@@ -394,9 +394,9 @@ fn render_controls(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(block, area);
 
     let line = Line::from(vec![
-        Span::styled("[j/k · w/s] ", theme::green_hi()),
+        Span::styled("[w/s] ", theme::green_hi()),
         Span::styled("member   ", theme::dim()),
-        Span::styled("[J/K · W/S] ", theme::green_hi()),
+        Span::styled("[W/S] ", theme::green_hi()),
         Span::styled("group    ", theme::dim()),
         Span::styled("[r] ", theme::green_hi()),
         Span::styled("restart   ", theme::dim()),
