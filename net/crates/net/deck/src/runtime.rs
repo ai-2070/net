@@ -89,8 +89,12 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     #[cfg(not(feature = "samples"))]
     let migration_source: Option<Arc<dyn MigrationSnapshotSource>> = None;
 
-    let sdk =
-        MeshOsDaemonSdk::start_with_options(cfg, dispatcher, Some(verifier), migration_source);
+    let sdk = MeshOsDaemonSdk::start_with_verifier_and_migration_source(
+        cfg,
+        dispatcher,
+        Some(verifier),
+        migration_source,
+    );
 
     let identity = OperatorIdentity::from_keypair(operator_keypair);
     let deck = Arc::new(DeckClient::from_runtime(sdk.runtime(), identity));

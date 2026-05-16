@@ -609,16 +609,26 @@ impl MeshOsDaemonSdk {
         user_dispatcher: Arc<D>,
         verifier: Arc<super::ice::AdminVerifier>,
     ) -> Self {
-        Self::start_with_options(config, user_dispatcher, Some(verifier), None)
+        Self::start_with_verifier_and_migration_source(
+            config,
+            user_dispatcher,
+            Some(verifier),
+            None,
+        )
     }
 
-    /// Kitchen-sink constructor — install any combination of
-    /// optional runtime extensions in one call. Production
-    /// deployments wiring multiple seams (verifier + chain
-    /// appenders + migration source + …) call this directly;
-    /// the other `start_*` constructors forward through here
-    /// with `None` defaults for the slots they don't surface.
-    pub fn start_with_options<D: ActionDispatcher>(
+    /// Install an `AdminVerifier` plus an optional migration
+    /// snapshot source in one call. This is **not** the full
+    /// extension surface — the underlying
+    /// [`MeshOsRuntime`] also accepts admin-audit / log /
+    /// failure chain appenders and a migration aborter; this
+    /// SDK-wrapper constructor exposes only the two extensions
+    /// the daemon-side SDK shipped first. Plumbing the other
+    /// extension slots through the SDK wrapper is tracked in
+    /// `MESHOS_SDK_PLAN.md` § Deferred work; for now,
+    /// deployments needing the full surface drop down to
+    /// [`MeshOsRuntimeBuilder`] directly.
+    pub fn start_with_verifier_and_migration_source<D: ActionDispatcher>(
         config: MeshOsConfig,
         user_dispatcher: Arc<D>,
         verifier: Option<Arc<super::ice::AdminVerifier>>,
