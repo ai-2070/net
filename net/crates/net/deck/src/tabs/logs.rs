@@ -18,13 +18,18 @@ pub fn render(
     search: &str,
     search_editing: bool,
 ) {
+    // Status bar gets two rows: the chip line on top and a
+    // blank spacer below so the search/filter/pause chips
+    // don't visually collide with the global footer's
+    // tab/jump/cursor row.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(2)])
         .split(area);
     render_filter_bar(frame, rows[0], min_level, paused, search, search_editing);
     render_log_grid(frame, rows[1], tick, records, min_level, search);
-    render_status(frame, rows[2], records, min_level, paused, search);
+    let status_row = Rect { height: 1, ..rows[2] };
+    render_status(frame, status_row, records, min_level, paused, search);
 }
 
 fn render_filter_bar(
