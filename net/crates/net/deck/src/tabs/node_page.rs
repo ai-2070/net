@@ -51,18 +51,22 @@ pub fn render(
     let needed = 2 /* borders */ + 6 /* main rows */ + 1 /* spacer */ + cap_lines + 1;
     let panel_h = (needed as u16)
         .max(12)
-        .min(area.height.saturating_sub(7));
+        .min(area.height.saturating_sub(8));
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(panel_h), // NODE
             Constraint::Min(0),          // PLACEMENT
-            Constraint::Length(1),       // bottom hint row
+            Constraint::Length(2),       // hint row + spacer above global footer
         ])
         .split(area);
     render_peer_panel(frame, rows[0], entry);
     render_placement_panel(frame, rows[1], entry, live);
-    render_back_hint(frame, rows[2]);
+    // Render the hint on the top half of the 2-row footer band
+    // so a blank line sits between [Esc] back and the global
+    // tab/jump/cursor row below.
+    let hint_row = Rect { height: 1, ..rows[2] };
+    render_back_hint(frame, hint_row);
 }
 
 fn render_back_hint(frame: &mut Frame<'_>, area: Rect) {
