@@ -256,26 +256,47 @@ fn cell_dim(s: &'static str) -> Cell<'static> {
 /// Substring match across the searchable surface of an audit
 /// record: command kind, operator IDs (hex), and a flattened
 /// rendition of the target spans. `needle_lower` must already
-/// be lowercased; we lowercase the haystack here once per
-/// record (acceptable at typical audit-ring sizes).
+/// be lowercased; matches case-insensitively in one pass over
+/// each candidate string without allocating a lowercased copy.
 pub(crate) fn record_matches(rec: &AdminAuditRecord, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
     }
     let (cmd, _) = command_repr(&rec.event);
-    if cmd.to_ascii_lowercase().contains(needle_lower) {
+    if ascii_icontains(cmd, needle_lower) {
         return true;
     }
+    use std::fmt::Write;
+    let mut buf = String::with_capacity(18);
     for id in &rec.operator_ids {
-        if format!("0x{id:x}").contains(needle_lower) {
+        buf.clear();
+        let _ = write!(&mut buf, "0x{id:x}");
+        if ascii_icontains(&buf, needle_lower) {
             return true;
         }
     }
-    let target_text: String = target_spans(&rec.event)
+    target_spans(&rec.event)
         .iter()
-        .map(|s| s.content.as_ref())
-        .collect();
-    target_text.to_ascii_lowercase().contains(needle_lower)
+        .any(|s| ascii_icontains(s.content.as_ref(), needle_lower))
+}
+
+/// ASCII case-insensitive substring search that allocates
+/// nothing — the haystack is scanned by byte position, with
+/// `eq_ignore_ascii_case` over slices of the needle's length.
+/// Both inputs are assumed ASCII (the call sites are hex IDs
+/// and English command words).
+pub(crate) fn ascii_icontains(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    let n = needle_lower.len();
+    if haystack.len() < n {
+        return false;
+    }
+    haystack
+        .as_bytes()
+        .windows(n)
+        .any(|w| w.eq_ignore_ascii_case(needle_lower.as_bytes()))
 }
 
 /// Append active-filter chips to the title row so an operator

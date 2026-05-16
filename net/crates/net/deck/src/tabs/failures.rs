@@ -191,15 +191,14 @@ fn append_search_chip(spans: &mut Vec<Span<'static>>, search: &str, search_editi
 
 /// Substring match across the searchable surface of a failure
 /// record: source token + reason. `needle_lower` must already
-/// be lowercased.
+/// be lowercased. ASCII case-insensitive — no per-call
+/// allocation of a lowercased haystack copy.
 pub(crate) fn record_matches(rec: &FailureRecord, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
     }
-    if rec.source.to_ascii_lowercase().contains(needle_lower) {
-        return true;
-    }
-    rec.reason.to_ascii_lowercase().contains(needle_lower)
+    super::audit::ascii_icontains(&rec.source, needle_lower)
+        || super::audit::ascii_icontains(&rec.reason, needle_lower)
 }
 
 fn unix_now_ms() -> u64 {
