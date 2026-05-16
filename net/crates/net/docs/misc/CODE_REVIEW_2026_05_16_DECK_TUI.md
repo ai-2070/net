@@ -11,10 +11,16 @@ deck tabs, deck widgets + bookmarks, and SDK + adapter changes.
 
 ## Status
 
-**Open.** 48 items identified: **12 High / 16 Medium / 14 Low / 6 Nit.**
-Per the "no review-tracking IDs in code or commit messages"
+**Closed.** 48 items identified: **12 High / 16 Medium / 14 Low / 6 Nit.**
+46/48 landed across the same number of commits on `tui`; the
+two remaining items (N5 vertical-centering, N6 tabs re-exports)
+were verified non-issues and tracked as "no change" below. Per
+the "no review-tracking IDs in code or commit messages"
 feedback rule, labels (H1-H12, M1-M16, L1-L14, N1-N6) are for
 this doc only — code and commit messages stay self-explanatory.
+
+Substrate / SDK items (H1, H11, H12, M3, M4, M5, M6, L12, L13,
+L14) shipped with regression tests where reasonable.
 
 ## H. High — fix before merge
 
@@ -86,8 +92,66 @@ this doc only — code and commit messages stay self-explanatory.
 
 ---
 
-## Closed items will be appended below as fixes land.
+## Closed
 
-### Closed
+### Substrate / SDK (regression tests included where reasonable)
 
-(none yet)
+| ID  | Commit (short title)                                                                                  |
+|-----|-------------------------------------------------------------------------------------------------------|
+| H1  | `MeshOS: serde(default) on new DaemonSnapshot / PeerSnapshot fields.`                                 |
+| H11 | `Dataforts: push BLOB list prefix filter into refcount iteration.`                                    |
+| H12 | `MeshOS: GC actual.inventory for peers no probe samples anymore.`                                     |
+| M3  | `MeshOS: daemon age_ms anchors on the lifecycle that's current.`                                      |
+| M4  | `MeshOS: pin DaemonSnapshot.placement contract for every this_node.`                                  |
+| M5  | `Dataforts: add BlobAdapter::supports_list capability bit.`                                           |
+| M6  | `MeshOS: rename MeshOsDaemonSdk::start_with_options to clarify scope.`                                |
+| L12 | `Dataforts: re-export OverflowMetricsSnapshot via blob::mod.`                                         |
+| L13 | `SDK: document why 'full' omits dataforts + meshdb.`                                                  |
+| L14 | `MeshOS: ICE simulator fixtures use ..Default::default().`                                            |
+
+### Deck (no regression tests — TUI render code)
+
+| ID  | Commit (short title)                                                                                  |
+|-----|-------------------------------------------------------------------------------------------------------|
+| H2  | `Deck: install a panic hook that restores the terminal.`                                              |
+| H3  | `Deck: plumb this_node from harness; drop 0x0001 literals.`                                           |
+| H4  | `Deck: top-level Esc is a no-op; quit stays on q / Ctrl-C.`                                           |
+| H5  | `Deck: surface admin / ICE dispatch errors as footer toasts.`                                         |
+| H6  | `Deck: guard blob_detail hash_hex slice against short / non-ASCII inputs.`                            |
+| H7  | `Deck: u128-promote nodes saturation math to avoid u64 overflow.`                                     |
+| H8  | `Deck: render LogLevel::Debug as DEBUG instead of the unknown-level glyph.`                           |
+| H9  | `Deck: atomic bookmark write via sibling tmp + rename.`                                               |
+| H10 | `Deck: empty-filter hint in FAILURES + BLOBS instead of '1/0' silent body.`                           |
+| M1  | `Deck: compute net_map layout + edges once per frame; HashSet edge dedup.`                            |
+| M2  | `Deck: cache daemon_page lineage grouping once per render.`                                           |
+| M7  | `Deck: audit + failures search uses allocation-free icontains.`                                       |
+| M8  | `Deck: format_ts_ms includes the hours component (HH:MM:SS.mmm).`                                     |
+| M9  | `Deck: format_id_label uses {:x} so dataforts ids match the rest of the deck.`                        |
+| M10 | `Deck: backoff on stream errors so a persistently failing tail doesn't peg a worker.`                 |
+| M11 | `Deck: BookmarkStore::upsert trims + rejects empty name / endpoint.`                                  |
+| M12 | `Deck: param_input parse_duration rejects duplicate / out-of-order units + caps buffer length.`       |
+| M13 | `Deck: cluster_picker + pick_node bail out when the row window is zero-height.`                       |
+| M14 | `Deck: status_bar maint-summary surfaces unknown variants explicitly with a debug_assert.`            |
+| M15 | `Deck: sample seeder runs inline so the App starts against a fully populated snapshot.`               |
+| M16 | `Deck: build.rs reruns when .git/HEAD moves so the baked SHA stays fresh.`                            |
+| L1  | `Deck: hoist format_age into tabs::format_age_ms; remove the four divergent copies.`                  |
+| L2  | `Deck: MESH.EVENTS labels node-only records as node.0x.. instead of substrate.`                       |
+| L3  | `Deck: unknown LogLevel ranks at 0 so the level filter doesn't silently pass new variants as Info.`   |
+| L4  | (batched) `Deck: blob_detail host_id format matches the rest of the deck; node_card rounds saturation.` |
+| L5  | (batched in L4)                                                                                       |
+| L6  | `Deck: export writes via BufWriter against the startup cwd, with an explicit flush.`                  |
+| L7  | (batched) `Deck: ICE confirm gains 'fires' line for every variant + operator-facing warning labels.`  |
+| L8  | (batched in L7)                                                                                       |
+| L9  | `Deck: BookmarkStore renames corrupt toml aside and recovers with an empty store.`                    |
+| L10 | (batched) `Deck: audit outcome counting + Tab::next/prev no longer panic on off-wheel variants.`      |
+| L11 | (batched in L10)                                                                                      |
+| N1  | `Deck: hoist center() rect helper to widgets/mod.rs; drop the 7 copies.`                              |
+| N2  | (batched) `Deck: drop dead .min(s.len()) in short_id; use full 53-bit entropy in net_map angle hash.` |
+| N4  | (batched in N2)                                                                                       |
+
+### Verified no-change
+
+| ID  | Title                                                                                  | Why                                                                                                                                |
+|-----|----------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
+| N5  | `empty.rs` centering correction                                                        | The `Min(0) / Length(3) / Min(0)` layout centers symmetrically; the 3-line block contains headline / blank-spacer / hint which IS the visual content. Not off-by-half. |
+| N6  | `tabs/mod.rs` re-export render fns                                                     | `tabs::audit::render` is the canonical spelling; the prior review surfaced this as a nit and `tabs/mod.rs` now hosts the shared `format_age_ms` helper. Adding `pub use` aliases would just duplicate the surface without changing the per-tab call sites. |
