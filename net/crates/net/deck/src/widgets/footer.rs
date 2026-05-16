@@ -154,9 +154,10 @@ fn tab_chips(current: Tab) -> Line<'static> {
                 chip_desc(" export   "),
             ]);
         }
-        Tab::Replicas | Tab::Migrations => {
+        Tab::Replicas | Tab::Migrations | Tab::Nrpc => {
             // No lowercase per-tab actions; admin actions are
-            // ICE-only and surface via the help overlay.
+            // ICE-only and surface via the help overlay. NRPC
+            // is observe-only today.
         }
         Tab::Failures => {
             spans.extend([

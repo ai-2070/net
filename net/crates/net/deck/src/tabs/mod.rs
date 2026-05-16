@@ -10,6 +10,7 @@ pub mod migrations;
 pub mod net_map;
 pub mod node_page;
 pub mod nodes;
+pub mod nrpc;
 pub mod replicas;
 
 /// Tiered h/m/s renderer for an age expressed as elapsed

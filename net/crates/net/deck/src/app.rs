@@ -18,6 +18,7 @@ pub enum Tab {
     Daemons,
     Groups,
     Dataforts,
+    Nrpc,
     Blobs,
     Logs,
     Audit,
@@ -27,13 +28,13 @@ pub enum Tab {
 }
 
 impl Tab {
-    /// Tab order rendered by the tab strip. FAILURES is hidden
-    /// (its variant, state, render module, and key handlers all
-    /// stay in the codebase so re-enabling is a single-line
-    /// addition here). The strip carries 10 slots — keys
-    /// `1`..`9` plus `0` — with LOGS pinned to `0` so it stays
-    /// reachable from any tab without clobbering the alphabetic
-    /// shortcuts.
+    /// Tab order rendered by the tab strip. FAILURES + AUDIT
+    /// are hidden (their variants, state, render modules, and
+    /// key handlers stay in the codebase so re-enabling is a
+    /// one-line addition here). The strip carries 10 slots —
+    /// keys `1`..`9` plus `0` — with LOGS pinned to `0` so it
+    /// stays reachable from any tab without clobbering the
+    /// alphabetic shortcuts.
     pub fn all() -> [Tab; 10] {
         [
             Tab::NetMap,
@@ -41,10 +42,10 @@ impl Tab {
             Tab::Daemons,
             Tab::Groups,
             Tab::Dataforts,
+            Tab::Nrpc,
             Tab::Blobs,
             Tab::Migrations,
             Tab::Replicas,
-            Tab::Audit,
             Tab::Logs,
         ]
     }
@@ -56,6 +57,7 @@ impl Tab {
             Tab::Daemons => "DAEMONS",
             Tab::Groups => "GROUPS",
             Tab::Dataforts => "DATAFORTS",
+            Tab::Nrpc => "NRPC",
             Tab::Logs => "LOGS",
             Tab::Audit => "AUDIT",
             Tab::Replicas => "CHAINS",
@@ -1408,10 +1410,10 @@ impl App {
             KeyCode::Char('3') => self.current = Tab::Daemons,
             KeyCode::Char('4') => self.current = Tab::Groups,
             KeyCode::Char('5') => self.current = Tab::Dataforts,
-            KeyCode::Char('6') => self.current = Tab::Blobs,
-            KeyCode::Char('7') => self.current = Tab::Migrations,
-            KeyCode::Char('8') => self.current = Tab::Replicas,
-            KeyCode::Char('9') => self.current = Tab::Audit,
+            KeyCode::Char('6') => self.current = Tab::Nrpc,
+            KeyCode::Char('7') => self.current = Tab::Blobs,
+            KeyCode::Char('8') => self.current = Tab::Migrations,
+            KeyCode::Char('9') => self.current = Tab::Replicas,
             KeyCode::Char('0') => self.current = Tab::Logs,
             // DAEMON tab navigation. Lowercase letters walk the
             // member axis (cursor inside the focused group);
@@ -2669,6 +2671,9 @@ impl App {
             Tab::Dataforts => {
                 let entries = self.collect_dataforts();
                 tabs::dataforts::render(frame, chunks[3], &entries, self.dataforts_cursor);
+            }
+            Tab::Nrpc => {
+                tabs::nrpc::render(frame, chunks[3]);
             }
             Tab::Groups => {
                 let logs = self.logs_tail.snapshot();
