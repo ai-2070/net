@@ -1,0 +1,24 @@
+net/crates/net/deck/src/runtime.rs
+  s_4a2fa2d5f63459::t_bfb83f29727d27 806-811,813-818,831-834,857-860,867-871
+  s_4a2fa2d5f63459::t_48a4329e9843f7 151-152
+  s_4a2fa2d5f63459::t_860dde179dd37d 177-179
+  s_4a2fa2d5f63459::t_d498226e89704a 614-701,704,733-735,737-742,744-802
+  s_4a2fa2d5f63459::t_9ff08843aafef7 36-41
+  s_4a2fa2d5f63459::t_2c9f3a7cd78c20 128
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "42a36c95b80a1f6bc89650ec926c6eb1a24e91d9",
+  "prompts": {},
+  "sessions": {
+    "s_4a2fa2d5f63459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5d060031-ba25-4cac-9cbf-32d9a94cbf0c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
