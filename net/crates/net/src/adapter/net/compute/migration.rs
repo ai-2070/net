@@ -313,7 +313,7 @@ impl MigrationState {
     /// Payload byte count of the snapshot once set; `None`
     /// while the snapshot phase is still in progress (or
     /// when the orchestrator advanced past Snapshot via
-    /// [`Self::force_phase`] without calling `set_snapshot`).
+    /// `force_phase` without calling `set_snapshot`).
     pub fn snapshot_size_bytes(&self) -> Option<u64> {
         self.snapshot.as_ref().map(|s| s.state.len() as u64)
     }

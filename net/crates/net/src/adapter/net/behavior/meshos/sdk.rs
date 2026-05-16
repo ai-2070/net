@@ -627,7 +627,7 @@ impl MeshOsDaemonSdk {
     /// extension slots through the SDK wrapper is tracked in
     /// `MESHOS_SDK_PLAN.md` § Deferred work; for now,
     /// deployments needing the full surface drop down to
-    /// [`MeshOsRuntimeBuilder`] directly.
+    /// [`MeshOsRuntime::start_with_full_extensions`] directly.
     pub fn start_with_verifier_and_migration_source<D: ActionDispatcher>(
         config: MeshOsConfig,
         user_dispatcher: Arc<D>,
