@@ -1,0 +1,25 @@
+net/crates/net/deck/src/demo/cluster.rs
+  s_33e8c099a9039e::t_944d6ce11588b9 7-15
+net/crates/net/deck/src/demo/spawn.rs
+  s_33e8c099a9039e::t_4b5016acfc779b 379-380
+  s_33e8c099a9039e::t_9e761aec6a2329 334
+  s_33e8c099a9039e::t_763a0634ea1ccc 348-349
+net/crates/net/deck/src/demo/dataforts.rs
+  s_33e8c099a9039e::t_3fa5e9ea44f1d1 20,22-24,27-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "a8ed27dfc260f443548cf9962e892d1cb475ed27",
+  "prompts": {},
+  "sessions": {
+    "s_33e8c099a9039e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f5bf814-14c4-4dd9-b249-30bbae94726a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
