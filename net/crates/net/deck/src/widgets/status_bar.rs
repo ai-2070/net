@@ -1,6 +1,6 @@
 use net_sdk::deck::{
     DaemonHealthSnapshot, DaemonLifecycleSnapshot, MaintenanceStateSnapshot, MeshOsSnapshot,
-    PeerHealthSnapshot,
+    PeerHealthSnapshot, PeerSnapshot,
 };
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -29,7 +29,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "LIVE"
     };
 
-    let peers = peer_summary(&app.snapshot);
+    // Pass the synthesized local PeerSnapshot so peer_summary
+    // reads its actual `health` field instead of hardcoding
+    // "local is Healthy". The synth stamps Healthy today, but
+    // a future contract change that lets the local node self-
+    // report Degraded / Unreachable propagates here without
+    // silently disagreeing with NODES / NET.MAP.
+    let local_peer = app.local_peer_snapshot();
+    let peers = peer_summary(&app.snapshot, &local_peer);
     let daemons = daemon_summary(&app.snapshot);
     // Substrate's `recently_emitted` is a ring of the last N
     // reconcile-emitted actions (capped by
@@ -134,16 +141,24 @@ struct PeerSummary {
     unreachable: usize,
 }
 
-fn peer_summary(snap: &MeshOsSnapshot) -> PeerSummary {
-    // Local node counts too: NODES + NET.MAP now render it
+fn peer_summary(snap: &MeshOsSnapshot, local: &PeerSnapshot) -> PeerSummary {
+    // Local node counts too: NODES + NET.MAP render it
     // alongside remote peers, so the status-bar chip needs
-    // to match (17 peers + self = 18). Local is assumed
-    // Healthy — the synthesized local PeerSnapshot stamps
-    // `Some(Healthy)` and nothing local-side reports its own
-    // node as Degraded / Unreachable.
-    let mut healthy = 1;
+    // to match (17 peers + self = 18). The local PeerSnapshot
+    // is synthesized by the App (the substrate fold doesn't
+    // insert self into `snap.peers`), and its `health` field
+    // is what NODES + NET.MAP read — so this summary stays in
+    // lockstep with them.
+    let mut healthy = 0;
     let mut degraded = 0;
     let mut unreachable = 0;
+    // Pre-pass: classify the local peer.
+    match local.health {
+        Some(PeerHealthSnapshot::Healthy) => healthy += 1,
+        Some(PeerHealthSnapshot::Degraded) => degraded += 1,
+        Some(PeerHealthSnapshot::Unreachable) => unreachable += 1,
+        _ => {}
+    }
     for p in snap.peers.values() {
         match p.health {
             Some(PeerHealthSnapshot::Healthy) => healthy += 1,
