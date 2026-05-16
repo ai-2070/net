@@ -25,14 +25,19 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub fn all() -> [Tab; 10] {
+    /// Tab order rendered by the tab strip. AUDIT is intentionally
+    /// omitted (hidden for now) — the `Tab::Audit` variant, its
+    /// state fields, render module, and per-tab key handlers all
+    /// stay in the codebase so re-enabling is a single-line addition
+    /// here. While hidden, AUDIT is unreachable from the tab bar,
+    /// the `1-9` jump keys, and the Tab/arrow cycling.
+    pub fn all() -> [Tab; 9] {
         [
             Tab::NetMap,
             Tab::List,
             Tab::Dataforts,
             Tab::Daemon,
             Tab::Logs,
-            Tab::Audit,
             Tab::Replicas,
             Tab::Migrations,
             Tab::Failures,
@@ -551,34 +556,41 @@ impl App {
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                 self.current = self.current.prev()
             }
+            // Numeric tab jumps follow `Tab::all()` order; AUDIT
+            // is hidden so the slot it used to claim is filled
+            // by the next tab in the list. Adding AUDIT back to
+            // `Tab::all()` will re-shift these.
             KeyCode::Char('1') => self.current = Tab::NetMap,
             KeyCode::Char('2') => self.current = Tab::List,
             KeyCode::Char('3') => self.current = Tab::Dataforts,
             KeyCode::Char('4') => self.current = Tab::Daemon,
             KeyCode::Char('5') => self.current = Tab::Logs,
-            KeyCode::Char('6') => self.current = Tab::Audit,
-            KeyCode::Char('7') => self.current = Tab::Replicas,
-            KeyCode::Char('8') => self.current = Tab::Migrations,
-            KeyCode::Char('9') => self.current = Tab::Failures,
-            KeyCode::Char('0') => self.current = Tab::Blobs,
+            KeyCode::Char('6') => self.current = Tab::Replicas,
+            KeyCode::Char('7') => self.current = Tab::Migrations,
+            KeyCode::Char('8') => self.current = Tab::Failures,
+            KeyCode::Char('9') => self.current = Tab::Blobs,
             // DAEMON tab navigation. `j`/`k` move within the
-            // current group's members; `J`/`K` step to the
-            // next / previous group. No-op on other tabs.
+            // primary axis (j/k/arrows) moves between groups —
+            // matches the cursor semantics on every other tab,
+            // where vertical nav is the primary motion. `w`/`s`
+            // are the in-group "horizontal" axis for picking
+            // a specific member within the cursored group; the
+            // detail panel reflects the cursored member.
             KeyCode::Char('j') | KeyCode::Down if self.current == Tab::Daemon => {
-                self.daemon_cursor.member = self.daemon_cursor.member.saturating_add(1);
-                self.clamp_daemon_cursor();
-            }
-            KeyCode::Char('k') | KeyCode::Up if self.current == Tab::Daemon => {
-                self.daemon_cursor.member = self.daemon_cursor.member.saturating_sub(1);
-            }
-            KeyCode::Char('J') if self.current == Tab::Daemon => {
                 self.daemon_cursor.group = self.daemon_cursor.group.saturating_add(1);
                 self.daemon_cursor.member = 0;
                 self.clamp_daemon_cursor();
             }
-            KeyCode::Char('K') if self.current == Tab::Daemon => {
+            KeyCode::Char('k') | KeyCode::Up if self.current == Tab::Daemon => {
                 self.daemon_cursor.group = self.daemon_cursor.group.saturating_sub(1);
                 self.daemon_cursor.member = 0;
+            }
+            KeyCode::Char('s') if self.current == Tab::Daemon => {
+                self.daemon_cursor.member = self.daemon_cursor.member.saturating_add(1);
+                self.clamp_daemon_cursor();
+            }
+            KeyCode::Char('w') if self.current == Tab::Daemon => {
+                self.daemon_cursor.member = self.daemon_cursor.member.saturating_sub(1);
             }
             // DAEMON tab actions: `r` proposes
             // restart-all-daemons on the cursored member's
@@ -698,6 +710,14 @@ impl App {
             KeyCode::Char('/') if self.current == Tab::Blobs => {
                 self.blobs_search_editing = true;
             }
+            // Export the current filtered view to a timestamped
+            // file in the cwd. Captures only what would render —
+            // operator's filter chips dictate what lands in the
+            // file. Surfaces success/failure in the footer toast.
+            KeyCode::Char('e') if self.current == Tab::Logs => self.export_logs(),
+            KeyCode::Char('e') if self.current == Tab::Audit => self.export_audit(),
+            KeyCode::Char('e') if self.current == Tab::Failures => self.export_failures(),
+            KeyCode::Char('e') if self.current == Tab::Blobs => self.export_blobs(),
             // BLOBS: open the detail modal for the cursored
             // entry. Snapshots the entry so a subsequent
             // inventory refresh doesn't shift the body.
@@ -708,14 +728,6 @@ impl App {
             KeyCode::Char('B') if self.current == Tab::Dataforts => {
                 self.current = Tab::Blobs;
             }
-            // Export the current filtered view to a timestamped
-            // file in the cwd. Captures only what would render —
-            // operator's filter chips dictate what lands in the
-            // file. Surfaces success/failure in the footer toast.
-            KeyCode::Char('w') if self.current == Tab::Logs => self.export_logs(),
-            KeyCode::Char('w') if self.current == Tab::Audit => self.export_audit(),
-            KeyCode::Char('w') if self.current == Tab::Failures => self.export_failures(),
-            KeyCode::Char('w') if self.current == Tab::Blobs => self.export_blobs(),
             KeyCode::Char('n') if self.current == Tab::Audit => {
                 self.audit_limit = match self.audit_limit {
                     None => Some(25),

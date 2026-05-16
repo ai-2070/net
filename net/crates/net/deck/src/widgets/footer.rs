@@ -34,7 +34,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, toast: Option<&str>) {
         Span::styled(" inval   ", theme::dim()),
         Span::styled("r", theme::green()),
         Span::styled(" restart   ", theme::dim()),
-        Span::styled("w", theme::green()),
+        Span::styled("e", theme::green()),
         Span::styled(" export   ", theme::dim()),
         Span::styled("q", theme::green()),
         Span::styled(" quit", theme::dim()),

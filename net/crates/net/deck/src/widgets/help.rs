@@ -19,19 +19,19 @@ struct Binding {
 
 /// Routine bindings — navigation + cursor + dismissals.
 const NAVIGATION: &[Binding] = &[
-    Binding { keys: "1-9, 0",    desc: "jump to tab (0 = BLOBS)" },
+    Binding { keys: "1-9",       desc: "jump to tab" },
     Binding { keys: ":",         desc: "open cluster picker" },
     Binding { keys: "Enter",     desc: "BLOBS: open blob detail" },
     Binding { keys: "B",         desc: "DATAFORTS: jump to BLOBS" },
     Binding { keys: "Tab / ◂▸",  desc: "cycle tab" },
     Binding { keys: "↓ / ↑",     desc: "cursor down / up (also j / k)" },
     Binding { keys: "g / G",     desc: "cursor to top / bottom" },
-    Binding { keys: "J / K",     desc: "DAEMON: next / prev group" },
+    Binding { keys: "w / s",     desc: "DAEMON: member within group (cursor is group axis)" },
     Binding { keys: "f",         desc: "AUDIT/LOGS: cycle filter (ICE-only or min level)" },
     Binding { keys: "n",         desc: "AUDIT: cycle row limit (none/25/100)" },
     Binding { keys: "p",         desc: "LOGS: pause / resume the tail" },
     Binding { keys: "/",         desc: "LOGS/AUDIT/FAILURES: substring search (Enter commit, Esc clear)" },
-    Binding { keys: "w",         desc: "LOGS/AUDIT/FAILURES: export current view to ./deck-<tab>-<ts>.txt" },
+    Binding { keys: "e",         desc: "LOGS/FAILURES/BLOBS: export current view to ./deck-<tab>-<ts>.txt" },
     Binding { keys: "?",         desc: "toggle this help overlay" },
     Binding { keys: "q / Esc",   desc: "quit (or close modal)" },
     Binding { keys: "Ctrl-C",    desc: "quit" },

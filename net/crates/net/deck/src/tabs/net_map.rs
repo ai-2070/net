@@ -80,11 +80,46 @@ struct LiveNode {
 }
 
 fn project_live_peers(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
+    // Radial layout off the substrate's proximity probe: each
+    // peer sits at radius proportional to its measured RTT
+    // from this node, with the angle deterministically hashed
+    // from the node id so the layout is stable across ticks.
+    // Peers with no RTT sample land at the outer edge so
+    // they're visible but read as "unranked." Reflects the
+    // real cluster topology Deck has access to today —
+    // pairwise distances would need a 2D MDS over the full
+    // proximity graph; that's a future refinement.
+    let max_rtt_us: u64 = snapshot
+        .peers
+        .values()
+        .filter_map(|p| p.rtt_ms.map(|ms| ms.saturating_mul(1_000)))
+        .max()
+        .unwrap_or(1);
     snapshot
         .peers
         .iter()
         .map(|(id, p)| {
-            let (x, y) = hash_position(*id);
+            let angle = angle_for(*id);
+            // RTT samples come through as milliseconds in the
+            // snapshot; the demo probe sources microseconds
+            // but the snapshot fold stores them as ms. Either
+            // way the ratio against the max is what places
+            // the peer on its radial.
+            let rtt_us = p
+                .rtt_ms
+                .map(|ms| ms.saturating_mul(1_000))
+                .unwrap_or(max_rtt_us);
+            let radius_unit = (rtt_us as f64 / max_rtt_us.max(1) as f64).clamp(0.05, 1.0);
+            // Canvas extent: ~70 on each axis with a small
+            // margin. Multiply by 0.55 to keep most peers
+            // inside the visible window even after the
+            // y-axis is squished (terminal cells are taller
+            // than wide, so a circle reads as a vertical
+            // ellipse without compensation).
+            let radius_x = radius_unit * 60.0;
+            let radius_y = radius_unit * 36.0;
+            let x = radius_x * angle.cos();
+            let y = radius_y * angle.sin();
             let health = p.health.unwrap_or(PeerHealthSnapshot::Healthy);
             LiveNode {
                 id: *id,
@@ -96,26 +131,17 @@ fn project_live_peers(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
         .collect()
 }
 
-/// Deterministic 2D position for a node id. Hashes the full
-/// u64 through splitmix64 (good output distribution on small /
-/// sparse input domains — the demo node ids are all 16-bit, so
-/// a naive `id >> 32` half-split produces zero for every peer
-/// and collapses the y axis). Both halves of the 64-bit output
-/// feed a separate axis, so peers with low-entropy ids still
-/// scatter across the canvas. Stable across renders so the
-/// graph doesn't jitter.
-fn hash_position(id: u64) -> (f64, f64) {
+/// Deterministic angular position (radians) for a node id.
+/// splitmix64 → 32-bit unit fraction → `0..2π`. Stable across
+/// renders so the graph doesn't jitter, and well-distributed
+/// for sparse inputs (the demo node ids are 16-bit).
+fn angle_for(id: u64) -> f64 {
     let mut s = id.wrapping_add(0x9e37_79b9_7f4a_7c15);
     s = (s ^ (s >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     s = (s ^ (s >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     s ^= s >> 31;
-    let x_unit = (s as u32) as f64 / u32::MAX as f64;
-    let y_unit = ((s >> 32) as u32) as f64 / u32::MAX as f64;
-    // 90% of canvas extent on each axis to keep labels off
-    // the border. Canvas bounds: x ∈ [-80, 80], y ∈ [-45, 70].
-    let x = -72.0 + x_unit * 144.0;
-    let y = -38.0 + y_unit * 100.0;
-    (x, y)
+    let unit = (s as u32) as f64 / u32::MAX as f64;
+    unit * std::f64::consts::TAU
 }
 
 fn paint_live_graph(ctx: &mut Context<'_>, peers: &[LiveNode]) {

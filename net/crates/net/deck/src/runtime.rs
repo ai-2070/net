@@ -293,9 +293,13 @@ mod samples {
     struct SampleLocalityProbe;
     impl LocalityProbe for SampleLocalityProbe {
         fn rtt_samples(&self) -> Vec<(NodeId, Duration)> {
+            // RTT values in the PEERS table are *milliseconds*
+            // — matches what real cluster probes report and
+            // what the snapshot fold stores in `rtt_ms`. The
+            // map's radial layout reads `rtt_ms` directly.
             PEERS
                 .iter()
-                .map(|(id, us, _)| (*id, Duration::from_micros(*us)))
+                .map(|(id, ms, _)| (*id, Duration::from_millis(*ms)))
                 .collect()
         }
     }

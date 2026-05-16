@@ -20,15 +20,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, current: Tab) {
     let brand = Line::from(vec![Span::styled("DECK  ", theme::green_hi())]);
     frame.render_widget(Paragraph::new(brand), cols[0]);
 
-    // Tab key glyphs: 1..=9 then 0 (for the 10th tab; matches
-    // `KeyCode::Char('0') => Tab::Blobs` in App::on_key).
-    let key_for = |i: usize| -> String {
-        if i < 9 {
-            format!("[{}] ", i + 1)
-        } else {
-            "[0] ".to_string()
-        }
-    };
+    // Tab key glyphs: 1..=9 (9 visible tabs, AUDIT hidden).
+    let key_for = |i: usize| -> String { format!("[{}] ", i + 1) };
 
     let mut spans = Vec::new();
     for (i, tab) in Tab::all().iter().enumerate() {
