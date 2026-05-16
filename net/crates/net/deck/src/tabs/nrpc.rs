@@ -18,12 +18,12 @@ use crate::{
     theme, widgets,
 };
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, calls: &[NrpcCall]) {
+pub fn render(frame: &mut Frame<'_>, area: Rect, calls: &[NrpcCall], paused: bool) {
     if calls.is_empty() {
         render_empty(frame, area);
         return;
     }
-    render_table(frame, area, calls);
+    render_table(frame, area, calls, paused);
 }
 
 fn render_empty(frame: &mut Frame<'_>, area: Rect) {
@@ -46,13 +46,17 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_table(frame: &mut Frame<'_>, area: Rect, calls: &[NrpcCall]) {
+fn render_table(frame: &mut Frame<'_>, area: Rect, calls: &[NrpcCall], paused: bool) {
     let total = calls.len();
-    let header_line = Line::from(vec![
+    let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("NRPC", theme::green_hi()),
         Span::styled(format!("    {total} recent calls"), theme::chrome()),
-    ]);
+    ];
+    if paused {
+        title_spans.push(Span::styled("    [PAUSED]", theme::amber()));
+    }
+    let header_line = Line::from(title_spans);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())

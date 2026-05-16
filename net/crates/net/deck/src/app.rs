@@ -219,6 +219,11 @@ pub struct App {
     /// `[p]` on the LOGS tab. Other tabs keep using the live
     /// snapshot — only the log tail is paused.
     pub logs_paused: Option<Vec<net_sdk::deck::LogRecord>>,
+    /// NRPC tab pause: same shape as `logs_paused`. Toggled
+    /// via `[p]` on the NRPC tab. Calls keep flowing into
+    /// `nrpc_tail` underneath; the render path just substitutes
+    /// the frozen snapshot when this is `Some`.
+    pub nrpc_paused: Option<Vec<crate::streams::NrpcCall>>,
     /// LOGS tab substring filter applied to record messages.
     /// Empty = no filter. Edited via `[/]`; survives switching
     /// off the LOGS tab until explicitly cleared.
@@ -504,6 +509,7 @@ impl App {
             audit_limit: None,
             logs_min_level: net_sdk::deck::LogLevel::Info,
             logs_paused: None,
+            nrpc_paused: None,
             logs_search: String::new(),
             logs_search_editing: false,
             audit_search: String::new(),
@@ -1675,6 +1681,16 @@ impl App {
                     None => Some(self.logs_tail.snapshot()),
                 };
             }
+            // NRPC pause: same toggle shape as LOGS — freezes
+            // the call ring in place so the operator can scan
+            // recent calls without new injections rolling them
+            // off the visible window.
+            KeyCode::Char('p') if self.current == Tab::Nrpc => {
+                self.nrpc_paused = match self.nrpc_paused.take() {
+                    Some(_) => None,
+                    None => Some(self.nrpc_tail.snapshot()),
+                };
+            }
             // LOGS: open the substring search prompt. The
             // existing buffer is preserved so the operator can
             // refine instead of retyping.
@@ -2812,8 +2828,15 @@ impl App {
                 tabs::dataforts::render(frame, chunks[3], &entries, self.dataforts_cursor);
             }
             Tab::Nrpc => {
-                let calls = self.nrpc_tail.snapshot();
-                tabs::nrpc::render(frame, chunks[3], &calls);
+                let owned: Vec<crate::streams::NrpcCall>;
+                let calls: &[crate::streams::NrpcCall] = match &self.nrpc_paused {
+                    Some(frozen) => frozen.as_slice(),
+                    None => {
+                        owned = self.nrpc_tail.snapshot();
+                        owned.as_slice()
+                    }
+                };
+                tabs::nrpc::render(frame, chunks[3], calls, self.nrpc_paused.is_some());
             }
             Tab::Groups => {
                 let logs = self.logs_tail.snapshot();
