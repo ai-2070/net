@@ -1,0 +1,36 @@
+net/crates/net/deck/src/widgets/status_bar.rs
+  s_3bbc444b3ef3e5::t_beaaa86fe0531f 36-44
+net/crates/net/deck/src/widgets/help.rs
+  s_3bbc444b3ef3e5::t_676d6c1cbaa122 66
+  s_3bbc444b3ef3e5::t_d3567aaf32896d 89
+  s_3bbc444b3ef3e5::t_13b240cf04c23a 23
+net/crates/net/deck/src/widgets/cluster_picker.rs
+  s_3bbc444b3ef3e5::t_1d15e190e2a611 1-153
+net/crates/net/deck/src/app.rs
+  s_3bbc444b3ef3e5::t_fbe756b4584ae9 364-396
+  s_3bbc444b3ef3e5::t_ee239fae439e61 118-119,121-127
+  s_3bbc444b3ef3e5::t_bd5ac3009cccc5 219-226
+  s_3bbc444b3ef3e5::t_77f781ac56bc37 1545-1559
+  s_3bbc444b3ef3e5::t_6e952a74ec4629 294
+  s_3bbc444b3ef3e5::t_70986c2bb32cdc 1110-1112
+  s_3bbc444b3ef3e5::t_23b9b150618cd7 1091-1102
+  s_3bbc444b3ef3e5::t_298f5c8d5bc329 512-515
+net/crates/net/deck/src/widgets/mod.rs
+  s_3bbc444b3ef3e5::t_33d2496c000573 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "924f5c6757813c663ade16419b20fb9607c70ac8",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
