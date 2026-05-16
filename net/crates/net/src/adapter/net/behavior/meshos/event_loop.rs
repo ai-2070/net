@@ -790,7 +790,8 @@ impl MeshOsLoop {
         // strictly worse.
         let mut peers_seen_inventory: std::collections::HashSet<super::event::NodeId> =
             std::collections::HashSet::new();
-        let mut inventory_succeeded = false;
+        let mut all_probes_succeeded = true;
+        let mut any_probe_saw_samples = false;
         for probe in &inventory {
             let probe = Arc::clone(probe);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -798,13 +799,16 @@ impl MeshOsLoop {
             }));
             match result {
                 Ok(samples) => {
-                    inventory_succeeded = true;
+                    if !samples.is_empty() {
+                        any_probe_saw_samples = true;
+                    }
                     for (peer, inv) in samples {
                         peers_seen_inventory.insert(peer);
                         self.actual.inventory.insert(peer, inv);
                     }
                 }
                 Err(_) => {
+                    all_probes_succeeded = false;
                     tracing::error!(
                         target: "meshos",
                         "inventory probe panicked — sample skipped this tick",
@@ -812,11 +816,25 @@ impl MeshOsLoop {
                 }
             }
         }
-        // Prune only when at least one probe succeeded —
-        // matches the per-probe "sample skipped this tick"
-        // semantic so an entirely-panicking probe pass doesn't
-        // erase the previous tick's data.
-        if inventory_succeeded {
+        // Two-axis guard for the GC pass:
+        //
+        //   * `all_probes_succeeded` — a partial-panic pass
+        //     can leave `peers_seen_inventory` short of peers
+        //     that the panicking probe owned authoritatively
+        //     (e.g. two inventory probes with disjoint
+        //     coverage); pruning then drops the panicking
+        //     probe's peers despite no probe knowing they
+        //     departed. Wait for the next clean tick instead.
+        //
+        //   * `any_probe_saw_samples` — the trait contract
+        //     allows a probe to return `Ok(vec![])` for a
+        //     transient empty-this-tick (procfs unavailable,
+        //     no peers known yet at startup); pruning on an
+        //     all-empty pass would wipe every previously-seen
+        //     peer's inventory. The first tick at startup
+        //     legitimately has no peers, so this also
+        //     prevents a cold-start wipe.
+        if all_probes_succeeded && any_probe_saw_samples {
             self.actual
                 .inventory
                 .retain(|peer, _| peers_seen_inventory.contains(peer));
@@ -1567,6 +1585,175 @@ mod tests {
         );
         assert!(inv_peers.contains(&0xB), "peer 0xB should still be sampled");
         assert!(inv_peers.contains(&0xC), "peer 0xC should still be sampled");
+    }
+
+    #[tokio::test]
+    async fn inventory_gc_does_not_wipe_peers_when_one_of_two_probes_panics() {
+        // Multi-probe partial-panic case: probe A reports peer
+        // 0xA, probe B reports peer 0xB. On tick 2, probe B
+        // panics; the GC pass must not drop 0xB just because A
+        // didn't sample it. Without the `all_probes_succeeded`
+        // guard, `peers_seen_inventory = {0xA}` and `retain`
+        // would wipe 0xB even though no probe authoritatively
+        // observed its departure.
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+        struct SteadyProbe {
+            peer: u64,
+            cpu: f64,
+        }
+        impl super::super::probes::InventoryProbe for SteadyProbe {
+            fn inventory_samples(&self) -> Vec<(u64, super::super::probes::PeerInventory)> {
+                vec![(
+                    self.peer,
+                    super::super::probes::PeerInventory {
+                        cpu_load_1m: Some(self.cpu),
+                        ..Default::default()
+                    },
+                )]
+            }
+        }
+        struct SometimesPanickingProbe {
+            tick: AtomicUsize,
+            peer: u64,
+            cpu: f64,
+        }
+        impl super::super::probes::InventoryProbe for SometimesPanickingProbe {
+            fn inventory_samples(&self) -> Vec<(u64, super::super::probes::PeerInventory)> {
+                let t = self.tick.fetch_add(1, AOrdering::Relaxed);
+                if t == 0 {
+                    vec![(
+                        self.peer,
+                        super::super::probes::PeerInventory {
+                            cpu_load_1m: Some(self.cpu),
+                            ..Default::default()
+                        },
+                    )]
+                } else {
+                    panic!("probe B panicked on tick {t}");
+                }
+            }
+        }
+        let registry = ProbeRegistry::new();
+        registry.add_inventory_probe(Arc::new(SteadyProbe {
+            peer: 0xA,
+            cpu: 0.1,
+        }));
+        registry.add_inventory_probe(Arc::new(SometimesPanickingProbe {
+            tick: AtomicUsize::new(0),
+            peer: 0xB,
+            cpu: 0.2,
+        }));
+        let cfg = MeshOsConfig {
+            tick_interval: StdDuration::from_millis(10),
+            ..fast_test_config()
+        };
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _actions_rx,
+            reader,
+        } = MeshOsLoop::new(cfg);
+        let loop_ = loop_.with_probe_registry(registry);
+        let task = tokio::spawn(loop_.run());
+        // Wait for the first tick (both probes succeed) and
+        // several subsequent ticks (probe B panics).
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        let snap = reader.read();
+        let inv_peers: std::collections::BTreeSet<u64> = snap
+            .peers
+            .iter()
+            .filter(|(_, p)| p.cpu_load_1m.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(StdDuration::from_secs(2), task).await;
+        assert!(
+            inv_peers.contains(&0xA),
+            "probe A's peer should still be in inventory: {inv_peers:?}",
+        );
+        assert!(
+            inv_peers.contains(&0xB),
+            "probe B's peer must survive probe B's panic — partial-panic ticks are not authoritative for the panicking probe's peers: {inv_peers:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_gc_does_not_wipe_on_a_transient_empty_probe() {
+        // The InventoryProbe trait permits an `Ok(vec![])`
+        // return ("no peers this tick" — transient procfs
+        // unavailability, cold start, etc.). Without the
+        // `any_probe_saw_samples` guard the GC pass would
+        // treat the empty return as "no peers authoritatively
+        // exist anymore" and wipe every previously-seen peer's
+        // inventory.
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+        struct FlakyProbe {
+            tick: AtomicUsize,
+        }
+        impl super::super::probes::InventoryProbe for FlakyProbe {
+            fn inventory_samples(&self) -> Vec<(u64, super::super::probes::PeerInventory)> {
+                let t = self.tick.fetch_add(1, AOrdering::Relaxed);
+                // Tick 0: populate. Subsequent ticks: empty
+                // (simulate the resource probe losing its
+                // procfs handle for a few cycles).
+                if t == 0 {
+                    vec![
+                        (
+                            0xA,
+                            super::super::probes::PeerInventory {
+                                cpu_load_1m: Some(0.1),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            0xB,
+                            super::super::probes::PeerInventory {
+                                cpu_load_1m: Some(0.2),
+                                ..Default::default()
+                            },
+                        ),
+                    ]
+                } else {
+                    vec![]
+                }
+            }
+        }
+        let registry = ProbeRegistry::new();
+        registry.add_inventory_probe(Arc::new(FlakyProbe {
+            tick: AtomicUsize::new(0),
+        }));
+        let cfg = MeshOsConfig {
+            tick_interval: StdDuration::from_millis(10),
+            ..fast_test_config()
+        };
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _actions_rx,
+            reader,
+        } = MeshOsLoop::new(cfg);
+        let loop_ = loop_.with_probe_registry(registry);
+        let task = tokio::spawn(loop_.run());
+        // Wait long enough for the populating tick + several
+        // empty ticks.
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        let snap = reader.read();
+        let inv_peers: std::collections::BTreeSet<u64> = snap
+            .peers
+            .iter()
+            .filter(|(_, p)| p.cpu_load_1m.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(StdDuration::from_secs(2), task).await;
+        assert!(
+            inv_peers.contains(&0xA),
+            "transient empty probe return must not wipe inventory: {inv_peers:?}",
+        );
+        assert!(
+            inv_peers.contains(&0xB),
+            "transient empty probe return must not wipe inventory: {inv_peers:?}",
+        );
     }
 
     #[tokio::test]
