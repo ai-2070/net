@@ -619,6 +619,16 @@ impl MeshOsRuntime {
         self.probes.add_health_probe(probe);
     }
 
+    /// Install an [`super::probes::InventoryProbe`] on the live
+    /// loop. Polled on every Tick alongside the other probes;
+    /// samples populate the per-peer inventory axes
+    /// (`PeerSnapshot::cpu_load_1m` / `mem_*` / `disk_*` /
+    /// `saturation_trend` / `capability_set` /
+    /// `software_version` / `forked_from`).
+    pub fn add_inventory_probe(&self, probe: Arc<dyn super::probes::InventoryProbe>) {
+        self.probes.add_inventory_probe(probe);
+    }
+
     /// Clone the probe registry. Used by tests + advanced
     /// callers that want to install probes outside the runtime's
     /// own lifetime.

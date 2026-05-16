@@ -47,6 +47,12 @@ pub struct MeshOsState {
     /// transitions; here we only mirror what the admin chain
     /// committed).
     pub(crate) maintenance: HashMap<NodeId, MaintenanceMirror>,
+    /// Per-peer inventory axes (CPU / mem / disk / saturation
+    /// / capability set / software version / fork origin).
+    /// Fed by `InventoryProbe` instances on every Tick; the
+    /// snapshot fold projects this into `PeerSnapshot`'s
+    /// inventory fields. `None` for any peer no probe samples.
+    pub(crate) inventory: HashMap<NodeId, super::probes::PeerInventory>,
     /// Phase E — this node's own maintenance state machine.
     /// Driven by admin events (operator commands) and observed
     /// transition confirmations from the chain. Reconcile reads

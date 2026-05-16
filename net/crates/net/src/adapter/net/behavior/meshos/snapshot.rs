@@ -268,7 +268,24 @@ pub struct ReplicaSnapshot {
 }
 
 /// Per-peer Deck-renderable summary.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Fields after `maintenance` are the Feature-11 inventory
+/// axes — extended to give Deck a per-node resource view
+/// (`NODE_INVENTORY` per `DECK_PLAN.md` § Deferred work). All
+/// of them are `Option`-wrapped or default-able so the
+/// addition is non-breaking for existing consumers: a probe
+/// that doesn't sample the axis (or a node that doesn't expose
+/// it) leaves the field at its default (`None` / empty), and
+/// the snapshot fold simply doesn't populate it.
+///
+/// Note: `Copy` and `Eq` are dropped from the derive set
+/// because `capability_set: BTreeSet<String>` and
+/// `software_version: Option<String>` are heap-owned, and
+/// `cpu_load_1m: Option<f64>` doesn't implement `Eq`. Callers
+/// that previously copied a `PeerSnapshot` by value now
+/// borrow or clone; the snapshot is a read-only projection so
+/// the change is benign for every downstream we ship today.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct PeerSnapshot {
     /// Latest RTT in milliseconds, if any.
     pub rtt_ms: Option<u64>,
@@ -276,6 +293,42 @@ pub struct PeerSnapshot {
     pub health: Option<PeerHealthSnapshot>,
     /// Maintenance state mirror.
     pub maintenance: Option<MaintenanceMirrorSnapshot>,
+    /// Host CPU load average over the last minute. `None`
+    /// when no resource probe is wired (lightweight containers
+    /// without procfs / a node that opted out of host
+    /// sampling).
+    pub cpu_load_1m: Option<f64>,
+    /// Host memory currently used, in bytes. `None` when no
+    /// resource probe is wired.
+    pub mem_used_bytes: Option<u64>,
+    /// Host memory cap, in bytes. `None` when no resource
+    /// probe is wired.
+    pub mem_total_bytes: Option<u64>,
+    /// Host disk currently used, in bytes. Distinct from the
+    /// dataforts blob-adapter disk: this is the *host* disk,
+    /// not the per-adapter dataforts cap.
+    pub disk_used_bytes: Option<u64>,
+    /// Host disk cap, in bytes.
+    pub disk_total_bytes: Option<u64>,
+    /// Rolling 0.0..=1.0 saturation score the substrate
+    /// computes from existing health-probe signals. `None`
+    /// when no probe drives it. Operators dashboard this to
+    /// spot peers under sustained pressure before they tip
+    /// into `Degraded` health.
+    pub saturation_trend: Option<f32>,
+    /// Capabilities the peer advertises. Empty when the peer
+    /// hasn't published a capability set or when the local
+    /// node's capability index hasn't indexed them yet. The
+    /// capability strings match what the `capability_index`
+    /// projection holds.
+    pub capability_set: std::collections::BTreeSet<String>,
+    /// Substrate software version the peer is running, as a
+    /// semver string. `None` when the peer hasn't advertised
+    /// its version (older substrates before this surface).
+    pub software_version: Option<String>,
+    /// For fork-group members, the origin node the fork
+    /// descends from. `None` for non-fork peers.
+    pub forked_from: Option<NodeId>,
 }
 
 /// Wire form of `NodeHealth`.
@@ -516,6 +569,23 @@ impl MeshOsSnapshot {
                         MaintenanceMirrorSnapshot::Recovery
                     }
                 });
+            }
+            // Inventory axes — `InventoryProbe` samples land in
+            // `actual.inventory`; copy each axis through to the
+            // corresponding `PeerSnapshot` field. Unsampled
+            // peers stay at the snapshot's defaults (None /
+            // empty set).
+            for (peer, inv) in &actual.inventory {
+                let entry = peers.entry(*peer).or_default();
+                entry.cpu_load_1m = inv.cpu_load_1m;
+                entry.mem_used_bytes = inv.mem_used_bytes;
+                entry.mem_total_bytes = inv.mem_total_bytes;
+                entry.disk_used_bytes = inv.disk_used_bytes;
+                entry.disk_total_bytes = inv.disk_total_bytes;
+                entry.saturation_trend = inv.saturation_trend;
+                entry.capability_set = inv.capability_set.clone();
+                entry.software_version = inv.software_version.clone();
+                entry.forked_from = inv.forked_from;
             }
             peers
         };

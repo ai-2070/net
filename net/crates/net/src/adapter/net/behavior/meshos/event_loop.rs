@@ -258,6 +258,7 @@ impl MaintenanceDiscriminant {
 struct ProbeListsInner {
     locality: Vec<Arc<dyn LocalityProbe>>,
     health: Vec<Arc<dyn HealthProbe>>,
+    inventory: Vec<Arc<dyn super::probes::InventoryProbe>>,
 }
 
 #[derive(Clone, Default)]
@@ -293,13 +294,25 @@ impl ProbeRegistry {
         self.inner.lists.write().health.push(probe);
     }
 
+    /// Install an [`super::probes::InventoryProbe`]. Probes are
+    /// polled by the loop in registration order, once per Tick;
+    /// partial samples merge into per-peer state (later probes
+    /// overwrite earlier on the same peer + axis).
+    pub fn add_inventory_probe(&self, probe: Arc<dyn super::probes::InventoryProbe>) {
+        self.inner.lists.write().inventory.push(probe);
+    }
+
     /// Atomic snapshot of installed probe counts —
-    /// `(locality, health)`. One read lock covers both lists,
-    /// so the pair is consistent even if a concurrent
-    /// installer fires between them.
-    pub fn probe_counts(&self) -> (usize, usize) {
+    /// `(locality, health, inventory)`. One read lock covers
+    /// all three lists, so the triple is consistent even if a
+    /// concurrent installer fires between them.
+    pub fn probe_counts(&self) -> (usize, usize, usize) {
         let guard = self.inner.lists.read();
-        (guard.locality.len(), guard.health.len())
+        (
+            guard.locality.len(),
+            guard.health.len(),
+            guard.inventory.len(),
+        )
     }
 }
 
@@ -718,12 +731,16 @@ impl MeshOsLoop {
     /// out the `ProbeRegistry`), so trust-but-isolate is the
     /// right posture.
     fn poll_probes(&mut self) {
-        // Clone both lists out under a single read lock so a
-        // concurrent install between the locality and health
-        // passes doesn't see one half of an inconsistent pair.
-        let (locality, health) = {
+        // Clone all probe lists out under a single read lock so
+        // a concurrent install between the locality / health /
+        // inventory passes doesn't see a half-applied registry.
+        let (locality, health, inventory) = {
             let guard = self.probes.lists.read();
-            (guard.locality.clone(), guard.health.clone())
+            (
+                guard.locality.clone(),
+                guard.health.clone(),
+                guard.inventory.clone(),
+            )
         };
         for probe in &locality {
             let probe = Arc::clone(probe);
@@ -757,6 +774,25 @@ impl MeshOsLoop {
                     tracing::error!(
                         target: "meshos",
                         "health probe panicked — sample skipped this tick",
+                    );
+                }
+            }
+        }
+        for probe in &inventory {
+            let probe = Arc::clone(probe);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                probe.inventory_samples()
+            }));
+            match result {
+                Ok(samples) => {
+                    for (peer, inv) in samples {
+                        self.actual.inventory.insert(peer, inv);
+                    }
+                }
+                Err(_) => {
+                    tracing::error!(
+                        target: "meshos",
+                        "inventory probe panicked — sample skipped this tick",
                     );
                 }
             }

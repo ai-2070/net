@@ -132,10 +132,10 @@ mod samples {
     use net_sdk::compute::CausalEvent;
     use net_sdk::dataforts::BlobMetrics;
     use net_sdk::meshos::{
-        ChainId, DaemonError, EntityKeypair, HealthProbe, LocalityProbe, MeshDaemon,
-        MeshOsDaemonHandle, MeshOsDaemonSdk, MeshOsEvent, MigrationPhaseSnapshot,
-        MigrationSnapshot, MigrationSnapshotSource, NodeHealth, NodeId, PlacementIntent,
-        ReplicaUpdate,
+        ChainId, DaemonError, EntityKeypair, HealthProbe, InventoryProbe, LocalityProbe,
+        MeshDaemon, MeshOsDaemonHandle, MeshOsDaemonSdk, MeshOsEvent, MigrationPhaseSnapshot,
+        MigrationSnapshot, MigrationSnapshotSource, NodeHealth, NodeId, PeerInventory,
+        PlacementIntent, ReplicaUpdate,
     };
 
     /// Seed a `BlobMetrics` with a realistic-looking steady
@@ -262,6 +262,83 @@ mod samples {
         }
     }
 
+    /// Static inventory fixture — each peer gets a synthetic
+    /// resource snapshot keyed off the peer index so the values
+    /// vary across the fleet without drifting. The two Degraded
+    /// peers also report higher saturation + memory pressure
+    /// (matches the on-screen story: hot peers + degraded
+    /// health). All peers advertise the same software version
+    /// in samples mode; one peer reports as forked-from another
+    /// so the fork-origin column has something to render.
+    struct SampleInventoryProbe;
+    impl InventoryProbe for SampleInventoryProbe {
+        fn inventory_samples(&self) -> Vec<(NodeId, PeerInventory)> {
+            PEERS
+                .iter()
+                .enumerate()
+                .map(|(i, (id, _, h))| {
+                    let degraded = matches!(h, NodeHealth::Degraded);
+                    // CPU load avg: degraded peers run hot.
+                    let cpu = if degraded {
+                        2.4 + (i as f64 * 0.07)
+                    } else {
+                        0.5 + (i as f64 * 0.13).fract()
+                    };
+                    // Memory: degraded peers near cap.
+                    let mem_used: u64 = if degraded {
+                        (62 + (i as u64 % 4)) << 30 // ~62 GB
+                    } else {
+                        ((24 + (i as u64 * 3) % 32) << 30) as u64 // 24..56 GB
+                    };
+                    let mem_total: u64 = 64 << 30;
+                    let disk_used: u64 = ((256 + (i as u64 * 47) % 512) << 30) as u64;
+                    let disk_total: u64 = 1u64 << 40; // 1 TiB
+                    // Saturation: rises with health pressure;
+                    // degraded peers cross the 0.8 amber/red
+                    // threshold the LIST tab shades on.
+                    let sat: f32 = if degraded {
+                        0.82 + ((i as f32 * 0.03) % 0.1)
+                    } else {
+                        0.22 + ((i as f32 * 0.07) % 0.5)
+                    };
+                    // Capability set: every peer carries the
+                    // base capabilities; degraded peers also
+                    // advertise the dataforts overflow tag so
+                    // operators can see it in the inventory
+                    // detail panel later.
+                    let mut caps = std::collections::BTreeSet::new();
+                    caps.insert("compute.daemon".to_string());
+                    caps.insert("meshos.health".to_string());
+                    if degraded {
+                        caps.insert("dataforts.blob.overflow".to_string());
+                    }
+                    if i % 4 == 0 {
+                        caps.insert("greedy.cache".to_string());
+                    }
+                    let inv = PeerInventory {
+                        cpu_load_1m: Some(cpu),
+                        mem_used_bytes: Some(mem_used),
+                        mem_total_bytes: Some(mem_total),
+                        disk_used_bytes: Some(disk_used),
+                        disk_total_bytes: Some(disk_total),
+                        saturation_trend: Some(sat),
+                        capability_set: caps,
+                        software_version: Some("0.17.0".to_string()),
+                        // The last peer's fixture demonstrates
+                        // the fork-of column: it reports as
+                        // forked from peer 0 (0xa96f).
+                        forked_from: if i == PEERS.len() - 1 {
+                            Some(PEERS[0].0)
+                        } else {
+                            None
+                        },
+                    };
+                    (*id, inv)
+                })
+                .collect()
+        }
+    }
+
     /// Eight synthetic chains spread across the peer fixture
     /// so the REPLICAS tab has data to render under samples
     /// mode. Holders are drawn from `PEERS`; chains are sized
@@ -287,6 +364,7 @@ mod samples {
     pub fn install(sdk: &MeshOsDaemonSdk) -> color_eyre::Result<Vec<MeshOsDaemonHandle>> {
         sdk.runtime().add_locality_probe(Arc::new(SampleLocalityProbe));
         sdk.runtime().add_health_probe(Arc::new(SampleHealthProbe));
+        sdk.runtime().add_inventory_probe(Arc::new(SampleInventoryProbe));
 
         // Replica seeding: fire one ReplicaUpdate per (chain,
         // holder) plus one PlacementIntent per chain. Run in a

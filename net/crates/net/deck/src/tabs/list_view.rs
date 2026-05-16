@@ -112,6 +112,10 @@ fn render_live_nodes_table(
         cell_dim("NODE"),
         cell_dim("HEALTH"),
         cell_dim("RTT"),
+        cell_dim("CPU"),
+        cell_dim("MEM"),
+        cell_dim("DISK"),
+        cell_dim("SAT"),
         cell_dim("DAEMONS"),
         cell_dim("MAINT"),
     ])
@@ -137,6 +141,36 @@ fn render_live_nodes_table(
             Some(ms) => format!("{ms}ms"),
             None => "—".to_string(),
         };
+        let cpu_text = match p.cpu_load_1m {
+            Some(load) => format!("{load:.2}"),
+            None => "—".to_string(),
+        };
+        let mem_text = match (p.mem_used_bytes, p.mem_total_bytes) {
+            (Some(used), Some(total)) if total > 0 => {
+                format!("{}%", (used * 100 / total).min(999))
+            }
+            _ => "—".to_string(),
+        };
+        let disk_text = match (p.disk_used_bytes, p.disk_total_bytes) {
+            (Some(used), Some(total)) if total > 0 => {
+                format!("{}%", (used * 100 / total).min(999))
+            }
+            _ => "—".to_string(),
+        };
+        // Saturation gets a color: green under 0.5, amber to
+        // 0.8, red above. Matches the health-gate hysteresis
+        // intuition used elsewhere.
+        let (sat_text, sat_style) = match p.saturation_trend {
+            Some(s) if s < 0.5 => (format!("{:.2}", s), theme::green()),
+            Some(s) if s < 0.8 => (format!("{:.2}", s), theme::amber()),
+            Some(s) => (format!("{:.2}", s), theme::red()),
+            None => ("—".to_string(), theme::chrome()),
+        };
+        // Highlight mem/disk into amber/red when approaching
+        // host pressure so the operator's eye catches them
+        // before the saturation_trend tilts.
+        let mem_style = pressure_style(p.mem_used_bytes, p.mem_total_bytes);
+        let disk_style = pressure_style(p.disk_used_bytes, p.disk_total_bytes);
         let daemon_count = snapshot
             .daemons
             .values()
@@ -178,6 +212,10 @@ fn render_live_nodes_table(
             Cell::from(Line::from(id_spans)),
             Cell::from(Span::styled(health_text, health_style)),
             Cell::from(Span::styled(rtt_text, theme::text())),
+            Cell::from(Span::styled(cpu_text, theme::text())),
+            Cell::from(Span::styled(mem_text, mem_style)),
+            Cell::from(Span::styled(disk_text, disk_style)),
+            Cell::from(Span::styled(sat_text, sat_style)),
             Cell::from(Span::styled(format!("{daemon_count:>3}"), theme::text())),
             Cell::from(Span::styled(maint_text, maint_style)),
         ]));
@@ -190,6 +228,10 @@ fn render_live_nodes_table(
             Constraint::Length(18), // NODE: id.label
             Constraint::Length(11), // HEALTH
             Constraint::Length(7),  // RTT
+            Constraint::Length(5),  // CPU
+            Constraint::Length(5),  // MEM
+            Constraint::Length(5),  // DISK
+            Constraint::Length(5),  // SAT
             Constraint::Length(8),  // DAEMONS
             Constraint::Length(10), // MAINT
         ],
@@ -310,4 +352,23 @@ fn format_age(ms: u64) -> String {
 
 fn cell_dim(s: &'static str) -> Cell<'static> {
     Cell::from(Span::styled(s, theme::chrome()))
+}
+
+/// Color a percentage-style pressure value (used/total) green
+/// when comfortable, amber under load, red at capacity. Same
+/// thresholds the dataforts health gate uses (85% / 95%).
+fn pressure_style(used: Option<u64>, total: Option<u64>) -> ratatui::style::Style {
+    match (used, total) {
+        (Some(u), Some(t)) if t > 0 => {
+            let ratio = u as f64 / t as f64;
+            if ratio >= 0.95 {
+                theme::red()
+            } else if ratio >= 0.85 {
+                theme::amber()
+            } else {
+                theme::text()
+            }
+        }
+        _ => theme::chrome(),
+    }
 }

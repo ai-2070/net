@@ -66,6 +66,52 @@ pub trait HealthProbe: Send + Sync + 'static {
     fn health_samples(&self) -> Vec<(NodeId, NodeHealth)>;
 }
 
+/// Per-peer inventory axes — the resource / capability /
+/// version snapshot the Deck's NODE.INV column surfaces.
+/// Every field is `Option` or default-able so a probe can
+/// publish only the axes it actually samples (e.g. a host-
+/// resource probe might populate `cpu_load_1m` + `mem_*` but
+/// leave `capability_set` empty for a capability-only probe
+/// to fill in).
+///
+/// Maps 1:1 onto the corresponding fields on
+/// [`super::snapshot::PeerSnapshot`]; the snapshot fold copies
+/// each axis through unchanged.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PeerInventory {
+    /// 1-minute CPU load average.
+    pub cpu_load_1m: Option<f64>,
+    /// Host memory used, in bytes.
+    pub mem_used_bytes: Option<u64>,
+    /// Host memory cap, in bytes.
+    pub mem_total_bytes: Option<u64>,
+    /// Host disk used, in bytes.
+    pub disk_used_bytes: Option<u64>,
+    /// Host disk cap, in bytes.
+    pub disk_total_bytes: Option<u64>,
+    /// Rolling 0.0..=1.0 saturation score the probe computes
+    /// from its own signals.
+    pub saturation_trend: Option<f32>,
+    /// Capabilities the peer advertises.
+    pub capability_set: std::collections::BTreeSet<String>,
+    /// Substrate semver string.
+    pub software_version: Option<String>,
+    /// Fork-group origin, if the peer is a fork.
+    pub forked_from: Option<NodeId>,
+}
+
+/// Inventory probe — surfaces per-peer resource / capability
+/// / version axes on demand. Called once per Tick alongside
+/// the locality + health probes; partial samples are fine —
+/// a probe that only publishes some axes leaves others
+/// defaulted.
+pub trait InventoryProbe: Send + Sync + 'static {
+    /// Return the latest per-peer inventory snapshot. The loop
+    /// merges samples into state per Tick; later probes
+    /// overwrite earlier on the same peer.
+    fn inventory_samples(&self) -> Vec<(NodeId, PeerInventory)>;
+}
+
 /// Wraps a `ProximityGraph` and reports RTT samples by reading
 /// each known node's `latency_us`. Cheap — one DashMap iterate
 /// per Tick + integer conversion per entry.
