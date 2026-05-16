@@ -158,19 +158,3 @@ pub fn id_spans_styled(id: &str, id_style: Style) -> Vec<Span<'static>> {
 pub fn id_spans(id: &str) -> Vec<Span<'static>> {
     id_spans_styled(id, theme::text())
 }
-
-/// Label-first variant: `label.0xXXXX` — the human-readable
-/// label leads, hex follows as dim metadata. Used by survey
-/// views (NODES tab) where operators recognize peers by role
-/// before identifying by hex. Falls back to bare id when the
-/// fixture has no entry, same as the id-first variant.
-pub fn label_first_spans(id: &str, label_style: Style) -> Vec<Span<'static>> {
-    match label_of(id) {
-        Some(label) => vec![
-            Span::styled(label.to_string(), label_style),
-            Span::styled(".", theme::chrome()),
-            Span::styled(id.to_string(), theme::dim()),
-        ],
-        None => vec![Span::styled(id.to_string(), label_style)],
-    }
-}

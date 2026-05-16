@@ -19,6 +19,7 @@
 
 use net_sdk::deck::{
     DaemonHealthSnapshot, DaemonLifecycleSnapshot, DaemonSnapshot, LogRecord, MeshOsSnapshot,
+    MigrationPhaseSnapshot, MigrationSnapshot, NodeId,
 };
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -61,6 +62,7 @@ pub fn render(
     entry: &DaemonFocusEntry,
     live: &MeshOsSnapshot,
     logs: &[LogRecord],
+    this_node: NodeId,
 ) {
     // Cache the lineage grouping for the whole frame — both
     // the facts panel (lineage_info) and the group panel
@@ -80,7 +82,14 @@ pub fn render(
         ])
         .split(area);
 
-    render_facts_panel(frame, rows[0], entry, &groups);
+    // Resolve any in-flight migration for this daemon up front
+    // so the FACTS panel can decide whether to render the
+    // right-side migration sub-panel.
+    let migration = live
+        .in_flight_migrations
+        .iter()
+        .find(|m| m.daemon_origin == entry.id);
+    render_facts_panel(frame, rows[0], entry, &groups, migration, this_node);
     render_group_panel(frame, rows[1], entry, &groups, &rows_total);
     render_log_tail(frame, rows[2], entry.id, logs);
     let hint_row = Rect {
@@ -120,6 +129,8 @@ fn render_facts_panel(
     area: Rect,
     entry: &DaemonFocusEntry,
     groups: &[lineage::LiveGroup<'_>],
+    migration: Option<&MigrationSnapshot>,
+    this_node: NodeId,
 ) {
     let d = &entry.snapshot;
     let (group_kind, display_name, member_count, role) = lineage_info(entry, groups);
@@ -142,6 +153,27 @@ fn render_facts_panel(
         .title_alignment(Alignment::Left);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // Split the panel into left facts + (when there's a live
+    // migration for this daemon) a right-side MIGRATION column
+    // with a 1-col vertical divider between them. When no
+    // migration is in flight the left side takes the full
+    // width and the divider + right column drop out entirely.
+    let cols = if migration.is_some() {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Length(1), // divider
+                Constraint::Min(0),
+            ])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0)])
+            .split(inner)
+    };
 
     let lineage_line = match group_kind {
         LiveGroupKind::Solo => "standalone · no group".to_string(),
@@ -175,7 +207,7 @@ fn render_facts_panel(
         _ => (theme::chrome(), "—"),
     };
 
-    let mut placement_spans = vec![Span::styled("  placement   ", theme::chrome())];
+    let mut placement_spans = vec![Span::styled("  placement  ", theme::chrome())];
     placement_spans.extend(nodes::id_spans(&format!("0x{:x}", d.placement)));
     placement_spans.push(Span::styled(
         format!(" · saturation {:.2}", d.saturation),
@@ -184,23 +216,117 @@ fn render_facts_panel(
 
     let lines = vec![
         kv(
-            "identity    ",
+            "identity   ",
             &format!("ent.{}", short_id(entry.id)),
             theme::text(),
         ),
-        kv("lineage     ", &lineage_line, theme::text()),
-        kv("role        ", &role_line, theme::text()),
-        kv("kind        ", &display_name, theme::cyan()),
-        kv("lifecycle   ", &lifecycle_line, theme::green()),
-        kv("health      ", health_text, health_style),
+        kv("lineage    ", &lineage_line, theme::text()),
+        kv("role       ", &role_line, theme::text()),
+        kv("kind       ", &display_name, theme::cyan()),
+        kv("lifecycle  ", &lifecycle_line, theme::green()),
+        kv("health     ", health_text, health_style),
         Line::from(placement_spans),
         kv(
-            "restart     ",
+            "restart    ",
             &format!("{:?}", d.restart_state),
             theme::dim(),
         ),
     ];
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), cols[0]);
+
+    if let Some(m) = migration {
+        // Vertical divider — single column of light box-drawing
+        // characters between the FACTS columns. Drawn line-by-
+        // line so the height matches whatever `inner` resolved
+        // to (the FACTS panel is fixed at 10 inner rows but a
+        // future resize is honest about it).
+        let divider_lines: Vec<Line> = (0..cols[1].height)
+            .map(|_| Line::from(Span::styled("│", theme::rule())))
+            .collect();
+        frame.render_widget(Paragraph::new(divider_lines), cols[1]);
+        render_migration_panel(frame, cols[2], m, this_node);
+    }
+}
+
+/// Right-side MIGRATION sub-panel — mirrors the columns
+/// MIGRATIONS uses (role / size / phase / prog / retry /
+/// age-in-phase / elapsed) so the Daemon page reads as the
+/// per-daemon view of the same data.
+fn render_migration_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    m: &MigrationSnapshot,
+    this_node: NodeId,
+) {
+    let (role_text, role_style) = if this_node == m.target_node {
+        ("target", theme::green())
+    } else if this_node == m.source_node {
+        ("source", theme::cyan())
+    } else {
+        ("observer", theme::dim())
+    };
+    let size_text = match m.snapshot_bytes {
+        Some(n) => format_bytes(n),
+        None => "—".to_string(),
+    };
+    let (phase_style, phase_text) = match m.phase {
+        MigrationPhaseSnapshot::Snapshot => (theme::dim(), "Snapshot"),
+        MigrationPhaseSnapshot::Transfer => (theme::cyan(), "Transfer"),
+        MigrationPhaseSnapshot::Restore => (theme::cyan(), "Restore"),
+        MigrationPhaseSnapshot::Replay => (theme::cyan(), "Replay"),
+        MigrationPhaseSnapshot::Cutover => (theme::amber(), "Cutover"),
+        MigrationPhaseSnapshot::Complete => (theme::green(), "Complete"),
+        _ => (theme::chrome(), "?"),
+    };
+    let prog_text = match m.progress_pct {
+        Some(p) => format!("{p}%"),
+        None => "—".to_string(),
+    };
+    let retry_style = if m.retries == 0 {
+        theme::dim()
+    } else if m.retries < 3 {
+        theme::amber()
+    } else {
+        theme::red()
+    };
+    // Heading: a quiet section title so the right column reads
+    // as its own thing without competing with the DAEMON title.
+    let header_spans = vec![Span::styled(
+        "── MIGRATION ──",
+        theme::text(),
+    )];
+    let lines = vec![
+        Line::from(header_spans),
+        kv("role       ", role_text, role_style),
+        kv("size       ", &size_text, theme::text()),
+        kv("phase      ", phase_text, phase_style),
+        kv("prog       ", &prog_text, theme::text()),
+        kv("retry      ", &format!("{}", m.retries), retry_style),
+        kv("age        ", &format_age(m.age_in_phase_ms), theme::text()),
+        kv("elapsed    ", &format_age(m.elapsed_ms), theme::dim()),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Compact byte-count formatter — same shape the BLOBS /
+/// MIGRATIONS columns use, kept inline so the daemon page
+/// doesn't reach across tab modules.
+fn format_bytes(n: u64) -> String {
+    const KB: u64 = 1_024;
+    const MB: u64 = 1_024 * KB;
+    const GB: u64 = 1_024 * MB;
+    const TB: u64 = 1_024 * GB;
+    if n < KB {
+        format!("{n}B")
+    } else if n < MB {
+        format!("{:.1}KB", n as f64 / KB as f64)
+    } else if n < GB {
+        format!("{:.1}MB", n as f64 / MB as f64)
+    } else if n < TB {
+        format!("{:.1}GB", n as f64 / GB as f64)
+    } else {
+        format!("{:.1}TB", n as f64 / TB as f64)
+    }
 }
 
 fn lineage_info(

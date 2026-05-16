@@ -2578,7 +2578,14 @@ impl App {
         // the body until they Esc out.
         if let Some(focus) = self.daemon_focus.as_ref() {
             let logs = self.logs_tail.snapshot();
-            tabs::daemon_page::render(frame, chunks[3], focus, &self.snapshot, &logs);
+            tabs::daemon_page::render(
+                frame,
+                chunks[3],
+                focus,
+                &self.snapshot,
+                &logs,
+                self.this_node,
+            );
             widgets::footer::render(
                 frame,
                 chunks[4],
