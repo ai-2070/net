@@ -1,0 +1,21 @@
+net/crates/net/deck/src/app.rs
+  s_1154ed76acced2::t_3c31a4c2e50bc3 2918-2927
+net/crates/net/deck/src/streams.rs
+  s_1154ed76acced2::t_69c4ab182e5176 85-98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "47017fb75b9fd9a64911aa44611e4d6b063a46b7",
+  "prompts": {},
+  "sessions": {
+    "s_1154ed76acced2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7338ec16-8489-41da-930b-6d502753862d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
