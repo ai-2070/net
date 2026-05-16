@@ -1714,8 +1714,42 @@ impl App {
         }
     }
 
+    /// Number of FAILURES rows the render path will actually
+    /// emit given the current `/` search needle. Held under the
+    /// records lock to avoid cloning the full tail just to
+    /// count it.
+    fn visible_failures_count(&self) -> usize {
+        let needle = self.failures_search.to_ascii_lowercase();
+        let records = self.failures_tail.records.lock();
+        if needle.is_empty() {
+            return records.len();
+        }
+        records
+            .iter()
+            .filter(|r| tabs::failures::record_matches(r, &needle))
+            .count()
+    }
+
+    /// Number of BLOBS rows the render path will actually emit
+    /// given the current `/` search needle. Mirrors
+    /// [`Self::visible_failures_count`].
+    fn visible_blobs_count(&self) -> usize {
+        let needle = self.blobs_search.to_ascii_lowercase();
+        let records = self.blobs_tail.records.lock();
+        if needle.is_empty() {
+            return records.len();
+        }
+        records
+            .iter()
+            .filter(|r| tabs::blobs::record_matches(r, &needle))
+            .count()
+    }
+
     fn clamp_failures_cursor(&mut self) {
-        let n = self.failures_tail.records.lock().len();
+        // Clamp against the filtered count so the cursor + Enter
+        // target stay coherent with the visible rows when a `/`
+        // search narrows the list.
+        let n = self.visible_failures_count();
         if n == 0 {
             self.failures_cursor = 0;
         } else if self.failures_cursor >= n {
@@ -1724,7 +1758,7 @@ impl App {
     }
 
     fn clamp_blobs_cursor(&mut self) {
-        let n = self.blobs_tail.records.lock().len();
+        let n = self.visible_blobs_count();
         if n == 0 {
             self.blobs_cursor = 0;
         } else if self.blobs_cursor >= n {
@@ -1812,11 +1846,11 @@ impl App {
                 self.migration_cursor = n.saturating_sub(1);
             }
             Tab::Failures => {
-                let n = self.failures_tail.records.lock().len();
+                let n = self.visible_failures_count();
                 self.failures_cursor = n.saturating_sub(1);
             }
             Tab::Blobs => {
-                let n = self.blobs_tail.records.lock().len();
+                let n = self.visible_blobs_count();
                 self.blobs_cursor = n.saturating_sub(1);
             }
             Tab::Groups => {
