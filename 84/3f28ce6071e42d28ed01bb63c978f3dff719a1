@@ -1,0 +1,49 @@
+net/crates/net/deck/src/demo/spawn.rs
+  s_33e8c099a9039e::t_b779be2a246a41 293,399-400,429
+  s_33e8c099a9039e::t_b227a966162bc4 248
+net/crates/net/deck/src/demo/migrator.rs
+  s_33e8c099a9039e::t_b779be2a246a41 100,183
+net/crates/net/bindings/go/meshos-ffi/src/lib.rs
+  s_33e8c099a9039e::t_b779be2a246a41 59,61-62,534,616-617,786-789,807-808,841-843,894
+net/crates/net/sdk/src/testing/cluster.rs
+  s_33e8c099a9039e::t_b779be2a246a41 135,265-270,276,319,344,363,560-566,598-611
+net/crates/net/bindings/python/src/meshos.rs
+  s_33e8c099a9039e::t_b779be2a246a41 36,39-40,66,92,160-163,202-205,531-533,725-730,748,766-768,783-787,790-791
+net/crates/net/sdk/src/mesh.rs
+  s_33e8c099a9039e::t_b779be2a246a41 377
+net/crates/net/sdk/tests/cluster_harness.rs
+  s_33e8c099a9039e::t_b779be2a246a41 43,79
+net/crates/net/sdk/tests/cluster_supervisor.rs
+  s_33e8c099a9039e::t_b779be2a246a41 73-81
+net/crates/net/deck/src/demo/rpc_chatter.rs
+  s_33e8c099a9039e::t_b779be2a246a41 129
+  s_33e8c099a9039e::t_ebfce68c7c0f71 126,128,142,155
+net/crates/net/sdk/src/mesh_rpc.rs
+  s_33e8c099a9039e::t_b779be2a246a41 27-29
+net/crates/net/deck/src/demo/dataforts.rs
+  s_33e8c099a9039e::t_b779be2a246a41 27-35
+net/crates/net/src/adapter/net/mesh.rs
+  s_33e8c099a9039e::t_b779be2a246a41 1208,4695
+net/crates/net/bindings/node/src/meshos.rs
+  s_33e8c099a9039e::t_b779be2a246a41 41,44-45,289-292,394,440-442,445-451,940
+net/crates/net/sdk/tests/rpc_observer.rs
+  s_33e8c099a9039e::t_b779be2a246a41 109-113
+net/crates/net/deck/src/main.rs
+  s_33e8c099a9039e::t_8ffccd8060af0b 94
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "843f28ce6071e42d28ed01bb63c978f3dff719a1",
+  "prompts": {},
+  "sessions": {
+    "s_33e8c099a9039e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f5bf814-14c4-4dd9-b249-30bbae94726a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
