@@ -12,10 +12,33 @@ use ratatui::{
 use crate::{tabs, widgets};
 
 /// Restoration target when the operator presses `[Esc]` on
-/// LOGS after pivoting in via `[l]`. The variants capture the
-/// three contexts `filter_logs_for_id` is reachable from.
+/// LOGS after pivoting in via `[l]`. Captures both the
+/// navigation context (focus page / tab) and the LOGS-tab
+/// state the pivot clobbered (search / level filter / pause).
+/// Esc must restore both halves; otherwise an operator who
+/// paused at `Warn`, pivoted to inspect a daemon's logs, and
+/// Esc'd back would find their pause gone and the level filter
+/// stuck at Debug on the next visit.
 #[derive(Clone, Debug)]
-pub enum LogsBackTarget {
+pub struct LogsBackTarget {
+    /// Where the operator was — focus page or plain tab.
+    pub context: LogsBackContext,
+    /// `logs_search` value before `filter_logs_for_id`
+    /// overwrote it with the entity hex. Restored verbatim.
+    pub prior_search: String,
+    /// `logs_min_level` value before the pivot lowered it to
+    /// `Debug`. Restored verbatim.
+    pub prior_min_level: net_sdk::deck::LogLevel,
+    /// `logs_paused` value before the pivot cleared it.
+    /// Restored via move so the frozen-snapshot allocation
+    /// isn't duplicated.
+    pub prior_paused: Option<Vec<net_sdk::deck::LogRecord>>,
+}
+
+/// Navigation half of [`LogsBackTarget`] — the three
+/// contexts `filter_logs_for_id` is reachable from.
+#[derive(Clone, Debug)]
+pub enum LogsBackContext {
     /// Operator was on the DAEMON focus page (`daemon_focus`
     /// was set). Esc restores the focus entry verbatim.
     DaemonFocus(crate::tabs::daemon_page::DaemonFocusEntry),
@@ -826,50 +849,61 @@ impl App {
     /// any active node/daemon focus since the operator is now
     /// reading logs.
     fn filter_logs_for_id(&mut self, id: u64) {
-        // Capture where the operator came from so `[Esc]` on
-        // LOGS can return them — daemon focus, node focus, or
-        // a plain tab (NODES / DAEMONS / GROUPS / DATAFORTS).
-        // Focus-mode capture wins because it's the deeper
-        // context and the operator expects Esc to walk back
-        // up the stack, not snap to the tab the focus came
-        // from originally.
-        self.logs_back = if let Some(focus) = self.daemon_focus.as_ref() {
-            Some(LogsBackTarget::DaemonFocus(focus.clone()))
+        // Capture where the operator came from + the LOGS-tab
+        // state the pivot is about to clobber, so `[Esc]` on
+        // LOGS can restore both halves. Focus-mode capture
+        // wins because it's the deeper context and the
+        // operator expects Esc to walk back up the stack, not
+        // snap to the tab the focus came from originally.
+        let context = if let Some(focus) = self.daemon_focus.as_ref() {
+            LogsBackContext::DaemonFocus(focus.clone())
         } else if let Some(focus) = self.node_focus.as_ref() {
-            Some(LogsBackTarget::NodeFocus(focus.clone()))
+            LogsBackContext::NodeFocus(focus.clone())
         } else {
-            Some(LogsBackTarget::Tab(self.current))
+            LogsBackContext::Tab(self.current)
         };
+        self.logs_back = Some(LogsBackTarget {
+            context,
+            prior_search: std::mem::take(&mut self.logs_search),
+            prior_min_level: self.logs_min_level,
+            prior_paused: self.logs_paused.take(),
+        });
         self.logs_search = format!("0x{id:x}");
         self.logs_search_editing = false;
         self.logs_min_level = net_sdk::deck::LogLevel::Debug;
-        self.logs_paused = None;
         self.current = Tab::Logs;
         self.node_focus = None;
         self.daemon_focus = None;
     }
 
-    /// Restore the pre-`[l]` context. Clears the LOGS filter
-    /// the pivot installed so the operator doesn't see the
-    /// hex search persist after Esc — they came back to look
-    /// at the previous surface, not a stale-filter LOGS view
-    /// on next pivot.
+    /// Restore the pre-`[l]` context AND the LOGS-tab state the
+    /// pivot clobbered (search, level filter, pause). An
+    /// operator who paused at `Warn`, pivoted to inspect a
+    /// daemon's logs, and Esc'd back gets their pause + level
+    /// back; an operator who pivoted from a fresh LOGS view
+    /// gets fresh LOGS back. Any custom search the operator
+    /// typed on LOGS post-pivot is replaced by the pre-pivot
+    /// search — Esc-back means "undo the pivot", which
+    /// includes any temporary LOGS edits the pivot session
+    /// introduced.
     fn pop_logs_back(&mut self) -> bool {
         let Some(target) = self.logs_back.take() else {
             return false;
         };
-        self.logs_search = String::new();
+        self.logs_search = target.prior_search;
         self.logs_search_editing = false;
-        match target {
-            LogsBackTarget::DaemonFocus(focus) => {
+        self.logs_min_level = target.prior_min_level;
+        self.logs_paused = target.prior_paused;
+        match target.context {
+            LogsBackContext::DaemonFocus(focus) => {
                 self.daemon_focus = Some(focus);
                 self.node_focus = None;
             }
-            LogsBackTarget::NodeFocus(focus) => {
+            LogsBackContext::NodeFocus(focus) => {
                 self.node_focus = Some(focus);
                 self.daemon_focus = None;
             }
-            LogsBackTarget::Tab(tab) => {
+            LogsBackContext::Tab(tab) => {
                 self.current = tab;
             }
         }
