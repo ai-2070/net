@@ -549,6 +549,7 @@ impl MeshOsSnapshot {
     /// side; the loop reads it on publish) — the snapshot copies
     /// it so consumers see executor-side dispatch failures even
     /// when the chain-fold path is not wired up.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_state(
         actual: &MeshOsState,
         desired: &DesiredState,
