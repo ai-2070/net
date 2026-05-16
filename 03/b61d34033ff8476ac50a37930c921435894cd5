@@ -1,0 +1,39 @@
+net/crates/net/sdk/src/testing/mod.rs
+  s_33e8c099a9039e::t_453b7b03f4cb2b 1-36
+net/crates/net/sdk/src/testing/probes.rs
+  s_33e8c099a9039e::t_4c169382fa9639 1-157
+net/crates/net/sdk/src/lib.rs
+  s_33e8c099a9039e::t_eb88bf57c59e3c 63-64
+net/crates/net/sdk/Cargo.toml
+  s_33e8c099a9039e::t_a0a74338f07082 108-114
+net/crates/net/sdk/src/compute.rs
+  s_33e8c099a9039e::t_bf9bba222099b2 352
+  s_33e8c099a9039e::t_c858a9633ba892 245
+  s_33e8c099a9039e::t_2970028eaa5518 265
+  s_33e8c099a9039e::t_86b1127ada7179 184
+net/crates/net/sdk/src/testing/cluster.rs
+  s_33e8c099a9039e::t_bbed754e5c903c 193-201,209-222,229-244,247
+  s_33e8c099a9039e::t_a8f5fa027eb6c5 225
+  s_33e8c099a9039e::t_be426d033c347b 404-407
+  s_33e8c099a9039e::t_7e162ebcef86d6 127-131,135
+  s_33e8c099a9039e::t_ca1892917150a1 1-126,132-134,136-192,202-208,223-224,226-228,245-246,248-403,408-455
+net/crates/net/sdk/tests/cluster_harness.rs
+  s_33e8c099a9039e::t_88fb96fcb83ba1 103-108
+  s_33e8c099a9039e::t_8d372f31e77120 1-102,109-161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "03b61d34033ff8476ac50a37930c921435894cd5",
+  "prompts": {},
+  "sessions": {
+    "s_33e8c099a9039e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f5bf814-14c4-4dd9-b249-30bbae94726a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
