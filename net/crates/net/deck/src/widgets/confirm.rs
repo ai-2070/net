@@ -245,27 +245,26 @@ impl ConfirmAction {
             Self::RestartAllDaemons { daemon_count, .. } => vec![
                 format!("affects {daemon_count} daemon(s) on the host node"),
                 "each daemon is stopped and re-spawned by the supervisor".to_string(),
-                "fires `admin().restart_all_daemons(node)` — signed,".to_string(),
-                "lands on the admin chain with the operator's identity".to_string(),
+                "fires `admin().restart_all_daemons(node)`".to_string(),
             ],
             Self::Cordon { .. } => vec![
                 "stops new placements from landing on this node".to_string(),
                 "existing daemons + replicas stay; no eviction".to_string(),
                 "reversible via `[C]` (uncordon) without further effect".to_string(),
-                "fires `admin().cordon(node)` — signed, audit-logged".to_string(),
+                "fires `admin().cordon(node)`".to_string(),
             ],
             Self::Uncordon { .. } => vec![
                 "re-admits the node to the placement scorer".to_string(),
                 "new replicas + daemons may land here on the next pass".to_string(),
                 "no-op if the node was never cordoned".to_string(),
-                "fires `admin().uncordon(node)` — signed, audit-logged".to_string(),
+                "fires `admin().uncordon(node)`".to_string(),
             ],
             Self::Drain { drain_for, .. } => vec![
                 format!("drains the node within {}s", drain_for.as_secs()),
                 "kicks the maintenance state machine: Active →".to_string(),
                 "EnteringMaintenance → Maintenance → DrainFailed?".to_string(),
                 "replicas evacuate; daemons receive Shutdown control event".to_string(),
-                "fires `admin().drain(node, drain_for)` — signed, audit-logged".to_string(),
+                "fires `admin().drain(node, drain_for)`".to_string(),
             ],
             Self::EnterMaintenance { .. } => vec![
                 "begins an indefinite maintenance window".to_string(),
@@ -295,19 +294,16 @@ impl ConfirmAction {
                 format!("freezes cluster-wide action emission for {}s", ttl.as_secs()),
                 "reconcile + folds keep running; only outbound actions stop".to_string(),
                 "auto-thaws at the deadline; `[T]` cancels early".to_string(),
-                "ICE — multi-op signed; lands on the admin chain".to_string(),
             ],
             Self::IceThawCluster { .. } => vec![
                 "cancels an in-effect freeze immediately".to_string(),
                 "reconcile resumes action emission on the next tick".to_string(),
                 "no-op if no freeze is in effect".to_string(),
-                "ICE — multi-op signed; lands on the admin chain".to_string(),
             ],
             Self::IceForceRestartDaemon { .. } => vec![
                 "force-restarts the daemon, bypassing crash-loop backoff".to_string(),
                 "supervisor's BackingOff / CrashLooping gate is cleared".to_string(),
                 "use after operator-side recovery — not a routine retry".to_string(),
-                "ICE — multi-op signed; lands on the admin chain".to_string(),
             ],
             Self::DropReplicas { chains, .. } => vec![
                 format!("evicts {} replica(s) from this node", chains.len()),
@@ -319,27 +315,23 @@ impl ConfirmAction {
                 "flushes avoid-list entries cluster-wide".to_string(),
                 "every node clears its local avoid list".to_string(),
                 "reconcile may re-add entries on the next tick".to_string(),
-                "ICE — multi-op signed; lands on the admin chain".to_string(),
             ],
             Self::IceKillMigration { .. } => vec![
                 "aborts the in-flight migration on its host node".to_string(),
                 "MigrationOrchestrator drops the daemon's record".to_string(),
                 "no-op on nodes that aren't hosting this migration".to_string(),
-                "ICE — multi-op signed; lands on the admin chain".to_string(),
             ],
             Self::IceForceEvictReplica { .. } => vec![
                 "evicts the replica holder, bypassing scheduler".to_string(),
                 "cooldown + count-driven hysteresis".to_string(),
                 "elected chain leader emits the RequestEviction".to_string(),
                 "non-leaders fold the event but emit nothing".to_string(),
-                "ICE — multi-op signed; lands on the admin chain".to_string(),
             ],
             Self::IceForceCutover { .. } => vec![
                 "pins the chain's next placement to the target".to_string(),
                 "bypasses the placement scorer for one pass".to_string(),
                 "elected chain leader emits the RequestPlacement".to_string(),
                 "no-op if target is already a holder".to_string(),
-                "ICE — multi-op signed; lands on the admin chain".to_string(),
             ],
         }
     }
