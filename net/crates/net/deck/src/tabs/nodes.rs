@@ -117,13 +117,13 @@ fn render_live_nodes_table(
         };
         let mem_text = match (p.mem_used_bytes, p.mem_total_bytes) {
             (Some(used), Some(total)) if total > 0 => {
-                format!("{}%", (used * 100 / total).min(999))
+                format!("{}%", percent_u64(used, total))
             }
             _ => "—".to_string(),
         };
         let disk_text = match (p.disk_used_bytes, p.disk_total_bytes) {
             (Some(used), Some(total)) if total > 0 => {
-                format!("{}%", (used * 100 / total).min(999))
+                format!("{}%", percent_u64(used, total))
             }
             _ => "—".to_string(),
         };
@@ -217,6 +217,19 @@ fn cell_dim(s: &'static str) -> Cell<'static> {
 }
 
 /// Color a percentage-style pressure value (used/total) green
+/// Integer-percent of `used / total`, computed in u128 so a
+/// large `used` (close to `u64::MAX / 100`) doesn't silently
+/// overflow under release-mode wrapping arithmetic. Capped at
+/// 999 to leave room for the rare over-100% case (drift between
+/// usage reporting and the cap) without distorting the column.
+fn percent_u64(used: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let pct = (used as u128) * 100 / (total as u128);
+    pct.min(999) as u64
+}
+
 /// when comfortable, amber under load, red at capacity. Same
 /// thresholds the dataforts health gate uses (85% / 95%).
 fn pressure_style(used: Option<u64>, total: Option<u64>) -> ratatui::style::Style {
