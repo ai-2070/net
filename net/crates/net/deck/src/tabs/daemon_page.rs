@@ -132,6 +132,34 @@ fn render_facts_panel(
     migration: Option<&MigrationSnapshot>,
     this_node: NodeId,
 ) {
+    // Two side-by-side cells when there's an in-flight migration
+    // for this daemon: a DAEMON cell on the left + a MIGRATION
+    // cell on the right, each with its own bordered block. No
+    // migration → the DAEMON cell takes the full row.
+    let cols = if migration.is_some() {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Min(0)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0)])
+            .split(area)
+    };
+
+    render_daemon_cell(frame, cols[0], entry, groups);
+    if let Some(m) = migration {
+        render_migration_cell(frame, cols[1], m, this_node);
+    }
+}
+
+fn render_daemon_cell(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    entry: &DaemonFocusEntry,
+    groups: &[lineage::LiveGroup<'_>],
+) {
     let d = &entry.snapshot;
     let (group_kind, display_name, member_count, role) = lineage_info(entry, groups);
 
@@ -153,27 +181,6 @@ fn render_facts_panel(
         .title_alignment(Alignment::Left);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    // Split the panel into left facts + (when there's a live
-    // migration for this daemon) a right-side MIGRATION column
-    // with a 1-col vertical divider between them. When no
-    // migration is in flight the left side takes the full
-    // width and the divider + right column drop out entirely.
-    let cols = if migration.is_some() {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(50),
-                Constraint::Length(1), // divider
-                Constraint::Min(0),
-            ])
-            .split(inner)
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0)])
-            .split(inner)
-    };
 
     let lineage_line = match group_kind {
         LiveGroupKind::Solo => "standalone · no group".to_string(),
@@ -232,27 +239,15 @@ fn render_facts_panel(
             theme::dim(),
         ),
     ];
-    frame.render_widget(Paragraph::new(lines), cols[0]);
-
-    if let Some(m) = migration {
-        // Vertical divider — single column of light box-drawing
-        // characters between the FACTS columns. Drawn line-by-
-        // line so the height matches whatever `inner` resolved
-        // to (the FACTS panel is fixed at 10 inner rows but a
-        // future resize is honest about it).
-        let divider_lines: Vec<Line> = (0..cols[1].height)
-            .map(|_| Line::from(Span::styled("│", theme::rule())))
-            .collect();
-        frame.render_widget(Paragraph::new(divider_lines), cols[1]);
-        render_migration_panel(frame, cols[2], m, this_node);
-    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Right-side MIGRATION sub-panel — mirrors the columns
-/// MIGRATIONS uses (role / size / phase / prog / retry /
-/// age-in-phase / elapsed) so the Daemon page reads as the
-/// per-daemon view of the same data.
-fn render_migration_panel(
+/// Right-side MIGRATION cell — its own bordered block, mirrors
+/// the columns MIGRATIONS uses (role / size / phase / prog /
+/// retry / age-in-phase / elapsed) so the Daemon page reads as
+/// the per-daemon view of the same data. The PROG row renders
+/// a horizontal progress bar coloured by phase.
+fn render_migration_cell(
     frame: &mut Frame<'_>,
     area: Rect,
     m: &MigrationSnapshot,
@@ -278,10 +273,6 @@ fn render_migration_panel(
         MigrationPhaseSnapshot::Complete => (theme::green(), "Complete"),
         _ => (theme::chrome(), "?"),
     };
-    let prog_text = match m.progress_pct {
-        Some(p) => format!("{p}%"),
-        None => "—".to_string(),
-    };
     let retry_style = if m.retries == 0 {
         theme::dim()
     } else if m.retries < 3 {
@@ -289,23 +280,59 @@ fn render_migration_panel(
     } else {
         theme::red()
     };
-    // Heading: a quiet section title so the right column reads
-    // as its own thing without competing with the DAEMON title.
-    let header_spans = vec![Span::styled(
-        "── MIGRATION ──",
-        theme::text(),
-    )];
+
+    // Title shows the migration vector at a glance — operator
+    // doesn't have to scan the role + role-style to know
+    // direction. Source → target reads left-to-right.
+    let title = Line::from(vec![
+        Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+        Span::styled("MIGRATION", theme::green_hi()),
+        Span::styled(format!("    0x{:x}", m.source_node), theme::cyan()),
+        Span::styled("  →  ", theme::chrome()),
+        Span::styled(format!("0x{:x}", m.target_node), theme::cyan()),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::rule())
+        .title(title)
+        .title_alignment(Alignment::Left);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
     let lines = vec![
-        Line::from(header_spans),
         kv("role       ", role_text, role_style),
         kv("size       ", &size_text, theme::text()),
         kv("phase      ", phase_text, phase_style),
-        kv("prog       ", &prog_text, theme::text()),
+        progress_bar_line("prog       ", m.progress_pct, phase_style),
         kv("retry      ", &format!("{}", m.retries), retry_style),
         kv("age        ", &format_age(m.age_in_phase_ms), theme::text()),
         kv("elapsed    ", &format_age(m.elapsed_ms), theme::dim()),
     ];
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Inline progress bar: `label  ████████░░░░░░░░  30%`. Bar
+/// is 16 cells wide — fits in the migration cell's content
+/// width with room for the percent suffix. `None` → renders
+/// a row of `—` instead of an empty bar.
+fn progress_bar_line(label: &str, pct: Option<u8>, bar_style: Style) -> Line<'static> {
+    const WIDTH: usize = 16;
+    match pct {
+        Some(p) => {
+            let p = p.min(100);
+            let filled = (p as usize * WIDTH) / 100;
+            let bar: String = "█".repeat(filled) + &"░".repeat(WIDTH - filled);
+            Line::from(vec![
+                Span::styled(format!("  {label}"), theme::chrome()),
+                Span::styled(bar, bar_style),
+                Span::styled(format!("  {p}%"), theme::text()),
+            ])
+        }
+        None => Line::from(vec![
+            Span::styled(format!("  {label}"), theme::chrome()),
+            Span::styled("—".to_string(), theme::dim()),
+        ]),
+    }
 }
 
 use super::format_bytes;
