@@ -822,7 +822,7 @@ impl App {
         let local = self.local_datafort();
         crate::widgets::node_card::NodeCardView {
             id: self.this_node,
-            label: None,
+            label: Some("local".to_string()),
             is_local: true,
             health: Some("Healthy"),
             cpu_load_1m: local.cpu_load_1m,
@@ -1038,7 +1038,7 @@ impl App {
         }
         tabs::dataforts::DatafortEntry {
             id: self.this_node,
-            label: None,
+            label: Some("local".to_string()),
             is_local: true,
             health: Some("Healthy"),
             cpu_load_1m: Some(0.42),
@@ -1079,7 +1079,7 @@ impl App {
             self.modal = Some(Modal::BlobDetail {
                 entry: entry.clone(),
                 host_id: self.this_node,
-                host_label: None,
+                host_label: Some("local".to_string()),
             });
         }
     }

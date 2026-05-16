@@ -45,19 +45,23 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // 100 cols even with the cluster chip + version on the
     // right. Each chip stays self-describing via its label.
     let sep = || Span::styled(" · ", theme::chrome());
-    let cluster_style = if app.active_cluster == "local" {
-        theme::green_hi()
-    } else {
-        theme::amber()
-    };
 
     let mut left = vec![
         Span::styled("● ", theme::green()),
         Span::styled(mode_text, theme::green_hi()),
         sep(),
-        Span::styled(app.active_cluster.clone(), cluster_style),
-        sep(),
     ];
+    // Remote bookmarks get their cluster name in the header so
+    // an operator pivoting between clusters always sees which
+    // one they're on; the default `"local"` is implicit and
+    // gets omitted to keep the chrome quiet.
+    if app.active_cluster != "local" {
+        left.push(Span::styled(
+            app.active_cluster.clone(),
+            theme::amber(),
+        ));
+        left.push(sep());
+    }
 
     // peers: 17p 14H/2D/0U
     left.push(Span::styled(format!("{}p ", peers.total), theme::text()));
