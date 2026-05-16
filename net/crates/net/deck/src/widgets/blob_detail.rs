@@ -25,7 +25,7 @@ pub fn render(
     host_id: u64,
     host_label: Option<&str>,
 ) {
-    let modal_area = center(area, 80, 21);
+    let modal_area = center(area, 80, 23);
     frame.render_widget(Clear, modal_area);
 
     let block = Block::default()
@@ -53,7 +53,9 @@ pub fn render(
             Constraint::Length(1), // host
             Constraint::Length(1), // adapter
             Constraint::Length(1), // hash full
+            Constraint::Length(1), // size (NEW)
             Constraint::Length(1), // ref + pin
+            Constraint::Length(1), // replicas observed / target (NEW)
             Constraint::Length(1), // first seen
             Constraint::Length(1), // last seen
             Constraint::Length(1), // spacer
@@ -93,6 +95,16 @@ pub fn render(
     frame.render_widget(kv("host    ", &host_str), rows[2]);
     frame.render_widget(kv("adapter ", &entry.adapter_id), rows[3]);
     frame.render_widget(kv("hash    ", &entry.hash_hex), rows[4]);
+    // Payload size — `Option<u64>` on the SDK entry: `None` for
+    // hashes that entered the table via `incr` from a remote
+    // source (chunk lives on a peer, size is the peer's to
+    // advertise) or for adapters that don't track per-hash
+    // size cheaply.
+    let size_text = match entry.size_bytes {
+        Some(n) => format!("{} ({n} bytes)", crate::tabs::format_bytes(n)),
+        None => "—  (not advertised by this adapter)".to_string(),
+    };
+    frame.render_widget(kv("size    ", &size_text), rows[5]);
     frame.render_widget(
         kv(
             "ref     ",
@@ -102,15 +114,47 @@ pub fn render(
                 if entry.pinned { "  (pinned)" } else { "" }
             ),
         ),
-        rows[5],
+        rows[6],
+    );
+    // Replication — `observed / target` with a per-component
+    // dash when either side is unknown. Observed is the count
+    // of distinct nodes advertising the hash via the
+    // substrate's `causal:<hex>` capability tag; target is
+    // the adapter's configured replication factor.
+    let replicas_text = match (entry.replicas_observed, entry.replica_target) {
+        (Some(o), Some(t)) => {
+            let suffix = if (o as u32) < t {
+                "  under-replicated"
+            } else if o as u32 == t {
+                "  at target"
+            } else {
+                "  over-replicated"
+            };
+            format!("{o} / {t}{suffix}")
+        }
+        (None, Some(t)) => format!("—  /  {t}  (observer not wired)"),
+        (Some(o), None) => format!("{o}  /  —  (no target configured)"),
+        (None, None) => "—  (replication not governed by substrate)".to_string(),
+    };
+    let replicas_style = match (entry.replicas_observed, entry.replica_target) {
+        (Some(o), Some(t)) if (o as u32) < t => theme::amber(),
+        (Some(_), Some(_)) => theme::green(),
+        _ => theme::dim(),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  replicas ", theme::chrome()),
+            Span::styled(replicas_text, replicas_style),
+        ])),
+        rows[7],
     );
     frame.render_widget(
         kv("first   ", &fmt_unix_ms(entry.first_seen_unix_ms)),
-        rows[6],
+        rows[8],
     );
     frame.render_widget(
         kv("last    ", &fmt_unix_ms(entry.last_seen_unix_ms)),
-        rows[7],
+        rows[9],
     );
 
     let now_ms = unix_now_ms();
@@ -127,7 +171,7 @@ pub fn render(
             theme::text(),
         ),
     ]);
-    frame.render_widget(Paragraph::new(age_line), rows[9]);
+    frame.render_widget(Paragraph::new(age_line), rows[11]);
 
     // GC retention status — pure-logic mirror of
     // `should_sweep(entry, now, DEFAULT_RETENTION_FLOOR, false)`.
@@ -163,7 +207,7 @@ pub fn render(
             Span::styled("  gc      ", theme::chrome()),
             Span::styled(gc_text, gc_style),
         ])),
-        rows[10],
+        rows[12],
     );
 
     // Chunk channel is `MeshBlobAdapter`'s internal RedEX
@@ -182,13 +226,13 @@ pub fn render(
     } else {
         String::from("blob/?/?")
     };
-    frame.render_widget(kv("channel ", &channel), rows[11]);
+    frame.render_widget(kv("channel ", &channel), rows[13]);
 
     let notes = Line::from(vec![Span::styled(
         "  chunk-level granularity (BlobAdapter::list); logical-blob view needs substrate BlobRef index",
         theme::dim(),
     )]);
-    frame.render_widget(Paragraph::new(notes), rows[12]);
+    frame.render_widget(Paragraph::new(notes), rows[14]);
 
     let bindings = Line::from(vec![
         Span::styled("[Enter]", theme::green_hi()),
@@ -198,7 +242,7 @@ pub fn render(
     ]);
     frame.render_widget(
         Paragraph::new(bindings).alignment(Alignment::Center),
-        rows[13],
+        rows[15],
     );
 }
 
