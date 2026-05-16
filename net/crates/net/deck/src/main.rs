@@ -77,17 +77,14 @@ async fn main() -> color_eyre::Result<()> {
 
     let this_node = harness.this_node();
     let terminal = ratatui::init();
-    let app = App::new(
-        deck,
-        logs_tail,
-        audit_tail,
-        failures_tail,
-        blob_adapters.clone(),
-        blobs_tail.clone(),
-        nrpc_tail.clone(),
-        bookmarks,
-        this_node,
-    );
+    let tails = streams::Tails {
+        logs: logs_tail,
+        audit: audit_tail,
+        failures: failures_tail,
+        blobs: blobs_tail.clone(),
+        nrpc: nrpc_tail.clone(),
+    };
+    let app = App::new(deck, tails, blob_adapters.clone(), bookmarks, this_node);
     let _blobs_poll_task = if blob_adapters.is_empty() {
         None
     } else {

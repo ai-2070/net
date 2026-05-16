@@ -142,7 +142,7 @@ fn render_table(
             (None, None) => "—".to_string(),
         };
         let repl_style = match (e.replicas_observed, e.replica_target) {
-            (Some(o), Some(t)) if o < t as u32 => theme::amber(),
+            (Some(o), Some(t)) if o < t => theme::amber(),
             (Some(_), Some(_)) => theme::green(),
             _ => theme::dim(),
         };

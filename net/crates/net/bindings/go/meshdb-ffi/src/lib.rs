@@ -1941,11 +1941,9 @@ mod tests {
 
     #[test]
     fn ffi_last_error_starts_null_and_clears_correctly() {
-        unsafe {
-            net_meshdb_clear_last_error();
-            assert!(net_meshdb_last_error_message().is_null());
-            assert!(net_meshdb_last_error_kind().is_null());
-        }
+        net_meshdb_clear_last_error();
+        assert!(net_meshdb_last_error_message().is_null());
+        assert!(net_meshdb_last_error_kind().is_null());
     }
 
     #[test]

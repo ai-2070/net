@@ -10,6 +10,12 @@
 mod blob;
 #[cfg(feature = "net")]
 mod capabilities;
+#[cfg(any(
+    feature = "meshdb",
+    feature = "cortex",
+    feature = "compute",
+    feature = "groups"
+))]
 mod common;
 #[cfg(feature = "compute")]
 mod compute;

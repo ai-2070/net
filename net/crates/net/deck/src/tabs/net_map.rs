@@ -42,6 +42,12 @@ pub struct LocalAnchor<'a> {
     pub peer: &'a net_sdk::deck::PeerSnapshot,
 }
 
+/// Per-frame graph layout: the projected peer set + the edge
+/// adjacency pairs computed from `nearest_edges`. Aliased so
+/// the `render_graph` body can refer to it without tripping
+/// `clippy::type_complexity` on the bare nested-generic form.
+type GraphLayout = (Vec<LiveNode>, Vec<(usize, usize)>);
+
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -78,7 +84,7 @@ pub fn render_graph(
     // `spread_overlaps` and `nearest_edges` are O(n²) in the
     // peer count; doing them once and threading through the
     // title + the canvas avoids paying twice on every paint.
-    let layout: Option<(Vec<LiveNode>, Vec<(usize, usize)>)> = snapshot
+    let layout: Option<GraphLayout> = snapshot
         .filter(|s| !s.peers.is_empty() || local.is_some())
         .map(|s| {
             let nodes = project_live_peers(s, local.as_ref());

@@ -502,17 +502,20 @@ fn synthetic_greedy_view(node_id: u64, label: Option<&'static str>) -> tabs::dat
 impl App {
     pub fn new(
         deck: Arc<DeckClient>,
-        logs_tail: crate::streams::LogsTail,
-        audit_tail: crate::streams::AuditTail,
-        failures_tail: crate::streams::FailuresTail,
+        tails: crate::streams::Tails,
         blob_adapters: Vec<Arc<net_sdk::dataforts::MeshBlobAdapter>>,
-        blobs_tail: crate::streams::BlobsTail,
-        nrpc_tail: crate::streams::NrpcTail,
         bookmarks: crate::bookmarks::BookmarkStore,
         this_node: net_sdk::meshos::NodeId,
     ) -> Self {
         let snapshot = Arc::new(deck.status());
         let (toast_tx, toast_rx) = std::sync::mpsc::channel();
+        let crate::streams::Tails {
+            logs: logs_tail,
+            audit: audit_tail,
+            failures: failures_tail,
+            blobs: blobs_tail,
+            nrpc: nrpc_tail,
+        } = tails;
         Self {
             current: Tab::NetMap,
             logs_tail,

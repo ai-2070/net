@@ -156,20 +156,11 @@ static NEXT_CANCEL_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// `cancel_call` evicts orphans older than `ORPHAN_TTL` so a
 /// `reserve_token` + `cancel_call` flow whose `rpc_call` never
 /// runs doesn't leak a registry entry forever.
+#[derive(Default)]
 struct CancelEntry {
     cancelled: bool,
     handle: Option<tokio::task::AbortHandle>,
     marked_at: Option<std::time::Instant>,
-}
-
-impl Default for CancelEntry {
-    fn default() -> Self {
-        Self {
-            cancelled: false,
-            handle: None,
-            marked_at: None,
-        }
-    }
 }
 
 /// How long an orphaned (cancel-only, no live handle) registry

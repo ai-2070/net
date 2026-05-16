@@ -13,6 +13,51 @@ pub mod nodes;
 pub mod nrpc;
 pub mod replicas;
 
+/// Window an indexable list of `total` items into `body_h` rows
+/// while keeping `cursor` visible. Reserves a row for each of
+/// the top/bottom "N more" indicators only when those
+/// indicators would be non-empty, so a list that fits exactly
+/// still renders edge-to-edge.
+///
+/// Returns `(start, end, hidden_above, hidden_below)` — the
+/// visible slice is `start..end`.
+pub fn scroll_window(total: usize, body_h: usize, cursor: usize) -> (usize, usize, usize, usize) {
+    if total == 0 || body_h == 0 {
+        return (0, 0, 0, 0);
+    }
+    if total <= body_h {
+        return (0, total, 0, 0);
+    }
+    let cursor = cursor.min(total - 1);
+    let mut top_reserve = 0usize;
+    let mut bot_reserve = 0usize;
+    for _ in 0..3 {
+        let viewport = body_h.saturating_sub(top_reserve + bot_reserve);
+        if viewport == 0 {
+            return (cursor, cursor, cursor, total - cursor);
+        }
+        let half = viewport / 2;
+        let want_start = cursor.saturating_sub(half);
+        let want_end = (want_start + viewport).min(total);
+        let start = want_end.saturating_sub(viewport);
+        let end = want_end;
+        let need_top = if start > 0 { 1 } else { 0 };
+        let need_bot = if end < total { 1 } else { 0 };
+        if need_top == top_reserve && need_bot == bot_reserve {
+            return (start, end, start, total - end);
+        }
+        top_reserve = need_top;
+        bot_reserve = need_bot;
+    }
+    let viewport = body_h.saturating_sub(top_reserve + bot_reserve).max(1);
+    let half = viewport / 2;
+    let want_start = cursor.saturating_sub(half);
+    let want_end = (want_start + viewport).min(total);
+    let start = want_end.saturating_sub(viewport);
+    let end = want_end;
+    (start, end, start, total - end)
+}
+
 /// Tiered h/m/s renderer for an age expressed as elapsed
 /// milliseconds. Shared across every tab that surfaces a
 /// "X ago" column so the format stays consistent: `Xh YYm`

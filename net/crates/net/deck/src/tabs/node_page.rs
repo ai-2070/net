@@ -701,21 +701,36 @@ fn render_placement_panel(
         .collect();
     frame.render_widget(Paragraph::new(divider_lines), cols[1]);
 
+    // Each column reserves its first row for a header label;
+    // remaining rows are the scroll viewport.
+    let body_h = (cols[0].height as usize).saturating_sub(1);
+
     // Daemons on this node. The cursor walks this list; the
     // current row gets a `▶` marker and a brighter id color so
     // the operator can see which daemon `[Enter]` will open.
+    // When the list overflows the viewport, scroll to keep the
+    // cursor visible and surface hidden counts as ▲/▼ markers.
     let placement_cursor = if daemons_here.is_empty() {
         0
     } else {
         entry.placement_cursor.min(daemons_here.len() - 1)
     };
-    let mut daemon_lines: Vec<Line> = Vec::with_capacity(daemons_here.len() + 1);
+    let mut daemon_lines: Vec<Line> = Vec::new();
     daemon_lines.push(Line::from(vec![Span::styled("  DAEMONS", theme::chrome())]));
     if daemons_here.is_empty() {
         daemon_lines.push(Line::from(vec![Span::styled("    none", theme::dim())]));
     } else {
-        for (i, (id, d)) in daemons_here.iter().enumerate() {
-            let is_cursor = i == placement_cursor;
+        let (start, end, hidden_above, hidden_below) =
+            super::scroll_window(daemons_here.len(), body_h, placement_cursor);
+        if hidden_above > 0 {
+            daemon_lines.push(Line::from(vec![Span::styled(
+                format!("    ▲ {hidden_above} more"),
+                theme::dim(),
+            )]));
+        }
+        for (i, (id, d)) in daemons_here[start..end].iter().enumerate() {
+            let abs = start + i;
+            let is_cursor = abs == placement_cursor;
             let marker = if is_cursor { "  ▶ " } else { "    · " };
             let id_style = if is_cursor {
                 theme::green_hi()
@@ -729,24 +744,44 @@ fn render_placement_panel(
                 Span::styled(d.name.clone(), theme::text()),
             ]));
         }
+        if hidden_below > 0 {
+            daemon_lines.push(Line::from(vec![Span::styled(
+                format!("    ▼ {hidden_below} more"),
+                theme::dim(),
+            )]));
+        }
     }
     frame.render_widget(Paragraph::new(daemon_lines), cols[0]);
 
-    // Chains held by this node.
-    let mut chain_lines: Vec<Line> = Vec::with_capacity(chains_here.len() + 1);
+    // Chains held by this node. No cursor here, so the list is
+    // top-anchored; surface overflow as a trailing "+ N more"
+    // line so the operator sees the count even when clipped.
+    let mut chain_lines: Vec<Line> = Vec::new();
     chain_lines.push(Line::from(vec![Span::styled(
         "  CHAINS HELD",
         theme::chrome(),
     )]));
     if chains_here.is_empty() {
         chain_lines.push(Line::from(vec![Span::styled("    none", theme::dim())]));
-    } else {
+    } else if chains_here.len() <= body_h {
         for chain in &chains_here {
             chain_lines.push(Line::from(vec![
                 Span::styled("    · ", theme::chrome()),
                 Span::styled(format!("chain.0x{chain:x}"), theme::text()),
             ]));
         }
+    } else {
+        let shown = body_h.saturating_sub(1);
+        for chain in chains_here.iter().take(shown) {
+            chain_lines.push(Line::from(vec![
+                Span::styled("    · ", theme::chrome()),
+                Span::styled(format!("chain.0x{chain:x}"), theme::text()),
+            ]));
+        }
+        chain_lines.push(Line::from(vec![Span::styled(
+            format!("    + {} more", chains_here.len() - shown),
+            theme::dim(),
+        )]));
     }
     frame.render_widget(Paragraph::new(chain_lines), cols[2]);
 }

@@ -194,16 +194,34 @@ fn render_datafort_list(
 ) {
     let total = entries.len();
     let pos = cursor.min(total.saturating_sub(1)) + 1;
-    let header_line = Line::from(vec![
+    // Body height available for rows (excluding borders + header).
+    let body_h = (area.height as usize)
+        .saturating_sub(2) // top/bottom borders
+        .saturating_sub(1); // header row
+    let (start, end, hidden_above, hidden_below) = super::scroll_window(total, body_h, cursor);
+
+    let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("DATAFORTS", theme::green_hi()),
         Span::styled(format!("    {total} reachable"), theme::chrome()),
         Span::styled(format!("    {pos}/{total}"), theme::dim()),
-    ]);
+    ];
+    if hidden_above > 0 {
+        title_spans.push(Span::styled(
+            format!("    ▲ {hidden_above} more"),
+            theme::dim(),
+        ));
+    }
+    if hidden_below > 0 {
+        title_spans.push(Span::styled(
+            format!("    ▼ {hidden_below} more"),
+            theme::dim(),
+        ));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
-        .title(header_line);
+        .title(Line::from(title_spans));
     let header = Row::new(vec![
         cell_dim(" "),
         cell_dim("NODE"),
@@ -215,8 +233,9 @@ fn render_datafort_list(
     ])
     .height(1);
 
-    let mut rows: Vec<Row> = Vec::with_capacity(entries.len());
-    for (i, e) in entries.iter().enumerate() {
+    let mut rows: Vec<Row> = Vec::with_capacity(end.saturating_sub(start));
+    for (offset, e) in entries[start..end].iter().enumerate() {
+        let i = start + offset;
         let is_cursor = i == cursor;
         let marker = if is_cursor { "▶" } else { " " };
         let id_style = if is_cursor {
@@ -287,7 +306,8 @@ fn render_datafort_list(
     .header(header)
     .block(block)
     .column_spacing(2);
-    let mut state = TableState::default().with_selected(Some(cursor.min(total.saturating_sub(1))));
+    let selected = cursor.checked_sub(start).filter(|s| start + *s < end);
+    let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
 }
 

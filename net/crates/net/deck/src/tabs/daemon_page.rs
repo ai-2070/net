@@ -397,8 +397,21 @@ fn render_group_panel(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
-    for (i, r) in rows.iter().enumerate() {
+    // Scroll the row list to keep the cursor visible when the
+    // group has more members than the panel can show, and
+    // surface the hidden counts as ▲/▼ markers so the operator
+    // sees that there's more above/below the viewport.
+    let body_h = inner.height as usize;
+    let (start, end, hidden_above, hidden_below) = super::scroll_window(rows.len(), body_h, cursor);
+    let mut lines: Vec<Line> = Vec::with_capacity(end.saturating_sub(start) + 2);
+    if hidden_above > 0 {
+        lines.push(Line::from(vec![Span::styled(
+            format!("    ▲ {hidden_above} more"),
+            theme::dim(),
+        )]));
+    }
+    for (offset, r) in rows[start..end].iter().enumerate() {
+        let i = start + offset;
         let is_cursor = i == cursor;
         let marker = if is_cursor { "▶" } else { " " };
         let marker_style = theme::green_hi();
@@ -437,6 +450,12 @@ fn render_group_panel(
                 ]));
             }
         }
+    }
+    if hidden_below > 0 {
+        lines.push(Line::from(vec![Span::styled(
+            format!("    ▼ {hidden_below} more"),
+            theme::dim(),
+        )]));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }

@@ -338,18 +338,3 @@ pub(crate) fn record_matches(rec: &LogRecord, needle_lower: &str) -> bool {
     }
     false
 }
-
-fn format_ts_ms(ts_ms: u64) -> String {
-    // wall-clock-relative; show as HH:MM:SS.mmm so a record
-    // an hour old doesn't read identically to one a minute
-    // old. The prior MM:SS.mmm form dropped the hours
-    // component entirely and made multi-hour log windows
-    // ambiguous against the rest of the deck (NET.MAP /
-    // DAEMONS / DAEMON.PAGE all stamp `HH:MM:SS.mmm`).
-    let total_sec = ts_ms / 1_000;
-    let hh = total_sec / 3_600;
-    let mm = (total_sec / 60) % 60;
-    let ss = total_sec % 60;
-    let ms = ts_ms % 1_000;
-    format!("{hh:02}:{mm:02}:{ss:02}.{ms:03}")
-}

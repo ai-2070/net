@@ -181,6 +181,7 @@ struct Inner {
     /// returns the local node (with the right announcements) and
     /// places correctly. Revisit when a `MeshNode::local_caps()`
     /// getter lands.
+    #[cfg_attr(not(feature = "groups"), allow(dead_code))]
     scheduler: Arc<Scheduler>,
     /// Core factory registry, keyed by `origin_hash`. `spawn` mirrors
     /// each SDK-side kind registration into this map with the
@@ -241,6 +242,7 @@ struct Inner {
     /// Monotonic id minted by `register_deliver_observer`, used by
     /// the returned `ObserverHandle` to identify its entry on
     /// `Drop`/`unregister`.
+    #[cfg_attr(not(feature = "groups"), allow(dead_code))]
     observer_id_counter: std::sync::atomic::AtomicU64,
 }
 
@@ -260,6 +262,7 @@ pub(crate) type DeliverObserver = Arc<dyn Fn(&CausalEvent) + Send + Sync>;
 /// handle removes the observer from the runtime's per-origin
 /// observer list. Safe to drop after the runtime itself has been
 /// dropped: the `Weak` upgrade in `Drop` silently no-ops.
+#[cfg_attr(not(feature = "groups"), allow(dead_code))]
 pub(crate) struct ObserverHandle {
     runtime: std::sync::Weak<Inner>,
     origin: u64,
@@ -346,6 +349,7 @@ impl DaemonRuntime {
     ///
     /// `pub(crate)` — only the SDK's own group wrappers use this.
     /// See the `observers` field on [`Inner`] for the design rationale.
+    #[cfg_attr(not(feature = "groups"), allow(dead_code))]
     pub(crate) fn register_deliver_observer(
         &self,
         origin: u64,

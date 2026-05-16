@@ -409,3 +409,16 @@ pub fn spawn_blobs_poll(
         }
     })
 }
+
+/// Bundle of every render-side stream the App consumes. Each
+/// tail is independently cloneable (cheap `Arc` clone) so the
+/// bin can hold its own handle for the spawned drain tasks while
+/// still moving this struct into `App::new`. Keeps the App
+/// constructor under clippy's `too_many_arguments` ceiling.
+pub struct Tails {
+    pub logs: LogsTail,
+    pub audit: AuditTail,
+    pub failures: FailuresTail,
+    pub blobs: BlobsTail,
+    pub nrpc: NrpcTail,
+}
