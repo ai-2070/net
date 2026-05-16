@@ -238,12 +238,13 @@ fn percent_u64(used: u64, total: u64) -> u64 {
 /// when comfortable, amber under load, red at capacity. Same
 /// thresholds the dataforts health gate uses (85% / 95%).
 fn pressure_style(used: Option<u64>, total: Option<u64>) -> ratatui::style::Style {
+    use net_sdk::dataforts::{HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD};
     match (used, total) {
         (Some(u), Some(t)) if t > 0 => {
             let ratio = u as f64 / t as f64;
-            if ratio >= 0.95 {
+            if ratio >= HEALTH_GATE_EMIT_THRESHOLD {
                 theme::red()
-            } else if ratio >= 0.85 {
+            } else if ratio >= HEALTH_GATE_CLEAR_THRESHOLD {
                 theme::amber()
             } else {
                 theme::text()

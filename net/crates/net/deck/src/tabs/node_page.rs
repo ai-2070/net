@@ -795,13 +795,15 @@ fn maint_label(mirror: Option<MaintenanceMirrorSnapshot>) -> String {
     }
 }
 
-/// Pressure-band color: green steady, amber at ≥0.85, red at
-/// ≥0.95. Matches the dataforts health-gate thresholds the
-/// rest of the deck uses.
+/// Pressure-band color: green steady, amber at the clear
+/// threshold, red at the emit threshold. Wired to the
+/// dataforts health-gate constants so this view and the
+/// substrate's gate cross the same lines.
 fn pressure_color(ratio: f64) -> ratatui::style::Color {
-    if ratio >= 0.95 {
+    use net_sdk::dataforts::{HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD};
+    if ratio >= HEALTH_GATE_EMIT_THRESHOLD {
         theme::RED
-    } else if ratio >= 0.85 {
+    } else if ratio >= HEALTH_GATE_CLEAR_THRESHOLD {
         theme::AMBER
     } else {
         theme::GREEN_HI
@@ -809,9 +811,10 @@ fn pressure_color(ratio: f64) -> ratatui::style::Color {
 }
 
 fn pct_style(ratio: f64) -> ratatui::style::Style {
-    if ratio >= 0.95 {
+    use net_sdk::dataforts::{HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD};
+    if ratio >= HEALTH_GATE_EMIT_THRESHOLD {
         theme::red()
-    } else if ratio >= 0.85 {
+    } else if ratio >= HEALTH_GATE_CLEAR_THRESHOLD {
         theme::amber()
     } else {
         theme::text()
