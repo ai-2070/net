@@ -297,6 +297,23 @@ enum NodeActionKind {
     InvalidatePlacement,
 }
 
+/// Map a lowercase action keypress to its NodeActionKind. Used
+/// by both the NODES tab dispatcher and the NODE-page focus
+/// handler so the bindings stay aligned between the list and
+/// the dedicated page.
+fn node_action_for(code: KeyCode) -> Option<NodeActionKind> {
+    match code {
+        KeyCode::Char('c') => Some(NodeActionKind::Cordon),
+        KeyCode::Char('C') => Some(NodeActionKind::Uncordon),
+        KeyCode::Char('d') => Some(NodeActionKind::Drain),
+        KeyCode::Char('m') => Some(NodeActionKind::EnterMaintenance),
+        KeyCode::Char('M') => Some(NodeActionKind::ExitMaintenance),
+        KeyCode::Char('a') => Some(NodeActionKind::ClearAvoidList),
+        KeyCode::Char('i') => Some(NodeActionKind::InvalidatePlacement),
+        _ => None,
+    }
+}
+
 /// ICE commit pipeline shared by every ICE variant: simulate
 /// (binds `issued_at_ms` + `blast_hash`), sign with the
 /// deck's operator identity, commit the signed bundle. Errors
@@ -1094,6 +1111,15 @@ impl App {
             } else if matches!(code, KeyCode::Enter) {
                 self.dispatch_daemon_focus_enter();
                 return;
+            } else if matches!(code, KeyCode::Char('r')) {
+                self.propose_restart_all_daemons();
+                return;
+            } else if matches!(code, KeyCode::Char('R')) {
+                self.propose_ice_force_restart_daemon();
+                return;
+            } else if matches!(code, KeyCode::Char('?')) {
+                self.modal = Some(Modal::Help);
+                return;
             } else {
                 return;
             }
@@ -1114,6 +1140,27 @@ impl App {
                 return;
             } else if matches!(code, KeyCode::Enter) {
                 self.open_cursored_node_placement();
+                return;
+            } else if let Some(kind) = node_action_for(code) {
+                // Routine admin actions on the focused node —
+                // mirror NODES tab bindings so the operator can
+                // act without Esc-ing back to the list.
+                self.propose_node_action(kind);
+                return;
+            } else if matches!(code, KeyCode::Char('D')) {
+                self.propose_drop_replicas();
+                return;
+            } else if matches!(code, KeyCode::Char('F')) {
+                self.propose_ice_freeze();
+                return;
+            } else if matches!(code, KeyCode::Char('T')) {
+                self.propose_ice_thaw();
+                return;
+            } else if matches!(code, KeyCode::Char('A')) {
+                self.propose_ice_flush_avoid_lists();
+                return;
+            } else if matches!(code, KeyCode::Char('?')) {
+                self.modal = Some(Modal::Help);
                 return;
             } else {
                 return;
@@ -1488,11 +1535,16 @@ impl App {
 
     fn propose_ice_force_restart_daemon(&mut self) {
         use net_sdk::deck::{simulate_ice_proposal, DaemonRef, IceActionProposal};
-        let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
-        let Some(group) = groups.get(self.groups_cursor.group) else { return };
-        let Some(member) = group.members.get(self.groups_cursor.member) else { return };
-        let daemon_id = member.id;
-        let daemon_name = member.daemon.name.clone();
+        // Daemon focus targets the focused daemon; falls back to
+        // the GROUPS tab cursor when no Daemon page is open.
+        let (daemon_id, daemon_name) = if let Some(focus) = self.daemon_focus.as_ref() {
+            (focus.id, focus.snapshot.name.clone())
+        } else {
+            let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
+            let Some(group) = groups.get(self.groups_cursor.group) else { return };
+            let Some(member) = group.members.get(self.groups_cursor.member) else { return };
+            (member.id, member.daemon.name.clone())
+        };
         let action = IceActionProposal::ForceRestartDaemon {
             daemon: DaemonRef {
                 id: daemon_id,
@@ -1728,9 +1780,14 @@ impl App {
         ));
     }
 
-    /// Look up the NodeId at the LIST cursor position. Returns
-    /// `None` if the peers map is empty.
+    /// Resolve the NodeId the active admin action should target.
+    /// When the NODE page is open, that's the focused node;
+    /// otherwise the cursored peer on NODES. Returns `None`
+    /// only when nothing is focused and the peers map is empty.
     pub fn cursored_node(&self) -> Option<u64> {
+        if let Some(focus) = self.node_focus.as_ref() {
+            return Some(focus.id);
+        }
         self.snapshot
             .peers
             .keys()
@@ -2036,10 +2093,18 @@ impl App {
     /// cursored daemon's host node. No-op if no daemon is
     /// selected (empty snapshot, etc.).
     fn propose_restart_all_daemons(&mut self) {
-        let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
-        let Some(group) = groups.get(self.groups_cursor.group) else { return };
-        let Some(member) = group.members.get(self.groups_cursor.member) else { return };
-        let node = member.daemon.placement;
+        // Daemon focus targets its own placement; falls back to
+        // the GROUPS tab cursor when no Daemon page is open.
+        let placement = if let Some(focus) = self.daemon_focus.as_ref() {
+            Some(focus.snapshot.placement)
+        } else {
+            let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
+            groups
+                .get(self.groups_cursor.group)
+                .and_then(|g| g.members.get(self.groups_cursor.member))
+                .map(|m| m.daemon.placement)
+        };
+        let Some(node) = placement else { return };
         let node_display = format!(
             "0x{:x}{}",
             node,
@@ -2206,7 +2271,7 @@ impl App {
                 frame,
                 chunks[4],
                 self.current,
-                true,
+                widgets::footer::FocusKind::Daemon,
                 self.toast.as_ref().map(|(s, _)| s.as_str()),
             );
             self.render_modal_overlay(frame, area);
@@ -2240,7 +2305,7 @@ impl App {
                 frame,
                 chunks[4],
                 self.current,
-                true,
+                widgets::footer::FocusKind::Node,
                 self.toast.as_ref().map(|(s, _)| s.as_str()),
             );
             // Modal overlay still renders on top in case one
@@ -2367,7 +2432,7 @@ impl App {
             frame,
             chunks[4],
             self.current,
-            false,
+            widgets::footer::FocusKind::None,
             self.toast.as_ref().map(|(s, _)| s.as_str()),
         );
 

@@ -11,7 +11,22 @@ use crate::{app::Tab, theme};
 /// are actually wired on that tab — operators don't see options
 /// they can't use. Common keys (tab/jump/cursor/help/quit) are
 /// always present.
-pub fn render(frame: &mut Frame<'_>, area: Rect, current: Tab, in_focus: bool, toast: Option<&str>) {
+/// Focus context — which kind of page the operator is on, so
+/// the footer can advertise the right action keys.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FocusKind {
+    None,
+    Node,
+    Daemon,
+}
+
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    current: Tab,
+    focus: FocusKind,
+    toast: Option<&str>,
+) {
     // Active toast hijacks the footer row — confirmation
     // messages need to be visible against the binding hints.
     if let Some(msg) = toast {
@@ -19,27 +34,53 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, current: Tab, in_focus: bool, t
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    let line = if in_focus {
-        focus_chips()
-    } else {
-        tab_chips(current)
+    let line = match focus {
+        FocusKind::Node => node_focus_chips(),
+        FocusKind::Daemon => daemon_focus_chips(),
+        FocusKind::None => tab_chips(current),
     };
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// Chips shown while the operator is on a focused page (Node
-/// or Daemon — `Enter` drilldown). Most cluster actions don't
-/// apply at this scope; the row strips down to navigation +
-/// drill + exit.
-fn focus_chips() -> Line<'static> {
+/// Chips for the NODE page — mirrors the NODES tab's admin
+/// actions so an operator on the focused page sees the same
+/// keys they'd use from the list.
+fn node_focus_chips() -> Line<'static> {
+    let mut spans = base_nav();
+    spans.extend([
+        chip_key("Enter"),
+        chip_desc(" daemon   "),
+        chip_key("c/C"),
+        chip_desc(" cordon   "),
+        chip_key("d"),
+        chip_desc(" drain   "),
+        chip_key("m/M"),
+        chip_desc(" maint   "),
+        chip_key("a"),
+        chip_desc(" avoid   "),
+        chip_key("i"),
+        chip_desc(" inval   "),
+        chip_key("Esc"),
+        chip_desc(" back   "),
+        chip_key("q"),
+        chip_desc(" quit"),
+    ]);
+    Line::from(spans)
+}
+
+/// Chips for the DAEMON page — restart-all on the placement
+/// host + ICE force-restart on the daemon.
+fn daemon_focus_chips() -> Line<'static> {
     let mut spans = base_nav();
     spans.extend([
         chip_key("Enter"),
         chip_desc(" drill   "),
+        chip_key("r"),
+        chip_desc(" restart   "),
+        chip_key("R"),
+        chip_desc(" ICE restart   "),
         chip_key("Esc"),
         chip_desc(" back   "),
-        chip_key("?"),
-        chip_desc(" help   "),
         chip_key("q"),
         chip_desc(" quit"),
     ]);

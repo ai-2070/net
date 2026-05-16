@@ -102,7 +102,7 @@ fn render_graph(
                 .block(title_block)
                 .marker(Marker::Braille)
                 .x_bounds([-80.0, 80.0])
-                .y_bounds([-45.0, 70.0])
+                .y_bounds([-50.0, 50.0])
                 .paint(move |ctx| paint_live_graph(ctx, &peers, &edges, cursor));
             frame.render_widget(canvas, area);
         }
@@ -160,8 +160,8 @@ fn radial_layout(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
             let rtt_ms = p.rtt_ms.unwrap_or(max_rtt);
             let normalized = (rtt_ms.saturating_sub(min_rtt)) as f64 / range as f64;
             let radius_unit = (normalized * 0.8 + 0.15).clamp(0.15, 0.95);
-            let radius_x = radius_unit * 65.0;
-            let radius_y = radius_unit * 38.0;
+            let radius_x = radius_unit * 72.0;
+            let radius_y = radius_unit * 45.0;
             let x = radius_x * angle.cos();
             let y = radius_y * angle.sin();
             let health = p.health.unwrap_or(PeerHealthSnapshot::Healthy);
@@ -186,18 +186,18 @@ fn radial_layout(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
 /// randomness) thin the clumps out while preserving the
 /// overall layout topology.
 fn spread_overlaps(nodes: &mut [LiveNode]) {
-    const ITERATIONS: usize = 60;
+    const ITERATIONS: usize = 120;
     /// Minimum desired separation between any two nodes, in
-    /// canvas units. Roughly two glyph widths so labels don't
-    /// run over each other.
-    const MIN_DIST: f64 = 14.0;
+    /// canvas units. Sized to keep id labels (`0xXXXX` ≈ 6
+    /// columns wide) from clobbering each other.
+    const MIN_DIST: f64 = 22.0;
     const STRENGTH: f64 = 0.5;
     /// Canvas-clamp bounds — match the canvas `*_bounds` in
-    /// render_graph, with a 5-unit margin so labels fit.
-    const X_MIN: f64 = -75.0;
-    const X_MAX: f64 = 75.0;
-    const Y_MIN: f64 = -40.0;
-    const Y_MAX: f64 = 65.0;
+    /// render_graph with a small margin so labels fit.
+    const X_MIN: f64 = -76.0;
+    const X_MAX: f64 = 60.0; // narrower on the right so the cursor id_label fits
+    const Y_MIN: f64 = -47.0;
+    const Y_MAX: f64 = 47.0;
 
     for _ in 0..ITERATIONS {
         let n = nodes.len();
