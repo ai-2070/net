@@ -778,6 +778,19 @@ impl MeshOsLoop {
                 }
             }
         }
+        // Track inventory samples seen this tick so the GC pass
+        // below drops entries for peers no probe sees anymore.
+        // The map is probe-exclusive (no `MeshOsEvent` populates
+        // it), so it's safe to authoritatively prune from the
+        // probe pass. The rtt + node_health maps are also fed by
+        // `MeshOsEvent::{RttSample, NodeHealth}` event folds, so
+        // their per-tick prune would erase event-driven samples;
+        // those maps grow with proximity churn but the inventory
+        // leak the review flagged was per-peer multi-field and
+        // strictly worse.
+        let mut peers_seen_inventory: std::collections::HashSet<super::event::NodeId> =
+            std::collections::HashSet::new();
+        let mut inventory_succeeded = false;
         for probe in &inventory {
             let probe = Arc::clone(probe);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -785,7 +798,9 @@ impl MeshOsLoop {
             }));
             match result {
                 Ok(samples) => {
+                    inventory_succeeded = true;
                     for (peer, inv) in samples {
+                        peers_seen_inventory.insert(peer);
                         self.actual.inventory.insert(peer, inv);
                     }
                 }
@@ -796,6 +811,15 @@ impl MeshOsLoop {
                     );
                 }
             }
+        }
+        // Prune only when at least one probe succeeded —
+        // matches the per-probe "sample skipped this tick"
+        // semantic so an entirely-panicking probe pass doesn't
+        // erase the previous tick's data.
+        if inventory_succeeded {
+            self.actual
+                .inventory
+                .retain(|peer, _| peers_seen_inventory.contains(peer));
         }
     }
 
@@ -1470,6 +1494,79 @@ mod tests {
             count >= 1,
             "loop should have completed at least one reconcile pass despite probe panics",
         );
+    }
+
+    #[tokio::test]
+    async fn inventory_gc_drops_peers_no_probe_samples_anymore() {
+        // poll_probes used to insert per-peer inventory samples
+        // and never remove them. A peer that departed from
+        // proximity would leak into actual.inventory forever,
+        // surfacing in every snapshot until the process
+        // restarted. Pin the per-tick GC: an inventory probe
+        // whose sample set shrinks across ticks should leave
+        // actual.inventory pruned to match.
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+        use std::sync::Mutex;
+        struct ShrinkingProbe {
+            tick: AtomicUsize,
+            // Mutex so the trait method can mutate freely
+            // without &mut self.
+            samples_per_tick: Mutex<Vec<Vec<(u64, super::super::probes::PeerInventory)>>>,
+        }
+        impl super::super::probes::InventoryProbe for ShrinkingProbe {
+            fn inventory_samples(&self) -> Vec<(u64, super::super::probes::PeerInventory)> {
+                let t = self.tick.fetch_add(1, AOrdering::Relaxed);
+                let guard = self.samples_per_tick.lock().unwrap();
+                // Past the end of the scripted set, stick on the
+                // final entry so the steady state stays observed.
+                let idx = t.min(guard.len().saturating_sub(1));
+                guard.get(idx).cloned().unwrap_or_default()
+            }
+        }
+        let inv_with_cpu = |cpu: f64| super::super::probes::PeerInventory {
+            cpu_load_1m: Some(cpu),
+            ..Default::default()
+        };
+        let probe = Arc::new(ShrinkingProbe {
+            tick: AtomicUsize::new(0),
+            samples_per_tick: Mutex::new(vec![
+                vec![(0xA, inv_with_cpu(0.1)), (0xB, inv_with_cpu(0.2)), (0xC, inv_with_cpu(0.3))],
+                vec![(0xB, inv_with_cpu(0.2)), (0xC, inv_with_cpu(0.3))],
+                vec![(0xB, inv_with_cpu(0.2)), (0xC, inv_with_cpu(0.3))],
+            ]),
+        });
+        let registry = ProbeRegistry::new();
+        registry.add_inventory_probe(probe);
+        let cfg = MeshOsConfig {
+            tick_interval: StdDuration::from_millis(10),
+            ..fast_test_config()
+        };
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _actions_rx,
+            reader,
+        } = MeshOsLoop::new(cfg);
+        let loop_ = loop_.with_probe_registry(registry);
+        let task = tokio::spawn(loop_.run());
+        // Wait long enough for at least two ticks to fire so
+        // the second sample set (without peer 0xA) lands.
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        let snap = reader.read();
+        let inv_peers: std::collections::BTreeSet<u64> = snap
+            .peers
+            .iter()
+            .filter(|(_, p)| p.cpu_load_1m.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(StdDuration::from_secs(2), task).await;
+        assert!(
+            !inv_peers.contains(&0xA),
+            "peer 0xA stopped being sampled but still appears in the inventory: {inv_peers:?}",
+        );
+        assert!(inv_peers.contains(&0xB), "peer 0xB should still be sampled");
+        assert!(inv_peers.contains(&0xC), "peer 0xC should still be sampled");
     }
 
     #[tokio::test]
