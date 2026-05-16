@@ -61,18 +61,25 @@ fn render_graph(
     snapshot: Option<&MeshOsSnapshot>,
     cursor: usize,
 ) {
-    let live_peers: Option<Vec<LiveNode>> = snapshot
+    // Compute the layout + edge set once per frame. Both
+    // `spread_overlaps` and `nearest_edges` are O(n²) in the
+    // peer count; doing them once and threading through the
+    // title + the canvas avoids paying twice on every paint.
+    let layout: Option<(Vec<LiveNode>, Vec<(usize, usize)>)> = snapshot
         .filter(|s| !s.peers.is_empty())
-        .map(project_live_peers);
+        .map(|s| {
+            let nodes = project_live_peers(s);
+            let edges = nearest_edges(&nodes, 2);
+            (nodes, edges)
+        });
 
-    let title_text = match live_peers.as_ref() {
-        Some(peers) => {
+    let title_text = match layout.as_ref() {
+        Some((peers, edges)) => {
             let n = peers.len();
             let datafort_count = peers
                 .iter()
                 .filter(|p| p.role == NodeRole::Datafort)
                 .count();
-            let edges = nearest_edges(peers, 2);
             let pos = cursor.min(n.saturating_sub(1)) + 1;
             format!(
                 "    {} nodes · {} edges · {} dataforts    {}/{}",
@@ -96,11 +103,10 @@ fn render_graph(
         .title(header)
         .title_alignment(Alignment::Left);
 
-    match live_peers {
-        Some(peers) => {
+    match layout {
+        Some((peers, edges)) => {
             let n = peers.len();
             let cursor = cursor.min(n.saturating_sub(1));
-            let edges = nearest_edges(&peers, 2);
             let canvas = Canvas::default()
                 .block(title_block)
                 .marker(Marker::Braille)
@@ -244,8 +250,11 @@ fn angle_for(id: u64) -> f64 {
 
 /// For each peer, link to its k nearest neighbours by Euclidean
 /// distance in graph coordinates. De-duplicated so an edge
-/// (a, b) is the same as (b, a).
+/// (a, b) is the same as (b, a). Uses a HashSet for dedup so
+/// large peer sets don't pay O(n²k) on the per-frame
+/// `Vec::contains` scan.
 fn nearest_edges(peers: &[LiveNode], k: usize) -> Vec<(usize, usize)> {
+    let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
     let mut edges: Vec<(usize, usize)> = Vec::new();
     for (i, a) in peers.iter().enumerate() {
         let mut ranked: Vec<(usize, f64)> = peers
@@ -261,7 +270,7 @@ fn nearest_edges(peers: &[LiveNode], k: usize) -> Vec<(usize, usize)> {
         ranked.sort_by(|(_, da), (_, db)| da.partial_cmp(db).unwrap_or(std::cmp::Ordering::Equal));
         for (j, _) in ranked.into_iter().take(k) {
             let pair = if i < j { (i, j) } else { (j, i) };
-            if !edges.contains(&pair) {
+            if seen.insert(pair) {
                 edges.push(pair);
             }
         }
