@@ -104,7 +104,6 @@ fn render_table(
         cell_dim("STATUS"),
         cell_dim("AGE"),
         cell_dim("CHANNEL"),
-        cell_dim("LAST TOUCH"),
     ])
     .height(1);
 
@@ -158,12 +157,13 @@ fn render_table(
             ("quiet", theme::dim())
         };
         let age_text = format_relative(e.first_seen_unix_ms, now_ms);
-        // Channel preview: `blob/XX/…` — the leading two hex
-        // chars are the bucket prefix the adapter shards on,
-        // which is the part operators grep on. The detail
-        // modal renders the full channel.
+        // Channel: `blob/{bucket}/{rest_of_hash}` — the same
+        // path operators grep on against the adapter's
+        // tracing logs. Rendered in full; the table widget
+        // truncates at the column edge so wider terminals
+        // show more of the hash inline.
         let channel_text = if e.hash_hex.len() >= 2 && e.hash_hex.is_char_boundary(2) {
-            format!("blob/{}/…", &e.hash_hex[..2])
+            format!("blob/{}/{}", &e.hash_hex[..2], &e.hash_hex[2..])
         } else {
             "blob/?".to_string()
         };
@@ -176,10 +176,6 @@ fn render_table(
             Cell::from(Span::styled(status_text, status_style)),
             Cell::from(Span::styled(age_text, theme::dim())),
             Cell::from(Span::styled(channel_text, theme::chrome())),
-            Cell::from(Span::styled(
-                format_relative(e.last_seen_unix_ms, now_ms),
-                theme::text(),
-            )),
         ]));
     }
 
@@ -193,8 +189,7 @@ fn render_table(
             Constraint::Length(7),  // repl (e.g. "—/3" or "12/3")
             Constraint::Length(10), // status
             Constraint::Length(11), // age
-            Constraint::Length(11), // channel
-            Constraint::Min(0),     // last touch
+            Constraint::Min(0),     // channel (full path; truncates at column edge)
         ],
     )
     .header(header)
