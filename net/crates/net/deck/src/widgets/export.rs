@@ -59,6 +59,8 @@ pub fn write_logs(records: &[LogRecord]) -> Result<ExportResult, ExportError> {
         .map_err(|e| format!("write: {e}"))?;
         count += 1;
     }
+    use std::io::Write;
+    f.flush().map_err(|e| format!("flush: {e}"))?;
     Ok(ExportResult { path, count })
 }
 
@@ -93,6 +95,8 @@ pub fn write_audit(records: &[AdminAuditRecord]) -> Result<ExportResult, ExportE
         .map_err(|e| format!("write: {e}"))?;
         count += 1;
     }
+    use std::io::Write;
+    f.flush().map_err(|e| format!("flush: {e}"))?;
     Ok(ExportResult { path, count })
 }
 
@@ -114,6 +118,8 @@ pub fn write_blobs(entries: &[BlobInventoryEntry]) -> Result<ExportResult, Expor
         .map_err(|e| format!("write: {e}"))?;
         count += 1;
     }
+    use std::io::Write;
+    f.flush().map_err(|e| format!("flush: {e}"))?;
     Ok(ExportResult { path, count })
 }
 
@@ -134,6 +140,8 @@ pub fn write_failures(records: &[FailureRecord]) -> Result<ExportResult, ExportE
         .map_err(|e| format!("write: {e}"))?;
         count += 1;
     }
+    use std::io::Write;
+    f.flush().map_err(|e| format!("flush: {e}"))?;
     Ok(ExportResult { path, count })
 }
 
@@ -152,30 +160,43 @@ pub fn write_failures(records: &[FailureRecord]) -> Result<ExportResult, ExportE
 /// - Rust: replace the time-portion `-`s with `:` then
 ///   `chrono::DateTime::parse_from_rfc3339`.
 /// - JS: same un-mangle then `Date.parse`.
-fn open_unique(tab: &str) -> Result<(String, std::fs::File), ExportError> {
+fn open_unique(tab: &str) -> Result<(String, std::io::BufWriter<std::fs::File>), ExportError> {
     let now = chrono::Utc::now();
     // Filename-safe ISO 8601 — dashes everywhere; the
     // un-mangle to RFC3339 is `s/T(\d{2})-(\d{2})-/T$1:$2:/`.
     let stamp = now.format("%Y-%m-%dT%H-%M-%SZ").to_string();
+    // Resolve against the process's startup cwd so the
+    // recorded path is deterministic for the operator to find
+    // afterwards. `current_dir` failures fall back to the bare
+    // relative path (writeln will still land it in whatever
+    // the OS thinks is cwd).
+    let cwd = std::env::current_dir().ok();
     let base = format!("deck-{tab}-{stamp}");
     // Same-second collision retry: append `-1`, `-2`, …
     // until `create_new` succeeds. Caps at 100 attempts to
     // refuse to busy-loop if the directory is full / write-
     // protected.
     for attempt in 0..100 {
-        let path = if attempt == 0 {
+        let filename = if attempt == 0 {
             format!("{base}{EXTENSION}")
         } else {
             format!("{base}-{attempt}{EXTENSION}")
         };
+        let full_path = match cwd.as_ref() {
+            Some(d) => d.join(&filename),
+            None => std::path::PathBuf::from(&filename),
+        };
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)
+            .open(&full_path)
         {
-            Ok(f) => return Ok((path, f)),
+            // BufWriter so every writeln is amortised against
+            // an 8 KiB buffer; long log windows used to issue
+            // one syscall per line.
+            Ok(f) => return Ok((full_path.display().to_string(), std::io::BufWriter::new(f))),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("create {path}: {e}")),
+            Err(e) => return Err(format!("create {}: {e}", full_path.display())),
         }
     }
     Err(format!("create deck-{tab}-{stamp}: too many collisions"))
