@@ -180,12 +180,23 @@ pub struct DaemonSnapshot {
     /// Deck-side aggregations across multiple snapshots can
     /// still answer "which node hosts daemon 0xNN?" without
     /// the operator pivoting through a separate lookup.
+    ///
+    /// `#[serde(default)]` so JSON consumers built against an
+    /// older shape (no `placement` key) deserialize cleanly —
+    /// the field reads back as `0` (`NodeId::default()`) and the
+    /// caller can treat that as "unknown" rather than failing
+    /// the decode outright.
+    #[serde(default)]
     pub placement: NodeId,
     /// Milliseconds since the most recent `Started` lifecycle
     /// signal. `0` if the daemon never reported a start (still
     /// in `Stopped` lifecycle, or freshly registered before the
     /// supervisor confirmed). Useful for the Deck binary's
     /// per-daemon age column without leaking wall-clock state.
+    ///
+    /// `#[serde(default)]` for the same forward-compat reason
+    /// as `placement`.
+    #[serde(default)]
     pub age_ms: u64,
 }
 
@@ -272,11 +283,16 @@ pub struct ReplicaSnapshot {
 /// Fields after `maintenance` are the Feature-11 inventory
 /// axes — extended to give Deck a per-node resource view
 /// (`NODE_INVENTORY` per `DECK_PLAN.md` § Deferred work). All
-/// of them are `Option`-wrapped or default-able so the
-/// addition is non-breaking for existing consumers: a probe
-/// that doesn't sample the axis (or a node that doesn't expose
-/// it) leaves the field at its default (`None` / empty), and
-/// the snapshot fold simply doesn't populate it.
+/// of them are `Option`-wrapped or default-able and carry
+/// `#[serde(default)]` so a JSON consumer built against the
+/// older shape (no inventory keys) deserializes cleanly —
+/// missing fields read back at their default. For postcard,
+/// the wire is positional + length-prefixed: cross-binary
+/// postcard compatibility still requires both sides agree on
+/// the field count, so this defense is JSON-only. In-process
+/// (the substrate's `ArcSwap<MeshOsSnapshot>` path) the change
+/// is unconditionally safe because both encoder and decoder
+/// are the same binary.
 ///
 /// Note: `Copy` and `Eq` are dropped from the derive set
 /// because `capability_set: BTreeSet<String>` and
@@ -297,37 +313,46 @@ pub struct PeerSnapshot {
     /// when no resource probe is wired (lightweight containers
     /// without procfs / a node that opted out of host
     /// sampling).
+    #[serde(default)]
     pub cpu_load_1m: Option<f64>,
     /// Host memory currently used, in bytes. `None` when no
     /// resource probe is wired.
+    #[serde(default)]
     pub mem_used_bytes: Option<u64>,
     /// Host memory cap, in bytes. `None` when no resource
     /// probe is wired.
+    #[serde(default)]
     pub mem_total_bytes: Option<u64>,
     /// Host disk currently used, in bytes. Distinct from the
     /// dataforts blob-adapter disk: this is the *host* disk,
     /// not the per-adapter dataforts cap.
+    #[serde(default)]
     pub disk_used_bytes: Option<u64>,
     /// Host disk cap, in bytes.
+    #[serde(default)]
     pub disk_total_bytes: Option<u64>,
     /// Rolling 0.0..=1.0 saturation score the substrate
     /// computes from existing health-probe signals. `None`
     /// when no probe drives it. Operators dashboard this to
     /// spot peers under sustained pressure before they tip
     /// into `Degraded` health.
+    #[serde(default)]
     pub saturation_trend: Option<f32>,
     /// Capabilities the peer advertises. Empty when the peer
     /// hasn't published a capability set or when the local
     /// node's capability index hasn't indexed them yet. The
     /// capability strings match what the `capability_index`
     /// projection holds.
+    #[serde(default)]
     pub capability_set: std::collections::BTreeSet<String>,
     /// Substrate software version the peer is running, as a
     /// semver string. `None` when the peer hasn't advertised
     /// its version (older substrates before this surface).
+    #[serde(default)]
     pub software_version: Option<String>,
     /// For fork-group members, the origin node the fork
     /// descends from. `None` for non-fork peers.
+    #[serde(default)]
     pub forked_from: Option<NodeId>,
 }
 
@@ -920,6 +945,50 @@ mod tests {
         let json = serde_json::to_string(&snap).expect("encode json");
         let back2: MeshOsSnapshot = serde_json::from_str(&json).expect("decode json");
         assert_eq!(snap, back2);
+    }
+
+    #[test]
+    fn daemon_snapshot_decodes_legacy_json_without_placement_or_age() {
+        // Pre-`placement`/`age_ms` JSON shape. Reconstructed by
+        // hand so the test pins the contract: a Deck-SDK client
+        // built against the older schema can still decode a
+        // newer snapshot's per-daemon entries, and a substrate
+        // built today can still decode an older snapshot's
+        // entries without the new fields.
+        let legacy = r#"{
+            "name": "compute-A",
+            "lifecycle": "Running",
+            "health": "Healthy",
+            "saturation": 0.25,
+            "restart_state": "Idle"
+        }"#;
+        let back: DaemonSnapshot = serde_json::from_str(legacy).expect("decode legacy");
+        assert_eq!(back.name, "compute-A");
+        assert_eq!(back.lifecycle, DaemonLifecycleSnapshot::Running);
+        assert_eq!(back.placement, 0);
+        assert_eq!(back.age_ms, 0);
+    }
+
+    #[test]
+    fn peer_snapshot_decodes_legacy_json_without_inventory_fields() {
+        // Pre-inventory JSON shape: only `rtt_ms`, `health`,
+        // `maintenance`. The Feature-11 inventory axes (cpu /
+        // mem / disk / saturation_trend / capability_set /
+        // software_version / forked_from) must all default to
+        // None / empty when absent so a Deck SDK consumer
+        // bumping its substrate dep doesn't see decode failures.
+        let legacy = r#"{
+            "rtt_ms": 7,
+            "health": "Healthy",
+            "maintenance": "Active"
+        }"#;
+        let back: PeerSnapshot = serde_json::from_str(legacy).expect("decode legacy");
+        assert_eq!(back.rtt_ms, Some(7));
+        assert!(back.cpu_load_1m.is_none());
+        assert!(back.mem_used_bytes.is_none());
+        assert!(back.capability_set.is_empty());
+        assert!(back.software_version.is_none());
+        assert!(back.forked_from.is_none());
     }
 
     #[test]
