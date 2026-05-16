@@ -411,7 +411,7 @@ fn render_legend(frame: &mut Frame<'_>, area: Rect) {
         Span::styled("◆ ", theme::green_hi()),
         Span::styled("NODE   ", theme::dim()),
         Span::styled("■ ", theme::green_hi()),
-        Span::styled("DATAFORTS   ", theme::dim()),
+        Span::styled("DATAFORT   ", theme::dim()),
         Span::styled("◆ ", theme::amber()),
         Span::styled("DEGRADED   ", theme::dim()),
         Span::styled("◇ ", theme::red()),
