@@ -5,12 +5,12 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use std::collections::{HashMap, VecDeque};
 
 use crate::{
     app::DaemonCursor,
     lineage::{self, GroupKind as LiveGroupKind, LiveGroup, LiveMember, MemberRole as LiveRole},
     nodes, theme, widgets,
+    widgets::node_card::NodeCardView,
 };
 
 pub fn render(
@@ -18,7 +18,7 @@ pub fn render(
     area: Rect,
     snapshot: Option<&MeshOsSnapshot>,
     cursor: DaemonCursor,
-    saturation: &HashMap<u64, VecDeque<f32>>,
+    local_node: &NodeCardView,
     logs: &[LogRecord],
 ) {
     let cols = Layout::default()
@@ -35,7 +35,15 @@ pub fn render(
     if has_groups {
         let groups = groups.unwrap();
         render_list(frame, cols[0], &groups, cursor);
-        render_detail(frame, cols[1], &groups, cursor, saturation, logs);
+        render_detail(
+            frame,
+            cols[1],
+            &groups,
+            cursor,
+            snapshot,
+            local_node,
+            logs,
+        );
     } else {
         render_empty_list(frame, cols[0]);
         render_empty_detail(frame, cols[1]);
@@ -243,7 +251,8 @@ fn render_detail(
     area: Rect,
     groups: &[LiveGroup<'_>],
     cursor: DaemonCursor,
-    saturation: &HashMap<u64, VecDeque<f32>>,
+    snapshot: Option<&MeshOsSnapshot>,
+    local_node: &NodeCardView,
     logs: &[LogRecord],
 ) {
     let Some((group, member)) = groups
@@ -266,20 +275,73 @@ fn render_detail(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Resolve the NODE card for the daemon's placement: local
+    // gets the synthesized view passed in; remote peers come
+    // from `snapshot.peers`. `placement_card_h` sizes itself to
+    // 5 fixed lines (id/health/cpu/mem/disk) + 1 blank + 1 caps
+    // header + N caps + 2 borders.
+    let placement_view = resolve_placement_view(member.daemon, snapshot, local_node);
+    let card_h = (placement_view.capabilities.len().clamp(1, 6) as u16 + 9).min(14);
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),  // facts
-            Constraint::Length(8),  // host saturation
-            Constraint::Min(0),     // log tail
-            Constraint::Length(3),  // controls
+            Constraint::Length(8),       // facts
+            Constraint::Length(card_h),  // placement NODE card
+            Constraint::Min(0),          // log tail
+            Constraint::Length(3),       // controls
         ])
         .split(inner);
 
     render_facts(frame, rows[0], group, member);
-    render_saturation(frame, rows[1], member.daemon, saturation);
+    widgets::node_card::render(frame, rows[1], &placement_view);
     render_log_tail(frame, rows[2], member.id, logs);
     render_controls(frame, rows[3]);
+}
+
+fn resolve_placement_view(
+    daemon: &DaemonSnapshot,
+    snapshot: Option<&MeshOsSnapshot>,
+    local_node: &NodeCardView,
+) -> NodeCardView {
+    if daemon.placement == 0x0001 {
+        return local_node.clone();
+    }
+    let Some(snap) = snapshot else {
+        return NodeCardView {
+            id: daemon.placement,
+            label: nodes::label_of(&format!("0x{:x}", daemon.placement))
+                .map(|s| s.to_string()),
+            ..NodeCardView::default()
+        };
+    };
+    let Some((_, peer)) = snap.peers.iter().find(|(id, _)| **id == daemon.placement)
+    else {
+        return NodeCardView {
+            id: daemon.placement,
+            label: nodes::label_of(&format!("0x{:x}", daemon.placement))
+                .map(|s| s.to_string()),
+            ..NodeCardView::default()
+        };
+    };
+    NodeCardView {
+        id: daemon.placement,
+        label: nodes::label_of(&format!("0x{:x}", daemon.placement))
+            .map(|s| s.to_string()),
+        is_local: false,
+        health: match peer.health {
+            Some(net_sdk::deck::PeerHealthSnapshot::Healthy) => Some("Healthy"),
+            Some(net_sdk::deck::PeerHealthSnapshot::Degraded) => Some("Degraded"),
+            Some(net_sdk::deck::PeerHealthSnapshot::Unreachable) => Some("Unreachable"),
+            _ => None,
+        },
+        cpu_load_1m: peer.cpu_load_1m,
+        mem_used_bytes: peer.mem_used_bytes,
+        mem_total_bytes: peer.mem_total_bytes,
+        disk_used_bytes: peer.disk_used_bytes,
+        disk_total_bytes: peer.disk_total_bytes,
+        capabilities: peer.capability_set.iter().cloned().collect(),
+    }
 }
 
 fn render_facts(
@@ -343,25 +405,6 @@ fn render_facts(
         kv("restart    ", format!("{:?}", d.restart_state)),
     ];
     frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// Host-saturation histogram for the daemon's placement node.
-/// Deck-sampled rolling window (60 ticks ≈ 7s @ 120ms tick). The
-/// data is the substrate's `peer.saturation_trend` scalar — the
-/// same signal backpressure decisions read — so the curve is
-/// honest about being *host* saturation, not per-daemon.
-fn render_saturation(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    daemon: &DaemonSnapshot,
-    saturation: &HashMap<u64, VecDeque<f32>>,
-) {
-    let samples: Vec<f32> = saturation
-        .get(&daemon.placement)
-        .map(|q| q.iter().copied().collect())
-        .unwrap_or_default();
-    let node_hex = format!("0x{:x}", daemon.placement);
-    widgets::saturation::render(frame, area, "NODE", &node_hex, &samples);
 }
 
 /// Tail of log lines scoped to the cursored daemon. Pulls from

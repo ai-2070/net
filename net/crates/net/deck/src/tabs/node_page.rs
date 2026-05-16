@@ -27,9 +27,7 @@ use ratatui::{
     Frame,
 };
 
-use std::collections::{HashMap, VecDeque};
-
-use crate::{theme, widgets};
+use crate::theme;
 
 /// Snapshot of the focused peer + its id.
 #[derive(Clone, Debug)]
@@ -90,23 +88,17 @@ pub fn render(
     entry: &NodeFocusEntry,
     live: &MeshOsSnapshot,
     datafort: Option<&DatafortView>,
-    saturation: &HashMap<u64, VecDeque<f32>>,
 ) {
     // NODE panel grows with the capability tree so a node with
     // deep capability subtrees (sensor.radar.shortwave …) still
     // gets the full tree drawn instead of being clipped. Clamp to
-    // leave room for SATURATION + the optional DATAFORT + PLACEMENT.
+    // leave room for the optional DATAFORT + PLACEMENT.
     let cap_lines = count_cap_lines(&entry.peer.capability_set);
     let needed = 2 /* borders */ + 6 /* main rows */ + 1 /* spacer */ + cap_lines + 1;
     let datafort_h: u16 = match datafort {
         Some(v) => {
-            // Blob block: 1 status row + per-adapter rows (local
-            // only) or 1 caps row (remote). Greedy block: 4 rows
-            // of k/v when present. Plus 2 borders + 1 separator.
             let blob_rows = if v.is_local && !v.adapters.is_empty() {
                 v.adapters.len() as u16 + 1
-            } else if !v.is_local {
-                1
             } else {
                 1
             };
@@ -116,24 +108,12 @@ pub fn render(
         }
         None => 0,
     };
-    // Saturation block is 9 rows: 1 title + 1 chips + ~5 bars +
-    // 1 axis + 1 spacer for the top border. Skip when the node
-    // has no samples yet (would render a "no samples" placeholder
-    // that wastes a band).
-    let has_sat = saturation
-        .get(&entry.id)
-        .map(|q| !q.is_empty())
-        .unwrap_or(false);
-    let sat_h: u16 = if has_sat { 9 } else { 0 };
     let panel_h = (needed as u16)
         .max(12)
-        .min(area.height.saturating_sub(8 + datafort_h + sat_h));
+        .min(area.height.saturating_sub(8 + datafort_h));
 
     let mut constraints: Vec<Constraint> = Vec::new();
     constraints.push(Constraint::Length(panel_h));
-    if sat_h > 0 {
-        constraints.push(Constraint::Length(sat_h));
-    }
     if datafort_h > 0 {
         constraints.push(Constraint::Length(datafort_h));
     }
@@ -145,19 +125,9 @@ pub fn render(
         .constraints(constraints)
         .split(area);
 
-    // Walk through `rows` in the order we built constraints.
     let mut i = 0;
     render_peer_panel(frame, rows[i], entry);
     i += 1;
-    if sat_h > 0 {
-        let samples: Vec<f32> = saturation
-            .get(&entry.id)
-            .map(|q| q.iter().copied().collect())
-            .unwrap_or_default();
-        let node_hex = format!("0x{:x}", entry.id);
-        widgets::saturation::render(frame, rows[i], "SATURATION", &node_hex, &samples);
-        i += 1;
-    }
     if let Some(v) = datafort {
         render_datafort_panel(frame, rows[i], entry, v);
         i += 1;

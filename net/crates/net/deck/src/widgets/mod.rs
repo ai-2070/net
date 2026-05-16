@@ -8,7 +8,7 @@ pub mod footer;
 pub mod help;
 pub mod param_input;
 pub mod pick_node;
+pub mod node_card;
 pub mod rule;
-pub mod saturation;
 pub mod status_bar;
 pub mod tab_bar;

@@ -89,14 +89,6 @@ pub struct App {
     /// collections are empty to decide between live and
     /// fixture rendering paths.
     pub snapshot: Arc<MeshOsSnapshot>,
-    /// Deck-sampled host saturation ring per node. The DAEMONS
-    /// detail panel reads the cursored daemon's host curve from
-    /// here; the data source is the substrate's per-peer
-    /// `saturation_trend` scalar, sampled once per tick and
-    /// capped at 60 most-recent samples per node. Semantically
-    /// this is the host (placement) saturation, not per-daemon —
-    /// daemons sharing a node share the curve.
-    pub saturation_history: std::collections::HashMap<u64, std::collections::VecDeque<f32>>,
     /// Phase-4 streaming tail for LOGS. Fed by a background
     /// `subscribe_logs` task; the LOGS render path reads from
     /// this buffer instead of `snapshot.log_ring`, so the
@@ -413,7 +405,6 @@ impl App {
             tick: 0,
             deck,
             snapshot,
-            saturation_history: std::collections::HashMap::new(),
             daemon_cursor: DaemonCursor::default(),
             netmap_cursor: 0,
             list_cursor: 0,
@@ -461,31 +452,6 @@ impl App {
 
     fn refresh_snapshot(&mut self) {
         self.snapshot = Arc::new(self.deck.status());
-        self.sample_saturation();
-    }
-
-    /// Push the current `peer.saturation_trend` into each peer's
-    /// ring buffer. Keeps 60 most-recent samples per node so the
-    /// DAEMONS detail panel can render the host's saturation as
-    /// a rolling histogram. Peers that vanish from the snapshot
-    /// have their history dropped (next reappearance starts a
-    /// fresh buffer).
-    fn sample_saturation(&mut self) {
-        const CAP: usize = 60;
-        let mut live: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for (id, peer) in self.snapshot.peers.iter() {
-            live.insert(*id);
-            let sample = peer.saturation_trend.unwrap_or(0.0);
-            let buf = self
-                .saturation_history
-                .entry(*id)
-                .or_insert_with(std::collections::VecDeque::new);
-            buf.push_back(sample);
-            while buf.len() > CAP {
-                buf.pop_front();
-            }
-        }
-        self.saturation_history.retain(|id, _| live.contains(id));
     }
 
     /// 3-second decay on toast messages so a confirmation
@@ -660,6 +626,27 @@ impl App {
                 peer: peer.clone(),
                 source: None,
             });
+        }
+    }
+
+    /// Snapshot of the deck's local node as a `NodeCardView`.
+    /// Used by the DAEMONS detail panel when the cursored
+    /// daemon's placement is the local node (`0x0001`) — that id
+    /// isn't in `snapshot.peers`, so we synthesize it here from
+    /// the same data the DATAFORTS local row reads.
+    fn local_node_card(&self) -> crate::widgets::node_card::NodeCardView {
+        let local = self.local_datafort();
+        crate::widgets::node_card::NodeCardView {
+            id: 0x0001,
+            label: Some("local".to_string()),
+            is_local: true,
+            health: Some("Healthy"),
+            cpu_load_1m: local.cpu_load_1m,
+            mem_used_bytes: local.mem_used_bytes,
+            mem_total_bytes: local.mem_total_bytes,
+            disk_used_bytes: local.disk_used_bytes,
+            disk_total_bytes: local.disk_total_bytes,
+            capabilities: local.capabilities.clone(),
         }
     }
 
@@ -2140,7 +2127,6 @@ impl App {
                 focus,
                 &self.snapshot,
                 datafort.as_ref(),
-                &self.saturation_history,
             );
             widgets::footer::render(
                 frame,
@@ -2181,12 +2167,13 @@ impl App {
             }
             Tab::Daemon => {
                 let logs = self.logs_tail.snapshot();
+                let local_node = self.local_node_card();
                 tabs::daemon::render(
                     frame,
                     chunks[3],
                     Some(&self.snapshot),
                     self.daemon_cursor,
-                    &self.saturation_history,
+                    &local_node,
                     &logs,
                 );
             }
