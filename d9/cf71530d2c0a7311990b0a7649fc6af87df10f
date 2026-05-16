@@ -1,0 +1,30 @@
+net/crates/net/deck/src/widgets/help.rs
+  s_3bbc444b3ef3e5::t_7f34e064745d46 22
+net/crates/net/deck/src/app.rs
+  s_3bbc444b3ef3e5::t_e6d3cafb7d45bc 1065-1066,1069
+  s_3bbc444b3ef3e5::t_0271e593f8a32d 1153-1155,1162-1165
+  s_3bbc444b3ef3e5::t_97d5548e18d7b9 30-31,33-36,46-47
+  s_3bbc444b3ef3e5::t_c3916e0855203e 623-627
+  s_3bbc444b3ef3e5::t_bc06eb9d964a84 764
+  s_3bbc444b3ef3e5::t_ada01adb4a5906 496
+net/crates/net/deck/src/widgets/tab_bar.rs
+  s_3bbc444b3ef3e5::t_20015004723245 23-32
+net/crates/net/deck/src/widgets/footer.rs
+  s_3bbc444b3ef3e5::t_9a5407b60e2249 158
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "d9cf71530d2c0a7311990b0a7649fc6af87df10f",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
