@@ -31,6 +31,17 @@ use ratatui::{
 
 use crate::{theme, widgets};
 
+/// The local node, threaded into the NET.MAP layout so it
+/// renders at the canvas center and participates in the
+/// repulsion pass that spreads overlapping peers apart. The
+/// substrate's `snapshot.peers` excludes self; the deck
+/// synthesizes the entry from the local datafort and passes
+/// it down here.
+pub struct LocalAnchor<'a> {
+    pub id: net_sdk::deck::NodeId,
+    pub peer: &'a net_sdk::deck::PeerSnapshot,
+}
+
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -38,6 +49,7 @@ pub fn render(
     snapshot: Option<&MeshOsSnapshot>,
     cursor: usize,
     logs: &[LogRecord],
+    local: Option<LocalAnchor<'_>>,
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -48,27 +60,28 @@ pub fn render(
         ])
         .split(area);
 
-    render_graph(frame, rows[0], snapshot, cursor);
+    render_graph(frame, rows[0], snapshot, cursor, local);
     render_events(frame, rows[1], logs);
     render_legend(frame, rows[2]);
 }
 
 // ───────────────────────── graph ─────────────────────────
 
-fn render_graph(
+pub fn render_graph(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: Option<&MeshOsSnapshot>,
     cursor: usize,
+    local: Option<LocalAnchor<'_>>,
 ) {
     // Compute the layout + edge set once per frame. Both
     // `spread_overlaps` and `nearest_edges` are O(n²) in the
     // peer count; doing them once and threading through the
     // title + the canvas avoids paying twice on every paint.
     let layout: Option<(Vec<LiveNode>, Vec<(usize, usize)>)> = snapshot
-        .filter(|s| !s.peers.is_empty())
+        .filter(|s| !s.peers.is_empty() || local.is_some())
         .map(|s| {
-            let nodes = project_live_peers(s);
+            let nodes = project_live_peers(s, local.as_ref());
             let edges = nearest_edges(&nodes, 2);
             (nodes, edges)
         });
@@ -145,43 +158,60 @@ struct LiveNode {
     role: NodeRole,
 }
 
-fn project_live_peers(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
-    let mut nodes = radial_layout(snapshot);
+fn project_live_peers(snapshot: &MeshOsSnapshot, local: Option<&LocalAnchor<'_>>) -> Vec<LiveNode> {
+    let mut nodes = radial_layout(snapshot, local);
     spread_overlaps(&mut nodes);
     nodes
 }
 
-fn radial_layout(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
+fn radial_layout(snapshot: &MeshOsSnapshot, local: Option<&LocalAnchor<'_>>) -> Vec<LiveNode> {
     let observed: Vec<u64> = snapshot.peers.values().filter_map(|p| p.rtt_ms).collect();
     let min_rtt = observed.iter().copied().min().unwrap_or(0);
     let max_rtt = observed.iter().copied().max().unwrap_or(0);
     let range = max_rtt.saturating_sub(min_rtt).max(1);
 
-    snapshot
-        .peers
-        .iter()
-        .map(|(id, p)| {
-            let angle = angle_for(*id);
-            let rtt_ms = p.rtt_ms.unwrap_or(max_rtt);
-            let normalized = (rtt_ms.saturating_sub(min_rtt)) as f64 / range as f64;
-            let radius_unit = (normalized * 0.8 + 0.15).clamp(0.15, 0.95);
-            let radius_x = radius_unit * 72.0;
-            let radius_y = radius_unit * 45.0;
-            let x = radius_x * angle.cos();
-            let y = radius_y * angle.sin();
-            let health = p.health.unwrap_or(PeerHealthSnapshot::Healthy);
-            let label = crate::nodes::label_for(&format!("0x{:x}", *id), &p.capability_set);
-            let role = classify_role(&p.capability_set);
-            LiveNode {
-                id: *id,
-                label,
-                x,
-                y,
-                health,
-                role,
-            }
-        })
-        .collect()
+    let mut out: Vec<LiveNode> = Vec::with_capacity(snapshot.peers.len() + local.is_some() as usize);
+    // Local node anchors at the canvas origin: the operator's
+    // node is the "you-are-here" pin. Remote peers radiate
+    // outward by RTT, and `spread_overlaps` pushes any peer
+    // crowding the center back out — that's the geometric /
+    // minimal-distance distribution the layout promises.
+    if let Some(anchor) = local {
+        let label =
+            crate::nodes::label_for(&format!("0x{:x}", anchor.id), &anchor.peer.capability_set);
+        let role = classify_role(&anchor.peer.capability_set);
+        out.push(LiveNode {
+            id: anchor.id,
+            label,
+            x: 0.0,
+            y: 0.0,
+            health: PeerHealthSnapshot::Healthy,
+            role,
+        });
+    }
+
+    out.extend(snapshot.peers.iter().map(|(id, p)| {
+        let angle = angle_for(*id);
+        let rtt_ms = p.rtt_ms.unwrap_or(max_rtt);
+        let normalized = (rtt_ms.saturating_sub(min_rtt)) as f64 / range as f64;
+        let radius_unit = (normalized * 0.8 + 0.15).clamp(0.15, 0.95);
+        let radius_x = radius_unit * 72.0;
+        let radius_y = radius_unit * 45.0;
+        let x = radius_x * angle.cos();
+        let y = radius_y * angle.sin();
+        let health = p.health.unwrap_or(PeerHealthSnapshot::Healthy);
+        let label = crate::nodes::label_for(&format!("0x{:x}", *id), &p.capability_set);
+        let role = classify_role(&p.capability_set);
+        LiveNode {
+            id: *id,
+            label,
+            x,
+            y,
+            health,
+            role,
+        }
+    }));
+    out
 }
 
 /// Push overlapping nodes apart with pairwise repulsion. The

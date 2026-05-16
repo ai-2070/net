@@ -581,11 +581,23 @@ impl App {
     /// stays stable across a subsequent tick under the focused
     /// id.
     fn focus_node(&mut self, peer_index: usize) {
+        // NET.MAP layout is `[local, ...peers]` — cursor 0
+        // resolves to the local node. Route through the
+        // existing `focus_host` so the local synthesis path
+        // and remote-peer lookup share one entry point.
+        if peer_index == 0 {
+            let label = crate::nodes::label_for(
+                &format!("0x{:x}", self.this_node),
+                &self.local_peer_snapshot().capability_set,
+            );
+            self.focus_host(self.this_node, label);
+            return;
+        }
         let pair = self
             .snapshot
             .peers
             .iter()
-            .nth(peer_index)
+            .nth(peer_index - 1)
             .map(|(id, p)| (*id, p.clone()));
         if let Some((id, peer)) = pair {
             let label = crate::nodes::label_for(&format!("0x{id:x}"), &peer.capability_set);
@@ -768,6 +780,31 @@ impl App {
     /// takes an explicit id rather than a peer-index — the host
     /// is often the local node, which doesn't live in
     /// `snapshot.peers`.
+    /// Build a `PeerSnapshot` representing the local node from
+    /// the synthetic datafort fixture data. The substrate's fold
+    /// never inserts the local node into `snapshot.peers` (probes
+    /// report on remote peers only), so any tab that wants to
+    /// render the local node alongside remote peers — NODES /
+    /// NET.MAP / the NODE page — asks for this synthesis.
+    pub fn local_peer_snapshot(&self) -> net_sdk::deck::PeerSnapshot {
+        let local = self.local_datafort();
+        let mut caps = std::collections::BTreeSet::new();
+        for c in &local.capabilities {
+            caps.insert(c.clone());
+        }
+        net_sdk::deck::PeerSnapshot {
+            health: Some(net_sdk::deck::PeerHealthSnapshot::Healthy),
+            cpu_load_1m: local.cpu_load_1m,
+            mem_used_bytes: local.mem_used_bytes,
+            mem_total_bytes: local.mem_total_bytes,
+            disk_used_bytes: local.disk_used_bytes,
+            disk_total_bytes: local.disk_total_bytes,
+            capability_set: caps,
+            software_version: Some("0.17.0".to_string()),
+            ..Default::default()
+        }
+    }
+
     fn focus_host(&mut self, host_id: u64, host_label: Option<String>) {
         // Mirror `focus_daemon`'s mutual-exclusion: opening the
         // Node page drops any Daemon-page focus so the render
@@ -775,28 +812,10 @@ impl App {
         // keep showing the old page over the new one.
         self.daemon_focus = None;
         if host_id == self.this_node {
-            // Synthesize a PeerSnapshot for the local node (same
-            // as `focus_datafort` for the local datafort).
-            let local = self.local_datafort();
-            let mut caps = std::collections::BTreeSet::new();
-            for c in &local.capabilities {
-                caps.insert(c.clone());
-            }
-            let peer = net_sdk::deck::PeerSnapshot {
-                health: Some(net_sdk::deck::PeerHealthSnapshot::Healthy),
-                cpu_load_1m: local.cpu_load_1m,
-                mem_used_bytes: local.mem_used_bytes,
-                mem_total_bytes: local.mem_total_bytes,
-                disk_used_bytes: local.disk_used_bytes,
-                disk_total_bytes: local.disk_total_bytes,
-                capability_set: caps,
-                software_version: Some("0.17.0".to_string()),
-                ..Default::default()
-            };
             self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
                 id: host_id,
                 label: host_label,
-                peer,
+                peer: self.local_peer_snapshot(),
                 placement_cursor: 0,
             });
         } else if let Some((id, peer)) =
@@ -1754,7 +1773,11 @@ impl App {
     }
 
     fn clamp_nodes_cursor(&mut self) {
-        let n = self.snapshot.peers.len();
+        // NODES table is `[local, ...peers]` — the local row
+        // always sits at index 0, so the clamp upper bound is
+        // 1 + peers.len(). Same shape for `clamp_netmap_cursor`
+        // since NET.MAP includes the local node at the center.
+        let n = 1 + self.snapshot.peers.len();
         if n == 0 {
             self.nodes_cursor = 0;
         } else if self.nodes_cursor >= n {
@@ -1763,7 +1786,10 @@ impl App {
     }
 
     fn clamp_netmap_cursor(&mut self) {
-        let n = self.snapshot.peers.len();
+        // NET.MAP's project_live_peers prepends the local node
+        // before remote peers, so the layout's index space is
+        // `[local, ...peers]` — same shape as NODES.
+        let n = 1 + self.snapshot.peers.len();
         if n == 0 {
             self.netmap_cursor = 0;
         } else if self.netmap_cursor >= n {
@@ -1903,7 +1929,8 @@ impl App {
     fn cursor_to_bottom(&mut self) {
         match self.current {
             Tab::NetMap => {
-                let n = self.snapshot.peers.len();
+                // `[local, ...peers]` — local always present.
+                let n = 1 + self.snapshot.peers.len();
                 self.netmap_cursor = n.saturating_sub(1);
             }
             Tab::Dataforts => {
@@ -1918,7 +1945,9 @@ impl App {
                 self.dataforts_cursor = n.saturating_sub(1);
             }
             Tab::Nodes => {
-                let n = self.snapshot.peers.len();
+                // `[local, ...peers]` — local always present, so
+                // total rows = 1 + peers.len().
+                let n = 1 + self.snapshot.peers.len();
                 self.nodes_cursor = n.saturating_sub(1);
             }
             Tab::Daemons => {
@@ -2005,7 +2034,18 @@ impl App {
         if let Some(focus) = self.node_focus.as_ref() {
             return Some(focus.id);
         }
-        self.snapshot.peers.keys().nth(self.nodes_cursor).copied()
+        // NODES table is `[local, ...peers]` — cursor 0 maps to
+        // `this_node`, 1..=N to peers.iter().nth(N - 1). Match
+        // the table's render order so admin actions land on
+        // the row the operator's eye is on.
+        if self.nodes_cursor == 0 {
+            return Some(self.this_node);
+        }
+        self.snapshot
+            .peers
+            .keys()
+            .nth(self.nodes_cursor - 1)
+            .copied()
     }
 
     fn propose_node_action(&mut self, kind: NodeActionKind) {
@@ -2522,6 +2562,11 @@ impl App {
         match self.current {
             Tab::NetMap => {
                 let logs = self.logs_tail.snapshot();
+                let local_peer = self.local_peer_snapshot();
+                let local_anchor = tabs::net_map::LocalAnchor {
+                    id: self.this_node,
+                    peer: &local_peer,
+                };
                 tabs::net_map::render(
                     frame,
                     chunks[3],
@@ -2529,10 +2574,25 @@ impl App {
                     Some(&self.snapshot),
                     self.netmap_cursor,
                     &logs,
+                    Some(local_anchor),
                 )
             }
             Tab::Nodes => {
-                tabs::nodes::render(frame, chunks[3], Some(&self.snapshot), self.nodes_cursor)
+                {
+                    let local_peer = self.local_peer_snapshot();
+                    let local_row = tabs::nodes::LocalNodeRow {
+                        id: self.this_node,
+                        peer: &local_peer,
+                        local_maintenance: &self.snapshot.local_maintenance,
+                    };
+                    tabs::nodes::render(
+                        frame,
+                        chunks[3],
+                        Some(&self.snapshot),
+                        self.nodes_cursor,
+                        Some(local_row),
+                    );
+                }
             }
             Tab::Daemons => {
                 tabs::daemons::render(frame, chunks[3], Some(&self.snapshot), self.daemons_cursor)

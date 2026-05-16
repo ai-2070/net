@@ -12,10 +12,32 @@ use ratatui::{
 
 use crate::{nodes, theme, widgets};
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeshOsSnapshot>, cursor: usize) {
-    match snapshot {
-        Some(s) if !s.peers.is_empty() => render_live_nodes_table(frame, area, s, cursor),
-        _ => render_empty_nodes_table(frame, area),
+/// Local-node row included in the NODES table alongside the
+/// snapshot's remote peers. The substrate's `snapshot.peers`
+/// map only contains *remote* peers — local probes never
+/// sample self — so the App synthesizes this row to keep the
+/// operator's own node visible alongside everyone else.
+pub struct LocalNodeRow<'a> {
+    pub id: net_sdk::deck::NodeId,
+    pub peer: &'a net_sdk::deck::PeerSnapshot,
+    pub local_maintenance: &'a net_sdk::deck::MaintenanceStateSnapshot,
+}
+
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: Option<&MeshOsSnapshot>,
+    cursor: usize,
+    local: Option<LocalNodeRow<'_>>,
+) {
+    let has_peers = snapshot.map(|s| !s.peers.is_empty()).unwrap_or(false);
+    let has_local = local.is_some();
+    if has_peers || has_local {
+        if let Some(s) = snapshot {
+            render_live_nodes_table(frame, area, s, cursor, local);
+        }
+    } else {
+        render_empty_nodes_table(frame, area);
     }
 }
 
@@ -47,19 +69,27 @@ fn render_live_nodes_table(
     area: Rect,
     snapshot: &MeshOsSnapshot,
     cursor: usize,
+    local: Option<LocalNodeRow<'_>>,
 ) {
     use net_sdk::deck::{MaintenanceMirrorSnapshot, PeerHealthSnapshot};
 
-    let total = snapshot.peers.len();
-    let healthy = snapshot
-        .peers
-        .values()
-        .filter(|p| matches!(p.health, Some(PeerHealthSnapshot::Healthy)))
+    // Walk a single iterator that prepends the local node so
+    // every cursor-aware downstream (`cursored_node` in
+    // `app.rs`, clamp / step / cursor_to_bottom) treats the
+    // table as `[local, ...peers]` consistently.
+    let local_peer = local.as_ref().map(|r| (r.id, r.peer));
+    let nodes_iter: Vec<(u64, &net_sdk::deck::PeerSnapshot)> = local_peer
+        .into_iter()
+        .chain(snapshot.peers.iter().map(|(id, p)| (*id, p)))
+        .collect();
+    let total = nodes_iter.len();
+    let healthy = nodes_iter
+        .iter()
+        .filter(|(_, p)| matches!(p.health, Some(PeerHealthSnapshot::Healthy)))
         .count();
-    let degraded = snapshot
-        .peers
-        .values()
-        .filter(|p| matches!(p.health, Some(PeerHealthSnapshot::Degraded)))
+    let degraded = nodes_iter
+        .iter()
+        .filter(|(_, p)| matches!(p.health, Some(PeerHealthSnapshot::Degraded)))
         .count();
     let pos = cursor.min(total.saturating_sub(1)) + 1;
     let header_line = Line::from(vec![
@@ -95,13 +125,37 @@ fn render_live_nodes_table(
     // render instead of re-scanning `snapshot.daemons` for
     // every peer row (was O(peers × daemons) per frame).
     let mut daemon_counts: std::collections::HashMap<u64, usize> =
-        std::collections::HashMap::with_capacity(snapshot.peers.len());
+        std::collections::HashMap::with_capacity(total);
     for d in snapshot.daemons.values() {
         *daemon_counts.entry(d.placement).or_insert(0) += 1;
     }
+    let local_id = local.as_ref().map(|r| r.id);
+    let local_maintenance_mirror = local.as_ref().map(|r| {
+        // Map the local node's `MaintenanceStateSnapshot`
+        // (richer state machine with timestamps) onto the
+        // `MaintenanceMirrorSnapshot` form used by the peer
+        // column so the local row renders the same MAINT chip
+        // vocabulary as remote peers.
+        use net_sdk::deck::MaintenanceStateSnapshot;
+        match r.local_maintenance {
+            MaintenanceStateSnapshot::Active => MaintenanceMirrorSnapshot::Active,
+            MaintenanceStateSnapshot::EnteringMaintenance { .. } => {
+                MaintenanceMirrorSnapshot::EnteringMaintenance
+            }
+            MaintenanceStateSnapshot::Maintenance { .. } => MaintenanceMirrorSnapshot::Maintenance,
+            MaintenanceStateSnapshot::ExitingMaintenance { .. } => {
+                MaintenanceMirrorSnapshot::ExitingMaintenance
+            }
+            MaintenanceStateSnapshot::DrainFailed { .. } => MaintenanceMirrorSnapshot::DrainFailed,
+            MaintenanceStateSnapshot::Recovery { .. } => MaintenanceMirrorSnapshot::Recovery,
+            _ => MaintenanceMirrorSnapshot::Active,
+        }
+    });
 
-    let mut table_rows: Vec<Row> = Vec::with_capacity(snapshot.peers.len());
-    for (i, (peer_id, p)) in snapshot.peers.iter().enumerate() {
+    let mut table_rows: Vec<Row> = Vec::with_capacity(total);
+    for (i, (peer_id, p)) in nodes_iter.iter().enumerate() {
+        let peer_id = *peer_id;
+        let is_local_row = Some(peer_id) == local_id;
         let is_cursor = i == cursor;
         let marker = if is_cursor { "▶" } else { " " };
         let id_spans = if is_cursor {
@@ -116,9 +170,15 @@ fn render_live_nodes_table(
             None => (theme::chrome(), "—"),
             _ => (theme::chrome(), "?"),
         };
-        let rtt_text = match p.rtt_ms {
-            Some(ms) => format!("{ms}ms"),
-            None => "—".to_string(),
+        let rtt_text = if is_local_row {
+            // Local node has no RTT-to-self; render `self` so
+            // the column doesn't read as missing data.
+            "self".to_string()
+        } else {
+            match p.rtt_ms {
+                Some(ms) => format!("{ms}ms"),
+                None => "—".to_string(),
+            }
         };
         let cpu_text = match p.cpu_load_1m {
             Some(load) => format!("{load:.2}"),
@@ -150,9 +210,17 @@ fn render_live_nodes_table(
         // before the saturation_trend tilts.
         let mem_style = pressure_style(p.mem_used_bytes, p.mem_total_bytes);
         let disk_style = pressure_style(p.disk_used_bytes, p.disk_total_bytes);
-        let daemon_count = daemon_counts.get(peer_id).copied().unwrap_or(0);
+        let daemon_count = daemon_counts.get(&peer_id).copied().unwrap_or(0);
+        // Local row reads its maintenance from the substrate's
+        // own `local_maintenance` state machine; remote rows
+        // read the mirror folded from admin commits.
+        let maintenance = if is_local_row {
+            local_maintenance_mirror
+        } else {
+            p.maintenance
+        };
         let maint_style;
-        let maint_text = match p.maintenance {
+        let maint_text = match maintenance {
             Some(MaintenanceMirrorSnapshot::Active) | None => {
                 maint_style = theme::chrome();
                 "—".to_string()
