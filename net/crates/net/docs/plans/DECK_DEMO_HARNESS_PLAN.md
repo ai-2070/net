@@ -1,6 +1,6 @@
 # Deck Demo Harness — implementation plan
 
-> The substrate-side primitives [`DECK_DEMO_PLAN.md`](DECK_DEMO_PLAN.md) needs in order to boot a real in-process multi-node cluster instead of synthetic fixtures. Four pieces: **Phase 0** (in-process multi-`MeshOsRuntime` harness) + three missing items the deck demo can't build on top of yet — **A** daemon supervisor pattern across nodes, **B** real chain placement, **C** lifecycle coordination. This plan ships those primitives; the demo plan consumes them.
+> The substrate-side primitives [`DECK_DEMO_PLAN.md`](DECK_DEMO_PLAN.md) needs in order to boot a real in-process multi-node cluster instead of synthetic fixtures. Five pieces: **Phase 0** (in-process multi-`MeshOsRuntime` harness) + four missing items the deck demo can't build on top of yet — **A** daemon supervisor pattern across nodes, **B** real chain placement, **C** lifecycle coordination, **D** nRPC observer hook on `Mesh`. This plan ships those primitives; the demo plan consumes them.
 
 ## Status
 
@@ -153,21 +153,76 @@ impl ClusterHarness {
 
 **Substrate work.** None. This is policy + composition on top of primitives that already exist.
 
+### Missing item D — nRPC observer hook on `Mesh`
+
+**Goal.** Anyone holding a `Mesh` handle can install an `RpcObserver` that fires on every `serve_rpc_typed` / `call_typed` completion with the metadata the deck's NRPC tab wants — caller, callee, method, latency, status, request/response sizes. The deck demo's Phase 4 wires its `NrpcTail` push behind one such observer; the same hook is useful for tracing / metrics / debugging.
+
+**Today's shape.** `Mesh::serve_rpc_typed` and `Mesh::call_typed` exist (the SDK / `nrpc_echo` example exercise them) but the dispatch path emits no observability events. Today's deck `NrpcTail` is fed by a synthetic seeder under `samples-logs` precisely because there's nothing to subscribe to.
+
+**API sketch (illustrative, not final).**
+
+```rust
+/// Fired on each nRPC call boundary the local `Mesh` participates
+/// in — either as caller (outbound) or callee (inbound). `latency_ms`
+/// is wall-clock between request send and response receive on the
+/// caller side; on the callee side it's the dispatch-to-respond
+/// span. `status` carries success / typed-error / timeout / canceled.
+pub trait RpcObserver: Send + Sync + 'static {
+    fn on_call(&self, evt: RpcCallEvent);
+}
+
+pub struct RpcCallEvent {
+    pub caller: NodeId,
+    pub callee: NodeId,
+    pub method: String,
+    pub latency_ms: u32,
+    pub status: RpcCallStatus,
+    pub request_bytes: u32,
+    pub response_bytes: u32,
+    pub direction: RpcDirection,    // Outbound | Inbound
+    pub ts_unix_ms: u64,
+}
+
+pub enum RpcCallStatus { Ok, Error(String), Timeout, Canceled }
+
+impl Mesh {
+    /// Install an observer. Replaces any previously-installed one.
+    /// Pass `None` to clear. Cheap on the call path: one
+    /// `ArcSwap::load` per call boundary; observer firings are
+    /// `Box<dyn Fn>` calls inside the dispatch task.
+    pub fn set_rpc_observer(&self, observer: Option<Arc<dyn RpcObserver>>);
+}
+```
+
+**Substrate work.** New. Two surface changes:
+
+1. **Carry the observer.** `Mesh` (or its inner type) grows an `ArcSwapOption<Arc<dyn RpcObserver>>` field. `set_rpc_observer` updates it. Cheap reads on the hot path.
+
+2. **Fire from the dispatch path.** `Mesh::call_typed` records `Instant::now()` before sending, the inbound dispatcher records `Instant::now()` when invoking the user's handler. Both sides build an `RpcCallEvent` and call `observer.on_call(...)` if installed. Failure modes (timeout, codec error, cancellation) all funnel into the `RpcCallStatus` variants.
+
+**Performance posture.** Observer firing is opt-in and cheap when not installed (one ArcSwap load → `None` → skip). Installed-but-busy observers run inline on the dispatch task; a slow observer slows nRPC dispatch. The expected use is a non-blocking push into a ring (the deck's `NrpcTail::push` already is) — anything heavier should be sketched against a bounded mpsc on the observer side. Same posture as `DeliverObserver` on `DaemonRuntime` (see [`SDK_GROUPS_SURFACE_PLAN.md`](SDK_GROUPS_SURFACE_PLAN.md) for the precedent).
+
+**Why it's separable from items A–C.** A–C are pure SDK-composition primitives — no substrate surface change. D introduces new substrate API on `Mesh` and crosses the SemVer boundary. Reviewed independently. Lands as its own PR.
+
+**Smoke test.** `tests/rpc_observer.rs`: spawn 2 nodes via the harness, install an observer on node 0 that pushes into a `Mutex<Vec<_>>`, have node 0 call a typed RPC on node 1, assert the observer fired once with `direction = Outbound, status = Ok`. Second case: same but installed on the callee, assert `direction = Inbound`. Third case: caller-side timeout, assert `status = Timeout`.
+
 ## Phases — dependency order
 
 1. **Phase 0** — the harness itself. Standalone deliverable; smoke test demonstrates 5-node peering.
 2. **Item C (skeleton)** — `shutdown` + timeouts on Phase 0's `new`. Drop semantics. The "lifecycle" piece is interleaved with Phase 0 because they share the same state machine; it's listed separately because its surface is independently reviewable.
 3. **Item A** — `spawn_per_node` + `spawn_where`. Depends only on Phase 0 + item C.
 4. **Item B** — `spawn_replica_group` and friends. Depends on Phase 0 + item C; reuses item A's rollback machinery internally.
+5. **Item D** — `RpcObserver` + `Mesh::set_rpc_observer`. Independent of the harness internally (substrate-only change) but lands alongside because the deck demo's Phase 4 is the load-bearing consumer.
 
-A reasonable PR sequence: Phase 0 + item C as one PR (they're entangled), item A as a second PR, item B as a third. Each PR ships with its own test under `crates/net/sdk/tests/cluster_*.rs`.
+A reasonable PR sequence: Phase 0 + item C as one PR (they're entangled), item A as a second PR, item B as a third, item D as a fourth. Each PR ships with its own test under `crates/net/sdk/tests/cluster_*.rs` or `crates/net/tests/rpc_observer.rs`.
 
 ## Non-goals
 
 - **No production multi-node SDK.** This is a `testing`-feature harness. It's not optimized, it doesn't tolerate handshake failures with retries, it doesn't survive a runtime crash. Production multi-node lives in user code; the harness is for tests + demos.
 - **No new transport.** UDP loopback is the only transport. An in-memory channel transport would be faster but adds a code path that doesn't exist in production and would invalidate the harness's "real transport" claim.
-- **No SDK semantic changes.** `MeshOsRuntime` / `DaemonRuntime` / `ReplicaGroup` / `Scheduler` keep their current behavior. Every new symbol is composition on top.
+- **No SDK semantic changes outside item D.** `MeshOsRuntime` / `DaemonRuntime` / `ReplicaGroup` / `Scheduler` keep their current behavior; items A–C are composition on top. Item D adds one new method to `Mesh` (`set_rpc_observer`) and one new trait (`RpcObserver`) — additive, no breakage.
 - **No persistent state across runs.** The harness boots fresh every time. No on-disk redex / chain history. Tests that need persistence wire their own `RedexFile` paths through `MeshOsConfig`.
+- **No observer batching / async dispatch.** `RpcObserver::on_call` is sync, fires inline on the dispatch task. Heavy observers must push into their own queue. Building an async observer trait or batching primitive is a future cleanup once a real consumer asks for it.
 
 ## Trade-offs to flag
 
@@ -197,3 +252,4 @@ A reasonable PR sequence: Phase 0 + item C as one PR (they're entangled), item A
 - **Topology variants.** Ring / star / partition-tolerant configurations. Out of scope until a test asks.
 - **Cross-host harness.** Spawn N processes on N hosts. Distinct primitive; future plan if a multi-host demo or e2e suite comes along.
 - **Failure injection.** "Drop this node's UDP packets to that node for 5 s" — useful for partition-tolerance tests. Out of scope; the harness exposes raw `Mesh` handles so a test can drive packet-loss simulation via the existing substrate hooks if it wants to.
+- **Multi-observer dispatch.** Item D allows one `RpcObserver` per `Mesh`. A future "metrics observer AND tracing observer AND deck observer" composition would need either chained observers or an observer registry; out of scope until a second consumer beyond the deck demo exists.
