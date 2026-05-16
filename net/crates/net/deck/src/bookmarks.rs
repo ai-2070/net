@@ -245,7 +245,22 @@ impl BookmarkStore {
         };
         let text =
             toml::to_string_pretty(&file).map_err(|e| BookmarkError::Serialize(e.to_string()))?;
-        let tmp = path.with_extension("toml.tmp");
+        // Unique tmp suffix (pid + ms since epoch) so two deck
+        // instances pointing at the same config dir don't race
+        // on the rename. A fixed sibling name (`bookmarks.toml.tmp`)
+        // would let one process's partial write land via the
+        // other's rename. Stable enough on a single process —
+        // pid changes between instances and ms changes between
+        // saves.
+        let suffix = {
+            let pid = std::process::id();
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            format!("toml.tmp.{pid}.{ms}")
+        };
+        let tmp = path.with_extension(suffix);
         std::fs::write(&tmp, text)
             .map_err(|e| BookmarkError::Io(format!("write {}: {e}", tmp.display())))?;
         std::fs::rename(&tmp, path).map_err(|e| {
