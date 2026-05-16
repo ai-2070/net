@@ -106,8 +106,23 @@ async fn main() -> color_eyre::Result<()> {
     let _nrpc_seeder_task = runtime::spawn_nrpc_seeder(nrpc_tail, this_node);
     #[cfg(not(feature = "samples-logs"))]
     drop(nrpc_tail);
+    let pending_admin = app.pending_admin_handle();
     let result = app.run(terminal);
     ratatui::restore();
+
+    // Await any in-flight admin / ICE dispatches the operator
+    // confirmed during the session — gives the substrate time
+    // to commit (and to push a "failed" toast that the channel
+    // will still pick up post-app via the receiver hand-off).
+    // 2 s per task is the budget; a stuck RPC doesn't block
+    // shutdown forever.
+    let handles: Vec<_> = pending_admin
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default();
+    for h in handles {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
+    }
 
     // Explicit drop so the harness's tear-down runs before
     // the process exits — drops the SDK + samples daemons +

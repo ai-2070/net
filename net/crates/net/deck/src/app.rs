@@ -302,6 +302,12 @@ pub struct App {
     pub toast_tx: std::sync::mpsc::Sender<String>,
     /// Receiver side; drained by the tick loop into `toast`.
     pub toast_rx: std::sync::mpsc::Receiver<String>,
+    /// In-flight admin / ICE dispatch tasks the operator
+    /// confirmed during this session. Each `dispatch_confirm`
+    /// pushes its `JoinHandle` here so the binary can await
+    /// any still-running ones on shutdown (with a timeout)
+    /// instead of cancelling them mid-RPC.
+    pub pending_admin: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -546,7 +552,18 @@ impl App {
             toast: None,
             toast_tx,
             toast_rx,
+            pending_admin: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Clone the `pending_admin` handle so the binary can
+    /// await in-flight admin tasks on shutdown. Cheap (one
+    /// Arc clone); the resulting handle observes the same
+    /// Vec the App pushes into.
+    pub fn pending_admin_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> {
+        std::sync::Arc::clone(&self.pending_admin)
     }
 
     pub fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
@@ -2634,11 +2651,16 @@ impl App {
     /// Spawn a tokio task that fires the SDK call corresponding
     /// to the confirmed action. Routine admin failures surface
     /// as a footer toast; ICE failures additionally surface
-    /// through the audit ring via `dispatch_ice`.
+    /// through the audit ring via `dispatch_ice`. The
+    /// `JoinHandle` is stashed on `pending_admin` so a quit
+    /// (q / Ctrl-C) can await any still-running dispatches
+    /// before tearing down the harness — operators see the
+    /// outcome land instead of the RPC getting cancelled mid-
+    /// flight on shutdown.
     fn dispatch_confirm(&self, action: crate::widgets::confirm::ConfirmAction) {
         let deck = Arc::clone(&self.deck);
         let toast_tx = self.toast_tx.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             use crate::widgets::confirm::ConfirmAction;
             let report_routine = |kind: &str, res: Result<_, _>| {
                 if let Err(err) = res {
@@ -2735,6 +2757,13 @@ impl App {
                 }
             }
         });
+        // Stash the handle so shutdown can await it. Also drop
+        // any already-finished handles while we have the lock,
+        // so a long session doesn't accumulate dead entries.
+        if let Ok(mut pending) = self.pending_admin.lock() {
+            pending.retain(|h| !h.is_finished());
+            pending.push(handle);
+        }
     }
 
     /// Clamp the daemon cursor against the current snapshot's
