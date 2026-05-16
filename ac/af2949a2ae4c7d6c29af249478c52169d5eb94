@@ -1,0 +1,22 @@
+net/crates/net/docs/plans/DECK_DEMO_HARNESS_PLAN.md
+  s_33e8c099a9039e::t_a346b6a8dd6b6e 156-208,215,217
+  s_33e8c099a9039e::t_7c269f6872a5dd 3
+  s_33e8c099a9039e::t_875449f6d88ab6 223,225
+  s_33e8c099a9039e::t_4e767bbbc73c45 255
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "acaf2949a2ae4c7d6c29af249478c52169d5eb94",
+  "prompts": {},
+  "sessions": {
+    "s_33e8c099a9039e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f5bf814-14c4-4dd9-b249-30bbae94726a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
