@@ -135,6 +135,12 @@ pub struct App {
     /// detail pane on the right reflects whichever member is
     /// pointed to.
     pub daemon_cursor: DaemonCursor,
+    /// Cursor on the NET.MAP tab — index into the same
+    /// peers-sorted-by-id order the LIST tab uses, so the
+    /// cursor stays semantically aligned across the two
+    /// node-centric tabs. `Enter` opens the node detail
+    /// modal.
+    pub netmap_cursor: usize,
     /// Cursor on the LIST tab's nodes table — index into the
     /// peers map's sorted key order. `j`/`k` moves it; the
     /// row gets a `▶` marker + brighter id styling. Action
@@ -236,6 +242,13 @@ pub enum Modal {
     BlobDetail {
         entry: net_sdk::dataforts::BlobInventoryEntry,
     },
+    /// Node detail — opened with `[Enter]` on the NET.MAP
+    /// tab. Snapshots the cursored peer (id + label + full
+    /// `PeerSnapshot`) so the next tick under the cursor
+    /// doesn't shift the body.
+    NodeDetail {
+        entry: crate::widgets::node_detail::NodeDetailEntry,
+    },
     /// Export confirmation — pops after `[e]` lands a file
     /// on disk so the operator sees the resolved path before
     /// returning to the tab. Carries the outcome (success
@@ -317,6 +330,7 @@ impl App {
             deck,
             snapshot,
             daemon_cursor: DaemonCursor::default(),
+            netmap_cursor: 0,
             list_cursor: 0,
             replica_cursor: 0,
             migration_cursor: 0,
@@ -378,6 +392,25 @@ impl App {
     /// toast — the latest action's confirmation always wins.
     pub fn set_toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    /// Snapshot the cursored NET.MAP peer into a detail modal.
+    /// Peers are ordered by NodeId (matches the LIST tab and
+    /// what NET.MAP's cursor sees), so `netmap_cursor` indexes
+    /// the same way the canvas iterates.
+    fn open_node_detail(&mut self) {
+        let pair = self
+            .snapshot
+            .peers
+            .iter()
+            .nth(self.netmap_cursor)
+            .map(|(id, p)| (*id, p.clone()));
+        if let Some((id, peer)) = pair {
+            let label = crate::nodes::label_of(&format!("0x{id:x}")).map(|s| s.to_string());
+            self.modal = Some(Modal::NodeDetail {
+                entry: crate::widgets::node_detail::NodeDetailEntry { id, label, peer },
+            });
+        }
     }
 
     /// Snapshot the cursored BLOBS entry into a detail modal.
@@ -621,6 +654,14 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up if self.current == Tab::List => {
                 self.list_cursor = self.list_cursor.saturating_sub(1);
             }
+            // NET.MAP shares the peers-by-id order with LIST.
+            KeyCode::Char('j') | KeyCode::Down if self.current == Tab::NetMap => {
+                self.netmap_cursor = self.netmap_cursor.saturating_add(1);
+                self.clamp_netmap_cursor();
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.current == Tab::NetMap => {
+                self.netmap_cursor = self.netmap_cursor.saturating_sub(1);
+            }
             KeyCode::Char('j') | KeyCode::Down if self.current == Tab::Replicas => {
                 self.replica_cursor = self.replica_cursor.saturating_add(1);
                 self.clamp_replica_cursor();
@@ -730,6 +771,9 @@ impl App {
             // entry. Snapshots the entry so a subsequent
             // inventory refresh doesn't shift the body.
             KeyCode::Enter if self.current == Tab::Blobs => self.open_blob_detail(),
+            // NET.MAP: open the node detail modal for the
+            // cursored peer.
+            KeyCode::Enter if self.current == Tab::NetMap => self.open_node_detail(),
             // DATAFORTS: cross-link to BLOBS. Operators reading
             // aggregate metrics jump straight to per-chunk
             // inventory of the same adapter.
@@ -876,6 +920,15 @@ impl App {
         }
     }
 
+    fn clamp_netmap_cursor(&mut self) {
+        let n = self.snapshot.peers.len();
+        if n == 0 {
+            self.netmap_cursor = 0;
+        } else if self.netmap_cursor >= n {
+            self.netmap_cursor = n - 1;
+        }
+    }
+
     fn clamp_replica_cursor(&mut self) {
         let n = self.snapshot.replicas.len();
         if n == 0 {
@@ -945,6 +998,7 @@ impl App {
 
     fn cursor_to_top(&mut self) {
         match self.current {
+            Tab::NetMap => self.netmap_cursor = 0,
             Tab::List => self.list_cursor = 0,
             Tab::Replicas => self.replica_cursor = 0,
             Tab::Migrations => self.migration_cursor = 0,
@@ -957,6 +1011,10 @@ impl App {
 
     fn cursor_to_bottom(&mut self) {
         match self.current {
+            Tab::NetMap => {
+                let n = self.snapshot.peers.len();
+                self.netmap_cursor = n.saturating_sub(1);
+            }
             Tab::List => {
                 let n = self.snapshot.peers.len();
                 self.list_cursor = n.saturating_sub(1);
@@ -1183,6 +1241,8 @@ impl App {
                     // BlobDetail is informational — Enter just
                     // closes (same as Esc / q).
                     Some(Modal::BlobDetail { .. }) => {}
+                    // NodeDetail is informational — Enter closes.
+                    Some(Modal::NodeDetail { .. }) => {}
                     // ExportDone is informational — Enter closes.
                     Some(Modal::ExportDone { .. }) => {}
                     // ParamInput is intercepted earlier in this
@@ -1498,7 +1558,13 @@ impl App {
         widgets::rule::render(frame, chunks[2]);
         match self.current {
             Tab::NetMap => {
-                tabs::net_map::render(frame, chunks[3], self.tick, Some(&self.snapshot))
+                tabs::net_map::render(
+                    frame,
+                    chunks[3],
+                    self.tick,
+                    Some(&self.snapshot),
+                    self.netmap_cursor,
+                )
             }
             Tab::List => tabs::list_view::render(
                 frame,
@@ -1634,6 +1700,9 @@ impl App {
             }
             Some(Modal::BlobDetail { entry }) => {
                 widgets::blob_detail::render(frame, area, entry);
+            }
+            Some(Modal::NodeDetail { entry }) => {
+                widgets::node_detail::render(frame, area, entry);
             }
             Some(Modal::ExportDone { outcome }) => {
                 widgets::export_done::render(frame, area, outcome);

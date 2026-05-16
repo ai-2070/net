@@ -17,6 +17,7 @@ pub fn render(
     area: Rect,
     _tick: u64,
     snapshot: Option<&MeshOsSnapshot>,
+    cursor: usize,
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -28,7 +29,11 @@ pub fn render(
         .map(project_live_peers);
 
     let title_text = match live_peers.as_ref() {
-        Some(peers) => format!("   {} live nodes", peers.len()),
+        Some(peers) => {
+            let n = peers.len();
+            let pos = cursor.min(n.saturating_sub(1)) + 1;
+            format!("   {n} live nodes    {pos}/{n}")
+        }
         None => "   no peers".to_string(),
     };
     let header = Line::from(vec![
@@ -44,6 +49,8 @@ pub fn render(
 
     match live_peers {
         Some(peers) => {
+            let n = peers.len();
+            let cursor = cursor.min(n.saturating_sub(1));
             // Move-by-clone into the closure — the canvas
             // `paint` borrow must outlive the call, and
             // ratatui captures by Fn (not FnOnce).
@@ -52,7 +59,7 @@ pub fn render(
                 .marker(Marker::Braille)
                 .x_bounds([-80.0, 80.0])
                 .y_bounds([-45.0, 70.0])
-                .paint(move |ctx| paint_live_graph(ctx, &peers));
+                .paint(move |ctx| paint_live_graph(ctx, &peers, cursor));
             frame.render_widget(canvas, rows[0]);
         }
         None => {
@@ -81,43 +88,46 @@ struct LiveNode {
 
 fn project_live_peers(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
     // Radial layout off the substrate's proximity probe: each
-    // peer sits at radius proportional to its measured RTT
-    // from this node, with the angle deterministically hashed
-    // from the node id so the layout is stable across ticks.
-    // Peers with no RTT sample land at the outer edge so
-    // they're visible but read as "unranked." Reflects the
-    // real cluster topology Deck has access to today —
-    // pairwise distances would need a 2D MDS over the full
-    // proximity graph; that's a future refinement.
-    let max_rtt_us: u64 = snapshot
+    // peer sits at a radius derived from its measured RTT from
+    // this node, with the angle deterministically hashed from
+    // the node id so the layout is stable across ticks.
+    //
+    // Normalization is min-max across the observed RTT range,
+    // not max-only. One outlier (a far-away peer) under
+    // max-only normalization compresses every closer peer into
+    // the central 20% of the canvas; min-max spreads the
+    // range across the full radial extent so the cluster
+    // topology actually reads.
+    let observed: Vec<u64> = snapshot
         .peers
         .values()
-        .filter_map(|p| p.rtt_ms.map(|ms| ms.saturating_mul(1_000)))
-        .max()
-        .unwrap_or(1);
+        .filter_map(|p| p.rtt_ms)
+        .collect();
+    let min_rtt = observed.iter().copied().min().unwrap_or(0);
+    let max_rtt = observed.iter().copied().max().unwrap_or(0);
+    let range = max_rtt.saturating_sub(min_rtt).max(1);
+
     snapshot
         .peers
         .iter()
         .map(|(id, p)| {
             let angle = angle_for(*id);
-            // RTT samples come through as milliseconds in the
-            // snapshot; the demo probe sources microseconds
-            // but the snapshot fold stores them as ms. Either
-            // way the ratio against the max is what places
-            // the peer on its radial.
-            let rtt_us = p
-                .rtt_ms
-                .map(|ms| ms.saturating_mul(1_000))
-                .unwrap_or(max_rtt_us);
-            let radius_unit = (rtt_us as f64 / max_rtt_us.max(1) as f64).clamp(0.05, 1.0);
+            // Peers with no RTT sample land at the outer edge
+            // so they're visible but read as "unranked."
+            let rtt_ms = p.rtt_ms.unwrap_or(max_rtt);
+            let normalized = (rtt_ms.saturating_sub(min_rtt)) as f64 / range as f64;
+            // Floor at 0.15 so the closest peer isn't pinned to
+            // the origin (would collide with future "this node"
+            // marker + obscures the relative positions of other
+            // close peers); ceiling at 0.95 leaves headroom for
+            // labels at the outer edge.
+            let radius_unit = (normalized * 0.8 + 0.15).clamp(0.15, 0.95);
             // Canvas extent: ~70 on each axis with a small
-            // margin. Multiply by 0.55 to keep most peers
-            // inside the visible window even after the
-            // y-axis is squished (terminal cells are taller
-            // than wide, so a circle reads as a vertical
-            // ellipse without compensation).
-            let radius_x = radius_unit * 60.0;
-            let radius_y = radius_unit * 36.0;
+            // margin. Y squished vs X because terminal cells
+            // are taller than wide; without compensation a
+            // mathematical circle reads as a vertical ellipse.
+            let radius_x = radius_unit * 65.0;
+            let radius_y = radius_unit * 38.0;
             let x = radius_x * angle.cos();
             let y = radius_y * angle.sin();
             let health = p.health.unwrap_or(PeerHealthSnapshot::Healthy);
@@ -144,24 +154,41 @@ fn angle_for(id: u64) -> f64 {
     unit * std::f64::consts::TAU
 }
 
-fn paint_live_graph(ctx: &mut Context<'_>, peers: &[LiveNode]) {
-    // No edges yet — replica-derived adjacency lands in a
-    // follow-up slice once the demo seeds `snapshot.replicas`.
-    for n in peers {
+fn paint_live_graph(ctx: &mut Context<'_>, peers: &[LiveNode], cursor: usize) {
+    // Labels only on the cursored node — every-node labels
+    // collide at small radii. Operators reach detail via
+    // `Enter` → NodeDetail modal anyway. The cursored node
+    // also gets a brighter glyph + a `[` bracket marker so the
+    // selection is visible at a glance.
+    for (i, n) in peers.iter().enumerate() {
+        let is_cursor = i == cursor;
         let (glyph, color) = glyph_for_health(n.health);
-        ctx.print(
-            n.x,
-            n.y,
-            Line::styled(
-                glyph.to_string(),
-                ratatui::style::Style::default().fg(color),
-            ),
-        );
-        ctx.print(
-            n.x + 2.5,
-            n.y - 2.0,
-            Line::styled(format!("0x{:x}", n.id), theme::dim()),
-        );
+        let glyph_style = if is_cursor {
+            ratatui::style::Style::default()
+                .fg(theme::GREEN_HI)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        } else {
+            ratatui::style::Style::default().fg(color)
+        };
+        ctx.print(n.x, n.y, Line::styled(glyph.to_string(), glyph_style));
+        if is_cursor {
+            // Bracket the selection.
+            ctx.print(
+                n.x - 2.5,
+                n.y,
+                Line::styled("[", ratatui::style::Style::default().fg(theme::GREEN_HI)),
+            );
+            ctx.print(
+                n.x + 2.5,
+                n.y,
+                Line::styled("]", ratatui::style::Style::default().fg(theme::GREEN_HI)),
+            );
+            ctx.print(
+                n.x + 4.5,
+                n.y - 2.0,
+                Line::styled(format!("0x{:x}", n.id), theme::green_hi()),
+            );
+        }
     }
 }
 
@@ -181,7 +208,9 @@ fn render_legend(frame: &mut Frame<'_>, area: Rect) {
         Span::styled("◆ ", theme::amber()),
         Span::styled("DEGRADED   ", theme::dim()),
         Span::styled("◇ ", theme::red()),
-        Span::styled("UNREACHABLE", theme::dim()),
+        Span::styled("UNREACHABLE   ", theme::dim()),
+        Span::styled("[Enter]", theme::green_hi()),
+        Span::styled(" detail", theme::dim()),
     ]);
     frame.render_widget(Paragraph::new(legend).alignment(Alignment::Right), area);
 }
