@@ -1,12 +1,14 @@
 //! NET.MAP tab — proximity graph + mesh event tail.
 //!
 //! Top half: a canvas drawing peers at radial positions seeded
-//! from the substrate's RTT probe, with edges connecting each
-//! peer to its k-nearest neighbours. Per-role glyphs:
+//! from the substrate's RTT probe, then refined by a few passes
+//! of pairwise repulsion so co-located peers (same RTT band)
+//! don't overlap. Edges connect each peer to its k-nearest
+//! neighbours after the spread pass.
 //!
-//!   ◆ COMPUTE     · default
+//! Per-role glyphs:
+//!   ◆ NODE        · default
 //!   ■ DATAFORTS   · peer carries `dataforts.blob.storage`
-//!   ◇ DEVICE      · peer carries any `sensor.*` cap
 //!
 //! Title carries live counts: `{n} nodes · {m} edges · {d} dataforts`.
 //!
@@ -40,8 +42,8 @@ pub fn render(
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),    // graph
-            Constraint::Length(12), // MESH.EVENTS panel
+            Constraint::Min(0),    // graph — gets the slack
+            Constraint::Length(7), // MESH.EVENTS panel — title + 4 rows + bottom border
             Constraint::Length(2), // legend
         ])
         .split(area);
@@ -121,9 +123,8 @@ fn render_graph(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NodeRole {
-    Compute,
+    Node,
     Datafort,
-    Device,
 }
 
 struct LiveNode {
@@ -136,6 +137,12 @@ struct LiveNode {
 }
 
 fn project_live_peers(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
+    let mut nodes = radial_layout(snapshot);
+    spread_overlaps(&mut nodes);
+    nodes
+}
+
+fn radial_layout(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
     let observed: Vec<u64> = snapshot
         .peers
         .values()
@@ -172,13 +179,56 @@ fn project_live_peers(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
         .collect()
 }
 
+/// Push overlapping nodes apart with pairwise repulsion. The
+/// radial layout puts peers with similar RTT at the same
+/// radius, so a region with 5 close peers can clump on a thin
+/// arc. A few iterations of repulsion (deterministic — no
+/// randomness) thin the clumps out while preserving the
+/// overall layout topology.
+fn spread_overlaps(nodes: &mut [LiveNode]) {
+    const ITERATIONS: usize = 60;
+    /// Minimum desired separation between any two nodes, in
+    /// canvas units. Roughly two glyph widths so labels don't
+    /// run over each other.
+    const MIN_DIST: f64 = 14.0;
+    const STRENGTH: f64 = 0.5;
+    /// Canvas-clamp bounds — match the canvas `*_bounds` in
+    /// render_graph, with a 5-unit margin so labels fit.
+    const X_MIN: f64 = -75.0;
+    const X_MAX: f64 = 75.0;
+    const Y_MIN: f64 = -40.0;
+    const Y_MAX: f64 = 65.0;
+
+    for _ in 0..ITERATIONS {
+        let n = nodes.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let dx = nodes[i].x - nodes[j].x;
+                let dy = nodes[i].y - nodes[j].y;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist < MIN_DIST && dist > 0.001 {
+                    let push = (MIN_DIST - dist) * STRENGTH / dist;
+                    let pdx = dx * push;
+                    let pdy = dy * push;
+                    nodes[i].x += pdx;
+                    nodes[i].y += pdy;
+                    nodes[j].x -= pdx;
+                    nodes[j].y -= pdy;
+                }
+            }
+        }
+        for n in nodes.iter_mut() {
+            n.x = n.x.clamp(X_MIN, X_MAX);
+            n.y = n.y.clamp(Y_MIN, Y_MAX);
+        }
+    }
+}
+
 fn classify_role(caps: &std::collections::BTreeSet<String>) -> NodeRole {
     if caps.iter().any(|c| c == "dataforts.blob.storage") {
         NodeRole::Datafort
-    } else if caps.iter().any(|c| c.starts_with("sensor.")) {
-        NodeRole::Device
     } else {
-        NodeRole::Compute
+        NodeRole::Node
     }
 }
 
@@ -289,9 +339,8 @@ fn glyph_for(n: &LiveNode) -> (char, ratatui::style::Color) {
         _ => theme::TEXT,
     };
     let glyph = match n.role {
-        NodeRole::Compute => '◆',
+        NodeRole::Node => '◆',
         NodeRole::Datafort => '■',
-        NodeRole::Device => '◇',
     };
     (glyph, color)
 }
@@ -360,11 +409,9 @@ fn fmt_ts(ts_ms: u64) -> String {
 fn render_legend(frame: &mut Frame<'_>, area: Rect) {
     let legend = Line::from(vec![
         Span::styled("◆ ", theme::green_hi()),
-        Span::styled("COMPUTE   ", theme::dim()),
+        Span::styled("NODE   ", theme::dim()),
         Span::styled("■ ", theme::green_hi()),
         Span::styled("DATAFORTS   ", theme::dim()),
-        Span::styled("◇ ", theme::text()),
-        Span::styled("DEVICE   ", theme::dim()),
         Span::styled("◆ ", theme::amber()),
         Span::styled("DEGRADED   ", theme::dim()),
         Span::styled("◇ ", theme::red()),
