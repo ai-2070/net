@@ -87,8 +87,8 @@ pub fn render(
     );
 
     let host_str = match host_label {
-        Some(l) => format!("0x{host_id:04x}.{l}"),
-        None => format!("0x{host_id:04x}"),
+        Some(l) => format!("0x{host_id:x}.{l}"),
+        None => format!("0x{host_id:x}"),
     };
     frame.render_widget(kv("host    ", &host_str), rows[2]);
     frame.render_widget(kv("adapter ", &entry.adapter_id), rows[3]);

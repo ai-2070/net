@@ -118,7 +118,7 @@ fn bar_kv(label: &str, used: Option<u64>, total: Option<u64>) -> Line<'static> {
     let mut spans = vec![Span::styled(format!("  {label:<12}"), theme::chrome())];
     match ratio {
         Some(r) => {
-            let pct = (r * 100.0) as u16;
+            let pct = (r * 100.0).round() as u16;
             let color = if r >= HEALTH_GATE_EMIT {
                 theme::RED
             } else if r >= HEALTH_GATE_CLEAR {
