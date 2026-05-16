@@ -358,13 +358,12 @@ fn render_identity_column(
     frame: &mut Frame<'_>,
     area: Rect,
     entry: &NodeFocusEntry,
-    id_label: &str,
+    _id_label: &str,
 ) {
     let (health_text, health_style) = health_label_styled(entry.peer.health);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // id
             Constraint::Length(1), // health
             Constraint::Length(1), // rtt
             Constraint::Length(1), // maint
@@ -374,8 +373,10 @@ fn render_identity_column(
         ])
         .split(area);
 
-    frame.render_widget(kv("id        ", id_label, theme::green_hi()), rows[0]);
-    frame.render_widget(kv("health    ", health_text, health_style), rows[1]);
+    // id is shown in the panel title, no need to repeat it
+    // here — the row used to be the first identity entry but
+    // was redundant with the section header above.
+    frame.render_widget(kv("health    ", health_text, health_style), rows[0]);
     frame.render_widget(
         kv(
             "rtt       ",
@@ -386,7 +387,7 @@ fn render_identity_column(
                 .unwrap_or_else(|| "—".to_string()),
             theme::text(),
         ),
-        rows[2],
+        rows[1],
     );
     frame.render_widget(
         kv(
@@ -394,7 +395,7 @@ fn render_identity_column(
             &maint_label(entry.peer.maintenance),
             theme::cyan(),
         ),
-        rows[3],
+        rows[2],
     );
     frame.render_widget(
         kv(
@@ -402,7 +403,7 @@ fn render_identity_column(
             entry.peer.software_version.as_deref().unwrap_or("—"),
             theme::text(),
         ),
-        rows[4],
+        rows[3],
     );
     frame.render_widget(
         kv(
@@ -414,7 +415,7 @@ fn render_identity_column(
                 .unwrap_or_else(|| "—".to_string()),
             theme::text(),
         ),
-        rows[5],
+        rows[4],
     );
 }
 
