@@ -373,8 +373,11 @@ fn kv(label: &str, value: &str, value_style: ratatui::style::Style) -> Line<'sta
 }
 
 fn short_id(id: u64) -> String {
+    // `{:016x}` always produces exactly 16 chars, so the
+    // first 6 are always present without the `.min(s.len())`
+    // guard the prior version carried defensively.
     let s = format!("{id:016x}");
-    format!("0x{}", &s[..6.min(s.len())])
+    format!("0x{}", &s[..6])
 }
 
 use super::format_age_ms as format_age;

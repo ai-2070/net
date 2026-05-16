@@ -242,7 +242,11 @@ fn angle_for(id: u64) -> f64 {
     s = (s ^ (s >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     s = (s ^ (s >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     s ^= s >> 31;
-    let unit = (s as u32) as f64 / u32::MAX as f64;
+    // Drop the bottom 11 bits and use the 53 mantissa-bit
+    // payload directly — the prior `(s as u32) as f64` cast
+    // threw away half the entropy and could collide nearby
+    // node ids onto identical angles.
+    let unit = (s >> 11) as f64 / ((1u64 << 53) as f64);
     unit * std::f64::consts::TAU
 }
 
