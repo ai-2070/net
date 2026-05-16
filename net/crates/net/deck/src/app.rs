@@ -417,6 +417,43 @@ impl App {
         }
     }
 
+    /// View of the local node hosting this deck's adapters,
+    /// rendered alongside the cursored adapter on DATAFORTS.
+    /// Aggregates resource stats across every registered adapter
+    /// so a fleet with three adapters totalling 3.5 TB shows
+    /// 3.5 TB on the node-disk gauge instead of one adapter's
+    /// slice. Stats live in synthetic form here — the deck
+    /// doesn't have a system-stats probe in this demo runtime.
+    fn host_node_view(&self) -> tabs::dataforts::HostNodeView {
+        let (disk_used, disk_total) = self.blob_adapters.iter().fold(
+            (0u64, 0u64),
+            |(u, t), a| {
+                let m = a.metrics().snapshot();
+                (u + m.disk_used_bytes, t + m.disk_capacity_bytes)
+            },
+        );
+        let any_overflow = self.blob_adapters.iter().any(|a| a.overflow_enabled());
+        let mut capabilities = vec![
+            "compute.daemon".to_string(),
+            "meshos.health".to_string(),
+            "dataforts.blob.storage".to_string(),
+        ];
+        if any_overflow {
+            capabilities.push("dataforts.blob.overflow".to_string());
+        }
+        tabs::dataforts::HostNodeView {
+            id: 0x0001,
+            label: Some("local"),
+            health: Some("Healthy"),
+            cpu_load_1m: Some(0.42),
+            mem_used_bytes: Some(28u64 << 30),
+            mem_total_bytes: Some(64u64 << 30),
+            disk_used_bytes: Some(disk_used),
+            disk_total_bytes: Some(disk_total),
+            capabilities,
+        }
+    }
+
     /// Snapshot the cursored BLOBS entry into a detail modal.
     /// The modal owns its copy of the entry so a subsequent
     /// inventory refresh (~500 ms tick) under the cursor
@@ -1646,9 +1683,20 @@ impl App {
                 let entries: Vec<tabs::dataforts::AdapterEntry> = self
                     .blob_adapters
                     .iter()
-                    .map(|a| tabs::dataforts::AdapterEntry {
-                        id: a.adapter_id().to_string(),
-                        metrics: a.metrics().snapshot(),
+                    .map(|a| {
+                        let metrics = a.metrics().snapshot();
+                        let overflow_enabled = a.overflow_enabled();
+                        let mut capabilities = vec!["dataforts.blob.storage".to_string()];
+                        if overflow_enabled {
+                            capabilities.push("dataforts.blob.overflow".to_string());
+                        }
+                        tabs::dataforts::AdapterEntry {
+                            id: a.adapter_id().to_string(),
+                            metrics,
+                            overflow_enabled,
+                            capabilities,
+                            host: self.host_node_view(),
+                        }
                     })
                     .collect();
                 tabs::dataforts::render(

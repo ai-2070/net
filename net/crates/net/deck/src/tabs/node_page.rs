@@ -51,13 +51,29 @@ pub fn render(
     let needed = 2 /* borders */ + 6 /* main rows */ + 1 /* spacer */ + cap_lines + 1;
     let panel_h = (needed as u16)
         .max(12)
-        .min(area.height.saturating_sub(6));
+        .min(area.height.saturating_sub(7));
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(panel_h), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(panel_h), // NODE
+            Constraint::Min(0),          // PLACEMENT
+            Constraint::Length(1),       // bottom hint row
+        ])
         .split(area);
     render_peer_panel(frame, rows[0], entry);
     render_placement_panel(frame, rows[1], entry, live);
+    render_back_hint(frame, rows[2]);
+}
+
+fn render_back_hint(frame: &mut Frame<'_>, area: Rect) {
+    let hint = Line::from(vec![
+        Span::styled("[Esc]", theme::green_hi()),
+        Span::styled(" back", theme::dim()),
+    ]);
+    frame.render_widget(
+        Paragraph::new(hint).alignment(Alignment::Right),
+        area,
+    );
 }
 
 // ───────────────────────── peer panel ─────────────────────────
@@ -85,7 +101,6 @@ fn render_peer_panel(frame: &mut Frame<'_>, area: Rect, entry: &NodeFocusEntry) 
             Span::styled(health_glyph, health_style),
             Span::styled(" ", theme::chrome()),
             Span::styled(health_label(entry.peer.health), health_style),
-            Span::styled("    [Esc] back", theme::dim()),
         ]))
         .title_alignment(Alignment::Left);
     let inner = block.inner(area);
@@ -448,8 +463,17 @@ fn render_placement_panel(
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Length(1), // vertical divider
+            Constraint::Percentage(50),
+        ])
         .split(inner);
+
+    let divider_lines: Vec<Line> = (0..cols[1].height)
+        .map(|_| Line::from(Span::styled("│", theme::rule())))
+        .collect();
+    frame.render_widget(Paragraph::new(divider_lines), cols[1]);
 
     // Daemons on this node.
     let mut daemon_lines: Vec<Line> = Vec::with_capacity(daemons_here.len() + 1);
@@ -493,7 +517,7 @@ fn render_placement_panel(
             ]));
         }
     }
-    frame.render_widget(Paragraph::new(chain_lines), cols[1]);
+    frame.render_widget(Paragraph::new(chain_lines), cols[2]);
 }
 
 // ───────────────────────── helpers ─────────────────────────

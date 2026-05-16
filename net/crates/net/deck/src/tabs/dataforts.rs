@@ -30,6 +30,30 @@ use crate::{theme, widgets};
 pub struct AdapterEntry {
     pub id: String,
     pub metrics: BlobMetricsSnapshot,
+    pub overflow_enabled: bool,
+    /// Capability tags this adapter advertises into the mesh.
+    pub capabilities: Vec<String>,
+    /// Local host the adapter is running on. Populated from the
+    /// runtime's `this_node` view; rendered in the new context
+    /// row alongside the adapter's own config.
+    pub host: HostNodeView,
+}
+
+/// Point-in-time view of the node hosting an adapter. Mirrors
+/// the slice of `PeerSnapshot` the deck renders for any peer —
+/// kept as its own type so the deck can populate it for the
+/// local node, which doesn't appear in `snapshot.peers`.
+#[derive(Clone)]
+pub struct HostNodeView {
+    pub id: u64,
+    pub label: Option<&'static str>,
+    pub health: Option<&'static str>,
+    pub cpu_load_1m: Option<f64>,
+    pub mem_used_bytes: Option<u64>,
+    pub mem_total_bytes: Option<u64>,
+    pub disk_used_bytes: Option<u64>,
+    pub disk_total_bytes: Option<u64>,
+    pub capabilities: Vec<String>,
 }
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, entries: &[AdapterEntry], cursor: usize) {
@@ -48,12 +72,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entries: &[AdapterEntry], curso
         .constraints([
             Constraint::Length(list_height), // adapter list
             Constraint::Length(3),           // status bar
-            Constraint::Min(0),              // body
+            Constraint::Length(14),          // IO + OVERFLOW counters
+            Constraint::Min(0),              // context: config | host
         ])
         .split(area);
     render_adapter_list(frame, rows[0], entries, cursor);
     render_status(frame, rows[1], &entries[cursor].metrics, &entries[cursor].id);
     render_body(frame, rows[2], &entries[cursor].metrics);
+    render_context_row(frame, rows[3], &entries[cursor]);
 }
 
 fn render_adapter_list(
@@ -294,6 +320,204 @@ fn render_overflow_panel(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSn
         kv("low_water_cleared", o.low_water_cleared_total),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+// ───────────────────────── context row ─────────────────────────
+//
+// Side-by-side panel below the IO/OVERFLOW counters. Left side
+// is this adapter's config + advertised capabilities; right side
+// is the host node's identity, resource snapshot, and capability
+// set. Lets an operator read the "what is this adapter" answer
+// without bouncing to the NODE page.
+
+fn render_context_row(frame: &mut Frame<'_>, area: Rect, entry: &AdapterEntry) {
+    if area.height < 4 {
+        return;
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    render_adapter_config_panel(frame, cols[0], entry);
+    render_host_node_panel(frame, cols[1], &entry.host);
+}
+
+fn render_adapter_config_panel(frame: &mut Frame<'_>, area: Rect, entry: &AdapterEntry) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::rule())
+        .title(Line::from(vec![
+            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+            Span::styled("DATAFORT", theme::green_hi()),
+            Span::styled(format!("    {}", entry.id), theme::amber()),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(ctx_kv("id", &entry.id, theme::text()));
+    lines.push(ctx_kv(
+        "capacity",
+        &fmt_bytes(entry.metrics.disk_capacity_bytes),
+        theme::text(),
+    ));
+    lines.push(ctx_kv(
+        "overflow",
+        if entry.overflow_enabled {
+            if entry.metrics.overflow.active {
+                "enabled · ACTIVE"
+            } else {
+                "enabled · idle"
+            }
+        } else {
+            "off"
+        },
+        if entry.overflow_enabled {
+            if entry.metrics.overflow.active {
+                theme::amber()
+            } else {
+                theme::green()
+            }
+        } else {
+            theme::dim()
+        },
+    ));
+    lines.push(ctx_kv(
+        "disk_ratio",
+        &format!("{:.2}", entry.metrics.overflow.disk_ratio),
+        theme::dim(),
+    ));
+    lines.push(Line::from(vec![Span::raw("")]));
+    lines.push(Line::from(vec![Span::styled(
+        "  advertises",
+        theme::chrome(),
+    )]));
+    if entry.capabilities.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("      ", theme::chrome()),
+            Span::styled("—", theme::chrome()),
+        ]));
+    } else {
+        for cap in &entry.capabilities {
+            lines.push(Line::from(vec![
+                Span::styled("      ", theme::chrome()),
+                Span::styled(cap.clone(), theme::text()),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_host_node_panel(frame: &mut Frame<'_>, area: Rect, host: &HostNodeView) {
+    let id_label = match host.label {
+        Some(l) => format!("0x{:04x}.{}", host.id, l),
+        None => format!("0x{:04x}", host.id),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::rule())
+        .title(Line::from(vec![
+            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+            Span::styled("NODE", theme::green_hi()),
+            Span::styled(format!("    {}", id_label), theme::text()),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(ctx_kv(
+        "health",
+        host.health.unwrap_or("—"),
+        health_style(host.health),
+    ));
+    lines.push(ctx_kv(
+        "cpu_1m",
+        &host
+            .cpu_load_1m
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "—".to_string()),
+        cpu_style(host.cpu_load_1m),
+    ));
+    lines.push(bar_kv(
+        "memory",
+        host.mem_used_bytes,
+        host.mem_total_bytes,
+    ));
+    lines.push(bar_kv("disk", host.disk_used_bytes, host.disk_total_bytes));
+    lines.push(Line::from(vec![Span::raw("")]));
+    lines.push(Line::from(vec![Span::styled(
+        "  capabilities",
+        theme::chrome(),
+    )]));
+    if host.capabilities.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("      ", theme::chrome()),
+            Span::styled("—", theme::chrome()),
+        ]));
+    } else {
+        for cap in &host.capabilities {
+            lines.push(Line::from(vec![
+                Span::styled("      ", theme::chrome()),
+                Span::styled(cap.clone(), theme::text()),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn ctx_kv(label: &str, value: &str, value_style: ratatui::style::Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {label:<12}"), theme::chrome()),
+        Span::styled(value.to_string(), value_style),
+    ])
+}
+
+fn bar_kv(label: &str, used: Option<u64>, total: Option<u64>) -> Line<'static> {
+    let (ratio, label_value) = match (used, total) {
+        (Some(u), Some(t)) if t > 0 => {
+            let r = (u as f64 / t as f64).clamp(0.0, 1.0);
+            (Some(r), format!("{} / {}", fmt_bytes(u), fmt_bytes(t)))
+        }
+        _ => (None, "—".to_string()),
+    };
+    let mut spans = vec![Span::styled(format!("  {label:<12}"), theme::chrome())];
+    match ratio {
+        Some(r) => {
+            let pct = (r * 100.0) as u16;
+            let color = if r >= HEALTH_GATE_EMIT_THRESHOLD {
+                theme::RED
+            } else if r >= HEALTH_GATE_CLEAR_THRESHOLD {
+                theme::AMBER
+            } else {
+                theme::GREEN_HI
+            };
+            spans.push(bar(pct, 12, color));
+            spans.push(Span::styled(format!("  {pct:>3}%  "), theme::text()));
+            spans.push(Span::styled(label_value, theme::dim()));
+        }
+        None => {
+            spans.push(Span::styled(label_value, theme::chrome()));
+        }
+    }
+    Line::from(spans)
+}
+
+fn health_style(s: Option<&'static str>) -> ratatui::style::Style {
+    match s {
+        Some("Healthy") => theme::green(),
+        Some("Degraded") => theme::amber(),
+        Some("Unreachable") => theme::red(),
+        _ => theme::chrome(),
+    }
+}
+
+fn cpu_style(load: Option<f64>) -> ratatui::style::Style {
+    match load {
+        Some(v) if v >= 2.0 => theme::red(),
+        Some(v) if v >= 1.0 => theme::amber(),
+        Some(_) => theme::green(),
+        None => theme::chrome(),
+    }
 }
 
 fn kv(label: &'static str, value: u64) -> Line<'static> {
