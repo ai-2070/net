@@ -1304,7 +1304,7 @@ impl BlobAdapter for MeshBlobAdapter {
             .collect();
         // Most-recently-touched first — operators triaging
         // an incident want the freshest churn at the top.
-        entries.sort_by(|a, b| b.last_seen_unix_ms.cmp(&a.last_seen_unix_ms));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.last_seen_unix_ms));
         if opts.limit > 0 && entries.len() > opts.limit {
             entries.truncate(opts.limit);
         }
