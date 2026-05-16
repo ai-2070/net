@@ -355,6 +355,10 @@ Same `ffi_guard!` macro + thread-local `LAST_ERROR_*` surface MeshDB / MeshOS SD
 Phase 2 of this plan ships the ICE surface. It carries five disciplines beyond ordinary admin commits:
 
 1. **Multi-operator signing.** `IceProposal::commit(signatures)` requires `signatures.len() >= ice_threshold` (default 2; configurable per-cluster via a `safety.toml` operator-policy chain that the substrate reads on startup). The substrate-side verifier re-checks the threshold at commit time — an SDK that lies about the threshold can't commit because the substrate validates.
+
+   **Why M-of-N matters.** Routine admin commits (cordon, drain, etc.) are reversible and tolerate single-operator authority. ICE actions are not: `force_cutover` to a node that can't host the workload, a misfired `force_evict_replica` on the last healthy holder, a `kill_migration` mid-cutover, or a panic-fired `freeze_cluster` during reconcile can wedge or damage the cluster in ways an operator can't roll back without another break-glass action. Requiring `>= ice_threshold` distinct operator signatures over the same `(action, issued_at_ms, blast_hash)` tuple closes three concrete threats: (a) a single compromised keypair can't fire ICE alone; (b) a single panicked or mistaken operator has to convince a co-operator before commit; (c) insider unilateral action shows up in audit as sub-threshold sig bundles that the verifier rejected. The signing payload is domain-tagged (`ICE_SIGNING_DOMAIN`) so an ICE signature can't cross-validate as a routine admin commit, and the verifier deduplicates by `OperatorSignature::operator_id` so the same operator can't satisfy the threshold by signing twice.
+
+   **What the threat model does not cover.** Both operator keypairs compromised in the same window, or operators colluding — neither is mitigated by M-of-N. Those require key-rotation cadence + operator-policy auditing, which live outside this plan.
 2. **Blast-radius simulation.** `IceProposal::simulate()` is mandatory before commit in the substrate-side contract — proposals committed without a prior `simulate()` invocation in the same `IceProposal` lifetime fail with `IceError::SimulationRequired`. Each binding plumbs the simulation API + makes `commit()` without a prior `simulate()` a compile-time error where the language allows.
 3. **Lockout timer.** After an ICE force-operation commits on a node, that node enters a 5-minute "ICE cooldown" during which subsequent ICE operations targeting the same node require an extra signature. The cooldown rides chain metadata; every node observes it identically.
 4. **Dedicated audit subchain.** ICE force-operations land on a `ice.admin.<cluster>` subchain in addition to the main admin chain. The audit query has a `.force_only()` filter that reads only the ICE subchain, so security review can replay every break-glass event without scanning the full admin history.
@@ -382,6 +386,32 @@ Per-binding README walking one realistic operator workflow end-to-end:
 6. Query the audit chain for the last 10 admin commits; verify the `enter_maintenance` is there.
 
 Each README matches the MeshDB / MeshOS SDK README format (slice-based, explicit "what ships in v1 vs deferred"). The C SDK ships a runnable `examples/deck.c` analogous to the existing `examples/meshdb.c`.
+
+---
+
+## Deferred work
+
+### Cross-deck co-signing workflow
+
+§7 #1 specifies *that* `IceProposal::commit` requires `signatures.len() >= ice_threshold` and *what* the substrate verifies. It does **not** specify *how* a second operator's signature reaches the originating deck. Today the substrate accepts the bundle and the SDK exposes the per-operator `OperatorIdentity::sign_proposal`, but there's no defined operator-facing workflow for the two (or more) deck instances to exchange signatures over an unsigned proposal.
+
+Status: **deferred**. The demo runtime ships with `ice_signature_threshold = 1` so the single-operator path commits without coordination; M-of-N landings wait for a Deck consumer driving the workflow.
+
+When this comes back the SDK additions are bounded:
+
+- **Expose offline-signing primitives.** Re-export `BlastRadiusHash`, `blast_radius_hash(&BlastRadius) -> BlastRadiusHash`, and `ice_proposal_signing_payload(&IceActionProposal, issued_at_ms, &BlastRadiusHash) -> Vec<u8>` from `net_sdk::deck::*`. The substrate already implements all three at `behavior::meshos::ice`; they're internal-only today because no consumer needs them.
+- **Add a serializable proposal bundle.** A new `IceProposalBundle { action: IceActionProposal, issued_at_ms: u64, blast: BlastRadius }` carries everything a remote operator needs to (a) re-derive the same `blast_hash` locally and (b) sign over the same domain-tagged payload. All three fields are already `Serialize + Deserialize`; the bundle is a thin tuple type with one helper: `bundle.signing_payload() -> Vec<u8>` (delegates to `ice_proposal_signing_payload`).
+- **Document the round-trip.** Operator A's deck simulates and produces a bundle; A signs locally and exports `(bundle, sig_a)` as a postcard or JSON blob (paste / file / out-of-band channel); operator B's deck imports the bundle, verifies its own re-derived `blast_hash` matches what A signed over, signs locally, exports `sig_b`; A imports `sig_b` and commits with `&[sig_a, sig_b]`. The substrate verifier rebuilds the signing payload from `(action, issued_at_ms, blast_hash)` so both signatures bind to the exact same envelope or commit fails closed.
+
+The deck-binary surface this unlocks (export bundle, import signature, commit modal that shows collected-so-far vs required) is **out of scope of this plan**. The SDK delta is the prerequisite; the UI follows whenever the workflow has a real consumer demanding it.
+
+### Things explicitly not deferred to this section
+
+- Substrate-side multi-signature verification — already implemented and tested at `behavior::deck::SimulatedIceProposal::commit`.
+- Threshold configuration — already plumbed via `DeckClientConfig::ice_signature_threshold`.
+- Distinct-operator deduplication — already enforced (`unique_operators` set in the verifier).
+
+What's deferred is the **operator-facing exchange protocol**, not the substrate's verification semantics.
 
 ---
 
