@@ -95,11 +95,21 @@ fn render_adapter_list(
         let marker = if is_cursor { "▶" } else { " " };
         let id_style = if is_cursor { theme::green_hi() } else { theme::text() };
         let m = &e.metrics;
-        let disk_pct = if m.disk_capacity_bytes == 0 {
-            0
+        let ratio = if m.disk_capacity_bytes == 0 {
+            0.0
         } else {
-            ((m.disk_used_bytes * 100) / m.disk_capacity_bytes).min(999)
+            (m.disk_used_bytes as f64 / m.disk_capacity_bytes as f64).clamp(0.0, 1.0)
         };
+        let disk_pct = (ratio * 100.0) as u16;
+        let (bar_color, _, _) = bar_style_for(ratio);
+        // DISK column is a `┃━━━━━━━━━┃ NN%` bar + percent.
+        // Bar color tracks the health-gate threshold the same
+        // way the detail status panel does — green steady →
+        // amber watch above 85% → red EMIT at/above 95%.
+        let disk_cell = Cell::from(Line::from(vec![
+            bar(disk_pct, 10, bar_color),
+            Span::styled(format!(" {disk_pct:>3}%"), theme::dim()),
+        ]));
         let (gate_text, gate_style) = gate_chip(m.disk_used_bytes, m.disk_capacity_bytes);
         let overflow_active = m.overflow.active;
         let (of_text, of_style) = if overflow_active {
@@ -110,7 +120,7 @@ fn render_adapter_list(
         rows.push(Row::new(vec![
             Cell::from(Span::styled(marker, theme::green_hi())),
             Cell::from(Span::styled(e.id.clone(), id_style)),
-            Cell::from(Span::styled(format!("{disk_pct:>3}%"), theme::text())),
+            disk_cell,
             Cell::from(Span::styled(gate_text, gate_style)),
             Cell::from(Span::styled(format!("{:>6}", m.blobs_stored_total), theme::text())),
             Cell::from(Span::styled(format!("{:>6}", m.blobs_fetched_total), theme::text())),
@@ -124,7 +134,7 @@ fn render_adapter_list(
         [
             Constraint::Length(2),  // cursor
             Constraint::Length(20), // adapter id
-            Constraint::Length(5),  // disk %
+            Constraint::Length(16), // disk bar + %
             Constraint::Length(10), // gate
             Constraint::Length(7),  // stored
             Constraint::Length(8),  // fetched
