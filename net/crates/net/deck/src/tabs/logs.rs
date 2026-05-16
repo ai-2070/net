@@ -270,6 +270,7 @@ fn project_log_records(
         .filter(|r| needle.is_empty() || record_matches(r, &needle))
     {
         let (level_style, level_pad) = match rec.level {
+            LogLevel::Debug => (theme::chrome(), "DEBUG"),
             LogLevel::Info => (theme::dim(), "INFO "),
             LogLevel::Warn => (theme::amber(), "WARN "),
             LogLevel::Error => (theme::red(), "ERR  "),
