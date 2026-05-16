@@ -671,28 +671,27 @@ impl App {
             KeyCode::Char('7') => self.current = Tab::Migrations,
             KeyCode::Char('8') => self.current = Tab::Failures,
             KeyCode::Char('9') => self.current = Tab::Blobs,
-            // DAEMON tab navigation. `j`/`k` move within the
-            // primary axis (j/k/arrows) moves between groups —
-            // matches the cursor semantics on every other tab,
-            // where vertical nav is the primary motion. `w`/`s`
-            // are the in-group "horizontal" axis for picking
-            // a specific member within the cursored group; the
-            // detail panel reflects the cursored member.
-            KeyCode::Char('j') | KeyCode::Down if self.current == Tab::Daemon => {
+            // DAEMON tab navigation. Lowercase keys + arrows
+            // walk the member axis (cursor inside the focused
+            // group); uppercase keys walk the group axis. `j`/`k`
+            // is the vim-style alias for `w`/`s`, matching the
+            // global "j/k is the same as w/s everywhere" rule
+            // the rest of the deck follows.
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Daemon => {
+                self.daemon_cursor.member = self.daemon_cursor.member.saturating_add(1);
+                self.clamp_daemon_cursor();
+            }
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Daemon => {
+                self.daemon_cursor.member = self.daemon_cursor.member.saturating_sub(1);
+            }
+            KeyCode::Char('J' | 'S') if self.current == Tab::Daemon => {
                 self.daemon_cursor.group = self.daemon_cursor.group.saturating_add(1);
                 self.daemon_cursor.member = 0;
                 self.clamp_daemon_cursor();
             }
-            KeyCode::Char('k') | KeyCode::Up if self.current == Tab::Daemon => {
+            KeyCode::Char('K' | 'W') if self.current == Tab::Daemon => {
                 self.daemon_cursor.group = self.daemon_cursor.group.saturating_sub(1);
                 self.daemon_cursor.member = 0;
-            }
-            KeyCode::Char('s') if self.current == Tab::Daemon => {
-                self.daemon_cursor.member = self.daemon_cursor.member.saturating_add(1);
-                self.clamp_daemon_cursor();
-            }
-            KeyCode::Char('w') if self.current == Tab::Daemon => {
-                self.daemon_cursor.member = self.daemon_cursor.member.saturating_sub(1);
             }
             // DAEMON tab actions: `r` proposes
             // restart-all-daemons on the cursored member's
@@ -706,36 +705,37 @@ impl App {
             KeyCode::Char('R') if self.current == Tab::Daemon => {
                 self.propose_ice_force_restart_daemon();
             }
-            // LIST tab navigation: `j`/`k` move the cursor
-            // through the nodes table (sorted by NodeId).
-            KeyCode::Char('j') | KeyCode::Down if self.current == Tab::List => {
+            // LIST tab navigation: `j`/`k`/`s`/`w` + arrows move
+            // the cursor through the nodes table (sorted by
+            // NodeId). `s`/`w` are the WASD alias for `j`/`k`.
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::List => {
                 self.list_cursor = self.list_cursor.saturating_add(1);
                 self.clamp_list_cursor();
             }
-            KeyCode::Char('k') | KeyCode::Up if self.current == Tab::List => {
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::List => {
                 self.list_cursor = self.list_cursor.saturating_sub(1);
             }
             // NET.MAP shares the peers-by-id order with LIST.
-            KeyCode::Char('j') | KeyCode::Down if self.current == Tab::NetMap => {
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::NetMap => {
                 self.netmap_cursor = self.netmap_cursor.saturating_add(1);
                 self.clamp_netmap_cursor();
             }
-            KeyCode::Char('k') | KeyCode::Up if self.current == Tab::NetMap => {
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::NetMap => {
                 self.netmap_cursor = self.netmap_cursor.saturating_sub(1);
             }
             // DATAFORTS adapter list cursor.
-            KeyCode::Char('j') | KeyCode::Down if self.current == Tab::Dataforts => {
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Dataforts => {
                 self.dataforts_cursor = self.dataforts_cursor.saturating_add(1);
                 self.clamp_dataforts_cursor();
             }
-            KeyCode::Char('k') | KeyCode::Up if self.current == Tab::Dataforts => {
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Dataforts => {
                 self.dataforts_cursor = self.dataforts_cursor.saturating_sub(1);
             }
-            KeyCode::Char('j') | KeyCode::Down if self.current == Tab::Replicas => {
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Replicas => {
                 self.replica_cursor = self.replica_cursor.saturating_add(1);
                 self.clamp_replica_cursor();
             }
-            KeyCode::Char('k') | KeyCode::Up if self.current == Tab::Replicas => {
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Replicas => {
                 self.replica_cursor = self.replica_cursor.saturating_sub(1);
             }
             // ICE force-evict-replica on the cursored chain.
@@ -752,25 +752,25 @@ impl App {
             KeyCode::Char('O') if self.current == Tab::Replicas => {
                 self.propose_ice_force_cutover();
             }
-            KeyCode::Char('j') | KeyCode::Down if self.current == Tab::Migrations => {
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Migrations => {
                 self.migration_cursor = self.migration_cursor.saturating_add(1);
                 self.clamp_migration_cursor();
             }
-            KeyCode::Char('k') | KeyCode::Up if self.current == Tab::Migrations => {
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Migrations => {
                 self.migration_cursor = self.migration_cursor.saturating_sub(1);
             }
-            KeyCode::Char('j') | KeyCode::Down if self.current == Tab::Failures => {
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Failures => {
                 self.failures_cursor = self.failures_cursor.saturating_add(1);
                 self.clamp_failures_cursor();
             }
-            KeyCode::Char('k') | KeyCode::Up if self.current == Tab::Failures => {
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Failures => {
                 self.failures_cursor = self.failures_cursor.saturating_sub(1);
             }
-            KeyCode::Char('j') | KeyCode::Down if self.current == Tab::Blobs => {
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Blobs => {
                 self.blobs_cursor = self.blobs_cursor.saturating_add(1);
                 self.clamp_blobs_cursor();
             }
-            KeyCode::Char('k') | KeyCode::Up if self.current == Tab::Blobs => {
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Blobs => {
                 self.blobs_cursor = self.blobs_cursor.saturating_sub(1);
             }
             // Vim-style top/bottom on every cursor-driven tab.
@@ -1289,7 +1289,7 @@ impl App {
                 self.modal = None;
             }
             // Cursor navigation inside the PickNode modal.
-            KeyCode::Char('j') | KeyCode::Down
+            KeyCode::Char('j' | 's') | KeyCode::Down
                 if matches!(self.modal, Some(Modal::PickNode { .. })) =>
             {
                 if let Some(Modal::PickNode { cursor, .. }) = self.modal.as_mut() {
@@ -1297,7 +1297,7 @@ impl App {
                 }
                 self.clamp_pick_cursor();
             }
-            KeyCode::Char('k') | KeyCode::Up
+            KeyCode::Char('k' | 'w') | KeyCode::Up
                 if matches!(self.modal, Some(Modal::PickNode { .. })) =>
             {
                 if let Some(Modal::PickNode { cursor, .. }) = self.modal.as_mut() {
@@ -1305,7 +1305,7 @@ impl App {
                 }
             }
             // Cluster picker cursor.
-            KeyCode::Char('j') | KeyCode::Down
+            KeyCode::Char('j' | 's') | KeyCode::Down
                 if matches!(self.modal, Some(Modal::ClusterPicker { .. })) =>
             {
                 let n = 1 + self.bookmarks.sorted().len();
@@ -1313,7 +1313,7 @@ impl App {
                     *cursor = (*cursor + 1).min(n.saturating_sub(1));
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up
+            KeyCode::Char('k' | 'w') | KeyCode::Up
                 if matches!(self.modal, Some(Modal::ClusterPicker { .. })) =>
             {
                 if let Some(Modal::ClusterPicker { cursor }) = self.modal.as_mut() {
