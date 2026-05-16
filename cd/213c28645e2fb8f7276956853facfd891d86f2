@@ -1,0 +1,21 @@
+net/crates/net/deck/src/tabs/net_map.rs
+  s_3bbc444b3ef3e5::t_e8831ce1fcdaa9 1-18,38,42-46,49-61,69-70,72-79,81,98,104-105,108-109,122-128,135,162,169,175-184,194-250,255,269,284-344,346,349-359,363-367
+net/crates/net/deck/src/app.rs
+  s_3bbc444b3ef3e5::t_51558f4db648e4 2253,2260
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "cd213c28645e2fb8f7276956853facfd891d86f2",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
