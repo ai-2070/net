@@ -50,6 +50,8 @@ fn node_focus_chips() -> Line<'static> {
     spans.extend([
         chip_key("Enter"),
         chip_desc(" daemon   "),
+        chip_key("l"),
+        chip_desc(" logs   "),
         chip_key("c/C"),
         chip_desc(" cordon   "),
         chip_key("d"),
@@ -75,6 +77,8 @@ fn daemon_focus_chips() -> Line<'static> {
     spans.extend([
         chip_key("Enter"),
         chip_desc(" drill   "),
+        chip_key("l"),
+        chip_desc(" logs   "),
         chip_key("r"),
         chip_desc(" restart   "),
         chip_key("R"),
@@ -97,6 +101,8 @@ fn tab_chips(current: Tab) -> Line<'static> {
             spans.extend([
                 chip_key("Enter"),
                 chip_desc(" detail   "),
+                chip_key("l"),
+                chip_desc(" logs   "),
                 chip_key("c/C"),
                 chip_desc(" cordon   "),
                 chip_key("d"),
@@ -110,7 +116,12 @@ fn tab_chips(current: Tab) -> Line<'static> {
             ]);
         }
         Tab::Daemons => {
-            spans.extend([chip_key("Enter"), chip_desc(" host node   ")]);
+            spans.extend([
+                chip_key("Enter"),
+                chip_desc(" host node   "),
+                chip_key("l"),
+                chip_desc(" logs   "),
+            ]);
         }
         Tab::Dataforts => {
             spans.extend([
@@ -118,6 +129,8 @@ fn tab_chips(current: Tab) -> Line<'static> {
                 chip_desc(" detail   "),
                 chip_key("b"),
                 chip_desc(" blobs   "),
+                chip_key("l"),
+                chip_desc(" logs   "),
             ]);
         }
         Tab::Groups => {

@@ -24,6 +24,7 @@ const NAVIGATION: &[Binding] = &[
     Binding { keys: "Enter",     desc: "BLOBS: blob detail · NODES/NET.MAP/DATAFORTS: node page · DAEMONS/GROUPS/MIGRATIONS: daemon page · NODE→DAEMON, DAEMON→NODE/SIBLING" },
     Binding { keys: "Esc",       desc: "close node page / modal / search prompt (else quit)" },
     Binding { keys: "b",         desc: "DATAFORTS: jump to BLOBS" },
+    Binding { keys: "l",         desc: "NODES/DAEMONS/GROUPS/DATAFORTS + node/daemon page: jump to LOGS filtered for the cursored id" },
     Binding { keys: "Tab / ◂▸",  desc: "cycle tab" },
     Binding { keys: "↓ / ↑",     desc: "cursor down / up (also j/k or s/w)" },
     Binding { keys: "g / G",     desc: "cursor to top / bottom" },

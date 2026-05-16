@@ -788,6 +788,25 @@ impl App {
     /// takes an explicit id rather than a peer-index — the host
     /// is often the local node, which doesn't live in
     /// `snapshot.peers`.
+    /// Pivot to the LOGS tab with the search prefilled to the
+    /// given entity id (node or daemon). The substrate stamps
+    /// `node_id` + `daemon_id` on every record, and the LOGS
+    /// `record_matches` filter greps the rendered `0xN` form of
+    /// each, so a single hex string narrows the tail to just
+    /// the entries touching that entity. Also drops the
+    /// level filter to Debug so nothing's hidden, and clears
+    /// any active node/daemon focus since the operator is now
+    /// reading logs.
+    fn filter_logs_for_id(&mut self, id: u64) {
+        self.logs_search = format!("0x{id:x}");
+        self.logs_search_editing = false;
+        self.logs_min_level = net_sdk::deck::LogLevel::Debug;
+        self.logs_paused = None;
+        self.current = Tab::Logs;
+        self.node_focus = None;
+        self.daemon_focus = None;
+    }
+
     /// Build a `PeerSnapshot` representing the local node from
     /// the synthetic datafort fixture data. The substrate's fold
     /// never inserts the local node into `snapshot.peers` (probes
@@ -1284,6 +1303,13 @@ impl App {
             } else if matches!(code, KeyCode::Char('R')) {
                 self.propose_ice_force_restart_daemon();
                 return;
+            } else if matches!(code, KeyCode::Char('l')) {
+                // Pivot to LOGS filtered for this daemon's id.
+                if let Some(focus) = self.daemon_focus.as_ref() {
+                    let id = focus.id;
+                    self.filter_logs_for_id(id);
+                }
+                return;
             } else if matches!(code, KeyCode::Char('?')) {
                 self.modal = Some(Modal::Help);
                 return;
@@ -1345,6 +1371,17 @@ impl App {
                 return;
             } else if matches!(code, KeyCode::Char('A')) {
                 self.propose_ice_flush_avoid_lists();
+                return;
+            } else if matches!(code, KeyCode::Char('l')) {
+                // Pivot to LOGS filtered for this node's id —
+                // greps the tail for `0x<hex>` matches on
+                // either `node_id` or `daemon_id` so the
+                // operator sees every record touching this
+                // host (own daemons + node-level chatter).
+                if let Some(focus) = self.node_focus.as_ref() {
+                    let id = focus.id;
+                    self.filter_logs_for_id(id);
+                }
                 return;
             } else if matches!(code, KeyCode::Char('?')) {
                 self.modal = Some(Modal::Help);
@@ -1657,6 +1694,33 @@ impl App {
             // inventory of the same adapter.
             KeyCode::Char('b') if self.current == Tab::Dataforts => {
                 self.current = Tab::Blobs;
+            }
+            // DATAFORTS / NODES: `l` pivots straight to LOGS
+            // filtered for the cursored row's id. Saves the
+            // operator the Enter → l detour through the NODE
+            // page when they already know which host they want
+            // a log tail for.
+            KeyCode::Char('l') if self.current == Tab::Dataforts => {
+                let entries = self.collect_dataforts();
+                if let Some(entry) = entries.get(self.dataforts_cursor) {
+                    let id = entry.id;
+                    self.filter_logs_for_id(id);
+                }
+            }
+            KeyCode::Char('l') if self.current == Tab::Nodes => {
+                if let Some(id) = self.cursored_node() {
+                    self.filter_logs_for_id(id);
+                }
+            }
+            KeyCode::Char('l') if self.current == Tab::Daemons => {
+                if let Some((id, _)) = self.cursored_daemon_for_admin() {
+                    self.filter_logs_for_id(id);
+                }
+            }
+            KeyCode::Char('l') if self.current == Tab::Groups => {
+                if let Some((id, _)) = self.cursored_daemon_for_admin() {
+                    self.filter_logs_for_id(id);
+                }
             }
             KeyCode::Char('n') if self.current == Tab::Audit => {
                 self.audit_limit = match self.audit_limit {
