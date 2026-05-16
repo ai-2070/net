@@ -48,6 +48,12 @@ pub fn amber() -> Style {
 pub fn red() -> Style {
     Style::default().fg(RED)
 }
+/// Bold variant of [`red`] for catastrophic-tier signals
+/// (e.g. NRPC latencies in the seconds-or-more band where
+/// "slow" already saturated the regular red).
+pub fn red_hi() -> Style {
+    Style::default().fg(RED).add_modifier(Modifier::BOLD)
+}
 pub fn cyan() -> Style {
     Style::default().fg(CYAN)
 }

@@ -120,11 +120,16 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, calls: &[NrpcCall], paused: b
             Constraint::Length(20), // caller (id.label)
             Constraint::Length(2),  // arrow
             Constraint::Length(20), // callee (id.label)
-            Constraint::Min(28),    // method (flex)
+            Constraint::Length(28), // method
             Constraint::Length(9),  // latency
             Constraint::Length(8),  // req bytes
             Constraint::Length(8),  // resp bytes
-            Constraint::Length(20), // status
+            // STATUS as flex so a long error reason
+            // ("Err: kinematic singularity", "Err: model
+            // overloaded") isn't silently clipped at a fixed
+            // width. Sits last so narrow terminals shrink the
+            // status tail rather than dropping a column.
+            Constraint::Min(20),
         ],
     )
     .header(header)
@@ -137,9 +142,14 @@ fn cell_dim(s: &'static str) -> Cell<'static> {
     Cell::from(Span::styled(s, theme::chrome()))
 }
 
-/// Latency colouring: green under 10ms, amber 10-100ms, red
-/// above. Matches the latency-aware coloring on the NET.MAP
-/// proximity layout so cross-tab pivots stay coherent.
+/// Latency colouring tiers:
+///   * `< 10ms` green
+///   * `10..100ms` amber
+///   * `100..1000ms` red (slow but bounded)
+///   * `>= 1000ms` bold red (catastrophic — seconds-tier)
+///
+/// The bold-red tier distinguishes a 240 ms outlier from a 6 s
+/// outage; without it both rendered as the same shade of red.
 fn format_latency(ms: u32) -> (String, ratatui::style::Style) {
     let text = if ms < 1_000 {
         format!("{ms}ms")
@@ -150,8 +160,10 @@ fn format_latency(ms: u32) -> (String, ratatui::style::Style) {
         theme::green()
     } else if ms < 100 {
         theme::amber()
-    } else {
+    } else if ms < 1_000 {
         theme::red()
+    } else {
+        theme::red_hi()
     };
     (text, style)
 }
