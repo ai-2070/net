@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::{nodes, theme};
+use crate::theme;
 
 /// LOGS tab view state — the filter / search / pause knobs the
 /// operator twiddles. Grouped into a struct so `render` doesn't
@@ -274,42 +274,13 @@ fn project_log_records(
         .filter(|r| level_rank(r.level) >= min)
         .filter(|r| needle.is_empty() || record_matches(r, &needle))
     {
-        let (level_style, level_pad) = match rec.level {
-            LogLevel::Debug => (theme::chrome(), "DEBUG"),
-            LogLevel::Info => (theme::dim(), "INFO "),
-            LogLevel::Warn => (theme::amber(), "WARN "),
-            LogLevel::Error => (theme::red(), "ERR  "),
-            _ => (theme::text(), "?    "),
-        };
-        let ts = format_ts_ms(rec.ts_ms);
-        let mut spans = vec![
-            Span::styled(ts, theme::chrome()),
-            Span::styled("  ", theme::chrome()),
-            Span::styled(level_pad.to_string(), level_style),
-            Span::styled("  ", theme::chrome()),
-        ];
-        // The runtime stamps `node_id` and `daemon_id` on every
-        // record. Format `<node>/<daemon>` so the source column
-        // still reads even when one or the other is missing.
-        match (rec.node_id, rec.daemon_id) {
-            (Some(node), Some(daemon)) => {
-                spans.extend(nodes::id_spans(&format!("0x{node:x}")));
-                spans.push(Span::styled("/", theme::chrome()));
-                spans.push(Span::styled(format!("0x{daemon:x}"), theme::cyan()));
-            }
-            (Some(node), None) => {
-                spans.extend(nodes::id_spans(&format!("0x{node:x}")));
-            }
-            (None, Some(daemon)) => {
-                spans.push(Span::styled(format!("daemon.0x{daemon:x}"), theme::cyan()));
-            }
-            (None, None) => {
-                spans.push(Span::styled("—", theme::chrome()));
-            }
-        }
-        spans.push(Span::styled("  ", theme::chrome()));
-        spans.push(Span::styled(rec.message.clone(), theme::text()));
-        out.push(Line::from(spans));
+        // The shared `render_event_line` helper produces the
+        // combined `TS  ICON  source  message` shape used by
+        // both LOGS and the NET.MAP MESH.EVENTS panel. Icon +
+        // color encode level + a coarse content category in a
+        // single column, replacing the prior dedicated LEVEL
+        // column.
+        out.push(super::render_event_line(rec));
     }
     out
 }

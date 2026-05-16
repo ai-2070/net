@@ -17,7 +17,7 @@
 //! this is the at-a-glance "what's happening across the mesh"
 //! view that pairs with the spatial layout above.
 
-use net_sdk::deck::{LogLevel, LogRecord, MeshOsSnapshot, PeerHealthSnapshot};
+use net_sdk::deck::{LogRecord, MeshOsSnapshot, PeerHealthSnapshot};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     symbols::Marker,
@@ -394,33 +394,14 @@ fn render_events(frame: &mut Frame<'_>, area: Rect, logs: &[LogRecord]) {
     let start = logs.len().saturating_sub(take);
     let mut lines: Vec<Line> = Vec::with_capacity(take);
     for r in &logs[start..] {
-        let (level_text, level_style) = match r.level {
-            LogLevel::Error => ("ERROR", theme::red()),
-            LogLevel::Warn => ("WARN ", theme::amber()),
-            LogLevel::Info => ("INFO ", theme::green()),
-            LogLevel::Debug => ("DEBUG", theme::dim()),
-            _ => ("?    ", theme::dim()),
-        };
-        // Source attribution by what the record actually
-        // carries: a daemon id beats a node id, a node id (no
-        // daemon) reads as `node.0x…`, and only the bare
-        // (None, None) case falls back to "substrate".
-        let source = match (r.daemon_id, r.node_id) {
-            (Some(d), _) => format!("daemon.0x{d:x}"),
-            (None, Some(n)) => format!("node.0x{n:x}"),
-            (None, None) => "substrate".to_string(),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {}  ", fmt_ts(r.ts_ms)), theme::chrome()),
-            Span::styled(level_text.to_string(), level_style),
-            Span::styled(format!("  {source:<14}  "), theme::cyan()),
-            Span::styled(r.message.clone(), theme::text()),
-        ]));
+        // Shared `render_event_line` produces the combined
+        // `TS  ICON  source  message` shape; the LOGS tab uses
+        // the same helper so both surfaces speak the same
+        // visual vocabulary.
+        lines.push(super::render_event_line(r));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
-
-use super::fmt_ts_hms_ms as fmt_ts;
 
 // ───────────────────────── legend ─────────────────────────
 

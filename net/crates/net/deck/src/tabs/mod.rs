@@ -66,3 +66,145 @@ pub fn unix_now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+/// Glyph + color for a log record, derived from level + a
+/// coarse message-content classifier. Replaces the prior
+/// dedicated LEVEL column on the LOGS / MESH.EVENTS surfaces
+/// — the icon does double duty as a severity tag and an
+/// at-a-glance event-category marker.
+///
+/// Categories (Info level only — Warn / Error / Debug short-
+/// circuit to their own glyphs):
+///
+/// - `▶` announce / publish / commit / verified — broadcast
+///   and admin-acknowledgement events.
+/// - `↗` started / transfer / snapshot / register — outgoing
+///   work the local node initiated.
+/// - `↘` drained / fetch / acked / received / completed —
+///   incoming or terminal events.
+/// - `↻` retry / restart / rotation / reflow / freeze / thaw /
+///   rebalance / swept — lifecycle cycling.
+/// - `·` default catch-all.
+pub fn event_icon(
+    rec: &net_sdk::deck::LogRecord,
+) -> (char, ratatui::style::Style) {
+    use net_sdk::deck::LogLevel;
+    // Every glyph here MUST render at one terminal cell —
+    // mixing 1-cell and 2-cell characters jitters the source
+    // column right by a cell per emoji row. `⚠` (U+26A0) gets
+    // emoji presentation by default in Windows Terminal /
+    // most modern fonts, so we use `▲` (U+25B2, BMP triangle)
+    // instead. `✗` / `▶` / `↗` / `↘` / `↻` / `·` all stay
+    // text-presented at one cell.
+    match rec.level {
+        LogLevel::Error => ('✗', crate::theme::red()),
+        LogLevel::Warn => ('▲', crate::theme::amber()),
+        LogLevel::Debug => ('·', crate::theme::dim()),
+        _ => classify_info(&rec.message),
+    }
+}
+
+fn classify_info(message: &str) -> (char, ratatui::style::Style) {
+    // ASCII case-insensitive substring scan; the fixture
+    // vocabulary is English / ASCII so a plain lowercase view
+    // is fine. Order matters — first match wins, so the more
+    // specific categories (cycle / pull / push) sit before the
+    // catch-all dot.
+    let lower = message.to_ascii_lowercase();
+    let contains_any = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
+    if contains_any(&[
+        "announce",
+        "advertise",
+        "publish",
+        "intent",
+        "commit",
+        "verified",
+        "bundle",
+    ]) {
+        return ('▶', crate::theme::green());
+    }
+    if contains_any(&[
+        "started",
+        "transfer",
+        "snapshot taken",
+        "register",
+        "store",
+    ]) {
+        return ('↗', crate::theme::green());
+    }
+    if contains_any(&[
+        "drained",
+        "fetch",
+        "acked",
+        "received",
+        "completed",
+        "cleared",
+        "swept",
+        "pull",
+    ]) {
+        return ('↘', crate::theme::cyan());
+    }
+    if contains_any(&[
+        "retry",
+        "restart",
+        "rotation",
+        "reflow",
+        "freeze",
+        "thaw",
+        "rebalance",
+        "cutover",
+        "drain",
+    ]) {
+        return ('↻', crate::theme::cyan());
+    }
+    ('·', crate::theme::dim())
+}
+
+/// Compact source attribution string for a log record.
+/// Mirrors the prior NET.MAP source rule:
+/// - daemon id present → `daemon.0x<hex>`
+/// - node id present, no daemon → `node.0x<hex>`
+/// - neither → `substrate`
+pub fn event_source(rec: &net_sdk::deck::LogRecord) -> String {
+    match (rec.daemon_id, rec.node_id) {
+        (Some(d), _) => format!("daemon.0x{d:x}"),
+        (None, Some(n)) => format!("node.0x{n:x}"),
+        (None, None) => "substrate".to_string(),
+    }
+}
+
+/// Render a `LogRecord` as a single ratatui line in the
+/// combined format the LOGS + MESH.EVENTS surfaces share:
+///
+///   `HH:MM:SS.mmm  ICON  source  message`
+///
+/// Icon + source + message are each styled distinctly so the
+/// operator's eye lands on the event category first, the
+/// origin second, and the body last.
+pub fn render_event_line(
+    rec: &net_sdk::deck::LogRecord,
+) -> ratatui::text::Line<'static> {
+    use ratatui::text::Span;
+    let (icon, icon_style) = event_icon(rec);
+    let source = event_source(rec);
+    // Source pad sized to the widest realistic attribution:
+    // `daemon.0x` (9) + up-to-10-hex daemon id = 19 chars.
+    // Under-pad and the daemon rows would overflow with no
+    // trailing space, jamming the message body up against
+    // the source while `node.0x1` rows kept their breathing
+    // room — the staggered look the prior `<14` produced.
+    const SOURCE_PAD: usize = 19;
+    // Source label tracks the icon color so the eye sees one
+    // categorical band per row instead of cyan-everywhere vs.
+    // category-colored-icon. Warn / error / cycle / announce
+    // rows pick up their accent on the attribution column too.
+    ratatui::text::Line::from(vec![
+        Span::styled(format!("  {}  ", fmt_ts_hms_ms(rec.ts_ms)), crate::theme::chrome()),
+        Span::styled(format!("{icon} "), icon_style),
+        Span::styled(
+            format!("{source:<width$}  ", source = source, width = SOURCE_PAD),
+            icon_style,
+        ),
+        Span::styled(rec.message.clone(), crate::theme::text()),
+    ])
+}
