@@ -339,6 +339,12 @@ pub enum Modal {
     /// the substrate RPC slice isn't landed yet.
     ClusterPicker {
         cursor: usize,
+        /// Sorted snapshot taken at modal-open time. Cached so
+        /// the cursor handler + render path don't re-sort the
+        /// bookmark store on every `j`/`k` keystroke. Bookmarks
+        /// can't be mutated while the picker is open, so a
+        /// snapshot-at-open is durably correct.
+        sorted: Vec<crate::bookmarks::Bookmark>,
     },
     /// Blob detail — opened with `[Enter]` on the BLOBS tab.
     /// Snapshots the cursored entry into the modal so a
@@ -1582,7 +1588,9 @@ impl App {
             }
             // Cluster picker — global, opens from any tab.
             KeyCode::Char(':') => {
-                self.modal = Some(Modal::ClusterPicker { cursor: 0 });
+                let sorted: Vec<crate::bookmarks::Bookmark> =
+                    self.bookmarks.sorted().into_iter().cloned().collect();
+                self.modal = Some(Modal::ClusterPicker { cursor: 0, sorted });
             }
             // `l` was previously bound here as a vim-style
             // tab-cycle alias, but the per-tab / focus-mode
@@ -2367,15 +2375,15 @@ impl App {
             KeyCode::Char('j' | 's') | KeyCode::Down
                 if matches!(self.modal, Some(Modal::ClusterPicker { .. })) =>
             {
-                let n = 1 + self.bookmarks.sorted().len();
-                if let Some(Modal::ClusterPicker { cursor }) = self.modal.as_mut() {
+                if let Some(Modal::ClusterPicker { cursor, sorted }) = self.modal.as_mut() {
+                    let n = 1 + sorted.len();
                     *cursor = (*cursor + 1).min(n.saturating_sub(1));
                 }
             }
             KeyCode::Char('k' | 'w') | KeyCode::Up
                 if matches!(self.modal, Some(Modal::ClusterPicker { .. })) =>
             {
-                if let Some(Modal::ClusterPicker { cursor }) = self.modal.as_mut() {
+                if let Some(Modal::ClusterPicker { cursor, .. }) = self.modal.as_mut() {
                     *cursor = cursor.saturating_sub(1);
                 }
             }
@@ -2386,7 +2394,7 @@ impl App {
                     Some(Modal::PickNode { purpose, cursor }) => {
                         self.commit_pick(purpose, cursor);
                     }
-                    Some(Modal::ClusterPicker { cursor }) => {
+                    Some(Modal::ClusterPicker { cursor, .. }) => {
                         self.commit_cluster_pick(cursor);
                     }
                     // BlobDetail: Enter opens the NODE page for
@@ -3048,13 +3056,11 @@ impl App {
             }) => {
                 widgets::param_input::render(frame, area, purpose, buffer, error.as_deref());
             }
-            Some(Modal::ClusterPicker { cursor }) => {
-                let sorted: Vec<crate::bookmarks::Bookmark> =
-                    self.bookmarks.sorted().into_iter().cloned().collect();
+            Some(Modal::ClusterPicker { cursor, sorted }) => {
                 widgets::cluster_picker::render(
                     frame,
                     area,
-                    &sorted,
+                    sorted,
                     &self.active_cluster,
                     *cursor,
                 );
