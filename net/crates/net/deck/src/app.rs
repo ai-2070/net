@@ -671,25 +671,26 @@ impl App {
             KeyCode::Char('7') => self.current = Tab::Migrations,
             KeyCode::Char('8') => self.current = Tab::Replicas,
             KeyCode::Char('9') => self.current = Tab::Failures,
-            // DAEMON tab navigation. Lowercase keys + arrows
-            // walk the member axis (cursor inside the focused
-            // group); uppercase keys walk the group axis. `j`/`k`
-            // is the vim-style alias for `w`/`s`, matching the
-            // global "j/k is the same as w/s everywhere" rule
-            // the rest of the deck follows.
-            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Daemon => {
+            // DAEMON tab navigation. Lowercase letters walk the
+            // member axis (cursor inside the focused group);
+            // uppercase letters + arrows walk the group axis.
+            // Arrows match the group axis because operators
+            // typically think of the daemon list as "groups
+            // first, members within"; the member axis is the
+            // tighter sub-cursor reached via j/k/w/s.
+            KeyCode::Char('j' | 's') if self.current == Tab::Daemon => {
                 self.daemon_cursor.member = self.daemon_cursor.member.saturating_add(1);
                 self.clamp_daemon_cursor();
             }
-            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Daemon => {
+            KeyCode::Char('k' | 'w') if self.current == Tab::Daemon => {
                 self.daemon_cursor.member = self.daemon_cursor.member.saturating_sub(1);
             }
-            KeyCode::Char('J' | 'S') if self.current == Tab::Daemon => {
+            KeyCode::Char('J' | 'S') | KeyCode::Down if self.current == Tab::Daemon => {
                 self.daemon_cursor.group = self.daemon_cursor.group.saturating_add(1);
                 self.daemon_cursor.member = 0;
                 self.clamp_daemon_cursor();
             }
-            KeyCode::Char('K' | 'W') if self.current == Tab::Daemon => {
+            KeyCode::Char('K' | 'W') | KeyCode::Up if self.current == Tab::Daemon => {
                 self.daemon_cursor.group = self.daemon_cursor.group.saturating_sub(1);
                 self.daemon_cursor.member = 0;
             }
