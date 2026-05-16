@@ -1,0 +1,23 @@
+net/crates/net/sdk/src/meshdb.rs
+  s_3bbc444b3ef3e5::t_ff6ca2da51e5cf 1-73
+net/crates/net/sdk/src/lib.rs
+  s_3bbc444b3ef3e5::t_ca4be2bec244f9 47-48
+net/crates/net/sdk/Cargo.toml
+  s_3bbc444b3ef3e5::t_3bb72dae84732b 100-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "bb867481e885b31a35ecfe336708625271363e5a",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
