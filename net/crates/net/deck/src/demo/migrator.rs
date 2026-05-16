@@ -51,9 +51,13 @@ const MIGRATION_CYCLE_INTERVAL: Duration = Duration::from_secs(30);
 /// transition without the next cycle racing.
 const MIGRATION_COMPLETION_WAIT: Duration = Duration::from_secs(8);
 
-/// Compute-layer daemon used as the migration subject. Stateless,
-/// no inbound processing — the substrate's migration path only
-/// needs the daemon to be registered + spawnable, not to do work.
+/// Compute-layer daemon used as the migration subject. The
+/// substrate's migration path won't initiate a transfer for a
+/// daemon that reports `is_stateful() == false` OR returns
+/// `None` from `snapshot()` — the orchestrator surfaces this
+/// as `state operation failed: daemon is stateless or snapshot
+/// failed`. We report stateful + return a tiny placeholder
+/// snapshot so the 6-phase machine has something to ship.
 struct MigratableDaemon;
 
 impl ComputeMeshDaemon for MigratableDaemon {
@@ -65,6 +69,20 @@ impl ComputeMeshDaemon for MigratableDaemon {
     }
     fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, TraitDaemonError> {
         Ok(vec![])
+    }
+    fn is_stateful(&self) -> bool {
+        true
+    }
+    fn snapshot(&self) -> Option<Bytes> {
+        // Empty payload is enough — the demo only cares that
+        // the migration's Snapshot → Transfer → Restore phases
+        // tick through end-to-end. A future slice could
+        // serialize a fake counter / tick to make the round-
+        // trip visible to the target's `restore`.
+        Some(Bytes::new())
+    }
+    fn restore(&mut self, _state: Bytes) -> Result<(), TraitDaemonError> {
+        Ok(())
     }
 }
 
@@ -142,18 +160,17 @@ async fn run_loop(runtimes: Vec<DaemonRuntime>, node_ids: Vec<NodeId>, total: us
                         // before the next cycle.
                         tokio::time::sleep(MIGRATION_COMPLETION_WAIT).await;
                     }
-                    Err(ComputeDaemonError::Migration(_))
-                    | Err(ComputeDaemonError::MigrationFailed(_)) => {
+                    Err(e @ ComputeDaemonError::Migration(_))
+                    | Err(e @ ComputeDaemonError::MigrationFailed(_)) => {
                         // Cross-node UDP migration on loopback
                         // is best-effort; some attempts may fail
                         // when the target's DaemonRuntime hasn't
                         // finished accepting yet. Don't kill the
-                        // loop — log via stderr and try the
-                        // next cycle.
+                        // loop — log the underlying reason and
+                        // try the next cycle.
                         eprintln!(
                             "[deck demo] migration cycle {cycle} \
-                             from node[0]->node[{target_idx}] failed; \
-                             continuing"
+                             node[0]->node[{target_idx}] failed: {e}"
                         );
                     }
                     Err(e) => {
