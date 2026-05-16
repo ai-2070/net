@@ -114,7 +114,7 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     let deck = Arc::new(DeckClient::from_runtime(sdk.runtime(), identity));
 
     #[cfg(feature = "samples")]
-    let _daemons = samples::install(&sdk)?;
+    let _daemons = samples::install(&sdk).await?;
 
     // Real `MeshBlobAdapter` set in samples mode — three
     // instances against in-memory `Redex` handles with
@@ -441,9 +441,13 @@ mod samples {
     /// Install probes + register 11 grouped daemons + seed
     /// the snapshot's `replicas` map by publishing
     /// `ReplicaUpdate::Added` + `PlacementIntent` events
-    /// through the runtime handle. No background task — once
-    /// the seed events fold, the snapshot is steady-state.
-    pub fn install(sdk: &MeshOsDaemonSdk) -> color_eyre::Result<Vec<MeshOsDaemonHandle>> {
+    /// through the runtime handle. Awaits the seeding completes
+    /// before returning so the App starts against a fully
+    /// populated steady-state snapshot rather than a partial
+    /// one.
+    pub async fn install(
+        sdk: &MeshOsDaemonSdk,
+    ) -> color_eyre::Result<Vec<MeshOsDaemonHandle>> {
         sdk.runtime()
             .add_locality_probe(Arc::new(SampleLocalityProbe));
         sdk.runtime().add_health_probe(Arc::new(SampleHealthProbe));
@@ -451,29 +455,26 @@ mod samples {
             .add_inventory_probe(Arc::new(SampleInventoryProbe));
 
         // Replica seeding: fire one ReplicaUpdate per (chain,
-        // holder) plus one PlacementIntent per chain. Run in a
-        // background task because publish is async; the task
-        // completes after a handful of awaits and naturally
-        // drops.
+        // holder) plus one PlacementIntent per chain. Done
+        // inline (no detached spawn) so the harness drop can't
+        // race with partial population.
         let handle = sdk.runtime().handle_clone();
-        tokio::spawn(async move {
-            for (chain, desired, holders) in CHAINS {
+        for (chain, desired, holders) in CHAINS {
+            let _ = handle
+                .publish(MeshOsEvent::PlacementIntent(PlacementIntent {
+                    chain: *chain,
+                    desired_replicas: *desired,
+                }))
+                .await;
+            for holder in holders.iter() {
                 let _ = handle
-                    .publish(MeshOsEvent::PlacementIntent(PlacementIntent {
+                    .publish(MeshOsEvent::ReplicaUpdate(ReplicaUpdate::Added {
                         chain: *chain,
-                        desired_replicas: *desired,
+                        holder: *holder,
                     }))
                     .await;
-                for holder in holders.iter() {
-                    let _ = handle
-                        .publish(MeshOsEvent::ReplicaUpdate(ReplicaUpdate::Added {
-                            chain: *chain,
-                            holder: *holder,
-                        }))
-                        .await;
-                }
             }
-        });
+        }
 
         // 11 daemons across all four lineage groups. The
         // `#suffix` convention in each name is parsed by
