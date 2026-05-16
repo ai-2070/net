@@ -1,0 +1,23 @@
+net/crates/net/docs/plans/MESHOS_SDK_PLAN.md
+  s_5af7ced268385a::t_38ab86ee6d40ad 7,9-22
+  s_5af7ced268385a::t_1f11d03f303233 107,109,112-113,116-121,123-135,138,140-141,143-145,148-163,169-172,176-177,180-185
+  s_5af7ced268385a::t_c22cb9f815976f 534-538,540
+  s_5af7ced268385a::t_4ebc21f18ed31e 207,209,212-218,223,231-260,265,269,271-279,282-284,286,288,290,293,307-311,313,315-323,328,330,332,340-341,346,349-351,353,355,358-360,365,380-395,400,404-407,410-412,414,419-421,423,425,441-446,448-452,454-456,458-459,461-462,464-470,476-478
+  s_5af7ced268385a::t_ce27b0364e95a3 488
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "39bbe6cc9d4ce26dafc4d5b75e916f3a7e651c48",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
