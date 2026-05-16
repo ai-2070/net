@@ -2549,6 +2549,7 @@ impl App {
                 chunks[3],
                 Some(&self.snapshot),
                 self.migration_cursor,
+                self.this_node,
             ),
             Tab::Failures => {
                 let records = self.failures_tail.snapshot();
