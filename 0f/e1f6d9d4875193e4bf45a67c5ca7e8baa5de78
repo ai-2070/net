@@ -1,0 +1,21 @@
+net/crates/net/deck/src/nodes.rs
+  s_4a2fa2d5f63459::t_ec4c17f85dbf74 16-17,20,24,28,32,36,38,41,45,49,51-52,55,59,63,65-66,69,73,75-76,79,82-83,85,87-88,92
+net/crates/net/deck/src/runtime.rs
+  s_4a2fa2d5f63459::t_8b938d78d798d1 399-405,410-468,470-504,506-530,532-537,540-546,550-563
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "0fe1f6d9d4875193e4bf45a67c5ca7e8baa5de78",
+  "prompts": {},
+  "sessions": {
+    "s_4a2fa2d5f63459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5d060031-ba25-4cac-9cbf-32d9a94cbf0c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
