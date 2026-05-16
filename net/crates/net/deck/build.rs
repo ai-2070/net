@@ -36,11 +36,21 @@ fn main() {
         .unwrap_or_else(|| "dev".to_string());
 
     println!("cargo:rustc-env=DECK_GIT_SHA={sha}");
-    // No `rerun-if-changed` for the .git tree — the path
-    // depends on the active branch (`.git/refs/heads/<branch>`)
-    // and is brittle to detached HEAD / packed-refs. Source
-    // edits typically accompany commits, so cargo's default
-    // rebuild trigger catches the common case; CI builds run
-    // build.rs every time anyway.
+    // Re-run when HEAD itself moves (any commit on the
+    // currently checked-out branch). On detached HEAD or a
+    // freshly-cloned repo the file is still present, so this
+    // is robust against typical worktree shapes. Walking
+    // `.git/refs/heads/*` would also catch packed-refs
+    // explicitly but the additional surface mostly fires on
+    // unrelated branch updates.
+    let head_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("..")
+        .join(".git")
+        .join("HEAD");
+    if head_path.exists() {
+        println!("cargo:rerun-if-changed={}", head_path.display());
+    }
     println!("cargo:rerun-if-env-changed=DECK_GIT_SHA");
 }
