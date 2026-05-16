@@ -1,0 +1,21 @@
+net/crates/net/deck/src/widgets/param_input.rs
+  s_46edf7dc333ef6::t_1dd4173dae99d5 79-83,89-98,102,113-122,126,129,136-140,148-153
+net/crates/net/deck/src/app.rs
+  s_46edf7dc333ef6::t_c336a2bf6ae6c5 2022-2025
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "3d32df80a070017dda0debdffe3a4a793723d27e",
+  "prompts": {},
+  "sessions": {
+    "s_46edf7dc333ef6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e145bb62-38ea-4dbe-81cd-e36e7e65c2ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
