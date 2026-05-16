@@ -15,6 +15,7 @@
 //!   runtime + supervisor produce on their own.
 
 mod app;
+mod bookmarks;
 mod lineage;
 mod nodes;
 mod runtime;
@@ -45,9 +46,26 @@ async fn main() -> color_eyre::Result<()> {
     let _failures_stream_task =
         streams::spawn_failures_stream(deck.clone(), failures_tail.clone());
 
+    // Bookmark store — loaded from `$XDG_CONFIG_HOME/deck/bookmarks.toml`
+    // (or the platform equivalent). A first-run with no config
+    // directory yields an empty store; a malformed file is
+    // surfaced via stderr so the operator notices. The picker
+    // UX that consumes this ships with the multi-cluster slice.
+    let bookmarks = bookmarks::BookmarkStore::load().unwrap_or_else(|err| {
+        eprintln!("[deck] bookmark store: {err} — using empty store");
+        bookmarks::BookmarkStore::empty()
+    });
+
     let terminal = ratatui::init();
-    let result =
-        App::new(deck, logs_tail, audit_tail, failures_tail, blob_metrics).run(terminal);
+    let result = App::new(
+        deck,
+        logs_tail,
+        audit_tail,
+        failures_tail,
+        blob_metrics,
+        bookmarks,
+    )
+    .run(terminal);
     ratatui::restore();
 
     // Explicit drop so the harness's tear-down runs before

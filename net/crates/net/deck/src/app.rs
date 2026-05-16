@@ -98,6 +98,14 @@ pub struct App {
     /// it); `None` when the adapter is unhooked. The DATAFORTS
     /// tab snapshots from this on each render.
     pub blob_metrics: Option<Arc<net_sdk::dataforts::BlobMetrics>>,
+    /// Cluster bookmark store — loaded from
+    /// `$XDG_CONFIG_HOME/deck/bookmarks.toml` at startup. Used
+    /// by the (still-deferred) Multi-Cluster Switcher; holds
+    /// the persisted "known meshes" list so the bookmark picker
+    /// reads + writes through this handle. Empty in default
+    /// builds until the operator adds their first cluster.
+    #[allow(dead_code)] // consumed by the multi-cluster picker slice
+    pub bookmarks: crate::bookmarks::BookmarkStore,
     /// Cursor on the DAEMON tab's lineage tree. Indices into
     /// the live group list — `j`/`k` move the cursor; the
     /// detail pane on the right reflects whichever member is
@@ -241,6 +249,7 @@ impl App {
         audit_tail: crate::streams::AuditTail,
         failures_tail: crate::streams::FailuresTail,
         blob_metrics: Option<Arc<net_sdk::dataforts::BlobMetrics>>,
+        bookmarks: crate::bookmarks::BookmarkStore,
     ) -> Self {
         let snapshot = Arc::new(deck.status());
         Self {
@@ -249,6 +258,7 @@ impl App {
             audit_tail,
             failures_tail,
             blob_metrics,
+            bookmarks,
             should_quit: false,
             started: Instant::now(),
             tick: 0,

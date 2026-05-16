@@ -19,6 +19,10 @@ ai2070-net-sdk = { path = "../sdk", features = ["meshos", "deck", "dataforts"] }
 bytes = "1"
 parking_lot = "0.12"
 futures = { version = "0.3", default-features = false, features = ["std"] }
+# Bookmark store at `$XDG_CONFIG_HOME/deck/bookmarks.toml`.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
 
 [features]
 default = []
