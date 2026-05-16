@@ -1297,6 +1297,10 @@ impl BlobAdapter for MeshBlobAdapter {
         }
         Ok(entries)
     }
+
+    fn supports_list(&self) -> bool {
+        true
+    }
 }
 
 /// Pattern for matching a hex prefix against a raw `[u8; 32]`
@@ -1584,6 +1588,28 @@ mod tests {
             .await
             .unwrap();
         assert!(missed.is_empty(), "flipped nibble must not match");
+    }
+
+    #[tokio::test]
+    async fn supports_list_distinguishes_mesh_from_opt_out_adapter() {
+        // The BlobAdapter trait default for `supports_list`
+        // is `false` — adapters that genuinely enumerate must
+        // override. MeshBlobAdapter holds the refcount table
+        // and enumerates authoritatively, so its override
+        // returns `true`. A consumer (the Deck BLOBS tab)
+        // checks supports_list before rendering "0 rows"
+        // vs "N/A" so opt-out adapters aren't conflated with
+        // empty ones.
+        let adapter = make_adapter();
+        assert!(adapter.supports_list(), "MeshBlobAdapter enumerates");
+        // Default impl on a trait object that doesn't override
+        // (NoopAdapter doesn't override) should report false.
+        let noop: Arc<dyn super::super::adapter::BlobAdapter> =
+            Arc::new(super::super::noop::NoopAdapter::new("noop"));
+        assert!(
+            !noop.supports_list(),
+            "default opt-out adapter must not advertise list support",
+        );
     }
 
     #[tokio::test]

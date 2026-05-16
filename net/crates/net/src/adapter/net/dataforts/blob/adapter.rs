@@ -248,6 +248,13 @@ pub trait BlobAdapter: Send + Sync + 'static {
     /// answer, not a failure — the BLOBS tab simply shows no
     /// rows for that adapter.
     ///
+    /// Distinct from "this adapter holds nothing": consumers
+    /// that need to tell the two apart consult
+    /// [`Self::supports_list`] first. A `false` answer means
+    /// the default opt-out is in effect; a `true` answer means
+    /// the result of `list` is authoritative (`Ok([])` truly
+    /// means empty).
+    ///
     /// Granularity is **chunk-level**, not logical-blob-level.
     /// `MeshBlobAdapter` tracks blobs in a refcount table keyed
     /// by content hash: a `BlobRef::Small` corresponds to one
@@ -266,6 +273,19 @@ pub trait BlobAdapter: Send + Sync + 'static {
     /// (`MeshBlobAdapter` sorts by `last_seen_unix_ms` desc).
     async fn list(&self, _opts: &BlobListOptions) -> Result<Vec<BlobInventoryEntry>, BlobError> {
         Ok(Vec::new())
+    }
+
+    /// Whether [`Self::list`] returns an authoritative enumeration.
+    ///
+    /// Defaults to `false`, matching the default `list` impl that
+    /// returns an empty vec to avoid accidental enumeration cost
+    /// on adapters with prohibitive scans (S3 with millions of
+    /// keys, IPFS). Adapters that genuinely enumerate (Mesh, fs)
+    /// override to `true` so consumers (the Deck BLOBS tab,
+    /// scripted exporters) can tell the two cases apart instead
+    /// of conflating "no rows" with "opt-out".
+    fn supports_list(&self) -> bool {
+        false
     }
 }
 
