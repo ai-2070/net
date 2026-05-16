@@ -60,6 +60,11 @@ async fn main() -> color_eyre::Result<()> {
     // Adapter-level errors flow into the App's toast channel.
     let blobs_tail = streams::BlobsTail::new();
 
+    // NRPC tail — populated by the samples-logs injector today;
+    // empty without that flag, ready for a real nRPC observer
+    // wire-up.
+    let nrpc_tail = streams::NrpcTail::new(streams::NRPC_TAIL_CAP);
+
     // Bookmark store — loaded from `$XDG_CONFIG_HOME/deck/bookmarks.toml`
     // (or the platform equivalent). A first-run with no config
     // directory yields an empty store; a malformed file is
@@ -79,6 +84,7 @@ async fn main() -> color_eyre::Result<()> {
         failures_tail,
         blob_adapters.clone(),
         blobs_tail.clone(),
+        nrpc_tail.clone(),
         bookmarks,
         this_node,
     );
@@ -92,6 +98,14 @@ async fn main() -> color_eyre::Result<()> {
             app.toast_tx.clone(),
         ))
     };
+    // NRPC traffic injector — only fires under `samples-logs`.
+    // Pushes synthetic call records into the NRPC tail at a
+    // fixed cadence so the NRPC tab demonstrates the call
+    // ring offline.
+    #[cfg(feature = "samples-logs")]
+    let _nrpc_seeder_task = runtime::spawn_nrpc_seeder(nrpc_tail, this_node);
+    #[cfg(not(feature = "samples-logs"))]
+    drop(nrpc_tail);
     let result = app.run(terminal);
     ratatui::restore();
 

@@ -878,3 +878,150 @@ mod samples_logs {
         }
     }
 }
+
+/// Synthetic nRPC traffic injector. Pushes call records into
+/// the deck's `NrpcTail` on a fixed cadence so the NRPC tab
+/// demonstrates the call ring under `samples-logs`. The real
+/// nRPC observer wire-up (when the substrate exposes it) will
+/// replace this seeder without touching the tail consumer.
+#[cfg(feature = "samples-logs")]
+pub fn spawn_nrpc_seeder(
+    tail: crate::streams::NrpcTail,
+    this_node: net_sdk::meshos::NodeId,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { nrpc_seeder::run(tail, this_node).await })
+}
+
+#[cfg(feature = "samples-logs")]
+mod nrpc_seeder {
+    use std::time::Duration;
+
+    use crate::streams::{NrpcCall, NrpcStatus, NrpcTail};
+
+    /// Cadence between injected calls. ~150ms = ~6/s, dense
+    /// enough to fill the call ring quickly without overwhelming
+    /// the render path.
+    const TICK: Duration = Duration::from_millis(150);
+
+    /// Method vocabulary, paired with a typical request /
+    /// response byte-count and a base latency. The seeder picks
+    /// one per tick and rotates through the call cast so every
+    /// row reads as a plausible cluster RPC.
+    const METHODS: &[(&str, u32, u32, u32)] = &[
+        // (method, req_bytes, resp_bytes, base_latency_ms)
+        ("ai.inference.grasp_request", 12_288, 2_048, 18),
+        ("ai.inference.chat_complete", 2_048, 65_536, 240),
+        ("ai.cache.kv_lookup", 256, 4_096, 2),
+        ("audio.mixer.set_channel_level", 32, 16, 1),
+        ("audio.mixer.subscribe_meters", 64, 128, 1),
+        ("drone.swarm.assign_waypoint", 96, 32, 4),
+        ("drone.flight.publish_telemetry", 128, 16, 1),
+        ("robot.arm.move_to_pose", 192, 32, 6),
+        ("robot.gripper.set_force", 24, 16, 1),
+        ("sensor.lidar.subscribe_pointcloud", 64, 524_288, 3),
+        ("sensor.camera.request_frame", 32, 1_048_576, 8),
+        ("stage.cues.fire_cue", 96, 32, 2),
+        ("stage.lights.set_universe", 1_024, 16, 1),
+        ("vehicle.fusion.publish_track", 512, 16, 2),
+        ("storage.blob.fetch", 64, 524_288, 12),
+        ("storage.blob.store", 65_536, 32, 14),
+    ];
+
+    /// Caller / callee pairs. Pulled from the `nodes::NODES`
+    /// fixture so cross-tab id pivots still resolve to the
+    /// labeled rows. `this_node` is also a valid endpoint —
+    /// some calls originate locally.
+    const CALL_PAIRS: &[(u64, u64)] = &[
+        // AI rack consumers
+        (0xfc2, 0xbdda),   // camera-system → ai-gpu-1 (vision grasp)
+        (0xe068, 0xbdda),  // robot-arm → ai-gpu-1
+        (0xe9b8, 0x6dfb),  // side-stage → ai-gpu-2 (chat assistant)
+        (0xbdda, 0x3c81),  // ai-gpu-1 → ai-cache
+        (0x6dfb, 0x3c81),  // ai-gpu-2 → ai-cache
+        // Audio / stage
+        (0xe685, 0xa96f),  // concert-audio → main-stage (cue sync)
+        (0xd4ff, 0xe685),  // monitor-mix → concert-audio
+        (0xa96f, 0x3599),  // main-stage → stage-lighting (cue→lights)
+        (0xa96f, 0x3599),  // main-stage → stage-lighting (pyro)
+        // Drone swarm
+        (0x372b, 0xeba8),  // ground-station → scout-3
+        (0x372b, 0x82ee),  // ground-station → follower-1
+        (0xeba8, 0xbdda),  // scout-3 → ai-gpu-1 (track ID)
+        // Vehicle
+        (0xf206, 0x6808),  // chase-truck → pit-lane
+        (0xf206, 0xbdda),  // chase-truck → ai-gpu-1 (perception)
+        // Robotics
+        (0xe068, 0xbf44),  // robot-arm → assembly-line
+        (0xfc2, 0xe068),   // camera-system → robot-arm
+    ];
+
+    fn unix_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    pub async fn run(tail: NrpcTail, _this_node: net_sdk::meshos::NodeId) {
+        let mut ticker = tokio::time::interval(TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut i = 0usize;
+        loop {
+            ticker.tick().await;
+            let (method, req_bytes, resp_bytes, base_latency) =
+                METHODS[i % METHODS.len()];
+            let (caller, callee) = CALL_PAIRS[i % CALL_PAIRS.len()];
+            // Deterministic-but-varied jitter so latencies don't
+            // read as identical across rows. Pseudo-random via
+            // index arithmetic (no rand crate dependency).
+            let jitter = ((i as u32).wrapping_mul(2_654_435_761) % 16) as i32 - 4;
+            let latency_ms = ((base_latency as i32).saturating_add(jitter)).max(1) as u32;
+            // Status mix: ~85% Ok, ~7% InFlight, ~4% Error,
+            // ~4% Timeout. Picked by `i % 100` so the mix is
+            // exact over each 100-call window.
+            let bucket = i % 100;
+            let status = if bucket < 85 {
+                NrpcStatus::Ok
+            } else if bucket < 92 {
+                NrpcStatus::InFlight
+            } else if bucket < 96 {
+                NrpcStatus::Error(error_reason_for(method).to_string())
+            } else {
+                NrpcStatus::Timeout
+            };
+            tail.push(NrpcCall {
+                ts_ms: unix_now_ms(),
+                caller,
+                callee,
+                method: method.to_string(),
+                latency_ms,
+                status,
+                request_bytes: req_bytes,
+                response_bytes: resp_bytes,
+            });
+            i = i.wrapping_add(1);
+        }
+    }
+
+    /// Method-flavoured error reasons. Reads as a real failure
+    /// rather than a generic "Error".
+    fn error_reason_for(method: &str) -> &'static str {
+        if method.starts_with("ai.") {
+            "model overloaded"
+        } else if method.starts_with("audio.") {
+            "channel muted"
+        } else if method.starts_with("drone.") {
+            "geofence violation"
+        } else if method.starts_with("robot.") {
+            "kinematic singularity"
+        } else if method.starts_with("sensor.") {
+            "sensor offline"
+        } else if method.starts_with("stage.") {
+            "interlock open"
+        } else if method.starts_with("storage.") {
+            "checksum mismatch"
+        } else {
+            "remote rejected"
+        }
+    }
+}

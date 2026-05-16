@@ -1,28 +1,39 @@
 //! NRPC tab — request/response traffic across the mesh.
 //!
-//! Placeholder body. The substrate's nRPC layer carries every
-//! typed mesh RPC (request/reply, streaming, fan-out); this tab
-//! will eventually render the live call ring: caller, callee,
-//! method, latency, status code. For now it shows the empty-
-//! state hint while the observer plumbing lands.
+//! Renders the rolling `NrpcTail` ring as a flat table:
+//! caller → callee, method, latency, payload sizes, status.
+//! Newest call at the bottom (tail-style). Populated by the
+//! `samples-logs` injector today; a real nRPC observer wire-up
+//! will replace the injector without changing this consumer.
 
 use ratatui::{
-    layout::{Alignment, Rect},
+    layout::{Alignment, Constraint, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders},
+    widgets::{Block, Borders, Cell, Row, Table},
     Frame,
 };
 
-use crate::{theme, widgets};
+use crate::{
+    streams::{NrpcCall, NrpcStatus},
+    theme, widgets,
+};
 
-pub fn render(frame: &mut Frame<'_>, area: Rect) {
+pub fn render(frame: &mut Frame<'_>, area: Rect, calls: &[NrpcCall]) {
+    if calls.is_empty() {
+        render_empty(frame, area);
+        return;
+    }
+    render_table(frame, area, calls);
+}
+
+fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
         .title(Line::from(vec![
             Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
             Span::styled("NRPC", theme::green_hi()),
-            Span::styled("    0 calls in flight", theme::chrome()),
+            Span::styled("    0 calls observed", theme::chrome()),
         ]))
         .title_alignment(Alignment::Left);
     let inner = block.inner(area);
@@ -31,6 +42,112 @@ pub fn render(frame: &mut Frame<'_>, area: Rect) {
         frame,
         inner,
         "no nRPC traffic observed yet",
-        "wire an nRPC observer to populate the call ring",
+        "run with --features samples-logs or wire a real nRPC observer",
     );
+}
+
+fn render_table(frame: &mut Frame<'_>, area: Rect, calls: &[NrpcCall]) {
+    let total = calls.len();
+    let header_line = Line::from(vec![
+        Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+        Span::styled("NRPC", theme::green_hi()),
+        Span::styled(format!("    {total} recent calls"), theme::chrome()),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::rule())
+        .title(header_line)
+        .title_alignment(Alignment::Left);
+
+    let header = Row::new(vec![
+        cell_dim("TS"),
+        cell_dim("CALLER"),
+        cell_dim(""),
+        cell_dim("CALLEE"),
+        cell_dim("METHOD"),
+        cell_dim("LATENCY"),
+        cell_dim("REQ"),
+        cell_dim("RESP"),
+        cell_dim("STATUS"),
+    ])
+    .height(1);
+
+    // Take the most recent N rows that fit the visible body.
+    // Inner height = area.height - 2 (block borders) - 1 (header).
+    let take = (area.height as usize).saturating_sub(3).max(1);
+    let start = calls.len().saturating_sub(take);
+    let visible = &calls[start..];
+
+    let mut rows: Vec<Row> = Vec::with_capacity(visible.len());
+    for c in visible {
+        let ts = super::fmt_ts_hms_ms(c.ts_ms);
+        let caller = format!("0x{:x}", c.caller);
+        let callee = format!("0x{:x}", c.callee);
+        let (latency_text, latency_style) = format_latency(c.latency_ms);
+        let (status_text, status_style) = match &c.status {
+            NrpcStatus::Ok => ("Ok".to_string(), theme::green()),
+            NrpcStatus::InFlight => ("InFlight".to_string(), theme::cyan()),
+            NrpcStatus::Error(reason) => (format!("Err: {reason}"), theme::red()),
+            NrpcStatus::Timeout => ("Timeout".to_string(), theme::amber()),
+        };
+        rows.push(Row::new(vec![
+            Cell::from(Span::styled(ts, theme::chrome())),
+            Cell::from(Line::from(crate::nodes::id_spans(&caller))),
+            Cell::from(Span::styled("→", theme::chrome())),
+            Cell::from(Line::from(crate::nodes::id_spans(&callee))),
+            Cell::from(Span::styled(c.method.clone(), theme::cyan())),
+            Cell::from(Span::styled(latency_text, latency_style)),
+            Cell::from(Span::styled(
+                super::format_bytes(c.request_bytes as u64),
+                theme::dim(),
+            )),
+            Cell::from(Span::styled(
+                super::format_bytes(c.response_bytes as u64),
+                theme::dim(),
+            )),
+            Cell::from(Span::styled(status_text, status_style)),
+        ]));
+    }
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(13), // ts (HH:MM:SS.mmm)
+            Constraint::Length(20), // caller (id.label)
+            Constraint::Length(2),  // arrow
+            Constraint::Length(20), // callee (id.label)
+            Constraint::Min(28),    // method (flex)
+            Constraint::Length(9),  // latency
+            Constraint::Length(8),  // req bytes
+            Constraint::Length(8),  // resp bytes
+            Constraint::Length(20), // status
+        ],
+    )
+    .header(header)
+    .block(block)
+    .column_spacing(1);
+    frame.render_widget(table, area);
+}
+
+fn cell_dim(s: &'static str) -> Cell<'static> {
+    Cell::from(Span::styled(s, theme::chrome()))
+}
+
+/// Latency colouring: green under 10ms, amber 10-100ms, red
+/// above. Matches the latency-aware coloring on the NET.MAP
+/// proximity layout so cross-tab pivots stay coherent.
+fn format_latency(ms: u32) -> (String, ratatui::style::Style) {
+    let text = if ms < 1_000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    };
+    let style = if ms < 10 {
+        theme::green()
+    } else if ms < 100 {
+        theme::amber()
+    } else {
+        theme::red()
+    };
+    (text, style)
 }

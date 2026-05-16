@@ -20,6 +20,77 @@ use net_sdk::dataforts::{BlobAdapter, BlobInventoryEntry, BlobListOptions, MeshB
 use net_sdk::deck::{AdminAuditRecord, DeckClient, FailureRecord, LogFilter, LogRecord};
 use parking_lot::Mutex;
 
+/// One observed nRPC call — caller, callee, method, latency,
+/// status. The deck-side model is observation-only today; the
+/// substrate's nRPC layer doesn't yet emit a call stream that
+/// the SDK exposes, so the buffer is fed by mock injectors
+/// (samples-logs) and, eventually, a real observer wire.
+///
+/// `#[allow(dead_code)]` because the struct is fully populated
+/// only by the samples-logs injector; the default-feature
+/// build sees the fields as never read.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct NrpcCall {
+    pub ts_ms: u64,
+    pub caller: u64,
+    pub callee: u64,
+    pub method: String,
+    pub latency_ms: u32,
+    pub status: NrpcStatus,
+    pub request_bytes: u32,
+    pub response_bytes: u32,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub enum NrpcStatus {
+    Ok,
+    InFlight,
+    Error(String),
+    Timeout,
+}
+
+/// Capacity of the NRPC tail. Calls can be chatty (sub-ms
+/// inference / mixer sub-bus updates / sensor frame requests),
+/// so 5000 gives a few minutes of history at sustained traffic
+/// before the ring rolls.
+pub const NRPC_TAIL_CAP: usize = 5_000;
+
+/// Shared, lock-protected ring of nRPC call records. Same
+/// shape as `LogsTail`; render-side reads via `snapshot()`,
+/// injectors push via `push`. `#[allow(dead_code)]` for the
+/// same default-feature reason as `NrpcCall`.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct NrpcTail {
+    pub records: Arc<Mutex<VecDeque<NrpcCall>>>,
+    pub cap: usize,
+}
+
+#[allow(dead_code)]
+impl NrpcTail {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            records: Arc::new(Mutex::new(VecDeque::with_capacity(cap.min(1024)))),
+            cap,
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<NrpcCall> {
+        let g = self.records.lock();
+        g.iter().cloned().collect()
+    }
+
+    pub fn push(&self, call: NrpcCall) {
+        let mut g = self.records.lock();
+        if g.len() == self.cap {
+            g.pop_front();
+        }
+        g.push_back(call);
+    }
+}
+
 /// Capacity of the LOGS tail. 5000 records × ~256B per record
 /// is ~1.3MB — fine for an operator session and deep enough
 /// that scrolling back through an incident's worth of lines

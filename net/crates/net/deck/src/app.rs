@@ -123,6 +123,10 @@ pub struct App {
     pub blob_adapters: Vec<Arc<net_sdk::dataforts::MeshBlobAdapter>>,
     /// Cursor on the DATAFORTS adapter list.
     pub dataforts_cursor: usize,
+    /// NRPC tab tail — observed nRPC calls. Populated by the
+    /// `samples-logs` seeder today; a real nRPC observer will
+    /// wire in later without changing the consumer.
+    pub nrpc_tail: crate::streams::NrpcTail,
     /// BLOBS inventory tail — periodically refreshed from
     /// `MeshBlobAdapter::list(...)`. Empty when no adapter is
     /// wired; the BLOBS tab shows its empty state in that
@@ -442,6 +446,7 @@ impl App {
         failures_tail: crate::streams::FailuresTail,
         blob_adapters: Vec<Arc<net_sdk::dataforts::MeshBlobAdapter>>,
         blobs_tail: crate::streams::BlobsTail,
+        nrpc_tail: crate::streams::NrpcTail,
         bookmarks: crate::bookmarks::BookmarkStore,
         this_node: net_sdk::meshos::NodeId,
     ) -> Self {
@@ -454,6 +459,7 @@ impl App {
             failures_tail,
             blob_adapters,
             dataforts_cursor: 0,
+            nrpc_tail,
             blobs_tail,
             blobs_cursor: 0,
             blobs_search: String::new(),
@@ -2673,7 +2679,8 @@ impl App {
                 tabs::dataforts::render(frame, chunks[3], &entries, self.dataforts_cursor);
             }
             Tab::Nrpc => {
-                tabs::nrpc::render(frame, chunks[3]);
+                let calls = self.nrpc_tail.snapshot();
+                tabs::nrpc::render(frame, chunks[3], &calls);
             }
             Tab::Groups => {
                 let logs = self.logs_tail.snapshot();
