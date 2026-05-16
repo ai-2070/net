@@ -374,10 +374,7 @@ impl Mesh {
     /// v1 fires only `RpcDirection::Outbound`; server-side
     /// (inbound) firing is a follow-up.
     #[cfg(feature = "cortex")]
-    pub fn set_rpc_observer(
-        &self,
-        observer: Option<crate::mesh_rpc::RpcObserverHandle>,
-    ) {
+    pub fn set_rpc_observer(&self, observer: Option<crate::mesh_rpc::RpcObserverHandle>) {
         self.node.set_rpc_observer(observer);
     }
 

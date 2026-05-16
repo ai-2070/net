@@ -34,7 +34,6 @@ use super::daemons::{
 use super::dataforts::build_adapters;
 use super::migrator;
 use super::rpc_chatter;
-use super::rpc_chatter::BurstControl;
 use crate::streams::NrpcTail;
 
 /// Per-node heartbeat cadence. Picks a slightly-staggered base
@@ -91,10 +90,6 @@ pub struct Harness {
     /// Node[0]'s 64-bit node id. The deck's UI uses this to
     /// disambiguate "this node" from remote peers.
     this_node: NodeId,
-    /// Burst-mode control surface — `[B]` in the deck flips
-    /// this to fire the requester loops at max sustained
-    /// loopback rate for a fixed window.
-    burst: BurstControl,
 }
 
 impl Harness {
@@ -108,13 +103,6 @@ impl Harness {
 
     pub fn this_node(&self) -> NodeId {
         self.this_node
-    }
-
-    /// Return a clone of the burst-mode control surface. The
-    /// caller (typically `main.rs`) hands the clone to the
-    /// `App` so a `[B]` keypress can fire a benchmark window.
-    pub fn burst(&self) -> BurstControl {
-        self.burst.clone()
     }
 
     /// Tear down the cluster cleanly. Awaits every node's
@@ -257,9 +245,7 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
     // the remaining nodes.
     rpc_chatter::install_observers(&cluster, nrpc_tail);
     let rpc_responder_handles = rpc_chatter::install_responders(&cluster)?;
-    let burst = BurstControl::new();
-    let rpc_requester_tasks =
-        rpc_chatter::spawn_requester_loops(&cluster, burst.clone());
+    let rpc_requester_tasks = rpc_chatter::spawn_requester_loops(&cluster);
 
     Ok(Harness {
         cluster: Some(cluster),
@@ -272,7 +258,6 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
         deck,
         blob_adapters,
         this_node,
-        burst,
     })
 }
 
@@ -305,10 +290,7 @@ async fn run_heartbeat_loop(
         // metrics without an RNG dependency.
         let n1 = (tick.wrapping_mul(37) ^ node_id) % 9_999;
         let n2 = ((tick.wrapping_mul(53) ^ (node_id >> 8)) % 480) + 20;
-        let message = format!(
-            "gpu-{node_index} :: {}",
-            fill_template(template, n1, n2),
-        );
+        let message = format!("gpu-{node_index} :: {}", fill_template(template, n1, n2),);
         let line = LogLine {
             level: LogLevel::Info,
             daemon_id: Some(daemon_id),
@@ -414,9 +396,8 @@ mod tests {
         // Verify each group name appears the expected number of
         // times. The deck's `lineage::group_daemons` will fold
         // these into one row per group.
-        let count_with_name = |name: &str| -> usize {
-            snap.daemons.values().filter(|d| d.name == name).count()
-        };
+        let count_with_name =
+            |name: &str| -> usize { snap.daemons.values().filter(|d| d.name == name).count() };
         assert_eq!(count_with_name("node_agent"), 1);
         assert_eq!(count_with_name("inference_worker#replica"), 3);
         assert_eq!(count_with_name("rollout_forge#fork@7"), 3);
@@ -445,9 +426,6 @@ mod tests {
         );
         // Clean shutdown — the cluster's into_shutdown drains
         // every node's MeshOsDaemonSdk so no tasks leak.
-        harness
-            .into_shutdown()
-            .await
-            .expect("demo shutdown clean");
+        harness.into_shutdown().await.expect("demo shutdown clean");
     }
 }

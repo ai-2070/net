@@ -199,13 +199,6 @@ fn tab_chips(current: Tab) -> Line<'static> {
             ]);
         }
     }
-    // `[B]` triggers a 5 s nRPC burst against the demo's
-    // requester loops. Surfaces only under the `demo` feature
-    // so non-demo builds don't carry a hint for a keybinding
-    // that has no effect.
-    if cfg!(feature = "demo") {
-        spans.extend([chip_key("B"), chip_desc(" bench   ")]);
-    }
     spans.extend([
         chip_key("?"),
         chip_desc(" help   "),

@@ -131,13 +131,6 @@ pub struct App {
     pub should_quit: bool,
     pub started: Instant,
     pub tick: u64,
-    /// Optional handle on a burst-mode atomic flag. When
-    /// installed (only in `--features demo` builds), pressing
-    /// `[B]` flips it to `true` for `BURST_WINDOW`, prompting
-    /// the demo's nRPC requester loops to fire at max
-    /// loopback rate. Feature-agnostic shape (`Arc<AtomicBool>`)
-    /// so the App doesn't have to import the demo module.
-    pub burst_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// The deck client. Always present — the binary spawns
     /// an in-process runtime at startup. Tabs read snapshot
     /// data through it.
@@ -537,7 +530,6 @@ impl App {
             this_node,
             should_quit: false,
             started: Instant::now(),
-            burst_flag: None,
             tick: 0,
             deck,
             snapshot,
@@ -568,15 +560,6 @@ impl App {
             toast_rx,
             pending_admin: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
-    }
-
-    /// Install a burst-mode flag. Called by `main.rs` under
-    /// `#[cfg(feature = "demo")]` with the harness's flag
-    /// handle so the App's `[B]` keypress can drive the
-    /// demo's nRPC requester loops at max sustained rate
-    /// for a fixed window.
-    pub fn set_burst_flag(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
-        self.burst_flag = Some(flag);
     }
 
     /// Clone the `pending_admin` handle so the binary can
@@ -1600,26 +1583,6 @@ impl App {
             // required.
             KeyCode::Char('?') => {
                 self.modal = Some(Modal::Help);
-            }
-            // Burst-mode trigger — installed only when the
-            // deck was built with `--features demo`. Flips the
-            // demo's nRPC requester loops to max sustained
-            // loopback rate for ~5 s; the toast surfaces the
-            // ongoing burst window. Stats land in the status
-            // bar via the existing `NrpcTail` records.
-            KeyCode::Char('B') => {
-                if let Some(flag) = self.burst_flag.as_ref().map(Arc::clone) {
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                    self.set_toast("BENCH: nRPC burst window — 5s");
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        flag.store(false, std::sync::atomic::Ordering::Relaxed);
-                    });
-                } else {
-                    self.set_toast(
-                        "BENCH unavailable — rebuild with --features demo",
-                    );
-                }
             }
             // Cluster picker — global, opens from any tab.
             KeyCode::Char(':') => {

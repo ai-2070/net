@@ -38,12 +38,12 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
+use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::behavior::meshos::{
     LoggingDispatcher, MaintenanceMirrorSnapshot, MaintenanceStateView, MeshOsConfig,
-    MeshOsDaemonHandle as CoreHandle, MeshOsDaemonSdk as CoreSdk, MetadataView,
-    PeerHealthSnapshot, PeerSnapshot, SdkError, DEFAULT_GRACEFUL_SHUTDOWN,
+    MeshOsDaemonHandle as CoreHandle, MeshOsDaemonSdk as CoreSdk, MetadataView, PeerHealthSnapshot,
+    PeerSnapshot, SdkError, DEFAULT_GRACEFUL_SHUTDOWN,
 };
-use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::compute::{
     DaemonControl as CoreDaemonControl, DaemonError as CoreDaemonError, MeshDaemon,
 };
@@ -286,7 +286,10 @@ impl From<&PeerSnapshot> for PeerSnapshotJs {
         Self {
             rtt_ms: snap.rtt_ms.map(BigInt::from),
             health: snap.health.map(peer_health_str).map(String::from),
-            maintenance: snap.maintenance.map(maintenance_mirror_str).map(String::from),
+            maintenance: snap
+                .maintenance
+                .map(maintenance_mirror_str)
+                .map(String::from),
             cpu_load_1m: snap.cpu_load_1m,
             mem_used_bytes: snap.mem_used_bytes.map(BigInt::from),
             mem_total_bytes: snap.mem_total_bytes.map(BigInt::from),
@@ -388,9 +391,7 @@ fn parse_log_level(level: &str) -> Result<CoreLogLevel> {
         other => {
             return Err(sdk_err(
                 "invalid_log_level",
-                format!(
-                    "log level must be one of trace|debug|info|warn|error; got {other:?}"
-                ),
+                format!("log level must be one of trace|debug|info|warn|error; got {other:?}"),
             ));
         }
     })
@@ -436,17 +437,18 @@ impl napi::bindgen_prelude::FromNapiValue for DaemonObjectTsfns {
         // without crossing into JS land. JS callers who keep `name`
         // as a method should call it on the user side before
         // building the daemon object.
-        let name: String = obj.get_named_property::<Option<String>>("name")?.ok_or_else(|| {
-            sdk_err(
-                "invalid_daemon",
-                "daemon `name` must be a string property",
-            )
-        })?;
+        let name: String = obj
+            .get_named_property::<Option<String>>("name")?
+            .ok_or_else(|| sdk_err("invalid_daemon", "daemon `name` must be a string property"))?;
 
         // Required: `process(event) -> Buffer[]`.
-        let process_fn: Function<'_, CausalEventJs, Vec<Buffer>> = obj
-            .get_named_property("process")
-            .map_err(|e| sdk_err("invalid_daemon", format!("daemon has no `process` method: {e}")))?;
+        let process_fn: Function<'_, CausalEventJs, Vec<Buffer>> =
+            obj.get_named_property("process").map_err(|e| {
+                sdk_err(
+                    "invalid_daemon",
+                    format!("daemon has no `process` method: {e}"),
+                )
+            })?;
         let process: ProcessTsfn = process_fn.build_threadsafe_function().build()?;
 
         // Optional: `snapshot()`, `restore(state)`, `onControl(event)`.
@@ -935,11 +937,6 @@ impl MeshOsDaemonSdk {
         sdk.shutdown()
             .await
             .map(|_stats| ())
-            .map_err(|e| {
-                sdk_err(
-                    "shutdown_failed",
-                    format!("runtime shutdown failed: {e:?}"),
-                )
-            })
+            .map_err(|e| sdk_err("shutdown_failed", format!("runtime shutdown failed: {e:?}")))
     }
 }

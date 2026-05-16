@@ -106,7 +106,11 @@ async fn observer_fires_on_successful_call() {
     assert_eq!(resp.sum, 5);
 
     let events = observer.snapshot();
-    assert_eq!(events.len(), 1, "expected one observer event, got {events:?}");
+    assert_eq!(
+        events.len(),
+        1,
+        "expected one observer event, got {events:?}"
+    );
     let evt = &events[0];
     assert_eq!(evt.caller, caller.node_id());
     assert_eq!(evt.callee, server.node_id());

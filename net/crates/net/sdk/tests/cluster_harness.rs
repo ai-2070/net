@@ -40,10 +40,7 @@ async fn five_node_cluster_boots_and_converges() {
     // MeshOS layer: each runtime's snapshot.peers reflects the
     // other 4 peers via the bridge probes.
     for (i, node) in harness.nodes().iter().enumerate() {
-        let sdk = node
-            .sdk
-            .as_ref()
-            .expect("sdk present before shutdown");
+        let sdk = node.sdk.as_ref().expect("sdk present before shutdown");
         let snap = sdk.runtime().snapshot();
         assert_eq!(
             snap.peers.len(),
@@ -79,9 +76,7 @@ async fn five_node_cluster_boots_and_converges() {
 /// pairwise-iteration code that wouldn't surface at n = 5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_node_cluster_pair_handshake() {
-    let harness = ClusterHarness::new(2)
-        .await
-        .expect("2-node cluster boot");
+    let harness = ClusterHarness::new(2).await.expect("2-node cluster boot");
     assert_eq!(harness.len(), 2);
     for node in harness.nodes() {
         assert_eq!(node.mesh.peer_count(), 1);

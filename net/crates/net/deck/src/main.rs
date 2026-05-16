@@ -91,8 +91,7 @@ async fn main() -> color_eyre::Result<()> {
 
     let this_node = harness.this_node();
     let terminal = ratatui::init();
-    #[allow(unused_mut)]
-    let mut app = App::new(
+    let app = App::new(
         deck,
         logs_tail,
         audit_tail,
@@ -103,10 +102,6 @@ async fn main() -> color_eyre::Result<()> {
         bookmarks,
         this_node,
     );
-    #[cfg(feature = "demo")]
-    {
-        app.set_burst_flag(harness.burst().flag());
-    }
     let _blobs_poll_task = if blob_adapters.is_empty() {
         None
     } else {

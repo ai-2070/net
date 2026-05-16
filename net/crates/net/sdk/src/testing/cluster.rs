@@ -132,10 +132,7 @@ impl NodeDaemonHandle {
     /// Forward to the wrapped `MeshOsDaemonHandle`. Consumes
     /// self so the auto-unregister-on-drop seam doesn't run a
     /// second time after the explicit drain completes.
-    pub async fn graceful_shutdown(
-        self,
-        grace: Duration,
-    ) -> Result<(), crate::meshos::SdkError> {
+    pub async fn graceful_shutdown(self, grace: Duration) -> Result<(), crate::meshos::SdkError> {
         self.handle.graceful_shutdown(grace).await
     }
 }
@@ -265,20 +262,18 @@ impl ClusterHarness {
                     let peer_addr = format!("{addr_j}");
                     mesh_i.connect(&peer_addr, &pubkey_j, id_j).await
                 };
-                let result = tokio::time::timeout(
-                    handshake_budget,
-                    async move { tokio::join!(accept, connect) },
-                )
-                .await;
+                let result =
+                    tokio::time::timeout(
+                        handshake_budget,
+                        async move { tokio::join!(accept, connect) },
+                    )
+                    .await;
                 match result {
                     Err(_) => {
                         return Err(ClusterError::Handshake {
                             from: i,
                             to: j,
-                            reason: format!(
-                                "timed out after {}ms",
-                                handshake_budget.as_millis()
-                            ),
+                            reason: format!("timed out after {}ms", handshake_budget.as_millis()),
                         });
                     }
                     Ok((accept_res, connect_res)) => {
@@ -321,9 +316,7 @@ impl ClusterHarness {
         for m in meshes.iter() {
             m.announce_capabilities(crate::capabilities::CapabilitySet::new())
                 .await
-                .map_err(|e| {
-                    ClusterError::MeshBuild(format!("announce_capabilities: {e}"))
-                })?;
+                .map_err(|e| ClusterError::MeshBuild(format!("announce_capabilities: {e}")))?;
         }
 
         // (5) Build N MeshOsDaemonSdk instances. Each is wired
@@ -348,9 +341,7 @@ impl ClusterHarness {
             //      the orchestrator handle at construction.
             let daemon_runtime = DaemonRuntime::new(Arc::clone(mesh));
             daemon_runtime.start().await.map_err(|e| {
-                ClusterError::MeshBuild(format!(
-                    "daemon_runtime.start() on node[{i}]: {e}"
-                ))
+                ClusterError::MeshBuild(format!("daemon_runtime.start() on node[{i}]: {e}"))
             })?;
             let migration_source: Arc<dyn MigrationSnapshotSource> =
                 Arc::new(OrchestratorMigrationSnapshotSource::new(
@@ -369,11 +360,7 @@ impl ClusterHarness {
             // (6) Install bridge probes on each runtime so its
             //     tick loop folds peer state derived from the
             //     real Mesh sessions.
-            install_mesh_probes(
-                sdk.runtime(),
-                Arc::clone(mesh),
-                Arc::clone(&expected_peers),
-            );
+            install_mesh_probes(sdk.runtime(), Arc::clone(mesh), Arc::clone(&expected_peers));
             nodes.push(ClusterNode {
                 mesh: Arc::clone(mesh),
                 sdk: Some(sdk),
@@ -570,13 +557,13 @@ impl ClusterHarness {
         for rt in &runtimes {
             let _ = rt.shutdown().await;
         }
-        let sdks: Vec<MeshOsDaemonSdk> = self
-            .nodes
-            .iter_mut()
-            .filter_map(|n| n.sdk.take())
-            .collect();
-        let results = join_all(sdks.into_iter().map(|sdk| async move { sdk.shutdown().await }))
-            .await;
+        let sdks: Vec<MeshOsDaemonSdk> =
+            self.nodes.iter_mut().filter_map(|n| n.sdk.take()).collect();
+        let results = join_all(
+            sdks.into_iter()
+                .map(|sdk| async move { sdk.shutdown().await }),
+        )
+        .await;
         for r in results {
             // RuntimeShutdownError doesn't implement Display
             // today; fall back to Debug so callers still see
@@ -608,14 +595,20 @@ impl ClusterHarness {
         D: ComputeMeshDaemon + 'static,
         F: Fn() -> D + Send + Sync + 'static,
     {
-        let anchor = self.nodes.get(anchor_index).ok_or_else(|| ClusterError::Spawn {
-            node_index: anchor_index,
-            reason: "anchor_index out of range".into(),
-        })?;
-        let rt = anchor.daemon_runtime.as_ref().ok_or_else(|| ClusterError::Spawn {
-            node_index: anchor_index,
-            reason: "anchor node has no daemon runtime".into(),
-        })?;
+        let anchor = self
+            .nodes
+            .get(anchor_index)
+            .ok_or_else(|| ClusterError::Spawn {
+                node_index: anchor_index,
+                reason: "anchor_index out of range".into(),
+            })?;
+        let rt = anchor
+            .daemon_runtime
+            .as_ref()
+            .ok_or_else(|| ClusterError::Spawn {
+                node_index: anchor_index,
+                reason: "anchor node has no daemon runtime".into(),
+            })?;
         // `register_factory` is idempotent only within the same
         // kind+closure — re-registering with a fresh closure
         // fails. Tests that call `spawn_replica_group` twice

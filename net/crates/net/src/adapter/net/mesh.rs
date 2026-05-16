@@ -1205,8 +1205,7 @@ pub struct MeshNode {
     /// when no observer is installed. See
     /// `cortex::rpc_observer::RpcObserver`.
     #[cfg(feature = "cortex")]
-    rpc_observer:
-        Arc<ArcSwapOption<crate::adapter::net::cortex::rpc_observer::RpcObserverHandle>>,
+    rpc_observer: Arc<ArcSwapOption<crate::adapter::net::cortex::rpc_observer::RpcObserverHandle>>,
     /// Optional migration subprotocol handler — same `ArcSwapOption`
     /// surface as on `MeshNode`, propagated into the dispatch
     /// context so the packet-receive loop stays lock-free.
@@ -4693,8 +4692,7 @@ impl MeshNode {
                 request_bytes,
                 response_bytes,
                 direction: crate::adapter::net::cortex::rpc_observer::RpcDirection::Outbound,
-                ts_unix_ms:
-                    crate::adapter::net::cortex::rpc_observer::unix_now_ms(),
+                ts_unix_ms: crate::adapter::net::cortex::rpc_observer::unix_now_ms(),
             };
             obs.on_call(evt);
         }

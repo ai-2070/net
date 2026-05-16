@@ -56,11 +56,11 @@ use bytes::Bytes;
 use tokio::runtime::Runtime;
 
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
-use net::adapter::net::behavior::meshos::{
-    LoggingDispatcher, MeshOsConfig, MeshOsDaemonHandle as CoreHandle,
-    MeshOsDaemonSdk as CoreSdk, SdkError, DEFAULT_GRACEFUL_SHUTDOWN,
-};
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
+use net::adapter::net::behavior::meshos::{
+    LoggingDispatcher, MeshOsConfig, MeshOsDaemonHandle as CoreHandle, MeshOsDaemonSdk as CoreSdk,
+    SdkError, DEFAULT_GRACEFUL_SHUTDOWN,
+};
 use net::adapter::net::compute::{
     DaemonControl as CoreDaemonControl, DaemonError as CoreDaemonError, MeshDaemon,
 };
@@ -531,9 +531,7 @@ pub extern "C" fn net_meshos_handle_daemon_id(handle: *const NetMeshOsHandle) ->
 /// Daemon name (NUL-terminated). Pointer valid for the handle's
 /// lifetime. Returns NULL on NULL handle.
 #[no_mangle]
-pub extern "C" fn net_meshos_handle_daemon_name(
-    handle: *const NetMeshOsHandle,
-) -> *const c_char {
+pub extern "C" fn net_meshos_handle_daemon_name(handle: *const NetMeshOsHandle) -> *const c_char {
     match unsafe { handle.as_ref() } {
         Some(h) => h.daemon_name.as_ptr(),
         None => ptr::null(),
@@ -615,11 +613,8 @@ pub extern "C" fn net_meshos_next_control(
                 if timeout_ms == 0 {
                     h.next_control().await
                 } else {
-                    match tokio::time::timeout(
-                        Duration::from_millis(timeout_ms),
-                        h.next_control(),
-                    )
-                    .await
+                    match tokio::time::timeout(Duration::from_millis(timeout_ms), h.next_control())
+                        .await
                     {
                         Ok(ev) => ev,
                         Err(_) => None,
@@ -788,7 +783,10 @@ mod tests {
         assert_eq!(net_meshos_sdk_shutdown(sdk), NET_MESHOS_OK);
 
         // Double shutdown surfaces ALREADY_SHUTDOWN.
-        assert_eq!(net_meshos_sdk_shutdown(sdk), NET_MESHOS_ERR_ALREADY_SHUTDOWN);
+        assert_eq!(
+            net_meshos_sdk_shutdown(sdk),
+            NET_MESHOS_ERR_ALREADY_SHUTDOWN
+        );
         let kind_ptr = net_meshos_last_error_kind();
         assert!(!kind_ptr.is_null());
         let kind = unsafe { CStr::from_ptr(kind_ptr).to_string_lossy().into_owned() };
@@ -806,13 +804,8 @@ mod tests {
         let (name_ptr, name_len) = cstr_ptr(name);
         let seed = [7u8; 32];
         let mut handle: *mut NetMeshOsHandle = ptr::null_mut();
-        let status = net_meshos_register_daemon(
-            sdk,
-            name_ptr,
-            name_len,
-            seed.as_ptr(),
-            &mut handle,
-        );
+        let status =
+            net_meshos_register_daemon(sdk, name_ptr, name_len, seed.as_ptr(), &mut handle);
         assert_eq!(status, NET_MESHOS_OK);
         assert!(!handle.is_null());
 
@@ -845,7 +838,9 @@ mod tests {
             NET_MESHOS_ERR_INVALID_ARG,
         );
         let kind = unsafe {
-            CStr::from_ptr(net_meshos_last_error_kind()).to_string_lossy().into_owned()
+            CStr::from_ptr(net_meshos_last_error_kind())
+                .to_string_lossy()
+                .into_owned()
         };
         assert_eq!(kind, "invalid_log_level");
 
@@ -896,13 +891,7 @@ mod tests {
         let sdk: *mut NetMeshOsSdk = ptr::null_mut();
         let mut h: *mut NetMeshOsHandle = ptr::null_mut();
         // null SDK pointer
-        let status = net_meshos_register_daemon(
-            sdk,
-            ptr::null(),
-            0,
-            ptr::null(),
-            &mut h,
-        );
+        let status = net_meshos_register_daemon(sdk, ptr::null(), 0, ptr::null(), &mut h);
         assert_eq!(status, NET_MESHOS_ERR_NULL);
         let _ = unsafe { CStr::from_ptr(net_meshos_last_error_kind()) };
 

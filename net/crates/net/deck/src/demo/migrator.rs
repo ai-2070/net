@@ -97,9 +97,7 @@ pub fn install_factories(harness: &ClusterHarness) -> Result<(), color_eyre::Rep
             .as_ref()
             .ok_or_else(|| color_eyre::eyre::eyre!("node[{i}] daemon_runtime missing"))?;
         rt.register_factory(MIGRATABLE_KIND, || Box::new(MigratableDaemon))
-            .map_err(|e| {
-                color_eyre::eyre::eyre!("register_factory on node[{i}]: {e:?}")
-            })?;
+            .map_err(|e| color_eyre::eyre::eyre!("register_factory on node[{i}]: {e:?}"))?;
     }
     Ok(())
 }
@@ -182,9 +180,7 @@ async fn run_loop(runtimes: Vec<DaemonRuntime>, node_ids: Vec<NodeId>, total: us
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "[deck demo] migration cycle {cycle} spawn failed: {e:?}"
-                );
+                eprintln!("[deck demo] migration cycle {cycle} spawn failed: {e:?}");
             }
         }
         // Wait the cycle interval before the next attempt.

@@ -70,12 +70,15 @@ async fn spawn_where_filters_subset() {
     let harness = ClusterHarness::new(4).await.expect("4-node cluster boot");
     // Pick nodes at index 0 and 2 only.
     let handles = harness
-        .spawn_where(|| BareDaemon, |node| {
-            // The harness owns the node order; we filter by index
-            // captured via node_id since the predicate doesn't get
-            // the index directly.
-            node.node_id == harness.nth(0).node_id || node.node_id == harness.nth(2).node_id
-        })
+        .spawn_where(
+            || BareDaemon,
+            |node| {
+                // The harness owns the node order; we filter by index
+                // captured via node_id since the predicate doesn't get
+                // the index directly.
+                node.node_id == harness.nth(0).node_id || node.node_id == harness.nth(2).node_id
+            },
+        )
         .await
         .expect("spawn_where");
     assert_eq!(handles.len(), 2);

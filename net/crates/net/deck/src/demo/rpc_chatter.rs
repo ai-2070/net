@@ -16,7 +16,6 @@
 //! The NRPC tab populates from observation, not from a
 //! synthetic seeder.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,45 +58,6 @@ const CALL_INTERVAL: Duration = Duration::from_millis(250);
 /// hung responder doesn't accumulate in-flight call_id state
 /// in the caller's pending map forever.
 const CALL_DEADLINE: Duration = Duration::from_millis(2_000);
-
-/// Cadence while a burst is active — fires as fast as the
-/// substrate's typed-RPC dispatch sustains on loopback. 1 ms
-/// is a conservative ceiling; the loop spends most of its
-/// time inside `call_typed`'s await rather than the sleep.
-const CALL_INTERVAL_BURST: Duration = Duration::from_millis(1);
-
-/// Cooperative burst signal — the requester loops poll this
-/// flag on every cycle. The deck flips it to `true` for a
-/// fixed window when the operator hits `[B]`, then flips it
-/// back. Lives behind an `Arc` so the harness, the requester
-/// tasks, and the App's keypress handler can all hold cheap
-/// clones.
-#[derive(Clone, Default)]
-pub struct BurstControl {
-    flag: Arc<AtomicBool>,
-}
-
-impl BurstControl {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.flag.load(Ordering::Relaxed)
-    }
-
-    pub fn set(&self, active: bool) {
-        self.flag.store(active, Ordering::Relaxed);
-    }
-
-    /// Expose the raw `Arc<AtomicBool>` so consumers outside
-    /// the `demo` module (e.g. the `App`, which avoids
-    /// importing the demo-feature-gated `BurstControl`) can
-    /// drive the flag through a feature-agnostic shape.
-    pub fn flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.flag)
-    }
-}
 
 /// Observer bridge — converts substrate `RpcCallEvent`s into
 /// deck `NrpcCall` records and pushes them into the shared
@@ -163,19 +123,10 @@ pub fn install_responders(
 
 /// Spawn one requester task per node[2..N]. Each task fires a
 /// `call_typed` at one of the two responder nodes every
-/// `CALL_INTERVAL` ms (or `CALL_INTERVAL_BURST` while
-/// `burst.is_active()`), alternating between responders so
+/// `CALL_INTERVAL` ms, alternating between responders so
 /// both nodes see traffic.
-pub fn spawn_requester_loops(
-    harness: &ClusterHarness,
-    burst: BurstControl,
-) -> Vec<JoinHandle<()>> {
-    let responder_ids: Vec<u64> = harness
-        .nodes()
-        .iter()
-        .take(2)
-        .map(|n| n.node_id)
-        .collect();
+pub fn spawn_requester_loops(harness: &ClusterHarness) -> Vec<JoinHandle<()>> {
+    let responder_ids: Vec<u64> = harness.nodes().iter().take(2).map(|n| n.node_id).collect();
     if responder_ids.is_empty() {
         return Vec::new();
     }
@@ -187,9 +138,8 @@ pub fn spawn_requester_loops(
         .map(|(idx, node)| {
             let mesh = node.mesh.clone();
             let responders = responder_ids.clone();
-            let burst = burst.clone();
             tokio::spawn(async move {
-                run_requester_loop(idx, mesh, responders, burst).await;
+                run_requester_loop(idx, mesh, responders).await;
             })
         })
         .collect()
@@ -199,16 +149,10 @@ async fn run_requester_loop(
     requester_idx: usize,
     mesh: Arc<net_sdk::mesh::Mesh>,
     responders: Vec<u64>,
-    burst: BurstControl,
 ) {
     let mut tick: u64 = 0;
     loop {
-        let interval = if burst.is_active() {
-            CALL_INTERVAL_BURST
-        } else {
-            CALL_INTERVAL
-        };
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(CALL_INTERVAL).await;
         let target = responders[(tick as usize + requester_idx) % responders.len()];
         let req = EchoRequest { tick };
         let opts = CallOptionsTyped {

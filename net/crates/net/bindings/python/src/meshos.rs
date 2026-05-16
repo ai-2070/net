@@ -33,12 +33,12 @@ use pyo3::types::{PyBytes, PyDict, PyTuple};
 use tokio::runtime::Runtime;
 
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
+use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::behavior::meshos::{
     LoggingDispatcher, MaintenanceMirrorSnapshot, MaintenanceStateView, MeshOsConfig,
-    MeshOsDaemonHandle as CoreHandle, MeshOsDaemonSdk as CoreSdk, MetadataView,
-    PeerHealthSnapshot, PeerSnapshot, SdkError, DEFAULT_GRACEFUL_SHUTDOWN,
+    MeshOsDaemonHandle as CoreHandle, MeshOsDaemonSdk as CoreSdk, MetadataView, PeerHealthSnapshot,
+    PeerSnapshot, SdkError, DEFAULT_GRACEFUL_SHUTDOWN,
 };
-use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::compute::{
     DaemonControl as CoreDaemonControl, DaemonError as CoreDaemonError, MeshDaemon,
 };
@@ -63,8 +63,7 @@ pyo3::create_exception!(
 /// branch on the discriminator without parsing the envelope.
 /// Mirrors the `MeshDbError` pattern at `meshdb.rs:1422-1437`.
 fn sdk_err(py: Python<'_>, kind: &str, message: &str) -> PyErr {
-    let err =
-        MeshOsSdkError::new_err(format!("<<meshos-sdk-kind:{kind}>>{message}"));
+    let err = MeshOsSdkError::new_err(format!("<<meshos-sdk-kind:{kind}>>{message}"));
     let _ = err.value(py).setattr("kind", kind);
     let _ = err.value(py).setattr("message", message);
     err
@@ -90,9 +89,7 @@ fn parse_log_level(level: &str) -> PyResult<CoreLogLevel> {
                 Err(sdk_err(
                     py,
                     "invalid_log_level",
-                    &format!(
-                        "log level must be one of trace|debug|info|warn|error; got {other:?}"
-                    ),
+                    &format!("log level must be one of trace|debug|info|warn|error; got {other:?}"),
                 ))
             });
         }
@@ -160,7 +157,10 @@ fn maintenance_state_to_dict<'py>(
         } => {
             d.set_item("kind", "EnteringMaintenance")?;
             d.set_item("since_ms", since_ms)?;
-            d.set_item("deadline_remaining_ms", deadline_remaining_ms.as_ref().copied())?;
+            d.set_item(
+                "deadline_remaining_ms",
+                deadline_remaining_ms.as_ref().copied(),
+            )?;
         }
         MaintenanceStateView::Maintenance { since_ms } => {
             d.set_item("kind", "Maintenance")?;
@@ -199,7 +199,10 @@ fn metadata_view_to_dict<'py>(
     d.set_item("node_id", view.node_id)?;
     d.set_item("daemon_id", view.daemon_id)?;
     d.set_item("daemon_name", view.daemon_name.clone())?;
-    d.set_item("maintenance_state", maintenance_state_to_dict(py, &view.maintenance_state)?)?;
+    d.set_item(
+        "maintenance_state",
+        maintenance_state_to_dict(py, &view.maintenance_state)?,
+    )?;
     let peers = PyDict::new(py);
     for (node_id, snap) in &view.peers {
         peers.set_item(*node_id, peer_snapshot_to_dict(py, snap)?)?;
@@ -525,7 +528,9 @@ impl MeshDaemon for PyDaemonBridge {
                     if let Ok(s) = bound.extract::<String>() {
                         return match s.as_str() {
                             "healthy" | "Healthy" => H::Healthy,
-                            "degraded" | "Degraded" => H::Degraded { reason: String::new() },
+                            "degraded" | "Degraded" => H::Degraded {
+                                reason: String::new(),
+                            },
                             "unhealthy" | "Unhealthy" => H::Unhealthy,
                             _ => H::Healthy,
                         };
@@ -717,7 +722,12 @@ impl PyMeshOsDaemonHandle {
                 runtime.block_on(async {
                     match timeout_ms {
                         Some(ms) => {
-                            match tokio::time::timeout(Duration::from_millis(ms), handle.next_control()).await {
+                            match tokio::time::timeout(
+                                Duration::from_millis(ms),
+                                handle.next_control(),
+                            )
+                            .await
+                            {
                                 Ok(ev) => ev,
                                 Err(_) => None, // timeout elapsed
                             }
@@ -735,10 +745,7 @@ impl PyMeshOsDaemonHandle {
 
     /// Non-blocking control-event receive. Returns the next event
     /// as a dict, or `None` if the channel is empty / closed.
-    fn try_next_control<'py>(
-        &mut self,
-        py: Python<'py>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    fn try_next_control<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         let inner = self.require_inner_mut()?;
         match inner.try_next_control() {
             Some(ev) => Ok(Some(daemon_control_to_dict(py, ev)?)),
@@ -756,7 +763,9 @@ impl PyMeshOsDaemonHandle {
     fn publish_log(&self, py: Python<'_>, level: &str, message: &str) -> PyResult<()> {
         let lvl = parse_log_level(level)?;
         let inner = self.require_inner()?;
-        inner.publish_log(lvl, message).map_err(|e| sdk_err_from(py, e))
+        inner
+            .publish_log(lvl, message)
+            .map_err(|e| sdk_err_from(py, e))
     }
 
     /// Publish (or update) the daemon's capability set.
@@ -771,12 +780,15 @@ impl PyMeshOsDaemonHandle {
     /// malformed dict surfaces a typed error immediately rather
     /// than silently lost when the chain commit lands.
     #[pyo3(signature = (caps=None))]
-    fn publish_capabilities(&self, py: Python<'_>, caps: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+    fn publish_capabilities(
+        &self,
+        py: Python<'_>,
+        caps: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
         let inner = self.require_inner()?;
         let cap_set = match caps {
-            Some(d) => crate::capabilities::capability_set_from_py(d).map_err(|e| {
-                sdk_err(py, "invalid_capabilities", &format!("{e}"))
-            })?,
+            Some(d) => crate::capabilities::capability_set_from_py(d)
+                .map_err(|e| sdk_err(py, "invalid_capabilities", &format!("{e}")))?,
             None => CapabilitySet::default(),
         };
         inner
