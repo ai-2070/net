@@ -121,6 +121,10 @@ fn tab_chips(current: Tab) -> Line<'static> {
                 chip_desc(" host node   "),
                 chip_key("l"),
                 chip_desc(" logs   "),
+                chip_key("r"),
+                chip_desc(" restart   "),
+                chip_key("R"),
+                chip_desc(" ICE restart   "),
             ]);
         }
         Tab::Dataforts => {
@@ -141,6 +145,8 @@ fn tab_chips(current: Tab) -> Line<'static> {
                 chip_desc(" group   "),
                 chip_key("r"),
                 chip_desc(" restart   "),
+                chip_key("R"),
+                chip_desc(" ICE restart   "),
             ]);
         }
         Tab::Logs => {
