@@ -1,0 +1,25 @@
+net/crates/net/deck/src/tabs/blobs.rs
+  s_4a2fa2d5f63459::t_6595f3bd8c0cf3 261
+net/crates/net/deck/src/tabs/daemon_page.rs
+  s_4a2fa2d5f63459::t_1ae17f1c703f16 311
+net/crates/net/deck/src/tabs/mod.rs
+  s_4a2fa2d5f63459::t_d64a817f783d76 47-70
+net/crates/net/deck/src/tabs/migrations.rs
+  s_4a2fa2d5f63459::t_6e75db1f45c63f 185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "988d1121c2d1146f234dbdf7b3565133688a5d4f",
+  "prompts": {},
+  "sessions": {
+    "s_4a2fa2d5f63459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5d060031-ba25-4cac-9cbf-32d9a94cbf0c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
