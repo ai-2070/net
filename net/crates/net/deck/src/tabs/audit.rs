@@ -264,7 +264,7 @@ fn cell_dim(s: &'static str) -> Cell<'static> {
 /// rendition of the target spans. `needle_lower` must already
 /// be lowercased; we lowercase the haystack here once per
 /// record (acceptable at typical audit-ring sizes).
-fn record_matches(rec: &AdminAuditRecord, needle_lower: &str) -> bool {
+pub(crate) fn record_matches(rec: &AdminAuditRecord, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
     }

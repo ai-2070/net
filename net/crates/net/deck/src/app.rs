@@ -158,6 +158,13 @@ pub struct App {
     /// signature collector, future help screen). When `Some`,
     /// the modal absorbs key input until dismissed.
     pub modal: Option<Modal>,
+    /// Ephemeral "toast" message shown in the footer for
+    /// ~3 seconds after an action. Used for confirming
+    /// side-effects the operator can't see directly — e.g.
+    /// `[w]` exports report "wrote N records to <path>" so
+    /// the operator knows the file landed without leaving
+    /// the TUI.
+    pub toast: Option<(String, Instant)>,
 }
 
 #[derive(Clone, Debug)]
@@ -263,6 +270,7 @@ impl App {
             failures_search: String::new(),
             failures_search_editing: false,
             modal: None,
+            toast: None,
         }
     }
 
@@ -282,6 +290,7 @@ impl App {
             if last_tick.elapsed() >= tick_rate {
                 self.tick = self.tick.wrapping_add(1);
                 self.refresh_snapshot();
+                self.expire_toast();
                 last_tick = Instant::now();
             }
         }
@@ -290,6 +299,94 @@ impl App {
 
     fn refresh_snapshot(&mut self) {
         self.snapshot = Arc::new(self.deck.status());
+    }
+
+    /// 3-second decay on toast messages so a confirmation
+    /// doesn't sit on screen forever; new actions overwrite
+    /// stale toasts immediately via [`Self::set_toast`].
+    fn expire_toast(&mut self) {
+        if let Some((_, t)) = self.toast.as_ref() {
+            if t.elapsed() >= Duration::from_secs(3) {
+                self.toast = None;
+            }
+        }
+    }
+
+    /// Set the footer's ephemeral message. Replaces any prior
+    /// toast — the latest action's confirmation always wins.
+    pub fn set_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    /// Export the LOGS view to a file. Applies the same filter
+    /// stack the render path uses (level threshold + substring
+    /// search) so the export reflects what the operator sees;
+    /// pause state determines live-vs-frozen source. Confirms
+    /// success or failure in the footer toast.
+    fn export_logs(&mut self) {
+        let records: Vec<net_sdk::deck::LogRecord> = match &self.logs_paused {
+            Some(frozen) => frozen.clone(),
+            None => self.logs_tail.snapshot(),
+        };
+        let min_rank = tabs::logs::level_rank(self.logs_min_level);
+        let needle = self.logs_search.to_ascii_lowercase();
+        let filtered: Vec<_> = records
+            .into_iter()
+            .filter(|r| tabs::logs::level_rank(r.level) >= min_rank)
+            .filter(|r| tabs::logs::record_matches(r, &needle))
+            .collect();
+        match crate::widgets::export::write_logs(&filtered) {
+            Ok(out) => self.set_toast(format!(
+                "wrote {} log records → {}",
+                out.count, out.path
+            )),
+            Err(e) => self.set_toast(format!("export failed: {e}")),
+        }
+    }
+
+    fn export_audit(&mut self) {
+        let records = self.audit_tail.snapshot();
+        let needle = self.audit_search.to_ascii_lowercase();
+        let limit = self.audit_limit.unwrap_or(usize::MAX);
+        // Match render-time projection: newest-first, force-only
+        // + search applied, capped to limit. Then re-reverse so
+        // the file reads chronologically (oldest-first) while
+        // the on-screen view is newest-first.
+        let filtered: Vec<_> = records
+            .iter()
+            .rev()
+            .filter(|r| !self.audit_force_only || r.event.is_ice())
+            .filter(|r| tabs::audit::record_matches(r, &needle))
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        match crate::widgets::export::write_audit(&filtered) {
+            Ok(out) => self.set_toast(format!(
+                "wrote {} audit records → {}",
+                out.count, out.path
+            )),
+            Err(e) => self.set_toast(format!("export failed: {e}")),
+        }
+    }
+
+    fn export_failures(&mut self) {
+        let records = self.failures_tail.snapshot();
+        let needle = self.failures_search.to_ascii_lowercase();
+        let filtered: Vec<_> = records
+            .iter()
+            .filter(|r| tabs::failures::record_matches(r, &needle))
+            .cloned()
+            .collect();
+        match crate::widgets::export::write_failures(&filtered) {
+            Ok(out) => self.set_toast(format!(
+                "wrote {} failure records → {}",
+                out.count, out.path
+            )),
+            Err(e) => self.set_toast(format!("export failed: {e}")),
+        }
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -456,6 +553,13 @@ impl App {
             KeyCode::Char('/') if self.current == Tab::Failures => {
                 self.failures_search_editing = true;
             }
+            // Export the current filtered view to a timestamped
+            // file in the cwd. Captures only what would render —
+            // operator's filter chips dictate what lands in the
+            // file. Surfaces success/failure in the footer toast.
+            KeyCode::Char('w') if self.current == Tab::Logs => self.export_logs(),
+            KeyCode::Char('w') if self.current == Tab::Audit => self.export_audit(),
+            KeyCode::Char('w') if self.current == Tab::Failures => self.export_failures(),
             KeyCode::Char('n') if self.current == Tab::Audit => {
                 self.audit_limit = match self.audit_limit {
                     None => Some(25),
@@ -1251,7 +1355,11 @@ impl App {
                 );
             }
         }
-        widgets::footer::render(frame, chunks[4]);
+        widgets::footer::render(
+            frame,
+            chunks[4],
+            self.toast.as_ref().map(|(s, _)| s.as_str()),
+        );
 
         // Modal overlay (renders last so it sits visually on
         // top of the body).
@@ -1282,3 +1390,4 @@ impl App {
         }
     }
 }
+

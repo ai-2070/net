@@ -107,7 +107,7 @@ fn level_chip(min_level: LogLevel) -> (&'static str, ratatui::style::Style) {
 
 /// Numeric rank used for "min level" comparisons. Higher means
 /// more severe.
-fn level_rank(l: LogLevel) -> u8 {
+pub(crate) fn level_rank(l: LogLevel) -> u8 {
     match l {
         LogLevel::Debug => 0,
         LogLevel::Info => 1,
@@ -291,7 +291,7 @@ fn matches_ci(haystack: &str, needle_lower: &str) -> bool {
 /// hex directly — even when the message text doesn't repeat
 /// the id (e.g. an auto-generated daemon log emitted via
 /// `publish_log` without echoing the id into the message).
-fn record_matches(rec: &LogRecord, needle_lower: &str) -> bool {
+pub(crate) fn record_matches(rec: &LogRecord, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
     }

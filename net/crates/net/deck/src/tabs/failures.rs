@@ -166,7 +166,7 @@ fn append_search_chip(spans: &mut Vec<Span<'static>>, search: &str, search_editi
 /// Substring match across the searchable surface of a failure
 /// record: source token + reason. `needle_lower` must already
 /// be lowercased.
-fn record_matches(rec: &FailureRecord, needle_lower: &str) -> bool {
+pub(crate) fn record_matches(rec: &FailureRecord, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
     }

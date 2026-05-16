@@ -7,11 +7,18 @@ use ratatui::{
 
 use crate::theme;
 
-pub fn render(frame: &mut Frame<'_>, area: Rect) {
+pub fn render(frame: &mut Frame<'_>, area: Rect, toast: Option<&str>) {
+    // Active toast hijacks the footer row — confirmation
+    // messages need to be visible against the binding hints.
+    if let Some(msg) = toast {
+        let line = Line::from(vec![Span::styled(format!("  {msg}"), theme::green_hi())]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let line = Line::from(vec![
         Span::styled("◂▸", theme::green()),
         Span::styled(" tab   ", theme::dim()),
-        Span::styled("1-6", theme::green()),
+        Span::styled("1-9", theme::green()),
         Span::styled(" jump   ", theme::dim()),
         Span::styled("j/k", theme::green()),
         Span::styled(" cursor   ", theme::dim()),
@@ -27,6 +34,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect) {
         Span::styled(" inval   ", theme::dim()),
         Span::styled("r", theme::green()),
         Span::styled(" restart   ", theme::dim()),
+        Span::styled("w", theme::green()),
+        Span::styled(" export   ", theme::dim()),
         Span::styled("q", theme::green()),
         Span::styled(" quit", theme::dim()),
     ]);

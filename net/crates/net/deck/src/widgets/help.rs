@@ -28,6 +28,7 @@ const NAVIGATION: &[Binding] = &[
     Binding { keys: "n",         desc: "AUDIT: cycle row limit (none/25/100)" },
     Binding { keys: "p",         desc: "LOGS: pause / resume the tail" },
     Binding { keys: "/",         desc: "LOGS/AUDIT/FAILURES: substring search (Enter commit, Esc clear)" },
+    Binding { keys: "w",         desc: "LOGS/AUDIT/FAILURES: export current view to ./deck-<tab>-<ts>.txt" },
     Binding { keys: "?",         desc: "toggle this help overlay" },
     Binding { keys: "q / Esc",   desc: "quit (or close modal)" },
     Binding { keys: "Ctrl-C",    desc: "quit" },
@@ -61,7 +62,7 @@ const MODAL: &[Binding] = &[
 ];
 
 pub fn render(frame: &mut Frame<'_>, area: Rect) {
-    let modal_area = center(area, 78, 40);
+    let modal_area = center(area, 78, 41);
     frame.render_widget(Clear, modal_area);
 
     let block = Block::default()
@@ -84,7 +85,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(13), // navigation
+            Constraint::Length(14), // navigation
             Constraint::Length(11), // admin
             Constraint::Length(9),  // ice
             Constraint::Length(4),  // modal
