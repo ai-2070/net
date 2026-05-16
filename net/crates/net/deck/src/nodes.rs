@@ -12,7 +12,19 @@ pub struct NodeRef {
     pub label: &'static str,
 }
 
+// Fixture keys MUST match the `format!("0x{:x}", id)` form the
+// deck renders — no leading zeros. `0x0fc2` would mismatch
+// against `0xfc2` and the row would render unlabeled; same goes
+// for the local node `0x0001` → `0x1`. The `label_of` lookup is
+// a strict string compare against this table.
 pub const NODES: &[NodeRef] = &[
+    // Local node — `this_node` for the samples runtime. Kept in
+    // the fixture so the NODES + NET.MAP renderers resolve it
+    // through the same path as remote peers.
+    NodeRef {
+        id: "0x1",
+        label: "local",
+    },
     // Live event production (5 nodes) — main stage + audio
     // mix booths + dimmer room running DMX / lighting / pyro.
     NodeRef {
@@ -88,7 +100,7 @@ pub const NODES: &[NodeRef] = &[
         label: "edge-drone",
     },
     NodeRef {
-        id: "0x0fc2",
+        id: "0xfc2",
         label: "vision-rig",
     },
 ];
@@ -145,4 +157,20 @@ pub fn id_spans_styled(id: &str, id_style: Style) -> Vec<Span<'static>> {
 /// [`theme::dim`] (gray).
 pub fn id_spans(id: &str) -> Vec<Span<'static>> {
     id_spans_styled(id, theme::text())
+}
+
+/// Label-first variant: `label.0xXXXX` — the human-readable
+/// label leads, hex follows as dim metadata. Used by survey
+/// views (NODES tab) where operators recognize peers by role
+/// before identifying by hex. Falls back to bare id when the
+/// fixture has no entry, same as the id-first variant.
+pub fn label_first_spans(id: &str, label_style: Style) -> Vec<Span<'static>> {
+    match label_of(id) {
+        Some(label) => vec![
+            Span::styled(label.to_string(), label_style),
+            Span::styled(".", theme::chrome()),
+            Span::styled(id.to_string(), theme::dim()),
+        ],
+        None => vec![Span::styled(id.to_string(), label_style)],
+    }
 }

@@ -158,11 +158,15 @@ fn render_live_nodes_table(
         let is_local_row = Some(peer_id) == local_id;
         let is_cursor = i == cursor;
         let marker = if is_cursor { "▶" } else { " " };
-        let id_spans = if is_cursor {
-            nodes::id_spans_styled(&format!("0x{peer_id:x}"), theme::green_hi())
+        // Label-first ordering: human-readable name leads, hex
+        // suffix dims. The survey view's eye-time goes to
+        // recognition, not identification.
+        let label_style = if is_cursor {
+            theme::green_hi()
         } else {
-            nodes::id_spans(&format!("0x{peer_id:x}"))
+            theme::text()
         };
+        let id_spans = nodes::label_first_spans(&format!("0x{peer_id:x}"), label_style);
         let (health_style, health_text) = match p.health {
             Some(PeerHealthSnapshot::Healthy) => (theme::green(), "Healthy"),
             Some(PeerHealthSnapshot::Degraded) => (theme::amber(), "Degraded"),
@@ -268,7 +272,7 @@ fn render_live_nodes_table(
         table_rows,
         [
             Constraint::Length(2),  // cursor marker
-            Constraint::Length(18), // NODE: id.label
+            Constraint::Length(22), // NODE: label.0xhex (fits ground-station / monitor-booth)
             Constraint::Length(11), // HEALTH
             Constraint::Length(7),  // RTT
             Constraint::Length(5),  // CPU
