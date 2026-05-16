@@ -417,22 +417,71 @@ impl App {
         }
     }
 
-    /// View of the local node hosting this deck's adapters,
-    /// rendered alongside the cursored adapter on DATAFORTS.
-    /// Aggregates resource stats across every registered adapter
-    /// so a fleet with three adapters totalling 3.5 TB shows
-    /// 3.5 TB on the node-disk gauge instead of one adapter's
-    /// slice. Stats live in synthetic form here — the deck
-    /// doesn't have a system-stats probe in this demo runtime.
-    fn host_node_view(&self) -> tabs::dataforts::HostNodeView {
-        let (disk_used, disk_total) = self.blob_adapters.iter().fold(
-            (0u64, 0u64),
-            |(u, t), a| {
-                let m = a.metrics().snapshot();
-                (u + m.disk_used_bytes, t + m.disk_capacity_bytes)
-            },
-        );
-        let any_overflow = self.blob_adapters.iter().any(|a| a.overflow_enabled());
+    /// Build the DATAFORTS list for the current frame. Always
+    /// starts with the local datafort (the deck's host node +
+    /// its wired adapters), then appends every peer in the
+    /// snapshot that advertises `dataforts.blob.storage` as a
+    /// remote datafort. Remote rows have no adapter detail —
+    /// the deck reads peer-level disk + caps + health straight
+    /// from `snapshot.peers`.
+    fn collect_dataforts(&self) -> Vec<tabs::dataforts::DatafortEntry> {
+        let mut out: Vec<tabs::dataforts::DatafortEntry> = Vec::new();
+        out.push(self.local_datafort());
+        for (id, p) in self.snapshot.peers.iter() {
+            if !p
+                .capability_set
+                .iter()
+                .any(|c| c == "dataforts.blob.storage")
+            {
+                continue;
+            }
+            let label = crate::nodes::label_of(&format!("0x{:x}", *id));
+            let health = match p.health {
+                Some(net_sdk::deck::PeerHealthSnapshot::Healthy) => Some("Healthy"),
+                Some(net_sdk::deck::PeerHealthSnapshot::Degraded) => Some("Degraded"),
+                Some(net_sdk::deck::PeerHealthSnapshot::Unreachable) => Some("Unreachable"),
+                _ => None,
+            };
+            out.push(tabs::dataforts::DatafortEntry {
+                id: *id,
+                label,
+                is_local: false,
+                health,
+                cpu_load_1m: p.cpu_load_1m,
+                mem_used_bytes: p.mem_used_bytes,
+                mem_total_bytes: p.mem_total_bytes,
+                disk_used_bytes: p.disk_used_bytes,
+                disk_total_bytes: p.disk_total_bytes,
+                capabilities: p.capability_set.iter().cloned().collect(),
+                adapters: Vec::new(),
+            });
+        }
+        out
+    }
+
+    /// The local datafort: synthetic node stats + the actual
+    /// per-adapter snapshots from `self.blob_adapters`. Disk
+    /// aggregates across every wired adapter so the node-level
+    /// gauge reflects the host's total blob footprint.
+    fn local_datafort(&self) -> tabs::dataforts::DatafortEntry {
+        let adapters: Vec<tabs::dataforts::AdapterEntry> = self
+            .blob_adapters
+            .iter()
+            .map(|a| {
+                let metrics = a.metrics().snapshot();
+                let overflow_enabled = a.overflow_enabled();
+                tabs::dataforts::AdapterEntry {
+                    id: a.adapter_id().to_string(),
+                    metrics,
+                    overflow_enabled,
+                }
+            })
+            .collect();
+        let (disk_used, disk_total) =
+            adapters.iter().fold((0u64, 0u64), |(u, t), a| {
+                (u + a.metrics.disk_used_bytes, t + a.metrics.disk_capacity_bytes)
+            });
+        let any_overflow = adapters.iter().any(|a| a.overflow_enabled);
         let mut capabilities = vec![
             "compute.daemon".to_string(),
             "meshos.health".to_string(),
@@ -441,9 +490,10 @@ impl App {
         if any_overflow {
             capabilities.push("dataforts.blob.overflow".to_string());
         }
-        tabs::dataforts::HostNodeView {
+        tabs::dataforts::DatafortEntry {
             id: 0x0001,
             label: Some("local"),
+            is_local: true,
             health: Some("Healthy"),
             cpu_load_1m: Some(0.42),
             mem_used_bytes: Some(28u64 << 30),
@@ -451,6 +501,7 @@ impl App {
             disk_used_bytes: Some(disk_used),
             disk_total_bytes: Some(disk_total),
             capabilities,
+            adapters,
         }
     }
 
@@ -1681,27 +1732,7 @@ impl App {
                 self.list_cursor,
             ),
             Tab::Dataforts => {
-                // Snapshot each adapter's metrics at the start
-                // of the frame so the list + detail body agree.
-                let entries: Vec<tabs::dataforts::AdapterEntry> = self
-                    .blob_adapters
-                    .iter()
-                    .map(|a| {
-                        let metrics = a.metrics().snapshot();
-                        let overflow_enabled = a.overflow_enabled();
-                        let mut capabilities = vec!["dataforts.blob.storage".to_string()];
-                        if overflow_enabled {
-                            capabilities.push("dataforts.blob.overflow".to_string());
-                        }
-                        tabs::dataforts::AdapterEntry {
-                            id: a.adapter_id().to_string(),
-                            metrics,
-                            overflow_enabled,
-                            capabilities,
-                            host: self.host_node_view(),
-                        }
-                    })
-                    .collect();
+                let entries = self.collect_dataforts();
                 tabs::dataforts::render(
                     frame,
                     chunks[3],

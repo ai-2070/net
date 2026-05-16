@@ -351,7 +351,15 @@ mod samples {
                     let mut caps = std::collections::BTreeSet::new();
                     caps.insert("compute.daemon".to_string());
                     caps.insert("meshos.health".to_string());
-                    if degraded {
+                    // ~every third peer participates as a remote
+                    // datafort so the DATAFORTS list has more than
+                    // just the local node to render. Overflow on a
+                    // subset (every 6th) so the gauge mix isn't
+                    // uniform.
+                    if i % 3 == 0 {
+                        caps.insert("dataforts.blob.storage".to_string());
+                    }
+                    if degraded || i % 6 == 0 {
                         caps.insert("dataforts.blob.overflow".to_string());
                     }
                     if i % 4 == 0 {

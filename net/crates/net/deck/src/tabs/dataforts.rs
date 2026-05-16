@@ -1,14 +1,23 @@
-//! DATAFORTS tab — renders the live blob-adapter set. Each
-//! registered adapter shows up as a row in the top list with
-//! its core metrics summarized; the cursored adapter drives
-//! the detail body below (disk gauge + health-gate verdict +
-//! Store/Fetch/GC + Overflow panels).
+//! DATAFORTS tab — one row per node acting as a blob storage
+//! tier. A datafort is any peer advertising
+//! `dataforts.blob.storage`, plus the local node. The cursored
+//! datafort drives the detail body below: aggregate disk +
+//! health-gate, IO / OVERFLOW counters (local only — remote
+//! adapter-level state isn't probed across the wire), and a
+//! per-datafort breakdown of adapters + node info.
+//!
+//! The deck reads remote dataforts straight from `snapshot.peers`
+//! (capability tags, disk fields, health). No separate
+//! adapter-level probe runs across the cluster — peer-side
+//! decisions like admission / overflow read the node's own local
+//! view, so the deck doesn't need per-remote-adapter telemetry to
+//! make routing or health calls.
 //!
 //! Layout:
-//! - adapter list (height = N rows + header, capped)
-//! - status bar: capacity / used / disk-ratio / health-gate
-//! - left column: store + fetch + GC counters
-//! - right column: overflow counter family (per-reason)
+//! - dataforts list (height = N rows + header, capped)
+//! - status bar: aggregate disk + health-gate verdict
+//! - IO + OVERFLOW counters (local; placeholder for remote)
+//! - context row: adapters (local) | node info
 
 use net_sdk::dataforts::{
     evaluate_health_gate, BlobMetricsSnapshot, HealthGateAction,
@@ -23,30 +32,14 @@ use ratatui::{
 
 use crate::{theme, widgets};
 
-/// One row of the multi-adapter list. The deck snapshots each
-/// registered adapter's metrics at the frame boundary so the
-/// list + detail body agree on what the adapter looked like.
+/// One row of the dataforts list — either the local node (with
+/// full adapter-level detail) or a remote peer observed to
+/// advertise `dataforts.blob.storage`.
 #[derive(Clone)]
-pub struct AdapterEntry {
-    pub id: String,
-    pub metrics: BlobMetricsSnapshot,
-    pub overflow_enabled: bool,
-    /// Capability tags this adapter advertises into the mesh.
-    pub capabilities: Vec<String>,
-    /// Local host the adapter is running on. Populated from the
-    /// runtime's `this_node` view; rendered in the new context
-    /// row alongside the adapter's own config.
-    pub host: HostNodeView,
-}
-
-/// Point-in-time view of the node hosting an adapter. Mirrors
-/// the slice of `PeerSnapshot` the deck renders for any peer —
-/// kept as its own type so the deck can populate it for the
-/// local node, which doesn't appear in `snapshot.peers`.
-#[derive(Clone)]
-pub struct HostNodeView {
+pub struct DatafortEntry {
     pub id: u64,
     pub label: Option<&'static str>,
+    pub is_local: bool,
     pub health: Option<&'static str>,
     pub cpu_load_1m: Option<f64>,
     pub mem_used_bytes: Option<u64>,
@@ -54,49 +47,58 @@ pub struct HostNodeView {
     pub disk_used_bytes: Option<u64>,
     pub disk_total_bytes: Option<u64>,
     pub capabilities: Vec<String>,
+    /// Per-adapter rows. Populated only for the local datafort.
+    pub adapters: Vec<AdapterEntry>,
 }
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, entries: &[AdapterEntry], cursor: usize) {
+/// One adapter on the local datafort. Metrics are snapshotted
+/// at frame boundary so the list + detail agree.
+#[derive(Clone)]
+pub struct AdapterEntry {
+    pub id: String,
+    pub metrics: BlobMetricsSnapshot,
+    pub overflow_enabled: bool,
+}
+
+pub fn render(frame: &mut Frame<'_>, area: Rect, entries: &[DatafortEntry], cursor: usize) {
     if entries.is_empty() {
         render_empty(frame, area);
         return;
     }
     let cursor = cursor.min(entries.len().saturating_sub(1));
-    // List height: header + one row per adapter, capped at 8
-    // rows so the detail body keeps reasonable real estate on
-    // tall clusters.
-    let visible_rows = entries.len().min(8);
-    let list_height = (visible_rows as u16) + 3; // header + borders
+    let visible_rows = entries.len().min(10);
+    let list_height = (visible_rows as u16) + 3;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(list_height), // adapter list
-            Constraint::Length(3),           // status bar
-            Constraint::Length(14),          // IO + OVERFLOW counters
-            Constraint::Min(0),              // context: config | host
+            Constraint::Length(list_height),
+            Constraint::Length(3),  // aggregate status bar
+            Constraint::Length(14), // IO + OVERFLOW
+            Constraint::Min(0),     // context (adapters | node)
         ])
         .split(area);
-    render_adapter_list(frame, rows[0], entries, cursor);
-    render_status(frame, rows[1], &entries[cursor].metrics, &entries[cursor].id);
-    render_body(frame, rows[2], &entries[cursor].metrics);
-    render_context_row(frame, rows[3], &entries[cursor]);
+    render_datafort_list(frame, rows[0], entries, cursor);
+    let cur = &entries[cursor];
+    let agg = aggregate_for(cur);
+    render_status(frame, rows[1], cur, &agg);
+    render_body(frame, rows[2], cur, &agg);
+    render_context_row(frame, rows[3], cur);
 }
 
-fn render_adapter_list(
+// ───────────────────────── top list ─────────────────────────
+
+fn render_datafort_list(
     frame: &mut Frame<'_>,
     area: Rect,
-    entries: &[AdapterEntry],
+    entries: &[DatafortEntry],
     cursor: usize,
 ) {
     let total = entries.len();
     let pos = cursor.min(total.saturating_sub(1)) + 1;
     let header_line = Line::from(vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-        Span::styled("ADAPTERS", theme::green_hi()),
-        Span::styled(
-            format!("    {total} registered"),
-            theme::chrome(),
-        ),
+        Span::styled("DATAFORTS", theme::green_hi()),
+        Span::styled(format!("    {total} reachable"), theme::chrome()),
         Span::styled(format!("    {pos}/{total}"), theme::dim()),
     ]);
     let block = Block::default()
@@ -105,12 +107,11 @@ fn render_adapter_list(
         .title(header_line);
     let header = Row::new(vec![
         cell_dim(" "),
-        cell_dim("ADAPTER"),
+        cell_dim("NODE"),
+        cell_dim("ROLE"),
+        cell_dim("HEALTH"),
         cell_dim("DISK"),
-        cell_dim("GATE"),
-        cell_dim("STORED"),
-        cell_dim("FETCHED"),
-        cell_dim("BYTES"),
+        cell_dim("ADAPT"),
         cell_dim("OVERFLOW"),
     ])
     .height(1);
@@ -120,38 +121,47 @@ fn render_adapter_list(
         let is_cursor = i == cursor;
         let marker = if is_cursor { "▶" } else { " " };
         let id_style = if is_cursor { theme::green_hi() } else { theme::text() };
-        let m = &e.metrics;
-        let ratio = if m.disk_capacity_bytes == 0 {
-            0.0
-        } else {
-            (m.disk_used_bytes as f64 / m.disk_capacity_bytes as f64).clamp(0.0, 1.0)
+
+        let id_label = format_id_label(e.id, e.label);
+        let role_text = if e.is_local { "local" } else { "remote" };
+        let role_style = if e.is_local { theme::cyan() } else { theme::dim() };
+
+        let (health_text, health_style) = health_chip(e.health);
+        let (ratio, disk_pct) = match (e.disk_used_bytes, e.disk_total_bytes) {
+            (Some(u), Some(t)) if t > 0 => {
+                let r = (u as f64 / t as f64).clamp(0.0, 1.0);
+                (r, (r * 100.0) as u16)
+            }
+            _ => (0.0, 0),
         };
-        let disk_pct = (ratio * 100.0) as u16;
         let (bar_color, _, _) = bar_style_for(ratio);
-        // DISK column is a `┃━━━━━━━━━┃ NN%` bar + percent.
-        // Bar color tracks the health-gate threshold the same
-        // way the detail status panel does — green steady →
-        // amber watch above 85% → red EMIT at/above 95%.
         let disk_cell = Cell::from(Line::from(vec![
             bar(disk_pct, 10, bar_color),
             Span::styled(format!(" {disk_pct:>3}%"), theme::dim()),
         ]));
-        let (gate_text, gate_style) = gate_chip(m.disk_used_bytes, m.disk_capacity_bytes);
-        let overflow_active = m.overflow.active;
-        let (of_text, of_style) = if overflow_active {
-            ("ACTIVE", theme::amber())
+
+        let adapt_text = if e.is_local {
+            format!("{:>3}", e.adapters.len())
         } else {
-            ("idle", theme::dim())
+            "  —".to_string()
         };
+        let overflow_text = overflow_label(e);
+        let overflow_style = if overflow_text == "ACTIVE" {
+            theme::amber()
+        } else if overflow_text == "armed" {
+            theme::green()
+        } else {
+            theme::dim()
+        };
+
         rows.push(Row::new(vec![
             Cell::from(Span::styled(marker, theme::green_hi())),
-            Cell::from(Span::styled(e.id.clone(), id_style)),
+            Cell::from(Span::styled(id_label, id_style)),
+            Cell::from(Span::styled(role_text, role_style)),
+            Cell::from(Span::styled(health_text, health_style)),
             disk_cell,
-            Cell::from(Span::styled(gate_text, gate_style)),
-            Cell::from(Span::styled(format!("{:>6}", m.blobs_stored_total), theme::text())),
-            Cell::from(Span::styled(format!("{:>6}", m.blobs_fetched_total), theme::text())),
-            Cell::from(Span::styled(fmt_bytes(m.bytes_stored_total), theme::dim())),
-            Cell::from(Span::styled(of_text, of_style)),
+            Cell::from(Span::styled(adapt_text, theme::dim())),
+            Cell::from(Span::styled(overflow_text.to_string(), overflow_style)),
         ]));
     }
 
@@ -159,12 +169,11 @@ fn render_adapter_list(
         rows,
         [
             Constraint::Length(2),  // cursor
-            Constraint::Length(20), // adapter id
+            Constraint::Length(20), // node id.label
+            Constraint::Length(7),  // role
+            Constraint::Length(11), // health
             Constraint::Length(16), // disk bar + %
-            Constraint::Length(10), // gate
-            Constraint::Length(7),  // stored
-            Constraint::Length(8),  // fetched
-            Constraint::Length(11), // bytes
+            Constraint::Length(5),  // adapter count
             Constraint::Min(8),     // overflow
         ],
     )
@@ -174,16 +183,24 @@ fn render_adapter_list(
     frame.render_widget(table, area);
 }
 
-fn cell_dim(s: &'static str) -> Cell<'static> {
-    Cell::from(Span::styled(s, theme::chrome()))
+fn overflow_label(e: &DatafortEntry) -> &'static str {
+    if e.is_local {
+        if e.adapters.iter().any(|a| a.metrics.overflow.active) {
+            "ACTIVE"
+        } else if e.adapters.iter().any(|a| a.overflow_enabled) {
+            "armed"
+        } else {
+            "off"
+        }
+    } else if e.capabilities.iter().any(|c| c == "dataforts.blob.overflow") {
+        "armed"
+    } else {
+        "off"
+    }
 }
 
-fn gate_chip(used: u64, cap: u64) -> (&'static str, ratatui::style::Style) {
-    let gate = evaluate_health_gate(used, cap, false);
-    match gate {
-        HealthGateAction::Emit => ("UNHEALTHY", theme::red()),
-        HealthGateAction::Clear | HealthGateAction::Unchanged => ("healthy", theme::green()),
-    }
+fn cell_dim(s: &'static str) -> Cell<'static> {
+    Cell::from(Span::styled(s, theme::chrome()))
 }
 
 fn render_empty(frame: &mut Frame<'_>, area: Rect) {
@@ -193,46 +210,45 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
         .title(Line::from(vec![
             Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
             Span::styled("DATAFORTS", theme::green_hi()),
-            Span::styled("    no adapter wired", theme::chrome()),
+            Span::styled("    no dataforts reachable", theme::chrome()),
         ]));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     widgets::empty::render(
         frame,
         inner,
-        "no blob adapter attached to this runtime",
-        "wire a MeshBlobAdapter",
+        "no datafort reachable from this deck",
+        "wire a MeshBlobAdapter locally or join a cluster with a storage peer",
     );
 }
 
-fn render_status(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSnapshot, adapter_id: &str) {
+// ───────────────────────── status bar ─────────────────────────
+
+fn render_status(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    cur: &DatafortEntry,
+    agg: &AggregateView,
+) {
+    let title_id = format_id_label(cur.id, cur.label);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
         .title(Line::from(vec![
             Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-            Span::styled("BLOB.ADAPTER", theme::green_hi()),
-            Span::styled(format!("    {adapter_id}"), theme::amber()),
+            Span::styled("DATAFORT", theme::green_hi()),
+            Span::styled(format!("    {title_id}"), theme::amber()),
         ]));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let used = snap.disk_used_bytes;
-    let cap = snap.disk_capacity_bytes;
-    let ratio = if cap == 0 {
-        0.0
-    } else {
-        used as f64 / cap as f64
-    };
+    let used = agg.disk_used;
+    let cap = agg.disk_capacity;
+    let ratio = if cap == 0 { 0.0 } else { used as f64 / cap as f64 };
     let pct = (ratio * 100.0) as u16;
     let pct_clamped = pct.min(100);
-
     let (bar_color, bar_label, bar_style) = bar_style_for(ratio);
-    let gate = evaluate_health_gate(used, cap, false);
-    let (gate_text, gate_style) = match gate {
-        HealthGateAction::Emit => ("UNHEALTHY", theme::red()),
-        HealthGateAction::Clear | HealthGateAction::Unchanged => ("healthy", theme::green()),
-    };
+    let (gate_text, gate_style) = gate_chip(used, cap);
 
     let line = Line::from(vec![
         Span::styled("disk ", theme::chrome()),
@@ -257,16 +273,47 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSnapshot, 
     frame.render_widget(Paragraph::new(line), inner);
 }
 
-fn render_body(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSnapshot) {
+fn gate_chip(used: u64, cap: u64) -> (&'static str, ratatui::style::Style) {
+    let gate = evaluate_health_gate(used, cap, false);
+    match gate {
+        HealthGateAction::Emit => ("UNHEALTHY", theme::red()),
+        HealthGateAction::Clear | HealthGateAction::Unchanged => ("healthy", theme::green()),
+    }
+}
+
+// ───────────────────────── body (IO / OVERFLOW) ─────────────────────────
+
+fn render_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    cur: &DatafortEntry,
+    agg: &AggregateView,
+) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
-    render_io_panel(frame, cols[0], snap);
-    render_overflow_panel(frame, cols[1], snap);
+
+    if cur.is_local {
+        render_io_panel(frame, cols[0], agg);
+        render_overflow_panel(frame, cols[1], agg);
+    } else {
+        render_remote_panel(
+            frame,
+            cols[0],
+            "STORE / FETCH / GC",
+            "adapter-level counters live on the host node",
+        );
+        render_remote_panel(
+            frame,
+            cols[1],
+            "OVERFLOW",
+            "remote dataforts surface overflow only via the cap advertisement",
+        );
+    }
 }
 
-fn render_io_panel(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSnapshot) {
+fn render_io_panel(frame: &mut Frame<'_>, area: Rect, agg: &AggregateView) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -276,19 +323,17 @@ fn render_io_panel(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSnapshot
         ]));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
     let lines = vec![
-        kv("blobs_stored_total", snap.blobs_stored_total),
-        kv("blobs_fetched_total", snap.blobs_fetched_total),
-        kv_bytes("bytes_stored_total", snap.bytes_stored_total),
-        kv("gc_swept_total", snap.gc_swept_total),
+        kv("blobs_stored_total", agg.blobs_stored),
+        kv("blobs_fetched_total", agg.blobs_fetched),
+        kv_bytes("bytes_stored_total", agg.bytes_stored),
+        kv("gc_swept_total", agg.gc_swept),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_overflow_panel(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSnapshot) {
-    let o = &snap.overflow;
-    let (active_text, active_style) = if o.active {
+fn render_overflow_panel(frame: &mut Frame<'_>, area: Rect, agg: &AggregateView) {
+    let (active_text, active_style) = if agg.overflow_active {
         ("ACTIVE", theme::amber())
     } else {
         ("idle", theme::dim())
@@ -304,7 +349,7 @@ fn render_overflow_panel(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSn
         ]));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
+    let o = &agg.overflow;
     let lines = vec![
         kv("pushes_admitted_total", o.pushes_admitted_total),
         kv("push_errors_total", o.push_errors_total),
@@ -322,97 +367,105 @@ fn render_overflow_panel(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSn
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-// ───────────────────────── context row ─────────────────────────
-//
-// Side-by-side panel below the IO/OVERFLOW counters. Left side
-// is this adapter's config + advertised capabilities; right side
-// is the host node's identity, resource snapshot, and capability
-// set. Lets an operator read the "what is this adapter" answer
-// without bouncing to the NODE page.
-
-fn render_context_row(frame: &mut Frame<'_>, area: Rect, entry: &AdapterEntry) {
-    if area.height < 4 {
-        return;
-    }
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    render_adapter_config_panel(frame, cols[0], entry);
-    render_host_node_panel(frame, cols[1], &entry.host);
-}
-
-fn render_adapter_config_panel(frame: &mut Frame<'_>, area: Rect, entry: &AdapterEntry) {
+fn render_remote_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    hint: &str,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
         .title(Line::from(vec![
             Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-            Span::styled("DATAFORT", theme::green_hi()),
-            Span::styled(format!("    {}", entry.id), theme::amber()),
+            Span::styled(title.to_string(), theme::green_hi()),
+            Span::styled("    remote", theme::dim()),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            format!("  {hint}"),
+            theme::chrome(),
+        )]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+// ───────────────────────── context row ─────────────────────────
+
+fn render_context_row(frame: &mut Frame<'_>, area: Rect, cur: &DatafortEntry) {
+    if area.height < 4 {
+        return;
+    }
+    if cur.is_local {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+        render_adapters_panel(frame, cols[0], cur);
+        render_node_panel(frame, cols[1], cur);
+    } else {
+        render_node_panel(frame, area, cur);
+    }
+}
+
+fn render_adapters_panel(frame: &mut Frame<'_>, area: Rect, cur: &DatafortEntry) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::rule())
+        .title(Line::from(vec![
+            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+            Span::styled("ADAPTERS", theme::green_hi()),
+            Span::styled(
+                format!("    {} on this datafort", cur.adapters.len()),
+                theme::chrome(),
+            ),
         ]));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(ctx_kv("id", &entry.id, theme::text()));
-    lines.push(ctx_kv(
-        "capacity",
-        &fmt_bytes(entry.metrics.disk_capacity_bytes),
-        theme::text(),
-    ));
-    lines.push(ctx_kv(
-        "overflow",
-        if entry.overflow_enabled {
-            if entry.metrics.overflow.active {
-                "enabled · ACTIVE"
-            } else {
-                "enabled · idle"
-            }
-        } else {
-            "off"
-        },
-        if entry.overflow_enabled {
-            if entry.metrics.overflow.active {
-                theme::amber()
-            } else {
-                theme::green()
-            }
-        } else {
-            theme::dim()
-        },
-    ));
-    lines.push(ctx_kv(
-        "disk_ratio",
-        &format!("{:.2}", entry.metrics.overflow.disk_ratio),
-        theme::dim(),
-    ));
-    lines.push(Line::from(vec![Span::raw("")]));
-    lines.push(Line::from(vec![Span::styled(
-        "  advertises",
-        theme::chrome(),
-    )]));
-    if entry.capabilities.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("      ", theme::chrome()),
-            Span::styled("—", theme::chrome()),
-        ]));
+    if cur.adapters.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  no adapters",
+            theme::chrome(),
+        )]));
     } else {
-        for cap in &entry.capabilities {
+        for a in &cur.adapters {
+            let m = &a.metrics;
+            let ratio = if m.disk_capacity_bytes == 0 {
+                0.0
+            } else {
+                (m.disk_used_bytes as f64 / m.disk_capacity_bytes as f64).clamp(0.0, 1.0)
+            };
+            let pct = (ratio * 100.0) as u16;
+            let (bar_color, _, _) = bar_style_for(ratio);
+            let overflow_chip = if m.overflow.active {
+                Span::styled("  ACTIVE", theme::amber())
+            } else if a.overflow_enabled {
+                Span::styled("  armed", theme::green())
+            } else {
+                Span::styled("  off", theme::dim())
+            };
             lines.push(Line::from(vec![
-                Span::styled("      ", theme::chrome()),
-                Span::styled(cap.clone(), theme::text()),
+                Span::styled(format!("  {:<14}", a.id), theme::text()),
+                bar(pct, 10, bar_color),
+                Span::styled(format!(" {pct:>3}%  "), theme::dim()),
+                Span::styled(
+                    format!("{} / {}", fmt_bytes(m.disk_used_bytes), fmt_bytes(m.disk_capacity_bytes)),
+                    theme::dim(),
+                ),
+                overflow_chip,
             ]));
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_host_node_panel(frame: &mut Frame<'_>, area: Rect, host: &HostNodeView) {
-    let id_label = match host.label {
-        Some(l) => format!("0x{:04x}.{}", host.id, l),
-        None => format!("0x{:04x}", host.id),
-    };
+fn render_node_panel(frame: &mut Frame<'_>, area: Rect, cur: &DatafortEntry) {
+    let id_label = format_id_label(cur.id, cur.label);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -420,42 +473,38 @@ fn render_host_node_panel(frame: &mut Frame<'_>, area: Rect, host: &HostNodeView
             Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
             Span::styled("NODE", theme::green_hi()),
             Span::styled(format!("    {}", id_label), theme::text()),
+            Span::styled(
+                if cur.is_local { "    local" } else { "    remote" },
+                if cur.is_local { theme::cyan() } else { theme::dim() },
+            ),
         ]));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(ctx_kv(
-        "health",
-        host.health.unwrap_or("—"),
-        health_style(host.health),
-    ));
+    let (health_text, health_style) = health_chip(cur.health);
+    lines.push(ctx_kv("health", health_text, health_style));
     lines.push(ctx_kv(
         "cpu_1m",
-        &host
-            .cpu_load_1m
+        &cur.cpu_load_1m
             .map(|v| format!("{v:.2}"))
             .unwrap_or_else(|| "—".to_string()),
-        cpu_style(host.cpu_load_1m),
+        cpu_style(cur.cpu_load_1m),
     ));
-    lines.push(bar_kv(
-        "memory",
-        host.mem_used_bytes,
-        host.mem_total_bytes,
-    ));
-    lines.push(bar_kv("disk", host.disk_used_bytes, host.disk_total_bytes));
-    lines.push(Line::from(vec![Span::raw("")]));
+    lines.push(bar_kv("memory", cur.mem_used_bytes, cur.mem_total_bytes));
+    lines.push(bar_kv("disk", cur.disk_used_bytes, cur.disk_total_bytes));
+    lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
         "  capabilities",
         theme::chrome(),
     )]));
-    if host.capabilities.is_empty() {
+    if cur.capabilities.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("      ", theme::chrome()),
             Span::styled("—", theme::chrome()),
         ]));
     } else {
-        for cap in &host.capabilities {
+        for cap in &cur.capabilities {
             lines.push(Line::from(vec![
                 Span::styled("      ", theme::chrome()),
                 Span::styled(cap.clone(), theme::text()),
@@ -463,6 +512,87 @@ fn render_host_node_panel(frame: &mut Frame<'_>, area: Rect, host: &HostNodeView
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+// ───────────────────────── aggregation ─────────────────────────
+
+/// Aggregate view across the cursored datafort's adapters (local)
+/// or its peer-level fields (remote). Drives the status bar +
+/// IO/OVERFLOW panels.
+struct AggregateView {
+    disk_used: u64,
+    disk_capacity: u64,
+    blobs_stored: u64,
+    blobs_fetched: u64,
+    bytes_stored: u64,
+    gc_swept: u64,
+    overflow_active: bool,
+    overflow: net_sdk::dataforts::OverflowMetricsSnapshot,
+}
+
+fn aggregate_for(cur: &DatafortEntry) -> AggregateView {
+    if cur.is_local {
+        let mut v = AggregateView {
+            disk_used: 0,
+            disk_capacity: 0,
+            blobs_stored: 0,
+            blobs_fetched: 0,
+            bytes_stored: 0,
+            gc_swept: 0,
+            overflow_active: false,
+            overflow: Default::default(),
+        };
+        for a in &cur.adapters {
+            let m = &a.metrics;
+            v.disk_used += m.disk_used_bytes;
+            v.disk_capacity += m.disk_capacity_bytes;
+            v.blobs_stored += m.blobs_stored_total;
+            v.blobs_fetched += m.blobs_fetched_total;
+            v.bytes_stored += m.bytes_stored_total;
+            v.gc_swept += m.gc_swept_total;
+            v.overflow_active |= m.overflow.active;
+            sum_overflow(&mut v.overflow, &m.overflow);
+        }
+        v
+    } else {
+        AggregateView {
+            disk_used: cur.disk_used_bytes.unwrap_or(0),
+            disk_capacity: cur.disk_total_bytes.unwrap_or(0),
+            blobs_stored: 0,
+            blobs_fetched: 0,
+            bytes_stored: 0,
+            gc_swept: 0,
+            overflow_active: false,
+            overflow: Default::default(),
+        }
+    }
+}
+
+fn sum_overflow(
+    acc: &mut net_sdk::dataforts::OverflowMetricsSnapshot,
+    o: &net_sdk::dataforts::OverflowMetricsSnapshot,
+) {
+    acc.pushes_admitted_total += o.pushes_admitted_total;
+    acc.push_errors_total += o.push_errors_total;
+    acc.pushed_bytes_total += o.pushed_bytes_total;
+    acc.rejected_no_target_total += o.rejected_no_target_total;
+    acc.rejected_no_storage_cap_total += o.rejected_no_storage_cap_total;
+    acc.rejected_not_participating_total += o.rejected_not_participating_total;
+    acc.rejected_sender_not_overflowing_total += o.rejected_sender_not_overflowing_total;
+    acc.rejected_unhealthy_total += o.rejected_unhealthy_total;
+    acc.rejected_scope_mismatch_total += o.rejected_scope_mismatch_total;
+    acc.rejected_insufficient_disk_total += o.rejected_insufficient_disk_total;
+    acc.high_water_triggered_total += o.high_water_triggered_total;
+    acc.low_water_cleared_total += o.low_water_cleared_total;
+}
+
+// ───────────────────────── helpers ─────────────────────────
+
+fn format_id_label(id: u64, label: Option<&'static str>) -> String {
+    match label {
+        Some(l) => format!("0x{id:04x}.{l}"),
+        None => format!("0x{id:04x}"),
+    }
 }
 
 fn ctx_kv(label: &str, value: &str, value_style: ratatui::style::Style) -> Line<'static> {
@@ -495,19 +625,17 @@ fn bar_kv(label: &str, used: Option<u64>, total: Option<u64>) -> Line<'static> {
             spans.push(Span::styled(format!("  {pct:>3}%  "), theme::text()));
             spans.push(Span::styled(label_value, theme::dim()));
         }
-        None => {
-            spans.push(Span::styled(label_value, theme::chrome()));
-        }
+        None => spans.push(Span::styled(label_value, theme::chrome())),
     }
     Line::from(spans)
 }
 
-fn health_style(s: Option<&'static str>) -> ratatui::style::Style {
+fn health_chip(s: Option<&'static str>) -> (&'static str, ratatui::style::Style) {
     match s {
-        Some("Healthy") => theme::green(),
-        Some("Degraded") => theme::amber(),
-        Some("Unreachable") => theme::red(),
-        _ => theme::chrome(),
+        Some("Healthy") => ("Healthy", theme::green()),
+        Some("Degraded") => ("Degraded", theme::amber()),
+        Some("Unreachable") => ("Unreachable", theme::red()),
+        _ => ("—", theme::chrome()),
     }
 }
 
@@ -534,8 +662,6 @@ fn kv_bytes(label: &'static str, value: u64) -> Line<'static> {
     ])
 }
 
-/// Zeros dim; non-zero brighter so the operator's eye lands on
-/// counters that have actual activity behind them.
 fn value_style(value: u64) -> ratatui::style::Style {
     if value == 0 {
         theme::dim()
@@ -568,9 +694,6 @@ fn bar(pct: u16, width: u16, color: ratatui::style::Color) -> Span<'static> {
     Span::styled(s, ratatui::style::Style::default().fg(color))
 }
 
-/// Human-readable bytes — KB/MB/GB/TB at the closest power of
-/// 1024. Single-decimal precision keeps the column stable
-/// without losing too much resolution.
 fn fmt_bytes(b: u64) -> String {
     const K: u64 = 1 << 10;
     const M: u64 = 1 << 20;
