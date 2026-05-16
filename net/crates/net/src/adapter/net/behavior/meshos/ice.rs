@@ -1985,11 +1985,8 @@ mod tests {
             DaemonSnapshot {
                 name: "telemetry".into(),
                 lifecycle: DaemonLifecycleSnapshot::Stopped,
-                health: None,
-                saturation: 0.0,
                 restart_state: RestartStateSnapshot::BackingOff { until_ms: 5_000 },
-                placement: 0,
-                age_ms: 0,
+                ..Default::default()
             },
         );
         let daemon = DaemonRef {
@@ -2034,20 +2031,14 @@ mod tests {
 
     #[test]
     fn simulate_force_restart_daemon_warns_when_already_idle() {
-        use super::super::snapshot::{
-            DaemonLifecycleSnapshot, DaemonSnapshot, RestartStateSnapshot,
-        };
+        use super::super::snapshot::{DaemonLifecycleSnapshot, DaemonSnapshot};
         let mut snap = MeshOsSnapshot::default();
         snap.daemons.insert(
             7,
             DaemonSnapshot {
                 name: "telemetry".into(),
                 lifecycle: DaemonLifecycleSnapshot::Running,
-                health: None,
-                saturation: 0.0,
-                restart_state: RestartStateSnapshot::Idle,
-                placement: 0,
-                age_ms: 0,
+                ..Default::default()
             },
         );
         let blast = simulate(
