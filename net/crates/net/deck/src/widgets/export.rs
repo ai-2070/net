@@ -182,11 +182,15 @@ fn open_unique(tab: &str) -> Result<(String, std::fs::File), ExportError> {
 }
 
 fn format_ts_ms(ts_ms: u64) -> String {
+    // Mirror the in-deck render format (HH:MM:SS.mmm) so an
+    // exported log window's timestamps line up with what the
+    // operator saw on the LOGS tab.
     let total_sec = ts_ms / 1_000;
+    let hh = total_sec / 3_600;
     let mm = (total_sec / 60) % 60;
     let ss = total_sec % 60;
     let ms = ts_ms % 1_000;
-    format!("{mm:02}:{ss:02}.{ms:03}")
+    format!("{hh:02}:{mm:02}:{ss:02}.{ms:03}")
 }
 
 fn format_log_source(rec: &LogRecord) -> String {
