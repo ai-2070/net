@@ -1462,7 +1462,11 @@ impl App {
     }
 
     fn clamp_dataforts_cursor(&mut self) {
-        let n = self.blob_adapters.len();
+        // DATAFORTS lists one row per datafort node (local +
+        // every peer carrying a dataforts cap), not per blob
+        // adapter. Pinning to `blob_adapters.len()` stuck the
+        // cursor at 3 even when 7 dataforts were rendered.
+        let n = self.collect_dataforts().len();
         if n == 0 {
             self.dataforts_cursor = 0;
         } else if self.dataforts_cursor >= n {
