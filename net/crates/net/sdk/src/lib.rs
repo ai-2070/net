@@ -39,13 +39,11 @@ pub mod compute;
 pub mod config;
 #[cfg(feature = "cortex")]
 pub mod cortex;
-#[cfg(feature = "deck")]
-pub mod deck;
 #[cfg(feature = "dataforts")]
 pub mod dataforts;
+#[cfg(feature = "deck")]
+pub mod deck;
 pub mod error;
-#[cfg(feature = "meshdb")]
-pub mod meshdb;
 #[cfg(feature = "groups")]
 pub mod groups;
 #[cfg(feature = "net")]
@@ -54,6 +52,8 @@ pub mod mesh;
 pub mod mesh_rpc;
 #[cfg(all(feature = "net", feature = "cortex"))]
 pub mod mesh_rpc_resilience;
+#[cfg(feature = "meshdb")]
+pub mod meshdb;
 #[cfg(feature = "meshos")]
 pub mod meshos;
 mod net;

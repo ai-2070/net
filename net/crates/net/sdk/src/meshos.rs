@@ -96,8 +96,8 @@ pub use net::adapter::net::behavior::meshos::{
 // Supporting types daemon authors need.
 pub use net::adapter::net::behavior::capability::CapabilitySet;
 pub use net::adapter::net::behavior::meshos::{
-    ActionDispatcher, DispatchError, HealthProbe, InventoryProbe, LocalityProbe, LogLevel,
-    LogLine, LoggingDispatcher, MeshOsConfig, MeshOsRuntime, PeerInventory, ProbeRegistry,
+    ActionDispatcher, DispatchError, HealthProbe, InventoryProbe, LocalityProbe, LogLevel, LogLine,
+    LoggingDispatcher, MeshOsConfig, MeshOsRuntime, PeerInventory, ProbeRegistry,
     RuntimeShutdownError, RuntimeStats,
 };
 // Event-source supporting types — exposed so test / demo

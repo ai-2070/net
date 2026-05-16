@@ -54,20 +54,45 @@
 
 pub use net::adapter::net::behavior::meshdb::{
     // AST — what consumers compose.
-    clamp_join_watermark_secs, AggregateFn, AggregateRowPayload, AggregateValue, ChainRef, Expr,
-    GroupKey, JoinKey, JoinKind, JoinedRowPayload, MeshQuery, NumericAggregateKind,
-    NumericReductionKind, OrderDir, OrderKey, QueryV1, ResultRow, SeqNum, WindowBoundary,
-    WindowSpec, DEFAULT_JOIN_WATERMARK_SECS,
+    clamp_join_watermark_secs,
+    AggregateFn,
+    AggregateRowPayload,
+    AggregateValue,
+    // Errors.
+    BudgetMetric,
+    // Cache (Phase F) — consumers tuning result reuse opt in
+    // explicitly via `LocalMeshQueryExecutor::with_cache`.
+    CachePolicy,
     // Executor — what consumers run plans through.
-    ChainReader, LocalMeshQueryExecutor, MeshQueryExecutor, QueryHandle, QueryId, ResultStream,
-    RunningQuery,
+    ChainReader,
+    ChainRef,
     // Plan — minimally exposed so the planner output can flow
     // into the executor; consumers don't construct
     // `ExecutionPlan` directly, they get it from `planner.plan(query)`.
-    ExecutionPlan, MeshQueryPlanner,
-    // Errors.
-    BudgetMetric, MeshError,
-    // Cache (Phase F) — consumers tuning result reuse opt in
-    // explicitly via `LocalMeshQueryExecutor::with_cache`.
-    CachePolicy, LruResultCache,
+    ExecutionPlan,
+    Expr,
+    GroupKey,
+    JoinKey,
+    JoinKind,
+    JoinedRowPayload,
+    LocalMeshQueryExecutor,
+    LruResultCache,
+    MeshError,
+    MeshQuery,
+    MeshQueryExecutor,
+    MeshQueryPlanner,
+    NumericAggregateKind,
+    NumericReductionKind,
+    OrderDir,
+    OrderKey,
+    QueryHandle,
+    QueryId,
+    QueryV1,
+    ResultRow,
+    ResultStream,
+    RunningQuery,
+    SeqNum,
+    WindowBoundary,
+    WindowSpec,
+    DEFAULT_JOIN_WATERMARK_SECS,
 };
