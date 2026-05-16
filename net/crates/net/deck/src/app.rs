@@ -1232,7 +1232,14 @@ impl App {
             return;
         }
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            // Top-level Esc is a no-op. The modal absorber + focus
+            // absorbers above handle Esc-to-dismiss in their own
+            // arms; the outer fall-through used to quit the app,
+            // which made Esc a session-ending key in any context
+            // where the operator pressed it to "cancel" without
+            // a modal open. Quit stays on `q` and Ctrl-C.
+            KeyCode::Esc => {}
+            KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => self.should_quit = true,
             // Help overlay — works on every tab, no cursor
             // required.
