@@ -1153,6 +1153,80 @@ mod tests {
     }
 
     #[test]
+    fn daemon_snapshot_postcard_wire_is_byte_stable() {
+        // The first-pass review's `serde(default)` fix is
+        // JSON-only — postcard cross-binary decode still
+        // requires field count + order agreement between
+        // encoder and decoder. Pin the on-wire bytes for a
+        // representative `DaemonSnapshot` so any accidental
+        // wire change (added field without a corresponding
+        // bump, reordered fields, type substitution) trips
+        // a clear regression here instead of silently rolling
+        // out to consumers and surfacing as decode errors at
+        // operator time.
+        let s = DaemonSnapshot {
+            name: "x".into(),
+            lifecycle: DaemonLifecycleSnapshot::Running,
+            health: None,
+            saturation: 0.5,
+            restart_state: RestartStateSnapshot::Idle,
+            placement: 0xAA,
+            age_ms: 1234,
+        };
+        let bytes = postcard::to_allocvec(&s).expect("encode");
+        // Captured 2026-05-16 against this exact field shape.
+        // To rotate after an intentional schema bump: drop a
+        // `dbg!(&bytes);` here, re-run, paste the printout.
+        let captured: &[u8] = &[
+            0x01, 0x78, 0x02, 0x00, 0x00, 0x00, 0x00, 0x3F, 0x00, 0xAA, 0x01, 0xD2, 0x09,
+        ];
+        assert_eq!(
+            bytes, captured,
+            "DaemonSnapshot postcard wire drifted — got {bytes:?}",
+        );
+        let back: DaemonSnapshot =
+            postcard::from_bytes(captured).expect("decode captured bytes");
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn peer_snapshot_postcard_wire_is_byte_stable() {
+        // Same forward-compat guard as the DaemonSnapshot test
+        // above, against `PeerSnapshot` whose Feature-11
+        // inventory axes were the most recent additions and
+        // the most exposed via the Deck SDK surface.
+        let mut p = PeerSnapshot {
+            rtt_ms: Some(7),
+            health: Some(PeerHealthSnapshot::Healthy),
+            maintenance: Some(MaintenanceMirrorSnapshot::Active),
+            cpu_load_1m: Some(0.25),
+            mem_used_bytes: Some(1024),
+            mem_total_bytes: Some(8192),
+            disk_used_bytes: None,
+            disk_total_bytes: None,
+            saturation_trend: Some(0.4),
+            capability_set: std::collections::BTreeSet::new(),
+            software_version: Some("v1".into()),
+            forked_from: None,
+        };
+        p.capability_set.insert("net.peer".into());
+        let bytes = postcard::to_allocvec(&p).expect("encode");
+        let captured: &[u8] = &[
+            0x01, 0x07, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xD0,
+            0x3F, 0x01, 0x80, 0x08, 0x01, 0x80, 0x40, 0x00, 0x00, 0x01, 0xCD, 0xCC, 0xCC, 0x3E,
+            0x01, 0x08, 0x6E, 0x65, 0x74, 0x2E, 0x70, 0x65, 0x65, 0x72, 0x01, 0x02, 0x76, 0x31,
+            0x00,
+        ];
+        assert_eq!(
+            bytes, captured,
+            "PeerSnapshot postcard wire drifted — got {bytes:?}",
+        );
+        let back: PeerSnapshot =
+            postcard::from_bytes(captured).expect("decode captured bytes");
+        assert_eq!(back, p);
+    }
+
+    #[test]
     fn action_kind_str_covers_every_variant() {
         // Without `MeshOsAction`'s `#[non_exhaustive]` we'd get
         // a compile error if `action_kind_str` missed a variant.
