@@ -34,8 +34,9 @@ use tokio::runtime::Runtime;
 
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use net::adapter::net::behavior::meshos::{
-    LoggingDispatcher, MaintenanceStateView, MeshOsConfig, MeshOsDaemonHandle as CoreHandle,
-    MeshOsDaemonSdk as CoreSdk, MetadataView, SdkError, DEFAULT_GRACEFUL_SHUTDOWN,
+    LoggingDispatcher, MaintenanceMirrorSnapshot, MaintenanceStateView, MeshOsConfig,
+    MeshOsDaemonHandle as CoreHandle, MeshOsDaemonSdk as CoreSdk, MetadataView,
+    PeerHealthSnapshot, PeerSnapshot, SdkError, DEFAULT_GRACEFUL_SHUTDOWN,
 };
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::compute::{
@@ -186,9 +187,10 @@ fn maintenance_state_to_dict<'py>(
 }
 
 /// Render a `MetadataView` as a Python dict. Peers are emitted as
-/// a list of `{node_id, ...}` dicts in slice 1; the full
-/// `PeerSnapshot` projection lands when the operator-side
-/// `subscribe_peers` surface ships.
+/// a dict keyed by node id, each value a full `PeerSnapshot`
+/// projection (rtt, health, maintenance mirror, host metrics,
+/// capabilities, software version). The cross-binding wire form is
+/// `peers: {node_id: {rtt_ms, health, maintenance, ...}}`.
 fn metadata_view_to_dict<'py>(
     py: Python<'py>,
     view: &MetadataView,
@@ -198,11 +200,57 @@ fn metadata_view_to_dict<'py>(
     d.set_item("daemon_id", view.daemon_id)?;
     d.set_item("daemon_name", view.daemon_name.clone())?;
     d.set_item("maintenance_state", maintenance_state_to_dict(py, &view.maintenance_state)?)?;
-    // Slice 1: emit only the peer count + node ids. Full peer
-    // projection (rtt, health, maintenance mirror) lands in slice 2.
-    let peer_ids: Vec<u64> = view.peers.keys().copied().collect();
-    d.set_item("peers", peer_ids)?;
+    let peers = PyDict::new(py);
+    for (node_id, snap) in &view.peers {
+        peers.set_item(*node_id, peer_snapshot_to_dict(py, snap)?)?;
+    }
+    d.set_item("peers", peers)?;
     Ok(d)
+}
+
+/// Render a `PeerSnapshot` as a Python dict. Health and maintenance
+/// mirror enums are stringified to their variant names; the rest
+/// of the fields are passed through as their native scalar types.
+fn peer_snapshot_to_dict<'py>(
+    py: Python<'py>,
+    snap: &PeerSnapshot,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("rtt_ms", snap.rtt_ms)?;
+    d.set_item("health", snap.health.map(peer_health_str))?;
+    d.set_item("maintenance", snap.maintenance.map(maintenance_mirror_str))?;
+    d.set_item("cpu_load_1m", snap.cpu_load_1m)?;
+    d.set_item("mem_used_bytes", snap.mem_used_bytes)?;
+    d.set_item("mem_total_bytes", snap.mem_total_bytes)?;
+    d.set_item("disk_used_bytes", snap.disk_used_bytes)?;
+    d.set_item("disk_total_bytes", snap.disk_total_bytes)?;
+    d.set_item("saturation_trend", snap.saturation_trend)?;
+    let caps: Vec<String> = snap.capability_set.iter().cloned().collect();
+    d.set_item("capability_set", caps)?;
+    d.set_item("software_version", snap.software_version.clone())?;
+    d.set_item("forked_from", snap.forked_from)?;
+    Ok(d)
+}
+
+fn peer_health_str(h: PeerHealthSnapshot) -> &'static str {
+    match h {
+        PeerHealthSnapshot::Healthy => "Healthy",
+        PeerHealthSnapshot::Degraded => "Degraded",
+        PeerHealthSnapshot::Unreachable => "Unreachable",
+        _ => "Unknown",
+    }
+}
+
+fn maintenance_mirror_str(m: MaintenanceMirrorSnapshot) -> &'static str {
+    match m {
+        MaintenanceMirrorSnapshot::Active => "Active",
+        MaintenanceMirrorSnapshot::EnteringMaintenance => "EnteringMaintenance",
+        MaintenanceMirrorSnapshot::Maintenance => "Maintenance",
+        MaintenanceMirrorSnapshot::ExitingMaintenance => "ExitingMaintenance",
+        MaintenanceMirrorSnapshot::DrainFailed => "DrainFailed",
+        MaintenanceMirrorSnapshot::Recovery => "Recovery",
+        _ => "Unknown",
+    }
 }
 
 // =========================================================================
@@ -711,15 +759,28 @@ impl PyMeshOsDaemonHandle {
         inner.publish_log(lvl, message).map_err(|e| sdk_err_from(py, e))
     }
 
-    /// Publish (or update) the daemon's capability set. Slice 1 is
-    /// a stub on the substrate side — returns without committing.
-    /// The pyclass accepts a dict for forward-compatibility; the
-    /// argument is ignored today.
-    #[pyo3(signature = (_caps=None))]
-    fn publish_capabilities(&self, py: Python<'_>, _caps: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+    /// Publish (or update) the daemon's capability set.
+    ///
+    /// `caps` is a dict matching the cross-language capability
+    /// shape from `bindings/python/src/capabilities.rs` —
+    /// `{hardware?, software?, models?, tools?, tags?, limits?, metadata?}`.
+    /// `None` clears to the empty default.
+    ///
+    /// The substrate-side commit is a stub today (returns `Ok(())`
+    /// without committing); the conversion still runs so a
+    /// malformed dict surfaces a typed error immediately rather
+    /// than silently lost when the chain commit lands.
+    #[pyo3(signature = (caps=None))]
+    fn publish_capabilities(&self, py: Python<'_>, caps: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
         let inner = self.require_inner()?;
+        let cap_set = match caps {
+            Some(d) => crate::capabilities::capability_set_from_py(d).map_err(|e| {
+                sdk_err(py, "invalid_capabilities", &format!("{e}"))
+            })?,
+            None => CapabilitySet::default(),
+        };
         inner
-            .publish_capabilities(CapabilitySet::default())
+            .publish_capabilities(cap_set)
             .map_err(|e| sdk_err_from(py, e))
     }
 

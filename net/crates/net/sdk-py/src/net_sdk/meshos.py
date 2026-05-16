@@ -144,12 +144,43 @@ MaintenanceState = Union[
 ]
 
 
+PeerHealth = Literal["Healthy", "Degraded", "Unreachable", "Unknown"]
+PeerMaintenance = Literal[
+    "Active",
+    "EnteringMaintenance",
+    "Maintenance",
+    "ExitingMaintenance",
+    "DrainFailed",
+    "Recovery",
+    "Unknown",
+]
+
+
+class PeerSnapshot(TypedDict):
+    rtt_ms: Optional[int]
+    health: Optional[PeerHealth]
+    maintenance: Optional[PeerMaintenance]
+    cpu_load_1m: Optional[float]
+    mem_used_bytes: Optional[int]
+    mem_total_bytes: Optional[int]
+    disk_used_bytes: Optional[int]
+    disk_total_bytes: Optional[int]
+    saturation_trend: Optional[float]
+    capability_set: list[str]
+    software_version: Optional[str]
+    forked_from: Optional[int]
+
+
 class MetadataView(TypedDict):
     node_id: int
     daemon_id: int
     daemon_name: str
     maintenance_state: MaintenanceState
-    peers: list[int]
+    # Keyed by peer node id; each value is a full PeerSnapshot
+    # projection. Slice 2 promoted this from a bare list of ids to
+    # the full dict so consumers can read rtt/health/maintenance
+    # without a follow-up call.
+    peers: dict[int, PeerSnapshot]
 
 
 # =========================================================================
@@ -359,5 +390,8 @@ __all__ = [
     "DaemonControlUnknown",
     "MaintenanceState",
     "MetadataView",
+    "PeerSnapshot",
+    "PeerHealth",
+    "PeerMaintenance",
     "LogLevel",
 ]

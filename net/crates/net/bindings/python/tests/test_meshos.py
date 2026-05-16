@@ -111,12 +111,14 @@ def test_register_daemon_returns_handle_with_correct_identity() -> None:
             handle.graceful_shutdown(grace_ms=10)
 
 
-def test_metadata_view_carries_active_maintenance_state_and_peers_list() -> None:
+def test_metadata_view_carries_active_maintenance_state_and_peers() -> None:
     with MeshOsDaemonSdk.start() as sdk:
         with sdk.register_daemon(_EchoDaemon(), Identity.generate()) as handle:
             md = handle.metadata()
             assert md["maintenance_state"]["kind"] == "Active"
-            assert isinstance(md["peers"], list)
+            # Slice 2 emits peers as a `{node_id: PeerSnapshot}` dict.
+            # Empty here since there are no peers in a single-node fixture.
+            assert isinstance(md["peers"], dict)
             assert md["daemon_name"] == "echo"
 
 
@@ -221,6 +223,150 @@ def test_publish_capabilities_stub_returns_without_error() -> None:
         with sdk.register_daemon(_EchoDaemon(), Identity.generate()) as handle:
             handle.publish_capabilities({"tags": ["software.telemetry"]})
             # No assertion on side effect — slice 1 is a no-op stub.
+
+
+# -------------------------------------------------------------------------
+# Slice 2: real CapabilitySet conversion. The substrate-side commit
+# remains a stub; the conversion still runs so a malformed dict
+# surfaces a typed error immediately.
+# -------------------------------------------------------------------------
+
+
+def test_publish_capabilities_accepts_full_cap_set_dict() -> None:
+    with MeshOsDaemonSdk.start() as sdk:
+        with sdk.register_daemon(_EchoDaemon(), Identity.generate()) as handle:
+            handle.publish_capabilities(
+                {
+                    "hardware": {"cpu_cores": 8, "ram_bytes": 16 * 1024**3},
+                    "software": {"runtime": "rust-1.78"},
+                    "tags": ["software.telemetry", "scope:trusted"],
+                }
+            )
+
+
+def test_publish_capabilities_with_none_clears_to_default() -> None:
+    with MeshOsDaemonSdk.start() as sdk:
+        with sdk.register_daemon(_EchoDaemon(), Identity.generate()) as handle:
+            handle.publish_capabilities(None)
+            handle.publish_capabilities()  # no-arg path
+
+
+def test_publish_capabilities_rejects_malformed_dict_with_typed_error() -> None:
+    with MeshOsDaemonSdk.start() as sdk:
+        with sdk.register_daemon(_EchoDaemon(), Identity.generate()) as handle:
+            with pytest.raises(MeshOsSdkError) as excinfo:
+                # `models` must be a list of dicts per
+                # capabilities::capability_set_from_py; a bare
+                # string violates the schema.
+                handle.publish_capabilities({"models": "not a list"})
+            assert excinfo.value.kind == "invalid_capabilities"
+
+
+# -------------------------------------------------------------------------
+# Slice 2: peer snapshot decoding. No peers exist in a single-node
+# fixture, but the shape is verifiable — `peers` is a dict (not a
+# list) and gains structured `PeerSnapshot` projections per id.
+# -------------------------------------------------------------------------
+
+
+def test_metadata_peers_is_a_dict_not_a_list() -> None:
+    """Slice 2 returns `peers` as a `{node_id: PeerSnapshot}` dict.
+    The slice 1 form was `peers: [node_id, ...]`; consumers that
+    upgraded must adjust. Pin the shape so regressions surface."""
+    with MeshOsDaemonSdk.start() as sdk:
+        with sdk.register_daemon(_EchoDaemon(), Identity.generate()) as handle:
+            md = handle.metadata()
+            assert isinstance(md["peers"], dict)
+
+
+# -------------------------------------------------------------------------
+# Slice 2: snapshot/restore wiring. The supervisor invokes the
+# bridge's snapshot/restore on migration; from the daemon-side SDK
+# we can't drive migration directly, but we *can* verify a daemon
+# with snapshot+restore methods registers cleanly without raising
+# (the bridge resolves the optional callables eagerly at registration
+# time, so an invalid method signature would surface here).
+# -------------------------------------------------------------------------
+
+
+class _StatefulDaemon:
+    def __init__(self) -> None:
+        self.value = 0
+        self.restored_from: bytes | None = None
+
+    def name(self) -> str:
+        return "stateful"
+
+    def process(self, event):
+        self.value += 1
+        return [b"v=%d" % self.value]
+
+    def snapshot(self) -> bytes | None:
+        return self.value.to_bytes(8, "little")
+
+    def restore(self, state: bytes) -> None:
+        self.restored_from = bytes(state)
+        self.value = int.from_bytes(state, "little")
+
+
+def test_stateful_daemon_with_snapshot_and_restore_registers_cleanly() -> None:
+    daemon = _StatefulDaemon()
+    with MeshOsDaemonSdk.start() as sdk:
+        with sdk.register_daemon(daemon, Identity.generate()) as handle:
+            assert handle.daemon_name == "stateful"
+
+
+class _DaemonWithSnapshotReturningNone:
+    """Stateless daemons return `None` from `snapshot()`. The bridge
+    must treat this as 'no snapshot to capture' rather than
+    crashing on the missing return value."""
+
+    def name(self) -> str:
+        return "stateless-with-snapshot-method"
+
+    def process(self, event):
+        return []
+
+    def snapshot(self) -> None:
+        return None
+
+
+def test_daemon_with_explicit_none_snapshot_registers_cleanly() -> None:
+    with MeshOsDaemonSdk.start() as sdk:
+        with sdk.register_daemon(
+            _DaemonWithSnapshotReturningNone(), Identity.generate()
+        ) as handle:
+            assert handle.daemon_name == "stateless-with-snapshot-method"
+
+
+# -------------------------------------------------------------------------
+# Slice 2: optional health / saturation callbacks resolved at register.
+# -------------------------------------------------------------------------
+
+
+class _DaemonWithHealth:
+    def __init__(self, queue_depth: int) -> None:
+        self.queue_depth = queue_depth
+
+    def name(self) -> str:
+        return "with-health"
+
+    def process(self, event):
+        return []
+
+    def health(self):
+        if self.queue_depth < 1000:
+            return "healthy"
+        return {"kind": "degraded", "reason": "queue depth"}
+
+    def saturation(self) -> float:
+        return min(1.0, self.queue_depth / 1000.0)
+
+
+def test_daemon_with_health_and_saturation_callbacks_registers_cleanly() -> None:
+    with MeshOsDaemonSdk.start() as sdk:
+        with sdk.register_daemon(_DaemonWithHealth(0), Identity.generate()) as handle:
+            assert handle.daemon_name == "with-health"
 
 
 # -------------------------------------------------------------------------
