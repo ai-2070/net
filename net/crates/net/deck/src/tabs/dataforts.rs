@@ -710,9 +710,13 @@ fn sum_overflow(
 // ───────────────────────── helpers ─────────────────────────
 
 fn format_id_label(id: u64, label: Option<&str>) -> String {
+    // Match the rest of the deck (`{:x}` minimum-width): a
+    // padded `{:04x}` rendered the same id as `0x0001` here
+    // and `0x1` on NODES / REPLICAS / AUDIT, so a hex search
+    // an operator typed wouldn't match across tabs.
     match label {
-        Some(l) => format!("0x{id:04x}.{l}"),
-        None => format!("0x{id:04x}"),
+        Some(l) => format!("0x{id:x}.{l}"),
+        None => format!("0x{id:x}"),
     }
 }
 
