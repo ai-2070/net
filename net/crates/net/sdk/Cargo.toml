@@ -109,7 +109,15 @@ meshdb = ["net/meshdb"]
 # compute + groups, no external transports). The default shape for
 # a single-node or LAN-only deployment.
 local = ["net", "cortex", "compute", "groups"]
-# Everything — local stack plus external transports.
+# Everything — local stack plus external transports plus the
+# operator-facing surfaces. `dataforts` and `meshdb` are
+# deliberately omitted: both pull substrate features that
+# enlarge the dependency footprint (redex-disk, blake3, the
+# meshdb query plane), and `full` is meant to be "the
+# common bundle for an operator's full-stack daemon", not
+# "every flag this crate exposes". Consumers that want
+# dataforts blob storage or the MeshDB query plane add those
+# flags explicitly.
 full = ["local", "redis", "jetstream", "meshos", "deck"]
 
 # nRPC quickstart — requires net + cortex.
