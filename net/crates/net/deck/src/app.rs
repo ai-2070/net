@@ -1785,7 +1785,14 @@ impl App {
                 self.netmap_cursor = n.saturating_sub(1);
             }
             Tab::Dataforts => {
-                let n = self.blob_adapters.len();
+                // The rendered list is `1 local + N remote
+                // dataforts`, sourced from `collect_dataforts()`.
+                // `blob_adapters.len()` only counts the local
+                // node's wired blob adapters and skips the
+                // remote-datafort rows entirely; using it here
+                // landed the cursor at the wrong row whenever a
+                // peer advertised `dataforts.blob.storage`.
+                let n = self.collect_dataforts().len();
                 self.dataforts_cursor = n.saturating_sub(1);
             }
             Tab::Nodes => {
