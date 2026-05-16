@@ -1,0 +1,48 @@
+net/crates/net/deck/src/tabs/dataforts.rs
+  s_33e8c099a9039e::t_d05eadb7743fbd 197-203,208-220,224,236-238,309-310
+net/crates/net/deck/src/main.rs
+  s_33e8c099a9039e::t_52a1909032f9ee 80-87
+net/crates/net/deck/src/tabs/net_map.rs
+  s_33e8c099a9039e::t_2d9ffc7d409db7 87
+  s_33e8c099a9039e::t_6c06720c50ffb2 45-50
+net/crates/net/deck/src/tabs/node_page.rs
+  s_33e8c099a9039e::t_62f1c65a981ec2 724
+  s_33e8c099a9039e::t_659c0c80e97c9c 704-707,711-712,718,723,725-733,747-752,756-759,766,773-784
+net/crates/net/bindings/node/src/lib.rs
+  s_33e8c099a9039e::t_a51ac0dcf1e2ae 13-18
+net/crates/net/bindings/go/meshdb-ffi/src/lib.rs
+  s_33e8c099a9039e::t_09b98f0ad859ba 1944-1946
+net/crates/net/deck/src/tabs/mod.rs
+  s_33e8c099a9039e::t_0df36867b6ad1e 16-60
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  s_33e8c099a9039e::t_9c338d77947729 159
+net/crates/net/sdk/src/compute.rs
+  s_33e8c099a9039e::t_ac97184150f11f 265
+  s_33e8c099a9039e::t_3a4bd3a3972fdb 245
+  s_33e8c099a9039e::t_3824d0258ec175 352
+  s_33e8c099a9039e::t_b79f23ce4a8d26 184
+net/crates/net/deck/src/tabs/daemon_page.rs
+  s_33e8c099a9039e::t_811c04f4367f85 400-414,454-458
+net/crates/net/deck/src/app.rs
+  s_33e8c099a9039e::t_6f7e628bb44293 505,512-518
+net/crates/net/deck/src/tabs/blobs.rs
+  s_33e8c099a9039e::t_7cda4bb5f14fbd 145
+net/crates/net/deck/src/streams.rs
+  s_33e8c099a9039e::t_92205c133532e7 412-424
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "f3d4ad274ebb009bb2261203fdffb4173f2a0085",
+  "prompts": {},
+  "sessions": {
+    "s_33e8c099a9039e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f5bf814-14c4-4dd9-b249-30bbae94726a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
