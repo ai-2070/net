@@ -93,13 +93,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ));
     left.push(sep());
 
-    // recently emitted: 0 recent
-    let recent_style = if recent == 0 {
-        theme::dim()
-    } else {
-        theme::amber()
-    };
-    left.push(Span::styled(format!("{recent} recent"), recent_style));
+    // recently emitted: 0 recent — kept dim regardless of
+    // count. The substrate's `recently_emitted` ring is a
+    // diagnostic counter (last N emitted; executor doesn't
+    // signal completion back), not a live-pressure signal
+    // worth amber-pulsing in the operator's peripheral view.
+    left.push(Span::styled(format!("{recent} recent"), theme::dim()));
     left.push(sep());
 
     // local maintenance state
