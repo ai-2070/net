@@ -33,6 +33,26 @@ pub struct ExportResult {
 /// structured error kinds.
 pub type ExportError = String;
 
+/// Sanitise a daemon-supplied string before it lands in an
+/// export file. Replaces line-terminators with a single space
+/// so each record stays on one line, and replaces every other
+/// control character (including the `\x1b` that starts an
+/// ANSI escape) with `?`. Without this a daemon log message
+/// containing `\n` would break the one-record-per-line
+/// format and an `\x1b]…` payload would survive to disk and
+/// to any pager / `cat` an operator ran over the file.
+fn sanitize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' | '\r' | '\t' => out.push(' '),
+            c if c.is_control() => out.push('?'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Write a slice of LOG records as plain text. Format:
 /// `MM:SS.mmm LEVEL  source  message` per line, matching
 /// the in-deck row layout (minus the styling).
@@ -52,7 +72,7 @@ pub fn write_logs(records: &[LogRecord]) -> Result<ExportResult, ExportError> {
             f,
             "{ts}  {level}  {source}  {msg}",
             ts = format_ts_ms(rec.ts_ms),
-            msg = rec.message,
+            msg = sanitize(&rec.message),
         )
         .map_err(|e| format!("write: {e}"))?;
         count += 1;
@@ -107,7 +127,7 @@ pub fn write_blobs(entries: &[BlobInventoryEntry]) -> Result<ExportResult, Expor
         writeln!(
             f,
             "hash={hash}  ref={ref_}  pin={pin}  first_seen_ms={first}  last_seen_ms={last}",
-            hash = e.hash_hex,
+            hash = sanitize(&e.hash_hex),
             ref_ = e.refcount,
             pin = if e.pinned { "1" } else { "0" },
             first = e.first_seen_unix_ms,
@@ -132,8 +152,8 @@ pub fn write_failures(records: &[FailureRecord]) -> Result<ExportResult, ExportE
             "seq={seq:>5}  ts_ms={ts}  source={src}  reason={reason}",
             seq = rec.seq,
             ts = rec.recorded_at_ms,
-            src = rec.source,
-            reason = rec.reason,
+            src = sanitize(&rec.source),
+            reason = sanitize(&rec.reason),
         )
         .map_err(|e| format!("write: {e}"))?;
         count += 1;
