@@ -1,0 +1,38 @@
+net/crates/net/deck/src/tabs/dataforts.rs
+  s_4a2fa2d5f63459::t_0df2c027023c47 696-730
+  s_4a2fa2d5f63459::t_81e21cf266981c 668-673
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_4a2fa2d5f63459::t_072af973f5a70a 1374-1377,1379,1382
+net/crates/net/deck/src/tabs/daemon_page.rs
+  s_4a2fa2d5f63459::t_30b433d96fca21 375
+net/crates/net/deck/src/tabs/audit.rs
+  s_4a2fa2d5f63459::t_e96326b9633d5a 343
+net/crates/net/deck/src/tabs/failures.rs
+  s_4a2fa2d5f63459::t_b220d5dfb61a5b 204
+net/crates/net/deck/src/tabs/blobs.rs
+  s_4a2fa2d5f63459::t_05f22c9efd806d 222
+net/crates/net/deck/src/tabs/groups.rs
+  s_4a2fa2d5f63459::t_1eecfc4133026d 442
+net/crates/net/deck/src/tabs/mod.rs
+  s_4a2fa2d5f63459::t_b749630ffd7586 46-68
+net/crates/net/deck/src/tabs/net_map.rs
+  s_4a2fa2d5f63459::t_63ebfd16f6bdc2 423
+net/crates/net/deck/src/bookmarks.rs
+  s_4a2fa2d5f63459::t_fc3d2dc3deb17e 124-141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "b68ddc95893cb08219f902efa8ccbf6fdbea7ad6",
+  "prompts": {},
+  "sessions": {
+    "s_4a2fa2d5f63459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5d060031-ba25-4cac-9cbf-32d9a94cbf0c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
