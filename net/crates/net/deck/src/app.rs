@@ -1270,8 +1270,6 @@ impl App {
         let is_tab_switch = matches!(
             code,
             KeyCode::Char('0'..='9')
-                | KeyCode::Char('h')
-                | KeyCode::Char('l')
                 | KeyCode::Tab
                 | KeyCode::BackTab
                 | KeyCode::Left
@@ -1439,12 +1437,13 @@ impl App {
             KeyCode::Char(':') => {
                 self.modal = Some(Modal::ClusterPicker { cursor: 0 });
             }
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                self.current = self.current.next()
-            }
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                self.current = self.current.prev()
-            }
+            // `l` was previously bound here as a vim-style
+            // tab-cycle alias, but the per-tab / focus-mode
+            // `l` shortcut (jump to LOGS filtered for the
+            // cursored id) needs the key. Tab cycling stays
+            // on Tab / BackTab / arrow keys.
+            KeyCode::Tab | KeyCode::Right => self.current = self.current.next(),
+            KeyCode::BackTab | KeyCode::Left => self.current = self.current.prev(),
             // Numeric tab jumps follow `Tab::all()` order. `0`
             // is the 10th slot (LOGS) — pinned there so the
             // alphabetic shortcuts stay free.
