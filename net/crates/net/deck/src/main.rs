@@ -30,6 +30,16 @@ use app::App;
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
+    // Restore the terminal on panic. color_eyre installs a
+    // report hook but doesn't undo raw mode / alternate
+    // screen; without this hook a panic inside the App's run
+    // loop leaves the operator's terminal scrambled.
+    let prev_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        prev_panic_hook(info);
+    }));
+
     let harness = runtime::spawn().await?;
     let deck = harness.deck();
     let blob_adapters = harness.blob_adapters();
