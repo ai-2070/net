@@ -343,10 +343,11 @@ mod samples {
                         0.22 + ((i as f32 * 0.07) % 0.5)
                     };
                     // Capability set: every peer carries the
-                    // base capabilities; degraded peers also
-                    // advertise the dataforts overflow tag so
-                    // operators can see it in the inventory
-                    // detail panel later.
+                    // base capabilities; specialty peers (the
+                    // gpu rig, edge box, and lab bench) advertise
+                    // deeper namespaces so the NODE-page caps
+                    // tree exercises both the single-chain and
+                    // branching renderings.
                     let mut caps = std::collections::BTreeSet::new();
                     caps.insert("compute.daemon".to_string());
                     caps.insert("meshos.health".to_string());
@@ -355,6 +356,27 @@ mod samples {
                     }
                     if i % 4 == 0 {
                         caps.insert("greedy.cache".to_string());
+                    }
+                    match *id {
+                        0xbdda => {
+                            // gpu-rig: GPU-family compute fanout
+                            caps.insert("compute.gpu.cuda".to_string());
+                            caps.insert("compute.gpu.tensor".to_string());
+                            caps.insert("compute.gpu.rocm".to_string());
+                        }
+                        0xf83d => {
+                            // edge: light sensor suite
+                            caps.insert("sensor.lidar".to_string());
+                            caps.insert("sensor.temp.cel".to_string());
+                        }
+                        0x0fc2 => {
+                            // lab-bench: full sensor stack
+                            caps.insert("sensor.lidar".to_string());
+                            caps.insert("sensor.radar.shortwave".to_string());
+                            caps.insert("sensor.radar.longwave".to_string());
+                            caps.insert("sensor.temp.cel".to_string());
+                        }
+                        _ => {}
                     }
                     let inv = PeerInventory {
                         cpu_load_1m: Some(cpu),

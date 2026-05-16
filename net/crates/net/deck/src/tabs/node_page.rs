@@ -43,9 +43,18 @@ pub fn render(
     entry: &NodeFocusEntry,
     live: &MeshOsSnapshot,
 ) {
+    // NODE panel grows with the capability tree so a node with
+    // deep capability subtrees (sensor.radar.shortwave …) still
+    // gets the full tree drawn instead of being clipped. Clamp to
+    // leave at least 6 rows for PLACEMENT below.
+    let cap_lines = count_cap_lines(&entry.peer.capability_set);
+    let needed = 2 /* borders */ + 6 /* main rows */ + 1 /* spacer */ + cap_lines + 1;
+    let panel_h = (needed as u16)
+        .max(12)
+        .min(area.height.saturating_sub(6));
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(14), Constraint::Min(0)])
+        .constraints([Constraint::Length(panel_h), Constraint::Min(0)])
         .split(area);
     render_peer_panel(frame, rows[0], entry);
     render_placement_panel(frame, rows[1], entry, live);
@@ -83,14 +92,15 @@ fn render_peer_panel(frame: &mut Frame<'_>, area: Rect, entry: &NodeFocusEntry) 
     frame.render_widget(block, area);
 
     // Top of inner: two columns (identity + resources). The
-    // capabilities flow takes a single line at the bottom of
-    // the panel so the row reads like a tag set rather than a
-    // bulleted list.
+    // capability tree takes the remaining height so deep
+    // capability namespaces render in full instead of as a
+    // truncated single-line tag flow.
     let stack = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),    // identity + resources
-            Constraint::Length(2), // caps header + caps flow
+            Constraint::Length(6), // identity + resources
+            Constraint::Length(1), // spacer
+            Constraint::Min(0),    // caps tree
         ])
         .split(inner);
 
@@ -101,7 +111,7 @@ fn render_peer_panel(frame: &mut Frame<'_>, area: Rect, entry: &NodeFocusEntry) 
 
     render_identity_column(frame, cols[0], entry, &id_label);
     render_resources_column(frame, cols[1], entry);
-    render_caps_row(frame, stack[1], entry);
+    render_caps_section(frame, stack[2], entry);
 }
 
 fn render_identity_column(
@@ -263,28 +273,138 @@ fn render_sat_row(frame: &mut Frame<'_>, area: Rect, sat: Option<f32>) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_caps_row(frame: &mut Frame<'_>, area: Rect, entry: &NodeFocusEntry) {
-    let mut spans = vec![Span::styled("  caps      ", theme::chrome())];
-    if entry.peer.capability_set.is_empty() {
-        spans.push(Span::styled("—", theme::chrome()));
+// ───────────────────────── capability tree ─────────────────────────
+//
+// Capabilities are dot-separated namespaces (e.g.
+// `sensor.radar.shortwave`). Rendered as a tree grouped by the
+// shared prefix so deep namespaces read clearly. A subtree that
+// is a single linear chain (no branching) collapses inline as
+// `parent.child.grandchild`; a subtree that branches gets one
+// indented row per child:
+//
+//     compute.daemon
+//     greedy.cache
+//     sensor.
+//       lidar
+//       radar.
+//         shortwave
+//         longwave
+//       temp.cel
+
+struct CapNode {
+    name: String,
+    children: Vec<CapNode>,
+}
+
+fn render_caps_section(frame: &mut Frame<'_>, area: Rect, entry: &NodeFocusEntry) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![Span::styled(
+        "  caps",
+        theme::chrome(),
+    )]));
+
+    let tree = build_cap_tree(&entry.peer.capability_set);
+    if tree.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("      ", theme::chrome()),
+            Span::styled("—", theme::chrome()),
+        ]));
     } else {
-        let mut first = true;
-        for cap in &entry.peer.capability_set {
-            if !first {
-                spans.push(Span::styled("  ·  ", theme::chrome()));
-            }
-            spans.push(Span::styled(cap.clone(), theme::text()));
-            first = false;
+        for node in &tree {
+            push_cap_lines(node, 0, &mut lines);
         }
     }
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(area);
-    // Skip rows[0] as a blank spacer; render the caps on
-    // rows[1] so it reads as a separated row, not a
-    // continuation of the resources column.
-    frame.render_widget(Paragraph::new(Line::from(spans)), layout[1]);
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn push_cap_lines(node: &CapNode, depth: usize, lines: &mut Vec<Line<'static>>) {
+    // 6-col gutter to align under the "caps" label, then 2 cols
+    // per depth level for the tree indent.
+    let indent = format!("      {}", "  ".repeat(depth));
+    if is_chain(node) {
+        lines.push(Line::from(vec![
+            Span::styled(indent, theme::chrome()),
+            Span::styled(chain_path(node), theme::text()),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(indent, theme::chrome()),
+            Span::styled(format!("{}.", node.name), theme::cyan()),
+        ]));
+        for child in &node.children {
+            push_cap_lines(child, depth + 1, lines);
+        }
+    }
+}
+
+fn build_cap_tree<'a, I>(caps: I) -> Vec<CapNode>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let mut sorted: Vec<&String> = caps.into_iter().collect();
+    sorted.sort();
+    let mut roots: Vec<CapNode> = Vec::new();
+    for cap in sorted {
+        let parts: Vec<&str> = cap.split('.').filter(|s| !s.is_empty()).collect();
+        insert_cap(&mut roots, &parts);
+    }
+    roots
+}
+
+fn insert_cap(siblings: &mut Vec<CapNode>, parts: &[&str]) {
+    let Some((head, rest)) = parts.split_first() else {
+        return;
+    };
+    if let Some(child) = siblings.iter_mut().find(|c| c.name == *head) {
+        insert_cap(&mut child.children, rest);
+    } else {
+        let mut node = CapNode {
+            name: (*head).to_string(),
+            children: Vec::new(),
+        };
+        insert_cap(&mut node.children, rest);
+        siblings.push(node);
+    }
+}
+
+fn is_chain(node: &CapNode) -> bool {
+    match node.children.len() {
+        0 => true,
+        1 => is_chain(&node.children[0]),
+        _ => false,
+    }
+}
+
+fn chain_path(node: &CapNode) -> String {
+    if node.children.is_empty() {
+        node.name.clone()
+    } else {
+        format!("{}.{}", node.name, chain_path(&node.children[0]))
+    }
+}
+
+fn count_cap_lines<'a, I>(caps: I) -> usize
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let tree = build_cap_tree(caps);
+    // 1 line for the "caps" header, + N for the tree (or 1 for
+    // the "—" empty marker).
+    let body = if tree.is_empty() {
+        1
+    } else {
+        tree.iter().map(count_cap_node_lines).sum()
+    };
+    1 + body
+}
+
+fn count_cap_node_lines(node: &CapNode) -> usize {
+    if is_chain(node) {
+        1
+    } else {
+        1 + node.children.iter().map(count_cap_node_lines).sum::<usize>()
+    }
 }
 
 // ───────────────────────── placement panel ─────────────────────────

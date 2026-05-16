@@ -81,6 +81,7 @@ pub fn render(
 
 struct LiveNode {
     id: u64,
+    label: Option<&'static str>,
     x: f64,
     y: f64,
     health: PeerHealthSnapshot,
@@ -131,8 +132,10 @@ fn project_live_peers(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
             let x = radius_x * angle.cos();
             let y = radius_y * angle.sin();
             let health = p.health.unwrap_or(PeerHealthSnapshot::Healthy);
+            let label = crate::nodes::label_of(&format!("0x{:x}", *id));
             LiveNode {
                 id: *id,
+                label,
                 x,
                 y,
                 health,
@@ -155,40 +158,40 @@ fn angle_for(id: u64) -> f64 {
 }
 
 fn paint_live_graph(ctx: &mut Context<'_>, peers: &[LiveNode], cursor: usize) {
-    // Labels only on the cursored node — every-node labels
-    // collide at small radii. Operators reach detail via
-    // `Enter` → NodeDetail modal anyway. The cursored node
-    // also gets a brighter glyph + a `[` bracket marker so the
-    // selection is visible at a glance.
+    // Two-pass paint so the cursored node always wins z-order
+    // against any nearby gray label that would otherwise occlude
+    // it. Pass 1: every non-cursor node + its dim id tag. Pass 2:
+    // the cursor glyph, brackets, and full id.label in highlight.
     for (i, n) in peers.iter().enumerate() {
-        let is_cursor = i == cursor;
-        let (glyph, color) = glyph_for_health(n.health);
-        let glyph_style = if is_cursor {
-            ratatui::style::Style::default()
-                .fg(theme::GREEN_HI)
-                .add_modifier(ratatui::style::Modifier::BOLD)
-        } else {
-            ratatui::style::Style::default().fg(color)
-        };
-        ctx.print(n.x, n.y, Line::styled(glyph.to_string(), glyph_style));
-        if is_cursor {
-            // Bracket the selection.
-            ctx.print(
-                n.x - 2.5,
-                n.y,
-                Line::styled("[", ratatui::style::Style::default().fg(theme::GREEN_HI)),
-            );
-            ctx.print(
-                n.x + 2.5,
-                n.y,
-                Line::styled("]", ratatui::style::Style::default().fg(theme::GREEN_HI)),
-            );
-            ctx.print(
-                n.x + 4.5,
-                n.y - 2.0,
-                Line::styled(format!("0x{:x}", n.id), theme::green_hi()),
-            );
+        if i == cursor {
+            continue;
         }
+        let (glyph, color) = glyph_for_health(n.health);
+        ctx.print(
+            n.x,
+            n.y,
+            Line::styled(glyph.to_string(), ratatui::style::Style::default().fg(color)),
+        );
+        ctx.print(
+            n.x + 3.0,
+            n.y,
+            Line::styled(format!("0x{:x}", n.id), theme::chrome()),
+        );
+    }
+
+    if let Some(n) = peers.get(cursor) {
+        let (glyph, _color) = glyph_for_health(n.health);
+        let cursor_style = ratatui::style::Style::default()
+            .fg(theme::GREEN_HI)
+            .add_modifier(ratatui::style::Modifier::BOLD);
+        ctx.print(n.x, n.y, Line::styled(glyph.to_string(), cursor_style));
+        ctx.print(n.x - 2.5, n.y, Line::styled("[", cursor_style));
+        ctx.print(n.x + 2.5, n.y, Line::styled("]", cursor_style));
+        let id_label = match n.label {
+            Some(label) => format!("0x{:x}.{label}", n.id),
+            None => format!("0x{:x}", n.id),
+        };
+        ctx.print(n.x + 4.5, n.y, Line::styled(id_label, theme::green_hi()));
     }
 }
 
