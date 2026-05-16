@@ -180,6 +180,13 @@ fn daemon_summary(snap: &MeshOsSnapshot) -> DaemonSummary {
 }
 
 fn local_maint_summary(snap: &MeshOsSnapshot) -> (ratatui::style::Style, &'static str) {
+    // `MaintenanceStateSnapshot` is `#[non_exhaustive]` so a
+    // wildcard is unavoidable — but every *shipped* variant
+    // must have an explicit arm above. A future variant
+    // surfacing here as the `unknown-maint` fallback is the
+    // signal to extend the match; the explicit fallback label
+    // beats the prior `"?"` for operator legibility and trips
+    // a debug-build assertion so CI catches the gap.
     match snap.local_maintenance {
         MaintenanceStateSnapshot::Active => (theme::green(), "active"),
         MaintenanceStateSnapshot::EnteringMaintenance { .. } => (theme::cyan(), "draining"),
@@ -187,6 +194,12 @@ fn local_maint_summary(snap: &MeshOsSnapshot) -> (ratatui::style::Style, &'stati
         MaintenanceStateSnapshot::ExitingMaintenance { .. } => (theme::cyan(), "exiting"),
         MaintenanceStateSnapshot::DrainFailed { .. } => (theme::red(), "DRAIN-FAILED"),
         MaintenanceStateSnapshot::Recovery { .. } => (theme::cyan(), "recovery"),
-        _ => (theme::chrome(), "?"),
+        ref other => {
+            debug_assert!(
+                false,
+                "local_maint_summary: unrecognised MaintenanceStateSnapshot variant {other:?} — add an explicit arm",
+            );
+            (theme::amber(), "unknown-maint")
+        }
     }
 }
