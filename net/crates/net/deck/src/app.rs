@@ -5,7 +5,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use net_sdk::dataforts::BlobAdapter;
 use net_sdk::deck::{DeckClient, MeshOsSnapshot};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     DefaultTerminal, Frame,
 };
 
@@ -199,6 +199,11 @@ pub struct App {
     /// signature collector, future help screen). When `Some`,
     /// the modal absorbs key input until dismissed.
     pub modal: Option<Modal>,
+    /// Focused node — when `Some`, the body of the active
+    /// tab is replaced with a full-page node detail view of
+    /// the peer with this id. Set by `[Enter]` on LIST or
+    /// NET.MAP cursored row; cleared by `[Esc]`.
+    pub node_focus: Option<crate::tabs::node_page::NodeFocusEntry>,
     /// Ephemeral "toast" message shown in the footer for
     /// ~3 seconds after an action. Used for confirming
     /// side-effects the operator can't see directly — e.g.
@@ -244,13 +249,6 @@ pub enum Modal {
     /// shift the body. Dismissed with the usual `Esc` / `q`.
     BlobDetail {
         entry: net_sdk::dataforts::BlobInventoryEntry,
-    },
-    /// Node detail — opened with `[Enter]` on the NET.MAP
-    /// tab. Snapshots the cursored peer (id + label + full
-    /// `PeerSnapshot`) so the next tick under the cursor
-    /// doesn't shift the body.
-    NodeDetail {
-        entry: crate::widgets::node_detail::NodeDetailEntry,
     },
     /// Export confirmation — pops after `[e]` lands a file
     /// on disk so the operator sees the resolved path before
@@ -350,6 +348,7 @@ impl App {
             failures_search: String::new(),
             failures_search_editing: false,
             modal: None,
+            node_focus: None,
             toast: None,
         }
     }
@@ -398,22 +397,23 @@ impl App {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
-    /// Snapshot the cursored NET.MAP peer into a detail modal.
-    /// Peers are ordered by NodeId (matches the LIST tab and
-    /// what NET.MAP's cursor sees), so `netmap_cursor` indexes
-    /// the same way the canvas iterates.
-    fn open_node_detail(&mut self) {
+    /// Focus the node at `peer_index` in the snapshot's
+    /// peers-by-id order. Peers iterate the BTreeMap order, so
+    /// this matches both LIST and NET.MAP cursor semantics —
+    /// the index is whichever cursor the caller passes.
+    /// Snapshots the `PeerSnapshot` so the upper page body
+    /// stays stable across a subsequent tick under the focused
+    /// id.
+    fn focus_node(&mut self, peer_index: usize) {
         let pair = self
             .snapshot
             .peers
             .iter()
-            .nth(self.netmap_cursor)
+            .nth(peer_index)
             .map(|(id, p)| (*id, p.clone()));
         if let Some((id, peer)) = pair {
             let label = crate::nodes::label_of(&format!("0x{id:x}")).map(|s| s.to_string());
-            self.modal = Some(Modal::NodeDetail {
-                entry: crate::widgets::node_detail::NodeDetailEntry { id, label, peer },
-            });
+            self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry { id, label, peer });
         }
     }
 
@@ -569,6 +569,26 @@ impl App {
         if self.modal.is_some() {
             self.on_modal_key(code, mods);
             return;
+        }
+        // Focused node page: Esc returns to the underlying
+        // tab; cursor + tab-switch keys still work so the
+        // operator can navigate back without explicitly
+        // un-focusing first.
+        if self.node_focus.is_some() {
+            if matches!(code, KeyCode::Esc) {
+                self.node_focus = None;
+                return;
+            }
+            // Tab switches clear focus too (focus is a
+            // LIST/NET.MAP sub-view; jumping to another tab
+            // exits it cleanly).
+            if matches!(
+                code,
+                KeyCode::Char('1'..='9') | KeyCode::Tab | KeyCode::BackTab
+            ) {
+                self.node_focus = None;
+                // fall through to the normal handler
+            }
         }
         // Search prompts are the second-tier absorber: while a
         // tab's `_editing` flag is set, keystrokes go into that
@@ -783,9 +803,18 @@ impl App {
             // entry. Snapshots the entry so a subsequent
             // inventory refresh doesn't shift the body.
             KeyCode::Enter if self.current == Tab::Blobs => self.open_blob_detail(),
-            // NET.MAP: open the node detail modal for the
-            // cursored peer.
-            KeyCode::Enter if self.current == Tab::NetMap => self.open_node_detail(),
+            // Open the dedicated node detail page for the
+            // cursored peer on LIST (`list_cursor`) or NET.MAP
+            // (`netmap_cursor`). Both tabs share the
+            // peers-by-id order, so the right cursor is
+            // dispatched per source tab. Esc returns to the
+            // originating tab.
+            KeyCode::Enter if self.current == Tab::NetMap => {
+                self.focus_node(self.netmap_cursor);
+            }
+            KeyCode::Enter if self.current == Tab::List => {
+                self.focus_node(self.list_cursor);
+            }
             // DATAFORTS: cross-link to BLOBS. Operators reading
             // aggregate metrics jump straight to per-chunk
             // inventory of the same adapter.
@@ -1267,8 +1296,6 @@ impl App {
                     // BlobDetail is informational — Enter just
                     // closes (same as Esc / q).
                     Some(Modal::BlobDetail { .. }) => {}
-                    // NodeDetail is informational — Enter closes.
-                    Some(Modal::NodeDetail { .. }) => {}
                     // ExportDone is informational — Enter closes.
                     Some(Modal::ExportDone { .. }) => {}
                     // ParamInput is intercepted earlier in this
@@ -1582,6 +1609,21 @@ impl App {
         widgets::status_bar::render(frame, chunks[0], self);
         widgets::tab_bar::render(frame, chunks[1], self.current);
         widgets::rule::render(frame, chunks[2]);
+        // Node focus pre-empts the tab's normal body — the
+        // operator drilled into a peer; the page owns the
+        // body until they Esc out.
+        if let Some(focus) = self.node_focus.as_ref() {
+            tabs::node_page::render(frame, chunks[3], focus, &self.snapshot);
+            widgets::footer::render(
+                frame,
+                chunks[4],
+                self.toast.as_ref().map(|(s, _)| s.as_str()),
+            );
+            // Modal overlay still renders on top in case one
+            // is open (rare in focus mode but possible).
+            self.render_modal_overlay(frame, area);
+            return;
+        }
         match self.current {
             Tab::NetMap => {
                 tabs::net_map::render(
@@ -1698,8 +1740,14 @@ impl App {
             self.toast.as_ref().map(|(s, _)| s.as_str()),
         );
 
-        // Modal overlay (renders last so it sits visually on
-        // top of the body).
+        self.render_modal_overlay(frame, area);
+    }
+
+    /// Render the active modal (if any) over the body. Hoisted
+    /// out of `draw` so the focused-node early-return path can
+    /// still surface modals (rare: a confirm-modal opened from
+    /// the page itself once we add page-level actions).
+    fn render_modal_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
         match &self.modal {
             Some(Modal::Confirm(action)) => widgets::confirm::render(frame, area, action),
             Some(Modal::Help) => widgets::help::render(frame, area),
@@ -1740,9 +1788,6 @@ impl App {
             }
             Some(Modal::BlobDetail { entry }) => {
                 widgets::blob_detail::render(frame, area, entry);
-            }
-            Some(Modal::NodeDetail { entry }) => {
-                widgets::node_detail::render(frame, area, entry);
             }
             Some(Modal::ExportDone { outcome }) => {
                 widgets::export_done::render(frame, area, outcome);

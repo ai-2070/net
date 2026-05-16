@@ -6,7 +6,6 @@ pub mod export;
 pub mod export_done;
 pub mod footer;
 pub mod help;
-pub mod node_detail;
 pub mod param_input;
 pub mod pick_node;
 pub mod rule;

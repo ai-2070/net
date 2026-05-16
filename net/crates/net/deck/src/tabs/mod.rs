@@ -7,4 +7,5 @@ pub mod list_view;
 pub mod logs;
 pub mod migrations;
 pub mod net_map;
+pub mod node_page;
 pub mod replicas;
