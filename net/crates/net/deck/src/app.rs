@@ -1366,7 +1366,7 @@ impl App {
             // DATAFORTS: cross-link to BLOBS. Operators reading
             // aggregate metrics jump straight to per-chunk
             // inventory of the same adapter.
-            KeyCode::Char('B') if self.current == Tab::Dataforts => {
+            KeyCode::Char('b') if self.current == Tab::Dataforts => {
                 self.current = Tab::Blobs;
             }
             KeyCode::Char('n') if self.current == Tab::Audit => {

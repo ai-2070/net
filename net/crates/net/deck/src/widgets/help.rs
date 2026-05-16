@@ -23,7 +23,7 @@ const NAVIGATION: &[Binding] = &[
     Binding { keys: ":",         desc: "open cluster picker" },
     Binding { keys: "Enter",     desc: "BLOBS: blob detail · NODES/NET.MAP/DATAFORTS: node page · DAEMONS/GROUPS: daemon page · NODE→DAEMON, DAEMON→NODE/SIBLING" },
     Binding { keys: "Esc",       desc: "close node page / modal / search prompt (else quit)" },
-    Binding { keys: "B",         desc: "DATAFORTS: jump to BLOBS" },
+    Binding { keys: "b",         desc: "DATAFORTS: jump to BLOBS" },
     Binding { keys: "Tab / ◂▸",  desc: "cycle tab" },
     Binding { keys: "↓ / ↑",     desc: "cursor down / up (also j/k or s/w)" },
     Binding { keys: "g / G",     desc: "cursor to top / bottom" },

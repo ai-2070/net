@@ -81,7 +81,7 @@ fn tab_chips(current: Tab) -> Line<'static> {
             spans.extend([
                 chip_key("Enter"),
                 chip_desc(" detail   "),
-                chip_key("B"),
+                chip_key("b"),
                 chip_desc(" blobs   "),
             ]);
         }
