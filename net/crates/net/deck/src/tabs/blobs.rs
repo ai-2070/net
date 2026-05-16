@@ -258,24 +258,4 @@ fn format_relative(then_ms: u64, now_ms: u64) -> String {
     }
 }
 
-/// Compact byte-count: bytes / KB / MB / GB / TB with one
-/// decimal past KB. Truncates to the largest unit where the
-/// value reads as ≥1 so a 999-byte blob stays "999B" instead
-/// of jumping to "0.9KB".
-fn format_bytes(n: u64) -> String {
-    const KB: u64 = 1_024;
-    const MB: u64 = 1_024 * KB;
-    const GB: u64 = 1_024 * MB;
-    const TB: u64 = 1_024 * GB;
-    if n < KB {
-        format!("{n}B")
-    } else if n < MB {
-        format!("{:.1}KB", n as f64 / KB as f64)
-    } else if n < GB {
-        format!("{:.1}MB", n as f64 / MB as f64)
-    } else if n < TB {
-        format!("{:.1}GB", n as f64 / GB as f64)
-    } else {
-        format!("{:.1}TB", n as f64 / TB as f64)
-    }
-}
+use super::format_bytes;

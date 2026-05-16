@@ -182,26 +182,7 @@ fn role_for(
     }
 }
 
-/// Compact byte-count: bytes / KB / MB / GB / TB. Mirrors the
-/// BLOBS tab's `format_bytes` so both surfaces speak the same
-/// magnitude.
-fn format_bytes(n: u64) -> String {
-    const KB: u64 = 1_024;
-    const MB: u64 = 1_024 * KB;
-    const GB: u64 = 1_024 * MB;
-    const TB: u64 = 1_024 * GB;
-    if n < KB {
-        format!("{n}B")
-    } else if n < MB {
-        format!("{:.1}KB", n as f64 / KB as f64)
-    } else if n < GB {
-        format!("{:.1}MB", n as f64 / MB as f64)
-    } else if n < TB {
-        format!("{:.1}GB", n as f64 / GB as f64)
-    } else {
-        format!("{:.1}TB", n as f64 / TB as f64)
-    }
-}
+use super::format_bytes;
 
 fn phase_repr(p: &MigrationPhaseSnapshot) -> (ratatui::style::Style, &'static str) {
     // Earlier phases dim, later phases brighter, Complete green.
