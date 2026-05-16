@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 
 use super::cluster::{build_cluster, DEMO_NODE_COUNT};
 use super::daemons::{DroneDaemon, HeartbeatDaemon, MixerDaemon, PyroSafetyDaemon};
+use super::dataforts::build_adapters;
 
 /// Per-node heartbeat cadence. Picks a slightly-staggered base
 /// so the 5 nodes don't all emit on the same tick; jitter is
@@ -206,13 +207,20 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     let deck = Arc::new(DeckClient::from_runtime(sdk0.runtime(), identity));
     let this_node = node0.node_id;
 
+    // Build one MeshBlobAdapter per node (Phase 2 of
+    // DECK_DEMO_PLAN.md). Each adapter is in-memory `Redex`-
+    // backed; we keep them all on the harness's
+    // `blob_adapters` so the deck's BLOBS tail polls every
+    // adapter into one merged inventory.
+    let blob_adapters = build_adapters(DEMO_NODE_COUNT).await;
+
     Ok(Harness {
         cluster: Some(cluster),
         _heartbeat_handles: heartbeat_handles,
         _group_handles: group_handles,
         _heartbeat_tasks: heartbeat_tasks,
         deck,
-        blob_adapters: Vec::new(),
+        blob_adapters,
         this_node,
     })
 }
@@ -327,6 +335,12 @@ mod tests {
             snap.log_ring.len() >= 2,
             "log_ring should carry heartbeat lines (got {})",
             snap.log_ring.len()
+        );
+        // Phase 2: one MeshBlobAdapter per demo node.
+        assert_eq!(
+            harness.blob_adapters.len(),
+            5,
+            "demo should wire 5 blob adapters (one per node)"
         );
         // Clean shutdown — the cluster's into_shutdown drains
         // every node's MeshOsDaemonSdk so no tasks leak.
