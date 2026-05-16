@@ -287,8 +287,7 @@ fn render_datafort_list(
     .header(header)
     .block(block)
     .column_spacing(2);
-    let mut state =
-        TableState::default().with_selected(Some(cursor.min(total.saturating_sub(1))));
+    let mut state = TableState::default().with_selected(Some(cursor.min(total.saturating_sub(1))));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -700,7 +699,9 @@ fn sum_overflow(
     // unbounded telemetry sums against a fully populated
     // cluster could otherwise overflow on the wire even if
     // each adapter's counters stay within range.
-    acc.pushes_admitted_total = acc.pushes_admitted_total.saturating_add(o.pushes_admitted_total);
+    acc.pushes_admitted_total = acc
+        .pushes_admitted_total
+        .saturating_add(o.pushes_admitted_total);
     acc.push_errors_total = acc.push_errors_total.saturating_add(o.push_errors_total);
     acc.pushed_bytes_total = acc.pushed_bytes_total.saturating_add(o.pushed_bytes_total);
     acc.rejected_no_target_total = acc

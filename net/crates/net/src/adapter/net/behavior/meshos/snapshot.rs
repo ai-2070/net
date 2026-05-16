@@ -1229,8 +1229,7 @@ mod tests {
             bytes, captured,
             "DaemonSnapshot postcard wire drifted — got {bytes:?}",
         );
-        let back: DaemonSnapshot =
-            postcard::from_bytes(captured).expect("decode captured bytes");
+        let back: DaemonSnapshot = postcard::from_bytes(captured).expect("decode captured bytes");
         assert_eq!(back, s);
     }
 
@@ -1266,8 +1265,7 @@ mod tests {
             bytes, captured,
             "PeerSnapshot postcard wire drifted — got {bytes:?}",
         );
-        let back: PeerSnapshot =
-            postcard::from_bytes(captured).expect("decode captured bytes");
+        let back: PeerSnapshot = postcard::from_bytes(captured).expect("decode captured bytes");
         assert_eq!(back, p);
     }
 

@@ -195,8 +195,8 @@ fn render_table(
     .header(header)
     .block(block)
     .column_spacing(2);
-    let mut state = TableState::default()
-        .with_selected(Some(effective_cursor.min(shown.saturating_sub(1))));
+    let mut state =
+        TableState::default().with_selected(Some(effective_cursor.min(shown.saturating_sub(1))));
     frame.render_stateful_widget(table, area, &mut state);
     // Entries exist but the search matched none: tell the
     // operator their filter is in play instead of leaving an

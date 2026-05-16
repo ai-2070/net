@@ -173,8 +173,8 @@ mod samples {
     use net_sdk::compute::CausalEvent;
     use net_sdk::dataforts::{publish_blob_ref, BlobAdapter, MeshBlobAdapter, Redex};
     use net_sdk::meshos::{
-        ChainId, DaemonError, EntityKeypair, HealthProbe, InventoryProbe, LocalityProbe,
-        LogLevel, LogLine, MeshDaemon, MeshOsDaemonHandle, MeshOsDaemonSdk, MeshOsEvent,
+        ChainId, DaemonError, EntityKeypair, HealthProbe, InventoryProbe, LocalityProbe, LogLevel,
+        LogLine, MeshDaemon, MeshOsDaemonHandle, MeshOsDaemonSdk, MeshOsEvent,
         MigrationPhaseSnapshot, MigrationSnapshot, MigrationSnapshotSource, NodeHealth, NodeId,
         PeerInventory, PlacementIntent, ReplicaUpdate,
     };
@@ -637,11 +637,17 @@ mod samples {
     /// music-sync, pyrotech handshakes.
     const STAGE_CUES_LOGS: &[(LogLevel, &str)] = &[
         (LogLevel::Info, "cue 47 ready: scene/clear-back"),
-        (LogLevel::Info, "lighting universe 1 rendered (512 channels)"),
+        (
+            LogLevel::Info,
+            "lighting universe 1 rendered (512 channels)",
+        ),
         (LogLevel::Info, "follow-spot 2 assigned to operator 'rio'"),
         (LogLevel::Info, "scene transition: act 2, song 3"),
         (LogLevel::Info, "music-sync locked at 128.0 bpm"),
-        (LogLevel::Info, "pyrotechnics safety gate cleared: zone 3 armed"),
+        (
+            LogLevel::Info,
+            "pyrotechnics safety gate cleared: zone 3 armed",
+        ),
         (LogLevel::Warn, "stage light 12 brownout — falling back"),
     ];
 
@@ -650,7 +656,10 @@ mod samples {
     const VISION_GRASP_LOGS: &[(LogLevel, &str)] = &[
         (LogLevel::Info, "grasp candidates: 4 (top confidence 89%)"),
         (LogLevel::Info, "AI cache hit (98%) on batch 248"),
-        (LogLevel::Info, "vision-grasp model v2.4 loaded (context 8192)"),
+        (
+            LogLevel::Info,
+            "vision-grasp model v2.4 loaded (context 8192)",
+        ),
         (LogLevel::Info, "tracking 16 object keypoints"),
         (LogLevel::Info, "robot trajectory: 4 waypoints planned"),
         (LogLevel::Warn, "scene occluded — falling back to radar"),
@@ -664,7 +673,10 @@ mod samples {
         (LogLevel::Info, "channel 12 muted: feedback detected"),
         (LogLevel::Info, "vocal reverb applied (1.8s tail)"),
         (LogLevel::Info, "compressor: 4:1 ratio, 2ms attack"),
-        (LogLevel::Warn, "input gain hot on channel 4 (-0.3 dB headroom)"),
+        (
+            LogLevel::Warn,
+            "input gain hot on channel 4 (-0.3 dB headroom)",
+        ),
     ];
 
     /// `pyro_safety#standby` — pyrotechnic safety system. The
@@ -676,7 +688,10 @@ mod samples {
         (LogLevel::Info, "abort signal cleared — gate green"),
         (LogLevel::Info, "weather check: wind 8mph, OK to fire"),
         (LogLevel::Info, "operator override authenticated"),
-        (LogLevel::Warn, "humidity above safe threshold (78%) — derating"),
+        (
+            LogLevel::Warn,
+            "humidity above safe threshold (78%) — derating",
+        ),
     ];
 
     /// `drone_swarm#fork@7` — drone-swarm coordinators, each
@@ -784,11 +799,7 @@ mod samples {
                 daemon_id: Some(daemon_id),
                 message: msg.to_string(),
             };
-            if handle
-                .publish(MeshOsEvent::LogLine(line))
-                .await
-                .is_err()
-            {
+            if handle.publish(MeshOsEvent::LogLine(line)).await.is_err() {
                 // Loop closed — substrate shutting down. Exit
                 // cleanly; harness's `_sdk` drop already raced
                 // ahead.
@@ -841,9 +852,15 @@ mod samples_logs {
         (LogLevel::Warn, "follower-1 link degraded — 244ms latency"),
         (LogLevel::Info, "operator override cleared safety freeze"),
         (LogLevel::Warn, "peer avoid list growing (52 entries)"),
-        (LogLevel::Info, "storage GC: 142 unused chunks freed (3.2 GB)"),
+        (
+            LogLevel::Info,
+            "storage GC: 142 unused chunks freed (3.2 GB)",
+        ),
         (LogLevel::Error, "resource probe crashed — sample skipped"),
-        (LogLevel::Info, "cluster snapshot: 17 nodes, 11 daemons, 8 chains"),
+        (
+            LogLevel::Info,
+            "cluster snapshot: 17 nodes, 11 daemons, 8 chains",
+        ),
         (LogLevel::Warn, "action queue 91% full (58 / 64)"),
         (LogLevel::Info, "admin action accepted: drain follower-1"),
         (LogLevel::Info, "signed operator action verified"),
@@ -933,26 +950,26 @@ mod nrpc_seeder {
     /// some calls originate locally.
     const CALL_PAIRS: &[(u64, u64)] = &[
         // AI rack consumers
-        (0xfc2, 0xbdda),   // camera-system → ai-gpu-1 (vision grasp)
-        (0xe068, 0xbdda),  // robot-arm → ai-gpu-1
-        (0xe9b8, 0x6dfb),  // side-stage → ai-gpu-2 (chat assistant)
-        (0xbdda, 0x3c81),  // ai-gpu-1 → ai-cache
-        (0x6dfb, 0x3c81),  // ai-gpu-2 → ai-cache
+        (0xfc2, 0xbdda),  // camera-system → ai-gpu-1 (vision grasp)
+        (0xe068, 0xbdda), // robot-arm → ai-gpu-1
+        (0xe9b8, 0x6dfb), // side-stage → ai-gpu-2 (chat assistant)
+        (0xbdda, 0x3c81), // ai-gpu-1 → ai-cache
+        (0x6dfb, 0x3c81), // ai-gpu-2 → ai-cache
         // Audio / stage
-        (0xe685, 0xa96f),  // concert-audio → main-stage (cue sync)
-        (0xd4ff, 0xe685),  // monitor-mix → concert-audio
-        (0xa96f, 0x3599),  // main-stage → stage-lighting (cue→lights)
-        (0xa96f, 0x3599),  // main-stage → stage-lighting (pyro)
+        (0xe685, 0xa96f), // concert-audio → main-stage (cue sync)
+        (0xd4ff, 0xe685), // monitor-mix → concert-audio
+        (0xa96f, 0x3599), // main-stage → stage-lighting (cue→lights)
+        (0xa96f, 0x3599), // main-stage → stage-lighting (pyro)
         // Drone swarm
-        (0x372b, 0xeba8),  // ground-station → scout-3
-        (0x372b, 0x82ee),  // ground-station → follower-1
-        (0xeba8, 0xbdda),  // scout-3 → ai-gpu-1 (track ID)
+        (0x372b, 0xeba8), // ground-station → scout-3
+        (0x372b, 0x82ee), // ground-station → follower-1
+        (0xeba8, 0xbdda), // scout-3 → ai-gpu-1 (track ID)
         // Vehicle
-        (0xf206, 0x6808),  // chase-truck → pit-lane
-        (0xf206, 0xbdda),  // chase-truck → ai-gpu-1 (perception)
+        (0xf206, 0x6808), // chase-truck → pit-lane
+        (0xf206, 0xbdda), // chase-truck → ai-gpu-1 (perception)
         // Robotics
-        (0xe068, 0xbf44),  // robot-arm → assembly-line
-        (0xfc2, 0xe068),   // camera-system → robot-arm
+        (0xe068, 0xbf44), // robot-arm → assembly-line
+        (0xfc2, 0xe068),  // camera-system → robot-arm
     ];
 
     fn unix_now_ms() -> u64 {
@@ -968,8 +985,7 @@ mod nrpc_seeder {
         let mut i = 0usize;
         loop {
             ticker.tick().await;
-            let (method, req_bytes, resp_bytes, base_latency) =
-                METHODS[i % METHODS.len()];
+            let (method, req_bytes, resp_bytes, base_latency) = METHODS[i % METHODS.len()];
             // Decouple the call-pair index from the method
             // index so (caller, callee, method) cycles over
             // METHODS.len() × CALL_PAIRS.len() distinct triples

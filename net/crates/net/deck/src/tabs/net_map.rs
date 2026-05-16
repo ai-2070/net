@@ -170,7 +170,8 @@ fn radial_layout(snapshot: &MeshOsSnapshot, local: Option<&LocalAnchor<'_>>) -> 
     let max_rtt = observed.iter().copied().max().unwrap_or(0);
     let range = max_rtt.saturating_sub(min_rtt).max(1);
 
-    let mut out: Vec<LiveNode> = Vec::with_capacity(snapshot.peers.len() + local.is_some() as usize);
+    let mut out: Vec<LiveNode> =
+        Vec::with_capacity(snapshot.peers.len() + local.is_some() as usize);
     // Local node anchors at the canvas origin: the operator's
     // node is the "you-are-here" pin. Remote peers radiate
     // outward by RTT, and `spread_overlaps` pushes any peer

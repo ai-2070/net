@@ -144,8 +144,8 @@ fn render_table(
     .header(header)
     .block(block)
     .column_spacing(2);
-    let mut state = TableState::default()
-        .with_selected(Some(effective_cursor.min(shown.saturating_sub(1))));
+    let mut state =
+        TableState::default().with_selected(Some(effective_cursor.min(shown.saturating_sub(1))));
     frame.render_stateful_widget(table, area, &mut state);
     // Records exist but the active search matches none — render
     // a one-line hint inside the body so the operator isn't

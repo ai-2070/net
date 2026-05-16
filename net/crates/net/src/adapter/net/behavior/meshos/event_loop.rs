@@ -1572,7 +1572,11 @@ mod tests {
         let probe = Arc::new(ShrinkingProbe {
             tick: AtomicUsize::new(0),
             samples_per_tick: Mutex::new(vec![
-                vec![(0xA, inv_with_cpu(0.1)), (0xB, inv_with_cpu(0.2)), (0xC, inv_with_cpu(0.3))],
+                vec![
+                    (0xA, inv_with_cpu(0.1)),
+                    (0xB, inv_with_cpu(0.2)),
+                    (0xC, inv_with_cpu(0.3)),
+                ],
                 vec![(0xB, inv_with_cpu(0.2)), (0xC, inv_with_cpu(0.3))],
                 vec![(0xB, inv_with_cpu(0.2)), (0xC, inv_with_cpu(0.3))],
             ]),

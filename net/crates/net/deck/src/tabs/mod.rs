@@ -110,9 +110,7 @@ pub fn unix_now_ms() -> u64 {
 /// - `↻` retry / restart / rotation / reflow / freeze / thaw /
 ///   rebalance / swept — lifecycle cycling.
 /// - `·` default catch-all.
-pub fn event_icon(
-    rec: &net_sdk::deck::LogRecord,
-) -> (char, ratatui::style::Style) {
+pub fn event_icon(rec: &net_sdk::deck::LogRecord) -> (char, ratatui::style::Style) {
     use net_sdk::deck::LogLevel;
     // Every glyph here MUST render at one terminal cell —
     // mixing 1-cell and 2-cell characters jitters the source
@@ -148,13 +146,7 @@ fn classify_info(message: &str) -> (char, ratatui::style::Style) {
     ]) {
         return ('▶', crate::theme::green());
     }
-    if contains_any(&[
-        "started",
-        "transfer",
-        "snapshot taken",
-        "register",
-        "store",
-    ]) {
+    if contains_any(&["started", "transfer", "snapshot taken", "register", "store"]) {
         return ('↗', crate::theme::green());
     }
     if contains_any(&[
@@ -206,9 +198,7 @@ pub fn event_source(rec: &net_sdk::deck::LogRecord) -> String {
 /// Icon + source + message are each styled distinctly so the
 /// operator's eye lands on the event category first, the
 /// origin second, and the body last.
-pub fn render_event_line(
-    rec: &net_sdk::deck::LogRecord,
-) -> ratatui::text::Line<'static> {
+pub fn render_event_line(rec: &net_sdk::deck::LogRecord) -> ratatui::text::Line<'static> {
     use ratatui::text::Span;
     let (icon, icon_style) = event_icon(rec);
     let source = event_source(rec);
@@ -224,7 +214,10 @@ pub fn render_event_line(
     // category-colored-icon. Warn / error / cycle / announce
     // rows pick up their accent on the attribution column too.
     ratatui::text::Line::from(vec![
-        Span::styled(format!("  {}  ", fmt_ts_hms_ms(rec.ts_ms)), crate::theme::chrome()),
+        Span::styled(
+            format!("  {}  ", fmt_ts_hms_ms(rec.ts_ms)),
+            crate::theme::chrome(),
+        ),
         Span::styled(format!("{icon} "), icon_style),
         Span::styled(
             format!("{source:<width$}  ", source = source, width = SOURCE_PAD),

@@ -63,10 +63,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // one they're on; the default `"local"` is implicit and
     // gets omitted to keep the chrome quiet.
     if app.active_cluster != "local" {
-        left.push(Span::styled(
-            app.active_cluster.clone(),
-            theme::amber(),
-        ));
+        left.push(Span::styled(app.active_cluster.clone(), theme::amber()));
         left.push(sep());
     }
 

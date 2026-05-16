@@ -1398,9 +1398,7 @@ impl App {
         // rather than firing an admin proposal.
         if let KeyCode::Char(c) = code {
             if c.is_ascii_alphabetic()
-                && mods.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                )
+                && mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
                 && !(c == 'c' && mods.contains(KeyModifiers::CONTROL))
             {
                 return;
@@ -2895,21 +2893,19 @@ impl App {
                 )
             }
             Tab::Nodes => {
-                {
-                    let local_peer = self.local_peer_snapshot();
-                    let local_row = tabs::nodes::LocalNodeRow {
-                        id: self.this_node,
-                        peer: &local_peer,
-                        local_maintenance: &self.snapshot.local_maintenance,
-                    };
-                    tabs::nodes::render(
-                        frame,
-                        chunks[3],
-                        Some(&self.snapshot),
-                        self.nodes_cursor,
-                        Some(local_row),
-                    );
-                }
+                let local_peer = self.local_peer_snapshot();
+                let local_row = tabs::nodes::LocalNodeRow {
+                    id: self.this_node,
+                    peer: &local_peer,
+                    local_maintenance: &self.snapshot.local_maintenance,
+                };
+                tabs::nodes::render(
+                    frame,
+                    chunks[3],
+                    Some(&self.snapshot),
+                    self.nodes_cursor,
+                    Some(local_row),
+                );
             }
             Tab::Daemons => {
                 tabs::daemons::render(frame, chunks[3], Some(&self.snapshot), self.daemons_cursor)
@@ -3057,13 +3053,7 @@ impl App {
                 widgets::param_input::render(frame, area, purpose, buffer, error.as_deref());
             }
             Some(Modal::ClusterPicker { cursor, sorted }) => {
-                widgets::cluster_picker::render(
-                    frame,
-                    area,
-                    sorted,
-                    &self.active_cluster,
-                    *cursor,
-                );
+                widgets::cluster_picker::render(frame, area, sorted, &self.active_cluster, *cursor);
             }
             Some(Modal::BlobDetail {
                 entry,

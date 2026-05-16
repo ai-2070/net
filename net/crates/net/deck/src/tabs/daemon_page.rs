@@ -309,9 +309,7 @@ fn render_migration_cell(
     // 2 (lead) + 11 (label) + 2 (gap) + 4 ("100%") = 19 cells.
     // Anything left over is bar; clamp to a sensible band so
     // the bar still reads as a bar at narrow widths.
-    let bar_width = (inner.width as usize)
-        .saturating_sub(19)
-        .clamp(4, 16);
+    let bar_width = (inner.width as usize).saturating_sub(19).clamp(4, 16);
     let lines = vec![
         kv("role       ", role_text, role_style),
         kv("size       ", &size_text, theme::text()),

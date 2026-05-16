@@ -380,8 +380,7 @@ pub fn spawn_blobs_poll(
                             .map(|prev| prev.is_some())
                             .unwrap_or(false)
                         {
-                            let _ = toast_tx
-                                .send(format!("BLOBS poll: adapter {id} recovered"));
+                            let _ = toast_tx.send(format!("BLOBS poll: adapter {id} recovered"));
                         }
                         last_err.insert(id, None);
                     }

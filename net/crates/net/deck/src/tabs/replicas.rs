@@ -180,8 +180,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cu
     .header(header)
     .block(block)
     .column_spacing(2);
-    let mut state =
-        TableState::default().with_selected(Some(cursor.min(total.saturating_sub(1))));
+    let mut state = TableState::default().with_selected(Some(cursor.min(total.saturating_sub(1))));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
