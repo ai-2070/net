@@ -1193,7 +1193,7 @@ impl App {
             KeyCode::Char('r') if self.current == Tab::Groups => {
                 self.propose_restart_all_daemons();
             }
-            // ICE force-restart on DAEMON tab. Targets the
+            // ICE force-restart on GROUPS tab. Targets the
             // cursored daemon; bypasses crash-loop backoff.
             KeyCode::Char('R') if self.current == Tab::Groups => {
                 self.propose_ice_force_restart_daemon();
@@ -1344,7 +1344,7 @@ impl App {
             // inventory refresh doesn't shift the body.
             KeyCode::Enter if self.current == Tab::Blobs => self.open_blob_detail(),
             // Open the dedicated node detail page for the
-            // cursored peer on LIST (`nodes_cursor`) or NET.MAP
+            // cursored peer on NODES (`nodes_cursor`) or NET.MAP
             // (`netmap_cursor`). Both tabs share the
             // peers-by-id order, so the right cursor is
             // dispatched per source tab. Esc returns to the
@@ -1411,7 +1411,7 @@ impl App {
             KeyCode::Char('D') if self.current == Tab::Nodes => {
                 self.propose_drop_replicas();
             }
-            // ICE break-glass on LIST tab: `F` freeze, `T` thaw,
+            // ICE break-glass on NODES tab: `F` freeze, `T` thaw,
             // `A` flush avoid lists (global scope). Cluster-wide
             // except where noted; capital letters distinguish
             // from routine commands.

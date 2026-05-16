@@ -62,7 +62,7 @@ fn render_empty(
         frame,
         inner,
         "no admin commits yet",
-        "cordon a node ([c] on LIST) or restart a daemon ([r] on DAEMON) to populate",
+        "cordon a node ([c] on NODES) or restart a daemon ([r] on GROUPS) to populate",
     );
 }
 
