@@ -33,6 +33,11 @@ pub struct Harness {
     /// daemons stay registered for the session.
     #[cfg(feature = "samples")]
     _daemons: Vec<net_sdk::meshos::MeshOsDaemonHandle>,
+    /// Background log + mesh-event seeder task; the handle is
+    /// kept on the harness so the task gets aborted when the
+    /// harness drops (tokio cancellation on `JoinHandle::drop`).
+    #[cfg(feature = "samples-logs")]
+    _log_seeder_task: tokio::task::JoinHandle<()>,
     deck: Arc<DeckClient>,
     /// Registered `MeshBlobAdapter` instances. Samples mode
     /// wires several with distinct activity profiles so the
@@ -126,10 +131,19 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     #[cfg(not(feature = "samples"))]
     let blob_adapters: Vec<Arc<MeshBlobAdapter>> = Vec::new();
 
+    // Synthetic log + mesh-event seeder — fires a steady
+    // stream of LogLine events through the runtime so LOGS /
+    // FAILURES / AUDIT tabs and the NET.MAP MESH.EVENTS
+    // section render representative content offline.
+    #[cfg(feature = "samples-logs")]
+    let _log_seeder_task = samples_logs::install(sdk.runtime().handle_clone());
+
     Ok(Harness {
         _sdk: sdk,
         #[cfg(feature = "samples")]
         _daemons,
+        #[cfg(feature = "samples-logs")]
+        _log_seeder_task,
         deck,
         blob_adapters,
         this_node,
@@ -553,5 +567,122 @@ mod samples {
                 EntityKeypair::generate(),
             )?,
         ])
+    }
+}
+
+/// Synthetic log + mesh-event seeder. Spawns a tokio task
+/// that loops at a fixed cadence publishing
+/// `MeshOsEvent::LogLine` records against the runtime
+/// handle. Independent of the `samples` feature — the
+/// substrate accepts log events whether or not any daemons
+/// are registered. Daemon-tagged lines reference
+/// synthetic origin hashes (matching the migration
+/// fixture's `0xdaee_xxxx` range); node-level lines fall
+/// through to the substrate's `node.0x<this_node>` source
+/// attribution via the snapshot fold.
+///
+/// The seeder exits when the runtime closes — `publish`
+/// returns `Err(LoopClosed)` once the SDK drops, and the
+/// loop breaks. No abort wiring needed; the JoinHandle on
+/// the harness keeps the task referenced for the operator
+/// session and naturally ends on shutdown.
+#[cfg(feature = "samples-logs")]
+mod samples_logs {
+    use std::time::Duration;
+
+    use net_sdk::meshos::{LogLevel, LogLine, MeshOsEvent, MeshOsHandle};
+
+    /// Spawn the seeder and return its `JoinHandle` for the
+    /// harness to hold.
+    pub fn install(handle: MeshOsHandle) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { run(handle).await })
+    }
+
+    /// Per-tick cadence. Fast enough to fill the LOGS tail in
+    /// a few minutes of demo operation; slow enough not to
+    /// overwhelm the render path or the substrate's log-ring
+    /// rotation.
+    const TICK: Duration = Duration::from_millis(700);
+
+    /// Daemon-tagged log fixtures. Each is a `(daemon_id,
+    /// level, message)` triple. The daemon ids match the
+    /// migration fixture's hex range so cross-tab pivots
+    /// from MIGRATIONS → LOGS land on familiar identifiers
+    /// when both feature flags are enabled.
+    const DAEMON_LOGS: &[(u64, LogLevel, &str)] = &[
+        (0xdaee_0001, LogLevel::Info, "snapshot taken (12 events buffered)"),
+        (0xdaee_0001, LogLevel::Info, "transfer chunk 1/3 acked"),
+        (0xdaee_0002, LogLevel::Info, "transfer started (48 MB)"),
+        (0xdaee_0002, LogLevel::Warn, "rtt to target rising (147ms p95)"),
+        (0xdaee_0003, LogLevel::Info, "replay buffer drained (318 events)"),
+        (0xdaee_0003, LogLevel::Info, "cutover candidate selected"),
+        (0xdaee_0004, LogLevel::Info, "cutover acked by target"),
+        (0xdaee_0004, LogLevel::Error, "drain deadline elapsed; retrying"),
+        (0xdaee_0005, LogLevel::Warn, "saturation crossed 0.85 threshold"),
+        (0xdaee_0005, LogLevel::Info, "pressure relief: shedding to peer 0x82ee"),
+        (0xdaee_0006, LogLevel::Error, "chunk fetch failed: HashMismatch"),
+        (0xdaee_0006, LogLevel::Info, "retrying fetch from alternate adapter"),
+        (0xdaee_0007, LogLevel::Info, "fold replayed through seq 4_812_993"),
+        (0xdaee_0008, LogLevel::Warn, "backoff window extended to 30s"),
+    ];
+
+    /// Node-level (no `daemon_id`) log fixtures. The
+    /// substrate stamps `node_id = this_node` on these so
+    /// they render as `node.0x<this_node>` in the
+    /// MESH.EVENTS section.
+    const NODE_LOGS: &[(LogLevel, &str)] = &[
+        (LogLevel::Info, "peer 0xa96f handshake completed"),
+        (LogLevel::Info, "placement intent recorded for chain 0xc005"),
+        (LogLevel::Warn, "peer 0xeba8 entered Degraded — rtt 244ms"),
+        (LogLevel::Info, "freeze gate cleared (operator: 0x7f3a)"),
+        (LogLevel::Warn, "avoid list grew past soft cap (52 entries)"),
+        (LogLevel::Info, "GC swept 142 quiescent chunks (3.2 GB)"),
+        (LogLevel::Error, "inventory probe panicked — skipped this tick"),
+        (LogLevel::Info, "snapshot publish: 17 peers, 11 daemons, 8 chains"),
+        (LogLevel::Warn, "action queue depth approaching cap (58 / 64)"),
+        (LogLevel::Info, "admin commit accepted: drain 0x82ee"),
+        (LogLevel::Info, "ICE bundle verified — 1-of-1 operator threshold"),
+        (LogLevel::Warn, "peer 0x6808 entered Degraded — rtt 451ms"),
+        (LogLevel::Info, "cluster freeze lifted; 0 backlogged commits"),
+        (LogLevel::Error, "datafort 0x6dfb: storage adapter unhealthy (95%)"),
+    ];
+
+    /// Inner loop. Walks both fixtures in interleaved order
+    /// so the LOGS tab gets a steady mix of daemon-tagged
+    /// and node-level lines; breaks cleanly when the
+    /// substrate's loop closes (publishes start failing).
+    async fn run(handle: MeshOsHandle) {
+        let mut ticker = tokio::time::interval(TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut i = 0usize;
+        loop {
+            ticker.tick().await;
+            // Alternate daemon / node every tick — at TICK
+            // = 700ms that's ~85 lines/minute, enough to fill
+            // the LOGS tail visibly without burying real
+            // operator-driven entries.
+            let line = if i.is_multiple_of(2) {
+                let (daemon_id, level, msg) = DAEMON_LOGS[(i / 2) % DAEMON_LOGS.len()];
+                LogLine {
+                    level,
+                    daemon_id: Some(daemon_id),
+                    message: msg.to_string(),
+                }
+            } else {
+                let (level, msg) = NODE_LOGS[(i / 2) % NODE_LOGS.len()];
+                LogLine {
+                    level,
+                    daemon_id: None,
+                    message: msg.to_string(),
+                }
+            };
+            if handle.publish(MeshOsEvent::LogLine(line)).await.is_err() {
+                // Loop closed — substrate is shutting down.
+                // Exit gracefully; the harness's `_sdk` drop
+                // already raced ahead of us.
+                break;
+            }
+            i = i.wrapping_add(1);
+        }
     }
 }

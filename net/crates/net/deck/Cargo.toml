@@ -44,3 +44,13 @@ default = []
 # but injects nothing — the deck shows the empty cluster
 # view, ready to connect to real cluster sources.
 samples = []
+# `samples-logs` opts in to a background log + mesh-event
+# seeder. Independent of `samples` (the deck doesn't need
+# fake daemons to render log content), but the two stack:
+# combining `samples,samples-logs` produces a feature-rich
+# screenshot environment where daemon-tagged logs reference
+# the registered fake daemons.
+#
+#   cargo run -p deck --features samples-logs
+#   cargo run -p deck --features samples,samples-logs
+samples-logs = []
