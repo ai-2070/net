@@ -2019,8 +2019,10 @@ impl App {
             }
             KeyCode::Char(c) => {
                 if let Some(Modal::ParamInput { buffer, error, .. }) = self.modal.as_mut() {
-                    buffer.push(c);
-                    *error = None;
+                    if buffer.chars().count() < crate::widgets::param_input::MAX_BUFFER_LEN {
+                        buffer.push(c);
+                        *error = None;
+                    }
                 }
             }
             _ => {}

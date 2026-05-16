@@ -76,14 +76,30 @@ impl ParamInputPurpose {
 /// digits with no unit suffix are treated as seconds (so a
 /// bare `60` reads as 60s, which matches how operators muscle-
 /// memory the freeze TTL).
+///
+/// Units must appear once and in descending magnitude (`h`
+/// before `m` before `s`). `5m5m` / `1s30m` are rejected so
+/// the parser can't silently sum a typo into a longer-than-
+/// intended duration.
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty input".to_string());
     }
+    /// Magnitude rank: higher number = larger unit. Each
+    /// occurrence must be strictly smaller than the previous.
+    fn rank(unit: char) -> Option<u8> {
+        match unit {
+            'h' | 'H' => Some(3),
+            'm' | 'M' => Some(2),
+            's' | 'S' => Some(1),
+            _ => None,
+        }
+    }
     let mut total = Duration::ZERO;
     let mut num: u64 = 0;
     let mut have_digit = false;
+    let mut last_unit_rank: u8 = u8::MAX;
     for c in s.chars() {
         if let Some(d) = c.to_digit(10) {
             num = num
@@ -94,26 +110,47 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         } else if !have_digit {
             return Err(format!("expected digit before '{c}'"));
         } else {
-            let unit = match c {
+            let Some(r) = rank(c) else {
+                return Err(format!("unknown unit '{c}'; use s / m / h"));
+            };
+            if r >= last_unit_rank {
+                return Err(format!(
+                    "unit '{c}' must come after a larger unit (use h then m then s)"
+                ));
+            }
+            last_unit_rank = r;
+            let unit_dur = match c {
                 'h' | 'H' => Duration::from_secs(num.saturating_mul(3600)),
                 'm' | 'M' => Duration::from_secs(num.saturating_mul(60)),
                 's' | 'S' => Duration::from_secs(num),
-                _ => return Err(format!("unknown unit '{c}'; use s / m / h")),
+                _ => unreachable!("rank() filtered to s/m/h"),
             };
             total = total
-                .checked_add(unit)
+                .checked_add(unit_dur)
                 .ok_or_else(|| "duration overflows".to_string())?;
             num = 0;
             have_digit = false;
         }
     }
     if have_digit {
+        // Trailing bare number = seconds; must be the last
+        // component, so no further units are admitted.
+        if last_unit_rank <= 1 {
+            return Err("trailing seconds value duplicates an earlier 's'".to_string());
+        }
         total = total
             .checked_add(Duration::from_secs(num))
             .ok_or_else(|| "duration overflows".to_string())?;
     }
     Ok(total)
 }
+
+/// Cap on raw key entry into a ParamInput buffer. Long enough
+/// for `99h59m59s` plus a generous typo / paste budget, short
+/// enough that a runaway paste can't blow past the modal's
+/// 64-column input rendering. Enforced at the App layer where
+/// the buffer is mutated.
+pub const MAX_BUFFER_LEN: usize = 32;
 
 /// Render the active duration as `Xm Ys` / `Yh Zm` for the
 /// preview line so the operator can verify what the buffer
