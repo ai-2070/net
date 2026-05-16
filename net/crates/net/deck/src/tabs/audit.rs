@@ -75,15 +75,19 @@ fn render_table(
     search: &str,
     search_editing: bool,
 ) {
+    // One pass over the records to count outcomes — the prior
+    // three separate `.filter().count()` passes scanned a
+    // potentially-large ring three times per frame.
     let total = records.len();
-    let accepted = records
-        .iter()
-        .filter(|r| matches!(r.outcome, VerificationOutcome::Accepted))
-        .count();
-    let unverified = records
-        .iter()
-        .filter(|r| matches!(r.outcome, VerificationOutcome::Unverified))
-        .count();
+    let mut accepted = 0usize;
+    let mut unverified = 0usize;
+    for r in records {
+        match r.outcome {
+            VerificationOutcome::Accepted => accepted += 1,
+            VerificationOutcome::Unverified => unverified += 1,
+            _ => {}
+        }
+    }
     let rejected = total.saturating_sub(accepted + unverified);
 
     let mut title_spans = vec![

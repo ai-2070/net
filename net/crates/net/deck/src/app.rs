@@ -67,14 +67,22 @@ impl Tab {
 
     pub fn next(self) -> Tab {
         let all = Self::all();
-        let i = all.iter().position(|t| *t == self).unwrap();
-        all[(i + 1) % all.len()]
+        // `Tab` has variants beyond `Tab::all()` (e.g. focused-
+        // page-only variants); fall back to the head of the
+        // cycle instead of panicking when the current tab isn't
+        // in the wheel.
+        match all.iter().position(|t| *t == self) {
+            Some(i) => all[(i + 1) % all.len()],
+            None => all[0],
+        }
     }
 
     pub fn prev(self) -> Tab {
         let all = Self::all();
-        let i = all.iter().position(|t| *t == self).unwrap();
-        all[(i + all.len() - 1) % all.len()]
+        match all.iter().position(|t| *t == self) {
+            Some(i) => all[(i + all.len() - 1) % all.len()],
+            None => all[0],
+        }
     }
 }
 
