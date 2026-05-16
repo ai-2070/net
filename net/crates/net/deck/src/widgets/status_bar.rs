@@ -105,6 +105,33 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     left.push(Span::styled(format!("{recent} recent"), theme::dim()));
     left.push(sep());
 
+    // nRPC throughput chip — computed from the last second of
+    // observed calls in `NrpcTail`. Amber under burst mode so
+    // the operator's eye lands on the spike; dim otherwise.
+    let stats = nrpc_stats(app);
+    if stats.calls_per_sec > 0 {
+        let burst_active = app
+            .burst_flag
+            .as_ref()
+            .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false);
+        let chip_style = if burst_active {
+            theme::amber()
+        } else {
+            theme::cyan()
+        };
+        left.push(Span::styled(
+            format!("{}/s rpc", stats.calls_per_sec),
+            chip_style,
+        ));
+        left.push(Span::styled("  ", theme::chrome()));
+        left.push(Span::styled(
+            format!("p99 {}ms", stats.p99_ms),
+            theme::dim(),
+        ));
+        left.push(sep());
+    }
+
     // local maintenance state
     left.push(Span::styled(maint_text, maint_style));
     left.push(sep());
@@ -136,6 +163,53 @@ struct PeerSummary {
     healthy: usize,
     degraded: usize,
     unreachable: usize,
+}
+
+/// Per-frame nRPC throughput + tail-latency derived from the
+/// last second of `NrpcTail` records. Recomputed every frame
+/// — cheap (one snapshot clone + linear sort over <100
+/// entries in steady state).
+struct NrpcStats {
+    calls_per_sec: u32,
+    p99_ms: u32,
+}
+
+fn nrpc_stats(app: &App) -> NrpcStats {
+    let now = unix_now_ms();
+    // Look back 1 s. A bench burst at ~5k calls/s would
+    // briefly populate the ring with several thousand
+    // records; the tail's bounded ring caps the worst-case
+    // here.
+    let cutoff = now.saturating_sub(1_000);
+    let records = app.nrpc_tail.snapshot();
+    let recent: Vec<&crate::streams::NrpcCall> =
+        records.iter().filter(|c| c.ts_ms >= cutoff).collect();
+    if recent.is_empty() {
+        return NrpcStats {
+            calls_per_sec: 0,
+            p99_ms: 0,
+        };
+    }
+    let calls_per_sec = recent.len() as u32;
+    let mut latencies: Vec<u32> = recent.iter().map(|c| c.latency_ms).collect();
+    latencies.sort_unstable();
+    // p99 index — `latencies.len() * 99 / 100`, saturated at
+    // the last element. For low sample counts (<100) this
+    // collapses to "max latency" which is the right
+    // conservative reading.
+    let idx = ((latencies.len() * 99) / 100).min(latencies.len() - 1);
+    let p99_ms = latencies[idx];
+    NrpcStats {
+        calls_per_sec,
+        p99_ms,
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn peer_summary(snap: &MeshOsSnapshot, local: &PeerSnapshot) -> PeerSummary {

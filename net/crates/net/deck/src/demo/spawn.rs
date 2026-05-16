@@ -2,7 +2,7 @@
 //!
 //! 1. Build the 5-node `ClusterHarness` (handshakes + bridge
 //!    probes done by the harness itself).
-//! 2. Register a `HeartbeatDaemon` on every node via the
+//! 2. Register a `NodeAgentDaemon` on every node via the
 //!    node's `MeshOsDaemonSdk`. The substrate folds each
 //!    registration into its local snapshot's `daemons` set,
 //!    so the deck's DAEMONS tab shows them naturally.
@@ -28,10 +28,13 @@ use net_sdk::testing::ClusterHarness;
 use tokio::task::JoinHandle;
 
 use super::cluster::{build_cluster, DEMO_NODE_COUNT};
-use super::daemons::{DroneDaemon, HeartbeatDaemon, MixerDaemon, PyroSafetyDaemon};
+use super::daemons::{
+    InferenceWorkerDaemon, NodeAgentDaemon, RolloutForgeDaemon, TrainerCanaryDaemon,
+};
 use super::dataforts::build_adapters;
 use super::migrator;
 use super::rpc_chatter;
+use super::rpc_chatter::BurstControl;
 use crate::streams::NrpcTail;
 
 /// Per-node heartbeat cadence. Picks a slightly-staggered base
@@ -88,6 +91,10 @@ pub struct Harness {
     /// Node[0]'s 64-bit node id. The deck's UI uses this to
     /// disambiguate "this node" from remote peers.
     this_node: NodeId,
+    /// Burst-mode control surface — `[B]` in the deck flips
+    /// this to fire the requester loops at max sustained
+    /// loopback rate for a fixed window.
+    burst: BurstControl,
 }
 
 impl Harness {
@@ -101,6 +108,13 @@ impl Harness {
 
     pub fn this_node(&self) -> NodeId {
         self.this_node
+    }
+
+    /// Return a clone of the burst-mode control surface. The
+    /// caller (typically `main.rs`) hands the clone to the
+    /// `App` so a `[B]` keypress can fire a benchmark window.
+    pub fn burst(&self) -> BurstControl {
+        self.burst.clone()
     }
 
     /// Tear down the cluster cleanly. Awaits every node's
@@ -143,7 +157,7 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
     registry.register(&operator_keypair);
     let _verifier = Arc::new(AdminVerifier::new(Arc::new(registry), 1));
 
-    // Register a HeartbeatDaemon per node and start its log-
+    // Register a NodeAgentDaemon per node and start its log-
     // emitter task. The handles are stored on the harness so
     // they outlive this fn; dropping them auto-unregisters.
     let mut heartbeat_handles: Vec<MeshOsDaemonHandle> = Vec::with_capacity(cluster.len());
@@ -156,8 +170,8 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
         let kp = EntityKeypair::generate();
         let daemon_id = kp.origin_hash();
         let handle = sdk
-            .register_daemon(Box::new(HeartbeatDaemon), kp)
-            .map_err(|e| color_eyre::eyre::eyre!("register HeartbeatDaemon on node[{i}]: {e}"))?;
+            .register_daemon(Box::new(NodeAgentDaemon), kp)
+            .map_err(|e| color_eyre::eyre::eyre!("register NodeAgentDaemon on node[{i}]: {e}"))?;
         // `MeshOsDaemonHandle::Drop` auto-unregisters, so we
         // park the handle on the harness for the session.
         // Log publishing rides a separately-cloned
@@ -194,25 +208,25 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
     for replica_idx in 0..3 {
         let kp = EntityKeypair::generate();
         let h = sdk0
-            .register_daemon(Box::new(MixerDaemon), kp)
+            .register_daemon(Box::new(InferenceWorkerDaemon), kp)
             .map_err(|e| {
-                color_eyre::eyre::eyre!("register MixerDaemon[{replica_idx}]: {e}")
+                color_eyre::eyre::eyre!("register InferenceWorkerDaemon[{replica_idx}]: {e}")
             })?;
         group_handles.push(h);
     }
     for fork_idx in 0..3 {
         let kp = EntityKeypair::generate();
         let h = sdk0
-            .register_daemon(Box::new(DroneDaemon), kp)
-            .map_err(|e| color_eyre::eyre::eyre!("register DroneDaemon[{fork_idx}]: {e}"))?;
+            .register_daemon(Box::new(RolloutForgeDaemon), kp)
+            .map_err(|e| color_eyre::eyre::eyre!("register RolloutForgeDaemon[{fork_idx}]: {e}"))?;
         group_handles.push(h);
     }
     for standby_idx in 0..3 {
         let kp = EntityKeypair::generate();
         let h = sdk0
-            .register_daemon(Box::new(PyroSafetyDaemon), kp)
+            .register_daemon(Box::new(TrainerCanaryDaemon), kp)
             .map_err(|e| {
-                color_eyre::eyre::eyre!("register PyroSafetyDaemon[{standby_idx}]: {e}")
+                color_eyre::eyre::eyre!("register TrainerCanaryDaemon[{standby_idx}]: {e}")
             })?;
         group_handles.push(h);
     }
@@ -243,7 +257,9 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
     // the remaining nodes.
     rpc_chatter::install_observers(&cluster, nrpc_tail);
     let rpc_responder_handles = rpc_chatter::install_responders(&cluster)?;
-    let rpc_requester_tasks = rpc_chatter::spawn_requester_loops(&cluster);
+    let burst = BurstControl::new();
+    let rpc_requester_tasks =
+        rpc_chatter::spawn_requester_loops(&cluster, burst.clone());
 
     Ok(Harness {
         cluster: Some(cluster),
@@ -256,20 +272,23 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
         deck,
         blob_adapters,
         this_node,
+        burst,
     })
 }
 
-/// Per-node heartbeat log loop. Emits a fresh log line at a
-/// jittered cadence around `HEARTBEAT_BASE_INTERVAL`. The
-/// message corpus is small + node-keyed so the LOGS tab
-/// doesn't read identically across nodes.
+/// Per-node `NodeAgent` log loop. Emits a fresh AI-inference-
+/// flavored log line at a jittered cadence around
+/// `HEARTBEAT_BASE_INTERVAL`. The message corpus is small +
+/// node-keyed so the LOGS tab reads as live inference traffic
+/// (batches dispatched, tokens/s, cache hits, …) rather than
+/// identical noise across nodes.
 async fn run_heartbeat_loop(
     node_index: usize,
     node_id: NodeId,
     daemon_id: u64,
     handle: MeshOsHandle,
 ) {
-    let messages = heartbeat_corpus();
+    let messages = inference_corpus();
     let mut tick = 0u64;
     loop {
         // Deterministic-but-varied jitter so the demo doesn't
@@ -279,14 +298,21 @@ async fn run_heartbeat_loop(
             .saturating_add(Duration::from_millis(jitter_ms.max(0) as u64))
             .saturating_sub(Duration::from_millis((-jitter_ms).max(0) as u64));
         tokio::time::sleep(interval).await;
-        let msg_idx = (tick as usize + node_index) % messages.len();
+        let template = messages[(tick as usize + node_index) % messages.len()];
+        // Templates carry up to two `{}` placeholders that get
+        // filled with cheap deterministic numbers — batch ids,
+        // ms latencies, tokens/s, etc. Looks like real workload
+        // metrics without an RNG dependency.
+        let n1 = (tick.wrapping_mul(37) ^ node_id) % 9_999;
+        let n2 = ((tick.wrapping_mul(53) ^ (node_id >> 8)) % 480) + 20;
+        let message = format!(
+            "gpu-{node_index} :: {}",
+            fill_template(template, n1, n2),
+        );
         let line = LogLine {
             level: LogLevel::Info,
             daemon_id: Some(daemon_id),
-            message: format!(
-                "node[{node_index}] heartbeat tick={tick} :: {}",
-                messages[msg_idx]
-            ),
+            message,
         };
         if handle.publish(MeshOsEvent::LogLine(line)).await.is_err() {
             // Loop closed — substrate shutting down. Exit
@@ -297,28 +323,56 @@ async fn run_heartbeat_loop(
     }
 }
 
-/// A short list of heartbeat message bodies so per-tick log
-/// lines don't all read identically. Hand-picked to imply a
-/// real-cluster feel without committing to specific daemon
-/// semantics.
-fn heartbeat_corpus() -> [&'static str; 8] {
-    [
-        "snapshot folded — peers steady",
-        "scheduler tick — no placement drift",
-        "capability index stable",
-        "no migrations in flight",
-        "tick checkpoint",
-        "lifecycle gate Ready",
-        "no failures observed",
-        "redex tail watermark advanced",
+/// AI-inference workload corpus — templated log lines so a VC
+/// viewer reads the LOGS tab as "this is a real inference
+/// fleet doing real work." Each template carries up to two
+/// `{}` placeholders for batch-id / latency-ms / tokens-per-
+/// second style numbers; `fill_template` substitutes them
+/// from deterministic per-tick counters so the demo stays
+/// reproducible.
+fn inference_corpus() -> &'static [&'static str] {
+    &[
+        "dispatched batch {} to gpu-0 in {}ms",
+        "prefill batch {} completed — tokens/s {}",
+        "cache hit rate {}% on prompt-id {}",
+        "decode step {} :: ttft {}ms",
+        "embedding shard {} flushed to redex ({}KB)",
+        "rollout cohort {} — A/B split p99 delta {}ms",
+        "tokenizer queue depth {} → 4 :: backpressure clear",
+        "kv cache eviction batch {} freed {}MB",
+        "scheduler tick — queue depth {}",
+        "inference completed for trace {} in {}ms",
+        "weights sync verified :: epoch {}",
+        "trainer canary sync_through advanced to {}",
+        "speculative draft accepted ratio {}% :: batch {}",
+        "telemetry flush {} records",
     ]
+}
+
+/// Substitute up to two `{}` placeholders left-to-right.
+/// Trivial — full `format!` machinery is overkill for the
+/// fixed corpus.
+fn fill_template(tpl: &str, a: u64, b: u64) -> String {
+    let mut out = String::with_capacity(tpl.len() + 12);
+    let mut iter = tpl.split("{}");
+    let first = iter.next().unwrap_or("");
+    out.push_str(first);
+    if let Some(rest) = iter.next() {
+        out.push_str(&a.to_string());
+        out.push_str(rest);
+    }
+    if let Some(rest) = iter.next() {
+        out.push_str(&b.to_string());
+        out.push_str(rest);
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     //! End-to-end smoke tests for the demo's Phase 1 slice.
     //! Boots the real 5-node cluster + registers the
-    //! per-node `HeartbeatDaemon`s and asserts the deck's
+    //! per-node `NodeAgentDaemon`s and asserts the deck's
     //! observable surfaces line up: snapshot has the 4 remote
     //! peers, each node carries a registered daemon, and the
     //! log loop emits records within a generous budget.
@@ -338,7 +392,7 @@ mod tests {
             .expect("demo spawn must succeed");
         // The deck observes node[0]; its snapshot should
         // include the other 4 peers via the bridge probes
-        // and one registered HeartbeatDaemon for itself.
+        // and one registered NodeAgentDaemon for itself.
         // Wait long enough for at least a few heartbeat
         // emits (~800 ms base; allow 3 s for headroom).
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -348,8 +402,8 @@ mod tests {
             8,
             "node[0] snapshot must see 8 remote peers"
         );
-        // Node[0] hosts: 1 HeartbeatDaemon + 3 MixerDaemons
-        // (replica) + 3 DroneDaemons (fork) + 3 PyroSafetyDaemons
+        // Node[0] hosts: 1 NodeAgentDaemon + 3 InferenceWorkerDaemons
+        // (replica) + 3 RolloutForgeDaemons (fork) + 3 TrainerCanaryDaemons
         // (standby) = 10 registered locally.
         assert_eq!(
             snap.daemons.len(),
@@ -363,10 +417,10 @@ mod tests {
         let count_with_name = |name: &str| -> usize {
             snap.daemons.values().filter(|d| d.name == name).count()
         };
-        assert_eq!(count_with_name("heartbeat"), 1);
-        assert_eq!(count_with_name("audio_mixer#replica"), 3);
-        assert_eq!(count_with_name("drone_swarm#fork@7"), 3);
-        assert_eq!(count_with_name("pyro_safety#standby"), 3);
+        assert_eq!(count_with_name("node_agent"), 1);
+        assert_eq!(count_with_name("inference_worker#replica"), 3);
+        assert_eq!(count_with_name("rollout_forge#fork@7"), 3);
+        assert_eq!(count_with_name("trainer_canary#standby"), 3);
         // Logs ride the same fold; expect non-trivial volume.
         assert!(
             snap.log_ring.len() >= 2,

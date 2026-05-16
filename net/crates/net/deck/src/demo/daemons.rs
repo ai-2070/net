@@ -10,21 +10,28 @@ use net_sdk::capabilities::CapabilityFilter;
 use net_sdk::compute::CausalEvent;
 use net_sdk::meshos::{DaemonError, MeshDaemon};
 
-/// Per-node "I'm alive" daemon. Stateless, no inbound
-/// processing — the periodic log lines are emitted by a
-/// side task that holds the `MeshOsDaemonHandle`; see
-/// `spawn::install_heartbeat_loggers`.
-///
-/// The name is deliberately stable across all 5 nodes so the
-/// DAEMONS tab's "by kind" grouping (when the deck adds one)
-/// can render them in a single row. The per-node disambiguation
-/// comes from the daemon's keypair-derived `origin_hash`, not
-/// its `name()`.
-pub struct HeartbeatDaemon;
+// The demo's narrative arc is an AI inference fleet:
+// 1 NodeAgent per node, 3 InferenceWorkers as a replica
+// trio, 3 RolloutForge daemons as a fork group (A/B model
+// variants), 3 TrainerCanary daemons as a standby triad
+// (1 active + 2 warm).
+//
+// The name suffixes (`#replica` / `#fork@<seq>` / `#standby`)
+// are what the deck's `lineage::group_daemons` parser keys
+// on, so changing the base names doesn't break the GROUPS /
+// CHAINS rendering — it just relabels the rows with vocab a
+// non-engineer viewer recognizes.
 
-impl MeshDaemon for HeartbeatDaemon {
+/// Per-node monitoring agent. Stateless; the periodic log
+/// lines are emitted by a side task that holds the
+/// `MeshOsDaemonHandle`. Renamed from `heartbeat` to land in
+/// the AI-inference narrative; the name still has no group
+/// suffix so the daemon registers as `Solo`.
+pub struct NodeAgentDaemon;
+
+impl MeshDaemon for NodeAgentDaemon {
     fn name(&self) -> &str {
-        "heartbeat"
+        "node_agent"
     }
     fn requirements(&self) -> CapabilityFilter {
         CapabilityFilter::default()
@@ -34,14 +41,15 @@ impl MeshDaemon for HeartbeatDaemon {
     }
 }
 
-/// Replica-group flavor daemon. The `#replica` suffix is what
-/// the deck's `lineage::group_daemons` parser looks for to
-/// classify the three instances as a `ReplicaGroup`. Stateless.
-pub struct MixerDaemon;
+/// Replica-group flavor daemon — three interchangeable
+/// inference workers serving the same model. The deck's
+/// `lineage::group_daemons` parser keys on the `#replica`
+/// suffix to classify them as a `ReplicaGroup`.
+pub struct InferenceWorkerDaemon;
 
-impl MeshDaemon for MixerDaemon {
+impl MeshDaemon for InferenceWorkerDaemon {
     fn name(&self) -> &str {
-        "audio_mixer#replica"
+        "inference_worker#replica"
     }
     fn requirements(&self) -> CapabilityFilter {
         CapabilityFilter::default()
@@ -51,14 +59,15 @@ impl MeshDaemon for MixerDaemon {
     }
 }
 
-/// Fork-group flavor daemon. The `#fork@<seq>` suffix carries
-/// the parent fork sequence so the deck displays the fork
-/// lineage's parent-seq badge. Stateless.
-pub struct DroneDaemon;
+/// Fork-group flavor daemon — A/B model rollout variants
+/// forked from a shared base at `fork_seq=7`. The deck
+/// displays the fork lineage's parent-seq badge alongside
+/// the group name.
+pub struct RolloutForgeDaemon;
 
-impl MeshDaemon for DroneDaemon {
+impl MeshDaemon for RolloutForgeDaemon {
     fn name(&self) -> &str {
-        "drone_swarm#fork@7"
+        "rollout_forge#fork@7"
     }
     fn requirements(&self) -> CapabilityFilter {
         CapabilityFilter::default()
@@ -68,15 +77,14 @@ impl MeshDaemon for DroneDaemon {
     }
 }
 
-/// Standby-group flavor daemon. The `#standby` suffix groups
-/// the three instances into a `StandbyGroup`. The deck
-/// assigns "active" to the lowest-`daemon_id` member; the
-/// rest render as "warm" standbys.
-pub struct PyroSafetyDaemon;
+/// Standby-group flavor daemon — one active trainer canary
+/// plus two warm standbys. The deck assigns "active" to the
+/// lowest-`daemon_id` member; the rest render as warm.
+pub struct TrainerCanaryDaemon;
 
-impl MeshDaemon for PyroSafetyDaemon {
+impl MeshDaemon for TrainerCanaryDaemon {
     fn name(&self) -> &str {
-        "pyro_safety#standby"
+        "trainer_canary#standby"
     }
     fn requirements(&self) -> CapabilityFilter {
         CapabilityFilter::default()
