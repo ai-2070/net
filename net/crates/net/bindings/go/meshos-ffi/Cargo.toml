@@ -1,0 +1,28 @@
+[package]
+name = "net-meshos-ffi"
+version = "0.17.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "C ABI MeshOS daemon-author SDK for the Go binding of Net"
+# Distributed as a cdylib alongside the Go binding, not via crates.io.
+publish = false
+
+[lib]
+# `cdylib` for the shared object Go links against; `staticlib` for
+# platforms that prefer `.a` archives; `rlib` so in-crate
+# `#[cfg(test)] mod tests` blocks can use the test harness. The
+# shipped artifact is the cdylib. The C header at
+# `include/net_meshos.h` (added in Phase 5) is what the C SDK ships.
+name = "net_meshos"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = []
+
+[dependencies]
+# Substrate-side MeshOS SDK + the daemon trait. Pulls in
+# `compute` for `MeshDaemon` and `meshos` for the supervisor runtime;
+# the latter implies `cortex` per the substrate's feature gating.
+net = { package = "ai2070-net", version = "0.17.0", path = "../../..", default-features = false, features = ["meshos"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
+bytes = "1.11"

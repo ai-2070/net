@@ -1875,6 +1875,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-meshos-ffi"
+version = "0.17.0"
+dependencies = [
+ "ai2070-net",
+ "bytes",
+ "tokio",
+]
+
+[[package]]
 name = "net-node"
 version = "0.17.0"
 dependencies = [
