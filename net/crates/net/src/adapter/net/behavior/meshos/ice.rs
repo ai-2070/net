@@ -2169,12 +2169,14 @@ mod tests {
                 daemon_origin: 0xCAFE,
                 phase: MigrationPhaseSnapshot::Transfer,
                 elapsed_ms: 250,
+                ..Default::default()
             },
             // A noise migration that should not match the target.
             MigrationSnapshot {
                 daemon_origin: 0xBEEF,
                 phase: MigrationPhaseSnapshot::Replay,
                 elapsed_ms: 50,
+                ..Default::default()
             },
         ]
         .into();

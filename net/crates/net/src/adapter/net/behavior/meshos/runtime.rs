@@ -1107,6 +1107,7 @@ mod tests {
                     daemon_origin: 0xABCD,
                     phase: MigrationPhaseSnapshot::Cutover,
                     elapsed_ms: 750,
+                    ..Default::default()
                 }]
             }
         }

@@ -64,13 +64,49 @@ impl MigrationSnapshotSource for OrchestratorMigrationSnapshotSource {
         self.orchestrator
             .list_migrations()
             .into_iter()
-            .map(|(daemon_origin, phase, elapsed_ms)| MigrationSnapshot {
-                daemon_origin,
-                phase: MigrationPhaseSnapshot::from(phase),
-                elapsed_ms,
+            .map(|item| {
+                let phase = MigrationPhaseSnapshot::from(item.phase);
+                MigrationSnapshot {
+                    daemon_origin: item.daemon_origin,
+                    phase,
+                    elapsed_ms: item.elapsed_ms,
+                    source_node: item.source_node,
+                    target_node: item.target_node,
+                    age_in_phase_ms: item.age_in_phase_ms,
+                    snapshot_bytes: item.snapshot_bytes,
+                    retries: item.retries,
+                    progress_pct: phase_progress_pct(phase),
+                    buffered_events: item.buffered_events,
+                }
             })
             .collect()
     }
+}
+
+/// Coarse phase-ordinal → percentage projection. Honest about
+/// the substrate-side limitation: byte-level progress requires
+/// the orchestrator to track `(bytes_done, bytes_total)` per
+/// active phase, which isn't wired today. The deck consumes
+/// this for an at-a-glance pipeline indicator alongside the
+/// PHASE column; finer reporting plugs in here when the
+/// orchestrator gains progress callbacks.
+fn phase_progress_pct(phase: MigrationPhaseSnapshot) -> Option<u8> {
+    // `MigrationPhaseSnapshot` is `#[non_exhaustive]`; the
+    // wildcard `_` arm guards against a future variant landing
+    // before this function gets updated. The current crate
+    // sees all listed variants as exhaustive — the allow
+    // silences the same-crate unreachable lint without giving
+    // up the cross-crate forward-compat.
+    #[allow(unreachable_patterns)]
+    Some(match phase {
+        MigrationPhaseSnapshot::Snapshot => 10,
+        MigrationPhaseSnapshot::Transfer => 30,
+        MigrationPhaseSnapshot::Restore => 50,
+        MigrationPhaseSnapshot::Replay => 70,
+        MigrationPhaseSnapshot::Cutover => 90,
+        MigrationPhaseSnapshot::Complete => 100,
+        _ => return None,
+    })
 }
 
 /// Convenient `Arc`-wrapped default; the loop holds an

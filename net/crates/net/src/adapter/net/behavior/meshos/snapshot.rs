@@ -118,6 +118,11 @@ pub struct MeshOsSnapshot {
 /// `MigrationOrchestrator::list_migrations()` by the
 /// [`super::migration_snapshot_source::MigrationSnapshotSource`]
 /// adapter and embedded in the snapshot on every publish tick.
+///
+/// Fields after `elapsed_ms` carry `#[serde(default)]` so a
+/// JSON consumer built against the pre-extension shape decodes
+/// cleanly (postcard cross-binary compat still requires field
+/// count + order agreement, same as `PeerSnapshot`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MigrationSnapshot {
     /// `MigrationId` (== daemon origin hash). Matches
@@ -128,6 +133,39 @@ pub struct MigrationSnapshot {
     pub phase: MigrationPhaseSnapshot,
     /// Milliseconds since the migration began on this node.
     pub elapsed_ms: u64,
+    /// Node ID where the daemon is being migrated FROM.
+    #[serde(default)]
+    pub source_node: u64,
+    /// Node ID where the daemon is being migrated TO.
+    #[serde(default)]
+    pub target_node: u64,
+    /// Milliseconds since the current phase was entered.
+    /// Distinct from `elapsed_ms` so operators can tell a
+    /// migration stuck in Replay for 30 minutes apart from one
+    /// merely 30 minutes old overall.
+    #[serde(default)]
+    pub age_in_phase_ms: u64,
+    /// Snapshot payload size in bytes; `None` while the source
+    /// hasn't produced one yet.
+    #[serde(default)]
+    pub snapshot_bytes: Option<u64>,
+    /// Retry attempts accumulated by the orchestrator's
+    /// retry-driver. `0` while no retry has been observed.
+    #[serde(default)]
+    pub retries: u32,
+    /// Best-effort progress percentage. Today the orchestrator
+    /// doesn't track byte-level transfer progress, so this is
+    /// derived from the phase ordinal (Snapshot → ... → Complete)
+    /// and reads as a coarse pipeline indicator rather than a
+    /// fine-grained transfer gauge. `None` for phases the deck
+    /// can't classify.
+    #[serde(default)]
+    pub progress_pct: Option<u8>,
+    /// Events buffered awaiting replay. Bloats while the source
+    /// runs Snapshot/Transfer/Restore and drains during Replay;
+    /// a flat-high count is a "cutover overdue" signal.
+    #[serde(default)]
+    pub buffered_events: u32,
 }
 
 /// Wire form of [`crate::adapter::net::compute::MigrationPhase`].

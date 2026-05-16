@@ -144,11 +144,25 @@ pub struct MigrationState {
     /// long-running stalls in operator dashboards. `Instant` is
     /// monotonic by contract and is unaffected by clock jumps.
     started_at: std::time::Instant,
+    /// Monotonic instant when the current phase was entered.
+    /// Used by operator tooling (Deck MIGRATIONS tab) to
+    /// distinguish "stuck in Replay for 30 minutes" from
+    /// "migration started 30 minutes ago" — the latter is
+    /// expected for large daemons, the former signals a stall.
+    phase_entered_at: std::time::Instant,
+    /// Number of retry attempts this migration has accumulated.
+    /// Bumped by callers that re-drive a failed step via
+    /// [`Self::bump_retry`]; surfaced through the migration
+    /// snapshot so operators can spot migrations cycling
+    /// through transient failures without dropping into the
+    /// per-daemon log.
+    retry_count: u32,
 }
 
 impl MigrationState {
     /// Create a new migration.
     pub fn new(daemon_origin: u64, source_node: u64, target_node: u64) -> Self {
+        let now = std::time::Instant::now();
         Self {
             daemon_origin,
             source_node,
@@ -156,7 +170,9 @@ impl MigrationState {
             phase: MigrationPhase::Snapshot,
             snapshot: None,
             buffered_events: Vec::new(),
-            started_at: std::time::Instant::now(),
+            started_at: now,
+            phase_entered_at: now,
+            retry_count: 0,
         }
     }
 
@@ -183,6 +199,7 @@ impl MigrationState {
         }
         self.snapshot = Some(snapshot);
         self.phase = MigrationPhase::Transfer;
+        self.phase_entered_at = std::time::Instant::now();
         Ok(())
     }
 
@@ -195,6 +212,7 @@ impl MigrationState {
             });
         }
         self.phase = MigrationPhase::Restore;
+        self.phase_entered_at = std::time::Instant::now();
         Ok(())
     }
 
@@ -207,6 +225,7 @@ impl MigrationState {
             });
         }
         self.phase = MigrationPhase::Replay;
+        self.phase_entered_at = std::time::Instant::now();
         Ok(())
     }
 
@@ -224,6 +243,7 @@ impl MigrationState {
             });
         }
         self.phase = MigrationPhase::Cutover;
+        self.phase_entered_at = std::time::Instant::now();
         Ok(())
     }
 
@@ -236,6 +256,7 @@ impl MigrationState {
             });
         }
         self.phase = MigrationPhase::Complete;
+        self.phase_entered_at = std::time::Instant::now();
         Ok(())
     }
 
@@ -246,6 +267,7 @@ impl MigrationState {
     /// The target will validate the reassembled snapshot.
     pub(crate) fn force_phase(&mut self, phase: MigrationPhase) {
         self.phase = phase;
+        self.phase_entered_at = std::time::Instant::now();
     }
 
     /// Check if migration is finished.
@@ -260,6 +282,40 @@ impl MigrationState {
     /// in operator dashboards.
     pub fn elapsed_ms(&self) -> u64 {
         u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Milliseconds since the current phase was entered. Same
+    /// monotonic source as [`Self::elapsed_ms`]; resets on
+    /// every phase transition.
+    pub fn age_in_phase_ms(&self) -> u64 {
+        u64::try_from(self.phase_entered_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Number of retries this migration has accumulated.
+    #[inline]
+    pub fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+
+    /// Increment the retry counter. Saturating at `u32::MAX`
+    /// so a stuck retry loop never wraps to `0` and masks the
+    /// retry pressure from operator dashboards.
+    pub fn bump_retry(&mut self) {
+        self.retry_count = self.retry_count.saturating_add(1);
+    }
+
+    /// Number of events currently buffered awaiting replay.
+    #[inline]
+    pub fn buffered_event_count(&self) -> usize {
+        self.buffered_events.len()
+    }
+
+    /// Payload byte count of the snapshot once set; `None`
+    /// while the snapshot phase is still in progress (or
+    /// when the orchestrator advanced past Snapshot via
+    /// [`Self::force_phase`] without calling `set_snapshot`).
+    pub fn snapshot_size_bytes(&self) -> Option<u64> {
+        self.snapshot.as_ref().map(|s| s.state.len() as u64)
     }
 
     /// Get the daemon origin hash.
