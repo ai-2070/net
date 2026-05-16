@@ -1,0 +1,21 @@
+net/crates/net/deck/src/tabs/audit.rs
+  s_46edf7dc333ef6::t_f37e9965c33e42 78-80,82-90
+net/crates/net/deck/src/app.rs
+  s_46edf7dc333ef6::t_34dcc401767e33 70-77,82-85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "287dc313f61af7af150e549839f00397c15560cb",
+  "prompts": {},
+  "sessions": {
+    "s_46edf7dc333ef6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e145bb62-38ea-4dbe-81cd-e36e7e65c2ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
