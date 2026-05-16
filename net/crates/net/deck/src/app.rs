@@ -2250,12 +2250,14 @@ impl App {
         }
         match self.current {
             Tab::NetMap => {
+                let logs = self.logs_tail.snapshot();
                 tabs::net_map::render(
                     frame,
                     chunks[3],
                     self.tick,
                     Some(&self.snapshot),
                     self.netmap_cursor,
+                    &logs,
                 )
             }
             Tab::Nodes => tabs::nodes::render(

@@ -1,4 +1,21 @@
-use net_sdk::deck::{MeshOsSnapshot, PeerHealthSnapshot};
+//! NET.MAP tab — proximity graph + mesh event tail.
+//!
+//! Top half: a canvas drawing peers at radial positions seeded
+//! from the substrate's RTT probe, with edges connecting each
+//! peer to its k-nearest neighbours. Per-role glyphs:
+//!
+//!   ◆ COMPUTE     · default
+//!   ■ DATAFORTS   · peer carries `dataforts.blob.storage`
+//!   ◇ DEVICE      · peer carries any `sensor.*` cap
+//!
+//! Title carries live counts: `{n} nodes · {m} edges · {d} dataforts`.
+//!
+//! Bottom half: MESH.EVENTS — tail of the most recent log records
+//! shaped like a `tail -f` feed. Same data the LOGS tab reads;
+//! this is the at-a-glance "what's happening across the mesh"
+//! view that pairs with the spatial layout above.
+
+use net_sdk::deck::{LogLevel, LogRecord, MeshOsSnapshot, PeerHealthSnapshot};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     symbols::Marker,
@@ -18,12 +35,30 @@ pub fn render(
     _tick: u64,
     snapshot: Option<&MeshOsSnapshot>,
     cursor: usize,
+    logs: &[LogRecord],
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .constraints([
+            Constraint::Min(0),    // graph
+            Constraint::Length(12), // MESH.EVENTS panel
+            Constraint::Length(2), // legend
+        ])
         .split(area);
 
+    render_graph(frame, rows[0], snapshot, cursor);
+    render_events(frame, rows[1], logs);
+    render_legend(frame, rows[2]);
+}
+
+// ───────────────────────── graph ─────────────────────────
+
+fn render_graph(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: Option<&MeshOsSnapshot>,
+    cursor: usize,
+) {
     let live_peers: Option<Vec<LiveNode>> = snapshot
         .filter(|s| !s.peers.is_empty())
         .map(project_live_peers);
@@ -31,10 +66,19 @@ pub fn render(
     let title_text = match live_peers.as_ref() {
         Some(peers) => {
             let n = peers.len();
+            let datafort_count = peers.iter().filter(|p| p.role == NodeRole::Datafort).count();
+            let edges = nearest_edges(peers, 2);
             let pos = cursor.min(n.saturating_sub(1)) + 1;
-            format!("   {n} live nodes    {pos}/{n}")
+            format!(
+                "    {} nodes · {} edges · {} dataforts    {}/{}",
+                n,
+                edges.len(),
+                datafort_count,
+                pos,
+                n
+            )
         }
-        None => "   no peers".to_string(),
+        None => "    no peers".to_string(),
     };
     let header = Line::from(vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
@@ -51,20 +95,18 @@ pub fn render(
         Some(peers) => {
             let n = peers.len();
             let cursor = cursor.min(n.saturating_sub(1));
-            // Move-by-clone into the closure — the canvas
-            // `paint` borrow must outlive the call, and
-            // ratatui captures by Fn (not FnOnce).
+            let edges = nearest_edges(&peers, 2);
             let canvas = Canvas::default()
                 .block(title_block)
                 .marker(Marker::Braille)
                 .x_bounds([-80.0, 80.0])
                 .y_bounds([-45.0, 70.0])
-                .paint(move |ctx| paint_live_graph(ctx, &peers, cursor));
-            frame.render_widget(canvas, rows[0]);
+                .paint(move |ctx| paint_live_graph(ctx, &peers, &edges, cursor));
+            frame.render_widget(canvas, area);
         }
         None => {
-            let inner = title_block.inner(rows[0]);
-            frame.render_widget(title_block, rows[0]);
+            let inner = title_block.inner(area);
+            frame.render_widget(title_block, area);
             widgets::empty::render(
                 frame,
                 inner,
@@ -73,11 +115,16 @@ pub fn render(
             );
         }
     }
-
-    render_legend(frame, rows[1]);
 }
 
 // ───────────────────────── live projection ─────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeRole {
+    Compute,
+    Datafort,
+    Device,
+}
 
 struct LiveNode {
     id: u64,
@@ -85,20 +132,10 @@ struct LiveNode {
     x: f64,
     y: f64,
     health: PeerHealthSnapshot,
+    role: NodeRole,
 }
 
 fn project_live_peers(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
-    // Radial layout off the substrate's proximity probe: each
-    // peer sits at a radius derived from its measured RTT from
-    // this node, with the angle deterministically hashed from
-    // the node id so the layout is stable across ticks.
-    //
-    // Normalization is min-max across the observed RTT range,
-    // not max-only. One outlier (a far-away peer) under
-    // max-only normalization compresses every closer peer into
-    // the central 20% of the canvas; min-max spreads the
-    // range across the full radial extent so the cluster
-    // topology actually reads.
     let observed: Vec<u64> = snapshot
         .peers
         .values()
@@ -113,41 +150,38 @@ fn project_live_peers(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
         .iter()
         .map(|(id, p)| {
             let angle = angle_for(*id);
-            // Peers with no RTT sample land at the outer edge
-            // so they're visible but read as "unranked."
             let rtt_ms = p.rtt_ms.unwrap_or(max_rtt);
             let normalized = (rtt_ms.saturating_sub(min_rtt)) as f64 / range as f64;
-            // Floor at 0.15 so the closest peer isn't pinned to
-            // the origin (would collide with future "this node"
-            // marker + obscures the relative positions of other
-            // close peers); ceiling at 0.95 leaves headroom for
-            // labels at the outer edge.
             let radius_unit = (normalized * 0.8 + 0.15).clamp(0.15, 0.95);
-            // Canvas extent: ~70 on each axis with a small
-            // margin. Y squished vs X because terminal cells
-            // are taller than wide; without compensation a
-            // mathematical circle reads as a vertical ellipse.
             let radius_x = radius_unit * 65.0;
             let radius_y = radius_unit * 38.0;
             let x = radius_x * angle.cos();
             let y = radius_y * angle.sin();
             let health = p.health.unwrap_or(PeerHealthSnapshot::Healthy);
             let label = crate::nodes::label_of(&format!("0x{:x}", *id));
+            let role = classify_role(&p.capability_set);
             LiveNode {
                 id: *id,
                 label,
                 x,
                 y,
                 health,
+                role,
             }
         })
         .collect()
 }
 
-/// Deterministic angular position (radians) for a node id.
-/// splitmix64 → 32-bit unit fraction → `0..2π`. Stable across
-/// renders so the graph doesn't jitter, and well-distributed
-/// for sparse inputs (the demo node ids are 16-bit).
+fn classify_role(caps: &std::collections::BTreeSet<String>) -> NodeRole {
+    if caps.iter().any(|c| c == "dataforts.blob.storage") {
+        NodeRole::Datafort
+    } else if caps.iter().any(|c| c.starts_with("sensor.")) {
+        NodeRole::Device
+    } else {
+        NodeRole::Compute
+    }
+}
+
 fn angle_for(id: u64) -> f64 {
     let mut s = id.wrapping_add(0x9e37_79b9_7f4a_7c15);
     s = (s ^ (s >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -157,16 +191,68 @@ fn angle_for(id: u64) -> f64 {
     unit * std::f64::consts::TAU
 }
 
-fn paint_live_graph(ctx: &mut Context<'_>, peers: &[LiveNode], cursor: usize) {
-    // Two-pass paint so the cursored node always wins z-order
-    // against any nearby gray label that would otherwise occlude
-    // it. Pass 1: every non-cursor node + its dim id tag. Pass 2:
-    // the cursor glyph, brackets, and full id.label in highlight.
+// ───────────────────────── edges ─────────────────────────
+
+/// For each peer, link to its k nearest neighbours by Euclidean
+/// distance in graph coordinates. De-duplicated so an edge
+/// (a, b) is the same as (b, a).
+fn nearest_edges(peers: &[LiveNode], k: usize) -> Vec<(usize, usize)> {
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for (i, a) in peers.iter().enumerate() {
+        let mut ranked: Vec<(usize, f64)> = peers
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(j, b)| {
+                let dx = a.x - b.x;
+                let dy = a.y - b.y;
+                (j, dx * dx + dy * dy)
+            })
+            .collect();
+        ranked.sort_by(|(_, da), (_, db)| da.partial_cmp(db).unwrap_or(std::cmp::Ordering::Equal));
+        for (j, _) in ranked.into_iter().take(k) {
+            let pair = if i < j { (i, j) } else { (j, i) };
+            if !edges.contains(&pair) {
+                edges.push(pair);
+            }
+        }
+    }
+    edges
+}
+
+fn paint_live_graph(
+    ctx: &mut Context<'_>,
+    peers: &[LiveNode],
+    edges: &[(usize, usize)],
+    cursor: usize,
+) {
+    // Edges first so node glyphs sit on top of them.
+    for (a, b) in edges {
+        let (Some(pa), Some(pb)) = (peers.get(*a), peers.get(*b)) else {
+            continue;
+        };
+        // Sample dots along the segment so the edge reads as a
+        // dotted line at terminal resolution.
+        let steps = 12;
+        for s in 1..steps {
+            let t = s as f64 / steps as f64;
+            let x = pa.x + (pb.x - pa.x) * t;
+            let y = pa.y + (pb.y - pa.y) * t;
+            ctx.print(
+                x,
+                y,
+                Line::styled("·", ratatui::style::Style::default().fg(theme::RULE)),
+            );
+        }
+    }
+
+    // Two-pass node paint so the cursored node wins z-order
+    // against neighboring gray labels.
     for (i, n) in peers.iter().enumerate() {
         if i == cursor {
             continue;
         }
-        let (glyph, color) = glyph_for_health(n.health);
+        let (glyph, color) = glyph_for(n);
         ctx.print(
             n.x,
             n.y,
@@ -180,7 +266,7 @@ fn paint_live_graph(ctx: &mut Context<'_>, peers: &[LiveNode], cursor: usize) {
     }
 
     if let Some(n) = peers.get(cursor) {
-        let (glyph, _color) = glyph_for_health(n.health);
+        let (glyph, _) = glyph_for(n);
         let cursor_style = ratatui::style::Style::default()
             .fg(theme::GREEN_HI)
             .add_modifier(ratatui::style::Modifier::BOLD);
@@ -195,19 +281,90 @@ fn paint_live_graph(ctx: &mut Context<'_>, peers: &[LiveNode], cursor: usize) {
     }
 }
 
-fn glyph_for_health(h: PeerHealthSnapshot) -> (char, ratatui::style::Color) {
-    match h {
-        PeerHealthSnapshot::Healthy => ('◆', theme::GREEN_HI),
-        PeerHealthSnapshot::Degraded => ('◆', theme::AMBER),
-        PeerHealthSnapshot::Unreachable => ('◇', theme::RED),
-        _ => ('◆', theme::TEXT),
-    }
+fn glyph_for(n: &LiveNode) -> (char, ratatui::style::Color) {
+    let color = match n.health {
+        PeerHealthSnapshot::Healthy => theme::GREEN_HI,
+        PeerHealthSnapshot::Degraded => theme::AMBER,
+        PeerHealthSnapshot::Unreachable => theme::RED,
+        _ => theme::TEXT,
+    };
+    let glyph = match n.role {
+        NodeRole::Compute => '◆',
+        NodeRole::Datafort => '■',
+        NodeRole::Device => '◇',
+    };
+    (glyph, color)
 }
+
+// ───────────────────────── mesh events ─────────────────────────
+
+fn render_events(frame: &mut Frame<'_>, area: Rect, logs: &[LogRecord]) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::rule())
+        .title(Line::from(vec![
+            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+            Span::styled("MESH.EVENTS", theme::green_hi()),
+            Span::styled(format!("    {} records", logs.len()), theme::chrome()),
+        ]))
+        .title_alignment(Alignment::Left);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if logs.is_empty() {
+        widgets::empty::render(
+            frame,
+            inner,
+            "no mesh events yet",
+            "daemons + admin actions land here as they fire",
+        );
+        return;
+    }
+
+    let take = (inner.height as usize).max(1);
+    let start = logs.len().saturating_sub(take);
+    let mut lines: Vec<Line> = Vec::with_capacity(take);
+    for r in &logs[start..] {
+        let (level_text, level_style) = match r.level {
+            LogLevel::Error => ("ERROR", theme::red()),
+            LogLevel::Warn => ("WARN ", theme::amber()),
+            LogLevel::Info => ("INFO ", theme::green()),
+            LogLevel::Debug => ("DEBUG", theme::dim()),
+            _ => ("?    ", theme::dim()),
+        };
+        let source = match r.daemon_id {
+            Some(d) => format!("daemon.0x{d:x}"),
+            None => "substrate".to_string(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {}  ", fmt_ts(r.ts_ms)), theme::chrome()),
+            Span::styled(level_text.to_string(), level_style),
+            Span::styled(format!("  {source:<14}  "), theme::cyan()),
+            Span::styled(r.message.clone(), theme::text()),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn fmt_ts(ts_ms: u64) -> String {
+    let total_s = ts_ms / 1000;
+    let ms = ts_ms % 1000;
+    let s = total_s % 60;
+    let m = (total_s / 60) % 60;
+    let h = (total_s / 3600) % 24;
+    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+}
+
+// ───────────────────────── legend ─────────────────────────
 
 fn render_legend(frame: &mut Frame<'_>, area: Rect) {
     let legend = Line::from(vec![
         Span::styled("◆ ", theme::green_hi()),
-        Span::styled("HEALTHY   ", theme::dim()),
+        Span::styled("COMPUTE   ", theme::dim()),
+        Span::styled("■ ", theme::green_hi()),
+        Span::styled("DATAFORTS   ", theme::dim()),
+        Span::styled("◇ ", theme::text()),
+        Span::styled("DEVICE   ", theme::dim()),
         Span::styled("◆ ", theme::amber()),
         Span::styled("DEGRADED   ", theme::dim()),
         Span::styled("◇ ", theme::red()),
