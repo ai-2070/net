@@ -135,7 +135,13 @@ struct PeerSummary {
 }
 
 fn peer_summary(snap: &MeshOsSnapshot) -> PeerSummary {
-    let mut healthy = 0;
+    // Local node counts too: NODES + NET.MAP now render it
+    // alongside remote peers, so the status-bar chip needs
+    // to match (17 peers + self = 18). Local is assumed
+    // Healthy — the synthesized local PeerSnapshot stamps
+    // `Some(Healthy)` and nothing local-side reports its own
+    // node as Degraded / Unreachable.
+    let mut healthy = 1;
     let mut degraded = 0;
     let mut unreachable = 0;
     for p in snap.peers.values() {
@@ -147,7 +153,7 @@ fn peer_summary(snap: &MeshOsSnapshot) -> PeerSummary {
         }
     }
     PeerSummary {
-        total: snap.peers.len(),
+        total: snap.peers.len() + 1,
         healthy,
         degraded,
         unreachable,
