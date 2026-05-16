@@ -65,7 +65,7 @@ fn render_live(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cur
         cell_dim("KIND"),
         cell_dim("LINEAGE"),
         cell_dim("NODE"),
-        cell_dim("LIFE"),
+        cell_dim("STATE"),
         cell_dim("HEALTH"),
         cell_dim("SAT"),
         cell_dim("AGE"),
