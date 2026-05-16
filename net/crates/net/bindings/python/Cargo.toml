@@ -64,6 +64,14 @@ compute = ["net", "dep:net-sdk", "net-sdk/compute", "dep:dashmap"]
 # Stage 3 of `SDK_GROUPS_SURFACE_PLAN.md` — HA/scaling overlays
 # (ReplicaGroup, ForkGroup, StandbyGroup). Sits on top of compute.
 groups = ["compute", "net-sdk/groups"]
+# MeshOS daemon-author SDK (`MESHOS_SDK_PLAN.md` Phase 2). Builds on
+# `compute` for the `MeshDaemon` trait + `Identity` wrapper and on
+# the substrate's `net/meshos` for the supervisor runtime. The
+# substrate's `meshos` feature implies `cortex`, which the Python
+# binding's `cortex` feature already activates if any cortex-tier
+# class is reachable — listing `cortex` here keeps the dep chain
+# explicit when consumers ask only for `meshos`.
+meshos = ["compute", "cortex", "net/meshos", "net-sdk/meshos"]
 
 [dependencies]
 net = { package = "ai2070-net", version = "0.17.0", path = "../..", default-features = false }

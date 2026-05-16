@@ -349,6 +349,58 @@ else:
     )
 
 
+# MeshOS daemon-author SDK. Present iff the native module was built
+# with the `meshos` Cargo feature. Slice 1 surface — register /
+# control receive / publish_log / graceful_shutdown / metadata.
+try:
+    from ._net import (
+        MeshOsDaemonHandle,
+        MeshOsDaemonSdk,
+        MeshOsSdkError,
+    )
+except ImportError:
+    # `meshos` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(
+        [
+            "MeshOsDaemonHandle",
+            "MeshOsDaemonSdk",
+            "MeshOsSdkError",
+            "meshos_sdk_error_kind",
+        ]
+    )
+
+    def meshos_sdk_error_kind(exc: "MeshOsSdkError") -> str | None:
+        """Extract the kind discriminator from a caught
+        ``MeshOsSdkError``.
+
+        The Rust side wraps every SDK error in the
+        ``<<meshos-sdk-kind:KIND>>MSG`` envelope and attaches a
+        ``.kind`` attribute on the exception instance. Prefer
+        ``exc.kind`` over parsing; this helper is a fallback for
+        callers that hold the exception's stringified form (e.g.
+        bubbled through logs).
+
+        Returns ``None`` when the message doesn't carry the
+        envelope (shouldn't happen for exceptions raised by this
+        module).
+        """
+        kind = getattr(exc, "kind", None)
+        if isinstance(kind, str):
+            return kind
+        msg = str(exc)
+        marker = "<<meshos-sdk-kind:"
+        start = msg.find(marker)
+        if start == -1:
+            return None
+        start += len(marker)
+        end = msg.find(">>", start)
+        if end == -1:
+            return None
+        return msg[start:end]
+
+
 # MeshDB surface. Present iff the native module was built with
 # the `meshdb` Cargo feature. Slice 1 shipped the atomic factory
 # AST + sync runner + Phase F cache options; slice 2 added the

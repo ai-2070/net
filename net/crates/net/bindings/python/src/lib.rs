@@ -29,6 +29,11 @@ mod mesh_rpc;
 // stay slim.
 #[cfg(feature = "meshdb")]
 mod meshdb;
+// MeshOS daemon-author SDK (Phase 2 slice 1: register / control
+// receive / publish_log / graceful_shutdown). Builds on `compute`
+// for the `MeshDaemon` trait + the `Identity` wrapper.
+#[cfg(feature = "meshos")]
+mod meshos;
 #[cfg(feature = "net")]
 mod placement;
 #[cfg(feature = "redis")]
@@ -2338,6 +2343,15 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<meshdb::PyPredicate>()?;
         m.add_class::<meshdb::PyQueryBuilder>()?;
         m.add("MeshDbError", m.py().get_type::<meshdb::MeshDbError>())?;
+    }
+    #[cfg(feature = "meshos")]
+    {
+        m.add_class::<meshos::PyMeshOsDaemonSdk>()?;
+        m.add_class::<meshos::PyMeshOsDaemonHandle>()?;
+        m.add(
+            "MeshOsSdkError",
+            m.py().get_type::<meshos::MeshOsSdkError>(),
+        )?;
     }
     Ok(())
 }
