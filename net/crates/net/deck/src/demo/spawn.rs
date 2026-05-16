@@ -331,7 +331,7 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn five_node_demo_boots_and_logs_appear() {
+    async fn demo_boots_and_logs_appear() {
         let nrpc_tail = NrpcTail::new(1024);
         let harness = spawn(nrpc_tail.clone())
             .await
@@ -345,8 +345,8 @@ mod tests {
         let snap = harness.deck.status();
         assert_eq!(
             snap.peers.len(),
-            4,
-            "node[0] snapshot must see 4 remote peers"
+            8,
+            "node[0] snapshot must see 8 remote peers"
         );
         // Node[0] hosts: 1 HeartbeatDaemon + 3 MixerDaemons
         // (replica) + 3 DroneDaemons (fork) + 3 PyroSafetyDaemons
@@ -376,8 +376,8 @@ mod tests {
         // Phase 2: one MeshBlobAdapter per demo node.
         assert_eq!(
             harness.blob_adapters.len(),
-            5,
-            "demo should wire 5 blob adapters (one per node)"
+            9,
+            "demo should wire 9 blob adapters (one per node)"
         );
         // Phase 4: requester loops fire at ~250 ms; after 3 s
         // the observer should have logged a non-trivial number

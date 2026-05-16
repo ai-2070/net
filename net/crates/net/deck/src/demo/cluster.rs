@@ -4,10 +4,15 @@
 
 use net_sdk::testing::{ClusterError, ClusterHarness};
 
-/// Hardcoded per `DECK_DEMO_PLAN.md` locked decisions: 5 nodes,
-/// enough room for the replica trio + fork trio + standby
-/// triad without contention.
-pub const DEMO_NODE_COUNT: usize = 5;
+/// 9 nodes — gives the NET.MAP a real cluster shape and lets
+/// the replica trio / fork trio / standby triad each land on
+/// distinct subsets of nodes with breathing room. Picked over
+/// the original 5-node baseline because 5 reads as "toy" to
+/// non-engineer viewers; 9 reads as "real cluster." Boot stays
+/// well under the harness's 10 s ceiling on a developer
+/// laptop (pairwise handshake = N²/2 = 36 pairs at ~50 ms
+/// each ≈ 2 s).
+pub const DEMO_NODE_COUNT: usize = 9;
 
 /// Build the underlying multi-node harness. Returns once every
 /// `Mesh` has handshook with every other Mesh and every

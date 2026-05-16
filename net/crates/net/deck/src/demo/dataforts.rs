@@ -17,16 +17,22 @@ use net_sdk::dataforts::{publish_blob_ref, BlobAdapter, MeshBlobAdapter, Redex};
 
 /// Disk-cap presets per demo node, chosen so the DATAFORTS
 /// tab's `DISK` bar renders at visibly distinct fill
-/// percentages across the 5 nodes. Indexed by node position
+/// percentages across the 9 nodes. Indexed by node position
 /// in the harness; falls back to the last entry for any
-/// out-of-range index.
+/// out-of-range index. Profiles are tagged with role names
+/// the operator will recognize from a real cluster — primary
+/// / cold / replicated / analytics / backup / ingest / etc.
 const ADAPTER_PROFILES: &[(&str, u64, usize, usize)] = &[
     // (id, disk_cap_bytes, initial_stores, initial_fetches)
-    ("primary", 1u64 << 40, 5, 3),     // 1 TiB cap, balanced
-    ("cold", 512u64 << 30, 2, 18),     // 512 GiB cap, read-heavy
-    ("replicated", 2u64 << 40, 11, 0), // 2 TiB cap, write-heavy
-    ("analytics", 768u64 << 30, 7, 5), // 768 GiB cap, balanced
-    ("backup", 4u64 << 40, 3, 0),      // 4 TiB cap, write-only
+    ("primary", 1u64 << 40, 5, 3),       // 1 TiB cap, balanced
+    ("cold", 512u64 << 30, 2, 18),       // 512 GiB cap, read-heavy
+    ("replicated", 2u64 << 40, 11, 0),   // 2 TiB cap, write-heavy
+    ("analytics", 768u64 << 30, 7, 5),   // 768 GiB cap, balanced
+    ("backup", 4u64 << 40, 3, 0),        // 4 TiB cap, write-only
+    ("ingest", 1u64 << 40, 14, 1),       // 1 TiB cap, ingest-heavy
+    ("snapshot", 2u64 << 40, 4, 22),     // 2 TiB cap, snapshot-restore heavy
+    ("staging", 256u64 << 30, 8, 8),     // 256 GiB cap, balanced small
+    ("archive", 8u64 << 40, 1, 0),       // 8 TiB cap, write-once
 ];
 
 /// Build N adapters — one per demo node. Returns a vec of
