@@ -11,8 +11,6 @@
 //! collision yields an overwrite which is fine — operators
 //! who want history version-control the directory.
 
-use std::io::Write;
-
 use net_sdk::dataforts::BlobInventoryEntry;
 use net_sdk::deck::{
     AdminAuditRecord, AdminEvent, FailureRecord, LogLevel, LogRecord, VerificationOutcome,
