@@ -1,4 +1,4 @@
-//! BLOBS tab — chunk-level inventory of the local blob
+//! BLOBS tab — chunk-level inventory of every wired blob
 //! adapter. Sourced from `MeshBlobAdapter::list(...)` polled
 //! at the deck's tick cadence (see `streams::spawn_blobs_poll`).
 //! Newest-touched first.
@@ -9,7 +9,7 @@
 //! chunk); the substrate doesn't track logical-blob → chunk
 //! association in a queryable index today.
 
-use net_sdk::dataforts::BlobInventoryEntry;
+use net_sdk::dataforts::{BlobInventoryEntry, DEFAULT_RETENTION_FLOOR};
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
     text::{Line, Span},
@@ -97,15 +97,19 @@ fn render_table(
 
     let header = Row::new(vec![
         cell_dim(" "),
-        cell_dim("HASH (truncated)"),
-        cell_dim("REF"),
-        cell_dim("PIN"),
-        cell_dim("FIRST SEEN"),
+        cell_dim("ADAPTER"),
+        cell_dim("HASH"),
+        cell_dim("SIZE"),
+        cell_dim("REPL"),
+        cell_dim("STATUS"),
+        cell_dim("AGE"),
+        cell_dim("CHANNEL"),
         cell_dim("LAST TOUCH"),
     ])
     .height(1);
 
     let now_ms = unix_now_ms();
+    let floor_ms = DEFAULT_RETENTION_FLOOR.as_millis() as u64;
     let mut rows: Vec<Row> = Vec::with_capacity(shown);
     let effective_cursor = cursor.min(shown.saturating_sub(1));
     for (i, e) in visible.iter().enumerate() {
@@ -128,26 +132,50 @@ fn render_table(
         } else {
             theme::text()
         };
-        let ref_style = if e.refcount == 0 {
-            theme::dim()
-        } else {
-            theme::green()
+        let size_text = match e.size_bytes {
+            Some(n) => format_bytes(n),
+            None => "—".to_string(),
         };
-        let pin_text = if e.pinned { "PIN" } else { " · " };
-        let pin_style = if e.pinned {
-            theme::amber()
+        let repl_text = match (e.replicas_observed, e.replica_target) {
+            (Some(o), Some(t)) => format!("{o}/{t}"),
+            (None, Some(t)) => format!("—/{t}"),
+            (Some(o), None) => format!("{o}/—"),
+            (None, None) => "—".to_string(),
+        };
+        let repl_style = match (e.replicas_observed, e.replica_target) {
+            (Some(o), Some(t)) if o < t as u32 => theme::amber(),
+            (Some(_), Some(_)) => theme::green(),
+            _ => theme::dim(),
+        };
+        let age_first = now_ms.saturating_sub(e.first_seen_unix_ms);
+        let (status_text, status_style) = if e.pinned {
+            ("pinned", theme::amber())
+        } else if e.refcount > 0 {
+            ("live", theme::green())
+        } else if age_first >= floor_ms {
+            ("sweepable", theme::red())
         } else {
-            theme::chrome()
+            ("quiet", theme::dim())
+        };
+        let age_text = format_relative(e.first_seen_unix_ms, now_ms);
+        // Channel preview: `blob/XX/…` — the leading two hex
+        // chars are the bucket prefix the adapter shards on,
+        // which is the part operators grep on. The detail
+        // modal renders the full channel.
+        let channel_text = if e.hash_hex.len() >= 2 && e.hash_hex.is_char_boundary(2) {
+            format!("blob/{}/…", &e.hash_hex[..2])
+        } else {
+            "blob/?".to_string()
         };
         rows.push(Row::new(vec![
             Cell::from(Span::styled(marker, theme::green_hi())),
+            Cell::from(Span::styled(e.adapter_id.clone(), theme::cyan())),
             Cell::from(Span::styled(hash_short, hash_style)),
-            Cell::from(Span::styled(format!("{:>3}", e.refcount), ref_style)),
-            Cell::from(Span::styled(pin_text, pin_style)),
-            Cell::from(Span::styled(
-                format_relative(e.first_seen_unix_ms, now_ms),
-                theme::dim(),
-            )),
+            Cell::from(Span::styled(size_text, theme::text())),
+            Cell::from(Span::styled(repl_text, repl_style)),
+            Cell::from(Span::styled(status_text, status_style)),
+            Cell::from(Span::styled(age_text, theme::dim())),
+            Cell::from(Span::styled(channel_text, theme::chrome())),
             Cell::from(Span::styled(
                 format_relative(e.last_seen_unix_ms, now_ms),
                 theme::text(),
@@ -159,10 +187,13 @@ fn render_table(
         rows,
         [
             Constraint::Length(2),  // cursor
+            Constraint::Length(12), // adapter
             Constraint::Length(19), // hash window
-            Constraint::Length(4),  // ref
-            Constraint::Length(4),  // pin
-            Constraint::Length(11), // first seen
+            Constraint::Length(8),  // size
+            Constraint::Length(7),  // repl (e.g. "—/3" or "12/3")
+            Constraint::Length(10), // status
+            Constraint::Length(11), // age
+            Constraint::Length(11), // channel
             Constraint::Min(0),     // last touch
         ],
     )
@@ -229,5 +260,27 @@ fn format_relative(then_ms: u64, now_ms: u64) -> String {
         format!("{}m ago", delta / 60)
     } else {
         format!("{}h ago", delta / 3_600)
+    }
+}
+
+/// Compact byte-count: bytes / KB / MB / GB / TB with one
+/// decimal past KB. Truncates to the largest unit where the
+/// value reads as ≥1 so a 999-byte blob stays "999B" instead
+/// of jumping to "0.9KB".
+fn format_bytes(n: u64) -> String {
+    const KB: u64 = 1_024;
+    const MB: u64 = 1_024 * KB;
+    const GB: u64 = 1_024 * MB;
+    const TB: u64 = 1_024 * GB;
+    if n < KB {
+        format!("{n}B")
+    } else if n < MB {
+        format!("{:.1}KB", n as f64 / KB as f64)
+    } else if n < GB {
+        format!("{:.1}MB", n as f64 / MB as f64)
+    } else if n < TB {
+        format!("{:.1}GB", n as f64 / GB as f64)
+    } else {
+        format!("{:.1}TB", n as f64 / TB as f64)
     }
 }
