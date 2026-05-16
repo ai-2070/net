@@ -101,7 +101,10 @@ impl BookmarkStore {
     }
 
     /// Load from a specific path. Used by tests + by future
-    /// `--bookmarks <path>` overrides.
+    /// `--bookmarks <path>` overrides. A corrupt / unparseable
+    /// file is renamed aside (`<path>.corrupt-<unix_ms>`) so
+    /// the next save can recover with an empty store rather
+    /// than leaving the operator unable to launch the deck.
     pub fn load_from(path: &Path) -> Result<Self, BookmarkError> {
         if !path.exists() {
             return Ok(Self {
@@ -111,8 +114,26 @@ impl BookmarkStore {
         }
         let text = std::fs::read_to_string(path)
             .map_err(|e| BookmarkError::Io(format!("read {}: {e}", path.display())))?;
-        let file: BookmarkFile = toml::from_str(&text)
-            .map_err(|e| BookmarkError::Parse(format!("{}: {e}", path.display())))?;
+        let file: BookmarkFile = match toml::from_str(&text) {
+            Ok(f) => f,
+            Err(e) => {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let aside = path.with_extension(format!("toml.corrupt-{stamp}"));
+                // Best-effort rename — if it fails, surface the
+                // parse error instead so the operator at least
+                // sees a meaningful message.
+                if std::fs::rename(path, &aside).is_ok() {
+                    return Ok(Self {
+                        bookmarks: Vec::new(),
+                        path: Some(path.to_path_buf()),
+                    });
+                }
+                return Err(BookmarkError::Parse(format!("{}: {e}", path.display())));
+            }
+        };
         if file.version != CURRENT_VERSION {
             return Err(BookmarkError::Version(file.version, CURRENT_VERSION));
         }
