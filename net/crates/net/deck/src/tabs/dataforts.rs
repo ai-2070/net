@@ -26,7 +26,7 @@ use net_sdk::dataforts::{
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
     Frame,
 };
 
@@ -287,7 +287,9 @@ fn render_datafort_list(
     .header(header)
     .block(block)
     .column_spacing(2);
-    frame.render_widget(table, area);
+    let mut state =
+        TableState::default().with_selected(Some(cursor.min(total.saturating_sub(1))));
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 fn overflow_label(e: &DatafortEntry) -> &'static str {

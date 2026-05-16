@@ -8,7 +8,7 @@ use net_sdk::deck::FailureRecord;
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Row, Table},
+    widgets::{Block, Borders, Cell, Row, Table, TableState},
     Frame,
 };
 
@@ -144,7 +144,9 @@ fn render_table(
     .header(header)
     .block(block)
     .column_spacing(2);
-    frame.render_widget(table, area);
+    let mut state = TableState::default()
+        .with_selected(Some(effective_cursor.min(shown.saturating_sub(1))));
+    frame.render_stateful_widget(table, area, &mut state);
     // Records exist but the active search matches none — render
     // a one-line hint inside the body so the operator isn't
     // staring at an empty table wondering whether their filter

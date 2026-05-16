@@ -8,7 +8,7 @@ use net_sdk::deck::{MeshOsSnapshot, MigrationPhaseSnapshot, NodeId};
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Row, Table},
+    widgets::{Block, Borders, Cell, Row, Table, TableState},
     Frame,
 };
 
@@ -150,7 +150,9 @@ fn render_table(
     .header(header)
     .block(block)
     .column_spacing(2);
-    frame.render_widget(table, area);
+    let mut state =
+        TableState::default().with_selected(Some(cursor.min(total.saturating_sub(1))));
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 /// Compact node id label. Operator-grep-friendly hex form; the

@@ -6,7 +6,7 @@ use net_sdk::deck::MeshOsSnapshot;
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Row, Table},
+    widgets::{Block, Borders, Cell, Row, Table, TableState},
     Frame,
 };
 
@@ -282,7 +282,13 @@ fn render_live_nodes_table(
     .header(header)
     .block(block)
     .column_spacing(2);
-    frame.render_widget(table, area);
+    // Stateful render so ratatui's Table widget auto-scrolls
+    // the visible window when the cursor would otherwise sit
+    // off-screen. We rebuild the state from scratch each frame
+    // (selected = cursor, offset = 0); ratatui mutates offset
+    // during render to bring the selected row into view.
+    let mut state = TableState::default().with_selected(Some(cursor.min(total.saturating_sub(1))));
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 fn cell_dim(s: &'static str) -> Cell<'static> {
