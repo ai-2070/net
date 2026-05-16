@@ -629,6 +629,28 @@ impl MeshOsRuntime {
         self.probes.add_inventory_probe(probe);
     }
 
+    /// Detach every installed [`LocalityProbe`]. Pair with
+    /// [`Self::add_locality_probe`] when a caller swaps probe
+    /// sources mid-flight (test harnesses, hot-config reload).
+    pub fn clear_locality_probes(&self) {
+        self.probes.clear_locality_probes();
+    }
+
+    /// Detach every installed [`HealthProbe`]. Same shape as
+    /// [`Self::clear_locality_probes`].
+    pub fn clear_health_probes(&self) {
+        self.probes.clear_health_probes();
+    }
+
+    /// Detach every installed
+    /// [`super::probes::InventoryProbe`]. Same shape as
+    /// [`Self::clear_locality_probes`]; required when swapping
+    /// sources because last-writer-wins per peer means a stale
+    /// probe left installed can stomp a live replacement.
+    pub fn clear_inventory_probes(&self) {
+        self.probes.clear_inventory_probes();
+    }
+
     /// Clone the probe registry. Used by tests + advanced
     /// callers that want to install probes outside the runtime's
     /// own lifetime.

@@ -314,6 +314,30 @@ impl ProbeRegistry {
             guard.inventory.len(),
         )
     }
+
+    /// Drop every installed [`LocalityProbe`]. Long-running
+    /// runtimes that swap probe sources (test harnesses,
+    /// hot-config reloaders) would otherwise accumulate dead
+    /// probes that keep firing every Tick; this lets a caller
+    /// detach the old set before installing replacements.
+    pub fn clear_locality_probes(&self) {
+        self.inner.lists.write().locality.clear();
+    }
+
+    /// Drop every installed [`HealthProbe`]. Same rationale as
+    /// [`Self::clear_locality_probes`].
+    pub fn clear_health_probes(&self) {
+        self.inner.lists.write().health.clear();
+    }
+
+    /// Drop every installed [`super::probes::InventoryProbe`].
+    /// Same rationale as [`Self::clear_locality_probes`]. Last-
+    /// writer-wins per peer means a stale probe left installed
+    /// can stomp a live replacement's samples, so callers
+    /// swapping inventory sources should clear first.
+    pub fn clear_inventory_probes(&self) {
+        self.inner.lists.write().inventory.clear();
+    }
 }
 
 /// Read-only handle to the loop's most recent snapshot.
@@ -2392,5 +2416,60 @@ mod tests {
 
         drop(handle);
         let _ = tokio::time::timeout(StdDuration::from_secs(1), task).await;
+    }
+
+    /// `clear_inventory_probes` must drop every installed
+    /// inventory probe (and only those) so callers swapping
+    /// probe sources mid-flight can detach the previous set
+    /// before installing replacements. Without this, a stale
+    /// probe left in the append-only registry can stomp the
+    /// new one's samples via last-writer-wins per peer.
+    #[test]
+    fn clear_inventory_probes_drops_installed_probes_only() {
+        struct DummyInventoryProbe;
+        impl super::super::probes::InventoryProbe for DummyInventoryProbe {
+            fn inventory_samples(&self) -> Vec<(u64, super::super::probes::PeerInventory)> {
+                vec![]
+            }
+        }
+        struct DummyLocalityProbe;
+        impl super::super::probes::LocalityProbe for DummyLocalityProbe {
+            fn rtt_samples(&self) -> Vec<(u64, StdDuration)> {
+                vec![]
+            }
+        }
+        struct DummyHealthProbe;
+        impl super::super::probes::HealthProbe for DummyHealthProbe {
+            fn health_samples(&self) -> Vec<(u64, super::super::event::NodeHealth)> {
+                vec![]
+            }
+        }
+
+        let reg = ProbeRegistry::new();
+        reg.add_locality_probe(Arc::new(DummyLocalityProbe));
+        reg.add_health_probe(Arc::new(DummyHealthProbe));
+        reg.add_inventory_probe(Arc::new(DummyInventoryProbe));
+        reg.add_inventory_probe(Arc::new(DummyInventoryProbe));
+        assert_eq!(reg.probe_counts(), (1, 1, 2));
+
+        reg.clear_inventory_probes();
+        assert_eq!(
+            reg.probe_counts(),
+            (1, 1, 0),
+            "inventory cleared; locality + health untouched"
+        );
+
+        // The other clear paths are symmetric — verify they
+        // also touch only their own list.
+        reg.clear_locality_probes();
+        assert_eq!(reg.probe_counts(), (0, 1, 0));
+        reg.clear_health_probes();
+        assert_eq!(reg.probe_counts(), (0, 0, 0));
+
+        // Post-clear, re-install must succeed and count
+        // independently — the underlying Vec wasn't replaced
+        // with something half-broken.
+        reg.add_inventory_probe(Arc::new(DummyInventoryProbe));
+        assert_eq!(reg.probe_counts(), (0, 0, 1));
     }
 }
