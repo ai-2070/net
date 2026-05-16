@@ -395,15 +395,15 @@ Each README matches the MeshDB / MeshOS SDK README format (slice-based, explicit
 
 §7 #1 specifies *that* `IceProposal::commit` requires `signatures.len() >= ice_threshold` and *what* the substrate verifies. It does **not** specify *how* a second operator's signature reaches the originating deck. Today the substrate accepts the bundle and the SDK exposes the per-operator `OperatorIdentity::sign_proposal`, but there's no defined operator-facing workflow for the two (or more) deck instances to exchange signatures over an unsigned proposal.
 
-Status: **deferred**. The demo runtime ships with `ice_signature_threshold = 1` so the single-operator path commits without coordination; M-of-N landings wait for a Deck consumer driving the workflow.
+Status: **indefinitely deferred**. The demo runtime ships with `ice_signature_threshold = 1` and the single-operator path is sufficient for current and foreseeable cluster operations; no near-term roadmap item drives multi-op coordination. The notes below capture the design surface so a future reviewer doesn't have to re-derive it — this is reference material, not a queued slice.
 
-When this comes back the SDK additions are bounded:
+If a consumer ever revives the workflow the SDK additions are bounded:
 
 - **Expose offline-signing primitives.** Re-export `BlastRadiusHash`, `blast_radius_hash(&BlastRadius) -> BlastRadiusHash`, and `ice_proposal_signing_payload(&IceActionProposal, issued_at_ms, &BlastRadiusHash) -> Vec<u8>` from `net_sdk::deck::*`. The substrate already implements all three at `behavior::meshos::ice`; they're internal-only today because no consumer needs them.
 - **Add a serializable proposal bundle.** A new `IceProposalBundle { action: IceActionProposal, issued_at_ms: u64, blast: BlastRadius }` carries everything a remote operator needs to (a) re-derive the same `blast_hash` locally and (b) sign over the same domain-tagged payload. All three fields are already `Serialize + Deserialize`; the bundle is a thin tuple type with one helper: `bundle.signing_payload() -> Vec<u8>` (delegates to `ice_proposal_signing_payload`).
 - **Document the round-trip.** Operator A's deck simulates and produces a bundle; A signs locally and exports `(bundle, sig_a)` as a postcard or JSON blob (paste / file / out-of-band channel); operator B's deck imports the bundle, verifies its own re-derived `blast_hash` matches what A signed over, signs locally, exports `sig_b`; A imports `sig_b` and commits with `&[sig_a, sig_b]`. The substrate verifier rebuilds the signing payload from `(action, issued_at_ms, blast_hash)` so both signatures bind to the exact same envelope or commit fails closed.
 
-The deck-binary surface this unlocks (export bundle, import signature, commit modal that shows collected-so-far vs required) is **out of scope of this plan**. The SDK delta is the prerequisite; the UI follows whenever the workflow has a real consumer demanding it.
+The deck-binary surface this would unlock (export bundle, import signature, commit modal that shows collected-so-far vs required) is **not a planned feature**. This section exists to pin the design if anyone picks it up later.
 
 ### Things explicitly not deferred to this section
 
