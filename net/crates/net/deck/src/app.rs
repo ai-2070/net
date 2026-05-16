@@ -232,6 +232,13 @@ pub struct App {
     /// the operator knows the file landed without leaving
     /// the TUI.
     pub toast: Option<(String, Instant)>,
+    /// Sender side of the spawn-back toast channel. Cloned into
+    /// every detached admin dispatch task so failed simulate /
+    /// commit calls surface as a footer toast instead of being
+    /// silently dropped.
+    pub toast_tx: std::sync::mpsc::Sender<String>,
+    /// Receiver side; drained by the tick loop into `toast`.
+    pub toast_rx: std::sync::mpsc::Receiver<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -328,18 +335,31 @@ fn node_action_for(code: KeyCode) -> Option<NodeActionKind> {
 /// (binds `issued_at_ms` + `blast_hash`), sign with the
 /// deck's operator identity, commit the signed bundle. Errors
 /// surface in the audit ring as `Rejected` entries; on
-/// success the audit row reads `Accepted`.
-async fn dispatch_ice(deck: &Arc<DeckClient>, proposal: net_sdk::deck::IceProposal<'_>) {
+/// success the audit row reads `Accepted`. Failures at the
+/// simulate / commit boundary also flow into `toast_tx` so
+/// the operator sees the rejection in the footer immediately
+/// instead of waiting for the audit ring to update.
+async fn dispatch_ice(
+    deck: &Arc<DeckClient>,
+    proposal: net_sdk::deck::IceProposal<'_>,
+    kind: &str,
+    toast_tx: std::sync::mpsc::Sender<String>,
+) {
     let simulated = match proposal.simulate().await {
         Ok(s) => s,
-        Err(_) => return,
+        Err(err) => {
+            let _ = toast_tx.send(format!("ICE {kind} rejected: simulate failed — {err}"));
+            return;
+        }
     };
     let sig = deck.identity().sign_proposal(
         simulated.action(),
         simulated.issued_at_ms(),
         &simulated.blast_hash(),
     );
-    let _ = simulated.commit(&[sig]).await;
+    if let Err(err) = simulated.commit(&[sig]).await {
+        let _ = toast_tx.send(format!("ICE {kind} rejected: commit failed — {err}"));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -416,6 +436,7 @@ impl App {
         this_node: net_sdk::meshos::NodeId,
     ) -> Self {
         let snapshot = Arc::new(deck.status());
+        let (toast_tx, toast_rx) = std::sync::mpsc::channel();
         Self {
             current: Tab::NetMap,
             logs_tail,
@@ -456,6 +477,8 @@ impl App {
             node_focus: None,
             daemon_focus: None,
             toast: None,
+            toast_tx,
+            toast_rx,
         }
     }
 
@@ -475,6 +498,7 @@ impl App {
             if last_tick.elapsed() >= tick_rate {
                 self.tick = self.tick.wrapping_add(1);
                 self.refresh_snapshot();
+                self.drain_toast_channel();
                 self.expire_toast();
                 last_tick = Instant::now();
             }
@@ -484,6 +508,19 @@ impl App {
 
     fn refresh_snapshot(&mut self) {
         self.snapshot = Arc::new(self.deck.status());
+    }
+
+    /// Drain any toasts queued by detached dispatch tasks; the
+    /// most recent message wins (matches `set_toast`'s "latest
+    /// action overwrites" rule).
+    fn drain_toast_channel(&mut self) {
+        let mut latest: Option<String> = None;
+        while let Ok(msg) = self.toast_rx.try_recv() {
+            latest = Some(msg);
+        }
+        if let Some(msg) = latest {
+            self.set_toast(msg);
+        }
     }
 
     /// 3-second decay on toast messages so a confirmation
@@ -2143,48 +2180,70 @@ impl App {
     }
 
     /// Spawn a tokio task that fires the SDK call corresponding
-    /// to the confirmed action. Fire-and-forget — the result
-    /// surfaces in the snapshot's audit ring on the next tick.
+    /// to the confirmed action. Routine admin failures surface
+    /// as a footer toast; ICE failures additionally surface
+    /// through the audit ring via `dispatch_ice`.
     fn dispatch_confirm(&self, action: crate::widgets::confirm::ConfirmAction) {
         let deck = Arc::clone(&self.deck);
+        let toast_tx = self.toast_tx.clone();
         tokio::spawn(async move {
             use crate::widgets::confirm::ConfirmAction;
+            let report_routine = |kind: &str, res: Result<_, _>| {
+                if let Err(err) = res {
+                    let _ = toast_tx.send(format!("{kind} failed — {err}"));
+                }
+            };
             match action {
                 ConfirmAction::RestartAllDaemons { node, .. } => {
-                    let _ = deck.admin().restart_all_daemons(node).await;
+                    report_routine(
+                        "restart_all_daemons",
+                        deck.admin().restart_all_daemons(node).await,
+                    );
                 }
                 ConfirmAction::Cordon { node, .. } => {
-                    let _ = deck.admin().cordon(node).await;
+                    report_routine("cordon", deck.admin().cordon(node).await);
                 }
                 ConfirmAction::Uncordon { node, .. } => {
-                    let _ = deck.admin().uncordon(node).await;
+                    report_routine("uncordon", deck.admin().uncordon(node).await);
                 }
                 ConfirmAction::Drain {
                     node, drain_for, ..
                 } => {
-                    let _ = deck.admin().drain(node, drain_for).await;
+                    report_routine("drain", deck.admin().drain(node, drain_for).await);
                 }
                 ConfirmAction::EnterMaintenance {
                     node, drain_for, ..
                 } => {
-                    let _ = deck.admin().enter_maintenance(node, drain_for).await;
+                    report_routine(
+                        "enter_maintenance",
+                        deck.admin().enter_maintenance(node, drain_for).await,
+                    );
                 }
                 ConfirmAction::ExitMaintenance { node, .. } => {
-                    let _ = deck.admin().exit_maintenance(node).await;
+                    report_routine(
+                        "exit_maintenance",
+                        deck.admin().exit_maintenance(node).await,
+                    );
                 }
                 ConfirmAction::ClearAvoidList { node, .. } => {
-                    let _ = deck.admin().clear_avoid_list(node).await;
+                    report_routine(
+                        "clear_avoid_list",
+                        deck.admin().clear_avoid_list(node).await,
+                    );
                 }
                 ConfirmAction::InvalidatePlacement { node, .. } => {
-                    let _ = deck.admin().invalidate_placement(node).await;
+                    report_routine(
+                        "invalidate_placement",
+                        deck.admin().invalidate_placement(node).await,
+                    );
                 }
                 ConfirmAction::IceFreezeCluster { ttl, .. } => {
                     let proposal = deck.ice().freeze_cluster(ttl);
-                    dispatch_ice(&deck, proposal).await;
+                    dispatch_ice(&deck, proposal, "freeze_cluster", toast_tx.clone()).await;
                 }
                 ConfirmAction::IceThawCluster { .. } => {
                     let proposal = deck.ice().thaw_cluster();
-                    dispatch_ice(&deck, proposal).await;
+                    dispatch_ice(&deck, proposal, "thaw_cluster", toast_tx.clone()).await;
                 }
                 ConfirmAction::IceForceRestartDaemon {
                     daemon_id,
@@ -2196,28 +2255,31 @@ impl App {
                         name: daemon_name,
                     };
                     let proposal = deck.ice().force_restart_daemon(daemon_ref);
-                    dispatch_ice(&deck, proposal).await;
+                    dispatch_ice(&deck, proposal, "force_restart_daemon", toast_tx.clone()).await;
                 }
                 ConfirmAction::DropReplicas { node, chains, .. } => {
-                    let _ = deck.admin().drop_replicas(node, chains).await;
+                    report_routine(
+                        "drop_replicas",
+                        deck.admin().drop_replicas(node, chains).await,
+                    );
                 }
                 ConfirmAction::IceFlushAvoidLists { .. } => {
                     let proposal = deck
                         .ice()
                         .flush_avoid_lists(net_sdk::deck::AvoidScope::Global);
-                    dispatch_ice(&deck, proposal).await;
+                    dispatch_ice(&deck, proposal, "flush_avoid_lists", toast_tx.clone()).await;
                 }
                 ConfirmAction::IceKillMigration { migration, .. } => {
                     let proposal = deck.ice().kill_migration(migration);
-                    dispatch_ice(&deck, proposal).await;
+                    dispatch_ice(&deck, proposal, "kill_migration", toast_tx.clone()).await;
                 }
                 ConfirmAction::IceForceEvictReplica { chain, victim, .. } => {
                     let proposal = deck.ice().force_evict_replica(chain, victim);
-                    dispatch_ice(&deck, proposal).await;
+                    dispatch_ice(&deck, proposal, "force_evict_replica", toast_tx.clone()).await;
                 }
                 ConfirmAction::IceForceCutover { chain, target, .. } => {
                     let proposal = deck.ice().force_cutover(chain, target);
-                    dispatch_ice(&deck, proposal).await;
+                    dispatch_ice(&deck, proposal, "force_cutover", toast_tx.clone()).await;
                 }
             }
         });
