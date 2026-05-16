@@ -167,7 +167,7 @@ fn render_section(frame: &mut Frame<'_>, area: Rect, title: &str, bindings: &[Bi
     let mut lines: Vec<Line> = Vec::with_capacity(bindings.len() + 1);
     lines.push(Line::from(vec![Span::styled(
         format!("── {title} ──"),
-        theme::chrome(),
+        theme::text(),
     )]));
     for b in bindings {
         lines.push(Line::from(vec![
