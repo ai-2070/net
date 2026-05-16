@@ -105,6 +105,13 @@ dataforts = ["net/dataforts"]
 # own `meshdb` feature (Phase A of `MESHDB_PLAN.md`); this
 # flag composes against it.
 meshdb = ["net/meshdb"]
+# Testing — in-process multi-node `ClusterHarness` + bridge probes
+# (Mesh → MeshOsRuntime). Powers the deck demo and any integration
+# test that wants real UDP loopback + a real MeshOS snapshot fold
+# across N nodes. See `DECK_DEMO_HARNESS_PLAN.md`. Lives behind a
+# feature flag because the harness is dev-only — never link the
+# scaffolding into a release binary.
+testing = ["meshos"]
 # Everything that runs locally (mesh + storage/state + security +
 # compute + groups, no external transports). The default shape for
 # a single-node or LAN-only deployment.
