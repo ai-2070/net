@@ -274,13 +274,32 @@ fn project_log_records(
         .filter(|r| level_rank(r.level) >= min)
         .filter(|r| needle.is_empty() || record_matches(r, &needle))
     {
-        // The shared `render_event_line` helper produces the
-        // combined `TS  ICON  source  message` shape used by
-        // both LOGS and the NET.MAP MESH.EVENTS panel. Icon +
-        // color encode level + a coarse content category in a
-        // single column, replacing the prior dedicated LEVEL
-        // column.
-        out.push(super::render_event_line(rec));
+        // LOGS-specific layout: `TS LEVEL ICON source message`.
+        // The NET.MAP MESH.EVENTS panel still uses the shared
+        // icon-only `render_event_line` — LOGS gets the
+        // explicit LEVEL chip back because the export format
+        // includes it and operators search by level threshold
+        // here, so the column doubles as a filter readout.
+        let (level_text, level_style) = match rec.level {
+            LogLevel::Debug => ("DEBUG", theme::chrome()),
+            LogLevel::Info => ("INFO ", theme::dim()),
+            LogLevel::Warn => ("WARN ", theme::amber()),
+            LogLevel::Error => ("ERROR", theme::red()),
+            _ => ("?    ", theme::text()),
+        };
+        let (icon, icon_style) = super::event_icon(rec);
+        let source = super::event_source(rec);
+        const SOURCE_PAD: usize = 19;
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("  {}  ", super::fmt_ts_hms_ms(rec.ts_ms)),
+                theme::chrome(),
+            ),
+            Span::styled(format!("{level_text}  "), level_style),
+            Span::styled(format!("{icon} "), icon_style),
+            Span::styled(format!("{source:<SOURCE_PAD$}  "), icon_style),
+            Span::styled(rec.message.clone(), theme::text()),
+        ]));
     }
     out
 }
