@@ -85,6 +85,14 @@ pub fn render(
     let total = bookmarks.len() + 1;
     let cursor = cursor.min(total.saturating_sub(1));
 
+    // Tiny terminal (rows[3].height == 0) would otherwise
+    // window to an empty range and render no entries — bail
+    // out before the loop so the modal's chrome still appears
+    // when there's no room for the list body.
+    if max == 0 {
+        return;
+    }
+
     let half = max / 2;
     let start = cursor.saturating_sub(half);
     let end = (start + max).min(total);

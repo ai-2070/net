@@ -168,6 +168,12 @@ fn peer_lines(
     }
     let cursor = cursor.min(peers.len() - 1);
     // Centered scroll: keep cursor mid-window where possible.
+    // Bail out early on zero-height windows so the math below
+    // doesn't produce an empty range that silently swallows
+    // an otherwise-non-empty peer list.
+    if height == 0 {
+        return Vec::new();
+    }
     let half = height / 2;
     let start = cursor.saturating_sub(half);
     let end = (start + height).min(peers.len());
