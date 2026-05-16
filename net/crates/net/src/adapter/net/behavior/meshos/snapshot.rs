@@ -53,11 +53,18 @@ pub struct MeshOsSnapshot {
     pub avoid_list: BTreeMap<NodeId, AvoidEntrySnapshot>,
     /// This node's own maintenance state.
     pub local_maintenance: MaintenanceStateSnapshot,
-    /// Pending actions (reconcile emitted, executor hasn't
-    /// drained yet). Wrapped in `Arc<[…]>` so consumers
-    /// holding the snapshot past the `ArcSwap` guard can
-    /// clone in O(1) instead of paying a per-element copy.
-    pub pending: std::sync::Arc<[PendingActionSnapshot]>,
+    /// Ring buffer of the last N actions reconcile emitted,
+    /// bounded by `action_queue_capacity`. Entries are NOT
+    /// removed when the executor drains them — there's no
+    /// completion signal back to the loop — so this is "what
+    /// the loop recently asked for," not "what is currently
+    /// in flight." Renamed from `pending` so neither the SDK
+    /// surface nor downstream UIs (Deck status chip,
+    /// dashboards) mislabel the count as live in-flight work.
+    /// Wrapped in `Arc<[…]>` so consumers holding the
+    /// snapshot past the `ArcSwap` guard can clone in O(1)
+    /// instead of paying a per-element copy.
+    pub recently_emitted: std::sync::Arc<[PendingActionSnapshot]>,
     /// Ring buffer of recent failures (daemon crashes, drain
     /// timeouts, etc.). Stays as a `VecDeque` because the
     /// chain-replay fold mutates this directly (`push_failure`
@@ -692,7 +699,7 @@ impl MeshOsSnapshot {
             },
         };
 
-        let pending: std::sync::Arc<[PendingActionSnapshot]> = pending
+        let recently_emitted: std::sync::Arc<[PendingActionSnapshot]> = pending
             .iter()
             .map(|p| PendingActionSnapshot {
                 id: p.id.0,
@@ -718,7 +725,7 @@ impl MeshOsSnapshot {
             peers,
             avoid_list,
             local_maintenance,
-            pending,
+            recently_emitted,
             recent_failures: recent_failures.iter().cloned().collect(),
             freeze_remaining_ms,
             admin_audit,

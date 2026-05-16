@@ -2233,18 +2233,22 @@ mod tests {
         let _ = task.await;
         let snap = reader.read();
         assert!(
-            !snap.pending.is_empty(),
-            "expected at least one pending action; saw none",
+            !snap.recently_emitted.is_empty(),
+            "expected at least one recently-emitted action; saw none",
         );
         // The latest tick anchors the snapshot's now. Actions
         // emitted in that tick render with age_ms == 0 only when
         // reconcile uses last_tick for emitted_at.
-        let zero_age_count = snap.pending.iter().filter(|p| p.age_ms == 0).count();
+        let zero_age_count = snap
+            .recently_emitted
+            .iter()
+            .filter(|p| p.age_ms == 0)
+            .count();
         assert!(
             zero_age_count >= 1,
             "expected at least one action emitted in the snapshot's tick to render \
-             age_ms == 0 (anchored on last_tick); pending = {:?}",
-            snap.pending,
+             age_ms == 0 (anchored on last_tick); recently_emitted = {:?}",
+            snap.recently_emitted,
         );
     }
 

@@ -31,7 +31,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let peers = peer_summary(&app.snapshot);
     let daemons = daemon_summary(&app.snapshot);
-    let pending = app.snapshot.pending.len();
+    // Substrate's `recently_emitted` is a ring of the last N
+    // reconcile-emitted actions (capped by
+    // `action_queue_capacity`); the executor doesn't signal
+    // completion, so this is NOT a live "in flight" count.
+    // Label the chip honestly so operators read it as "recent
+    // reconcile work," not "currently pending tasks."
+    let recent = app.snapshot.recently_emitted.len();
     let (maint_style, maint_text) = local_maint_summary(&app.snapshot);
 
     // Single-character separator (` · `) compresses spacing vs
@@ -83,13 +89,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ));
     left.push(sep());
 
-    // pending: 0 pending
-    let pending_style = if pending == 0 {
+    // recently emitted: 0 recent
+    let recent_style = if recent == 0 {
         theme::dim()
     } else {
         theme::amber()
     };
-    left.push(Span::styled(format!("{pending} pending"), pending_style));
+    left.push(Span::styled(format!("{recent} recent"), recent_style));
     left.push(sep());
 
     // local maintenance state
