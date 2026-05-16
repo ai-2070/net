@@ -1,0 +1,36 @@
+net/crates/net/deck/src/demo/migrator.rs
+  s_33e8c099a9039e::t_6353c933a5c9a9 145-146
+  s_33e8c099a9039e::t_8a11778211a372 1-24,34,36-65,67-144,147-177
+  s_33e8c099a9039e::t_9f9e308adb4372 25-32
+  s_33e8c099a9039e::t_4c4e99399ab6e7 33,35
+  s_33e8c099a9039e::t_164e213968d0d6 66
+net/crates/net/deck/src/demo/spawn.rs
+  s_33e8c099a9039e::t_47bfdd252f9e65 68-71
+  s_33e8c099a9039e::t_743ff673085b8f 33
+  s_33e8c099a9039e::t_378d66d2d664c8 222-229,235
+net/crates/net/sdk/src/compute.rs
+  s_33e8c099a9039e::t_95156e96b2785b 1656-1658,1660
+  s_33e8c099a9039e::t_03a32a5458fddc 1652-1655,1659,1661-1663
+net/crates/net/sdk/src/testing/cluster.rs
+  s_33e8c099a9039e::t_d2cbdc78a5bd31 340-354,357,359,367
+  s_33e8c099a9039e::t_7a0f9c5358182c 355-356,358
+  s_33e8c099a9039e::t_c8b8f7398bdb72 25-26
+net/crates/net/deck/src/demo/mod.rs
+  s_33e8c099a9039e::t_8cbbbddd127de6 18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "c2e93c91cb34440e64459d24dec060c152e73bba",
+  "prompts": {},
+  "sessions": {
+    "s_33e8c099a9039e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f5bf814-14c4-4dd9-b249-30bbae94726a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
