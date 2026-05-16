@@ -627,6 +627,47 @@ impl App {
         });
     }
 
+    /// Resolve the cursored migration in the MIGRATIONS tab and
+    /// open the Daemon page for the daemon being migrated. The
+    /// daemon may not be in this node's `snapshot.daemons` (the
+    /// substrate folds only locally-supervised daemons, and a
+    /// migration's daemon lives on the source node until
+    /// cutover); we synthesize a minimal placeholder snapshot in
+    /// that case so the operator still gets a useful page —
+    /// identity + the placement edge they can drill into via
+    /// `[Enter]` on the placement row.
+    fn focus_migration_cursored(&mut self) {
+        let Some(m) = self
+            .snapshot
+            .in_flight_migrations
+            .get(self.migration_cursor)
+            .cloned()
+        else {
+            return;
+        };
+        let daemon = if let Some(d) = self.snapshot.daemons.get(&m.daemon_origin) {
+            d.clone()
+        } else {
+            // Placeholder: the daemon is mid-migration and not on
+            // this node. Stamp placement against the source node
+            // (the authoritative copy until cutover) so the page
+            // reads "running on source, migrating to target."
+            // Name carries the daemon's origin hex so the page
+            // header isn't ambiguous against other "(migrating)"
+            // rows the operator may navigate through.
+            net_sdk::deck::DaemonSnapshot {
+                name: format!("(migrating) 0x{:x}", m.daemon_origin),
+                lifecycle: net_sdk::deck::DaemonLifecycleSnapshot::Running,
+                health: None,
+                saturation: 0.0,
+                restart_state: net_sdk::deck::RestartStateSnapshot::Idle,
+                placement: m.source_node,
+                age_ms: m.elapsed_ms,
+            }
+        };
+        self.focus_daemon(m.daemon_origin, daemon);
+    }
+
     /// Resolve the cursored daemon in the flat DAEMONS tab and
     /// open its Daemon page. Mirrors `focus_groups_cursored_daemon`
     /// for the GROUPS lineage view.
@@ -1561,6 +1602,14 @@ impl App {
             }
             KeyCode::Enter if self.current == Tab::Groups => {
                 self.focus_groups_cursored_daemon();
+            }
+            // MIGRATIONS: Enter opens the Daemon page for the
+            // daemon under the cursor, same cross-link pattern as
+            // DAEMONS / GROUPS. Useful for jumping from a stalled
+            // migration row to the daemon's lineage / placement
+            // view without remembering the origin hex.
+            KeyCode::Enter if self.current == Tab::Migrations => {
+                self.focus_migration_cursored();
             }
             // DATAFORTS: cross-link to BLOBS. Operators reading
             // aggregate metrics jump straight to per-chunk
