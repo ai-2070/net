@@ -49,7 +49,7 @@ const ADMIN: &[Binding] = &[
     },
     Binding {
         keys: "d",
-        desc: "NODES: drain (prompts for window)",
+        desc: "NODES / DAEMONS: drain host (prompts for window)",
     },
     Binding {
         keys: "m",
@@ -73,7 +73,7 @@ const ADMIN: &[Binding] = &[
     },
     Binding {
         keys: "r",
-        desc: "GROUPS: restart all daemons (on host)",
+        desc: "DAEMONS / GROUPS: restart all daemons on host",
     },
 ];
 
@@ -92,7 +92,7 @@ const ICE: &[Binding] = &[
     },
     Binding {
         keys: "R",
-        desc: "GROUPS: ICE force-restart (bypass backoff)",
+        desc: "DAEMONS / GROUPS: ICE force-restart (bypass backoff)",
     },
     Binding {
         keys: "K",

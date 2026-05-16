@@ -1619,6 +1619,20 @@ impl App {
             KeyCode::Enter if self.current == Tab::Daemons => {
                 self.focus_daemons_cursored();
             }
+            // DAEMONS row admin actions — mirror the daemon-focus
+            // mode so operators can act without first opening the
+            // Daemon page. `d`/`r` route through the cursored
+            // daemon's host (drain / restart-all); `R` is the
+            // ICE force-restart that targets the daemon itself.
+            KeyCode::Char('d') if self.current == Tab::Daemons => {
+                self.propose_drain_daemon_host();
+            }
+            KeyCode::Char('r') if self.current == Tab::Daemons => {
+                self.propose_restart_all_daemons();
+            }
+            KeyCode::Char('R') if self.current == Tab::Daemons => {
+                self.propose_ice_force_restart_daemon();
+            }
             KeyCode::Enter if self.current == Tab::Groups => {
                 self.focus_groups_cursored_daemon();
             }
@@ -1742,20 +1756,13 @@ impl App {
 
     fn propose_ice_force_restart_daemon(&mut self) {
         use net_sdk::deck::{simulate_ice_proposal, DaemonRef, IceActionProposal};
-        // Daemon focus targets the focused daemon; falls back to
-        // the GROUPS tab cursor when no Daemon page is open.
-        let (daemon_id, daemon_name) = if let Some(focus) = self.daemon_focus.as_ref() {
-            (focus.id, focus.snapshot.name.clone())
-        } else {
-            let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
-            let Some(group) = groups.get(self.groups_cursor.group) else {
-                return;
-            };
-            let Some(member) = group.members.get(self.groups_cursor.member) else {
-                return;
-            };
-            (member.id, member.daemon.name.clone())
+        // Same resolver as `propose_restart_all_daemons`: works
+        // from the Daemon page, the GROUPS lineage view, and
+        // the DAEMONS flat list.
+        let Some((daemon_id, daemon)) = self.cursored_daemon_for_admin() else {
+            return;
         };
+        let daemon_name = daemon.name.clone();
         let action = IceActionProposal::ForceRestartDaemon {
             daemon: DaemonRef {
                 id: daemon_id,
@@ -2329,19 +2336,74 @@ impl App {
     /// Build a restart-all-daemons confirmation for the
     /// cursored daemon's host node. No-op if no daemon is
     /// selected (empty snapshot, etc.).
-    fn propose_restart_all_daemons(&mut self) {
-        // Daemon focus targets its own placement; falls back to
-        // the GROUPS tab cursor when no Daemon page is open.
-        let placement = if let Some(focus) = self.daemon_focus.as_ref() {
-            Some(focus.snapshot.placement)
-        } else {
-            let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
-            groups
+    /// Resolve the daemon the operator's cursor is on for an
+    /// admin action. Priority:
+    ///   1. An open Daemon page (`daemon_focus`).
+    ///   2. The DAEMONS flat-list cursor (when on `Tab::Daemons`).
+    ///   3. The GROUPS lineage-view cursor (when on `Tab::Groups`).
+    ///
+    /// Returns `None` when the operator's context isn't one of
+    /// the above, or when the snapshot has no daemons at the
+    /// resolved index.
+    fn cursored_daemon_for_admin(&self) -> Option<(u64, net_sdk::deck::DaemonSnapshot)> {
+        if let Some(focus) = self.daemon_focus.as_ref() {
+            return Some((focus.id, focus.snapshot.clone()));
+        }
+        let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
+        match self.current {
+            Tab::Daemons => {
+                // DAEMONS tab walks the same flat order
+                // `focus_daemons_cursored` uses.
+                let mut idx = 0usize;
+                for g in &groups {
+                    for m in &g.members {
+                        if idx == self.daemons_cursor {
+                            return Some((m.id, m.daemon.clone()));
+                        }
+                        idx += 1;
+                    }
+                }
+                None
+            }
+            Tab::Groups => groups
                 .get(self.groups_cursor.group)
                 .and_then(|g| g.members.get(self.groups_cursor.member))
-                .map(|m| m.daemon.placement)
+                .map(|m| (m.id, m.daemon.clone())),
+            _ => None,
+        }
+    }
+
+    /// Drain the cursored daemon's host. Opens the same
+    /// ParamInput modal `propose_node_action(Drain)` uses, with
+    /// the daemon's placement node as the target. The substrate
+    /// doesn't model a per-daemon drain; the closest meaningful
+    /// action is "drain the host this daemon runs on," which
+    /// triggers the cluster to migrate all daemons off, this one
+    /// included.
+    fn propose_drain_daemon_host(&mut self) {
+        use crate::widgets::param_input::ParamInputPurpose;
+        let Some((_, daemon)) = self.cursored_daemon_for_admin() else {
+            return;
         };
-        let Some(node) = placement else { return };
+        let node = daemon.placement;
+        let node_display = self.node_display(node);
+        let purpose = ParamInputPurpose::DrainWindow { node, node_display };
+        let buffer = purpose.default_buffer().to_string();
+        self.modal = Some(Modal::ParamInput {
+            purpose,
+            buffer,
+            error: None,
+        });
+    }
+
+    fn propose_restart_all_daemons(&mut self) {
+        // Routes the action to the cursored daemon's host —
+        // works from the Daemon page, the GROUPS lineage view,
+        // and the DAEMONS flat list.
+        let Some((_, daemon)) = self.cursored_daemon_for_admin() else {
+            return;
+        };
+        let node = daemon.placement;
         let node_display = self.node_display(node);
         let daemon_count = self
             .snapshot
