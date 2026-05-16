@@ -1,0 +1,23 @@
+net/crates/net/deck/src/tabs/migrations.rs
+  s_4a2fa2d5f63459::t_d9216fbf34caa3 28
+  s_4a2fa2d5f63459::t_17d7c1e48317fb 53-59,77-80,82-84,99-105,107-118,122-125,127-129,139-146,156-203
+  s_4a2fa2d5f63459::t_254569c5a66fd7 7,17-23
+net/crates/net/deck/src/app.rs
+  s_4a2fa2d5f63459::t_be74bc432ddd71 2552
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "37a9c450c2c15c02de2b5ec43f57395bdb6058b8",
+  "prompts": {},
+  "sessions": {
+    "s_4a2fa2d5f63459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5d060031-ba25-4cac-9cbf-32d9a94cbf0c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
