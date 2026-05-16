@@ -19,7 +19,8 @@ use std::net::SocketAddr;
 
 use crate::mesh::{Mesh, MeshBuilder};
 use crate::meshos::{
-    LoggingDispatcher, MeshOsConfig, MeshOsDaemonSdk, NodeId, RuntimeShutdownError,
+    EntityKeypair, LoggingDispatcher, MeshDaemon, MeshOsConfig, MeshOsDaemonHandle,
+    MeshOsDaemonSdk, NodeId, RuntimeShutdownError,
 };
 
 use super::probes::install_mesh_probes;
@@ -94,6 +95,41 @@ pub struct ClusterNode {
     pub public_key: [u8; 32],
 }
 
+/// One daemon registered against one node by the supervisor.
+/// Holds the underlying `MeshOsDaemonHandle` plus the node-side
+/// metadata callers need to disambiguate which node the daemon
+/// landed on.
+///
+/// The wrapped handle's `Drop` auto-unregisters the daemon if
+/// the caller drops this struct without calling
+/// [`Self::graceful_shutdown`] first; for tests + demos that
+/// matches the lifecycle the SDK already documents.
+pub struct NodeDaemonHandle {
+    /// 0-based index into the harness's `nodes()` slice.
+    pub node_index: usize,
+    /// The Mesh-derived node id the daemon runs on. Stable for
+    /// the daemon's lifetime.
+    pub node_id: NodeId,
+    /// `EntityKeypair::origin_hash()` of the daemon. Used as
+    /// the key the MeshOS registry stores under.
+    pub daemon_id: u64,
+    /// Underlying SDK handle. Owns the per-daemon control
+    /// channel and the unregister-on-drop seam.
+    pub handle: MeshOsDaemonHandle,
+}
+
+impl NodeDaemonHandle {
+    /// Forward to the wrapped `MeshOsDaemonHandle`. Consumes
+    /// self so the auto-unregister-on-drop seam doesn't run a
+    /// second time after the explicit drain completes.
+    pub async fn graceful_shutdown(
+        self,
+        grace: Duration,
+    ) -> Result<(), crate::meshos::SdkError> {
+        self.handle.graceful_shutdown(grace).await
+    }
+}
+
 /// Mid-run health check. Returns counts of nodes whose `Mesh` and
 /// `MeshOsRuntime` views match the expected full-mesh topology.
 #[derive(Clone, Copy, Debug)]
@@ -141,6 +177,13 @@ pub enum ClusterError {
     /// `MeshOsDaemonSdk::shutdown` returned an error.
     #[error("shutdown failed: {0}")]
     Shutdown(String),
+    /// `MeshOsDaemonSdk::register_daemon` returned an error
+    /// during a supervisor call (`spawn_per_node` / `spawn_where`).
+    /// Any prior successful registrations from the same call
+    /// were rolled back via `graceful_shutdown` before this
+    /// error surfaced.
+    #[error("daemon spawn on node[{node_index}] failed: {reason}")]
+    Spawn { node_index: usize, reason: String },
 }
 
 /// Multi-node harness. Hand-rolls N `(Mesh, MeshOsDaemonSdk)`
@@ -381,6 +424,81 @@ impl ClusterHarness {
         }
     }
 
+    /// Register one daemon on every node. `factory` is called
+    /// once per node; each call's `MeshDaemon` is wrapped in a
+    /// fresh `EntityKeypair` and registered against that node's
+    /// `MeshOsDaemonSdk`. Returns a [`NodeDaemonHandle`] per
+    /// successful registration.
+    ///
+    /// **Rollback.** If any registration fails, every prior
+    /// successful registration in the same call is rolled back
+    /// via `graceful_shutdown` (reverse order, ~200 ms grace
+    /// each) before the error is returned. The cluster's other
+    /// state (Mesh sessions, MeshOS runtimes) is untouched.
+    pub async fn spawn_per_node<D, F>(
+        &self,
+        factory: F,
+    ) -> Result<Vec<NodeDaemonHandle>, ClusterError>
+    where
+        D: MeshDaemon + 'static,
+        F: Fn() -> D,
+    {
+        self.spawn_where(factory, |_| true).await
+    }
+
+    /// Like [`Self::spawn_per_node`] but only registers on nodes
+    /// for which `predicate` returns `true`. Useful when the
+    /// demo's topology splits responder daemons onto a subset
+    /// of the cluster (e.g., 2 of 5 nodes serve nRPC).
+    pub async fn spawn_where<D, F, P>(
+        &self,
+        factory: F,
+        predicate: P,
+    ) -> Result<Vec<NodeDaemonHandle>, ClusterError>
+    where
+        D: MeshDaemon + 'static,
+        F: Fn() -> D,
+        P: Fn(&ClusterNode) -> bool,
+    {
+        let rollback_grace = Duration::from_millis(200);
+        let mut spawned: Vec<NodeDaemonHandle> = Vec::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            if !predicate(node) {
+                continue;
+            }
+            let sdk = match node.sdk.as_ref() {
+                Some(sdk) => sdk,
+                None => {
+                    rollback(spawned, rollback_grace).await;
+                    return Err(ClusterError::Spawn {
+                        node_index: i,
+                        reason: "node sdk already shut down".into(),
+                    });
+                }
+            };
+            let daemon = Box::new(factory());
+            let keypair = EntityKeypair::generate();
+            let daemon_id = keypair.origin_hash();
+            match sdk.register_daemon(daemon, keypair) {
+                Ok(handle) => spawned.push(NodeDaemonHandle {
+                    node_index: i,
+                    node_id: node.node_id,
+                    daemon_id,
+                    handle,
+                }),
+                Err(e) => {
+                    let reason = e.to_string();
+                    rollback(spawned, rollback_grace).await;
+                    return Err(ClusterError::Spawn {
+                        node_index: i,
+                        reason,
+                    });
+                }
+            }
+        }
+        Ok(spawned)
+    }
+
     /// Drive a clean shutdown: drains the MeshOsDaemonSdk on
     /// every node (in parallel) and lets the `Mesh` `Drop`
     /// impls release their UDP sockets. Idempotent — calling
@@ -426,6 +544,17 @@ impl Drop for ClusterHarness {
              explicit shutdown — relying on Drop impls. \
              Awaiting `harness.shutdown().await` is the clean path."
         );
+    }
+}
+
+/// Drain a partially-spawned daemon set in reverse order, with
+/// a short grace per handle. Failures during rollback are
+/// swallowed — the original spawn error is what the caller
+/// should see; logging a noisy chain of rollback errors would
+/// drown that signal.
+async fn rollback(handles: Vec<NodeDaemonHandle>, grace: Duration) {
+    for h in handles.into_iter().rev() {
+        let _ = h.handle.graceful_shutdown(grace).await;
     }
 }
 

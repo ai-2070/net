@@ -32,5 +32,7 @@
 pub mod cluster;
 pub mod probes;
 
-pub use cluster::{ClusterConfig, ClusterError, ClusterHarness, ClusterHealth, ClusterNode};
+pub use cluster::{
+    ClusterConfig, ClusterError, ClusterHarness, ClusterHealth, ClusterNode, NodeDaemonHandle,
+};
 pub use probes::{install_mesh_probes, MeshHealthProbe, MeshInventoryProbe, MeshLocalityProbe};
