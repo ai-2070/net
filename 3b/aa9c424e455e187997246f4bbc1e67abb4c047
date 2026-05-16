@@ -1,0 +1,21 @@
+net/crates/net/deck/src/tabs/failures.rs
+  s_46edf7dc333ef6::t_dde7a8035b080c 194-195,200-201
+net/crates/net/deck/src/tabs/audit.rs
+  s_46edf7dc333ef6::t_9e5ae4f5073c38 259-260,266,269-270,272-274,278,280-299
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "3baa9c424e455e187997246f4bbc1e67abb4c047",
+  "prompts": {},
+  "sessions": {
+    "s_46edf7dc333ef6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e145bb62-38ea-4dbe-81cd-e36e7e65c2ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
