@@ -483,15 +483,4 @@ fn kv(k: &'static str, v: String) -> Line<'static> {
     ])
 }
 
-fn format_age(ms: u64) -> String {
-    let s = ms / 1_000;
-    let m = s / 60;
-    let h = m / 60;
-    if h > 0 {
-        format!("{h}h {:02}m", m % 60)
-    } else if m > 0 {
-        format!("{m}m {:02}s", s % 60)
-    } else {
-        format!("{s}s")
-    }
-}
+use super::format_age_ms as format_age;

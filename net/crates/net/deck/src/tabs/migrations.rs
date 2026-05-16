@@ -118,14 +118,4 @@ fn cell_dim(s: &'static str) -> Cell<'static> {
     Cell::from(Span::styled(s, theme::chrome()))
 }
 
-fn format_age(ms: u64) -> String {
-    let s = ms / 1_000;
-    let m = s / 60;
-    if m > 0 {
-        format!("{m}m {:02}s", s % 60)
-    } else if s > 0 {
-        format!("{s}s")
-    } else {
-        format!("{ms}ms")
-    }
-}
+use super::format_age_ms as format_age;
