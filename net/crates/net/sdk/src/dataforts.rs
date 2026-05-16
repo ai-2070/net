@@ -19,7 +19,7 @@
 pub use net::adapter::net::dataforts::{
     evaluate_health_gate, publish_blob_ref, BlobAdapter, BlobInventoryEntry, BlobListOptions,
     BlobMetrics, BlobMetricsSnapshot, BlobRef, HealthGateAction, MeshBlobAdapter,
-    HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
+    DEFAULT_RETENTION_FLOOR, HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
 };
 // `Redex` is the underlying storage handle a `MeshBlobAdapter`
 // is constructed against. Consumers wiring an adapter need

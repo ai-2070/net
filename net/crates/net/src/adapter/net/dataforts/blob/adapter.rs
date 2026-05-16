@@ -292,6 +292,11 @@ pub struct BlobListOptions {
 /// note on [`BlobAdapter::list`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlobInventoryEntry {
+    /// `adapter_id()` of the adapter that produced this entry.
+    /// Multi-adapter deployments surface this so the operator
+    /// can tell which backend holds the chunk; single-adapter
+    /// callers can ignore.
+    pub adapter_id: String,
     /// 64-character lowercase hex of the blob's BLAKE3 content
     /// hash. The canonical id at this granularity.
     pub hash_hex: String,

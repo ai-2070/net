@@ -51,7 +51,7 @@ impl Tab {
             Tab::NetMap => "NET.MAP",
             Tab::List => "LIST",
             Tab::Dataforts => "DATAFORTS",
-            Tab::Daemon => "DAEMON",
+            Tab::Daemon => "DAEMONS",
             Tab::Logs => "LOGS",
             Tab::Audit => "AUDIT",
             Tab::Replicas => "REPLICAS",

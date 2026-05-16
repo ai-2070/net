@@ -1266,6 +1266,7 @@ impl BlobAdapter for MeshBlobAdapter {
             .snapshot()
             .into_iter()
             .map(|(hash, e)| super::adapter::BlobInventoryEntry {
+                adapter_id: self.id.clone(),
                 hash_hex: hex_encode(&hash),
                 refcount: e.refcount,
                 pinned: e.pinned,

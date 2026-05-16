@@ -7,7 +7,7 @@
 //! Read-only. Future slices may add `[D]` drop, `[P]` pin
 //! actions here; today the modal is informational.
 
-use net_sdk::dataforts::BlobInventoryEntry;
+use net_sdk::dataforts::{BlobInventoryEntry, DEFAULT_RETENTION_FLOOR};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -19,7 +19,7 @@ use ratatui::{
 use crate::theme;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, entry: &BlobInventoryEntry) {
-    let modal_area = center(area, 78, 16);
+    let modal_area = center(area, 80, 20);
     frame.render_widget(Clear, modal_area);
 
     let block = Block::default()
@@ -42,16 +42,19 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entry: &BlobInventoryEntry) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // headline
-            Constraint::Length(1), // spacer
-            Constraint::Length(1), // hash full
-            Constraint::Length(1), // refcount + pin
-            Constraint::Length(1), // first seen
-            Constraint::Length(1), // last seen
-            Constraint::Length(1), // spacer
-            Constraint::Length(1), // age line
-            Constraint::Min(0),    // notes
-            Constraint::Length(1), // bindings
+            Constraint::Length(1),  // headline
+            Constraint::Length(1),  // spacer
+            Constraint::Length(1),  // adapter
+            Constraint::Length(1),  // hash full
+            Constraint::Length(1),  // ref + pin
+            Constraint::Length(1),  // first seen
+            Constraint::Length(1),  // last seen
+            Constraint::Length(1),  // spacer
+            Constraint::Length(1),  // age line
+            Constraint::Length(1),  // gc-status line
+            Constraint::Length(1),  // chunk channel
+            Constraint::Min(0),     // notes
+            Constraint::Length(1),  // bindings
         ])
         .split(inner);
 
@@ -76,7 +79,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entry: &BlobInventoryEntry) {
         rows[0],
     );
 
-    frame.render_widget(kv("hash    ", &entry.hash_hex), rows[2]);
+    frame.render_widget(kv("adapter ", &entry.adapter_id), rows[2]);
+    frame.render_widget(kv("hash    ", &entry.hash_hex), rows[3]);
     frame.render_widget(
         kv(
             "ref     ",
@@ -86,22 +90,22 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entry: &BlobInventoryEntry) {
                 if entry.pinned { "  (pinned)" } else { "" }
             ),
         ),
-        rows[3],
-    );
-    frame.render_widget(
-        kv("first   ", &fmt_unix_ms(entry.first_seen_unix_ms)),
         rows[4],
     );
     frame.render_widget(
-        kv("last    ", &fmt_unix_ms(entry.last_seen_unix_ms)),
+        kv("first   ", &fmt_unix_ms(entry.first_seen_unix_ms)),
         rows[5],
+    );
+    frame.render_widget(
+        kv("last    ", &fmt_unix_ms(entry.last_seen_unix_ms)),
+        rows[6],
     );
 
     let now_ms = unix_now_ms();
     let age_first = now_ms.saturating_sub(entry.first_seen_unix_ms);
     let age_last = now_ms.saturating_sub(entry.last_seen_unix_ms);
     let age_line = Line::from(vec![
-        Span::styled("  age   ", theme::chrome()),
+        Span::styled("  age     ", theme::chrome()),
         Span::styled(
             format!(
                 "stored {} ago · last touched {} ago",
@@ -111,21 +115,66 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entry: &BlobInventoryEntry) {
             theme::text(),
         ),
     ]);
-    frame.render_widget(Paragraph::new(age_line), rows[7]);
+    frame.render_widget(Paragraph::new(age_line), rows[8]);
+
+    // GC retention status — pure-logic mirror of
+    // `should_sweep(entry, now, DEFAULT_RETENTION_FLOOR, false)`.
+    // Pinned blobs are protected; live (refcount > 0) ones are
+    // protected; quiescent ones age out and become sweep-
+    // eligible once `age_first >= DEFAULT_RETENTION_FLOOR`.
+    let floor_ms = DEFAULT_RETENTION_FLOOR.as_millis() as u64;
+    let (gc_text, gc_style) = if entry.pinned {
+        ("pinned — protected from GC".to_string(), theme::amber())
+    } else if entry.refcount > 0 {
+        (
+            format!("live ({}× referenced) — protected", entry.refcount),
+            theme::green(),
+        )
+    } else if age_first >= floor_ms {
+        (
+            "quiescent past retention floor — GC-eligible".to_string(),
+            theme::red(),
+        )
+    } else {
+        let until = floor_ms.saturating_sub(age_first);
+        (
+            format!(
+                "quiescent — GC-eligible in {} (retention floor {})",
+                fmt_ms(until),
+                fmt_ms(floor_ms),
+            ),
+            theme::dim(),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  gc      ", theme::chrome()),
+            Span::styled(gc_text, gc_style),
+        ])),
+        rows[9],
+    );
+
+    // Chunk channel is `MeshBlobAdapter`'s internal RedEX
+    // channel for the hash — operators tracing chunk-level
+    // I/O against the adapter's logs grep on this. Computed
+    // here from the hash (matches what the adapter would
+    // derive); no SDK call needed.
+    let channel = format!("blob/{}/{}", &entry.hash_hex[..2], &entry.hash_hex[2..]);
+    frame.render_widget(kv("channel ", &channel), rows[10]);
 
     let notes = Line::from(vec![Span::styled(
-        "  chunk-level granularity (per BlobAdapter::list); logical-blob view needs substrate BlobRef index",
+        "  chunk-level granularity (BlobAdapter::list); logical-blob view needs substrate BlobRef index",
         theme::dim(),
     )]);
-    frame.render_widget(Paragraph::new(notes), rows[8]);
+    frame.render_widget(Paragraph::new(notes), rows[11]);
 
     let bindings = Line::from(vec![
-        Span::styled("[Esc]", theme::dim()),
+        Span::styled("[Esc / Enter]", theme::dim()),
         Span::styled(" close", theme::dim()),
     ]);
     frame.render_widget(
         Paragraph::new(bindings).alignment(Alignment::Center),
-        rows[9],
+        rows[12],
     );
 }
 
