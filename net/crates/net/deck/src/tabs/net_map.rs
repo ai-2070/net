@@ -96,22 +96,25 @@ fn project_live_peers(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
         .collect()
 }
 
-/// Deterministic 2D position for a node id. Two cheap xorshift
-/// hashes seeded from low / high halves; the resulting `(x, y)`
-/// is stable across renders so the graph doesn't jitter.
+/// Deterministic 2D position for a node id. Hashes the full
+/// u64 through splitmix64 (good output distribution on small /
+/// sparse input domains — the demo node ids are all 16-bit, so
+/// a naive `id >> 32` half-split produces zero for every peer
+/// and collapses the y axis). Both halves of the 64-bit output
+/// feed a separate axis, so peers with low-entropy ids still
+/// scatter across the canvas. Stable across renders so the
+/// graph doesn't jitter.
 fn hash_position(id: u64) -> (f64, f64) {
-    let lo = id & 0xffff_ffff;
-    let hi = id >> 32;
-    let mut a = (lo as u32).wrapping_mul(0x9e37_79b9) ^ 0xdead_beef;
-    let mut b = ((hi ^ 0x1234_5678) as u32).wrapping_mul(0x85eb_ca6b) ^ 0xc0ff_ee01;
-    a ^= a >> 16;
-    a = a.wrapping_mul(0x7feb_352d);
-    a ^= a >> 15;
-    b ^= b >> 16;
-    b = b.wrapping_mul(0xa9d6_d4a3);
-    b ^= b >> 15;
-    let x = -70.0 + ((a as f64) / (u32::MAX as f64)) * 140.0;
-    let y = -38.0 + ((b as f64) / (u32::MAX as f64)) * 100.0;
+    let mut s = id.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    s = (s ^ (s >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    s = (s ^ (s >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    s ^= s >> 31;
+    let x_unit = (s as u32) as f64 / u32::MAX as f64;
+    let y_unit = ((s >> 32) as u32) as f64 / u32::MAX as f64;
+    // 90% of canvas extent on each axis to keep labels off
+    // the border. Canvas bounds: x ∈ [-80, 80], y ∈ [-45, 70].
+    let x = -72.0 + x_unit * 144.0;
+    let y = -38.0 + y_unit * 100.0;
     (x, y)
 }
 

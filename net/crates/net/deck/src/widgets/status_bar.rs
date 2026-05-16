@@ -14,7 +14,7 @@ use crate::{app::App, theme};
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
+        .constraints([Constraint::Min(0), Constraint::Length(28)])
         .split(area);
 
     let uptime = app.started.elapsed().as_secs();
@@ -29,51 +29,53 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let pending = app.snapshot.pending.len();
     let (maint_style, maint_text) = local_maint_summary(&app.snapshot);
 
+    // Single-character separator (` · `) compresses spacing vs
+    // the prior triple-space gutters so the whole row fits at
+    // 100 cols even with the cluster chip + version on the
+    // right. Each chip stays self-describing via its label.
+    let sep = || Span::styled(" · ", theme::chrome());
+    let cluster_style = if app.active_cluster == "local" {
+        theme::green_hi()
+    } else {
+        theme::amber()
+    };
+
     let mut left = vec![
         Span::styled("● ", theme::green()),
         Span::styled(mode_text, theme::green_hi()),
-        Span::styled("   ", theme::chrome()),
-        Span::styled("cluster:", theme::chrome()),
-        Span::styled(
-            format!("{}   ", app.active_cluster),
-            if app.active_cluster == "local" {
-                theme::green_hi()
-            } else {
-                theme::amber()
-            },
-        ),
+        sep(),
+        Span::styled(app.active_cluster.clone(), cluster_style),
+        sep(),
     ];
 
-    // peers: 17p ·  14H/2D/0U
+    // peers: 17p 14H/2D/0U
     left.push(Span::styled(format!("{}p ", peers.total), theme::text()));
     left.push(Span::styled(format!("{}H", peers.healthy), theme::green()));
     left.push(Span::styled("/", theme::chrome()));
     left.push(Span::styled(format!("{}D", peers.degraded), theme::amber()));
     left.push(Span::styled("/", theme::chrome()));
     left.push(Span::styled(format!("{}U", peers.unreachable), theme::red()));
-    left.push(Span::styled("   ", theme::chrome()));
+    left.push(sep());
 
-    // daemons: 11d ·  11R/0B/0X (running/backoff/crashloop)
+    // daemons: 11d 11R/0B/0X
     left.push(Span::styled(format!("{}d ", daemons.total), theme::text()));
     left.push(Span::styled(format!("{}R", daemons.running), theme::green()));
     left.push(Span::styled("/", theme::chrome()));
     left.push(Span::styled(format!("{}B", daemons.backing_off), theme::amber()));
     left.push(Span::styled("/", theme::chrome()));
     left.push(Span::styled(format!("{}X", daemons.crash_looping), theme::red()));
-    left.push(Span::styled("   ", theme::chrome()));
+    left.push(sep());
 
     // pending: 0 pending
     let pending_style = if pending == 0 { theme::dim() } else { theme::amber() };
     left.push(Span::styled(format!("{pending} pending"), pending_style));
-    left.push(Span::styled("   ", theme::chrome()));
+    left.push(sep());
 
     // local maintenance state
-    left.push(Span::styled("MAINT: ", theme::chrome()));
     left.push(Span::styled(maint_text, maint_style));
-    left.push(Span::styled("   ", theme::chrome()));
+    left.push(sep());
 
-    left.push(Span::styled("UP: ", theme::chrome()));
-    left.push(Span::styled(format!("{uptime}s"), theme::text()));
+    left.push(Span::styled(format!("{uptime}s"), theme::dim()));
 
     // Version comes from Cargo at compile time and is always
     // accurate. The SHA is opt-in via `DECK_GIT_SHA` (set by a

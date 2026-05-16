@@ -24,7 +24,7 @@ const NAVIGATION: &[Binding] = &[
     Binding { keys: "Enter",     desc: "BLOBS: open blob detail" },
     Binding { keys: "B",         desc: "DATAFORTS: jump to BLOBS" },
     Binding { keys: "Tab / ◂▸",  desc: "cycle tab" },
-    Binding { keys: "j / k",     desc: "cursor down / up" },
+    Binding { keys: "↓ / ↑",     desc: "cursor down / up (also j / k)" },
     Binding { keys: "g / G",     desc: "cursor to top / bottom" },
     Binding { keys: "J / K",     desc: "DAEMON: next / prev group" },
     Binding { keys: "f",         desc: "AUDIT/LOGS: cycle filter (ICE-only or min level)" },
