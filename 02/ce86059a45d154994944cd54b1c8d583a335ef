@@ -1,0 +1,37 @@
+net/crates/net/deck/src/tabs/nodes.rs
+  s_4a2fa2d5f63459::t_a56e083fd43a65 213-221,223
+  s_4a2fa2d5f63459::t_300dab9396cd81 15-40
+  s_4a2fa2d5f63459::t_4ef724caf687bf 128,132-153,155-158
+  s_4a2fa2d5f63459::t_dacbb5ff914003 173-181
+  s_4a2fa2d5f63459::t_7afab35b4f31fd 72,76-88,90-92
+net/crates/net/deck/src/tabs/net_map.rs
+  s_4a2fa2d5f63459::t_c855243a60677d 161-162,167,173-214
+  s_4a2fa2d5f63459::t_c5799d40095210 70,75,82,84
+  s_4a2fa2d5f63459::t_c868137b925b85 34-44,52,63
+net/crates/net/deck/src/app.rs
+  s_4a2fa2d5f63459::t_d635fa4709b9b7 783-807,818
+  s_4a2fa2d5f63459::t_402a136939d760 2565-2569,2577
+  s_4a2fa2d5f63459::t_31521b8536bbb4 1789-1792
+  s_4a2fa2d5f63459::t_5e694ac4545f27 1948-1950
+  s_4a2fa2d5f63459::t_f8f9ee3db59415 2037-2048
+  s_4a2fa2d5f63459::t_0fd5877de3c799 2581-2595
+  s_4a2fa2d5f63459::t_0289d116fbbbb1 1932-1933
+  s_4a2fa2d5f63459::t_526009a78cc6d3 1776-1780
+  s_4a2fa2d5f63459::t_d246854ec91d78 584-595,600
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "02ce86059a45d154994944cd54b1c8d583a335ef",
+  "prompts": {},
+  "sessions": {
+    "s_4a2fa2d5f63459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5d060031-ba25-4cac-9cbf-32d9a94cbf0c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
