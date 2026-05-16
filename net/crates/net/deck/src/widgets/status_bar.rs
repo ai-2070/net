@@ -23,8 +23,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(area);
 
     let uptime = app.started.elapsed().as_secs();
-    let mode_text = if cfg!(feature = "samples") {
-        "LIVE +samples"
+    let mode_text = if cfg!(feature = "demo") {
+        "LIVE +demo"
     } else {
         "LIVE"
     };
