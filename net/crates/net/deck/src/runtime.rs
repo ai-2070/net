@@ -403,7 +403,7 @@ mod samples {
     }
 
     /// Eight synthetic chains spread across the peer fixture
-    /// so the REPLICAS tab has data to render under samples
+    /// so the CHAINS tab has data to render under samples
     /// mode. Holders are drawn from `PEERS`; chains are sized
     /// 2–4 to exercise the over/under/ok column tags. The
     /// last chain is intentionally undersized so the

@@ -56,8 +56,8 @@ const ICE: &[Binding] = &[
     Binding { keys: "A",   desc: "LIST: ICE flush avoid lists (global)" },
     Binding { keys: "R",   desc: "DAEMON: ICE force-restart (bypass backoff)" },
     Binding { keys: "K",   desc: "MIGRATIONS: ICE kill migration" },
-    Binding { keys: "E",   desc: "REPLICAS: ICE force-evict first holder" },
-    Binding { keys: "O",   desc: "REPLICAS: ICE force-cutover (pick target)" },
+    Binding { keys: "E",   desc: "CHAINS: ICE force-evict first holder" },
+    Binding { keys: "O",   desc: "CHAINS: ICE force-cutover (pick target)" },
 ];
 
 const MODAL: &[Binding] = &[

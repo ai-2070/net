@@ -36,13 +36,13 @@ impl Tab {
         [
             Tab::NetMap,
             Tab::List,
-            Tab::Dataforts,
             Tab::Daemon,
-            Tab::Logs,
-            Tab::Replicas,
-            Tab::Migrations,
-            Tab::Failures,
+            Tab::Dataforts,
             Tab::Blobs,
+            Tab::Logs,
+            Tab::Migrations,
+            Tab::Replicas,
+            Tab::Failures,
         ]
     }
 
@@ -54,7 +54,7 @@ impl Tab {
             Tab::Daemon => "DAEMONS",
             Tab::Logs => "LOGS",
             Tab::Audit => "AUDIT",
-            Tab::Replicas => "REPLICAS",
+            Tab::Replicas => "CHAINS",
             Tab::Migrations => "MIGRATIONS",
             Tab::Failures => "FAILURES",
             Tab::Blobs => "BLOBS",
@@ -150,7 +150,7 @@ pub struct App {
     /// bindings (`c` cordon, `C` uncordon, future drain)
     /// target the cursored node.
     pub list_cursor: usize,
-    /// Cursor on the REPLICAS tab — index into the replicas
+    /// Cursor on the CHAINS tab — index into the replicas
     /// map's sorted-by-chain order.
     pub replica_cursor: usize,
     /// Cursor on the MIGRATIONS tab — index into
@@ -664,13 +664,13 @@ impl App {
             // `Tab::all()` will re-shift these.
             KeyCode::Char('1') => self.current = Tab::NetMap,
             KeyCode::Char('2') => self.current = Tab::List,
-            KeyCode::Char('3') => self.current = Tab::Dataforts,
-            KeyCode::Char('4') => self.current = Tab::Daemon,
-            KeyCode::Char('5') => self.current = Tab::Logs,
-            KeyCode::Char('6') => self.current = Tab::Replicas,
+            KeyCode::Char('3') => self.current = Tab::Daemon,
+            KeyCode::Char('4') => self.current = Tab::Dataforts,
+            KeyCode::Char('5') => self.current = Tab::Blobs,
+            KeyCode::Char('6') => self.current = Tab::Logs,
             KeyCode::Char('7') => self.current = Tab::Migrations,
-            KeyCode::Char('8') => self.current = Tab::Failures,
-            KeyCode::Char('9') => self.current = Tab::Blobs,
+            KeyCode::Char('8') => self.current = Tab::Replicas,
+            KeyCode::Char('9') => self.current = Tab::Failures,
             // DAEMON tab navigation. Lowercase keys + arrows
             // walk the member axis (cursor inside the focused
             // group); uppercase keys walk the group axis. `j`/`k`

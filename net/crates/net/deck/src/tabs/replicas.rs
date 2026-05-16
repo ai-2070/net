@@ -1,4 +1,4 @@
-//! REPLICAS tab — projects `snapshot.replicas` as a chain-by-
+//! CHAINS tab — projects `snapshot.replicas` as a chain-by-
 //! chain table. Each row shows the chain id, current holders
 //! as `id.label` chips, desired count, elected leader, and a
 //! health column derived from holder count vs desired.
@@ -39,7 +39,7 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
         .border_style(theme::rule())
         .title(Line::from(vec![
             Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-            Span::styled("REPLICAS", theme::green_hi()),
+            Span::styled("CHAINS", theme::green_hi()),
             Span::styled("    0 chains", theme::chrome()),
         ]));
     let inner = block.inner(area);
@@ -83,7 +83,7 @@ fn render_table(
     let pos = cursor.min(total.saturating_sub(1)) + 1;
     let header_line = Line::from(vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-        Span::styled("REPLICAS", theme::green_hi()),
+        Span::styled("CHAINS", theme::green_hi()),
         Span::styled(
             format!(
                 "    {total} chains · {ok} ok · {under} under · {over} over · {leaderless} leaderless"
