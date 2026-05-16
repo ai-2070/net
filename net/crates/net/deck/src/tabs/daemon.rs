@@ -1,10 +1,11 @@
-use net_sdk::deck::{DaemonLifecycleSnapshot, DaemonSnapshot, MeshOsSnapshot};
+use net_sdk::deck::{DaemonLifecycleSnapshot, DaemonSnapshot, LogLevel, LogRecord, MeshOsSnapshot};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
+use std::collections::{HashMap, VecDeque};
 
 use crate::{
     app::DaemonCursor,
@@ -17,6 +18,8 @@ pub fn render(
     area: Rect,
     snapshot: Option<&MeshOsSnapshot>,
     cursor: DaemonCursor,
+    saturation: &HashMap<u64, VecDeque<f32>>,
+    logs: &[LogRecord],
 ) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -32,7 +35,7 @@ pub fn render(
     if has_groups {
         let groups = groups.unwrap();
         render_list(frame, cols[0], &groups, cursor);
-        render_detail(frame, cols[1], &groups, cursor);
+        render_detail(frame, cols[1], &groups, cursor, saturation, logs);
     } else {
         render_empty_list(frame, cols[0]);
         render_empty_detail(frame, cols[1]);
@@ -240,6 +243,8 @@ fn render_detail(
     area: Rect,
     groups: &[LiveGroup<'_>],
     cursor: DaemonCursor,
+    saturation: &HashMap<u64, VecDeque<f32>>,
+    logs: &[LogRecord],
 ) {
     let Some((group, member)) = groups
         .get(cursor.group)
@@ -264,15 +269,17 @@ fn render_detail(
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8), // facts
-            Constraint::Length(7), // group siblings panel
-            Constraint::Min(0),    // controls
+            Constraint::Length(8),  // facts
+            Constraint::Length(8),  // host saturation
+            Constraint::Min(0),     // log tail
+            Constraint::Length(3),  // controls
         ])
         .split(inner);
 
     render_facts(frame, rows[0], group, member);
-    render_group_panel(frame, rows[1], group, cursor);
-    render_controls(frame, rows[2]);
+    render_saturation(frame, rows[1], member.daemon, saturation);
+    render_log_tail(frame, rows[2], member.id, logs);
+    render_controls(frame, rows[3]);
 }
 
 fn render_facts(
@@ -338,48 +345,208 @@ fn render_facts(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_group_panel(
+/// Host-saturation histogram for the daemon's placement node.
+/// Deck-sampled rolling window (60 ticks ≈ 7s @ 120ms tick). The
+/// data is the substrate's `peer.saturation_trend` scalar — the
+/// same signal backpressure decisions read — so the curve is
+/// honest about being *host* saturation, not per-daemon.
+fn render_saturation(
     frame: &mut Frame<'_>,
     area: Rect,
-    group: &LiveGroup<'_>,
-    cursor: DaemonCursor,
+    daemon: &DaemonSnapshot,
+    saturation: &HashMap<u64, VecDeque<f32>>,
 ) {
-    let (title, accent) = match group.kind {
-        LiveGroupKind::Solo => ("LINEAGE  (no group)", theme::TEXT_DIM),
-        LiveGroupKind::Replica => ("LINEAGE  REPLICA SIBLINGS", theme::GREEN_HI),
-        LiveGroupKind::Fork { .. } => ("LINEAGE  FORK SIBLINGS", theme::AMBER),
-        LiveGroupKind::Standby => ("LINEAGE  STANDBY MEMBERS", theme::CYAN),
-    };
+    let mut title_spans: Vec<Span> = vec![
+        Span::styled(
+            "HOST.SATURATION  ",
+            ratatui::style::Style::default().fg(theme::GREEN_HI),
+        ),
+        Span::styled("node ", theme::chrome()),
+    ];
+    title_spans.extend(nodes::id_spans(&format!("0x{:x}", daemon.placement)));
+    title_spans.push(Span::styled("  · 60 samples", theme::chrome()));
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(theme::rule())
-        .title(Line::from(vec![Span::styled(
-            title,
-            ratatui::style::Style::default().fg(accent),
-        )]));
+        .title(Line::from(title_spans));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut lines: Vec<Line> = Vec::new();
-    for (mi, m) in group.members.iter().enumerate() {
-        let last = mi + 1 == group.members.len();
-        let is_cursor = mi == cursor.member;
-        let connector = if last { "└─ " } else { "├─ " };
-        let cursor_glyph = if is_cursor { "▶" } else { " " };
-        let (glyph, role_text, color) = role_repr(m.role, group.kind);
-        let id_style = if is_cursor { theme::green_hi() } else { theme::text() };
+    let samples: Vec<f32> = saturation
+        .get(&daemon.placement)
+        .map(|q| q.iter().copied().collect())
+        .unwrap_or_default();
+
+    if samples.is_empty() {
+        let lines = vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "  no samples yet — host not in snapshot.peers",
+                theme::chrome(),
+            )]),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    // p50 / p99 / max from the buffer.
+    let mut sorted: Vec<f32> = samples.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p50 = sorted[sorted.len() / 2];
+    let p99 = sorted[(sorted.len() * 99 / 100).min(sorted.len() - 1)];
+    let max = sorted.last().copied().unwrap_or(0.0);
+
+    // Histogram body: render the last N samples as vertical bars
+    // where N matches the inner width. Each bar height ∝ sample.
+    let width = inner.width as usize;
+    let take = samples.len().min(width.max(1));
+    let start = samples.len() - take;
+    let visible = &samples[start..];
+
+    // 5 visual rows for the bar grid, top row is the headline
+    // band of percentile labels, bottom row carries the axis
+    // text. That gives:
+    //   row 0: percentile labels
+    //   row 1..=5: bar grid (5 vertical levels)
+    //   row 6: axis labels
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // percentile chips
+            Constraint::Min(0),    // bars
+            Constraint::Length(1), // axis
+        ])
+        .split(inner);
+
+    // Percentile chips row.
+    let chips = Line::from(vec![
+        Span::styled("  p50 ", theme::chrome()),
+        Span::styled(format!("{p50:.2}"), pressure_style(p50)),
+        Span::styled("   p99 ", theme::chrome()),
+        Span::styled(format!("{p99:.2}"), pressure_style(p99)),
+        Span::styled("   max ", theme::chrome()),
+        Span::styled(format!("{max:.2}"), pressure_style(max)),
+    ]);
+    frame.render_widget(Paragraph::new(chips), rows[0]);
+
+    // Bar grid. Each column = one sample; each row = a 1/H slice
+    // of the [0,1] saturation range, top row representing
+    // saturation ≥ (H-1)/H.
+    let h = rows[1].height as usize;
+    if h > 0 {
+        let mut grid_lines: Vec<Line> = Vec::with_capacity(h);
+        for row_idx in 0..h {
+            let level = (h - row_idx) as f32 / h as f32; // top row → 1.0, bottom → 1/h
+            let mut spans: Vec<Span> = Vec::with_capacity(take + 1);
+            spans.push(Span::raw(""));
+            for v in visible.iter().copied() {
+                let cell = if v >= level {
+                    Span::styled("█", pressure_style(v))
+                } else {
+                    Span::raw(" ")
+                };
+                spans.push(cell);
+            }
+            grid_lines.push(Line::from(spans));
+        }
+        frame.render_widget(Paragraph::new(grid_lines), rows[1]);
+    }
+
+    // Axis row: 0 ........ 0.5 ........ 1.0, scaled to width.
+    let axis_w = rows[2].width as usize;
+    let mut axis = String::with_capacity(axis_w);
+    for i in 0..axis_w {
+        if i == 0 {
+            axis.push_str("0.0");
+        } else if i == axis_w / 2 {
+            axis.push_str("0.5");
+        } else if i + 3 == axis_w {
+            axis.push_str("1.0");
+        } else {
+            axis.push(' ');
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(axis, theme::chrome()))),
+        rows[2],
+    );
+}
+
+fn pressure_style(v: f32) -> ratatui::style::Style {
+    if v >= 0.85 {
+        theme::red()
+    } else if v >= 0.65 {
+        theme::amber()
+    } else {
+        ratatui::style::Style::default().fg(theme::GREEN_HI)
+    }
+}
+
+/// Tail of log lines scoped to the cursored daemon. Pulls from
+/// the deck's streaming `LogsTail` (filter by `daemon_id`) and
+/// renders the most recent N lines.
+fn render_log_tail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    daemon_id: u64,
+    logs: &[LogRecord],
+) {
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(theme::rule())
+        .title(Line::from(vec![
+            Span::styled(
+                "LOG.TAIL  ",
+                ratatui::style::Style::default().fg(theme::GREEN_HI),
+            ),
+            Span::styled(format!("daemon {}", short_id(daemon_id)), theme::cyan()),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let filtered: Vec<&LogRecord> = logs
+        .iter()
+        .filter(|r| r.daemon_id == Some(daemon_id))
+        .collect();
+    if filtered.is_empty() {
+        let lines = vec![Line::from(vec![Span::styled(
+            "  no log lines for this daemon yet",
+            theme::chrome(),
+        )])];
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+    let take = (inner.height as usize).max(1);
+    let start = filtered.len().saturating_sub(take);
+    let mut lines: Vec<Line> = Vec::with_capacity(take);
+    for r in &filtered[start..] {
+        let (level_text, level_style) = match r.level {
+            LogLevel::Error => ("ERROR", theme::red()),
+            LogLevel::Warn => ("WARN ", theme::amber()),
+            LogLevel::Info => ("INFO ", theme::green()),
+            LogLevel::Debug => ("DEBUG", theme::dim()),
+            _ => ("?    ", theme::dim()),
+        };
         lines.push(Line::from(vec![
-            Span::styled(connector, theme::rule()),
-            Span::styled(cursor_glyph, theme::green_hi()),
-            Span::raw(" "),
-            Span::styled(glyph, ratatui::style::Style::default().fg(color)),
-            Span::raw(" "),
-            Span::styled(format!("{:<10}", short_id(m.id)), id_style),
-            Span::raw(" "),
-            Span::styled(role_text, ratatui::style::Style::default().fg(color)),
+            Span::styled(format!("  {}  ", fmt_ts(r.ts_ms)), theme::chrome()),
+            Span::styled(level_text.to_string(), level_style),
+            Span::styled("  ", theme::chrome()),
+            Span::styled(r.message.clone(), theme::text()),
         ]));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn fmt_ts(ts_ms: u64) -> String {
+    // Render as HH:MM:SS.mmm derived from unix-ms. No TZ
+    // conversion — operators correlate against the same clock
+    // the substrate stamps.
+    let total_s = ts_ms / 1000;
+    let ms = ts_ms % 1000;
+    let s = total_s % 60;
+    let m = (total_s / 60) % 60;
+    let h = (total_s / 3600) % 24;
+    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
 }
 
 fn render_controls(frame: &mut Frame<'_>, area: Rect) {
