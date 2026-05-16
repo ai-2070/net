@@ -1329,6 +1329,26 @@ impl App {
             self.on_modal_key(code, mods);
             return;
         }
+        // Drop alphabetic `Char` keypresses carrying an
+        // extended modifier (Ctrl / Alt / Super). Without this
+        // gate an operator's terminal-native readline chord —
+        // `^A` cursor-home, `^D` EOF, `⌥W` word-back, etc. —
+        // matches one of the lowercase / uppercase admin arms
+        // below (every `Char('X')` arm matches regardless of
+        // modifiers). Ctrl-C remains the explicit exception
+        // (quit); everything else routes to a no-op so the
+        // operator's chord does what the terminal expects
+        // rather than firing an admin proposal.
+        if let KeyCode::Char(c) = code {
+            if c.is_ascii_alphabetic()
+                && mods.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                )
+                && !(c == 'c' && mods.contains(KeyModifiers::CONTROL))
+            {
+                return;
+            }
+        }
         // Focused node page: Esc returns to the underlying
         // tab; cursor + tab-switch keys still work so the
         // operator can navigate back without explicitly
