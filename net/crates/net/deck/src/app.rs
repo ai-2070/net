@@ -249,6 +249,12 @@ pub enum Modal {
     /// shift the body. Dismissed with the usual `Esc` / `q`.
     BlobDetail {
         entry: net_sdk::dataforts::BlobInventoryEntry,
+        /// Node hosting this blob. Threaded in so the modal can
+        /// label the holder and `[Enter]` can jump straight to
+        /// the NODE page for it. Always the local datafort
+        /// (`0x0001`) today — BLOBS sources from local adapters.
+        host_id: u64,
+        host_label: Option<&'static str>,
     },
     /// Export confirmation — pops after `[e]` lands a file
     /// on disk so the operator sees the resolved path before
@@ -417,6 +423,105 @@ impl App {
         }
     }
 
+    /// Open the NODE page on `host_id`. Used by the blob-detail
+    /// modal's `[Enter]` so an operator inspecting a chunk can
+    /// jump straight to the host node. Mirrors `focus_node` but
+    /// takes an explicit id rather than a peer-index — the host
+    /// is often the local node, which doesn't live in
+    /// `snapshot.peers`.
+    fn focus_host(&mut self, host_id: u64, host_label: Option<&'static str>) {
+        if host_id == 0x0001 {
+            // Synthesize a PeerSnapshot for the local node (same
+            // as `focus_datafort` for the local datafort).
+            let local = self.local_datafort();
+            let mut caps = std::collections::BTreeSet::new();
+            for c in &local.capabilities {
+                caps.insert(c.clone());
+            }
+            let peer = net_sdk::deck::PeerSnapshot {
+                health: Some(net_sdk::deck::PeerHealthSnapshot::Healthy),
+                cpu_load_1m: local.cpu_load_1m,
+                mem_used_bytes: local.mem_used_bytes,
+                mem_total_bytes: local.mem_total_bytes,
+                disk_used_bytes: local.disk_used_bytes,
+                disk_total_bytes: local.disk_total_bytes,
+                capability_set: caps,
+                software_version: Some("0.17.0".to_string()),
+                ..Default::default()
+            };
+            self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
+                id: host_id,
+                label: host_label.map(|s| s.to_string()),
+                peer,
+            });
+        } else if let Some((id, peer)) =
+            self.snapshot.peers.iter().find(|(pid, _)| **pid == host_id)
+        {
+            let label = host_label
+                .map(|s| s.to_string())
+                .or_else(|| crate::nodes::label_of(&format!("0x{:x}", *id)).map(|s| s.to_string()));
+            self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
+                id: *id,
+                label,
+                peer: peer.clone(),
+            });
+        }
+    }
+
+    /// Build the DATAFORT view rendered on the NODE page for the
+    /// focused peer. Local datafort gets the full adapter list;
+    /// remote dataforts surface only the aggregate disk + the
+    /// `dataforts.*` cap tags (no remote-adapter probe today).
+    fn datafort_view_for(&self, node_id: u64) -> tabs::node_page::DatafortView {
+        // Local id matches the demo runtime's `this_node`.
+        if node_id == 0x0001 {
+            let adapters: Vec<tabs::node_page::DatafortAdapterRow> = self
+                .blob_adapters
+                .iter()
+                .map(|a| {
+                    let m = a.metrics().snapshot();
+                    tabs::node_page::DatafortAdapterRow {
+                        id: a.adapter_id().to_string(),
+                        disk_used_bytes: m.disk_used_bytes,
+                        disk_capacity_bytes: m.disk_capacity_bytes,
+                        overflow_enabled: a.overflow_enabled(),
+                        overflow_active: m.overflow.active,
+                    }
+                })
+                .collect();
+            let (disk_used, disk_total) =
+                adapters.iter().fold((0u64, 0u64), |(u, t), a| {
+                    (u + a.disk_used_bytes, t + a.disk_capacity_bytes)
+                });
+            let overflow_enabled = adapters.iter().any(|a| a.overflow_enabled);
+            let overflow_active = adapters.iter().any(|a| a.overflow_active);
+            tabs::node_page::DatafortView {
+                is_local: true,
+                disk_used_bytes: Some(disk_used),
+                disk_total_bytes: Some(disk_total),
+                overflow_enabled,
+                overflow_active,
+                adapters,
+            }
+        } else if let Some((_, peer)) =
+            self.snapshot.peers.iter().find(|(id, _)| **id == node_id)
+        {
+            tabs::node_page::DatafortView {
+                is_local: false,
+                disk_used_bytes: peer.disk_used_bytes,
+                disk_total_bytes: peer.disk_total_bytes,
+                overflow_enabled: peer
+                    .capability_set
+                    .iter()
+                    .any(|c| c == "dataforts.blob.overflow"),
+                overflow_active: false,
+                adapters: Vec::new(),
+            }
+        } else {
+            tabs::node_page::DatafortView::default()
+        }
+    }
+
     /// Focus the NODE page on the datafort at `idx` in the
     /// dataforts list. For the local datafort the deck
     /// synthesizes a `PeerSnapshot` from the same view the
@@ -569,8 +674,13 @@ impl App {
             .collect();
         let idx = self.blobs_cursor.min(visible.len().saturating_sub(1));
         if let Some(entry) = visible.get(idx) {
+            // BLOBS sources from the local adapters today, so
+            // every entry's host is `this_node`. When remote
+            // adapter probes land, populate this from the entry.
             self.modal = Some(Modal::BlobDetail {
                 entry: entry.clone(),
+                host_id: 0x0001,
+                host_label: Some("local"),
             });
         }
     }
@@ -1450,9 +1560,13 @@ impl App {
                     Some(Modal::ClusterPicker { cursor }) => {
                         self.commit_cluster_pick(cursor);
                     }
-                    // BlobDetail is informational — Enter just
-                    // closes (same as Esc / q).
-                    Some(Modal::BlobDetail { .. }) => {}
+                    // BlobDetail: Enter opens the NODE page for
+                    // the host (the modal already shows the
+                    // host id.label — Enter is the jump). Esc
+                    // / q close without navigating.
+                    Some(Modal::BlobDetail { host_id, host_label, .. }) => {
+                        self.focus_host(host_id, host_label);
+                    }
                     // ExportDone is informational — Enter closes.
                     Some(Modal::ExportDone { .. }) => {}
                     // ParamInput is intercepted earlier in this
@@ -1770,7 +1884,23 @@ impl App {
         // operator drilled into a peer; the page owns the
         // body until they Esc out.
         if let Some(focus) = self.node_focus.as_ref() {
-            tabs::node_page::render(frame, chunks[3], focus, &self.snapshot);
+            let datafort = if focus
+                .peer
+                .capability_set
+                .iter()
+                .any(|c| c == "dataforts.blob.storage")
+            {
+                Some(self.datafort_view_for(focus.id))
+            } else {
+                None
+            };
+            tabs::node_page::render(
+                frame,
+                chunks[3],
+                focus,
+                &self.snapshot,
+                datafort.as_ref(),
+            );
             widgets::footer::render(
                 frame,
                 chunks[4],
@@ -1938,8 +2068,8 @@ impl App {
                     *cursor,
                 );
             }
-            Some(Modal::BlobDetail { entry }) => {
-                widgets::blob_detail::render(frame, area, entry);
+            Some(Modal::BlobDetail { entry, host_id, host_label }) => {
+                widgets::blob_detail::render(frame, area, entry, *host_id, *host_label);
             }
             Some(Modal::ExportDone { outcome }) => {
                 widgets::export_done::render(frame, area, outcome);

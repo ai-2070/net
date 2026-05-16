@@ -37,36 +37,200 @@ pub struct NodeFocusEntry {
     pub peer: PeerSnapshot,
 }
 
+/// Minimal datafort view rendered on the NODE page when the
+/// focused node advertises `dataforts.blob.storage`. For the
+/// local datafort the deck populates the adapter list; for a
+/// remote datafort the list is empty and the panel shows just
+/// the cap badges (the deck has no remote-adapter probe today).
+#[derive(Clone, Debug, Default)]
+pub struct DatafortView {
+    pub is_local: bool,
+    pub disk_used_bytes: Option<u64>,
+    pub disk_total_bytes: Option<u64>,
+    pub overflow_enabled: bool,
+    pub overflow_active: bool,
+    pub adapters: Vec<DatafortAdapterRow>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DatafortAdapterRow {
+    pub id: String,
+    pub disk_used_bytes: u64,
+    pub disk_capacity_bytes: u64,
+    pub overflow_enabled: bool,
+    pub overflow_active: bool,
+}
+
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
     entry: &NodeFocusEntry,
     live: &MeshOsSnapshot,
+    datafort: Option<&DatafortView>,
 ) {
     // NODE panel grows with the capability tree so a node with
     // deep capability subtrees (sensor.radar.shortwave …) still
     // gets the full tree drawn instead of being clipped. Clamp to
-    // leave at least 6 rows for PLACEMENT below.
+    // leave room for PLACEMENT + the optional DATAFORT section.
     let cap_lines = count_cap_lines(&entry.peer.capability_set);
     let needed = 2 /* borders */ + 6 /* main rows */ + 1 /* spacer */ + cap_lines + 1;
+    let datafort_h: u16 = match datafort {
+        Some(v) if v.is_local && !v.adapters.is_empty() => {
+            // 1 status row + 1 row per adapter + 2 borders
+            (v.adapters.len() as u16 + 3).min(10)
+        }
+        Some(_) => 4, // remote: 2 content rows + 2 borders
+        None => 0,
+    };
     let panel_h = (needed as u16)
         .max(12)
-        .min(area.height.saturating_sub(8));
+        .min(area.height.saturating_sub(8 + datafort_h));
+    let constraints: Vec<Constraint> = if datafort_h > 0 {
+        vec![
+            Constraint::Length(panel_h),     // NODE
+            Constraint::Length(datafort_h),  // DATAFORT
+            Constraint::Min(0),              // PLACEMENT
+            Constraint::Length(2),           // hint row + spacer
+        ]
+    } else {
+        vec![
+            Constraint::Length(panel_h),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ]
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(panel_h), // NODE
-            Constraint::Min(0),          // PLACEMENT
-            Constraint::Length(2),       // hint row + spacer above global footer
-        ])
+        .constraints(constraints)
         .split(area);
     render_peer_panel(frame, rows[0], entry);
-    render_placement_panel(frame, rows[1], entry, live);
-    // Render the hint on the top half of the 2-row footer band
-    // so a blank line sits between [Esc] back and the global
-    // tab/jump/cursor row below.
-    let hint_row = Rect { height: 1, ..rows[2] };
+    let hint_row;
+    if let Some(v) = datafort {
+        render_datafort_panel(frame, rows[1], entry, v);
+        render_placement_panel(frame, rows[2], entry, live);
+        hint_row = Rect { height: 1, ..rows[3] };
+    } else {
+        render_placement_panel(frame, rows[1], entry, live);
+        hint_row = Rect { height: 1, ..rows[2] };
+    }
     render_back_hint(frame, hint_row);
+}
+
+fn render_datafort_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    entry: &NodeFocusEntry,
+    view: &DatafortView,
+) {
+    let (disk_used, disk_total) = match (view.disk_used_bytes, view.disk_total_bytes) {
+        (Some(u), Some(t)) => (u, t),
+        _ => (0u64, 0u64),
+    };
+    let ratio = if disk_total == 0 {
+        0.0
+    } else {
+        (disk_used as f64 / disk_total as f64).clamp(0.0, 1.0)
+    };
+    let pct = (ratio * 100.0) as u16;
+    let bar_color = pressure_color(ratio);
+    let overflow_chip = if view.overflow_active {
+        Span::styled("    ACTIVE", theme::amber())
+    } else if view.overflow_enabled {
+        Span::styled("    enabled", theme::green())
+    } else {
+        Span::styled("    off", theme::dim())
+    };
+    let role = if view.is_local { "local" } else { "remote" };
+    let role_style = if view.is_local { theme::cyan() } else { theme::dim() };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::rule())
+        .title(Line::from(vec![
+            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+            Span::styled("DATAFORT", theme::green_hi()),
+            Span::styled(format!("    {}", role), role_style),
+            Span::styled("    overflow", theme::chrome()),
+            overflow_chip,
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let disk_label = if disk_total > 0 {
+        format!("{} / {}", fmt_bytes(disk_used), fmt_bytes(disk_total))
+    } else {
+        "—".to_string()
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  disk      ", theme::chrome()),
+        bar_span(pct, 16, bar_color),
+        Span::styled(format!("  {pct:>3}%  "), theme::text()),
+        Span::styled(disk_label, theme::dim()),
+    ]));
+
+    if view.is_local {
+        if view.adapters.is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                "  adapters  —",
+                theme::chrome(),
+            )]));
+        } else {
+            for a in &view.adapters {
+                let r = if a.disk_capacity_bytes == 0 {
+                    0.0
+                } else {
+                    (a.disk_used_bytes as f64 / a.disk_capacity_bytes as f64).clamp(0.0, 1.0)
+                };
+                let p = (r * 100.0) as u16;
+                let chip = if a.overflow_active {
+                    Span::styled("  ACTIVE", theme::amber())
+                } else if a.overflow_enabled {
+                    Span::styled("  enabled", theme::green())
+                } else {
+                    Span::styled("  off", theme::dim())
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<12}", a.id), theme::text()),
+                    bar_span(p, 12, pressure_color(r)),
+                    Span::styled(format!(" {p:>3}%  ", ), theme::dim()),
+                    Span::styled(
+                        format!(
+                            "{} / {}",
+                            fmt_bytes(a.disk_used_bytes),
+                            fmt_bytes(a.disk_capacity_bytes)
+                        ),
+                        theme::dim(),
+                    ),
+                    chip,
+                ]));
+            }
+        }
+    } else {
+        // Remote: surface the cap tags the peer advertises.
+        let caps: Vec<&String> = entry
+            .peer
+            .capability_set
+            .iter()
+            .filter(|c| c.starts_with("dataforts."))
+            .collect();
+        let chips: Vec<Span> = if caps.is_empty() {
+            vec![Span::styled("  caps      —", theme::chrome())]
+        } else {
+            let mut v = vec![Span::styled("  caps      ", theme::chrome())];
+            let mut first = true;
+            for c in caps {
+                if !first {
+                    v.push(Span::styled("  ·  ", theme::chrome()));
+                }
+                v.push(Span::styled(c.clone(), theme::text()));
+                first = false;
+            }
+            v
+        };
+        lines.push(Line::from(chips));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_back_hint(frame: &mut Frame<'_>, area: Rect) {

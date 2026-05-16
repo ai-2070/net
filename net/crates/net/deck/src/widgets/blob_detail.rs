@@ -18,8 +18,14 @@ use ratatui::{
 
 use crate::theme;
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, entry: &BlobInventoryEntry) {
-    let modal_area = center(area, 80, 20);
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    entry: &BlobInventoryEntry,
+    host_id: u64,
+    host_label: Option<&str>,
+) {
+    let modal_area = center(area, 80, 21);
     frame.render_widget(Clear, modal_area);
 
     let block = Block::default()
@@ -44,6 +50,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entry: &BlobInventoryEntry) {
         .constraints([
             Constraint::Length(1),  // headline
             Constraint::Length(1),  // spacer
+            Constraint::Length(1),  // host
             Constraint::Length(1),  // adapter
             Constraint::Length(1),  // hash full
             Constraint::Length(1),  // ref + pin
@@ -79,8 +86,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entry: &BlobInventoryEntry) {
         rows[0],
     );
 
-    frame.render_widget(kv("adapter ", &entry.adapter_id), rows[2]);
-    frame.render_widget(kv("hash    ", &entry.hash_hex), rows[3]);
+    let host_str = match host_label {
+        Some(l) => format!("0x{host_id:04x}.{l}"),
+        None => format!("0x{host_id:04x}"),
+    };
+    frame.render_widget(kv("host    ", &host_str), rows[2]);
+    frame.render_widget(kv("adapter ", &entry.adapter_id), rows[3]);
+    frame.render_widget(kv("hash    ", &entry.hash_hex), rows[4]);
     frame.render_widget(
         kv(
             "ref     ",
@@ -90,15 +102,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entry: &BlobInventoryEntry) {
                 if entry.pinned { "  (pinned)" } else { "" }
             ),
         ),
-        rows[4],
-    );
-    frame.render_widget(
-        kv("first   ", &fmt_unix_ms(entry.first_seen_unix_ms)),
         rows[5],
     );
     frame.render_widget(
-        kv("last    ", &fmt_unix_ms(entry.last_seen_unix_ms)),
+        kv("first   ", &fmt_unix_ms(entry.first_seen_unix_ms)),
         rows[6],
+    );
+    frame.render_widget(
+        kv("last    ", &fmt_unix_ms(entry.last_seen_unix_ms)),
+        rows[7],
     );
 
     let now_ms = unix_now_ms();
@@ -115,7 +127,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entry: &BlobInventoryEntry) {
             theme::text(),
         ),
     ]);
-    frame.render_widget(Paragraph::new(age_line), rows[8]);
+    frame.render_widget(Paragraph::new(age_line), rows[9]);
 
     // GC retention status — pure-logic mirror of
     // `should_sweep(entry, now, DEFAULT_RETENTION_FLOOR, false)`.
@@ -151,7 +163,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entry: &BlobInventoryEntry) {
             Span::styled("  gc      ", theme::chrome()),
             Span::styled(gc_text, gc_style),
         ])),
-        rows[9],
+        rows[10],
     );
 
     // Chunk channel is `MeshBlobAdapter`'s internal RedEX
@@ -160,21 +172,23 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entry: &BlobInventoryEntry) {
     // here from the hash (matches what the adapter would
     // derive); no SDK call needed.
     let channel = format!("blob/{}/{}", &entry.hash_hex[..2], &entry.hash_hex[2..]);
-    frame.render_widget(kv("channel ", &channel), rows[10]);
+    frame.render_widget(kv("channel ", &channel), rows[11]);
 
     let notes = Line::from(vec![Span::styled(
         "  chunk-level granularity (BlobAdapter::list); logical-blob view needs substrate BlobRef index",
         theme::dim(),
     )]);
-    frame.render_widget(Paragraph::new(notes), rows[11]);
+    frame.render_widget(Paragraph::new(notes), rows[12]);
 
     let bindings = Line::from(vec![
-        Span::styled("[Esc / Enter]", theme::dim()),
+        Span::styled("[Enter]", theme::green_hi()),
+        Span::styled(" open host node    ", theme::dim()),
+        Span::styled("[Esc]", theme::green_hi()),
         Span::styled(" close", theme::dim()),
     ]);
     frame.render_widget(
         Paragraph::new(bindings).alignment(Alignment::Center),
-        rows[12],
+        rows[13],
     );
 }
 
