@@ -123,9 +123,9 @@ pub fn render(
     // the adapter's configured replication factor.
     let replicas_text = match (entry.replicas_observed, entry.replica_target) {
         (Some(o), Some(t)) => {
-            let suffix = if (o as u32) < t {
+            let suffix = if o < t {
                 "  under-replicated"
-            } else if o as u32 == t {
+            } else if o == t {
                 "  at target"
             } else {
                 "  over-replicated"
@@ -137,7 +137,7 @@ pub fn render(
         (None, None) => "—  (replication not governed by substrate)".to_string(),
     };
     let replicas_style = match (entry.replicas_observed, entry.replica_target) {
-        (Some(o), Some(t)) if (o as u32) < t => theme::amber(),
+        (Some(o), Some(t)) if o < t => theme::amber(),
         (Some(_), Some(_)) => theme::green(),
         _ => theme::dim(),
     };

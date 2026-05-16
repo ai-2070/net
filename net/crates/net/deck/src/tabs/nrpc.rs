@@ -42,7 +42,7 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
         frame,
         inner,
         "no nRPC traffic observed yet",
-        "run with --features samples-logs or wire a real nRPC observer",
+        "enable the nRPC sample injector or wire a real nRPC observer",
     );
 }
 
