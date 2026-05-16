@@ -172,6 +172,13 @@ impl BookmarkStore {
     /// Write the store back to its backing path. Creates parent
     /// directories if missing. No-op when the store was
     /// constructed via [`empty`] (no path).
+    ///
+    /// Writes are atomic: the encoded TOML lands in a sibling
+    /// `.tmp` file first, then renames over the destination.
+    /// A crash mid-write leaves either the prior content intact
+    /// (rename never happened) or the new content fully in
+    /// place — never a half-written file the next `load()`
+    /// reports as `Parse(...)`.
     pub fn save(&self) -> Result<(), BookmarkError> {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
@@ -187,8 +194,19 @@ impl BookmarkStore {
         };
         let text =
             toml::to_string_pretty(&file).map_err(|e| BookmarkError::Serialize(e.to_string()))?;
-        std::fs::write(path, text)
-            .map_err(|e| BookmarkError::Io(format!("write {}: {e}", path.display())))?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, text)
+            .map_err(|e| BookmarkError::Io(format!("write {}: {e}", tmp.display())))?;
+        std::fs::rename(&tmp, path).map_err(|e| {
+            // Best-effort cleanup so a failed rename doesn't
+            // leave a stray .tmp around forever.
+            let _ = std::fs::remove_file(&tmp);
+            BookmarkError::Io(format!(
+                "rename {} -> {}: {e}",
+                tmp.display(),
+                path.display()
+            ))
+        })?;
         Ok(())
     }
 
