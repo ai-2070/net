@@ -1,0 +1,20 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_16_DECK_TUI_THIRD_PASS.md
+  s_1154ed76acced2::t_5f6309e57cd21f 124-166
+  s_1154ed76acced2::t_9c9cbf00345457 20-22,28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "b07ef398f1594dd4c20b64fef6cf512d4a1d50f7",
+  "prompts": {},
+  "sessions": {
+    "s_1154ed76acced2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7338ec16-8489-41da-930b-6d502753862d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
