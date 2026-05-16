@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use futures::future::{join_all, try_join_all};
 use std::net::SocketAddr;
 
+use crate::compute::{DaemonRuntime, MeshDaemon as ComputeMeshDaemon};
+use crate::groups::{ReplicaGroup, ReplicaGroupConfig};
 use crate::mesh::{Mesh, MeshBuilder};
 use crate::meshos::{
     EntityKeypair, LoggingDispatcher, MeshDaemon, MeshOsConfig, MeshOsDaemonHandle,
@@ -72,18 +74,25 @@ impl Default for ClusterConfig {
     }
 }
 
-/// Per-node handle in a [`ClusterHarness`]. Owns one `Mesh` and
-/// one `MeshOsDaemonSdk`; consumers register daemons through the
-/// SDK and drive RPC / channel work through the `Mesh`.
+/// Per-node handle in a [`ClusterHarness`]. Owns one `Mesh`, one
+/// `MeshOsDaemonSdk` (state fold / snapshot reader), and one
+/// `DaemonRuntime` (compute surface for `ReplicaGroup` /
+/// `ForkGroup` / `StandbyGroup`). All three share the underlying
+/// `Mesh` handle.
 pub struct ClusterNode {
-    /// The Mesh handle, shared `Arc` so bridge probes can hold
-    /// long-lived clones without invalidating the harness's own
-    /// reference.
+    /// The Mesh handle, shared `Arc` so bridge probes + the
+    /// compute `DaemonRuntime` can hold long-lived clones
+    /// without invalidating the harness's own reference.
     pub mesh: Arc<Mesh>,
     /// MeshOS daemon SDK. Wrapped in `Option` so
     /// [`ClusterHarness::shutdown`] can take it out and drive an
     /// owning `sdk.shutdown().await`. None after shutdown.
     pub sdk: Option<MeshOsDaemonSdk>,
+    /// Compute-surface daemon runtime. Owns the group / migration
+    /// primitives that operate on `Arc<Mesh>` directly rather
+    /// than through the MeshOS state fold. Same lifecycle as
+    /// `sdk` — taken out during shutdown.
+    pub daemon_runtime: Option<DaemonRuntime>,
     /// Local UDP bind address (the kernel-assigned ephemeral
     /// port). Useful for cross-checking the harness's expected
     /// peer topology.
@@ -300,6 +309,22 @@ impl ClusterHarness {
             m.start();
         }
 
+        // (4a) Each node announces a baseline (empty) capability
+        //      set so every peer's CapabilityIndex registers an
+        //      entry for it. `Scheduler::place_with_spread`
+        //      reads from that index, so this is the
+        //      prerequisite for `spawn_replica_group` /
+        //      `place_with_spread` to find > 1 candidate. An
+        //      empty set still announces presence (the wire
+        //      record carries node_id + entity_id + version).
+        for m in meshes.iter() {
+            m.announce_capabilities(crate::capabilities::CapabilitySet::new())
+                .await
+                .map_err(|e| {
+                    ClusterError::MeshBuild(format!("announce_capabilities: {e}"))
+                })?;
+        }
+
         // (5) Build N MeshOsDaemonSdk instances. Each is wired
         //     to the matching Mesh's node_id so the MeshOS layer
         //     keys daemons + peers under the same id space the
@@ -328,9 +353,19 @@ impl ClusterHarness {
                 Arc::clone(mesh),
                 Arc::clone(&expected_peers),
             );
+            // (6a) Build the compute-surface DaemonRuntime on the
+            //      same Mesh. `register_factory` calls can land
+            //      here once `start()` flips Registering→Ready.
+            let daemon_runtime = DaemonRuntime::new(Arc::clone(mesh));
+            daemon_runtime.start().await.map_err(|e| {
+                ClusterError::MeshBuild(format!(
+                    "daemon_runtime.start() on node[{i}]: {e}"
+                ))
+            })?;
             nodes.push(ClusterNode {
                 mesh: Arc::clone(mesh),
                 sdk: Some(sdk),
+                daemon_runtime: Some(daemon_runtime),
                 local_addr,
                 node_id,
                 public_key,
@@ -511,6 +546,18 @@ impl ClusterHarness {
             return Ok(());
         }
         self.shutdown_called = true;
+        // Drain the compute DaemonRuntimes first — they ride on
+        // the same `Mesh` as the MeshOS SDKs, and tearing them
+        // down before the SDK shutdown reduces the chance of a
+        // task referring to a Mesh that's about to be dropped.
+        let runtimes: Vec<DaemonRuntime> = self
+            .nodes
+            .iter_mut()
+            .filter_map(|n| n.daemon_runtime.take())
+            .collect();
+        for rt in &runtimes {
+            let _ = rt.shutdown().await;
+        }
         let sdks: Vec<MeshOsDaemonSdk> = self
             .nodes
             .iter_mut()
@@ -525,6 +572,52 @@ impl ClusterHarness {
             r.map_err(|e: RuntimeShutdownError| ClusterError::Shutdown(format!("{e:?}")))?;
         }
         Ok(())
+    }
+
+    /// Register a factory and spawn a `ReplicaGroup` against the
+    /// chosen anchor node's `DaemonRuntime`. The replica group
+    /// uses `Scheduler::place_with_spread` against the live
+    /// capability index — populated by Phase 0's
+    /// `announce_capabilities` step — so member placement is
+    /// real (not synthetic).
+    ///
+    /// `anchor_index` chooses which node hosts the group's
+    /// coordinator state; member daemons may land on remote
+    /// nodes depending on placement. For the deck demo this is
+    /// node[0]; tests can pick another to exercise the spread.
+    pub fn spawn_replica_group<D, F>(
+        &self,
+        anchor_index: usize,
+        kind: &str,
+        factory: F,
+        config: ReplicaGroupConfig,
+    ) -> Result<ReplicaGroup, ClusterError>
+    where
+        D: ComputeMeshDaemon + 'static,
+        F: Fn() -> D + Send + Sync + 'static,
+    {
+        let anchor = self.nodes.get(anchor_index).ok_or_else(|| ClusterError::Spawn {
+            node_index: anchor_index,
+            reason: "anchor_index out of range".into(),
+        })?;
+        let rt = anchor.daemon_runtime.as_ref().ok_or_else(|| ClusterError::Spawn {
+            node_index: anchor_index,
+            reason: "anchor node has no daemon runtime".into(),
+        })?;
+        // `register_factory` is idempotent only within the same
+        // kind+closure — re-registering with a fresh closure
+        // fails. Tests that call `spawn_replica_group` twice
+        // with different kinds are fine; same-kind tests must
+        // tear down the prior group first.
+        rt.register_factory(kind, move || Box::new(factory()))
+            .map_err(|e| ClusterError::Spawn {
+                node_index: anchor_index,
+                reason: format!("register_factory({kind}): {e:?}"),
+            })?;
+        ReplicaGroup::spawn(rt, kind, config).map_err(|e| ClusterError::Spawn {
+            node_index: anchor_index,
+            reason: format!("ReplicaGroup::spawn({kind}): {e:?}"),
+        })
     }
 }
 

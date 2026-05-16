@@ -111,7 +111,12 @@ meshdb = ["net/meshdb"]
 # across N nodes. See `DECK_DEMO_HARNESS_PLAN.md`. Lives behind a
 # feature flag because the harness is dev-only — never link the
 # scaffolding into a release binary.
-testing = ["meshos"]
+#
+# Pulls `groups` so `ClusterHarness::spawn_replica_group` and
+# siblings can compose against the real `ReplicaGroup` /
+# `ForkGroup` / `StandbyGroup` primitives. `groups` transitively
+# brings in `compute`.
+testing = ["meshos", "groups"]
 # Everything that runs locally (mesh + storage/state + security +
 # compute + groups, no external transports). The default shape for
 # a single-node or LAN-only deployment.
