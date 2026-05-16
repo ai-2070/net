@@ -24,6 +24,8 @@ mod error;
 mod meta;
 pub mod rpc;
 #[cfg(feature = "cortex")]
+pub mod rpc_observer;
+#[cfg(feature = "cortex")]
 mod watermark;
 
 #[cfg(feature = "cortex")]
@@ -53,4 +55,9 @@ pub use rpc::{
     FLAG_RPC_STREAMING_RESPONSE, HEADER_NRPC_STREAMING, HEADER_NRPC_STREAMING_CONTINUE,
     HEADER_NRPC_STREAMING_END, HEADER_NRPC_STREAM_WINDOW_INITIAL, MAX_RPC_BODY_LEN,
     MAX_RPC_HEADERS, MAX_RPC_HEADER_NAME_LEN, MAX_RPC_HEADER_VALUE_LEN, MAX_RPC_SERVICE_NAME_LEN,
+};
+#[cfg(feature = "cortex")]
+pub use rpc_observer::{
+    unix_now_ms as rpc_observer_unix_now_ms, RpcCallEvent, RpcCallStatus, RpcDirection,
+    RpcObserver, RpcObserverHandle,
 };

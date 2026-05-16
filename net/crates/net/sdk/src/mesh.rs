@@ -359,6 +359,28 @@ impl Mesh {
         self.node.local_addr()
     }
 
+    /// Install (or clear with `None`) the caller-side nRPC
+    /// observer for this `Mesh`. Fires on every `call_typed`
+    /// completion (success / server error / timeout / transport
+    /// error) with a typed [`crate::mesh_rpc::RpcCallEvent`].
+    /// See `DECK_DEMO_HARNESS_PLAN.md` Missing Item D for the
+    /// design rationale.
+    ///
+    /// Replaces any previously-installed observer.
+    /// Observers run inline on the dispatch task; implementations
+    /// must be cheap (push into a bounded ring / mpsc, not
+    /// block).
+    ///
+    /// v1 fires only `RpcDirection::Outbound`; server-side
+    /// (inbound) firing is a follow-up.
+    #[cfg(feature = "cortex")]
+    pub fn set_rpc_observer(
+        &self,
+        observer: Option<crate::mesh_rpc::RpcObserverHandle>,
+    ) {
+        self.node.set_rpc_observer(observer);
+    }
+
     /// Crate-internal accessor for the underlying `MeshNode`.
     /// Used by `mesh_rpc` to delegate the typed RPC API; not
     /// intended for downstream consumers (the public surface
