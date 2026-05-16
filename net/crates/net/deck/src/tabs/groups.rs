@@ -89,6 +89,11 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, groups: &[LiveGroup<'_>], curs
     let g_pos = cursor.group.min(n_groups.saturating_sub(1));
     let m_total = groups.get(g_pos).map(|g| g.members.len()).unwrap_or(0);
     let m_pos = cursor.member.min(m_total.saturating_sub(1));
+    // Renderable counts: hide the off-by-one "1/0" when a
+    // group is empty / the cluster is empty entirely. Same
+    // shape the FAILURES / BLOBS chips adopted.
+    let g_chip_pos = if n_groups == 0 { 0 } else { g_pos + 1 };
+    let m_chip_pos = if m_total == 0 { 0 } else { m_pos + 1 };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -100,11 +105,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, groups: &[LiveGroup<'_>], curs
                 theme::chrome(),
             ),
             Span::styled(
-                format!(
-                    "    grp {}/{n_groups} · mbr {}/{m_total}",
-                    g_pos + 1,
-                    m_pos + 1
-                ),
+                format!("    grp {g_chip_pos}/{n_groups} · mbr {m_chip_pos}/{m_total}"),
                 theme::dim(),
             ),
         ]));
