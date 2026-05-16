@@ -1666,7 +1666,13 @@ impl MigrationOrchestrator {
                     age_in_phase_ms: record.state.age_in_phase_ms(),
                     snapshot_bytes: record.state.snapshot_size_bytes(),
                     retries: record.state.retry_count(),
-                    buffered_events: record.state.buffered_event_count() as u32,
+                    // Saturate at `u32::MAX` instead of a raw cast.
+                    // The whole point of surfacing this is to flag
+                    // stuck-in-Replay migrations buffering without
+                    // bound; a wrap to a small number would read as
+                    // forward progress when reality is the opposite.
+                    buffered_events: u32::try_from(record.state.buffered_event_count())
+                        .unwrap_or(u32::MAX),
                 }
             })
             .collect()
@@ -2932,5 +2938,26 @@ mod tests {
         assert_eq!(list[0].target_node, 0x2222);
         assert_eq!(list[0].retries, 0);
         assert_eq!(list[0].buffered_events, 0);
+    }
+
+    /// The conversion used at the `list_migrations` call site
+    /// (a raw `as u32` would wrap silently). A stuck-in-Replay
+    /// migration buffering past `u32::MAX` must report
+    /// `u32::MAX`, not a wrapped small number, so operators
+    /// reading the Deck don't mistake overflow for drain.
+    #[test]
+    fn buffered_events_saturates_at_u32_max() {
+        let cast = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        assert_eq!(cast(0), 0);
+        assert_eq!(cast(1), 1);
+        assert_eq!(cast(u32::MAX as usize), u32::MAX);
+        // On 64-bit hosts these are strictly above u32::MAX;
+        // on a hypothetical 32-bit host the saturating
+        // conversion is a no-op and the assertion still
+        // holds.
+        assert_eq!(cast(usize::MAX), u32::MAX);
+        if let Some(overflow) = (u32::MAX as usize).checked_add(1) {
+            assert_eq!(cast(overflow), u32::MAX);
+        }
     }
 }
