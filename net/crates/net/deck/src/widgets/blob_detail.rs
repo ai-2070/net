@@ -170,8 +170,18 @@ pub fn render(
     // channel for the hash — operators tracing chunk-level
     // I/O against the adapter's logs grep on this. Computed
     // here from the hash (matches what the adapter would
-    // derive); no SDK call needed.
-    let channel = format!("blob/{}/{}", &entry.hash_hex[..2], &entry.hash_hex[2..]);
+    // derive); no SDK call needed. Guard the split: a hash
+    // shorter than two hex chars (e.g. an adapter that surfaced
+    // a malformed entry) renders as the literal "n/a" rather
+    // than panicking on the slice — and the split is at a
+    // byte boundary because `hash_hex` is ASCII hex by
+    // construction, but we still check `is_char_boundary` so
+    // a hypothetical non-ASCII row doesn't panic either.
+    let channel = if entry.hash_hex.len() >= 2 && entry.hash_hex.is_char_boundary(2) {
+        format!("blob/{}/{}", &entry.hash_hex[..2], &entry.hash_hex[2..])
+    } else {
+        String::from("blob/?/?")
+    };
     frame.render_widget(kv("channel ", &channel), rows[11]);
 
     let notes = Line::from(vec![Span::styled(
