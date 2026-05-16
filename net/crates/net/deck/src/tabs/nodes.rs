@@ -91,6 +91,15 @@ fn render_live_nodes_table(
     ])
     .height(1);
 
+    // Pre-aggregate daemon → peer placement counts once per
+    // render instead of re-scanning `snapshot.daemons` for
+    // every peer row (was O(peers × daemons) per frame).
+    let mut daemon_counts: std::collections::HashMap<u64, usize> =
+        std::collections::HashMap::with_capacity(snapshot.peers.len());
+    for d in snapshot.daemons.values() {
+        *daemon_counts.entry(d.placement).or_insert(0) += 1;
+    }
+
     let mut table_rows: Vec<Row> = Vec::with_capacity(snapshot.peers.len());
     for (i, (peer_id, p)) in snapshot.peers.iter().enumerate() {
         let is_cursor = i == cursor;
@@ -141,11 +150,7 @@ fn render_live_nodes_table(
         // before the saturation_trend tilts.
         let mem_style = pressure_style(p.mem_used_bytes, p.mem_total_bytes);
         let disk_style = pressure_style(p.disk_used_bytes, p.disk_total_bytes);
-        let daemon_count = snapshot
-            .daemons
-            .values()
-            .filter(|d| d.placement == *peer_id)
-            .count();
+        let daemon_count = daemon_counts.get(peer_id).copied().unwrap_or(0);
         let maint_style;
         let maint_text = match p.maintenance {
             Some(MaintenanceMirrorSnapshot::Active) | None => {
