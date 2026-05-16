@@ -33,6 +33,7 @@ async fn main() -> color_eyre::Result<()> {
     let harness = runtime::spawn().await?;
     let deck = harness.deck();
     let blob_metrics = harness.blob_metrics();
+    let blob_adapter = harness.blob_adapter();
 
     // Phase 4: spawn streaming tails before handing the deck to
     // the App. The handles are kept alive for the App's
@@ -45,6 +46,19 @@ async fn main() -> color_eyre::Result<()> {
     let failures_tail = streams::FailuresTail::new(streams::FAILURES_TAIL_CAP);
     let _failures_stream_task =
         streams::spawn_failures_stream(deck.clone(), failures_tail.clone());
+
+    // BLOBS inventory poller — distinct from the log / audit /
+    // failure streams because `BlobAdapter::list` is one-shot
+    // rather than a stream. Polls every 500 ms when an adapter
+    // is wired; left idle (empty tail) when not.
+    let blobs_tail = streams::BlobsTail::new();
+    let _blobs_poll_task = blob_adapter.as_ref().map(|adapter| {
+        streams::spawn_blobs_poll(
+            adapter.clone(),
+            blobs_tail.clone(),
+            std::time::Duration::from_millis(500),
+        )
+    });
 
     // Bookmark store — loaded from `$XDG_CONFIG_HOME/deck/bookmarks.toml`
     // (or the platform equivalent). A first-run with no config
@@ -63,6 +77,7 @@ async fn main() -> color_eyre::Result<()> {
         audit_tail,
         failures_tail,
         blob_metrics,
+        blobs_tail,
         bookmarks,
     )
     .run(terminal);

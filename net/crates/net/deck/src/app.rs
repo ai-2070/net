@@ -21,10 +21,11 @@ pub enum Tab {
     Replicas,
     Migrations,
     Failures,
+    Blobs,
 }
 
 impl Tab {
-    pub fn all() -> [Tab; 9] {
+    pub fn all() -> [Tab; 10] {
         [
             Tab::NetMap,
             Tab::List,
@@ -35,6 +36,7 @@ impl Tab {
             Tab::Replicas,
             Tab::Migrations,
             Tab::Failures,
+            Tab::Blobs,
         ]
     }
 
@@ -49,6 +51,7 @@ impl Tab {
             Tab::Replicas => "REPLICAS",
             Tab::Migrations => "MIGRATIONS",
             Tab::Failures => "FAILURES",
+            Tab::Blobs => "BLOBS",
         }
     }
 
@@ -98,6 +101,19 @@ pub struct App {
     /// it); `None` when the adapter is unhooked. The DATAFORTS
     /// tab snapshots from this on each render.
     pub blob_metrics: Option<Arc<net_sdk::dataforts::BlobMetrics>>,
+    /// BLOBS inventory tail — periodically refreshed from
+    /// `MeshBlobAdapter::list(...)`. Empty when no adapter is
+    /// wired; the BLOBS tab shows its empty state in that
+    /// case.
+    pub blobs_tail: crate::streams::BlobsTail,
+    /// Cursor on the BLOBS tab — index into the visible
+    /// (filtered) projection of `blobs_tail.snapshot()`.
+    pub blobs_cursor: usize,
+    /// BLOBS substring search. Matches hash prefix; empty =
+    /// no filter.
+    pub blobs_search: String,
+    /// When `true`, keystrokes go into `blobs_search`.
+    pub blobs_search_editing: bool,
     /// Cluster bookmark store — loaded from
     /// `$XDG_CONFIG_HOME/deck/bookmarks.toml` at startup. Used
     /// by the (still-deferred) Multi-Cluster Switcher; holds
@@ -249,6 +265,7 @@ impl App {
         audit_tail: crate::streams::AuditTail,
         failures_tail: crate::streams::FailuresTail,
         blob_metrics: Option<Arc<net_sdk::dataforts::BlobMetrics>>,
+        blobs_tail: crate::streams::BlobsTail,
         bookmarks: crate::bookmarks::BookmarkStore,
     ) -> Self {
         let snapshot = Arc::new(deck.status());
@@ -258,6 +275,10 @@ impl App {
             audit_tail,
             failures_tail,
             blob_metrics,
+            blobs_tail,
+            blobs_cursor: 0,
+            blobs_search: String::new(),
+            blobs_search_editing: false,
             bookmarks,
             should_quit: false,
             started: Instant::now(),
@@ -399,6 +420,23 @@ impl App {
         }
     }
 
+    fn export_blobs(&mut self) {
+        let entries = self.blobs_tail.snapshot();
+        let needle = self.blobs_search.to_ascii_lowercase();
+        let filtered: Vec<_> = entries
+            .iter()
+            .filter(|e| tabs::blobs::record_matches(e, &needle))
+            .cloned()
+            .collect();
+        match crate::widgets::export::write_blobs(&filtered) {
+            Ok(out) => self.set_toast(format!(
+                "wrote {} blob entries → {}",
+                out.count, out.path
+            )),
+            Err(e) => self.set_toast(format!("export failed: {e}")),
+        }
+    }
+
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         // Modal absorbs all input until dismissed.
         if self.modal.is_some() {
@@ -408,7 +446,11 @@ impl App {
         // Search prompts are the second-tier absorber: while a
         // tab's `_editing` flag is set, keystrokes go into that
         // tab's query buffer rather than the normal bindings.
-        if self.logs_search_editing || self.audit_search_editing || self.failures_search_editing {
+        if self.logs_search_editing
+            || self.audit_search_editing
+            || self.failures_search_editing
+            || self.blobs_search_editing
+        {
             self.on_search_key(code);
             return;
         }
@@ -437,6 +479,7 @@ impl App {
             KeyCode::Char('7') => self.current = Tab::Replicas,
             KeyCode::Char('8') => self.current = Tab::Migrations,
             KeyCode::Char('9') => self.current = Tab::Failures,
+            KeyCode::Char('0') => self.current = Tab::Blobs,
             // DAEMON tab navigation. `j`/`k` move within the
             // current group's members; `J`/`K` step to the
             // next / previous group. No-op on other tabs.
@@ -512,6 +555,13 @@ impl App {
             KeyCode::Char('k') if self.current == Tab::Failures => {
                 self.failures_cursor = self.failures_cursor.saturating_sub(1);
             }
+            KeyCode::Char('j') if self.current == Tab::Blobs => {
+                self.blobs_cursor = self.blobs_cursor.saturating_add(1);
+                self.clamp_blobs_cursor();
+            }
+            KeyCode::Char('k') if self.current == Tab::Blobs => {
+                self.blobs_cursor = self.blobs_cursor.saturating_sub(1);
+            }
             // Vim-style top/bottom on every cursor-driven tab.
             // `g` jumps to the first row / group / member; `G`
             // jumps to the last. No-op on tabs without a list.
@@ -563,6 +613,10 @@ impl App {
             KeyCode::Char('/') if self.current == Tab::Failures => {
                 self.failures_search_editing = true;
             }
+            // BLOBS: substring search against the hash hex.
+            KeyCode::Char('/') if self.current == Tab::Blobs => {
+                self.blobs_search_editing = true;
+            }
             // Export the current filtered view to a timestamped
             // file in the cwd. Captures only what would render —
             // operator's filter chips dictate what lands in the
@@ -570,6 +624,7 @@ impl App {
             KeyCode::Char('w') if self.current == Tab::Logs => self.export_logs(),
             KeyCode::Char('w') if self.current == Tab::Audit => self.export_audit(),
             KeyCode::Char('w') if self.current == Tab::Failures => self.export_failures(),
+            KeyCode::Char('w') if self.current == Tab::Blobs => self.export_blobs(),
             KeyCode::Char('n') if self.current == Tab::Audit => {
                 self.audit_limit = match self.audit_limit {
                     None => Some(25),
@@ -737,6 +792,15 @@ impl App {
         }
     }
 
+    fn clamp_blobs_cursor(&mut self) {
+        let n = self.blobs_tail.records.lock().len();
+        if n == 0 {
+            self.blobs_cursor = 0;
+        } else if self.blobs_cursor >= n {
+            self.blobs_cursor = n - 1;
+        }
+    }
+
     /// Absorb a single keypress into the active tab's search
     /// buffer. `Enter` commits (filter stays active), `Esc`
     /// cancels and clears, `Backspace` pops, any printable char
@@ -749,6 +813,8 @@ impl App {
             (&mut self.audit_search, &mut self.audit_search_editing)
         } else if self.failures_search_editing {
             (&mut self.failures_search, &mut self.failures_search_editing)
+        } else if self.blobs_search_editing {
+            (&mut self.blobs_search, &mut self.blobs_search_editing)
         } else {
             return;
         };
@@ -772,6 +838,7 @@ impl App {
             Tab::Replicas => self.replica_cursor = 0,
             Tab::Migrations => self.migration_cursor = 0,
             Tab::Failures => self.failures_cursor = 0,
+            Tab::Blobs => self.blobs_cursor = 0,
             Tab::Daemon => self.daemon_cursor = DaemonCursor::default(),
             _ => {}
         }
@@ -794,6 +861,10 @@ impl App {
             Tab::Failures => {
                 let n = self.failures_tail.records.lock().len();
                 self.failures_cursor = n.saturating_sub(1);
+            }
+            Tab::Blobs => {
+                let n = self.blobs_tail.records.lock().len();
+                self.blobs_cursor = n.saturating_sub(1);
             }
             Tab::Daemon => {
                 let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
@@ -1362,6 +1433,17 @@ impl App {
                     self.failures_cursor,
                     &self.failures_search,
                     self.failures_search_editing,
+                );
+            }
+            Tab::Blobs => {
+                let entries = self.blobs_tail.snapshot();
+                tabs::blobs::render(
+                    frame,
+                    chunks[3],
+                    &entries,
+                    self.blobs_cursor,
+                    &self.blobs_search,
+                    self.blobs_search_editing,
                 );
             }
         }

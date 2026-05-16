@@ -1252,6 +1252,53 @@ impl BlobAdapter for MeshBlobAdapter {
             encoding: blob_ref.encoding(),
         })
     }
+
+    async fn list(
+        &self,
+        opts: &super::adapter::BlobListOptions,
+    ) -> Result<Vec<super::adapter::BlobInventoryEntry>, BlobError> {
+        // Pull a stable snapshot of the refcount table once;
+        // every projected entry derives from this single
+        // sample so the row order + counts agree across
+        // multiple fields on the same iteration.
+        let mut entries: Vec<super::adapter::BlobInventoryEntry> = self
+            .refcount
+            .snapshot()
+            .into_iter()
+            .map(|(hash, e)| super::adapter::BlobInventoryEntry {
+                hash_hex: hex_encode(&hash),
+                refcount: e.refcount,
+                pinned: e.pinned,
+                first_seen_unix_ms: e.first_seen_unix_ms,
+                last_seen_unix_ms: e.last_seen_unix_ms,
+            })
+            .collect();
+        // Apply caller filters in memory — the table doesn't
+        // index by prefix and the typical adapter holds tens
+        // of thousands of entries at most.
+        if let Some(prefix) = opts.prefix_hex.as_deref() {
+            let prefix = prefix.to_ascii_lowercase();
+            entries.retain(|e| e.hash_hex.starts_with(&prefix));
+        }
+        // Most-recently-touched first — operators triaging
+        // an incident want the freshest churn at the top.
+        entries.sort_by(|a, b| b.last_seen_unix_ms.cmp(&a.last_seen_unix_ms));
+        if opts.limit > 0 && entries.len() > opts.limit {
+            entries.truncate(opts.limit);
+        }
+        Ok(entries)
+    }
+}
+
+/// Lowercase-hex render of a 32-byte hash. Inline to avoid a
+/// `hex` crate dependency here; the substrate already has
+/// `blake3::Hash::to_hex` but we hold raw `[u8; 32]` keys.
+fn hex_encode(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 impl MeshBlobAdapter {
@@ -1361,6 +1408,82 @@ mod tests {
         adapter.store(&blob, &payload).await.unwrap();
         let fetched = adapter.fetch(&blob).await.unwrap();
         assert_eq!(fetched, payload);
+    }
+
+    #[tokio::test]
+    async fn list_enumerates_stored_chunks_with_metadata() {
+        use super::super::adapter::BlobListOptions;
+        let adapter = make_adapter();
+        // Store three distinct payloads → three distinct chunk
+        // hashes land in the refcount table via the store path.
+        for payload in [
+            b"blob-one".to_vec(),
+            b"blob-two-other-bytes".to_vec(),
+            b"blob-three-with-still-different".to_vec(),
+        ] {
+            let blob = small_ref_for(&payload);
+            adapter.store(&blob, &payload).await.unwrap();
+        }
+        // No filter → every entry comes back. Sort order is
+        // last-seen-desc; we only assert the set since the
+        // three stores land in the same millisecond on most
+        // hosts.
+        let entries = adapter.list(&BlobListOptions::default()).await.unwrap();
+        assert_eq!(entries.len(), 3, "all three stored chunks should enumerate");
+        for e in &entries {
+            assert_eq!(e.hash_hex.len(), 64, "32-byte hash → 64 hex chars");
+            assert!(e.last_seen_unix_ms > 0);
+            assert!(e.first_seen_unix_ms <= e.last_seen_unix_ms);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_prefix_filter_narrows_to_matching_hash() {
+        use super::super::adapter::BlobListOptions;
+        let adapter = make_adapter();
+        let payload = b"prefix-target".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+        let all = adapter.list(&BlobListOptions::default()).await.unwrap();
+        assert_eq!(all.len(), 1);
+        let prefix = all[0].hash_hex[..4].to_string();
+        let narrowed = adapter
+            .list(&BlobListOptions {
+                prefix_hex: Some(prefix.clone()),
+                limit: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(narrowed.len(), 1);
+        assert!(narrowed[0].hash_hex.starts_with(&prefix));
+        // Bogus prefix → empty result.
+        let empty = adapter
+            .list(&BlobListOptions {
+                prefix_hex: Some("zzz".to_string()),
+                limit: 0,
+            })
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_limit_caps_result_count() {
+        use super::super::adapter::BlobListOptions;
+        let adapter = make_adapter();
+        for i in 0u32..5 {
+            let payload = format!("payload-{i}").into_bytes();
+            let blob = small_ref_for(&payload);
+            adapter.store(&blob, &payload).await.unwrap();
+        }
+        let limited = adapter
+            .list(&BlobListOptions {
+                prefix_hex: None,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 2, "limit caps the result count");
     }
 
     #[tokio::test]

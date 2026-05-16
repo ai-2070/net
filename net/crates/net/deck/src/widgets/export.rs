@@ -13,6 +13,7 @@
 
 use std::io::Write;
 
+use net_sdk::dataforts::BlobInventoryEntry;
 use net_sdk::deck::{
     AdminAuditRecord, AdminEvent, FailureRecord, LogLevel, LogRecord, VerificationOutcome,
 };
@@ -87,6 +88,28 @@ pub fn write_audit(records: &[AdminAuditRecord]) -> Result<ExportResult, ExportE
             "seq={seq:>5}  ts_ms={ts}  {outcome}  op={op}  cmd={cmd}  target={target}",
             seq = rec.seq,
             ts = rec.committed_at_ms,
+        )
+        .map_err(|e| format!("write: {e}"))?;
+        count += 1;
+    }
+    Ok(ExportResult { path, count })
+}
+
+/// Write a slice of BLOBS inventory entries as plain text.
+/// Ordering preserved from the caller's projection.
+pub fn write_blobs(entries: &[BlobInventoryEntry]) -> Result<ExportResult, ExportError> {
+    let path = filename("blobs");
+    let mut f = std::fs::File::create(&path).map_err(|e| format!("create: {e}"))?;
+    let mut count = 0;
+    for e in entries {
+        writeln!(
+            f,
+            "hash={hash}  ref={ref_}  pin={pin}  first_seen_ms={first}  last_seen_ms={last}",
+            hash = e.hash_hex,
+            ref_ = e.refcount,
+            pin = if e.pinned { "1" } else { "0" },
+            first = e.first_seen_unix_ms,
+            last = e.last_seen_unix_ms,
         )
         .map_err(|e| format!("write: {e}"))?;
         count += 1;

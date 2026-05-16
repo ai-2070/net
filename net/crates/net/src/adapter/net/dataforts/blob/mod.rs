@@ -42,7 +42,7 @@ pub(crate) fn hex32(hash: &[u8; 32]) -> String {
     s
 }
 
-pub use adapter::{BlobAdapter, BlobStat};
+pub use adapter::{BlobAdapter, BlobInventoryEntry, BlobListOptions, BlobStat};
 pub use admission::{
     auth_allows_blob_op, should_migrate_blob_to, should_pull_blob, MigrateBlobReject,
     MigrateBlobVerdict, PullBlobReject, PullBlobVerdict,

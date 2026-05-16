@@ -16,6 +16,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use futures::StreamExt;
+use net_sdk::dataforts::{BlobAdapter, BlobInventoryEntry, BlobListOptions, MeshBlobAdapter};
 use net_sdk::deck::{AdminAuditRecord, DeckClient, FailureRecord, LogFilter, LogRecord};
 use parking_lot::Mutex;
 
@@ -186,6 +187,77 @@ pub fn spawn_failures_stream(
             match item {
                 Ok(record) => tail.push(record),
                 Err(_err) => continue,
+            }
+        }
+    })
+}
+
+/// Cap on the BLOBS inventory snapshot the deck renders. The
+/// adapter's full set may exceed this; the cap bounds memory
+/// + render cost at the cost of truncating to most-recently-
+/// touched entries first.
+pub const BLOBS_TAIL_CAP: usize = 5_000;
+
+/// BLOBS inventory tail. Distinct from the log / audit /
+/// failure tails because the source isn't a `Stream` —
+/// `BlobAdapter::list` is a one-shot query. The spawned task
+/// re-polls on a fixed cadence and overwrites the cached
+/// snapshot. App reads via [`Self::snapshot`].
+#[derive(Clone)]
+pub struct BlobsTail {
+    pub records: Arc<Mutex<Vec<BlobInventoryEntry>>>,
+}
+
+impl BlobsTail {
+    pub fn new() -> Self {
+        Self {
+            records: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Copy the current inventory into a flat Vec for the
+    /// render path. Brief lock; never held across an await.
+    pub fn snapshot(&self) -> Vec<BlobInventoryEntry> {
+        self.records.lock().clone()
+    }
+
+    /// Overwrite the cached inventory with a fresh poll. Used
+    /// by [`spawn_blobs_poll`].
+    fn replace(&self, entries: Vec<BlobInventoryEntry>) {
+        *self.records.lock() = entries;
+    }
+}
+
+impl Default for BlobsTail {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Spawn the BLOBS inventory poller. Polls `adapter.list(...)`
+/// every `poll_interval`; updates the cached snapshot via
+/// [`BlobsTail::replace`]. Cancelled when the returned handle
+/// is dropped.
+pub fn spawn_blobs_poll(
+    adapter: Arc<MeshBlobAdapter>,
+    tail: BlobsTail,
+    poll_interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(poll_interval);
+        // Skip the immediate tick — the spawn-time call below
+        // covers the cold path; the interval ticks for the
+        // refresh cadence after that.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let opts = BlobListOptions {
+                prefix_hex: None,
+                limit: BLOBS_TAIL_CAP,
+            };
+            match adapter.list(&opts).await {
+                Ok(entries) => tail.replace(entries),
+                Err(_) => continue,
             }
         }
     })

@@ -233,4 +233,80 @@ pub trait BlobAdapter: Send + Sync + 'static {
             ..Default::default()
         })
     }
+
+    /// Enumerate blob chunks the adapter has observed. Powers
+    /// the operator-facing "Blob & Artifact Explorer" surface
+    /// (`DECK_PLAN.md` § Deferred work § Blob & Artifact
+    /// Explorer) — adapters that can cheaply enumerate (Mesh,
+    /// fs) override; adapters with prohibitive enumeration
+    /// cost (S3 with millions of keys, IPFS) leave the default
+    /// "empty" so consumers don't accidentally rack up backend
+    /// charges.
+    ///
+    /// The default returns an empty vec rather than an error
+    /// because "this adapter doesn't enumerate" is a normal
+    /// answer, not a failure — the BLOBS tab simply shows no
+    /// rows for that adapter.
+    ///
+    /// Granularity is **chunk-level**, not logical-blob-level.
+    /// `MeshBlobAdapter` tracks blobs in a refcount table keyed
+    /// by content hash: a `BlobRef::Small` corresponds to one
+    /// entry, a `BlobRef::Manifest` to N entries (one per
+    /// chunk). Reconstructing logical `BlobRef`s would need a
+    /// per-store BlobRef index the substrate doesn't carry
+    /// today; that's tracked as a follow-on in
+    /// `DECK_PLAN.md` § Deferred work § Blob & Artifact
+    /// Explorer.
+    ///
+    /// `opts.prefix_hex` filters by a hex prefix of the
+    /// content hash (e.g. `Some("abcd")` returns only chunks
+    /// whose hash starts with `0xab 0xcd`). `opts.limit` caps
+    /// the result count — adapters may return fewer when
+    /// fewer match. Order is unspecified at the trait level
+    /// (`MeshBlobAdapter` sorts by `last_seen_unix_ms` desc).
+    async fn list(&self, _opts: &BlobListOptions) -> Result<Vec<BlobInventoryEntry>, BlobError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Options for [`BlobAdapter::list`]. Built to grow — additional
+/// filters (date range, encoding, refcount band) land here
+/// without changing the trait signature.
+#[derive(Clone, Debug, Default)]
+pub struct BlobListOptions {
+    /// Lowercase hex prefix matched against the content hash.
+    /// `None` matches every entry. Adapters that can't filter
+    /// on the prefix scan all and filter in-memory.
+    pub prefix_hex: Option<String>,
+    /// Cap on the returned set. `0` (the default for
+    /// `BlobListOptions::default()`) is interpreted as "no
+    /// caller cap"; consumers reading via the SDK pass a
+    /// concrete value (typically 1000–10000) to bound
+    /// memory.
+    pub limit: usize,
+}
+
+/// One row of the operator-facing blob inventory: a content
+/// hash the adapter has observed, plus the refcount-table
+/// metadata that goes with it. Chunk-level granularity per the
+/// note on [`BlobAdapter::list`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobInventoryEntry {
+    /// 64-character lowercase hex of the blob's BLAKE3 content
+    /// hash. The canonical id at this granularity.
+    pub hash_hex: String,
+    /// Refcount the adapter tracks. `0` means quiescent and on
+    /// the GC retention clock; non-zero means at least one
+    /// source is holding a live reference.
+    pub refcount: u32,
+    /// `true` when the operator has explicitly pinned the
+    /// entry against GC (operators sometimes pin known-good
+    /// chunks during a debug session).
+    pub pinned: bool,
+    /// First wall-clock unix-ms the adapter observed this
+    /// hash (the retention floor measures from here).
+    pub first_seen_unix_ms: u64,
+    /// Most recent wall-clock unix-ms the adapter observed
+    /// this hash (any incr / decr / store).
+    pub last_seen_unix_ms: u64,
 }

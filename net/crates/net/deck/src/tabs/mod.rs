@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod blobs;
 pub mod dataforts;
 pub mod daemon;
 pub mod failures;

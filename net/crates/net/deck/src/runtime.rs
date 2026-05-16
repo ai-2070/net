@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use net_sdk::dataforts::BlobMetrics;
+use net_sdk::dataforts::{BlobMetrics, MeshBlobAdapter};
 use net_sdk::deck::{AdminVerifier, DeckClient, OperatorIdentity, OperatorRegistry};
 use net_sdk::meshos::{EntityKeypair, MeshOsConfig, MeshOsDaemonSdk, MigrationSnapshotSource};
 
@@ -32,13 +32,12 @@ pub struct Harness {
     #[cfg(feature = "samples")]
     _daemons: Vec<net_sdk::meshos::MeshOsDaemonHandle>,
     deck: Arc<DeckClient>,
-    /// Blob-adapter metrics handle. In samples mode this is
-    /// pre-populated with representative values so the
-    /// DATAFORTS tab renders concrete numbers; in default mode
-    /// it stays `None` and the tab shows its "no adapter
-    /// wired" empty state until a real `MeshBlobAdapter` is
-    /// hooked up.
-    blob_metrics: Option<Arc<BlobMetrics>>,
+    /// Real `MeshBlobAdapter` instance — `Some` in samples
+    /// mode (constructed against an in-memory `Redex` + seeded
+    /// with synthetic stores so DATAFORTS + BLOBS render real
+    /// data); `None` in default mode (operator wires their own
+    /// adapter or leaves the tabs in their empty state).
+    blob_adapter: Option<Arc<MeshBlobAdapter>>,
 }
 
 impl Harness {
@@ -46,8 +45,19 @@ impl Harness {
         Arc::clone(&self.deck)
     }
 
+    /// Adapter-side metrics handle for the DATAFORTS tab.
+    /// Sourced from the same `MeshBlobAdapter` BLOBS reads
+    /// from, so the two surfaces stay coherent.
     pub fn blob_metrics(&self) -> Option<Arc<BlobMetrics>> {
-        self.blob_metrics.clone()
+        self.blob_adapter
+            .as_ref()
+            .map(|a| Arc::new(a.metrics().clone()))
+    }
+
+    /// Adapter handle for the BLOBS tab + future blob-browse
+    /// surfaces. `None` when no adapter is wired.
+    pub fn blob_adapter(&self) -> Option<Arc<MeshBlobAdapter>> {
+        self.blob_adapter.clone()
     }
 }
 
@@ -98,22 +108,24 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     #[cfg(feature = "samples")]
     let _daemons = samples::install(&sdk)?;
 
-    // BlobMetrics in samples mode: pre-fill with realistic
-    // counters so the DATAFORTS tab paints concrete numbers
-    // out of the box. Default mode leaves it `None` so the
-    // tab's empty state explains it's waiting on adapter
-    // wiring.
+    // Real `MeshBlobAdapter` in samples mode — constructs
+    // against an in-memory `Redex`, advertises a 1 TiB cap so
+    // the disk gauge reads under the health-gate threshold,
+    // and immediately stores a handful of synthetic chunks so
+    // BLOBS has real entries to list + DATAFORTS shows real
+    // store activity. Default mode leaves the field `None`;
+    // operators wire their own adapter when they have one.
     #[cfg(feature = "samples")]
-    let blob_metrics = Some(samples::install_blob_metrics());
+    let blob_adapter = Some(samples::install_blob_adapter().await);
     #[cfg(not(feature = "samples"))]
-    let blob_metrics: Option<Arc<BlobMetrics>> = None;
+    let blob_adapter: Option<Arc<MeshBlobAdapter>> = None;
 
     Ok(Harness {
         _sdk: sdk,
         #[cfg(feature = "samples")]
         _daemons,
         deck,
-        blob_metrics,
+        blob_adapter,
     })
 }
 
@@ -130,7 +142,7 @@ mod samples {
     use bytes::Bytes;
     use net_sdk::capabilities::CapabilityFilter;
     use net_sdk::compute::CausalEvent;
-    use net_sdk::dataforts::BlobMetrics;
+    use net_sdk::dataforts::{publish_blob_ref, BlobAdapter, MeshBlobAdapter, Redex};
     use net_sdk::meshos::{
         ChainId, DaemonError, EntityKeypair, HealthProbe, InventoryProbe, LocalityProbe,
         MeshDaemon, MeshOsDaemonHandle, MeshOsDaemonSdk, MeshOsEvent, MigrationPhaseSnapshot,
@@ -138,30 +150,63 @@ mod samples {
         PlacementIntent, ReplicaUpdate,
     };
 
-    /// Seed a `BlobMetrics` with a realistic-looking steady
-    /// state so the DATAFORTS tab paints concrete numbers in
-    /// samples mode. Numbers are static — no background tick
-    /// bumps them, matching the "samples are a fixture, not
-    /// an event seeder" rule the rest of this module follows.
-    pub fn install_blob_metrics() -> Arc<BlobMetrics> {
-        let m = BlobMetrics::new();
-        // 1 TB cap, ~256 GB used → 0.25 disk ratio (well below
-        // the 0.85 hysteresis-clear floor).
-        let cap_bytes: u64 = 1 << 40;
-        let used_bytes: u64 = 256 * (1 << 30);
-        m.set_disk_capacity_bytes(cap_bytes);
-        m.set_disk_used_bytes(used_bytes);
-        // A few hundred stores + fetches so the rate columns
-        // aren't all zero. `record_store` bumps both
-        // `blobs_stored_total` and `bytes_stored_total`.
-        for size in [4_096u64, 16_384, 65_536, 4_096, 1_048_576, 4_096, 32_768] {
-            m.record_store(size);
+    /// Construct a real `MeshBlobAdapter` against an in-memory
+    /// `Redex`, advertise a 1 TiB cap, then seed it with a
+    /// handful of synthetic store + fetch operations so the
+    /// DATAFORTS metrics + BLOBS inventory both render real
+    /// data in samples mode. No background ticking — the
+    /// stores fire once at startup and the adapter's state
+    /// stays steady from there. The "samples are a fixture,
+    /// not an event seeder" rule still holds.
+    pub async fn install_blob_adapter() -> Arc<MeshBlobAdapter> {
+        let redex = Arc::new(Redex::new());
+        // 1 TiB cap — well above the seeded stored bytes so the
+        // disk gauge reads green on the DATAFORTS tab. Matches
+        // the prior `install_blob_metrics` capacity.
+        let adapter = MeshBlobAdapter::new("deck-samples", redex)
+            .with_disk_capacity(1u64 << 40);
+        let adapter = Arc::new(adapter);
+        // A handful of synthetic blobs — the BLOBS tab needs
+        // entries to render rows; bytes vary so each landing
+        // has a distinct content hash. After the loop the
+        // adapter's metrics reflect (n stores, sum bytes
+        // stored); BLOBS lists n chunks newest-first.
+        let payloads: &[&[u8]] = &[
+            b"deck-samples/blob-one-tiny",
+            b"deck-samples/blob-two-a-little-larger-payload",
+            b"deck-samples/blob-three-mid-sized-content-for-the-fixture",
+            b"deck-samples/blob-four/some-bytes/here",
+            b"deck-samples/blob-five-final-fixture-entry",
+        ];
+        // Stored blob_refs kept so we can immediately re-fetch
+        // a few — the fetch counter on DATAFORTS otherwise
+        // reads 0 at startup and the metric looks broken.
+        let mut stored = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            // `publish_blob_ref` is the canonical store entry
+            // point — computes the content hash, builds the
+            // `BlobRef::Small`, and stores via the adapter's
+            // own `store()` path. Bumps `blobs_stored_total` +
+            // `bytes_stored_total` + the refcount table; the
+            // chunk lands in the in-memory Redex.
+            if let Ok(blob) = publish_blob_ref(
+                adapter.as_ref(),
+                format!("mesh://deck-samples/{}", payload.len()),
+                payload,
+            )
+            .await
+            {
+                stored.push(blob);
+            }
         }
-        for _ in 0..14 {
-            m.record_fetch();
+        // A few extra fetches so the fetch counter isn't zero
+        // when DATAFORTS first renders.
+        if let Some(blob) = stored.first() {
+            for _ in 0..3 {
+                let _ = BlobAdapter::fetch(adapter.as_ref(), blob).await;
+            }
         }
-        m.record_gc_swept(2);
-        Arc::new(m)
+        adapter
     }
 
     /// Synthetic migration snapshot source — returns a static

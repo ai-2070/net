@@ -17,9 +17,15 @@
 //! cares about.
 
 pub use net::adapter::net::dataforts::{
-    evaluate_health_gate, BlobMetrics, BlobMetricsSnapshot, HealthGateAction,
+    evaluate_health_gate, publish_blob_ref, BlobAdapter, BlobInventoryEntry, BlobListOptions,
+    BlobMetrics, BlobMetricsSnapshot, BlobRef, HealthGateAction, MeshBlobAdapter,
     HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
 };
+// `Redex` is the underlying storage handle a `MeshBlobAdapter`
+// is constructed against. Consumers wiring an adapter need
+// the constructor; the rest of the Redex API stays substrate-
+// internal.
+pub use net::adapter::net::redex::Redex;
 // `OverflowMetricsSnapshot` is the nested type on
 // `BlobMetricsSnapshot::overflow`; reach in via the metrics
 // module path so consumers can name the type explicitly.
