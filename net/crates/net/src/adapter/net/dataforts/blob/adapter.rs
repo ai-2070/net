@@ -334,4 +334,21 @@ pub struct BlobInventoryEntry {
     /// Most recent wall-clock unix-ms the adapter observed
     /// this hash (any incr / decr / store).
     pub last_seen_unix_ms: u64,
+    /// Payload size in bytes. `Some(n)` whenever the local
+    /// adapter has observed a store; `None` for hashes that
+    /// only entered the table via `incr` from a remote source
+    /// (the chunk isn't local yet — the size is the peer's to
+    /// advertise) and for adapters that don't track per-hash
+    /// size cheaply.
+    pub size_bytes: Option<u64>,
+    /// Distinct nodes observed advertising this hash via the
+    /// substrate's `causal:<hex>` capability tag. `None` for
+    /// adapters that don't participate in the advertisement
+    /// layer; mirrors [`BlobStat::replicas_observed`].
+    pub replicas_observed: Option<u32>,
+    /// Operator-configured replication factor for this
+    /// adapter. `None` for adapters whose durability isn't
+    /// governed by the substrate (S3, IPFS, FS); mirrors
+    /// [`BlobStat::replica_target`].
+    pub replica_target: Option<u32>,
 }

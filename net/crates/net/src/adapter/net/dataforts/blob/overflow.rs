@@ -1118,7 +1118,7 @@ mod tests {
     fn refcount_with_zero(hashes: &[[u8; 32]], now_ms: u64) -> BlobRefcountTable {
         let rc = BlobRefcountTable::new();
         for h in hashes {
-            rc.store_observed(*h, now_ms);
+            rc.store_observed(*h, 0, now_ms);
         }
         rc
     }
@@ -1215,9 +1215,9 @@ mod tests {
         let (b, _) = hex64(0xBB);
         let heat = heat_registry_with(now, &[(a, 0.0), (b, 0.0)]);
         let refcount = BlobRefcountTable::new();
-        refcount.store_observed(a, 1_000_000);
+        refcount.store_observed(a, 0, 1_000_000);
         refcount.pin(a, 1_000_000);
-        refcount.store_observed(b, 1_000_000);
+        refcount.store_observed(b, 0, 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
         let index = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();

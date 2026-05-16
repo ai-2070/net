@@ -896,12 +896,14 @@ impl MeshBlobAdapter {
                     actual: computed_existing,
                 });
             }
-            self.refcount.store_observed(*hash, now_ms);
+            self.refcount
+                .store_observed(*hash, bytes.len() as u64, now_ms);
             return Ok(());
         }
         file.append(bytes)
             .map_err(|e| BlobError::Backend(format!("mesh blob: append chunk: {}", e)))?;
-        self.refcount.store_observed(*hash, now_ms);
+        self.refcount
+            .store_observed(*hash, bytes.len() as u64, now_ms);
         Ok(())
     }
 
@@ -1278,6 +1280,14 @@ impl BlobAdapter for MeshBlobAdapter {
             Some(pat) => hash_matches_pattern(hash, pat),
             None => true,
         });
+        // `replica_target` is per-adapter (set via
+        // `with_replication`); cheap to read once outside the
+        // map. `replicas_observed` would require a capability-
+        // index lookup per row — surface `None` for now and
+        // flip to a bulk lookup when the cap index is wired
+        // through to this path (see `BlobStat::replicas_observed`
+        // for the eventual integration point).
+        let replica_target = self.replication.as_ref().map(|c| c.factor as u32);
         let mut entries: Vec<super::adapter::BlobInventoryEntry> = raw
             .into_iter()
             .map(|(hash, e)| super::adapter::BlobInventoryEntry {
@@ -1287,6 +1297,9 @@ impl BlobAdapter for MeshBlobAdapter {
                 pinned: e.pinned,
                 first_seen_unix_ms: e.first_seen_unix_ms,
                 last_seen_unix_ms: e.last_seen_unix_ms,
+                size_bytes: e.size_bytes,
+                replicas_observed: None,
+                replica_target,
             })
             .collect();
         // Most-recently-touched first — operators triaging
