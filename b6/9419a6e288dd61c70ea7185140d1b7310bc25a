@@ -1,0 +1,44 @@
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_33e8c099a9039e::t_1bd073c5dff685 1222,1224-1235,1241-1248
+  s_33e8c099a9039e::t_0a7aef36fd0cfa 1258-1266,1275,1278-1285
+  s_33e8c099a9039e::t_73ad9e5258cdd2 1079-1086
+  s_33e8c099a9039e::t_9fbf257b8dc77b 1040-1048
+  s_33e8c099a9039e::t_71479295252ae9 1160,1169-1178
+net/crates/net/sdk/src/mesh.rs
+  s_33e8c099a9039e::t_dcf25e3fc54dc4 362-383
+net/crates/net/sdk/src/mesh_rpc.rs
+  s_33e8c099a9039e::t_56c0e491a57715 27-29
+net/crates/net/sdk/tests/rpc_observer.rs
+  s_33e8c099a9039e::t_a1b5a6b3c71986 1-236
+net/crates/net/src/adapter/net/cortex/mod.rs
+  s_33e8c099a9039e::t_df5688cd201683 59-63
+  s_33e8c099a9039e::t_c4694bba229e70 27-28
+net/crates/net/src/adapter/net/mesh.rs
+  s_33e8c099a9039e::t_c2c75cb5760106 4640-4671
+  s_33e8c099a9039e::t_4c316285b64252 4672-4702
+  s_33e8c099a9039e::t_9eb9cee3e30b34 1711-1712
+  s_33e8c099a9039e::t_67e52953067c94 1201-1209
+net/crates/net/src/adapter/net/cortex/rpc_observer.rs
+  s_33e8c099a9039e::t_63a1de5e68997d 84-85
+  s_33e8c099a9039e::t_81f5fa9a8c7ed4 1-26,28,30-39,41,45,47,51-73,75-83,86-97,100-118
+  s_33e8c099a9039e::t_1292dbb9e134dd 40,42-44,46,48-50
+  s_33e8c099a9039e::t_c0a174184d12a3 27,29
+  s_33e8c099a9039e::t_2213ff2a83d1d2 74
+  s_33e8c099a9039e::t_895bc7667d00c5 98-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "b69419a6e288dd61c70ea7185140d1b7310bc25a",
+  "prompts": {},
+  "sessions": {
+    "s_33e8c099a9039e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f5bf814-14c4-4dd9-b249-30bbae94726a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
