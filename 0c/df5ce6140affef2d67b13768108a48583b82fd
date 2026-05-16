@@ -1,0 +1,20 @@
+net/crates/net/deck/src/app.rs
+  s_4a2fa2d5f63459::t_dde3ca96ba816c 1717-1747,1749-1752,1761
+  s_4a2fa2d5f63459::t_357eef7a136453 1849,1853
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "0cdf5ce6140affef2d67b13768108a48583b82fd",
+  "prompts": {},
+  "sessions": {
+    "s_4a2fa2d5f63459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5d060031-ba25-4cac-9cbf-32d9a94cbf0c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
