@@ -49,7 +49,7 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
         frame,
         inner,
         "no blob chunks indexed",
-        "wire a `MeshBlobAdapter` + store blobs, or run with --features samples",
+        "wire a `MeshBlobAdapter` + store blobs",
     );
 }
 

@@ -56,7 +56,7 @@ fn render_empty_list(frame: &mut Frame<'_>, area: Rect) {
         frame,
         inner,
         "no daemons registered yet",
-        "register via the MeshOsDaemonSdk — or run with --features samples",
+        "register via the MeshOsDaemonSdk",
     );
 }
 

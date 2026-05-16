@@ -201,7 +201,7 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
         frame,
         inner,
         "no blob adapter attached to this runtime",
-        "run with --features samples for a pre-populated fixture, or wire a MeshBlobAdapter",
+        "wire a MeshBlobAdapter",
     );
 }
 

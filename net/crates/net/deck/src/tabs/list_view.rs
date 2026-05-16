@@ -47,7 +47,7 @@ fn render_empty_nodes_table(frame: &mut Frame<'_>, area: Rect) {
         frame,
         inner,
         "no peers reported yet",
-        "wire a proximity / health probe — or run with --features samples",
+        "wire a proximity / health probe",
     );
 }
 
@@ -66,7 +66,7 @@ fn render_empty_daemons_table(frame: &mut Frame<'_>, area: Rect) {
         frame,
         inner,
         "no daemons registered yet",
-        "register via the MeshOsDaemonSdk — or run with --features samples",
+        "register via the MeshOsDaemonSdk",
     );
 }
 

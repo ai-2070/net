@@ -69,7 +69,7 @@ pub fn render(
                 frame,
                 inner,
                 "no peers reported yet",
-                "wire a proximity / health probe — or run with --features samples",
+                "wire a proximity / health probe",
             );
         }
     }
