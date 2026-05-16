@@ -236,6 +236,13 @@ pub enum Modal {
     BlobDetail {
         entry: net_sdk::dataforts::BlobInventoryEntry,
     },
+    /// Export confirmation — pops after `[e]` lands a file
+    /// on disk so the operator sees the resolved path before
+    /// returning to the tab. Carries the outcome (success
+    /// with path + count, or failure with error string).
+    ExportDone {
+        outcome: crate::widgets::export_done::ExportOutcome,
+    },
 }
 
 /// Internal helper enum used by `propose_node_action` to
@@ -436,6 +443,27 @@ impl App {
     /// search) so the export reflects what the operator sees;
     /// pause state determines live-vs-frozen source. Confirms
     /// success or failure in the footer toast.
+    /// Wrap an export result into the `ExportDone` modal so
+    /// the operator sees the resolved path immediately — toasts
+    /// are too easy to miss in a busy session, and the path is
+    /// the actionable bit (operator copies it into the incident
+    /// write-up).
+    fn open_export_modal(&mut self, tab: &str, result: Result<crate::widgets::export::ExportResult, crate::widgets::export::ExportError>) {
+        use crate::widgets::export_done::ExportOutcome;
+        let outcome = match result {
+            Ok(out) => ExportOutcome::Ok {
+                tab: tab.to_string(),
+                path: out.path,
+                count: out.count,
+            },
+            Err(message) => ExportOutcome::Err {
+                tab: tab.to_string(),
+                message,
+            },
+        };
+        self.modal = Some(Modal::ExportDone { outcome });
+    }
+
     fn export_logs(&mut self) {
         let records: Vec<net_sdk::deck::LogRecord> = match &self.logs_paused {
             Some(frozen) => frozen.clone(),
@@ -448,13 +476,8 @@ impl App {
             .filter(|r| tabs::logs::level_rank(r.level) >= min_rank)
             .filter(|r| tabs::logs::record_matches(r, &needle))
             .collect();
-        match crate::widgets::export::write_logs(&filtered) {
-            Ok(out) => self.set_toast(format!(
-                "wrote {} log records → {}",
-                out.count, out.path
-            )),
-            Err(e) => self.set_toast(format!("export failed: {e}")),
-        }
+        let result = crate::widgets::export::write_logs(&filtered);
+        self.open_export_modal("LOGS", result);
     }
 
     fn export_audit(&mut self) {
@@ -476,13 +499,8 @@ impl App {
             .into_iter()
             .rev()
             .collect();
-        match crate::widgets::export::write_audit(&filtered) {
-            Ok(out) => self.set_toast(format!(
-                "wrote {} audit records → {}",
-                out.count, out.path
-            )),
-            Err(e) => self.set_toast(format!("export failed: {e}")),
-        }
+        let result = crate::widgets::export::write_audit(&filtered);
+        self.open_export_modal("AUDIT", result);
     }
 
     fn export_failures(&mut self) {
@@ -493,13 +511,8 @@ impl App {
             .filter(|r| tabs::failures::record_matches(r, &needle))
             .cloned()
             .collect();
-        match crate::widgets::export::write_failures(&filtered) {
-            Ok(out) => self.set_toast(format!(
-                "wrote {} failure records → {}",
-                out.count, out.path
-            )),
-            Err(e) => self.set_toast(format!("export failed: {e}")),
-        }
+        let result = crate::widgets::export::write_failures(&filtered);
+        self.open_export_modal("FAILURES", result);
     }
 
     fn export_blobs(&mut self) {
@@ -510,13 +523,8 @@ impl App {
             .filter(|e| tabs::blobs::record_matches(e, &needle))
             .cloned()
             .collect();
-        match crate::widgets::export::write_blobs(&filtered) {
-            Ok(out) => self.set_toast(format!(
-                "wrote {} blob entries → {}",
-                out.count, out.path
-            )),
-            Err(e) => self.set_toast(format!("export failed: {e}")),
-        }
+        let result = crate::widgets::export::write_blobs(&filtered);
+        self.open_export_modal("BLOBS", result);
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -1175,6 +1183,8 @@ impl App {
                     // BlobDetail is informational — Enter just
                     // closes (same as Esc / q).
                     Some(Modal::BlobDetail { .. }) => {}
+                    // ExportDone is informational — Enter closes.
+                    Some(Modal::ExportDone { .. }) => {}
                     // ParamInput is intercepted earlier in this
                     // function; reaching here would be a bug.
                     Some(Modal::ParamInput { .. }) => {}
@@ -1624,6 +1634,9 @@ impl App {
             }
             Some(Modal::BlobDetail { entry }) => {
                 widgets::blob_detail::render(frame, area, entry);
+            }
+            Some(Modal::ExportDone { outcome }) => {
+                widgets::export_done::render(frame, area, outcome);
             }
             None => {}
         }

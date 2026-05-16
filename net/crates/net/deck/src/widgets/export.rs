@@ -18,6 +18,9 @@ use net_sdk::deck::{
     AdminAuditRecord, AdminEvent, FailureRecord, LogLevel, LogRecord, VerificationOutcome,
 };
 
+/// File extension on every export.
+const EXTENSION: &str = ".txt";
+
 /// Outcome reported back to the caller. `path` is the
 /// resolved file path; `count` is how many records were
 /// written.
@@ -36,8 +39,7 @@ pub type ExportError = String;
 /// `MM:SS.mmm LEVEL  source  message` per line, matching
 /// the in-deck row layout (minus the styling).
 pub fn write_logs(records: &[LogRecord]) -> Result<ExportResult, ExportError> {
-    let path = filename("logs");
-    let mut f = std::fs::File::create(&path).map_err(|e| format!("create: {e}"))?;
+    let (path, mut f) = open_unique("logs")?;
     let mut count = 0;
     for rec in records {
         let level = match rec.level {
@@ -63,8 +65,7 @@ pub fn write_logs(records: &[LogRecord]) -> Result<ExportResult, ExportError> {
 /// Write a slice of AUDIT records (newest-first preserved
 /// from the caller's projection) as plain text.
 pub fn write_audit(records: &[AdminAuditRecord]) -> Result<ExportResult, ExportError> {
-    let path = filename("audit");
-    let mut f = std::fs::File::create(&path).map_err(|e| format!("create: {e}"))?;
+    let (path, mut f) = open_unique("audit")?;
     let mut count = 0;
     for rec in records.iter().rev() {
         let outcome = match rec.outcome {
@@ -98,8 +99,7 @@ pub fn write_audit(records: &[AdminAuditRecord]) -> Result<ExportResult, ExportE
 /// Write a slice of BLOBS inventory entries as plain text.
 /// Ordering preserved from the caller's projection.
 pub fn write_blobs(entries: &[BlobInventoryEntry]) -> Result<ExportResult, ExportError> {
-    let path = filename("blobs");
-    let mut f = std::fs::File::create(&path).map_err(|e| format!("create: {e}"))?;
+    let (path, mut f) = open_unique("blobs")?;
     let mut count = 0;
     for e in entries {
         writeln!(
@@ -120,8 +120,7 @@ pub fn write_blobs(entries: &[BlobInventoryEntry]) -> Result<ExportResult, Expor
 /// Write a slice of FAILURE records as plain text. Newest-
 /// first ordering matches the in-deck projection.
 pub fn write_failures(records: &[FailureRecord]) -> Result<ExportResult, ExportError> {
-    let path = filename("failures");
-    let mut f = std::fs::File::create(&path).map_err(|e| format!("create: {e}"))?;
+    let (path, mut f) = open_unique("failures")?;
     let mut count = 0;
     for rec in records.iter().rev() {
         writeln!(
@@ -138,12 +137,48 @@ pub fn write_failures(records: &[FailureRecord]) -> Result<ExportResult, ExportE
     Ok(ExportResult { path, count })
 }
 
-fn filename(tab: &str) -> String {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    format!("deck-{tab}-{ms}.txt")
+/// Open a new export file with a timestamp in its name,
+/// retrying with a `-N` suffix if (extremely rarely) one
+/// already exists at the chosen path. `create_new(true)`
+/// means we never silently overwrite — the file the modal
+/// reports is always the one we just wrote.
+///
+/// Filename shape:
+/// `deck-<tab>-2026-05-16T18-32-45Z.txt`
+///
+/// ISO 8601 UTC with `:` substituted by `-` for cross-platform
+/// filename safety (Windows / NTFS reject `:`). To parse:
+///
+/// - Rust: replace the time-portion `-`s with `:` then
+///   `chrono::DateTime::parse_from_rfc3339`.
+/// - JS: same un-mangle then `Date.parse`.
+fn open_unique(tab: &str) -> Result<(String, std::fs::File), ExportError> {
+    let now = chrono::Utc::now();
+    // Filename-safe ISO 8601 — dashes everywhere; the
+    // un-mangle to RFC3339 is `s/T(\d{2})-(\d{2})-/T$1:$2:/`.
+    let stamp = now.format("%Y-%m-%dT%H-%M-%SZ").to_string();
+    let base = format!("deck-{tab}-{stamp}");
+    // Same-second collision retry: append `-1`, `-2`, …
+    // until `create_new` succeeds. Caps at 100 attempts to
+    // refuse to busy-loop if the directory is full / write-
+    // protected.
+    for attempt in 0..100 {
+        let path = if attempt == 0 {
+            format!("{base}{EXTENSION}")
+        } else {
+            format!("{base}-{attempt}{EXTENSION}")
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => return Ok((path, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("create {path}: {e}")),
+        }
+    }
+    Err(format!("create deck-{tab}-{stamp}: too many collisions"))
 }
 
 fn format_ts_ms(ts_ms: u64) -> String {

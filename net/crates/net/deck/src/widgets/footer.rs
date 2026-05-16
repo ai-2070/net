@@ -20,7 +20,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, toast: Option<&str>) {
         Span::styled(" tab   ", theme::dim()),
         Span::styled("1-9", theme::green()),
         Span::styled(" jump   ", theme::dim()),
-        Span::styled("j/k", theme::green()),
+        Span::styled("↑↓", theme::green()),
         Span::styled(" cursor   ", theme::dim()),
         Span::styled("c/C", theme::green()),
         Span::styled(" cordon   ", theme::dim()),

@@ -23,6 +23,11 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
+# ISO 8601 timestamps in export filenames so operators can
+# `chrono::DateTime::parse_from_rfc3339` (after the `-` → `:`
+# un-mangle for filename safety) or feed them to JS
+# `Date.parse`.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [features]
 default = []
