@@ -28,7 +28,7 @@ use net_sdk::testing::ClusterHarness;
 use tokio::task::JoinHandle;
 
 use super::cluster::{build_cluster, DEMO_NODE_COUNT};
-use super::daemons::HeartbeatDaemon;
+use super::daemons::{DroneDaemon, HeartbeatDaemon, MixerDaemon, PyroSafetyDaemon};
 
 /// Per-node heartbeat cadence. Picks a slightly-staggered base
 /// so the 5 nodes don't all emit on the same tick; jitter is
@@ -55,6 +55,10 @@ pub struct Harness {
     /// stay registered for the session; dropped on shutdown
     /// (auto-unregisters via `MeshOsDaemonHandle::Drop`).
     _heartbeat_handles: Vec<MeshOsDaemonHandle>,
+    /// Handles for the replica / fork / standby trios pinned
+    /// to node[0]. Same lifetime semantics as the heartbeat
+    /// handles — dropping them on shutdown auto-unregisters.
+    _group_handles: Vec<MeshOsDaemonHandle>,
     /// Tokio tasks driving the per-node heartbeat log emits.
     /// Aborted on drop (the harness goes away, tokio drops the
     /// handles, the spawned futures are cancelled).
@@ -155,12 +159,49 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
         heartbeat_tasks.push(task);
     }
 
-    // Build the DeckClient anchored on node[0]'s MeshOsRuntime.
+    // Register the group-flavored daemon trios on node[0]'s
+    // `MeshOsDaemonSdk`. The substrate's snapshot is local-only,
+    // so concentrating the group members on the observed node
+    // is what makes the deck's GROUPS / CHAINS / DAEMONS tabs
+    // render the full picture. The trade-off: the per-daemon
+    // `placement` field on every member reads as node[0] in
+    // the demo, which the operator can ignore — the lineage
+    // visualization is what we're after for v1. A future slice
+    // wires cluster-wide daemon visibility once the substrate
+    // grows that primitive.
     let node0 = cluster.nth(0);
     let sdk0 = node0
         .sdk
         .as_ref()
         .ok_or_else(|| color_eyre::eyre::eyre!("node[0] sdk missing"))?;
+    let mut group_handles: Vec<MeshOsDaemonHandle> = Vec::with_capacity(9);
+    for replica_idx in 0..3 {
+        let kp = EntityKeypair::generate();
+        let h = sdk0
+            .register_daemon(Box::new(MixerDaemon), kp)
+            .map_err(|e| {
+                color_eyre::eyre::eyre!("register MixerDaemon[{replica_idx}]: {e}")
+            })?;
+        group_handles.push(h);
+    }
+    for fork_idx in 0..3 {
+        let kp = EntityKeypair::generate();
+        let h = sdk0
+            .register_daemon(Box::new(DroneDaemon), kp)
+            .map_err(|e| color_eyre::eyre::eyre!("register DroneDaemon[{fork_idx}]: {e}"))?;
+        group_handles.push(h);
+    }
+    for standby_idx in 0..3 {
+        let kp = EntityKeypair::generate();
+        let h = sdk0
+            .register_daemon(Box::new(PyroSafetyDaemon), kp)
+            .map_err(|e| {
+                color_eyre::eyre::eyre!("register PyroSafetyDaemon[{standby_idx}]: {e}")
+            })?;
+        group_handles.push(h);
+    }
+
+    // Build the DeckClient anchored on node[0]'s MeshOsRuntime.
     let identity = OperatorIdentity::from_keypair(operator_keypair);
     let deck = Arc::new(DeckClient::from_runtime(sdk0.runtime(), identity));
     let this_node = node0.node_id;
@@ -168,6 +209,7 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     Ok(Harness {
         cluster: Some(cluster),
         _heartbeat_handles: heartbeat_handles,
+        _group_handles: group_handles,
         _heartbeat_tasks: heartbeat_tasks,
         deck,
         blob_adapters: Vec::new(),
@@ -261,10 +303,25 @@ mod tests {
             4,
             "node[0] snapshot must see 4 remote peers"
         );
-        assert!(
-            !snap.daemons.is_empty(),
-            "snapshot must show at least node[0]'s HeartbeatDaemon"
+        // Node[0] hosts: 1 HeartbeatDaemon + 3 MixerDaemons
+        // (replica) + 3 DroneDaemons (fork) + 3 PyroSafetyDaemons
+        // (standby) = 10 registered locally.
+        assert_eq!(
+            snap.daemons.len(),
+            10,
+            "node[0] should show 1 heartbeat + 9 group daemons; got {}",
+            snap.daemons.len()
         );
+        // Verify each group name appears the expected number of
+        // times. The deck's `lineage::group_daemons` will fold
+        // these into one row per group.
+        let count_with_name = |name: &str| -> usize {
+            snap.daemons.values().filter(|d| d.name == name).count()
+        };
+        assert_eq!(count_with_name("heartbeat"), 1);
+        assert_eq!(count_with_name("audio_mixer#replica"), 3);
+        assert_eq!(count_with_name("drone_swarm#fork@7"), 3);
+        assert_eq!(count_with_name("pyro_safety#standby"), 3);
         // Logs ride the same fold; expect non-trivial volume.
         assert!(
             snap.log_ring.len() >= 2,

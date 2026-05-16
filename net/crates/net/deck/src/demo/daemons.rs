@@ -33,3 +33,55 @@ impl MeshDaemon for HeartbeatDaemon {
         Ok(Vec::new())
     }
 }
+
+/// Replica-group flavor daemon. The `#replica` suffix is what
+/// the deck's `lineage::group_daemons` parser looks for to
+/// classify the three instances as a `ReplicaGroup`. Stateless.
+pub struct MixerDaemon;
+
+impl MeshDaemon for MixerDaemon {
+    fn name(&self) -> &str {
+        "audio_mixer#replica"
+    }
+    fn requirements(&self) -> CapabilityFilter {
+        CapabilityFilter::default()
+    }
+    fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Fork-group flavor daemon. The `#fork@<seq>` suffix carries
+/// the parent fork sequence so the deck displays the fork
+/// lineage's parent-seq badge. Stateless.
+pub struct DroneDaemon;
+
+impl MeshDaemon for DroneDaemon {
+    fn name(&self) -> &str {
+        "drone_swarm#fork@7"
+    }
+    fn requirements(&self) -> CapabilityFilter {
+        CapabilityFilter::default()
+    }
+    fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Standby-group flavor daemon. The `#standby` suffix groups
+/// the three instances into a `StandbyGroup`. The deck
+/// assigns "active" to the lowest-`daemon_id` member; the
+/// rest render as "warm" standbys.
+pub struct PyroSafetyDaemon;
+
+impl MeshDaemon for PyroSafetyDaemon {
+    fn name(&self) -> &str {
+        "pyro_safety#standby"
+    }
+    fn requirements(&self) -> CapabilityFilter {
+        CapabilityFilter::default()
+    }
+    fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+        Ok(Vec::new())
+    }
+}
