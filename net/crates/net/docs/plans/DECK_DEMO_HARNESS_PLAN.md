@@ -1,10 +1,20 @@
 # Deck Demo Harness — implementation plan
 
-> The substrate-side primitives [`DECK_DEMO_PLAN.md`](DECK_DEMO_PLAN.md) needs in order to boot a real in-process multi-node cluster instead of synthetic fixtures. Five pieces: **Phase 0** (in-process multi-`MeshOsRuntime` harness) + four missing items the deck demo can't build on top of yet — **A** daemon supervisor pattern across nodes, **B** real chain placement, **C** lifecycle coordination, **D** nRPC observer hook on `Mesh`. This plan ships those primitives; the demo plan consumes them.
+> The substrate-side primitives [`DECK_DEMO_PLAN.md`](DECK_DEMO_PLAN.md) needs in order to boot a real in-process multi-node cluster instead of synthetic fixtures. Six pieces: **Phase 0** (in-process multi-`Mesh` + multi-`MeshOsRuntime` harness) + **Phase 0.5** (bridge probes that glue the network layer into the MeshOS snapshot fold) + four missing items the deck demo can't build on top of yet — **A** daemon supervisor pattern across nodes, **B** real chain placement, **C** lifecycle coordination, **D** nRPC observer hook on `Mesh`. This plan ships those primitives; the demo plan consumes them.
 
 ## Status
 
-Design only. Today the SDK can boot **one** `MeshOsRuntime` cleanly (`MeshOsDaemonSdk::start_with_verifier_and_migration_source`, exercised by `deck/src/runtime.rs:117` and every integration test). It can boot **two** raw `Mesh` instances peered over UDP loopback (`crates/net/sdk/examples/nrpc_echo.rs:69-91`). It cannot boot **N** `MeshOsRuntime` instances peered together with a coherent lifecycle. Every prerequisite for `DECK_DEMO_PLAN.md`'s Phase 1 lives here.
+Design only. Today the SDK can boot **one** `MeshOsRuntime` cleanly (`MeshOsDaemonSdk::start_with_verifier_and_migration_source`, exercised by `deck/src/runtime.rs:117` and every integration test). It can boot **two** raw `Mesh` instances peered over UDP loopback (`crates/net/sdk/examples/nrpc_echo.rs:69-91`). It cannot boot **N** `MeshOsRuntime` instances **with their state folds wired to a real `Mesh`** and a coherent lifecycle. Every prerequisite for `DECK_DEMO_PLAN.md`'s Phase 1 lives here.
+
+## Architectural framing — MeshOS vs Mesh
+
+**Critical to understand before reading the phases.** The substrate splits the network layer from the MeshOS state layer:
+
+- **`Mesh` / `MeshNode`** (under `crates/net/src/adapter/net/`) is the network. UDP, handshake, capability broadcast, peer table, RTT measurement. This is what `nrpc_echo` boots.
+- **`MeshOsRuntime`** (under `crates/net/src/adapter/net/behavior/meshos/`) is the state fold. Snapshot, scheduler, daemon registry, migration orchestrator, replica/chain machinery. Built without any network knowledge by `MeshOsRuntime::start_with_full_extensions` (sdk.rs:643) which takes an empty `ProbeRegistry`.
+- **`MeshOsDaemonSdk`** wraps `MeshOsRuntime`. Today's `deck/src/runtime.rs:90-122` constructs one with `MeshOsConfig::default()`, registers no probes, and never binds a socket. Its `snapshot.peers` is empty unless a synthetic probe (`SampleLocalityProbe` et al.) is registered.
+
+The two layers communicate through **probe traits** (`LocalityProbe`, `HealthProbe`, `InventoryProbe`) that the runtime polls on every tick. The samples mode fills the fold by registering synthetic probes that fabricate data. A real cluster needs **bridge probes** that read off a real `Mesh` and surface the data the runtime expects. Phase 0.5 ships those bridge probes; without them, Phase 0's harness would return handles whose snapshots stay empty.
 
 ## Frame
 
@@ -15,7 +25,11 @@ The SDK already has every load-bearing piece in isolation:
 - `Scheduler::place_with_spread` computes capability-spread placements once it can see peers in the `CapabilityIndex`.
 - `ReplicaGroup` / `ForkGroup` / `StandbyGroup` (per `SDK_GROUPS_SURFACE_PLAN.md`) spawn coordinated daemon sets through a `DaemonRuntime` + scheduler.
 
-What's missing is **glue**: a harness that stands N runtimes up, peers them by address, waits for the capability fold to converge, then hands the caller a typed handle for registering daemons + groups across all of them. The deck demo is the first consumer; the same primitive is useful for SDK integration tests today (multi-node groups, real migrations, real chain assignment) that are currently single-process / single-runtime workarounds.
+What's missing is **glue at two levels**:
+1. A harness that stands N `Mesh` + `MeshOsRuntime` pairs up, peers them by address, waits for the capability fold to converge.
+2. Bridge probes that wire each `Mesh`'s peer table → that `MeshOsRuntime`'s probe registry so the fold reflects what the network sees.
+
+The deck demo is the first consumer of both; the same primitives are useful for SDK integration tests today (multi-node groups, real migrations, real chain assignment) that are currently single-process / single-runtime workarounds.
 
 ## Why this exists
 
@@ -31,35 +45,77 @@ Three reasons this is a substrate-level plan, not deck-binary code:
 
 Four phases. Each is independently reviewable and lands a self-contained primitive.
 
-### Phase 0 — In-process multi-`MeshOsRuntime` harness
+### Phase 0 — Multi-`Mesh` + multi-`MeshOsRuntime` harness
 
-**Goal.** A `ClusterHarness::new(n)` call returns N booted-and-peered `MeshOsDaemonSdk` handles in under 3 s on a developer laptop. Real UDP loopback, real handshake, real capability fold.
+**Goal.** A `ClusterHarness::new(n)` call returns N booted-and-peered nodes — each node is a `(Mesh, MeshOsDaemonSdk)` pair — within ~3 s on a developer laptop. Real UDP loopback, real handshake. The MeshOS layer's snapshot is **not yet populated** at this phase; that's Phase 0.5's job.
 
 **API sketch (illustrative, not final).**
 
 ```rust
 pub struct ClusterHarness {
-    runtimes: Vec<MeshOsDaemonSdk>,
-    addrs: Vec<SocketAddr>,
+    nodes: Vec<ClusterNode>,
+}
+
+pub struct ClusterNode {
+    pub mesh: Arc<Mesh>,
+    pub sdk: MeshOsDaemonSdk,
+    pub local_addr: SocketAddr,
+    pub node_id: NodeId,
+    pub public_key: [u8; 32],
 }
 
 impl ClusterHarness {
-    /// Spawn `n` runtimes on `127.0.0.1:<ephemeral>` and peer
-    /// every pair via `Mesh::connect_direct`. Blocks until each
-    /// runtime's capability fold reports `n-1` peers.
+    /// Spawn `n` (Mesh, MeshOsRuntime) pairs on
+    /// `127.0.0.1:<ephemeral>` and peer every Mesh pair.
+    /// Returns once every Mesh sees `n-1` peer sessions.
+    /// Bridge probes (Phase 0.5) are wired during this call.
     pub async fn new(n: usize) -> Result<Self, ClusterError>;
-    pub fn nodes(&self) -> &[MeshOsDaemonSdk];
-    pub fn nth(&self, i: usize) -> &MeshOsDaemonSdk;
+    pub fn nodes(&self) -> &[ClusterNode];
+    pub fn nth(&self, i: usize) -> &ClusterNode;
 }
 ```
 
-**Files.** `crates/net/sdk/src/testing/cluster.rs` (new module, gated behind a `testing` Cargo feature so it doesn't pollute the release surface). Re-exported as `net_sdk::testing::ClusterHarness`.
+**Files.** `crates/net/sdk/src/testing/mod.rs` + `crates/net/sdk/src/testing/cluster.rs` (new module, gated behind a `testing` Cargo feature so it doesn't pollute the release surface). Re-exported as `net_sdk::testing::ClusterHarness`.
 
-**Boot order.** (1) allocate N OS ports (bind 0 → keep socket, read assigned port); (2) build N `MeshOsConfig`s with `bind_addr` set to the allocated ports; (3) call `MeshOsDaemonSdk::start_with_verifier_and_migration_source` for each; (4) for each ordered pair `(i, j)` with `i < j`, call `runtime[i].mesh().connect_direct(addrs[j], identity[j])`; (5) poll every runtime's snapshot until `peers.len() == n - 1`, with a 5 s timeout.
+**Boot order.** (1) build N `Mesh` instances via `MeshBuilder::new("127.0.0.1:0", &psk)` — same path `nrpc_echo` uses. The kernel assigns an ephemeral port; read it back via `mesh.inner().local_addr()`. (2) For each ordered pair `(i, j)` with `i < j`, drive an `accept` + `connect` pair (the `nrpc_echo` pattern at examples/nrpc_echo.rs:81-87, generalized to N-way). (3) Build N `MeshOsDaemonSdk`s. (4) **Phase 0.5 wires bridge probes** between each Mesh and its sibling MeshOsRuntime. (5) Poll every Mesh's session table until `n-1` sessions are established, then poll every MeshOsRuntime's `snapshot.peers` until it reports `n-1` peers, with separate timeout budgets.
 
-**Where the substrate currently blocks.** Nowhere — every primitive used above already exists. The work is purely composition + the timeout-polling loop.
+**Where the substrate currently blocks.** Nowhere at the Mesh layer — `MeshBuilder` + `accept`/`connect` already work. The `MeshOsRuntime` layer needs the bridge probes from Phase 0.5 before its snapshot reflects peer state. Mesh-only harness functionality is shippable on its own and is useful for tests that don't need the MeshOS state fold.
 
-**Smoke test.** `tests/cluster_harness.rs`: boot 5 nodes, assert each one sees 4 peers within 3 s, drop the harness, assert clean shutdown (no leaked tokio tasks via `JoinSet::shutdown`).
+**Smoke test.** `tests/cluster_harness.rs`: boot 5 nodes, assert each `Mesh` sees 4 peer sessions within 3 s, drop the harness, assert clean shutdown (no leaked tokio tasks).
+
+### Phase 0.5 — Bridge probes (Mesh → MeshOsRuntime)
+
+**Goal.** Three small `LocalityProbe` / `HealthProbe` / `InventoryProbe` impls that read from a `Mesh` handle and surface what the `MeshOsRuntime`'s tick loop expects. Registered against each runtime's `ProbeRegistry` during `ClusterHarness::new`. Once installed, the runtime's `snapshot.peers` populates naturally each tick.
+
+**Why this is its own phase.** It's the bridge that gives the harness's `MeshOsDaemonSdk` handles non-empty snapshots. Without it, the deck demo (and any test) gets back handles whose `snapshot.peers` stays empty forever even though the underlying `Mesh` instances are fully peered. The synthetic `SampleLocalityProbe` does the same shape today; this is its real counterpart.
+
+**API sketch.**
+
+```rust
+/// Reads peer RTT from a `Mesh` and reports it through the
+/// runtime's `LocalityProbe` interface. Cheap each tick — one
+/// borrow of the mesh's peer table.
+pub struct MeshLocalityProbe { mesh: Arc<Mesh> }
+impl LocalityProbe for MeshLocalityProbe { /* ... */ }
+
+pub struct MeshHealthProbe { mesh: Arc<Mesh> }
+impl HealthProbe for MeshHealthProbe { /* ... */ }
+
+pub struct MeshInventoryProbe { mesh: Arc<Mesh> }
+impl InventoryProbe for MeshInventoryProbe { /* ... */ }
+
+/// Convenience: install all three on a runtime in one call.
+/// Called by `ClusterHarness::new` after the Mesh pairs handshake.
+pub fn install_mesh_probes(sdk: &MeshOsDaemonSdk, mesh: Arc<Mesh>);
+```
+
+**Files.** `crates/net/sdk/src/testing/probes.rs` (same `testing` feature gate as the harness). Re-exported as `net_sdk::testing::{MeshLocalityProbe, MeshHealthProbe, MeshInventoryProbe, install_mesh_probes}`.
+
+**Substrate work.** Likely none — the existing `Mesh` exposes peer iteration + RTT + capability sets via accessors the bridge probes call. If a needed accessor is missing (e.g. "is this peer reachable right now"), add it as a small substrate change in the same PR; the alternative is hand-rolling a peer-table mirror in the testing module which would invariably drift.
+
+**Smoke test.** Extension to Phase 0's smoke test: after the 5-node mesh peers, poll each `MeshOsDaemonSdk`'s `snapshot.peers` and assert it reports 4 entries within 2 s (separate budget from the Mesh handshake). Validate health = `Healthy` for every entry and `rtt_ms` is `Some(_)`.
+
+**Where this gets revisited.** A production-quality `MeshLocalityProbe` belongs in the SDK proper (not behind `testing`) once real deployments want it. For v1 it lives in `testing` because its only consumer is the harness; promoting it later is a rename, not a rewrite.
 
 ### Missing item A — Daemon supervisor pattern across nodes
 
@@ -208,13 +264,14 @@ impl Mesh {
 
 ## Phases — dependency order
 
-1. **Phase 0** — the harness itself. Standalone deliverable; smoke test demonstrates 5-node peering.
-2. **Item C (skeleton)** — `shutdown` + timeouts on Phase 0's `new`. Drop semantics. The "lifecycle" piece is interleaved with Phase 0 because they share the same state machine; it's listed separately because its surface is independently reviewable.
-3. **Item A** — `spawn_per_node` + `spawn_where`. Depends only on Phase 0 + item C.
-4. **Item B** — `spawn_replica_group` and friends. Depends on Phase 0 + item C; reuses item A's rollback machinery internally.
-5. **Item D** — `RpcObserver` + `Mesh::set_rpc_observer`. Independent of the harness internally (substrate-only change) but lands alongside because the deck demo's Phase 4 is the load-bearing consumer.
+1. **Phase 0** — the multi-Mesh + multi-MeshOsRuntime harness skeleton. Standalone deliverable; smoke test demonstrates 5-node `Mesh` peering.
+2. **Phase 0.5** — bridge probes. Depends on Phase 0. Smoke test extends to assert MeshOS-layer `snapshot.peers` populates.
+3. **Item C (skeleton)** — `shutdown` + timeouts on Phase 0's `new`. Drop semantics. The "lifecycle" piece is interleaved with Phase 0 because they share the same state machine; it's listed separately because its surface is independently reviewable.
+4. **Item A** — `spawn_per_node` + `spawn_where`. Depends on Phase 0 + 0.5 + item C.
+5. **Item B** — `spawn_replica_group` and friends. Depends on Phase 0 + 0.5 + item C; reuses item A's rollback machinery internally.
+6. **Item D** — `RpcObserver` + `Mesh::set_rpc_observer`. Independent of the harness internally (substrate-only change) but lands alongside because the deck demo's Phase 4 is the load-bearing consumer.
 
-A reasonable PR sequence: Phase 0 + item C as one PR (they're entangled), item A as a second PR, item B as a third, item D as a fourth. Each PR ships with its own test under `crates/net/sdk/tests/cluster_*.rs` or `crates/net/tests/rpc_observer.rs`.
+A reasonable PR sequence: **Phase 0 + Phase 0.5 + item C** as one PR (entangled — the lifecycle owns the boot path, the bridge probes wire during boot), item A as a second PR, item B as a third, item D as a fourth. Each PR ships with its own test under `crates/net/sdk/tests/cluster_*.rs` or `crates/net/tests/rpc_observer.rs`.
 
 ## Non-goals
 
