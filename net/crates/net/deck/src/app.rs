@@ -11,6 +11,21 @@ use ratatui::{
 
 use crate::{tabs, widgets};
 
+/// Restoration target when the operator presses `[Esc]` on
+/// LOGS after pivoting in via `[l]`. The variants capture the
+/// three contexts `filter_logs_for_id` is reachable from.
+#[derive(Clone, Debug)]
+pub enum LogsBackTarget {
+    /// Operator was on the DAEMON focus page (`daemon_focus`
+    /// was set). Esc restores the focus entry verbatim.
+    DaemonFocus(crate::tabs::daemon_page::DaemonFocusEntry),
+    /// Operator was on the NODE focus page.
+    NodeFocus(crate::tabs::node_page::NodeFocusEntry),
+    /// Operator was on a regular tab — Esc returns there
+    /// without restoring any focus.
+    Tab(Tab),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     NetMap,
@@ -239,6 +254,12 @@ pub struct App {
     /// Daemon page. Mutually exclusive with `node_focus`; each
     /// `focus_*` helper clears the other before setting.
     pub daemon_focus: Option<crate::tabs::daemon_page::DaemonFocusEntry>,
+    /// What to restore when the operator presses `[Esc]` on the
+    /// LOGS tab after pivoting in via `[l]`. Captures the
+    /// focus / tab state at pivot time so Esc returns the
+    /// operator exactly where they came from instead of leaving
+    /// them stranded on LOGS with a stale filter.
+    pub logs_back: Option<LogsBackTarget>,
     /// Ephemeral "toast" message shown in the footer for
     /// ~3 seconds after an action. Used for confirming
     /// side-effects the operator can't see directly — e.g.
@@ -492,6 +513,7 @@ impl App {
             modal: None,
             node_focus: None,
             daemon_focus: None,
+            logs_back: None,
             toast: None,
             toast_tx,
             toast_rx,
@@ -798,6 +820,20 @@ impl App {
     /// any active node/daemon focus since the operator is now
     /// reading logs.
     fn filter_logs_for_id(&mut self, id: u64) {
+        // Capture where the operator came from so `[Esc]` on
+        // LOGS can return them — daemon focus, node focus, or
+        // a plain tab (NODES / DAEMONS / GROUPS / DATAFORTS).
+        // Focus-mode capture wins because it's the deeper
+        // context and the operator expects Esc to walk back
+        // up the stack, not snap to the tab the focus came
+        // from originally.
+        self.logs_back = if let Some(focus) = self.daemon_focus.as_ref() {
+            Some(LogsBackTarget::DaemonFocus(focus.clone()))
+        } else if let Some(focus) = self.node_focus.as_ref() {
+            Some(LogsBackTarget::NodeFocus(focus.clone()))
+        } else {
+            Some(LogsBackTarget::Tab(self.current))
+        };
         self.logs_search = format!("0x{id:x}");
         self.logs_search_editing = false;
         self.logs_min_level = net_sdk::deck::LogLevel::Debug;
@@ -805,6 +841,33 @@ impl App {
         self.current = Tab::Logs;
         self.node_focus = None;
         self.daemon_focus = None;
+    }
+
+    /// Restore the pre-`[l]` context. Clears the LOGS filter
+    /// the pivot installed so the operator doesn't see the
+    /// hex search persist after Esc — they came back to look
+    /// at the previous surface, not a stale-filter LOGS view
+    /// on next pivot.
+    fn pop_logs_back(&mut self) -> bool {
+        let Some(target) = self.logs_back.take() else {
+            return false;
+        };
+        self.logs_search = String::new();
+        self.logs_search_editing = false;
+        match target {
+            LogsBackTarget::DaemonFocus(focus) => {
+                self.daemon_focus = Some(focus);
+                self.node_focus = None;
+            }
+            LogsBackTarget::NodeFocus(focus) => {
+                self.node_focus = Some(focus);
+                self.daemon_focus = None;
+            }
+            LogsBackTarget::Tab(tab) => {
+                self.current = tab;
+            }
+        }
+        true
     }
 
     /// Build a `PeerSnapshot` representing the local node from
@@ -1419,6 +1482,13 @@ impl App {
             return;
         }
         match code {
+            // Esc on LOGS pops the back-target the `[l]` pivot
+            // stashed — operator returns to whichever focus
+            // page or tab they came from. Without a stashed
+            // target Esc falls through to the no-op below.
+            KeyCode::Esc if self.current == Tab::Logs => {
+                self.pop_logs_back();
+            }
             // Top-level Esc is a no-op. The modal absorber + focus
             // absorbers above handle Esc-to-dismiss in their own
             // arms; the outer fall-through used to quit the app,
