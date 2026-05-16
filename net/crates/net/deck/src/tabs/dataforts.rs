@@ -665,12 +665,12 @@ fn aggregate_for(cur: &DatafortEntry) -> AggregateView {
         };
         for a in &cur.adapters {
             let m = &a.metrics;
-            v.disk_used += m.disk_used_bytes;
-            v.disk_capacity += m.disk_capacity_bytes;
-            v.blobs_stored += m.blobs_stored_total;
-            v.blobs_fetched += m.blobs_fetched_total;
-            v.bytes_stored += m.bytes_stored_total;
-            v.gc_swept += m.gc_swept_total;
+            v.disk_used = v.disk_used.saturating_add(m.disk_used_bytes);
+            v.disk_capacity = v.disk_capacity.saturating_add(m.disk_capacity_bytes);
+            v.blobs_stored = v.blobs_stored.saturating_add(m.blobs_stored_total);
+            v.blobs_fetched = v.blobs_fetched.saturating_add(m.blobs_fetched_total);
+            v.bytes_stored = v.bytes_stored.saturating_add(m.bytes_stored_total);
+            v.gc_swept = v.gc_swept.saturating_add(m.gc_swept_total);
             v.overflow_active |= m.overflow.active;
             sum_overflow(&mut v.overflow, &m.overflow);
         }
@@ -693,18 +693,41 @@ fn sum_overflow(
     acc: &mut net_sdk::dataforts::OverflowMetricsSnapshot,
     o: &net_sdk::dataforts::OverflowMetricsSnapshot,
 ) {
-    acc.pushes_admitted_total += o.pushes_admitted_total;
-    acc.push_errors_total += o.push_errors_total;
-    acc.pushed_bytes_total += o.pushed_bytes_total;
-    acc.rejected_no_target_total += o.rejected_no_target_total;
-    acc.rejected_no_storage_cap_total += o.rejected_no_storage_cap_total;
-    acc.rejected_not_participating_total += o.rejected_not_participating_total;
-    acc.rejected_sender_not_overflowing_total += o.rejected_sender_not_overflowing_total;
-    acc.rejected_unhealthy_total += o.rejected_unhealthy_total;
-    acc.rejected_scope_mismatch_total += o.rejected_scope_mismatch_total;
-    acc.rejected_insufficient_disk_total += o.rejected_insufficient_disk_total;
-    acc.high_water_triggered_total += o.high_water_triggered_total;
-    acc.low_water_cleared_total += o.low_water_cleared_total;
+    // Saturating per-counter sum — matches the rest of the
+    // deck's u64 aggregation pattern (H7 set this on NODES);
+    // unbounded telemetry sums against a fully populated
+    // cluster could otherwise overflow on the wire even if
+    // each adapter's counters stay within range.
+    acc.pushes_admitted_total = acc.pushes_admitted_total.saturating_add(o.pushes_admitted_total);
+    acc.push_errors_total = acc.push_errors_total.saturating_add(o.push_errors_total);
+    acc.pushed_bytes_total = acc.pushed_bytes_total.saturating_add(o.pushed_bytes_total);
+    acc.rejected_no_target_total = acc
+        .rejected_no_target_total
+        .saturating_add(o.rejected_no_target_total);
+    acc.rejected_no_storage_cap_total = acc
+        .rejected_no_storage_cap_total
+        .saturating_add(o.rejected_no_storage_cap_total);
+    acc.rejected_not_participating_total = acc
+        .rejected_not_participating_total
+        .saturating_add(o.rejected_not_participating_total);
+    acc.rejected_sender_not_overflowing_total = acc
+        .rejected_sender_not_overflowing_total
+        .saturating_add(o.rejected_sender_not_overflowing_total);
+    acc.rejected_unhealthy_total = acc
+        .rejected_unhealthy_total
+        .saturating_add(o.rejected_unhealthy_total);
+    acc.rejected_scope_mismatch_total = acc
+        .rejected_scope_mismatch_total
+        .saturating_add(o.rejected_scope_mismatch_total);
+    acc.rejected_insufficient_disk_total = acc
+        .rejected_insufficient_disk_total
+        .saturating_add(o.rejected_insufficient_disk_total);
+    acc.high_water_triggered_total = acc
+        .high_water_triggered_total
+        .saturating_add(o.high_water_triggered_total);
+    acc.low_water_cleared_total = acc
+        .low_water_cleared_total
+        .saturating_add(o.low_water_cleared_total);
 }
 
 // ───────────────────────── helpers ─────────────────────────

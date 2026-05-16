@@ -201,12 +201,7 @@ pub(crate) fn record_matches(rec: &FailureRecord, needle_lower: &str) -> bool {
         || super::audit::ascii_icontains(&rec.reason, needle_lower)
 }
 
-fn unix_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use super::unix_now_ms;
 
 fn format_relative(recorded_at_ms: u64, now_ms: u64) -> String {
     let delta = now_ms.saturating_sub(recorded_at_ms) / 1_000;

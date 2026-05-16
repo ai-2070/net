@@ -121,7 +121,24 @@ impl BookmarkStore {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
-                let aside = path.with_extension(format!("toml.corrupt-{stamp}"));
+                // Resolve a non-colliding aside path. Two
+                // corrupt-recovery cycles inside the same ms
+                // (rare but possible on a fast restart loop)
+                // would otherwise clobber the prior aside;
+                // probe `.toml.corrupt-{stamp}`,
+                // `.toml.corrupt-{stamp}-1`, … until one is
+                // free. Best-effort — if the loop overflows
+                // (1000+ collisions, only realistic in test
+                // scaffolding) fall back to the raw stamp and
+                // let the rename clobber, since the prior
+                // aside is also a recovery artefact.
+                let mut aside = path.with_extension(format!("toml.corrupt-{stamp}"));
+                for suffix in 1..1000u32 {
+                    if !aside.exists() {
+                        break;
+                    }
+                    aside = path.with_extension(format!("toml.corrupt-{stamp}-{suffix}"));
+                }
                 // Best-effort rename — if it fails, surface the
                 // parse error instead so the operator at least
                 // sees a meaningful message.

@@ -1371,10 +1371,15 @@ fn hash_matches_pattern(hash: &[u8; 32], pat: &HexPrefixPattern) -> bool {
 /// Lowercase-hex render of a 32-byte hash. Inline to avoid a
 /// `hex` crate dependency here; the substrate already has
 /// `blake3::Hash::to_hex` but we hold raw `[u8; 32]` keys.
+/// Uses `write!` into the pre-allocated buffer rather than
+/// `format!` per byte — saves 64 transient `String` allocs
+/// per call, which adds up on prefix scans across a 32k-entry
+/// refcount table.
 fn hex_encode(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
     let mut out = String::with_capacity(64);
     for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+        let _ = write!(&mut out, "{b:02x}");
     }
     out
 }

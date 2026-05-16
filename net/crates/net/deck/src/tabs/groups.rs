@@ -439,17 +439,7 @@ fn render_log_tail(frame: &mut Frame<'_>, area: Rect, daemon_id: u64, logs: &[Lo
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn fmt_ts(ts_ms: u64) -> String {
-    // Render as HH:MM:SS.mmm derived from unix-ms. No TZ
-    // conversion — operators correlate against the same clock
-    // the substrate stamps.
-    let total_s = ts_ms / 1000;
-    let ms = ts_ms % 1000;
-    let s = total_s % 60;
-    let m = (total_s / 60) % 60;
-    let h = (total_s / 3600) % 24;
-    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
-}
+use super::fmt_ts_hms_ms as fmt_ts;
 
 fn render_controls(frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default()

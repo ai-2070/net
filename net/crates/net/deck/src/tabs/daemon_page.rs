@@ -372,14 +372,6 @@ fn kv(label: &str, value: &str, value_style: ratatui::style::Style) -> Line<'sta
     ])
 }
 
+use super::fmt_ts_hms_ms as fmt_ts;
 use super::format_age_ms as format_age;
 use super::short_id;
-
-fn fmt_ts(ts_ms: u64) -> String {
-    let total_s = ts_ms / 1000;
-    let ms = ts_ms % 1000;
-    let s = total_s % 60;
-    let m = (total_s / 60) % 60;
-    let h = (total_s / 3600) % 24;
-    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
-}

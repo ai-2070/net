@@ -340,12 +340,7 @@ fn append_filter_chips(
     }
 }
 
-fn unix_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use super::unix_now_ms;
 
 /// Format a `committed_at_ms` (Unix epoch ms) as
 /// relative-to-now: "Xs ago" / "Xm ago" / "Xh ago".
