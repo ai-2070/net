@@ -80,6 +80,10 @@ groups = ["compute", "net-sdk/groups"]
 # consumers asking only for `meshos` get the full transitive dep
 # chain.
 meshos = ["compute", "cortex", "net/meshos", "net-sdk/meshos"]
+# Deck SDK — operator-side bindings (`DECK_SDK_PLAN.md` Phase 5).
+# Builds on `meshos` for the supervisor runtime + snapshot reader.
+# Phase 1 substrate constraint: non-signing today.
+deck = ["meshos", "net-sdk/deck"]
 # Test-only helpers (`testInjectSyntheticPeer`, etc.). Gated
 # separately so enabling `groups` alone does NOT export test-only
 # APIs to production JS consumers. The vitest suite builds with

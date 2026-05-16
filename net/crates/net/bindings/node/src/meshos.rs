@@ -940,3 +940,14 @@ impl MeshOsDaemonSdk {
             .map_err(|e| sdk_err("shutdown_failed", format!("runtime shutdown failed: {e:?}")))
     }
 }
+
+// Sibling-module accessor for the Deck binding. Returns `None`
+// when the SDK has been consumed by `shutdown`. Same shape as
+// the PyO3 binding's `with_core` accessor.
+#[cfg(feature = "deck")]
+impl MeshOsDaemonSdk {
+    pub(crate) async fn with_core<R>(&self, f: impl FnOnce(&CoreSdk) -> R) -> Option<R> {
+        let guard = self.inner.lock().await;
+        guard.as_ref().map(f)
+    }
+}

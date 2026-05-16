@@ -576,8 +576,10 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.AdminCommands = nativeBinding.AdminCommands
 module.exports.DaemonHandle = nativeBinding.DaemonHandle
 module.exports.DaemonRuntime = nativeBinding.DaemonRuntime
+module.exports.DeckClient = nativeBinding.DeckClient
 module.exports.ForkGroup = nativeBinding.ForkGroup
 module.exports.Identity = nativeBinding.Identity
 module.exports.MemoriesAdapter = nativeBinding.MemoriesAdapter
@@ -591,6 +593,7 @@ module.exports.Net = nativeBinding.Net
 module.exports.NetDb = nativeBinding.NetDb
 module.exports.NetMesh = nativeBinding.NetMesh
 module.exports.NetStream = nativeBinding.NetStream
+module.exports.OperatorIdentity = nativeBinding.OperatorIdentity
 module.exports.Redex = nativeBinding.Redex
 module.exports.RedexFile = nativeBinding.RedexFile
 module.exports.RedexTailIter = nativeBinding.RedexTailIter
@@ -598,7 +601,9 @@ module.exports.RedisStreamDedup = nativeBinding.RedisStreamDedup
 module.exports.ReplicaGroup = nativeBinding.ReplicaGroup
 module.exports.RpcStream = nativeBinding.RpcStream
 module.exports.ServeHandle = nativeBinding.ServeHandle
+module.exports.SnapshotStream = nativeBinding.SnapshotStream
 module.exports.StandbyGroup = nativeBinding.StandbyGroup
+module.exports.StatusSummaryStream = nativeBinding.StatusSummaryStream
 module.exports.TasksAdapter = nativeBinding.TasksAdapter
 module.exports.TasksSnapshotAndWatch = nativeBinding.TasksSnapshotAndWatch
 module.exports.TaskWatchIter = nativeBinding.TaskWatchIter
