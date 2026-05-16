@@ -1,0 +1,24 @@
+net/crates/net/deck/src/app.rs
+  s_3bbc444b3ef3e5::t_44ed42199c33a5 1735
+  s_3bbc444b3ef3e5::t_46ffb977a5fb79 420-484,493,496,504
+net/crates/net/deck/src/tabs/dataforts.rs
+  s_3bbc444b3ef3e5::t_ae516621aa63d1 1-14,17-20,35-37,39,42,50-51,54-63,69-70,74-77,80-85,88-90,93,100-101,110-112,114,124-135,142-152,154,156,159-161,163-164,172-174,176,186-199,202-203,213,220-221,225-233,239-240,245-247,251,276-291,296-313,316,327-330,335-336,352,370-395,397-398,402-411,414,420-424,430-439,441-448,450-451,453-460,467-468,476-479,485-486,489,492,494-496,501,507,517-597,628,633,635-638
+net/crates/net/deck/src/runtime.rs
+  s_3bbc444b3ef3e5::t_6bdee2596be0fa 354-362
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "bff117ec4ac1407410b6b48736b1e2f4c27a9420",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
