@@ -70,6 +70,8 @@ fn tab_chips(current: Tab) -> Line<'static> {
         }
         Tab::Dataforts => {
             spans.extend([
+                chip_key("Enter"),
+                chip_desc(" detail   "),
                 chip_key("B"),
                 chip_desc(" blobs   "),
             ]);

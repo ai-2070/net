@@ -148,7 +148,7 @@ fn render_datafort_list(
         let overflow_text = overflow_label(e);
         let overflow_style = if overflow_text == "ACTIVE" {
             theme::amber()
-        } else if overflow_text == "armed" {
+        } else if overflow_text == "enabled" {
             theme::green()
         } else {
             theme::dim()
@@ -188,12 +188,12 @@ fn overflow_label(e: &DatafortEntry) -> &'static str {
         if e.adapters.iter().any(|a| a.metrics.overflow.active) {
             "ACTIVE"
         } else if e.adapters.iter().any(|a| a.overflow_enabled) {
-            "armed"
+            "enabled"
         } else {
             "off"
         }
     } else if e.capabilities.iter().any(|c| c == "dataforts.blob.overflow") {
-        "armed"
+        "enabled"
     } else {
         "off"
     }
@@ -399,13 +399,25 @@ fn render_context_row(frame: &mut Frame<'_>, area: Rect, cur: &DatafortEntry) {
     if area.height < 4 {
         return;
     }
+    // ADAPTERS sits above NODE so the drill-down (per-adapter
+    // breakdown of the cursored datafort) reads first and the
+    // host-node summary closes the section. Remote dataforts
+    // have no adapter detail, so the NODE pane takes the full
+    // section.
     if cur.is_local {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        // Adapter list is 1 row per adapter + 1 title row + 2
+        // borders. Reserve that exact height for ADAPTERS and
+        // let NODE take whatever's left.
+        let adapter_h = (cur.adapters.len() as u16 + 3).min(area.height);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(adapter_h),
+                Constraint::Min(0),
+            ])
             .split(area);
-        render_adapters_panel(frame, cols[0], cur);
-        render_node_panel(frame, cols[1], cur);
+        render_adapters_panel(frame, rows[0], cur);
+        render_node_panel(frame, rows[1], cur);
     } else {
         render_node_panel(frame, area, cur);
     }
@@ -445,7 +457,7 @@ fn render_adapters_panel(frame: &mut Frame<'_>, area: Rect, cur: &DatafortEntry)
             let overflow_chip = if m.overflow.active {
                 Span::styled("  ACTIVE", theme::amber())
             } else if a.overflow_enabled {
-                Span::styled("  armed", theme::green())
+                Span::styled("  enabled", theme::green())
             } else {
                 Span::styled("  off", theme::dim())
             };

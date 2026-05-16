@@ -417,6 +417,51 @@ impl App {
         }
     }
 
+    /// Focus the NODE page on the datafort at `idx` in the
+    /// dataforts list. For the local datafort the deck
+    /// synthesizes a `PeerSnapshot` from the same view the
+    /// DATAFORTS tab renders (the local node isn't in
+    /// `snapshot.peers`); for a remote datafort we look the
+    /// peer up by id.
+    fn focus_datafort(&mut self, idx: usize) {
+        let entries = self.collect_dataforts();
+        let Some(entry) = entries.get(idx) else { return };
+        if entry.is_local {
+            let mut caps = std::collections::BTreeSet::new();
+            for c in &entry.capabilities {
+                caps.insert(c.clone());
+            }
+            let peer = net_sdk::deck::PeerSnapshot {
+                health: Some(net_sdk::deck::PeerHealthSnapshot::Healthy),
+                cpu_load_1m: entry.cpu_load_1m,
+                mem_used_bytes: entry.mem_used_bytes,
+                mem_total_bytes: entry.mem_total_bytes,
+                disk_used_bytes: entry.disk_used_bytes,
+                disk_total_bytes: entry.disk_total_bytes,
+                capability_set: caps,
+                software_version: Some("0.17.0".to_string()),
+                ..Default::default()
+            };
+            self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
+                id: entry.id,
+                label: entry.label.map(|s| s.to_string()),
+                peer,
+            });
+        } else if let Some((id, peer)) = self
+            .snapshot
+            .peers
+            .iter()
+            .find(|(pid, _)| **pid == entry.id)
+        {
+            let label = crate::nodes::label_of(&format!("0x{:x}", *id)).map(|s| s.to_string());
+            self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
+                id: *id,
+                label,
+                peer: peer.clone(),
+            });
+        }
+    }
+
     /// Build the DATAFORTS list for the current frame. Always
     /// starts with the local datafort (the deck's host node +
     /// its wired adapters), then appends every peer in the
@@ -668,14 +713,29 @@ impl App {
                 return;
             }
             // Tab switches clear focus too (focus is a
-            // LIST/NET.MAP sub-view; jumping to another tab
-            // exits it cleanly).
+            // LIST/NET.MAP/DATAFORTS sub-view; jumping to
+            // another tab exits it cleanly). Includes left/right
+            // arrows and h/l so cycling tabs doesn't leave the
+            // node page rendered against an unrelated tab's
+            // state.
             if matches!(
                 code,
-                KeyCode::Char('1'..='9') | KeyCode::Tab | KeyCode::BackTab
+                KeyCode::Char('1'..='9')
+                    | KeyCode::Char('h')
+                    | KeyCode::Char('l')
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Left
+                    | KeyCode::Right
             ) {
                 self.node_focus = None;
                 // fall through to the normal handler
+            } else {
+                // Any other key while focused (cursor, etc) is
+                // absorbed so it doesn't act on the underlying
+                // tab — only the explicit exits above pass
+                // through.
+                return;
             }
         }
         // Search prompts are the second-tier absorber: while a
@@ -903,6 +963,14 @@ impl App {
             }
             KeyCode::Enter if self.current == Tab::List => {
                 self.focus_node(self.list_cursor);
+            }
+            // DATAFORTS: Enter opens the NODE page for the
+            // cursored datafort. Local goes via a synthesized
+            // PeerSnapshot (the local node isn't in
+            // `snapshot.peers`); remote dataforts find the
+            // matching peer by id.
+            KeyCode::Enter if self.current == Tab::Dataforts => {
+                self.focus_datafort(self.dataforts_cursor);
             }
             // DATAFORTS: cross-link to BLOBS. Operators reading
             // aggregate metrics jump straight to per-chunk
