@@ -87,9 +87,11 @@ pub fn spawn_logs_stream(deck: Arc<DeckClient>, tail: LogsTail) -> tokio::task::
                 Err(_err) => {
                     // Stream-level errors are surfaced by the
                     // SDK but rare in practice (substrate gone).
-                    // Continue tailing; the next poll may
-                    // recover. If the substrate is truly gone
-                    // the stream will end on its own.
+                    // Back off briefly so a persistently failing
+                    // stream doesn't peg a tokio worker; if the
+                    // substrate is truly gone the stream will
+                    // end on its own.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
                 }
             }
@@ -136,7 +138,17 @@ pub fn spawn_audit_stream(deck: Arc<DeckClient>, tail: AuditTail) -> tokio::task
         while let Some(item) = stream.next().await {
             match item {
                 Ok(record) => tail.push(record),
-                Err(_err) => continue,
+                Err(_err) => {
+                    // Back off briefly so a persistently
+                    // failing stream doesn't peg a tokio
+                    // worker in a tight retry loop. 50ms is
+                    // small enough to feel instant on success;
+                    // a stream that errors continuously will
+                    // either end (substrate gone — the while
+                    // loop exits) or recover.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
             }
         }
     })
@@ -186,7 +198,17 @@ pub fn spawn_failures_stream(
         while let Some(item) = stream.next().await {
             match item {
                 Ok(record) => tail.push(record),
-                Err(_err) => continue,
+                Err(_err) => {
+                    // Back off briefly so a persistently
+                    // failing stream doesn't peg a tokio
+                    // worker in a tight retry loop. 50ms is
+                    // small enough to feel instant on success;
+                    // a stream that errors continuously will
+                    // either end (substrate gone — the while
+                    // loop exits) or recover.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
             }
         }
     })
