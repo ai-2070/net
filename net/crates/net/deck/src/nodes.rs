@@ -36,6 +36,36 @@ pub fn label_of(id: &str) -> Option<&'static str> {
     NODES.iter().find(|n| n.id == id).map(|n| n.label)
 }
 
+/// Richer label resolution that falls back to the peer's
+/// capability tags when no fixture entry matches. Order of
+/// preference:
+///
+/// 1. Hardcoded fixture (`NODES`).
+/// 2. Any `region:` / `host:` scoped cap, with the prefix
+///    stripped — `region:eu-west-3` → `eu-west-3`. Matches
+///    the scope-tag shape the substrate's
+///    `dataforts::greedy::GreedyConfig` already uses.
+/// 3. The first plain (un-scoped) cap as a last resort, so
+///    a peer with `["compute.daemon", "meshos.health"]`
+///    renders as `…compute.daemon` rather than bare hex.
+///
+/// `None` only when the id isn't in the fixture AND the cap
+/// set is empty.
+pub fn label_for(id: &str, caps: &std::collections::BTreeSet<String>) -> Option<String> {
+    if let Some(fixture) = NODES.iter().find(|n| n.id == id) {
+        return Some(fixture.label.to_string());
+    }
+    for cap in caps {
+        if let Some(rest) = cap.strip_prefix("region:") {
+            return Some(rest.to_string());
+        }
+        if let Some(rest) = cap.strip_prefix("host:") {
+            return Some(rest.to_string());
+        }
+    }
+    caps.iter().next().cloned()
+}
+
 /// Render `id.label` as a 3-span sequence: id (caller-supplied
 /// style), `.` (chrome), label (dim). If the id is unknown to
 /// the fixture, returns just the id span.

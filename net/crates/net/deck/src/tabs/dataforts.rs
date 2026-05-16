@@ -38,7 +38,7 @@ use crate::{theme, widgets};
 #[derive(Clone)]
 pub struct DatafortEntry {
     pub id: u64,
-    pub label: Option<&'static str>,
+    pub label: Option<String>,
     pub is_local: bool,
     pub health: Option<&'static str>,
     pub cpu_load_1m: Option<f64>,
@@ -136,7 +136,7 @@ fn render_greedy_panel(
             Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
             Span::styled("GREEDY", theme::green_hi()),
             Span::styled(
-                format!("    {}", format_id_label(cur.id, cur.label)),
+                format!("    {}", format_id_label(cur.id, cur.label.as_deref())),
                 theme::amber(),
             ),
         ]));
@@ -229,7 +229,7 @@ fn render_datafort_list(
         let marker = if is_cursor { "▶" } else { " " };
         let id_style = if is_cursor { theme::green_hi() } else { theme::text() };
 
-        let id_label = format_id_label(e.id, e.label);
+        let id_label = format_id_label(e.id, e.label.as_deref());
         let role_text = if e.is_local { "local" } else { "remote" };
         let role_style = if e.is_local { theme::cyan() } else { theme::dim() };
 
@@ -337,7 +337,7 @@ fn render_status(
     cur: &DatafortEntry,
     agg: &AggregateView,
 ) {
-    let title_id = format_id_label(cur.id, cur.label);
+    let title_id = format_id_label(cur.id, cur.label.as_deref());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -575,7 +575,7 @@ fn render_adapters_panel(frame: &mut Frame<'_>, area: Rect, cur: &DatafortEntry)
 }
 
 fn render_node_panel(frame: &mut Frame<'_>, area: Rect, cur: &DatafortEntry) {
-    let id_label = format_id_label(cur.id, cur.label);
+    let id_label = format_id_label(cur.id, cur.label.as_deref());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -698,7 +698,7 @@ fn sum_overflow(
 
 // ───────────────────────── helpers ─────────────────────────
 
-fn format_id_label(id: u64, label: Option<&'static str>) -> String {
+fn format_id_label(id: u64, label: Option<&str>) -> String {
     match label {
         Some(l) => format!("0x{id:04x}.{l}"),
         None => format!("0x{id:04x}"),

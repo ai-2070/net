@@ -129,7 +129,7 @@ enum NodeRole {
 
 struct LiveNode {
     id: u64,
-    label: Option<&'static str>,
+    label: Option<String>,
     x: f64,
     y: f64,
     health: PeerHealthSnapshot,
@@ -165,7 +165,7 @@ fn radial_layout(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
             let x = radius_x * angle.cos();
             let y = radius_y * angle.sin();
             let health = p.health.unwrap_or(PeerHealthSnapshot::Healthy);
-            let label = crate::nodes::label_of(&format!("0x{:x}", *id));
+            let label = crate::nodes::label_for(&format!("0x{:x}", *id), &p.capability_set);
             let role = classify_role(&p.capability_set);
             LiveNode {
                 id: *id,
@@ -323,7 +323,7 @@ fn paint_live_graph(
         ctx.print(n.x, n.y, Line::styled(glyph.to_string(), cursor_style));
         ctx.print(n.x - 2.5, n.y, Line::styled("[", cursor_style));
         ctx.print(n.x + 2.5, n.y, Line::styled("]", cursor_style));
-        let id_label = match n.label {
+        let id_label = match n.label.as_deref() {
             Some(label) => format!("0x{:x}.{label}", n.id),
             None => format!("0x{:x}", n.id),
         };

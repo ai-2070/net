@@ -267,7 +267,7 @@ pub enum Modal {
         /// the NODE page for it. Always the local datafort
         /// (`0x0001`) today — BLOBS sources from local adapters.
         host_id: u64,
-        host_label: Option<&'static str>,
+        host_label: Option<String>,
     },
     /// Export confirmation — pops after `[e]` lands a file
     /// on disk so the operator sees the resolved path before
@@ -494,6 +494,31 @@ impl App {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
+    /// Resolve a node id to its human label using the chained
+    /// lookup in `crate::nodes::label_for`: fixture first, then
+    /// scoped caps, then first plain cap. Falls back to the
+    /// fixture-only `label_of` when the peer isn't in the
+    /// snapshot (e.g. the local node `0x0001`).
+    pub fn node_label(&self, id: u64) -> Option<String> {
+        let id_hex = format!("0x{id:x}");
+        if let Some(peer) = self.snapshot.peers.get(&id) {
+            crate::nodes::label_for(&id_hex, &peer.capability_set)
+        } else {
+            crate::nodes::label_of(&id_hex).map(|s| s.to_string())
+        }
+    }
+
+    /// `0x{id:x}.{label}` if the chain returns a label, bare
+    /// hex otherwise. Used by the confirm-modal proposals to
+    /// stamp the action target in a way the operator recognises.
+    pub fn node_display(&self, id: u64) -> String {
+        let suffix = self
+            .node_label(id)
+            .map(|l| format!(".{l}"))
+            .unwrap_or_default();
+        format!("0x{id:x}{suffix}")
+    }
+
     /// Focus the node at `peer_index` in the snapshot's
     /// peers-by-id order. Peers iterate the BTreeMap order, so
     /// this matches both LIST and NET.MAP cursor semantics —
@@ -509,7 +534,7 @@ impl App {
             .nth(peer_index)
             .map(|(id, p)| (*id, p.clone()));
         if let Some((id, peer)) = pair {
-            let label = crate::nodes::label_of(&format!("0x{id:x}")).map(|s| s.to_string());
+            let label = crate::nodes::label_for(&format!("0x{id:x}"), &peer.capability_set);
             self.daemon_focus = None;
             self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
                 id,
@@ -588,7 +613,7 @@ impl App {
         match row {
             crate::tabs::daemon_page::GroupRow::PlacementNode { id } => {
                 let id = *id;
-                let label = crate::nodes::label_of(&format!("0x{id:x}"));
+                let label = self.node_label(id);
                 self.focus_host(id, label);
             }
             crate::tabs::daemon_page::GroupRow::Sibling { id } => {
@@ -636,7 +661,7 @@ impl App {
     /// takes an explicit id rather than a peer-index — the host
     /// is often the local node, which doesn't live in
     /// `snapshot.peers`.
-    fn focus_host(&mut self, host_id: u64, host_label: Option<&'static str>) {
+    fn focus_host(&mut self, host_id: u64, host_label: Option<String>) {
         // Mirror `focus_daemon`'s mutual-exclusion: opening the
         // Node page drops any Daemon-page focus so the render
         // dispatcher (which checks daemon_focus first) doesn't
@@ -663,16 +688,16 @@ impl App {
             };
             self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
                 id: host_id,
-                label: host_label.map(|s| s.to_string()),
+                label: host_label,
                 peer,
                 placement_cursor: 0,
             });
         } else if let Some((id, peer)) =
             self.snapshot.peers.iter().find(|(pid, _)| **pid == host_id)
         {
-            let label = host_label
-                .map(|s| s.to_string())
-                .or_else(|| crate::nodes::label_of(&format!("0x{:x}", *id)).map(|s| s.to_string()));
+            let label = host_label.or_else(|| {
+                crate::nodes::label_for(&format!("0x{:x}", *id), &peer.capability_set)
+            });
             self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
                 id: *id,
                 label,
@@ -746,6 +771,9 @@ impl App {
                 .capability_set
                 .iter()
                 .any(|c| c == "greedy.cache" || c == "dataforts.greedy.cache");
+            // Fixture-only here — synthetic_greedy_view derives
+            // a scope set keyed off `region:` / `gpu-rig` etc.
+            // and uses the static fixture's vocabulary.
             let label = crate::nodes::label_of(&format!("0x{node_id:x}"));
             let greedy = if has_greedy {
                 Some(synthetic_greedy_view(node_id, label))
@@ -797,7 +825,7 @@ impl App {
             };
             self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
                 id: entry.id,
-                label: entry.label.map(|s| s.to_string()),
+                label: entry.label.clone(),
                 peer,
                 placement_cursor: 0,
             });
@@ -807,7 +835,8 @@ impl App {
             .iter()
             .find(|(pid, _)| **pid == entry.id)
         {
-            let label = crate::nodes::label_of(&format!("0x{:x}", *id)).map(|s| s.to_string());
+            let label =
+                crate::nodes::label_for(&format!("0x{:x}", *id), &peer.capability_set);
             self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
                 id: *id,
                 label,
@@ -837,15 +866,20 @@ impl App {
             if !has_blob && !has_greedy {
                 continue;
             }
-            let label = crate::nodes::label_of(&format!("0x{:x}", *id));
+            let label = crate::nodes::label_for(&format!("0x{:x}", *id), &p.capability_set);
             let health = match p.health {
                 Some(net_sdk::deck::PeerHealthSnapshot::Healthy) => Some("Healthy"),
                 Some(net_sdk::deck::PeerHealthSnapshot::Degraded) => Some("Degraded"),
                 Some(net_sdk::deck::PeerHealthSnapshot::Unreachable) => Some("Unreachable"),
                 _ => None,
             };
+            // synthetic_greedy_view takes the static fixture
+            // vocabulary; pass the bare fixture label, not the
+            // chained one, so scope tags stay coherent.
+            let greedy_fixture_label =
+                crate::nodes::label_of(&format!("0x{:x}", *id));
             let greedy = if has_greedy {
-                Some(synthetic_greedy_view(*id, label))
+                Some(synthetic_greedy_view(*id, greedy_fixture_label))
             } else {
                 None
             };
@@ -900,7 +934,7 @@ impl App {
         }
         tabs::dataforts::DatafortEntry {
             id: 0x0001,
-            label: Some("local"),
+            label: Some("local".to_string()),
             is_local: true,
             health: Some("Healthy"),
             cpu_load_1m: Some(0.42),
@@ -941,7 +975,7 @@ impl App {
             self.modal = Some(Modal::BlobDetail {
                 entry: entry.clone(),
                 host_id: 0x0001,
-                host_label: Some("local"),
+                host_label: Some("local".to_string()),
             });
         }
     }
@@ -1506,13 +1540,7 @@ impl App {
             .filter(|(_, r)| r.holders.contains(&node))
             .map(|(chain, _)| *chain)
             .collect();
-        let node_display = format!(
-            "0x{:x}{}",
-            node,
-            crate::nodes::label_of(&format!("0x{node:x}"))
-                .map(|l| format!(".{l}"))
-                .unwrap_or_default(),
-        );
+        let node_display = self.node_display(node);
         self.modal = Some(Modal::Confirm(
             crate::widgets::confirm::ConfirmAction::DropReplicas {
                 node,
@@ -1797,13 +1825,7 @@ impl App {
 
     fn propose_node_action(&mut self, kind: NodeActionKind) {
         let Some(node) = self.cursored_node() else { return };
-        let node_display = format!(
-            "0x{:x}{}",
-            node,
-            crate::nodes::label_of(&format!("0x{node:x}"))
-                .map(|l| format!(".{l}"))
-                .unwrap_or_default(),
-        );
+        let node_display = self.node_display(node);
         // Drain takes an operator-typed window, so it routes
         // through ParamInput rather than building a Confirm
         // directly with the hardcoded default.
@@ -1923,6 +1945,9 @@ impl App {
                     Some(Modal::BlobDetail { host_id, host_label, .. }) => {
                         self.focus_host(host_id, host_label);
                     }
+                    // ^ host_label is now Option<String>; moved
+                    // by `take()` above so this is the owning
+                    // copy.
                     // ExportDone is informational — Enter closes.
                     Some(Modal::ExportDone { .. }) => {}
                     // ParamInput is intercepted earlier in this
@@ -2048,13 +2073,7 @@ impl App {
         let this_node = 0x0001;
         let candidates = purpose.candidates(&self.snapshot, this_node);
         let Some(picked) = candidates.get(cursor).copied() else { return };
-        let picked_display = format!(
-            "0x{:x}{}",
-            picked,
-            crate::nodes::label_of(&format!("0x{picked:x}"))
-                .map(|l| format!(".{l}"))
-                .unwrap_or_default(),
-        );
+        let picked_display = self.node_display(picked);
         match purpose {
             crate::widgets::pick_node::PickNodePurpose::ForceCutoverTarget { chain } => {
                 let action = IceActionProposal::ForceCutover {
@@ -2105,13 +2124,7 @@ impl App {
                 .map(|m| m.daemon.placement)
         };
         let Some(node) = placement else { return };
-        let node_display = format!(
-            "0x{:x}{}",
-            node,
-            crate::nodes::label_of(&format!("0x{node:x}"))
-                .map(|l| format!(".{l}"))
-                .unwrap_or_default(),
-        );
+        let node_display = self.node_display(node);
         let daemon_count = self
             .snapshot
             .daemons
@@ -2483,7 +2496,13 @@ impl App {
                 );
             }
             Some(Modal::BlobDetail { entry, host_id, host_label }) => {
-                widgets::blob_detail::render(frame, area, entry, *host_id, *host_label);
+                widgets::blob_detail::render(
+                    frame,
+                    area,
+                    entry,
+                    *host_id,
+                    host_label.as_deref(),
+                );
             }
             Some(Modal::ExportDone { outcome }) => {
                 widgets::export_done::render(frame, area, outcome);

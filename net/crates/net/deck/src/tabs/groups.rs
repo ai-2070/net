@@ -326,8 +326,10 @@ fn resolve_placement_view(
     };
     NodeCardView {
         id: daemon.placement,
-        label: nodes::label_of(&format!("0x{:x}", daemon.placement))
-            .map(|s| s.to_string()),
+        label: nodes::label_for(
+            &format!("0x{:x}", daemon.placement),
+            &peer.capability_set,
+        ),
         is_local: false,
         health: match peer.health {
             Some(net_sdk::deck::PeerHealthSnapshot::Healthy) => Some("Healthy"),
