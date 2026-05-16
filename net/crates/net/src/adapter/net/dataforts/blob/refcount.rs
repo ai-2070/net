@@ -211,6 +211,30 @@ impl BlobRefcountTable {
         self.inner.iter().map(|r| (*r.key(), *r.value())).collect()
     }
 
+    /// Streaming variant of [`Self::snapshot`] that drops every
+    /// entry whose hash the predicate rejects before adding it
+    /// to the output vector. Cheaper than `snapshot().retain(..)`
+    /// for narrow-prefix scans against a large table because the
+    /// rejected entries never touch the result allocation. Used
+    /// by the adapter `list` path to honor `BlobListOptions::prefix_hex`
+    /// without materializing the whole table per call.
+    pub fn snapshot_filter<F>(&self, mut accept: F) -> Vec<([u8; 32], RefcountEntry)>
+    where
+        F: FnMut(&[u8; 32]) -> bool,
+    {
+        self.inner
+            .iter()
+            .filter_map(|r| {
+                let key = *r.key();
+                if accept(&key) {
+                    Some((key, *r.value()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Total count of hashes with `refcount == 0`. Exposed for
     /// `dataforts_blob_gc_pending` — operators see how much
     /// the sweep would reclaim if every other condition were
