@@ -353,9 +353,14 @@ fn glyph_for(n: &LiveNode) -> (char, ratatui::style::Color) {
         PeerHealthSnapshot::Unreachable => theme::RED,
         _ => theme::TEXT,
     };
-    let glyph = match n.role {
-        NodeRole::Node => '◆',
-        NodeRole::Datafort => '■',
+    // Unreachable peers get the hollow diamond the legend
+    // advertises so the operator's eye picks them out even at
+    // a glance — color alone reads as "amber-but-redder" on a
+    // dense map and the legend then doesn't match the canvas.
+    let glyph = match (n.role, n.health) {
+        (_, PeerHealthSnapshot::Unreachable) => '◇',
+        (NodeRole::Node, _) => '◆',
+        (NodeRole::Datafort, _) => '■',
     };
     (glyph, color)
 }
