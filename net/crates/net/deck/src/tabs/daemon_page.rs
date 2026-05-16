@@ -62,7 +62,12 @@ pub fn render(
     live: &MeshOsSnapshot,
     logs: &[LogRecord],
 ) {
-    let rows_total = group_rows(entry, live);
+    // Cache the lineage grouping for the whole frame — both
+    // the facts panel (lineage_info) and the group panel
+    // (sibling_role per row) used to recompute it per call,
+    // re-walking the full daemon set N+1 times per render.
+    let groups = lineage::group_daemons(&live.daemons);
+    let rows_total = group_rows_from(entry, &groups);
     let group_h = (rows_total.len() as u16 + 2).clamp(4, 12);
 
     let rows = Layout::default()
@@ -75,8 +80,8 @@ pub fn render(
         ])
         .split(area);
 
-    render_facts_panel(frame, rows[0], entry, live);
-    render_group_panel(frame, rows[1], entry, live, &rows_total);
+    render_facts_panel(frame, rows[0], entry, &groups);
+    render_group_panel(frame, rows[1], entry, &groups, &rows_total);
     render_log_tail(frame, rows[2], entry.id, logs);
     let hint_row = Rect {
         height: 1,
@@ -88,11 +93,15 @@ pub fn render(
 /// Build the GROUP list (placement at index 0, siblings 1..N).
 /// Public so the Enter handler can dispatch on the cursor.
 pub fn group_rows(entry: &DaemonFocusEntry, live: &MeshOsSnapshot) -> Vec<GroupRow> {
+    let groups = lineage::group_daemons(&live.daemons);
+    group_rows_from(entry, &groups)
+}
+
+fn group_rows_from(entry: &DaemonFocusEntry, groups: &[lineage::LiveGroup<'_>]) -> Vec<GroupRow> {
     let mut out: Vec<GroupRow> = Vec::new();
     out.push(GroupRow::PlacementNode {
         id: entry.snapshot.placement,
     });
-    let groups = lineage::group_daemons(&live.daemons);
     if let Some(group) = groups
         .iter()
         .find(|g| g.members.iter().any(|m| m.id == entry.id))
@@ -110,10 +119,10 @@ fn render_facts_panel(
     frame: &mut Frame<'_>,
     area: Rect,
     entry: &DaemonFocusEntry,
-    live: &MeshOsSnapshot,
+    groups: &[lineage::LiveGroup<'_>],
 ) {
     let d = &entry.snapshot;
-    let (group_kind, display_name, member_count, role) = lineage_info(entry, live);
+    let (group_kind, display_name, member_count, role) = lineage_info(entry, groups);
 
     let title = Line::from(vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
@@ -196,10 +205,9 @@ fn render_facts_panel(
 
 fn lineage_info(
     entry: &DaemonFocusEntry,
-    live: &MeshOsSnapshot,
+    groups: &[lineage::LiveGroup<'_>],
 ) -> (LiveGroupKind, String, usize, LiveRole) {
-    let groups = lineage::group_daemons(&live.daemons);
-    for g in &groups {
+    for g in groups {
         if let Some(m) = g.members.iter().find(|m| m.id == entry.id) {
             return (g.kind, g.display_name.clone(), g.members.len(), m.role);
         }
@@ -220,7 +228,7 @@ fn render_group_panel(
     frame: &mut Frame<'_>,
     area: Rect,
     entry: &DaemonFocusEntry,
-    live: &MeshOsSnapshot,
+    groups: &[lineage::LiveGroup<'_>],
     rows: &[GroupRow],
 ) {
     let cursor = entry.cursor.min(rows.len().saturating_sub(1));
@@ -267,7 +275,7 @@ fn render_group_panel(
                 } else {
                     theme::text()
                 };
-                let (role_text, role_style) = sibling_role(*id, live);
+                let (role_text, role_style) = sibling_role(*id, groups);
                 let suffix = if is_self { "  (this daemon)" } else { "" };
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {marker} "), marker_style),
@@ -283,9 +291,11 @@ fn render_group_panel(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn sibling_role(daemon_id: u64, live: &MeshOsSnapshot) -> (String, ratatui::style::Style) {
-    let groups = lineage::group_daemons(&live.daemons);
-    for g in &groups {
+fn sibling_role(
+    daemon_id: u64,
+    groups: &[lineage::LiveGroup<'_>],
+) -> (String, ratatui::style::Style) {
+    for g in groups {
         if let Some(m) = g.members.iter().find(|m| m.id == daemon_id) {
             let style = match g.kind {
                 LiveGroupKind::Solo => theme::dim(),
