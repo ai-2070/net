@@ -1,0 +1,24 @@
+net/crates/net/deck/src/tabs/daemon_page.rs
+  s_46edf7dc333ef6::t_c06d7b66c9f1fc 122,125
+  s_46edf7dc333ef6::t_23c961d0a006b2 231
+  s_46edf7dc333ef6::t_820b235e688209 294-298
+  s_46edf7dc333ef6::t_a4f24b059931bc 208,210
+  s_46edf7dc333ef6::t_70b4876583b02f 65-70,83-84,96-100
+  s_46edf7dc333ef6::t_ce512a258e69a6 278
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "a373c9047fbc44e3fe335e61cc4b1dcf26cb0109",
+  "prompts": {},
+  "sessions": {
+    "s_46edf7dc333ef6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e145bb62-38ea-4dbe-81cd-e36e7e65c2ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
