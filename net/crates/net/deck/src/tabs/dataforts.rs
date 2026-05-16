@@ -73,16 +73,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entries: &[DatafortEntry], curs
         .constraints([
             Constraint::Length(list_height),
             Constraint::Length(3),  // aggregate status bar
-            Constraint::Length(14), // IO + OVERFLOW
             Constraint::Min(0),     // context (adapters | node)
+            Constraint::Length(14), // STORE + OVERFLOW counters
         ])
         .split(area);
     render_datafort_list(frame, rows[0], entries, cursor);
     let cur = &entries[cursor];
     let agg = aggregate_for(cur);
     render_status(frame, rows[1], cur, &agg);
-    render_body(frame, rows[2], cur, &agg);
-    render_context_row(frame, rows[3], cur);
+    render_context_row(frame, rows[2], cur);
+    render_body(frame, rows[3], cur, &agg);
 }
 
 // ───────────────────────── top list ─────────────────────────
@@ -399,25 +399,16 @@ fn render_context_row(frame: &mut Frame<'_>, area: Rect, cur: &DatafortEntry) {
     if area.height < 4 {
         return;
     }
-    // ADAPTERS sits above NODE so the drill-down (per-adapter
-    // breakdown of the cursored datafort) reads first and the
-    // host-node summary closes the section. Remote dataforts
-    // have no adapter detail, so the NODE pane takes the full
-    // section.
+    // ADAPTERS sits to the left, NODE to the right, side-by-
+    // side. Remote dataforts have no adapter detail, so the
+    // NODE pane takes the full row.
     if cur.is_local {
-        // Adapter list is 1 row per adapter + 1 title row + 2
-        // borders. Reserve that exact height for ADAPTERS and
-        // let NODE take whatever's left.
-        let adapter_h = (cur.adapters.len() as u16 + 3).min(area.height);
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(adapter_h),
-                Constraint::Min(0),
-            ])
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(area);
-        render_adapters_panel(frame, rows[0], cur);
-        render_node_panel(frame, rows[1], cur);
+        render_adapters_panel(frame, cols[0], cur);
+        render_node_panel(frame, cols[1], cur);
     } else {
         render_node_panel(frame, area, cur);
     }
