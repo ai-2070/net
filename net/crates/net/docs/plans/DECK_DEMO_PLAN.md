@@ -24,21 +24,21 @@ Three reasons this is worth a written plan:
 
 ## What ships
 
-Four phases. Each lands a vertical slice that's usable on its own (you can ship Phase 1 alone and have a real-cluster demo that doesn't migrate; you can ship Phases 1+2 without dataforts activity; etc.).
+Five phases. Each lands a vertical slice that's usable on its own (you can ship Phase 1 alone and have a real-cluster demo with empty NRPC + MIGRATIONS tabs; each subsequent phase fills in another tab).
 
-1. **Phase 1 — Real daemons across real nodes.** Boot 3 (or 5 — see [§Open questions](#open-questions)) MeshOS runtimes via the harness from `DECK_DEMO_HARNESS_PLAN.md`. Register three real `MeshDaemon` impls: `HeartbeatDaemon` (publishes one log line per second per node, drives LOGS / MESH.EVENTS), `MixerDaemon` × 3 as a real `ReplicaGroup` (drives GROUPS / CHAINS), `DroneDaemon` × 3 as a real `ForkGroup` (drives the fork lineage flavor). The substrate folds them into `snapshot.daemons` naturally — no injection. Total ~7 real daemons across 3-5 real runtimes.
+1. **Phase 1 — Real daemons across real nodes.** Boot 5 MeshOS runtimes via the harness from `DECK_DEMO_HARNESS_PLAN.md`. Register four real `MeshDaemon` impls: `HeartbeatDaemon` (one per node — publishes log lines at natural daemon cadence, drives LOGS / MESH.EVENTS), `MixerDaemon` × 3 as a real `ReplicaGroup` (drives GROUPS / CHAINS), `DroneDaemon` × 3 as a real `ForkGroup` (drives the fork lineage flavor), `PyroSafetyDaemon` × 3 as a real `StandbyGroup` (drives the standby lineage flavor — 1 active + 2 warm, demonstrates `promote` on demand). The substrate folds them into `snapshot.daemons` naturally — no injection. Total ~14 real daemons across 5 real runtimes.
 
 2. **Phase 2 — Real dataforts activity.** Each demo node attaches a real `MeshBlobAdapter` (the existing in-memory `Redex`-backed adapter — already real, the samples just don't use it from real nodes today). `HeartbeatDaemon` writes a small blob per tick and references it in its next log line. BLOBS and DATAFORTS tabs read live `BlobInventoryEntry` records produced by real `store_*` calls, not the boot-time fixture. The greedy-LRU + data-gravity instrumentation surfaces actual eviction / fetch counters.
 
-3. **Phase 3 — Real migrations.** A demo-side scheduler picks one daemon every ~30 s and calls `DaemonRuntime::migrate_to` against a peer node. The real `MigrationOrchestrator` drives the 6-phase machine (`Snapshot → Transfer → Restore → Replay → Cutover → Complete`); `MeshOsRuntime` folds the in-flight record into `snapshot.in_flight_migrations`. Replaces `SampleMigrationSnapshotSource` end-to-end. Operator can `[K]` from the MIGRATIONS tab to actually kill a real migration via ICE.
+3. **Phase 3 — Real migrations (v1, day-one).** A demo-side scheduler picks one daemon every ~30 s and calls `DaemonRuntime::migrate_to` against a peer node. The real `MigrationOrchestrator` drives the 6-phase machine (`Snapshot → Transfer → Restore → Replay → Cutover → Complete`); `MeshOsRuntime` folds the in-flight record into `snapshot.in_flight_migrations`. Replaces `SampleMigrationSnapshotSource` end-to-end. Operator can `[K]` from the MIGRATIONS tab to actually kill a real migration via ICE. Ships in v1 — no env-var disable knob; the demo is incomplete without it.
 
-4. **Phase 4 — Cargo + cleanup.** Remove `samples`, `samples-logs`, the `samples_logs` module, and every `Sample*Probe` / fixture constant from `deck/src/runtime.rs`. Add `demo` (off by default; `cargo run --features demo`). Move the in-memory `Redex` adapter setup that's currently flag-gated into the always-on harness path so the single-node default ships with a working dataforts surface. Update `main.rs` to branch on the feature: `demo::spawn()` under the flag, `runtime::spawn()` otherwise.
+4. **Phase 4 — Real nRPC observation.** Depends on `DECK_DEMO_HARNESS_PLAN.md` Missing item D (substrate-level `RpcObserver` hook on `Mesh::call_typed` / `serve_rpc_typed`). Two demo-side pieces land here: an `RpcChatterPair` (a tiny `requester` daemon that periodically calls a `responder` daemon's typed RPC method) wired across 4 of the 5 nodes so calls flow over real handshake-encrypted UDP, and the deck's `NrpcTail` re-pointed at the observer hook instead of the synthetic seeder. NRPC tab populates from real call records — caller, callee, method, latency, status, byte counts — produced by the substrate's actual nRPC dispatch path.
+
+5. **Phase 5 — Cargo + cleanup.** Remove `samples`, `samples-logs`, the `samples_logs` module, and every `Sample*Probe` / fixture constant from `deck/src/runtime.rs`. Add `demo` (off by default; `cargo run --features demo`). Move the in-memory `Redex` adapter setup that's currently flag-gated into the always-on harness path so the single-node default ships with a working dataforts surface. Update `main.rs` to branch on the feature: `demo::spawn()` under the flag, `runtime::spawn()` otherwise.
 
 ## What this doc does NOT ship
 
 🚫 **Not a real distributed cluster.** All nodes share one OS process. Suitable for "show me the deck UI against real-looking telemetry," not for load testing or network-fault scenarios. UDP loopback is real transport but every runtime crashes together.
-
-🚫 **Not an nRPC observer.** Today's `samples-logs` nRPC seeder fabricates 150 ms call records to populate the NRPC tab. The SDK has no nRPC observer hook yet — adding one is a substrate-level Phase 5+ piece, out of scope. The NRPC tab stays empty under `demo`; document the gap in the empty-state hint instead of faking it.
 
 🚫 **Not failure-injection.** A "canary daemon that crashes every 90 s" would populate the FAILURES tab. Out of scope for v1 — operators who want to see the failures path can `cargo run --features demo` and then hit `[K]` on a migration or `[F]` to force-freeze a node; the substrate emits real failure records from real ICE actions.
 
@@ -48,22 +48,23 @@ Four phases. Each lands a vertical slice that's usable on its own (you can ship 
 
 ### Phase 1 — Real daemons (the load-bearing slice)
 
-**Goal.** A 3-node `cargo run --features demo` boots a real cluster, registers real daemons, and every deck tab renders live data within ~3 seconds of startup.
+**Goal.** A 5-node `cargo run --features demo` boots a real cluster, registers real daemons, and every deck tab — LOGS, NODES, DAEMONS, GROUPS, CHAINS, NET.MAP — renders live data within ~5 s of startup. (NRPC + MIGRATIONS populate in Phases 3–4.)
 
 **Depends on.** `DECK_DEMO_HARNESS_PLAN.md` Phase 0 (multi-node harness) + Missing-item A (daemon supervisor) + Missing-item B (real chain placement) + Missing-item C (lifecycle coordination).
 
 **Files this phase adds.**
 - `deck/src/demo/mod.rs` — feature-gated module, re-exports `spawn` + the demo `Harness` type.
-- `deck/src/demo/cluster.rs` — calls into the harness from `DECK_DEMO_HARNESS_PLAN.md`; configures node count, peer topology, port pool.
-- `deck/src/demo/daemons.rs` — `HeartbeatDaemon`, `MixerDaemon`, `DroneDaemon` impls.
+- `deck/src/demo/cluster.rs` — calls into the harness from `DECK_DEMO_HARNESS_PLAN.md`; configures the 5-node topology + port pool.
+- `deck/src/demo/daemons.rs` — `HeartbeatDaemon`, `MixerDaemon`, `DroneDaemon`, `PyroSafetyDaemon` impls.
 - `deck/src/demo/spawn.rs` — orchestrates boot order: harness up → peer mesh stabilized → daemons registered → groups spawned → return a `Harness` to `main.rs`.
 
 **Daemons in concrete terms.**
-- `HeartbeatDaemon`: one per node. `process()` is a no-op (nothing inbound). A tokio task spawned alongside it calls `publish_log` every 1 s with a varying message (tick count, free-form text drawn from a small per-node corpus so the LOGS tab doesn't read identically across nodes). Total: one daemon per node.
-- `MixerDaemon`: a `ReplicaGroup` of 3 members across the 3 nodes. The group's factory builds members with deterministic keypairs (`group_seed + index`). `process()` handles a fake `MixCommand` event the demo publishes every ~5 s; routes round-robin across members. Drives the GROUPS tab's replica row and the CHAINS tab's first chain.
-- `DroneDaemon`: a `ForkGroup` of 3 forks from a common parent at `fork_seq = 7`. Each fork's identity is unique. `process()` is a no-op. Exists to populate the GROUPS tab's fork-lineage tag and the second chain in the CHAINS tab.
+- `HeartbeatDaemon`: one per node (5 total). `process()` is a no-op (nothing inbound). A tokio task spawned alongside it calls `publish_log` at natural daemon cadence — roughly every 800 ms with jitter, varied messages drawn from a per-node corpus so the LOGS tab doesn't read identically across nodes. Total LOGS rate: ~6 lines/s; intentionally verbose.
+- `MixerDaemon`: a `ReplicaGroup` of 3 members placed across 3 of the 5 nodes by `Scheduler::place_with_spread`. The group's factory builds members with deterministic keypairs (`group_seed + index`). `process()` handles a `MixCommand` event the demo publishes every ~3 s; routes round-robin across members. Drives the GROUPS tab's replica row and the CHAINS tab's first chain.
+- `DroneDaemon`: a `ForkGroup` of 3 forks from a common parent at `fork_seq = 7`. Each fork's identity is unique. `process()` is a no-op. Populates the GROUPS tab's fork-lineage tag and the second chain in the CHAINS tab.
+- `PyroSafetyDaemon`: a `StandbyGroup` (1 active + 2 warm) placed across the remaining nodes. `sync_standbys(...)` runs at ~10 s cadence so the standby `synced_through` advances visibly. Operator can hit `[P]` (TBD binding) to trigger a real `promote` and see the active swap in the GROUPS tab.
 
-**Boot expectations.** From `cargo run --features demo` to fully-stabilized cluster: < 5 s. The deck shows a "booting demo cluster… (N/3 nodes ready)" splash while the harness comes up.
+**Boot expectations.** From `cargo run --features demo` to fully-stabilized cluster: < 5 s. The deck shows a "booting demo cluster… (N/5 nodes ready)" splash while the harness comes up.
 
 ### Phase 2 — Real dataforts activity
 
@@ -78,7 +79,7 @@ Four phases. Each lands a vertical slice that's usable on its own (you can ship 
 
 ### Phase 3 — Real migrations
 
-**Goal.** MIGRATIONS tab observes real in-flight migrations driven by `MigrationOrchestrator::migrate_to`. The 4-record `SampleMigrationSnapshotSource` is deleted; the production `OrchestratorMigrationSnapshotSource` is wired in its place.
+**Goal.** MIGRATIONS tab observes real in-flight migrations driven by `MigrationOrchestrator::migrate_to`. The 4-record `SampleMigrationSnapshotSource` is deleted; the production `OrchestratorMigrationSnapshotSource` is wired in its place. Day-one v1 deliverable — the demo is not feature-complete without it.
 
 **What lands.**
 - `deck/src/demo/migrator.rs` — a tokio task that, every ~30 s, picks one `HeartbeatDaemon` instance and calls `runtime.migrate_to(daemon, target_node)`. Target is picked round-robin across non-source nodes. Resolves the daemon → target NodeId via `Scheduler::query`.
@@ -87,7 +88,20 @@ Four phases. Each lands a vertical slice that's usable on its own (you can ship 
 
 **Cadence trade-off.** 30 s is "long enough that the operator sees the migration progress through phases on screen, short enough that there's always one in flight to look at." Shorter and the MIGRATIONS tab is constantly busy; longer and the demo reads as quiet. Tunable via a constant in `demo/migrator.rs`.
 
-### Phase 4 — Cargo + cleanup
+### Phase 4 — Real nRPC observation
+
+**Goal.** NRPC tab populates from real `Mesh::call_typed` / `serve_rpc_typed` traffic flowing across the cluster, observed via the substrate-level `RpcObserver` hook from `DECK_DEMO_HARNESS_PLAN.md` Missing item D.
+
+**Depends on.** `DECK_DEMO_HARNESS_PLAN.md` Missing item D (`RpcObserver` trait on `Mesh`, fired on each call's send + receive boundary, carries `(caller, callee, method, latency_ms, status, request_bytes, response_bytes)`).
+
+**What lands on the demo side.**
+- `deck/src/demo/rpc_chatter.rs` — defines `RpcChatterDaemon` in two roles: a *responder* registered on 2 nodes that serves a small typed RPC surface (`echo`, `ping`, `metrics_snapshot`), and a *requester* registered on the remaining 3 nodes that fires a call against a random responder every ~250 ms. Round-robin method selection across the surface so the NRPC tab shows method-level diversity.
+- `deck/src/streams.rs::NrpcTail` wired to the new observer: a small bridge `impl RpcObserver` pushes each completed call into the existing `NrpcTail` ring, replacing the `samples-logs` synthetic seeder entirely. The bridge installs on every node's `Mesh` at harness boot.
+- Status mix is whatever the real RPC dispatch produces — `Ok` is the default; `Error` records show up on the rare boot-race calls before the responder side is fully registered, and (per Phase 3) on calls aimed at a daemon that's mid-migration. No fabricated error distribution.
+
+**Per-node call volume.** 3 requesters at 250 ms each = ~12 calls/s observed. Roughly the same density the synthetic seeder produced (~6/s) but real. If the LOGS tab becomes drowned by mesh chatter during early testing, requester cadence is bumped down. Tunable via a constant in `demo/rpc_chatter.rs`.
+
+### Phase 5 — Cargo + cleanup
 
 **Cargo edits in `deck/Cargo.toml`.**
 - Delete `[features] samples = [...]` and `samples-logs = ["samples"]`.
@@ -96,24 +110,19 @@ Four phases. Each lands a vertical slice that's usable on its own (you can ship 
 
 **Code edits.**
 - Delete `samples_logs` module + every `Sample*Probe` and `SampleDaemon` in `deck/src/runtime.rs`.
+- Delete `runtime::spawn_nrpc_seeder` and every synthetic-injector path — Phase 4 replaced them with the real `RpcObserver` bridge feeding `NrpcTail`.
 - Move the in-memory `MeshBlobAdapter` wiring that was `samples`-gated into the always-on path with adapter-list = empty. The single-node default ships with the dataforts surface compiled in (already the case) but no adapters wired by default; the user wires their own.
 - `main.rs` branches: `#[cfg(feature = "demo")] let harness = demo::spawn().await?;` else `let harness = runtime::spawn().await?;`.
-- Update `runtime/spawn_nrpc_seeder`'s callers and feature gates. The seeder + injector go away with `samples-logs`; the `NrpcTail` stays (rendering empty when no observer is wired — same as today's non-`samples-logs` build).
+- The `NrpcTail` survives but stays observer-driven. Non-demo single-node builds render it empty until the operator wires their own observer (clean shape; no fixture).
 
 **Doc edits.** `DECK_FEATURES.md` and the deck `README.md` get a section explaining the demo flag. `DECK_PLAN.md`'s opening status line mentions the demo flag exists.
 
-## Open questions
-
-1. **3 nodes vs 5 nodes.** 3 is the smallest count that exercises every lineage shape (replica trio, fork trio, plus 1 standby). 5 gives room for standby groups to breathe (1 active + 2 warm), more diverse chain holders, and a less crowded NET.MAP. 5 also doubles roughly every cost (RAM, ports, tokio tasks) and pushes boot time toward 5-7 s. **Recommend 3 for v1, configurable via env var (`DECK_DEMO_NODES=5`) for operators who want the larger view.**
-
-2. **Phase 3 in v1 or v2.** Real migrations are the most visually compelling demo feature but the most likely to be flaky on first cut (phase transitions are sensitive to RTT jitter and snapshot size). **Recommend including Phase 3 in v1 but with a `DECK_DEMO_MIGRATIONS=0` env-var override to disable it if the early implementation is too noisy in screenshots.**
-
-3. **Log verbosity.** `samples-logs` deliberately over-emitted at ~1.3 s cadence so the LOGS tab always had fresh content. With real daemons emitting at 1 s per node × 3 nodes, the LOGS tab gets ~3 lines/s — denser than `samples-logs` and probably right for a demo. If it reads as noisy, the per-daemon cadence becomes 2-3 s and the corpus widens. **Recommend 1 s per node for v1; revisit after seeing it on screen.**
-
-4. **NRPC tab.** Documented as "empty under demo, no observer wired." Acceptable for v1. The alternative is one of (a) keep the synthetic seeder under a separate flag, (b) build a real nRPC observer in the SDK. (b) is the right long-term answer but is itself a substrate Phase 5+ piece; (a) reintroduces the same drift problem `demo` was meant to solve. **Recommend (none) for v1 — empty NRPC with a clear hint.**
-
 ## Locked decisions
 
+- **5 nodes.** Hardcoded in v1 — no env-var override. Five is enough room for `ReplicaGroup` × 3, `ForkGroup` × 3, and `StandbyGroup` (1 active + 2 warm) without contention, with diverse chain holders and an uncluttered NET.MAP. Costs (RAM / ports / tokio tasks) acceptable on any dev laptop. Boot time budget: < 5 s.
+- **Real migrations day-one.** Phase 3 ships in v1. No env-var disable knob — the demo is incomplete without it. Initial flakiness from RTT jitter or snapshot-size issues is treated as a bug to fix, not a feature to gate.
+- **Real logging, verbose-OK.** `HeartbeatDaemon` emits at natural cadence (~800 ms with jitter, ~6 lines/s across the 5 nodes). No artificial throttling. If the LOGS tab reads as noisy, the answer is to lean on the existing filter bar / pause toggle, not to slow the daemons.
+- **Real `RpcObserver`, not a fake.** Phase 4 builds the substrate-level observer hook (`DECK_DEMO_HARNESS_PLAN.md` Missing item D) and wires `NrpcTail` to it. The synthetic seeder is deleted. NRPC tab populates from real traffic only.
 - **One process, N runtimes.** Multi-process demos (each runtime as its own OS process, deck attaches via remote `DeckClient`) are out of scope — that's the multi-cluster slice's territory.
 - **UDP loopback.** Each runtime gets its own ephemeral port on `127.0.0.1`. No in-memory channel transport — the real handshake / capability broadcast / scope enforcement run end-to-end.
 - **Real signing.** ICE actions from the deck use a demo operator identity (deterministic keypair seeded from a fixed string). The signed-commit path is the real one; the identity is just convenient.
@@ -121,6 +130,6 @@ Four phases. Each lands a vertical slice that's usable on its own (you can ship 
 
 ## Deferred work
 
-- **nRPC observer.** Real call records in the NRPC tab need an SDK-level observer hook. Substrate-level Phase 5+ work; tracked separately.
 - **Cross-host demo cluster.** A `demo` mode that spawns N processes across a small inventory of hosts (for a "real" datacenter feel during demos) is a future option. Reuses everything from this plan but the harness picks real IP addresses instead of `127.0.0.1`.
 - **Demo-side stress knobs.** "Spawn 100 daemons", "rotate chain leaders every 5 s", "simulate node loss" — operator-facing demo controls. Out of scope for the first cut; add once the v1 demo is in operators' hands and a real ask emerges.
+- **Failure-injection canary.** A daemon that crashes on schedule to drive the FAILURES tab without operator ICE actions. Deferred per [§What this doc does NOT ship](#what-this-doc-does-not-ship).
