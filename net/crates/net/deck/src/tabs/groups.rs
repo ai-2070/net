@@ -232,9 +232,7 @@ fn health_repr(d: &DaemonSnapshot) -> (ratatui::style::Color, &'static str) {
     }
 }
 
-fn short_id(id: u64) -> String {
-    format!("0x{id:x}")
-}
+use super::short_id;
 
 // ───────────────────────── live detail (right pane) ─────────────────────────
 
