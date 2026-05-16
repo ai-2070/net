@@ -1654,6 +1654,8 @@ impl App {
             widgets::footer::render(
                 frame,
                 chunks[4],
+                self.current,
+                true,
                 self.toast.as_ref().map(|(s, _)| s.as_str()),
             );
             // Modal overlay still renders on top in case one
@@ -1785,6 +1787,8 @@ impl App {
         widgets::footer::render(
             frame,
             chunks[4],
+            self.current,
+            false,
             self.toast.as_ref().map(|(s, _)| s.as_str()),
         );
 
