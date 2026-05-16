@@ -995,6 +995,38 @@ struct MigrationRecord {
     started_at: Instant,
 }
 
+/// One row of [`MigrationOrchestrator::list_migrations`]. Used
+/// by operator-facing surfaces (Deck MIGRATIONS tab via the
+/// `MigrationSnapshot` wire form, ICE blast-radius simulator).
+/// Pre-`MigrationListItem` this was a `(u64, MigrationPhase, u64)`
+/// tuple; the operator-facing columns outgrew the tuple's
+/// readability budget, and a named struct documents which
+/// field is which without per-caller comments.
+#[derive(Clone, Debug)]
+pub struct MigrationListItem {
+    /// Origin hash of the daemon being migrated.
+    pub daemon_origin: u64,
+    /// Source node ID.
+    pub source_node: u64,
+    /// Target node ID.
+    pub target_node: u64,
+    /// Current phase.
+    pub phase: MigrationPhase,
+    /// Milliseconds since the migration started.
+    pub elapsed_ms: u64,
+    /// Milliseconds since the current phase was entered. Distinct
+    /// from `elapsed_ms` — a migration ten minutes old that
+    /// transitioned to Replay one minute ago reports `60_000` here.
+    pub age_in_phase_ms: u64,
+    /// Snapshot payload size in bytes; `None` while the source
+    /// hasn't produced a snapshot yet.
+    pub snapshot_bytes: Option<u64>,
+    /// Retry attempts accumulated by orchestrator-driven retries.
+    pub retries: u32,
+    /// Events buffered awaiting replay.
+    pub buffered_events: u32,
+}
+
 /// Outcome of [`MigrationOrchestrator::buffer_event`].
 ///
 /// A `bool` return conflated two distinct caller responses
@@ -1619,13 +1651,29 @@ impl MigrationOrchestrator {
     }
 
     /// List all in-flight migrations: (daemon_origin, phase, elapsed_ms).
-    pub fn list_migrations(&self) -> Vec<(u64, MigrationPhase, u64)> {
+    pub fn list_migrations(&self) -> Vec<MigrationListItem> {
         self.migrations
             .iter()
             .map(|entry| {
                 let record = entry.lock();
                 let elapsed = record.started_at.elapsed().as_millis() as u64;
-                (*entry.key(), record.state.phase(), elapsed)
+                MigrationListItem {
+                    daemon_origin: *entry.key(),
+                    source_node: record.state.source_node(),
+                    target_node: record.state.target_node(),
+                    phase: record.state.phase(),
+                    elapsed_ms: elapsed,
+                    age_in_phase_ms: record.state.age_in_phase_ms(),
+                    snapshot_bytes: record.state.snapshot_size_bytes(),
+                    retries: record.state.retry_count(),
+                    // Saturate at `u32::MAX` instead of a raw cast.
+                    // The whole point of surfacing this is to flag
+                    // stuck-in-Replay migrations buffering without
+                    // bound; a wrap to a small number would read as
+                    // forward progress when reality is the opposite.
+                    buffered_events: u32::try_from(record.state.buffered_event_count())
+                        .unwrap_or(u32::MAX),
+                }
             })
             .collect()
     }
@@ -2885,6 +2933,31 @@ mod tests {
 
         let list = orch.list_migrations();
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].0, origin);
+        assert_eq!(list[0].daemon_origin, origin);
+        assert_eq!(list[0].source_node, 0x1111);
+        assert_eq!(list[0].target_node, 0x2222);
+        assert_eq!(list[0].retries, 0);
+        assert_eq!(list[0].buffered_events, 0);
+    }
+
+    /// The conversion used at the `list_migrations` call site
+    /// (a raw `as u32` would wrap silently). A stuck-in-Replay
+    /// migration buffering past `u32::MAX` must report
+    /// `u32::MAX`, not a wrapped small number, so operators
+    /// reading the Deck don't mistake overflow for drain.
+    #[test]
+    fn buffered_events_saturates_at_u32_max() {
+        let cast = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        assert_eq!(cast(0), 0);
+        assert_eq!(cast(1), 1);
+        assert_eq!(cast(u32::MAX as usize), u32::MAX);
+        // On 64-bit hosts these are strictly above u32::MAX;
+        // on a hypothetical 32-bit host the saturating
+        // conversion is a no-op and the assertion still
+        // holds.
+        assert_eq!(cast(usize::MAX), u32::MAX);
+        if let Some(overflow) = (u32::MAX as usize).checked_add(1) {
+            assert_eq!(cast(overflow), u32::MAX);
+        }
     }
 }

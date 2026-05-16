@@ -269,9 +269,13 @@ pub struct StatusSummary {
     pub replica_chains: usize,
     /// Number of avoid-list entries on this node.
     pub avoid_list_entries: usize,
-    /// Pending action queue depth (reconcile emitted, executor
-    /// hasn't drained yet).
-    pub pending_action_queue_depth: usize,
+    /// Depth of the ring of recently-emitted actions (count
+    /// of entries in `MeshOsSnapshot::recently_emitted`).
+    /// This is "what reconcile recently asked for," NOT "what
+    /// is currently in flight" — the executor doesn't signal
+    /// completion back to the loop, so the ring caps at
+    /// `action_queue_capacity` and never drains on its own.
+    pub recently_emitted_count: usize,
     /// Executor failure ring depth.
     pub recent_failure_count: usize,
     /// Admin audit ring depth (signed ICE bundles + unsigned
@@ -359,7 +363,7 @@ fn build_status_summary(snap: &MeshOsSnapshot) -> StatusSummary {
         daemons,
         replica_chains: snap.replicas.len(),
         avoid_list_entries: snap.avoid_list.len(),
-        pending_action_queue_depth: snap.pending.len(),
+        recently_emitted_count: snap.recently_emitted.len(),
         recent_failure_count: snap.recent_failures.len(),
         admin_audit_ring_depth: snap.admin_audit.len(),
         freeze_remaining_ms: snap.freeze_remaining_ms,
@@ -2390,7 +2394,7 @@ mod tests {
         assert_eq!(summary.peers, PeerCounts::default());
         assert_eq!(summary.daemons, DaemonCounts::default());
         assert_eq!(summary.replica_chains, 0);
-        assert_eq!(summary.pending_action_queue_depth, 0);
+        assert_eq!(summary.recently_emitted_count, 0);
         assert!(summary.freeze_remaining_ms.is_none());
         assert!(!summary.local_maintenance_active);
         let _ = runtime.shutdown().await;

@@ -2,6 +2,7 @@
 members = [
     ".",
     "sdk",
+    "deck",
     "bindings/node",
     "bindings/python",
     "bindings/go/compute-ffi",

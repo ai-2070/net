@@ -1,0 +1,182 @@
+//! Help overlay — lists every keybinding the deck knows
+//! about, grouped by purpose. Opened with `?`; dismissed
+//! with `Esc` / `q` / `?`.
+
+use ratatui::{
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph},
+    Frame,
+};
+
+use crate::theme;
+
+struct Binding {
+    keys: &'static str,
+    desc: &'static str,
+}
+
+/// Routine bindings — navigation + cursor + dismissals.
+const NAVIGATION: &[Binding] = &[
+    Binding { keys: "1-9, 0",    desc: "jump to tab (0 = LOGS)" },
+    Binding { keys: ":",         desc: "open cluster picker" },
+    Binding { keys: "Enter",     desc: "BLOBS: blob detail · NODES/NET.MAP/DATAFORTS: node page · DAEMONS/GROUPS/MIGRATIONS: daemon page · NODE→DAEMON, DAEMON→NODE/SIBLING" },
+    Binding { keys: "Esc",       desc: "close node page / modal / search prompt (else quit)" },
+    Binding { keys: "b",         desc: "DATAFORTS: jump to BLOBS" },
+    Binding { keys: "l",         desc: "NODES/DAEMONS/GROUPS/DATAFORTS + node/daemon page: jump to LOGS filtered for the cursored id" },
+    Binding { keys: "Tab / ◂▸",  desc: "cycle tab" },
+    Binding { keys: "↓ / ↑",     desc: "cursor down / up (also j/k or s/w)" },
+    Binding { keys: "g / G",     desc: "cursor to top / bottom" },
+    Binding { keys: "J/K · W/S", desc: "GROUPS: group axis (uppercase moves between groups)" },
+    Binding { keys: "f",         desc: "AUDIT/LOGS: cycle filter (ICE-only or min level)" },
+    Binding { keys: "n",         desc: "AUDIT: cycle row limit (none/25/100)" },
+    Binding { keys: "p",         desc: "LOGS: pause / resume the tail" },
+    Binding { keys: "/",         desc: "LOGS/AUDIT/FAILURES: substring search (Enter commit, Esc clear)" },
+    Binding { keys: "e",         desc: "LOGS/FAILURES/BLOBS: export current view to ./deck-<tab>-<ts>.txt" },
+    Binding { keys: "?",         desc: "toggle this help overlay" },
+    Binding { keys: "q / Esc",   desc: "quit (or close modal)" },
+    Binding { keys: "Ctrl-C",    desc: "quit" },
+];
+
+const ADMIN: &[Binding] = &[
+    Binding {
+        keys: "c",
+        desc: "NODES: cordon (cursored node)",
+    },
+    Binding {
+        keys: "C",
+        desc: "NODES: uncordon",
+    },
+    Binding {
+        keys: "d",
+        desc: "NODES / DAEMONS: drain host (prompts for window)",
+    },
+    Binding {
+        keys: "m",
+        desc: "NODES: enter maintenance",
+    },
+    Binding {
+        keys: "M",
+        desc: "NODES: exit maintenance",
+    },
+    Binding {
+        keys: "a",
+        desc: "NODES: clear avoid list",
+    },
+    Binding {
+        keys: "i",
+        desc: "NODES: invalidate placement",
+    },
+    Binding {
+        keys: "D",
+        desc: "NODES: drop all replicas on node",
+    },
+    Binding {
+        keys: "r",
+        desc: "DAEMONS / GROUPS: restart all daemons on host",
+    },
+];
+
+const ICE: &[Binding] = &[
+    Binding {
+        keys: "F",
+        desc: "NODES: ICE freeze cluster (prompts for ttl)",
+    },
+    Binding {
+        keys: "T",
+        desc: "NODES: ICE thaw cluster",
+    },
+    Binding {
+        keys: "A",
+        desc: "NODES: ICE flush avoid lists (global)",
+    },
+    Binding {
+        keys: "R",
+        desc: "DAEMONS / GROUPS: ICE force-restart (bypass backoff)",
+    },
+    Binding {
+        keys: "K",
+        desc: "MIGRATIONS: ICE kill migration",
+    },
+    Binding {
+        keys: "E",
+        desc: "CHAINS: ICE force-evict first holder",
+    },
+    Binding {
+        keys: "O",
+        desc: "CHAINS: ICE force-cutover (pick target)",
+    },
+];
+
+const MODAL: &[Binding] = &[
+    Binding {
+        keys: "Enter / Space",
+        desc: "confirm pending action",
+    },
+    Binding {
+        keys: "Esc / q",
+        desc: "cancel pending action",
+    },
+];
+
+pub fn render(frame: &mut Frame<'_>, area: Rect) {
+    let modal_area = center(area, 78, 44);
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::green())
+        .title(Line::from(vec![
+            Span::styled(" ? ", theme::green()),
+            Span::styled(
+                "DECK KEYBINDINGS",
+                Style::default()
+                    .fg(theme::GREEN_HI)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]))
+        .title_alignment(Alignment::Left);
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(17), // navigation
+            Constraint::Length(11), // admin
+            Constraint::Length(9),  // ice
+            Constraint::Length(4),  // modal
+            Constraint::Min(0),     // footer
+        ])
+        .split(inner);
+
+    render_section(frame, rows[0], "NAVIGATION", NAVIGATION);
+    render_section(frame, rows[1], "ADMIN  (signed, audit-logged)", ADMIN);
+    render_section(frame, rows[2], "ICE  (break-glass, red modal)", ICE);
+    render_section(frame, rows[3], "MODAL", MODAL);
+
+    let footer = Line::from(vec![
+        Span::styled("[?] / [Esc] ", theme::green_hi()),
+        Span::styled("close help", theme::dim()),
+    ]);
+    frame.render_widget(Paragraph::new(footer).alignment(Alignment::Center), rows[4]);
+}
+
+fn render_section(frame: &mut Frame<'_>, area: Rect, title: &str, bindings: &[Binding]) {
+    let mut lines: Vec<Line> = Vec::with_capacity(bindings.len() + 1);
+    lines.push(Line::from(vec![Span::styled(
+        format!("── {title} ──"),
+        theme::text(),
+    )]));
+    for b in bindings {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<15}", b.keys), theme::green_hi()),
+            Span::styled(b.desc.to_string(), theme::text()),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+use super::center;

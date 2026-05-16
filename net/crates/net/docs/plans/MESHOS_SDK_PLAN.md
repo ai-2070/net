@@ -4,9 +4,22 @@
 
 ## Status
 
-Design only. The MeshOS substrate ships behind the `meshos` Cargo feature (`MESHOS_PLAN.md` Phases A–G + executor + snapshot reader + source converters + scheduler + chain integration); this plan turns the daemon-facing slice into language bindings.
+**Phase 1 (Rust SDK) shipped.** The canonical surface lives behind the `meshos` Cargo feature and is re-exported from `net_sdk::meshos` (`crates/net/sdk/src/meshos.rs:91-147`). What landed against the design below: `MeshOsDaemonSdk::start(config, dispatcher) → register_daemon(daemon, kp) -> MeshOsDaemonHandle`, `next_control() / try_next_control()`, `publish_log(level, message)`, `graceful_shutdown(grace)`, `metadata() -> &MetadataView`, the `<<meshos-sdk-kind:KIND>>MSG` error format on `SdkError`, and the `daemon_main!` macro. Surfaces that grew beyond the original §1 design — and that the four language bindings now need to reshape — are listed under **Surfaces that grew beyond §1** below; the §2–§5 binding sections are written against the actual Rust surface, not the original sketch. The capability-publish path remains a stub (`MeshOsDaemonHandle::publish_capabilities` returns `Ok(())` pending the chain commit; see substrate-side TODO) — every binding's `publishCapabilities`/`publish_capabilities`/`PublishCapabilities`/`net_meshos_publish_capabilities` MUST surface the same stub semantics so consumers don't write code against a contract the substrate doesn't yet honor.
 
-Activation gate: a real consumer workload — Hermes / Deck / a tenant-supplied daemon — that needs to write supervised daemons in a language other than Rust. The Rust SDK is the canonical surface; the other four bindings ride the same trait-shape behind language-native ergonomics, landing in dependency order as consumers arrive.
+**Phases 2–5 (Python / Node / Go / C) not started.** Every binding's MeshOS-SDK surface is **absent** — no `bindings/python/src/meshos.rs`, no `bindings/node/src/meshos.rs`, no `bindings/go/meshos-ffi/`, no `include/net_meshos.h`. The compute-daemon precedent exists per binding (`bindings/python/src/compute.rs`, `bindings/node/src/compute.rs`, `bindings/go/compute-ffi/src/lib.rs`) and gives the FFI shapes the MeshOS-SDK binding layers on top of; the MeshOS-supervised registration / control-event / capability-publish surface is what each binding still needs to add.
+
+**Two-tier packaging is set per language.** Python ships as `bindings/python` (pyo3 cdylib) + `sdk-py` (pure-Python ergonomic wrapper); Node ships as `bindings/node` (napi-rs cdylib) + `sdk-ts` (pure-TypeScript ergonomic wrapper). The MeshOS-SDK binding lands in the cdylib tier; the ergonomic surface (context manager / `for await` iterator / typed factories) lands in the wrapper tier. Go has only the cdylib + `bindings/go/net/` wrapper (no `sdk-go`); C has only the header + cdylib. Each per-language design section calls out which tier owns which piece.
+
+**Surfaces that grew beyond §1** (Rust-canonical, must be mirrored by every binding):
+
+- `MaintenanceStateView` — WASM-friendly projection of `MaintenanceState` carrying relative-ms timestamps + a `kind` discriminator (`Active`, `EnteringMaintenance`, `Maintenance`, `ExitingMaintenance`, `DrainFailed { reason }`, `Recovery`). Daemons read it through `handle.metadata().maintenance_state` to observe their own node's state without needing an `Instant`-anchored representation. Bindings cannot serialize `MaintenanceState` directly — they MUST go through `MaintenanceStateView`.
+- `publish_log(level: LogLevel, message: &str)` on the handle — non-blocking `try_publish` semantics. Drops the line + increments a metric when the runtime's log ring is full rather than parking. Every binding exposes this as `publish_log` / `publishLog` / `PublishLog` / `net_meshos_publish_log`.
+- `try_next_control() -> Option<DaemonControl>` non-blocking variant alongside the async `next_control()`. Bindings that don't have a native async story (C, synchronous Python) expose only `try_next_control`-equivalent + a blocking-with-timeout variant; async-native bindings (Tokio, asyncio, AsyncIterable, channels) expose both.
+- `DEFAULT_GRACEFUL_SHUTDOWN: Duration = 5s` and `DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 8` — defaults the binding surface should expose as named constants so consumers can pass them through `.with_control_capacity(...)` / equivalent.
+- `DaemonControlRouter` + `SdkRoutingDispatcher<D>` + `RouterControlSink` — substrate-internal plumbing that wraps the consumer dispatcher with daemon-control translation. Bindings don't expose these directly; they're internal to how `start(config, dispatcher)` is constructed and are only relevant when the binding's `start()` signature accepts a user dispatcher.
+- Re-exported substrate seams: `RedexAdminAuditAppender`, `RedexFailureAppender`, `RedexLogAppender` (production persistence), `OrchestratorMigrationAborter` / `MigrationAborter` / `MigrationAbortError` (migration-abort dispatcher seam), `OrchestratorMigrationSnapshotSource` / `MigrationSnapshot` / `MigrationPhaseSnapshot` / `MigrationSnapshotSource` (ICE blast-radius snapshot source seam). These are **runtime-wiring** types, not daemon-author types — bindings that target the daemon-author surface only (the common case) can skip them; bindings targeting tenant operators that also build the runtime expose them as opaque handles with a `with_xxx` configuration step on the `MeshOsDaemonSdk` builder.
+
+**Activation gate for Phases 2–5:** a real consumer workload — Hermes / Deck / a tenant-supplied daemon — that needs to write supervised daemons in a language other than Rust. The other four bindings ride the same surface shape behind language-native ergonomics, landing in dependency order as consumers arrive.
 
 **Substrate prereqs** (all in code today):
 
@@ -91,61 +104,85 @@ What this doc does NOT ship (deferred non-goals, per the scope brief):
 
 ## Design
 
-### 1. Rust SDK (canonical)
+### 1. Rust SDK (canonical) — shipped
 
-Lives in `src/adapter/net/sdk/meshos/`. Re-exports the relevant `compute::daemon` + `behavior::meshos` types under a clean SDK-facing module path so consumers don't import substrate internals.
+Lives at `crates/net/sdk/src/meshos.rs` (the customer-facing seam) re-exporting types whose implementation sits at `crates/net/src/adapter/net/behavior/meshos/sdk.rs`. The two-file split mirrors the MeshDB SDK pattern: the SDK module is a re-export curtain so consumers `use net_sdk::meshos::*` rather than reaching into substrate internals.
 
 ```rust
-// Re-exports from substrate
-pub use crate::adapter::net::compute::daemon::{
+// Re-exports from substrate (actual import path)
+pub use net::adapter::net::compute::{
     DaemonControl, DaemonError, DaemonHealth, MeshDaemon,
 };
-pub use crate::adapter::net::behavior::capability::CapabilitySet;
+pub use net::adapter::net::behavior::capability::CapabilitySet;
+pub use net::adapter::net::behavior::meshos::{
+    MeshOsDaemonSdk, MeshOsDaemonHandle, MetadataView, MaintenanceStateView,
+    SdkError, SdkRoutingDispatcher, DaemonControlRouter,
+    DEFAULT_CONTROL_CHANNEL_CAPACITY, DEFAULT_GRACEFUL_SHUTDOWN,
+};
 
-// SDK-side surface
-pub struct MeshOsDaemonHandle {
-    daemon_id: u64,
-    registry: Arc<DaemonRegistry>,
-    control_rx: tokio::sync::mpsc::Receiver<DaemonControl>,
-    metadata: MetadataView,
+// Entry point — runtime construction wraps a user-supplied dispatcher
+// with daemon-control routing; the SDK owns lifecycle of both.
+impl MeshOsDaemonSdk {
+    pub fn start(config: MeshOsConfig, dispatcher: Arc<dyn ActionDispatcher>) -> Self;
+    pub fn start_with_options(config: MeshOsConfig, dispatcher: Arc<dyn ActionDispatcher>,
+                              opts: MeshOsDaemonSdkOptions) -> Self;
+    pub fn from_runtime(runtime: MeshOsRuntime) -> Self;
+
+    /// Register a daemon. Returns a handle owning its lifecycle.
+    /// Drop the handle to unregister (graceful — the supervisor
+    /// sees the unregister event via the lifecycle observer).
+    pub fn register_daemon(
+        &self,
+        daemon: Box<dyn MeshDaemon>,
+        keypair: EntityKeypair,
+    ) -> Result<MeshOsDaemonHandle, SdkError>;
+
+    pub async fn shutdown(self) -> Result<(), RuntimeShutdownError>;
 }
 
 impl MeshOsDaemonHandle {
-    /// Register a daemon with a MeshOS runtime. Returns the
-    /// handle that owns the daemon's lifecycle. Drop the
-    /// handle to unregister (graceful — the supervisor sees
-    /// the unregister event via the lifecycle observer).
-    pub fn register(
-        runtime: &MeshOsRuntime,
-        daemon: Box<dyn MeshDaemon>,
-        keypair: EntityKeypair,
-    ) -> Result<Self, SdkError>;
-
-    /// Receive the next supervisor control event. Async — parks
-    /// until the supervisor emits a signal or the handle drops.
-    pub async fn next_control(&mut self) -> Option<DaemonControl>;
-
-    /// Snapshot of cluster metadata visible to this daemon.
-    /// Read-only.
+    pub fn daemon_id(&self) -> u64;
+    pub fn daemon_name(&self) -> &str;
     pub fn metadata(&self) -> &MetadataView;
 
-    /// Publish (or update) the daemon's CapabilitySet.
+    /// Async control-event receive. Parks until the supervisor
+    /// emits a signal or the handle drops.
+    pub async fn next_control(&mut self) -> Option<DaemonControl>;
+
+    /// Non-blocking variant. Returns `None` if the channel is
+    /// empty (vs. closed); bindings without async expose this.
+    pub fn try_next_control(&mut self) -> Option<DaemonControl>;
+
+    /// Publish a log line via the substrate's log ring.
+    /// Non-blocking; drops the line + increments a metric when
+    /// the ring is full.
+    pub fn publish_log(&self, level: LogLevel, message: &str) -> Result<(), SdkError>;
+
+    /// Stub today — returns `Ok(())` without committing. Will
+    /// route through the capability chain once the substrate
+    /// commit path lands. Bindings expose the same stub semantics.
     pub fn publish_capabilities(&self, caps: CapabilitySet) -> Result<(), SdkError>;
 
-    /// Graceful shutdown — calls `on_control(Shutdown)` then
-    /// waits for the daemon's main loop to exit cleanly.
     pub async fn graceful_shutdown(self, grace: Duration) -> Result<(), SdkError>;
 }
 
-/// Read-only view of the cluster context the daemon can observe.
-/// Snapshotted at construction; refresh via `runtime.snapshot()`
-/// if the daemon needs fresher data.
+/// Read-only cluster context. `maintenance_state` is the
+/// WASM-friendly `MaintenanceStateView` (relative-ms, no
+/// `Instant`), not the substrate's `Instant`-anchored
+/// `MaintenanceState`.
 pub struct MetadataView {
     pub node_id: NodeId,
     pub daemon_id: u64,
-    pub maintenance_state: MaintenanceState,
+    pub daemon_name: String,
+    pub maintenance_state: MaintenanceStateView,
     pub peers: BTreeMap<NodeId, PeerSnapshot>,
 }
+
+/// WASM-friendly maintenance-state projection. Variants:
+/// Active, EnteringMaintenance { deadline_in_ms }, Maintenance,
+/// ExitingMaintenance { deadline_in_ms }, DrainFailed { reason },
+/// Recovery { since_ms }. Every binding emits this shape.
+pub enum MaintenanceStateView { /* … */ }
 ```
 
 **`daemon_main!` macro** for the common case (single daemon per process):
@@ -167,20 +204,23 @@ Behind the macro: registers the daemon, spawns the control-event task, runs the 
 
 **Substrate dependencies:** `MeshOsRuntime`, `MeshDaemon`, `DaemonRegistry`, `CapabilitySet`. No new substrate APIs; the SDK is purely a re-bundling.
 
-### 2. Python SDK (pyo3)
+### 2. Python SDK (pyo3) — design
 
-Lives in `bindings/python/src/meshos.rs` + `bindings/python/python/net/meshos.py`. Sync-first (matches MeshDB's precedent — Python is sync by default; async surfaces land in a follow-up).
+**Tier split.** The pyo3 cdylib `bindings/python/src/meshos.rs` exposes the raw FFI types (`PyMeshOsDaemonSdk`, `PyMeshOsDaemonHandle`); the pure-Python wrapper `sdk-py/src/net_sdk/meshos.py` adds the ergonomic context-manager + protocol class. Precedent: `bindings/python/src/compute.rs` already wires `MeshDaemon` for the compute surface (without MeshOS supervision) — the MeshOS-SDK pyo3 module re-uses its `PyDaemonRuntime` wrapping strategy (per-callback `Python::with_gil`, factory marshalling).
 
 ```python
-# bindings/python/python/net/meshos.py
-from net._net import MeshOsHandle, DaemonControl, DaemonHealth
+# sdk-py/src/net_sdk/meshos.py — ergonomic wrapper
+from net._net import (
+    MeshOsDaemonSdk as _RawSdk,
+    MeshOsDaemonHandle as _RawHandle,
+    DaemonControl, DaemonHealth, LogLevel,
+    MaintenanceStateView,
+)
 
 class MeshOsDaemon:
     """Implement this to be supervised by MeshOS."""
     def name(self) -> str: ...
-    def process(self, event: bytes) -> list[bytes]:
-        """Process one inbound causal event, return zero or more outputs."""
-        return []
+    def process(self, event: bytes) -> list[bytes]: return []
 
     # Optional methods — default impls match the Rust defaults
     def health(self) -> DaemonHealth: return DaemonHealth.Healthy
@@ -188,50 +228,73 @@ class MeshOsDaemon:
     def on_control(self, ev: DaemonControl) -> None: pass
     def snapshot(self) -> bytes | None: return None
     def restore(self, state: bytes) -> None: pass
-    def required_capabilities(self) -> CapabilitySet: return CapabilitySet()
-    def optional_capabilities(self) -> CapabilitySet: return CapabilitySet()
+    def required_capabilities(self) -> "CapabilitySet": return CapabilitySet()
+    def optional_capabilities(self) -> "CapabilitySet": return CapabilitySet()
 
-# Registration entry point — sync by default
-def register(daemon: MeshOsDaemon, keypair: EntityKeypair) -> MeshOsHandle:
-    """Register a daemon with MeshOS. Returns the handle that owns
-    its lifecycle. Use as a context manager for graceful shutdown."""
-    ...
+class MeshOsDaemonSdk:
+    @classmethod
+    def start(cls, config: "MeshOsConfig", dispatcher) -> "MeshOsDaemonSdk": ...
+    def register_daemon(
+        self, daemon: MeshOsDaemon, keypair: "EntityKeypair",
+    ) -> "MeshOsDaemonHandle": ...
+    def shutdown(self) -> None: ...
+    def __enter__(self): return self
+    def __exit__(self, *exc): self.shutdown()
+
+class MeshOsDaemonHandle:
+    @property
+    def daemon_id(self) -> int: ...
+    @property
+    def daemon_name(self) -> str: ...
+    @property
+    def metadata(self) -> "MetadataView": ...
+
+    def next_control(self, timeout_ms: int | None = None) -> DaemonControl | None:
+        """Blocking with optional timeout. Returns None on timeout/closed."""
+    def try_next_control(self) -> DaemonControl | None: ...
+    def publish_log(self, level: LogLevel, message: str) -> None: ...
+    def publish_capabilities(self, caps: "CapabilitySet") -> None:
+        """Stub today — returns without committing (substrate TODO)."""
+    def graceful_shutdown(self, grace_ms: int = 5_000) -> None: ...
+    def __enter__(self): return self
+    def __exit__(self, *exc): self.graceful_shutdown()
 ```
 
 ```python
 # Usage
-import net.meshos as meshos
+import net_sdk.meshos as meshos
 
 class TelemetryDaemon(meshos.MeshOsDaemon):
     def name(self): return "telemetry"
-    def process(self, event):
-        # ... handle event, return outputs ...
-        return [b"out"]
+    def process(self, event: bytes): return [b"out"]
     def health(self):
-        return meshos.DaemonHealth.Healthy if self.queue_depth < 1000 else meshos.DaemonHealth.Degraded(reason="queue depth")
+        return (meshos.DaemonHealth.Healthy if self.queue_depth < 1000
+                else meshos.DaemonHealth.Degraded(reason="queue depth"))
 
-with meshos.register(TelemetryDaemon(), kp) as handle:
-    while True:
-        ev = handle.next_control()  # blocks until next control event
-        if isinstance(ev, meshos.DaemonControl.Shutdown):
-            break  # context manager drains on exit
+with meshos.MeshOsDaemonSdk.start(config, dispatcher) as sdk:
+    with sdk.register_daemon(TelemetryDaemon(), kp) as handle:
+        handle.publish_log(meshos.LogLevel.Info, "started")
+        while ev := handle.next_control():
+            if ev.kind == "Shutdown":
+                break
 ```
 
-**`next_control()`** is sync-blocking (per Python convention). An `async def anext_control()` lands when a consumer asks for the pyo3-asyncio shape.
+**Sync-first.** `next_control(timeout_ms)` is blocking per Python convention (with an explicit timeout — bindings without async still need cooperative cancellation). An `async def anext_control()` + `async for` lands when a consumer asks for the pyo3-asyncio shape.
 
-**Trait routing.** pyo3 instantiates a `PyMeshOsDaemon` wrapper struct holding the Python object; the Rust side implements `MeshDaemon` by calling back into Python via `Python::with_gil` for each trait method. GIL is acquired once per call; control-event delivery uses a per-daemon mpsc that the SDK fed into the wrapper.
+**Trait routing.** pyo3 instantiates a `PyMeshOsDaemon` wrapper struct holding the Python object; the Rust side implements `MeshDaemon` by calling back into Python via `Python::with_gil` for each trait method. GIL is acquired once per call; control-event delivery uses a per-daemon mpsc that `register_daemon` feeds into the wrapper.
 
-### 3. Node / TypeScript SDK (napi-rs)
+**Error surface.** Errors raise `MeshOsSdkError(kind: str, message: str)` with the substrate `<<meshos-sdk-kind:KIND>>MSG` discriminator parsed into `(kind, message)`. Known kinds today: `register_failed`, `queue_full`, `loop_closed` (additive — every binding tolerates unknown kinds as a passthrough). Routing precedent: the compute binding's `daemon: <kind>[: detail]` convention at `bindings/python/src/compute.rs:49`.
 
-Lives in `bindings/node/src/meshos.rs` + `bindings/node/index.d.ts`. AsyncIterable for control events; the rest sync.
+### 3. Node / TypeScript SDK (napi-rs) — design
+
+**Tier split.** The napi-rs cdylib `bindings/node/src/meshos.rs` exposes raw classes (`MeshOsDaemonSdk`, `MeshOsDaemonHandle`) and a `nextControl(timeoutMs?)` napi-callable; the pure-TypeScript wrapper at `sdk-ts/src/meshos.ts` re-exports them and adds `AsyncIterable` + a typed `MeshOsDaemon` interface. Precedent: `bindings/node/src/compute.rs` wires `MeshDaemon` for compute via TSFN-marshalled factories — the same TSFN strategy carries here, plus an `EventDispatchBridge` analogue for control-event delivery (factor out as a shared helper).
 
 ```typescript
-// Daemon implementor
+// sdk-ts/src/meshos.ts (ergonomic wrapper)
 export interface MeshOsDaemon {
   name(): string;
   process(event: Buffer): Buffer[];
 
-  // Optional methods — defaults match Rust
   health?(): DaemonHealth;
   saturation?(): number;
   onControl?(ev: DaemonControl): void;
@@ -241,28 +304,32 @@ export interface MeshOsDaemon {
   optionalCapabilities?(): CapabilitySet;
 }
 
-// Registration
-export function register(
-  daemon: MeshOsDaemon,
-  keypair: EntityKeypair,
-): Promise<MeshOsHandle>;
+export class MeshOsDaemonSdk {
+  static start(config: MeshOsConfig, dispatcher: ActionDispatcher): Promise<MeshOsDaemonSdk>;
+  registerDaemon(daemon: MeshOsDaemon, keypair: EntityKeypair): Promise<MeshOsDaemonHandle>;
+  shutdown(): Promise<void>;
+}
 
-export class MeshOsHandle {
+export class MeshOsDaemonHandle {
   readonly daemonId: bigint;
-  readonly metadata: MetadataView;
-  publishCapabilities(caps: CapabilitySet): Promise<void>;
-  controlEvents(): AsyncIterable<DaemonControl>;
-  gracefulShutdown(graceMs: number): Promise<void>;
+  readonly daemonName: string;
+  readonly metadata: MetadataView;     // { ..., maintenanceState: MaintenanceStateView }
+
+  nextControl(timeoutMs?: number): Promise<DaemonControl | null>;
+  tryNextControl(): DaemonControl | null;
+  controlEvents(): AsyncIterable<DaemonControl>;   // TS shim over nextControl
+  publishLog(level: LogLevel, message: string): void;
+  publishCapabilities(caps: CapabilitySet): Promise<void>;   // stub
+  gracefulShutdown(graceMs?: number): Promise<void>;
 }
 ```
 
 ```typescript
-// Usage
-import { register, DaemonHealth, DaemonControl } from '@ai2070/net/meshos';
+import { MeshOsDaemonSdk, DaemonHealth } from '@ai2070/net-sdk/meshos';
 
-const daemon = {
+const daemon: MeshOsDaemon = {
   name() { return 'telemetry'; },
-  process(ev: Buffer): Buffer[] { return [Buffer.from('out')]; },
+  process(ev) { return [Buffer.from('out')]; },
   health() {
     return this.queueDepth < 1000
       ? DaemonHealth.healthy()
@@ -270,27 +337,32 @@ const daemon = {
   },
 };
 
-const handle = await register(daemon, kp);
+const sdk = await MeshOsDaemonSdk.start(config, dispatcher);
+const handle = await sdk.registerDaemon(daemon, kp);
 for await (const ev of handle.controlEvents()) {
   if (ev.kind === 'Shutdown') break;
 }
 await handle.gracefulShutdown(5000);
+await sdk.shutdown();
 ```
 
-**AsyncIterable** matches the MeshDB Node binding's `for await` ergonomics — same TS shim pattern that adds `Symbol.asyncIterator` over a raw `next()` method.
+**AsyncIterable** matches the MeshDB Node binding's `for await` ergonomics — the same TS shim pattern in `sdk-ts/src/` that adds `Symbol.asyncIterator` over a raw `nextControl()` napi method. The cdylib never exposes the `AsyncIterable` directly; that's wrapper-tier only so the TS shim stays a pure-JS transform.
 
-### 4. Go SDK (cgo)
+**Error surface.** Errors throw `MeshOsSdkError extends Error { kind: string }` with the discriminator parsed out of the substrate's `<<meshos-sdk-kind:KIND>>MSG` message. Precedent: `bindings/node/errors.ts` already implements the discriminator-aware `classifyError(message)` over the compute / MeshDB error namespace; the MeshOS error wrapper plugs into the same matcher.
 
-Lives in `bindings/go/meshos-ffi/` (the cdylib) + `bindings/go/go/meshos/` (the Go wrapper). Channel-based control events; sync everything else.
+### 4. Go SDK (cgo) — design
+
+**Tier layout.** Cdylib at `bindings/go/meshos-ffi/` exporting `net_meshos_*` C functions; Go wrapper at `bindings/go/net/meshos.go` providing the idiomatic surface. There is no `sdk-go/` tier (the Go binding is single-tier; the wrapper file lives next to the existing `compute.go` equivalent). Precedent: `bindings/go/compute-ffi/src/lib.rs` (currently stage 6 of the daemon lifecycle) gives the FFI shape; the `.go` wrapper for it is the gap — the MeshOS-SDK binding can ship its own `meshos.go` ahead of the compute one or land both together.
 
 ```go
-// Daemon implementor
+// bindings/go/net/meshos.go
+package net
+
 type MeshOsDaemon interface {
     Name() string
     Process(event []byte) ([][]byte, error)
 
-    // Optional methods — Go interfaces don't have defaults; the
-    // SDK wraps + provides defaults via a default-impl base.
+    // Optional — embed DefaultDaemon to get defaults.
     Health() DaemonHealth
     Saturation() float32
     OnControl(ev DaemonControl)
@@ -300,51 +372,57 @@ type MeshOsDaemon interface {
     OptionalCapabilities() CapabilitySet
 }
 
-// Convenience: embed to get defaults for everything except Name+Process.
 type DefaultDaemon struct{}
 func (DefaultDaemon) Health() DaemonHealth { return DaemonHealth{Kind: HealthHealthy} }
 func (DefaultDaemon) Saturation() float32 { return 0 }
 // ... etc
 
-// Registration
-func Register(daemon MeshOsDaemon, kp *EntityKeypair) (*MeshOsHandle, error)
+type MeshOsDaemonSdk struct{ /* opaque handle */ }
 
-// Handle
-type MeshOsHandle struct { /* ... */ }
-func (h *MeshOsHandle) DaemonID() uint64
-func (h *MeshOsHandle) Metadata() *MetadataView
-func (h *MeshOsHandle) ControlEvents() <-chan DaemonControl
-func (h *MeshOsHandle) PublishCapabilities(caps CapabilitySet) error
-func (h *MeshOsHandle) GracefulShutdown(ctx context.Context) error
+func StartMeshOsDaemonSdk(ctx context.Context, cfg MeshOsConfig, dispatcher ActionDispatcher,
+                          opts ...MeshOsDaemonSdkOption) (*MeshOsDaemonSdk, error)
+func (s *MeshOsDaemonSdk) RegisterDaemon(daemon MeshOsDaemon, kp *EntityKeypair) (*MeshOsDaemonHandle, error)
+func (s *MeshOsDaemonSdk) Shutdown(ctx context.Context) error
+
+type MeshOsDaemonHandle struct{ /* opaque handle */ }
+func (h *MeshOsDaemonHandle) DaemonID() uint64
+func (h *MeshOsDaemonHandle) DaemonName() string
+func (h *MeshOsDaemonHandle) Metadata() *MetadataView
+func (h *MeshOsDaemonHandle) ControlEvents() <-chan DaemonControl       // closes on shutdown/ctx-cancel
+func (h *MeshOsDaemonHandle) TryNextControl() (DaemonControl, bool)
+func (h *MeshOsDaemonHandle) PublishLog(level LogLevel, message string) error
+func (h *MeshOsDaemonHandle) PublishCapabilities(caps CapabilitySet) error   // stub
+func (h *MeshOsDaemonHandle) GracefulShutdown(ctx context.Context) error
 ```
 
 ```go
-// Usage
 type Telemetry struct {
-    meshos.DefaultDaemon
+    net.DefaultDaemon
     queueDepth int
 }
 func (t *Telemetry) Name() string { return "telemetry" }
-func (t *Telemetry) Process(ev []byte) ([][]byte, error) {
-    return [][]byte{[]byte("out")}, nil
-}
-func (t *Telemetry) Health() meshos.DaemonHealth {
-    if t.queueDepth < 1000 { return meshos.DaemonHealth{Kind: meshos.HealthHealthy} }
-    return meshos.DaemonHealth{Kind: meshos.HealthDegraded, Reason: "queue depth"}
+func (t *Telemetry) Process(ev []byte) ([][]byte, error) { return [][]byte{[]byte("out")}, nil }
+func (t *Telemetry) Health() net.DaemonHealth {
+    if t.queueDepth < 1000 { return net.DaemonHealth{Kind: net.HealthHealthy} }
+    return net.DaemonHealth{Kind: net.HealthDegraded, Reason: "queue depth"}
 }
 
-handle, err := meshos.Register(&Telemetry{}, kp)
+sdk, _ := net.StartMeshOsDaemonSdk(ctx, cfg, dispatcher)
+defer sdk.Shutdown(ctx)
+handle, _ := sdk.RegisterDaemon(&Telemetry{}, kp)
 for ev := range handle.ControlEvents() {
-    if ev.Kind == meshos.ControlShutdown { break }
+    if ev.Kind == net.ControlShutdown { break }
 }
 handle.GracefulShutdown(ctx)
 ```
 
-**Pumping goroutine.** The cdylib spawns a per-daemon goroutine that pumps control events from the Rust side over a `chan DaemonControl`. Caller selects on the channel + `ctx.Done()` per the standard Go cancellation idiom (lifted from `MeshDBQuery.ExecuteContext`).
+**Pumping goroutine.** The Go wrapper spawns a per-handle goroutine that pumps control events from the cdylib over a `chan DaemonControl`. The channel closes on `ctx.Done()` or substrate shutdown — caller selects on the channel + `ctx.Done()` per standard Go cancellation idiom (lifted from `bindings/go/net/meshdb.go`'s `MeshDBQuery.ExecuteContext`).
 
-### 5. C SDK (raw FFI)
+**Error surface.** Errors come back as `MeshOsSdkError{Kind, Message}` parsed from the `<<meshos-sdk-kind:KIND>>MSG` envelope. Precedent: `bindings/go/compute-ffi/src/lib.rs:83-125` already formats SDK errors with this convention.
 
-Lives in `bindings/go/meshos-ffi/include/net_meshos.h` (shared with Go) + the meshos-ffi cdylib. Function-pointer-table for daemon callbacks; the consumer manages memory.
+### 5. C SDK (raw FFI) — design
+
+Header at `include/net_meshos.h` (joins the existing `net.h` / `net_meshdb.h` / `net_rpc.h` / `net.go.h` set under `crates/net/include/`); cdylib shared with Go at `bindings/go/meshos-ffi/`. Function-pointer-table for daemon callbacks; the consumer owns memory.
 
 ```c
 // Vtable the consumer fills in
@@ -360,30 +438,44 @@ typedef struct {
     int (*restore)(void* ctx, const uint8_t* state, size_t); // optional
 } NetMeshOsDaemonVtable;
 
-// Lifecycle
-NetMeshOsHandle* net_meshos_register(const NetMeshOsDaemonVtable* vt, void* ctx,
-                                      const NetEntityKeypair* kp);
-void net_meshos_unregister(NetMeshOsHandle*);
+// SDK lifecycle (one per process; multi-instance allowed for tests)
+NetMeshOsDaemonSdk* net_meshos_sdk_start(const NetMeshOsConfig*,
+                                          const NetActionDispatcherVtable* dispatcher_vt,
+                                          void* dispatcher_ctx);
+int net_meshos_sdk_shutdown(NetMeshOsDaemonSdk*);
+void net_meshos_sdk_free(NetMeshOsDaemonSdk*);
 
-// Control events — caller polls
-int net_meshos_next_control(NetMeshOsHandle*, NetDaemonControl* out, uint64_t timeout_ms);
+// Per-daemon lifecycle
+NetMeshOsDaemonHandle* net_meshos_register_daemon(NetMeshOsDaemonSdk*,
+                                                   const NetMeshOsDaemonVtable* vt, void* ctx,
+                                                   const NetEntityKeypair* kp);
+void net_meshos_handle_free(NetMeshOsDaemonHandle*);
 
-// Capabilities
-int net_meshos_publish_capabilities(NetMeshOsHandle*, const NetCapabilitySet*);
+// Control events — caller polls (blocking with timeout) or tries non-blocking
+int net_meshos_next_control(NetMeshOsDaemonHandle*, NetDaemonControl* out, uint64_t timeout_ms);
+int net_meshos_try_next_control(NetMeshOsDaemonHandle*, NetDaemonControl* out);
 
-// Metadata read-only
-const NetMetadataView* net_meshos_metadata(NetMeshOsHandle*);
+// Log emission (non-blocking; ring full ⇒ drop + metric)
+int net_meshos_publish_log(NetMeshOsDaemonHandle*, NetLogLevel level, const char* message);
 
-// Graceful shutdown
-int net_meshos_graceful_shutdown(NetMeshOsHandle*, uint64_t grace_ms);
+// Capabilities (stub today; returns 0 without committing)
+int net_meshos_publish_capabilities(NetMeshOsDaemonHandle*, const NetCapabilitySet*);
 
-// Last-error surface (matches MeshDB FFI pattern)
+// Metadata read-only — pointer valid for the handle's lifetime
+const NetMetadataView* net_meshos_metadata(NetMeshOsDaemonHandle*);
+
+// Graceful shutdown — drains the daemon, frees the handle on success
+int net_meshos_graceful_shutdown(NetMeshOsDaemonHandle*, uint64_t grace_ms);
+
+// Last-error surface (matches existing net.h / net_meshdb.h pattern)
 const char* net_meshos_last_error_message(void);
 const char* net_meshos_last_error_kind(void);
 void net_meshos_clear_last_error(void);
 ```
 
-**Patterns lifted from MeshDB FFI:** `ffi_guard!` macro wrapping every entry point for `catch_unwind`; thread-local `LAST_ERROR_*` surface; `<inttypes.h>` `PRIx64` / `PRIu64` for example code.
+**Patterns lifted from existing C headers.** `include/net_meshdb.h:467-480` already pins the thread-local `last_error_{message,kind}` + `clear_last_error` triple; the MeshOS header mirrors it byte-for-byte (only the prefix changes). The cdylib uses the same `ffi_guard!` macro wrapping every entry point for `catch_unwind`; sample code uses `<inttypes.h>` `PRIx64` / `PRIu64` macros.
+
+**`MaintenanceStateView` C-form** is a tagged union: `typedef struct { uint32_t tag; union { struct { uint64_t deadline_in_ms; } entering_or_exiting; struct { const char* reason; } drain_failed; struct { uint64_t since_ms; } recovery; } body; } NetMaintenanceStateView;` with `tag` ∈ `{Active=0, EnteringMaintenance=1, Maintenance=2, ExitingMaintenance=3, DrainFailed=4, Recovery=5}`. The reason string lives in arena memory owned by the parent `NetMetadataView`; lifetime ends at handle drop.
 
 ### 6. Wire / FFI contracts (shared across bindings)
 
@@ -393,7 +485,7 @@ void net_meshos_clear_last_error(void);
 
 **Snapshot / restore.** Opaque bytes. The daemon owns the encoding; MeshOS treats the snapshot as a blob. Postcard for Rust daemons by convention; other languages pick their own.
 
-**Error kinds.** Re-use the `<<meshdb-kind:KIND>>MSG` discriminator format from MeshDB FFI for cross-language error parsing. SDK errors land as kinds like `register_failed`, `daemon_not_found`, `capability_publish_failed`, etc.
+**Error kinds.** Substrate format is `<<meshos-sdk-kind:KIND>>MSG` (substrate-side regex matches MeshDB's). Kinds actually emitted by the Rust SDK today: `register_failed`, `queue_full`, `loop_closed`. Bindings parse the kind into a language-native field (Python `MeshOsSdkError.kind`, TS `err.kind`, Go `MeshOsSdkError{Kind}`, C `net_meshos_last_error_kind()`) and pass unknown kinds through unchanged so substrate-side additions don't require coordinated binding releases.
 
 ### 7. Tests
 
@@ -439,13 +531,13 @@ Lock these so phase implementations don't relitigate:
 
 Activation order, dependency-driven:
 
-- **Phase 1 — Rust SDK.** Re-export module under `src/adapter/net/sdk/meshos/`. `MeshOsDaemonHandle` + `daemon_main!` macro + integration tests against `MeshOsRuntime` with `LoggingDispatcher`. The canonical surface every other binding mirrors.
-- **Phase 2 — Python SDK.** pyo3 wrapper. `class MeshOsDaemon` Python protocol + `net.meshos.register(...)`. Sync control-event delivery. README walkthrough; pytest integration tests.
-- **Phase 3 — Node / TypeScript SDK.** napi-rs wrapper. AsyncIterable control events; TS shim layered on the `next_control()` napi method. README + vitest integration tests.
-- **Phase 4 — Go SDK.** cgo via the meshos-ffi cdylib + Go wrapper at `bindings/go/go/meshos/`. Channel-based control events; `context.Context` for graceful shutdown. README + Go test fixtures.
-- **Phase 5 — C SDK.** Vtable-based daemon registration + last-error surface. Header at `include/net_meshos.h`; runnable `examples/meshos.c`. Phase 5 is the smallest — it's mostly the cdylib's C-export surface that Phases 3–4 already require.
+- **Phase 1 — Rust SDK. SHIPPED.** `net_sdk::meshos` re-exports + the `daemon_main!` macro live at `crates/net/sdk/src/meshos.rs`; the implementation lives at `crates/net/src/adapter/net/behavior/meshos/sdk.rs`. Surfaces landed: `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `MetadataView`, `MaintenanceStateView`, `SdkError` (`<<meshos-sdk-kind:KIND>>MSG`), `next_control` / `try_next_control` / `publish_log` / `graceful_shutdown`, RedEX appender re-exports (`RedexAdminAuditAppender` / `RedexFailureAppender` / `RedexLogAppender`), migration-abort seam (`OrchestratorMigrationAborter`), migration-snapshot source seam (`OrchestratorMigrationSnapshotSource`). Integration tests in-module + `tests/meshos_pipeline.rs` + `tests/compute_runtime.rs`. **Stub remaining:** `publish_capabilities` — substrate chain commit not yet wired; the SDK surface is final, the binding can ship the method now and consumers see no behavior change when the substrate lands the commit.
+- **Phase 2 — Python SDK. NOT STARTED.** No `bindings/python/src/meshos.rs` yet; the compute precedent at `bindings/python/src/compute.rs` is the wrapping template. pyo3 cdylib exposes raw `MeshOsDaemonSdk` / `MeshOsDaemonHandle`; `sdk-py/src/net_sdk/meshos.py` adds the context-manager + protocol class. Slice 1: `start` + `register_daemon` + `next_control` + `publish_log` + `graceful_shutdown`. Slice 2: `publish_capabilities` (stub-passthrough) + snapshot/restore + `MaintenanceStateView` decoding. Slice 3: async wrappers via pyo3-asyncio.
+- **Phase 3 — Node / TypeScript SDK. NOT STARTED.** No `bindings/node/src/meshos.rs` yet; the compute precedent at `bindings/node/src/compute.rs` (TSFN-marshalled factories) is the wrapping template. napi-rs cdylib exposes raw classes; `sdk-ts/src/meshos.ts` adds the `AsyncIterable` shim + `MeshOsDaemon` interface. Slice 1: `start` + `registerDaemon` + `controlEvents` + `publishLog`. Slice 2: `publishCapabilities` stub + snapshot/restore. Slice 3: typed `MaintenanceStateView` matchers, error discriminator parsing.
+- **Phase 4 — Go SDK. NOT STARTED.** No `bindings/go/meshos-ffi/` cdylib yet; `bindings/go/compute-ffi/` is the template (currently mid-build, stage 6). cdylib + `bindings/go/net/meshos.go` wrapper. Slice 1: `StartMeshOsDaemonSdk` + `RegisterDaemon` + `ControlEvents` channel + `PublishLog`. Slice 2: `PublishCapabilities` stub + snapshot/restore. Slice 3: `MaintenanceStateView` decode + `context.Context` plumbing on every blocking call.
+- **Phase 5 — C SDK. NOT STARTED.** No `include/net_meshos.h` yet; `include/net_meshdb.h` is the template for the last-error trio + the layout convention. Smallest phase — it's mostly the cdylib's C-export surface that Phase 4 already requires.
 
-Phases 2–5 land independently of each other; only Phase 1 (Rust) is a hard prereq. Per-language slices can ship partial surface — e.g., Python ships register + control-event receive in slice 1, capability sync + snapshot in slice 2 — as long as the slice list converges on the full daemon-contract surface before declaring "v1 done."
+Phases 2–5 land independently of each other; only Phase 1 (Rust, shipped) is a hard prereq. Per-language slices can ship partial surface — e.g., Python ships register + control-event receive in slice 1, capability sync + snapshot in slice 2 — as long as the slice list converges on the full daemon-contract surface before declaring "v1 done."
 
 ---
 

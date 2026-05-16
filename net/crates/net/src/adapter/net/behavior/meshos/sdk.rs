@@ -597,6 +597,70 @@ impl MeshOsDaemonSdk {
         }
     }
 
+    /// Like [`Self::start`] but also installs an
+    /// [`super::ice::AdminVerifier`] on the runtime. Required
+    /// for any deployment where the operator's signed admin
+    /// commits should fold with `VerificationOutcome::Accepted`
+    /// instead of `Unverified` — the verifier's
+    /// [`super::ice::OperatorRegistry`] must contain the
+    /// operator key that signs incoming commits.
+    pub fn start_with_verifier<D: ActionDispatcher>(
+        config: MeshOsConfig,
+        user_dispatcher: Arc<D>,
+        verifier: Arc<super::ice::AdminVerifier>,
+    ) -> Self {
+        Self::start_with_verifier_and_migration_source(
+            config,
+            user_dispatcher,
+            Some(verifier),
+            None,
+        )
+    }
+
+    /// Install an `AdminVerifier` plus an optional migration
+    /// snapshot source in one call. This is **not** the full
+    /// extension surface — the underlying
+    /// [`MeshOsRuntime`] also accepts admin-audit / log /
+    /// failure chain appenders and a migration aborter; this
+    /// SDK-wrapper constructor exposes only the two extensions
+    /// the daemon-side SDK shipped first. Plumbing the other
+    /// extension slots through the SDK wrapper is tracked in
+    /// `MESHOS_SDK_PLAN.md` § Deferred work; for now,
+    /// deployments needing the full surface drop down to
+    /// [`MeshOsRuntime::start_with_full_extensions`] directly.
+    pub fn start_with_verifier_and_migration_source<D: ActionDispatcher>(
+        config: MeshOsConfig,
+        user_dispatcher: Arc<D>,
+        verifier: Option<Arc<super::ice::AdminVerifier>>,
+        migration_snapshot_source: Option<
+            Arc<dyn super::migration_snapshot_source::MigrationSnapshotSource>,
+        >,
+    ) -> Self {
+        let router = DaemonControlRouter::new();
+        let routed = Arc::new(SdkRoutingDispatcher::new(user_dispatcher, router.clone()));
+        let sink: Arc<dyn super::control::ControlSink> =
+            Arc::new(RouterControlSink::new(router.clone()));
+        let runtime = MeshOsRuntime::start_with_full_extensions(
+            config,
+            routed,
+            super::event_loop::ProbeRegistry::new(),
+            super::scheduler::SchedulerRegistry::new(),
+            Arc::new(DaemonRegistry::new()),
+            Some(sink),
+            verifier,
+            None, // admin audit appender
+            None, // log appender
+            None, // failure appender
+            None, // migration aborter
+            migration_snapshot_source,
+        );
+        Self {
+            runtime,
+            router,
+            control_capacity: DEFAULT_CONTROL_CHANNEL_CAPACITY,
+        }
+    }
+
     /// Override the per-daemon control-channel capacity. Default
     /// is [`DEFAULT_CONTROL_CHANNEL_CAPACITY`]. Increase for
     /// daemons that pause `process()` longer than the supervisor's

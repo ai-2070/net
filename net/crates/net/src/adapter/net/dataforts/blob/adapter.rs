@@ -233,4 +233,122 @@ pub trait BlobAdapter: Send + Sync + 'static {
             ..Default::default()
         })
     }
+
+    /// Enumerate blob chunks the adapter has observed. Powers
+    /// the operator-facing "Blob & Artifact Explorer" surface
+    /// (`DECK_PLAN.md` § Deferred work § Blob & Artifact
+    /// Explorer) — adapters that can cheaply enumerate (Mesh,
+    /// fs) override; adapters with prohibitive enumeration
+    /// cost (S3 with millions of keys, IPFS) leave the default
+    /// "empty" so consumers don't accidentally rack up backend
+    /// charges.
+    ///
+    /// The default returns an empty vec rather than an error
+    /// because "this adapter doesn't enumerate" is a normal
+    /// answer, not a failure — the BLOBS tab simply shows no
+    /// rows for that adapter.
+    ///
+    /// Distinct from "this adapter holds nothing": consumers
+    /// that need to tell the two apart consult
+    /// [`Self::supports_list`] first. A `false` answer means
+    /// the default opt-out is in effect; a `true` answer means
+    /// the result of `list` is authoritative (`Ok([])` truly
+    /// means empty).
+    ///
+    /// Granularity is **chunk-level**, not logical-blob-level.
+    /// `MeshBlobAdapter` tracks blobs in a refcount table keyed
+    /// by content hash: a `BlobRef::Small` corresponds to one
+    /// entry, a `BlobRef::Manifest` to N entries (one per
+    /// chunk). Reconstructing logical `BlobRef`s would need a
+    /// per-store BlobRef index the substrate doesn't carry
+    /// today; that's tracked as a follow-on in
+    /// `DECK_PLAN.md` § Deferred work § Blob & Artifact
+    /// Explorer.
+    ///
+    /// `opts.prefix_hex` filters by a hex prefix of the
+    /// content hash (e.g. `Some("abcd")` returns only chunks
+    /// whose hash starts with `0xab 0xcd`). `opts.limit` caps
+    /// the result count — adapters may return fewer when
+    /// fewer match. Order is unspecified at the trait level
+    /// (`MeshBlobAdapter` sorts by `last_seen_unix_ms` desc).
+    async fn list(&self, _opts: &BlobListOptions) -> Result<Vec<BlobInventoryEntry>, BlobError> {
+        Ok(Vec::new())
+    }
+
+    /// Whether [`Self::list`] returns an authoritative enumeration.
+    ///
+    /// Defaults to `false`, matching the default `list` impl that
+    /// returns an empty vec to avoid accidental enumeration cost
+    /// on adapters with prohibitive scans (S3 with millions of
+    /// keys, IPFS). Adapters that genuinely enumerate (Mesh, fs)
+    /// override to `true` so consumers (the Deck BLOBS tab,
+    /// scripted exporters) can tell the two cases apart instead
+    /// of conflating "no rows" with "opt-out".
+    fn supports_list(&self) -> bool {
+        false
+    }
+}
+
+/// Options for [`BlobAdapter::list`]. Built to grow — additional
+/// filters (date range, encoding, refcount band) land here
+/// without changing the trait signature.
+#[derive(Clone, Debug, Default)]
+pub struct BlobListOptions {
+    /// Lowercase hex prefix matched against the content hash.
+    /// `None` matches every entry. Adapters that can't filter
+    /// on the prefix scan all and filter in-memory.
+    pub prefix_hex: Option<String>,
+    /// Cap on the returned set. `0` (the default for
+    /// `BlobListOptions::default()`) is interpreted as "no
+    /// caller cap"; consumers reading via the SDK pass a
+    /// concrete value (typically 1000–10000) to bound
+    /// memory.
+    pub limit: usize,
+}
+
+/// One row of the operator-facing blob inventory: a content
+/// hash the adapter has observed, plus the refcount-table
+/// metadata that goes with it. Chunk-level granularity per the
+/// note on [`BlobAdapter::list`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobInventoryEntry {
+    /// `adapter_id()` of the adapter that produced this entry.
+    /// Multi-adapter deployments surface this so the operator
+    /// can tell which backend holds the chunk; single-adapter
+    /// callers can ignore.
+    pub adapter_id: String,
+    /// 64-character lowercase hex of the blob's BLAKE3 content
+    /// hash. The canonical id at this granularity.
+    pub hash_hex: String,
+    /// Refcount the adapter tracks. `0` means quiescent and on
+    /// the GC retention clock; non-zero means at least one
+    /// source is holding a live reference.
+    pub refcount: u32,
+    /// `true` when the operator has explicitly pinned the
+    /// entry against GC (operators sometimes pin known-good
+    /// chunks during a debug session).
+    pub pinned: bool,
+    /// First wall-clock unix-ms the adapter observed this
+    /// hash (the retention floor measures from here).
+    pub first_seen_unix_ms: u64,
+    /// Most recent wall-clock unix-ms the adapter observed
+    /// this hash (any incr / decr / store).
+    pub last_seen_unix_ms: u64,
+    /// Payload size in bytes. `Some(n)` whenever the local
+    /// adapter has observed a store; `None` for hashes that
+    /// only entered the table via `incr` from a remote source
+    /// (the chunk isn't local yet — the size is the peer's to
+    /// advertise) and for adapters that don't track per-hash
+    /// size cheaply.
+    pub size_bytes: Option<u64>,
+    /// Distinct nodes observed advertising this hash via the
+    /// substrate's `causal:<hex>` capability tag. `None` for
+    /// adapters that don't participate in the advertisement
+    /// layer; mirrors [`BlobStat::replicas_observed`].
+    pub replicas_observed: Option<u32>,
+    /// Operator-configured replication factor for this
+    /// adapter. `None` for adapters whose durability isn't
+    /// governed by the substrate (S3, IPFS, FS); mirrors
+    /// [`BlobStat::replica_target`].
+    pub replica_target: Option<u32>,
 }

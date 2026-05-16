@@ -53,11 +53,18 @@ pub struct MeshOsSnapshot {
     pub avoid_list: BTreeMap<NodeId, AvoidEntrySnapshot>,
     /// This node's own maintenance state.
     pub local_maintenance: MaintenanceStateSnapshot,
-    /// Pending actions (reconcile emitted, executor hasn't
-    /// drained yet). Wrapped in `Arc<[…]>` so consumers
-    /// holding the snapshot past the `ArcSwap` guard can
-    /// clone in O(1) instead of paying a per-element copy.
-    pub pending: std::sync::Arc<[PendingActionSnapshot]>,
+    /// Ring buffer of the last N actions reconcile emitted,
+    /// bounded by `action_queue_capacity`. Entries are NOT
+    /// removed when the executor drains them — there's no
+    /// completion signal back to the loop — so this is "what
+    /// the loop recently asked for," not "what is currently
+    /// in flight." Renamed from `pending` so neither the SDK
+    /// surface nor downstream UIs (Deck status chip,
+    /// dashboards) mislabel the count as live in-flight work.
+    /// Wrapped in `Arc<[…]>` so consumers holding the
+    /// snapshot past the `ArcSwap` guard can clone in O(1)
+    /// instead of paying a per-element copy.
+    pub recently_emitted: std::sync::Arc<[PendingActionSnapshot]>,
     /// Ring buffer of recent failures (daemon crashes, drain
     /// timeouts, etc.). Stays as a `VecDeque` because the
     /// chain-replay fold mutates this directly (`push_failure`
@@ -111,6 +118,11 @@ pub struct MeshOsSnapshot {
 /// `MigrationOrchestrator::list_migrations()` by the
 /// [`super::migration_snapshot_source::MigrationSnapshotSource`]
 /// adapter and embedded in the snapshot on every publish tick.
+///
+/// Fields after `elapsed_ms` carry `#[serde(default)]` so a
+/// JSON consumer built against the pre-extension shape decodes
+/// cleanly (postcard cross-binary compat still requires field
+/// count + order agreement, same as `PeerSnapshot`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MigrationSnapshot {
     /// `MigrationId` (== daemon origin hash). Matches
@@ -121,6 +133,39 @@ pub struct MigrationSnapshot {
     pub phase: MigrationPhaseSnapshot,
     /// Milliseconds since the migration began on this node.
     pub elapsed_ms: u64,
+    /// Node ID where the daemon is being migrated FROM.
+    #[serde(default)]
+    pub source_node: u64,
+    /// Node ID where the daemon is being migrated TO.
+    #[serde(default)]
+    pub target_node: u64,
+    /// Milliseconds since the current phase was entered.
+    /// Distinct from `elapsed_ms` so operators can tell a
+    /// migration stuck in Replay for 30 minutes apart from one
+    /// merely 30 minutes old overall.
+    #[serde(default)]
+    pub age_in_phase_ms: u64,
+    /// Snapshot payload size in bytes; `None` while the source
+    /// hasn't produced one yet.
+    #[serde(default)]
+    pub snapshot_bytes: Option<u64>,
+    /// Retry attempts accumulated by the orchestrator's
+    /// retry-driver. `0` while no retry has been observed.
+    #[serde(default)]
+    pub retries: u32,
+    /// Best-effort progress percentage. Today the orchestrator
+    /// doesn't track byte-level transfer progress, so this is
+    /// derived from the phase ordinal (Snapshot → ... → Complete)
+    /// and reads as a coarse pipeline indicator rather than a
+    /// fine-grained transfer gauge. `None` for phases the deck
+    /// can't classify.
+    #[serde(default)]
+    pub progress_pct: Option<u8>,
+    /// Events buffered awaiting replay. Bloats while the source
+    /// runs Snapshot/Transfer/Restore and drains during Replay;
+    /// a flat-high count is a "cutover overdue" signal.
+    #[serde(default)]
+    pub buffered_events: u32,
 }
 
 /// Wire form of [`crate::adapter::net::compute::MigrationPhase`].
@@ -174,6 +219,40 @@ pub struct DaemonSnapshot {
     pub saturation: f32,
     /// Crash-loop / backoff gate state.
     pub restart_state: RestartStateSnapshot,
+    /// Host node currently running this daemon. The substrate's
+    /// fold path only inserts entries into `MeshOsState::daemons`
+    /// in response to *local* lifecycle signals (the supervisor
+    /// on this node hands them in), so for a snapshot built on
+    /// node X this is unconditionally X. The field stays on the
+    /// wire so Deck-side aggregations across multiple snapshots
+    /// can still answer "which node hosts daemon 0xNN?" without
+    /// the operator pivoting through a separate lookup. The
+    /// `placement_matches_this_node_for_every_entry` regression
+    /// test pins the invariant so a future refactor that
+    /// piggy-backs remote daemon state on `actual.daemons` is
+    /// caught at the snapshot boundary.
+    ///
+    /// `#[serde(default)]` so JSON consumers built against an
+    /// older shape (no `placement` key) deserialize cleanly —
+    /// the field reads back as `0` (`NodeId::default()`) and the
+    /// caller can treat that as "unknown" rather than failing
+    /// the decode outright.
+    #[serde(default)]
+    pub placement: NodeId,
+    /// Milliseconds since the most recent lifecycle signal
+    /// relevant to the current phase: time since `Started`
+    /// while the daemon is running, time since the most recent
+    /// exit / crash while the daemon is `Stopped`, and `0` for
+    /// daemons that never reported any lifecycle signal at all
+    /// (freshly registered before the supervisor confirmed).
+    /// Phase-anchored so the Deck's per-daemon age column reads
+    /// as "running for X" / "stopped X ago" without leaking
+    /// wall-clock state.
+    ///
+    /// `#[serde(default)]` for the same forward-compat reason
+    /// as `placement`.
+    #[serde(default)]
+    pub age_ms: u64,
 }
 
 /// Wire form of [`DaemonLifecycle`]. Defaults to `Stopped` for
@@ -255,7 +334,29 @@ pub struct ReplicaSnapshot {
 }
 
 /// Per-peer Deck-renderable summary.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Fields after `maintenance` are the Feature-11 inventory
+/// axes — extended to give Deck a per-node resource view
+/// (`NODE_INVENTORY` per `DECK_PLAN.md` § Deferred work). All
+/// of them are `Option`-wrapped or default-able and carry
+/// `#[serde(default)]` so a JSON consumer built against the
+/// older shape (no inventory keys) deserializes cleanly —
+/// missing fields read back at their default. For postcard,
+/// the wire is positional + length-prefixed: cross-binary
+/// postcard compatibility still requires both sides agree on
+/// the field count, so this defense is JSON-only. In-process
+/// (the substrate's `ArcSwap<MeshOsSnapshot>` path) the change
+/// is unconditionally safe because both encoder and decoder
+/// are the same binary.
+///
+/// Note: `Copy` and `Eq` are dropped from the derive set
+/// because `capability_set: BTreeSet<String>` and
+/// `software_version: Option<String>` are heap-owned, and
+/// `cpu_load_1m: Option<f64>` doesn't implement `Eq`. Callers
+/// that previously copied a `PeerSnapshot` by value now
+/// borrow or clone; the snapshot is a read-only projection so
+/// the change is benign for every downstream we ship today.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct PeerSnapshot {
     /// Latest RTT in milliseconds, if any.
     pub rtt_ms: Option<u64>,
@@ -263,6 +364,51 @@ pub struct PeerSnapshot {
     pub health: Option<PeerHealthSnapshot>,
     /// Maintenance state mirror.
     pub maintenance: Option<MaintenanceMirrorSnapshot>,
+    /// Host CPU load average over the last minute. `None`
+    /// when no resource probe is wired (lightweight containers
+    /// without procfs / a node that opted out of host
+    /// sampling).
+    #[serde(default)]
+    pub cpu_load_1m: Option<f64>,
+    /// Host memory currently used, in bytes. `None` when no
+    /// resource probe is wired.
+    #[serde(default)]
+    pub mem_used_bytes: Option<u64>,
+    /// Host memory cap, in bytes. `None` when no resource
+    /// probe is wired.
+    #[serde(default)]
+    pub mem_total_bytes: Option<u64>,
+    /// Host disk currently used, in bytes. Distinct from the
+    /// dataforts blob-adapter disk: this is the *host* disk,
+    /// not the per-adapter dataforts cap.
+    #[serde(default)]
+    pub disk_used_bytes: Option<u64>,
+    /// Host disk cap, in bytes.
+    #[serde(default)]
+    pub disk_total_bytes: Option<u64>,
+    /// Rolling 0.0..=1.0 saturation score the substrate
+    /// computes from existing health-probe signals. `None`
+    /// when no probe drives it. Operators dashboard this to
+    /// spot peers under sustained pressure before they tip
+    /// into `Degraded` health.
+    #[serde(default)]
+    pub saturation_trend: Option<f32>,
+    /// Capabilities the peer advertises. Empty when the peer
+    /// hasn't published a capability set or when the local
+    /// node's capability index hasn't indexed them yet. The
+    /// capability strings match what the `capability_index`
+    /// projection holds.
+    #[serde(default)]
+    pub capability_set: std::collections::BTreeSet<String>,
+    /// Substrate software version the peer is running, as a
+    /// semver string. `None` when the peer hasn't advertised
+    /// its version (older substrates before this surface).
+    #[serde(default)]
+    pub software_version: Option<String>,
+    /// For fork-group members, the origin node the fork
+    /// descends from. `None` for non-fork peers.
+    #[serde(default)]
+    pub forked_from: Option<NodeId>,
 }
 
 /// Wire form of `NodeHealth`.
@@ -403,6 +549,7 @@ impl MeshOsSnapshot {
     /// side; the loop reads it on publish) — the snapshot copies
     /// it so consumers see executor-side dispatch failures even
     /// when the chain-fold path is not wired up.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_state(
         actual: &MeshOsState,
         desired: &DesiredState,
@@ -411,6 +558,7 @@ impl MeshOsSnapshot {
         in_flight_migrations: Vec<MigrationSnapshot>,
         admin_audit_ring: &std::collections::VecDeque<super::ice::AdminAuditRecord>,
         log_ring: &std::collections::VecDeque<super::logs::LogRecord>,
+        this_node: NodeId,
     ) -> Self {
         let now = actual.last_tick.unwrap_or_else(std::time::Instant::now);
 
@@ -418,9 +566,38 @@ impl MeshOsSnapshot {
             .daemons
             .iter()
             .map(|(d, status)| {
+                // For a Running / Starting / Stopping daemon
+                // `age_ms` is the time since the most recent
+                // `Started` signal — that's the in-process uptime
+                // the Deck wants. For a Stopped daemon, however,
+                // `last_started` is the time the daemon *last*
+                // started, which is unrelated to the present
+                // (Stopped) state: an instance that crashed five
+                // seconds ago after an hour of uptime would report
+                // ~3.6M ms, which reads as "still running, hour
+                // old" on the Deck. Anchor against the most
+                // recent exit / crash for Stopped lifecycles so
+                // the column reads as "stopped X ms ago"; fall
+                // back to 0 for daemons that never reported any
+                // lifecycle signal at all.
+                let started_age = status
+                    .last_started
+                    .map(|t| now.saturating_duration_since(t).as_millis() as u64);
+                let stopped_age = status
+                    .last_exit
+                    .into_iter()
+                    .chain(status.last_crash)
+                    .max()
+                    .map(|t| now.saturating_duration_since(t).as_millis() as u64);
+                let age_ms = match status.lifecycle {
+                    DaemonLifecycle::Stopped => stopped_age.or(started_age).unwrap_or(0),
+                    _ => started_age.unwrap_or(0),
+                };
                 let snapshot = DaemonSnapshot {
                     name: d.name.clone(),
                     lifecycle: status.lifecycle.into(),
+                    placement: this_node,
+                    age_ms,
                     health: status.health.as_ref().map(|h| match h {
                         super::event::DaemonHealth::Healthy => DaemonHealthSnapshot::Healthy,
                         super::event::DaemonHealth::Degraded { reason } => {
@@ -498,6 +675,23 @@ impl MeshOsSnapshot {
                     }
                 });
             }
+            // Inventory axes — `InventoryProbe` samples land in
+            // `actual.inventory`; copy each axis through to the
+            // corresponding `PeerSnapshot` field. Unsampled
+            // peers stay at the snapshot's defaults (None /
+            // empty set).
+            for (peer, inv) in &actual.inventory {
+                let entry = peers.entry(*peer).or_default();
+                entry.cpu_load_1m = inv.cpu_load_1m;
+                entry.mem_used_bytes = inv.mem_used_bytes;
+                entry.mem_total_bytes = inv.mem_total_bytes;
+                entry.disk_used_bytes = inv.disk_used_bytes;
+                entry.disk_total_bytes = inv.disk_total_bytes;
+                entry.saturation_trend = inv.saturation_trend;
+                entry.capability_set = inv.capability_set.clone();
+                entry.software_version = inv.software_version.clone();
+                entry.forked_from = inv.forked_from;
+            }
             peers
         };
 
@@ -544,7 +738,7 @@ impl MeshOsSnapshot {
             },
         };
 
-        let pending: std::sync::Arc<[PendingActionSnapshot]> = pending
+        let recently_emitted: std::sync::Arc<[PendingActionSnapshot]> = pending
             .iter()
             .map(|p| PendingActionSnapshot {
                 id: p.id.0,
@@ -570,7 +764,7 @@ impl MeshOsSnapshot {
             peers,
             avoid_list,
             local_maintenance,
-            pending,
+            recently_emitted,
             recent_failures: recent_failures.iter().cloned().collect(),
             freeze_remaining_ms,
             admin_audit,
@@ -708,6 +902,7 @@ mod tests {
             Vec::new(),
             &std::collections::VecDeque::new(),
             &std::collections::VecDeque::new(),
+            0,
         );
         let daemon = snap.daemons.get(&1).expect("daemon present");
         assert_eq!(daemon.name, "telemetry");
@@ -737,6 +932,7 @@ mod tests {
             Vec::new(),
             &std::collections::VecDeque::new(),
             &std::collections::VecDeque::new(),
+            0,
         );
         let r = snap.replicas.get(&0xAA).expect("replica present");
         assert_eq!(r.holders, vec![1, 2, 3]);
@@ -757,6 +953,7 @@ mod tests {
             Vec::new(),
             &std::collections::VecDeque::new(),
             &std::collections::VecDeque::new(),
+            0,
         );
         let r = snap
             .replicas
@@ -819,6 +1016,7 @@ mod tests {
             Vec::new(),
             &std::collections::VecDeque::new(),
             &std::collections::VecDeque::new(),
+            0,
         );
         let bytes = postcard::to_allocvec(&snap).expect("encode");
         let back: MeshOsSnapshot = postcard::from_bytes(&bytes).expect("decode");
@@ -827,6 +1025,249 @@ mod tests {
         let json = serde_json::to_string(&snap).expect("encode json");
         let back2: MeshOsSnapshot = serde_json::from_str(&json).expect("decode json");
         assert_eq!(snap, back2);
+    }
+
+    #[test]
+    fn placement_matches_this_node_for_every_entry() {
+        // The snapshot fold for `daemons` is local-only: every
+        // entry's `placement` must equal the `this_node` the
+        // caller passes, regardless of the daemon id or
+        // lifecycle. Anchors against a future refactor that
+        // accidentally piggy-backs remote daemon state onto
+        // the local `actual.daemons` map — such a change would
+        // silently mis-label remote daemons as locally hosted
+        // unless the populator was updated alongside it.
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        for (name, id) in [("alpha", 1u64), ("beta", 2), ("gamma", 3)] {
+            let mut status = DaemonStatus::default();
+            status.lifecycle = DaemonLifecycle::Running;
+            actual.daemons.insert(dref(name, id), status);
+        }
+        for this_node in [0u64, 1, 0x2A2A, NodeId::MAX] {
+            let snap = MeshOsSnapshot::from_state(
+                &actual,
+                &DesiredState::default(),
+                &[],
+                &[],
+                Vec::new(),
+                &std::collections::VecDeque::new(),
+                &std::collections::VecDeque::new(),
+                this_node,
+            );
+            assert!(!snap.daemons.is_empty(), "fixture daemons were dropped");
+            for (id, d) in &snap.daemons {
+                assert_eq!(
+                    d.placement, this_node,
+                    "daemon {id} placement diverged from this_node {this_node:x}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn daemon_age_anchors_on_last_exit_when_stopped() {
+        // A daemon that ran for a long time and then crashed
+        // should report `age_ms` against the exit, not the
+        // last `Started`. Otherwise the Deck reads "running,
+        // X hours old" for a daemon that has actually been
+        // dead the whole time.
+        let mut actual = MeshOsState::default();
+        let now = Instant::now();
+        actual.last_tick = Some(now);
+        let d = dref("worker", 1);
+        let mut status = DaemonStatus::default();
+        status.lifecycle = DaemonLifecycle::Stopped;
+        status.last_started = Some(now - Duration::from_secs(3600));
+        status.last_exit = Some(now - Duration::from_secs(5));
+        actual.daemons.insert(d, status);
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &DesiredState::default(),
+            &[],
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+            0,
+        );
+        let daemon = snap.daemons.get(&1).expect("daemon present");
+        // ~5s window (allow a tick of jitter — the test pins
+        // "anchored on exit, not on started").
+        assert!(daemon.age_ms < 60_000, "got age_ms = {}", daemon.age_ms);
+        assert!(daemon.age_ms >= 5_000, "got age_ms = {}", daemon.age_ms);
+    }
+
+    #[test]
+    fn daemon_age_anchors_on_last_started_when_running() {
+        // The Running path should keep its original
+        // semantics: time since the most recent `Started`.
+        let mut actual = MeshOsState::default();
+        let now = Instant::now();
+        actual.last_tick = Some(now);
+        let d = dref("worker", 2);
+        let mut status = DaemonStatus::default();
+        status.lifecycle = DaemonLifecycle::Running;
+        status.last_started = Some(now - Duration::from_secs(30));
+        status.last_exit = Some(now - Duration::from_secs(900));
+        actual.daemons.insert(d, status);
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &DesiredState::default(),
+            &[],
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+            0,
+        );
+        let daemon = snap.daemons.get(&2).expect("daemon present");
+        assert!(daemon.age_ms >= 30_000, "got age_ms = {}", daemon.age_ms);
+        assert!(daemon.age_ms < 60_000, "got age_ms = {}", daemon.age_ms);
+    }
+
+    #[test]
+    fn daemon_age_uses_most_recent_of_exit_or_crash() {
+        // Crash newer than exit → anchor on crash.
+        let mut actual = MeshOsState::default();
+        let now = Instant::now();
+        actual.last_tick = Some(now);
+        let d = dref("worker", 3);
+        let mut status = DaemonStatus::default();
+        status.lifecycle = DaemonLifecycle::Stopped;
+        status.last_started = Some(now - Duration::from_secs(120));
+        status.last_exit = Some(now - Duration::from_secs(90));
+        status.last_crash = Some(now - Duration::from_secs(10));
+        actual.daemons.insert(d, status);
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &DesiredState::default(),
+            &[],
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+            0,
+        );
+        let daemon = snap.daemons.get(&3).expect("daemon present");
+        assert!(daemon.age_ms >= 10_000, "got age_ms = {}", daemon.age_ms);
+        assert!(daemon.age_ms < 60_000, "got age_ms = {}", daemon.age_ms);
+    }
+
+    #[test]
+    fn daemon_snapshot_decodes_legacy_json_without_placement_or_age() {
+        // Pre-`placement`/`age_ms` JSON shape. Reconstructed by
+        // hand so the test pins the contract: a Deck-SDK client
+        // built against the older schema can still decode a
+        // newer snapshot's per-daemon entries, and a substrate
+        // built today can still decode an older snapshot's
+        // entries without the new fields.
+        let legacy = r#"{
+            "name": "compute-A",
+            "lifecycle": "Running",
+            "health": "Healthy",
+            "saturation": 0.25,
+            "restart_state": "Idle"
+        }"#;
+        let back: DaemonSnapshot = serde_json::from_str(legacy).expect("decode legacy");
+        assert_eq!(back.name, "compute-A");
+        assert_eq!(back.lifecycle, DaemonLifecycleSnapshot::Running);
+        assert_eq!(back.placement, 0);
+        assert_eq!(back.age_ms, 0);
+    }
+
+    #[test]
+    fn peer_snapshot_decodes_legacy_json_without_inventory_fields() {
+        // Pre-inventory JSON shape: only `rtt_ms`, `health`,
+        // `maintenance`. The Feature-11 inventory axes (cpu /
+        // mem / disk / saturation_trend / capability_set /
+        // software_version / forked_from) must all default to
+        // None / empty when absent so a Deck SDK consumer
+        // bumping its substrate dep doesn't see decode failures.
+        let legacy = r#"{
+            "rtt_ms": 7,
+            "health": "Healthy",
+            "maintenance": "Active"
+        }"#;
+        let back: PeerSnapshot = serde_json::from_str(legacy).expect("decode legacy");
+        assert_eq!(back.rtt_ms, Some(7));
+        assert!(back.cpu_load_1m.is_none());
+        assert!(back.mem_used_bytes.is_none());
+        assert!(back.capability_set.is_empty());
+        assert!(back.software_version.is_none());
+        assert!(back.forked_from.is_none());
+    }
+
+    #[test]
+    fn daemon_snapshot_postcard_wire_is_byte_stable() {
+        // The first-pass review's `serde(default)` fix is
+        // JSON-only — postcard cross-binary decode still
+        // requires field count + order agreement between
+        // encoder and decoder. Pin the on-wire bytes for a
+        // representative `DaemonSnapshot` so any accidental
+        // wire change (added field without a corresponding
+        // bump, reordered fields, type substitution) trips
+        // a clear regression here instead of silently rolling
+        // out to consumers and surfacing as decode errors at
+        // operator time.
+        let s = DaemonSnapshot {
+            name: "x".into(),
+            lifecycle: DaemonLifecycleSnapshot::Running,
+            health: None,
+            saturation: 0.5,
+            restart_state: RestartStateSnapshot::Idle,
+            placement: 0xAA,
+            age_ms: 1234,
+        };
+        let bytes = postcard::to_allocvec(&s).expect("encode");
+        // Captured 2026-05-16 against this exact field shape.
+        // To rotate after an intentional schema bump: drop a
+        // `dbg!(&bytes);` here, re-run, paste the printout.
+        let captured: &[u8] = &[
+            0x01, 0x78, 0x02, 0x00, 0x00, 0x00, 0x00, 0x3F, 0x00, 0xAA, 0x01, 0xD2, 0x09,
+        ];
+        assert_eq!(
+            bytes, captured,
+            "DaemonSnapshot postcard wire drifted — got {bytes:?}",
+        );
+        let back: DaemonSnapshot = postcard::from_bytes(captured).expect("decode captured bytes");
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn peer_snapshot_postcard_wire_is_byte_stable() {
+        // Same forward-compat guard as the DaemonSnapshot test
+        // above, against `PeerSnapshot` whose Feature-11
+        // inventory axes were the most recent additions and
+        // the most exposed via the Deck SDK surface.
+        let mut p = PeerSnapshot {
+            rtt_ms: Some(7),
+            health: Some(PeerHealthSnapshot::Healthy),
+            maintenance: Some(MaintenanceMirrorSnapshot::Active),
+            cpu_load_1m: Some(0.25),
+            mem_used_bytes: Some(1024),
+            mem_total_bytes: Some(8192),
+            disk_used_bytes: None,
+            disk_total_bytes: None,
+            saturation_trend: Some(0.4),
+            capability_set: std::collections::BTreeSet::new(),
+            software_version: Some("v1".into()),
+            forked_from: None,
+        };
+        p.capability_set.insert("net.peer".into());
+        let bytes = postcard::to_allocvec(&p).expect("encode");
+        let captured: &[u8] = &[
+            0x01, 0x07, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xD0,
+            0x3F, 0x01, 0x80, 0x08, 0x01, 0x80, 0x40, 0x00, 0x00, 0x01, 0xCD, 0xCC, 0xCC, 0x3E,
+            0x01, 0x08, 0x6E, 0x65, 0x74, 0x2E, 0x70, 0x65, 0x65, 0x72, 0x01, 0x02, 0x76, 0x31,
+            0x00,
+        ];
+        assert_eq!(
+            bytes, captured,
+            "PeerSnapshot postcard wire drifted — got {bytes:?}",
+        );
+        let back: PeerSnapshot = postcard::from_bytes(captured).expect("decode captured bytes");
+        assert_eq!(back, p);
     }
 
     #[test]

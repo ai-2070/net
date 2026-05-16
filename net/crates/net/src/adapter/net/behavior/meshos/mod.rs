@@ -130,7 +130,8 @@ pub use migration_snapshot_source::{
     MigrationSnapshotSource, NoOpMigrationSnapshotSource, OrchestratorMigrationSnapshotSource,
 };
 pub use probes::{
-    HealthProbe, LocalityProbe, ProximityGraphHealthProbe, ProximityGraphLocalityProbe,
+    HealthProbe, InventoryProbe, LocalityProbe, PeerInventory, ProximityGraphHealthProbe,
+    ProximityGraphLocalityProbe,
 };
 pub use reconcile::{reconcile, STOP_GRACE_PERIOD};
 pub use redex_appenders::{RedexAdminAuditAppender, RedexFailureAppender, RedexLogAppender};

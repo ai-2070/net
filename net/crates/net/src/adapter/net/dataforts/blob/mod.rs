@@ -42,7 +42,7 @@ pub(crate) fn hex32(hash: &[u8; 32]) -> String {
     s
 }
 
-pub use adapter::{BlobAdapter, BlobStat};
+pub use adapter::{BlobAdapter, BlobInventoryEntry, BlobListOptions, BlobStat};
 pub use admission::{
     auth_allows_blob_op, should_migrate_blob_to, should_pull_blob, MigrateBlobReject,
     MigrateBlobVerdict, PullBlobReject, PullBlobVerdict,
@@ -66,7 +66,7 @@ pub use mesh::{
 };
 pub use metrics::{
     evaluate_health_gate, BlobMetrics, BlobMetricsSnapshot, HealthGateAction,
-    HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
+    OverflowMetricsSnapshot, HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
 };
 pub use migration::{
     drive_blob_migration_tick, drive_blob_migration_tick_arc,

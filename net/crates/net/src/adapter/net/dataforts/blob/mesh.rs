@@ -896,12 +896,14 @@ impl MeshBlobAdapter {
                     actual: computed_existing,
                 });
             }
-            self.refcount.store_observed(*hash, now_ms);
+            self.refcount
+                .store_observed(*hash, bytes.len() as u64, now_ms);
             return Ok(());
         }
         file.append(bytes)
             .map_err(|e| BlobError::Backend(format!("mesh blob: append chunk: {}", e)))?;
-        self.refcount.store_observed(*hash, now_ms);
+        self.refcount
+            .store_observed(*hash, bytes.len() as u64, now_ms);
         Ok(())
     }
 
@@ -1252,6 +1254,147 @@ impl BlobAdapter for MeshBlobAdapter {
             encoding: blob_ref.encoding(),
         })
     }
+
+    async fn list(
+        &self,
+        opts: &super::adapter::BlobListOptions,
+    ) -> Result<Vec<super::adapter::BlobInventoryEntry>, BlobError> {
+        // Parse the caller's hex prefix into a byte pattern up
+        // front so the per-entry filter doesn't allocate a 64-
+        // char hex string just to throw it away. An invalid
+        // prefix (non-hex character) matches nothing — a typo
+        // in the operator's search box shouldn't crash the
+        // BLOBS tab or surface as an error.
+        let pattern = opts.prefix_hex.as_deref().map(parse_hex_prefix);
+        if matches!(pattern, Some(None)) {
+            return Ok(Vec::new());
+        }
+        let pattern = pattern.flatten();
+        // Pull a stable, prefix-filtered snapshot in one pass —
+        // entries that don't match the prefix never touch the
+        // output Vec, and we skip hex-encoding their hashes.
+        // The typical adapter holds tens of thousands of
+        // entries; a narrow prefix against that scale is the
+        // hot path Deck operators actually take.
+        let raw = self.refcount.snapshot_filter(|hash| match &pattern {
+            Some(pat) => hash_matches_pattern(hash, pat),
+            None => true,
+        });
+        // `replica_target` is per-adapter (set via
+        // `with_replication`); cheap to read once outside the
+        // map. `replicas_observed` would require a capability-
+        // index lookup per row — surface `None` for now and
+        // flip to a bulk lookup when the cap index is wired
+        // through to this path (see `BlobStat::replicas_observed`
+        // for the eventual integration point).
+        let replica_target = self.replication.as_ref().map(|c| c.factor as u32);
+        let mut entries: Vec<super::adapter::BlobInventoryEntry> = raw
+            .into_iter()
+            .map(|(hash, e)| super::adapter::BlobInventoryEntry {
+                adapter_id: self.id.clone(),
+                hash_hex: hex_encode(&hash),
+                refcount: e.refcount,
+                pinned: e.pinned,
+                first_seen_unix_ms: e.first_seen_unix_ms,
+                last_seen_unix_ms: e.last_seen_unix_ms,
+                size_bytes: e.size_bytes,
+                replicas_observed: None,
+                replica_target,
+            })
+            .collect();
+        // Most-recently-touched first — operators triaging
+        // an incident want the freshest churn at the top.
+        entries.sort_by_key(|e| std::cmp::Reverse(e.last_seen_unix_ms));
+        if opts.limit > 0 && entries.len() > opts.limit {
+            entries.truncate(opts.limit);
+        }
+        Ok(entries)
+    }
+
+    fn supports_list(&self) -> bool {
+        true
+    }
+}
+
+/// Pattern for matching a hex prefix against a raw `[u8; 32]`
+/// without allocating the entry's hex string. `full_bytes` is the
+/// strict byte prefix (one byte per two hex chars); `half_nibble`
+/// is the high nibble of an odd-length prefix's trailing
+/// character, paired with the byte index that nibble compares
+/// against. `None` for the half-nibble when the prefix length is
+/// even.
+#[derive(Debug, Clone)]
+struct HexPrefixPattern {
+    full_bytes: Vec<u8>,
+    half_nibble: Option<(usize, u8)>,
+}
+
+/// Parse a hex prefix into a [`HexPrefixPattern`]. Returns
+/// `None` on any non-hex character so the caller can short-
+/// circuit to an empty result. An empty prefix yields an
+/// always-matching pattern.
+fn parse_hex_prefix(prefix: &str) -> Option<HexPrefixPattern> {
+    let lower = prefix.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut full_bytes = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let hi = hex_nibble(bytes[i])?;
+        let lo = hex_nibble(bytes[i + 1])?;
+        full_bytes.push((hi << 4) | lo);
+        i += 2;
+    }
+    let half_nibble = if i < bytes.len() {
+        Some((full_bytes.len(), hex_nibble(bytes[i])?))
+    } else {
+        None
+    };
+    Some(HexPrefixPattern {
+        full_bytes,
+        half_nibble,
+    })
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn hash_matches_pattern(hash: &[u8; 32], pat: &HexPrefixPattern) -> bool {
+    if pat.full_bytes.len() > hash.len() {
+        return false;
+    }
+    if hash[..pat.full_bytes.len()] != pat.full_bytes[..] {
+        return false;
+    }
+    if let Some((idx, nibble)) = pat.half_nibble {
+        if idx >= hash.len() {
+            return false;
+        }
+        if (hash[idx] >> 4) != nibble {
+            return false;
+        }
+    }
+    true
+}
+
+/// Lowercase-hex render of a 32-byte hash. Inline to avoid a
+/// `hex` crate dependency here; the substrate already has
+/// `blake3::Hash::to_hex` but we hold raw `[u8; 32]` keys.
+/// Uses `write!` into the pre-allocated buffer rather than
+/// `format!` per byte — saves 64 transient `String` allocs
+/// per call, which adds up on prefix scans across a 32k-entry
+/// refcount table.
+fn hex_encode(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
 }
 
 impl MeshBlobAdapter {
@@ -1361,6 +1504,169 @@ mod tests {
         adapter.store(&blob, &payload).await.unwrap();
         let fetched = adapter.fetch(&blob).await.unwrap();
         assert_eq!(fetched, payload);
+    }
+
+    #[tokio::test]
+    async fn list_enumerates_stored_chunks_with_metadata() {
+        use super::super::adapter::BlobListOptions;
+        let adapter = make_adapter();
+        // Store three distinct payloads → three distinct chunk
+        // hashes land in the refcount table via the store path.
+        for payload in [
+            b"blob-one".to_vec(),
+            b"blob-two-other-bytes".to_vec(),
+            b"blob-three-with-still-different".to_vec(),
+        ] {
+            let blob = small_ref_for(&payload);
+            adapter.store(&blob, &payload).await.unwrap();
+        }
+        // No filter → every entry comes back. Sort order is
+        // last-seen-desc; we only assert the set since the
+        // three stores land in the same millisecond on most
+        // hosts.
+        let entries = adapter.list(&BlobListOptions::default()).await.unwrap();
+        assert_eq!(entries.len(), 3, "all three stored chunks should enumerate");
+        for e in &entries {
+            assert_eq!(e.hash_hex.len(), 64, "32-byte hash → 64 hex chars");
+            assert!(e.last_seen_unix_ms > 0);
+            assert!(e.first_seen_unix_ms <= e.last_seen_unix_ms);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_prefix_filter_narrows_to_matching_hash() {
+        use super::super::adapter::BlobListOptions;
+        let adapter = make_adapter();
+        let payload = b"prefix-target".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+        let all = adapter.list(&BlobListOptions::default()).await.unwrap();
+        assert_eq!(all.len(), 1);
+        let prefix = all[0].hash_hex[..4].to_string();
+        let narrowed = adapter
+            .list(&BlobListOptions {
+                prefix_hex: Some(prefix.clone()),
+                limit: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(narrowed.len(), 1);
+        assert!(narrowed[0].hash_hex.starts_with(&prefix));
+        // Bogus prefix → empty result.
+        let empty = adapter
+            .list(&BlobListOptions {
+                prefix_hex: Some("zzz".to_string()),
+                limit: 0,
+            })
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_odd_length_prefix_matches_high_nibble() {
+        // Odd-length hex prefixes are a real path in the
+        // Deck's BLOBS tab (operators type three-or-five-hex-
+        // char prefixes when they only remember the leading
+        // nibbles). The matcher must compare the trailing
+        // nibble against the high half of the next byte —
+        // pinning that here so a future refactor can't quietly
+        // round odd prefixes down to the even-length case.
+        use super::super::adapter::BlobListOptions;
+        let adapter = make_adapter();
+        let payload = b"odd-prefix-target".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+        let all = adapter.list(&BlobListOptions::default()).await.unwrap();
+        assert_eq!(all.len(), 1);
+        let prefix_odd = all[0].hash_hex[..3].to_string();
+        let narrowed = adapter
+            .list(&BlobListOptions {
+                prefix_hex: Some(prefix_odd.clone()),
+                limit: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(narrowed.len(), 1);
+        assert!(narrowed[0].hash_hex.starts_with(&prefix_odd));
+        // The same odd prefix's leading nibble flipped should
+        // miss the hash entirely.
+        let mut flipped: Vec<u8> = prefix_odd.bytes().collect();
+        let last = *flipped.last().unwrap();
+        flipped.pop();
+        // Pick any other hex digit for the trailing nibble.
+        let other = if last == b'0' { b'1' } else { b'0' };
+        flipped.push(other);
+        let flipped = String::from_utf8(flipped).unwrap();
+        let missed = adapter
+            .list(&BlobListOptions {
+                prefix_hex: Some(flipped),
+                limit: 0,
+            })
+            .await
+            .unwrap();
+        assert!(missed.is_empty(), "flipped nibble must not match");
+    }
+
+    #[tokio::test]
+    async fn supports_list_distinguishes_mesh_from_opt_out_adapter() {
+        // The BlobAdapter trait default for `supports_list`
+        // is `false` — adapters that genuinely enumerate must
+        // override. MeshBlobAdapter holds the refcount table
+        // and enumerates authoritatively, so its override
+        // returns `true`. A consumer (the Deck BLOBS tab)
+        // checks supports_list before rendering "0 rows"
+        // vs "N/A" so opt-out adapters aren't conflated with
+        // empty ones.
+        let adapter = make_adapter();
+        assert!(adapter.supports_list(), "MeshBlobAdapter enumerates");
+        // Default impl on a trait object that doesn't override
+        // (NoopAdapter doesn't override) should report false.
+        let noop: Arc<dyn super::super::adapter::BlobAdapter> =
+            Arc::new(super::super::noop::NoopAdapter::new("noop"));
+        assert!(
+            !noop.supports_list(),
+            "default opt-out adapter must not advertise list support",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_invalid_hex_prefix_returns_empty_not_error() {
+        // A typo in the operator's search box should produce
+        // an empty result, not crash the tab or return Err.
+        use super::super::adapter::BlobListOptions;
+        let adapter = make_adapter();
+        adapter
+            .store(&small_ref_for(b"bytes"), b"bytes".as_ref())
+            .await
+            .unwrap();
+        let out = adapter
+            .list(&BlobListOptions {
+                prefix_hex: Some("not-hex".into()),
+                limit: 0,
+            })
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_limit_caps_result_count() {
+        use super::super::adapter::BlobListOptions;
+        let adapter = make_adapter();
+        for i in 0u32..5 {
+            let payload = format!("payload-{i}").into_bytes();
+            let blob = small_ref_for(&payload);
+            adapter.store(&blob, &payload).await.unwrap();
+        }
+        let limited = adapter
+            .list(&BlobListOptions {
+                prefix_hex: None,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 2, "limit caps the result count");
     }
 
     #[tokio::test]

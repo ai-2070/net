@@ -42,16 +42,23 @@
 pub use net::adapter::net::behavior::deck::{
     AdminCommands, AdminError, AuditQuery, AuditStream, ChainCommit, DaemonCounts, DeckClient,
     DeckClientConfig, DeckError, FailureStream, IceCommands, IceError, IceProposal, LogFilter,
-    LogStream, OperatorIdentity, OperatorRegistry, OperatorSignature, PeerCounts, SnapshotStream,
-    StatusSummary, StatusSummaryStream,
+    LogStream, OperatorIdentity, OperatorRegistry, OperatorSignature, PeerCounts,
+    SimulatedIceProposal, SnapshotStream, StatusSummary, StatusSummaryStream,
 };
+// Pure ICE simulator — runs a `BlastRadius` against any
+// `MeshOsSnapshot` + `IceActionProposal` without touching the
+// runtime. Used by the deck binary to preview blast radius
+// inside the confirmation modal before the operator actually
+// fires the proposal through `IceProposal::simulate().commit(...)`.
+pub use net::adapter::net::behavior::meshos::simulate_ice_proposal;
 
 // Supporting types operators need from the MeshOS surface to
 // build commands or read snapshots.
 pub use net::adapter::net::behavior::meshos::{
     AdminAuditRecord, AdminEvent, AdminVerifier, AvoidScope, BlastRadius, BlastWarning, ChainId,
-    DaemonHealthSnapshot, DaemonLifecycleSnapshot, DaemonSnapshot, FailureRecord,
-    IceActionProposal, LogLevel, LogLine, LogRecord, MaintenanceStateSnapshot, MeshOsSnapshot,
-    MigrationId, MigrationPhaseSnapshot, MigrationSnapshot, NodeId, PeerHealthSnapshot,
-    PeerSnapshot, ReplicaSnapshot, RestartStateSnapshot, VerificationOutcome, VerifyError,
+    DaemonHealthSnapshot, DaemonLifecycleSnapshot, DaemonRef, DaemonSnapshot, FailureRecord,
+    IceActionProposal, LogLevel, LogLine, LogRecord, MaintenanceMirrorSnapshot,
+    MaintenanceStateSnapshot, MeshOsSnapshot, MigrationId, MigrationPhaseSnapshot,
+    MigrationSnapshot, NodeId, PeerHealthSnapshot, PeerSnapshot, ReplicaSnapshot,
+    RestartStateSnapshot, VerificationOutcome, VerifyError,
 };

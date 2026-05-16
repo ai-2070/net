@@ -96,8 +96,24 @@ pub use net::adapter::net::behavior::meshos::{
 // Supporting types daemon authors need.
 pub use net::adapter::net::behavior::capability::CapabilitySet;
 pub use net::adapter::net::behavior::meshos::{
-    ActionDispatcher, DispatchError, LogLevel, LogLine, MeshOsConfig, MeshOsRuntime,
+    ActionDispatcher, DispatchError, HealthProbe, InventoryProbe, LocalityProbe, LogLevel, LogLine,
+    LoggingDispatcher, MeshOsConfig, MeshOsRuntime, PeerInventory, ProbeRegistry,
     RuntimeShutdownError, RuntimeStats,
+};
+// Event-source supporting types — exposed so test / demo
+// callers can write probes that report `NodeHealth` values
+// and so consumers wiring custom event sources can match
+// against `NodeId` in the public surface.
+pub use net::adapter::net::behavior::meshos::{NodeHealth, NodeId};
+
+// Direct event injection — for in-process / test / demo
+// consumers that want to publish events into the runtime's
+// fold without going through a source converter. Daemon
+// authors don't need these; the daemon-side SDK exposes
+// `publish_log` and `next_control` and refuses every other
+// event-issuance path by design.
+pub use net::adapter::net::behavior::meshos::{
+    ChainId, MeshOsEvent, MeshOsHandle, MeshOsHandleError, PlacementIntent, ReplicaUpdate,
 };
 pub use net::adapter::net::compute::{
     DaemonControl, DaemonError, DaemonHealth, DaemonHostConfig, MeshDaemon,

@@ -258,6 +258,7 @@ impl MaintenanceDiscriminant {
 struct ProbeListsInner {
     locality: Vec<Arc<dyn LocalityProbe>>,
     health: Vec<Arc<dyn HealthProbe>>,
+    inventory: Vec<Arc<dyn super::probes::InventoryProbe>>,
 }
 
 #[derive(Clone, Default)]
@@ -293,13 +294,49 @@ impl ProbeRegistry {
         self.inner.lists.write().health.push(probe);
     }
 
+    /// Install an [`super::probes::InventoryProbe`]. Probes are
+    /// polled by the loop in registration order, once per Tick;
+    /// partial samples merge into per-peer state (later probes
+    /// overwrite earlier on the same peer + axis).
+    pub fn add_inventory_probe(&self, probe: Arc<dyn super::probes::InventoryProbe>) {
+        self.inner.lists.write().inventory.push(probe);
+    }
+
     /// Atomic snapshot of installed probe counts —
-    /// `(locality, health)`. One read lock covers both lists,
-    /// so the pair is consistent even if a concurrent
-    /// installer fires between them.
-    pub fn probe_counts(&self) -> (usize, usize) {
+    /// `(locality, health, inventory)`. One read lock covers
+    /// all three lists, so the triple is consistent even if a
+    /// concurrent installer fires between them.
+    pub fn probe_counts(&self) -> (usize, usize, usize) {
         let guard = self.inner.lists.read();
-        (guard.locality.len(), guard.health.len())
+        (
+            guard.locality.len(),
+            guard.health.len(),
+            guard.inventory.len(),
+        )
+    }
+
+    /// Drop every installed [`LocalityProbe`]. Long-running
+    /// runtimes that swap probe sources (test harnesses,
+    /// hot-config reloaders) would otherwise accumulate dead
+    /// probes that keep firing every Tick; this lets a caller
+    /// detach the old set before installing replacements.
+    pub fn clear_locality_probes(&self) {
+        self.inner.lists.write().locality.clear();
+    }
+
+    /// Drop every installed [`HealthProbe`]. Same rationale as
+    /// [`Self::clear_locality_probes`].
+    pub fn clear_health_probes(&self) {
+        self.inner.lists.write().health.clear();
+    }
+
+    /// Drop every installed [`super::probes::InventoryProbe`].
+    /// Same rationale as [`Self::clear_locality_probes`]. Last-
+    /// writer-wins per peer means a stale probe left installed
+    /// can stomp a live replacement's samples, so callers
+    /// swapping inventory sources should clear first.
+    pub fn clear_inventory_probes(&self) {
+        self.inner.lists.write().inventory.clear();
     }
 }
 
@@ -718,12 +755,16 @@ impl MeshOsLoop {
     /// out the `ProbeRegistry`), so trust-but-isolate is the
     /// right posture.
     fn poll_probes(&mut self) {
-        // Clone both lists out under a single read lock so a
-        // concurrent install between the locality and health
-        // passes doesn't see one half of an inconsistent pair.
-        let (locality, health) = {
+        // Clone all probe lists out under a single read lock so
+        // a concurrent install between the locality / health /
+        // inventory passes doesn't see a half-applied registry.
+        let (locality, health, inventory) = {
             let guard = self.probes.lists.read();
-            (guard.locality.clone(), guard.health.clone())
+            (
+                guard.locality.clone(),
+                guard.health.clone(),
+                guard.inventory.clone(),
+            )
         };
         for probe in &locality {
             let probe = Arc::clone(probe);
@@ -760,6 +801,67 @@ impl MeshOsLoop {
                     );
                 }
             }
+        }
+        // Track inventory samples seen this tick so the GC pass
+        // below drops entries for peers no probe sees anymore.
+        // The map is probe-exclusive (no `MeshOsEvent` populates
+        // it), so it's safe to authoritatively prune from the
+        // probe pass. The rtt + node_health maps are also fed by
+        // `MeshOsEvent::{RttSample, NodeHealth}` event folds, so
+        // their per-tick prune would erase event-driven samples;
+        // those maps grow with proximity churn but the inventory
+        // leak the review flagged was per-peer multi-field and
+        // strictly worse.
+        let mut peers_seen_inventory: std::collections::HashSet<super::event::NodeId> =
+            std::collections::HashSet::new();
+        let mut all_probes_succeeded = true;
+        let mut any_probe_saw_samples = false;
+        for probe in &inventory {
+            let probe = Arc::clone(probe);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                probe.inventory_samples()
+            }));
+            match result {
+                Ok(samples) => {
+                    if !samples.is_empty() {
+                        any_probe_saw_samples = true;
+                    }
+                    for (peer, inv) in samples {
+                        peers_seen_inventory.insert(peer);
+                        self.actual.inventory.insert(peer, inv);
+                    }
+                }
+                Err(_) => {
+                    all_probes_succeeded = false;
+                    tracing::error!(
+                        target: "meshos",
+                        "inventory probe panicked — sample skipped this tick",
+                    );
+                }
+            }
+        }
+        // Two-axis guard for the GC pass:
+        //
+        //   * `all_probes_succeeded` — a partial-panic pass
+        //     can leave `peers_seen_inventory` short of peers
+        //     that the panicking probe owned authoritatively
+        //     (e.g. two inventory probes with disjoint
+        //     coverage); pruning then drops the panicking
+        //     probe's peers despite no probe knowing they
+        //     departed. Wait for the next clean tick instead.
+        //
+        //   * `any_probe_saw_samples` — the trait contract
+        //     allows a probe to return `Ok(vec![])` for a
+        //     transient empty-this-tick (procfs unavailable,
+        //     no peers known yet at startup); pruning on an
+        //     all-empty pass would wipe every previously-seen
+        //     peer's inventory. The first tick at startup
+        //     legitimately has no peers, so this also
+        //     prevents a cold-start wipe.
+        if all_probes_succeeded && any_probe_saw_samples {
+            self.actual
+                .inventory
+                .retain(|peer, _| peers_seen_inventory.contains(peer));
         }
     }
 
@@ -1287,6 +1389,7 @@ impl MeshOsLoop {
             in_flight_migrations,
             &self.admin_audit_ring,
             &self.log_ring,
+            self.config.this_node,
         );
         snap.runtime_epoch_id = self.runtime_epoch_id;
         self.snapshot.store(Arc::new(snap));
@@ -1432,6 +1535,252 @@ mod tests {
         assert!(
             count >= 1,
             "loop should have completed at least one reconcile pass despite probe panics",
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_gc_drops_peers_no_probe_samples_anymore() {
+        // poll_probes used to insert per-peer inventory samples
+        // and never remove them. A peer that departed from
+        // proximity would leak into actual.inventory forever,
+        // surfacing in every snapshot until the process
+        // restarted. Pin the per-tick GC: an inventory probe
+        // whose sample set shrinks across ticks should leave
+        // actual.inventory pruned to match.
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+        use std::sync::Mutex;
+        struct ShrinkingProbe {
+            tick: AtomicUsize,
+            // Mutex so the trait method can mutate freely
+            // without &mut self.
+            samples_per_tick: Mutex<Vec<Vec<(u64, super::super::probes::PeerInventory)>>>,
+        }
+        impl super::super::probes::InventoryProbe for ShrinkingProbe {
+            fn inventory_samples(&self) -> Vec<(u64, super::super::probes::PeerInventory)> {
+                let t = self.tick.fetch_add(1, AOrdering::Relaxed);
+                let guard = self.samples_per_tick.lock().unwrap();
+                // Past the end of the scripted set, stick on the
+                // final entry so the steady state stays observed.
+                let idx = t.min(guard.len().saturating_sub(1));
+                guard.get(idx).cloned().unwrap_or_default()
+            }
+        }
+        let inv_with_cpu = |cpu: f64| super::super::probes::PeerInventory {
+            cpu_load_1m: Some(cpu),
+            ..Default::default()
+        };
+        let probe = Arc::new(ShrinkingProbe {
+            tick: AtomicUsize::new(0),
+            samples_per_tick: Mutex::new(vec![
+                vec![
+                    (0xA, inv_with_cpu(0.1)),
+                    (0xB, inv_with_cpu(0.2)),
+                    (0xC, inv_with_cpu(0.3)),
+                ],
+                vec![(0xB, inv_with_cpu(0.2)), (0xC, inv_with_cpu(0.3))],
+                vec![(0xB, inv_with_cpu(0.2)), (0xC, inv_with_cpu(0.3))],
+            ]),
+        });
+        let registry = ProbeRegistry::new();
+        registry.add_inventory_probe(probe);
+        let cfg = MeshOsConfig {
+            tick_interval: StdDuration::from_millis(10),
+            ..fast_test_config()
+        };
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _actions_rx,
+            reader,
+        } = MeshOsLoop::new(cfg);
+        let loop_ = loop_.with_probe_registry(registry);
+        let task = tokio::spawn(loop_.run());
+        // Wait long enough for at least two ticks to fire so
+        // the second sample set (without peer 0xA) lands.
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        let snap = reader.read();
+        let inv_peers: std::collections::BTreeSet<u64> = snap
+            .peers
+            .iter()
+            .filter(|(_, p)| p.cpu_load_1m.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(StdDuration::from_secs(2), task).await;
+        assert!(
+            !inv_peers.contains(&0xA),
+            "peer 0xA stopped being sampled but still appears in the inventory: {inv_peers:?}",
+        );
+        assert!(inv_peers.contains(&0xB), "peer 0xB should still be sampled");
+        assert!(inv_peers.contains(&0xC), "peer 0xC should still be sampled");
+    }
+
+    #[tokio::test]
+    async fn inventory_gc_does_not_wipe_peers_when_one_of_two_probes_panics() {
+        // Multi-probe partial-panic case: probe A reports peer
+        // 0xA, probe B reports peer 0xB. On tick 2, probe B
+        // panics; the GC pass must not drop 0xB just because A
+        // didn't sample it. Without the `all_probes_succeeded`
+        // guard, `peers_seen_inventory = {0xA}` and `retain`
+        // would wipe 0xB even though no probe authoritatively
+        // observed its departure.
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+        struct SteadyProbe {
+            peer: u64,
+            cpu: f64,
+        }
+        impl super::super::probes::InventoryProbe for SteadyProbe {
+            fn inventory_samples(&self) -> Vec<(u64, super::super::probes::PeerInventory)> {
+                vec![(
+                    self.peer,
+                    super::super::probes::PeerInventory {
+                        cpu_load_1m: Some(self.cpu),
+                        ..Default::default()
+                    },
+                )]
+            }
+        }
+        struct SometimesPanickingProbe {
+            tick: AtomicUsize,
+            peer: u64,
+            cpu: f64,
+        }
+        impl super::super::probes::InventoryProbe for SometimesPanickingProbe {
+            fn inventory_samples(&self) -> Vec<(u64, super::super::probes::PeerInventory)> {
+                let t = self.tick.fetch_add(1, AOrdering::Relaxed);
+                if t == 0 {
+                    vec![(
+                        self.peer,
+                        super::super::probes::PeerInventory {
+                            cpu_load_1m: Some(self.cpu),
+                            ..Default::default()
+                        },
+                    )]
+                } else {
+                    panic!("probe B panicked on tick {t}");
+                }
+            }
+        }
+        let registry = ProbeRegistry::new();
+        registry.add_inventory_probe(Arc::new(SteadyProbe {
+            peer: 0xA,
+            cpu: 0.1,
+        }));
+        registry.add_inventory_probe(Arc::new(SometimesPanickingProbe {
+            tick: AtomicUsize::new(0),
+            peer: 0xB,
+            cpu: 0.2,
+        }));
+        let cfg = MeshOsConfig {
+            tick_interval: StdDuration::from_millis(10),
+            ..fast_test_config()
+        };
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _actions_rx,
+            reader,
+        } = MeshOsLoop::new(cfg);
+        let loop_ = loop_.with_probe_registry(registry);
+        let task = tokio::spawn(loop_.run());
+        // Wait for the first tick (both probes succeed) and
+        // several subsequent ticks (probe B panics).
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        let snap = reader.read();
+        let inv_peers: std::collections::BTreeSet<u64> = snap
+            .peers
+            .iter()
+            .filter(|(_, p)| p.cpu_load_1m.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(StdDuration::from_secs(2), task).await;
+        assert!(
+            inv_peers.contains(&0xA),
+            "probe A's peer should still be in inventory: {inv_peers:?}",
+        );
+        assert!(
+            inv_peers.contains(&0xB),
+            "probe B's peer must survive probe B's panic — partial-panic ticks are not authoritative for the panicking probe's peers: {inv_peers:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_gc_does_not_wipe_on_a_transient_empty_probe() {
+        // The InventoryProbe trait permits an `Ok(vec![])`
+        // return ("no peers this tick" — transient procfs
+        // unavailability, cold start, etc.). Without the
+        // `any_probe_saw_samples` guard the GC pass would
+        // treat the empty return as "no peers authoritatively
+        // exist anymore" and wipe every previously-seen peer's
+        // inventory.
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+        struct FlakyProbe {
+            tick: AtomicUsize,
+        }
+        impl super::super::probes::InventoryProbe for FlakyProbe {
+            fn inventory_samples(&self) -> Vec<(u64, super::super::probes::PeerInventory)> {
+                let t = self.tick.fetch_add(1, AOrdering::Relaxed);
+                // Tick 0: populate. Subsequent ticks: empty
+                // (simulate the resource probe losing its
+                // procfs handle for a few cycles).
+                if t == 0 {
+                    vec![
+                        (
+                            0xA,
+                            super::super::probes::PeerInventory {
+                                cpu_load_1m: Some(0.1),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            0xB,
+                            super::super::probes::PeerInventory {
+                                cpu_load_1m: Some(0.2),
+                                ..Default::default()
+                            },
+                        ),
+                    ]
+                } else {
+                    vec![]
+                }
+            }
+        }
+        let registry = ProbeRegistry::new();
+        registry.add_inventory_probe(Arc::new(FlakyProbe {
+            tick: AtomicUsize::new(0),
+        }));
+        let cfg = MeshOsConfig {
+            tick_interval: StdDuration::from_millis(10),
+            ..fast_test_config()
+        };
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _actions_rx,
+            reader,
+        } = MeshOsLoop::new(cfg);
+        let loop_ = loop_.with_probe_registry(registry);
+        let task = tokio::spawn(loop_.run());
+        // Wait long enough for the populating tick + several
+        // empty ticks.
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        let snap = reader.read();
+        let inv_peers: std::collections::BTreeSet<u64> = snap
+            .peers
+            .iter()
+            .filter(|(_, p)| p.cpu_load_1m.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        handle.publish(MeshOsEvent::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(StdDuration::from_secs(2), task).await;
+        assert!(
+            inv_peers.contains(&0xA),
+            "transient empty probe return must not wipe inventory: {inv_peers:?}",
+        );
+        assert!(
+            inv_peers.contains(&0xB),
+            "transient empty probe return must not wipe inventory: {inv_peers:?}",
         );
     }
 
@@ -1912,18 +2261,22 @@ mod tests {
         let _ = task.await;
         let snap = reader.read();
         assert!(
-            !snap.pending.is_empty(),
-            "expected at least one pending action; saw none",
+            !snap.recently_emitted.is_empty(),
+            "expected at least one recently-emitted action; saw none",
         );
         // The latest tick anchors the snapshot's now. Actions
         // emitted in that tick render with age_ms == 0 only when
         // reconcile uses last_tick for emitted_at.
-        let zero_age_count = snap.pending.iter().filter(|p| p.age_ms == 0).count();
+        let zero_age_count = snap
+            .recently_emitted
+            .iter()
+            .filter(|p| p.age_ms == 0)
+            .count();
         assert!(
             zero_age_count >= 1,
             "expected at least one action emitted in the snapshot's tick to render \
-             age_ms == 0 (anchored on last_tick); pending = {:?}",
-            snap.pending,
+             age_ms == 0 (anchored on last_tick); recently_emitted = {:?}",
+            snap.recently_emitted,
         );
     }
 
@@ -2067,5 +2420,60 @@ mod tests {
 
         drop(handle);
         let _ = tokio::time::timeout(StdDuration::from_secs(1), task).await;
+    }
+
+    /// `clear_inventory_probes` must drop every installed
+    /// inventory probe (and only those) so callers swapping
+    /// probe sources mid-flight can detach the previous set
+    /// before installing replacements. Without this, a stale
+    /// probe left in the append-only registry can stomp the
+    /// new one's samples via last-writer-wins per peer.
+    #[test]
+    fn clear_inventory_probes_drops_installed_probes_only() {
+        struct DummyInventoryProbe;
+        impl super::super::probes::InventoryProbe for DummyInventoryProbe {
+            fn inventory_samples(&self) -> Vec<(u64, super::super::probes::PeerInventory)> {
+                vec![]
+            }
+        }
+        struct DummyLocalityProbe;
+        impl super::super::probes::LocalityProbe for DummyLocalityProbe {
+            fn rtt_samples(&self) -> Vec<(u64, StdDuration)> {
+                vec![]
+            }
+        }
+        struct DummyHealthProbe;
+        impl super::super::probes::HealthProbe for DummyHealthProbe {
+            fn health_samples(&self) -> Vec<(u64, super::super::event::NodeHealth)> {
+                vec![]
+            }
+        }
+
+        let reg = ProbeRegistry::new();
+        reg.add_locality_probe(Arc::new(DummyLocalityProbe));
+        reg.add_health_probe(Arc::new(DummyHealthProbe));
+        reg.add_inventory_probe(Arc::new(DummyInventoryProbe));
+        reg.add_inventory_probe(Arc::new(DummyInventoryProbe));
+        assert_eq!(reg.probe_counts(), (1, 1, 2));
+
+        reg.clear_inventory_probes();
+        assert_eq!(
+            reg.probe_counts(),
+            (1, 1, 0),
+            "inventory cleared; locality + health untouched"
+        );
+
+        // The other clear paths are symmetric — verify they
+        // also touch only their own list.
+        reg.clear_locality_probes();
+        assert_eq!(reg.probe_counts(), (0, 1, 0));
+        reg.clear_health_probes();
+        assert_eq!(reg.probe_counts(), (0, 0, 0));
+
+        // Post-clear, re-install must succeed and count
+        // independently — the underlying Vec wasn't replaced
+        // with something half-broken.
+        reg.add_inventory_probe(Arc::new(DummyInventoryProbe));
+        assert_eq!(reg.probe_counts(), (0, 0, 1));
     }
 }

@@ -91,11 +91,33 @@ meshos = ["compute", "net/meshos"]
 # slices as the substrate's signed admin chain + blast-radius
 # simulator come online.
 deck = ["meshos"]
+# Dataforts — mesh-native blob storage adapter. Re-exports
+# `adapter::net::dataforts::*` so operator-facing surfaces
+# (the deck's DATAFORTS tab) can render real `BlobMetrics`
+# instead of a fixture. Pulls in redex + redex-disk + blake3
+# transitively via `net/dataforts`.
+dataforts = ["net/dataforts"]
+# MeshDB — federated query plane above the substrate's chains.
+# Re-exports the typed `MeshQuery` AST + `MeshQueryExecutor`
+# + `ChainReader` so tenant tooling (and future Deck MeshDB
+# Console) can compose queries without reaching through
+# internal substrate paths. The substrate gates MeshDB on its
+# own `meshdb` feature (Phase A of `MESHDB_PLAN.md`); this
+# flag composes against it.
+meshdb = ["net/meshdb"]
 # Everything that runs locally (mesh + storage/state + security +
 # compute + groups, no external transports). The default shape for
 # a single-node or LAN-only deployment.
 local = ["net", "cortex", "compute", "groups"]
-# Everything — local stack plus external transports.
+# Everything — local stack plus external transports plus the
+# operator-facing surfaces. `dataforts` and `meshdb` are
+# deliberately omitted: both pull substrate features that
+# enlarge the dependency footprint (redex-disk, blake3, the
+# meshdb query plane), and `full` is meant to be "the
+# common bundle for an operator's full-stack daemon", not
+# "every flag this crate exposes". Consumers that want
+# dataforts blob storage or the MeshDB query plane add those
+# flags explicitly.
 full = ["local", "redis", "jetstream", "meshos", "deck"]
 
 # nRPC quickstart — requires net + cortex.

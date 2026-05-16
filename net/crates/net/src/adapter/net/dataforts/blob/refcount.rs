@@ -68,6 +68,12 @@ pub struct RefcountEntry {
     /// `BlobRefcountTable::pin`. Pinned hashes survive GC
     /// regardless of refcount / retention floor.
     pub pinned: bool,
+    /// Payload size in bytes for this hash. `Some(n)` whenever
+    /// the local adapter has observed a store; `None` for hashes
+    /// that only entered the table via `incr` from a remote
+    /// source (the chunk isn't local yet — the size is the peer's
+    /// to advertise).
+    pub size_bytes: Option<u64>,
 }
 
 /// Refcount + pin tracking table for the [`MeshBlobAdapter`](super::MeshBlobAdapter)'s
@@ -108,19 +114,29 @@ impl BlobRefcountTable {
 
     /// Record that a hash was stored locally (no refcount change;
     /// just stamps `first_seen` so the retention floor starts the
-    /// clock). Subsequent `incr` calls preserve the original
-    /// `first_seen`. Idempotent.
-    pub fn store_observed(&self, hash: [u8; 32], now_unix_ms: u64) {
+    /// clock and pins the chunk's payload size for the
+    /// `BlobInventoryEntry.size_bytes` projection). Subsequent
+    /// `incr` calls preserve the original `first_seen` and don't
+    /// touch `size_bytes`. Idempotent.
+    pub fn store_observed(&self, hash: [u8; 32], size_bytes: u64, now_unix_ms: u64) {
         self.inner
             .entry(hash)
             .and_modify(|e| {
                 e.last_seen_unix_ms = now_unix_ms;
+                // Size was unknown until this store landed —
+                // stamp it now. A subsequent re-store of the same
+                // hash carries the same payload (content-addressed)
+                // so the value is stable.
+                if e.size_bytes.is_none() {
+                    e.size_bytes = Some(size_bytes);
+                }
             })
             .or_insert(RefcountEntry {
                 refcount: 0,
                 first_seen_unix_ms: now_unix_ms,
                 last_seen_unix_ms: now_unix_ms,
                 pinned: false,
+                size_bytes: Some(size_bytes),
             });
     }
 
@@ -134,6 +150,7 @@ impl BlobRefcountTable {
             first_seen_unix_ms: now_unix_ms,
             last_seen_unix_ms: now_unix_ms,
             pinned: false,
+            size_bytes: None,
         });
         entry.refcount = entry.refcount.saturating_add(1);
         entry.last_seen_unix_ms = now_unix_ms;
@@ -176,6 +193,7 @@ impl BlobRefcountTable {
                 first_seen_unix_ms: now_unix_ms,
                 last_seen_unix_ms: now_unix_ms,
                 pinned: true,
+                size_bytes: None,
             });
     }
 
@@ -209,6 +227,30 @@ impl BlobRefcountTable {
     /// order is needed.
     pub fn snapshot(&self) -> Vec<([u8; 32], RefcountEntry)> {
         self.inner.iter().map(|r| (*r.key(), *r.value())).collect()
+    }
+
+    /// Streaming variant of [`Self::snapshot`] that drops every
+    /// entry whose hash the predicate rejects before adding it
+    /// to the output vector. Cheaper than `snapshot().retain(..)`
+    /// for narrow-prefix scans against a large table because the
+    /// rejected entries never touch the result allocation. Used
+    /// by the adapter `list` path to honor `BlobListOptions::prefix_hex`
+    /// without materializing the whole table per call.
+    pub fn snapshot_filter<F>(&self, mut accept: F) -> Vec<([u8; 32], RefcountEntry)>
+    where
+        F: FnMut(&[u8; 32]) -> bool,
+    {
+        self.inner
+            .iter()
+            .filter_map(|r| {
+                let key = *r.key();
+                if accept(&key) {
+                    Some((key, *r.value()))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Total count of hashes with `refcount == 0`. Exposed for
@@ -361,7 +403,7 @@ mod tests {
     #[test]
     fn store_observed_stamps_first_seen() {
         let t = BlobRefcountTable::new();
-        t.store_observed(h(1), 1_000);
+        t.store_observed(h(1), 0, 1_000);
         let e = t.get(&h(1)).unwrap();
         assert_eq!(e.refcount, 0);
         assert_eq!(e.first_seen_unix_ms, 1_000);
@@ -370,8 +412,8 @@ mod tests {
     #[test]
     fn store_observed_is_idempotent_on_first_seen() {
         let t = BlobRefcountTable::new();
-        t.store_observed(h(1), 1_000);
-        t.store_observed(h(1), 5_000);
+        t.store_observed(h(1), 0, 1_000);
+        t.store_observed(h(1), 0, 5_000);
         let e = t.get(&h(1)).unwrap();
         assert_eq!(e.first_seen_unix_ms, 1_000);
         assert_eq!(e.last_seen_unix_ms, 5_000);
@@ -380,8 +422,8 @@ mod tests {
     #[test]
     fn pinned_count_and_zero_refcount_count() {
         let t = BlobRefcountTable::new();
-        t.store_observed(h(1), 0);
-        t.store_observed(h(2), 0);
+        t.store_observed(h(1), 0, 0);
+        t.store_observed(h(2), 0, 0);
         t.incr(h(3), 0);
         t.pin(h(4), 0);
         assert_eq!(t.pinned_count(), 1);
@@ -396,6 +438,7 @@ mod tests {
             first_seen_unix_ms: 0,
             last_seen_unix_ms: 0,
             pinned: false,
+            size_bytes: None,
         };
         // 25h elapsed > 24h floor; no pressure; no refs; no pin.
         let now = 25 * ONE_HOUR_MS;
@@ -409,6 +452,7 @@ mod tests {
             first_seen_unix_ms: 0,
             last_seen_unix_ms: 0,
             pinned: true,
+            size_bytes: None,
         };
         let now = 25 * ONE_HOUR_MS;
         assert!(!should_sweep(&entry, now, DEFAULT_RETENTION_FLOOR, false));
@@ -421,6 +465,7 @@ mod tests {
             first_seen_unix_ms: 0,
             last_seen_unix_ms: 0,
             pinned: false,
+            size_bytes: None,
         };
         let now = 25 * ONE_HOUR_MS;
         assert!(!should_sweep(&entry, now, DEFAULT_RETENTION_FLOOR, false));
@@ -433,6 +478,7 @@ mod tests {
             first_seen_unix_ms: 0,
             last_seen_unix_ms: 0,
             pinned: false,
+            size_bytes: None,
         };
         // 12h elapsed < 24h floor.
         let now = 12 * ONE_HOUR_MS;
@@ -448,6 +494,7 @@ mod tests {
             first_seen_unix_ms: 0,
             last_seen_unix_ms: 0,
             pinned: false,
+            size_bytes: None,
         };
         let now = ONE_DAY_MS;
         assert!(should_sweep(&entry, now, DEFAULT_RETENTION_FLOOR, false));
@@ -460,6 +507,7 @@ mod tests {
             first_seen_unix_ms: 0,
             last_seen_unix_ms: 0,
             pinned: false,
+            size_bytes: None,
         };
         let now = 25 * ONE_HOUR_MS;
         // Critical pressure: don't make a bad day worse.
@@ -470,13 +518,13 @@ mod tests {
     fn deletable_hashes_returns_only_sweep_eligible() {
         let t = BlobRefcountTable::new();
         // h(1): eligible
-        t.store_observed(h(1), 0);
+        t.store_observed(h(1), 0, 0);
         // h(2): pinned (skip)
         t.pin(h(2), 0);
         // h(3): refcount > 0 (skip)
         t.incr(h(3), 0);
         // h(4): under retention floor (skip)
-        t.store_observed(h(4), 24 * ONE_HOUR_MS);
+        t.store_observed(h(4), 0, 24 * ONE_HOUR_MS);
         let now = 25 * ONE_HOUR_MS;
         let mut deletable = t.deletable_hashes(now, DEFAULT_RETENTION_FLOOR, false);
         deletable.sort();
@@ -486,7 +534,7 @@ mod tests {
     #[test]
     fn deletable_hashes_returns_empty_under_pressure() {
         let t = BlobRefcountTable::new();
-        t.store_observed(h(1), 0);
+        t.store_observed(h(1), 0, 0);
         let now = 25 * ONE_HOUR_MS;
         let deletable = t.deletable_hashes(now, DEFAULT_RETENTION_FLOOR, true);
         assert!(deletable.is_empty());
@@ -495,7 +543,7 @@ mod tests {
     #[test]
     fn remove_clears_entry() {
         let t = BlobRefcountTable::new();
-        t.store_observed(h(1), 0);
+        t.store_observed(h(1), 0, 0);
         assert_eq!(t.len(), 1);
         t.remove(&h(1));
         assert_eq!(t.len(), 0);
@@ -734,7 +782,7 @@ mod tests {
         let table = BlobRefcountTable::new();
         // Pre-seed 32 hashes so the snapshot has real work to do.
         for i in 0..32u8 {
-            table.store_observed(h(i), 0);
+            table.store_observed(h(i), 0, 0);
         }
 
         let threads = 4usize;
