@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/behavior/meshos/snapshot.rs
+  s_46edf7dc333ef6::t_fb5831c297db0c 191-199
+  s_46edf7dc333ef6::t_cf41b98b39bb9f 517-543,548
+  s_46edf7dc333ef6::t_f08455ea0f0d6b 979-1066
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "b7cb312d84ce9bce2b9b050dbef65b7bf20128f6",
+  "prompts": {},
+  "sessions": {
+    "s_46edf7dc333ef6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e145bb62-38ea-4dbe-81cd-e36e7e65c2ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
