@@ -54,3 +54,15 @@ samples = []
 #   cargo run -p deck --features samples-logs
 #   cargo run -p deck --features samples,samples-logs
 samples-logs = []
+# `demo` boots a real 5-node in-process MeshOS cluster via
+# `net_sdk::testing::ClusterHarness` and registers real daemons
+# across the nodes. The deck observes node[0]'s view; the
+# substrate folds peer / daemon / log / chain state naturally
+# through the bridge probes + real `MeshOsDaemonSdk` registrations,
+# replacing the synthetic `samples` fixtures.
+#
+# See `crates/net/docs/plans/DECK_DEMO_PLAN.md`. Dev-only; never
+# ship to crates.io as a default feature.
+#
+#   cargo run -p deck --features demo
+demo = ["ai2070-net-sdk/testing", "ai2070-net-sdk/cortex"]

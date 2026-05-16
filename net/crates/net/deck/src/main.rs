@@ -16,8 +16,14 @@
 
 mod app;
 mod bookmarks;
+#[cfg(feature = "demo")]
+mod demo;
 mod lineage;
 mod nodes;
+// `runtime` is the single-node spawn path; unused when `demo`
+// is on because main.rs branches to `demo::spawn`. Allow dead-
+// code under the demo feature so the build stays warning-free.
+#[cfg_attr(feature = "demo", allow(dead_code))]
 mod runtime;
 mod streams;
 mod tabs;
@@ -40,6 +46,13 @@ async fn main() -> color_eyre::Result<()> {
         prev_panic_hook(info);
     }));
 
+    // `demo` boots a real multi-node cluster via
+    // `net_sdk::testing::ClusterHarness`; otherwise the
+    // single-node `runtime::spawn` path runs (with the
+    // synthetic `samples` fixture if that feature is on).
+    #[cfg(feature = "demo")]
+    let harness = demo::spawn().await?;
+    #[cfg(not(feature = "demo"))]
     let harness = runtime::spawn().await?;
     let deck = harness.deck();
     let blob_adapters = harness.blob_adapters();
@@ -126,7 +139,13 @@ async fn main() -> color_eyre::Result<()> {
 
     // Explicit drop so the harness's tear-down runs before
     // the process exits — drops the SDK + samples daemons +
-    // backing tokio tasks deterministically.
+    // backing tokio tasks deterministically. Under `demo`
+    // we drive the cluster's explicit async shutdown so the
+    // multi-node `MeshOsDaemonSdk::shutdown` futures actually
+    // resolve before the process exits.
+    #[cfg(feature = "demo")]
+    let _ = harness.into_shutdown().await;
+    #[cfg(not(feature = "demo"))]
     drop(harness);
     result
 }
