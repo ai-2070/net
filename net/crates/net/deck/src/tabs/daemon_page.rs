@@ -84,11 +84,16 @@ pub fn render(
 
     // Resolve any in-flight migration for this daemon up front
     // so the FACTS panel can decide whether to render the
-    // right-side migration sub-panel.
+    // right-side migration sub-panel. `Complete` migrations
+    // intentionally don't keep the right cell pinned forever —
+    // once the orchestrator marks the phase complete the
+    // daemon's facts go back to single-column rendering even
+    // if the producer hasn't dropped the record from
+    // `in_flight_migrations` yet.
     let migration = live
         .in_flight_migrations
         .iter()
-        .find(|m| m.daemon_origin == entry.id);
+        .find(|m| m.daemon_origin == entry.id && m.phase != MigrationPhaseSnapshot::Complete);
     render_facts_panel(frame, rows[0], entry, &groups, migration, this_node);
     render_group_panel(frame, rows[1], entry, &groups, &rows_total);
     render_log_tail(frame, rows[2], entry.id, logs);
@@ -299,11 +304,19 @@ fn render_migration_cell(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Compute a bar width that fits the cell. The line is
+    // "  prog       <bar>  NN%" — the fixed scaffolding takes
+    // 2 (lead) + 11 (label) + 2 (gap) + 4 ("100%") = 19 cells.
+    // Anything left over is bar; clamp to a sensible band so
+    // the bar still reads as a bar at narrow widths.
+    let bar_width = (inner.width as usize)
+        .saturating_sub(19)
+        .clamp(4, 16);
     let lines = vec![
         kv("role       ", role_text, role_style),
         kv("size       ", &size_text, theme::text()),
         kv("phase      ", phase_text, phase_style),
-        progress_bar_line("prog       ", m.progress_pct, phase_style),
+        progress_bar_line("prog       ", m.progress_pct, phase_style, bar_width),
         kv("retry      ", &format!("{}", m.retries), retry_style),
         kv("age        ", &format_age(m.age_in_phase_ms), theme::text()),
         kv("elapsed    ", &format_age(m.elapsed_ms), theme::dim()),
@@ -311,17 +324,22 @@ fn render_migration_cell(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Inline progress bar: `label  ████████░░░░░░░░  30%`. Bar
-/// is 16 cells wide — fits in the migration cell's content
-/// width with room for the percent suffix. `None` → renders
-/// a row of `—` instead of an empty bar.
-fn progress_bar_line(label: &str, pct: Option<u8>, bar_style: Style) -> Line<'static> {
-    const WIDTH: usize = 16;
+/// Inline progress bar: `label  ████████░░░░░░░░  30%`. The
+/// caller passes `bar_width` so a narrow daemon page (half of
+/// a 60-col layout) shrinks the bar rather than overflowing
+/// onto the next row. `None` pct renders a row of `—` instead
+/// of an empty bar.
+fn progress_bar_line(
+    label: &str,
+    pct: Option<u8>,
+    bar_style: Style,
+    bar_width: usize,
+) -> Line<'static> {
     match pct {
         Some(p) => {
             let p = p.min(100);
-            let filled = (p as usize * WIDTH) / 100;
-            let bar: String = "█".repeat(filled) + &"░".repeat(WIDTH - filled);
+            let filled = (p as usize * bar_width) / 100;
+            let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
             Line::from(vec![
                 Span::styled(format!("  {label}"), theme::chrome()),
                 Span::styled(bar, bar_style),
