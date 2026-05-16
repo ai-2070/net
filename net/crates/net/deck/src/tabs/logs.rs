@@ -140,14 +140,19 @@ fn level_chip(min_level: LogLevel) -> (&'static str, ratatui::style::Style) {
 }
 
 /// Numeric rank used for "min level" comparisons. Higher means
-/// more severe.
+/// more severe. The fallback `0` (treats an unknown future
+/// variant as the most verbose, NOT as Info) means a new
+/// variant lands in the operator's view by default; the
+/// previous `1` fallback silently let unknown variants past
+/// the Info filter, which is the wrong direction for a
+/// `#[non_exhaustive]` enum.
 pub(crate) fn level_rank(l: LogLevel) -> u8 {
     match l {
         LogLevel::Debug => 0,
         LogLevel::Info => 1,
         LogLevel::Warn => 2,
         LogLevel::Error => 3,
-        _ => 1,
+        _ => 0,
     }
 }
 
