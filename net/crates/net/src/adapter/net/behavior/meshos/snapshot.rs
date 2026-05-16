@@ -174,12 +174,18 @@ pub struct DaemonSnapshot {
     pub saturation: f32,
     /// Crash-loop / backoff gate state.
     pub restart_state: RestartStateSnapshot,
-    /// Host node currently running this daemon. The substrate
-    /// folds local-only state, so for a snapshot read off node
-    /// X this is always X — but the field stays on the wire so
-    /// Deck-side aggregations across multiple snapshots can
-    /// still answer "which node hosts daemon 0xNN?" without
-    /// the operator pivoting through a separate lookup.
+    /// Host node currently running this daemon. The substrate's
+    /// fold path only inserts entries into `MeshOsState::daemons`
+    /// in response to *local* lifecycle signals (the supervisor
+    /// on this node hands them in), so for a snapshot built on
+    /// node X this is unconditionally X. The field stays on the
+    /// wire so Deck-side aggregations across multiple snapshots
+    /// can still answer "which node hosts daemon 0xNN?" without
+    /// the operator pivoting through a separate lookup. The
+    /// `placement_matches_this_node_for_every_entry` regression
+    /// test pins the invariant so a future refactor that
+    /// piggy-backs remote daemon state on `actual.daemons` is
+    /// caught at the snapshot boundary.
     ///
     /// `#[serde(default)]` so JSON consumers built against an
     /// older shape (no `placement` key) deserialize cleanly —
@@ -973,6 +979,44 @@ mod tests {
         let json = serde_json::to_string(&snap).expect("encode json");
         let back2: MeshOsSnapshot = serde_json::from_str(&json).expect("decode json");
         assert_eq!(snap, back2);
+    }
+
+    #[test]
+    fn placement_matches_this_node_for_every_entry() {
+        // The snapshot fold for `daemons` is local-only: every
+        // entry's `placement` must equal the `this_node` the
+        // caller passes, regardless of the daemon id or
+        // lifecycle. Anchors against a future refactor that
+        // accidentally piggy-backs remote daemon state onto
+        // the local `actual.daemons` map — such a change would
+        // silently mis-label remote daemons as locally hosted
+        // unless the populator was updated alongside it.
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(Instant::now());
+        for (name, id) in [("alpha", 1u64), ("beta", 2), ("gamma", 3)] {
+            let mut status = DaemonStatus::default();
+            status.lifecycle = DaemonLifecycle::Running;
+            actual.daemons.insert(dref(name, id), status);
+        }
+        for this_node in [0u64, 1, 0x2A2A, NodeId::MAX] {
+            let snap = MeshOsSnapshot::from_state(
+                &actual,
+                &DesiredState::default(),
+                &[],
+                &[],
+                Vec::new(),
+                &std::collections::VecDeque::new(),
+                &std::collections::VecDeque::new(),
+                this_node,
+            );
+            assert!(!snap.daemons.is_empty(), "fixture daemons were dropped");
+            for (id, d) in &snap.daemons {
+                assert_eq!(
+                    d.placement, this_node,
+                    "daemon {id} placement diverged from this_node {this_node:x}",
+                );
+            }
+        }
     }
 
     #[test]
