@@ -188,11 +188,15 @@ pub struct DaemonSnapshot {
     /// the decode outright.
     #[serde(default)]
     pub placement: NodeId,
-    /// Milliseconds since the most recent `Started` lifecycle
-    /// signal. `0` if the daemon never reported a start (still
-    /// in `Stopped` lifecycle, or freshly registered before the
-    /// supervisor confirmed). Useful for the Deck binary's
-    /// per-daemon age column without leaking wall-clock state.
+    /// Milliseconds since the most recent lifecycle signal
+    /// relevant to the current phase: time since `Started`
+    /// while the daemon is running, time since the most recent
+    /// exit / crash while the daemon is `Stopped`, and `0` for
+    /// daemons that never reported any lifecycle signal at all
+    /// (freshly registered before the supervisor confirmed).
+    /// Phase-anchored so the Deck's per-daemon age column reads
+    /// as "running for X" / "stopped X ago" without leaking
+    /// wall-clock state.
     ///
     /// `#[serde(default)]` for the same forward-compat reason
     /// as `placement`.
@@ -510,14 +514,38 @@ impl MeshOsSnapshot {
             .daemons
             .iter()
             .map(|(d, status)| {
+                // For a Running / Starting / Stopping daemon
+                // `age_ms` is the time since the most recent
+                // `Started` signal — that's the in-process uptime
+                // the Deck wants. For a Stopped daemon, however,
+                // `last_started` is the time the daemon *last*
+                // started, which is unrelated to the present
+                // (Stopped) state: an instance that crashed five
+                // seconds ago after an hour of uptime would report
+                // ~3.6M ms, which reads as "still running, hour
+                // old" on the Deck. Anchor against the most
+                // recent exit / crash for Stopped lifecycles so
+                // the column reads as "stopped X ms ago"; fall
+                // back to 0 for daemons that never reported any
+                // lifecycle signal at all.
+                let started_age = status
+                    .last_started
+                    .map(|t| now.saturating_duration_since(t).as_millis() as u64);
+                let stopped_age = status
+                    .last_exit
+                    .into_iter()
+                    .chain(status.last_crash)
+                    .max()
+                    .map(|t| now.saturating_duration_since(t).as_millis() as u64);
+                let age_ms = match status.lifecycle {
+                    DaemonLifecycle::Stopped => stopped_age.or(started_age).unwrap_or(0),
+                    _ => started_age.unwrap_or(0),
+                };
                 let snapshot = DaemonSnapshot {
                     name: d.name.clone(),
                     lifecycle: status.lifecycle.into(),
                     placement: this_node,
-                    age_ms: status
-                        .last_started
-                        .map(|t| now.saturating_duration_since(t).as_millis() as u64)
-                        .unwrap_or(0),
+                    age_ms,
                     health: status.health.as_ref().map(|h| match h {
                         super::event::DaemonHealth::Healthy => DaemonHealthSnapshot::Healthy,
                         super::event::DaemonHealth::Degraded { reason } => {
@@ -945,6 +973,95 @@ mod tests {
         let json = serde_json::to_string(&snap).expect("encode json");
         let back2: MeshOsSnapshot = serde_json::from_str(&json).expect("decode json");
         assert_eq!(snap, back2);
+    }
+
+    #[test]
+    fn daemon_age_anchors_on_last_exit_when_stopped() {
+        // A daemon that ran for a long time and then crashed
+        // should report `age_ms` against the exit, not the
+        // last `Started`. Otherwise the Deck reads "running,
+        // X hours old" for a daemon that has actually been
+        // dead the whole time.
+        let mut actual = MeshOsState::default();
+        let now = Instant::now();
+        actual.last_tick = Some(now);
+        let d = dref("worker", 1);
+        let mut status = DaemonStatus::default();
+        status.lifecycle = DaemonLifecycle::Stopped;
+        status.last_started = Some(now - Duration::from_secs(3600));
+        status.last_exit = Some(now - Duration::from_secs(5));
+        actual.daemons.insert(d, status);
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &DesiredState::default(),
+            &[],
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+            0,
+        );
+        let daemon = snap.daemons.get(&1).expect("daemon present");
+        // ~5s window (allow a tick of jitter — the test pins
+        // "anchored on exit, not on started").
+        assert!(daemon.age_ms < 60_000, "got age_ms = {}", daemon.age_ms);
+        assert!(daemon.age_ms >= 5_000, "got age_ms = {}", daemon.age_ms);
+    }
+
+    #[test]
+    fn daemon_age_anchors_on_last_started_when_running() {
+        // The Running path should keep its original
+        // semantics: time since the most recent `Started`.
+        let mut actual = MeshOsState::default();
+        let now = Instant::now();
+        actual.last_tick = Some(now);
+        let d = dref("worker", 2);
+        let mut status = DaemonStatus::default();
+        status.lifecycle = DaemonLifecycle::Running;
+        status.last_started = Some(now - Duration::from_secs(30));
+        status.last_exit = Some(now - Duration::from_secs(900));
+        actual.daemons.insert(d, status);
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &DesiredState::default(),
+            &[],
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+            0,
+        );
+        let daemon = snap.daemons.get(&2).expect("daemon present");
+        assert!(daemon.age_ms >= 30_000, "got age_ms = {}", daemon.age_ms);
+        assert!(daemon.age_ms < 60_000, "got age_ms = {}", daemon.age_ms);
+    }
+
+    #[test]
+    fn daemon_age_uses_most_recent_of_exit_or_crash() {
+        // Crash newer than exit → anchor on crash.
+        let mut actual = MeshOsState::default();
+        let now = Instant::now();
+        actual.last_tick = Some(now);
+        let d = dref("worker", 3);
+        let mut status = DaemonStatus::default();
+        status.lifecycle = DaemonLifecycle::Stopped;
+        status.last_started = Some(now - Duration::from_secs(120));
+        status.last_exit = Some(now - Duration::from_secs(90));
+        status.last_crash = Some(now - Duration::from_secs(10));
+        actual.daemons.insert(d, status);
+        let snap = MeshOsSnapshot::from_state(
+            &actual,
+            &DesiredState::default(),
+            &[],
+            &[],
+            Vec::new(),
+            &std::collections::VecDeque::new(),
+            &std::collections::VecDeque::new(),
+            0,
+        );
+        let daemon = snap.daemons.get(&3).expect("daemon present");
+        assert!(daemon.age_ms >= 10_000, "got age_ms = {}", daemon.age_ms);
+        assert!(daemon.age_ms < 60_000, "got age_ms = {}", daemon.age_ms);
     }
 
     #[test]
