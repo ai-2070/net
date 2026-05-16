@@ -12,14 +12,14 @@ use ratatui::{
 use crate::{app::App, theme};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // Right column carries codename + version + sha + help.
-    // The codename ("ATOMIC PLAYBOYS" today, ~25 cols
-    // including the label) pushes the budget past the prior
-    // 28-col reservation; bump to 56 so the left chip row
-    // doesn't get squeezed at 80-col widths.
+    // Right column carries codename + version + help. The
+    // codename ("ATOMIC PLAYBOYS" today, ~25 cols including
+    // the label) pushes the budget past the prior 28-col
+    // reservation; 44 fits the row without squeezing the
+    // left chips at 80-col widths.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(56)])
+        .constraints([Constraint::Min(0), Constraint::Length(44)])
         .split(area);
 
     let uptime = app.started.elapsed().as_secs();
@@ -99,28 +99,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     left.push(Span::styled(format!("{uptime}s"), theme::dim()));
 
     // Version comes from Cargo at compile time and is always
-    // accurate. The SHA is opt-in via `DECK_GIT_SHA` (set by a
-    // CI build script when shipping); local dev builds show
-    // "dev" so the chip never lies about being a release.
-    // Codename is the substrate's release milestone (v0.17 →
-    // "Atomic Playboys"); kept inline rather than env-injected
-    // because the deck ships from the same workspace and
-    // tracks the same release cadence.
+    // accurate. Codename is the substrate's release milestone
+    // (v0.17 → "Atomic Playboys"); kept inline rather than
+    // env-injected because the deck ships from the same
+    // workspace and tracks the same release cadence.
     let version = concat!("v", env!("CARGO_PKG_VERSION"));
-    let sha = option_env!("DECK_GIT_SHA").unwrap_or("dev");
     let codename = "ATOMIC PLAYBOYS";
-    let (sha_label_style, sha_style) = if sha == "dev" {
-        (theme::chrome(), theme::dim())
-    } else {
-        (theme::chrome(), theme::text())
-    };
     let right = Line::from(vec![
         Span::styled("CODENAME: ", theme::chrome()),
-        Span::styled(codename, theme::green_hi()),
+        Span::styled(codename, theme::text()),
         Span::styled("   ", theme::chrome()),
         Span::styled(format!("{version}   "), theme::chrome()),
-        Span::styled("SHA: ", sha_label_style),
-        Span::styled(format!("{sha}   "), sha_style),
         Span::styled("?", theme::green_hi()),
         Span::styled(" help", theme::dim()),
     ]);
