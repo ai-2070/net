@@ -1,0 +1,40 @@
+net/crates/net/bindings/python/tests/test_meshos.py
+  s_5af7ced268385a::t_00fa0f3edc7096 1-60,68-76,81-122,124-128,133-140,150,152,158,175-277
+  s_5af7ced268385a::t_b6fff1ec93bed3 123,129-132
+  s_5af7ced268385a::t_466d90ab1f747d 141-149,151,153-157,159,165-167
+  s_5af7ced268385a::t_a4965a9820cae7 160-164,168-174
+  s_5af7ced268385a::t_afeed997ec425d 61-67,77-80
+net/crates/net/bindings/python/Cargo.toml
+  s_5af7ced268385a::t_3b09d40f1aa693 67-74
+net/crates/net/bindings/python/src/lib.rs
+  s_5af7ced268385a::t_64defa0b629b0e 2347-2355
+  s_5af7ced268385a::t_e09b8333fb73fa 32-36
+net/crates/net/bindings/python/src/meshos.rs
+  s_5af7ced268385a::t_337dca18a659e8 323-326
+  s_5af7ced268385a::t_ee41fab1dc5f86 481,501
+  s_5af7ced268385a::t_49dbbbfa2842ac 927
+  s_5af7ced268385a::t_153b2aaa79b48f 37-38,41-43
+  s_5af7ced268385a::t_7a5c1b95171f2c 1-36,39-40,44-60,64,69-271,275-322,327-480,482-500,502-926,928-962
+  s_5af7ced268385a::t_b101c4d611a001 61-63,65-68
+  s_5af7ced268385a::t_0f656ab93a6214 272-274
+net/crates/net/bindings/python/python/net/__init__.py
+  s_5af7ced268385a::t_b8607cd327cbc7 352-403
+net/crates/net/sdk-py/src/net_sdk/meshos.py
+  s_5af7ced268385a::t_31652db8928c53 1-363
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "f2f4c0da94f3b54507f6649dd7d02fdf4298fe13",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
