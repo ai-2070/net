@@ -33,6 +33,12 @@ pub struct Harness {
     /// daemons stay registered for the session.
     #[cfg(feature = "samples")]
     _daemons: Vec<net_sdk::meshos::MeshOsDaemonHandle>,
+    /// Per-daemon log seeder task — emits daemon-tagged log
+    /// lines from each thematic daemon's vocabulary so the
+    /// LOGS tab shows real per-daemon chatter. Lifetime
+    /// bounded to the harness's tokio runtime.
+    #[cfg(feature = "samples")]
+    _daemon_log_seeder_task: tokio::task::JoinHandle<()>,
     /// Background log + mesh-event seeder task; the handle is
     /// kept on the harness so the task gets aborted when the
     /// harness drops (tokio cancellation on `JoinHandle::drop`).
@@ -119,7 +125,7 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     let deck = Arc::new(DeckClient::from_runtime(sdk.runtime(), identity));
 
     #[cfg(feature = "samples")]
-    let _daemons = samples::install(&sdk).await?;
+    let (_daemons, _daemon_log_seeder_task) = samples::install(&sdk).await?;
 
     // Real `MeshBlobAdapter` set in samples mode — three
     // instances against in-memory `Redex` handles with
@@ -142,6 +148,8 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
         _sdk: sdk,
         #[cfg(feature = "samples")]
         _daemons,
+        #[cfg(feature = "samples")]
+        _daemon_log_seeder_task,
         #[cfg(feature = "samples-logs")]
         _log_seeder_task,
         deck,
@@ -166,9 +174,9 @@ mod samples {
     use net_sdk::dataforts::{publish_blob_ref, BlobAdapter, MeshBlobAdapter, Redex};
     use net_sdk::meshos::{
         ChainId, DaemonError, EntityKeypair, HealthProbe, InventoryProbe, LocalityProbe,
-        MeshDaemon, MeshOsDaemonHandle, MeshOsDaemonSdk, MeshOsEvent, MigrationPhaseSnapshot,
-        MigrationSnapshot, MigrationSnapshotSource, NodeHealth, NodeId, PeerInventory,
-        PlacementIntent, ReplicaUpdate,
+        LogLevel, LogLine, MeshDaemon, MeshOsDaemonHandle, MeshOsDaemonSdk, MeshOsEvent,
+        MigrationPhaseSnapshot, MigrationSnapshot, MigrationSnapshotSource, NodeHealth, NodeId,
+        PeerInventory, PlacementIntent, ReplicaUpdate,
     };
 
     /// Construct three real `MeshBlobAdapter` instances against
@@ -603,16 +611,97 @@ mod samples {
         (0xc008, 3, &[0x6808, 0x0fc2]), // intentionally under by 1
     ];
 
-    /// Install probes + register 11 grouped daemons + seed
-    /// the snapshot's `replicas` map by publishing
-    /// `ReplicaUpdate::Added` + `PlacementIntent` events
-    /// through the runtime handle. Awaits the seeding completes
-    /// before returning so the App starts against a fully
-    /// populated steady-state snapshot rather than a partial
-    /// one.
+    /// Per-daemon vocabulary table. Each row is a daemon name
+    /// + a pool of log lines the per-daemon seeder cycles
+    /// through. Five thematic domains across 11 daemons cover
+    /// the full lineage matrix:
+    ///
+    /// - Solo: `mainstage_cue`, `openclaw_inference`
+    /// - Replica × 3: `foh_mixer#replica`
+    /// - Standby × 3: `pyro_gate#standby`
+    /// - Fork × 3: `swarm_coord#fork@7`
+    ///
+    /// The `#suffix` convention is parsed by `crate::lineage`
+    /// to recover group membership.
+    const DAEMON_ROSTER: &[(&str, &[(LogLevel, &str)])] = &[
+        ("mainstage_cue", MAINSTAGE_LOGS),
+        ("openclaw_inference", OPENCLAW_LOGS),
+        ("foh_mixer#replica", FOH_LOGS),
+        ("foh_mixer#replica", FOH_LOGS),
+        ("foh_mixer#replica", FOH_LOGS),
+        ("pyro_gate#standby", PYRO_LOGS),
+        ("pyro_gate#standby", PYRO_LOGS),
+        ("pyro_gate#standby", PYRO_LOGS),
+        ("swarm_coord#fork@7", SWARM_LOGS),
+        ("swarm_coord#fork@7", SWARM_LOGS),
+        ("swarm_coord#fork@7", SWARM_LOGS),
+    ];
+
+    /// `mainstage_cue` — DMX cue firing, lighting transitions,
+    /// MIDI clock, pyrotech-gate handshakes.
+    const MAINSTAGE_LOGS: &[(LogLevel, &str)] = &[
+        (LogLevel::Info, "cue 47 ready: scene/clear-back"),
+        (LogLevel::Info, "dmx universe 1 rendered, 512 channels"),
+        (LogLevel::Info, "follow-spot 2 → operator 'rio'"),
+        (LogLevel::Info, "scene transition: act2/song-3"),
+        (LogLevel::Info, "midi clock locked at 128.0 bpm"),
+        (LogLevel::Info, "pyro gate cleared: zone-3 armed"),
+        (LogLevel::Warn, "fixture 12 brownout reported; falling back"),
+    ];
+
+    /// `openclaw_inference` — vision-grasp model serving on
+    /// the gpu rack, depth fusion + kv-cache reads.
+    const OPENCLAW_LOGS: &[(LogLevel, &str)] = &[
+        (LogLevel::Info, "grasp candidates: 4 (top score 0.89)"),
+        (LogLevel::Info, "kv-cache hit (98%) on batch 248"),
+        (LogLevel::Info, "model openclaw-2.4, ctx 8192"),
+        (LogLevel::Info, "depth fusion: 16 keypoints tracked"),
+        (LogLevel::Info, "joint trajectory smoothed (4 waypoints)"),
+        (LogLevel::Warn, "occluded scene detected; falling back to radar"),
+    ];
+
+    /// `foh_mixer#replica` — front-of-house audio mixers
+    /// processing the live bus + monitor sends.
+    const FOH_LOGS: &[(LogLevel, &str)] = &[
+        (LogLevel::Info, "bus 3: -2.4 dB clip avoid"),
+        (LogLevel::Info, "monitor send 7 → in-ear 3"),
+        (LogLevel::Info, "channel 12 muted: feedback detected"),
+        (LogLevel::Info, "reverb tail 1.8s applied to vocals"),
+        (LogLevel::Info, "compressor 4:1 ratio, attack 2ms"),
+        (LogLevel::Warn, "input gain hot on channel 4 (-0.3 dB headroom)"),
+    ];
+
+    /// `pyro_gate#standby` — pyrotechnic safety gate. The
+    /// active one fires interlocks; warm standbys publish
+    /// heartbeats + readiness checks.
+    const PYRO_LOGS: &[(LogLevel, &str)] = &[
+        (LogLevel::Info, "fixture 4 armed: confetti canon"),
+        (LogLevel::Info, "interlock: stage rail OK"),
+        (LogLevel::Info, "abort signal cleared, gate green"),
+        (LogLevel::Info, "weather check: wind 8mph, OK"),
+        (LogLevel::Info, "operator override authenticated (op:0x7f3a)"),
+        (LogLevel::Warn, "humidity above gate threshold (78%) — derating"),
+    ];
+
+    /// `swarm_coord#fork@7` — drone-swarm coordinator forks,
+    /// each driving a subset of the formation.
+    const SWARM_LOGS: &[(LogLevel, &str)] = &[
+        (LogLevel::Info, "formation: V-shape, 7 drones, spacing 4.2m"),
+        (LogLevel::Info, "waypoint 12 reached, holding"),
+        (LogLevel::Info, "wind compensation: +1.2m east drift"),
+        (LogLevel::Info, "follow target locked: vehicle-04"),
+        (LogLevel::Info, "battery telemetry: median 78%, min 64%"),
+        (LogLevel::Warn, "geofence breach prevented (lat 51.522)"),
+    ];
+
+    /// Install probes + register the 11-daemon roster + seed
+    /// replicas + spawn the per-daemon log seeder.
+    /// Awaits the seeding completes before returning so the
+    /// App starts against a fully populated steady-state
+    /// snapshot rather than a partial one.
     pub async fn install(
         sdk: &MeshOsDaemonSdk,
-    ) -> color_eyre::Result<Vec<MeshOsDaemonHandle>> {
+    ) -> color_eyre::Result<(Vec<MeshOsDaemonHandle>, tokio::task::JoinHandle<()>)> {
         sdk.runtime()
             .add_locality_probe(Arc::new(SampleLocalityProbe));
         sdk.runtime().add_health_probe(Arc::new(SampleHealthProbe));
@@ -641,74 +730,92 @@ mod samples {
             }
         }
 
-        // 11 daemons across all four lineage groups. The
-        // `#suffix` convention in each name is parsed by
+        // Register each daemon from the roster and collect
+        // (daemon_id, vocab) pairs for the seeder. The
+        // `#suffix` portion of each name is parsed by
         // `crate::lineage` to recover group membership.
-        Ok(vec![
-            sdk.register_daemon(
-                Box::new(SampleDaemon::new("mikoshi")),
+        let mut handles: Vec<MeshOsDaemonHandle> = Vec::with_capacity(DAEMON_ROSTER.len());
+        let mut seeder_roster: Vec<(u64, &'static [(LogLevel, &'static str)])> =
+            Vec::with_capacity(DAEMON_ROSTER.len());
+        for (name, vocab) in DAEMON_ROSTER {
+            let h = sdk.register_daemon(
+                Box::new(SampleDaemon::new(*name)),
                 EntityKeypair::generate(),
-            )?,
-            sdk.register_daemon(
-                Box::new(SampleDaemon::new("telemetry")),
-                EntityKeypair::generate(),
-            )?,
-            sdk.register_daemon(
-                Box::new(SampleDaemon::new("gravity#replica")),
-                EntityKeypair::generate(),
-            )?,
-            sdk.register_daemon(
-                Box::new(SampleDaemon::new("gravity#replica")),
-                EntityKeypair::generate(),
-            )?,
-            sdk.register_daemon(
-                Box::new(SampleDaemon::new("gravity#replica")),
-                EntityKeypair::generate(),
-            )?,
-            sdk.register_daemon(
-                Box::new(SampleDaemon::new("anti_entr#standby")),
-                EntityKeypair::generate(),
-            )?,
-            sdk.register_daemon(
-                Box::new(SampleDaemon::new("anti_entr#standby")),
-                EntityKeypair::generate(),
-            )?,
-            sdk.register_daemon(
-                Box::new(SampleDaemon::new("anti_entr#standby")),
-                EntityKeypair::generate(),
-            )?,
-            sdk.register_daemon(
-                Box::new(SampleDaemon::new("drift_corr#fork@42")),
-                EntityKeypair::generate(),
-            )?,
-            sdk.register_daemon(
-                Box::new(SampleDaemon::new("drift_corr#fork@42")),
-                EntityKeypair::generate(),
-            )?,
-            sdk.register_daemon(
-                Box::new(SampleDaemon::new("drift_corr#fork@42")),
-                EntityKeypair::generate(),
-            )?,
-        ])
+            )?;
+            seeder_roster.push((h.daemon_id(), *vocab));
+            handles.push(h);
+        }
+
+        // Spawn the seeder task on the runtime's main handle.
+        // Daemon-tagged log lines flow through the same path
+        // a real daemon's `publish_log` would take; the
+        // substrate's snapshot fold stamps `node_id` on the
+        // way through.
+        let seeder_handle = sdk.runtime().handle_clone();
+        let seeder_task = tokio::spawn(async move {
+            run_daemon_log_seeder(seeder_handle, seeder_roster).await;
+        });
+
+        Ok((handles, seeder_task))
+    }
+
+    /// Round-robin daemon-log seeder. Cycles through the
+    /// roster every tick, picking the next message in each
+    /// daemon's vocabulary so every daemon publishes roughly
+    /// in lockstep. Cadence is intentionally faster than the
+    /// `samples-logs` node-level seeder so daemon chatter
+    /// dominates the LOGS tail.
+    async fn run_daemon_log_seeder(
+        handle: net_sdk::meshos::MeshOsHandle,
+        roster: Vec<(u64, &'static [(LogLevel, &'static str)])>,
+    ) {
+        if roster.is_empty() {
+            return;
+        }
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(450));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut i = 0usize;
+        loop {
+            ticker.tick().await;
+            let (daemon_id, vocab) = roster[i % roster.len()];
+            if vocab.is_empty() {
+                i = i.wrapping_add(1);
+                continue;
+            }
+            let (level, msg) = vocab[(i / roster.len()) % vocab.len()];
+            let line = LogLine {
+                level,
+                daemon_id: Some(daemon_id),
+                message: msg.to_string(),
+            };
+            if handle
+                .publish(MeshOsEvent::LogLine(line))
+                .await
+                .is_err()
+            {
+                // Loop closed — substrate shutting down. Exit
+                // cleanly; harness's `_sdk` drop already raced
+                // ahead.
+                break;
+            }
+            i = i.wrapping_add(1);
+        }
     }
 }
 
-/// Synthetic log + mesh-event seeder. Spawns a tokio task
-/// that loops at a fixed cadence publishing
-/// `MeshOsEvent::LogLine` records against the runtime
-/// handle. Independent of the `samples` feature — the
-/// substrate accepts log events whether or not any daemons
-/// are registered. Daemon-tagged lines reference
-/// synthetic origin hashes (matching the migration
-/// fixture's `0xdaee_xxxx` range); node-level lines fall
-/// through to the substrate's `node.0x<this_node>` source
-/// attribution via the snapshot fold.
+/// Node-level mesh-event seeder. Publishes `MeshOsEvent::LogLine`
+/// records with `daemon_id = None` so the substrate stamps the
+/// local node as the source — these surface in the NET.MAP
+/// MESH.EVENTS panel as `node.0x<this_node>` chatter, separate
+/// from the per-daemon vocabulary that ships under the
+/// `samples` flag.
 ///
-/// The seeder exits when the runtime closes — `publish`
-/// returns `Err(LoopClosed)` once the SDK drops, and the
-/// loop breaks. No abort wiring needed; the JoinHandle on
-/// the harness keeps the task referenced for the operator
-/// session and naturally ends on shutdown.
+/// Independent of `samples` — operators running `samples-logs`
+/// alone still get a populated MESH.EVENTS feed; stacking with
+/// `samples` adds daemon-tagged chatter on top.
+///
+/// Exits when the runtime closes — `publish` returns
+/// `Err(LoopClosed)` once the SDK drops and the loop breaks.
 #[cfg(feature = "samples-logs")]
 mod samples_logs {
     use std::time::Duration;
@@ -721,33 +828,10 @@ mod samples_logs {
         tokio::spawn(async move { run(handle).await })
     }
 
-    /// Per-tick cadence. Fast enough to fill the LOGS tail in
-    /// a few minutes of demo operation; slow enough not to
-    /// overwhelm the render path or the substrate's log-ring
-    /// rotation.
-    const TICK: Duration = Duration::from_millis(700);
-
-    /// Daemon-tagged log fixtures. Each is a `(daemon_id,
-    /// level, message)` triple. The daemon ids match the
-    /// migration fixture's hex range so cross-tab pivots
-    /// from MIGRATIONS → LOGS land on familiar identifiers
-    /// when both feature flags are enabled.
-    const DAEMON_LOGS: &[(u64, LogLevel, &str)] = &[
-        (0xdaee_0001, LogLevel::Info, "snapshot taken (12 events buffered)"),
-        (0xdaee_0001, LogLevel::Info, "transfer chunk 1/3 acked"),
-        (0xdaee_0002, LogLevel::Info, "transfer started (48 MB)"),
-        (0xdaee_0002, LogLevel::Warn, "rtt to target rising (147ms p95)"),
-        (0xdaee_0003, LogLevel::Info, "replay buffer drained (318 events)"),
-        (0xdaee_0003, LogLevel::Info, "cutover candidate selected"),
-        (0xdaee_0004, LogLevel::Info, "cutover acked by target"),
-        (0xdaee_0004, LogLevel::Error, "drain deadline elapsed; retrying"),
-        (0xdaee_0005, LogLevel::Warn, "saturation crossed 0.85 threshold"),
-        (0xdaee_0005, LogLevel::Info, "pressure relief: shedding to peer 0x82ee"),
-        (0xdaee_0006, LogLevel::Error, "chunk fetch failed: HashMismatch"),
-        (0xdaee_0006, LogLevel::Info, "retrying fetch from alternate adapter"),
-        (0xdaee_0007, LogLevel::Info, "fold replayed through seq 4_812_993"),
-        (0xdaee_0008, LogLevel::Warn, "backoff window extended to 30s"),
-    ];
+    /// Per-tick cadence. Slower than the per-daemon seeder so
+    /// mesh-level chatter doesn't drown out daemon vocabulary
+    /// when both flags are enabled.
+    const TICK: Duration = Duration::from_millis(1_300);
 
     /// Node-level (no `daemon_id`) log fixtures. The
     /// substrate stamps `node_id = this_node` on these so
@@ -770,34 +854,21 @@ mod samples_logs {
         (LogLevel::Error, "datafort 0x6dfb: storage adapter unhealthy (95%)"),
     ];
 
-    /// Inner loop. Walks both fixtures in interleaved order
-    /// so the LOGS tab gets a steady mix of daemon-tagged
-    /// and node-level lines; breaks cleanly when the
-    /// substrate's loop closes (publishes start failing).
+    /// Inner loop. Walks the node-level fixture; daemon-level
+    /// chatter is now owned by the per-daemon seeder under
+    /// `samples`, so this module's sole job is the mesh-wide
+    /// event feed.
     async fn run(handle: MeshOsHandle) {
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut i = 0usize;
         loop {
             ticker.tick().await;
-            // Alternate daemon / node every tick — at TICK
-            // = 700ms that's ~85 lines/minute, enough to fill
-            // the LOGS tail visibly without burying real
-            // operator-driven entries.
-            let line = if i.is_multiple_of(2) {
-                let (daemon_id, level, msg) = DAEMON_LOGS[(i / 2) % DAEMON_LOGS.len()];
-                LogLine {
-                    level,
-                    daemon_id: Some(daemon_id),
-                    message: msg.to_string(),
-                }
-            } else {
-                let (level, msg) = NODE_LOGS[(i / 2) % NODE_LOGS.len()];
-                LogLine {
-                    level,
-                    daemon_id: None,
-                    message: msg.to_string(),
-                }
+            let (level, msg) = NODE_LOGS[i % NODE_LOGS.len()];
+            let line = LogLine {
+                level,
+                daemon_id: None,
+                message: msg.to_string(),
             };
             if handle.publish(MeshOsEvent::LogLine(line)).await.is_err() {
                 // Loop closed — substrate is shutting down.
