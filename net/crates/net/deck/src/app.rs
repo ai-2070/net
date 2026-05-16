@@ -1219,6 +1219,26 @@ impl App {
             } else if matches!(code, KeyCode::Char('?')) {
                 self.modal = Some(Modal::Help);
                 return;
+            } else if matches!(code, KeyCode::Char('g')) {
+                // Vim-style top/bottom mirror the cursor tabs.
+                if let Some(f) = self.daemon_focus.as_mut() {
+                    f.cursor = 0;
+                }
+                return;
+            } else if matches!(code, KeyCode::Char('G')) {
+                let last = self
+                    .daemon_focus
+                    .as_ref()
+                    .map(|focus| {
+                        crate::tabs::daemon_page::group_rows(focus, &self.snapshot)
+                            .len()
+                            .saturating_sub(1)
+                    })
+                    .unwrap_or(0);
+                if let Some(f) = self.daemon_focus.as_mut() {
+                    f.cursor = last;
+                }
+                return;
             } else {
                 return;
             }
@@ -1260,6 +1280,25 @@ impl App {
                 return;
             } else if matches!(code, KeyCode::Char('?')) {
                 self.modal = Some(Modal::Help);
+                return;
+            } else if matches!(code, KeyCode::Char('g')) {
+                if let Some(f) = self.node_focus.as_mut() {
+                    f.placement_cursor = 0;
+                }
+                return;
+            } else if matches!(code, KeyCode::Char('G')) {
+                let last = self
+                    .node_focus
+                    .as_ref()
+                    .map(|focus| {
+                        crate::tabs::node_page::daemons_on(&self.snapshot, focus.id)
+                            .len()
+                            .saturating_sub(1)
+                    })
+                    .unwrap_or(0);
+                if let Some(f) = self.node_focus.as_mut() {
+                    f.placement_cursor = last;
+                }
                 return;
             } else {
                 return;
