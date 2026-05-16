@@ -1,0 +1,21 @@
+net/crates/net/deck/src/widgets/status_bar.rs
+  s_1154ed76acced2::t_917efe0aff12f5 144-145,147-152,155-161
+  s_1154ed76acced2::t_a6bf228cb7da4f 3
+  s_1154ed76acced2::t_7784ae642ab91d 32-39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "130c360adb53bd98bb1cca046f44b44efca93418",
+  "prompts": {},
+  "sessions": {
+    "s_1154ed76acced2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7338ec16-8489-41da-930b-6d502753862d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
