@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use net_sdk::dataforts::{BlobMetrics, MeshBlobAdapter};
+use net_sdk::dataforts::MeshBlobAdapter;
 use net_sdk::deck::{AdminVerifier, DeckClient, OperatorIdentity, OperatorRegistry};
 use net_sdk::meshos::{EntityKeypair, MeshOsConfig, MeshOsDaemonSdk, MigrationSnapshotSource};
 
@@ -32,12 +32,13 @@ pub struct Harness {
     #[cfg(feature = "samples")]
     _daemons: Vec<net_sdk::meshos::MeshOsDaemonHandle>,
     deck: Arc<DeckClient>,
-    /// Real `MeshBlobAdapter` instance — `Some` in samples
-    /// mode (constructed against an in-memory `Redex` + seeded
-    /// with synthetic stores so DATAFORTS + BLOBS render real
-    /// data); `None` in default mode (operator wires their own
-    /// adapter or leaves the tabs in their empty state).
-    blob_adapter: Option<Arc<MeshBlobAdapter>>,
+    /// Registered `MeshBlobAdapter` instances. Samples mode
+    /// wires several with distinct activity profiles so the
+    /// DATAFORTS tab demonstrates multi-adapter behaviour;
+    /// default mode leaves the vec empty until an operator
+    /// registers their own. BLOBS reads from whichever adapter
+    /// the operator cursors on the DATAFORTS list.
+    blob_adapters: Vec<Arc<MeshBlobAdapter>>,
 }
 
 impl Harness {
@@ -45,19 +46,12 @@ impl Harness {
         Arc::clone(&self.deck)
     }
 
-    /// Adapter-side metrics handle for the DATAFORTS tab.
-    /// Sourced from the same `MeshBlobAdapter` BLOBS reads
-    /// from, so the two surfaces stay coherent.
-    pub fn blob_metrics(&self) -> Option<Arc<BlobMetrics>> {
-        self.blob_adapter
-            .as_ref()
-            .map(|a| Arc::new(a.metrics().clone()))
-    }
-
-    /// Adapter handle for the BLOBS tab + future blob-browse
-    /// surfaces. `None` when no adapter is wired.
-    pub fn blob_adapter(&self) -> Option<Arc<MeshBlobAdapter>> {
-        self.blob_adapter.clone()
+    /// All registered adapters in registration order. The
+    /// DATAFORTS list iterates this; the BLOBS tab's
+    /// inventory poller binds to the first one (index 0,
+    /// matches DATAFORTS's starting cursor).
+    pub fn blob_adapters(&self) -> Vec<Arc<MeshBlobAdapter>> {
+        self.blob_adapters.clone()
     }
 }
 
@@ -108,24 +102,22 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     #[cfg(feature = "samples")]
     let _daemons = samples::install(&sdk)?;
 
-    // Real `MeshBlobAdapter` in samples mode — constructs
-    // against an in-memory `Redex`, advertises a 1 TiB cap so
-    // the disk gauge reads under the health-gate threshold,
-    // and immediately stores a handful of synthetic chunks so
-    // BLOBS has real entries to list + DATAFORTS shows real
-    // store activity. Default mode leaves the field `None`;
-    // operators wire their own adapter when they have one.
+    // Real `MeshBlobAdapter` set in samples mode — three
+    // instances against in-memory `Redex` handles with
+    // distinct disk caps + activity profiles so DATAFORTS
+    // can demonstrate the multi-adapter list. Default mode
+    // leaves the vec empty; operators wire their own.
     #[cfg(feature = "samples")]
-    let blob_adapter = Some(samples::install_blob_adapter().await);
+    let blob_adapters = samples::install_blob_adapters().await;
     #[cfg(not(feature = "samples"))]
-    let blob_adapter: Option<Arc<MeshBlobAdapter>> = None;
+    let blob_adapters: Vec<Arc<MeshBlobAdapter>> = Vec::new();
 
     Ok(Harness {
         _sdk: sdk,
         #[cfg(feature = "samples")]
         _daemons,
         deck,
-        blob_adapter,
+        blob_adapters,
     })
 }
 
@@ -150,59 +142,59 @@ mod samples {
         PlacementIntent, ReplicaUpdate,
     };
 
-    /// Construct a real `MeshBlobAdapter` against an in-memory
-    /// `Redex`, advertise a 1 TiB cap, then seed it with a
-    /// handful of synthetic store + fetch operations so the
-    /// DATAFORTS metrics + BLOBS inventory both render real
-    /// data in samples mode. No background ticking — the
-    /// stores fire once at startup and the adapter's state
-    /// stays steady from there. The "samples are a fixture,
-    /// not an event seeder" rule still holds.
-    pub async fn install_blob_adapter() -> Arc<MeshBlobAdapter> {
+    /// Construct three real `MeshBlobAdapter` instances against
+    /// in-memory `Redex` handles with distinct configurations
+    /// + activity profiles so DATAFORTS demonstrates the
+    /// multi-adapter list. No background ticking — the stores
+    /// fire once at startup and the adapter's state stays
+    /// steady from there, matching the rest of samples mode's
+    /// "fixture, not event seeder" rule.
+    pub async fn install_blob_adapters() -> Vec<Arc<MeshBlobAdapter>> {
+        let mut out = Vec::new();
+        // Primary: 1 TiB cap, the original sample workload.
+        out.push(install_blob_adapter_one("deck-samples", 1u64 << 40, 5, 3).await);
+        // Cold storage: smaller cap (512 GiB), fewer writes,
+        // a few fetches.
+        out.push(install_blob_adapter_one("cold-storage", 512u64 << 30, 2, 18).await);
+        // Replicated: bigger cap (2 TiB), more stores, no
+        // fetches — looks like a write-heavy backing tier.
+        out.push(install_blob_adapter_one("replicated", 2u64 << 40, 11, 0).await);
+        out
+    }
+
+    /// Single-adapter helper: constructs against a new Redex,
+    /// stores `stores` synthetic chunks, then fires `fetches`
+    /// re-fetches of the first stored blob so the fetch
+    /// counter isn't zero.
+    async fn install_blob_adapter_one(
+        id: &str,
+        cap_bytes: u64,
+        stores: usize,
+        fetches: usize,
+    ) -> Arc<MeshBlobAdapter> {
         let redex = Arc::new(Redex::new());
-        // 1 TiB cap — well above the seeded stored bytes so the
-        // disk gauge reads green on the DATAFORTS tab. Matches
-        // the prior `install_blob_metrics` capacity.
-        let adapter = MeshBlobAdapter::new("deck-samples", redex)
-            .with_disk_capacity(1u64 << 40);
+        let adapter = MeshBlobAdapter::new(id, redex).with_disk_capacity(cap_bytes);
         let adapter = Arc::new(adapter);
-        // A handful of synthetic blobs — the BLOBS tab needs
-        // entries to render rows; bytes vary so each landing
-        // has a distinct content hash. After the loop the
-        // adapter's metrics reflect (n stores, sum bytes
-        // stored); BLOBS lists n chunks newest-first.
-        let payloads: &[&[u8]] = &[
-            b"deck-samples/blob-one-tiny",
-            b"deck-samples/blob-two-a-little-larger-payload",
-            b"deck-samples/blob-three-mid-sized-content-for-the-fixture",
-            b"deck-samples/blob-four/some-bytes/here",
-            b"deck-samples/blob-five-final-fixture-entry",
-        ];
-        // Stored blob_refs kept so we can immediately re-fetch
-        // a few — the fetch counter on DATAFORTS otherwise
-        // reads 0 at startup and the metric looks broken.
-        let mut stored = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            // `publish_blob_ref` is the canonical store entry
-            // point — computes the content hash, builds the
-            // `BlobRef::Small`, and stores via the adapter's
-            // own `store()` path. Bumps `blobs_stored_total` +
-            // `bytes_stored_total` + the refcount table; the
-            // chunk lands in the in-memory Redex.
+        // Synthetic payloads — bytes vary so each landing has
+        // a distinct content hash. The `id` is hashed into the
+        // payload prefix too so different adapters store
+        // different chunks (their refcount rings + the
+        // resulting BLOBS view stay distinct per adapter).
+        let mut stored = Vec::with_capacity(stores);
+        for i in 0..stores {
+            let payload = format!("{id}/blob-{i:03}-fixture-content").into_bytes();
             if let Ok(blob) = publish_blob_ref(
                 adapter.as_ref(),
-                format!("mesh://deck-samples/{}", payload.len()),
-                payload,
+                format!("mesh://{id}/{i}"),
+                &payload,
             )
             .await
             {
                 stored.push(blob);
             }
         }
-        // A few extra fetches so the fetch counter isn't zero
-        // when DATAFORTS first renders.
         if let Some(blob) = stored.first() {
-            for _ in 0..3 {
+            for _ in 0..fetches {
                 let _ = BlobAdapter::fetch(adapter.as_ref(), blob).await;
             }
         }

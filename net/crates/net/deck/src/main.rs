@@ -32,8 +32,7 @@ async fn main() -> color_eyre::Result<()> {
 
     let harness = runtime::spawn().await?;
     let deck = harness.deck();
-    let blob_metrics = harness.blob_metrics();
-    let blob_adapter = harness.blob_adapter();
+    let blob_adapters = harness.blob_adapters();
 
     // Phase 4: spawn streaming tails before handing the deck to
     // the App. The handles are kept alive for the App's
@@ -47,12 +46,12 @@ async fn main() -> color_eyre::Result<()> {
     let _failures_stream_task =
         streams::spawn_failures_stream(deck.clone(), failures_tail.clone());
 
-    // BLOBS inventory poller — distinct from the log / audit /
-    // failure streams because `BlobAdapter::list` is one-shot
-    // rather than a stream. Polls every 500 ms when an adapter
-    // is wired; left idle (empty tail) when not.
+    // BLOBS inventory poller — bound to the first registered
+    // adapter. Future iteration may poll a multi-adapter union;
+    // for now the BLOBS tab indexes the same adapter the
+    // DATAFORTS list-cursor starts on (index 0).
     let blobs_tail = streams::BlobsTail::new();
-    let _blobs_poll_task = blob_adapter.as_ref().map(|adapter| {
+    let _blobs_poll_task = blob_adapters.first().map(|adapter| {
         streams::spawn_blobs_poll(
             adapter.clone(),
             blobs_tail.clone(),
@@ -76,7 +75,7 @@ async fn main() -> color_eyre::Result<()> {
         logs_tail,
         audit_tail,
         failures_tail,
-        blob_metrics,
+        blob_adapters,
         blobs_tail,
         bookmarks,
     )

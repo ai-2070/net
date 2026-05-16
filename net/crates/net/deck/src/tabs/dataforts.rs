@@ -1,10 +1,11 @@
-//! DATAFORTS tab — renders the live `BlobMetricsSnapshot` from
-//! the local mesh blob adapter. With samples mode the runtime
-//! pre-fills realistic counters; in default mode the adapter
-//! is unhooked and the tab shows an empty state explaining
-//! that.
+//! DATAFORTS tab — renders the live blob-adapter set. Each
+//! registered adapter shows up as a row in the top list with
+//! its core metrics summarized; the cursored adapter drives
+//! the detail body below (disk gauge + health-gate verdict +
+//! Store/Fetch/GC + Overflow panels).
 //!
 //! Layout:
+//! - adapter list (height = N rows + header, capped)
 //! - status bar: capacity / used / disk-ratio / health-gate
 //! - left column: store + fetch + GC counters
 //! - right column: overflow counter family (per-reason)
@@ -16,23 +17,137 @@ use net_sdk::dataforts::{
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
     Frame,
 };
 
 use crate::{theme, widgets};
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&BlobMetricsSnapshot>) {
-    let Some(snap) = snapshot else {
+/// One row of the multi-adapter list. The deck snapshots each
+/// registered adapter's metrics at the frame boundary so the
+/// list + detail body agree on what the adapter looked like.
+#[derive(Clone)]
+pub struct AdapterEntry {
+    pub id: String,
+    pub metrics: BlobMetricsSnapshot,
+}
+
+pub fn render(frame: &mut Frame<'_>, area: Rect, entries: &[AdapterEntry], cursor: usize) {
+    if entries.is_empty() {
         render_empty(frame, area);
         return;
-    };
+    }
+    let cursor = cursor.min(entries.len().saturating_sub(1));
+    // List height: header + one row per adapter, capped at 8
+    // rows so the detail body keeps reasonable real estate on
+    // tall clusters.
+    let visible_rows = entries.len().min(8);
+    let list_height = (visible_rows as u16) + 3; // header + borders
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(list_height), // adapter list
+            Constraint::Length(3),           // status bar
+            Constraint::Min(0),              // body
+        ])
         .split(area);
-    render_status(frame, rows[0], snap);
-    render_body(frame, rows[1], snap);
+    render_adapter_list(frame, rows[0], entries, cursor);
+    render_status(frame, rows[1], &entries[cursor].metrics, &entries[cursor].id);
+    render_body(frame, rows[2], &entries[cursor].metrics);
+}
+
+fn render_adapter_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    entries: &[AdapterEntry],
+    cursor: usize,
+) {
+    let total = entries.len();
+    let pos = cursor.min(total.saturating_sub(1)) + 1;
+    let header_line = Line::from(vec![
+        Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+        Span::styled("ADAPTERS", theme::green_hi()),
+        Span::styled(
+            format!("    {total} registered"),
+            theme::chrome(),
+        ),
+        Span::styled(format!("    {pos}/{total}"), theme::dim()),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::rule())
+        .title(header_line);
+    let header = Row::new(vec![
+        cell_dim(" "),
+        cell_dim("ADAPTER"),
+        cell_dim("DISK"),
+        cell_dim("GATE"),
+        cell_dim("STORED"),
+        cell_dim("FETCHED"),
+        cell_dim("BYTES"),
+        cell_dim("OVERFLOW"),
+    ])
+    .height(1);
+
+    let mut rows: Vec<Row> = Vec::with_capacity(entries.len());
+    for (i, e) in entries.iter().enumerate() {
+        let is_cursor = i == cursor;
+        let marker = if is_cursor { "▶" } else { " " };
+        let id_style = if is_cursor { theme::green_hi() } else { theme::text() };
+        let m = &e.metrics;
+        let disk_pct = if m.disk_capacity_bytes == 0 {
+            0
+        } else {
+            ((m.disk_used_bytes * 100) / m.disk_capacity_bytes).min(999)
+        };
+        let (gate_text, gate_style) = gate_chip(m.disk_used_bytes, m.disk_capacity_bytes);
+        let overflow_active = m.overflow.active;
+        let (of_text, of_style) = if overflow_active {
+            ("ACTIVE", theme::amber())
+        } else {
+            ("idle", theme::dim())
+        };
+        rows.push(Row::new(vec![
+            Cell::from(Span::styled(marker, theme::green_hi())),
+            Cell::from(Span::styled(e.id.clone(), id_style)),
+            Cell::from(Span::styled(format!("{disk_pct:>3}%"), theme::text())),
+            Cell::from(Span::styled(gate_text, gate_style)),
+            Cell::from(Span::styled(format!("{:>6}", m.blobs_stored_total), theme::text())),
+            Cell::from(Span::styled(format!("{:>6}", m.blobs_fetched_total), theme::text())),
+            Cell::from(Span::styled(fmt_bytes(m.bytes_stored_total), theme::dim())),
+            Cell::from(Span::styled(of_text, of_style)),
+        ]));
+    }
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(2),  // cursor
+            Constraint::Length(20), // adapter id
+            Constraint::Length(5),  // disk %
+            Constraint::Length(10), // gate
+            Constraint::Length(7),  // stored
+            Constraint::Length(8),  // fetched
+            Constraint::Length(11), // bytes
+            Constraint::Min(8),     // overflow
+        ],
+    )
+    .header(header)
+    .block(block)
+    .column_spacing(2);
+    frame.render_widget(table, area);
+}
+
+fn cell_dim(s: &'static str) -> Cell<'static> {
+    Cell::from(Span::styled(s, theme::chrome()))
+}
+
+fn gate_chip(used: u64, cap: u64) -> (&'static str, ratatui::style::Style) {
+    let gate = evaluate_health_gate(used, cap, false);
+    match gate {
+        HealthGateAction::Emit => ("UNHEALTHY", theme::red()),
+        HealthGateAction::Clear | HealthGateAction::Unchanged => ("healthy", theme::green()),
+    }
 }
 
 fn render_empty(frame: &mut Frame<'_>, area: Rect) {
@@ -54,13 +169,14 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_status(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSnapshot) {
+fn render_status(frame: &mut Frame<'_>, area: Rect, snap: &BlobMetricsSnapshot, adapter_id: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
         .title(Line::from(vec![
             Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
             Span::styled("BLOB.ADAPTER", theme::green_hi()),
+            Span::styled(format!("    {adapter_id}"), theme::amber()),
         ]));
     let inner = block.inner(area);
     frame.render_widget(block, area);

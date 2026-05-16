@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use net_sdk::dataforts::BlobAdapter;
 use net_sdk::deck::{DeckClient, MeshOsSnapshot};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
@@ -101,11 +102,13 @@ pub struct App {
     /// tab — executor rejections, drain failures, constraint
     /// drops.
     pub failures_tail: crate::streams::FailuresTail,
-    /// Blob-adapter metrics handle. `Some` when a
-    /// `MeshBlobAdapter` is wired (or samples mode pre-fills
-    /// it); `None` when the adapter is unhooked. The DATAFORTS
-    /// tab snapshots from this on each render.
-    pub blob_metrics: Option<Arc<net_sdk::dataforts::BlobMetrics>>,
+    /// Registered blob adapters. DATAFORTS lists them at the
+    /// top of the tab; the cursored adapter drives the detail
+    /// body. Empty when no adapter is wired (the tab shows
+    /// its "no adapter wired" empty state).
+    pub blob_adapters: Vec<Arc<net_sdk::dataforts::MeshBlobAdapter>>,
+    /// Cursor on the DATAFORTS adapter list.
+    pub dataforts_cursor: usize,
     /// BLOBS inventory tail — periodically refreshed from
     /// `MeshBlobAdapter::list(...)`. Empty when no adapter is
     /// wired; the BLOBS tab shows its empty state in that
@@ -307,7 +310,7 @@ impl App {
         logs_tail: crate::streams::LogsTail,
         audit_tail: crate::streams::AuditTail,
         failures_tail: crate::streams::FailuresTail,
-        blob_metrics: Option<Arc<net_sdk::dataforts::BlobMetrics>>,
+        blob_adapters: Vec<Arc<net_sdk::dataforts::MeshBlobAdapter>>,
         blobs_tail: crate::streams::BlobsTail,
         bookmarks: crate::bookmarks::BookmarkStore,
     ) -> Self {
@@ -317,7 +320,8 @@ impl App {
             logs_tail,
             audit_tail,
             failures_tail,
-            blob_metrics,
+            blob_adapters,
+            dataforts_cursor: 0,
             blobs_tail,
             blobs_cursor: 0,
             blobs_search: String::new(),
@@ -662,6 +666,14 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up if self.current == Tab::NetMap => {
                 self.netmap_cursor = self.netmap_cursor.saturating_sub(1);
             }
+            // DATAFORTS adapter list cursor.
+            KeyCode::Char('j') | KeyCode::Down if self.current == Tab::Dataforts => {
+                self.dataforts_cursor = self.dataforts_cursor.saturating_add(1);
+                self.clamp_dataforts_cursor();
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.current == Tab::Dataforts => {
+                self.dataforts_cursor = self.dataforts_cursor.saturating_sub(1);
+            }
             KeyCode::Char('j') | KeyCode::Down if self.current == Tab::Replicas => {
                 self.replica_cursor = self.replica_cursor.saturating_add(1);
                 self.clamp_replica_cursor();
@@ -929,6 +941,15 @@ impl App {
         }
     }
 
+    fn clamp_dataforts_cursor(&mut self) {
+        let n = self.blob_adapters.len();
+        if n == 0 {
+            self.dataforts_cursor = 0;
+        } else if self.dataforts_cursor >= n {
+            self.dataforts_cursor = n - 1;
+        }
+    }
+
     fn clamp_replica_cursor(&mut self) {
         let n = self.snapshot.replicas.len();
         if n == 0 {
@@ -999,6 +1020,7 @@ impl App {
     fn cursor_to_top(&mut self) {
         match self.current {
             Tab::NetMap => self.netmap_cursor = 0,
+            Tab::Dataforts => self.dataforts_cursor = 0,
             Tab::List => self.list_cursor = 0,
             Tab::Replicas => self.replica_cursor = 0,
             Tab::Migrations => self.migration_cursor = 0,
@@ -1014,6 +1036,10 @@ impl App {
             Tab::NetMap => {
                 let n = self.snapshot.peers.len();
                 self.netmap_cursor = n.saturating_sub(1);
+            }
+            Tab::Dataforts => {
+                let n = self.blob_adapters.len();
+                self.dataforts_cursor = n.saturating_sub(1);
             }
             Tab::List => {
                 let n = self.snapshot.peers.len();
@@ -1573,8 +1599,22 @@ impl App {
                 self.list_cursor,
             ),
             Tab::Dataforts => {
-                let snap = self.blob_metrics.as_ref().map(|m| m.snapshot());
-                tabs::dataforts::render(frame, chunks[3], snap.as_ref());
+                // Snapshot each adapter's metrics at the start
+                // of the frame so the list + detail body agree.
+                let entries: Vec<tabs::dataforts::AdapterEntry> = self
+                    .blob_adapters
+                    .iter()
+                    .map(|a| tabs::dataforts::AdapterEntry {
+                        id: a.adapter_id().to_string(),
+                        metrics: a.metrics().snapshot(),
+                    })
+                    .collect();
+                tabs::dataforts::render(
+                    frame,
+                    chunks[3],
+                    &entries,
+                    self.dataforts_cursor,
+                );
             }
             Tab::Daemon => tabs::daemon::render(
                 frame,
