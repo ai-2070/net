@@ -1,0 +1,22 @@
+net/crates/net/deck/Cargo.toml
+  s_4a2fa2d5f63459::t_6955fe8f5e7268 3
+net/crates/net/deck/src/widgets/status_bar.rs
+  s_4a2fa2d5f63459::t_b3f1b0f3d25174 105-108,111,118-120
+  s_4a2fa2d5f63459::t_5cf5d3f2108b1d 15-19,22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "3acf968221d93b597f8d7d739363c8becfdc8b5d",
+  "prompts": {},
+  "sessions": {
+    "s_4a2fa2d5f63459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5d060031-ba25-4cac-9cbf-32d9a94cbf0c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
