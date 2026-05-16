@@ -35,6 +35,23 @@ pub struct NodeFocusEntry {
     pub id: u64,
     pub label: Option<String>,
     pub peer: PeerSnapshot,
+    /// Source list the focus was opened from. Drives the
+    /// previous/next bindings on the page so an operator can
+    /// step through the underlying list without Esc-ing first.
+    /// `None` means the focus was opened from a context with
+    /// no natural neighbours (e.g. the BLOBS modal pointing at
+    /// a host) — navigation keys are absorbed.
+    pub source: Option<FocusSource>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusSource {
+    /// `snapshot.peers` in BTreeMap order. Used when focus was
+    /// opened from LIST or NET.MAP.
+    Peers(usize),
+    /// `App::collect_dataforts()` in its render order. Used
+    /// when focus was opened from DATAFORTS.
+    Dataforts(usize),
 }
 
 /// Minimal datafort view rendered on the NODE page when the

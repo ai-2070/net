@@ -308,6 +308,15 @@ pub struct DaemonCursor {
     pub member: usize,
 }
 
+/// Bound `idx + delta` into `[0, n)`. Used by the NODE-page
+/// stepper so navigation past either end stops at the boundary
+/// rather than wrapping.
+fn clamp_step(idx: usize, delta: i32, n: usize) -> usize {
+    let signed = idx as i64 + delta as i64;
+    let last = n.saturating_sub(1) as i64;
+    signed.clamp(0, last) as usize
+}
+
 impl App {
     pub fn new(
         deck: Arc<DeckClient>,
@@ -419,7 +428,47 @@ impl App {
             .map(|(id, p)| (*id, p.clone()));
         if let Some((id, peer)) = pair {
             let label = crate::nodes::label_of(&format!("0x{id:x}")).map(|s| s.to_string());
-            self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry { id, label, peer });
+            self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
+                id,
+                label,
+                peer,
+                source: Some(crate::tabs::node_page::FocusSource::Peers(peer_index)),
+            });
+        }
+    }
+
+    /// Step the NODE focus to the next / previous entry within
+    /// the source list it was opened from. Mirrors the cursor
+    /// in the underlying tab so an Esc-out lands at the new
+    /// position. Sources without natural neighbours (focus_host
+    /// from a modal) leave the focus untouched.
+    fn step_node_focus(&mut self, delta: i32) {
+        let Some(source) = self.node_focus.as_ref().and_then(|f| f.source) else {
+            return;
+        };
+        match source {
+            crate::tabs::node_page::FocusSource::Peers(idx) => {
+                let n = self.snapshot.peers.len();
+                if n == 0 {
+                    return;
+                }
+                let next = clamp_step(idx, delta, n);
+                // Mirror the LIST / NET.MAP cursor so leaving
+                // focus leaves the underlying tab at the new
+                // position.
+                self.list_cursor = next;
+                self.netmap_cursor = next;
+                self.focus_node(next);
+            }
+            crate::tabs::node_page::FocusSource::Dataforts(idx) => {
+                let entries = self.collect_dataforts();
+                if entries.is_empty() {
+                    return;
+                }
+                let next = clamp_step(idx, delta, entries.len());
+                self.dataforts_cursor = next;
+                self.focus_datafort(next);
+            }
         }
     }
 
@@ -453,6 +502,7 @@ impl App {
                 id: host_id,
                 label: host_label.map(|s| s.to_string()),
                 peer,
+                source: None,
             });
         } else if let Some((id, peer)) =
             self.snapshot.peers.iter().find(|(pid, _)| **pid == host_id)
@@ -464,6 +514,7 @@ impl App {
                 id: *id,
                 label,
                 peer: peer.clone(),
+                source: None,
             });
         }
     }
@@ -551,6 +602,7 @@ impl App {
                 id: entry.id,
                 label: entry.label.map(|s| s.to_string()),
                 peer,
+                source: Some(crate::tabs::node_page::FocusSource::Dataforts(idx)),
             });
         } else if let Some((id, peer)) = self
             .snapshot
@@ -563,6 +615,7 @@ impl App {
                 id: *id,
                 label,
                 peer: peer.clone(),
+                source: Some(crate::tabs::node_page::FocusSource::Dataforts(idx)),
             });
         }
     }
@@ -840,6 +893,18 @@ impl App {
             ) {
                 self.node_focus = None;
                 // fall through to the normal handler
+            } else if matches!(
+                code,
+                KeyCode::Down | KeyCode::Char('j' | 's')
+            ) {
+                self.step_node_focus(1);
+                return;
+            } else if matches!(
+                code,
+                KeyCode::Up | KeyCode::Char('k' | 'w')
+            ) {
+                self.step_node_focus(-1);
+                return;
             } else {
                 // Any other key while focused (cursor, etc) is
                 // absorbed so it doesn't act on the underlying
