@@ -469,11 +469,26 @@ fn render_blast_radius(frame: &mut Frame<'_>, area: Rect, blast: &BlastRadius) {
             ),
         ]));
     }
-    for w in blast.warnings.iter().take(3) {
+    // ICE break-glass: the warnings *are* the rationale, so
+    // truncate visibly rather than silently hiding extras.
+    // Cap at 3 so the modal doesn't grow past its budget on
+    // dense scenarios; signal the rest with a `… +N more`
+    // chip so the operator can ask the audit log for the
+    // full list before confirming.
+    const MAX_VISIBLE_WARNINGS: usize = 3;
+    let total = blast.warnings.len();
+    for w in blast.warnings.iter().take(MAX_VISIBLE_WARNINGS) {
         lines.push(Line::from(vec![
             Span::styled("⚠  ", theme::amber()),
             Span::styled(warning_label(w), theme::amber()),
         ]));
+    }
+    if total > MAX_VISIBLE_WARNINGS {
+        let hidden = total - MAX_VISIBLE_WARNINGS;
+        lines.push(Line::from(vec![Span::styled(
+            format!("⚠  … +{hidden} more (see AUDIT)"),
+            theme::amber(),
+        )]));
     }
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
