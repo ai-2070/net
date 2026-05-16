@@ -71,7 +71,15 @@ fn render_table(
         .collect();
     let total = entries.len();
     let shown = visible.len();
-    let pos = cursor.min(shown.saturating_sub(1)) + 1;
+    // When the filter narrows to zero rows, surface "0/0" in
+    // the chip and a one-line hint below — the prior
+    // saturating-sub left the chip showing "1/0" against an
+    // empty body.
+    let pos = if shown == 0 {
+        0
+    } else {
+        cursor.min(shown - 1) + 1
+    };
 
     let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
@@ -162,6 +170,23 @@ fn render_table(
     .block(block)
     .column_spacing(2);
     frame.render_widget(table, area);
+    // Entries exist but the search matched none: tell the
+    // operator their filter is in play instead of leaving an
+    // empty body that reads as "no chunks indexed".
+    if shown == 0 && total > 0 {
+        let inner = area.inner(ratatui::layout::Margin {
+            vertical: 2,
+            horizontal: 2,
+        });
+        let hint = Line::from(Span::styled(
+            format!("no chunks match \"{search}\" — {total} hidden by filter"),
+            theme::dim(),
+        ));
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(hint).alignment(Alignment::Left),
+            inner,
+        );
+    }
 }
 
 fn append_search_chip(spans: &mut Vec<Span<'static>>, search: &str, search_editing: bool) {

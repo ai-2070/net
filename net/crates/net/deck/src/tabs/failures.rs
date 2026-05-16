@@ -69,7 +69,14 @@ fn render_table(
         .collect();
     let total = records.len();
     let shown = visible.len();
-    let pos = cursor.min(shown.saturating_sub(1)) + 1;
+    // When the filter narrows the set to zero, the cursor chip
+    // would render as "1/0" — pin it to "0/0" instead and let
+    // the body render its "no matches" hint.
+    let pos = if shown == 0 {
+        0
+    } else {
+        cursor.min(shown - 1) + 1
+    };
     let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("FAILURES", theme::green_hi()),
@@ -138,6 +145,24 @@ fn render_table(
     .block(block)
     .column_spacing(2);
     frame.render_widget(table, area);
+    // Records exist but the active search matches none — render
+    // a one-line hint inside the body so the operator isn't
+    // staring at an empty table wondering whether their filter
+    // is broken or there's genuinely nothing to see.
+    if shown == 0 && total > 0 {
+        let inner = area.inner(ratatui::layout::Margin {
+            vertical: 2,
+            horizontal: 2,
+        });
+        let hint = Line::from(Span::styled(
+            format!("no matches for \"{search}\" — {total} records hidden by filter"),
+            theme::dim(),
+        ));
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(hint).alignment(Alignment::Left),
+            inner,
+        );
+    }
 }
 
 fn cell_dim(s: &'static str) -> Cell<'static> {
