@@ -6,7 +6,7 @@
 //! Rendered by `App::draw` after the tab content, so it
 //! visually sits on top.
 
-use net_sdk::deck::BlastRadius;
+use net_sdk::deck::{BlastRadius, BlastWarning};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -285,16 +285,19 @@ impl ConfirmAction {
                 ),
                 "reconcile + folds keep running; only outbound actions stop".to_string(),
                 "auto-thaws at the deadline; `[T]` cancels early".to_string(),
+                "fires `ice().freeze_cluster(ttl)`".to_string(),
             ],
             Self::IceThawCluster { .. } => vec![
                 "cancels an in-effect freeze immediately".to_string(),
                 "reconcile resumes action emission on the next tick".to_string(),
                 "no-op if no freeze is in effect".to_string(),
+                "fires `ice().thaw_cluster()`".to_string(),
             ],
             Self::IceForceRestartDaemon { .. } => vec![
                 "force-restarts the daemon, bypassing crash-loop backoff".to_string(),
                 "supervisor's BackingOff / CrashLooping gate is cleared".to_string(),
                 "use after operator-side recovery — not a routine retry".to_string(),
+                "fires `ice().force_restart_daemon(daemon)`".to_string(),
             ],
             Self::DropReplicas { chains, .. } => vec![
                 format!("evicts {} replica(s) from this node", chains.len()),
@@ -306,23 +309,27 @@ impl ConfirmAction {
                 "flushes avoid-list entries cluster-wide".to_string(),
                 "every node clears its local avoid list".to_string(),
                 "reconcile may re-add entries on the next tick".to_string(),
+                "fires `ice().flush_avoid_lists(scope)`".to_string(),
             ],
             Self::IceKillMigration { .. } => vec![
                 "aborts the in-flight migration on its host node".to_string(),
                 "MigrationOrchestrator drops the daemon's record".to_string(),
                 "no-op on nodes that aren't hosting this migration".to_string(),
+                "fires `ice().kill_migration(migration)`".to_string(),
             ],
             Self::IceForceEvictReplica { .. } => vec![
                 "evicts the replica holder, bypassing scheduler".to_string(),
                 "cooldown + count-driven hysteresis".to_string(),
                 "elected chain leader emits the RequestEviction".to_string(),
                 "non-leaders fold the event but emit nothing".to_string(),
+                "fires `ice().force_evict_replica(chain, victim)`".to_string(),
             ],
             Self::IceForceCutover { .. } => vec![
                 "pins the chain's next placement to the target".to_string(),
                 "bypasses the placement scorer for one pass".to_string(),
                 "elected chain leader emits the RequestPlacement".to_string(),
                 "no-op if target is already a holder".to_string(),
+                "fires `ice().force_cutover(chain, target)`".to_string(),
             ],
         }
     }
@@ -465,10 +472,69 @@ fn render_blast_radius(frame: &mut Frame<'_>, area: Rect, blast: &BlastRadius) {
     for w in blast.warnings.iter().take(3) {
         lines.push(Line::from(vec![
             Span::styled("⚠  ", theme::amber()),
-            Span::styled(format!("{w:?}"), theme::amber()),
+            Span::styled(warning_label(w), theme::amber()),
         ]));
     }
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
+}
+
+/// Render a `BlastWarning` variant as an operator-facing
+/// label. The substrate intentionally ships these as a tagged
+/// enum (binding-side error routing keys on the variant name);
+/// the deck does the human rendering here. New substrate
+/// variants surface as `unknown-warning` until the match
+/// catches up — `BlastWarning` is `#[non_exhaustive]` so the
+/// wildcard is unavoidable.
+fn warning_label(w: &BlastWarning) -> String {
+    match w {
+        BlastWarning::ClusterFreezeBlocksOperatorActions => {
+            "freeze blocks operator actions until thaw".to_string()
+        }
+        BlastWarning::ThawResumesPendingReconciles => {
+            "thaw resumes reconcile transitions paused mid-flight".to_string()
+        }
+        BlastWarning::ThawHasNoFreezeToCancel => "no freeze in effect — thaw is a no-op".to_string(),
+        BlastWarning::GlobalAvoidFlushMayReEmit => {
+            "global avoid flush: reconcile may re-emit on the next tick".to_string()
+        }
+        BlastWarning::AvoidFlushLocalToTargetNodeOnly => {
+            "local-scope flush — other nodes ignore this event".to_string()
+        }
+        BlastWarning::AvoidFlushRecoversPeer { peer } => {
+            format!("every node will stop avoiding peer 0x{peer:x}")
+        }
+        BlastWarning::ForcedEvictionBypassesCooldown { chain, victim } => {
+            format!("force-evict bypasses cooldown (chain 0x{chain:x}, victim 0x{victim:x})")
+        }
+        BlastWarning::ForcedEvictionTargetsUnknownChain { chain } => {
+            format!("chain 0x{chain:x} not in snapshot — no leader will emit")
+        }
+        BlastWarning::ForcedEvictionTargetsNonHolder { chain, victim } => format!(
+            "victim 0x{victim:x} not currently a holder of chain 0x{chain:x} — no-op"
+        ),
+        BlastWarning::ForcedRestartBypassesBackoff { daemon_id } => {
+            format!("force-restart bypasses crash-loop backoff (daemon 0x{daemon_id:x})")
+        }
+        BlastWarning::ForcedRestartTargetsUnknownDaemon { daemon_id } => {
+            format!("daemon 0x{daemon_id:x} not observed — likely a typo")
+        }
+        BlastWarning::ForcedRestartDaemonNotInBackoff { daemon_id } => {
+            format!("daemon 0x{daemon_id:x} already idle — restart is a no-op")
+        }
+        BlastWarning::ForcedCutoverBypassesPlacementScorer { chain, target } => {
+            format!("force-cutover bypasses placement scorer (chain 0x{chain:x}, target 0x{target:x})")
+        }
+        BlastWarning::ForcedCutoverTargetsUnknownChain { chain } => {
+            format!("chain 0x{chain:x} not in snapshot — no leader will emit")
+        }
+        BlastWarning::ForcedCutoverTargetAlreadyHolder { chain, target } => {
+            format!("target 0x{target:x} already a holder of chain 0x{chain:x} — no-op")
+        }
+        BlastWarning::KillMigrationDispatcherIntegrationPending { migration } => format!(
+            "kill_migration is local-only today — migration 0x{migration:x} may exist on another node"
+        ),
+        _ => "unknown-warning".to_string(),
+    }
 }
 
 fn center(area: Rect, width: u16, height: u16) -> Rect {
