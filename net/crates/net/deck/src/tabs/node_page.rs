@@ -27,7 +27,9 @@ use ratatui::{
     Frame,
 };
 
-use crate::theme;
+use std::collections::{HashMap, VecDeque};
+
+use crate::{theme, widgets};
 
 /// Snapshot of the focused peer + its id.
 #[derive(Clone, Debug)]
@@ -67,6 +69,10 @@ pub struct DatafortView {
     pub overflow_enabled: bool,
     pub overflow_active: bool,
     pub adapters: Vec<DatafortAdapterRow>,
+    /// Greedy-cache config, when the node carries `greedy.cache`.
+    /// Rendered as a compact set of key/value rows below the
+    /// blob block.
+    pub greedy: Option<crate::tabs::dataforts::GreedyView>,
 }
 
 #[derive(Clone, Debug)]
@@ -84,52 +90,81 @@ pub fn render(
     entry: &NodeFocusEntry,
     live: &MeshOsSnapshot,
     datafort: Option<&DatafortView>,
+    saturation: &HashMap<u64, VecDeque<f32>>,
 ) {
     // NODE panel grows with the capability tree so a node with
     // deep capability subtrees (sensor.radar.shortwave …) still
     // gets the full tree drawn instead of being clipped. Clamp to
-    // leave room for PLACEMENT + the optional DATAFORT section.
+    // leave room for SATURATION + the optional DATAFORT + PLACEMENT.
     let cap_lines = count_cap_lines(&entry.peer.capability_set);
     let needed = 2 /* borders */ + 6 /* main rows */ + 1 /* spacer */ + cap_lines + 1;
     let datafort_h: u16 = match datafort {
-        Some(v) if v.is_local && !v.adapters.is_empty() => {
-            // 1 status row + 1 row per adapter + 2 borders
-            (v.adapters.len() as u16 + 3).min(10)
+        Some(v) => {
+            // Blob block: 1 status row + per-adapter rows (local
+            // only) or 1 caps row (remote). Greedy block: 4 rows
+            // of k/v when present. Plus 2 borders + 1 separator.
+            let blob_rows = if v.is_local && !v.adapters.is_empty() {
+                v.adapters.len() as u16 + 1
+            } else if !v.is_local {
+                1
+            } else {
+                1
+            };
+            let greedy_rows = if v.greedy.is_some() { 5 } else { 0 };
+            let h = 2 /* borders */ + blob_rows + greedy_rows;
+            h.min(14)
         }
-        Some(_) => 4, // remote: 2 content rows + 2 borders
         None => 0,
     };
+    // Saturation block is 9 rows: 1 title + 1 chips + ~5 bars +
+    // 1 axis + 1 spacer for the top border. Skip when the node
+    // has no samples yet (would render a "no samples" placeholder
+    // that wastes a band).
+    let has_sat = saturation
+        .get(&entry.id)
+        .map(|q| !q.is_empty())
+        .unwrap_or(false);
+    let sat_h: u16 = if has_sat { 9 } else { 0 };
     let panel_h = (needed as u16)
         .max(12)
-        .min(area.height.saturating_sub(8 + datafort_h));
-    let constraints: Vec<Constraint> = if datafort_h > 0 {
-        vec![
-            Constraint::Length(panel_h),     // NODE
-            Constraint::Length(datafort_h),  // DATAFORT
-            Constraint::Min(0),              // PLACEMENT
-            Constraint::Length(2),           // hint row + spacer
-        ]
-    } else {
-        vec![
-            Constraint::Length(panel_h),
-            Constraint::Min(0),
-            Constraint::Length(2),
-        ]
-    };
+        .min(area.height.saturating_sub(8 + datafort_h + sat_h));
+
+    let mut constraints: Vec<Constraint> = Vec::new();
+    constraints.push(Constraint::Length(panel_h));
+    if sat_h > 0 {
+        constraints.push(Constraint::Length(sat_h));
+    }
+    if datafort_h > 0 {
+        constraints.push(Constraint::Length(datafort_h));
+    }
+    constraints.push(Constraint::Min(0));
+    constraints.push(Constraint::Length(2));
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
-    render_peer_panel(frame, rows[0], entry);
-    let hint_row;
-    if let Some(v) = datafort {
-        render_datafort_panel(frame, rows[1], entry, v);
-        render_placement_panel(frame, rows[2], entry, live);
-        hint_row = Rect { height: 1, ..rows[3] };
-    } else {
-        render_placement_panel(frame, rows[1], entry, live);
-        hint_row = Rect { height: 1, ..rows[2] };
+
+    // Walk through `rows` in the order we built constraints.
+    let mut i = 0;
+    render_peer_panel(frame, rows[i], entry);
+    i += 1;
+    if sat_h > 0 {
+        let samples: Vec<f32> = saturation
+            .get(&entry.id)
+            .map(|q| q.iter().copied().collect())
+            .unwrap_or_default();
+        let node_hex = format!("0x{:x}", entry.id);
+        widgets::saturation::render(frame, rows[i], "SATURATION", &node_hex, &samples);
+        i += 1;
     }
+    if let Some(v) = datafort {
+        render_datafort_panel(frame, rows[i], entry, v);
+        i += 1;
+    }
+    render_placement_panel(frame, rows[i], entry, live);
+    i += 1;
+    let hint_row = Rect { height: 1, ..rows[i] };
     render_back_hint(frame, hint_row);
 }
 
@@ -229,7 +264,10 @@ fn render_datafort_panel(
             .peer
             .capability_set
             .iter()
-            .filter(|c| c.starts_with("dataforts."))
+            .filter(|c| {
+                c.starts_with("dataforts.")
+                    || *c == "greedy.cache"
+            })
             .collect();
         let chips: Vec<Span> = if caps.is_empty() {
             vec![Span::styled("  caps      —", theme::chrome())]
@@ -247,6 +285,40 @@ fn render_datafort_panel(
         };
         lines.push(Line::from(chips));
     }
+
+    if let Some(g) = view.greedy.as_ref() {
+        lines.push(Line::from(vec![Span::styled(
+            "  greedy",
+            theme::chrome(),
+        )]));
+        let scopes_text = if g.scopes.is_empty() {
+            "any scope".to_string()
+        } else {
+            g.scopes.join(" · ")
+        };
+        lines.push(Line::from(vec![
+            Span::styled("    scopes        ", theme::chrome()),
+            Span::styled(scopes_text, theme::text()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    rtt_max       ", theme::chrome()),
+            Span::styled(format!("{} ms", g.proximity_max_rtt_ms), theme::text()),
+            Span::styled("    cap_total    ", theme::chrome()),
+            Span::styled(fmt_bytes(g.total_cap_bytes), theme::text()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    bandwidth    ", theme::chrome()),
+            Span::styled(
+                format!(
+                    "{:.0}% of {}/s",
+                    g.bandwidth_budget_fraction * 100.0,
+                    fmt_bytes(g.nic_peak_bytes_per_s)
+                ),
+                theme::text(),
+            ),
+        ]));
+    }
+
     frame.render_widget(Paragraph::new(lines), inner);
 }
 

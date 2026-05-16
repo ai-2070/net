@@ -49,6 +49,30 @@ pub struct DatafortEntry {
     pub capabilities: Vec<String>,
     /// Per-adapter rows. Populated only for the local datafort.
     pub adapters: Vec<AdapterEntry>,
+    /// Greedy-cache subsystem config. Present only when the node
+    /// advertises `greedy.cache`. Surfaced in its own GREEDY bar
+    /// in the detail body.
+    pub greedy: Option<GreedyView>,
+}
+
+/// Per-node greedy-cache configuration as the deck observes it.
+/// Mirrors the load-bearing knobs from
+/// `crate::adapter::net::dataforts::greedy::GreedyConfig` — the
+/// values an operator needs to see to understand admission and
+/// LRU pressure. Today populated synthetically for samples peers
+/// (no remote-greedy probe); real wiring would source this from
+/// each peer's published config.
+#[derive(Clone, Debug)]
+pub struct GreedyView {
+    pub proximity_max_rtt_ms: u64,
+    pub per_channel_cap_bytes: u64,
+    pub total_cap_bytes: u64,
+    pub bandwidth_budget_fraction: f32,
+    pub nic_peak_bytes_per_s: u64,
+    pub scopes: Vec<String>,
+    pub colocation: &'static str,
+    pub intent_match: &'static str,
+    pub observer_inflight_cap: usize,
 }
 
 /// One adapter on the local datafort. Metrics are snapshotted
@@ -68,21 +92,104 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entries: &[DatafortEntry], curs
     let cursor = cursor.min(entries.len().saturating_sub(1));
     let visible_rows = entries.len().min(10);
     let list_height = (visible_rows as u16) + 3;
+    let cur_preview = &entries[cursor];
+    let greedy_h: u16 = if cur_preview.greedy.is_some() { 8 } else { 0 };
+    let mut constraints: Vec<Constraint> = vec![
+        Constraint::Length(list_height),
+        Constraint::Length(3), // aggregate status bar
+    ];
+    if greedy_h > 0 {
+        constraints.push(Constraint::Length(greedy_h));
+    }
+    constraints.push(Constraint::Min(0)); // context
+    constraints.push(Constraint::Length(14)); // STORE + OVERFLOW
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(list_height),
-            Constraint::Length(3),  // aggregate status bar
-            Constraint::Min(0),     // context (adapters | node)
-            Constraint::Length(14), // STORE + OVERFLOW counters
-        ])
+        .constraints(constraints)
         .split(area);
     render_datafort_list(frame, rows[0], entries, cursor);
     let cur = &entries[cursor];
     let agg = aggregate_for(cur);
     render_status(frame, rows[1], cur, &agg);
-    render_context_row(frame, rows[2], cur);
-    render_body(frame, rows[3], cur, &agg);
+    let mut i = 2;
+    if greedy_h > 0 {
+        if let Some(g) = cur.greedy.as_ref() {
+            render_greedy_panel(frame, rows[i], cur, g);
+        }
+        i += 1;
+    }
+    render_context_row(frame, rows[i], cur);
+    render_body(frame, rows[i + 1], cur, &agg);
+}
+
+fn render_greedy_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    cur: &DatafortEntry,
+    g: &GreedyView,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::rule())
+        .title(Line::from(vec![
+            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+            Span::styled("GREEDY", theme::green_hi()),
+            Span::styled(
+                format!("    {}", format_id_label(cur.id, cur.label)),
+                theme::amber(),
+            ),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+
+    let scopes_text = if g.scopes.is_empty() {
+        "—  (admits any scope)".to_string()
+    } else {
+        g.scopes.join(" · ")
+    };
+    let left_lines = vec![
+        kv_str("scopes              ", &scopes_text),
+        kv_str(
+            "proximity_max_rtt   ",
+            &format!("{} ms", g.proximity_max_rtt_ms),
+        ),
+        kv_str(
+            "per_channel_cap     ",
+            &fmt_bytes(g.per_channel_cap_bytes),
+        ),
+        kv_str("total_cap           ", &fmt_bytes(g.total_cap_bytes)),
+    ];
+    frame.render_widget(Paragraph::new(left_lines), cols[0]);
+
+    let right_lines = vec![
+        kv_str(
+            "bandwidth_budget    ",
+            &format!(
+                "{:.0}% of {}/s",
+                g.bandwidth_budget_fraction * 100.0,
+                fmt_bytes(g.nic_peak_bytes_per_s)
+            ),
+        ),
+        kv_str("intent_match        ", g.intent_match),
+        kv_str("colocation_policy   ", g.colocation),
+        kv_str(
+            "observer_inflight_cap",
+            &format!("{}", g.observer_inflight_cap),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(right_lines), cols[1]);
+}
+
+fn kv_str(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {label}"), theme::chrome()),
+        Span::styled(value.to_string(), theme::text()),
+    ])
 }
 
 // ───────────────────────── top list ─────────────────────────

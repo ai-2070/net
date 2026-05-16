@@ -78,6 +78,8 @@ fn tab_chips(current: Tab) -> Line<'static> {
         }
         Tab::Daemon => {
             spans.extend([
+                chip_key("Enter"),
+                chip_desc(" host node   "),
                 chip_key("W/S"),
                 chip_desc(" group   "),
                 chip_key("r"),

@@ -325,6 +325,65 @@ fn clamp_step(idx: usize, delta: i32, n: usize) -> usize {
     signed.clamp(0, last) as usize
 }
 
+/// Synthetic per-node greedy config used while the substrate has
+/// no remote-greedy probe. Values are deterministically derived
+/// from the node id so the deck shows varied (but stable) configs
+/// across peers in samples mode. Locked defaults match
+/// `GreedyConfig::default()` from the dataforts module.
+fn synthetic_greedy_view(
+    node_id: u64,
+    label: Option<&'static str>,
+) -> tabs::dataforts::GreedyView {
+    // Cheap hash off the id so each peer gets a stable but
+    // distinct config slot.
+    let h = (node_id ^ (node_id >> 17)) as usize;
+    let proximity_max_rtt_ms: u64 = match h % 4 {
+        0 => 100,
+        1 => 200, // matches GreedyConfig default
+        2 => 350,
+        _ => 500,
+    };
+    let total_cap_bytes: u64 = match h % 3 {
+        0 => 4 * (1u64 << 30),  // 4 GiB
+        1 => 10 * (1u64 << 30), // GreedyConfig default (10 GiB)
+        _ => 32 * (1u64 << 30), // 32 GiB
+    };
+    let per_channel_cap_bytes: u64 = 100 * (1u64 << 20); // 100 MiB default
+    let bandwidth_budget_fraction: f32 = match h % 4 {
+        0 => 0.15,
+        1 => 0.25, // default
+        2 => 0.40,
+        _ => 0.60,
+    };
+    let nic_peak_bytes_per_s: u64 = 125_000_000; // 1 Gbps default
+    // Scopes derive from the label (region suffix) when present
+    // so the demo reads "scopes: region:ap-south1" etc.
+    let scopes: Vec<String> = match label {
+        Some(l) if l.starts_with("eu-") || l.starts_with("us-") || l.starts_with("ap-") => {
+            vec![format!("region:{l}")]
+        }
+        Some("gpu-rig") => vec!["intent:compute".to_string(), "region:any".to_string()],
+        Some("edge") | Some("lab-bench") => vec!["intent:sensor".to_string()],
+        _ => Vec::new(),
+    };
+    let (colocation, intent_match) = if h % 2 == 0 {
+        ("SoftPreference", "AnyOfLocalCapabilities")
+    } else {
+        ("Strict", "Strict")
+    };
+    tabs::dataforts::GreedyView {
+        proximity_max_rtt_ms,
+        per_channel_cap_bytes,
+        total_cap_bytes,
+        bandwidth_budget_fraction,
+        nic_peak_bytes_per_s,
+        scopes,
+        colocation,
+        intent_match,
+        observer_inflight_cap: 1024,
+    }
+}
+
 impl App {
     pub fn new(
         deck: Arc<DeckClient>,
@@ -471,6 +530,57 @@ impl App {
         }
     }
 
+    /// Focus the NODE page on the placement node of the
+    /// cursored daemon. Resolves the daemon via its grouped
+    /// position in the DAEMONS list (same indexing the tab
+    /// renders), then looks the placement up in `snapshot.peers`.
+    /// Synthesizes a PeerSnapshot for the local node (id 0x0001
+    /// isn't in `snapshot.peers`) so it works for daemons
+    /// running locally.
+    fn focus_daemon_placement(&mut self) {
+        let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
+        let Some(group) = groups.get(self.daemon_cursor.group) else { return };
+        let Some(member) = group.members.get(self.daemon_cursor.member) else { return };
+        let placement = member.daemon.placement;
+        let label = crate::nodes::label_of(&format!("0x{placement:x}"));
+        if placement == 0x0001 {
+            // Synthesize local — same shape as focus_datafort's
+            // local branch.
+            let local = self.local_datafort();
+            let mut caps = std::collections::BTreeSet::new();
+            for c in &local.capabilities {
+                caps.insert(c.clone());
+            }
+            let peer = net_sdk::deck::PeerSnapshot {
+                health: Some(net_sdk::deck::PeerHealthSnapshot::Healthy),
+                cpu_load_1m: local.cpu_load_1m,
+                mem_used_bytes: local.mem_used_bytes,
+                mem_total_bytes: local.mem_total_bytes,
+                disk_used_bytes: local.disk_used_bytes,
+                disk_total_bytes: local.disk_total_bytes,
+                capability_set: caps,
+                software_version: Some("0.17.0".to_string()),
+                ..Default::default()
+            };
+            self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
+                id: placement,
+                label: label.map(|s| s.to_string()),
+                peer,
+                source: None,
+            });
+        } else if let Some(peer_idx) = self
+            .snapshot
+            .peers
+            .iter()
+            .position(|(id, _)| *id == placement)
+        {
+            // Land in Peers source so on-page ↑/↓ walks peers.
+            self.list_cursor = peer_idx;
+            self.netmap_cursor = peer_idx;
+            self.focus_node(peer_idx);
+        }
+    }
+
     /// Step the NODE focus to the next / previous entry within
     /// the source list it was opened from. Mirrors the cursor
     /// in the underlying tab so an Esc-out lands at the new
@@ -587,10 +697,21 @@ impl App {
                 overflow_enabled,
                 overflow_active,
                 adapters,
+                greedy: None,
             }
         } else if let Some((_, peer)) =
             self.snapshot.peers.iter().find(|(id, _)| **id == node_id)
         {
+            let has_greedy = peer
+                .capability_set
+                .iter()
+                .any(|c| c == "greedy.cache" || c == "dataforts.greedy.cache");
+            let label = crate::nodes::label_of(&format!("0x{node_id:x}"));
+            let greedy = if has_greedy {
+                Some(synthetic_greedy_view(node_id, label))
+            } else {
+                None
+            };
             tabs::node_page::DatafortView {
                 is_local: false,
                 disk_used_bytes: peer.disk_used_bytes,
@@ -601,6 +722,7 @@ impl App {
                     .any(|c| c == "dataforts.blob.overflow"),
                 overflow_active: false,
                 adapters: Vec::new(),
+                greedy,
             }
         } else {
             tabs::node_page::DatafortView::default()
@@ -656,20 +778,22 @@ impl App {
 
     /// Build the DATAFORTS list for the current frame. Always
     /// starts with the local datafort (the deck's host node +
-    /// its wired adapters), then appends every peer in the
-    /// snapshot that advertises `dataforts.blob.storage` as a
-    /// remote datafort. Remote rows have no adapter detail —
-    /// the deck reads peer-level disk + caps + health straight
-    /// from `snapshot.peers`.
+    /// its wired adapters), then appends every peer that
+    /// advertises a dataforts capability — blob storage or
+    /// greedy cache — as a remote datafort.
     fn collect_dataforts(&self) -> Vec<tabs::dataforts::DatafortEntry> {
         let mut out: Vec<tabs::dataforts::DatafortEntry> = Vec::new();
         out.push(self.local_datafort());
         for (id, p) in self.snapshot.peers.iter() {
-            if !p
+            let has_blob = p
                 .capability_set
                 .iter()
-                .any(|c| c == "dataforts.blob.storage")
-            {
+                .any(|c| c == "dataforts.blob.storage");
+            let has_greedy = p
+                .capability_set
+                .iter()
+                .any(|c| c == "greedy.cache" || c == "dataforts.greedy.cache");
+            if !has_blob && !has_greedy {
                 continue;
             }
             let label = crate::nodes::label_of(&format!("0x{:x}", *id));
@@ -678,6 +802,11 @@ impl App {
                 Some(net_sdk::deck::PeerHealthSnapshot::Degraded) => Some("Degraded"),
                 Some(net_sdk::deck::PeerHealthSnapshot::Unreachable) => Some("Unreachable"),
                 _ => None,
+            };
+            let greedy = if has_greedy {
+                Some(synthetic_greedy_view(*id, label))
+            } else {
+                None
             };
             out.push(tabs::dataforts::DatafortEntry {
                 id: *id,
@@ -691,6 +820,7 @@ impl App {
                 disk_total_bytes: p.disk_total_bytes,
                 capabilities: p.capability_set.iter().cloned().collect(),
                 adapters: Vec::new(),
+                greedy,
             });
         }
         out
@@ -739,6 +869,9 @@ impl App {
             disk_total_bytes: Some(disk_total),
             capabilities,
             adapters,
+            // Local datafort is blob-only today; greedy isn't
+            // wired into the deck runtime.
+            greedy: None,
         }
     }
 
@@ -1180,6 +1313,11 @@ impl App {
             // matching peer by id.
             KeyCode::Enter if self.current == Tab::Dataforts => {
                 self.focus_datafort(self.dataforts_cursor);
+            }
+            // DAEMONS: Enter opens the NODE page for the
+            // placement node of the cursored daemon.
+            KeyCode::Enter if self.current == Tab::Daemon => {
+                self.focus_daemon_placement();
             }
             // DATAFORTS: cross-link to BLOBS. Operators reading
             // aggregate metrics jump straight to per-chunk
@@ -1983,12 +2121,15 @@ impl App {
         // operator drilled into a peer; the page owns the
         // body until they Esc out.
         if let Some(focus) = self.node_focus.as_ref() {
-            let datafort = if focus
+            let has_blob = focus
                 .peer
                 .capability_set
                 .iter()
-                .any(|c| c == "dataforts.blob.storage")
-            {
+                .any(|c| c == "dataforts.blob.storage");
+            let has_greedy = focus.peer.capability_set.iter().any(|c| {
+                c == "greedy.cache" || c == "dataforts.greedy.cache"
+            });
+            let datafort = if has_blob || has_greedy {
                 Some(self.datafort_view_for(focus.id))
             } else {
                 None
@@ -1999,6 +2140,7 @@ impl App {
                 focus,
                 &self.snapshot,
                 datafort.as_ref(),
+                &self.saturation_history,
             );
             widgets::footer::render(
                 frame,
