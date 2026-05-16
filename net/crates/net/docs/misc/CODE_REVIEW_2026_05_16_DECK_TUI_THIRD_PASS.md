@@ -17,11 +17,15 @@ landed after the second-pass closeout (`14e075d7`):
 
 ## Status
 
-**Open.** 24 items identified: **3 High / 8 Medium / 11 Low / 2 Nit.**
+**Closed.** 24 items identified: **3 High / 8 Medium / 11 Low / 2 Nit.**
+22/24 landed across the same number of commits on `tui`; L3 and
+L11 were verified non-issues and tracked as "no change" below.
 Per the "no review-tracking IDs in code or commit messages"
 feedback rule, labels (H1-H3, M1-M8, L1-L11, N1-N2) are for
 this doc only — code and commit messages stay
 self-explanatory.
+
+Substrate / SDK items (H3, M7) shipped with regression tests.
 
 ## Verification notes
 
@@ -117,3 +121,46 @@ Net read of the 7 post-second-pass commits:
   L1 notes the unconditional `healthy = 1` assumption. The
   comment in the code calls out the local-Healthy contract
   explicitly, so this is a contract pin rather than a bug.
+
+---
+
+## Closed
+
+### Substrate / SDK (regression tests included)
+
+| ID  | Commit (short title)                                                                                  |
+|-----|-------------------------------------------------------------------------------------------------------|
+| H3  | `MeshOS: list_migrations saturates buffered_events at u32::MAX instead of wrapping.`                  |
+| M7  | `MeshOS: ProbeRegistry gains clear_locality/health/inventory probes APIs.`                            |
+
+### Deck (no regression tests — TUI render code)
+
+| ID  | Commit (short title)                                                                                  |
+|-----|-------------------------------------------------------------------------------------------------------|
+| H1  | (batched) `Deck: node_card uses canonical 0x{:x} id + shared HEALTH_GATE_* constants.`                |
+| H2  | `Deck: drop Ctrl/Alt/Super-modified alphabetic keys at the on_key entry.`                             |
+| M1  | (batched) `Deck: pop_logs_back restores the pre-pivot search, level, and pause state.`                |
+| M2  | (batched) `Deck: NRPC table moves STATUS to flex + adds a >=1s catastrophic latency tier.`            |
+| M3  | (batched) `Deck: MIGRATION sub-panel adapts the progress bar to cell width + hides on Complete.`      |
+| M4  | (batched in H1) `Deck: node_card uses canonical 0x{:x} id + shared HEALTH_GATE_* constants.`          |
+| M5  | `Deck: stash dispatch_confirm JoinHandles + await them on shutdown.`                                  |
+| M6  | `Deck: sanitize daemon-supplied strings before writing to export files.`                              |
+| M8  | `Deck: NRPC render path clones only the visible tail, not the whole ring.`                            |
+| L1  | `Deck: peer_summary reads the synthesized local PeerSnapshot's health field.`                         |
+| L2  | (batched in M1) `Deck: pop_logs_back restores the pre-pivot search, level, and pause state.`          |
+| L4  | `Deck: NRPC seeder decouples method index from call-pair index.`                                      |
+| L5  | (batched in M2) `Deck: NRPC table moves STATUS to flex + adds a >=1s catastrophic latency tier.`      |
+| L6  | (batched in M2)                                                                                       |
+| L7  | (batched in M3) `Deck: MIGRATION sub-panel adapts the progress bar to cell width + hides on Complete.`|
+| L8  | `Deck: cluster picker caches the sorted bookmark snapshot at modal open.`                             |
+| L9  | `Deck: bookmarks save uses pid+ms tmp suffix so concurrent deck instances don't race.`                |
+| L10 | `Deck: tab_bar shows '+N' indicator when the tab strip overflows.`                                    |
+| N1  | (batched) `Deck: drop dead u32 casts in blob_detail + soften NRPC empty-state hint.`                  |
+| N2  | (batched in N1)                                                                                       |
+
+### Verified no-change
+
+| ID  | Title                                                                                  | Why                                                                                                                                                                                                                                                                            |
+|-----|----------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| L3  | `TableState on the audit tab`                                                          | Verified by reading `tabs/audit.rs` + the AUDIT key paths: the tab has filter state (`audit_force_only`, `audit_limit`, `audit_search`) but no row cursor. The `j`/`k` arms don't apply to AUDIT, so the `TableState` refactor doesn't apply either. Was a misread.            |
+| L11 | `Inventory map not scrubbed on PeerDeparted events`                                    | Verified by reading `behavior/meshos/event.rs`: `MeshOsEvent` has no `PeerDeparted` variant. `rtt` / `node_health` / `inventory` are all poll-and-overwrite — there's no event-driven departure semantic for any of them. The probe-driven GC at `event_loop.rs:837-841` already correctly retains-by-probes. Was a misread. |
