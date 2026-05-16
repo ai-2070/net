@@ -14,9 +14,7 @@ use ratatui::{
 };
 
 use crate::theme;
-
-const HEALTH_GATE_CLEAR: f64 = 0.85;
-const HEALTH_GATE_EMIT: f64 = 0.95;
+use net_sdk::dataforts::{HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD};
 
 #[derive(Clone, Debug, Default)]
 pub struct NodeCardView {
@@ -33,9 +31,14 @@ pub struct NodeCardView {
 }
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, view: &NodeCardView) {
+    // Use `{:x}` (variable-width, no leading-zero pad) to match
+    // every other tab's node-id rendering. Padding to 4 hex
+    // digits would show the same id as `0x0001` here while the
+    // rest of the deck renders `0x1` — confusing the operator
+    // on cross-tab pivots.
     let id_label = match view.label.as_deref() {
-        Some(l) => format!("0x{:04x}.{l}", view.id),
-        None => format!("0x{:04x}", view.id),
+        Some(l) => format!("0x{:x}.{l}", view.id),
+        None => format!("0x{:x}", view.id),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -119,9 +122,9 @@ fn bar_kv(label: &str, used: Option<u64>, total: Option<u64>) -> Line<'static> {
     match ratio {
         Some(r) => {
             let pct = (r * 100.0).round() as u16;
-            let color = if r >= HEALTH_GATE_EMIT {
+            let color = if r >= HEALTH_GATE_EMIT_THRESHOLD {
                 theme::RED
-            } else if r >= HEALTH_GATE_CLEAR {
+            } else if r >= HEALTH_GATE_CLEAR_THRESHOLD {
                 theme::AMBER
             } else {
                 theme::GREEN_HI
