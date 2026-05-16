@@ -1,0 +1,66 @@
+net/crates/net/deck/src/tabs/blobs.rs
+  s_3bbc444b3ef3e5::t_c85df5507e734d 1-204
+net/crates/net/deck/src/tabs/mod.rs
+  s_3bbc444b3ef3e5::t_8545e7ca437949 2
+net/crates/net/deck/src/widgets/export.rs
+  s_3bbc444b3ef3e5::t_d57b00386c4a01 98-119
+  s_3bbc444b3ef3e5::t_e552da51419cbd 16
+net/crates/net/deck/src/widgets/help.rs
+  s_3bbc444b3ef3e5::t_4b80e71853ef59 22
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_3bbc444b3ef3e5::t_2c4057d07710fb 1414-1488
+  s_3bbc444b3ef3e5::t_3ddcb159ee5650 1255-1301
+net/crates/net/sdk/src/dataforts.rs
+  s_3bbc444b3ef3e5::t_09168c41872efe 20-21
+  s_3bbc444b3ef3e5::t_88f5db158c32cf 24-28
+net/crates/net/deck/src/main.rs
+  s_3bbc444b3ef3e5::t_6ba04ce1f937ba 80
+  s_3bbc444b3ef3e5::t_2a4b60ebf52a2e 36,50-61
+net/crates/net/src/adapter/net/dataforts/blob/adapter.rs
+  s_3bbc444b3ef3e5::t_0d733f27fcd90e 236,239-250,261,263-277,279-288,294
+  s_3bbc444b3ef3e5::t_1bd586ccbe0dfb 237-238,251-260,262,278,289-293,295-311
+net/crates/net/src/adapter/net/dataforts/mod.rs
+  s_3bbc444b3ef3e5::t_93314cda2e9119 48-49
+net/crates/net/deck/src/runtime.rs
+  s_3bbc444b3ef3e5::t_db0fe8a6cea1c8 181-184,192,197-200,203-204,206
+  s_3bbc444b3ef3e5::t_6199043d3a62f1 20,35-40,48-50,52-60
+  s_3bbc444b3ef3e5::t_eb503470b09daa 111-117,119,121,128
+  s_3bbc444b3ef3e5::t_ad04b13de59ecc 145
+  s_3bbc444b3ef3e5::t_a2e6dc3e368814 153-180,185-191,193-196,202,205,207,209
+net/crates/net/deck/src/streams.rs
+  s_3bbc444b3ef3e5::t_e92baefd64ee4b 19
+  s_3bbc444b3ef3e5::t_4c0c79965b3aa9 194-264
+net/crates/net/deck/src/app.rs
+  s_3bbc444b3ef3e5::t_cb80f85d80fd42 558-564
+  s_3bbc444b3ef3e5::t_ea99d7fd651b5d 627
+  s_3bbc444b3ef3e5::t_14bdbe664ce9a5 24,28,39,54
+  s_3bbc444b3ef3e5::t_91e23163532e79 104-116
+  s_3bbc444b3ef3e5::t_dcff512d7d8a52 841
+  s_3bbc444b3ef3e5::t_a30d46a21e5776 482
+  s_3bbc444b3ef3e5::t_ae338e9ff56ff0 268,278-281
+  s_3bbc444b3ef3e5::t_eae50e6d830780 423-439
+  s_3bbc444b3ef3e5::t_0cd761441b1aee 795-803
+  s_3bbc444b3ef3e5::t_76a6884ab98652 616-619
+  s_3bbc444b3ef3e5::t_8e377d2b1a7410 1438-1448
+  s_3bbc444b3ef3e5::t_15e81758f7fd6b 865-868
+  s_3bbc444b3ef3e5::t_ab033634d9c064 816-817
+  s_3bbc444b3ef3e5::t_30fef2711cff4b 449-453
+net/crates/net/src/adapter/net/dataforts/blob/mod.rs
+  s_3bbc444b3ef3e5::t_d9a5b3584c4a65 45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "828e82fdc5afcdc939813ad8c1e15d936a1a549e",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
