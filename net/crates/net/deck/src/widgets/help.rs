@@ -20,6 +20,7 @@ struct Binding {
 /// Routine bindings — navigation + cursor + dismissals.
 const NAVIGATION: &[Binding] = &[
     Binding { keys: "1-9, 0",    desc: "jump to tab (0 = BLOBS)" },
+    Binding { keys: ":",         desc: "open cluster picker" },
     Binding { keys: "Tab / ◂▸",  desc: "cycle tab" },
     Binding { keys: "j / k",     desc: "cursor down / up" },
     Binding { keys: "g / G",     desc: "cursor to top / bottom" },
@@ -62,7 +63,7 @@ const MODAL: &[Binding] = &[
 ];
 
 pub fn render(frame: &mut Frame<'_>, area: Rect) {
-    let modal_area = center(area, 78, 41);
+    let modal_area = center(area, 78, 42);
     frame.render_widget(Clear, modal_area);
 
     let block = Block::default()
@@ -85,7 +86,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(14), // navigation
+            Constraint::Length(15), // navigation
             Constraint::Length(11), // admin
             Constraint::Length(9),  // ice
             Constraint::Length(4),  // modal

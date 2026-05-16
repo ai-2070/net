@@ -1,3 +1,4 @@
+pub mod cluster_picker;
 pub mod confirm;
 pub mod empty;
 pub mod export;

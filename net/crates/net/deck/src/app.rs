@@ -115,13 +115,16 @@ pub struct App {
     /// When `true`, keystrokes go into `blobs_search`.
     pub blobs_search_editing: bool,
     /// Cluster bookmark store — loaded from
-    /// `$XDG_CONFIG_HOME/deck/bookmarks.toml` at startup. Used
-    /// by the (still-deferred) Multi-Cluster Switcher; holds
-    /// the persisted "known meshes" list so the bookmark picker
-    /// reads + writes through this handle. Empty in default
-    /// builds until the operator adds their first cluster.
-    #[allow(dead_code)] // consumed by the multi-cluster picker slice
+    /// `$XDG_CONFIG_HOME/deck/bookmarks.toml` at startup.
+    /// Surfaced through the cluster picker modal (`:` to open).
     pub bookmarks: crate::bookmarks::BookmarkStore,
+    /// Active cluster identity. `"local"` for the in-process
+    /// runtime the binary spawned at startup; future remote
+    /// connections will set this to the bookmark name. Today
+    /// switching to a non-`"local"` value is gated by the
+    /// substrate RPC slice — the picker surfaces a toast
+    /// rather than misleadingly succeeding.
+    pub active_cluster: String,
     /// Cursor on the DAEMON tab's lineage tree. Indices into
     /// the live group list — `j`/`k` move the cursor; the
     /// detail pane on the right reflects whichever member is
@@ -213,6 +216,14 @@ pub enum Modal {
         buffer: String,
         error: Option<String>,
     },
+    /// Cluster picker — lists `"local"` + the bookmark store's
+    /// entries. `j`/`k` to cursor, `Enter` to select. Selecting
+    /// `"local"` is a no-op (already active); selecting a
+    /// bookmark today toasts a deferred-feature notice because
+    /// the substrate RPC slice isn't landed yet.
+    ClusterPicker {
+        cursor: usize,
+    },
 }
 
 /// Internal helper enum used by `propose_node_action` to
@@ -280,6 +291,7 @@ impl App {
             blobs_search: String::new(),
             blobs_search_editing: false,
             bookmarks,
+            active_cluster: "local".to_string(),
             should_quit: false,
             started: Instant::now(),
             tick: 0,
@@ -347,6 +359,39 @@ impl App {
     /// toast — the latest action's confirmation always wins.
     pub fn set_toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    /// Cluster-picker selection: index 0 is the always-present
+    /// `"local"` entry; subsequent indices map to the sorted
+    /// bookmark list. Selecting `local` is a no-op (already
+    /// active); selecting a remote bookmark surfaces a toast
+    /// noting the substrate RPC slice is required — the
+    /// connection itself can't dial until the wire layer lands.
+    fn commit_cluster_pick(&mut self, cursor: usize) {
+        if cursor == 0 {
+            // Already on local — no-op feedback.
+            if self.active_cluster != "local" {
+                self.active_cluster = "local".to_string();
+                self.set_toast("switched to local cluster");
+            }
+            return;
+        }
+        let sorted: Vec<crate::bookmarks::Bookmark> = self
+            .bookmarks
+            .sorted()
+            .into_iter()
+            .cloned()
+            .collect();
+        let Some(bm) = sorted.get(cursor - 1) else { return };
+        // Real switch requires the substrate's deck-RPC slice
+        // (DECK_PLAN.md § Deferred work § Multi-Cluster
+        // Switcher). The picker UX exists today so operators
+        // can manage bookmarks; the dial happens when the
+        // substrate slot lands.
+        self.set_toast(format!(
+            "remote cluster '{}' — substrate RPC slice required",
+            bm.name
+        ));
     }
 
     /// Export the LOGS view to a file. Applies the same filter
@@ -463,6 +508,10 @@ impl App {
             // required.
             KeyCode::Char('?') => {
                 self.modal = Some(Modal::Help);
+            }
+            // Cluster picker — global, opens from any tab.
+            KeyCode::Char(':') => {
+                self.modal = Some(Modal::ClusterPicker { cursor: 0 });
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 self.current = self.current.next()
@@ -1039,12 +1088,27 @@ impl App {
                     *cursor = cursor.saturating_sub(1);
                 }
             }
+            // Cluster picker cursor.
+            KeyCode::Char('j') if matches!(self.modal, Some(Modal::ClusterPicker { .. })) => {
+                let n = 1 + self.bookmarks.sorted().len();
+                if let Some(Modal::ClusterPicker { cursor }) = self.modal.as_mut() {
+                    *cursor = (*cursor + 1).min(n.saturating_sub(1));
+                }
+            }
+            KeyCode::Char('k') if matches!(self.modal, Some(Modal::ClusterPicker { .. })) => {
+                if let Some(Modal::ClusterPicker { cursor }) = self.modal.as_mut() {
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let modal = self.modal.take();
                 match modal {
                     Some(Modal::Confirm(action)) => self.dispatch_confirm(action),
                     Some(Modal::PickNode { purpose, cursor }) => {
                         self.commit_pick(purpose, cursor);
+                    }
+                    Some(Modal::ClusterPicker { cursor }) => {
+                        self.commit_cluster_pick(cursor);
                     }
                     // ParamInput is intercepted earlier in this
                     // function; reaching here would be a bug.
@@ -1476,6 +1540,21 @@ impl App {
                     purpose,
                     buffer,
                     error.as_deref(),
+                );
+            }
+            Some(Modal::ClusterPicker { cursor }) => {
+                let sorted: Vec<crate::bookmarks::Bookmark> = self
+                    .bookmarks
+                    .sorted()
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                widgets::cluster_picker::render(
+                    frame,
+                    area,
+                    &sorted,
+                    &self.active_cluster,
+                    *cursor,
                 );
             }
             None => {}

@@ -33,6 +33,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled("● ", theme::green()),
         Span::styled(mode_text, theme::green_hi()),
         Span::styled("   ", theme::chrome()),
+        Span::styled("cluster:", theme::chrome()),
+        Span::styled(
+            format!("{}   ", app.active_cluster),
+            if app.active_cluster == "local" {
+                theme::green_hi()
+            } else {
+                theme::amber()
+            },
+        ),
     ];
 
     // peers: 17p ·  14H/2D/0U
