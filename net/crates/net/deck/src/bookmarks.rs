@@ -144,13 +144,26 @@ impl BookmarkStore {
     /// Add or replace a bookmark. Replacement is matched by
     /// `name` (operator-visible identity) — re-adding under the
     /// same name updates the endpoint / identity / pinned
-    /// state.
-    pub fn upsert(&mut self, bm: Bookmark) {
+    /// state. Rejects empty / whitespace-only names and empty
+    /// endpoints so an operator-edited TOML with blanks doesn't
+    /// silently create unusable bookmarks.
+    pub fn upsert(&mut self, mut bm: Bookmark) -> Result<(), BookmarkError> {
+        bm.name = bm.name.trim().to_string();
+        bm.endpoint = bm.endpoint.trim().to_string();
+        if bm.name.is_empty() {
+            return Err(BookmarkError::InvalidField("name must be non-empty".into()));
+        }
+        if bm.endpoint.is_empty() {
+            return Err(BookmarkError::InvalidField(
+                "endpoint must be non-empty".into(),
+            ));
+        }
         if let Some(slot) = self.bookmarks.iter_mut().find(|b| b.name == bm.name) {
             *slot = bm;
         } else {
             self.bookmarks.push(bm);
         }
+        Ok(())
     }
 
     /// Remove a bookmark by name. Returns `true` if a removal
@@ -245,6 +258,9 @@ pub enum BookmarkError {
     /// File version doesn't match this build's expectations.
     /// `(found, expected)`.
     Version(u32, u32),
+    /// A field on a bookmark failed validation (empty name,
+    /// empty endpoint, …).
+    InvalidField(String),
 }
 
 impl std::fmt::Display for BookmarkError {
@@ -258,6 +274,7 @@ impl std::fmt::Display for BookmarkError {
                 f,
                 "bookmark file version {found} unsupported (expected {expected})"
             ),
+            Self::InvalidField(msg) => write!(f, "bookmark invalid: {msg}"),
         }
     }
 }
@@ -290,18 +307,22 @@ mod tests {
         let dir = tempdir_unique();
         let path = dir.join("bookmarks.toml");
         let mut store = BookmarkStore::load_from(&path).expect("missing ok");
-        store.upsert(Bookmark {
-            name: "prod-east".to_string(),
-            endpoint: "mesh://0xa96f@10.0.0.7:9001".to_string(),
-            default_identity: None,
-            pinned: false,
-        });
-        store.upsert(Bookmark {
-            name: "dev-laptop".to_string(),
-            endpoint: "unix:///tmp/deck-dev.sock".to_string(),
-            default_identity: Some("~/.config/deck/identities/dev.toml".to_string()),
-            pinned: false,
-        });
+        store
+            .upsert(Bookmark {
+                name: "prod-east".to_string(),
+                endpoint: "mesh://0xa96f@10.0.0.7:9001".to_string(),
+                default_identity: None,
+                pinned: false,
+            })
+            .expect("valid bookmark");
+        store
+            .upsert(Bookmark {
+                name: "dev-laptop".to_string(),
+                endpoint: "unix:///tmp/deck-dev.sock".to_string(),
+                default_identity: Some("~/.config/deck/identities/dev.toml".to_string()),
+                pinned: false,
+            })
+            .expect("valid bookmark");
         assert_eq!(store.toggle_pin("prod-east"), Some(true));
         store.save().expect("save");
 
@@ -329,20 +350,51 @@ mod tests {
     #[test]
     fn upsert_replaces_existing_by_name() {
         let mut store = BookmarkStore::empty();
-        store.upsert(Bookmark {
-            name: "k1".to_string(),
-            endpoint: "a".to_string(),
-            ..Default::default()
-        });
-        store.upsert(Bookmark {
-            name: "k1".to_string(),
-            endpoint: "b".to_string(),
-            pinned: true,
-            ..Default::default()
-        });
+        store
+            .upsert(Bookmark {
+                name: "k1".to_string(),
+                endpoint: "a".to_string(),
+                ..Default::default()
+            })
+            .expect("valid bookmark");
+        store
+            .upsert(Bookmark {
+                name: "k1".to_string(),
+                endpoint: "b".to_string(),
+                pinned: true,
+                ..Default::default()
+            })
+            .expect("valid bookmark");
         assert_eq!(store.bookmarks().len(), 1);
         assert_eq!(store.bookmarks()[0].endpoint, "b");
         assert!(store.bookmarks()[0].pinned);
+    }
+
+    #[test]
+    fn upsert_rejects_empty_name() {
+        let mut store = BookmarkStore::empty();
+        let err = store
+            .upsert(Bookmark {
+                name: "  ".to_string(),
+                endpoint: "mesh://example".to_string(),
+                ..Default::default()
+            })
+            .expect_err("whitespace-only name must be rejected");
+        assert!(matches!(err, BookmarkError::InvalidField(_)));
+        assert!(store.bookmarks().is_empty());
+    }
+
+    #[test]
+    fn upsert_rejects_empty_endpoint() {
+        let mut store = BookmarkStore::empty();
+        let err = store
+            .upsert(Bookmark {
+                name: "named".to_string(),
+                endpoint: "".to_string(),
+                ..Default::default()
+            })
+            .expect_err("empty endpoint must be rejected");
+        assert!(matches!(err, BookmarkError::InvalidField(_)));
     }
 
     #[test]
