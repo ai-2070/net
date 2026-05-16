@@ -314,37 +314,35 @@ fn project_log_records(
     out
 }
 
-/// ASCII case-insensitive substring match. `needle` must
-/// already be lowercased by the caller — we lowercase the
-/// haystack here. Non-ASCII bytes pass through verbatim which
-/// is fine for the operator-facing log messages we render.
-fn matches_ci(haystack: &str, needle_lower: &str) -> bool {
-    if needle_lower.is_empty() {
-        return true;
-    }
-    haystack.to_ascii_lowercase().contains(needle_lower)
-}
-
 /// Match a log record against the search needle. Covers the
 /// message column plus the structured `daemon_id` / `node_id`
 /// fields rendered as `0x…` so operators can grep by daemon
 /// hex directly — even when the message text doesn't repeat
 /// the id (e.g. an auto-generated daemon log emitted via
 /// `publish_log` without echoing the id into the message).
+/// Allocation-free — reuses `audit::ascii_icontains` so the
+/// per-render filter doesn't lowercase the haystack into a
+/// fresh `String` for every record × every frame.
 pub(crate) fn record_matches(rec: &LogRecord, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
     }
-    if matches_ci(&rec.message, needle_lower) {
+    if super::audit::ascii_icontains(&rec.message, needle_lower) {
         return true;
     }
+    use std::fmt::Write;
+    let mut buf = String::with_capacity(18);
     if let Some(d) = rec.daemon_id {
-        if format!("0x{d:x}").contains(needle_lower) {
+        buf.clear();
+        let _ = write!(&mut buf, "0x{d:x}");
+        if super::audit::ascii_icontains(&buf, needle_lower) {
             return true;
         }
     }
     if let Some(n) = rec.node_id {
-        if format!("0x{n:x}").contains(needle_lower) {
+        buf.clear();
+        let _ = write!(&mut buf, "0x{n:x}");
+        if super::audit::ascii_icontains(&buf, needle_lower) {
             return true;
         }
     }
