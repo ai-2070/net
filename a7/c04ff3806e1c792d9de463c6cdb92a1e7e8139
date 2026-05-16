@@ -1,0 +1,19 @@
+net/crates/net/deck/src/tabs/dataforts.rs
+  s_46edf7dc333ef6::t_4374e4f3abaca0 713-716,718-719
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "a7c04ff3806e1c792d9de463c6cdb92a1e7e8139",
+  "prompts": {},
+  "sessions": {
+    "s_46edf7dc333ef6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e145bb62-38ea-4dbe-81cd-e36e7e65c2ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
