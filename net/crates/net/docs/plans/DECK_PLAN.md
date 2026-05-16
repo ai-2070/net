@@ -15,9 +15,11 @@ Activation gate: an SRE workload that wants to operate a running cluster from a 
 
 **Substrate gaps this plan introduces:**
 
-- **No public Dataforts read surface for Deck.** Feature 6 (Blob & Artifact Explorer) needs `chain metadata`, `blob movement history`, `heat level`, `access frequency`, `anti-entropy cycles`, `artifact ancestry`. The Deck SDK doesn't surface those today — they live behind the Dataforts adapter. Two paths: (a) extend the Deck SDK with a `dataforts()` accessor that re-exports the existing types, (b) compose against the substrate-internal Dataforts types directly from the binary. This plan pins (a) as the slice that unblocks Feature 6.
-- **No per-node cluster inventory surface.** Feature 11 (Node Inventory) needs CPU / mem / disk / saturation trend / capability set / fork-of ancestry / software version. The snapshot's `peers: BTreeMap<NodeId, PeerSnapshot>` has health + locality but not the resource axes. This plan extends the substrate-side `PeerSnapshot` (a strict addition, default-able) when Feature 11 lands.
-- **No persistent cluster bookmark store.** Feature 12 (Multi-Cluster Switcher) needs disk-backed "known meshes" with optional pin-per-tab semantics. Out of scope for the SDK — the binary owns the bookmark store on disk.
+- **Dataforts read surface (aggregate).** *Resolved.* `net_sdk::dataforts::*` ships `BlobMetrics{,Snapshot}` + overflow + health-gate; the DATAFORTS tab consumes them.
+- **Dataforts browse surface (per-blob inventory + movement + ancestry).** *Substrate-blocked.* Feature 6 (Blob & Artifact Explorer) needs `BlobAdapter::list` / `stat` / `history` semantics the substrate doesn't expose. Design pinned in [Deferred work § Blob & Artifact Explorer](#blob--artifact-explorer-feature-6).
+- **No remote `DeckClient`.** *Substrate-blocked.* Feature 12 (Multi-Cluster Switcher) needs a `DeckClient::connect(endpoint, identity)` constructor backed by a `SUBPROTOCOL_DECK_RPC` server on the substrate. Design pinned in [Deferred work § Multi-Cluster Switcher](#multi-cluster-switcher-feature-12).
+- **No per-node cluster inventory surface.** *Substrate-blocked.* Feature 11 (Node Inventory) needs CPU / mem / disk / saturation trend / capability set / fork-of ancestry / software version axes on `PeerSnapshot`. Design pinned in [Deferred work § `PeerSnapshot` inventory axes](#peersnapshot-inventory-axes-feature-11-prereq).
+- **No persistent cluster bookmark store.** Deck-side, *not substrate-blocked*. Disk format locked in [§4 #10](#4-locked-decisions); ships alongside the Multi-Cluster slice. See [Deferred work § Persistent cluster bookmark store](#persistent-cluster-bookmark-store).
 
 ## Frame
 
@@ -227,8 +229,103 @@ Following the SDK plans' precedent:
 
 - **Keymap conflicts.** tmux + vim share `Ctrl-b` for different semantics; the default `Ctrl-b` for tab navigation will surprise tmux power-users. Likely resolution: surface a `--no-tmux` mode that swaps `Ctrl-b` for `Ctrl-w`-style navigation. Decision deferred to Phase 1's UX validation.
 - **Wide-terminal rendering of the topology map.** ratatui's canvas widget renders well on terminals ≥ 120 columns; narrower terminals collapse the map to a list view. The exact breakpoint (and the list-view shape) ships with Phase 2.
-- **Operator-identity multiplexing.** Default is one identity per session; the disk format already supports a `[identities.<name>]` table for future "switch identity mid-session" workflows (e.g. paging-in a co-operator without restarting the binary). Phase 5 (ICE) is where this becomes load-bearing; the slice that lands the multi-signature collection determines whether the binary holds multiple identities live or shells out to a co-operator's instance.
+- **Operator-identity multiplexing.** Default is one identity per session; the disk format already supports a `[identities.<name>]` table for future "switch identity mid-session" workflows (e.g. paging-in a co-operator without restarting the binary). Moot while cross-deck co-signing is indefinitely deferred per [`DECK_SDK_PLAN.md`](DECK_SDK_PLAN.md#cross-deck-co-signing-workflow).
 
 ---
 
-*Atomic Playboys (post-`DECK_SDK_PLAN.md`) release candidate. Gates on a real cluster operator workload — drain a node, observe the migration progress, ICE-force-evict a wedged replica, scroll the audit ring. The substrate + SDK are in code; this plan turns the features list into the smallest sequence of phases that lets an operator actually run a cluster from a terminal.*
+## Deferred work
+
+Phase 6 is the long tail (Features 6 / 8 / 12). All three slices are blocked by substrate gaps the SDK can't paper over; each section below pins the design surface so a future contributor doesn't have to re-derive it. Status terminology mirrors [`DECK_SDK_PLAN.md`](DECK_SDK_PLAN.md): **substrate-blocked** means the slice can't start until a named substrate addition lands; **indefinitely deferred** means no near-term roadmap item drives it. The MeshDB Console (Feature 8) lives in the same bucket — the SDK surface ships at `net_sdk::meshdb::*` (Phase 6 prereq) but Phase A is "AST + planner skeleton pending a consumer" per `MESHDB_PLAN.md`.
+
+### Blob & Artifact Explorer (Feature 6)
+
+Status: **substrate-blocked**. The SDK exposes the dataforts *read* surface (`net_sdk::dataforts::BlobMetrics{,Snapshot}` + overflow + health-gate), which powers the DATAFORTS tab today. What the Blob & Artifact Explorer needs is the *browse* surface: per-blob inventory, movement history, heat / access frequency, anti-entropy cycles, artifact ancestry. None of those land through `BlobMetrics` because metrics are aggregates over the adapter, not per-blob facts. The substrate's `BlobAdapter` trait + `MeshBlobAdapter` implementation focus on `store` / `fetch` / `pull` semantics; there's no `list(prefix)` / `stat(blob_ref)` / `history(blob_ref)` surface.
+
+Substrate additions when the slice activates:
+
+- **`BlobAdapter::list(opts: BlobListOptions) -> impl Stream<Item = BlobStat>`.** Paginated enumeration of stored blobs. `BlobListOptions` carries an optional adapter-id filter, a prefix on the `BlobRef::Manifest` digest space, an optional `since: Option<u64>` watermark (stream items with `seq > since` for incremental sync), and a `limit` cap. Returns a stream so a 100k-blob adapter doesn't materialize the full set on every call.
+- **`BlobStat` shape (snapshot type, `Serialize + Deserialize`):** `blob_ref: BlobRef`, `size_bytes: u64`, `stored_at_ms: u64`, `last_accessed_ms: Option<u64>`, `heat: f64` (from the existing `HeatRegistry` snapshot), `refcount: u64`, `replicas: u32`, `host_adapters: Vec<AdapterId>`. The fields map 1:1 to operator-facing columns in the explorer; no synthesis is left to the binary.
+- **`BlobAdapter::history(blob_ref) -> Vec<BlobMovementRecord>`** for movement / pull / overflow events on a single blob. Backed by appending to a per-blob movement log inside the existing `dataforts.blob` chain; today the substrate emits the records to logs (`publish_log`) but doesn't index them. The deck surface would read the indexed view, not grep logs.
+- **Per-blob lineage via `BlobRef::Manifest`.** Manifests already carry sibling-chunk ancestry; surfacing it is mostly a re-projection. `ManifestSiblings` is already public in `net::adapter::net::dataforts::blob`; the SDK would re-export it.
+
+SDK extensions when the substrate lands:
+
+- Re-export `BlobStat`, `BlobListOptions`, `BlobMovementRecord`, `ManifestSiblings` under `net_sdk::dataforts::*`.
+- Add `DeckClient::blob_adapters() -> Vec<AdapterId>` and `DeckClient::blob_adapter(id) -> Option<BlobAdapterHandle>` returning a typed handle whose `list()` / `stat()` / `history()` delegate to the substrate methods.
+
+Deck binary surface when the SDK delta lands:
+
+- **BLOBS tab** — table over `BlobStat` with cursor + `[/]` substring search over blob_ref + adapter columns. `[Enter]` on a row opens a detail panel showing `history(blob_ref)` (newest-first) + sibling-chunk ancestry from the manifest. Reuses the existing tail / cursor / `M/N` chip patterns; no new modal shape required.
+- **Cross-link from DATAFORTS** — `[B]` on the DATAFORTS tab jumps to BLOBS filtered to the currently-selected adapter. Mirrors the cross-tab idiom from LOGS daemon-pin (`L` from DAEMON).
+
+What this section does *not* cover: write operations on blobs (the deck stays read-only on the dataforts surface), blob-content viewing (the deck shows metadata, not bytes; operators read content through the SDK), and GC / retention controls (those ride the existing admin commit chain via the SDK's `admin()` once exposed).
+
+### Multi-Cluster Switcher (Feature 12)
+
+Status: **substrate-blocked**. The current `DeckClient::from_runtime(&MeshOsRuntime, identity)` constructor binds the client to an in-process runtime; there's no remote constructor backed by an RPC protocol. The deck binary spawns its own substrate locally because that's the only path the SDK offers. Multi-cluster needs a wire transport that mirrors the methods deck calls on a `MeshOsHandle` — snapshot reads, admin commits, log / failure / audit stream subscriptions.
+
+Substrate additions when the slice activates:
+
+- **`SUBPROTOCOL_DECK_RPC` slot** + a request / response envelope mirroring the cortex-RPC dispatch pattern at `behavior::cortex::rpc`. Request set covers: `Status` (snapshot read), `CommitAdmin(SignedAdminEvent)`, `CommitIceProposal(SignedIceCommit)`, `Simulate(IceActionProposal, issued_at_ms)`, `SubscribeLogs(LogFilter, since_seq)`, `SubscribeFailures(since_seq)`, `SubscribeAudit(AuditFilter, since_seq)`, `AuditQuery(AuditQuery)`. Streaming responses ride the existing chunked-response framing the cortex RPC dispatcher already uses; the substrate gains a `MeshOsRpcServer` analogous to `MeshOsRpcClient`.
+- **Wire authentication.** The remote DeckClient signs every request with the operator identity it would have signed with locally; the substrate-side server verifies via the existing channel-auth guard before dispatching. Same trust boundary as in-process — the operator key is the auth token, the network is just transport.
+- **Reconnection semantics.** Streams resume from `last_seen_seq` so a brief network blip doesn't reset the operator's scrollback. Same seq-watermark dedup the in-process streams use.
+
+SDK extensions when the substrate lands:
+
+- **`DeckClient::connect(endpoint: ConnectionString, identity: OperatorIdentity) -> Result<DeckClient, DeckError>`** — async constructor over an `RpcTransport` (mesh-internal). The returned client has the same surface as the in-process client; consumers can't tell the difference. Method bodies that today read `self.snapshot_reader` instead dispatch RPCs to the remote substrate.
+- **`ConnectionString` shape:** `mesh://<node-id>@<endpoint>` for direct mesh dial, or `unix://<path>` for local socket testing. Parser lives in `net_sdk::deck::connection`. Discovery is out of scope; the operator supplies a known endpoint via the bookmark store.
+- **`StreamingTransport` trait** abstracting the mesh RPC vs the in-process direct-read path. The existing in-process `DeckClient` keeps working unchanged; `DeckClient::connect` returns one backed by the streaming transport.
+
+Deck binary surface when the SDK delta lands:
+
+- **Bookmark store at `$XDG_CONFIG_HOME/deck/bookmarks.toml`** (deck-only — no substrate dependency, *not* substrate-blocked).
+  - Format: `[[cluster]]` table per known mesh with `name`, `endpoint`, `default_identity` (path under `~/.config/deck/identities/`).
+  - Read at startup; written on add / remove / pin via in-app commands.
+  - Disk footprint capped at 10 MiB total per [Locked decision #10](#4-locked-decisions); each cluster entry is a few hundred bytes.
+- **Tab strip becomes cluster-aware.** Today the tabs are *views over one cluster*; multi-cluster makes each tab hold an `Arc<DeckClient>` + the current view enum. The view-switch is `1`-`9` (existing); the cluster-switch is a new modal opened by `:` or `Ctrl-k` that surfaces the bookmark list.
+- **Per-cluster scrollback cache** at `$XDG_CACHE_HOME/deck/<cluster-id>/{logs,audit,failures}.bin`. Bounded ring (10 MiB cap); survives reconnects. Eviction is age-driven.
+- **Status bar gains a cluster chip** — current cluster name + connection state (live / reconnecting / disconnected). The chip swaps to red on disconnect; the active view freezes at the last good snapshot until the stream resumes.
+
+What this section does *not* cover: cluster discovery (operators supply endpoints by hand), federated queries across clusters (each tab is one cluster), and cross-cluster ICE commits (the SDK's ICE surface is per-`DeckClient`; firing ICE in one cluster doesn't ripple to another by design).
+
+### `PeerSnapshot` inventory axes (Feature 11 prereq)
+
+Status: **substrate-blocked**. The current `PeerSnapshot` carries `health: Option<PeerHealthSnapshot>`, `locality`, `rtt_ms`, and the maintenance mirror state. Feature 11 (Node Inventory) calls for resource axes the substrate doesn't expose:
+
+- `cpu_load_1m: Option<f64>` — load average over the last minute. `None` when the host doesn't sample it (e.g. lightweight containers without procfs).
+- `mem_used_bytes: Option<u64>` + `mem_total_bytes: Option<u64>` — point-in-time memory pressure.
+- `disk_used_bytes: Option<u64>` + `disk_total_bytes: Option<u64>` — host disk; distinct from the dataforts blob-adapter disk surfaced today.
+- `saturation_trend: Option<f32>` — a `0.0..=1.0` rolling score the substrate already could compute from existing health probes; `None` when no probe drives it.
+- `capability_set: BTreeSet<CapabilityLabel>` — the capabilities the peer advertises. Reuses the existing `capability_index` projection.
+- `software_version: Option<String>` — semver of the substrate binary the peer is running. Helps operators spot version drift during rolling deploys.
+- `forked_from: Option<NodeId>` — for fork-group peers, the origin node. Already in the fork-group state machine; needs surfacing.
+
+Substrate additions when the slice activates:
+
+- Extend `PeerSnapshot` with the fields above. All `Option`-wrapped or default-able (`BTreeSet::new()`) so the addition is non-breaking for existing snapshot consumers.
+- Wire population from the existing `HealthProbe` / `LocalityProbe` / `capability_index` surfaces. New probe types (e.g. `ResourceProbe`) for the host-resource axes; substrate ships a `Default::default()` impl that leaves everything `None` so operators can opt into resource sampling per-deployment.
+- Serde-compatibility test: postcard-round-trip a snapshot built by the pre-extension version against a consumer compiled with the new fields. Old consumers see the new fields as ignored; new consumers see missing fields as `None`.
+
+SDK extensions when the substrate lands:
+
+- Re-export the new types (`CapabilityLabel` already public; `ResourceProbe` trait + impls if introduced).
+- No `DeckClient` API change — the snapshot grows fields in place.
+
+Deck binary surface when the SDK delta lands:
+
+- **NODE.INV tab** (or extension of the existing LIST tab's lower row) — table over `peers` with CPU / mem / disk / saturation / capability count columns + cursor. `[Enter]` opens a detail panel with the full capability set + software version + fork-of ancestry.
+- **Status-bar aggregate** — the LIVE chip gains a `(N drift, M overloaded)` suffix when one or more peers report a non-matching software version or `saturation_trend > 0.8`.
+
+### Persistent cluster bookmark store
+
+Status: **deck-only — not substrate-blocked**. Ships with the Multi-Cluster slice but is logically independent: the bookmark store is just a TOML file the binary reads at startup and writes on operator action. The remote-DeckClient piece is what blocks multi-cluster; the bookmark store is a precursor that could ship standalone with placeholder UX (list + add + remove against in-process clusters only) the day Multi-Cluster activates. No design block here — the format is locked in [§4 #10](#4-locked-decisions) and the disk paths are pinned in [§ Interaction surfaces](#interaction-surfaces).
+
+### Things explicitly not deferred to this section
+
+- The DATAFORTS read surface (Phase 2's blob-adapter aggregate view) — already lives at `net_sdk::dataforts::*` and the DATAFORTS tab consumes it.
+- The MeshDB AST surface — already re-exported at `net_sdk::meshdb::*`. Tenant tooling can compose MeshDB queries today; the deck-side console waits on a working `ChainReader` over the MeshOS chain (substrate work tracked in `MESHDB_PLAN.md`).
+- The in-process `DeckClient` — unchanged; everything in this plan extends it rather than replacing it.
+
+---
+
+*Atomic Playboys (post-`DECK_SDK_PLAN.md`) release candidate. Gates on a real cluster operator workload — drain a node, observe the migration progress, ICE-force-evict a wedged replica, scroll the audit ring. The substrate + SDK are in code; this plan turns the features list into the smallest sequence of phases that lets an operator actually run a cluster from a terminal. Phases 1–5 ship; Phase 6 + Feature 11 are substrate-blocked per the [Deferred work](#deferred-work) section.*
