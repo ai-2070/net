@@ -44,6 +44,8 @@ pub mod deck;
 #[cfg(feature = "dataforts")]
 pub mod dataforts;
 pub mod error;
+#[cfg(feature = "meshdb")]
+pub mod meshdb;
 #[cfg(feature = "groups")]
 pub mod groups;
 #[cfg(feature = "net")]

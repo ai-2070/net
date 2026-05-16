@@ -97,6 +97,14 @@ deck = ["meshos"]
 # instead of a fixture. Pulls in redex + redex-disk + blake3
 # transitively via `net/dataforts`.
 dataforts = ["net/dataforts"]
+# MeshDB — federated query plane above the substrate's chains.
+# Re-exports the typed `MeshQuery` AST + `MeshQueryExecutor`
+# + `ChainReader` so tenant tooling (and future Deck MeshDB
+# Console) can compose queries without reaching through
+# internal substrate paths. The substrate gates MeshDB on its
+# own `meshdb` feature (Phase A of `MESHDB_PLAN.md`); this
+# flag composes against it.
+meshdb = ["net/meshdb"]
 # Everything that runs locally (mesh + storage/state + security +
 # compute + groups, no external transports). The default shape for
 # a single-node or LAN-only deployment.
