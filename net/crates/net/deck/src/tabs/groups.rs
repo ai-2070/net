@@ -296,7 +296,7 @@ fn resolve_placement_view(
     snapshot: Option<&MeshOsSnapshot>,
     local_node: &NodeCardView,
 ) -> NodeCardView {
-    if daemon.placement == 0x0001 {
+    if daemon.placement == local_node.id {
         return local_node.clone();
     }
     let Some(snap) = snapshot else {

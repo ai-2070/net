@@ -137,6 +137,13 @@ pub struct App {
     /// substrate RPC slice — the picker surfaces a toast
     /// rather than misleadingly succeeding.
     pub active_cluster: String,
+    /// The substrate runtime's local node id, plumbed from the
+    /// harness at startup. Used everywhere the UI synthesizes
+    /// or attributes per-node state to "this node"
+    /// (placement-based pivots, admin commits, local-datafort
+    /// node card) so the deck never hardcodes a literal that
+    /// can drift from the actual `MeshOsConfig::this_node`.
+    pub this_node: net_sdk::meshos::NodeId,
     /// Cursor on the GROUPS tab's lineage tree. Indices into
     /// the live group list — `j`/`k` move the cursor; the
     /// detail pane on the right reflects whichever member is
@@ -266,7 +273,9 @@ pub enum Modal {
         /// Node hosting this blob. Threaded in so the modal can
         /// label the holder and `[Enter]` can jump straight to
         /// the NODE page for it. Always the local datafort
-        /// (`0x0001`) today — BLOBS sources from local adapters.
+        /// (`App::this_node`) today — BLOBS sources from local
+        /// adapters; cross-node attribution lands with the
+        /// remote inventory probe.
         host_id: u64,
         host_label: Option<String>,
     },
@@ -404,6 +413,7 @@ impl App {
         blob_adapters: Vec<Arc<net_sdk::dataforts::MeshBlobAdapter>>,
         blobs_tail: crate::streams::BlobsTail,
         bookmarks: crate::bookmarks::BookmarkStore,
+        this_node: net_sdk::meshos::NodeId,
     ) -> Self {
         let snapshot = Arc::new(deck.status());
         Self {
@@ -419,6 +429,7 @@ impl App {
             blobs_search_editing: false,
             bookmarks,
             active_cluster: "local".to_string(),
+            this_node,
             should_quit: false,
             started: Instant::now(),
             tick: 0,
@@ -496,7 +507,7 @@ impl App {
     /// lookup in `crate::nodes::label_for`: fixture first, then
     /// scoped caps, then first plain cap. Falls back to the
     /// fixture-only `label_of` when the peer isn't in the
-    /// snapshot (e.g. the local node `0x0001`).
+    /// snapshot (e.g. the local node `App::this_node`).
     pub fn node_label(&self, id: u64) -> Option<String> {
         let id_hex = format!("0x{id:x}");
         if let Some(peer) = self.snapshot.peers.get(&id) {
@@ -677,7 +688,7 @@ impl App {
         // dispatcher (which checks daemon_focus first) doesn't
         // keep showing the old page over the new one.
         self.daemon_focus = None;
-        if host_id == 0x0001 {
+        if host_id == self.this_node {
             // Synthesize a PeerSnapshot for the local node (same
             // as `focus_datafort` for the local datafort).
             let local = self.local_datafort();
@@ -718,13 +729,13 @@ impl App {
 
     /// Snapshot of the deck's local node as a `NodeCardView`.
     /// Used by the DAEMONS detail panel when the cursored
-    /// daemon's placement is the local node (`0x0001`) — that id
-    /// isn't in `snapshot.peers`, so we synthesize it here from
-    /// the same data the DATAFORTS local row reads.
+    /// daemon's placement is the local node — that id isn't in
+    /// `snapshot.peers`, so we synthesize it here from the same
+    /// data the DATAFORTS local row reads.
     fn local_node_card(&self) -> crate::widgets::node_card::NodeCardView {
         let local = self.local_datafort();
         crate::widgets::node_card::NodeCardView {
-            id: 0x0001,
+            id: self.this_node,
             label: Some("local".to_string()),
             is_local: true,
             health: Some("Healthy"),
@@ -742,8 +753,7 @@ impl App {
     /// remote dataforts surface only the aggregate disk + the
     /// `dataforts.*` cap tags (no remote-adapter probe today).
     fn datafort_view_for(&self, node_id: u64) -> tabs::node_page::DatafortView {
-        // Local id matches the demo runtime's `this_node`.
-        if node_id == 0x0001 {
+        if node_id == self.this_node {
             let adapters: Vec<tabs::node_page::DatafortAdapterRow> = self
                 .blob_adapters
                 .iter()
@@ -941,7 +951,7 @@ impl App {
             capabilities.push("dataforts.blob.overflow".to_string());
         }
         tabs::dataforts::DatafortEntry {
-            id: 0x0001,
+            id: self.this_node,
             label: Some("local".to_string()),
             is_local: true,
             health: Some("Healthy"),
@@ -982,7 +992,7 @@ impl App {
             // adapter probes land, populate this from the entry.
             self.modal = Some(Modal::BlobDetail {
                 entry: entry.clone(),
-                host_id: 0x0001,
+                host_id: self.this_node,
                 host_label: Some("local".to_string()),
             });
         }
@@ -2034,10 +2044,9 @@ impl App {
     /// Clamp the picker cursor against the candidate set the
     /// current `PickNodePurpose` would offer.
     fn clamp_pick_cursor(&mut self) {
-        let this_node = 0x0001; // matches the demo runtime
         let n = match self.modal.as_ref() {
             Some(Modal::PickNode { purpose, .. }) => {
-                purpose.candidates(&self.snapshot, this_node).len()
+                purpose.candidates(&self.snapshot, self.this_node).len()
             }
             _ => return,
         };
@@ -2055,8 +2064,7 @@ impl App {
     /// into the appropriate ICE action variant.
     fn commit_pick(&mut self, purpose: crate::widgets::pick_node::PickNodePurpose, cursor: usize) {
         use net_sdk::deck::{simulate_ice_proposal, IceActionProposal};
-        let this_node = 0x0001;
-        let candidates = purpose.candidates(&self.snapshot, this_node);
+        let candidates = purpose.candidates(&self.snapshot, self.this_node);
         let Some(picked) = candidates.get(cursor).copied() else {
             return;
         };
@@ -2426,13 +2434,12 @@ impl App {
             Some(Modal::Confirm(action)) => widgets::confirm::render(frame, area, action),
             Some(Modal::Help) => widgets::help::render(frame, area),
             Some(Modal::PickNode { purpose, cursor }) => {
-                let this_node = 0x0001;
                 widgets::pick_node::render(
                     frame,
                     area,
                     purpose,
                     &self.snapshot,
-                    this_node,
+                    self.this_node,
                     *cursor,
                 );
             }

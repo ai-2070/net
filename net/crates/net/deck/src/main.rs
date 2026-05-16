@@ -78,6 +78,7 @@ async fn main() -> color_eyre::Result<()> {
         bookmarks::BookmarkStore::empty()
     });
 
+    let this_node = harness.this_node();
     let terminal = ratatui::init();
     let result = App::new(
         deck,
@@ -87,6 +88,7 @@ async fn main() -> color_eyre::Result<()> {
         blob_adapters,
         blobs_tail,
         bookmarks,
+        this_node,
     )
     .run(terminal);
     ratatui::restore();

@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use net_sdk::dataforts::MeshBlobAdapter;
 use net_sdk::deck::{AdminVerifier, DeckClient, OperatorIdentity, OperatorRegistry};
-use net_sdk::meshos::{EntityKeypair, MeshOsConfig, MeshOsDaemonSdk, MigrationSnapshotSource};
+use net_sdk::meshos::{
+    EntityKeypair, MeshOsConfig, MeshOsDaemonSdk, MigrationSnapshotSource, NodeId,
+};
 
 /// Handle returned by [`spawn`]. Hold for the app lifetime;
 /// dropping it tears the runtime down.
@@ -39,6 +41,11 @@ pub struct Harness {
     /// registers their own. BLOBS reads from whichever adapter
     /// the operator cursors on the DATAFORTS list.
     blob_adapters: Vec<Arc<MeshBlobAdapter>>,
+    /// The `this_node` id the substrate runtime was configured
+    /// with. The App uses it for placement-based pivots and
+    /// admin commits without hardcoding a literal that drifts
+    /// from the runtime config.
+    this_node: NodeId,
 }
 
 impl Harness {
@@ -53,6 +60,12 @@ impl Harness {
     pub fn blob_adapters(&self) -> Vec<Arc<MeshBlobAdapter>> {
         self.blob_adapters.clone()
     }
+
+    /// The runtime's local node id. Plumbed into `App::new`
+    /// so the UI never hardcodes a node-id literal.
+    pub fn this_node(&self) -> NodeId {
+        self.this_node
+    }
 }
 
 /// Spawn the in-process runtime. With the `samples` feature
@@ -66,6 +79,7 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     let mut cfg = MeshOsConfig::default();
     cfg.this_node = 0x0001;
     cfg.tick_interval = Duration::from_millis(250);
+    let this_node = cfg.this_node;
     let dispatcher = Arc::new(net_sdk::meshos::LoggingDispatcher::new());
 
     // Single operator keypair used for both:
@@ -118,6 +132,7 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
         _daemons,
         deck,
         blob_adapters,
+        this_node,
     })
 }
 
