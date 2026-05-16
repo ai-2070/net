@@ -970,7 +970,13 @@ mod nrpc_seeder {
             ticker.tick().await;
             let (method, req_bytes, resp_bytes, base_latency) =
                 METHODS[i % METHODS.len()];
-            let (caller, callee) = CALL_PAIRS[i % CALL_PAIRS.len()];
+            // Decouple the call-pair index from the method
+            // index so (caller, callee, method) cycles over
+            // METHODS.len() × CALL_PAIRS.len() distinct triples
+            // instead of locking in lockstep at the GCD. Without
+            // this the same tuple recurred every 16 ticks; with
+            // it the cycle is 256.
+            let (caller, callee) = CALL_PAIRS[(i / METHODS.len()) % CALL_PAIRS.len()];
             // Deterministic-but-varied jitter so latencies don't
             // read as identical across rows. Pseudo-random via
             // index arithmetic (no rand crate dependency).
