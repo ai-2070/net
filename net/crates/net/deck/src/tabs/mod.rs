@@ -1,11 +1,12 @@
 pub mod audit;
 pub mod blobs;
+pub mod daemons;
 pub mod dataforts;
-pub mod daemon;
 pub mod failures;
-pub mod list_view;
+pub mod groups;
 pub mod logs;
 pub mod migrations;
 pub mod net_map;
 pub mod node_page;
+pub mod nodes;
 pub mod replicas;

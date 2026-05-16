@@ -1,12 +1,16 @@
-use net_sdk::deck::{DaemonHealthSnapshot, DaemonLifecycleSnapshot, MeshOsSnapshot};
+//! NODES tab — full-height table of every peer in the cluster.
+//! Used to share its area with a DAEMONS panel; the daemons
+//! surface now lives on its own tab so this view is nodes-only.
+
+use net_sdk::deck::MeshOsSnapshot;
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Rect},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Row, Table},
     Frame,
 };
 
-use crate::{lineage, nodes, theme, widgets};
+use crate::{nodes, theme, widgets};
 
 pub fn render(
     frame: &mut Frame<'_>,
@@ -14,23 +18,13 @@ pub fn render(
     snapshot: Option<&MeshOsSnapshot>,
     cursor: usize,
 ) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(area);
-
     match snapshot {
-        Some(s) if !s.peers.is_empty() => render_live_nodes_table(frame, rows[0], s, cursor),
-        _ => render_empty_nodes_table(frame, rows[0]),
-    }
-
-    match snapshot {
-        Some(s) if !s.daemons.is_empty() => render_live_daemons_table(frame, rows[1], s),
-        _ => render_empty_daemons_table(frame, rows[1]),
+        Some(s) if !s.peers.is_empty() => render_live_nodes_table(frame, area, s, cursor),
+        _ => render_empty_nodes_table(frame, area),
     }
 }
 
-// ───────────────────────── empty-state panels ─────────────────────────
+// ───────────────────────── empty-state panel ─────────────────────────
 
 fn render_empty_nodes_table(frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default()
@@ -48,25 +42,6 @@ fn render_empty_nodes_table(frame: &mut Frame<'_>, area: Rect) {
         inner,
         "no peers reported yet",
         "wire a proximity / health probe",
-    );
-}
-
-fn render_empty_daemons_table(frame: &mut Frame<'_>, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::rule())
-        .title(Line::from(vec![
-            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-            Span::styled("DAEMONS", theme::green_hi()),
-            Span::styled("    0 registered", theme::chrome()),
-        ]));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    widgets::empty::render(
-        frame,
-        inner,
-        "no daemons registered yet",
-        "register via the MeshOsDaemonSdk",
     );
 }
 
@@ -240,114 +215,6 @@ fn render_live_nodes_table(
     .block(block)
     .column_spacing(2);
     frame.render_widget(table, area);
-}
-
-// ───────────────────────── live render: daemons ─────────────────────────
-
-fn render_live_daemons_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot) {
-    let groups = lineage::group_daemons(&snapshot.daemons);
-    let total: usize = groups.iter().map(|g| g.members.len()).sum();
-    let header_line = Line::from(vec![
-        Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-        Span::styled("DAEMONS", theme::green_hi()),
-        Span::styled(
-            format!("   {total} live · {} groups", groups.len()),
-            theme::chrome(),
-        ),
-    ]);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::rule())
-        .title(header_line)
-        .title_alignment(Alignment::Left);
-
-    let header = Row::new(vec![
-        cell_dim("DAEMON"),
-        cell_dim("KIND"),
-        cell_dim("LINEAGE"),
-        cell_dim("NODE"),
-        cell_dim("LIFE"),
-        cell_dim("HEALTH"),
-        cell_dim("SAT"),
-        cell_dim("AGE"),
-    ])
-    .height(1);
-
-    let mut table_rows: Vec<Row> = Vec::with_capacity(total);
-    for group in &groups {
-        for m in &group.members {
-            let d = m.daemon;
-            let tag = lineage::lineage_tag(m.role, group.kind);
-            let lineage_style = match group.kind {
-                lineage::GroupKind::Solo => theme::dim(),
-                lineage::GroupKind::Replica => theme::green_hi(),
-                lineage::GroupKind::Fork { .. } => theme::amber(),
-                lineage::GroupKind::Standby => theme::cyan(),
-            };
-            let life_style = match d.lifecycle {
-                DaemonLifecycleSnapshot::Running => theme::green(),
-                DaemonLifecycleSnapshot::Starting | DaemonLifecycleSnapshot::Stopping => {
-                    theme::amber()
-                }
-                DaemonLifecycleSnapshot::Stopped => theme::dim(),
-                _ => theme::dim(),
-            };
-            let (health_style, health_text) = match d.health {
-                Some(DaemonHealthSnapshot::Healthy) => (theme::green(), "Healthy"),
-                Some(DaemonHealthSnapshot::Degraded { .. }) => (theme::amber(), "Degraded"),
-                Some(DaemonHealthSnapshot::Unhealthy) => (theme::red(), "Unhealthy"),
-                _ => (theme::chrome(), "—"),
-            };
-            let life_text = match d.lifecycle {
-                DaemonLifecycleSnapshot::Running => "Running",
-                DaemonLifecycleSnapshot::Starting => "Starting",
-                DaemonLifecycleSnapshot::Stopping => "Stopping",
-                DaemonLifecycleSnapshot::Stopped => "Stopped",
-                _ => "?",
-            };
-            table_rows.push(Row::new(vec![
-                Cell::from(Span::styled(format!("0x{:x}", m.id), theme::text())),
-                Cell::from(Span::styled(group.display_name.clone(), theme::cyan())),
-                Cell::from(Span::styled(tag, lineage_style)),
-                Cell::from(Line::from(nodes::id_spans(&format!("0x{:x}", d.placement)))),
-                Cell::from(Span::styled(life_text, life_style)),
-                Cell::from(Span::styled(health_text, health_style)),
-                Cell::from(Span::styled(format!("{:.2}", d.saturation), theme::text())),
-                Cell::from(Span::styled(format_age(d.age_ms), theme::dim())),
-            ]));
-        }
-    }
-
-    let table = Table::new(
-        table_rows,
-        [
-            Constraint::Length(10), // DAEMON
-            Constraint::Length(12), // KIND
-            Constraint::Length(14), // LINEAGE
-            Constraint::Length(18), // NODE: id.label
-            Constraint::Length(9),  // LIFE
-            Constraint::Length(10), // HEALTH
-            Constraint::Length(6),  // SAT
-            Constraint::Length(9),  // AGE
-        ],
-    )
-    .header(header)
-    .block(block)
-    .column_spacing(2);
-    frame.render_widget(table, area);
-}
-
-fn format_age(ms: u64) -> String {
-    let s = ms / 1_000;
-    let m = s / 60;
-    let h = m / 60;
-    if h > 0 {
-        format!("{h}h {:02}m", m % 60)
-    } else if m > 0 {
-        format!("{m}m {:02}s", s % 60)
-    } else {
-        format!("{s}s")
-    }
 }
 
 fn cell_dim(s: &'static str) -> Cell<'static> {

@@ -52,7 +52,7 @@ fn tab_chips(current: Tab) -> Line<'static> {
                 chip_desc(" detail   "),
             ]);
         }
-        Tab::List => {
+        Tab::Nodes => {
             spans.extend([
                 chip_key("Enter"),
                 chip_desc(" detail   "),
@@ -68,6 +68,12 @@ fn tab_chips(current: Tab) -> Line<'static> {
                 chip_desc(" inval   "),
             ]);
         }
+        Tab::Daemons => {
+            spans.extend([
+                chip_key("Enter"),
+                chip_desc(" host node   "),
+            ]);
+        }
         Tab::Dataforts => {
             spans.extend([
                 chip_key("Enter"),
@@ -76,7 +82,7 @@ fn tab_chips(current: Tab) -> Line<'static> {
                 chip_desc(" blobs   "),
             ]);
         }
-        Tab::Daemon => {
+        Tab::Groups => {
             spans.extend([
                 chip_key("Enter"),
                 chip_desc(" host node   "),

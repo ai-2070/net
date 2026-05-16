@@ -14,44 +14,46 @@ use crate::{tabs, widgets};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     NetMap,
-    List,
+    Nodes,
+    Daemons,
+    Groups,
     Dataforts,
-    Daemon,
+    Blobs,
     Logs,
     Audit,
     Replicas,
     Migrations,
     Failures,
-    Blobs,
 }
 
 impl Tab {
-    /// Tab order rendered by the tab strip. AUDIT is intentionally
-    /// omitted (hidden for now) — the `Tab::Audit` variant, its
-    /// state fields, render module, and per-tab key handlers all
-    /// stay in the codebase so re-enabling is a single-line addition
-    /// here. While hidden, AUDIT is unreachable from the tab bar,
-    /// the `1-9` jump keys, and the Tab/arrow cycling.
+    /// Tab order rendered by the tab strip. AUDIT and FAILURES
+    /// are intentionally omitted (hidden for now) — their
+    /// variants, state, render modules, and key handlers all
+    /// stay in the codebase so re-enabling is a single-line
+    /// addition here. While hidden they're unreachable from the
+    /// tab bar, the `1-9` jump keys, and the Tab/arrow cycling.
     pub fn all() -> [Tab; 9] {
         [
             Tab::NetMap,
-            Tab::List,
-            Tab::Daemon,
+            Tab::Nodes,
+            Tab::Daemons,
+            Tab::Groups,
             Tab::Dataforts,
             Tab::Blobs,
             Tab::Logs,
             Tab::Migrations,
             Tab::Replicas,
-            Tab::Failures,
         ]
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::NetMap => "NET.MAP",
-            Tab::List => "LIST",
+            Tab::Nodes => "NODES",
+            Tab::Daemons => "DAEMONS",
+            Tab::Groups => "GROUPS",
             Tab::Dataforts => "DATAFORTS",
-            Tab::Daemon => "DAEMONS",
             Tab::Logs => "LOGS",
             Tab::Audit => "AUDIT",
             Tab::Replicas => "CHAINS",
@@ -133,11 +135,16 @@ pub struct App {
     /// substrate RPC slice — the picker surfaces a toast
     /// rather than misleadingly succeeding.
     pub active_cluster: String,
-    /// Cursor on the DAEMON tab's lineage tree. Indices into
+    /// Cursor on the GROUPS tab's lineage tree. Indices into
     /// the live group list — `j`/`k` move the cursor; the
     /// detail pane on the right reflects whichever member is
     /// pointed to.
-    pub daemon_cursor: DaemonCursor,
+    pub groups_cursor: DaemonCursor,
+    /// Cursor on the DAEMONS tab — flat index into the daemon
+    /// list in lineage-group order (same order the table
+    /// renders). `Enter` opens the NODE page for the cursored
+    /// daemon's placement.
+    pub daemons_cursor: usize,
     /// Cursor on the NET.MAP tab — index into the same
     /// peers-sorted-by-id order the LIST tab uses, so the
     /// cursor stays semantically aligned across the two
@@ -149,7 +156,7 @@ pub struct App {
     /// row gets a `▶` marker + brighter id styling. Action
     /// bindings (`c` cordon, `C` uncordon, future drain)
     /// target the cursored node.
-    pub list_cursor: usize,
+    pub nodes_cursor: usize,
     /// Cursor on the CHAINS tab — index into the replicas
     /// map's sorted-by-chain order.
     pub replica_cursor: usize,
@@ -405,9 +412,10 @@ impl App {
             tick: 0,
             deck,
             snapshot,
-            daemon_cursor: DaemonCursor::default(),
+            groups_cursor: DaemonCursor::default(),
+            daemons_cursor: 0,
             netmap_cursor: 0,
-            list_cursor: 0,
+            nodes_cursor: 0,
             replica_cursor: 0,
             migration_cursor: 0,
             failures_cursor: 0,
@@ -505,8 +513,8 @@ impl App {
     /// running locally.
     fn focus_daemon_placement(&mut self) {
         let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
-        let Some(group) = groups.get(self.daemon_cursor.group) else { return };
-        let Some(member) = group.members.get(self.daemon_cursor.member) else { return };
+        let Some(group) = groups.get(self.groups_cursor.group) else { return };
+        let Some(member) = group.members.get(self.groups_cursor.member) else { return };
         let placement = member.daemon.placement;
         let label = crate::nodes::label_of(&format!("0x{placement:x}"));
         if placement == 0x0001 {
@@ -541,7 +549,7 @@ impl App {
             .position(|(id, _)| *id == placement)
         {
             // Land in Peers source so on-page ↑/↓ walks peers.
-            self.list_cursor = peer_idx;
+            self.nodes_cursor = peer_idx;
             self.netmap_cursor = peer_idx;
             self.focus_node(peer_idx);
         }
@@ -566,7 +574,7 @@ impl App {
                 // Mirror the LIST / NET.MAP cursor so leaving
                 // focus leaves the underlying tab at the new
                 // position.
-                self.list_cursor = next;
+                self.nodes_cursor = next;
                 self.netmap_cursor = next;
                 self.focus_node(next);
             }
@@ -1103,14 +1111,14 @@ impl App {
             // by the next tab in the list. Adding AUDIT back to
             // `Tab::all()` will re-shift these.
             KeyCode::Char('1') => self.current = Tab::NetMap,
-            KeyCode::Char('2') => self.current = Tab::List,
-            KeyCode::Char('3') => self.current = Tab::Daemon,
-            KeyCode::Char('4') => self.current = Tab::Dataforts,
-            KeyCode::Char('5') => self.current = Tab::Blobs,
-            KeyCode::Char('6') => self.current = Tab::Logs,
-            KeyCode::Char('7') => self.current = Tab::Migrations,
-            KeyCode::Char('8') => self.current = Tab::Replicas,
-            KeyCode::Char('9') => self.current = Tab::Failures,
+            KeyCode::Char('2') => self.current = Tab::Nodes,
+            KeyCode::Char('3') => self.current = Tab::Daemons,
+            KeyCode::Char('4') => self.current = Tab::Groups,
+            KeyCode::Char('5') => self.current = Tab::Dataforts,
+            KeyCode::Char('6') => self.current = Tab::Blobs,
+            KeyCode::Char('7') => self.current = Tab::Logs,
+            KeyCode::Char('8') => self.current = Tab::Migrations,
+            KeyCode::Char('9') => self.current = Tab::Replicas,
             // DAEMON tab navigation. Lowercase letters walk the
             // member axis (cursor inside the focused group);
             // uppercase letters + arrows walk the group axis.
@@ -1118,43 +1126,53 @@ impl App {
             // typically think of the daemon list as "groups
             // first, members within"; the member axis is the
             // tighter sub-cursor reached via j/k/w/s.
-            KeyCode::Char('j' | 's') if self.current == Tab::Daemon => {
-                self.daemon_cursor.member = self.daemon_cursor.member.saturating_add(1);
-                self.clamp_daemon_cursor();
+            KeyCode::Char('j' | 's') if self.current == Tab::Groups => {
+                self.groups_cursor.member = self.groups_cursor.member.saturating_add(1);
+                self.clamp_groups_cursor();
             }
-            KeyCode::Char('k' | 'w') if self.current == Tab::Daemon => {
-                self.daemon_cursor.member = self.daemon_cursor.member.saturating_sub(1);
+            KeyCode::Char('k' | 'w') if self.current == Tab::Groups => {
+                self.groups_cursor.member = self.groups_cursor.member.saturating_sub(1);
             }
-            KeyCode::Char('J' | 'S') | KeyCode::Down if self.current == Tab::Daemon => {
-                self.daemon_cursor.group = self.daemon_cursor.group.saturating_add(1);
-                self.daemon_cursor.member = 0;
-                self.clamp_daemon_cursor();
+            KeyCode::Char('J' | 'S') | KeyCode::Down if self.current == Tab::Groups => {
+                self.groups_cursor.group = self.groups_cursor.group.saturating_add(1);
+                self.groups_cursor.member = 0;
+                self.clamp_groups_cursor();
             }
-            KeyCode::Char('K' | 'W') | KeyCode::Up if self.current == Tab::Daemon => {
-                self.daemon_cursor.group = self.daemon_cursor.group.saturating_sub(1);
-                self.daemon_cursor.member = 0;
+            KeyCode::Char('K' | 'W') | KeyCode::Up if self.current == Tab::Groups => {
+                self.groups_cursor.group = self.groups_cursor.group.saturating_sub(1);
+                self.groups_cursor.member = 0;
             }
             // DAEMON tab actions: `r` proposes
             // restart-all-daemons on the cursored member's
             // host node. Pops a confirmation modal; Enter on
             // the modal fires the signed admin commit.
-            KeyCode::Char('r') if self.current == Tab::Daemon => {
+            KeyCode::Char('r') if self.current == Tab::Groups => {
                 self.propose_restart_all_daemons();
             }
             // ICE force-restart on DAEMON tab. Targets the
             // cursored daemon; bypasses crash-loop backoff.
-            KeyCode::Char('R') if self.current == Tab::Daemon => {
+            KeyCode::Char('R') if self.current == Tab::Groups => {
                 self.propose_ice_force_restart_daemon();
             }
-            // LIST tab navigation: `j`/`k`/`s`/`w` + arrows move
+            // NODES tab navigation: `j`/`k`/`s`/`w` + arrows move
             // the cursor through the nodes table (sorted by
             // NodeId). `s`/`w` are the WASD alias for `j`/`k`.
-            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::List => {
-                self.list_cursor = self.list_cursor.saturating_add(1);
-                self.clamp_list_cursor();
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Nodes => {
+                self.nodes_cursor = self.nodes_cursor.saturating_add(1);
+                self.clamp_nodes_cursor();
             }
-            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::List => {
-                self.list_cursor = self.list_cursor.saturating_sub(1);
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Nodes => {
+                self.nodes_cursor = self.nodes_cursor.saturating_sub(1);
+            }
+            // DAEMONS flat-table cursor — single axis over the
+            // lineage-group flattened order. Enter opens the
+            // placement node's NODE page.
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Daemons => {
+                self.daemons_cursor = self.daemons_cursor.saturating_add(1);
+                self.clamp_daemons_cursor();
+            }
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Daemons => {
+                self.daemons_cursor = self.daemons_cursor.saturating_sub(1);
             }
             // NET.MAP shares the peers-by-id order with LIST.
             KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::NetMap => {
@@ -1282,7 +1300,7 @@ impl App {
             // inventory refresh doesn't shift the body.
             KeyCode::Enter if self.current == Tab::Blobs => self.open_blob_detail(),
             // Open the dedicated node detail page for the
-            // cursored peer on LIST (`list_cursor`) or NET.MAP
+            // cursored peer on LIST (`nodes_cursor`) or NET.MAP
             // (`netmap_cursor`). Both tabs share the
             // peers-by-id order, so the right cursor is
             // dispatched per source tab. Esc returns to the
@@ -1290,8 +1308,8 @@ impl App {
             KeyCode::Enter if self.current == Tab::NetMap => {
                 self.focus_node(self.netmap_cursor);
             }
-            KeyCode::Enter if self.current == Tab::List => {
-                self.focus_node(self.list_cursor);
+            KeyCode::Enter if self.current == Tab::Nodes => {
+                self.focus_node(self.nodes_cursor);
             }
             // DATAFORTS: Enter opens the NODE page for the
             // cursored datafort. Local goes via a synthesized
@@ -1301,9 +1319,14 @@ impl App {
             KeyCode::Enter if self.current == Tab::Dataforts => {
                 self.focus_datafort(self.dataforts_cursor);
             }
-            // DAEMONS: Enter opens the NODE page for the
-            // placement node of the cursored daemon.
-            KeyCode::Enter if self.current == Tab::Daemon => {
+            // DAEMONS (flat table): Enter opens the placement
+            // NODE page for the cursored daemon.
+            KeyCode::Enter if self.current == Tab::Daemons => {
+                self.focus_daemons_cursored_placement();
+            }
+            // GROUPS: Enter opens the NODE page for the
+            // placement node of the cursored daemon's group.
+            KeyCode::Enter if self.current == Tab::Groups => {
                 self.focus_daemon_placement();
             }
             // DATAFORTS: cross-link to BLOBS. Operators reading
@@ -1321,41 +1344,41 @@ impl App {
             }
             // LIST tab actions on the cursored node: `c` cordon,
             // `C` uncordon, `d` drain (5-minute default window).
-            KeyCode::Char('c') if self.current == Tab::List => {
+            KeyCode::Char('c') if self.current == Tab::Nodes => {
                 self.propose_node_action(NodeActionKind::Cordon);
             }
-            KeyCode::Char('C') if self.current == Tab::List => {
+            KeyCode::Char('C') if self.current == Tab::Nodes => {
                 self.propose_node_action(NodeActionKind::Uncordon);
             }
-            KeyCode::Char('d') if self.current == Tab::List => {
+            KeyCode::Char('d') if self.current == Tab::Nodes => {
                 self.propose_node_action(NodeActionKind::Drain);
             }
-            KeyCode::Char('m') if self.current == Tab::List => {
+            KeyCode::Char('m') if self.current == Tab::Nodes => {
                 self.propose_node_action(NodeActionKind::EnterMaintenance);
             }
-            KeyCode::Char('M') if self.current == Tab::List => {
+            KeyCode::Char('M') if self.current == Tab::Nodes => {
                 self.propose_node_action(NodeActionKind::ExitMaintenance);
             }
-            KeyCode::Char('a') if self.current == Tab::List => {
+            KeyCode::Char('a') if self.current == Tab::Nodes => {
                 self.propose_node_action(NodeActionKind::ClearAvoidList);
             }
-            KeyCode::Char('i') if self.current == Tab::List => {
+            KeyCode::Char('i') if self.current == Tab::Nodes => {
                 self.propose_node_action(NodeActionKind::InvalidatePlacement);
             }
-            KeyCode::Char('D') if self.current == Tab::List => {
+            KeyCode::Char('D') if self.current == Tab::Nodes => {
                 self.propose_drop_replicas();
             }
             // ICE break-glass on LIST tab: `F` freeze, `T` thaw,
             // `A` flush avoid lists (global scope). Cluster-wide
             // except where noted; capital letters distinguish
             // from routine commands.
-            KeyCode::Char('F') if self.current == Tab::List => {
+            KeyCode::Char('F') if self.current == Tab::Nodes => {
                 self.propose_ice_freeze();
             }
-            KeyCode::Char('T') if self.current == Tab::List => {
+            KeyCode::Char('T') if self.current == Tab::Nodes => {
                 self.propose_ice_thaw();
             }
-            KeyCode::Char('A') if self.current == Tab::List => {
+            KeyCode::Char('A') if self.current == Tab::Nodes => {
                 self.propose_ice_flush_avoid_lists();
             }
             _ => {}
@@ -1423,8 +1446,8 @@ impl App {
     fn propose_ice_force_restart_daemon(&mut self) {
         use net_sdk::deck::{simulate_ice_proposal, DaemonRef, IceActionProposal};
         let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
-        let Some(group) = groups.get(self.daemon_cursor.group) else { return };
-        let Some(member) = group.members.get(self.daemon_cursor.member) else { return };
+        let Some(group) = groups.get(self.groups_cursor.group) else { return };
+        let Some(member) = group.members.get(self.groups_cursor.member) else { return };
         let daemon_id = member.id;
         let daemon_name = member.daemon.name.clone();
         let action = IceActionProposal::ForceRestartDaemon {
@@ -1443,12 +1466,12 @@ impl App {
         ));
     }
 
-    fn clamp_list_cursor(&mut self) {
+    fn clamp_nodes_cursor(&mut self) {
         let n = self.snapshot.peers.len();
         if n == 0 {
-            self.list_cursor = 0;
-        } else if self.list_cursor >= n {
-            self.list_cursor = n - 1;
+            self.nodes_cursor = 0;
+        } else if self.nodes_cursor >= n {
+            self.nodes_cursor = n - 1;
         }
     }
 
@@ -1545,12 +1568,13 @@ impl App {
         match self.current {
             Tab::NetMap => self.netmap_cursor = 0,
             Tab::Dataforts => self.dataforts_cursor = 0,
-            Tab::List => self.list_cursor = 0,
+            Tab::Nodes => self.nodes_cursor = 0,
+            Tab::Daemons => self.daemons_cursor = 0,
             Tab::Replicas => self.replica_cursor = 0,
             Tab::Migrations => self.migration_cursor = 0,
             Tab::Failures => self.failures_cursor = 0,
             Tab::Blobs => self.blobs_cursor = 0,
-            Tab::Daemon => self.daemon_cursor = DaemonCursor::default(),
+            Tab::Groups => self.groups_cursor = DaemonCursor::default(),
             _ => {}
         }
     }
@@ -1565,9 +1589,13 @@ impl App {
                 let n = self.blob_adapters.len();
                 self.dataforts_cursor = n.saturating_sub(1);
             }
-            Tab::List => {
+            Tab::Nodes => {
                 let n = self.snapshot.peers.len();
-                self.list_cursor = n.saturating_sub(1);
+                self.nodes_cursor = n.saturating_sub(1);
+            }
+            Tab::Daemons => {
+                let n = tabs::daemons::total_daemons(&self.snapshot);
+                self.daemons_cursor = n.saturating_sub(1);
             }
             Tab::Replicas => {
                 let n = self.snapshot.replicas.len();
@@ -1585,11 +1613,11 @@ impl App {
                 let n = self.blobs_tail.records.lock().len();
                 self.blobs_cursor = n.saturating_sub(1);
             }
-            Tab::Daemon => {
+            Tab::Groups => {
                 let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
                 if let Some(last) = groups.len().checked_sub(1) {
-                    self.daemon_cursor.group = last;
-                    self.daemon_cursor.member =
+                    self.groups_cursor.group = last;
+                    self.groups_cursor.member =
                         groups[last].members.len().saturating_sub(1);
                 }
             }
@@ -1663,7 +1691,7 @@ impl App {
         self.snapshot
             .peers
             .keys()
-            .nth(self.list_cursor)
+            .nth(self.nodes_cursor)
             .copied()
     }
 
@@ -1966,8 +1994,8 @@ impl App {
     /// selected (empty snapshot, etc.).
     fn propose_restart_all_daemons(&mut self) {
         let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
-        let Some(group) = groups.get(self.daemon_cursor.group) else { return };
-        let Some(member) = group.members.get(self.daemon_cursor.member) else { return };
+        let Some(group) = groups.get(self.groups_cursor.group) else { return };
+        let Some(member) = group.members.get(self.groups_cursor.member) else { return };
         let node = member.daemon.placement;
         let node_display = format!(
             "0x{:x}{}",
@@ -2076,21 +2104,43 @@ impl App {
     /// live lineage groups. With no daemons in the snapshot
     /// the cursor is reset to (0, 0) — the fixture tab uses
     /// hardcoded constants in that case.
-    fn clamp_daemon_cursor(&mut self) {
+    fn clamp_groups_cursor(&mut self) {
         let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
         if groups.is_empty() {
-            self.daemon_cursor = DaemonCursor::default();
+            self.groups_cursor = DaemonCursor::default();
             return;
         }
-        if self.daemon_cursor.group >= groups.len() {
-            self.daemon_cursor.group = groups.len() - 1;
+        if self.groups_cursor.group >= groups.len() {
+            self.groups_cursor.group = groups.len() - 1;
         }
-        let n_members = groups[self.daemon_cursor.group].members.len();
+        let n_members = groups[self.groups_cursor.group].members.len();
         if n_members == 0 {
-            self.daemon_cursor.member = 0;
-        } else if self.daemon_cursor.member >= n_members {
-            self.daemon_cursor.member = n_members - 1;
+            self.groups_cursor.member = 0;
+        } else if self.groups_cursor.member >= n_members {
+            self.groups_cursor.member = n_members - 1;
         }
+    }
+
+    /// Clamp the DAEMONS flat-table cursor.
+    fn clamp_daemons_cursor(&mut self) {
+        let n = tabs::daemons::total_daemons(&self.snapshot);
+        if n == 0 {
+            self.daemons_cursor = 0;
+        } else if self.daemons_cursor >= n {
+            self.daemons_cursor = n - 1;
+        }
+    }
+
+    /// Focus the NODE page on the placement node of the
+    /// cursored daemon in the flat DAEMONS table.
+    fn focus_daemons_cursored_placement(&mut self) {
+        let Some(placement) =
+            tabs::daemons::cursored_placement(&self.snapshot, self.daemons_cursor)
+        else {
+            return;
+        };
+        let label = crate::nodes::label_of(&format!("0x{placement:x}"));
+        self.focus_host(placement, label);
     }
 
     fn draw(&self, frame: &mut Frame<'_>) {
@@ -2154,11 +2204,17 @@ impl App {
                     self.netmap_cursor,
                 )
             }
-            Tab::List => tabs::list_view::render(
+            Tab::Nodes => tabs::nodes::render(
                 frame,
                 chunks[3],
                 Some(&self.snapshot),
-                self.list_cursor,
+                self.nodes_cursor,
+            ),
+            Tab::Daemons => tabs::daemons::render(
+                frame,
+                chunks[3],
+                Some(&self.snapshot),
+                self.daemons_cursor,
             ),
             Tab::Dataforts => {
                 let entries = self.collect_dataforts();
@@ -2169,14 +2225,14 @@ impl App {
                     self.dataforts_cursor,
                 );
             }
-            Tab::Daemon => {
+            Tab::Groups => {
                 let logs = self.logs_tail.snapshot();
                 let local_node = self.local_node_card();
-                tabs::daemon::render(
+                tabs::groups::render(
                     frame,
                     chunks[3],
                     Some(&self.snapshot),
-                    self.daemon_cursor,
+                    self.groups_cursor,
                     &local_node,
                     &logs,
                 );
