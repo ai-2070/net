@@ -73,10 +73,7 @@ fn render_table(
     let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("FAILURES", theme::green_hi()),
-        Span::styled(
-            format!("    {shown}/{total} records"),
-            theme::chrome(),
-        ),
+        Span::styled(format!("    {shown}/{total} records"), theme::chrome()),
         Span::styled(format!("    {pos}/{shown}"), theme::dim()),
     ];
     append_search_chip(&mut title_spans, search, search_editing);
@@ -113,7 +110,11 @@ fn render_table(
         } else {
             format!("{:>5}", rec.seq)
         };
-        let reason_style = if is_cursor { theme::green_hi() } else { theme::text() };
+        let reason_style = if is_cursor {
+            theme::green_hi()
+        } else {
+            theme::text()
+        };
         rows.push(Row::new(vec![
             Cell::from(Span::styled(marker, theme::green_hi())),
             Cell::from(Span::styled(seq_text, theme::dim())),

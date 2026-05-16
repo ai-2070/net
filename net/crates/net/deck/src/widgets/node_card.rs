@@ -45,8 +45,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &NodeCardView) {
             Span::styled("NODE", theme::green_hi()),
             Span::styled(format!("    {id_label}"), theme::text()),
             Span::styled(
-                if view.is_local { "    local" } else { "    remote" },
-                if view.is_local { theme::cyan() } else { theme::dim() },
+                if view.is_local {
+                    "    local"
+                } else {
+                    "    remote"
+                },
+                if view.is_local {
+                    theme::cyan()
+                } else {
+                    theme::dim()
+                },
             ),
         ]));
     let inner = block.inner(area);

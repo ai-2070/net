@@ -48,20 +48,20 @@ pub fn render(
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // headline
-            Constraint::Length(1),  // spacer
-            Constraint::Length(1),  // host
-            Constraint::Length(1),  // adapter
-            Constraint::Length(1),  // hash full
-            Constraint::Length(1),  // ref + pin
-            Constraint::Length(1),  // first seen
-            Constraint::Length(1),  // last seen
-            Constraint::Length(1),  // spacer
-            Constraint::Length(1),  // age line
-            Constraint::Length(1),  // gc-status line
-            Constraint::Length(1),  // chunk channel
-            Constraint::Min(0),     // notes
-            Constraint::Length(1),  // bindings
+            Constraint::Length(1), // headline
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // host
+            Constraint::Length(1), // adapter
+            Constraint::Length(1), // hash full
+            Constraint::Length(1), // ref + pin
+            Constraint::Length(1), // first seen
+            Constraint::Length(1), // last seen
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // age line
+            Constraint::Length(1), // gc-status line
+            Constraint::Length(1), // chunk channel
+            Constraint::Min(0),    // notes
+            Constraint::Length(1), // bindings
         ])
         .split(inner);
 

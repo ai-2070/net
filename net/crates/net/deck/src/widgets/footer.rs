@@ -91,10 +91,7 @@ fn tab_chips(current: Tab) -> Line<'static> {
     let mut spans = base_nav();
     match current {
         Tab::NetMap => {
-            spans.extend([
-                chip_key("Enter"),
-                chip_desc(" detail   "),
-            ]);
+            spans.extend([chip_key("Enter"), chip_desc(" detail   ")]);
         }
         Tab::Nodes => {
             spans.extend([
@@ -113,10 +110,7 @@ fn tab_chips(current: Tab) -> Line<'static> {
             ]);
         }
         Tab::Daemons => {
-            spans.extend([
-                chip_key("Enter"),
-                chip_desc(" host node   "),
-            ]);
+            spans.extend([chip_key("Enter"), chip_desc(" host node   ")]);
         }
         Tab::Dataforts => {
             spans.extend([

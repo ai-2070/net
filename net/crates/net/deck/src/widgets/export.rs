@@ -222,10 +222,9 @@ fn format_admin_event(event: &AdminEvent) -> (&'static str, String) {
             "force_evict_replica",
             format!("chain=0x{chain:x} victim=0x{victim:x}"),
         ),
-        ForceRestartDaemon { daemon } => (
-            "force_restart_daemon",
-            format!("daemon=0x{:x}", daemon.id),
-        ),
+        ForceRestartDaemon { daemon } => {
+            ("force_restart_daemon", format!("daemon=0x{:x}", daemon.id))
+        }
         ForceCutover { chain, target } => (
             "force_cutover",
             format!("chain=0x{chain:x} target=0x{target:x}"),

@@ -16,9 +16,7 @@
 //! is read live so the page reflects the cluster as it
 //! evolves.
 
-use net_sdk::deck::{
-    MaintenanceMirrorSnapshot, MeshOsSnapshot, PeerHealthSnapshot, PeerSnapshot,
-};
+use net_sdk::deck::{MaintenanceMirrorSnapshot, MeshOsSnapshot, PeerHealthSnapshot, PeerSnapshot};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -32,7 +30,10 @@ use crate::theme;
 /// Daemons placed on `node_id` in `snapshot.daemons` order.
 /// Exposed so the app layer's Enter handler can resolve the
 /// `placement_cursor` without re-walking the snapshot.
-pub fn daemons_on(snapshot: &MeshOsSnapshot, node_id: u64) -> Vec<(u64, &net_sdk::deck::DaemonSnapshot)> {
+pub fn daemons_on(
+    snapshot: &MeshOsSnapshot,
+    node_id: u64,
+) -> Vec<(u64, &net_sdk::deck::DaemonSnapshot)> {
     snapshot
         .daemons
         .iter()
@@ -132,7 +133,10 @@ pub fn render(
     }
     render_placement_panel(frame, rows[i], entry, live);
     i += 1;
-    let hint_row = Rect { height: 1, ..rows[i] };
+    let hint_row = Rect {
+        height: 1,
+        ..rows[i]
+    };
     render_back_hint(frame, hint_row);
 }
 
@@ -161,7 +165,11 @@ fn render_datafort_panel(
         Span::styled("    off", theme::dim())
     };
     let role = if view.is_local { "local" } else { "remote" };
-    let role_style = if view.is_local { theme::cyan() } else { theme::dim() };
+    let role_style = if view.is_local {
+        theme::cyan()
+    } else {
+        theme::dim()
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -213,7 +221,7 @@ fn render_datafort_panel(
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {:<12}", a.id), theme::text()),
                     bar_span(p, 12, pressure_color(r)),
-                    Span::styled(format!(" {p:>3}%  ", ), theme::dim()),
+                    Span::styled(format!(" {p:>3}%  ",), theme::dim()),
                     Span::styled(
                         format!(
                             "{} / {}",
@@ -232,10 +240,7 @@ fn render_datafort_panel(
             .peer
             .capability_set
             .iter()
-            .filter(|c| {
-                c.starts_with("dataforts.")
-                    || *c == "greedy.cache"
-            })
+            .filter(|c| c.starts_with("dataforts.") || *c == "greedy.cache")
             .collect();
         let chips: Vec<Span> = if caps.is_empty() {
             vec![Span::styled("  caps      —", theme::chrome())]
@@ -255,10 +260,7 @@ fn render_datafort_panel(
     }
 
     if let Some(g) = view.greedy.as_ref() {
-        lines.push(Line::from(vec![Span::styled(
-            "  greedy",
-            theme::chrome(),
-        )]));
+        lines.push(Line::from(vec![Span::styled("  greedy", theme::chrome())]));
         let scopes_text = if g.scopes.is_empty() {
             "any scope".to_string()
         } else {
@@ -295,10 +297,7 @@ fn render_back_hint(frame: &mut Frame<'_>, area: Rect) {
         Span::styled("[Esc]", theme::green_hi()),
         Span::styled(" back", theme::dim()),
     ]);
-    frame.render_widget(
-        Paragraph::new(hint).alignment(Alignment::Right),
-        area,
-    );
+    frame.render_widget(Paragraph::new(hint).alignment(Alignment::Right), area);
 }
 
 // ───────────────────────── peer panel ─────────────────────────
@@ -539,10 +538,7 @@ struct CapNode {
 
 fn render_caps_section(frame: &mut Frame<'_>, area: Rect, entry: &NodeFocusEntry) {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from(vec![Span::styled(
-        "  caps",
-        theme::chrome(),
-    )]));
+    lines.push(Line::from(vec![Span::styled("  caps", theme::chrome())]));
 
     let tree = build_cap_tree(&entry.peer.capability_set);
     if tree.is_empty() {
@@ -644,7 +640,11 @@ fn count_cap_node_lines(node: &CapNode) -> usize {
     if is_chain(node) {
         1
     } else {
-        1 + node.children.iter().map(count_cap_node_lines).sum::<usize>()
+        1 + node
+            .children
+            .iter()
+            .map(count_cap_node_lines)
+            .sum::<usize>()
     }
 }
 
@@ -710,15 +710,9 @@ fn render_placement_panel(
         entry.placement_cursor.min(daemons_here.len() - 1)
     };
     let mut daemon_lines: Vec<Line> = Vec::with_capacity(daemons_here.len() + 1);
-    daemon_lines.push(Line::from(vec![Span::styled(
-        "  DAEMONS",
-        theme::chrome(),
-    )]));
+    daemon_lines.push(Line::from(vec![Span::styled("  DAEMONS", theme::chrome())]));
     if daemons_here.is_empty() {
-        daemon_lines.push(Line::from(vec![Span::styled(
-            "    none",
-            theme::dim(),
-        )]));
+        daemon_lines.push(Line::from(vec![Span::styled("    none", theme::dim())]));
     } else {
         for (i, (id, d)) in daemons_here.iter().enumerate() {
             let is_cursor = i == placement_cursor;
@@ -745,10 +739,7 @@ fn render_placement_panel(
         theme::chrome(),
     )]));
     if chains_here.is_empty() {
-        chain_lines.push(Line::from(vec![Span::styled(
-            "    none",
-            theme::dim(),
-        )]));
+        chain_lines.push(Line::from(vec![Span::styled("    none", theme::dim())]));
     } else {
         for chain in &chains_here {
             chain_lines.push(Line::from(vec![
@@ -787,9 +778,7 @@ fn health_label(h: Option<PeerHealthSnapshot>) -> &'static str {
     }
 }
 
-fn health_label_styled(
-    h: Option<PeerHealthSnapshot>,
-) -> (&'static str, ratatui::style::Style) {
+fn health_label_styled(h: Option<PeerHealthSnapshot>) -> (&'static str, ratatui::style::Style) {
     let (_, style) = health_dot(h);
     (health_label(h), style)
 }

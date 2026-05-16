@@ -68,7 +68,10 @@ fn render_graph(
     let title_text = match live_peers.as_ref() {
         Some(peers) => {
             let n = peers.len();
-            let datafort_count = peers.iter().filter(|p| p.role == NodeRole::Datafort).count();
+            let datafort_count = peers
+                .iter()
+                .filter(|p| p.role == NodeRole::Datafort)
+                .count();
             let edges = nearest_edges(peers, 2);
             let pos = cursor.min(n.saturating_sub(1)) + 1;
             format!(
@@ -143,11 +146,7 @@ fn project_live_peers(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
 }
 
 fn radial_layout(snapshot: &MeshOsSnapshot) -> Vec<LiveNode> {
-    let observed: Vec<u64> = snapshot
-        .peers
-        .values()
-        .filter_map(|p| p.rtt_ms)
-        .collect();
+    let observed: Vec<u64> = snapshot.peers.values().filter_map(|p| p.rtt_ms).collect();
     let min_rtt = observed.iter().copied().min().unwrap_or(0);
     let max_rtt = observed.iter().copied().max().unwrap_or(0);
     let range = max_rtt.saturating_sub(min_rtt).max(1);
@@ -306,7 +305,10 @@ fn paint_live_graph(
         ctx.print(
             n.x,
             n.y,
-            Line::styled(glyph.to_string(), ratatui::style::Style::default().fg(color)),
+            Line::styled(
+                glyph.to_string(),
+                ratatui::style::Style::default().fg(color),
+            ),
         );
         ctx.print(
             n.x + 3.0,

@@ -12,12 +12,7 @@ use ratatui::{
 
 use crate::{nodes, theme, widgets};
 
-pub fn render(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: Option<&MeshOsSnapshot>,
-    cursor: usize,
-) {
+pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeshOsSnapshot>, cursor: usize) {
     match snapshot {
         Some(s) if !s.peers.is_empty() => render_live_nodes_table(frame, area, s, cursor),
         _ => render_empty_nodes_table(frame, area),

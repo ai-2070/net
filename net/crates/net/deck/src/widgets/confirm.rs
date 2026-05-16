@@ -98,10 +98,7 @@ pub enum ConfirmAction {
     /// ICE break-glass: abort an in-flight migration on the
     /// node that hosts it. Reads from
     /// `ice().kill_migration(migration)`.
-    IceKillMigration {
-        migration: u64,
-        blast: BlastRadius,
-    },
+    IceKillMigration { migration: u64, blast: BlastRadius },
     /// ICE break-glass: force-evict a replica holder bypassing
     /// the scheduler's rebalance cooldown. Reads from
     /// `ice().force_evict_replica(chain, victim)`.
@@ -204,17 +201,12 @@ impl ConfirmAction {
                 daemon_id,
                 daemon_name,
                 ..
-            } => format!(
-                "ICE  force-restart daemon  ·  0x{daemon_id:x} · {daemon_name}"
-            ),
+            } => format!("ICE  force-restart daemon  ·  0x{daemon_id:x} · {daemon_name}"),
             Self::DropReplicas {
                 node_display,
                 chains,
                 ..
-            } => format!(
-                "drop {} replica(s) on {node_display}",
-                chains.len()
-            ),
+            } => format!("drop {} replica(s) on {node_display}", chains.len()),
             Self::IceFlushAvoidLists { .. } => {
                 "ICE  flush avoid lists  ·  global scope".to_string()
             }
@@ -225,16 +217,12 @@ impl ConfirmAction {
                 chain,
                 victim_display,
                 ..
-            } => format!(
-                "ICE  force-evict replica  ·  chain.0x{chain:x} from {victim_display}"
-            ),
+            } => format!("ICE  force-evict replica  ·  chain.0x{chain:x} from {victim_display}"),
             Self::IceForceCutover {
                 chain,
                 target_display,
                 ..
-            } => format!(
-                "ICE  force-cutover  ·  chain.0x{chain:x} → {target_display}"
-            ),
+            } => format!("ICE  force-cutover  ·  chain.0x{chain:x} → {target_display}"),
         }
     }
 
@@ -291,7 +279,10 @@ impl ConfirmAction {
                 "fires `admin().invalidate_placement(node)`".to_string(),
             ],
             Self::IceFreezeCluster { ttl, .. } => vec![
-                format!("freezes cluster-wide action emission for {}s", ttl.as_secs()),
+                format!(
+                    "freezes cluster-wide action emission for {}s",
+                    ttl.as_secs()
+                ),
                 "reconcile + folds keep running; only outbound actions stop".to_string(),
                 "auto-thaws at the deadline; `[T]` cancels early".to_string(),
             ],
@@ -348,12 +339,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, action: &ConfirmAction) {
     frame.render_widget(Clear, modal_area);
 
     let (border_style, title_glyph, title_text, title_color) = if is_ice {
-        (
-            theme::red(),
-            " ❄ ",
-            "ICE  BREAK-GLASS",
-            theme::RED,
-        )
+        (theme::red(), " ❄ ", "ICE  BREAK-GLASS", theme::RED)
     } else {
         (theme::amber(), " ⚠ ", "CONFIRM", theme::AMBER)
     };
@@ -425,7 +411,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, action: &ConfirmAction) {
     }
 
     let bindings = Line::from(vec![
-        Span::styled("[Enter]", if is_ice { theme::red() } else { theme::green_hi() }),
+        Span::styled(
+            "[Enter]",
+            if is_ice {
+                theme::red()
+            } else {
+                theme::green_hi()
+            },
+        ),
         Span::styled(" confirm    ", theme::dim()),
         Span::styled("[Esc]", theme::dim()),
         Span::styled(" cancel", theme::dim()),
@@ -475,10 +468,7 @@ fn render_blast_radius(frame: &mut Frame<'_>, area: Rect, blast: &BlastRadius) {
             Span::styled(format!("{w:?}"), theme::amber()),
         ]));
     }
-    frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
 
 fn center(area: Rect, width: u16, height: u16) -> Rect {

@@ -194,8 +194,8 @@ pub fn spawn_failures_stream(
 
 /// Cap on the BLOBS inventory snapshot the deck renders. The
 /// adapter's full set may exceed this; the cap bounds memory
-/// + render cost at the cost of truncating to most-recently-
-/// touched entries first.
+/// and render cost at the cost of truncating to
+/// most-recently-touched entries first.
 pub const BLOBS_TAIL_CAP: usize = 5_000;
 
 /// BLOBS inventory tail. Distinct from the log / audit /

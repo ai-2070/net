@@ -76,10 +76,7 @@ fn render_table(
     let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("BLOBS", theme::green_hi()),
-        Span::styled(
-            format!("    {shown}/{total} chunks"),
-            theme::chrome(),
-        ),
+        Span::styled(format!("    {shown}/{total} chunks"), theme::chrome()),
         Span::styled(format!("    {pos}/{shown}"), theme::dim()),
     ];
     append_search_chip(&mut title_spans, search, search_editing);
@@ -110,18 +107,30 @@ fn render_table(
         // which would dominate the row. Operators search for
         // a prefix to disambiguate.
         let hash_short = if e.hash_hex.len() > 16 {
-            format!("{}…{}", &e.hash_hex[..8], &e.hash_hex[e.hash_hex.len() - 8..])
+            format!(
+                "{}…{}",
+                &e.hash_hex[..8],
+                &e.hash_hex[e.hash_hex.len() - 8..]
+            )
         } else {
             e.hash_hex.clone()
         };
-        let hash_style = if is_cursor { theme::green_hi() } else { theme::text() };
+        let hash_style = if is_cursor {
+            theme::green_hi()
+        } else {
+            theme::text()
+        };
         let ref_style = if e.refcount == 0 {
             theme::dim()
         } else {
             theme::green()
         };
         let pin_text = if e.pinned { "PIN" } else { " · " };
-        let pin_style = if e.pinned { theme::amber() } else { theme::chrome() };
+        let pin_style = if e.pinned {
+            theme::amber()
+        } else {
+            theme::chrome()
+        };
         rows.push(Row::new(vec![
             Cell::from(Span::styled(marker, theme::green_hi())),
             Cell::from(Span::styled(hash_short, hash_style)),

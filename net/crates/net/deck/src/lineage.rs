@@ -32,9 +32,7 @@ pub enum GroupKind {
     /// active, rest are warm.
     Standby,
     /// Forks from a common parent.
-    Fork {
-        parent_seq: u64,
-    },
+    Fork { parent_seq: u64 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,7 +75,11 @@ pub fn group_daemons(daemons: &BTreeMap<u64, DaemonSnapshot>) -> Vec<LiveGroup<'
             .enumerate()
             .map(|(i, (id, d))| {
                 let role = role_for(kind, i);
-                LiveMember { id, daemon: d, role }
+                LiveMember {
+                    id,
+                    daemon: d,
+                    role,
+                }
             })
             .collect();
         groups.push(LiveGroup {

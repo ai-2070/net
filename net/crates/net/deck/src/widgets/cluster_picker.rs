@@ -97,7 +97,11 @@ pub fn render(
             // The synthetic local entry.
             let active = active_idx_for_label("local");
             let mut spans = vec![Span::styled(marker, theme::green_hi())];
-            let id_style = if is_cursor { theme::green_hi() } else { theme::text() };
+            let id_style = if is_cursor {
+                theme::green_hi()
+            } else {
+                theme::text()
+            };
             spans.push(Span::styled("local", id_style));
             spans.push(Span::styled("    in-process MeshOS runtime", theme::dim()));
             if active {
@@ -108,15 +112,16 @@ pub fn render(
             let bm = &bookmarks[i - 1];
             let active = active_idx_for_label(&bm.name);
             let mut spans = vec![Span::styled(marker, theme::green_hi())];
-            let name_style = if is_cursor { theme::green_hi() } else { theme::text() };
+            let name_style = if is_cursor {
+                theme::green_hi()
+            } else {
+                theme::text()
+            };
             spans.push(Span::styled(bm.name.clone(), name_style));
             if bm.pinned {
                 spans.push(Span::styled("  📌", theme::amber()));
             }
-            spans.push(Span::styled(
-                format!("    {}", bm.endpoint),
-                theme::dim(),
-            ));
+            spans.push(Span::styled(format!("    {}", bm.endpoint), theme::dim()));
             if active {
                 spans.push(Span::styled("    ◀ active", theme::amber()));
             }

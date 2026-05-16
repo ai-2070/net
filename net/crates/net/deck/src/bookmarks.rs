@@ -137,11 +137,7 @@ impl BookmarkStore {
     /// so the picker reads the same on every render.
     pub fn sorted(&self) -> Vec<&Bookmark> {
         let mut out: Vec<&Bookmark> = self.bookmarks.iter().collect();
-        out.sort_by(|a, b| {
-            b.pinned
-                .cmp(&a.pinned)
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        out.sort_by(|a, b| b.pinned.cmp(&a.pinned).then_with(|| a.name.cmp(&b.name)));
         out
     }
 
@@ -189,8 +185,8 @@ impl BookmarkStore {
             version: CURRENT_VERSION,
             clusters: self.bookmarks.clone(),
         };
-        let text = toml::to_string_pretty(&file)
-            .map_err(|e| BookmarkError::Serialize(e.to_string()))?;
+        let text =
+            toml::to_string_pretty(&file).map_err(|e| BookmarkError::Serialize(e.to_string()))?;
         std::fs::write(path, text)
             .map_err(|e| BookmarkError::Io(format!("write {}: {e}", path.display())))?;
         Ok(())
@@ -262,10 +258,12 @@ mod tests {
         store.save().expect("save no-op when nothing to write");
         // No file should be created — empty save still works
         // because the path is set but the file wasn't requested.
-        assert!(!path.exists() || {
-            let s = std::fs::read_to_string(&path).unwrap();
-            !s.is_empty()
-        });
+        assert!(
+            !path.exists() || {
+                let s = std::fs::read_to_string(&path).unwrap();
+                !s.is_empty()
+            }
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -334,8 +332,11 @@ mod tests {
         let dir = tempdir_unique();
         let path = dir.join("bookmarks.toml");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&path, "version = 999\n[[cluster]]\nname = \"x\"\nendpoint = \"y\"\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "version = 999\n[[cluster]]\nname = \"x\"\nendpoint = \"y\"\n",
+        )
+        .unwrap();
         match BookmarkStore::load_from(&path) {
             Err(BookmarkError::Version(999, 1)) => {}
             other => panic!("expected version mismatch, got {other:?}"),

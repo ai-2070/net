@@ -20,8 +20,15 @@ use crate::theme;
 /// into a bug report.
 #[derive(Clone, Debug)]
 pub enum ExportOutcome {
-    Ok { tab: String, path: String, count: usize },
-    Err { tab: String, message: String },
+    Ok {
+        tab: String,
+        path: String,
+        count: usize,
+    },
+    Err {
+        tab: String,
+        message: String,
+    },
 }
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, outcome: &ExportOutcome) {

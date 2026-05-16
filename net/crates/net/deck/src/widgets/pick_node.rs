@@ -101,9 +101,7 @@ pub fn render(
             Span::styled(" ❄ ", theme::red()),
             Span::styled(
                 "ICE  PICK NODE",
-                Style::default()
-                    .fg(theme::RED)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
         ]))
@@ -125,9 +123,7 @@ pub fn render(
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
             purpose.headline(),
-            Style::default()
-                .fg(theme::RED)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
         )]))
         .alignment(Alignment::Center),
         rows[0],
@@ -184,20 +180,19 @@ fn peer_lines(
             let abs = start + i;
             let is_cursor = abs == cursor;
             let marker = if is_cursor { "▶ " } else { "  " };
-            let id_style = if is_cursor { theme::green_hi() } else { theme::text() };
+            let id_style = if is_cursor {
+                theme::green_hi()
+            } else {
+                theme::text()
+            };
             let mut spans = vec![Span::styled(marker, theme::green_hi())];
-            spans.extend(nodes::id_spans_styled(
-                &format!("0x{peer_id:x}"),
-                id_style,
-            ));
+            spans.extend(nodes::id_spans_styled(&format!("0x{peer_id:x}"), id_style));
             // health badge
             if let Some(p) = snapshot.peers.get(peer_id) {
                 let (health_style, health_text) = match p.health {
                     Some(PeerHealthSnapshot::Healthy) => (theme::green(), " · Healthy"),
                     Some(PeerHealthSnapshot::Degraded) => (theme::amber(), " · Degraded"),
-                    Some(PeerHealthSnapshot::Unreachable) => {
-                        (theme::red(), " · Unreachable")
-                    }
+                    Some(PeerHealthSnapshot::Unreachable) => (theme::red(), " · Unreachable"),
                     _ => (theme::chrome(), " · —"),
                 };
                 spans.push(Span::styled(health_text, health_style));

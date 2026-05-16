@@ -39,30 +39,84 @@ const NAVIGATION: &[Binding] = &[
 ];
 
 const ADMIN: &[Binding] = &[
-    Binding { keys: "c",   desc: "NODES: cordon (cursored node)" },
-    Binding { keys: "C",   desc: "NODES: uncordon" },
-    Binding { keys: "d",   desc: "NODES: drain (prompts for window)" },
-    Binding { keys: "m",   desc: "NODES: enter maintenance" },
-    Binding { keys: "M",   desc: "NODES: exit maintenance" },
-    Binding { keys: "a",   desc: "NODES: clear avoid list" },
-    Binding { keys: "i",   desc: "NODES: invalidate placement" },
-    Binding { keys: "D",   desc: "NODES: drop all replicas on node" },
-    Binding { keys: "r",   desc: "GROUPS: restart all daemons (on host)" },
+    Binding {
+        keys: "c",
+        desc: "NODES: cordon (cursored node)",
+    },
+    Binding {
+        keys: "C",
+        desc: "NODES: uncordon",
+    },
+    Binding {
+        keys: "d",
+        desc: "NODES: drain (prompts for window)",
+    },
+    Binding {
+        keys: "m",
+        desc: "NODES: enter maintenance",
+    },
+    Binding {
+        keys: "M",
+        desc: "NODES: exit maintenance",
+    },
+    Binding {
+        keys: "a",
+        desc: "NODES: clear avoid list",
+    },
+    Binding {
+        keys: "i",
+        desc: "NODES: invalidate placement",
+    },
+    Binding {
+        keys: "D",
+        desc: "NODES: drop all replicas on node",
+    },
+    Binding {
+        keys: "r",
+        desc: "GROUPS: restart all daemons (on host)",
+    },
 ];
 
 const ICE: &[Binding] = &[
-    Binding { keys: "F",   desc: "NODES: ICE freeze cluster (prompts for ttl)" },
-    Binding { keys: "T",   desc: "NODES: ICE thaw cluster" },
-    Binding { keys: "A",   desc: "NODES: ICE flush avoid lists (global)" },
-    Binding { keys: "R",   desc: "GROUPS: ICE force-restart (bypass backoff)" },
-    Binding { keys: "K",   desc: "MIGRATIONS: ICE kill migration" },
-    Binding { keys: "E",   desc: "CHAINS: ICE force-evict first holder" },
-    Binding { keys: "O",   desc: "CHAINS: ICE force-cutover (pick target)" },
+    Binding {
+        keys: "F",
+        desc: "NODES: ICE freeze cluster (prompts for ttl)",
+    },
+    Binding {
+        keys: "T",
+        desc: "NODES: ICE thaw cluster",
+    },
+    Binding {
+        keys: "A",
+        desc: "NODES: ICE flush avoid lists (global)",
+    },
+    Binding {
+        keys: "R",
+        desc: "GROUPS: ICE force-restart (bypass backoff)",
+    },
+    Binding {
+        keys: "K",
+        desc: "MIGRATIONS: ICE kill migration",
+    },
+    Binding {
+        keys: "E",
+        desc: "CHAINS: ICE force-evict first holder",
+    },
+    Binding {
+        keys: "O",
+        desc: "CHAINS: ICE force-cutover (pick target)",
+    },
 ];
 
 const MODAL: &[Binding] = &[
-    Binding { keys: "Enter / Space",  desc: "confirm pending action" },
-    Binding { keys: "Esc / q",        desc: "cancel pending action" },
+    Binding {
+        keys: "Enter / Space",
+        desc: "confirm pending action",
+    },
+    Binding {
+        keys: "Esc / q",
+        desc: "cancel pending action",
+    },
 ];
 
 pub fn render(frame: &mut Frame<'_>, area: Rect) {
@@ -106,10 +160,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect) {
         Span::styled("[?] / [Esc] ", theme::green_hi()),
         Span::styled("close help", theme::dim()),
     ]);
-    frame.render_widget(
-        Paragraph::new(footer).alignment(Alignment::Center),
-        rows[4],
-    );
+    frame.render_widget(Paragraph::new(footer).alignment(Alignment::Center), rows[4]);
 }
 
 fn render_section(frame: &mut Frame<'_>, area: Rect, title: &str, bindings: &[Binding]) {

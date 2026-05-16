@@ -14,12 +14,7 @@ use ratatui::{
 
 use crate::{theme, widgets};
 
-pub fn render(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: Option<&MeshOsSnapshot>,
-    cursor: usize,
-) {
+pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeshOsSnapshot>, cursor: usize) {
     let has_records = snapshot
         .map(|s| !s.in_flight_migrations.is_empty())
         .unwrap_or(false);
@@ -49,12 +44,7 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_table(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: &MeshOsSnapshot,
-    cursor: usize,
-) {
+fn render_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cursor: usize) {
     let total = snapshot.in_flight_migrations.len();
     let pos = cursor.min(total.saturating_sub(1)) + 1;
     let header_line = Line::from(vec![
@@ -82,7 +72,11 @@ fn render_table(
         let is_cursor = i == cursor;
         let marker = if is_cursor { "▶" } else { " " };
         let daemon_text = format!("daemon.0x{:x}", m.daemon_origin);
-        let daemon_style = if is_cursor { theme::green_hi() } else { theme::text() };
+        let daemon_style = if is_cursor {
+            theme::green_hi()
+        } else {
+            theme::text()
+        };
         let (phase_style, phase_text) = phase_repr(&m.phase);
         rows.push(Row::new(vec![
             Cell::from(Span::styled(marker, theme::green_hi())),

@@ -17,15 +17,8 @@ use ratatui::{
 
 use crate::{nodes, theme, widgets};
 
-pub fn render(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: Option<&MeshOsSnapshot>,
-    cursor: usize,
-) {
-    let has_replicas = snapshot
-        .map(|s| !s.replicas.is_empty())
-        .unwrap_or(false);
+pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeshOsSnapshot>, cursor: usize) {
+    let has_replicas = snapshot.map(|s| !s.replicas.is_empty()).unwrap_or(false);
     if has_replicas {
         render_table(frame, area, snapshot.unwrap(), cursor);
     } else {
@@ -52,12 +45,7 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_table(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: &MeshOsSnapshot,
-    cursor: usize,
-) {
+fn render_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cursor: usize) {
     let total = snapshot.replicas.len();
     let mut under = 0;
     let mut over = 0;
@@ -114,7 +102,11 @@ fn render_table(
         let is_cursor = i == cursor;
         let marker = if is_cursor { "▶" } else { " " };
         let chain_text = format!("chain.0x{chain:x}");
-        let chain_style = if is_cursor { theme::green_hi() } else { theme::text() };
+        let chain_style = if is_cursor {
+            theme::green_hi()
+        } else {
+            theme::text()
+        };
 
         let held = r.holders.len();
         let (status_style, status_text) = match r.desired_count {
@@ -131,9 +123,7 @@ fn render_table(
 
         // Leader cell as id.label, or — when leaderless.
         let leader_cell = match r.leader {
-            Some(leader) => Cell::from(Line::from(
-                nodes::id_spans(&format!("0x{leader:x}")),
-            )),
+            Some(leader) => Cell::from(Line::from(nodes::id_spans(&format!("0x{leader:x}")))),
             None => Cell::from(Span::styled("—", theme::red())),
         };
 
@@ -152,10 +142,7 @@ fn render_table(
             } else {
                 theme::text()
             };
-            holder_spans.extend(nodes::id_spans_styled(
-                &format!("0x{h:x}"),
-                id_style,
-            ));
+            holder_spans.extend(nodes::id_spans_styled(&format!("0x{h:x}"), id_style));
         }
         if r.holders.len() > show {
             holder_spans.push(Span::styled(

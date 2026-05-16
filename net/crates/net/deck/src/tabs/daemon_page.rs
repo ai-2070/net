@@ -68,17 +68,20 @@ pub fn render(
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(12),        // FACTS
-            Constraint::Length(group_h),   // GROUP
-            Constraint::Min(0),            // LOG.TAIL
-            Constraint::Length(2),         // hint row + spacer
+            Constraint::Length(12),      // FACTS
+            Constraint::Length(group_h), // GROUP
+            Constraint::Min(0),          // LOG.TAIL
+            Constraint::Length(2),       // hint row + spacer
         ])
         .split(area);
 
     render_facts_panel(frame, rows[0], entry, live);
     render_group_panel(frame, rows[1], entry, live, &rows_total);
     render_log_tail(frame, rows[2], entry.id, logs);
-    let hint_row = Rect { height: 1, ..rows[3] };
+    let hint_row = Rect {
+        height: 1,
+        ..rows[3]
+    };
     render_back_hint(frame, hint_row);
 }
 
@@ -90,9 +93,10 @@ pub fn group_rows(entry: &DaemonFocusEntry, live: &MeshOsSnapshot) -> Vec<GroupR
         id: entry.snapshot.placement,
     });
     let groups = lineage::group_daemons(&live.daemons);
-    if let Some(group) = groups.iter().find(|g| {
-        g.members.iter().any(|m| m.id == entry.id)
-    }) {
+    if let Some(group) = groups
+        .iter()
+        .find(|g| g.members.iter().any(|m| m.id == entry.id))
+    {
         for m in &group.members {
             out.push(GroupRow::Sibling { id: m.id });
         }
@@ -116,7 +120,9 @@ fn render_facts_panel(
         Span::styled("DAEMON", theme::green_hi()),
         Span::styled(
             format!("    {}", short_id(entry.id)),
-            Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("    · {}", display_name), theme::cyan()),
     ]);
@@ -131,9 +137,9 @@ fn render_facts_panel(
     let lineage_line = match group_kind {
         LiveGroupKind::Solo => "standalone · no group".to_string(),
         LiveGroupKind::Replica => format!("ReplicaGroup · {display_name} · {member_count} members"),
-        LiveGroupKind::Fork { parent_seq } => format!(
-            "ForkGroup · {display_name} · parent @ seq={parent_seq} · {member_count} forks"
-        ),
+        LiveGroupKind::Fork { parent_seq } => {
+            format!("ForkGroup · {display_name} · parent @ seq={parent_seq} · {member_count} forks")
+        }
         LiveGroupKind::Standby => {
             let warm = member_count.saturating_sub(1);
             format!("StandbyGroup · {display_name} · 1 active + {warm} warm")
@@ -168,14 +174,22 @@ fn render_facts_panel(
     ));
 
     let lines = vec![
-        kv("identity    ", &format!("ent.{}", short_id(entry.id)), theme::text()),
+        kv(
+            "identity    ",
+            &format!("ent.{}", short_id(entry.id)),
+            theme::text(),
+        ),
         kv("lineage     ", &lineage_line, theme::text()),
         kv("role        ", &role_line, theme::text()),
         kv("kind        ", &display_name, theme::cyan()),
         kv("lifecycle   ", &lifecycle_line, theme::green()),
         kv("health      ", health_text, health_style),
         Line::from(placement_spans),
-        kv("restart     ", &format!("{:?}", d.restart_state), theme::dim()),
+        kv(
+            "restart     ",
+            &format!("{:?}", d.restart_state),
+            theme::dim(),
+        ),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -233,7 +247,7 @@ fn render_group_panel(
         match r {
             GroupRow::PlacementNode { id } => {
                 let mut spans: Vec<Span> = vec![
-                    Span::styled(format!("  {marker} ", ), marker_style),
+                    Span::styled(format!("  {marker} ",), marker_style),
                     Span::styled("NODE  ", theme::chrome()),
                 ];
                 let id_style = if is_cursor {
@@ -269,10 +283,7 @@ fn render_group_panel(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn sibling_role(
-    daemon_id: u64,
-    live: &MeshOsSnapshot,
-) -> (String, ratatui::style::Style) {
+fn sibling_role(daemon_id: u64, live: &MeshOsSnapshot) -> (String, ratatui::style::Style) {
     let groups = lineage::group_daemons(&live.daemons);
     for g in &groups {
         if let Some(m) = g.members.iter().find(|m| m.id == daemon_id) {
@@ -290,12 +301,7 @@ fn sibling_role(
 
 // ───────────────────────── log tail ─────────────────────────
 
-fn render_log_tail(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    daemon_id: u64,
-    logs: &[LogRecord],
-) {
+fn render_log_tail(frame: &mut Frame<'_>, area: Rect, daemon_id: u64, logs: &[LogRecord]) {
     use net_sdk::deck::LogLevel;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -346,10 +352,7 @@ fn render_back_hint(frame: &mut Frame<'_>, area: Rect) {
         Span::styled("[Esc]", theme::green_hi()),
         Span::styled(" back", theme::dim()),
     ]);
-    frame.render_widget(
-        Paragraph::new(hint).alignment(Alignment::Right),
-        area,
-    );
+    frame.render_widget(Paragraph::new(hint).alignment(Alignment::Right), area);
 }
 
 fn kv(label: &str, value: &str, value_style: ratatui::style::Style) -> Line<'static> {

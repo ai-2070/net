@@ -54,20 +54,36 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     left.push(Span::styled("/", theme::chrome()));
     left.push(Span::styled(format!("{}D", peers.degraded), theme::amber()));
     left.push(Span::styled("/", theme::chrome()));
-    left.push(Span::styled(format!("{}U", peers.unreachable), theme::red()));
+    left.push(Span::styled(
+        format!("{}U", peers.unreachable),
+        theme::red(),
+    ));
     left.push(sep());
 
     // daemons: 11d 11R/0B/0X
     left.push(Span::styled(format!("{}d ", daemons.total), theme::text()));
-    left.push(Span::styled(format!("{}R", daemons.running), theme::green()));
+    left.push(Span::styled(
+        format!("{}R", daemons.running),
+        theme::green(),
+    ));
     left.push(Span::styled("/", theme::chrome()));
-    left.push(Span::styled(format!("{}B", daemons.backing_off), theme::amber()));
+    left.push(Span::styled(
+        format!("{}B", daemons.backing_off),
+        theme::amber(),
+    ));
     left.push(Span::styled("/", theme::chrome()));
-    left.push(Span::styled(format!("{}X", daemons.crash_looping), theme::red()));
+    left.push(Span::styled(
+        format!("{}X", daemons.crash_looping),
+        theme::red(),
+    ));
     left.push(sep());
 
     // pending: 0 pending
-    let pending_style = if pending == 0 { theme::dim() } else { theme::amber() };
+    let pending_style = if pending == 0 {
+        theme::dim()
+    } else {
+        theme::amber()
+    };
     left.push(Span::styled(format!("{pending} pending"), pending_style));
     left.push(sep());
 
@@ -163,9 +179,7 @@ fn daemon_summary(snap: &MeshOsSnapshot) -> DaemonSummary {
     }
 }
 
-fn local_maint_summary(
-    snap: &MeshOsSnapshot,
-) -> (ratatui::style::Style, &'static str) {
+fn local_maint_summary(snap: &MeshOsSnapshot) -> (ratatui::style::Style, &'static str) {
     match snap.local_maintenance {
         MaintenanceStateSnapshot::Active => (theme::green(), "active"),
         MaintenanceStateSnapshot::EnteringMaintenance { .. } => (theme::cyan(), "draining"),

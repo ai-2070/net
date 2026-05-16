@@ -4,9 +4,7 @@
 //! grouped lineage view (replica families, fork groups, standby
 //! sets) lives on the GROUPS tab.
 
-use net_sdk::deck::{
-    DaemonHealthSnapshot, DaemonLifecycleSnapshot, MeshOsSnapshot,
-};
+use net_sdk::deck::{DaemonHealthSnapshot, DaemonLifecycleSnapshot, MeshOsSnapshot};
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
     text::{Line, Span},
@@ -16,12 +14,7 @@ use ratatui::{
 
 use crate::{lineage, nodes, theme, widgets};
 
-pub fn render(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: Option<&MeshOsSnapshot>,
-    cursor: usize,
-) {
+pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeshOsSnapshot>, cursor: usize) {
     match snapshot {
         Some(s) if !s.daemons.is_empty() => render_live(frame, area, s, cursor),
         _ => render_empty(frame, area),
@@ -47,12 +40,7 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_live(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: &MeshOsSnapshot,
-    cursor: usize,
-) {
+fn render_live(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cursor: usize) {
     let groups = lineage::group_daemons(&snapshot.daemons);
     let total: usize = groups.iter().map(|g| g.members.len()).sum();
     let pos = cursor.min(total.saturating_sub(1)) + 1;

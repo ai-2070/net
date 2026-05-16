@@ -20,8 +20,8 @@
 //! - context row: adapters (local) | node info
 
 use net_sdk::dataforts::{
-    evaluate_health_gate, BlobMetricsSnapshot, HealthGateAction,
-    HEALTH_GATE_CLEAR_THRESHOLD, HEALTH_GATE_EMIT_THRESHOLD,
+    evaluate_health_gate, BlobMetricsSnapshot, HealthGateAction, HEALTH_GATE_CLEAR_THRESHOLD,
+    HEALTH_GATE_EMIT_THRESHOLD,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -123,12 +123,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, entries: &[DatafortEntry], curs
     render_body(frame, rows[i + 1], cur, &agg);
 }
 
-fn render_greedy_panel(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    cur: &DatafortEntry,
-    g: &GreedyView,
-) {
+fn render_greedy_panel(frame: &mut Frame<'_>, area: Rect, cur: &DatafortEntry, g: &GreedyView) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -158,10 +153,7 @@ fn render_greedy_panel(
             "proximity_max_rtt   ",
             &format!("{} ms", g.proximity_max_rtt_ms),
         ),
-        kv_str(
-            "per_channel_cap     ",
-            &fmt_bytes(g.per_channel_cap_bytes),
-        ),
+        kv_str("per_channel_cap     ", &fmt_bytes(g.per_channel_cap_bytes)),
         kv_str("total_cap           ", &fmt_bytes(g.total_cap_bytes)),
     ];
     frame.render_widget(Paragraph::new(left_lines), cols[0]);
@@ -227,11 +219,19 @@ fn render_datafort_list(
     for (i, e) in entries.iter().enumerate() {
         let is_cursor = i == cursor;
         let marker = if is_cursor { "▶" } else { " " };
-        let id_style = if is_cursor { theme::green_hi() } else { theme::text() };
+        let id_style = if is_cursor {
+            theme::green_hi()
+        } else {
+            theme::text()
+        };
 
         let id_label = format_id_label(e.id, e.label.as_deref());
         let role_text = if e.is_local { "local" } else { "remote" };
-        let role_style = if e.is_local { theme::cyan() } else { theme::dim() };
+        let role_style = if e.is_local {
+            theme::cyan()
+        } else {
+            theme::dim()
+        };
 
         let (health_text, health_style) = health_chip(e.health);
         let (ratio, disk_pct) = match (e.disk_used_bytes, e.disk_total_bytes) {
@@ -299,7 +299,11 @@ fn overflow_label(e: &DatafortEntry) -> &'static str {
         } else {
             "off"
         }
-    } else if e.capabilities.iter().any(|c| c == "dataforts.blob.overflow") {
+    } else if e
+        .capabilities
+        .iter()
+        .any(|c| c == "dataforts.blob.overflow")
+    {
         "enabled"
     } else {
         "off"
@@ -331,12 +335,7 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
 
 // ───────────────────────── status bar ─────────────────────────
 
-fn render_status(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    cur: &DatafortEntry,
-    agg: &AggregateView,
-) {
+fn render_status(frame: &mut Frame<'_>, area: Rect, cur: &DatafortEntry, agg: &AggregateView) {
     let title_id = format_id_label(cur.id, cur.label.as_deref());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -351,7 +350,11 @@ fn render_status(
 
     let used = agg.disk_used;
     let cap = agg.disk_capacity;
-    let ratio = if cap == 0 { 0.0 } else { used as f64 / cap as f64 };
+    let ratio = if cap == 0 {
+        0.0
+    } else {
+        used as f64 / cap as f64
+    };
     let pct = (ratio * 100.0) as u16;
     let pct_clamped = pct.min(100);
     let (bar_color, bar_label, bar_style) = bar_style_for(ratio);
@@ -390,12 +393,7 @@ fn gate_chip(used: u64, cap: u64) -> (&'static str, ratatui::style::Style) {
 
 // ───────────────────────── body (IO / OVERFLOW) ─────────────────────────
 
-fn render_body(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    cur: &DatafortEntry,
-    agg: &AggregateView,
-) {
+fn render_body(frame: &mut Frame<'_>, area: Rect, cur: &DatafortEntry, agg: &AggregateView) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -463,23 +461,27 @@ fn render_overflow_panel(frame: &mut Frame<'_>, area: Rect, agg: &AggregateView)
         kv_bytes("pushed_bytes_total", o.pushed_bytes_total),
         kv("rejected_no_target", o.rejected_no_target_total),
         kv("rejected_no_storage_cap", o.rejected_no_storage_cap_total),
-        kv("rejected_not_participating", o.rejected_not_participating_total),
-        kv("rejected_sender_not_overflowing", o.rejected_sender_not_overflowing_total),
+        kv(
+            "rejected_not_participating",
+            o.rejected_not_participating_total,
+        ),
+        kv(
+            "rejected_sender_not_overflowing",
+            o.rejected_sender_not_overflowing_total,
+        ),
         kv("rejected_unhealthy", o.rejected_unhealthy_total),
         kv("rejected_scope_mismatch", o.rejected_scope_mismatch_total),
-        kv("rejected_insufficient_disk", o.rejected_insufficient_disk_total),
+        kv(
+            "rejected_insufficient_disk",
+            o.rejected_insufficient_disk_total,
+        ),
         kv("high_water_triggered", o.high_water_triggered_total),
         kv("low_water_cleared", o.low_water_cleared_total),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_remote_panel(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    title: &str,
-    hint: &str,
-) {
+fn render_remote_panel(frame: &mut Frame<'_>, area: Rect, title: &str, hint: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -492,10 +494,7 @@ fn render_remote_panel(
     frame.render_widget(block, area);
     let lines = vec![
         Line::from(""),
-        Line::from(vec![Span::styled(
-            format!("  {hint}"),
-            theme::chrome(),
-        )]),
+        Line::from(vec![Span::styled(format!("  {hint}"), theme::chrome())]),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -564,7 +563,11 @@ fn render_adapters_panel(frame: &mut Frame<'_>, area: Rect, cur: &DatafortEntry)
                 bar(pct, 10, bar_color),
                 Span::styled(format!(" {pct:>3}%  "), theme::dim()),
                 Span::styled(
-                    format!("{} / {}", fmt_bytes(m.disk_used_bytes), fmt_bytes(m.disk_capacity_bytes)),
+                    format!(
+                        "{} / {}",
+                        fmt_bytes(m.disk_used_bytes),
+                        fmt_bytes(m.disk_capacity_bytes)
+                    ),
                     theme::dim(),
                 ),
                 overflow_chip,
@@ -584,8 +587,16 @@ fn render_node_panel(frame: &mut Frame<'_>, area: Rect, cur: &DatafortEntry) {
             Span::styled("NODE", theme::green_hi()),
             Span::styled(format!("    {}", id_label), theme::text()),
             Span::styled(
-                if cur.is_local { "    local" } else { "    remote" },
-                if cur.is_local { theme::cyan() } else { theme::dim() },
+                if cur.is_local {
+                    "    local"
+                } else {
+                    "    remote"
+                },
+                if cur.is_local {
+                    theme::cyan()
+                } else {
+                    theme::dim()
+                },
             ),
         ]));
     let inner = block.inner(area);

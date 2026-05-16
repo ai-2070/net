@@ -228,10 +228,7 @@ fn target_spans(e: &AdminEvent) -> Vec<Span<'static>> {
         ThawCluster => vec![Span::styled("cluster", theme::text())],
         FlushAvoidLists { .. } => vec![Span::styled("avoid lists", theme::text())],
         ForceEvictReplica { chain, victim } => {
-            let mut s = vec![Span::styled(
-                format!("chain.0x{chain:x} · "),
-                theme::text(),
-            )];
+            let mut s = vec![Span::styled(format!("chain.0x{chain:x} · "), theme::text())];
             s.extend(nodes::id_spans(&format!("0x{victim:x}")));
             s
         }
@@ -240,10 +237,7 @@ fn target_spans(e: &AdminEvent) -> Vec<Span<'static>> {
             theme::cyan(),
         )],
         ForceCutover { chain, target } => {
-            let mut s = vec![Span::styled(
-                format!("chain.0x{chain:x} → "),
-                theme::text(),
-            )];
+            let mut s = vec![Span::styled(format!("chain.0x{chain:x} → "), theme::text())];
             s.extend(nodes::id_spans(&format!("0x{target:x}")));
             s
         }
@@ -340,4 +334,3 @@ fn format_relative(committed_at_ms: u64, now_ms: u64) -> String {
         format!("{}h ago", delta / 3_600)
     }
 }
-

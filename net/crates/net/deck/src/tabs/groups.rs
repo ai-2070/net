@@ -27,23 +27,12 @@ pub fn render(
         .split(area);
 
     let groups = snapshot.map(|s| lineage::group_daemons(&s.daemons));
-    let has_groups = groups
-        .as_ref()
-        .map(|g| !g.is_empty())
-        .unwrap_or(false);
+    let has_groups = groups.as_ref().map(|g| !g.is_empty()).unwrap_or(false);
 
     if has_groups {
         let groups = groups.unwrap();
         render_list(frame, cols[0], &groups, cursor);
-        render_detail(
-            frame,
-            cols[1],
-            &groups,
-            cursor,
-            snapshot,
-            local_node,
-            logs,
-        );
+        render_detail(frame, cols[1], &groups, cursor, snapshot, local_node, logs);
     } else {
         render_empty_list(frame, cols[0]);
         render_empty_detail(frame, cols[1]);
@@ -91,12 +80,7 @@ fn render_empty_detail(frame: &mut Frame<'_>, area: Rect) {
 
 // ───────────────────────── live list (lineage tree) ─────────────────────────
 
-fn render_list(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    groups: &[LiveGroup<'_>],
-    cursor: DaemonCursor,
-) {
+fn render_list(frame: &mut Frame<'_>, area: Rect, groups: &[LiveGroup<'_>], cursor: DaemonCursor) {
     let total: usize = groups.iter().map(|g| g.members.len()).sum();
     let n_groups = groups.len();
     // Daemon cursor is two-level (group + member within group).
@@ -192,8 +176,16 @@ fn member_line(
 
     let (glyph, role_text, role_color) = role_repr(member.role, kind);
 
-    let cursor_color = if is_cursor { theme::GREEN_HI } else { theme::CHROME };
-    let id_style = if is_cursor { theme::green_hi() } else { theme::text() };
+    let cursor_color = if is_cursor {
+        theme::GREEN_HI
+    } else {
+        theme::CHROME
+    };
+    let id_style = if is_cursor {
+        theme::green_hi()
+    } else {
+        theme::text()
+    };
 
     let (health_color, health_text) = health_repr(member.daemon);
 
@@ -286,10 +278,10 @@ fn render_detail(
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),       // facts
-            Constraint::Length(card_h),  // placement NODE card
-            Constraint::Min(0),          // log tail
-            Constraint::Length(3),       // controls
+            Constraint::Length(8),      // facts
+            Constraint::Length(card_h), // placement NODE card
+            Constraint::Min(0),         // log tail
+            Constraint::Length(3),      // controls
         ])
         .split(inner);
 
@@ -310,26 +302,20 @@ fn resolve_placement_view(
     let Some(snap) = snapshot else {
         return NodeCardView {
             id: daemon.placement,
-            label: nodes::label_of(&format!("0x{:x}", daemon.placement))
-                .map(|s| s.to_string()),
+            label: nodes::label_of(&format!("0x{:x}", daemon.placement)).map(|s| s.to_string()),
             ..NodeCardView::default()
         };
     };
-    let Some((_, peer)) = snap.peers.iter().find(|(id, _)| **id == daemon.placement)
-    else {
+    let Some((_, peer)) = snap.peers.iter().find(|(id, _)| **id == daemon.placement) else {
         return NodeCardView {
             id: daemon.placement,
-            label: nodes::label_of(&format!("0x{:x}", daemon.placement))
-                .map(|s| s.to_string()),
+            label: nodes::label_of(&format!("0x{:x}", daemon.placement)).map(|s| s.to_string()),
             ..NodeCardView::default()
         };
     };
     NodeCardView {
         id: daemon.placement,
-        label: nodes::label_for(
-            &format!("0x{:x}", daemon.placement),
-            &peer.capability_set,
-        ),
+        label: nodes::label_for(&format!("0x{:x}", daemon.placement), &peer.capability_set),
         is_local: false,
         health: match peer.health {
             Some(net_sdk::deck::PeerHealthSnapshot::Healthy) => Some("Healthy"),
@@ -346,12 +332,7 @@ fn resolve_placement_view(
     }
 }
 
-fn render_facts(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    group: &LiveGroup<'_>,
-    member: &LiveMember<'_>,
-) {
+fn render_facts(frame: &mut Frame<'_>, area: Rect, group: &LiveGroup<'_>, member: &LiveMember<'_>) {
     let d = member.daemon;
     let group_line = match group.kind {
         LiveGroupKind::Solo => "standalone · no group".to_string(),
@@ -412,12 +393,7 @@ fn render_facts(
 /// Tail of log lines scoped to the cursored daemon. Pulls from
 /// the deck's streaming `LogsTail` (filter by `daemon_id`) and
 /// renders the most recent N lines.
-fn render_log_tail(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    daemon_id: u64,
-    logs: &[LogRecord],
-) {
+fn render_log_tail(frame: &mut Frame<'_>, area: Rect, daemon_id: u64, logs: &[LogRecord]) {
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(theme::rule())

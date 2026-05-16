@@ -29,12 +29,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, headline: &str, hint: &str) {
         .split(area);
 
     let lines = vec![
-        Line::from(Span::styled(format!("· · · {headline} · · ·"), theme::dim())),
+        Line::from(Span::styled(
+            format!("· · · {headline} · · ·"),
+            theme::dim(),
+        )),
         Line::from(""),
         Line::from(Span::styled(hint, theme::chrome())),
     ];
-    frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center),
-        rows[1],
-    );
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), rows[1]);
 }

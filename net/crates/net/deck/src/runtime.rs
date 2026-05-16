@@ -89,12 +89,8 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     #[cfg(not(feature = "samples"))]
     let migration_source: Option<Arc<dyn MigrationSnapshotSource>> = None;
 
-    let sdk = MeshOsDaemonSdk::start_with_options(
-        cfg,
-        dispatcher,
-        Some(verifier),
-        migration_source,
-    );
+    let sdk =
+        MeshOsDaemonSdk::start_with_options(cfg, dispatcher, Some(verifier), migration_source);
 
     let identity = OperatorIdentity::from_keypair(operator_keypair);
     let deck = Arc::new(DeckClient::from_runtime(sdk.runtime(), identity));
@@ -144,7 +140,7 @@ mod samples {
 
     /// Construct three real `MeshBlobAdapter` instances against
     /// in-memory `Redex` handles with distinct configurations
-    /// + activity profiles so DATAFORTS demonstrates the
+    /// plus activity profiles so DATAFORTS demonstrates the
     /// multi-adapter list. No background ticking — the stores
     /// fire once at startup and the adapter's state stays
     /// steady from there, matching the rest of samples mode's
@@ -183,12 +179,8 @@ mod samples {
         let mut stored = Vec::with_capacity(stores);
         for i in 0..stores {
             let payload = format!("{id}/blob-{i:03}-fixture-content").into_bytes();
-            if let Ok(blob) = publish_blob_ref(
-                adapter.as_ref(),
-                format!("mesh://{id}/{i}"),
-                &payload,
-            )
-            .await
+            if let Ok(blob) =
+                publish_blob_ref(adapter.as_ref(), format!("mesh://{id}/{i}"), &payload).await
             {
                 stored.push(blob);
             }
@@ -263,23 +255,23 @@ mod samples {
     /// the `id.label` rendering resolves. Two peers Degraded
     /// so the UI exercises all three health states.
     const PEERS: &[(NodeId, u64, NodeHealth)] = &[
-        (0xa96f,  41, NodeHealth::Healthy),
-        (0xe9b8,  39, NodeHealth::Healthy),
-        (0xe685,  12, NodeHealth::Healthy),
-        (0xd4ff,  44, NodeHealth::Healthy),
-        (0x3599,  47, NodeHealth::Healthy),
-        (0x372b,  88, NodeHealth::Healthy),
+        (0xa96f, 41, NodeHealth::Healthy),
+        (0xe9b8, 39, NodeHealth::Healthy),
+        (0xe685, 12, NodeHealth::Healthy),
+        (0xd4ff, 44, NodeHealth::Healthy),
+        (0x3599, 47, NodeHealth::Healthy),
+        (0x372b, 88, NodeHealth::Healthy),
         (0xeba8, 244, NodeHealth::Degraded),
-        (0x82ee,  92, NodeHealth::Healthy),
-        (0xbdda,  85, NodeHealth::Healthy),
-        (0x6dfb,  31, NodeHealth::Healthy),
-        (0x3c81,  18, NodeHealth::Healthy),
+        (0x82ee, 92, NodeHealth::Healthy),
+        (0xbdda, 85, NodeHealth::Healthy),
+        (0x6dfb, 31, NodeHealth::Healthy),
+        (0x3c81, 18, NodeHealth::Healthy),
         (0xe068, 162, NodeHealth::Healthy),
-        (0xbf44,  29, NodeHealth::Healthy),
+        (0xbf44, 29, NodeHealth::Healthy),
         (0xf206, 167, NodeHealth::Healthy),
         (0xf83d, 159, NodeHealth::Healthy),
         (0x6808, 451, NodeHealth::Degraded),
-        (0x0fc2,  73, NodeHealth::Healthy),
+        (0x0fc2, 73, NodeHealth::Healthy),
     ];
 
     struct SampleLocalityProbe;
@@ -329,14 +321,14 @@ mod samples {
                     let mem_used: u64 = if degraded {
                         (62 + (i as u64 % 4)) << 30 // ~62 GB
                     } else {
-                        ((24 + (i as u64 * 3) % 32) << 30) as u64 // 24..56 GB
+                        (24 + (i as u64 * 3) % 32) << 30 // 24..56 GB
                     };
                     let mem_total: u64 = 64 << 30;
-                    let disk_used: u64 = ((256 + (i as u64 * 47) % 512) << 30) as u64;
+                    let disk_used: u64 = (256 + (i as u64 * 47) % 512) << 30;
                     let disk_total: u64 = 1u64 << 40; // 1 TiB
-                    // Saturation: rises with health pressure;
-                    // degraded peers cross the 0.8 amber/red
-                    // threshold the LIST tab shades on.
+                                                      // Saturation: rises with health pressure;
+                                                      // degraded peers cross the 0.8 amber/red
+                                                      // threshold the LIST tab shades on.
                     let sat: f32 = if degraded {
                         0.82 + ((i as f32 * 0.03) % 0.1)
                     } else {
@@ -433,9 +425,11 @@ mod samples {
     /// through the runtime handle. No background task — once
     /// the seed events fold, the snapshot is steady-state.
     pub fn install(sdk: &MeshOsDaemonSdk) -> color_eyre::Result<Vec<MeshOsDaemonHandle>> {
-        sdk.runtime().add_locality_probe(Arc::new(SampleLocalityProbe));
+        sdk.runtime()
+            .add_locality_probe(Arc::new(SampleLocalityProbe));
         sdk.runtime().add_health_probe(Arc::new(SampleHealthProbe));
-        sdk.runtime().add_inventory_probe(Arc::new(SampleInventoryProbe));
+        sdk.runtime()
+            .add_inventory_probe(Arc::new(SampleInventoryProbe));
 
         // Replica seeding: fire one ReplicaUpdate per (chain,
         // holder) plus one PlacementIntent per chain. Run in a

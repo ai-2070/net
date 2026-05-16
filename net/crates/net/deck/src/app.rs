@@ -30,9 +30,10 @@ impl Tab {
     /// Tab order rendered by the tab strip. FAILURES is hidden
     /// (its variant, state, render module, and key handlers all
     /// stay in the codebase so re-enabling is a single-line
-    /// addition here). The strip carries 10 slots — keys 1-9
-    /// + 0 — with LOGS pinned to `0` so it stays reachable
-    /// from any tab without clobbering the alphabetic shortcuts.
+    /// addition here). The strip carries 10 slots — keys
+    /// `1`..`9` plus `0` — with LOGS pinned to `0` so it stays
+    /// reachable from any tab without clobbering the alphabetic
+    /// shortcuts.
     pub fn all() -> [Tab; 10] {
         [
             Tab::NetMap,
@@ -343,10 +344,7 @@ pub struct DaemonCursor {
 /// from the node id so the deck shows varied (but stable) configs
 /// across peers in samples mode. Locked defaults match
 /// `GreedyConfig::default()` from the dataforts module.
-fn synthetic_greedy_view(
-    node_id: u64,
-    label: Option<&'static str>,
-) -> tabs::dataforts::GreedyView {
+fn synthetic_greedy_view(node_id: u64, label: Option<&'static str>) -> tabs::dataforts::GreedyView {
     // Cheap hash off the id so each peer gets a stable but
     // distinct config slot.
     let h = (node_id ^ (node_id >> 17)) as usize;
@@ -369,8 +367,8 @@ fn synthetic_greedy_view(
         _ => 0.60,
     };
     let nic_peak_bytes_per_s: u64 = 125_000_000; // 1 Gbps default
-    // Scopes derive from the label (region suffix) when present
-    // so the demo reads "scopes: region:ap-south1" etc.
+                                                 // Scopes derive from the label (region suffix) when present
+                                                 // so the demo reads "scopes: region:ap-south1" etc.
     let scopes: Vec<String> = match label {
         Some(l) if l.starts_with("eu-") || l.starts_with("us-") || l.starts_with("ap-") => {
             vec![format!("region:{l}")]
@@ -379,7 +377,7 @@ fn synthetic_greedy_view(
         Some("edge") | Some("lab-bench") => vec!["intent:sensor".to_string()],
         _ => Vec::new(),
     };
-    let (colocation, intent_match) = if h % 2 == 0 {
+    let (colocation, intent_match) = if h.is_multiple_of(2) {
         ("SoftPreference", "AnyOfLocalCapabilities")
     } else {
         ("Strict", "Strict")
@@ -551,8 +549,12 @@ impl App {
     /// renders).
     fn focus_groups_cursored_daemon(&mut self) {
         let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
-        let Some(group) = groups.get(self.groups_cursor.group) else { return };
-        let Some(member) = group.members.get(self.groups_cursor.member) else { return };
+        let Some(group) = groups.get(self.groups_cursor.group) else {
+            return;
+        };
+        let Some(member) = group.members.get(self.groups_cursor.member) else {
+            return;
+        };
         self.focus_daemon(member.id, member.daemon.clone());
     }
 
@@ -589,7 +591,9 @@ impl App {
     /// Walk the Daemon page's group-row cursor up / down.
     /// Cursor 0 = placement node, 1..=N = sibling at index N-1.
     fn step_daemon_focus_cursor(&mut self, delta: i32) {
-        let Some(focus) = self.daemon_focus.as_ref() else { return };
+        let Some(focus) = self.daemon_focus.as_ref() else {
+            return;
+        };
         let rows = crate::tabs::daemon_page::group_rows(focus, &self.snapshot);
         if rows.is_empty() {
             return;
@@ -606,7 +610,9 @@ impl App {
     /// opens the Node page; sibling daemon row swaps focus to
     /// that daemon's page.
     fn dispatch_daemon_focus_enter(&mut self) {
-        let Some(focus) = self.daemon_focus.as_ref() else { return };
+        let Some(focus) = self.daemon_focus.as_ref() else {
+            return;
+        };
         let rows = crate::tabs::daemon_page::group_rows(focus, &self.snapshot);
         let cursor = focus.cursor.min(rows.len().saturating_sub(1));
         let Some(row) = rows.get(cursor) else { return };
@@ -628,7 +634,9 @@ impl App {
     /// Walk the Node page's placement cursor through the daemons
     /// running on the focused node.
     fn step_node_placement_cursor(&mut self, delta: i32) {
-        let Some(focus) = self.node_focus.as_ref() else { return };
+        let Some(focus) = self.node_focus.as_ref() else {
+            return;
+        };
         let daemons = crate::tabs::node_page::daemons_on(&self.snapshot, focus.id);
         if daemons.is_empty() {
             return;
@@ -644,7 +652,9 @@ impl App {
     /// Open the cursored placement daemon's Daemon page from the
     /// Node page focus.
     fn open_cursored_node_placement(&mut self) {
-        let Some(focus) = self.node_focus.as_ref() else { return };
+        let Some(focus) = self.node_focus.as_ref() else {
+            return;
+        };
         let daemons = crate::tabs::node_page::daemons_on(&self.snapshot, focus.id);
         if daemons.is_empty() {
             return;
@@ -695,9 +705,8 @@ impl App {
         } else if let Some((id, peer)) =
             self.snapshot.peers.iter().find(|(pid, _)| **pid == host_id)
         {
-            let label = host_label.or_else(|| {
-                crate::nodes::label_for(&format!("0x{:x}", *id), &peer.capability_set)
-            });
+            let label = host_label
+                .or_else(|| crate::nodes::label_for(&format!("0x{:x}", *id), &peer.capability_set));
             self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
                 id: *id,
                 label,
@@ -749,10 +758,9 @@ impl App {
                     }
                 })
                 .collect();
-            let (disk_used, disk_total) =
-                adapters.iter().fold((0u64, 0u64), |(u, t), a| {
-                    (u + a.disk_used_bytes, t + a.disk_capacity_bytes)
-                });
+            let (disk_used, disk_total) = adapters.iter().fold((0u64, 0u64), |(u, t), a| {
+                (u + a.disk_used_bytes, t + a.disk_capacity_bytes)
+            });
             let overflow_enabled = adapters.iter().any(|a| a.overflow_enabled);
             let overflow_active = adapters.iter().any(|a| a.overflow_active);
             tabs::node_page::DatafortView {
@@ -764,9 +772,7 @@ impl App {
                 adapters,
                 greedy: None,
             }
-        } else if let Some((_, peer)) =
-            self.snapshot.peers.iter().find(|(id, _)| **id == node_id)
-        {
+        } else if let Some((_, peer)) = self.snapshot.peers.iter().find(|(id, _)| **id == node_id) {
             let has_greedy = peer
                 .capability_set
                 .iter()
@@ -805,7 +811,9 @@ impl App {
     /// peer up by id.
     fn focus_datafort(&mut self, idx: usize) {
         let entries = self.collect_dataforts();
-        let Some(entry) = entries.get(idx) else { return };
+        let Some(entry) = entries.get(idx) else {
+            return;
+        };
         self.daemon_focus = None;
         if entry.is_local {
             let mut caps = std::collections::BTreeSet::new();
@@ -835,8 +843,7 @@ impl App {
             .iter()
             .find(|(pid, _)| **pid == entry.id)
         {
-            let label =
-                crate::nodes::label_for(&format!("0x{:x}", *id), &peer.capability_set);
+            let label = crate::nodes::label_for(&format!("0x{:x}", *id), &peer.capability_set);
             self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
                 id: *id,
                 label,
@@ -876,8 +883,7 @@ impl App {
             // synthetic_greedy_view takes the static fixture
             // vocabulary; pass the bare fixture label, not the
             // chained one, so scope tags stay coherent.
-            let greedy_fixture_label =
-                crate::nodes::label_of(&format!("0x{:x}", *id));
+            let greedy_fixture_label = crate::nodes::label_of(&format!("0x{:x}", *id));
             let greedy = if has_greedy {
                 Some(synthetic_greedy_view(*id, greedy_fixture_label))
             } else {
@@ -919,10 +925,12 @@ impl App {
                 }
             })
             .collect();
-        let (disk_used, disk_total) =
-            adapters.iter().fold((0u64, 0u64), |(u, t), a| {
-                (u + a.metrics.disk_used_bytes, t + a.metrics.disk_capacity_bytes)
-            });
+        let (disk_used, disk_total) = adapters.iter().fold((0u64, 0u64), |(u, t), a| {
+            (
+                u + a.metrics.disk_used_bytes,
+                t + a.metrics.disk_capacity_bytes,
+            )
+        });
         let any_overflow = adapters.iter().any(|a| a.overflow_enabled);
         let mut capabilities = vec![
             "compute.daemon".to_string(),
@@ -995,13 +1003,11 @@ impl App {
             }
             return;
         }
-        let sorted: Vec<crate::bookmarks::Bookmark> = self
-            .bookmarks
-            .sorted()
-            .into_iter()
-            .cloned()
-            .collect();
-        let Some(bm) = sorted.get(cursor - 1) else { return };
+        let sorted: Vec<crate::bookmarks::Bookmark> =
+            self.bookmarks.sorted().into_iter().cloned().collect();
+        let Some(bm) = sorted.get(cursor - 1) else {
+            return;
+        };
         // Real switch requires the substrate's deck-RPC slice
         // (DECK_PLAN.md § Deferred work § Multi-Cluster
         // Switcher). The picker UX exists today so operators
@@ -1023,7 +1029,11 @@ impl App {
     /// are too easy to miss in a busy session, and the path is
     /// the actionable bit (operator copies it into the incident
     /// write-up).
-    fn open_export_modal(&mut self, tab: &str, result: Result<crate::widgets::export::ExportResult, crate::widgets::export::ExportError>) {
+    fn open_export_modal(
+        &mut self,
+        tab: &str,
+        result: Result<crate::widgets::export::ExportResult, crate::widgets::export::ExportError>,
+    ) {
         use crate::widgets::export_done::ExportOutcome;
         let outcome = match result {
             Ok(out) => ExportOutcome::Ok {
@@ -1213,9 +1223,7 @@ impl App {
         }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true
-            }
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => self.should_quit = true,
             // Help overlay — works on every tab, no cursor
             // required.
             KeyCode::Char('?') => {
@@ -1530,7 +1538,9 @@ impl App {
     }
 
     fn propose_drop_replicas(&mut self) {
-        let Some(node) = self.cursored_node() else { return };
+        let Some(node) = self.cursored_node() else {
+            return;
+        };
         // Default: every chain this node currently holds. The
         // operator confirms before any commit fires.
         let chains: Vec<u64> = self
@@ -1569,8 +1579,12 @@ impl App {
             (focus.id, focus.snapshot.name.clone())
         } else {
             let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
-            let Some(group) = groups.get(self.groups_cursor.group) else { return };
-            let Some(member) = group.members.get(self.groups_cursor.member) else { return };
+            let Some(group) = groups.get(self.groups_cursor.group) else {
+                return;
+            };
+            let Some(member) = group.members.get(self.groups_cursor.member) else {
+                return;
+            };
             (member.id, member.daemon.name.clone())
         };
         let action = IceActionProposal::ForceRestartDaemon {
@@ -1740,8 +1754,7 @@ impl App {
                 let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
                 if let Some(last) = groups.len().checked_sub(1) {
                     self.groups_cursor.group = last;
-                    self.groups_cursor.member =
-                        groups[last].members.len().saturating_sub(1);
+                    self.groups_cursor.member = groups[last].members.len().saturating_sub(1);
                 }
             }
             _ => {}
@@ -1749,12 +1762,7 @@ impl App {
     }
 
     fn propose_ice_force_cutover(&mut self) {
-        let Some((chain, _)) = self
-            .snapshot
-            .replicas
-            .iter()
-            .nth(self.replica_cursor)
-        else {
+        let Some((chain, _)) = self.snapshot.replicas.iter().nth(self.replica_cursor) else {
             return;
         };
         self.modal = Some(Modal::PickNode {
@@ -1769,21 +1777,14 @@ impl App {
         // Open a picker over the cursored chain's holders. The
         // Enter handler transitions into the Confirm modal once
         // the operator chooses which holder to evict.
-        let Some((chain, replica)) = self
-            .snapshot
-            .replicas
-            .iter()
-            .nth(self.replica_cursor)
-        else {
+        let Some((chain, replica)) = self.snapshot.replicas.iter().nth(self.replica_cursor) else {
             return;
         };
         if replica.holders.is_empty() {
             return; // chain has no holders; nothing to evict
         }
         self.modal = Some(Modal::PickNode {
-            purpose: crate::widgets::pick_node::PickNodePurpose::ForceEvictHolder {
-                chain: *chain,
-            },
+            purpose: crate::widgets::pick_node::PickNodePurpose::ForceEvictHolder { chain: *chain },
             cursor: 0,
         });
     }
@@ -1801,10 +1802,7 @@ impl App {
         let action = IceActionProposal::KillMigration { migration };
         let blast = simulate_ice_proposal(&self.snapshot, &action);
         self.modal = Some(Modal::Confirm(
-            crate::widgets::confirm::ConfirmAction::IceKillMigration {
-                migration,
-                blast,
-            },
+            crate::widgets::confirm::ConfirmAction::IceKillMigration { migration, blast },
         ));
     }
 
@@ -1816,15 +1814,13 @@ impl App {
         if let Some(focus) = self.node_focus.as_ref() {
             return Some(focus.id);
         }
-        self.snapshot
-            .peers
-            .keys()
-            .nth(self.nodes_cursor)
-            .copied()
+        self.snapshot.peers.keys().nth(self.nodes_cursor).copied()
     }
 
     fn propose_node_action(&mut self, kind: NodeActionKind) {
-        let Some(node) = self.cursored_node() else { return };
+        let Some(node) = self.cursored_node() else {
+            return;
+        };
         let node_display = self.node_display(node);
         // Drain takes an operator-typed window, so it routes
         // through ParamInput rather than building a Confirm
@@ -1841,14 +1837,12 @@ impl App {
             return;
         }
         let action = match kind {
-            NodeActionKind::Cordon => crate::widgets::confirm::ConfirmAction::Cordon {
-                node,
-                node_display,
-            },
-            NodeActionKind::Uncordon => crate::widgets::confirm::ConfirmAction::Uncordon {
-                node,
-                node_display,
-            },
+            NodeActionKind::Cordon => {
+                crate::widgets::confirm::ConfirmAction::Cordon { node, node_display }
+            }
+            NodeActionKind::Uncordon => {
+                crate::widgets::confirm::ConfirmAction::Uncordon { node, node_display }
+            }
             NodeActionKind::Drain => unreachable!("Drain handled above"),
             NodeActionKind::EnterMaintenance => {
                 crate::widgets::confirm::ConfirmAction::EnterMaintenance {
@@ -1858,22 +1852,13 @@ impl App {
                 }
             }
             NodeActionKind::ExitMaintenance => {
-                crate::widgets::confirm::ConfirmAction::ExitMaintenance {
-                    node,
-                    node_display,
-                }
+                crate::widgets::confirm::ConfirmAction::ExitMaintenance { node, node_display }
             }
             NodeActionKind::ClearAvoidList => {
-                crate::widgets::confirm::ConfirmAction::ClearAvoidList {
-                    node,
-                    node_display,
-                }
+                crate::widgets::confirm::ConfirmAction::ClearAvoidList { node, node_display }
             }
             NodeActionKind::InvalidatePlacement => {
-                crate::widgets::confirm::ConfirmAction::InvalidatePlacement {
-                    node,
-                    node_display,
-                }
+                crate::widgets::confirm::ConfirmAction::InvalidatePlacement { node, node_display }
             }
         };
         self.modal = Some(Modal::Confirm(action));
@@ -1942,7 +1927,11 @@ impl App {
                     // the host (the modal already shows the
                     // host id.label — Enter is the jump). Esc
                     // / q close without navigating.
-                    Some(Modal::BlobDetail { host_id, host_label, .. }) => {
+                    Some(Modal::BlobDetail {
+                        host_id,
+                        host_label,
+                        ..
+                    }) => {
                         self.focus_host(host_id, host_label);
                     }
                     // ^ host_label is now Option<String>; moved
@@ -1991,7 +1980,10 @@ impl App {
     fn commit_param_input(&mut self) {
         use crate::widgets::param_input::{parse_duration, ParamInputPurpose};
         let modal = self.modal.take();
-        let Some(Modal::ParamInput { purpose, buffer, .. }) = modal else {
+        let Some(Modal::ParamInput {
+            purpose, buffer, ..
+        }) = modal
+        else {
             return;
         };
         let parsed = match parse_duration(&buffer) {
@@ -2033,10 +2025,7 @@ impl App {
                 let action = IceActionProposal::FreezeCluster { ttl: parsed };
                 let blast = simulate_ice_proposal(&self.snapshot, &action);
                 self.modal = Some(Modal::Confirm(
-                    crate::widgets::confirm::ConfirmAction::IceFreezeCluster {
-                        ttl: parsed,
-                        blast,
-                    },
+                    crate::widgets::confirm::ConfirmAction::IceFreezeCluster { ttl: parsed, blast },
                 ));
             }
         }
@@ -2064,15 +2053,13 @@ impl App {
     /// Transition from `PickNode` to `Confirm` once the
     /// operator presses Enter — bake the cursored candidate
     /// into the appropriate ICE action variant.
-    fn commit_pick(
-        &mut self,
-        purpose: crate::widgets::pick_node::PickNodePurpose,
-        cursor: usize,
-    ) {
+    fn commit_pick(&mut self, purpose: crate::widgets::pick_node::PickNodePurpose, cursor: usize) {
         use net_sdk::deck::{simulate_ice_proposal, IceActionProposal};
         let this_node = 0x0001;
         let candidates = purpose.candidates(&self.snapshot, this_node);
-        let Some(picked) = candidates.get(cursor).copied() else { return };
+        let Some(picked) = candidates.get(cursor).copied() else {
+            return;
+        };
         let picked_display = self.node_display(picked);
         match purpose {
             crate::widgets::pick_node::PickNodePurpose::ForceCutoverTarget { chain } => {
@@ -2200,9 +2187,9 @@ impl App {
                     let _ = deck.admin().drop_replicas(node, chains).await;
                 }
                 ConfirmAction::IceFlushAvoidLists { .. } => {
-                    let proposal = deck.ice().flush_avoid_lists(
-                        net_sdk::deck::AvoidScope::Global,
-                    );
+                    let proposal = deck
+                        .ice()
+                        .flush_avoid_lists(net_sdk::deck::AvoidScope::Global);
                     dispatch_ice(&deck, proposal).await;
                 }
                 ConfirmAction::IceKillMigration { migration, .. } => {
@@ -2273,13 +2260,7 @@ impl App {
         // the body until they Esc out.
         if let Some(focus) = self.daemon_focus.as_ref() {
             let logs = self.logs_tail.snapshot();
-            tabs::daemon_page::render(
-                frame,
-                chunks[3],
-                focus,
-                &self.snapshot,
-                &logs,
-            );
+            tabs::daemon_page::render(frame, chunks[3], focus, &self.snapshot, &logs);
             widgets::footer::render(
                 frame,
                 chunks[4],
@@ -2299,21 +2280,17 @@ impl App {
                 .capability_set
                 .iter()
                 .any(|c| c == "dataforts.blob.storage");
-            let has_greedy = focus.peer.capability_set.iter().any(|c| {
-                c == "greedy.cache" || c == "dataforts.greedy.cache"
-            });
+            let has_greedy = focus
+                .peer
+                .capability_set
+                .iter()
+                .any(|c| c == "greedy.cache" || c == "dataforts.greedy.cache");
             let datafort = if has_blob || has_greedy {
                 Some(self.datafort_view_for(focus.id))
             } else {
                 None
             };
-            tabs::node_page::render(
-                frame,
-                chunks[3],
-                focus,
-                &self.snapshot,
-                datafort.as_ref(),
-            );
+            tabs::node_page::render(frame, chunks[3], focus, &self.snapshot, datafort.as_ref());
             widgets::footer::render(
                 frame,
                 chunks[4],
@@ -2338,26 +2315,15 @@ impl App {
                     &logs,
                 )
             }
-            Tab::Nodes => tabs::nodes::render(
-                frame,
-                chunks[3],
-                Some(&self.snapshot),
-                self.nodes_cursor,
-            ),
-            Tab::Daemons => tabs::daemons::render(
-                frame,
-                chunks[3],
-                Some(&self.snapshot),
-                self.daemons_cursor,
-            ),
+            Tab::Nodes => {
+                tabs::nodes::render(frame, chunks[3], Some(&self.snapshot), self.nodes_cursor)
+            }
+            Tab::Daemons => {
+                tabs::daemons::render(frame, chunks[3], Some(&self.snapshot), self.daemons_cursor)
+            }
             Tab::Dataforts => {
                 let entries = self.collect_dataforts();
-                tabs::dataforts::render(
-                    frame,
-                    chunks[3],
-                    &entries,
-                    self.dataforts_cursor,
-                );
+                tabs::dataforts::render(frame, chunks[3], &entries, self.dataforts_cursor);
             }
             Tab::Groups => {
                 let logs = self.logs_tail.snapshot();
@@ -2388,10 +2354,12 @@ impl App {
                     chunks[3],
                     self.tick,
                     records,
-                    self.logs_min_level,
-                    self.logs_paused.is_some(),
-                    &self.logs_search,
-                    self.logs_search_editing,
+                    tabs::logs::LogsView {
+                        min_level: self.logs_min_level,
+                        paused: self.logs_paused.is_some(),
+                        search: &self.logs_search,
+                        search_editing: self.logs_search_editing,
+                    },
                 );
             }
             Tab::Audit => {
@@ -2406,12 +2374,9 @@ impl App {
                     self.audit_search_editing,
                 );
             }
-            Tab::Replicas => tabs::replicas::render(
-                frame,
-                chunks[3],
-                Some(&self.snapshot),
-                self.replica_cursor,
-            ),
+            Tab::Replicas => {
+                tabs::replicas::render(frame, chunks[3], Some(&self.snapshot), self.replica_cursor)
+            }
             Tab::Migrations => tabs::migrations::render(
                 frame,
                 chunks[3],
@@ -2471,22 +2436,16 @@ impl App {
                     *cursor,
                 );
             }
-            Some(Modal::ParamInput { purpose, buffer, error }) => {
-                widgets::param_input::render(
-                    frame,
-                    area,
-                    purpose,
-                    buffer,
-                    error.as_deref(),
-                );
+            Some(Modal::ParamInput {
+                purpose,
+                buffer,
+                error,
+            }) => {
+                widgets::param_input::render(frame, area, purpose, buffer, error.as_deref());
             }
             Some(Modal::ClusterPicker { cursor }) => {
-                let sorted: Vec<crate::bookmarks::Bookmark> = self
-                    .bookmarks
-                    .sorted()
-                    .into_iter()
-                    .cloned()
-                    .collect();
+                let sorted: Vec<crate::bookmarks::Bookmark> =
+                    self.bookmarks.sorted().into_iter().cloned().collect();
                 widgets::cluster_picker::render(
                     frame,
                     area,
@@ -2495,14 +2454,12 @@ impl App {
                     *cursor,
                 );
             }
-            Some(Modal::BlobDetail { entry, host_id, host_label }) => {
-                widgets::blob_detail::render(
-                    frame,
-                    area,
-                    entry,
-                    *host_id,
-                    host_label.as_deref(),
-                );
+            Some(Modal::BlobDetail {
+                entry,
+                host_id,
+                host_label,
+            }) => {
+                widgets::blob_detail::render(frame, area, entry, *host_id, host_label.as_deref());
             }
             Some(Modal::ExportDone { outcome }) => {
                 widgets::export_done::render(frame, area, outcome);
@@ -2511,4 +2468,3 @@ impl App {
         }
     }
 }
-

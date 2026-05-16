@@ -8,15 +8,23 @@ use ratatui::{
 
 use crate::{nodes, theme};
 
+/// LOGS tab view state — the filter / search / pause knobs the
+/// operator twiddles. Grouped into a struct so `render` doesn't
+/// take a 7-argument bag of bools and strings; the App stamps
+/// one of these per frame from its own state.
+pub struct LogsView<'a> {
+    pub min_level: LogLevel,
+    pub paused: bool,
+    pub search: &'a str,
+    pub search_editing: bool,
+}
+
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
     tick: u64,
     records: &[LogRecord],
-    min_level: LogLevel,
-    paused: bool,
-    search: &str,
-    search_editing: bool,
+    view: LogsView<'_>,
 ) {
     // Status bar gets two rows: the chip line on top and a
     // blank spacer below so the search/filter/pause chips
@@ -24,12 +32,33 @@ pub fn render(
     // tab/jump/cursor row.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
         .split(area);
-    render_filter_bar(frame, rows[0], min_level, paused, search, search_editing);
-    render_log_grid(frame, rows[1], tick, records, min_level, search);
-    let status_row = Rect { height: 1, ..rows[2] };
-    render_status(frame, status_row, records, min_level, paused, search);
+    render_filter_bar(
+        frame,
+        rows[0],
+        view.min_level,
+        view.paused,
+        view.search,
+        view.search_editing,
+    );
+    render_log_grid(frame, rows[1], tick, records, view.min_level, view.search);
+    let status_row = Rect {
+        height: 1,
+        ..rows[2]
+    };
+    render_status(
+        frame,
+        status_row,
+        records,
+        view.min_level,
+        view.paused,
+        view.search,
+    );
 }
 
 fn render_filter_bar(
@@ -241,10 +270,10 @@ fn project_log_records(
         .filter(|r| needle.is_empty() || record_matches(r, &needle))
     {
         let (level_style, level_pad) = match rec.level {
-            LogLevel::Info  => (theme::dim(),   "INFO "),
-            LogLevel::Warn  => (theme::amber(), "WARN "),
-            LogLevel::Error => (theme::red(),   "ERR  "),
-            _              => (theme::text(),  "?    "),
+            LogLevel::Info => (theme::dim(), "INFO "),
+            LogLevel::Warn => (theme::amber(), "WARN "),
+            LogLevel::Error => (theme::red(), "ERR  "),
+            _ => (theme::text(), "?    "),
         };
         let ts = format_ts_ms(rec.ts_ms);
         let mut spans = vec![

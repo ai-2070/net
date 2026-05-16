@@ -25,10 +25,7 @@ use crate::theme;
 #[derive(Clone, Debug)]
 pub enum ParamInputPurpose {
     /// Drain window for a routine `Drain` admin commit.
-    DrainWindow {
-        node: u64,
-        node_display: String,
-    },
+    DrainWindow { node: u64, node_display: String },
     /// TTL for `IceFreezeCluster`. ICE-class.
     IceFreezeTtl,
 }
@@ -43,9 +40,7 @@ impl ParamInputPurpose {
 
     pub fn hint(&self) -> &'static str {
         match self {
-            Self::DrainWindow { .. } => {
-                "window for the placement controller to relocate workload"
-            }
+            Self::DrainWindow { .. } => "window for the placement controller to relocate workload",
             Self::IceFreezeTtl => {
                 "global placement freeze — auto-thaws after TTL or on manual thaw"
             }
@@ -65,14 +60,8 @@ impl ParamInputPurpose {
     /// operator typed `5` instead of `5m` or similar.
     pub fn range(&self) -> (Duration, Duration) {
         match self {
-            Self::DrainWindow { .. } => (
-                Duration::from_secs(1),
-                Duration::from_secs(60 * 60 * 24),
-            ),
-            Self::IceFreezeTtl => (
-                Duration::from_secs(5),
-                Duration::from_secs(60 * 30),
-            ),
+            Self::DrainWindow { .. } => (Duration::from_secs(1), Duration::from_secs(60 * 60 * 24)),
+            Self::IceFreezeTtl => (Duration::from_secs(5), Duration::from_secs(60 * 30)),
         }
     }
 
@@ -166,7 +155,9 @@ pub fn render(
             Span::styled(marker, accent),
             Span::styled(
                 banner,
-                Style::default().fg(accent.fg.unwrap_or_default()).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(accent.fg.unwrap_or_default())
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
         ]))
@@ -191,7 +182,9 @@ pub fn render(
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
             purpose.headline(),
-            Style::default().fg(accent.fg.unwrap_or_default()).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(accent.fg.unwrap_or_default())
+                .add_modifier(Modifier::BOLD),
         )]))
         .alignment(Alignment::Center),
         rows[0],
@@ -221,7 +214,10 @@ pub fn render(
             Err(_) => Line::from(vec![Span::styled("", theme::dim())]),
         },
     };
-    frame.render_widget(Paragraph::new(preview).alignment(Alignment::Center), rows[4]);
+    frame.render_widget(
+        Paragraph::new(preview).alignment(Alignment::Center),
+        rows[4],
+    );
 
     let (min, max) = purpose.range();
     frame.render_widget(
