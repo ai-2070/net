@@ -336,20 +336,6 @@ export declare class Identity {
   get tokenCacheLen(): number
 }
 
-/**
- * In-process `ChainReader` Node wrapper. Slice 1 ships the
- * in-memory variant; populate via `.append(originHash, seq,
- * payload)` then hand to `MeshQueryRunner`. Phase B+ will
- * expose a `fromRedex(...)` adapter.
- */
-export declare class InMemoryChainReader {
-  constructor()
-  /** Append a single event to the in-memory store. */
-  append(originHash: bigint, seq: bigint, payload: Buffer): void
-  /** Tip of chain `originHash`, or `null` if unknown. */
-  latestSeq(originHash: bigint): bigint | null
-}
-
 /** Typed memories adapter handle. */
 export declare class MemoriesAdapter {
   /**
@@ -425,139 +411,100 @@ export declare class MemoryWatchIter {
   close(): void
 }
 
-/**
- * 1:1 AST factory surface. Construct via static methods that
- * mirror the Rust `OperatorPlan` variants. Internally carries
- * a fully-planned `OperatorNode`; slice 1 exposes only the
- * atomic operators that don't need planner-side resolution.
- */
-export declare class MeshQuery {
-  /** Read the event at `seq` from chain `originHash`. */
-  static at(originHash: bigint, seq: bigint): MeshQuery
-  /** Read events in the half-open seq range `[start, end)`. */
-  static between(originHash: bigint, start: bigint, end: bigint): MeshQuery
-  /** Read the tip event from chain `originHash`. */
-  static latest(originHash: bigint): MeshQuery
+export declare class MeshOsDaemonHandle {
   /**
-   * Start a fluent builder. Equivalent to constructing a
-   * fresh [`QueryBuilder`]; chainable methods (`at`,
-   * `between`, `latest`, `filter`, `count`, `sum`, `avg`,
-   * `min`, `max`, `percentile`, `distinctCount`, `window`,
-   * `join`) compose into a final `MeshQuery` via `.build()`.
+   * Substrate identifier (the keypair's origin hash). Stable
+   * across the handle's lifetime — readable after shutdown.
    */
-  static builder(): MeshQuery
+  get daemonId(): bigint
+  /** Daemon's `name` at registration. Readable after shutdown. */
+  get daemonName(): string
   /**
-   * Filter `inner`'s rows by `predicate`. The executor builds
-   * a synthetic per-row tag view (origin / seq / flat JSON
-   * payload fields) and evaluates the predicate; rows whose
-   * evaluation returns `true` pass through unchanged. Rows
-   * whose payload isn't JSON are still filterable by their
-   * row-intrinsic fields (`origin`, `seq`); payload field
-   * references against a non-JSON payload simply don't match.
+   * Cached metadata view. Refresh via `refreshMetadata()` for
+   * fresh peer / maintenance state.
    */
-  static filter(inner: MeshQuery, predicate: Predicate): MeshQuery
+  metadata(): Promise<MetadataViewJs>
   /**
-   * Tumbling window on `seq` with the given bucket `size`.
-   * Emits one sentinel row per non-empty bucket; decode via
-   * `ResultRow.decodeWindow()`.
+   * Rebuild the metadata view from the runtime's latest
+   * snapshot. Cheap.
    */
-  static window(inner: MeshQuery, size: bigint): MeshQuery
+  refreshMetadata(): Promise<MetadataViewJs>
   /**
-   * Count rows. `groupBy` is an optional list of row-
-   * intrinsic field names: `null` / `[]` = single bucket;
-   * `["origin"]`, `["seq"]`, or `["origin", "seq"]` for
-   * per-group counts.
+   * Block until the next control event arrives, the runtime
+   * shuts down, or `timeoutMs` elapses. Resolves to the event
+   * or `null` on timeout / shutdown.
    */
-  static count(inner: MeshQuery, groupBy?: Array<string> | undefined | null): MeshQuery
+  nextControl(timeoutMs?: bigint | undefined | null): Promise<DaemonControlJs | null>
   /**
-   * Sum of a numeric field across rows. `field` is a row-
-   * intrinsic name (`origin` / `seq`) or a dotted JSON path.
+   * Non-blocking control-event receive. Returns the next event
+   * or `null` if the channel is empty.
    */
-  static sum(inner: MeshQuery, field: string, groupBy?: Array<string> | undefined | null): MeshQuery
+  tryNextControl(): Promise<DaemonControlJs | null>
   /**
-   * Arithmetic mean. Rows where the field is missing /
-   * non-numeric are excluded from both numerator + denom.
+   * Publish a log line tagged with this daemon's id. Non-blocking;
+   * throws `MeshOsSdkError` with `kind` `queue_full` or
+   * `loop_closed` when the substrate's log ring is saturated.
    */
-  static avg(inner: MeshQuery, field: string, groupBy?: Array<string> | undefined | null): MeshQuery
-  /** Minimum value of a numeric field. */
-  static min(inner: MeshQuery, field: string, groupBy?: Array<string> | undefined | null): MeshQuery
-  /** Maximum value of a numeric field. */
-  static max(inner: MeshQuery, field: string, groupBy?: Array<string> | undefined | null): MeshQuery
+  publishLog(level: string, message: string): Promise<void>
   /**
-   * Nearest-rank exact percentile at `p ∈ [0.0, 1.0]`. Same
-   * field-extraction semantics as the numeric aggregates.
+   * Publish (or update) the daemon's capability set. Slice 1 is
+   * a substrate-side stub — the call returns without committing.
+   * The argument is accepted for forward-compatibility; today
+   * it's ignored.
    */
-  static percentile(inner: MeshQuery, field: string, p: number, groupBy?: Array<string> | undefined | null): MeshQuery
+  publishCapabilities(caps?: CapabilitySetJs | undefined | null): Promise<void>
   /**
-   * Exact distinct count over the canonical string
-   * projection of a row-intrinsic / JSON field.
+   * Drive a graceful shutdown. Sends
+   * `Shutdown { gracePeriodMs }` on the daemon's control
+   * channel, parks for `graceMs`, then unregisters. Consumes
+   * the handle — subsequent method calls throw
+   * `MeshOsSdkError(kind: "already_shutdown")`.
    */
-  static distinctCount(inner: MeshQuery, field: string, groupBy?: Array<string> | undefined | null): MeshQuery
-  /**
-   * Inner / outer hash- or sort-merge-join. `kind` is one of
-   * `"inner"` / `"left_outer"` / `"right_outer"` /
-   * `"full_outer"`. `key` is the field name both sides share
-   * — row-intrinsic names (`origin` / `seq` / `origin,seq`)
-   * map to the typed enum; anything else is treated as a
-   * JSON payload path. `strategy` defaults to
-   * `"hash_broadcast"` (alternatives: `"sort_merge"`).
-   * `watermarkSecs` is informational under snapshot
-   * semantics.
-   */
-  static join(left: MeshQuery, right: MeshQuery, kind: string, key: string, strategy?: string | undefined | null, watermarkSecs?: number | undefined | null): MeshQuery
-  /**
-   * Emit a pre-walked lineage as one row per entry. `entries`
-   * is a list of `LineageEntry` in walk order; `direction` is
-   * `"back"` or `"forward"`. Each entry emits a `ResultRow`
-   * with `originHash = entry.originHash`, `seq = entry.tipSeq
-   * ?? 0`, payload empty. Compose with `at` / `between` to
-   * fetch event content for each chain.
-   */
-  static lineageEmit(originHash: bigint, entries: Array<LineageEntry>, direction: string): MeshQuery
+  gracefulShutdown(graceMs?: bigint | undefined | null): Promise<void>
 }
 
-/**
- * Runs queries against a [`InMemoryChainReader`] via the
- * substrate's `LocalMeshQueryExecutor`. Async by design —
- * `execute()` returns a `MeshQueryStream` whose `next()` is
- * async. The TS-side wrapper layers `Symbol.asyncIterator`
- * so callers can `for await (const row of stream)`.
- */
-export declare class MeshQueryRunner {
+export declare class MeshOsDaemonSdk {
   /**
-   * Build a runner. `enableCache` wires the Phase F LRU
-   * (default: false). Capability-version source is hard-
-   * wired to `0` while there's no `CapabilityIndex` plumbed
-   * (slice 1 is local-executor-only).
+   * Start the SDK with optional config + the substrate's
+   * `LoggingDispatcher` as the action consumer.
+   *
+   * Async because `CoreSdk::start` calls `tokio::spawn`
+   * internally — that requires a tokio context, which the napi
+   * `async fn` runtime provides. Sync-factory would force us
+   * to build a second tokio runtime here, which collides with
+   * napi-rs's own (the "Cannot start a runtime from within a
+   * runtime" panic).
+   *
+   * `controlCapacity` overrides the per-daemon control-channel
+   * capacity (default 8 events). `callbackTimeoutMs` bounds how
+   * long the bridge waits for each JS callback to respond
+   * (default 60_000 ms) — see [`DEFAULT_CALLBACK_TIMEOUT_MS`]
+   * for the deadlock-prevention rationale.
    */
-  constructor(reader: InMemoryChainReader, enableCache?: boolean | undefined | null)
+  static start(config?: MeshOsConfigJs | undefined | null, controlCapacity?: number | undefined | null, callbackTimeoutMs?: number | undefined | null): Promise<MeshOsDaemonSdk>
   /**
-   * Execute `query`. Returns a stream whose `next()` yields
-   * the next [`ResultRow`] (or `null` on EOF). The full row
-   * list is drained at execute time and buffered inside the
-   * stream; true row-by-row streaming lands when a consumer
-   * needs it.
+   * Register a JS daemon under the supplied identity. The
+   * daemon object must expose `name` (string property) and
+   * `process(event)`; optional `snapshot`, `restore`,
+   * `onControl`.
+   *
+   * Returns the handle that owns the daemon's lifecycle. Drop
+   * the handle to unregister (the Rust-side `Drop` impl still
+   * cleans up the registry slot); call `gracefulShutdown` for
+   * the explicit drain path.
    */
-  execute(query: MeshQuery, options?: ExecuteOptions | undefined | null): Promise<MeshQueryStream>
-}
-
-/**
- * Pull-based row stream. The JS-side TS shim adds
- * `Symbol.asyncIterator` over this; raw callers can use
- * `await stream.next()` in a loop themselves.
- */
-export declare class MeshQueryStream {
+  registerDaemon(daemon: DaemonObjectTsfns, identity: Identity): Promise<MeshOsDaemonHandle>
   /**
-   * The next row, or `null` on end-of-stream. Idempotent
-   * post-EOF — repeated calls keep returning `null`.
+   * Diagnostic counter — total control events the router
+   * dropped across every registered daemon because a daemon's
+   * channel was full.
    */
-  next(): Promise<ResultRow | null>
+  droppedControlEvents(): Promise<bigint>
   /**
-   * Drain the remaining rows into a list. Convenience for
-   * callers that don't want to write the `await next()`
-   * loop. Subsequent `.next()` calls return `null`.
+   * Tear down the wrapped runtime. Consumes the SDK — subsequent
+   * method calls throw `already_shutdown`.
    */
-  toArray(): Promise<Array<ResultRow>>
+  shutdown(): Promise<void>
 }
 
 /**
@@ -1056,64 +1003,6 @@ export declare class NetStream {
   get peerNodeId(): bigint
   /** The caller-chosen stream id. */
   get streamId(): bigint
-}
-
-/**
- * Fluent builder for the common-ops query shape. Each
- * chainable method returns a fresh builder so callers can
- * write
- *
- * ```ts
- * const q = MeshQuery.builder()
- *   .between(0xCDn, 0n, 100n)
- *   .filter(predicateEquals('severity', 'high'))
- *   .count(null)
- *   .build();
- * ```
- *
- * Source operators (`at` / `between` / `latest`) seed the
- * pipeline; pipeline operators require a seeded state and
- * surface a `MeshDbError` when called on an empty builder.
- * `.build()` consumes the builder into a `MeshQuery`.
- */
-export declare class QueryBuilder {
-  /** Source: read a single event. Resets any prior state. */
-  at(originHash: bigint, seq: bigint): QueryBuilder
-  /**
-   * Source: read events in the half-open seq range. Resets
-   * any prior state.
-   */
-  between(originHash: bigint, start: bigint, end: bigint): QueryBuilder
-  /** Source: read the tip event. Resets any prior state. */
-  latest(originHash: bigint): QueryBuilder
-  /** Filter the current pipeline's rows. */
-  filter(predicate: Predicate): QueryBuilder
-  /** Count rows in the current pipeline. */
-  count(groupBy?: Array<string> | undefined | null): QueryBuilder
-  /** Sum of a numeric field. */
-  sum(field: string, groupBy?: Array<string> | undefined | null): QueryBuilder
-  /** Arithmetic mean of a numeric field. */
-  avg(field: string, groupBy?: Array<string> | undefined | null): QueryBuilder
-  /** Min over a numeric field. */
-  min(field: string, groupBy?: Array<string> | undefined | null): QueryBuilder
-  /** Max over a numeric field. */
-  max(field: string, groupBy?: Array<string> | undefined | null): QueryBuilder
-  /** Nearest-rank percentile. */
-  percentile(field: string, p: number, groupBy?: Array<string> | undefined | null): QueryBuilder
-  /** Exact distinct count. */
-  distinctCount(field: string, groupBy?: Array<string> | undefined | null): QueryBuilder
-  /** Tumbling window on `seq` with the given bucket `size`. */
-  window(size: bigint): QueryBuilder
-  /**
-   * Join the current pipeline with `right`. See
-   * [`MeshQuery::join`] for full parameter docs.
-   */
-  join(right: MeshQuery, kind: string, key: string, strategy?: string | undefined | null, watermarkSecs?: number | undefined | null): QueryBuilder
-  /**
-   * Terminal: consume the builder into a `MeshQuery`.
-   * Surfaces `MeshDbError` when the builder has no source.
-   */
-  build(): MeshQuery
 }
 
 /**
@@ -1694,60 +1583,6 @@ export interface AcceleratorJs {
 }
 
 /**
- * Decoded aggregate-row payload (slice 2 decoder).
- *
- * `kind` is one of `"count"` / `"sum"` / `"avg"` / `"min"` /
- * `"max"` / `"distinct_count"` / `"percentile"`. `value` is the
- * numeric output (always set for count / distinct_count;
- * `null` for the others when the group held no numeric rows).
- * `count` mirrors `value` as a BigInt for the count-flavored
- * kinds so callers don't have to coerce floats.
- */
-export interface AggregateResult {
-  group?: GroupKey
-  kind: string
-  value?: number
-  count?: bigint
-}
-
-/**
- * Cache policy as a tagged plain-object shape. `kind` is one
- * of `"permanent"` (cache until LRU eviction; use only when
- * the query's result is immutable under substrate semantics)
- * or `"time_bound"` (TTL expiry, `ttlSeconds` defaults to
- * 5 s per the locked Phase F join-watermark mirror).
- *
- * Construct via the [`cachePolicyPermanent`] /
- * [`cachePolicyTimeBound`] module-level factories for
- * type-safe defaults, or build the object literal directly
- * if you're sure about the shape.
- */
-export interface CachePolicy {
-  /**
-   * `"permanent"` or `"time_bound"`. Unknown kinds map to
-   * the default `TimeBound(5s)`.
-   */
-  kind: string
-  /**
-   * TTL in seconds (only meaningful when `kind ==
-   * "time_bound"`). Omitted / non-finite → 5 s.
-   */
-  ttlSeconds?: number
-}
-
-/**
- * Build a `"permanent"` cache policy object. Equivalent to
- * `{ kind: "permanent" }`.
- */
-export declare function cachePolicyPermanent(): CachePolicy
-
-/**
- * Build a `"time_bound"` cache policy object. `seconds`
- * defaults to 5 s when omitted.
- */
-export declare function cachePolicyTimeBound(seconds?: number | undefined | null): CachePolicy
-
-/**
  * Per-call options. All fields are optional; defaults match the
  * inner [`InnerCallOptions::default()`].
  */
@@ -1844,6 +1679,18 @@ export interface CausalEventJs {
 }
 
 /**
+ * The causal event handed to a daemon's `process(event)` callback.
+ * Matches the cross-binding wire form: `{originHash, sequence,
+ * payload}`. Sequence + originHash ride as `BigInt` to avoid the
+ * `2^53` precision cliff.
+ */
+export interface CausalEventJs {
+  originHash: bigint
+  sequence: bigint
+  payload: Buffer
+}
+
+/**
  * JS-facing channel config, mirroring the core `ChannelConfig`
  * field-for-field. v1 does not expose `publishCaps` /
  * Channel registration config. `publishCaps` / `subscribeCaps`
@@ -1910,6 +1757,24 @@ export interface CortexSnapshot {
 }
 
 /**
+ * Supervisor → daemon control event, in the cross-binding wire
+ * form. Variants:
+ *
+ * - `{kind: "Shutdown", gracePeriodMs}`
+ * - `{kind: "DrainStart", gracePeriodMs}`
+ * - `{kind: "DrainFinish"}`
+ * - `{kind: "BackpressureOn", level}` — `level` is `[0.0, 1.0]`.
+ * - `{kind: "BackpressureOff"}`
+ * - `{kind: "Unknown"}` — fallback when the substrate adds a
+ *   variant the binding hasn't been rebuilt against.
+ */
+export interface DaemonControlJs {
+  kind: string
+  gracePeriodMs?: bigint
+  level?: number
+}
+
+/**
  * Host configuration for a daemon. Omitted fields fall back to
  * the core defaults (`auto_snapshot_interval: 0`,
  * `max_log_entries: 10_000`).
@@ -1961,26 +1826,6 @@ export interface DaemonStatsJs {
 }
 
 /**
- * Try to decode `row.payload` as an aggregate payload.
- * Returns `null` for rows that aren't aggregate sentinels.
- */
-export declare function decodeAggregate(row: ResultRow): AggregateResult | null
-
-/**
- * Try to decode `row.payload` as a joined-row payload.
- * Returns `null` when the bytes don't deserialize as a
- * JoinedRow.
- */
-export declare function decodeJoined(row: ResultRow): JoinedRow | null
-
-/**
- * Try to decode `row.payload` as a window bucket. Returns
- * `null` when the bytes don't deserialize as a
- * WindowBoundary.
- */
-export declare function decodeWindow(row: ResultRow): WindowBoundary | null
-
-/**
  * Delegate a token to a new subject. The `parent_bytes` token must
  * have `delegation_depth > 0` and include the `delegate` scope; the
  * `signer` identity must be the subject of the parent token.
@@ -2001,16 +1846,6 @@ export interface EventBusOptions {
   jetstream?: JetStreamOptions
   /** Net adapter configuration for encrypted UDP transport */
   net?: NetOptions
-}
-
-/**
- * Per-execute options. `bypassCache` skips both lookup AND
- * writeback (Phase F decision); `cachePolicy` defaults to
- * `TimeBound(5s)` when omitted.
- */
-export interface ExecuteOptions {
-  bypassCache?: boolean
-  cachePolicy?: CachePolicy
 }
 
 export interface ForkGroupConfigJs {
@@ -2071,17 +1906,6 @@ export interface GroupHostConfigJs {
   maxLogEntries?: number
 }
 
-/**
- * Group-key identifier carried inside an `AggregateResult`.
- * `kind` is `"origin"` / `"seq"` / `"origin_seq"`; the
- * populated field(s) match the kind.
- */
-export interface GroupKey {
-  kind: string
-  originHash?: bigint
-  seq?: bigint
-}
-
 export interface HardwareJs {
   cpuCores?: number
   cpuThreads?: number
@@ -2133,41 +1957,16 @@ export interface JetStreamOptions {
 }
 
 /**
- * Decoded join-row payload (slice 2 decoder). Either side is
- * `null` for outer-join unmatched rows; inner-join rows have
- * both populated.
+ * Maintenance state projection. The `kind` discriminator carries
+ * the variant; `sinceMs` / `deadlineRemainingMs` / `reason` are
+ * populated only for variants that carry them. Mirrors the
+ * Python binding's dict envelope.
  */
-export interface JoinedRow {
-  left?: ResultRow
-  right?: ResultRow
-}
-
-/**
- * One chain reached during a lineage walk. Pre-walked by the
- * caller and handed to `MeshQuery.lineageEmit(...)`. The SDK
- * doesn't itself walk the `fork-of:` graph — that needs a
- * `CapabilityIndex`, which isn't plumbed through the Node
- * runner yet. Callers maintain their own graph view and emit
- * entries in walk order: index 0 is the start origin with
- * `depth = 0n`; ancestors / descendants follow.
- */
-export interface LineageEntry {
-  /** Chain origin hash (substrate `u64`). */
-  originHash: bigint
-  /**
-   * Hops from the walk's start. `0n` for the start origin.
-   * Substrate-side this is a `u32`; values outside that range
-   * are rejected at the `lineageEmit` factory. BigInt for
-   * shape parity with the other id-like fields on this
-   * struct.
-   */
-  depth: bigint
-  /**
-   * Best-known tip seq for this chain, if any. Surfaces in
-   * the emitted row's `seq` field (defaults to `0` when
-   * absent).
-   */
-  tipSeq?: bigint
+export interface MaintenanceStateJs {
+  kind: string
+  sinceMs?: bigint
+  deadlineRemainingMs?: bigint
+  reason?: string
 }
 
 export interface MemberInfoJs {
@@ -2297,6 +2096,27 @@ export interface MeshOptions {
    * without `--features port-mapping`.
    */
   tryPortMapping?: boolean
+}
+
+export interface MeshOsConfigJs {
+  thisNode?: bigint
+  tickIntervalMs?: bigint
+  eventQueueCapacity?: number
+  actionQueueCapacity?: number
+}
+
+/**
+ * Read-only cluster view a daemon can observe. Peers are emitted
+ * as a list of `[nodeId, PeerSnapshotJs]` tuples so JS callers
+ * can `.entries()`/`.map()` cleanly while preserving BigInt
+ * fidelity on the node id keys.
+ */
+export interface MetadataViewJs {
+  nodeId: bigint
+  daemonId: bigint
+  daemonName: string
+  maintenanceState: MaintenanceStateJs
+  peers: Array<PeerSnapshotEntryJs>
 }
 
 /**
@@ -2443,6 +2263,26 @@ export declare function normalizeGpuVendor(vendor: string): string
  */
 export declare function parseToken(bytes: Buffer): TokenInfo
 
+export interface PeerSnapshotEntryJs {
+  nodeId: bigint
+  snapshot: PeerSnapshotJs
+}
+
+export interface PeerSnapshotJs {
+  rttMs?: bigint
+  health?: string
+  maintenance?: string
+  cpuLoad1M?: number
+  memUsedBytes?: bigint
+  memTotalBytes?: bigint
+  diskUsedBytes?: bigint
+  diskTotalBytes?: bigint
+  saturationTrend?: number
+  capabilitySet: Array<string>
+  softwareVersion?: string
+  forkedFrom?: bigint
+}
+
 /**
  * Candidate handed to the JS placement-filter predicate.
  *
@@ -2478,82 +2318,6 @@ export interface PollResponse {
   /** Whether there are more events available */
   hasMore: boolean
 }
-
-/**
- * Tagged predicate object. `kind` discriminates the variant;
- * the field set is the union of all variants' inputs (each
- * variant uses a subset). Build with the module-level
- * `predicate*` helpers — manual object literals work too if
- * you're sure about the field set.
- *
- * Field paths target the synthetic `Dataforts` axis: a
- * row-intrinsic name like `"origin"` / `"seq"` resolves to the
- * row's intrinsic; a JSON path like `"severity"` or `"a.b.c"`
- * resolves to the flattened JSON-object payload.
- */
-export interface Predicate {
-  /**
-   * Variant discriminator. One of: `exists` / `equals` /
-   * `numeric_at_least` / `numeric_at_most` /
-   * `numeric_in_range` / `string_prefix` / `string_matches`
-   * / `semver_at_least` / `and` / `or` / `not`.
-   */
-  kind: string
-  /** Field name (axis-tag predicates). */
-  field?: string
-  /** String value (equals). */
-  value?: string
-  /** Numeric threshold (numeric_at_least / numeric_at_most). */
-  threshold?: number
-  /** Range lower bound (numeric_in_range). */
-  min?: number
-  /** Range upper bound (numeric_in_range). */
-  max?: number
-  /** String prefix (string_prefix). */
-  prefix?: string
-  /** String pattern (string_matches). */
-  pattern?: string
-  /** Version literal (semver_at_least). */
-  version?: string
-  /**
-   * Child predicates (and / or / not — `not` uses a 1-element
-   * list).
-   */
-  children?: Array<Predicate>
-}
-
-/** Conjunction. Empty list evaluates to `true` (vacuous match). */
-export declare function predicateAnd(children: Array<Predicate>): Predicate
-
-/** `field == value` (string equality). */
-export declare function predicateEquals(field: string, value: string): Predicate
-
-/** Field is present (any value). */
-export declare function predicateExists(field: string): Predicate
-
-/** Negation. */
-export declare function predicateNot(child: Predicate): Predicate
-
-/** `field >= threshold` (numeric). */
-export declare function predicateNumericAtLeast(field: string, threshold: number): Predicate
-
-/** `field <= threshold` (numeric). */
-export declare function predicateNumericAtMost(field: string, threshold: number): Predicate
-
-/** `min <= field <= max`. */
-export declare function predicateNumericInRange(field: string, min: number, max: number): Predicate
-
-/** Disjunction. Empty list evaluates to `false`. */
-export declare function predicateOr(children: Array<Predicate>): Predicate
-
-/** `field >= version` (semver). */
-export declare function predicateSemverAtLeast(field: string, version: string): Predicate
-
-/** Substring `pattern` in `field`. */
-export declare function predicateStringMatches(field: string, pattern: string): Predicate
-
-/** `field.startsWith(prefix)`. */
-export declare function predicateStringPrefix(field: string, prefix: string): Predicate
 
 /** Publish-fanout config, mirror of the core `PublishConfig`. */
 export interface PublishConfigJs {
@@ -2732,27 +2496,6 @@ export interface RequestContextJs {
   routingKey?: string
   sessionId?: string
   requestId?: string
-}
-
-/**
- * One row from a query result.
- *
- * `originHash` is the 16-hex chain identifier; `seq` is the
- * per-chain monotonic sequence; `payload` is opaque bytes
- * (event body for plain reads, or a postcard-encoded envelope
- * for aggregate / join / window sentinel rows — see the
- * `decodeAggregate` / `decodeJoined` / `decodeWindow`
- * module-level helpers).
- *
- * Plain object (not a class) so it can be nested inside
- * `WindowBoundary.rows` / `JoinedRow.left` etc. without the
- * `Vec<ResultRow>` marshalling restriction that
- * `#[napi]` classes carry.
- */
-export interface ResultRow {
-  originHash: bigint
-  seq: bigint
-  payload: Buffer
 }
 
 /**
@@ -3016,15 +2759,3 @@ export interface ToolJs {
  * for that.
  */
 export declare function verifyToken(bytes: Buffer): boolean
-
-/**
- * Decoded window-bucket payload (slice 2 decoder). `start`
- * and `end` are the bucket's seq bounds (half-open); `rows`
- * is the list of rows that fell in the bucket, in seq-asc
- * order.
- */
-export interface WindowBoundary {
-  start: bigint
-  end: bigint
-  rows: Array<ResultRow>
-}

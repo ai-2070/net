@@ -296,6 +296,16 @@ impl Identity {
     pub(crate) fn to_sdk_identity(&self) -> net_sdk::Identity {
         net_sdk::Identity::from_seed(*self.keypair.secret_bytes())
     }
+
+    /// Clone out the inner `EntityKeypair`. Used by the MeshOS
+    /// binding's `register_daemon` which takes an owned keypair
+    /// (the supervisor reads the `origin_hash` as the daemon's
+    /// substrate id). `EntityKeypair: Clone` so this is cheap;
+    /// the secret bytes never leave the binding.
+    #[cfg(feature = "meshos")]
+    pub(crate) fn keypair_clone(&self) -> EntityKeypair {
+        (*self.keypair).clone()
+    }
 }
 
 // =========================================================================

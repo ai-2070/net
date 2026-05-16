@@ -72,6 +72,14 @@ compute = ["net", "dep:net-sdk", "net-sdk/compute", "dep:dashmap"]
 # pulled into the build when this flag is set — a `compute`-only
 # build doesn't compile the groups code.
 groups = ["compute", "net-sdk/groups"]
+# MeshOS daemon-author SDK (`MESHOS_SDK_PLAN.md` Phase 3). Builds on
+# `compute` for the `MeshDaemon` trait + `Identity` wrapper and on
+# the substrate's `net/meshos` for the supervisor runtime. The
+# substrate's `meshos` feature implies `cortex`, which the Node
+# binding's `cortex` feature already activates — list it here so
+# consumers asking only for `meshos` get the full transitive dep
+# chain.
+meshos = ["compute", "cortex", "net/meshos", "net-sdk/meshos"]
 # Test-only helpers (`testInjectSyntheticPeer`, etc.). Gated
 # separately so enabling `groups` alone does NOT export test-only
 # APIs to production JS consumers. The vitest suite builds with
