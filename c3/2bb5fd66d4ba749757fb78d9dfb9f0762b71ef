@@ -1,0 +1,20 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_16_DECK_TUI.md
+  s_46edf7dc333ef6::t_63809e8bb025cd 14-18,22-23
+  s_46edf7dc333ef6::t_b0990617cfaf97 95-157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "c32bb5fd66d4ba749757fb78d9dfb9f0762b71ef",
+  "prompts": {},
+  "sessions": {
+    "s_46edf7dc333ef6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e145bb62-38ea-4dbe-81cd-e36e7e65c2ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
