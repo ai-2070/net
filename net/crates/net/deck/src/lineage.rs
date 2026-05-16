@@ -38,10 +38,10 @@ pub enum GroupKind {
 #[derive(Clone, Copy, Debug)]
 pub enum MemberRole {
     Solo,
-    Replica(u8),
+    Replica(u16),
     StandbyActive,
-    StandbyWarm(u8),
-    Fork(u8),
+    StandbyWarm(u16),
+    Fork(u16),
 }
 
 pub struct LiveMember<'a> {
@@ -114,15 +114,22 @@ fn parse_name(name: &str) -> (GroupKind, String) {
 }
 
 fn role_for(kind: GroupKind, index: usize) -> MemberRole {
+    // Saturate rather than truncate — `u8` wrapped to 0 for
+    // member 256 and rendered `REP m[0]` for the 257th
+    // replica in a stress configuration. `u16` lifts the
+    // cliff to 65_536, well past any realistic group size,
+    // and `min(u16::MAX)` keeps the worst case readable
+    // instead of silently aliasing.
+    let cap = |i: usize| -> u16 { i.min(u16::MAX as usize) as u16 };
     match kind {
         GroupKind::Solo => MemberRole::Solo,
-        GroupKind::Replica => MemberRole::Replica(index as u8),
-        GroupKind::Fork { .. } => MemberRole::Fork(index as u8),
+        GroupKind::Replica => MemberRole::Replica(cap(index)),
+        GroupKind::Fork { .. } => MemberRole::Fork(cap(index)),
         GroupKind::Standby => {
             if index == 0 {
                 MemberRole::StandbyActive
             } else {
-                MemberRole::StandbyWarm((index - 1) as u8)
+                MemberRole::StandbyWarm(cap(index - 1))
             }
         }
     }
