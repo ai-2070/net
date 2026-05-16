@@ -1,0 +1,27 @@
+net/crates/net/deck/src/tabs/mod.rs
+  s_46edf7dc333ef6::t_baf04d5c194ae5 14-33
+net/crates/net/deck/src/tabs/daemons.rs
+  s_46edf7dc333ef6::t_629acce3e1bce8 161
+net/crates/net/deck/src/tabs/groups.rs
+  s_46edf7dc333ef6::t_65498fb5af47f2 486
+net/crates/net/deck/src/tabs/daemon_page.rs
+  s_46edf7dc333ef6::t_23d4fae7e43c31 380
+net/crates/net/deck/src/tabs/migrations.rs
+  s_46edf7dc333ef6::t_d62f64f7f42027 121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "f062c85f894720ef45428da4c49f85d8c6f02007",
+  "prompts": {},
+  "sessions": {
+    "s_46edf7dc333ef6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e145bb62-38ea-4dbe-81cd-e36e7e65c2ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
