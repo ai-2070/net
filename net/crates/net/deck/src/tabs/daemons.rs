@@ -42,9 +42,21 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
 
 fn render_live(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cursor: usize) {
     let groups = lineage::group_daemons(&snapshot.daemons);
-    let total: usize = groups.iter().map(|g| g.members.len()).sum();
+    // Flatten group→member into a single ordered list so the
+    // scroll window can slice on a flat index. Pairs each member
+    // with the group it came from so the row render still has
+    // the lineage metadata in hand.
+    let flat: Vec<(&lineage::LiveGroup<'_>, &lineage::LiveMember<'_>)> = groups
+        .iter()
+        .flat_map(|g| g.members.iter().map(move |m| (g, m)))
+        .collect();
+    let total = flat.len();
     let pos = cursor.min(total.saturating_sub(1)) + 1;
-    let header_line = Line::from(vec![
+    let body_h = (area.height as usize)
+        .saturating_sub(2)
+        .saturating_sub(1);
+    let (start, end, hidden_above, hidden_below) = super::scroll_window(total, body_h, cursor);
+    let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("DAEMONS", theme::green_hi()),
         Span::styled(
@@ -52,11 +64,23 @@ fn render_live(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cur
             theme::chrome(),
         ),
         Span::styled(format!("    {pos}/{total}"), theme::dim()),
-    ]);
+    ];
+    if hidden_above > 0 {
+        title_spans.push(Span::styled(
+            format!("    ▲ {hidden_above} more"),
+            theme::dim(),
+        ));
+    }
+    if hidden_below > 0 {
+        title_spans.push(Span::styled(
+            format!("    ▼ {hidden_below} more"),
+            theme::dim(),
+        ));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
-        .title(header_line)
+        .title(Line::from(title_spans))
         .title_alignment(Alignment::Left);
 
     let header = Row::new(vec![
@@ -72,10 +96,10 @@ fn render_live(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cur
     ])
     .height(1);
 
-    let mut table_rows: Vec<Row> = Vec::with_capacity(total);
-    let mut row_idx = 0usize;
-    for group in &groups {
-        for m in &group.members {
+    let mut table_rows: Vec<Row> = Vec::with_capacity(end.saturating_sub(start));
+    for (offset, (group, m)) in flat[start..end].iter().enumerate() {
+        let row_idx = start + offset;
+        {
             let d = m.daemon;
             let is_cursor = row_idx == cursor;
             let marker = if is_cursor { "▶" } else { " " };
@@ -123,7 +147,6 @@ fn render_live(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cur
                 Cell::from(Span::styled(format!("{:.2}", d.saturation), theme::text())),
                 Cell::from(Span::styled(format_age(d.age_ms), theme::dim())),
             ]));
-            row_idx += 1;
         }
     }
 
@@ -144,8 +167,8 @@ fn render_live(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cur
     .header(header)
     .block(block)
     .column_spacing(2);
-    let total = total_daemons(snapshot);
-    let mut state = TableState::default().with_selected(Some(cursor.min(total.saturating_sub(1))));
+    let selected = cursor.checked_sub(start).filter(|s| start + *s < end);
+    let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
 }
 

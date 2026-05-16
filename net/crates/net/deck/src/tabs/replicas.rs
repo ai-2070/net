@@ -69,7 +69,11 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cu
     }
 
     let pos = cursor.min(total.saturating_sub(1)) + 1;
-    let header_line = Line::from(vec![
+    let body_h = (area.height as usize)
+        .saturating_sub(2)
+        .saturating_sub(1);
+    let (start, end, hidden_above, hidden_below) = super::scroll_window(total, body_h, cursor);
+    let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("CHAINS", theme::green_hi()),
         Span::styled(
@@ -79,11 +83,23 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cu
             theme::chrome(),
         ),
         Span::styled(format!("    {pos}/{total}"), theme::dim()),
-    ]);
+    ];
+    if hidden_above > 0 {
+        title_spans.push(Span::styled(
+            format!("    ▲ {hidden_above} more"),
+            theme::dim(),
+        ));
+    }
+    if hidden_below > 0 {
+        title_spans.push(Span::styled(
+            format!("    ▼ {hidden_below} more"),
+            theme::dim(),
+        ));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
-        .title(header_line)
+        .title(Line::from(title_spans))
         .title_alignment(Alignment::Left);
 
     let header = Row::new(vec![
@@ -97,8 +113,9 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cu
     ])
     .height(1);
 
-    let mut rows: Vec<Row> = Vec::with_capacity(total);
-    for (i, (chain, r)) in snapshot.replicas.iter().enumerate() {
+    let mut rows: Vec<Row> = Vec::with_capacity(end.saturating_sub(start));
+    for (offset, (chain, r)) in snapshot.replicas.iter().skip(start).take(end - start).enumerate() {
+        let i = start + offset;
         let is_cursor = i == cursor;
         let marker = if is_cursor { "▶" } else { " " };
         let chain_text = format!("chain.0x{chain:x}");
@@ -180,7 +197,8 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cu
     .header(header)
     .block(block)
     .column_spacing(2);
-    let mut state = TableState::default().with_selected(Some(cursor.min(total.saturating_sub(1))));
+    let selected = cursor.checked_sub(start).filter(|s| start + *s < end);
+    let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
 }
 

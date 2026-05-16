@@ -92,7 +92,11 @@ fn render_live_nodes_table(
         .filter(|(_, p)| matches!(p.health, Some(PeerHealthSnapshot::Degraded)))
         .count();
     let pos = cursor.min(total.saturating_sub(1)) + 1;
-    let header_line = Line::from(vec![
+    let body_h = (area.height as usize)
+        .saturating_sub(2)
+        .saturating_sub(1);
+    let (start, end, hidden_above, hidden_below) = super::scroll_window(total, body_h, cursor);
+    let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("NODES", theme::green_hi()),
         Span::styled(
@@ -100,11 +104,23 @@ fn render_live_nodes_table(
             theme::chrome(),
         ),
         Span::styled(format!("    {pos}/{total}"), theme::dim()),
-    ]);
+    ];
+    if hidden_above > 0 {
+        title_spans.push(Span::styled(
+            format!("    ▲ {hidden_above} more"),
+            theme::dim(),
+        ));
+    }
+    if hidden_below > 0 {
+        title_spans.push(Span::styled(
+            format!("    ▼ {hidden_below} more"),
+            theme::dim(),
+        ));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
-        .title(header_line)
+        .title(Line::from(title_spans))
         .title_alignment(Alignment::Left);
 
     let header = Row::new(vec![
@@ -152,8 +168,9 @@ fn render_live_nodes_table(
         }
     });
 
-    let mut table_rows: Vec<Row> = Vec::with_capacity(total);
-    for (i, (peer_id, p)) in nodes_iter.iter().enumerate() {
+    let mut table_rows: Vec<Row> = Vec::with_capacity(end.saturating_sub(start));
+    for (offset, (peer_id, p)) in nodes_iter[start..end].iter().enumerate() {
+        let i = start + offset;
         let peer_id = *peer_id;
         let is_local_row = Some(peer_id) == local_id;
         let is_cursor = i == cursor;
@@ -282,12 +299,11 @@ fn render_live_nodes_table(
     .header(header)
     .block(block)
     .column_spacing(2);
-    // Stateful render so ratatui's Table widget auto-scrolls
-    // the visible window when the cursor would otherwise sit
-    // off-screen. We rebuild the state from scratch each frame
-    // (selected = cursor, offset = 0); ratatui mutates offset
-    // during render to bring the selected row into view.
-    let mut state = TableState::default().with_selected(Some(cursor.min(total.saturating_sub(1))));
+    // The slice is already scrolled to keep the cursor visible;
+    // map the absolute cursor into the slice's local index so
+    // the `▶` marker + selection style land on the right row.
+    let selected = cursor.checked_sub(start).filter(|s| start + *s < end);
+    let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
 }
 

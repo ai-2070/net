@@ -59,16 +59,32 @@ fn render_table(
 ) {
     let total = snapshot.in_flight_migrations.len();
     let pos = cursor.min(total.saturating_sub(1)) + 1;
-    let header_line = Line::from(vec![
+    let body_h = (area.height as usize)
+        .saturating_sub(2)
+        .saturating_sub(1);
+    let (start, end, hidden_above, hidden_below) = super::scroll_window(total, body_h, cursor);
+    let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("MIGRATIONS", theme::green_hi()),
         Span::styled(format!("    {total} in flight"), theme::chrome()),
         Span::styled(format!("    {pos}/{total}"), theme::dim()),
-    ]);
+    ];
+    if hidden_above > 0 {
+        title_spans.push(Span::styled(
+            format!("    ▲ {hidden_above} more"),
+            theme::dim(),
+        ));
+    }
+    if hidden_below > 0 {
+        title_spans.push(Span::styled(
+            format!("    ▼ {hidden_below} more"),
+            theme::dim(),
+        ));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
-        .title(header_line)
+        .title(Line::from(title_spans))
         .title_alignment(Alignment::Left);
 
     let header = Row::new(vec![
@@ -86,8 +102,9 @@ fn render_table(
     ])
     .height(1);
 
-    let mut rows: Vec<Row> = Vec::with_capacity(total);
-    for (i, m) in snapshot.in_flight_migrations.iter().enumerate() {
+    let mut rows: Vec<Row> = Vec::with_capacity(end.saturating_sub(start));
+    for (offset, m) in snapshot.in_flight_migrations[start..end].iter().enumerate() {
+        let i = start + offset;
         let is_cursor = i == cursor;
         let marker = if is_cursor { "▶" } else { " " };
         let daemon_text = format!("daemon.0x{:x}", m.daemon_origin);
@@ -150,7 +167,8 @@ fn render_table(
     .header(header)
     .block(block)
     .column_spacing(2);
-    let mut state = TableState::default().with_selected(Some(cursor.min(total.saturating_sub(1))));
+    let selected = cursor.checked_sub(start).filter(|s| start + *s < end);
+    let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
 }
 
