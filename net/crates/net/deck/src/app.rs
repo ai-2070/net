@@ -27,13 +27,13 @@ pub enum Tab {
 }
 
 impl Tab {
-    /// Tab order rendered by the tab strip. AUDIT and FAILURES
-    /// are intentionally omitted (hidden for now) — their
-    /// variants, state, render modules, and key handlers all
+    /// Tab order rendered by the tab strip. FAILURES is hidden
+    /// (its variant, state, render module, and key handlers all
     /// stay in the codebase so re-enabling is a single-line
-    /// addition here. While hidden they're unreachable from the
-    /// tab bar, the `1-9` jump keys, and the Tab/arrow cycling.
-    pub fn all() -> [Tab; 9] {
+    /// addition here). The strip carries 10 slots — keys 1-9
+    /// + 0 — with LOGS pinned to `0` so it stays reachable
+    /// from any tab without clobbering the alphabetic shortcuts.
+    pub fn all() -> [Tab; 10] {
         [
             Tab::NetMap,
             Tab::Nodes,
@@ -41,9 +41,10 @@ impl Tab {
             Tab::Groups,
             Tab::Dataforts,
             Tab::Blobs,
-            Tab::Logs,
             Tab::Migrations,
             Tab::Replicas,
+            Tab::Audit,
+            Tab::Logs,
         ]
     }
 
@@ -492,6 +493,7 @@ impl App {
             .map(|(id, p)| (*id, p.clone()));
         if let Some((id, peer)) = pair {
             let label = crate::nodes::label_of(&format!("0x{id:x}")).map(|s| s.to_string());
+            self.daemon_focus = None;
             self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
                 id,
                 label,
@@ -618,6 +620,11 @@ impl App {
     /// is often the local node, which doesn't live in
     /// `snapshot.peers`.
     fn focus_host(&mut self, host_id: u64, host_label: Option<&'static str>) {
+        // Mirror `focus_daemon`'s mutual-exclusion: opening the
+        // Node page drops any Daemon-page focus so the render
+        // dispatcher (which checks daemon_focus first) doesn't
+        // keep showing the old page over the new one.
+        self.daemon_focus = None;
         if host_id == 0x0001 {
             // Synthesize a PeerSnapshot for the local node (same
             // as `focus_datafort` for the local datafort).
@@ -754,6 +761,7 @@ impl App {
     fn focus_datafort(&mut self, idx: usize) {
         let entries = self.collect_dataforts();
         let Some(entry) = entries.get(idx) else { return };
+        self.daemon_focus = None;
         if entry.is_local {
             let mut caps = std::collections::BTreeSet::new();
             for c in &entry.capabilities {
@@ -1054,10 +1062,11 @@ impl App {
         // operator can navigate back without explicitly
         // un-focusing first.
         // Tab-switch keys exit any focus mode cleanly. Defined
-        // once so both branches below check the same set.
+        // once so both branches below check the same set. `0`
+        // is in here because it now jumps to LOGS.
         let is_tab_switch = matches!(
             code,
-            KeyCode::Char('1'..='9')
+            KeyCode::Char('0'..='9')
                 | KeyCode::Char('h')
                 | KeyCode::Char('l')
                 | KeyCode::Tab
@@ -1141,19 +1150,19 @@ impl App {
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                 self.current = self.current.prev()
             }
-            // Numeric tab jumps follow `Tab::all()` order; AUDIT
-            // is hidden so the slot it used to claim is filled
-            // by the next tab in the list. Adding AUDIT back to
-            // `Tab::all()` will re-shift these.
+            // Numeric tab jumps follow `Tab::all()` order. `0`
+            // is the 10th slot (LOGS) — pinned there so the
+            // alphabetic shortcuts stay free.
             KeyCode::Char('1') => self.current = Tab::NetMap,
             KeyCode::Char('2') => self.current = Tab::Nodes,
             KeyCode::Char('3') => self.current = Tab::Daemons,
             KeyCode::Char('4') => self.current = Tab::Groups,
             KeyCode::Char('5') => self.current = Tab::Dataforts,
             KeyCode::Char('6') => self.current = Tab::Blobs,
-            KeyCode::Char('7') => self.current = Tab::Logs,
-            KeyCode::Char('8') => self.current = Tab::Migrations,
-            KeyCode::Char('9') => self.current = Tab::Replicas,
+            KeyCode::Char('7') => self.current = Tab::Migrations,
+            KeyCode::Char('8') => self.current = Tab::Replicas,
+            KeyCode::Char('9') => self.current = Tab::Audit,
+            KeyCode::Char('0') => self.current = Tab::Logs,
             // DAEMON tab navigation. Lowercase letters walk the
             // member axis (cursor inside the focused group);
             // uppercase letters + arrows walk the group axis.

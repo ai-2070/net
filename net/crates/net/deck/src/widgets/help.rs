@@ -19,7 +19,7 @@ struct Binding {
 
 /// Routine bindings — navigation + cursor + dismissals.
 const NAVIGATION: &[Binding] = &[
-    Binding { keys: "1-9",       desc: "jump to tab" },
+    Binding { keys: "1-9, 0",    desc: "jump to tab (0 = LOGS)" },
     Binding { keys: ":",         desc: "open cluster picker" },
     Binding { keys: "Enter",     desc: "BLOBS: blob detail · NODES/NET.MAP/DATAFORTS: node page · DAEMONS/GROUPS: daemon page · NODE→DAEMON, DAEMON→NODE/SIBLING" },
     Binding { keys: "Esc",       desc: "close node page / modal / search prompt (else quit)" },

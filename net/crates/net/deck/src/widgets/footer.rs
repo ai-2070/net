@@ -155,7 +155,7 @@ fn base_nav() -> Vec<Span<'static>> {
     vec![
         chip_key("◂▸"),
         chip_desc(" tab   "),
-        chip_key("1-9"),
+        chip_key("0-9"),
         chip_desc(" jump   "),
         chip_key("↑↓"),
         chip_desc(" cursor   "),
