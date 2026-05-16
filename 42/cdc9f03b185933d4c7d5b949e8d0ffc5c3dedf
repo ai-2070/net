@@ -1,0 +1,38 @@
+net/crates/net/deck/src/main.rs
+  s_46edf7dc333ef6::t_b8897a27c872fb 81,91
+net/crates/net/deck/src/app.rs
+  s_46edf7dc333ef6::t_f17a95fb6533eb 140-146
+  s_46edf7dc333ef6::t_57b826e16b70ca 995
+  s_46edf7dc333ef6::t_1737958180eea9 416,432
+  s_46edf7dc333ef6::t_379ebdf65a368c 510
+  s_46edf7dc333ef6::t_37e129a8475c87 2067
+  s_46edf7dc333ef6::t_4ebf55e441bb9b 2442
+  s_46edf7dc333ef6::t_adc56f03410efa 954
+  s_46edf7dc333ef6::t_8c5dcf0dc1c67b 276-278
+  s_46edf7dc333ef6::t_fc25c3bda94b89 691
+  s_46edf7dc333ef6::t_176f6047b12246 756
+  s_46edf7dc333ef6::t_5bf40e89f252b5 2049
+  s_46edf7dc333ef6::t_c5cdee3c041826 732-734,738
+net/crates/net/deck/src/tabs/groups.rs
+  s_46edf7dc333ef6::t_6f31822d615fbe 299
+net/crates/net/deck/src/runtime.rs
+  s_46edf7dc333ef6::t_0d67d5733f26f5 82
+  s_46edf7dc333ef6::t_c5f76784d55a57 135
+  s_46edf7dc333ef6::t_39235d61048543 22-24,44-48,63-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "42cdc9f03b185933d4c7d5b949e8d0ffc5c3dedf",
+  "prompts": {},
+  "sessions": {
+    "s_46edf7dc333ef6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e145bb62-38ea-4dbe-81cd-e36e7e65c2ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
