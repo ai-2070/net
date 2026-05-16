@@ -25,8 +25,8 @@ pub const NODES: &[NodeRef] = &[
         id: "0x1",
         label: "local",
     },
-    // Live event production (5 nodes) — main stage + audio
-    // mix booths + dimmer room running DMX / lighting / pyro.
+    // Live event production (5 nodes) — concert stage, audio
+    // mix booths, lighting + special effects.
     NodeRef {
         id: "0xa96f",
         label: "main-stage",
@@ -37,15 +37,15 @@ pub const NODES: &[NodeRef] = &[
     },
     NodeRef {
         id: "0xe685",
-        label: "foh-mix",
+        label: "concert-audio",
     },
     NodeRef {
         id: "0xd4ff",
-        label: "monitor-booth",
+        label: "monitor-mix",
     },
     NodeRef {
         id: "0x3599",
-        label: "dimmer-room",
+        label: "stage-lighting",
     },
     // Drone swarm + ground station (3 nodes).
     NodeRef {
@@ -61,28 +61,28 @@ pub const NODES: &[NodeRef] = &[
         label: "follower-1",
     },
     // AI inference cluster (3 nodes) — GPU racks running the
-    // openclaw / hermes model harnesses + a KV-cache host.
+    // vision-grasp + chat model harnesses + a KV-cache host.
     NodeRef {
         id: "0xbdda",
-        label: "gpu-rack-a",
+        label: "ai-gpu-1",
     },
     NodeRef {
         id: "0x6dfb",
-        label: "gpu-rack-b",
+        label: "ai-gpu-2",
     },
     NodeRef {
         id: "0x3c81",
-        label: "model-cache",
+        label: "ai-cache",
     },
-    // Robotics cell (2 nodes) — 6-/7-dof arms on a shared
-    // gantry, gripper + kinematics workloads.
+    // Robotics cell (2 nodes) — 6-/7-axis arms on a shared
+    // gantry, gripper + motion-planning workloads.
     NodeRef {
         id: "0xe068",
-        label: "arm-cell",
+        label: "robot-arm",
     },
     NodeRef {
         id: "0xbf44",
-        label: "gantry",
+        label: "assembly-line",
     },
     // Autonomous vehicle mesh (2 nodes) — chase truck + pit
     // lane support; CAN-FD / EtherCAT busses, ADAS fusion.
@@ -101,7 +101,7 @@ pub const NODES: &[NodeRef] = &[
     },
     NodeRef {
         id: "0xfc2",
-        label: "vision-rig",
+        label: "camera-system",
     },
 ];
 

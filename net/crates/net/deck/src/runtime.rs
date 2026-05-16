@@ -414,144 +414,138 @@ mod samples {
                     let mut caps = std::collections::BTreeSet::new();
                     caps.insert("compute.daemon".to_string());
                     caps.insert("meshos.health".to_string());
+                    // VC-readable capability names: every cap
+                    // says what the node DOES rather than the
+                    // wire protocol / hardware revision. A
+                    // non-technical reader pattern-matches on
+                    // `robot.arm`, `drone.camera`, `ai.model.chat`
+                    // and gets the right mental model without
+                    // knowing CAN-FD or BF16 or DMX.
                     match *id {
                         // ── Live event production ──────────────
                         0xa96f => {
-                            // main-stage: DMX universes + audio
-                            // monitor sends + MIDI clock.
+                            // main stage — lighting + cue sync.
                             caps.insert("zone:stage".to_string());
-                            caps.insert("stage.dmx.fixture".to_string());
-                            caps.insert("stage.lighting.intelligent".to_string());
-                            caps.insert("stage.cue.trigger".to_string());
-                            caps.insert("stage.midi.bridge".to_string());
+                            caps.insert("stage.lighting".to_string());
+                            caps.insert("stage.spotlights".to_string());
+                            caps.insert("stage.cue-system".to_string());
+                            caps.insert("stage.music-sync".to_string());
                         }
                         0xe9b8 => {
-                            // side-stage: lighter rig — DMX
-                            // fixture set + cue triggers only.
+                            // side stage — lighter rig.
                             caps.insert("zone:stage".to_string());
-                            caps.insert("stage.dmx.fixture".to_string());
-                            caps.insert("stage.cue.trigger".to_string());
+                            caps.insert("stage.lighting".to_string());
+                            caps.insert("stage.cue-system".to_string());
                         }
                         0xe685 => {
-                            // foh-mix: front-of-house audio.
-                            caps.insert("zone:foh".to_string());
-                            caps.insert("stage.audio.mix.foh".to_string());
-                            caps.insert("sensor.audio.array".to_string());
+                            // front-of-house audio mix.
+                            caps.insert("zone:audio".to_string());
+                            caps.insert("audio.concert-mix".to_string());
+                            caps.insert("sensor.microphone-array".to_string());
                         }
                         0xd4ff => {
-                            // monitor-booth: monitor mixes.
-                            caps.insert("zone:foh".to_string());
-                            caps.insert("stage.audio.mix.monitor".to_string());
+                            // monitor mix — in-ear / wedge feeds.
+                            caps.insert("zone:audio".to_string());
+                            caps.insert("audio.monitor-mix".to_string());
                         }
                         0x3599 => {
-                            // dimmer-room: DMX + pyrotech gate.
+                            // lighting + special effects rig.
                             caps.insert("zone:stage".to_string());
-                            caps.insert("stage.dmx.fixture".to_string());
-                            caps.insert("stage.pyro.gate".to_string());
-                            caps.insert("stage.fog.ducted".to_string());
+                            caps.insert("stage.lighting".to_string());
+                            caps.insert("stage.pyrotechnics".to_string());
+                            caps.insert("stage.fog-machine".to_string());
                         }
                         // ── Drone swarm ────────────────────────
                         0x372b => {
-                            // ground-station: swarm coordinator.
+                            // ground station — swarm control.
                             caps.insert("zone:hangar".to_string());
-                            caps.insert("drone.swarm.coord".to_string());
-                            caps.insert("drone.fc.px4".to_string());
+                            caps.insert("drone.swarm-control".to_string());
+                            caps.insert("drone.flight-controller".to_string());
                         }
                         0xeba8 => {
-                            // scout-3: quad with cinema payload.
+                            // scout drone — quadcopter, cinema cam.
                             caps.insert("zone:airspace".to_string());
-                            caps.insert("drone.airframe.quad".to_string());
-                            caps.insert("drone.payload.cinema".to_string());
-                            caps.insert("sensor.camera.rgb".to_string());
-                            caps.insert("sensor.gps.rtk".to_string());
+                            caps.insert("drone.quadcopter".to_string());
+                            caps.insert("drone.cinema-camera".to_string());
+                            caps.insert("sensor.camera".to_string());
+                            caps.insert("sensor.gps".to_string());
                         }
                         0x82ee => {
-                            // follower-1: hex with thermal +
-                            // solid-state lidar.
+                            // follower drone — hex, thermal + lidar.
                             caps.insert("zone:airspace".to_string());
-                            caps.insert("drone.airframe.hex".to_string());
-                            caps.insert("drone.payload.thermal".to_string());
-                            caps.insert("sensor.lidar.solid_state".to_string());
+                            caps.insert("drone.hexacopter".to_string());
+                            caps.insert("drone.thermal-camera".to_string());
+                            caps.insert("sensor.lidar".to_string());
                         }
                         // ── AI inference cluster ───────────────
                         0xbdda => {
-                            // gpu-rack-a: Hopper-class GPUs
-                            // running the openclaw vision-grasp
-                            // model with FP8 batches.
+                            // gpu rack A — vision-grasp model.
                             caps.insert("zone:rack".to_string());
-                            caps.insert("gpu.b300.h200".to_string());
-                            caps.insert("gpu.tensor.fp8".to_string());
-                            caps.insert("model.serving.batch".to_string());
-                            caps.insert("model.harness.openclaw".to_string());
+                            caps.insert("gpu.nvidia-blackwell".to_string());
+                            caps.insert("gpu.tensor-cores".to_string());
+                            caps.insert("ai.batch-inference".to_string());
+                            caps.insert("ai.vision-grasp-model".to_string());
                         }
                         0x6dfb => {
-                            // gpu-rack-b: streaming hermes chat
-                            // agent on BF16.
+                            // gpu rack B — chat model, streaming.
                             caps.insert("zone:rack".to_string());
-                            caps.insert("gpu.b300.h200".to_string());
-                            caps.insert("gpu.tensor.bf16".to_string());
-                            caps.insert("model.serving.stream".to_string());
-                            caps.insert("model.harness.hermes".to_string());
+                            caps.insert("gpu.nvidia-blackwell".to_string());
+                            caps.insert("gpu.tensor-cores".to_string());
+                            caps.insert("ai.live-inference".to_string());
+                            caps.insert("ai.chat-model".to_string());
                         }
                         0x3c81 => {
-                            // model-cache: KV-cache host backed
-                            // by blob storage.
+                            // model cache — kv-cache + blob storage.
                             caps.insert("zone:rack".to_string());
-                            caps.insert("model.cache.kv".to_string());
+                            caps.insert("ai.kv-cache".to_string());
                             caps.insert("dataforts.blob.storage".to_string());
                             caps.insert("greedy.cache".to_string());
                         }
                         // ── Robotics cell ──────────────────────
                         0xe068 => {
-                            // arm-cell: 7-dof manipulator with
-                            // parallel gripper and Jacobian-based
-                            // motion planning.
+                            // 7-axis robot arm with parallel gripper.
                             caps.insert("zone:cell".to_string());
-                            caps.insert("robot.arm.7dof".to_string());
-                            caps.insert("robot.gripper.parallel".to_string());
-                            caps.insert("robot.kinematics.jacobian".to_string());
+                            caps.insert("robot.7-axis-arm".to_string());
+                            caps.insert("robot.gripper".to_string());
+                            caps.insert("robot.motion-planning".to_string());
                         }
                         0xbf44 => {
-                            // gantry: 6-dof gantry-mounted arm,
-                            // suction gripper.
+                            // 6-axis arm on gantry — suction pickup.
                             caps.insert("zone:cell".to_string());
-                            caps.insert("robot.arm.6dof".to_string());
-                            caps.insert("robot.gripper.suction".to_string());
+                            caps.insert("robot.6-axis-arm".to_string());
+                            caps.insert("robot.suction-gripper".to_string());
                         }
                         // ── Autonomous vehicle mesh ────────────
                         0xf206 => {
-                            // chase-truck: CAN-FD + L4 ADAS,
-                            // surround radar + spinning lidar.
+                            // chase truck — L4 autonomous, full
+                            // sensor stack.
                             caps.insert("zone:track".to_string());
-                            caps.insert("vehicle.bus.canfd".to_string());
-                            caps.insert("vehicle.adas.l4".to_string());
-                            caps.insert("vehicle.fusion.surround".to_string());
-                            caps.insert("sensor.lidar.spinning".to_string());
-                            caps.insert("sensor.radar.fmcw".to_string());
+                            caps.insert("vehicle.can-bus".to_string());
+                            caps.insert("vehicle.autonomy-l4".to_string());
+                            caps.insert("vehicle.360-sensor-fusion".to_string());
+                            caps.insert("sensor.lidar".to_string());
+                            caps.insert("sensor.radar".to_string());
                         }
                         0x6808 => {
-                            // pit-lane: EtherCAT bus + IMU.
+                            // pit-lane support — ethercat + motion.
                             caps.insert("zone:pit".to_string());
-                            caps.insert("vehicle.bus.ethercat".to_string());
-                            caps.insert("sensor.imu.9dof".to_string());
+                            caps.insert("vehicle.ethercat".to_string());
+                            caps.insert("sensor.motion-tracker".to_string());
                         }
                         // ── Edge ───────────────────────────────
                         0xf83d => {
-                            // edge-drone: on-board ardupilot
-                            // with a depth camera.
+                            // edge drone — quad with depth cam.
                             caps.insert("zone:airspace".to_string());
-                            caps.insert("drone.airframe.quad".to_string());
-                            caps.insert("drone.fc.ardupilot".to_string());
-                            caps.insert("sensor.camera.depth".to_string());
+                            caps.insert("drone.quadcopter".to_string());
+                            caps.insert("drone.flight-controller".to_string());
+                            caps.insert("sensor.depth-camera".to_string());
                         }
                         0x0fc2 => {
-                            // vision-rig: depth + RGB stack;
-                            // hosts an openclaw harness for
-                            // on-rig grasp inference.
+                            // vision rig — depth + RGB + grasp AI.
                             caps.insert("zone:cell".to_string());
-                            caps.insert("sensor.camera.rgb".to_string());
-                            caps.insert("sensor.camera.depth".to_string());
-                            caps.insert("model.harness.openclaw".to_string());
+                            caps.insert("sensor.camera".to_string());
+                            caps.insert("sensor.depth-camera".to_string());
+                            caps.insert("ai.vision-grasp-model".to_string());
                         }
                         _ => {}
                     }
@@ -616,82 +610,84 @@ mod samples {
     /// through. Five thematic domains across 11 daemons cover
     /// the full lineage matrix:
     ///
-    /// - Solo: `mainstage_cue`, `openclaw_inference`
-    /// - Replica × 3: `foh_mixer#replica`
-    /// - Standby × 3: `pyro_gate#standby`
-    /// - Fork × 3: `swarm_coord#fork@7`
+    /// - Solo: `stage_cues`, `vision_grasp_ai`
+    /// - Replica × 3: `audio_mixer#replica`
+    /// - Standby × 3: `pyro_safety#standby`
+    /// - Fork × 3: `drone_swarm#fork@7`
     ///
     /// The `#suffix` convention is parsed by `crate::lineage`
-    /// to recover group membership.
+    /// to recover group membership. Names + messages avoid
+    /// industry jargon so a non-technical reader can recognize
+    /// what each daemon does at a glance.
     const DAEMON_ROSTER: &[(&str, &[(LogLevel, &str)])] = &[
-        ("mainstage_cue", MAINSTAGE_LOGS),
-        ("openclaw_inference", OPENCLAW_LOGS),
-        ("foh_mixer#replica", FOH_LOGS),
-        ("foh_mixer#replica", FOH_LOGS),
-        ("foh_mixer#replica", FOH_LOGS),
-        ("pyro_gate#standby", PYRO_LOGS),
-        ("pyro_gate#standby", PYRO_LOGS),
-        ("pyro_gate#standby", PYRO_LOGS),
-        ("swarm_coord#fork@7", SWARM_LOGS),
-        ("swarm_coord#fork@7", SWARM_LOGS),
-        ("swarm_coord#fork@7", SWARM_LOGS),
+        ("stage_cues", STAGE_CUES_LOGS),
+        ("vision_grasp_ai", VISION_GRASP_LOGS),
+        ("audio_mixer#replica", AUDIO_MIXER_LOGS),
+        ("audio_mixer#replica", AUDIO_MIXER_LOGS),
+        ("audio_mixer#replica", AUDIO_MIXER_LOGS),
+        ("pyro_safety#standby", PYRO_SAFETY_LOGS),
+        ("pyro_safety#standby", PYRO_SAFETY_LOGS),
+        ("pyro_safety#standby", PYRO_SAFETY_LOGS),
+        ("drone_swarm#fork@7", DRONE_SWARM_LOGS),
+        ("drone_swarm#fork@7", DRONE_SWARM_LOGS),
+        ("drone_swarm#fork@7", DRONE_SWARM_LOGS),
     ];
 
-    /// `mainstage_cue` — DMX cue firing, lighting transitions,
-    /// MIDI clock, pyrotech-gate handshakes.
-    const MAINSTAGE_LOGS: &[(LogLevel, &str)] = &[
+    /// `stage_cues` — concert cue firing, lighting transitions,
+    /// music-sync, pyrotech handshakes.
+    const STAGE_CUES_LOGS: &[(LogLevel, &str)] = &[
         (LogLevel::Info, "cue 47 ready: scene/clear-back"),
-        (LogLevel::Info, "dmx universe 1 rendered, 512 channels"),
-        (LogLevel::Info, "follow-spot 2 → operator 'rio'"),
-        (LogLevel::Info, "scene transition: act2/song-3"),
-        (LogLevel::Info, "midi clock locked at 128.0 bpm"),
-        (LogLevel::Info, "pyro gate cleared: zone-3 armed"),
-        (LogLevel::Warn, "fixture 12 brownout reported; falling back"),
+        (LogLevel::Info, "lighting universe 1 rendered (512 channels)"),
+        (LogLevel::Info, "follow-spot 2 assigned to operator 'rio'"),
+        (LogLevel::Info, "scene transition: act 2, song 3"),
+        (LogLevel::Info, "music-sync locked at 128.0 bpm"),
+        (LogLevel::Info, "pyrotechnics safety gate cleared: zone 3 armed"),
+        (LogLevel::Warn, "stage light 12 brownout — falling back"),
     ];
 
-    /// `openclaw_inference` — vision-grasp model serving on
-    /// the gpu rack, depth fusion + kv-cache reads.
-    const OPENCLAW_LOGS: &[(LogLevel, &str)] = &[
-        (LogLevel::Info, "grasp candidates: 4 (top score 0.89)"),
-        (LogLevel::Info, "kv-cache hit (98%) on batch 248"),
-        (LogLevel::Info, "model openclaw-2.4, ctx 8192"),
-        (LogLevel::Info, "depth fusion: 16 keypoints tracked"),
-        (LogLevel::Info, "joint trajectory smoothed (4 waypoints)"),
-        (LogLevel::Warn, "occluded scene detected; falling back to radar"),
+    /// `vision_grasp_ai` — robot-grasp inference using the
+    /// vision-grasp model, depth fusion + AI cache reads.
+    const VISION_GRASP_LOGS: &[(LogLevel, &str)] = &[
+        (LogLevel::Info, "grasp candidates: 4 (top confidence 89%)"),
+        (LogLevel::Info, "AI cache hit (98%) on batch 248"),
+        (LogLevel::Info, "vision-grasp model v2.4 loaded (context 8192)"),
+        (LogLevel::Info, "tracking 16 object keypoints"),
+        (LogLevel::Info, "robot trajectory: 4 waypoints planned"),
+        (LogLevel::Warn, "scene occluded — falling back to radar"),
     ];
 
-    /// `foh_mixer#replica` — front-of-house audio mixers
-    /// processing the live bus + monitor sends.
-    const FOH_LOGS: &[(LogLevel, &str)] = &[
-        (LogLevel::Info, "bus 3: -2.4 dB clip avoid"),
-        (LogLevel::Info, "monitor send 7 → in-ear 3"),
+    /// `audio_mixer#replica` — concert audio mixers processing
+    /// the live bus + monitor sends.
+    const AUDIO_MIXER_LOGS: &[(LogLevel, &str)] = &[
+        (LogLevel::Info, "audio bus 3 limiter active (-2.4dB)"),
+        (LogLevel::Info, "monitor send 7 routed to in-ear 3"),
         (LogLevel::Info, "channel 12 muted: feedback detected"),
-        (LogLevel::Info, "reverb tail 1.8s applied to vocals"),
-        (LogLevel::Info, "compressor 4:1 ratio, attack 2ms"),
+        (LogLevel::Info, "vocal reverb applied (1.8s tail)"),
+        (LogLevel::Info, "compressor: 4:1 ratio, 2ms attack"),
         (LogLevel::Warn, "input gain hot on channel 4 (-0.3 dB headroom)"),
     ];
 
-    /// `pyro_gate#standby` — pyrotechnic safety gate. The
+    /// `pyro_safety#standby` — pyrotechnic safety system. The
     /// active one fires interlocks; warm standbys publish
     /// heartbeats + readiness checks.
-    const PYRO_LOGS: &[(LogLevel, &str)] = &[
-        (LogLevel::Info, "fixture 4 armed: confetti canon"),
-        (LogLevel::Info, "interlock: stage rail OK"),
-        (LogLevel::Info, "abort signal cleared, gate green"),
-        (LogLevel::Info, "weather check: wind 8mph, OK"),
-        (LogLevel::Info, "operator override authenticated (op:0x7f3a)"),
-        (LogLevel::Warn, "humidity above gate threshold (78%) — derating"),
+    const PYRO_SAFETY_LOGS: &[(LogLevel, &str)] = &[
+        (LogLevel::Info, "confetti canon 4 armed"),
+        (LogLevel::Info, "interlock check: stage rail OK"),
+        (LogLevel::Info, "abort signal cleared — gate green"),
+        (LogLevel::Info, "weather check: wind 8mph, OK to fire"),
+        (LogLevel::Info, "operator override authenticated"),
+        (LogLevel::Warn, "humidity above safe threshold (78%) — derating"),
     ];
 
-    /// `swarm_coord#fork@7` — drone-swarm coordinator forks,
-    /// each driving a subset of the formation.
-    const SWARM_LOGS: &[(LogLevel, &str)] = &[
+    /// `drone_swarm#fork@7` — drone-swarm coordinators, each
+    /// driving a subset of the formation.
+    const DRONE_SWARM_LOGS: &[(LogLevel, &str)] = &[
         (LogLevel::Info, "formation: V-shape, 7 drones, spacing 4.2m"),
-        (LogLevel::Info, "waypoint 12 reached, holding"),
-        (LogLevel::Info, "wind compensation: +1.2m east drift"),
-        (LogLevel::Info, "follow target locked: vehicle-04"),
-        (LogLevel::Info, "battery telemetry: median 78%, min 64%"),
-        (LogLevel::Warn, "geofence breach prevented (lat 51.522)"),
+        (LogLevel::Info, "waypoint 12 reached, holding position"),
+        (LogLevel::Info, "wind compensation: 1.2m east drift"),
+        (LogLevel::Info, "tracking target: chase truck"),
+        (LogLevel::Info, "battery levels: median 78%, lowest 64%"),
+        (LogLevel::Warn, "no-fly zone breach prevented"),
     ];
 
     /// Install probes + register the 11-daemon roster + seed
@@ -836,22 +832,24 @@ mod samples_logs {
     /// Node-level (no `daemon_id`) log fixtures. The
     /// substrate stamps `node_id = this_node` on these so
     /// they render as `node.0x<this_node>` in the
-    /// MESH.EVENTS section.
+    /// MESH.EVENTS section. Phrasing favours plain English so
+    /// a non-technical reader can follow what the cluster is
+    /// doing without knowing the substrate vocabulary.
     const NODE_LOGS: &[(LogLevel, &str)] = &[
-        (LogLevel::Info, "peer 0xa96f handshake completed"),
-        (LogLevel::Info, "placement intent recorded for chain 0xc005"),
-        (LogLevel::Warn, "peer 0xeba8 entered Degraded — rtt 244ms"),
-        (LogLevel::Info, "freeze gate cleared (operator: 0x7f3a)"),
-        (LogLevel::Warn, "avoid list grew past soft cap (52 entries)"),
-        (LogLevel::Info, "GC swept 142 quiescent chunks (3.2 GB)"),
-        (LogLevel::Error, "inventory probe panicked — skipped this tick"),
-        (LogLevel::Info, "snapshot publish: 17 peers, 11 daemons, 8 chains"),
-        (LogLevel::Warn, "action queue depth approaching cap (58 / 64)"),
-        (LogLevel::Info, "admin commit accepted: drain 0x82ee"),
-        (LogLevel::Info, "ICE bundle verified — 1-of-1 operator threshold"),
-        (LogLevel::Warn, "peer 0x6808 entered Degraded — rtt 451ms"),
-        (LogLevel::Info, "cluster freeze lifted; 0 backlogged commits"),
-        (LogLevel::Error, "datafort 0x6dfb: storage adapter unhealthy (95%)"),
+        (LogLevel::Info, "main-stage joined the cluster"),
+        (LogLevel::Info, "replica chain 0xc005 placement assigned"),
+        (LogLevel::Warn, "follower-1 link degraded — 244ms latency"),
+        (LogLevel::Info, "operator override cleared safety freeze"),
+        (LogLevel::Warn, "peer avoid list growing (52 entries)"),
+        (LogLevel::Info, "storage GC: 142 unused chunks freed (3.2 GB)"),
+        (LogLevel::Error, "resource probe crashed — sample skipped"),
+        (LogLevel::Info, "cluster snapshot: 17 nodes, 11 daemons, 8 chains"),
+        (LogLevel::Warn, "action queue 91% full (58 / 64)"),
+        (LogLevel::Info, "admin action accepted: drain follower-1"),
+        (LogLevel::Info, "signed operator action verified"),
+        (LogLevel::Warn, "pit-lane link degraded — 451ms latency"),
+        (LogLevel::Info, "cluster freeze lifted; no backlog"),
+        (LogLevel::Error, "ai-gpu-2 storage unhealthy — disk at 95%"),
     ];
 
     /// Inner loop. Walks the node-level fixture; daemon-level
