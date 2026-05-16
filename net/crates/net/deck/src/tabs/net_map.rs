@@ -392,9 +392,14 @@ fn render_events(frame: &mut Frame<'_>, area: Rect, logs: &[LogRecord]) {
             LogLevel::Debug => ("DEBUG", theme::dim()),
             _ => ("?    ", theme::dim()),
         };
-        let source = match r.daemon_id {
-            Some(d) => format!("daemon.0x{d:x}"),
-            None => "substrate".to_string(),
+        // Source attribution by what the record actually
+        // carries: a daemon id beats a node id, a node id (no
+        // daemon) reads as `node.0x…`, and only the bare
+        // (None, None) case falls back to "substrate".
+        let source = match (r.daemon_id, r.node_id) {
+            (Some(d), _) => format!("daemon.0x{d:x}"),
+            (None, Some(n)) => format!("node.0x{n:x}"),
+            (None, None) => "substrate".to_string(),
         };
         lines.push(Line::from(vec![
             Span::styled(format!("  {}  ", fmt_ts(r.ts_ms)), theme::chrome()),
