@@ -11,7 +11,7 @@ name = "deck"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.29"
 color-eyre = "0.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
