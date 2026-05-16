@@ -396,19 +396,163 @@ mod samples {
                         0.22 + ((i as f32 * 0.07) % 0.5)
                     };
                     // Capability set: every peer carries the
-                    // base capabilities; specialty peers (the
-                    // gpu rig, edge box, and lab bench) advertise
-                    // deeper namespaces so the NODE-page caps
-                    // tree exercises both the single-chain and
-                    // branching renderings.
+                    // base substrate caps; thematic caps are
+                    // assigned per-node-role so each peer
+                    // advertises the workloads its physical
+                    // role implies. NODE.PAGE caps tree exercises
+                    // both single-chain (stage / vehicle nodes)
+                    // and branching (GPU rack, sensor rigs)
+                    // renderings.
                     let mut caps = std::collections::BTreeSet::new();
                     caps.insert("compute.daemon".to_string());
                     caps.insert("meshos.health".to_string());
-                    // ~every third peer participates as a remote
-                    // datafort so the DATAFORTS list has more than
-                    // just the local node to render. Overflow on a
-                    // subset (every 6th) so the gauge mix isn't
-                    // uniform.
+                    match *id {
+                        // ── Live event production ──────────────
+                        0xa96f => {
+                            // main-stage: DMX universes + audio
+                            // monitor sends + MIDI clock.
+                            caps.insert("zone:stage".to_string());
+                            caps.insert("stage.dmx.fixture".to_string());
+                            caps.insert("stage.lighting.intelligent".to_string());
+                            caps.insert("stage.cue.trigger".to_string());
+                            caps.insert("stage.midi.bridge".to_string());
+                        }
+                        0xe9b8 => {
+                            // side-stage: lighter rig — DMX
+                            // fixture set + cue triggers only.
+                            caps.insert("zone:stage".to_string());
+                            caps.insert("stage.dmx.fixture".to_string());
+                            caps.insert("stage.cue.trigger".to_string());
+                        }
+                        0xe685 => {
+                            // foh-mix: front-of-house audio.
+                            caps.insert("zone:foh".to_string());
+                            caps.insert("stage.audio.mix.foh".to_string());
+                            caps.insert("sensor.audio.array".to_string());
+                        }
+                        0xd4ff => {
+                            // monitor-booth: monitor mixes.
+                            caps.insert("zone:foh".to_string());
+                            caps.insert("stage.audio.mix.monitor".to_string());
+                        }
+                        0x3599 => {
+                            // dimmer-room: DMX + pyrotech gate.
+                            caps.insert("zone:stage".to_string());
+                            caps.insert("stage.dmx.fixture".to_string());
+                            caps.insert("stage.pyro.gate".to_string());
+                            caps.insert("stage.fog.ducted".to_string());
+                        }
+                        // ── Drone swarm ────────────────────────
+                        0x372b => {
+                            // ground-station: swarm coordinator.
+                            caps.insert("zone:hangar".to_string());
+                            caps.insert("drone.swarm.coord".to_string());
+                            caps.insert("drone.fc.px4".to_string());
+                        }
+                        0xeba8 => {
+                            // scout-3: quad with cinema payload.
+                            caps.insert("zone:airspace".to_string());
+                            caps.insert("drone.airframe.quad".to_string());
+                            caps.insert("drone.payload.cinema".to_string());
+                            caps.insert("sensor.camera.rgb".to_string());
+                            caps.insert("sensor.gps.rtk".to_string());
+                        }
+                        0x82ee => {
+                            // follower-1: hex with thermal +
+                            // solid-state lidar.
+                            caps.insert("zone:airspace".to_string());
+                            caps.insert("drone.airframe.hex".to_string());
+                            caps.insert("drone.payload.thermal".to_string());
+                            caps.insert("sensor.lidar.solid_state".to_string());
+                        }
+                        // ── AI inference cluster ───────────────
+                        0xbdda => {
+                            // gpu-rack-a: Hopper-class GPUs
+                            // running the openclaw vision-grasp
+                            // model with FP8 batches.
+                            caps.insert("zone:rack".to_string());
+                            caps.insert("gpu.b300.h200".to_string());
+                            caps.insert("gpu.tensor.fp8".to_string());
+                            caps.insert("model.serving.batch".to_string());
+                            caps.insert("model.harness.openclaw".to_string());
+                        }
+                        0x6dfb => {
+                            // gpu-rack-b: streaming hermes chat
+                            // agent on BF16.
+                            caps.insert("zone:rack".to_string());
+                            caps.insert("gpu.b300.h200".to_string());
+                            caps.insert("gpu.tensor.bf16".to_string());
+                            caps.insert("model.serving.stream".to_string());
+                            caps.insert("model.harness.hermes".to_string());
+                        }
+                        0x3c81 => {
+                            // model-cache: KV-cache host backed
+                            // by blob storage.
+                            caps.insert("zone:rack".to_string());
+                            caps.insert("model.cache.kv".to_string());
+                            caps.insert("dataforts.blob.storage".to_string());
+                            caps.insert("greedy.cache".to_string());
+                        }
+                        // ── Robotics cell ──────────────────────
+                        0xe068 => {
+                            // arm-cell: 7-dof manipulator with
+                            // parallel gripper and Jacobian-based
+                            // motion planning.
+                            caps.insert("zone:cell".to_string());
+                            caps.insert("robot.arm.7dof".to_string());
+                            caps.insert("robot.gripper.parallel".to_string());
+                            caps.insert("robot.kinematics.jacobian".to_string());
+                        }
+                        0xbf44 => {
+                            // gantry: 6-dof gantry-mounted arm,
+                            // suction gripper.
+                            caps.insert("zone:cell".to_string());
+                            caps.insert("robot.arm.6dof".to_string());
+                            caps.insert("robot.gripper.suction".to_string());
+                        }
+                        // ── Autonomous vehicle mesh ────────────
+                        0xf206 => {
+                            // chase-truck: CAN-FD + L4 ADAS,
+                            // surround radar + spinning lidar.
+                            caps.insert("zone:track".to_string());
+                            caps.insert("vehicle.bus.canfd".to_string());
+                            caps.insert("vehicle.adas.l4".to_string());
+                            caps.insert("vehicle.fusion.surround".to_string());
+                            caps.insert("sensor.lidar.spinning".to_string());
+                            caps.insert("sensor.radar.fmcw".to_string());
+                        }
+                        0x6808 => {
+                            // pit-lane: EtherCAT bus + IMU.
+                            caps.insert("zone:pit".to_string());
+                            caps.insert("vehicle.bus.ethercat".to_string());
+                            caps.insert("sensor.imu.9dof".to_string());
+                        }
+                        // ── Edge ───────────────────────────────
+                        0xf83d => {
+                            // edge-drone: on-board ardupilot
+                            // with a depth camera.
+                            caps.insert("zone:airspace".to_string());
+                            caps.insert("drone.airframe.quad".to_string());
+                            caps.insert("drone.fc.ardupilot".to_string());
+                            caps.insert("sensor.camera.depth".to_string());
+                        }
+                        0x0fc2 => {
+                            // vision-rig: depth + RGB stack;
+                            // hosts an openclaw harness for
+                            // on-rig grasp inference.
+                            caps.insert("zone:cell".to_string());
+                            caps.insert("sensor.camera.rgb".to_string());
+                            caps.insert("sensor.camera.depth".to_string());
+                            caps.insert("model.harness.openclaw".to_string());
+                        }
+                        _ => {}
+                    }
+                    // Greedy-cache + datafort participation is
+                    // sprinkled in for the DATAFORTS list to
+                    // demonstrate the multi-adapter view. KV-cache
+                    // host already carries them above; this layer
+                    // adds extra participation so the list isn't
+                    // dominated by a single node role.
                     if i % 3 == 0 {
                         caps.insert("dataforts.blob.storage".to_string());
                     }
@@ -417,27 +561,6 @@ mod samples {
                     }
                     if i % 4 == 0 {
                         caps.insert("greedy.cache".to_string());
-                    }
-                    match *id {
-                        0xbdda => {
-                            // gpu-rig: GPU-family compute fanout
-                            caps.insert("compute.gpu.cuda".to_string());
-                            caps.insert("compute.gpu.tensor".to_string());
-                            caps.insert("compute.gpu.rocm".to_string());
-                        }
-                        0xf83d => {
-                            // edge: light sensor suite
-                            caps.insert("sensor.lidar".to_string());
-                            caps.insert("sensor.temp.cel".to_string());
-                        }
-                        0x0fc2 => {
-                            // lab-bench: full sensor stack
-                            caps.insert("sensor.lidar".to_string());
-                            caps.insert("sensor.radar.shortwave".to_string());
-                            caps.insert("sensor.radar.longwave".to_string());
-                            caps.insert("sensor.temp.cel".to_string());
-                        }
-                        _ => {}
                     }
                     let inv = PeerInventory {
                         cpu_load_1m: Some(cpu),

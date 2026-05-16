@@ -13,73 +13,83 @@ pub struct NodeRef {
 }
 
 pub const NODES: &[NodeRef] = &[
+    // Live event production (5 nodes) — main stage + audio
+    // mix booths + dimmer room running DMX / lighting / pyro.
     NodeRef {
         id: "0xa96f",
-        label: "eu-west-3",
+        label: "main-stage",
     },
     NodeRef {
         id: "0xe9b8",
-        label: "eu-west-3",
+        label: "side-stage",
     },
     NodeRef {
         id: "0xe685",
-        label: "eu-west-3",
+        label: "foh-mix",
     },
     NodeRef {
         id: "0xd4ff",
-        label: "eu-west-3",
+        label: "monitor-booth",
     },
     NodeRef {
         id: "0x3599",
-        label: "eu-west-3",
+        label: "dimmer-room",
     },
+    // Drone swarm + ground station (3 nodes).
     NodeRef {
         id: "0x372b",
-        label: "us-east-1",
+        label: "ground-station",
     },
     NodeRef {
         id: "0xeba8",
-        label: "us-east-1",
+        label: "scout-3",
     },
     NodeRef {
         id: "0x82ee",
-        label: "us-east-1",
+        label: "follower-1",
     },
+    // AI inference cluster (3 nodes) — GPU racks running the
+    // openclaw / hermes model harnesses + a KV-cache host.
     NodeRef {
         id: "0xbdda",
-        label: "gpu-rig",
+        label: "gpu-rack-a",
     },
     NodeRef {
         id: "0x6dfb",
-        label: "us-east-1",
+        label: "gpu-rack-b",
     },
     NodeRef {
         id: "0x3c81",
-        label: "us-east-1",
+        label: "model-cache",
     },
+    // Robotics cell (2 nodes) — 6-/7-dof arms on a shared
+    // gantry, gripper + kinematics workloads.
     NodeRef {
         id: "0xe068",
-        label: "ap-south1",
+        label: "arm-cell",
     },
     NodeRef {
         id: "0xbf44",
-        label: "ap-south1",
+        label: "gantry",
     },
+    // Autonomous vehicle mesh (2 nodes) — chase truck + pit
+    // lane support; CAN-FD / EtherCAT busses, ADAS fusion.
     NodeRef {
         id: "0xf206",
-        label: "ap-south1",
-    },
-    NodeRef {
-        id: "0xf83d",
-        label: "edge",
+        label: "chase-truck",
     },
     NodeRef {
         id: "0x6808",
-        label: "ap-south1",
+        label: "pit-lane",
+    },
+    // Edge drone + vision rig — depth cameras, on-board AI.
+    NodeRef {
+        id: "0xf83d",
+        label: "edge-drone",
     },
     NodeRef {
         id: "0x0fc2",
-        label: "lab-bench",
+        label: "vision-rig",
     },
 ];
 
