@@ -43,3 +43,4 @@ package-lock.json
 # Copies of libraries
 memex/
 l0/
+net/crates/net/deck-*.txt
