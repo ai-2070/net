@@ -15,6 +15,7 @@
 pub mod cluster;
 pub mod daemons;
 pub mod dataforts;
+pub mod migrator;
 pub mod spawn;
 
 // `Harness` is part of the public demo surface (it's the

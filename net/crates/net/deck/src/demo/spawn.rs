@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 use super::cluster::{build_cluster, DEMO_NODE_COUNT};
 use super::daemons::{DroneDaemon, HeartbeatDaemon, MixerDaemon, PyroSafetyDaemon};
 use super::dataforts::build_adapters;
+use super::migrator;
 
 /// Per-node heartbeat cadence. Picks a slightly-staggered base
 /// so the 5 nodes don't all emit on the same tick; jitter is
@@ -64,6 +65,10 @@ pub struct Harness {
     /// Aborted on drop (the harness goes away, tokio drops the
     /// handles, the spawned futures are cancelled).
     _heartbeat_tasks: Vec<JoinHandle<()>>,
+    /// Phase 3 migration driver task — spawns a fresh
+    /// compute-layer daemon on node[0] every ~30 s and
+    /// migrates it to a rotating peer. Aborted on Drop.
+    _migration_task: JoinHandle<()>,
     /// `DeckClient` anchored on node[0]'s `MeshOsRuntime`. The
     /// deck observes node[0]'s snapshot fold (which includes
     /// the other 4 peers via the bridge probes).
@@ -214,11 +219,20 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     // adapter into one merged inventory.
     let blob_adapters = build_adapters(DEMO_NODE_COUNT).await;
 
+    // Phase 3: register the compute-layer migratable factory
+    // on every node and kick off the periodic migration
+    // driver. The `OrchestratorMigrationSnapshotSource` wired
+    // by the cluster harness folds the orchestrator's
+    // in-flight state into each node's snapshot.
+    migrator::install_factories(&cluster)?;
+    let migration_task = migrator::spawn_loop(&cluster);
+
     Ok(Harness {
         cluster: Some(cluster),
         _heartbeat_handles: heartbeat_handles,
         _group_handles: group_handles,
         _heartbeat_tasks: heartbeat_tasks,
+        _migration_task: migration_task,
         deck,
         blob_adapters,
         this_node,

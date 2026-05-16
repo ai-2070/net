@@ -1649,6 +1649,18 @@ impl DaemonRuntime {
         self.inner.scheduler.clone()
     }
 
+    /// Shared migration orchestrator. The
+    /// `OrchestratorMigrationSnapshotSource` adapter wraps this
+    /// `Arc` to bridge the compute-layer orchestrator's
+    /// in-flight state into the MeshOS snapshot's
+    /// `in_flight_migrations` field. Exposed `pub(crate)` so
+    /// the in-crate `testing` harness builds the source
+    /// out-of-band; the adapter type itself lives in
+    /// `net::adapter::net::behavior::meshos::migration_snapshot_source`.
+    pub(crate) fn migration_orchestrator_arc(&self) -> Arc<MigrationOrchestrator> {
+        self.inner.orchestrator.clone()
+    }
+
     /// Shared daemon registry (group members register/unregister
     /// here alongside direct-spawn daemons).
     #[cfg(feature = "groups")]

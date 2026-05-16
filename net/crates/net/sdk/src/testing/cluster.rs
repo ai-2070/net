@@ -22,7 +22,8 @@ use crate::groups::{ReplicaGroup, ReplicaGroupConfig};
 use crate::mesh::{Mesh, MeshBuilder};
 use crate::meshos::{
     EntityKeypair, LoggingDispatcher, MeshDaemon, MeshOsConfig, MeshOsDaemonHandle,
-    MeshOsDaemonSdk, NodeId, RuntimeShutdownError,
+    MeshOsDaemonSdk, MigrationSnapshotSource, NodeId, OrchestratorMigrationSnapshotSource,
+    RuntimeShutdownError,
 };
 
 use super::probes::install_mesh_probes;
@@ -336,6 +337,26 @@ impl ClusterHarness {
         let mut nodes = Vec::with_capacity(n);
         for (i, mesh) in meshes.iter().enumerate() {
             let (node_id, public_key, local_addr) = identities[i];
+            // (5a) Build the compute DaemonRuntime FIRST so its
+            //      `MigrationOrchestrator` exists before the
+            //      MeshOsDaemonSdk's snapshot loop starts. The
+            //      production `OrchestratorMigrationSnapshotSource`
+            //      wraps the orchestrator's `Arc` and the MeshOS
+            //      loop installs it via
+            //      `start_with_verifier_and_migration_source`'s
+            //      `migration_source` parameter — both sides need
+            //      the orchestrator handle at construction.
+            let daemon_runtime = DaemonRuntime::new(Arc::clone(mesh));
+            daemon_runtime.start().await.map_err(|e| {
+                ClusterError::MeshBuild(format!(
+                    "daemon_runtime.start() on node[{i}]: {e}"
+                ))
+            })?;
+            let migration_source: Arc<dyn MigrationSnapshotSource> =
+                Arc::new(OrchestratorMigrationSnapshotSource::new(
+                    daemon_runtime.migration_orchestrator_arc(),
+                ));
+
             let mut mesh_cfg = MeshOsConfig::default();
             mesh_cfg.this_node = node_id;
             mesh_cfg.tick_interval = cfg.meshos_tick_interval;
@@ -343,7 +364,7 @@ impl ClusterHarness {
                 mesh_cfg,
                 Arc::clone(&dispatcher) as Arc<LoggingDispatcher>,
                 None,
-                None,
+                Some(migration_source),
             );
             // (6) Install bridge probes on each runtime so its
             //     tick loop folds peer state derived from the
@@ -353,15 +374,6 @@ impl ClusterHarness {
                 Arc::clone(mesh),
                 Arc::clone(&expected_peers),
             );
-            // (6a) Build the compute-surface DaemonRuntime on the
-            //      same Mesh. `register_factory` calls can land
-            //      here once `start()` flips Registering→Ready.
-            let daemon_runtime = DaemonRuntime::new(Arc::clone(mesh));
-            daemon_runtime.start().await.map_err(|e| {
-                ClusterError::MeshBuild(format!(
-                    "daemon_runtime.start() on node[{i}]: {e}"
-                ))
-            })?;
             nodes.push(ClusterNode {
                 mesh: Arc::clone(mesh),
                 sdk: Some(sdk),
