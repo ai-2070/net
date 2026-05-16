@@ -1,0 +1,23 @@
+net/crates/net/deck/src/widgets/confirm.rs
+  s_46edf7dc333ef6::t_30adbcc058a3c9 312,318,325,332
+  s_46edf7dc333ef6::t_f3b38256e59d05 9
+  s_46edf7dc333ef6::t_43705c923a0f13 288,294,300
+  s_46edf7dc333ef6::t_70b8acb1832773 475
+  s_46edf7dc333ef6::t_5405f7ab256e4e 481-539
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "5faaf8fedaf19209b5ec9ca5cddcb82504f78d0b",
+  "prompts": {},
+  "sessions": {
+    "s_46edf7dc333ef6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e145bb62-38ea-4dbe-81cd-e36e7e65c2ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
