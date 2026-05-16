@@ -47,11 +47,17 @@ async fn main() -> color_eyre::Result<()> {
     }));
 
     // `demo` boots a real multi-node cluster via
+    // NRPC tail — built BEFORE the harness so the demo's
+    // observer bridge can be wired into it during spawn.
+    // Non-demo builds use it for the samples-logs injector
+    // (when that feature is also on) or leave it empty.
+    let nrpc_tail = streams::NrpcTail::new(streams::NRPC_TAIL_CAP);
+
     // `net_sdk::testing::ClusterHarness`; otherwise the
     // single-node `runtime::spawn` path runs (with the
     // synthetic `samples` fixture if that feature is on).
     #[cfg(feature = "demo")]
-    let harness = demo::spawn().await?;
+    let harness = demo::spawn(nrpc_tail.clone()).await?;
     #[cfg(not(feature = "demo"))]
     let harness = runtime::spawn().await?;
     let deck = harness.deck();
@@ -72,11 +78,6 @@ async fn main() -> color_eyre::Result<()> {
     // a single inventory cache, capped at `BLOBS_TAIL_CAP`.
     // Adapter-level errors flow into the App's toast channel.
     let blobs_tail = streams::BlobsTail::new();
-
-    // NRPC tail — populated by the samples-logs injector today;
-    // empty without that flag, ready for a real nRPC observer
-    // wire-up.
-    let nrpc_tail = streams::NrpcTail::new(streams::NRPC_TAIL_CAP);
 
     // Bookmark store — loaded from `$XDG_CONFIG_HOME/deck/bookmarks.toml`
     // (or the platform equivalent). A first-run with no config

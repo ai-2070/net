@@ -31,6 +31,8 @@ use super::cluster::{build_cluster, DEMO_NODE_COUNT};
 use super::daemons::{DroneDaemon, HeartbeatDaemon, MixerDaemon, PyroSafetyDaemon};
 use super::dataforts::build_adapters;
 use super::migrator;
+use super::rpc_chatter;
+use crate::streams::NrpcTail;
 
 /// Per-node heartbeat cadence. Picks a slightly-staggered base
 /// so the 5 nodes don't all emit on the same tick; jitter is
@@ -69,6 +71,13 @@ pub struct Harness {
     /// compute-layer daemon on node[0] every ~30 s and
     /// migrates it to a rotating peer. Aborted on Drop.
     _migration_task: JoinHandle<()>,
+    /// Phase 4: typed-RPC responder handles parked on nodes
+    /// 0 and 1. Dropping these would unregister the `demo.echo`
+    /// service mid-session.
+    _rpc_responder_handles: Vec<net_sdk::mesh_rpc::ServeHandle>,
+    /// Phase 4: per-requester loop tasks (nodes 2..N).
+    /// Aborted on Drop.
+    _rpc_requester_tasks: Vec<JoinHandle<()>>,
     /// `DeckClient` anchored on node[0]'s `MeshOsRuntime`. The
     /// deck observes node[0]'s snapshot fold (which includes
     /// the other 4 peers via the bridge probes).
@@ -109,10 +118,11 @@ impl Harness {
     }
 }
 
-/// Boot the demo cluster. Equivalent to
-/// `crate::runtime::spawn()` for non-demo builds — same return
-/// shape, same lifetime semantics.
-pub async fn spawn() -> color_eyre::Result<Harness> {
+/// Boot the demo cluster. `nrpc_tail` is the deck's shared
+/// `NrpcTail` ring that Phase 4's observer bridge pushes into;
+/// `main.rs` constructs it and clones one handle into the
+/// demo so the deck's NRPC tab reads the same records.
+pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
     eprintln!(
         "[deck demo] booting {} - node cluster on 127.0.0.1:<ephemeral>",
         DEMO_NODE_COUNT
@@ -227,12 +237,22 @@ pub async fn spawn() -> color_eyre::Result<Harness> {
     migrator::install_factories(&cluster)?;
     let migration_task = migrator::spawn_loop(&cluster);
 
+    // Phase 4: install observer bridges into the shared
+    // `NrpcTail` on every node, register typed `demo.echo`
+    // responders on nodes 0+1, and spawn requester loops on
+    // the remaining nodes.
+    rpc_chatter::install_observers(&cluster, nrpc_tail);
+    let rpc_responder_handles = rpc_chatter::install_responders(&cluster)?;
+    let rpc_requester_tasks = rpc_chatter::spawn_requester_loops(&cluster);
+
     Ok(Harness {
         cluster: Some(cluster),
         _heartbeat_handles: heartbeat_handles,
         _group_handles: group_handles,
         _heartbeat_tasks: heartbeat_tasks,
         _migration_task: migration_task,
+        _rpc_responder_handles: rpc_responder_handles,
+        _rpc_requester_tasks: rpc_requester_tasks,
         deck,
         blob_adapters,
         this_node,
@@ -312,7 +332,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn five_node_demo_boots_and_logs_appear() {
-        let harness = spawn().await.expect("demo spawn must succeed");
+        let nrpc_tail = NrpcTail::new(1024);
+        let harness = spawn(nrpc_tail.clone())
+            .await
+            .expect("demo spawn must succeed");
         // The deck observes node[0]; its snapshot should
         // include the other 4 peers via the bridge probes
         // and one registered HeartbeatDaemon for itself.
@@ -355,6 +378,16 @@ mod tests {
             harness.blob_adapters.len(),
             5,
             "demo should wire 5 blob adapters (one per node)"
+        );
+        // Phase 4: requester loops fire at ~250 ms; after 3 s
+        // the observer should have logged a non-trivial number
+        // of calls. Generous floor — CI variance + handshake
+        // bring-up can eat a few hundred ms before the first
+        // calls flow.
+        let nrpc_records = nrpc_tail.snapshot();
+        assert!(
+            !nrpc_records.is_empty(),
+            "Phase 4: NrpcTail should carry observer-recorded calls within 3 s"
         );
         // Clean shutdown — the cluster's into_shutdown drains
         // every node's MeshOsDaemonSdk so no tasks leak.
