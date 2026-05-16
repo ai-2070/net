@@ -27,12 +27,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, current: Tab, in_focus: bool, t
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// Chips shown while the operator is on the NODE page (Enter
-/// drilldown). Most cluster actions don't apply at this scope, so
-/// the row strips down to navigation + the exit hint.
+/// Chips shown while the operator is on a focused page (Node
+/// or Daemon — `Enter` drilldown). Most cluster actions don't
+/// apply at this scope; the row strips down to navigation +
+/// drill + exit.
 fn focus_chips() -> Line<'static> {
     let mut spans = base_nav();
     spans.extend([
+        chip_key("Enter"),
+        chip_desc(" drill   "),
         chip_key("Esc"),
         chip_desc(" back   "),
         chip_key("?"),

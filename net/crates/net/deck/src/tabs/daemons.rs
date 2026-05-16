@@ -159,23 +159,6 @@ fn render_live(
     frame.render_widget(table, area);
 }
 
-/// Resolve the cursored daemon row → its placement node id.
-/// `cursor` indexes into the flat daemon list in lineage-group
-/// order (same order the table renders).
-pub fn cursored_placement(snapshot: &MeshOsSnapshot, cursor: usize) -> Option<u64> {
-    let groups = lineage::group_daemons(&snapshot.daemons);
-    let mut idx = 0usize;
-    for g in &groups {
-        for m in &g.members {
-            if idx == cursor {
-                return Some(m.daemon.placement);
-            }
-            idx += 1;
-        }
-    }
-    None
-}
-
 /// Total daemon count across all groups. Used by the cursor
 /// clamp.
 pub fn total_daemons(snapshot: &MeshOsSnapshot) -> usize {

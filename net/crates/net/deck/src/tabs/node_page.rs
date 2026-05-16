@@ -29,29 +29,27 @@ use ratatui::{
 
 use crate::theme;
 
+/// Daemons placed on `node_id` in `snapshot.daemons` order.
+/// Exposed so the app layer's Enter handler can resolve the
+/// `placement_cursor` without re-walking the snapshot.
+pub fn daemons_on(snapshot: &MeshOsSnapshot, node_id: u64) -> Vec<(u64, &net_sdk::deck::DaemonSnapshot)> {
+    snapshot
+        .daemons
+        .iter()
+        .filter(|(_, d)| d.placement == node_id)
+        .map(|(id, d)| (*id, d))
+        .collect()
+}
+
 /// Snapshot of the focused peer + its id.
 #[derive(Clone, Debug)]
 pub struct NodeFocusEntry {
     pub id: u64,
     pub label: Option<String>,
     pub peer: PeerSnapshot,
-    /// Source list the focus was opened from. Drives the
-    /// previous/next bindings on the page so an operator can
-    /// step through the underlying list without Esc-ing first.
-    /// `None` means the focus was opened from a context with
-    /// no natural neighbours (e.g. the BLOBS modal pointing at
-    /// a host) — navigation keys are absorbed.
-    pub source: Option<FocusSource>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FocusSource {
-    /// `snapshot.peers` in BTreeMap order. Used when focus was
-    /// opened from LIST or NET.MAP.
-    Peers(usize),
-    /// `App::collect_dataforts()` in its render order. Used
-    /// when focus was opened from DATAFORTS.
-    Dataforts(usize),
+    /// Cursor over the daemons listed in the PLACEMENT panel.
+    /// `[Enter]` opens the cursored daemon's Daemon page.
+    pub placement_cursor: usize,
 }
 
 /// Minimal datafort view rendered on the NODE page when the
@@ -702,7 +700,14 @@ fn render_placement_panel(
         .collect();
     frame.render_widget(Paragraph::new(divider_lines), cols[1]);
 
-    // Daemons on this node.
+    // Daemons on this node. The cursor walks this list; the
+    // current row gets a `▶` marker and a brighter id color so
+    // the operator can see which daemon `[Enter]` will open.
+    let placement_cursor = if daemons_here.is_empty() {
+        0
+    } else {
+        entry.placement_cursor.min(daemons_here.len() - 1)
+    };
     let mut daemon_lines: Vec<Line> = Vec::with_capacity(daemons_here.len() + 1);
     daemon_lines.push(Line::from(vec![Span::styled(
         "  DAEMONS",
@@ -714,10 +719,17 @@ fn render_placement_panel(
             theme::dim(),
         )]));
     } else {
-        for (id, d) in &daemons_here {
+        for (i, (id, d)) in daemons_here.iter().enumerate() {
+            let is_cursor = i == placement_cursor;
+            let marker = if is_cursor { "  ▶ " } else { "    · " };
+            let id_style = if is_cursor {
+                theme::green_hi()
+            } else {
+                theme::cyan()
+            };
             daemon_lines.push(Line::from(vec![
-                Span::styled("    · ", theme::chrome()),
-                Span::styled(format!("daemon.0x{id:x}"), theme::cyan()),
+                Span::styled(marker, theme::green_hi()),
+                Span::styled(format!("daemon.0x{id:x}"), id_style),
                 Span::styled("  ", theme::chrome()),
                 Span::styled(d.name.clone(), theme::text()),
             ]));

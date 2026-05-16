@@ -21,7 +21,7 @@ struct Binding {
 const NAVIGATION: &[Binding] = &[
     Binding { keys: "1-9",       desc: "jump to tab" },
     Binding { keys: ":",         desc: "open cluster picker" },
-    Binding { keys: "Enter",     desc: "BLOBS: blob detail · NODES/NET.MAP/DAEMONS/GROUPS/DATAFORTS: node page" },
+    Binding { keys: "Enter",     desc: "BLOBS: blob detail · NODES/NET.MAP/DATAFORTS: node page · DAEMONS/GROUPS: daemon page · NODE→DAEMON, DAEMON→NODE/SIBLING" },
     Binding { keys: "Esc",       desc: "close node page / modal / search prompt (else quit)" },
     Binding { keys: "B",         desc: "DATAFORTS: jump to BLOBS" },
     Binding { keys: "Tab / ◂▸",  desc: "cycle tab" },

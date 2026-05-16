@@ -208,9 +208,14 @@ pub struct App {
     pub modal: Option<Modal>,
     /// Focused node — when `Some`, the body of the active
     /// tab is replaced with a full-page node detail view of
-    /// the peer with this id. Set by `[Enter]` on LIST or
-    /// NET.MAP cursored row; cleared by `[Esc]`.
+    /// the peer with this id. Set by `[Enter]` on NODES,
+    /// NET.MAP, DATAFORTS, or a Daemon-page placement row;
+    /// cleared by `[Esc]`.
     pub node_focus: Option<crate::tabs::node_page::NodeFocusEntry>,
+    /// Focused daemon — same shape as `node_focus` but for the
+    /// Daemon page. Mutually exclusive with `node_focus`; each
+    /// `focus_*` helper clears the other before setting.
+    pub daemon_focus: Option<crate::tabs::daemon_page::DaemonFocusEntry>,
     /// Ephemeral "toast" message shown in the footer for
     /// ~3 seconds after an action. Used for confirming
     /// side-effects the operator can't see directly — e.g.
@@ -313,15 +318,6 @@ async fn dispatch_ice(deck: &Arc<DeckClient>, proposal: net_sdk::deck::IcePropos
 pub struct DaemonCursor {
     pub group: usize,
     pub member: usize,
-}
-
-/// Bound `idx + delta` into `[0, n)`. Used by the NODE-page
-/// stepper so navigation past either end stops at the boundary
-/// rather than wrapping.
-fn clamp_step(idx: usize, delta: i32, n: usize) -> usize {
-    let signed = idx as i64 + delta as i64;
-    let last = n.saturating_sub(1) as i64;
-    signed.clamp(0, last) as usize
 }
 
 /// Synthetic per-node greedy config used while the substrate has
@@ -431,6 +427,7 @@ impl App {
             failures_search_editing: false,
             modal: None,
             node_focus: None,
+            daemon_focus: None,
             toast: None,
         }
     }
@@ -499,95 +496,119 @@ impl App {
                 id,
                 label,
                 peer,
-                source: Some(crate::tabs::node_page::FocusSource::Peers(peer_index)),
+                placement_cursor: 0,
             });
         }
     }
 
-    /// Focus the NODE page on the placement node of the
-    /// cursored daemon. Resolves the daemon via its grouped
-    /// position in the DAEMONS list (same indexing the tab
-    /// renders), then looks the placement up in `snapshot.peers`.
-    /// Synthesizes a PeerSnapshot for the local node (id 0x0001
-    /// isn't in `snapshot.peers`) so it works for daemons
-    /// running locally.
-    fn focus_daemon_placement(&mut self) {
+    /// Open the Daemon page focused on the cursored daemon in
+    /// the GROUPS tab. Resolves the daemon via its grouped
+    /// position in the GROUPS list (same indexing the tab
+    /// renders).
+    fn focus_groups_cursored_daemon(&mut self) {
         let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
         let Some(group) = groups.get(self.groups_cursor.group) else { return };
         let Some(member) = group.members.get(self.groups_cursor.member) else { return };
-        let placement = member.daemon.placement;
-        let label = crate::nodes::label_of(&format!("0x{placement:x}"));
-        if placement == 0x0001 {
-            // Synthesize local — same shape as focus_datafort's
-            // local branch.
-            let local = self.local_datafort();
-            let mut caps = std::collections::BTreeSet::new();
-            for c in &local.capabilities {
-                caps.insert(c.clone());
+        self.focus_daemon(member.id, member.daemon.clone());
+    }
+
+    /// Open the Daemon page on `id`, snapshotting the daemon at
+    /// focus time so the facts pane stays stable across ticks.
+    /// Clears `node_focus` so the page replaces, not stacks on,
+    /// any previously-focused node view.
+    fn focus_daemon(&mut self, id: u64, snapshot: net_sdk::deck::DaemonSnapshot) {
+        self.node_focus = None;
+        self.daemon_focus = Some(crate::tabs::daemon_page::DaemonFocusEntry {
+            id,
+            snapshot,
+            cursor: 0,
+        });
+    }
+
+    /// Resolve the cursored daemon in the flat DAEMONS tab and
+    /// open its Daemon page. Mirrors `focus_groups_cursored_daemon`
+    /// for the GROUPS lineage view.
+    fn focus_daemons_cursored(&mut self) {
+        let mut idx = 0usize;
+        let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
+        for g in &groups {
+            for m in &g.members {
+                if idx == self.daemons_cursor {
+                    self.focus_daemon(m.id, m.daemon.clone());
+                    return;
+                }
+                idx += 1;
             }
-            let peer = net_sdk::deck::PeerSnapshot {
-                health: Some(net_sdk::deck::PeerHealthSnapshot::Healthy),
-                cpu_load_1m: local.cpu_load_1m,
-                mem_used_bytes: local.mem_used_bytes,
-                mem_total_bytes: local.mem_total_bytes,
-                disk_used_bytes: local.disk_used_bytes,
-                disk_total_bytes: local.disk_total_bytes,
-                capability_set: caps,
-                software_version: Some("0.17.0".to_string()),
-                ..Default::default()
-            };
-            self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {
-                id: placement,
-                label: label.map(|s| s.to_string()),
-                peer,
-                source: None,
-            });
-        } else if let Some(peer_idx) = self
-            .snapshot
-            .peers
-            .iter()
-            .position(|(id, _)| *id == placement)
-        {
-            // Land in Peers source so on-page ↑/↓ walks peers.
-            self.nodes_cursor = peer_idx;
-            self.netmap_cursor = peer_idx;
-            self.focus_node(peer_idx);
         }
     }
 
-    /// Step the NODE focus to the next / previous entry within
-    /// the source list it was opened from. Mirrors the cursor
-    /// in the underlying tab so an Esc-out lands at the new
-    /// position. Sources without natural neighbours (focus_host
-    /// from a modal) leave the focus untouched.
-    fn step_node_focus(&mut self, delta: i32) {
-        let Some(source) = self.node_focus.as_ref().and_then(|f| f.source) else {
+    /// Walk the Daemon page's group-row cursor up / down.
+    /// Cursor 0 = placement node, 1..=N = sibling at index N-1.
+    fn step_daemon_focus_cursor(&mut self, delta: i32) {
+        let Some(focus) = self.daemon_focus.as_ref() else { return };
+        let rows = crate::tabs::daemon_page::group_rows(focus, &self.snapshot);
+        if rows.is_empty() {
             return;
-        };
-        match source {
-            crate::tabs::node_page::FocusSource::Peers(idx) => {
-                let n = self.snapshot.peers.len();
-                if n == 0 {
-                    return;
-                }
-                let next = clamp_step(idx, delta, n);
-                // Mirror the LIST / NET.MAP cursor so leaving
-                // focus leaves the underlying tab at the new
-                // position.
-                self.nodes_cursor = next;
-                self.netmap_cursor = next;
-                self.focus_node(next);
+        }
+        let cur = focus.cursor as i64 + delta as i64;
+        let last = rows.len().saturating_sub(1) as i64;
+        let next = cur.clamp(0, last) as usize;
+        if let Some(f) = self.daemon_focus.as_mut() {
+            f.cursor = next;
+        }
+    }
+
+    /// Dispatch `[Enter]` on the Daemon page: placement-node row
+    /// opens the Node page; sibling daemon row swaps focus to
+    /// that daemon's page.
+    fn dispatch_daemon_focus_enter(&mut self) {
+        let Some(focus) = self.daemon_focus.as_ref() else { return };
+        let rows = crate::tabs::daemon_page::group_rows(focus, &self.snapshot);
+        let cursor = focus.cursor.min(rows.len().saturating_sub(1));
+        let Some(row) = rows.get(cursor) else { return };
+        match row {
+            crate::tabs::daemon_page::GroupRow::PlacementNode { id } => {
+                let id = *id;
+                let label = crate::nodes::label_of(&format!("0x{id:x}"));
+                self.focus_host(id, label);
             }
-            crate::tabs::node_page::FocusSource::Dataforts(idx) => {
-                let entries = self.collect_dataforts();
-                if entries.is_empty() {
-                    return;
+            crate::tabs::daemon_page::GroupRow::Sibling { id } => {
+                let id = *id;
+                if let Some(d) = self.snapshot.daemons.get(&id) {
+                    self.focus_daemon(id, d.clone());
                 }
-                let next = clamp_step(idx, delta, entries.len());
-                self.dataforts_cursor = next;
-                self.focus_datafort(next);
             }
         }
+    }
+
+    /// Walk the Node page's placement cursor through the daemons
+    /// running on the focused node.
+    fn step_node_placement_cursor(&mut self, delta: i32) {
+        let Some(focus) = self.node_focus.as_ref() else { return };
+        let daemons = crate::tabs::node_page::daemons_on(&self.snapshot, focus.id);
+        if daemons.is_empty() {
+            return;
+        }
+        let cur = focus.placement_cursor as i64 + delta as i64;
+        let last = daemons.len().saturating_sub(1) as i64;
+        let next = cur.clamp(0, last) as usize;
+        if let Some(f) = self.node_focus.as_mut() {
+            f.placement_cursor = next;
+        }
+    }
+
+    /// Open the cursored placement daemon's Daemon page from the
+    /// Node page focus.
+    fn open_cursored_node_placement(&mut self) {
+        let Some(focus) = self.node_focus.as_ref() else { return };
+        let daemons = crate::tabs::node_page::daemons_on(&self.snapshot, focus.id);
+        if daemons.is_empty() {
+            return;
+        }
+        let cursor = focus.placement_cursor.min(daemons.len() - 1);
+        let (id, d) = daemons[cursor];
+        let d = d.clone();
+        self.focus_daemon(id, d);
     }
 
     /// Open the NODE page on `host_id`. Used by the blob-detail
@@ -620,7 +641,7 @@ impl App {
                 id: host_id,
                 label: host_label.map(|s| s.to_string()),
                 peer,
-                source: None,
+                placement_cursor: 0,
             });
         } else if let Some((id, peer)) =
             self.snapshot.peers.iter().find(|(pid, _)| **pid == host_id)
@@ -632,7 +653,7 @@ impl App {
                 id: *id,
                 label,
                 peer: peer.clone(),
-                source: None,
+                placement_cursor: 0,
             });
         }
     }
@@ -753,7 +774,7 @@ impl App {
                 id: entry.id,
                 label: entry.label.map(|s| s.to_string()),
                 peer,
-                source: Some(crate::tabs::node_page::FocusSource::Dataforts(idx)),
+                placement_cursor: 0,
             });
         } else if let Some((id, peer)) = self
             .snapshot
@@ -766,7 +787,7 @@ impl App {
                 id: *id,
                 label,
                 peer: peer.clone(),
-                source: Some(crate::tabs::node_page::FocusSource::Dataforts(idx)),
+                placement_cursor: 0,
             });
         }
     }
@@ -1032,46 +1053,60 @@ impl App {
         // tab; cursor + tab-switch keys still work so the
         // operator can navigate back without explicitly
         // un-focusing first.
+        // Tab-switch keys exit any focus mode cleanly. Defined
+        // once so both branches below check the same set.
+        let is_tab_switch = matches!(
+            code,
+            KeyCode::Char('1'..='9')
+                | KeyCode::Char('h')
+                | KeyCode::Char('l')
+                | KeyCode::Tab
+                | KeyCode::BackTab
+                | KeyCode::Left
+                | KeyCode::Right
+        );
+
+        // Daemon page focus has priority — when both are set
+        // (shouldn't happen, but defensive), drop only this
+        // one on Esc / tab-switch.
+        if self.daemon_focus.is_some() {
+            if matches!(code, KeyCode::Esc) {
+                self.daemon_focus = None;
+                return;
+            }
+            if is_tab_switch {
+                self.daemon_focus = None;
+            } else if matches!(code, KeyCode::Down | KeyCode::Char('j' | 's')) {
+                self.step_daemon_focus_cursor(1);
+                return;
+            } else if matches!(code, KeyCode::Up | KeyCode::Char('k' | 'w')) {
+                self.step_daemon_focus_cursor(-1);
+                return;
+            } else if matches!(code, KeyCode::Enter) {
+                self.dispatch_daemon_focus_enter();
+                return;
+            } else {
+                return;
+            }
+        }
         if self.node_focus.is_some() {
             if matches!(code, KeyCode::Esc) {
                 self.node_focus = None;
                 return;
             }
-            // Tab switches clear focus too (focus is a
-            // LIST/NET.MAP/DATAFORTS sub-view; jumping to
-            // another tab exits it cleanly). Includes left/right
-            // arrows and h/l so cycling tabs doesn't leave the
-            // node page rendered against an unrelated tab's
-            // state.
-            if matches!(
-                code,
-                KeyCode::Char('1'..='9')
-                    | KeyCode::Char('h')
-                    | KeyCode::Char('l')
-                    | KeyCode::Tab
-                    | KeyCode::BackTab
-                    | KeyCode::Left
-                    | KeyCode::Right
-            ) {
+            if is_tab_switch {
                 self.node_focus = None;
                 // fall through to the normal handler
-            } else if matches!(
-                code,
-                KeyCode::Down | KeyCode::Char('j' | 's')
-            ) {
-                self.step_node_focus(1);
+            } else if matches!(code, KeyCode::Down | KeyCode::Char('j' | 's')) {
+                self.step_node_placement_cursor(1);
                 return;
-            } else if matches!(
-                code,
-                KeyCode::Up | KeyCode::Char('k' | 'w')
-            ) {
-                self.step_node_focus(-1);
+            } else if matches!(code, KeyCode::Up | KeyCode::Char('k' | 'w')) {
+                self.step_node_placement_cursor(-1);
+                return;
+            } else if matches!(code, KeyCode::Enter) {
+                self.open_cursored_node_placement();
                 return;
             } else {
-                // Any other key while focused (cursor, etc) is
-                // absorbed so it doesn't act on the underlying
-                // tab — only the explicit exits above pass
-                // through.
                 return;
             }
         }
@@ -1319,15 +1354,14 @@ impl App {
             KeyCode::Enter if self.current == Tab::Dataforts => {
                 self.focus_datafort(self.dataforts_cursor);
             }
-            // DAEMONS (flat table): Enter opens the placement
-            // NODE page for the cursored daemon.
+            // DAEMONS / GROUPS: Enter opens the Daemon page for
+            // the cursored daemon. From there the operator can
+            // drill into the placement Node or jump to a sibling.
             KeyCode::Enter if self.current == Tab::Daemons => {
-                self.focus_daemons_cursored_placement();
+                self.focus_daemons_cursored();
             }
-            // GROUPS: Enter opens the NODE page for the
-            // placement node of the cursored daemon's group.
             KeyCode::Enter if self.current == Tab::Groups => {
-                self.focus_daemon_placement();
+                self.focus_groups_cursored_daemon();
             }
             // DATAFORTS: cross-link to BLOBS. Operators reading
             // aggregate metrics jump straight to per-chunk
@@ -2131,18 +2165,6 @@ impl App {
         }
     }
 
-    /// Focus the NODE page on the placement node of the
-    /// cursored daemon in the flat DAEMONS table.
-    fn focus_daemons_cursored_placement(&mut self) {
-        let Some(placement) =
-            tabs::daemons::cursored_placement(&self.snapshot, self.daemons_cursor)
-        else {
-            return;
-        };
-        let label = crate::nodes::label_of(&format!("0x{placement:x}"));
-        self.focus_host(placement, label);
-    }
-
     fn draw(&self, frame: &mut Frame<'_>) {
         let area = frame.area();
         let chunks = Layout::default()
@@ -2158,6 +2180,29 @@ impl App {
         widgets::status_bar::render(frame, chunks[0], self);
         widgets::tab_bar::render(frame, chunks[1], self.current);
         widgets::rule::render(frame, chunks[2]);
+        // Daemon focus pre-empts the tab's normal body. The
+        // operator drilled into a daemon (from DAEMONS, GROUPS,
+        // or a NODE page's placement row); the Daemon page owns
+        // the body until they Esc out.
+        if let Some(focus) = self.daemon_focus.as_ref() {
+            let logs = self.logs_tail.snapshot();
+            tabs::daemon_page::render(
+                frame,
+                chunks[3],
+                focus,
+                &self.snapshot,
+                &logs,
+            );
+            widgets::footer::render(
+                frame,
+                chunks[4],
+                self.current,
+                true,
+                self.toast.as_ref().map(|(s, _)| s.as_str()),
+            );
+            self.render_modal_overlay(frame, area);
+            return;
+        }
         // Node focus pre-empts the tab's normal body — the
         // operator drilled into a peer; the page owns the
         // body until they Esc out.
