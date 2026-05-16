@@ -1,0 +1,47 @@
+net/crates/net/deck/src/widgets/help.rs
+  s_3bbc444b3ef3e5::t_a3b0385511b268 42-49,54-56
+  s_3bbc444b3ef3e5::t_48dda4fbbd6eeb 24
+  s_3bbc444b3ef3e5::t_9d4ff55f62ed4d 30,50,57
+net/crates/net/deck/src/app.rs
+  s_3bbc444b3ef3e5::t_40f86e3d48f4c9 142,415,516-517,1130-1131,1134,1137-1139,1142-1143,1449-1450,1577,1619-1620,1997-1998,2107,2110,2113-2114,2116,2118-2120,2235
+  s_3bbc444b3ef3e5::t_8d8735b3a3fd35 159,418,552,577,1161-1162,1165,1303,1312,1469,1472-1474,1571,1594,1694,2211
+  s_3bbc444b3ef3e5::t_95eaf006119a24 1115-1121
+  s_3bbc444b3ef3e5::t_2430f6a945618c 1129,1133,1136,1141,1149,1154,1329,1616,2228
+  s_3bbc444b3ef3e5::t_f1933bc0343785 1157,1167-1175
+  s_3bbc444b3ef3e5::t_5e46a744db93b8 1322-1328
+  s_3bbc444b3ef3e5::t_531b259c14e369 1572
+  s_3bbc444b3ef3e5::t_af8fb4d3036388 17-19,21,30-35,39,41,53,55
+  s_3bbc444b3ef3e5::t_54e1411ca966de 2213,2217
+  s_3bbc444b3ef3e5::t_960748945cf317 416
+  s_3bbc444b3ef3e5::t_7e1c10e8ee126d 2231
+  s_3bbc444b3ef3e5::t_803c5b9b281736 138,143-147
+  s_3bbc444b3ef3e5::t_e1c6279014b6a6 2207
+  s_3bbc444b3ef3e5::t_8f132dadc6b53c 40,54
+  s_3bbc444b3ef3e5::t_eb54f93e3ac412 1596-1598
+  s_3bbc444b3ef3e5::t_0f882d08fc6b5f 2124-2145
+  s_3bbc444b3ef3e5::t_8eebbacc6b5704 1114,1160,1164,1311,1347,1350,1353,1356,1359,1362,1365,1368,1375,1378,1381,1592
+net/crates/net/deck/src/tabs/daemons.rs
+  s_3bbc444b3ef3e5::t_4441c69d983345 1-201
+net/crates/net/deck/src/tabs/nodes.rs
+  s_3bbc444b3ef3e5::t_805a8cdeed5e06 1-27
+net/crates/net/deck/src/tabs/mod.rs
+  s_3bbc444b3ef3e5::t_dcc4523374ae1f 3,6,11
+net/crates/net/deck/src/widgets/footer.rs
+  s_3bbc444b3ef3e5::t_b6554fcb6dde9f 55,71-76,85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "670d8845df78b9bb8889f36148d89c062ff97084",
+  "prompts": {},
+  "sessions": {
+    "s_3bbc444b3ef3e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85fee1ae-99a9-4aa0-a321-1a0de21a5c42",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
