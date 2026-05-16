@@ -34,6 +34,10 @@ mod meshdb;
 // for the `MeshDaemon` trait + the `Identity` wrapper.
 #[cfg(feature = "meshos")]
 mod meshos;
+// Deck SDK — operator-side bindings (Phase 4 slice 1). Builds on
+// `meshos` for the supervisor runtime accessors.
+#[cfg(feature = "deck")]
+mod deck;
 #[cfg(feature = "net")]
 mod placement;
 #[cfg(feature = "redis")]
@@ -2352,6 +2356,15 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
             "MeshOsSdkError",
             m.py().get_type::<meshos::MeshOsSdkError>(),
         )?;
+    }
+    #[cfg(feature = "deck")]
+    {
+        m.add_class::<deck::PyDeckClient>()?;
+        m.add_class::<deck::PyAdminCommands>()?;
+        m.add_class::<deck::PySnapshotStream>()?;
+        m.add_class::<deck::PyStatusSummaryStream>()?;
+        m.add_class::<deck::PyOperatorIdentity>()?;
+        m.add("DeckSdkError", m.py().get_type::<deck::DeckSdkError>())?;
     }
     Ok(())
 }

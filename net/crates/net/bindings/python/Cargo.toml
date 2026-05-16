@@ -72,6 +72,12 @@ groups = ["compute", "net-sdk/groups"]
 # class is reachable — listing `cortex` here keeps the dep chain
 # explicit when consumers ask only for `meshos`.
 meshos = ["compute", "cortex", "net/meshos", "net-sdk/meshos"]
+# Deck SDK — operator-side bindings (`DECK_SDK_PLAN.md` Phase 4).
+# Builds on `meshos` for the supervisor runtime + snapshot reader.
+# Phase 1 substrate constraint: non-signing today (the substrate
+# records the operator id but doesn't yet route through channel-
+# auth); the binding surface is final.
+deck = ["meshos", "net/meshos", "net-sdk/deck"]
 
 [dependencies]
 net = { package = "ai2070-net", version = "0.17.0", path = "../..", default-features = false }

@@ -887,6 +887,29 @@ impl PyMeshOsDaemonSdk {
             })
         }
     }
+
+    /// Borrow the tokio runtime shared with the substrate SDK.
+    /// Used by sibling modules (currently: the Deck SDK) that
+    /// need to drive `block_on` on the same scheduler the
+    /// supervisor runs on. Returns `None` when the SDK has been
+    /// consumed by `shutdown()`.
+    #[cfg(feature = "deck")]
+    pub(crate) fn runtime_clone(&self) -> Option<Arc<Runtime>> {
+        if self.inner.is_some() {
+            Some(self.runtime.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Run a closure with a borrow of the inner `CoreSdk`. Returns
+    /// `None` when the SDK is shut down. Same callsite shape as
+    /// `runtime_clone`; used by the Deck binding to construct a
+    /// `DeckClient` against the supervisor's `MeshOsRuntime`.
+    #[cfg(feature = "deck")]
+    pub(crate) fn with_core<R>(&self, f: impl FnOnce(&CoreSdk) -> R) -> Option<R> {
+        self.inner.as_ref().map(f)
+    }
 }
 
 #[pymethods]

@@ -401,6 +401,69 @@ else:
         return msg[start:end]
 
 
+# Deck SDK surface — operator-side bindings. Present iff the
+# native module was built with the `deck` Cargo feature. Slice 1
+# ships client + admin + snapshot/status streams; audit / logs /
+# failures land in slice 2, ICE in slice 3.
+try:
+    from ._net import (
+        AdminCommands as _DeckAdminCommands,
+        DeckClient,
+        DeckSdkError,
+        OperatorIdentity,
+        SnapshotStream as _DeckSnapshotStream,
+        StatusSummaryStream as _DeckStatusSummaryStream,
+    )
+except ImportError:
+    # `deck` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    # Re-export under a deck-scoped name so the symbol doesn't
+    # collide with the existing `AdminCommands` namespace used by
+    # the deck binary's own re-exports.
+    DeckAdminCommands = _DeckAdminCommands
+    DeckSnapshotStream = _DeckSnapshotStream
+    DeckStatusSummaryStream = _DeckStatusSummaryStream
+    __all__.extend(
+        [
+            "DeckClient",
+            "DeckAdminCommands",
+            "DeckSnapshotStream",
+            "DeckStatusSummaryStream",
+            "DeckSdkError",
+            "OperatorIdentity",
+            "deck_sdk_error_kind",
+        ]
+    )
+
+    def deck_sdk_error_kind(exc: "DeckSdkError") -> str | None:
+        """Extract the kind discriminator from a caught
+        ``DeckSdkError``.
+
+        The Rust side wraps every SDK error in the
+        ``<<deck-sdk-kind:KIND>>MSG`` envelope and attaches a
+        ``.kind`` attribute on the exception instance. Prefer
+        ``exc.kind`` over parsing; this helper is a fallback for
+        callers that hold the stringified form.
+
+        Returns ``None`` when the message doesn't carry the
+        envelope.
+        """
+        kind = getattr(exc, "kind", None)
+        if isinstance(kind, str):
+            return kind
+        msg = str(exc)
+        marker = "<<deck-sdk-kind:"
+        start = msg.find(marker)
+        if start == -1:
+            return None
+        start += len(marker)
+        end = msg.find(">>", start)
+        if end == -1:
+            return None
+        return msg[start:end]
+
+
 # MeshDB surface. Present iff the native module was built with
 # the `meshdb` Cargo feature. Slice 1 shipped the atomic factory
 # AST + sync runner + Phase F cache options; slice 2 added the
