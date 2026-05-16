@@ -256,31 +256,72 @@ impl Default for BlobsTail {
     }
 }
 
-/// Spawn the BLOBS inventory poller. Polls `adapter.list(...)`
-/// every `poll_interval`; updates the cached snapshot via
-/// [`BlobsTail::replace`]. Cancelled when the returned handle
-/// is dropped.
+/// Spawn the BLOBS inventory poller. Polls every wired
+/// adapter on each tick and unions their results into the
+/// cached snapshot via [`BlobsTail::replace`]; the merged Vec
+/// is capped at `BLOBS_TAIL_CAP`. Adapter-level errors are
+/// surfaced as footer toasts on each transition (ok → err /
+/// changed message) so a persistently failing adapter doesn't
+/// spam the operator. Cancelled when the returned handle is
+/// dropped.
 pub fn spawn_blobs_poll(
-    adapter: Arc<MeshBlobAdapter>,
+    adapters: Vec<Arc<MeshBlobAdapter>>,
     tail: BlobsTail,
     poll_interval: std::time::Duration,
+    toast_tx: std::sync::mpsc::Sender<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(poll_interval);
-        // Skip the immediate tick — the spawn-time call below
-        // covers the cold path; the interval ticks for the
-        // refresh cadence after that.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Per-adapter last error state. Toasts fire only on
+        // transitions (None → Some / new message) so a stuck
+        // adapter logs once, not every tick.
+        let mut last_err: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
         loop {
             ticker.tick().await;
             let opts = BlobListOptions {
                 prefix_hex: None,
                 limit: BLOBS_TAIL_CAP,
             };
-            match adapter.list(&opts).await {
-                Ok(entries) => tail.replace(entries),
-                Err(_) => continue,
+            let mut merged: Vec<BlobInventoryEntry> = Vec::new();
+            for adapter in &adapters {
+                let id = adapter.adapter_id().to_string();
+                match adapter.list(&opts).await {
+                    Ok(entries) => {
+                        merged.extend(entries);
+                        if last_err
+                            .get(&id)
+                            .map(|prev| prev.is_some())
+                            .unwrap_or(false)
+                        {
+                            let _ = toast_tx
+                                .send(format!("BLOBS poll: adapter {id} recovered"));
+                        }
+                        last_err.insert(id, None);
+                    }
+                    Err(err) => {
+                        let msg = format!("{err}");
+                        let changed = last_err
+                            .get(&id)
+                            .map(|prev| prev.as_deref() != Some(msg.as_str()))
+                            .unwrap_or(true);
+                        if changed {
+                            let _ = toast_tx
+                                .send(format!("BLOBS poll: adapter {id} list error: {msg}"));
+                        }
+                        last_err.insert(id, Some(msg));
+                    }
+                }
             }
+            // Cap the merged set so unions across many adapters
+            // don't blow past the render budget; the entries
+            // adapters return are themselves already capped per
+            // call so the truncation only kicks in on the union.
+            if merged.len() > BLOBS_TAIL_CAP {
+                merged.truncate(BLOBS_TAIL_CAP);
+            }
+            tail.replace(merged);
         }
     })
 }

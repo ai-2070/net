@@ -55,18 +55,10 @@ async fn main() -> color_eyre::Result<()> {
     let failures_tail = streams::FailuresTail::new(streams::FAILURES_TAIL_CAP);
     let _failures_stream_task = streams::spawn_failures_stream(deck.clone(), failures_tail.clone());
 
-    // BLOBS inventory poller — bound to the first registered
-    // adapter. Future iteration may poll a multi-adapter union;
-    // for now the BLOBS tab indexes the same adapter the
-    // DATAFORTS list-cursor starts on (index 0).
+    // BLOBS inventory poller — unions every wired adapter into
+    // a single inventory cache, capped at `BLOBS_TAIL_CAP`.
+    // Adapter-level errors flow into the App's toast channel.
     let blobs_tail = streams::BlobsTail::new();
-    let _blobs_poll_task = blob_adapters.first().map(|adapter| {
-        streams::spawn_blobs_poll(
-            adapter.clone(),
-            blobs_tail.clone(),
-            std::time::Duration::from_millis(500),
-        )
-    });
 
     // Bookmark store — loaded from `$XDG_CONFIG_HOME/deck/bookmarks.toml`
     // (or the platform equivalent). A first-run with no config
@@ -80,17 +72,27 @@ async fn main() -> color_eyre::Result<()> {
 
     let this_node = harness.this_node();
     let terminal = ratatui::init();
-    let result = App::new(
+    let app = App::new(
         deck,
         logs_tail,
         audit_tail,
         failures_tail,
-        blob_adapters,
-        blobs_tail,
+        blob_adapters.clone(),
+        blobs_tail.clone(),
         bookmarks,
         this_node,
-    )
-    .run(terminal);
+    );
+    let _blobs_poll_task = if blob_adapters.is_empty() {
+        None
+    } else {
+        Some(streams::spawn_blobs_poll(
+            blob_adapters,
+            blobs_tail,
+            std::time::Duration::from_millis(500),
+            app.toast_tx.clone(),
+        ))
+    };
+    let result = app.run(terminal);
     ratatui::restore();
 
     // Explicit drop so the harness's tear-down runs before
