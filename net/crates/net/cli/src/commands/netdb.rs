@@ -113,9 +113,19 @@ pub struct RestoreArgs {
     /// doesn't carry the producing origin in its envelope today,
     /// so this is operator-supplied — pass the same value the
     /// snapshot was authored under to avoid a silent cross-origin
-    /// restore.
-    #[arg(long, default_value_t = 0)]
-    pub origin: u64,
+    /// restore. Required. Pass `--allow-origin-zero` if the
+    /// snapshot really was produced at origin 0; this keeps the
+    /// "forgot the flag" footgun from silently folding chains
+    /// against the wrong origin.
+    #[arg(long)]
+    pub origin: Option<u64>,
+
+    /// Acknowledge that `--origin 0` is intentional (e.g.
+    /// single-node deployments or test snapshots). Without this,
+    /// `--origin 0` is rejected to flush out the "forgot to pass
+    /// --origin" footgun.
+    #[arg(long)]
+    pub allow_origin_zero: bool,
 
     /// Input file (postcard-encoded `NetDbSnapshot`).
     #[arg(long)]
@@ -420,6 +430,29 @@ async fn run_memories_delete(
 // =========================================================================
 
 async fn run_restore(args: RestoreArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
+    // Pre-fix `--origin` was `default_value_t = 0` so clap could
+    // not distinguish "operator forgot --origin" from "operator
+    // typed --origin 0". A defaulted-to-zero origin silently
+    // folded chains against the wrong origin if the snapshot was
+    // authored elsewhere. Require explicit --origin, with
+    // --allow-origin-zero for the legitimate origin=0 case.
+    let origin = match (args.origin, args.allow_origin_zero) {
+        (Some(0), false) => {
+            return Err(crate::error::invalid_args(
+                "--origin 0 must be explicitly acknowledged via --allow-origin-zero \
+                 (the snapshot has no embedded origin, so a defaulted zero risks a \
+                 silent cross-origin fold)",
+            ));
+        }
+        (Some(v), _) => v,
+        (None, true) => 0,
+        (None, false) => {
+            return Err(crate::error::invalid_args(
+                "--origin <u64> is required; pass the value the snapshot was authored \
+                 under, or --allow-origin-zero for an intentional origin=0 restore",
+            ));
+        }
+    };
     let dest = match args.store.as_deref() {
         Some(p) => p.to_path_buf(),
         None => default_netdb_path().ok_or_else(|| {
@@ -476,7 +509,7 @@ async fn run_restore(args: RestoreArgs, output: Option<OutputFormat>) -> Result<
     })?;
     let redex = Redex::new().with_persistent_dir(&dest);
     let _ = NetDb::builder(redex)
-        .origin(args.origin)
+        .origin(origin)
         .persistent(true)
         .with_tasks()
         .with_memories()
