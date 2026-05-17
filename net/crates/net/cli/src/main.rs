@@ -190,7 +190,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
     let config_path = cli.config.as_deref();
     let profile = cli.profile.as_str();
     match cli.command {
-        Command::Version => commands::version::run().await,
+        Command::Version => commands::version::run(output).await,
         Command::Identity(cmd) => commands::identity::run(cmd, output).await,
         Command::Admin(cmd) => commands::admin::run(cmd, output, config_path, profile).await,
         Command::Ice(cmd) => commands::ice::run(cmd, output, config_path, profile).await,

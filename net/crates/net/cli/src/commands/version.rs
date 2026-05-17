@@ -7,7 +7,7 @@
 
 use crate::prelude::*;
 
-pub async fn run() -> Result<(), CliError> {
+pub async fn run(output: Option<OutputFormat>) -> Result<(), CliError> {
     let info = VersionInfo {
         // `CARGO_PKG_VERSION` is set by cargo at build time —
         // tracks `cli/Cargo.toml:version`.
@@ -22,12 +22,7 @@ pub async fn run() -> Result<(), CliError> {
         // --short HEAD` in release builds.
         git_revision: option_env!("NET_BUILD_REVISION"),
     };
-    // `version` predates the `--output` global flag's full
-    // dispatch wiring; emit JSON to stdout unconditionally —
-    // the value is small enough that table-vs-JSON doesn't
-    // change ergonomics, and consumers piping the output to
-    // `jq` get a stable shape.
-    emit_value(OutputFormat::Json, &info)
+    emit_value(OutputFormat::resolve_oneshot(output), &info)
         .map_err(|e| crate::error::generic(format!("failed to write version output: {e}")))
 }
 
