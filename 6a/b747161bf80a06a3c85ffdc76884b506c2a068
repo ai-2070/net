@@ -1,0 +1,21 @@
+go/meshos.go
+  s_b3022192a92c59::t_68b5c4bee3ada8 1-984
+go/meshos_test.go
+  s_b3022192a92c59::t_416226ee582666 1-217
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "6ab747161bf80a06a3c85ffdc76884b506c2a068",
+  "prompts": {},
+  "sessions": {
+    "s_b3022192a92c59": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d594c56e-1353-4a07-aa91-e09d2c583c0f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
