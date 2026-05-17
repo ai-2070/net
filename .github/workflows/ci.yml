@@ -42,6 +42,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --doc --features "net redex cortex netdb"
 
+      # `deck` is a separate workspace member (TUI operator console);
+      # its #[test] functions live alongside its sources and aren't
+      # compiled by `cargo test --lib` (which builds only the
+      # current-package lib). Run them explicitly via `-p deck`.
+      - name: Run Deck unit tests
+        if: ${{ !cancelled() }}
+        run: cargo test --lib -p deck
+
   integration-tests:
     name: Integration tests (Net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC, Dataforts, MeshDB, MeshOS)
     runs-on: ubuntu-latest
@@ -279,14 +287,15 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-sdk-${{ hashFiles('**/Cargo.lock') }}
 
-      # Feature set widens beyond `net` so the SDK tests gated on
-      # `cortex` (rpc_observer, cortex_surface) and `testing`
-      # (cluster_harness, cluster_replica_group, cluster_supervisor)
-      # actually run instead of compiling to an empty test binary.
-      # `testing = ["meshos", "groups"]` so groups-gated tests pick up
-      # as a side effect — fix, not regression.
+      # Feature set covers every SDK integration test except
+      # `redis_dedup_contract` (gated on `redis`, deferred until CI
+      # service containers land — same policy as the main crate's
+      # `integration_redis`). Without this width, tests gated on
+      # `cortex` / `testing` / `compute` / `nat-traversal` /
+      # `port-mapping` compile to empty test binaries and the
+      # contract goes silently unverified.
       - name: Run Rust SDK tests (includes mesh_stream_backpressure)
-        run: cargo test --features "net cortex testing"
+        run: cargo test --features "net cortex testing compute nat-traversal port-mapping"
 
   node-tests:
     name: Node bindings tests (vitest)
