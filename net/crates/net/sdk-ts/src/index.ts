@@ -224,6 +224,29 @@ export type {
   MigrationErrorKind,
 } from './compute';
 
+// MeshDB (causal-chain query layer).
+export {
+  DisposableMeshQueryRunner,
+  InMemoryChainReader,
+  MeshQuery,
+  MeshQueryRunner,
+  MeshQueryStream,
+  QueryBuilder,
+  parseMeshDbErrorKind,
+} from './meshdb';
+export type {
+  AggregateResult,
+  CachePolicy,
+  ExecuteOptions,
+  GroupKey,
+  JoinedRow,
+  LineageEntry,
+  MeshDbPredicate,
+  ParsedMeshDbError,
+  ResultRow,
+  WindowBoundary,
+} from './meshdb';
+
 // MeshOS (daemon-author SDK over the MeshOS supervisor).
 export { MeshOsDaemonSdk, MeshOsDaemonHandle, MeshOsSdkError } from './meshos';
 export type {
