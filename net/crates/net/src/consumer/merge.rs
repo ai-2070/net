@@ -465,11 +465,19 @@ impl PollMerger {
             None => CompositeCursor::new(),
         };
 
-        // Determine which shards to poll
-        let shards: Vec<u16> = request
+        // Determine which shards to poll. Dedup the list so a caller
+        // that supplies a non-deduped slice (e.g. forwarded from a
+        // fan-out source) doesn't double-fetch a shard and return
+        // duplicate events in the response payload. The cursor would
+        // stay correct either way, but the duplicate events would
+        // survive filtering + ordering + the per-poll limit and reach
+        // the caller.
+        let mut shards: Vec<u16> = request
             .shards
             .clone()
             .unwrap_or_else(|| self.shard_ids.clone());
+        shards.sort_unstable();
+        shards.dedup();
 
         if shards.is_empty() {
             return Ok(ConsumeResponse::empty());
@@ -1537,6 +1545,49 @@ mod tests {
         assert!(response.events.is_empty());
         assert!(response.next_id.is_none());
         assert!(!response.has_more);
+    }
+
+    /// A caller that forwards a non-deduplicated shard list — e.g.
+    /// `vec![0, 0, 1]` — must not cause `poll()` to fetch the same
+    /// shard twice and return duplicate events. Pre-fix, the merger
+    /// consumed `shards` verbatim and issued one `poll_shard(0, …)`
+    /// per occurrence; both returned the same events; the duplicates
+    /// survived the per-shard limit and reached the caller.
+    #[tokio::test]
+    async fn poll_dedupes_duplicate_shard_ids_in_request() {
+        let adapter = Arc::new(MockAdapter::new());
+        adapter.add_events(
+            0,
+            vec![
+                StoredEvent::from_value("s0-a".to_string(), json!({"v": 1}), 1, 0),
+                StoredEvent::from_value("s0-b".to_string(), json!({"v": 2}), 2, 0),
+            ],
+        );
+        adapter.add_events(
+            1,
+            vec![StoredEvent::from_value(
+                "s1-a".to_string(),
+                json!({"v": 3}),
+                3,
+                1,
+            )],
+        );
+
+        let merger = PollMerger::new(adapter, vec![0, 1]);
+        let response = merger
+            .poll(ConsumeRequest::new(100).shards(vec![0, 0, 1]))
+            .await
+            .unwrap();
+
+        // 2 events from shard 0 (not 4 — i.e. not fetched twice) plus
+        // 1 event from shard 1 = 3 total. Pre-fix this was 5.
+        assert_eq!(response.events.len(), 3);
+        let s0_count = response
+            .events
+            .iter()
+            .filter(|e| e.shard_id == 0)
+            .count();
+        assert_eq!(s0_count, 2, "shard 0 events must not be duplicated");
     }
 
     /// Regression: per-shard adapter errors must surface on
