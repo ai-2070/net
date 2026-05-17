@@ -272,7 +272,7 @@ where
     let simulated = proposal
         .simulate()
         .await
-        .map_err(|e| map_ice_error(&format!("simulate: {e}"), e_kind(&e)))?;
+        .map_err(|e| map_ice_error(&format!("simulate: {e}"), e.kind))?;
     let blast = simulated.blast_radius().clone();
     let preview = SimulationPreview {
         issued_at_ms: simulated.issued_at_ms(),
@@ -322,7 +322,7 @@ where
     let commit: ChainCommit = simulated
         .commit(&signatures)
         .await
-        .map_err(|e| map_ice_error(&format!("commit: {e}"), e_kind(&e)))?;
+        .map_err(|e| map_ice_error(&format!("commit: {e}"), e.kind))?;
     let payload = ChainCommitMirror {
         commit_id: commit.commit_id(),
         operator_id: commit.operator_id(),
@@ -338,19 +338,15 @@ where
     Ok(())
 }
 
-fn e_kind(e: &net_sdk::deck::IceError) -> Option<&'static str> {
-    Some(e.kind)
-}
-
-fn map_ice_error(msg: &str, kind: Option<&'static str>) -> CliError {
+fn map_ice_error(msg: &str, kind: &'static str) -> CliError {
     match kind {
-        Some("simulation_required") => _CE::new(ExitCodeKind::IceSimulationBlocked, msg),
-        Some("not_authorized")
-        | Some("signature_invalid")
-        | Some("insufficient_signatures")
-        | Some("envelope_expired")
-        | Some("envelope_from_future")
-        | Some("ice_cooldown_active") => _CE::new(ExitCodeKind::OperatorPolicyRejected, msg),
+        "simulation_required" => _CE::new(ExitCodeKind::IceSimulationBlocked, msg),
+        "not_authorized"
+        | "signature_invalid"
+        | "insufficient_signatures"
+        | "envelope_expired"
+        | "envelope_from_future"
+        | "ice_cooldown_active" => _CE::new(ExitCodeKind::OperatorPolicyRejected, msg),
         _ => sdk(msg),
     }
 }
