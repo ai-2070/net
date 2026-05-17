@@ -299,7 +299,29 @@ Three modes for `net daemon run`:
 - **`net rpc discover <SERVICE>`** — wraps `find_service_nodes(service)`. Output table (TTY) or ndjson (non-TTY) listing the advertising node ids.
 - **`net rpc services`** — enumerate every `nrpc:<service>` tag in the local capability index. Useful for discovery from a bastion ("what's actually wired up?").
 
-### 6. Config file shape
+### 6. Capability + proximity surface
+
+`net cap` and `net peer` wrap the substrate's capability-system and proximity-graph reads + writes (`adapter/net/behavior/capability.rs`, `adapter/net/behavior/proximity.rs`, plus the `MeshAdapter` accessors). Both are local-node operations — they read or modify what this node advertises / observes about its mesh neighbors.
+
+**`net cap` — capability advertisement + discovery:**
+
+- **`announce`** — wraps `MeshAdapter::announce_capabilities(set)`. `--tags <TAG>...` accepts a list of free-form tag strings the substrate folds into a `CapabilitySet` via `add_tag` chaining (same shape every binding's `requiredCapabilities` route accepts). `--from-file <PATH>` reads a TOML / JSON file with the full structured shape (GPU vendor + VRAM, model declarations, accelerator entries) for richer adverts. Replaces the local node's advertised set; partial updates use the existing `announce_capabilities_with(...)` builder under the hood (`--add-tag` / `--remove-tag` follow-up flags are an explicit deferred slice).
+- **`show`** — local case: print the substrate's last-announced set for this node. `--node <ID>`: read from `ProximityGraph::nodes_with_capabilities()` and emit the matching peer's advertised set. Output `json` / `yaml` / `table` per the global `--output` rule.
+- **`query`** — compiles the flag set into a `CapabilityFilter` (the substrate type at `behavior/capability.rs:~2134`) and calls `CapabilityIndex::query(filter)` via `MeshAdapter::capability_index().query(...)`. Returns the matching node id list. Useful for sanity-checking placement decisions ("which nodes would actually pass this filter today?"). Flags map 1:1: `--require-gpu` → `CapabilityFilter::require_gpu`, `--min-memory-gb` → `min_memory_gb`, `--model <ID>` → `require_models.push(ID)`, etc.
+- **`nodes`** — wraps `ProximityGraph::nodes_with_capabilities()`. Emits `(node_id, CapabilitySet)` tuples — the "what does the whole mesh look like, capability-wise" snapshot. Table form is one node per row with tag count + a tag-summary column; ndjson form emits the full set per node.
+
+**`net peer` — peer + NAT-traversal helpers:**
+
+- **`ls`** — wraps `ProximityGraph::all_nodes()`. One row per peer: `node_id`, `rtt_ms`, `health` (Healthy / Degraded / Unreachable / Unknown), `nat_class`, `reflex_addr`, `hops`. Output `table` (TTY) or `ndjson` (non-TTY).
+- **`reflex`** — wraps `MeshAdapter::peer_reflex_addr(node)`. With no `--node`, returns the local node's `reflex_addr()`. Exits 3 with kind `peer_unknown` if the peer has no observed reflex yet (probe + retry hint in stderr).
+- **`nat`** — wraps `MeshAdapter::nat_type()` + `reflex_addr()` for the local node. Emits `{ nat_class, reflex_addr, source }` where `source` is `probe` / `override` / `none`.
+- **`reclassify-nat`** — wraps `MeshAdapter::reclassify_nat()`. Awaits the next classifier sweep, then prints the post-sweep nat-class. Useful after a network move.
+- **`set-reflex <ADDR>`** — wraps `set_reflex_override(addr)`. Pins `nat_class = "open"` and `reflex_addr = Some(addr)` until cleared. Documented as an optimization (not correctness — routed-handshake still works without it).
+- **`clear-reflex`** — wraps `clear_reflex_override()`. The next probe sweep repopulates `reflex_addr` naturally.
+
+Both subcommand groups are read-only from a cluster-state perspective with one local-state exception: `cap announce` and `peer set-reflex` mutate what *this node* tells the rest of the mesh, but never commit to the admin chain. They're "tell my peers about my own state" surfaces, not "tell other nodes what to do" surfaces — which keeps them firmly outside the admin-commit path that requires operator signing.
+
+### 7. Config file shape
 
 ```toml
 # ~/.config/net/config.toml
@@ -323,7 +345,7 @@ default_timeout_ms = 30000
 
 `--config` / `--profile` / `NET_PROFILE` env var resolve the active profile. Every individual flag overrides the profile value.
 
-### 7. Identity store
+### 8. Identity store
 
 Operator identities are stored as TOML files:
 
@@ -339,7 +361,7 @@ note        = "Production operator for the deck-fleet cluster"
 
 The seed file is read-only by `chmod 600`; the CLI errors with kind `permissive_mode` if the file is world-readable. Pattern lifted from `ssh-keygen`.
 
-### 8. Wire / FFI contracts
+### 9. Wire / FFI contracts
 
 The CLI inherits everything from the Rust SDK — no new wire formats. JSON output uses serde's default representation; specifically:
 
@@ -356,7 +378,7 @@ The CLI inherits everything from the Rust SDK — no new wire formats. JSON outp
 - `MeshOsSnapshot` → forwarded verbatim; `--output yaml` rewraps for readability.
 - Errors → `{"kind": "...", "message": "..."}` on stderr, exit code per the table above.
 
-### 9. Tests
+### 10. Tests
 
 Three layers:
 
@@ -364,7 +386,7 @@ Three layers:
 2. **In-process integration** — every subcommand under `tests/`. Each test spins a `net_sdk::testing::ClusterHarness`, drives the CLI via `assert_cmd`, and checks stdout / stderr / exit code. ~40 cases planned for Phase 1.
 3. **Exit-code coverage** — `tests/exit_codes.rs` enumerates every documented code (0–8, sample 10–11), invokes a fixture that produces that code, and asserts the binary exits with it. Pinned so future contributors can't quietly broaden the meaning of an exit code.
 
-### 10. Documentation
+### 11. Documentation
 
 - **`docs/net-cli.md`** — operator-facing reference. Each subcommand's flags, output shape, example invocation, exit codes, env vars. Format lifted from `git-scm.com`-style man pages.
 - **`docs/net-cli-cookbook.md`** — recipes. Common CI patterns (drain-and-wait, audit-since-deploy, ICE preview in dry-run), shell snippets, jq one-liners.
@@ -399,9 +421,9 @@ Lock these so phase implementations don't relitigate:
 
 Activation order, dependency-driven:
 
-- **Phase 1 — Scaffolding + read-only surface.** `cli/Cargo.toml` + `src/main.rs` with clap routing for `net version`, `net identity (generate|show|fingerprint)`, `net snapshot get`, `net snapshot status`, `net audit recent` / `audit stream`, `net log tail`, `net failures tail`, `net daemon ls`. Config + global flags + output dispatch. Exit-code table. Help-text goldens. Wires nothing that mutates substrate state — purely read + identity authoring.
+- **Phase 1 — Scaffolding + read-only surface.** `cli/Cargo.toml` + `src/main.rs` with clap routing for `net version`, `net identity (generate|show|fingerprint)`, `net snapshot get`, `net snapshot status`, `net audit recent` / `audit stream`, `net log tail`, `net failures tail`, `net daemon ls`, `net cap (show|query|nodes)`, `net peer (ls|reflex|nat)`. Config + global flags + output dispatch. Exit-code table. Help-text goldens. Wires nothing that mutates substrate or local-node state — purely read + identity authoring.
 
-- **Phase 2 — Admin write surface + nRPC client.** `net admin (drain|enter-maintenance|exit-maintenance|cordon|uncordon|drop-replicas|invalidate-placement|restart-all-daemons|clear-avoid-list)`. `--dry-run` support. Identity loading + commit envelope construction. `net rpc (call|stream|discover|services)` — Tier 1 client surface over `MeshAdapter::call_service` / `call_streaming` / `find_service_nodes`. Integration tests for every admin variant + ≥3 per `rpc` command (happy path, `NoRoute`, payload-shape mismatch).
+- **Phase 2 — Admin write surface + nRPC client + local-state writes.** `net admin (drain|enter-maintenance|exit-maintenance|cordon|uncordon|drop-replicas|invalidate-placement|restart-all-daemons|clear-avoid-list)`. `--dry-run` support. Identity loading + commit envelope construction. `net rpc (call|stream|discover|services)` — Tier 1 client surface over `MeshAdapter::call_service` / `call_streaming` / `find_service_nodes`. `net cap announce` + `net peer (reclassify-nat|set-reflex|clear-reflex)` — local-state writes that update what this node advertises but never commit to the admin chain. Integration tests for every admin variant + ≥3 per `rpc` / `cap` / `peer` command (happy path, error path, output-format variant).
 
 - **Phase 3 — ICE break-glass surface.** `net ice (freeze-cluster|thaw-cluster|flush-avoid-lists|force-evict-replica|force-restart-daemon|force-cutover|kill-migration)`. Simulate → preview table → confirm gate → commit. `--yes` for non-interactive flows; `--sig` for pre-collected signatures. `net identity registry (add|remove|list)`. ICE-specific integration tests + the exit-code-8 coverage.
 
