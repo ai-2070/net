@@ -1,0 +1,35 @@
+net/crates/net/bindings/go/cortex-ffi/src/lib.rs
+  s_5af7ced268385a::t_4dd5225c2a3d69 1-144,147-204,206-207,209-298,303,306-307,309,312-574
+  s_5af7ced268385a::t_2d5476b56313c9 205,208
+  s_5af7ced268385a::t_a991119c10b532 299-302,304-305,308,310-311
+  s_5af7ced268385a::t_8f26cd735e1daf 145-146
+net/crates/net/include/net_cortex.h
+  s_5af7ced268385a::t_cbbcbca557db8e 1-339
+net/crates/net/bindings/go/cortex-ffi/src/tasks.rs
+  s_5af7ced268385a::t_8ca98873626927 419
+  s_5af7ced268385a::t_d6c59405bd27e0 1-5,7-9,11-418,420-536
+  s_5af7ced268385a::t_269e39aeec39ff 6,10
+net/crates/net/bindings/go/cortex-ffi/src/memories.rs
+  s_5af7ced268385a::t_e0b3b7e7c5936b 6,10
+  s_5af7ced268385a::t_51c0c93eb61cc4 1-5,7-9,11-593
+net/crates/net/bindings/go/cortex-ffi/Cargo.toml
+  s_5af7ced268385a::t_a4db8550008f80 1-35
+net/crates/net/Cargo.toml
+  s_5af7ced268385a::t_db617449e266e0 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "58c281f57e7874c410d651d12ba985ba80d51842",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
