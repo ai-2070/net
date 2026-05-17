@@ -74,6 +74,12 @@ is-terminal = "0.4"
 bytes = "1"
 hex = "0.4"
 
+# SHA-256 for the operator-visible identity fingerprint. ssh
+# uses SHA-256 for the analogous `ssh-keygen -lf` surface; we
+# mirror the algorithm so operators recognize the fingerprint
+# format at a glance.
+sha2 = "0.10"
+
 # Typed errors at the config / identity boundary.
 thiserror = "2"
 
