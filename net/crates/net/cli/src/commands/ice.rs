@@ -296,14 +296,13 @@ where
     // always demand the typed `YES` even with `--yes` so a stray
     // shell-history recall can't ram an ICE commit through.
     let stdin_is_tty = std::io::IsTerminal::is_terminal(&io::stdin());
-    if !stdin_is_tty {
-        if !common.yes {
-            return Err(_CE::new(
-                ExitCodeKind::ConfirmationRefused,
-                "stdin is not a TTY; pass --yes to skip the interactive confirm prompt",
-            ));
-        }
-    } else if !prompt_for_yes()? {
+    if !stdin_is_tty && !common.yes {
+        return Err(_CE::new(
+            ExitCodeKind::ConfirmationRefused,
+            "stdin is not a TTY; pass --yes to skip the interactive confirm prompt",
+        ));
+    }
+    if stdin_is_tty && !prompt_for_yes()? {
         return Err(crate::error::confirmation_refused());
     }
 
