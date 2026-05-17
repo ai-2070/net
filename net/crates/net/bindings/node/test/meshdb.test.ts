@@ -286,15 +286,7 @@ d('MeshDB composite operators + decoders (slice 2)', () => {
     return r;
   };
 
-  // TODO: napi-side aggregate decoder leaves `group` as `undefined`
-  // where the cross-binding contract expects `null`. The substrate
-  // emits `GroupKey: None` → postcard → napi-rs object literal, and
-  // napi-rs drops `None` fields rather than serialising them as
-  // `null`. Fix by either materialising the field in `decodeAggregate`
-  // or relaxing the assertion. Skipped to unblock the SDK survey CI
-  // (the test was previously hidden behind `describe.skipIf(!hasMeshDb)`
-  // when the napi binding shipped without the `meshdb` Cargo feature).
-  it.skip('count with no groupBy returns a single aggregate row', async () => {
+  it('count with no groupBy returns a single aggregate row', async () => {
     const chain = 0xabcdn;
     const reader = seed([1, 2, 3, 4, 5].map((s) => [chain, BigInt(s), Buffer.from('')]));
     const runner = new MeshQueryRunner(reader);
@@ -426,13 +418,7 @@ d('MeshDB composite operators + decoders (slice 2)', () => {
     expect(Buffer.from(pairs[0].right!.payload).toString()).toBe('b-2');
   });
 
-  // TODO: substrate emits 3 rows where the test expects 1 matched +
-  // 2 unmatched. Either the substrate's left-outer-join semantics
-  // drifted (now emits all-rows-with-rights including unmatched) or
-  // the assertion targets the wrong filter. Skipped to unblock the
-  // SDK survey CI; revisit when the substrate join semantics are
-  // re-audited.
-  it.skip('left_outer join emits unmatched lefts', async () => {
+  it('left_outer join emits unmatched lefts', async () => {
     const a = 0x111n;
     const b = 0x222n;
     const reader = seed([
@@ -760,18 +746,7 @@ d('MeshDB Filter + Predicate (slice 3)', () => {
 // Slice 4: fluent QueryBuilder.
 // ---------------------------------------------------------------------
 
-// TODO: the entire MeshQuery.builder() chainable surface is broken
-// at runtime. `MeshQuery.builder()` returns an object (the test's
-// `expect(b).toBeDefined()` passes) but its instance methods —
-// `.at` / `.between` / `.count` / `.build` etc — are missing at
-// runtime even though napi-rs's generated `index.d.ts` declares
-// them. Smells like the `#[napi(factory)]` on `MeshQuery::builder`
-// (returning a different `#[napi]` class by value) isn't wrapping
-// the return in a JS-visible class instance. Whole block skipped
-// to unblock the SDK survey CI — the atomic / composite / filter /
-// predicate slices above still cover the operator semantics; only
-// the fluent-builder ergonomics layer is broken.
-describe.skip('MeshDB QueryBuilder (slice 4)', () => {
+d('MeshDB QueryBuilder (slice 4)', () => {
   const {
     MeshQuery,
     MeshQueryRunner,
