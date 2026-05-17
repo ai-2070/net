@@ -12,6 +12,7 @@
 
 pub mod admin;
 pub mod audit;
+pub mod blob;
 pub mod cap;
 pub mod daemon;
 pub mod db;

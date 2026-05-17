@@ -1,9 +1,33 @@
-//! `net daemon ls` — list daemons known to the local snapshot.
+//! `net daemon (ls|run|shutdown|log)` — daemon authoring +
+//! observation.
 //!
-//! Phase 1 scope: read-only listing from
-//! `MeshOsSnapshot::daemons`. `net daemon run` (factory-id
-//! based authoring on-ramp) + `net daemon shutdown` + `net
-//! daemon log` ship in Phase 4.
+//! Phase 1: `ls` (snapshot-driven, ships today).
+//!
+//! Phase 4 design stubs (intentionally not wired into the clap
+//! router):
+//!
+//! - **`net daemon run --kind <FACTORY-ID>`** — needs a
+//!   `net_daemon_factories::register!` macro inventory that
+//!   doesn't exist today. The plan (§4 "Daemon authoring
+//!   on-ramp") pins the shape: a downstream crate registers
+//!   daemon factories under string ids; the CLI iterates the
+//!   inventory at startup and dispatches `run --kind <id>` to
+//!   the matching factory's `Box<dyn MeshDaemon>` constructor.
+//!   The runtime then drives the lifecycle (register → run
+//!   process loop → graceful shutdown on Ctrl-C / control
+//!   event).
+//!
+//! - **`net daemon shutdown <ID>`** — wraps
+//!   `MeshOsDaemonHandle::graceful_shutdown(grace)`. Blocked on
+//!   the same `MeshOsRuntime::mesh()` accessor work the
+//!   peer/port/rpc subcommands wait on, because the supervisor
+//!   needs to be addressable across processes (the in-process
+//!   supervisor doesn't share state across `net daemon run`
+//!   and `net daemon shutdown` invocations).
+//!
+//! - **`net daemon log [--daemon <ID>]`** — already covered by
+//!   `net log tail --daemon <ID>` from Phase 1. Phase 4 adds
+//!   the `daemon log` alias for consumer ergonomics.
 
 use std::path::PathBuf;
 

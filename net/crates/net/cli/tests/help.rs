@@ -17,6 +17,7 @@ const SUBCOMMANDS: &[&str] = &[
     "version",
     "identity",
     "admin",
+    "ice",
     "snapshot",
     "audit",
     "log",
