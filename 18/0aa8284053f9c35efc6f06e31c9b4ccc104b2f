@@ -1,0 +1,58 @@
+net/crates/net/src/ffi/cortex.rs
+  s_85b38155803bed::t_3317fb7ae3c20b 1670-1671,1690-1693,1698-1699
+  s_85b38155803bed::t_baa44070ffa06f 2343-2346,2351-2352
+net/crates/net/bindings/node/src/cortex.rs
+  s_85b38155803bed::t_8d8086e45e170e 1829,1832-1840
+  s_85b38155803bed::t_9593fc8b736fd5 1305-1307,1310-1318
+net/crates/net/bindings/python/src/cortex.rs
+  s_85b38155803bed::t_ed31ec3d537afd 1159-1162,1166-1173
+  s_85b38155803bed::t_a275dbbe91a841 1682,1686-1693
+net/crates/net/tests/integration_cortex_adapter.rs
+  s_85b38155803bed::t_ab90f193c96959 67,96,113,131,156,183,214,282,308,336,381,410
+net/crates/net/src/adapter/net/cortex/error.rs
+  s_85b38155803bed::t_c07018c45cdfef 27-42
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  s_85b38155803bed::t_a94ce56c255250 192-196
+  s_85b38155803bed::t_56744f51cdf168 419-424
+  s_85b38155803bed::t_8212ef040eb46b 123-128
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  s_85b38155803bed::t_deed98f5ed2316 144-149,413-418
+  s_85b38155803bed::t_2c273e891ed2b6 235-239
+net/crates/net/sdk/tests/cortex_surface.rs
+  s_85b38155803bed::t_ab90f193c96959 31-32,47,68,75,101-102
+net/crates/net/tests/integration_cortex_memories.rs
+  s_85b38155803bed::t_ab90f193c96959 46,77,81,94,107,155,252,258,286,367,484,497,525,575,588,623,629,662,668,707,757,784,841-842,869,879,916,923,982,997
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  s_85b38155803bed::t_068dddd5a17fe0 1215,1271,1646,1707,1749,1798,1854,1892,2068,2158,2275,2312
+  s_85b38155803bed::t_63733f639d6608 1249-1250
+  s_85b38155803bed::t_6f0e9bfce197ec 282-291,296,311,322,335,338
+  s_85b38155803bed::t_7df2b546eb6404 2238-2239
+  s_85b38155803bed::t_4851940a63e4f1 1584-1586
+  s_85b38155803bed::t_c97919d102b7ff 1529-1540
+  s_85b38155803bed::t_0b538cdd4b5c9a 1962-1963
+net/crates/net/tests/integration_cortex_tasks.rs
+  s_85b38155803bed::t_ab90f193c96959 40,68,83,96,114,122,144-145,168,201,274,323,388,399,546,596,603,617,652,665,703,749,764,802,811,852,861,892,936,960,990,1038,1047,1074,1103,1115,1145,1150,1204
+net/crates/net/tests/integration_netdb.rs
+  s_85b38155803bed::t_ab90f193c96959 60,86,152,217-218,348-349,410,448-449,506
+net/crates/net/benches/cortex.rs
+  s_85b38155803bed::t_3df926f6487ea7 128
+  s_85b38155803bed::t_c02ddf1555fe6b 109
+  s_85b38155803bed::t_5a67719600123a 178
+  s_85b38155803bed::t_aa5763da45b32b 154
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "180aa8284053f9c35efc6f06e31c9b4ccc104b2f",
+  "prompts": {},
+  "sessions": {
+    "s_85b38155803bed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a87163a2-e445-4527-8e9a-d6b1e77222f5",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
