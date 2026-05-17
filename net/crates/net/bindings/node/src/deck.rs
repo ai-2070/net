@@ -38,10 +38,15 @@ use net::adapter::net::behavior::deck::{
     AdminCommands as CoreAdminCommands, AuditQuery as CoreAuditQuery,
     AuditStream as CoreAuditStream, ChainCommit as CoreChainCommit, DeckClient as CoreClient,
     DeckClientConfig as CoreConfig, DeckError, FailureStream as CoreFailureStream,
-    LogFilter as CoreLogFilter, LogStream as CoreLogStream, OperatorIdentity as CoreIdentity,
-    SnapshotStream as CoreSnapshotStream, StatusSummary, StatusSummaryStream as CoreStatusStream,
+    IceProposal as CoreIceProposal, LogFilter as CoreLogFilter, LogStream as CoreLogStream,
+    OperatorIdentity as CoreIdentity, SnapshotStream as CoreSnapshotStream, StatusSummary,
+    StatusSummaryStream as CoreStatusStream,
 };
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
+use net::adapter::net::behavior::meshos::{
+    AvoidScope as CoreAvoidScope, ChainId as CoreChainId, DaemonRef as CoreDaemonRef,
+    MigrationId as CoreMigrationId, OperatorSignature as CoreOperatorSignature,
+};
 use net::adapter::net::EntityKeypair;
 
 use futures::StreamExt;
@@ -502,6 +507,18 @@ impl DeckClient {
         }
     }
 
+    /// Break-glass surface. Returns `IceCommands` whose 7
+    /// factories produce `IceProposal`s. Each must be
+    /// `simulate()`-d (yielding a `SimulatedIceProposal`) before
+    /// `commit(signatures)`. The typestate is enforced at the
+    /// class level: `IceProposal` has no `commit` method.
+    #[napi(getter)]
+    pub fn ice(&self) -> IceCommands {
+        IceCommands {
+            client: self.client.clone(),
+        }
+    }
+
     /// One-shot read of the latest `MeshOsSnapshot` as a JSON
     /// string. The TS wrapper parses the JSON into an object.
     #[napi]
@@ -902,5 +919,353 @@ impl AuditQuery {
         AuditStream {
             inner: tokio::sync::Mutex::new(Some(self.build(&self.client).stream())),
         }
+    }
+}
+
+// =========================================================================
+// Slice 3 — ICE break-glass surface
+//
+// Typestate: IceProposal exposes only `simulate()`. The
+// SimulatedIceProposal returned from `simulate()` is the only
+// class exposing `commit(signatures)`. Direct commit on an
+// IceProposal is unreachable at the class level — mirrors the
+// substrate's compile-time typestate enforcement.
+// =========================================================================
+
+/// Avoid-list flush scope. Variants:
+///
+/// - `{ kind: 'global' }` — clear cluster-wide avoid lists.
+/// - `{ kind: 'local', node: bigint }` — clear `node`'s avoid list.
+/// - `{ kind: 'onPeer', peer: bigint }` — remove `peer` from every
+///   node's avoid list.
+#[napi(object)]
+pub struct AvoidScopeJs {
+    pub kind: String,
+    pub node: Option<BigInt>,
+    pub peer: Option<BigInt>,
+}
+
+impl AvoidScopeJs {
+    fn into_core(self) -> Result<CoreAvoidScope> {
+        match self.kind.as_str() {
+            "global" | "Global" => Ok(CoreAvoidScope::Global),
+            "local" | "Local" => {
+                let bi = self.node.ok_or_else(|| {
+                    deck_err(
+                        "invalid_avoid_scope",
+                        "scope 'local' requires 'node' BigInt".to_string(),
+                    )
+                })?;
+                let node = crate::common::bigint_u64(bi).map_err(|e| {
+                    deck_err("invalid_avoid_scope", format!("node: {}", e.reason))
+                })?;
+                Ok(CoreAvoidScope::Local { node })
+            }
+            "onPeer" | "on_peer" | "OnPeer" => {
+                let bi = self.peer.ok_or_else(|| {
+                    deck_err(
+                        "invalid_avoid_scope",
+                        "scope 'onPeer' requires 'peer' BigInt".to_string(),
+                    )
+                })?;
+                let peer = crate::common::bigint_u64(bi).map_err(|e| {
+                    deck_err("invalid_avoid_scope", format!("peer: {}", e.reason))
+                })?;
+                Ok(CoreAvoidScope::OnPeer { peer })
+            }
+            other => Err(deck_err(
+                "invalid_avoid_scope",
+                format!(
+                    "scope.kind must be 'global' | 'local' | 'onPeer'; got {other:?}"
+                ),
+            )),
+        }
+    }
+}
+
+/// `OperatorSignature` carried by ICE commits. `signature` must
+/// be exactly 64 ed25519 signature bytes.
+#[napi(object)]
+pub struct OperatorSignatureJs {
+    pub operator_id: BigInt,
+    pub signature: Buffer,
+}
+
+impl OperatorSignatureJs {
+    fn into_core(self) -> Result<CoreOperatorSignature> {
+        let operator_id = crate::common::bigint_u64(self.operator_id)
+            .map_err(|e| deck_err("invalid_signature", format!("operatorId: {}", e.reason)))?;
+        Ok(CoreOperatorSignature {
+            operator_id,
+            signature: self.signature.as_ref().to_vec(),
+        })
+    }
+}
+
+/// Build a substrate `IceProposal` from a saved action. The
+/// substrate's factories pin a fresh `issued_at_ms` per call;
+/// the simulator is pure over the latest snapshot so the
+/// committed envelope still binds to a stable `(action,
+/// issued_at_ms, blast_hash)` triple.
+fn build_core_proposal<'a>(
+    client: &'a CoreClient,
+    action: net::adapter::net::behavior::meshos::IceActionProposal,
+) -> CoreIceProposal<'a> {
+    use net::adapter::net::behavior::meshos::IceActionProposal as A;
+    match action {
+        A::FreezeCluster { ttl } => client.ice().freeze_cluster(ttl),
+        A::FlushAvoidLists { scope } => client.ice().flush_avoid_lists(scope),
+        A::ForceEvictReplica { chain, victim } => client.ice().force_evict_replica(chain, victim),
+        A::ForceRestartDaemon { daemon } => client.ice().force_restart_daemon(daemon),
+        A::ForceCutover { chain, target } => client.ice().force_cutover(chain, target),
+        A::KillMigration { migration } => client.ice().kill_migration(migration),
+        A::ThawCluster => client.ice().thaw_cluster(),
+        // `IceActionProposal` is `#[non_exhaustive]` — new
+        // substrate variants fall back; bindings stay forward-
+        // compatible.
+        _ => client.ice().thaw_cluster(),
+    }
+}
+
+/// `IceCommands` — operator-side break-glass surface. Every
+/// factory returns an `IceProposal` that must be `simulate()`-d
+/// before commit.
+#[napi]
+pub struct IceCommands {
+    client: Arc<CoreClient>,
+}
+
+#[napi]
+impl IceCommands {
+    #[napi]
+    pub fn freeze_cluster(&self, ttl_ms: BigInt) -> Result<IceProposal> {
+        let ttl_ms = crate::common::bigint_u64(ttl_ms)
+            .map_err(|e| deck_err("invalid_argument", format!("ttlMs: {}", e.reason)))?;
+        let p = self.client.ice().freeze_cluster(Duration::from_millis(ttl_ms));
+        Ok(IceProposal::new_from(
+            self.client.clone(),
+            p.action().clone(),
+            p.issued_at_ms(),
+        ))
+    }
+
+    #[napi]
+    pub fn flush_avoid_lists(&self, scope: AvoidScopeJs) -> Result<IceProposal> {
+        let scope = scope.into_core()?;
+        let p = self.client.ice().flush_avoid_lists(scope);
+        Ok(IceProposal::new_from(
+            self.client.clone(),
+            p.action().clone(),
+            p.issued_at_ms(),
+        ))
+    }
+
+    #[napi]
+    pub fn force_evict_replica(&self, chain: BigInt, victim: BigInt) -> Result<IceProposal> {
+        let chain = crate::common::bigint_u64(chain)
+            .map_err(|e| deck_err("invalid_argument", format!("chain: {}", e.reason)))?;
+        let victim = crate::common::bigint_u64(victim)
+            .map_err(|e| deck_err("invalid_argument", format!("victim: {}", e.reason)))?;
+        let p = self.client.ice().force_evict_replica(chain as CoreChainId, victim);
+        Ok(IceProposal::new_from(
+            self.client.clone(),
+            p.action().clone(),
+            p.issued_at_ms(),
+        ))
+    }
+
+    /// Propose force-restarting a daemon. `id` is the registry-
+    /// local daemon id; `name` is `MeshDaemon::name()`.
+    #[napi]
+    pub fn force_restart_daemon(&self, id: BigInt, name: String) -> Result<IceProposal> {
+        let id = crate::common::bigint_u64(id)
+            .map_err(|e| deck_err("invalid_argument", format!("id: {}", e.reason)))?;
+        let daemon = CoreDaemonRef { id, name };
+        let p = self.client.ice().force_restart_daemon(daemon);
+        Ok(IceProposal::new_from(
+            self.client.clone(),
+            p.action().clone(),
+            p.issued_at_ms(),
+        ))
+    }
+
+    #[napi]
+    pub fn force_cutover(&self, chain: BigInt, target: BigInt) -> Result<IceProposal> {
+        let chain = crate::common::bigint_u64(chain)
+            .map_err(|e| deck_err("invalid_argument", format!("chain: {}", e.reason)))?;
+        let target = crate::common::bigint_u64(target)
+            .map_err(|e| deck_err("invalid_argument", format!("target: {}", e.reason)))?;
+        let p = self.client.ice().force_cutover(chain as CoreChainId, target);
+        Ok(IceProposal::new_from(
+            self.client.clone(),
+            p.action().clone(),
+            p.issued_at_ms(),
+        ))
+    }
+
+    #[napi]
+    pub fn kill_migration(&self, migration: BigInt) -> Result<IceProposal> {
+        let migration = crate::common::bigint_u64(migration)
+            .map_err(|e| deck_err("invalid_argument", format!("migration: {}", e.reason)))?;
+        let p = self.client.ice().kill_migration(migration as CoreMigrationId);
+        Ok(IceProposal::new_from(
+            self.client.clone(),
+            p.action().clone(),
+            p.issued_at_ms(),
+        ))
+    }
+
+    #[napi]
+    pub fn thaw_cluster(&self) -> IceProposal {
+        let p = self.client.ice().thaw_cluster();
+        IceProposal::new_from(
+            self.client.clone(),
+            p.action().clone(),
+            p.issued_at_ms(),
+        )
+    }
+}
+
+/// Pre-simulation ICE proposal. Has no `commit` method —
+/// typestate enforces `simulate()` first.
+#[napi]
+pub struct IceProposal {
+    client: Arc<CoreClient>,
+    /// Stored under a mutex so async `simulate` can consume the
+    /// action without breaking napi's `&self` requirement.
+    state: tokio::sync::Mutex<
+        Option<net::adapter::net::behavior::meshos::IceActionProposal>,
+    >,
+    issued_at_ms: u64,
+}
+
+impl IceProposal {
+    fn new_from(
+        client: Arc<CoreClient>,
+        action: net::adapter::net::behavior::meshos::IceActionProposal,
+        issued_at_ms: u64,
+    ) -> Self {
+        Self {
+            client,
+            state: tokio::sync::Mutex::new(Some(action)),
+            issued_at_ms,
+        }
+    }
+}
+
+#[napi]
+impl IceProposal {
+    /// Milliseconds-since-`UNIX_EPOCH` stamp pinned at proposal
+    /// construction. Signatures must cover this exact value.
+    #[napi(getter)]
+    pub fn issued_at_ms(&self) -> BigInt {
+        BigInt::from(self.issued_at_ms)
+    }
+
+    /// Pre-execution preview. Consumes the proposal — subsequent
+    /// `simulate()` calls throw `DeckSdkError(kind: "already_simulated")`.
+    #[napi]
+    pub async fn simulate(&self) -> Result<SimulatedIceProposal> {
+        let action = self.state.lock().await.take().ok_or_else(|| {
+            deck_err(
+                "already_simulated",
+                "IceProposal was already consumed by simulate()",
+            )
+        })?;
+        let issued_at_ms = self.issued_at_ms;
+        let action_for_commit = action.clone();
+        let proposal = build_core_proposal(&self.client, action);
+        let blast = match proposal.simulate().await {
+            Ok(sim) => sim.blast_radius().clone(),
+            Err(e) => return Err(deck_err_from(e)),
+        };
+        Ok(SimulatedIceProposal {
+            client: self.client.clone(),
+            state: tokio::sync::Mutex::new(Some(SimulatedState {
+                action: action_for_commit,
+                blast,
+            })),
+            issued_at_ms,
+        })
+    }
+}
+
+struct SimulatedState {
+    action: net::adapter::net::behavior::meshos::IceActionProposal,
+    blast: net::adapter::net::behavior::meshos::BlastRadius,
+}
+
+/// A simulated ICE proposal. The only class exposing `commit`.
+#[napi]
+pub struct SimulatedIceProposal {
+    client: Arc<CoreClient>,
+    state: tokio::sync::Mutex<Option<SimulatedState>>,
+    issued_at_ms: u64,
+}
+
+#[napi]
+impl SimulatedIceProposal {
+    /// Milliseconds-since-`UNIX_EPOCH` stamp from the original
+    /// `IceProposal`. Signatures must cover this exact value.
+    #[napi(getter)]
+    pub fn issued_at_ms(&self) -> BigInt {
+        BigInt::from(self.issued_at_ms)
+    }
+
+    /// Pre-execution blast radius as a JSON string. The TS
+    /// wrapper parses to a native object.
+    #[napi]
+    pub async fn blast_radius(&self) -> Result<String> {
+        let guard = self.state.lock().await;
+        let state = guard.as_ref().ok_or_else(|| {
+            deck_err(
+                "already_committed",
+                "SimulatedIceProposal was already consumed by commit()",
+            )
+        })?;
+        serde_json::to_string(&state.blast)
+            .map_err(|e| deck_err("blast_serialize_failed", e.to_string()))
+    }
+
+    /// Blake3 digest of the blast radius. Signers must cover
+    /// this exact hash.
+    #[napi]
+    pub async fn blast_hash(&self) -> Result<Buffer> {
+        let guard = self.state.lock().await;
+        let state = guard.as_ref().ok_or_else(|| {
+            deck_err(
+                "already_committed",
+                "SimulatedIceProposal was already consumed by commit()",
+            )
+        })?;
+        let hash = net::adapter::net::behavior::meshos::blast_radius_hash(&state.blast);
+        Ok(Buffer::from(hash.as_ref()))
+    }
+
+    /// Commit with the supplied operator signatures. Consumes the
+    /// proposal — subsequent calls throw `already_committed`.
+    #[napi]
+    pub async fn commit(
+        &self,
+        signatures: Vec<OperatorSignatureJs>,
+    ) -> Result<ChainCommitJs> {
+        let state = self.state.lock().await.take().ok_or_else(|| {
+            deck_err(
+                "already_committed",
+                "SimulatedIceProposal was already consumed by commit()",
+            )
+        })?;
+        let mut sigs = Vec::with_capacity(signatures.len());
+        for s in signatures {
+            sigs.push(s.into_core()?);
+        }
+        let client = self.client.clone();
+        let proposal = build_core_proposal(&client, state.action);
+        let simulated = proposal.simulate().await.map_err(deck_err_from)?;
+        simulated
+            .commit(&sigs)
+            .await
+            .map(|c| chain_commit_to_js(&c))
+            .map_err(deck_err_from)
     }
 }

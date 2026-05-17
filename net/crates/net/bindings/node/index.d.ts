@@ -359,6 +359,14 @@ export declare class DeckClient {
   /** Typed admin-event surface. */
   get admin(): AdminCommands
   /**
+   * Break-glass surface. Returns `IceCommands` whose 7
+   * factories produce `IceProposal`s. Each must be
+   * `simulate()`-d (yielding a `SimulatedIceProposal`) before
+   * `commit(signatures)`. The typestate is enforced at the
+   * class level: `IceProposal` has no `commit` method.
+   */
+  get ice(): IceCommands
+  /**
    * One-shot read of the latest `MeshOsSnapshot` as a JSON
    * string. The TS wrapper parses the JSON into an object.
    */
@@ -422,6 +430,42 @@ export declare class ForkGroup {
   get members(): Array<MemberInfoJs>
   get forkCount(): number
   get healthyCount(): number
+}
+
+/**
+ * `IceCommands` — operator-side break-glass surface. Every
+ * factory returns an `IceProposal` that must be `simulate()`-d
+ * before commit.
+ */
+export declare class IceCommands {
+  freezeCluster(ttlMs: bigint): IceProposal
+  flushAvoidLists(scope: AvoidScopeJs): IceProposal
+  forceEvictReplica(chain: bigint, victim: bigint): IceProposal
+  /**
+   * Propose force-restarting a daemon. `id` is the registry-
+   * local daemon id; `name` is `MeshDaemon::name()`.
+   */
+  forceRestartDaemon(id: bigint, name: string): IceProposal
+  forceCutover(chain: bigint, target: bigint): IceProposal
+  killMigration(migration: bigint): IceProposal
+  thawCluster(): IceProposal
+}
+
+/**
+ * Pre-simulation ICE proposal. Has no `commit` method —
+ * typestate enforces `simulate()` first.
+ */
+export declare class IceProposal {
+  /**
+   * Milliseconds-since-`UNIX_EPOCH` stamp pinned at proposal
+   * construction. Signatures must cover this exact value.
+   */
+  get issuedAtMs(): bigint
+  /**
+   * Pre-execution preview. Consumes the proposal — subsequent
+   * `simulate()` calls throw `DeckSdkError(kind: "already_simulated")`.
+   */
+  simulate(): Promise<SimulatedIceProposal>
 }
 
 /**
@@ -1959,6 +2003,30 @@ export declare class ServeHandle {
   isClosed(): boolean
 }
 
+/** A simulated ICE proposal. The only class exposing `commit`. */
+export declare class SimulatedIceProposal {
+  /**
+   * Milliseconds-since-`UNIX_EPOCH` stamp from the original
+   * `IceProposal`. Signatures must cover this exact value.
+   */
+  get issuedAtMs(): bigint
+  /**
+   * Pre-execution blast radius as a JSON string. The TS
+   * wrapper parses to a native object.
+   */
+  blastRadius(): Promise<string>
+  /**
+   * Blake3 digest of the blast radius. Signers must cover
+   * this exact hash.
+   */
+  blastHash(): Promise<Buffer>
+  /**
+   * Commit with the supplied operator signatures. Consumes the
+   * proposal — subsequent calls throw `already_committed`.
+   */
+  commit(signatures: Array<OperatorSignatureJs>): Promise<ChainCommitJs>
+}
+
 /**
  * Live `MeshOsSnapshot` stream. The napi handle exposes a
  * `nextSnapshot()` method that resolves to a JSON string (or
@@ -2203,6 +2271,20 @@ export interface AggregateResult {
   kind: string
   value?: number
   count?: bigint
+}
+
+/**
+ * Avoid-list flush scope. Variants:
+ *
+ * - `{ kind: 'global' }` — clear cluster-wide avoid lists.
+ * - `{ kind: 'local', node: bigint }` — clear `node`'s avoid list.
+ * - `{ kind: 'onPeer', peer: bigint }` — remove `peer` from every
+ *   node's avoid list.
+ */
+export interface AvoidScopeJs {
+  kind: string
+  node?: bigint
+  peer?: bigint
 }
 
 /** Snapshot of currently-registered adapter ids. */
@@ -3219,6 +3301,15 @@ export interface NetStreamStats {
  * `"unknown"`.
  */
 export declare function normalizeGpuVendor(vendor: string): string
+
+/**
+ * `OperatorSignature` carried by ICE commits. `signature` must
+ * be exactly 64 ed25519 signature bytes.
+ */
+export interface OperatorSignatureJs {
+  operatorId: bigint
+  signature: Buffer
+}
 
 /**
  * Operator-tunable knobs for the v0.3 active-overflow controller.

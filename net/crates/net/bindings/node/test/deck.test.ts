@@ -368,4 +368,149 @@ d('Deck SDK operator-side bindings (Phase 5 slice 1)', () => {
       await sdk.shutdown();
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Slice 3 — ICE break-glass surface
+  // -------------------------------------------------------------------------
+
+  it('all 7 ice factories return IceProposal instances', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      const ice = client.ice;
+      const proposals = [
+        ice.freezeCluster(60_000n),
+        ice.flushAvoidLists({ kind: 'global', node: undefined, peer: undefined }),
+        ice.forceEvictReplica(1n, 2n),
+        ice.forceRestartDaemon(3n, 'echo'),
+        ice.forceCutover(4n, 5n),
+        ice.killMigration(6n),
+        ice.thawCluster(),
+      ];
+      for (const p of proposals) {
+        expect(p.issuedAtMs > 0n).toBe(true);
+      }
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('ice proposal exposes simulate but NOT commit (typestate)', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      const proposal = client.ice.freezeCluster(60_000n);
+      expect(typeof (proposal as any).simulate).toBe('function');
+      expect((proposal as any).commit).toBeUndefined();
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('flushAvoidLists accepts all three AvoidScope variants', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      client.ice.flushAvoidLists({ kind: 'global', node: undefined, peer: undefined });
+      client.ice.flushAvoidLists({ kind: 'local', node: 0xCAFEn, peer: undefined });
+      client.ice.flushAvoidLists({ kind: 'onPeer', node: undefined, peer: 0xBEEFn });
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('invalid avoid scope kind throws invalid_avoid_scope', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      try {
+        client.ice.flushAvoidLists({ kind: 'nonsense' as never, node: undefined, peer: undefined });
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(parseKind(e)).toBe('invalid_avoid_scope');
+      }
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('simulate() advances to SimulatedIceProposal with blast radius + hash', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      const proposal = client.ice.freezeCluster(60_000n);
+      const simulated = await proposal.simulate();
+      // Typestate: simulated has commit + blast radius + blast hash.
+      expect(typeof (simulated as any).commit).toBe('function');
+      expect(typeof (simulated as any).blastRadius).toBe('function');
+      expect(typeof (simulated as any).blastHash).toBe('function');
+      const blast = JSON.parse(await simulated.blastRadius());
+      expect(typeof blast).toBe('object');
+      const hash = await simulated.blastHash();
+      expect(hash.length).toBe(32);
+      expect(simulated.issuedAtMs > 0n).toBe(true);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('double simulate throws already_simulated', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      const proposal = client.ice.freezeCluster(60_000n);
+      await proposal.simulate();
+      try {
+        await proposal.simulate();
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(parseKind(e)).toBe('already_simulated');
+      }
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('commit with empty signatures fails with insufficient_signatures', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      const proposal = client.ice.freezeCluster(60_000n);
+      const simulated = await proposal.simulate();
+      try {
+        await simulated.commit([]);
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(parseKind(e)).toBe('insufficient_signatures');
+      }
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('commit consumes the simulated proposal — second commit throws already_committed', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      const proposal = client.ice.freezeCluster(60_000n);
+      const simulated = await proposal.simulate();
+      const sig = {
+        operatorId: 1n,
+        signature: Buffer.alloc(64, 0),
+      };
+      // First commit — default threshold=1, no OperatorRegistry,
+      // so substrate publishes via unsigned admin path.
+      const c = await simulated.commit([sig]);
+      expect(c.eventKind).toBe('freeze_cluster');
+      // Second commit — proposal consumed.
+      try {
+        await simulated.commit([sig]);
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(parseKind(e)).toBe('already_committed');
+      }
+    } finally {
+      await sdk.shutdown();
+    }
+  });
 });

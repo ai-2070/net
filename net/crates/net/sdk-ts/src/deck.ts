@@ -41,15 +41,20 @@ import {
   AuditStream as NapiAuditStream,
   DeckClient as NapiClient,
   FailureStream as NapiFailureStream,
+  IceCommands as NapiIceCommands,
+  IceProposal as NapiIceProposal,
   LogStream as NapiLogStream,
   OperatorIdentity,
+  SimulatedIceProposal as NapiSimulatedIceProposal,
   SnapshotStream as NapiSnapshotStream,
   StatusSummaryStream as NapiStatusStream,
+  type AvoidScopeJs,
   type ChainCommitJs,
   type DeckClientConfigJs,
   type FailureRecordJs,
   type LogFilterJs,
   type LogRecordJs,
+  type OperatorSignatureJs,
   type StatusSummaryJs,
 } from '@ai2070/net';
 
@@ -337,6 +342,13 @@ export class DeckClient {
   /** Typed admin-event surface. */
   get admin(): AdminCommands {
     return new AdminCommands(this.raw.admin);
+  }
+
+  /** Break-glass surface. Returns `IceCommands` whose factories
+   * produce `IceProposal`s. Each must be `.simulate()`-d
+   * (yielding a `SimulatedIceProposal`) before `.commit(...)`. */
+  get ice(): IceCommands {
+    return new IceCommands(this.raw.ice);
   }
 
   /**
@@ -631,5 +643,145 @@ export class AuditQuery {
     AsyncIterable<AdminAuditRecord> & { close: () => Promise<void> }
   > {
     return rethrowAsync(async () => auditStreamToAsyncIterable(await this.raw.stream()));
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Slice 3 — ICE break-glass surface
+//
+// Typestate: `IceProposal` has no `commit` method. Only the
+// `SimulatedIceProposal` returned from `IceProposal.simulate()`
+// exposes `commit(signatures)`. Direct commit is unreachable at
+// the class level — same shape as the substrate's compile-time
+// typestate.
+// ----------------------------------------------------------------------------
+
+/** Avoid-list flush scope discriminated union. */
+export type AvoidScope =
+  | { kind: 'global' }
+  | { kind: 'local'; node: bigint }
+  | { kind: 'onPeer'; peer: bigint };
+
+function avoidScopeToJs(scope: AvoidScope): AvoidScopeJs {
+  switch (scope.kind) {
+    case 'global':
+      return { kind: 'global', node: undefined, peer: undefined };
+    case 'local':
+      return { kind: 'local', node: scope.node, peer: undefined };
+    case 'onPeer':
+      return { kind: 'onPeer', node: undefined, peer: scope.peer };
+  }
+}
+
+/** Signature pair carried by ICE commits. `signature` must be 64
+ * ed25519 bytes (the substrate verifier rejects malformed sigs
+ * with kind `signature_invalid`). */
+export interface OperatorSignature {
+  operatorId: bigint;
+  signature: Buffer;
+}
+
+function operatorSignatureToJs(sig: OperatorSignature): OperatorSignatureJs {
+  return {
+    operatorId: sig.operatorId,
+    signature: sig.signature,
+  };
+}
+
+// `BlastRadius` is JSON-shaped at the binding boundary.
+export type BlastRadius = Record<string, unknown>;
+
+export class IceCommands {
+  constructor(private readonly raw: NapiIceCommands) {}
+
+  freezeCluster(ttlMs: bigint): IceProposal {
+    return rethrow(() => new IceProposal(this.raw.freezeCluster(ttlMs)));
+  }
+
+  flushAvoidLists(scope: AvoidScope): IceProposal {
+    return rethrow(() =>
+      new IceProposal(this.raw.flushAvoidLists(avoidScopeToJs(scope))),
+    );
+  }
+
+  forceEvictReplica(chain: bigint, victim: bigint): IceProposal {
+    return rethrow(
+      () => new IceProposal(this.raw.forceEvictReplica(chain, victim)),
+    );
+  }
+
+  /** Propose force-restarting a daemon. `id` is the registry-
+   * local daemon id; `name` is `MeshDaemon::name()`. */
+  forceRestartDaemon(id: bigint, name: string): IceProposal {
+    return rethrow(
+      () => new IceProposal(this.raw.forceRestartDaemon(id, name)),
+    );
+  }
+
+  forceCutover(chain: bigint, target: bigint): IceProposal {
+    return rethrow(
+      () => new IceProposal(this.raw.forceCutover(chain, target)),
+    );
+  }
+
+  killMigration(migration: bigint): IceProposal {
+    return rethrow(() => new IceProposal(this.raw.killMigration(migration)));
+  }
+
+  thawCluster(): IceProposal {
+    return new IceProposal(this.raw.thawCluster());
+  }
+}
+
+/** Pre-simulation ICE proposal. No `commit` method —
+ * `simulate()` must run first. */
+export class IceProposal {
+  constructor(private readonly raw: NapiIceProposal) {}
+
+  get issuedAtMs(): bigint {
+    return this.raw.issuedAtMs;
+  }
+
+  /** Pre-execution preview. Consumes the proposal — subsequent
+   * `simulate()` calls throw `DeckSdkError(kind: "already_simulated")`. */
+  async simulate(): Promise<SimulatedIceProposal> {
+    return rethrowAsync(async () => new SimulatedIceProposal(await this.raw.simulate()));
+  }
+}
+
+/** A simulated ICE proposal. Only class exposing `commit`. */
+export class SimulatedIceProposal {
+  constructor(private readonly raw: NapiSimulatedIceProposal) {}
+
+  get issuedAtMs(): bigint {
+    return this.raw.issuedAtMs;
+  }
+
+  /** Pre-execution blast radius, parsed from the binding's JSON. */
+  async blastRadius(): Promise<BlastRadius> {
+    return rethrowAsync(async () => JSON.parse(await this.raw.blastRadius()) as BlastRadius);
+  }
+
+  /** Blake3 digest of the blast radius (32 bytes). */
+  async blastHash(): Promise<Buffer> {
+    return rethrowAsync(() => this.raw.blastHash());
+  }
+
+  /** Commit with operator signatures. Consumes the proposal —
+   * subsequent calls throw `already_committed`. */
+  async commit(signatures: OperatorSignature[]): Promise<ChainCommit> {
+    return rethrowAsync(async () => {
+      const raw = await this.raw.commit(signatures.map(operatorSignatureToJs));
+      return chainCommitFromJs(raw);
+    });
+  }
+}
+
+// `rethrow` for sync entry points — mirrors `rethrowAsync`.
+function rethrow<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (e) {
+    throw DeckSdkError.fromCaught(e);
   }
 }
