@@ -50,6 +50,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --lib -p deck
 
+      # Deck doctests — `///` examples in deck/src/. Same rationale
+      # as `cargo test --doc` for the main crate.
+      - name: Run Deck doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --doc -p deck
+
   integration-tests:
     name: Integration tests (Net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC, Dataforts, MeshDB, MeshOS)
     runs-on: ubuntu-latest
@@ -296,6 +302,13 @@ jobs:
       # contract goes silently unverified.
       - name: Run Rust SDK tests (includes mesh_stream_backpressure)
         run: cargo test --features "net cortex testing compute nat-traversal port-mapping"
+
+      # SDK doctests — `///` examples in `sdk/src/`. Same feature set
+      # as the test run so doc examples gated on those features
+      # compile.
+      - name: Run Rust SDK doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --doc --features "net cortex testing compute nat-traversal port-mapping"
 
   node-tests:
     name: Node bindings tests (vitest)
@@ -659,6 +672,59 @@ jobs:
       - name: Run clippy
         working-directory: ${{ matrix.crate.path }}
         run: cargo clippy ${{ matrix.crate.features }} --all-targets -- -D warnings
+
+  ffi-tests:
+    # Executes `cargo test --lib` for each FFI shim crate. The
+    # `ffi-clippy` matrix above lints these but never runs their
+    # internal `#[cfg(test)] mod tests {}` blocks; pre-fix, ~85
+    # Rust unit tests in `bindings/go/*-ffi` and ~32 in the
+    # node/python NAPI/PyO3 surfaces were silently uncovered. The
+    # `rust-sdk` member is omitted — the dedicated `rust-sdk-tests`
+    # job already covers its tests with a broader feature set.
+    name: FFI tests (${{ matrix.crate.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - name: node
+            path: net/crates/net/bindings/node
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,test-helpers
+          - name: python
+            path: net/crates/net/bindings/python
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck
+          - name: go-compute-ffi
+            path: net/crates/net/bindings/go/compute-ffi
+            features: ""
+          - name: go-rpc-ffi
+            path: net/crates/net/bindings/go/rpc-ffi
+            features: ""
+          - name: go-meshdb-ffi
+            path: net/crates/net/bindings/go/meshdb-ffi
+            features: ""
+          - name: go-deck-ffi
+            path: net/crates/net/bindings/go/deck-ffi
+            features: ""
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-test-ffi-${{ matrix.crate.name }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run tests
+        working-directory: ${{ matrix.crate.path }}
+        run: cargo test --lib ${{ matrix.crate.features }}
 
   fmt:
     name: Format
