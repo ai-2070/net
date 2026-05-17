@@ -2758,6 +2758,16 @@ fn netdb_redex_config(persistent: bool) -> RedexFileConfig {
     }
 }
 
+/// Tuple shape that the NetDb-builder closures emit on success — the
+/// owning Arc for the parent Redex plus an Option-wrapped Arc per
+/// enabled adapter. Factored out so clippy's `type_complexity` lint
+/// doesn't trip on the inline form.
+type NetDbBuildOutcome = (
+    Arc<InnerRedex>,
+    Option<Arc<InnerTasksAdapter>>,
+    Option<Arc<InnerMemoriesAdapter>>,
+);
+
 fn build_netdb_handle(
     redex_arc: Arc<InnerRedex>,
     tasks: Option<Arc<InnerTasksAdapter>>,
@@ -2819,12 +2829,8 @@ pub extern "C" fn net_netdb_open(
             None
         };
         let memories = if cfg.with_memories {
-            match InnerMemoriesAdapter::open_with_config(
-                &redex_arc,
-                cfg.origin_hash,
-                file_cfg,
-            )
-            .await
+            match InnerMemoriesAdapter::open_with_config(&redex_arc, cfg.origin_hash, file_cfg)
+                .await
             {
                 Ok(m) => Some(Arc::new(m)),
                 Err(e) => {
@@ -2895,15 +2901,11 @@ pub extern "C" fn net_netdb_open_from_snapshot(
     let redex_arc: Arc<InnerRedex> = Arc::clone(&redex_ref.inner);
     let file_cfg = netdb_redex_config(cfg.persistent);
 
-    let result: std::result::Result<
-        (
-            Arc<InnerRedex>,
-            Option<Arc<InnerTasksAdapter>>,
-            Option<Arc<InnerMemoriesAdapter>>,
-        ),
-        String,
-    > = block_on(async move {
-        let tasks = match (cfg.with_tasks, snapshot.as_ref().and_then(|s| s.tasks.as_ref())) {
+    let result: std::result::Result<NetDbBuildOutcome, String> = block_on(async move {
+        let tasks = match (
+            cfg.with_tasks,
+            snapshot.as_ref().and_then(|s| s.tasks.as_ref()),
+        ) {
             (true, Some((bytes, last_seq))) => Some(Arc::new(
                 InnerTasksAdapter::open_from_snapshot_with_config(
                     &redex_arc,
@@ -2945,21 +2947,19 @@ pub extern "C" fn net_netdb_open_from_snapshot(
                     }
                 }
             }
-            (true, None) => match InnerMemoriesAdapter::open_with_config(
-                &redex_arc,
-                cfg.origin_hash,
-                file_cfg,
-            )
-            .await
-            {
-                Ok(m) => Some(Arc::new(m)),
-                Err(e) => {
-                    if let Some(t) = &tasks {
-                        let _ = t.close();
+            (true, None) => {
+                match InnerMemoriesAdapter::open_with_config(&redex_arc, cfg.origin_hash, file_cfg)
+                    .await
+                {
+                    Ok(m) => Some(Arc::new(m)),
+                    Err(e) => {
+                        if let Some(t) = &tasks {
+                            let _ = t.close();
+                        }
+                        return Err(e.to_string());
                     }
-                    return Err(e.to_string());
                 }
-            },
+            }
             (false, _) => None,
         };
         Ok((redex_arc, tasks, memories))
@@ -3835,11 +3835,7 @@ mod tests {
     // =====================================================================
 
     /// Helper: open a NetDb with both adapters enabled.
-    fn open_full_netdb(
-        r: *mut RedexHandle,
-        origin: u64,
-        persistent: bool,
-    ) -> *mut NetDbHandle {
+    fn open_full_netdb(r: *mut RedexHandle, origin: u64, persistent: bool) -> *mut NetDbHandle {
         let cfg = format!(
             r#"{{"origin_hash":{origin},"persistent":{persistent},"with_tasks":true,"with_memories":true}}"#,
             origin = origin,
@@ -3873,10 +3869,8 @@ mod tests {
     #[test]
     fn netdb_accessor_rejects_unenabled_model() {
         let r = redex();
-        let cfg = CString::new(
-            r#"{"origin_hash":42,"with_tasks":true,"with_memories":false}"#,
-        )
-        .unwrap();
+        let cfg =
+            CString::new(r#"{"origin_hash":42,"with_tasks":true,"with_memories":false}"#).unwrap();
         let mut db: *mut NetDbHandle = ptr::null_mut();
         assert_eq!(net_netdb_open(r, cfg.as_ptr(), &mut db), 0);
 
@@ -3911,7 +3905,10 @@ mod tests {
         assert_eq!(net_netdb_tasks(db, &mut t), 0);
         let title = CString::new("first").unwrap();
         let mut seq: u64 = 0;
-        assert_eq!(net_tasks_create(t, 1, title.as_ptr(), 1_000_000, &mut seq), 0);
+        assert_eq!(
+            net_tasks_create(t, 1, title.as_ptr(), 1_000_000, &mut seq),
+            0
+        );
         // Wait for the fold to apply so the snapshot has the task baked in.
         assert_eq!(net_tasks_wait_for_seq(t, seq, 500), 0);
         net_tasks_adapter_free(t);
@@ -3928,10 +3925,9 @@ mod tests {
         net_netdb_free(db);
 
         // Restore into a fresh DB.
-        let cfg = CString::new(
-            r#"{"origin_hash":3735928559,"with_tasks":true,"with_memories":true}"#,
-        )
-        .unwrap();
+        let cfg =
+            CString::new(r#"{"origin_hash":3735928559,"with_tasks":true,"with_memories":true}"#)
+                .unwrap();
         let mut db2: *mut NetDbHandle = ptr::null_mut();
         let rc = net_netdb_open_from_snapshot(r, cfg.as_ptr(), bytes, len, &mut db2);
         assert_eq!(rc, 0, "restore should succeed (rc={rc})");
@@ -3979,10 +3975,8 @@ mod tests {
     #[test]
     fn netdb_open_from_empty_snapshot_opens_from_scratch() {
         let r = redex();
-        let cfg = CString::new(
-            r#"{"origin_hash":1,"with_tasks":true,"with_memories":false}"#,
-        )
-        .unwrap();
+        let cfg =
+            CString::new(r#"{"origin_hash":1,"with_tasks":true,"with_memories":false}"#).unwrap();
         let mut db: *mut NetDbHandle = ptr::null_mut();
         let rc = net_netdb_open_from_snapshot(r, cfg.as_ptr(), ptr::null(), 0, &mut db);
         assert_eq!(rc, 0);
