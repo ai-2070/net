@@ -10,8 +10,9 @@
 //! u64 fields (ids, timestamps, RedEX sequences) cross the napi
 //! boundary as `BigInt` to preserve full 64-bit precision.
 //!
-//! Watch / `AsyncIterator` is deliberately deferred — the JS async
-//! iterator glue lands in a follow-up session.
+//! Live watch surface: [`TaskWatchIter`] / [`MemoryWatchIter`] (plus
+//! the `*SnapshotAndWatch` flavours) expose `next()` / `close()` so
+//! the SDK wrapper can adapt them into a JS `for await` loop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

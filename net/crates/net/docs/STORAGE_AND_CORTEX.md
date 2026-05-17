@@ -249,10 +249,12 @@ helps you structure daemons so adopting them later is straightforward.
   `MemoriesAdapter` as a tag index is pending a domain-model tweak
   (`MemoryRetaggedPayload` needs to carry old + new tags so the
   projection can emit symmetric insert/remove ops).
-- **NetDB watchers in the SDK** (`db.tasks.watch(filter)` /
-  `snapshotAndWatch` on the Node and Python SDKs). The Rust surface
-  exists today (`adapter.watch()` / `adapter.snapshot_and_watch(...)`);
-  the napi / pyo3 NetDb class wrappers are a focused follow-up.
+- **NetDB watchers in the Go / C bindings** (`db.tasks.watch(filter)` /
+  `snapshotAndWatch`). The Rust surface exists today
+  (`adapter.watch()` / `adapter.snapshot_and_watch(...)`) and the napi
+  + pyo3 wrappers ship in `bindings/node` + `bindings/python`; the Go
+  and C bindings don't have a NetDB adapter surface at all yet, so
+  this is gated on a `cortex-ffi` crate landing first.
 
 ## FAQ
 
