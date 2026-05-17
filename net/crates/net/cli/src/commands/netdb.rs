@@ -131,12 +131,24 @@ pub struct RestoreArgs {
     #[arg(long)]
     pub from: PathBuf,
 
-    /// Allow restoring over a non-empty store. The substrate
-    /// re-folds the snapshot's chains against the local Redex
-    /// — without `--force` we refuse if the destination
-    /// directory already contains data.
+    /// Allow restoring over a non-empty store. **The substrate
+    /// re-folds the snapshot's chains against the existing local
+    /// Redex** — `--force` does NOT clear `--store` first. The
+    /// effective operation is therefore "merge snapshot into the
+    /// current store," not "replace store with snapshot." If you
+    /// need a clean restore, remove `--store` manually before
+    /// running, or pass `--clear` to have the CLI do it for you.
+    /// Without `--force` we refuse if `--store` already contains
+    /// data.
     #[arg(long)]
     pub force: bool,
+
+    /// Clear `--store` before folding the snapshot, producing a
+    /// clean restore rather than a merge. Implies `--force`. Use
+    /// when the snapshot is the authoritative state and any
+    /// existing chains under `--store` should be discarded.
+    #[arg(long)]
+    pub clear: bool,
 }
 
 #[derive(Args, Debug)]
@@ -459,7 +471,27 @@ async fn run_restore(args: RestoreArgs, output: Option<OutputFormat>) -> Result<
             generic("no $XDG_DATA_HOME / data dir available; pass --store <PATH>")
         })?,
     };
-    if !args.force && dest.exists() {
+    // `--clear` implies `--force` and produces an actual restore
+    // (snapshot replaces existing store). Plain `--force` keeps
+    // the pre-fix merge semantic — re-documented honestly above
+    // so the verb-vs-behavior gap is visible to operators.
+    let force = args.force || args.clear;
+    if args.clear && dest.exists() {
+        tokio::fs::remove_dir_all(&dest).await.map_err(|e| {
+            generic(format!(
+                "--clear: failed to remove existing store {}: {e}",
+                dest.display()
+            ))
+        })?;
+    } else if args.force && dest.exists() {
+        eprintln!(
+            "warning: --force on a non-empty store {} merges the snapshot's chains \
+             into the existing Redex (this is a fold, not a replace). Pass --clear \
+             to remove the store before folding.",
+            dest.display()
+        );
+    }
+    if !force && dest.exists() {
         // The non-empty check must distinguish empty-dir from
         // read-error: pre-fix `read_dir`'s `Err(_) => false` and
         // `next_entry`'s `.unwrap_or(None)` both swallowed I/O
