@@ -27,6 +27,14 @@ use std::fmt;
 /// 4 = ICE simulation blocked; 5 = operator-policy reject;
 /// 6 = connection failure; 7 = timeout; 8 = confirmation refused;
 /// 10+ = subcommand-specific.
+///
+/// Every variant is part of the locked operator contract: the
+/// numeric discriminators are what consumer scripts `case $?` on.
+/// Variants that no current command path constructs (`Success`,
+/// `ConnectionFailure`, the `Db*` codes, etc.) still reserve
+/// their slot, so the enum carries `#[allow(dead_code)]` to keep
+/// the unused-variant lint quiet without weakening the contract.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ExitCodeKind {
@@ -71,6 +79,7 @@ impl CliError {
         self.kind as u8
     }
 
+    #[allow(dead_code)]
     pub fn kind(&self) -> ExitCodeKind {
         self.kind
     }
