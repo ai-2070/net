@@ -1164,24 +1164,34 @@ fn blast_radius_to_json(
 /// `issued_at_ms` to the value we held — same `(action,
 /// issued_at_ms, blast_hash)` triple substrate-side verifier
 /// expects.
+///
+/// `IceActionProposal` is `#[non_exhaustive]` — an unknown
+/// variant returns a `DeckError { kind: "unknown_action" }`
+/// rather than silently mapping to `ThawCluster` (the most
+/// destructive action). Callers `?`-bubble through the
+/// existing `DeckError → PyErr` adapter.
 fn build_core_proposal<'a>(
     client: &'a CoreClient,
     action: net::adapter::net::behavior::meshos::IceActionProposal,
-) -> CoreIceProposal<'a> {
+) -> Result<CoreIceProposal<'a>, DeckError> {
     use net::adapter::net::behavior::meshos::IceActionProposal as A;
     match action {
-        A::FreezeCluster { ttl } => client.ice().freeze_cluster(ttl),
-        A::FlushAvoidLists { scope } => client.ice().flush_avoid_lists(scope),
-        A::ForceEvictReplica { chain, victim } => client.ice().force_evict_replica(chain, victim),
-        A::ForceRestartDaemon { daemon } => client.ice().force_restart_daemon(daemon),
-        A::ForceCutover { chain, target } => client.ice().force_cutover(chain, target),
-        A::KillMigration { migration } => client.ice().kill_migration(migration),
-        A::ThawCluster => client.ice().thaw_cluster(),
-        // `IceActionProposal` is `#[non_exhaustive]`. New variants
-        // arriving from the substrate fall back to `thaw_cluster`
-        // — harmless for an unknown variant; bindings stay
-        // forward-compatible.
-        _ => client.ice().thaw_cluster(),
+        A::FreezeCluster { ttl } => Ok(client.ice().freeze_cluster(ttl)),
+        A::FlushAvoidLists { scope } => Ok(client.ice().flush_avoid_lists(scope)),
+        A::ForceEvictReplica { chain, victim } => {
+            Ok(client.ice().force_evict_replica(chain, victim))
+        }
+        A::ForceRestartDaemon { daemon } => Ok(client.ice().force_restart_daemon(daemon)),
+        A::ForceCutover { chain, target } => Ok(client.ice().force_cutover(chain, target)),
+        A::KillMigration { migration } => Ok(client.ice().kill_migration(migration)),
+        A::ThawCluster => Ok(client.ice().thaw_cluster()),
+        other => Err(DeckError {
+            kind: "unknown_action",
+            message: format!(
+                "IceActionProposal carries an unknown variant ({other:?}); \
+                 rebuild the SDK binding against the current substrate"
+            ),
+        }),
     }
 }
 
@@ -1339,7 +1349,7 @@ impl PyIceProposal {
         let action_for_commit = action.clone();
         let blast = py.detach(move || {
             runtime.block_on(async move {
-                let proposal = build_core_proposal(&client, action);
+                let proposal = build_core_proposal(&client, action)?;
                 proposal.simulate().await.map(|s| s.blast_radius().clone())
             })
         });
@@ -1451,7 +1461,7 @@ impl PySimulatedIceProposal {
         let client = self.client.clone();
         let commit_result = py.detach(move || {
             runtime.block_on(async move {
-                let proposal = build_core_proposal(&client, action);
+                let proposal = build_core_proposal(&client, action)?;
                 let simulated = proposal.simulate().await?;
                 simulated.commit(&sigs).await
             })

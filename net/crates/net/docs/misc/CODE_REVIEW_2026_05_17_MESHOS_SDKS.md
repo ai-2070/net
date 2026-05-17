@@ -462,7 +462,7 @@ Test breadth is good (~125 tests across TS/Py for the two SDKs, plus C examples)
 | Severity | Action |
 |---|---|
 | Real bug | Add `net_deck_client_new` equivalent to Node + Python (item 1). |
-| Real bug | Fix `build_core_proposal` to error on unknown variants instead of silently calling `thaw_cluster` (item 2). |
+| Done | `build_core_proposal` returns `Err("unknown_action")` for unmapped variants in all three FFIs (Node / Python / Go); callers `?`-bubble through their respective error envelopes (item 2). |
 | Real bug | Replace `issued_at_ms = u64::MAX` sentinel with a `consumed: bool` field (item 3). |
 | Verify | Audit whether `commit` re-running `simulate` is safe under cluster-state movement (item 4). |
 | Footgun | Add `close()` / `[Symbol.asyncDispose]` to TS `DeckClient` / `IceProposal` / `SimulatedIceProposal` (item 5). |

@@ -1060,23 +1060,34 @@ impl OperatorSignatureJs {
 /// the simulator is pure over the latest snapshot so the
 /// committed envelope still binds to a stable `(action,
 /// issued_at_ms, blast_hash)` triple.
+///
+/// `IceActionProposal` is `#[non_exhaustive]` — if the binding
+/// is loaded against a substrate that introduced a new variant,
+/// we refuse to map it instead of silently substituting
+/// `ThawCluster` (the most destructive action). Caller must
+/// rebuild the binding against the substrate it actually links.
 fn build_core_proposal<'a>(
     client: &'a CoreClient,
     action: net::adapter::net::behavior::meshos::IceActionProposal,
-) -> CoreIceProposal<'a> {
+) -> Result<CoreIceProposal<'a>> {
     use net::adapter::net::behavior::meshos::IceActionProposal as A;
     match action {
-        A::FreezeCluster { ttl } => client.ice().freeze_cluster(ttl),
-        A::FlushAvoidLists { scope } => client.ice().flush_avoid_lists(scope),
-        A::ForceEvictReplica { chain, victim } => client.ice().force_evict_replica(chain, victim),
-        A::ForceRestartDaemon { daemon } => client.ice().force_restart_daemon(daemon),
-        A::ForceCutover { chain, target } => client.ice().force_cutover(chain, target),
-        A::KillMigration { migration } => client.ice().kill_migration(migration),
-        A::ThawCluster => client.ice().thaw_cluster(),
-        // `IceActionProposal` is `#[non_exhaustive]` — new
-        // substrate variants fall back; bindings stay forward-
-        // compatible.
-        _ => client.ice().thaw_cluster(),
+        A::FreezeCluster { ttl } => Ok(client.ice().freeze_cluster(ttl)),
+        A::FlushAvoidLists { scope } => Ok(client.ice().flush_avoid_lists(scope)),
+        A::ForceEvictReplica { chain, victim } => {
+            Ok(client.ice().force_evict_replica(chain, victim))
+        }
+        A::ForceRestartDaemon { daemon } => Ok(client.ice().force_restart_daemon(daemon)),
+        A::ForceCutover { chain, target } => Ok(client.ice().force_cutover(chain, target)),
+        A::KillMigration { migration } => Ok(client.ice().kill_migration(migration)),
+        A::ThawCluster => Ok(client.ice().thaw_cluster()),
+        other => Err(deck_err(
+            "unknown_action",
+            format!(
+                "IceActionProposal carries an unknown variant ({other:?}); \
+                 rebuild the SDK binding against the current substrate"
+            ),
+        )),
     }
 }
 
@@ -1233,7 +1244,7 @@ impl IceProposal {
         })?;
         let issued_at_ms = self.issued_at_ms;
         let action_for_commit = action.clone();
-        let proposal = build_core_proposal(&self.client, action);
+        let proposal = build_core_proposal(&self.client, action)?;
         let blast = match proposal.simulate().await {
             Ok(sim) => sim.blast_radius().clone(),
             Err(e) => return Err(deck_err_from(e)),
@@ -1337,7 +1348,7 @@ impl SimulatedIceProposal {
             sigs.push(s.into_core()?);
         }
         let client = self.client.clone();
-        let proposal = build_core_proposal(&client, state.action);
+        let proposal = build_core_proposal(&client, state.action)?;
         let simulated = proposal.simulate().await.map_err(deck_err_from)?;
         simulated
             .commit(&sigs)

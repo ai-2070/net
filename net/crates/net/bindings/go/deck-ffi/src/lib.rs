@@ -1773,22 +1773,31 @@ unsafe fn signatures_from_c(
 /// Build a substrate `IceProposal` from a saved action. The
 /// substrate's factories pin a fresh `issued_at_ms` per call;
 /// the simulator is pure over the latest snapshot.
+///
+/// `IceActionProposal` is `#[non_exhaustive]` — an unknown
+/// variant returns `Err` rather than silently mapping to
+/// `ThawCluster` (the most destructive action). Callers
+/// translate the error into the standard last-error envelope
+/// with kind `"unknown_action"`.
 fn build_core_proposal<'a>(
     client: &'a CoreClient,
     action: net::adapter::net::behavior::meshos::IceActionProposal,
-) -> CoreIceProposal<'a> {
+) -> Result<CoreIceProposal<'a>, String> {
     use net::adapter::net::behavior::meshos::IceActionProposal as A;
     match action {
-        A::FreezeCluster { ttl } => client.ice().freeze_cluster(ttl),
-        A::FlushAvoidLists { scope } => client.ice().flush_avoid_lists(scope),
-        A::ForceEvictReplica { chain, victim } => client.ice().force_evict_replica(chain, victim),
-        A::ForceRestartDaemon { daemon } => client.ice().force_restart_daemon(daemon),
-        A::ForceCutover { chain, target } => client.ice().force_cutover(chain, target),
-        A::KillMigration { migration } => client.ice().kill_migration(migration),
-        A::ThawCluster => client.ice().thaw_cluster(),
-        // `#[non_exhaustive]` substrate enum — new variants fall
-        // back so bindings stay forward-compatible.
-        _ => client.ice().thaw_cluster(),
+        A::FreezeCluster { ttl } => Ok(client.ice().freeze_cluster(ttl)),
+        A::FlushAvoidLists { scope } => Ok(client.ice().flush_avoid_lists(scope)),
+        A::ForceEvictReplica { chain, victim } => {
+            Ok(client.ice().force_evict_replica(chain, victim))
+        }
+        A::ForceRestartDaemon { daemon } => Ok(client.ice().force_restart_daemon(daemon)),
+        A::ForceCutover { chain, target } => Ok(client.ice().force_cutover(chain, target)),
+        A::KillMigration { migration } => Ok(client.ice().kill_migration(migration)),
+        A::ThawCluster => Ok(client.ice().thaw_cluster()),
+        other => Err(format!(
+            "IceActionProposal carries an unknown variant ({other:?}); \
+             rebuild the SDK binding against the current substrate"
+        )),
     }
 }
 
@@ -2105,7 +2114,13 @@ pub extern "C" fn net_deck_ice_proposal_simulate(
         // Mark consumed.
         p.issued_at_ms = u64::MAX;
         clear_last_error_inner();
-        let core_proposal = build_core_proposal(inner, action.clone());
+        let core_proposal = match build_core_proposal(inner, action.clone()) {
+            Ok(p) => p,
+            Err(msg) => {
+                set_last_error("unknown_action", &msg);
+                return NET_DECK_ERR_CALL_FAILED;
+            }
+        };
         let blast = match runtime().block_on(core_proposal.simulate()) {
             Ok(sim) => sim.blast_radius().clone(),
             Err(e) => {
@@ -2237,8 +2252,14 @@ pub extern "C" fn net_deck_simulated_commit(
         clear_last_error_inner();
         let action = s.action.clone();
         let core_sigs: Vec<CoreOperatorSignature> = sigs.iter().map(|x| x.to_core()).collect();
+        let proposal = match build_core_proposal(inner, action) {
+            Ok(p) => p,
+            Err(msg) => {
+                set_last_error("unknown_action", &msg);
+                return NET_DECK_ERR_CALL_FAILED;
+            }
+        };
         let commit = runtime().block_on(async move {
-            let proposal = build_core_proposal(inner, action);
             let simulated = proposal.simulate().await?;
             simulated.commit(&core_sigs).await
         });
