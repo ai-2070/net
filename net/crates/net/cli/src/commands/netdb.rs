@@ -604,15 +604,28 @@ async fn open_netdb(
                 path.display()
             ))
         })?;
-    } else if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+    } else {
         // Read paths refuse to silently fabricate an empty store —
         // a typo'd `--store /var/tmp/typo` would otherwise return
-        // zero rows with no diagnostic.
-        return Err(crate::error::invalid_args(format!(
-            "netdb store {} does not exist; pass --store <PATH> to an \
-             existing store or run a mutation first to create one",
-            path.display()
-        )));
+        // zero rows with no diagnostic. Surface a permission error
+        // from `try_exists` distinctly so the operator gets the
+        // right remediation (fix ACLs vs pass `--store`).
+        match tokio::fs::try_exists(&path).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(crate::error::invalid_args(format!(
+                    "netdb store {} does not exist; pass --store <PATH> to an \
+                     existing store or run a mutation first to create one",
+                    path.display()
+                )));
+            }
+            Err(e) => {
+                return Err(generic(format!(
+                    "failed to stat netdb store {}: {e}",
+                    path.display()
+                )));
+            }
+        }
     }
     let redex = Redex::new().with_persistent_dir(&path);
     let mut builder: NetDbBuilder = NetDb::builder(redex).origin(origin).persistent(true);
