@@ -242,61 +242,105 @@ fn install_tracing(verbose: u8, quiet: bool) {
 mod humantime {
     use std::time::Duration;
 
-    /// Parse a human-readable duration string (`30s`, `2m`,
-    /// `500ms`, `1h30m`). Mirrors the small subset the CLI's
-    /// `--timeout` / `--drain-for` / `--ttl` flags accept.
+    /// Parse a human-readable duration string. Accepts:
+    ///
+    /// - A bare integer (`30`), interpreted as seconds.
+    /// - A unit-suffixed value (`500ms`, `2m`, `1h`).
+    /// - Composite components separated by an optional single
+    ///   space (`1h30m`, `1h 30m`).
+    ///
+    /// Every component after a bare integer must carry a unit
+    /// (`1m5` is rejected, not silently 65s), and whitespace is
+    /// only allowed between components (not inside a number).
+    /// Overflow on the unit multiplication is a typed error.
     pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
         let s = s.trim();
         if s.is_empty() {
             return Err("empty duration".into());
         }
-        // Support a comma-separated `1h30m` style by splitting on
-        // unit boundaries.
+        // Bare-integer fast path — `30` parses as 30s. Anything
+        // else requires an explicit unit on every numeric
+        // component so `1m5` can't silently mean 65s.
+        if s.chars().all(|c| c.is_ascii_digit()) {
+            let value: u64 = s
+                .parse()
+                .map_err(|_| format!("invalid integer {s:?}"))?;
+            return Ok(Duration::from_secs(value));
+        }
+
         let mut total = Duration::ZERO;
         let mut digits = String::new();
         let mut units = String::new();
+        let mut between_components = false;
         for c in s.chars() {
             if c.is_ascii_digit() {
                 if !units.is_empty() {
-                    total += apply_unit(&digits, &units)?;
+                    total = total
+                        .checked_add(apply_unit(&digits, &units)?)
+                        .ok_or_else(|| format!("duration overflow in {s:?}"))?;
                     digits.clear();
                     units.clear();
                 }
                 digits.push(c);
+                between_components = false;
             } else if c.is_alphabetic() {
+                if digits.is_empty() {
+                    return Err(format!("unit {c:?} with no preceding number"));
+                }
                 units.push(c);
+                between_components = false;
             } else if c.is_whitespace() {
-                // tolerate spaces
+                // Whitespace is only valid as a component
+                // separator (after a complete `<number><unit>`),
+                // never inside a number or unit.
+                if !units.is_empty() {
+                    total = total
+                        .checked_add(apply_unit(&digits, &units)?)
+                        .ok_or_else(|| format!("duration overflow in {s:?}"))?;
+                    digits.clear();
+                    units.clear();
+                    between_components = true;
+                } else if !between_components {
+                    return Err(format!("unexpected whitespace inside duration {s:?}"));
+                }
             } else {
                 return Err(format!("invalid character {c:?} in duration"));
             }
         }
-        if digits.is_empty() {
-            return Err("missing numeric component".into());
-        }
         if units.is_empty() {
-            // Bare integer → seconds.
-            units.push('s');
+            return Err(format!(
+                "missing unit on trailing number in duration {s:?}"
+            ));
         }
-        total += apply_unit(&digits, &units)?;
-        Ok(total)
+        total
+            .checked_add(apply_unit(&digits, &units)?)
+            .ok_or_else(|| format!("duration overflow in {s:?}"))
     }
 
     fn apply_unit(digits: &str, unit: &str) -> Result<Duration, String> {
         let value: u64 = digits
             .parse()
             .map_err(|_| format!("invalid numeric value {digits:?}"))?;
-        let dur = match unit {
-            "ns" => Duration::from_nanos(value),
-            "us" | "µs" => Duration::from_micros(value),
-            "ms" => Duration::from_millis(value),
-            "s" | "sec" | "secs" => Duration::from_secs(value),
-            "m" | "min" | "mins" => Duration::from_secs(value * 60),
-            "h" | "hr" | "hrs" => Duration::from_secs(value * 60 * 60),
-            "d" | "day" | "days" => Duration::from_secs(value * 60 * 60 * 24),
+        // Use `checked_mul` on the unit multipliers so a wildly
+        // out-of-range value (`999999999999d`) surfaces as a typed
+        // error instead of a silent release-mode wrap.
+        let secs = match unit {
+            "ns" => return Ok(Duration::from_nanos(value)),
+            "us" | "µs" => return Ok(Duration::from_micros(value)),
+            "ms" => return Ok(Duration::from_millis(value)),
+            "s" | "sec" | "secs" => value,
+            "m" | "min" | "mins" => value
+                .checked_mul(60)
+                .ok_or_else(|| format!("duration overflow at {value}{unit}"))?,
+            "h" | "hr" | "hrs" => value
+                .checked_mul(3600)
+                .ok_or_else(|| format!("duration overflow at {value}{unit}"))?,
+            "d" | "day" | "days" => value
+                .checked_mul(86_400)
+                .ok_or_else(|| format!("duration overflow at {value}{unit}"))?,
             other => return Err(format!("unknown duration unit {other:?}")),
         };
-        Ok(dur)
+        Ok(Duration::from_secs(secs))
     }
 
     #[cfg(test)]
@@ -321,6 +365,11 @@ mod humantime {
                 parse_duration("1h30m").unwrap(),
                 Duration::from_secs(3600 + 30 * 60)
             );
+            // Whitespace between components is fine.
+            assert_eq!(
+                parse_duration("1h 30m").unwrap(),
+                Duration::from_secs(3600 + 30 * 60)
+            );
         }
 
         #[test]
@@ -328,6 +377,27 @@ mod humantime {
             assert!(parse_duration("").is_err());
             assert!(parse_duration("abc").is_err());
             assert!(parse_duration("10x").is_err());
+        }
+
+        #[test]
+        fn rejects_trailing_unitless_number() {
+            // Previously parsed silently as 65s; now rejected so
+            // operators can't typo a duration into a wrong value.
+            assert!(parse_duration("1m5").is_err());
+        }
+
+        #[test]
+        fn rejects_whitespace_inside_a_number() {
+            // Previously collapsed across the whitespace and read
+            // "10 5s" as 105s; now rejected.
+            assert!(parse_duration("10 5s").is_err());
+        }
+
+        #[test]
+        fn rejects_overflow_on_unit_multiplication() {
+            // 2^64 / 86400 ≈ 2.13e14 days; any larger value
+            // overflows the u64 multiplier.
+            assert!(parse_duration("999999999999999d").is_err());
         }
     }
 }
