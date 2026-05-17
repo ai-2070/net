@@ -1,0 +1,21 @@
+net/crates/net/bindings/node/Cargo.toml
+  s_33e8c099a9039e::t_f90f7feec12533 24-27,29-32
+net/crates/net/bindings/python/Cargo.toml
+  s_33e8c099a9039e::t_50b26b9d211b67 25-28,30-32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "846d894993021c8b57c527e98933209a652fd48f",
+  "prompts": {},
+  "sessions": {
+    "s_33e8c099a9039e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f5bf814-14c4-4dd9-b249-30bbae94726a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
