@@ -279,8 +279,14 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-sdk-${{ hashFiles('**/Cargo.lock') }}
 
+      # Feature set widens beyond `net` so the SDK tests gated on
+      # `cortex` (rpc_observer, cortex_surface) and `testing`
+      # (cluster_harness, cluster_replica_group, cluster_supervisor)
+      # actually run instead of compiling to an empty test binary.
+      # `testing = ["meshos", "groups"]` so groups-gated tests pick up
+      # as a side effect — fix, not regression.
       - name: Run Rust SDK tests (includes mesh_stream_backpressure)
-        run: cargo test --features net
+        run: cargo test --features "net cortex testing"
 
   node-tests:
     name: Node bindings tests (vitest)
