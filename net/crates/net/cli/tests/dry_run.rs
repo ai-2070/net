@@ -2,11 +2,12 @@
 //!
 //! The admin `--dry-run` path short-circuits before
 //! `CliContext::build`, so these tests exercise the clap routing
-//! + the JSON envelope shape without paying the substrate-boot
+//! and the JSON envelope shape without paying the substrate-boot
 //! cost. The ICE dry-run still simulates (and therefore boots the
-//! supervisor), so this file pins only the admin surface — the
-//! pre-existing `tests/exit_codes.rs::code_8_…` test already
-//! exercises the ICE simulate path on `freeze-cluster`.
+//! supervisor), so this file pins only the admin surface; the
+//! pre-existing `code_8_on_ice_confirmation_refused_non_tty` test
+//! in `tests/exit_codes.rs` already exercises the ICE simulate
+//! path on `freeze-cluster`.
 
 use assert_cmd::prelude::*;
 use serde_json::Value;
