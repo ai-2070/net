@@ -1,0 +1,35 @@
+net/crates/net/bindings/python/src/deck.rs
+  s_275316fc500935::t_ee17d46d55836c 159-160,162
+  s_275316fc500935::t_747d11f71f42b2 610-611,613
+net/crates/net/bindings/python/Cargo.toml
+  s_275316fc500935::t_9ec9ad6116288b 110-112
+net/crates/net/bindings/go/deck-ffi/Cargo.toml
+  s_275316fc500935::t_7d019d0b1f8b1b 31-34
+net/crates/net/include/net_deck.h
+  s_275316fc500935::t_98cf0d2867f1db 226-235
+  s_275316fc500935::t_c7e85a4aa5bda7 753-759
+net/crates/net/bindings/go/deck-ffi/src/lib.rs
+  s_275316fc500935::t_87a033736006a9 381-389
+  s_275316fc500935::t_e39f5d81d50f2d 2427-2431,2433
+net/crates/net/bindings/node/Cargo.toml
+  s_275316fc500935::t_ffd16674510318 129-131
+net/crates/net/bindings/node/src/deck.rs
+  s_275316fc500935::t_2be5bae3ae0e7b 562-563,565
+  s_275316fc500935::t_baaf8f4c25d24c 112-116,119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "489b3f11a466f21050e7d2832faec9fa69a360ab",
+  "prompts": {},
+  "sessions": {
+    "s_275316fc500935": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f087a884-b322-4d2f-9650-4afee91efe78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
