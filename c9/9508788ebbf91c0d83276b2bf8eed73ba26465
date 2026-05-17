@@ -1,0 +1,29 @@
+net/crates/net/bindings/node/index.d.ts
+  s_5af7ced268385a::t_afa8a784615027 2981-2991
+net/crates/net/bindings/node/src/meshos.rs
+  s_5af7ced268385a::t_abbfa6fe84db00 515-531,538-541,546-580
+  s_5af7ced268385a::t_a65922847d4bbf 48-49
+  s_5af7ced268385a::t_68cba63f39f3fd 593-596,608-611
+  s_5af7ced268385a::t_8f9d1d9b117b12 623-629,634,638
+  s_5af7ced268385a::t_12fee4ef9dc52f 755-827
+  s_5af7ced268385a::t_b80c27a5d3fa3b 440-449
+  s_5af7ced268385a::t_4039596bd84052 107-132
+net/crates/net/bindings/node/test/meshos.test.ts
+  s_5af7ced268385a::t_b086af728343c5 330-413
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "c99508788ebbf91c0d83276b2bf8eed73ba26465",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
