@@ -57,7 +57,7 @@ tracing = "0.1"
 
 # XDG paths + TOML for the config + identity stores.
 dirs = "6"
-toml = "0.8"
+toml = "0.9"
 
 # Streaming combinators used by the audit/log/failures ndjson
 # outputs and the snapshot watch loop.
