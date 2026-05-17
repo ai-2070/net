@@ -1,0 +1,29 @@
+net/crates/net/bindings/go/net/deck.go
+  s_5af7ced268385a::t_fefaf83fbf81b3 1482-1895
+  s_5af7ced268385a::t_7771175ba1412a 290-321
+  s_5af7ced268385a::t_d32e11ef174b6d 527-532,1457-1459
+net/crates/net/bindings/go/deck-ffi/src/lib.rs
+  s_5af7ced268385a::t_c1887fb69e4361 67-70,75,77
+  s_5af7ced268385a::t_3e3790b8ec3fe2 3528-3529
+  s_5af7ced268385a::t_1d36efa5ef0b39 2278-2724,2726,2729-2900
+  s_5af7ced268385a::t_6a96ab47612640 3510-3527,3530-3791
+  s_5af7ced268385a::t_67a390c44a4f92 2725,2727-2728
+net/crates/net/include/net_deck.h
+  s_5af7ced268385a::t_beaa2caa594600 706-886
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "add64c8599fe021a6d81e6e8dde7a033767c8570",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
