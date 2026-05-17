@@ -753,9 +753,17 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
 
         let policy = adapter_config.on_fold_error;
         let inner_task = inner.clone();
-        let mut stream = Box::pin(file.tail(start_seq));
 
         tokio::spawn(async move {
+            // Registration and consumption share a task. Pre-fix
+            // `file.tail(start_seq)` ran on the caller's task and the
+            // `tokio::spawn` then queued; concurrent appends in that
+            // window could saturate the bounded tail channel before
+            // this task polled even once, evicting the watcher with
+            // `Lagged` and killing the fold loop on its first item.
+            // Doing both inside the spawn pins them adjacent in
+            // scheduler order.
+            let mut stream = Box::pin(inner_task.file.tail(start_seq));
             loop {
                 tokio::select! {
                     biased;
