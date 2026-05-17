@@ -1,0 +1,20 @@
+net/crates/net/cli/tests/exit_codes.rs
+  s_d47f820cd75eec::t_20b6210a6616a3 7,12,16-17,19-25,29
+  s_d47f820cd75eec::t_7333348d0af4b8 85-112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "3f820c696952eab7c36fdd485593323737e59020",
+  "prompts": {},
+  "sessions": {
+    "s_d47f820cd75eec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "787d00f4-6902-4cbd-a2f7-ef1a994cd53b",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
