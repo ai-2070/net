@@ -97,19 +97,7 @@ pub struct DropReplicasArgs {
     pub common: CommonAdminArgs,
 }
 
-/// Parse a `u64` from either decimal or a `0x`-prefixed hex
-/// literal. Operators read node ids as hex from snapshot output;
-/// rejecting `0xABCD` because clap's default parser only takes
-/// decimal is a needless papercut.
-fn parse_u64_flexible(s: &str) -> Result<u64, String> {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u64::from_str_radix(rest, 16).map_err(|e| format!("invalid hex: {e}"))
-    } else {
-        s.parse::<u64>()
-            .map_err(|e| format!("invalid integer: {e}"))
-    }
-}
+use crate::parsers::parse_u64_flexible;
 
 #[derive(Args, Debug)]
 pub struct CommonAdminArgs {

@@ -26,6 +26,7 @@ mod config;
 mod context;
 mod error;
 mod output;
+mod parsers;
 mod prelude;
 
 use std::path::PathBuf;

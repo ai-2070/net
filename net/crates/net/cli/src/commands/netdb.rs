@@ -195,15 +195,7 @@ pub struct NetdbCommon {
     pub origin: u64,
 }
 
-fn parse_u64_flexible(s: &str) -> Result<u64, String> {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u64::from_str_radix(rest, 16).map_err(|e| format!("invalid hex: {e}"))
-    } else {
-        s.parse::<u64>()
-            .map_err(|e| format!("invalid integer: {e}"))
-    }
-}
+use crate::parsers::parse_u64_flexible;
 
 pub async fn run(cmd: NetdbCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
     match cmd {

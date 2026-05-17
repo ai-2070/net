@@ -151,15 +151,7 @@ pub struct CommonIceArgs {
     pub supervisor_node: u64,
 }
 
-fn parse_u64_flexible(s: &str) -> Result<u64, String> {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u64::from_str_radix(rest, 16).map_err(|e| format!("invalid hex: {e}"))
-    } else {
-        s.parse::<u64>()
-            .map_err(|e| format!("invalid integer: {e}"))
-    }
-}
+use crate::parsers::parse_u64_flexible;
 
 fn parse_scope(s: &str) -> Result<AvoidScope, CliError> {
     if s == "global" {
