@@ -8,9 +8,12 @@ A third pass the same day, scoped to the surface a `netdb-watcher` subscriber wo
 
 ## Status
 
-- **Fixed:** #38 (`6aed1cb1`), #39 (`abf2a64e`), #40 (`180aa828`) — the cortex adapter Critical block. A future `netdb-watcher` built on `tail` + `wait_for_seq` now (a) registers its watcher inside the spawned fold task, (b) catches up via direct in-memory reads then resubscribes on `RedexError::Lagged` instead of dying, and (c) surfaces fold-task stops via `Result<(), Option<u64>>` so callers cannot silently observe stale state. Regression test in the cortex adapter pins the lag-recovery path; existing Stop-policy tests now use the strict return type.
-- **Remaining Critical:** none.
-- **Remaining data-loss / silent-corruption / silent-rotation-loss hazards (treat next):** #1, #3, #4, #5, #17, #22, #23, #24, #25, #26, #41, #42, #43.
+- **All actionable items fixed.** 42 commits land the audit's High → Low blocks; obsoleted items are noted under **Obsolete** below.
+- **Fixed (Critical):** #38 (`6aed1cb1`), #39 (`abf2a64e`), #40 (`180aa828`) — cortex adapter.
+- **Fixed (High):** #1 (`8fc804b5`), #2 (`48514380`), #3 (`14400edc`), #4 (`2689686d`), #5 (`96cd3160`), #6 (`774d9993`), #7 (`4b296c3b`), #17 (`8004b296`), #22 (`7624653e`), #23 (`c39b91f5`), #24 (`ecc3aff2`), #25 (`a20839b8`), #26 (`e4331c90`), #33 (`8e948da0`), #41 (`1b80180f`), #43 (`d8dd1777`).
+- **Fixed (Medium):** #8 (`931a20bf`), #9 (`59773760`), #10 (`e68fad34`), #11 (`45391be6`), #18 (`ec259f3f`), #29 (`044d17d1`), #30 (`b7040251`), #34 (`e474cf6b`), #35 (`14400edc` — covered by #3), #36 (`32ae6b63`), #45 (`c33e7d74`), #46 (`6c5430fc`).
+- **Fixed (Low):** #12 (`57d0e986`), #13 (`b4a5a7a6`), #14 (`0cec8fe4`), #15 (`8908ed3b`), #16 (`769e7dfe`), #19 (`94485fb7`), #20 (`d07c8270`), #21 (`8ad7641d`), #31 (`cf7b584e`), #32 (`85ac88e4`), #37 (`e5840dfa`).
+- **Obsolete (audit misread):** #27 (`has_more` semantics under corrupt records — re-reading the code, the cursor advances via `last_seen_seq` correctly and the over-fetch-by-1 detector works as documented); #28 (`PyNetDb::open` dual runtimes — `make_runtime()` is already a process-wide `OnceLock<Arc<Runtime>>` singleton, so every adapter under a PyNetDb shares the same runtime); #42 (`next_seq` racing failed-write rollback — `RedexFile::next_seq()` already takes the state lock per the existing docstring at file.rs:381, serializing the read with the rollback path); #44 (`changes_tx.send` outside the write-lock — `handle_event` is called sequentially from the spawn task's loop, no concurrent senders so the send ordering matches the watermark ordering).
 - **Remaining High:** #1, #2, #3, #4, #5, #6, #7, #17, #33 (CLI); #22, #23, #24, #25, #26 (extended); #41, #42, #43 (pass 3).
 - **Remaining Medium:** #8, #9, #10, #11, #18, #34, #35, #36 (CLI); #27, #28, #29, #30 (extended); #44, #45, #46 (pass 3).
 - **Remaining Low:** #12, #13, #14, #15, #16, #19, #20, #21, #37 (CLI); #31, #32 (extended).
