@@ -764,19 +764,95 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
             // Doing both inside the spawn pins them adjacent in
             // scheduler order.
             let mut stream = Box::pin(inner_task.file.tail(start_seq));
-            loop {
+            'outer: loop {
                 tokio::select! {
                     biased;
                     _ = inner_task.shutdown.notified() => {
-                        break;
+                        break 'outer;
                     }
                     next = stream.next() => {
                         match next {
-                            None => break,
+                            None => break 'outer,
+                            Some(Err(RedexError::Lagged)) => {
+                                // Subscriber fell behind the bounded
+                                // tail buffer. Pre-fix this broke the
+                                // fold loop permanently and a watcher
+                                // sitting on `wait_for_seq` would
+                                // silently observe stale state past
+                                // the lag point.
+                                //
+                                // Recover by catching up the gap via
+                                // direct reads from the in-memory
+                                // index, then resubscribing live.
+                                // A naive `file.tail(folded+1)`
+                                // resubscribe would deadlock when the
+                                // gap exceeds `tail_buffer_size`:
+                                // backfill pre-flight would signal
+                                // `Lagged` again and we'd loop on the
+                                // same signal indefinitely.
+                                let resume_head = 'catchup: loop {
+                                    let folded = inner_task
+                                        .folded_through_seq
+                                        .load(Ordering::Acquire);
+                                    let resume = if folded == u64::MAX {
+                                        start_seq
+                                    } else {
+                                        folded.saturating_add(1)
+                                    };
+                                    let head = inner_task.file.next_seq();
+                                    if resume >= head {
+                                        break 'catchup Some(head);
+                                    }
+                                    let events = inner_task
+                                        .file
+                                        .read_range(resume, head);
+                                    if events.is_empty() {
+                                        // Retention has evicted the
+                                        // gap. The fold cannot recover
+                                        // what is no longer durable;
+                                        // halt rather than silently
+                                        // skip ahead.
+                                        tracing::error!(
+                                            gap_start = resume,
+                                            gap_end = head,
+                                            "cortex fold task cannot recover \
+                                             from tail lag: events evicted by \
+                                             retention"
+                                        );
+                                        break 'catchup None;
+                                    }
+                                    let mut halted = false;
+                                    for event in events {
+                                        if handle_event(
+                                            &inner_task,
+                                            &mut fold,
+                                            &event,
+                                            policy,
+                                        ) {
+                                            halted = true;
+                                            break;
+                                        }
+                                    }
+                                    if halted {
+                                        break 'catchup None;
+                                    }
+                                };
+                                match resume_head {
+                                    Some(head) => {
+                                        stream = Box::pin(
+                                            inner_task.file.tail(head),
+                                        );
+                                        tracing::warn!(
+                                            "cortex fold task recovered \
+                                             from tail lag"
+                                        );
+                                    }
+                                    None => break 'outer,
+                                }
+                            }
                             Some(Err(_)) => {
-                                // Tail yielded an error (e.g. file
-                                // closed). Stop cleanly.
-                                break;
+                                // Closed / Io / other terminal error.
+                                break 'outer;
                             }
                             Some(Ok(event)) => {
                                 if handle_event(
@@ -785,7 +861,7 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
                                     &event,
                                     policy,
                                 ) {
-                                    break;
+                                    break 'outer;
                                 }
                             }
                         }
@@ -2089,6 +2165,65 @@ mod tests {
             saw_seq,
             "the stream should still emit Seq events after the lag",
         );
+    }
+
+    /// Pin: when the tail stream surfaces `RedexError::Lagged` the
+    /// fold task catches the gap up via direct in-memory reads and
+    /// resubscribes live, rather than silently exiting. Pre-fix
+    /// the match arm broke out of the fold loop the first time the
+    /// subscriber fell behind `tail_buffer_size`; state then never
+    /// advanced past the lag point and `wait_for_seq` returned
+    /// immediately on the `running == false` branch with no
+    /// indication anything went wrong.
+    ///
+    /// Triggers `Lagged` deterministically via the backfill
+    /// pre-flight: 50 events in the index with `tail_buffer_size =
+    /// 4` exceeds the buffer, so `RedexFile::tail` signals
+    /// `Lagged` as the very first stream item.
+    #[tokio::test]
+    async fn fold_task_recovers_from_tail_lagged() {
+        let redex = Redex::new();
+        let cfg = RedexFileConfig::default().with_tail_buffer_size(4);
+
+        // Stage the gap in the file's in-memory index without
+        // going through an adapter (no watchers → no lag pressure
+        // during stage). `CountFold` ignores payload, so empty
+        // bytes are fine.
+        let file = redex
+            .open_file(&cn("cortex/tail-lag-recovery"), cfg)
+            .unwrap();
+        for _ in 0..50u64 {
+            file.append(b"").unwrap();
+        }
+
+        // Open a FromBeginning adapter on the same file. The
+        // tail()'s backfill pre-flight sees 50 retained events vs.
+        // buffer=4 and signals Lagged first thing. Post-fix the
+        // recovery loop reads the gap from the index and tails
+        // live; pre-fix the fold task exits and state stays at 0.
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/tail-lag-recovery"),
+            RedexFileConfig::default(), // ignored on reopen
+            CortexAdapterConfig::default(),
+            CountFold,
+            0u64,
+        )
+        .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            adapter.wait_for_seq(49),
+        )
+        .await
+        .expect("wait_for_seq(49) timed out — tail-Lagged recovery regressed");
+
+        assert_eq!(*adapter.state().read(), 50);
+        assert!(
+            adapter.is_running(),
+            "fold task must stay alive after recovering from tail lag",
+        );
+        assert_eq!(adapter.fold_errors(), 0);
     }
 
     /// `changes()` continues to silently drop lag (the documented
