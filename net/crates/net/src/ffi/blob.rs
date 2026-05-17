@@ -443,17 +443,39 @@ pub struct NetBlobAdapterVtable {
     pub free_buffer: NetBlobAdapterFreeFn,
 }
 
-/// Opaque caller-context pointer. The pointer is set once at
-/// adapter registration and never mutated; the caller is
-/// responsible for the pointee's thread-safety, the substrate
-/// just shuttles it across calls. `Send + Sync` are asserted
-/// unconditionally — the C-side caller is the trust boundary
-/// for cross-thread access to whatever the pointer references.
+/// Opaque caller-context pointer.
+///
+/// # Concurrency contract (caller MUST uphold)
+///
+/// The substrate dispatches every vtable call from a
+/// `tokio::task::spawn_blocking` worker, which means the same
+/// `ctx` pointer is observed from **multiple OS threads over the
+/// lifetime of the registration** and may be observed
+/// **concurrently** if two events for the same adapter are
+/// in-flight. `Send + Sync` are asserted unconditionally because
+/// the substrate has no visibility into what the pointer
+/// references — the C-side registrant is the trust boundary.
+///
+/// In practical terms, this means a registrant **MUST** pass a
+/// `ctx` whose pointee is:
+///
+/// - **`Send` across threads**: any per-thread state (e.g. a
+///   thread-local OS handle, a goroutine-local pointer, a
+///   Python `PyObject*` held without the GIL) is unsafe.
+/// - **`Sync` for concurrent dispatch**: any state mutated
+///   inside vtable callbacks must be protected against
+///   data races by the registrant (lock, atomic, etc.).
+///
+/// Wrappers that cannot meet the `Sync` requirement (e.g. a
+/// Python adapter that uses the GIL) MUST serialize their own
+/// dispatch behind a `Mutex` before passing control to the
+/// language runtime.
 struct OpaqueCtx(*mut c_void);
 
-// SAFETY: opaque-pointer transport. Cross-thread coherence of the
-// pointee is the C-side caller's responsibility; the substrate
-// only reads and forwards the same address verbatim.
+// SAFETY: opaque-pointer transport — see `OpaqueCtx` doc above.
+// Cross-thread coherence of the pointee is the C-side caller's
+// responsibility; the substrate only reads and forwards the
+// same address verbatim.
 unsafe impl Send for OpaqueCtx {}
 unsafe impl Sync for OpaqueCtx {}
 
@@ -698,7 +720,28 @@ impl BlobAdapter for CallbackBlobAdapter {
 ///   AND any in-flight calls have completed).
 /// - `ctx` is an opaque pointer the substrate passes through unchanged
 ///   to every vtable call; the caller is responsible for keeping the
-///   pointee alive and thread-safe for the same lifetime as `vtable`.
+///   pointee alive for the same lifetime as `vtable`.
+///
+/// # Concurrency contract (caller MUST uphold)
+///
+/// The substrate dispatches every vtable call from a
+/// `tokio::task::spawn_blocking` worker. The same `ctx` will be
+/// observed from **multiple OS threads** over the lifetime of the
+/// registration and may be observed **concurrently** when two
+/// in-flight calls are dispatched to the same adapter.
+///
+/// The pointee of `ctx` therefore MUST be:
+/// - safely transferable across threads (`Send`-equivalent in the
+///   caller's runtime); and
+/// - safely accessed concurrently (`Sync`-equivalent), or guarded
+///   inside the vtable callbacks by a caller-owned lock.
+///
+/// Passing a thread-local pointer (an OS thread handle, a Go
+/// goroutine-local pointer, a Python `PyObject*` held outside the
+/// GIL, etc.) is **undefined behaviour**. Wrappers whose runtime
+/// cannot meet the `Sync` requirement MUST serialize vtable
+/// dispatch inside the callback before crossing into the
+/// language runtime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_blob_register_callback_adapter(
     adapter_id: *const c_char,

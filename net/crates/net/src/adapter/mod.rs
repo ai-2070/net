@@ -65,6 +65,7 @@ use crate::event::{Batch, StoredEvent};
 /// based on the URI spec: userinfo is the substring between
 /// `"://"` and the first `'@'`, scoped to the authority component.
 #[must_use]
+#[cfg(any(feature = "redis", feature = "jetstream"))]
 pub(crate) fn redact_url(url: &str) -> std::borrow::Cow<'_, str> {
     let Some(scheme_end) = url.find("://") else {
         return std::borrow::Cow::Borrowed(url);
@@ -330,6 +331,7 @@ mod tests {
         adapter.shutdown().await.unwrap();
     }
 
+    #[cfg(any(feature = "redis", feature = "jetstream"))]
     #[test]
     fn redact_url_strips_userinfo() {
         assert_eq!(
@@ -349,6 +351,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "redis", feature = "jetstream"))]
     #[test]
     fn redact_url_passthrough_when_no_userinfo() {
         assert_eq!(
