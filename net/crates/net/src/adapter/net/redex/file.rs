@@ -434,6 +434,34 @@ impl RedexFile {
     /// only after the disk write succeeds (for persistent files);
     /// `next_seq` is rolled back on disk failure so no seq number is
     /// burnt and no in-memory entry diverges from disk.
+    ///
+    /// **Notify-vs-fsync ordering (durability contract).** Under
+    /// every `FsyncPolicy` except a hypothetical "always fsync on
+    /// append" (which does not exist — the per-write latency
+    /// penalty would dominate), `notify_watchers` fires while the
+    /// new event is still only in the kernel page cache. A crash
+    /// between notify and the next scheduled fsync (per
+    /// `FsyncPolicy::EveryN`, `Interval`, or `IntervalOrBytes`)
+    /// loses the event from disk after subscribers have already
+    /// observed it.
+    ///
+    /// Watchers persisting derived state past the live event must
+    /// therefore:
+    ///   1. Key durable records idempotently on `(channel, seq)`.
+    ///   2. On restart, consult the on-disk file's
+    ///      [`Self::next_seq`] and tail from
+    ///      `last_persisted_local_seq + 1`, treating any seq above
+    ///      the local watermark and at-or-below the file's
+    ///      current head as a re-delivery — re-apply only if not
+    ///      already reflected in derived state.
+    /// `FsyncPolicy::Never` (heap-only or fire-and-forget disk)
+    /// makes the same contract apply to the *in-memory* state on
+    /// process restart; persistent files with a non-`Never` policy
+    /// narrow the window but do not close it. The cortex adapter's
+    /// `applied_through_seq` watermark + snapshot/restore pair
+    /// already implements the idempotent-reconcile recipe; ad-hoc
+    /// subscribers (a future netdb-watcher persisting elsewhere)
+    /// must mirror it.
     pub fn append(&self, payload: &[u8]) -> Result<u64, RedexError> {
         self.check_not_closed()?;
         let cks = payload_checksum(payload);
