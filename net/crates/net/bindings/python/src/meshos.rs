@@ -331,6 +331,16 @@ struct PyDaemonBridge {
     on_control: Option<Py<PyAny>>,
     health: Option<Py<PyAny>>,
     saturation: Option<Py<PyAny>>,
+    /// Capability advertisement snapshotted at construction.
+    /// The substrate calls `required_capabilities` /
+    /// `optional_capabilities` from non-GIL contexts; resolving
+    /// once at construction avoids a `Python::attach` per call
+    /// and keeps the trait surface infallible (substrate-side
+    /// errors here would silently degrade to `default()`). Daemon
+    /// authors who need lifetime-dynamic capabilities can call
+    /// `handle.publish_capabilities(set)` after a state change.
+    required_capabilities: CapabilitySet,
+    optional_capabilities: CapabilitySet,
 }
 
 impl PyDaemonBridge {
@@ -371,6 +381,9 @@ impl PyDaemonBridge {
         let health = optional_callable(py, &instance, "health");
         let saturation = optional_callable(py, &instance, "saturation");
 
+        let required_capabilities = resolve_capabilities(py, &instance, "required_capabilities")?;
+        let optional_capabilities = resolve_capabilities(py, &instance, "optional_capabilities")?;
+
         // `instance` is consumed only to read attributes; the
         // bound-method callables hold strong refs back to it so
         // the daemon stays alive as long as the bridge does.
@@ -383,8 +396,54 @@ impl PyDaemonBridge {
             on_control,
             health,
             saturation,
+            required_capabilities,
+            optional_capabilities,
         })
     }
+}
+
+/// Resolve the daemon's capability advertisement for the given
+/// attribute (`"required_capabilities"` or
+/// `"optional_capabilities"`). Accepts:
+///
+/// - `None` / attribute missing → empty `CapabilitySet`.
+/// - A list/tuple of tag strings → each tag added via
+///   `CapabilitySet::add_tag`.
+/// - A callable returning either of the above → called with no
+///   args, result resolved the same way.
+///
+/// Invalid shapes raise `MeshOsSdkError(kind="invalid_daemon")`.
+fn resolve_capabilities(
+    py: Python<'_>,
+    instance: &Py<PyAny>,
+    attr: &str,
+) -> PyResult<CapabilitySet> {
+    let bound = match instance.bind(py).getattr(attr) {
+        Ok(v) if !v.is_none() => v,
+        _ => return Ok(CapabilitySet::default()),
+    };
+    let resolved = if bound.is_callable() {
+        bound.call0()?
+    } else {
+        bound
+    };
+    if resolved.is_none() {
+        return Ok(CapabilitySet::default());
+    }
+    let tags: Vec<String> = resolved.extract().map_err(|e| {
+        sdk_err(
+            py,
+            "invalid_daemon",
+            &format!(
+                "{attr} must return a list/tuple of tag strings (or None): {e}",
+            ),
+        )
+    })?;
+    let mut set = CapabilitySet::new();
+    for tag in tags {
+        set = set.add_tag(tag);
+    }
+    Ok(set)
 }
 
 /// Fetch an attribute that may be missing or `None`; only return
@@ -402,19 +461,22 @@ impl MeshDaemon for PyDaemonBridge {
     }
 
     fn requirements(&self) -> CapabilityFilter {
-        // Slice 1: empty filter. The Python-side
-        // `required_capabilities` / `optional_capabilities` shape
-        // arrives in slice 2 along with `publish_capabilities` chain
-        // commit — same gating as the compute binding's slice 1.
+        // `requirements()` is a placement filter — what *kind*
+        // of node the daemon needs. Distinct from the daemon's
+        // own capability advertisement (`required_capabilities`
+        // / `optional_capabilities`). The Python surface exposes
+        // only the advertise side today; placement-filter
+        // routing remains substrate-internal until a consumer
+        // workflow needs it.
         CapabilityFilter::default()
     }
 
     fn required_capabilities(&self) -> CapabilitySet {
-        CapabilitySet::default()
+        self.required_capabilities.clone()
     }
 
     fn optional_capabilities(&self) -> CapabilitySet {
-        CapabilitySet::default()
+        self.optional_capabilities.clone()
     }
 
     fn process(&mut self, event: &CausalEvent) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {

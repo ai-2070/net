@@ -421,3 +421,75 @@ def test_meshos_sdk_error_kind_helper_parses_envelope() -> None:
                 assert "<<meshos-sdk-kind:invalid_log_level>>" in str(e)
             else:  # pragma: no cover
                 pytest.fail("expected publish_log to raise")
+
+
+# -------------------------------------------------------------------------
+# Capability advertisement — `required_capabilities` /
+# `optional_capabilities` routed through the bridge.
+# -------------------------------------------------------------------------
+
+
+class _CapabilityDaemon:
+    """Daemon advertising static capability tag lists. The Python
+    surface accepts either a method or a property; this test
+    exercises the method form."""
+
+    def name(self) -> str:
+        return "cap-daemon"
+
+    def process(self, event):
+        return [event["payload"]]
+
+    def required_capabilities(self) -> list[str]:
+        return ["hardware.gpu", "software.model.foo=llama-3.1-70b"]
+
+    def optional_capabilities(self) -> list[str]:
+        return ["heat:cold"]
+
+
+class _BadCapabilityDaemon:
+    """Daemon whose `required_capabilities` returns the wrong shape
+    — should raise `invalid_daemon` at registration time."""
+
+    def name(self) -> str:
+        return "bad-cap-daemon"
+
+    def process(self, event):
+        return []
+
+    def required_capabilities(self) -> int:  # type: ignore[override]
+        return 42
+
+
+def test_register_daemon_accepts_capability_tag_lists() -> None:
+    """Daemons returning capability tag lists register cleanly.
+    The cached `CapabilitySet` is built from the tags at construction
+    time so the substrate sees the advertised set on every poll
+    without re-entering Python."""
+    with MeshOsDaemonSdk.start() as sdk:
+        handle = sdk.register_daemon(_CapabilityDaemon(), Identity.generate())
+        # Substrate doesn't yet expose the resolved CapabilitySet on
+        # the handle; the contract is that registration succeeds with
+        # a non-default tag list. Verified-by-construction: an
+        # invalid shape would raise; a valid one returns a usable
+        # handle.
+        assert handle.daemon_id != 0
+        handle.graceful_shutdown(grace_ms=10)
+
+
+def test_register_daemon_rejects_invalid_capability_shape() -> None:
+    with MeshOsDaemonSdk.start() as sdk:
+        with pytest.raises(MeshOsSdkError) as excinfo:
+            sdk.register_daemon(_BadCapabilityDaemon(), Identity.generate())
+        assert excinfo.value.kind == "invalid_daemon"
+        assert "required_capabilities" in str(excinfo.value)
+
+
+def test_register_daemon_tolerates_missing_capability_methods() -> None:
+    """The `_EchoDaemon` fixture has neither `required_capabilities`
+    nor `optional_capabilities`. The bridge should fall back to
+    empty sets without raising."""
+    with MeshOsDaemonSdk.start() as sdk:
+        handle = sdk.register_daemon(_EchoDaemon(), Identity.generate())
+        assert handle.daemon_id != 0
+        handle.graceful_shutdown(grace_ms=10)
