@@ -1,0 +1,32 @@
+net/crates/net/bindings/node/src/deck.rs
+  s_275316fc500935::t_87dc2bc7eb7098 1443-1453,1459-1466
+  s_275316fc500935::t_90e141ec7e8a04 1332-1341,1343-1350
+net/crates/net/bindings/python/src/deck.rs
+  s_275316fc500935::t_da825ff8d7d501 1563-1573,1580-1586
+  s_275316fc500935::t_4a2f52a554834a 1443-1453,1464,1467
+  s_275316fc500935::t_d4efa9b538e06e 1457-1463,1475
+net/crates/net/bindings/go/deck-ffi/src/lib.rs
+  s_275316fc500935::t_aa2ed41a8d2aa5 1795-1801,1808
+  s_275316fc500935::t_4c6b7ed7dad4a6 3563-3568,3592-3597,3599-3601,3603-3605
+  s_275316fc500935::t_c5a2e792bd4afc 1794,1802,1807,1809-1810
+  s_275316fc500935::t_7bd274c9d461ab 3540,3584
+  s_275316fc500935::t_2c523e14d14a6f 2146-2148,2156-2160
+  s_275316fc500935::t_126459e514e998 2291-2292,2300-2303
+  s_275316fc500935::t_0fe5a883cc4c40 3524-3539,3541-3562,3569-3583,3585-3591,3598,3602,3606-3613
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "9191b949e85222ecf07dc7acee5ad063cb2eed6d",
+  "prompts": {},
+  "sessions": {
+    "s_275316fc500935": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f087a884-b322-4d2f-9650-4afee91efe78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
