@@ -1,0 +1,24 @@
+go/netdb.go
+  s_b3022192a92c59::t_0db8ecc2f08eae 1-214
+go/netdb_test.go
+  s_b3022192a92c59::t_8547c97720b426 1-199
+go/net.h
+  s_b3022192a92c59::t_d380808a9bf6e0 249
+  s_b3022192a92c59::t_75529330377311 340-367
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "9f0626aeccfbafbf11e5ad640c60e42cebe9ea47",
+  "prompts": {},
+  "sessions": {
+    "s_b3022192a92c59": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d594c56e-1353-4a07-aa91-e09d2c583c0f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
