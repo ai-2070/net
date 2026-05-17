@@ -59,6 +59,13 @@ const CALL_INTERVAL: Duration = Duration::from_millis(250);
 /// in the caller's pending map forever.
 const CALL_DEADLINE: Duration = Duration::from_millis(2_000);
 
+/// Number of nodes (at the front of the harness's `nodes()`
+/// slice) that serve the `demo.echo` typed RPC. Requesters
+/// alternate calls across them. Held constant at 2 so the
+/// NRPC tab consistently shows multiple callee node_ids;
+/// requester count is then `DEMO_NODE_COUNT - RESPONDER_COUNT`.
+const RESPONDER_COUNT: usize = 2;
+
 /// Observer bridge — converts substrate `RpcCallEvent`s into
 /// deck `NrpcCall` records and pushes them into the shared
 /// `NrpcTail`. Cheap on the hot path: one record allocation +
@@ -105,7 +112,7 @@ pub fn install_responders(
     harness: &ClusterHarness,
 ) -> Result<Vec<ServeHandle>, color_eyre::Report> {
     let mut handles = Vec::new();
-    for idx in 0..2 {
+    for idx in 0..RESPONDER_COUNT {
         let node = harness.nth(idx);
         let h = node
             .mesh()
@@ -126,7 +133,12 @@ pub fn install_responders(
 /// `CALL_INTERVAL` ms, alternating between responders so
 /// both nodes see traffic.
 pub fn spawn_requester_loops(harness: &ClusterHarness) -> Vec<JoinHandle<()>> {
-    let responder_ids: Vec<u64> = harness.nodes().iter().take(2).map(|n| n.node_id()).collect();
+    let responder_ids: Vec<u64> = harness
+        .nodes()
+        .iter()
+        .take(RESPONDER_COUNT)
+        .map(|n| n.node_id())
+        .collect();
     if responder_ids.is_empty() {
         return Vec::new();
     }
@@ -134,7 +146,7 @@ pub fn spawn_requester_loops(harness: &ClusterHarness) -> Vec<JoinHandle<()>> {
         .nodes()
         .iter()
         .enumerate()
-        .skip(2)
+        .skip(RESPONDER_COUNT)
         .map(|(idx, node)| {
             let mesh = node.mesh().clone();
             let responders = responder_ids.clone();

@@ -280,10 +280,10 @@ If every publish fails (broken adapter), the loop completes silently with `store
 | Severity | Action |
 |---|---|
 | Done | `ClusterConfig.verifier` field installed on every node's SDK; demo wires it via `build_cluster(verifier)`; regression test in `cluster_harness.rs::verifier_threads_through_to_every_node` (item 1). |
-| Doc | Re-flow truncated comments in `main.rs:46-66` and remove the `samples-logs` reference (item 2). |
-| Doc | Reword "Idempotent" on `migrator::install_factories` (item 3). |
-| Polish | Sweep stale "5-node" comments → 9 (item 4); unify `Vec::with_capacity` to `cluster.len()` or `DEMO_NODE_COUNT` (item 5); extract `RESPONDER_COUNT` (item 6). |
-| Nice-to-have | Simplify jitter math (7), warn-on-failure in dataforts (9). |
+| Done | Re-flow `main.rs:46-66` comments + drop the `samples-logs` reference (item 2). |
+| Done | Reword `migrator::install_factories` doc to "Single-shot" (item 3). |
+| Done | Sweep "5-node" comments + capacity literals → `DEMO_NODE_COUNT` / derived counts (items 4, 5); extract `RESPONDER_COUNT` constant (item 6). |
+| Done | Simplify jitter math, add `debug_assert!` on extra `{}` in `fill_template`, surface dataforts publish failures via stderr (items 7, 8, 9). |
 
 No blockers. The demo refactor is well-structured, well-tested, and well-documented. The verifier wiring (item 1) is the only thing worth fixing before "real signing" appears in any demo script.
 

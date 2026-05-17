@@ -46,16 +46,16 @@ async fn main() -> color_eyre::Result<()> {
         prev_panic_hook(info);
     }));
 
-    // `demo` boots a real multi-node cluster via
     // NRPC tail — built BEFORE the harness so the demo's
-    // observer bridge can be wired into it during spawn.
-    // Non-demo builds use it for the samples-logs injector
-    // (when that feature is also on) or leave it empty.
+    // observer bridge (see `demo::rpc_chatter::install_observers`)
+    // can be wired into it during spawn. Non-demo builds leave
+    // it inert until the operator pipes their own observer in.
     let nrpc_tail = streams::NrpcTail::new(streams::NRPC_TAIL_CAP);
 
-    // `net_sdk::testing::ClusterHarness`; otherwise the
-    // single-node `runtime::spawn` path runs with an empty
-    // cluster view ready for real-cluster wiring.
+    // Under `--features demo`, `demo::spawn` boots a real
+    // multi-node cluster via `net_sdk::testing::ClusterHarness`;
+    // otherwise the single-node `runtime::spawn` path runs with
+    // an empty cluster view ready for real-cluster wiring.
     #[cfg(feature = "demo")]
     let harness = demo::spawn(nrpc_tail.clone()).await?;
     #[cfg(not(feature = "demo"))]

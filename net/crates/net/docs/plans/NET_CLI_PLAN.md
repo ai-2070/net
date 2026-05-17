@@ -110,6 +110,26 @@ Subcommands:
               discover   <SERVICE>           # nodes advertising `nrpc:<SERVICE>`
               services                        # every nRPC service in the index
 
+  cap       Capability advertisement + discovery.
+              announce   --tags <TAG>... | --from-file <PATH>
+                         (replaces the local node's advertised `CapabilitySet`)
+              show       [--node <ID>]                # default = local node
+              query      --tags <TAG>... [--require-gpu] [--min-memory-gb <N>]
+                         [--min-vram-gb <N>] [--model <ID>] [--tool <ID>]
+                         (compiles to a `CapabilityFilter`; returns matching node ids)
+              nodes                                    # every (node, caps) tuple
+                                                       # known to the local index
+
+  peer      Peer + NAT-traversal helpers.
+              ls                              # every peer with rtt / health /
+                                              # nat-class / reflex from the
+                                              # proximity graph
+              reflex     [--node <ID>]                # default = local reflex_addr
+              nat                                     # local node's nat_type
+              reclassify-nat                          # force a classifier sweep
+              set-reflex    <ADDR>                    # install a reflex override
+              clear-reflex                            # drop the override
+
   identity  Operator + entity identity authoring.
               generate   [--out <PATH>]
               show       <PATH>
@@ -336,7 +356,7 @@ The CLI inherits everything from the Rust SDK — no new wire formats. JSON outp
 - `MeshOsSnapshot` → forwarded verbatim; `--output yaml` rewraps for readability.
 - Errors → `{"kind": "...", "message": "..."}` on stderr, exit code per the table above.
 
-### 8. Tests
+### 9. Tests
 
 Three layers:
 
@@ -344,7 +364,7 @@ Three layers:
 2. **In-process integration** — every subcommand under `tests/`. Each test spins a `net_sdk::testing::ClusterHarness`, drives the CLI via `assert_cmd`, and checks stdout / stderr / exit code. ~40 cases planned for Phase 1.
 3. **Exit-code coverage** — `tests/exit_codes.rs` enumerates every documented code (0–8, sample 10–11), invokes a fixture that produces that code, and asserts the binary exits with it. Pinned so future contributors can't quietly broaden the meaning of an exit code.
 
-### 9. Documentation
+### 10. Documentation
 
 - **`docs/net-cli.md`** — operator-facing reference. Each subcommand's flags, output shape, example invocation, exit codes, env vars. Format lifted from `git-scm.com`-style man pages.
 - **`docs/net-cli-cookbook.md`** — recipes. Common CI patterns (drain-and-wait, audit-since-deploy, ICE preview in dry-run), shell snippets, jq one-liners.
@@ -381,7 +401,7 @@ Activation order, dependency-driven:
 
 - **Phase 1 — Scaffolding + read-only surface.** `cli/Cargo.toml` + `src/main.rs` with clap routing for `net version`, `net identity (generate|show|fingerprint)`, `net snapshot get`, `net snapshot status`, `net audit recent` / `audit stream`, `net log tail`, `net failures tail`, `net daemon ls`. Config + global flags + output dispatch. Exit-code table. Help-text goldens. Wires nothing that mutates substrate state — purely read + identity authoring.
 
-- **Phase 2 — Admin write surface.** `net admin (drain|enter-maintenance|exit-maintenance|cordon|uncordon|drop-replicas|invalidate-placement|restart-all-daemons|clear-avoid-list)`. `--dry-run` support. Identity loading + commit envelope construction. Integration tests for every admin variant.
+- **Phase 2 — Admin write surface + nRPC client.** `net admin (drain|enter-maintenance|exit-maintenance|cordon|uncordon|drop-replicas|invalidate-placement|restart-all-daemons|clear-avoid-list)`. `--dry-run` support. Identity loading + commit envelope construction. `net rpc (call|stream|discover|services)` — Tier 1 client surface over `MeshAdapter::call_service` / `call_streaming` / `find_service_nodes`. Integration tests for every admin variant + ≥3 per `rpc` command (happy path, `NoRoute`, payload-shape mismatch).
 
 - **Phase 3 — ICE break-glass surface.** `net ice (freeze-cluster|thaw-cluster|flush-avoid-lists|force-evict-replica|force-restart-daemon|force-cutover|kill-migration)`. Simulate → preview table → confirm gate → commit. `--yes` for non-interactive flows; `--sig` for pre-collected signatures. `net identity registry (add|remove|list)`. ICE-specific integration tests + the exit-code-8 coverage.
 
@@ -390,6 +410,14 @@ Activation order, dependency-driven:
 - **Phase 5 — Remote attach.** `--endpoint tcp://host:port` for talking to a substrate node from a different process. **Substrate-side prereq**: a remote-attach handshake doesn't exist yet — this phase is gated on `MESHOS_PLAN.md`'s remote-attach work landing first.
 
 Phases 1–4 land independently of each other; Phase 5 has a hard substrate prereq.
+
+### Indefinitely deferred
+
+These surfaces are designed-but-unscheduled. The notes pin the shape so a future reviewer doesn't have to re-derive it; revival waits on a consumer workflow that justifies the work.
+
+- **`net rpc metrics` + `net rpc trace`** — nRPC observability subcommands. `metrics` wraps `rpc_metrics_snapshot()` with `--output (json|prom|table)` (the SDK already provides `prometheus_text()`) and a `--watch <DUR>` polling mode. `trace` issues a single call with tracing turned on and emits the per-hop `RpcCallEvent` stream as ndjson alongside the reply. Both are useful for debugging routing decisions + latency; both are deferred until consumers ask, because (a) the Prometheus surface is already accessible from any Rust consumer of the SDK, and (b) per-call tracing's signal-to-noise is low without a UI on top.
+- **`net rpc bench`** — load-test driver (concurrency × duration × payload → p50/p95/p99 latency, success rate, error breakdown by `RpcError` kind). Deferred — bench tooling is better served by `criterion` or a dedicated harness than by a CLI subcommand.
+- **`net rpc serve --exec <BINARY>`** — host a service via a subprocess shim that talks to the CLI over stdio. Deferred — defining the stdio line protocol isn't worth it until a real cross-language consumer needs it; the Rust path goes through `net daemon run --kind <FACTORY-ID>` instead.
 
 ## Non-goals
 

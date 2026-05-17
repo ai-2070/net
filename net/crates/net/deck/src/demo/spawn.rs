@@ -37,8 +37,9 @@ use super::rpc_chatter;
 use crate::streams::NrpcTail;
 
 /// Per-node heartbeat cadence. Picks a slightly-staggered base
-/// so the 5 nodes don't all emit on the same tick; jitter is
-/// added per-emit so the LOGS tab doesn't read as mechanical.
+/// so the cluster's nodes don't all emit on the same tick;
+/// jitter is added per-emit so the LOGS tab doesn't read as
+/// mechanical.
 const HEARTBEAT_BASE_INTERVAL: Duration = Duration::from_millis(800);
 
 /// Returned by [`spawn`]. Mirrors `crate::runtime::Harness`'s
@@ -193,7 +194,8 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
     let sdk0 = node0
         .sdk()
         .ok_or_else(|| color_eyre::eyre::eyre!("node[0] sdk missing"))?;
-    let mut group_handles: Vec<MeshOsDaemonHandle> = Vec::with_capacity(9);
+    // 3 daemons in each of the 3 group flavors (replica / fork / standby).
+    let mut group_handles: Vec<MeshOsDaemonHandle> = Vec::with_capacity(3 * 3);
     for replica_idx in 0..3 {
         let kp = EntityKeypair::generate();
         let h = sdk0
@@ -280,9 +282,11 @@ async fn run_heartbeat_loop(
         // Deterministic-but-varied jitter so the demo doesn't
         // need an RNG dependency. ±150 ms around the base.
         let jitter_ms = ((tick.wrapping_mul(11) ^ node_id) % 300) as i64 - 150;
-        let interval = HEARTBEAT_BASE_INTERVAL
-            .saturating_add(Duration::from_millis(jitter_ms.max(0) as u64))
-            .saturating_sub(Duration::from_millis((-jitter_ms).max(0) as u64));
+        let interval = if jitter_ms >= 0 {
+            HEARTBEAT_BASE_INTERVAL + Duration::from_millis(jitter_ms as u64)
+        } else {
+            HEARTBEAT_BASE_INTERVAL.saturating_sub(Duration::from_millis(-jitter_ms as u64))
+        };
         tokio::time::sleep(interval).await;
         let template = messages[(tick as usize + node_index) % messages.len()];
         // Templates carry up to two `{}` placeholders that get
@@ -348,15 +352,21 @@ fn fill_template(tpl: &str, a: u64, b: u64) -> String {
         out.push_str(&b.to_string());
         out.push_str(rest);
     }
+    // Catch corpus-edit typos that introduce a third placeholder —
+    // the current corpus tops out at two `{}`s per template.
+    debug_assert!(
+        iter.next().is_none(),
+        "fill_template: corpus template has > 2 `{{}}` placeholders: {tpl:?}"
+    );
     out
 }
 
 #[cfg(test)]
 mod tests {
     //! End-to-end smoke tests for the demo's Phase 1 slice.
-    //! Boots the real 5-node cluster + registers the
-    //! per-node `NodeAgentDaemon`s and asserts the deck's
-    //! observable surfaces line up: snapshot has the 4 remote
+    //! Boots the real DEMO_NODE_COUNT-node cluster + registers
+    //! the per-node `NodeAgentDaemon`s and asserts the deck's
+    //! observable surfaces line up: snapshot has the remote
     //! peers, each node carries a registered daemon, and the
     //! log loop emits records within a generous budget.
     //!
@@ -374,9 +384,9 @@ mod tests {
             .await
             .expect("demo spawn must succeed");
         // The deck observes node[0]; its snapshot should
-        // include the other 4 peers via the bridge probes
-        // and one registered NodeAgentDaemon for itself.
-        // Wait long enough for at least a few heartbeat
+        // include the other DEMO_NODE_COUNT-1 peers via the
+        // bridge probes and one registered NodeAgentDaemon for
+        // itself. Wait long enough for at least a few heartbeat
         // emits (~800 ms base; allow 3 s for headroom).
         tokio::time::sleep(Duration::from_secs(3)).await;
         let snap = harness.deck.status();

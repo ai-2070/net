@@ -87,7 +87,7 @@ impl ComputeMeshDaemon for MigratableDaemon {
 }
 
 /// Register `demo.migratable` on every node's DaemonRuntime.
-/// Idempotent — `register_factory` rejects duplicate kinds on
+/// Single-shot — `register_factory` rejects duplicate kinds on
 /// the same runtime, so callers must invoke this exactly once
 /// per harness lifetime. Returns `Ok(())` on success.
 pub fn install_factories(harness: &ClusterHarness) -> Result<(), color_eyre::Report> {
@@ -122,7 +122,8 @@ pub fn spawn_loop(harness: &ClusterHarness) -> tokio::task::JoinHandle<()> {
 async fn run_loop(runtimes: Vec<DaemonRuntime>, node_ids: Vec<NodeId>, total: usize) {
     if total < 2 {
         // Migrations need at least 2 nodes; the demo always
-        // boots 5 but guard against future single-node use.
+        // boots `DEMO_NODE_COUNT` (currently 9) but guard against
+        // future single-node use.
         return;
     }
     let source_rt = runtimes[0].clone();

@@ -67,10 +67,15 @@ async fn install_one(
     let mut stored = Vec::with_capacity(stores);
     for i in 0..stores {
         let payload = format!("{id}/blob-{i:03}-demo-content").into_bytes();
-        if let Ok(blob) =
-            publish_blob_ref(adapter.as_ref(), format!("mesh://{id}/{i}"), &payload).await
-        {
-            stored.push(blob);
+        match publish_blob_ref(adapter.as_ref(), format!("mesh://{id}/{i}"), &payload).await {
+            Ok(blob) => stored.push(blob),
+            Err(e) => {
+                // Surface the failure so the operator notices an
+                // adapter that's misconfigured; silent skip would
+                // render the DATAFORTS tab with an empty adapter
+                // and no signal why.
+                eprintln!("[deck demo] dataforts seed publish failed on {id}/{i}: {e}");
+            }
         }
     }
     // Fire `fetches` re-fetches of the first stored blob so the
