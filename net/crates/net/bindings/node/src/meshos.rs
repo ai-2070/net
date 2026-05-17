@@ -778,15 +778,27 @@ impl MeshOsDaemonHandle {
         h.publish_log(lvl, message).map_err(sdk_err_from)
     }
 
-    /// Publish (or update) the daemon's capability set. Slice 1 is
-    /// a substrate-side stub — the call returns without committing.
-    /// The argument is accepted for forward-compatibility; today
-    /// it's ignored.
+    /// Publish (or update) the daemon's capability set.
+    ///
+    /// `caps` is a `CapabilitySetJs` POJO matching the cross-
+    /// binding capability shape (`hardware?, software?, models?,
+    /// tools?, tags?, limits?, metadata?`). `null` clears to the
+    /// empty default.
+    ///
+    /// The substrate-side commit is a stub today (returns
+    /// `Ok(())` without committing); the conversion still runs
+    /// so a malformed schema surfaces a typed error at the
+    /// binding boundary rather than silently lost when the
+    /// chain commit lands.
     #[napi]
     pub async fn publish_capabilities(
         &self,
-        _caps: Option<crate::capabilities::CapabilitySetJs>,
+        caps: Option<crate::capabilities::CapabilitySetJs>,
     ) -> Result<()> {
+        let cap_set = match caps {
+            Some(c) => crate::capabilities::capability_set_from_js(c),
+            None => CapabilitySet::default(),
+        };
         let guard = self.inner.lock().await;
         let h = guard.as_ref().ok_or_else(|| {
             sdk_err(
@@ -794,8 +806,7 @@ impl MeshOsDaemonHandle {
                 "daemon handle was already consumed by gracefulShutdown",
             )
         })?;
-        h.publish_capabilities(CapabilitySet::default())
-            .map_err(sdk_err_from)
+        h.publish_capabilities(cap_set).map_err(sdk_err_from)
     }
 
     /// Drive a graceful shutdown. Sends

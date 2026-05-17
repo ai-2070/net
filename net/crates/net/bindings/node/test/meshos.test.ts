@@ -244,6 +244,31 @@ d('MeshOS daemon-author SDK (Phase 3 slice 1)', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Slice 2 — real CapabilitySet conversion
+  // -------------------------------------------------------------------------
+
+  it('publishCapabilities accepts a typed CapabilitySetJs object', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const handle = await sdk.registerDaemon(
+        { name: 'with-caps', process: () => [] },
+        Identity.generate(),
+      );
+      try {
+        await handle.publishCapabilities({
+          hardware: { cpuCores: 8 },
+          software: { runtime: 'rust-1.78' },
+          tags: ['software.telemetry'],
+        } as never);
+      } finally {
+        await handle.gracefulShutdown(10n);
+      }
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  // -------------------------------------------------------------------------
   // Daemon validation
   // -------------------------------------------------------------------------
 

@@ -701,10 +701,18 @@ export declare class MeshOsDaemonHandle {
    */
   publishLog(level: string, message: string): Promise<void>
   /**
-   * Publish (or update) the daemon's capability set. Slice 1 is
-   * a substrate-side stub — the call returns without committing.
-   * The argument is accepted for forward-compatibility; today
-   * it's ignored.
+   * Publish (or update) the daemon's capability set.
+   *
+   * `caps` is a `CapabilitySetJs` POJO matching the cross-
+   * binding capability shape (`hardware?, software?, models?,
+   * tools?, tags?, limits?, metadata?`). `null` clears to the
+   * empty default.
+   *
+   * The substrate-side commit is a stub today (returns
+   * `Ok(())` without committing); the conversion still runs
+   * so a malformed schema surfaces a typed error at the
+   * binding boundary rather than silently lost when the
+   * chain commit lands.
    */
   publishCapabilities(caps?: CapabilitySetJs | undefined | null): Promise<void>
   /**
