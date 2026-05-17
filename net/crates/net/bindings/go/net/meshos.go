@@ -249,14 +249,28 @@ static inline NetMeshOsDaemonVtable goMeshOsBuildVtable(void) {
     vt.saturation = goMeshOsSaturationTrampoline;
     return vt;
 }
+
+// Slice 2 — metadata + capability advertisement.
+extern char* net_meshos_metadata(const NetMeshOsHandle* handle);
+extern char* net_meshos_refresh_metadata(NetMeshOsHandle* handle);
+extern void net_meshos_free_string(char* s);
+extern int net_meshos_publish_capabilities(
+    NetMeshOsHandle* handle,
+    const char* tags_json_ptr,
+    size_t tags_json_len
+);
 */
 import "C"
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime"
 	"runtime/cgo"
+	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -537,6 +551,12 @@ type MeshOsDaemonHandle struct {
 	// (which registers an internal no-op daemon and needs no
 	// Go-side dispatch). Released on `Free` / finalizer.
 	daemonHandle cgo.Handle
+	// controlOnce gates the per-handle ControlEvents pump
+	// goroutine. The first `ControlEvents(ctx)` call spawns it;
+	// subsequent calls return the same channel.
+	controlOnce sync.Once
+	// controlChan is closed when the pump goroutine exits.
+	controlChan chan MeshOsDaemonControl
 }
 
 // DaemonID returns the substrate identifier (the keypair's origin
@@ -897,4 +917,230 @@ func goMeshOsSaturationTrampoline(userCtx unsafe.Pointer) C.float {
 		v = 1
 	}
 	return C.float(v)
+}
+
+// =====================================================================
+// Slice 2 — metadata + capability advertisement
+// =====================================================================
+
+// MeshOsMaintenanceStateView mirrors the cdylib's tagged-union
+// `MaintenanceStateView` projection. Inspect `Kind` to discriminate;
+// variant-specific fields are populated per kind:
+//
+//   - "active"                — no extra fields.
+//   - "entering_maintenance"  — SinceMs + DeadlineRemainingMs (nullable).
+//   - "maintenance"           — SinceMs.
+//   - "exiting_maintenance"   — SinceMs.
+//   - "drain_failed"          — SinceMs + Reason.
+//   - "recovery"              — SinceMs.
+//   - "unknown"               — forward-compat fallback for substrate
+//     variants the binding doesn't yet know.
+type MeshOsMaintenanceStateView struct {
+	Kind                string  `json:"kind"`
+	SinceMs             uint64  `json:"since_ms,omitempty"`
+	DeadlineRemainingMs *uint64 `json:"deadline_remaining_ms,omitempty"`
+	Reason              string  `json:"reason,omitempty"`
+}
+
+// MeshOsPeerSnapshot mirrors the per-peer view inside
+// `MetadataView`. Health / maintenance fields are stringified
+// substrate enum variants ("Healthy" / "Degraded" / etc.).
+type MeshOsPeerSnapshot struct {
+	NodeID          uint64   `json:"node_id"`
+	RttMs           *uint64  `json:"rtt_ms,omitempty"`
+	Health          *string  `json:"health,omitempty"`
+	Maintenance     *string  `json:"maintenance,omitempty"`
+	CpuLoad1m       *float64 `json:"cpu_load_1m,omitempty"`
+	MemUsedBytes    *uint64  `json:"mem_used_bytes,omitempty"`
+	MemTotalBytes   *uint64  `json:"mem_total_bytes,omitempty"`
+	DiskUsedBytes   *uint64  `json:"disk_used_bytes,omitempty"`
+	DiskTotalBytes  *uint64  `json:"disk_total_bytes,omitempty"`
+	SaturationTrend *float64 `json:"saturation_trend,omitempty"`
+	CapabilitySet   []string `json:"capability_set,omitempty"`
+	SoftwareVersion *string  `json:"software_version,omitempty"`
+	ForkedFrom      *uint64  `json:"forked_from,omitempty"`
+}
+
+// MeshOsMetadataView is the daemon's read-only cluster context.
+// Returned by `MeshOsDaemonHandle.Metadata()` /
+// `RefreshMetadata()`.
+type MeshOsMetadataView struct {
+	NodeID           uint64                     `json:"node_id"`
+	DaemonID         uint64                     `json:"daemon_id"`
+	DaemonName       string                     `json:"daemon_name"`
+	MaintenanceState MeshOsMaintenanceStateView `json:"maintenance_state"`
+	Peers            []MeshOsPeerSnapshot       `json:"peers"`
+}
+
+// Metadata returns a fresh snapshot of the daemon's
+// `MetadataView` decoded from the cdylib's JSON envelope.
+// Returns `ErrMeshOsAlreadyShutdown` after `GracefulShutdown`.
+func (h *MeshOsDaemonHandle) Metadata() (*MeshOsMetadataView, error) {
+	if h == nil || h.ptr == nil {
+		return nil, ErrMeshOsInvalidArg
+	}
+	raw := C.net_meshos_metadata(h.ptr)
+	if raw == nil {
+		return nil, lastMeshOsError()
+	}
+	defer C.net_meshos_free_string(raw)
+	jsonStr := C.GoString(raw)
+	var view MeshOsMetadataView
+	if err := json.Unmarshal([]byte(jsonStr), &view); err != nil {
+		return nil, fmt.Errorf("meshos: decode metadata JSON: %w", err)
+	}
+	return &view, nil
+}
+
+// RefreshMetadata re-pulls from the runtime's latest snapshot
+// and returns the freshly-rendered view.
+func (h *MeshOsDaemonHandle) RefreshMetadata() (*MeshOsMetadataView, error) {
+	if h == nil || h.ptr == nil {
+		return nil, ErrMeshOsInvalidArg
+	}
+	raw := C.net_meshos_refresh_metadata(h.ptr)
+	if raw == nil {
+		return nil, lastMeshOsError()
+	}
+	defer C.net_meshos_free_string(raw)
+	jsonStr := C.GoString(raw)
+	var view MeshOsMetadataView
+	if err := json.Unmarshal([]byte(jsonStr), &view); err != nil {
+		return nil, fmt.Errorf("meshos: decode metadata JSON: %w", err)
+	}
+	return &view, nil
+}
+
+// PublishCapabilities advertises a fresh capability tag set
+// for this daemon. Pass an empty slice to clear the advert.
+//
+// **Stub today.** The substrate's
+// `MeshOsDaemonHandle::publish_capabilities` returns `Ok(())`
+// without committing to the capability chain — the call
+// succeeds, but the rest of the cluster won't observe the
+// update until the substrate's chain-commit path lands. Every
+// binding surfaces the same stub semantics so consumers don't
+// write code against a contract the substrate doesn't yet
+// honor. Cuts over transparently when the substrate ships.
+func (h *MeshOsDaemonHandle) PublishCapabilities(tags []string) error {
+	if h == nil || h.ptr == nil {
+		return ErrMeshOsInvalidArg
+	}
+	if len(tags) == 0 {
+		status := C.net_meshos_publish_capabilities(h.ptr, nil, 0)
+		return statusToError(status)
+	}
+	payload, err := json.Marshal(tags)
+	if err != nil {
+		return fmt.Errorf("meshos: encode capability tags: %w", err)
+	}
+	status := C.net_meshos_publish_capabilities(
+		h.ptr,
+		(*C.char)(unsafe.Pointer(&payload[0])),
+		C.size_t(len(payload)),
+	)
+	return statusToError(status)
+}
+
+// =====================================================================
+// Slice 3 — ControlEvents channel + context.Context plumbing
+// =====================================================================
+
+// ControlEvents returns a buffered channel that delivers
+// `MeshOsDaemonControl` events as the supervisor emits them.
+// The channel closes when `ctx` is cancelled or the daemon
+// handle is shut down. The first call on a handle spawns the
+// pumping goroutine; subsequent calls return the same channel.
+//
+// The goroutine uses a 50ms poll cadence — the cdylib's
+// `next_control` blocks with a timeout, so the goroutine
+// alternates between polling and checking `ctx.Done()`. For
+// hot-path workloads where 50ms is too coarse, fall back to
+// `TryNextControl` / `NextControl(timeoutMs)` directly.
+func (h *MeshOsDaemonHandle) ControlEvents(ctx context.Context) <-chan MeshOsDaemonControl {
+	h.controlOnce.Do(func() {
+		h.controlChan = make(chan MeshOsDaemonControl, 16)
+		go h.pumpControlEvents(ctx)
+	})
+	return h.controlChan
+}
+
+func (h *MeshOsDaemonHandle) pumpControlEvents(ctx context.Context) {
+	defer close(h.controlChan)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		// Use a short timeout so we can check ctx between polls.
+		ev, err := h.NextControl(50)
+		if err != nil {
+			// `already_shutdown` or any other terminal error stops
+			// the pump.
+			return
+		}
+		if ev.Kind == ControlNone {
+			continue
+		}
+		select {
+		case h.controlChan <- ev:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// MetadataContext is the context-aware variant of Metadata.
+// Cancellation aborts the call before the JSON-decode step; the
+// underlying FFI fetch is fast (microseconds) so cancellation
+// inside the FFI is best-effort.
+func (h *MeshOsDaemonHandle) MetadataContext(ctx context.Context) (*MeshOsMetadataView, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return h.Metadata()
+}
+
+// GracefulShutdownContext is the context-aware variant of
+// `GracefulShutdown`. The context's deadline overrides the
+// caller-supplied grace if it expires sooner; cancellation
+// before the call propagates as `ctx.Err()`.
+func (h *MeshOsDaemonHandle) GracefulShutdownContext(ctx context.Context, grace time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		until := time.Until(deadline)
+		if until < grace {
+			grace = until
+		}
+	}
+	if grace < 0 {
+		grace = 0
+	}
+	return h.GracefulShutdown(uint64(grace / time.Millisecond))
+}
+
+// lastMeshOsError reads the cdylib's thread-local last-error
+// pair and constructs a typed Go error.
+func lastMeshOsError() error {
+	kindPtr := C.net_meshos_last_error_kind()
+	msgPtr := C.net_meshos_last_error_message()
+	if kindPtr == nil && msgPtr == nil {
+		return ErrMeshOs
+	}
+	kind := ""
+	if kindPtr != nil {
+		kind = C.GoString(kindPtr)
+	}
+	msg := ""
+	if msgPtr != nil {
+		msg = C.GoString(msgPtr)
+	}
+	C.net_meshos_clear_last_error()
+	if kind == "already_shutdown" {
+		return ErrMeshOsAlreadyShutdown
+	}
+	return fmt.Errorf("meshos: %s: %s", kind, msg)
 }
