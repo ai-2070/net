@@ -428,6 +428,13 @@ jobs:
       - name: Type-check (tsc)
         run: npm run build
 
+      # vitest auto-discovers everything under `test/`. Notable
+      # deck-specific coverage exercised by this step:
+      #   - test/deck.test.ts — Symbol.asyncDispose hook shape +
+      #     runtime drain. The runtime test promotes the "binding
+      #     stale" skip to a hard failure when CI=true, so a
+      #     misconfigured --features list (missing `deck`) above
+      #     fails loudly rather than silently skipping.
       - name: Run vitest
         run: npm test
 
@@ -510,6 +517,12 @@ jobs:
           pip install --no-deps -e .
           pip install pytest pydantic
 
+      # pytest auto-discovers `tests/` per pyproject.toml's
+      # `testpaths`. Notable deck-specific coverage:
+      #   - tests/test_deck_wrapper.py — wrapper-level
+      #     DeckClient.from_seed kwarg forwarding +
+      #     __enter__/__exit__ dunder dispatch (stubs the raw
+      #     pyo3 class so this stays a pure-Python test).
       - name: Run tests
         run: pytest -v
 
@@ -676,6 +689,16 @@ jobs:
     # node/python NAPI/PyO3 surfaces were silently uncovered. The
     # `rust-sdk` member is omitted — the dedicated `rust-sdk-tests`
     # job already covers its tests with a broader feature set.
+    #
+    # Notable deck-specific coverage in `go-deck-ffi`:
+    #   - ice_simulate_unknown_variant_leaves_husk_retryable
+    #   - ice_commit_unknown_variant_leaves_husk_retryable
+    #     (both use a thread-local fault-injection switch on
+    #     `build_core_proposal` to exercise the failure-branch
+    #     invariant — the husk stays retry-able when the variant
+    #     is unrecognised)
+    #   - audit_query_setters_set_last_error_on_null_query
+    #     (pins the last-error envelope on every NULL-arm return)
     name: FFI tests (${{ matrix.crate.name }})
     runs-on: ubuntu-latest
     strategy:

@@ -24,8 +24,17 @@ describe('DeckClient — async-dispose hook', () => {
     // Skip cleanly if the local napi binding predates the
     // standalone constructor (`DeckClient.new`). CI rebuilds
     // the binding before running this suite, so the skip path
-    // only fires for stale local checkouts.
+    // must never fire there — `CI=true` is the standard GH
+    // Actions / vitest signal, and we promote the skip to a
+    // hard failure when it's set so a feature-flag regression
+    // in the napi build can't silently hide.
     if (typeof napi.DeckClient?.new !== 'function') {
+      if (process.env.CI) {
+        throw new Error(
+          'napi binding lacks DeckClient.new in CI — the binding build is misconfigured ' +
+            '(check the --features list in .github/workflows/ci.yml includes `deck`).',
+        );
+      }
       skip('napi binding lacks DeckClient.new — rebuild bindings/node');
       return;
     }
