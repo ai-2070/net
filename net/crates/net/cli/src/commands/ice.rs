@@ -296,15 +296,7 @@ where
     // always demand the typed `YES` even with `--yes` so a stray
     // shell-history recall can't ram an ICE commit through.
     let stdin_is_tty = std::io::IsTerminal::is_terminal(&io::stdin());
-    if !stdin_is_tty && !common.yes {
-        return Err(_CE::new(
-            ExitCodeKind::ConfirmationRefused,
-            "stdin is not a TTY; pass --yes to skip the interactive confirm prompt",
-        ));
-    }
-    if stdin_is_tty && !prompt_for_yes()? {
-        return Err(crate::error::confirmation_refused());
-    }
+    check_confirm_gate(stdin_is_tty, common.yes, prompt_for_yes)?;
 
     // Sign locally + collect supplied signatures.
     let mut signatures: Vec<OperatorSignature> = Vec::new();
@@ -334,6 +326,26 @@ where
     };
     emit_value(OutputFormat::resolve_oneshot(output), &payload)
         .map_err(|e| generic(format!("write commit: {e}")))?;
+    Ok(())
+}
+
+/// Confirmation-gate logic extracted so the code-8 exit path
+/// has cheap unit-test coverage that doesn't pay the substrate
+/// boot cost the integration test does. Returns `Err` with
+/// `ConfirmationRefused` when the gate rejects.
+fn check_confirm_gate<P>(stdin_is_tty: bool, yes_flag: bool, prompt: P) -> Result<(), CliError>
+where
+    P: FnOnce() -> Result<bool, CliError>,
+{
+    if !stdin_is_tty && !yes_flag {
+        return Err(_CE::new(
+            ExitCodeKind::ConfirmationRefused,
+            "stdin is not a TTY; pass --yes to skip the interactive confirm prompt",
+        ));
+    }
+    if stdin_is_tty && !prompt()? {
+        return Err(crate::error::confirmation_refused());
+    }
     Ok(())
 }
 
@@ -411,4 +423,44 @@ struct ChainCommitMirror {
     operator_id: u64,
     event_kind: &'static str,
     committed_at_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_tty_without_yes_refuses_with_code_8() {
+        let err =
+            check_confirm_gate(false, false, || panic!("prompt must not run")).unwrap_err();
+        assert_eq!(err.kind(), ExitCodeKind::ConfirmationRefused);
+    }
+
+    #[test]
+    fn non_tty_with_yes_passes() {
+        check_confirm_gate(false, true, || panic!("prompt must not run")).unwrap();
+    }
+
+    #[test]
+    fn tty_prompt_no_refuses_with_code_8() {
+        let err = check_confirm_gate(true, false, || Ok(false)).unwrap_err();
+        assert_eq!(err.kind(), ExitCodeKind::ConfirmationRefused);
+    }
+
+    #[test]
+    fn tty_prompt_yes_passes() {
+        check_confirm_gate(true, false, || Ok(true)).unwrap();
+    }
+
+    #[test]
+    fn tty_always_prompts_even_with_yes_flag() {
+        // Dual-key behaviour: `--yes` does not short-circuit the
+        // typed prompt on an interactive terminal.
+        let prompted = std::cell::Cell::new(false);
+        let _ = check_confirm_gate(true, true, || {
+            prompted.set(true);
+            Ok(true)
+        });
+        assert!(prompted.get(), "TTY path must always prompt");
+    }
 }
