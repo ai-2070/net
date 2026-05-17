@@ -1,0 +1,21 @@
+net/crates/net/bindings/node/src/deck.rs
+  s_275316fc500935::t_bd63a8150160de 532,588,623,647
+net/crates/net/bindings/python/src/deck.rs
+  s_275316fc500935::t_bd63a8150160de 552,560,569,648,690,712
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "4b52257121a3f382b330c0fce6e0de24bd246636",
+  "prompts": {},
+  "sessions": {
+    "s_275316fc500935": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f087a884-b322-4d2f-9650-4afee91efe78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
