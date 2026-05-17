@@ -164,13 +164,6 @@ enum DaemonCommand {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
-    // Top-level panic / error formatting. Stays minimal — typed
-    // errors carry their own kind discriminator through `CliError`.
-    if let Err(e) = color_eyre::install() {
-        eprintln!("net: failed to install error reporter: {e}");
-        return ExitCode::from(1);
-    }
-
     let cli = Cli::parse();
     install_tracing(cli.verbose, cli.quiet);
 

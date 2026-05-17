@@ -2152,7 +2152,6 @@ dependencies = [
  "ai2070-net-sdk",
  "assert_cmd",
  "clap",
- "color-eyre",
  "comfy-table",
  "dirs 5.0.1",
  "futures",
