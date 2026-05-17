@@ -53,12 +53,20 @@ pub async fn run_log_tail(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let _ = args.follow; // accepted but always-on
+    // Validate the filter up-front so an invalid `--min-level`
+    // exits before we pay the substrate-startup cost. The other
+    // filter knobs (daemon / node / since) are typed by clap.
+    let min_level = match args.min_level.as_deref() {
+        Some(s) => Some(parse_log_level(s)?),
+        None => None,
+    };
+
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
 
     let mut filter = LogFilter::new();
-    if let Some(level_str) = args.min_level.as_deref() {
-        filter = filter.min_level(parse_log_level(level_str)?);
+    if let Some(level) = min_level {
+        filter = filter.min_level(level);
     }
     if let Some(d) = args.daemon {
         filter = filter.with_daemon(d);
