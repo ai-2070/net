@@ -874,8 +874,24 @@ impl SnapshotReassembler {
             self.latest_seq.insert(daemon_origin, seq_through);
         }
 
-        // Single-chunk fast path: no state to keep.
+        // Single-chunk fast path: no state to keep. Honour the
+        // total_chunks-mismatch guard before bypassing — a peer that
+        // shipped chunk 0/3 for `(daemon_origin, seq_through)` and
+        // followed up with chunk 0/1 for the same key would otherwise
+        // have the second message accepted as a complete snapshot,
+        // dodging the mismatch error the multi-chunk path below
+        // returns. The dedup-by-seq_through eviction above only fires
+        // when a *newer* seq_through arrives; same-key collisions
+        // still need to be caught here.
         if total_chunks == 1 {
+            if let Some(state) = self.pending.get(&(daemon_origin, seq_through)) {
+                if state.total_chunks != 1 {
+                    return Err(ReassemblyError::TotalChunksMismatch {
+                        got: 1,
+                        expected: state.total_chunks,
+                    });
+                }
+            }
             self.pending.remove(&(daemon_origin, seq_through));
             return Ok(Some(snapshot_bytes));
         }
@@ -2452,6 +2468,37 @@ mod tests {
             "got {:?}",
             result
         );
+        assert_eq!(reassembler.pending_count(), 1);
+    }
+
+    /// The total_chunks==1 fast path must not bypass the
+    /// total_chunks-mismatch guard. A peer that opened reassembly
+    /// with chunk 0/3 for `(daemon, seq)` could otherwise follow up
+    /// with chunk 0/1 for the same key and have the second payload
+    /// accepted as a complete snapshot — substituting its content
+    /// for the in-flight multi-chunk one. The fast path now consults
+    /// `pending` first and surfaces TotalChunksMismatch when the
+    /// declared total disagrees with the in-flight state.
+    #[test]
+    fn fast_path_rejects_single_chunk_after_multi_chunk_state() {
+        let mut reassembler = SnapshotReassembler::new();
+        // Open with chunk 0/3.
+        reassembler.feed(0xAAAA, vec![1; 10], 7, 0, 3).unwrap();
+        // Attacker follows up declaring total_chunks=1 for same key.
+        let result = reassembler.feed(0xAAAA, vec![2; 10], 7, 0, 1);
+        assert!(
+            matches!(
+                result,
+                Err(ReassemblyError::TotalChunksMismatch {
+                    got: 1,
+                    expected: 3,
+                })
+            ),
+            "fast path must refuse substitution; got {:?}",
+            result
+        );
+        // The original in-flight reassembly must still exist; the
+        // attempted substitution must not have evicted it.
         assert_eq!(reassembler.pending_count(), 1);
     }
 
