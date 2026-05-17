@@ -131,12 +131,19 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
     let toml_text = toml::to_string_pretty(&file)
         .map_err(|e| generic(format!("failed to serialize identity TOML: {e}")))?;
 
-    tokio::fs::write(&path, &toml_text).await.map_err(|e| {
-        generic(format!(
-            "failed to write identity file {}: {e}",
-            path.display()
-        ))
-    })?;
+    // Atomic, mode-restricted publish. Pre-fix `tokio::fs::write`
+    // created the file with the process umask (commonly 0o644 —
+    // world-readable on most distros) and `enforce_strict_permissions`
+    // only chmod'd it down to 0o600 *after* the bytes had already
+    // landed on disk. A reader / backup agent / inotify-watcher in
+    // that window could grab the seed. Open the temp file with
+    // mode=0o600 in one syscall (Unix), write the seed into the
+    // already-restricted handle, and atomic-rename onto the final
+    // path so the visible file is either an intact prior identity
+    // or the new one - never a half-written world-readable seed.
+    let pid = std::process::id();
+    let tmp = path.with_extension(format!("tmp.{pid}"));
+    write_identity_atomically(&tmp, &path, toml_text.as_bytes()).await?;
     enforce_strict_permissions(&path).await?;
 
     // Print the public summary on stdout — never the seed, even
@@ -251,6 +258,57 @@ async fn read_identity_file(
         ))
     })?;
     Ok(parsed)
+}
+
+/// Write `bytes` to `tmp` with the tightest creation mode the
+/// platform supports, then atomic-rename onto `final_path`. On Unix
+/// the temp file is created with `O_CREAT | O_EXCL` and mode 0o600
+/// in a single syscall so the seed is never reachable to a
+/// concurrent reader at the default umask. On Windows the temp
+/// file is created with default ACLs — managed out-of-band per the
+/// module header — and `enforce_strict_permissions` is a no-op.
+async fn write_identity_atomically(
+    tmp: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+) -> Result<(), CliError> {
+    let tmp_owned = tmp.to_path_buf();
+    let bytes_owned = bytes.to_vec();
+
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp_owned)?;
+        std::io::Write::write_all(&mut f, &bytes_owned)?;
+        f.sync_all()?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| generic(format!("seed-write task panicked: {e}")))?
+    .map_err(|e| {
+        generic(format!(
+            "failed to write identity tmp {}: {e}",
+            tmp.display()
+        ))
+    })?;
+
+    tokio::fs::rename(tmp, final_path).await.map_err(|e| {
+        let tmp_for_cleanup = tmp.to_path_buf();
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_file(tmp_for_cleanup).await;
+        });
+        generic(format!(
+            "rename identity tmp {} -> {}: {e}",
+            tmp.display(),
+            final_path.display()
+        ))
+    })?;
+    Ok(())
 }
 
 #[cfg(unix)]
