@@ -1,0 +1,34 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_17_MESHOS_SDKS.md
+  s_ac2931afe38c4a::t_f1166e3165bff5 464
+net/crates/net/bindings/python/tests/test_deck.py
+  s_ac2931afe38c4a::t_fd640ee5ee6a9a 88-120
+net/crates/net/bindings/node/src/meshos.rs
+  s_ac2931afe38c4a::t_4be635d7b8c355 386
+net/crates/net/bindings/node/src/deck.rs
+  s_ac2931afe38c4a::t_6df940c4cafb11 45-47
+  s_ac2931afe38c4a::t_fe432cb65ca660 515-518,522-528,533-586,618
+net/crates/net/bindings/node/test/deck.test.ts
+  s_ac2931afe38c4a::t_383ed5826ef7d1 95-126
+net/crates/net/bindings/python/src/deck.rs
+  s_ac2931afe38c4a::t_4cc6b6152ba217 537-540,545-550,555-624,663
+  s_ac2931afe38c4a::t_8360f48486e4be 51
+  s_ac2931afe38c4a::t_249797df9d6cf3 52,56
+net/crates/net/bindings/python/src/meshos.rs
+  s_ac2931afe38c4a::t_5c58e23cb71951 264
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "1c914f9de6658f0352436700eb0d5bcbe529d822",
+  "prompts": {},
+  "sessions": {
+    "s_ac2931afe38c4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59271d48-d72a-4337-b857-962412f18343",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
