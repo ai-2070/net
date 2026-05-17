@@ -246,6 +246,7 @@ void net_free_string(char* s);
 
 /* Opaque handle types */
 typedef struct net_redex_s           net_redex_t;
+typedef struct net_netdb_s           net_netdb_t;
 typedef struct net_redex_file_s      net_redex_file_t;
 typedef struct net_redex_tail_s      net_redex_tail_t;
 typedef struct net_tasks_adapter_s   net_tasks_adapter_t;
@@ -335,6 +336,34 @@ int  net_memories_snapshot_and_watch(net_memories_adapter_t* handle,
 int  net_memories_watch_next(net_memories_watch_t* cursor, uint32_t timeout_ms,
                              char** out_json, size_t* out_len);
 void net_memories_watch_free(net_memories_watch_t* cursor);
+
+/* ---- NetDb (cross-adapter bundle) ----
+ *
+ * Composes Tasks + Memories over a single Redex behind one handle.
+ *
+ * Open shape — `config_json`:
+ *   { "origin_hash": <u64>, "persistent": <bool>,
+ *     "with_tasks": <bool>, "with_memories": <bool> }
+ *
+ * Snapshot wire format is the postcard encoding of `NetDbSnapshot`. Bundles
+ * captured here round-trip with the Rust, napi, and PyO3 surfaces.
+ *
+ * `net_netdb_tasks` / `net_netdb_memories` hand out independent Arc-cloned
+ * adapter handles — freeing them does NOT close the underlying adapter, and
+ * the NetDb itself can be freed before the adapter clones. Errors collapse
+ * to `NET_ERR_NETDB`. */
+int  net_netdb_open(net_redex_t* redex, const char* config_json,
+                    net_netdb_t** out_handle);
+int  net_netdb_open_from_snapshot(net_redex_t* redex, const char* config_json,
+                                  const uint8_t* bundle, size_t bundle_len,
+                                  net_netdb_t** out_handle);
+int  net_netdb_snapshot(net_netdb_t* handle,
+                        uint8_t** out_bytes, size_t* out_len);
+void net_netdb_free_bundle(uint8_t* bytes, size_t len);
+int  net_netdb_tasks(net_netdb_t* handle, net_tasks_adapter_t** out_handle);
+int  net_netdb_memories(net_netdb_t* handle, net_memories_adapter_t** out_handle);
+int  net_netdb_close(net_netdb_t* handle);
+void net_netdb_free(net_netdb_t* handle);
 
 /* =========================================================================
  * Redis Streams consumer-side dedup helper (`redis` feature).
