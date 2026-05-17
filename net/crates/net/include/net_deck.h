@@ -91,9 +91,13 @@
  * `net_deck_last_error_kind`.
  *
  * Panics from substrate calls are trapped by `catch_unwind` at
- * every FFI entry point; instead of unwinding across the C ABI
- * (UB), the call returns the appropriate error status and
- * populates the last-error pair with kind `"runtime_panic"`.
+ * every FFI entry point that calls into the substrate; instead
+ * of unwinding across the C ABI (UB), the call returns the
+ * appropriate error status and populates the last-error pair
+ * with kind `"runtime_panic"`. Trivial setters / getters that
+ * only tag a pointer and assign a field skip the trap — they
+ * have no panic surface, so wrapping would only add `catch_unwind`
+ * overhead.
  *
  * # Threading
  *

@@ -691,7 +691,7 @@ pub extern "C" fn net_meshos_sdk_shutdown(sdk: *mut NetMeshOsSdk) -> c_int {
             return NET_MESHOS_ERR_NULL;
         };
         clear_last_error_inner();
-        let inner = match sdk_ref.inner.lock().unwrap().take() {
+        let inner = match sdk_ref.inner.lock().unwrap_or_else(|e| e.into_inner()).take() {
             Some(s) => s,
             None => {
                 set_last_error("already_shutdown", "MeshOsDaemonSdk was already shut down");
@@ -717,7 +717,7 @@ pub extern "C" fn net_meshos_sdk_dropped_control_events(sdk: *mut NetMeshOsSdk) 
         let Some(sdk_ref) = (unsafe { sdk.as_ref() }) else {
             return u64::MAX;
         };
-        let guard = sdk_ref.inner.lock().unwrap();
+        let guard = sdk_ref.inner.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(s) => s.dropped_control_events(),
             None => u64::MAX,
@@ -773,7 +773,7 @@ pub extern "C" fn net_meshos_register_daemon(
         clear_last_error_inner();
         let keypair = EntityKeypair::from_bytes(seed);
         let daemon = Box::new(NoopDaemon { name: name.clone() });
-        let guard = sdk_ref.inner.lock().unwrap();
+        let guard = sdk_ref.inner.lock().unwrap_or_else(|e| e.into_inner());
         let sdk_inner = match guard.as_ref() {
             Some(s) => s,
             None => {
@@ -873,7 +873,7 @@ pub extern "C" fn net_meshos_register_daemon_with_vtable(
             vtable,
             user_ctx: UserCtx(user_ctx),
         });
-        let guard = sdk_ref.inner.lock().unwrap();
+        let guard = sdk_ref.inner.lock().unwrap_or_else(|e| e.into_inner());
         let sdk_inner = match guard.as_ref() {
             Some(s) => s,
             None => {
@@ -960,7 +960,7 @@ pub extern "C" fn net_meshos_try_next_control(
             return NET_MESHOS_ERR_INVALID_ARG;
         }
         clear_last_error_inner();
-        let mut guard = h_ref.inner.lock().unwrap();
+        let mut guard = h_ref.inner.lock().unwrap_or_else(|e| e.into_inner());
         let h = match guard.as_mut() {
             Some(h) => h,
             None => {
@@ -1000,7 +1000,7 @@ pub extern "C" fn net_meshos_next_control(
         }
         clear_last_error_inner();
         let ev = {
-            let mut guard = h_ref.inner.lock().unwrap();
+            let mut guard = h_ref.inner.lock().unwrap_or_else(|e| e.into_inner());
             let h = match guard.as_mut() {
                 Some(h) => h,
                 None => {
@@ -1069,7 +1069,7 @@ pub extern "C" fn net_meshos_publish_log(
             }
         };
         clear_last_error_inner();
-        let guard = h_ref.inner.lock().unwrap();
+        let guard = h_ref.inner.lock().unwrap_or_else(|e| e.into_inner());
         let h = match guard.as_ref() {
             Some(h) => h,
             None => {
@@ -1110,7 +1110,7 @@ pub extern "C" fn net_meshos_graceful_shutdown(
             set_last_error("invalid_argument", "handle pointer is NULL");
             return NET_MESHOS_ERR_NULL;
         };
-        let inner = match h_ref.inner.lock().unwrap().take() {
+        let inner = match h_ref.inner.lock().unwrap_or_else(|e| e.into_inner()).take() {
             Some(h) => h,
             None => {
                 set_last_error("already_shutdown", "daemon handle was already consumed");
@@ -1243,7 +1243,7 @@ pub extern "C" fn net_meshos_metadata(handle: *const NetMeshOsHandle) -> *mut c_
             set_last_error("invalid_argument", "handle pointer is NULL");
             return ptr::null_mut();
         };
-        let guard = h_ref.inner.lock().unwrap();
+        let guard = h_ref.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(inner) = guard.as_ref() else {
             set_last_error("already_shutdown", "daemon handle was already consumed");
             return ptr::null_mut();
@@ -1271,7 +1271,7 @@ pub extern "C" fn net_meshos_refresh_metadata(handle: *mut NetMeshOsHandle) -> *
             set_last_error("invalid_argument", "handle pointer is NULL");
             return ptr::null_mut();
         };
-        let mut guard = h_ref.inner.lock().unwrap();
+        let mut guard = h_ref.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(inner) = guard.as_mut() else {
             set_last_error("already_shutdown", "daemon handle was already consumed");
             return ptr::null_mut();
@@ -1324,7 +1324,7 @@ pub extern "C" fn net_meshos_publish_capabilities(
             set_last_error("invalid_argument", "handle pointer is NULL");
             return NET_MESHOS_ERR_NULL;
         };
-        let guard = h_ref.inner.lock().unwrap();
+        let guard = h_ref.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(inner) = guard.as_ref() else {
             set_last_error("already_shutdown", "daemon handle was already consumed");
             return NET_MESHOS_ERR_ALREADY_SHUTDOWN;
@@ -1571,7 +1571,7 @@ mod tests {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if payload_len > 0 {
             let slice = unsafe { std::slice::from_raw_parts(payload_ptr, payload_len) };
-            *state.last_payload.lock().unwrap() = slice.to_vec();
+            *state.last_payload.lock().unwrap_or_else(|e| e.into_inner()) = slice.to_vec();
         }
         // Emit two echo outputs so we can verify multi-emit works.
         let out1 = b"out1";
@@ -1677,7 +1677,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
-        assert_eq!(*state.last_payload.lock().unwrap(), b"hello");
+        assert_eq!(*state.last_payload.lock().unwrap_or_else(|e| e.into_inner()), b"hello");
 
         let snap = MeshDaemon::snapshot(&bridge).expect("snapshot returned");
         assert_eq!(snap.as_ref(), b"snapshot-v1");

@@ -1423,6 +1423,13 @@ pub extern "C" fn net_deck_audit_query_free(query: *mut NetDeckAuditQuery) {
     }
 }
 
+// The audit-query setters clear the thread-local last-error pair on
+// success so a successful setter doesn't leave a stale `kind` from
+// an earlier unrelated failure visible to the caller's next
+// `net_deck_last_error_kind()` read. They're not wrapped in
+// `ffi_guard!` because the body is pure pointer-tag-and-assign with
+// no panic surface.
+
 #[no_mangle]
 pub extern "C" fn net_deck_audit_query_recent(
     query: *mut NetDeckAuditQuery,
@@ -1432,6 +1439,7 @@ pub extern "C" fn net_deck_audit_query_recent(
         return NET_DECK_ERR_NULL;
     };
     q.recent_limit = Some(limit);
+    clear_last_error_inner();
     NET_DECK_OK
 }
 
@@ -1444,6 +1452,7 @@ pub extern "C" fn net_deck_audit_query_by_operator(
         return NET_DECK_ERR_NULL;
     };
     q.by_operator = Some(operator_id);
+    clear_last_error_inner();
     NET_DECK_OK
 }
 
@@ -1457,6 +1466,7 @@ pub extern "C" fn net_deck_audit_query_between(
         return NET_DECK_ERR_NULL;
     };
     q.between = Some((start_ms, end_ms));
+    clear_last_error_inner();
     NET_DECK_OK
 }
 
@@ -1466,6 +1476,7 @@ pub extern "C" fn net_deck_audit_query_force_only(query: *mut NetDeckAuditQuery)
         return NET_DECK_ERR_NULL;
     };
     q.force_only = true;
+    clear_last_error_inner();
     NET_DECK_OK
 }
 
@@ -1475,6 +1486,7 @@ pub extern "C" fn net_deck_audit_query_since(query: *mut NetDeckAuditQuery, seq:
         return NET_DECK_ERR_NULL;
     };
     q.since = Some(seq);
+    clear_last_error_inner();
     NET_DECK_OK
 }
 
