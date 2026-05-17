@@ -1,0 +1,21 @@
+go/meshdb.go
+  s_b3022192a92c59::t_e0a12cf759e452 1-326
+go/meshdb_test.go
+  s_b3022192a92c59::t_6d0c94360137cb 1-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "b199e710ae4595059eda99b82bf4492617f8da89",
+  "prompts": {},
+  "sessions": {
+    "s_b3022192a92c59": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d594c56e-1353-4a07-aa91-e09d2c583c0f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
