@@ -635,7 +635,14 @@ async fn run_restore(
         .map_err(|e| sdk(format!("netdb restore: {e}")))?;
     let info = RestoreResult {
         path: dest.display().to_string(),
-        bytes_restored: bytes.len() as u64,
+        // `bytes_read` reflects the on-disk postcard envelope
+        // length, which is what we actually loaded from `--from`.
+        // Pre-fix this field was named `bytes_restored`, which
+        // implied "bytes folded into state" - misleading
+        // telemetry on a destructive command. Renamed to make
+        // the semantic accurate; per-adapter `last_seq` for
+        // "what landed" is tracked separately via the substrate.
+        bytes_read: bytes.len() as u64,
     };
     let r = emit_value(OutputFormat::resolve_oneshot(output), &info)
         .map_err(|e| generic(format!("write restore result: {e}")));
@@ -706,7 +713,7 @@ struct MutationResult {
 #[derive(Serialize)]
 struct RestoreResult {
     path: String,
-    bytes_restored: u64,
+    bytes_read: u64,
 }
 
 async fn run_tasks_ls(
