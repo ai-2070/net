@@ -279,14 +279,21 @@ impl<State> CortexAdapter<State> {
     /// through `seq` (applied successfully OR skipped via
     /// `recoverable_decode` under `Stop` policy), or until the
     /// fold task stops (e.g. close, non-recoverable fold error
-    /// under `Stop`). Returning after the task has stopped is
-    /// correct behavior — callers should re-check
-    /// [`Self::is_running`] if they need to distinguish.
+    /// under `Stop`).
+    ///
+    /// Returns `Ok(())` when the folded watermark reaches `seq`,
+    /// or `Err(folded)` where `folded` is the highest seq processed
+    /// before the fold task stopped (`None` if it stopped without
+    /// processing anything). Pre-fix this returned `()` for both
+    /// outcomes, so a caller waiting on a seq the fold task never
+    /// reached (close, Stop-policy halt, retention-evicted tail
+    /// lag) silently observed stale state. Mirrors
+    /// [`Self::wait_for_applied_seq`]'s shape.
     ///
     /// Use pattern:
     /// ```ignore
     /// let seq = adapter.ingest(envelope)?;
-    /// adapter.wait_for_seq(seq).await;
+    /// adapter.wait_for_seq(seq).await?;
     /// let state = adapter.state().read();
     /// // state reflects the ingest, UNLESS the event at `seq`
     /// // was skipped via recoverable_decode under `Stop`.
@@ -301,7 +308,7 @@ impl<State> CortexAdapter<State> {
     /// If you need to confirm `state` actually reflects the
     /// ingest at `seq`, follow up with
     /// `adapter.applied_through_seq() >= Some(seq)`.
-    pub async fn wait_for_seq(&self, seq: u64) {
+    pub async fn wait_for_seq(&self, seq: u64) -> Result<(), Option<u64>> {
         // Any seq strictly below `start_seq` is conceptually behind
         // us — those events were applied before we opened the
         // adapter (or are explicitly past the LiveOnly cutoff).
@@ -312,7 +319,7 @@ impl<State> CortexAdapter<State> {
         // freshly-created log: `seq < start_seq` is false, but the
         // sentinel check below correctly waits for the first event.
         if seq < self.inner.start_seq {
-            return;
+            return Ok(());
         }
         loop {
             let notified = self.inner.notify.notified();
@@ -325,10 +332,10 @@ impl<State> CortexAdapter<State> {
             // after the sentinel check returns exactly when seq has
             // been applied.
             if watermark != u64::MAX && watermark >= seq {
-                return;
+                return Ok(());
             }
             if !self.inner.running.load(Ordering::Acquire) {
-                return;
+                return Err(self.folded_through_seq());
             }
             notified.await;
         }
@@ -1205,7 +1212,7 @@ mod tests {
                 let meta = EventMeta::new(1, 0, 1, i, 0);
                 let env = EventEnvelope::new(meta, Bytes::from_static(b""));
                 let seq = pre.ingest(env).unwrap();
-                pre.wait_for_seq(seq).await;
+                pre.wait_for_seq(seq).await.unwrap();
             }
             let (b, ls) = pre.snapshot().unwrap();
             bytes = b;
@@ -1239,7 +1246,8 @@ mod tests {
                      short-circuit regressed",
                         seq
                     )
-                });
+                })
+                .expect("wait_for_seq must Ok-return when seq < start_seq");
         }
     }
 
@@ -1260,7 +1268,7 @@ mod tests {
             let meta = EventMeta::new(1, 0, 1, i, 0);
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             let seq = adapter.ingest(env).unwrap();
-            adapter.wait_for_seq(seq).await;
+            adapter.wait_for_seq(seq).await.unwrap();
         }
 
         assert_eq!(*adapter.state().read(), 10);
@@ -1518,9 +1526,18 @@ mod tests {
             adapter.ingest(env).unwrap();
         }
 
-        // Wait until fold task stops. wait_for_seq returns on stop
-        // even if the seq isn't reached.
-        adapter.wait_for_seq(10).await;
+        // Wait until fold task stops. wait_for_seq surfaces the
+        // halt as Err(Some(folded_through)) — pre-fix it returned
+        // silently and the caller had no way to distinguish a
+        // halt from a successful fold-through.
+        let folded = adapter
+            .wait_for_seq(10)
+            .await
+            .expect_err("Stop policy must surface the halt to wait_for_seq");
+        // Seqs 0..=2 folded; seq 3 errored; the watermark caps at
+        // 2 under Stop+non-recoverable so `folded_through` reflects
+        // the successful prefix.
+        assert_eq!(folded, Some(2));
         assert!(!adapter.is_running());
         assert_eq!(adapter.fold_errors(), 1);
         // Seqs 0..=2 folded; seq 3 errored; seqs 4..=9 never folded.
@@ -1564,8 +1581,9 @@ mod tests {
             adapter.ingest(env).unwrap();
         }
 
-        // Wait for halt.
-        adapter.wait_for_seq(10).await;
+        // Wait for halt. wait_for_seq now surfaces the halt as
+        // `Err(Some(folded))` rather than silently returning.
+        let _ = adapter.wait_for_seq(10).await.expect_err("Stop policy halt");
         assert!(!adapter.is_running(), "Stop policy must halt the task");
         assert_eq!(adapter.fold_errors(), 1);
 
@@ -1625,7 +1643,7 @@ mod tests {
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             adapter.ingest(env).unwrap();
         }
-        adapter.wait_for_seq(5).await;
+        adapter.wait_for_seq(5).await.unwrap();
 
         // Live consumer didn't deadlock — folded reached the tail.
         assert_eq!(
@@ -1686,7 +1704,7 @@ mod tests {
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             adapter.ingest(env).unwrap();
         }
-        adapter.wait_for_seq(2).await;
+        adapter.wait_for_seq(2).await.unwrap();
 
         assert_eq!(adapter.folded_through_seq(), Some(2));
         assert_eq!(
@@ -1728,7 +1746,7 @@ mod tests {
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             adapter.ingest(env).unwrap();
         }
-        adapter.wait_for_seq(7).await;
+        adapter.wait_for_seq(7).await.unwrap();
 
         let folded = adapter.folded_through_seq();
         let applied = adapter.applied_through_seq();
@@ -1777,7 +1795,7 @@ mod tests {
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             adapter.ingest(env).unwrap();
         }
-        adapter.wait_for_seq(4).await;
+        adapter.wait_for_seq(4).await.unwrap();
 
         assert_eq!(adapter.folded_through_seq(), Some(4));
         assert_eq!(
@@ -1833,7 +1851,7 @@ mod tests {
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             adapter.ingest(env).unwrap();
         }
-        adapter.wait_for_seq(4).await;
+        adapter.wait_for_seq(4).await.unwrap();
 
         // Pre-snapshot state: STRICT-PREFIX applied caps at 1
         // (seq 2 was skipped; the prefix breaks there). Folded
@@ -1871,7 +1889,7 @@ mod tests {
         )
         .unwrap();
 
-        restored.wait_for_seq(4).await;
+        restored.wait_for_seq(4).await.unwrap();
 
         // Pre-fix this assertion would FAIL: snapshot would have
         // returned Some(4) (folded), restore would tail from
@@ -1941,7 +1959,8 @@ mod tests {
         // regresses with an indefinite hang.)
         tokio::time::timeout(std::time::Duration::from_secs(2), adapter.wait_for_seq(seq))
             .await
-            .expect("wait_for_seq must return promptly even for a recoverable-decode-skipped seq");
+            .expect("wait_for_seq must return promptly even for a recoverable-decode-skipped seq")
+            .expect("recoverable-decode skip still advances the folded watermark");
 
         // Confirm what was actually observable at return:
         // folded reached seq, applied did not.
@@ -2046,7 +2065,7 @@ mod tests {
             let meta = EventMeta::new(0, 0, 0, i, 0);
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             let seq = adapter.ingest(env).unwrap();
-            adapter.wait_for_seq(seq).await;
+            adapter.wait_for_seq(seq).await.unwrap();
         }
 
         // Fold task is still running — the decode error didn't
@@ -2136,7 +2155,7 @@ mod tests {
             let meta = EventMeta::new(0, 0, 0, i, 0);
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             let seq = adapter.ingest(env).unwrap();
-            adapter.wait_for_seq(seq).await;
+            adapter.wait_for_seq(seq).await.unwrap();
         }
 
         // First poll should see a Lagged event (the broadcast channel
@@ -2216,7 +2235,8 @@ mod tests {
             adapter.wait_for_seq(49),
         )
         .await
-        .expect("wait_for_seq(49) timed out — tail-Lagged recovery regressed");
+        .expect("wait_for_seq(49) timed out — tail-Lagged recovery regressed")
+        .expect("fold task must remain alive through Lagged recovery");
 
         assert_eq!(*adapter.state().read(), 50);
         assert!(
@@ -2252,7 +2272,7 @@ mod tests {
             let meta = EventMeta::new(0, 0, 0, i, 0);
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             let seq = adapter.ingest(env).unwrap();
-            adapter.wait_for_seq(seq).await;
+            adapter.wait_for_seq(seq).await.unwrap();
         }
 
         // Drain everything we can from the stream. Item type is `u64`
@@ -2289,7 +2309,7 @@ mod tests {
             let meta = EventMeta::new(0, 0, 0, i, 0);
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             let seq = adapter.ingest(env).unwrap();
-            adapter.wait_for_seq(seq).await;
+            adapter.wait_for_seq(seq).await.unwrap();
         }
 
         assert!(adapter.is_running());

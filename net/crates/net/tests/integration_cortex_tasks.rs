@@ -37,7 +37,7 @@ async fn test_full_task_lifecycle() {
     let _ = tasks.create(2, "ship adapter", t0 + 1).unwrap();
     let _ = tasks.rename(1, "write better docs", t0 + 2).unwrap();
     let seq = tasks.complete(2, t0 + 3).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     let state = tasks.state();
     let guard = state.read();
@@ -65,7 +65,7 @@ async fn test_delete_removes_task() {
 
     tasks.create(1, "temp", 100).unwrap();
     let seq = tasks.delete(1).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     let state = tasks.state();
     let guard = state.read();
@@ -80,7 +80,7 @@ async fn test_rename_on_unknown_id_is_noop() {
 
     // Rename before create — fold silently drops (log is the truth).
     let seq = tasks.rename(42, "ghost", 100).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     let state = tasks.state();
     let guard = state.read();
@@ -93,7 +93,7 @@ async fn test_complete_on_unknown_id_is_noop() {
     let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let seq = tasks.complete(99, 100).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     let state = tasks.state();
     let guard = state.read();
@@ -111,7 +111,7 @@ async fn test_replay_after_close_reconstructs_state() {
         tasks.create(2, "b", 101).unwrap();
         tasks.complete(1, 102).unwrap();
         let seq = tasks.rename(2, "b-renamed", 103).unwrap();
-        tasks.wait_for_seq(seq).await;
+        tasks.wait_for_seq(seq).await.unwrap();
         tasks.close().unwrap();
     }
 
@@ -119,7 +119,7 @@ async fn test_replay_after_close_reconstructs_state() {
     // the adapter doesn't drop the file), so reopen replays.
     let tasks2 = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
     // 4 events were appended → wait for fold to catch up.
-    tasks2.wait_for_seq(3).await;
+    tasks2.wait_for_seq(3).await.unwrap();
 
     let state = tasks2.state();
     let guard = state.read();
@@ -141,8 +141,8 @@ async fn test_multi_producer_same_file_different_origins() {
 
     a.create(1, "from-a", 100).unwrap();
     let seq = b.create(2, "from-b", 101).unwrap();
-    a.wait_for_seq(seq).await;
-    b.wait_for_seq(seq).await;
+    a.wait_for_seq(seq).await.unwrap();
+    b.wait_for_seq(seq).await.unwrap();
 
     let state_a = a.state();
     let state_b = b.state();
@@ -165,7 +165,7 @@ async fn test_pending_and_completed_queries() {
         tasks.complete(i, 200 + i).unwrap();
     }
     let last = tasks.complete(10, 9999).unwrap(); // idempotent-ish; refreshes updated_ns
-    tasks.wait_for_seq(last).await;
+    tasks.wait_for_seq(last).await.unwrap();
 
     let state = tasks.state();
     let guard = state.read();
@@ -198,7 +198,7 @@ async fn test_query_through_live_adapter() {
     tasks.complete(2, 2500).unwrap();
     tasks.complete(4, 4500).unwrap();
     let last = tasks.rename(5, "EPSILON", 5500).unwrap();
-    tasks.wait_for_seq(last).await;
+    tasks.wait_for_seq(last).await.unwrap();
 
     let state = tasks.state();
     let guard = state.read();
@@ -271,7 +271,7 @@ async fn time_filter_cutoff_is_inclusive() {
     tasks.create(1, "before", 1000).unwrap();
     tasks.create(2, "at-cutoff", 2000).unwrap();
     let last = tasks.create(3, "after", 3000).unwrap();
-    tasks.wait_for_seq(last).await;
+    tasks.wait_for_seq(last).await.unwrap();
 
     let state = tasks.state();
     let guard = state.read();
@@ -320,7 +320,7 @@ async fn test_watch_initial_emission() {
     tasks.create(1, "a", 100).unwrap();
     tasks.create(2, "b", 200).unwrap();
     let seq = tasks.complete(2, 250).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     let mut stream = Box::pin(
         tasks
@@ -385,7 +385,7 @@ async fn test_watch_dedupes_unchanged_results() {
     tasks.create(1, "p", 100).unwrap();
     tasks.create(2, "c", 200).unwrap();
     let seq = tasks.complete(2, 250).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     let mut stream = Box::pin(tasks.watch().where_status(TaskStatus::Pending).stream());
     let initial = stream.next().await.unwrap();
@@ -396,7 +396,7 @@ async fn test_watch_dedupes_unchanged_results() {
     //   - rename on completed id 2 (still completed, filter unaffected)
     tasks.complete(2, 9999).unwrap();
     let seq = tasks.rename(2, "c-renamed", 9999).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     // No duplicate should have fired. Assert the next emission only
     // comes after we do something that DOES change Pending set.
@@ -543,7 +543,7 @@ async fn test_regression_fold_rejects_checksum_mismatch() {
         .ingest(EventEnvelope::new(wrong_meta, Bytes::from(tail)))
         .unwrap();
 
-    adapter.wait_for_seq(seq).await;
+    adapter.wait_for_seq(seq).await.unwrap();
 
     // Post-#141: the fold task is STILL running — Decode-class
     // errors are recoverable per-event failures, not stream-fatal.
@@ -593,14 +593,14 @@ async fn test_regression_open_from_snapshot_bumps_app_seq_past_replayed_events()
     // Events 0, 1 — pre-snapshot.
     tasks.create(1, "a", 100).unwrap();
     let seq1 = tasks.create(2, "b", 200).unwrap();
-    tasks.wait_for_seq(seq1).await;
+    tasks.wait_for_seq(seq1).await.unwrap();
     let (state_bytes, last_seq) = tasks.snapshot().unwrap();
     assert_eq!(last_seq, Some(1), "snapshot must capture seqs 0..=1");
 
     // Events 2, 3 — post-snapshot (still folding on the live adapter).
     tasks.create(3, "c", 300).unwrap();
     let seq3 = tasks.create(4, "d", 400).unwrap();
-    tasks.wait_for_seq(seq3).await;
+    tasks.wait_for_seq(seq3).await.unwrap();
     tasks.close().unwrap();
 
     // Restore on the SAME Redex so the file already contains seqs
@@ -614,7 +614,7 @@ async fn test_regression_open_from_snapshot_bumps_app_seq_past_replayed_events()
     // `seq_or_ts` must be 4 (continuing past the replayed events)
     // NOT 2 (which would collide with the replayed event at seq 2).
     let new_seq = restored.create(5, "e", 500).unwrap();
-    restored.wait_for_seq(new_seq).await;
+    restored.wait_for_seq(new_seq).await.unwrap();
 
     // Read the event we just ingested from the file and decode its
     // EventMeta to inspect `seq_or_ts`.
@@ -649,7 +649,7 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
     tasks.create(1, "a", 100).unwrap();
     tasks.create(2, "b", 200).unwrap();
     let seq = tasks.create(3, "c", 300).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     let (state_bytes, last_seq) = tasks.snapshot().unwrap();
     tasks.close().unwrap();
@@ -662,7 +662,7 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
 
     // Next ingest on the restored adapter.
     let new_seq = tasks2.create(4, "d", 400).unwrap();
-    tasks2.wait_for_seq(new_seq).await;
+    tasks2.wait_for_seq(new_seq).await.unwrap();
 
     // Read the raw RedEX event (seq 0 is the first ingest on the fresh
     // redex2 file — which is this post-restore create). Decode its
@@ -700,7 +700,7 @@ async fn test_open_returns_with_state_already_caught_up() {
         a.create(1, "first", 100).unwrap();
         a.create(2, "second", 200).unwrap();
         let seq = a.create(3, "third", 300).unwrap();
-        a.wait_for_seq(seq).await;
+        a.wait_for_seq(seq).await.unwrap();
         a.close().unwrap();
     }
 
@@ -746,7 +746,7 @@ async fn test_open_from_snapshot_with_empty_replay_tail_keeps_snapshot_app_seq()
     tasks.create(1, "a", 100).unwrap();
     tasks.create(2, "b", 200).unwrap();
     let seq = tasks.create(3, "c", 300).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     // Snapshot covers every event — replay tail will be empty.
     let (state_bytes, last_seq) = tasks.snapshot().unwrap();
@@ -761,7 +761,7 @@ async fn test_open_from_snapshot_with_empty_replay_tail_keeps_snapshot_app_seq()
     // Persisted app_seq was 3 (three pre-snapshot ingests). The first
     // post-restore ingest must stamp seq_or_ts = 3.
     let new_seq = restored.create(4, "d", 400).unwrap();
-    restored.wait_for_seq(new_seq).await;
+    restored.wait_for_seq(new_seq).await.unwrap();
 
     let file = redex2
         .open_file(
@@ -799,7 +799,7 @@ async fn test_regression_open_advances_app_seq_past_existing_same_origin_events(
         a.create(1, "first", 100).unwrap();
         a.create(2, "second", 200).unwrap();
         let seq = a.create(3, "third", 300).unwrap();
-        a.wait_for_seq(seq).await;
+        a.wait_for_seq(seq).await.unwrap();
         a.close().unwrap();
     }
 
@@ -808,7 +808,7 @@ async fn test_regression_open_advances_app_seq_past_existing_same_origin_events(
     // above).
     let b = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
     let new_seq = b.create(4, "fourth", 400).unwrap();
-    b.wait_for_seq(new_seq).await;
+    b.wait_for_seq(new_seq).await.unwrap();
 
     // Read the raw event. Its `seq_or_ts` must be 3 (continuing past
     // the replayed events), NOT 0 (which would duplicate the first
@@ -849,7 +849,7 @@ async fn test_regression_open_ignores_other_origins_when_advancing_app_seq() {
         b.create(10, "b1", 100).unwrap();
         b.create(11, "b2", 200).unwrap();
         let seq = b.create(12, "b3", 300).unwrap();
-        b.wait_for_seq(seq).await;
+        b.wait_for_seq(seq).await.unwrap();
         b.close().unwrap();
     }
 
@@ -858,7 +858,7 @@ async fn test_regression_open_ignores_other_origins_when_advancing_app_seq() {
     // `app_seq` stays at 0.
     let a = TasksAdapter::open(&redex, ORIGIN_A).await.unwrap();
     let new_seq = a.create(20, "a1", 400).unwrap();
-    a.wait_for_seq(new_seq).await;
+    a.wait_for_seq(new_seq).await.unwrap();
 
     let file = redex
         .open_file(
@@ -889,7 +889,7 @@ async fn test_regression_checksum_is_computed_not_zero() {
     let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let seq = tasks.create(42, "distinctive title", 12345).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     // Read the raw RedEX event for this append.
     let file = redex
@@ -933,7 +933,7 @@ async fn test_regression_watch_without_order_by_is_stable() {
     for id in 1..=N {
         last = tasks.create(id, format!("t-{}", id), id * 100).unwrap();
     }
-    tasks.wait_for_seq(last).await;
+    tasks.wait_for_seq(last).await.unwrap();
 
     // Open watch *without* order_by. The fix makes this default to
     // IdAsc under the hood.
@@ -957,7 +957,7 @@ async fn test_snapshot_and_restore_skips_replay() {
     tasks.create(2, "beta", 200).unwrap();
     tasks.complete(1, 150).unwrap();
     let seq = tasks.rename(2, "beta-v2", 250).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     let (bytes, last_seq) = tasks.snapshot().unwrap();
     assert_eq!(last_seq, Some(3)); // 4 events → seq 0..=3
@@ -987,7 +987,7 @@ async fn test_snapshot_and_restore_skips_replay() {
     // tails FromSeq(4).
     let seq = tasks2.create(3, "gamma", 300).unwrap();
     assert_eq!(seq, 4);
-    tasks2.wait_for_seq(seq).await;
+    tasks2.wait_for_seq(seq).await.unwrap();
     assert_eq!(tasks2.state().read().len(), 3);
 }
 
@@ -1035,7 +1035,7 @@ async fn test_persistent_tasks_recover_across_processes() {
         tasks.create(1, "durable", 100).unwrap();
         tasks.create(2, "also durable", 101).unwrap();
         let seq = tasks.complete(1, 102).unwrap();
-        tasks.wait_for_seq(seq).await;
+        tasks.wait_for_seq(seq).await.unwrap();
         tasks.close().unwrap();
     }
 
@@ -1044,7 +1044,7 @@ async fn test_persistent_tasks_recover_across_processes() {
     let tasks2 = TasksAdapter::open_with_config(&redex2, ORIGIN, cfg)
         .await
         .unwrap();
-    tasks2.wait_for_seq(2).await;
+    tasks2.wait_for_seq(2).await.unwrap();
 
     let state = tasks2.state();
     let guard = state.read();
@@ -1071,7 +1071,7 @@ async fn test_snapshot_and_watch_snapshot_reflects_current_state() {
     tasks.create(1, "p1", 100).unwrap();
     tasks.create(2, "c1", 200).unwrap();
     let seq = tasks.complete(2, 250).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     let watcher = tasks.watch().where_status(TaskStatus::Pending);
     let (snapshot, _stream) = tasks.snapshot_and_watch(watcher);
@@ -1100,7 +1100,7 @@ async fn test_regression_snapshot_and_watch_delivers_post_call_updates() {
     let redex = Redex::new();
     let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
     let seq = tasks.create(1, "seed", 100).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     let watcher = tasks.watch();
     let (initial, mut stream) = tasks.snapshot_and_watch(watcher);
@@ -1112,7 +1112,7 @@ async fn test_regression_snapshot_and_watch_delivers_post_call_updates() {
     // path), but having it as a baseline guards against any future
     // over-eager filtering that also drops legitimate deltas.
     let seq = tasks.create(2, "post", 200).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     let observed = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
         .await
@@ -1142,12 +1142,12 @@ async fn test_regression_snapshot_and_watch_forwards_divergent_stream_initial() 
         let redex = Redex::new();
         let tasks = std::sync::Arc::new(TasksAdapter::open(&redex, ORIGIN).await.unwrap());
         let seq = tasks.create(1, "seed", 100).unwrap();
-        tasks.wait_for_seq(seq).await;
+        tasks.wait_for_seq(seq).await.unwrap();
 
         let tasks_m = tasks.clone();
         let mutator = tokio::spawn(async move {
             let seq = tasks_m.create(2, "race", 200).unwrap();
-            tasks_m.wait_for_seq(seq).await;
+            tasks_m.wait_for_seq(seq).await.unwrap();
         });
 
         let watcher = tasks.watch();
@@ -1201,7 +1201,7 @@ async fn poll_for_token_synchronous_non_blocking_check() {
     let token = WriteToken::new(ORIGIN, seq);
 
     // Wait for the fold to apply through `seq` so poll can succeed.
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
     tasks
         .poll_for_token(token)
         .expect("poll must succeed once seq applied");

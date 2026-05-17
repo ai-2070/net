@@ -57,7 +57,7 @@ async fn test_netdb_crud_through_tasks_handle() {
     tasks.create(1, "write plan", 100).unwrap();
     tasks.create(2, "ship adapter", 200).unwrap();
     let seq = tasks.complete(1, 150).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     let state = tasks.state();
     let guard = state.read();
@@ -83,7 +83,7 @@ async fn test_netdb_find_many_on_tasks_state() {
         db.tasks().complete(i, 1000 + i).unwrap();
     }
     let last = db.tasks().complete(10, 9999).unwrap();
-    db.tasks().wait_for_seq(last).await;
+    db.tasks().wait_for_seq(last).await.unwrap();
 
     let state = db.tasks().state();
     let guard = state.read();
@@ -149,7 +149,7 @@ async fn test_netdb_find_many_on_memories_state() {
         )
         .unwrap();
     let seq = db.memories().pin(1, 310).unwrap();
-    db.memories().wait_for_seq(seq).await;
+    db.memories().wait_for_seq(seq).await.unwrap();
 
     let state = db.memories().state();
     let guard = state.read();
@@ -214,8 +214,8 @@ async fn test_netdb_whole_snapshot_and_restore() {
             .unwrap();
         let m_seq = db.memories().pin(1, 110).unwrap();
 
-        db.tasks().wait_for_seq(t_seq).await;
-        db.memories().wait_for_seq(m_seq).await;
+        db.tasks().wait_for_seq(t_seq).await.unwrap();
+        db.memories().wait_for_seq(m_seq).await.unwrap();
 
         let snapshot = db.snapshot().unwrap();
         assert!(snapshot.tasks.is_some());
@@ -345,8 +345,8 @@ async fn test_regression_dual_model_alternating_ingests_do_not_produce_duplicate
         .pin(1, 150)
         .expect("dual-model ingest must not surface phantom-duplicate app_seq");
 
-    db.tasks().wait_for_seq(t_seq).await;
-    db.memories().wait_for_seq(m_seq).await;
+    db.tasks().wait_for_seq(t_seq).await.unwrap();
+    db.memories().wait_for_seq(m_seq).await.unwrap();
 
     assert_eq!(db.tasks().count(), 1);
     assert_eq!(db.memories().count(), 1);
@@ -407,7 +407,7 @@ async fn test_regression_concurrent_ingest_into_single_tasks_adapter_succeeds() 
     // Wait for the fold to apply every event so `count()` is
     // authoritative.
     let max_seq = *seqs.iter().max().unwrap();
-    db.tasks().wait_for_seq(max_seq).await;
+    db.tasks().wait_for_seq(max_seq).await.unwrap();
 
     assert_eq!(
         db.tasks().count(),
@@ -445,8 +445,8 @@ async fn test_regression_dual_model_stress_no_phantom_duplicate_app_seq() {
     // watermarks must converge.
     let t_last = db.tasks().complete(N, 999).unwrap();
     let m_last = db.memories().pin(N, 999).unwrap();
-    db.tasks().wait_for_seq(t_last).await;
-    db.memories().wait_for_seq(m_last).await;
+    db.tasks().wait_for_seq(t_last).await.unwrap();
+    db.memories().wait_for_seq(m_last).await.unwrap();
 
     assert_eq!(db.tasks().count(), N as usize);
     assert_eq!(db.memories().count(), N as usize);
@@ -503,7 +503,7 @@ async fn test_regression_build_from_snapshot_error_path_is_clean() {
     // Smoke ingest to prove the fresh handle is functional after a
     // prior failed build in the same test scope.
     let seq = db.tasks().create(1, "t", 100).unwrap();
-    db.tasks().wait_for_seq(seq).await;
+    db.tasks().wait_for_seq(seq).await.unwrap();
     assert_eq!(db.tasks().state().read().len(), 1);
     db.close().unwrap();
 }

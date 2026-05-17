@@ -106,7 +106,7 @@ fn bench_fold_barrier(c: &mut Criterion) {
         b.iter(|| {
             id = id.wrapping_add(1);
             let seq = tasks.create(id, "t", 0).unwrap();
-            runtime.block_on(tasks.wait_for_seq(seq));
+            runtime.block_on(tasks.wait_for_seq(seq)).unwrap();
         });
     });
 
@@ -125,7 +125,7 @@ fn bench_fold_barrier(c: &mut Criterion) {
             let seq = memories
                 .store(id, "content", tags.clone(), "source", 0)
                 .unwrap();
-            runtime.block_on(memories.wait_for_seq(seq));
+            runtime.block_on(memories.wait_for_seq(seq)).unwrap();
         });
     });
 
@@ -151,7 +151,7 @@ fn populated_tasks(runtime: &Runtime, n: usize) -> TasksAdapter {
             last_seq = tasks.complete(id, i as u64).unwrap();
         }
     }
-    runtime.block_on(tasks.wait_for_seq(last_seq));
+    runtime.block_on(tasks.wait_for_seq(last_seq)).unwrap();
     tasks
 }
 
@@ -175,7 +175,7 @@ fn populated_memories(runtime: &Runtime, n: usize) -> MemoriesAdapter {
             .store(id, format!("content-{}", i), tags, "src", i as u64)
             .unwrap();
     }
-    runtime.block_on(memories.wait_for_seq(last_seq));
+    runtime.block_on(memories.wait_for_seq(last_seq)).unwrap();
     memories
 }
 

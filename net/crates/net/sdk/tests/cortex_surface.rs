@@ -28,8 +28,8 @@ async fn netdb_builder_bundles_both_adapters() {
         .memories()
         .store(1, "hello", Vec::<String>::new(), "alice", 100)
         .unwrap();
-    db.tasks().wait_for_seq(t_seq).await;
-    db.memories().wait_for_seq(m_seq).await;
+    db.tasks().wait_for_seq(t_seq).await.unwrap();
+    db.memories().wait_for_seq(m_seq).await.unwrap();
 
     assert_eq!(db.tasks().count(), 1);
     assert_eq!(db.memories().count(), 1);
@@ -44,7 +44,7 @@ async fn standalone_adapter_opens_without_netdb() {
     let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let seq = tasks.create(1, "hello", 100).unwrap();
-    tasks.wait_for_seq(seq).await;
+    tasks.wait_for_seq(seq).await.unwrap();
 
     let state = tasks.state();
     let guard = state.read();
@@ -65,14 +65,14 @@ async fn snapshot_and_watch_round_trip() {
         .unwrap();
 
     let seq = db.tasks().create(1, "seed", 100).unwrap();
-    db.tasks().wait_for_seq(seq).await;
+    db.tasks().wait_for_seq(seq).await.unwrap();
 
     let watcher = db.tasks().watch();
     let (snapshot, mut stream) = db.tasks().snapshot_and_watch(watcher);
     assert_eq!(snapshot.len(), 1);
 
     let seq = db.tasks().create(2, "next", 200).unwrap();
-    db.tasks().wait_for_seq(seq).await;
+    db.tasks().wait_for_seq(seq).await.unwrap();
 
     let delta = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
         .await
@@ -98,8 +98,8 @@ async fn netdb_snapshot_bundle_round_trips() {
         .memories()
         .store(1, "memory", Vec::<String>::new(), "alice", 100)
         .unwrap();
-    db_a.tasks().wait_for_seq(t_seq).await;
-    db_a.memories().wait_for_seq(m_seq).await;
+    db_a.tasks().wait_for_seq(t_seq).await.unwrap();
+    db_a.memories().wait_for_seq(m_seq).await.unwrap();
 
     let snapshot = db_a.snapshot().unwrap();
 
