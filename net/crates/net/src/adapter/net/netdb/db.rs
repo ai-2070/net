@@ -132,6 +132,20 @@ impl NetDb {
     /// snapshotted under its own state lock (consistent per-model);
     /// there is no cross-model consistency guarantee because each
     /// model is a separate RedEX file.
+    ///
+    /// **Cross-model ordering caveat.** Tasks are snapshotted
+    /// first, then memories. An ingest that lands in both models
+    /// between the two calls is captured by the memories snapshot
+    /// but missed by the tasks snapshot — so the resulting
+    /// `NetDbSnapshot` can split a logical "write to both models"
+    /// across the two halves. A watcher snapshotting between
+    /// event deliveries needs to either (a) treat each model's
+    /// `last_seq` as the authoritative ordering and reconcile
+    /// idempotently on restore, or (b) drain both models'
+    /// `wait_for_seq(known_last)` before calling `snapshot()` to
+    /// pin a deliberate cut-off. The lock order (tasks → memories)
+    /// is fixed so any future writer that takes both locks must
+    /// match this order to avoid deadlock.
     pub fn snapshot(&self) -> Result<NetDbSnapshot, NetDbError> {
         let tasks = if let Some(t) = &self.tasks {
             Some(t.snapshot()?)
