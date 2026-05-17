@@ -619,7 +619,15 @@ async fn run_snapshot(args: SnapshotArgs, output: Option<OutputFormat>) -> Resul
     let bytes = snapshot
         .encode()
         .map_err(|e| sdk(format!("netdb snapshot encode: {e}")))?;
-    if let Some(parent) = args.out.parent() {
+    // `parent()` returns Some("") for a bare filename like
+    // "snap.bin"; `create_dir_all("")` errors on Windows. Filter
+    // it so we skip the dir-create step when the user passed a
+    // bare path or a relative leaf.
+    if let Some(parent) = args
+        .out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
         tokio::fs::create_dir_all(parent).await.map_err(|e| {
             generic(format!(
                 "failed to create parent directory {}: {e}",
@@ -627,9 +635,31 @@ async fn run_snapshot(args: SnapshotArgs, output: Option<OutputFormat>) -> Resul
             ))
         })?;
     }
-    tokio::fs::write(&args.out, &bytes)
-        .await
-        .map_err(|e| generic(format!("write snapshot to {}: {e}", args.out.display())))?;
+    // Atomic publish: write to a temp file next to the final
+    // destination, then rename. Pre-fix `tokio::fs::write`
+    // overwrote the target in place, so any crash / SIGKILL /
+    // full-disk between the truncate and the final flush left a
+    // truncated postcard blob at the documented path and operators
+    // lost their previous snapshot. fsync on the tmp + parent dir
+    // is tracked separately under the audit's #20 follow-up.
+    let pid = std::process::id();
+    let tmp = args.out.with_extension(format!("tmp.{pid}"));
+    tokio::fs::write(&tmp, &bytes).await.map_err(|e| {
+        generic(format!("write snapshot tmp {}: {e}", tmp.display()))
+    })?;
+    tokio::fs::rename(&tmp, &args.out).await.map_err(|e| {
+        // Best-effort cleanup of the temp file if rename failed;
+        // ignore secondary errors.
+        let tmp_for_cleanup = tmp.clone();
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_file(tmp_for_cleanup).await;
+        });
+        generic(format!(
+            "rename snapshot tmp {} -> {}: {e}",
+            tmp.display(),
+            args.out.display()
+        ))
+    })?;
     let info = SnapshotResult {
         path: args.out.display().to_string(),
         bytes: bytes.len() as u64,
