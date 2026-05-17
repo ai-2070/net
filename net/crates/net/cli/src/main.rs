@@ -192,9 +192,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Identity(cmd) => commands::identity::run(cmd, output).await,
         Command::Admin(cmd) => commands::admin::run(cmd, output, config_path, profile).await,
         Command::Ice(cmd) => commands::ice::run(cmd, output, config_path, profile).await,
-        Command::Snapshot(cmd) => {
-            commands::snapshot::run(cmd, output, config_path, profile).await
-        }
+        Command::Snapshot(cmd) => commands::snapshot::run(cmd, output, config_path, profile).await,
         Command::Audit(cmd) => commands::audit::run(cmd, output, config_path, profile).await,
         Command::Log(LogCommand::Tail(args)) => {
             commands::logs::run_log_tail(args, output, config_path, profile).await

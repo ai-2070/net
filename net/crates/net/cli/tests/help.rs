@@ -14,18 +14,8 @@ use predicates::prelude::*;
 use std::process::Command;
 
 const SUBCOMMANDS: &[&str] = &[
-    "version",
-    "identity",
-    "admin",
-    "ice",
-    "snapshot",
-    "audit",
-    "log",
-    "failures",
-    "cap",
-    "peer",
-    "daemon",
-    "netdb",
+    "version", "identity", "admin", "ice", "snapshot", "audit", "log", "failures", "cap", "peer",
+    "daemon", "netdb",
 ];
 
 #[test]
@@ -55,9 +45,7 @@ fn every_top_level_subcommand_has_help() {
             .unwrap()
             .args([sub, "--help"])
             .assert();
-        assert
-            .success()
-            .stdout(predicate::str::is_empty().not());
+        assert.success().stdout(predicate::str::is_empty().not());
     }
 }
 

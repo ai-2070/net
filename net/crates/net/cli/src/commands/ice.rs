@@ -29,9 +29,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
-use net_sdk::deck::{
-    AvoidScope, BlastRadius, ChainCommit, DaemonRef, OperatorSignature,
-};
+use net_sdk::deck::{AvoidScope, BlastRadius, ChainCommit, DaemonRef, OperatorSignature};
 use serde::Serialize;
 
 use crate::context::{resolve_profile, CliContext};
@@ -158,7 +156,8 @@ fn parse_u64_flexible(s: &str) -> Result<u64, String> {
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(rest, 16).map_err(|e| format!("invalid hex: {e}"))
     } else {
-        s.parse::<u64>().map_err(|e| format!("invalid integer: {e}"))
+        s.parse::<u64>()
+            .map_err(|e| format!("invalid integer: {e}"))
     }
 }
 
@@ -264,12 +263,8 @@ where
     F: for<'a> FnOnce(&'a net_sdk::deck::DeckClient) -> net_sdk::deck::IceProposal<'a>,
 {
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx = CliContext::build(
-        &profile,
-        common.identity.as_deref(),
-        common.supervisor_node,
-    )
-    .await?;
+    let ctx =
+        CliContext::build(&profile, common.identity.as_deref(), common.supervisor_node).await?;
     let deck = ctx.deck();
     let proposal = build_proposal(deck.as_ref());
 
@@ -385,13 +380,10 @@ fn parse_supplied_sig(raw: &str) -> Result<OperatorSignature, CliError> {
         operator_id: u64,
         signature_hex: String,
     }
-    let parsed: SigJson = serde_json::from_str(raw).map_err(|e| {
-        crate::error::invalid_args(format!("--sig must be JSON object: {e}"))
-    })?;
+    let parsed: SigJson = serde_json::from_str(raw)
+        .map_err(|e| crate::error::invalid_args(format!("--sig must be JSON object: {e}")))?;
     let bytes = hex::decode(&parsed.signature_hex).map_err(|e| {
-        crate::error::invalid_args(format!(
-            "--sig signature_hex is not valid hex: {e}"
-        ))
+        crate::error::invalid_args(format!("--sig signature_hex is not valid hex: {e}"))
     })?;
     if bytes.len() != 64 {
         return Err(crate::error::invalid_args(format!(

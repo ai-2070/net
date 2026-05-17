@@ -98,7 +98,9 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
     let seed = *identity.keypair().secret_bytes();
     let public_key = *identity.keypair().entity_id().as_bytes();
 
-    let path = args.out.unwrap_or_else(|| default_identity_path(operator_id));
+    let path = args
+        .out
+        .unwrap_or_else(|| default_identity_path(operator_id));
 
     if !args.force && path.exists() {
         return Err(invalid_args(format!(
@@ -191,11 +193,7 @@ async fn run_fingerprint(
     let mut hasher = SimpleSha256::new();
     hasher.update(&public_key);
     let digest = hasher.finalize();
-    let short: Vec<String> = digest
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02X}"))
-        .collect();
+    let short: Vec<String> = digest.iter().take(8).map(|b| format!("{b:02X}")).collect();
     let fingerprint = short.join(":");
     let info = FingerprintOutput {
         operator_id_hex: file.operator_id_hex.clone(),
@@ -442,7 +440,11 @@ fn sha256_oneshot(data: &[u8]) -> Vec<u8> {
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
-            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let t2 = s0.wrapping_add(maj);

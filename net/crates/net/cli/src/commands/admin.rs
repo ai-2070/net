@@ -106,7 +106,8 @@ fn parse_u64_flexible(s: &str) -> Result<u64, String> {
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(rest, 16).map_err(|e| format!("invalid hex: {e}"))
     } else {
-        s.parse::<u64>().map_err(|e| format!("invalid integer: {e}"))
+        s.parse::<u64>()
+            .map_err(|e| format!("invalid integer: {e}"))
     }
 }
 
@@ -214,9 +215,7 @@ pub async fn run(
                     node: args.node,
                     chains: chains.clone(),
                 },
-                move |deck, _| async move {
-                    deck.admin().drop_replicas(args.node, chains).await
-                },
+                move |deck, _| async move { deck.admin().drop_replicas(args.node, chains).await },
             )
             .await
         }
@@ -266,9 +265,7 @@ async fn handle<F, Fut>(
 ) -> Result<(), CliError>
 where
     F: FnOnce(std::sync::Arc<net_sdk::deck::DeckClient>, u64) -> Fut,
-    Fut: std::future::Future<
-        Output = std::result::Result<ChainCommit, net_sdk::deck::AdminError>,
-    >,
+    Fut: std::future::Future<Output = std::result::Result<ChainCommit, net_sdk::deck::AdminError>>,
 {
     if common.dry_run {
         let preview = DryRunPreview {
@@ -281,12 +278,8 @@ where
     }
 
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx = CliContext::build(
-        &profile,
-        common.identity.as_deref(),
-        common.supervisor_node,
-    )
-    .await?;
+    let ctx =
+        CliContext::build(&profile, common.identity.as_deref(), common.supervisor_node).await?;
     let deck = ctx.deck();
     let commit = commit(deck, common.supervisor_node)
         .await
@@ -344,15 +337,36 @@ struct DryRunPreview {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum AdminEnvelope {
-    Drain { node: u64, drain_for_ms: u64 },
-    EnterMaintenance { node: u64, drain_for_ms: Option<u64> },
-    ExitMaintenance { node: u64 },
-    Cordon { node: u64 },
-    Uncordon { node: u64 },
-    DropReplicas { node: u64, chains: Vec<u64> },
-    InvalidatePlacement { node: u64 },
-    RestartAllDaemons { node: u64 },
-    ClearAvoidList { node: u64 },
+    Drain {
+        node: u64,
+        drain_for_ms: u64,
+    },
+    EnterMaintenance {
+        node: u64,
+        drain_for_ms: Option<u64>,
+    },
+    ExitMaintenance {
+        node: u64,
+    },
+    Cordon {
+        node: u64,
+    },
+    Uncordon {
+        node: u64,
+    },
+    DropReplicas {
+        node: u64,
+        chains: Vec<u64>,
+    },
+    InvalidatePlacement {
+        node: u64,
+    },
+    RestartAllDaemons {
+        node: u64,
+    },
+    ClearAvoidList {
+        node: u64,
+    },
 }
 
 // Silence unused-import warning when SystemTime is referenced only

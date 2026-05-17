@@ -200,7 +200,8 @@ fn parse_u64_flexible(s: &str) -> Result<u64, String> {
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(rest, 16).map_err(|e| format!("invalid hex: {e}"))
     } else {
-        s.parse::<u64>().map_err(|e| format!("invalid integer: {e}"))
+        s.parse::<u64>()
+            .map_err(|e| format!("invalid integer: {e}"))
     }
 }
 
@@ -209,9 +210,7 @@ pub async fn run(cmd: NetdbCommand, output: Option<OutputFormat>) -> Result<(), 
         NetdbCommand::Tasks(TasksCommand::Ls(args)) => run_tasks_ls(args, output).await,
         NetdbCommand::Tasks(TasksCommand::Create(args)) => run_tasks_create(args, output).await,
         NetdbCommand::Tasks(TasksCommand::Rename(args)) => run_tasks_rename(args, output).await,
-        NetdbCommand::Tasks(TasksCommand::Complete(args)) => {
-            run_tasks_complete(args, output).await
-        }
+        NetdbCommand::Tasks(TasksCommand::Complete(args)) => run_tasks_complete(args, output).await,
         NetdbCommand::Tasks(TasksCommand::Delete(args)) => run_tasks_delete(args, output).await,
         NetdbCommand::Memories(MemoriesCommand::Ls(args)) => run_memories_ls(args, output).await,
         NetdbCommand::Memories(MemoriesCommand::Store(args)) => {
@@ -242,7 +241,13 @@ async fn run_tasks_create(
     args: TasksCreateArgs,
     output: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let netdb = open_netdb(args.common.store.as_deref(), args.common.origin, true, false).await?;
+    let netdb = open_netdb(
+        args.common.store.as_deref(),
+        args.common.origin,
+        true,
+        false,
+    )
+    .await?;
     let tasks = netdb
         .try_tasks()
         .ok_or_else(|| sdk("NetDB has no tasks adapter wired"))?;
@@ -256,7 +261,13 @@ async fn run_tasks_rename(
     args: TasksRenameArgs,
     output: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let netdb = open_netdb(args.common.store.as_deref(), args.common.origin, true, false).await?;
+    let netdb = open_netdb(
+        args.common.store.as_deref(),
+        args.common.origin,
+        true,
+        false,
+    )
+    .await?;
     let tasks = netdb
         .try_tasks()
         .ok_or_else(|| sdk("NetDB has no tasks adapter wired"))?;
@@ -270,7 +281,13 @@ async fn run_tasks_complete(
     args: TasksIdArgs,
     output: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let netdb = open_netdb(args.common.store.as_deref(), args.common.origin, true, false).await?;
+    let netdb = open_netdb(
+        args.common.store.as_deref(),
+        args.common.origin,
+        true,
+        false,
+    )
+    .await?;
     let tasks = netdb
         .try_tasks()
         .ok_or_else(|| sdk("NetDB has no tasks adapter wired"))?;
@@ -280,11 +297,14 @@ async fn run_tasks_complete(
     emit_mutation(output, "task_completed", args.id, seq)
 }
 
-async fn run_tasks_delete(
-    args: TasksIdArgs,
-    output: Option<OutputFormat>,
-) -> Result<(), CliError> {
-    let netdb = open_netdb(args.common.store.as_deref(), args.common.origin, true, false).await?;
+async fn run_tasks_delete(args: TasksIdArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
+    let netdb = open_netdb(
+        args.common.store.as_deref(),
+        args.common.origin,
+        true,
+        false,
+    )
+    .await?;
     let tasks = netdb
         .try_tasks()
         .ok_or_else(|| sdk("NetDB has no tasks adapter wired"))?;
@@ -302,7 +322,13 @@ async fn run_memories_store(
     args: MemoriesStoreArgs,
     output: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let netdb = open_netdb(args.common.store.as_deref(), args.common.origin, false, true).await?;
+    let netdb = open_netdb(
+        args.common.store.as_deref(),
+        args.common.origin,
+        false,
+        true,
+    )
+    .await?;
     let memories = netdb
         .try_memories()
         .ok_or_else(|| sdk("NetDB has no memories adapter wired"))?;
@@ -316,7 +342,13 @@ async fn run_memories_retag(
     args: MemoriesRetagArgs,
     output: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let netdb = open_netdb(args.common.store.as_deref(), args.common.origin, false, true).await?;
+    let netdb = open_netdb(
+        args.common.store.as_deref(),
+        args.common.origin,
+        false,
+        true,
+    )
+    .await?;
     let memories = netdb
         .try_memories()
         .ok_or_else(|| sdk("NetDB has no memories adapter wired"))?;
@@ -331,7 +363,13 @@ async fn run_memories_pin(
     output: Option<OutputFormat>,
     unpin: bool,
 ) -> Result<(), CliError> {
-    let netdb = open_netdb(args.common.store.as_deref(), args.common.origin, false, true).await?;
+    let netdb = open_netdb(
+        args.common.store.as_deref(),
+        args.common.origin,
+        false,
+        true,
+    )
+    .await?;
     let memories = netdb
         .try_memories()
         .ok_or_else(|| sdk("NetDB has no memories adapter wired"))?;
@@ -357,7 +395,13 @@ async fn run_memories_delete(
     args: MemoriesIdArgs,
     output: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let netdb = open_netdb(args.common.store.as_deref(), args.common.origin, false, true).await?;
+    let netdb = open_netdb(
+        args.common.store.as_deref(),
+        args.common.origin,
+        false,
+        true,
+    )
+    .await?;
     let memories = netdb
         .try_memories()
         .ok_or_else(|| sdk("NetDB has no memories adapter wired"))?;
@@ -371,16 +415,14 @@ async fn run_memories_delete(
 // restore
 // =========================================================================
 
-async fn run_restore(
-    args: RestoreArgs,
-    output: Option<OutputFormat>,
-) -> Result<(), CliError> {
+async fn run_restore(args: RestoreArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
     use net_sdk::cortex::{NetDb, Redex};
 
     let dest = match args.store.as_deref() {
         Some(p) => p.to_path_buf(),
-        None => default_netdb_path()
-            .ok_or_else(|| generic("no $XDG_DATA_HOME / data dir available; pass --store <PATH>"))?,
+        None => default_netdb_path().ok_or_else(|| {
+            generic("no $XDG_DATA_HOME / data dir available; pass --store <PATH>")
+        })?,
     };
     if !args.force && dest.exists() {
         let non_empty = match tokio::fs::read_dir(&dest).await {
@@ -463,11 +505,14 @@ struct RestoreResult {
     bytes_restored: u64,
 }
 
-async fn run_tasks_ls(
-    args: TasksLsArgs,
-    output: Option<OutputFormat>,
-) -> Result<(), CliError> {
-    let netdb = open_netdb(args.store.as_deref(), args.origin, /*tasks=*/ true, false).await?;
+async fn run_tasks_ls(args: TasksLsArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
+    let netdb = open_netdb(
+        args.store.as_deref(),
+        args.origin,
+        /*tasks=*/ true,
+        false,
+    )
+    .await?;
     let tasks: Vec<TaskRow> = match netdb.try_tasks() {
         Some(adapter) => {
             let state_arc = adapter.state();
@@ -491,7 +536,13 @@ async fn run_memories_ls(
     args: MemoriesLsArgs,
     output: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let netdb = open_netdb(args.store.as_deref(), args.origin, false, /*memories=*/ true).await?;
+    let netdb = open_netdb(
+        args.store.as_deref(),
+        args.origin,
+        false,
+        /*memories=*/ true,
+    )
+    .await?;
     let memories: Vec<MemoryRow> = match netdb.try_memories() {
         Some(adapter) => {
             let state_arc = adapter.state();
@@ -511,10 +562,7 @@ async fn run_memories_ls(
     Ok(())
 }
 
-async fn run_snapshot(
-    args: SnapshotArgs,
-    output: Option<OutputFormat>,
-) -> Result<(), CliError> {
+async fn run_snapshot(args: SnapshotArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
     if !args.force && args.out.exists() {
         return Err(crate::error::invalid_args(format!(
             "{} already exists; pass --force to overwrite",
@@ -556,8 +604,9 @@ async fn open_netdb(
 ) -> Result<Arc<NetDb>, CliError> {
     let path = match store {
         Some(p) => p.to_path_buf(),
-        None => default_netdb_path()
-            .ok_or_else(|| generic("no $XDG_DATA_HOME / data dir available; pass --store <PATH>"))?,
+        None => default_netdb_path().ok_or_else(|| {
+            generic("no $XDG_DATA_HOME / data dir available; pass --store <PATH>")
+        })?,
     };
     tokio::fs::create_dir_all(&path).await.map_err(|e| {
         generic(format!(

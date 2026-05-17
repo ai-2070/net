@@ -3551,27 +3551,42 @@ mod tests {
         // Seed a stale envelope so we can prove the setters
         // overwrite it instead of leaving it leaking through.
         set_last_error("stale", "from a prior unrelated call");
-        assert_eq!(net_deck_audit_query_recent(ptr::null_mut(), 10), NET_DECK_ERR_NULL);
+        assert_eq!(
+            net_deck_audit_query_recent(ptr::null_mut(), 10),
+            NET_DECK_ERR_NULL
+        );
         let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
         assert_eq!(kind, "invalid_argument");
 
         set_last_error("stale", "from a prior unrelated call");
-        assert_eq!(net_deck_audit_query_by_operator(ptr::null_mut(), 1), NET_DECK_ERR_NULL);
+        assert_eq!(
+            net_deck_audit_query_by_operator(ptr::null_mut(), 1),
+            NET_DECK_ERR_NULL
+        );
         let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
         assert_eq!(kind, "invalid_argument");
 
         set_last_error("stale", "from a prior unrelated call");
-        assert_eq!(net_deck_audit_query_between(ptr::null_mut(), 0, 0), NET_DECK_ERR_NULL);
+        assert_eq!(
+            net_deck_audit_query_between(ptr::null_mut(), 0, 0),
+            NET_DECK_ERR_NULL
+        );
         let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
         assert_eq!(kind, "invalid_argument");
 
         set_last_error("stale", "from a prior unrelated call");
-        assert_eq!(net_deck_audit_query_force_only(ptr::null_mut()), NET_DECK_ERR_NULL);
+        assert_eq!(
+            net_deck_audit_query_force_only(ptr::null_mut()),
+            NET_DECK_ERR_NULL
+        );
         let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
         assert_eq!(kind, "invalid_argument");
 
         set_last_error("stale", "from a prior unrelated call");
-        assert_eq!(net_deck_audit_query_since(ptr::null_mut(), 0), NET_DECK_ERR_NULL);
+        assert_eq!(
+            net_deck_audit_query_since(ptr::null_mut(), 0),
+            NET_DECK_ERR_NULL
+        );
         let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
         assert_eq!(kind, "invalid_argument");
 
@@ -3646,8 +3661,7 @@ mod tests {
         // "insufficient_signatures" from the empty-sigs guard
         // because the husk is still uncommitted.
         let mut commit2 = NetDeckChainCommit::default();
-        let status =
-            net_deck_simulated_commit(simulated, client, ptr::null(), 0, &mut commit2);
+        let status = net_deck_simulated_commit(simulated, client, ptr::null(), 0, &mut commit2);
         assert_eq!(status, NET_DECK_ERR_CALL_FAILED);
         let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
         assert_eq!(

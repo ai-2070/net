@@ -34,7 +34,11 @@ fn code_0_on_success() {
 fn code_1_on_generic_error_missing_identity_file() {
     Command::cargo_bin("net")
         .unwrap()
-        .args(["identity", "show", "/this/path/definitely/does/not/exist.toml"])
+        .args([
+            "identity",
+            "show",
+            "/this/path/definitely/does/not/exist.toml",
+        ])
         .assert()
         .code(1);
 }

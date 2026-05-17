@@ -116,8 +116,8 @@ pub fn emit_stream_row<T: Serialize>(fmt: OutputFormat, row: &T) -> io::Result<(
             // Stream payloads in TTY mode default to a compact
             // one-line JSON dump — readable without padding the
             // terminal width.
-            let s = serde_json::to_string(row)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let s =
+                serde_json::to_string(row).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             writeln!(&mut lock, "{}", s)?;
         }
     }

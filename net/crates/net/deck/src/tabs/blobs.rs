@@ -81,9 +81,7 @@ fn render_table(
         cursor.min(shown - 1) + 1
     };
 
-    let body_h = (area.height as usize)
-        .saturating_sub(2)
-        .saturating_sub(1);
+    let body_h = (area.height as usize).saturating_sub(2).saturating_sub(1);
     let effective_cursor = cursor.min(shown.saturating_sub(1));
     let (start, end, hidden_above, hidden_below) =
         super::scroll_window(shown, body_h, effective_cursor);

@@ -69,9 +69,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cu
     }
 
     let pos = cursor.min(total.saturating_sub(1)) + 1;
-    let body_h = (area.height as usize)
-        .saturating_sub(2)
-        .saturating_sub(1);
+    let body_h = (area.height as usize).saturating_sub(2).saturating_sub(1);
     let (start, end, hidden_above, hidden_below) = super::scroll_window(total, body_h, cursor);
     let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
@@ -114,7 +112,13 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cu
     .height(1);
 
     let mut rows: Vec<Row> = Vec::with_capacity(end.saturating_sub(start));
-    for (offset, (chain, r)) in snapshot.replicas.iter().skip(start).take(end - start).enumerate() {
+    for (offset, (chain, r)) in snapshot
+        .replicas
+        .iter()
+        .skip(start)
+        .take(end - start)
+        .enumerate()
+    {
         let i = start + offset;
         let is_cursor = i == cursor;
         let marker = if is_cursor { "▶" } else { " " };

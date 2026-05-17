@@ -27,9 +27,8 @@ pub async fn run() -> Result<(), CliError> {
     // the value is small enough that table-vs-JSON doesn't
     // change ergonomics, and consumers piping the output to
     // `jq` get a stable shape.
-    emit_value(OutputFormat::Json, &info).map_err(|e| {
-        crate::error::generic(format!("failed to write version output: {e}"))
-    })
+    emit_value(OutputFormat::Json, &info)
+        .map_err(|e| crate::error::generic(format!("failed to write version output: {e}")))
 }
 
 #[derive(serde::Serialize)]

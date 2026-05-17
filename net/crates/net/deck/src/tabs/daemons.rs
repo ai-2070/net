@@ -52,9 +52,7 @@ fn render_live(frame: &mut Frame<'_>, area: Rect, snapshot: &MeshOsSnapshot, cur
         .collect();
     let total = flat.len();
     let pos = cursor.min(total.saturating_sub(1)) + 1;
-    let body_h = (area.height as usize)
-        .saturating_sub(2)
-        .saturating_sub(1);
+    let body_h = (area.height as usize).saturating_sub(2).saturating_sub(1);
     let (start, end, hidden_above, hidden_below) = super::scroll_window(total, body_h, cursor);
     let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
