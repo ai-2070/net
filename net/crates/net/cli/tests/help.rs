@@ -30,12 +30,14 @@ fn help_succeeds() {
 
 #[test]
 fn version_flag_succeeds() {
+    // Track `Cargo.toml:version` via `env!` so a workspace bump
+    // doesn't silently invalidate the assertion.
     Command::cargo_bin("net")
         .unwrap()
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.17.0"));
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
