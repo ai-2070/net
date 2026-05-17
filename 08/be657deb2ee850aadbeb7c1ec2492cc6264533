@@ -1,0 +1,66 @@
+net/crates/net/bindings/python/tests/test_stub_drift.py
+  s_003b573b78d73d::t_0ccf52a69dfd28 1-122
+net/crates/net/bindings/go/net/tasks.go
+  s_003b573b78d73d::t_c65e439d98161e 262-277
+net/crates/net/bindings/go/net/memories.go
+  s_003b573b78d73d::t_2ba8f778a2b9b3 227-239
+net/crates/net/bindings/go/net/netdb.go
+  s_003b573b78d73d::t_15d0dfef76f2db 1-278
+net/crates/net/bindings/node/README.md
+  s_003b573b78d73d::t_eaf9eb08777950 1-45
+net/crates/net/sdk-py/README.md
+  s_003b573b78d73d::t_ec221fffd23ac8 1059-1083
+go/deck.go
+  s_003b573b78d73d::t_3b0b851f709f03 1-646
+net/crates/net/docs/misc/SDK_SURVEY_2026_05_17_BINDINGS_COVERAGE.md
+  s_003b573b78d73d::t_c43a5eb0e7aacd 155-162
+  s_003b573b78d73d::t_7aaa905172c6f4 176-184
+  s_003b573b78d73d::t_f93a6db8755236 56-57
+  s_003b573b78d73d::t_52241b21f41d78 115-137
+  s_003b573b78d73d::t_2163c0c8b1a09f 106-108
+  s_003b573b78d73d::t_b885d83ff800b0 220-225
+  s_003b573b78d73d::t_5783a3e6e1d01b 19-22
+  s_003b573b78d73d::t_db5b664f4aaa0a 26-32
+  s_003b573b78d73d::t_6ba3a561335447 86-105,109-112
+  s_003b573b78d73d::t_3a8f22dc0a12b1 62-79
+  s_003b573b78d73d::t_2bee2808533e48 227-233,235-253
+  s_003b573b78d73d::t_e93d0d12640de7 149-153
+  s_003b573b78d73d::t_910b0a091f099b 164-171
+  s_003b573b78d73d::t_5db2a9410217c6 42-48
+  s_003b573b78d73d::t_554d909bc24c95 201-210
+  s_003b573b78d73d::t_0266a6ef8f8384 186-199
+  s_003b573b78d73d::t_2bbb3c7a1da151 215-218
+  s_003b573b78d73d::t_8665ce80f0b917 4-6,8-11
+  s_003b573b78d73d::t_2d92fc314bdae0 33-37
+net/crates/net/bindings/python/README.md
+  s_003b573b78d73d::t_1d8414d17ca175 1040-1063
+go/deck_test.go
+  s_003b573b78d73d::t_26bb45b1777cdb 1-183
+net/crates/net/bindings/go/net/netdb_test.go
+  s_003b573b78d73d::t_469ed9fda3a4e1 1-234
+net/crates/net/sdk-ts/README.md
+  s_003b573b78d73d::t_78cf60713543cb 1656-1681
+net/crates/net/bindings/go/net/README.md
+  s_003b573b78d73d::t_10de3d591b594b 1-53
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_003b573b78d73d::t_987a40d81691a4 1066,1068-1071,1073-1093,1095-1099,1101-1109,1111-1114,1116-1122,1125-1146,1151-1161,1163-1164,1166-1389,1392-1393,1395-1434
+  s_003b573b78d73d::t_82a033a08a3c41 1504-1536,1542-1601,1603-1621,1624-1633,1636-1641,1644-1664,1667-1678,1681-1701,1704-1736,1739-1774
+  s_003b573b78d73d::t_a7a108ad755b3f 247
+  s_003b573b78d73d::t_bbafd2a61ad390 974-976,983-986,988-1007,1010,1013-1017,1019-1058
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "08be657deb2ee850aadbeb7c1ec2492cc6264533",
+  "prompts": {},
+  "sessions": {
+    "s_003b573b78d73d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0c3f523e-cae1-41eb-82c0-affb976b6594",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
