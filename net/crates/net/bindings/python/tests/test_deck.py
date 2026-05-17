@@ -118,6 +118,28 @@ def test_deck_client_standalone_constructor_accepts_config_dicts() -> None:
     assert client.identity().operator_id == OperatorIdentity.from_seed(seed).operator_id
 
 
+def test_deck_client_close_drains_owned_supervisor_idempotently() -> None:
+    seed = b"\x57" * 32
+    client = DeckClient(seed)
+    # First close drains the private SDK.
+    client.close()
+    # Second close is a no-op — must not raise.
+    client.close()
+
+
+def test_deck_client_close_noop_for_from_meshos_clients() -> None:
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        # External SDK — close must NOT drain it.
+        client.close()
+        # The bound deck client still works because the external
+        # SDK is still up.
+        assert isinstance(json.loads(client.status()), dict)
+    finally:
+        sdk.shutdown()
+
+
 def test_deck_client_accepts_config_dict() -> None:
     sdk = MeshOsDaemonSdk.start()
     try:

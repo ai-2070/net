@@ -466,7 +466,7 @@ Test breadth is good (~125 tests across TS/Py for the two SDKs, plus C examples)
 | Done | `NetDeckIceProposal` now carries a `consumed: bool` flag (matching `SimulatedIceProposal`); `issued_at_ms` survives `_simulate` consumption. Regression: `ice_issued_at_ms_survives_consumption_by_simulate` (item 3). |
 | Verify | Audit whether `commit` re-running `simulate` is safe under cluster-state movement (item 4). |
 | Done (partial) | TS `DeckClient.close()` + `[Symbol.asyncDispose]` drain the private supervisor (only fires for clients built via `DeckClient.new`; no-op for `fromMeshos`). `IceProposal`/`SimulatedIceProposal` close() not added — they hold no heavy resources and GC naturally (item 5). |
-| Footgun | Add `__enter__`/`__exit__` to Python `DeckClient` and ICE proposal classes for consistency with `MeshOsDaemonSdk` (item 6). |
+| Done (partial) | Python `PyDeckClient.close()` drains the owned SDK (no-op for `from_meshos`); `sdk-py` wrapper exposes `from_seed` factory + `close()` + `__enter__`/`__exit__`. ICE proposal context-manager support not added — same rationale as TS (item 6). |
 | Footgun | Cancel the Go `pumpControlEvents` goroutine on `Free()` (item 7). |
 | API | Unify `subscribe_failures(since_seq)` optionality across Node + Python + C (item 8). |
 | API | Add `timeout_ms` to Node + Python `AuditStream.next` (item 9). |

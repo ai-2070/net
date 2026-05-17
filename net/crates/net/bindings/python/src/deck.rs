@@ -671,6 +671,30 @@ impl PyDeckClient {
         }
     }
 
+    /// Tear down the private supervisor runtime if this client
+    /// owns one (constructed via `DeckClient(seed, ...)`). No-op
+    /// for clients built via `from_meshos` against an externally-
+    /// managed SDK — the caller is responsible for that SDK's
+    /// own `shutdown()`. Idempotent: subsequent calls return
+    /// without raising.
+    ///
+    /// Wired through the Python SDK wrapper's `close()` /
+    /// `__enter__` / `__exit__` so `with DeckClient(seed) as
+    /// deck:` drains the supervisor at scope exit.
+    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        let Some(sdk) = self._owned_sdk.take() else {
+            // External SDK or already closed — no-op.
+            return Ok(());
+        };
+        let runtime = self.runtime.clone();
+        py.detach(move || {
+            runtime.block_on(async {
+                let _ = sdk.shutdown().await;
+            });
+        });
+        Ok(())
+    }
+
     /// Typed admin-event surface. Each method commits an
     /// `AdminEvent` variant + returns a `ChainCommit` dict.
     #[getter]

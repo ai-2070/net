@@ -425,11 +425,24 @@ class DeckClient:
     """Operator-side client to the cluster's admin / snapshot /
     status surfaces.
 
-    Construct against a running :class:`net_sdk.meshos.MeshOsDaemonSdk`::
+    Two construction paths:
+
+    - Against an externally-managed SDK (default `__init__`)::
 
         sdk = meshos.MeshOsDaemonSdk.start()
         identity = deck.OperatorIdentity.generate()
         client = deck.DeckClient(sdk, identity)
+
+    - Standalone with a private supervisor (`from_seed`)::
+
+        with deck.DeckClient.from_seed(b"\\x42" * 32) as client:
+            ...  # supervisor drained on __exit__
+
+    Context-manager support (`with` / `__enter__` / `__exit__`)
+    drains the supervisor on scope exit when the client owns one
+    (i.e. constructed via `from_seed`). For `__init__`-built
+    clients, context exit is a no-op — the caller owns the
+    externally-managed SDK's lifecycle.
     """
 
     __slots__ = ("_raw",)
@@ -445,6 +458,39 @@ class DeckClient:
         # napi class via its `_raw` slot.
         raw_sdk = getattr(meshos_sdk, "_raw", meshos_sdk)
         self._raw = _RawClient.from_meshos(raw_sdk, identity, config)
+
+    @classmethod
+    def from_seed(
+        cls,
+        operator_seed: bytes,
+        meshos_config: Optional[dict[str, Any]] = None,
+        deck_config: Optional[dict[str, Any]] = None,
+    ) -> "DeckClient":
+        """Construct a standalone client owning a private MeshOS
+        supervisor runtime, mirroring the cdylib's
+        ``net_deck_client_new`` (operator-only mode).
+
+        ``operator_seed`` must be exactly 32 bytes of ed25519 seed
+        material. The supervisor is drained on :meth:`close` or
+        context-manager exit; if neither is called the runtime
+        releases on GC.
+        """
+        inst = cls.__new__(cls)
+        inst._raw = _RawClient(operator_seed, meshos_config, deck_config)
+        return inst
+
+    def close(self) -> None:
+        """Drain the private supervisor runtime if the client
+        owns one (constructed via :meth:`from_seed`). No-op
+        otherwise. Idempotent — calling twice doesn't raise."""
+        self._raw.close()
+
+    def __enter__(self) -> "DeckClient":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> Literal[False]:
+        self.close()
+        return False
 
     def identity(self) -> OperatorIdentity:
         return self._raw.identity()
