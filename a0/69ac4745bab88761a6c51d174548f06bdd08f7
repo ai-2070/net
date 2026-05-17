@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/bug-audit-2026-05-18/PHASE3_CORTEX_RPC_DROP.md
+  s_f641e31a81af58::t_a305b54d21601b 1-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "a069ac4745bab88761a6c51d174548f06bdd08f7",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
