@@ -1,0 +1,92 @@
+[package]
+name = "net-cli"
+version = "0.17.0"
+edition = "2021"
+description = "Unified `net` command-line tool — Phase 1 (read-only surface)"
+license = "Apache-2.0"
+# Distributed as a binary, not via crates.io. Block accidental
+# `cargo publish` from shipping the embedded SDK consumer.
+publish = false
+
+[[bin]]
+name = "net"
+path = "src/main.rs"
+
+[dependencies]
+# Path-only dep on the workspace SDK — the binary is shipped as
+# part of the workspace, never published independently.
+net-sdk = { package = "ai2070-net-sdk", path = "../sdk", default-features = false, features = [
+    "net",
+    "nat-traversal",
+    "cortex",
+    "compute",
+    "groups",
+    "meshos",
+    "deck",
+    "dataforts",
+    "meshdb",
+] }
+
+# Clap derives the argv parser from typed structs; `env` enables
+# `NET_*` env-var fallback for global flags (`--profile` etc.).
+clap = { version = "4", features = ["derive", "env"] }
+
+# Multi-thread tokio for the SDK; macros for `#[tokio::main]`.
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "signal",
+    "fs",
+] }
+
+# Serde stack for output dispatch + identity/config file parsing.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Color-eyre is the top-level handler at `main`; per-command
+# errors stay typed via the `error.rs` module.
+color-eyre = "0.6"
+
+# Pretty terminal tables for `--output table` (Phase 1: read-only
+# views).
+comfy-table = "7"
+
+# Tracing-subscriber wires `-v` / `-vv` / `-vvv` to env-filter
+# levels. Format pinned to compact for stderr.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# XDG paths + TOML for the config + identity stores.
+dirs = "5"
+toml = "0.8"
+
+# Streaming combinators used by the audit/log/failures ndjson
+# outputs and the snapshot watch loop.
+futures = "0.3"
+
+# Detect TTY-vs-pipe for auto-output-format selection.
+is-terminal = "0.4"
+
+# Bytes / hex utilities for identity material.
+bytes = "1"
+hex = "0.4"
+
+# Typed errors at the config / identity boundary.
+thiserror = "2"
+
+[dev-dependencies]
+# Drive the binary in integration tests.
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+# Async test helpers — `#[tokio::test]` + the SDK's in-process
+# cluster fixtures.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "test-util",
+] }
