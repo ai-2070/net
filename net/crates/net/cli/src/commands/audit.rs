@@ -44,7 +44,7 @@ pub struct RecentArgs {
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 0x0001)]
+    #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub node: u64,
 }
 
@@ -62,7 +62,7 @@ pub struct StreamArgs {
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 0x0001)]
+    #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub node: u64,
 }
 

@@ -110,7 +110,7 @@ pub struct CommonAdminArgs {
     pub identity: Option<PathBuf>,
 
     /// Substrate node id for the in-process supervisor.
-    #[arg(long, default_value_t = 0x0001)]
+    #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub supervisor_node: u64,
 }
 

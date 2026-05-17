@@ -10,3 +10,9 @@
 pub(crate) use crate::error::{CliError, ExitCodeKind};
 #[allow(unused_imports)]
 pub(crate) use crate::output::{emit_stream_row, emit_value, OutputFormat};
+
+/// Default `--node` value for subcommands that talk to the
+/// in-process supervisor. Centralised so a future protocol bump
+/// (or a `--node` rename) doesn't need to touch every command
+/// module.
+pub(crate) const DEFAULT_SUPERVISOR_NODE: u64 = 1;
