@@ -318,7 +318,7 @@ async fn run_tasks_create(
     let seq = tasks
         .create(args.id, args.title, now_ns())
         .map_err(|e| sdk(format!("tasks create: {e}")))?;
-    emit_mutation(output, "task_created", args.id, seq)
+    emit_mutation(output, "task_created", args.id, seq, netdb)
 }
 
 async fn run_tasks_rename(
@@ -341,7 +341,7 @@ async fn run_tasks_rename(
     let seq = tasks
         .rename(args.id, args.title, now_ns())
         .map_err(|e| sdk(format!("tasks rename: {e}")))?;
-    emit_mutation(output, "task_renamed", args.id, seq)
+    emit_mutation(output, "task_renamed", args.id, seq, netdb)
 }
 
 async fn run_tasks_complete(
@@ -364,7 +364,7 @@ async fn run_tasks_complete(
     let seq = tasks
         .complete(args.id, now_ns())
         .map_err(|e| sdk(format!("tasks complete: {e}")))?;
-    emit_mutation(output, "task_completed", args.id, seq)
+    emit_mutation(output, "task_completed", args.id, seq, netdb)
 }
 
 async fn run_tasks_delete(
@@ -387,7 +387,7 @@ async fn run_tasks_delete(
     let seq = tasks
         .delete(args.id)
         .map_err(|e| sdk(format!("tasks delete: {e}")))?;
-    emit_mutation(output, "task_deleted", args.id, seq)
+    emit_mutation(output, "task_deleted", args.id, seq, netdb)
 }
 
 // =========================================================================
@@ -414,7 +414,7 @@ async fn run_memories_store(
     let seq = memories
         .store(args.id, args.content, args.tags, args.source, now_ns())
         .map_err(|e| sdk(format!("memories store: {e}")))?;
-    emit_mutation(output, "memory_stored", args.id, seq)
+    emit_mutation(output, "memory_stored", args.id, seq, netdb)
 }
 
 async fn run_memories_retag(
@@ -437,7 +437,7 @@ async fn run_memories_retag(
     let seq = memories
         .retag(args.id, args.tags, now_ns())
         .map_err(|e| sdk(format!("memories retag: {e}")))?;
-    emit_mutation(output, "memory_retagged", args.id, seq)
+    emit_mutation(output, "memory_retagged", args.id, seq, netdb)
 }
 
 async fn run_memories_pin(
@@ -473,7 +473,7 @@ async fn run_memories_pin(
             "memory_pinned",
         )
     };
-    emit_mutation(output, kind, args.id, seq)
+    emit_mutation(output, kind, args.id, seq, netdb)
 }
 
 async fn run_memories_delete(
@@ -496,7 +496,7 @@ async fn run_memories_delete(
     let seq = memories
         .delete(args.id)
         .map_err(|e| sdk(format!("memories delete: {e}")))?;
-    emit_mutation(output, "memory_deleted", args.id, seq)
+    emit_mutation(output, "memory_deleted", args.id, seq, netdb)
 }
 
 // =========================================================================
@@ -629,7 +629,7 @@ async fn run_restore(
             "snapshot file carries neither tasks nor memories; nothing to restore",
         ));
     }
-    let _ = builder
+    let netdb = builder
         .build_from_snapshot(&snap)
         .await
         .map_err(|e| sdk(format!("netdb restore: {e}")))?;
@@ -637,8 +637,12 @@ async fn run_restore(
         path: dest.display().to_string(),
         bytes_restored: bytes.len() as u64,
     };
-    emit_value(OutputFormat::resolve_oneshot(output), &info)
-        .map_err(|e| generic(format!("write restore result: {e}")))?;
+    let r = emit_value(OutputFormat::resolve_oneshot(output), &info)
+        .map_err(|e| generic(format!("write restore result: {e}")));
+    if let Err(e) = netdb.close() {
+        tracing::warn!(error = %e, "netdb close failed at end of restore");
+    }
+    r?;
     Ok(())
 }
 
@@ -659,10 +663,23 @@ fn emit_mutation(
     kind: &'static str,
     id: u64,
     seq: u64,
+    netdb: Arc<NetDb>,
 ) -> Result<(), CliError> {
     let info = MutationResult { kind, id, seq };
-    emit_value(OutputFormat::resolve_oneshot(output), &info)
-        .map_err(|e| generic(format!("write mutation result: {e}")))?;
+    let r = emit_value(OutputFormat::resolve_oneshot(output), &info)
+        .map_err(|e| generic(format!("write mutation result: {e}")));
+    // Close the NetDb on the success path. Pre-fix the Arc just
+    // dropped on function exit and `NetDb` has no Drop impl, so
+    // the persistent-dir handle outlived the function on Windows
+    // (no fsync, no explicit close) until the inner adapters'
+    // Arcs final-dropped. A subsequent `net netdb <verb>` in the
+    // same process tree, or a future netdb-watcher holding the
+    // same dir, could see stale data, and a crash during
+    // shutdown could lose the last appended frame.
+    if let Err(e) = netdb.close() {
+        tracing::warn!(error = %e, "netdb close failed at end of CLI mutation");
+    }
+    r?;
     Ok(())
 }
 
@@ -708,8 +725,12 @@ async fn run_tasks_ls(
         let guard = state_arc.read();
         guard.all().cloned().collect()
     };
-    emit_value(OutputFormat::resolve_oneshot(output), &tasks)
-        .map_err(|e| generic(format!("write tasks: {e}")))?;
+    let r = emit_value(OutputFormat::resolve_oneshot(output), &tasks)
+        .map_err(|e| generic(format!("write tasks: {e}")));
+    if let Err(e) = netdb.close() {
+        tracing::warn!(error = %e, "netdb close failed at end of tasks ls");
+    }
+    r?;
     Ok(())
 }
 
@@ -737,8 +758,12 @@ async fn run_memories_ls(
         let guard = state_arc.read();
         guard.all().cloned().collect()
     };
-    emit_value(OutputFormat::resolve_oneshot(output), &memories)
-        .map_err(|e| generic(format!("write memories: {e}")))?;
+    let r = emit_value(OutputFormat::resolve_oneshot(output), &memories)
+        .map_err(|e| generic(format!("write memories: {e}")));
+    if let Err(e) = netdb.close() {
+        tracing::warn!(error = %e, "netdb close failed at end of memories ls");
+    }
+    r?;
     Ok(())
 }
 
@@ -835,8 +860,12 @@ async fn run_snapshot(
         path: args.out.display().to_string(),
         bytes: bytes.len() as u64,
     };
-    emit_value(OutputFormat::resolve_oneshot(output), &info)
-        .map_err(|e| generic(format!("write snapshot result: {e}")))?;
+    let r = emit_value(OutputFormat::resolve_oneshot(output), &info)
+        .map_err(|e| generic(format!("write snapshot result: {e}")));
+    if let Err(e) = netdb.close() {
+        tracing::warn!(error = %e, "netdb close failed at end of snapshot");
+    }
+    r?;
     Ok(())
 }
 
