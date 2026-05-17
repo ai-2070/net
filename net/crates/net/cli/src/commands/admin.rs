@@ -323,6 +323,20 @@ struct DryRunPreview {
 
 /// Tagged-union projection of the `AdminEvent` variants the CLI
 /// emits. Same shape every binding's audit query reads back.
+///
+/// **Drift hazard.** This enum is built from CLI args and is the
+/// authoritative input for `--dry-run`. The SDK's
+/// `deck.admin().<verb>()` call path builds its own on-wire
+/// `AdminEvent`; the two shapes must stay in sync so a
+/// `--dry-run` preview matches the eventual commit byte-for-byte.
+/// Adding a new field to the SDK `AdminEvent` without mirroring
+/// it here makes `--dry-run` lie silently. Today the smoke tests
+/// at `cli/tests/dry_run.rs` only check the shape; a deeper test
+/// that runs a real commit in a test substrate and asserts
+/// equality with the dry-run envelope is tracked separately and
+/// would belong here when the SDK exposes a test surface for
+/// admin commits. Until then, any code touching this enum must
+/// cross-check the SDK side by hand.
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum AdminEnvelope {
