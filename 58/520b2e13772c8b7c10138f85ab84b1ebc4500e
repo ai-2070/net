@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_ac2931afe38c4a::t_5216486700276c 1207-1214
+  s_ac2931afe38c4a::t_4a5cf845c9f2d6 4662-4665,4676-4678
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_17_MESHOS_SDKS.md
+  s_ac2931afe38c4a::t_e1e1c955b5d12e 46,57,60,62-67
+  s_ac2931afe38c4a::t_3461544bee1ee8 125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "58520b2e13772c8b7c10138f85ab84b1ebc4500e",
+  "prompts": {},
+  "sessions": {
+    "s_ac2931afe38c4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59271d48-d72a-4337-b857-962412f18343",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
