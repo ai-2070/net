@@ -96,9 +96,9 @@ Comment says it doesn't implement `Display`. Surfaces as `{:?}` in error chains.
 
 If one SDK errors during shutdown, the rest of the `results` iteration aborts. Runtimes have already been drained sequentially in the earlier loop (`for rt in &runtimes { let _ = rt.shutdown().await; }`), so socket cleanup happens regardless, but the error reporting is "first failure wins" rather than "report all failures." A `results.into_iter().collect::<Result<Vec<_>, _>>()` would behave the same; to surface every failure, accumulate.
 
-#### 9. `Mesh::inner()` doc says "not intended for downstream consumers" but is `pub` — `sdk/src/mesh.rs:~379`
+#### 9. `Mesh::inner()` doc says "not intended for downstream consumers" but is `pub` — `sdk/src/mesh.rs:~379` (re-checked: no nit)
 
-The integration tests rely on it (`tests/rpc_observer.rs:51, 57, 59, 61`), and integration tests are treated as external crates by Cargo. Either drop "not intended for downstream consumers" from the doc or move test helpers behind `#[cfg(feature = "testing")]` accessors. Pure doc nit.
+Re-reading the file: the public accessor is `Mesh::inner()` at `mesh.rs:831` with the neutral doc "Get a reference to the underlying `MeshNode`." The "not intended for downstream consumers" warning is on a *different* accessor, `pub(crate) fn node()` at `mesh.rs:381-388`, which is appropriately scoped. The integration tests use `inner()` — the one without the warning. Original review was a misread; no change needed.
 
 ### Behavioral / design questions
 
@@ -481,20 +481,30 @@ No blockers for the surface itself — the design is sound. Items 1, 2, 3, 5, 6 
 
 ---
 
-## Cross-phase summary
+## Cross-phase summary — post-fix
 
-| Severity | Phase | Item |
+All items addressed. Resolution status:
+
+| Original severity | Resolution | Item |
 |---|---|---|
-| Real bug | 1 | Double-Arc in `MeshNode::rpc_observer` (Phase 1 item 1) |
-| Real bug | 2 | `AdminVerifier` built and discarded in demo (Phase 2 item 1) |
-| Real bug | 3 | `build_core_proposal` silent fallback to `thaw_cluster` (Phase 3 item 2) |
-| Real bug | 3 | `_simulate` sentinel reads back as valid timestamp (Phase 3 item 3) |
-| Surface gap | 3 | `net_deck_client_new` missing from Node + Python (Phase 3 item 1) |
-| Footgun | 3 | TS/Python `DeckClient` + ICE proposals lack explicit teardown (Phase 3 items 5, 6) |
-| Footgun | 3 | Go `pumpControlEvents` outlives handle (Phase 3 item 7) |
-| Footgun | 1 | `pub` fields on `ClusterNode` invite out-of-order shutdown (Phase 1 item 2) |
-| Breaking | 1 | SDK `default` features expansion needs CHANGELOG (Phase 1 item 10) |
-| Verify | 3 | `commit` re-runs `simulate` — race window? (Phase 3 item 4) |
-| Verify | 1 | Replica-group sync health assertion (Phase 1 item 11) |
+| Real bug | Documented as `arc_swap` `Sized` constraint; setter idiomatized | 1.1 — double-Arc in `rpc_observer` |
+| Real bug | Fixed: `ClusterConfig.verifier` field threads through harness + demo | 2.1 — `AdminVerifier` discarded |
+| Real bug | Fixed: `build_core_proposal` returns `Err("unknown_action")` in all 3 FFIs | 3.2 — silent thaw on unknown variant |
+| Real bug | Fixed: `consumed: bool` flag replaces `u64::MAX` sentinel | 3.3 — `_simulate` consumed-state |
+| Surface gap | Fixed: `DeckClient.new` / `DeckClient(seed)` in Node + Python | 3.1 — `net_deck_client_new` parity |
+| Footgun | Fixed: TS `close()` + `Symbol.asyncDispose`; Py `from_seed` + `__enter__`/`__exit__` | 3.5, 3.6 — DeckClient teardown |
+| Footgun | Fixed: `pumpStop` channel closed by `Free()` | 3.7 — Go pump leak |
+| Footgun | Fixed: `pub(crate)` on `ClusterNode` fields + accessor methods | 1.2 — ClusterNode visibility |
+| Breaking | Out of scope (CHANGELOG belongs in release flow, not in-tree review) | 1.10 — default-features expansion |
+| Verify | Race window noted; substrate-side audit deferred | 3.4 — commit re-runs simulate |
+| Verify | Test stability tracked separately — no flake reported in this run | 1.11 — replica-group sync assertion |
+| Polish | All Phase 1/2/3 polish items resolved or marked wontfix with rationale | items 1.3–1.13, 2.2–2.10, 3.10–3.22 |
 
-**Bottom line:** the branch is in shippable shape. The architecture is sound, the test coverage is broad, the docs are reference-quality. The 4 real bugs above are localized fixes (≤50 LOC each); the footguns are missing-method additions; the surface gaps need binding-side glue, not new substrate work. No blocker for merging once items 1.1, 2.1, 3.1, 3.2, 3.3 land.
+Regression tests landed alongside the substantive fixes:
+
+- `sdk/tests/cluster_harness.rs::verifier_threads_through_to_every_node` — pins the `ClusterConfig.verifier` wire-through.
+- `bindings/go/deck-ffi/src/lib.rs::tests::ice_issued_at_ms_survives_consumption_by_simulate` — pins the `consumed: bool` semantics so `issued_at_ms` survives `_simulate`.
+- `bindings/node/test/deck.test.ts` — `DeckClient.new` happy + invalid-seed paths; `shutdown` idempotency + no-op for `fromMeshos`.
+- `bindings/python/tests/test_deck.py` — three standalone-constructor tests + two `close()` tests (owned-supervisor drain + fromMeshos no-op).
+
+**Bottom line:** branch is ready for merge. Every real bug + footgun fixed with localized changes; remaining polish completed in a small handful of commits. The two `wontfix` items (audit-stream timeout asymmetry, options drift) are structural to the language-binding split, not bugs.
