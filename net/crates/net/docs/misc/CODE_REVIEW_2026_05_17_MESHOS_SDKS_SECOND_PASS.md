@@ -265,19 +265,21 @@ These were tracked-but-deferred in the first review; no action taken in the veri
 
 New planning doc, 571 LOC, status: **"Not started."** No corresponding code lands in this branch — the `cli/` workspace member exists with an empty `src/` and the workspace `cli` feature flag is wired, but Phase 1 activation waits on a real consumer workflow.
 
-Pure design-only addition; nothing to review at the implementation level. The plan is coherent with sibling plans (`DECK_DEMO_PLAN`, `DECK_DEMO_HARNESS_PLAN`, `DECK_SDK_PLAN`, `MESHOS_SDK_PLAN`), and the ten "locked decisions" (§482–500) are load-bearing constraints that prevent scope creep. The two update commits (`55c6ed6a`, `eb3ae9ea`) expanded the surface (nRPC, cap/peer, port-mapping, NetDB sections) without introducing contradictions.
+Pure design-only addition; nothing to review at the implementation level. The plan is coherent with sibling plans (`DECK_DEMO_PLAN`, `DECK_DEMO_HARNESS_PLAN`, `DECK_SDK_PLAN`, `MESHOS_SDK_PLAN`), and the locked decisions are load-bearing constraints that prevent scope creep.
 
-Four open spec questions worth resolving before Phase 1 work starts — cheaper to close now than during implementation:
+Four open spec questions raised in this review pass have since been resolved upstream in the plan (Kyra, 2026-05-17). Status:
 
-1. **NetDB path safety model.** Plan defaults to `$XDG_DATA_HOME/net/netdb.redex` (§383) but requires explicit `--store <PATH>` on every subcommand (§408). Should Phase 1 auto-discover or stay strict? Document the intent — both are defensible, but the asymmetry between "we know where it lives" and "you must tell us where it lives" reads as undecided.
-2. **Predicate DSL for `--where <EXPR>` is underspecified.** §375, §389 show examples but no grammar. Phase 1/2 will need a parser; a sub-design (or a punt to a stdlib like `cel-rust` / `evalexpr`) belongs in the plan, not the implementation review.
-3. **`--dry-run` × `--yes` interaction.** §312–314 specify each flag independently. Codify the matrix: does `net ice <action> --dry-run --yes` print the envelope and exit 0, or error as mutual exclusion?
-4. **`--identity <PATH>` pre-flight validation.** §448 mentions `chmod 600` and `permissive_mode`, but the error story for missing file / directory / unreadable falls into the single "exit code 3 = SDK error" bucket (§210–223). Either widen the exit code table or pre-flight identity loading with structured errors before SDK construction.
+| Question | Resolution | Landed in `NET_CLI_PLAN.md` |
+|---|---|---|
+| NetDB path: auto-discover or always explicit? | Always explicit — `--store` required on every invocation; XDG path is a bootstrapping convention, not an implicit global. | Locked decision 11 + §9 wording strengthened. |
+| `--where <EXPR>` grammar? | Minimal CEL-style subset: `EXPR := TERM (("&&" \| "||") TERM)*`, no `in` / `!` / nesting. `evalexpr` in Phase 2. | Locked decision 12 + §8 grammar block. |
+| `--dry-run` × `--yes` interaction? | Valid combo (matches `kubectl` / `terraform`): simulate, auto-confirm, print envelope, exit 0. | Locked decision 4 amended + decision 13 cross-reference. |
+| Identity pre-flight + exit codes? | Pre-flight before SDK init; dedicated exit codes 17 (not found) / 18 (unreadable) / 19 (malformed); structured JSON errors. | Exit-code table extended; locked decision 14. |
 
-Two substrate-side dependencies the plan flags but doesn't sequence:
+Two substrate dependencies have been sequenced into their consuming phases:
 
-- **`net_sdk::traversal::try_map_once(...)`** doesn't exist yet (§364). Plan calls it "half a day's work" — fine, but block Phase 2 behind it landing first or you'll fork the Phase 2 effort.
-- **`net_daemon_factories::register!`** macro (§322) is mentioned as a Phase 4 invention with no API sketch. Reasonable to defer, but earmark Phase 4 design as "starts with this macro."
+- **`net_sdk::traversal::try_map_once(...)`** must land before Phase 2 CLI work begins (else Phase 2 forks traversal logic into the CLI, violating locked decision 1). Phase 2 description + §7 updated to make this explicit.
+- **`net_daemon_factories::register!`** macro design + implementation is the first deliverable of Phase 4 (factory ID → constructor binding, scope contract, error story for missing / duplicate factories). Phase 4 description + §4 updated.
 
 ---
 
@@ -309,7 +311,7 @@ These would all be cheap to add and would lock in the lifetime + filter contract
 | Polish | Wrap `MeshOsDaemonHandle.Free()` body in `sync.Once` for concurrent-call + finalizer races (items N1, N2). Composes with N4. |
 | Polish | Audit-query setter NULL arm sets last-error (item N5); Python `close()` surfaces shutdown errors symmetrically with Node (item N6); rename `_owned_sdk` → `owned_sdk` (item N8); drop the `Uint8Array as Buffer` cast in TS `DeckClient.new` (item N9); remove the stale test comment (item N10); sweep three stale "5-node" module-level docstrings (item N12). |
 | Tests | Add the wrapper-level `DeckClient.from_seed` + ctx-manager test in `sdk-py` (item N11); pin error-message substrings on `DeckClient.new(badSeed)`; exercise `await using` on TS `DeckClient`; broader concurrency / GC / shutdown-while-iterating / filter-correctness tests across bindings (first-pass test-coverage gaps). |
-| Plan | Resolve four open `NET_CLI_PLAN.md` spec questions (NetDB path safety, predicate DSL, `--dry-run` × `--yes`, identity pre-flight) before Phase 1 work starts. |
+| Done | Four open `NET_CLI_PLAN.md` spec questions resolved (Kyra, 2026-05-17): NetDB always explicit (decision 11), CEL-subset predicate grammar (decision 12), `--dry-run` × `--yes` composes (decision 4/13), identity pre-flight + exit codes 17/18/19 (decision 14). Substrate dependencies sequenced: `try_map_once` blocks Phase 2, `register!` macro begins Phase 4. |
 | Tracking | Substrate-side audit for `commit` re-running `simulate` (item 3.4) — overlaps with the N3 fix surface. |
 | Release | CHANGELOG entry for `sdk/Cargo.toml` default-features expansion before next tag (item 1.10). |
 
@@ -317,8 +319,8 @@ These would all be cheap to add and would lock in the lifetime + filter contract
 
 ## Bottom line
 
-The first-pass review's closeout is accurate: every fix it claims is wired in code, with regression tests where they matter. The verification pass surfaced new items concentrated in three areas: (a) consume-on-failure regressions in `simulate()` / `commit()` across all three FFIs (N3) — a latent footgun that the first review's `22f885eb` + `d1ccd36c` fixes introduced together but neither test suite exercises on the failure branch; (b) Go `Free`/`Close`-vs-in-flight-FFI thread-safety (N1, N2, N4, N13), where the `3131f710` pumpStop fix narrowed the MeshOS race but did not close it and did not generalize to the five Deck stream types with the same shape; and (c) a small cluster of polish gaps — partial 5-node sweep (N12), undecided seed-zeroization threat model (N14), and four `NET_CLI_PLAN.md` spec questions worth resolving before Phase 1 starts.
+The first-pass review's closeout is accurate: every fix it claims is wired in code, with regression tests where they matter. The verification pass surfaced new items concentrated in two areas: (a) consume-on-failure regressions in `simulate()` / `commit()` across all three FFIs (N3) — a latent footgun that the first review's `22f885eb` + `d1ccd36c` fixes introduced together but neither test suite exercises on the failure branch; (b) Go `Free`/`Close`-vs-in-flight-FFI thread-safety (N1, N2, N4, N13), where the `3131f710` pumpStop fix narrowed the MeshOS race but did not close it and did not generalize to the five Deck stream types with the same shape. The smaller cluster of polish gaps — partial 5-node sweep (N12) and undecided seed-zeroization threat model (N14) — round out the open items. The four `NET_CLI_PLAN.md` spec questions surfaced in this pass have since been resolved upstream (Kyra, 2026-05-17) and folded into the plan as locked decisions 11–14 plus phase-sequenced substrate dependencies.
 
 None of N1–N14 break HEAD today. N3 fires only when the substrate introduces a new `IceActionProposal` variant; N4/N13 are narrow ≤50 ms windows that require explicit `Free`/`Close` racing in-flight `Next`; the rest are polish, tests, or design clarifications. But N3, N4, N13, and N7 are the kind of regressions a v1 SDK release should not ship with — all four are localized fixes (clone-first, `done` channel for MeshOS pump, `done`/`sync.Mutex` for Deck streams, `Drop` impl).
 
-**No HEAD-blockers for merge.** Pre-v1 punch list: N3, N4, N7, N13. Polish, tests, threat-model decision, and CLI spec questions can land in follow-ups.
+**No HEAD-blockers for merge.** Pre-v1 punch list: N3, N4, N7, N13. Polish, tests, and seed-zeroization threat-model decision can land in follow-ups. CLI plan questions resolved.
