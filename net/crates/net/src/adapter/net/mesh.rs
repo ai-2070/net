@@ -432,7 +432,19 @@ struct DispatchCtx {
     /// `(origin_node_id, version)`. Written by the dispatch handler
     /// before indexing + forwarding so a `(origin, version)` tuple
     /// is processed at most once per node.
-    seen_announcements: Arc<DashMap<(u64, u64), std::time::Instant>>,
+    /// Per-(node_id, version, is_direct) dedup of capability
+    /// announcements. The `is_direct` axis (`hop_count == 0`)
+    /// keeps a forwarded ann's dedup from suppressing the same
+    /// peer's later direct announcement — the TOFU pin runs only
+    /// on the direct path, so a forwarder cannot poison the
+    /// dedup table for a peer's `(node_id, version)` and stop
+    /// the victim's `peer_entity_ids` mapping from populating.
+    /// Two diamond-arrived forwarded anns still dedup against
+    /// each other (both `is_direct == false`); two diamond-
+    /// arrived direct anns is a non-sequitur (`from_node ==
+    /// ann.node_id` on the direct path, so there's only one peer
+    /// that can produce one).
+    seen_announcements: Arc<DashMap<(u64, u64, bool), std::time::Instant>>,
     /// Whether inbound `CapabilityAnnouncement` packets without a
     /// signature are dropped. Validity is not enforced yet.
     require_signed_capabilities: bool,
@@ -1371,7 +1383,19 @@ pub struct MeshNode {
     /// announcement's effective lifetime (2× `ttl_secs`) has
     /// elapsed. Mirrors the `seen_pingwaves` cache in
     /// [`ProximityGraph`].
-    seen_announcements: Arc<DashMap<(u64, u64), std::time::Instant>>,
+    /// Per-(node_id, version, is_direct) dedup of capability
+    /// announcements. The `is_direct` axis (`hop_count == 0`)
+    /// keeps a forwarded ann's dedup from suppressing the same
+    /// peer's later direct announcement — the TOFU pin runs only
+    /// on the direct path, so a forwarder cannot poison the
+    /// dedup table for a peer's `(node_id, version)` and stop
+    /// the victim's `peer_entity_ids` mapping from populating.
+    /// Two diamond-arrived forwarded anns still dedup against
+    /// each other (both `is_direct == false`); two diamond-
+    /// arrived direct anns is a non-sequitur (`from_node ==
+    /// ann.node_id` on the direct path, so there's only one peer
+    /// that can produce one).
+    seen_announcements: Arc<DashMap<(u64, u64, bool), std::time::Instant>>,
     /// Timestamp of the most recent outbound capability-announcement
     /// broadcast from this origin. Compared against
     /// `config.min_announce_interval` on every `announce_capabilities_with`
@@ -5142,12 +5166,20 @@ impl MeshNode {
             return;
         }
 
-        // Dedup on (origin, version). A `(node_id, version)` tuple
-        // is processed at most once — protects against diamond
-        // topologies where the same announcement arrives twice via
-        // different paths. Insert happens AFTER validation so a
-        // malformed announcement doesn't poison the cache.
-        let dedup_key = (ann.node_id, ann.version);
+        // Dedup on (origin, version, is_direct). The third axis is
+        // `hop_count == 0` — without it, a forwarder that ships an
+        // announcement claiming a victim's `(node_id, version)`
+        // primes the cache and the victim's own direct ann arriving
+        // later is silently dropped, leaving `peer_entity_ids` un-
+        // populated for that peer and breaking subsequent
+        // channel-auth (TOFU pin runs only on the direct path).
+        // Diamond topologies are still protected: a forwarded ann
+        // dedups against any later forwarded ann for the same key;
+        // the direct path is a distinct key processed exactly once.
+        // Insert happens AFTER validation so a malformed
+        // announcement doesn't poison the cache.
+        let is_direct = ann.hop_count == 0;
+        let dedup_key = (ann.node_id, ann.version, is_direct);
         if ctx.seen_announcements.contains_key(&dedup_key) {
             return;
         }
