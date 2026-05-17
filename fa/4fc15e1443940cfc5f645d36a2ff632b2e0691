@@ -1,0 +1,25 @@
+net/crates/net/src/ffi/cortex.rs
+  s_b3022192a92c59::t_ae127880ca0bc3 2696-3019,3021-3023,3025,3027,3029-3034,3038-3042,3047,3050-3191
+  s_b3022192a92c59::t_02c84a26463983 3832-3992
+  s_b3022192a92c59::t_f90b32388322c8 39
+  s_b3022192a92c59::t_e8a4463b7959c3 3020,3024,3026,3028,3035-3037,3043-3046,3048-3049
+net/crates/net/include/net.go.h
+  s_b3022192a92c59::t_11089113edc515 342-369
+  s_b3022192a92c59::t_abec5554cb3890 257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "fa4fc15e1443940cfc5f645d36a2ff632b2e0691",
+  "prompts": {},
+  "sessions": {
+    "s_b3022192a92c59": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d594c56e-1353-4a07-aa91-e09d2c583c0f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
