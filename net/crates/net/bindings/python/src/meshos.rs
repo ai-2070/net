@@ -781,12 +781,11 @@ impl PyMeshOsDaemonHandle {
             py.detach(|| {
                 runtime.block_on(async {
                     let next: Option<CoreDaemonControl> = match timeout_ms {
-                        Some(ms) => tokio::time::timeout(
-                            Duration::from_millis(ms),
-                            handle.next_control(),
-                        )
-                        .await
-                        .unwrap_or_default(),
+                        Some(ms) => {
+                            tokio::time::timeout(Duration::from_millis(ms), handle.next_control())
+                                .await
+                                .unwrap_or_default()
+                        }
                         None => handle.next_control().await,
                     };
                     next
