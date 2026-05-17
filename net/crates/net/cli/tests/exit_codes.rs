@@ -32,13 +32,15 @@ fn code_0_on_success() {
 
 #[test]
 fn code_1_on_generic_error_missing_identity_file() {
+    // Build a path under a tempdir that we never write to —
+    // portable across Unix and Windows, and immune to a future
+    // operator who happens to have a `this/path/...` folder.
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("definitely-does-not-exist.toml");
     Command::cargo_bin("net")
         .unwrap()
-        .args([
-            "identity",
-            "show",
-            "/this/path/definitely/does/not/exist.toml",
-        ])
+        .args(["identity", "show"])
+        .arg(&missing)
         .assert()
         .code(1);
 }
