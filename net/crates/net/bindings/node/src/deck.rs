@@ -1329,15 +1329,25 @@ impl IceProposal {
     /// `simulate()` calls throw `DeckSdkError(kind: "already_simulated")`.
     #[napi]
     pub async fn simulate(&self) -> Result<SimulatedIceProposal> {
-        let action = self.state.lock().await.take().ok_or_else(|| {
-            deck_err(
-                "already_simulated",
-                "IceProposal was already consumed by simulate()",
-            )
-        })?;
+        let mut guard = self.state.lock().await;
+        let action = guard
+            .as_ref()
+            .ok_or_else(|| {
+                deck_err(
+                    "already_simulated",
+                    "IceProposal was already consumed by simulate()",
+                )
+            })?
+            .clone();
         let issued_at_ms = self.issued_at_ms;
-        let action_for_commit = action.clone();
-        let proposal = build_core_proposal(&self.client, action)?;
+        // Validate the variant before taking the action out of
+        // the mutex; an unknown-variant rejection leaves the
+        // husk retry-able instead of stranding it as consumed.
+        let proposal = build_core_proposal(&self.client, action.clone())?;
+        // From here the husk represents a real attempt.
+        guard.take();
+        drop(guard);
+        let action_for_commit = action;
         let blast = match proposal.simulate().await {
             Ok(sim) => sim.blast_radius().clone(),
             Err(e) => return Err(deck_err_from(e)),
@@ -1430,18 +1440,30 @@ impl SimulatedIceProposal {
     /// proposal — subsequent calls throw `already_committed`.
     #[napi]
     pub async fn commit(&self, signatures: Vec<OperatorSignatureJs>) -> Result<ChainCommitJs> {
-        let state = self.state.lock().await.take().ok_or_else(|| {
-            deck_err(
-                "already_committed",
-                "SimulatedIceProposal was already consumed by commit()",
-            )
-        })?;
+        let mut guard = self.state.lock().await;
+        let action = guard
+            .as_ref()
+            .ok_or_else(|| {
+                deck_err(
+                    "already_committed",
+                    "SimulatedIceProposal was already consumed by commit()",
+                )
+            })?
+            .action
+            .clone();
         let mut sigs = Vec::with_capacity(signatures.len());
         for s in signatures {
             sigs.push(s.into_core()?);
         }
         let client = self.client.clone();
-        let proposal = build_core_proposal(&client, state.action)?;
+        // Validate the variant before taking the state out of
+        // the mutex; an unknown-variant rejection leaves the
+        // husk retry-able.
+        let proposal = build_core_proposal(&client, action)?;
+        // Variant accepted: this husk now represents a real
+        // commit attempt and must refuse retries.
+        guard.take();
+        drop(guard);
         let simulated = proposal.simulate().await.map_err(deck_err_from)?;
         simulated
             .commit(&sigs)

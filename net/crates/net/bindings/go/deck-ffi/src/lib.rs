@@ -1791,10 +1791,23 @@ unsafe fn signatures_from_c(
 /// `ThawCluster` (the most destructive action). Callers
 /// translate the error into the standard last-error envelope
 /// with kind `"unknown_action"`.
+#[cfg(test)]
+thread_local! {
+    /// Per-thread fault-injection switch. Set to `true` to force
+    /// the next `build_core_proposal` call on this thread to
+    /// return `Err`; the call resets it. Thread-local so parallel
+    /// `cargo test` runs don't poison each other's expectations.
+    static FAIL_NEXT_BUILD_CORE_PROPOSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn build_core_proposal<'a>(
     client: &'a CoreClient,
     action: net::adapter::net::behavior::meshos::IceActionProposal,
 ) -> Result<CoreIceProposal<'a>, String> {
+    #[cfg(test)]
+    if FAIL_NEXT_BUILD_CORE_PROPOSAL.with(|c| c.replace(false)) {
+        return Err("fault injection: simulated unknown variant".to_string());
+    }
     use net::adapter::net::behavior::meshos::IceActionProposal as A;
     match action {
         A::FreezeCluster { ttl } => Ok(client.ice().freeze_cluster(ttl)),
@@ -2129,11 +2142,10 @@ pub extern "C" fn net_deck_ice_proposal_simulate(
         }
         let action = p.action.clone();
         let issued_at_ms = p.issued_at_ms;
-        // Mark consumed; `issued_at_ms` stays valid so
-        // `net_deck_ice_proposal_issued_at_ms` still returns the
-        // pinned value on the husk.
-        p.consumed = true;
         clear_last_error_inner();
+        // Validate the variant before flipping `consumed` so an
+        // unknown-variant rejection leaves the husk retry-able
+        // instead of stranding it as consumed-but-unused.
         let core_proposal = match build_core_proposal(inner, action.clone()) {
             Ok(p) => p,
             Err(msg) => {
@@ -2141,6 +2153,11 @@ pub extern "C" fn net_deck_ice_proposal_simulate(
                 return NET_DECK_ERR_CALL_FAILED;
             }
         };
+        // From here on the husk represents a real attempt. Mark
+        // consumed; `issued_at_ms` stays valid so
+        // `net_deck_ice_proposal_issued_at_ms` keeps returning
+        // the pinned value.
+        p.consumed = true;
         let blast = match runtime().block_on(core_proposal.simulate()) {
             Ok(sim) => sim.blast_radius().clone(),
             Err(e) => {
@@ -2268,10 +2285,11 @@ pub extern "C" fn net_deck_simulated_commit(
                 return NET_DECK_ERR_INVALID_ARG;
             }
         };
-        s.committed = true;
         clear_last_error_inner();
         let action = s.action.clone();
         let core_sigs: Vec<CoreOperatorSignature> = sigs.iter().map(|x| x.to_core()).collect();
+        // Validate the variant before flipping `committed` so an
+        // unknown-variant rejection leaves the husk retry-able.
         let proposal = match build_core_proposal(inner, action) {
             Ok(p) => p,
             Err(msg) => {
@@ -2279,6 +2297,10 @@ pub extern "C" fn net_deck_simulated_commit(
                 return NET_DECK_ERR_CALL_FAILED;
             }
         };
+        // From here on the husk represents a real commit attempt;
+        // refusing a retry is the correct behaviour even if the
+        // substrate-side commit later errors.
+        s.committed = true;
         let commit = runtime().block_on(async move {
             let simulated = proposal.simulate().await?;
             simulated.commit(&core_sigs).await
@@ -3493,6 +3515,96 @@ mod tests {
             after, before,
             "issued_at_ms must survive _simulate consumption (got {after}, was {before})"
         );
+
+        net_deck_simulated_free(simulated);
+        net_deck_ice_proposal_free(proposal);
+        net_deck_client_free(client);
+    }
+
+    /// Regression: if `build_core_proposal` rejects the variant
+    /// (a substrate enum has grown a new variant the binding
+    /// doesn't recognize), the husk must stay retry-able rather
+    /// than flip to `consumed`. Pre-fix the order was
+    /// `consumed = true; build_core_proposal(...)?` so an
+    /// unknown variant left an orphan husk and the next call
+    /// surfaced `already_simulated` instead of the real cause.
+    #[test]
+    fn ice_simulate_unknown_variant_leaves_husk_retryable() {
+        let client = make_client(0x55);
+        let mut proposal: *mut NetDeckIceProposal = ptr::null_mut();
+        assert_eq!(
+            net_deck_ice_freeze_cluster(client, 60_000, &mut proposal),
+            NET_DECK_OK
+        );
+
+        FAIL_NEXT_BUILD_CORE_PROPOSAL.with(|c| c.set(true));
+        let mut simulated: *mut NetDeckSimulatedIceProposal = ptr::null_mut();
+        let status = net_deck_ice_proposal_simulate(proposal, client, &mut simulated);
+        assert_eq!(status, NET_DECK_ERR_CALL_FAILED);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "unknown_action");
+        assert!(simulated.is_null());
+        net_deck_clear_last_error();
+
+        // Husk should still be usable — retry without fault
+        // injection must succeed, proving consumed never flipped.
+        assert_eq!(
+            net_deck_ice_proposal_simulate(proposal, client, &mut simulated),
+            NET_DECK_OK
+        );
+        assert!(!simulated.is_null());
+
+        net_deck_simulated_free(simulated);
+        net_deck_ice_proposal_free(proposal);
+        net_deck_client_free(client);
+    }
+
+    /// Same invariant on the commit path: an unknown variant must
+    /// not leave the simulated husk in the `committed` state.
+    /// The retry assertion is intentionally limited to checking
+    /// the kind != "already_committed" via an empty-signatures
+    /// retry — driving a real signed commit twice would invoke
+    /// the substrate path with no policy setup, which is out of
+    /// scope for this regression.
+    #[test]
+    fn ice_commit_unknown_variant_leaves_husk_retryable() {
+        let client = make_client(0x56);
+        let mut proposal: *mut NetDeckIceProposal = ptr::null_mut();
+        net_deck_ice_freeze_cluster(client, 60_000, &mut proposal);
+        let mut simulated: *mut NetDeckSimulatedIceProposal = ptr::null_mut();
+        net_deck_ice_proposal_simulate(proposal, client, &mut simulated);
+
+        let sig_bytes = [0x00u8; 64];
+        let sig = NetDeckOperatorSignature {
+            operator_id: 1,
+            signature_ptr: sig_bytes.as_ptr(),
+            signature_len: 64,
+        };
+
+        FAIL_NEXT_BUILD_CORE_PROPOSAL.with(|c| c.set(true));
+        let mut commit = NetDeckChainCommit::default();
+        let status = net_deck_simulated_commit(simulated, client, &sig, 1, &mut commit);
+        assert_eq!(status, NET_DECK_ERR_CALL_FAILED);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "unknown_action");
+        net_deck_clear_last_error();
+
+        // Retry with empty signatures — exercises the husk-state
+        // check before the substrate path. Pre-fix this would
+        // return "already_committed" (the husk had been
+        // mistakenly flipped). Post-fix it returns
+        // "insufficient_signatures" from the empty-sigs guard
+        // because the husk is still uncommitted.
+        let mut commit2 = NetDeckChainCommit::default();
+        let status =
+            net_deck_simulated_commit(simulated, client, ptr::null(), 0, &mut commit2);
+        assert_eq!(status, NET_DECK_ERR_CALL_FAILED);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(
+            kind, "insufficient_signatures",
+            "husk should still be uncommitted after unknown_action error, got kind={kind}"
+        );
+        net_deck_clear_last_error();
 
         net_deck_simulated_free(simulated);
         net_deck_ice_proposal_free(proposal);

@@ -1440,20 +1440,31 @@ impl PyIceProposal {
     /// Pre-execution preview. Consumes the proposal — subsequent
     /// calls raise `DeckSdkError(kind="already_simulated")`.
     fn simulate(&mut self, py: Python<'_>) -> PyResult<PySimulatedIceProposal> {
-        let action = self.action.take().ok_or_else(|| {
-            deck_err(
-                py,
-                "already_simulated",
-                "IceProposal was already consumed by simulate()",
-            )
-        })?;
+        let action = self
+            .action
+            .as_ref()
+            .ok_or_else(|| {
+                deck_err(
+                    py,
+                    "already_simulated",
+                    "IceProposal was already consumed by simulate()",
+                )
+            })?
+            .clone();
         let issued_at_ms = self.issued_at_ms;
         let runtime = self.runtime.clone();
         let client = self.client.clone();
-        let action_for_commit = action.clone();
+        // Validate the variant up-front. The husk only flips to
+        // consumed once we know the action is known to this
+        // binding, so an unknown-variant rejection leaves the
+        // proposal retry-able. Substrate-side simulate errors
+        // still consume the husk (matching Go + Node).
+        build_core_proposal(&client, action.clone()).map_err(|e| deck_err(py, e.kind, &e.message))?;
+        self.action = None;
+        let action_for_build = action.clone();
         let blast = py.detach(move || {
             runtime.block_on(async move {
-                let proposal = build_core_proposal(&client, action)?;
+                let proposal = build_core_proposal(&client, action_for_build)?;
                 proposal.simulate().await.map(|s| s.blast_radius().clone())
             })
         });
@@ -1461,7 +1472,7 @@ impl PyIceProposal {
             Ok(b) => Ok(PySimulatedIceProposal {
                 client: self.client.clone(),
                 runtime: self.runtime.clone(),
-                action: Some(action_for_commit),
+                action: Some(action),
                 issued_at_ms,
                 blast: b,
                 committed: false,
@@ -1549,20 +1560,30 @@ impl PySimulatedIceProposal {
                 "SimulatedIceProposal was already consumed by commit()",
             ));
         }
-        let action = self.action.take().ok_or_else(|| {
-            deck_err(
-                py,
-                "already_committed",
-                "SimulatedIceProposal was already consumed by commit()",
-            )
-        })?;
+        let action = self
+            .action
+            .as_ref()
+            .ok_or_else(|| {
+                deck_err(
+                    py,
+                    "already_committed",
+                    "SimulatedIceProposal was already consumed by commit()",
+                )
+            })?
+            .clone();
         let mut sigs = Vec::with_capacity(signatures.len());
         for d in signatures {
             sigs.push(operator_signature_from_dict(py, &d)?);
         }
-        self.committed = true;
         let runtime = self.runtime.clone();
         let client = self.client.clone();
+        // Validate the variant up-front so an unknown-variant
+        // rejection leaves the husk retry-able. Substrate-side
+        // simulate/commit errors still consume the husk (matching
+        // Go + Node).
+        build_core_proposal(&client, action.clone()).map_err(|e| deck_err(py, e.kind, &e.message))?;
+        self.action = None;
+        self.committed = true;
         let commit_result = py.detach(move || {
             runtime.block_on(async move {
                 let proposal = build_core_proposal(&client, action)?;
