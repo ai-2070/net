@@ -430,8 +430,7 @@ mod tests {
 
     #[test]
     fn non_tty_without_yes_refuses_with_code_8() {
-        let err =
-            check_confirm_gate(false, false, || panic!("prompt must not run")).unwrap_err();
+        let err = check_confirm_gate(false, false, || panic!("prompt must not run")).unwrap_err();
         assert_eq!(err.kind(), ExitCodeKind::ConfirmationRefused);
     }
 
