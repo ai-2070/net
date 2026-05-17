@@ -1,0 +1,22 @@
+net/crates/net/cli/src/commands/netdb.rs
+  s_5af7ced268385a::t_b4c8e15c11398d 106-206
+  s_5af7ced268385a::t_2a51bc9ab50aaf 33-34
+  s_5af7ced268385a::t_31126efe99d2d3 210-215,217-231,233-395,397-463
+  s_5af7ced268385a::t_c5c10a1c2b6935 41-48,55-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "2f9fdb29c3f9316990ec416bcbbabf48aa39c866",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
