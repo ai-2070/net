@@ -10,6 +10,25 @@ Wraps the `@ai2070/net` NAPI bindings with streaming, typed channels, and a deve
 npm install @ai2070/net-sdk @ai2070/net
 ```
 
+## Cargo features (transitive)
+
+`@ai2070/net-sdk` is pure TypeScript; every wrapper class dispatches into the underlying `@ai2070/net` napi-rs binding. Published `.node` artifacts ship every feature enabled, but anyone building from source via `napi build` needs to pass them — symbols from a disabled feature are absent at runtime and the TypeScript wrapper's `import` will fail with `undefined`.
+
+| Cargo feature | sdk-ts wrapper module | Surface |
+|---|---|---|
+| `cortex` | `@ai2070/net-sdk/cortex` (also re-exported top-level) | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, error types |
+| `meshdb` | `@ai2070/net-sdk/meshdb` | `MeshQuery`, `MeshQueryRunner`, `MeshQueryStream`, `QueryBuilder`, `InMemoryChainReader`, result + config types |
+| `meshos` | `@ai2070/net-sdk/meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `MeshOsDaemon` interface, `DaemonHealth`, `CapabilityAdvert` |
+| `compute` | `@ai2070/net-sdk/compute` | `DaemonRuntime`, `DaemonHandle`, `MigrationHandle`, daemon trait shapes |
+| `groups` | `@ai2070/net-sdk/groups` | `ReplicaGroup`, `ForkGroup`, `StandbyGroup`, group config types |
+| `deck` | `@ai2070/net-sdk/deck` | `DeckClient`, `OperatorIdentity`, admin / snapshot / status streams, ICE break-glass |
+| `redis` | `@ai2070/net-sdk` top-level | `RedisStreamDedup` |
+| `net` | `@ai2070/net-sdk/mesh` | `MeshNode`, `NetStream`, channel auth |
+
+The bus surface (`NetNode`, `EventStream`, capabilities, identity, predicates) is always present.
+
+The `default` Cargo feature set enables every flag, so `npm install` users get full functionality. If you're building from source for an embedded target, slim the feature set in `bindings/node/Cargo.toml` and rebuild via `npm run build:debug` (or `build` for release).
+
 ## Quick Start
 
 ```typescript

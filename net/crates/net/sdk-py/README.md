@@ -12,6 +12,22 @@ pip install ai2070-net-sdk
 
 The package publishes as `ai2070-net-sdk` on PyPI but imports as `from net_sdk import ...` (the in-source module name is preserved). The native binding `ai2070-net` is pulled in transitively as a dependency.
 
+## Cargo features (transitive)
+
+`net_sdk` is pure Python; every method-level surface dispatches into the underlying `net._net` PyO3 binding (the `ai2070-net` package). Which classes are reachable depends on which Cargo features that binding was built with — wheels from PyPI ship every feature enabled, source builds (`maturin develop`) need to ask.
+
+| Cargo feature | sdk-py wrapper module | Reaches into |
+|---|---|---|
+| `cortex` | `net_sdk.redex`, `net_sdk.cortex`, `net_sdk.netdb` | Redex, RedexFile, TasksAdapter, MemoriesAdapter, NetDb |
+| `meshdb` | `net_sdk.meshdb` | MeshQuery, MeshQueryRunner, QueryBuilder, Predicate, InMemoryChainReader |
+| `meshos` | `net_sdk.meshos` | MeshOsDaemonSdk, MeshOsDaemonHandle, Protocol class for daemon authors |
+| `dataforts` | (re-exported directly from `net_sdk` top-level) | BlobRef, MeshBlobAdapter, blob_publish, blob_resolve |
+| `compute` | (top-level) | DaemonRuntime, DaemonHandle, MigrationHandle |
+| `groups` | (top-level) | ReplicaGroup, ForkGroup, StandbyGroup |
+| `deck` | `net_sdk.deck` | DeckClient, OperatorIdentity, IceCommands |
+
+Each wrapper module fails fast with a clean `ImportError` if its required feature wasn't built into the wheel — the message points at the maturin command to rebuild with the missing feature.
+
 ## Quick Start
 
 ```python
