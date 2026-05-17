@@ -45,9 +45,16 @@ def _ensure_net_stub() -> None:
             setattr(stub, name, type(name, (), {}))
 
     # Future-proof against new top-level imports: any unknown attribute
-    # access on the stub module returns an opaque class.
+    # access on the stub module returns an opaque class. Names ending
+    # in `Error` are made Exception subclasses so wrapper modules
+    # whose `except` clauses reference them (`except CortexError:`)
+    # don't trip `TypeError: catching classes that do not inherit
+    # from BaseException`.
     def __getattr__(attr_name: str) -> type:
-        cls = type(attr_name, (), {})
+        if attr_name.endswith("Error"):
+            cls = type(attr_name, (Exception,), {})
+        else:
+            cls = type(attr_name, (), {})
         setattr(stub, attr_name, cls)
         return cls
 

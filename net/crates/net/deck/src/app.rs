@@ -291,7 +291,7 @@ pub struct App {
     /// Ephemeral "toast" message shown in the footer for
     /// ~3 seconds after an action. Used for confirming
     /// side-effects the operator can't see directly — e.g.
-    /// `[w]` exports report "wrote N records to <path>" so
+    /// `[w]` exports report `"wrote N records to <path>"` so
     /// the operator knows the file landed without leaving
     /// the TUI.
     pub toast: Option<(String, Instant)>,

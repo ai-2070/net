@@ -224,6 +224,19 @@ func OpenMemoriesAdapter(redex *Redex, originHash uint64, persistent bool) (*Mem
 	return a, nil
 }
 
+// newMemoriesAdapterFromRaw wraps a raw `*MemoriesAdapterHandle` (obtained
+// from another cgo file in the same package, e.g. `net_netdb_memories`)
+// into a `*MemoriesAdapter`. The handle must already be Arc-cloned by the
+// caller — freeing the returned adapter calls
+// `net_memories_adapter_free` exactly once.
+//
+// Used by NetDb.Memories() to bridge across the per-file cgo type wall.
+func newMemoriesAdapterFromRaw(handle unsafe.Pointer, originHash uint64) *MemoriesAdapter {
+	a := &MemoriesAdapter{handle: (*C.MemoriesAdapterHandle)(handle), originHash: originHash}
+	runtime.SetFinalizer(a, func(a *MemoriesAdapter) { _ = a.Close() })
+	return a
+}
+
 // OriginHash returns the adapter's bound origin_hash.
 func (a *MemoriesAdapter) OriginHash() uint64 {
 	return a.originHash

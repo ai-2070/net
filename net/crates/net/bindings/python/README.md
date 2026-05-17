@@ -10,6 +10,27 @@ pip install ai2070-net
 
 The package publishes as `ai2070-net` on PyPI but imports as `from net import ...` (the in-source module name is preserved). For the higher-level Pythonic surface (generators, typed channels, dataclass/Pydantic support), install [`ai2070-net-sdk`](../../sdk-py/) instead — it depends on this package.
 
+## Cargo features
+
+The PyO3 binding wraps a feature-gated Rust crate. Wheels published to PyPI ship with every feature enabled, but anyone building from source with `maturin develop` / `maturin build` needs to ask for the features they want — symbols from a disabled feature are silently absent from `net._net` and the matching `from net import ...` block in `net/__init__.py` quietly skips them.
+
+| Cargo feature | Surface (Python classes) | Notes |
+|---|---|---|
+| `cortex` | `Redex`, `RedexFile`, `RedexEvent`, `TasksAdapter`, `MemoriesAdapter`, `Task`, `Memory`, `NetDb`, `CortexError`, `RedexError`, `NetDbError` | Required by `meshos` and `dataforts`. |
+| `meshdb` | `MeshQuery`, `MeshQueryRunner`, `QueryBuilder`, `Predicate`, `ResultRow`, `AggregateResult`, `JoinedRow`, `LineageEntry`, `CachePolicy`, `ExecuteOptions`, `GroupKey`, `WindowBoundary`, `InMemoryChainReader`, `MeshDbError` | Independent. |
+| `meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `MeshOsSdkError` | Pulls in `compute` + `cortex`. |
+| `dataforts` | `BlobRef`, `BlobError`, `MeshBlobAdapter`, `blob_publish`, `blob_resolve`, adapter registry | Pulls in `cortex` + `net`. |
+| `compute` | `DaemonRuntime`, `DaemonHandle`, `CausalEvent`, `DaemonError`, `MigrationHandle`, `MigrationError` | Required by `meshos` and `groups`. |
+| `groups` | `ReplicaGroup`, `ForkGroup`, `StandbyGroup`, `GroupError` | Pulls in `compute`. |
+| `deck` | `DeckClient`, `OperatorIdentity`, `AdminCommands`, `SnapshotStream`, `StatusSummaryStream`, `IceCommands`, `OperatorRegistry`, `AdminVerifier`, `DeckSdkError` | Pulls in `meshos`. |
+| `net` | `NetMesh`, `NetStream`, `NetKeypair`, `Identity`, token / channel-auth helpers | Encrypted mesh transport + per-peer streams. |
+| `redis` | `RedisStreamDedup` | Redis Streams adapter dedup helper. |
+| `jetstream` | (no Python surface yet) | NATS JetStream adapter — Rust-only. |
+
+All are enabled by default in `Cargo.toml`. Disable with `maturin develop --no-default-features --features "<list>"` if you need a thinner wheel.
+
+The `net.__init__` module try-imports each family conditionally, so a wheel built without (say) `meshos` won't surface `MeshOsDaemonSdk` and the corresponding `from net import MeshOsDaemonSdk` raises `ImportError` cleanly.
+
 ## Quick Start
 
 ```python
@@ -1015,6 +1036,30 @@ Core semantics live in the main
 2. **Use `ingest_raw_batch()` for bulk operations** - Reduces per-call overhead
 3. **Increase `ring_buffer_capacity`** - Larger buffers handle bursts better
 4. **Match `num_shards` to CPU cores** - Default is optimal for most cases
+
+## Cargo features
+
+The five feature flags that gate the storage / query / OS surfaces on this binding. Wheels built without a feature silently omit its symbols — the build never warns. `bindings/python/python/net/__init__.py` try-imports each block individually, so `from net import Redex` raises `ImportError` (not `AttributeError`) when the underlying `_net` extension was compiled without `cortex`.
+
+| Feature | Surface enabled in the PyO3 module |
+|---|---|
+| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, `Task`, `Memory`, watch iterators, `RedexError`, `CortexError`, `NetDbError` |
+| `redex-disk` | Disk-backed persistence for RedEX — the `persistent_dir` ctor arg and `Persistent: true` on `open_file`. Without it the persistent path returns `RedexError`. |
+| `netdb` | `NetDb` composition over Tasks + Memories (requires `cortex`). The `net_netdb_*` FFI entry points ship with this feature. |
+| `meshdb` | `MeshQuery`, `MeshQueryRunner`, `QueryBuilder`, `Predicate`, `InMemoryChainReader`, the rest of the query layer, plus the `libnet_meshdb` cdylib. |
+| `meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, plus the `libnet_meshos` cdylib. |
+
+Enable at build time:
+
+```bash
+# Dev install into the active venv:
+maturin develop --features "cortex netdb redex-disk meshdb meshos"
+
+# Or produce a wheel:
+maturin build --release --features "cortex netdb redex-disk meshdb meshos"
+```
+
+PyPI wheels published as `ai2070-net` ship with every feature enabled; the flags above only matter for source builds.
 
 ## License
 

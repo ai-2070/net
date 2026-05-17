@@ -36,6 +36,7 @@ use crate::adapter::net::cortex::tasks::{
     TasksWatcher,
 };
 use crate::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
+use crate::adapter::net::netdb::{NetDbError as InnerNetDbError, NetDbSnapshot};
 use crate::adapter::net::redex::{
     FsyncPolicy, Redex as InnerRedex, RedexError, RedexEvent, RedexFile as InnerRedexFile,
     RedexFileConfig, WriteToken as InnerWriteToken,
@@ -51,10 +52,6 @@ use super::NetError;
 
 pub(crate) const NET_ERR_CORTEX_CLOSED: c_int = -100;
 pub(crate) const NET_ERR_CORTEX_FOLD: c_int = -101;
-// Exported via the Go header (`net.h` / `ErrNetDb`) for forward
-// compatibility with future NetDb-layer errors; no current FFI site
-// returns it, hence the allow.
-#[allow(dead_code)]
 pub(crate) const NET_ERR_NETDB: c_int = -102;
 pub(crate) const NET_ERR_REDEX: c_int = -103;
 pub(crate) const NET_ERR_TIMEOUT: c_int = 1;
@@ -2696,6 +2693,502 @@ pub extern "C" fn net_memories_watch_free(cursor: *mut MemoriesWatchHandle) {
     }
 }
 
+// =========================================================================
+// NetDb — unified cross-adapter façade
+// =========================================================================
+//
+// Composes RedEX + Tasks + Memories under a single handle. The Rust core
+// (`adapter/net/netdb/db.rs`) consumes `Redex` by value; the FFI cannot do
+// that from an `Arc<InnerRedex>` shared with the parent `RedexHandle`, so
+// the bundle is composed here directly. Snapshot bytes round-trip through
+// the same `NetDbSnapshot` postcard format the Rust + napi + PyO3 surfaces
+// emit, so a bundle captured in Rust restores in Go/C and vice versa.
+
+#[derive(Deserialize)]
+struct NetDbOpenConfigJson {
+    /// origin_hash stamped on every EventMeta by bundled adapters.
+    origin_hash: u64,
+    /// Use persistent-mode RedEX files for every enabled model. Requires
+    /// the parent Redex to have been built with a persistent_dir.
+    #[serde(default)]
+    persistent: bool,
+    /// Include the tasks model.
+    #[serde(default)]
+    with_tasks: bool,
+    /// Include the memories model.
+    #[serde(default)]
+    with_memories: bool,
+}
+
+/// FFI handle wrapping a NetDb bundle.
+///
+/// Holds an Arc-clone of the parent `Redex` plus optional Arc handles to
+/// each enabled adapter. Returned via [`net_netdb_open`] /
+/// [`net_netdb_open_from_snapshot`]; freed via [`net_netdb_free`]. The
+/// adapter Arcs are also re-handed-out via [`net_netdb_tasks`] /
+/// [`net_netdb_memories`] as independent `TasksAdapterHandle` /
+/// `MemoriesAdapterHandle` allocations — those handles must be freed
+/// separately and survive their parent NetDb being freed (Arc semantics).
+pub struct NetDbHandle {
+    #[allow(dead_code)] // kept alive so the adapters' underlying RedEX files outlive us
+    redex: ManuallyDrop<Arc<InnerRedex>>,
+    tasks: Option<ManuallyDrop<Arc<InnerTasksAdapter>>>,
+    memories: Option<ManuallyDrop<Arc<InnerMemoriesAdapter>>>,
+    guard: HandleGuard,
+}
+
+fn parse_netdb_config(
+    config_json: *const c_char,
+) -> std::result::Result<NetDbOpenConfigJson, c_int> {
+    if config_json.is_null() {
+        return Err(NetError::NullPointer.into());
+    }
+    let s = match unsafe { c_str_to_owned(config_json) } {
+        Some(s) => s,
+        None => return Err(NetError::InvalidUtf8.into()),
+    };
+    serde_json::from_str(&s).map_err(|_| NetError::InvalidJson.into())
+}
+
+fn netdb_redex_config(persistent: bool) -> RedexFileConfig {
+    if persistent {
+        RedexFileConfig::default().with_persistent(true)
+    } else {
+        RedexFileConfig::default()
+    }
+}
+
+/// Tuple shape that the NetDb-builder closures emit on success — the
+/// owning Arc for the parent Redex plus an Option-wrapped Arc per
+/// enabled adapter. Factored out so clippy's `type_complexity` lint
+/// doesn't trip on the inline form.
+type NetDbBuildOutcome = (
+    Arc<InnerRedex>,
+    Option<Arc<InnerTasksAdapter>>,
+    Option<Arc<InnerMemoriesAdapter>>,
+);
+
+fn build_netdb_handle(
+    redex_arc: Arc<InnerRedex>,
+    tasks: Option<Arc<InnerTasksAdapter>>,
+    memories: Option<Arc<InnerMemoriesAdapter>>,
+) -> *mut NetDbHandle {
+    let handle = Box::new(NetDbHandle {
+        redex: ManuallyDrop::new(redex_arc),
+        tasks: tasks.map(ManuallyDrop::new),
+        memories: memories.map(ManuallyDrop::new),
+        guard: HandleGuard::new(),
+    });
+    Box::into_raw(handle)
+}
+
+/// Open a NetDb bundle against an existing `Redex`. `config_json` shape:
+/// `{"origin_hash": u64, "persistent": bool, "with_tasks": bool,
+/// "with_memories": bool}`. Failure-atomic: if the second adapter open
+/// fails, the first is closed before returning `NET_ERR_NETDB`.
+///
+/// Returns:
+///   * `0` on success — `*out_handle` owns a fresh `NetDbHandle`.
+///   * `NetError::NullPointer` (`-1`) on null inputs.
+///   * `NetError::InvalidUtf8` / `NetError::InvalidJson` on bad config.
+///   * `NetError::ShuttingDown` when the parent Redex is in `_free`.
+///   * `NET_ERR_NETDB` when any adapter open fails.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_netdb_open(
+    redex: *mut RedexHandle,
+    config_json: *const c_char,
+    out_handle: *mut *mut NetDbHandle,
+) -> c_int {
+    if redex.is_null() || out_handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    unsafe {
+        *out_handle = ptr::null_mut();
+    }
+    let cfg = match parse_netdb_config(config_json) {
+        Ok(c) => c,
+        Err(rc) => return rc,
+    };
+    let redex_ref = unsafe { &*redex };
+    let _op = match redex_ref.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let redex_arc: Arc<InnerRedex> = Arc::clone(&redex_ref.inner);
+    let file_cfg = netdb_redex_config(cfg.persistent);
+
+    let result = block_on(async move {
+        let tasks = if cfg.with_tasks {
+            match InnerTasksAdapter::open_with_config(&redex_arc, cfg.origin_hash, file_cfg.clone())
+                .await
+            {
+                Ok(t) => Some(Arc::new(t)),
+                Err(e) => return Err((redex_arc, e.to_string())),
+            }
+        } else {
+            None
+        };
+        let memories = if cfg.with_memories {
+            match InnerMemoriesAdapter::open_with_config(&redex_arc, cfg.origin_hash, file_cfg)
+                .await
+            {
+                Ok(m) => Some(Arc::new(m)),
+                Err(e) => {
+                    // First-wins rollback: close tasks if it opened.
+                    if let Some(t) = &tasks {
+                        let _ = t.close();
+                    }
+                    return Err((redex_arc, e.to_string()));
+                }
+            }
+        } else {
+            None
+        };
+        Ok((redex_arc, tasks, memories))
+    });
+    match result {
+        Ok((redex_arc, tasks, memories)) => {
+            let h = build_netdb_handle(redex_arc, tasks, memories);
+            unsafe {
+                *out_handle = h;
+            }
+            0
+        }
+        Err(_) => NET_ERR_NETDB,
+    }
+}
+
+/// Restore a NetDb from a postcard-encoded `NetDbSnapshot` bundle. For
+/// each enabled model whose bundle entry is `Some`, restore from that
+/// entry; otherwise open from scratch. Same failure-atomicity guarantee
+/// as [`net_netdb_open`]. `bundle_len == 0` is treated as a no-op
+/// "open from scratch" — equivalent to `net_netdb_open`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_netdb_open_from_snapshot(
+    redex: *mut RedexHandle,
+    config_json: *const c_char,
+    bundle: *const u8,
+    bundle_len: usize,
+    out_handle: *mut *mut NetDbHandle,
+) -> c_int {
+    if redex.is_null() || out_handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    unsafe {
+        *out_handle = ptr::null_mut();
+    }
+    if bundle.is_null() && bundle_len != 0 {
+        return NetError::NullPointer.into();
+    }
+    let cfg = match parse_netdb_config(config_json) {
+        Ok(c) => c,
+        Err(rc) => return rc,
+    };
+    let snapshot: Option<NetDbSnapshot> = if bundle_len == 0 {
+        None
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(bundle, bundle_len) };
+        match NetDbSnapshot::decode(slice) {
+            Ok(s) => Some(s),
+            Err(_) => return NET_ERR_NETDB,
+        }
+    };
+    let redex_ref = unsafe { &*redex };
+    let _op = match redex_ref.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let redex_arc: Arc<InnerRedex> = Arc::clone(&redex_ref.inner);
+    let file_cfg = netdb_redex_config(cfg.persistent);
+
+    let result: std::result::Result<NetDbBuildOutcome, String> = block_on(async move {
+        let tasks = match (
+            cfg.with_tasks,
+            snapshot.as_ref().and_then(|s| s.tasks.as_ref()),
+        ) {
+            (true, Some((bytes, last_seq))) => Some(Arc::new(
+                InnerTasksAdapter::open_from_snapshot_with_config(
+                    &redex_arc,
+                    cfg.origin_hash,
+                    file_cfg.clone(),
+                    bytes,
+                    *last_seq,
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+            )),
+            (true, None) => Some(Arc::new(
+                InnerTasksAdapter::open_with_config(&redex_arc, cfg.origin_hash, file_cfg.clone())
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )),
+            (false, _) => None,
+        };
+        let memories = match (
+            cfg.with_memories,
+            snapshot.as_ref().and_then(|s| s.memories.as_ref()),
+        ) {
+            (true, Some((bytes, last_seq))) => {
+                match InnerMemoriesAdapter::open_from_snapshot_with_config(
+                    &redex_arc,
+                    cfg.origin_hash,
+                    file_cfg,
+                    bytes,
+                    *last_seq,
+                )
+                .await
+                {
+                    Ok(m) => Some(Arc::new(m)),
+                    Err(e) => {
+                        if let Some(t) = &tasks {
+                            let _ = t.close();
+                        }
+                        return Err(e.to_string());
+                    }
+                }
+            }
+            (true, None) => {
+                match InnerMemoriesAdapter::open_with_config(&redex_arc, cfg.origin_hash, file_cfg)
+                    .await
+                {
+                    Ok(m) => Some(Arc::new(m)),
+                    Err(e) => {
+                        if let Some(t) = &tasks {
+                            let _ = t.close();
+                        }
+                        return Err(e.to_string());
+                    }
+                }
+            }
+            (false, _) => None,
+        };
+        Ok((redex_arc, tasks, memories))
+    });
+    match result {
+        Ok((redex_arc, tasks, memories)) => {
+            let h = build_netdb_handle(redex_arc, tasks, memories);
+            unsafe {
+                *out_handle = h;
+            }
+            0
+        }
+        Err(_) => NET_ERR_NETDB,
+    }
+}
+
+/// Capture a per-model snapshot bundle. On success allocates a
+/// `Vec<u8>` and hands its parts to the caller — caller MUST free via
+/// [`net_netdb_free_bundle`]. The wire format is the postcard encoding
+/// of `NetDbSnapshot` and round-trips with the Rust + napi + PyO3
+/// snapshot calls.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_netdb_snapshot(
+    handle: *mut NetDbHandle,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    if handle.is_null() || out_bytes.is_null() || out_len.is_null() {
+        return NetError::NullPointer.into();
+    }
+    unsafe {
+        *out_bytes = ptr::null_mut();
+        *out_len = 0;
+    }
+    let netdb = unsafe { &*handle };
+    let _op = match netdb.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let tasks_snap = match &netdb.tasks {
+        Some(t) => match t.snapshot() {
+            Ok(s) => Some(s),
+            Err(_) => return NET_ERR_NETDB,
+        },
+        None => None,
+    };
+    let mem_snap = match &netdb.memories {
+        Some(m) => match m.snapshot() {
+            Ok(s) => Some(s),
+            Err(_) => return NET_ERR_NETDB,
+        },
+        None => None,
+    };
+    let bundle = NetDbSnapshot {
+        tasks: tasks_snap,
+        memories: mem_snap,
+    };
+    let encoded: Vec<u8> = match bundle.encode() {
+        Ok(v) => v,
+        Err(_) => return NET_ERR_NETDB,
+    };
+    let boxed: Box<[u8]> = encoded.into_boxed_slice();
+    let len = boxed.len();
+    let slice_ptr: *mut [u8] = Box::into_raw(boxed);
+    unsafe {
+        *out_bytes = slice_ptr as *mut u8;
+        *out_len = len;
+    }
+    0
+}
+
+/// Free a snapshot bundle produced by [`net_netdb_snapshot`]. NULL-safe.
+/// Caller MUST pass the exact (ptr, len) pair returned by the snapshot
+/// call; passing a different `len` or a pointer not originated from
+/// `net_netdb_snapshot` is undefined behavior.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_netdb_free_bundle(bytes: *mut u8, len: usize) {
+    if bytes.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: paired with `Box::into_raw(Box<[u8]>)` from
+    // `net_netdb_snapshot`. The `(ptr, len)` shape is recreated via
+    // `slice_from_raw_parts_mut` so `Box::from_raw` reconstructs the
+    // original `Box<[u8]>` and drops it.
+    unsafe {
+        let slice_ptr = std::ptr::slice_from_raw_parts_mut(bytes, len);
+        drop(Box::from_raw(slice_ptr));
+    }
+}
+
+/// Hand out an Arc-cloned `TasksAdapterHandle` from this NetDb. The
+/// returned handle is independent — freeing it does NOT close the
+/// underlying adapter (the NetDb still holds its own clone). Returns
+/// `NET_ERR_NETDB` if the tasks model wasn't enabled at open time.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_netdb_tasks(
+    handle: *mut NetDbHandle,
+    out_handle: *mut *mut TasksAdapterHandle,
+) -> c_int {
+    if handle.is_null() || out_handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    unsafe {
+        *out_handle = ptr::null_mut();
+    }
+    let netdb = unsafe { &*handle };
+    let _op = match netdb.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let inner = match &netdb.tasks {
+        Some(t) => Arc::clone(t),
+        None => return NET_ERR_NETDB,
+    };
+    let h = Box::new(TasksAdapterHandle {
+        inner: ManuallyDrop::new(inner),
+        guard: HandleGuard::new(),
+    });
+    unsafe {
+        *out_handle = Box::into_raw(h);
+    }
+    0
+}
+
+/// Mirror of [`net_netdb_tasks`] for the memories model.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_netdb_memories(
+    handle: *mut NetDbHandle,
+    out_handle: *mut *mut MemoriesAdapterHandle,
+) -> c_int {
+    if handle.is_null() || out_handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    unsafe {
+        *out_handle = ptr::null_mut();
+    }
+    let netdb = unsafe { &*handle };
+    let _op = match netdb.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let inner = match &netdb.memories {
+        Some(m) => Arc::clone(m),
+        None => return NET_ERR_NETDB,
+    };
+    let h = Box::new(MemoriesAdapterHandle {
+        inner: ManuallyDrop::new(inner),
+        guard: HandleGuard::new(),
+    });
+    unsafe {
+        *out_handle = Box::into_raw(h);
+    }
+    0
+}
+
+/// Close every enabled adapter on this NetDb. Idempotent. Surfaces the
+/// first adapter's close error, logs the second so a double-failure is
+/// observable — matches the Rust core's `NetDb::close()` semantics. The
+/// underlying RedEX files stay open on the parent manager.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_netdb_close(handle: *mut NetDbHandle) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let netdb = unsafe { &*handle };
+    let _op = match netdb.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let tasks_err = netdb
+        .tasks
+        .as_ref()
+        .map(|t| t.close())
+        .unwrap_or(Ok(()))
+        .err();
+    let mem_err = netdb
+        .memories
+        .as_ref()
+        .map(|m| m.close())
+        .unwrap_or(Ok(()))
+        .err();
+    match (tasks_err, mem_err) {
+        (None, None) => 0,
+        (Some(_), None) | (None, Some(_)) => NET_ERR_NETDB,
+        (Some(t), Some(m)) => {
+            // Surface tasks' error; log memories' so it's observable.
+            tracing::warn!(
+                tasks_error = %t,
+                memories_error = %m,
+                "net_netdb_close: both adapters failed; surfacing tasks and logging memories",
+            );
+            NET_ERR_NETDB
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn net_netdb_free(handle: *mut NetDbHandle) {
+    if handle.is_null() {
+        return;
+    }
+    let h: &NetDbHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        unsafe {
+            if let Some(t) = (*handle).tasks.as_mut() {
+                ManuallyDrop::drop(t);
+            }
+            if let Some(m) = (*handle).memories.as_mut() {
+                ManuallyDrop::drop(m);
+            }
+            ManuallyDrop::drop(&mut (*handle).redex);
+        }
+    } else {
+        tracing::warn!(
+            "net_netdb_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
+    }
+}
+
+// Re-export of `NetDbError` is intentional: the FFI doesn't expose the
+// variant set directly (errors collapse to `NET_ERR_NETDB`), but a future
+// "detailed error" surface would consume this. Keeping the import alive
+// also pins the doc cross-link from `cortex.rs` to `netdb/error.rs`.
+#[allow(dead_code)]
+fn _netdb_error_keep_alive(e: InnerNetDbError) -> InnerNetDbError {
+    e
+}
+
 // ABI-visible no-op to force the linker to keep `c_void` happy on
 // some older linkers; harmless otherwise.
 #[doc(hidden)]
@@ -3334,6 +3827,161 @@ mod tests {
             "post-disable Prometheus text must be empty; got {after_text:?}"
         );
 
+        net_redex_free(r);
+    }
+
+    // =====================================================================
+    // NetDb FFI — composition, accessors, snapshot round-trip
+    // =====================================================================
+
+    /// Helper: open a NetDb with both adapters enabled.
+    fn open_full_netdb(r: *mut RedexHandle, origin: u64, persistent: bool) -> *mut NetDbHandle {
+        let cfg = format!(
+            r#"{{"origin_hash":{origin},"persistent":{persistent},"with_tasks":true,"with_memories":true}}"#,
+            origin = origin,
+            persistent = persistent,
+        );
+        let cfg_c = CString::new(cfg).unwrap();
+        let mut h: *mut NetDbHandle = ptr::null_mut();
+        let rc = net_netdb_open(r, cfg_c.as_ptr(), &mut h);
+        assert_eq!(rc, 0, "net_netdb_open should succeed (rc={rc})");
+        assert!(!h.is_null());
+        h
+    }
+
+    /// `net_netdb_open` must pre-zero `*out_handle` on every non-success
+    /// return so a caller that doesn't strictly check the rc still sees
+    /// `null` rather than stale stack data.
+    #[test]
+    fn netdb_open_zeroes_out_handle_on_error() {
+        let r = redex();
+        let bad = CString::new("not json").unwrap();
+        let sentinel = 0xDEAD_BEEF_usize as *mut NetDbHandle;
+        let mut h: *mut NetDbHandle = sentinel;
+        let rc = net_netdb_open(r, bad.as_ptr(), &mut h);
+        assert_eq!(rc, NetError::InvalidJson as c_int);
+        assert!(h.is_null(), "expected null on error, got {h:?}");
+        net_redex_free(r);
+    }
+
+    /// Asking `net_netdb_tasks` for a model that wasn't enabled at open
+    /// time must return `NET_ERR_NETDB` and leave `*out_handle` null.
+    #[test]
+    fn netdb_accessor_rejects_unenabled_model() {
+        let r = redex();
+        let cfg =
+            CString::new(r#"{"origin_hash":42,"with_tasks":true,"with_memories":false}"#).unwrap();
+        let mut db: *mut NetDbHandle = ptr::null_mut();
+        assert_eq!(net_netdb_open(r, cfg.as_ptr(), &mut db), 0);
+
+        // Tasks was enabled → accessor succeeds.
+        let mut t: *mut TasksAdapterHandle = ptr::null_mut();
+        assert_eq!(net_netdb_tasks(db, &mut t), 0);
+        assert!(!t.is_null());
+        net_tasks_adapter_free(t);
+
+        // Memories was NOT enabled → accessor returns NET_ERR_NETDB.
+        let sentinel = 0xDEAD_BEEF_usize as *mut MemoriesAdapterHandle;
+        let mut m: *mut MemoriesAdapterHandle = sentinel;
+        let rc = net_netdb_memories(db, &mut m);
+        assert_eq!(rc, NET_ERR_NETDB);
+        assert!(m.is_null(), "expected null on error, got {m:?}");
+
+        net_netdb_free(db);
+        net_redex_free(r);
+    }
+
+    /// Snapshot bytes round-trip: capture a bundle from a populated
+    /// NetDb, restore into a fresh NetDb, and verify the restored Tasks
+    /// adapter sees the original task. Confirms the postcard wire
+    /// format is stable across the FFI boundary.
+    #[test]
+    fn netdb_snapshot_roundtrips_through_ffi() {
+        let r = redex();
+        let db = open_full_netdb(r, 0xDEAD_BEEF, false);
+
+        // Seed: create one task on the source DB.
+        let mut t: *mut TasksAdapterHandle = ptr::null_mut();
+        assert_eq!(net_netdb_tasks(db, &mut t), 0);
+        let title = CString::new("first").unwrap();
+        let mut seq: u64 = 0;
+        assert_eq!(
+            net_tasks_create(t, 1, title.as_ptr(), 1_000_000, &mut seq),
+            0
+        );
+        // Wait for the fold to apply so the snapshot has the task baked in.
+        assert_eq!(net_tasks_wait_for_seq(t, seq, 500), 0);
+        net_tasks_adapter_free(t);
+
+        // Capture snapshot.
+        let mut bytes: *mut u8 = ptr::null_mut();
+        let mut len: usize = 0;
+        assert_eq!(net_netdb_snapshot(db, &mut bytes, &mut len), 0);
+        assert!(!bytes.is_null());
+        assert!(len > 0, "snapshot bundle should not be empty");
+
+        // Close + free the source DB; the task survives in the bundle.
+        let _ = net_netdb_close(db);
+        net_netdb_free(db);
+
+        // Restore into a fresh DB.
+        let cfg =
+            CString::new(r#"{"origin_hash":3735928559,"with_tasks":true,"with_memories":true}"#)
+                .unwrap();
+        let mut db2: *mut NetDbHandle = ptr::null_mut();
+        let rc = net_netdb_open_from_snapshot(r, cfg.as_ptr(), bytes, len, &mut db2);
+        assert_eq!(rc, 0, "restore should succeed (rc={rc})");
+        assert!(!db2.is_null());
+
+        // Read back tasks and verify the original task is present.
+        let mut t2: *mut TasksAdapterHandle = ptr::null_mut();
+        assert_eq!(net_netdb_tasks(db2, &mut t2), 0);
+        let filter = CString::new("{}").unwrap();
+        let mut list_json: *mut c_char = ptr::null_mut();
+        let mut list_len: usize = 0;
+        assert_eq!(
+            net_tasks_list(t2, filter.as_ptr(), &mut list_json, &mut list_len),
+            0
+        );
+        let list = unsafe { CStr::from_ptr(list_json) }
+            .to_string_lossy()
+            .into_owned();
+        super::super::net_free_string(list_json);
+        assert!(
+            list.contains("\"first\""),
+            "restored task list should contain the seeded title; got {list}"
+        );
+        net_tasks_adapter_free(t2);
+
+        net_netdb_free_bundle(bytes, len);
+        net_netdb_free(db2);
+        net_redex_free(r);
+    }
+
+    /// `net_netdb_free_bundle` must NULL-safe-accept null / zero-len
+    /// inputs so callers don't need to branch before freeing on the
+    /// error path (where the rc != 0 contract leaves bytes==null).
+    #[test]
+    fn netdb_free_bundle_is_null_safe() {
+        // Both no-ops; the test passes if neither aborts.
+        net_netdb_free_bundle(ptr::null_mut(), 0);
+        net_netdb_free_bundle(ptr::null_mut(), 16);
+        let mut buf: Vec<u8> = vec![0u8; 4];
+        net_netdb_free_bundle(buf.as_mut_ptr(), 0);
+    }
+
+    /// `net_netdb_open_from_snapshot` with `bundle_len == 0` opens from
+    /// scratch (no entries to restore). Equivalent to `net_netdb_open`.
+    #[test]
+    fn netdb_open_from_empty_snapshot_opens_from_scratch() {
+        let r = redex();
+        let cfg =
+            CString::new(r#"{"origin_hash":1,"with_tasks":true,"with_memories":false}"#).unwrap();
+        let mut db: *mut NetDbHandle = ptr::null_mut();
+        let rc = net_netdb_open_from_snapshot(r, cfg.as_ptr(), ptr::null(), 0, &mut db);
+        assert_eq!(rc, 0);
+        assert!(!db.is_null());
+        net_netdb_free(db);
         net_redex_free(r);
     }
 }

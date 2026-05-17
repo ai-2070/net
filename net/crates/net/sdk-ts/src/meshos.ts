@@ -215,6 +215,26 @@ export interface CausalEvent {
 // ----------------------------------------------------------------------------
 
 /**
+ * Daemon health envelope. Either a plain string discriminator
+ * (`'healthy'` / `'degraded'` / `'unhealthy'`) or an object form
+ * carrying an optional `reason` that rides into the substrate's
+ * `Degraded { reason }` variant.
+ */
+export type DaemonHealth =
+  | 'healthy'
+  | 'degraded'
+  | 'unhealthy'
+  | { kind: 'healthy' | 'degraded' | 'unhealthy'; reason?: string };
+
+/**
+ * Capability tag advertisement. Mirrors the `requiredCapabilities`
+ * / `optionalCapabilities` slot consumed by the substrate's
+ * placement filter. Either a static `string[]` or a `() => string[]`
+ * callable resolved once at registration time.
+ */
+export type CapabilityAdvert = string[] | (() => string[]);
+
+/**
  * A MeshOS-supervised daemon. Required: `name` (string property) +
  * `process(event)` (returns `Buffer[]` per inbound event, or `[]`
  * for sinks).
@@ -227,6 +247,13 @@ export interface CausalEvent {
  *  - `onControl(event: DaemonControl)` — trait callback; the SDK
  *    *also* delivers the same event over `controlEvents()`. Use
  *    whichever delivery model fits.
+ *  - `health()` — return liveness state; default `'healthy'`.
+ *  - `saturation()` — return load factor in `[0.0, 1.0]`; default 0.
+ *
+ * Optional properties:
+ *  - `requiredCapabilities` / `optionalCapabilities` — static tag
+ *    list or callable returning one. Resolved once at registration
+ *    time and cached on the substrate side.
  */
 export interface MeshOsDaemon {
   name: string;
@@ -234,6 +261,10 @@ export interface MeshOsDaemon {
   snapshot?(): Buffer | null;
   restore?(state: Buffer): void;
   onControl?(event: DaemonControl): void;
+  health?(): DaemonHealth;
+  saturation?(): number;
+  requiredCapabilities?: CapabilityAdvert;
+  optionalCapabilities?: CapabilityAdvert;
 }
 
 // ----------------------------------------------------------------------------

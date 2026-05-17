@@ -262,9 +262,7 @@ mod humantime {
         // else requires an explicit unit on every numeric
         // component so `1m5` can't silently mean 65s.
         if s.chars().all(|c| c.is_ascii_digit()) {
-            let value: u64 = s
-                .parse()
-                .map_err(|_| format!("invalid integer {s:?}"))?;
+            let value: u64 = s.parse().map_err(|_| format!("invalid integer {s:?}"))?;
             return Ok(Duration::from_secs(value));
         }
 
@@ -308,9 +306,7 @@ mod humantime {
             }
         }
         if units.is_empty() {
-            return Err(format!(
-                "missing unit on trailing number in duration {s:?}"
-            ));
+            return Err(format!("missing unit on trailing number in duration {s:?}"));
         }
         total
             .checked_add(apply_unit(&digits, &units)?)

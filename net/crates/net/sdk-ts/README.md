@@ -10,6 +10,25 @@ Wraps the `@ai2070/net` NAPI bindings with streaming, typed channels, and a deve
 npm install @ai2070/net-sdk @ai2070/net
 ```
 
+## Cargo features (transitive)
+
+`@ai2070/net-sdk` is pure TypeScript; every wrapper class dispatches into the underlying `@ai2070/net` napi-rs binding. Published `.node` artifacts ship every feature enabled, but anyone building from source via `napi build` needs to pass them — symbols from a disabled feature are absent at runtime and the TypeScript wrapper's `import` will fail with `undefined`.
+
+| Cargo feature | sdk-ts wrapper module | Surface |
+|---|---|---|
+| `cortex` | `@ai2070/net-sdk/cortex` (also re-exported top-level) | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, error types |
+| `meshdb` | `@ai2070/net-sdk/meshdb` | `MeshQuery`, `MeshQueryRunner`, `MeshQueryStream`, `QueryBuilder`, `InMemoryChainReader`, result + config types |
+| `meshos` | `@ai2070/net-sdk/meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `MeshOsDaemon` interface, `DaemonHealth`, `CapabilityAdvert` |
+| `compute` | `@ai2070/net-sdk/compute` | `DaemonRuntime`, `DaemonHandle`, `MigrationHandle`, daemon trait shapes |
+| `groups` | `@ai2070/net-sdk/groups` | `ReplicaGroup`, `ForkGroup`, `StandbyGroup`, group config types |
+| `deck` | `@ai2070/net-sdk/deck` | `DeckClient`, `OperatorIdentity`, admin / snapshot / status streams, ICE break-glass |
+| `redis` | `@ai2070/net-sdk` top-level | `RedisStreamDedup` |
+| `net` | `@ai2070/net-sdk/mesh` | `MeshNode`, `NetStream`, channel auth |
+
+The bus surface (`NetNode`, `EventStream`, capabilities, identity, predicates) is always present.
+
+The `default` Cargo feature set enables every flag, so `npm install` users get full functionality. If you're building from source for an embedded target, slim the feature set in `bindings/node/Cargo.toml` and rebuild via `npm run build:debug` (or `build` for release).
+
 ## Quick Start
 
 ```typescript
@@ -1633,6 +1652,32 @@ domains): [`../README.md#daemons`](../README.md#daemons).
 | `file.readRange(start, end)` | Range read over retained entries |
 | `file.tail(fromSeq?)` | `AsyncIterable<RedexEvent>` |
 | `file.sync()` / `file.close()` | Explicit fsync / close |
+
+## Cargo features
+
+`@ai2070/net-sdk` wraps `@ai2070/net` (the napi-rs binding), so its reachable surface matches whatever Cargo features the underlying `.node` artifact was built with. The five feature flags relevant to building from source:
+
+| Feature | What it enables on the underlying `@ai2070/net` binding |
+|---|---|
+| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, `Task`, `Memory`, watch iterators, `RedexError`, `CortexError`, `NetDbError` |
+| `redex-disk` | Disk-backed RedEX persistence — the `persistentDir` ctor option and `persistent: true` on `openFile`. Without it the persistent path rejects with `RedexError`. |
+| `netdb` | `NetDb` composition (requires `cortex`); the `net_netdb_*` FFI entry points ship with this feature. |
+| `meshdb` | `MeshQuery`, `MeshQueryRunner`, `MeshQueryStream`, `QueryBuilder`, `InMemoryChainReader`, plus the `libnet_meshdb` cdylib. |
+| `meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, plus the `libnet_meshos` cdylib. |
+
+A `.node` artifact built without a feature silently omits its symbols — there is no build warning. The TypeScript wrapper destructures the napi exports lazily, so a missing feature surfaces as `undefined` at the import site rather than a load-time error.
+
+Enable at build time (rebuild the underlying `@ai2070/net` artifact, then re-link / reinstall in the consumer):
+
+```bash
+cd net/crates/net/bindings/node
+napi build --platform --release --features "cortex netdb redex-disk meshdb meshos"
+# The repo's `npm run build` script already passes a full feature
+# set; see `bindings/node/package.json` -> scripts.build for the
+# canonical list of flags shipped to npm.
+```
+
+Pre-built npm artifacts ship with every feature enabled; the flags above only matter for source builds.
 
 ## License
 

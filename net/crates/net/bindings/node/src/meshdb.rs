@@ -1,3 +1,10 @@
+// `#[napi]` exports functions / structs to JS but leaves them "unused"
+// from Rust's POV, so clippy's dead-code analysis fires when the
+// node binding is linted with `--all-targets` (which compiles the
+// `lib test` configuration). Suppress at file scope — matches the
+// pattern in `meshos.rs`.
+#![allow(dead_code)]
+
 //! Node bindings for MeshDB — federated query layer.
 //!
 //! # Slice 1 scope
@@ -410,7 +417,13 @@ impl MeshQuery {
     /// `between`, `latest`, `filter`, `count`, `sum`, `avg`,
     /// `min`, `max`, `percentile`, `distinctCount`, `window`,
     /// `join`) compose into a final `MeshQuery` via `.build()`.
-    #[napi(factory)]
+    ///
+    /// Annotated as a plain `#[napi]` static method rather than
+    /// `#[napi(factory)]` because the return type is a different
+    /// class (`QueryBuilder`) — `factory` always wraps the return
+    /// value as `Self`, which would mis-construct the JS instance
+    /// as a `MeshQuery` and strip the `QueryBuilder` methods.
+    #[napi]
     pub fn builder() -> QueryBuilder {
         QueryBuilder { state: None }
     }

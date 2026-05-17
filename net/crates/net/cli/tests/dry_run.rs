@@ -36,14 +36,7 @@ fn json_stdout(args: &[&str]) -> Value {
 
 #[test]
 fn admin_drain_dry_run() {
-    let v = json_stdout(&[
-        "admin",
-        "drain",
-        "0x1",
-        "--drain-for",
-        "5m",
-        "--dry-run",
-    ]);
+    let v = json_stdout(&["admin", "drain", "0x1", "--drain-for", "5m", "--dry-run"]);
     assert_eq!(v["dry_run"], true);
     assert_eq!(v["envelope"]["kind"], "drain");
     assert_eq!(v["envelope"]["node"], 1);

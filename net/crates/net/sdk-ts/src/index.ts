@@ -224,6 +224,43 @@ export type {
   MigrationErrorKind,
 } from './compute';
 
+// MeshDB (causal-chain query layer).
+export {
+  DisposableMeshQueryRunner,
+  InMemoryChainReader,
+  MeshQuery,
+  MeshQueryRunner,
+  MeshQueryStream,
+  QueryBuilder,
+  parseMeshDbErrorKind,
+} from './meshdb';
+export type {
+  AggregateResult,
+  CachePolicy,
+  ExecuteOptions,
+  GroupKey,
+  JoinedRow,
+  LineageEntry,
+  MeshDbPredicate,
+  ParsedMeshDbError,
+  ResultRow,
+  WindowBoundary,
+} from './meshdb';
+
+// MeshOS (daemon-author SDK over the MeshOS supervisor).
+export { MeshOsDaemonSdk, MeshOsDaemonHandle, MeshOsSdkError } from './meshos';
+export type {
+  MeshOsDaemon,
+  MeshOsConfig,
+  MeshOsDaemonSdkOptions,
+  DaemonControl,
+  DaemonHealth,
+  CapabilityAdvert,
+  MaintenanceState,
+  MetadataView,
+  PeerSnapshot,
+} from './meshos';
+
 // Groups (HA / scaling overlays — Stage 2 of SDK_GROUPS_SURFACE_PLAN).
 export { ReplicaGroup, ForkGroup, StandbyGroup, GroupError } from './groups';
 export type {

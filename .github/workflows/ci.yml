@@ -356,7 +356,16 @@ jobs:
       # surface from source.
       - name: Build native module
         working-directory: net/crates/net/bindings/node
-        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,test-helpers
+        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,test-helpers
+
+      # Compile the sibling .ts shims (meshdb.ts, mesh_rpc.ts, errors.ts)
+      # into .js so `require('../meshdb')` in the test suite resolves.
+      # `napi build` only produces the native `.node` artifact; the
+      # AsyncIterable shim that augments MeshQueryStream is plain TS
+      # that needs its own tsc pass.
+      - name: Build TypeScript shims
+        working-directory: net/crates/net/bindings/node
+        run: npm run build:ts
 
       - name: Run tests
         run: npm test
@@ -414,7 +423,7 @@ jobs:
         working-directory: net/crates/net/bindings/node
         run: |
           npm i --ignore-scripts
-          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,meshos,deck,test-helpers
+          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,meshos,deck,meshdb,test-helpers
 
       - name: Install npm dependencies
         run: npm i
@@ -479,15 +488,16 @@ jobs:
       - name: Install maturin and pytest
         run: pip install --upgrade pip maturin pytest
 
-      # `net,cortex,compute,groups,meshos,deck` mirrors the Node
-      # binding's feature set for tests. `groups` is needed so
+      # `net,cortex,compute,groups,meshdb,meshos,deck` mirrors the
+      # Node binding's feature set for tests. `groups` is needed so
       # `test_groups.py` can import `ReplicaGroup` / `ForkGroup` /
-      # `StandbyGroup` / `GroupError`; `meshos` / `deck` enable the
-      # corresponding test modules (each guarded by `pytest.skip`
-      # when the feature is absent). Default `redis` is omitted
+      # `StandbyGroup` / `GroupError`; `meshdb` / `meshos` / `deck`
+      # enable the corresponding test modules (each guarded by
+      # `pytest.skip` when the feature is absent) plus the stub-drift
+      # test's MeshDB class coverage. Default `redis` is omitted
       # because the suite doesn't exercise the Redis adapter.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshos,deck
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck
 
       - name: Run tests
         run: pytest -v
@@ -551,11 +561,17 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-go-${{ hashFiles('**/Cargo.lock') }}
 
-      # The Go bindings link against TWO cdylibs via cgo:
+      # The Go bindings link against FIVE cdylibs via cgo:
       #   - `-lnet` (libnet.so, the main `ai2070-net` crate) from net.go
       #   - `-lnet_compute` (libnet_compute.so, the `net-compute-ffi`
       #     workspace member at bindings/go/compute-ffi) from compute.go
-      # Both end up in `net/crates/net/target/release/`.
+      #   - `-lnet_meshdb` (libnet_meshdb.so, the `net-meshdb-ffi`
+      #     workspace member at bindings/go/meshdb-ffi) from meshdb.go
+      #   - `-lnet_meshos` (libnet_meshos.so, the `net-meshos-ffi`
+      #     workspace member at bindings/go/meshos-ffi) from meshos.go
+      #   - `-lnet_deck` (libnet_deck.so, the `net-deck-ffi`
+      #     workspace member at bindings/go/deck-ffi) from deck.go
+      # All five end up in `net/crates/net/target/release/`.
       #
       # Features:
       #   - `ai2070-net` needs `netdb,dataforts,redex-disk,nat-traversal,redis`
@@ -566,14 +582,16 @@ jobs:
       #   - `net-compute-ffi` needs `test-helpers` so the FFI symbol
       #     `net_compute_test_inject_synthetic_peer` (referenced by
       #     `groups_testhelpers.go`) is exported.
+      #   - `net-meshdb-ffi`, `net-meshos-ffi`, `net-deck-ffi` have no
+      #     extra features beyond their defaults.
       #
       # Built as one cargo invocation so feature unification on the
       # shared `ai2070-net` dep doesn't cause a second compilation pass.
-      - name: Build net + net_compute cdylibs
+      - name: Build net + net_compute + net_meshdb + net_meshos + net_deck cdylibs
         working-directory: net/crates/net
         run: >
           cargo build --release
-          -p ai2070-net -p net-compute-ffi
+          -p ai2070-net -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi
           --features "ai2070-net/netdb,ai2070-net/dataforts,ai2070-net/redex-disk,ai2070-net/nat-traversal,ai2070-net/redis,net-compute-ffi/test-helpers"
 
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
@@ -641,9 +659,9 @@ jobs:
             path: net/crates/net/bindings/node
             # Mirrors the `node-tests` napi build (no redis default,
             # plus `test-helpers` so the test-only FFI symbols are
-            # included in the lint set, plus `meshos,deck` so the
-            # MeshOS / Deck SDK NAPI surface compiles).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,test-helpers
+            # included in the lint set, plus `meshos,deck,meshdb` so
+            # the MeshOS / Deck / MeshDB NAPI surfaces compile).
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,test-helpers
           - name: python
             path: net/crates/net/bindings/python
             # Mirrors the `python-tests` `maturin develop` invocation
@@ -760,27 +778,191 @@ jobs:
       # napi-rs links `napi_*` runtime symbols at load time (Node
       # provides them inside its embedded V8); a standalone
       # `cargo test --lib` binary can't resolve them at link time.
-      # Two flags work in concert:
-      #   --unresolved-symbols=ignore-all  — tolerate at link time
-      #   -z,lazy                          — tolerate at LOAD time
-      # The second flag is the one this commit adds. Modern Ubuntu
-      # toolchains default to `-z,now` as a hardening posture,
-      # which makes the dynamic linker resolve every symbol
-      # eagerly at process startup and crash with
-      # `symbol lookup error: undefined symbol: napi_get_reference_value`
-      # before main() runs. `-z,lazy` reverts to lazy resolution,
-      # so napi symbols are only touched if the test code path
-      # calls them — and the tests only exercise pure-Rust
-      # helpers (`bigint_u64`, capability conversion, etc.) that
-      # never reach napi.
+      # Lazy-linking flags (`-z lazy`, `--allow-shlib-undefined`,
+      # `LD_BIND_NOT=1`) defer resolution but modern Ubuntu's
+      # `-z now` hardening still trips before main() and the
+      # binary fails with `undefined symbol: napi_get_reference_value`
+      # / exit 127.
+      #
+      # Hard fix: build a tiny `libnapi_stub.so` that exports every
+      # napi symbol the binding references as a no-op, then
+      # `LD_PRELOAD` it before running cargo test. The dynamic
+      # linker finds the symbol in the stub, the process starts,
+      # and the tests run their pure-Rust helpers
+      # (`bigint_u64`, capability conversion, etc.) without ever
+      # invoking the stubs at runtime — none of these tests reach
+      # the napi-rs runtime code path.
       #
       # Other matrix members don't need this and would silently
-      # mask real link-time bugs if it were set globally.
-      - name: Run tests (node — napi runtime symbols deferred)
+      # mask real link-time bugs if the stub were set globally.
+      - name: Build napi stub library
+        if: matrix.crate.name == 'node'
+        working-directory: ${{ matrix.crate.path }}
+        run: |
+          cat > /tmp/napi_stub.c <<'CEOF'
+          // No-op stubs for every napi_* symbol the napi-rs runtime
+          // references. The cargo-test binary calls none of these at
+          // runtime — the pure-Rust unit tests this matrix entry
+          // covers don't exercise napi-rs's JS-bridge code path —
+          // but the dynamic linker needs symbol *definitions* to load
+          // the binary at all. Every stub returns 0 (napi_ok) so
+          // even if a stub IS called by accident, the caller sees a
+          // benign "success with no value" result.
+          #include <stddef.h>
+          typedef int napi_status;
+          #define NAPI_STUB(name) napi_status name() { return 0; }
+          NAPI_STUB(napi_get_reference_value)
+          NAPI_STUB(napi_create_reference)
+          NAPI_STUB(napi_delete_reference)
+          NAPI_STUB(napi_reference_ref)
+          NAPI_STUB(napi_reference_unref)
+          NAPI_STUB(napi_module_register)
+          NAPI_STUB(napi_set_instance_data)
+          NAPI_STUB(napi_get_instance_data)
+          NAPI_STUB(napi_create_function)
+          NAPI_STUB(napi_throw)
+          NAPI_STUB(napi_throw_error)
+          NAPI_STUB(napi_throw_type_error)
+          NAPI_STUB(napi_get_undefined)
+          NAPI_STUB(napi_get_null)
+          NAPI_STUB(napi_get_global)
+          NAPI_STUB(napi_create_object)
+          NAPI_STUB(napi_create_array)
+          NAPI_STUB(napi_create_array_with_length)
+          NAPI_STUB(napi_create_string_utf8)
+          NAPI_STUB(napi_create_string_latin1)
+          NAPI_STUB(napi_create_string_utf16)
+          NAPI_STUB(napi_create_double)
+          NAPI_STUB(napi_create_int32)
+          NAPI_STUB(napi_create_uint32)
+          NAPI_STUB(napi_create_int64)
+          NAPI_STUB(napi_create_bigint_int64)
+          NAPI_STUB(napi_create_bigint_uint64)
+          NAPI_STUB(napi_create_bigint_words)
+          NAPI_STUB(napi_get_value_bigint_int64)
+          NAPI_STUB(napi_get_value_bigint_uint64)
+          NAPI_STUB(napi_get_value_bigint_words)
+          NAPI_STUB(napi_get_value_bool)
+          NAPI_STUB(napi_get_value_double)
+          NAPI_STUB(napi_get_value_int32)
+          NAPI_STUB(napi_get_value_uint32)
+          NAPI_STUB(napi_get_value_int64)
+          NAPI_STUB(napi_get_value_string_utf8)
+          NAPI_STUB(napi_get_value_string_latin1)
+          NAPI_STUB(napi_get_value_string_utf16)
+          NAPI_STUB(napi_get_boolean)
+          NAPI_STUB(napi_typeof)
+          NAPI_STUB(napi_get_property)
+          NAPI_STUB(napi_set_property)
+          NAPI_STUB(napi_has_property)
+          NAPI_STUB(napi_delete_property)
+          NAPI_STUB(napi_define_class)
+          NAPI_STUB(napi_define_properties)
+          NAPI_STUB(napi_get_property_names)
+          NAPI_STUB(napi_get_all_property_names)
+          NAPI_STUB(napi_call_function)
+          NAPI_STUB(napi_new_instance)
+          NAPI_STUB(napi_instanceof)
+          NAPI_STUB(napi_is_array)
+          NAPI_STUB(napi_get_array_length)
+          NAPI_STUB(napi_get_element)
+          NAPI_STUB(napi_set_element)
+          NAPI_STUB(napi_create_buffer)
+          NAPI_STUB(napi_create_buffer_copy)
+          NAPI_STUB(napi_create_external_buffer)
+          NAPI_STUB(napi_get_buffer_info)
+          NAPI_STUB(napi_is_buffer)
+          NAPI_STUB(napi_create_arraybuffer)
+          NAPI_STUB(napi_create_external_arraybuffer)
+          NAPI_STUB(napi_get_arraybuffer_info)
+          NAPI_STUB(napi_is_arraybuffer)
+          NAPI_STUB(napi_wrap)
+          NAPI_STUB(napi_unwrap)
+          NAPI_STUB(napi_remove_wrap)
+          NAPI_STUB(napi_create_error)
+          NAPI_STUB(napi_create_type_error)
+          NAPI_STUB(napi_create_range_error)
+          NAPI_STUB(napi_get_and_clear_last_exception)
+          NAPI_STUB(napi_is_exception_pending)
+          NAPI_STUB(napi_open_handle_scope)
+          NAPI_STUB(napi_close_handle_scope)
+          NAPI_STUB(napi_open_escapable_handle_scope)
+          NAPI_STUB(napi_close_escapable_handle_scope)
+          NAPI_STUB(napi_escape_handle)
+          NAPI_STUB(napi_run_script)
+          NAPI_STUB(napi_get_node_version)
+          NAPI_STUB(napi_get_version)
+          NAPI_STUB(napi_create_promise)
+          NAPI_STUB(napi_resolve_deferred)
+          NAPI_STUB(napi_reject_deferred)
+          NAPI_STUB(napi_is_promise)
+          NAPI_STUB(napi_get_uv_event_loop)
+          NAPI_STUB(napi_create_threadsafe_function)
+          NAPI_STUB(napi_get_threadsafe_function_context)
+          NAPI_STUB(napi_call_threadsafe_function)
+          NAPI_STUB(napi_acquire_threadsafe_function)
+          NAPI_STUB(napi_release_threadsafe_function)
+          NAPI_STUB(napi_ref_threadsafe_function)
+          NAPI_STUB(napi_unref_threadsafe_function)
+          NAPI_STUB(napi_add_env_cleanup_hook)
+          NAPI_STUB(napi_remove_env_cleanup_hook)
+          NAPI_STUB(napi_add_async_cleanup_hook)
+          NAPI_STUB(napi_remove_async_cleanup_hook)
+          NAPI_STUB(napi_fatal_error)
+          NAPI_STUB(napi_fatal_exception)
+          NAPI_STUB(napi_async_init)
+          NAPI_STUB(napi_async_destroy)
+          NAPI_STUB(napi_make_callback)
+          NAPI_STUB(napi_create_async_work)
+          NAPI_STUB(napi_delete_async_work)
+          NAPI_STUB(napi_queue_async_work)
+          NAPI_STUB(napi_cancel_async_work)
+          NAPI_STUB(napi_open_callback_scope)
+          NAPI_STUB(napi_close_callback_scope)
+          NAPI_STUB(napi_create_date)
+          NAPI_STUB(napi_get_date_value)
+          NAPI_STUB(napi_is_date)
+          NAPI_STUB(napi_object_freeze)
+          NAPI_STUB(napi_object_seal)
+          NAPI_STUB(napi_strict_equals)
+          NAPI_STUB(napi_coerce_to_bool)
+          NAPI_STUB(napi_coerce_to_number)
+          NAPI_STUB(napi_coerce_to_string)
+          NAPI_STUB(napi_coerce_to_object)
+          NAPI_STUB(napi_is_error)
+          NAPI_STUB(napi_get_named_property)
+          NAPI_STUB(napi_set_named_property)
+          NAPI_STUB(napi_has_named_property)
+          NAPI_STUB(napi_get_prototype)
+          NAPI_STUB(napi_get_cb_info)
+          NAPI_STUB(napi_get_new_target)
+          NAPI_STUB(napi_add_finalizer)
+          NAPI_STUB(napi_create_typedarray)
+          NAPI_STUB(napi_is_typedarray)
+          NAPI_STUB(napi_get_typedarray_info)
+          NAPI_STUB(napi_create_dataview)
+          NAPI_STUB(napi_is_dataview)
+          NAPI_STUB(napi_get_dataview_info)
+          NAPI_STUB(napi_create_symbol)
+          NAPI_STUB(napi_check_object_type_tag)
+          NAPI_STUB(napi_type_tag_object)
+          NAPI_STUB(node_api_get_module_file_name)
+          NAPI_STUB(node_api_create_external_string_latin1)
+          NAPI_STUB(node_api_create_external_string_utf16)
+          NAPI_STUB(node_api_symbol_for)
+          NAPI_STUB(node_api_create_property_key_latin1)
+          NAPI_STUB(node_api_create_property_key_utf16)
+          NAPI_STUB(node_api_create_property_key_utf8)
+          NAPI_STUB(node_api_create_buffer_from_arraybuffer)
+          CEOF
+          gcc -shared -fPIC -o /tmp/libnapi_stub.so /tmp/napi_stub.c
+
+      - name: Run tests (node — napi symbols stubbed)
         if: matrix.crate.name == 'node'
         working-directory: ${{ matrix.crate.path }}
         env:
-          RUSTFLAGS: "-C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,-z,lazy"
+          RUSTFLAGS: "-C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,--allow-shlib-undefined"
+          LD_PRELOAD: "/tmp/libnapi_stub.so"
         run: cargo test --lib ${{ matrix.crate.features }}
 
       - name: Run tests
