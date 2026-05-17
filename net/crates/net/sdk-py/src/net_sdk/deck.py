@@ -57,6 +57,18 @@ try:
         _HAS_SLICE_2 = True
     except ImportError:  # pragma: no cover
         _HAS_SLICE_2 = False
+    # Operator-policy surface — `OperatorRegistry` + `AdminVerifier`.
+    # Try-import so older wheels still load. Re-exported under the
+    # plain names from this module.
+    try:
+        from net import (  # type: ignore[attr-defined]
+            DeckAdminVerifier as AdminVerifier,
+            DeckOperatorRegistry as OperatorRegistry,
+        )
+
+        _HAS_VERIFIER = True
+    except ImportError:  # pragma: no cover
+        _HAS_VERIFIER = False
 except ImportError as e:  # pragma: no cover
     raise ImportError(
         "Deck SDK symbols not present in `net._net`. Rebuild the "
@@ -92,6 +104,9 @@ __all__ = [
     "OperatorSignature",
     "BlastRadius",
     "AvoidScope",
+    # Operator-policy verifier surface.
+    "OperatorRegistry",
+    "AdminVerifier",
 ]
 
 

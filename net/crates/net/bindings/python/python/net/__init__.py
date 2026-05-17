@@ -458,6 +458,26 @@ else:
     except ImportError:  # pragma: no cover
         pass
 
+    # Operator-policy verifier surface — `OperatorRegistry` +
+    # `AdminVerifier`. Try-import so wheels built before this
+    # surface landed still load.
+    try:
+        from ._net import (
+            AdminVerifier as _DeckAdminVerifier,
+            OperatorRegistry as _DeckOperatorRegistry,
+        )
+
+        DeckOperatorRegistry = _DeckOperatorRegistry
+        DeckAdminVerifier = _DeckAdminVerifier
+        __all__.extend(
+            [
+                "DeckOperatorRegistry",
+                "DeckAdminVerifier",
+            ]
+        )
+    except ImportError:  # pragma: no cover
+        pass
+
     def deck_sdk_error_kind(exc: "DeckSdkError") -> str | None:
         """Extract the kind discriminator from a caught
         ``DeckSdkError``.

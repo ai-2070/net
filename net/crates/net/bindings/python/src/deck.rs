@@ -28,7 +28,7 @@
 //! and `.message` attached. Cross-binding parity with the MeshOS
 //! SDK's error format.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use pyo3::exceptions::PyException;
@@ -46,9 +46,12 @@ use net::adapter::net::behavior::deck::{
 };
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::behavior::meshos::{
-    AvoidScope as CoreAvoidScope, ChainId as CoreChainId, DaemonRef as CoreDaemonRef,
-    MeshOsSnapshot, MigrationId as CoreMigrationId, OperatorSignature as CoreOperatorSignature,
+    AdminVerifier as CoreAdminVerifier, AvoidScope as CoreAvoidScope, ChainId as CoreChainId,
+    DaemonRef as CoreDaemonRef, MeshOsSnapshot, MigrationId as CoreMigrationId,
+    OperatorRegistry as CoreOperatorRegistry, OperatorSignature as CoreOperatorSignature,
+    VerifyError as CoreVerifyError, blast_radius_hash, ice_proposal_signing_payload,
 };
+use net::adapter::net::identity::EntityId;
 
 use futures::StreamExt;
 
@@ -77,6 +80,14 @@ fn deck_err(py: Python<'_>, kind: &str, message: &str) -> PyErr {
 
 fn deck_err_from(py: Python<'_>, e: DeckError) -> PyErr {
     deck_err(py, e.kind, &e.message)
+}
+
+/// Map a substrate-side `VerifyError` to the Python `DeckSdkError`
+/// envelope. The kind comes straight from the substrate's stable
+/// discriminator (`not_authorized`, `signature_invalid`, etc.) so
+/// cross-binding consumers branch on the same string.
+fn verify_error_to_py(py: Python<'_>, e: CoreVerifyError) -> PyErr {
+    deck_err(py, e.kind(), &e.to_string())
 }
 
 // =========================================================================
@@ -169,6 +180,64 @@ impl PyOperatorIdentity {
     #[getter]
     fn operator_id(&self) -> u64 {
         self.inner.operator_id()
+    }
+
+    /// 32-byte ed25519 public key. Used by an offline tool that
+    /// authors the cluster's `OperatorRegistry` from a set of
+    /// known identities.
+    fn public_key<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        let bytes = self.inner.keypair().entity_id().as_bytes();
+        PyBytes::new(py, bytes)
+    }
+
+    /// Sign a simulated ICE proposal. Returns a signature dict
+    /// `{"operator_id": int, "signature": bytes}` directly
+    /// consumable by `SimulatedIceProposal.commit([sig, ...])`.
+    ///
+    /// Wraps the substrate's `OperatorIdentity::sign_proposal` —
+    /// covers `(ICE_SIGNING_DOMAIN || issued_at_ms ||
+    /// blast_hash || postcard(action))` so the verifier rebuilds
+    /// the same bytes locally.
+    fn sign_proposal<'py>(
+        &self,
+        py: Python<'py>,
+        simulated: &PySimulatedIceProposal,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let action = simulated.action.as_ref().ok_or_else(|| {
+            deck_err(
+                py,
+                "already_committed",
+                "SimulatedIceProposal was already consumed by commit()",
+            )
+        })?;
+        let hash = blast_radius_hash(&simulated.blast);
+        let sig = self
+            .inner
+            .sign_proposal(action, simulated.issued_at_ms, &hash);
+        let d = PyDict::new(py);
+        d.set_item("operator_id", sig.operator_id)?;
+        d.set_item("signature", PyBytes::new(py, &sig.signature))?;
+        Ok(d)
+    }
+
+    /// Sign raw payload bytes with this operator's ed25519 key.
+    /// Returns `{"operator_id": int, "signature": bytes}`.
+    ///
+    /// Useful for offline / cross-deck signing flows where the
+    /// `(action, issued_at_ms, blast_hash)` triple is exchanged
+    /// out-of-band and the local deck reproduces
+    /// `ice_proposal_signing_payload(...)` independently. Most
+    /// consumers want `sign_proposal(simulated)` instead.
+    fn sign_payload<'py>(
+        &self,
+        py: Python<'py>,
+        payload: &[u8],
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let sig = self.inner.keypair().sign(payload);
+        let d = PyDict::new(py);
+        d.set_item("operator_id", self.inner.operator_id())?;
+        d.set_item("signature", PyBytes::new(py, &sig.to_bytes()))?;
+        Ok(d)
     }
 
     fn __repr__(&self) -> String {
@@ -1313,8 +1382,32 @@ impl PySimulatedIceProposal {
     /// Blake3 digest of the blast radius. Signers must cover
     /// this exact hash; substrate verifier rebuilds + compares.
     fn blast_hash<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let hash = net::adapter::net::behavior::meshos::blast_radius_hash(&self.blast);
+        let hash = blast_radius_hash(&self.blast);
         Ok(PyBytes::new(py, hash.as_ref()))
+    }
+
+    /// Deterministic signing payload bytes the verifier will
+    /// reconstruct: `ICE_SIGNING_DOMAIN || issued_at_ms (le u64)
+    /// || blast_hash (32) || postcard(action)`. Returned for the
+    /// offline / cross-deck signing flow — pair with
+    /// `OperatorIdentity.sign_payload(payload)` on a remote
+    /// deck to produce a signature the local deck can pass into
+    /// `commit([sig, ...])`. Raises `already_committed` once the
+    /// proposal has been consumed by `commit()`.
+    fn signing_payload<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let action = self.action.as_ref().ok_or_else(|| {
+            deck_err(
+                py,
+                "already_committed",
+                "SimulatedIceProposal was already consumed by commit()",
+            )
+        })?;
+        let hash = blast_radius_hash(&self.blast);
+        let payload = ice_proposal_signing_payload(action, self.issued_at_ms, &hash);
+        Ok(PyBytes::new(py, &payload))
     }
 
     /// Commit the proposal with the supplied operator signatures.
@@ -1365,6 +1458,252 @@ impl PySimulatedIceProposal {
             self.committed,
             self.issued_at_ms,
             self.blast.affected_nodes.len(),
+        )
+    }
+}
+
+// =========================================================================
+// PyOperatorRegistry — operator-policy authoring + offline verify
+// =========================================================================
+
+/// Cluster operator-policy registry. Holds known operator public
+/// keys keyed by 64-bit operator id; `verify` / `verify_bundle`
+/// authenticate `OperatorSignature` dicts against the policy.
+///
+/// The substrate's loop has its own copy installed via
+/// `AdminVerifier`; this Python class is the offline tool for
+/// authoring the policy, pre-verifying bundles before commit,
+/// and unit-testing operator workflows. Mutations are
+/// thread-safe via an internal mutex (the cdylib runs callbacks
+/// on tokio workers).
+#[pyclass(name = "OperatorRegistry", module = "net._net", from_py_object)]
+#[derive(Clone)]
+pub struct PyOperatorRegistry {
+    inner: Arc<Mutex<CoreOperatorRegistry>>,
+}
+
+impl PyOperatorRegistry {
+    /// Snapshot the registry into an `Arc<CoreOperatorRegistry>`
+    /// suitable for handing to `AdminVerifier::new`. The
+    /// snapshot is detached — later mutations on the Python
+    /// registry don't propagate.
+    pub(crate) fn snapshot(&self) -> Arc<CoreOperatorRegistry> {
+        let g = self.inner.lock().expect("registry mutex poisoned");
+        Arc::new(g.clone())
+    }
+}
+
+#[pymethods]
+impl PyOperatorRegistry {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(CoreOperatorRegistry::new())),
+        }
+    }
+
+    /// Insert an operator's 32-byte ed25519 public key under
+    /// `operator_id`. Subsequent `verify` calls for that
+    /// operator id resolve against this entry.
+    fn insert(&self, py: Python<'_>, operator_id: u64, public_key: &[u8]) -> PyResult<()> {
+        if public_key.len() != 32 {
+            return Err(deck_err(
+                py,
+                "invalid_public_key",
+                &format!("public_key must be 32 bytes, got {}", public_key.len()),
+            ));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(public_key);
+        let entity_id = EntityId::from_bytes(arr);
+        let mut g = self.inner.lock().map_err(|_| {
+            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
+        })?;
+        g.insert(operator_id, entity_id);
+        Ok(())
+    }
+
+    /// Convenience — register `identity`'s public key under its
+    /// derived operator id (the keypair's origin hash).
+    fn register(&self, py: Python<'_>, identity: &PyOperatorIdentity) -> PyResult<()> {
+        let mut g = self.inner.lock().map_err(|_| {
+            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
+        })?;
+        g.register(identity.inner.keypair());
+        Ok(())
+    }
+
+    /// `True` iff `operator_id` is registered.
+    fn contains(&self, py: Python<'_>, operator_id: u64) -> PyResult<bool> {
+        let g = self.inner.lock().map_err(|_| {
+            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
+        })?;
+        Ok(g.contains(operator_id))
+    }
+
+    fn __contains__(&self, py: Python<'_>, operator_id: u64) -> PyResult<bool> {
+        self.contains(py, operator_id)
+    }
+
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        let g = self.inner.lock().map_err(|_| {
+            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
+        })?;
+        Ok(g.len())
+    }
+
+    fn is_empty(&self, py: Python<'_>) -> PyResult<bool> {
+        let g = self.inner.lock().map_err(|_| {
+            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
+        })?;
+        Ok(g.is_empty())
+    }
+
+    /// Verify a single `OperatorSignature` dict over `payload`.
+    /// Raises `DeckSdkError` with `kind = "not_authorized"` for
+    /// an unknown operator id and `"signature_invalid"` for a
+    /// malformed / tampered signature.
+    fn verify(
+        &self,
+        py: Python<'_>,
+        signature: &Bound<'_, PyDict>,
+        payload: &[u8],
+    ) -> PyResult<()> {
+        let sig = operator_signature_from_dict(py, signature)?;
+        let g = self.inner.lock().map_err(|_| {
+            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
+        })?;
+        g.verify(&sig, payload).map_err(|e| verify_error_to_py(py, e))
+    }
+
+    /// Verify every signature in the bundle over `payload` and
+    /// confirm at least `threshold` *distinct* operator ids
+    /// signed it. Distinct-operator dedup is the load-bearing
+    /// M-of-N gate — a bundle of `[sig_A, sig_A]` against a
+    /// `threshold = 2` raises `insufficient_signatures`.
+    fn verify_bundle(
+        &self,
+        py: Python<'_>,
+        signatures: Vec<Bound<'_, PyDict>>,
+        payload: &[u8],
+        threshold: usize,
+    ) -> PyResult<()> {
+        let mut sigs = Vec::with_capacity(signatures.len());
+        for d in signatures {
+            sigs.push(operator_signature_from_dict(py, &d)?);
+        }
+        let g = self.inner.lock().map_err(|_| {
+            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
+        })?;
+        g.verify_bundle(&sigs, payload, threshold)
+            .map_err(|e| verify_error_to_py(py, e))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        let g = self.inner.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("registry mutex poisoned")
+        })?;
+        Ok(format!("OperatorRegistry(operators={})", g.len()))
+    }
+}
+
+// =========================================================================
+// PyAdminVerifier — substrate verifier wrapper
+// =========================================================================
+
+/// Substrate-side admin commit verifier. Bundles an
+/// `OperatorRegistry` snapshot with the cluster's signature
+/// threshold + freshness/skew/ICE-cooldown windows. Useful for
+/// offline unit testing of operator-policy decisions.
+///
+/// Constructors snapshot the registry at build time — later
+/// mutations on the source `OperatorRegistry` are not reflected.
+/// Rebuild the verifier after every policy change.
+#[pyclass(name = "AdminVerifier", module = "net._net")]
+pub struct PyAdminVerifier {
+    inner: CoreAdminVerifier,
+}
+
+#[pymethods]
+impl PyAdminVerifier {
+    /// Build a verifier with `threshold` minimum signatures and
+    /// the substrate's default freshness window (300s),
+    /// future-skew tolerance (30s), and ICE cooldown (300s).
+    /// `threshold = 0` is clamped to `1`.
+    #[new]
+    fn new(registry: &PyOperatorRegistry, threshold: usize) -> Self {
+        Self {
+            inner: CoreAdminVerifier::new(registry.snapshot(), threshold),
+        }
+    }
+
+    /// Build with explicit freshness + future-skew windows and
+    /// the default ICE cooldown.
+    #[staticmethod]
+    fn with_freshness(
+        registry: &PyOperatorRegistry,
+        threshold: usize,
+        freshness_window_ms: u64,
+        future_skew_ms: u64,
+    ) -> Self {
+        Self {
+            inner: CoreAdminVerifier::with_freshness(
+                registry.snapshot(),
+                threshold,
+                Duration::from_millis(freshness_window_ms),
+                Duration::from_millis(future_skew_ms),
+            ),
+        }
+    }
+
+    /// Build with every policy knob explicit. Primarily for
+    /// tests that need a short cooldown window.
+    #[staticmethod]
+    fn with_full_policy(
+        registry: &PyOperatorRegistry,
+        threshold: usize,
+        freshness_window_ms: u64,
+        future_skew_ms: u64,
+        ice_cooldown_ms: u64,
+    ) -> Self {
+        Self {
+            inner: CoreAdminVerifier::with_full_policy(
+                registry.snapshot(),
+                threshold,
+                Duration::from_millis(freshness_window_ms),
+                Duration::from_millis(future_skew_ms),
+                Duration::from_millis(ice_cooldown_ms),
+            ),
+        }
+    }
+
+    #[getter]
+    fn threshold(&self) -> usize {
+        self.inner.threshold()
+    }
+
+    #[getter]
+    fn freshness_window_ms(&self) -> u64 {
+        self.inner.freshness_window().as_millis() as u64
+    }
+
+    #[getter]
+    fn future_skew_ms(&self) -> u64 {
+        self.inner.future_skew().as_millis() as u64
+    }
+
+    #[getter]
+    fn ice_cooldown_ms(&self) -> u64 {
+        self.inner.ice_cooldown().as_millis() as u64
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AdminVerifier(threshold={}, freshness_ms={}, future_skew_ms={}, ice_cooldown_ms={})",
+            self.inner.threshold(),
+            self.inner.freshness_window().as_millis() as u64,
+            self.inner.future_skew().as_millis() as u64,
+            self.inner.ice_cooldown().as_millis() as u64,
         )
     }
 }

@@ -25,6 +25,18 @@ try:
 except ImportError:  # pragma: no cover
     pytest.skip("Deck SDK not compiled into this wheel", allow_module_level=True)
 
+# Operator-policy verifier surface — try-imported so wheels built
+# before the surface landed still skip those tests cleanly.
+try:
+    from net import (  # type: ignore[attr-defined]
+        DeckAdminVerifier,
+        DeckOperatorRegistry,
+    )
+
+    _HAS_VERIFIER = True
+except ImportError:  # pragma: no cover
+    _HAS_VERIFIER = False
+
 
 # -------------------------------------------------------------------------
 # OperatorIdentity
@@ -596,6 +608,196 @@ def test_ice_simulated_commit_consumes_proposal() -> None:
         # Second commit — proposal consumed.
         with pytest.raises(DeckSdkError) as excinfo:
             simulated.commit([{"operator_id": 1, "signature": b"\x00" * 64}])
+        assert excinfo.value.kind == "already_committed"
+    finally:
+        sdk.shutdown()
+
+
+# -------------------------------------------------------------------------
+# Operator-policy verifier surface: OperatorRegistry, AdminVerifier,
+# OperatorIdentity.sign_proposal / sign_payload,
+# SimulatedIceProposal.signing_payload.
+# -------------------------------------------------------------------------
+
+
+pytestmark_verifier = pytest.mark.skipif(
+    not _HAS_VERIFIER, reason="OperatorRegistry/AdminVerifier not in this wheel"
+)
+
+
+@pytestmark_verifier
+def test_operator_registry_lifecycle() -> None:
+    reg = DeckOperatorRegistry()
+    assert len(reg) == 0
+    assert reg.is_empty()
+    a = OperatorIdentity.generate()
+    b = OperatorIdentity.generate()
+    reg.register(a)
+    reg.insert(b.operator_id, b.public_key())
+    assert len(reg) == 2
+    assert a.operator_id in reg
+    assert b.operator_id in reg
+    assert 0xDEADBEEF not in reg
+
+
+@pytestmark_verifier
+def test_operator_registry_rejects_bad_public_key() -> None:
+    reg = DeckOperatorRegistry()
+    with pytest.raises(DeckSdkError) as excinfo:
+        reg.insert(1, b"\x00" * 31)
+    assert excinfo.value.kind == "invalid_public_key"
+
+
+@pytestmark_verifier
+def test_operator_identity_sign_payload_then_registry_verify() -> None:
+    """`sign_payload` + `registry.verify` should round-trip over
+    any byte payload."""
+    identity = OperatorIdentity.generate()
+    reg = DeckOperatorRegistry()
+    reg.register(identity)
+
+    payload = b"verify-roundtrip-canary"
+    sig = identity.sign_payload(payload)
+    assert isinstance(sig, dict)
+    assert sig["operator_id"] == identity.operator_id
+    assert len(sig["signature"]) == 64
+
+    reg.verify(sig, payload)  # no exception
+
+    # Tampered payload — same signature, different bytes.
+    with pytest.raises(DeckSdkError) as excinfo:
+        reg.verify(sig, payload + b"!")
+    assert excinfo.value.kind == "signature_invalid"
+
+
+@pytestmark_verifier
+def test_operator_registry_verify_rejects_unknown_operator() -> None:
+    reg = DeckOperatorRegistry()
+    stranger = OperatorIdentity.generate()
+    sig = stranger.sign_payload(b"hello")
+    with pytest.raises(DeckSdkError) as excinfo:
+        reg.verify(sig, b"hello")
+    assert excinfo.value.kind == "not_authorized"
+
+
+@pytestmark_verifier
+def test_operator_registry_verify_bundle_distinct_operator_dedup() -> None:
+    """Two signatures from the same operator must not satisfy
+    a threshold of 2 — the distinct-operator dedup gate is the
+    M-of-N guarantee."""
+    a = OperatorIdentity.generate()
+    b = OperatorIdentity.generate()
+    reg = DeckOperatorRegistry()
+    reg.register(a)
+    reg.register(b)
+    payload = b"bundle-payload"
+    sig_a = a.sign_payload(payload)
+    sig_b = b.sign_payload(payload)
+
+    # Two distinct operators clears threshold=2.
+    reg.verify_bundle([sig_a, sig_b], payload, 2)
+
+    # Single operator signing twice does NOT clear threshold=2.
+    with pytest.raises(DeckSdkError) as excinfo:
+        reg.verify_bundle([sig_a, sig_a], payload, 2)
+    assert excinfo.value.kind == "insufficient_signatures"
+
+
+@pytestmark_verifier
+def test_admin_verifier_constructors_expose_policy_knobs() -> None:
+    reg = DeckOperatorRegistry()
+    v1 = DeckAdminVerifier(reg, 3)
+    assert v1.threshold == 3
+    assert v1.freshness_window_ms == 300_000  # substrate default
+    assert v1.future_skew_ms == 30_000
+    assert v1.ice_cooldown_ms == 300_000
+
+    v2 = DeckAdminVerifier.with_freshness(reg, 2, 60_000, 5_000)
+    assert v2.threshold == 2
+    assert v2.freshness_window_ms == 60_000
+    assert v2.future_skew_ms == 5_000
+    assert v2.ice_cooldown_ms == 300_000  # default carries through
+
+    v3 = DeckAdminVerifier.with_full_policy(reg, 1, 1_000, 500, 250)
+    assert v3.threshold == 1
+    assert v3.freshness_window_ms == 1_000
+    assert v3.future_skew_ms == 500
+    assert v3.ice_cooldown_ms == 250
+
+
+@pytestmark_verifier
+def test_admin_verifier_clamps_zero_threshold_to_one() -> None:
+    """The substrate clamps `threshold = 0` to `1` since no admin
+    path should ever accept an empty signature bundle."""
+    reg = DeckOperatorRegistry()
+    v = DeckAdminVerifier(reg, 0)
+    assert v.threshold == 1
+
+
+@pytestmark_verifier
+def test_simulated_signing_payload_matches_sign_proposal_payload() -> None:
+    """`signing_payload()` returns the exact bytes that
+    `sign_proposal()` covers — needed for offline / cross-deck
+    signing workflows."""
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        identity = OperatorIdentity.generate()
+        client = DeckClient.from_meshos(sdk, identity)
+        proposal = client.ice.freeze_cluster(ttl_ms=60_000)
+        simulated = proposal.simulate()
+        payload = simulated.signing_payload()
+        assert isinstance(payload, bytes)
+        # ICE_SIGNING_DOMAIN prefix — substrate const
+        # `b"net.meshos.ice.v1\0"`.
+        assert payload.startswith(b"net.meshos.ice.v1\x00")
+
+        # Sign via the proposal-aware helper vs. the raw-payload
+        # helper — should agree byte-for-byte.
+        sig_via_proposal = identity.sign_proposal(simulated)
+        sig_via_payload = identity.sign_payload(payload)
+        assert sig_via_proposal["operator_id"] == sig_via_payload["operator_id"]
+        assert sig_via_proposal["signature"] == sig_via_payload["signature"]
+    finally:
+        sdk.shutdown()
+
+
+@pytestmark_verifier
+def test_sign_proposal_then_verify_with_registry_succeeds() -> None:
+    """Full offline-verify flow: sign a simulated proposal, hand
+    the payload + signature to a registry that knows the
+    operator, and verify."""
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        identity = OperatorIdentity.generate()
+        client = DeckClient.from_meshos(sdk, identity)
+        proposal = client.ice.flush_avoid_lists({"kind": "global"})
+        simulated = proposal.simulate()
+        payload = simulated.signing_payload()
+        sig = identity.sign_proposal(simulated)
+
+        reg = DeckOperatorRegistry()
+        reg.register(identity)
+        reg.verify(sig, payload)  # no exception
+        reg.verify_bundle([sig], payload, 1)
+    finally:
+        sdk.shutdown()
+
+
+@pytestmark_verifier
+def test_signing_payload_after_commit_raises_already_committed() -> None:
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        identity = OperatorIdentity.generate()
+        client = DeckClient.from_meshos(sdk, identity)
+        proposal = client.ice.freeze_cluster(ttl_ms=60_000)
+        simulated = proposal.simulate()
+        # Consume via commit (single fake sig — default threshold=1).
+        simulated.commit([{"operator_id": 1, "signature": b"\x00" * 64}])
+        with pytest.raises(DeckSdkError) as excinfo:
+            simulated.signing_payload()
+        assert excinfo.value.kind == "already_committed"
+        with pytest.raises(DeckSdkError) as excinfo:
+            identity.sign_proposal(simulated)
         assert excinfo.value.kind == "already_committed"
     finally:
         sdk.shutdown()

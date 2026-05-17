@@ -2371,6 +2371,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<deck::PyIceCommands>()?;
         m.add_class::<deck::PyIceProposal>()?;
         m.add_class::<deck::PySimulatedIceProposal>()?;
+        m.add_class::<deck::PyOperatorRegistry>()?;
+        m.add_class::<deck::PyAdminVerifier>()?;
         m.add("DeckSdkError", m.py().get_type::<deck::DeckSdkError>())?;
     }
     Ok(())
