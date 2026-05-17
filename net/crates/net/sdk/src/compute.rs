@@ -1657,6 +1657,7 @@ impl DaemonRuntime {
     /// the in-crate `testing` harness builds the source
     /// out-of-band; the adapter type itself lives in
     /// `net::adapter::net::behavior::meshos::migration_snapshot_source`.
+    #[cfg(feature = "testing")]
     pub(crate) fn migration_orchestrator_arc(&self) -> Arc<MigrationOrchestrator> {
         self.inner.orchestrator.clone()
     }
