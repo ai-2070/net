@@ -424,8 +424,6 @@ async fn run_memories_delete(
 // =========================================================================
 
 async fn run_restore(args: RestoreArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
-    use net_sdk::cortex::{NetDb, Redex};
-
     let dest = match args.store.as_deref() {
         Some(p) => p.to_path_buf(),
         None => default_netdb_path().ok_or_else(|| {
