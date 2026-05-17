@@ -717,7 +717,24 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-test-ffi-${{ matrix.crate.name }}-${{ hashFiles('**/Cargo.lock') }}
 
+      # napi-rs links `napi_*` runtime symbols at load time (Node
+      # provides them inside its embedded V8); a standalone
+      # `cargo test --lib` binary can't resolve them at link time.
+      # Tell `ld` to leave undefined symbols alone for the node
+      # crate only — the test binary never *invokes* the napi
+      # entry points (cargo test runs `#[cfg(test)] mod tests`
+      # blocks that touch pure-Rust helpers like `bigint_u64`).
+      # Other matrix members don't need this and would silently
+      # mask real link-time bugs if it were set globally.
+      - name: Run tests (node — napi runtime symbols deferred)
+        if: matrix.crate.name == 'node'
+        working-directory: ${{ matrix.crate.path }}
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,--unresolved-symbols=ignore-all"
+        run: cargo test --lib ${{ matrix.crate.features }}
+
       - name: Run tests
+        if: matrix.crate.name != 'node'
         working-directory: ${{ matrix.crate.path }}
         run: cargo test --lib ${{ matrix.crate.features }}
 
