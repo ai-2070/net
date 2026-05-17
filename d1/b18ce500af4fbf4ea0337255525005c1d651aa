@@ -1,0 +1,22 @@
+net/crates/net/deck/src/demo/spawn.rs
+  s_275316fc500935::t_66f142e4cdd273 3-4
+  s_275316fc500935::t_65dc22037dc2f4 86
+net/crates/net/deck/src/demo/rpc_chatter.rs
+  s_275316fc500935::t_bf44cb04d1da42 8-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "d1b18ce500af4fbf4ea0337255525005c1d651aa",
+  "prompts": {},
+  "sessions": {
+    "s_275316fc500935": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f087a884-b322-4d2f-9650-4afee91efe78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
