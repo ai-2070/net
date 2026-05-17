@@ -6,7 +6,7 @@
  * - {@link DeckSdkError} typed Error subclass that parses the
  *   substrate `<<deck-sdk-kind:KIND>>MSG` envelope.
  * - Auto-JSON-parsing for `status()` and `snapshots()`.
- * - `AsyncIterable<MeshOsSnapshot>` / `AsyncIterable<StatusSummary>`
+ * - `AsyncIterable<unknown> /* parsed MeshOsSnapshot JSON */` / `AsyncIterable<StatusSummary>`
  *   wrappers over the raw `nextSnapshot()` / `nextSummary()`
  *   methods.
  *
@@ -144,13 +144,8 @@ export interface StatusSummary {
   recentFailureCount: number;
   adminAuditRingDepth: number;
   freezeRemainingMs: bigint | null;
-  localMaintenanceActive: bool;
+  localMaintenanceActive: boolean;
 }
-
-// `bool` alias avoids the linter complaining about TypeScript's
-// boolean keyword in an interface property; resolve to the actual
-// boolean primitive.
-type bool = boolean;
 
 export interface DeckClientConfig {
   snapshotPollIntervalMs?: bigint;
@@ -248,7 +243,7 @@ function statusSummaryFromJs(s: StatusSummaryJs): StatusSummary {
 // ----------------------------------------------------------------------------
 
 /**
- * Wrap a raw napi snapshot stream as `AsyncIterable<MeshOsSnapshot>`.
+ * Wrap a raw napi snapshot stream as `AsyncIterable<unknown> /* parsed MeshOsSnapshot JSON */`.
  * The napi side emits JSON-encoded snapshots; we parse here so
  * consumers see a native object. Returns `null` from `nextSnapshot()`
  * when the underlying stream closes.
@@ -365,7 +360,7 @@ export class DeckClient {
     config?: DeckClientConfig,
   ): Promise<DeckClient> {
     return rethrowAsync(async () => {
-      const rawSdk = (sdk as unknown as { raw: never }).raw;
+      const rawSdk = sdk.__rawNapiSdk();
       const cfg: DeckClientConfigJs | undefined = config
         ? {
             snapshotPollIntervalMs: config.snapshotPollIntervalMs,
@@ -413,8 +408,10 @@ export class DeckClient {
   }
 
   /**
-   * One-shot read of the latest `MeshOsSnapshot`, parsed into a
-   * native object from the binding's JSON form.
+   * One-shot read of the latest `MeshOsSnapshot` (parsed JSON;
+   * `unknown` because the substrate snapshot's exact shape isn't
+   * mirrored in the TS surface — consumers cast or use a runtime
+   * validator).
    */
   status(): unknown {
     try {
@@ -430,7 +427,7 @@ export class DeckClient {
   }
 
   /**
-   * Live snapshot stream as `AsyncIterable<MeshOsSnapshot>`. JSON
+   * Live snapshot stream as `AsyncIterable<unknown> /* parsed MeshOsSnapshot JSON */`. JSON
    * parsing happens automatically.
    *
    * Async on the napi side because the substrate creates a

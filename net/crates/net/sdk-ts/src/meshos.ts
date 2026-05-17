@@ -264,6 +264,16 @@ export class MeshOsDaemonSdk {
   private constructor(private readonly raw: NapiSdk) {}
 
   /**
+   * @internal Accessor for sibling SDK modules (currently the
+   * Deck SDK's `DeckClient.fromMeshos`) that need to compose
+   * against the underlying napi handle. Not part of the public
+   * API; calling it from consumer code is unsupported.
+   */
+  __rawNapiSdk(): NapiSdk {
+    return this.raw;
+  }
+
+  /**
    * Start the SDK with optional config + the substrate's
    * `LoggingDispatcher`. Async so the napi-side factory runs in
    * the napi tokio context (a nested local runtime would deadlock).
