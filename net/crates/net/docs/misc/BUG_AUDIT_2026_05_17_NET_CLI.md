@@ -1,14 +1,17 @@
-# Bug audit — 2026-05-17 — `net-cli`
+# Bug audit — 2026-05-17 — `net-cli` (+ extended pass)
 
 Multi-agent bug hunt across `net/crates/net/cli/src/` (~3.6k LOC, 23 Rust files) on branch `netdb-watcher`. Scope was the in-tree net-cli surface as of `21d6f697` (post `net-cli-phase1` merge). Findings are demonstrable defects, not style. Overlaps with `CODE_REVIEW_2026_05_17_NET_CLI_PHASE1.md` are called out where relevant; this doc adds the items that review did not surface.
 
+A second pass the same day extended the hunt outward into `net/crates/net/src/adapter/**`, `net/crates/net/sdk/src/**`, and the Python / Node / Go FFI bindings. Those findings live in the **Extended scope** section below (items #17 onward in CLI; #22 onward outside CLI) so the net-cli numbering stays stable for cross-references.
+
 ## Status
 
-- **Remaining Critical:** none — but #1, #3, #4, #5 are data-loss / silent-corruption hazards and should be treated next.
-- **Remaining High:** #1, #2, #3, #4, #5, #6, #7
-- **Remaining Medium:** #8, #9, #10, #11
-- **Remaining Low:** #12, #13, #14, #15, #16
+- **Remaining Critical:** none — but #1, #3, #4, #5, #17, #22, #23, #24, #25, #26 are data-loss / silent-corruption / silent-rotation-loss hazards and should be treated next.
+- **Remaining High:** #1, #2, #3, #4, #5, #6, #7, #17 (CLI); #22, #23, #24, #25, #26 (extended).
+- **Remaining Medium:** #8, #9, #10, #11, #18 (CLI); #27, #28, #29, #30 (extended).
+- **Remaining Low:** #12, #13, #14, #15, #16, #19, #20, #21 (CLI); #31, #32 (extended).
 - **Overlap with `CODE_REVIEW_2026_05_17_NET_CLI_PHASE1`:** #9 ↔ B3 (--yes doc/code mismatch).
+- **Internal overlap (extended pass re-confirmed existing items):** extended pass #A ↔ existing #6 (`--force restore` merges), extended pass #B ↔ existing #1 (restore safety-gate swallows I/O errors). Notes added inline; no new entries created for those.
 - **Clean (audited and looked good):** `parse_u64_flexible`, humantime grammar + `checked_mul` on unit multipliers, ICE confirm-gate truth table (TTY/non-TTY × `--yes`), `pin`/`unpin` boolean dispatch in `run_memories_pin`, exit-code mapping table, `DEFAULT_SUPERVISOR_NODE = 1` consistency across the 11 subcommand call-sites, clap subcommand wiring, output JSON/text dispatch, config precedence (`--config` > env > default-path).
 
 ## High
@@ -27,6 +30,8 @@ Multi-agent bug hunt across `net/crates/net/cli/src/` (~3.6k LOC, 23 Rust files)
 
 7. **`commands/ice.rs:298, 364-381` — confirm prompt does a synchronous stdin read inside an async fn.** `prompt_for_yes` calls `io::stdin().lock().read_line(...)` while the Tokio runtime is live (started at `CliContext::build`, `257-263`). The blocking read parks a worker thread for as long as the operator stares at the prompt; background SDK tasks (logging dispatcher, mesh ticks) freeze. Fix: `tokio::io::stdin` or `tokio::task::spawn_blocking`.
 
+17. **`commands/netdb.rs:456-461` — `run_restore` hard-codes `.with_tasks().with_memories()` regardless of snapshot contents.** Even if `snap.tasks` or `snap.memories` is `None`, the rebuilt `NetDb` opens both adapters against `dest`. A tasks-only snapshot (the exact case exercised by `test_restore_opens_missing_model_fresh` in `bindings/python/tests/test_netdb.py:140` and `bindings/node/test/netdb.test.ts:160`) silently materializes a fresh `cortex/memories` channel file the operator never asked for; combined with #6 (`--force` merges instead of replacing), any pre-existing memories on disk get replayed and folded against an empty snapshot half. Add `--with-tasks` / `--with-memories` flags symmetric with the SDK builder, or branch on what `snap` actually carries.
+
 ## Medium
 
 8. **`commands/ice.rs:308-310` — `--sig` parsed *after* the operator has already typed YES.** A malformed `--sig` JSON aborts with `InvalidArgs` post-confirmation, wasting the dual-key ceremony and producing confusing UX. Parse all `--sig` entries up front (ideally before `simulate`) so an argv typo doesn't survive past the gate.
@@ -36,6 +41,8 @@ Multi-agent bug hunt across `net/crates/net/cli/src/` (~3.6k LOC, 23 Rust files)
 10. **`commands/netdb.rs:554, 105` and `commands/identity.rs:105` — `Path::exists()` follows symlinks and lies on permission errors.** A symlink at `--out` pointing to a sensitive file is "non-existent" by `exists()` and gets overwritten; a permission error pretends the path is absent. Use `tokio::fs::try_exists` (already used on the read path at `netdb.rs:613`) and distinguish `Ok(false)` from `Err`.
 
 11. **`commands/logs.rs:86-101` and `commands/audit.rs:136-155` — streaming output can deadlock on a stalled consumer.** `emit_stream_row` writes synchronously to `io::stdout()`. If the downstream pipe (e.g. `jq`) stops draining, the write blocks forever with no cancellation arm. Ctrl-C cleanly aborts `stream.next()` but not the stdout write. Fix: wrap stdout writes in a bounded `mpsc` + writer task with a cancellation `select!`, or at minimum document the wedge condition.
+
+18. **`commands/netdb.rs:560` — `run_snapshot` always opens both adapters and silently fabricates empty model state.** `open_netdb(..., true, true, false)` opens tasks and memories unconditionally. If the store on disk only ever had tasks, opening the memories channel creates an empty channel; `db.snapshot()` then returns `NetDbSnapshot { tasks: Some(_), memories: Some((empty_bytes, None)) }`. A later restore (after #17 is fixed) will believe memories were intentionally captured. Add CLI flags symmetric with the SDK builder, or inspect what's actually present on disk before opening.
 
 ## Low
 
@@ -49,6 +56,46 @@ Multi-agent bug hunt across `net/crates/net/cli/src/` (~3.6k LOC, 23 Rust files)
 
 16. **`commands/ice.rs:36` — double import `CliError, CliError as _CE`.** Compiles, but the two aliases used inconsistently across the file signal an unfinished refactor; readers have to mentally unify them on every error site.
 
+19. **`commands/netdb.rs:477-483` — `now_ns()` silently returns `0` on clock skew.** `.unwrap_or(0)` on `duration_since(UNIX_EPOCH)` stamps every `created_ns` / `updated_ns` with `0` on a pre-1970 host clock. Tasks/memories ordering filters (`UpdatedDesc`, etc.) collapse into insertion order and time-based `find_many` predicates break. Surface an error or fall back to a monotonic-but-distinct value instead of swallowing.
+
+20. **`commands/netdb.rs:575-577` — snapshot write skips fsync (compounds with #3).** Even after #3's atomic-tempfile-then-rename is applied, `tokio::fs::write` (or `tokio::fs::File::write_all`) without an explicit `sync_all` on the temp file *and* an `fsync` on the parent directory leaves the rename durable only at the kernel's discretion. A power loss after the rename returns to userspace, but before the page-cache flushes, still loses the snapshot. The full atomic-publish recipe is: write tmp → `sync_all` tmp → rename → `fsync` parent dir.
+
+21. **`adapter/net/netdb/db.rs:30-32` (decode) + `commands/netdb.rs:447` (caller) — `postcard::from_bytes` on operator-supplied snapshot has no length cap.** Postcard itself is memory-safe but obeys the decoded `Vec` length prefixes; a crafted `--from` blob can request multi-GB allocations and OOM the daemon. `bindings/python/tests/test_netdb.py:175` already exercises garbage bytes through this path. Bound the input with `postcard::take_from_bytes` after a magic-bytes + size sanity check, or refuse files larger than a hard ceiling before calling into postcard.
+
+## Extended scope — adapter, SDK, bindings (2026-05-17, pass 2)
+
+Same date, three additional parallel general-purpose agents took the audit outward into `net/crates/net/src/adapter/**`, `net/crates/net/sdk/src/**`, and the FFI bindings (Python, Node, Go). Items below are numbered to continue from the CLI section above. Two findings from this pass re-confirmed CLI items that were already filed (#6 and #1); those are noted in the Status section and not duplicated as new entries.
+
+### High
+
+22. **`sdk/src/mesh_rpc_resilience.rs:599` — jitter source contributes ~0 ns of entropy.** `compute_backoff` does `Instant::now().elapsed().as_nanos()` to decorrelate concurrent retries. `Instant::now()` returns a fresh `Instant`, and `.elapsed()` then measures the gap between construction and the very next call — always single-digit ns. The doc-comment explicitly cites a "high-resolution monotonic" source intended to break thundering-herd lockstep on parallel retries; in reality the `now_ns` term is essentially a constant and the only real entropy left is `attempt.wrapping_mul(...)` + `thread_id`, so retries from one call-site still align. Fix: cache a process-epoch `Instant` in a `OnceLock<Instant>` and measure elapsed from *that*, or hash `Instant::now()`'s tick directly.
+
+23. **`bindings/go/compute-ffi/src/lib.rs:2159, 2364, 2537` — silent `u32 → u8` truncation on group spawn.** `replica_count as u8`, `fork_count as u8`, `member_count as u8` truncate without validation. A Go caller passing 300 silently spawns a group of 44. The matching `scale_to` paths (e.g. line 2278) *do* validate via `u8::try_from` and surface `group_err_out_reason`, and the helper docstring at line 2007 even calls out this exact case ("replica count 300 exceeds 255") — so the validator exists but the spawn entry points skip it. Mirror the `scale_to` validation at the three spawn sites.
+
+24. **`adapter/net/cortex/tasks/adapter.rs:452-470` and `adapter/net/cortex/memories/adapter.rs:415-434` — docstring contradicts the code.** The doc block "Why not `fetch_add` then ingest unconditionally?" explicitly warns that this shape leaves a permanent gap which "the next snapshot would persist … and on restore, future ingests would pick up at the inflated value." The code immediately below does exactly `let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);` followed by an unconditional `inner.ingest(...)` — with no rollback on `Err`. Either the docs lie or the rollback was lost in a bugfix; either way operators reading the contract get the wrong story, and any restore taken after a post-`fetch_add` ingest failure inherits the bug the docs warn against. Fix: either reinstate the rollback (`fetch_sub` on `Err`) or rewrite the doc to acknowledge the gap.
+
+25. **`adapter/net/behavior/proximity.rs:514-521` — `set_local_capabilities` lost-update race.** `version = local_capability_version.fetch_add(1, ...)` returns the prior value+1 atomically, but the very next line does `local_capability_version.store(version, Ordering::Relaxed)` with the *local* computed version. Two concurrent callers interleave: A `fetch_add → 1`, B `fetch_add → 2`, then A's `store(1)` overwrites B's already-bumped `2`. The counter regresses, and a later `set_local_capabilities` may not bump past existing peers — pingwave consumers see "stale" capability info. The triple write of `hash`, `version`, and the `RwLock<Option<CapabilitySet>>` is also non-atomic: a reader inside `create_pingwave` can sample a hash that doesn't correspond to the version.
+
+26. **`adapter/net/behavior/loadbalance.rs:323` — `connections.fetch_sub(1)` underflow silently removes the endpoint from rotation forever.** `record_completion` decrements unconditionally; the public `LoadBalancer::record_completion` (line 863) accepts any `node_id` from a caller. The test at lines 1891-1895 explicitly acknowledges "calling `record_completion()` without a matching `record_request()` would underflow." After underflow to `u32::MAX - k`, `try_record_request` always fails (`c >= max_connections`) and `get_available_endpoints` filters the endpoint out forever — a silent permanent removal from rotation with no log, no metric, no recovery. Replace with `fetch_update` and a saturating sub.
+
+### Medium
+
+27. **`adapter/jetstream.rs:621-684` — `has_more` can lie when corrupt records are mixed in.** Loop fills `events` with successful deserializations; `Err(Serialization)` skips without pushing. The condition `events.len() < fetch_limit` combined with the `events.len() > limit` "more available" detector means that with a stream of N good records plus many corrupt ones past `limit`, `has_more` can return `false` when more good records actually exist past the skip window. The cursor advances via `last_seen_seq` so the *next* poll will still pick them up, but a caller that decides "stop iterating" off the immediate `has_more` will truncate.
+
+28. **`bindings/python/src/cortex.rs:2080-2192` — `PyNetDb::open` spawns two independent tokio runtimes.** `PyTasksAdapter::open` and `PyMemoriesAdapter::open` each call `make_runtime()` (fresh multi-thread runtime). A `PyNetDb.open(with_tasks=True, with_memories=True)` therefore creates two complete runtimes per NetDb instance, plus a third inside `shared_runtime()` if meshdb is involved. Each carries its own worker thread pool. With many short-lived `PyNetDb`s (the test pattern called out at `bindings/python/src/meshdb.rs:1337`) this leaks threads and FDs proportional to instance count. Fix: route both adapters through a single shared runtime.
+
+29. **`bindings/python/src/meshdb.rs:1342-1351` — `shared_runtime()` has a get-then-init race window.** Two threads simultaneously hitting the `RT.get().is_none()` path both build a fresh `Runtime`; the losing thread's `Runtime` is dropped without joining its spawned worker threads (wasteful, not unsafe). Replace the check-then-init pattern with `OnceLock::get_or_init`.
+
+30. **`bindings/python/src/lib.rs:1238` — `NetMesh::new` always builds a fresh `TokenCache`.** The mesh's `TokenCache` is created per `NetMesh.__new__`, so a caller's `Identity.install_token(...)` against the same seed never reaches the mesh's cache (different `Arc<TokenCache>`). The doc-comment at lines 1233-1239 acknowledges "today each `NetMesh` gets its own" but the consequence is that subscribe-with-token from a separately-built `Identity` silently fails verification until the token is explicitly re-installed via `NetMesh.subscribe_channel(..., token=bytes)`. Discoverability hazard, not a memory bug — but the contract should either be enforced (share the cache across `NetMesh` instances bound to the same seed) or loudly stated in the Python-side docs.
+
+### Low
+
+31. **`sdk/src/stream.rs:215-222` — backoff doubles on empty-but-`has_more=true` polls.** When `response.events.is_empty()`, the loop unconditionally doubles backoff up to `max_backoff` — even if `response.has_more == true` (the cursor advanced but the filter on this shard matched nothing). Each empty-but-advancing poll exponentially extends the wait until `max_backoff`, defeating the cursor's forward progress. Only back off when *no* progress was made.
+
+32. **`adapter/net/behavior/loadbalance.rs:1242-1249` — `hash_ring.insert(hash, node_id)` has no collision check.** FNV-1a + 32-byte NodeId × 150 vnodes ≈ ~150 entries per node; at 1000 nodes the u64 birthday-bound collision probability is still tiny, but the failure mode (the later insert wins, the earlier vnode is silently lost → uneven distribution) is unobservable. Either use `entry(hash).or_insert(...)` and bump a metric on collision, or move to a wider hash.
+
 ## Methodology
 
-Two parallel general-purpose agents — one on `commands/{netdb,admin,ice,identity}.rs` (the high-churn surface), one on `commands/{audit,blob,cap,daemon,db,logs,peer,port,rpc,snapshot,version,mod}.rs` + `{main,config,context,error,output,parsers,prelude}.rs`. Both read each file in full and cross-referenced helpers when bugs spanned modules. Findings deduped and merged.
+Two parallel general-purpose agents on the first pass — one on `commands/{netdb,admin,ice,identity}.rs` (the high-churn surface), one on `commands/{audit,blob,cap,daemon,db,logs,peer,port,rpc,snapshot,version,mod}.rs` + `{main,config,context,error,output,parsers,prelude}.rs`. Both read each file in full and cross-referenced helpers when bugs spanned modules.
+
+Three additional parallel general-purpose agents on the second pass — one on netdb-adjacent CLI + tests + the `NetDb` core (`adapter/net/netdb/**`, `cortex/{tasks,memories}/adapter.rs`, integration + binding tests), one on `adapter/net/behavior/**` + `adapter/{dedup_state,jetstream}.rs`, one on `sdk/src/**` + `bindings/{python,node,go}/**`. Findings deduped against the first pass, against each other, and merged. Two of the second-pass findings re-confirmed already-filed CLI items (#6 and #1); those are noted in **Status** rather than duplicated.
