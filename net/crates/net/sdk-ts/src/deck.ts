@@ -6,7 +6,7 @@
  * - {@link DeckSdkError} typed Error subclass that parses the
  *   substrate `<<deck-sdk-kind:KIND>>MSG` envelope.
  * - Auto-JSON-parsing for `status()` and `snapshots()`.
- * - `AsyncIterable<unknown> /* parsed MeshOsSnapshot JSON */` / `AsyncIterable<StatusSummary>`
+ * - `AsyncIterable<unknown>` (parsed `MeshOsSnapshot` JSON) / `AsyncIterable<StatusSummary>`
  *   wrappers over the raw `nextSnapshot()` / `nextSummary()`
  *   methods.
  *
@@ -243,7 +243,7 @@ function statusSummaryFromJs(s: StatusSummaryJs): StatusSummary {
 // ----------------------------------------------------------------------------
 
 /**
- * Wrap a raw napi snapshot stream as `AsyncIterable<unknown> /* parsed MeshOsSnapshot JSON */`.
+ * Wrap a raw napi snapshot stream as `AsyncIterable<unknown>` (parsed `MeshOsSnapshot` JSON).
  * The napi side emits JSON-encoded snapshots; we parse here so
  * consumers see a native object. Returns `null` from `nextSnapshot()`
  * when the underlying stream closes.
@@ -321,7 +321,7 @@ export class DeckClient {
    * releases on GC.
    */
   static async new(
-    operatorSeed: Uint8Array | Buffer,
+    operatorSeed: Buffer,
     meshosConfig?: MeshOsConfig,
     deckConfig?: DeckClientConfig,
   ): Promise<DeckClient> {
@@ -340,11 +340,7 @@ export class DeckClient {
             iceSignatureThreshold: deckConfig.iceSignatureThreshold,
           }
         : undefined;
-      const raw = await NapiClient.new(
-        operatorSeed as unknown as Buffer,
-        meshos,
-        deck,
-      );
+      const raw = await NapiClient.new(operatorSeed, meshos, deck);
       return new DeckClient(raw);
     });
   }
@@ -427,7 +423,7 @@ export class DeckClient {
   }
 
   /**
-   * Live snapshot stream as `AsyncIterable<unknown> /* parsed MeshOsSnapshot JSON */`. JSON
+   * Live snapshot stream as `AsyncIterable<unknown>` (parsed `MeshOsSnapshot` JSON). JSON
    * parsing happens automatically.
    *
    * Async on the napi side because the substrate creates a
