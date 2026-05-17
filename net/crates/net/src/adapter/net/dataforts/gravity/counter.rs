@@ -911,7 +911,10 @@ mod tests {
         // the iter-mut-during-bump path didn't leave the underlying
         // HashMap in a torn state.
         let guard = registry.lock().unwrap();
-        assert!(guard.get(&target).is_some(), "target entry should survive the storm");
+        assert!(
+            guard.get(&target).is_some(),
+            "target entry should survive the storm"
+        );
     }
 
     /// LRU eviction under a tight cap with concurrent inserts from
