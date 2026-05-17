@@ -2978,6 +2978,17 @@ export interface HashedEvent {
   hash: bigint
 }
 
+/**
+ * JS-side health response object form. `kind` is one of
+ * `"healthy"` / `"degraded"` / `"unhealthy"`; `reason` rides
+ * into the substrate's `Degraded { reason }` variant when
+ * present.
+ */
+export interface HealthObjJs {
+  kind: string
+  reason?: string
+}
+
 /** Ingestion result. */
 export interface IngestResult {
   /** Shard the event was assigned to */

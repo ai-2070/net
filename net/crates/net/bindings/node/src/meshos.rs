@@ -45,7 +45,8 @@ use net::adapter::net::behavior::meshos::{
     PeerSnapshot, SdkError, DEFAULT_GRACEFUL_SHUTDOWN,
 };
 use net::adapter::net::compute::{
-    DaemonControl as CoreDaemonControl, DaemonError as CoreDaemonError, MeshDaemon,
+    DaemonControl as CoreDaemonControl, DaemonError as CoreDaemonError,
+    DaemonHealth as CoreDaemonHealth, MeshDaemon,
 };
 use net::adapter::net::state::causal::CausalEvent;
 
@@ -102,6 +103,32 @@ type OnControlTsfn = napi::threadsafe_function::ThreadsafeFunction<
     napi::Status,
     false,
 >;
+
+/// `health()` returns either a string (`"healthy"` / `"degraded"`
+/// / `"unhealthy"`) or an object `{ kind, reason? }`. The TSFN
+/// surface accepts an `Either<String, HealthObjJs>` and the
+/// `MeshDaemon::health` impl resolves to the substrate enum.
+type HealthTsfn = napi::threadsafe_function::ThreadsafeFunction<
+    (),
+    napi::Either<String, HealthObjJs>,
+    (),
+    napi::Status,
+    false,
+>;
+
+/// `saturation()` returns a number clamped to `[0.0, 1.0]`.
+type SaturationTsfn =
+    napi::threadsafe_function::ThreadsafeFunction<(), f64, (), napi::Status, false>;
+
+/// JS-side health response object form. `kind` is one of
+/// `"healthy"` / `"degraded"` / `"unhealthy"`; `reason` rides
+/// into the substrate's `Degraded { reason }` variant when
+/// present.
+#[napi(object)]
+pub struct HealthObjJs {
+    pub kind: String,
+    pub reason: Option<String>,
+}
 
 // =========================================================================
 // Cross-binding wire form — POJOs marshalled to JS.
@@ -410,6 +437,16 @@ pub struct DaemonObjectTsfns {
     snapshot: Option<SnapshotTsfn>,
     restore: Option<RestoreTsfn>,
     on_control: Option<OnControlTsfn>,
+    health: Option<HealthTsfn>,
+    saturation: Option<SaturationTsfn>,
+    /// Capability advertisement resolved synchronously at
+    /// registration time. The Node main thread is the only place
+    /// `FromNapiValue` runs, so we read these once here and
+    /// cache the built `CapabilitySet`s — `MeshDaemon::*` calls
+    /// from substrate workers then clone the cached set rather
+    /// than re-entering JS land.
+    required_capabilities: CapabilitySet,
+    optional_capabilities: CapabilitySet,
 }
 
 impl napi::bindgen_prelude::TypeName for DaemonObjectTsfns {
@@ -475,14 +512,72 @@ impl napi::bindgen_prelude::FromNapiValue for DaemonObjectTsfns {
             None => None,
         };
 
+        let health_fn: Option<Function<'_, (), napi::Either<String, HealthObjJs>>> =
+            obj.get_named_property("health")?;
+        let health: Option<HealthTsfn> = match health_fn {
+            Some(f) => Some(f.build_threadsafe_function().build()?),
+            None => None,
+        };
+
+        let saturation_fn: Option<Function<'_, (), f64>> =
+            obj.get_named_property("saturation")?;
+        let saturation: Option<SaturationTsfn> = match saturation_fn {
+            Some(f) => Some(f.build_threadsafe_function().build()?),
+            None => None,
+        };
+
+        let required_capabilities = resolve_capabilities_napi(&obj, "requiredCapabilities")?;
+        let optional_capabilities = resolve_capabilities_napi(&obj, "optionalCapabilities")?;
+
         Ok(DaemonObjectTsfns {
             name,
             process,
             snapshot,
             restore,
             on_control,
+            health,
+            saturation,
+            required_capabilities,
+            optional_capabilities,
         })
     }
+}
+
+/// Resolve a daemon-side capability advertisement (either a
+/// `string[]` property or a `() -> string[]` callable) on the JS
+/// main thread. Caches the result as a `CapabilitySet` for
+/// substrate-side polls. Invalid shapes raise an `invalid_daemon`
+/// error at registration time.
+fn resolve_capabilities_napi(
+    obj: &napi::bindgen_prelude::Object,
+    attr: &str,
+) -> Result<CapabilitySet> {
+    use napi::bindgen_prelude::JsObjectValue as _;
+
+    // First try as a `string[]` property — the common case.
+    if let Ok(Some(tags)) = obj.get_named_property::<Option<Vec<String>>>(attr) {
+        let mut set = CapabilitySet::new();
+        for tag in tags {
+            set = set.add_tag(tag);
+        }
+        return Ok(set);
+    }
+    // Fall back to a callable: `() -> string[]`.
+    let callable: Option<Function<'_, (), Vec<String>>> = obj.get_named_property(attr)?;
+    let Some(f) = callable else {
+        return Ok(CapabilitySet::default());
+    };
+    let tags = f.call(()).map_err(|e| {
+        sdk_err(
+            "invalid_daemon",
+            format!("`{attr}()` threw: {e}"),
+        )
+    })?;
+    let mut set = CapabilitySet::new();
+    for tag in tags {
+        set = set.add_tag(tag);
+    }
+    Ok(set)
 }
 
 // =========================================================================
@@ -495,6 +590,10 @@ struct MeshOsDaemonBridge {
     snapshot: Option<SnapshotTsfn>,
     restore: Option<RestoreTsfn>,
     on_control: Option<OnControlTsfn>,
+    health: Option<HealthTsfn>,
+    saturation: Option<SaturationTsfn>,
+    required_capabilities: CapabilitySet,
+    optional_capabilities: CapabilitySet,
     callback_timeout: Duration,
 }
 
@@ -506,6 +605,10 @@ impl MeshOsDaemonBridge {
             snapshot: tsfns.snapshot,
             restore: tsfns.restore,
             on_control: tsfns.on_control,
+            health: tsfns.health,
+            saturation: tsfns.saturation,
+            required_capabilities: tsfns.required_capabilities,
+            optional_capabilities: tsfns.optional_capabilities,
             callback_timeout,
         }
     }
@@ -517,18 +620,22 @@ impl MeshDaemon for MeshOsDaemonBridge {
     }
 
     fn requirements(&self) -> CapabilityFilter {
-        // Slice 1: empty filter. `requiredCapabilities` /
-        // `optionalCapabilities` on the JS daemon object land in
-        // slice 2 along with the substrate-side capability commit.
+        // `requirements()` is a placement filter — what *kind*
+        // of node the daemon needs. Distinct from the daemon's
+        // own advertisement (`required_capabilities` /
+        // `optional_capabilities`). The Node surface exposes
+        // only the advertise side today; placement-filter
+        // routing remains substrate-internal until a consumer
+        // workflow needs it.
         CapabilityFilter::default()
     }
 
     fn required_capabilities(&self) -> CapabilitySet {
-        CapabilitySet::default()
+        self.required_capabilities.clone()
     }
 
     fn optional_capabilities(&self) -> CapabilitySet {
-        CapabilitySet::default()
+        self.optional_capabilities.clone()
     }
 
     fn process(&mut self, event: &CausalEvent) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
@@ -644,6 +751,79 @@ impl MeshDaemon for MeshOsDaemonBridge {
             ev_js,
             napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
         );
+    }
+
+    fn health(&self) -> CoreDaemonHealth {
+        let Some(tsfn) = self.health.as_ref() else {
+            return CoreDaemonHealth::Healthy;
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<napi::Either<String, HealthObjJs>>>(1);
+        let status = tsfn.call_with_return_value(
+            (),
+            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+            move |ret, _env| {
+                let _ = tx.send(ret);
+                Ok(())
+            },
+        );
+        if status != napi::Status::Ok {
+            return CoreDaemonHealth::Healthy;
+        }
+        let resp = match rx.recv_timeout(self.callback_timeout) {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                eprintln!("MeshOsDaemonBridge::health JS callback threw: {e}");
+                return CoreDaemonHealth::Healthy;
+            }
+            Err(_) => return CoreDaemonHealth::Healthy,
+        };
+        parse_health_response(resp)
+    }
+
+    fn saturation(&self) -> f32 {
+        let Some(tsfn) = self.saturation.as_ref() else {
+            return 0.0;
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<f64>>(1);
+        let status = tsfn.call_with_return_value(
+            (),
+            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+            move |ret, _env| {
+                let _ = tx.send(ret);
+                Ok(())
+            },
+        );
+        if status != napi::Status::Ok {
+            return 0.0;
+        }
+        match rx.recv_timeout(self.callback_timeout) {
+            Ok(Ok(v)) => (v as f32).clamp(0.0, 1.0),
+            Ok(Err(e)) => {
+                eprintln!("MeshOsDaemonBridge::saturation JS callback threw: {e}");
+                0.0
+            }
+            Err(_) => 0.0,
+        }
+    }
+}
+
+/// Resolve a JS health response into the substrate enum. Accepts
+/// either a string discriminator or a `{ kind, reason? }` object.
+/// Unknown kinds degrade to `Healthy` so a typo on the JS side
+/// can't wedge the supervisor — operators see the daemon as
+/// healthy until they fix the callback.
+fn parse_health_response(resp: napi::Either<String, HealthObjJs>) -> CoreDaemonHealth {
+    let (kind, reason) = match resp {
+        napi::Either::A(s) => (s, None),
+        napi::Either::B(obj) => (obj.kind, obj.reason),
+    };
+    match kind.as_str() {
+        "healthy" => CoreDaemonHealth::Healthy,
+        "degraded" => CoreDaemonHealth::Degraded {
+            reason: reason.unwrap_or_else(|| "(unspecified)".into()),
+        },
+        "unhealthy" => CoreDaemonHealth::Unhealthy,
+        _ => CoreDaemonHealth::Healthy,
     }
 }
 

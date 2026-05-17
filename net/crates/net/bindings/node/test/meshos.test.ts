@@ -327,4 +327,88 @@ d('MeshOS daemon-author SDK (Phase 3 slice 1)', () => {
       await sdk.shutdown();
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Slice 2 — capability advertisement + health/saturation routing.
+  // -------------------------------------------------------------------------
+
+  it('registerDaemon accepts requiredCapabilities/optionalCapabilities as string[]', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const daemon = {
+        name: 'cap-daemon',
+        process: () => [],
+        requiredCapabilities: ['hardware.gpu', 'software.model.foo=llama-3.1-70b'],
+        optionalCapabilities: ['heat:cold'],
+      };
+      const handle = await sdk.registerDaemon(daemon, Identity.generate());
+      expect(handle.daemonId).not.toBe(0n);
+      await handle.gracefulShutdown(10n);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('registerDaemon accepts requiredCapabilities as a callable', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const daemon = {
+        name: 'cap-daemon-callable',
+        process: () => [],
+        requiredCapabilities: () => ['hardware.gpu'],
+      };
+      const handle = await sdk.registerDaemon(daemon, Identity.generate());
+      expect(handle.daemonId).not.toBe(0n);
+      await handle.gracefulShutdown(10n);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('registerDaemon tolerates daemons without capability methods', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const handle = await sdk.registerDaemon(
+        { name: 'minimal', process: () => [] },
+        Identity.generate(),
+      );
+      expect(handle.daemonId).not.toBe(0n);
+      await handle.gracefulShutdown(10n);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('registerDaemon accepts JS-side health (string) and saturation callbacks', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const daemon = {
+        name: 'health-daemon',
+        process: () => [],
+        health: () => 'degraded',
+        saturation: () => 0.75,
+      };
+      const handle = await sdk.registerDaemon(daemon, Identity.generate());
+      expect(handle.daemonId).not.toBe(0n);
+      await handle.gracefulShutdown(10n);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('health callback may return a {kind, reason} object', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const daemon = {
+        name: 'health-obj-daemon',
+        process: () => [],
+        health: () => ({ kind: 'degraded', reason: 'queue depth high' }),
+      };
+      const handle = await sdk.registerDaemon(daemon, Identity.generate());
+      expect(handle.daemonId).not.toBe(0n);
+      await handle.gracefulShutdown(10n);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
 });
