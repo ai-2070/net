@@ -1,0 +1,25 @@
+net/crates/net/cli/src/commands/ice.rs
+  s_8c2b4b36ad9479::t_0d1c1f91f82507 258-264
+net/crates/net/cli/src/commands/admin.rs
+  s_8c2b4b36ad9479::t_0d1c1f91f82507 195-206,266-272
+net/crates/net/cli/src/commands/logs.rs
+  s_8c2b4b36ad9479::t_0d1c1f91f82507 57-59
+net/crates/net/cli/src/output.rs
+  s_8c2b4b36ad9479::t_0d1c1f91f82507 70,74,78,83,99,106,112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "8f8e47fd06a2f9a407a0d1874ef238d3922080a7",
+  "prompts": {},
+  "sessions": {
+    "s_8c2b4b36ad9479": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c178f51c-95e0-4224-ba26-c4901e8acca7",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
