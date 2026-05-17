@@ -1,0 +1,23 @@
+net/crates/net/sdk-ts/test/meshos_types.test.ts
+  s_b3022192a92c59::t_8c1cb9fb4de1f2 1-70
+net/crates/net/sdk-ts/src/meshos.ts
+  s_b3022192a92c59::t_41a177cecaf900 218-236,250-256,264-267
+net/crates/net/sdk-ts/src/index.ts
+  s_b3022192a92c59::t_30d0882019daa6 227-240
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "0dc50c4bb2c2a50dd3ce8da55f064603fa5e7699",
+  "prompts": {},
+  "sessions": {
+    "s_b3022192a92c59": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d594c56e-1353-4a07-aa91-e09d2c583c0f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
