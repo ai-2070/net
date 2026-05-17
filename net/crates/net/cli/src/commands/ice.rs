@@ -373,8 +373,15 @@ where
 fn map_ice_error(msg: &str, kind: &'static str) -> CliError {
     match kind {
         "simulation_required" => CliError::new(ExitCodeKind::IceSimulationBlocked, msg),
+        // `signature_invalid` is a cryptographic verifier
+        // failure, not a policy / quorum reject. Pre-fix it
+        // surfaced under `OperatorPolicyRejected` (5) along
+        // with the other ICE policy failures; route it to a
+        // distinct `IceSignatureInvalid` (13) so audit
+        // dashboards can tell "verifier failed" from "policy
+        // rejected."
+        "signature_invalid" => CliError::new(ExitCodeKind::IceSignatureInvalid, msg),
         "not_authorized"
-        | "signature_invalid"
         | "insufficient_signatures"
         | "envelope_expired"
         | "envelope_from_future"

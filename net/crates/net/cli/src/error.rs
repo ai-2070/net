@@ -54,6 +54,15 @@ pub enum ExitCodeKind {
     /// `net db` — predicate DSL (`--where` / `--filter`) failed
     /// to parse.
     DbPredicateParseFailed = 12,
+    /// `net ice` — a supplied operator signature failed
+    /// cryptographic verification. Pre-fix this surfaced under
+    /// `OperatorPolicyRejected` (5), conflating
+    /// signature-verification failure with policy / quorum
+    /// failure. Audit readers seeing exit code 5 expected a
+    /// policy gate; the verifier failure shape is distinct
+    /// (operator's key + signature pair did not validate against
+    /// the simulated envelope).
+    IceSignatureInvalid = 13,
 }
 
 /// Typed CLI error. Carries the exit-code discriminator + a
@@ -145,5 +154,6 @@ mod tests {
         assert_eq!(ExitCodeKind::DaemonFactoryNotFound as u8, 10);
         assert_eq!(ExitCodeKind::DbQueryParseFailed as u8, 11);
         assert_eq!(ExitCodeKind::DbPredicateParseFailed as u8, 12);
+        assert_eq!(ExitCodeKind::IceSignatureInvalid as u8, 13);
     }
 }
