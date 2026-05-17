@@ -2,13 +2,18 @@
 // C ABI exported by `net::ffi::meshos` (compiled as
 // `libnet_meshos`).
 //
-// # Scope (slice 1a)
+// # Scope (slice 1b)
 //
-// Lifecycle, control receive, log emission, graceful shutdown.
-// User-supplied daemon callbacks (`process` / `snapshot` /
-// `restore` / `onControl`) are NOT plumbed yet — the registered
-// daemon is an internal no-op on the Rust side. Slice 1b adds the
-// cgo `//export` callback bridge.
+// Lifecycle, control receive, log emission, graceful shutdown,
+// and the vtable-based daemon-callback bridge.
+//
+// `RegisterDaemon` registers an internal no-op daemon for
+// lifecycle-only consumers. Real daemons go through the C ABI's
+// `net_meshos_register_daemon_with_vtable`; the Go-side
+// `//export` trampoline that lets Go consumers supply
+// closures-as-callbacks is a slice-1c follow-up — the cdylib
+// surface, C SDK, and Rust-side bridge ship today so the C / C++
+// / Zig / etc. consumer path is complete.
 //
 // # Memory model
 //
@@ -126,6 +131,28 @@ extern int net_meshos_graceful_shutdown(
 extern const char* net_meshos_last_error_message(void);
 extern const char* net_meshos_last_error_kind(void);
 extern void net_meshos_clear_last_error(void);
+
+// Slice 1b — vtable bridge. The Go-side `//export` trampoline
+// surface lands in slice 1c; for now these are declared so the
+// cdylib's exported symbols are documented at the Go binding
+// boundary.
+#define NET_MESHOS_HEALTH_HEALTHY 0
+#define NET_MESHOS_HEALTH_DEGRADED 1
+#define NET_MESHOS_HEALTH_UNHEALTHY 2
+
+typedef struct NetMeshOsProcessEmitCtx NetMeshOsProcessEmitCtx;
+typedef struct NetMeshOsSnapshotEmitCtx NetMeshOsSnapshotEmitCtx;
+
+extern void net_meshos_process_emit(
+    NetMeshOsProcessEmitCtx* ctx,
+    const uint8_t* payload_ptr,
+    size_t payload_len
+);
+extern void net_meshos_snapshot_emit(
+    NetMeshOsSnapshotEmitCtx* ctx,
+    const uint8_t* payload_ptr,
+    size_t payload_len
+);
 */
 import "C"
 

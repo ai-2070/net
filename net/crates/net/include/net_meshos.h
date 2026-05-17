@@ -13,18 +13,22 @@
  * Companion to `MESHOS_SDK_PLAN.md` Phase 5; consumes the cdylib
  * built for Phase 4 (Go) without modification.
  *
- * # Scope (slice 1a)
+ * # Scope (slice 1b)
  *
- * SDK + handle lifecycle, control-event RX, log emission, graceful
- * shutdown. The substrate-side daemon registered by
- * `net_meshos_register_daemon` is an internal no-op `MeshDaemon`
- * impl in this slice — the C consumer cannot yet plug in
- * `process` / `snapshot` / `restore` / `on_control` callbacks.
- * The vtable-based callback bridge (slice 1b) is the next slice
- * and is the only thing keeping this header from being the full
- * daemon-author contract. Everything else — lifecycle, control
- * event delivery, log emission, graceful shutdown, error envelope —
- * is permanent SDK shape.
+ * Full daemon-author surface. `net_meshos_register_daemon_with_vtable`
+ * accepts a `NetMeshOsDaemonVtable` struct of consumer-supplied
+ * C function pointers (`process` / `snapshot` / `restore` /
+ * `on_control` / `health` / `saturation`); the cdylib bridges
+ * each into the substrate's `MeshDaemon` trait. `process` and
+ * `snapshot` callbacks emit output buffers via the
+ * `net_meshos_process_emit` / `_snapshot_emit` helpers — the
+ * bridge copies the bytes immediately so the caller may free the
+ * source buffer as soon as the emit returns.
+ *
+ * The slice-1a `net_meshos_register_daemon` (which registers an
+ * internal no-op daemon) is kept for lifecycle-only consumers
+ * that want to drive control / log / shutdown surfaces without
+ * plugging in process logic.
  *
  * # Build
  *
@@ -217,7 +221,123 @@ int net_meshos_sdk_shutdown(NetMeshOsSdk* sdk);
 uint64_t net_meshos_sdk_dropped_control_events(NetMeshOsSdk* sdk);
 
 /* =========================================================================
+ * Daemon registration — vtable callbacks (slice 1b)
+ *
+ * Consumer supplies a `NetMeshOsDaemonVtable` of C function
+ * pointers. Each callback receives the consumer's `user_ctx`.
+ * Callbacks fire from tokio worker threads — consumer is
+ * responsible for the thread-safety of any shared state.
+ *
+ * `process` is required; every other field may be NULL to take
+ * the substrate default. The vtable struct is copied during
+ * registration; the caller may free or reuse the struct as soon
+ * as `net_meshos_register_daemon_with_vtable` returns. Each
+ * non-NULL function pointer must remain valid until the handle
+ * is freed.
+ * ========================================================================= */
+
+/* Health discriminator returned by the vtable's `health` callback. */
+#define NET_MESHOS_HEALTH_HEALTHY   0
+#define NET_MESHOS_HEALTH_DEGRADED  1
+#define NET_MESHOS_HEALTH_UNHEALTHY 2
+
+/* Opaque emit contexts. Handed to `process` / `snapshot`
+ * callbacks. Consumers must NOT free; the bridge owns the
+ * underlying buffer. */
+typedef struct NetMeshOsProcessEmitCtx  NetMeshOsProcessEmitCtx;
+typedef struct NetMeshOsSnapshotEmitCtx NetMeshOsSnapshotEmitCtx;
+
+/* Vtable of consumer-supplied callbacks. */
+typedef struct {
+    /* Required. Return 0 on success; non-zero surfaces as
+     * substrate `ProcessFailed`. Emit zero or more output buffers
+     * via `net_meshos_process_emit(emit_ctx, ptr, len)`. */
+    int (*process)(
+        void* user_ctx,
+        NetMeshOsProcessEmitCtx* emit_ctx,
+        uint64_t origin_hash,
+        uint64_t sequence,
+        const uint8_t* payload_ptr,
+        size_t payload_len
+    );
+    /* Optional. Stateless daemons set NULL. Emit at most one
+     * snapshot buffer via `net_meshos_snapshot_emit(emit_ctx,
+     * ptr, len)`; subsequent emits in the same callback are
+     * ignored. */
+    void (*snapshot)(
+        void* user_ctx,
+        NetMeshOsSnapshotEmitCtx* emit_ctx
+    );
+    /* Optional. Return 0 on success; non-zero surfaces as
+     * substrate `RestoreFailed`. */
+    int (*restore)(
+        void* user_ctx,
+        const uint8_t* payload_ptr,
+        size_t payload_len
+    );
+    /* Optional. Fires when the supervisor routes a daemon-
+     * targeted action. Same wire form as `next_control` — `kind`
+     * is one of `NET_MESHOS_CONTROL_*`. */
+    void (*on_control)(
+        void* user_ctx,
+        int kind,
+        uint64_t grace_period_ms,
+        float level
+    );
+    /* Optional. Returns one of `NET_MESHOS_HEALTH_*`. NULL = always
+     * `Healthy`. */
+    int (*health)(void* user_ctx);
+    /* Optional. Returns a value in `[0.0, 1.0]`. NULL = `0.0`. */
+    float (*saturation)(void* user_ctx);
+} NetMeshOsDaemonVtable;
+
+/* Emit a process-output buffer. Bytes are copied immediately;
+ * the source buffer may be freed as soon as this returns. Safe
+ * to call multiple times per `process` invocation. */
+void net_meshos_process_emit(
+    NetMeshOsProcessEmitCtx* ctx,
+    const uint8_t* payload_ptr,
+    size_t payload_len
+);
+
+/* Emit the daemon's snapshot buffer. Calling more than once per
+ * snapshot callback is a no-op for subsequent calls. */
+void net_meshos_snapshot_emit(
+    NetMeshOsSnapshotEmitCtx* ctx,
+    const uint8_t* payload_ptr,
+    size_t payload_len
+);
+
+/* Register a daemon with consumer-supplied callbacks.
+ *
+ *   sdk             — running SDK handle.
+ *   name_ptr/_len   — UTF-8 daemon name (NOT NUL-terminated).
+ *   seed_ptr        — 32 bytes of ed25519 seed (operator id =
+ *                     keypair's origin hash).
+ *   vtable_ptr      — vtable; `process` field is required.
+ *   user_ctx        — opaque pointer passed verbatim to every
+ *                     callback. Consumer owns the lifetime —
+ *                     must outlive the handle.
+ *   out             — receives the registered handle.
+ *
+ * Returns NET_MESHOS_OK on success. Caller MUST free the handle
+ * via `net_meshos_handle_free` (or `net_meshos_graceful_shutdown`
+ * followed by `_free`). */
+int net_meshos_register_daemon_with_vtable(
+    NetMeshOsSdk* sdk,
+    const char* name_ptr,
+    size_t name_len,
+    const uint8_t* seed_ptr,
+    const NetMeshOsDaemonVtable* vtable_ptr,
+    void* user_ctx,
+    NetMeshOsHandle** out
+);
+
+/* =========================================================================
  * Daemon registration (slice 1a — internal no-op daemon)
+ *
+ * Kept for lifecycle-only consumers. Real daemons use
+ * `_with_vtable` above.
  * ========================================================================= */
 
 /* Register a daemon under the supplied identity.
@@ -230,13 +350,10 @@ uint64_t net_meshos_sdk_dropped_control_events(NetMeshOsSdk* sdk);
  *                         uses its `origin_hash` as the daemon's
  *                         substrate id.
  *
- * **Slice 1a caveat:** the substrate-side daemon registered by
- * this call is an internal no-op `MeshDaemon` impl. Slice 1b
- * lands the vtable-based callback bridge (`process` / `snapshot`
- * / `restore` / `on_control` function pointers) that lets C
- * consumers implement real daemons. The supervisor lifecycle —
- * control events, log emission, graceful shutdown — works
- * end-to-end against today's no-op daemon.
+ * **No-op daemon:** the substrate-side daemon registered by
+ * this call is an internal no-op `MeshDaemon` impl. Use
+ * `net_meshos_register_daemon_with_vtable` for daemons that plug
+ * in `process` / `snapshot` / `restore` / `on_control` callbacks.
  *
  * On success, writes a heap-allocated handle to `*out` and returns
  * NET_MESHOS_OK. On failure, populates the thread-local last-error
