@@ -108,8 +108,17 @@ enum Command {
     /// Substrate failure stream.
     #[command(subcommand)]
     Failures(FailuresCommand),
-    // Subsequent commands (daemon / cap / peer / port / db /
-    // netdb) land in follow-up commits within Phase 1.
+    /// Capability advertisement + discovery.
+    #[command(subcommand)]
+    Cap(commands::cap::CapCommand),
+    /// Peer + NAT-traversal helpers.
+    #[command(subcommand)]
+    Peer(PeerCommand),
+    /// Per-daemon listing.
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+    // Subsequent commands (port / db / netdb) land in follow-up
+    // commits within Phase 1.
 }
 
 #[derive(Subcommand, Debug)]
@@ -122,6 +131,21 @@ enum LogCommand {
 enum FailuresCommand {
     /// Tail the failure stream.
     Tail(commands::logs::FailuresTailArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum PeerCommand {
+    /// List peers known to the local snapshot.
+    Ls(commands::peer::LsArgs),
+    // reflex / nat / reclassify-nat / set-reflex / clear-reflex
+    // land once the SDK exposes a mesh adapter accessor on the
+    // runtime — followup within Phase 1.
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonCommand {
+    /// List daemons known to the local snapshot.
+    Ls(commands::daemon::LsArgs),
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -163,6 +187,13 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         }
         Command::Failures(FailuresCommand::Tail(args)) => {
             commands::logs::run_failures_tail(args, output, config_path, profile).await
+        }
+        Command::Cap(cmd) => commands::cap::run(cmd, output, config_path, profile).await,
+        Command::Peer(PeerCommand::Ls(args)) => {
+            commands::peer::run_ls(args, output, config_path, profile).await
+        }
+        Command::Daemon(DaemonCommand::Ls(args)) => {
+            commands::daemon::run_ls(args, output, config_path, profile).await
         }
     }
 }
