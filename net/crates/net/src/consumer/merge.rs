@@ -205,8 +205,57 @@ impl CompositeCursor {
     /// `String`, `&str`, and `Arc<str>` itself. This lets adapters
     /// hand us a freshly-allocated `String` (becomes a single boxed
     /// allocation) without forcing a second copy for the cursor.
+    ///
+    /// **Unconditional**: skips the backend-format guard and the
+    /// monotonicity guard. Use [`Self::set_checked`] from production
+    /// poll paths — the documented "refuse to advance across a
+    /// JetStream → Redis cursor format change" protection lives in
+    /// the checked variant, not here. The unchecked variant is kept
+    /// public for tests that need to seed a cursor directly.
     pub fn set(&mut self, shard_id: u16, position: impl Into<CursorPos>) {
         self.positions.insert(shard_id, position.into());
+    }
+
+    /// Set the position for a specific shard, applying the same
+    /// backend-format mismatch guard as [`Self::update_from_events`].
+    /// Returns `true` if the write happened, `false` if it was
+    /// refused (format mismatch — error-logged so operators see the
+    /// migration). No-existing-position is treated as accept (first
+    /// write).
+    ///
+    /// Production poll paths must use this instead of [`Self::set`]
+    /// so a mid-stream backend migration (JetStream → Redis or vice
+    /// versa) is surfaced and refused at the cursor write site
+    /// rather than silently overwriting the format and stalling the
+    /// caller.
+    pub fn set_checked(&mut self, shard_id: u16, new_id: &str) -> bool {
+        match self.positions.get(&shard_id) {
+            Some(existing) => {
+                let existing_fmt = id_format(existing.as_ref());
+                let new_fmt = id_format(new_id);
+                if existing_fmt != new_fmt {
+                    tracing::error!(
+                        shard_id,
+                        existing = %existing,
+                        new = %new_id,
+                        existing_format = ?existing_fmt,
+                        new_format = ?new_fmt,
+                        "stream id format change detected — likely a \
+                         backend migration (e.g. JetStream → Redis). \
+                         Refusing to advance the cursor; operator must \
+                         explicitly reset to consume from the new \
+                         backend.",
+                    );
+                    return false;
+                }
+                self.positions.insert(shard_id, Arc::from(new_id));
+                true
+            }
+            None => {
+                self.positions.insert(shard_id, Arc::from(new_id));
+                true
+            }
+        }
     }
 
     /// Update positions from consumed events.
@@ -564,7 +613,12 @@ impl PollMerger {
                         has_more,
                     } = shard_result;
                     if let (Some(nc), Some(next_id)) = (new_cursor.as_mut(), next_id) {
-                        nc.set(shard_id, next_id);
+                        // Route through set_checked so a mid-stream
+                        // backend migration (JetStream→Redis cursor
+                        // format change) is refused with a loud error
+                        // log rather than silently overwriting the
+                        // format on the cursor.
+                        nc.set_checked(shard_id, &next_id);
                     }
                     if has_more {
                         any_has_more = true;
@@ -758,7 +812,11 @@ impl PollMerger {
                 let should_override =
                     request.filter.is_none() || rolled_back.contains(&event.shard_id);
                 if should_override {
-                    final_cursor.set(event.shard_id, event.id.clone());
+                    // Same backend-format guard as the Step-1
+                    // adapter-cursor write site above. Surfaces a
+                    // mid-stream backend migration deterministically
+                    // rather than overwriting silently.
+                    final_cursor.set_checked(event.shard_id, &event.id);
                 }
                 // Else: the adapter's `next_id` (already in
                 // `final_cursor` via the `new_cursor` initial
@@ -1545,6 +1603,44 @@ mod tests {
         assert!(response.events.is_empty());
         assert!(response.next_id.is_none());
         assert!(!response.has_more);
+    }
+
+    /// Production poll() must route every cursor write through the
+    /// backend-format guard. Pre-fix, both the Step-1 adapter-
+    /// next_id write and the Step-2 last-event override called the
+    /// unchecked `set`, so a mid-stream backend migration
+    /// (JetStream numeric ids → Redis stream ids of the form
+    /// `<ms>-<seq>`) would silently overwrite the format and the
+    /// documented "refuse to advance, operator must reset" guard
+    /// from `update_from_events` never fired in production.
+    #[test]
+    fn composite_cursor_set_checked_refuses_format_change() {
+        let mut cursor = CompositeCursor::new();
+        cursor.set(0, "42".to_string()); // JetStream numeric
+        // Same shard, new id in Redis stream format.
+        let accepted = cursor.set_checked(0, "1700000000000-0");
+        assert!(
+            !accepted,
+            "format change must be refused — set_checked must return false"
+        );
+        // Cursor must NOT have advanced.
+        assert_eq!(cursor.get(0), Some("42"));
+    }
+
+    #[test]
+    fn composite_cursor_set_checked_accepts_same_format_advance() {
+        let mut cursor = CompositeCursor::new();
+        cursor.set(0, "42".to_string());
+        // Newer JetStream id — same format, monotonically forward.
+        assert!(cursor.set_checked(0, "100"));
+        assert_eq!(cursor.get(0), Some("100"));
+    }
+
+    #[test]
+    fn composite_cursor_set_checked_accepts_first_write() {
+        let mut cursor = CompositeCursor::new();
+        assert!(cursor.set_checked(3, "1700000000000-0"));
+        assert_eq!(cursor.get(3), Some("1700000000000-0"));
     }
 
     /// A caller that forwards a non-deduplicated shard list — e.g.
