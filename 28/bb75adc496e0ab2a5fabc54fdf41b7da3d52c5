@@ -1,0 +1,20 @@
+net/crates/net/bindings/node/index.d.ts
+  s_ac2931afe38c4a::t_1f0a8e31f9082a 407-419
+  s_ac2931afe38c4a::t_89a2026cf166ec 380-383,386-398
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "28bb75adc496e0ab2a5fabc54fdf41b7da3d52c5",
+  "prompts": {},
+  "sessions": {
+    "s_ac2931afe38c4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59271d48-d72a-4337-b857-962412f18343",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
