@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/netdb/error.rs
+  s_85b38155803bed::t_f865754025e047 24-33
+net/crates/net/src/adapter/net/netdb/db.rs
+  s_85b38155803bed::t_a587dc54f56e5f 215-222
+  s_85b38155803bed::t_b16fd6cc40ec6a 263-265
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "c33e7d74dad0fa6feb6b4f9e2a21afc436aeec3a",
+  "prompts": {},
+  "sessions": {
+    "s_85b38155803bed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a87163a2-e445-4527-8e9a-d6b1e77222f5",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
