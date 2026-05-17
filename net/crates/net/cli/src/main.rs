@@ -238,9 +238,12 @@ fn install_tracing(verbose: u8, quiet: bool) {
         .try_init();
 }
 
-// `humantime` is brought in transitively via tracing-subscriber's
-// env-filter machinery; expose it as a tiny shim so the `--timeout`
-// flag's `value_parser` resolves without an extra direct dep.
+// Self-contained duration parser for the `--timeout` /
+// `--drain-for` / `--ttl` flags. Mirrors the small subset of the
+// `humantime` crate's syntax that operator-facing flags need;
+// the real `humantime` crate is intentionally not in the dep
+// list (the parser is ~50 lines and avoids an extra build edge
+// for one value-parser shim).
 mod humantime {
     use std::time::Duration;
 
