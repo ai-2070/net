@@ -1,0 +1,23 @@
+net/crates/net/bindings/go/net/meshos.go
+  s_ac2931afe38c4a::t_c131b87ec6fcbc 560-565
+  s_ac2931afe38c4a::t_e7c93e36401007 1088,1100-1103,1109-1113,1123
+  s_ac2931afe38c4a::t_2e4f35041e9ed8 652-660,665-673
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_17_MESHOS_SDKS.md
+  s_ac2931afe38c4a::t_dbb3b49a1e350c 470
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "3131f7108e01b7d083c6aa1daaf989366f8c2f3b",
+  "prompts": {},
+  "sessions": {
+    "s_ac2931afe38c4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59271d48-d72a-4337-b857-962412f18343",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
