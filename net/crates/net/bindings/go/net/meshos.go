@@ -557,6 +557,12 @@ type MeshOsDaemonHandle struct {
 	controlOnce sync.Once
 	// controlChan is closed when the pump goroutine exits.
 	controlChan chan MeshOsDaemonControl
+	// pumpStop is closed by `Free` to signal the pump goroutine
+	// to exit even when the caller never cancelled the ctx they
+	// passed to `ControlEvents`. Without this, `Free` would
+	// release the underlying `ptr` while the pump was still
+	// polling on it (use-after-free against a freed handle).
+	pumpStop chan struct{}
 }
 
 // DaemonID returns the substrate identifier (the keypair's origin
@@ -643,9 +649,28 @@ func (h *MeshOsDaemonHandle) GracefulShutdown(graceMs uint64) error {
 }
 
 // Free releases the handle. Idempotent on nil receivers.
+//
+// Stops the `ControlEvents` pump goroutine (if one was started)
+// before the underlying FFI handle is freed — otherwise the pump
+// would race the free and either deref a freed pointer or surface
+// a confusing `invalid_argument` to whichever goroutine was
+// ranging over the channel. The pump's own deferred
+// `close(h.controlChan)` runs after it returns from
+// `pumpControlEvents`, so the consumer's `range` loop terminates
+// cleanly.
 func (h *MeshOsDaemonHandle) Free() {
 	if h == nil || h.ptr == nil {
 		return
+	}
+	if h.pumpStop != nil {
+		// Multiple Free calls land here; guard against a
+		// double-close panic.
+		select {
+		case <-h.pumpStop:
+			// Already closed by a prior Free.
+		default:
+			close(h.pumpStop)
+		}
 	}
 	C.net_meshos_handle_free(h.ptr)
 	h.ptr = nil
@@ -1060,6 +1085,7 @@ func (h *MeshOsDaemonHandle) PublishCapabilities(tags []string) error {
 func (h *MeshOsDaemonHandle) ControlEvents(ctx context.Context) <-chan MeshOsDaemonControl {
 	h.controlOnce.Do(func() {
 		h.controlChan = make(chan MeshOsDaemonControl, 16)
+		h.pumpStop = make(chan struct{})
 		go h.pumpControlEvents(ctx)
 	})
 	return h.controlChan
@@ -1071,13 +1097,20 @@ func (h *MeshOsDaemonHandle) pumpControlEvents(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-h.pumpStop:
+			// `Free` was called — exit before polling the
+			// (about to be freed) FFI handle.
+			return
 		default:
 		}
 		// Use a short timeout so we can check ctx between polls.
 		ev, err := h.NextControl(50)
 		if err != nil {
-			// `already_shutdown` or any other terminal error stops
-			// the pump.
+			// `already_shutdown`, `invalid_argument` (NULL handle
+			// after Free), or any other terminal error stops the
+			// pump. Treating every error as terminal is correct
+			// here — the underlying FFI handle can't transition
+			// from a failure state back to producing events.
 			return
 		}
 		if ev.Kind == ControlNone {
@@ -1086,6 +1119,8 @@ func (h *MeshOsDaemonHandle) pumpControlEvents(ctx context.Context) {
 		select {
 		case h.controlChan <- ev:
 		case <-ctx.Done():
+			return
+		case <-h.pumpStop:
 			return
 		}
 	}
