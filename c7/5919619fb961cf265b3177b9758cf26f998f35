@@ -1,0 +1,23 @@
+net/crates/net/docs/plans/MESHOS_SDK_PLAN.md
+  s_5af7ced268385a::t_29e091227887dc 9
+  s_5af7ced268385a::t_ea4ff2acbf25a8 535-538,542-563
+net/crates/net/docs/plans/DECK_SDK_PLAN.md
+  s_5af7ced268385a::t_6f2422e8fdfff9 706-709,713-727
+  s_5af7ced268385a::t_015a7d1a42ca25 24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "c75919619fb961cf265b3177b9758cf26f998f35",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
