@@ -298,6 +298,10 @@ async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
 
 #[cfg(not(unix))]
 async fn check_strict_permissions(_path: &Path) -> Result<(), CliError> {
+    // Mirror of `enforce_strict_permissions` on Windows: NTFS
+    // ACLs don't have a clean 0o600 analog accessible from
+    // `std::fs`, so the permission gate is a no-op on Windows
+    // and operators manage ACLs out-of-band.
     Ok(())
 }
 
