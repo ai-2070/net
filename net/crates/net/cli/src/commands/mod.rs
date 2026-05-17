@@ -19,5 +19,7 @@ pub mod identity;
 pub mod logs;
 pub mod netdb;
 pub mod peer;
+pub mod port;
+pub mod rpc;
 pub mod snapshot;
 pub mod version;

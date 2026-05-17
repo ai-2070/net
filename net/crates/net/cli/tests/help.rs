@@ -16,6 +16,7 @@ use std::process::Command;
 const SUBCOMMANDS: &[&str] = &[
     "version",
     "identity",
+    "admin",
     "snapshot",
     "audit",
     "log",
