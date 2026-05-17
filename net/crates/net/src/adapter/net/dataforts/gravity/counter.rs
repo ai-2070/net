@@ -850,10 +850,16 @@ mod tests {
     }
 
     /// Background `bump` storm on a single hash while a foreground
-    /// thread runs `tick(policy, now)` repeatedly. Asserts no panic
-    /// and the tick produces at least one emission per cycle
-    /// (the rate is well above the threshold ratio after the first
-    /// few bumps land). Pins the iter-mut-during-bump safety.
+    /// thread runs `tick(policy, now)` repeatedly. Pins the
+    /// iter-mut-during-bump safety: neither thread may panic, and
+    /// the mutex must stay live across the storm.
+    ///
+    /// Emission count is intentionally *not* asserted — under mutex
+    /// contention the bumper can be starved enough by the ticker
+    /// that no tick observes a rate above the emission threshold.
+    /// Deterministic emission semantics are covered by
+    /// `blob_heat_tick_emits_above_threshold`; this test pins the
+    /// concurrency-safety half of the contract.
     #[test]
     fn blob_heat_tick_concurrent_with_bumps_is_panic_free() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -889,29 +895,23 @@ mod tests {
             let start = start.clone();
             thread::spawn(move || {
                 start.wait();
-                let mut total = 0usize;
                 for _ in 0..200 {
                     let now = Instant::now();
-                    let emissions = {
-                        let mut guard = registry.lock().unwrap();
-                        guard.tick(&policy, now)
-                    };
-                    total += emissions.len();
+                    let mut guard = registry.lock().unwrap();
+                    let _ = guard.tick(&policy, now);
                 }
                 stop.store(true, Ordering::Relaxed);
-                total
             })
         };
 
         bumper.join().expect("bumper panicked");
-        let total_emissions = ticker.join().expect("ticker panicked");
-        // The bumper guarantees rate > 0 for most of the ticker's
-        // window, so at least *some* emissions land. The exact
-        // count is non-deterministic under the race.
-        assert!(
-            total_emissions > 0,
-            "tick must surface at least one emission while bumps run"
-        );
+        ticker.join().expect("ticker panicked");
+
+        // Registry must still be usable after the storm — pins that
+        // the iter-mut-during-bump path didn't leave the underlying
+        // HashMap in a torn state.
+        let guard = registry.lock().unwrap();
+        assert!(guard.get(&target).is_some(), "target entry should survive the storm");
     }
 
     /// LRU eviction under a tight cap with concurrent inserts from
