@@ -1,0 +1,35 @@
+net/crates/net/cli/src/commands/cap.rs
+  s_8c2b4b36ad9479::t_c5b5c76cfe3cd8 43,57,66
+net/crates/net/cli/src/commands/ice.rs
+  s_8c2b4b36ad9479::t_21b8ba0e095b0f 151
+net/crates/net/cli/src/commands/snapshot.rs
+  s_8c2b4b36ad9479::t_1e7c775be32bf4 41,50
+net/crates/net/cli/src/commands/audit.rs
+  s_8c2b4b36ad9479::t_d1051f52e9d7eb 47,65
+net/crates/net/cli/src/prelude.rs
+  s_8c2b4b36ad9479::t_b82820f863f0ca 13-18
+net/crates/net/cli/src/commands/admin.rs
+  s_8c2b4b36ad9479::t_571f89ca3d73eb 113
+net/crates/net/cli/src/commands/daemon.rs
+  s_8c2b4b36ad9479::t_1c203483d7a574 47
+net/crates/net/cli/src/commands/logs.rs
+  s_8c2b4b36ad9479::t_774cfe4f99a503 46,132
+net/crates/net/cli/src/commands/peer.rs
+  s_8c2b4b36ad9479::t_a23fbb42b7c7f1 27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "85713362d8a3244b195d158d6dcf482d5741d60b",
+  "prompts": {},
+  "sessions": {
+    "s_8c2b4b36ad9479": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c178f51c-95e0-4224-ba26-c4901e8acca7",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
