@@ -5,16 +5,14 @@
 //! code by invoking a fixture that produces it.
 //!
 //! Codes covered today (Phase 1 + Phase 3 ICE):
-//! - 0   Success            — `net version`.
-//! - 1   Generic            — `net identity show /nonexistent`.
-//! - 2   InvalidArgs        — `net snapshot get --bogus`.
-//! - 3   SDK error          — covered by other commands (no
-//!                            fixture pinned today because
-//!                            triggering a substrate error
-//!                            deterministically requires a
-//!                            larger harness).
-//! - 8   ConfirmationRefused — `net ice freeze-cluster` with
-//!                            non-TTY stdin and no `--yes`.
+//! - 0 Success — `net version`.
+//! - 1 Generic — `net identity show /nonexistent`.
+//! - 2 InvalidArgs — `net snapshot get --bogus`.
+//! - 3 SDK error — covered by other commands (no fixture pinned
+//!   today because triggering a substrate error deterministically
+//!   requires a larger harness).
+//! - 8 ConfirmationRefused — `net ice freeze-cluster` with non-TTY
+//!   stdin and no `--yes`.
 //!
 //! Codes 4–7 + 10–12 will be pinned as the matching command
 //! surfaces ship (ICE simulation guard / signature verification /
