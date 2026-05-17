@@ -1198,6 +1198,22 @@ pub struct MeshNode {
     /// Prometheus exposure or custom observability.
     #[cfg(feature = "cortex")]
     rpc_metrics: Arc<crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry>,
+    /// Optional caller-side nRPC observer. Fired from `Mesh::call`
+    /// on each call boundary (success / server-error / timeout /
+    /// transport error). `Arc<ArcSwapOption<...>>` so a hot-path
+    /// load is one `ArcSwap::load` + `is_none()` short-circuit
+    /// when no observer is installed. See
+    /// `cortex::rpc_observer::RpcObserver`.
+    ///
+    /// The inner type is `RpcObserverHandle` (= `Arc<dyn RpcObserver>`),
+    /// which means the cell stores `Option<Arc<Arc<dyn RpcObserver>>>` —
+    /// a double-`Arc`. This is a structural limitation of `arc_swap`:
+    /// `RefCnt for Arc<T>` requires `T: Sized`, so `ArcSwapOption<dyn ..>`
+    /// doesn't compile. The extra indirection is one allocation per
+    /// install + one extra `Deref` per hot-path load; both are cheap
+    /// relative to the observer firing path itself.
+    #[cfg(feature = "cortex")]
+    rpc_observer: Arc<ArcSwapOption<crate::adapter::net::cortex::rpc_observer::RpcObserverHandle>>,
     /// Optional migration subprotocol handler — same `ArcSwapOption`
     /// surface as on `MeshNode`, propagated into the dispatch
     /// context so the packet-receive loop stays lock-free.
@@ -1699,6 +1715,8 @@ impl MeshNode {
             rpc_local_services: Arc::new(dashmap::DashSet::new()),
             #[cfg(feature = "cortex")]
             rpc_metrics: Arc::new(crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry::new()),
+            #[cfg(feature = "cortex")]
+            rpc_observer: Arc::new(ArcSwapOption::empty()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
             pending_direct_initiators,
@@ -4624,6 +4642,71 @@ impl MeshNode {
         &self,
     ) -> crate::adapter::net::mesh_rpc_metrics::RpcMetricsSnapshot {
         self.rpc_metrics.snapshot()
+    }
+
+    /// Install (or clear with `None`) the caller-side nRPC
+    /// observer. Replaces any previously-installed observer.
+    /// Cheap to load on the hot path — the dispatch path checks
+    /// for an installed observer via one `ArcSwap::load` and
+    /// short-circuits when `None`. Observers run inline on the
+    /// dispatch task; implementations must be cheap (push into
+    /// a bounded ring or mpsc, not block).
+    ///
+    /// See `cortex::rpc_observer::RpcObserver` for the trait
+    /// shape and the captured event metadata.
+    #[cfg(feature = "cortex")]
+    pub fn set_rpc_observer(
+        &self,
+        observer: Option<crate::adapter::net::cortex::rpc_observer::RpcObserverHandle>,
+    ) {
+        // Inner `Arc::new` is the double-Arc the field doc calls
+        // out — arc_swap's `RefCnt for Arc<T>` requires `T: Sized`,
+        // so we cannot store a bare `Arc<dyn RpcObserver>`.
+        self.rpc_observer.store(observer.map(Arc::new));
+    }
+
+    /// Hot-path load of the currently-installed nRPC observer,
+    /// if any. Cheap — one `ArcSwap::load`. The dispatch path
+    /// calls this on every completed boundary and short-
+    /// circuits when `None`.
+    #[cfg(feature = "cortex")]
+    pub fn rpc_observer(
+        &self,
+    ) -> Option<crate::adapter::net::cortex::rpc_observer::RpcObserverHandle> {
+        // `load_full()` returns `Option<Arc<Arc<dyn RpcObserver>>>`
+        // (see field doc). Clone the inner `Arc<dyn ..>` so the
+        // caller holds a flat handle.
+        self.rpc_observer.load_full().map(|arc| (*arc).clone())
+    }
+
+    /// Fire the installed `RpcObserver` (if any) with an
+    /// outbound call event. No-op when no observer is wired.
+    /// Called from `mesh_rpc::Mesh::call` at every exit
+    /// branch.
+    #[cfg(feature = "cortex")]
+    pub(crate) fn fire_rpc_observer_outbound(
+        &self,
+        callee: u64,
+        method: &str,
+        latency_ms: u32,
+        status: crate::adapter::net::cortex::rpc_observer::RpcCallStatus,
+        request_bytes: u32,
+        response_bytes: u32,
+    ) {
+        if let Some(obs) = self.rpc_observer() {
+            let evt = crate::adapter::net::cortex::rpc_observer::RpcCallEvent {
+                caller: self.node_id(),
+                callee,
+                method: method.to_string(),
+                latency_ms,
+                status,
+                request_bytes,
+                response_bytes,
+                direction: crate::adapter::net::cortex::rpc_observer::RpcDirection::Outbound,
+                ts_unix_ms: crate::adapter::net::cortex::rpc_observer::unix_now_ms(),
+            };
+            obs.on_call(evt);
+        }
     }
 
     /// Capability index — accessor for `mesh_rpc::Mesh::find_service_nodes`

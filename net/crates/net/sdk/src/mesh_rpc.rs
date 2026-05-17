@@ -24,7 +24,8 @@ use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
 
 pub use net::adapter::net::cortex::{
-    RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink, RpcStatus,
+    RpcCallEvent, RpcCallStatus, RpcContext, RpcDirection, RpcHandler, RpcHandlerError,
+    RpcObserver, RpcObserverHandle, RpcResponsePayload, RpcResponseSink, RpcStatus,
     RpcStreamingHandler, StreamItem,
 };
 pub use net::adapter::net::mesh_rpc::{

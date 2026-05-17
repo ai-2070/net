@@ -66,9 +66,9 @@
   },
   "scripts": {
     "artifacts": "napi artifacts",
-    "build": "napi build --platform --release --features redis,net,cortex,compute,groups",
-    "build:debug": "napi build --platform --features redis,net,cortex,compute,groups",
-    "build:test": "napi build --platform --features redis,net,cortex,compute,groups,test-helpers",
+    "build": "napi build --platform --release --features redis,net,cortex,compute,groups,meshos,deck",
+    "build:debug": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck",
+    "build:test": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck,test-helpers",
     "build:ts": "tsc -p tsconfig.build.json",
     "prepublishOnly": "npm run build:ts && napi prepublish -t npm",
     "test": "vitest run",

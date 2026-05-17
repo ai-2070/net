@@ -29,6 +29,15 @@ mod mesh_rpc;
 // stay slim.
 #[cfg(feature = "meshdb")]
 mod meshdb;
+// MeshOS daemon-author SDK (Phase 2 slice 1: register / control
+// receive / publish_log / graceful_shutdown). Builds on `compute`
+// for the `MeshDaemon` trait + the `Identity` wrapper.
+#[cfg(feature = "meshos")]
+mod meshos;
+// Deck SDK — operator-side bindings (Phase 4 slice 1). Builds on
+// `meshos` for the supervisor runtime accessors.
+#[cfg(feature = "deck")]
+mod deck;
 #[cfg(feature = "net")]
 mod placement;
 #[cfg(feature = "redis")]
@@ -2338,6 +2347,33 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<meshdb::PyPredicate>()?;
         m.add_class::<meshdb::PyQueryBuilder>()?;
         m.add("MeshDbError", m.py().get_type::<meshdb::MeshDbError>())?;
+    }
+    #[cfg(feature = "meshos")]
+    {
+        m.add_class::<meshos::PyMeshOsDaemonSdk>()?;
+        m.add_class::<meshos::PyMeshOsDaemonHandle>()?;
+        m.add(
+            "MeshOsSdkError",
+            m.py().get_type::<meshos::MeshOsSdkError>(),
+        )?;
+    }
+    #[cfg(feature = "deck")]
+    {
+        m.add_class::<deck::PyDeckClient>()?;
+        m.add_class::<deck::PyAdminCommands>()?;
+        m.add_class::<deck::PySnapshotStream>()?;
+        m.add_class::<deck::PyStatusSummaryStream>()?;
+        m.add_class::<deck::PyOperatorIdentity>()?;
+        m.add_class::<deck::PyLogStream>()?;
+        m.add_class::<deck::PyFailureStream>()?;
+        m.add_class::<deck::PyAuditQuery>()?;
+        m.add_class::<deck::PyAuditStream>()?;
+        m.add_class::<deck::PyIceCommands>()?;
+        m.add_class::<deck::PyIceProposal>()?;
+        m.add_class::<deck::PySimulatedIceProposal>()?;
+        m.add_class::<deck::PyOperatorRegistry>()?;
+        m.add_class::<deck::PyAdminVerifier>()?;
+        m.add("DeckSdkError", m.py().get_type::<deck::DeckSdkError>())?;
     }
     Ok(())
 }

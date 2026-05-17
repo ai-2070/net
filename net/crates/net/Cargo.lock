@@ -2087,12 +2087,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-deck-ffi"
+version = "0.17.0"
+dependencies = [
+ "ai2070-net",
+ "futures",
+ "serde_json",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "net-meshdb-ffi"
 version = "0.17.0"
 dependencies = [
  "ai2070-net",
  "futures",
  "postcard",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "net-meshos-ffi"
+version = "0.17.0"
+dependencies = [
+ "ai2070-net",
+ "bytes",
  "serde_json",
  "tokio",
 ]
@@ -2116,6 +2137,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "xxhash-rust",
+ "zeroize",
 ]
 
 [[package]]
@@ -2134,6 +2156,7 @@ dependencies = [
  "pyo3-build-config",
  "serde_json",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

@@ -5,19 +5,25 @@
 //! site aesthetic (neon-green on pitch black).
 //!
 //! Build modes:
-//! - default: live in-process `MeshOsRuntime`, no sample
-//!   data. Every tab reads from the snapshot — empty until
-//!   real cluster sources are wired.
-//! - `--features samples`: adds a static fixture of 17 fake
-//!   peers + 11 daemons across all four lineage groups so
-//!   the deck has something concrete to monitor. No event
-//!   seeders — the deck observes whatever steady state the
-//!   runtime + supervisor produce on their own.
+//! - default: live in-process single-node `MeshOsRuntime`, no
+//!   cluster data. Every tab reads from the snapshot — empty
+//!   until real cluster sources are wired.
+//! - `--features demo`: boots a real 5-node in-process
+//!   MeshOS cluster via `net_sdk::testing::ClusterHarness`
+//!   with real daemons, real migrations, real blob adapters,
+//!   and a real nRPC observer feeding the NRPC tail. See
+//!   `crates/net/docs/plans/DECK_DEMO_PLAN.md`.
 
 mod app;
 mod bookmarks;
+#[cfg(feature = "demo")]
+mod demo;
 mod lineage;
 mod nodes;
+// `runtime` is the single-node spawn path; unused when `demo`
+// is on because main.rs branches to `demo::spawn`. Allow dead-
+// code under the demo feature so the build stays warning-free.
+#[cfg_attr(feature = "demo", allow(dead_code))]
 mod runtime;
 mod streams;
 mod tabs;
@@ -40,6 +46,19 @@ async fn main() -> color_eyre::Result<()> {
         prev_panic_hook(info);
     }));
 
+    // NRPC tail — built BEFORE the harness so the demo's
+    // observer bridge (see `demo::rpc_chatter::install_observers`)
+    // can be wired into it during spawn. Non-demo builds leave
+    // it inert until the operator pipes their own observer in.
+    let nrpc_tail = streams::NrpcTail::new(streams::NRPC_TAIL_CAP);
+
+    // Under `--features demo`, `demo::spawn` boots a real
+    // multi-node cluster via `net_sdk::testing::ClusterHarness`;
+    // otherwise the single-node `runtime::spawn` path runs with
+    // an empty cluster view ready for real-cluster wiring.
+    #[cfg(feature = "demo")]
+    let harness = demo::spawn(nrpc_tail.clone()).await?;
+    #[cfg(not(feature = "demo"))]
     let harness = runtime::spawn().await?;
     let deck = harness.deck();
     let blob_adapters = harness.blob_adapters();
@@ -59,11 +78,6 @@ async fn main() -> color_eyre::Result<()> {
     // a single inventory cache, capped at `BLOBS_TAIL_CAP`.
     // Adapter-level errors flow into the App's toast channel.
     let blobs_tail = streams::BlobsTail::new();
-
-    // NRPC tail — populated by the samples-logs injector today;
-    // empty without that flag, ready for a real nRPC observer
-    // wire-up.
-    let nrpc_tail = streams::NrpcTail::new(streams::NRPC_TAIL_CAP);
 
     // Bookmark store — loaded from `$XDG_CONFIG_HOME/deck/bookmarks.toml`
     // (or the platform equivalent). A first-run with no config
@@ -95,13 +109,10 @@ async fn main() -> color_eyre::Result<()> {
             app.toast_tx.clone(),
         ))
     };
-    // NRPC traffic injector — only fires under `samples-logs`.
-    // Pushes synthetic call records into the NRPC tail at a
-    // fixed cadence so the NRPC tab demonstrates the call
-    // ring offline.
-    #[cfg(feature = "samples-logs")]
-    let _nrpc_seeder_task = runtime::spawn_nrpc_seeder(nrpc_tail, this_node);
-    #[cfg(not(feature = "samples-logs"))]
+    // Under `demo`, the `NrpcTail` was already wired with an
+    // observer bridge during `demo::spawn`. Non-demo builds
+    // leave it inert until the operator pipes their own
+    // observer in.
     drop(nrpc_tail);
     let pending_admin = app.pending_admin_handle();
     let result = app.run(terminal);
@@ -122,8 +133,14 @@ async fn main() -> color_eyre::Result<()> {
     }
 
     // Explicit drop so the harness's tear-down runs before
-    // the process exits — drops the SDK + samples daemons +
-    // backing tokio tasks deterministically.
+    // the process exits — drops the SDK + backing tokio tasks
+    // deterministically. Under `demo` we drive the cluster's
+    // explicit async shutdown so the multi-node
+    // `MeshOsDaemonSdk::shutdown` futures actually resolve
+    // before the process exits.
+    #[cfg(feature = "demo")]
+    let _ = harness.into_shutdown().await;
+    #[cfg(not(feature = "demo"))]
     drop(harness);
     result
 }

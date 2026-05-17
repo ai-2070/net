@@ -35,6 +35,14 @@ mod mesh_rpc;
 // behind the binding's `meshdb` Cargo feature.
 #[cfg(feature = "meshdb")]
 mod meshdb;
+// MeshOS daemon-author SDK (Phase 3 slice 1). Builds on `compute`
+// for the `MeshDaemon` trait + `Identity` wrapper.
+#[cfg(feature = "meshos")]
+mod meshos;
+// Deck SDK — operator-side bindings (Phase 5 slice 1). Builds on
+// `meshos` for the supervisor runtime accessors.
+#[cfg(feature = "deck")]
+mod deck;
 #[cfg(feature = "net")]
 mod placement;
 #[cfg(feature = "redis")]

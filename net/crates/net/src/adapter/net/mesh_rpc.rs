@@ -1037,6 +1037,15 @@ impl MeshNode {
         payload: Bytes,
         opts: CallOptions,
     ) -> Result<RpcReply, RpcError> {
+        // `started_total` brackets the entire call for the
+        // `RpcObserver` latency field; the substrate-internal
+        // `started` further down (set after the subscription
+        // setup) drives the existing `RpcReply::latency_ns`
+        // accounting so observers and Prometheus metrics
+        // measure slightly different spans but stay consistent
+        // within their own surface.
+        let started_total = Instant::now();
+        let request_bytes_len = payload.len() as u32;
         let request_channel =
             ChannelName::new(&format!("{service}.requests")).map_err(|e| RpcError::NoRoute {
                 target: target_node_id,
@@ -1067,6 +1076,14 @@ impl MeshNode {
             .await
         {
             metrics_guard.record(CallOutcome::NoRoute);
+            self.fire_rpc_observer_outbound(
+                target_node_id,
+                service,
+                started_total.elapsed().as_millis() as u32,
+                crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Error(e.to_string()),
+                request_bytes_len,
+                0,
+            );
             return Err(e);
         }
 
@@ -1140,7 +1157,7 @@ impl MeshNode {
             // routing layer's job, retry won't help). Other
             // transport errors stay as Transport so retry is
             // applicable.
-            return Err(if classify_publish_no_session(&e) {
+            let err = if classify_publish_no_session(&e) {
                 metrics_guard.record(CallOutcome::NoRoute);
                 RpcError::NoRoute {
                     target: target_node_id,
@@ -1149,7 +1166,16 @@ impl MeshNode {
             } else {
                 metrics_guard.record(CallOutcome::Transport);
                 RpcError::Transport(e)
-            });
+            };
+            self.fire_rpc_observer_outbound(
+                target_node_id,
+                service,
+                started_total.elapsed().as_millis() as u32,
+                crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Error(err.to_string()),
+                request_bytes_len,
+                0,
+            );
+            return Err(err);
         }
 
         // From here on, the REQUEST is in flight on the server.
@@ -1193,14 +1219,33 @@ impl MeshNode {
                 // for a server that's no longer tracking this id.
                 guard.completed = true;
                 metrics_guard.record(CallOutcome::Transport);
-                return Err(RpcError::Transport(AdapterError::Connection(
+                let err = RpcError::Transport(AdapterError::Connection(
                     "rpc client pending sender dropped (no response will arrive)".into(),
-                )));
+                ));
+                self.fire_rpc_observer_outbound(
+                    target_node_id,
+                    service,
+                    started_total.elapsed().as_millis() as u32,
+                    crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Error(
+                        err.to_string(),
+                    ),
+                    request_bytes_len,
+                    0,
+                );
+                return Err(err);
             }
             Err(_elapsed) => {
                 // Timeout: leave `completed=false` so Drop emits
                 // CANCEL automatically; surface Timeout to caller.
                 metrics_guard.record(CallOutcome::Timeout);
+                self.fire_rpc_observer_outbound(
+                    target_node_id,
+                    service,
+                    started_total.elapsed().as_millis() as u32,
+                    crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Timeout,
+                    request_bytes_len,
+                    0,
+                );
                 return Err(RpcError::Timeout {
                     elapsed_ms: started.elapsed().as_millis() as u64,
                 });
@@ -1210,6 +1255,15 @@ impl MeshNode {
         // Map the wire status onto the public Result type.
         if resp.status.is_ok() {
             metrics_guard.record(CallOutcome::Ok);
+            let response_bytes_len = resp.body.len() as u32;
+            self.fire_rpc_observer_outbound(
+                target_node_id,
+                service,
+                started_total.elapsed().as_millis() as u32,
+                crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Ok,
+                request_bytes_len,
+                response_bytes_len,
+            );
             Ok(RpcReply {
                 body: Bytes::from(resp.body),
                 headers: resp.headers,
@@ -1218,8 +1272,17 @@ impl MeshNode {
         } else {
             metrics_guard.record(CallOutcome::ServerError);
             let status = resp.status.to_wire();
+            let response_bytes_len = resp.body.len() as u32;
             let message = String::from_utf8(resp.body)
                 .unwrap_or_else(|e| format!("<{} bytes of non-utf8 body>", e.into_bytes().len()));
+            self.fire_rpc_observer_outbound(
+                target_node_id,
+                service,
+                started_total.elapsed().as_millis() as u32,
+                crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Error(message.clone()),
+                request_bytes_len,
+                response_bytes_len,
+            );
             Err(RpcError::ServerError { status, message })
         }
     }

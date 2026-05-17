@@ -212,9 +212,11 @@ async fn runtime_reflex_override_via_sdk() {
 }
 
 /// `connect_direct` end-to-end via the SDK: Open×Open pair
-/// picks the Direct action, increments relay_fallbacks (no
-/// punch was attempted because no punch was warranted), and
-/// leaves `punches_attempted` at zero.
+/// picks the Direct action, succeeds on the direct
+/// handshake against the peer's advertised reflex, and leaves
+/// both `punches_attempted` + `relay_fallbacks` at zero (per
+/// the substrate's documented stats semantics — a successful
+/// direct connect is not a relay fallback).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_direct_open_pair_via_sdk() {
     let psk = [0x42u8; 32];
@@ -272,9 +274,13 @@ async fn connect_direct_open_pair_via_sdk() {
         after.punches_attempted, before.punches_attempted,
         "Open × Open should not attempt a punch",
     );
+    // `record_relay_fallback` fires only when the direct
+    // handshake fails and the routed-table fallback succeeds —
+    // see `adapter/net/mesh.rs:~7641-7693`. A successful direct
+    // connect (the happy path this test exercises) leaves the
+    // counter unchanged.
     assert_eq!(
-        after.relay_fallbacks,
-        before.relay_fallbacks + 1,
-        "Direct action bumps relay_fallbacks",
+        after.relay_fallbacks, before.relay_fallbacks,
+        "successful Direct path is not a relay fallback",
     );
 }

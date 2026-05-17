@@ -349,6 +349,163 @@ else:
     )
 
 
+# MeshOS daemon-author SDK. Present iff the native module was built
+# with the `meshos` Cargo feature. Slice 1 surface — register /
+# control receive / publish_log / graceful_shutdown / metadata.
+try:
+    from ._net import (
+        MeshOsDaemonHandle,
+        MeshOsDaemonSdk,
+        MeshOsSdkError,
+    )
+except ImportError:
+    # `meshos` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(
+        [
+            "MeshOsDaemonHandle",
+            "MeshOsDaemonSdk",
+            "MeshOsSdkError",
+            "meshos_sdk_error_kind",
+        ]
+    )
+
+    def meshos_sdk_error_kind(exc: "MeshOsSdkError") -> str | None:
+        """Extract the kind discriminator from a caught
+        ``MeshOsSdkError``.
+
+        The Rust side wraps every SDK error in the
+        ``<<meshos-sdk-kind:KIND>>MSG`` envelope and attaches a
+        ``.kind`` attribute on the exception instance. Prefer
+        ``exc.kind`` over parsing; this helper is a fallback for
+        callers that hold the exception's stringified form (e.g.
+        bubbled through logs).
+
+        Returns ``None`` when the message doesn't carry the
+        envelope (shouldn't happen for exceptions raised by this
+        module).
+        """
+        kind = getattr(exc, "kind", None)
+        if isinstance(kind, str):
+            return kind
+        msg = str(exc)
+        marker = "<<meshos-sdk-kind:"
+        start = msg.find(marker)
+        if start == -1:
+            return None
+        start += len(marker)
+        end = msg.find(">>", start)
+        if end == -1:
+            return None
+        return msg[start:end]
+
+
+# Deck SDK surface — operator-side bindings. Present iff the
+# native module was built with the `deck` Cargo feature. Slice 1
+# ships client + admin + snapshot/status streams; audit / logs /
+# failures land in slice 2, ICE in slice 3.
+try:
+    from ._net import (
+        AdminCommands as _DeckAdminCommands,
+        DeckClient,
+        DeckSdkError,
+        OperatorIdentity,
+        SnapshotStream as _DeckSnapshotStream,
+        StatusSummaryStream as _DeckStatusSummaryStream,
+    )
+except ImportError:
+    # `deck` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    # Re-export under a deck-scoped name so the symbol doesn't
+    # collide with the existing `AdminCommands` namespace used by
+    # the deck binary's own re-exports.
+    DeckAdminCommands = _DeckAdminCommands
+    DeckSnapshotStream = _DeckSnapshotStream
+    DeckStatusSummaryStream = _DeckStatusSummaryStream
+    __all__.extend(
+        [
+            "DeckClient",
+            "DeckAdminCommands",
+            "DeckSnapshotStream",
+            "DeckStatusSummaryStream",
+            "DeckSdkError",
+            "OperatorIdentity",
+            "deck_sdk_error_kind",
+        ]
+    )
+
+    # Slice 3 — ICE break-glass surface. Try-import so wheels
+    # built before slice 3 still load.
+    try:
+        from ._net import (
+            IceCommands as _DeckIceCommands,
+            IceProposal as _DeckIceProposal,
+            SimulatedIceProposal as _DeckSimulatedIceProposal,
+        )
+
+        DeckIceCommands = _DeckIceCommands
+        DeckIceProposal = _DeckIceProposal
+        DeckSimulatedIceProposal = _DeckSimulatedIceProposal
+        __all__.extend(
+            [
+                "DeckIceCommands",
+                "DeckIceProposal",
+                "DeckSimulatedIceProposal",
+            ]
+        )
+    except ImportError:  # pragma: no cover
+        pass
+
+    # Operator-policy verifier surface — `OperatorRegistry` +
+    # `AdminVerifier`. Try-import so wheels built before this
+    # surface landed still load.
+    try:
+        from ._net import (
+            AdminVerifier as _DeckAdminVerifier,
+            OperatorRegistry as _DeckOperatorRegistry,
+        )
+
+        DeckOperatorRegistry = _DeckOperatorRegistry
+        DeckAdminVerifier = _DeckAdminVerifier
+        __all__.extend(
+            [
+                "DeckOperatorRegistry",
+                "DeckAdminVerifier",
+            ]
+        )
+    except ImportError:  # pragma: no cover
+        pass
+
+    def deck_sdk_error_kind(exc: "DeckSdkError") -> str | None:
+        """Extract the kind discriminator from a caught
+        ``DeckSdkError``.
+
+        The Rust side wraps every SDK error in the
+        ``<<deck-sdk-kind:KIND>>MSG`` envelope and attaches a
+        ``.kind`` attribute on the exception instance. Prefer
+        ``exc.kind`` over parsing; this helper is a fallback for
+        callers that hold the stringified form.
+
+        Returns ``None`` when the message doesn't carry the
+        envelope.
+        """
+        kind = getattr(exc, "kind", None)
+        if isinstance(kind, str):
+            return kind
+        msg = str(exc)
+        marker = "<<deck-sdk-kind:"
+        start = msg.find(marker)
+        if start == -1:
+            return None
+        start += len(marker)
+        end = msg.find(">>", start)
+        if end == -1:
+            return None
+        return msg[start:end]
+
+
 # MeshDB surface. Present iff the native module was built with
 # the `meshdb` Cargo feature. Slice 1 shipped the atomic factory
 # AST + sync runner + Phase F cache options; slice 2 added the

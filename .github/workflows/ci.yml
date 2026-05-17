@@ -42,6 +42,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --doc --features "net redex cortex netdb"
 
+      # `deck` is a separate workspace member (TUI operator console).
+      # It's a binary-only package — `[[bin]]` with no `[lib]` — so
+      # `--lib` / `--doc` would fail with "no library targets found".
+      # Its `#[test]` modules live alongside the binary sources;
+      # `--bins` compiles them into the binary's test harness.
+      - name: Run Deck unit tests
+        if: ${{ !cancelled() }}
+        run: cargo test -p deck --bins
+
   integration-tests:
     name: Integration tests (Net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC, Dataforts, MeshDB, MeshOS)
     runs-on: ubuntu-latest
@@ -279,8 +288,22 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-sdk-${{ hashFiles('**/Cargo.lock') }}
 
+      # Feature set covers every SDK integration test except
+      # `redis_dedup_contract` (gated on `redis`, deferred until CI
+      # service containers land — same policy as the main crate's
+      # `integration_redis`). Without this width, tests gated on
+      # `cortex` / `testing` / `compute` / `nat-traversal` /
+      # `port-mapping` compile to empty test binaries and the
+      # contract goes silently unverified.
       - name: Run Rust SDK tests (includes mesh_stream_backpressure)
-        run: cargo test --features net
+        run: cargo test --features "net cortex testing compute nat-traversal port-mapping"
+
+      # SDK doctests — `///` examples in `sdk/src/`. Same feature set
+      # as the test run so doc examples gated on those features
+      # compile.
+      - name: Run Rust SDK doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --doc --features "net cortex testing compute nat-traversal port-mapping"
 
   node-tests:
     name: Node bindings tests (vitest)
@@ -333,7 +356,7 @@ jobs:
       # surface from source.
       - name: Build native module
         working-directory: net/crates/net/bindings/node
-        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,test-helpers
+        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,test-helpers
 
       - name: Run tests
         run: npm test
@@ -391,7 +414,7 @@ jobs:
         working-directory: net/crates/net/bindings/node
         run: |
           npm i --ignore-scripts
-          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,test-helpers
+          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,meshos,deck,test-helpers
 
       - name: Install npm dependencies
         run: npm i
@@ -405,6 +428,13 @@ jobs:
       - name: Type-check (tsc)
         run: npm run build
 
+      # vitest auto-discovers everything under `test/`. Notable
+      # deck-specific coverage exercised by this step:
+      #   - test/deck.test.ts — Symbol.asyncDispose hook shape +
+      #     runtime drain. The runtime test promotes the "binding
+      #     stale" skip to a hard failure when CI=true, so a
+      #     misconfigured --features list (missing `deck`) above
+      #     fails loudly rather than silently skipping.
       - name: Run vitest
         run: npm test
 
@@ -449,14 +479,15 @@ jobs:
       - name: Install maturin and pytest
         run: pip install --upgrade pip maturin pytest
 
-      # `net,cortex,compute,groups` mirrors the Node binding's
-      # feature set for tests. `groups` is needed so `test_groups.py`
-      # can import `ReplicaGroup` / `ForkGroup` / `StandbyGroup` /
-      # `GroupError`; without it the module would skip via the
-      # `pytestmark` guard in the test file. Default `redis` is
-      # omitted because the suite doesn't exercise the Redis adapter.
+      # `net,cortex,compute,groups,meshos,deck` mirrors the Node
+      # binding's feature set for tests. `groups` is needed so
+      # `test_groups.py` can import `ReplicaGroup` / `ForkGroup` /
+      # `StandbyGroup` / `GroupError`; `meshos` / `deck` enable the
+      # corresponding test modules (each guarded by `pytest.skip`
+      # when the feature is absent). Default `redis` is omitted
+      # because the suite doesn't exercise the Redis adapter.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex,compute,groups
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshos,deck
 
       - name: Run tests
         run: pytest -v
@@ -486,6 +517,12 @@ jobs:
           pip install --no-deps -e .
           pip install pytest pydantic
 
+      # pytest auto-discovers `tests/` per pyproject.toml's
+      # `testpaths`. Notable deck-specific coverage:
+      #   - tests/test_deck_wrapper.py — wrapper-level
+      #     DeckClient.from_seed kwarg forwarding +
+      #     __enter__/__exit__ dunder dispatch (stubs the raw
+      #     pyo3 class so this stays a pure-Python test).
       - name: Run tests
         run: pytest -v
 
@@ -604,12 +641,15 @@ jobs:
             path: net/crates/net/bindings/node
             # Mirrors the `node-tests` napi build (no redis default,
             # plus `test-helpers` so the test-only FFI symbols are
-            # included in the lint set).
-            features: --no-default-features --features net,cortex,compute,groups,test-helpers
+            # included in the lint set, plus `meshos,deck` so the
+            # MeshOS / Deck SDK NAPI surface compiles).
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,test-helpers
           - name: python
             path: net/crates/net/bindings/python
-            # Mirrors the `python-tests` `maturin develop` invocation.
-            features: --no-default-features --features net,cortex,compute,groups
+            # Mirrors the `python-tests` `maturin develop` invocation
+            # (plus `meshos,deck` so the corresponding pyo3 surfaces
+            # are linted).
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             # Default features only — the cdylib production build
@@ -640,6 +680,96 @@ jobs:
       - name: Run clippy
         working-directory: ${{ matrix.crate.path }}
         run: cargo clippy ${{ matrix.crate.features }} --all-targets -- -D warnings
+
+  ffi-tests:
+    # Executes `cargo test --lib` for each FFI shim crate. The
+    # `ffi-clippy` matrix above lints these but never runs their
+    # internal `#[cfg(test)] mod tests {}` blocks; pre-fix, ~85
+    # Rust unit tests in `bindings/go/*-ffi` and ~32 in the
+    # node/python NAPI/PyO3 surfaces were silently uncovered. The
+    # `rust-sdk` member is omitted — the dedicated `rust-sdk-tests`
+    # job already covers its tests with a broader feature set.
+    #
+    # Notable deck-specific coverage in `go-deck-ffi`:
+    #   - ice_simulate_unknown_variant_leaves_husk_retryable
+    #   - ice_commit_unknown_variant_leaves_husk_retryable
+    #     (both use a thread-local fault-injection switch on
+    #     `build_core_proposal` to exercise the failure-branch
+    #     invariant — the husk stays retry-able when the variant
+    #     is unrecognised)
+    #   - audit_query_setters_set_last_error_on_null_query
+    #     (pins the last-error envelope on every NULL-arm return)
+    name: FFI tests (${{ matrix.crate.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - name: node
+            path: net/crates/net/bindings/node
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,test-helpers
+          - name: python
+            path: net/crates/net/bindings/python
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck
+          - name: go-compute-ffi
+            path: net/crates/net/bindings/go/compute-ffi
+            features: ""
+          - name: go-rpc-ffi
+            path: net/crates/net/bindings/go/rpc-ffi
+            features: ""
+          - name: go-meshdb-ffi
+            path: net/crates/net/bindings/go/meshdb-ffi
+            features: ""
+          - name: go-deck-ffi
+            path: net/crates/net/bindings/go/deck-ffi
+            features: ""
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-test-ffi-${{ matrix.crate.name }}-${{ hashFiles('**/Cargo.lock') }}
+
+      # napi-rs links `napi_*` runtime symbols at load time (Node
+      # provides them inside its embedded V8); a standalone
+      # `cargo test --lib` binary can't resolve them at link time.
+      # Two flags work in concert:
+      #   --unresolved-symbols=ignore-all  — tolerate at link time
+      #   -z,lazy                          — tolerate at LOAD time
+      # The second flag is the one this commit adds. Modern Ubuntu
+      # toolchains default to `-z,now` as a hardening posture,
+      # which makes the dynamic linker resolve every symbol
+      # eagerly at process startup and crash with
+      # `symbol lookup error: undefined symbol: napi_get_reference_value`
+      # before main() runs. `-z,lazy` reverts to lazy resolution,
+      # so napi symbols are only touched if the test code path
+      # calls them — and the tests only exercise pure-Rust
+      # helpers (`bigint_u64`, capability conversion, etc.) that
+      # never reach napi.
+      #
+      # Other matrix members don't need this and would silently
+      # mask real link-time bugs if it were set globally.
+      - name: Run tests (node — napi runtime symbols deferred)
+        if: matrix.crate.name == 'node'
+        working-directory: ${{ matrix.crate.path }}
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,-z,lazy"
+        run: cargo test --lib ${{ matrix.crate.features }}
+
+      - name: Run tests
+        if: matrix.crate.name != 'node'
+        working-directory: ${{ matrix.crate.path }}
+        run: cargo test --lib ${{ matrix.crate.features }}
 
   fmt:
     name: Format

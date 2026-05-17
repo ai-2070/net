@@ -17,7 +17,30 @@ name = "_net"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["redis", "net"]
+# Out-of-the-box `pip install ai2070-net-sdk` ships the full
+# distributed-agent stack: mesh transport + NAT traversal +
+# typed nRPC + capability-based service discovery + daemon
+# supervision + replica/fork/standby coordination + MeshOS
+# daemon-authoring + dataforts blob storage + MeshDB federated
+# query plane + Redis dedup helper. Python devs can't rebuild
+# the wheel — whatever PyPI shipped is what they have, so
+# every primitive a harness vendor would plausibly want is on
+# by default.
+#
+# `jetstream` / `port-mapping` stay opt-in: the NATS-specific
+# adapter (+1.3 MB, niche audience that knows it wants NATS),
+# and the UPnP/SOAP +1.4 MB outlier.
+default = [
+    "net",
+    "nat-traversal",
+    "cortex",
+    "compute",
+    "groups",
+    "meshos",
+    "dataforts",
+    "meshdb",
+    "redis",
+]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
 # PyO3 wrapper around the canonical Rust implementation.
@@ -64,12 +87,29 @@ compute = ["net", "dep:net-sdk", "net-sdk/compute", "dep:dashmap"]
 # Stage 3 of `SDK_GROUPS_SURFACE_PLAN.md` — HA/scaling overlays
 # (ReplicaGroup, ForkGroup, StandbyGroup). Sits on top of compute.
 groups = ["compute", "net-sdk/groups"]
+# MeshOS daemon-author SDK (`MESHOS_SDK_PLAN.md` Phase 2). Builds on
+# `compute` for the `MeshDaemon` trait + `Identity` wrapper and on
+# the substrate's `net/meshos` for the supervisor runtime. The
+# substrate's `meshos` feature implies `cortex`, which the Python
+# binding's `cortex` feature already activates if any cortex-tier
+# class is reachable — listing `cortex` here keeps the dep chain
+# explicit when consumers ask only for `meshos`.
+meshos = ["compute", "cortex", "net/meshos", "net-sdk/meshos"]
+# Deck SDK — operator-side bindings (`DECK_SDK_PLAN.md` Phase 4).
+# Builds on `meshos` for the supervisor runtime + snapshot reader.
+# Phase 1 substrate constraint: non-signing today (the substrate
+# records the operator id but doesn't yet route through channel-
+# auth); the binding surface is final.
+deck = ["meshos", "net/meshos", "net-sdk/deck"]
 
 [dependencies]
 net = { package = "ai2070-net", version = "0.17.0", path = "../..", default-features = false }
 net-sdk = { package = "ai2070-net-sdk", version = "0.17.0", path = "../../sdk", default-features = false, optional = true }
 dashmap = { version = "6", optional = true }
 pyo3 = { version = "0.28.0", features = ["extension-module"] }
+# Zeroizing wrapper for transient operator-seed copies in the
+# DeckClient / OperatorIdentity standalone constructors.
+zeroize = "1"
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "sync"] }
 futures = "0.3"
 serde_json = "1.0.145"
