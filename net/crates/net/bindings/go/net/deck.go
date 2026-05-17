@@ -151,6 +151,110 @@ extern void net_deck_status_summary_stream_free(NetDeckStatusSummaryStream* stre
 extern const char* net_deck_last_error_message(void);
 extern const char* net_deck_last_error_kind(void);
 extern void net_deck_clear_last_error(void);
+
+// Slice 2 — log levels + LogFilter.
+#define NET_DECK_LOG_TRACE 0
+#define NET_DECK_LOG_DEBUG 1
+#define NET_DECK_LOG_INFO  2
+#define NET_DECK_LOG_WARN  3
+#define NET_DECK_LOG_ERROR 4
+
+typedef struct {
+    int min_level_present;
+    int min_level;
+    int daemon_id_present;
+    uint64_t daemon_id;
+    int node_id_present;
+    uint64_t node_id;
+    int since_seq_present;
+    uint64_t since_seq;
+} NetDeckLogFilter;
+
+// Slice 2 — Log + Failure record wire forms.
+typedef struct {
+    uint64_t seq;
+    uint64_t ts_ms;
+    int level;
+    int daemon_id_present;
+    uint64_t daemon_id;
+    int node_id_present;
+    uint64_t node_id;
+    char* message;
+} NetDeckLogRecord;
+
+extern void net_deck_log_record_drop(NetDeckLogRecord* record);
+
+typedef struct {
+    uint64_t seq;
+    char* source;
+    char* reason;
+    uint64_t recorded_at_ms;
+} NetDeckFailureRecord;
+
+extern void net_deck_failure_record_drop(NetDeckFailureRecord* record);
+
+// Slice 2 — Log + Failure streams.
+typedef struct NetDeckLogStream NetDeckLogStream;
+typedef struct NetDeckFailureStream NetDeckFailureStream;
+
+extern int net_deck_subscribe_logs(
+    const NetDeckClient* client,
+    const NetDeckLogFilter* filter,
+    NetDeckLogStream** out
+);
+extern int net_deck_log_stream_next(
+    NetDeckLogStream* stream,
+    uint64_t timeout_ms,
+    NetDeckLogRecord* out,
+    int* has_item_out
+);
+extern void net_deck_log_stream_free(NetDeckLogStream* stream);
+
+extern int net_deck_subscribe_failures(
+    const NetDeckClient* client,
+    uint64_t since_seq,
+    NetDeckFailureStream** out
+);
+extern int net_deck_failure_stream_next(
+    NetDeckFailureStream* stream,
+    uint64_t timeout_ms,
+    NetDeckFailureRecord* out,
+    int* has_item_out
+);
+extern void net_deck_failure_stream_free(NetDeckFailureStream* stream);
+
+// Slice 2 — AuditQuery + AuditStream.
+typedef struct NetDeckAuditQuery NetDeckAuditQuery;
+typedef struct NetDeckAuditStream NetDeckAuditStream;
+
+extern int net_deck_audit_query_new(NetDeckAuditQuery** out);
+extern void net_deck_audit_query_free(NetDeckAuditQuery* query);
+
+extern int net_deck_audit_query_recent(NetDeckAuditQuery* query, size_t limit);
+extern int net_deck_audit_query_by_operator(NetDeckAuditQuery* query, uint64_t operator_id);
+extern int net_deck_audit_query_between(NetDeckAuditQuery* query, uint64_t start_ms, uint64_t end_ms);
+extern int net_deck_audit_query_force_only(NetDeckAuditQuery* query);
+extern int net_deck_audit_query_since(NetDeckAuditQuery* query, uint64_t seq);
+
+extern int net_deck_audit_query_collect(
+    const NetDeckAuditQuery* query,
+    const NetDeckClient* client,
+    char*** records_out,
+    size_t* count_out
+);
+extern void net_deck_audit_records_free(char** records, size_t count);
+
+extern int net_deck_audit_query_stream(
+    const NetDeckAuditQuery* query,
+    const NetDeckClient* client,
+    NetDeckAuditStream** out
+);
+extern int net_deck_audit_stream_next(
+    NetDeckAuditStream* stream,
+    uint64_t timeout_ms,
+    char** out
+);
+extern void net_deck_audit_stream_free(NetDeckAuditStream* stream);
 */
 import "C"
 
@@ -672,6 +776,376 @@ func (s *DeckStatusSummaryStream) Free() {
 		return
 	}
 	C.net_deck_status_summary_stream_free(s.ptr)
+	s.ptr = nil
+	runtime.SetFinalizer(s, nil)
+}
+
+// =====================================================================
+// Slice 2 — Log + Failure streams + Audit query
+// =====================================================================
+
+// DeckLogLevel mirrors the FFI `NET_DECK_LOG_*` constants.
+type DeckLogLevel int
+
+const (
+	DeckLogTrace DeckLogLevel = DeckLogLevel(C.NET_DECK_LOG_TRACE)
+	DeckLogDebug DeckLogLevel = DeckLogLevel(C.NET_DECK_LOG_DEBUG)
+	DeckLogInfo  DeckLogLevel = DeckLogLevel(C.NET_DECK_LOG_INFO)
+	DeckLogWarn  DeckLogLevel = DeckLogLevel(C.NET_DECK_LOG_WARN)
+	DeckLogError DeckLogLevel = DeckLogLevel(C.NET_DECK_LOG_ERROR)
+)
+
+func (l DeckLogLevel) String() string {
+	switch l {
+	case DeckLogTrace:
+		return "trace"
+	case DeckLogDebug:
+		return "debug"
+	case DeckLogInfo:
+		return "info"
+	case DeckLogWarn:
+		return "warn"
+	case DeckLogError:
+		return "error"
+	default:
+		return "unknown"
+	}
+}
+
+// DeckLogFilter restricts the log stream. Every field is
+// optional — `nil`-valued pointers match every record.
+type DeckLogFilter struct {
+	MinLevel *DeckLogLevel
+	DaemonID *uint64
+	NodeID   *uint64
+	SinceSeq *uint64
+}
+
+func (f *DeckLogFilter) toC() C.NetDeckLogFilter {
+	var out C.NetDeckLogFilter
+	if f == nil {
+		return out
+	}
+	if f.MinLevel != nil {
+		out.min_level_present = 1
+		out.min_level = C.int(*f.MinLevel)
+	}
+	if f.DaemonID != nil {
+		out.daemon_id_present = 1
+		out.daemon_id = C.uint64_t(*f.DaemonID)
+	}
+	if f.NodeID != nil {
+		out.node_id_present = 1
+		out.node_id = C.uint64_t(*f.NodeID)
+	}
+	if f.SinceSeq != nil {
+		out.since_seq_present = 1
+		out.since_seq = C.uint64_t(*f.SinceSeq)
+	}
+	return out
+}
+
+// DeckLogRecord is one log line. `DaemonID` / `NodeID` are nil
+// for substrate-level messages.
+type DeckLogRecord struct {
+	Seq      uint64
+	TsMs     uint64
+	Level    DeckLogLevel
+	DaemonID *uint64
+	NodeID   *uint64
+	Message  string
+}
+
+func logRecordFromC(rec *C.NetDeckLogRecord) DeckLogRecord {
+	out := DeckLogRecord{
+		Seq:   uint64(rec.seq),
+		TsMs:  uint64(rec.ts_ms),
+		Level: DeckLogLevel(rec.level),
+	}
+	if rec.daemon_id_present != 0 {
+		d := uint64(rec.daemon_id)
+		out.DaemonID = &d
+	}
+	if rec.node_id_present != 0 {
+		n := uint64(rec.node_id)
+		out.NodeID = &n
+	}
+	if rec.message != nil {
+		out.Message = C.GoString(rec.message)
+	}
+	return out
+}
+
+// DeckFailureRecord is one executor-failure record.
+type DeckFailureRecord struct {
+	Seq          uint64
+	Source       string
+	Reason       string
+	RecordedAtMs uint64
+}
+
+func failureRecordFromC(rec *C.NetDeckFailureRecord) DeckFailureRecord {
+	out := DeckFailureRecord{
+		Seq:          uint64(rec.seq),
+		RecordedAtMs: uint64(rec.recorded_at_ms),
+	}
+	if rec.source != nil {
+		out.Source = C.GoString(rec.source)
+	}
+	if rec.reason != nil {
+		out.Reason = C.GoString(rec.reason)
+	}
+	return out
+}
+
+// DeckLogStream — handle for the live log stream.
+type DeckLogStream struct {
+	ptr *C.NetDeckLogStream
+}
+
+// SubscribeLogs opens a log stream. `filter == nil` matches
+// every record.
+func (c *DeckClient) SubscribeLogs(filter *DeckLogFilter) (*DeckLogStream, error) {
+	if c == nil || c.ptr == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var raw *C.NetDeckLogStream
+	var filterPtr *C.NetDeckLogFilter
+	var cFilter C.NetDeckLogFilter
+	if filter != nil {
+		cFilter = filter.toC()
+		filterPtr = &cFilter
+	}
+	if err := deckStatusToError(C.net_deck_subscribe_logs(c.ptr, filterPtr, &raw)); err != nil {
+		return nil, err
+	}
+	s := &DeckLogStream{ptr: raw}
+	runtime.SetFinalizer(s, func(s *DeckLogStream) { s.Free() })
+	return s, nil
+}
+
+// Next blocks up to `timeoutMs` for the next log record. Returns
+// `(nil, nil)` on timeout, `(nil, ErrDeckEndOfStream)` on stream
+// end. Pass `0` for an unbounded wait.
+func (s *DeckLogStream) Next(timeoutMs uint64) (*DeckLogRecord, error) {
+	if s == nil || s.ptr == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var rec C.NetDeckLogRecord
+	var hasItem C.int
+	status := C.net_deck_log_stream_next(s.ptr, C.uint64_t(timeoutMs), &rec, &hasItem)
+	if err := deckStatusToError(status); err != nil {
+		return nil, err
+	}
+	if hasItem == 0 {
+		return nil, nil
+	}
+	out := logRecordFromC(&rec)
+	// Free the FFI-allocated message string.
+	C.net_deck_log_record_drop(&rec)
+	return &out, nil
+}
+
+func (s *DeckLogStream) Close() { s.Free() }
+
+func (s *DeckLogStream) Free() {
+	if s == nil || s.ptr == nil {
+		return
+	}
+	C.net_deck_log_stream_free(s.ptr)
+	s.ptr = nil
+	runtime.SetFinalizer(s, nil)
+}
+
+// DeckFailureStream — handle for the live failure stream.
+type DeckFailureStream struct {
+	ptr *C.NetDeckFailureStream
+}
+
+func (c *DeckClient) SubscribeFailures(sinceSeq uint64) (*DeckFailureStream, error) {
+	if c == nil || c.ptr == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var raw *C.NetDeckFailureStream
+	if err := deckStatusToError(C.net_deck_subscribe_failures(c.ptr, C.uint64_t(sinceSeq), &raw)); err != nil {
+		return nil, err
+	}
+	s := &DeckFailureStream{ptr: raw}
+	runtime.SetFinalizer(s, func(s *DeckFailureStream) { s.Free() })
+	return s, nil
+}
+
+func (s *DeckFailureStream) Next(timeoutMs uint64) (*DeckFailureRecord, error) {
+	if s == nil || s.ptr == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var rec C.NetDeckFailureRecord
+	var hasItem C.int
+	status := C.net_deck_failure_stream_next(s.ptr, C.uint64_t(timeoutMs), &rec, &hasItem)
+	if err := deckStatusToError(status); err != nil {
+		return nil, err
+	}
+	if hasItem == 0 {
+		return nil, nil
+	}
+	out := failureRecordFromC(&rec)
+	C.net_deck_failure_record_drop(&rec)
+	return &out, nil
+}
+
+func (s *DeckFailureStream) Close() { s.Free() }
+
+func (s *DeckFailureStream) Free() {
+	if s == nil || s.ptr == nil {
+		return
+	}
+	C.net_deck_failure_stream_free(s.ptr)
+	s.ptr = nil
+	runtime.SetFinalizer(s, nil)
+}
+
+// =====================================================================
+// AuditQuery — fluent builder + AuditStream
+// =====================================================================
+
+// DeckAuditQuery is the Go-side handle for the audit query
+// builder. Holds only filter state — pass the parent
+// `DeckClient` on Collect / Stream.
+type DeckAuditQuery struct {
+	ptr *C.NetDeckAuditQuery
+}
+
+func (c *DeckClient) Audit() (*DeckAuditQuery, error) {
+	var raw *C.NetDeckAuditQuery
+	if err := deckStatusToError(C.net_deck_audit_query_new(&raw)); err != nil {
+		return nil, err
+	}
+	q := &DeckAuditQuery{ptr: raw}
+	runtime.SetFinalizer(q, func(q *DeckAuditQuery) { q.Free() })
+	return q, nil
+}
+
+func (q *DeckAuditQuery) Recent(limit uint) *DeckAuditQuery {
+	if q != nil && q.ptr != nil {
+		C.net_deck_audit_query_recent(q.ptr, C.size_t(limit))
+	}
+	return q
+}
+
+func (q *DeckAuditQuery) ByOperator(operatorID uint64) *DeckAuditQuery {
+	if q != nil && q.ptr != nil {
+		C.net_deck_audit_query_by_operator(q.ptr, C.uint64_t(operatorID))
+	}
+	return q
+}
+
+func (q *DeckAuditQuery) Between(startMs, endMs uint64) *DeckAuditQuery {
+	if q != nil && q.ptr != nil {
+		C.net_deck_audit_query_between(q.ptr, C.uint64_t(startMs), C.uint64_t(endMs))
+	}
+	return q
+}
+
+func (q *DeckAuditQuery) ForceOnly() *DeckAuditQuery {
+	if q != nil && q.ptr != nil {
+		C.net_deck_audit_query_force_only(q.ptr)
+	}
+	return q
+}
+
+func (q *DeckAuditQuery) Since(seq uint64) *DeckAuditQuery {
+	if q != nil && q.ptr != nil {
+		C.net_deck_audit_query_since(q.ptr, C.uint64_t(seq))
+	}
+	return q
+}
+
+// Collect returns the audit records as parsed `map[string]any`
+// objects. JSON parsing happens in Go; the FFI returns an array
+// of CString JSON payloads which we free immediately after copy.
+func (q *DeckAuditQuery) Collect(client *DeckClient) ([]map[string]any, error) {
+	if q == nil || q.ptr == nil || client == nil || client.ptr == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var records **C.char
+	var count C.size_t
+	status := C.net_deck_audit_query_collect(q.ptr, client.ptr, &records, &count)
+	if err := deckStatusToError(status); err != nil {
+		return nil, err
+	}
+	defer C.net_deck_audit_records_free(records, count)
+	out := make([]map[string]any, 0, int(count))
+	for i := 0; i < int(count); i++ {
+		ptr := *(**C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(records)) + uintptr(i)*unsafe.Sizeof(uintptr(0))))
+		if ptr == nil {
+			continue
+		}
+		raw := C.GoString(ptr)
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+			return nil, fmt.Errorf("%w: audit JSON parse: %v", ErrDeckCallFailed, err)
+		}
+		out = append(out, parsed)
+	}
+	return out, nil
+}
+
+func (q *DeckAuditQuery) Stream(client *DeckClient) (*DeckAuditStream, error) {
+	if q == nil || q.ptr == nil || client == nil || client.ptr == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var raw *C.NetDeckAuditStream
+	if err := deckStatusToError(C.net_deck_audit_query_stream(q.ptr, client.ptr, &raw)); err != nil {
+		return nil, err
+	}
+	s := &DeckAuditStream{ptr: raw}
+	runtime.SetFinalizer(s, func(s *DeckAuditStream) { s.Free() })
+	return s, nil
+}
+
+func (q *DeckAuditQuery) Free() {
+	if q == nil || q.ptr == nil {
+		return
+	}
+	C.net_deck_audit_query_free(q.ptr)
+	q.ptr = nil
+	runtime.SetFinalizer(q, nil)
+}
+
+// DeckAuditStream — sync iterator over audit records (returned
+// as parsed `map[string]any`).
+type DeckAuditStream struct {
+	ptr *C.NetDeckAuditStream
+}
+
+func (s *DeckAuditStream) Next(timeoutMs uint64) (map[string]any, error) {
+	if s == nil || s.ptr == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var jsonPtr *C.char
+	status := C.net_deck_audit_stream_next(s.ptr, C.uint64_t(timeoutMs), &jsonPtr)
+	if err := deckStatusToError(status); err != nil {
+		return nil, err
+	}
+	if jsonPtr == nil {
+		return nil, nil
+	}
+	defer C.net_deck_free_string(jsonPtr)
+	raw := C.GoString(jsonPtr)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil, fmt.Errorf("%w: audit JSON parse: %v", ErrDeckCallFailed, err)
+	}
+	return parsed, nil
+}
+
+func (s *DeckAuditStream) Close() { s.Free() }
+
+func (s *DeckAuditStream) Free() {
+	if s == nil || s.ptr == nil {
+		return
+	}
+	C.net_deck_audit_stream_free(s.ptr)
 	s.ptr = nil
 	runtime.SetFinalizer(s, nil)
 }

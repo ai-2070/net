@@ -13,12 +13,13 @@
  * Companion to `DECK_SDK_PLAN.md` Phase 7; consumes the cdylib
  * shipped for Phase 6 (Go) without modification.
  *
- * # Scope (slice 1)
+ * # Scope (slice 2)
  *
  * Client lifecycle, all 9 `AdminCommands` methods, one-shot
- * `status` / `status_summary`, and snapshot + status-summary
- * streams. Audit / log / failure streams land in slice 2; ICE
- * (force_*, simulate/commit typestate) in slice 3.
+ * `status` / `status_summary`, snapshot + status-summary
+ * streams, the audit-query fluent builder + audit stream, log
+ * stream with filter, and failure stream. ICE (force_*,
+ * simulate/commit typestate) lands in slice 3.
  *
  * # Operator-only mode
  *
@@ -370,6 +371,172 @@ int net_deck_status_summary_stream_next(
 );
 
 void net_deck_status_summary_stream_free(NetDeckStatusSummaryStream* stream);
+
+/* =========================================================================
+ * Slice 2 — log levels + LogFilter
+ *
+ * Constants match the substrate's `LogLevel` enum.
+ * ========================================================================= */
+
+#define NET_DECK_LOG_TRACE 0
+#define NET_DECK_LOG_DEBUG 1
+#define NET_DECK_LOG_INFO  2
+#define NET_DECK_LOG_WARN  3
+#define NET_DECK_LOG_ERROR 4
+
+/* Optional fields for filtering the log stream. Each `_present`
+ * flag guards the matching scalar. Pass NULL to
+ * `net_deck_subscribe_logs` to match every record. */
+typedef struct {
+    int min_level_present;
+    int min_level;
+    int daemon_id_present;
+    uint64_t daemon_id;
+    int node_id_present;
+    uint64_t node_id;
+    int since_seq_present;
+    uint64_t since_seq;
+} NetDeckLogFilter;
+
+/* =========================================================================
+ * Slice 2 — Log + Failure record wire forms
+ *
+ * String fields are heap-allocated by the cdylib. Caller MUST
+ * call the matching `_drop` function to release them when done
+ * with the record. The `_drop` calls are idempotent on records
+ * whose string fields are NULL (e.g., a zero-initialized struct
+ * returned from `_next` on timeout).
+ * ========================================================================= */
+
+typedef struct {
+    uint64_t seq;
+    uint64_t ts_ms;
+    int level;
+    int daemon_id_present;
+    uint64_t daemon_id;
+    int node_id_present;
+    uint64_t node_id;
+    char* message;
+} NetDeckLogRecord;
+
+void net_deck_log_record_drop(NetDeckLogRecord* record);
+
+typedef struct {
+    uint64_t seq;
+    char* source;
+    char* reason;
+    uint64_t recorded_at_ms;
+} NetDeckFailureRecord;
+
+void net_deck_failure_record_drop(NetDeckFailureRecord* record);
+
+/* =========================================================================
+ * Slice 2 — Log + Failure streams
+ * ========================================================================= */
+
+typedef struct NetDeckLogStream      NetDeckLogStream;
+typedef struct NetDeckFailureStream  NetDeckFailureStream;
+
+/* Subscribe to the log ring. `filter` may be NULL — matches
+ * every record. */
+int net_deck_subscribe_logs(
+    const NetDeckClient* client,
+    const NetDeckLogFilter* filter,
+    NetDeckLogStream** out
+);
+
+/* Wait up to `timeout_ms` for the next log record. On success
+ * writes the record (caller frees the message via
+ * `net_deck_log_record_drop`) and sets `*has_item_out = 1`. On
+ * timeout sets `*has_item_out = 0` and returns OK. On stream end
+ * returns NET_DECK_ERR_END_OF_STREAM. Pass `0` for an unbounded
+ * wait. */
+int net_deck_log_stream_next(
+    NetDeckLogStream* stream,
+    uint64_t timeout_ms,
+    NetDeckLogRecord* out,
+    int* has_item_out
+);
+
+void net_deck_log_stream_free(NetDeckLogStream* stream);
+
+/* Subscribe to the failure ring starting at `since_seq + 1`. */
+int net_deck_subscribe_failures(
+    const NetDeckClient* client,
+    uint64_t since_seq,
+    NetDeckFailureStream** out
+);
+
+int net_deck_failure_stream_next(
+    NetDeckFailureStream* stream,
+    uint64_t timeout_ms,
+    NetDeckFailureRecord* out,
+    int* has_item_out
+);
+
+void net_deck_failure_stream_free(NetDeckFailureStream* stream);
+
+/* =========================================================================
+ * Slice 2 — AuditQuery fluent builder + AuditStream
+ *
+ * Build a query via the freestanding builder, then call
+ * `_collect` (eager list of JSON CStrings) or `_stream` (sync
+ * iterator). Pass the parent `NetDeckClient` on each terminal
+ * call — the builder itself doesn't reference the client.
+ * ========================================================================= */
+
+typedef struct NetDeckAuditQuery  NetDeckAuditQuery;
+typedef struct NetDeckAuditStream NetDeckAuditStream;
+
+/* Construct a freestanding audit query builder. */
+int net_deck_audit_query_new(NetDeckAuditQuery** out);
+
+/* Free the builder. Idempotent on NULL. */
+void net_deck_audit_query_free(NetDeckAuditQuery* query);
+
+/* Filter setters. Each returns NET_DECK_OK or
+ * NET_DECK_ERR_NULL on a NULL builder. */
+int net_deck_audit_query_recent(NetDeckAuditQuery* query, size_t limit);
+int net_deck_audit_query_by_operator(NetDeckAuditQuery* query, uint64_t operator_id);
+int net_deck_audit_query_between(
+    NetDeckAuditQuery* query, uint64_t start_ms, uint64_t end_ms
+);
+int net_deck_audit_query_force_only(NetDeckAuditQuery* query);
+int net_deck_audit_query_since(NetDeckAuditQuery* query, uint64_t seq);
+
+/* Collect audit records as a heap-allocated array of JSON
+ * CStrings. Writes the count to `*count_out` and the array
+ * pointer to `*records_out`. Caller frees via
+ * `net_deck_audit_records_free(records, count)`. */
+int net_deck_audit_query_collect(
+    const NetDeckAuditQuery* query,
+    const NetDeckClient* client,
+    char*** records_out,
+    size_t* count_out
+);
+
+/* Free the records array returned by `_collect`. Frees each
+ * JSON CString + the outer array. Idempotent on NULL. */
+void net_deck_audit_records_free(char** records, size_t count);
+
+/* Open a sync audit stream. */
+int net_deck_audit_query_stream(
+    const NetDeckAuditQuery* query,
+    const NetDeckClient* client,
+    NetDeckAuditStream** out
+);
+
+/* Wait up to `timeout_ms` for the next audit record. On success
+ * writes a heap-allocated JSON CString to `*out` (caller frees
+ * via `net_deck_free_string`). On timeout writes NULL. On stream
+ * end returns NET_DECK_ERR_END_OF_STREAM. */
+int net_deck_audit_stream_next(
+    NetDeckAuditStream* stream,
+    uint64_t timeout_ms,
+    char** out
+);
+
+void net_deck_audit_stream_free(NetDeckAuditStream* stream);
 
 /* =========================================================================
  * Last-error trio (thread-local)

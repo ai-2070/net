@@ -55,10 +55,13 @@ use futures::StreamExt;
 use tokio::runtime::Runtime;
 
 use net::adapter::net::behavior::deck::{
-    AdminCommands as CoreAdminCommands, ChainCommit as CoreChainCommit, DeckClient as CoreClient,
-    DeckClientConfig as CoreConfig, DeckError, OperatorIdentity as CoreIdentity,
+    AdminCommands as CoreAdminCommands, AuditQuery as CoreAuditQuery,
+    AuditStream as CoreAuditStream, ChainCommit as CoreChainCommit, DeckClient as CoreClient,
+    DeckClientConfig as CoreConfig, DeckError, FailureStream as CoreFailureStream,
+    LogFilter as CoreLogFilter, LogStream as CoreLogStream, OperatorIdentity as CoreIdentity,
     SnapshotStream as CoreSnapshotStream, StatusSummary, StatusSummaryStream as CoreStatusStream,
 };
+use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::behavior::meshos::{
     LoggingDispatcher, MeshOsConfig, MeshOsDaemonSdk as CoreSdk,
 };
@@ -907,8 +910,792 @@ pub extern "C" fn net_deck_status_summary_stream_free(stream: *mut NetDeckStatus
 }
 
 // =========================================================================
-// Tests
+// Slice 2 — Log levels + LogFilter
 // =========================================================================
+
+pub const NET_DECK_LOG_TRACE: c_int = 0;
+pub const NET_DECK_LOG_DEBUG: c_int = 1;
+pub const NET_DECK_LOG_INFO: c_int = 2;
+pub const NET_DECK_LOG_WARN: c_int = 3;
+pub const NET_DECK_LOG_ERROR: c_int = 4;
+
+fn log_level_from_c(level: c_int) -> Option<CoreLogLevel> {
+    Some(match level {
+        NET_DECK_LOG_TRACE => CoreLogLevel::Trace,
+        NET_DECK_LOG_DEBUG => CoreLogLevel::Debug,
+        NET_DECK_LOG_INFO => CoreLogLevel::Info,
+        NET_DECK_LOG_WARN => CoreLogLevel::Warn,
+        NET_DECK_LOG_ERROR => CoreLogLevel::Error,
+        _ => return None,
+    })
+}
+
+fn log_level_to_c(level: CoreLogLevel) -> c_int {
+    match level {
+        CoreLogLevel::Trace => NET_DECK_LOG_TRACE,
+        CoreLogLevel::Debug => NET_DECK_LOG_DEBUG,
+        CoreLogLevel::Info => NET_DECK_LOG_INFO,
+        CoreLogLevel::Warn => NET_DECK_LOG_WARN,
+        CoreLogLevel::Error => NET_DECK_LOG_ERROR,
+        _ => NET_DECK_LOG_INFO,
+    }
+}
+
+/// LogFilter — every field is optional; the `_present` bool
+/// guards each scalar. Pass NULL to `net_deck_subscribe_logs` for
+/// "match everything."
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NetDeckLogFilter {
+    pub min_level_present: c_int,
+    pub min_level: c_int,
+    pub daemon_id_present: c_int,
+    pub daemon_id: u64,
+    pub node_id_present: c_int,
+    pub node_id: u64,
+    pub since_seq_present: c_int,
+    pub since_seq: u64,
+}
+
+impl NetDeckLogFilter {
+    fn into_core(self) -> Result<CoreLogFilter, &'static str> {
+        let mut f = CoreLogFilter::default();
+        if self.min_level_present != 0 {
+            f.min_level = Some(log_level_from_c(self.min_level).ok_or("invalid_log_level")?);
+        }
+        if self.daemon_id_present != 0 {
+            f.daemon_id = Some(self.daemon_id);
+        }
+        if self.node_id_present != 0 {
+            f.node_id = Some(self.node_id);
+        }
+        if self.since_seq_present != 0 {
+            f.since_seq = Some(self.since_seq);
+        }
+        Ok(f)
+    }
+}
+
+// =========================================================================
+// Slice 2 — Log + Failure record wire forms
+// =========================================================================
+
+/// LogRecord wire form. The `message` field is a heap-allocated
+/// CString owned by the cdylib; caller MUST call
+/// `net_deck_log_record_drop` to release it (idempotent on a
+/// zero-initialized struct).
+#[repr(C)]
+pub struct NetDeckLogRecord {
+    pub seq: u64,
+    pub ts_ms: u64,
+    pub level: c_int,
+    pub daemon_id_present: c_int,
+    pub daemon_id: u64,
+    pub node_id_present: c_int,
+    pub node_id: u64,
+    /// Heap-allocated CString; caller frees via
+    /// `net_deck_log_record_drop`.
+    pub message: *mut c_char,
+}
+
+impl Default for NetDeckLogRecord {
+    fn default() -> Self {
+        Self {
+            seq: 0,
+            ts_ms: 0,
+            level: NET_DECK_LOG_INFO,
+            daemon_id_present: 0,
+            daemon_id: 0,
+            node_id_present: 0,
+            node_id: 0,
+            message: ptr::null_mut(),
+        }
+    }
+}
+
+fn log_record_to_c(
+    record: &net::adapter::net::behavior::meshos::LogRecord,
+) -> NetDeckLogRecord {
+    let message = CString::new(record.message.clone())
+        .unwrap_or_else(|_| CString::new("").expect("empty cstr"))
+        .into_raw();
+    NetDeckLogRecord {
+        seq: record.seq,
+        ts_ms: record.ts_ms,
+        level: log_level_to_c(record.level),
+        daemon_id_present: if record.daemon_id.is_some() { 1 } else { 0 },
+        daemon_id: record.daemon_id.unwrap_or(0),
+        node_id_present: if record.node_id.is_some() { 1 } else { 0 },
+        node_id: record.node_id.unwrap_or(0),
+        message,
+    }
+}
+
+/// Drop a `NetDeckLogRecord`. Frees the heap-allocated `message`
+/// pointer. Idempotent on a record whose `message` is NULL.
+#[no_mangle]
+pub extern "C" fn net_deck_log_record_drop(record: *mut NetDeckLogRecord) {
+    let Some(record) = (unsafe { record.as_mut() }) else {
+        return;
+    };
+    if !record.message.is_null() {
+        unsafe {
+            let _ = CString::from_raw(record.message);
+        }
+        record.message = ptr::null_mut();
+    }
+}
+
+/// FailureRecord wire form. `source` and `reason` are heap-
+/// allocated CStrings owned by the cdylib; caller MUST call
+/// `net_deck_failure_record_drop`.
+#[repr(C)]
+pub struct NetDeckFailureRecord {
+    pub seq: u64,
+    pub source: *mut c_char,
+    pub reason: *mut c_char,
+    pub recorded_at_ms: u64,
+}
+
+impl Default for NetDeckFailureRecord {
+    fn default() -> Self {
+        Self {
+            seq: 0,
+            source: ptr::null_mut(),
+            reason: ptr::null_mut(),
+            recorded_at_ms: 0,
+        }
+    }
+}
+
+fn failure_record_to_c(
+    record: &net::adapter::net::behavior::meshos::FailureRecord,
+) -> NetDeckFailureRecord {
+    let source = CString::new(record.source.clone())
+        .unwrap_or_else(|_| CString::new("").expect("empty cstr"))
+        .into_raw();
+    let reason = CString::new(record.reason.clone())
+        .unwrap_or_else(|_| CString::new("").expect("empty cstr"))
+        .into_raw();
+    NetDeckFailureRecord {
+        seq: record.seq,
+        source,
+        reason,
+        recorded_at_ms: record.recorded_at_ms,
+    }
+}
+
+/// Drop a `NetDeckFailureRecord`. Frees the heap-allocated
+/// `source` + `reason`. Idempotent on a record whose strings are
+/// NULL.
+#[no_mangle]
+pub extern "C" fn net_deck_failure_record_drop(record: *mut NetDeckFailureRecord) {
+    let Some(record) = (unsafe { record.as_mut() }) else {
+        return;
+    };
+    if !record.source.is_null() {
+        unsafe {
+            let _ = CString::from_raw(record.source);
+        }
+        record.source = ptr::null_mut();
+    }
+    if !record.reason.is_null() {
+        unsafe {
+            let _ = CString::from_raw(record.reason);
+        }
+        record.reason = ptr::null_mut();
+    }
+}
+
+// =========================================================================
+// Slice 2 — Log + Failure streams
+// =========================================================================
+
+pub struct NetDeckLogStream {
+    inner: Option<CoreLogStream>,
+}
+
+pub struct NetDeckFailureStream {
+    inner: Option<CoreFailureStream>,
+}
+
+/// Subscribe to the runtime's log ring. `filter` may be NULL —
+/// matches every record.
+#[no_mangle]
+pub extern "C" fn net_deck_subscribe_logs(
+    client: *const NetDeckClient,
+    filter: *const NetDeckLogFilter,
+    out: *mut *mut NetDeckLogStream,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let core_filter = if filter.is_null() {
+            CoreLogFilter::default()
+        } else {
+            match unsafe { *filter }.into_core() {
+                Ok(f) => f,
+                Err(kind) => {
+                    set_last_error(
+                        kind,
+                        "log filter has an invalid field (likely min_level)",
+                    );
+                    return NET_DECK_ERR_INVALID_ARG;
+                }
+            }
+        };
+        let stream = {
+            let Some(c) = (unsafe { client.as_ref() }) else {
+                set_last_error("invalid_argument", "client pointer is NULL");
+                return NET_DECK_ERR_NULL;
+            };
+            let Some(inner) = c.client.as_ref() else {
+                set_last_error("already_shutdown", "DeckClient was already freed");
+                return NET_DECK_ERR_ALREADY_SHUTDOWN;
+            };
+            let _enter = runtime().enter();
+            inner.subscribe_logs(core_filter)
+        };
+        clear_last_error_inner();
+        let boxed = Box::into_raw(Box::new(NetDeckLogStream {
+            inner: Some(stream),
+        }));
+        unsafe { *out = boxed };
+        NET_DECK_OK
+    })
+}
+
+/// Block up to `timeout_ms` for the next log record. On success
+/// writes the record to `*out` (caller frees via
+/// `net_deck_log_record_drop`) and sets `*has_item_out = 1`. On
+/// timeout sets `*has_item_out = 0` and returns OK. On stream end
+/// returns `NET_DECK_ERR_END_OF_STREAM`. Pass `0` for an
+/// unbounded wait.
+#[no_mangle]
+pub extern "C" fn net_deck_log_stream_next(
+    stream: *mut NetDeckLogStream,
+    timeout_ms: u64,
+    out: *mut NetDeckLogRecord,
+    has_item_out: *mut c_int,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() || has_item_out.is_null() {
+            set_last_error("invalid_argument", "out / has_item_out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(s) = (unsafe { stream.as_mut() }) else {
+            set_last_error("invalid_argument", "stream pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let inner = match s.inner.as_mut() {
+            Some(i) => i,
+            None => {
+                unsafe { *has_item_out = 0 };
+                return NET_DECK_ERR_END_OF_STREAM;
+            }
+        };
+        clear_last_error_inner();
+        let item = runtime().block_on(async {
+            if timeout_ms == 0 {
+                inner.next().await
+            } else {
+                match tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next()).await {
+                    Ok(r) => r,
+                    Err(_) => None,
+                }
+            }
+        });
+        match item {
+            Some(Ok(record)) => {
+                unsafe {
+                    *out = log_record_to_c(&record);
+                    *has_item_out = 1;
+                };
+                NET_DECK_OK
+            }
+            Some(Err(e)) => {
+                set_last_error_from_sdk(&e);
+                NET_DECK_ERR_CALL_FAILED
+            }
+            None if timeout_ms == 0 => {
+                unsafe { *has_item_out = 0 };
+                NET_DECK_ERR_END_OF_STREAM
+            }
+            None => {
+                unsafe { *has_item_out = 0 };
+                NET_DECK_OK
+            }
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_log_stream_free(stream: *mut NetDeckLogStream) {
+    if stream.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(stream);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_subscribe_failures(
+    client: *const NetDeckClient,
+    since_seq: u64,
+    out: *mut *mut NetDeckFailureStream,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let stream = {
+            let Some(c) = (unsafe { client.as_ref() }) else {
+                set_last_error("invalid_argument", "client pointer is NULL");
+                return NET_DECK_ERR_NULL;
+            };
+            let Some(inner) = c.client.as_ref() else {
+                set_last_error("already_shutdown", "DeckClient was already freed");
+                return NET_DECK_ERR_ALREADY_SHUTDOWN;
+            };
+            let _enter = runtime().enter();
+            inner.subscribe_failures(since_seq)
+        };
+        clear_last_error_inner();
+        let boxed = Box::into_raw(Box::new(NetDeckFailureStream {
+            inner: Some(stream),
+        }));
+        unsafe { *out = boxed };
+        NET_DECK_OK
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_failure_stream_next(
+    stream: *mut NetDeckFailureStream,
+    timeout_ms: u64,
+    out: *mut NetDeckFailureRecord,
+    has_item_out: *mut c_int,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() || has_item_out.is_null() {
+            set_last_error("invalid_argument", "out / has_item_out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(s) = (unsafe { stream.as_mut() }) else {
+            set_last_error("invalid_argument", "stream pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let inner = match s.inner.as_mut() {
+            Some(i) => i,
+            None => {
+                unsafe { *has_item_out = 0 };
+                return NET_DECK_ERR_END_OF_STREAM;
+            }
+        };
+        clear_last_error_inner();
+        let item = runtime().block_on(async {
+            if timeout_ms == 0 {
+                inner.next().await
+            } else {
+                match tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next()).await {
+                    Ok(r) => r,
+                    Err(_) => None,
+                }
+            }
+        });
+        match item {
+            Some(Ok(record)) => {
+                unsafe {
+                    *out = failure_record_to_c(&record);
+                    *has_item_out = 1;
+                };
+                NET_DECK_OK
+            }
+            Some(Err(e)) => {
+                set_last_error_from_sdk(&e);
+                NET_DECK_ERR_CALL_FAILED
+            }
+            None if timeout_ms == 0 => {
+                unsafe { *has_item_out = 0 };
+                NET_DECK_ERR_END_OF_STREAM
+            }
+            None => {
+                unsafe { *has_item_out = 0 };
+                NET_DECK_OK
+            }
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_failure_stream_free(stream: *mut NetDeckFailureStream) {
+    if stream.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(stream);
+    }
+}
+
+// =========================================================================
+// Slice 2 — AuditQuery (fluent builder) + AuditStream
+// =========================================================================
+
+/// Audit query builder. Holds only filter state; each builder
+/// method takes the parent `NetDeckClient` pointer + the builder
+/// pointer, so the builder doesn't need to borrow the client
+/// across the FFI.
+///
+/// **Lifetime contract:** the builder is freestanding — it's safe
+/// to free the parent client before / after the builder. The
+/// `_collect` / `_stream` calls require a live parent client.
+pub struct NetDeckAuditQuery {
+    recent_limit: Option<usize>,
+    by_operator: Option<u64>,
+    between: Option<(u64, u64)>,
+    force_only: bool,
+    since: Option<u64>,
+}
+
+impl NetDeckAuditQuery {
+    fn build<'a>(&self, client: &'a CoreClient) -> CoreAuditQuery<'a> {
+        let mut q = client.audit();
+        if let Some(n) = self.recent_limit {
+            q = q.recent(n);
+        }
+        if let Some(op) = self.by_operator {
+            q = q.by_operator(op);
+        }
+        if let Some((start, end)) = self.between {
+            q = q.between(start, end);
+        }
+        if self.force_only {
+            q = q.force_only();
+        }
+        if let Some(s) = self.since {
+            q = q.since(s);
+        }
+        q
+    }
+}
+
+pub struct NetDeckAuditStream {
+    inner: Option<CoreAuditStream>,
+}
+
+/// Construct a new audit query. Holds only filter state; the
+/// client pointer is supplied on `_collect` / `_stream`.
+#[no_mangle]
+pub extern "C" fn net_deck_audit_query_new(
+    out: *mut *mut NetDeckAuditQuery,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        clear_last_error_inner();
+        let boxed = Box::into_raw(Box::new(NetDeckAuditQuery {
+            recent_limit: None,
+            by_operator: None,
+            between: None,
+            force_only: false,
+            since: None,
+        }));
+        unsafe { *out = boxed };
+        NET_DECK_OK
+    })
+}
+
+/// Free a freestanding audit query builder. Idempotent on NULL.
+#[no_mangle]
+pub extern "C" fn net_deck_audit_query_free(query: *mut NetDeckAuditQuery) {
+    if query.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(query);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_audit_query_recent(
+    query: *mut NetDeckAuditQuery,
+    limit: usize,
+) -> c_int {
+    let Some(q) = (unsafe { query.as_mut() }) else {
+        return NET_DECK_ERR_NULL;
+    };
+    q.recent_limit = Some(limit);
+    NET_DECK_OK
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_audit_query_by_operator(
+    query: *mut NetDeckAuditQuery,
+    operator_id: u64,
+) -> c_int {
+    let Some(q) = (unsafe { query.as_mut() }) else {
+        return NET_DECK_ERR_NULL;
+    };
+    q.by_operator = Some(operator_id);
+    NET_DECK_OK
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_audit_query_between(
+    query: *mut NetDeckAuditQuery,
+    start_ms: u64,
+    end_ms: u64,
+) -> c_int {
+    let Some(q) = (unsafe { query.as_mut() }) else {
+        return NET_DECK_ERR_NULL;
+    };
+    q.between = Some((start_ms, end_ms));
+    NET_DECK_OK
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_audit_query_force_only(query: *mut NetDeckAuditQuery) -> c_int {
+    let Some(q) = (unsafe { query.as_mut() }) else {
+        return NET_DECK_ERR_NULL;
+    };
+    q.force_only = true;
+    NET_DECK_OK
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_audit_query_since(
+    query: *mut NetDeckAuditQuery,
+    seq: u64,
+) -> c_int {
+    let Some(q) = (unsafe { query.as_mut() }) else {
+        return NET_DECK_ERR_NULL;
+    };
+    q.since = Some(seq);
+    NET_DECK_OK
+}
+
+/// Collect audit records as an array of heap-allocated JSON
+/// strings. On success writes the count to `*count_out` and a
+/// heap-allocated `char**` to `*records_out`. Caller frees via
+/// `net_deck_audit_records_free(records, count)`.
+#[no_mangle]
+pub extern "C" fn net_deck_audit_query_collect(
+    query: *const NetDeckAuditQuery,
+    client: *const NetDeckClient,
+    records_out: *mut *mut *mut c_char,
+    count_out: *mut usize,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if records_out.is_null() || count_out.is_null() {
+            set_last_error("invalid_argument", "records_out / count_out is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(q) = (unsafe { query.as_ref() }) else {
+            set_last_error("invalid_argument", "query pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(c) = (unsafe { client.as_ref() }) else {
+            set_last_error("invalid_argument", "client pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(inner) = c.client.as_ref() else {
+            set_last_error("already_shutdown", "DeckClient was already freed");
+            return NET_DECK_ERR_ALREADY_SHUTDOWN;
+        };
+        clear_last_error_inner();
+        let records = q.build(inner).collect();
+        let mut json_cstrings: Vec<*mut c_char> = Vec::with_capacity(records.len());
+        for r in &records {
+            let s = match serde_json::to_string(r) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Clean up anything we've already allocated.
+                    for ptr in json_cstrings.drain(..) {
+                        if !ptr.is_null() {
+                            unsafe {
+                                let _ = CString::from_raw(ptr);
+                            }
+                        }
+                    }
+                    set_last_error("audit_serialize_failed", &e.to_string());
+                    return NET_DECK_ERR_CALL_FAILED;
+                }
+            };
+            let c = match CString::new(s) {
+                Ok(c) => c,
+                Err(_) => {
+                    for ptr in json_cstrings.drain(..) {
+                        if !ptr.is_null() {
+                            unsafe {
+                                let _ = CString::from_raw(ptr);
+                            }
+                        }
+                    }
+                    set_last_error("audit_serialize_failed", "JSON contained NUL byte");
+                    return NET_DECK_ERR_CALL_FAILED;
+                }
+            };
+            json_cstrings.push(c.into_raw());
+        }
+        let count = json_cstrings.len();
+        let boxed_array = json_cstrings.into_boxed_slice();
+        let ptr = Box::into_raw(boxed_array) as *mut *mut c_char;
+        unsafe {
+            *records_out = ptr;
+            *count_out = count;
+        };
+        NET_DECK_OK
+    })
+}
+
+/// Free an array of audit records returned by `_collect`. Frees
+/// each heap-allocated JSON CString + the outer array. Idempotent
+/// on NULL.
+#[no_mangle]
+pub extern "C" fn net_deck_audit_records_free(records: *mut *mut c_char, count: usize) {
+    if records.is_null() || count == 0 {
+        if !records.is_null() {
+            unsafe {
+                let _ = Box::from_raw(std::slice::from_raw_parts_mut(records, 0));
+            }
+        }
+        return;
+    }
+    unsafe {
+        let slice = std::slice::from_raw_parts_mut(records, count);
+        for ptr in slice.iter() {
+            if !ptr.is_null() {
+                let _ = CString::from_raw(*ptr);
+            }
+        }
+        let _ = Box::from_raw(slice as *mut [*mut c_char]);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_audit_query_stream(
+    query: *const NetDeckAuditQuery,
+    client: *const NetDeckClient,
+    out: *mut *mut NetDeckAuditStream,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(q) = (unsafe { query.as_ref() }) else {
+            set_last_error("invalid_argument", "query pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(c) = (unsafe { client.as_ref() }) else {
+            set_last_error("invalid_argument", "client pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(inner) = c.client.as_ref() else {
+            set_last_error("already_shutdown", "DeckClient was already freed");
+            return NET_DECK_ERR_ALREADY_SHUTDOWN;
+        };
+        clear_last_error_inner();
+        let stream = {
+            let _enter = runtime().enter();
+            q.build(inner).stream()
+        };
+        let boxed = Box::into_raw(Box::new(NetDeckAuditStream {
+            inner: Some(stream),
+        }));
+        unsafe { *out = boxed };
+        NET_DECK_OK
+    })
+}
+
+/// Block up to `timeout_ms` for the next audit record. On success
+/// writes a heap-allocated JSON CString to `*out` (caller frees
+/// via `net_deck_free_string`) and returns NET_DECK_OK. On timeout
+/// returns NET_DECK_OK with `*out = NULL`. On stream end returns
+/// NET_DECK_ERR_END_OF_STREAM. Pass `0` for an unbounded wait.
+#[no_mangle]
+pub extern "C" fn net_deck_audit_stream_next(
+    stream: *mut NetDeckAuditStream,
+    timeout_ms: u64,
+    out: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(s) = (unsafe { stream.as_mut() }) else {
+            set_last_error("invalid_argument", "stream pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let inner = match s.inner.as_mut() {
+            Some(i) => i,
+            None => {
+                unsafe { *out = ptr::null_mut() };
+                return NET_DECK_ERR_END_OF_STREAM;
+            }
+        };
+        clear_last_error_inner();
+        let item = runtime().block_on(async {
+            if timeout_ms == 0 {
+                inner.next().await
+            } else {
+                match tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next()).await {
+                    Ok(r) => r,
+                    Err(_) => None,
+                }
+            }
+        });
+        match item {
+            Some(Ok(r)) => {
+                let json = match serde_json::to_string(&r) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        set_last_error("audit_serialize_failed", &e.to_string());
+                        return NET_DECK_ERR_CALL_FAILED;
+                    }
+                };
+                let c = match CString::new(json) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        set_last_error("audit_serialize_failed", "JSON contained NUL byte");
+                        return NET_DECK_ERR_CALL_FAILED;
+                    }
+                };
+                unsafe { *out = c.into_raw() };
+                NET_DECK_OK
+            }
+            Some(Err(e)) => {
+                set_last_error_from_sdk(&e);
+                NET_DECK_ERR_CALL_FAILED
+            }
+            None if timeout_ms == 0 => {
+                unsafe { *out = ptr::null_mut() };
+                NET_DECK_ERR_END_OF_STREAM
+            }
+            None => {
+                unsafe { *out = ptr::null_mut() };
+                NET_DECK_OK
+            }
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_audit_stream_free(stream: *mut NetDeckAuditStream) {
+    if stream.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(stream);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1082,5 +1869,196 @@ mod tests {
         let kind = unsafe { CStr::from_ptr(kind_ptr).to_string_lossy().into_owned() };
         assert_eq!(kind, "invalid_argument");
         net_deck_clear_last_error();
+    }
+
+    // =========================================================================
+    // Slice 2 tests
+    // =========================================================================
+
+    #[test]
+    fn audit_query_lifecycle_collect_on_fresh_runtime() {
+        let client = make_client(0x20);
+        let mut q: *mut NetDeckAuditQuery = ptr::null_mut();
+        assert_eq!(net_deck_audit_query_new(&mut q), NET_DECK_OK);
+        assert!(!q.is_null());
+        net_deck_audit_query_recent(q, 100);
+
+        let mut records: *mut *mut c_char = ptr::null_mut();
+        let mut count: usize = 0;
+        let status = net_deck_audit_query_collect(q, client, &mut records, &mut count);
+        assert_eq!(status, NET_DECK_OK);
+        // Fresh runtime; may be 0 or more records (depending on
+        // whether prior tests left state — admin ring is process-
+        // scoped though we use a fresh `NetDeckClient` per test).
+        net_deck_audit_records_free(records, count);
+        net_deck_audit_query_free(q);
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn audit_query_accepts_every_filter_method() {
+        let client = make_client(0x21);
+        let mut q: *mut NetDeckAuditQuery = ptr::null_mut();
+        assert_eq!(net_deck_audit_query_new(&mut q), NET_DECK_OK);
+        assert_eq!(net_deck_audit_query_recent(q, 10), NET_DECK_OK);
+        assert_eq!(net_deck_audit_query_by_operator(q, 0x123), NET_DECK_OK);
+        assert_eq!(
+            net_deck_audit_query_between(q, 0, 2_000_000_000_000),
+            NET_DECK_OK
+        );
+        assert_eq!(net_deck_audit_query_force_only(q), NET_DECK_OK);
+        assert_eq!(net_deck_audit_query_since(q, 0), NET_DECK_OK);
+
+        let mut records: *mut *mut c_char = ptr::null_mut();
+        let mut count: usize = 0;
+        let status = net_deck_audit_query_collect(q, client, &mut records, &mut count);
+        assert_eq!(status, NET_DECK_OK);
+        net_deck_audit_records_free(records, count);
+        net_deck_audit_query_free(q);
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn audit_ring_eventually_contains_record_after_admin_commit() {
+        // Fast tick so the audit fold runs promptly.
+        let seed = [0x22u8; 32];
+        let mut client: *mut NetDeckClient = ptr::null_mut();
+        let status = net_deck_client_new(0, 20, 0, 0, 0, 0, seed.as_ptr(), &mut client);
+        assert_eq!(status, NET_DECK_OK);
+
+        let mut commit = NetDeckChainCommit::default();
+        assert_eq!(
+            net_deck_admin_cordon(client, 0xCAFE, &mut commit),
+            NET_DECK_OK
+        );
+
+        // Poll up to 2s.
+        let mut q: *mut NetDeckAuditQuery = ptr::null_mut();
+        net_deck_audit_query_new(&mut q);
+        net_deck_audit_query_recent(q, 100);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found = false;
+        while std::time::Instant::now() < deadline {
+            let mut records: *mut *mut c_char = ptr::null_mut();
+            let mut count: usize = 0;
+            let status = net_deck_audit_query_collect(q, client, &mut records, &mut count);
+            assert_eq!(status, NET_DECK_OK);
+            if count > 0 {
+                // Parse the first record + assert key presence.
+                let json_ptr = unsafe { *records };
+                let s = unsafe { CStr::from_ptr(json_ptr).to_string_lossy().into_owned() };
+                let parsed: serde_json::Value = serde_json::from_str(&s).expect("valid json");
+                let obj = parsed.as_object().expect("audit record is object");
+                for key in ["seq", "committed_at_ms", "event", "operator_ids", "outcome"] {
+                    assert!(obj.contains_key(key), "missing key {key}: {s}");
+                }
+                net_deck_audit_records_free(records, count);
+                found = true;
+                break;
+            }
+            net_deck_audit_records_free(records, count);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(found, "expected audit ring to populate within 2s");
+
+        net_deck_audit_query_free(q);
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn subscribe_logs_with_filter_and_close() {
+        let client = make_client(0x23);
+        let filter = NetDeckLogFilter {
+            min_level_present: 1,
+            min_level: NET_DECK_LOG_WARN,
+            ..Default::default()
+        };
+        let mut stream: *mut NetDeckLogStream = ptr::null_mut();
+        let status = net_deck_subscribe_logs(client, &filter, &mut stream);
+        assert_eq!(status, NET_DECK_OK);
+        assert!(!stream.is_null());
+        net_deck_log_stream_free(stream);
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn subscribe_logs_null_filter_matches_everything() {
+        let client = make_client(0x24);
+        let mut stream: *mut NetDeckLogStream = ptr::null_mut();
+        let status = net_deck_subscribe_logs(client, ptr::null(), &mut stream);
+        assert_eq!(status, NET_DECK_OK);
+        net_deck_log_stream_free(stream);
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn subscribe_logs_rejects_invalid_min_level() {
+        let client = make_client(0x25);
+        let filter = NetDeckLogFilter {
+            min_level_present: 1,
+            min_level: 99, // out of range
+            ..Default::default()
+        };
+        let mut stream: *mut NetDeckLogStream = ptr::null_mut();
+        let status = net_deck_subscribe_logs(client, &filter, &mut stream);
+        assert_eq!(status, NET_DECK_ERR_INVALID_ARG);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "invalid_log_level");
+        net_deck_clear_last_error();
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn log_stream_next_with_timeout_returns_no_item() {
+        let client = make_client(0x26);
+        let mut stream: *mut NetDeckLogStream = ptr::null_mut();
+        net_deck_subscribe_logs(client, ptr::null(), &mut stream);
+        let mut record = NetDeckLogRecord::default();
+        let mut has_item: c_int = 0;
+        let status = net_deck_log_stream_next(stream, 50, &mut record, &mut has_item);
+        assert_eq!(status, NET_DECK_OK);
+        assert_eq!(has_item, 0, "expected no log record in 50ms");
+        // Defensive: drop in case some platform writes startup
+        // logs into the ring fast enough to land within 50ms.
+        net_deck_log_record_drop(&mut record);
+        net_deck_log_stream_free(stream);
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn failure_stream_subscribe_next_close() {
+        let client = make_client(0x27);
+        let mut stream: *mut NetDeckFailureStream = ptr::null_mut();
+        let status = net_deck_subscribe_failures(client, 0, &mut stream);
+        assert_eq!(status, NET_DECK_OK);
+        let mut record = NetDeckFailureRecord::default();
+        let mut has_item: c_int = 0;
+        let status = net_deck_failure_stream_next(stream, 50, &mut record, &mut has_item);
+        assert_eq!(status, NET_DECK_OK);
+        assert_eq!(has_item, 0);
+        net_deck_failure_record_drop(&mut record);
+        net_deck_failure_stream_free(stream);
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn audit_stream_subscribe_close_protocol() {
+        let client = make_client(0x28);
+        let mut q: *mut NetDeckAuditQuery = ptr::null_mut();
+        net_deck_audit_query_new(&mut q);
+        net_deck_audit_query_recent(q, 10);
+
+        let mut stream: *mut NetDeckAuditStream = ptr::null_mut();
+        let status = net_deck_audit_query_stream(q, client, &mut stream);
+        assert_eq!(status, NET_DECK_OK);
+        // Timeout on a quiet ring.
+        let mut json_ptr: *mut c_char = ptr::null_mut();
+        let status = net_deck_audit_stream_next(stream, 50, &mut json_ptr);
+        assert_eq!(status, NET_DECK_OK);
+        assert!(json_ptr.is_null(), "expected timeout — no audit item");
+        net_deck_audit_stream_free(stream);
+        net_deck_audit_query_free(q);
+        net_deck_client_free(client);
     }
 }
