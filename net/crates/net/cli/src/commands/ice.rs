@@ -255,9 +255,13 @@ where
     F: for<'a> FnOnce(&'a net_sdk::deck::DeckClient) -> net_sdk::deck::IceProposal<'a>,
 {
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx =
-        CliContext::build(&profile, common.identity.as_deref(), common.supervisor_node, true)
-            .await?;
+    let ctx = CliContext::build(
+        &profile,
+        common.identity.as_deref(),
+        common.supervisor_node,
+        true,
+    )
+    .await?;
     let deck = ctx.deck();
     let proposal = build_proposal(deck.as_ref());
 

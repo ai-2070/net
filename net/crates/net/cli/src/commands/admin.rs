@@ -192,22 +192,18 @@ pub async fn run(
             )
             .await
         }
-        AdminCommand::DropReplicas(args) => {
-            handle(
-                args.common,
-                output,
-                config_path,
-                profile_name,
-                AdminEnvelope::DropReplicas {
-                    node: args.node,
-                    chains: args.chains.clone(),
-                },
-                move |deck, _| async move {
-                    deck.admin().drop_replicas(args.node, args.chains).await
-                },
-            )
-            .await
-        }
+        AdminCommand::DropReplicas(args) => handle(
+            args.common,
+            output,
+            config_path,
+            profile_name,
+            AdminEnvelope::DropReplicas {
+                node: args.node,
+                chains: args.chains.clone(),
+            },
+            move |deck, _| async move { deck.admin().drop_replicas(args.node, args.chains).await },
+        )
+        .await,
         AdminCommand::InvalidatePlacement(args) => {
             handle(
                 args.common,
@@ -267,9 +263,13 @@ where
     }
 
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx =
-        CliContext::build(&profile, common.identity.as_deref(), common.supervisor_node, true)
-            .await?;
+    let ctx = CliContext::build(
+        &profile,
+        common.identity.as_deref(),
+        common.supervisor_node,
+        true,
+    )
+    .await?;
     let deck = ctx.deck();
     let commit = commit(deck, common.supervisor_node)
         .await
@@ -358,4 +358,3 @@ enum AdminEnvelope {
         node: u64,
     },
 }
-

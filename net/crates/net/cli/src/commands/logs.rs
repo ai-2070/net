@@ -54,9 +54,9 @@ pub async fn run_log_tail(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let _ = args.follow; // accepted but always-on
-    // Validate the filter up-front so an invalid `--min-level`
-    // exits before we pay the substrate-startup cost. The other
-    // filter knobs (daemon / node / since) are typed by clap.
+                         // Validate the filter up-front so an invalid `--min-level`
+                         // exits before we pay the substrate-startup cost. The other
+                         // filter knobs (daemon / node / since) are typed by clap.
     let min_level = match args.min_level.as_deref() {
         Some(s) => Some(parse_log_level(s)?),
         None => None,
