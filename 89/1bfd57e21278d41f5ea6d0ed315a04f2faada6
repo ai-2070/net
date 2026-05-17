@@ -1,0 +1,19 @@
+net/crates/net/bindings/node/test/deck.test.ts
+  s_275316fc500935::t_b0eeb1f8fce63e 113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "891bfd57e21278d41f5ea6d0ed315a04f2faada6",
+  "prompts": {},
+  "sessions": {
+    "s_275316fc500935": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f087a884-b322-4d2f-9650-4afee91efe78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
