@@ -1,0 +1,21 @@
+net/crates/net/src/ffi/blob.rs
+  s_f641e31a81af58::t_b71c6b4eb4bcec 1087-1092
+  s_f641e31a81af58::t_e732e2e17a6397 263
+  s_f641e31a81af58::t_59286b562d00f3 327-371,376,386,389-398
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "d9d0f56b818caead9b98580d2a2c9e7ab8ce692f",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
