@@ -26,3 +26,4 @@ default = []
 net = { package = "ai2070-net", version = "0.17.0", path = "../../..", default-features = false, features = ["meshos"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 bytes = "1.11"
+serde_json = "1"

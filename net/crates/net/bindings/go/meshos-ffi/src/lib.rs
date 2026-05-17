@@ -69,7 +69,8 @@ use tokio::runtime::Runtime;
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::behavior::meshos::{
-    LoggingDispatcher, MeshOsConfig, MeshOsDaemonHandle as CoreHandle, MeshOsDaemonSdk as CoreSdk,
+    LoggingDispatcher, MaintenanceMirrorSnapshot, MaintenanceStateView, MeshOsConfig,
+    MeshOsDaemonHandle as CoreHandle, MeshOsDaemonSdk as CoreSdk, MetadataView, PeerHealthSnapshot,
     SdkError, DEFAULT_GRACEFUL_SHUTDOWN,
 };
 use net::adapter::net::compute::{
@@ -1136,6 +1137,233 @@ pub extern "C" fn net_meshos_graceful_shutdown(
 }
 
 // =========================================================================
+// Metadata + capability advertisement (slice 2)
+// =========================================================================
+
+/// JSON-render a [`MetadataView`] for cross-FFI transport.
+/// Mirrors the Python binding's `metadata_view_to_dict` shape so
+/// every binding observes the same field names + value
+/// projections.
+fn metadata_view_to_json(view: &MetadataView) -> String {
+    use serde_json::{json, Value};
+    let peers: Vec<Value> = view
+        .peers
+        .iter()
+        .map(|(id, snap)| {
+            json!({
+                "node_id": id,
+                "rtt_ms": snap.rtt_ms,
+                "health": snap.health.map(peer_health_str),
+                "maintenance": snap.maintenance.map(maintenance_mirror_str),
+                "cpu_load_1m": snap.cpu_load_1m,
+                "mem_used_bytes": snap.mem_used_bytes,
+                "mem_total_bytes": snap.mem_total_bytes,
+                "disk_used_bytes": snap.disk_used_bytes,
+                "disk_total_bytes": snap.disk_total_bytes,
+                "saturation_trend": snap.saturation_trend,
+                "capability_set": snap.capability_set.iter().collect::<Vec<_>>(),
+                "software_version": snap.software_version,
+                "forked_from": snap.forked_from,
+            })
+        })
+        .collect();
+    let value = json!({
+        "node_id": view.node_id,
+        "daemon_id": view.daemon_id,
+        "daemon_name": view.daemon_name,
+        "maintenance_state": maintenance_state_to_json(&view.maintenance_state),
+        "peers": peers,
+    });
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".into())
+}
+
+fn maintenance_state_to_json(state: &MaintenanceStateView) -> serde_json::Value {
+    use serde_json::json;
+    match state {
+        MaintenanceStateView::Active => json!({"kind": "active"}),
+        MaintenanceStateView::EnteringMaintenance {
+            since_ms,
+            deadline_remaining_ms,
+        } => json!({
+            "kind": "entering_maintenance",
+            "since_ms": since_ms,
+            "deadline_remaining_ms": deadline_remaining_ms,
+        }),
+        MaintenanceStateView::Maintenance { since_ms } => json!({
+            "kind": "maintenance",
+            "since_ms": since_ms,
+        }),
+        MaintenanceStateView::ExitingMaintenance { since_ms } => json!({
+            "kind": "exiting_maintenance",
+            "since_ms": since_ms,
+        }),
+        MaintenanceStateView::DrainFailed { since_ms, reason } => json!({
+            "kind": "drain_failed",
+            "since_ms": since_ms,
+            "reason": reason,
+        }),
+        MaintenanceStateView::Recovery { since_ms } => json!({
+            "kind": "recovery",
+            "since_ms": since_ms,
+        }),
+        // `MaintenanceStateView` is `#[non_exhaustive]`. Future
+        // variants emit a JSON object with `kind: "unknown"` so
+        // older bindings degrade gracefully instead of failing
+        // to parse.
+        _ => json!({"kind": "unknown"}),
+    }
+}
+
+fn peer_health_str(h: PeerHealthSnapshot) -> &'static str {
+    match h {
+        PeerHealthSnapshot::Healthy => "Healthy",
+        PeerHealthSnapshot::Degraded => "Degraded",
+        PeerHealthSnapshot::Unreachable => "Unreachable",
+        _ => "Unknown",
+    }
+}
+
+fn maintenance_mirror_str(m: MaintenanceMirrorSnapshot) -> &'static str {
+    match m {
+        MaintenanceMirrorSnapshot::Active => "Active",
+        MaintenanceMirrorSnapshot::EnteringMaintenance => "EnteringMaintenance",
+        MaintenanceMirrorSnapshot::Maintenance => "Maintenance",
+        MaintenanceMirrorSnapshot::ExitingMaintenance => "ExitingMaintenance",
+        MaintenanceMirrorSnapshot::DrainFailed => "DrainFailed",
+        MaintenanceMirrorSnapshot::Recovery => "Recovery",
+        _ => "Unknown",
+    }
+}
+
+/// Return a JSON-encoded `MetadataView` snapshot. Caller MUST
+/// release via `net_meshos_free_string`. Returns NULL on NULL
+/// handle or after `graceful_shutdown` (the inner SDK handle is
+/// consumed); last-error populated.
+#[no_mangle]
+pub extern "C" fn net_meshos_metadata(handle: *const NetMeshOsHandle) -> *mut c_char {
+    ffi_guard!(ptr::null_mut(), {
+        let Some(h_ref) = (unsafe { handle.as_ref() }) else {
+            set_last_error("invalid_argument", "handle pointer is NULL");
+            return ptr::null_mut();
+        };
+        let guard = h_ref.inner.lock().unwrap();
+        let Some(inner) = guard.as_ref() else {
+            set_last_error("already_shutdown", "daemon handle was already consumed");
+            return ptr::null_mut();
+        };
+        let json = metadata_view_to_json(inner.metadata());
+        match CString::new(json) {
+            Ok(c) => c.into_raw(),
+            Err(_) => {
+                set_last_error(
+                    "metadata_serialize_failed",
+                    "metadata JSON contained an unexpected NUL byte",
+                );
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Refresh the metadata cache from the runtime's latest snapshot
+/// + re-render. Caller MUST release via `net_meshos_free_string`.
+#[no_mangle]
+pub extern "C" fn net_meshos_refresh_metadata(handle: *mut NetMeshOsHandle) -> *mut c_char {
+    ffi_guard!(ptr::null_mut(), {
+        let Some(h_ref) = (unsafe { handle.as_ref() }) else {
+            set_last_error("invalid_argument", "handle pointer is NULL");
+            return ptr::null_mut();
+        };
+        let mut guard = h_ref.inner.lock().unwrap();
+        let Some(inner) = guard.as_mut() else {
+            set_last_error("already_shutdown", "daemon handle was already consumed");
+            return ptr::null_mut();
+        };
+        let json = metadata_view_to_json(inner.refresh_metadata());
+        match CString::new(json) {
+            Ok(c) => c.into_raw(),
+            Err(_) => {
+                set_last_error(
+                    "metadata_serialize_failed",
+                    "metadata JSON contained an unexpected NUL byte",
+                );
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Free a heap-allocated C string returned by this crate (e.g.
+/// from `net_meshos_metadata`). Idempotent on NULL.
+#[no_mangle]
+pub extern "C" fn net_meshos_free_string(s: *mut c_char) {
+    if s.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = CString::from_raw(s);
+    }
+}
+
+/// Publish a capability advertisement update for this daemon.
+/// `tags_json_ptr` / `tags_json_len` carry a UTF-8 JSON array of
+/// tag strings (`["hardware.gpu", "software.model.foo=…", …]`).
+///
+/// **Stub today.** The substrate's
+/// `MeshOsDaemonHandle::publish_capabilities` returns `Ok(())`
+/// without committing to the capability chain — every binding
+/// surfaces the same stub semantics so consumers don't write
+/// code against a contract the substrate doesn't yet honor.
+/// Cuts over transparently when the substrate's chain commit
+/// lands.
+#[no_mangle]
+pub extern "C" fn net_meshos_publish_capabilities(
+    handle: *mut NetMeshOsHandle,
+    tags_json_ptr: *const c_char,
+    tags_json_len: usize,
+) -> c_int {
+    ffi_guard!(NET_MESHOS_ERR_CALL_FAILED, {
+        let Some(h_ref) = (unsafe { handle.as_ref() }) else {
+            set_last_error("invalid_argument", "handle pointer is NULL");
+            return NET_MESHOS_ERR_NULL;
+        };
+        let guard = h_ref.inner.lock().unwrap();
+        let Some(inner) = guard.as_ref() else {
+            set_last_error("already_shutdown", "daemon handle was already consumed");
+            return NET_MESHOS_ERR_ALREADY_SHUTDOWN;
+        };
+        let mut set = CapabilitySet::new();
+        if tags_json_len > 0 {
+            let Some(s) = cstr_to_string(tags_json_ptr, tags_json_len) else {
+                set_last_error("invalid_argument", "tags_json is not valid UTF-8");
+                return NET_MESHOS_ERR_INVALID_ARG;
+            };
+            let tags: Vec<String> = match serde_json::from_str(&s) {
+                Ok(t) => t,
+                Err(e) => {
+                    set_last_error(
+                        "invalid_argument",
+                        &format!("tags_json must be a JSON array of strings: {e}"),
+                    );
+                    return NET_MESHOS_ERR_INVALID_ARG;
+                }
+            };
+            for tag in tags {
+                set = set.add_tag(tag);
+            }
+        }
+        clear_last_error_inner();
+        match inner.publish_capabilities(set) {
+            Ok(()) => NET_MESHOS_OK,
+            Err(e) => {
+                set_last_error_from_sdk(&e);
+                NET_MESHOS_ERR_CALL_FAILED
+            }
+        }
+    })
+}
+
+// =========================================================================
 // Helpers
 // =========================================================================
 
@@ -1523,6 +1751,106 @@ mod tests {
         let kind = unsafe { CStr::from_ptr(net_meshos_last_error_kind()).to_string_lossy() };
         assert_eq!(kind, "invalid_argument");
         net_meshos_clear_last_error();
+        net_meshos_sdk_shutdown(sdk);
+        net_meshos_sdk_free(sdk);
+    }
+
+    // ---- Slice 2: metadata + publish_capabilities ----
+
+    #[test]
+    fn metadata_returns_json_with_node_id_and_daemon_fields() {
+        let mut sdk: *mut NetMeshOsSdk = ptr::null_mut();
+        assert_eq!(net_meshos_sdk_start(0, 0, 0, 0, 0, &mut sdk), NET_MESHOS_OK);
+
+        let name = "metadata-test";
+        let (name_ptr, name_len) = cstr_ptr(name);
+        let seed = [0x55u8; 32];
+        let mut handle: *mut NetMeshOsHandle = ptr::null_mut();
+        assert_eq!(
+            net_meshos_register_daemon(sdk, name_ptr, name_len, seed.as_ptr(), &mut handle),
+            NET_MESHOS_OK,
+        );
+
+        let json_ptr = net_meshos_metadata(handle);
+        assert!(!json_ptr.is_null());
+        let json_str = unsafe { CStr::from_ptr(json_ptr) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        net_meshos_free_string(json_ptr);
+
+        // Parse + inspect.
+        let v: serde_json::Value = serde_json::from_str(&json_str).expect("metadata JSON parses");
+        assert!(v.get("node_id").is_some(), "metadata missing node_id");
+        let expected_id = EntityKeypair::from_bytes(seed).origin_hash();
+        assert_eq!(v["daemon_id"].as_u64().unwrap(), expected_id);
+        assert_eq!(v["daemon_name"].as_str().unwrap(), "metadata-test");
+        // `maintenance_state` is a tagged object.
+        let kind = v["maintenance_state"]["kind"].as_str().unwrap();
+        assert!(
+            ["active", "entering_maintenance", "maintenance", "exiting_maintenance",
+             "drain_failed", "recovery", "unknown"].contains(&kind),
+            "unexpected maintenance_state kind: {kind}",
+        );
+        // `peers` is always an array (possibly empty in this fixture).
+        assert!(v["peers"].is_array());
+
+        net_meshos_graceful_shutdown(handle, 10);
+        net_meshos_handle_free(handle);
+        net_meshos_sdk_shutdown(sdk);
+        net_meshos_sdk_free(sdk);
+    }
+
+    #[test]
+    fn metadata_after_shutdown_returns_null_with_kind() {
+        let mut sdk: *mut NetMeshOsSdk = ptr::null_mut();
+        assert_eq!(net_meshos_sdk_start(0, 0, 0, 0, 0, &mut sdk), NET_MESHOS_OK);
+        let name = "shutdown-meta";
+        let (name_ptr, name_len) = cstr_ptr(name);
+        let seed = [0x77u8; 32];
+        let mut handle: *mut NetMeshOsHandle = ptr::null_mut();
+        net_meshos_register_daemon(sdk, name_ptr, name_len, seed.as_ptr(), &mut handle);
+        net_meshos_graceful_shutdown(handle, 10);
+        let json_ptr = net_meshos_metadata(handle);
+        assert!(json_ptr.is_null());
+        let kind = unsafe { CStr::from_ptr(net_meshos_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "already_shutdown");
+        net_meshos_clear_last_error();
+        net_meshos_handle_free(handle);
+        net_meshos_sdk_shutdown(sdk);
+        net_meshos_sdk_free(sdk);
+    }
+
+    #[test]
+    fn publish_capabilities_stub_returns_ok() {
+        let mut sdk: *mut NetMeshOsSdk = ptr::null_mut();
+        assert_eq!(net_meshos_sdk_start(0, 0, 0, 0, 0, &mut sdk), NET_MESHOS_OK);
+        let name = "cap-test";
+        let (name_ptr, name_len) = cstr_ptr(name);
+        let seed = [0xAAu8; 32];
+        let mut handle: *mut NetMeshOsHandle = ptr::null_mut();
+        net_meshos_register_daemon(sdk, name_ptr, name_len, seed.as_ptr(), &mut handle);
+
+        let tags = r#"["hardware.gpu", "software.model.foo=llama-3.1-70b"]"#;
+        let (tags_ptr, tags_len) = cstr_ptr(tags);
+        let status = net_meshos_publish_capabilities(handle, tags_ptr, tags_len);
+        assert_eq!(status, NET_MESHOS_OK);
+
+        // Empty / NULL tags also valid → clears advertisement.
+        let status = net_meshos_publish_capabilities(handle, ptr::null(), 0);
+        assert_eq!(status, NET_MESHOS_OK);
+
+        // Malformed JSON → invalid_argument.
+        let bad = r#"not an array"#;
+        let (bad_ptr, bad_len) = cstr_ptr(bad);
+        let status = net_meshos_publish_capabilities(handle, bad_ptr, bad_len);
+        assert_eq!(status, NET_MESHOS_ERR_INVALID_ARG);
+        let kind = unsafe { CStr::from_ptr(net_meshos_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "invalid_argument");
+        net_meshos_clear_last_error();
+
+        net_meshos_graceful_shutdown(handle, 10);
+        net_meshos_handle_free(handle);
         net_meshos_sdk_shutdown(sdk);
         net_meshos_sdk_free(sdk);
     }

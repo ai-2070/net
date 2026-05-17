@@ -441,6 +441,66 @@ int net_meshos_graceful_shutdown(
 );
 
 /* =========================================================================
+ * Metadata + capability advertisement (slice 2)
+ * ========================================================================= */
+
+/* Return a heap-allocated JSON CString rendering of the daemon's
+ * `MetadataView`. Shape:
+ *
+ *   {
+ *     "node_id": <u64>,
+ *     "daemon_id": <u64>,
+ *     "daemon_name": <string>,
+ *     "maintenance_state": {
+ *       "kind": "active"
+ *             | "entering_maintenance" (since_ms, deadline_remaining_ms?)
+ *             | "maintenance" (since_ms)
+ *             | "exiting_maintenance" (since_ms)
+ *             | "drain_failed" (since_ms, reason)
+ *             | "recovery" (since_ms)
+ *             | "unknown",
+ *       ... discriminator-specific fields ...
+ *     },
+ *     "peers": [ { "node_id", "rtt_ms", "health", "maintenance",
+ *                  "cpu_load_1m", "mem_used_bytes", ...
+ *                  "capability_set": [tag, ...] }, ... ]
+ *   }
+ *
+ * Caller MUST release the buffer via `net_meshos_free_string`.
+ * Returns NULL on NULL handle or after `graceful_shutdown`; the
+ * thread-local last-error pair carries the kind. */
+char* net_meshos_metadata(const NetMeshOsHandle* handle);
+
+/* Refresh the metadata cache from the runtime's latest snapshot
+ * and return the freshly-rendered JSON. Same ownership +
+ * lifetime contract as `net_meshos_metadata`. */
+char* net_meshos_refresh_metadata(NetMeshOsHandle* handle);
+
+/* Free a heap-allocated C string returned by this crate (e.g.
+ * from `net_meshos_metadata` / `net_meshos_refresh_metadata`).
+ * Idempotent on NULL. */
+void net_meshos_free_string(char* s);
+
+/* Publish a capability advertisement update for this daemon.
+ * `tags_json_ptr` / `tags_json_len` carry a UTF-8 JSON array of
+ * tag strings, e.g.
+ * `["hardware.gpu", "software.model.foo=llama-3.1-70b"]`. Pass
+ * NULL / 0 to clear the advertisement.
+ *
+ * Stub today — the substrate's
+ * `MeshOsDaemonHandle::publish_capabilities` returns `Ok(())`
+ * without committing to the capability chain. Every binding
+ * surfaces the same stub semantics so consumers don't write
+ * code against a contract the substrate doesn't yet honor.
+ * Cuts over transparently when the substrate's chain commit
+ * lands. */
+int net_meshos_publish_capabilities(
+    NetMeshOsHandle* handle,
+    const char* tags_json_ptr,
+    size_t tags_json_len
+);
+
+/* =========================================================================
  * Last-error trio (thread-local)
  * ========================================================================= */
 

@@ -1890,6 +1890,7 @@ version = "0.17.0"
 dependencies = [
  "ai2070-net",
  "bytes",
+ "serde_json",
  "tokio",
 ]
 
