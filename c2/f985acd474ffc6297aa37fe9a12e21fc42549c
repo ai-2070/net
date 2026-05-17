@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/bug-audit-2026-05-18/PHASE3_UMBRELLA.md
+  s_f641e31a81af58::t_a4e2c2d5b17f9b 4-6,11-14,18,20,24-45,48-49,51,55-63,67-73,76-77,79,81-83,85-88,90,93-94,96,99-100,102,104-123,127-145,149-177,181-190,194-197,201-206
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "c2f985acd474ffc6297aa37fe9a12e21fc42549c",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
