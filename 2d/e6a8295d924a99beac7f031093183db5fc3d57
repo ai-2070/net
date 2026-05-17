@@ -1,0 +1,23 @@
+net/crates/net/bindings/node/index.d.ts
+  s_5af7ced268385a::t_cc061cb6161952 704-715
+net/crates/net/bindings/node/test/meshos.test.ts
+  s_5af7ced268385a::t_7bfdec303e3386 247-271
+net/crates/net/bindings/node/src/meshos.rs
+  s_5af7ced268385a::t_86e3ef4bbc23c4 781-792,796,798-801,809
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "2de6a8295d924a99beac7f031093183db5fc3d57",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
