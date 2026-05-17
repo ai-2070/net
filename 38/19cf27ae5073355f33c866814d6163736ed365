@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_18_NET_CRATE_PLAN.md
+  s_f641e31a81af58::t_014b99c1a8ab32 1-72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "3819cf27ae5073355f33c866814d6163736ed365",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
