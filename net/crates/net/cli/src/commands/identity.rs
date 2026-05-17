@@ -102,11 +102,28 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
         .out
         .unwrap_or_else(|| default_identity_path(operator_id));
 
-    if !args.force && path.exists() {
-        return Err(invalid_args(format!(
-            "identity file already exists at {}; pass --force to overwrite",
-            path.display()
-        )));
+    // `try_exists` distinguishes "file is absent" (Ok(false)) from
+    // "I can't tell because of a permission error" (Err). Pre-fix
+    // `.exists()` followed symlinks and returned false on
+    // permission errors, so a symlink at `path` pointing to a
+    // sensitive file (or a permission-denied stat) silently
+    // skipped the safety gate and we overwrote the target.
+    if !args.force {
+        match tokio::fs::try_exists(&path).await {
+            Ok(true) => {
+                return Err(invalid_args(format!(
+                    "identity file already exists at {}; pass --force to overwrite",
+                    path.display()
+                )));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(generic(format!(
+                    "failed to stat {}: {e}; pass --force to override",
+                    path.display()
+                )));
+            }
+        }
     }
 
     // Ensure the parent directory exists. We deliberately don't

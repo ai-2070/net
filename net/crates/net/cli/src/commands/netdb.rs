@@ -720,11 +720,27 @@ async fn run_snapshot(
     output: Option<OutputFormat>,
     profile_netdb: Option<&std::path::Path>,
 ) -> Result<(), CliError> {
-    if !args.force && args.out.exists() {
-        return Err(crate::error::invalid_args(format!(
-            "{} already exists; pass --force to overwrite",
-            args.out.display()
-        )));
+    // `try_exists` distinguishes Ok(false)=absent from Err=stat
+    // failure; pre-fix `.exists()` followed symlinks and returned
+    // false on permission errors, letting a symlink at `--out`
+    // pointing at a sensitive file or a permission-denied stat
+    // skip the safety gate.
+    if !args.force {
+        match tokio::fs::try_exists(&args.out).await {
+            Ok(true) => {
+                return Err(crate::error::invalid_args(format!(
+                    "{} already exists; pass --force to overwrite",
+                    args.out.display()
+                )));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(generic(format!(
+                    "failed to stat {}: {e}; pass --force to override",
+                    args.out.display()
+                )));
+            }
+        }
     }
     let netdb = open_netdb(args.store.as_deref(), profile_netdb, args.origin, true, true, false).await?;
     let snapshot = netdb
