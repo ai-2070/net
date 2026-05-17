@@ -560,11 +560,15 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-go-${{ hashFiles('**/Cargo.lock') }}
 
-      # The Go bindings link against TWO cdylibs via cgo:
+      # The Go bindings link against FOUR cdylibs via cgo:
       #   - `-lnet` (libnet.so, the main `ai2070-net` crate) from net.go
       #   - `-lnet_compute` (libnet_compute.so, the `net-compute-ffi`
       #     workspace member at bindings/go/compute-ffi) from compute.go
-      # Both end up in `net/crates/net/target/release/`.
+      #   - `-lnet_meshdb` (libnet_meshdb.so, the `net-meshdb-ffi`
+      #     workspace member at bindings/go/meshdb-ffi) from meshdb.go
+      #   - `-lnet_meshos` (libnet_meshos.so, the `net-meshos-ffi`
+      #     workspace member at bindings/go/meshos-ffi) from meshos.go
+      # All four end up in `net/crates/net/target/release/`.
       #
       # Features:
       #   - `ai2070-net` needs `netdb,dataforts,redex-disk,nat-traversal,redis`
@@ -575,14 +579,16 @@ jobs:
       #   - `net-compute-ffi` needs `test-helpers` so the FFI symbol
       #     `net_compute_test_inject_synthetic_peer` (referenced by
       #     `groups_testhelpers.go`) is exported.
+      #   - `net-meshdb-ffi` and `net-meshos-ffi` have no extra features
+      #     beyond their defaults.
       #
       # Built as one cargo invocation so feature unification on the
       # shared `ai2070-net` dep doesn't cause a second compilation pass.
-      - name: Build net + net_compute cdylibs
+      - name: Build net + net_compute + net_meshdb + net_meshos cdylibs
         working-directory: net/crates/net
         run: >
           cargo build --release
-          -p ai2070-net -p net-compute-ffi
+          -p ai2070-net -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi
           --features "ai2070-net/netdb,ai2070-net/dataforts,ai2070-net/redex-disk,ai2070-net/nat-traversal,ai2070-net/redis,net-compute-ffi/test-helpers"
 
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
