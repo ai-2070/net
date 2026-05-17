@@ -1269,7 +1269,7 @@ impl LoadBalancer {
             // adversarial node-id choice (the probe terminates
             // because the ring has at most virtual_nodes * nodes
             // entries, far below u64::MAX).
-            while !self.hash_ring.insert(hash, node_id).is_none() {
+            while self.hash_ring.insert(hash, node_id).is_some() {
                 hash = hash.wrapping_add(1);
             }
         }

@@ -454,6 +454,7 @@ impl RedexFile {
     ///      the local watermark and at-or-below the file's
     ///      current head as a re-delivery — re-apply only if not
     ///      already reflected in derived state.
+    ///
     /// `FsyncPolicy::Never` (heap-only or fire-and-forget disk)
     /// makes the same contract apply to the *in-memory* state on
     /// process restart; persistent files with a non-`Never` policy
