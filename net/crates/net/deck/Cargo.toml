@@ -22,7 +22,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 # Bookmark store at `$XDG_CONFIG_HOME/deck/bookmarks.toml`.
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
-dirs = "5"
+dirs = "6"
 # ISO 8601 timestamps in export filenames so operators can
 # `chrono::DateTime::parse_from_rfc3339` (after the `-` → `:`
 # un-mangle for filename safety) or feed them to JS
