@@ -1,0 +1,20 @@
+net/crates/net/sdk-ts/src/deck.ts
+  s_ac2931afe38c4a::t_250f6e0a446815 9,246,426
+  s_ac2931afe38c4a::t_2ec062a83c3d6f 324,343
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "5fa277f010cfa11f36f1a51b7a01a8c88b946e47",
+  "prompts": {},
+  "sessions": {
+    "s_ac2931afe38c4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59271d48-d72a-4337-b857-962412f18343",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
