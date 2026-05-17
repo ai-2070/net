@@ -1,0 +1,28 @@
+net/crates/net/bindings/python/Cargo.toml
+  s_33e8c099a9039e::t_308fbb70cceed7 24-28,30-31,39-40
+  s_33e8c099a9039e::t_e7b87e32c2b707 20-23,29,32-38,41-43
+net/crates/net/bindings/node/Cargo.toml
+  s_33e8c099a9039e::t_7a33c9c8de7797 19-22,27-29,32-38,41-43
+  s_33e8c099a9039e::t_58a867d67fb042 23-26,30-31,39-40
+net/crates/net/sdk/Cargo.toml
+  s_33e8c099a9039e::t_aefc06dc5eca39 38-39,45-46,49-51,59-60
+  s_33e8c099a9039e::t_7a0560d1e64146 35-37,40-44,47-48,52-58,61
+  s_33e8c099a9039e::t_6ef06648a0ab5f 150-152,165-173
+  s_33e8c099a9039e::t_220fb5bdadc52c 153-164
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "b7746bbed4bfb61e3bfabf6b2bb97a6f3b42e684",
+  "prompts": {},
+  "sessions": {
+    "s_33e8c099a9039e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f5bf814-14c4-4dd9-b249-30bbae94726a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
