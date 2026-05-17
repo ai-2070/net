@@ -594,6 +594,30 @@ async fn run_restore(
             )));
         }
     }
+    // Hard cap on snapshot file size before letting postcard
+    // touch operator-supplied bytes. Postcard is memory-safe but
+    // obeys the decoded `Vec` length prefixes; a crafted `--from`
+    // blob can request multi-GB allocations and OOM the daemon.
+    // 4 GiB is generous for any legitimate snapshot
+    // (`bindings/python/tests/test_netdb.py` exercises this path
+    // with byte-sized blobs); raise the bound here when a real
+    // workload pushes past it.
+    const SNAPSHOT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    let meta = tokio::fs::metadata(&args.from).await.map_err(|e| {
+        generic(format!(
+            "failed to stat snapshot file {}: {e}",
+            args.from.display()
+        ))
+    })?;
+    if meta.len() > SNAPSHOT_MAX_BYTES {
+        return Err(crate::error::invalid_args(format!(
+            "snapshot file {} is {} bytes, exceeds the {} byte ceiling; \
+             pass a smaller snapshot or raise SNAPSHOT_MAX_BYTES",
+            args.from.display(),
+            meta.len(),
+            SNAPSHOT_MAX_BYTES
+        )));
+    }
     let bytes = tokio::fs::read(&args.from).await.map_err(|e| {
         generic(format!(
             "failed to read snapshot file {}: {e}",
