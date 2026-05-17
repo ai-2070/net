@@ -200,7 +200,7 @@ pub async fn run(
             let scope = parse_scope(&args.scope)?;
             let common = args.common;
             run_ice(common, output, config_path, profile_name, move |deck| {
-                deck.ice().flush_avoid_lists(scope.clone())
+                deck.ice().flush_avoid_lists(scope)
             })
             .await
         }
