@@ -234,4 +234,138 @@ d('Deck SDK operator-side bindings (Phase 5 slice 1)', () => {
       await sdk.shutdown();
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Slice 2 — Audit query
+  // -------------------------------------------------------------------------
+
+  it('audit().collect() returns an array even on a fresh runtime', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      const q = client.audit();
+      q.recent(100);
+      const records = q.collect();
+      expect(Array.isArray(records)).toBe(true);
+      for (const r of records) {
+        const parsed = JSON.parse(r);
+        expect(typeof parsed).toBe('object');
+      }
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('audit ring eventually carries a record after admin commit', async () => {
+    // The substrate folds admin commits on a tick (default
+    // 500ms). Configure a fast tick + poll briefly.
+    const sdk = await MeshOsDaemonSdk.start({ tickIntervalMs: 20n });
+    try {
+      const identity = OperatorIdentity.generate();
+      const client = await DeckClient.fromMeshos(sdk, identity);
+      await client.admin.cordon(0xCAFEn);
+      const deadline = Date.now() + 2_000;
+      let parsed: Array<Record<string, unknown>> = [];
+      while (Date.now() < deadline) {
+        const q = client.audit();
+        q.recent(100);
+        const raw = q.collect();
+        if (raw.length > 0) {
+          parsed = raw.map((s) => JSON.parse(s) as Record<string, unknown>);
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      expect(parsed.length).toBeGreaterThan(0);
+      const first = parsed[0];
+      for (const key of ['seq', 'committed_at_ms', 'event', 'operator_ids', 'outcome']) {
+        expect(first).toHaveProperty(key);
+      }
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('audit query accepts every filter combination', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      const q = client.audit();
+      q.recent(10);
+      q.byOperator(0x123n);
+      q.between(0n, 2_000_000_000_000n);
+      q.forceOnly();
+      q.since(0n);
+      const records = q.collect();
+      expect(Array.isArray(records)).toBe(true);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Slice 2 — Log + Failure streams
+  // -------------------------------------------------------------------------
+
+  it('subscribeLogs() returns a stream with close support', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      const stream = await client.subscribeLogs();
+      await stream.close();
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('subscribeLogs() accepts a typed filter dict', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      const stream = await client.subscribeLogs({
+        minLevel: 'warn',
+        sinceSeq: 0n,
+      });
+      await stream.close();
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('subscribeLogs() rejects invalid level with invalid_log_level kind', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      try {
+        await client.subscribeLogs({ minLevel: 'verbose' as never });
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(parseKind(e)).toBe('invalid_log_level');
+      }
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('subscribeFailures() returns a stream with close support', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      const stream = await client.subscribeFailures(0n);
+      await stream.close();
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('subscribeFailures() defaults sinceSeq to 0n', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      const stream = await client.subscribeFailures();
+      await stream.close();
+    } finally {
+      await sdk.shutdown();
+    }
+  });
 });

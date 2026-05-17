@@ -35,10 +35,13 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use net::adapter::net::behavior::deck::{
-    AdminCommands as CoreAdminCommands, ChainCommit as CoreChainCommit, DeckClient as CoreClient,
-    DeckClientConfig as CoreConfig, DeckError, OperatorIdentity as CoreIdentity,
+    AdminCommands as CoreAdminCommands, AuditQuery as CoreAuditQuery,
+    AuditStream as CoreAuditStream, ChainCommit as CoreChainCommit, DeckClient as CoreClient,
+    DeckClientConfig as CoreConfig, DeckError, FailureStream as CoreFailureStream,
+    LogFilter as CoreLogFilter, LogStream as CoreLogStream, OperatorIdentity as CoreIdentity,
     SnapshotStream as CoreSnapshotStream, StatusSummary, StatusSummaryStream as CoreStatusStream,
 };
+use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::EntityKeypair;
 
 use futures::StreamExt;
@@ -534,6 +537,370 @@ impl DeckClient {
     pub async fn status_summary_stream(&self) -> StatusSummaryStream {
         StatusSummaryStream {
             inner: tokio::sync::Mutex::new(Some(self.client.status_summary_stream())),
+        }
+    }
+
+    /// Audit query builder. Returns an `AuditQuery` whose chain
+    /// methods (`recent` / `byOperator` / `between` / `forceOnly`
+    /// / `since`) configure the filter; `collect()` returns a list
+    /// of JSON strings and `stream()` returns a sync iterator
+    /// (resolved through `nextRecord()`).
+    #[napi]
+    pub fn audit(&self) -> AuditQuery {
+        AuditQuery {
+            client: self.client.clone(),
+            recent_limit: None,
+            by_operator: None,
+            between: None,
+            force_only: false,
+            since: None,
+        }
+    }
+
+    /// Subscribe to per-daemon / per-node log records.
+    /// `filter` is an optional `LogFilterJs` object — every
+    /// field is optional and missing fields match every record.
+    /// Same runtime-context requirement as `snapshots`.
+    #[napi]
+    pub async fn subscribe_logs(&self, filter: Option<LogFilterJs>) -> Result<LogStream> {
+        let core_filter = match filter {
+            Some(f) => f.into_core()?,
+            None => CoreLogFilter::default(),
+        };
+        Ok(LogStream {
+            inner: tokio::sync::Mutex::new(Some(self.client.subscribe_logs(core_filter))),
+        })
+    }
+
+    /// Subscribe to executor failure records starting from
+    /// `since_seq + 1`. Pass `0n` (or omit) to start from
+    /// whatever is still in the ring.
+    #[napi]
+    pub async fn subscribe_failures(
+        &self,
+        since_seq: Option<BigInt>,
+    ) -> Result<FailureStream> {
+        let seq = match since_seq {
+            Some(bi) => crate::common::bigint_u64(bi)
+                .map_err(|e| deck_err("invalid_argument", format!("sinceSeq: {}", e.reason)))?,
+            None => 0,
+        };
+        Ok(FailureStream {
+            inner: tokio::sync::Mutex::new(Some(self.client.subscribe_failures(seq))),
+        })
+    }
+}
+
+// =========================================================================
+// Slice 2 — LogFilter POJO
+// =========================================================================
+
+/// Optional fields for filtering the log stream. Every field is
+/// optional; missing fields match every record.
+#[napi(object)]
+pub struct LogFilterJs {
+    /// `"trace"` | `"debug"` | `"info"` | `"warn"` | `"error"`.
+    pub min_level: Option<String>,
+    pub daemon_id: Option<BigInt>,
+    pub node_id: Option<BigInt>,
+    pub since_seq: Option<BigInt>,
+}
+
+impl LogFilterJs {
+    fn into_core(self) -> Result<CoreLogFilter> {
+        let mut f = CoreLogFilter::default();
+        if let Some(s) = self.min_level {
+            f.min_level = Some(parse_log_level_str(&s)?);
+        }
+        if let Some(bi) = self.daemon_id {
+            f.daemon_id = Some(
+                crate::common::bigint_u64(bi)
+                    .map_err(|e| deck_err("invalid_filter", format!("daemonId: {}", e.reason)))?,
+            );
+        }
+        if let Some(bi) = self.node_id {
+            f.node_id = Some(
+                crate::common::bigint_u64(bi)
+                    .map_err(|e| deck_err("invalid_filter", format!("nodeId: {}", e.reason)))?,
+            );
+        }
+        if let Some(bi) = self.since_seq {
+            f.since_seq = Some(
+                crate::common::bigint_u64(bi)
+                    .map_err(|e| deck_err("invalid_filter", format!("sinceSeq: {}", e.reason)))?,
+            );
+        }
+        Ok(f)
+    }
+}
+
+fn parse_log_level_str(s: &str) -> Result<CoreLogLevel> {
+    Ok(match s {
+        "trace" | "TRACE" | "Trace" => CoreLogLevel::Trace,
+        "debug" | "DEBUG" | "Debug" => CoreLogLevel::Debug,
+        "info" | "INFO" | "Info" => CoreLogLevel::Info,
+        "warn" | "WARN" | "Warn" | "warning" | "WARNING" => CoreLogLevel::Warn,
+        "error" | "ERROR" | "Error" => CoreLogLevel::Error,
+        other => {
+            return Err(deck_err(
+                "invalid_log_level",
+                format!(
+                    "log level must be one of trace|debug|info|warn|error; got {other:?}"
+                ),
+            ));
+        }
+    })
+}
+
+fn log_level_to_str(level: CoreLogLevel) -> &'static str {
+    match level {
+        CoreLogLevel::Trace => "trace",
+        CoreLogLevel::Debug => "debug",
+        CoreLogLevel::Info => "info",
+        CoreLogLevel::Warn => "warn",
+        CoreLogLevel::Error => "error",
+        _ => "unknown",
+    }
+}
+
+// =========================================================================
+// Slice 2 — LogRecord + FailureRecord wire forms
+// =========================================================================
+
+#[napi(object)]
+pub struct LogRecordJs {
+    pub seq: BigInt,
+    pub ts_ms: BigInt,
+    pub level: String,
+    pub daemon_id: Option<BigInt>,
+    pub node_id: Option<BigInt>,
+    pub message: String,
+}
+
+fn log_record_to_js(record: &net::adapter::net::behavior::meshos::LogRecord) -> LogRecordJs {
+    LogRecordJs {
+        seq: BigInt::from(record.seq),
+        ts_ms: BigInt::from(record.ts_ms),
+        level: log_level_to_str(record.level).to_string(),
+        daemon_id: record.daemon_id.map(BigInt::from),
+        node_id: record.node_id.map(BigInt::from),
+        message: record.message.clone(),
+    }
+}
+
+#[napi(object)]
+pub struct FailureRecordJs {
+    pub seq: BigInt,
+    pub source: String,
+    pub reason: String,
+    pub recorded_at_ms: BigInt,
+}
+
+fn failure_record_to_js(
+    record: &net::adapter::net::behavior::meshos::FailureRecord,
+) -> FailureRecordJs {
+    FailureRecordJs {
+        seq: BigInt::from(record.seq),
+        source: record.source.clone(),
+        reason: record.reason.clone(),
+        recorded_at_ms: BigInt::from(record.recorded_at_ms),
+    }
+}
+
+// =========================================================================
+// Slice 2 — Log + Failure + Audit streams
+// =========================================================================
+
+#[napi]
+pub struct LogStream {
+    inner: tokio::sync::Mutex<Option<CoreLogStream>>,
+}
+
+#[napi]
+impl LogStream {
+    /// Resolve to the next log record, or `null` when the stream
+    /// closes.
+    #[napi]
+    pub async fn next_record(&self) -> Result<Option<LogRecordJs>> {
+        let mut guard = self.inner.lock().await;
+        let stream = match guard.as_mut() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        match stream.next().await {
+            Some(Ok(r)) => Ok(Some(log_record_to_js(&r))),
+            Some(Err(e)) => Err(deck_err_from(e)),
+            None => Ok(None),
+        }
+    }
+
+    /// Close the stream. Subsequent `nextRecord()` calls resolve
+    /// to `null`.
+    #[napi]
+    pub async fn close(&self) {
+        *self.inner.lock().await = None;
+    }
+}
+
+#[napi]
+pub struct FailureStream {
+    inner: tokio::sync::Mutex<Option<CoreFailureStream>>,
+}
+
+#[napi]
+impl FailureStream {
+    #[napi]
+    pub async fn next_record(&self) -> Result<Option<FailureRecordJs>> {
+        let mut guard = self.inner.lock().await;
+        let stream = match guard.as_mut() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        match stream.next().await {
+            Some(Ok(r)) => Ok(Some(failure_record_to_js(&r))),
+            Some(Err(e)) => Err(deck_err_from(e)),
+            None => Ok(None),
+        }
+    }
+
+    #[napi]
+    pub async fn close(&self) {
+        *self.inner.lock().await = None;
+    }
+}
+
+#[napi]
+pub struct AuditStream {
+    inner: tokio::sync::Mutex<Option<CoreAuditStream>>,
+}
+
+#[napi]
+impl AuditStream {
+    /// Resolve to the next audit record as a JSON string, or
+    /// `null` when the stream closes. The TS wrapper parses the
+    /// JSON into a native object.
+    #[napi]
+    pub async fn next_record(&self) -> Result<Option<String>> {
+        let mut guard = self.inner.lock().await;
+        let stream = match guard.as_mut() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        match stream.next().await {
+            Some(Ok(r)) => serde_json::to_string(&r)
+                .map(Some)
+                .map_err(|e| deck_err("audit_serialize_failed", e.to_string())),
+            Some(Err(e)) => Err(deck_err_from(e)),
+            None => Ok(None),
+        }
+    }
+
+    #[napi]
+    pub async fn close(&self) {
+        *self.inner.lock().await = None;
+    }
+}
+
+// =========================================================================
+// Slice 2 — AuditQuery (fluent builder)
+// =========================================================================
+
+/// Fluent admin-audit query builder. Chain `recent` / `byOperator`
+/// / `between` / `forceOnly` / `since` before calling `collect()`
+/// (eager list of JSON strings) or `stream()` (async iterator).
+#[napi]
+pub struct AuditQuery {
+    client: Arc<CoreClient>,
+    recent_limit: Option<u32>,
+    by_operator: Option<u64>,
+    between: Option<(u64, u64)>,
+    force_only: bool,
+    since: Option<u64>,
+}
+
+impl AuditQuery {
+    fn build<'a>(&self, client: &'a CoreClient) -> CoreAuditQuery<'a> {
+        let mut q = client.audit();
+        if let Some(n) = self.recent_limit {
+            q = q.recent(n as usize);
+        }
+        if let Some(op) = self.by_operator {
+            q = q.by_operator(op);
+        }
+        if let Some((start, end)) = self.between {
+            q = q.between(start, end);
+        }
+        if self.force_only {
+            q = q.force_only();
+        }
+        if let Some(s) = self.since {
+            q = q.since(s);
+        }
+        q
+    }
+}
+
+#[napi]
+impl AuditQuery {
+    #[napi]
+    pub fn recent(&mut self, limit: u32) {
+        self.recent_limit = Some(limit);
+    }
+
+    #[napi]
+    pub fn by_operator(&mut self, operator_id: BigInt) -> Result<()> {
+        self.by_operator = Some(
+            crate::common::bigint_u64(operator_id)
+                .map_err(|e| deck_err("invalid_argument", format!("operatorId: {}", e.reason)))?,
+        );
+        Ok(())
+    }
+
+    #[napi]
+    pub fn between(&mut self, start_ms: BigInt, end_ms: BigInt) -> Result<()> {
+        let start = crate::common::bigint_u64(start_ms)
+            .map_err(|e| deck_err("invalid_argument", format!("startMs: {}", e.reason)))?;
+        let end = crate::common::bigint_u64(end_ms)
+            .map_err(|e| deck_err("invalid_argument", format!("endMs: {}", e.reason)))?;
+        self.between = Some((start, end));
+        Ok(())
+    }
+
+    #[napi]
+    pub fn force_only(&mut self) {
+        self.force_only = true;
+    }
+
+    #[napi]
+    pub fn since(&mut self, seq: BigInt) -> Result<()> {
+        self.since = Some(
+            crate::common::bigint_u64(seq)
+                .map_err(|e| deck_err("invalid_argument", format!("since: {}", e.reason)))?,
+        );
+        Ok(())
+    }
+
+    /// Eager — returns a list of JSON-encoded audit records. The
+    /// TS wrapper parses each entry into a native object.
+    #[napi]
+    pub fn collect(&self) -> Result<Vec<String>> {
+        let client = self.client.clone();
+        let records = self.build(&client).collect();
+        let mut out = Vec::with_capacity(records.len());
+        for r in records {
+            out.push(serde_json::to_string(&r).map_err(|e| {
+                deck_err("audit_serialize_failed", e.to_string())
+            })?);
+        }
+        Ok(out)
+    }
+
+    /// Returns an `AuditStream` for sync iteration over JSON-
+    /// encoded audit records.
+    #[napi]
+    pub async fn stream(&self) -> AuditStream {
+        AuditStream {
+            inner: tokio::sync::Mutex::new(Some(self.build(&self.client).stream())),
         }
     }
 }

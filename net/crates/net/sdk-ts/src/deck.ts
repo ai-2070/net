@@ -37,12 +37,19 @@
 
 import {
   AdminCommands as NapiAdmin,
+  AuditQuery as NapiAuditQuery,
+  AuditStream as NapiAuditStream,
   DeckClient as NapiClient,
+  FailureStream as NapiFailureStream,
+  LogStream as NapiLogStream,
   OperatorIdentity,
   SnapshotStream as NapiSnapshotStream,
   StatusSummaryStream as NapiStatusStream,
   type ChainCommitJs,
   type DeckClientConfigJs,
+  type FailureRecordJs,
+  type LogFilterJs,
+  type LogRecordJs,
   type StatusSummaryJs,
 } from '@ai2070/net';
 
@@ -367,5 +374,262 @@ export class DeckClient {
     AsyncIterable<StatusSummary> & { close: () => Promise<void> }
   > {
     return statusSummariesToAsyncIterable(await this.raw.statusSummaryStream());
+  }
+
+  // =========================================================================
+  // Slice 2 — audit + logs + failures
+  // =========================================================================
+
+  /**
+   * Fluent admin-audit query builder. Chain `.recent(n)` /
+   * `.byOperator(id)` / `.between(start, end)` / `.forceOnly()` /
+   * `.since(seq)` before calling `.collect()` (eager list of
+   * parsed audit records) or `.stream()` (`AsyncIterable`).
+   */
+  audit(): AuditQuery {
+    return new AuditQuery(this.raw.audit());
+  }
+
+  /**
+   * Subscribe to the runtime's log ring. Returns an
+   * `AsyncIterable<LogRecord>`. Filter fields are all optional
+   * — missing fields match every record.
+   */
+  async subscribeLogs(
+    filter?: LogFilter,
+  ): Promise<AsyncIterable<LogRecord> & { close: () => Promise<void> }> {
+    return rethrowAsync(async () => {
+      const raw = await this.raw.subscribeLogs(
+        filter ? toNapiLogFilter(filter) : null,
+      );
+      return logStreamToAsyncIterable(raw);
+    });
+  }
+
+  /**
+   * Subscribe to the executor failure ring starting at
+   * `sinceSeq + 1`. Pass `0n` (or omit) to start from whatever
+   * is still in the ring.
+   */
+  async subscribeFailures(
+    sinceSeq?: bigint,
+  ): Promise<AsyncIterable<FailureRecord> & { close: () => Promise<void> }> {
+    return rethrowAsync(async () => {
+      const raw = await this.raw.subscribeFailures(sinceSeq);
+      return failureStreamToAsyncIterable(raw);
+    });
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Slice 2 — typed envelopes
+// ----------------------------------------------------------------------------
+
+export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error';
+
+export interface LogFilter {
+  minLevel?: LogLevel;
+  daemonId?: bigint;
+  nodeId?: bigint;
+  sinceSeq?: bigint;
+}
+
+function toNapiLogFilter(f: LogFilter): LogFilterJs {
+  return {
+    minLevel: f.minLevel,
+    daemonId: f.daemonId,
+    nodeId: f.nodeId,
+    sinceSeq: f.sinceSeq,
+  };
+}
+
+export interface LogRecord {
+  seq: bigint;
+  tsMs: bigint;
+  level: LogLevel;
+  daemonId: bigint | null;
+  nodeId: bigint | null;
+  message: string;
+}
+
+function logRecordFromJs(r: LogRecordJs): LogRecord {
+  return {
+    seq: r.seq,
+    tsMs: r.tsMs,
+    level: r.level as LogLevel,
+    daemonId: r.daemonId ?? null,
+    nodeId: r.nodeId ?? null,
+    message: r.message,
+  };
+}
+
+export interface FailureRecord {
+  seq: bigint;
+  source: string;
+  reason: string;
+  recordedAtMs: bigint;
+}
+
+function failureRecordFromJs(r: FailureRecordJs): FailureRecord {
+  return {
+    seq: r.seq,
+    source: r.source,
+    reason: r.reason,
+    recordedAtMs: r.recordedAtMs,
+  };
+}
+
+// `AdminAuditRecord` carries a nested `AdminEvent` enum which is
+// JSON-shaped at the binding boundary. Type loosely; per-variant
+// typed envelopes can land in a future slice when consumers ask.
+export type AdminAuditRecord = Record<string, unknown>;
+
+// ----------------------------------------------------------------------------
+// Slice 2 — Log + Failure AsyncIterable wrappers
+// ----------------------------------------------------------------------------
+
+function logStreamToAsyncIterable(
+  raw: NapiLogStream,
+): AsyncIterable<LogRecord> & { close: () => Promise<void> } {
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        async next(): Promise<IteratorResult<LogRecord>> {
+          try {
+            const item = await raw.nextRecord();
+            if (item === null) return { value: undefined, done: true };
+            return { value: logRecordFromJs(item), done: false };
+          } catch (e) {
+            throw DeckSdkError.fromCaught(e);
+          }
+        },
+        async return(): Promise<IteratorResult<LogRecord>> {
+          await raw.close();
+          return { value: undefined, done: true };
+        },
+      };
+    },
+    async close() {
+      await raw.close();
+    },
+  };
+}
+
+function failureStreamToAsyncIterable(
+  raw: NapiFailureStream,
+): AsyncIterable<FailureRecord> & { close: () => Promise<void> } {
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        async next(): Promise<IteratorResult<FailureRecord>> {
+          try {
+            const item = await raw.nextRecord();
+            if (item === null) return { value: undefined, done: true };
+            return { value: failureRecordFromJs(item), done: false };
+          } catch (e) {
+            throw DeckSdkError.fromCaught(e);
+          }
+        },
+        async return(): Promise<IteratorResult<FailureRecord>> {
+          await raw.close();
+          return { value: undefined, done: true };
+        },
+      };
+    },
+    async close() {
+      await raw.close();
+    },
+  };
+}
+
+function auditStreamToAsyncIterable(
+  raw: NapiAuditStream,
+): AsyncIterable<AdminAuditRecord> & { close: () => Promise<void> } {
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        async next(): Promise<IteratorResult<AdminAuditRecord>> {
+          try {
+            const json = await raw.nextRecord();
+            if (json === null) return { value: undefined, done: true };
+            return { value: JSON.parse(json) as AdminAuditRecord, done: false };
+          } catch (e) {
+            throw DeckSdkError.fromCaught(e);
+          }
+        },
+        async return(): Promise<IteratorResult<AdminAuditRecord>> {
+          await raw.close();
+          return { value: undefined, done: true };
+        },
+      };
+    },
+    async close() {
+      await raw.close();
+    },
+  };
+}
+
+// ----------------------------------------------------------------------------
+// Slice 2 — AuditQuery fluent builder
+// ----------------------------------------------------------------------------
+
+/**
+ * Fluent admin-audit query builder.
+ *
+ * @example
+ * ```ts
+ * const records = await client.audit()
+ *   .recent(100)
+ *   .byOperator(operatorId)
+ *   .forceOnly()
+ *   .collect();
+ *
+ * for await (const record of (await client.audit().since(lastSeq).stream())) {
+ *   handle(record);
+ * }
+ * ```
+ */
+export class AuditQuery {
+  constructor(private readonly raw: NapiAuditQuery) {}
+
+  recent(limit: number): AuditQuery {
+    this.raw.recent(limit);
+    return this;
+  }
+
+  byOperator(operatorId: bigint): AuditQuery {
+    this.raw.byOperator(operatorId);
+    return this;
+  }
+
+  between(startMs: bigint, endMs: bigint): AuditQuery {
+    this.raw.between(startMs, endMs);
+    return this;
+  }
+
+  forceOnly(): AuditQuery {
+    this.raw.forceOnly();
+    return this;
+  }
+
+  since(seq: bigint): AuditQuery {
+    this.raw.since(seq);
+    return this;
+  }
+
+  /** Eager — returns a list of audit records (JSON-parsed into
+   * native objects). */
+  async collect(): Promise<AdminAuditRecord[]> {
+    return rethrowAsync(async () => {
+      const raw = this.raw.collect();
+      return raw.map((s) => JSON.parse(s) as AdminAuditRecord);
+    });
+  }
+
+  /** Async iterator over audit records. */
+  async stream(): Promise<
+    AsyncIterable<AdminAuditRecord> & { close: () => Promise<void> }
+  > {
+    return rethrowAsync(async () => auditStreamToAsyncIterable(await this.raw.stream()));
   }
 }

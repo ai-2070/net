@@ -18,6 +18,70 @@ export declare class AdminCommands {
 }
 
 /**
+ * Fluent admin-audit query builder. Chain `recent` / `byOperator`
+ * / `between` / `forceOnly` / `since` before calling `collect()`
+ * (eager list of JSON strings) or `stream()` (async iterator).
+ */
+export declare class AuditQuery {
+  recent(limit: number): void
+  byOperator(operatorId: bigint): void
+  between(startMs: bigint, endMs: bigint): void
+  forceOnly(): void
+  since(seq: bigint): void
+  /**
+   * Eager — returns a list of JSON-encoded audit records. The
+   * TS wrapper parses each entry into a native object.
+   */
+  collect(): Array<string>
+  /**
+   * Returns an `AuditStream` for sync iteration over JSON-
+   * encoded audit records.
+   */
+  stream(): Promise<AuditStream>
+}
+
+export declare class AuditStream {
+  /**
+   * Resolve to the next audit record as a JSON string, or
+   * `null` when the stream closes. The TS wrapper parses the
+   * JSON into a native object.
+   */
+  nextRecord(): Promise<string | null>
+  close(): Promise<void>
+}
+
+/** Typed handle to a single content-addressed blob. */
+export declare class BlobRef {
+  /**
+   * Construct from `(uri, hash, size)`. `hash` MUST be exactly
+   * 32 bytes; throws otherwise. The version byte is auto-set to
+   * v1 on construction.
+   */
+  constructor(uri: string, hash: Buffer, size: bigint)
+  get version(): number
+  get uri(): string
+  /**
+   * 32-byte BLAKE3 hash. For Small (the only variant the Node
+   * constructor produces today); v0.2 will surface chunked
+   * manifests via a separate accessor.
+   */
+  get hash(): Buffer
+  get size(): bigint
+  /**
+   * Wire-encoded form (discriminator + version + hash + size + uri).
+   * Pass this as the payload to `RedexFile.append` / `Mesh.publish`.
+   */
+  encode(): Buffer
+  /**
+   * Parse a wire-encoded form. Throws when the bytes do not
+   * start with the discriminator (use `isBlobRef(bytes)` first
+   * to peek without throwing) or when the frame is malformed /
+   * unsupported-version.
+   */
+  static fromEncoded(bytes: Buffer): BlobRef
+}
+
+/**
  * Handle returned by [`DaemonRuntime::spawn`]. Identifies a
  * specific daemon by its `origin_hash`; cloning the JS object
  * shares the same underlying daemon. Dropping the handle does
@@ -317,6 +381,32 @@ export declare class DeckClient {
    * requirement as `snapshots`.
    */
   statusSummaryStream(): Promise<StatusSummaryStream>
+  /**
+   * Audit query builder. Returns an `AuditQuery` whose chain
+   * methods (`recent` / `byOperator` / `between` / `forceOnly`
+   * / `since`) configure the filter; `collect()` returns a list
+   * of JSON strings and `stream()` returns a sync iterator
+   * (resolved through `nextRecord()`).
+   */
+  audit(): AuditQuery
+  /**
+   * Subscribe to per-daemon / per-node log records.
+   * `filter` is an optional `LogFilterJs` object — every
+   * field is optional and missing fields match every record.
+   * Same runtime-context requirement as `snapshots`.
+   */
+  subscribeLogs(filter?: LogFilterJs | undefined | null): Promise<LogStream>
+  /**
+   * Subscribe to executor failure records starting from
+   * `since_seq + 1`. Pass `0n` (or omit) to start from
+   * whatever is still in the ring.
+   */
+  subscribeFailures(sinceSeq?: bigint | undefined | null): Promise<FailureStream>
+}
+
+export declare class FailureStream {
+  nextRecord(): Promise<FailureRecordJs | null>
+  close(): Promise<void>
 }
 
 export declare class ForkGroup {
@@ -394,6 +484,33 @@ export declare class Identity {
   get tokenCacheLen(): number
 }
 
+/**
+ * In-process `ChainReader` Node wrapper. Slice 1 ships the
+ * in-memory variant; populate via `.append(originHash, seq,
+ * payload)` then hand to `MeshQueryRunner`. Phase B+ will
+ * expose a `fromRedex(...)` adapter.
+ */
+export declare class InMemoryChainReader {
+  constructor()
+  /** Append a single event to the in-memory store. */
+  append(originHash: bigint, seq: bigint, payload: Buffer): void
+  /** Tip of chain `originHash`, or `null` if unknown. */
+  latestSeq(originHash: bigint): bigint | null
+}
+
+export declare class LogStream {
+  /**
+   * Resolve to the next log record, or `null` when the stream
+   * closes.
+   */
+  nextRecord(): Promise<LogRecordJs | null>
+  /**
+   * Close the stream. Subsequent `nextRecord()` calls resolve
+   * to `null`.
+   */
+  close(): Promise<void>
+}
+
 /** Typed memories adapter handle. */
 export declare class MemoriesAdapter {
   /**
@@ -467,6 +584,85 @@ export declare class MemoryWatchIter {
   next(): Promise<Array<Memory> | null>
   /** Terminate the iterator early. Idempotent. */
   close(): void
+}
+
+/**
+ * Substrate-owned blob storage adapter. Stores chunks as
+ * content-addressed `RedexFile`s and rides the existing
+ * per-chunk replication runtime for cross-node placement.
+ *
+ * Mirrors the Python `MeshBlobAdapter` class. The async
+ * methods (`store` / `fetch` / `fetchRange` / `exists`) run
+ * the substrate's tokio runtime under napi's `tokio_rt`
+ * feature; the JS event loop isn't blocked.
+ */
+export declare class MeshBlobAdapter {
+  /**
+   * Construct the adapter. `redex` must outlive the adapter
+   * (the napi class holds an `Arc` clone internally so this
+   * is automatic). `adapterId` surfaces in the Prometheus
+   * body's `adapter=...` label.
+   */
+  constructor(redex: Redex, adapterId: string, options?: MeshBlobAdapterOptions | undefined | null)
+  /** Adapter identity tag — surfaces in the Prometheus body. */
+  get adapterId(): string
+  /**
+   * Store `data` under the content-address declared by
+   * `blobRef`. Verifies `blake3(data) == blobRef.hash`
+   * before persisting; mismatches throw `"blob: ..."`.
+   * Idempotent on identical bytes.
+   */
+  store(blobRef: BlobRef, data: Buffer): Promise<void>
+  /**
+   * Fetch the content-addressed bytes for `blobRef`.
+   * Verifies BLAKE3 against the supplied hash; throws on
+   * mismatch or missing content.
+   */
+  fetch(blobRef: BlobRef): Promise<Buffer>
+  /**
+   * Fetch a half-open `[start, end)` byte range. The
+   * substrate does NOT verify partial fetches against the
+   * full-content hash — callers accept the trade-off.
+   */
+  fetchRange(blobRef: BlobRef, start: bigint, end: bigint): Promise<Buffer>
+  /**
+   * Probe local presence. Returns `true` when every chunk of
+   * `blobRef` is locally reachable.
+   */
+  exists(blobRef: BlobRef): Promise<boolean>
+  /**
+   * Render the adapter's Prometheus text body. Includes the
+   * v0.2 counter family + the v0.3 overflow counter family.
+   */
+  prometheusText(): string
+  /**
+   * True iff the adapter is currently advertising
+   * `dataforts.blob.overflow` and accepting inbound
+   * `OverflowPush` requests.
+   */
+  get overflowEnabled(): boolean
+  /**
+   * True iff the most recent overflow tick observed local
+   * disk at or above the high-water threshold. Tracks
+   * `dataforts_blob_overflow_active`.
+   */
+  get overflowActive(): boolean
+  /**
+   * Snapshot the current overflow configuration. Returns a
+   * plain JS object with the typed knobs.
+   */
+  get overflowConfig(): OverflowConfigJs
+  /**
+   * Flip the overflow master switch at runtime. The
+   * adapter's next capability rebroadcast adds (or removes)
+   * the `dataforts.blob.overflow` tag.
+   */
+  setOverflowEnabled(enabled: boolean): void
+  /**
+   * Replace the entire overflow configuration. Useful for
+   * atomic enable + tune in one call.
+   */
+  setOverflowConfig(config: OverflowConfigJs): void
 }
 
 export declare class MeshOsDaemonHandle {
@@ -563,6 +759,150 @@ export declare class MeshOsDaemonSdk {
    * method calls throw `already_shutdown`.
    */
   shutdown(): Promise<void>
+}
+
+/**
+ * 1:1 AST factory surface. Construct via static methods that
+ * mirror the Rust `OperatorPlan` variants. Internally carries
+ * a fully-planned `OperatorNode`; slice 1 exposes only the
+ * atomic operators that don't need planner-side resolution.
+ */
+export declare class MeshQuery {
+  /** Read the event at `seq` from chain `originHash`. */
+  static at(originHash: bigint, seq: bigint): MeshQuery
+  /** Read events in the half-open seq range `[start, end)`. */
+  static between(originHash: bigint, start: bigint, end: bigint): MeshQuery
+  /** Read the tip event from chain `originHash`. */
+  static latest(originHash: bigint): MeshQuery
+  /**
+   * Start a fluent builder. Equivalent to constructing a
+   * fresh [`QueryBuilder`]; chainable methods (`at`,
+   * `between`, `latest`, `filter`, `count`, `sum`, `avg`,
+   * `min`, `max`, `percentile`, `distinctCount`, `window`,
+   * `join`) compose into a final `MeshQuery` via `.build()`.
+   */
+  static builder(): MeshQuery
+  /**
+   * Filter `inner`'s rows by `predicate`. The executor builds
+   * a synthetic per-row tag view (origin / seq / flat JSON
+   * payload fields) and evaluates the predicate; rows whose
+   * evaluation returns `true` pass through unchanged. Rows
+   * whose payload isn't JSON are still filterable by their
+   * row-intrinsic fields (`origin`, `seq`); payload field
+   * references against a non-JSON payload simply don't match.
+   */
+  static filter(inner: MeshQuery, predicate: Predicate): MeshQuery
+  /**
+   * Tumbling window on `seq` with the given bucket `size`.
+   * Emits one sentinel row per non-empty bucket; decode via
+   * `ResultRow.decodeWindow()`.
+   */
+  static window(inner: MeshQuery, size: bigint): MeshQuery
+  /**
+   * Count rows. `groupBy` is an optional list of row-
+   * intrinsic field names: `null` / `[]` = single bucket;
+   * `["origin"]`, `["seq"]`, or `["origin", "seq"]` for
+   * per-group counts.
+   */
+  static count(inner: MeshQuery, groupBy?: Array<string> | undefined | null): MeshQuery
+  /**
+   * Sum of a numeric field across rows. `field` is a row-
+   * intrinsic name (`origin` / `seq`) or a dotted JSON path.
+   */
+  static sum(inner: MeshQuery, field: string, groupBy?: Array<string> | undefined | null): MeshQuery
+  /**
+   * Arithmetic mean. Rows where the field is missing /
+   * non-numeric are excluded from both numerator + denom.
+   */
+  static avg(inner: MeshQuery, field: string, groupBy?: Array<string> | undefined | null): MeshQuery
+  /** Minimum value of a numeric field. */
+  static min(inner: MeshQuery, field: string, groupBy?: Array<string> | undefined | null): MeshQuery
+  /** Maximum value of a numeric field. */
+  static max(inner: MeshQuery, field: string, groupBy?: Array<string> | undefined | null): MeshQuery
+  /**
+   * Nearest-rank exact percentile at `p ∈ [0.0, 1.0]`. Same
+   * field-extraction semantics as the numeric aggregates.
+   */
+  static percentile(inner: MeshQuery, field: string, p: number, groupBy?: Array<string> | undefined | null): MeshQuery
+  /**
+   * Exact distinct count over the canonical string
+   * projection of a row-intrinsic / JSON field.
+   */
+  static distinctCount(inner: MeshQuery, field: string, groupBy?: Array<string> | undefined | null): MeshQuery
+  /**
+   * Inner / outer hash- or sort-merge-join. `kind` is one of
+   * `"inner"` / `"left_outer"` / `"right_outer"` /
+   * `"full_outer"`. `key` is the field name both sides share
+   * — row-intrinsic names (`origin` / `seq` / `origin,seq`)
+   * map to the typed enum; anything else is treated as a
+   * JSON payload path. `strategy` defaults to
+   * `"hash_broadcast"` (alternatives: `"sort_merge"`).
+   * `watermarkSecs` is informational under snapshot
+   * semantics.
+   */
+  static join(left: MeshQuery, right: MeshQuery, kind: string, key: string, strategy?: string | undefined | null, watermarkSecs?: number | undefined | null): MeshQuery
+  /**
+   * Emit a pre-walked lineage as one row per entry. `entries`
+   * is a list of `LineageEntry` in walk order; `direction` is
+   * `"back"` or `"forward"`. Each entry emits a `ResultRow`
+   * with `originHash = entry.originHash`, `seq = entry.tipSeq
+   * ?? 0`, payload empty. Compose with `at` / `between` to
+   * fetch event content for each chain.
+   */
+  static lineageEmit(originHash: bigint, entries: Array<LineageEntry>, direction: string): MeshQuery
+}
+
+/**
+ * Runs queries against a [`InMemoryChainReader`] via the
+ * substrate's `LocalMeshQueryExecutor`. Async by design —
+ * `execute()` returns a `MeshQueryStream` whose `next()` is
+ * async. The TS-side wrapper layers `Symbol.asyncIterator`
+ * so callers can `for await (const row of stream)`.
+ */
+export declare class MeshQueryRunner {
+  /**
+   * Build a runner. `enableCache` wires the Phase F LRU
+   * (default: false). Capability-version source is hard-
+   * wired to `0` while there's no `CapabilityIndex` plumbed
+   * (slice 1 is local-executor-only).
+   */
+  constructor(reader: InMemoryChainReader, enableCache?: boolean | undefined | null)
+  /**
+   * Execute `query`. Returns a stream whose `next()` yields
+   * the next [`ResultRow`] (or `null` on EOF). The full row
+   * list is drained at execute time and buffered inside the
+   * stream; true row-by-row streaming lands when a consumer
+   * needs it.
+   */
+  execute(query: MeshQuery, options?: ExecuteOptions | undefined | null): Promise<MeshQueryStream>
+}
+
+/**
+ * Pull-based row stream. The JS-side TS shim adds
+ * `Symbol.asyncIterator` over this; raw callers can use
+ * `await stream.next()` in a loop themselves.
+ */
+export declare class MeshQueryStream {
+  /**
+   * The next row, or `null` on end-of-stream. Idempotent
+   * post-EOF — repeated calls keep returning `null`.
+   */
+  next(): Promise<ResultRow | null>
+  /**
+   * Drain the remaining rows into a list. Convenience for
+   * callers that don't want to write the `await next()`
+   * loop. Subsequent `.next()` calls return `null`.
+   */
+  toArray(): Promise<Array<ResultRow>>
+  /**
+   * Discard any remaining rows immediately, freeing the
+   * backing buffer. Used by the AsyncIterable `return()` /
+   * `throw()` hooks so a `for await (...) { if (...) break; }`
+   * loop releases the result vector promptly instead of
+   * holding it pinned on the AsyncMutex until JS GC fires.
+   * Subsequent `.next()` calls return `null`.
+   */
+  release(): Promise<void>
 }
 
 /**
@@ -1050,6 +1390,104 @@ export declare class NetMesh {
   unregisterPlacementFilter(id: string): boolean
   /** Whether `id` is currently registered. Mainly for tests. */
   hasPlacementFilter(id: string): boolean
+  /**
+   * NAT classification for this mesh, as a stable string:
+   * `"open" | "cone" | "symmetric" | "unknown"`. `unknown`
+   * is the pre-classification state; classification runs
+   * in the background after `start()` once ≥2 peers are
+   * connected.
+   */
+  natType(): string
+  /**
+   * This mesh's public-facing `ip:port` as observed by a
+   * remote peer, or `null` before classification has
+   * produced an observation. Rides on outbound capability
+   * announcements so peers can attempt direct connects
+   * without a separate discovery round-trip.
+   */
+  reflexAddr(): string | null
+  /**
+   * NAT classification most recently advertised by
+   * `peer_node_id` (parsed from the `nat:*` tag on their
+   * capability announcement). Returns `"unknown"` when
+   * the peer hasn't announced. The pair-type matrix
+   * treats Unknown as "attempt direct, fall back on
+   * failure," never "don't attempt."
+   */
+  peerNatType(peerNodeId: bigint): string
+  /**
+   * Send one reflex probe to `peer_node_id` and resolve
+   * with the public `ip:port` the peer observed on the
+   * probe's UDP envelope. Useful for tests and for
+   * diagnosing misclassifications.
+   *
+   * Rejects with an `Error` whose `message` follows the
+   * `traversal: <kind>[: <detail>]` convention (kinds:
+   * `reflex-timeout`, `peer-not-reachable`, `transport`).
+   */
+  probeReflex(peerNodeId: bigint): Promise<string>
+  /**
+   * Explicitly re-run the classification sweep. Normally
+   * the background loop handles this; call this after a
+   * suspected NAT rebind (e.g. gateway reboot) to
+   * accelerate re-classification. No-op when fewer than
+   * 2 peers are connected. Never rejects.
+   */
+  reclassifyNat(): Promise<void>
+  /**
+   * Cumulative NAT-traversal counters for this mesh.
+   * Object shape: `{ punchesAttempted, punchesSucceeded,
+   * relayFallbacks }` — all u64 bigints, monotonic, never
+   * reset. Useful for telemetry on punch success rate and
+   * relay load.
+   */
+  traversalStats(): TraversalStats
+  /**
+   * Establish a session to `peer_node_id` via the
+   * rendezvous path. The pair-type matrix decides between
+   * a direct handshake and a relay-coordinated punch;
+   * either way the returned session is equivalent in
+   * correctness to `connect()`.
+   *
+   * **Optimization, not correctness.** `connect_direct`
+   * always resolves (on punch-failed, the session is
+   * established via the routed-handshake fallback).
+   * Inspect `traversal_stats()` afterward to distinguish
+   * a successful punch from a relay fallback.
+   *
+   * Rejects with `traversal: peer-not-reachable` when we
+   * have no cached reflex for `peer_node_id`, or
+   * `traversal: transport: ...` on a socket-level
+   * handshake error.
+   */
+  connectDirect(peerNodeId: bigint, peerPublicKey: Buffer, coordinator: bigint): Promise<void>
+  /**
+   * Install a runtime reflex override. Forces `natType()`
+   * to `"open"` and `reflexAddr()` to `external`
+   * immediately, short-circuiting any further classifier
+   * sweeps. Runtime counterpart of the `reflexOverride`
+   * option passed at `create()` time — useful when a
+   * port-forward goes live mid-session or when a stage-4
+   * port-mapping task has just installed a mapping.
+   *
+   * **Optimization, not correctness.** Nodes without an
+   * override still reach every peer via the routed-
+   * handshake path.
+   *
+   * `external` is an `"ip:port"` string — rejects with
+   * `invalid reflex override` if it fails to parse.
+   */
+  setReflexOverride(external: string): void
+  /**
+   * Drop a previously-installed reflex override. The
+   * classifier resumes on its normal cadence;
+   * `reflexAddr()` clears to `null` immediately so a
+   * between-sweep read doesn't return a stale override.
+   *
+   * No-op when no override is active — safe to call
+   * unconditionally on shutdown or revoke paths.
+   */
+  clearReflexOverride(): void
 }
 
 /**
@@ -1080,6 +1518,64 @@ export declare class OperatorIdentity {
    */
   static fromIdentity(identity: Identity): OperatorIdentity
   get operatorId(): bigint
+}
+
+/**
+ * Fluent builder for the common-ops query shape. Each
+ * chainable method returns a fresh builder so callers can
+ * write
+ *
+ * ```ts
+ * const q = MeshQuery.builder()
+ *   .between(0xCDn, 0n, 100n)
+ *   .filter(predicateEquals('severity', 'high'))
+ *   .count(null)
+ *   .build();
+ * ```
+ *
+ * Source operators (`at` / `between` / `latest`) seed the
+ * pipeline; pipeline operators require a seeded state and
+ * surface a `MeshDbError` when called on an empty builder.
+ * `.build()` consumes the builder into a `MeshQuery`.
+ */
+export declare class QueryBuilder {
+  /** Source: read a single event. Resets any prior state. */
+  at(originHash: bigint, seq: bigint): QueryBuilder
+  /**
+   * Source: read events in the half-open seq range. Resets
+   * any prior state.
+   */
+  between(originHash: bigint, start: bigint, end: bigint): QueryBuilder
+  /** Source: read the tip event. Resets any prior state. */
+  latest(originHash: bigint): QueryBuilder
+  /** Filter the current pipeline's rows. */
+  filter(predicate: Predicate): QueryBuilder
+  /** Count rows in the current pipeline. */
+  count(groupBy?: Array<string> | undefined | null): QueryBuilder
+  /** Sum of a numeric field. */
+  sum(field: string, groupBy?: Array<string> | undefined | null): QueryBuilder
+  /** Arithmetic mean of a numeric field. */
+  avg(field: string, groupBy?: Array<string> | undefined | null): QueryBuilder
+  /** Min over a numeric field. */
+  min(field: string, groupBy?: Array<string> | undefined | null): QueryBuilder
+  /** Max over a numeric field. */
+  max(field: string, groupBy?: Array<string> | undefined | null): QueryBuilder
+  /** Nearest-rank percentile. */
+  percentile(field: string, p: number, groupBy?: Array<string> | undefined | null): QueryBuilder
+  /** Exact distinct count. */
+  distinctCount(field: string, groupBy?: Array<string> | undefined | null): QueryBuilder
+  /** Tumbling window on `seq` with the given bucket `size`. */
+  window(size: bigint): QueryBuilder
+  /**
+   * Join the current pipeline with `right`. See
+   * [`MeshQuery::join`] for full parameter docs.
+   */
+  join(right: MeshQuery, kind: string, key: string, strategy?: string | undefined | null, watermarkSecs?: number | undefined | null): QueryBuilder
+  /**
+   * Terminal: consume the builder into a `MeshQuery`.
+   * Surfaces `MeshDbError` when the builder has no source.
+   */
+  build(): MeshQuery
 }
 
 /**
@@ -1685,6 +2181,84 @@ export interface AcceleratorJs {
 }
 
 /**
+ * Decoded aggregate-row payload (slice 2 decoder).
+ *
+ * `kind` is one of `"count"` / `"sum"` / `"avg"` / `"min"` /
+ * `"max"` / `"distinct_count"` / `"percentile"`. `value` is the
+ * numeric output (always set for count / distinct_count;
+ * `null` for the others when the group held no numeric rows).
+ * `count` mirrors `value` as a BigInt for the count-flavored
+ * kinds so callers don't have to coerce floats.
+ */
+export interface AggregateResult {
+  group?: GroupKey
+  kind: string
+  value?: number
+  count?: bigint
+}
+
+/** Snapshot of currently-registered adapter ids. */
+export declare function blobAdapterIds(): Array<string>
+
+/** True if `adapterId` resolves to a registered adapter. */
+export declare function blobAdapterRegistered(adapterId: string): boolean
+
+/**
+ * Write `data` to the registered adapter and return the encoded
+ * BlobRef bytes — drop these straight into `RedexFile.append` or
+ * `Mesh.publish` as the event payload.
+ */
+export declare function blobPublish(adapterId: string, uri: string, data: Buffer): Promise<Buffer>
+
+/**
+ * Resolve `payload` to its content bytes. Inline payloads come
+ * back as-is; encoded-BlobRef payloads route through the adapter
+ * registered under `adapterId`, fetch + verify, and return the
+ * resolved bytes.
+ */
+export declare function blobResolve(adapterId: string, payload: Buffer): Promise<Buffer>
+
+/**
+ * Cache policy as a tagged plain-object shape. `kind` is one
+ * of `"permanent"` (cache until LRU eviction; use only when
+ * the query's result is immutable under substrate semantics)
+ * or `"time_bound"` (TTL expiry, `ttlSeconds` defaults to
+ * 5 s per the locked Phase F join-watermark mirror).
+ *
+ * Construct via the [`cachePolicyPermanent`] /
+ * [`cachePolicyTimeBound`] module-level factories for
+ * type-safe defaults, or build the object literal directly
+ * if you're sure about the shape.
+ */
+export interface CachePolicy {
+  /**
+   * `"permanent"` or `"time_bound"`. Unknown kinds map to
+   * the default `TimeBound(5s)`.
+   */
+  kind: string
+  /**
+   * TTL in seconds (only meaningful when `kind ==
+   * "time_bound"`). Omitted / non-finite → 5 s.
+   */
+  ttlSeconds?: number
+}
+
+/**
+ * Build a `"permanent"` cache policy object. Equivalent to
+ * `{ kind: "permanent" }`.
+ */
+export declare function cachePolicyPermanent(): CachePolicy
+
+/**
+ * Build a `"time_bound"` cache policy object. `seconds`
+ * defaults to 5 s when omitted. Negative or non-finite
+ * values are rejected at the factory (Python / Go behave the
+ * same way); the converter at execute-time no longer rewrites
+ * silently.
+ */
+export declare function cachePolicyTimeBound(seconds?: number | undefined | null): CachePolicy
+
+/**
  * Per-call options. All fields are optional; defaults match the
  * inner [`InnerCallOptions::default()`].
  */
@@ -1947,10 +2521,68 @@ export interface DaemonStatsJs {
   snapshotsTaken: bigint
 }
 
+/**
+ * JS-side config for `Redex.enableGravityForGreedy`. Locked
+ * Phase-4 defaults — `DATAFORTS_PLAN.md` § Phase 4. All fields
+ * optional; omit any to keep the substrate default.
+ */
+export interface DataGravityConfigJs {
+  /**
+   * Whether the counter + emission cycle is active. Default
+   * `true`; pass `false` to keep the policy carried but
+   * suppress emissions.
+   */
+  enabled?: boolean
+  /**
+   * Re-emission threshold ratio. Range `[1.01, 10.0]`. Default
+   * `2.0`.
+   */
+  emitThresholdRatio?: number
+  /**
+   * Decay half-life in seconds. Default `1800` (30 min).
+   * `BigInt` so values match the Python `u64` / Go `uint64`
+   * shape; u32 here would overflow at ~136 years which is
+   * silly but the cross-binding parity matters more.
+   */
+  decayHalfLifeSecs?: bigint
+  /**
+   * Tick interval for the gravity tick task, in milliseconds.
+   * Default `500`. `BigInt` for parity with Python u64 / Go
+   * uint64; a u32 ms field overflows at ~49 days.
+   */
+  tickIntervalMs?: bigint
+  /**
+   * Wire normalization reference rate. Higher value = wider
+   * dynamic range on the `[0.0, 1.0]` wire encoding for heat
+   * tags. Default `1000.0`.
+   */
+  normalizationReferenceRate?: number
+}
+
 export interface DeckClientConfigJs {
   snapshotPollIntervalMs?: bigint
   iceSignatureThreshold?: number
 }
+
+/**
+ * Try to decode `row.payload` as an aggregate payload.
+ * Returns `null` for rows that aren't aggregate sentinels.
+ */
+export declare function decodeAggregate(row: ResultRow): AggregateResult | null
+
+/**
+ * Try to decode `row.payload` as a joined-row payload.
+ * Returns `null` when the bytes don't deserialize as a
+ * JoinedRow.
+ */
+export declare function decodeJoined(row: ResultRow): JoinedRow | null
+
+/**
+ * Try to decode `row.payload` as a window bucket. Returns
+ * `null` when the bytes don't deserialize as a
+ * WindowBoundary.
+ */
+export declare function decodeWindow(row: ResultRow): WindowBoundary | null
 
 /**
  * Delegate a token to a new subject. The `parent_bytes` token must
@@ -1973,6 +2605,23 @@ export interface EventBusOptions {
   jetstream?: JetStreamOptions
   /** Net adapter configuration for encrypted UDP transport */
   net?: NetOptions
+}
+
+/**
+ * Per-execute options. `bypassCache` skips both lookup AND
+ * writeback (Phase F decision); `cachePolicy` defaults to
+ * `TimeBound(5s)` when omitted.
+ */
+export interface ExecuteOptions {
+  bypassCache?: boolean
+  cachePolicy?: CachePolicy
+}
+
+export interface FailureRecordJs {
+  seq: bigint
+  source: string
+  reason: string
+  recordedAtMs: bigint
 }
 
 export interface ForkGroupConfigJs {
@@ -2011,6 +2660,65 @@ export interface GpuInfoJs {
 }
 
 /**
+ * JS-side config for `Redex.enableGreedyDataforts`. Locked
+ * Phase-1 defaults — `DATAFORTS_PLAN.md` § Phase 1. All fields
+ * optional; omit any to keep the substrate default.
+ */
+export interface GreedyConfigJs {
+  /**
+   * Scope filter — chains whose `scope:` tag matches any of
+   * these admit. Empty / omitted admits regardless of scope.
+   */
+  scopes?: Array<string>
+  /**
+   * Maximum acceptable RTT to the chain's home node, in
+   * milliseconds. Default `200`.
+   */
+  proximityMaxRttMs?: number
+  /**
+   * Per-channel byte cap on the cache substrate. Default
+   * `100 * 1024 * 1024` (100 MiB). Floor `1 * 1024 * 1024`.
+   */
+  perChannelCapBytes?: bigint
+  /**
+   * Total byte cap across every channel. LRU eviction drives
+   * toward this bound. Default `10 * 1024 * 1024 * 1024` (10
+   * GiB).
+   */
+  totalCapBytes?: bigint
+  /**
+   * I/O budget as a fraction of measured NIC peak.
+   * Range `(0.0, 1.0]`. Default `0.25`.
+   */
+  bandwidthBudgetFraction?: number
+  /**
+   * Override for the NIC peak (bytes/sec) the bandwidth budget
+   * computes against. Default falls back to 1 Gbps. Deployments
+   * on faster NICs should set this explicitly to avoid the
+   * `bandwidth` reason saturating the admit_rejected counter
+   * under normal load.
+   */
+  nicPeakBytesPerS?: bigint
+  /**
+   * Maximum in-flight `observe_event` tasks. Default `1024`.
+   * Floor 1. Past this many spawned tasks the observer drops
+   * events with a metric increment rather than blocking the
+   * mesh inbound hot path.
+   */
+  observerInflightCap?: number
+  /**
+   * Intent-match policy. One of `"disabled"` /
+   * `"any_of_local_capabilities"` (default) / `"strict"`.
+   */
+  intentMatch?: string
+  /**
+   * Colocation policy. One of `"ignore"` / `"soft_preference"`
+   * (default) / `"strict_required"`.
+   */
+  colocationPolicy?: string
+}
+
+/**
  * Aggregate group health. Matches the core `GroupHealth` enum
  * as a tagged object so TS callers can discriminate on `status`.
  */
@@ -2031,6 +2739,17 @@ export interface GroupHealthJs {
 export interface GroupHostConfigJs {
   autoSnapshotInterval?: bigint
   maxLogEntries?: number
+}
+
+/**
+ * Group-key identifier carried inside an `AggregateResult`.
+ * `kind` is `"origin"` / `"seq"` / `"origin_seq"`; the
+ * populated field(s) match the kind.
+ */
+export interface GroupKey {
+  kind: string
+  originHash?: bigint
+  seq?: bigint
 }
 
 export interface HardwareJs {
@@ -2063,6 +2782,12 @@ export interface IngestResult {
   timestamp: number
 }
 
+/**
+ * Peek the first byte to determine whether `bytes` is a wire-
+ * encoded BlobRef. Cheap; no decode, no allocation.
+ */
+export declare function isBlobRef(bytes: Buffer): boolean
+
 /** NATS JetStream adapter configuration. */
 export interface JetStreamOptions {
   /** NATS server URL (e.g., "nats://localhost:4222") */
@@ -2081,6 +2806,89 @@ export interface JetStreamOptions {
   maxAgeMs?: number
   /** Number of stream replicas (default: 1) */
   replicas?: number
+}
+
+/**
+ * Decoded join-row payload (slice 2 decoder). Either side is
+ * `null` for outer-join unmatched rows; inner-join rows have
+ * both populated.
+ */
+export interface JoinedRow {
+  left?: ResultRow
+  right?: ResultRow
+}
+
+/** Args handed to the JS `fetch` / `exists` functions. */
+export interface JsBlobFetchArgs {
+  uri: string
+  hash: Buffer
+  size: bigint
+}
+
+/** Args handed to the JS `fetchRange` function. */
+export interface JsBlobFetchRangeArgs {
+  uri: string
+  hash: Buffer
+  size: bigint
+  start: bigint
+  end: bigint
+}
+
+/** Args handed to the JS `store` function. */
+export interface JsBlobStoreArgs {
+  uri: string
+  hash: Buffer
+  size: bigint
+  data: Buffer
+}
+
+/**
+ * One chain reached during a lineage walk. Pre-walked by the
+ * caller and handed to `MeshQuery.lineageEmit(...)`. The SDK
+ * doesn't itself walk the `fork-of:` graph — that needs a
+ * `CapabilityIndex`, which isn't plumbed through the Node
+ * runner yet. Callers maintain their own graph view and emit
+ * entries in walk order: index 0 is the start origin with
+ * `depth = 0n`; ancestors / descendants follow.
+ */
+export interface LineageEntry {
+  /** Chain origin hash (substrate `u64`). */
+  originHash: bigint
+  /**
+   * Hops from the walk's start. `0n` for the start origin.
+   * Substrate-side this is a `u32`; values outside that range
+   * are rejected at the `lineageEmit` factory. BigInt for
+   * shape parity with the other id-like fields on this
+   * struct.
+   */
+  depth: bigint
+  /**
+   * Best-known tip seq for this chain, if any. Surfaces in
+   * the emitted row's `seq` field (defaults to `0` when
+   * absent).
+   */
+  tipSeq?: bigint
+}
+
+/**
+ * Optional fields for filtering the log stream. Every field is
+ * optional; missing fields match every record.
+ */
+export interface LogFilterJs {
+  /** `"trace"` | `"debug"` | `"info"` | `"warn"` | `"error"`. */
+  minLevel?: string
+  daemonId?: bigint
+  nodeId?: bigint
+  sinceSeq?: bigint
+}
+
+export interface LogRecordJs {
+  seq: bigint
+  tsMs: bigint
+  level: string
+  daemonId?: bigint
+  nodeId?: bigint
+  message: string
 }
 
 /**
@@ -2146,6 +2954,27 @@ export interface MemoryFilter {
   updatedBeforeNs?: bigint
   orderBy?: MemoriesOrderBy
   limit?: number
+}
+
+/**
+ * Options for the `MeshBlobAdapter` constructor. Both fields
+ * optional — defaults match the Rust + Python bindings (no
+ * persistence, no overflow).
+ */
+export interface MeshBlobAdapterOptions {
+  /**
+   * Opt every per-chunk file into disk persistence. Default
+   * `false` (in-memory). Requires the underlying `Redex` to
+   * have been constructed with `{ persistentDir: ... }`.
+   */
+  persistent?: boolean
+  /**
+   * Active-overflow initial config. Pass `{ enabled: true }`
+   * to opt in at defaults; pass a full
+   * [`OverflowConfigJs`] to tune. Omit entirely for the v0.2
+   * pull-only posture (the default).
+   */
+  overflow?: OverflowConfigJs
 }
 
 /** Configuration for creating a MeshNode. */
@@ -2384,6 +3213,54 @@ export interface NetStreamStats {
 export declare function normalizeGpuVendor(vendor: string): string
 
 /**
+ * Operator-tunable knobs for the v0.3 active-overflow controller.
+ * Mirrors the Rust [`InnerOverflowConfig`] shape. Pass at
+ * construction via [`MeshBlobAdapter::new`]'s `overflow` option,
+ * or replace at runtime via [`MeshBlobAdapter::setOverflowConfig`].
+ *
+ * Every field except `enabled` is optional — omit any knob to
+ * inherit the Rust-side default. Matches the Go and Python
+ * bindings' partial-config posture. Pass `{ enabled: true }` to
+ * turn overflow on with all-default thresholds; pass
+ * `{ enabled: true, highWaterRatio: 0.90 }` to override one knob.
+ */
+export interface OverflowConfigJs {
+  /**
+   * Master switch. `false` = adapter never pushes, never
+   * advertises the `dataforts.blob.overflow` capability tag,
+   * never accepts inbound `OverflowPush` requests. Default
+   * for new adapters.
+   */
+  enabled: boolean
+  /**
+   * Disk usage ratio at or above which the overflow tick
+   * fires. Default `0.85`.
+   */
+  highWaterRatio?: number
+  /**
+   * Disk usage ratio at or below which the controller
+   * re-enters the inactive state. Hysteresis band between
+   * `lowWaterRatio` and `highWaterRatio` preserves the
+   * prior active state. Default `0.70`.
+   */
+  lowWaterRatio?: number
+  /**
+   * Per-tick push budget. Each push opens a chunk channel
+   * with replication armed; this caps the bandwidth burst.
+   * Default `16`.
+   */
+  maxPushesPerTick?: number
+  /**
+   * Topology scope bound on push-target selection: one of
+   * `"node"` / `"zone"` / `"region"` / `"mesh"`. Default
+   * `"mesh"`.
+   */
+  scope?: string
+  /** Tick cadence in milliseconds. Default `30000`. */
+  tickIntervalMs?: number
+}
+
+/**
  * Parse a serialized `PermissionToken`. Throws `token:
  * invalid_format` on bad length / structure; the signature is NOT
  * verified here (use [`verify_token`] or `installToken` for that).
@@ -2452,6 +3329,82 @@ export interface PollResponse {
   /** Whether there are more events available */
   hasMore: boolean
 }
+
+/**
+ * Tagged predicate object. `kind` discriminates the variant;
+ * the field set is the union of all variants' inputs (each
+ * variant uses a subset). Build with the module-level
+ * `predicate*` helpers — manual object literals work too if
+ * you're sure about the field set.
+ *
+ * Field paths target the synthetic `Dataforts` axis: a
+ * row-intrinsic name like `"origin"` / `"seq"` resolves to the
+ * row's intrinsic; a JSON path like `"severity"` or `"a.b.c"`
+ * resolves to the flattened JSON-object payload.
+ */
+export interface Predicate {
+  /**
+   * Variant discriminator. One of: `exists` / `equals` /
+   * `numeric_at_least` / `numeric_at_most` /
+   * `numeric_in_range` / `string_prefix` / `string_matches`
+   * / `semver_at_least` / `and` / `or` / `not`.
+   */
+  kind: string
+  /** Field name (axis-tag predicates). */
+  field?: string
+  /** String value (equals). */
+  value?: string
+  /** Numeric threshold (numeric_at_least / numeric_at_most). */
+  threshold?: number
+  /** Range lower bound (numeric_in_range). */
+  min?: number
+  /** Range upper bound (numeric_in_range). */
+  max?: number
+  /** String prefix (string_prefix). */
+  prefix?: string
+  /** String pattern (string_matches). */
+  pattern?: string
+  /** Version literal (semver_at_least). */
+  version?: string
+  /**
+   * Child predicates (and / or / not — `not` uses a 1-element
+   * list).
+   */
+  children?: Array<Predicate>
+}
+
+/** Conjunction. Empty list evaluates to `true` (vacuous match). */
+export declare function predicateAnd(children: Array<Predicate>): Predicate
+
+/** `field == value` (string equality). */
+export declare function predicateEquals(field: string, value: string): Predicate
+
+/** Field is present (any value). */
+export declare function predicateExists(field: string): Predicate
+
+/** Negation. */
+export declare function predicateNot(child: Predicate): Predicate
+
+/** `field >= threshold` (numeric). */
+export declare function predicateNumericAtLeast(field: string, threshold: number): Predicate
+
+/** `field <= threshold` (numeric). */
+export declare function predicateNumericAtMost(field: string, threshold: number): Predicate
+
+/** `min <= field <= max`. */
+export declare function predicateNumericInRange(field: string, min: number, max: number): Predicate
+
+/** Disjunction. Empty list evaluates to `false`. */
+export declare function predicateOr(children: Array<Predicate>): Predicate
+
+/** `field >= version` (semver). */
+export declare function predicateSemverAtLeast(field: string, version: string): Predicate
+
+/** Substring `pattern` in `field`. */
+export declare function predicateStringMatches(field: string, pattern: string): Predicate
+
+/** `field.startsWith(prefix)`. */
+export declare function predicateStringPrefix(field: string, prefix: string): Predicate
 
 /** Publish-fanout config, mirror of the core `PublishConfig`. */
 export interface PublishConfigJs {
@@ -2558,6 +3511,51 @@ export interface RedisOptions {
   maxStreamLen?: number
 }
 
+/**
+ * Register a JS-implemented BlobAdapter whose methods return
+ * Promises. The four function args MUST be JS functions returning
+ * `Promise<...>` of the per-method shape:
+ *
+ * - `storeFn({ uri, hash, size, data }) -> Promise<void>`
+ * - `fetchFn({ uri, hash, size }) -> Promise<Buffer>`
+ * - `fetchRangeFn({ uri, hash, size, start, end }) -> Promise<Buffer>`
+ * - `existsFn({ uri, hash, size }) -> Promise<boolean>`
+ *
+ * The substrate awaits each Promise from a tokio task; the JS
+ * event loop drives resolution. Per-call `timeoutMs` defaults to
+ * 30 s (the same as the sync bridge) and is the **total budget**
+ * across both stages — JS returning the Promise, and the Promise
+ * resolving. Pass `null` / omit to keep the default.
+ *
+ * Rejected Promises collapse to `BlobError::Backend(reason)`.
+ */
+export declare function registerAsyncBlobAdapter(id: string, storeFn: (arg: JsBlobStoreArgs) => Promise<undefined>, fetchFn: (arg: JsBlobFetchArgs) => Promise<Buffer>, fetchRangeFn: (arg: JsBlobFetchRangeArgs) => Promise<Buffer>, existsFn: (arg: JsBlobFetchArgs) => Promise<boolean>, timeoutMs?: number | undefined | null): void
+
+/**
+ * Register a JS-implemented BlobAdapter. The four function args
+ * MUST be sync JS functions returning the per-method shape:
+ *
+ * - `storeFn({ uri, hash, size, data }) -> void`
+ * - `fetchFn({ uri, hash, size }) -> Buffer`
+ * - `fetchRangeFn({ uri, hash, size, start, end }) -> Buffer`
+ * - `existsFn({ uri, hash, size }) -> boolean`
+ *
+ * JS-thrown errors collapse to `BlobError::Backend(err)`. Per-call
+ * `timeoutMs` defaults to 30 s; longer-running adapters should be
+ * implemented in Rust. Pass `null` / omit to keep the default.
+ *
+ * For Promise-returning JS methods, use
+ * [`register_async_blob_adapter`] instead.
+ */
+export declare function registerBlobAdapter(id: string, storeFn: (arg: JsBlobStoreArgs) => void, fetchFn: (arg: JsBlobFetchArgs) => Buffer, fetchRangeFn: (arg: JsBlobFetchRangeArgs) => Buffer, existsFn: (arg: JsBlobFetchArgs) => boolean, timeoutMs?: number | undefined | null): void
+
+/**
+ * Register a filesystem-backed BlobAdapter under `adapterId`.
+ * `root` is the on-disk directory the adapter content-addresses
+ * blobs under. Throws if `adapterId` is already in use.
+ */
+export declare function registerFilesystemBlobAdapter(adapterId: string, root: string): void
+
 export interface ReplicaGroupConfigJs {
   /** Desired number of replicas. Must be ≥ 1. */
   replicaCount: number
@@ -2630,6 +3628,27 @@ export interface RequestContextJs {
   routingKey?: string
   sessionId?: string
   requestId?: string
+}
+
+/**
+ * One row from a query result.
+ *
+ * `originHash` is the 16-hex chain identifier; `seq` is the
+ * per-chain monotonic sequence; `payload` is opaque bytes
+ * (event body for plain reads, or a postcard-encoded envelope
+ * for aggregate / join / window sentinel rows — see the
+ * `decodeAggregate` / `decodeJoined` / `decodeWindow`
+ * module-level helpers).
+ *
+ * Plain object (not a class) so it can be nested inside
+ * `WindowBoundary.rows` / `JoinedRow.left` etc. without the
+ * `Vec<ResultRow>` marshalling restriction that
+ * `#[napi]` classes carry.
+ */
+export interface ResultRow {
+  originHash: bigint
+  seq: bigint
+  payload: Buffer
 }
 
 /**
@@ -2900,8 +3919,61 @@ export interface ToolJs {
 }
 
 /**
+ * Cumulative NAT-traversal counters surfaced via
+ * `NetMesh.traversalStats()`. All counters are monotonic u64s
+ * and never reset — subtract snapshots for deltas. Exposed as
+ * BigInt because JavaScript numbers can't round-trip full u64.
+ *
+ * Framing reminder (plan §5): NAT traversal is an optimization,
+ * not a connectivity requirement. `relay_fallbacks` isn't a
+ * failure counter — it counts `connect_direct` resolutions that
+ * stayed on the routed-handshake path, which is always
+ * available regardless of NAT shape.
+ */
+export interface TraversalStats {
+  /**
+   * Number of hole-punch attempts the pair-type matrix
+   * elected to initiate. Bumps once per attempt, whether the
+   * punch eventually succeeds or falls back.
+   */
+  punchesAttempted: bigint
+  /**
+   * Subset of attempts that produced a direct session.
+   * Always `<= punchesAttempted`; the difference is the
+   * punch-failure rate.
+   */
+  punchesSucceeded: bigint
+  /**
+   * Number of `connect_direct` resolutions that stayed on
+   * the routed-handshake path — matrix-skipped pairs plus
+   * punch-failed attempts. Every `connect_direct` that
+   * doesn't establish a directly-punched session increments
+   * this counter.
+   */
+  relayFallbacks: bigint
+}
+
+/**
+ * Remove an adapter registration. Returns `true` if an adapter
+ * was removed, `false` if no adapter was registered under that id.
+ */
+export declare function unregisterBlobAdapter(adapterId: string): boolean
+
+/**
  * Verify a serialized token's signature. Returns `true` on valid.
  * Time-bound validity is a separate check — use [`token_is_expired`]
  * for that.
  */
 export declare function verifyToken(bytes: Buffer): boolean
+
+/**
+ * Decoded window-bucket payload (slice 2 decoder). `start`
+ * and `end` are the bucket's seq bounds (half-open); `rows`
+ * is the list of rows that fell in the bucket, in seq-asc
+ * order.
+ */
+export interface WindowBoundary {
+  start: bigint
+  end: bigint
+  rows: Array<ResultRow>
+}
