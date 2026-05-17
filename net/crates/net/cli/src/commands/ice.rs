@@ -33,7 +33,7 @@ use net_sdk::deck::{AvoidScope, BlastRadius, ChainCommit, DaemonRef, OperatorSig
 use serde::Serialize;
 
 use crate::context::{resolve_profile, CliContext};
-use crate::error::{generic, sdk, CliError, CliError as _CE, ExitCodeKind};
+use crate::error::{generic, sdk, CliError, ExitCodeKind};
 use crate::parsers::parse_u64_flexible;
 use crate::prelude::{emit_value, OutputFormat};
 
@@ -359,7 +359,7 @@ where
     P: FnOnce() -> Result<bool, CliError>,
 {
     if !stdin_is_tty && !yes_flag {
-        return Err(_CE::new(
+        return Err(CliError::new(
             ExitCodeKind::ConfirmationRefused,
             "stdin is not a TTY; pass --yes to skip the interactive confirm prompt",
         ));
@@ -372,13 +372,13 @@ where
 
 fn map_ice_error(msg: &str, kind: &'static str) -> CliError {
     match kind {
-        "simulation_required" => _CE::new(ExitCodeKind::IceSimulationBlocked, msg),
+        "simulation_required" => CliError::new(ExitCodeKind::IceSimulationBlocked, msg),
         "not_authorized"
         | "signature_invalid"
         | "insufficient_signatures"
         | "envelope_expired"
         | "envelope_from_future"
-        | "ice_cooldown_active" => _CE::new(ExitCodeKind::OperatorPolicyRejected, msg),
+        | "ice_cooldown_active" => CliError::new(ExitCodeKind::OperatorPolicyRejected, msg),
         _ => sdk(msg),
     }
 }
