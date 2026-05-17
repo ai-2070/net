@@ -109,6 +109,11 @@ pub struct RestoreArgs {
     #[arg(long)]
     pub store: Option<PathBuf>,
 
+    /// Origin to attribute the restored chains to. `NetDbSnapshot`
+    /// doesn't carry the producing origin in its envelope today,
+    /// so this is operator-supplied — pass the same value the
+    /// snapshot was authored under to avoid a silent cross-origin
+    /// restore.
     #[arg(long, default_value_t = 0)]
     pub origin: u64,
 
