@@ -180,7 +180,7 @@ async fn main() -> ExitCode {
             // Print the kind + message to stderr; the exit code
             // carries the discriminator for scripting consumers.
             eprintln!("net: {}", e);
-            ExitCode::from(e.code() as u8)
+            ExitCode::from(e.code())
         }
     }
 }
