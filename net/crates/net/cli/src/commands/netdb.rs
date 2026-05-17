@@ -696,9 +696,18 @@ async fn run_tasks_ls(
     let adapter = netdb
         .try_tasks()
         .ok_or_else(|| sdk("NetDB has no tasks adapter wired"))?;
-    let state_arc = adapter.state();
-    let guard = state_arc.read();
-    let tasks: Vec<Task> = guard.all().cloned().collect();
+    // Collect under the read guard and drop it before the
+    // synchronous stdout write. Pre-fix the guard lived across
+    // `emit_value`, which means a concurrent `net netdb tasks
+    // create` in the same process tree (and any future in-process
+    // watcher) blocked on the writer lock while we drained
+    // stdout; a piped `| jq` on a slow consumer stalled writers
+    // indefinitely.
+    let tasks: Vec<Task> = {
+        let state_arc = adapter.state();
+        let guard = state_arc.read();
+        guard.all().cloned().collect()
+    };
     emit_value(OutputFormat::resolve_oneshot(output), &tasks)
         .map_err(|e| generic(format!("write tasks: {e}")))?;
     Ok(())
@@ -721,9 +730,13 @@ async fn run_memories_ls(
     let adapter = netdb
         .try_memories()
         .ok_or_else(|| sdk("NetDB has no memories adapter wired"))?;
-    let state_arc = adapter.state();
-    let guard = state_arc.read();
-    let memories: Vec<Memory> = guard.all().cloned().collect();
+    // Drop the read guard before the synchronous stdout write -
+    // see the run_tasks_ls comment for the rationale.
+    let memories: Vec<Memory> = {
+        let state_arc = adapter.state();
+        let guard = state_arc.read();
+        guard.all().cloned().collect()
+    };
     emit_value(OutputFormat::resolve_oneshot(output), &memories)
         .map_err(|e| generic(format!("write memories: {e}")))?;
     Ok(())
