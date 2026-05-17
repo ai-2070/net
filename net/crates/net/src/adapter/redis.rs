@@ -565,36 +565,30 @@ impl Adapter for RedisAdapter {
             return false;
         }
 
-        // Use a dedicated single-shot multiplexed connection for
-        // the health check rather than the shared
-        // `ConnectionManager` used by `on_batch` / `poll_shard`.
-        // `tokio::time::timeout` cancels the PING future locally
-        // but does NOT roll back bytes already on the wire (same
-        // hazard documented for `on_batch` above). On the SHARED
-        // connection a leftover PING reply could in principle
-        // confuse the multiplexed correlation when followed by
-        // a real command — using a fresh connection that's
-        // dropped after the PING means any leftover bytes go to
-        // a connection that's already being torn down.
+        // Reuse the pooled `ConnectionManager` from `init` rather
+        // than opening a fresh TCP+TLS handshake on every probe.
+        // ConnectionManager owns one long-lived connection and
+        // transparently reconnects with backoff on failure — a
+        // healthcheck timeout that left bytes on the wire is the
+        // exact scenario its reconnect logic exists for, and the
+        // next `on_batch` / `poll_shard` would have triggered the
+        // same reconnect path. Pre-fix every probe did a full
+        // TCP+TLS handshake (a real cost under TLS), and a high-
+        // frequency orchestrator liveness probe could meaningfully
+        // load the broker.
         //
-        // Also bounds the check by `command_timeout` so an
+        // `command_timeout` still bounds the wall-time so an
         // unhealthy backend always returns `false` within a
-        // predictable window (orchestrator liveness probes
-        // require a deterministic cap).
-        let conn_fut = self.client.get_multiplexed_async_connection();
-        let mut conn = match tokio::time::timeout(self.config.command_timeout, conn_fut).await {
-            Ok(Ok(c)) => c,
-            _ => return false,
-        };
+        // predictable window (orchestrator liveness probes need
+        // a deterministic cap).
+        let Some(conn) = &self.conn else { return false };
+        let mut conn = conn.clone();
         let cmd = redis::cmd("PING");
         let fut = cmd.query_async::<String>(&mut conn);
         matches!(
             tokio::time::timeout(self.config.command_timeout, fut).await,
             Ok(Ok(_))
         )
-        // `conn` is dropped here, so any leftover PING reply
-        // ends up on a torn-down connection rather than the
-        // shared multiplex.
     }
 }
 
