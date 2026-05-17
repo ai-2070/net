@@ -1168,6 +1168,11 @@ pub extern "C" fn net_redex_file_append(
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
     };
+    // `slice::from_raw_parts` requires `len <= isize::MAX`. A caller
+    // passing a sign-extended `-1` would immediately UB otherwise.
+    if len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let slice = unsafe { std::slice::from_raw_parts(payload, len) };
     match file.inner.append(slice) {
         Ok(seq) => {
@@ -2894,6 +2899,10 @@ pub extern "C" fn net_netdb_open_from_snapshot(
     let snapshot: Option<NetDbSnapshot> = if bundle_len == 0 {
         None
     } else {
+        // `slice::from_raw_parts` requires `len <= isize::MAX`.
+        if bundle_len > isize::MAX as usize {
+            return NetError::InvalidJson.into();
+        }
         let slice = unsafe { std::slice::from_raw_parts(bundle, bundle_len) };
         match NetDbSnapshot::decode(slice) {
             Ok(s) => Some(s),

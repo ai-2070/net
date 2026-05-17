@@ -233,6 +233,10 @@ pub unsafe extern "C" fn net_blob_publish(
     if data.is_null() && data_len > 0 {
         return NetError::NullPointer.into();
     }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if data_len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let data_slice = if data_len == 0 {
         &[][..]
     } else {
@@ -300,6 +304,10 @@ pub unsafe extern "C" fn net_blob_resolve(
     };
     if payload.is_null() && payload_len > 0 {
         return NetError::NullPointer.into();
+    }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if payload_len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
     }
     let payload_slice = if payload_len == 0 {
         &[][..]
@@ -934,6 +942,10 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_store(
     if handle.is_null() || blob_ref_bytes.is_null() {
         return NetError::NullPointer.into();
     }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if blob_ref_len > isize::MAX as usize || data_len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
     let blob_ref = match InnerBlobRef::decode(blob_slice) {
         Ok(Some(b)) => b,
@@ -972,6 +984,10 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_fetch(
 ) -> c_int {
     if handle.is_null() || blob_ref_bytes.is_null() || out_data.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
+    }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if blob_ref_len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
     }
     let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
     let blob_ref = match InnerBlobRef::decode(blob_slice) {
@@ -1012,6 +1028,10 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_exists(
 ) -> c_int {
     if handle.is_null() || blob_ref_bytes.is_null() || out_exists.is_null() {
         return NetError::NullPointer.into();
+    }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if blob_ref_len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
     }
     let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
     let blob_ref = match InnerBlobRef::decode(blob_slice) {

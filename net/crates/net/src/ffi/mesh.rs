@@ -1765,6 +1765,10 @@ pub extern "C" fn net_mesh_subscribe_channel_with_token(
         Ok(n) => n,
         Err(_) => return NET_ERR_CHANNEL,
     };
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if token_len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let slice = unsafe { std::slice::from_raw_parts(token, token_len) };
     let parsed = match PermissionToken::from_bytes(slice) {
         Ok(t) => t,
@@ -2239,6 +2243,9 @@ pub extern "C" fn net_identity_sign(
     };
     let slice = if len == 0 {
         &[][..]
+    } else if len > isize::MAX as usize {
+        // `slice::from_raw_parts` requires `len <= isize::MAX`.
+        return NetError::InvalidJson.into();
     } else {
         unsafe { std::slice::from_raw_parts(msg, len) }
     };
@@ -2319,6 +2326,10 @@ pub extern "C" fn net_identity_install_token(
 ) -> c_int {
     if handle.is_null() || token.is_null() {
         return NetError::NullPointer.into();
+    }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
     }
     let slice = unsafe { std::slice::from_raw_parts(token, len) };
     let parsed = match PermissionToken::from_bytes(slice) {
@@ -2422,6 +2433,10 @@ pub extern "C" fn net_parse_token(
     if token.is_null() || out_json.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
     }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let slice = unsafe { std::slice::from_raw_parts(token, len) };
     let parsed = match PermissionToken::from_bytes(slice) {
         Ok(t) => t,
@@ -2449,6 +2464,10 @@ pub extern "C" fn net_verify_token(token: *const u8, len: usize, out_ok: *mut c_
     if token.is_null() || out_ok.is_null() {
         return NetError::NullPointer.into();
     }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let slice = unsafe { std::slice::from_raw_parts(token, len) };
     let parsed = match PermissionToken::from_bytes(slice) {
         Ok(t) => t,
@@ -2472,6 +2491,10 @@ pub extern "C" fn net_token_is_expired(
 ) -> c_int {
     if token.is_null() || out_expired.is_null() {
         return NetError::NullPointer.into();
+    }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
     }
     let slice = unsafe { std::slice::from_raw_parts(token, len) };
     let parsed = match PermissionToken::from_bytes(slice) {
@@ -2505,6 +2528,10 @@ pub extern "C" fn net_delegate_token(
         || out_token_len.is_null()
     {
         return NetError::NullPointer.into();
+    }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if parent_len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
     }
     let parent_slice = unsafe { std::slice::from_raw_parts(parent, parent_len) };
     let parent_tok = match PermissionToken::from_bytes(parent_slice) {
@@ -4016,6 +4043,44 @@ mod tests {
         let hw = hardware_from_json(h);
         assert_eq!(hw.cpu_cores, u16::MAX);
         assert_eq!(hw.cpu_threads, u16::MAX);
+    }
+
+    /// A C caller passing `(size_t)-1` as `len` to the token-parsing
+    /// FFI entry points previously triggered immediate UB in
+    /// `slice::from_raw_parts` (which requires `len <= isize::MAX`).
+    /// The guard must short-circuit with a typed error before the
+    /// dangling pointer is dereferenced. The sentinel pointer is
+    /// never read because the size check fires first.
+    #[test]
+    fn token_entry_points_reject_oversize_len() {
+        let invalid_json: c_int = NetError::InvalidJson.into();
+        let mut sentinel: u8 = 0;
+        let token = &mut sentinel as *mut u8 as *const u8;
+
+        let mut out_json: *mut c_char = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        assert_eq!(
+            net_parse_token(token, usize::MAX, &mut out_json, &mut out_len),
+            invalid_json,
+        );
+        assert!(out_json.is_null());
+
+        let mut out_ok: c_int = -42;
+        assert_eq!(
+            net_verify_token(token, usize::MAX, &mut out_ok),
+            invalid_json,
+        );
+
+        let mut out_expired: c_int = -42;
+        assert_eq!(
+            net_token_is_expired(token, usize::MAX, &mut out_expired),
+            invalid_json,
+        );
+
+        assert_eq!(
+            sentinel, 0,
+            "sentinel must not be touched: the length guard fires before any deref"
+        );
     }
 }
 
