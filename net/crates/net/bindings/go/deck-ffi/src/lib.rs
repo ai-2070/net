@@ -64,13 +64,17 @@ use net::adapter::net::behavior::deck::{
 };
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::behavior::meshos::{
-    AvoidScope as CoreAvoidScope, ChainId as CoreChainId, DaemonRef as CoreDaemonRef,
-    MigrationId as CoreMigrationId, OperatorSignature as CoreOperatorSignature,
+    AdminVerifier as CoreAdminVerifier, AvoidScope as CoreAvoidScope, ChainId as CoreChainId,
+    DaemonRef as CoreDaemonRef, MigrationId as CoreMigrationId,
+    OperatorRegistry as CoreOperatorRegistry, OperatorSignature as CoreOperatorSignature,
+    VerifyError as CoreVerifyError, blast_radius_hash, ice_proposal_signing_payload,
 };
 use net::adapter::net::behavior::meshos::{
     LoggingDispatcher, MeshOsConfig, MeshOsDaemonSdk as CoreSdk,
 };
+use net::adapter::net::identity::EntityId;
 use net::adapter::net::EntityKeypair;
+use std::sync::Mutex;
 
 // =========================================================================
 // Status codes
@@ -2271,6 +2275,629 @@ pub extern "C" fn net_deck_simulated_free(simulated: *mut NetDeckSimulatedIcePro
     }
 }
 
+/// Return the deterministic ICE signing payload bytes (`ICE_SIGNING_DOMAIN
+/// || issued_at_ms (le u64) || blast_hash (32) || postcard(action)`) as
+/// a heap-allocated buffer. On success writes the buffer pointer to
+/// `*out_ptr` and the byte count to `*out_len`. The buffer MUST be
+/// released via `net_deck_signing_payload_free(ptr, len)`.
+///
+/// Returns `NET_DECK_ERR_CALL_FAILED` with kind `already_committed` if
+/// the proposal has been consumed by `net_deck_simulated_commit`.
+#[no_mangle]
+pub extern "C" fn net_deck_simulated_signing_payload(
+    simulated: *const NetDeckSimulatedIceProposal,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out_ptr.is_null() || out_len.is_null() {
+            set_last_error("invalid_argument", "out_ptr / out_len is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(s) = (unsafe { simulated.as_ref() }) else {
+            set_last_error("invalid_argument", "simulated pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        };
+        if s.committed {
+            set_last_error(
+                "already_committed",
+                "SimulatedIceProposal was already consumed by commit()",
+            );
+            return NET_DECK_ERR_CALL_FAILED;
+        }
+        let hash = blast_radius_hash(&s.blast);
+        let payload = ice_proposal_signing_payload(&s.action, s.issued_at_ms, &hash);
+        let len = payload.len();
+        let mut boxed = payload.into_boxed_slice();
+        let ptr = boxed.as_mut_ptr();
+        std::mem::forget(boxed);
+        unsafe {
+            *out_ptr = ptr;
+            *out_len = len;
+        }
+        NET_DECK_OK
+    })
+}
+
+/// Free a buffer returned by `net_deck_simulated_signing_payload`.
+/// Idempotent on NULL.
+#[no_mangle]
+pub extern "C" fn net_deck_signing_payload_free(ptr: *mut u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len));
+    }
+}
+
+// =========================================================================
+// OperatorIdentity opaque handle
+//
+// Decouples the operator identity from `net_deck_client_new` for
+// the offline signing flow + operator-policy authoring. Existing
+// `net_deck_client_new(... seed_ptr)` API still works; this is
+// additive.
+// =========================================================================
+
+pub struct NetDeckOperatorIdentity {
+    inner: CoreIdentity,
+}
+
+/// Generate a fresh ed25519 keypair + operator identity. Heap-
+/// allocated; caller frees via `net_deck_operator_identity_free`.
+#[no_mangle]
+pub extern "C" fn net_deck_operator_identity_generate() -> *mut NetDeckOperatorIdentity {
+    Box::into_raw(Box::new(NetDeckOperatorIdentity {
+        inner: CoreIdentity::generate(),
+    }))
+}
+
+/// Load an operator identity from a 32-byte ed25519 seed. Writes
+/// the handle to `*out`. Returns `NET_DECK_ERR_INVALID_ARG` on
+/// NULL pointers.
+#[no_mangle]
+pub extern "C" fn net_deck_operator_identity_from_seed(
+    seed_ptr: *const u8,
+    out: *mut *mut NetDeckOperatorIdentity,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if seed_ptr.is_null() || out.is_null() {
+            set_last_error("invalid_argument", "seed_ptr / out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let seed: [u8; 32] = unsafe { std::slice::from_raw_parts(seed_ptr, 32) }
+            .try_into()
+            .expect("slice has len 32");
+        let identity = NetDeckOperatorIdentity {
+            inner: CoreIdentity::from_keypair(EntityKeypair::from_bytes(seed)),
+        };
+        unsafe { *out = Box::into_raw(Box::new(identity)) };
+        NET_DECK_OK
+    })
+}
+
+/// Return the operator id (the keypair's origin hash). Returns 0
+/// on NULL handle.
+#[no_mangle]
+pub extern "C" fn net_deck_operator_identity_operator_id(
+    identity: *const NetDeckOperatorIdentity,
+) -> u64 {
+    match unsafe { identity.as_ref() } {
+        Some(i) => i.inner.operator_id(),
+        None => 0,
+    }
+}
+
+/// Write the 32-byte ed25519 public key into `out_buf`. `out_buf`
+/// MUST point to at least 32 writable bytes.
+#[no_mangle]
+pub extern "C" fn net_deck_operator_identity_public_key(
+    identity: *const NetDeckOperatorIdentity,
+    out_buf: *mut u8,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out_buf.is_null() {
+            set_last_error("invalid_argument", "out_buf is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(i) = (unsafe { identity.as_ref() }) else {
+            set_last_error("invalid_argument", "identity pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        };
+        let bytes = i.inner.keypair().entity_id().as_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, 32);
+        }
+        NET_DECK_OK
+    })
+}
+
+/// Sign a simulated ICE proposal. On success writes the operator
+/// id to `*out_operator_id` and the 64-byte ed25519 signature
+/// into `out_signature`. `out_signature` MUST point to at least
+/// 64 writable bytes.
+///
+/// Returns `already_committed` if the simulated proposal has
+/// been consumed by `net_deck_simulated_commit`.
+#[no_mangle]
+pub extern "C" fn net_deck_operator_identity_sign_proposal(
+    identity: *const NetDeckOperatorIdentity,
+    simulated: *const NetDeckSimulatedIceProposal,
+    out_operator_id: *mut u64,
+    out_signature: *mut u8,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out_operator_id.is_null() || out_signature.is_null() {
+            set_last_error(
+                "invalid_argument",
+                "out_operator_id / out_signature is NULL",
+            );
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(i) = (unsafe { identity.as_ref() }) else {
+            set_last_error("invalid_argument", "identity pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        };
+        let Some(s) = (unsafe { simulated.as_ref() }) else {
+            set_last_error("invalid_argument", "simulated pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        };
+        if s.committed {
+            set_last_error(
+                "already_committed",
+                "SimulatedIceProposal was already consumed by commit()",
+            );
+            return NET_DECK_ERR_CALL_FAILED;
+        }
+        let hash = blast_radius_hash(&s.blast);
+        let sig = i.inner.sign_proposal(&s.action, s.issued_at_ms, &hash);
+        unsafe {
+            *out_operator_id = sig.operator_id;
+            std::ptr::copy_nonoverlapping(sig.signature.as_ptr(), out_signature, 64);
+        }
+        NET_DECK_OK
+    })
+}
+
+/// Sign raw payload bytes with this operator's ed25519 key.
+/// Useful for offline / cross-deck signing flows where the
+/// signing payload is exchanged out-of-band.
+#[no_mangle]
+pub extern "C" fn net_deck_operator_identity_sign_payload(
+    identity: *const NetDeckOperatorIdentity,
+    payload_ptr: *const u8,
+    payload_len: usize,
+    out_operator_id: *mut u64,
+    out_signature: *mut u8,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out_operator_id.is_null() || out_signature.is_null() {
+            set_last_error(
+                "invalid_argument",
+                "out_operator_id / out_signature is NULL",
+            );
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(i) = (unsafe { identity.as_ref() }) else {
+            set_last_error("invalid_argument", "identity pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        };
+        let payload: &[u8] = if payload_len == 0 {
+            &[]
+        } else if payload_ptr.is_null() {
+            set_last_error(
+                "invalid_argument",
+                "payload_ptr is NULL but payload_len > 0",
+            );
+            return NET_DECK_ERR_INVALID_ARG;
+        } else {
+            unsafe { std::slice::from_raw_parts(payload_ptr, payload_len) }
+        };
+        let sig = i.inner.keypair().sign(payload);
+        unsafe {
+            *out_operator_id = i.inner.operator_id();
+            std::ptr::copy_nonoverlapping(sig.to_bytes().as_ptr(), out_signature, 64);
+        }
+        NET_DECK_OK
+    })
+}
+
+/// Free an operator identity. Idempotent on NULL.
+#[no_mangle]
+pub extern "C" fn net_deck_operator_identity_free(identity: *mut NetDeckOperatorIdentity) {
+    if identity.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(identity);
+    }
+}
+
+// =========================================================================
+// OperatorRegistry opaque handle
+// =========================================================================
+
+pub struct NetDeckOperatorRegistry {
+    inner: Mutex<CoreOperatorRegistry>,
+}
+
+impl NetDeckOperatorRegistry {
+    fn snapshot_arc(&self) -> Arc<CoreOperatorRegistry> {
+        let g = self.inner.lock().expect("registry mutex poisoned");
+        Arc::new(g.clone())
+    }
+}
+
+/// Map a substrate `VerifyError` to the last-error envelope. Sets
+/// the kind to the substrate's stable discriminator and the
+/// message to `e.to_string()`.
+fn set_verify_error(e: CoreVerifyError) {
+    set_last_error(e.kind(), &e.to_string());
+}
+
+/// Create a new empty operator registry. Caller frees via
+/// `net_deck_operator_registry_free`.
+#[no_mangle]
+pub extern "C" fn net_deck_operator_registry_new() -> *mut NetDeckOperatorRegistry {
+    Box::into_raw(Box::new(NetDeckOperatorRegistry {
+        inner: Mutex::new(CoreOperatorRegistry::new()),
+    }))
+}
+
+/// Insert an operator's 32-byte ed25519 public key under
+/// `operator_id`. `public_key` MUST point to at least 32 bytes.
+#[no_mangle]
+pub extern "C" fn net_deck_operator_registry_insert(
+    registry: *mut NetDeckOperatorRegistry,
+    operator_id: u64,
+    public_key: *const u8,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if public_key.is_null() {
+            set_last_error("invalid_public_key", "public_key pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(r) = (unsafe { registry.as_ref() }) else {
+            set_last_error("invalid_argument", "registry pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        };
+        let mut bytes = [0u8; 32];
+        unsafe {
+            std::ptr::copy_nonoverlapping(public_key, bytes.as_mut_ptr(), 32);
+        }
+        let entity_id = EntityId::from_bytes(bytes);
+        let mut g = r
+            .inner
+            .lock()
+            .map_err(|_| ())
+            .or_else(|_| -> Result<_, ()> {
+                set_last_error("registry_poisoned", "operator registry mutex poisoned");
+                Err(())
+            });
+        let Ok(g) = g.as_deref_mut() else {
+            return NET_DECK_ERR_CALL_FAILED;
+        };
+        g.insert(operator_id, entity_id);
+        NET_DECK_OK
+    })
+}
+
+/// Register an `OperatorIdentity`'s public key under its derived
+/// operator id (the keypair's origin hash).
+#[no_mangle]
+pub extern "C" fn net_deck_operator_registry_register(
+    registry: *mut NetDeckOperatorRegistry,
+    identity: *const NetDeckOperatorIdentity,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        let Some(r) = (unsafe { registry.as_ref() }) else {
+            set_last_error("invalid_argument", "registry pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        };
+        let Some(i) = (unsafe { identity.as_ref() }) else {
+            set_last_error("invalid_argument", "identity pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        };
+        let mut g = match r.inner.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                set_last_error("registry_poisoned", "operator registry mutex poisoned");
+                return NET_DECK_ERR_CALL_FAILED;
+            }
+        };
+        g.register(i.inner.keypair());
+        NET_DECK_OK
+    })
+}
+
+/// `1` iff `operator_id` is registered; `0` otherwise. Returns
+/// `-1` on NULL pointer (no last-error set).
+#[no_mangle]
+pub extern "C" fn net_deck_operator_registry_contains(
+    registry: *const NetDeckOperatorRegistry,
+    operator_id: u64,
+) -> c_int {
+    let Some(r) = (unsafe { registry.as_ref() }) else {
+        return NET_DECK_ERR_NULL;
+    };
+    let Ok(g) = r.inner.lock() else {
+        return NET_DECK_ERR_CALL_FAILED;
+    };
+    if g.contains(operator_id) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Number of registered operators. Returns 0 on NULL.
+#[no_mangle]
+pub extern "C" fn net_deck_operator_registry_len(
+    registry: *const NetDeckOperatorRegistry,
+) -> usize {
+    match unsafe { registry.as_ref() } {
+        Some(r) => r.inner.lock().map(|g| g.len()).unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// Verify a single signature over `payload`. On success returns
+/// `NET_DECK_OK`. On failure sets the last-error kind to the
+/// substrate's stable discriminator (`not_authorized`,
+/// `signature_invalid`) and returns `NET_DECK_ERR_CALL_FAILED`.
+#[no_mangle]
+pub extern "C" fn net_deck_operator_registry_verify(
+    registry: *const NetDeckOperatorRegistry,
+    signature: *const NetDeckOperatorSignature,
+    payload_ptr: *const u8,
+    payload_len: usize,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        let Some(r) = (unsafe { registry.as_ref() }) else {
+            set_last_error("invalid_argument", "registry pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        };
+        let Some(sig_in) = (unsafe { signature.as_ref() }) else {
+            set_last_error("invalid_signature", "signature pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        };
+        if sig_in.signature_ptr.is_null() || sig_in.signature_len == 0 {
+            set_last_error(
+                "invalid_signature",
+                "signature buffer is NULL or zero-length",
+            );
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let sig_bytes =
+            unsafe { std::slice::from_raw_parts(sig_in.signature_ptr, sig_in.signature_len) }
+                .to_vec();
+        let core_sig = CoreOperatorSignature {
+            operator_id: sig_in.operator_id,
+            signature: sig_bytes,
+        };
+        let payload: &[u8] = if payload_len == 0 {
+            &[]
+        } else if payload_ptr.is_null() {
+            set_last_error(
+                "invalid_argument",
+                "payload_ptr is NULL but payload_len > 0",
+            );
+            return NET_DECK_ERR_INVALID_ARG;
+        } else {
+            unsafe { std::slice::from_raw_parts(payload_ptr, payload_len) }
+        };
+        let g = match r.inner.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                set_last_error("registry_poisoned", "operator registry mutex poisoned");
+                return NET_DECK_ERR_CALL_FAILED;
+            }
+        };
+        match g.verify(&core_sig, payload) {
+            Ok(()) => NET_DECK_OK,
+            Err(e) => {
+                set_verify_error(e);
+                NET_DECK_ERR_CALL_FAILED
+            }
+        }
+    })
+}
+
+/// Verify every signature in the bundle over `payload` and
+/// confirm at least `threshold` distinct operator ids signed it.
+/// On failure sets the appropriate kind and returns
+/// `NET_DECK_ERR_CALL_FAILED`.
+#[no_mangle]
+pub extern "C" fn net_deck_operator_registry_verify_bundle(
+    registry: *const NetDeckOperatorRegistry,
+    sigs_ptr: *const NetDeckOperatorSignature,
+    sigs_count: usize,
+    payload_ptr: *const u8,
+    payload_len: usize,
+    threshold: usize,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        let Some(r) = (unsafe { registry.as_ref() }) else {
+            set_last_error("invalid_argument", "registry pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        };
+        let owned = match unsafe { signatures_from_c(sigs_ptr, sigs_count) } {
+            Ok(o) => o,
+            Err(kind) => {
+                set_last_error(kind, "signature buffer is NULL or zero-length");
+                return NET_DECK_ERR_INVALID_ARG;
+            }
+        };
+        let core_sigs: Vec<CoreOperatorSignature> = owned
+            .into_iter()
+            .map(|s| CoreOperatorSignature {
+                operator_id: s.operator_id,
+                signature: s.signature,
+            })
+            .collect();
+        let payload: &[u8] = if payload_len == 0 {
+            &[]
+        } else if payload_ptr.is_null() {
+            set_last_error(
+                "invalid_argument",
+                "payload_ptr is NULL but payload_len > 0",
+            );
+            return NET_DECK_ERR_INVALID_ARG;
+        } else {
+            unsafe { std::slice::from_raw_parts(payload_ptr, payload_len) }
+        };
+        let g = match r.inner.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                set_last_error("registry_poisoned", "operator registry mutex poisoned");
+                return NET_DECK_ERR_CALL_FAILED;
+            }
+        };
+        match g.verify_bundle(&core_sigs, payload, threshold) {
+            Ok(()) => NET_DECK_OK,
+            Err(e) => {
+                set_verify_error(e);
+                NET_DECK_ERR_CALL_FAILED
+            }
+        }
+    })
+}
+
+/// Free an operator registry. Idempotent on NULL.
+#[no_mangle]
+pub extern "C" fn net_deck_operator_registry_free(registry: *mut NetDeckOperatorRegistry) {
+    if registry.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(registry);
+    }
+}
+
+// =========================================================================
+// AdminVerifier opaque handle
+//
+// Wraps a snapshotted registry with the cluster's policy knobs.
+// Useful for offline unit testing of operator policy decisions.
+// =========================================================================
+
+pub struct NetDeckAdminVerifier {
+    inner: CoreAdminVerifier,
+}
+
+/// Build a verifier with `threshold` minimum signatures and the
+/// substrate defaults (300s freshness, 30s future-skew, 300s ICE
+/// cooldown). `threshold = 0` is clamped to `1`.
+#[no_mangle]
+pub extern "C" fn net_deck_admin_verifier_new(
+    registry: *const NetDeckOperatorRegistry,
+    threshold: usize,
+) -> *mut NetDeckAdminVerifier {
+    let Some(r) = (unsafe { registry.as_ref() }) else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(NetDeckAdminVerifier {
+        inner: CoreAdminVerifier::new(r.snapshot_arc(), threshold),
+    }))
+}
+
+/// Build with explicit freshness + future-skew windows and the
+/// default ICE cooldown.
+#[no_mangle]
+pub extern "C" fn net_deck_admin_verifier_with_freshness(
+    registry: *const NetDeckOperatorRegistry,
+    threshold: usize,
+    freshness_window_ms: u64,
+    future_skew_ms: u64,
+) -> *mut NetDeckAdminVerifier {
+    let Some(r) = (unsafe { registry.as_ref() }) else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(NetDeckAdminVerifier {
+        inner: CoreAdminVerifier::with_freshness(
+            r.snapshot_arc(),
+            threshold,
+            Duration::from_millis(freshness_window_ms),
+            Duration::from_millis(future_skew_ms),
+        ),
+    }))
+}
+
+/// Build with every policy knob explicit.
+#[no_mangle]
+pub extern "C" fn net_deck_admin_verifier_with_full_policy(
+    registry: *const NetDeckOperatorRegistry,
+    threshold: usize,
+    freshness_window_ms: u64,
+    future_skew_ms: u64,
+    ice_cooldown_ms: u64,
+) -> *mut NetDeckAdminVerifier {
+    let Some(r) = (unsafe { registry.as_ref() }) else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(NetDeckAdminVerifier {
+        inner: CoreAdminVerifier::with_full_policy(
+            r.snapshot_arc(),
+            threshold,
+            Duration::from_millis(freshness_window_ms),
+            Duration::from_millis(future_skew_ms),
+            Duration::from_millis(ice_cooldown_ms),
+        ),
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_admin_verifier_threshold(
+    verifier: *const NetDeckAdminVerifier,
+) -> usize {
+    match unsafe { verifier.as_ref() } {
+        Some(v) => v.inner.threshold(),
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_admin_verifier_freshness_window_ms(
+    verifier: *const NetDeckAdminVerifier,
+) -> u64 {
+    match unsafe { verifier.as_ref() } {
+        Some(v) => v.inner.freshness_window().as_millis() as u64,
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_admin_verifier_future_skew_ms(
+    verifier: *const NetDeckAdminVerifier,
+) -> u64 {
+    match unsafe { verifier.as_ref() } {
+        Some(v) => v.inner.future_skew().as_millis() as u64,
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_admin_verifier_ice_cooldown_ms(
+    verifier: *const NetDeckAdminVerifier,
+) -> u64 {
+    match unsafe { verifier.as_ref() } {
+        Some(v) => v.inner.ice_cooldown().as_millis() as u64,
+        None => 0,
+    }
+}
+
+/// Free an admin verifier. Idempotent on NULL.
+#[no_mangle]
+pub extern "C" fn net_deck_admin_verifier_free(verifier: *mut NetDeckAdminVerifier) {
+    if verifier.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(verifier);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2876,6 +3503,288 @@ mod tests {
         assert_eq!(kind, "invalid_signature");
         net_deck_clear_last_error();
 
+        net_deck_simulated_free(simulated);
+        net_deck_ice_proposal_free(proposal);
+        net_deck_client_free(client);
+    }
+
+    // ---- Operator-policy verifier surface ----
+
+    #[test]
+    fn operator_identity_lifecycle() {
+        let seed = [0x77u8; 32];
+        let mut identity: *mut NetDeckOperatorIdentity = ptr::null_mut();
+        let status = net_deck_operator_identity_from_seed(seed.as_ptr(), &mut identity);
+        assert_eq!(status, NET_DECK_OK);
+        assert!(!identity.is_null());
+
+        let op_id = net_deck_operator_identity_operator_id(identity);
+        let expected = EntityKeypair::from_bytes(seed).origin_hash();
+        assert_eq!(op_id, expected);
+
+        let mut pubkey = [0u8; 32];
+        let status = net_deck_operator_identity_public_key(identity, pubkey.as_mut_ptr());
+        assert_eq!(status, NET_DECK_OK);
+        let expected_kp = EntityKeypair::from_bytes(seed);
+        let expected_pk = expected_kp.entity_id().as_bytes();
+        assert_eq!(&pubkey, expected_pk);
+
+        net_deck_operator_identity_free(identity);
+    }
+
+    #[test]
+    fn operator_registry_insert_and_contains() {
+        let registry = net_deck_operator_registry_new();
+        assert!(!registry.is_null());
+        assert_eq!(net_deck_operator_registry_len(registry), 0);
+
+        let pk = [0xAAu8; 32];
+        let status = net_deck_operator_registry_insert(registry, 42, pk.as_ptr());
+        assert_eq!(status, NET_DECK_OK);
+        assert_eq!(net_deck_operator_registry_len(registry), 1);
+        assert_eq!(net_deck_operator_registry_contains(registry, 42), 1);
+        assert_eq!(net_deck_operator_registry_contains(registry, 99), 0);
+
+        net_deck_operator_registry_free(registry);
+    }
+
+    #[test]
+    fn operator_registry_rejects_null_pubkey() {
+        let registry = net_deck_operator_registry_new();
+        let status = net_deck_operator_registry_insert(registry, 1, ptr::null());
+        assert_eq!(status, NET_DECK_ERR_INVALID_ARG);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "invalid_public_key");
+        net_deck_clear_last_error();
+        net_deck_operator_registry_free(registry);
+    }
+
+    #[test]
+    fn sign_payload_then_registry_verify_roundtrip() {
+        let identity = net_deck_operator_identity_generate();
+        let registry = net_deck_operator_registry_new();
+        net_deck_operator_registry_register(registry, identity);
+
+        let payload = b"hello-canary";
+        let mut op_id: u64 = 0;
+        let mut sig_bytes = [0u8; 64];
+        let status = net_deck_operator_identity_sign_payload(
+            identity,
+            payload.as_ptr(),
+            payload.len(),
+            &mut op_id,
+            sig_bytes.as_mut_ptr(),
+        );
+        assert_eq!(status, NET_DECK_OK);
+        assert_eq!(op_id, net_deck_operator_identity_operator_id(identity));
+
+        let sig = NetDeckOperatorSignature {
+            operator_id: op_id,
+            signature_ptr: sig_bytes.as_ptr(),
+            signature_len: 64,
+        };
+        let status = net_deck_operator_registry_verify(
+            registry,
+            &sig,
+            payload.as_ptr(),
+            payload.len(),
+        );
+        assert_eq!(status, NET_DECK_OK);
+
+        // Tampered payload → signature_invalid.
+        let bad = b"hello-canary!";
+        let status = net_deck_operator_registry_verify(registry, &sig, bad.as_ptr(), bad.len());
+        assert_eq!(status, NET_DECK_ERR_CALL_FAILED);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "signature_invalid");
+        net_deck_clear_last_error();
+
+        net_deck_operator_registry_free(registry);
+        net_deck_operator_identity_free(identity);
+    }
+
+    #[test]
+    fn registry_verify_rejects_unknown_operator() {
+        let identity = net_deck_operator_identity_generate();
+        let registry = net_deck_operator_registry_new();
+        let payload = b"hello";
+        let mut op_id: u64 = 0;
+        let mut sig_bytes = [0u8; 64];
+        net_deck_operator_identity_sign_payload(
+            identity,
+            payload.as_ptr(),
+            payload.len(),
+            &mut op_id,
+            sig_bytes.as_mut_ptr(),
+        );
+        let sig = NetDeckOperatorSignature {
+            operator_id: op_id,
+            signature_ptr: sig_bytes.as_ptr(),
+            signature_len: 64,
+        };
+        let status = net_deck_operator_registry_verify(
+            registry,
+            &sig,
+            payload.as_ptr(),
+            payload.len(),
+        );
+        assert_eq!(status, NET_DECK_ERR_CALL_FAILED);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "not_authorized");
+        net_deck_clear_last_error();
+        net_deck_operator_registry_free(registry);
+        net_deck_operator_identity_free(identity);
+    }
+
+    #[test]
+    fn verify_bundle_distinct_operator_dedup() {
+        let a = net_deck_operator_identity_generate();
+        let b = net_deck_operator_identity_generate();
+        let registry = net_deck_operator_registry_new();
+        net_deck_operator_registry_register(registry, a);
+        net_deck_operator_registry_register(registry, b);
+
+        let payload = b"bundle-canary";
+        let mut sig_a_bytes = [0u8; 64];
+        let mut sig_b_bytes = [0u8; 64];
+        let mut a_id: u64 = 0;
+        let mut b_id: u64 = 0;
+        net_deck_operator_identity_sign_payload(
+            a,
+            payload.as_ptr(),
+            payload.len(),
+            &mut a_id,
+            sig_a_bytes.as_mut_ptr(),
+        );
+        net_deck_operator_identity_sign_payload(
+            b,
+            payload.as_ptr(),
+            payload.len(),
+            &mut b_id,
+            sig_b_bytes.as_mut_ptr(),
+        );
+
+        let sig_a = NetDeckOperatorSignature {
+            operator_id: a_id,
+            signature_ptr: sig_a_bytes.as_ptr(),
+            signature_len: 64,
+        };
+        let sig_b = NetDeckOperatorSignature {
+            operator_id: b_id,
+            signature_ptr: sig_b_bytes.as_ptr(),
+            signature_len: 64,
+        };
+
+        // Distinct operators → threshold 2 satisfied.
+        let bundle = [sig_a, sig_b];
+        let status = net_deck_operator_registry_verify_bundle(
+            registry,
+            bundle.as_ptr(),
+            2,
+            payload.as_ptr(),
+            payload.len(),
+            2,
+        );
+        assert_eq!(status, NET_DECK_OK);
+
+        // Same operator twice → insufficient.
+        let dup = [
+            NetDeckOperatorSignature {
+                operator_id: a_id,
+                signature_ptr: sig_a_bytes.as_ptr(),
+                signature_len: 64,
+            },
+            NetDeckOperatorSignature {
+                operator_id: a_id,
+                signature_ptr: sig_a_bytes.as_ptr(),
+                signature_len: 64,
+            },
+        ];
+        let status = net_deck_operator_registry_verify_bundle(
+            registry,
+            dup.as_ptr(),
+            2,
+            payload.as_ptr(),
+            payload.len(),
+            2,
+        );
+        assert_eq!(status, NET_DECK_ERR_CALL_FAILED);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "insufficient_signatures");
+        net_deck_clear_last_error();
+
+        net_deck_operator_registry_free(registry);
+        net_deck_operator_identity_free(a);
+        net_deck_operator_identity_free(b);
+    }
+
+    #[test]
+    fn admin_verifier_policy_knobs() {
+        let registry = net_deck_operator_registry_new();
+        let v = net_deck_admin_verifier_new(registry, 3);
+        assert!(!v.is_null());
+        assert_eq!(net_deck_admin_verifier_threshold(v), 3);
+        assert_eq!(net_deck_admin_verifier_freshness_window_ms(v), 300_000);
+        assert_eq!(net_deck_admin_verifier_future_skew_ms(v), 30_000);
+        assert_eq!(net_deck_admin_verifier_ice_cooldown_ms(v), 300_000);
+        net_deck_admin_verifier_free(v);
+
+        let v2 = net_deck_admin_verifier_with_full_policy(registry, 0, 1_000, 500, 250);
+        assert_eq!(net_deck_admin_verifier_threshold(v2), 1); // clamp 0 → 1
+        assert_eq!(net_deck_admin_verifier_freshness_window_ms(v2), 1_000);
+        assert_eq!(net_deck_admin_verifier_future_skew_ms(v2), 500);
+        assert_eq!(net_deck_admin_verifier_ice_cooldown_ms(v2), 250);
+        net_deck_admin_verifier_free(v2);
+
+        net_deck_operator_registry_free(registry);
+    }
+
+    #[test]
+    fn signing_payload_matches_sign_proposal_payload() {
+        let client = make_client(0x91);
+        let mut proposal: *mut NetDeckIceProposal = ptr::null_mut();
+        net_deck_ice_freeze_cluster(client, 60_000, &mut proposal);
+        let mut simulated: *mut NetDeckSimulatedIceProposal = ptr::null_mut();
+        net_deck_ice_proposal_simulate(proposal, client, &mut simulated);
+
+        let mut payload_ptr: *mut u8 = ptr::null_mut();
+        let mut payload_len: usize = 0;
+        let status =
+            net_deck_simulated_signing_payload(simulated, &mut payload_ptr, &mut payload_len);
+        assert_eq!(status, NET_DECK_OK);
+        assert!(!payload_ptr.is_null());
+        assert!(payload_len > 0);
+
+        // ICE_SIGNING_DOMAIN prefix.
+        let payload = unsafe { std::slice::from_raw_parts(payload_ptr, payload_len) };
+        assert!(payload.starts_with(b"net.meshos.ice.v1\0"));
+
+        let identity = net_deck_operator_identity_generate();
+        let mut prop_op_id: u64 = 0;
+        let mut prop_sig = [0u8; 64];
+        let status = net_deck_operator_identity_sign_proposal(
+            identity,
+            simulated,
+            &mut prop_op_id,
+            prop_sig.as_mut_ptr(),
+        );
+        assert_eq!(status, NET_DECK_OK);
+
+        let mut payload_op_id: u64 = 0;
+        let mut payload_sig = [0u8; 64];
+        let status = net_deck_operator_identity_sign_payload(
+            identity,
+            payload.as_ptr(),
+            payload.len(),
+            &mut payload_op_id,
+            payload_sig.as_mut_ptr(),
+        );
+        assert_eq!(status, NET_DECK_OK);
+        assert_eq!(prop_op_id, payload_op_id);
+        assert_eq!(prop_sig, payload_sig);
+
+        net_deck_signing_payload_free(payload_ptr, payload_len);
+        net_deck_operator_identity_free(identity);
         net_deck_simulated_free(simulated);
         net_deck_ice_proposal_free(proposal);
         net_deck_client_free(client);

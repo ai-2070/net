@@ -287,6 +287,38 @@ extern char* net_deck_simulated_blast_radius(const NetDeckSimulatedIceProposal* 
 extern int net_deck_simulated_blast_hash(const NetDeckSimulatedIceProposal* simulated, uint8_t* out_buf);
 extern int net_deck_simulated_commit(NetDeckSimulatedIceProposal* simulated, const NetDeckClient* client, const NetDeckOperatorSignature* sigs_ptr, size_t sigs_count, NetDeckChainCommit* out);
 extern void net_deck_simulated_free(NetDeckSimulatedIceProposal* simulated);
+extern int net_deck_simulated_signing_payload(const NetDeckSimulatedIceProposal* simulated, uint8_t** out_ptr, size_t* out_len);
+extern void net_deck_signing_payload_free(uint8_t* ptr, size_t len);
+
+typedef struct NetDeckOperatorIdentity NetDeckOperatorIdentity;
+typedef struct NetDeckOperatorRegistry NetDeckOperatorRegistry;
+typedef struct NetDeckAdminVerifier   NetDeckAdminVerifier;
+
+extern NetDeckOperatorIdentity* net_deck_operator_identity_generate(void);
+extern int net_deck_operator_identity_from_seed(const uint8_t* seed_ptr, NetDeckOperatorIdentity** out);
+extern uint64_t net_deck_operator_identity_operator_id(const NetDeckOperatorIdentity* identity);
+extern int net_deck_operator_identity_public_key(const NetDeckOperatorIdentity* identity, uint8_t* out_buf);
+extern int net_deck_operator_identity_sign_proposal(const NetDeckOperatorIdentity* identity, const NetDeckSimulatedIceProposal* simulated, uint64_t* out_operator_id, uint8_t* out_signature);
+extern int net_deck_operator_identity_sign_payload(const NetDeckOperatorIdentity* identity, const uint8_t* payload_ptr, size_t payload_len, uint64_t* out_operator_id, uint8_t* out_signature);
+extern void net_deck_operator_identity_free(NetDeckOperatorIdentity* identity);
+
+extern NetDeckOperatorRegistry* net_deck_operator_registry_new(void);
+extern int net_deck_operator_registry_insert(NetDeckOperatorRegistry* registry, uint64_t operator_id, const uint8_t* public_key);
+extern int net_deck_operator_registry_register(NetDeckOperatorRegistry* registry, const NetDeckOperatorIdentity* identity);
+extern int net_deck_operator_registry_contains(const NetDeckOperatorRegistry* registry, uint64_t operator_id);
+extern size_t net_deck_operator_registry_len(const NetDeckOperatorRegistry* registry);
+extern int net_deck_operator_registry_verify(const NetDeckOperatorRegistry* registry, const NetDeckOperatorSignature* signature, const uint8_t* payload_ptr, size_t payload_len);
+extern int net_deck_operator_registry_verify_bundle(const NetDeckOperatorRegistry* registry, const NetDeckOperatorSignature* sigs_ptr, size_t sigs_count, const uint8_t* payload_ptr, size_t payload_len, size_t threshold);
+extern void net_deck_operator_registry_free(NetDeckOperatorRegistry* registry);
+
+extern NetDeckAdminVerifier* net_deck_admin_verifier_new(const NetDeckOperatorRegistry* registry, size_t threshold);
+extern NetDeckAdminVerifier* net_deck_admin_verifier_with_freshness(const NetDeckOperatorRegistry* registry, size_t threshold, uint64_t freshness_window_ms, uint64_t future_skew_ms);
+extern NetDeckAdminVerifier* net_deck_admin_verifier_with_full_policy(const NetDeckOperatorRegistry* registry, size_t threshold, uint64_t freshness_window_ms, uint64_t future_skew_ms, uint64_t ice_cooldown_ms);
+extern size_t net_deck_admin_verifier_threshold(const NetDeckAdminVerifier* verifier);
+extern uint64_t net_deck_admin_verifier_freshness_window_ms(const NetDeckAdminVerifier* verifier);
+extern uint64_t net_deck_admin_verifier_future_skew_ms(const NetDeckAdminVerifier* verifier);
+extern uint64_t net_deck_admin_verifier_ice_cooldown_ms(const NetDeckAdminVerifier* verifier);
+extern void net_deck_admin_verifier_free(NetDeckAdminVerifier* verifier);
 */
 import "C"
 
@@ -492,12 +524,12 @@ func summaryFromC(s C.NetDeckStatusSummary) DeckStatusSummary {
 // DeckClientConfig holds the optional supervisor + deck tunables.
 // Zero-value fields take the substrate default.
 type DeckClientConfig struct {
-	ThisNode                uint64
-	TickIntervalMs          uint64
-	EventQueueCapacity      int
-	ActionQueueCapacity     int
-	SnapshotPollIntervalMs  uint64
-	IceSignatureThreshold   int
+	ThisNode               uint64
+	TickIntervalMs         uint64
+	EventQueueCapacity     int
+	ActionQueueCapacity    int
+	SnapshotPollIntervalMs uint64
+	IceSignatureThreshold  int
 }
 
 // =====================================================================
@@ -1422,9 +1454,9 @@ func (s *DeckSimulatedIceProposal) Commit(client *DeckClient, signatures []DeckO
 			return ChainCommit{}, fmt.Errorf("%w: signature %d has empty bytes", ErrDeckInvalidArg, i)
 		}
 		cSigs[i] = C.NetDeckOperatorSignature{
-			operator_id:    C.uint64_t(sig.OperatorID),
-			signature_ptr:  (*C.uint8_t)(unsafe.Pointer(&sig.Signature[0])),
-			signature_len:  C.size_t(len(sig.Signature)),
+			operator_id:   C.uint64_t(sig.OperatorID),
+			signature_ptr: (*C.uint8_t)(unsafe.Pointer(&sig.Signature[0])),
+			signature_len: C.size_t(len(sig.Signature)),
 		}
 	}
 	var sigsPtr *C.NetDeckOperatorSignature
@@ -1446,4 +1478,418 @@ func (s *DeckSimulatedIceProposal) Free() {
 	C.net_deck_simulated_free(s.ptr)
 	s.ptr = nil
 	runtime.SetFinalizer(s, nil)
+}
+
+// SigningPayload returns the deterministic ICE signing payload
+// bytes (`ICE_SIGNING_DOMAIN || issued_at_ms (LE u64) ||
+// blast_hash (32) || postcard(action)`). Useful for the offline
+// / cross-deck signing workflow — pair with
+// `DeckOperatorIdentity.SignPayload(payload)` on a remote deck
+// to produce a signature the local deck can hand into
+// `Commit([]DeckOperatorSignature{...})`.
+//
+// Returns `DeckSdkError(kind: "already_committed")` once the
+// proposal has been consumed by `Commit`.
+func (s *DeckSimulatedIceProposal) SigningPayload() ([]byte, error) {
+	if s == nil || s.ptr == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var ptr *C.uint8_t
+	var length C.size_t
+	status := C.net_deck_simulated_signing_payload(s.ptr, &ptr, &length)
+	if err := deckStatusToError(status); err != nil {
+		return nil, err
+	}
+	if ptr == nil || length == 0 {
+		return nil, nil
+	}
+	out := C.GoBytes(unsafe.Pointer(ptr), C.int(length))
+	C.net_deck_signing_payload_free(ptr, length)
+	return out, nil
+}
+
+// =====================================================================
+// DeckOperatorIdentity — opaque handle for the offline signing seam
+// =====================================================================
+
+// DeckOperatorIdentity is an operator's ed25519 keypair wrapped
+// as an opaque handle. Distinct from the identity passed to
+// `NewDeckClient` (which currently takes a raw seed); this
+// handle is for the offline signing flow + operator-policy
+// authoring. Call `Free` when done.
+type DeckOperatorIdentity struct {
+	ptr *C.NetDeckOperatorIdentity
+}
+
+// GenerateDeckOperatorIdentity creates a fresh keypair.
+func GenerateDeckOperatorIdentity() *DeckOperatorIdentity {
+	raw := C.net_deck_operator_identity_generate()
+	if raw == nil {
+		return nil
+	}
+	h := &DeckOperatorIdentity{ptr: raw}
+	runtime.SetFinalizer(h, func(h *DeckOperatorIdentity) { h.Free() })
+	return h
+}
+
+// NewDeckOperatorIdentityFromSeed loads an identity from a
+// 32-byte ed25519 seed.
+func NewDeckOperatorIdentityFromSeed(seed []byte) (*DeckOperatorIdentity, error) {
+	if len(seed) != 32 {
+		return nil, fmt.Errorf("%w: seed must be 32 bytes, got %d", ErrDeckInvalidArg, len(seed))
+	}
+	var raw *C.NetDeckOperatorIdentity
+	status := C.net_deck_operator_identity_from_seed(
+		(*C.uint8_t)(unsafe.Pointer(&seed[0])),
+		&raw,
+	)
+	if err := deckStatusToError(status); err != nil {
+		return nil, err
+	}
+	h := &DeckOperatorIdentity{ptr: raw}
+	runtime.SetFinalizer(h, func(h *DeckOperatorIdentity) { h.Free() })
+	return h, nil
+}
+
+// OperatorID returns the keypair's origin hash.
+func (i *DeckOperatorIdentity) OperatorID() uint64 {
+	if i == nil || i.ptr == nil {
+		return 0
+	}
+	return uint64(C.net_deck_operator_identity_operator_id(i.ptr))
+}
+
+// PublicKey returns the 32-byte ed25519 verifying key. Used to
+// author an `OperatorRegistry` from a set of known identities.
+func (i *DeckOperatorIdentity) PublicKey() ([]byte, error) {
+	if i == nil || i.ptr == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	buf := make([]byte, 32)
+	status := C.net_deck_operator_identity_public_key(
+		i.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&buf[0])),
+	)
+	if err := deckStatusToError(status); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// SignProposal signs a simulated ICE proposal. Returns the
+// operator id + 64-byte ed25519 signature shaped as a
+// `DeckOperatorSignature` that `Commit` accepts directly.
+//
+// Returns `DeckSdkError(kind: "already_committed")` if the
+// simulated proposal has been consumed by `Commit`.
+func (i *DeckOperatorIdentity) SignProposal(simulated *DeckSimulatedIceProposal) (DeckOperatorSignature, error) {
+	if i == nil || i.ptr == nil || simulated == nil || simulated.ptr == nil {
+		return DeckOperatorSignature{}, ErrDeckInvalidArg
+	}
+	var opID C.uint64_t
+	var sigBytes [64]byte
+	status := C.net_deck_operator_identity_sign_proposal(
+		i.ptr,
+		simulated.ptr,
+		&opID,
+		(*C.uint8_t)(unsafe.Pointer(&sigBytes[0])),
+	)
+	if err := deckStatusToError(status); err != nil {
+		return DeckOperatorSignature{}, err
+	}
+	out := make([]byte, 64)
+	copy(out, sigBytes[:])
+	return DeckOperatorSignature{
+		OperatorID: uint64(opID),
+		Signature:  out,
+	}, nil
+}
+
+// SignPayload signs raw payload bytes with this identity's
+// ed25519 key. Useful for offline / cross-deck signing flows
+// where the deterministic ICE signing payload is exchanged
+// out-of-band (see `DeckSimulatedIceProposal.SigningPayload`).
+func (i *DeckOperatorIdentity) SignPayload(payload []byte) (DeckOperatorSignature, error) {
+	if i == nil || i.ptr == nil {
+		return DeckOperatorSignature{}, ErrDeckInvalidArg
+	}
+	var payloadPtr *C.uint8_t
+	if len(payload) > 0 {
+		payloadPtr = (*C.uint8_t)(unsafe.Pointer(&payload[0]))
+	}
+	var opID C.uint64_t
+	var sigBytes [64]byte
+	status := C.net_deck_operator_identity_sign_payload(
+		i.ptr,
+		payloadPtr,
+		C.size_t(len(payload)),
+		&opID,
+		(*C.uint8_t)(unsafe.Pointer(&sigBytes[0])),
+	)
+	if err := deckStatusToError(status); err != nil {
+		return DeckOperatorSignature{}, err
+	}
+	out := make([]byte, 64)
+	copy(out, sigBytes[:])
+	return DeckOperatorSignature{
+		OperatorID: uint64(opID),
+		Signature:  out,
+	}, nil
+}
+
+// Free releases the identity handle. Idempotent.
+func (i *DeckOperatorIdentity) Free() {
+	if i == nil || i.ptr == nil {
+		return
+	}
+	C.net_deck_operator_identity_free(i.ptr)
+	i.ptr = nil
+	runtime.SetFinalizer(i, nil)
+}
+
+// =====================================================================
+// DeckOperatorRegistry — operator-policy authoring + offline verify
+// =====================================================================
+
+// DeckOperatorRegistry holds known operator public keys keyed
+// by 64-bit operator id. Use to author the cluster's
+// operator-policy snapshot or to pre-verify bundles before
+// invoking `DeckSimulatedIceProposal.Commit`. Mutations are
+// thread-safe at the cdylib layer.
+type DeckOperatorRegistry struct {
+	ptr *C.NetDeckOperatorRegistry
+}
+
+// NewDeckOperatorRegistry creates an empty registry.
+func NewDeckOperatorRegistry() *DeckOperatorRegistry {
+	raw := C.net_deck_operator_registry_new()
+	if raw == nil {
+		return nil
+	}
+	r := &DeckOperatorRegistry{ptr: raw}
+	runtime.SetFinalizer(r, func(r *DeckOperatorRegistry) { r.Free() })
+	return r
+}
+
+// Insert an operator's 32-byte ed25519 public key under
+// `operatorID`.
+func (r *DeckOperatorRegistry) Insert(operatorID uint64, publicKey []byte) error {
+	if r == nil || r.ptr == nil {
+		return ErrDeckInvalidArg
+	}
+	if len(publicKey) != 32 {
+		return fmt.Errorf("%w: publicKey must be 32 bytes, got %d", ErrDeckInvalidArg, len(publicKey))
+	}
+	status := C.net_deck_operator_registry_insert(
+		r.ptr,
+		C.uint64_t(operatorID),
+		(*C.uint8_t)(unsafe.Pointer(&publicKey[0])),
+	)
+	return deckStatusToError(status)
+}
+
+// Register an identity under its derived operator id (the
+// keypair's origin hash).
+func (r *DeckOperatorRegistry) Register(identity *DeckOperatorIdentity) error {
+	if r == nil || r.ptr == nil || identity == nil || identity.ptr == nil {
+		return ErrDeckInvalidArg
+	}
+	status := C.net_deck_operator_registry_register(r.ptr, identity.ptr)
+	return deckStatusToError(status)
+}
+
+// Contains reports whether `operatorID` is registered.
+func (r *DeckOperatorRegistry) Contains(operatorID uint64) bool {
+	if r == nil || r.ptr == nil {
+		return false
+	}
+	return C.net_deck_operator_registry_contains(r.ptr, C.uint64_t(operatorID)) == 1
+}
+
+// Len returns the number of registered operators.
+func (r *DeckOperatorRegistry) Len() int {
+	if r == nil || r.ptr == nil {
+		return 0
+	}
+	return int(C.net_deck_operator_registry_len(r.ptr))
+}
+
+// Verify a single signature over `payload`. Returns a
+// `DeckSdkError` carrying the substrate's stable kind
+// discriminator (`not_authorized`, `signature_invalid`) on
+// failure.
+func (r *DeckOperatorRegistry) Verify(signature DeckOperatorSignature, payload []byte) error {
+	if r == nil || r.ptr == nil {
+		return ErrDeckInvalidArg
+	}
+	if len(signature.Signature) == 0 {
+		return fmt.Errorf("%w: signature is empty", ErrDeckInvalidArg)
+	}
+	cSig := C.NetDeckOperatorSignature{
+		operator_id:   C.uint64_t(signature.OperatorID),
+		signature_ptr: (*C.uint8_t)(unsafe.Pointer(&signature.Signature[0])),
+		signature_len: C.size_t(len(signature.Signature)),
+	}
+	var payloadPtr *C.uint8_t
+	if len(payload) > 0 {
+		payloadPtr = (*C.uint8_t)(unsafe.Pointer(&payload[0]))
+	}
+	status := C.net_deck_operator_registry_verify(r.ptr, &cSig, payloadPtr, C.size_t(len(payload)))
+	return deckStatusToError(status)
+}
+
+// VerifyBundle confirms every signature over `payload` and that
+// at least `threshold` *distinct* operator ids signed it. The
+// distinct-operator dedup gate is the M-of-N guarantee.
+func (r *DeckOperatorRegistry) VerifyBundle(signatures []DeckOperatorSignature, payload []byte, threshold int) error {
+	if r == nil || r.ptr == nil {
+		return ErrDeckInvalidArg
+	}
+	cSigs := make([]C.NetDeckOperatorSignature, len(signatures))
+	for i, sig := range signatures {
+		if len(sig.Signature) == 0 {
+			return fmt.Errorf("%w: signature %d is empty", ErrDeckInvalidArg, i)
+		}
+		cSigs[i] = C.NetDeckOperatorSignature{
+			operator_id:   C.uint64_t(sig.OperatorID),
+			signature_ptr: (*C.uint8_t)(unsafe.Pointer(&sig.Signature[0])),
+			signature_len: C.size_t(len(sig.Signature)),
+		}
+	}
+	var sigsPtr *C.NetDeckOperatorSignature
+	if len(cSigs) > 0 {
+		sigsPtr = &cSigs[0]
+	}
+	var payloadPtr *C.uint8_t
+	if len(payload) > 0 {
+		payloadPtr = (*C.uint8_t)(unsafe.Pointer(&payload[0]))
+	}
+	status := C.net_deck_operator_registry_verify_bundle(
+		r.ptr,
+		sigsPtr,
+		C.size_t(len(signatures)),
+		payloadPtr,
+		C.size_t(len(payload)),
+		C.size_t(threshold),
+	)
+	return deckStatusToError(status)
+}
+
+// Free releases the registry. Idempotent.
+func (r *DeckOperatorRegistry) Free() {
+	if r == nil || r.ptr == nil {
+		return
+	}
+	C.net_deck_operator_registry_free(r.ptr)
+	r.ptr = nil
+	runtime.SetFinalizer(r, nil)
+}
+
+// =====================================================================
+// DeckAdminVerifier — substrate verifier wrapper
+// =====================================================================
+
+// DeckAdminVerifier bundles a snapshotted OperatorRegistry with
+// the cluster's policy knobs (signature threshold, freshness
+// window, future-skew tolerance, ICE cooldown). Useful for
+// offline unit testing of operator-policy decisions.
+//
+// Constructors snapshot the registry at build time — rebuild
+// after every policy change.
+type DeckAdminVerifier struct {
+	ptr *C.NetDeckAdminVerifier
+}
+
+// NewDeckAdminVerifier builds a verifier with the substrate's
+// default freshness (300s), future-skew (30s), and ICE cooldown
+// (300s) windows. `threshold = 0` is clamped to `1`.
+func NewDeckAdminVerifier(registry *DeckOperatorRegistry, threshold int) *DeckAdminVerifier {
+	if registry == nil || registry.ptr == nil {
+		return nil
+	}
+	raw := C.net_deck_admin_verifier_new(registry.ptr, C.size_t(threshold))
+	if raw == nil {
+		return nil
+	}
+	v := &DeckAdminVerifier{ptr: raw}
+	runtime.SetFinalizer(v, func(v *DeckAdminVerifier) { v.Free() })
+	return v
+}
+
+// NewDeckAdminVerifierWithFreshness uses explicit freshness +
+// future-skew windows and the default ICE cooldown.
+func NewDeckAdminVerifierWithFreshness(registry *DeckOperatorRegistry, threshold int, freshnessWindowMs, futureSkewMs uint64) *DeckAdminVerifier {
+	if registry == nil || registry.ptr == nil {
+		return nil
+	}
+	raw := C.net_deck_admin_verifier_with_freshness(
+		registry.ptr,
+		C.size_t(threshold),
+		C.uint64_t(freshnessWindowMs),
+		C.uint64_t(futureSkewMs),
+	)
+	if raw == nil {
+		return nil
+	}
+	v := &DeckAdminVerifier{ptr: raw}
+	runtime.SetFinalizer(v, func(v *DeckAdminVerifier) { v.Free() })
+	return v
+}
+
+// NewDeckAdminVerifierWithFullPolicy sets every policy knob.
+// Primarily for tests that need a short cooldown window.
+func NewDeckAdminVerifierWithFullPolicy(registry *DeckOperatorRegistry, threshold int, freshnessWindowMs, futureSkewMs, iceCooldownMs uint64) *DeckAdminVerifier {
+	if registry == nil || registry.ptr == nil {
+		return nil
+	}
+	raw := C.net_deck_admin_verifier_with_full_policy(
+		registry.ptr,
+		C.size_t(threshold),
+		C.uint64_t(freshnessWindowMs),
+		C.uint64_t(futureSkewMs),
+		C.uint64_t(iceCooldownMs),
+	)
+	if raw == nil {
+		return nil
+	}
+	v := &DeckAdminVerifier{ptr: raw}
+	runtime.SetFinalizer(v, func(v *DeckAdminVerifier) { v.Free() })
+	return v
+}
+
+func (v *DeckAdminVerifier) Threshold() int {
+	if v == nil || v.ptr == nil {
+		return 0
+	}
+	return int(C.net_deck_admin_verifier_threshold(v.ptr))
+}
+
+func (v *DeckAdminVerifier) FreshnessWindowMs() uint64 {
+	if v == nil || v.ptr == nil {
+		return 0
+	}
+	return uint64(C.net_deck_admin_verifier_freshness_window_ms(v.ptr))
+}
+
+func (v *DeckAdminVerifier) FutureSkewMs() uint64 {
+	if v == nil || v.ptr == nil {
+		return 0
+	}
+	return uint64(C.net_deck_admin_verifier_future_skew_ms(v.ptr))
+}
+
+func (v *DeckAdminVerifier) IceCooldownMs() uint64 {
+	if v == nil || v.ptr == nil {
+		return 0
+	}
+	return uint64(C.net_deck_admin_verifier_ice_cooldown_ms(v.ptr))
+}
+
+func (v *DeckAdminVerifier) Free() {
+	if v == nil || v.ptr == nil {
+		return
+	}
+	C.net_deck_admin_verifier_free(v.ptr)
+	v.ptr = nil
+	runtime.SetFinalizer(v, nil)
 }

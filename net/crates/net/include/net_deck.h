@@ -703,6 +703,187 @@ int net_deck_simulated_commit(
 /* Free a simulated proposal handle. Idempotent on NULL. */
 void net_deck_simulated_free(NetDeckSimulatedIceProposal* simulated);
 
+/* Heap-allocate + return the deterministic ICE signing payload
+ * bytes (`ICE_SIGNING_DOMAIN || issued_at_ms (LE u64) ||
+ * blast_hash (32) || postcard(action)`). On success writes the
+ * buffer pointer to `*out_ptr` and the byte count to `*out_len`;
+ * caller MUST release the buffer via
+ * `net_deck_signing_payload_free(*out_ptr, *out_len)`. Returns
+ * `NET_DECK_ERR_CALL_FAILED` with kind `already_committed` if
+ * the proposal has been consumed by `net_deck_simulated_commit`. */
+int net_deck_simulated_signing_payload(
+    const NetDeckSimulatedIceProposal* simulated,
+    uint8_t** out_ptr,
+    size_t* out_len
+);
+
+/* Free a buffer returned by `net_deck_simulated_signing_payload`.
+ * Idempotent on NULL / zero length. */
+void net_deck_signing_payload_free(uint8_t* ptr, size_t len);
+
+/* =========================================================================
+ * Operator identity opaque handle
+ * ========================================================================= */
+
+typedef struct NetDeckOperatorIdentity NetDeckOperatorIdentity;
+
+/* Generate a fresh ed25519 keypair + operator identity. Caller
+ * frees via `net_deck_operator_identity_free`. */
+NetDeckOperatorIdentity* net_deck_operator_identity_generate(void);
+
+/* Load from a 32-byte ed25519 seed. Writes the handle to `*out`. */
+int net_deck_operator_identity_from_seed(
+    const uint8_t* seed_ptr,
+    NetDeckOperatorIdentity** out
+);
+
+/* Operator id (the keypair's origin hash). Returns 0 on NULL. */
+uint64_t net_deck_operator_identity_operator_id(
+    const NetDeckOperatorIdentity* identity
+);
+
+/* Write the 32-byte ed25519 public key into `out_buf`. */
+int net_deck_operator_identity_public_key(
+    const NetDeckOperatorIdentity* identity,
+    uint8_t* out_buf
+);
+
+/* Sign a simulated ICE proposal. On success writes the operator
+ * id to `*out_operator_id` and the 64-byte signature into
+ * `out_signature`. Returns kind `already_committed` if the
+ * proposal has been consumed by `net_deck_simulated_commit`. */
+int net_deck_operator_identity_sign_proposal(
+    const NetDeckOperatorIdentity* identity,
+    const NetDeckSimulatedIceProposal* simulated,
+    uint64_t* out_operator_id,
+    uint8_t* out_signature
+);
+
+/* Sign raw payload bytes. Useful for offline / cross-deck
+ * signing flows where the signing payload is exchanged
+ * out-of-band (see `net_deck_simulated_signing_payload`). */
+int net_deck_operator_identity_sign_payload(
+    const NetDeckOperatorIdentity* identity,
+    const uint8_t* payload_ptr,
+    size_t payload_len,
+    uint64_t* out_operator_id,
+    uint8_t* out_signature
+);
+
+/* Free an operator identity. Idempotent on NULL. */
+void net_deck_operator_identity_free(NetDeckOperatorIdentity* identity);
+
+/* =========================================================================
+ * Operator registry opaque handle
+ *
+ * Authoring tool + offline-friendly verifier for operator
+ * signature bundles. Mutations are thread-safe at the cdylib
+ * layer (internal mutex).
+ * ========================================================================= */
+
+typedef struct NetDeckOperatorRegistry NetDeckOperatorRegistry;
+
+/* Create an empty operator registry. */
+NetDeckOperatorRegistry* net_deck_operator_registry_new(void);
+
+/* Insert a 32-byte ed25519 public key under `operator_id`. */
+int net_deck_operator_registry_insert(
+    NetDeckOperatorRegistry* registry,
+    uint64_t operator_id,
+    const uint8_t* public_key
+);
+
+/* Register an `OperatorIdentity`'s public key under its derived
+ * operator id (the keypair's origin hash). */
+int net_deck_operator_registry_register(
+    NetDeckOperatorRegistry* registry,
+    const NetDeckOperatorIdentity* identity
+);
+
+/* Returns 1 iff `operator_id` is registered, 0 otherwise, -1 on
+ * NULL pointer. */
+int net_deck_operator_registry_contains(
+    const NetDeckOperatorRegistry* registry,
+    uint64_t operator_id
+);
+
+/* Number of registered operators. Returns 0 on NULL. */
+size_t net_deck_operator_registry_len(
+    const NetDeckOperatorRegistry* registry
+);
+
+/* Verify a single signature over `payload`. On failure sets the
+ * thread-local last-error kind to the substrate's stable
+ * discriminator (`not_authorized`, `signature_invalid`). */
+int net_deck_operator_registry_verify(
+    const NetDeckOperatorRegistry* registry,
+    const NetDeckOperatorSignature* signature,
+    const uint8_t* payload_ptr,
+    size_t payload_len
+);
+
+/* Verify every signature in the bundle and confirm at least
+ * `threshold` *distinct* operator ids signed `payload`. The
+ * distinct-operator dedup gate is the load-bearing M-of-N
+ * guarantee. */
+int net_deck_operator_registry_verify_bundle(
+    const NetDeckOperatorRegistry* registry,
+    const NetDeckOperatorSignature* sigs_ptr,
+    size_t sigs_count,
+    const uint8_t* payload_ptr,
+    size_t payload_len,
+    size_t threshold
+);
+
+/* Free an operator registry. Idempotent on NULL. */
+void net_deck_operator_registry_free(NetDeckOperatorRegistry* registry);
+
+/* =========================================================================
+ * Admin verifier opaque handle
+ *
+ * Wraps a snapshotted `OperatorRegistry` with the cluster's
+ * policy knobs (threshold, freshness window, future-skew
+ * tolerance, ICE cooldown). Useful for offline unit testing of
+ * operator-policy decisions. Constructors snapshot the
+ * registry at build time — rebuild after every policy change.
+ * ========================================================================= */
+
+typedef struct NetDeckAdminVerifier NetDeckAdminVerifier;
+
+/* Substrate defaults: 300s freshness, 30s future-skew, 300s ICE
+ * cooldown. `threshold = 0` is clamped to `1`. Returns NULL on
+ * NULL registry. */
+NetDeckAdminVerifier* net_deck_admin_verifier_new(
+    const NetDeckOperatorRegistry* registry,
+    size_t threshold
+);
+
+/* Explicit freshness + future-skew windows, default ICE cooldown. */
+NetDeckAdminVerifier* net_deck_admin_verifier_with_freshness(
+    const NetDeckOperatorRegistry* registry,
+    size_t threshold,
+    uint64_t freshness_window_ms,
+    uint64_t future_skew_ms
+);
+
+/* Every policy knob explicit. Primarily for tests that need a
+ * short cooldown window. */
+NetDeckAdminVerifier* net_deck_admin_verifier_with_full_policy(
+    const NetDeckOperatorRegistry* registry,
+    size_t threshold,
+    uint64_t freshness_window_ms,
+    uint64_t future_skew_ms,
+    uint64_t ice_cooldown_ms
+);
+
+size_t net_deck_admin_verifier_threshold(const NetDeckAdminVerifier* verifier);
+uint64_t net_deck_admin_verifier_freshness_window_ms(const NetDeckAdminVerifier* verifier);
+uint64_t net_deck_admin_verifier_future_skew_ms(const NetDeckAdminVerifier* verifier);
+uint64_t net_deck_admin_verifier_ice_cooldown_ms(const NetDeckAdminVerifier* verifier);
+
+/* Free an admin verifier. Idempotent on NULL. */
+void net_deck_admin_verifier_free(NetDeckAdminVerifier* verifier);
+
 /* =========================================================================
  * Last-error trio (thread-local)
  * ========================================================================= */
