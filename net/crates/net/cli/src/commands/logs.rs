@@ -18,8 +18,9 @@ use crate::prelude::{emit_stream_row, OutputFormat};
 
 #[derive(Args, Debug)]
 pub struct LogTailArgs {
-    /// Follow the stream (default). The flag is accepted for
-    /// symmetry with `tail -f`; `net log tail` always tails.
+    /// Accepted for symmetry with `tail -f`; this command always
+    /// follows the stream regardless of whether `--follow` is
+    /// passed (there is no one-shot mode).
     #[arg(short = 'f', long)]
     pub follow: bool,
 
