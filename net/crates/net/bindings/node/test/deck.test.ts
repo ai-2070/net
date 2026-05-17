@@ -124,6 +124,29 @@ d('Deck SDK operator-side bindings (Phase 5 slice 1)', () => {
     }
   });
 
+  it('DeckClient.shutdown drains the owned supervisor; second call is a no-op', async () => {
+    const client = await DeckClient.new(Buffer.alloc(32, 0x57));
+    // First shutdown drains the private SDK.
+    await client.shutdown();
+    // Second shutdown is idempotent — returns Ok without throwing.
+    await client.shutdown();
+  });
+
+  it('DeckClient.shutdown is a no-op for fromMeshos-constructed clients', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
+      // External SDK — shutdown must NOT drain it.
+      await client.shutdown();
+      // Sdk is still alive; we can still register a daemon etc.
+      // (status() against the bound deck client still works.)
+      const snap = client.status();
+      expect(typeof snap).toBe('string');
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
   // -------------------------------------------------------------------------
   // status / statusSummary
   // -------------------------------------------------------------------------

@@ -627,6 +627,32 @@ impl DeckClient {
         }
     }
 
+    /// Tear down the private supervisor runtime if the client
+    /// owns one (constructed via `DeckClient.new`). No-op for
+    /// clients built via `fromMeshos` against an externally-
+    /// managed SDK — the caller is responsible for that SDK's
+    /// own `shutdown()`. Idempotent: subsequent calls return
+    /// `Ok(())` without re-shutting down.
+    ///
+    /// Wired into the TS wrapper's `close()` /
+    /// `Symbol.asyncDispose` so `await using deck = …;` drains
+    /// the supervisor at scope exit.
+    #[napi]
+    pub async fn shutdown(&self) -> Result<()> {
+        let Some(cell) = self._owned_sdk.as_ref() else {
+            // External SDK — caller owns its lifecycle. No-op.
+            return Ok(());
+        };
+        let Some(sdk) = cell.lock().await.take() else {
+            // Already shut down on a prior call.
+            return Ok(());
+        };
+        sdk.shutdown()
+            .await
+            .map(|_stats| ())
+            .map_err(|e| deck_err("shutdown_failed", format!("runtime shutdown failed: {e:?}")))
+    }
+
     /// Typed admin-event surface.
     #[napi(getter)]
     pub fn admin(&self) -> AdminCommands {

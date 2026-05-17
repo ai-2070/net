@@ -56,11 +56,12 @@ import {
   type FailureRecordJs,
   type LogFilterJs,
   type LogRecordJs,
+  type MeshOsConfigJs,
   type OperatorSignatureJs,
   type StatusSummaryJs,
 } from '@ai2070/net';
 
-import { MeshOsDaemonSdk } from './meshos.js';
+import { MeshOsDaemonSdk, type MeshOsConfig } from './meshos.js';
 
 // ----------------------------------------------------------------------------
 // Typed error envelope (mirrors MeshOS SDK's MeshOsSdkError)
@@ -314,6 +315,46 @@ export class DeckClient {
   private constructor(private readonly raw: NapiClient) {}
 
   /**
+   * Construct a deck client that owns a private supervisor
+   * runtime. Mirrors the cdylib's `net_deck_client_new`
+   * (operator-only mode) for consumers without a separately-
+   * managed `MeshOsDaemonSdk`.
+   *
+   * `operatorSeed` must be exactly 32 bytes of ed25519 seed
+   * material. Call `.close()` (or use `await using`) to drain
+   * the supervisor at end of scope; otherwise the runtime
+   * releases on GC.
+   */
+  static async new(
+    operatorSeed: Uint8Array | Buffer,
+    meshosConfig?: MeshOsConfig,
+    deckConfig?: DeckClientConfig,
+  ): Promise<DeckClient> {
+    return rethrowAsync(async () => {
+      const meshos: MeshOsConfigJs | undefined = meshosConfig
+        ? {
+            thisNode: meshosConfig.thisNode,
+            tickIntervalMs: meshosConfig.tickIntervalMs,
+            eventQueueCapacity: meshosConfig.eventQueueCapacity,
+            actionQueueCapacity: meshosConfig.actionQueueCapacity,
+          }
+        : undefined;
+      const deck: DeckClientConfigJs | undefined = deckConfig
+        ? {
+            snapshotPollIntervalMs: deckConfig.snapshotPollIntervalMs,
+            iceSignatureThreshold: deckConfig.iceSignatureThreshold,
+          }
+        : undefined;
+      const raw = await NapiClient.new(
+        operatorSeed as unknown as Buffer,
+        meshos,
+        deck,
+      );
+      return new DeckClient(raw);
+    });
+  }
+
+  /**
    * Construct against a running `MeshOsDaemonSdk`. Reuses the
    * SDK's tokio runtime so streams + admin commits run on the
    * same supervisor scheduler.
@@ -334,6 +375,24 @@ export class DeckClient {
       const raw = await NapiClient.fromMeshos(rawSdk, identity, cfg);
       return new DeckClient(raw);
     });
+  }
+
+  /**
+   * Tear down the private supervisor runtime if this client owns
+   * one (constructed via `DeckClient.new`). No-op for clients
+   * built via `fromMeshos` against an externally-managed SDK.
+   * Idempotent: subsequent calls return without throwing.
+   */
+  async close(): Promise<void> {
+    await rethrowAsync(() => this.raw.shutdown());
+  }
+
+  /**
+   * `await using` hook so `await using deck = await DeckClient.new(...)`
+   * drains the supervisor at scope exit.
+   */
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.close();
   }
 
   /** Operator identity bound to this client. */
