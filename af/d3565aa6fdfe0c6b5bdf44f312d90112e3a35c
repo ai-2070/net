@@ -1,0 +1,28 @@
+net/crates/net/bindings/go/net/deck.go
+  s_275316fc500935::t_03827638b6d9b7 850-855,874,877-886
+  s_275316fc500935::t_da6eabe1880f77 1082-1083,1085-1087
+  s_275316fc500935::t_b8469027b65397 825-826,828-830
+  s_275316fc500935::t_498b96337bdc2c 1256-1257,1259-1261,1265-1270,1293,1296-1305
+  s_275316fc500935::t_f0cc749f7062c7 1104-1109,1129,1132-1141
+  s_275316fc500935::t_dfe491972023cc 1041-1046,1067,1070-1079
+  s_275316fc500935::t_c5186faa9bc3c5 746-751,753-755
+  s_275316fc500935::t_6aeefedb697bb6 330
+  s_275316fc500935::t_4412eabbfd228b 778-783,803-805,809,812-821
+  s_275316fc500935::t_84b16667c0cd4b 1008-1009,1011-1013
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "afd3565aa6fdfe0c6b5bdf44f312d90112e3a35c",
+  "prompts": {},
+  "sessions": {
+    "s_275316fc500935": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f087a884-b322-4d2f-9650-4afee91efe78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
