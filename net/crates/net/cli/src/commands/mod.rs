@@ -10,6 +10,7 @@
 //! `cap`, `peer`, `port`, `db`, `netdb`) land in subsequent
 //! commits.
 
+pub mod admin;
 pub mod audit;
 pub mod cap;
 pub mod daemon;
