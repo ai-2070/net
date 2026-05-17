@@ -707,6 +707,28 @@ impl ShardManager {
         table.shards.iter().map(|s| s.lock().len() as u64).sum()
     }
 
+    /// Best-effort variant of [`total_pending_in_rings`] that never
+    /// blocks: every shard whose mutex is currently held is skipped
+    /// (counted as zero). Use this from `Drop` or any path that may
+    /// run on a thread already holding a shard lock (single-thread
+    /// runtime + panic during shutdown is the canonical hazard); the
+    /// blocking variant would self-deadlock there.
+    ///
+    /// Returns `(sum_counted, uncounted_shard_count)` so the caller
+    /// can log the uncertainty in the result.
+    pub fn try_total_pending_in_rings(&self) -> (u64, usize) {
+        let table = self.table.load();
+        let mut sum: u64 = 0;
+        let mut uncounted: usize = 0;
+        for s in table.shards.iter() {
+            match s.try_lock() {
+                Some(guard) => sum += guard.len() as u64,
+                None => uncounted += 1,
+            }
+        }
+        (sum, uncounted)
+    }
+
     /// Get aggregated statistics from all shards.
     ///
     /// Lock-free: reads each shard's atomic counters directly via the
@@ -1044,6 +1066,38 @@ mod tests {
         assert!(
             metrics.avg_push_latency_ns > 0,
             "push latency must be recorded"
+        );
+    }
+
+    /// `try_total_pending_in_rings` must never block, must skip
+    /// shards whose mutex is currently held, and must report how
+    /// many it skipped. This is what makes `EventBus::Drop`
+    /// safe to call on a thread that already holds a shard lock.
+    #[test]
+    fn try_total_pending_in_rings_skips_held_shards() {
+        let manager = ShardManager::new(2, 1024, BackpressureMode::DropNewest);
+        // Push some events so a non-zero count is observable.
+        manager.ingest(json!({"i": 1})).unwrap();
+        manager.ingest(json!({"i": 2})).unwrap();
+        manager.ingest(json!({"i": 3})).unwrap();
+
+        // Uncontended: all shards counted, uncounted_shards == 0.
+        let (sum, uncounted) = manager.try_total_pending_in_rings();
+        assert_eq!(uncounted, 0);
+        let baseline_sum = sum;
+        assert!(baseline_sum > 0, "events should be pending in some shard");
+
+        // Hold one shard's mutex and re-check: that shard must be
+        // skipped, uncounted must be 1, and the call must return
+        // immediately (this test would hang on the blocking
+        // `total_pending_in_rings` variant).
+        let table = manager.table.load();
+        let _guard = table.shards[0].lock();
+        let (sum2, uncounted2) = manager.try_total_pending_in_rings();
+        assert_eq!(uncounted2, 1, "the locked shard must be uncounted");
+        assert!(
+            sum2 <= baseline_sum,
+            "sum must not include events from the locked shard"
         );
     }
 

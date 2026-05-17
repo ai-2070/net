@@ -1793,7 +1793,23 @@ impl Drop for EventBus {
             // observe the shutdown flag and exit, but we have no
             // synchronous way from Drop to enumerate them. The ring-
             // buffer count is a lower bound on the stranded total.
-            let stranded_in_rings = self.shard_manager.total_pending_in_rings();
+            //
+            // Use the non-blocking accessor: if `Drop` runs on a
+            // thread that already holds a shard mutex (single-thread
+            // runtime + panic during shutdown is the canonical
+            // hazard), the blocking `total_pending_in_rings` would
+            // self-deadlock. Best-effort accounting is the right
+            // trade-off here — we'd rather under-report stranded
+            // events than wedge the drop forever.
+            let (stranded_in_rings, uncounted_shards) =
+                self.shard_manager.try_total_pending_in_rings();
+            if uncounted_shards > 0 {
+                tracing::warn!(
+                    uncounted_shards,
+                    "EventBus::drop: {uncounted_shards} shard(s) were locked at \
+                     drop time and could not be accounted for in stranded_in_rings"
+                );
+            }
             if stranded_in_rings > 0 {
                 self.stats
                     .events_dropped
