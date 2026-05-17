@@ -463,6 +463,15 @@ pub struct StoredEvent {
 
     /// Shard this event belongs to.
     pub shard_id: u16,
+
+    /// Application-level idempotency key as written by the producer.
+    /// Adapters carry an opaque dedup token on the wire (Redis Streams
+    /// uses a `dedup_id` field; JetStream uses `Nats-Msg-Id`). The
+    /// trait-level consumer ([`Adapter::poll_shard`]) surfaces it here
+    /// so callers can drive their own dedup table without re-reading
+    /// the raw broker payload. `None` when the adapter or the wire
+    /// entry doesn't carry one.
+    pub dedup_id: Option<String>,
 }
 
 impl StoredEvent {
@@ -474,6 +483,7 @@ impl StoredEvent {
             raw,
             insertion_ts,
             shard_id,
+            dedup_id: None,
         }
     }
 
@@ -489,7 +499,17 @@ impl StoredEvent {
             raw,
             insertion_ts,
             shard_id,
+            dedup_id: None,
         }
+    }
+
+    /// Attach an application-level dedup identifier (the producer's
+    /// `dedup_id` / `Nats-Msg-Id`). Returns `self` for chaining.
+    #[inline]
+    #[must_use]
+    pub fn with_dedup_id(mut self, dedup_id: Option<String>) -> Self {
+        self.dedup_id = dedup_id;
+        self
     }
 
     /// Parse the raw bytes into a JSON value on demand.
@@ -514,7 +534,10 @@ impl Serialize for StoredEvent {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("StoredEvent", 4)?;
+        // dedup_id is included only when present, so unaware callers
+        // see exactly the legacy 4-field shape.
+        let field_count = if self.dedup_id.is_some() { 5 } else { 4 };
+        let mut state = serializer.serialize_struct("StoredEvent", field_count)?;
         state.serialize_field("id", &self.id)?;
         // Serialize raw bytes as a `RawValue` so the on-wire JSON
         // is byte-for-byte the same as the input. Pre-fix the
@@ -540,6 +563,9 @@ impl Serialize for StoredEvent {
         state.serialize_field("raw", &*raw_value)?;
         state.serialize_field("insertion_ts", &self.insertion_ts)?;
         state.serialize_field("shard_id", &self.shard_id)?;
+        if let Some(dedup_id) = &self.dedup_id {
+            state.serialize_field("dedup_id", dedup_id)?;
+        }
         state.end()
     }
 }

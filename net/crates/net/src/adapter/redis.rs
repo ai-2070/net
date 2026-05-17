@@ -231,34 +231,59 @@ impl RedisAdapter {
             let Value::Array(fields) = &parts[1] else {
                 continue;
             };
-            // Find the "d" field. Compare against the byte literal directly
-            // — no allocation for what is otherwise a constant-name probe
-            // on every entry.
+            // Find the "d" (data) and "dedup_id" fields. Compare
+            // against byte literals directly — no allocation for
+            // what is otherwise a constant-name probe on every entry.
+            // The XADD producer at on_batch writes both fields; the
+            // documented consumer contract at the top of this module
+            // requires us to surface dedup_id so callers can drive
+            // their own dedup table.
+            let mut data_bytes: Option<&[u8]> = None;
+            let mut dedup_id: Option<String> = None;
             let mut i = 0;
             while i + 1 < fields.len() {
-                let is_data_field = match &fields[i] {
-                    Value::BulkString(bytes) => bytes.as_slice() == b"d",
-                    Value::SimpleString(s) => s == "d",
-                    _ => false,
-                };
-
-                if is_data_field {
-                    if let Value::BulkString(data) = &fields[i + 1] {
-                        match Self::deserialize_event(&id, data) {
-                            Ok(event) => events.push(event),
-                            Err(e) => {
-                                tracing::warn!(
-                                    stream = %stream_key,
-                                    id = %id,
-                                    error = %e,
-                                    "Failed to deserialize event, skipping"
-                                );
-                            }
+                match &fields[i] {
+                    Value::BulkString(bytes) if bytes.as_slice() == b"d" => {
+                        if let Value::BulkString(data) = &fields[i + 1] {
+                            data_bytes = Some(data.as_slice());
                         }
                     }
-                    break;
+                    Value::SimpleString(s) if s == "d" => {
+                        if let Value::BulkString(data) = &fields[i + 1] {
+                            data_bytes = Some(data.as_slice());
+                        }
+                    }
+                    Value::BulkString(bytes) if bytes.as_slice() == b"dedup_id" => {
+                        if let Value::BulkString(v) = &fields[i + 1] {
+                            dedup_id = Some(String::from_utf8_lossy(v).into_owned());
+                        } else if let Value::SimpleString(v) = &fields[i + 1] {
+                            dedup_id = Some(v.clone());
+                        }
+                    }
+                    Value::SimpleString(s) if s == "dedup_id" => {
+                        if let Value::BulkString(v) = &fields[i + 1] {
+                            dedup_id = Some(String::from_utf8_lossy(v).into_owned());
+                        } else if let Value::SimpleString(v) = &fields[i + 1] {
+                            dedup_id = Some(v.clone());
+                        }
+                    }
+                    _ => {}
                 }
                 i += 2;
+            }
+
+            if let Some(data) = data_bytes {
+                match Self::deserialize_event(&id, data) {
+                    Ok(event) => events.push(event.with_dedup_id(dedup_id)),
+                    Err(e) => {
+                        tracing::warn!(
+                            stream = %stream_key,
+                            id = %id,
+                            error = %e,
+                            "Failed to deserialize event, skipping"
+                        );
+                    }
+                }
             }
         }
 
@@ -744,6 +769,72 @@ mod tests {
         assert!(result.events.is_empty());
         assert!(result.next_id.is_none());
         assert!(!result.has_more);
+    }
+
+    /// Build a synthetic XRANGE entry carrying both `d` and `dedup_id`
+    /// fields — mirroring exactly what `on_batch` writes.
+    fn xrange_entry_with_dedup(id: &str, payload: &[u8], dedup_id: &str) -> Value {
+        Value::Array(vec![
+            Value::BulkString(id.as_bytes().to_vec()),
+            Value::Array(vec![
+                Value::BulkString(b"d".to_vec()),
+                Value::BulkString(payload.to_vec()),
+                Value::BulkString(b"dedup_id".to_vec()),
+                Value::BulkString(dedup_id.as_bytes().to_vec()),
+            ]),
+        ])
+    }
+
+    /// The producer-side dedup_id contract documented at the top of
+    /// this module says consumers MUST be able to extract dedup_id
+    /// from the field map. Pre-fix parse_xrange_response only probed
+    /// for the "d" field and silently dropped dedup_id, leaving every
+    /// trait-level consumer with no way to dedup retries without
+    /// re-decoding the raw broker entry. This round-trip test pins
+    /// the field through the parser.
+    #[test]
+    fn parse_xrange_response_surfaces_dedup_id() {
+        let good = br#"{"r":{"k":"v"},"t":1,"s":0}"#;
+        let response = Value::Array(vec![
+            xrange_entry_with_dedup("1-0", good, "nonce123:0:42:0"),
+            // Entry with no dedup_id — backwards compatibility.
+            xrange_entry("2-0", good),
+        ]);
+
+        let result = RedisAdapter::parse_xrange_response(response, 10, "myapp:shard:0");
+
+        assert_eq!(result.events.len(), 2);
+        assert_eq!(
+            result.events[0].dedup_id.as_deref(),
+            Some("nonce123:0:42:0"),
+            "dedup_id must round-trip from wire field through StoredEvent"
+        );
+        assert!(
+            result.events[1].dedup_id.is_none(),
+            "missing dedup_id field must surface as None, not panic or fabricate"
+        );
+    }
+
+    /// Field-order independence: dedup_id may precede `d` on the wire.
+    /// The parser must not depend on emission order from the producer.
+    #[test]
+    fn parse_xrange_response_dedup_id_order_independent() {
+        let good = br#"{"r":{"k":"v"},"t":1,"s":0}"#;
+        let entry = Value::Array(vec![
+            Value::BulkString(b"5-0".to_vec()),
+            Value::Array(vec![
+                Value::BulkString(b"dedup_id".to_vec()),
+                Value::BulkString(b"abc:0:1:0".to_vec()),
+                Value::BulkString(b"d".to_vec()),
+                Value::BulkString(good.to_vec()),
+            ]),
+        ]);
+
+        let result =
+            RedisAdapter::parse_xrange_response(Value::Array(vec![entry]), 10, "myapp:shard:0");
+
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].dedup_id.as_deref(), Some("abc:0:1:0"));
     }
 
     /// Pin: Redis Cluster topology errors (`MOVED`, `ASK`,
