@@ -42,19 +42,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --doc --features "net redex cortex netdb"
 
-      # `deck` is a separate workspace member (TUI operator console);
-      # its #[test] functions live alongside its sources and aren't
-      # compiled by `cargo test --lib` (which builds only the
-      # current-package lib). Run them explicitly via `-p deck`.
+      # `deck` is a separate workspace member (TUI operator console).
+      # It's a binary-only package — `[[bin]]` with no `[lib]` — so
+      # `--lib` / `--doc` would fail with "no library targets found".
+      # Its `#[test]` modules live alongside the binary sources;
+      # `--bins` compiles them into the binary's test harness.
       - name: Run Deck unit tests
         if: ${{ !cancelled() }}
-        run: cargo test --lib -p deck
-
-      # Deck doctests — `///` examples in deck/src/. Same rationale
-      # as `cargo test --doc` for the main crate.
-      - name: Run Deck doctests
-        if: ${{ !cancelled() }}
-        run: cargo test --doc -p deck
+        run: cargo test -p deck --bins
 
   integration-tests:
     name: Integration tests (Net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC, Dataforts, MeshDB, MeshOS)
