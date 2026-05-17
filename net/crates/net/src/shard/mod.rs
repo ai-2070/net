@@ -37,6 +37,7 @@ use crate::timestamp::TimestampGenerator;
 use serde_json::Value as JsonValue;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Atomic counters for a single shard. Kept outside `Shard` as `Arc`s
 /// so `ShardManager::stats()` can aggregate them without locking each
@@ -144,6 +145,7 @@ impl Shard {
     /// This is the fastest ingestion path - no serialization or hashing needed.
     #[inline]
     pub fn try_push_raw(&mut self, raw: Bytes) -> Result<u64, IngestionError> {
+        let push_start = self.metrics_collector.as_ref().map(|_| Instant::now());
         let ts = self.timestamp_gen.next();
         let event = InternalEvent::new(raw, ts, self.id);
 
@@ -152,6 +154,10 @@ impl Shard {
                 self.counters
                     .events_ingested
                     .fetch_add(1, AtomicOrdering::Relaxed);
+                if let (Some(collector), Some(start)) = (&self.metrics_collector, push_start) {
+                    collector.record_push(start.elapsed().as_nanos() as u64);
+                    collector.record_buffer_len(self.ring_buffer.len());
+                }
                 Ok(ts)
             }
             Err(_) => {
@@ -169,6 +175,7 @@ impl Shard {
     /// This serializes the value once before storing.
     #[inline]
     pub fn try_push(&mut self, raw: JsonValue) -> Result<u64, IngestionError> {
+        let push_start = self.metrics_collector.as_ref().map(|_| Instant::now());
         let ts = self.timestamp_gen.next();
         let event = InternalEvent::from_value(raw, ts, self.id);
 
@@ -177,6 +184,10 @@ impl Shard {
                 self.counters
                     .events_ingested
                     .fetch_add(1, AtomicOrdering::Relaxed);
+                if let (Some(collector), Some(start)) = (&self.metrics_collector, push_start) {
+                    collector.record_push(start.elapsed().as_nanos() as u64);
+                    collector.record_buffer_len(self.ring_buffer.len());
+                }
                 Ok(ts)
             }
             Err(_) => {
@@ -1009,6 +1020,49 @@ mod tests {
         assert_eq!(event.shard_id, 0);
         assert_eq!(event.insertion_ts, ts);
         assert!(shard.is_empty());
+    }
+
+    /// A `Shard` configured with a `ShardMetricsCollector` must feed every
+    /// successful push into the collector so the dynamic-scaling and
+    /// drain-finalize paths see non-zero counters. Without this wiring
+    /// `evaluate_scaling` reads `fill_ratio == 0` for every shard and
+    /// `finalize_draining`'s "is the ring actually empty" predicate is a
+    /// no-op (it sees `pushes_since_drain_start == 0` regardless of
+    /// contents).
+    #[test]
+    fn try_push_feeds_metrics_collector() {
+        let collector = Arc::new(ShardMetricsCollector::new(0, 1024));
+        let mut shard = Shard::with_metrics(0, 1024, Arc::clone(&collector));
+
+        for i in 0..16 {
+            shard.try_push(json!({"i": i})).unwrap();
+        }
+
+        let metrics = collector.collect_and_reset();
+        assert_eq!(metrics.event_rate, 16, "every push must increment event_rate");
+        assert!(metrics.fill_ratio > 0.0, "buffer length must be observable");
+        assert!(
+            metrics.avg_push_latency_ns > 0,
+            "push latency must be recorded"
+        );
+    }
+
+    /// Same wiring for `try_push_raw` — the byte-oriented hot path.
+    #[test]
+    fn try_push_raw_feeds_metrics_collector() {
+        let collector = Arc::new(ShardMetricsCollector::new(0, 1024));
+        let mut shard = Shard::with_metrics(0, 1024, Arc::clone(&collector));
+
+        for i in 0..16 {
+            shard
+                .try_push_raw(bytes::Bytes::from(format!("event-{i}")))
+                .unwrap();
+        }
+
+        let metrics = collector.collect_and_reset();
+        assert_eq!(metrics.event_rate, 16);
+        assert!(metrics.fill_ratio > 0.0);
+        assert!(metrics.avg_push_latency_ns > 0);
     }
 
     #[test]
