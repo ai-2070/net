@@ -1441,6 +1441,7 @@ pub extern "C" fn net_deck_audit_query_recent(
     limit: usize,
 ) -> c_int {
     let Some(q) = (unsafe { query.as_mut() }) else {
+        set_last_error("invalid_argument", "query pointer is NULL");
         return NET_DECK_ERR_NULL;
     };
     q.recent_limit = Some(limit);
@@ -1454,6 +1455,7 @@ pub extern "C" fn net_deck_audit_query_by_operator(
     operator_id: u64,
 ) -> c_int {
     let Some(q) = (unsafe { query.as_mut() }) else {
+        set_last_error("invalid_argument", "query pointer is NULL");
         return NET_DECK_ERR_NULL;
     };
     q.by_operator = Some(operator_id);
@@ -1468,6 +1470,7 @@ pub extern "C" fn net_deck_audit_query_between(
     end_ms: u64,
 ) -> c_int {
     let Some(q) = (unsafe { query.as_mut() }) else {
+        set_last_error("invalid_argument", "query pointer is NULL");
         return NET_DECK_ERR_NULL;
     };
     q.between = Some((start_ms, end_ms));
@@ -1478,6 +1481,7 @@ pub extern "C" fn net_deck_audit_query_between(
 #[no_mangle]
 pub extern "C" fn net_deck_audit_query_force_only(query: *mut NetDeckAuditQuery) -> c_int {
     let Some(q) = (unsafe { query.as_mut() }) else {
+        set_last_error("invalid_argument", "query pointer is NULL");
         return NET_DECK_ERR_NULL;
     };
     q.force_only = true;
@@ -1488,6 +1492,7 @@ pub extern "C" fn net_deck_audit_query_force_only(query: *mut NetDeckAuditQuery)
 #[no_mangle]
 pub extern "C" fn net_deck_audit_query_since(query: *mut NetDeckAuditQuery, seq: u64) -> c_int {
     let Some(q) = (unsafe { query.as_mut() }) else {
+        set_last_error("invalid_argument", "query pointer is NULL");
         return NET_DECK_ERR_NULL;
     };
     q.since = Some(seq);
@@ -3535,6 +3540,44 @@ mod tests {
     /// `consumed = true; build_core_proposal(...)?` so an
     /// unknown variant left an orphan husk and the next call
     /// surfaced `already_simulated` instead of the real cause.
+    /// Regression: audit-query setters used to return
+    /// `NET_DECK_ERR_NULL` on a NULL query pointer without
+    /// touching the last-error envelope. A consumer that read
+    /// `net_deck_last_error_*` after the NULL-arm return would
+    /// see a stale unrelated kind/message from a prior call.
+    #[test]
+    fn audit_query_setters_set_last_error_on_null_query() {
+        net_deck_clear_last_error();
+        // Seed a stale envelope so we can prove the setters
+        // overwrite it instead of leaving it leaking through.
+        set_last_error("stale", "from a prior unrelated call");
+        assert_eq!(net_deck_audit_query_recent(ptr::null_mut(), 10), NET_DECK_ERR_NULL);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "invalid_argument");
+
+        set_last_error("stale", "from a prior unrelated call");
+        assert_eq!(net_deck_audit_query_by_operator(ptr::null_mut(), 1), NET_DECK_ERR_NULL);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "invalid_argument");
+
+        set_last_error("stale", "from a prior unrelated call");
+        assert_eq!(net_deck_audit_query_between(ptr::null_mut(), 0, 0), NET_DECK_ERR_NULL);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "invalid_argument");
+
+        set_last_error("stale", "from a prior unrelated call");
+        assert_eq!(net_deck_audit_query_force_only(ptr::null_mut()), NET_DECK_ERR_NULL);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "invalid_argument");
+
+        set_last_error("stale", "from a prior unrelated call");
+        assert_eq!(net_deck_audit_query_since(ptr::null_mut(), 0), NET_DECK_ERR_NULL);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "invalid_argument");
+
+        net_deck_clear_last_error();
+    }
+
     #[test]
     fn ice_simulate_unknown_variant_leaves_husk_retryable() {
         let client = make_client(0x55);
