@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Args, Subcommand};
-use net_sdk::cortex::{NetDb, NetDbBuilder, Redex};
+use net_sdk::cortex::{Memory, NetDb, NetDbBuilder, Redex, Task};
 use serde::Serialize;
 
 use crate::error::{generic, sdk, CliError};
@@ -513,17 +513,11 @@ async fn run_tasks_ls(args: TasksLsArgs, output: Option<OutputFormat>) -> Result
         false,
     )
     .await?;
-    let tasks: Vec<TaskRow> = match netdb.try_tasks() {
+    let tasks: Vec<Task> = match netdb.try_tasks() {
         Some(adapter) => {
             let state_arc = adapter.state();
             let guard = state_arc.read();
-            guard
-                .all()
-                .map(|t| TaskRow {
-                    id: format!("{:?}", t.id),
-                    title: format!("{:?}", t),
-                })
-                .collect()
+            guard.all().cloned().collect()
         }
         None => Vec::new(),
     };
@@ -543,17 +537,11 @@ async fn run_memories_ls(
         /*memories=*/ true,
     )
     .await?;
-    let memories: Vec<MemoryRow> = match netdb.try_memories() {
+    let memories: Vec<Memory> = match netdb.try_memories() {
         Some(adapter) => {
             let state_arc = adapter.state();
             let guard = state_arc.read();
-            guard
-                .all()
-                .map(|m| MemoryRow {
-                    id: format!("{:?}", m.id),
-                    summary: format!("{:?}", m),
-                })
-                .collect()
+            guard.all().cloned().collect()
         }
         None => Vec::new(),
     };
@@ -631,18 +619,6 @@ async fn open_netdb(
 
 fn default_netdb_path() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("net").join("netdb"))
-}
-
-#[derive(Serialize)]
-struct TaskRow {
-    id: String,
-    title: String,
-}
-
-#[derive(Serialize)]
-struct MemoryRow {
-    id: String,
-    summary: String,
 }
 
 #[derive(Serialize)]
