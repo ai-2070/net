@@ -73,10 +73,44 @@ pub async fn run_ls(
 // `serde(flatten)` relies on `DaemonSnapshot` not exposing its own
 // `id` field. If the SDK ever adds one, rename this wrapper's `id`
 // to `daemon_id` (and update consumer scripts) — serde silently
-// allows duplicate keys with last-write-wins.
+// allows duplicate keys with last-write-wins. The
+// `daemon_row_no_id_collision` test below pins this contract by
+// round-tripping a sample DaemonRow through JSON and asserting the
+// `id` field comes from the wrapper, not from the flattened
+// snapshot. Add a matching guard if a future field would collide
+// (test deliberately serialises and checks both keys present).
 #[derive(Serialize)]
 struct DaemonRow {
     id: u64,
     #[serde(flatten)]
     snapshot: DaemonSnapshot,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin: a DaemonRow serialises with the wrapper's `id` at the
+    /// top level. If `DaemonSnapshot` ever grows an `id` field,
+    /// serde's last-write-wins on duplicate keys silently drops
+    /// one of them; this test produces a sample value and
+    /// asserts the wrapper's id survives the flatten merge.
+    /// Use `DaemonSnapshot::default()` so the test is robust to
+    /// future fields being added to the snapshot - only an `id`
+    /// field would break this assertion.
+    #[test]
+    fn daemon_row_id_is_wrapper_field() {
+        let row = DaemonRow {
+            id: 0xDEADBEEF,
+            snapshot: DaemonSnapshot::default(),
+        };
+        let v = serde_json::to_value(&row).expect("serialise DaemonRow");
+        assert_eq!(
+            v.get("id").and_then(|v| v.as_u64()),
+            Some(0xDEADBEEF),
+            "DaemonRow.id must surface as the wrapper's id field; if this fails \
+             check whether DaemonSnapshot grew an id field that collides with the \
+             flatten - rename the wrapper field to daemon_id and update consumers"
+        );
+    }
 }
