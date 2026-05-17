@@ -19,6 +19,7 @@ use serde::Serialize;
 
 use crate::context::{resolve_profile, CliContext};
 use crate::error::{generic, sdk, CliError};
+use crate::parsers::parse_u64_flexible;
 use crate::prelude::{emit_value, OutputFormat};
 
 #[derive(Subcommand, Debug)]
@@ -96,8 +97,6 @@ pub struct DropReplicasArgs {
     #[command(flatten)]
     pub common: CommonAdminArgs,
 }
-
-use crate::parsers::parse_u64_flexible;
 
 #[derive(Args, Debug)]
 pub struct CommonAdminArgs {

@@ -18,6 +18,7 @@ use net_sdk::cortex::{Memory, NetDb, NetDbBuilder, Redex, Task};
 use serde::Serialize;
 
 use crate::error::{generic, sdk, CliError};
+use crate::parsers::parse_u64_flexible;
 use crate::prelude::{emit_value, OutputFormat};
 
 #[derive(Subcommand, Debug)]
@@ -194,8 +195,6 @@ pub struct NetdbCommon {
     #[arg(long, default_value_t = 0)]
     pub origin: u64,
 }
-
-use crate::parsers::parse_u64_flexible;
 
 pub async fn run(cmd: NetdbCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
     match cmd {

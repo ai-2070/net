@@ -34,6 +34,7 @@ use serde::Serialize;
 
 use crate::context::{resolve_profile, CliContext};
 use crate::error::{generic, sdk, CliError, CliError as _CE, ExitCodeKind};
+use crate::parsers::parse_u64_flexible;
 use crate::prelude::{emit_value, OutputFormat};
 
 #[derive(Subcommand, Debug)]
@@ -150,8 +151,6 @@ pub struct CommonIceArgs {
     #[arg(long, default_value_t = 0x0001)]
     pub supervisor_node: u64,
 }
-
-use crate::parsers::parse_u64_flexible;
 
 fn parse_scope(s: &str) -> Result<AvoidScope, CliError> {
     if s == "global" {
