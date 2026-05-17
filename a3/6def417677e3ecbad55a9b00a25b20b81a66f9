@@ -1,0 +1,41 @@
+net/crates/net/sdk/src/testing/cluster.rs
+  s_ac2931afe38c4a::t_c9cb8306e1ae6b 83-87,92,96,101,105,108,110-144
+net/crates/net/deck/src/demo/spawn.rs
+  s_ac2931afe38c4a::t_e313101e119d5f 191
+  s_ac2931afe38c4a::t_d7decb4310e2fc 155,171
+  s_ac2931afe38c4a::t_f68497286b162b 223
+net/crates/net/sdk/tests/cluster_harness.rs
+  s_ac2931afe38c4a::t_388de21a28197f 34,82,114
+  s_ac2931afe38c4a::t_1ed2d44debb3bf 84
+  s_ac2931afe38c4a::t_ada3c26465195f 116
+  s_ac2931afe38c4a::t_2bd7ab2c5ff211 43,54,56
+net/crates/net/sdk/tests/cluster_supervisor.rs
+  s_ac2931afe38c4a::t_a0293cb4cb6ddf 62
+  s_ac2931afe38c4a::t_62feda76de6973 79-80
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_17_MESHOS_SDKS.md
+  s_ac2931afe38c4a::t_1d942294c73e1b 126
+net/crates/net/deck/src/demo/rpc_chatter.rs
+  s_ac2931afe38c4a::t_b0b145d009369e 97
+  s_ac2931afe38c4a::t_b66bfe497e3500 129
+  s_ac2931afe38c4a::t_8a53374282bf93 111
+  s_ac2931afe38c4a::t_e68c16a12b70df 139
+net/crates/net/deck/src/demo/migrator.rs
+  s_ac2931afe38c4a::t_f1afd468b2ed68 113,115
+  s_ac2931afe38c4a::t_5b5999ad06ce38 96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "a36def417677e3ecbad55a9b00a25b20b81a66f9",
+  "prompts": {},
+  "sessions": {
+    "s_ac2931afe38c4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59271d48-d72a-4337-b857-962412f18343",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
