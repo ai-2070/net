@@ -4,16 +4,19 @@
 //
 // # Scope (slice 1b)
 //
-// Lifecycle, control receive, log emission, graceful shutdown,
-// and the vtable-based daemon-callback bridge.
+// Full daemon-author surface: lifecycle, control receive, log
+// emission, graceful shutdown, and the cgo `//export` trampoline
+// bridge that lets Go consumers supply real daemon callbacks
+// (process / snapshot / restore / onControl / health /
+// saturation) against the cdylib's vtable.
 //
 // `RegisterDaemon` registers an internal no-op daemon for
-// lifecycle-only consumers. Real daemons go through the C ABI's
-// `net_meshos_register_daemon_with_vtable`; the Go-side
-// `//export` trampoline that lets Go consumers supply
-// closures-as-callbacks is a slice-1c follow-up — the cdylib
-// surface, C SDK, and Rust-side bridge ship today so the C / C++
-// / Zig / etc. consumer path is complete.
+// lifecycle-only consumers. `RegisterDaemonWithCallbacks`
+// (slice 1b) accepts a [MeshOsDaemon] interface implementation;
+// the wrapper allocates a `cgo.Handle` that the //export
+// trampolines dispatch through, so each Go closure runs on a
+// tokio worker thread without copying state across the FFI on
+// every call.
 //
 // # Memory model
 //
@@ -153,6 +156,99 @@ extern void net_meshos_snapshot_emit(
     const uint8_t* payload_ptr,
     size_t payload_len
 );
+
+// Vtable struct mirroring the cdylib's
+// `NetMeshOsDaemonVtable`. Each field is a function pointer
+// the consumer fills in. The Go wrapper builds this with
+// pointers to //export'd Go trampolines below.
+typedef int (*NetMeshOsProcessFn)(
+    void* user_ctx,
+    NetMeshOsProcessEmitCtx* emit_ctx,
+    uint64_t origin_hash,
+    uint64_t sequence,
+    const uint8_t* payload_ptr,
+    size_t payload_len
+);
+typedef void (*NetMeshOsSnapshotFn)(
+    void* user_ctx,
+    NetMeshOsSnapshotEmitCtx* emit_ctx
+);
+typedef int (*NetMeshOsRestoreFn)(
+    void* user_ctx,
+    const uint8_t* payload_ptr,
+    size_t payload_len
+);
+typedef void (*NetMeshOsOnControlFn)(
+    void* user_ctx,
+    int kind,
+    uint64_t grace_period_ms,
+    float level
+);
+typedef int (*NetMeshOsHealthFn)(void* user_ctx);
+typedef float (*NetMeshOsSaturationFn)(void* user_ctx);
+
+typedef struct {
+    NetMeshOsProcessFn process;
+    NetMeshOsSnapshotFn snapshot;
+    NetMeshOsRestoreFn restore;
+    NetMeshOsOnControlFn on_control;
+    NetMeshOsHealthFn health;
+    NetMeshOsSaturationFn saturation;
+} NetMeshOsDaemonVtable;
+
+extern int net_meshos_register_daemon_with_vtable(
+    NetMeshOsSdk* sdk,
+    const char* name_ptr,
+    size_t name_len,
+    const uint8_t* seed_ptr,
+    const NetMeshOsDaemonVtable* vtable_ptr,
+    void* user_ctx,
+    NetMeshOsHandle** out
+);
+
+// Forward declarations of the //export'd Go trampolines (cgo
+// emits these into `_cgo_export.h`; we duplicate the
+// declarations here so the static-inline builder below can
+// take their addresses).
+extern int goMeshOsProcessTrampoline(
+    void* user_ctx,
+    NetMeshOsProcessEmitCtx* emit_ctx,
+    uint64_t origin_hash,
+    uint64_t sequence,
+    const uint8_t* payload_ptr,
+    size_t payload_len
+);
+extern void goMeshOsSnapshotTrampoline(
+    void* user_ctx,
+    NetMeshOsSnapshotEmitCtx* emit_ctx
+);
+extern int goMeshOsRestoreTrampoline(
+    void* user_ctx,
+    const uint8_t* payload_ptr,
+    size_t payload_len
+);
+extern void goMeshOsOnControlTrampoline(
+    void* user_ctx,
+    int kind,
+    uint64_t grace_period_ms,
+    float level
+);
+extern int goMeshOsHealthTrampoline(void* user_ctx);
+extern float goMeshOsSaturationTrampoline(void* user_ctx);
+
+// Populate a vtable with pointers to the //export'd Go
+// trampolines. The cdylib copies the vtable on registration,
+// so this returned-by-value form is safe.
+static inline NetMeshOsDaemonVtable goMeshOsBuildVtable(void) {
+    NetMeshOsDaemonVtable vt;
+    vt.process    = goMeshOsProcessTrampoline;
+    vt.snapshot   = goMeshOsSnapshotTrampoline;
+    vt.restore    = goMeshOsRestoreTrampoline;
+    vt.on_control = goMeshOsOnControlTrampoline;
+    vt.health     = goMeshOsHealthTrampoline;
+    vt.saturation = goMeshOsSaturationTrampoline;
+    return vt;
+}
 */
 import "C"
 
@@ -160,6 +256,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"runtime/cgo"
 	"unsafe"
 )
 
@@ -434,6 +531,12 @@ func (s *MeshOsDaemonSdk) Free() {
 // MeshOsDaemonHandle is the Go-side handle for a registered daemon.
 type MeshOsDaemonHandle struct {
 	ptr *C.NetMeshOsHandle
+	// daemonHandle is the `cgo.Handle` allocated by
+	// `RegisterDaemonWithCallbacks` for the //export trampoline
+	// dispatch. Zero for handles produced by `RegisterDaemon`
+	// (which registers an internal no-op daemon and needs no
+	// Go-side dispatch). Released on `Free` / finalizer.
+	daemonHandle cgo.Handle
 }
 
 // DaemonID returns the substrate identifier (the keypair's origin
@@ -526,5 +629,272 @@ func (h *MeshOsDaemonHandle) Free() {
 	}
 	C.net_meshos_handle_free(h.ptr)
 	h.ptr = nil
+	if h.daemonHandle != 0 {
+		h.daemonHandle.Delete()
+		h.daemonHandle = 0
+	}
 	runtime.SetFinalizer(h, nil)
+}
+
+// =====================================================================
+// Slice 1b — MeshOsDaemon interface + cgo //export trampolines
+// =====================================================================
+
+// MeshOsCausalEvent is the value handed to a daemon's `Process`
+// callback. Mirrors the substrate's `CausalEvent` projection.
+type MeshOsCausalEvent struct {
+	OriginHash uint64
+	Sequence   uint64
+	// Payload is a fresh copy of the substrate's event bytes —
+	// safe to retain past the callback return.
+	Payload []byte
+}
+
+// MeshOsDaemonHealthKind discriminates a daemon's reported
+// health. Matches the substrate's `DaemonHealth` shape with the
+// reason elided.
+type MeshOsDaemonHealthKind int
+
+const (
+	HealthHealthy   MeshOsDaemonHealthKind = MeshOsDaemonHealthKind(C.NET_MESHOS_HEALTH_HEALTHY)
+	HealthDegraded  MeshOsDaemonHealthKind = MeshOsDaemonHealthKind(C.NET_MESHOS_HEALTH_DEGRADED)
+	HealthUnhealthy MeshOsDaemonHealthKind = MeshOsDaemonHealthKind(C.NET_MESHOS_HEALTH_UNHEALTHY)
+)
+
+// MeshOsDaemon is the Go-side daemon contract. Embed
+// [MeshOsDefaultDaemon] to inherit no-op defaults for every
+// method except `Name` + `Process`.
+//
+// **Threading.** Callbacks fire from tokio worker threads — the
+// cgo bridge dispatches through a `cgo.Handle` looked up by the
+// runtime, so consumer state is shared across threads. Protect
+// any shared state with `sync.Mutex` / atomics as needed. Hot
+// loops still pay the cgo crossing cost; the substrate's
+// `process()` runs once per event, which is the dominant path.
+type MeshOsDaemon interface {
+	// Name returns the daemon's substrate-side name. Stable
+	// across the daemon's lifetime; the bridge resolves it
+	// once at registration.
+	Name() string
+	// Process handles one inbound causal event and returns zero
+	// or more output payloads. Non-nil error surfaces as
+	// `ProcessFailed` on the substrate side.
+	Process(event MeshOsCausalEvent) ([][]byte, error)
+	// Snapshot returns the daemon's serialized state, or
+	// `(nil, false)` for stateless daemons.
+	Snapshot() ([]byte, bool)
+	// Restore re-seeds the daemon's state from a snapshot.
+	// Non-nil error surfaces as `RestoreFailed`.
+	Restore(state []byte) error
+	// OnControl fires for every supervisor control event
+	// routed to this daemon. Return-fast — the supervisor's
+	// reconcile loop blocks on this call.
+	OnControl(event MeshOsDaemonControl)
+	// Health reports the daemon's current health.
+	Health() MeshOsDaemonHealthKind
+	// Saturation reports a value in `[0.0, 1.0]` summarizing
+	// how loaded the daemon is.
+	Saturation() float32
+}
+
+// MeshOsDefaultDaemon is a zero-method base every MeshOsDaemon
+// implementation can embed to inherit no-op defaults for the
+// optional methods. Override `Name` and `Process`; the rest
+// fall through to safe substrate defaults.
+type MeshOsDefaultDaemon struct{}
+
+func (MeshOsDefaultDaemon) Snapshot() ([]byte, bool)        { return nil, false }
+func (MeshOsDefaultDaemon) Restore(_ []byte) error          { return nil }
+func (MeshOsDefaultDaemon) OnControl(_ MeshOsDaemonControl) {}
+func (MeshOsDefaultDaemon) Health() MeshOsDaemonHealthKind  { return HealthHealthy }
+func (MeshOsDefaultDaemon) Saturation() float32             { return 0 }
+
+// RegisterDaemonWithCallbacks registers a user-supplied
+// [MeshOsDaemon] under the given 32-byte ed25519 seed. The
+// wrapper allocates a `cgo.Handle` for the daemon, builds the
+// vtable with pointers to //export'd trampolines, and hands
+// ownership of the handle to the resulting
+// [MeshOsDaemonHandle] — when the handle is freed (or
+// gracefully shut down + freed), the cgo.Handle is released.
+//
+// Returns `ErrMeshOsInvalidArg` if the seed isn't 32 bytes or
+// the daemon is nil.
+func (s *MeshOsDaemonSdk) RegisterDaemonWithCallbacks(daemon MeshOsDaemon, seed []byte) (*MeshOsDaemonHandle, error) {
+	if s == nil || s.ptr == nil {
+		return nil, wrapMeshOsError(ErrMeshOsInvalidArg)
+	}
+	if daemon == nil {
+		return nil, fmt.Errorf("%w: daemon is nil", ErrMeshOsInvalidArg)
+	}
+	if len(seed) != 32 {
+		return nil, fmt.Errorf("%w: seed must be 32 bytes, got %d", ErrMeshOsInvalidArg, len(seed))
+	}
+	name := daemon.Name()
+	if name == "" {
+		return nil, fmt.Errorf("%w: daemon Name() returned empty string", ErrMeshOsInvalidArg)
+	}
+
+	cgoHandle := cgo.NewHandle(daemon)
+	vt := C.goMeshOsBuildVtable()
+
+	var raw *C.NetMeshOsHandle
+	var namePtr *C.char
+	var nameLen C.size_t
+	if len(name) > 0 {
+		nameBytes := []byte(name)
+		namePtr = (*C.char)(unsafe.Pointer(&nameBytes[0]))
+		nameLen = C.size_t(len(nameBytes))
+	}
+	seedPtr := (*C.uint8_t)(unsafe.Pointer(&seed[0]))
+	userCtx := unsafe.Pointer(uintptr(cgoHandle))
+	status := C.net_meshos_register_daemon_with_vtable(
+		s.ptr, namePtr, nameLen, seedPtr, &vt, userCtx, &raw,
+	)
+	if err := statusToError(status); err != nil {
+		cgoHandle.Delete()
+		return nil, err
+	}
+	h := &MeshOsDaemonHandle{ptr: raw, daemonHandle: cgoHandle}
+	runtime.SetFinalizer(h, func(h *MeshOsDaemonHandle) { h.Free() })
+	return h, nil
+}
+
+// =====================================================================
+// //export trampolines — dispatch through cgo.Handle into the
+// user's MeshOsDaemon implementation
+// =====================================================================
+
+func handleFromCtx(userCtx unsafe.Pointer) MeshOsDaemon {
+	h := cgo.Handle(uintptr(userCtx))
+	v := h.Value()
+	if d, ok := v.(MeshOsDaemon); ok {
+		return d
+	}
+	return nil
+}
+
+//export goMeshOsProcessTrampoline
+func goMeshOsProcessTrampoline(
+	userCtx unsafe.Pointer,
+	emitCtx *C.NetMeshOsProcessEmitCtx,
+	originHash C.uint64_t,
+	sequence C.uint64_t,
+	payloadPtr *C.uint8_t,
+	payloadLen C.size_t,
+) C.int {
+	d := handleFromCtx(userCtx)
+	if d == nil {
+		return C.int(1)
+	}
+	var payload []byte
+	if payloadLen > 0 && payloadPtr != nil {
+		payload = C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen))
+	}
+	event := MeshOsCausalEvent{
+		OriginHash: uint64(originHash),
+		Sequence:   uint64(sequence),
+		Payload:    payload,
+	}
+	outputs, err := d.Process(event)
+	if err != nil {
+		return C.int(1)
+	}
+	for _, out := range outputs {
+		if len(out) == 0 {
+			C.net_meshos_process_emit(emitCtx, nil, 0)
+		} else {
+			C.net_meshos_process_emit(
+				emitCtx,
+				(*C.uint8_t)(unsafe.Pointer(&out[0])),
+				C.size_t(len(out)),
+			)
+		}
+	}
+	return C.int(0)
+}
+
+//export goMeshOsSnapshotTrampoline
+func goMeshOsSnapshotTrampoline(
+	userCtx unsafe.Pointer,
+	emitCtx *C.NetMeshOsSnapshotEmitCtx,
+) {
+	d := handleFromCtx(userCtx)
+	if d == nil {
+		return
+	}
+	payload, present := d.Snapshot()
+	if !present {
+		return
+	}
+	if len(payload) == 0 {
+		C.net_meshos_snapshot_emit(emitCtx, nil, 0)
+		return
+	}
+	C.net_meshos_snapshot_emit(
+		emitCtx,
+		(*C.uint8_t)(unsafe.Pointer(&payload[0])),
+		C.size_t(len(payload)),
+	)
+}
+
+//export goMeshOsRestoreTrampoline
+func goMeshOsRestoreTrampoline(
+	userCtx unsafe.Pointer,
+	payloadPtr *C.uint8_t,
+	payloadLen C.size_t,
+) C.int {
+	d := handleFromCtx(userCtx)
+	if d == nil {
+		return C.int(1)
+	}
+	var state []byte
+	if payloadLen > 0 && payloadPtr != nil {
+		state = C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen))
+	}
+	if err := d.Restore(state); err != nil {
+		return C.int(1)
+	}
+	return C.int(0)
+}
+
+//export goMeshOsOnControlTrampoline
+func goMeshOsOnControlTrampoline(
+	userCtx unsafe.Pointer,
+	kind C.int,
+	gracePeriodMs C.uint64_t,
+	level C.float,
+) {
+	d := handleFromCtx(userCtx)
+	if d == nil {
+		return
+	}
+	d.OnControl(MeshOsDaemonControl{
+		Kind:          DaemonControlKind(kind),
+		GracePeriodMs: uint64(gracePeriodMs),
+		Level:         float32(level),
+	})
+}
+
+//export goMeshOsHealthTrampoline
+func goMeshOsHealthTrampoline(userCtx unsafe.Pointer) C.int {
+	d := handleFromCtx(userCtx)
+	if d == nil {
+		return C.int(C.NET_MESHOS_HEALTH_HEALTHY)
+	}
+	return C.int(d.Health())
+}
+
+//export goMeshOsSaturationTrampoline
+func goMeshOsSaturationTrampoline(userCtx unsafe.Pointer) C.float {
+	d := handleFromCtx(userCtx)
+	if d == nil {
+		return C.float(0)
+	}
+	v := d.Saturation()
+	if v < 0 {
+		v = 0
+	} else if v > 1 {
+		v = 1
+	}
+	return C.float(v)
 }
