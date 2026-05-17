@@ -94,7 +94,7 @@ impl RpcObserver for NrpcTailObserver {
 pub fn install_observers(harness: &ClusterHarness, tail: NrpcTail) {
     for node in harness.nodes() {
         let obs: Arc<dyn RpcObserver> = Arc::new(NrpcTailObserver { tail: tail.clone() });
-        node.mesh.set_rpc_observer(Some(obs));
+        node.mesh().set_rpc_observer(Some(obs));
     }
 }
 
@@ -108,7 +108,7 @@ pub fn install_responders(
     for idx in 0..2 {
         let node = harness.nth(idx);
         let h = node
-            .mesh
+            .mesh()
             .serve_rpc_typed(ECHO_SERVICE, Codec::Json, |req: EchoRequest| async move {
                 Ok::<_, String>(EchoResponse {
                     tick: req.tick,
@@ -126,7 +126,7 @@ pub fn install_responders(
 /// `CALL_INTERVAL` ms, alternating between responders so
 /// both nodes see traffic.
 pub fn spawn_requester_loops(harness: &ClusterHarness) -> Vec<JoinHandle<()>> {
-    let responder_ids: Vec<u64> = harness.nodes().iter().take(2).map(|n| n.node_id).collect();
+    let responder_ids: Vec<u64> = harness.nodes().iter().take(2).map(|n| n.node_id()).collect();
     if responder_ids.is_empty() {
         return Vec::new();
     }
@@ -136,7 +136,7 @@ pub fn spawn_requester_loops(harness: &ClusterHarness) -> Vec<JoinHandle<()>> {
         .enumerate()
         .skip(2)
         .map(|(idx, node)| {
-            let mesh = node.mesh.clone();
+            let mesh = node.mesh().clone();
             let responders = responder_ids.clone();
             tokio::spawn(async move {
                 run_requester_loop(idx, mesh, responders).await;

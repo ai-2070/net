@@ -31,7 +31,7 @@ async fn five_node_cluster_boots_and_converges() {
     // Mesh layer: each node sees the other 4.
     for (i, node) in harness.nodes().iter().enumerate() {
         assert_eq!(
-            node.mesh.peer_count(),
+            node.mesh().peer_count(),
             4,
             "node[{i}] mesh.peer_count() mismatch"
         );
@@ -40,7 +40,7 @@ async fn five_node_cluster_boots_and_converges() {
     // MeshOS layer: each runtime's snapshot.peers reflects the
     // other 4 peers via the bridge probes.
     for (i, node) in harness.nodes().iter().enumerate() {
-        let sdk = node.sdk.as_ref().expect("sdk present before shutdown");
+        let sdk = node.sdk().expect("sdk present before shutdown");
         let snap = sdk.runtime().snapshot();
         assert_eq!(
             snap.peers.len(),
@@ -51,9 +51,9 @@ async fn five_node_cluster_boots_and_converges() {
         // Every entry should key on a distinct peer node_id —
         // never the local one.
         assert!(
-            !snap.peers.contains_key(&node.node_id),
+            !snap.peers.contains_key(&node.node_id()),
             "node[{i}] snapshot.peers includes self {:x}",
-            node.node_id
+            node.node_id()
         );
     }
 
@@ -79,10 +79,9 @@ async fn two_node_cluster_pair_handshake() {
     let harness = ClusterHarness::new(2).await.expect("2-node cluster boot");
     assert_eq!(harness.len(), 2);
     for node in harness.nodes() {
-        assert_eq!(node.mesh.peer_count(), 1);
+        assert_eq!(node.mesh().peer_count(), 1);
         let snap = node
-            .sdk
-            .as_ref()
+            .sdk()
             .expect("sdk present before shutdown")
             .runtime()
             .snapshot();
@@ -112,10 +111,9 @@ async fn single_node_cluster_boots() {
     let harness = ClusterHarness::new(1).await.expect("1-node cluster boot");
     assert_eq!(harness.len(), 1);
     let node = harness.nth(0);
-    assert_eq!(node.mesh.peer_count(), 0);
+    assert_eq!(node.mesh().peer_count(), 0);
     let snap = node
-        .sdk
-        .as_ref()
+        .sdk()
         .expect("sdk present before shutdown")
         .runtime()
         .snapshot();

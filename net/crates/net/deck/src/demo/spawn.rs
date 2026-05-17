@@ -152,8 +152,7 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
     let mut heartbeat_tasks: Vec<JoinHandle<()>> = Vec::with_capacity(cluster.len());
     for (i, node) in cluster.nodes().iter().enumerate() {
         let sdk = node
-            .sdk
-            .as_ref()
+            .sdk()
             .ok_or_else(|| color_eyre::eyre::eyre!("node[{i}] sdk missing"))?;
         let kp = EntityKeypair::generate();
         let daemon_id = kp.origin_hash();
@@ -169,7 +168,7 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
         // independent of the daemon-handle drop.
         heartbeat_handles.push(handle);
         let node_index = i;
-        let node_id = node.node_id;
+        let node_id = node.node_id();
         let mesh_os_handle = sdk.runtime().handle_clone();
         let task = tokio::spawn(async move {
             run_heartbeat_loop(node_index, node_id, daemon_id, mesh_os_handle).await;
@@ -189,8 +188,7 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
     // grows that primitive.
     let node0 = cluster.nth(0);
     let sdk0 = node0
-        .sdk
-        .as_ref()
+        .sdk()
         .ok_or_else(|| color_eyre::eyre::eyre!("node[0] sdk missing"))?;
     let mut group_handles: Vec<MeshOsDaemonHandle> = Vec::with_capacity(9);
     for replica_idx in 0..3 {
@@ -222,7 +220,7 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
     // Build the DeckClient anchored on node[0]'s MeshOsRuntime.
     let identity = OperatorIdentity::from_keypair(operator_keypair);
     let deck = Arc::new(DeckClient::from_runtime(sdk0.runtime(), identity));
-    let this_node = node0.node_id;
+    let this_node = node0.node_id();
 
     // Build one MeshBlobAdapter per node (Phase 2 of
     // DECK_DEMO_PLAN.md). Each adapter is in-memory `Redex`-

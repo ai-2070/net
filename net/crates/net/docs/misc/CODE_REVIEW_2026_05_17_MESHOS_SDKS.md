@@ -123,7 +123,7 @@ For a 100 ms tick interval, that's 4 polls per tick, fine. If `meshos_tick_inter
 | Severity | Action |
 |---|---|
 | Done | Document `arc_swap`'s `Sized` constraint inline + tidy setter (item 1). |
-| Footgun | Consider `pub(crate)` on `ClusterNode` fields + accessors (item 2). |
+| Done | `ClusterNode` fields → `pub(crate)` + accessor methods (item 2). |
 | Breaking | Confirm default-features expansion (item 10) is the intent; add a CHANGELOG note. |
 | Nice-to-have | `Cow` method name (5), `RuntimeShutdownError: Display` (7), `tracing::warn!` in drop (3). |
 | Verify | Replica-group sync health assertion (11). |

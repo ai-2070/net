@@ -80,29 +80,68 @@ impl Default for ClusterConfig {
 /// `DaemonRuntime` (compute surface for `ReplicaGroup` /
 /// `ForkGroup` / `StandbyGroup`). All three share the underlying
 /// `Mesh` handle.
+///
+/// Fields are `pub(crate)` so external callers can't `.take()`
+/// the SDK / runtime out of order — [`ClusterHarness::shutdown`]
+/// is the supported drain path. Read access goes through the
+/// accessor methods below.
 pub struct ClusterNode {
     /// The Mesh handle, shared `Arc` so bridge probes + the
     /// compute `DaemonRuntime` can hold long-lived clones
     /// without invalidating the harness's own reference.
-    pub mesh: Arc<Mesh>,
+    pub(crate) mesh: Arc<Mesh>,
     /// MeshOS daemon SDK. Wrapped in `Option` so
     /// [`ClusterHarness::shutdown`] can take it out and drive an
     /// owning `sdk.shutdown().await`. None after shutdown.
-    pub sdk: Option<MeshOsDaemonSdk>,
+    pub(crate) sdk: Option<MeshOsDaemonSdk>,
     /// Compute-surface daemon runtime. Owns the group / migration
     /// primitives that operate on `Arc<Mesh>` directly rather
     /// than through the MeshOS state fold. Same lifecycle as
     /// `sdk` — taken out during shutdown.
-    pub daemon_runtime: Option<DaemonRuntime>,
+    pub(crate) daemon_runtime: Option<DaemonRuntime>,
     /// Local UDP bind address (the kernel-assigned ephemeral
     /// port). Useful for cross-checking the harness's expected
     /// peer topology.
-    pub local_addr: SocketAddr,
+    pub(crate) local_addr: SocketAddr,
     /// The Mesh-derived 64-bit node id. Stable for the node's
     /// lifetime; the MeshOS layer keys peers by this id.
-    pub node_id: NodeId,
+    pub(crate) node_id: NodeId,
     /// The Mesh's Noise public key.
-    pub public_key: [u8; 32],
+    pub(crate) public_key: [u8; 32],
+}
+
+impl ClusterNode {
+    /// Borrow the underlying `Mesh` handle.
+    pub fn mesh(&self) -> &Arc<Mesh> {
+        &self.mesh
+    }
+
+    /// Borrow the node's `MeshOsDaemonSdk`, or `None` once
+    /// [`ClusterHarness::shutdown`] has drained it.
+    pub fn sdk(&self) -> Option<&MeshOsDaemonSdk> {
+        self.sdk.as_ref()
+    }
+
+    /// Borrow the node's compute-surface `DaemonRuntime`, or
+    /// `None` once [`ClusterHarness::shutdown`] has drained it.
+    pub fn daemon_runtime(&self) -> Option<&DaemonRuntime> {
+        self.daemon_runtime.as_ref()
+    }
+
+    /// Local UDP bind address.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Mesh-derived 64-bit node id.
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// The Mesh's Noise public key (32 bytes).
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
 }
 
 /// One daemon registered against one node by the supervisor.

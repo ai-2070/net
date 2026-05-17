@@ -93,8 +93,7 @@ impl ComputeMeshDaemon for MigratableDaemon {
 pub fn install_factories(harness: &ClusterHarness) -> Result<(), color_eyre::Report> {
     for (i, node) in harness.nodes().iter().enumerate() {
         let rt = node
-            .daemon_runtime
-            .as_ref()
+            .daemon_runtime()
             .ok_or_else(|| color_eyre::eyre::eyre!("node[{i}] daemon_runtime missing"))?;
         rt.register_factory(MIGRATABLE_KIND, || Box::new(MigratableDaemon))
             .map_err(|e| color_eyre::eyre::eyre!("register_factory on node[{i}]: {e:?}"))?;
@@ -111,9 +110,9 @@ pub fn spawn_loop(harness: &ClusterHarness) -> tokio::task::JoinHandle<()> {
     let runtimes: Vec<DaemonRuntime> = harness
         .nodes()
         .iter()
-        .filter_map(|n| n.daemon_runtime.clone())
+        .filter_map(|n| n.daemon_runtime().cloned())
         .collect();
-    let node_ids: Vec<NodeId> = harness.nodes().iter().map(|n| n.node_id).collect();
+    let node_ids: Vec<NodeId> = harness.nodes().iter().map(|n| n.node_id()).collect();
     let total = node_ids.len();
     tokio::spawn(async move {
         run_loop(runtimes, node_ids, total).await;

@@ -59,7 +59,7 @@ async fn spawn_per_node_registers_on_every_node() {
     // node_id on each handle must match the corresponding
     // node's id in the harness.
     for h in &handles {
-        assert_eq!(h.node_id, harness.nth(h.node_index).node_id);
+        assert_eq!(h.node_id, harness.nth(h.node_index).node_id());
     }
     drop(handles);
     harness.shutdown().await.expect("shutdown");
@@ -76,7 +76,8 @@ async fn spawn_where_filters_subset() {
                 // The harness owns the node order; we filter by index
                 // captured via node_id since the predicate doesn't get
                 // the index directly.
-                node.node_id == harness.nth(0).node_id || node.node_id == harness.nth(2).node_id
+                node.node_id() == harness.nth(0).node_id()
+                    || node.node_id() == harness.nth(2).node_id()
             },
         )
         .await
