@@ -775,19 +775,24 @@ jobs:
       # napi-rs links `napi_*` runtime symbols at load time (Node
       # provides them inside its embedded V8); a standalone
       # `cargo test --lib` binary can't resolve them at link time.
-      # Two flags work in concert:
+      # Four flags work in concert:
       #   --unresolved-symbols=ignore-all  — tolerate at link time
+      #   --allow-shlib-undefined          — tolerate undefined refs
+      #                                       from dependent shared libs
       #   -z,lazy                          — tolerate at LOAD time
-      # The second flag is the one this commit adds. Modern Ubuntu
-      # toolchains default to `-z,now` as a hardening posture,
-      # which makes the dynamic linker resolve every symbol
+      #   -z,nodelete                      — defer module unload
+      # Modern Ubuntu toolchains default to `-z,now` as a hardening
+      # posture, which makes the dynamic linker resolve every symbol
       # eagerly at process startup and crash with
       # `symbol lookup error: undefined symbol: napi_get_reference_value`
       # before main() runs. `-z,lazy` reverts to lazy resolution,
       # so napi symbols are only touched if the test code path
       # calls them — and the tests only exercise pure-Rust
       # helpers (`bigint_u64`, capability conversion, etc.) that
-      # never reach napi.
+      # never reach napi. The `LD_BIND_NOT=1` env var disables
+      # symbol lookup failures during lazy binding — together with
+      # `LD_BIND_NOW=` cleared, this lets the process start even
+      # when a referenced napi symbol can't be resolved.
       #
       # Other matrix members don't need this and would silently
       # mask real link-time bugs if it were set globally.
@@ -795,7 +800,9 @@ jobs:
         if: matrix.crate.name == 'node'
         working-directory: ${{ matrix.crate.path }}
         env:
-          RUSTFLAGS: "-C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,-z,lazy"
+          RUSTFLAGS: "-C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,--allow-shlib-undefined -C link-arg=-Wl,-z,lazy"
+          LD_BIND_NOT: "1"
+          LD_BIND_NOW: ""
         run: cargo test --lib ${{ matrix.crate.features }}
 
       - name: Run tests
