@@ -790,11 +790,24 @@ jobs:
 
   cli-tests:
     # `net-cli`'s test surface is broader than the FFI shims:
-    # unit tests inside `src/`, plus integration tests under
-    # `tests/help.rs` + `tests/exit_codes.rs` that spawn the
-    # binary via `assert_cmd`. `cargo test --lib` would skip
-    # the integration crates, so we run the full
-    # `cargo test -p net-cli` here.
+    # unit tests inside `src/`, plus integration-test crates under
+    # `tests/` that spawn the binary via `assert_cmd`. The crate
+    # has no lib target, so `cargo test --lib` would silently skip
+    # everything; `cargo test -p net-cli` runs every target cargo
+    # auto-discovers, so a new `tests/foo.rs` doesn't need a CI
+    # edit.
+    #
+    # Current surface (informational; not a check):
+    #
+    #   src/main.rs                  — humantime duration parser
+    #   src/output.rs                — format resolver
+    #   src/error.rs                 — exit-code discriminator pin
+    #   src/parsers.rs               — parse_u64_flexible
+    #   src/commands/ice.rs          — confirmation-gate logic
+    #   src/commands/identity.rs     — iso8601 formatter
+    #   tests/help.rs                — help-text + version surface
+    #   tests/exit_codes.rs          — documented exit codes
+    #   tests/dry_run.rs             — admin verb `--dry-run` envelope
     name: Net CLI tests
     runs-on: ubuntu-latest
     defaults:
