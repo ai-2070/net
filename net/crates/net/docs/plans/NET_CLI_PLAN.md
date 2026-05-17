@@ -220,7 +220,11 @@ Auto-detection rule: when `--output` is not specified, the binary picks `table` 
 | 6 | Connection / handshake failure. | `start` couldn't reach the substrate node. |
 | 7 | Timeout. | `--timeout` elapsed before the SDK call resolved. |
 | 8 | Confirmation refused. | TTY user said "no" at the ICE preview prompt. |
-| 10–19 | Subcommand-specific. | `net daemon` uses 10 for "factory not found", `net db` uses 11 for "query parse failed", etc. |
+| 10–16 | Subcommand-specific. | `net daemon` uses 10 for "factory not found", `net db` uses 11 for "query parse failed", etc. |
+| 17 | Identity file not found. | `--identity <PATH>` points at a non-existent path. Pre-flight check before SDK init. |
+| 18 | Identity unreadable. | File exists but permission denied, points at a directory, or otherwise can't be opened. Pre-flight. |
+| 19 | Identity malformed. | File is readable but isn't a valid identity TOML / seed can't be parsed. Pre-flight. |
+| 20+ | Reserved for future subcommand-specific codes. | |
 
 ## Design
 
@@ -319,7 +323,7 @@ For `--operator-key <PATH>` flows (multi-operator signing): the CLI loads the lo
 
 Three modes for `net daemon run`:
 
-- **Default** — `--kind <FACTORY-ID>` resolves a factory registered in a downstream crate via the `net_daemon_factories::register!` macro (Phase 3 invention). The CLI iterates registered factories at startup.
+- **Default** — `--kind <FACTORY-ID>` resolves a factory registered in a downstream crate via the `net_daemon_factories::register!` macro. The macro itself is a Phase 4 invention — **Phase 4 begins with designing and implementing it** (factory ID → constructor binding, scope contract, missing-factory error story); the CLI iterates registered factories at startup. Pinning the registration shape now keeps the daemon on-ramp consistent and prevents ad-hoc per-binary registration logic.
 - **Embedded** — `--exec <BINARY>` spawns a subprocess that talks to the CLI via stdio + a tiny line protocol. Lets non-Rust daemons piggyback on the CLI's lifecycle wiring. Deferred to Phase 4.
 - **Probe** — `--probe` runs a no-op daemon and just reports lifecycle events on stdout. Useful for testing the supervisor connection without a real factory.
 
@@ -362,7 +366,9 @@ Both subcommand groups are read-only from a cluster-state perspective with one l
 - **`net port probe-peer <NODE>`** — wraps `MeshAdapter::probe_reflex(peer)`. Sends a coordinator-mediated reflex probe to `peer` and prints the source address the coordinator observed for this node ("here's what the rest of the mesh sees you as"). Exits 3 with kind `transport` if the socket fails, `unavailable` if no coordinator session is up. Distinct from `net peer reflex <NODE>` — that's a cached lookup; this actively probes.
 - **`net port try-map --internal-port <P>`** — ad-hoc port-map attempt against the local gateway. Picks NAT-PMP (`Protocol::NatPmp`) when `--protocol nat-pmp`, UPnP (`Protocol::UpnpIgd`) when `upnp`, both-in-order when `auto`. On success prints the `PortMapping` (`{ external, internal_port, ttl_ms, protocol }`); on failure prints the `PortMappingError` kind (`unavailable` / `timeout` / `transport` / `refused`) with exit code 3. **Default behaviour revokes the mapping on exit** — this is a "does my router even support this?" diagnostic, not a way to permanently install a mapping outside the running mesh's lifecycle. `--keep` overrides for the rare case an operator wants the mapping installed without spinning up a full node. Requires the `port-mapping` cargo feature in the CLI build.
 
-Substrate-side prereq for `try-map`: the existing `PortMapperClient` impls (NAT-PMP / UPnP-IGD) are accessible through the traversal module today, but there's no public one-shot helper that constructs a client, runs `probe → install → remove`, and returns the `PortMapping`. The CLI's Phase 2 slice adds a small `sdk-side` adapter (`net_sdk::traversal::try_map_once(protocol, internal_port, ttl)`) wrapping the existing impls; that's a half-day's work, no substrate-internal changes required.
+Substrate-side prereq for `try-map`: the existing `PortMapperClient` impls (NAT-PMP / UPnP-IGD) are accessible through the traversal module today, but there's no public one-shot helper that constructs a client, runs `probe → install → remove`, and returns the `PortMapping`. The CLI needs a small `sdk-side` adapter (`net_sdk::traversal::try_map_once(protocol, internal_port, ttl)`) wrapping the existing impls; that's a half-day's work, no substrate-internal changes required.
+
+**This adapter must land before Phase 2 starts.** Phase 2 is blocked on it — implementing `net port try-map` against a missing SDK helper would either fork the traversal logic into the CLI (inconsistent with locked decision 1: "no command bypasses the SDK") or block the rest of Phase 2 behind the diagnostic. The fix is to merge `try_map_once` into `net-sdk` as the first substrate-side patch of the Phase 2 cycle, before any CLI work begins.
 
 ### 8. MeshDB query surface
 
@@ -372,7 +378,17 @@ Substrate-side prereq for `try-map`: the existing `PortMapperClient` impls (NAT-
 - **`net db latest --chain <CHAIN>`** — shorthand for `MeshQuery::latest(chain)`. Returns the freshest row from the chain.
 - **`net db between --chain <CHAIN> --start <T1> --end <T2>`** — shorthand for `MeshQuery::between(chain, t1, t2)`. Bounded timeline scan.
 - **`net db tail --chain <CHAIN> [--from <SEQ>]`** — `MeshQuery::latest(chain)` driven through `ResultStream` as ndjson; closes on `Ctrl-C` or chain end.
-- **`net db filter --chain <CHAIN> --where <EXPR>`** — shorthand for `MeshQuery::latest(chain).filter(parse(expr))`. `<EXPR>` accepts a small predicate DSL (`field == "x"`, `field > 42`, `tag in ["a","b"]`, `&&` / `||` / `!`). Parser lives in the CLI; compiles to an `Expr` the substrate already accepts. A misformed expression exits with subcommand-specific code 12.
+- **`net db filter --chain <CHAIN> --where <EXPR>`** — shorthand for `MeshQuery::latest(chain).filter(parse(expr))`. `<EXPR>` accepts a minimal CEL-style boolean grammar (see locked decision 12):
+
+  ```
+  EXPR  := TERM (("&&" | "||") TERM)*
+  TERM  := KEY OP VALUE
+  OP    := "==" | "!=" | "<" | "<=" | ">" | ">="
+  KEY   := identifier
+  VALUE := number | string | boolean
+  ```
+
+  Example: `--where "node_id == 3 && health != 'Unhealthy'"`. Implemented via `evalexpr` in Phase 2. No user-defined functions, no nested expressions, no `in` / `!` / set membership in v1 — those are deferred until a concrete use case forces the surface. Parser lives in the CLI; compiles to an `Expr` the substrate already accepts. A misformed expression exits with subcommand-specific code 12.
 - **`net db aggregate --chain <CHAIN> --kind <KIND> --field <FIELD> [--window <DUR>] [--group-by <KEY>]`** — composes `MeshQuery::latest(chain).aggregate(...)` using `NumericAggregateKind` for `sum|count|min|max|avg`. `--window` wraps the aggregate in a `WindowSpec` (sliding by default); `--group-by` adds a `GroupKey`. Prints one row per group as ndjson.
 - **`net db plan --query <Q> | --query-file <PATH>`** — runs `MeshQueryPlanner::plan(query)` but **does not** execute. Emits the `ExecutionPlan` as JSON — useful for understanding planner decisions (which chains get scanned, whether the cache layer engages, what the join watermark resolves to) before kicking off an expensive query.
 
@@ -382,7 +398,7 @@ Output defaults: `tail`, `between`, `aggregate`, `filter`, `run` emit ndjson; `l
 
 `net netdb` wraps `NetDb` (`adapter/net/netdb`) — the Cortex-backed local KV store every daemon can use for tasks + memories. Audience is **daemon developers + agents debugging local state**, not cluster operators; operators don't directly touch tasks / memories in production. The subcommand group lives in the same binary because the SDK already wires NetDB and a separate `netdb-cli` would duplicate config + identity loading for marginal cleanliness.
 
-Both `tasks` and `memories` are independent adapters with `with_tasks()` / `with_memories()` builder gates on the substrate; `net netdb` opens whichever the operator's `--store <PATH>` (or config-file `netdb.path`) requests, defaulting to `$XDG_DATA_HOME/net/netdb.redex`.
+Both `tasks` and `memories` are independent adapters with `with_tasks()` / `with_memories()` builder gates on the substrate; `net netdb` opens whichever the operator's `--store <PATH>` (or config-file `netdb.path`) requests. The XDG location `$XDG_DATA_HOME/net/netdb.redex` is a convention for bootstrapping, **not** an implicit default — see locked decision 11. Every invocation must name the store explicitly; the CLI never auto-discovers.
 
 **Tasks** — wraps `TasksAdapter` (`cortex/tasks/adapter.rs`):
 
@@ -405,7 +421,7 @@ Both `tasks` and `memories` are independent adapters with `with_tasks()` / `with
 - **`snapshot --out <PATH>`** — serialize the live snapshot via `NetDbSnapshot::encode()` (postcard) to `<PATH>`. Useful for backup + cross-machine replication during daemon development.
 - **`restore --from <PATH>`** — `NetDbSnapshot::decode(bytes)` then `NetDbBuilder::build_from_snapshot(snapshot)`. Fails fast if the target store is non-empty unless `--force` is set.
 
-Every `net netdb` command requires `--store <PATH>` (or config-file equivalent); the binary refuses to operate on whatever happens to live at a default path without confirmation, since these operations mutate persistent state.
+Every `net netdb` command requires `--store <PATH>` (or config-file equivalent) — no exceptions, no auto-discovery, even on the read-only `tasks ls` / `memories ls` / `snapshot` slice. This is the locked decision 11 surface: NetDB paths are deliberate resources, not magical globals. SDKs auto-configure internally; the CLI is explicit. Scripts that target NetDB must pin the store, which is exactly the safety contract operators need.
 
 ### 10. Config file shape
 
@@ -489,7 +505,7 @@ Lock these so phase implementations don't relitigate:
 
 3. **Exit codes are a stable contract.** The table above is locked; broadening a code's meaning (e.g. reusing 4 for non-ICE failures) requires a major version bump.
 
-4. **ICE writes go through simulate + confirm.** No `--yes` flag bypasses the simulate step. `--dry-run` skips the commit; `--yes` skips the interactive prompt only. Substrate-side `SimulationRequired` enforcement is the backstop.
+4. **ICE writes go through simulate + confirm.** No `--yes` flag bypasses the simulate step. `--dry-run` skips the commit; `--yes` skips the interactive prompt only. Substrate-side `SimulationRequired` enforcement is the backstop. `--dry-run` and `--yes` compose: `net ice <action> --dry-run --yes` simulates, auto-confirms without prompting, prints the envelope, and exits 0. This matches `kubectl` / `terraform` conventions and is the canonical CI shape.
 
 5. **Identity files are TOML with the seed inline.** Format pinned to the layout in §6. Re-using the SSH-style separate-pubkey-file split was considered and rejected; the CLI's audience is operators who already manage TOML config.
 
@@ -503,17 +519,25 @@ Lock these so phase implementations don't relitigate:
 
 10. **`net-blob` is absorbed in Phase 4.** Until then, both binaries ship; after, `net-blob` becomes an alias that prints a deprecation warning and forwards to `net blob`.
 
+11. **NetDB paths are always explicit.** `net netdb` never auto-discovers a store. Every invocation must pass `--store <PATH>` (or set `netdb.path` in the config profile). The XDG location `$XDG_DATA_HOME/net/netdb.redex` is a bootstrapping convention, not an implicit global — auto-discovery would create the illusion of mutable global state, which is the wrong default for a distributed-OS CLI that operators script against. SDKs auto-configure; the CLI is explicit.
+
+12. **The `--where` predicate is a minimal CEL-style subset.** Grammar locked at `EXPR := TERM (("&&" | "||") TERM)*`, `TERM := KEY OP VALUE`, `OP := "==" | "!=" | "<" | "<=" | ">" | ">="`. No user-defined functions, no nested expressions, no `in` / `!` / set membership in v1. Implemented via `evalexpr` in Phase 2; broader grammar (e.g. `in`, parentheses, negation) requires a new locked-decision entry and a minor version bump. This keeps help text, error messages, parser, and tests in lockstep.
+
+13. **`--dry-run` and `--yes` compose.** See decision 4 above — restated here so consumers searching this section find the rule. They are not mutually exclusive; combined, the CLI simulates, auto-confirms without prompting, prints the envelope, and exits 0.
+
+14. **Identity is loaded and validated before SDK construction.** `--identity <PATH>` triggers a pre-flight: file existence, readability, parse success. Failures get dedicated exit codes — 17 (not found), 18 (unreadable / permission denied / not a regular file), 19 (malformed). Collapsing all three onto the generic exit-3 SDK-error bucket was rejected as too blunt for scripted use. Structured JSON errors on stderr in non-TTY mode (`{"kind": "identity_not_found" | "identity_unreadable" | "identity_malformed", "path": "...", "message": "..."}`).
+
 ## Phases
 
 Activation order, dependency-driven:
 
 - **Phase 1 — Scaffolding + read-only surface.** `cli/Cargo.toml` + `src/main.rs` with clap routing for `net version`, `net identity (generate|show|fingerprint)`, `net snapshot get`, `net snapshot status`, `net audit recent` / `audit stream`, `net log tail`, `net failures tail`, `net daemon ls`, `net cap (show|query|nodes)`, `net peer (ls|reflex|nat)`, `net port gateway`, `net db (run|latest|between|tail|filter|aggregate|plan)`, `net netdb (tasks ls|memories ls|snapshot)`. Config + global flags + output dispatch. Exit-code table. Help-text goldens. Wires nothing that mutates substrate or local-node state — purely read + identity authoring.
 
-- **Phase 2 — Admin write surface + nRPC client + local-state writes + port-map diag + NetDB mutations.** `net admin (drain|enter-maintenance|exit-maintenance|cordon|uncordon|drop-replicas|invalidate-placement|restart-all-daemons|clear-avoid-list)`. `--dry-run` support. Identity loading + commit envelope construction. `net rpc (call|stream|discover|services)` — Tier 1 client surface over `MeshAdapter::call_service` / `call_streaming` / `find_service_nodes`. `net cap announce` + `net peer (reclassify-nat|set-reflex|clear-reflex)` — local-state writes that update what this node advertises but never commit to the admin chain. `net port (probe-peer|try-map)` — adds the `net_sdk::traversal::try_map_once` adapter helper that wraps the existing `PortMapperClient` impls into a one-shot `probe → install → remove`; requires the CLI build to enable the `port-mapping` cargo feature. `net netdb tasks (create|complete|rename|delete)` + `net netdb memories (store|retag|pin|unpin|delete)` + `net netdb restore` — local-store mutations on a developer's NetDB; `--force` gates `restore` over a non-empty store. Integration tests for every admin variant + ≥3 per `rpc` / `cap` / `peer` / `port` / `db` / `netdb` command (happy path, error path, output-format variant).
+- **Phase 2 — Admin write surface + nRPC client + local-state writes + port-map diag + NetDB mutations.** **Blocked on `net_sdk::traversal::try_map_once` landing first** (see §7); the SDK helper must merge before any Phase 2 CLI work begins so `net port try-map` rides the SDK rather than forking traversal logic into the CLI. Once that prereq is in: `net admin (drain|enter-maintenance|exit-maintenance|cordon|uncordon|drop-replicas|invalidate-placement|restart-all-daemons|clear-avoid-list)`. `--dry-run` support (composes with `--yes` per locked decision 4/13). Identity loading + commit envelope construction (pre-flight per locked decision 14; exit codes 17/18/19). `net rpc (call|stream|discover|services)` — Tier 1 client surface over `MeshAdapter::call_service` / `call_streaming` / `find_service_nodes`. `net cap announce` + `net peer (reclassify-nat|set-reflex|clear-reflex)` — local-state writes that update what this node advertises but never commit to the admin chain. `net port (probe-peer|try-map)` — wraps the now-landed `try_map_once` helper; requires the CLI build to enable the `port-mapping` cargo feature. `net netdb tasks (create|complete|rename|delete)` + `net netdb memories (store|retag|pin|unpin|delete)` + `net netdb restore` — local-store mutations on a developer's NetDB; `--force` gates `restore` over a non-empty store. `--where` predicate parser (`evalexpr` integration per locked decision 12). Integration tests for every admin variant + ≥3 per `rpc` / `cap` / `peer` / `port` / `db` / `netdb` command (happy path, error path, output-format variant).
 
 - **Phase 3 — ICE break-glass surface.** `net ice (freeze-cluster|thaw-cluster|flush-avoid-lists|force-evict-replica|force-restart-daemon|force-cutover|kill-migration)`. Simulate → preview table → confirm gate → commit. `--yes` for non-interactive flows; `--sig` for pre-collected signatures. `net identity registry (add|remove|list)`. ICE-specific integration tests + the exit-code-8 coverage.
 
-- **Phase 4 — Daemon run + blob absorption.** `net daemon run --kind <FACTORY-ID>` with the `net_daemon_factories::register!` macro inventory. `net daemon shutdown`. `net daemon log`. `net blob` absorbs `net-blob`'s `put` / `get` / `ls` / `rm` surface. `net-blob` becomes a forwarding shim.
+- **Phase 4 — Daemon run + blob absorption.** **Starts with designing and implementing the `net_daemon_factories::register!` macro** — factory ID → constructor binding, scope contract (process-wide registration via `inventory`-style linker hooks vs explicit per-binary opt-in), missing-factory error story (exit code 10 per the table), duplicate-factory handling. Once the macro exists: `net daemon run --kind <FACTORY-ID>` iterates the registered inventory. `net daemon shutdown`. `net daemon log`. `net blob` absorbs `net-blob`'s `put` / `get` / `ls` / `rm` surface. `net-blob` becomes a forwarding shim.
 
 - **Phase 5 — Remote attach.** `--endpoint tcp://host:port` for talking to a substrate node from a different process. **Substrate-side prereq**: a remote-attach handshake doesn't exist yet — this phase is gated on `MESHOS_PLAN.md`'s remote-attach work landing first.
 
