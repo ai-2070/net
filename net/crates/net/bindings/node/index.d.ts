@@ -377,10 +377,25 @@ export declare class DaemonRuntime {
 
 /**
  * Operator-facing handle to the cluster's admin / snapshot / log /
- * audit surfaces. Construct via `fromMeshos(sdk, identity)`
- * against a running `MeshOsDaemonSdk`.
+ * audit surfaces. Construct via `DeckClient.new(...)` for the
+ * standalone "operator-only" mode (binding owns the supervisor),
+ * or via `fromMeshos(sdk, identity)` against an externally-managed
+ * `MeshOsDaemonSdk`.
  */
 export declare class DeckClient {
+  /**
+   * Construct a deck client owning a private supervisor runtime.
+   * Mirrors the cdylib's `net_deck_client_new` ("operator-only
+   * mode" per `net_deck.h`) for Node consumers who don't already
+   * have a `MeshOsDaemonSdk` to compose against.
+   *
+   * `operatorSeed` must be exactly 32 bytes of ed25519 seed
+   * material — the operator id is derived as the keypair's
+   * origin hash. `meshosConfig` / `deckConfig` accept the same
+   * shapes as the standalone factories; pass `null` for
+   * substrate defaults.
+   */
+  static new(operatorSeed: Buffer, meshosConfig?: MeshOsConfigJs | undefined | null, deckConfig?: DeckClientConfigJs | undefined | null): Promise<DeckClient>
   /**
    * Construct against a running `MeshOsDaemonSdk`. The deck
    * client reuses the SDK's tokio runtime, so streams + admin
@@ -389,6 +404,19 @@ export declare class DeckClient {
   static fromMeshos(sdk: MeshOsDaemonSdk, identity: OperatorIdentity, config?: DeckClientConfigJs | undefined | null): Promise<DeckClient>
   /** Operator identity bound to this client. */
   identity(): OperatorIdentity
+  /**
+   * Tear down the private supervisor runtime if the client
+   * owns one (constructed via `DeckClient.new`). No-op for
+   * clients built via `fromMeshos` against an externally-
+   * managed SDK — the caller is responsible for that SDK's
+   * own `shutdown()`. Idempotent: subsequent calls return
+   * without throwing.
+   *
+   * Wired into the TS wrapper's `close()` /
+   * `Symbol.asyncDispose` so `await using deck = …;` drains
+   * the supervisor at scope exit.
+   */
+  shutdown(): Promise<void>
   /** Typed admin-event surface. */
   get admin(): AdminCommands
   /**
