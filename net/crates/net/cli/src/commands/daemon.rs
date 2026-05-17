@@ -32,6 +32,7 @@
 use std::path::PathBuf;
 
 use clap::Args;
+use net_sdk::deck::DaemonSnapshot;
 use serde::Serialize;
 
 use crate::context::{resolve_profile, CliContext};
@@ -61,7 +62,7 @@ pub async fn run_ls(
         .iter()
         .map(|(id, d)| DaemonRow {
             id: *id,
-            name: format!("{:?}", d),
+            snapshot: d.clone(),
         })
         .collect();
     emit_value(OutputFormat::resolve_oneshot(output), &rows)
@@ -72,9 +73,6 @@ pub async fn run_ls(
 #[derive(Serialize)]
 struct DaemonRow {
     id: u64,
-    /// Debug-formatted projection of the substrate's
-    /// `DaemonSnapshot`. Typed fields land when we add a
-    /// `DaemonSummary` mirror — Phase 1 keeps the surface
-    /// lightweight while the schema is exercised.
-    name: String,
+    #[serde(flatten)]
+    snapshot: DaemonSnapshot,
 }

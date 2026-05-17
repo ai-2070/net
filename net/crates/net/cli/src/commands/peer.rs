@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 use clap::Args;
+use net_sdk::deck::{MaintenanceMirrorSnapshot, PeerHealthSnapshot};
 use serde::Serialize;
 
 use crate::context::{resolve_profile, CliContext};
@@ -42,8 +43,8 @@ pub async fn run_ls(
         .map(|(id, p)| PeerRow {
             node: *id,
             rtt_ms: p.rtt_ms,
-            health: p.health.map(|h| format!("{h:?}")),
-            maintenance: p.maintenance.map(|m| format!("{m:?}")),
+            health: p.health,
+            maintenance: p.maintenance,
             cpu_load_1m: p.cpu_load_1m,
             mem_used_bytes: p.mem_used_bytes,
             mem_total_bytes: p.mem_total_bytes,
@@ -60,8 +61,8 @@ pub async fn run_ls(
 struct PeerRow {
     node: u64,
     rtt_ms: Option<u64>,
-    health: Option<String>,
-    maintenance: Option<String>,
+    health: Option<PeerHealthSnapshot>,
+    maintenance: Option<MaintenanceMirrorSnapshot>,
     cpu_load_1m: Option<f64>,
     mem_used_bytes: Option<u64>,
     mem_total_bytes: Option<u64>,
