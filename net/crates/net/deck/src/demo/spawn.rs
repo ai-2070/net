@@ -1,7 +1,7 @@
 //! Orchestrates the demo's boot sequence:
 //!
-//! 1. Build the 5-node `ClusterHarness` (handshakes + bridge
-//!    probes done by the harness itself).
+//! 1. Build the `DEMO_NODE_COUNT`-node `ClusterHarness`
+//!    (handshakes + bridge probes done by the harness itself).
 //! 2. Register a `NodeAgentDaemon` on every node via the
 //!    node's `MeshOsDaemonSdk`. The substrate folds each
 //!    registration into its local snapshot's `daemons` set,
@@ -83,7 +83,7 @@ pub struct Harness {
     _rpc_requester_tasks: Vec<JoinHandle<()>>,
     /// `DeckClient` anchored on node[0]'s `MeshOsRuntime`. The
     /// deck observes node[0]'s snapshot fold (which includes
-    /// the other 4 peers via the bridge probes).
+    /// the other peers via the bridge probes).
     deck: Arc<DeckClient>,
     /// No blob adapters in Phase 1; Phase 2 wires per-node
     /// in-memory `Redex`-backed adapters.

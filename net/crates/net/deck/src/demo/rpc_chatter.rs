@@ -5,13 +5,13 @@
 //!    translates `RpcCallEvent`s into `NrpcCall` records and
 //!    pushes them into the deck's `NrpcTail`. Installed on
 //!    every node's `Mesh`.
-//! 2. **Responders.** On 2 of the 5 nodes (indices 0 and 1)
-//!    we call `mesh.serve_rpc_typed` to register an `echo`
-//!    typed handler.
-//! 3. **Requesters.** On the remaining 3 nodes (2, 3, 4) a
-//!    tokio task fires periodic `call_typed` requests at a
-//!    random responder. Real Noise-encrypted UDP, real
-//!    substrate dispatch, real observer firings.
+//! 2. **Responders.** On the first `RESPONDER_COUNT` nodes
+//!    (indices 0 and 1) we call `mesh.serve_rpc_typed` to
+//!    register an `echo` typed handler.
+//! 3. **Requesters.** On the remaining nodes a tokio task
+//!    fires periodic `call_typed` requests at a random
+//!    responder. Real Noise-encrypted UDP, real substrate
+//!    dispatch, real observer firings.
 //!
 //! The NRPC tab populates from observation, not from a
 //! synthetic seeder.
