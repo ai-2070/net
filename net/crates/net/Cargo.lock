@@ -1864,6 +1864,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-deck-ffi"
+version = "0.17.0"
+dependencies = [
+ "ai2070-net",
+ "futures",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "net-meshdb-ffi"
 version = "0.17.0"
 dependencies = [

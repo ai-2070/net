@@ -9,6 +9,7 @@ members = [
     "bindings/go/rpc-ffi",
     "bindings/go/meshdb-ffi",
     "bindings/go/meshos-ffi",
+    "bindings/go/deck-ffi",
 ]
 
 [package]
