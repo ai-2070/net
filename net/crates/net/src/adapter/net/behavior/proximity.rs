@@ -510,15 +510,35 @@ impl ProximityGraph {
 
     /// Set local capabilities
     pub fn set_local_capabilities(&self, caps: CapabilitySet) {
+        // Take the caps write lock FIRST so the three updates
+        // (hash, version, the `Option<CapabilitySet>`) cannot
+        // tear from a concurrent reader's perspective. Pre-fix:
+        //   1. `fetch_add` then `store(version)` was a classic
+        //      lost-update race - two callers A and B doing
+        //      `fetch_add -> 1` / `fetch_add -> 2` could
+        //      interleave their stores so the final atomic
+        //      reads back the older value, regressing the
+        //      version counter and breaking the "newer caps
+        //      always have a strictly-higher version" contract
+        //      pingwave consumers rely on.
+        //   2. Three independent unordered writes (hash, version,
+        //      RwLock) let a reader inside `create_pingwave`
+        //      sample a hash that didn't match the version it
+        //      read, or a CapabilitySet that didn't match either.
+        // Holding the write lock across all three serialises
+        // concurrent set_local_capabilities callers, and uses
+        // the fetch_add return value directly (no second store).
         let hash = hash_capabilities(&caps);
-        let version = self
+        let mut guard = self.local_capabilities.write().unwrap();
+        // fetch_add returns the prior value; the atomic is now
+        // at `prior + 1`. Use that value directly - storing it
+        // back is what introduced the lost-update race pre-fix.
+        let _new_version = self
             .local_capability_version
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-        self.local_capability_hash.store(hash, Ordering::Relaxed);
-        self.local_capability_version
-            .store(version, Ordering::Relaxed);
-        *self.local_capabilities.write().unwrap() = Some(caps);
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        self.local_capability_hash.store(hash, Ordering::Release);
+        *guard = Some(caps);
     }
 
     /// Set local load level (0-255)
