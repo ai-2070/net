@@ -1,0 +1,33 @@
+net/crates/net/bindings/node/test/deck.test.ts
+  s_5af7ced268385a::t_b47d56e9154b23 237-245,249-260,262-269,273-288,290-292,300-370
+  s_5af7ced268385a::t_e555bedd31281c 246-248,261,270-272,289,293-299
+net/crates/net/bindings/node/index.js
+  s_5af7ced268385a::t_33ae5f78c761af 580-582,586,589-590,594,597-599,607,622-627,629-631,634,638-651,656
+net/crates/net/sdk-ts/src/deck.ts
+  s_5af7ced268385a::t_6add840f186832 411-412,415
+  s_5af7ced268385a::t_c1d35b36e4703a 40-41,43-44,50-52
+  s_5af7ced268385a::t_1494961f968089 378-410,413-414,416-634
+net/crates/net/bindings/node/index.d.ts
+  s_5af7ced268385a::t_5dccd4c2fad90d 401-402,404
+  s_5af7ced268385a::t_33ae5f78c761af 21-83,384-400,403,405-409,487-513,589-667,764-907,1393-1490,1523-1580,2183-2260,2524-2561,2567-2586,2610-2626,2662-2720,2744-2754,2785-2790,2811-2893,2959-2979,3215-3262,3333-3408,3514-3558,3633-3653,3921-3961,3968-3979
+net/crates/net/bindings/node/src/deck.rs
+  s_5af7ced268385a::t_e098d677d097ff 542-575,578,588-905
+  s_5af7ced268385a::t_2bd5d308b29828 576-577,579-587
+  s_5af7ced268385a::t_e67990d1932d9a 38-41,44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "e3a8a2c6a8620ebef88005a21bdba1386745db6f",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
