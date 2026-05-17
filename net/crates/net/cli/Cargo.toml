@@ -56,7 +56,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing = "0.1"
 
 # XDG paths + TOML for the config + identity stores.
-dirs = "5"
+dirs = "6"
 toml = "0.8"
 
 # Streaming combinators used by the audit/log/failures ndjson
