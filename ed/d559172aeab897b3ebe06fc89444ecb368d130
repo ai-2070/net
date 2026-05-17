@@ -1,0 +1,21 @@
+net/crates/net/bindings/node/src/cortex.rs
+  s_5af7ced268385a::t_5a23a326cd184e 13-15
+net/crates/net/docs/STORAGE_AND_CORTEX.md
+  s_5af7ced268385a::t_7f0feb8efcf6a9 252-257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "edd559172aeab897b3ebe06fc89444ecb368d130",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
