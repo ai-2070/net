@@ -1,0 +1,23 @@
+net/crates/net/include/net_cortex.h
+  s_b3022192a92c59::t_9ccccea54e8cac 1-156
+net/crates/net/include/net.go.h
+  s_b3022192a92c59::t_ba7c38938e61ed 233,235-238,240-242,244
+net/crates/net/include/README.md
+  s_b3022192a92c59::t_ef1e5c3af84ff4 12-13,16-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "33edd522a42da67442eb6ba32a312bc6e8f02ba3",
+  "prompts": {},
+  "sessions": {
+    "s_b3022192a92c59": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d594c56e-1353-4a07-aa91-e09d2c583c0f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
