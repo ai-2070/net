@@ -658,6 +658,23 @@ jobs:
             # symbols are exercised by the `go test` suite, not by
             # consumers.
             features: ""
+          - name: cli
+            path: net/crates/net/cli
+            # `net-cli` pulls the SDK in with the explicit feature
+            # set its Cargo.toml declares; clippy honors that.
+            # `--all-targets` covers the bin + integration test
+            # crates under `tests/`.
+            features: ""
+          - name: deck
+            path: net/crates/net/deck
+            # The deck TUI binary's `unit-tests` step at the top
+            # of this workflow runs its `#[cfg(test)] mod tests`
+            # blocks, but clippy lints + module-level dead-code
+            # checks weren't covered until this matrix entry.
+            # Default features only — matches the cargo invocation
+            # the test step uses, so what the binary ships gets
+            # linted (not the `demo` feature, which is dev-only).
+            features: ""
     steps:
       - uses: actions/checkout@v6
 
@@ -771,6 +788,51 @@ jobs:
         working-directory: ${{ matrix.crate.path }}
         run: cargo test --lib ${{ matrix.crate.features }}
 
+  cli-tests:
+    # `net-cli`'s test surface is broader than the FFI shims:
+    # unit tests inside `src/`, plus integration-test crates under
+    # `tests/` that spawn the binary via `assert_cmd`. The crate
+    # has no lib target, so `cargo test --lib` would silently skip
+    # everything; `cargo test -p net-cli` runs every target cargo
+    # auto-discovers, so a new `tests/foo.rs` doesn't need a CI
+    # edit.
+    #
+    # Current surface (informational; not a check):
+    #
+    #   src/main.rs                  — humantime duration parser
+    #   src/output.rs                — format resolver
+    #   src/error.rs                 — exit-code discriminator pin
+    #   src/parsers.rs               — parse_u64_flexible
+    #   src/commands/ice.rs          — confirmation-gate logic
+    #   src/commands/identity.rs     — iso8601 formatter
+    #   tests/help.rs                — help-text + version surface
+    #   tests/exit_codes.rs          — documented exit codes
+    #   tests/dry_run.rs             — admin verb `--dry-run` envelope
+    name: Net CLI tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-cli-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run net-cli tests
+        run: cargo test -p net-cli
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -813,5 +875,21 @@ jobs:
 
       - name: Build documentation
         run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # `cargo doc --all-features` only docs the current package
+      # (the root `ai2070-net` crate). Workspace members live in
+      # their own crates; `net-cli` and `deck` both have
+      # substantial module-level docstrings that document the
+      # subcommand / TUI surface contracts — keep them
+      # warning-free.
+      - name: Build net-cli documentation
+        run: cargo doc -p net-cli --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Build deck documentation
+        run: cargo doc -p deck --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

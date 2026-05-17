@@ -1489,7 +1489,8 @@ impl PyIceProposal {
         // binding, so an unknown-variant rejection leaves the
         // proposal retry-able. Substrate-side simulate errors
         // still consume the husk (matching Go + Node).
-        build_core_proposal(&client, action.clone()).map_err(|e| deck_err(py, e.kind, &e.message))?;
+        build_core_proposal(&client, action.clone())
+            .map_err(|e| deck_err(py, e.kind, &e.message))?;
         self.action = None;
         let action_for_build = action.clone();
         let blast = py.detach(move || {
@@ -1611,7 +1612,8 @@ impl PySimulatedIceProposal {
         // rejection leaves the husk retry-able. Substrate-side
         // simulate/commit errors still consume the husk (matching
         // Go + Node).
-        build_core_proposal(&client, action.clone()).map_err(|e| deck_err(py, e.kind, &e.message))?;
+        build_core_proposal(&client, action.clone())
+            .map_err(|e| deck_err(py, e.kind, &e.message))?;
         self.action = None;
         self.committed = true;
         let commit_result = py.detach(move || {

@@ -92,9 +92,7 @@ fn render_live_nodes_table(
         .filter(|(_, p)| matches!(p.health, Some(PeerHealthSnapshot::Degraded)))
         .count();
     let pos = cursor.min(total.saturating_sub(1)) + 1;
-    let body_h = (area.height as usize)
-        .saturating_sub(2)
-        .saturating_sub(1);
+    let body_h = (area.height as usize).saturating_sub(2).saturating_sub(1);
     let (start, end, hidden_above, hidden_below) = super::scroll_window(total, body_h, cursor);
     let mut title_spans = vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),

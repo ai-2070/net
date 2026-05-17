@@ -539,9 +539,11 @@ Activation order, dependency-driven:
 
 - **Phase 4 — Daemon run + blob absorption.** **Starts with designing and implementing the `net_daemon_factories::register!` macro** — factory ID → constructor binding, scope contract (process-wide registration via `inventory`-style linker hooks vs explicit per-binary opt-in), missing-factory error story (exit code 10 per the table), duplicate-factory handling. Once the macro exists: `net daemon run --kind <FACTORY-ID>` iterates the registered inventory. `net daemon shutdown`. `net daemon log`. `net blob` absorbs `net-blob`'s `put` / `get` / `ls` / `rm` surface. `net-blob` becomes a forwarding shim.
 
-- **Phase 5 — Remote attach.** `--endpoint tcp://host:port` for talking to a substrate node from a different process. **Substrate-side prereq**: a remote-attach handshake doesn't exist yet — this phase is gated on `MESHOS_PLAN.md`'s remote-attach work landing first.
+- **Phase 5 — Remote attach. INDEFINITELY DEFERRED.** `--endpoint mesh://<bootstrap-peer>:<port>?psk=<file>` for operator commands from a different machine. The substrate already has the wire layer (encrypted UDP + channel-auth + nRPC + capability-based service discovery); what's missing is the Deck nRPC service surface (`DeckService.{Snapshots, Status, AdminDrain, …, IceSimulate, IceCommit, AuditQuery, LogTail, FailureTail}`) plus server-side handlers each substrate node would register. Client wrapper would be a `RemoteDeckClient` that mirrors `DeckClient`'s method names but routes through `mesh.call_service(…)`. Real scope: ~2–3 days of substrate work, not a fundamental architectural change.
 
-Phases 1–4 land independently of each other; Phase 5 has a hard substrate prereq.
+Status: indefinitely deferred — no consumer workflow drives this today. The strongest pull would be Deck-the-TUI rendering a real production cluster from an operator's laptop (currently it only sees its own in-process supervisor or the `--features demo` synthetic cluster); multi-operator ICE coordination is the second-strongest. Revive when one of those is concrete.
+
+Phases 1–4 land independently of each other; Phase 5 stays parked until a consumer needs it.
 
 ### Indefinitely deferred
 
@@ -592,4 +594,4 @@ It explicitly does NOT interact with:
 
 ---
 
-*v0.17 cycle release candidate. Gates on a real consumer workflow (CI bot / ChatOps / SRE runbook). Phases 1–4 land independently; Phase 5 (remote attach) waits on substrate work. The `net-blob` binary stays in place until Phase 4 absorbs it.*
+*v0.17 cycle release candidate. Gates on a real consumer workflow (CI bot / ChatOps / SRE runbook). Phases 1–4 land independently; Phase 5 (remote attach) is indefinitely deferred — the substrate already has the wire layer (encrypted UDP + nRPC + capability discovery), what's missing is the Deck nRPC service surface, and no consumer drives that today. The `net-blob` binary stays in place until Phase 4 absorbs it.*
