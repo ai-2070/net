@@ -33,7 +33,7 @@ use net_sdk::deck::{AvoidScope, BlastRadius, ChainCommit, DaemonRef, OperatorSig
 use serde::Serialize;
 
 use crate::context::{resolve_profile, CliContext};
-use crate::error::{generic, sdk, CliError, CliError as _CE, ExitCodeKind};
+use crate::error::{generic, sdk, CliError, ExitCodeKind};
 use crate::parsers::parse_u64_flexible;
 use crate::prelude::{emit_value, OutputFormat};
 
@@ -131,8 +131,10 @@ pub struct CommonIceArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Skip the interactive `YES` prompt. Required when stdout
-    /// is non-TTY; rejected on TTY unless explicitly passed.
+    /// Skip the interactive `YES` prompt. Required when **stdin**
+    /// is not a TTY (scripts / CI); on an interactive terminal
+    /// the prompt always runs regardless of `--yes` (a stray
+    /// shell-history recall can't ram an ICE commit through).
     #[arg(long)]
     pub yes: bool,
 
@@ -289,25 +291,43 @@ where
         return Ok(());
     }
 
+    // Parse supplied signatures up-front, BEFORE the confirm
+    // gate. Pre-fix `--sig` was parsed after the operator had
+    // already typed YES; a malformed `--sig` JSON aborted with
+    // InvalidArgs post-confirmation, wasting the dual-key
+    // ceremony and producing confusing UX. Surface argv typos
+    // immediately so the gate only runs on inputs we know are
+    // well-formed.
+    let mut signatures: Vec<OperatorSignature> = Vec::new();
+    for raw in &common.sigs {
+        signatures.push(parse_supplied_sig(raw)?);
+    }
+
     // Confirmation gate. The break-glass surface keeps a dual-key
     // feel: `--yes` only short-circuits the prompt when stdin is
     // not a TTY (scripts / CI). On an interactive terminal we
     // always demand the typed `YES` even with `--yes` so a stray
     // shell-history recall can't ram an ICE commit through.
+    //
+    // Run the gate on a blocking-pool task so the operator's wait
+    // at the prompt doesn't park a tokio worker. Pre-fix
+    // `prompt_for_yes` did `io::stdin().lock().read_line(...)`
+    // synchronously on the SDK runtime, freezing background tasks
+    // (logging dispatcher, mesh ticks) for the duration of the
+    // confirmation typing.
     let stdin_is_tty = std::io::IsTerminal::is_terminal(&io::stdin());
-    check_confirm_gate(stdin_is_tty, common.yes, prompt_for_yes)?;
+    let yes_flag = common.yes;
+    tokio::task::spawn_blocking(move || check_confirm_gate(stdin_is_tty, yes_flag, prompt_for_yes))
+        .await
+        .map_err(|e| generic(format!("confirm-gate task panicked: {e}")))??;
 
-    // Sign locally + collect supplied signatures.
-    let mut signatures: Vec<OperatorSignature> = Vec::new();
+    // Sign locally now that the gate has passed.
     let local_sig = ctx.identity().sign_proposal(
         simulated.action(),
         simulated.issued_at_ms(),
         &simulated.blast_hash(),
     );
     signatures.push(local_sig);
-    for raw in &common.sigs {
-        signatures.push(parse_supplied_sig(raw)?);
-    }
 
     let commit: ChainCommit = simulated
         .commit(&signatures)
@@ -337,7 +357,7 @@ where
     P: FnOnce() -> Result<bool, CliError>,
 {
     if !stdin_is_tty && !yes_flag {
-        return Err(_CE::new(
+        return Err(CliError::new(
             ExitCodeKind::ConfirmationRefused,
             "stdin is not a TTY; pass --yes to skip the interactive confirm prompt",
         ));
@@ -350,13 +370,20 @@ where
 
 fn map_ice_error(msg: &str, kind: &'static str) -> CliError {
     match kind {
-        "simulation_required" => _CE::new(ExitCodeKind::IceSimulationBlocked, msg),
+        "simulation_required" => CliError::new(ExitCodeKind::IceSimulationBlocked, msg),
+        // `signature_invalid` is a cryptographic verifier
+        // failure, not a policy / quorum reject. Pre-fix it
+        // surfaced under `OperatorPolicyRejected` (5) along
+        // with the other ICE policy failures; route it to a
+        // distinct `IceSignatureInvalid` (13) so audit
+        // dashboards can tell "verifier failed" from "policy
+        // rejected."
+        "signature_invalid" => CliError::new(ExitCodeKind::IceSignatureInvalid, msg),
         "not_authorized"
-        | "signature_invalid"
         | "insufficient_signatures"
         | "envelope_expired"
         | "envelope_from_future"
-        | "ice_cooldown_active" => _CE::new(ExitCodeKind::OperatorPolicyRejected, msg),
+        | "ice_cooldown_active" => CliError::new(ExitCodeKind::OperatorPolicyRejected, msg),
         _ => sdk(msg),
     }
 }

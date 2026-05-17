@@ -64,7 +64,7 @@ async fn test_read_after_write() {
 
     for i in 0..50u64 {
         let seq = adapter.ingest(mk_env(1, i, b"")).unwrap();
-        adapter.wait_for_seq(seq).await;
+        adapter.wait_for_seq(seq).await.unwrap();
     }
 
     let state_handle = adapter.state();
@@ -93,7 +93,7 @@ async fn test_replay_from_beginning_rebuilds_state() {
         .unwrap();
         for i in 0..25u64 {
             let seq = a.ingest(mk_env(2, i, b"")).unwrap();
-            a.wait_for_seq(seq).await;
+            a.wait_for_seq(seq).await.unwrap();
         }
         a.close().unwrap();
     }
@@ -110,7 +110,7 @@ async fn test_replay_from_beginning_rebuilds_state() {
     )
     .unwrap();
     // Wait for the fold to catch up to the last event.
-    a2.wait_for_seq(24).await;
+    a2.wait_for_seq(24).await.unwrap();
     assert_eq!(a2.state().read().seen.len(), 25);
 }
 
@@ -128,7 +128,7 @@ async fn test_from_seq_checkpoint_resume() {
     .unwrap();
     for i in 0..10u64 {
         let seq = a.ingest(mk_env(3, i, b"")).unwrap();
-        a.wait_for_seq(seq).await;
+        a.wait_for_seq(seq).await.unwrap();
     }
     a.close().unwrap();
 
@@ -153,7 +153,7 @@ async fn test_from_seq_checkpoint_resume() {
         Some(4),
     )
     .unwrap();
-    a2.wait_for_seq(9).await;
+    a2.wait_for_seq(9).await.unwrap();
 
     let state = a2.state();
     let guard = state.read();
@@ -180,7 +180,7 @@ async fn test_live_only_skips_pre_open_events() {
         .unwrap();
         for i in 0..10u64 {
             let seq = a.ingest(mk_env(5, i, b"")).unwrap();
-            a.wait_for_seq(seq).await;
+            a.wait_for_seq(seq).await.unwrap();
         }
         a.close().unwrap();
     }
@@ -211,7 +211,7 @@ async fn test_live_only_skips_pre_open_events() {
     // Append 3 more — these arrive live.
     for i in 100..103u64 {
         let seq = a2.ingest(mk_env(5, i, b"")).unwrap();
-        a2.wait_for_seq(seq).await;
+        a2.wait_for_seq(seq).await.unwrap();
     }
 
     let state = a2.state();
@@ -279,7 +279,7 @@ async fn test_mixed_dispatch_routing() {
     let seq = adapter
         .ingest(mk_env(DISPATCH_TASK_DELETED, 2, b""))
         .unwrap();
-    adapter.wait_for_seq(seq).await;
+    adapter.wait_for_seq(seq).await.unwrap();
 
     let state = adapter.state();
     let guard = state.read();
@@ -305,7 +305,7 @@ async fn test_ingest_after_close_errors() {
     .unwrap();
 
     let seq = adapter.ingest(mk_env(0, 0, b"")).unwrap();
-    adapter.wait_for_seq(seq).await;
+    adapter.wait_for_seq(seq).await.unwrap();
     adapter.close().unwrap();
 
     // State handle survives close.
@@ -333,7 +333,7 @@ async fn test_burst_ordering_preserved() {
     for i in 0..500u64 {
         last_seq = adapter.ingest(mk_env(7, i, b"")).unwrap();
     }
-    adapter.wait_for_seq(last_seq).await;
+    adapter.wait_for_seq(last_seq).await.unwrap();
 
     let state = adapter.state();
     let guard = state.read();
@@ -378,7 +378,7 @@ async fn test_regression_folded_through_seq_sentinel_handles_u64_range() {
     );
 
     let seq = adapter.ingest(mk_env(1, 0, b"")).unwrap();
-    adapter.wait_for_seq(seq).await;
+    adapter.wait_for_seq(seq).await.unwrap();
 
     assert_eq!(
         adapter.folded_through_seq(),
@@ -407,7 +407,7 @@ async fn test_state_handle_is_shared_arc() {
     assert!(Arc::ptr_eq(&handle_a, &handle_b));
 
     let seq = adapter.ingest(mk_env(0, 42, b"")).unwrap();
-    adapter.wait_for_seq(seq).await;
+    adapter.wait_for_seq(seq).await.unwrap();
 
     // Writing through the fold is visible on both handles.
     assert_eq!(handle_a.read().seen.len(), 1);

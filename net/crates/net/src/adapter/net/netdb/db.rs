@@ -132,6 +132,20 @@ impl NetDb {
     /// snapshotted under its own state lock (consistent per-model);
     /// there is no cross-model consistency guarantee because each
     /// model is a separate RedEX file.
+    ///
+    /// **Cross-model ordering caveat.** Tasks are snapshotted
+    /// first, then memories. An ingest that lands in both models
+    /// between the two calls is captured by the memories snapshot
+    /// but missed by the tasks snapshot — so the resulting
+    /// `NetDbSnapshot` can split a logical "write to both models"
+    /// across the two halves. A watcher snapshotting between
+    /// event deliveries needs to either (a) treat each model's
+    /// `last_seq` as the authoritative ordering and reconcile
+    /// idempotently on restore, or (b) drain both models'
+    /// `wait_for_seq(known_last)` before calling `snapshot()` to
+    /// pin a deliberate cut-off. The lock order (tasks → memories)
+    /// is fixed so any future writer that takes both locks must
+    /// match this order to avoid deadlock.
     pub fn snapshot(&self) -> Result<NetDbSnapshot, NetDbError> {
         let tasks = if let Some(t) = &self.tasks {
             Some(t.snapshot()?)
@@ -212,6 +226,14 @@ impl NetDbBuilder {
     /// but cannot directly observe the closed first-adapter after
     /// the Redex has been dropped.
     pub async fn build(self) -> Result<NetDb, NetDbError> {
+        // Refuse a no-models build. Pre-fix this returned a no-op
+        // NetDb whose `tasks()` / `memories()` accessors panicked
+        // on first call; surface the config error as a typed
+        // `?` so a misconfigured profile or test fixture doesn't
+        // turn into a process panic at the first read.
+        if !self.want_tasks && !self.want_memories {
+            return Err(NetDbError::NoModelsEnabled);
+        }
         let cfg = self.redex_config();
 
         let tasks = if self.want_tasks {
@@ -252,6 +274,9 @@ impl NetDbBuilder {
     /// propagates. See `build`'s docs for the caveat that the
     /// failing Redex is dropped with the builder.
     pub async fn build_from_snapshot(self, snapshot: &NetDbSnapshot) -> Result<NetDb, NetDbError> {
+        if !self.want_tasks && !self.want_memories {
+            return Err(NetDbError::NoModelsEnabled);
+        }
         let cfg = self.redex_config();
 
         let tasks = match (self.want_tasks, &snapshot.tasks) {

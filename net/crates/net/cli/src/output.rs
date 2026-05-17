@@ -91,6 +91,16 @@ pub fn emit_value<T: Serialize>(fmt: OutputFormat, value: &T) -> io::Result<()> 
 /// Text / Table forms render the value via Display through a
 /// JSON intermediary so subcommands don't need to hand-roll a
 /// formatter per payload type.
+///
+/// **Blocking-stdout caveat.** This writes synchronously to a
+/// locked `io::stdout()`. If the downstream consumer (e.g. a
+/// piped `jq`) stalls and the kernel pipe buffer fills, the
+/// write blocks indefinitely. Callers' tokio `select!` arms see
+/// neither Ctrl-C nor the next stream row until the consumer
+/// resumes draining. The wedge is rare in practice (pipe
+/// readers either drain or close, which we surface as
+/// `BrokenPipe`), but operators wiring this to filtering
+/// downstreams that can stall on disk should be aware.
 pub fn emit_stream_row<T: Serialize>(fmt: OutputFormat, row: &T) -> io::Result<()> {
     let stdout = io::stdout();
     let mut lock = stdout.lock();

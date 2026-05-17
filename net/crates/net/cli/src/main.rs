@@ -202,7 +202,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Daemon(DaemonCommand::Ls(args)) => {
             commands::daemon::run_ls(args, output, config_path, profile).await
         }
-        Command::Netdb(cmd) => commands::netdb::run(cmd, output).await,
+        Command::Netdb(cmd) => commands::netdb::run(cmd, output, config_path, profile).await,
     }
 }
 

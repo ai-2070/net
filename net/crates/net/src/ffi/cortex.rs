@@ -1667,7 +1667,8 @@ pub extern "C" fn net_tasks_delete(
 
 /// Block until fold has applied every event up through `seq`. Pass
 /// `timeout_ms == 0` to wait indefinitely. Returns `0` on success,
-/// `1` on timeout, or negative on error.
+/// `1` on timeout, `NET_ERR_FOLD_STOPPED` (`-106`) if the fold task
+/// stopped before reaching `seq`, or negative on other errors.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_tasks_wait_for_seq(
     handle: *mut TasksAdapterHandle,
@@ -1686,13 +1687,16 @@ pub extern "C" fn net_tasks_wait_for_seq(
     block_on(async move {
         let fut = adapter.wait_for_seq(seq);
         if timeout_ms == 0 {
-            fut.await;
-            0
+            match fut.await {
+                Ok(()) => 0,
+                Err(_) => NET_ERR_FOLD_STOPPED,
+            }
         } else {
             match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms as u64), fut)
                 .await
             {
-                Ok(_) => 0,
+                Ok(Ok(())) => 0,
+                Ok(Err(_)) => NET_ERR_FOLD_STOPPED,
                 Err(_) => NET_ERR_TIMEOUT,
             }
         }
@@ -2336,13 +2340,16 @@ pub extern "C" fn net_memories_wait_for_seq(
     block_on(async move {
         let fut = adapter.wait_for_seq(seq);
         if timeout_ms == 0 {
-            fut.await;
-            0
+            match fut.await {
+                Ok(()) => 0,
+                Err(_) => NET_ERR_FOLD_STOPPED,
+            }
         } else {
             match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms as u64), fut)
                 .await
             {
-                Ok(_) => 0,
+                Ok(Ok(())) => 0,
+                Ok(Err(_)) => NET_ERR_FOLD_STOPPED,
                 Err(_) => NET_ERR_TIMEOUT,
             }
         }

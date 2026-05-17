@@ -174,6 +174,28 @@ impl Stream for EventStream {
             Poll::Ready(Ok(response)) => {
                 this.inflight = None;
                 if response.events.is_empty() {
+                    // Backoff only when the poll made no forward
+                    // progress. Pre-fix this branch fired on
+                    // `events.is_empty()` regardless of
+                    // `response.has_more` / `next_id`: a poll that
+                    // advanced the cursor past records this shard's
+                    // filter didn't match returned an empty batch
+                    // AND a fresh `next_id`, but the doubling fired
+                    // anyway and the wait grew exponentially even
+                    // though forward progress was happening. The
+                    // cursor's advance is the right "made progress"
+                    // signal; reset backoff when next_id changed.
+                    let progressed = response
+                        .next_id
+                        .as_ref()
+                        .map(|new| Some(new) != this.cursor.as_ref())
+                        .unwrap_or(false);
+                    if progressed {
+                        this.cursor = response.next_id;
+                        this.current_interval = this.opts.poll_interval;
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
                     // Backoff: double the interval, up to max.
                     // `current_interval * 2` panics on
                     // Duration overflow if a caller passed a

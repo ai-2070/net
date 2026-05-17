@@ -43,7 +43,7 @@ async fn test_full_memory_lifecycle() {
         .unwrap();
     memories.pin(1, 260).unwrap();
     let seq = memories.pin(2, 270).unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     let state = memories.state();
     let guard = state.read();
@@ -74,11 +74,11 @@ async fn test_pin_and_unpin_toggle() {
         .unwrap();
     memories.pin(1, 110).unwrap();
     let seq = memories.pin(1, 120).unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
     assert!(memories.state().read().get(1).unwrap().pinned);
 
     let seq = memories.unpin(1, 130).unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
     assert!(!memories.state().read().get(1).unwrap().pinned);
 }
 
@@ -91,7 +91,7 @@ async fn test_delete_removes_memory() {
         .store(1, "temp", Vec::<String>::new(), "alice", 100)
         .unwrap();
     let seq = memories.delete(1).unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     let state = memories.state();
     let guard = state.read();
@@ -104,7 +104,7 @@ async fn test_retag_on_unknown_id_is_noop() {
     let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let seq = memories.retag(999, vec!["ghost".into()], 100).unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     let state = memories.state();
     let guard = state.read();
@@ -152,7 +152,7 @@ async fn test_tag_queries_through_live_adapter() {
             400,
         )
         .unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     let state = memories.state();
     let guard = state.read();
@@ -249,13 +249,13 @@ async fn test_replay_after_close_reconstructs_state() {
         let seq = memories
             .retag(2, vec!["y".into(), "z".into()], 210)
             .unwrap();
-        memories.wait_for_seq(seq).await;
+        memories.wait_for_seq(seq).await.unwrap();
         memories.close().unwrap();
     }
 
     // Fresh adapter, same file — state replays from log.
     let memories2 = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
-    memories2.wait_for_seq(3).await;
+    memories2.wait_for_seq(3).await.unwrap();
 
     let state = memories2.state();
     let guard = state.read();
@@ -283,7 +283,7 @@ async fn test_watch_initial_emission() {
         .store(2, "other content", vec!["later".into()], "alice", 200)
         .unwrap();
     let seq = memories.pin(1, 210).unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     let mut stream = Box::pin(
         memories
@@ -364,7 +364,7 @@ async fn test_watch_dedupes_unchanged_results() {
         .store(2, "home note", vec!["home".into()], "alice", 200)
         .unwrap();
     let seq = memories.pin(2, 210).unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     let mut stream = Box::pin(memories.watch().where_tag("work").stream());
     let initial = stream.next().await.unwrap();
@@ -481,7 +481,7 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
     let seq = memories
         .store(3, "gamma", vec!["z".into()], "alice", 300)
         .unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     let (state_bytes, last_seq) = memories.snapshot().unwrap();
     memories.close().unwrap();
@@ -494,7 +494,7 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
     let new_seq = memories2
         .store(4, "delta", vec!["w".into()], "alice", 400)
         .unwrap();
-    memories2.wait_for_seq(new_seq).await;
+    memories2.wait_for_seq(new_seq).await.unwrap();
 
     let file = redex2
         .open_file(
@@ -522,7 +522,7 @@ async fn test_open_returns_with_state_already_caught_up() {
         a.store(1, "first", vec!["a".into()], "src", 100).unwrap();
         a.store(2, "second", vec!["b".into()], "src", 200).unwrap();
         let seq = a.store(3, "third", vec!["c".into()], "src", 300).unwrap();
-        a.wait_for_seq(seq).await;
+        a.wait_for_seq(seq).await.unwrap();
         a.close().unwrap();
     }
 
@@ -572,7 +572,7 @@ async fn test_open_from_snapshot_with_empty_replay_tail_keeps_snapshot_app_seq()
     let seq = memories
         .store(3, "c", vec!["z".into()], "src", 300)
         .unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     let (state_bytes, last_seq) = memories.snapshot().unwrap();
     memories.close().unwrap();
@@ -585,7 +585,7 @@ async fn test_open_from_snapshot_with_empty_replay_tail_keeps_snapshot_app_seq()
     let new_seq = restored
         .store(4, "d", vec!["w".into()], "src", 400)
         .unwrap();
-    restored.wait_for_seq(new_seq).await;
+    restored.wait_for_seq(new_seq).await.unwrap();
 
     let file = redex2
         .open_file(
@@ -620,13 +620,13 @@ async fn test_regression_open_advances_app_seq_past_existing_same_origin_events(
         a.store(1, "first", vec!["a".into()], "src", 100).unwrap();
         a.store(2, "second", vec!["b".into()], "src", 200).unwrap();
         let seq = a.store(3, "third", vec!["c".into()], "src", 300).unwrap();
-        a.wait_for_seq(seq).await;
+        a.wait_for_seq(seq).await.unwrap();
         a.close().unwrap();
     }
 
     let b = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
     let new_seq = b.store(4, "fourth", vec!["d".into()], "src", 400).unwrap();
-    b.wait_for_seq(new_seq).await;
+    b.wait_for_seq(new_seq).await.unwrap();
 
     let file = redex
         .open_file(
@@ -659,13 +659,13 @@ async fn test_regression_open_ignores_other_origins_when_advancing_app_seq() {
         b.store(10, "b1", vec!["x".into()], "src", 100).unwrap();
         b.store(11, "b2", vec!["y".into()], "src", 200).unwrap();
         let seq = b.store(12, "b3", vec!["z".into()], "src", 300).unwrap();
-        b.wait_for_seq(seq).await;
+        b.wait_for_seq(seq).await.unwrap();
         b.close().unwrap();
     }
 
     let a = MemoriesAdapter::open(&redex, ORIGIN_A).await.unwrap();
     let new_seq = a.store(20, "a1", vec!["q".into()], "src", 400).unwrap();
-    a.wait_for_seq(new_seq).await;
+    a.wait_for_seq(new_seq).await.unwrap();
 
     let file = redex
         .open_file(
@@ -704,7 +704,7 @@ async fn test_regression_checksum_is_computed_not_zero() {
             12345,
         )
         .unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     let file = redex
         .open_file(
@@ -754,7 +754,7 @@ async fn test_regression_watch_without_order_by_is_stable() {
             )
             .unwrap();
     }
-    memories.wait_for_seq(last).await;
+    memories.wait_for_seq(last).await.unwrap();
 
     // Open watch *without* order_by. The fix makes this default to
     // IdAsc under the hood.
@@ -781,7 +781,7 @@ async fn test_snapshot_and_restore_round_trip() {
     let seq = memories
         .retag(2, vec!["y".into(), "z".into()], 210)
         .unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     let (bytes, last_seq) = memories.snapshot().unwrap();
     assert_eq!(last_seq, Some(3));
@@ -838,8 +838,8 @@ async fn test_memories_and_tasks_coexist_on_same_redex() {
     let task_seq = tasks.complete(1, 210).unwrap();
     let mem_seq = memories.pin(1, 220).unwrap();
 
-    memories.wait_for_seq(mem_seq).await;
-    tasks.wait_for_seq(task_seq).await;
+    memories.wait_for_seq(mem_seq).await.unwrap();
+    tasks.wait_for_seq(task_seq).await.unwrap();
 
     // Memories state has 2 memories, one pinned.
     let mstate = memories.state();
@@ -866,7 +866,7 @@ async fn test_snapshot_and_watch_delivers_post_call_updates() {
     let seq = memories
         .store(1, "seed", vec!["t".into()], "alice", 100)
         .unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     let watcher = memories.watch();
     let (initial, mut stream) = memories.snapshot_and_watch(watcher);
@@ -876,7 +876,7 @@ async fn test_snapshot_and_watch_delivers_post_call_updates() {
     let seq = memories
         .store(2, "post", vec!["t".into()], "alice", 200)
         .unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     let observed = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
         .await
@@ -913,14 +913,14 @@ async fn test_regression_snapshot_and_watch_forwards_divergent_stream_initial() 
         let seq = memories
             .store(1, "seed", vec!["t".into()], "alice", 100)
             .unwrap();
-        memories.wait_for_seq(seq).await;
+        memories.wait_for_seq(seq).await.unwrap();
 
         let memories_m = memories.clone();
         let mutator = tokio::spawn(async move {
             let seq = memories_m
                 .store(2, "race", vec!["t".into()], "alice", 200)
                 .unwrap();
-            memories_m.wait_for_seq(seq).await;
+            memories_m.wait_for_seq(seq).await.unwrap();
         });
 
         let watcher = memories.watch();
@@ -979,7 +979,7 @@ async fn re_store_preserves_pinned_flag_and_created_ns() {
         .store(1, "first content", vec!["initial".into()], "alice", 100)
         .unwrap();
     let seq = memories.pin(1, 110).unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     {
         let state = memories.state();
@@ -994,7 +994,7 @@ async fn re_store_preserves_pinned_flag_and_created_ns() {
     let seq = memories
         .store(1, "updated content", vec!["updated".into()], "bob", 200)
         .unwrap();
-    memories.wait_for_seq(seq).await;
+    memories.wait_for_seq(seq).await.unwrap();
 
     let state = memories.state();
     let guard = state.read();

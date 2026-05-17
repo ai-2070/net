@@ -102,11 +102,28 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
         .out
         .unwrap_or_else(|| default_identity_path(operator_id));
 
-    if !args.force && path.exists() {
-        return Err(invalid_args(format!(
-            "identity file already exists at {}; pass --force to overwrite",
-            path.display()
-        )));
+    // `try_exists` distinguishes "file is absent" (Ok(false)) from
+    // "I can't tell because of a permission error" (Err). Pre-fix
+    // `.exists()` followed symlinks and returned false on
+    // permission errors, so a symlink at `path` pointing to a
+    // sensitive file (or a permission-denied stat) silently
+    // skipped the safety gate and we overwrote the target.
+    if !args.force {
+        match tokio::fs::try_exists(&path).await {
+            Ok(true) => {
+                return Err(invalid_args(format!(
+                    "identity file already exists at {}; pass --force to overwrite",
+                    path.display()
+                )));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(generic(format!(
+                    "failed to stat {}: {e}; pass --force to override",
+                    path.display()
+                )));
+            }
+        }
     }
 
     // Ensure the parent directory exists. We deliberately don't
@@ -131,12 +148,19 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
     let toml_text = toml::to_string_pretty(&file)
         .map_err(|e| generic(format!("failed to serialize identity TOML: {e}")))?;
 
-    tokio::fs::write(&path, &toml_text).await.map_err(|e| {
-        generic(format!(
-            "failed to write identity file {}: {e}",
-            path.display()
-        ))
-    })?;
+    // Atomic, mode-restricted publish. Pre-fix `tokio::fs::write`
+    // created the file with the process umask (commonly 0o644 —
+    // world-readable on most distros) and `enforce_strict_permissions`
+    // only chmod'd it down to 0o600 *after* the bytes had already
+    // landed on disk. A reader / backup agent / inotify-watcher in
+    // that window could grab the seed. Open the temp file with
+    // mode=0o600 in one syscall (Unix), write the seed into the
+    // already-restricted handle, and atomic-rename onto the final
+    // path so the visible file is either an intact prior identity
+    // or the new one - never a half-written world-readable seed.
+    let pid = std::process::id();
+    let tmp = path.with_extension(format!("tmp.{pid}"));
+    write_identity_atomically(&tmp, &path, toml_text.as_bytes()).await?;
     enforce_strict_permissions(&path).await?;
 
     // Print the public summary on stdout — never the seed, even
@@ -253,6 +277,57 @@ async fn read_identity_file(
     Ok(parsed)
 }
 
+/// Write `bytes` to `tmp` with the tightest creation mode the
+/// platform supports, then atomic-rename onto `final_path`. On Unix
+/// the temp file is created with `O_CREAT | O_EXCL` and mode 0o600
+/// in a single syscall so the seed is never reachable to a
+/// concurrent reader at the default umask. On Windows the temp
+/// file is created with default ACLs — managed out-of-band per the
+/// module header — and `enforce_strict_permissions` is a no-op.
+async fn write_identity_atomically(
+    tmp: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+) -> Result<(), CliError> {
+    let tmp_owned = tmp.to_path_buf();
+    let bytes_owned = bytes.to_vec();
+
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp_owned)?;
+        std::io::Write::write_all(&mut f, &bytes_owned)?;
+        f.sync_all()?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| generic(format!("seed-write task panicked: {e}")))?
+    .map_err(|e| {
+        generic(format!(
+            "failed to write identity tmp {}: {e}",
+            tmp.display()
+        ))
+    })?;
+
+    tokio::fs::rename(tmp, final_path).await.map_err(|e| {
+        let tmp_for_cleanup = tmp.to_path_buf();
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_file(tmp_for_cleanup).await;
+        });
+        generic(format!(
+            "rename identity tmp {} -> {}: {e}",
+            tmp.display(),
+            final_path.display()
+        ))
+    })?;
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn enforce_strict_permissions(path: &Path) -> Result<(), CliError> {
     use std::os::unix::fs::PermissionsExt;
@@ -297,11 +372,27 @@ async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
 }
 
 #[cfg(not(unix))]
-async fn check_strict_permissions(_path: &Path) -> Result<(), CliError> {
-    // Mirror of `enforce_strict_permissions` on Windows: NTFS
-    // ACLs don't have a clean 0o600 analog accessible from
-    // `std::fs`, so the permission gate is a no-op on Windows
-    // and operators manage ACLs out-of-band.
+async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
+    // NTFS ACLs don't have a clean 0o600 analog reachable from
+    // `std::fs`, so structurally the permission gate is a no-op
+    // on Windows — but pre-fix that no-op was silent and every
+    // doc on top of `read_identity_file` advertised a contract
+    // that wasn't enforced. Operators reading the help text or
+    // module header believed their identity files were guarded
+    // the same way `ssh` guards `~/.ssh/id_*`; on Windows they
+    // weren't, with no surfaced warning.
+    //
+    // Surface a stderr warning so a permissive ACL is at least
+    // observable in operator logs. Pass `--insecure-permissions`
+    // to suppress (matches the Unix gate's escape hatch). The
+    // proper fix is a `GetFileSecurityW` DACL check; tracked as
+    // a follow-up because it pulls in the `windows`-rs crate.
+    eprintln!(
+        "warning: identity-file permission gate is a no-op on Windows; \
+         NTFS ACLs on {} are not validated. Pass --insecure-permissions \
+         to silence, or manage the DACL out-of-band.",
+        path.display()
+    );
     Ok(())
 }
 

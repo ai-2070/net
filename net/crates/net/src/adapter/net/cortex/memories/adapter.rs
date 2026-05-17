@@ -141,7 +141,13 @@ impl MemoriesAdapter {
         let file = redex.open_file(&name, redex_config)?;
         let next_seq = file.next_seq();
         if next_seq > 0 {
-            inner.wait_for_seq(next_seq - 1).await;
+            inner
+                .wait_for_seq(next_seq - 1)
+                .await
+                .map_err(|folded_through| CortexAdapterError::FoldStoppedBeforeSeq {
+                    wanted: next_seq - 1,
+                    folded_through,
+                })?;
         }
 
         Ok(Self {
@@ -227,8 +233,11 @@ impl MemoriesAdapter {
     }
 
     /// Block until every event up through `seq` has been folded.
-    pub async fn wait_for_seq(&self, seq: u64) {
-        self.inner.wait_for_seq(seq).await;
+    /// Returns `Err(folded)` if the fold task stopped before
+    /// reaching `seq`; see [`CortexAdapter::wait_for_seq`] for the
+    /// stop-vs-success rationale.
+    pub async fn wait_for_seq(&self, seq: u64) -> Result<(), Option<u64>> {
+        self.inner.wait_for_seq(seq).await
     }
 
     /// Block until the fold task has processed every event up
@@ -402,7 +411,13 @@ impl MemoriesAdapter {
         let file = redex.open_file(&name, redex_config)?;
         let next_seq = file.next_seq();
         if next_seq > 0 {
-            inner.wait_for_seq(next_seq - 1).await;
+            inner
+                .wait_for_seq(next_seq - 1)
+                .await
+                .map_err(|folded_through| CortexAdapterError::FoldStoppedBeforeSeq {
+                    wanted: next_seq - 1,
+                    folded_through,
+                })?;
         }
 
         Ok(Self {

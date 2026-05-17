@@ -1156,13 +1156,21 @@ impl PyTasksAdapter {
     }
 
     /// Block until every event up through `seq` has been folded.
-    /// Releases the GIL for the duration of the wait.
-    fn wait_for_seq(&self, py: Python<'_>, seq: u64) {
+    /// Releases the GIL for the duration of the wait. Raises
+    /// `CortexError` if the fold task stopped before reaching `seq`
+    /// (close, Stop-policy halt, retention-evicted tail lag).
+    fn wait_for_seq(&self, py: Python<'_>, seq: u64) -> PyResult<()> {
         let inner = self.inner.clone();
         let runtime = self.runtime.clone();
         py.detach(|| {
-            runtime.block_on(async move { inner.wait_for_seq(seq).await });
-        });
+            runtime
+                .block_on(async move { inner.wait_for_seq(seq).await })
+                .map_err(|folded| {
+                    CortexError::new_err(format!(
+                        "wait_for_seq: fold task stopped; folded_through={folded:?}"
+                    ))
+                })
+        })
     }
 
     /// Read-your-writes wait. Blocks until this adapter's fold has
@@ -1671,12 +1679,18 @@ impl PyMemoriesAdapter {
             .map_err(|e| CortexError::new_err(format!("delete failed: {}", e)))
     }
 
-    fn wait_for_seq(&self, py: Python<'_>, seq: u64) {
+    fn wait_for_seq(&self, py: Python<'_>, seq: u64) -> PyResult<()> {
         let inner = self.inner.clone();
         let runtime = self.runtime.clone();
         py.detach(|| {
-            runtime.block_on(async move { inner.wait_for_seq(seq).await });
-        });
+            runtime
+                .block_on(async move { inner.wait_for_seq(seq).await })
+                .map_err(|folded| {
+                    CortexError::new_err(format!(
+                        "wait_for_seq: fold task stopped; folded_through={folded:?}"
+                    ))
+                })
+        })
     }
 
     /// Read-your-writes wait. Mirrors `TasksAdapter.wait_for_token`

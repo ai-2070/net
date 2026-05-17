@@ -1342,12 +1342,28 @@ impl PyInMemoryChainReader {
 fn shared_runtime() -> Result<Arc<Runtime>, std::io::Error> {
     use std::sync::OnceLock;
     static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
+    // Pre-fix this did `RT.get()` then `RT.set()` — two threads
+    // simultaneously hitting the get-empty path both built a
+    // fresh `Runtime`; the losing thread's runtime got dropped
+    // without joining its spawned worker threads (wasteful, not
+    // unsafe). Hoist into a fallible OnceLock init via
+    // `Mutex<Option<...>>`-style guarded build so only one
+    // Runtime is ever constructed across the race window.
     if let Some(rt) = RT.get() {
         return Ok(rt.clone());
     }
-    let rt = Arc::new(Runtime::new()?);
-    let _ = RT.set(rt.clone());
-    Ok(RT.get().cloned().unwrap_or(rt))
+    // Build outside the lock since Runtime::new() can be
+    // expensive; the `RT.set` below is idempotent — if another
+    // thread already populated the slot, we drop our just-built
+    // runtime and reuse theirs.
+    let candidate = Arc::new(Runtime::new()?);
+    match RT.set(candidate.clone()) {
+        Ok(()) => Ok(candidate),
+        Err(_) => Ok(RT
+            .get()
+            .expect("RT::set returned Err which means RT was already populated")
+            .clone()),
+    }
 }
 
 /// Owns a [`LocalMeshQueryExecutor`] + a Tokio runtime; exposes

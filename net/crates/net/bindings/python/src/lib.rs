@@ -1232,9 +1232,19 @@ mod mesh_bindings {
             node.set_channel_configs(channel_configs.clone());
             // Install a fresh TokenCache — channel auth needs
             // somewhere to stash tokens presented on subscribe.
-            // Callers wanting to share a cache across meshes can
-            // build one externally; today each `NetMesh` gets its
-            // own.
+            //
+            // **Known limitation.** Each `NetMesh` gets its own
+            // `TokenCache`. A caller's `Identity.install_token(...)`
+            // against the same seed binds to a different
+            // `Arc<TokenCache>` than the mesh's cache, so
+            // subscribe-with-token from a separately-built
+            // `Identity` silently fails verification until the
+            // token is explicitly re-installed via
+            // `NetMesh.subscribe_channel(..., token=bytes)`.
+            // Sharing across meshes is tracked separately — it
+            // needs a per-seed registry on the Python side so a
+            // second `NetMesh.__new__` with the same seed picks
+            // up the existing cache.
             node.set_token_cache(Arc::new(net::adapter::net::identity::TokenCache::new()));
 
             Ok(Self {

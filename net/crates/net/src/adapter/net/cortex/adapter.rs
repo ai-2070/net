@@ -279,14 +279,21 @@ impl<State> CortexAdapter<State> {
     /// through `seq` (applied successfully OR skipped via
     /// `recoverable_decode` under `Stop` policy), or until the
     /// fold task stops (e.g. close, non-recoverable fold error
-    /// under `Stop`). Returning after the task has stopped is
-    /// correct behavior — callers should re-check
-    /// [`Self::is_running`] if they need to distinguish.
+    /// under `Stop`).
+    ///
+    /// Returns `Ok(())` when the folded watermark reaches `seq`,
+    /// or `Err(folded)` where `folded` is the highest seq processed
+    /// before the fold task stopped (`None` if it stopped without
+    /// processing anything). Pre-fix this returned `()` for both
+    /// outcomes, so a caller waiting on a seq the fold task never
+    /// reached (close, Stop-policy halt, retention-evicted tail
+    /// lag) silently observed stale state. Mirrors
+    /// [`Self::wait_for_applied_seq`]'s shape.
     ///
     /// Use pattern:
     /// ```ignore
     /// let seq = adapter.ingest(envelope)?;
-    /// adapter.wait_for_seq(seq).await;
+    /// adapter.wait_for_seq(seq).await?;
     /// let state = adapter.state().read();
     /// // state reflects the ingest, UNLESS the event at `seq`
     /// // was skipped via recoverable_decode under `Stop`.
@@ -301,7 +308,7 @@ impl<State> CortexAdapter<State> {
     /// If you need to confirm `state` actually reflects the
     /// ingest at `seq`, follow up with
     /// `adapter.applied_through_seq() >= Some(seq)`.
-    pub async fn wait_for_seq(&self, seq: u64) {
+    pub async fn wait_for_seq(&self, seq: u64) -> Result<(), Option<u64>> {
         // Any seq strictly below `start_seq` is conceptually behind
         // us — those events were applied before we opened the
         // adapter (or are explicitly past the LiveOnly cutoff).
@@ -312,7 +319,7 @@ impl<State> CortexAdapter<State> {
         // freshly-created log: `seq < start_seq` is false, but the
         // sentinel check below correctly waits for the first event.
         if seq < self.inner.start_seq {
-            return;
+            return Ok(());
         }
         loop {
             let notified = self.inner.notify.notified();
@@ -325,10 +332,10 @@ impl<State> CortexAdapter<State> {
             // after the sentinel check returns exactly when seq has
             // been applied.
             if watermark != u64::MAX && watermark >= seq {
-                return;
+                return Ok(());
             }
             if !self.inner.running.load(Ordering::Acquire) {
-                return;
+                return Err(self.folded_through_seq());
             }
             notified.await;
         }
@@ -753,22 +760,106 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
 
         let policy = adapter_config.on_fold_error;
         let inner_task = inner.clone();
-        let mut stream = Box::pin(file.tail(start_seq));
 
         tokio::spawn(async move {
-            loop {
+            // Registration and consumption share a task. Pre-fix
+            // `file.tail(start_seq)` ran on the caller's task and the
+            // `tokio::spawn` then queued; concurrent appends in that
+            // window could saturate the bounded tail channel before
+            // this task polled even once, evicting the watcher with
+            // `Lagged` and killing the fold loop on its first item.
+            // Doing both inside the spawn pins them adjacent in
+            // scheduler order.
+            let mut stream = Box::pin(inner_task.file.tail(start_seq));
+            'outer: loop {
                 tokio::select! {
                     biased;
                     _ = inner_task.shutdown.notified() => {
-                        break;
+                        break 'outer;
                     }
                     next = stream.next() => {
                         match next {
-                            None => break,
+                            None => break 'outer,
+                            Some(Err(RedexError::Lagged)) => {
+                                // Subscriber fell behind the bounded
+                                // tail buffer. Pre-fix this broke the
+                                // fold loop permanently and a watcher
+                                // sitting on `wait_for_seq` would
+                                // silently observe stale state past
+                                // the lag point.
+                                //
+                                // Recover by catching up the gap via
+                                // direct reads from the in-memory
+                                // index, then resubscribing live.
+                                // A naive `file.tail(folded+1)`
+                                // resubscribe would deadlock when the
+                                // gap exceeds `tail_buffer_size`:
+                                // backfill pre-flight would signal
+                                // `Lagged` again and we'd loop on the
+                                // same signal indefinitely.
+                                let resume_head = 'catchup: loop {
+                                    let folded = inner_task
+                                        .folded_through_seq
+                                        .load(Ordering::Acquire);
+                                    let resume = if folded == u64::MAX {
+                                        start_seq
+                                    } else {
+                                        folded.saturating_add(1)
+                                    };
+                                    let head = inner_task.file.next_seq();
+                                    if resume >= head {
+                                        break 'catchup Some(head);
+                                    }
+                                    let events = inner_task
+                                        .file
+                                        .read_range(resume, head);
+                                    if events.is_empty() {
+                                        // Retention has evicted the
+                                        // gap. The fold cannot recover
+                                        // what is no longer durable;
+                                        // halt rather than silently
+                                        // skip ahead.
+                                        tracing::error!(
+                                            gap_start = resume,
+                                            gap_end = head,
+                                            "cortex fold task cannot recover \
+                                             from tail lag: events evicted by \
+                                             retention"
+                                        );
+                                        break 'catchup None;
+                                    }
+                                    let mut halted = false;
+                                    for event in events {
+                                        if handle_event(
+                                            &inner_task,
+                                            &mut fold,
+                                            &event,
+                                            policy,
+                                        ) {
+                                            halted = true;
+                                            break;
+                                        }
+                                    }
+                                    if halted {
+                                        break 'catchup None;
+                                    }
+                                };
+                                match resume_head {
+                                    Some(head) => {
+                                        stream = Box::pin(
+                                            inner_task.file.tail(head),
+                                        );
+                                        tracing::warn!(
+                                            "cortex fold task recovered \
+                                             from tail lag"
+                                        );
+                                    }
+                                    None => break 'outer,
+                                }
+                            }
                             Some(Err(_)) => {
-                                // Tail yielded an error (e.g. file
-                                // closed). Stop cleanly.
-                                break;
+                                // Closed / Io / other terminal error.
+                                break 'outer;
                             }
                             Some(Ok(event)) => {
                                 if handle_event(
@@ -777,7 +868,7 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
                                     &event,
                                     policy,
                                 ) {
-                                    break;
+                                    break 'outer;
                                 }
                             }
                         }
@@ -940,6 +1031,25 @@ where
     F: RedexFold<State>,
 {
     let seq = event.entry.seq;
+    // Guard the `u64::MAX` sentinel. `applied_through_seq` /
+    // `folded_through_seq` use `u64::MAX` to encode "nothing
+    // folded yet"; a real applied seq of `u64::MAX` (only
+    // reachable after the file's `next_seq` wraps a full 2^64
+    // append range, but `wrapping_add(1)` in the strict-prefix
+    // advance below can hit `u64::MAX` from `prev == u64::MAX -
+    // 1`) would silently fold into the sentinel and `snapshot`
+    // would persist `None`, making restore re-replay the entire
+    // chain. `watermark.rs::Watermark` guards the analogous
+    // `seq_or_ts` case the same way; the redex-seq path needs
+    // the same gate. Halt rather than overflow the sentinel.
+    if seq == u64::MAX {
+        tracing::error!(
+            "cortex fold halting: redex seq reached u64::MAX (sentinel \
+             collision); this means the file has assigned every possible \
+             seq value, an effectively impossible-without-bug condition"
+        );
+        return true;
+    }
     // Hold the write lock across both the fold and the watermark
     // update so that a `snapshot()` holding `state.read()` observes
     // a consistent `(state, folded_through_seq)` pair — otherwise
@@ -1121,7 +1231,7 @@ mod tests {
                 let meta = EventMeta::new(1, 0, 1, i, 0);
                 let env = EventEnvelope::new(meta, Bytes::from_static(b""));
                 let seq = pre.ingest(env).unwrap();
-                pre.wait_for_seq(seq).await;
+                pre.wait_for_seq(seq).await.unwrap();
             }
             let (b, ls) = pre.snapshot().unwrap();
             bytes = b;
@@ -1155,7 +1265,8 @@ mod tests {
                      short-circuit regressed",
                         seq
                     )
-                });
+                })
+                .expect("wait_for_seq must Ok-return when seq < start_seq");
         }
     }
 
@@ -1176,7 +1287,7 @@ mod tests {
             let meta = EventMeta::new(1, 0, 1, i, 0);
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             let seq = adapter.ingest(env).unwrap();
-            adapter.wait_for_seq(seq).await;
+            adapter.wait_for_seq(seq).await.unwrap();
         }
 
         assert_eq!(*adapter.state().read(), 10);
@@ -1434,9 +1545,18 @@ mod tests {
             adapter.ingest(env).unwrap();
         }
 
-        // Wait until fold task stops. wait_for_seq returns on stop
-        // even if the seq isn't reached.
-        adapter.wait_for_seq(10).await;
+        // Wait until fold task stops. wait_for_seq surfaces the
+        // halt as Err(Some(folded_through)) — pre-fix it returned
+        // silently and the caller had no way to distinguish a
+        // halt from a successful fold-through.
+        let folded = adapter
+            .wait_for_seq(10)
+            .await
+            .expect_err("Stop policy must surface the halt to wait_for_seq");
+        // Seqs 0..=2 folded; seq 3 errored; the watermark caps at
+        // 2 under Stop+non-recoverable so `folded_through` reflects
+        // the successful prefix.
+        assert_eq!(folded, Some(2));
         assert!(!adapter.is_running());
         assert_eq!(adapter.fold_errors(), 1);
         // Seqs 0..=2 folded; seq 3 errored; seqs 4..=9 never folded.
@@ -1480,8 +1600,12 @@ mod tests {
             adapter.ingest(env).unwrap();
         }
 
-        // Wait for halt.
-        adapter.wait_for_seq(10).await;
+        // Wait for halt. wait_for_seq now surfaces the halt as
+        // `Err(Some(folded))` rather than silently returning.
+        let _ = adapter
+            .wait_for_seq(10)
+            .await
+            .expect_err("Stop policy halt");
         assert!(!adapter.is_running(), "Stop policy must halt the task");
         assert_eq!(adapter.fold_errors(), 1);
 
@@ -1541,7 +1665,7 @@ mod tests {
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             adapter.ingest(env).unwrap();
         }
-        adapter.wait_for_seq(5).await;
+        adapter.wait_for_seq(5).await.unwrap();
 
         // Live consumer didn't deadlock — folded reached the tail.
         assert_eq!(
@@ -1602,7 +1726,7 @@ mod tests {
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             adapter.ingest(env).unwrap();
         }
-        adapter.wait_for_seq(2).await;
+        adapter.wait_for_seq(2).await.unwrap();
 
         assert_eq!(adapter.folded_through_seq(), Some(2));
         assert_eq!(
@@ -1644,7 +1768,7 @@ mod tests {
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             adapter.ingest(env).unwrap();
         }
-        adapter.wait_for_seq(7).await;
+        adapter.wait_for_seq(7).await.unwrap();
 
         let folded = adapter.folded_through_seq();
         let applied = adapter.applied_through_seq();
@@ -1693,7 +1817,7 @@ mod tests {
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             adapter.ingest(env).unwrap();
         }
-        adapter.wait_for_seq(4).await;
+        adapter.wait_for_seq(4).await.unwrap();
 
         assert_eq!(adapter.folded_through_seq(), Some(4));
         assert_eq!(
@@ -1749,7 +1873,7 @@ mod tests {
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             adapter.ingest(env).unwrap();
         }
-        adapter.wait_for_seq(4).await;
+        adapter.wait_for_seq(4).await.unwrap();
 
         // Pre-snapshot state: STRICT-PREFIX applied caps at 1
         // (seq 2 was skipped; the prefix breaks there). Folded
@@ -1787,7 +1911,7 @@ mod tests {
         )
         .unwrap();
 
-        restored.wait_for_seq(4).await;
+        restored.wait_for_seq(4).await.unwrap();
 
         // Pre-fix this assertion would FAIL: snapshot would have
         // returned Some(4) (folded), restore would tail from
@@ -1857,7 +1981,8 @@ mod tests {
         // regresses with an indefinite hang.)
         tokio::time::timeout(std::time::Duration::from_secs(2), adapter.wait_for_seq(seq))
             .await
-            .expect("wait_for_seq must return promptly even for a recoverable-decode-skipped seq");
+            .expect("wait_for_seq must return promptly even for a recoverable-decode-skipped seq")
+            .expect("recoverable-decode skip still advances the folded watermark");
 
         // Confirm what was actually observable at return:
         // folded reached seq, applied did not.
@@ -1962,7 +2087,7 @@ mod tests {
             let meta = EventMeta::new(0, 0, 0, i, 0);
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             let seq = adapter.ingest(env).unwrap();
-            adapter.wait_for_seq(seq).await;
+            adapter.wait_for_seq(seq).await.unwrap();
         }
 
         // Fold task is still running — the decode error didn't
@@ -2052,7 +2177,7 @@ mod tests {
             let meta = EventMeta::new(0, 0, 0, i, 0);
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             let seq = adapter.ingest(env).unwrap();
-            adapter.wait_for_seq(seq).await;
+            adapter.wait_for_seq(seq).await.unwrap();
         }
 
         // First poll should see a Lagged event (the broadcast channel
@@ -2083,6 +2208,63 @@ mod tests {
         );
     }
 
+    /// Pin: when the tail stream surfaces `RedexError::Lagged` the
+    /// fold task catches the gap up via direct in-memory reads and
+    /// resubscribes live, rather than silently exiting. Pre-fix
+    /// the match arm broke out of the fold loop the first time the
+    /// subscriber fell behind `tail_buffer_size`; state then never
+    /// advanced past the lag point and `wait_for_seq` returned
+    /// immediately on the `running == false` branch with no
+    /// indication anything went wrong.
+    ///
+    /// Triggers `Lagged` deterministically via the backfill
+    /// pre-flight: 50 events in the index with `tail_buffer_size =
+    /// 4` exceeds the buffer, so `RedexFile::tail` signals
+    /// `Lagged` as the very first stream item.
+    #[tokio::test]
+    async fn fold_task_recovers_from_tail_lagged() {
+        let redex = Redex::new();
+        let cfg = RedexFileConfig::default().with_tail_buffer_size(4);
+
+        // Stage the gap in the file's in-memory index without
+        // going through an adapter (no watchers → no lag pressure
+        // during stage). `CountFold` ignores payload, so empty
+        // bytes are fine.
+        let file = redex
+            .open_file(&cn("cortex/tail-lag-recovery"), cfg)
+            .unwrap();
+        for _ in 0..50u64 {
+            file.append(b"").unwrap();
+        }
+
+        // Open a FromBeginning adapter on the same file. The
+        // tail()'s backfill pre-flight sees 50 retained events vs.
+        // buffer=4 and signals Lagged first thing. Post-fix the
+        // recovery loop reads the gap from the index and tails
+        // live; pre-fix the fold task exits and state stays at 0.
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/tail-lag-recovery"),
+            RedexFileConfig::default(), // ignored on reopen
+            CortexAdapterConfig::default(),
+            CountFold,
+            0u64,
+        )
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), adapter.wait_for_seq(49))
+            .await
+            .expect("wait_for_seq(49) timed out — tail-Lagged recovery regressed")
+            .expect("fold task must remain alive through Lagged recovery");
+
+        assert_eq!(*adapter.state().read(), 50);
+        assert!(
+            adapter.is_running(),
+            "fold task must stay alive after recovering from tail lag",
+        );
+        assert_eq!(adapter.fold_errors(), 0);
+    }
+
     /// `changes()` continues to silently drop lag (the documented
     /// best-effort behavior) — pins the contract so a future
     /// refactor doesn't accidentally surface `Lagged` through the
@@ -2109,7 +2291,7 @@ mod tests {
             let meta = EventMeta::new(0, 0, 0, i, 0);
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             let seq = adapter.ingest(env).unwrap();
-            adapter.wait_for_seq(seq).await;
+            adapter.wait_for_seq(seq).await.unwrap();
         }
 
         // Drain everything we can from the stream. Item type is `u64`
@@ -2146,7 +2328,7 @@ mod tests {
             let meta = EventMeta::new(0, 0, 0, i, 0);
             let env = EventEnvelope::new(meta, Bytes::from_static(b""));
             let seq = adapter.ingest(env).unwrap();
-            adapter.wait_for_seq(seq).await;
+            adapter.wait_for_seq(seq).await.unwrap();
         }
 
         assert!(adapter.is_running());

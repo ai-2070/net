@@ -1302,11 +1302,20 @@ impl TasksAdapter {
     }
 
     /// Block until every event up through `seq` has been folded into
-    /// state. Use as a read-after-write barrier.
+    /// state. Use as a read-after-write barrier. Throws if the fold
+    /// task stopped before reaching `seq` (close, Stop-policy halt,
+    /// retention-evicted tail lag).
     #[napi]
     pub async fn wait_for_seq(&self, seq: BigInt) -> Result<()> {
-        self.inner.wait_for_seq(bigint_u64(seq)?).await;
-        Ok(())
+        self.inner
+            .wait_for_seq(bigint_u64(seq)?)
+            .await
+            .map_err(|folded| {
+                cortex_err(
+                    "wait_for_seq",
+                    format!("fold task stopped; folded_through={folded:?}"),
+                )
+            })
     }
 
     /// Read-your-writes wait. Blocks until this adapter's fold has
@@ -1817,10 +1826,18 @@ impl MemoriesAdapter {
     }
 
     /// Block until every event up through `seq` has been folded.
+    /// Throws if the fold task stopped before reaching `seq`.
     #[napi]
     pub async fn wait_for_seq(&self, seq: BigInt) -> Result<()> {
-        self.inner.wait_for_seq(bigint_u64(seq)?).await;
-        Ok(())
+        self.inner
+            .wait_for_seq(bigint_u64(seq)?)
+            .await
+            .map_err(|folded| {
+                cortex_err(
+                    "wait_for_seq",
+                    format!("fold task stopped; folded_through={folded:?}"),
+                )
+            })
     }
 
     /// Read-your-writes wait. See `TasksAdapter.waitForToken` for

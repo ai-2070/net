@@ -21,4 +21,14 @@ pub enum NetDbError {
     /// Snapshot encode / decode failure.
     #[error("snapshot: {0}")]
     Snapshot(String),
+
+    /// `NetDbBuilder::build()` / `build_from_snapshot()` was
+    /// called with neither `with_tasks()` nor `with_memories()`
+    /// configured. Pre-fix this returned a no-op `NetDb` whose
+    /// `tasks()` / `memories()` accessors panicked on first call.
+    /// Surface it at build time as a typed error so a
+    /// misconfigured profile or test fixture turns into a clean
+    /// `?` rather than a process panic.
+    #[error("NetDb must include at least one model; call with_tasks() or with_memories()")]
+    NoModelsEnabled,
 }

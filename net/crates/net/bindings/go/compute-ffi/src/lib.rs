@@ -2155,8 +2155,14 @@ pub extern "C" fn net_compute_replica_group_spawn(
     if max_log_entries > 0 {
         host.max_log_entries = max_log_entries;
     }
+    let Ok(replica_count_u8) = u8::try_from(replica_count) else {
+        return group_err_out_reason(
+            err_out,
+            format!("invalid-config: replica count {replica_count} exceeds 255"),
+        );
+    };
     let cfg = SdkReplicaGroupConfig {
-        replica_count: replica_count as u8,
+        replica_count: replica_count_u8,
         group_seed: seed,
         lb_strategy: lb,
         host_config: host,
@@ -2360,8 +2366,14 @@ pub extern "C" fn net_compute_fork_group_spawn(
     if max_log_entries > 0 {
         host.max_log_entries = max_log_entries;
     }
+    let Ok(fork_count_u8) = u8::try_from(fork_count) else {
+        return group_err_out_reason(
+            err_out,
+            format!("invalid-config: fork count {fork_count} exceeds 255"),
+        );
+    };
     let cfg = SdkForkGroupConfig {
-        fork_count: fork_count as u8,
+        fork_count: fork_count_u8,
         lb_strategy: lb,
         host_config: host,
     };
@@ -2533,8 +2545,14 @@ pub extern "C" fn net_compute_standby_group_spawn(
     if max_log_entries > 0 {
         host.max_log_entries = max_log_entries;
     }
+    let Ok(member_count_u8) = u8::try_from(member_count) else {
+        return group_err_out_reason(
+            err_out,
+            format!("invalid-config: member count {member_count} exceeds 255"),
+        );
+    };
     let cfg = SdkStandbyGroupConfig {
-        member_count: member_count as u8,
+        member_count: member_count_u8,
         group_seed: seed,
         host_config: host,
     };

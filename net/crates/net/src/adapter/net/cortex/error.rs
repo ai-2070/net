@@ -24,6 +24,22 @@ pub enum CortexAdapterError {
         seq: u64,
     },
 
+    /// `wait_for_seq` was asked to wait past a seq the fold task
+    /// will never reach: the task halted (close, Stop-policy halt,
+    /// retention-evicted tail lag) with the folded watermark in
+    /// `folded_through`. Pre-fix this manifested as
+    /// `wait_for_seq` silently returning `()` and the caller
+    /// reading state that did not reflect the requested seq.
+    #[error("fold stopped before seq {wanted}; folded through {folded_through:?}")]
+    FoldStoppedBeforeSeq {
+        /// The seq the caller was waiting for.
+        wanted: u64,
+        /// The highest seq the fold task processed before
+        /// stopping; `None` if it stopped without processing
+        /// anything.
+        folded_through: Option<u64>,
+    },
+
     /// `open` was called with a `StartPosition` that requires
     /// externally-rehydrated state — `FromSeq(n)` for `n > 0` or
     /// `LiveOnly`. Callers using these positions must construct

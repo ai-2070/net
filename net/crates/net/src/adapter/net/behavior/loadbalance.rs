@@ -320,7 +320,21 @@ impl EndpointState {
     }
 
     fn record_completion(&self, success: bool) {
-        self.connections.fetch_sub(1, Ordering::AcqRel);
+        // Saturating sub. Pre-fix `fetch_sub(1)` was unconditional;
+        // a caller hitting `record_completion` without a matching
+        // `record_request` (a substrate bug or a misuse of the
+        // public `LoadBalancer::record_completion(node_id)` API)
+        // underflowed `connections` to `u32::MAX - k`. After that,
+        // `try_record_request` always failed (`c >= max_connections`)
+        // and `get_available_endpoints` filtered the endpoint out
+        // forever - a silent, permanent removal from rotation with
+        // no log, no metric, no recovery path. The test at the
+        // bottom of this module explicitly acknowledged the hazard.
+        let _ = self
+            .connections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                Some(c.saturating_sub(1))
+            });
 
         // If this completion is for the half-open probe, it decides the
         // circuit's fate. Clearing the flag with swap also guarantees only
@@ -1243,8 +1257,21 @@ impl LoadBalancer {
     fn add_to_hash_ring(&self, node_id: NodeId) {
         for i in 0..self.virtual_nodes {
             let key = format!("{:?}-{}", node_id, i);
-            let hash = self.hash_key(&key);
-            self.hash_ring.insert(hash, node_id);
+            let mut hash = self.hash_key(&key);
+            // Linear-probe past collisions. FNV-1a + ~150 vnodes
+            // per node × ~1k nodes is well below the u64
+            // birthday-bound, but a collision is unobservable
+            // pre-fix: `insert(hash, node_id)` last-write-wins
+            // silently lost an earlier vnode and skewed the ring
+            // distribution toward the late writer. Probe by 1
+            // until we find an empty slot so every vnode is
+            // distinct, then we're guaranteed even with
+            // adversarial node-id choice (the probe terminates
+            // because the ring has at most virtual_nodes * nodes
+            // entries, far below u64::MAX).
+            while self.hash_ring.insert(hash, node_id).is_some() {
+                hash = hash.wrapping_add(1);
+            }
         }
     }
 

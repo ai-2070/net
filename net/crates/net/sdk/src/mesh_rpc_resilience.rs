@@ -23,7 +23,8 @@
 //! don't.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
@@ -596,7 +597,18 @@ fn compute_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
         // same SystemTime nanosecond bucket on a low-res Windows
         // clock, (b) on different threads, and (c) from different
         // call sites within one thread all decorrelate.
-        let now_ns = std::time::Instant::now().elapsed().as_nanos() as u64;
+        //
+        // Pre-fix this read `Instant::now().elapsed().as_nanos()`
+        // — but `.elapsed()` on a freshly-constructed `Instant`
+        // measures only the gap between construction and the
+        // very next call (a few ns of single-digit jitter), so
+        // the `now_ns` term contributed essentially zero entropy
+        // and parallel retries from the same call site stayed
+        // correlated. Anchor on a process-epoch `Instant` so we
+        // measure elapsed from process start instead.
+        static PROCESS_EPOCH: OnceLock<Instant> = OnceLock::new();
+        let epoch = PROCESS_EPOCH.get_or_init(Instant::now);
+        let now_ns = epoch.elapsed().as_nanos() as u64;
         let thread_id_bits = {
             // ThreadId is opaque; hash its Debug print to extract
             // bits cheaply. Stable within the process lifetime.

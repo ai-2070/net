@@ -257,11 +257,20 @@ jobs:
 
       # Loom tests exhaustively explore thread interleavings; release
       # mode is mandatory (debug builds are too slow to converge in CI
-      # time budget). No feature flags needed — the models in
-      # `loom_models.rs` use loom's substitute atomics standalone,
-      # not the production types.
+      # time budget). The models in `loom_models.rs` use loom's
+      # substitute atomics standalone, not the production types, so
+      # the test only imports from `loom` itself.
+      #
+      # `--no-default-features` skips compiling the `net` feature's
+      # `adapter::net` module: tokio gates `tokio::net::*` out under
+      # `#![cfg(not(loom))]`, and `adapter::net::{proxy, router,
+      # transport}` use `tokio::net::UdpSocket` extensively. Trying
+      # to compile the lib's net stack under `--cfg loom` fails on
+      # the missing tokio::net module. The loom test itself doesn't
+      # touch the net stack, so this is purely a build-time gate
+      # for the lib that the test target implicitly depends on.
       - name: Run loom models
-        run: cargo test --release --test loom_models
+        run: cargo test --release --no-default-features --test loom_models
         env:
           RUSTFLAGS: --cfg loom
 
