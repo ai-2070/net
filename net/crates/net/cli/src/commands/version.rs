@@ -13,10 +13,10 @@ pub async fn run() -> Result<(), CliError> {
         // tracks `cli/Cargo.toml:version`.
         cli_version: env!("CARGO_PKG_VERSION"),
         // Embed the SDK version the binary is linked against.
-        // The SDK's `Cargo.toml:version` always tracks the
-        // workspace version, so this is also the substrate
-        // version.
-        sdk_version: "0.17.0",
+        // Sourced from `net_sdk::VERSION` (itself an `env!`-pinned
+        // const) so a workspace bump can't drift this value out of
+        // sync with the linked crate.
+        sdk_version: net_sdk::VERSION,
         // `OPTION_ENV!` returns `None` when the var isn't set;
         // CI populates `NET_BUILD_REVISION` from `git rev-parse
         // --short HEAD` in release builds.

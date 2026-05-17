@@ -34,6 +34,12 @@
 //! # }
 //! ```
 
+/// Crate version, sourced from `Cargo.toml` at build time. Re-
+/// exported so downstream binaries (the `net` CLI in particular)
+/// can report the embedded SDK version without hardcoding a
+/// literal that silently drifts on every workspace bump.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[cfg(feature = "compute")]
 pub mod compute;
 pub mod config;
