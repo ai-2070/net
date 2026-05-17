@@ -1031,6 +1031,25 @@ where
     F: RedexFold<State>,
 {
     let seq = event.entry.seq;
+    // Guard the `u64::MAX` sentinel. `applied_through_seq` /
+    // `folded_through_seq` use `u64::MAX` to encode "nothing
+    // folded yet"; a real applied seq of `u64::MAX` (only
+    // reachable after the file's `next_seq` wraps a full 2^64
+    // append range, but `wrapping_add(1)` in the strict-prefix
+    // advance below can hit `u64::MAX` from `prev == u64::MAX -
+    // 1`) would silently fold into the sentinel and `snapshot`
+    // would persist `None`, making restore re-replay the entire
+    // chain. `watermark.rs::Watermark` guards the analogous
+    // `seq_or_ts` case the same way; the redex-seq path needs
+    // the same gate. Halt rather than overflow the sentinel.
+    if seq == u64::MAX {
+        tracing::error!(
+            "cortex fold halting: redex seq reached u64::MAX (sentinel \
+             collision); this means the file has assigned every possible \
+             seq value, an effectively impossible-without-bug condition"
+        );
+        return true;
+    }
     // Hold the write lock across both the fold and the watermark
     // update so that a `snapshot()` holding `state.read()` observes
     // a consistent `(state, folded_through_seq)` pair — otherwise
