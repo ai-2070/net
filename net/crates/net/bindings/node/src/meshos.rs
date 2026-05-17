@@ -915,11 +915,10 @@ impl MeshOsDaemonHandle {
                 "daemon handle was already consumed by gracefulShutdown",
             )
         })?;
-        let result = match timeout {
-            Some(d) => match tokio::time::timeout(d, h.next_control()).await {
-                Ok(ev) => ev,
-                Err(_) => None,
-            },
+        let result: Option<CoreDaemonControl> = match timeout {
+            Some(d) => tokio::time::timeout(d, h.next_control())
+                .await
+                .unwrap_or_default(),
             None => h.next_control().await,
         };
         Ok(result.map(DaemonControlJs::from))

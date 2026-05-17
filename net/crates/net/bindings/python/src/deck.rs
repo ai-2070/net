@@ -40,9 +40,8 @@ use net::adapter::net::behavior::deck::{
     AdminCommands as CoreAdminCommands, AuditQuery as CoreAuditQuery,
     AuditStream as CoreAuditStream, ChainCommit as CoreChainCommit, DeckClient as CoreClient,
     DeckClientConfig as CoreConfig, DeckError, FailureStream as CoreFailureStream,
-    IceCommands as CoreIceCommands, IceProposal as CoreIceProposal, LogFilter as CoreLogFilter,
-    LogStream as CoreLogStream, OperatorIdentity as CoreIdentity,
-    SimulatedIceProposal as CoreSimulated, SnapshotStream as CoreSnapshotStream, StatusSummary,
+    IceProposal as CoreIceProposal, LogFilter as CoreLogFilter, LogStream as CoreLogStream,
+    OperatorIdentity as CoreIdentity, SnapshotStream as CoreSnapshotStream, StatusSummary,
     StatusSummaryStream as CoreStatusStream,
 };
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
@@ -133,12 +132,6 @@ fn config_from_dict(py: Python<'_>, d: Option<&Bound<'_, PyDict>>) -> PyResult<C
 #[derive(Clone)]
 pub struct PyOperatorIdentity {
     inner: CoreIdentity,
-}
-
-impl PyOperatorIdentity {
-    pub(crate) fn inner(&self) -> &CoreIdentity {
-        &self.inner
-    }
 }
 
 #[pymethods]
