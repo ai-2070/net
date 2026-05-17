@@ -35,10 +35,33 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
+      # The sdk-ts `prebuild` script runs `napi build` in
+      # `bindings/node` when `index.d.ts` is missing (which it always
+      # is in a fresh CI checkout — the file is gitignored). napi-rs
+      # spawns cargo to build the cdylib, so the Rust toolchain has
+      # to be on PATH.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-npm-sdk-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Install dependencies
         run: npm i
 
       - name: Type-check + compile
+        # `npm run build`'s `prebuild` hook runs `napi build` in the
+        # sibling `bindings/node` directory (release flags matching
+        # `bindings/node/package.json`'s `build` script) before tsc
+        # runs against the freshly-generated `index.d.ts`.
         run: npm run build
 
       - name: Verify dist/ was produced
