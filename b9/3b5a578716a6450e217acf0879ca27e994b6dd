@@ -1,0 +1,19 @@
+net/crates/net/cli/src/commands/daemon.rs
+  s_8c2b4b36ad9479::t_4a89e4274e9398 73-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "b93b5a578716a6450e217acf0879ca27e994b6dd",
+  "prompts": {},
+  "sessions": {
+    "s_8c2b4b36ad9479": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c178f51c-95e0-4224-ba26-c4901e8acca7",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
