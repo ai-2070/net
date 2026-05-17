@@ -303,12 +303,23 @@ class MeshOsDaemonHandleWrapper:
     Thin pass-through around the PyO3 ``MeshOsDaemonHandle`` with
     context-manager sugar. Drop the handle to unregister; use
     :meth:`graceful_shutdown` for an explicit drain.
+
+    Cross-thread serialization. The underlying PyO3 class uses a
+    ``RefCell``-style guard for ``&mut self`` methods; concurrent
+    callers from a thread-pool executor and the asyncio event
+    loop can race and trigger a ``"Already borrowed"`` panic. A
+    process-wide ``threading.Lock`` serializes every borrow so
+    ``async for ev in handle`` plays nicely with
+    ``await loop.run_in_executor(None, handle.graceful_shutdown)``.
     """
 
-    __slots__ = ("_raw",)
+    __slots__ = ("_raw", "_borrow_lock")
 
     def __init__(self, raw: _RawHandle) -> None:
+        import threading
+
         self._raw = raw
+        self._borrow_lock = threading.Lock()
 
     @property
     def daemon_id(self) -> int:
@@ -330,11 +341,85 @@ class MeshOsDaemonHandleWrapper:
 
         Returns the event dict, or ``None`` on timeout / runtime
         shutdown."""
-        return self._raw.next_control(timeout_ms=timeout_ms)  # type: ignore[return-value]
+        with self._borrow_lock:
+            return self._raw.next_control(timeout_ms=timeout_ms)  # type: ignore[return-value]
 
     def try_next_control(self) -> Optional[DaemonControl]:
         """Non-blocking variant of :meth:`next_control`."""
-        return self._raw.try_next_control()  # type: ignore[return-value]
+        with self._borrow_lock:
+            return self._raw.try_next_control()  # type: ignore[return-value]
+
+    async def anext_control(
+        self, timeout_ms: Optional[int] = None
+    ) -> Optional[DaemonControl]:
+        """Async variant of :meth:`next_control`. Polls the
+        non-blocking :meth:`try_next_control` on the event loop with
+        an ``asyncio.sleep`` between iterations so the loop is never
+        parked and the underlying pyclass borrow doesn't block
+        concurrent calls from other tasks (e.g.
+        :meth:`graceful_shutdown`).
+
+        Returns the event dict, or ``None`` on timeout / runtime
+        shutdown — same semantics as the sync variant.
+
+        Slice-3 helper that lets daemons hosted inside an asyncio
+        application drive ``MeshOsDaemonHandle`` from coroutines
+        without spawning their own thread.
+
+        Pair with :meth:`__aiter__` for ``async for`` consumption:
+
+        .. code-block:: python
+
+            async for ev in handle:
+                if ev["kind"] == "Shutdown":
+                    break
+        """
+        import asyncio
+
+        # Poll cadence chosen to keep the borrow held for ~1ms at a
+        # time. Each sleep yields the loop so other tasks can take
+        # the &mut self lock (graceful_shutdown, publish_log).
+        poll_ms = 10
+        ms = 100 if timeout_ms is None else timeout_ms
+        remaining_ms = ms
+        while True:
+            with self._borrow_lock:
+                ev = self._raw.try_next_control()
+            if ev is not None:
+                return ev
+            if remaining_ms <= 0:
+                return None
+            step = min(poll_ms, remaining_ms)
+            await asyncio.sleep(step / 1000.0)
+            remaining_ms -= step
+
+    def __aiter__(self) -> "MeshOsDaemonHandleWrapper":
+        """``async for ev in handle`` — yields each control event
+        as it arrives. Stops iterating when the handle is consumed
+        by :meth:`graceful_shutdown` or the substrate shuts down
+        (``try_next_control`` raises ``already_shutdown``)."""
+        return self
+
+    async def __anext__(self) -> DaemonControl:
+        """Poll until the next control event arrives or the handle
+        is shut down.
+
+        ``StopAsyncIteration`` fires when the handle has been
+        consumed by :meth:`graceful_shutdown` (a subsequent
+        :meth:`try_next_control` raises ``already_shutdown``)."""
+        import asyncio
+
+        try:
+            while True:
+                with self._borrow_lock:
+                    ev = self._raw.try_next_control()
+                if ev is not None:
+                    return ev
+                await asyncio.sleep(0.01)
+        except MeshOsSdkError as e:
+            if getattr(e, "kind", None) == "already_shutdown":
+                raise StopAsyncIteration from None
+            raise
 
     def publish_log(self, level: LogLevel, message: str) -> None:
         """Publish a log line tagged with this daemon's id.
@@ -358,7 +443,8 @@ class MeshOsDaemonHandleWrapper:
         channel, parks for ``grace_ms``, then unregisters. Consumes
         the handle — subsequent method calls raise
         ``MeshOsSdkError(kind="already_shutdown")``."""
-        self._raw.graceful_shutdown(grace_ms=grace_ms)
+        with self._borrow_lock:
+            self._raw.graceful_shutdown(grace_ms=grace_ms)
 
     def __enter__(self) -> "MeshOsDaemonHandleWrapper":
         return self

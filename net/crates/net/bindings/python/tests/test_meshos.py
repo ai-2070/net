@@ -493,3 +493,83 @@ def test_register_daemon_tolerates_missing_capability_methods() -> None:
         handle = sdk.register_daemon(_EchoDaemon(), Identity.generate())
         assert handle.daemon_id != 0
         handle.graceful_shutdown(grace_ms=10)
+
+
+# -------------------------------------------------------------------------
+# Slice 3 — async control wrappers (`anext_control`, `async for`).
+#
+# The wrapper lives at `sdk-py/src/net_sdk/meshos.py`; pure-Python
+# `run_in_executor`-based bridge over the sync FFI. Verifies the
+# wrapper imports + the basic async surface compiles + a Shutdown
+# event reaches `__anext__` correctly via `graceful_shutdown`.
+# -------------------------------------------------------------------------
+
+
+import asyncio
+
+
+def test_async_control_iterator_stops_cleanly_on_graceful_shutdown() -> None:
+    """`async for ev in handle` should exit cleanly once
+    `graceful_shutdown` runs. The iterator terminates with
+    `StopAsyncIteration` (which `async for` swallows) when the
+    handle's `try_next_control` raises `already_shutdown`.
+
+    Note: `graceful_shutdown` consumes the inner handle
+    synchronously after queuing the Shutdown event, so the
+    iterator may or may not observe the Shutdown event itself
+    depending on timing — the meaningful contract is "iterator
+    stops cleanly, no exception bubbles out"."""
+    try:
+        from net_sdk.meshos import MeshOsDaemonHandleWrapper, MeshOsDaemonSdk as _Sdk
+    except ImportError:
+        pytest.skip("net_sdk wrapper not installed (run `pip install -e ../../sdk-py`)")
+
+    async def _run() -> str:
+        with _Sdk.start() as sdk:
+            handle: MeshOsDaemonHandleWrapper = sdk.register_daemon(
+                _EchoDaemon(), Identity.generate()
+            )
+
+            seen_kinds: list[str] = []
+
+            async def consume() -> str:
+                async for ev in handle:
+                    seen_kinds.append(ev["kind"])
+                    # Defensive break — if shutdown delivers via the
+                    # channel before the handle is consumed, we exit
+                    # the loop here. Otherwise the iterator stops via
+                    # the `already_shutdown` path.
+                    if ev["kind"] == "Shutdown":
+                        return "shutdown-seen"
+                return "iterator-stopped"
+
+            consumer = asyncio.create_task(consume())
+            await asyncio.sleep(0.05)
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: handle.graceful_shutdown(grace_ms=50)
+            )
+            return await asyncio.wait_for(consumer, timeout=2.0)
+
+    result = asyncio.run(_run())
+    # Either path is acceptable — the consumer must exit cleanly.
+    assert result in {"shutdown-seen", "iterator-stopped"}
+
+
+def test_anext_control_returns_none_on_timeout() -> None:
+    """`anext_control(timeout_ms=...)` returns `None` on timeout —
+    mirrors the sync `next_control` contract."""
+    try:
+        from net_sdk.meshos import MeshOsDaemonSdk as _Sdk
+    except ImportError:
+        pytest.skip("net_sdk wrapper not installed")
+
+    async def _run() -> Any:
+        with _Sdk.start() as sdk:
+            with sdk.register_daemon(_EchoDaemon(), Identity.generate()) as handle:
+                ev = await handle.anext_control(timeout_ms=50)
+                return ev
+
+    from typing import Any  # noqa: F401 — silences forward-ref
+
+    result = asyncio.run(_run())
+    assert result is None
