@@ -1,0 +1,25 @@
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_17_NET_CLI.md
+  s_4791afa9a65b5b::t_738c650d3cf7de 50-55
+  s_4791afa9a65b5b::t_0ca9950af59e0d 70-71
+  s_4791afa9a65b5b::t_5751f161d5cdd0 110-141,147-148
+  s_4791afa9a65b5b::t_23e8813565fa14 17
+  s_4791afa9a65b5b::t_42fe86c4fa3e6c 11-14
+  s_4791afa9a65b5b::t_478bcfa57cdbf7 7-8
+  s_4791afa9a65b5b::t_6714266990d7c0 36-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "93f37b363114d2ca0e715704946343e6551726e0",
+  "prompts": {},
+  "sessions": {
+    "s_4791afa9a65b5b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "89f5c2e1-b076-43f5-bd37-b28a7242dbaf",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
