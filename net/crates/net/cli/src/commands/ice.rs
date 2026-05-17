@@ -131,8 +131,10 @@ pub struct CommonIceArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Skip the interactive `YES` prompt. Required when stdout
-    /// is non-TTY; rejected on TTY unless explicitly passed.
+    /// Skip the interactive `YES` prompt. Required when **stdin**
+    /// is not a TTY (scripts / CI); on an interactive terminal
+    /// the prompt always runs regardless of `--yes` (a stray
+    /// shell-history recall can't ram an ICE commit through).
     #[arg(long)]
     pub yes: bool,
 
