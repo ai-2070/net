@@ -1,0 +1,21 @@
+net/crates/net/bindings/node/meshdb.ts
+  s_b3022192a92c59::t_f32e3e2f8fa425 30-37
+.github/workflows/ci.yml
+  s_b3022192a92c59::t_6677049ce36761 361-369
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "e951f285d6c3ef8e192824f72371bb84651c50c6",
+  "prompts": {},
+  "sessions": {
+    "s_b3022192a92c59": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d594c56e-1353-4a07-aa91-e09d2c583c0f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
