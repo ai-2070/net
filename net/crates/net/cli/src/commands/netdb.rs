@@ -102,6 +102,20 @@ pub struct SnapshotArgs {
 
     #[arg(long)]
     pub force: bool,
+
+    /// Include the tasks adapter in the snapshot. Defaults to
+    /// `true`. Pass `--no-tasks` to capture a memories-only
+    /// snapshot. Pre-fix this was unconditional and a tasks-only
+    /// store snapshot silently fabricated an empty memories
+    /// channel that `restore` then believed was authoritative.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub with_tasks: bool,
+
+    /// Include the memories adapter in the snapshot. Defaults to
+    /// `true`. Pass `--no-memories` to capture a tasks-only
+    /// snapshot.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub with_memories: bool,
 }
 
 #[derive(Args, Debug)]
@@ -742,7 +756,21 @@ async fn run_snapshot(
             }
         }
     }
-    let netdb = open_netdb(args.store.as_deref(), profile_netdb, args.origin, true, true, false).await?;
+    if !args.with_tasks && !args.with_memories {
+        return Err(crate::error::invalid_args(
+            "snapshot must include at least one of tasks or memories; \
+             do not pass both --with-tasks=false and --with-memories=false",
+        ));
+    }
+    let netdb = open_netdb(
+        args.store.as_deref(),
+        profile_netdb,
+        args.origin,
+        args.with_tasks,
+        args.with_memories,
+        false,
+    )
+    .await?;
     let snapshot = netdb
         .snapshot()
         .map_err(|e| sdk(format!("netdb snapshot: {e}")))?;
