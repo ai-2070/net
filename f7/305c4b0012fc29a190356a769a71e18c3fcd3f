@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/dataforts/gravity/counter.rs
+  s_003b573b78d73d::t_920686a2fbea51 853-862,900-901,908-914
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "f7305c4b0012fc29a190356a769a71e18c3fcd3f",
+  "prompts": {},
+  "sessions": {
+    "s_003b573b78d73d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0c3f523e-cae1-41eb-82c0-affb976b6594",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
