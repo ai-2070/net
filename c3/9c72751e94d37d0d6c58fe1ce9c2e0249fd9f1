@@ -1,0 +1,37 @@
+net/crates/net/include/README.md
+  s_f641e31a81af58::t_e28729366405da 1023-1027,1030-1036
+net/crates/net/src/ffi/mesh.rs
+  s_f641e31a81af58::t_17f965e3956eb4 2330-2333
+  s_f641e31a81af58::t_ad4125cbeacfae 2467-2470
+  s_f641e31a81af58::t_c5a49c8456c63b 4047-4084
+  s_f641e31a81af58::t_761aa20a72f4e5 2436-2439
+  s_f641e31a81af58::t_7a0d928c81c371 1768-1771
+  s_f641e31a81af58::t_f2306f6a6c0e73 2246-2248
+  s_f641e31a81af58::t_f1a40d66ebeb37 2495-2498
+  s_f641e31a81af58::t_f709c23d26afc3 2532-2535
+net/crates/net/src/ffi/cortex.rs
+  s_f641e31a81af58::t_a278d2bf55cd3a 2902-2905
+  s_f641e31a81af58::t_ee2fb27a2a04ee 1171-1175
+net/crates/net/src/ffi/blob.rs
+  s_f641e31a81af58::t_fc26d71b13858d 988-991
+  s_f641e31a81af58::t_a9d5d2f2d326ba 308-311
+  s_f641e31a81af58::t_52e62a3302d33f 236-239
+  s_f641e31a81af58::t_089cd3570a652c 1032-1035
+  s_f641e31a81af58::t_e3e804ccbcebf2 945-948
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "c39c72751e94d37d0d6c58fe1ce9c2e0249fd9f1",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
