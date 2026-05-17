@@ -691,7 +691,12 @@ pub extern "C" fn net_meshos_sdk_shutdown(sdk: *mut NetMeshOsSdk) -> c_int {
             return NET_MESHOS_ERR_NULL;
         };
         clear_last_error_inner();
-        let inner = match sdk_ref.inner.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let inner = match sdk_ref
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             Some(s) => s,
             None => {
                 set_last_error("already_shutdown", "MeshOsDaemonSdk was already shut down");
@@ -1677,7 +1682,10 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
-        assert_eq!(*state.last_payload.lock().unwrap_or_else(|e| e.into_inner()), b"hello");
+        assert_eq!(
+            *state.last_payload.lock().unwrap_or_else(|e| e.into_inner()),
+            b"hello"
+        );
 
         let snap = MeshDaemon::snapshot(&bridge).expect("snapshot returned");
         assert_eq!(snap.as_ref(), b"snapshot-v1");

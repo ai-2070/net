@@ -23,9 +23,7 @@ pub const DEMO_NODE_COUNT: usize = 9;
 /// path. Returns once every `Mesh` has handshook with every
 /// other Mesh and every `MeshOsRuntime`'s `snapshot.peers` has
 /// folded `N - 1` peers via the bridge probes.
-pub async fn build_cluster(
-    verifier: Arc<AdminVerifier>,
-) -> Result<ClusterHarness, ClusterError> {
+pub async fn build_cluster(verifier: Arc<AdminVerifier>) -> Result<ClusterHarness, ClusterError> {
     let cfg = ClusterConfig {
         verifier: Some(verifier),
         ..ClusterConfig::default()
