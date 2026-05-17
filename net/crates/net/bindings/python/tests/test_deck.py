@@ -60,6 +60,9 @@ def test_operator_identity_from_seed_rejects_wrong_length() -> None:
     with pytest.raises(DeckSdkError) as excinfo:
         OperatorIdentity.from_seed(b"\x42" * 31)
     assert excinfo.value.kind == "invalid_argument"
+    # Pin the message so a future drift to a different
+    # invalid_argument path can't silently pass this test.
+    assert "32 bytes" in str(excinfo.value)
 
 
 # -------------------------------------------------------------------------
@@ -106,6 +109,7 @@ def test_deck_client_standalone_constructor_rejects_wrong_seed_length() -> None:
     with pytest.raises(DeckSdkError) as excinfo:
         DeckClient(b"\x55" * 31)
     assert excinfo.value.kind == "invalid_argument"
+    assert "32 bytes" in str(excinfo.value)
 
 
 def test_deck_client_standalone_constructor_accepts_config_dicts() -> None:

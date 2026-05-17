@@ -120,6 +120,9 @@ d('Deck SDK operator-side bindings (Phase 5 slice 1)', () => {
       throw new Error('expected throw');
     } catch (e) {
       expect(parseKind(e)).toBe('invalid_argument');
+      // Pin the message so a future drift to a different
+      // invalid_argument path can't silently pass this test.
+      expect(String((e as Error).message ?? '')).toMatch(/32 bytes/);
     }
   });
 
