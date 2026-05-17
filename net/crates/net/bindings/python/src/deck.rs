@@ -714,12 +714,15 @@ impl PyDeckClient {
             return Ok(());
         };
         let runtime = self.runtime.clone();
-        py.detach(move || {
-            runtime.block_on(async {
-                let _ = sdk.shutdown().await;
-            });
-        });
-        Ok(())
+        let result = py.detach(move || runtime.block_on(async { sdk.shutdown().await }));
+        match result {
+            Ok(_stats) => Ok(()),
+            Err(e) => Err(deck_err(
+                py,
+                "shutdown_failed",
+                &format!("runtime shutdown failed: {e:?}"),
+            )),
+        }
     }
 
     /// Typed admin-event surface. Each method commits an
