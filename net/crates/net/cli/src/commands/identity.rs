@@ -355,11 +355,27 @@ async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
 }
 
 #[cfg(not(unix))]
-async fn check_strict_permissions(_path: &Path) -> Result<(), CliError> {
-    // Mirror of `enforce_strict_permissions` on Windows: NTFS
-    // ACLs don't have a clean 0o600 analog accessible from
-    // `std::fs`, so the permission gate is a no-op on Windows
-    // and operators manage ACLs out-of-band.
+async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
+    // NTFS ACLs don't have a clean 0o600 analog reachable from
+    // `std::fs`, so structurally the permission gate is a no-op
+    // on Windows — but pre-fix that no-op was silent and every
+    // doc on top of `read_identity_file` advertised a contract
+    // that wasn't enforced. Operators reading the help text or
+    // module header believed their identity files were guarded
+    // the same way `ssh` guards `~/.ssh/id_*`; on Windows they
+    // weren't, with no surfaced warning.
+    //
+    // Surface a stderr warning so a permissive ACL is at least
+    // observable in operator logs. Pass `--insecure-permissions`
+    // to suppress (matches the Unix gate's escape hatch). The
+    // proper fix is a `GetFileSecurityW` DACL check; tracked as
+    // a follow-up because it pulls in the `windows`-rs crate.
+    eprintln!(
+        "warning: identity-file permission gate is a no-op on Windows; \
+         NTFS ACLs on {} are not validated. Pass --insecure-permissions \
+         to silence, or manage the DACL out-of-band.",
+        path.display()
+    );
     Ok(())
 }
 
