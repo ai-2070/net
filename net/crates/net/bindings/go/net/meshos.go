@@ -551,6 +551,11 @@ type MeshOsDaemonHandle struct {
 	// (which registers an internal no-op daemon and needs no
 	// Go-side dispatch). Released on `Free` / finalizer.
 	daemonHandle cgo.Handle
+	// freeOnce serialises `Free` against itself and against the
+	// runtime finalizer. Without it concurrent callers could
+	// double-close `pumpStop`, double-free the FFI handle, or
+	// race the finalizer-vs-explicit `Free` window.
+	freeOnce sync.Once
 	// controlOnce gates the per-handle ControlEvents pump
 	// goroutine. The first `ControlEvents(ctx)` call spawns it;
 	// subsequent calls return the same channel.
@@ -563,6 +568,12 @@ type MeshOsDaemonHandle struct {
 	// release the underlying `ptr` while the pump was still
 	// polling on it (use-after-free against a freed handle).
 	pumpStop chan struct{}
+	// pumpDone is closed by `pumpControlEvents` on exit. `Free`
+	// waits on it before the C-free so a pump blocked inside
+	// `NextControl` finishes against the live handle. Without
+	// this wait, closing `pumpStop` only narrowed the race to
+	// the in-flight FFI call (≤50ms window).
+	pumpDone chan struct{}
 }
 
 // DaemonID returns the substrate identifier (the keypair's origin
@@ -648,37 +659,42 @@ func (h *MeshOsDaemonHandle) GracefulShutdown(graceMs uint64) error {
 	return statusToError(C.net_meshos_graceful_shutdown(h.ptr, C.uint64_t(graceMs)))
 }
 
-// Free releases the handle. Idempotent on nil receivers.
+// Free releases the handle. Safe to call concurrently and
+// repeatedly — `sync.Once` collapses every call past the first
+// (including the runtime finalizer) into a no-op.
 //
 // Stops the `ControlEvents` pump goroutine (if one was started)
 // before the underlying FFI handle is freed — otherwise the pump
 // would race the free and either deref a freed pointer or surface
 // a confusing `invalid_argument` to whichever goroutine was
-// ranging over the channel. The pump's own deferred
-// `close(h.controlChan)` runs after it returns from
+// ranging over the channel. After closing `pumpStop`, `Free`
+// waits on `pumpDone` so an in-flight `NextControl(50)` returns
+// before the C handle disappears under it. The pump's own
+// deferred `close(h.controlChan)` runs after it returns from
 // `pumpControlEvents`, so the consumer's `range` loop terminates
 // cleanly.
 func (h *MeshOsDaemonHandle) Free() {
-	if h == nil || h.ptr == nil {
+	if h == nil {
 		return
 	}
-	if h.pumpStop != nil {
-		// Multiple Free calls land here; guard against a
-		// double-close panic.
-		select {
-		case <-h.pumpStop:
-			// Already closed by a prior Free.
-		default:
-			close(h.pumpStop)
+	h.freeOnce.Do(func() {
+		if h.ptr == nil {
+			return
 		}
-	}
-	C.net_meshos_handle_free(h.ptr)
-	h.ptr = nil
-	if h.daemonHandle != 0 {
-		h.daemonHandle.Delete()
-		h.daemonHandle = 0
-	}
-	runtime.SetFinalizer(h, nil)
+		if h.pumpStop != nil {
+			close(h.pumpStop)
+			if h.pumpDone != nil {
+				<-h.pumpDone
+			}
+		}
+		C.net_meshos_handle_free(h.ptr)
+		h.ptr = nil
+		if h.daemonHandle != 0 {
+			h.daemonHandle.Delete()
+			h.daemonHandle = 0
+		}
+		runtime.SetFinalizer(h, nil)
+	})
 }
 
 // =====================================================================
@@ -1094,12 +1110,14 @@ func (h *MeshOsDaemonHandle) ControlEvents(ctx context.Context) <-chan MeshOsDae
 	h.controlOnce.Do(func() {
 		h.controlChan = make(chan MeshOsDaemonControl, 16)
 		h.pumpStop = make(chan struct{})
+		h.pumpDone = make(chan struct{})
 		go h.pumpControlEvents(ctx)
 	})
 	return h.controlChan
 }
 
 func (h *MeshOsDaemonHandle) pumpControlEvents(ctx context.Context) {
+	defer close(h.pumpDone)
 	defer close(h.controlChan)
 	for {
 		select {
