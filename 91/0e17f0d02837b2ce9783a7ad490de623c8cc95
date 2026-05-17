@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/NET_CLI_PLAN.md
+  s_5af7ced268385a::t_414f5385519073 1-413
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "910e17f0d02837b2ce9783a7ad490de623c8cc95",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
