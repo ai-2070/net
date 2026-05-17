@@ -294,8 +294,20 @@ where
     // not a TTY (scripts / CI). On an interactive terminal we
     // always demand the typed `YES` even with `--yes` so a stray
     // shell-history recall can't ram an ICE commit through.
+    //
+    // Run the gate on a blocking-pool task so the operator's wait
+    // at the prompt doesn't park a tokio worker. Pre-fix
+    // `prompt_for_yes` did `io::stdin().lock().read_line(...)`
+    // synchronously on the SDK runtime, freezing background tasks
+    // (logging dispatcher, mesh ticks) for the duration of the
+    // confirmation typing.
     let stdin_is_tty = std::io::IsTerminal::is_terminal(&io::stdin());
-    check_confirm_gate(stdin_is_tty, common.yes, prompt_for_yes)?;
+    let yes_flag = common.yes;
+    tokio::task::spawn_blocking(move || {
+        check_confirm_gate(stdin_is_tty, yes_flag, prompt_for_yes)
+    })
+    .await
+    .map_err(|e| generic(format!("confirm-gate task panicked: {e}")))??;
 
     // Sign locally + collect supplied signatures.
     let mut signatures: Vec<OperatorSignature> = Vec::new();
