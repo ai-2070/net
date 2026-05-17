@@ -70,7 +70,7 @@ hex = "0.4"
 # uses SHA-256 for the analogous `ssh-keygen -lf` surface; we
 # mirror the algorithm so operators recognize the fingerprint
 # format at a glance.
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Typed errors at the config / identity boundary.
 thiserror = "2"
