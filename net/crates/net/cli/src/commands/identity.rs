@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn iso8601_formats_known_timestamp() {
-        // 2026-05-17T12:34:56Z = 1763382896
+        // 2025-11-17T12:34:56Z = 1763382896
         assert_eq!(format_iso8601_utc(1763382896), "2025-11-17T12:34:56Z");
     }
 
