@@ -1,0 +1,25 @@
+net/crates/net/include/net_meshos.h
+  s_5af7ced268385a::t_d380a937b17aca 444-502
+net/crates/net/bindings/go/meshos-ffi/Cargo.toml
+  s_5af7ced268385a::t_5952f51ec71829 29
+net/crates/net/bindings/go/meshos-ffi/src/lib.rs
+  s_5af7ced268385a::t_acee8ff5774203 72-73
+  s_5af7ced268385a::t_67d9fca3ee1ae0 1757-1856
+  s_5af7ced268385a::t_70e0474a1165a8 1140-1365
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "3484f2fb50fabf888c4fa3c72bee8ff6952e90a6",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
