@@ -1,0 +1,19 @@
+net/crates/net/cli/tests/dry_run.rs
+  s_8c2b4b36ad9479::t_1172b5d0f2b6c0 1-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "595034d9c634597ba76767f8d2284449cdfe86e9",
+  "prompts": {},
+  "sessions": {
+    "s_8c2b4b36ad9479": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c178f51c-95e0-4224-ba26-c4901e8acca7",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
