@@ -488,15 +488,16 @@ jobs:
       - name: Install maturin and pytest
         run: pip install --upgrade pip maturin pytest
 
-      # `net,cortex,compute,groups,meshos,deck` mirrors the Node
-      # binding's feature set for tests. `groups` is needed so
+      # `net,cortex,compute,groups,meshdb,meshos,deck` mirrors the
+      # Node binding's feature set for tests. `groups` is needed so
       # `test_groups.py` can import `ReplicaGroup` / `ForkGroup` /
-      # `StandbyGroup` / `GroupError`; `meshos` / `deck` enable the
-      # corresponding test modules (each guarded by `pytest.skip`
-      # when the feature is absent). Default `redis` is omitted
+      # `StandbyGroup` / `GroupError`; `meshdb` / `meshos` / `deck`
+      # enable the corresponding test modules (each guarded by
+      # `pytest.skip` when the feature is absent) plus the stub-drift
+      # test's MeshDB class coverage. Default `redis` is omitted
       # because the suite doesn't exercise the Redis adapter.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshos,deck
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck
 
       - name: Run tests
         run: pytest -v

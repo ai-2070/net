@@ -4,6 +4,7 @@
 
 # Claude
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # Net misc files
 net/crates/net/sdk-ts/dist/
