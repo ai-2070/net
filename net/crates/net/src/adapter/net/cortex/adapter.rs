@@ -1602,7 +1602,10 @@ mod tests {
 
         // Wait for halt. wait_for_seq now surfaces the halt as
         // `Err(Some(folded))` rather than silently returning.
-        let _ = adapter.wait_for_seq(10).await.expect_err("Stop policy halt");
+        let _ = adapter
+            .wait_for_seq(10)
+            .await
+            .expect_err("Stop policy halt");
         assert!(!adapter.is_running(), "Stop policy must halt the task");
         assert_eq!(adapter.fold_errors(), 1);
 
@@ -2249,13 +2252,10 @@ mod tests {
         )
         .unwrap();
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            adapter.wait_for_seq(49),
-        )
-        .await
-        .expect("wait_for_seq(49) timed out — tail-Lagged recovery regressed")
-        .expect("fold task must remain alive through Lagged recovery");
+        tokio::time::timeout(std::time::Duration::from_secs(5), adapter.wait_for_seq(49))
+            .await
+            .expect("wait_for_seq(49) timed out — tail-Lagged recovery regressed")
+            .expect("fold task must remain alive through Lagged recovery");
 
         assert_eq!(*adapter.state().read(), 50);
         assert!(

@@ -863,11 +863,7 @@ async fn run_snapshot(
     // "snap.bin"; `create_dir_all("")` errors on Windows. Filter
     // it so we skip the dir-create step when the user passed a
     // bare path or a relative leaf.
-    if let Some(parent) = args
-        .out
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    {
+    if let Some(parent) = args.out.parent().filter(|p| !p.as_os_str().is_empty()) {
         tokio::fs::create_dir_all(parent).await.map_err(|e| {
             generic(format!(
                 "failed to create parent directory {}: {e}",

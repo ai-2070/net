@@ -317,11 +317,9 @@ where
     // confirmation typing.
     let stdin_is_tty = std::io::IsTerminal::is_terminal(&io::stdin());
     let yes_flag = common.yes;
-    tokio::task::spawn_blocking(move || {
-        check_confirm_gate(stdin_is_tty, yes_flag, prompt_for_yes)
-    })
-    .await
-    .map_err(|e| generic(format!("confirm-gate task panicked: {e}")))??;
+    tokio::task::spawn_blocking(move || check_confirm_gate(stdin_is_tty, yes_flag, prompt_for_yes))
+        .await
+        .map_err(|e| generic(format!("confirm-gate task panicked: {e}")))??;
 
     // Sign locally now that the gate has passed.
     let local_sig = ctx.identity().sign_proposal(

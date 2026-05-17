@@ -149,7 +149,9 @@ pub async fn run(
                 profile_name,
                 AdminEnvelope::EnterMaintenance {
                     node: args.node,
-                    drain_for_ms: args.drain_for.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                    drain_for_ms: args
+                        .drain_for
+                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
                 },
                 |deck, _| {
                     let drain_for = args.drain_for;

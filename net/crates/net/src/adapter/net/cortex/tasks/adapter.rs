@@ -120,12 +120,13 @@ impl TasksAdapter {
         let file = redex.open_file(&name, redex_config)?;
         let next_seq = file.next_seq();
         if next_seq > 0 {
-            inner.wait_for_seq(next_seq - 1).await.map_err(
-                |folded_through| CortexAdapterError::FoldStoppedBeforeSeq {
+            inner
+                .wait_for_seq(next_seq - 1)
+                .await
+                .map_err(|folded_through| CortexAdapterError::FoldStoppedBeforeSeq {
                     wanted: next_seq - 1,
                     folded_through,
-                },
-            )?;
+                })?;
         }
 
         Ok(Self {
@@ -416,12 +417,13 @@ impl TasksAdapter {
         let file = redex.open_file(&name, redex_config)?;
         let next_seq = file.next_seq();
         if next_seq > 0 {
-            inner.wait_for_seq(next_seq - 1).await.map_err(
-                |folded_through| CortexAdapterError::FoldStoppedBeforeSeq {
+            inner
+                .wait_for_seq(next_seq - 1)
+                .await
+                .map_err(|folded_through| CortexAdapterError::FoldStoppedBeforeSeq {
                     wanted: next_seq - 1,
                     folded_through,
-                },
-            )?;
+                })?;
         }
 
         Ok(Self {
