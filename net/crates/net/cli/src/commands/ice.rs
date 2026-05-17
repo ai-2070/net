@@ -264,7 +264,8 @@ where
 {
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx =
-        CliContext::build(&profile, common.identity.as_deref(), common.supervisor_node).await?;
+        CliContext::build(&profile, common.identity.as_deref(), common.supervisor_node, true)
+            .await?;
     let deck = ctx.deck();
     let proposal = build_proposal(deck.as_ref());
 

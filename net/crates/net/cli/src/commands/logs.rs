@@ -54,7 +54,7 @@ pub async fn run_log_tail(
 ) -> Result<(), CliError> {
     let _ = args.follow; // accepted but always-on
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node).await?;
+    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
 
     let mut filter = LogFilter::new();
     if let Some(level_str) = args.min_level.as_deref() {
@@ -131,7 +131,7 @@ pub async fn run_failures_tail(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node).await?;
+    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
 
     let mut stream = ctx.deck().subscribe_failures(args.since_seq);
     let fmt = OutputFormat::resolve_stream(output);

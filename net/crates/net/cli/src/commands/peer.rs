@@ -34,7 +34,7 @@ pub async fn run_ls(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node).await?;
+    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let snapshot = ctx.deck().status();
     let rows: Vec<PeerRow> = snapshot
         .peers

@@ -87,7 +87,7 @@ async fn run_show(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node).await?;
+    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let snapshot = ctx.deck().status();
     let target = args.peer.unwrap_or(args.node);
     let caps = snapshot
@@ -111,7 +111,7 @@ async fn run_query(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node).await?;
+    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let snapshot = ctx.deck().status();
     let required: BTreeSet<String> = args.tags.into_iter().collect();
     let matches: Vec<u64> = snapshot
@@ -136,7 +136,7 @@ async fn run_nodes(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node).await?;
+    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let snapshot = ctx.deck().status();
     let rows: Vec<CapNodesRow> = snapshot
         .peers

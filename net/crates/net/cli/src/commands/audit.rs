@@ -85,7 +85,7 @@ async fn run_recent(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node).await?;
+    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
 
     let deck = ctx.deck();
     let mut query = deck.audit().recent(args.limit);
@@ -114,7 +114,7 @@ async fn run_stream(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node).await?;
+    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
 
     let deck = ctx.deck();
     let mut query = deck.audit();

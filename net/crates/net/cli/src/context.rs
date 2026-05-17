@@ -45,10 +45,16 @@ impl CliContext {
     /// from (in priority order): `identity_override`,
     /// `profile.identity`, an ephemeral random keypair (with a
     /// diagnostic warning on stderr).
+    ///
+    /// `require_identity = true` refuses the ephemeral-fallback
+    /// path; the admin / ICE write surfaces pass this so a missing
+    /// identity can't silently sign a commit with a throwaway key
+    /// whose operator id no audit consumer will recognize.
     pub async fn build(
         profile: &Profile,
         identity_override: Option<&Path>,
         node_id: u64,
+        require_identity: bool,
     ) -> Result<Self, CliError> {
         // Endpoint check — Phase 1 supports only in-process.
         if let Some(endpoint) = profile.endpoint.as_deref() {
@@ -64,11 +70,20 @@ impl CliContext {
 
         // Identity resolution. Generates an ephemeral one as a
         // last resort so read-only subcommands work without
-        // ceremony; writes go through the explicit identity
-        // path.
+        // ceremony; writes pass `require_identity = true` so the
+        // ephemeral branch becomes a typed error instead of a
+        // silent warn-and-proceed.
         let keypair = match identity_override.or(profile.identity.as_deref()) {
             Some(path) => load_identity_keypair(path).await?,
             None => {
+                if require_identity {
+                    return Err(invalid_args(
+                        "no operator identity configured; pass --identity <PATH> \
+                         or set `identity = \"...\"` under your profile in the \
+                         config file. Admin / ICE commits refuse to sign with \
+                         an ephemeral keypair.",
+                    ));
+                }
                 tracing::warn!(
                     "no operator identity configured; using an ephemeral \
                      keypair. Run `net identity generate --out <PATH>` and \

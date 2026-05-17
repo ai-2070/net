@@ -279,7 +279,8 @@ where
 
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx =
-        CliContext::build(&profile, common.identity.as_deref(), common.supervisor_node).await?;
+        CliContext::build(&profile, common.identity.as_deref(), common.supervisor_node, true)
+            .await?;
     let deck = ctx.deck();
     let commit = commit(deck, common.supervisor_node)
         .await

@@ -60,14 +60,16 @@ pub async fn run(
     match cmd {
         SnapshotCommand::Get(args) => {
             let profile = resolve_profile(config_path, profile_name).await?;
-            let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node).await?;
+            let ctx =
+                CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
             let snapshot: MeshOsSnapshot = ctx.deck().status();
             emit_value(OutputFormat::resolve_oneshot(output), &snapshot)
                 .map_err(|e| generic(format!("write snapshot: {e}")))?;
         }
         SnapshotCommand::Status(args) => {
             let profile = resolve_profile(config_path, profile_name).await?;
-            let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node).await?;
+            let ctx =
+                CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
             let summary: StatusSummary = ctx.deck().status_summary();
             // `StatusSummary` lives in the substrate without serde
             // derives; copy into the CLI's local serializable mirror
