@@ -1,0 +1,23 @@
+net/crates/net/sdk-py/README.md
+  s_b3022192a92c59::t_aa4af7f4401e48 15-30
+net/crates/net/bindings/python/README.md
+  s_b3022192a92c59::t_a5a075f05ea17a 13-33
+net/crates/net/sdk-ts/README.md
+  s_b3022192a92c59::t_6bcc5008ac6804 13-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "601b3abe308f4cf6d6793fe8df2c29b7b0fe6cd2",
+  "prompts": {},
+  "sessions": {
+    "s_b3022192a92c59": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d594c56e-1353-4a07-aa91-e09d2c583c0f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
