@@ -258,7 +258,7 @@ impl BlobRef {
     /// the single-blob shape; the new enum surface uses
     /// [`Self::small`] for the same shape.
     #[deprecated(
-        since = "0.17.0",
+        since = "0.18.0",
         note = "use `BlobRef::small` for explicit-variant construction"
     )]
     pub fn new(uri: impl Into<String>, hash: [u8; 32], size: u64) -> Self {

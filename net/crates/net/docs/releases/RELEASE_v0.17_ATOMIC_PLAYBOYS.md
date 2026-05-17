@@ -24,7 +24,7 @@ The hardening posture from the Black Diamond / Rebel Yell / Eye of the Tiger lin
 
 The MeshOS SDK plan covering Rust / Python / Node / Go / C ships alongside as a design document — `MESHOS_SDK_PLAN.md`. The Rust SDK is the canonical surface; Python / Node / Go / C land in dependency order per consumer demand, all gated on the daemon-side-only restriction (no placement APIs, no admin-event issuance, no MeshOS-control surfaces in any binding, ever). A new `sdk` workspace member at `crates/net/sdk/` opens the slot.
 
-No new dependencies. No protocol changes. The crate version moves from `0.16.x` to `0.17.0` to reflect the new feature surface; the workspace gains the `sdk` member.
+No new dependencies. No protocol changes. The crate version moves from `0.16.x` to `0.18.0` to reflect the new feature surface; the workspace gains the `sdk` member.
 
 ---
 
@@ -366,7 +366,7 @@ The plan locks in ten decisions, most importantly the non-goals: no placement AP
 
 ## Toolchain + dependency upgrades
 
-No new dependencies. The `arc-swap = "1.7.1"` already in the workspace gets a new consumer (`MeshOsSnapshot` publish path). The `tracing = "0.1"` workspace dep gets a new consumer (every `meshos::*` module emits `debug!` / `warn!` / `error!` events at lifecycle and failure boundaries). The crate version moves from `0.16.x` to `0.17.0`; the workspace gains the `sdk` member at `crates/net/sdk/`.
+No new dependencies. The `arc-swap = "1.7.1"` already in the workspace gets a new consumer (`MeshOsSnapshot` publish path). The `tracing = "0.1"` workspace dep gets a new consumer (every `meshos::*` module emits `debug!` / `warn!` / `error!` events at lifecycle and failure boundaries). The crate version moves from `0.16.x` to `0.18.0`; the workspace gains the `sdk` member at `crates/net/sdk/`.
 
 The `meshos` Cargo feature gates the entire surface. It pulls in `cortex` (which pulls in `redex`); the substrate builds clean without `--features meshos` and the `meshos` cdylib path is purely additive.
 

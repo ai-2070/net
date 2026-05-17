@@ -116,14 +116,14 @@ Fix: add a `require_identity: bool` parameter (or a separate constructor) so `ad
 
 The justification (`// pulling sha2 would be the production choice…`) is candid but the cost/benefit doesn't add up. `sha2` is already in the SDK's tree, the `SimpleSha256` wrapper around `sha256_oneshot` adds a `Box<dyn FnMut>` for no reason, and a hand-rolled crypto primitive is worse than a vetted one even when not on a hot path. Either pull `sha2` or reuse `blake3` (already in the workspace).
 
-### D3. `version.rs:19` — `sdk_version: "0.17.0"` is a hardcoded string literal
+### D3. `version.rs:19` — `sdk_version: "0.18.0"` is a hardcoded string literal
 
 ```rust
 // Embed the SDK version the binary is linked against.
 // The SDK's `Cargo.toml:version` always tracks the
 // workspace version, so this is also the substrate
 // version.
-sdk_version: "0.17.0",
+sdk_version: "0.18.0",
 ```
 
 The comment claims it "tracks the workspace version" — it doesn't; nothing keeps it in sync. The first SDK bump without a CLI bump silently lies to `net version` consumers.
@@ -261,10 +261,10 @@ emit_value(OutputFormat::Json, &info)
 
 `main.rs:193` dispatches `Command::Version => commands::version::run().await` with no `output` argument, so `--output yaml net version` silently emits JSON. Either thread `output: Option<OutputFormat>` through and call `resolve_oneshot`, or update the misleading "predates the `--output` global flag" comment.
 
-### F3. `tests/help.rs:38` hardcodes `0.17.0`
+### F3. `tests/help.rs:38` hardcodes `0.18.0`
 
 ```rust
-.stdout(predicate::str::contains("0.17.0"));
+.stdout(predicate::str::contains("0.18.0"));
 ```
 
 The next `Cargo.toml:version` bump silently breaks the test. Substitute `env!("CARGO_PKG_VERSION")` so the assertion tracks the crate version.
@@ -339,7 +339,7 @@ if stdin_is_tty && !prompt_for_yes()? {
 ## Priority order before merge (second pass)
 
 1. **F4** — drop unused `bytes` dep (one-line).
-2. **F3** — switch the hardcoded `"0.17.0"` test assertion to `env!`.
+2. **F3** — switch the hardcoded `"0.18.0"` test assertion to `env!`.
 3. **F2** — decide: thread `--output` into `version`, or update the misleading comment.
 4. **F1** — flatten the no-op `Option` around `IceError::kind`.
 

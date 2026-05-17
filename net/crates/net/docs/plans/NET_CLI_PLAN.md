@@ -266,7 +266,7 @@ crates/net/cli/
 ```toml
 [package]
 name = "net-cli"
-version = "0.17.0"
+version = "0.18.0"
 publish = false
 
 [[bin]]
