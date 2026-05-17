@@ -360,10 +360,14 @@ fn map_ice_error(msg: &str, kind: Option<&'static str>) -> CliError {
 }
 
 fn prompt_for_yes() -> Result<bool, CliError> {
-    let mut stdout = io::stdout();
-    write!(stdout, "Type YES to confirm ICE commit: ")
+    // Write the prompt to stderr so the preview JSON on stdout
+    // stays uncontaminated when an operator pipes the command
+    // (`net ice ... | jq`). The typed response still reads from
+    // stdin.
+    let mut stderr = io::stderr();
+    write!(stderr, "Type YES to confirm ICE commit: ")
         .map_err(|e| generic(format!("prompt write: {e}")))?;
-    stdout
+    stderr
         .flush()
         .map_err(|e| generic(format!("prompt flush: {e}")))?;
     let mut line = String::new();
