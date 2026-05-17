@@ -13,8 +13,10 @@
 pub mod audit;
 pub mod cap;
 pub mod daemon;
+pub mod db;
 pub mod identity;
 pub mod logs;
+pub mod netdb;
 pub mod peer;
 pub mod snapshot;
 pub mod version;

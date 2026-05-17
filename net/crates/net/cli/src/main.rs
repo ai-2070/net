@@ -117,8 +117,14 @@ enum Command {
     /// Per-daemon listing.
     #[command(subcommand)]
     Daemon(DaemonCommand),
-    // Subsequent commands (port / db / netdb) land in follow-up
-    // commits within Phase 1.
+    /// NetDB local KV adapters (Cortex-backed tasks + memories).
+    #[command(subcommand)]
+    Netdb(commands::netdb::NetdbCommand),
+    // `net db` (MeshDB federated query plane) ships once the SDK
+    // exposes a `MeshOsRuntime::chain_reader()` accessor — see
+    // `commands/db.rs` for the design stub and
+    // `NET_CLI_PLAN.md §8`. `net port (gateway|probe-peer|
+    // try-map)` waits on the same mesh-adapter access.
 }
 
 #[derive(Subcommand, Debug)]
@@ -195,6 +201,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Daemon(DaemonCommand::Ls(args)) => {
             commands::daemon::run_ls(args, output, config_path, profile).await
         }
+        Command::Netdb(cmd) => commands::netdb::run(cmd, output).await,
     }
 }
 
