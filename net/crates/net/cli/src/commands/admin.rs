@@ -129,7 +129,7 @@ pub async fn run(
                 profile_name,
                 AdminEnvelope::Drain {
                     node: args.node,
-                    drain_for_ms: args.drain_for.as_millis() as u64,
+                    drain_for_ms: u64::try_from(args.drain_for.as_millis()).unwrap_or(u64::MAX),
                 },
                 |deck, supervisor_node| {
                     let drain_for = args.drain_for;
@@ -149,7 +149,7 @@ pub async fn run(
                 profile_name,
                 AdminEnvelope::EnterMaintenance {
                     node: args.node,
-                    drain_for_ms: args.drain_for.map(|d| d.as_millis() as u64),
+                    drain_for_ms: args.drain_for.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
                 },
                 |deck, _| {
                     let drain_for = args.drain_for;
@@ -300,7 +300,7 @@ impl From<&ChainCommit> for ChainCommitMirror {
         let committed_at_ms = c
             .committed_at()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
         Self {
             commit_id: c.commit_id(),
