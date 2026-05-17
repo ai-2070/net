@@ -1204,6 +1204,14 @@ pub struct MeshNode {
     /// load is one `ArcSwap::load` + `is_none()` short-circuit
     /// when no observer is installed. See
     /// `cortex::rpc_observer::RpcObserver`.
+    ///
+    /// The inner type is `RpcObserverHandle` (= `Arc<dyn RpcObserver>`),
+    /// which means the cell stores `Option<Arc<Arc<dyn RpcObserver>>>` —
+    /// a double-`Arc`. This is a structural limitation of `arc_swap`:
+    /// `RefCnt for Arc<T>` requires `T: Sized`, so `ArcSwapOption<dyn ..>`
+    /// doesn't compile. The extra indirection is one allocation per
+    /// install + one extra `Deref` per hot-path load; both are cheap
+    /// relative to the observer firing path itself.
     #[cfg(feature = "cortex")]
     rpc_observer: Arc<ArcSwapOption<crate::adapter::net::cortex::rpc_observer::RpcObserverHandle>>,
     /// Optional migration subprotocol handler — same `ArcSwapOption`
@@ -4651,10 +4659,10 @@ impl MeshNode {
         &self,
         observer: Option<crate::adapter::net::cortex::rpc_observer::RpcObserverHandle>,
     ) {
-        match observer {
-            Some(obs) => self.rpc_observer.store(Some(Arc::new(obs))),
-            None => self.rpc_observer.store(None),
-        }
+        // Inner `Arc::new` is the double-Arc the field doc calls
+        // out — arc_swap's `RefCnt for Arc<T>` requires `T: Sized`,
+        // so we cannot store a bare `Arc<dyn RpcObserver>`.
+        self.rpc_observer.store(observer.map(Arc::new));
     }
 
     /// Hot-path load of the currently-installed nRPC observer,
@@ -4665,6 +4673,9 @@ impl MeshNode {
     pub fn rpc_observer(
         &self,
     ) -> Option<crate::adapter::net::cortex::rpc_observer::RpcObserverHandle> {
+        // `load_full()` returns `Option<Arc<Arc<dyn RpcObserver>>>`
+        // (see field doc). Clone the inner `Arc<dyn ..>` so the
+        // caller holds a flat handle.
         self.rpc_observer.load_full().map(|arc| (*arc).clone())
     }
 

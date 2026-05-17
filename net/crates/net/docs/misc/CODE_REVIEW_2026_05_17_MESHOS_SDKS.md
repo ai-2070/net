@@ -43,7 +43,7 @@ Modified:
 
 #### 1. Double-Arc indirection on `MeshNode::rpc_observer` — `mesh.rs:1208, 4647-4665`
 
-The crate's convention for `ArcSwapOption` (lines 308, 1212, 1302, 1377 of the same file) is `ArcSwapOption<ValueType>`, where setters take `Arc<ValueType>` and `store(Some(handle))` directly. The new field breaks that:
+Originally flagged as a fixable bug; on closer look this is a structural limit of `arc_swap` 1.9.1, not a code smell.
 
 ```rust
 // cortex/rpc_observer.rs:107
@@ -54,12 +54,17 @@ rpc_observer: Arc<ArcSwapOption<...::RpcObserverHandle>>,
 //                              ^ already an Arc — this is ArcSwapOption<Arc<dyn RpcObserver>>
 
 // mesh.rs:4651
-self.rpc_observer.store(Some(Arc::new(obs)))  // wraps the already-Arc'd observer in another Arc
+self.rpc_observer.store(Some(Arc::new(obs)))  // wraps the already-Arc'd observer
 ```
 
-Net effect: every install allocates an outer `Arc<Arc<dyn RpcObserver>>`; the hot-path `load_full()` then double-derefs (`(*arc).clone()` on line 4665). Compare `set_migration_handler` at line 1951 — `store(Some(handler))` direct, no extra wrap.
+I tried changing the field to `Arc<ArcSwapOption<dyn RpcObserver>>` so the cell would store `Option<Arc<dyn RpcObserver>>` directly. `arc_swap`'s `RefCnt for Arc<T>` requires `T: Sized`, so the trait-object form fails to compile (`the size for values of type (dyn RpcObserver + 'static) cannot be known at compilation time… required for Arc<dyn RpcObserver> to implement RefCnt`). Compare `set_migration_handler` on `migration_handler: Arc<ArcSwapOption<MigrationSubprotocolHandler>>` — the substrate's other examples all happen to store sized concrete types, which is why this pattern works elsewhere.
 
-**Fix:** change the field to `Arc<ArcSwapOption<dyn RpcObserver>>` (ArcSwap supports `?Sized`), drop the `Arc::new` in the setter, and have `rpc_observer()` return the load directly (`load_full()` already produces `Option<Arc<dyn RpcObserver>>`). The `set_rpc_observer` body then collapses to `self.rpc_observer.store(observer)`.
+**Resolution.** Keep the double-`Arc`. Cleanups landed:
+- Field doc now spells out the constraint explicitly so the next reader doesn't repeat the same investigation.
+- Setter collapses `match observer { Some(o) => …, None => … }` to `store(observer.map(Arc::new))`.
+- Getter keeps the `(*arc).clone()` deref but with a one-line comment pointing to the field doc.
+
+Hot-path cost: one extra `Deref` per load (cheap) + one extra small allocation per install (one-time). Migrating off `arc_swap` to a crate that supports `?Sized` inners (e.g. building on `parking_lot::RwLock<Option<RpcObserverHandle>>`) is the only way to drop the indirection, and the trade-off (read-lock on every fire vs an atomic load) isn't worth it.
 
 ### Code-quality nits
 
@@ -117,7 +122,7 @@ For a 100 ms tick interval, that's 4 polls per tick, fine. If `meshos_tick_inter
 
 | Severity | Action |
 |---|---|
-| Real bug | Fix double-Arc in `rpc_observer` field type + setter (item 1). |
+| Done | Document `arc_swap`'s `Sized` constraint inline + tidy setter (item 1). |
 | Footgun | Consider `pub(crate)` on `ClusterNode` fields + accessors (item 2). |
 | Breaking | Confirm default-features expansion (item 10) is the intent; add a CHANGELOG note. |
 | Nice-to-have | `Cow` method name (5), `RuntimeShutdownError: Display` (7), `tracing::warn!` in drop (3). |
