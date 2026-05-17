@@ -320,7 +320,21 @@ impl EndpointState {
     }
 
     fn record_completion(&self, success: bool) {
-        self.connections.fetch_sub(1, Ordering::AcqRel);
+        // Saturating sub. Pre-fix `fetch_sub(1)` was unconditional;
+        // a caller hitting `record_completion` without a matching
+        // `record_request` (a substrate bug or a misuse of the
+        // public `LoadBalancer::record_completion(node_id)` API)
+        // underflowed `connections` to `u32::MAX - k`. After that,
+        // `try_record_request` always failed (`c >= max_connections`)
+        // and `get_available_endpoints` filtered the endpoint out
+        // forever - a silent, permanent removal from rotation with
+        // no log, no metric, no recovery path. The test at the
+        // bottom of this module explicitly acknowledged the hazard.
+        let _ = self
+            .connections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                Some(c.saturating_sub(1))
+            });
 
         // If this completion is for the half-open probe, it decides the
         // circuit's fate. Clearing the flag with swap also guarantees only
