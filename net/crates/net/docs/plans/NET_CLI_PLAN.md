@@ -99,6 +99,17 @@ Subcommands:
               between    --chain <CHAIN> --start <T1> --end <T2>
               tail       --chain <CHAIN> [--from <SEQ>]
 
+  rpc       Typed RPC (nRPC) client surface.
+              call       <SERVICE> <METHOD>
+                         [--node <ID>] [--payload <JSON>|--payload-file <PATH>]
+                         [--routing (latency|round-robin|sticky)]
+                         [--timeout <DUR>]
+              stream     <SERVICE> <METHOD>
+                         [--payload <JSON>|--payload-file <PATH>]
+                         (emits one ndjson line per chunk; Ctrl-C cancels)
+              discover   <SERVICE>           # nodes advertising `nrpc:<SERVICE>`
+              services                        # every nRPC service in the index
+
   identity  Operator + entity identity authoring.
               generate   [--out <PATH>]
               show       <PATH>
@@ -259,7 +270,16 @@ Three modes for `net daemon run`:
 - **Embedded** — `--exec <BINARY>` spawns a subprocess that talks to the CLI via stdio + a tiny line protocol. Lets non-Rust daemons piggyback on the CLI's lifecycle wiring. Deferred to Phase 4.
 - **Probe** — `--probe` runs a no-op daemon and just reports lifecycle events on stdout. Useful for testing the supervisor connection without a real factory.
 
-### 5. Config file shape
+### 5. nRPC client surface
+
+`net rpc` is the client-side wrapper over the SDK's typed-RPC layer (`crates/net/sdk/src/mesh_rpc.rs`). Server-side hosting goes through `net daemon run --kind <FACTORY-ID>` so handlers live with the daemon-authoring on-ramp rather than a separate subcommand.
+
+- **`net rpc call <SERVICE> <METHOD>`** — wraps `MeshAdapter::call_service(service, payload, opts)` (or `call(node, …)` when `--node` is set). Payload arrives as JSON (via `--payload <JSON>` or `--payload-file <PATH>`), gets re-encoded with the codec the service declares, and the reply body is decoded back to JSON on stdout. `--routing` maps to `CallOptions::routing_policy` (`latency` / `round-robin` / `sticky`). `--timeout` overrides `CallOptions::timeout`. Errors map onto exit code 3 with the `RpcError` kind discriminator on stderr (`NoRoute` / `Timeout` / `RemoteError` / etc.).
+- **`net rpc stream <SERVICE> <METHOD>`** — wraps `call_streaming(...)`. Each chunk decodes to a JSON object emitted as one ndjson line; `Ctrl-C` propagates as `RpcStream::cancel()` so the server-side sink terminates cleanly.
+- **`net rpc discover <SERVICE>`** — wraps `find_service_nodes(service)`. Output table (TTY) or ndjson (non-TTY) listing the advertising node ids.
+- **`net rpc services`** — enumerate every `nrpc:<service>` tag in the local capability index. Useful for discovery from a bastion ("what's actually wired up?").
+
+### 6. Config file shape
 
 ```toml
 # ~/.config/net/config.toml
@@ -283,7 +303,7 @@ default_timeout_ms = 30000
 
 `--config` / `--profile` / `NET_PROFILE` env var resolve the active profile. Every individual flag overrides the profile value.
 
-### 6. Identity store
+### 7. Identity store
 
 Operator identities are stored as TOML files:
 
@@ -299,7 +319,7 @@ note        = "Production operator for the deck-fleet cluster"
 
 The seed file is read-only by `chmod 600`; the CLI errors with kind `permissive_mode` if the file is world-readable. Pattern lifted from `ssh-keygen`.
 
-### 7. Wire / FFI contracts
+### 8. Wire / FFI contracts
 
 The CLI inherits everything from the Rust SDK — no new wire formats. JSON output uses serde's default representation; specifically:
 

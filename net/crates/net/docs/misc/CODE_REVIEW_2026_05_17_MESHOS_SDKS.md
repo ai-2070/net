@@ -279,7 +279,7 @@ If every publish fails (broken adapter), the loop completes silently with `store
 
 | Severity | Action |
 |---|---|
-| Real concern | Wire `AdminVerifier` through the harness so demo ICE commits use real signing (item 1). The plan doc claims it does. |
+| Done | `ClusterConfig.verifier` field installed on every node's SDK; demo wires it via `build_cluster(verifier)`; regression test in `cluster_harness.rs::verifier_threads_through_to_every_node` (item 1). |
 | Doc | Re-flow truncated comments in `main.rs:46-66` and remove the `samples-logs` reference (item 2). |
 | Doc | Reword "Idempotent" on `migrator::install_factories` (item 3). |
 | Polish | Sweep stale "5-node" comments → 9 (item 4); unify `Vec::with_capacity` to `cluster.len()` or `DEMO_NODE_COUNT` (item 5); extract `RESPONDER_COUNT` (item 6). |

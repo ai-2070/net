@@ -129,21 +129,24 @@ pub async fn spawn(nrpc_tail: NrpcTail) -> color_eyre::Result<Harness> {
         "[deck demo] booting {} - node cluster on 127.0.0.1:<ephemeral>",
         DEMO_NODE_COUNT
     );
-    let cluster = build_cluster()
+
+    // Operator identity. Shared across all nodes so admin
+    // commits the deck issues are accepted by every node's
+    // verifier. Built BEFORE the cluster so the verifier can
+    // be installed on every node's `MeshOsDaemonSdk` via
+    // `ClusterConfig.verifier`.
+    let operator_keypair = EntityKeypair::generate();
+    let mut registry = OperatorRegistry::new();
+    registry.register(&operator_keypair);
+    let verifier = Arc::new(AdminVerifier::new(Arc::new(registry), 1));
+
+    let cluster = build_cluster(Arc::clone(&verifier))
         .await
         .map_err(|e| color_eyre::eyre::eyre!("cluster boot: {e}"))?;
     eprintln!(
         "[deck demo] cluster up — {} nodes peered + snapshot folds converged",
         cluster.len()
     );
-
-    // Operator identity. Shared across all nodes so admin
-    // commits the deck issues are accepted by every node's
-    // verifier.
-    let operator_keypair = EntityKeypair::generate();
-    let mut registry = OperatorRegistry::new();
-    registry.register(&operator_keypair);
-    let _verifier = Arc::new(AdminVerifier::new(Arc::new(registry), 1));
 
     // Register a NodeAgentDaemon per node and start its log-
     // emitter task. The handles are stored on the harness so

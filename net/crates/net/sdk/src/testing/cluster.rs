@@ -60,6 +60,15 @@ pub struct ClusterConfig {
     /// the substrate default (500 ms) so the bridge probes fire
     /// quickly during boot.
     pub meshos_tick_interval: Duration,
+    /// Optional operator verifier installed on every node's
+    /// `MeshOsDaemonSdk`. Required for ICE / admin commits to
+    /// go through the real signed-commit path; leave as `None`
+    /// for tests that don't exercise admin verification.
+    ///
+    /// Gated on `feature = "deck"` because `AdminVerifier`
+    /// lives behind that flag in the SDK.
+    #[cfg(feature = "deck")]
+    pub verifier: Option<Arc<crate::deck::AdminVerifier>>,
 }
 
 impl Default for ClusterConfig {
@@ -71,6 +80,8 @@ impl Default for ClusterConfig {
             meshos_snapshot_stable_timeout: Duration::from_secs(3),
             poll_interval: Duration::from_millis(25),
             meshos_tick_interval: Duration::from_millis(100),
+            #[cfg(feature = "deck")]
+            verifier: None,
         }
     }
 }
@@ -390,9 +401,17 @@ impl ClusterHarness {
             let mut mesh_cfg = MeshOsConfig::default();
             mesh_cfg.this_node = node_id;
             mesh_cfg.tick_interval = cfg.meshos_tick_interval;
+            // Install the operator verifier on every node so ICE
+            // / admin commits go through the real signed-commit
+            // path. The cfg-attributed expression selects
+            // `cfg.verifier.clone()` when the `deck` feature is on
+            // (so `cfg.verifier` exists) and `None` otherwise.
             let sdk = MeshOsDaemonSdk::start_with_verifier_and_migration_source(
                 mesh_cfg,
                 Arc::clone(&dispatcher) as Arc<LoggingDispatcher>,
+                #[cfg(feature = "deck")]
+                cfg.verifier.clone(),
+                #[cfg(not(feature = "deck"))]
                 None,
                 Some(migration_source),
             );

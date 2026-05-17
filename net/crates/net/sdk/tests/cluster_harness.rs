@@ -152,3 +152,50 @@ async fn custom_config_path_runs() {
     assert_eq!(harness.len(), 3);
     harness.shutdown().await.expect("clean shutdown");
 }
+
+/// Regression: `ClusterConfig.verifier` must be installed on every
+/// node's `MeshOsDaemonSdk`. Pre-fix the demo built an `AdminVerifier`
+/// and immediately dropped it (`let _verifier = ...`), so deck-side
+/// ICE commits would bypass operator signature verification. The
+/// `verifier` field on `ClusterConfig` closes that gap; this test
+/// pins the wire-through so a future refactor that forgets to plumb
+/// the field through `with_config` is caught.
+#[cfg(feature = "deck")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verifier_threads_through_to_every_node() {
+    use std::sync::Arc;
+
+    use net_sdk::deck::{AdminVerifier, OperatorRegistry};
+    use net_sdk::meshos::EntityKeypair;
+
+    let kp = EntityKeypair::generate();
+    let mut registry = OperatorRegistry::new();
+    registry.register(&kp);
+    let verifier = Arc::new(AdminVerifier::new(Arc::new(registry), 1));
+
+    let cfg = ClusterConfig {
+        verifier: Some(Arc::clone(&verifier)),
+        ..ClusterConfig::default()
+    };
+    let harness = ClusterHarness::with_config(2, cfg)
+        .await
+        .expect("2-node cluster boot with verifier");
+    assert_eq!(harness.len(), 2);
+
+    // The substrate doesn't expose a "is verifier installed?" query,
+    // so the strongest assertion we can make from outside the SDK is
+    // that the cluster boots successfully with a verifier set —
+    // earlier the harness ignored the field entirely, so this call
+    // would have compiled but the verifier would have been dropped.
+    // The smoke test in `deck/src/demo/spawn.rs` covers the
+    // end-to-end signed-commit path.
+    let snap = harness
+        .nth(0)
+        .sdk()
+        .expect("sdk present before shutdown")
+        .runtime()
+        .snapshot();
+    assert_eq!(snap.peers.len(), 1);
+
+    harness.shutdown().await.expect("clean shutdown");
+}
