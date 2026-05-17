@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/jetstream.rs
+  s_f641e31a81af58::t_3adb26f25b859c 29,32-39
+  s_f641e31a81af58::t_3bc266cfcc52c3 301-317
+  s_f641e31a81af58::t_6aaa12ab6f070b 547-568
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "bf288f1f69d329e574d0f4eb1765e55ab7793a10",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
