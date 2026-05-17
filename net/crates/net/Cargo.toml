@@ -39,7 +39,23 @@ name = "net"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [features]
-default = []
+# Out-of-the-box `cargo add ai2070-net` ships the same stack the
+# Python wheel and Node npm package ship by default — mesh transport
+# + NAT traversal + CortEX (folded state) + NetDb + RedEX disk +
+# MeshDB query layer + MeshOS daemon-authoring + Dataforts blob
+# storage. `redis`, `jetstream`, `port-mapping`, `cli` stay opt-in:
+# external service deps / niche audiences / +1.4 MB router-poking
+# crate / binary-only surface. `compute` and `groups` aren't
+# core-crate features — they live in `net-sdk` and only the bindings
+# expose them.
+default = [
+    "net",
+    "nat-traversal",
+    "cortex",
+    "meshdb",
+    "meshos",
+    "dataforts",
+]
 redis = ["dep:redis"]
 jetstream = ["dep:async-nats"]
 net = [
