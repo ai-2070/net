@@ -68,23 +68,23 @@ pub fn emit_value<T: Serialize>(fmt: OutputFormat, value: &T) -> io::Result<()> 
     match fmt {
         OutputFormat::Json | OutputFormat::Table => {
             serde_json::to_writer_pretty(&mut lock, value)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             writeln!(&mut lock)?;
         }
         OutputFormat::Ndjson => {
             serde_json::to_writer(&mut lock, value)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             writeln!(&mut lock)?;
         }
         OutputFormat::Yaml => {
             serde_yaml::to_writer(&mut lock, value)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
         }
         OutputFormat::Text => {
             // Plain text: render Display via JSON intermediary
             // (so structs still render usefully).
             let s = serde_json::to_string_pretty(value)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             writeln!(&mut lock, "{}", s)?;
         }
     }
@@ -101,7 +101,7 @@ pub fn emit_stream_row<T: Serialize>(fmt: OutputFormat, row: &T) -> io::Result<(
     match fmt {
         OutputFormat::Ndjson | OutputFormat::Json => {
             serde_json::to_writer(&mut lock, row)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             writeln!(&mut lock)?;
         }
         OutputFormat::Yaml => {
@@ -109,14 +109,14 @@ pub fn emit_stream_row<T: Serialize>(fmt: OutputFormat, row: &T) -> io::Result<(
             // human-readable.
             writeln!(&mut lock, "---")?;
             serde_yaml::to_writer(&mut lock, row)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
         }
         OutputFormat::Text | OutputFormat::Table => {
             // Stream payloads in TTY mode default to a compact
             // one-line JSON dump — readable without padding the
             // terminal width.
             let s =
-                serde_json::to_string(row).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                serde_json::to_string(row).map_err(io::Error::other)?;
             writeln!(&mut lock, "{}", s)?;
         }
     }
