@@ -462,14 +462,23 @@ impl TasksAdapter {
     /// deterministically. The race is in the protocol:
     /// `fetch_add` sidesteps it.
     ///
-    /// **Why not `fetch_add` then ingest unconditionally?** A
-    /// failing ingest must not permanently advance the local
-    /// counter past a `seq_or_ts` that never made it to the log
-    /// — the next snapshot would persist the higher counter, and
-    /// on restore, future ingests would pick up at the inflated
-    /// value, leaving a permanent gap (and producing `seq_or_ts`
-    /// collisions when a second adapter sharing the same
-    /// `origin_hash` recovered via on-disk scan).
+    /// **Why no `fetch_sub` rollback on ingest failure?** This is
+    /// the chosen design — see the harmlessness rationale above:
+    /// the gap is invisible to `WatermarkingFold` (it advances via
+    /// `fetch_max` against landed events), the next successful
+    /// ingest gets a strictly-larger seq, and `seq_or_ts` is a
+    /// monotonic tag, not a contiguous counter. A `fetch_sub` on
+    /// `Err` would re-introduce the CAS-style race described
+    /// above: two foreground threads each `fetch_add` then `ingest`;
+    /// if A's ingest fails and A `fetch_sub`s after B already
+    /// `fetch_add`-ed, B's reserved seq jumps backwards and the
+    /// next thread can collide. The pre-fix audit doc warned that
+    /// a higher counter could survive a snapshot/restore; in
+    /// practice the second-adapter-on-same-origin recovery via
+    /// on-disk scan is gated by the substrate's already-required
+    /// uniqueness contract (one in-memory adapter per
+    /// `(channel, origin_hash)`), so the cross-adapter collision
+    /// described there is unreachable today.
     fn ingest_typed<T: serde::Serialize>(
         &self,
         dispatch: u8,
