@@ -1,0 +1,21 @@
+go/net.h
+  s_b3022192a92c59::t_fefd88f4dc812f 231,233-236,238
+go/net_cortex.h
+  s_b3022192a92c59::t_fc787ebeab84ac 1-156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "1d17d69c9f89058d1d6c6d04559e19d775a9cadc",
+  "prompts": {},
+  "sessions": {
+    "s_b3022192a92c59": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d594c56e-1353-4a07-aa91-e09d2c583c0f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
