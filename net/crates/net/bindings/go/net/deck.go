@@ -738,6 +738,20 @@ func (c *DeckClient) ClearAvoidList(node uint64) (ChainCommit, error) {
 // =====================================================================
 
 // DeckSnapshotStream is the Go-side handle for the snapshot stream.
+// DeckSnapshotStream wraps the cdylib's snapshot stream handle.
+//
+// # Concurrency
+//
+// Concurrent calls on the SAME stream are unsupported (the cdylib
+// declares the same constraint in net_deck.h's "Threading"
+// section). In particular: calling `Close` / `Free` from one
+// goroutine while another is blocked in `Next(timeoutMs)`
+// races the free against the FFI call's pointer deref and is a
+// use-after-free. Synchronise externally if needed — typically
+// the easy pattern is "one goroutine drives Next in a loop, the
+// owning goroutine signals shutdown via a channel that loop
+// reads, and only the owning goroutine calls Close after the
+// reader loop exits."
 type DeckSnapshotStream struct {
 	ptr *C.NetDeckSnapshotStream
 }
@@ -1139,8 +1153,11 @@ func (q *DeckAuditQuery) Collect(client *DeckClient) ([]map[string]any, error) {
 	}
 	defer C.net_deck_audit_records_free(records, count)
 	out := make([]map[string]any, 0, int(count))
-	for i := 0; i < int(count); i++ {
-		ptr := *(**C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(records)) + uintptr(i)*unsafe.Sizeof(uintptr(0))))
+	// `unsafe.Slice` (Go 1.17+) is the audit-friendly idiom for
+	// walking a C array — yields a `[]*C.char` we can range over
+	// directly instead of doing manual pointer arithmetic.
+	slice := unsafe.Slice(records, int(count))
+	for _, ptr := range slice {
 		if ptr == nil {
 			continue
 		}

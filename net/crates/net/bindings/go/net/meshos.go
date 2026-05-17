@@ -791,6 +791,14 @@ func (s *MeshOsDaemonSdk) RegisterDaemonWithCallbacks(daemon MeshOsDaemon, seed 
 		nameLen = C.size_t(len(nameBytes))
 	}
 	seedPtr := (*C.uint8_t)(unsafe.Pointer(&seed[0]))
+	// `cgo.Handle` is documented as a `uintptr` under the hood;
+	// round-tripping it through `unsafe.Pointer(uintptr(...))`
+	// hands the cdylib a value it can pass back through the
+	// vtable trampoline (`//export` callbacks reverse the round-
+	// trip via `cgo.Handle(uintptr(ptr))`). go vet may flag this
+	// shape generally but the runtime keeps the underlying value
+	// alive because we retain `cgoHandle` on the Go side until
+	// `Free`.
 	userCtx := unsafe.Pointer(uintptr(cgoHandle))
 	status := C.net_meshos_register_daemon_with_vtable(
 		s.ptr, namePtr, nameLen, seedPtr, &vt, userCtx, &raw,

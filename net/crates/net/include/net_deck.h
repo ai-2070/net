@@ -533,8 +533,13 @@ int net_deck_audit_query_stream(
 
 /* Wait up to `timeout_ms` for the next audit record. On success
  * writes a heap-allocated JSON CString to `*out` (caller frees
- * via `net_deck_free_string`). On timeout writes NULL. On stream
- * end returns NET_DECK_ERR_END_OF_STREAM. */
+ * via `net_deck_free_string`). On timeout writes NULL + returns
+ * NET_DECK_OK. On stream end returns NET_DECK_ERR_END_OF_STREAM.
+ *
+ * `timeout_ms == 0` waits indefinitely (consistent with the
+ * snapshot / log / failure streams). With `0`, the only OK +
+ * NULL return path is unreachable — every wakeup either yields
+ * a record (Ok) or signals stream-end (END_OF_STREAM). */
 int net_deck_audit_stream_next(
     NetDeckAuditStream* stream,
     uint64_t timeout_ms,
