@@ -1,0 +1,24 @@
+net/crates/net/bindings/python/src/meshos.rs
+  s_5af7ced268385a::t_18e2d85cc87252 334-343
+  s_5af7ced268385a::t_e3dd252b095f60 438
+  s_5af7ced268385a::t_cf442f3b4864a9 384-386,399-400,405-437,439-446
+  s_5af7ced268385a::t_a4b27a4fa5ef48 464-470,475,479
+net/crates/net/bindings/python/tests/test_meshos.py
+  s_5af7ced268385a::t_f9166d72e8a92d 424-495
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "f97b11ded3b65ac6b15a109909a33d77d132b164",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
