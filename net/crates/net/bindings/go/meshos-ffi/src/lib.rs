@@ -488,10 +488,7 @@ impl MeshDaemon for CDaemonBridge {
         CapabilitySet::default()
     }
 
-    fn process(
-        &mut self,
-        event: &CausalEvent,
-    ) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
+    fn process(&mut self, event: &CausalEvent) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
         let Some(process_fn) = self.vtable.process else {
             return Err(CoreDaemonError::ProcessFailed(
                 "vtable has no `process` callback".into(),
@@ -1630,10 +1627,7 @@ mod tests {
         };
 
         let mut sdk: *mut NetMeshOsSdk = ptr::null_mut();
-        assert_eq!(
-            net_meshos_sdk_start(0, 0, 0, 0, 0, &mut sdk),
-            NET_MESHOS_OK
-        );
+        assert_eq!(net_meshos_sdk_start(0, 0, 0, 0, 0, &mut sdk), NET_MESHOS_OK);
 
         let name = "vt-echo";
         let (name_ptr, name_len) = (name.as_ptr() as *const c_char, name.len());
@@ -1703,7 +1697,9 @@ mod tests {
         let sat = MeshDaemon::saturation(&bridge);
         assert!((sat - 0.7).abs() < 1e-6);
         assert_eq!(
-            state.health_calls.load(std::sync::atomic::Ordering::Relaxed),
+            state
+                .health_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
         assert_eq!(
@@ -1722,10 +1718,7 @@ mod tests {
     #[test]
     fn vtable_register_rejects_null_process_callback() {
         let mut sdk: *mut NetMeshOsSdk = ptr::null_mut();
-        assert_eq!(
-            net_meshos_sdk_start(0, 0, 0, 0, 0, &mut sdk),
-            NET_MESHOS_OK
-        );
+        assert_eq!(net_meshos_sdk_start(0, 0, 0, 0, 0, &mut sdk), NET_MESHOS_OK);
         let vtable = NetMeshOsDaemonVtable {
             process: None, // intentionally invalid
             snapshot: None,
@@ -1788,8 +1781,16 @@ mod tests {
         // `maintenance_state` is a tagged object.
         let kind = v["maintenance_state"]["kind"].as_str().unwrap();
         assert!(
-            ["active", "entering_maintenance", "maintenance", "exiting_maintenance",
-             "drain_failed", "recovery", "unknown"].contains(&kind),
+            [
+                "active",
+                "entering_maintenance",
+                "maintenance",
+                "exiting_maintenance",
+                "drain_failed",
+                "recovery",
+                "unknown"
+            ]
+            .contains(&kind),
             "unexpected maintenance_state kind: {kind}",
         );
         // `peers` is always an array (possibly empty in this fixture).

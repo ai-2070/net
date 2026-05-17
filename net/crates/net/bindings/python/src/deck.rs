@@ -37,19 +37,20 @@ use pyo3::types::{PyBytes, PyDict};
 use tokio::runtime::Runtime;
 
 use net::adapter::net::behavior::deck::{
-    AdminCommands as CoreAdminCommands, AuditQuery as CoreAuditQuery, AuditStream as CoreAuditStream,
-    ChainCommit as CoreChainCommit, DeckClient as CoreClient, DeckClientConfig as CoreConfig,
-    DeckError, FailureStream as CoreFailureStream, IceCommands as CoreIceCommands,
-    IceProposal as CoreIceProposal, LogFilter as CoreLogFilter, LogStream as CoreLogStream,
-    OperatorIdentity as CoreIdentity, SimulatedIceProposal as CoreSimulated,
-    SnapshotStream as CoreSnapshotStream, StatusSummary, StatusSummaryStream as CoreStatusStream,
+    AdminCommands as CoreAdminCommands, AuditQuery as CoreAuditQuery,
+    AuditStream as CoreAuditStream, ChainCommit as CoreChainCommit, DeckClient as CoreClient,
+    DeckClientConfig as CoreConfig, DeckError, FailureStream as CoreFailureStream,
+    IceCommands as CoreIceCommands, IceProposal as CoreIceProposal, LogFilter as CoreLogFilter,
+    LogStream as CoreLogStream, OperatorIdentity as CoreIdentity,
+    SimulatedIceProposal as CoreSimulated, SnapshotStream as CoreSnapshotStream, StatusSummary,
+    StatusSummaryStream as CoreStatusStream,
 };
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::behavior::meshos::{
-    AdminVerifier as CoreAdminVerifier, AvoidScope as CoreAvoidScope, ChainId as CoreChainId,
-    DaemonRef as CoreDaemonRef, MeshOsSnapshot, MigrationId as CoreMigrationId,
-    OperatorRegistry as CoreOperatorRegistry, OperatorSignature as CoreOperatorSignature,
-    VerifyError as CoreVerifyError, blast_radius_hash, ice_proposal_signing_payload,
+    blast_radius_hash, ice_proposal_signing_payload, AdminVerifier as CoreAdminVerifier,
+    AvoidScope as CoreAvoidScope, ChainId as CoreChainId, DaemonRef as CoreDaemonRef,
+    MeshOsSnapshot, MigrationId as CoreMigrationId, OperatorRegistry as CoreOperatorRegistry,
+    OperatorSignature as CoreOperatorSignature, VerifyError as CoreVerifyError,
 };
 use net::adapter::net::identity::EntityId;
 
@@ -228,11 +229,7 @@ impl PyOperatorIdentity {
     /// out-of-band and the local deck reproduces
     /// `ice_proposal_signing_payload(...)` independently. Most
     /// consumers want `sign_proposal(simulated)` instead.
-    fn sign_payload<'py>(
-        &self,
-        py: Python<'py>,
-        payload: &[u8],
-    ) -> PyResult<Bound<'py, PyDict>> {
+    fn sign_payload<'py>(&self, py: Python<'py>, payload: &[u8]) -> PyResult<Bound<'py, PyDict>> {
         let sig = self.inner.keypair().sign(payload);
         let d = PyDict::new(py);
         d.set_item("operator_id", self.inner.operator_id())?;
@@ -241,7 +238,10 @@ impl PyOperatorIdentity {
     }
 
     fn __repr__(&self) -> String {
-        format!("OperatorIdentity(operator_id={:#x})", self.inner.operator_id())
+        format!(
+            "OperatorIdentity(operator_id={:#x})",
+            self.inner.operator_id()
+        )
     }
 }
 
@@ -270,10 +270,7 @@ fn chain_commit_to_dict<'py>(
 // StatusSummary → dict
 // =========================================================================
 
-fn status_summary_to_dict<'py>(
-    py: Python<'py>,
-    s: &StatusSummary,
-) -> PyResult<Bound<'py, PyDict>> {
+fn status_summary_to_dict<'py>(py: Python<'py>, s: &StatusSummary) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     let peers = PyDict::new(py);
     peers.set_item("healthy", s.peers.healthy)?;
@@ -432,7 +429,10 @@ impl PyAdminCommands {
     ) -> PyResult<Bound<'py, PyDict>> {
         let runtime = self.runtime.clone();
         let commit = py.detach(|| {
-            runtime.block_on(self.admin().drain(node, Duration::from_millis(drain_for_ms)))
+            runtime.block_on(
+                self.admin()
+                    .drain(node, Duration::from_millis(drain_for_ms)),
+            )
         });
         match commit {
             Ok(c) => chain_commit_to_dict(py, &c),
@@ -452,7 +452,8 @@ impl PyAdminCommands {
     ) -> PyResult<Bound<'py, PyDict>> {
         let drain_for = drain_for_ms.map(Duration::from_millis);
         let runtime = self.runtime.clone();
-        let commit = py.detach(|| runtime.block_on(self.admin().enter_maintenance(node, drain_for)));
+        let commit =
+            py.detach(|| runtime.block_on(self.admin().enter_maintenance(node, drain_for)));
         match commit {
             Ok(c) => chain_commit_to_dict(py, &c),
             Err(e) => Err(deck_err_from(py, e)),
@@ -501,7 +502,11 @@ impl PyAdminCommands {
         }
     }
 
-    fn invalidate_placement<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyDict>> {
+    fn invalidate_placement<'py>(
+        &self,
+        py: Python<'py>,
+        node: u64,
+    ) -> PyResult<Bound<'py, PyDict>> {
         let runtime = self.runtime.clone();
         let commit = py.detach(|| runtime.block_on(self.admin().invalidate_placement(node)));
         match commit {
@@ -721,9 +726,7 @@ fn parse_log_level_str(py: Python<'_>, s: &str) -> PyResult<CoreLogLevel> {
             return Err(deck_err(
                 py,
                 "invalid_log_level",
-                &format!(
-                    "log level must be one of trace|debug|info|warn|error; got {other:?}"
-                ),
+                &format!("log level must be one of trace|debug|info|warn|error; got {other:?}"),
             ));
         }
     })
@@ -748,23 +751,22 @@ fn log_filter_from_dict(
         f.min_level = Some(parse_log_level_str(py, &s)?);
     }
     if let Some(v) = d.get_item("daemon_id")? {
-        f.daemon_id = Some(v.extract().map_err(|e| {
-            deck_err(py, "invalid_filter", &format!("daemon_id must be int: {e}"))
-        })?);
+        f.daemon_id =
+            Some(v.extract().map_err(|e| {
+                deck_err(py, "invalid_filter", &format!("daemon_id must be int: {e}"))
+            })?);
     }
     if let Some(v) = d.get_item("node_id")? {
-        f.node_id = Some(v.extract().map_err(|e| {
-            deck_err(py, "invalid_filter", &format!("node_id must be int: {e}"))
-        })?);
+        f.node_id =
+            Some(v.extract().map_err(|e| {
+                deck_err(py, "invalid_filter", &format!("node_id must be int: {e}"))
+            })?);
     }
     if let Some(v) = d.get_item("since_seq")? {
-        f.since_seq = Some(v.extract().map_err(|e| {
-            deck_err(
-                py,
-                "invalid_filter",
-                &format!("since_seq must be int: {e}"),
-            )
-        })?);
+        f.since_seq =
+            Some(v.extract().map_err(|e| {
+                deck_err(py, "invalid_filter", &format!("since_seq must be int: {e}"))
+            })?);
     }
     Ok(f)
 }
@@ -1100,9 +1102,7 @@ fn parse_avoid_scope(py: Python<'_>, d: &Bound<'_, PyDict>) -> PyResult<CoreAvoi
             return Err(deck_err(
                 py,
                 "invalid_avoid_scope",
-                &format!(
-                    "scope.kind must be 'global' | 'local' | 'on_peer'; got {other:?}"
-                ),
+                &format!("scope.kind must be 'global' | 'local' | 'on_peer'; got {other:?}"),
             ));
         }
     })
@@ -1114,7 +1114,11 @@ fn operator_signature_from_dict(
 ) -> PyResult<CoreOperatorSignature> {
     let op_id: u64 = match d.get_item("operator_id")? {
         Some(v) => v.extract().map_err(|e| {
-            deck_err(py, "invalid_signature", &format!("operator_id must be int: {e}"))
+            deck_err(
+                py,
+                "invalid_signature",
+                &format!("operator_id must be int: {e}"),
+            )
         })?,
         None => {
             return Err(deck_err(
@@ -1126,7 +1130,11 @@ fn operator_signature_from_dict(
     };
     let sig_bytes: Vec<u8> = match d.get_item("signature")? {
         Some(v) => v.extract().map_err(|e| {
-            deck_err(py, "invalid_signature", &format!("signature must be bytes: {e}"))
+            deck_err(
+                py,
+                "invalid_signature",
+                &format!("signature must be bytes: {e}"),
+            )
         })?,
         None => {
             return Err(deck_err(
@@ -1197,7 +1205,10 @@ pub struct PyIceCommands {
 #[pymethods]
 impl PyIceCommands {
     fn freeze_cluster(&self, ttl_ms: u64) -> PyIceProposal {
-        let proposal = self.client.ice().freeze_cluster(Duration::from_millis(ttl_ms));
+        let proposal = self
+            .client
+            .ice()
+            .freeze_cluster(Duration::from_millis(ttl_ms));
         PyIceProposal::from_action(
             self.client.clone(),
             self.runtime.clone(),
@@ -1222,7 +1233,10 @@ impl PyIceCommands {
     }
 
     fn force_evict_replica(&self, chain: u64, victim: u64) -> PyIceProposal {
-        let proposal = self.client.ice().force_evict_replica(chain as CoreChainId, victim);
+        let proposal = self
+            .client
+            .ice()
+            .force_evict_replica(chain as CoreChainId, victim);
         PyIceProposal::from_action(
             self.client.clone(),
             self.runtime.clone(),
@@ -1245,7 +1259,10 @@ impl PyIceCommands {
     }
 
     fn force_cutover(&self, chain: u64, target: u64) -> PyIceProposal {
-        let proposal = self.client.ice().force_cutover(chain as CoreChainId, target);
+        let proposal = self
+            .client
+            .ice()
+            .force_cutover(chain as CoreChainId, target);
         PyIceProposal::from_action(
             self.client.clone(),
             self.runtime.clone(),
@@ -1255,7 +1272,10 @@ impl PyIceCommands {
     }
 
     fn kill_migration(&self, migration: u64) -> PyIceProposal {
-        let proposal = self.client.ice().kill_migration(migration as CoreMigrationId);
+        let proposal = self
+            .client
+            .ice()
+            .kill_migration(migration as CoreMigrationId);
         PyIceProposal::from_action(
             self.client.clone(),
             self.runtime.clone(),
@@ -1394,10 +1414,7 @@ impl PySimulatedIceProposal {
     /// deck to produce a signature the local deck can pass into
     /// `commit([sig, ...])`. Raises `already_committed` once the
     /// proposal has been consumed by `commit()`.
-    fn signing_payload<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyBytes>> {
+    fn signing_payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let action = self.action.as_ref().ok_or_else(|| {
             deck_err(
                 py,
@@ -1516,9 +1533,10 @@ impl PyOperatorRegistry {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(public_key);
         let entity_id = EntityId::from_bytes(arr);
-        let mut g = self.inner.lock().map_err(|_| {
-            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
-        })?;
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
         g.insert(operator_id, entity_id);
         Ok(())
     }
@@ -1526,18 +1544,20 @@ impl PyOperatorRegistry {
     /// Convenience — register `identity`'s public key under its
     /// derived operator id (the keypair's origin hash).
     fn register(&self, py: Python<'_>, identity: &PyOperatorIdentity) -> PyResult<()> {
-        let mut g = self.inner.lock().map_err(|_| {
-            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
-        })?;
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
         g.register(identity.inner.keypair());
         Ok(())
     }
 
     /// `True` iff `operator_id` is registered.
     fn contains(&self, py: Python<'_>, operator_id: u64) -> PyResult<bool> {
-        let g = self.inner.lock().map_err(|_| {
-            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
-        })?;
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
         Ok(g.contains(operator_id))
     }
 
@@ -1546,16 +1566,18 @@ impl PyOperatorRegistry {
     }
 
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
-        let g = self.inner.lock().map_err(|_| {
-            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
-        })?;
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
         Ok(g.len())
     }
 
     fn is_empty(&self, py: Python<'_>) -> PyResult<bool> {
-        let g = self.inner.lock().map_err(|_| {
-            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
-        })?;
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
         Ok(g.is_empty())
     }
 
@@ -1570,10 +1592,12 @@ impl PyOperatorRegistry {
         payload: &[u8],
     ) -> PyResult<()> {
         let sig = operator_signature_from_dict(py, signature)?;
-        let g = self.inner.lock().map_err(|_| {
-            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
-        })?;
-        g.verify(&sig, payload).map_err(|e| verify_error_to_py(py, e))
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
+        g.verify(&sig, payload)
+            .map_err(|e| verify_error_to_py(py, e))
     }
 
     /// Verify every signature in the bundle over `payload` and
@@ -1592,17 +1616,19 @@ impl PyOperatorRegistry {
         for d in signatures {
             sigs.push(operator_signature_from_dict(py, &d)?);
         }
-        let g = self.inner.lock().map_err(|_| {
-            deck_err(py, "registry_poisoned", "operator registry mutex poisoned")
-        })?;
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
         g.verify_bundle(&sigs, payload, threshold)
             .map_err(|e| verify_error_to_py(py, e))
     }
 
     fn __repr__(&self) -> PyResult<String> {
-        let g = self.inner.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err("registry mutex poisoned")
-        })?;
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("registry mutex poisoned"))?;
         Ok(format!("OperatorRegistry(operators={})", g.len()))
     }
 }

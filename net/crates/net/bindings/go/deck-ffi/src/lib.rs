@@ -64,10 +64,10 @@ use net::adapter::net::behavior::deck::{
 };
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::behavior::meshos::{
-    AdminVerifier as CoreAdminVerifier, AvoidScope as CoreAvoidScope, ChainId as CoreChainId,
-    DaemonRef as CoreDaemonRef, MigrationId as CoreMigrationId,
-    OperatorRegistry as CoreOperatorRegistry, OperatorSignature as CoreOperatorSignature,
-    VerifyError as CoreVerifyError, blast_radius_hash, ice_proposal_signing_payload,
+    blast_radius_hash, ice_proposal_signing_payload, AdminVerifier as CoreAdminVerifier,
+    AvoidScope as CoreAvoidScope, ChainId as CoreChainId, DaemonRef as CoreDaemonRef,
+    MigrationId as CoreMigrationId, OperatorRegistry as CoreOperatorRegistry,
+    OperatorSignature as CoreOperatorSignature, VerifyError as CoreVerifyError,
 };
 use net::adapter::net::behavior::meshos::{
     LoggingDispatcher, MeshOsConfig, MeshOsDaemonSdk as CoreSdk,
@@ -531,11 +531,7 @@ pub extern "C" fn net_deck_status_summary(
 // AdminCommands × 9 — each commits and writes a ChainCommit
 // =========================================================================
 
-fn admin_commit<F>(
-    client: *const NetDeckClient,
-    out: *mut NetDeckChainCommit,
-    op: F,
-) -> c_int
+fn admin_commit<F>(client: *const NetDeckClient, out: *mut NetDeckChainCommit, op: F) -> c_int
 where
     F: for<'a> FnOnce(
         CoreAdminCommands<'a>,
@@ -642,7 +638,10 @@ pub extern "C" fn net_deck_admin_drop_replicas(
     out: *mut NetDeckChainCommit,
 ) -> c_int {
     if chains_len > 0 && chains_ptr.is_null() {
-        set_last_error("invalid_argument", "chains pointer is NULL but chains_len > 0");
+        set_last_error(
+            "invalid_argument",
+            "chains pointer is NULL but chains_len > 0",
+        );
         return NET_DECK_ERR_INVALID_ARG;
     }
     let chains: Vec<u64> = if chains_len == 0 {
@@ -1022,9 +1021,7 @@ impl Default for NetDeckLogRecord {
     }
 }
 
-fn log_record_to_c(
-    record: &net::adapter::net::behavior::meshos::LogRecord,
-) -> NetDeckLogRecord {
+fn log_record_to_c(record: &net::adapter::net::behavior::meshos::LogRecord) -> NetDeckLogRecord {
     let message = CString::new(record.message.clone())
         .unwrap_or_else(|_| CString::new("").expect("empty cstr"))
         .into_raw();
@@ -1147,10 +1144,7 @@ pub extern "C" fn net_deck_subscribe_logs(
             match unsafe { *filter }.into_core() {
                 Ok(f) => f,
                 Err(kind) => {
-                    set_last_error(
-                        kind,
-                        "log filter has an invalid field (likely min_level)",
-                    );
+                    set_last_error(kind, "log filter has an invalid field (likely min_level)");
                     return NET_DECK_ERR_INVALID_ARG;
                 }
             }
@@ -1399,9 +1393,7 @@ pub struct NetDeckAuditStream {
 /// Construct a new audit query. Holds only filter state; the
 /// client pointer is supplied on `_collect` / `_stream`.
 #[no_mangle]
-pub extern "C" fn net_deck_audit_query_new(
-    out: *mut *mut NetDeckAuditQuery,
-) -> c_int {
+pub extern "C" fn net_deck_audit_query_new(out: *mut *mut NetDeckAuditQuery) -> c_int {
     ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
         if out.is_null() {
             set_last_error("invalid_argument", "out pointer is NULL");
@@ -1478,10 +1470,7 @@ pub extern "C" fn net_deck_audit_query_force_only(query: *mut NetDeckAuditQuery)
 }
 
 #[no_mangle]
-pub extern "C" fn net_deck_audit_query_since(
-    query: *mut NetDeckAuditQuery,
-    seq: u64,
-) -> c_int {
+pub extern "C" fn net_deck_audit_query_since(query: *mut NetDeckAuditQuery, seq: u64) -> c_int {
     let Some(q) = (unsafe { query.as_mut() }) else {
         return NET_DECK_ERR_NULL;
     };
@@ -2038,9 +2027,7 @@ pub extern "C" fn net_deck_ice_thaw_cluster(
 /// Read the proposal's pinned `issued_at_ms` stamp. Returns 0 on
 /// NULL.
 #[no_mangle]
-pub extern "C" fn net_deck_ice_proposal_issued_at_ms(
-    proposal: *const NetDeckIceProposal,
-) -> u64 {
+pub extern "C" fn net_deck_ice_proposal_issued_at_ms(proposal: *const NetDeckIceProposal) -> u64 {
     match unsafe { proposal.as_ref() } {
         Some(p) => p.issued_at_ms,
         None => 0,
@@ -2107,7 +2094,10 @@ pub extern "C" fn net_deck_ice_proposal_simulate(
         // Option. Use a sentinel: clone the action + bump the
         // issued_at_ms to 0 to mark consumed.
         if p.issued_at_ms == u64::MAX {
-            set_last_error("already_simulated", "IceProposal was already consumed by simulate()");
+            set_last_error(
+                "already_simulated",
+                "IceProposal was already consumed by simulate()",
+            );
             return NET_DECK_ERR_CALL_FAILED;
         }
         let action = p.action.clone();
@@ -3048,8 +3038,7 @@ mod tests {
         );
         let mut summary = NetDeckStatusSummary::default();
         let mut has_item: c_int = 0;
-        let status =
-            net_deck_status_summary_stream_next(stream, 500, &mut summary, &mut has_item);
+        let status = net_deck_status_summary_stream_next(stream, 500, &mut summary, &mut has_item);
         assert_eq!(status, NET_DECK_OK);
         assert_eq!(has_item, 1);
         net_deck_status_summary_stream_free(stream);
@@ -3285,7 +3274,10 @@ mod tests {
         let client = make_client(0x31);
         let mut p: *mut NetDeckIceProposal = ptr::null_mut();
 
-        assert_eq!(net_deck_ice_freeze_cluster(client, 60_000, &mut p), NET_DECK_OK);
+        assert_eq!(
+            net_deck_ice_freeze_cluster(client, 60_000, &mut p),
+            NET_DECK_OK
+        );
         net_deck_ice_proposal_free(p);
 
         p = ptr::null_mut();
@@ -3583,12 +3575,8 @@ mod tests {
             signature_ptr: sig_bytes.as_ptr(),
             signature_len: 64,
         };
-        let status = net_deck_operator_registry_verify(
-            registry,
-            &sig,
-            payload.as_ptr(),
-            payload.len(),
-        );
+        let status =
+            net_deck_operator_registry_verify(registry, &sig, payload.as_ptr(), payload.len());
         assert_eq!(status, NET_DECK_OK);
 
         // Tampered payload → signature_invalid.
@@ -3622,12 +3610,8 @@ mod tests {
             signature_ptr: sig_bytes.as_ptr(),
             signature_len: 64,
         };
-        let status = net_deck_operator_registry_verify(
-            registry,
-            &sig,
-            payload.as_ptr(),
-            payload.len(),
-        );
+        let status =
+            net_deck_operator_registry_verify(registry, &sig, payload.as_ptr(), payload.len());
         assert_eq!(status, NET_DECK_ERR_CALL_FAILED);
         let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
         assert_eq!(kind, "not_authorized");

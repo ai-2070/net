@@ -519,8 +519,7 @@ impl napi::bindgen_prelude::FromNapiValue for DaemonObjectTsfns {
             None => None,
         };
 
-        let saturation_fn: Option<Function<'_, (), f64>> =
-            obj.get_named_property("saturation")?;
+        let saturation_fn: Option<Function<'_, (), f64>> = obj.get_named_property("saturation")?;
         let saturation: Option<SaturationTsfn> = match saturation_fn {
             Some(f) => Some(f.build_threadsafe_function().build()?),
             None => None,
@@ -567,12 +566,9 @@ fn resolve_capabilities_napi(
     let Some(f) = callable else {
         return Ok(CapabilitySet::default());
     };
-    let tags = f.call(()).map_err(|e| {
-        sdk_err(
-            "invalid_daemon",
-            format!("`{attr}()` threw: {e}"),
-        )
-    })?;
+    let tags = f
+        .call(())
+        .map_err(|e| sdk_err("invalid_daemon", format!("`{attr}()` threw: {e}")))?;
     let mut set = CapabilitySet::new();
     for tag in tags {
         set = set.add_tag(tag);
@@ -757,7 +753,8 @@ impl MeshDaemon for MeshOsDaemonBridge {
         let Some(tsfn) = self.health.as_ref() else {
             return CoreDaemonHealth::Healthy;
         };
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<napi::Either<String, HealthObjJs>>>(1);
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<Result<napi::Either<String, HealthObjJs>>>(1);
         let status = tsfn.call_with_return_value(
             (),
             napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,

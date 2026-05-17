@@ -434,9 +434,7 @@ fn resolve_capabilities(
         sdk_err(
             py,
             "invalid_daemon",
-            &format!(
-                "{attr} must return a list/tuple of tag strings (or None): {e}",
-            ),
+            &format!("{attr} must return a list/tuple of tag strings (or None): {e}",),
         )
     })?;
     let mut set = CapabilitySet::new();

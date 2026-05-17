@@ -44,10 +44,10 @@ use net::adapter::net::behavior::deck::{
 };
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::behavior::meshos::{
-    AdminVerifier as CoreAdminVerifier, AvoidScope as CoreAvoidScope, ChainId as CoreChainId,
-    DaemonRef as CoreDaemonRef, MigrationId as CoreMigrationId,
-    OperatorRegistry as CoreOperatorRegistry, OperatorSignature as CoreOperatorSignature,
-    VerifyError as CoreVerifyError, blast_radius_hash, ice_proposal_signing_payload,
+    blast_radius_hash, ice_proposal_signing_payload, AdminVerifier as CoreAdminVerifier,
+    AvoidScope as CoreAvoidScope, ChainId as CoreChainId, DaemonRef as CoreDaemonRef,
+    MigrationId as CoreMigrationId, OperatorRegistry as CoreOperatorRegistry,
+    OperatorSignature as CoreOperatorSignature, VerifyError as CoreVerifyError,
 };
 use net::adapter::net::identity::EntityId;
 use net::adapter::net::EntityKeypair;
@@ -454,18 +454,13 @@ impl AdminCommands {
     }
 
     #[napi]
-    pub async fn drop_replicas(
-        &self,
-        node: BigInt,
-        chains: Vec<BigInt>,
-    ) -> Result<ChainCommitJs> {
+    pub async fn drop_replicas(&self, node: BigInt, chains: Vec<BigInt>) -> Result<ChainCommitJs> {
         let node = crate::common::bigint_u64(node)
             .map_err(|e| deck_err("invalid_argument", format!("node: {}", e.reason)))?;
         let mut converted = Vec::with_capacity(chains.len());
         for (i, bi) in chains.into_iter().enumerate() {
-            let c = crate::common::bigint_u64(bi).map_err(|e| {
-                deck_err("invalid_argument", format!("chains[{i}]: {}", e.reason))
-            })?;
+            let c = crate::common::bigint_u64(bi)
+                .map_err(|e| deck_err("invalid_argument", format!("chains[{i}]: {}", e.reason)))?;
             converted.push(c);
         }
         self.admin()
@@ -659,10 +654,7 @@ impl DeckClient {
     /// `since_seq + 1`. Pass `0n` (or omit) to start from
     /// whatever is still in the ring.
     #[napi]
-    pub async fn subscribe_failures(
-        &self,
-        since_seq: Option<BigInt>,
-    ) -> Result<FailureStream> {
+    pub async fn subscribe_failures(&self, since_seq: Option<BigInt>) -> Result<FailureStream> {
         let seq = match since_seq {
             Some(bi) => crate::common::bigint_u64(bi)
                 .map_err(|e| deck_err("invalid_argument", format!("sinceSeq: {}", e.reason)))?,
@@ -727,9 +719,7 @@ fn parse_log_level_str(s: &str) -> Result<CoreLogLevel> {
         other => {
             return Err(deck_err(
                 "invalid_log_level",
-                format!(
-                    "log level must be one of trace|debug|info|warn|error; got {other:?}"
-                ),
+                format!("log level must be one of trace|debug|info|warn|error; got {other:?}"),
             ));
         }
     })
@@ -971,9 +961,10 @@ impl AuditQuery {
         let records = self.build(&client).collect();
         let mut out = Vec::with_capacity(records.len());
         for r in records {
-            out.push(serde_json::to_string(&r).map_err(|e| {
-                deck_err("audit_serialize_failed", e.to_string())
-            })?);
+            out.push(
+                serde_json::to_string(&r)
+                    .map_err(|e| deck_err("audit_serialize_failed", e.to_string()))?,
+            );
         }
         Ok(out)
     }
@@ -1022,9 +1013,8 @@ impl AvoidScopeJs {
                         "scope 'local' requires 'node' BigInt".to_string(),
                     )
                 })?;
-                let node = crate::common::bigint_u64(bi).map_err(|e| {
-                    deck_err("invalid_avoid_scope", format!("node: {}", e.reason))
-                })?;
+                let node = crate::common::bigint_u64(bi)
+                    .map_err(|e| deck_err("invalid_avoid_scope", format!("node: {}", e.reason)))?;
                 Ok(CoreAvoidScope::Local { node })
             }
             "onPeer" | "on_peer" | "OnPeer" => {
@@ -1034,16 +1024,13 @@ impl AvoidScopeJs {
                         "scope 'onPeer' requires 'peer' BigInt".to_string(),
                     )
                 })?;
-                let peer = crate::common::bigint_u64(bi).map_err(|e| {
-                    deck_err("invalid_avoid_scope", format!("peer: {}", e.reason))
-                })?;
+                let peer = crate::common::bigint_u64(bi)
+                    .map_err(|e| deck_err("invalid_avoid_scope", format!("peer: {}", e.reason)))?;
                 Ok(CoreAvoidScope::OnPeer { peer })
             }
             other => Err(deck_err(
                 "invalid_avoid_scope",
-                format!(
-                    "scope.kind must be 'global' | 'local' | 'onPeer'; got {other:?}"
-                ),
+                format!("scope.kind must be 'global' | 'local' | 'onPeer'; got {other:?}"),
             )),
         }
     }
@@ -1107,7 +1094,10 @@ impl IceCommands {
     pub fn freeze_cluster(&self, ttl_ms: BigInt) -> Result<IceProposal> {
         let ttl_ms = crate::common::bigint_u64(ttl_ms)
             .map_err(|e| deck_err("invalid_argument", format!("ttlMs: {}", e.reason)))?;
-        let p = self.client.ice().freeze_cluster(Duration::from_millis(ttl_ms));
+        let p = self
+            .client
+            .ice()
+            .freeze_cluster(Duration::from_millis(ttl_ms));
         Ok(IceProposal::new_from(
             self.client.clone(),
             p.action().clone(),
@@ -1132,7 +1122,10 @@ impl IceCommands {
             .map_err(|e| deck_err("invalid_argument", format!("chain: {}", e.reason)))?;
         let victim = crate::common::bigint_u64(victim)
             .map_err(|e| deck_err("invalid_argument", format!("victim: {}", e.reason)))?;
-        let p = self.client.ice().force_evict_replica(chain as CoreChainId, victim);
+        let p = self
+            .client
+            .ice()
+            .force_evict_replica(chain as CoreChainId, victim);
         Ok(IceProposal::new_from(
             self.client.clone(),
             p.action().clone(),
@@ -1161,7 +1154,10 @@ impl IceCommands {
             .map_err(|e| deck_err("invalid_argument", format!("chain: {}", e.reason)))?;
         let target = crate::common::bigint_u64(target)
             .map_err(|e| deck_err("invalid_argument", format!("target: {}", e.reason)))?;
-        let p = self.client.ice().force_cutover(chain as CoreChainId, target);
+        let p = self
+            .client
+            .ice()
+            .force_cutover(chain as CoreChainId, target);
         Ok(IceProposal::new_from(
             self.client.clone(),
             p.action().clone(),
@@ -1173,7 +1169,10 @@ impl IceCommands {
     pub fn kill_migration(&self, migration: BigInt) -> Result<IceProposal> {
         let migration = crate::common::bigint_u64(migration)
             .map_err(|e| deck_err("invalid_argument", format!("migration: {}", e.reason)))?;
-        let p = self.client.ice().kill_migration(migration as CoreMigrationId);
+        let p = self
+            .client
+            .ice()
+            .kill_migration(migration as CoreMigrationId);
         Ok(IceProposal::new_from(
             self.client.clone(),
             p.action().clone(),
@@ -1184,11 +1183,7 @@ impl IceCommands {
     #[napi]
     pub fn thaw_cluster(&self) -> IceProposal {
         let p = self.client.ice().thaw_cluster();
-        IceProposal::new_from(
-            self.client.clone(),
-            p.action().clone(),
-            p.issued_at_ms(),
-        )
+        IceProposal::new_from(self.client.clone(), p.action().clone(), p.issued_at_ms())
     }
 }
 
@@ -1199,9 +1194,7 @@ pub struct IceProposal {
     client: Arc<CoreClient>,
     /// Stored under a mutex so async `simulate` can consume the
     /// action without breaking napi's `&self` requirement.
-    state: tokio::sync::Mutex<
-        Option<net::adapter::net::behavior::meshos::IceActionProposal>,
-    >,
+    state: tokio::sync::Mutex<Option<net::adapter::net::behavior::meshos::IceActionProposal>>,
     issued_at_ms: u64,
 }
 
@@ -1332,10 +1325,7 @@ impl SimulatedIceProposal {
     /// Commit with the supplied operator signatures. Consumes the
     /// proposal — subsequent calls throw `already_committed`.
     #[napi]
-    pub async fn commit(
-        &self,
-        signatures: Vec<OperatorSignatureJs>,
-    ) -> Result<ChainCommitJs> {
+    pub async fn commit(&self, signatures: Vec<OperatorSignatureJs>) -> Result<ChainCommitJs> {
         let state = self.state.lock().await.take().ok_or_else(|| {
             deck_err(
                 "already_committed",
@@ -1472,8 +1462,7 @@ impl OperatorRegistry {
             .inner
             .lock()
             .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
-        g.verify(&sig, payload.as_ref())
-            .map_err(verify_error_to_js)
+        g.verify(&sig, payload.as_ref()).map_err(verify_error_to_js)
     }
 
     /// Verify every signature in the bundle and confirm at least
@@ -1538,7 +1527,10 @@ impl AdminVerifier {
         future_skew_ms: BigInt,
     ) -> Result<Self> {
         let fresh_ms = crate::common::bigint_u64(freshness_window_ms).map_err(|e| {
-            deck_err("invalid_argument", format!("freshnessWindowMs: {}", e.reason))
+            deck_err(
+                "invalid_argument",
+                format!("freshnessWindowMs: {}", e.reason),
+            )
         })?;
         let skew_ms = crate::common::bigint_u64(future_skew_ms)
             .map_err(|e| deck_err("invalid_argument", format!("futureSkewMs: {}", e.reason)))?;
@@ -1563,7 +1555,10 @@ impl AdminVerifier {
         ice_cooldown_ms: BigInt,
     ) -> Result<Self> {
         let fresh_ms = crate::common::bigint_u64(freshness_window_ms).map_err(|e| {
-            deck_err("invalid_argument", format!("freshnessWindowMs: {}", e.reason))
+            deck_err(
+                "invalid_argument",
+                format!("freshnessWindowMs: {}", e.reason),
+            )
         })?;
         let skew_ms = crate::common::bigint_u64(future_skew_ms)
             .map_err(|e| deck_err("invalid_argument", format!("futureSkewMs: {}", e.reason)))?;
