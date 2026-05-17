@@ -549,7 +549,7 @@ pub struct PyDeckClient {
     /// drains it on GC if the caller never invoked `close()`.
     /// `None` when constructed via `from_meshos` against an
     /// external SDK.
-    _owned_sdk: Option<CoreSdk>,
+    owned_sdk: Option<CoreSdk>,
 }
 
 impl Drop for PyDeckClient {
@@ -557,7 +557,7 @@ impl Drop for PyDeckClient {
     /// called. Without this, a `from_seed`-built client that gets
     /// garbage-collected abandons its tokio workers rather than
     /// shutting them down — defeats the point of the `close()`
-    /// fix. `_owned_sdk` is `None` after a successful `close()` or
+    /// fix. `owned_sdk` is `None` after a successful `close()` or
     /// for `from_meshos` builds, so the Drop is a no-op in both
     /// cases.
     ///
@@ -566,7 +566,7 @@ impl Drop for PyDeckClient {
     /// panic during shutdown would otherwise propagate out of
     /// the Drop and abort the process.
     fn drop(&mut self) {
-        let Some(sdk) = self._owned_sdk.take() else {
+        let Some(sdk) = self.owned_sdk.take() else {
             return;
         };
         let runtime = self.runtime.clone();
@@ -645,7 +645,7 @@ impl PyDeckClient {
         Ok(Self {
             client: Arc::new(core_client),
             runtime,
-            _owned_sdk: Some(sdk),
+            owned_sdk: Some(sdk),
         })
     }
 
@@ -687,7 +687,7 @@ impl PyDeckClient {
         Ok(Self {
             client: Arc::new(core_client),
             runtime,
-            _owned_sdk: None,
+            owned_sdk: None,
         })
     }
 
@@ -709,7 +709,7 @@ impl PyDeckClient {
     /// `__enter__` / `__exit__` so `with DeckClient(seed) as
     /// deck:` drains the supervisor at scope exit.
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        let Some(sdk) = self._owned_sdk.take() else {
+        let Some(sdk) = self.owned_sdk.take() else {
             // External SDK or already closed — no-op.
             return Ok(());
         };

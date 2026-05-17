@@ -529,7 +529,7 @@ pub struct DeckClient {
     /// Kept alive for the client's lifetime so the supervisor's
     /// tokio tasks + sockets stay up; the napi GC's drop runs
     /// the SDK's own teardown.
-    _owned_sdk: Option<tokio::sync::Mutex<Option<CoreSdk>>>,
+    owned_sdk: Option<tokio::sync::Mutex<Option<CoreSdk>>>,
 }
 
 #[napi]
@@ -585,7 +585,7 @@ impl DeckClient {
 
         Ok(DeckClient {
             client: Arc::new(core_client),
-            _owned_sdk: Some(tokio::sync::Mutex::new(Some(sdk))),
+            owned_sdk: Some(tokio::sync::Mutex::new(Some(sdk))),
         })
     }
 
@@ -620,7 +620,7 @@ impl DeckClient {
             })?;
         Ok(DeckClient {
             client: Arc::new(core_client),
-            _owned_sdk: None,
+            owned_sdk: None,
         })
     }
 
@@ -644,7 +644,7 @@ impl DeckClient {
     /// the supervisor at scope exit.
     #[napi]
     pub async fn shutdown(&self) -> Result<()> {
-        let Some(cell) = self._owned_sdk.as_ref() else {
+        let Some(cell) = self.owned_sdk.as_ref() else {
             // External SDK — caller owns its lifecycle. No-op.
             return Ok(());
         };
