@@ -1,0 +1,19 @@
+net/crates/net/cli/src/commands/admin.rs
+  s_85b38155803bed::t_3911d0b4f245d4 326-339
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "57d0e98682d7079659f78ffe86b7a8864a67ade4",
+  "prompts": {},
+  "sessions": {
+    "s_85b38155803bed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a87163a2-e445-4527-8e9a-d6b1e77222f5",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
