@@ -1,0 +1,23 @@
+.github/workflows/ci.yml
+  s_275316fc500935::t_1237829dcc65aa 520-525
+  s_275316fc500935::t_06f0f03612f1c5 692-701
+  s_275316fc500935::t_9e0167081dd61b 431-437
+net/crates/net/sdk-ts/test/deck.test.ts
+  s_275316fc500935::t_a27aa259a0a7d9 27-30,32-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "f3ee6c8da6e1ff52332e2eeb964225b06b88cde3",
+  "prompts": {},
+  "sessions": {
+    "s_275316fc500935": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f087a884-b322-4d2f-9650-4afee91efe78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
