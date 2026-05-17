@@ -92,11 +92,12 @@ struct Cli {
 enum Command {
     /// Print the SDK version + build metadata.
     Version,
-    // Subsequent commands (identity / snapshot / audit / log /
-    // failures / daemon / cap / peer / port / db / netdb) land in
-    // follow-up commits within Phase 1. The skeleton wires
-    // `version` first so the binary builds and the clap router is
-    // exercised before the substrate-driven subcommands light up.
+    /// Operator identity authoring + inspection.
+    #[command(subcommand)]
+    Identity(commands::identity::IdentityCommand),
+    // Subsequent commands (snapshot / audit / log / failures /
+    // daemon / cap / peer / port / db / netdb) land in follow-up
+    // commits within Phase 1.
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -123,8 +124,10 @@ async fn main() -> ExitCode {
 }
 
 async fn dispatch(cli: Cli) -> Result<(), CliError> {
+    let output = cli.output;
     match cli.command {
         Command::Version => commands::version::run().await,
+        Command::Identity(cmd) => commands::identity::run(cmd, output).await,
     }
 }
 

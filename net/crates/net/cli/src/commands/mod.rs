@@ -10,4 +10,5 @@
 //! `cap`, `peer`, `port`, `db`, `netdb`) land in subsequent
 //! commits.
 
+pub mod identity;
 pub mod version;
