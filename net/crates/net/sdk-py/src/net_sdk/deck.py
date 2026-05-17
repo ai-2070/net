@@ -104,10 +104,16 @@ __all__ = [
     "OperatorSignature",
     "BlastRadius",
     "AvoidScope",
-    # Operator-policy verifier surface.
-    "OperatorRegistry",
-    "AdminVerifier",
 ]
+
+# Operator-policy verifier surface — only present when the wheel
+# was built with a substrate version that exposes
+# `DeckAdminVerifier` / `DeckOperatorRegistry`. Adding the names
+# to `__all__` unconditionally would make `from net_sdk.deck
+# import *` raise `AttributeError` on older wheels even though
+# the rest of the module works fine.
+if _HAS_VERIFIER:
+    __all__ += ["OperatorRegistry", "AdminVerifier"]
 
 
 # =========================================================================

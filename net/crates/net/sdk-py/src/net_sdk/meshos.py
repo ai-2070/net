@@ -55,6 +55,12 @@ except ImportError as e:  # pragma: no cover — surface a clean message
 
 LogLevel = Literal["trace", "debug", "info", "warn", "error"]
 
+# Control-event poll cadence used by both the sync `anext_control`
+# helper and the async `__anext__` iterator. Chosen to keep the
+# pyo3 `&mut self` borrow held for ~1ms at a time so other tasks
+# (graceful_shutdown, publish_log) can grab the lock between polls.
+_CONTROL_POLL_INTERVAL_MS = 10
+
 
 # =========================================================================
 # Typed dict envelopes — match the PyO3 binding's emitted shape.
@@ -376,10 +382,8 @@ class MeshOsDaemonHandleWrapper:
         """
         import asyncio
 
-        # Poll cadence chosen to keep the borrow held for ~1ms at a
-        # time. Each sleep yields the loop so other tasks can take
-        # the &mut self lock (graceful_shutdown, publish_log).
-        poll_ms = 10
+        # See `_CONTROL_POLL_INTERVAL_MS` for the cadence rationale.
+        poll_ms = _CONTROL_POLL_INTERVAL_MS
         ms = 100 if timeout_ms is None else timeout_ms
         remaining_ms = ms
         while True:
@@ -415,7 +419,7 @@ class MeshOsDaemonHandleWrapper:
                     ev = self._raw.try_next_control()
                 if ev is not None:
                     return ev
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(_CONTROL_POLL_INTERVAL_MS / 1000.0)
         except MeshOsSdkError as e:
             if getattr(e, "kind", None) == "already_shutdown":
                 raise StopAsyncIteration from None
@@ -435,7 +439,7 @@ class MeshOsDaemonHandleWrapper:
         Slice 1 is a substrate-side stub — the call returns without
         committing. The binding accepts the argument for
         forward-compatibility."""
-        self._raw.publish_capabilities(_caps=caps)
+        self._raw.publish_capabilities(caps=caps)
 
     def graceful_shutdown(self, grace_ms: Optional[int] = None) -> None:
         """Drive a graceful shutdown. Sends
