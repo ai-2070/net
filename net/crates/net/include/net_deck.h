@@ -13,13 +13,14 @@
  * Companion to `DECK_SDK_PLAN.md` Phase 7; consumes the cdylib
  * shipped for Phase 6 (Go) without modification.
  *
- * # Scope (slice 2)
+ * # Scope (slice 3)
  *
  * Client lifecycle, all 9 `AdminCommands` methods, one-shot
  * `status` / `status_summary`, snapshot + status-summary
  * streams, the audit-query fluent builder + audit stream, log
- * stream with filter, and failure stream. ICE (force_*,
- * simulate/commit typestate) lands in slice 3.
+ * stream with filter, failure stream, and the **ICE break-glass
+ * surface** (7 factories + `simulate()` → `commit(signatures)`
+ * typestate enforced by two distinct opaque pointer types).
  *
  * # Operator-only mode
  *
@@ -537,6 +538,170 @@ int net_deck_audit_stream_next(
 );
 
 void net_deck_audit_stream_free(NetDeckAuditStream* stream);
+
+/* =========================================================================
+ * Slice 3 — ICE break-glass surface
+ *
+ * Typestate enforced at the C boundary via two distinct opaque
+ * handle types:
+ *
+ *   NetDeckIceProposal           — pre-simulation. NO commit fn.
+ *   NetDeckSimulatedIceProposal  — returned from `_simulate`;
+ *                                  the only handle commit accepts.
+ *
+ * Lifecycle:
+ *
+ *   1. Call any of the 7 factories (`net_deck_ice_freeze_cluster`
+ *      / `_flush_avoid_lists` / `_force_evict_replica` /
+ *      `_force_restart_daemon` / `_force_cutover` /
+ *      `_kill_migration` / `_thaw_cluster`) → `NetDeckIceProposal*`.
+ *   2. Call `net_deck_ice_proposal_simulate(proposal, client, &simulated)`
+ *      to consume the proposal + run the substrate simulator.
+ *   3. Optionally read `net_deck_simulated_blast_radius`
+ *      (heap-allocated JSON CString, free via
+ *      `net_deck_free_string`) or write `_blast_hash` into a
+ *      32-byte caller buffer.
+ *   4. Call `net_deck_simulated_commit(simulated, client,
+ *      sigs_ptr, sigs_count, &commit)` with at least
+ *      `ice_signature_threshold` signatures.
+ *   5. Free both handles via `net_deck_ice_proposal_free` and
+ *      `net_deck_simulated_free`. Both are idempotent on NULL.
+ *
+ * `force_drain` is substrate-deferred — not present in this
+ * slice.
+ * ========================================================================= */
+
+/* AvoidScope kind discriminator. */
+#define NET_DECK_AVOID_SCOPE_GLOBAL   0
+#define NET_DECK_AVOID_SCOPE_LOCAL    1
+#define NET_DECK_AVOID_SCOPE_ON_PEER  2
+
+/* `OperatorSignature` wire form. `signature_ptr` MUST point to
+ * exactly 64 ed25519 signature bytes; `signature_len` MUST be 64.
+ * Substrate verifier rejects malformed sigs with kind
+ * `signature_invalid`. */
+typedef struct {
+    uint64_t operator_id;
+    const uint8_t* signature_ptr;
+    size_t signature_len;
+} NetDeckOperatorSignature;
+
+typedef struct NetDeckIceProposal           NetDeckIceProposal;
+typedef struct NetDeckSimulatedIceProposal  NetDeckSimulatedIceProposal;
+
+/* Factories — all 7 return NET_DECK_OK + write the handle to
+ * `*out` on success. Caller MUST free via
+ * `net_deck_ice_proposal_free`. */
+int net_deck_ice_freeze_cluster(
+    const NetDeckClient* client,
+    uint64_t ttl_ms,
+    NetDeckIceProposal** out
+);
+
+/* `scope_kind` is one of NET_DECK_AVOID_SCOPE_*. `scope_node`
+ * is consulted when kind=LOCAL; `scope_peer` when kind=ON_PEER.
+ * Other fields are ignored for those variants. */
+int net_deck_ice_flush_avoid_lists(
+    const NetDeckClient* client,
+    int scope_kind,
+    uint64_t scope_node,
+    uint64_t scope_peer,
+    NetDeckIceProposal** out
+);
+
+int net_deck_ice_force_evict_replica(
+    const NetDeckClient* client,
+    uint64_t chain,
+    uint64_t victim,
+    NetDeckIceProposal** out
+);
+
+/* `name_ptr` / `name_len` is the daemon's `MeshDaemon::name()`
+ * (UTF-8, NOT NUL-terminated). */
+int net_deck_ice_force_restart_daemon(
+    const NetDeckClient* client,
+    uint64_t id,
+    const char* name_ptr,
+    size_t name_len,
+    NetDeckIceProposal** out
+);
+
+int net_deck_ice_force_cutover(
+    const NetDeckClient* client,
+    uint64_t chain,
+    uint64_t target,
+    NetDeckIceProposal** out
+);
+
+int net_deck_ice_kill_migration(
+    const NetDeckClient* client,
+    uint64_t migration,
+    NetDeckIceProposal** out
+);
+
+int net_deck_ice_thaw_cluster(
+    const NetDeckClient* client,
+    NetDeckIceProposal** out
+);
+
+/* Read the proposal's pinned `issued_at_ms` stamp. Returns 0
+ * on NULL. */
+uint64_t net_deck_ice_proposal_issued_at_ms(
+    const NetDeckIceProposal* proposal
+);
+
+/* Free a freestanding IceProposal. Idempotent on NULL. Calling
+ * after a successful `_simulate` is fine — `_simulate`
+ * consumes the inner state; this only frees the empty husk. */
+void net_deck_ice_proposal_free(NetDeckIceProposal* proposal);
+
+/* Consume the proposal and run the substrate simulator. On
+ * success writes a `*NetDeckSimulatedIceProposal` to `*out`
+ * (caller frees via `net_deck_simulated_free`). Already-
+ * simulated proposals return NET_DECK_ERR_CALL_FAILED with kind
+ * `already_simulated`. */
+int net_deck_ice_proposal_simulate(
+    NetDeckIceProposal* proposal,
+    const NetDeckClient* client,
+    NetDeckSimulatedIceProposal** out
+);
+
+/* Read the pinned `issued_at_ms` stamp from the simulated form. */
+uint64_t net_deck_simulated_issued_at_ms(
+    const NetDeckSimulatedIceProposal* simulated
+);
+
+/* Return the blast radius as a heap-allocated JSON CString.
+ * Caller frees via `net_deck_free_string`. Returns NULL on a
+ * NULL handle (last-error populated). */
+char* net_deck_simulated_blast_radius(
+    const NetDeckSimulatedIceProposal* simulated
+);
+
+/* Write the 32-byte Blake3 digest of the blast radius into
+ * `out_buf`. `out_buf` MUST point to at least 32 writable
+ * bytes. Signers must cover this exact hash. */
+int net_deck_simulated_blast_hash(
+    const NetDeckSimulatedIceProposal* simulated,
+    uint8_t* out_buf
+);
+
+/* Commit the simulated proposal with the supplied operator
+ * signatures. Consumes the inner state — subsequent calls
+ * return NET_DECK_ERR_CALL_FAILED with kind `already_committed`.
+ * `sigs_ptr` may be NULL when `sigs_count == 0`. Substrate-side
+ * the SDK gate rejects sub-threshold bundles with kind
+ * `insufficient_signatures`. */
+int net_deck_simulated_commit(
+    NetDeckSimulatedIceProposal* simulated,
+    const NetDeckClient* client,
+    const NetDeckOperatorSignature* sigs_ptr,
+    size_t sigs_count,
+    NetDeckChainCommit* out
+);
+
+/* Free a simulated proposal handle. Idempotent on NULL. */
+void net_deck_simulated_free(NetDeckSimulatedIceProposal* simulated);
 
 /* =========================================================================
  * Last-error trio (thread-local)

@@ -58,10 +58,15 @@ use net::adapter::net::behavior::deck::{
     AdminCommands as CoreAdminCommands, AuditQuery as CoreAuditQuery,
     AuditStream as CoreAuditStream, ChainCommit as CoreChainCommit, DeckClient as CoreClient,
     DeckClientConfig as CoreConfig, DeckError, FailureStream as CoreFailureStream,
-    LogFilter as CoreLogFilter, LogStream as CoreLogStream, OperatorIdentity as CoreIdentity,
-    SnapshotStream as CoreSnapshotStream, StatusSummary, StatusSummaryStream as CoreStatusStream,
+    IceProposal as CoreIceProposal, LogFilter as CoreLogFilter, LogStream as CoreLogStream,
+    OperatorIdentity as CoreIdentity, SnapshotStream as CoreSnapshotStream, StatusSummary,
+    StatusSummaryStream as CoreStatusStream,
 };
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
+use net::adapter::net::behavior::meshos::{
+    AvoidScope as CoreAvoidScope, ChainId as CoreChainId, DaemonRef as CoreDaemonRef,
+    MigrationId as CoreMigrationId, OperatorSignature as CoreOperatorSignature,
+};
 use net::adapter::net::behavior::meshos::{
     LoggingDispatcher, MeshOsConfig, MeshOsDaemonSdk as CoreSdk,
 };
@@ -1697,6 +1702,575 @@ pub extern "C" fn net_deck_audit_stream_free(stream: *mut NetDeckAuditStream) {
     }
 }
 
+// =========================================================================
+// Slice 3 — ICE break-glass surface
+//
+// Typestate enforced via two distinct opaque pointer types:
+// `NetDeckIceProposal*` has no commit function; `commit` accepts
+// only `NetDeckSimulatedIceProposal*`. The substrate's compile-
+// time typestate translates to API-shape enforcement at the C
+// boundary.
+// =========================================================================
+
+/// AvoidScope kind discriminator. Pass to `flush_avoid_lists`.
+pub const NET_DECK_AVOID_SCOPE_GLOBAL: c_int = 0;
+pub const NET_DECK_AVOID_SCOPE_LOCAL: c_int = 1;
+pub const NET_DECK_AVOID_SCOPE_ON_PEER: c_int = 2;
+
+fn avoid_scope_from_c(kind: c_int, node: u64, peer: u64) -> Result<CoreAvoidScope, &'static str> {
+    Ok(match kind {
+        NET_DECK_AVOID_SCOPE_GLOBAL => CoreAvoidScope::Global,
+        NET_DECK_AVOID_SCOPE_LOCAL => CoreAvoidScope::Local { node },
+        NET_DECK_AVOID_SCOPE_ON_PEER => CoreAvoidScope::OnPeer { peer },
+        _ => return Err("invalid_avoid_scope"),
+    })
+}
+
+/// `OperatorSignature` wire form. `signature_ptr` MUST point to
+/// exactly 64 ed25519 signature bytes.
+#[repr(C)]
+#[derive(Debug)]
+pub struct NetDeckOperatorSignature {
+    pub operator_id: u64,
+    pub signature_ptr: *const u8,
+    pub signature_len: usize,
+}
+
+/// Internal owned struct for the substrate-side `OperatorSignature`.
+struct OwnedOperatorSignature {
+    operator_id: u64,
+    signature: Vec<u8>,
+}
+
+impl OwnedOperatorSignature {
+    fn to_core(&self) -> CoreOperatorSignature {
+        CoreOperatorSignature {
+            operator_id: self.operator_id,
+            signature: self.signature.clone(),
+        }
+    }
+}
+
+unsafe fn signatures_from_c(
+    sigs_ptr: *const NetDeckOperatorSignature,
+    sigs_count: usize,
+) -> Result<Vec<OwnedOperatorSignature>, &'static str> {
+    if sigs_count == 0 {
+        return Ok(Vec::new());
+    }
+    if sigs_ptr.is_null() {
+        return Err("invalid_signature");
+    }
+    let slice = unsafe { std::slice::from_raw_parts(sigs_ptr, sigs_count) };
+    let mut out = Vec::with_capacity(sigs_count);
+    for sig in slice {
+        if sig.signature_ptr.is_null() || sig.signature_len == 0 {
+            return Err("invalid_signature");
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(sig.signature_ptr, sig.signature_len) }.to_vec();
+        out.push(OwnedOperatorSignature {
+            operator_id: sig.operator_id,
+            signature: bytes,
+        });
+    }
+    Ok(out)
+}
+
+/// Build a substrate `IceProposal` from a saved action. The
+/// substrate's factories pin a fresh `issued_at_ms` per call;
+/// the simulator is pure over the latest snapshot.
+fn build_core_proposal<'a>(
+    client: &'a CoreClient,
+    action: net::adapter::net::behavior::meshos::IceActionProposal,
+) -> CoreIceProposal<'a> {
+    use net::adapter::net::behavior::meshos::IceActionProposal as A;
+    match action {
+        A::FreezeCluster { ttl } => client.ice().freeze_cluster(ttl),
+        A::FlushAvoidLists { scope } => client.ice().flush_avoid_lists(scope),
+        A::ForceEvictReplica { chain, victim } => client.ice().force_evict_replica(chain, victim),
+        A::ForceRestartDaemon { daemon } => client.ice().force_restart_daemon(daemon),
+        A::ForceCutover { chain, target } => client.ice().force_cutover(chain, target),
+        A::KillMigration { migration } => client.ice().kill_migration(migration),
+        A::ThawCluster => client.ice().thaw_cluster(),
+        // `#[non_exhaustive]` substrate enum — new variants fall
+        // back so bindings stay forward-compatible.
+        _ => client.ice().thaw_cluster(),
+    }
+}
+
+// =========================================================================
+// IceProposal — pre-simulation handle
+// =========================================================================
+
+pub struct NetDeckIceProposal {
+    action: net::adapter::net::behavior::meshos::IceActionProposal,
+    issued_at_ms: u64,
+}
+
+fn make_ice_proposal_handle(
+    client: &CoreClient,
+    proposal: CoreIceProposal<'_>,
+    out: *mut *mut NetDeckIceProposal,
+) -> c_int {
+    let _ = client;
+    let action = proposal.action().clone();
+    let issued_at_ms = proposal.issued_at_ms();
+    let boxed = Box::into_raw(Box::new(NetDeckIceProposal {
+        action,
+        issued_at_ms,
+    }));
+    unsafe { *out = boxed };
+    NET_DECK_OK
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_ice_freeze_cluster(
+    client: *const NetDeckClient,
+    ttl_ms: u64,
+    out: *mut *mut NetDeckIceProposal,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(c) = (unsafe { client.as_ref() }) else {
+            set_last_error("invalid_argument", "client pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(inner) = c.client.as_ref() else {
+            set_last_error("already_shutdown", "DeckClient was already freed");
+            return NET_DECK_ERR_ALREADY_SHUTDOWN;
+        };
+        clear_last_error_inner();
+        let proposal = inner.ice().freeze_cluster(Duration::from_millis(ttl_ms));
+        make_ice_proposal_handle(inner, proposal, out)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_ice_flush_avoid_lists(
+    client: *const NetDeckClient,
+    scope_kind: c_int,
+    scope_node: u64,
+    scope_peer: u64,
+    out: *mut *mut NetDeckIceProposal,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let scope = match avoid_scope_from_c(scope_kind, scope_node, scope_peer) {
+            Ok(s) => s,
+            Err(kind) => {
+                set_last_error(
+                    kind,
+                    "scope_kind must be NET_DECK_AVOID_SCOPE_{GLOBAL|LOCAL|ON_PEER}",
+                );
+                return NET_DECK_ERR_INVALID_ARG;
+            }
+        };
+        let Some(c) = (unsafe { client.as_ref() }) else {
+            set_last_error("invalid_argument", "client pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(inner) = c.client.as_ref() else {
+            set_last_error("already_shutdown", "DeckClient was already freed");
+            return NET_DECK_ERR_ALREADY_SHUTDOWN;
+        };
+        clear_last_error_inner();
+        let proposal = inner.ice().flush_avoid_lists(scope);
+        make_ice_proposal_handle(inner, proposal, out)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_ice_force_evict_replica(
+    client: *const NetDeckClient,
+    chain: u64,
+    victim: u64,
+    out: *mut *mut NetDeckIceProposal,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(c) = (unsafe { client.as_ref() }) else {
+            set_last_error("invalid_argument", "client pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(inner) = c.client.as_ref() else {
+            set_last_error("already_shutdown", "DeckClient was already freed");
+            return NET_DECK_ERR_ALREADY_SHUTDOWN;
+        };
+        clear_last_error_inner();
+        let proposal = inner
+            .ice()
+            .force_evict_replica(chain as CoreChainId, victim);
+        make_ice_proposal_handle(inner, proposal, out)
+    })
+}
+
+/// `name_ptr` / `name_len` is the daemon's `MeshDaemon::name()`
+/// (UTF-8, NOT NUL-terminated).
+#[no_mangle]
+pub extern "C" fn net_deck_ice_force_restart_daemon(
+    client: *const NetDeckClient,
+    id: u64,
+    name_ptr: *const c_char,
+    name_len: usize,
+    out: *mut *mut NetDeckIceProposal,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        if name_ptr.is_null() {
+            set_last_error("invalid_argument", "name pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let name = unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len) };
+        let name = match std::str::from_utf8(name) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                set_last_error("invalid_argument", "daemon name is not valid UTF-8");
+                return NET_DECK_ERR_INVALID_ARG;
+            }
+        };
+        let Some(c) = (unsafe { client.as_ref() }) else {
+            set_last_error("invalid_argument", "client pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(inner) = c.client.as_ref() else {
+            set_last_error("already_shutdown", "DeckClient was already freed");
+            return NET_DECK_ERR_ALREADY_SHUTDOWN;
+        };
+        clear_last_error_inner();
+        let daemon = CoreDaemonRef { id, name };
+        let proposal = inner.ice().force_restart_daemon(daemon);
+        make_ice_proposal_handle(inner, proposal, out)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_ice_force_cutover(
+    client: *const NetDeckClient,
+    chain: u64,
+    target: u64,
+    out: *mut *mut NetDeckIceProposal,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(c) = (unsafe { client.as_ref() }) else {
+            set_last_error("invalid_argument", "client pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(inner) = c.client.as_ref() else {
+            set_last_error("already_shutdown", "DeckClient was already freed");
+            return NET_DECK_ERR_ALREADY_SHUTDOWN;
+        };
+        clear_last_error_inner();
+        let proposal = inner.ice().force_cutover(chain as CoreChainId, target);
+        make_ice_proposal_handle(inner, proposal, out)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_ice_kill_migration(
+    client: *const NetDeckClient,
+    migration: u64,
+    out: *mut *mut NetDeckIceProposal,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(c) = (unsafe { client.as_ref() }) else {
+            set_last_error("invalid_argument", "client pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(inner) = c.client.as_ref() else {
+            set_last_error("already_shutdown", "DeckClient was already freed");
+            return NET_DECK_ERR_ALREADY_SHUTDOWN;
+        };
+        clear_last_error_inner();
+        let proposal = inner.ice().kill_migration(migration as CoreMigrationId);
+        make_ice_proposal_handle(inner, proposal, out)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_ice_thaw_cluster(
+    client: *const NetDeckClient,
+    out: *mut *mut NetDeckIceProposal,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(c) = (unsafe { client.as_ref() }) else {
+            set_last_error("invalid_argument", "client pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(inner) = c.client.as_ref() else {
+            set_last_error("already_shutdown", "DeckClient was already freed");
+            return NET_DECK_ERR_ALREADY_SHUTDOWN;
+        };
+        clear_last_error_inner();
+        let proposal = inner.ice().thaw_cluster();
+        make_ice_proposal_handle(inner, proposal, out)
+    })
+}
+
+/// Read the proposal's pinned `issued_at_ms` stamp. Returns 0 on
+/// NULL.
+#[no_mangle]
+pub extern "C" fn net_deck_ice_proposal_issued_at_ms(
+    proposal: *const NetDeckIceProposal,
+) -> u64 {
+    match unsafe { proposal.as_ref() } {
+        Some(p) => p.issued_at_ms,
+        None => 0,
+    }
+}
+
+/// Free a freestanding IceProposal. Idempotent on NULL. Calling
+/// this after a successful `simulate` is fine — `simulate`
+/// consumes the proposal by taking it out of the box; this
+/// only frees the empty husk.
+#[no_mangle]
+pub extern "C" fn net_deck_ice_proposal_free(proposal: *mut NetDeckIceProposal) {
+    if proposal.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(proposal);
+    }
+}
+
+// =========================================================================
+// SimulatedIceProposal — only struct exposing commit
+// =========================================================================
+
+pub struct NetDeckSimulatedIceProposal {
+    action: net::adapter::net::behavior::meshos::IceActionProposal,
+    issued_at_ms: u64,
+    blast: net::adapter::net::behavior::meshos::BlastRadius,
+    committed: bool,
+}
+
+/// Consume the proposal and run the substrate simulator. On
+/// success writes a `*NetDeckSimulatedIceProposal` to `*out`
+/// (caller frees via `net_deck_simulated_free`) and returns
+/// NET_DECK_OK. The proposal pointer becomes a husk — caller
+/// still must `net_deck_ice_proposal_free` to release it.
+///
+/// Already-simulated proposals (where `simulate` already ran)
+/// return NET_DECK_ERR_CALL_FAILED with kind `already_simulated`.
+#[no_mangle]
+pub extern "C" fn net_deck_ice_proposal_simulate(
+    proposal: *mut NetDeckIceProposal,
+    client: *const NetDeckClient,
+    out: *mut *mut NetDeckSimulatedIceProposal,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(p) = (unsafe { proposal.as_mut() }) else {
+            set_last_error("invalid_argument", "proposal pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(c) = (unsafe { client.as_ref() }) else {
+            set_last_error("invalid_argument", "client pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(inner) = c.client.as_ref() else {
+            set_last_error("already_shutdown", "DeckClient was already freed");
+            return NET_DECK_ERR_ALREADY_SHUTDOWN;
+        };
+        // We can't `Option::take()` because action isn't an
+        // Option. Use a sentinel: clone the action + bump the
+        // issued_at_ms to 0 to mark consumed.
+        if p.issued_at_ms == u64::MAX {
+            set_last_error("already_simulated", "IceProposal was already consumed by simulate()");
+            return NET_DECK_ERR_CALL_FAILED;
+        }
+        let action = p.action.clone();
+        let issued_at_ms = p.issued_at_ms;
+        // Mark consumed.
+        p.issued_at_ms = u64::MAX;
+        clear_last_error_inner();
+        let core_proposal = build_core_proposal(inner, action.clone());
+        let blast = match runtime().block_on(core_proposal.simulate()) {
+            Ok(sim) => sim.blast_radius().clone(),
+            Err(e) => {
+                set_last_error_from_sdk(&e);
+                return NET_DECK_ERR_CALL_FAILED;
+            }
+        };
+        let boxed = Box::into_raw(Box::new(NetDeckSimulatedIceProposal {
+            action,
+            issued_at_ms,
+            blast,
+            committed: false,
+        }));
+        unsafe { *out = boxed };
+        NET_DECK_OK
+    })
+}
+
+/// Read the pinned `issued_at_ms` stamp.
+#[no_mangle]
+pub extern "C" fn net_deck_simulated_issued_at_ms(
+    simulated: *const NetDeckSimulatedIceProposal,
+) -> u64 {
+    match unsafe { simulated.as_ref() } {
+        Some(s) => s.issued_at_ms,
+        None => 0,
+    }
+}
+
+/// Return the blast radius as a heap-allocated JSON CString.
+/// Caller frees via `net_deck_free_string`. Returns NULL on
+/// NULL handle (last-error populated).
+#[no_mangle]
+pub extern "C" fn net_deck_simulated_blast_radius(
+    simulated: *const NetDeckSimulatedIceProposal,
+) -> *mut c_char {
+    ffi_guard!(ptr::null_mut(), {
+        let Some(s) = (unsafe { simulated.as_ref() }) else {
+            set_last_error("invalid_argument", "simulated pointer is NULL");
+            return ptr::null_mut();
+        };
+        match serde_json::to_string(&s.blast) {
+            Ok(j) => match CString::new(j) {
+                Ok(c) => c.into_raw(),
+                Err(_) => {
+                    set_last_error("blast_serialize_failed", "JSON contained NUL byte");
+                    ptr::null_mut()
+                }
+            },
+            Err(e) => {
+                set_last_error("blast_serialize_failed", &e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Write the 32-byte Blake3 digest of the blast radius into
+/// `out_buf`. `out_buf` MUST point to at least 32 writable bytes.
+#[no_mangle]
+pub extern "C" fn net_deck_simulated_blast_hash(
+    simulated: *const NetDeckSimulatedIceProposal,
+    out_buf: *mut u8,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out_buf.is_null() {
+            set_last_error("invalid_argument", "out_buf is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(s) = (unsafe { simulated.as_ref() }) else {
+            set_last_error("invalid_argument", "simulated pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let hash = net::adapter::net::behavior::meshos::blast_radius_hash(&s.blast);
+        let bytes = hash.as_ref();
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, 32);
+        }
+        NET_DECK_OK
+    })
+}
+
+/// Commit the simulated proposal. Consumes the inner state —
+/// subsequent calls return `already_committed`. `sigs_ptr` may
+/// be NULL when `sigs_count == 0`.
+#[no_mangle]
+pub extern "C" fn net_deck_simulated_commit(
+    simulated: *mut NetDeckSimulatedIceProposal,
+    client: *const NetDeckClient,
+    sigs_ptr: *const NetDeckOperatorSignature,
+    sigs_count: usize,
+    out: *mut NetDeckChainCommit,
+) -> c_int {
+    ffi_guard!(NET_DECK_ERR_CALL_FAILED, {
+        if out.is_null() {
+            set_last_error("invalid_argument", "out pointer is NULL");
+            return NET_DECK_ERR_INVALID_ARG;
+        }
+        let Some(s) = (unsafe { simulated.as_mut() }) else {
+            set_last_error("invalid_argument", "simulated pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        if s.committed {
+            set_last_error(
+                "already_committed",
+                "SimulatedIceProposal was already consumed by commit()",
+            );
+            return NET_DECK_ERR_CALL_FAILED;
+        }
+        let Some(c) = (unsafe { client.as_ref() }) else {
+            set_last_error("invalid_argument", "client pointer is NULL");
+            return NET_DECK_ERR_NULL;
+        };
+        let Some(inner) = c.client.as_ref() else {
+            set_last_error("already_shutdown", "DeckClient was already freed");
+            return NET_DECK_ERR_ALREADY_SHUTDOWN;
+        };
+        let sigs = match unsafe { signatures_from_c(sigs_ptr, sigs_count) } {
+            Ok(s) => s,
+            Err(kind) => {
+                set_last_error(
+                    kind,
+                    "signature array carries invalid entries (NULL pointer or zero length)",
+                );
+                return NET_DECK_ERR_INVALID_ARG;
+            }
+        };
+        s.committed = true;
+        clear_last_error_inner();
+        let action = s.action.clone();
+        let core_sigs: Vec<CoreOperatorSignature> = sigs.iter().map(|x| x.to_core()).collect();
+        let commit = runtime().block_on(async move {
+            let proposal = build_core_proposal(inner, action);
+            let simulated = proposal.simulate().await?;
+            simulated.commit(&core_sigs).await
+        });
+        match commit {
+            Ok(c) => {
+                unsafe { *out = chain_commit_to_c(&c) };
+                NET_DECK_OK
+            }
+            Err(e) => {
+                set_last_error_from_sdk(&e);
+                NET_DECK_ERR_CALL_FAILED
+            }
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn net_deck_simulated_free(simulated: *mut NetDeckSimulatedIceProposal) {
+    if simulated.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(simulated);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2059,6 +2633,251 @@ mod tests {
         assert!(json_ptr.is_null(), "expected timeout — no audit item");
         net_deck_audit_stream_free(stream);
         net_deck_audit_query_free(q);
+        net_deck_client_free(client);
+    }
+
+    // =========================================================================
+    // Slice 3 — ICE tests
+    // =========================================================================
+
+    #[test]
+    fn ice_freeze_cluster_factory_returns_proposal_with_issued_at_ms() {
+        let client = make_client(0x30);
+        let mut proposal: *mut NetDeckIceProposal = ptr::null_mut();
+        let status = net_deck_ice_freeze_cluster(client, 60_000, &mut proposal);
+        assert_eq!(status, NET_DECK_OK);
+        assert!(!proposal.is_null());
+        let issued_at_ms = net_deck_ice_proposal_issued_at_ms(proposal);
+        assert!(issued_at_ms > 0);
+        net_deck_ice_proposal_free(proposal);
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn ice_all_factories_succeed() {
+        let client = make_client(0x31);
+        let mut p: *mut NetDeckIceProposal = ptr::null_mut();
+
+        assert_eq!(net_deck_ice_freeze_cluster(client, 60_000, &mut p), NET_DECK_OK);
+        net_deck_ice_proposal_free(p);
+
+        p = ptr::null_mut();
+        assert_eq!(
+            net_deck_ice_flush_avoid_lists(client, NET_DECK_AVOID_SCOPE_GLOBAL, 0, 0, &mut p),
+            NET_DECK_OK
+        );
+        net_deck_ice_proposal_free(p);
+
+        p = ptr::null_mut();
+        assert_eq!(
+            net_deck_ice_flush_avoid_lists(client, NET_DECK_AVOID_SCOPE_LOCAL, 0xCAFE, 0, &mut p),
+            NET_DECK_OK
+        );
+        net_deck_ice_proposal_free(p);
+
+        p = ptr::null_mut();
+        assert_eq!(
+            net_deck_ice_flush_avoid_lists(client, NET_DECK_AVOID_SCOPE_ON_PEER, 0, 0xBEEF, &mut p),
+            NET_DECK_OK
+        );
+        net_deck_ice_proposal_free(p);
+
+        p = ptr::null_mut();
+        assert_eq!(
+            net_deck_ice_force_evict_replica(client, 1, 2, &mut p),
+            NET_DECK_OK
+        );
+        net_deck_ice_proposal_free(p);
+
+        p = ptr::null_mut();
+        let name = "echo";
+        assert_eq!(
+            net_deck_ice_force_restart_daemon(
+                client,
+                3,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                &mut p
+            ),
+            NET_DECK_OK
+        );
+        net_deck_ice_proposal_free(p);
+
+        p = ptr::null_mut();
+        assert_eq!(
+            net_deck_ice_force_cutover(client, 4, 5, &mut p),
+            NET_DECK_OK
+        );
+        net_deck_ice_proposal_free(p);
+
+        p = ptr::null_mut();
+        assert_eq!(net_deck_ice_kill_migration(client, 6, &mut p), NET_DECK_OK);
+        net_deck_ice_proposal_free(p);
+
+        p = ptr::null_mut();
+        assert_eq!(net_deck_ice_thaw_cluster(client, &mut p), NET_DECK_OK);
+        net_deck_ice_proposal_free(p);
+
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn ice_flush_avoid_lists_rejects_invalid_scope_kind() {
+        let client = make_client(0x32);
+        let mut p: *mut NetDeckIceProposal = ptr::null_mut();
+        let status = net_deck_ice_flush_avoid_lists(client, 99, 0, 0, &mut p);
+        assert_eq!(status, NET_DECK_ERR_INVALID_ARG);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "invalid_avoid_scope");
+        net_deck_clear_last_error();
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn ice_simulate_advances_to_simulated_with_blast_radius_and_hash() {
+        let client = make_client(0x33);
+        let mut proposal: *mut NetDeckIceProposal = ptr::null_mut();
+        assert_eq!(
+            net_deck_ice_freeze_cluster(client, 60_000, &mut proposal),
+            NET_DECK_OK
+        );
+
+        let mut simulated: *mut NetDeckSimulatedIceProposal = ptr::null_mut();
+        let status = net_deck_ice_proposal_simulate(proposal, client, &mut simulated);
+        assert_eq!(status, NET_DECK_OK);
+        assert!(!simulated.is_null());
+
+        let issued_at_ms = net_deck_simulated_issued_at_ms(simulated);
+        assert!(issued_at_ms > 0);
+
+        let json_ptr = net_deck_simulated_blast_radius(simulated);
+        assert!(!json_ptr.is_null());
+        let json = unsafe { CStr::from_ptr(json_ptr).to_string_lossy().into_owned() };
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert!(parsed.is_object());
+        net_deck_free_string(json_ptr);
+
+        let mut hash = [0u8; 32];
+        let status = net_deck_simulated_blast_hash(simulated, hash.as_mut_ptr());
+        assert_eq!(status, NET_DECK_OK);
+        // Blake3 hashes are not all zero unless the input was
+        // a specific bytestring; even an empty blast radius
+        // produces a non-trivial digest.
+        assert_ne!(hash, [0u8; 32]);
+
+        net_deck_simulated_free(simulated);
+        net_deck_ice_proposal_free(proposal);
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn ice_double_simulate_returns_already_simulated() {
+        let client = make_client(0x34);
+        let mut proposal: *mut NetDeckIceProposal = ptr::null_mut();
+        assert_eq!(
+            net_deck_ice_freeze_cluster(client, 60_000, &mut proposal),
+            NET_DECK_OK
+        );
+
+        let mut simulated: *mut NetDeckSimulatedIceProposal = ptr::null_mut();
+        assert_eq!(
+            net_deck_ice_proposal_simulate(proposal, client, &mut simulated),
+            NET_DECK_OK
+        );
+        net_deck_simulated_free(simulated);
+
+        // Second simulate on the same (consumed) proposal.
+        simulated = ptr::null_mut();
+        let status = net_deck_ice_proposal_simulate(proposal, client, &mut simulated);
+        assert_eq!(status, NET_DECK_ERR_CALL_FAILED);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "already_simulated");
+        net_deck_clear_last_error();
+
+        net_deck_ice_proposal_free(proposal);
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn ice_commit_with_empty_signatures_returns_insufficient() {
+        let client = make_client(0x35);
+        let mut proposal: *mut NetDeckIceProposal = ptr::null_mut();
+        net_deck_ice_freeze_cluster(client, 60_000, &mut proposal);
+        let mut simulated: *mut NetDeckSimulatedIceProposal = ptr::null_mut();
+        net_deck_ice_proposal_simulate(proposal, client, &mut simulated);
+
+        let mut commit = NetDeckChainCommit::default();
+        let status = net_deck_simulated_commit(simulated, client, ptr::null(), 0, &mut commit);
+        assert_eq!(status, NET_DECK_ERR_CALL_FAILED);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "insufficient_signatures");
+        net_deck_clear_last_error();
+
+        net_deck_simulated_free(simulated);
+        net_deck_ice_proposal_free(proposal);
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn ice_commit_with_signature_succeeds_and_consumes_proposal() {
+        let client = make_client(0x36);
+        let mut proposal: *mut NetDeckIceProposal = ptr::null_mut();
+        net_deck_ice_freeze_cluster(client, 60_000, &mut proposal);
+        let mut simulated: *mut NetDeckSimulatedIceProposal = ptr::null_mut();
+        net_deck_ice_proposal_simulate(proposal, client, &mut simulated);
+
+        let sig_bytes = [0x00u8; 64];
+        let sig = NetDeckOperatorSignature {
+            operator_id: 1,
+            signature_ptr: sig_bytes.as_ptr(),
+            signature_len: 64,
+        };
+        let mut commit = NetDeckChainCommit::default();
+        let status = net_deck_simulated_commit(simulated, client, &sig, 1, &mut commit);
+        assert_eq!(status, NET_DECK_OK);
+        assert_eq!(commit.event_kind, NET_DECK_EVENT_KIND_UNKNOWN);
+        // FreezeCluster isn't in the admin-event kind discriminator
+        // (it lives in ICE land); the deck SDK reports
+        // `event_kind = "freeze_cluster"` which maps to UNKNOWN in
+        // the C constant set.
+        assert!(commit.commit_id > 0);
+
+        // Second commit — proposal consumed.
+        let mut commit2 = NetDeckChainCommit::default();
+        let status = net_deck_simulated_commit(simulated, client, &sig, 1, &mut commit2);
+        assert_eq!(status, NET_DECK_ERR_CALL_FAILED);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "already_committed");
+        net_deck_clear_last_error();
+
+        net_deck_simulated_free(simulated);
+        net_deck_ice_proposal_free(proposal);
+        net_deck_client_free(client);
+    }
+
+    #[test]
+    fn ice_commit_rejects_malformed_signature_buffer() {
+        let client = make_client(0x37);
+        let mut proposal: *mut NetDeckIceProposal = ptr::null_mut();
+        net_deck_ice_freeze_cluster(client, 60_000, &mut proposal);
+        let mut simulated: *mut NetDeckSimulatedIceProposal = ptr::null_mut();
+        net_deck_ice_proposal_simulate(proposal, client, &mut simulated);
+
+        // signature_len = 0 → invalid.
+        let sig = NetDeckOperatorSignature {
+            operator_id: 1,
+            signature_ptr: ptr::null(),
+            signature_len: 0,
+        };
+        let mut commit = NetDeckChainCommit::default();
+        let status = net_deck_simulated_commit(simulated, client, &sig, 1, &mut commit);
+        assert_eq!(status, NET_DECK_ERR_INVALID_ARG);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "invalid_signature");
+        net_deck_clear_last_error();
+
+        net_deck_simulated_free(simulated);
+        net_deck_ice_proposal_free(proposal);
         net_deck_client_free(client);
     }
 }

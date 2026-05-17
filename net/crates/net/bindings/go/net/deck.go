@@ -255,6 +255,38 @@ extern int net_deck_audit_stream_next(
     char** out
 );
 extern void net_deck_audit_stream_free(NetDeckAuditStream* stream);
+
+// Slice 3 — ICE break-glass surface.
+#define NET_DECK_AVOID_SCOPE_GLOBAL  0
+#define NET_DECK_AVOID_SCOPE_LOCAL   1
+#define NET_DECK_AVOID_SCOPE_ON_PEER 2
+
+typedef struct {
+    uint64_t operator_id;
+    const uint8_t* signature_ptr;
+    size_t signature_len;
+} NetDeckOperatorSignature;
+
+typedef struct NetDeckIceProposal NetDeckIceProposal;
+typedef struct NetDeckSimulatedIceProposal NetDeckSimulatedIceProposal;
+
+extern int net_deck_ice_freeze_cluster(const NetDeckClient* client, uint64_t ttl_ms, NetDeckIceProposal** out);
+extern int net_deck_ice_flush_avoid_lists(const NetDeckClient* client, int scope_kind, uint64_t scope_node, uint64_t scope_peer, NetDeckIceProposal** out);
+extern int net_deck_ice_force_evict_replica(const NetDeckClient* client, uint64_t chain, uint64_t victim, NetDeckIceProposal** out);
+extern int net_deck_ice_force_restart_daemon(const NetDeckClient* client, uint64_t id, const char* name_ptr, size_t name_len, NetDeckIceProposal** out);
+extern int net_deck_ice_force_cutover(const NetDeckClient* client, uint64_t chain, uint64_t target, NetDeckIceProposal** out);
+extern int net_deck_ice_kill_migration(const NetDeckClient* client, uint64_t migration, NetDeckIceProposal** out);
+extern int net_deck_ice_thaw_cluster(const NetDeckClient* client, NetDeckIceProposal** out);
+
+extern uint64_t net_deck_ice_proposal_issued_at_ms(const NetDeckIceProposal* proposal);
+extern void net_deck_ice_proposal_free(NetDeckIceProposal* proposal);
+extern int net_deck_ice_proposal_simulate(NetDeckIceProposal* proposal, const NetDeckClient* client, NetDeckSimulatedIceProposal** out);
+
+extern uint64_t net_deck_simulated_issued_at_ms(const NetDeckSimulatedIceProposal* simulated);
+extern char* net_deck_simulated_blast_radius(const NetDeckSimulatedIceProposal* simulated);
+extern int net_deck_simulated_blast_hash(const NetDeckSimulatedIceProposal* simulated, uint8_t* out_buf);
+extern int net_deck_simulated_commit(NetDeckSimulatedIceProposal* simulated, const NetDeckClient* client, const NetDeckOperatorSignature* sigs_ptr, size_t sigs_count, NetDeckChainCommit* out);
+extern void net_deck_simulated_free(NetDeckSimulatedIceProposal* simulated);
 */
 import "C"
 
@@ -1146,6 +1178,272 @@ func (s *DeckAuditStream) Free() {
 		return
 	}
 	C.net_deck_audit_stream_free(s.ptr)
+	s.ptr = nil
+	runtime.SetFinalizer(s, nil)
+}
+
+// =====================================================================
+// Slice 3 — ICE break-glass surface
+// =====================================================================
+
+// AvoidScope is the discriminator for `Ice.FlushAvoidLists`.
+// Use the constructors `AvoidScopeGlobal`,
+// `AvoidScopeLocal(nodeID)`, `AvoidScopeOnPeer(peerID)`.
+type AvoidScope struct {
+	kind C.int
+	node uint64
+	peer uint64
+}
+
+func AvoidScopeGlobal() AvoidScope {
+	return AvoidScope{kind: C.NET_DECK_AVOID_SCOPE_GLOBAL}
+}
+
+func AvoidScopeLocal(node uint64) AvoidScope {
+	return AvoidScope{kind: C.NET_DECK_AVOID_SCOPE_LOCAL, node: node}
+}
+
+func AvoidScopeOnPeer(peer uint64) AvoidScope {
+	return AvoidScope{kind: C.NET_DECK_AVOID_SCOPE_ON_PEER, peer: peer}
+}
+
+// DeckOperatorSignature is one entry in the bundle passed to
+// `SimulatedIceProposal.Commit`. `Signature` must be exactly 64
+// ed25519 bytes.
+type DeckOperatorSignature struct {
+	OperatorID uint64
+	Signature  []byte
+}
+
+// DeckIceCommands — operator-side break-glass surface. Every
+// factory returns a `*DeckIceProposal` that must be `.Simulate()`-d
+// before commit.
+type DeckIceCommands struct {
+	client *DeckClient
+}
+
+// Ice returns the break-glass surface for the deck client.
+func (c *DeckClient) Ice() *DeckIceCommands {
+	if c == nil || c.ptr == nil {
+		return nil
+	}
+	return &DeckIceCommands{client: c}
+}
+
+func (ic *DeckIceCommands) FreezeCluster(ttlMs uint64) (*DeckIceProposal, error) {
+	if ic == nil || ic.client == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var raw *C.NetDeckIceProposal
+	if err := deckStatusToError(C.net_deck_ice_freeze_cluster(ic.client.ptr, C.uint64_t(ttlMs), &raw)); err != nil {
+		return nil, err
+	}
+	p := newIceProposal(raw)
+	return p, nil
+}
+
+func (ic *DeckIceCommands) FlushAvoidLists(scope AvoidScope) (*DeckIceProposal, error) {
+	if ic == nil || ic.client == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var raw *C.NetDeckIceProposal
+	if err := deckStatusToError(C.net_deck_ice_flush_avoid_lists(ic.client.ptr, scope.kind, C.uint64_t(scope.node), C.uint64_t(scope.peer), &raw)); err != nil {
+		return nil, err
+	}
+	return newIceProposal(raw), nil
+}
+
+func (ic *DeckIceCommands) ForceEvictReplica(chain, victim uint64) (*DeckIceProposal, error) {
+	if ic == nil || ic.client == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var raw *C.NetDeckIceProposal
+	if err := deckStatusToError(C.net_deck_ice_force_evict_replica(ic.client.ptr, C.uint64_t(chain), C.uint64_t(victim), &raw)); err != nil {
+		return nil, err
+	}
+	return newIceProposal(raw), nil
+}
+
+// ForceRestartDaemon — `name` is the daemon's `MeshDaemon::name()`.
+func (ic *DeckIceCommands) ForceRestartDaemon(id uint64, name string) (*DeckIceProposal, error) {
+	if ic == nil || ic.client == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var raw *C.NetDeckIceProposal
+	var namePtr *C.char
+	var nameLen C.size_t
+	if len(name) > 0 {
+		nameBytes := []byte(name)
+		namePtr = (*C.char)(unsafe.Pointer(&nameBytes[0]))
+		nameLen = C.size_t(len(nameBytes))
+	}
+	if err := deckStatusToError(C.net_deck_ice_force_restart_daemon(ic.client.ptr, C.uint64_t(id), namePtr, nameLen, &raw)); err != nil {
+		return nil, err
+	}
+	return newIceProposal(raw), nil
+}
+
+func (ic *DeckIceCommands) ForceCutover(chain, target uint64) (*DeckIceProposal, error) {
+	if ic == nil || ic.client == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var raw *C.NetDeckIceProposal
+	if err := deckStatusToError(C.net_deck_ice_force_cutover(ic.client.ptr, C.uint64_t(chain), C.uint64_t(target), &raw)); err != nil {
+		return nil, err
+	}
+	return newIceProposal(raw), nil
+}
+
+func (ic *DeckIceCommands) KillMigration(migration uint64) (*DeckIceProposal, error) {
+	if ic == nil || ic.client == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var raw *C.NetDeckIceProposal
+	if err := deckStatusToError(C.net_deck_ice_kill_migration(ic.client.ptr, C.uint64_t(migration), &raw)); err != nil {
+		return nil, err
+	}
+	return newIceProposal(raw), nil
+}
+
+func (ic *DeckIceCommands) ThawCluster() (*DeckIceProposal, error) {
+	if ic == nil || ic.client == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var raw *C.NetDeckIceProposal
+	if err := deckStatusToError(C.net_deck_ice_thaw_cluster(ic.client.ptr, &raw)); err != nil {
+		return nil, err
+	}
+	return newIceProposal(raw), nil
+}
+
+// DeckIceProposal — pre-simulation. No `Commit` method —
+// typestate enforces `Simulate()` first.
+type DeckIceProposal struct {
+	ptr *C.NetDeckIceProposal
+}
+
+func newIceProposal(raw *C.NetDeckIceProposal) *DeckIceProposal {
+	p := &DeckIceProposal{ptr: raw}
+	runtime.SetFinalizer(p, func(p *DeckIceProposal) { p.Free() })
+	return p
+}
+
+func (p *DeckIceProposal) IssuedAtMs() uint64 {
+	if p == nil || p.ptr == nil {
+		return 0
+	}
+	return uint64(C.net_deck_ice_proposal_issued_at_ms(p.ptr))
+}
+
+// Simulate consumes the proposal and runs the substrate
+// simulator. Subsequent calls return `DeckSdkError(kind:
+// "already_simulated")`. The caller still must `Free()` the
+// proposal husk after Simulate.
+func (p *DeckIceProposal) Simulate(client *DeckClient) (*DeckSimulatedIceProposal, error) {
+	if p == nil || p.ptr == nil || client == nil || client.ptr == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	var raw *C.NetDeckSimulatedIceProposal
+	if err := deckStatusToError(C.net_deck_ice_proposal_simulate(p.ptr, client.ptr, &raw)); err != nil {
+		return nil, err
+	}
+	s := &DeckSimulatedIceProposal{ptr: raw}
+	runtime.SetFinalizer(s, func(s *DeckSimulatedIceProposal) { s.Free() })
+	return s, nil
+}
+
+func (p *DeckIceProposal) Free() {
+	if p == nil || p.ptr == nil {
+		return
+	}
+	C.net_deck_ice_proposal_free(p.ptr)
+	p.ptr = nil
+	runtime.SetFinalizer(p, nil)
+}
+
+// DeckSimulatedIceProposal — the only handle exposing Commit.
+type DeckSimulatedIceProposal struct {
+	ptr *C.NetDeckSimulatedIceProposal
+}
+
+func (s *DeckSimulatedIceProposal) IssuedAtMs() uint64 {
+	if s == nil || s.ptr == nil {
+		return 0
+	}
+	return uint64(C.net_deck_simulated_issued_at_ms(s.ptr))
+}
+
+// BlastRadius returns the simulator's pre-execution preview as
+// a parsed map. JSON parsing happens Go-side; the FFI emits a
+// heap CString which we free immediately.
+func (s *DeckSimulatedIceProposal) BlastRadius() (map[string]any, error) {
+	if s == nil || s.ptr == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	jsonPtr := C.net_deck_simulated_blast_radius(s.ptr)
+	if jsonPtr == nil {
+		return nil, wrapDeckError(ErrDeckCallFailed)
+	}
+	defer C.net_deck_free_string(jsonPtr)
+	raw := C.GoString(jsonPtr)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil, fmt.Errorf("%w: blast JSON parse: %v", ErrDeckCallFailed, err)
+	}
+	return parsed, nil
+}
+
+// BlastHash returns the 32-byte Blake3 digest signers must cover.
+func (s *DeckSimulatedIceProposal) BlastHash() ([32]byte, error) {
+	var out [32]byte
+	if s == nil || s.ptr == nil {
+		return out, ErrDeckInvalidArg
+	}
+	status := C.net_deck_simulated_blast_hash(s.ptr, (*C.uint8_t)(unsafe.Pointer(&out[0])))
+	if err := deckStatusToError(status); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// Commit publishes the simulated proposal with the supplied
+// signatures. Consumes the proposal — subsequent calls return
+// `DeckSdkError(kind: "already_committed")`.
+func (s *DeckSimulatedIceProposal) Commit(client *DeckClient, signatures []DeckOperatorSignature) (ChainCommit, error) {
+	if s == nil || s.ptr == nil || client == nil || client.ptr == nil {
+		return ChainCommit{}, ErrDeckInvalidArg
+	}
+	// Build the C-side signature array. We keep the Go-side
+	// byte slices alive for the duration of the call by holding
+	// references to them in a local slice.
+	cSigs := make([]C.NetDeckOperatorSignature, len(signatures))
+	for i, sig := range signatures {
+		if len(sig.Signature) == 0 {
+			return ChainCommit{}, fmt.Errorf("%w: signature %d has empty bytes", ErrDeckInvalidArg, i)
+		}
+		cSigs[i] = C.NetDeckOperatorSignature{
+			operator_id:    C.uint64_t(sig.OperatorID),
+			signature_ptr:  (*C.uint8_t)(unsafe.Pointer(&sig.Signature[0])),
+			signature_len:  C.size_t(len(sig.Signature)),
+		}
+	}
+	var sigsPtr *C.NetDeckOperatorSignature
+	if len(cSigs) > 0 {
+		sigsPtr = &cSigs[0]
+	}
+	var commit C.NetDeckChainCommit
+	status := C.net_deck_simulated_commit(s.ptr, client.ptr, sigsPtr, C.size_t(len(signatures)), &commit)
+	if err := deckStatusToError(status); err != nil {
+		return ChainCommit{}, err
+	}
+	return chainCommitFromC(commit), nil
+}
+
+func (s *DeckSimulatedIceProposal) Free() {
+	if s == nil || s.ptr == nil {
+		return
+	}
+	C.net_deck_simulated_free(s.ptr)
 	s.ptr = nil
 	runtime.SetFinalizer(s, nil)
 }
