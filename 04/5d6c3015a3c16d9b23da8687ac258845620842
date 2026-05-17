@@ -1,0 +1,25 @@
+net/crates/net/bindings/python/src/deck.rs
+  s_ac2931afe38c4a::t_51491a336aaf32 674-697
+net/crates/net/sdk-py/src/net_sdk/deck.py
+  s_ac2931afe38c4a::t_eac0474017eb87 428-430,435-445,462-493
+net/crates/net/bindings/python/tests/test_deck.py
+  s_ac2931afe38c4a::t_4fd9eba3e54345 121-142
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_17_MESHOS_SDKS.md
+  s_ac2931afe38c4a::t_98ddc39a2ef643 469
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "045d6c3015a3c16d9b23da8687ac258845620842",
+  "prompts": {},
+  "sessions": {
+    "s_ac2931afe38c4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59271d48-d72a-4337-b857-962412f18343",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
