@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/redis.rs
+  s_f641e31a81af58::t_f936127df1211e 568-578,580,582-585
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "fca86c01a137fd1c5eeffdd4999b9228991a4cfe",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
