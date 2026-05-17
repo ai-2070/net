@@ -1,0 +1,19 @@
+net/crates/net/Cargo.toml
+  s_003b573b78d73d::t_04da08ffcfdd64 42-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "78005489a017be6b02a974f2212dab6bfeba8864",
+  "prompts": {},
+  "sessions": {
+    "s_003b573b78d73d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0c3f523e-cae1-41eb-82c0-affb976b6594",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
