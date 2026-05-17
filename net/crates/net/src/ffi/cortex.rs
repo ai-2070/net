@@ -2976,8 +2976,8 @@ pub extern "C" fn net_netdb_open_from_snapshot(
     }
 }
 
-/// Capture a per-model snapshot bundle. On success allocates a Vec<u8>
-/// and hands its parts to the caller — caller MUST free via
+/// Capture a per-model snapshot bundle. On success allocates a
+/// `Vec<u8>` and hands its parts to the caller — caller MUST free via
 /// [`net_netdb_free_bundle`]. The wire format is the postcard encoding
 /// of `NetDbSnapshot` and round-trips with the Rust + napi + PyO3
 /// snapshot calls.
