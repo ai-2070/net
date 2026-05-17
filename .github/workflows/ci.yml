@@ -720,17 +720,27 @@ jobs:
       # napi-rs links `napi_*` runtime symbols at load time (Node
       # provides them inside its embedded V8); a standalone
       # `cargo test --lib` binary can't resolve them at link time.
-      # Tell `ld` to leave undefined symbols alone for the node
-      # crate only — the test binary never *invokes* the napi
-      # entry points (cargo test runs `#[cfg(test)] mod tests`
-      # blocks that touch pure-Rust helpers like `bigint_u64`).
+      # Two flags work in concert:
+      #   --unresolved-symbols=ignore-all  — tolerate at link time
+      #   -z,lazy                          — tolerate at LOAD time
+      # The second flag is the one this commit adds. Modern Ubuntu
+      # toolchains default to `-z,now` as a hardening posture,
+      # which makes the dynamic linker resolve every symbol
+      # eagerly at process startup and crash with
+      # `symbol lookup error: undefined symbol: napi_get_reference_value`
+      # before main() runs. `-z,lazy` reverts to lazy resolution,
+      # so napi symbols are only touched if the test code path
+      # calls them — and the tests only exercise pure-Rust
+      # helpers (`bigint_u64`, capability conversion, etc.) that
+      # never reach napi.
+      #
       # Other matrix members don't need this and would silently
       # mask real link-time bugs if it were set globally.
       - name: Run tests (node — napi runtime symbols deferred)
         if: matrix.crate.name == 'node'
         working-directory: ${{ matrix.crate.path }}
         env:
-          RUSTFLAGS: "-C link-arg=-Wl,--unresolved-symbols=ignore-all"
+          RUSTFLAGS: "-C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,-z,lazy"
         run: cargo test --lib ${{ matrix.crate.features }}
 
       - name: Run tests
