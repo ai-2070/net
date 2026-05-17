@@ -234,3 +234,118 @@ Mixing prompts with structured data on the same stream breaks `net ice … | jq`
 4. **B1** — test docstring lies about what it asserts.
 
 Everything else is design polish that can be addressed alongside Phase 2.
+
+---
+
+# Second pass — 2026-05-17
+
+All 21 first-pass items addressed (B1–B4, D1–D9, C1–C7). The fresh pass below re-reads the tree post-fixes and surfaces what the first pass missed.
+
+## Fresh concerns
+
+### F1. `ice.rs:341–343` — `e_kind` wraps a value that's never `None`
+
+```rust
+fn e_kind(e: &net_sdk::deck::IceError) -> Option<&'static str> {
+    Some(e.kind)
+}
+```
+
+`IceError` is an alias for `DeckError`, which has `pub kind: &'static str` (`adapter/net/behavior/deck.rs:145–149`). The `Option` layer is dead — `map_ice_error` matches `Some(...)` for every dispatched arm. Take `&'static str` directly and inline `e.kind` at the two call sites.
+
+### F2. `version.rs:30` ignores the global `--output` flag
+
+```rust
+emit_value(OutputFormat::Json, &info)
+```
+
+`main.rs:193` dispatches `Command::Version => commands::version::run().await` with no `output` argument, so `--output yaml net version` silently emits JSON. Either thread `output: Option<OutputFormat>` through and call `resolve_oneshot`, or update the misleading "predates the `--output` global flag" comment.
+
+### F3. `tests/help.rs:38` hardcodes `0.17.0`
+
+```rust
+.stdout(predicate::str::contains("0.17.0"));
+```
+
+The next `Cargo.toml:version` bump silently breaks the test. Substitute `env!("CARGO_PKG_VERSION")` so the assertion tracks the crate version.
+
+### F4. `Cargo.toml:71` — `bytes = "1"` is unused
+
+No file under `cli/src/**` references `bytes::` or `use bytes`. The comment claims "Bytes / hex utilities for identity material" but only `hex` is actually used. Drop the dep.
+
+### F5. `main.rs:169` — `color-eyre` is installed but never propagates anything
+
+```rust
+if let Err(e) = color_eyre::install() {
+    eprintln!("net: failed to install error reporter: {e}");
+    return ExitCode::from(1);
+}
+```
+
+Nothing returns `eyre::Result` and nothing builds a `Report` — every error path uses the typed `CliError`. The installer + the `color-eyre` dep are unused. Drop it, or wire it to actually carry SDK error chains under `-vv`.
+
+### F6. `tests/exit_codes.rs:85–110 code_8_on_ice_confirmation_refused_non_tty` pays substrate boot + couples to simulation
+
+The test boots a `MeshOsDaemonSdk`, calls `proposal.simulate()`, renders the preview JSON, then fails the confirmation gate to assert code 8. If the substrate ever tightens its admin-verifier gate at simulate time, this test starts returning code 5 (OperatorPolicyRejected) without anything else changing. Cheaper fixture: pin code 8 against a path that only exercises the confirmation gate (e.g., a unit test on `prompt_for_yes()` reading `Stdio::null()`).
+
+### F7. `humantime::parse_duration` accepts surprising inputs
+
+```text
+"10 5s"  → 105s   (whitespace eats the unit boundary)
+"1m5"    → 65s    (trailing digits get a default `s` unit)
+"1m1m"   → 120s   (silently sums duplicate units)
+```
+
+The `--help` text claims `1h30m`-style syntax, but the parser is lazier than the documented grammar. Tighten the grammar (no internal whitespace; require a unit on every numeric component) or expand the docstring. Also: `Duration::from_secs(value * 60 * 60 * 24)` wraps silently in release mode at extreme inputs — `checked_mul` would be cleaner.
+
+### F8. Phase 1 / 2 / 3 mutations have zero integration-test coverage
+
+Integration tests only pin exit codes 0, 1, 2, 8. Admin commits (9 verbs), netdb mutations (10 ops), and ICE commits (7 factories) have no end-to-end test. Add one smoke test per category using `--dry-run` round-trips against the in-process supervisor — cheap to write, pins the JSON envelope shape.
+
+### F9. `daemon.rs:73–77` — `#[serde(flatten)]` collision risk worth a doc comment
+
+```rust
+#[derive(Serialize)]
+struct DaemonRow {
+    id: u64,
+    #[serde(flatten)]
+    snapshot: DaemonSnapshot,
+}
+```
+
+`DaemonSnapshot` today (`adapter/net/behavior/meshos/snapshot.rs:211–229`) has no `id` field, so the flatten is safe right now. A future SDK bump that adds `pub id: u64` would produce duplicate JSON keys (serde silently allows — last write wins). Add a one-line guard comment so the next reader knows.
+
+### F10. `ice.rs:298–308` — flatten the nested `if` for readability
+
+clippy doesn't fire (the outer has an `else if`), but the nested-if-without-else reads awkwardly. Equivalent and flatter:
+
+```rust
+if !stdin_is_tty && !common.yes {
+    return Err(...);
+}
+if stdin_is_tty && !prompt_for_yes()? {
+    return Err(...);
+}
+```
+
+## Smaller / cosmetic (second pass)
+
+- **`admin.rs:100`, `ice.rs:154`, `netdb.rs:198`** — `use crate::parsers::parse_u64_flexible;` is buried mid-file, after the attribute macros that use it. Compiles fine (attribute-name resolution sees the import regardless of placement), but stylistically belongs in the file-top import block.
+- **11 subcommands** each declare `#[arg(long, default_value_t = 0x0001)] pub node: u64`. A `pub(crate) const DEFAULT_SUPERVISOR_NODE: u64 = 1;` in `prelude` would document the convention.
+- **`netdb.rs:418–467 run_restore`** never checks that `args.origin` matches the snapshot's origin — silent cross-origin restore. Add a doc-comment caveat at minimum (the SDK type doesn't expose the origin today).
+- **`netdb.rs:603–612`** — `try_exists(...).unwrap_or(false)` swallows permission errors and reports them as "store does not exist". A permission denial gets the wrong remediation message.
+- **`identity.rs:299–301`** — `check_strict_permissions` is a silent no-op on Windows. The companion `enforce_strict_permissions` documents the design ("Operators on Windows manage NTFS ACLs out-of-band"); the check-side should mirror it.
+
+## Priority order before merge (second pass)
+
+1. **F4** — drop unused `bytes` dep (one-line).
+2. **F3** — switch the hardcoded `"0.17.0"` test assertion to `env!`.
+3. **F2** — decide: thread `--output` into `version`, or update the misleading comment.
+4. **F1** — flatten the no-op `Option` around `IceError::kind`.
+
+Phase-2 friendly (no merge block):
+- **F5** — decide whether to wire `color-eyre` end-to-end or remove it.
+- **F8** — add `--dry-run` smoke tests for admin/netdb/ICE verbs.
+- **F7** — tighten or document the humantime parser's accepted grammar.
+
+Verified clean: every B/D/C item from the first pass.
