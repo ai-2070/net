@@ -544,10 +544,35 @@ pub struct PyDeckClient {
     runtime: Arc<Runtime>,
     /// `Some` only when the client owns its private supervisor
     /// (constructed via the `__new__` constructor). The SDK stays
-    /// alive for the client's lifetime; PyO3's drop releases it
-    /// when the Python wrapper is garbage-collected. `None` when
-    /// constructed via `from_meshos` against an external SDK.
+    /// alive for the client's lifetime; the `Drop` impl below
+    /// drains it on GC if the caller never invoked `close()`.
+    /// `None` when constructed via `from_meshos` against an
+    /// external SDK.
     _owned_sdk: Option<CoreSdk>,
+}
+
+impl Drop for PyDeckClient {
+    /// Drain the private supervisor on GC if `close()` wasn't
+    /// called. Without this, a `from_seed`-built client that gets
+    /// garbage-collected abandons its tokio workers rather than
+    /// shutting them down — defeats the point of the `close()`
+    /// fix. `_owned_sdk` is `None` after a successful `close()` or
+    /// for `from_meshos` builds, so the Drop is a no-op in both
+    /// cases.
+    ///
+    /// Errors are silently discarded — Drop must not panic.
+    /// `catch_unwind` wraps the `block_on` because a substrate
+    /// panic during shutdown would otherwise propagate out of
+    /// the Drop and abort the process.
+    fn drop(&mut self) {
+        let Some(sdk) = self._owned_sdk.take() else {
+            return;
+        };
+        let runtime = self.runtime.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = runtime.block_on(sdk.shutdown());
+        }));
+    }
 }
 
 #[pymethods]
