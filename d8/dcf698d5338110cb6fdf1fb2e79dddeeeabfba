@@ -1,0 +1,20 @@
+net/crates/net/sdk/tests/mesh_nat_traversal.rs
+  s_5af7ced268385a::t_7f098a23d949eb 277-281,283-284
+  s_5af7ced268385a::t_f8cadac7704495 215-219
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "d8dcf698d5338110cb6fdf1fb2e79dddeeeabfba",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
