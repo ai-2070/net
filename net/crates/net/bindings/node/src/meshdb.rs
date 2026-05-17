@@ -1,3 +1,10 @@
+// `#[napi]` exports functions / structs to JS but leaves them "unused"
+// from Rust's POV, so clippy's dead-code analysis fires when the
+// node binding is linted with `--all-targets` (which compiles the
+// `lib test` configuration). Suppress at file scope — matches the
+// pattern in `meshos.rs`.
+#![allow(dead_code)]
+
 //! Node bindings for MeshDB — federated query layer.
 //!
 //! # Slice 1 scope
