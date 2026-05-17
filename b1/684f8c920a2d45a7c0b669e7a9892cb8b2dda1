@@ -1,0 +1,33 @@
+net/crates/net/bindings/python/tests/test_deck.py
+  s_5af7ced268385a::t_df2d08c3b2e524 281-306,312,314,316-318,338-359,365-368,373-435
+  s_5af7ced268385a::t_142535753040ba 360-364,369-372
+  s_5af7ced268385a::t_b2961dddc4e249 307-311,313,315,319-337
+net/crates/net/sdk-py/src/net_sdk/deck.py
+  s_5af7ced268385a::t_f3de1de70f26f5 282-396
+  s_5af7ced268385a::t_b9b7b74d52d80e 454-482
+  s_5af7ced268385a::t_c6658af04dfd37 46-59,79-87
+  s_5af7ced268385a::t_48234ae72f2369 34
+  s_5af7ced268385a::t_dfe100d8ea19e5 138-186
+net/crates/net/bindings/python/src/deck.rs
+  s_5af7ced268385a::t_90c9f7ace437ff 899-901
+  s_5af7ced268385a::t_24961b37939217 40-43,46
+  s_5af7ced268385a::t_7e274fa2a3e9ed 569-616,624-898,902-946
+net/crates/net/bindings/python/src/lib.rs
+  s_5af7ced268385a::t_02a3c1bf2244cf 2367-2370
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "b1684f8c920a2d45a7c0b669e7a9892cb8b2dda1",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
