@@ -48,10 +48,12 @@ use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::behavior::meshos::{
     blast_radius_hash, ice_proposal_signing_payload, AdminVerifier as CoreAdminVerifier,
     AvoidScope as CoreAvoidScope, ChainId as CoreChainId, DaemonRef as CoreDaemonRef,
-    MeshOsSnapshot, MigrationId as CoreMigrationId, OperatorRegistry as CoreOperatorRegistry,
+    LoggingDispatcher, MeshOsDaemonSdk as CoreSdk, MeshOsSnapshot,
+    MigrationId as CoreMigrationId, OperatorRegistry as CoreOperatorRegistry,
     OperatorSignature as CoreOperatorSignature, VerifyError as CoreVerifyError,
 };
 use net::adapter::net::identity::EntityId;
+use net::adapter::net::EntityKeypair;
 
 use futures::StreamExt;
 
@@ -532,17 +534,94 @@ impl PyAdminCommands {
 // =========================================================================
 
 /// Operator-facing handle to the cluster's admin / snapshot / log /
-/// audit surfaces. Construct via `from_meshos(sdk, identity)`
-/// against a running `MeshOsDaemonSdk`; the deck client borrows
-/// the supervisor runtime.
+/// audit surfaces. Construct via `DeckClient(...)` for the standalone
+/// "operator-only" mode (the binding owns the supervisor), or via
+/// `from_meshos(sdk, identity)` against an externally-managed
+/// `MeshOsDaemonSdk`.
 #[pyclass(name = "DeckClient", module = "net._net")]
 pub struct PyDeckClient {
     client: Arc<CoreClient>,
     runtime: Arc<Runtime>,
+    /// `Some` only when the client owns its private supervisor
+    /// (constructed via the `__new__` constructor). The SDK stays
+    /// alive for the client's lifetime; PyO3's drop releases it
+    /// when the Python wrapper is garbage-collected. `None` when
+    /// constructed via `from_meshos` against an external SDK.
+    _owned_sdk: Option<CoreSdk>,
 }
 
 #[pymethods]
 impl PyDeckClient {
+    /// Construct a deck client owning a private supervisor runtime.
+    /// Mirrors the cdylib's `net_deck_client_new` ("operator-only
+    /// mode" per `net_deck.h`) for Python consumers who don't
+    /// already have a `MeshOsDaemonSdk` to compose against.
+    ///
+    /// `operator_seed` must be exactly 32 bytes of ed25519 seed
+    /// material — the operator id is derived as the keypair's
+    /// origin hash. `meshos_config` / `deck_config` accept the
+    /// same dict shapes as the standalone factories; pass `None`
+    /// for substrate defaults.
+    #[new]
+    #[pyo3(signature = (operator_seed, meshos_config=None, deck_config=None))]
+    fn new(
+        py: Python<'_>,
+        operator_seed: &Bound<'_, PyBytes>,
+        meshos_config: Option<&Bound<'_, PyDict>>,
+        deck_config: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
+        let seed_bytes = operator_seed.as_bytes();
+        if seed_bytes.len() != 32 {
+            return Err(deck_err(
+                py,
+                "invalid_argument",
+                &format!(
+                    "operator_seed must be exactly 32 bytes; got {}",
+                    seed_bytes.len()
+                ),
+            ));
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(seed_bytes);
+        let keypair = EntityKeypair::from_bytes(seed);
+        let identity = CoreIdentity::from_keypair(keypair);
+
+        let sdk_cfg = crate::meshos::meshos_config_from_dict(py, meshos_config)?;
+        let deck_cfg = config_from_dict(py, deck_config)?;
+
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    deck_err(
+                        py,
+                        "runtime_start_failed",
+                        &format!("failed to build tokio runtime: {e}"),
+                    )
+                })?,
+        );
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        // Enter the runtime before `CoreSdk::start` so its internal
+        // `tokio::spawn` lands on the runtime we own.
+        let sdk = {
+            let _enter = runtime.enter();
+            CoreSdk::start(sdk_cfg, dispatcher)
+        };
+        let core_client = CoreClient::new(
+            sdk.runtime().handle_clone(),
+            sdk.runtime().snapshot_reader().clone(),
+            identity,
+            deck_cfg,
+        );
+
+        Ok(Self {
+            client: Arc::new(core_client),
+            runtime,
+            _owned_sdk: Some(sdk),
+        })
+    }
+
     /// Construct against a running `MeshOsDaemonSdk`. Reuses the
     /// SDK's tokio runtime so streams + admin commits run on the
     /// same supervisor scheduler.
@@ -581,6 +660,7 @@ impl PyDeckClient {
         Ok(Self {
             client: Arc::new(core_client),
             runtime,
+            _owned_sdk: None,
         })
     }
 

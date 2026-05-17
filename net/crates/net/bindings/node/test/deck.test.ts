@@ -92,6 +92,39 @@ d('Deck SDK operator-side bindings (Phase 5 slice 1)', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Standalone constructor (operator-only mode — mirrors net_deck_client_new)
+  // -------------------------------------------------------------------------
+
+  it('DeckClient.new builds a standalone client from an operator seed', async () => {
+    const seed = Buffer.alloc(32, 0x55);
+    const client = await DeckClient.new(seed);
+    try {
+      const identity = client.identity();
+      // Same seed must derive the same operator id as
+      // OperatorIdentity.fromSeed.
+      const reference = OperatorIdentity.fromSeed(seed);
+      expect(identity.operatorId).toBe(reference.operatorId);
+      // The supervisor is alive — status() returns a parseable
+      // snapshot rather than throwing already_shutdown.
+      const snap = client.status();
+      expect(typeof snap).toBe('string');
+      expect(typeof JSON.parse(snap)).toBe('object');
+    } finally {
+      // No explicit teardown yet (close() lands in a follow-up).
+      // The supervisor releases on GC.
+    }
+  });
+
+  it('DeckClient.new rejects a wrong-length seed with invalid_argument', async () => {
+    try {
+      await DeckClient.new(Buffer.alloc(31, 0x55));
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(parseKind(e)).toBe('invalid_argument');
+    }
+  });
+
+  // -------------------------------------------------------------------------
   // status / statusSummary
   // -------------------------------------------------------------------------
 

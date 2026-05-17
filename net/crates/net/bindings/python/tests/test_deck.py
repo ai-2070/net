@@ -85,6 +85,39 @@ def test_deck_client_rejects_shutdown_meshos_sdk() -> None:
     assert excinfo.value.kind == "already_shutdown"
 
 
+# -------------------------------------------------------------------------
+# Standalone constructor (operator-only mode — mirrors net_deck_client_new)
+# -------------------------------------------------------------------------
+
+
+def test_deck_client_standalone_constructor_from_seed() -> None:
+    seed = b"\x55" * 32
+    client = DeckClient(seed)
+    # Same seed must derive the same operator id as OperatorIdentity.from_seed.
+    expected = OperatorIdentity.from_seed(seed)
+    assert client.identity().operator_id == expected.operator_id
+    # The supervisor is alive — status() returns a parseable
+    # snapshot rather than raising already_shutdown.
+    snap = json.loads(client.status())
+    assert isinstance(snap, dict)
+
+
+def test_deck_client_standalone_constructor_rejects_wrong_seed_length() -> None:
+    with pytest.raises(DeckSdkError) as excinfo:
+        DeckClient(b"\x55" * 31)
+    assert excinfo.value.kind == "invalid_argument"
+
+
+def test_deck_client_standalone_constructor_accepts_config_dicts() -> None:
+    seed = b"\x56" * 32
+    client = DeckClient(
+        seed,
+        {"this_node": 0xABCD, "tick_interval_ms": 50},
+        {"snapshot_poll_interval_ms": 25, "ice_signature_threshold": 1},
+    )
+    assert client.identity().operator_id == OperatorIdentity.from_seed(seed).operator_id
+
+
 def test_deck_client_accepts_config_dict() -> None:
     sdk = MeshOsDaemonSdk.start()
     try:

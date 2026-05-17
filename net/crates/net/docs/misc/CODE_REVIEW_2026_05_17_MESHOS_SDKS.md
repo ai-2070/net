@@ -461,7 +461,7 @@ Test breadth is good (~125 tests across TS/Py for the two SDKs, plus C examples)
 
 | Severity | Action |
 |---|---|
-| Real bug | Add `net_deck_client_new` equivalent to Node + Python (item 1). |
+| Done | Node `DeckClient.new(seed, meshosConfig?, deckConfig?)` and Python `DeckClient(seed, meshos_config=None, deck_config=None)` factories now construct a standalone client owning a private supervisor (parity with the cdylib's `net_deck_client_new`). Regression tests in both language test suites (item 1). |
 | Done | `build_core_proposal` returns `Err("unknown_action")` for unmapped variants in all three FFIs (Node / Python / Go); callers `?`-bubble through their respective error envelopes (item 2). |
 | Done | `NetDeckIceProposal` now carries a `consumed: bool` flag (matching `SimulatedIceProposal`); `issued_at_ms` survives `_simulate` consumption. Regression: `ice_issued_at_ms_survives_consumption_by_simulate` (item 3). |
 | Verify | Audit whether `commit` re-running `simulate` is safe under cluster-state movement (item 4). |

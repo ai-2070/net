@@ -42,6 +42,9 @@ use net::adapter::net::behavior::deck::{
     OperatorIdentity as CoreIdentity, SnapshotStream as CoreSnapshotStream, StatusSummary,
     StatusSummaryStream as CoreStatusStream,
 };
+use net::adapter::net::behavior::meshos::{
+    LoggingDispatcher, MeshOsConfig, MeshOsDaemonSdk as CoreSdk,
+};
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::behavior::meshos::{
     blast_radius_hash, ice_proposal_signing_payload, AdminVerifier as CoreAdminVerifier,
@@ -509,15 +512,78 @@ impl AdminCommands {
 // =========================================================================
 
 /// Operator-facing handle to the cluster's admin / snapshot / log /
-/// audit surfaces. Construct via `fromMeshos(sdk, identity)`
-/// against a running `MeshOsDaemonSdk`.
+/// audit surfaces. Construct via `DeckClient.new(...)` for the
+/// standalone "operator-only" mode (binding owns the supervisor),
+/// or via `fromMeshos(sdk, identity)` against an externally-managed
+/// `MeshOsDaemonSdk`.
 #[napi]
 pub struct DeckClient {
     client: Arc<CoreClient>,
+    /// `Some` only when the client owns its private supervisor
+    /// runtime (constructed via `DeckClient.new`); `None` when
+    /// built via `fromMeshos` against an externally-managed SDK.
+    /// Kept alive for the client's lifetime so the supervisor's
+    /// tokio tasks + sockets stay up; the napi GC's drop runs
+    /// the SDK's own teardown.
+    _owned_sdk: Option<tokio::sync::Mutex<Option<CoreSdk>>>,
 }
 
 #[napi]
 impl DeckClient {
+    /// Construct a deck client owning a private supervisor runtime.
+    /// Mirrors the cdylib's `net_deck_client_new` ("operator-only
+    /// mode" per `net_deck.h`) for Node consumers who don't already
+    /// have a `MeshOsDaemonSdk` to compose against.
+    ///
+    /// `operatorSeed` must be exactly 32 bytes of ed25519 seed
+    /// material — the operator id is derived as the keypair's
+    /// origin hash. `meshosConfig` / `deckConfig` accept the same
+    /// shapes as the standalone factories; pass `null` for
+    /// substrate defaults.
+    #[napi(factory)]
+    pub async fn new(
+        operator_seed: Buffer,
+        meshos_config: Option<crate::meshos::MeshOsConfigJs>,
+        deck_config: Option<DeckClientConfigJs>,
+    ) -> Result<DeckClient> {
+        if operator_seed.len() != 32 {
+            return Err(deck_err(
+                "invalid_argument",
+                format!(
+                    "operatorSeed must be exactly 32 bytes; got {}",
+                    operator_seed.len()
+                ),
+            ));
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&operator_seed);
+        let keypair = EntityKeypair::from_bytes(seed);
+        let identity = CoreIdentity::from_keypair(keypair);
+
+        let sdk_cfg = match meshos_config {
+            Some(c) => c.into_core()?,
+            None => MeshOsConfig::default(),
+        };
+        let deck_cfg = match deck_config {
+            Some(c) => c.into_core()?,
+            None => CoreConfig::default(),
+        };
+
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let sdk = CoreSdk::start(sdk_cfg, dispatcher);
+        let core_client = CoreClient::new(
+            sdk.runtime().handle_clone(),
+            sdk.runtime().snapshot_reader().clone(),
+            identity,
+            deck_cfg,
+        );
+
+        Ok(DeckClient {
+            client: Arc::new(core_client),
+            _owned_sdk: Some(tokio::sync::Mutex::new(Some(sdk))),
+        })
+    }
+
     /// Construct against a running `MeshOsDaemonSdk`. The deck
     /// client reuses the SDK's tokio runtime, so streams + admin
     /// commits run on the same supervisor scheduler.
@@ -549,6 +615,7 @@ impl DeckClient {
             })?;
         Ok(DeckClient {
             client: Arc::new(core_client),
+            _owned_sdk: None,
         })
     }
 

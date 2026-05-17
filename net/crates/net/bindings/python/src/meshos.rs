@@ -261,7 +261,7 @@ fn maintenance_mirror_str(m: MaintenanceMirrorSnapshot) -> &'static str {
 // `daemon_host_config_from_dict` pattern.
 // =========================================================================
 
-fn meshos_config_from_dict(
+pub(crate) fn meshos_config_from_dict(
     py: Python<'_>,
     config: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<MeshOsConfig> {

@@ -383,7 +383,7 @@ pub struct MeshOsConfigJs {
 }
 
 impl MeshOsConfigJs {
-    fn into_core(self) -> Result<MeshOsConfig> {
+    pub(crate) fn into_core(self) -> Result<MeshOsConfig> {
         let mut cfg = MeshOsConfig::default();
         if let Some(bi) = self.this_node {
             cfg.this_node = crate::common::bigint_u64(bi)
