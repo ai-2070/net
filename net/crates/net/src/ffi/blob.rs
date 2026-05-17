@@ -260,12 +260,7 @@ pub unsafe extern "C" fn net_blob_publish(
         Err(_) => return NET_ERR_BLOB_PANIC,
     };
 
-    let boxed = bytes.into_boxed_slice();
-    let len = boxed.len();
-    let ptr = Box::into_raw(boxed) as *mut u8;
-    *out_payload = ptr;
-    *out_payload_len = len;
-    0
+    write_bytes_out(&bytes, out_payload, out_payload_len)
 }
 
 /// Resolve a payload to its content bytes. Inline payloads round-
@@ -329,16 +324,56 @@ pub unsafe extern "C" fn net_blob_resolve(
         Err(_) => return NET_ERR_BLOB_PANIC,
     };
 
-    let boxed = bytes.into_boxed_slice();
-    let len = boxed.len();
-    let ptr = Box::into_raw(boxed) as *mut u8;
-    *out_content = ptr;
-    *out_content_len = len;
+    write_bytes_out(&bytes, out_content, out_content_len)
+}
+
+/// Allocate a Rust-owned buffer with an explicit `Layout::array::<u8>(len)`,
+/// copy `src` into it, and write `(ptr, len)` to the caller's out-pointers.
+/// Pairs with [`net_blob_free_buffer`], which deallocates with the matching
+/// layout. Pre-fix this path went `Vec → into_boxed_slice → Box::into_raw`,
+/// freed via `Box::from_raw(slice_from_raw_parts_mut(ptr, len))`. That
+/// worked because `into_boxed_slice` happens to shrink-to-fit today, but
+/// relied on a `Vec` / `Box<[u8]>` allocator-internals coincidence. A
+/// future refactor to `Vec::leak` (which does NOT shrink) would have
+/// silently mismatched the dealloc layout. Using an explicit
+/// `Layout::array::<u8>` on both sides makes the contract self-evident.
+///
+/// # Safety
+/// `out_ptr` and `out_len` must be writable.
+unsafe fn write_bytes_out(src: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) -> c_int {
+    let len = src.len();
+    if len == 0 {
+        unsafe {
+            *out_ptr = ptr::null_mut();
+            *out_len = 0;
+        }
+        return 0;
+    }
+    let layout = match std::alloc::Layout::array::<u8>(len) {
+        Ok(l) => l,
+        // `Layout::array::<u8>` only fails when `len > isize::MAX`.
+        // The publish/resolve paths have already rejected that range
+        // (slice::from_raw_parts shares the same cap), so this is
+        // unreachable from the existing call sites — but defending it
+        // here keeps `write_bytes_out` safe to reuse from any future
+        // caller. Returning a typed code beats panicking across the
+        // surrounding `extern "C"` frame.
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    let alloc_ptr = unsafe { std::alloc::alloc(layout) };
+    if alloc_ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), alloc_ptr, len);
+        *out_ptr = alloc_ptr;
+        *out_len = len;
+    }
     0
 }
 
 /// Free a buffer returned by [`net_blob_publish`] or
-/// [`net_blob_resolve`]. Calling with `(null, 0)` is a no-op.
+/// [`net_blob_resolve`]. Calling with `(null, _)` or `(_, 0)` is a no-op.
 ///
 /// # Safety
 /// `ptr` MUST be a buffer that the substrate previously returned
@@ -348,10 +383,19 @@ pub unsafe extern "C" fn net_blob_resolve(
 /// behaviour.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_blob_free_buffer(ptr: *mut u8, len: usize) {
-    if ptr.is_null() {
+    if ptr.is_null() || len == 0 {
         return;
     }
-    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len));
+    // Match the `Layout::array::<u8>(len)` used by `write_bytes_out`.
+    // Any `len > isize::MAX` could not have come from us — the
+    // allocating side would have rejected the same layout — so the
+    // safest response is to abandon the free rather than unwind
+    // across the FFI boundary.
+    let layout = match std::alloc::Layout::array::<u8>(len) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    std::alloc::dealloc(ptr, layout);
 }
 
 // Ensure the unused-import lint stays quiet under feature gates that
@@ -1040,17 +1084,12 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_fetch(
     let adapter = unsafe { (*handle).inner.clone() };
     let result = block_on(async move { (*adapter).fetch(&blob_ref).await });
     match result {
-        Ok(bytes) => {
-            let mut boxed = bytes.into_boxed_slice();
-            let ptr_out = boxed.as_mut_ptr();
-            let len_out = boxed.len();
-            std::mem::forget(boxed);
-            unsafe {
-                *out_data = ptr_out;
-                *out_len = len_out;
-            }
-            0
-        }
+        // Allocate with the same explicit `Layout::array::<u8>(len)`
+        // path that `net_blob_free_buffer` deallocates with, so the
+        // pair is layout-symmetric regardless of any future
+        // `Vec::leak` / `into_boxed_slice` refactor inside the
+        // adapter.
+        Ok(bytes) => unsafe { write_bytes_out(&bytes, out_data, out_len) },
         Err(e) => err_to_code(&e),
     }
 }
