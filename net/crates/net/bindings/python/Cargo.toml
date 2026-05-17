@@ -22,13 +22,14 @@ crate-type = ["cdylib", "rlib"]
 # typed nRPC + capability-based service discovery + daemon
 # supervision + replica/fork/standby coordination + MeshOS
 # daemon-authoring + dataforts blob storage + MeshDB federated
-# query plane + Redis dedup + JetStream adapter. Python devs
-# can't rebuild the wheel — whatever PyPI shipped is what they
-# have, so every primitive a harness vendor would plausibly
-# want is on by default.
+# query plane + Redis dedup helper. Python devs can't rebuild
+# the wheel — whatever PyPI shipped is what they have, so
+# every primitive a harness vendor would plausibly want is on
+# by default.
 #
-# `port-mapping` stays opt-in: pulls in the UPnP/SOAP +1.4 MB
-# dep tree most consumers don't need.
+# `jetstream` / `port-mapping` stay opt-in: the NATS-specific
+# adapter (+1.3 MB, niche audience that knows it wants NATS),
+# and the UPnP/SOAP +1.4 MB outlier.
 default = [
     "net",
     "nat-traversal",
@@ -39,7 +40,6 @@ default = [
     "dataforts",
     "meshdb",
     "redis",
-    "jetstream",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
