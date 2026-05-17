@@ -1808,6 +1808,13 @@ fn build_core_proposal<'a>(
 pub struct NetDeckIceProposal {
     action: net::adapter::net::behavior::meshos::IceActionProposal,
     issued_at_ms: u64,
+    /// `true` once `net_deck_ice_proposal_simulate` consumed the
+    /// proposal; subsequent simulate calls return `already_simulated`.
+    /// Mirrors the `committed` flag on `NetDeckSimulatedIceProposal`.
+    /// Replaces the previous `issued_at_ms = u64::MAX` sentinel,
+    /// which leaked into `net_deck_ice_proposal_issued_at_ms` and
+    /// made a consumed proposal report a wildly different stamp.
+    consumed: bool,
 }
 
 fn make_ice_proposal_handle(
@@ -1821,6 +1828,7 @@ fn make_ice_proposal_handle(
     let boxed = Box::into_raw(Box::new(NetDeckIceProposal {
         action,
         issued_at_ms,
+        consumed: false,
     }));
     unsafe { *out = boxed };
     NET_DECK_OK
@@ -2043,10 +2051,11 @@ pub extern "C" fn net_deck_ice_proposal_issued_at_ms(proposal: *const NetDeckIce
     }
 }
 
-/// Free a freestanding IceProposal. Idempotent on NULL. Calling
-/// this after a successful `simulate` is fine — `simulate`
-/// consumes the proposal by taking it out of the box; this
-/// only frees the empty husk.
+/// Free a freestanding IceProposal. Idempotent on NULL.
+/// Calling this after a successful `simulate` is fine — the
+/// proposal's `consumed` flag is set so re-simulating returns
+/// `already_simulated`; the underlying box still needs this
+/// `_free` call to release.
 #[no_mangle]
 pub extern "C" fn net_deck_ice_proposal_free(proposal: *mut NetDeckIceProposal) {
     if proposal.is_null() {
@@ -2099,10 +2108,7 @@ pub extern "C" fn net_deck_ice_proposal_simulate(
             set_last_error("already_shutdown", "DeckClient was already freed");
             return NET_DECK_ERR_ALREADY_SHUTDOWN;
         };
-        // We can't `Option::take()` because action isn't an
-        // Option. Use a sentinel: clone the action + bump the
-        // issued_at_ms to 0 to mark consumed.
-        if p.issued_at_ms == u64::MAX {
+        if p.consumed {
             set_last_error(
                 "already_simulated",
                 "IceProposal was already consumed by simulate()",
@@ -2111,8 +2117,10 @@ pub extern "C" fn net_deck_ice_proposal_simulate(
         }
         let action = p.action.clone();
         let issued_at_ms = p.issued_at_ms;
-        // Mark consumed.
-        p.issued_at_ms = u64::MAX;
+        // Mark consumed; `issued_at_ms` stays valid so
+        // `net_deck_ice_proposal_issued_at_ms` still returns the
+        // pinned value on the husk.
+        p.consumed = true;
         clear_last_error_inner();
         let core_proposal = match build_core_proposal(inner, action.clone()) {
             Ok(p) => p,
@@ -3434,6 +3442,47 @@ mod tests {
         assert_eq!(kind, "already_simulated");
         net_deck_clear_last_error();
 
+        net_deck_ice_proposal_free(proposal);
+        net_deck_client_free(client);
+    }
+
+    /// Regression: `net_deck_ice_proposal_issued_at_ms` must keep
+    /// returning the pinned stamp after the proposal is consumed
+    /// by `_simulate`. Pre-fix the consumed-state marker was
+    /// `issued_at_ms = u64::MAX`, so the accessor leaked the
+    /// sentinel back to the caller — a consumer who pinned the
+    /// stamp before simulating then re-read after would see a
+    /// wildly different number with no error indication.
+    #[test]
+    fn ice_issued_at_ms_survives_consumption_by_simulate() {
+        let client = make_client(0x4F);
+        let mut proposal: *mut NetDeckIceProposal = ptr::null_mut();
+        assert_eq!(
+            net_deck_ice_freeze_cluster(client, 60_000, &mut proposal),
+            NET_DECK_OK
+        );
+
+        let before = net_deck_ice_proposal_issued_at_ms(proposal);
+        assert!(before > 0, "factory should pin a non-zero issued_at_ms");
+        assert_ne!(
+            before,
+            u64::MAX,
+            "factory should not return the consumed sentinel value"
+        );
+
+        let mut simulated: *mut NetDeckSimulatedIceProposal = ptr::null_mut();
+        assert_eq!(
+            net_deck_ice_proposal_simulate(proposal, client, &mut simulated),
+            NET_DECK_OK
+        );
+
+        let after = net_deck_ice_proposal_issued_at_ms(proposal);
+        assert_eq!(
+            after, before,
+            "issued_at_ms must survive _simulate consumption (got {after}, was {before})"
+        );
+
+        net_deck_simulated_free(simulated);
         net_deck_ice_proposal_free(proposal);
         net_deck_client_free(client);
     }
