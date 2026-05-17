@@ -70,6 +70,10 @@ pub async fn run_ls(
     Ok(())
 }
 
+// `serde(flatten)` relies on `DaemonSnapshot` not exposing its own
+// `id` field. If the SDK ever adds one, rename this wrapper's `id`
+// to `daemon_id` (and update consumer scripts) — serde silently
+// allows duplicate keys with last-write-wins.
 #[derive(Serialize)]
 struct DaemonRow {
     id: u64,
