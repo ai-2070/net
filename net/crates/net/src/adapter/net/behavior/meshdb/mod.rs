@@ -52,7 +52,7 @@
 //! ```rust
 //! # use net::adapter::net::behavior::meshdb::{MeshQuery, QueryV1, ChainRef, SeqNum};
 //! let _ = MeshQuery::V1(QueryV1::Latest {
-//!     origin: ChainRef::OriginHash([0; 32]),
+//!     origin: ChainRef::OriginHash(0),
 //! });
 //! ```
 //!
