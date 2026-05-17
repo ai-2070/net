@@ -17,7 +17,30 @@ name = "_net"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["redis", "net"]
+# Out-of-the-box `pip install ai2070-net-sdk` ships the full
+# distributed-agent stack: mesh transport + NAT traversal +
+# typed nRPC + capability-based service discovery + daemon
+# supervision + replica/fork/standby coordination + MeshOS
+# daemon-authoring + dataforts blob storage + MeshDB federated
+# query plane + Redis dedup + JetStream adapter. Python devs
+# can't rebuild the wheel — whatever PyPI shipped is what they
+# have, so every primitive a harness vendor would plausibly
+# want is on by default.
+#
+# `port-mapping` stays opt-in: pulls in the UPnP/SOAP +1.4 MB
+# dep tree most consumers don't need.
+default = [
+    "net",
+    "nat-traversal",
+    "cortex",
+    "compute",
+    "groups",
+    "meshos",
+    "dataforts",
+    "meshdb",
+    "redis",
+    "jetstream",
+]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
 # PyO3 wrapper around the canonical Rust implementation.

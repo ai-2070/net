@@ -32,7 +32,33 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [features]
-default = []
+# Out-of-the-box "I downloaded the SDK and it just works": real
+# mesh transport + NAT traversal + typed nRPC + capability-based
+# service discovery + daemon supervision + replica/fork/standby
+# coordination + MeshOS daemon-authoring + the dataforts blob
+# storage surface + the MeshDB federated query plane. Picked so
+# a web/Python/Node dev consuming the prebuilt binding artifact
+# (where opting into features post-install isn't a thing) gets
+# every primitive the protocol's pitch turns on, with no flags
+# to discover.
+#
+# A Rust consumer who wants a leaner build opts out via
+# `default-features = false` and picks what they need. The
+# `agent` and `local` meta-features below name useful subsets.
+#
+# `port-mapping` / `redis` / `jetstream` stay opt-in: heavy
+# UPnP/SOAP dep tree, or external transports most consumers
+# don't need.
+default = [
+    "net",
+    "nat-traversal",
+    "cortex",
+    "compute",
+    "groups",
+    "meshos",
+    "dataforts",
+    "meshdb",
+]
 # External transports (opt-in, network I/O).
 redis = ["net/redis"]
 jetstream = ["net/jetstream"]
@@ -121,16 +147,30 @@ testing = ["meshos", "groups"]
 # compute + groups, no external transports). The default shape for
 # a single-node or LAN-only deployment.
 local = ["net", "cortex", "compute", "groups"]
-# Everything — local stack plus external transports plus the
-# operator-facing surfaces. `dataforts` and `meshdb` are
-# deliberately omitted: both pull substrate features that
-# enlarge the dependency footprint (redex-disk, blake3, the
-# meshdb query plane), and `full` is meant to be "the
-# common bundle for an operator's full-stack daemon", not
-# "every flag this crate exposes". Consumers that want
-# dataforts blob storage or the MeshDB query plane add those
-# flags explicitly.
-full = ["local", "redis", "jetstream", "meshos", "deck"]
+# Named alias for the SDK's heavy default — useful when a consumer
+# has set `default-features = false` to pull a leaner build and
+# later wants to opt back into "the full distributed-agent stack
+# short of external transports / operator UI." Mirrors what the
+# bindings ship by default (minus redis / jetstream).
+agent = [
+    "net",
+    "nat-traversal",
+    "cortex",
+    "compute",
+    "groups",
+    "meshos",
+    "dataforts",
+    "meshdb",
+]
+# Everything — local stack plus NAT traversal plus external
+# transports plus the operator-facing surfaces. `dataforts` and
+# `meshdb` are deliberately omitted: both pull substrate features
+# that enlarge the dependency footprint (redex-disk, blake3, the
+# meshdb query plane), and `full` is meant to be "the common
+# bundle for an operator's full-stack daemon", not "every flag
+# this crate exposes". Consumers that want dataforts blob storage
+# or the MeshDB query plane add those flags explicitly.
+full = ["local", "nat-traversal", "redis", "jetstream", "meshos", "deck"]
 
 # nRPC quickstart — requires net + cortex.
 [[example]]

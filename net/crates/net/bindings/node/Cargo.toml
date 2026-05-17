@@ -16,7 +16,31 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["redis"]
+# Out-of-the-box `npm install @ai2070/net-sdk` ships the full
+# distributed-agent stack: mesh transport + NAT traversal +
+# typed nRPC + capability-based service discovery + daemon
+# supervision + replica/fork/standby coordination + MeshOS
+# daemon-authoring + dataforts blob storage + MeshDB federated
+# query plane + Redis dedup + JetStream adapter. Web devs can't
+# recompile a wheel — whatever ships in the `.node` is what
+# they have, so every primitive a harness vendor would
+# plausibly want is on by default and discoverable through the
+# typings.
+#
+# `port-mapping` / `test-helpers` stay opt-in: the UPnP/SOAP
+# +1.4 MB outlier, and the test-only injector surface.
+default = [
+    "net",
+    "nat-traversal",
+    "cortex",
+    "compute",
+    "groups",
+    "meshos",
+    "dataforts",
+    "meshdb",
+    "redis",
+    "jetstream",
+]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
 # NAPI wrapper around the canonical Rust implementation rather
