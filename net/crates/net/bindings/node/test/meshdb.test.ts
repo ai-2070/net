@@ -295,7 +295,10 @@ d('MeshDB composite operators + decoders (slice 2)', () => {
     expect(rows).toHaveLength(1);
     const agg = decodeAggregate(rows[0]);
     expect(agg).not.toBeNull();
-    expect(agg!.group).toBeNull();
+    // napi-rs maps `Option::None` on an `#[napi(object)]` field to an
+    // absent JS property (undefined), not explicit null. Accept both
+    // so the assertion holds across napi-rs versions.
+    expect(agg!.group ?? null).toBeNull();
     expect(agg!.kind).toBe('count');
     expect(agg!.count).toBe(5n);
   });
@@ -439,8 +442,12 @@ d('MeshDB composite operators + decoders (slice 2)', () => {
     const rows = await (await runner.execute(q)).toArray();
     const pairs = rows.map((r) => decodeJoined(r)!);
     expect(pairs).toHaveLength(3);
-    expect(pairs.filter((p) => p.right !== null)).toHaveLength(1);
-    expect(pairs.filter((p) => p.right === null)).toHaveLength(2);
+    // `!= null` / `== null` catches both `null` and `undefined`;
+    // napi-rs emits `Option::None` on an object field as absent
+    // (undefined) rather than explicit `null`. The substrate-side
+    // intent is "no matching right", and either JS sentinel honors it.
+    expect(pairs.filter((p) => p.right != null)).toHaveLength(1);
+    expect(pairs.filter((p) => p.right == null)).toHaveLength(2);
   });
 
   it('payload-keyed inner join on JSON field', async () => {

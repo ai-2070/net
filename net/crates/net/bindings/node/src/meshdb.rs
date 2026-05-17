@@ -417,7 +417,13 @@ impl MeshQuery {
     /// `between`, `latest`, `filter`, `count`, `sum`, `avg`,
     /// `min`, `max`, `percentile`, `distinctCount`, `window`,
     /// `join`) compose into a final `MeshQuery` via `.build()`.
-    #[napi(factory)]
+    ///
+    /// Annotated as a plain `#[napi]` static method rather than
+    /// `#[napi(factory)]` because the return type is a different
+    /// class (`QueryBuilder`) — `factory` always wraps the return
+    /// value as `Self`, which would mis-construct the JS instance
+    /// as a `MeshQuery` and strip the `QueryBuilder` methods.
+    #[napi]
     pub fn builder() -> QueryBuilder {
         QueryBuilder { state: None }
     }
