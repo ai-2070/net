@@ -210,7 +210,7 @@ impl JetStreamAdapter {
                 let js = self
                     .jetstream
                     .as_ref()
-                    .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))?;
+                    .ok_or_else(|| AdapterError::Shutdown)?;
 
                 // Try to get existing stream first; only create if missing.
                 match js.get_stream(&stream_name).await {
@@ -356,13 +356,13 @@ impl Adapter for JetStreamAdapter {
         // would proceed against a drained client, typically erroring
         // and sometimes hanging depending on async-nats internals.
         if !self.initialized.load(Ordering::Acquire) {
-            return Err(AdapterError::Connection("adapter not initialized".into()));
+            return Err(AdapterError::Shutdown);
         }
 
         let js = self
             .jetstream
             .as_ref()
-            .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))?;
+            .ok_or_else(|| AdapterError::Shutdown)?;
 
         // Convert to `async_nats::Subject` once — internally `Bytes`-
         // backed, so per-iteration `subject.clone()` is an Arc-style
@@ -583,7 +583,7 @@ impl Adapter for JetStreamAdapter {
         // clear `self.client` / `self.jetstream` from `&self`, so
         // we consult the flag instead.
         if !self.initialized.load(Ordering::Acquire) {
-            return Err(AdapterError::Connection("adapter not initialized".into()));
+            return Err(AdapterError::Shutdown);
         }
         let mut stream = self.get_or_create_stream(shard_id).await?;
 

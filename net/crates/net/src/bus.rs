@@ -2031,12 +2031,22 @@ async fn dispatch_batch(
                     // Tag with a `reason` field so this
                     // distinct drop cause is separately filterable
                     // from retry-exhausted and timeout in
-                    // observability tools.
+                    // observability tools. Shutdown is distinguished
+                    // from generic non-retryable so an operator
+                    // chasing "why are batches being dropped" can
+                    // immediately tell a sequencing bug (sending to
+                    // a stopped adapter) from a transport / config
+                    // failure.
+                    let reason = if e.is_shutdown() {
+                        "adapter_shutdown"
+                    } else {
+                        "non_retryable"
+                    };
                     tracing::error!(
                         shard_id,
                         error = %e,
                         attempt,
-                        reason = "non_retryable",
+                        reason,
                         "Non-retryable error from adapter, dropping batch"
                     );
                     return false;

@@ -189,11 +189,14 @@ impl RedisAdapter {
     /// Consult `initialized` first to refuse cleanly.
     async fn get_conn(&self) -> Result<ConnectionManager, AdapterError> {
         if !self.initialized.load(Ordering::Acquire) {
-            return Err(AdapterError::Fatal("adapter not initialized".into()));
+            return Err(AdapterError::Shutdown);
         }
-        self.conn
-            .clone()
-            .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))
+        // `initialized` is true but `conn` is None: this only happens
+        // during a re-init race where another caller has flipped
+        // initialized=true but not yet stored the new conn. Treat as
+        // Shutdown since the adapter isn't currently ready to accept
+        // traffic.
+        self.conn.clone().ok_or(AdapterError::Shutdown)
     }
 
     /// Parse an XRANGE response into a `ShardPollResult`.
