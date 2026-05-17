@@ -33,18 +33,22 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 use tokio::runtime::Runtime;
 
 use net::adapter::net::behavior::deck::{
     AdminCommands as CoreAdminCommands, AuditQuery as CoreAuditQuery, AuditStream as CoreAuditStream,
     ChainCommit as CoreChainCommit, DeckClient as CoreClient, DeckClientConfig as CoreConfig,
-    DeckError, FailureStream as CoreFailureStream, LogFilter as CoreLogFilter,
-    LogStream as CoreLogStream, OperatorIdentity as CoreIdentity,
+    DeckError, FailureStream as CoreFailureStream, IceCommands as CoreIceCommands,
+    IceProposal as CoreIceProposal, LogFilter as CoreLogFilter, LogStream as CoreLogStream,
+    OperatorIdentity as CoreIdentity, SimulatedIceProposal as CoreSimulated,
     SnapshotStream as CoreSnapshotStream, StatusSummary, StatusSummaryStream as CoreStatusStream,
 };
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
-use net::adapter::net::behavior::meshos::{ChainId as CoreChainId, MeshOsSnapshot};
+use net::adapter::net::behavior::meshos::{
+    AvoidScope as CoreAvoidScope, ChainId as CoreChainId, DaemonRef as CoreDaemonRef,
+    MeshOsSnapshot, MigrationId as CoreMigrationId, OperatorSignature as CoreOperatorSignature,
+};
 
 use futures::StreamExt;
 
@@ -566,6 +570,17 @@ impl PyDeckClient {
         }
     }
 
+    /// Break-glass surface. Returns `IceCommands` whose factories
+    /// produce `IceProposal`s — each must be `simulate()`-d
+    /// before commit per the typestate contract.
+    #[getter]
+    fn ice(&self) -> PyIceCommands {
+        PyIceCommands {
+            client: self.client.clone(),
+            runtime: self.runtime.clone(),
+        }
+    }
+
     /// Audit query builder over the in-memory admin-audit ring.
     /// Chain `.recent(n)`, `.by_operator(op_id)`,
     /// `.between(start_ms, end_ms)`, `.force_only()`, `.since(seq)`
@@ -944,5 +959,412 @@ impl PyAuditStream {
 
     fn close(&mut self) {
         self.inner = None;
+    }
+}
+
+// =========================================================================
+// Slice 3 — ICE break-glass surface
+//
+// Typestate: PyIceProposal has no `commit` — only PySimulatedIceProposal
+// does. The compile-time check we get in Rust translates into the
+// pyclass-level surface: `.simulate()` is the only path that produces
+// a SimulatedIceProposal, and only that class exposes `.commit`.
+// =========================================================================
+
+/// Parse an `AvoidScope` from a Python dict. Three shapes:
+///
+/// - `{"kind": "global"}` — `AvoidScope::Global`
+/// - `{"kind": "local", "node": int}` — `AvoidScope::Local { node }`
+/// - `{"kind": "on_peer", "peer": int}` — `AvoidScope::OnPeer { peer }`
+fn parse_avoid_scope(py: Python<'_>, d: &Bound<'_, PyDict>) -> PyResult<CoreAvoidScope> {
+    let kind: String = match d.get_item("kind")? {
+        Some(v) => v.extract().map_err(|e| {
+            deck_err(
+                py,
+                "invalid_avoid_scope",
+                &format!("scope.kind must be string: {e}"),
+            )
+        })?,
+        None => {
+            return Err(deck_err(
+                py,
+                "invalid_avoid_scope",
+                "scope dict missing required key 'kind'",
+            ));
+        }
+    };
+    Ok(match kind.as_str() {
+        "global" | "Global" => CoreAvoidScope::Global,
+        "local" | "Local" => {
+            let node: u64 = d
+                .get_item("node")?
+                .ok_or_else(|| {
+                    deck_err(
+                        py,
+                        "invalid_avoid_scope",
+                        "scope 'local' requires 'node' int",
+                    )
+                })?
+                .extract()
+                .map_err(|e| {
+                    deck_err(py, "invalid_avoid_scope", &format!("node must be int: {e}"))
+                })?;
+            CoreAvoidScope::Local { node }
+        }
+        "on_peer" | "OnPeer" => {
+            let peer: u64 = d
+                .get_item("peer")?
+                .ok_or_else(|| {
+                    deck_err(
+                        py,
+                        "invalid_avoid_scope",
+                        "scope 'on_peer' requires 'peer' int",
+                    )
+                })?
+                .extract()
+                .map_err(|e| {
+                    deck_err(py, "invalid_avoid_scope", &format!("peer must be int: {e}"))
+                })?;
+            CoreAvoidScope::OnPeer { peer }
+        }
+        other => {
+            return Err(deck_err(
+                py,
+                "invalid_avoid_scope",
+                &format!(
+                    "scope.kind must be 'global' | 'local' | 'on_peer'; got {other:?}"
+                ),
+            ));
+        }
+    })
+}
+
+fn operator_signature_from_dict(
+    py: Python<'_>,
+    d: &Bound<'_, PyDict>,
+) -> PyResult<CoreOperatorSignature> {
+    let op_id: u64 = match d.get_item("operator_id")? {
+        Some(v) => v.extract().map_err(|e| {
+            deck_err(py, "invalid_signature", &format!("operator_id must be int: {e}"))
+        })?,
+        None => {
+            return Err(deck_err(
+                py,
+                "invalid_signature",
+                "signature dict missing required key 'operator_id'",
+            ));
+        }
+    };
+    let sig_bytes: Vec<u8> = match d.get_item("signature")? {
+        Some(v) => v.extract().map_err(|e| {
+            deck_err(py, "invalid_signature", &format!("signature must be bytes: {e}"))
+        })?,
+        None => {
+            return Err(deck_err(
+                py,
+                "invalid_signature",
+                "signature dict missing required key 'signature'",
+            ));
+        }
+    };
+    Ok(CoreOperatorSignature {
+        operator_id: op_id,
+        signature: sig_bytes,
+    })
+}
+
+fn blast_radius_to_json(
+    py: Python<'_>,
+    blast: &net::adapter::net::behavior::meshos::BlastRadius,
+) -> PyResult<String> {
+    serde_json::to_string(blast).map_err(|e| {
+        deck_err(
+            py,
+            "blast_serialize_failed",
+            &format!("BlastRadius JSON serialize: {e}"),
+        )
+    })
+}
+
+/// Build a substrate-side `IceProposal` from a saved action.
+/// The substrate's `IceProposal::new` pins a fresh
+/// `issued_at_ms` per call; for the typestate's `simulate()`
+/// path this is fine because the simulator is pure over the
+/// current snapshot. The committed envelope re-binds
+/// `issued_at_ms` to the value we held — same `(action,
+/// issued_at_ms, blast_hash)` triple substrate-side verifier
+/// expects.
+fn build_core_proposal<'a>(
+    client: &'a CoreClient,
+    action: net::adapter::net::behavior::meshos::IceActionProposal,
+) -> CoreIceProposal<'a> {
+    use net::adapter::net::behavior::meshos::IceActionProposal as A;
+    match action {
+        A::FreezeCluster { ttl } => client.ice().freeze_cluster(ttl),
+        A::FlushAvoidLists { scope } => client.ice().flush_avoid_lists(scope),
+        A::ForceEvictReplica { chain, victim } => client.ice().force_evict_replica(chain, victim),
+        A::ForceRestartDaemon { daemon } => client.ice().force_restart_daemon(daemon),
+        A::ForceCutover { chain, target } => client.ice().force_cutover(chain, target),
+        A::KillMigration { migration } => client.ice().kill_migration(migration),
+        A::ThawCluster => client.ice().thaw_cluster(),
+        // `IceActionProposal` is `#[non_exhaustive]`. New variants
+        // arriving from the substrate fall back to `thaw_cluster`
+        // — harmless for an unknown variant; bindings stay
+        // forward-compatible.
+        _ => client.ice().thaw_cluster(),
+    }
+}
+
+// =========================================================================
+// PyIceCommands — 7 factory methods
+// =========================================================================
+
+#[pyclass(name = "IceCommands", module = "net._net")]
+pub struct PyIceCommands {
+    client: Arc<CoreClient>,
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyIceCommands {
+    fn freeze_cluster(&self, ttl_ms: u64) -> PyIceProposal {
+        let proposal = self.client.ice().freeze_cluster(Duration::from_millis(ttl_ms));
+        PyIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn flush_avoid_lists(
+        &self,
+        py: Python<'_>,
+        scope: &Bound<'_, PyDict>,
+    ) -> PyResult<PyIceProposal> {
+        let scope = parse_avoid_scope(py, scope)?;
+        let proposal = self.client.ice().flush_avoid_lists(scope);
+        Ok(PyIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        ))
+    }
+
+    fn force_evict_replica(&self, chain: u64, victim: u64) -> PyIceProposal {
+        let proposal = self.client.ice().force_evict_replica(chain as CoreChainId, victim);
+        PyIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    /// Propose force-restarting a daemon. `id` is the registry-
+    /// local daemon id; `name` is `MeshDaemon::name()`.
+    fn force_restart_daemon(&self, id: u64, name: String) -> PyIceProposal {
+        let daemon = CoreDaemonRef { id, name };
+        let proposal = self.client.ice().force_restart_daemon(daemon);
+        PyIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn force_cutover(&self, chain: u64, target: u64) -> PyIceProposal {
+        let proposal = self.client.ice().force_cutover(chain as CoreChainId, target);
+        PyIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn kill_migration(&self, migration: u64) -> PyIceProposal {
+        let proposal = self.client.ice().kill_migration(migration as CoreMigrationId);
+        PyIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn thaw_cluster(&self) -> PyIceProposal {
+        let proposal = self.client.ice().thaw_cluster();
+        PyIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+}
+
+// =========================================================================
+// PyIceProposal — pre-simulation typestate. No `commit` method.
+// =========================================================================
+
+#[pyclass(name = "IceProposal", module = "net._net")]
+pub struct PyIceProposal {
+    client: Arc<CoreClient>,
+    runtime: Arc<Runtime>,
+    action: Option<net::adapter::net::behavior::meshos::IceActionProposal>,
+    issued_at_ms: u64,
+}
+
+impl PyIceProposal {
+    fn from_action(
+        client: Arc<CoreClient>,
+        runtime: Arc<Runtime>,
+        action: net::adapter::net::behavior::meshos::IceActionProposal,
+        issued_at_ms: u64,
+    ) -> Self {
+        Self {
+            client,
+            runtime,
+            action: Some(action),
+            issued_at_ms,
+        }
+    }
+}
+
+#[pymethods]
+impl PyIceProposal {
+    #[getter]
+    fn issued_at_ms(&self) -> u64 {
+        self.issued_at_ms
+    }
+
+    /// Pre-execution preview. Consumes the proposal — subsequent
+    /// calls raise `DeckSdkError(kind="already_simulated")`.
+    fn simulate(&mut self, py: Python<'_>) -> PyResult<PySimulatedIceProposal> {
+        let action = self.action.take().ok_or_else(|| {
+            deck_err(
+                py,
+                "already_simulated",
+                "IceProposal was already consumed by simulate()",
+            )
+        })?;
+        let issued_at_ms = self.issued_at_ms;
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
+        let action_for_commit = action.clone();
+        let blast = py.detach(move || {
+            runtime.block_on(async move {
+                let proposal = build_core_proposal(&client, action);
+                proposal.simulate().await.map(|s| s.blast_radius().clone())
+            })
+        });
+        match blast {
+            Ok(b) => Ok(PySimulatedIceProposal {
+                client: self.client.clone(),
+                runtime: self.runtime.clone(),
+                action: Some(action_for_commit),
+                issued_at_ms,
+                blast: b,
+                committed: false,
+            }),
+            Err(e) => Err(deck_err_from(py, e)),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "IceProposal(consumed={}, issued_at_ms={})",
+            self.action.is_none(),
+            self.issued_at_ms,
+        )
+    }
+}
+
+// =========================================================================
+// PySimulatedIceProposal — only class exposing commit
+// =========================================================================
+
+#[pyclass(name = "SimulatedIceProposal", module = "net._net")]
+pub struct PySimulatedIceProposal {
+    client: Arc<CoreClient>,
+    runtime: Arc<Runtime>,
+    action: Option<net::adapter::net::behavior::meshos::IceActionProposal>,
+    issued_at_ms: u64,
+    blast: net::adapter::net::behavior::meshos::BlastRadius,
+    committed: bool,
+}
+
+#[pymethods]
+impl PySimulatedIceProposal {
+    /// Pre-execution blast-radius preview as a JSON string. The
+    /// `sdk-py` wrapper parses to a native dict.
+    fn blast_radius(&self, py: Python<'_>) -> PyResult<String> {
+        blast_radius_to_json(py, &self.blast)
+    }
+
+    #[getter]
+    fn issued_at_ms(&self) -> u64 {
+        self.issued_at_ms
+    }
+
+    /// Blake3 digest of the blast radius. Signers must cover
+    /// this exact hash; substrate verifier rebuilds + compares.
+    fn blast_hash<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let hash = net::adapter::net::behavior::meshos::blast_radius_hash(&self.blast);
+        Ok(PyBytes::new(py, hash.as_ref()))
+    }
+
+    /// Commit the proposal with the supplied operator signatures.
+    /// `signatures` is a list of dicts:
+    /// `{"operator_id": int, "signature": bytes}`.
+    fn commit<'py>(
+        &mut self,
+        py: Python<'py>,
+        signatures: Vec<Bound<'_, PyDict>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        if self.committed {
+            return Err(deck_err(
+                py,
+                "already_committed",
+                "SimulatedIceProposal was already consumed by commit()",
+            ));
+        }
+        let action = self.action.take().ok_or_else(|| {
+            deck_err(
+                py,
+                "already_committed",
+                "SimulatedIceProposal was already consumed by commit()",
+            )
+        })?;
+        let mut sigs = Vec::with_capacity(signatures.len());
+        for d in signatures {
+            sigs.push(operator_signature_from_dict(py, &d)?);
+        }
+        self.committed = true;
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
+        let commit_result = py.detach(move || {
+            runtime.block_on(async move {
+                let proposal = build_core_proposal(&client, action);
+                let simulated = proposal.simulate().await?;
+                simulated.commit(&sigs).await
+            })
+        });
+        match commit_result {
+            Ok(commit) => chain_commit_to_dict(py, &commit),
+            Err(e) => Err(deck_err_from(py, e)),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SimulatedIceProposal(committed={}, issued_at_ms={}, affected_nodes={})",
+            self.committed,
+            self.issued_at_ms,
+            self.blast.affected_nodes.len(),
+        )
     }
 }

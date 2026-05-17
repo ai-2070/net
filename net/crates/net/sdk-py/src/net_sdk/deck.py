@@ -85,6 +85,13 @@ __all__ = [
     "AdminAuditRecord",
     "LogLevel",
     "LogFilter",
+    # Slice 3 — ICE.
+    "IceCommands",
+    "IceProposal",
+    "SimulatedIceProposal",
+    "OperatorSignature",
+    "BlastRadius",
+    "AvoidScope",
 ]
 
 
@@ -480,5 +487,120 @@ class DeckClient:
         still in the ring."""
         return FailureStream(self._raw.subscribe_failures(since_seq))
 
+    # =====================================================================
+    # Slice 3 — ICE break-glass surface
+    # =====================================================================
+
+    @property
+    def ice(self) -> "IceCommands":
+        """Operator-side break-glass surface. Every method
+        constructs an :class:`IceProposal` that must be
+        :meth:`IceProposal.simulate`-d before commit."""
+        return IceCommands(self._raw.ice)
+
     def __repr__(self) -> str:
         return repr(self._raw)
+
+
+# =========================================================================
+# Slice 3 — ICE wrappers + typed envelopes
+# =========================================================================
+
+
+AvoidScopeGlobal = TypedDict("AvoidScopeGlobal", {"kind": Literal["global"]})
+AvoidScopeLocal = TypedDict("AvoidScopeLocal", {"kind": Literal["local"], "node": int})
+AvoidScopeOnPeer = TypedDict("AvoidScopeOnPeer", {"kind": Literal["on_peer"], "peer": int})
+AvoidScope = Union[AvoidScopeGlobal, AvoidScopeLocal, AvoidScopeOnPeer]
+
+
+class OperatorSignature(TypedDict):
+    """Signature pair carried by ICE commits."""
+
+    operator_id: int
+    signature: bytes
+
+
+# `BlastRadius` is JSON-shaped at the binding boundary. Type
+# loosely; the substrate's serde shape is the authoritative wire
+# form.
+BlastRadius = dict[str, Any]
+
+
+class IceCommands:
+    """Operator-side break-glass surface. Each method returns an
+    :class:`IceProposal` that must be `.simulate()`-d before
+    `.commit()`."""
+
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    def freeze_cluster(self, ttl_ms: int) -> "IceProposal":
+        return IceProposal(self._raw.freeze_cluster(ttl_ms))
+
+    def flush_avoid_lists(self, scope: AvoidScope) -> "IceProposal":
+        return IceProposal(self._raw.flush_avoid_lists(dict(scope)))
+
+    def force_evict_replica(self, chain: int, victim: int) -> "IceProposal":
+        return IceProposal(self._raw.force_evict_replica(chain, victim))
+
+    def force_restart_daemon(self, id: int, name: str) -> "IceProposal":
+        return IceProposal(self._raw.force_restart_daemon(id, name))
+
+    def force_cutover(self, chain: int, target: int) -> "IceProposal":
+        return IceProposal(self._raw.force_cutover(chain, target))
+
+    def kill_migration(self, migration: int) -> "IceProposal":
+        return IceProposal(self._raw.kill_migration(migration))
+
+    def thaw_cluster(self) -> "IceProposal":
+        return IceProposal(self._raw.thaw_cluster())
+
+
+class IceProposal:
+    """Pre-simulation ICE proposal. No ``commit`` method —
+    typestate enforces ``simulate()`` first."""
+
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    @property
+    def issued_at_ms(self) -> int:
+        return self._raw.issued_at_ms
+
+    def simulate(self) -> "SimulatedIceProposal":
+        """Pre-execution preview. Consumes the proposal —
+        subsequent calls raise ``DeckSdkError(kind="already_simulated")``."""
+        return SimulatedIceProposal(self._raw.simulate())
+
+
+class SimulatedIceProposal:
+    """A simulated ICE proposal. Carries the substrate's blast
+    radius preview; call :meth:`commit` with operator signatures
+    to publish."""
+
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    @property
+    def issued_at_ms(self) -> int:
+        return self._raw.issued_at_ms
+
+    def blast_radius(self) -> BlastRadius:
+        """Pre-execution preview, parsed from the binding's JSON."""
+        return json.loads(self._raw.blast_radius())
+
+    def blast_hash(self) -> bytes:
+        """Blake3 digest of the blast radius. Signers must cover
+        this exact hash."""
+        return self._raw.blast_hash()
+
+    def commit(self, signatures: list[OperatorSignature]) -> ChainCommit:
+        """Commit with the supplied operator signatures. Consumes
+        the simulated proposal."""
+        return self._raw.commit([dict(s) for s in signatures])  # type: ignore[return-value]

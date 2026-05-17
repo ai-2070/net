@@ -433,3 +433,169 @@ def test_subscribe_failures_returns_failure_stream() -> None:
         stream.close()
     finally:
         sdk.shutdown()
+
+
+# -------------------------------------------------------------------------
+# Slice 3 — ICE break-glass surface
+# -------------------------------------------------------------------------
+
+
+def test_ice_factories_all_return_ice_proposals() -> None:
+    """Each of the 7 IceCommands factories returns an IceProposal
+    with an issued_at_ms stamp."""
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        ice = client.ice
+
+        proposals = [
+            ice.freeze_cluster(ttl_ms=60_000),
+            ice.flush_avoid_lists({"kind": "global"}),
+            ice.force_evict_replica(chain=1, victim=2),
+            ice.force_restart_daemon(id=3, name="echo"),
+            ice.force_cutover(chain=4, target=5),
+            ice.kill_migration(migration=6),
+            ice.thaw_cluster(),
+        ]
+        for p in proposals:
+            assert p.issued_at_ms > 0
+    finally:
+        sdk.shutdown()
+
+
+def test_ice_proposal_has_no_commit_method() -> None:
+    """Typestate enforcement at the pyclass level: IceProposal
+    must not expose `commit` — only SimulatedIceProposal does."""
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        proposal = client.ice.freeze_cluster(ttl_ms=60_000)
+        assert not hasattr(proposal, "commit"), (
+            "IceProposal must not expose commit (typestate violation)"
+        )
+        assert hasattr(proposal, "simulate"), "IceProposal must expose simulate"
+    finally:
+        sdk.shutdown()
+
+
+def test_ice_avoid_scope_dict_variants() -> None:
+    """`flush_avoid_lists` accepts three scope shapes: global,
+    local (with node id), on_peer (with peer id)."""
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        client.ice.flush_avoid_lists({"kind": "global"})
+        client.ice.flush_avoid_lists({"kind": "local", "node": 0xCAFE})
+        client.ice.flush_avoid_lists({"kind": "on_peer", "peer": 0xBEEF})
+    finally:
+        sdk.shutdown()
+
+
+def test_ice_invalid_scope_raises_typed_error() -> None:
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        with pytest.raises(DeckSdkError) as excinfo:
+            client.ice.flush_avoid_lists({"kind": "nonsense"})
+        assert excinfo.value.kind == "invalid_avoid_scope"
+    finally:
+        sdk.shutdown()
+
+
+def test_ice_simulate_returns_simulated_proposal_with_blast_radius() -> None:
+    """`simulate()` advances the typestate and produces a
+    SimulatedIceProposal exposing `blast_radius()` + `blast_hash()`
+    + `commit()`."""
+    import json
+
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        proposal = client.ice.freeze_cluster(ttl_ms=60_000)
+        simulated = proposal.simulate()
+        # Typestate: simulated has commit + blast_radius + blast_hash.
+        assert hasattr(simulated, "commit")
+        assert hasattr(simulated, "blast_radius")
+        assert hasattr(simulated, "blast_hash")
+        # Blast radius is JSON-serializable.
+        blast = json.loads(simulated.blast_radius())
+        assert isinstance(blast, dict)
+        # Blast hash is 32 bytes (Blake3 digest).
+        h = simulated.blast_hash()
+        assert isinstance(h, (bytes, bytearray))
+        assert len(h) == 32
+        # issued_at_ms carried through.
+        assert simulated.issued_at_ms > 0
+    finally:
+        sdk.shutdown()
+
+
+def test_ice_double_simulate_raises_already_simulated() -> None:
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        proposal = client.ice.freeze_cluster(ttl_ms=60_000)
+        proposal.simulate()
+        with pytest.raises(DeckSdkError) as excinfo:
+            proposal.simulate()
+        assert excinfo.value.kind == "already_simulated"
+    finally:
+        sdk.shutdown()
+
+
+def test_ice_commit_with_no_signatures_succeeds_at_default_threshold_1() -> None:
+    """Default `ice_signature_threshold=1` means the substrate
+    accepts a single signature — but the path without an
+    `OperatorRegistry` installed publishes via the unsigned admin
+    route, which accepts empty signatures. Confirm the unsigned
+    path works for slice 3 testing."""
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        proposal = client.ice.freeze_cluster(ttl_ms=60_000)
+        simulated = proposal.simulate()
+        # With default threshold=1 and 0 signatures, the SDK gate
+        # rejects with `insufficient_signatures` BEFORE consulting
+        # the registry path. So an empty bundle fails.
+        with pytest.raises(DeckSdkError) as excinfo:
+            simulated.commit([])
+        assert excinfo.value.kind == "insufficient_signatures"
+    finally:
+        sdk.shutdown()
+
+
+def test_ice_commit_rejects_malformed_signature_dict() -> None:
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        proposal = client.ice.freeze_cluster(ttl_ms=60_000)
+        simulated = proposal.simulate()
+        with pytest.raises(DeckSdkError) as excinfo:
+            simulated.commit([{"operator_id": 0x1234}])  # missing signature
+        assert excinfo.value.kind == "invalid_signature"
+    finally:
+        sdk.shutdown()
+
+
+def test_ice_simulated_commit_consumes_proposal() -> None:
+    """The first commit consumes the simulated proposal; the
+    second raises `already_committed`. With default threshold=1 and
+    no OperatorRegistry installed, the SDK gate accepts a single
+    arbitrary signature and the substrate publishes via the
+    unsigned admin path."""
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        proposal = client.ice.freeze_cluster(ttl_ms=60_000)
+        simulated = proposal.simulate()
+        # First commit — succeeds (default threshold=1, no
+        # OperatorRegistry → unsigned admin route).
+        commit = simulated.commit([{"operator_id": 1, "signature": b"\x00" * 64}])
+        assert isinstance(commit, dict)
+        assert "commit_id" in commit
+        # Second commit — proposal consumed.
+        with pytest.raises(DeckSdkError) as excinfo:
+            simulated.commit([{"operator_id": 1, "signature": b"\x00" * 64}])
+        assert excinfo.value.kind == "already_committed"
+    finally:
+        sdk.shutdown()

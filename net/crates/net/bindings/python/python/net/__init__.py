@@ -436,6 +436,28 @@ else:
         ]
     )
 
+    # Slice 3 — ICE break-glass surface. Try-import so wheels
+    # built before slice 3 still load.
+    try:
+        from ._net import (
+            IceCommands as _DeckIceCommands,
+            IceProposal as _DeckIceProposal,
+            SimulatedIceProposal as _DeckSimulatedIceProposal,
+        )
+
+        DeckIceCommands = _DeckIceCommands
+        DeckIceProposal = _DeckIceProposal
+        DeckSimulatedIceProposal = _DeckSimulatedIceProposal
+        __all__.extend(
+            [
+                "DeckIceCommands",
+                "DeckIceProposal",
+                "DeckSimulatedIceProposal",
+            ]
+        )
+    except ImportError:  # pragma: no cover
+        pass
+
     def deck_sdk_error_kind(exc: "DeckSdkError") -> str | None:
         """Extract the kind discriminator from a caught
         ``DeckSdkError``.
