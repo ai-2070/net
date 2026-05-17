@@ -244,7 +244,7 @@ class Net:
 # CortEX adapter (requires the `cortex` feature at build time)
 # =========================================================================
 
-from typing import Iterator, List, Optional
+from typing import Any, Iterator, List, Optional
 
 class Redex:
     """Local RedEX manager. One handle per node; shared by all adapters.
@@ -971,36 +971,91 @@ class MeshOsSdkError(Exception):
 
 class MeshOsDaemonSdk:
     """Entry point for daemon-author code. Construct via
-    :py:meth:`start`; use ``register_daemon`` (or
-    ``register_daemon_with_callbacks`` for a trait-shaped daemon).
-    See `net/crates/net/bindings/python/src/meshos.rs` for the
+    :py:meth:`start`; use ``register_daemon`` to register a
+    Python daemon instance. See
+    `net/crates/net/bindings/python/src/meshos.rs` for the
     full method surface."""
 
     @staticmethod
     def start(
         config: Optional[dict] = None,
         control_capacity: Optional[int] = None,
-        callback_timeout_ms: Optional[int] = None,
-    ) -> "MeshOsDaemonSdk": ...
+    ) -> "MeshOsDaemonSdk":
+        """Start the SDK with optional config + the substrate's
+        ``LoggingDispatcher`` as the action consumer."""
+        ...
     def register_daemon(
-        self, name: str, identity: "Identity"
-    ) -> "MeshOsDaemonHandle": ...
-    def register_daemon_with_callbacks(
-        self, daemon: object, identity: "Identity"
-    ) -> "MeshOsDaemonHandle": ...
-    def shutdown(self) -> None: ...
+        self, daemon: Any, identity: "Identity"
+    ) -> "MeshOsDaemonHandle":
+        """Register a Python daemon under the supplied identity."""
+        ...
+    def dropped_control_events(self) -> int:
+        """Diagnostic counter — total control events the router
+        dropped because a daemon's channel was full."""
+        ...
+    def shutdown(self) -> None:
+        """Tear down the wrapped runtime. Consumes the SDK by
+        value — subsequent calls raise ``already_shutdown``."""
+        ...
+    def __enter__(self) -> "MeshOsDaemonSdk": ...
+    def __exit__(
+        self,
+        exc_type: Optional[Any] = None,
+        exc_value: Optional[Any] = None,
+        exc_traceback: Optional[Any] = None,
+    ) -> bool: ...
+    def __repr__(self) -> str: ...
 
 class MeshOsDaemonHandle:
-    """Operator-side handle to a registered daemon. Methods:
-    ``next_control`` / ``try_next_control`` / ``publish_log`` /
-    ``publish_capabilities`` / ``graceful_shutdown`` / ``metadata`` /
-    ``refresh_metadata``. Properties: ``daemon_id`` / ``daemon_name``.
-    See `meshos.rs`."""
+    """Operator-side handle to a registered daemon. See `meshos.rs`."""
 
     @property
-    def daemon_id(self) -> int: ...
+    def daemon_id(self) -> int:
+        """Substrate identifier (the keypair's origin hash).
+        Stable across the handle's lifetime, including after
+        shutdown."""
+        ...
     @property
-    def daemon_name(self) -> str: ...
+    def daemon_name(self) -> str:
+        """Daemon's ``name`` at registration. Stable across the
+        handle's lifetime, including after shutdown."""
+        ...
+    def metadata(self) -> dict:
+        """Return the cached metadata view as a dict."""
+        ...
+    def refresh_metadata(self) -> dict:
+        """Rebuild the metadata view from the runtime's latest
+        snapshot."""
+        ...
+    def next_control(self, timeout_ms: Optional[int] = None) -> Optional[dict]:
+        """Block until the next control event arrives, or
+        ``timeout_ms`` elapses, or the runtime shuts down."""
+        ...
+    def try_next_control(self) -> Optional[dict]:
+        """Non-blocking control-event receive. Returns ``None``
+        if the channel is empty / closed."""
+        ...
+    def publish_log(self, level: str, message: str) -> None:
+        """Publish a log line tagged with this daemon's id.
+        ``level`` is one of ``trace|debug|info|warn|error``."""
+        ...
+    def publish_capabilities(self, caps: Optional[dict] = None) -> None:
+        """Publish (or update) the daemon's capability set."""
+        ...
+    def graceful_shutdown(self, grace_ms: Optional[int] = None) -> None:
+        """Drive a graceful shutdown. Sends ``Shutdown
+        { grace_period_ms }`` on the daemon's control channel,
+        parks for ``grace_ms``, then unregisters. Consumes the
+        handle."""
+        ...
+    def __enter__(self) -> "MeshOsDaemonHandle": ...
+    def __exit__(
+        self,
+        exc_type: Optional[Any] = None,
+        exc_value: Optional[Any] = None,
+        exc_traceback: Optional[Any] = None,
+    ) -> bool: ...
+    def __repr__(self) -> str: ...
 
 # ---- MeshDB query layer (`meshdb.rs`) ---------------------------------------
 
@@ -1008,50 +1063,375 @@ class MeshDbError(Exception):
     """MeshDB query-layer error. Carries a ``<<meshdb-kind:...>>``
     envelope; see ``net_sdk.meshdb``."""
 
-class InMemoryChainReader:
-    """In-process chain reader. Pass to ``MeshQueryRunner`` to
-    execute queries against an in-memory event log."""
-
-class MeshQuery:
-    """A planned query AST. Reusable across runners."""
-
-class MeshQueryRunner:
-    """Drives query execution against a ``InMemoryChainReader``."""
-
-    def __init__(self, reader: InMemoryChainReader) -> None: ...
-
-class QueryBuilder:
-    """Atomic factory for ``MeshQuery``. Chain ``.from_origin(...)``,
-    ``.filter(...)``, ``.window(...)``, ``.aggregate(...)``,
-    ``.build()``."""
-
-class Predicate:
-    """MeshDB filter predicate IR (note: distinct from the
-    capability-system ``Predicate``)."""
+    kind: Optional[str]
 
 class ResultRow:
-    """A single materialized row from a query."""
+    """One row from a query result. ``origin`` is the chain's
+    16-hex u64 identifier; ``seq`` is the sequence number;
+    ``payload`` is opaque bytes."""
+
+    @property
+    def origin(self) -> int: ...
+    @property
+    def seq(self) -> int: ...
+    @property
+    def payload(self) -> bytes: ...
+    def decode_aggregate(self) -> Optional["AggregateResult"]:
+        """Try to decode this row's payload as an aggregate
+        payload. Returns ``None`` for non-aggregate rows."""
+        ...
+    def decode_joined(self) -> Optional["JoinedRow"]:
+        """Try to decode this row's payload as a joined-row
+        payload. Returns ``None`` when the bytes don't
+        deserialize as a JoinedRow."""
+        ...
+    def decode_window(self) -> Optional["WindowBoundary"]:
+        """Try to decode this row's payload as a window bucket.
+        Returns ``None`` when the bytes don't deserialize as a
+        WindowBoundary."""
+        ...
+    def __repr__(self) -> str: ...
 
 class AggregateResult:
-    """Aggregate output (count / sum / min / max / avg)."""
+    """Decoded aggregate-row payload. ``kind`` names which
+    aggregate function ran; ``value`` is the numeric output;
+    ``count`` mirrors ``value`` as an integer for count-flavored
+    kinds."""
+
+    @property
+    def group(self) -> Optional["GroupKey"]: ...
+    @property
+    def kind(self) -> str: ...
+    @property
+    def value(self) -> Optional[float]: ...
+    @property
+    def count(self) -> Optional[int]: ...
+    def __repr__(self) -> str: ...
+
+class GroupKey:
+    """Decoded group-key identifier carried inside an
+    ``AggregateResult``. ``kind`` is ``"origin"`` / ``"seq"`` /
+    ``"origin_seq"``."""
+
+    @property
+    def kind(self) -> str: ...
+    @property
+    def origin(self) -> Optional[int]: ...
+    @property
+    def seq(self) -> Optional[int]: ...
+    def __repr__(self) -> str: ...
 
 class JoinedRow:
-    """Row from a join operator."""
+    """Decoded join-row payload. ``left`` / ``right`` are the
+    source rows from each side of the join; either side is
+    ``None`` for outer-join unmatched rows."""
+
+    @property
+    def left(self) -> Optional["ResultRow"]: ...
+    @property
+    def right(self) -> Optional["ResultRow"]: ...
+    def __repr__(self) -> str: ...
+
+class WindowBoundary:
+    """Decoded window-bucket payload. ``start`` and ``end`` are
+    the bucket's seq bounds (half-open); ``rows`` is the list of
+    rows that landed in the bucket."""
+
+    @property
+    def start(self) -> int: ...
+    @property
+    def end(self) -> int: ...
+    @property
+    def rows(self) -> List["ResultRow"]: ...
+    def __repr__(self) -> str: ...
 
 class CachePolicy:
     """Cache config envelope for ``ExecuteOptions``."""
 
-class ExecuteOptions:
-    """Per-execution config knobs (cache policy, timeouts)."""
+    @staticmethod
+    def permanent() -> "CachePolicy":
+        """Cache until LRU eviction. Use only for queries whose
+        result is immutable under substrate semantics."""
+        ...
+    @staticmethod
+    def time_bound(seconds: float = 5.0) -> "CachePolicy":
+        """TTL expiry. Defaults to 5 s."""
+        ...
+    def __repr__(self) -> str: ...
 
-class GroupKey:
-    """Group-by key tuple from a window/aggregate result."""
+class ExecuteOptions:
+    """Per-execute options. Defaults: ``bypass_cache=False``,
+    ``cache_policy=TimeBound(5s)``."""
+
+    def __init__(
+        self,
+        bypass_cache: bool = False,
+        cache_policy: Optional["CachePolicy"] = None,
+    ) -> None: ...
+    @property
+    def bypass_cache(self) -> bool: ...
+    def __repr__(self) -> str: ...
+
+class Predicate:
+    """MeshDB filter predicate IR (note: distinct from the
+    capability-system ``Predicate``). Construct via the static
+    factory methods."""
+
+    @staticmethod
+    def exists(field: str) -> "Predicate":
+        """``field`` is present (any value)."""
+        ...
+    @staticmethod
+    def equals(field: str, value: str) -> "Predicate":
+        """``field == value`` (string equality)."""
+        ...
+    @staticmethod
+    def numeric_at_least(field: str, threshold: float) -> "Predicate":
+        """``field >= threshold`` (numeric)."""
+        ...
+    @staticmethod
+    def numeric_at_most(field: str, threshold: float) -> "Predicate":
+        """``field <= threshold`` (numeric)."""
+        ...
+    @staticmethod
+    def numeric_in_range(field: str, min: float, max: float) -> "Predicate":
+        """``min <= field <= max`` (numeric, both bounds inclusive)."""
+        ...
+    @staticmethod
+    def string_prefix(field: str, prefix: str) -> "Predicate":
+        """``field.startswith(prefix)``."""
+        ...
+    @staticmethod
+    def string_matches(field: str, pattern: str) -> "Predicate":
+        """``pattern in field`` (substring)."""
+        ...
+    @staticmethod
+    def semver_at_least(field: str, version: str) -> "Predicate":
+        """``field >= version`` (semver)."""
+        ...
+    @staticmethod
+    def and_(predicates: List["Predicate"]) -> "Predicate":
+        """Conjunction. Empty list evaluates to ``True``."""
+        ...
+    @staticmethod
+    def or_(predicates: List["Predicate"]) -> "Predicate":
+        """Disjunction. Empty list evaluates to ``False``."""
+        ...
+    @staticmethod
+    def not_(predicate: "Predicate") -> "Predicate":
+        """Negation."""
+        ...
+    def __repr__(self) -> str: ...
+
+class MeshQuery:
+    """A planned query AST. Reusable across runners. Construct
+    via static factory methods or via ``MeshQuery.builder()``."""
+
+    @staticmethod
+    def at(origin: int, seq: int) -> "MeshQuery":
+        """Read the event at ``seq`` from chain ``origin``."""
+        ...
+    @staticmethod
+    def between(origin: int, start: int, end: int) -> "MeshQuery":
+        """Read events in the half-open seq range
+        ``[start, end)`` from chain ``origin``."""
+        ...
+    @staticmethod
+    def latest(origin: int) -> "MeshQuery":
+        """Read the tip event from chain ``origin``."""
+        ...
+    @staticmethod
+    def builder() -> "QueryBuilder":
+        """Start a fluent builder."""
+        ...
+    @staticmethod
+    def filter(inner: "MeshQuery", predicate: "Predicate") -> "MeshQuery":
+        """Filter ``inner``'s rows by ``predicate``."""
+        ...
+    @staticmethod
+    def window(inner: "MeshQuery", size: int) -> "MeshQuery":
+        """Tumbling window on ``seq`` with the given bucket
+        ``size``."""
+        ...
+    @staticmethod
+    def count(
+        inner: "MeshQuery", group_by: Optional[List[str]] = None
+    ) -> "MeshQuery":
+        """Count rows."""
+        ...
+    @staticmethod
+    def sum(
+        inner: "MeshQuery",
+        field: str,
+        group_by: Optional[List[str]] = None,
+    ) -> "MeshQuery":
+        """Sum of a numeric field across rows."""
+        ...
+    @staticmethod
+    def avg(
+        inner: "MeshQuery",
+        field: str,
+        group_by: Optional[List[str]] = None,
+    ) -> "MeshQuery":
+        """Arithmetic mean across rows whose field resolves to
+        a number."""
+        ...
+    @staticmethod
+    def min(
+        inner: "MeshQuery",
+        field: str,
+        group_by: Optional[List[str]] = None,
+    ) -> "MeshQuery": ...
+    @staticmethod
+    def max(
+        inner: "MeshQuery",
+        field: str,
+        group_by: Optional[List[str]] = None,
+    ) -> "MeshQuery": ...
+    @staticmethod
+    def percentile(
+        inner: "MeshQuery",
+        field: str,
+        p: float,
+        group_by: Optional[List[str]] = None,
+    ) -> "MeshQuery":
+        """Nearest-rank exact percentile at ``p`` in
+        ``[0.0, 1.0]``."""
+        ...
+    @staticmethod
+    def distinct_count(
+        inner: "MeshQuery",
+        field: str,
+        group_by: Optional[List[str]] = None,
+    ) -> "MeshQuery":
+        """Exact distinct count over the canonical string
+        projection of a field."""
+        ...
+    @staticmethod
+    def lineage_emit(
+        origin: int, entries: List["LineageEntry"], direction: str
+    ) -> "MeshQuery":
+        """Emit a pre-walked lineage as one ``ResultRow`` per
+        entry. ``direction`` is ``"back"`` or ``"forward"``."""
+        ...
+    @staticmethod
+    def join(
+        left: "MeshQuery",
+        right: "MeshQuery",
+        kind: str,
+        key: str,
+        strategy: Optional[str] = None,
+        watermark_secs: float = 5.0,
+    ) -> "MeshQuery":
+        """Inner / outer hash-join over row-intrinsic or JSON
+        payload keys."""
+        ...
+    def __repr__(self) -> str: ...
+
+class QueryBuilder:
+    """Fluent builder for the common-ops query shape. Chain
+    ``.at`` / ``.between`` / ``.latest`` to seed; ``.filter`` /
+    ``.count`` / aggregates / ``.window`` / ``.join`` to
+    compose; ``.build()`` to consume into a ``MeshQuery``."""
+
+    def at(self, origin: int, seq: int) -> "QueryBuilder":
+        """Source: read a single event at ``seq``."""
+        ...
+    def between(
+        self, origin: int, start: int, end: int
+    ) -> "QueryBuilder":
+        """Source: read events in the half-open seq range."""
+        ...
+    def latest(self, origin: int) -> "QueryBuilder":
+        """Source: read the tip event."""
+        ...
+    def filter(self, predicate: "Predicate") -> "QueryBuilder":
+        """Filter the current pipeline's rows by ``predicate``."""
+        ...
+    def count(
+        self, group_by: Optional[List[str]] = None
+    ) -> "QueryBuilder": ...
+    def sum(
+        self, field: str, group_by: Optional[List[str]] = None
+    ) -> "QueryBuilder": ...
+    def avg(
+        self, field: str, group_by: Optional[List[str]] = None
+    ) -> "QueryBuilder": ...
+    def min(
+        self, field: str, group_by: Optional[List[str]] = None
+    ) -> "QueryBuilder": ...
+    def max(
+        self, field: str, group_by: Optional[List[str]] = None
+    ) -> "QueryBuilder": ...
+    def percentile(
+        self,
+        field: str,
+        p: float,
+        group_by: Optional[List[str]] = None,
+    ) -> "QueryBuilder": ...
+    def distinct_count(
+        self, field: str, group_by: Optional[List[str]] = None
+    ) -> "QueryBuilder": ...
+    def window(self, size: int) -> "QueryBuilder":
+        """Tumbling window on ``seq`` over the current pipeline."""
+        ...
+    def join(
+        self,
+        right: "MeshQuery",
+        kind: str,
+        key: str,
+        strategy: Optional[str] = None,
+        watermark_secs: float = 5.0,
+    ) -> "QueryBuilder": ...
+    def build(self) -> "MeshQuery":
+        """Terminal: consume the builder into a ``MeshQuery``."""
+        ...
+    def __repr__(self) -> str: ...
 
 class LineageEntry:
-    """Source-event reference attached to a result row."""
+    """One chain reached during a lineage walk. Hand to
+    ``MeshQuery.lineage_emit(...)``."""
 
-class WindowBoundary:
-    """Window boundary marker emitted by streaming aggregates."""
+    def __init__(
+        self, origin: int, depth: int, tip_seq: Optional[int] = None
+    ) -> None: ...
+    @property
+    def origin(self) -> int: ...
+    @property
+    def depth(self) -> int: ...
+    @property
+    def tip_seq(self) -> Optional[int]: ...
+    def __repr__(self) -> str: ...
+
+class InMemoryChainReader:
+    """In-process ``ChainReader`` Python wrapper. Slice 1 ships
+    a simple in-memory variant; ``.append(origin, seq, payload)``
+    populates it. Pass to ``MeshQueryRunner``."""
+
+    def __init__(self) -> None: ...
+    def append(self, origin: int, seq: int, payload: bytes) -> None:
+        """Append a single event to the in-memory store."""
+        ...
+    def latest_seq(self, origin: int) -> Optional[int]:
+        """Tip of chain ``origin``, or ``None`` if unknown."""
+        ...
+    def __repr__(self) -> str: ...
+
+class MeshQueryRunner:
+    """Drives query execution against an ``InMemoryChainReader``.
+    Sync-drain by design — Python is sync-first."""
+
+    def __init__(
+        self, reader: "InMemoryChainReader", enable_cache: bool = False
+    ) -> None: ...
+    def execute(
+        self,
+        query: "MeshQuery",
+        options: Optional["ExecuteOptions"] = None,
+    ) -> List["ResultRow"]:
+        """Execute ``query`` synchronously. Returns the full row
+        list."""
+        ...
 
 # ---- Dataforts blob surface (`blob.rs`) -------------------------------------
 
@@ -1121,35 +1501,277 @@ class DeckSdkError(Exception):
     kind: Optional[str]
 
 class OperatorIdentity:
-    """Operator credential bundle."""
+    """Operator credential bundle. Construct via ``generate()``
+    (tests) or ``from_seed(bytes)`` (production loads)."""
+
+    @staticmethod
+    def generate() -> "OperatorIdentity":
+        """Generate a fresh operator identity."""
+        ...
+    @staticmethod
+    def from_seed(seed: bytes) -> "OperatorIdentity":
+        """Load from a 32-byte ed25519 seed."""
+        ...
+    @staticmethod
+    def from_identity(identity: "Identity") -> "OperatorIdentity":
+        """Build from an existing ``net.Identity``."""
+        ...
+    @property
+    def operator_id(self) -> int:
+        """64-bit operator identifier (the keypair's origin hash)."""
+        ...
+    def public_key(self) -> bytes:
+        """32-byte ed25519 public key."""
+        ...
+    def sign_proposal(
+        self, simulated: "SimulatedIceProposal"
+    ) -> dict:
+        """Sign a simulated ICE proposal. Returns
+        ``{"operator_id": int, "signature": bytes}``."""
+        ...
+    def sign_payload(self, payload: bytes) -> dict:
+        """Sign raw payload bytes with this operator's ed25519
+        key."""
+        ...
+    def __repr__(self) -> str: ...
 
 class DeckClient:
     """Operator-side client for the cluster's admin / snapshot /
     log / failure / ICE surfaces."""
 
+    def __init__(
+        self,
+        operator_seed: bytes,
+        meshos_config: Optional[dict] = None,
+        deck_config: Optional[dict] = None,
+    ) -> None:
+        """Construct a deck client owning a private supervisor
+        runtime. ``operator_seed`` must be exactly 32 bytes."""
+        ...
+    @staticmethod
+    def from_meshos(
+        sdk: "MeshOsDaemonSdk",
+        identity: "OperatorIdentity",
+        config: Optional[dict] = None,
+    ) -> "DeckClient":
+        """Construct against a running ``MeshOsDaemonSdk``."""
+        ...
+    def identity(self) -> "OperatorIdentity":
+        """Operator identity bound to this client."""
+        ...
+    def close(self) -> None:
+        """Tear down the private supervisor runtime if this
+        client owns one. Idempotent."""
+        ...
+    @property
+    def admin(self) -> "AdminCommands":
+        """Typed admin-event surface."""
+        ...
+    def status(self) -> str:
+        """One-shot read of the latest ``MeshOsSnapshot`` as a
+        JSON string."""
+        ...
+    def status_summary(self) -> dict:
+        """One-shot read of the rolled-up ``StatusSummary``."""
+        ...
+    def snapshots(self) -> "SnapshotStream":
+        """Live snapshot stream — sync iterator over
+        JSON-encoded ``MeshOsSnapshot`` strings."""
+        ...
+    def status_summary_stream(self) -> "StatusSummaryStream":
+        """Live ``StatusSummary`` stream — sync iterator over
+        typed dicts."""
+        ...
+    @property
+    def ice(self) -> "IceCommands":
+        """Break-glass surface."""
+        ...
+    def audit(self) -> Any:
+        """Audit query builder over the in-memory admin-audit
+        ring."""
+        ...
+    def subscribe_logs(self, filter: Optional[dict] = None) -> Any:
+        """Subscribe to per-daemon / per-node log lines."""
+        ...
+    def subscribe_failures(self, since_seq: int = 0) -> Any:
+        """Subscribe to executor failure records starting from
+        ``since_seq + 1``."""
+        ...
+    def __repr__(self) -> str: ...
+
 class AdminCommands:
-    """Admin command dispatcher exposed via ``DeckClient.admin()``."""
+    """Admin command dispatcher exposed via ``DeckClient.admin``.
+    Each method commits an ``AdminEvent`` variant + returns a
+    ``ChainCommit`` dict."""
+
+    def drain(self, node: int, drain_for_ms: int) -> dict:
+        """Drain a node — start draining workloads."""
+        ...
+    def enter_maintenance(
+        self, node: int, drain_for_ms: Optional[int] = None
+    ) -> dict:
+        """Enter maintenance mode on a node."""
+        ...
+    def exit_maintenance(self, node: int) -> dict: ...
+    def cordon(self, node: int) -> dict: ...
+    def uncordon(self, node: int) -> dict: ...
+    def drop_replicas(self, node: int, chains: List[int]) -> dict: ...
+    def invalidate_placement(self, node: int) -> dict: ...
+    def restart_all_daemons(self, node: int) -> dict: ...
+    def clear_avoid_list(self, node: int) -> dict: ...
 
 class SnapshotStream:
-    """Async stream over snapshot JSON envelopes."""
+    """Live ``MeshOsSnapshot`` stream as a Python sync iterator.
+    Each ``__next__`` blocks until the next snapshot publishes.
+    Slice 1 returns JSON strings."""
+
+    def __iter__(self) -> "SnapshotStream": ...
+    def __next__(self) -> str: ...
+    def close(self) -> None:
+        """Close the stream explicitly. Subsequent ``__next__``
+        calls raise ``StopIteration``. Idempotent."""
+        ...
 
 class StatusSummaryStream:
-    """Async stream over status summary envelopes."""
+    """Live ``StatusSummary`` stream — sync iterator over typed
+    dicts."""
+
+    def __iter__(self) -> "StatusSummaryStream": ...
+    def __next__(self) -> dict: ...
+    def close(self) -> None: ...
 
 class IceCommands:
-    """ICE break-glass command dispatcher (slice 3)."""
+    """ICE break-glass command dispatcher. Each factory returns
+    an ``IceProposal`` that must be ``simulate()``-d before
+    commit per the typestate contract."""
+
+    def freeze_cluster(self, ttl_ms: int) -> "IceProposal": ...
+    def flush_avoid_lists(self, scope: dict) -> "IceProposal": ...
+    def force_evict_replica(
+        self, chain: int, victim: int
+    ) -> "IceProposal": ...
+    def force_restart_daemon(
+        self, id: int, name: str
+    ) -> "IceProposal":
+        """Propose force-restarting a daemon. ``id`` is the
+        registry-local daemon id; ``name`` is
+        ``MeshDaemon::name()``."""
+        ...
+    def force_cutover(
+        self, chain: int, target: int
+    ) -> "IceProposal": ...
+    def kill_migration(self, migration: int) -> "IceProposal": ...
+    def thaw_cluster(self) -> "IceProposal": ...
 
 class IceProposal:
-    """ICE break-glass proposal envelope."""
+    """ICE break-glass proposal envelope. Pre-simulation
+    typestate. Has no ``commit`` method — must be ``simulate()``-d
+    first."""
+
+    @property
+    def issued_at_ms(self) -> int: ...
+    def simulate(self) -> "SimulatedIceProposal":
+        """Pre-execution preview. Consumes the proposal —
+        subsequent calls raise
+        ``DeckSdkError(kind="already_simulated")``."""
+        ...
+    def __repr__(self) -> str: ...
 
 class SimulatedIceProposal:
-    """Dry-run ICE proposal (substrate-internal)."""
+    """Dry-run ICE proposal. Only class exposing ``commit``."""
+
+    def blast_radius(self) -> str:
+        """Pre-execution blast-radius preview as a JSON string."""
+        ...
+    @property
+    def issued_at_ms(self) -> int: ...
+    def blast_hash(self) -> bytes:
+        """Blake3 digest of the blast radius. Signers must
+        cover this exact hash."""
+        ...
+    def signing_payload(self) -> bytes:
+        """Deterministic signing payload bytes the verifier will
+        reconstruct."""
+        ...
+    def commit(self, signatures: List[dict]) -> dict:
+        """Commit the proposal with the supplied operator
+        signatures. Each signature is a dict
+        ``{"operator_id": int, "signature": bytes}``."""
+        ...
+    def __repr__(self) -> str: ...
 
 class OperatorRegistry:
-    """Operator policy registry."""
+    """Operator policy registry. Holds known operator public
+    keys keyed by 64-bit operator id."""
+
+    def __init__(self) -> None: ...
+    def insert(self, operator_id: int, public_key: bytes) -> None:
+        """Insert an operator's 32-byte ed25519 public key under
+        ``operator_id``."""
+        ...
+    def register(self, identity: "OperatorIdentity") -> None:
+        """Register ``identity``'s public key under its derived
+        operator id."""
+        ...
+    def contains(self, operator_id: int) -> bool:
+        """``True`` iff ``operator_id`` is registered."""
+        ...
+    def is_empty(self) -> bool: ...
+    def verify(self, signature: dict, payload: bytes) -> None:
+        """Verify a single ``OperatorSignature`` dict over
+        ``payload``."""
+        ...
+    def verify_bundle(
+        self,
+        signatures: List[dict],
+        payload: bytes,
+        threshold: int,
+    ) -> None:
+        """Verify every signature in the bundle over ``payload``
+        and confirm at least ``threshold`` distinct operator
+        ids signed it."""
+        ...
+    def __contains__(self, operator_id: int) -> bool: ...
+    def __len__(self) -> int: ...
+    def __repr__(self) -> str: ...
 
 class AdminVerifier:
-    """Admin-command policy verifier."""
+    """Substrate-side admin commit verifier. Bundles an
+    ``OperatorRegistry`` snapshot with the cluster's signature
+    threshold + freshness / skew / ICE-cooldown windows."""
+
+    def __init__(
+        self, registry: "OperatorRegistry", threshold: int
+    ) -> None: ...
+    @staticmethod
+    def with_freshness(
+        registry: "OperatorRegistry",
+        threshold: int,
+        freshness_window_ms: int,
+        future_skew_ms: int,
+    ) -> "AdminVerifier":
+        """Build with explicit freshness + future-skew windows
+        and the default ICE cooldown."""
+        ...
+    @staticmethod
+    def with_full_policy(
+        registry: "OperatorRegistry",
+        threshold: int,
+        freshness_window_ms: int,
+        future_skew_ms: int,
+        ice_cooldown_ms: int,
+    ) -> "AdminVerifier":
+        """Build with every policy knob explicit."""
+        ...
+    @property
+    def threshold(self) -> int: ...
+    @property
+    def freshness_window_ms(self) -> int: ...
+    @property
+    def future_skew_ms(self) -> int: ...
+    @property
+    def ice_cooldown_ms(self) -> int: ...
+    def __repr__(self) -> str: ...
 
 # ---- Redis Streams dedup (`redis_dedup.rs`) ---------------------------------
 

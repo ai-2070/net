@@ -1653,6 +1653,32 @@ domains): [`../README.md#daemons`](../README.md#daemons).
 | `file.tail(fromSeq?)` | `AsyncIterable<RedexEvent>` |
 | `file.sync()` / `file.close()` | Explicit fsync / close |
 
+## Cargo features
+
+`@ai2070/net-sdk` wraps `@ai2070/net` (the napi-rs binding), so its reachable surface matches whatever Cargo features the underlying `.node` artifact was built with. The five feature flags relevant to building from source:
+
+| Feature | What it enables on the underlying `@ai2070/net` binding |
+|---|---|
+| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, `Task`, `Memory`, watch iterators, `RedexError`, `CortexError`, `NetDbError` |
+| `redex-disk` | Disk-backed RedEX persistence — the `persistentDir` ctor option and `persistent: true` on `openFile`. Without it the persistent path rejects with `RedexError`. |
+| `netdb` | `NetDb` composition (requires `cortex`); the `net_netdb_*` FFI entry points ship with this feature. |
+| `meshdb` | `MeshQuery`, `MeshQueryRunner`, `MeshQueryStream`, `QueryBuilder`, `InMemoryChainReader`, plus the `libnet_meshdb` cdylib. |
+| `meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, plus the `libnet_meshos` cdylib. |
+
+A `.node` artifact built without a feature silently omits its symbols — there is no build warning. The TypeScript wrapper destructures the napi exports lazily, so a missing feature surfaces as `undefined` at the import site rather than a load-time error.
+
+Enable at build time (rebuild the underlying `@ai2070/net` artifact, then re-link / reinstall in the consumer):
+
+```bash
+cd net/crates/net/bindings/node
+napi build --platform --release --features "cortex netdb redex-disk meshdb meshos"
+# The repo's `npm run build` script already passes a full feature
+# set; see `bindings/node/package.json` -> scripts.build for the
+# canonical list of flags shipped to npm.
+```
+
+Pre-built npm artifacts ship with every feature enabled; the flags above only matter for source builds.
+
 ## License
 
 Apache-2.0

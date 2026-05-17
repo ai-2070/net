@@ -1,10 +1,14 @@
 # SDK Binding Coverage Survey — 2026-05-17
 
 Surveys the per-language SDK surface for the four persistence/folded-state
-layers (**RedEX**, **RedEX disk**, **CortEX**, **NetDb**) and the two
-substrate query/daemon layers (**MeshDB**, **MeshOS**).
+layers (**RedEX**, **RedEX disk**, **CortEX**, **NetDb**), the two
+substrate query/daemon layers (**MeshDB**, **MeshOS**), and the operator
+control plane (**Deck**).
 
-Verified against source in `net/crates/net/` rather than docs.
+Verified against source in `net/crates/net/` rather than docs. Re-verified
+after commit `33edd522` ("Split RedEX / CortEX / NetDb out of net.go.h into
+net_cortex.h") which landed P1.1 (NetDb C FFI) and P3.1 (header split) from
+the original plan.
 
 ---
 
@@ -12,34 +16,36 @@ Verified against source in `net/crates/net/` rather than docs.
 
 | Surface | Node | Python | Go | C |
 |---|---|---|---|---|
-| **RedEX** (in-memory log) | `Redex` — napi `bindings/node/index.d.ts:1270` + wrapper `sdk-ts/src/cortex.ts:128` | `net.Redex` (PyO3) — `bindings/python/python/net/_net.pyi:249` | `Redex` / `NewRedex()` — `bindings/go/net/redex.go:328` and top-level `go/cortex.go:114` | `net_redex_new()` — `include/net.go.h:260` (not in `include/net.h`) |
-| **RedEX disk** (persistent) | `new Redex({ persistentDir })` | `Redex(persistent_dir=...)` | `NewRedexWithPersistentDir(dir)` — `bindings/go/net/redex.go:337` | `net_redex_new_with_persistent_dir(path)` (via `net.go.h`) |
-| **CortEX** (Tasks + Memories adapters, watchers) | `TasksAdapter`, `MemoriesAdapter` — `sdk-ts/src/cortex.ts:386,550` | `TasksAdapter`, `MemoriesAdapter`, `Task`, `Memory`, `*WatchIter` — `_net.pyi:340,426` | `OpenTasksAdapter` / `OpenMemoriesAdapter` — `bindings/go/net/tasks.go:235`, `memories.go:200`; plus `OpenTasks` / `OpenMemories` aliases in top-level `go/cortex.go` | `net_tasks_*`, `net_memories_*` — `include/net.go.h:283-339` |
-| **NetDb** (cross-adapter façade + snapshot bundle) | `NetDb.open()` / `openFromSnapshot()` / `snapshot()` — `index.d.ts:1270`, sdk-ts `cortex.ts:708` | `net.NetDb` — `_net.pyi:512` | **Not exposed.** Rust FFI source notes "Go-side `NetDb` struct composes" (`src/ffi/cortex.rs:1441`); only `ErrNetDb` is reserved for forward compatibility | **No `net_netdb_*` symbols** in any shipped header. `NetDb` composition only happens inside the Node/Python binding crates (which call Rust directly, not the cortex FFI) |
+| **RedEX** (in-memory log) | `Redex` — napi `bindings/node/index.d.ts:1270` + wrapper `sdk-ts/src/cortex.ts:128` | `net.Redex` (PyO3) — `bindings/python/python/net/_net.pyi:249` | `Redex` / `NewRedex()` — `bindings/go/net/redex.go:328` and top-level `go/cortex.go:114` | `net_redex_new()` — `include/net_cortex.h:42` (post-split; previously `net.go.h:260`) |
+| **RedEX disk** (persistent) | `new Redex({ persistentDir })` | `Redex(persistent_dir=...)` | `NewRedexWithPersistentDir(dir)` — `bindings/go/net/redex.go:337` | `net_redex_new_with_persistent_dir(path)` — `net_cortex.h` |
+| **CortEX** (Tasks + Memories adapters, watchers) | `TasksAdapter`, `MemoriesAdapter` — `sdk-ts/src/cortex.ts:386,550` | `TasksAdapter`, `MemoriesAdapter`, `Task`, `Memory`, `*WatchIter` — `_net.pyi:340,426` | `OpenTasksAdapter` / `OpenMemoriesAdapter` — `bindings/go/net/tasks.go:235`, `memories.go:200`; plus `OpenTasks` / `OpenMemories` aliases in top-level `go/cortex.go` | `net_tasks_*`, `net_memories_*` — `include/net_cortex.h` (split out of `net.go.h`) |
+| **NetDb** (cross-adapter façade + snapshot bundle) | `NetDb.open()` / `openFromSnapshot()` / `snapshot()` — `index.d.ts:1166`, sdk-ts `cortex.ts:708` | `net.NetDb` + `NetDbError` — `__init__.py:75-97` (runtime-only; stub does not declare it) | **Still not exposed.** No `bindings/go/net/netdb.go` despite the C FFI now shipping. P1.2 below | **Shipped post-survey.** `net_cortex.h:39,139-150` — `net_netdb_open / open_from_snapshot / snapshot / free_bundle / tasks / memories / close / free`. Borrow semantics on adapter accessors (lifetime bounded by parent NetDb, no double-free with `net_tasks_adapter_free`) |
 
 ### Notes
 
-- **Canonical C `net.h` is bus-only.** The RedEX/CortEX C surface lives in
-  `include/net.go.h` (the 320-line `net.h` has no `redex`/`cortex`/`tasks`/
-  `memories` symbols). The "Go" filename is a misnomer — it's a plain C
-  header any C / C++ / Zig / Swift consumer can link against. The dedicated
-  `net_meshdb.h` next to it is a *different* product (MeshDB query layer),
-  not NetDb.
-- **Python split.** The cortex/NetDb surface is **only** in the low-level
-  PyO3 binding (`bindings/python` → `net._net`). The higher-level `sdk-py`
-  package (`net_sdk`) has no `redex.py` / `cortex.py` / `netdb.py` and
-  does not re-export them. So `from net import Redex, NetDb`, not
-  `from net_sdk import …`.
+- **C header layout (post-split).** Four headers ship today: `net.h` (bus
+  + shared error enum, 363 lines), `net_cortex.h` (RedEX / CortEX /
+  NetDb, 156 lines — added in commit `33edd522`), `net_rpc.h` (RPC, 498
+  lines), and the convenience header `net.go.h` (1528 lines, now
+  `#include`s `net_cortex.h` and inlines RPC + Deck declarations). The
+  three peer surfaces — `net_meshdb.h`, `net_meshos.h`, `net_deck.h` —
+  each ship as separate cdylibs.
+- **Python split.** Both tiers now ship: low-level PyO3 binding
+  (`bindings/python` → `net._net`) AND `sdk-py/src/net_sdk/{redex,
+  cortex, netdb, meshdb, meshos, deck}.py` ergonomic wrappers with
+  re-exports + context managers. `from net_sdk.redex import Redex`
+  and `from net import Redex` both work.
 - **Feature gate.** The whole stack is behind the Rust `cortex` Cargo
   feature. Python's `__init__.py` try-imports it
   (`bindings/python/python/net/__init__.py:67-107`); wheels built without
   `cortex` silently omit the symbols.
-- **NetDb gap on Go/C is structural, not a doc bug.** The `cortex.rs`
-  FFI deliberately ships adapters individually; NetDb composition is done
-  in the napi-rs / PyO3 layer by calling the Rust core directly. To get
-  equivalent semantics from Go or C today, callers open `Tasks` +
-  `Memories` separately and query each; there's no single
-  snapshot/restore bundle.
+- **NetDb gap on Go remains at the binding tier only.** The C FFI now
+  ships (P1.1 done), and the top-level `go/netdb.go` already wraps it
+  end-to-end (214 lines, full Tasks/Memories/Snapshot surface). But the
+  parallel `bindings/go/net/netdb.go` is still missing — Go consumers
+  importing the binding tier (`bindings/go/net`) instead of the
+  top-level `go/` package have to open `Tasks` + `Memories` separately
+  there. P1.2 below.
 
 ---
 
@@ -47,64 +53,88 @@ Verified against source in `net/crates/net/` rather than docs.
 
 | Surface | Node | Python | Go | C |
 |---|---|---|---|---|
-| **MeshDB** (query layer: AST + runner + chain reader) | napi `bindings/node` — `MeshQuery`, `MeshQueryRunner`, `MeshQueryStream` (`index.d.ts:883,975,998`) + helper `meshdb.ts`. **Not in `sdk-ts`** — no `meshdb.ts` wrapper | PyO3 `net._net` (via `__init__.py:516-553`): `MeshQuery`, `MeshQueryRunner`, `InMemoryChainReader`, `QueryBuilder`, `Predicate`, `ResultRow`, `AggregateResult`, `JoinedRow`, `WindowBoundary`, `GroupKey`, `LineageEntry`, `CachePolicy`, `ExecuteOptions`, `MeshDbError`. Typed stub `_net.pyi` does not declare them — runtime-only. No `net_sdk` wrapper module | `bindings/go/net/meshdb.go` — `MeshDBReader`, `MeshDBResult`, `MeshDBResultRow`, `MeshDBError`, `NewMeshDBReader()`. **Not re-exported from top-level `go/`** | Dedicated `include/net_meshdb.h` + `libnet_meshdb` cdylib (9 prototypes — small surface: Reader / Runner / Query / Iter). Built from `bindings/go/meshdb-ffi` |
-| **MeshOS** (daemon-author SDK) | napi `bindings/node` — `MeshOsDaemonHandle`, `MeshOsDaemonSdk` (`index.d.ts:773,833`) + `MeshOsConfigJs`. Plus `sdk-ts/src/meshos.ts:263,338` — `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `MeshOsSdkError` ergonomic wrapper | PyO3 `net._net` — `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `MeshOsSdkError` (`__init__.py:356-401`). Plus high-level `sdk-py/src/net_sdk/meshos.py` — `MeshOsDaemon` Protocol, typed-dict envelopes (`DaemonControl`, `MaintenanceState`), context-manager wrappers. Typed stub `_net.pyi` does not declare them — runtime-only | `bindings/go/net/meshos.go` — full surface (~1.2k LOC): `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `MeshOsConfig`, `MeshOsDaemon` interface with Go-side callback trampolines (`Snapshot` / `Restore` / `OnControl` / `Health` / `Saturation`), `MeshOsMetadataView`, `PublishCapabilities`, context-aware variants. Not re-exported from top-level `go/` | Dedicated `include/net_meshos.h` + `libnet_meshos` cdylib (~46 prototypes — full surface). Built from `bindings/go/meshos-ffi` |
+| **MeshDB** (query layer: AST + runner + chain reader) | napi `bindings/node` — `MeshQuery`, `MeshQueryRunner`, `MeshQueryStream` (`index.d.ts:773,975,998`) + ergonomic `sdk-ts/src/meshdb.ts` wrapper with `parseMeshDbErrorKind` helper | PyO3 `net._net` (via `__init__.py:516-553`): `MeshQuery`, `MeshQueryRunner`, `InMemoryChainReader`, `QueryBuilder`, `Predicate`, `ResultRow`, `AggregateResult`, `JoinedRow`, `WindowBoundary`, `GroupKey`, `LineageEntry`, `CachePolicy`, `ExecuteOptions`, `MeshDbError` + `sdk-py/src/net_sdk/meshdb.py` wrapper with `runner_cm` context manager. Typed stub `_net.pyi` declares the classes at lines 1007-1023 but **without method signatures** | `bindings/go/net/meshdb.go` — `MeshDBReader`, `MeshDBResult`, `MeshDBResultRow`, `MeshDBError`, `NewMeshDBReader()`. Also re-exported / parallel-implemented at top-level `go/meshdb.go` (326 lines) | Dedicated `include/net_meshdb.h` + `libnet_meshdb` cdylib (9 prototypes — small surface: Reader / Runner / Query / Iter). Built from `bindings/go/meshdb-ffi` |
+| **MeshOS** (daemon-author SDK) | napi `bindings/node` — `MeshOsDaemonHandle`, `MeshOsDaemonSdk` (`index.d.ts:773,833`) + `MeshOsConfigJs`. `registerDaemon(daemon: DaemonObjectTsfns, identity)` accepts full TSFN-bridged trait (process / snapshot / restore / onControl / health / saturation — see `bindings/node/src/meshos.rs:434-540`). Plus `sdk-ts/src/meshos.ts:263,338` ergonomic wrapper | PyO3 `net._net` — `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `MeshOsSdkError` (`__init__.py:356-401`). Plus high-level `sdk-py/src/net_sdk/meshos.py` — `MeshOsDaemon` Protocol, typed-dict envelopes (`DaemonControl`, `MaintenanceState`), context-manager wrappers. Typed stub `_net.pyi` declares the classes at 972-993 but **without method signatures** | `bindings/go/net/meshos.go` — full surface (~1.2k LOC): `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `MeshOsConfig`, `MeshOsDaemon` interface with Go-side callback trampolines (`Snapshot` / `Restore` / `OnControl` / `Health` / `Saturation`), `MeshOsMetadataView`, `PublishCapabilities`, context-aware variants. Also re-exported / parallel-implemented at top-level `go/meshos.go` (997 lines) | Dedicated `include/net_meshos.h` + `libnet_meshos` cdylib (~46 prototypes — full surface). Built from `bindings/go/meshos-ffi` |
 
 ### Notes
 
 - **Both are separate cdylibs.** Unlike RedEX/CortEX (which the Go binding
-  pulls in via `net.go.h`), MeshDB and MeshOS each ship their own header +
-  shared library — `libnet_meshdb.{so,dylib,dll}` and
-  `libnet_meshos.{so,dylib,dll}`. `net.go.h` contains zero `meshdb` /
-  `meshos` symbols. C consumers link the lib they want.
-- **TS coverage is asymmetric.** `sdk-ts` wraps MeshOS but **not MeshDB** —
-  Node MeshDB callers go directly to the napi binding (`@ai2070/net` /
-  `bindings/node`). MeshOS callers get both a low-level napi class and the
-  sdk-ts ergonomic wrapper.
-- **Python coverage is asymmetric in the opposite direction.** `sdk-py`
-  wraps **MeshOS** (`net_sdk/meshos.py` adds Protocol + typed-dicts +
-  context managers) but **not MeshDB**. MeshDB consumers import directly
-  from the `net` package (`from net import MeshQuery, MeshQueryRunner,
-  InMemoryChainReader, …`).
-- **Python typed stub `_net.pyi` is stale for both.** The stub stops at
-  the cortex surface (around line 843, `class Identity`). MeshDB and
-  MeshOS classes are imported and re-exported at runtime in
-  `__init__.py`, but type checkers and IDE autocomplete won't see them
-  unless the stub is extended.
-- **Go has both at the binding level only.** The top-level `go/` package
-  (the "high-level Go SDK") exposes RedEX / CortEX wrappers (`Redex`,
-  `OpenTasks`, etc.) but does **not** re-export MeshDB or MeshOS — Go
-  consumers `import "github.com/ai-2070/net/bindings/go/net"` directly
-  for those.
-- **MeshOS callback model varies.** Go uses cgo trampolines
-  (`goMeshOsProcessTrampoline`, `goMeshOsSnapshotTrampoline`, …) to
-  surface a Go `MeshOsDaemon` interface back through the FFI; Python
-  uses a Protocol class; Node currently exposes `RegisterDaemon` without
-  a callback-trait surface (verify napi exposes a daemon callback trait
-  before assuming parity with Go/Python).
+  pulls in via `net.go.h` / `net_cortex.h`), MeshDB and MeshOS each ship
+  their own header + shared library — `libnet_meshdb.{so,dylib,dll}` and
+  `libnet_meshos.{so,dylib,dll}`. C consumers link the lib they want.
+- **Wrapper parity now complete.** Both `sdk-ts` and `sdk-py` ship
+  MeshDB + MeshOS wrappers (`sdk-ts/src/meshdb.ts`, `meshos.ts`,
+  `sdk-py/src/net_sdk/meshdb.py`, `meshos.py`).
+- **Python typed stub `_net.pyi` is partially stale.** Classes are
+  declared past line 843 (`MeshOsDaemonSdk` at 972, `MeshDb` family at
+  1007-1023, Deck family at 1117-1152) but **with empty bodies** — type
+  checkers see the class exists but `.run()`, `.execute()`, `.admin()`
+  etc. return `Any`. Compare to RedEX/CortEX (lines 249-544) which have
+  full signatures.
+- **MeshOS callback model is symmetric across bindings.** Go cgo
+  trampolines (`goMeshOsProcessTrampoline`, …), Python Protocol class
+  (`MeshOsDaemon`), Node TSFN-bridged daemon object
+  (`DaemonObjectTsfns` in `bindings/node/src/meshos.rs:434-540`,
+  exposed at the napi surface as the `daemon` argument to
+  `registerDaemon`).
 - **Cargo feature gates.** MeshDB is behind the `meshdb` feature; MeshOS
   is behind `meshos`. Wheels / dylibs built without them silently omit
   the symbols (Python's `__init__.py` try-imports both feature blocks).
 
 ---
 
+## 3. Deck (operator control plane)
+
+| Surface | Node | Python | Go | C |
+|---|---|---|---|---|
+| **Deck** (operator client + admin verbs + snapshot/status streams) | `DeckClient`, `OperatorIdentity`, `AdminCommands`, `DeckSnapshotStream`, `DeckStatusSummaryStream` — napi `bindings/node/index.d.ts:354,1433` + ergonomic wrapper `sdk-ts/src/deck.ts:70,309` (`DeckSdkError`, JSON-parsing helpers, async-iterable streams) | `DeckClient`, `OperatorIdentity`, `DeckAdminCommands`, `DeckSnapshotStream`, `DeckStatusSummaryStream` — PyO3 runtime + `sdk-py/src/net_sdk/deck.py` wrapper (JSON parsing, context managers, `.kind` on errors). Stub `_net.pyi:1115-1152` is **forward-declare only** — class names present, no method signatures | `bindings/go/net/deck.go` — `DeckClient`, `NewDeckClient`, `OperatorID`, admin verbs (`Drain` / `EnterMaintenance` / `Cordon` / `DropReplicas` / …), `DeckSnapshotStream`, `DeckStatusSummaryStream`. **Not re-exported from top-level `go/`** | `include/net_deck.h` + `libnet_deck` cdylib (924 lines — full surface incl. admin verbs, ICE break-glass factories, operator identity / registry / admin-verifier) |
+
+### Notes
+
+- **All four bindings expose Deck at the low-level binding tier.** Unlike
+  NetDb (Go gap) or MeshDB (asymmetric wrapper coverage), Deck has full
+  coverage in `bindings/node`, `bindings/python`, `bindings/go/net`, and
+  `include/net_deck.h`. Both ergonomic wrappers (`sdk-ts/deck.ts`,
+  `sdk-py/net_sdk/deck.py`) also exist.
+- **Stub drift on Deck classes.** The Python `_net.pyi` stub declares 13
+  Deck classes (`DeckClient`, `OperatorIdentity`, `DeckAdminCommands`,
+  `DeckSnapshotStream`, `DeckStatusSummaryStream`, plus error/event
+  types) at lines 1115-1152 but **without method bodies** — type
+  checkers see the class exists but not its methods. Compare to
+  RedEX/CortEX (lines 249-544) which have full method signatures. The
+  runtime PyO3 binding has all methods.
+- **Go top-level wrapper missing.** Unlike MeshDB / MeshOS (each
+  shipped at both binding tier and top-level), Deck has no top-level
+  `go/deck.go` companion. Deck callers must import the binding tier
+  directly. P2.4 fixes this.
+
+---
+
 ## Cross-cutting observations
 
-1. **Two Python entry points, one canonical.** `net._net` (PyO3, runtime
-   ground truth) vs. `net_sdk` (pure-Python ergonomic wrappers, partial
-   coverage). RedEX / CortEX / NetDb / MeshDB are PyO3-only today;
-   MeshOS is the one surface that has a sdk-py wrapper.
-2. **Two Node entry points, one canonical.** `@ai2070/net`
-   (napi-rs `bindings/node`, ground truth) vs. `sdk-ts` (ergonomic
-   wrappers). MeshDB is napi-only on the Node side; all other surfaces
-   have sdk-ts wrappers.
-3. **C ABI is split across three+ headers.** `net.h` (bus only),
-   `net.go.h` (bus + RedEX + CortEX + RPC + Deck + … — the catch-all
-   "Go" header), `net_meshdb.h`, `net_meshos.h`. Pick the right one;
-   `net.h` alone gets you almost nothing beyond ingest/poll.
-4. **NetDb gap on Go/C and `sdk-py` wrapper gaps for RedEX/CortEX/NetDb/
-   MeshDB** are the largest parity gaps. If parity matters for any of
-   these surfaces, those are the targets.
+1. **Two Python entry points, both populated.** `net._net` (PyO3, runtime
+   ground truth) and `net_sdk` (pure-Python ergonomic wrappers) now both
+   cover all seven surfaces (RedEX / CortEX / NetDb / MeshDB / MeshOS /
+   Deck). Wrapper modules add re-exports + context managers; the runtime
+   classes themselves live in `net._net`.
+2. **Two Node entry points, both populated.** `@ai2070/net`
+   (napi-rs `bindings/node`, ground truth) and `sdk-ts` (ergonomic
+   wrappers) now both cover all seven surfaces. MeshDB is the most
+   recent addition (`sdk-ts/src/meshdb.ts`).
+3. **C ABI is six headers.** `net.h` (bus + error enum), `net_cortex.h`
+   (RedEX + CortEX + NetDb — post-split), `net_rpc.h` (RPC),
+   `net_meshdb.h` (MeshDB), `net_meshos.h` (MeshOS), `net_deck.h`
+   (Deck). The convenience `net.go.h` `#include`s `net_cortex.h` and
+   inlines RPC + Deck declarations for callers who want everything in
+   one place.
+4. **Remaining parity gaps** — much smaller than the original survey
+   suggested:
+   - `bindings/go/net/netdb.go` missing (top-level `go/netdb.go` already
+     exists)
+   - `go/deck.go` missing (top-level)
+   - `_net.pyi` method bodies missing for MeshDB / MeshOS / Deck
+     classes (~30 classes are forward-declared, not fully typed)
+   - Cargo feature gates undocumented in binding READMEs
 
 ---
 
@@ -116,212 +146,108 @@ Tier 2 items).
 
 ### Tier 1 — capability gaps (the binding can't do something a peer binding can)
 
-**P1.1 — Land `NetDb` FFI surface.** The Rust core already has
-`NetDb` / `NetDbBuilder` / `NetDbSnapshot`; the cortex FFI in
-`src/ffi/cortex.rs` reserves `NET_ERR_NETDB` and even comments
-"Go-side `NetDb` struct composes" but ships no symbols. Add:
+**P1.1 — Land `NetDb` FFI surface.** ✅ **DONE** (commit `33edd522`).
+Shipped in `include/net_cortex.h:39,139-150` with the seven prototypes
+listed in the original plan, plus a `net_netdb_free_bundle` helper for
+the snapshot bytes. Borrow semantics on `net_netdb_tasks` /
+`net_netdb_memories` documented in the header at lines 130-138.
 
-  - `net_netdb_open(redex, config_json, *out_handle) -> int`
-  - `net_netdb_open_from_snapshot(redex, config_json, bundle_bytes, bundle_len, *out_handle) -> int`
-  - `net_netdb_snapshot(handle, *out_bytes, *out_len) -> int`
-  - `net_netdb_tasks(handle, *out_tasks_handle) -> int` (borrow, no-free)
-  - `net_netdb_memories(handle, *out_memories_handle) -> int` (borrow, no-free)
-  - `net_netdb_close(handle) -> int` / `net_netdb_free(handle)`
+**P1.2 — Expose `NetDb` in the Go binding.** ✅ **DONE**.
+`bindings/go/net/netdb.go` (215 lines) ships the `NetDb` type with
+`OpenNetDb` / `OpenNetDbFromSnapshot` / `Tasks` / `Memories` /
+`Snapshot` / `Close` / `Free`. Adapter accessors bridge per-file cgo
+type walls via `newTasksAdapterFromRaw` / `newMemoriesAdapterFromRaw`
+helpers added to `tasks.go` / `memories.go`. Test scaffold at
+`bindings/go/net/netdb_test.go` covers open / accessor / snapshot
+round-trip / adapter-survives-db-free / nil-redex scenarios.
 
-  Borrow semantics on the adapter accessors avoid double-free with
-  `net_tasks_adapter_free` — document that the returned handle's
-  lifetime is bounded by the parent NetDb. Mirror the existing handle
-  convention from RedEX (opaque `*mut T`, JSON config, idempotent
-  free).
-
-  Files: `src/ffi/cortex.rs`, `include/net.go.h` (extend with the new
-  prototypes), regression test that scans both headers for drift
-  (existing scaffold per `net.h` comment at line 38).
-
-**P1.2 — Expose `NetDb` in the Go binding.** Once P1.1 lands, add
-`bindings/go/net/netdb.go` with `NetDb` type, `OpenNetDb(redex,
-config)` / `OpenNetDbFromSnapshot(redex, config, bundle)`,
-`(*NetDb).Tasks() *TasksAdapter`, `(*NetDb).Memories() *MemoriesAdapter`,
-`(*NetDb).Snapshot() ([]byte, error)`, `(*NetDb).Close() error`. Match
-the Go binding's existing finalizer + read-lock pattern (see
-`redex.go` for the template). Re-export from top-level `go/` (see P2.4).
-
-  Files: `bindings/go/net/netdb.go` (new), `bindings/go/net/netdb_test.go`
-  (new), `bindings/go/meshdb-ffi/Cargo.toml` review (if NetDb FFI builds
-  as part of a different ffi crate, wire the new cdylib symbols here).
-
-**P1.3 — Node MeshOS daemon callback trait.** Node's
-`MeshOsDaemonSdk.registerDaemon` accepts a name + seed but no
-`process` / `snapshot` / `restore` / `onControl` / `health` /
-`saturation` callbacks. Go and Python both surface this (Go via cgo
-trampolines `goMeshOsProcessTrampoline` etc.; Python via Protocol +
-`register_daemon_with_callbacks`). Add a napi entry point that takes
-TSFNs for each trait method and bridges them to the same C trampoline
-pattern the `DaemonRuntime.spawn` napi already uses for compute
-daemons. The pattern is proven — `index.d.ts:230` shows `spawn(...,
-process, snapshot?, restore?, ...)` already works for compute.
-
-  Files: `bindings/node/src/meshos.rs` (or wherever the napi MeshOS
-  impl lives — confirm with the napi crate layout), `bindings/node/index.d.ts`
-  signature update, `bindings/node/test/meshos.test.ts` test
-  covering at least process + snapshot + restore round-trip.
+**P1.3 — Node MeshOS daemon callback trait.** ✅ **DONE**.
+`registerDaemon(daemon: DaemonObjectTsfns, identity: Identity)` at
+`bindings/node/index.d.ts:753` accepts a full daemon object; the
+`DaemonObjectTsfns` `FromNapiValue` impl at
+`bindings/node/src/meshos.rs:434-540` builds TSFNs for `process` (required)
++ `snapshot` / `restore` / `onControl` / `health` / `saturation`
+(optional) + reads `requiredCapabilities` / `optionalCapabilities` synchronously
+at registration time.
 
 ### Tier 2 — DX / ergonomic parity (capability exists but is rough)
 
 **P2.1 — `sdk-py` wrapper modules for RedEX / CortEX / NetDb / MeshDB.**
-Mirror the `meshos.py` pattern: re-import from `net._net`, add typed
-shapes (`TypedDict` envelopes, `Protocol` classes where there's a
-callback trait, context-manager wrappers around open/close). Four new
-modules:
+✅ **DONE**. Four modules shipped at
+`sdk-py/src/net_sdk/{redex,cortex,netdb,meshdb}.py`, each with
+re-exports + a context-manager helper (`open_file_cm`, `tasks_cm`,
+`memories_cm`, `netdb_cm`, `runner_cm`).
 
-  - `net_sdk/redex.py` — `Redex`, `RedexFile`, `RedexEvent`,
-    `RedexTailIter` re-exports + a context-manager helper
-    `open_redex_file(path, **cfg)` that yields a `RedexFile` and
-    closes on exit.
-  - `net_sdk/cortex.py` — `TasksAdapter`, `MemoriesAdapter`, `Task`,
-    `Memory`, watch iterators + a `Task` / `Memory` `TypedDict`
-    matching the `find_many` result shape.
-  - `net_sdk/netdb.py` — `NetDb` re-export + `open_netdb(redex,
-    *adapters)` builder helper.
-  - `net_sdk/meshdb.py` — `MeshQuery`, `MeshQueryRunner`,
-    `InMemoryChainReader`, `Predicate`, `QueryBuilder` re-exports +
-    a `MeshQueryRunner` context manager.
+**P2.2 — `sdk-ts` wrapper for MeshDB.** ✅ **DONE**.
+`sdk-ts/src/meshdb.ts` (136 lines) re-exports the query AST + runner
+classes from `@ai2070/net` and adds a `parseMeshDbErrorKind` helper
+that unwraps the substrate's `<<meshdb-kind:KIND>>MESSAGE` envelope.
 
-  Mirror the `meshos.py` docstring + `from __future__ import
-  annotations` shape so the modules are consistent.
+**P2.3 — Extend `_net.pyi` type stub method bodies.** ✅ **DONE**.
+Stub grew from 1157 to 1779 lines (~622 added) with full method
+signatures for the MeshOS region (`MeshOsDaemonSdk`,
+`MeshOsDaemonHandle`), MeshDB region (`MeshDbError`,
+`InMemoryChainReader`, `MeshQuery`, `MeshQueryRunner`, `QueryBuilder`,
+plus newly-added `Predicate`, `ResultRow`, `AggregateResult`,
+`JoinedRow`, `WindowBoundary`, `GroupKey`, `LineageEntry`,
+`CachePolicy`, `ExecuteOptions`), and Deck region (`DeckClient`,
+`OperatorIdentity`, `AdminCommands`, `SnapshotStream`,
+`StatusSummaryStream`, `IceCommands`, `IceProposal`,
+`SimulatedIceProposal`, `OperatorRegistry`, `AdminVerifier`).
+Test scaffold at `bindings/python/tests/test_stub_drift.py`
+parametrizes over every stub class and asserts the runtime symbol
+matches.
 
-  Files: four new files under `sdk-py/src/net_sdk/`, plus
-  `sdk-py/src/net_sdk/__init__.py` if there's a re-export aggregator.
-
-**P2.2 — `sdk-ts` wrapper for MeshDB.** `sdk-ts` has wrappers for
-RedEX / CortEX / MeshOS / mesh / nRPC but not MeshDB. Add
-`sdk-ts/src/meshdb.ts` re-exporting `MeshQuery`, `MeshQueryRunner`,
-`MeshQueryStream`, `InMemoryChainReader` from `@ai2070/net` and
-adding a `using`-friendly disposable wrapper (Symbol.dispose) so
-runners can be used with TC39 explicit resource management.
-
-  Files: `sdk-ts/src/meshdb.ts` (new), `sdk-ts/src/index.ts` re-export
-  update, `sdk-ts/test/meshdb.test.ts` (new).
-
-**P2.3 — Extend `_net.pyi` type stub.** Stub stops at line 843
-(`class Identity`); MeshDb, MeshQuery, MeshQueryRunner,
-InMemoryChainReader, MeshOsDaemonSdk, MeshOsDaemonHandle, Predicate,
-QueryBuilder, ResultRow, AggregateResult, JoinedRow, WindowBoundary,
-GroupKey, LineageEntry, CachePolicy, ExecuteOptions, MeshDbError,
-MeshOsSdkError, BlobError, BlobRef, MeshBlobAdapter, DaemonRuntime,
-DaemonHandle, ForkGroup, ReplicaGroup, StandbyGroup, GroupError,
-DeckClient, OperatorIdentity, DeckSdkError — none are typed. Extend
-the stub to cover everything `__init__.py` re-exports.
-
-  Files: `bindings/python/python/net/_net.pyi` (append class
-  declarations matching the runtime surface). Per-class signature
-  source: the PyO3 `#[pymethods]` blocks in the matching Rust crate
-  (`bindings/python/src/meshdb.rs`, `meshos.rs`, etc.).
-
-**P2.4 — Top-level `go/` re-exports for MeshDB and MeshOS (and NetDb
-once P1.2 lands).** Top-level `go/` already wraps RedEX / CortEX via
-`go/cortex.go`. Add `go/meshdb.go` and `go/meshos.go` re-exporting
-the `bindings/go/net` types. Two options:
-
-  (a) Type aliases (`type MeshDBReader = netbindings.MeshDBReader`)
-      — zero overhead, propagates everything.
-  (b) Thin wrapper types — gives a stable top-level API even if the
-      binding moves under it.
-
-  Pick (a) for now (lower maintenance); switch to (b) if the binding
-  ever needs to evolve independently. Same call for NetDb once P1.2
-  is in.
-
-  Files: `go/meshdb.go` (new), `go/meshos.go` (new), `go/netdb.go`
-  (new, depends on P1.2).
+**P2.4 — Top-level `go/` companion for Deck.** ✅ **DONE**.
+`go/deck.go` (~480 lines) covers slice 1 of the Deck operator
+surface: `DeckClient` lifecycle, all 9 `AdminCommands` verbs (Drain,
+EnterMaintenance, ExitMaintenance, Cordon, Uncordon, DropReplicas,
+InvalidatePlacement, RestartAllDaemons, ClearAvoidList), one-shot
+Status / StatusSummary, snapshot + status-summary streams. Slice 2
+(logs, failures, audit) and slice 3 (ICE break-glass) are deferred
+to follow-up — those callers can use `bindings/go/net/deck.go`
+directly. Test scaffold at `go/deck_test.go` covers lifecycle, seed
+validation, status, admin verbs, and stream timeouts.
 
 ### Tier 3 — structural / documentation cleanup
 
 **P3.1 — Split RedEX / CortEX out of `net.go.h` into a dedicated
-`net_cortex.h`.** The "Go" header name is misleading — it's a valid
-C header for any consumer, and burying RedEX / CortEX / Tasks /
-Memories inside a file named `net.go.h` makes the C SDK story
-opaque. Mirror the pattern of `net_meshdb.h` / `net_meshos.h`:
+`net_cortex.h`.** ✅ **DONE** (commit `33edd522`). `include/net_cortex.h`
+now holds all `net_redex_*` / `net_tasks_*` / `net_memories_*` /
+`net_netdb_*` prototypes; `net.go.h` `#include`s it at line 244.
+Five-header layout in `include/README.md` reflects the current state.
 
-  - Move `net_redex_*`, `net_tasks_*`, `net_memories_*`, and (once
-    P1.1 lands) `net_netdb_*` prototypes from `net.go.h` into a new
-    `include/net_cortex.h`.
-  - Keep `net.go.h` as a convenience header that `#include`s the
-    submodule headers for callers who want everything in one place
-    (the Go cgo blocks already declare prototypes inline, so they're
-    unaffected).
-  - Update `include/README.md` to document the four-header layout
-    (`net.h` for bus, `net_cortex.h` for RedEX/CortEX/NetDb,
-    `net_meshdb.h` for MeshDB, `net_meshos.h` for MeshOS,
-    `net_rpc.h` / `net_deck.h` for their respective surfaces).
+**P3.2 — Cargo feature documentation.** ✅ **DONE**. "Cargo features"
+section added to all 5 READMEs (`bindings/python/README.md`,
+`bindings/node/README.md` — created, `bindings/go/net/README.md` —
+created, `sdk-py/README.md`, `sdk-ts/README.md`). Each section
+documents the `cortex` / `redex-disk` / `netdb` / `meshdb` / `meshos`
+flags with their symbol coverage and the silent-omission behavior.
 
-  Files: `include/net_cortex.h` (new), `include/net.go.h` (trim +
-  re-include), `include/README.md`.
+### Status
 
-**P3.2 — Cargo feature documentation.** Document the
-`cortex` / `meshdb` / `meshos` Cargo feature gates in the binding
-READMEs so consumers know what to ask for when building wheels /
-dylibs / npm packages. Today the gating only shows up in
-`bindings/python/python/net/__init__.py` try-imports — a wheel built
-without `cortex` silently lacks `Redex` but reports no build-time
-hint.
+All survey items now shipped. The doc remains as a coverage map +
+historical record of what was outstanding when first written; consult
+the binding source for the authoritative current surface.
 
-  Files: `bindings/python/README.md`, `bindings/node/README.md`,
-  `bindings/go/net/README.md` (if any), `sdk-py/README.md`,
-  `sdk-ts/README.md`. Add a "Cargo features" table to each.
-
-### Dependency graph
-
-```
-P1.1 (NetDb FFI)
-  └── P1.2 (Go NetDb)
-        └── P2.4 (top-level go/ NetDb re-export)
-  └── (Node/Python already use Rust core directly, unaffected)
-
-P1.3 (Node MeshOS callbacks)   — independent
-
-P2.1 (sdk-py wrappers)          — independent (each module independent)
-P2.2 (sdk-ts MeshDB)            — independent
-P2.3 (_net.pyi stub)            — independent
-
-P2.4 (go/ re-exports)
-  └── partially blocked on P1.2 for the NetDb piece; MeshDB / MeshOS
-      pieces are ready today.
-
-P3.1 (split net.go.h)
-  └── best to land after P1.1 so the new `net_cortex.h` is born
-      with NetDb prototypes rather than acquiring them in a follow-up.
-
-P3.2 (feature docs)             — independent, do last.
-```
-
-### Suggested execution order
-
-1. **P1.1** (NetDb FFI) — unblocks Go + the C `net_cortex.h` split.
-2. **P1.3** (Node MeshOS callbacks) — true capability gap, no
-   dependencies. Can run parallel to P1.1.
-3. **P1.2** (Go NetDb binding) + **P2.3** (`_net.pyi` stub) +
-   **P2.2** (sdk-ts MeshDB) — parallelizable after P1.1.
-4. **P2.1** (sdk-py wrappers) — pure-Python work, can start any
-   time but easier to validate once P2.3's stub is in.
-5. **P2.4** (top-level Go re-exports) — small, mechanical, do after
-   P1.2.
-6. **P3.1** (header split) — touches the C ABI surface; sequence
-   after P1.1 lands so it covers NetDb in the first pass.
-7. **P3.2** (feature-flag docs) — close out.
-
-### Rough effort estimate
-
-| Item | Effort |
+| Item | Status |
 |---|---|
-| P1.1 NetDb FFI | M (mirror RedEX FFI pattern; ~200-300 LOC + tests) |
-| P1.2 Go NetDb | S (mirror redex.go pattern) |
-| P1.3 Node MeshOS callbacks | M (mirror compute DaemonRuntime napi TSFN pattern) |
-| P2.1 sdk-py wrappers (4 modules) | S each, M total |
-| P2.2 sdk-ts MeshDB | S |
-| P2.3 `_net.pyi` stub | M (~20+ classes, mechanical) |
-| P2.4 go/ re-exports | XS (3 alias files) |
-| P3.1 header split | S (mechanical move + README) |
-| P3.2 feature docs | S |
+| P1.1 NetDb C FFI | ✅ Done (commit `33edd522`) |
+| P1.2 `bindings/go/net/netdb.go` | ✅ Done |
+| P1.3 Node MeshOS callback trait | ✅ Done |
+| P2.1 sdk-py wrappers | ✅ Done |
+| P2.2 sdk-ts MeshDB | ✅ Done |
+| P2.3 `_net.pyi` method bodies | ✅ Done |
+| P2.4 top-level `go/` companions | ✅ Done (Deck slice 1; slices 2/3 deferred) |
+| P3.1 Header split (`net_cortex.h`) | ✅ Done (commit `33edd522`) |
+| P3.2 Cargo feature docs | ✅ Done |
 
-XS = under an hour, S = half-day, M = 1-2 days, L = a week.
+### Follow-up surfaces (out of original survey scope)
+
+- Top-level `go/deck.go` covers slice 1 only. Slices 2 (log /
+  failure / audit streams) and 3 (ICE break-glass) remain available
+  via the binding tier (`bindings/go/net/deck.go`).
+- The Python `_net.pyi` stub now matches the runtime surface for
+  every feature-gated class. Add a CI check that runs
+  `tests/test_stub_drift.py` against a wheel built with all features
+  enabled to catch future drift.

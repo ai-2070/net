@@ -1056,6 +1056,31 @@ widening grew it from 159).
 | `shutdown()` | Graceful shutdown |
 | `bus` | Access underlying PyO3 binding |
 
+## Cargo features
+
+`net_sdk` is a pure-Python wrapper over `net._net` (the `ai2070-net` PyO3 extension), so its reachable surface is whatever was compiled into the underlying wheel. The five feature flags relevant to building from source:
+
+| Feature | What it enables on the underlying `net` package |
+|---|---|
+| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, `Task`, `Memory`, watch iterators, `RedexError`, `CortexError`, `NetDbError` |
+| `redex-disk` | Disk-backed RedEX persistence — `persistent_dir` ctor arg and `persistent=True` on `open_file`. Without it the persistent path returns `RedexError`. |
+| `netdb` | `NetDb` composition (requires `cortex`); the `net_netdb_*` FFI entry points ship with this feature. |
+| `meshdb` | `MeshQuery`, `MeshQueryRunner`, `QueryBuilder`, `Predicate`, `InMemoryChainReader`, plus the `libnet_meshdb` cdylib. |
+| `meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, plus the `libnet_meshos` cdylib. |
+
+A wheel built without a feature silently omits its symbols — there is no build warning. The `net.__init__` module try-imports each family, so a missing feature surfaces as a clean `ImportError` from `from net import Redex`, not an `AttributeError` deeper in the call stack. `net_sdk` wrappers re-raise the same `ImportError` when a feature they depend on wasn't built in.
+
+Enable at build time (rebuild the underlying `ai2070-net` wheel, then `pip install` it into the same env as `ai2070-net-sdk`):
+
+```bash
+cd net/crates/net/bindings/python
+maturin develop --features "cortex netdb redex-disk meshdb meshos"
+# Or:
+maturin build --release --features "cortex netdb redex-disk meshdb meshos"
+```
+
+PyPI wheels of `ai2070-net` ship with every feature enabled; the flags above only matter for source builds.
+
 ## License
 
 Apache-2.0

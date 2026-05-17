@@ -259,6 +259,22 @@ func OpenTasksAdapter(redex *Redex, originHash uint64, persistent bool) (*TasksA
 	return a, nil
 }
 
+// newTasksAdapterFromRaw wraps a raw `*TasksAdapterHandle` (obtained from
+// another cgo file in the same package, e.g. `net_netdb_tasks`) into a
+// `*TasksAdapter` with the same finalizer + close semantics as
+// `OpenTasksAdapter`. The handle must already be Arc-cloned by the
+// caller — freeing the returned adapter calls `net_tasks_adapter_free`
+// exactly once on the supplied pointer.
+//
+// Used by NetDb.Tasks() to bridge across the per-file cgo type wall
+// (each cgo file has its own `C.TasksAdapterHandle` Go type, so handles
+// must transit through `unsafe.Pointer`).
+func newTasksAdapterFromRaw(handle unsafe.Pointer, originHash uint64) *TasksAdapter {
+	a := &TasksAdapter{handle: (*C.TasksAdapterHandle)(handle), originHash: originHash}
+	runtime.SetFinalizer(a, func(a *TasksAdapter) { _ = a.Close() })
+	return a
+}
+
 // OriginHash returns the origin_hash the adapter is bound to.
 // Tokens issued by `Create` / `Rename` / `Complete` / `Delete`
 // carry this value as their `OriginHash`.
