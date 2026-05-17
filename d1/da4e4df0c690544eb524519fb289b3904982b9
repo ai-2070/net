@@ -1,0 +1,20 @@
+net/crates/net/bindings/go/deck-ffi/src/lib.rs
+  s_275316fc500935::t_ec9e5d1664eb49 1444,1458,1473,1484,1495
+  s_275316fc500935::t_1e41bf6f4c9242 3543-3580
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "d1da4e4df0c690544eb524519fb289b3904982b9",
+  "prompts": {},
+  "sessions": {
+    "s_275316fc500935": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f087a884-b322-4d2f-9650-4afee91efe78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
