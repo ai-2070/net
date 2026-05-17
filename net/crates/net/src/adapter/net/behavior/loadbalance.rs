@@ -1257,8 +1257,21 @@ impl LoadBalancer {
     fn add_to_hash_ring(&self, node_id: NodeId) {
         for i in 0..self.virtual_nodes {
             let key = format!("{:?}-{}", node_id, i);
-            let hash = self.hash_key(&key);
-            self.hash_ring.insert(hash, node_id);
+            let mut hash = self.hash_key(&key);
+            // Linear-probe past collisions. FNV-1a + ~150 vnodes
+            // per node × ~1k nodes is well below the u64
+            // birthday-bound, but a collision is unobservable
+            // pre-fix: `insert(hash, node_id)` last-write-wins
+            // silently lost an earlier vnode and skewed the ring
+            // distribution toward the late writer. Probe by 1
+            // until we find an empty slot so every vnode is
+            // distinct, then we're guaranteed even with
+            // adversarial node-id choice (the probe terminates
+            // because the ring has at most virtual_nodes * nodes
+            // entries, far below u64::MAX).
+            while !self.hash_ring.insert(hash, node_id).is_none() {
+                hash = hash.wrapping_add(1);
+            }
         }
     }
 
