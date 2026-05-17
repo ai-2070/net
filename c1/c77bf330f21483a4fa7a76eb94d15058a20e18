@@ -1,0 +1,24 @@
+net/crates/net/bindings/go/net/meshos.go
+  s_5af7ced268385a::t_fb38e03d988415 7-11,14-19
+  s_5af7ced268385a::t_bffe8ccd6974d0 259
+  s_5af7ced268385a::t_206ad8c45953c4 534-539
+  s_5af7ced268385a::t_00ddb5c33df756 632-635,638-705,707-899
+  s_5af7ced268385a::t_0201506f3211ea 706
+  s_5af7ced268385a::t_b648cda2849bda 159-251
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "c1c77bf330f21483a4fa7a76eb94d15058a20e18",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
