@@ -57,6 +57,7 @@ comfy-table = "7"
 # Tracing-subscriber wires `-v` / `-vv` / `-vvv` to env-filter
 # levels. Format pinned to compact for stderr.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing = "0.1"
 
 # XDG paths + TOML for the config + identity stores.
 dirs = "5"

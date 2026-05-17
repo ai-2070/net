@@ -23,6 +23,7 @@
 
 mod commands;
 mod config;
+mod context;
 mod error;
 mod output;
 mod prelude;
@@ -95,8 +96,11 @@ enum Command {
     /// Operator identity authoring + inspection.
     #[command(subcommand)]
     Identity(commands::identity::IdentityCommand),
-    // Subsequent commands (snapshot / audit / log / failures /
-    // daemon / cap / peer / port / db / netdb) land in follow-up
+    /// `MeshOsSnapshot` reads (one-shot).
+    #[command(subcommand)]
+    Snapshot(commands::snapshot::SnapshotCommand),
+    // Subsequent commands (audit / log / failures / daemon /
+    // cap / peer / port / db / netdb) land in follow-up
     // commits within Phase 1.
 }
 
@@ -125,9 +129,14 @@ async fn main() -> ExitCode {
 
 async fn dispatch(cli: Cli) -> Result<(), CliError> {
     let output = cli.output;
+    let config_path = cli.config.as_deref();
+    let profile = cli.profile.as_str();
     match cli.command {
         Command::Version => commands::version::run().await,
         Command::Identity(cmd) => commands::identity::run(cmd, output).await,
+        Command::Snapshot(cmd) => {
+            commands::snapshot::run(cmd, output, config_path, profile).await
+        }
     }
 }
 

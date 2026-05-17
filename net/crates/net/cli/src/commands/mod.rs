@@ -11,4 +11,5 @@
 //! commits.
 
 pub mod identity;
+pub mod snapshot;
 pub mod version;
