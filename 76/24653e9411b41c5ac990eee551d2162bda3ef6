@@ -1,0 +1,20 @@
+net/crates/net/sdk/src/mesh_rpc_resilience.rs
+  s_85b38155803bed::t_e0be1d43b6ea43 26-27
+  s_85b38155803bed::t_e7a9d98d9f15af 600-611
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "7624653e9411b41c5ac990eee551d2162bda3ef6",
+  "prompts": {},
+  "sessions": {
+    "s_85b38155803bed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a87163a2-e445-4527-8e9a-d6b1e77222f5",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
