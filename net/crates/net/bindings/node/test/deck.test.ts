@@ -110,8 +110,7 @@ d('Deck SDK operator-side bindings (Phase 5 slice 1)', () => {
       expect(typeof snap).toBe('string');
       expect(typeof JSON.parse(snap)).toBe('object');
     } finally {
-      // No explicit teardown yet (close() lands in a follow-up).
-      // The supervisor releases on GC.
+      await client.shutdown();
     }
   });
 
