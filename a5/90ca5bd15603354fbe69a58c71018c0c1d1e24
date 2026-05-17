@@ -1,0 +1,21 @@
+net/crates/net/cli/Cargo.toml
+  s_d47f820cd75eec::t_3304b7bafbcb4f 77-82
+net/crates/net/cli/src/commands/identity.rs
+  s_d47f820cd75eec::t_2a6a5abc1a2148 183-184,191-192
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "a590ca5bd15603354fbe69a58c71018c0c1d1e24",
+  "prompts": {},
+  "sessions": {
+    "s_d47f820cd75eec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "787d00f4-6902-4cbd-a2f7-ef1a994cd53b",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
