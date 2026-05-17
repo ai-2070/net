@@ -27,7 +27,14 @@
 // methods stay available for callers that prefer manual iteration
 // or batch drain.
 
-const native = require("./index") as { MeshQueryStream?: { prototype: object } };
+// The napi-generated MeshQueryStream is a constructor function with a
+// prototype, but the original cast typed it as a plain object — the
+// later `typeof === "function"` narrowing then collapsed it to `never`
+// and reading `.prototype` errored under `-D warnings`. Cast as a
+// Function with a prototype so both type-guards line up.
+const native = require("./index") as {
+  MeshQueryStream?: Function & { prototype: object };
+};
 
 if (
   native.MeshQueryStream &&
