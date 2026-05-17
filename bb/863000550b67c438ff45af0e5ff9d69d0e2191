@@ -1,0 +1,25 @@
+net/crates/net/cli/src/main.rs
+  s_5af7ced268385a::t_806a30fef20733 102-104
+  s_5af7ced268385a::t_7b876e5be3fc3b 194
+net/crates/net/cli/src/commands/mod.rs
+  s_5af7ced268385a::t_08fac293eb9fb7 18
+net/crates/net/cli/src/commands/ice.rs
+  s_5af7ced268385a::t_d5665023a096ce 1-32,34-427
+  s_5af7ced268385a::t_8481f5086ae32b 33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "bb863000550b67c438ff45af0e5ff9d69d0e2191",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
