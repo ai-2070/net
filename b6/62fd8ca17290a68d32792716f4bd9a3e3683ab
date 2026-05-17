@@ -1,0 +1,20 @@
+net/crates/net/src/consumer/merge.rs
+  s_f641e31a81af58::t_e15bc9212ce38f 468-475,479-480
+  s_f641e31a81af58::t_276da23730299e 1550-1592
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "b662fd8ca17290a68d32792716f4bd9a3e3683ab",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
