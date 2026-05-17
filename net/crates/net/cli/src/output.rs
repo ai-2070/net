@@ -61,7 +61,7 @@ impl OutputFormat {
 /// Emit a single serializable value on stdout in the chosen
 /// format. `Table` falls back to JSON for arbitrary serde
 /// payloads — typed subcommands that want a real table reach
-/// for [`emit_table`] directly with `comfy-table`-built rows.
+/// for `comfy-table` directly and render rows themselves.
 pub fn emit_value<T: Serialize>(fmt: OutputFormat, value: &T) -> io::Result<()> {
     let stdout = io::stdout();
     let mut lock = stdout.lock();

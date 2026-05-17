@@ -7,11 +7,12 @@
 //! # Entry point shape
 //!
 //! `tokio::main` builds the multi-thread runtime once, parses the
-//! global `Cli` struct via clap, builds a [`CliContext`] (config +
-//! identity + tracing), then dispatches to the matched subcommand.
-//! Every subcommand returns an [`ExitCode`] — typed errors flow
-//! through [`error::ExitCode`] which maps onto the documented exit
-//! table at `NET_CLI_PLAN.md:§"Exit codes (locked)"`.
+//! global `Cli` struct via clap, builds a `CliContext` (config +
+//! identity + tracing — see `context.rs`), then dispatches to the
+//! matched subcommand. Every subcommand returns an `ExitCode` —
+//! typed errors flow through `error::ExitCodeKind` which maps
+//! onto the documented exit table at `NET_CLI_PLAN.md:§"Exit
+//! codes (locked)"`.
 //!
 //! # Module map
 //!
