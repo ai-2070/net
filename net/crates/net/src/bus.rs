@@ -1676,12 +1676,15 @@ impl EventBus {
         // Draining for >100ms with an empty ring buffer and no
         // pushes since drain start. Poll until every requested
         // shard finalizes, capped by an outer deadline so a wedged
-        // producer can't pin this method forever.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // producer can't pin this method forever. Use
+        // `tokio::time::Instant` so tests under `tokio::time::pause()`
+        // advance the virtual clock via `sleep` rather than spinning
+        // until wall-clock catches up.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut finalized: std::collections::HashSet<u16> = std::collections::HashSet::new();
         let target: std::collections::HashSet<u16> = drained_ids.iter().copied().collect();
 
-        while finalized.len() < target.len() && std::time::Instant::now() < deadline {
+        while finalized.len() < target.len() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let stopped = mapper.finalize_draining();
             // `finalize_draining` is destructive — every qualifying
@@ -2267,9 +2270,13 @@ fn spawn_drain_worker_for_shard(
                 // and `EventBus::drop`, transitively making every
                 // producer push that happened-before its `in_flight`
                 // decrement visible to the subsequent `pop_batch_into`.
-                let finalize_deadline = std::time::Instant::now() + DRAIN_FINALIZE_TIMEOUT;
+                // `tokio::time::Instant` so virtualized-clock tests
+                // (`tokio::time::pause`) advance the deadline via
+                // `sleep` rather than spinning until wall-clock catches
+                // up.
+                let finalize_deadline = tokio::time::Instant::now() + DRAIN_FINALIZE_TIMEOUT;
                 while !drain_finalize_ready.load(AtomicOrdering::Acquire) {
-                    if std::time::Instant::now() >= finalize_deadline {
+                    if tokio::time::Instant::now() >= finalize_deadline {
                         tracing::warn!(
                             shard_id,
                             "drain worker timed out waiting for finalize gate; \
