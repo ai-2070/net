@@ -950,3 +950,208 @@ def normalize_gpu_vendor(vendor: str) -> str:
     inputs collapse to ``"unknown"``. Matches the NAPI helper so TS
     and Python callers produce identical announcement payloads."""
     ...
+
+# =============================================================================
+# Stubs for symbols exported by `net._net` at runtime that aren't yet typed
+# in detail here. Each class is declared without full method signatures so
+# `from net import X` resolves cleanly under mypy / pyright; method-level
+# typing happens at runtime via inspect / help(X). For the authoritative
+# method surface, see the matching PyO3 source under
+# `net/crates/net/bindings/python/src/<file>.rs`.
+# =============================================================================
+
+# ---- MeshOS daemon-author SDK (`meshos.rs`) ---------------------------------
+
+class MeshOsSdkError(Exception):
+    """MeshOS SDK-level error. Carries a ``.kind`` attribute matching
+    the ``<<meshos-sdk-kind:KIND>>`` envelope; see
+    ``net_sdk.meshos.meshos_sdk_error_kind``."""
+
+    kind: Optional[str]
+
+class MeshOsDaemonSdk:
+    """Entry point for daemon-author code. Construct via
+    :py:meth:`start`; use ``register_daemon`` (or
+    ``register_daemon_with_callbacks`` for a trait-shaped daemon).
+    See `net/crates/net/bindings/python/src/meshos.rs` for the
+    full method surface."""
+
+    @staticmethod
+    def start(
+        config: Optional[dict] = None,
+        control_capacity: Optional[int] = None,
+        callback_timeout_ms: Optional[int] = None,
+    ) -> "MeshOsDaemonSdk": ...
+    def register_daemon(
+        self, name: str, identity: "Identity"
+    ) -> "MeshOsDaemonHandle": ...
+    def register_daemon_with_callbacks(
+        self, daemon: object, identity: "Identity"
+    ) -> "MeshOsDaemonHandle": ...
+    def shutdown(self) -> None: ...
+
+class MeshOsDaemonHandle:
+    """Operator-side handle to a registered daemon. Methods:
+    ``next_control`` / ``try_next_control`` / ``publish_log`` /
+    ``publish_capabilities`` / ``graceful_shutdown`` / ``metadata`` /
+    ``refresh_metadata``. Properties: ``daemon_id`` / ``daemon_name``.
+    See `meshos.rs`."""
+
+    @property
+    def daemon_id(self) -> int: ...
+    @property
+    def daemon_name(self) -> str: ...
+
+# ---- MeshDB query layer (`meshdb.rs`) ---------------------------------------
+
+class MeshDbError(Exception):
+    """MeshDB query-layer error. Carries a ``<<meshdb-kind:...>>``
+    envelope; see ``net_sdk.meshdb``."""
+
+class InMemoryChainReader:
+    """In-process chain reader. Pass to ``MeshQueryRunner`` to
+    execute queries against an in-memory event log."""
+
+class MeshQuery:
+    """A planned query AST. Reusable across runners."""
+
+class MeshQueryRunner:
+    """Drives query execution against a ``InMemoryChainReader``."""
+
+    def __init__(self, reader: InMemoryChainReader) -> None: ...
+
+class QueryBuilder:
+    """Atomic factory for ``MeshQuery``. Chain ``.from_origin(...)``,
+    ``.filter(...)``, ``.window(...)``, ``.aggregate(...)``,
+    ``.build()``."""
+
+class Predicate:
+    """MeshDB filter predicate IR (note: distinct from the
+    capability-system ``Predicate``)."""
+
+class ResultRow:
+    """A single materialized row from a query."""
+
+class AggregateResult:
+    """Aggregate output (count / sum / min / max / avg)."""
+
+class JoinedRow:
+    """Row from a join operator."""
+
+class CachePolicy:
+    """Cache config envelope for ``ExecuteOptions``."""
+
+class ExecuteOptions:
+    """Per-execution config knobs (cache policy, timeouts)."""
+
+class GroupKey:
+    """Group-by key tuple from a window/aggregate result."""
+
+class LineageEntry:
+    """Source-event reference attached to a result row."""
+
+class WindowBoundary:
+    """Window boundary marker emitted by streaming aggregates."""
+
+# ---- Dataforts blob surface (`blob.rs`) -------------------------------------
+
+class BlobError(Exception):
+    """Dataforts blob-layer error."""
+
+class BlobRef:
+    """Content-addressed pointer to a blob payload (substrate-resolved)."""
+
+class MeshBlobAdapter:
+    """Substrate-owned blob adapter; publish / resolve through the mesh."""
+
+def register_blob_adapter(adapter_id: str, adapter: object) -> None: ...
+def register_filesystem_blob_adapter(adapter_id: str, root: str) -> None: ...
+def unregister_blob_adapter(adapter_id: str) -> None: ...
+def blob_adapter_ids() -> List[str]: ...
+def blob_adapter_registered(adapter_id: str) -> bool: ...
+def blob_publish(adapter_id: str, payload: bytes) -> bytes: ...
+def blob_resolve(blob_ref: bytes) -> bytes: ...
+
+# ---- Compute / daemon runtime (`compute.rs`) --------------------------------
+
+class DaemonError(Exception):
+    """Daemon-runtime error."""
+
+class MigrationError(Exception):
+    """Live-migration error. Carries a ``<<daemon: migration: KIND>>``
+    envelope; see ``net_sdk.compute.migration_error_kind``."""
+
+class CausalEvent:
+    """A causal event delivered to a daemon's ``process`` method."""
+
+    origin_hash: int
+    sequence: int
+    payload: bytes
+
+class DaemonRuntime:
+    """Substrate-owned daemon supervisor. ``spawn`` / ``spawn_from_snapshot``
+    / ``snapshot`` / ``shutdown``."""
+
+class DaemonHandle:
+    """Handle to a spawned daemon."""
+
+class MigrationHandle:
+    """Handle to an in-flight live-migration."""
+
+# ---- Groups (`groups.rs`) ---------------------------------------------------
+
+class GroupError(Exception):
+    """Group orchestration error."""
+
+class ReplicaGroup:
+    """N-replica HA group. Each member sees every event."""
+
+class ForkGroup:
+    """Fork-style group with deterministic event partitioning."""
+
+class StandbyGroup:
+    """Active/standby group with leader election."""
+
+# ---- Deck operator SDK (`deck.rs`) ------------------------------------------
+
+class DeckSdkError(Exception):
+    """Deck operator SDK error. Carries a ``<<deck-sdk-kind:KIND>>``
+    envelope; see ``net_sdk.deck.deck_sdk_error_kind``."""
+
+    kind: Optional[str]
+
+class OperatorIdentity:
+    """Operator credential bundle."""
+
+class DeckClient:
+    """Operator-side client for the cluster's admin / snapshot /
+    log / failure / ICE surfaces."""
+
+class AdminCommands:
+    """Admin command dispatcher exposed via ``DeckClient.admin()``."""
+
+class SnapshotStream:
+    """Async stream over snapshot JSON envelopes."""
+
+class StatusSummaryStream:
+    """Async stream over status summary envelopes."""
+
+class IceCommands:
+    """ICE break-glass command dispatcher (slice 3)."""
+
+class IceProposal:
+    """ICE break-glass proposal envelope."""
+
+class SimulatedIceProposal:
+    """Dry-run ICE proposal (substrate-internal)."""
+
+class OperatorRegistry:
+    """Operator policy registry."""
+
+class AdminVerifier:
+    """Admin-command policy verifier."""
+
+# ---- Redis Streams dedup (`redis_dedup.rs`) ---------------------------------
+
+class RedisStreamDedup:
+    """LRU-bounded dedup helper for Redis Streams consumers."""
