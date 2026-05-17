@@ -99,6 +99,9 @@ enum Command {
     /// Signed admin-chain commits (9 verbs).
     #[command(subcommand)]
     Admin(commands::admin::AdminCommand),
+    /// Break-glass ICE operator surface (simulate → commit).
+    #[command(subcommand)]
+    Ice(commands::ice::IceCommand),
     /// `MeshOsSnapshot` reads (one-shot).
     #[command(subcommand)]
     Snapshot(commands::snapshot::SnapshotCommand),
@@ -188,6 +191,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Version => commands::version::run().await,
         Command::Identity(cmd) => commands::identity::run(cmd, output).await,
         Command::Admin(cmd) => commands::admin::run(cmd, output, config_path, profile).await,
+        Command::Ice(cmd) => commands::ice::run(cmd, output, config_path, profile).await,
         Command::Snapshot(cmd) => {
             commands::snapshot::run(cmd, output, config_path, profile).await
         }

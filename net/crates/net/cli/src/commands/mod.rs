@@ -15,6 +15,7 @@ pub mod audit;
 pub mod cap;
 pub mod daemon;
 pub mod db;
+pub mod ice;
 pub mod identity;
 pub mod logs;
 pub mod netdb;
