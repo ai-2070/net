@@ -11,7 +11,7 @@
 //! context as the Phase 1 reads.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 use net_sdk::deck::ChainCommit;
@@ -370,7 +370,3 @@ enum AdminEnvelope {
     },
 }
 
-// Silence unused-import warning when SystemTime is referenced only
-// through the `committed_at` accessor path.
-#[allow(dead_code)]
-fn _systemtime_use(_t: SystemTime) {}
