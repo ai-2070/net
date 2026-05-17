@@ -327,6 +327,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"unsafe"
 )
 
@@ -742,18 +743,16 @@ func (c *DeckClient) ClearAvoidList(node uint64) (ChainCommit, error) {
 //
 // # Concurrency
 //
-// Concurrent calls on the SAME stream are unsupported (the cdylib
-// declares the same constraint in net_deck.h's "Threading"
-// section). In particular: calling `Close` / `Free` from one
-// goroutine while another is blocked in `Next(timeoutMs)`
-// races the free against the FFI call's pointer deref and is a
-// use-after-free. Synchronise externally if needed — typically
-// the easy pattern is "one goroutine drives Next in a loop, the
-// owning goroutine signals shutdown via a channel that loop
-// reads, and only the owning goroutine calls Close after the
-// reader loop exits."
+// `Next`, `Close`, and `Free` may be called concurrently from
+// different goroutines. The internal mutex serialises FFI access
+// against the pointer; `sync.Once` collapses repeated `Free`s
+// into a no-op. Closing the stream while another goroutine is
+// blocked in `Next(timeoutMs)` will wait for that call to return
+// before the C handle is freed — bounded by `timeoutMs`.
 type DeckSnapshotStream struct {
-	ptr *C.NetDeckSnapshotStream
+	ptr      *C.NetDeckSnapshotStream
+	mu       sync.Mutex
+	freeOnce sync.Once
 }
 
 // SubscribeSnapshots opens a live snapshot stream. Caller `.Free()`s
@@ -776,7 +775,12 @@ func (c *DeckClient) SubscribeSnapshots() (*DeckSnapshotStream, error) {
 // `(nil, ErrDeckEndOfStream)` when the underlying stream closes.
 // `timeoutMs == 0` waits indefinitely.
 func (s *DeckSnapshotStream) Next(timeoutMs uint64) (map[string]any, error) {
-	if s == nil || s.ptr == nil {
+	if s == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ptr == nil {
 		return nil, ErrDeckInvalidArg
 	}
 	var jsonPtr *C.char
@@ -796,22 +800,34 @@ func (s *DeckSnapshotStream) Next(timeoutMs uint64) (map[string]any, error) {
 	return parsed, nil
 }
 
-// Close + free the stream. Idempotent.
+// Close + free the stream. Safe to call concurrently with `Next`;
+// blocks at most one in-flight `Next(timeoutMs)` worth of time.
+// Repeated calls are no-ops via `sync.Once`.
 func (s *DeckSnapshotStream) Close() { s.Free() }
 
 func (s *DeckSnapshotStream) Free() {
-	if s == nil || s.ptr == nil {
+	if s == nil {
 		return
 	}
-	C.net_deck_snapshot_stream_free(s.ptr)
-	s.ptr = nil
-	runtime.SetFinalizer(s, nil)
+	s.freeOnce.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.ptr == nil {
+			return
+		}
+		C.net_deck_snapshot_stream_free(s.ptr)
+		s.ptr = nil
+		runtime.SetFinalizer(s, nil)
+	})
 }
 
 // DeckStatusSummaryStream is the Go-side handle for the status-
-// summary stream.
+// summary stream. See `DeckSnapshotStream` for the concurrency
+// contract.
 type DeckStatusSummaryStream struct {
-	ptr *C.NetDeckStatusSummaryStream
+	ptr      *C.NetDeckStatusSummaryStream
+	mu       sync.Mutex
+	freeOnce sync.Once
 }
 
 func (c *DeckClient) SubscribeStatusSummaries() (*DeckStatusSummaryStream, error) {
@@ -831,7 +847,12 @@ func (c *DeckClient) SubscribeStatusSummaries() (*DeckStatusSummaryStream, error
 // elapses. Returns `(nil, nil)` on timeout. Returns
 // `(nil, ErrDeckEndOfStream)` when the stream closes.
 func (s *DeckStatusSummaryStream) Next(timeoutMs uint64) (*DeckStatusSummary, error) {
-	if s == nil || s.ptr == nil {
+	if s == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ptr == nil {
 		return nil, ErrDeckInvalidArg
 	}
 	var out C.NetDeckStatusSummary
@@ -850,12 +871,19 @@ func (s *DeckStatusSummaryStream) Next(timeoutMs uint64) (*DeckStatusSummary, er
 func (s *DeckStatusSummaryStream) Close() { s.Free() }
 
 func (s *DeckStatusSummaryStream) Free() {
-	if s == nil || s.ptr == nil {
+	if s == nil {
 		return
 	}
-	C.net_deck_status_summary_stream_free(s.ptr)
-	s.ptr = nil
-	runtime.SetFinalizer(s, nil)
+	s.freeOnce.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.ptr == nil {
+			return
+		}
+		C.net_deck_status_summary_stream_free(s.ptr)
+		s.ptr = nil
+		runtime.SetFinalizer(s, nil)
+	})
 }
 
 // =====================================================================
@@ -977,8 +1005,12 @@ func failureRecordFromC(rec *C.NetDeckFailureRecord) DeckFailureRecord {
 }
 
 // DeckLogStream — handle for the live log stream.
+// DeckLogStream — see `DeckSnapshotStream` for the concurrency
+// contract.
 type DeckLogStream struct {
-	ptr *C.NetDeckLogStream
+	ptr      *C.NetDeckLogStream
+	mu       sync.Mutex
+	freeOnce sync.Once
 }
 
 // SubscribeLogs opens a log stream. `filter == nil` matches
@@ -1006,7 +1038,12 @@ func (c *DeckClient) SubscribeLogs(filter *DeckLogFilter) (*DeckLogStream, error
 // `(nil, nil)` on timeout, `(nil, ErrDeckEndOfStream)` on stream
 // end. Pass `0` for an unbounded wait.
 func (s *DeckLogStream) Next(timeoutMs uint64) (*DeckLogRecord, error) {
-	if s == nil || s.ptr == nil {
+	if s == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ptr == nil {
 		return nil, ErrDeckInvalidArg
 	}
 	var rec C.NetDeckLogRecord
@@ -1027,17 +1064,27 @@ func (s *DeckLogStream) Next(timeoutMs uint64) (*DeckLogRecord, error) {
 func (s *DeckLogStream) Close() { s.Free() }
 
 func (s *DeckLogStream) Free() {
-	if s == nil || s.ptr == nil {
+	if s == nil {
 		return
 	}
-	C.net_deck_log_stream_free(s.ptr)
-	s.ptr = nil
-	runtime.SetFinalizer(s, nil)
+	s.freeOnce.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.ptr == nil {
+			return
+		}
+		C.net_deck_log_stream_free(s.ptr)
+		s.ptr = nil
+		runtime.SetFinalizer(s, nil)
+	})
 }
 
-// DeckFailureStream — handle for the live failure stream.
+// DeckFailureStream — handle for the live failure stream. See
+// `DeckSnapshotStream` for the concurrency contract.
 type DeckFailureStream struct {
-	ptr *C.NetDeckFailureStream
+	ptr      *C.NetDeckFailureStream
+	mu       sync.Mutex
+	freeOnce sync.Once
 }
 
 func (c *DeckClient) SubscribeFailures(sinceSeq uint64) (*DeckFailureStream, error) {
@@ -1054,7 +1101,12 @@ func (c *DeckClient) SubscribeFailures(sinceSeq uint64) (*DeckFailureStream, err
 }
 
 func (s *DeckFailureStream) Next(timeoutMs uint64) (*DeckFailureRecord, error) {
-	if s == nil || s.ptr == nil {
+	if s == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ptr == nil {
 		return nil, ErrDeckInvalidArg
 	}
 	var rec C.NetDeckFailureRecord
@@ -1074,12 +1126,19 @@ func (s *DeckFailureStream) Next(timeoutMs uint64) (*DeckFailureRecord, error) {
 func (s *DeckFailureStream) Close() { s.Free() }
 
 func (s *DeckFailureStream) Free() {
-	if s == nil || s.ptr == nil {
+	if s == nil {
 		return
 	}
-	C.net_deck_failure_stream_free(s.ptr)
-	s.ptr = nil
-	runtime.SetFinalizer(s, nil)
+	s.freeOnce.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.ptr == nil {
+			return
+		}
+		C.net_deck_failure_stream_free(s.ptr)
+		s.ptr = nil
+		runtime.SetFinalizer(s, nil)
+	})
 }
 
 // =====================================================================
@@ -1194,13 +1253,21 @@ func (q *DeckAuditQuery) Free() {
 }
 
 // DeckAuditStream — sync iterator over audit records (returned
-// as parsed `map[string]any`).
+// as parsed `map[string]any`). See `DeckSnapshotStream` for the
+// concurrency contract.
 type DeckAuditStream struct {
-	ptr *C.NetDeckAuditStream
+	ptr      *C.NetDeckAuditStream
+	mu       sync.Mutex
+	freeOnce sync.Once
 }
 
 func (s *DeckAuditStream) Next(timeoutMs uint64) (map[string]any, error) {
-	if s == nil || s.ptr == nil {
+	if s == nil {
+		return nil, ErrDeckInvalidArg
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ptr == nil {
 		return nil, ErrDeckInvalidArg
 	}
 	var jsonPtr *C.char
@@ -1223,12 +1290,19 @@ func (s *DeckAuditStream) Next(timeoutMs uint64) (map[string]any, error) {
 func (s *DeckAuditStream) Close() { s.Free() }
 
 func (s *DeckAuditStream) Free() {
-	if s == nil || s.ptr == nil {
+	if s == nil {
 		return
 	}
-	C.net_deck_audit_stream_free(s.ptr)
-	s.ptr = nil
-	runtime.SetFinalizer(s, nil)
+	s.freeOnce.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.ptr == nil {
+			return
+		}
+		C.net_deck_audit_stream_free(s.ptr)
+		s.ptr = nil
+		runtime.SetFinalizer(s, nil)
+	})
 }
 
 // =====================================================================
