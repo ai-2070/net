@@ -427,9 +427,31 @@ async fn run_restore(args: RestoreArgs, output: Option<OutputFormat>) -> Result<
         })?,
     };
     if !args.force && dest.exists() {
+        // The non-empty check must distinguish empty-dir from
+        // read-error: pre-fix `read_dir`'s `Err(_) => false` and
+        // `next_entry`'s `.unwrap_or(None)` both swallowed I/O
+        // errors and proceeded as if the directory were empty —
+        // letting a populated store get overwritten without
+        // `--force` when read_dir hit a permission error, the
+        // path was not actually a directory, or next_entry hit
+        // mid-enumeration jitter.
         let non_empty = match tokio::fs::read_dir(&dest).await {
-            Ok(mut iter) => iter.next_entry().await.unwrap_or(None).is_some(),
-            Err(_) => false,
+            Ok(mut iter) => match iter.next_entry().await {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(e) => {
+                    return Err(generic(format!(
+                        "failed to inspect target store {}: {e}; pass --force to override",
+                        dest.display()
+                    )));
+                }
+            },
+            Err(e) => {
+                return Err(generic(format!(
+                    "failed to open target store {} for inspection: {e}; pass --force to override",
+                    dest.display()
+                )));
+            }
         };
         if non_empty {
             return Err(crate::error::invalid_args(format!(
