@@ -594,12 +594,28 @@ async fn run_restore(
             dest.display()
         ))
     })?;
+    // Open only the adapters the snapshot actually carries.
+    // Pre-fix the builder unconditionally wired `with_tasks` and
+    // `with_memories`, so a tasks-only snapshot still materialised
+    // an empty memories channel under `dest` (and vice-versa);
+    // operators reading the restored store back saw a phantom
+    // memories adapter they never asked for, and on a `--force`
+    // (merge) restore the pre-existing memories chains on disk got
+    // folded against an empty snapshot half.
     let redex = Redex::new().with_persistent_dir(&dest);
-    let _ = NetDb::builder(redex)
-        .origin(origin)
-        .persistent(true)
-        .with_tasks()
-        .with_memories()
+    let mut builder = NetDb::builder(redex).origin(origin).persistent(true);
+    if snap.tasks.is_some() {
+        builder = builder.with_tasks();
+    }
+    if snap.memories.is_some() {
+        builder = builder.with_memories();
+    }
+    if snap.tasks.is_none() && snap.memories.is_none() {
+        return Err(crate::error::invalid_args(
+            "snapshot file carries neither tasks nor memories; nothing to restore",
+        ));
+    }
+    let _ = builder
         .build_from_snapshot(&snap)
         .await
         .map_err(|e| sdk(format!("netdb restore: {e}")))?;
