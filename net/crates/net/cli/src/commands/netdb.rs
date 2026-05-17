@@ -223,31 +223,60 @@ pub struct NetdbCommon {
     pub origin: u64,
 }
 
-pub async fn run(cmd: NetdbCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
+pub async fn run(
+    cmd: NetdbCommand,
+    output: Option<OutputFormat>,
+    config_path: Option<&std::path::Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    // Resolve profile.netdb up-front so every subcommand path
+    // (including the read-only `tasks ls` path that doesn't carry
+    // a `--store`) honours it. Pre-fix `netdb` was the only
+    // top-level that ignored --config/--profile, so an operator
+    // with `netdb = "/srv/netdb"` in `prod` would land in the
+    // default `$XDG_DATA_HOME/net/netdb` and write mutations into
+    // the wrong store.
+    let profile_netdb = crate::context::resolve_profile(config_path, profile_name)
+        .await
+        .ok()
+        .and_then(|p| p.netdb);
+    let profile_netdb = profile_netdb.as_deref();
     match cmd {
-        NetdbCommand::Tasks(TasksCommand::Ls(args)) => run_tasks_ls(args, output).await,
-        NetdbCommand::Tasks(TasksCommand::Create(args)) => run_tasks_create(args, output).await,
-        NetdbCommand::Tasks(TasksCommand::Rename(args)) => run_tasks_rename(args, output).await,
-        NetdbCommand::Tasks(TasksCommand::Complete(args)) => run_tasks_complete(args, output).await,
-        NetdbCommand::Tasks(TasksCommand::Delete(args)) => run_tasks_delete(args, output).await,
-        NetdbCommand::Memories(MemoriesCommand::Ls(args)) => run_memories_ls(args, output).await,
+        NetdbCommand::Tasks(TasksCommand::Ls(args)) => {
+            run_tasks_ls(args, output, profile_netdb).await
+        }
+        NetdbCommand::Tasks(TasksCommand::Create(args)) => {
+            run_tasks_create(args, output, profile_netdb).await
+        }
+        NetdbCommand::Tasks(TasksCommand::Rename(args)) => {
+            run_tasks_rename(args, output, profile_netdb).await
+        }
+        NetdbCommand::Tasks(TasksCommand::Complete(args)) => {
+            run_tasks_complete(args, output, profile_netdb).await
+        }
+        NetdbCommand::Tasks(TasksCommand::Delete(args)) => {
+            run_tasks_delete(args, output, profile_netdb).await
+        }
+        NetdbCommand::Memories(MemoriesCommand::Ls(args)) => {
+            run_memories_ls(args, output, profile_netdb).await
+        }
         NetdbCommand::Memories(MemoriesCommand::Store(args)) => {
-            run_memories_store(args, output).await
+            run_memories_store(args, output, profile_netdb).await
         }
         NetdbCommand::Memories(MemoriesCommand::Retag(args)) => {
-            run_memories_retag(args, output).await
+            run_memories_retag(args, output, profile_netdb).await
         }
         NetdbCommand::Memories(MemoriesCommand::Pin(args)) => {
-            run_memories_pin(args, output, false).await
+            run_memories_pin(args, output, false, profile_netdb).await
         }
         NetdbCommand::Memories(MemoriesCommand::Unpin(args)) => {
-            run_memories_pin(args, output, true).await
+            run_memories_pin(args, output, true, profile_netdb).await
         }
         NetdbCommand::Memories(MemoriesCommand::Delete(args)) => {
-            run_memories_delete(args, output).await
+            run_memories_delete(args, output, profile_netdb).await
         }
-        NetdbCommand::Snapshot(args) => run_snapshot(args, output).await,
-        NetdbCommand::Restore(args) => run_restore(args, output).await,
+        NetdbCommand::Snapshot(args) => run_snapshot(args, output, profile_netdb).await,
+        NetdbCommand::Restore(args) => run_restore(args, output, profile_netdb).await,
     }
 }
 
@@ -258,9 +287,11 @@ pub async fn run(cmd: NetdbCommand, output: Option<OutputFormat>) -> Result<(), 
 async fn run_tasks_create(
     args: TasksCreateArgs,
     output: Option<OutputFormat>,
+    profile_netdb: Option<&std::path::Path>,
 ) -> Result<(), CliError> {
     let netdb = open_netdb(
         args.common.store.as_deref(),
+        profile_netdb,
         args.common.origin,
         true,
         false,
@@ -279,9 +310,11 @@ async fn run_tasks_create(
 async fn run_tasks_rename(
     args: TasksRenameArgs,
     output: Option<OutputFormat>,
+    profile_netdb: Option<&std::path::Path>,
 ) -> Result<(), CliError> {
     let netdb = open_netdb(
         args.common.store.as_deref(),
+        profile_netdb,
         args.common.origin,
         true,
         false,
@@ -300,9 +333,11 @@ async fn run_tasks_rename(
 async fn run_tasks_complete(
     args: TasksIdArgs,
     output: Option<OutputFormat>,
+    profile_netdb: Option<&std::path::Path>,
 ) -> Result<(), CliError> {
     let netdb = open_netdb(
         args.common.store.as_deref(),
+        profile_netdb,
         args.common.origin,
         true,
         false,
@@ -318,9 +353,14 @@ async fn run_tasks_complete(
     emit_mutation(output, "task_completed", args.id, seq)
 }
 
-async fn run_tasks_delete(args: TasksIdArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
+async fn run_tasks_delete(
+    args: TasksIdArgs,
+    output: Option<OutputFormat>,
+    profile_netdb: Option<&std::path::Path>,
+) -> Result<(), CliError> {
     let netdb = open_netdb(
         args.common.store.as_deref(),
+        profile_netdb,
         args.common.origin,
         true,
         false,
@@ -343,9 +383,11 @@ async fn run_tasks_delete(args: TasksIdArgs, output: Option<OutputFormat>) -> Re
 async fn run_memories_store(
     args: MemoriesStoreArgs,
     output: Option<OutputFormat>,
+    profile_netdb: Option<&std::path::Path>,
 ) -> Result<(), CliError> {
     let netdb = open_netdb(
         args.common.store.as_deref(),
+        profile_netdb,
         args.common.origin,
         false,
         true,
@@ -364,9 +406,11 @@ async fn run_memories_store(
 async fn run_memories_retag(
     args: MemoriesRetagArgs,
     output: Option<OutputFormat>,
+    profile_netdb: Option<&std::path::Path>,
 ) -> Result<(), CliError> {
     let netdb = open_netdb(
         args.common.store.as_deref(),
+        profile_netdb,
         args.common.origin,
         false,
         true,
@@ -386,9 +430,11 @@ async fn run_memories_pin(
     args: MemoriesIdArgs,
     output: Option<OutputFormat>,
     unpin: bool,
+    profile_netdb: Option<&std::path::Path>,
 ) -> Result<(), CliError> {
     let netdb = open_netdb(
         args.common.store.as_deref(),
+        profile_netdb,
         args.common.origin,
         false,
         true,
@@ -419,9 +465,11 @@ async fn run_memories_pin(
 async fn run_memories_delete(
     args: MemoriesIdArgs,
     output: Option<OutputFormat>,
+    profile_netdb: Option<&std::path::Path>,
 ) -> Result<(), CliError> {
     let netdb = open_netdb(
         args.common.store.as_deref(),
+        profile_netdb,
         args.common.origin,
         false,
         true,
@@ -441,7 +489,11 @@ async fn run_memories_delete(
 // restore
 // =========================================================================
 
-async fn run_restore(args: RestoreArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
+async fn run_restore(
+    args: RestoreArgs,
+    output: Option<OutputFormat>,
+    profile_netdb: Option<&std::path::Path>,
+) -> Result<(), CliError> {
     // Pre-fix `--origin` was `default_value_t = 0` so clap could
     // not distinguish "operator forgot --origin" from "operator
     // typed --origin 0". A defaulted-to-zero origin silently
@@ -467,9 +519,12 @@ async fn run_restore(args: RestoreArgs, output: Option<OutputFormat>) -> Result<
     };
     let dest = match args.store.as_deref() {
         Some(p) => p.to_path_buf(),
-        None => default_netdb_path().ok_or_else(|| {
-            generic("no $XDG_DATA_HOME / data dir available; pass --store <PATH>")
-        })?,
+        None => match profile_netdb {
+            Some(p) => p.to_path_buf(),
+            None => default_netdb_path().ok_or_else(|| {
+                generic("no $XDG_DATA_HOME / data dir available; pass --store <PATH>")
+            })?,
+        },
     };
     // `--clear` implies `--force` and produces an actual restore
     // (snapshot replaces existing store). Plain `--force` keeps
@@ -594,9 +649,14 @@ struct RestoreResult {
     bytes_restored: u64,
 }
 
-async fn run_tasks_ls(args: TasksLsArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
+async fn run_tasks_ls(
+    args: TasksLsArgs,
+    output: Option<OutputFormat>,
+    profile_netdb: Option<&std::path::Path>,
+) -> Result<(), CliError> {
     let netdb = open_netdb(
         args.store.as_deref(),
+        profile_netdb,
         args.origin,
         /*tasks=*/ true,
         false,
@@ -617,9 +677,11 @@ async fn run_tasks_ls(args: TasksLsArgs, output: Option<OutputFormat>) -> Result
 async fn run_memories_ls(
     args: MemoriesLsArgs,
     output: Option<OutputFormat>,
+    profile_netdb: Option<&std::path::Path>,
 ) -> Result<(), CliError> {
     let netdb = open_netdb(
         args.store.as_deref(),
+        profile_netdb,
         args.origin,
         false,
         /*memories=*/ true,
@@ -637,14 +699,18 @@ async fn run_memories_ls(
     Ok(())
 }
 
-async fn run_snapshot(args: SnapshotArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
+async fn run_snapshot(
+    args: SnapshotArgs,
+    output: Option<OutputFormat>,
+    profile_netdb: Option<&std::path::Path>,
+) -> Result<(), CliError> {
     if !args.force && args.out.exists() {
         return Err(crate::error::invalid_args(format!(
             "{} already exists; pass --force to overwrite",
             args.out.display()
         )));
     }
-    let netdb = open_netdb(args.store.as_deref(), args.origin, true, true, false).await?;
+    let netdb = open_netdb(args.store.as_deref(), profile_netdb, args.origin, true, true, false).await?;
     let snapshot = netdb
         .snapshot()
         .map_err(|e| sdk(format!("netdb snapshot: {e}")))?;
@@ -703,16 +769,26 @@ async fn run_snapshot(args: SnapshotArgs, output: Option<OutputFormat>) -> Resul
 
 async fn open_netdb(
     store: Option<&std::path::Path>,
+    profile_netdb: Option<&std::path::Path>,
     origin: u64,
     enable_tasks: bool,
     enable_memories: bool,
     create_if_missing: bool,
 ) -> Result<Arc<NetDb>, CliError> {
+    // Resolution precedence: explicit --store > profile.netdb >
+    // $XDG_DATA_HOME default. Pre-fix `profile.netdb` was ignored
+    // entirely for every netdb subcommand, so an operator with
+    // `netdb = "/srv/netdb"` in their `prod` profile and
+    // `net --profile prod netdb tasks ls` landed in the default
+    // path and writes mutations into the wrong store.
     let path = match store {
         Some(p) => p.to_path_buf(),
-        None => default_netdb_path().ok_or_else(|| {
-            generic("no $XDG_DATA_HOME / data dir available; pass --store <PATH>")
-        })?,
+        None => match profile_netdb {
+            Some(p) => p.to_path_buf(),
+            None => default_netdb_path().ok_or_else(|| {
+                generic("no $XDG_DATA_HOME / data dir available; pass --store <PATH>")
+            })?,
+        },
     };
     if create_if_missing {
         tokio::fs::create_dir_all(&path).await.map_err(|e| {
