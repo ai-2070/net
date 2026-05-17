@@ -93,11 +93,31 @@ Subcommands:
   failures  Substrate failure stream (`subscribe_failures`).
               tail       [--since-seq <N>] [--output (text|json)]
 
-  db        MeshDB queries.
+  db        MeshDB queries (federated query plane).
               run        --query <Q> | --query-file <PATH>
               latest     --chain <CHAIN>
               between    --chain <CHAIN> --start <T1> --end <T2>
               tail       --chain <CHAIN> [--from <SEQ>]
+              filter     --chain <CHAIN> --where <EXPR>
+              aggregate  --chain <CHAIN> --kind (sum|count|min|max|avg)
+                         --field <FIELD> [--window <DUR>] [--group-by <KEY>]
+              plan       --query <Q> | --query-file <PATH>
+                         (print the ExecutionPlan without executing)
+
+  netdb     NetDB local KV adapters (Cortex-backed tasks + memories).
+              tasks ls                                  [--filter <EXPR>]
+              tasks create   --title <T> [--note <N>]
+              tasks complete <ID>
+              tasks rename   <ID> --title <T>
+              tasks delete   <ID>
+              memories ls                               [--filter <EXPR>]
+              memories store --content <C> [--tag <TAG>...]
+              memories retag <ID> --tag <TAG>...
+              memories pin   <ID>
+              memories unpin <ID>
+              memories delete <ID>
+              snapshot --out <PATH>                    # export the full store
+              restore  --from <PATH>                   # import an exported store
 
   rpc       Typed RPC (nRPC) client surface.
               call       <SERVICE> <METHOD>
@@ -129,6 +149,19 @@ Subcommands:
               reclassify-nat                          # force a classifier sweep
               set-reflex    <ADDR>                    # install a reflex override
               clear-reflex                            # drop the override
+
+  port      Port-mapping + reachability helpers.
+              gateway                                 # detected IPv4 gateway +
+                                                      # local interface ip
+              probe-peer    <NODE>                    # active reflex probe via
+                                                      # the coordinator-mediated
+                                                      # path; returns the source
+                                                      # address observed
+              try-map       --internal-port <P>
+                            [--protocol (nat-pmp|upnp|auto)]
+                            [--ttl <DUR>]
+                            [--keep]                  # leave the mapping installed
+                                                      # (default: revoke on exit)
 
   identity  Operator + entity identity authoring.
               generate   [--out <PATH>]
@@ -321,7 +354,60 @@ Three modes for `net daemon run`:
 
 Both subcommand groups are read-only from a cluster-state perspective with one local-state exception: `cap announce` and `peer set-reflex` mutate what *this node* tells the rest of the mesh, but never commit to the admin chain. They're "tell my peers about my own state" surfaces, not "tell other nodes what to do" surfaces — which keeps them firmly outside the admin-commit path that requires operator signing.
 
-### 7. Config file shape
+### 7. Port-mapping + reachability helpers
+
+`net port` wraps the substrate's port-mapping stack (`adapter/net/traversal/portmap/`) and a thin set of reachability probes. Scoped tightly to what the mesh actually exposes — this is **not a generic TCP/UDP port scanner**. Operators reach for it when diagnosing "why isn't this node externally reachable" or "does my router support UPnP/NAT-PMP at all."
+
+- **`net port gateway`** — wraps `default_ipv4_gateway()` + `local_ipv4_for_gateway(gw)`. Prints `{ gateway, local_iface_ip, source }` where `source` is `routing-table` (resolved from the OS) or `unavailable`. First step when port-mapping isn't working: is the gateway even detectable?
+- **`net port probe-peer <NODE>`** — wraps `MeshAdapter::probe_reflex(peer)`. Sends a coordinator-mediated reflex probe to `peer` and prints the source address the coordinator observed for this node ("here's what the rest of the mesh sees you as"). Exits 3 with kind `transport` if the socket fails, `unavailable` if no coordinator session is up. Distinct from `net peer reflex <NODE>` — that's a cached lookup; this actively probes.
+- **`net port try-map --internal-port <P>`** — ad-hoc port-map attempt against the local gateway. Picks NAT-PMP (`Protocol::NatPmp`) when `--protocol nat-pmp`, UPnP (`Protocol::UpnpIgd`) when `upnp`, both-in-order when `auto`. On success prints the `PortMapping` (`{ external, internal_port, ttl_ms, protocol }`); on failure prints the `PortMappingError` kind (`unavailable` / `timeout` / `transport` / `refused`) with exit code 3. **Default behaviour revokes the mapping on exit** — this is a "does my router even support this?" diagnostic, not a way to permanently install a mapping outside the running mesh's lifecycle. `--keep` overrides for the rare case an operator wants the mapping installed without spinning up a full node. Requires the `port-mapping` cargo feature in the CLI build.
+
+Substrate-side prereq for `try-map`: the existing `PortMapperClient` impls (NAT-PMP / UPnP-IGD) are accessible through the traversal module today, but there's no public one-shot helper that constructs a client, runs `probe → install → remove`, and returns the `PortMapping`. The CLI's Phase 2 slice adds a small `sdk-side` adapter (`net_sdk::traversal::try_map_once(protocol, internal_port, ttl)`) wrapping the existing impls; that's a half-day's work, no substrate-internal changes required.
+
+### 8. MeshDB query surface
+
+`net db` wraps the SDK's MeshDB federated query plane (`crates/net/sdk/src/meshdb.rs`). The existing `run` / `latest` / `between` / `tail` slice covers raw query execution; this section adds the three composer-shortcut subcommands that let operators write common shapes without authoring a full `MeshQuery` JSON document.
+
+- **`net db run --query <Q>` / `--query-file <PATH>`** — parses a full `MeshQuery` JSON payload, hands it to `MeshQueryPlanner::plan(query)`, then to `LocalMeshQueryExecutor::execute(plan)`. Streams `ResultRow`s as ndjson on stdout. The shape of the JSON matches the `MeshQuery` serde repr — same envelope every Rust consumer constructs.
+- **`net db latest --chain <CHAIN>`** — shorthand for `MeshQuery::latest(chain)`. Returns the freshest row from the chain.
+- **`net db between --chain <CHAIN> --start <T1> --end <T2>`** — shorthand for `MeshQuery::between(chain, t1, t2)`. Bounded timeline scan.
+- **`net db tail --chain <CHAIN> [--from <SEQ>]`** — `MeshQuery::latest(chain)` driven through `ResultStream` as ndjson; closes on `Ctrl-C` or chain end.
+- **`net db filter --chain <CHAIN> --where <EXPR>`** — shorthand for `MeshQuery::latest(chain).filter(parse(expr))`. `<EXPR>` accepts a small predicate DSL (`field == "x"`, `field > 42`, `tag in ["a","b"]`, `&&` / `||` / `!`). Parser lives in the CLI; compiles to an `Expr` the substrate already accepts. A misformed expression exits with subcommand-specific code 12.
+- **`net db aggregate --chain <CHAIN> --kind <KIND> --field <FIELD> [--window <DUR>] [--group-by <KEY>]`** — composes `MeshQuery::latest(chain).aggregate(...)` using `NumericAggregateKind` for `sum|count|min|max|avg`. `--window` wraps the aggregate in a `WindowSpec` (sliding by default); `--group-by` adds a `GroupKey`. Prints one row per group as ndjson.
+- **`net db plan --query <Q> | --query-file <PATH>`** — runs `MeshQueryPlanner::plan(query)` but **does not** execute. Emits the `ExecutionPlan` as JSON — useful for understanding planner decisions (which chains get scanned, whether the cache layer engages, what the join watermark resolves to) before kicking off an expensive query.
+
+Output defaults: `tail`, `between`, `aggregate`, `filter`, `run` emit ndjson; `latest` emits a single JSON object on stdout. `plan` emits a single JSON `ExecutionPlan` object.
+
+### 9. NetDB local-store surface
+
+`net netdb` wraps `NetDb` (`adapter/net/netdb`) — the Cortex-backed local KV store every daemon can use for tasks + memories. Audience is **daemon developers + agents debugging local state**, not cluster operators; operators don't directly touch tasks / memories in production. The subcommand group lives in the same binary because the SDK already wires NetDB and a separate `netdb-cli` would duplicate config + identity loading for marginal cleanliness.
+
+Both `tasks` and `memories` are independent adapters with `with_tasks()` / `with_memories()` builder gates on the substrate; `net netdb` opens whichever the operator's `--store <PATH>` (or config-file `netdb.path`) requests, defaulting to `$XDG_DATA_HOME/net/netdb.redex`.
+
+**Tasks** — wraps `TasksAdapter` (`cortex/tasks/adapter.rs`):
+
+- **`tasks ls [--filter <EXPR>]`** — read `state().read().tasks()` and stream as ndjson. `--filter` uses the same predicate DSL as `net db filter` (compiled to a `TasksFilter`).
+- **`tasks create --title <T> [--note <N>]`** — wraps `TasksAdapter::create(title, note)`. Prints the new `TaskId` + the WriteToken; exit code 3 on substrate-side failure (`CortexAdapterError` kinds).
+- **`tasks complete <ID>`** — wraps `complete(id, now_ns)`.
+- **`tasks rename <ID> --title <T>`** — wraps `rename(id, new_title)`.
+- **`tasks delete <ID>`** — wraps `delete(id)`.
+
+**Memories** — wraps `MemoriesAdapter` (`cortex/memories/adapter.rs`):
+
+- **`memories ls [--filter <EXPR>]`** — read `state().read().memories()`. `--filter` compiles to `MemoriesFilter`.
+- **`memories store --content <C> [--tag <TAG>...]`** — wraps `store(content, tags, now_ns)`. Prints new `MemoryId` + WriteToken.
+- **`memories retag <ID> --tag <TAG>...`** — wraps `retag(id, tags)`.
+- **`memories pin <ID>`** / **`memories unpin <ID>`** — wraps `pin` / `unpin`.
+- **`memories delete <ID>`** — wraps `delete(id)`.
+
+**Snapshot / restore** — wraps `NetDb::snapshot()` (returns `NetDbSnapshot`) and `NetDbBuilder::build_from_snapshot(...)`:
+
+- **`snapshot --out <PATH>`** — serialize the live snapshot via `NetDbSnapshot::encode()` (postcard) to `<PATH>`. Useful for backup + cross-machine replication during daemon development.
+- **`restore --from <PATH>`** — `NetDbSnapshot::decode(bytes)` then `NetDbBuilder::build_from_snapshot(snapshot)`. Fails fast if the target store is non-empty unless `--force` is set.
+
+Every `net netdb` command requires `--store <PATH>` (or config-file equivalent); the binary refuses to operate on whatever happens to live at a default path without confirmation, since these operations mutate persistent state.
+
+### 10. Config file shape
 
 ```toml
 # ~/.config/net/config.toml
@@ -345,7 +431,7 @@ default_timeout_ms = 30000
 
 `--config` / `--profile` / `NET_PROFILE` env var resolve the active profile. Every individual flag overrides the profile value.
 
-### 8. Identity store
+### 11. Identity store
 
 Operator identities are stored as TOML files:
 
@@ -361,7 +447,7 @@ note        = "Production operator for the deck-fleet cluster"
 
 The seed file is read-only by `chmod 600`; the CLI errors with kind `permissive_mode` if the file is world-readable. Pattern lifted from `ssh-keygen`.
 
-### 9. Wire / FFI contracts
+### 12. Wire / FFI contracts
 
 The CLI inherits everything from the Rust SDK — no new wire formats. JSON output uses serde's default representation; specifically:
 
@@ -378,7 +464,7 @@ The CLI inherits everything from the Rust SDK — no new wire formats. JSON outp
 - `MeshOsSnapshot` → forwarded verbatim; `--output yaml` rewraps for readability.
 - Errors → `{"kind": "...", "message": "..."}` on stderr, exit code per the table above.
 
-### 10. Tests
+### 13. Tests
 
 Three layers:
 
@@ -386,7 +472,7 @@ Three layers:
 2. **In-process integration** — every subcommand under `tests/`. Each test spins a `net_sdk::testing::ClusterHarness`, drives the CLI via `assert_cmd`, and checks stdout / stderr / exit code. ~40 cases planned for Phase 1.
 3. **Exit-code coverage** — `tests/exit_codes.rs` enumerates every documented code (0–8, sample 10–11), invokes a fixture that produces that code, and asserts the binary exits with it. Pinned so future contributors can't quietly broaden the meaning of an exit code.
 
-### 11. Documentation
+### 14. Documentation
 
 - **`docs/net-cli.md`** — operator-facing reference. Each subcommand's flags, output shape, example invocation, exit codes, env vars. Format lifted from `git-scm.com`-style man pages.
 - **`docs/net-cli-cookbook.md`** — recipes. Common CI patterns (drain-and-wait, audit-since-deploy, ICE preview in dry-run), shell snippets, jq one-liners.
@@ -421,9 +507,9 @@ Lock these so phase implementations don't relitigate:
 
 Activation order, dependency-driven:
 
-- **Phase 1 — Scaffolding + read-only surface.** `cli/Cargo.toml` + `src/main.rs` with clap routing for `net version`, `net identity (generate|show|fingerprint)`, `net snapshot get`, `net snapshot status`, `net audit recent` / `audit stream`, `net log tail`, `net failures tail`, `net daemon ls`, `net cap (show|query|nodes)`, `net peer (ls|reflex|nat)`. Config + global flags + output dispatch. Exit-code table. Help-text goldens. Wires nothing that mutates substrate or local-node state — purely read + identity authoring.
+- **Phase 1 — Scaffolding + read-only surface.** `cli/Cargo.toml` + `src/main.rs` with clap routing for `net version`, `net identity (generate|show|fingerprint)`, `net snapshot get`, `net snapshot status`, `net audit recent` / `audit stream`, `net log tail`, `net failures tail`, `net daemon ls`, `net cap (show|query|nodes)`, `net peer (ls|reflex|nat)`, `net port gateway`, `net db (run|latest|between|tail|filter|aggregate|plan)`, `net netdb (tasks ls|memories ls|snapshot)`. Config + global flags + output dispatch. Exit-code table. Help-text goldens. Wires nothing that mutates substrate or local-node state — purely read + identity authoring.
 
-- **Phase 2 — Admin write surface + nRPC client + local-state writes.** `net admin (drain|enter-maintenance|exit-maintenance|cordon|uncordon|drop-replicas|invalidate-placement|restart-all-daemons|clear-avoid-list)`. `--dry-run` support. Identity loading + commit envelope construction. `net rpc (call|stream|discover|services)` — Tier 1 client surface over `MeshAdapter::call_service` / `call_streaming` / `find_service_nodes`. `net cap announce` + `net peer (reclassify-nat|set-reflex|clear-reflex)` — local-state writes that update what this node advertises but never commit to the admin chain. Integration tests for every admin variant + ≥3 per `rpc` / `cap` / `peer` command (happy path, error path, output-format variant).
+- **Phase 2 — Admin write surface + nRPC client + local-state writes + port-map diag + NetDB mutations.** `net admin (drain|enter-maintenance|exit-maintenance|cordon|uncordon|drop-replicas|invalidate-placement|restart-all-daemons|clear-avoid-list)`. `--dry-run` support. Identity loading + commit envelope construction. `net rpc (call|stream|discover|services)` — Tier 1 client surface over `MeshAdapter::call_service` / `call_streaming` / `find_service_nodes`. `net cap announce` + `net peer (reclassify-nat|set-reflex|clear-reflex)` — local-state writes that update what this node advertises but never commit to the admin chain. `net port (probe-peer|try-map)` — adds the `net_sdk::traversal::try_map_once` adapter helper that wraps the existing `PortMapperClient` impls into a one-shot `probe → install → remove`; requires the CLI build to enable the `port-mapping` cargo feature. `net netdb tasks (create|complete|rename|delete)` + `net netdb memories (store|retag|pin|unpin|delete)` + `net netdb restore` — local-store mutations on a developer's NetDB; `--force` gates `restore` over a non-empty store. Integration tests for every admin variant + ≥3 per `rpc` / `cap` / `peer` / `port` / `db` / `netdb` command (happy path, error path, output-format variant).
 
 - **Phase 3 — ICE break-glass surface.** `net ice (freeze-cluster|thaw-cluster|flush-avoid-lists|force-evict-replica|force-restart-daemon|force-cutover|kill-migration)`. Simulate → preview table → confirm gate → commit. `--yes` for non-interactive flows; `--sig` for pre-collected signatures. `net identity registry (add|remove|list)`. ICE-specific integration tests + the exit-code-8 coverage.
 
@@ -440,6 +526,8 @@ These surfaces are designed-but-unscheduled. The notes pin the shape so a future
 - **`net rpc metrics` + `net rpc trace`** — nRPC observability subcommands. `metrics` wraps `rpc_metrics_snapshot()` with `--output (json|prom|table)` (the SDK already provides `prometheus_text()`) and a `--watch <DUR>` polling mode. `trace` issues a single call with tracing turned on and emits the per-hop `RpcCallEvent` stream as ndjson alongside the reply. Both are useful for debugging routing decisions + latency; both are deferred until consumers ask, because (a) the Prometheus surface is already accessible from any Rust consumer of the SDK, and (b) per-call tracing's signal-to-noise is low without a UI on top.
 - **`net rpc bench`** — load-test driver (concurrency × duration × payload → p50/p95/p99 latency, success rate, error breakdown by `RpcError` kind). Deferred — bench tooling is better served by `criterion` or a dedicated harness than by a CLI subcommand.
 - **`net rpc serve --exec <BINARY>`** — host a service via a subprocess shim that talks to the CLI over stdio. Deferred — defining the stdio line protocol isn't worth it until a real cross-language consumer needs it; the Rust path goes through `net daemon run --kind <FACTORY-ID>` instead.
+- **`net port probe-tcp <HOST> <PORT>`** — one-shot TCP connect probe with `--timeout`, reporting `open` / `refused` / `timeout` / `unreachable` + round-trip ms. Useful for ChatOps reachability checks ("is the coordinator's advertised endpoint reachable from here"). Deferred — operators reaching for this can use `nc -zv` / `curl --connect-timeout` / `timeout 5 bash -c '</dev/tcp/host/port'`; adding a CLI subcommand that wraps `tokio::net::TcpStream::connect` adds surface area without doing anything the OS doesn't already do. Revive only if a runbook needs structured (JSON) output that the existing tools don't emit.
+- **`net db cache (stats|clear)`** — observability + control for the `LruResultCache` the MeshDB executor optionally wires via `LocalMeshQueryExecutor::with_cache(...)`. `stats` would print hit / miss / eviction counts + total entries; `clear` would reset the cache. Deferred — the cache is opt-in and operators rarely tune it directly; consumers that need the metrics already get them through the SDK's tracing-span surface. Revive when a real workflow needs CLI access to cache state.
 
 ## Non-goals
 
