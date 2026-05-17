@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "ai2070-net"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "arc-swap",
  "async-nats",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "ai2070-net-sdk"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "ai2070-net",
  "async-trait",
@@ -1025,7 +1025,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "deck"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "ai2070-net-sdk",
  "bytes",
@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "net-cli"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "ai2070-net-sdk",
  "assert_cmd",
@@ -2194,7 +2194,7 @@ dependencies = [
 
 [[package]]
 name = "net-compute-ffi"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "ai2070-net",
  "ai2070-net-sdk",
@@ -2208,7 +2208,7 @@ dependencies = [
 
 [[package]]
 name = "net-deck-ffi"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "ai2070-net",
  "futures",
@@ -2219,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "net-meshdb-ffi"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "ai2070-net",
  "futures",
@@ -2230,7 +2230,7 @@ dependencies = [
 
 [[package]]
 name = "net-meshos-ffi"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "ai2070-net",
  "bytes",
@@ -2240,7 +2240,7 @@ dependencies = [
 
 [[package]]
 name = "net-node"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "ai2070-net",
  "ai2070-net-sdk",
@@ -2262,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "net-python"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "ai2070-net",
  "ai2070-net-sdk",
@@ -2281,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "net-rpc-ffi"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "ai2070-net",
  "async-trait",

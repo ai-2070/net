@@ -1,6 +1,6 @@
 [package]
 name = "net-cli"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 description = "Unified `net` command-line tool — Phase 1 (read-only surface)"
 license = "Apache-2.0"

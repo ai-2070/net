@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "ai2070-net"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "igd-next"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bac9a3c8278f43b4cd8463380f4a25653ac843e5b177e1d3eaf849cc9ba10d4d"
 dependencies = [

@@ -956,7 +956,7 @@ impl App {
             disk_used_bytes: local.disk_used_bytes,
             disk_total_bytes: local.disk_total_bytes,
             capability_set: caps,
-            software_version: Some("0.17.0".to_string()),
+            software_version: Some("0.18.0".to_string()),
             ..Default::default()
         }
     }
@@ -1099,7 +1099,7 @@ impl App {
                 disk_used_bytes: entry.disk_used_bytes,
                 disk_total_bytes: entry.disk_total_bytes,
                 capability_set: caps,
-                software_version: Some("0.17.0".to_string()),
+                software_version: Some("0.18.0".to_string()),
                 ..Default::default()
             };
             self.node_focus = Some(crate::tabs::node_page::NodeFocusEntry {

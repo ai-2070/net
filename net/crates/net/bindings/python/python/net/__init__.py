@@ -408,10 +408,16 @@ else:
 try:
     from ._net import (
         AdminCommands as _DeckAdminCommands,
+    )
+    from ._net import (
         DeckClient,
         DeckSdkError,
         OperatorIdentity,
+    )
+    from ._net import (
         SnapshotStream as _DeckSnapshotStream,
+    )
+    from ._net import (
         StatusSummaryStream as _DeckStatusSummaryStream,
     )
 except ImportError:
@@ -441,7 +447,11 @@ else:
     try:
         from ._net import (
             IceCommands as _DeckIceCommands,
+        )
+        from ._net import (
             IceProposal as _DeckIceProposal,
+        )
+        from ._net import (
             SimulatedIceProposal as _DeckSimulatedIceProposal,
         )
 
@@ -464,6 +474,8 @@ else:
     try:
         from ._net import (
             AdminVerifier as _DeckAdminVerifier,
+        )
+        from ._net import (
             OperatorRegistry as _DeckOperatorRegistry,
         )
 
@@ -553,4 +565,4 @@ else:
     )
 
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"
