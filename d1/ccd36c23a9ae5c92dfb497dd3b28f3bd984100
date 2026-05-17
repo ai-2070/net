@@ -1,0 +1,24 @@
+net/crates/net/bindings/go/deck-ffi/src/lib.rs
+  s_ac2931afe38c4a::t_ba4d3930e4f2d5 2054-2058
+  s_ac2931afe38c4a::t_d28da07c05de7c 2111,2120-2123
+  s_ac2931afe38c4a::t_eb2977aef26a7e 3449-3489
+  s_ac2931afe38c4a::t_91369cd652c908 1811-1817,1831
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_17_MESHOS_SDKS.md
+  s_ac2931afe38c4a::t_e8b85096141a2d 466
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "d1ccd36c23a9ae5c92dfb497dd3b28f3bd984100",
+  "prompts": {},
+  "sessions": {
+    "s_ac2931afe38c4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59271d48-d72a-4337-b857-962412f18343",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
