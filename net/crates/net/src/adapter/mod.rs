@@ -54,6 +54,39 @@ use async_trait::async_trait;
 use crate::error::AdapterError;
 use crate::event::{Batch, StoredEvent};
 
+/// Strip `user:password@` from a connection URL for safe logging /
+/// `Debug` output. Returns an `Cow::Borrowed` when no redaction is
+/// needed so the common no-credentials path is allocation-free.
+///
+/// Both adapter init logs and `Debug` impls previously emitted
+/// `config.url` verbatim. A misconfigured operator who put the
+/// password in the URL (the canonical Redis / NATS shape) would
+/// leak it into every log sink the application uses. Redaction is
+/// based on the URI spec: userinfo is the substring between
+/// `"://"` and the first `'@'`, scoped to the authority component.
+#[must_use]
+pub(crate) fn redact_url(url: &str) -> std::borrow::Cow<'_, str> {
+    let Some(scheme_end) = url.find("://") else {
+        return std::borrow::Cow::Borrowed(url);
+    };
+    let after_scheme = scheme_end + 3;
+    // Only scan within the authority component — anything past the
+    // first '/' (path) or '?' (query) terminates it.
+    let authority_end = url[after_scheme..]
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .map_or(url.len(), |i| after_scheme + i);
+    let authority = &url[after_scheme..authority_end];
+    let Some(at_pos) = authority.find('@') else {
+        return std::borrow::Cow::Borrowed(url);
+    };
+    let mut redacted = String::with_capacity(url.len());
+    redacted.push_str(&url[..after_scheme]);
+    redacted.push_str("[REDACTED]");
+    redacted.push_str(&authority[at_pos..]);
+    redacted.push_str(&url[authority_end..]);
+    std::borrow::Cow::Owned(redacted)
+}
+
 /// Result of polling a single shard.
 #[derive(Debug, Clone)]
 pub struct ShardPollResult {
@@ -295,5 +328,41 @@ mod tests {
 
         adapter.flush().await.unwrap();
         adapter.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn redact_url_strips_userinfo() {
+        assert_eq!(
+            redact_url("redis://user:secret@redis.example.com:6379"),
+            "redis://[REDACTED]@redis.example.com:6379"
+        );
+        assert_eq!(
+            redact_url("nats://admin:p@ss@nats.svc:4222/path?foo=1"),
+            // Password contains an unencoded '@' — URI spec says it
+            // must be percent-encoded; the userinfo terminator is
+            // the first '@', so this is the most-permissive split.
+            "nats://[REDACTED]@ss@nats.svc:4222/path?foo=1"
+        );
+        assert_eq!(
+            redact_url("rediss://:tokenonly@host:6379"),
+            "rediss://[REDACTED]@host:6379"
+        );
+    }
+
+    #[test]
+    fn redact_url_passthrough_when_no_userinfo() {
+        assert_eq!(
+            redact_url("redis://redis.svc:6379"),
+            "redis://redis.svc:6379"
+        );
+        assert_eq!(
+            redact_url("nats://nats.svc:4222"),
+            "nats://nats.svc:4222"
+        );
+        // '@' in the path / query is not userinfo — must not redact.
+        assert_eq!(
+            redact_url("https://example.com/path/@handle"),
+            "https://example.com/path/@handle"
+        );
     }
 }

@@ -306,7 +306,7 @@ impl RedisAdapter {
 impl std::fmt::Debug for RedisAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedisAdapter")
-            .field("url", &self.config.url)
+            .field("url", &crate::adapter::redact_url(&self.config.url))
             .field("prefix", &self.config.prefix)
             .field("initialized", &self.initialized.load(Ordering::Relaxed))
             .finish()
@@ -349,7 +349,7 @@ impl Adapter for RedisAdapter {
 
         tracing::info!(
             adapter = "redis",
-            url = %self.config.url,
+            url = %crate::adapter::redact_url(&self.config.url),
             prefix = %self.config.prefix,
             "Redis adapter initialized"
         );
