@@ -1,0 +1,43 @@
+net/crates/net/deck/src/demo/cluster.rs
+  s_ac2931afe38c4a::t_38cb97cdbb822b 5-8,20-33
+net/crates/net/sdk/tests/cluster_harness.rs
+  s_ac2931afe38c4a::t_1b687886f0cc16 168-169
+  s_ac2931afe38c4a::t_ab62c06b31b93a 155-167,170-201
+net/crates/net/sdk/src/testing/cluster.rs
+  s_ac2931afe38c4a::t_aec14c2c5b6dbf 63-71,83-84
+  s_ac2931afe38c4a::t_2331773d7893bc 404-405
+  s_ac2931afe38c4a::t_d062870d419177 406-408,412-414
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_17_MESHOS_SDKS.md
+  s_ac2931afe38c4a::t_6e1779b9f511c7 282
+net/crates/net/docs/plans/NET_CLI_PLAN.md
+  s_5af7ced268385a::t_0ebfd89c4bd4f9 102-112
+  s_5af7ced268385a::t_1d6b20405d9f4f 273-282
+  s_5af7ced268385a::t_aa8ed6338c1229 306
+  s_5af7ced268385a::t_bd0ab9778012eb 322
+net/crates/net/deck/src/demo/spawn.rs
+  s_ac2931afe38c4a::t_c2298be535fc4a 135-137,141-149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "34acca9a8247a245cc351d0405f1aa52e47ca82d",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_ac2931afe38c4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59271d48-d72a-4337-b857-962412f18343",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
