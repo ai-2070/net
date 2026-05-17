@@ -2151,7 +2151,6 @@ version = "0.17.0"
 dependencies = [
  "ai2070-net-sdk",
  "assert_cmd",
- "bytes",
  "clap",
  "color-eyre",
  "comfy-table",

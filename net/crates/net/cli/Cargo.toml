@@ -67,8 +67,7 @@ toml = "0.8"
 # outputs and the snapshot watch loop.
 futures = "0.3"
 
-# Bytes / hex utilities for identity material.
-bytes = "1"
+# Hex codec for identity material (seed / public key / signature).
 hex = "0.4"
 
 # SHA-256 for the operator-visible identity fingerprint. ssh
