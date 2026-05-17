@@ -652,10 +652,23 @@ async fn run_restore(
 
 fn now_ns() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => u64::try_from(d.as_nanos()).unwrap_or(u64::MAX),
+        // Pre-1970 host clock. Pre-fix this `unwrap_or(0)`-ed,
+        // stamping every `created_ns` / `updated_ns` with 0 and
+        // collapsing time-ordered filters into insertion order.
+        // Surface a tracing warning and fall back to a fixed
+        // post-epoch sentinel (10 minutes past epoch) so
+        // downstream filters at least see a unique non-zero
+        // value, and operators see the misconfig in logs.
+        Err(_) => {
+            tracing::warn!(
+                "system clock is before UNIX epoch; stamping events with the post-epoch \
+                 sentinel - check NTP / RTC configuration"
+            );
+            600_000_000_000
+        }
+    }
 }
 
 fn emit_mutation(
