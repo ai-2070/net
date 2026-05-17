@@ -522,14 +522,12 @@ async fn run_tasks_ls(args: TasksLsArgs, output: Option<OutputFormat>) -> Result
         /*create_if_missing=*/ false,
     )
     .await?;
-    let tasks: Vec<Task> = match netdb.try_tasks() {
-        Some(adapter) => {
-            let state_arc = adapter.state();
-            let guard = state_arc.read();
-            guard.all().cloned().collect()
-        }
-        None => Vec::new(),
-    };
+    let adapter = netdb
+        .try_tasks()
+        .ok_or_else(|| sdk("NetDB has no tasks adapter wired"))?;
+    let state_arc = adapter.state();
+    let guard = state_arc.read();
+    let tasks: Vec<Task> = guard.all().cloned().collect();
     emit_value(OutputFormat::resolve_oneshot(output), &tasks)
         .map_err(|e| generic(format!("write tasks: {e}")))?;
     Ok(())
@@ -547,14 +545,12 @@ async fn run_memories_ls(
         /*create_if_missing=*/ false,
     )
     .await?;
-    let memories: Vec<Memory> = match netdb.try_memories() {
-        Some(adapter) => {
-            let state_arc = adapter.state();
-            let guard = state_arc.read();
-            guard.all().cloned().collect()
-        }
-        None => Vec::new(),
-    };
+    let adapter = netdb
+        .try_memories()
+        .ok_or_else(|| sdk("NetDB has no memories adapter wired"))?;
+    let state_arc = adapter.state();
+    let guard = state_arc.read();
+    let memories: Vec<Memory> = guard.all().cloned().collect();
     emit_value(OutputFormat::resolve_oneshot(output), &memories)
         .map_err(|e| generic(format!("write memories: {e}")))?;
     Ok(())
