@@ -87,7 +87,7 @@ const CURRENT_VERSION: u32 = 1;
 pub struct BookmarkStore {
     bookmarks: Vec<Bookmark>,
     /// `None` when the store was constructed standalone (tests);
-    /// `Some` when [`load`] resolved a real config path.
+    /// `Some` when [`BookmarkStore::load`] resolved a real config path.
     path: Option<PathBuf>,
 }
 
@@ -222,7 +222,7 @@ impl BookmarkStore {
 
     /// Write the store back to its backing path. Creates parent
     /// directories if missing. No-op when the store was
-    /// constructed via [`empty`] (no path).
+    /// constructed via [`BookmarkStore::empty`] (no path).
     ///
     /// Writes are atomic: the encoded TOML lands in a sibling
     /// `.tmp` file first, then renames over the destination.
@@ -277,7 +277,7 @@ impl BookmarkStore {
     }
 
     /// Path the store reads / writes. `None` when constructed
-    /// via [`empty`].
+    /// via [`BookmarkStore::empty`].
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
