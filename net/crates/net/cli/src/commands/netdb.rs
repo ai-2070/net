@@ -246,6 +246,7 @@ async fn run_tasks_create(
         args.common.origin,
         true,
         false,
+        true,
     )
     .await?;
     let tasks = netdb
@@ -266,6 +267,7 @@ async fn run_tasks_rename(
         args.common.origin,
         true,
         false,
+        true,
     )
     .await?;
     let tasks = netdb
@@ -286,6 +288,7 @@ async fn run_tasks_complete(
         args.common.origin,
         true,
         false,
+        true,
     )
     .await?;
     let tasks = netdb
@@ -303,6 +306,7 @@ async fn run_tasks_delete(args: TasksIdArgs, output: Option<OutputFormat>) -> Re
         args.common.origin,
         true,
         false,
+        true,
     )
     .await?;
     let tasks = netdb
@@ -327,6 +331,7 @@ async fn run_memories_store(
         args.common.origin,
         false,
         true,
+        true,
     )
     .await?;
     let memories = netdb
@@ -346,6 +351,7 @@ async fn run_memories_retag(
         args.common.store.as_deref(),
         args.common.origin,
         false,
+        true,
         true,
     )
     .await?;
@@ -367,6 +373,7 @@ async fn run_memories_pin(
         args.common.store.as_deref(),
         args.common.origin,
         false,
+        true,
         true,
     )
     .await?;
@@ -399,6 +406,7 @@ async fn run_memories_delete(
         args.common.store.as_deref(),
         args.common.origin,
         false,
+        true,
         true,
     )
     .await?;
@@ -511,6 +519,7 @@ async fn run_tasks_ls(args: TasksLsArgs, output: Option<OutputFormat>) -> Result
         args.origin,
         /*tasks=*/ true,
         false,
+        /*create_if_missing=*/ false,
     )
     .await?;
     let tasks: Vec<Task> = match netdb.try_tasks() {
@@ -535,6 +544,7 @@ async fn run_memories_ls(
         args.origin,
         false,
         /*memories=*/ true,
+        /*create_if_missing=*/ false,
     )
     .await?;
     let memories: Vec<Memory> = match netdb.try_memories() {
@@ -557,7 +567,7 @@ async fn run_snapshot(args: SnapshotArgs, output: Option<OutputFormat>) -> Resul
             args.out.display()
         )));
     }
-    let netdb = open_netdb(args.store.as_deref(), args.origin, true, true).await?;
+    let netdb = open_netdb(args.store.as_deref(), args.origin, true, true, false).await?;
     let snapshot = netdb
         .snapshot()
         .map_err(|e| sdk(format!("netdb snapshot: {e}")))?;
@@ -589,6 +599,7 @@ async fn open_netdb(
     origin: u64,
     enable_tasks: bool,
     enable_memories: bool,
+    create_if_missing: bool,
 ) -> Result<Arc<NetDb>, CliError> {
     let path = match store {
         Some(p) => p.to_path_buf(),
@@ -596,12 +607,23 @@ async fn open_netdb(
             generic("no $XDG_DATA_HOME / data dir available; pass --store <PATH>")
         })?,
     };
-    tokio::fs::create_dir_all(&path).await.map_err(|e| {
-        generic(format!(
-            "failed to create netdb directory {}: {e}",
+    if create_if_missing {
+        tokio::fs::create_dir_all(&path).await.map_err(|e| {
+            generic(format!(
+                "failed to create netdb directory {}: {e}",
+                path.display()
+            ))
+        })?;
+    } else if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        // Read paths refuse to silently fabricate an empty store —
+        // a typo'd `--store /var/tmp/typo` would otherwise return
+        // zero rows with no diagnostic.
+        return Err(crate::error::invalid_args(format!(
+            "netdb store {} does not exist; pass --store <PATH> to an \
+             existing store or run a mutation first to create one",
             path.display()
-        ))
-    })?;
+        )));
+    }
     let redex = Redex::new().with_persistent_dir(&path);
     let mut builder: NetDbBuilder = NetDb::builder(redex).origin(origin).persistent(true);
     if enable_tasks {
