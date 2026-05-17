@@ -851,18 +851,32 @@ async fn run_snapshot(
             ))
         })?;
     }
-    // Atomic publish: write to a temp file next to the final
-    // destination, then rename. Pre-fix `tokio::fs::write`
-    // overwrote the target in place, so any crash / SIGKILL /
-    // full-disk between the truncate and the final flush left a
-    // truncated postcard blob at the documented path and operators
-    // lost their previous snapshot. fsync on the tmp + parent dir
-    // is tracked separately under the audit's #20 follow-up.
+    // Atomic + durable publish: write to a temp file next to
+    // the final destination, fsync it, rename onto the target,
+    // fsync the parent dir so the rename is durable. Pre-fix the
+    // sequence stopped at `write` + `rename`, which is atomic
+    // visibility-wise but not durable: a power loss after the
+    // rename returned but before the page-cache / dirent flush
+    // could still revert to the previous snapshot. The
+    // tmp+rename layer alone closed the "truncated blob at the
+    // documented path" hazard from #3; this commit closes the
+    // crash-window hazard from #20.
     let pid = std::process::id();
     let tmp = args.out.with_extension(format!("tmp.{pid}"));
-    tokio::fs::write(&tmp, &bytes).await.map_err(|e| {
-        generic(format!("write snapshot tmp {}: {e}", tmp.display()))
-    })?;
+    let bytes_owned = bytes.clone();
+    let tmp_for_write = tmp.clone();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_for_write)?;
+        f.write_all(&bytes_owned)?;
+        f.sync_all()
+    })
+    .await
+    .map_err(|e| generic(format!("snapshot tmp-write task panicked: {e}")))?
+    .map_err(|e| generic(format!("write snapshot tmp {}: {e}", tmp.display())))?;
     tokio::fs::rename(&tmp, &args.out).await.map_err(|e| {
         // Best-effort cleanup of the temp file if rename failed;
         // ignore secondary errors.
@@ -876,6 +890,19 @@ async fn run_snapshot(
             args.out.display()
         ))
     })?;
+    // Fsync the parent directory so the dirent change from the
+    // rename is durable. Best-effort on Windows (parent fsync is
+    // a noop on NTFS dirents; ReadDirectoryChangesW + commit
+    // semantics differ from POSIX), so we ignore the error there.
+    if let Some(parent) = args.out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let parent = parent.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let f = std::fs::File::open(parent)?;
+            f.sync_all()
+        })
+        .await
+        .map_err(|e| generic(format!("parent-dir fsync task panicked: {e}")))?;
+    }
     let info = SnapshotResult {
         path: args.out.display().to_string(),
         bytes: bytes.len() as u64,
