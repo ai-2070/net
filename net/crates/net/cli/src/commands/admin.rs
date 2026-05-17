@@ -205,7 +205,6 @@ pub async fn run(
             .await
         }
         AdminCommand::DropReplicas(args) => {
-            let chains = args.chains.clone();
             handle(
                 args.common,
                 output,
@@ -213,9 +212,11 @@ pub async fn run(
                 profile_name,
                 AdminEnvelope::DropReplicas {
                     node: args.node,
-                    chains: chains.clone(),
+                    chains: args.chains.clone(),
                 },
-                move |deck, _| async move { deck.admin().drop_replicas(args.node, chains).await },
+                move |deck, _| async move {
+                    deck.admin().drop_replicas(args.node, args.chains).await
+                },
             )
             .await
         }
