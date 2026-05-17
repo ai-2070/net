@@ -164,12 +164,21 @@ extern int net_meshos_register_daemon_with_vtable(
     NetMeshOsHandle** out
 );
 
+// Forward declarations of the //export'd Go trampolines. Cgo's
+// `//export` emits the C function definition without `const`
+// qualifiers on pointer parameters regardless of the substrate
+// typedef shape, so these forward decls must drop `const` from
+// `payload_ptr` to match the cgo-generated `_cgo_export.c` body.
+// The substrate-side vtable typedef declares the pointer as
+// `const uint8_t*`; the vtable builder below casts each
+// trampoline through `NetMeshOsProcessFn` / `NetMeshOsRestoreFn`
+// to bridge the const mismatch on assignment.
 extern int topGoMeshOsProcessTrampoline(
     void* user_ctx,
     NetMeshOsProcessEmitCtx* emit_ctx,
     uint64_t origin_hash,
     uint64_t sequence,
-    const uint8_t* payload_ptr,
+    uint8_t* payload_ptr,
     size_t payload_len
 );
 extern void topGoMeshOsSnapshotTrampoline(
@@ -178,7 +187,7 @@ extern void topGoMeshOsSnapshotTrampoline(
 );
 extern int topGoMeshOsRestoreTrampoline(
     void* user_ctx,
-    const uint8_t* payload_ptr,
+    uint8_t* payload_ptr,
     size_t payload_len
 );
 extern void topGoMeshOsOnControlTrampoline(
@@ -192,9 +201,13 @@ extern float topGoMeshOsSaturationTrampoline(void* user_ctx);
 
 static inline NetMeshOsDaemonVtable topGoMeshOsBuildVtable(void) {
     NetMeshOsDaemonVtable vt;
-    vt.process    = topGoMeshOsProcessTrampoline;
+    // Cast `process` / `restore` through their typedefs to bridge
+    // the const-vs-non-const pointer mismatch with the cgo-emitted
+    // trampoline signature (substrate accepts `const uint8_t*`,
+    // cgo emits `uint8_t*`).
+    vt.process    = (NetMeshOsProcessFn)topGoMeshOsProcessTrampoline;
     vt.snapshot   = topGoMeshOsSnapshotTrampoline;
-    vt.restore    = topGoMeshOsRestoreTrampoline;
+    vt.restore    = (NetMeshOsRestoreFn)topGoMeshOsRestoreTrampoline;
     vt.on_control = topGoMeshOsOnControlTrampoline;
     vt.health     = topGoMeshOsHealthTrampoline;
     vt.saturation = topGoMeshOsSaturationTrampoline;
