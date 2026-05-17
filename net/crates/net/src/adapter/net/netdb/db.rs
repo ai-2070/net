@@ -212,6 +212,14 @@ impl NetDbBuilder {
     /// but cannot directly observe the closed first-adapter after
     /// the Redex has been dropped.
     pub async fn build(self) -> Result<NetDb, NetDbError> {
+        // Refuse a no-models build. Pre-fix this returned a no-op
+        // NetDb whose `tasks()` / `memories()` accessors panicked
+        // on first call; surface the config error as a typed
+        // `?` so a misconfigured profile or test fixture doesn't
+        // turn into a process panic at the first read.
+        if !self.want_tasks && !self.want_memories {
+            return Err(NetDbError::NoModelsEnabled);
+        }
         let cfg = self.redex_config();
 
         let tasks = if self.want_tasks {
@@ -252,6 +260,9 @@ impl NetDbBuilder {
     /// propagates. See `build`'s docs for the caveat that the
     /// failing Redex is dropped with the builder.
     pub async fn build_from_snapshot(self, snapshot: &NetDbSnapshot) -> Result<NetDb, NetDbError> {
+        if !self.want_tasks && !self.want_memories {
+            return Err(NetDbError::NoModelsEnabled);
+        }
         let cfg = self.redex_config();
 
         let tasks = match (self.want_tasks, &snapshot.tasks) {
