@@ -27,6 +27,8 @@ All claims spot-checked against current branch HEAD. Citations are line numbers 
 
 All fixes are real (code-level, not doc-only) and the regression test for the verifier wire-through (the most behavior-affecting fix) is in place.
 
+The Phase 2 polish sweep (`1def1c6a`) is the one partial: jitter math, `debug_assert!`, `RESPONDER_COUNT`, stderr logging, and `main.rs` comments all landed, but the "5-node" comment sweep skipped module-level docstrings — see N12.
+
 ---
 
 ## New concerns
@@ -199,6 +201,51 @@ The Python test at `bindings/python/tests/test_deck.py:93-102` keeps the supervi
 
 The Python tests at `bindings/python/tests/test_deck.py:18-24` import the raw pyo3 `DeckClient`, not the wrapper at `sdk-py/src/net_sdk/deck.py:468-499`. The new wrapper-level `from_seed` classmethod and `__enter__`/`__exit__` dunders have zero regression coverage. A trivial `with DeckClient.from_seed(seed) as c:` test would catch any wrapper-level wiring drift.
 
+### N12. Stale "5-node" comments in deck-demo module headers — `deck/src/demo/{spawn,rpc_chatter}.rs`
+
+The `1def1c6a` sweep updated inline comments and capacity literals but missed the loudest doc surface — the module-level `//!` docstrings that readers see first when opening a file:
+
+```
+deck/src/demo/spawn.rs:3        //! 1. Build the 5-node `ClusterHarness` (handshakes + bridge…
+deck/src/demo/spawn.rs:86           /// the other 4 peers via the bridge probes
+deck/src/demo/rpc_chatter.rs:8  //! 2. **Responders.** On 2 of the 5 nodes (indices 0 and 1)
+```
+
+(The fourth surviving "5-node" reference, `deck/src/demo/cluster.rs:13` — "the original 5-node baseline because 5 reads as 'toy' to" — is historically correct and should stay.)
+
+Replace with `DEMO_NODE_COUNT` or generic "N-node" / "the other peers" phrasing. Trivial.
+
+### N13. Go Deck streams have the same `Close`-vs-`Next` race that 3.7 fixed for MeshOS — `bindings/go/net/deck.go`
+
+The first-pass review flagged the analogous race on `MeshOsDaemonHandle.pumpControlEvents` (item 3.7), and `3131f710` fixed it with the `pumpStop` channel. The same shape exists on the Deck side and was not generalized:
+
+`DeckSnapshotStream`, `StatusSummaryStream`, `LogStream`, `FailureStream`, and `AuditStream` all expose `Close()` + `Free()` that call into `C.net_deck_*_stream_free` with no synchronization against an in-flight `Next(timeoutMs)`. If goroutine A is blocked in FFI `next(timeout_ms=5000)` while goroutine B calls `Close()`, the C handle is freed mid-call and goroutine A reads freed memory.
+
+`fa342102` added a doc comment ("Concurrent calls on the SAME stream are unsupported") but did not enforce it. Same shape as N1/N2/N4 — and the same family of fixes applies:
+
+- `sync.Mutex` around the FFI pointer (simplest; serializes `Next` + `Close`).
+- `sync.Once` on `Close`/`Free` (closes the double-free arm but doesn't help an in-flight `Next`).
+- `done chan struct{}` + select-based exit, matching the N4 fix.
+
+The N4 fix and this one share enough structure that they should be designed together.
+
+### N14. Operator seed bytes not zeroized in standalone constructors — `bindings/{node,python,go-{deck-}}ffi/...`
+
+Three entry points copy a 32-byte ed25519 seed into a stack array and never zero it:
+
+- Node `bindings/node/src/deck.rs:104-117` — `OperatorIdentity::from_seed` (`let mut arr = [0u8; 32]; arr.copy_from_slice(bytes);`).
+- Python `bindings/python/src/deck.rs` — `OperatorIdentity::from_seed` and `PyDeckClient::new` (same shape).
+- Go `bindings/go/deck-ffi/src/lib.rs` — `net_deck_client_new` and `net_deck_operator_identity_new` (same shape).
+
+After return, the stack frame is reclaimed but its bytes persist until overwritten by later allocations. The substrate's `EntityKeypair` likely also holds an unzeroized copy, and the original `Buffer` / `bytes` / C buffer on the caller side persists too — so the FFI shim is one of several non-zeroized copies, not the only window.
+
+This is a **threat-model decision**, not an obvious bug:
+
+- If the project treats seeds as sensitive, wrap the local `[u8; 32]` with `zeroize::Zeroizing` (one-line change per site) and document the expectation in `net_deck.h` near the `from_seed` family.
+- If seeds are treated as caller-owned and the FFI shim explicitly disclaims memory hygiene, document that disclaimer near the same entry points so the implicit contract is explicit.
+
+Either decision is defensible; the lack of either is the actual gap.
+
 ---
 
 ## Carried-forward open items (first-pass closeout)
@@ -218,7 +265,19 @@ These were tracked-but-deferred in the first review; no action taken in the veri
 
 New planning doc, 571 LOC, status: **"Not started."** No corresponding code lands in this branch — the `cli/` workspace member exists with an empty `src/` and the workspace `cli` feature flag is wired, but Phase 1 activation waits on a real consumer workflow.
 
-Pure design-only addition; nothing to review at the implementation level.
+Pure design-only addition; nothing to review at the implementation level. The plan is coherent with sibling plans (`DECK_DEMO_PLAN`, `DECK_DEMO_HARNESS_PLAN`, `DECK_SDK_PLAN`, `MESHOS_SDK_PLAN`), and the ten "locked decisions" (§482–500) are load-bearing constraints that prevent scope creep. The two update commits (`55c6ed6a`, `eb3ae9ea`) expanded the surface (nRPC, cap/peer, port-mapping, NetDB sections) without introducing contradictions.
+
+Four open spec questions worth resolving before Phase 1 work starts — cheaper to close now than during implementation:
+
+1. **NetDB path safety model.** Plan defaults to `$XDG_DATA_HOME/net/netdb.redex` (§383) but requires explicit `--store <PATH>` on every subcommand (§408). Should Phase 1 auto-discover or stay strict? Document the intent — both are defensible, but the asymmetry between "we know where it lives" and "you must tell us where it lives" reads as undecided.
+2. **Predicate DSL for `--where <EXPR>` is underspecified.** §375, §389 show examples but no grammar. Phase 1/2 will need a parser; a sub-design (or a punt to a stdlib like `cel-rust` / `evalexpr`) belongs in the plan, not the implementation review.
+3. **`--dry-run` × `--yes` interaction.** §312–314 specify each flag independently. Codify the matrix: does `net ice <action> --dry-run --yes` print the envelope and exit 0, or error as mutual exclusion?
+4. **`--identity <PATH>` pre-flight validation.** §448 mentions `chmod 600` and `permissive_mode`, but the error story for missing file / directory / unreadable falls into the single "exit code 3 = SDK error" bucket (§210–223). Either widen the exit code table or pre-flight identity loading with structured errors before SDK construction.
+
+Two substrate-side dependencies the plan flags but doesn't sequence:
+
+- **`net_sdk::traversal::try_map_once(...)`** doesn't exist yet (§364). Plan calls it "half a day's work" — fine, but block Phase 2 behind it landing first or you'll fork the Phase 2 effort.
+- **`net_daemon_factories::register!`** macro (§322) is mentioned as a Phase 4 invention with no API sketch. Reasonable to defer, but earmark Phase 4 design as "starts with this macro."
 
 ---
 
@@ -231,6 +290,8 @@ The first review's "Test coverage gaps" section is not yet addressed. Not blocki
 - No shutdown-while-iterating tests on async streams.
 - No filter-actually-filters test for `subscribeLogs`.
 - No `droppedControlEvents` counter test on the MeshOS surface.
+- `DeckClient.new(badSeed)` tests assert `error.kind === "invalid_argument"` but don't pin the message (Node `bindings/node/test/deck.test.ts:521-543`, Python `bindings/python/tests/test_deck.py` matching cases). If validation drifts to a different `invalid_argument` path, the test still passes. One-line `expect(err.message).toContain("32 bytes")` would tighten it.
+- `Symbol.asyncDispose` is implemented on TS `DeckClient` (3.5) but no test exercises `await using`. The TS compiler proves the shape; runtime behaviour is unproven.
 
 These would all be cheap to add and would lock in the lifetime + filter contracts the SDKs now advertise.
 
@@ -242,10 +303,13 @@ These would all be cheap to add and would lock in the lifetime + filter contract
 |---|---|
 | Pre-v1 | Clone-first / mutate-on-success in `simulate()` and `commit()` across Node, Python, and Go cdylib FFIs (item N3). Add failure-branch regression tests. |
 | Pre-v1 | `done chan struct{}` wait in Go `Free()` to close the pump-in-flight use-after-free window (item N4). |
+| Pre-v1 | Generalize the N4 fix to the five Go Deck stream types (item N13) — same `Close`-vs-`Next` use-after-free shape. Design the two together. |
 | Pre-v1 | `Drop` (or `__del__`) on `PyDeckClient` standalone path so a GC'd-without-`close()` instance still drains the owned supervisor (item N7). |
+| Decide | Seed-zeroization threat model — either `Zeroizing`-wrap the local `[u8; 32]` in the three standalone constructors, or document the disclaimer near them (item N14). |
 | Polish | Wrap `MeshOsDaemonHandle.Free()` body in `sync.Once` for concurrent-call + finalizer races (items N1, N2). Composes with N4. |
-| Polish | Audit-query setter NULL arm sets last-error (item N5); Python `close()` surfaces shutdown errors symmetrically with Node (item N6); rename `_owned_sdk` → `owned_sdk` (item N8); drop the `Uint8Array as Buffer` cast in TS `DeckClient.new` (item N9); remove the stale test comment (item N10). |
-| Tests | Add the wrapper-level `DeckClient.from_seed` + ctx-manager test in `sdk-py` (item N11); broader concurrency / GC / shutdown-while-iterating / filter-correctness tests across bindings (first-pass test-coverage gaps). |
+| Polish | Audit-query setter NULL arm sets last-error (item N5); Python `close()` surfaces shutdown errors symmetrically with Node (item N6); rename `_owned_sdk` → `owned_sdk` (item N8); drop the `Uint8Array as Buffer` cast in TS `DeckClient.new` (item N9); remove the stale test comment (item N10); sweep three stale "5-node" module-level docstrings (item N12). |
+| Tests | Add the wrapper-level `DeckClient.from_seed` + ctx-manager test in `sdk-py` (item N11); pin error-message substrings on `DeckClient.new(badSeed)`; exercise `await using` on TS `DeckClient`; broader concurrency / GC / shutdown-while-iterating / filter-correctness tests across bindings (first-pass test-coverage gaps). |
+| Plan | Resolve four open `NET_CLI_PLAN.md` spec questions (NetDB path safety, predicate DSL, `--dry-run` × `--yes`, identity pre-flight) before Phase 1 work starts. |
 | Tracking | Substrate-side audit for `commit` re-running `simulate` (item 3.4) — overlaps with the N3 fix surface. |
 | Release | CHANGELOG entry for `sdk/Cargo.toml` default-features expansion before next tag (item 1.10). |
 
@@ -253,8 +317,8 @@ These would all be cheap to add and would lock in the lifetime + filter contract
 
 ## Bottom line
 
-The first-pass review's closeout is accurate: every fix it claims is wired in code, with regression tests where they matter. The verification pass surfaced new items concentrated in two areas: (a) consume-on-failure regressions in `simulate()` / `commit()` across all three FFIs (N3) — a latent footgun that the first review's `22f885eb` + `d1ccd36c` fixes introduced together but neither test suite exercises on the failure branch; and (b) Go `MeshOsDaemonHandle.Free()` thread-safety (N1, N2, N4), where the `3131f710` pumpStop fix narrowed but did not close the race against the pump's in-flight `NextControl`.
+The first-pass review's closeout is accurate: every fix it claims is wired in code, with regression tests where they matter. The verification pass surfaced new items concentrated in three areas: (a) consume-on-failure regressions in `simulate()` / `commit()` across all three FFIs (N3) — a latent footgun that the first review's `22f885eb` + `d1ccd36c` fixes introduced together but neither test suite exercises on the failure branch; (b) Go `Free`/`Close`-vs-in-flight-FFI thread-safety (N1, N2, N4, N13), where the `3131f710` pumpStop fix narrowed the MeshOS race but did not close it and did not generalize to the five Deck stream types with the same shape; and (c) a small cluster of polish gaps — partial 5-node sweep (N12), undecided seed-zeroization threat model (N14), and four `NET_CLI_PLAN.md` spec questions worth resolving before Phase 1 starts.
 
-None of N1–N11 break HEAD today. N3 fires only when the substrate introduces a new `IceActionProposal` variant; N4 is a narrow ≤50 ms window; the rest are polish or test gaps. But N3, N4, and N7 are the kind of regressions a v1 SDK release should not ship with — all three are localized fixes (clone-first, `done` channel, `Drop` impl).
+None of N1–N14 break HEAD today. N3 fires only when the substrate introduces a new `IceActionProposal` variant; N4/N13 are narrow ≤50 ms windows that require explicit `Free`/`Close` racing in-flight `Next`; the rest are polish, tests, or design clarifications. But N3, N4, N13, and N7 are the kind of regressions a v1 SDK release should not ship with — all four are localized fixes (clone-first, `done` channel for MeshOS pump, `done`/`sync.Mutex` for Deck streams, `Drop` impl).
 
-**No HEAD-blockers for merge.** Pre-v1 punch list: N3, N4, N7. Polish and tests can land in follow-ups.
+**No HEAD-blockers for merge.** Pre-v1 punch list: N3, N4, N7, N13. Polish, tests, threat-model decision, and CLI spec questions can land in follow-ups.
