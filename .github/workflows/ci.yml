@@ -356,7 +356,7 @@ jobs:
       # surface from source.
       - name: Build native module
         working-directory: net/crates/net/bindings/node
-        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,test-helpers
+        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,test-helpers
 
       - name: Run tests
         run: npm test
@@ -414,7 +414,7 @@ jobs:
         working-directory: net/crates/net/bindings/node
         run: |
           npm i --ignore-scripts
-          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,meshos,deck,test-helpers
+          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,meshos,deck,meshdb,test-helpers
 
       - name: Install npm dependencies
         run: npm i
@@ -641,9 +641,9 @@ jobs:
             path: net/crates/net/bindings/node
             # Mirrors the `node-tests` napi build (no redis default,
             # plus `test-helpers` so the test-only FFI symbols are
-            # included in the lint set, plus `meshos,deck` so the
-            # MeshOS / Deck SDK NAPI surface compiles).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,test-helpers
+            # included in the lint set, plus `meshos,deck,meshdb` so
+            # the MeshOS / Deck / MeshDB NAPI surfaces compile).
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,test-helpers
           - name: python
             path: net/crates/net/bindings/python
             # Mirrors the `python-tests` `maturin develop` invocation
