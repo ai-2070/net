@@ -10,10 +10,9 @@
 //! `resolve_stream` to pick the effective format from the
 //! user-supplied flag + stdout's TTY-ness.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use clap::ValueEnum;
-use is_terminal::IsTerminal;
 use serde::Serialize;
 
 /// User-facing format choice. The `Default` variant means "let

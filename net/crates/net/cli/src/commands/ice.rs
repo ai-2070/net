@@ -299,7 +299,7 @@ where
     // not a TTY (scripts / CI). On an interactive terminal we
     // always demand the typed `YES` even with `--yes` so a stray
     // shell-history recall can't ram an ICE commit through.
-    let stdin_is_tty = is_terminal::IsTerminal::is_terminal(&io::stdin());
+    let stdin_is_tty = std::io::IsTerminal::is_terminal(&io::stdin());
     if !stdin_is_tty {
         if !common.yes {
             return Err(_CE::new(
