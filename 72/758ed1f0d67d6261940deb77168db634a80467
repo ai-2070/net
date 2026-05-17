@@ -1,0 +1,21 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_17_MESHOS_SDKS.md
+  s_ac2931afe38c4a::t_a9b5723f4e0021 1-131,284-288
+  s_ac2931afe38c4a::t_624a8d962b3326 132-283
+  s_ac2931afe38c4a::t_1ce1dbecee59c0 289-491
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "72758ed1f0d67d6261940deb77168db634a80467",
+  "prompts": {},
+  "sessions": {
+    "s_ac2931afe38c4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59271d48-d72a-4337-b857-962412f18343",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
