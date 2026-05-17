@@ -37,10 +37,13 @@ use pyo3::types::PyDict;
 use tokio::runtime::Runtime;
 
 use net::adapter::net::behavior::deck::{
-    AdminCommands as CoreAdminCommands, ChainCommit as CoreChainCommit, DeckClient as CoreClient,
-    DeckClientConfig as CoreConfig, DeckError, OperatorIdentity as CoreIdentity,
+    AdminCommands as CoreAdminCommands, AuditQuery as CoreAuditQuery, AuditStream as CoreAuditStream,
+    ChainCommit as CoreChainCommit, DeckClient as CoreClient, DeckClientConfig as CoreConfig,
+    DeckError, FailureStream as CoreFailureStream, LogFilter as CoreLogFilter,
+    LogStream as CoreLogStream, OperatorIdentity as CoreIdentity,
     SnapshotStream as CoreSnapshotStream, StatusSummary, StatusSummaryStream as CoreStatusStream,
 };
+use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::behavior::meshos::{ChainId as CoreChainId, MeshOsSnapshot};
 
 use futures::StreamExt;
@@ -563,10 +566,383 @@ impl PyDeckClient {
         }
     }
 
+    /// Audit query builder over the in-memory admin-audit ring.
+    /// Chain `.recent(n)`, `.by_operator(op_id)`,
+    /// `.between(start_ms, end_ms)`, `.force_only()`, `.since(seq)`
+    /// before calling `.collect()` for a list or `.stream()` for a
+    /// sync iterator.
+    fn audit(&self) -> PyAuditQuery {
+        PyAuditQuery {
+            client: self.client.clone(),
+            recent_limit: None,
+            by_operator: None,
+            between: None,
+            force_only: false,
+            since: None,
+            runtime: self.runtime.clone(),
+        }
+    }
+
+    /// Subscribe to per-daemon / per-node log lines. `filter` is
+    /// an optional dict with keys `min_level` (str), `daemon_id`
+    /// (int), `node_id` (int), `since_seq` (int). Missing keys
+    /// match every record. Returns a sync iterator over
+    /// `LogRecord` dicts.
+    #[pyo3(signature = (filter=None))]
+    fn subscribe_logs(
+        &self,
+        py: Python<'_>,
+        filter: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyLogStream> {
+        let core_filter = log_filter_from_dict(py, filter)?;
+        let _enter = self.runtime.enter();
+        Ok(PyLogStream {
+            inner: Some(self.client.subscribe_logs(core_filter)),
+            runtime: self.runtime.clone(),
+        })
+    }
+
+    /// Subscribe to executor failure records starting from
+    /// `since_seq + 1`. Returns a sync iterator over `FailureRecord`
+    /// dicts.
+    #[pyo3(signature = (since_seq=0))]
+    fn subscribe_failures(&self, since_seq: u64) -> PyFailureStream {
+        let _enter = self.runtime.enter();
+        PyFailureStream {
+            inner: Some(self.client.subscribe_failures(since_seq)),
+            runtime: self.runtime.clone(),
+        }
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "DeckClient(operator_id={:#x})",
             self.client.identity().operator_id()
         )
+    }
+}
+
+// =========================================================================
+// Slice 2 — LogFilter dict parsing
+// =========================================================================
+
+fn parse_log_level_str(py: Python<'_>, s: &str) -> PyResult<CoreLogLevel> {
+    Ok(match s {
+        "trace" | "TRACE" | "Trace" => CoreLogLevel::Trace,
+        "debug" | "DEBUG" | "Debug" => CoreLogLevel::Debug,
+        "info" | "INFO" | "Info" => CoreLogLevel::Info,
+        "warn" | "WARN" | "Warn" | "warning" | "WARNING" => CoreLogLevel::Warn,
+        "error" | "ERROR" | "Error" => CoreLogLevel::Error,
+        other => {
+            return Err(deck_err(
+                py,
+                "invalid_log_level",
+                &format!(
+                    "log level must be one of trace|debug|info|warn|error; got {other:?}"
+                ),
+            ));
+        }
+    })
+}
+
+fn log_filter_from_dict(
+    py: Python<'_>,
+    filter: Option<&Bound<'_, PyDict>>,
+) -> PyResult<CoreLogFilter> {
+    let mut f = CoreLogFilter::default();
+    let Some(d) = filter else {
+        return Ok(f);
+    };
+    if let Some(v) = d.get_item("min_level")? {
+        let s: String = v.extract().map_err(|e| {
+            deck_err(
+                py,
+                "invalid_filter",
+                &format!("min_level must be a string: {e}"),
+            )
+        })?;
+        f.min_level = Some(parse_log_level_str(py, &s)?);
+    }
+    if let Some(v) = d.get_item("daemon_id")? {
+        f.daemon_id = Some(v.extract().map_err(|e| {
+            deck_err(py, "invalid_filter", &format!("daemon_id must be int: {e}"))
+        })?);
+    }
+    if let Some(v) = d.get_item("node_id")? {
+        f.node_id = Some(v.extract().map_err(|e| {
+            deck_err(py, "invalid_filter", &format!("node_id must be int: {e}"))
+        })?);
+    }
+    if let Some(v) = d.get_item("since_seq")? {
+        f.since_seq = Some(v.extract().map_err(|e| {
+            deck_err(
+                py,
+                "invalid_filter",
+                &format!("since_seq must be int: {e}"),
+            )
+        })?);
+    }
+    Ok(f)
+}
+
+// =========================================================================
+// Slice 2 — Log + Failure records → typed dicts
+// =========================================================================
+
+fn log_level_to_str(lvl: CoreLogLevel) -> &'static str {
+    match lvl {
+        CoreLogLevel::Trace => "trace",
+        CoreLogLevel::Debug => "debug",
+        CoreLogLevel::Info => "info",
+        CoreLogLevel::Warn => "warn",
+        CoreLogLevel::Error => "error",
+        _ => "unknown",
+    }
+}
+
+fn log_record_to_dict<'py>(
+    py: Python<'py>,
+    record: &net::adapter::net::behavior::meshos::LogRecord,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("seq", record.seq)?;
+    d.set_item("ts_ms", record.ts_ms)?;
+    d.set_item("level", log_level_to_str(record.level))?;
+    d.set_item("daemon_id", record.daemon_id)?;
+    d.set_item("node_id", record.node_id)?;
+    d.set_item("message", record.message.clone())?;
+    Ok(d)
+}
+
+fn failure_record_to_dict<'py>(
+    py: Python<'py>,
+    record: &net::adapter::net::behavior::meshos::FailureRecord,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("seq", record.seq)?;
+    d.set_item("source", record.source.clone())?;
+    d.set_item("reason", record.reason.clone())?;
+    d.set_item("recorded_at_ms", record.recorded_at_ms)?;
+    Ok(d)
+}
+
+fn admin_audit_record_to_json(
+    py: Python<'_>,
+    record: &net::adapter::net::behavior::meshos::AdminAuditRecord,
+) -> PyResult<String> {
+    serde_json::to_string(record).map_err(|e| {
+        deck_err(
+            py,
+            "audit_serialize_failed",
+            &format!("AdminAuditRecord JSON serialize: {e}"),
+        )
+    })
+}
+
+// =========================================================================
+// Slice 2 — PyLogStream
+// =========================================================================
+
+/// Live log stream as a sync Python iterator. Each `__next__`
+/// blocks until the next record matching the filter publishes,
+/// or raises `StopIteration` when the underlying stream's
+/// substrate runtime shuts down.
+#[pyclass(name = "LogStream", module = "net._net")]
+pub struct PyLogStream {
+    inner: Option<CoreLogStream>,
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyLogStream {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let stream = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| deck_err(py, "stream_closed", "log stream was closed"))?;
+        let runtime = self.runtime.clone();
+        let item = py.detach(|| runtime.block_on(stream.next()));
+        match item {
+            Some(Ok(record)) => log_record_to_dict(py, &record),
+            Some(Err(e)) => Err(deck_err_from(py, e)),
+            None => Err(pyo3::exceptions::PyStopIteration::new_err(())),
+        }
+    }
+
+    fn close(&mut self) {
+        self.inner = None;
+    }
+}
+
+// =========================================================================
+// Slice 2 — PyFailureStream
+// =========================================================================
+
+#[pyclass(name = "FailureStream", module = "net._net")]
+pub struct PyFailureStream {
+    inner: Option<CoreFailureStream>,
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyFailureStream {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let stream = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| deck_err(py, "stream_closed", "failure stream was closed"))?;
+        let runtime = self.runtime.clone();
+        let item = py.detach(|| runtime.block_on(stream.next()));
+        match item {
+            Some(Ok(record)) => failure_record_to_dict(py, &record),
+            Some(Err(e)) => Err(deck_err_from(py, e)),
+            None => Err(pyo3::exceptions::PyStopIteration::new_err(())),
+        }
+    }
+
+    fn close(&mut self) {
+        self.inner = None;
+    }
+}
+
+// =========================================================================
+// Slice 2 — PyAuditQuery (fluent builder) + PyAuditStream
+// =========================================================================
+
+/// Fluent admin-audit query builder. Chain the filter methods
+/// before calling `.collect()` (eager list) or `.stream()` (sync
+/// iterator). Mirrors the substrate's `AuditQuery` API.
+///
+/// Each filter method returns the (mutated) builder so consumers
+/// can chain idiomatically in Python:
+///
+/// ```python
+/// records = (client.audit()
+///     .recent(100)
+///     .by_operator(op_id)
+///     .force_only()
+///     .collect())
+/// ```
+#[pyclass(name = "AuditQuery", module = "net._net")]
+pub struct PyAuditQuery {
+    client: Arc<CoreClient>,
+    recent_limit: Option<usize>,
+    by_operator: Option<u64>,
+    between: Option<(u64, u64)>,
+    force_only: bool,
+    since: Option<u64>,
+    runtime: Arc<Runtime>,
+}
+
+impl PyAuditQuery {
+    fn build<'a>(&self, client: &'a CoreClient) -> CoreAuditQuery<'a> {
+        let mut q = client.audit();
+        if let Some(n) = self.recent_limit {
+            q = q.recent(n);
+        }
+        if let Some(op) = self.by_operator {
+            q = q.by_operator(op);
+        }
+        if let Some((start, end)) = self.between {
+            q = q.between(start, end);
+        }
+        if self.force_only {
+            q = q.force_only();
+        }
+        if let Some(s) = self.since {
+            q = q.since(s);
+        }
+        q
+    }
+}
+
+#[pymethods]
+impl PyAuditQuery {
+    fn recent(mut slf: PyRefMut<Self>, limit: usize) -> PyRefMut<Self> {
+        slf.recent_limit = Some(limit);
+        slf
+    }
+
+    fn by_operator(mut slf: PyRefMut<Self>, operator_id: u64) -> PyRefMut<Self> {
+        slf.by_operator = Some(operator_id);
+        slf
+    }
+
+    fn between(mut slf: PyRefMut<Self>, start_ms: u64, end_ms: u64) -> PyRefMut<Self> {
+        slf.between = Some((start_ms, end_ms));
+        slf
+    }
+
+    fn force_only(mut slf: PyRefMut<Self>) -> PyRefMut<Self> {
+        slf.force_only = true;
+        slf
+    }
+
+    fn since(mut slf: PyRefMut<Self>, seq: u64) -> PyRefMut<Self> {
+        slf.since = Some(seq);
+        slf
+    }
+
+    /// Collect the audit records into a list of JSON strings. The
+    /// `sdk-py` wrapper parses each entry into a native dict.
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let client = self.client.clone();
+        let q = self.build(&client);
+        // `collect` is sync on the substrate — reads off the
+        // in-memory admin-audit ring synchronously.
+        let records = q.collect();
+        let mut out = Vec::with_capacity(records.len());
+        for r in records {
+            out.push(admin_audit_record_to_json(py, &r)?);
+        }
+        Ok(out)
+    }
+
+    /// Return a sync iterator over JSON-encoded audit records.
+    fn stream(&self) -> PyAuditStream {
+        let _enter = self.runtime.enter();
+        PyAuditStream {
+            inner: Some(self.build(&self.client).stream()),
+            runtime: self.runtime.clone(),
+        }
+    }
+}
+
+#[pyclass(name = "AuditStream", module = "net._net")]
+pub struct PyAuditStream {
+    inner: Option<CoreAuditStream>,
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyAuditStream {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<String> {
+        let stream = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| deck_err(py, "stream_closed", "audit stream was closed"))?;
+        let runtime = self.runtime.clone();
+        let item = py.detach(|| runtime.block_on(stream.next()));
+        match item {
+            Some(Ok(record)) => admin_audit_record_to_json(py, &record),
+            Some(Err(e)) => Err(deck_err_from(py, e)),
+            None => Err(pyo3::exceptions::PyStopIteration::new_err(())),
+        }
+    }
+
+    fn close(&mut self) {
+        self.inner = None;
     }
 }

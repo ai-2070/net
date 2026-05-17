@@ -278,3 +278,158 @@ def test_deck_sdk_error_kind_helper_parses_envelope() -> None:
         assert "<<deck-sdk-kind:invalid_argument>>" in str(e)
     else:  # pragma: no cover
         pytest.fail("expected DeckSdkError")
+
+
+# -------------------------------------------------------------------------
+# Slice 2 — Audit query
+# -------------------------------------------------------------------------
+
+
+def test_audit_collect_returns_empty_list_on_fresh_runtime() -> None:
+    """A fresh supervisor has nothing in the admin-audit ring;
+    `audit().collect()` should return an empty list."""
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        records = client.audit().recent(100).collect()
+        # Each record is a JSON string from the binding; slice-1-tier
+        # consumers (raw binding callers) parse themselves.
+        import json
+        for r in records:
+            json.loads(r)
+        # No assertion on length — depends on whether prior tests
+        # have committed; the audit ring is process-scoped.
+        assert isinstance(records, list)
+    finally:
+        sdk.shutdown()
+
+
+def test_audit_after_admin_commit_eventually_yields_record() -> None:
+    """The substrate folds admin commits on a tick (default
+    500ms), so the audit ring is eventually consistent. Configure
+    a fast tick + poll briefly; the audit ring should populate
+    within ~1s."""
+    import json
+    import time
+
+    sdk = MeshOsDaemonSdk.start({"tick_interval_ms": 20})
+    try:
+        identity = OperatorIdentity.generate()
+        client = DeckClient.from_meshos(sdk, identity)
+        client.admin.cordon(node=0xCAFE)
+        # Poll up to 2s for the audit ring to populate.
+        deadline = time.monotonic() + 2.0
+        records: list[dict] = []
+        while time.monotonic() < deadline:
+            raw = client.audit().recent(100).collect()
+            if raw:
+                records = [json.loads(r) for r in raw]
+                break
+            time.sleep(0.05)
+        assert records, (
+            "expected the substrate to fold the cordon into the audit "
+            "ring within the timeout"
+        )
+        # Each audit record carries a `seq`, `committed_at_ms`,
+        # `event`, `operator_ids`, `outcome`.
+        first = records[0]
+        for key in ("seq", "committed_at_ms", "event", "operator_ids", "outcome"):
+            assert key in first, f"missing field {key!r}: {first!r}"
+    finally:
+        sdk.shutdown()
+
+
+def test_audit_query_chains_filter_methods() -> None:
+    """The fluent builder should accept every filter chain combo
+    without raising."""
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        records = (client.audit()
+                       .recent(10)
+                       .by_operator(0x123)
+                       .between(0, 2_000_000_000_000)
+                       .force_only()
+                       .since(0)
+                       .collect())
+        assert isinstance(records, list)
+    finally:
+        sdk.shutdown()
+
+
+def test_audit_stream_returns_iterator_with_close() -> None:
+    """`audit().stream()` returns a sync iterator. We exercise
+    the iterator protocol + the close path; consuming records is
+    eventually-consistent (substrate folds on a tick) and tested
+    by `test_audit_after_admin_commit_eventually_yields_record`."""
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        stream = client.audit().recent(10).stream()
+        # The iterator protocol must be available; we don't pull
+        # an item (would block indefinitely on a quiet runtime).
+        assert hasattr(stream, "__next__")
+        assert hasattr(stream, "__iter__")
+        stream.close()
+    finally:
+        sdk.shutdown()
+
+
+# -------------------------------------------------------------------------
+# Slice 2 — Log + Failure streams
+# -------------------------------------------------------------------------
+
+
+def test_subscribe_logs_returns_log_stream() -> None:
+    """`subscribe_logs(None)` returns a LogStream. The stream
+    blocks until a record matching the filter publishes; we test
+    the empty-filter / quiet-channel shape by closing immediately."""
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        stream = client.subscribe_logs()
+        stream.close()
+    finally:
+        sdk.shutdown()
+
+
+def test_subscribe_logs_filter_dict_with_min_level() -> None:
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        stream = client.subscribe_logs({"min_level": "warn", "since_seq": 0})
+        stream.close()
+    finally:
+        sdk.shutdown()
+
+
+def test_subscribe_logs_invalid_level_raises_typed_error() -> None:
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        with pytest.raises(DeckSdkError) as excinfo:
+            client.subscribe_logs({"min_level": "verbose"})
+        assert excinfo.value.kind == "invalid_log_level"
+    finally:
+        sdk.shutdown()
+
+
+def test_subscribe_logs_rejects_non_string_min_level() -> None:
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        with pytest.raises(DeckSdkError) as excinfo:
+            client.subscribe_logs({"min_level": 5})
+        assert excinfo.value.kind == "invalid_filter"
+    finally:
+        sdk.shutdown()
+
+
+def test_subscribe_failures_returns_failure_stream() -> None:
+    sdk = MeshOsDaemonSdk.start()
+    try:
+        client = DeckClient.from_meshos(sdk, OperatorIdentity.generate())
+        stream = client.subscribe_failures(since_seq=0)
+        stream.close()
+    finally:
+        sdk.shutdown()

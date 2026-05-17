@@ -31,7 +31,7 @@ Example::
 from __future__ import annotations
 
 import json
-from typing import Any, Iterator, Literal, Optional
+from typing import Any, Iterator, Literal, Optional, Union
 
 try:
     from net import (  # type: ignore[attr-defined]
@@ -43,6 +43,20 @@ try:
         OperatorIdentity,
         deck_sdk_error_kind,
     )
+    # Slice 2 — present iff the wheel includes the audit/logs/
+    # failures surface. Optional so slice-1-only wheels (early
+    # CI builds) still import cleanly.
+    try:
+        from net import (  # type: ignore[attr-defined]
+            AuditQuery as _RawAuditQuery,
+            AuditStream as _RawAuditStream,
+            FailureStream as _RawFailureStream,
+            LogStream as _RawLogStream,
+        )
+
+        _HAS_SLICE_2 = True
+    except ImportError:  # pragma: no cover
+        _HAS_SLICE_2 = False
 except ImportError as e:  # pragma: no cover
     raise ImportError(
         "Deck SDK symbols not present in `net._net`. Rebuild the "
@@ -62,6 +76,15 @@ __all__ = [
     "deck_sdk_error_kind",
     "ChainCommit",
     "StatusSummary",
+    # Slice 2.
+    "AuditQuery",
+    "LogStream",
+    "FailureStream",
+    "LogRecord",
+    "FailureRecord",
+    "AdminAuditRecord",
+    "LogLevel",
+    "LogFilter",
 ]
 
 
@@ -109,6 +132,56 @@ class StatusSummary(TypedDict):
     admin_audit_ring_depth: int
     freeze_remaining_ms: Optional[int]
     local_maintenance_active: bool
+
+
+# =========================================================================
+# Slice 2 — typed envelopes
+# =========================================================================
+
+
+LogLevel = Literal["trace", "debug", "info", "warn", "error"]
+
+
+class LogFilter(TypedDict, total=False):
+    """Subset filter accepted by :meth:`DeckClient.subscribe_logs`.
+
+    Every key is optional — missing keys match every record.
+    """
+
+    min_level: LogLevel
+    daemon_id: int
+    node_id: int
+    since_seq: int
+
+
+class LogRecord(TypedDict):
+    """One log line. `daemon_id` / `node_id` are ``None`` for
+    substrate-level messages."""
+
+    seq: int
+    ts_ms: int
+    level: LogLevel
+    daemon_id: Optional[int]
+    node_id: Optional[int]
+    message: str
+
+
+class FailureRecord(TypedDict):
+    """One executor-failure record. `source` looks like
+    ``"daemon:foo"`` / ``"drain:node_x"``; `reason` is the
+    operator-readable detail."""
+
+    seq: int
+    source: str
+    reason: str
+    recorded_at_ms: int
+
+
+# `AdminAuditRecord` carries a nested `AdminEvent` enum which is
+# JSON-shaped on the binding side — type as a generic mapping for
+# now. Per-variant typed wrappers can land in a future slice when
+# consumers ask.
+AdminAuditRecord = dict[str, Any]
 
 
 # =========================================================================
@@ -206,6 +279,122 @@ class StatusSummaryStream:
 
 
 # =========================================================================
+# Slice 2 — Log + Failure + Audit streams
+# =========================================================================
+
+
+class LogStream:
+    """Sync iterator over :class:`LogRecord` dicts. Filter applied
+    at the substrate side; consumers can pass an empty filter to
+    tail every record on the runtime's log ring."""
+
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    def __iter__(self) -> Iterator[LogRecord]:
+        return self
+
+    def __next__(self) -> LogRecord:
+        return next(self._raw)  # typed dict from the binding
+
+    def close(self) -> None:
+        self._raw.close()
+
+
+class FailureStream:
+    """Sync iterator over :class:`FailureRecord` dicts. Tail starts
+    at the `since_seq + 1` watermark passed to
+    :meth:`DeckClient.subscribe_failures`."""
+
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    def __iter__(self) -> Iterator[FailureRecord]:
+        return self
+
+    def __next__(self) -> FailureRecord:
+        return next(self._raw)
+
+    def close(self) -> None:
+        self._raw.close()
+
+
+class _AuditStreamWrapper:
+    """Sync iterator that JSON-parses raw audit records emitted by
+    the binding's `AuditStream`."""
+
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    def __iter__(self) -> Iterator[AdminAuditRecord]:
+        return self
+
+    def __next__(self) -> AdminAuditRecord:
+        return json.loads(next(self._raw))
+
+    def close(self) -> None:
+        self._raw.close()
+
+
+class AuditQuery:
+    """Fluent admin-audit query builder. Chain filter methods
+    before calling :meth:`collect` (eager list) or :meth:`stream`
+    (sync iterator).
+
+    Example::
+
+        records = (client.audit()
+                       .recent(100)
+                       .by_operator(op_id)
+                       .force_only()
+                       .collect())
+
+        for record in client.audit().since(last_seq).stream():
+            handle(record)
+    """
+
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    def recent(self, limit: int) -> "AuditQuery":
+        self._raw.recent(limit)
+        return self
+
+    def by_operator(self, operator_id: int) -> "AuditQuery":
+        self._raw.by_operator(operator_id)
+        return self
+
+    def between(self, start_ms: int, end_ms: int) -> "AuditQuery":
+        self._raw.between(start_ms, end_ms)
+        return self
+
+    def force_only(self) -> "AuditQuery":
+        self._raw.force_only()
+        return self
+
+    def since(self, seq: int) -> "AuditQuery":
+        self._raw.since(seq)
+        return self
+
+    def collect(self) -> list[AdminAuditRecord]:
+        """Eager — returns a list of audit records (JSON-parsed
+        into native dicts)."""
+        return [json.loads(s) for s in self._raw.collect()]
+
+    def stream(self) -> _AuditStreamWrapper:
+        """Returns a sync iterator over audit records."""
+        return _AuditStreamWrapper(self._raw.stream())
+
+
+# =========================================================================
 # DeckClient — wraps the raw napi client + auto-parses snapshots
 # =========================================================================
 
@@ -261,6 +450,35 @@ class DeckClient:
         """Live :data:`StatusSummary` stream as a sync iterator
         over native dicts."""
         return StatusSummaryStream(self._raw.status_summary_stream())
+
+    # =====================================================================
+    # Slice 2 — audit + logs + failures
+    # =====================================================================
+
+    def audit(self) -> AuditQuery:
+        """Fluent admin-audit query builder. Chain
+        :meth:`AuditQuery.recent` / :meth:`by_operator` /
+        :meth:`between` / :meth:`force_only` / :meth:`since` and
+        call :meth:`collect` (eager list) or :meth:`stream`."""
+        return AuditQuery(self._raw.audit())
+
+    def subscribe_logs(
+        self, filter: Optional[LogFilter] = None
+    ) -> LogStream:
+        """Subscribe to the runtime's log ring. ``filter`` is an
+        optional dict with keys ``min_level`` (str),
+        ``daemon_id`` (int), ``node_id`` (int), ``since_seq``
+        (int). Missing keys match every record."""
+        # Cast the LogFilter TypedDict to a plain dict[str, Any] —
+        # the pyo3 binding accepts the underlying mapping shape.
+        raw_filter = dict(filter) if filter is not None else None
+        return LogStream(self._raw.subscribe_logs(raw_filter))
+
+    def subscribe_failures(self, since_seq: int = 0) -> FailureStream:
+        """Subscribe to the executor-failure ring starting at
+        ``since_seq + 1``. Pass ``0`` to start from whatever is
+        still in the ring."""
+        return FailureStream(self._raw.subscribe_failures(since_seq))
 
     def __repr__(self) -> str:
         return repr(self._raw)
