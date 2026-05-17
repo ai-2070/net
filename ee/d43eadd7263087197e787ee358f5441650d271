@@ -1,0 +1,25 @@
+net/crates/net/cli/tests/help.rs
+  s_5af7ced268385a::t_33edd92934aef4 20
+net/crates/net/cli/src/commands/mod.rs
+  s_5af7ced268385a::t_1c370f54105c86 15
+net/crates/net/cli/src/commands/blob.rs
+  s_5af7ced268385a::t_c565256600ba1e 1-28
+net/crates/net/cli/src/commands/daemon.rs
+  s_5af7ced268385a::t_1a313b25372e1b 1-2,4-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "eed43eadd7263087197e787ee358f5441650d271",
+  "prompts": {},
+  "sessions": {
+    "s_5af7ced268385a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcb58d6d-cbaa-4790-9ab0-d4df7231c1e3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
