@@ -1,0 +1,19 @@
+net/crates/net/cli/src/commands/logs.rs
+  s_d47f820cd75eec::t_c3141a0f494152 56-63,68-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "a402e773487e0d9936f9f2d6cef46b8740882c2e",
+  "prompts": {},
+  "sessions": {
+    "s_d47f820cd75eec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "787d00f4-6902-4cbd-a2f7-ef1a994cd53b",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
