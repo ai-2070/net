@@ -577,6 +577,7 @@ if (!nativeBinding) {
 
 module.exports = nativeBinding
 module.exports.AdminCommands = nativeBinding.AdminCommands
+module.exports.AdminVerifier = nativeBinding.AdminVerifier
 module.exports.AuditQuery = nativeBinding.AuditQuery
 module.exports.AuditStream = nativeBinding.AuditStream
 module.exports.BlobRef = nativeBinding.BlobRef
@@ -606,6 +607,7 @@ module.exports.NetDb = nativeBinding.NetDb
 module.exports.NetMesh = nativeBinding.NetMesh
 module.exports.NetStream = nativeBinding.NetStream
 module.exports.OperatorIdentity = nativeBinding.OperatorIdentity
+module.exports.OperatorRegistry = nativeBinding.OperatorRegistry
 module.exports.QueryBuilder = nativeBinding.QueryBuilder
 module.exports.Redex = nativeBinding.Redex
 module.exports.RedexFile = nativeBinding.RedexFile

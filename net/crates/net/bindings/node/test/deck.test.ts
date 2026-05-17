@@ -513,4 +513,185 @@ d('Deck SDK operator-side bindings (Phase 5 slice 1)', () => {
       await sdk.shutdown();
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Operator-policy verifier surface: OperatorRegistry,
+  // AdminVerifier, OperatorIdentity.signProposal / signPayload /
+  // publicKey, SimulatedIceProposal.signingPayload.
+  // -------------------------------------------------------------------------
+
+  const hasVerifier =
+    typeof symbols.OperatorRegistry === 'function' &&
+    typeof symbols.AdminVerifier === 'function';
+  const v = hasVerifier ? it : it.skip;
+
+  v('OperatorRegistry lifecycle: register, insert, contains, size', () => {
+    const { OperatorRegistry } = symbols as { OperatorRegistry: any };
+    const reg = new OperatorRegistry();
+    expect(reg.size).toBe(0);
+    expect(reg.isEmpty()).toBe(true);
+    const a = OperatorIdentity.generate();
+    const b = OperatorIdentity.generate();
+    reg.register(a);
+    reg.insert(b.operatorId, b.publicKey());
+    expect(reg.size).toBe(2);
+    expect(reg.contains(a.operatorId)).toBe(true);
+    expect(reg.contains(b.operatorId)).toBe(true);
+    expect(reg.contains(0xDEADBEEFn)).toBe(false);
+  });
+
+  v('OperatorRegistry rejects bad public key length', () => {
+    const { OperatorRegistry } = symbols as { OperatorRegistry: any };
+    const reg = new OperatorRegistry();
+    try {
+      reg.insert(1n, Buffer.alloc(31));
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(parseKind(e)).toBe('invalid_public_key');
+    }
+  });
+
+  v('signPayload + registry.verify round-trip any byte payload', () => {
+    const { OperatorRegistry } = symbols as { OperatorRegistry: any };
+    const identity = OperatorIdentity.generate();
+    const reg = new OperatorRegistry();
+    reg.register(identity);
+
+    const payload = Buffer.from('verify-roundtrip-canary');
+    const sig = identity.signPayload(payload);
+    expect(sig.operatorId).toBe(identity.operatorId);
+    expect(sig.signature.length).toBe(64);
+    reg.verify(sig, payload); // no throw
+
+    try {
+      reg.verify(sig, Buffer.concat([payload, Buffer.from('!')]));
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(parseKind(e)).toBe('signature_invalid');
+    }
+  });
+
+  v('registry.verify rejects unknown operator id', () => {
+    const { OperatorRegistry } = symbols as { OperatorRegistry: any };
+    const reg = new OperatorRegistry();
+    const stranger = OperatorIdentity.generate();
+    const sig = stranger.signPayload(Buffer.from('hello'));
+    try {
+      reg.verify(sig, Buffer.from('hello'));
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(parseKind(e)).toBe('not_authorized');
+    }
+  });
+
+  v('verifyBundle enforces distinct-operator dedup', () => {
+    const { OperatorRegistry } = symbols as { OperatorRegistry: any };
+    const a = OperatorIdentity.generate();
+    const b = OperatorIdentity.generate();
+    const reg = new OperatorRegistry();
+    reg.register(a);
+    reg.register(b);
+    const payload = Buffer.from('bundle-payload');
+    const sigA = a.signPayload(payload);
+    const sigB = b.signPayload(payload);
+
+    reg.verifyBundle([sigA, sigB], payload, 2);
+
+    try {
+      reg.verifyBundle([sigA, sigA], payload, 2);
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(parseKind(e)).toBe('insufficient_signatures');
+    }
+  });
+
+  v('AdminVerifier exposes policy knobs', () => {
+    const { OperatorRegistry, AdminVerifier } = symbols as {
+      OperatorRegistry: any;
+      AdminVerifier: any;
+    };
+    const reg = new OperatorRegistry();
+    const v1 = new AdminVerifier(reg, 3);
+    expect(v1.threshold).toBe(3);
+    expect(v1.freshnessWindowMs).toBe(300_000n);
+    expect(v1.futureSkewMs).toBe(30_000n);
+    expect(v1.iceCooldownMs).toBe(300_000n);
+
+    const v2 = AdminVerifier.withFreshness(reg, 2, 60_000n, 5_000n);
+    expect(v2.threshold).toBe(2);
+    expect(v2.freshnessWindowMs).toBe(60_000n);
+    expect(v2.futureSkewMs).toBe(5_000n);
+    expect(v2.iceCooldownMs).toBe(300_000n);
+
+    const v3 = AdminVerifier.withFullPolicy(reg, 1, 1_000n, 500n, 250n);
+    expect(v3.threshold).toBe(1);
+    expect(v3.iceCooldownMs).toBe(250n);
+  });
+
+  v('AdminVerifier clamps zero threshold to one', () => {
+    const { OperatorRegistry, AdminVerifier } = symbols as {
+      OperatorRegistry: any;
+      AdminVerifier: any;
+    };
+    const v = new AdminVerifier(new OperatorRegistry(), 0);
+    expect(v.threshold).toBe(1);
+  });
+
+  v('signingPayload matches signProposal payload byte-for-byte', async () => {
+    const { OperatorRegistry } = symbols as { OperatorRegistry: any };
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const identity = OperatorIdentity.generate();
+      const client = await DeckClient.fromMeshos(sdk, identity);
+      const proposal = client.ice.freezeCluster(60_000n);
+      const simulated = await proposal.simulate();
+      const payload = await simulated.signingPayload();
+      // ICE_SIGNING_DOMAIN prefix — substrate const
+      // `b"net.meshos.ice.v1\0"` (17 ASCII chars + trailing NUL,
+      // 18 bytes total). Comparing the first 17 bytes keeps the
+      // test source ASCII-clean; assert the 18th byte separately.
+      expect(payload.subarray(0, 17).toString('latin1')).toBe(
+        'net.meshos.ice.v1',
+      );
+      expect(payload[17]).toBe(0);
+
+      const sigViaProposal = await identity.signProposal(simulated);
+      const sigViaPayload = identity.signPayload(payload);
+      expect(sigViaProposal.operatorId).toBe(sigViaPayload.operatorId);
+      expect(Buffer.from(sigViaProposal.signature).equals(sigViaPayload.signature)).toBe(true);
+
+      const reg = new OperatorRegistry();
+      reg.register(identity);
+      reg.verify(sigViaProposal, payload); // no throw
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  v('signingPayload after commit throws already_committed', async () => {
+    const sdk = await MeshOsDaemonSdk.start();
+    try {
+      const identity = OperatorIdentity.generate();
+      const client = await DeckClient.fromMeshos(sdk, identity);
+      const proposal = client.ice.freezeCluster(60_000n);
+      const simulated = await proposal.simulate();
+      await simulated.commit([
+        { operatorId: 1n, signature: Buffer.alloc(64, 0) },
+      ]);
+      try {
+        await simulated.signingPayload();
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(parseKind(e)).toBe('already_committed');
+      }
+      try {
+        await identity.signProposal(simulated);
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(parseKind(e)).toBe('already_committed');
+      }
+    } finally {
+      await sdk.shutdown();
+    }
+  });
 });

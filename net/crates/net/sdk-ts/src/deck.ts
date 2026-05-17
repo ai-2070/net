@@ -37,6 +37,7 @@
 
 import {
   AdminCommands as NapiAdmin,
+  AdminVerifier as NapiAdminVerifier,
   AuditQuery as NapiAuditQuery,
   AuditStream as NapiAuditStream,
   DeckClient as NapiClient,
@@ -45,6 +46,7 @@ import {
   IceProposal as NapiIceProposal,
   LogStream as NapiLogStream,
   OperatorIdentity,
+  OperatorRegistry as NapiOperatorRegistry,
   SimulatedIceProposal as NapiSimulatedIceProposal,
   SnapshotStream as NapiSnapshotStream,
   StatusSummaryStream as NapiStatusStream,
@@ -783,5 +785,159 @@ function rethrow<T>(fn: () => T): T {
     return fn();
   } catch (e) {
     throw DeckSdkError.fromCaught(e);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Operator-policy verifier surface — OperatorRegistry + AdminVerifier
+// ----------------------------------------------------------------------------
+
+/** Cluster operator-policy registry. Authoring tool for the
+ * substrate's known-operator set; offline-friendly verifier for
+ * bundles before invoking
+ * {@link SimulatedIceProposal.commit}.
+ *
+ * Mutations are thread-safe at the napi binding layer. */
+export class OperatorRegistry {
+  /** @internal — exposed so {@link AdminVerifier} can re-use the
+   * underlying napi handle without round-tripping the public-key
+   * set through JS. */
+  readonly raw: NapiOperatorRegistry;
+
+  constructor(raw?: NapiOperatorRegistry) {
+    this.raw = raw ?? new NapiOperatorRegistry();
+  }
+
+  /** Insert an operator's 32-byte ed25519 public key under
+   * `operatorId`. */
+  insert(operatorId: bigint, publicKey: Buffer): void {
+    rethrow(() => this.raw.insert(operatorId, publicKey));
+  }
+
+  /** Register an `OperatorIdentity`'s public key under its
+   * derived operator id. */
+  register(identity: OperatorIdentity): void {
+    rethrow(() => this.raw.register(identity));
+  }
+
+  /** `true` iff `operatorId` is registered. */
+  contains(operatorId: bigint): boolean {
+    return rethrow(() => this.raw.contains(operatorId));
+  }
+
+  /** Number of registered operators. */
+  get size(): number {
+    return rethrow(() => this.raw.size);
+  }
+
+  /** `true` iff no operators are registered. */
+  isEmpty(): boolean {
+    return rethrow(() => this.raw.isEmpty());
+  }
+
+  /** Verify a single signature over `payload`. Throws
+   * `DeckSdkError` with the substrate's stable kind discriminator
+   * (`not_authorized`, `signature_invalid`, etc.). */
+  verify(signature: OperatorSignature, payload: Buffer): void {
+    rethrow(() =>
+      this.raw.verify(operatorSignatureToJs(signature), payload),
+    );
+  }
+
+  /** Verify every signature in the bundle and confirm at least
+   * `threshold` *distinct* operator ids signed `payload`. */
+  verifyBundle(
+    signatures: OperatorSignature[],
+    payload: Buffer,
+    threshold: number,
+  ): void {
+    rethrow(() =>
+      this.raw.verifyBundle(
+        signatures.map(operatorSignatureToJs),
+        payload,
+        threshold,
+      ),
+    );
+  }
+}
+
+/** Substrate-side admin commit verifier. Bundles an
+ * {@link OperatorRegistry} snapshot with the cluster's signature
+ * threshold + freshness/skew/ICE-cooldown windows. Useful for
+ * offline unit testing of operator-policy decisions.
+ *
+ * Constructors snapshot the registry at build time — later
+ * mutations on the source registry are not reflected. Rebuild
+ * the verifier after every policy change. */
+export class AdminVerifier {
+  private constructor(private readonly raw: NapiAdminVerifier) {}
+
+  /** Build a verifier with `threshold` minimum signatures and
+   * the substrate defaults (300s freshness, 30s future-skew,
+   * 300s ICE cooldown). `threshold = 0` is clamped to `1`. */
+  static new(registry: OperatorRegistry, threshold: number): AdminVerifier {
+    return rethrow(
+      () => new AdminVerifier(new NapiAdminVerifier(registry.raw, threshold)),
+    );
+  }
+
+  /** Build with explicit freshness + future-skew windows and
+   * the default ICE cooldown. */
+  static withFreshness(
+    registry: OperatorRegistry,
+    threshold: number,
+    freshnessWindowMs: bigint,
+    futureSkewMs: bigint,
+  ): AdminVerifier {
+    return rethrow(
+      () =>
+        new AdminVerifier(
+          NapiAdminVerifier.withFreshness(
+            registry.raw,
+            threshold,
+            freshnessWindowMs,
+            futureSkewMs,
+          ),
+        ),
+    );
+  }
+
+  /** Build with every policy knob explicit. Primarily for tests
+   * that need a short cooldown window. */
+  static withFullPolicy(
+    registry: OperatorRegistry,
+    threshold: number,
+    freshnessWindowMs: bigint,
+    futureSkewMs: bigint,
+    iceCooldownMs: bigint,
+  ): AdminVerifier {
+    return rethrow(
+      () =>
+        new AdminVerifier(
+          NapiAdminVerifier.withFullPolicy(
+            registry.raw,
+            threshold,
+            freshnessWindowMs,
+            futureSkewMs,
+            iceCooldownMs,
+          ),
+        ),
+    );
+  }
+
+  get threshold(): number {
+    return this.raw.threshold;
+  }
+
+  get freshnessWindowMs(): bigint {
+    return this.raw.freshnessWindowMs;
+  }
+
+  get futureSkewMs(): bigint {
+    return this.raw.futureSkewMs;
+  }
+
+  get iceCooldownMs(): bigint {
+    return this.raw.iceCooldownMs;
   }
 }

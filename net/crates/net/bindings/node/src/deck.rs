@@ -28,7 +28,7 @@
 //! `<<deck-sdk-kind:KIND>>MSG` discriminator verbatim. The TS
 //! wrapper parses the envelope into a typed `DeckSdkError`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use napi::bindgen_prelude::*;
@@ -44,9 +44,12 @@ use net::adapter::net::behavior::deck::{
 };
 use net::adapter::net::behavior::meshos::logs::LogLevel as CoreLogLevel;
 use net::adapter::net::behavior::meshos::{
-    AvoidScope as CoreAvoidScope, ChainId as CoreChainId, DaemonRef as CoreDaemonRef,
-    MigrationId as CoreMigrationId, OperatorSignature as CoreOperatorSignature,
+    AdminVerifier as CoreAdminVerifier, AvoidScope as CoreAvoidScope, ChainId as CoreChainId,
+    DaemonRef as CoreDaemonRef, MigrationId as CoreMigrationId,
+    OperatorRegistry as CoreOperatorRegistry, OperatorSignature as CoreOperatorSignature,
+    VerifyError as CoreVerifyError, blast_radius_hash, ice_proposal_signing_payload,
 };
+use net::adapter::net::identity::EntityId;
 use net::adapter::net::EntityKeypair;
 
 use futures::StreamExt;
@@ -61,6 +64,14 @@ fn deck_err(kind: &str, message: impl Into<String>) -> Error {
 
 fn deck_err_from(e: DeckError) -> Error {
     deck_err(e.kind, e.message)
+}
+
+/// Map a substrate `VerifyError` onto the `<<deck-sdk-kind:KIND>>MSG`
+/// envelope. The kind comes from the substrate's stable
+/// discriminator so cross-binding consumers branch on the same
+/// string ("not_authorized", "signature_invalid", etc.).
+fn verify_error_to_js(e: CoreVerifyError) -> Error {
+    deck_err(e.kind(), e.to_string())
 }
 
 // =========================================================================
@@ -115,6 +126,61 @@ impl OperatorIdentity {
     #[napi(getter)]
     pub fn operator_id(&self) -> BigInt {
         BigInt::from(self.inner.operator_id())
+    }
+
+    /// 32-byte ed25519 public key. Used by an offline tool that
+    /// authors the cluster's `OperatorRegistry` from a set of
+    /// known identities.
+    #[napi]
+    pub fn public_key(&self) -> Buffer {
+        Buffer::from(self.inner.keypair().entity_id().as_bytes().as_ref())
+    }
+
+    /// Sign a simulated ICE proposal. Returns an
+    /// `OperatorSignatureJs` directly consumable by
+    /// `SimulatedIceProposal.commit([sig, ...])`.
+    ///
+    /// Wraps the substrate's `OperatorIdentity::sign_proposal` —
+    /// covers `(ICE_SIGNING_DOMAIN || issued_at_ms ||
+    /// blast_hash || postcard(action))` so the verifier rebuilds
+    /// the same bytes locally.
+    #[napi]
+    pub async fn sign_proposal(
+        &self,
+        simulated: &SimulatedIceProposal,
+    ) -> Result<OperatorSignatureJs> {
+        let guard = simulated.state.lock().await;
+        let state = guard.as_ref().ok_or_else(|| {
+            deck_err(
+                "already_committed",
+                "SimulatedIceProposal was already consumed by commit()",
+            )
+        })?;
+        let hash = blast_radius_hash(&state.blast);
+        let sig = self
+            .inner
+            .sign_proposal(&state.action, simulated.issued_at_ms, &hash);
+        Ok(OperatorSignatureJs {
+            operator_id: BigInt::from(sig.operator_id),
+            signature: Buffer::from(sig.signature),
+        })
+    }
+
+    /// Sign raw payload bytes with this operator's ed25519 key.
+    /// Returns an `OperatorSignatureJs`.
+    ///
+    /// Useful for offline / cross-deck signing flows where the
+    /// `(action, issued_at_ms, blast_hash)` triple is exchanged
+    /// out-of-band and the local deck reproduces the signing
+    /// payload independently. Most consumers want
+    /// `signProposal(simulated)` instead.
+    #[napi]
+    pub fn sign_payload(&self, payload: Buffer) -> OperatorSignatureJs {
+        let sig = self.inner.keypair().sign(payload.as_ref());
+        OperatorSignatureJs {
+            operator_id: BigInt::from(self.inner.operator_id()),
+            signature: Buffer::from(sig.to_bytes().as_ref()),
+        }
     }
 }
 
@@ -1238,8 +1304,29 @@ impl SimulatedIceProposal {
                 "SimulatedIceProposal was already consumed by commit()",
             )
         })?;
-        let hash = net::adapter::net::behavior::meshos::blast_radius_hash(&state.blast);
+        let hash = blast_radius_hash(&state.blast);
         Ok(Buffer::from(hash.as_ref()))
+    }
+
+    /// Deterministic signing payload: `ICE_SIGNING_DOMAIN ||
+    /// issued_at_ms (le u64) || blast_hash (32) ||
+    /// postcard(action)`. Returned for the offline / cross-deck
+    /// signing flow — pair with
+    /// `OperatorIdentity.signPayload(payload)` on a remote deck
+    /// to produce a signature the local deck can pass into
+    /// `commit([sig, ...])`.
+    #[napi]
+    pub async fn signing_payload(&self) -> Result<Buffer> {
+        let guard = self.state.lock().await;
+        let state = guard.as_ref().ok_or_else(|| {
+            deck_err(
+                "already_committed",
+                "SimulatedIceProposal was already consumed by commit()",
+            )
+        })?;
+        let hash = blast_radius_hash(&state.blast);
+        let payload = ice_proposal_signing_payload(&state.action, self.issued_at_ms, &hash);
+        Ok(Buffer::from(payload))
     }
 
     /// Commit with the supplied operator signatures. Consumes the
@@ -1267,5 +1354,249 @@ impl SimulatedIceProposal {
             .await
             .map(|c| chain_commit_to_js(&c))
             .map_err(deck_err_from)
+    }
+}
+
+// =========================================================================
+// OperatorRegistry — operator-policy authoring + offline verify
+// =========================================================================
+
+/// Cluster operator-policy registry. Holds known operator public
+/// keys keyed by 64-bit operator id; `verify` / `verifyBundle`
+/// authenticate `OperatorSignatureJs` bundles against the
+/// policy.
+///
+/// Use cases: authoring the cluster's operator-policy snapshot,
+/// pre-verifying bundles before invoking
+/// `SimulatedIceProposal.commit`, unit-testing operator
+/// workflows. Mutations are thread-safe via an internal mutex.
+#[napi]
+pub struct OperatorRegistry {
+    inner: Arc<Mutex<CoreOperatorRegistry>>,
+}
+
+impl OperatorRegistry {
+    /// Snapshot the registry into an `Arc<CoreOperatorRegistry>`
+    /// suitable for handing to `AdminVerifier::new`. The
+    /// snapshot is detached — later mutations on the source
+    /// registry don't propagate.
+    fn snapshot(&self) -> std::sync::Arc<CoreOperatorRegistry> {
+        let g = self.inner.lock().expect("registry mutex poisoned");
+        std::sync::Arc::new(g.clone())
+    }
+}
+
+#[napi]
+impl OperatorRegistry {
+    #[napi(constructor)]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(CoreOperatorRegistry::new())),
+        }
+    }
+
+    /// Insert an operator's 32-byte ed25519 public key under
+    /// `operatorId`.
+    #[napi]
+    pub fn insert(&self, operator_id: BigInt, public_key: Buffer) -> Result<()> {
+        let op_id = crate::common::bigint_u64(operator_id)
+            .map_err(|e| deck_err("invalid_public_key", format!("operatorId: {}", e.reason)))?;
+        if public_key.len() != 32 {
+            return Err(deck_err(
+                "invalid_public_key",
+                format!("publicKey must be 32 bytes, got {}", public_key.len()),
+            ));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(public_key.as_ref());
+        let entity_id = EntityId::from_bytes(arr);
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
+        g.insert(op_id, entity_id);
+        Ok(())
+    }
+
+    /// Convenience — register `identity`'s public key under its
+    /// derived operator id.
+    #[napi]
+    pub fn register(&self, identity: &OperatorIdentity) -> Result<()> {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
+        g.register(identity.inner.keypair());
+        Ok(())
+    }
+
+    /// `true` iff `operatorId` is registered.
+    #[napi]
+    pub fn contains(&self, operator_id: BigInt) -> Result<bool> {
+        let op_id = crate::common::bigint_u64(operator_id)
+            .map_err(|e| deck_err("invalid_public_key", format!("operatorId: {}", e.reason)))?;
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
+        Ok(g.contains(op_id))
+    }
+
+    /// Number of registered operators.
+    #[napi(getter, js_name = "size")]
+    pub fn size(&self) -> Result<u32> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
+        Ok(g.len() as u32)
+    }
+
+    /// `true` iff no operators are registered.
+    #[napi]
+    pub fn is_empty(&self) -> Result<bool> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
+        Ok(g.is_empty())
+    }
+
+    /// Verify a single signature over `payload`. Throws a
+    /// `DeckSdkError`-shaped envelope with the appropriate kind
+    /// on failure.
+    #[napi]
+    pub fn verify(&self, signature: OperatorSignatureJs, payload: Buffer) -> Result<()> {
+        let sig = signature.into_core()?;
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
+        g.verify(&sig, payload.as_ref())
+            .map_err(verify_error_to_js)
+    }
+
+    /// Verify every signature in the bundle and confirm at least
+    /// `threshold` *distinct* operator ids signed `payload`.
+    /// The distinct-operator dedup gate is the M-of-N guarantee.
+    #[napi]
+    pub fn verify_bundle(
+        &self,
+        signatures: Vec<OperatorSignatureJs>,
+        payload: Buffer,
+        threshold: u32,
+    ) -> Result<()> {
+        let mut sigs = Vec::with_capacity(signatures.len());
+        for s in signatures {
+            sigs.push(s.into_core()?);
+        }
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
+        g.verify_bundle(&sigs, payload.as_ref(), threshold as usize)
+            .map_err(verify_error_to_js)
+    }
+}
+
+// =========================================================================
+// AdminVerifier — substrate verifier wrapper
+// =========================================================================
+
+/// Substrate-side admin commit verifier. Bundles an
+/// `OperatorRegistry` snapshot with the cluster's signature
+/// threshold + freshness/skew/ICE-cooldown windows. Useful for
+/// offline unit testing of operator-policy decisions.
+///
+/// Constructors snapshot the registry at build time — later
+/// mutations on the source registry are not reflected. Rebuild
+/// the verifier after every policy change.
+#[napi]
+pub struct AdminVerifier {
+    inner: CoreAdminVerifier,
+}
+
+#[napi]
+impl AdminVerifier {
+    /// Build a verifier with `threshold` minimum signatures and
+    /// the substrate defaults (300s freshness, 30s future-skew,
+    /// 300s ICE cooldown). `threshold = 0` is clamped to `1`.
+    #[napi(constructor)]
+    pub fn new(registry: &OperatorRegistry, threshold: u32) -> Self {
+        Self {
+            inner: CoreAdminVerifier::new(registry.snapshot(), threshold as usize),
+        }
+    }
+
+    /// Build with explicit freshness + future-skew windows and
+    /// the default ICE cooldown.
+    #[napi(factory)]
+    pub fn with_freshness(
+        registry: &OperatorRegistry,
+        threshold: u32,
+        freshness_window_ms: BigInt,
+        future_skew_ms: BigInt,
+    ) -> Result<Self> {
+        let fresh_ms = crate::common::bigint_u64(freshness_window_ms).map_err(|e| {
+            deck_err("invalid_argument", format!("freshnessWindowMs: {}", e.reason))
+        })?;
+        let skew_ms = crate::common::bigint_u64(future_skew_ms)
+            .map_err(|e| deck_err("invalid_argument", format!("futureSkewMs: {}", e.reason)))?;
+        Ok(Self {
+            inner: CoreAdminVerifier::with_freshness(
+                registry.snapshot(),
+                threshold as usize,
+                Duration::from_millis(fresh_ms),
+                Duration::from_millis(skew_ms),
+            ),
+        })
+    }
+
+    /// Build with every policy knob explicit. Primarily for
+    /// tests that need a short cooldown window.
+    #[napi(factory)]
+    pub fn with_full_policy(
+        registry: &OperatorRegistry,
+        threshold: u32,
+        freshness_window_ms: BigInt,
+        future_skew_ms: BigInt,
+        ice_cooldown_ms: BigInt,
+    ) -> Result<Self> {
+        let fresh_ms = crate::common::bigint_u64(freshness_window_ms).map_err(|e| {
+            deck_err("invalid_argument", format!("freshnessWindowMs: {}", e.reason))
+        })?;
+        let skew_ms = crate::common::bigint_u64(future_skew_ms)
+            .map_err(|e| deck_err("invalid_argument", format!("futureSkewMs: {}", e.reason)))?;
+        let cool_ms = crate::common::bigint_u64(ice_cooldown_ms)
+            .map_err(|e| deck_err("invalid_argument", format!("iceCooldownMs: {}", e.reason)))?;
+        Ok(Self {
+            inner: CoreAdminVerifier::with_full_policy(
+                registry.snapshot(),
+                threshold as usize,
+                Duration::from_millis(fresh_ms),
+                Duration::from_millis(skew_ms),
+                Duration::from_millis(cool_ms),
+            ),
+        })
+    }
+
+    #[napi(getter)]
+    pub fn threshold(&self) -> u32 {
+        self.inner.threshold() as u32
+    }
+
+    #[napi(getter)]
+    pub fn freshness_window_ms(&self) -> BigInt {
+        BigInt::from(self.inner.freshness_window().as_millis() as u64)
+    }
+
+    #[napi(getter)]
+    pub fn future_skew_ms(&self) -> BigInt {
+        BigInt::from(self.inner.future_skew().as_millis() as u64)
+    }
+
+    #[napi(getter)]
+    pub fn ice_cooldown_ms(&self) -> BigInt {
+        BigInt::from(self.inner.ice_cooldown().as_millis() as u64)
     }
 }

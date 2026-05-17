@@ -18,6 +18,39 @@ export declare class AdminCommands {
 }
 
 /**
+ * Substrate-side admin commit verifier. Bundles an
+ * `OperatorRegistry` snapshot with the cluster's signature
+ * threshold + freshness/skew/ICE-cooldown windows. Useful for
+ * offline unit testing of operator-policy decisions.
+ *
+ * Constructors snapshot the registry at build time — later
+ * mutations on the source registry are not reflected. Rebuild
+ * the verifier after every policy change.
+ */
+export declare class AdminVerifier {
+  /**
+   * Build a verifier with `threshold` minimum signatures and
+   * the substrate defaults (300s freshness, 30s future-skew,
+   * 300s ICE cooldown). `threshold = 0` is clamped to `1`.
+   */
+  constructor(registry: OperatorRegistry, threshold: number)
+  /**
+   * Build with explicit freshness + future-skew windows and
+   * the default ICE cooldown.
+   */
+  static withFreshness(registry: OperatorRegistry, threshold: number, freshnessWindowMs: bigint, futureSkewMs: bigint): AdminVerifier
+  /**
+   * Build with every policy knob explicit. Primarily for
+   * tests that need a short cooldown window.
+   */
+  static withFullPolicy(registry: OperatorRegistry, threshold: number, freshnessWindowMs: bigint, futureSkewMs: bigint, iceCooldownMs: bigint): AdminVerifier
+  get threshold(): number
+  get freshnessWindowMs(): bigint
+  get futureSkewMs(): bigint
+  get iceCooldownMs(): bigint
+}
+
+/**
  * Fluent admin-audit query builder. Chain `recent` / `byOperator`
  * / `between` / `forceOnly` / `since` before calling `collect()`
  * (eager list of JSON strings) or `stream()` (async iterator).
@@ -1570,6 +1603,77 @@ export declare class OperatorIdentity {
    */
   static fromIdentity(identity: Identity): OperatorIdentity
   get operatorId(): bigint
+  /**
+   * 32-byte ed25519 public key. Used by an offline tool that
+   * authors the cluster's `OperatorRegistry` from a set of
+   * known identities.
+   */
+  publicKey(): Buffer
+  /**
+   * Sign a simulated ICE proposal. Returns an
+   * `OperatorSignatureJs` directly consumable by
+   * `SimulatedIceProposal.commit([sig, ...])`.
+   *
+   * Wraps the substrate's `OperatorIdentity::sign_proposal` —
+   * covers `(ICE_SIGNING_DOMAIN || issued_at_ms ||
+   * blast_hash || postcard(action))` so the verifier rebuilds
+   * the same bytes locally.
+   */
+  signProposal(simulated: SimulatedIceProposal): Promise<OperatorSignatureJs>
+  /**
+   * Sign raw payload bytes with this operator's ed25519 key.
+   * Returns an `OperatorSignatureJs`.
+   *
+   * Useful for offline / cross-deck signing flows where the
+   * `(action, issued_at_ms, blast_hash)` triple is exchanged
+   * out-of-band and the local deck reproduces the signing
+   * payload independently. Most consumers want
+   * `signProposal(simulated)` instead.
+   */
+  signPayload(payload: Buffer): OperatorSignatureJs
+}
+
+/**
+ * Cluster operator-policy registry. Holds known operator public
+ * keys keyed by 64-bit operator id; `verify` / `verifyBundle`
+ * authenticate `OperatorSignatureJs` bundles against the
+ * policy.
+ *
+ * Use cases: authoring the cluster's operator-policy snapshot,
+ * pre-verifying bundles before invoking
+ * `SimulatedIceProposal.commit`, unit-testing operator
+ * workflows. Mutations are thread-safe via an internal mutex.
+ */
+export declare class OperatorRegistry {
+  constructor()
+  /**
+   * Insert an operator's 32-byte ed25519 public key under
+   * `operatorId`.
+   */
+  insert(operatorId: bigint, publicKey: Buffer): void
+  /**
+   * Convenience — register `identity`'s public key under its
+   * derived operator id.
+   */
+  register(identity: OperatorIdentity): void
+  /** `true` iff `operatorId` is registered. */
+  contains(operatorId: bigint): boolean
+  /** Number of registered operators. */
+  get size(): number
+  /** `true` iff no operators are registered. */
+  isEmpty(): boolean
+  /**
+   * Verify a single signature over `payload`. Throws a
+   * `DeckSdkError`-shaped envelope with the appropriate kind
+   * on failure.
+   */
+  verify(signature: OperatorSignatureJs, payload: Buffer): void
+  /**
+   * Verify every signature in the bundle and confirm at least
+   * `threshold` *distinct* operator ids signed `payload`.
+   * The distinct-operator dedup gate is the M-of-N guarantee.
+   */
+  verifyBundle(signatures: Array<OperatorSignatureJs>, payload: Buffer, threshold: number): void
 }
 
 /**
@@ -2020,6 +2124,16 @@ export declare class SimulatedIceProposal {
    * this exact hash.
    */
   blastHash(): Promise<Buffer>
+  /**
+   * Deterministic signing payload: `ICE_SIGNING_DOMAIN ||
+   * issued_at_ms (le u64) || blast_hash (32) ||
+   * postcard(action)`. Returned for the offline / cross-deck
+   * signing flow — pair with
+   * `OperatorIdentity.signPayload(payload)` on a remote deck
+   * to produce a signature the local deck can pass into
+   * `commit([sig, ...])`.
+   */
+  signingPayload(): Promise<Buffer>
   /**
    * Commit with the supplied operator signatures. Consumes the
    * proposal — subsequent calls throw `already_committed`.
