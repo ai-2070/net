@@ -23,7 +23,7 @@
     "dist"
   ],
   "scripts": {
-    "prebuild": "node -e \"require('fs').existsSync('../bindings/node/index.d.ts')||require('child_process').execSync('npm --prefix ../bindings/node run build',{stdio:'inherit'})\"",
+    "prebuild": "node -e \"const fs=require('fs'),cp=require('child_process');if(!fs.existsSync('../bindings/node/index.d.ts')){cp.execSync('npm --prefix ../bindings/node i --ignore-scripts',{stdio:'inherit'});cp.execSync('npm --prefix ../bindings/node run build',{stdio:'inherit'})}\"",
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest"
