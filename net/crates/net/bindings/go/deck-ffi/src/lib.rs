@@ -378,10 +378,15 @@ pub extern "C" fn net_deck_client_new(
             return NET_DECK_ERR_INVALID_ARG;
         }
         clear_last_error_inner();
-        let seed: [u8; 32] = unsafe { std::slice::from_raw_parts(operator_seed_ptr, 32) }
-            .try_into()
-            .expect("slice has len 32");
-        let keypair = EntityKeypair::from_bytes(seed);
+        // `Zeroizing` wipes the local stack copy on drop. The
+        // caller's source buffer and the substrate's internal
+        // keypair are independent copies; documenting the
+        // threat-model disclaimer for those lives in net_deck.h.
+        let seed = zeroize::Zeroizing::new(
+            <[u8; 32]>::try_from(unsafe { std::slice::from_raw_parts(operator_seed_ptr, 32) })
+                .expect("slice has len 32"),
+        );
+        let keypair = EntityKeypair::from_bytes(*seed);
         let identity = CoreIdentity::from_keypair(keypair);
 
         let mut sdk_cfg = MeshOsConfig::default();
@@ -2419,11 +2424,13 @@ pub extern "C" fn net_deck_operator_identity_from_seed(
             set_last_error("invalid_argument", "seed_ptr / out pointer is NULL");
             return NET_DECK_ERR_INVALID_ARG;
         }
-        let seed: [u8; 32] = unsafe { std::slice::from_raw_parts(seed_ptr, 32) }
-            .try_into()
-            .expect("slice has len 32");
+        // `Zeroizing` wipes the local stack copy on drop.
+        let seed = zeroize::Zeroizing::new(
+            <[u8; 32]>::try_from(unsafe { std::slice::from_raw_parts(seed_ptr, 32) })
+                .expect("slice has len 32"),
+        );
         let identity = NetDeckOperatorIdentity {
-            inner: CoreIdentity::from_keypair(EntityKeypair::from_bytes(seed)),
+            inner: CoreIdentity::from_keypair(EntityKeypair::from_bytes(*seed)),
         };
         unsafe { *out = Box::into_raw(Box::new(identity)) };
         NET_DECK_OK

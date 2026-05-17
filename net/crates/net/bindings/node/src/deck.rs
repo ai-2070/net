@@ -109,10 +109,14 @@ impl OperatorIdentity {
                 format!("seed must be 32 bytes, got {}", bytes.len()),
             ));
         }
-        let mut arr = [0u8; 32];
+        // `Zeroizing` wipes the local stack copy on drop. The
+        // caller's `Buffer` and the substrate's internal keypair
+        // are separate copies; documenting the threat model
+        // disclaimer for those lives in net_deck.h.
+        let mut arr = zeroize::Zeroizing::new([0u8; 32]);
         arr.copy_from_slice(bytes);
         Ok(Self {
-            inner: CoreIdentity::from_keypair(EntityKeypair::from_bytes(arr)),
+            inner: CoreIdentity::from_keypair(EntityKeypair::from_bytes(*arr)),
         })
     }
 
@@ -555,9 +559,10 @@ impl DeckClient {
                 ),
             ));
         }
-        let mut seed = [0u8; 32];
+        // `Zeroizing` wipes the local stack copy on drop.
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
         seed.copy_from_slice(&operator_seed);
-        let keypair = EntityKeypair::from_bytes(seed);
+        let keypair = EntityKeypair::from_bytes(*seed);
         let identity = CoreIdentity::from_keypair(keypair);
 
         let sdk_cfg = match meshos_config {

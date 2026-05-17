@@ -1871,6 +1871,7 @@ dependencies = [
  "futures",
  "serde_json",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -1913,6 +1914,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "xxhash-rust",
+ "zeroize",
 ]
 
 [[package]]
@@ -1931,6 +1933,7 @@ dependencies = [
  "pyo3-build-config",
  "serde_json",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

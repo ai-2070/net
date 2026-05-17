@@ -28,3 +28,7 @@ net = { package = "ai2070-net", version = "0.17.0", path = "../../..", default-f
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 futures = "0.3"
 serde_json = "1"
+# Zeroizing wrapper for transient operator-seed copies in the
+# net_deck_client_new / net_deck_operator_identity_new entry
+# points.
+zeroize = "1"

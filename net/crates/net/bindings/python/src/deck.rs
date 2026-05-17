@@ -156,9 +156,10 @@ impl PyOperatorIdentity {
                 &format!("seed must be 32 bytes, got {}", seed.len()),
             ));
         }
-        let mut arr = [0u8; 32];
+        // `Zeroizing` wipes the local stack copy on drop.
+        let mut arr = zeroize::Zeroizing::new([0u8; 32]);
         arr.copy_from_slice(seed);
-        let keypair = net::adapter::net::EntityKeypair::from_bytes(arr);
+        let keypair = net::adapter::net::EntityKeypair::from_bytes(*arr);
         Ok(Self {
             inner: CoreIdentity::from_keypair(keypair),
         })
@@ -606,9 +607,10 @@ impl PyDeckClient {
                 ),
             ));
         }
-        let mut seed = [0u8; 32];
+        // `Zeroizing` wipes the local stack copy on drop.
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
         seed.copy_from_slice(seed_bytes);
-        let keypair = EntityKeypair::from_bytes(seed);
+        let keypair = EntityKeypair::from_bytes(*seed);
         let identity = CoreIdentity::from_keypair(keypair);
 
         let sdk_cfg = crate::meshos::meshos_config_from_dict(py, meshos_config)?;

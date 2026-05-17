@@ -223,6 +223,16 @@ typedef struct NetDeckStatusSummaryStream  NetDeckStatusSummaryStream;
  * seed material. The substrate derives the operator id as the
  * keypair's origin hash.
  *
+ * Seed material hygiene. The cdylib zeroizes the transient
+ * stack copy it makes of `operator_seed_ptr` before returning,
+ * so the FFI shim does not itself become a long-lived window
+ * onto the seed. However: (a) the caller's buffer is NOT
+ * touched — callers that treat seeds as sensitive should
+ * `explicit_bzero` (or equivalent) their own copy after this
+ * call returns; and (b) the substrate's `EntityKeypair` holds
+ * its own internal copy for the life of the client handle.
+ * Free the client when done to release that copy.
+ *
  * On success writes a heap-allocated handle to `*out` and returns
  * NET_DECK_OK. Caller MUST free via `net_deck_client_free`. */
 int net_deck_client_new(
@@ -740,7 +750,13 @@ typedef struct NetDeckOperatorIdentity NetDeckOperatorIdentity;
  * frees via `net_deck_operator_identity_free`. */
 NetDeckOperatorIdentity* net_deck_operator_identity_generate(void);
 
-/* Load from a 32-byte ed25519 seed. Writes the handle to `*out`. */
+/* Load from a 32-byte ed25519 seed. Writes the handle to `*out`.
+ *
+ * Seed material hygiene: see the `net_deck_client_new` note —
+ * the cdylib zeroizes the transient stack copy it makes of
+ * `seed_ptr`; the caller's source buffer is NOT touched, and
+ * the substrate's keypair holds an internal copy for the
+ * identity handle's lifetime. */
 int net_deck_operator_identity_from_seed(
     const uint8_t* seed_ptr,
     NetDeckOperatorIdentity** out
