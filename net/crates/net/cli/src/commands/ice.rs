@@ -289,6 +289,18 @@ where
         return Ok(());
     }
 
+    // Parse supplied signatures up-front, BEFORE the confirm
+    // gate. Pre-fix `--sig` was parsed after the operator had
+    // already typed YES; a malformed `--sig` JSON aborted with
+    // InvalidArgs post-confirmation, wasting the dual-key
+    // ceremony and producing confusing UX. Surface argv typos
+    // immediately so the gate only runs on inputs we know are
+    // well-formed.
+    let mut signatures: Vec<OperatorSignature> = Vec::new();
+    for raw in &common.sigs {
+        signatures.push(parse_supplied_sig(raw)?);
+    }
+
     // Confirmation gate. The break-glass surface keeps a dual-key
     // feel: `--yes` only short-circuits the prompt when stdin is
     // not a TTY (scripts / CI). On an interactive terminal we
@@ -309,17 +321,13 @@ where
     .await
     .map_err(|e| generic(format!("confirm-gate task panicked: {e}")))??;
 
-    // Sign locally + collect supplied signatures.
-    let mut signatures: Vec<OperatorSignature> = Vec::new();
+    // Sign locally now that the gate has passed.
     let local_sig = ctx.identity().sign_proposal(
         simulated.action(),
         simulated.issued_at_ms(),
         &simulated.blast_hash(),
     );
     signatures.push(local_sig);
-    for raw in &common.sigs {
-        signatures.push(parse_supplied_sig(raw)?);
-    }
 
     let commit: ChainCommit = simulated
         .commit(&signatures)
