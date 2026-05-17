@@ -10,6 +10,8 @@
 //! `cap`, `peer`, `port`, `db`, `netdb`) land in subsequent
 //! commits.
 
+pub mod audit;
 pub mod identity;
+pub mod logs;
 pub mod snapshot;
 pub mod version;

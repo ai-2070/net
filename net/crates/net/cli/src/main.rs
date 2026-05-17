@@ -99,9 +99,29 @@ enum Command {
     /// `MeshOsSnapshot` reads (one-shot).
     #[command(subcommand)]
     Snapshot(commands::snapshot::SnapshotCommand),
-    // Subsequent commands (audit / log / failures / daemon /
-    // cap / peer / port / db / netdb) land in follow-up
-    // commits within Phase 1.
+    /// Read-only operator-audit queries.
+    #[command(subcommand)]
+    Audit(commands::audit::AuditCommand),
+    /// Substrate log stream.
+    #[command(subcommand)]
+    Log(LogCommand),
+    /// Substrate failure stream.
+    #[command(subcommand)]
+    Failures(FailuresCommand),
+    // Subsequent commands (daemon / cap / peer / port / db /
+    // netdb) land in follow-up commits within Phase 1.
+}
+
+#[derive(Subcommand, Debug)]
+enum LogCommand {
+    /// Tail the log stream.
+    Tail(commands::logs::LogTailArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum FailuresCommand {
+    /// Tail the failure stream.
+    Tail(commands::logs::FailuresTailArgs),
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -136,6 +156,13 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Identity(cmd) => commands::identity::run(cmd, output).await,
         Command::Snapshot(cmd) => {
             commands::snapshot::run(cmd, output, config_path, profile).await
+        }
+        Command::Audit(cmd) => commands::audit::run(cmd, output, config_path, profile).await,
+        Command::Log(LogCommand::Tail(args)) => {
+            commands::logs::run_log_tail(args, output, config_path, profile).await
+        }
+        Command::Failures(FailuresCommand::Tail(args)) => {
+            commands::logs::run_failures_tail(args, output, config_path, profile).await
         }
     }
 }
