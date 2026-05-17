@@ -1,0 +1,22 @@
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_b3022192a92c59::t_32ddb78ac87af3 953-1157
+net/crates/net/bindings/python/tests/test_pyi_stub_coverage.py
+  s_b3022192a92c59::t_804eb99966e17a 1-82,86-116
+  s_b3022192a92c59::t_892017aeb63aa7 83-85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "1e811ecb5fd44807140bd98f94d738d86aa1ae08",
+  "prompts": {},
+  "sessions": {
+    "s_b3022192a92c59": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d594c56e-1353-4a07-aa91-e09d2c583c0f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
