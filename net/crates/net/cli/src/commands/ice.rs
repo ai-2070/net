@@ -293,22 +293,21 @@ where
         return Ok(());
     }
 
-    // Confirmation gate. Non-TTY without `--yes` → exit 8.
-    // TTY: require typed `YES` even with `--yes` to keep the
-    // dual-key feel; `--yes` skips the prompt only when stdout
-    // is non-TTY.
+    // Confirmation gate. The break-glass surface keeps a dual-key
+    // feel: `--yes` only short-circuits the prompt when stdin is
+    // not a TTY (scripts / CI). On an interactive terminal we
+    // always demand the typed `YES` even with `--yes` so a stray
+    // shell-history recall can't ram an ICE commit through.
     let stdin_is_tty = is_terminal::IsTerminal::is_terminal(&io::stdin());
-    if !common.yes {
-        if !stdin_is_tty {
+    if !stdin_is_tty {
+        if !common.yes {
             return Err(_CE::new(
                 ExitCodeKind::ConfirmationRefused,
                 "stdin is not a TTY; pass --yes to skip the interactive confirm prompt",
             ));
         }
-        // Stdin is a TTY: prompt for typed YES.
-        if !prompt_for_yes()? {
-            return Err(crate::error::confirmation_refused());
-        }
+    } else if !prompt_for_yes()? {
+        return Err(crate::error::confirmation_refused());
     }
 
     // Sign locally + collect supplied signatures.
