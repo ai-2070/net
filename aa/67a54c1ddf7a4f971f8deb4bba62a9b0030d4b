@@ -1,0 +1,23 @@
+net/crates/net/cli/src/commands/admin.rs
+  s_8c2b4b36ad9479::t_4d2d3b838e3087 22
+net/crates/net/cli/src/commands/netdb.rs
+  s_8c2b4b36ad9479::t_dc9991a0905fc2 21
+net/crates/net/cli/src/commands/ice.rs
+  s_8c2b4b36ad9479::t_8f15bee78e2e9a 37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "aa67a54c1ddf7a4f971f8deb4bba62a9b0030d4b",
+  "prompts": {},
+  "sessions": {
+    "s_8c2b4b36ad9479": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c178f51c-95e0-4224-ba26-c4901e8acca7",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
