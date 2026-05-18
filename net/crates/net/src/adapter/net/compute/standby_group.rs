@@ -854,6 +854,13 @@ impl StandbyGroup {
     /// `MAX_RECOVERIES_PER_TICK` so a pathological "every slot
     /// unhealthy" state makes progress without wedging the caller.
     /// Returns the slot indices that were successfully placed.
+    ///
+    /// Skips `active_index` even when it is marked unhealthy: a
+    /// blank `DaemonHost::new` here would `registry.replace` the
+    /// live active and wipe its committed state. An unhealthy
+    /// active requires `promote` (which transfers the latest
+    /// standby snapshot + replays buffered events), not slot
+    /// re-placement.
     fn try_recover_inner<F>(
         &mut self,
         scheduler: &Scheduler,
@@ -864,11 +871,12 @@ impl StandbyGroup {
         F: Fn() -> Box<dyn MeshDaemon>,
     {
         const MAX_RECOVERIES_PER_TICK: usize = 4;
+        let active_index = self.active_index;
         let unhealthy: Vec<u8> = self
             .coord
             .members()
             .iter()
-            .filter(|m| !m.healthy)
+            .filter(|m| !m.healthy && m.index != active_index)
             .map(|m| m.index)
             .take(MAX_RECOVERIES_PER_TICK)
             .collect();
@@ -972,7 +980,17 @@ impl StandbyGroup {
 
 impl crate::adapter::net::compute::UnhealthySlotRecovery for StandbyGroup {
     fn has_unhealthy_slots(&self) -> bool {
-        self.coord.members().iter().any(|m| !m.healthy)
+        // Only standby slots are recoverable here; an unhealthy
+        // active must go through `promote`, not slot re-placement
+        // (see `try_recover_inner`). Returning `true` for an
+        // unhealthy-active-only state would make the recovery
+        // tick fire repeatedly with nothing to do, since the
+        // active slot is skipped inside `try_recover`.
+        let active_index = self.active_index;
+        self.coord
+            .members()
+            .iter()
+            .any(|m| !m.healthy && m.index != active_index)
     }
 
     fn try_recover(
@@ -2131,6 +2149,119 @@ mod tests {
             "active failure → promote returns Some"
         );
         assert_ne!(group.active_index(), 0, "active is no longer index 0");
+    }
+
+    /// Regression: `try_recover` must skip the active slot even when
+    /// `coord.mark_unhealthy(active_index)` is set. Pre-fix the
+    /// recovery path constructed a fresh `DaemonHost::new` and
+    /// `registry.replace`d the live active, wiping committed state
+    /// and resetting `synced_through` / `last_sync`. Active recovery
+    /// belongs to `promote`, not slot re-placement; the recovery
+    /// trait must also report `has_unhealthy_slots() == false` when
+    /// only the active is unhealthy, so the meshos tick doesn't busy-
+    /// loop calling `try_recover` with nothing to do.
+    #[test]
+    fn try_recover_skips_unhealthy_active_and_preserves_state() {
+        use crate::adapter::net::compute::UnhealthySlotRecovery;
+
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+
+        // Advance the active's state so a clobber is detectable.
+        let active_origin_before = group.active_origin();
+        for seq in 1..=5 {
+            let event = make_event(seq);
+            reg.deliver(active_origin_before, &event).unwrap();
+            group.on_event_delivered(event);
+        }
+        group.sync_standbys(&reg).unwrap();
+        let snapshot_before = reg.snapshot(active_origin_before).unwrap().unwrap();
+
+        // Simulate active node being briefly flagged unhealthy.
+        let active_index = group.active_index();
+        group.coord.mark_unhealthy(active_index);
+
+        // Recovery probe must NOT advertise work when only the active
+        // is unhealthy — promote, not recover, is the right tool.
+        assert!(
+            !group.has_unhealthy_slots(),
+            "has_unhealthy_slots must skip the active slot; only standby slots are recoverable",
+        );
+
+        let recovered = group.try_recover(&sched, &reg, &|| Box::new(StatefulDaemon::new()));
+        assert!(
+            !recovered.iter().any(|i| *i == active_index),
+            "try_recover must NOT include the active index in the recovered set",
+        );
+
+        // Active's daemon-host state is untouched: same origin, same
+        // serialized snapshot bytes.
+        assert_eq!(
+            group.active_origin(),
+            active_origin_before,
+            "active origin must be unchanged after a try_recover on the active slot",
+        );
+        let snapshot_after = reg.snapshot(active_origin_before).unwrap().unwrap();
+        assert_eq!(
+            snapshot_before.state, snapshot_after.state,
+            "active's daemon state must be preserved; try_recover must not replace the live active",
+        );
+
+        // The standby slots remain healthy too, so no spurious work.
+        assert_eq!(
+            group.members().iter().filter(|m| m.healthy).count(),
+            2,
+            "two standbys still healthy",
+        );
+    }
+
+    /// Companion: when a standby IS unhealthy alongside an unhealthy
+    /// active, `try_recover` repairs the standby and leaves the active
+    /// alone. `has_unhealthy_slots` returns true on account of the
+    /// standby, not the active.
+    #[test]
+    fn try_recover_repairs_standby_even_when_active_also_unhealthy() {
+        use crate::adapter::net::compute::UnhealthySlotRecovery;
+
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+        let active_index = group.active_index();
+        let active_origin_before = group.active_origin();
+
+        // Mark the active AND a standby unhealthy.
+        group.coord.mark_unhealthy(active_index);
+        let standby_index: u8 = (0u8..group.member_count())
+            .find(|i| *i != active_index)
+            .unwrap();
+        group.coord.mark_unhealthy(standby_index);
+
+        assert!(group.has_unhealthy_slots(), "standby slot is recoverable");
+        let recovered = group.try_recover(&sched, &reg, &|| Box::new(StatefulDaemon::new()));
+        assert!(
+            !recovered.iter().any(|i| *i == active_index),
+            "active still skipped",
+        );
+        assert_eq!(
+            group.active_origin(),
+            active_origin_before,
+            "active origin preserved",
+        );
     }
 
     /// `spawn` (v1) is unchanged after the v2 surface lands.
