@@ -467,10 +467,10 @@ pub struct StoredEvent {
     /// Application-level idempotency key as written by the producer.
     /// Adapters carry an opaque dedup token on the wire (Redis Streams
     /// uses a `dedup_id` field; JetStream uses `Nats-Msg-Id`). The
-    /// trait-level consumer ([`Adapter::poll_shard`]) surfaces it here
-    /// so callers can drive their own dedup table without re-reading
-    /// the raw broker payload. `None` when the adapter or the wire
-    /// entry doesn't carry one.
+    /// trait-level consumer ([`crate::adapter::Adapter::poll_shard`])
+    /// surfaces it here so callers can drive their own dedup table
+    /// without re-reading the raw broker payload. `None` when the
+    /// adapter or the wire entry doesn't carry one.
     pub dedup_id: Option<String>,
 }
 

@@ -716,12 +716,13 @@ impl ShardManager {
         table.shards.iter().map(|s| s.lock().len() as u64).sum()
     }
 
-    /// Best-effort variant of [`total_pending_in_rings`] that never
-    /// blocks: every shard whose mutex is currently held is skipped
-    /// (counted as zero). Use this from `Drop` or any path that may
-    /// run on a thread already holding a shard lock (single-thread
-    /// runtime + panic during shutdown is the canonical hazard); the
-    /// blocking variant would self-deadlock there.
+    /// Best-effort variant of [`Self::total_pending_in_rings`] that
+    /// never blocks: every shard whose mutex is currently held is
+    /// skipped (counted as zero). Use this from `Drop` or any path
+    /// that may run on a thread already holding a shard lock
+    /// (single-thread runtime + panic during shutdown is the
+    /// canonical hazard); the blocking variant would self-deadlock
+    /// there.
     ///
     /// Returns `(sum_counted, uncounted_shard_count)` so the caller
     /// can log the uncertainty in the result.
