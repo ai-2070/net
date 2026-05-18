@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  s_aa8bb6e2c88c9e::t_c3a2a408fb4806 852-857,870-877
+  s_aa8bb6e2c88c9e::t_2a01de9b6b75f7 1500-1520
+  s_aa8bb6e2c88c9e::t_f611759f3b8b0a 1736-1742
+net/crates/net/src/adapter/net/compute/scheduler.rs
+  s_aa8bb6e2c88c9e::t_04809df11a73e0 163-175
+net/crates/net/src/adapter/net/compute/fork_group.rs
+  s_aa8bb6e2c88c9e::t_c18e0c58d1bb54 295-299
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "848ef03ceb8c78c967dcfe5d605f7e6f2af284c3",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
