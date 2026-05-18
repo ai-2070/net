@@ -38,6 +38,13 @@ struct SourceMigrationState {
     snapshot: Option<StateSnapshot>,
     /// Events buffered between snapshot and cutover, in sequence order.
     buffered_events: Vec<CausalEvent>,
+    /// Running byte total of `buffered_events.payload` sizes. Updated
+    /// on push / drain so `buffer_event`'s cap check is O(1).
+    /// Pre-fix the check recomputed the sum with `iter().map().sum()`
+    /// on every insert — O(N) per call, O(N²) over the lifetime of
+    /// a migration, which is exactly the shape the byte cap exists
+    /// to bound against (a wedged target plus a high-volume daemon).
+    buffered_bytes: usize,
     /// Last buffered event sequence number.
     last_buffered_seq: u64,
     started_at: Instant,
@@ -189,6 +196,7 @@ impl MigrationSourceHandler {
             phase: MigrationPhase::Snapshot,
             snapshot: Some(snapshot.clone()),
             buffered_events: Vec::new(),
+            buffered_bytes: 0,
             last_buffered_seq: snapshot.through_seq,
             started_at: Instant::now(),
         }));
@@ -234,21 +242,26 @@ impl MigrationSourceHandler {
                 // (MAX_BUFFERED_EVENTS) is post-encode and never
                 // sees this. Surface BufferFull so the orchestrator
                 // can abort cleanly rather than OOM the node.
+                //
+                // Running `buffered_bytes` counter keeps this O(1)
+                // per insert — mirrors the target's `pending_bytes`
+                // shape. Pre-fix this recomputed the sum on every
+                // call (O(N²) over the migration life), exactly
+                // matching the attack shape the byte cap exists to
+                // bound against.
                 let event_bytes = event.payload.len();
-                let used: usize = state
-                    .buffered_events
-                    .iter()
-                    .map(|e| e.payload.len())
-                    .sum();
                 if state.buffered_events.len() >= MAX_SOURCE_BUFFERED_EVENTS
-                    || used.saturating_add(event_bytes) > MAX_SOURCE_BUFFERED_BYTES
+                    || state.buffered_bytes.saturating_add(event_bytes)
+                        > MAX_SOURCE_BUFFERED_BYTES
                 {
                     return Err(MigrationError::BufferFull {
                         events: state.buffered_events.len(),
-                        bytes: used,
+                        bytes: state.buffered_bytes,
                     });
                 }
                 state.last_buffered_seq = event.link.sequence;
+                state.buffered_bytes =
+                    state.buffered_bytes.saturating_add(event_bytes);
                 state.buffered_events.push(event);
                 Ok(true)
             }
@@ -297,7 +310,10 @@ impl MigrationSourceHandler {
             MigrationPhase::Snapshot
             | MigrationPhase::Transfer
             | MigrationPhase::Restore
-            | MigrationPhase::Replay => Ok(std::mem::take(&mut state.buffered_events)),
+            | MigrationPhase::Replay => {
+                state.buffered_bytes = 0;
+                Ok(std::mem::take(&mut state.buffered_events))
+            }
             other => Err(MigrationError::WrongPhase {
                 expected: MigrationPhase::Replay,
                 got: other,
@@ -315,7 +331,8 @@ impl MigrationSourceHandler {
         let mut state = entry.lock();
         state.phase = MigrationPhase::Cutover;
 
-        // Return any remaining buffered events for final sync
+        // Return any remaining buffered events for final sync.
+        state.buffered_bytes = 0;
         Ok(std::mem::take(&mut state.buffered_events))
     }
 
