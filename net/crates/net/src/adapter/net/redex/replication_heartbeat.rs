@@ -129,7 +129,23 @@ impl HeartbeatTracker {
             },
         );
         if role == ReplicaRole::Leader {
-            self.believed_leader = Some(peer);
+            // Tiebreak: keep the lex-smallest NodeId among
+            // concurrent Leader claimants. Pre-fix every Leader
+            // heartbeat overwrote `believed_leader` unconditionally,
+            // so two peers each claiming Leader during a failover
+            // (or one malicious peer asserting Leader against a
+            // real leader's heartbeats) flipped the believed leader
+            // every tick. The tick()-driven SyncRequest then
+            // alternated between the two leaders, landing divergent
+            // chunks. Lex-smallest is deterministic and is the same
+            // tiebreak election uses.
+            match self.believed_leader {
+                None => self.believed_leader = Some(peer),
+                Some(existing) if peer < existing => {
+                    self.believed_leader = Some(peer);
+                }
+                Some(_) => {}
+            }
         }
     }
 
@@ -276,17 +292,32 @@ mod tests {
     }
 
     #[test]
-    fn most_recent_leader_role_heartbeat_wins() {
+    fn lex_smallest_leader_wins_tiebreak() {
         let base = t0();
         let mut t = HeartbeatTracker::new(500);
-        t.record_heartbeat(0x42, ReplicaRole::Leader, 100, base);
-        assert_eq!(t.believed_leader(), Some(0x42));
-        // Second peer claims leader role — replaces the believed
-        // leader. (In a real partition the two peers' heartbeats
-        // arrive at different witnesses; here we model the
-        // observation from one witness's perspective.)
-        t.record_heartbeat(0x43, ReplicaRole::Leader, 200, at(base, 100));
+        // First Leader heartbeat establishes believed_leader.
+        t.record_heartbeat(0x43, ReplicaRole::Leader, 200, base);
         assert_eq!(t.believed_leader(), Some(0x43));
+        // A second peer with a lex-smaller NodeId also claims
+        // Leader — believed_leader switches to the smaller id.
+        // Pre-fix this overwrote unconditionally; two peers
+        // alternating Leader claims flipped believed_leader every
+        // tick, making replica SyncRequests alternate between
+        // them and landing divergent chunks.
+        t.record_heartbeat(0x42, ReplicaRole::Leader, 100, at(base, 100));
+        assert_eq!(
+            t.believed_leader(),
+            Some(0x42),
+            "lex-smallest Leader claimant should win the tiebreak",
+        );
+        // A LATER Leader heartbeat from the now-loser does NOT
+        // re-flip the believed leader.
+        t.record_heartbeat(0x43, ReplicaRole::Leader, 300, at(base, 200));
+        assert_eq!(
+            t.believed_leader(),
+            Some(0x42),
+            "established lex-smallest leader must not be overwritten by a larger-id claimant",
+        );
     }
 
     #[test]

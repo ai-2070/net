@@ -458,7 +458,7 @@ impl SyncResponse {
         let mut events = Vec::with_capacity(event_count.min(4096));
         for _ in 0..event_count {
             if cursor.remaining() < 8 + 4 {
-                // R-23: report total bytes needed correctly —
+                // Report total bytes needed correctly —
                 // consumed-so-far + still-needed.
                 let consumed = data.len() - cursor.remaining();
                 return Err(WireError::Truncated {
@@ -470,8 +470,19 @@ impl SyncResponse {
             let payload_len = cursor.get_u32_le() as usize;
             if cursor.remaining() < payload_len {
                 let consumed = data.len() - cursor.remaining();
+                // checked_add — on 32-bit targets a u32 payload_len
+                // close to u32::MAX would overflow the plain `+`
+                // expression (consumed ≥ payload_len lower-bound
+                // doesn't shrink the danger window). Same fix shape
+                // as the umbrella's L-9 for BufferedEvents.
+                let need = consumed
+                    .checked_add(payload_len)
+                    .ok_or(WireError::Truncated {
+                        need: usize::MAX,
+                        have: data.len(),
+                    })?;
                 return Err(WireError::Truncated {
-                    need: consumed + payload_len,
+                    need,
                     have: data.len(),
                 });
             }

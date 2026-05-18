@@ -255,7 +255,11 @@ pub fn handle_sync_request(
             // the ceiling get rejected above.
             break;
         }
-        acc += cost;
+        // saturating_add matches the predicate above and the
+        // function's `acc.saturating_add(cost)` style. Plain `+=`
+        // diverged from the surrounding pattern; future reviewers
+        // copying the loop body would carry the unguarded version.
+        acc = acc.saturating_add(cost);
         out.push(SyncEvent {
             event_seq: ev.entry.seq,
             payload: ev.payload.to_vec(),

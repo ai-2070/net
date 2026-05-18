@@ -146,6 +146,21 @@ impl BandwidthBudget {
         false
     }
 
+    /// Return previously-consumed `bytes` to the bucket. Called
+    /// when a wire send fails after `try_consume` already deducted
+    /// the cost — otherwise repeated send failures over a flaky
+    /// link would drift the budget toward permanent backpressure
+    /// without shipping any traffic. Idempotent saturation: the
+    /// returned tokens never exceed `capacity_bytes`.
+    ///
+    /// `bytes == 0` is a no-op.
+    pub fn refund(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.available_bytes = (self.available_bytes + bytes as f64).min(self.capacity_bytes);
+    }
+
     /// Current available token count in bytes. Useful for
     /// observability — operators can graph "how much catch-up
     /// budget is unused?" to spot under-utilized links.

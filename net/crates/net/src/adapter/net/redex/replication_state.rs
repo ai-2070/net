@@ -56,6 +56,14 @@ pub enum TransitionSignal {
     /// Local disk pressure tripped `UnderCapacity::Withdraw`.
     /// Drives `Replica → Idle`.
     DiskPressureWithdraw,
+    /// Disk-pressure withdraw from `Leader`. Lets the transition
+    /// metric label this case as disk-pressure rather than the
+    /// `ChannelClose` fallback the FSM used pre-fix, which made
+    /// operator dashboards triage it as "graceful channel close."
+    LeaderDiskPressureWithdraw,
+    /// Disk-pressure withdraw from `Candidate`. Same labeling
+    /// rationale as `LeaderDiskPressureWithdraw`.
+    CandidateDiskPressureWithdraw,
     /// Channel was closed. Drives `* → Idle` from any state.
     ChannelClose,
 }
@@ -145,6 +153,14 @@ impl StateTransition {
                 ReplicaRole::Replica,
                 ReplicaRole::Idle,
                 TransitionSignal::DiskPressureWithdraw,
+            ) | (
+                ReplicaRole::Leader,
+                ReplicaRole::Idle,
+                TransitionSignal::LeaderDiskPressureWithdraw,
+            ) | (
+                ReplicaRole::Candidate,
+                ReplicaRole::Idle,
+                TransitionSignal::CandidateDiskPressureWithdraw,
             )
         );
         if !permitted {

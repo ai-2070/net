@@ -312,11 +312,14 @@ impl ReplicationRuntimeHandle {
                     let _ = h.await;
                 }
             }
+            // Only the holder of the JoinHandle flips `stopped`,
+            // and only after `.await` returns. Pre-fix, a concurrent
+            // cancel() racer that lost the `take()` skipped the if-let
+            // block and then unconditionally stored `true` — before
+            // the winner's await had completed. `is_stopped()` then
+            // reported "joined" while the task was still running.
+            self.stopped.store(true, AtomicOrdering::Release);
         }
-        // Flip the "joined" flag only after the await returns.
-        // Concurrent cancel() racers that lost the handle take():
-        // poll `stopped` until our await completes.
-        self.stopped.store(true, AtomicOrdering::Release);
     }
 
     /// Returns `true` if the runtime has stopped (task joined).
@@ -344,8 +347,18 @@ impl Drop for ReplicationRuntimeHandle {
     /// that need the announce/withdraw side-effects to land must
     /// still `cancel().await` before drop.
     fn drop(&mut self) {
-        if let Some(h) = self.task.lock().take() {
-            h.abort();
+        // try_lock — pre-fix this took the parking_lot mutex
+        // unconditionally; on a single-thread runtime panic during
+        // shutdown, drop could fire on a thread already holding
+        // self.task (e.g. mid-cancel() when the future is dropped on
+        // panic), producing a deadlock. The best-effort abort can
+        // wait for the next normal cleanup if we lose the lock race
+        // — losing it means somebody else is already inside cancel()
+        // or another drop, and they will abort/await the task.
+        if let Some(mut guard) = self.task.try_lock() {
+            if let Some(h) = guard.take() {
+                h.abort();
+            }
         }
     }
 }
@@ -515,8 +528,23 @@ async fn on_tick(
     dispatcher: &Arc<dyn ReplicationDispatcher>,
     tracker: &Arc<Mutex<HeartbeatTracker>>,
 ) {
-    let now = Instant::now();
+    // Source `now` from tokio's clock so the silence-detection
+    // pass inside the tracker tick honors tokio::time::pause() in
+    // tests and stays coherent with the tokio::time::interval that
+    // drives this on_tick call. Pre-fix std::Instant::now() kept
+    // moving while virtual time was paused.
+    let now = tokio::time::Instant::now().into_std();
     let tail_seq = (inputs.tail_provider)();
+    // Bump the coordinator's cached tail at every tick so the next
+    // transition's announce_chain advertises the real tip. The
+    // CAS-monotonic guard inside record_tail_seq drops the write if
+    // tail_provider went backward (it shouldn't — tail_provider
+    // wraps next_seq()), so this is also idempotent. Without this
+    // the leader path's tail_seq atomic stays at the value the
+    // last apply_sync_response recorded (which only Replicas run),
+    // and a leader's announce_chain at promotion time ships
+    // tip_seq=0.
+    coordinator.record_tail_seq(tail_seq);
     let wall_clock_ms = (inputs.wall_clock_provider)();
     // R-10: capture `current_role` inside the same critical
     // section that holds the tracker lock so a concurrent
@@ -673,9 +701,16 @@ async fn on_inbound(
                 );
                 return;
             }
-            tracker
-                .lock()
-                .record_heartbeat(from, msg.role, msg.tail_seq, Instant::now());
+            // Source from tokio's clock so silence detection works
+            // under tokio::time::pause() — std::Instant::now()
+            // wouldn't advance with virtual time and the tick-driven
+            // silence check would never fire deterministically.
+            tracker.lock().record_heartbeat(
+                from,
+                msg.role,
+                msg.tail_seq,
+                tokio::time::Instant::now().into_std(),
+            );
         }
         Inbound::SyncRequest { from, msg } => {
             // R-12: defense-in-depth — validate channel_id at the
@@ -713,7 +748,7 @@ async fn on_inbound(
                     // Backpressure so the replica backs off.
                     let admitted = {
                         let mut bb = budget.lock();
-                        bb.try_consume(byte_estimate, Instant::now())
+                        bb.try_consume(byte_estimate, tokio::time::Instant::now().into_std())
                     };
                     if !admitted {
                         let nack = SyncNack {
@@ -751,6 +786,18 @@ async fn on_inbound(
                     // would still have been read off disk).
                     coordinator.metrics().incr_sync_bytes(byte_estimate);
                     if let Err(e) = dispatcher.send_sync_response(from, resp).await {
+                        // Refund the budget — pre-fix repeated
+                        // send failures over a flaky link drained
+                        // the bucket toward permanent backpressure
+                        // without shipping any traffic. The cumul-
+                        // ative bytes metric stays incremented
+                        // (operators still see "we tried to send
+                        // these bytes") but the rate budget can
+                        // recover.
+                        {
+                            let mut bb = budget.lock();
+                            bb.refund(byte_estimate);
+                        }
                         tracing::trace!(from = from, error = ?e, "replication: SyncResponse send failed");
                     }
                 }
@@ -790,6 +837,14 @@ async fn on_inbound(
             }
             match apply_sync_response(&inputs.file, &msg, inputs.channel_id) {
                 Ok(new_tail) => {
+                    // Record the post-apply tail on the coordinator
+                    // so capability-tag advertisements ride
+                    // `tip_seq=new_tail` instead of the dead-default
+                    // 0. find_chain_holders picks the freshest
+                    // holder by tip_seq during failover; pre-fix
+                    // every Leader/Replica advertised tip_seq=0
+                    // and lex-smallest holder won selection.
+                    coordinator.record_tail_seq(new_tail);
                     tracing::trace!(
                         from = from,
                         new_tail = new_tail,
@@ -853,6 +908,7 @@ async fn on_inbound(
                             // tail matches first_seq.
                             match apply_sync_response(&inputs.file, &msg, inputs.channel_id) {
                                 Ok(new_tail) => {
+                                    coordinator.record_tail_seq(new_tail);
                                     tracing::trace!(
                                         from = from,
                                         new_tail = new_tail,
@@ -1040,11 +1096,15 @@ async fn handle_disk_pressure(
                     // counters twice on a benign race.
                     super::replication_state::TransitionSignal::ChannelClose
                 }
-                ReplicaRole::Leader | ReplicaRole::Candidate => {
-                    // Disk pressure observed from a non-Replica
-                    // role — withdraw via ChannelClose, the only
-                    // signal valid from any state.
-                    super::replication_state::TransitionSignal::ChannelClose
+                ReplicaRole::Leader => {
+                    // Role-specific signal so the transition metric
+                    // labels this as disk-pressure withdraw instead
+                    // of the ChannelClose fallback (which operator
+                    // dashboards triage as "graceful channel close").
+                    super::replication_state::TransitionSignal::LeaderDiskPressureWithdraw
+                }
+                ReplicaRole::Candidate => {
+                    super::replication_state::TransitionSignal::CandidateDiskPressureWithdraw
                 }
             };
             if let Err(e) = coordinator.transition_to(ReplicaRole::Idle, signal).await {
