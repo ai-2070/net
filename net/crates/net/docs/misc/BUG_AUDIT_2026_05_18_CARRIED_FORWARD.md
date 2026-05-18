@@ -24,13 +24,18 @@ The replication subprotocol is the highest-leverage surface in this batch — **
 | Severity | Count | Top items |
 |---|---|---|
 | Critical | 3 | R-20, R-21, X-1 |
-| High | 12 | A-5, R-22, R-23, R-24, R-25, X-2, X-3, X-9, D-1, D-2, D-11, D-14 |
-| Medium | 23 | (see body) |
+| High | 13 | A-5, R-22, R-23, R-24, R-25, X-2, X-3, X-9, X-18, D-1, D-2, D-11, D-14 |
+| Medium | 25 | (see body) |
 | Low | 35 | (counts only at the end) |
+| Latent | 1 | MD-3 |
 | Null | 1 module | `netdb/` clean |
 
 Third pass added 1 H (D-14) + 4 M (D-15, D-16, R-35, X-13) + 8 L
 (R-36..R-39, X-14..X-17) — see "Third-pass additions" section.
+
+Fourth pass added 1 H (X-18) + 2 M (O-20, MD-1) + 1 L (MD-2) + 1 latent
+(MD-3) — see "Fourth-pass additions" section. `behavior/meshdb/` was
+newly in-scope for the fourth pass; the MD-* prefix names that module.
 
 ## Second-pass note (2026-05-18, later same day)
 
@@ -56,6 +61,40 @@ from the same source lines — confirmation signals, not duplicates.
 The new findings are listed in the "Third-pass additions" section
 below rather than threaded through the existing severity buckets
 so the prior numbering stays stable.
+
+## Fourth-pass note (2026-05-18 late evening)
+
+A fourth parallel-agent pass expanded scope to include
+`behavior/meshdb/` (newly in-scope as part of the carried-forward
+batch) alongside the original four modules, and surfaced 4 new
+findings plus 1 latent design issue: **X-18, O-20, MD-1, MD-2, MD-3**.
+The pass independently re-derived **D-2** (32-bit `usize` truncation
+in `MeshBlobAdapter::fetch_range`) from the same source lines —
+confirmation signal, not a new finding.
+
+Three agent-rated "highs" the pass produced were verified false
+positives against the actual code and not added:
+
+- "Replication leader concession race" at `replication_runtime.rs:730-753`
+  — the role re-check at `:736` already exists exactly as the agent
+  recommended, with no `.await` between the check and `send_sync_response`.
+- "Deferred-heap `pop().expect()` panic" at `meshos/executor.rs:366`
+  — `tokio::select!` is single-task and `self.deferred` is `&mut self`-
+  owned, so the heap cannot mutate between `peek` (line 358) and `pop`.
+- "Snapshot publish torn read of executor failure ring" at
+  `meshos/event_loop.rs:1379` — the read goes through a `RwLock`,
+  which prevents torn reads; the worst-case is a fresh failure landing
+  after the snapshot's clone and surfacing in the next snapshot.
+
+The fourth pass also surfaced four low-severity migration edges
+(`replayed_through` saturating-deadlock at `migration_target.rs:452`;
+`start_snapshot` single-flight gap between `contains_key` and the
+`entry()` insert; orphan `orchestrator_node` ref after failed pre-
+complete; `completed`-record TTL gap after failed source cleanup).
+Each requires exceptional preconditions (u64::MAX-events, very narrow
+race windows, or compound failures); they're listed under "Fourth-pass
+edges (not promoted)" rather than threaded into the main severity
+buckets.
 
 ---
 
@@ -389,6 +428,63 @@ per-module sequences (D-13 → D-14, R-34 → R-35, X-12 → X-13).
 
 ---
 
+## Fourth-pass additions
+
+Findings from the 2026-05-18 late-evening pass. Adds the `MD-*` prefix
+for `behavior/meshdb/` (newly in-scope). ID numbering continues the
+existing per-module sequences (X-17 → X-18, O-19 → O-20).
+
+### High
+
+#### X-18 — Migration dispatch arms accept arbitrary `from_node`; any peer forces cutover / abort
+- **File:** `src/adapter/net/subprotocol/migration_handler.rs:600-642` (`CleanupComplete`, `ActivateTarget`); `:654-690` (`MigrationFailed`); `:558-598` (`SnapshotReady`); `src/adapter/net/compute/migration_target.rs:295-306` (`activate`).
+- **What:** The subprotocol's `ActivateTarget` arm invokes `target_handler.activate(daemon_origin)` without comparing the inbound `from_node` against the migration's recorded `orchestrator_node`. The recorded orchestrator is consulted only when routing the *ack reply* (`:626-629`); it is not used to gate entry. The companion arms `CleanupComplete`, `MigrationFailed`, and `SnapshotReady` likewise dispatch state-mutating handler calls without binding `from_node` to the recorded orchestrator. Only the `TakeSnapshot` arm records the orchestrator (`start_snapshot(..., from_node)` at `:312`).
+- **Trigger / Attack:** Any peer with subprotocol-0x0500 reach ships `MigrationMessage::ActivateTarget{daemon_origin}` for a migration that is mid-Replay. The target flips to `Cutover` and goes live while the source still believes it owns the daemon → both nodes accept writes to the same origin → divergent chain heads. Same shape as **X-1** (StandbyGroup fencing) but driven by a single wire message rather than a partition heal. Symmetric variants: a forged `MigrationFailed` from any peer drives source rollback after legitimate cutover; a forged `CleanupComplete` makes the orchestrator emit `ActivateTarget` to a target that hasn't fully restored.
+- **Same shape as R-20:** R-20 is "no replica-set membership check on replication-subprotocol inbound." X-18 is the migration-subprotocol equivalent. The umbrella's A-1..A-3 capability fixes landed on the publish path; neither subprotocol was in their scope.
+- **Fix sketch:** In `dispatch()` for every state-mutating arm (`ActivateTarget`, `CleanupComplete`, `MigrationFailed`, `SnapshotReady`), look up the recorded `orchestrator_node(daemon_origin)`; reject with `MigrationError::WrongPeer` if it's `Some(n) && n != from_node`. The source-side `TakeSnapshot` arm already establishes the binding at `:312`; the symmetric check on later arms enforces "only the recorded orchestrator drives this migration forward." Add a regression test covering forged `ActivateTarget` from a non-orchestrator peer.
+
+### Medium
+
+#### O-20 — `admin_audit_seq` / `log_seq` plain-`+= 1`; wrap collides SDK dedup keys
+- **File:** `src/adapter/net/behavior/meshos/event_loop.rs:1078` (`admin_audit_seq`), `:1112` (`log_seq`).
+- **What:** Per-runtime monotonic sequence counters are `u64` fields incremented with `self.admin_audit_seq += 1` / `self.log_seq += 1`. On overflow they wrap to 0. The SDK dedup gate is keyed on `(seq, runtime_epoch_id)` — a wrapped `seq=1` collides with the ancient record at `seq=1`, and the dedup gate silently drops the new audit/log record.
+- **Impact:** Astronomical in practice (2^64 events ≈ centuries even at 10⁹/s) but the cost-to-fix is trivial and saturating preserves monotonicity rather than producing a key collision. Sibling counters in the same module already use `saturating_add` (compare maintenance loop, snapshot publisher).
+- **Fix sketch:** `self.admin_audit_seq = self.admin_audit_seq.saturating_add(1)` (and same for `log_seq`).
+
+#### MD-1 — Federated `drain_rows` unbounded; remote-peer aggregate response OOMs aggregator
+- **File:** `src/adapter/net/behavior/meshdb/federated.rs:732` (`execute_aggregate_numeric_federated`), `:952` (`drain_rows` helper).
+- **What:** `drain_rows()` collects all rows from a remote `ResultStream` into `Vec<ResultRow>` with no memory budget. Hash join paths *do* pre-check against `HASH_JOIN_MEMORY_BYTES` (256 MiB); federated aggregate and window operators drain the inner stream unbounded into a `BTreeMap<GroupKey, ...>` for grouped processing.
+- **Trigger:** Remote peer (or a misconfigured federation target) executes `Aggregate { inner: Between(...wide_seq_range) }` and returns millions of rows; the aggregating node drains them all before producing the grouped output. OOM lands on the aggregator, not the peer that returned the rows.
+- **Fix sketch:** Add `AGGREGATE_MAX_BYTES` (analog to `HASH_JOIN_MEMORY_BYTES`); accumulate bytes during `drain_rows` and return `MeshError::QueryBudgetExceeded` once the budget is hit. The planner's `total_cost.bandwidth_bytes` estimate can drive a pre-flight check; the runtime accumulator catches a misestimate.
+
+### Low
+
+#### MD-2 — `WindowSpec::TumblingSeq` saturates near `u64::MAX`; collides bucket boundaries
+- **File:** `src/adapter/net/behavior/meshdb/executor.rs:874-875`
+- **What:** Window bucketing computes `start = bucket.saturating_mul(size); end = start.saturating_add(size)`. Two adjacent buckets near `u64::MAX` both saturate to `end = u64::MAX`, producing indistinguishable `WindowBoundary` envelopes — breaks downstream `OrderBy` / cache-key disambiguation that treat boundary tuples as unique.
+- **Impact:** Centuries-away seq-counter precondition; not exploitable today. Listed for cheap pre-emption.
+- **Fix sketch:** At plan time, reject `WindowSpec::TumblingSeq{size}` where `size > u64::MAX / 2` (alongside the existing `size == 0` check at `:857`).
+
+### Latent
+
+#### MD-3 — `ContinuationToken` opaque-but-unsigned; future cross-peer forgery on `Resume`
+- **File:** `src/adapter/net/behavior/meshdb/protocol.rs:57` (`pub struct ContinuationToken(pub Vec<u8>)`); current handler at `src/adapter/net/behavior/meshdb/federated.rs:1152` returns `"Resume not yet implemented in LoopbackTransport (Phase B-4+)"`.
+- **What:** The token is an unsigned `Vec<u8>` carried verbatim through `MeshDbRequest::Resume`. When Phase B-4 wires real Resume handling, any peer that can address `SUBPROTOCOL_MESHDB` to a federated server can forge a token claiming arbitrary executor-private resumption state — e.g. "skip the row-level capability filter," "resume against a different tenant's cursor," or "jump past pagination." The opaque-bytes design has no peer-binding nonce or HMAC.
+- **Impact:** Not exploitable today (Resume errors out before reaching state-mutating code). Flagged here so the design issue is closed during Phase B-4 rather than after.
+- **Fix sketch:** Mint tokens as `serialize({peer_id, call_id, executor_state}) || HMAC(server_key, payload)`. On `Resume`, verify the HMAC and reject if `peer_id != from_node` or `call_id` is not in the executor's known-call set.
+
+### Fourth-pass edges (not promoted)
+
+Each requires exceptional preconditions; listed for completeness rather
+than threaded into the main severity buckets.
+
+- **`replayed_through.saturating_add(1)` deadlock at `migration_target.rs:452`** — at `u64::MAX` events `replayed_through` saturates and `drain_pending` never advances; further events sit in `pending_events` forever. Same astronomical precondition as **O-20**; reject further buffering with a typed `SequenceOverflow` when `replayed_through == u64::MAX`.
+- **`MigrationSourceHandler::start_snapshot` single-flight CAS gap at `migration_source.rs:121-170`** — `contains_key` check followed by `entry()` insert can let two concurrent callers both reach `daemon_registry.snapshot()`. The umbrella's docs claim duplicate snapshot work is acceptable, but if a future `snapshot()` impl has non-idempotent side-effects (counter bumps, deferred I/O) both fire. Rely entirely on `snapshots_in_progress` CAS and remove the separate `contains_key` check.
+- **Orphan `orchestrator_node` ref on pre-complete abort (`migration_target.rs:27`)** — if a migration aborts after the orchestrator-to-both link severs but the source-target link survives, the orchestrator never learns the failure. No outbound message-routing exists on the handler today; either add it or document the limitation.
+- **`completed`-record orphan on failed source cleanup (`migration_target.rs:337-371`)** — if the orchestrator gives up after a transient source-cleanup failure, the target's `completed` index keeps the entry indefinitely. A later legitimate re-migration of the same daemon shadows under the stale completion. Either gate `forget_completed()` on successful source cleanup, or age-evict `completed` entries.
+
+---
+
 
 
 `src/adapter/net/netdb/{db.rs, error.rs, mod.rs}` (399 LOC) is a thin builder + façade. All query/predicate/filter logic lives in `cortex::tasks` / `cortex::memories` (covered in `PHASE3_CORTEX_RPC_DROP.md`). No query expression is parsed, evaluated, or locked inside `netdb/`.
@@ -425,7 +521,7 @@ The four `.expect()`/`unwrap_or` sites in `db.rs` are documented or trivially sa
 
 0. **A-5** (capability strip vs. forward order) — regression in the currently-staged L-13 fix on `bugfixes-15`. Block the commit until the strip moves below the forward block and a multi-hop signed-propagation regression test exists. Cheap fix; expensive miss.
 1. **R-20** (peer auth) + **R-21** (dual-leader FSM) — the replication subprotocol can be hijacked or wedged by any mesh peer. Wire-protocol change; do them together with a single coordinated rollout.
-2. **X-1** (StandbyGroup fencing) — same class of bug as R-21 in a different layer. The fix (epoch/generation token) is a primitive both can share.
+2. **X-1** (StandbyGroup fencing) + **X-18** (migration-subprotocol peer auth) — same class of bug as R-20/R-21 in two different layers. X-18 is the migration-subprotocol analogue of R-20; the orchestrator-binding check is mechanical (record at `TakeSnapshot`, verify on every later arm) and lands in `subprotocol/migration_handler.rs`. X-1's fix (epoch / generation token) is a primitive R-21 and X-18 can both share.
 3. **R-22, R-23, R-24** (replication durability + NACK trust + partial-append accounting) — bundle with the R-20/R-21 wire change.
 4. **X-9** (`pending_events` unbounded) — wire-reachable OOM on every node accepting migration traffic; ~10-line fix.
 5. **D-11** (`BlobRef::Manifest` chunk-size validation) — wire-reachable slice panic on untrusted input; mechanical fix in the decoder plus a defensive `get(..)` in the consumer.
@@ -443,10 +539,13 @@ The four `.expect()`/`unwrap_or` sites in `db.rs` are documented or trivially sa
 16. **R-26, R-27** (dead tip_seq, budget refund) and the remaining lows can batch into a single cleanup commit. Fold **R-33** (replication wire 32-bit add) into the same commit as the umbrella's L-9 fix; **R-34** (catchup saturating-add symmetry) lands alongside.
 17. **Third-pass mediums** — **D-15** (GC segment-file unlink), **D-16** (Small `fetch_range` whole-chunk alloc), **R-35** (wall-clock `Instant` in tokio-tick'd loop, same M-4 anti-pattern), **X-13** (failed placements never retried on different-node recovery). Each is independent of the wire-protocol changes above and can land out of order.
 18. **Third-pass lows** — **R-36..R-39** (is_stopped race, Drop mutex, Leader disk-pressure signal label, believed_leader tiebreak), **X-14..X-17** (`scale_to` guard, dead `target_head`, scheduler vs `PlacementFilter`, multi-chunk validation asymmetry). Batch into the same cleanup commit as the other lows.
+19. **Fourth-pass mediums** — **MD-1** (federated `drain_rows` unbounded → aggregator OOM) + **O-20** (sequence-counter saturating-add). Each is an isolated change. MD-1 is the user-visible one (peer-controllable response can OOM the local aggregator); add a planner-driven byte budget. O-20 is a two-line trivial saturating swap matching sibling counters.
+20. **Fourth-pass lows + latent** — **MD-2** (window saturating-add near `u64::MAX`) and the four edges under "Fourth-pass edges (not promoted)" batch into a single defensive commit. **MD-3** (unsigned `ContinuationToken`) is a design issue to fix *during* Phase B-4 implementation rather than after; reference this entry from the Phase B-4 plan.
 
 ## Coverage gaps still carried forward
 
 - **Phase 2** (Miri / ASan / TSan / fuzz) — still skipped; existing `fuzz/fuzz_targets/` is wired.
 - **Cross-language conformance (Phase 4)** — Rust/TS/Py/Go SDK round-trip property tests not started.
 - **Dep audit** — `cargo-audit` / `cargo-machete` / `cargo-deny` / `cargo-udeps` not installed.
-- **Adjacent surfaces not reviewed this round:** `src/adapter/net/contested/`, `src/adapter/net/continuity/`, `src/adapter/net/cortex/` (re-review post-fixes), `src/adapter/net/identity/`, `src/adapter/net/subnet/`, `src/adapter/net/subprotocol/`, `src/adapter/net/state/`, `src/adapter/net/traversal/`. Each is a candidate for a follow-up.
+- **Adjacent surfaces not reviewed this round:** `src/adapter/net/contested/`, `src/adapter/net/continuity/`, `src/adapter/net/cortex/` (re-review post-fixes), `src/adapter/net/identity/`, `src/adapter/net/subnet/`, `src/adapter/net/state/`, `src/adapter/net/traversal/`. Each is a candidate for a follow-up. `src/adapter/net/subprotocol/` was partially covered by X-18 (migration handler) but the other subprotocol handlers (`redex_handler`, `capability_handler`, `meshdb_handler`, etc.) were not audited for the same "no `from_node` binding" class of issue R-20 + X-18 both share. **Recommend a targeted sweep:** for every subprotocol arm that mutates state, verify `from_node` is bound to a recorded principal before the mutation.
+- **`src/adapter/net/behavior/meshdb/`** is now partially covered (MD-1, MD-2, MD-3). The planner / federated executor / cache layer received targeted reads; full module sweep — including `executor.rs` plan execution, `transport.rs` framing, `row.rs` predicate walking, and the `query.rs` request/response surface — is still owed.
