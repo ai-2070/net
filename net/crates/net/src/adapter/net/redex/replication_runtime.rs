@@ -371,6 +371,90 @@ impl ReplicationRuntimeHandle {
     }
 }
 
+/// Per-leader catchup state — tracks consecutive empty SyncResponses
+/// in the face of an advertised tail gap. A buggy or byzantine
+/// leader that advertises ever-increasing `tail_seq` but ships
+/// `Response{events: []}` would otherwise loop the replica at
+/// heartbeat cadence forever; the backoff suppresses outbound
+/// SyncRequests once the threshold is crossed, with exponential
+/// growth capped at [`CATCHUP_BACKOFF_CAP`]. A non-empty response
+/// resets the counter so a transient stall doesn't permanently
+/// pause catchup.
+#[derive(Debug, Default)]
+pub struct CatchupBackoff {
+    entries: std::collections::HashMap<NodeId, BackoffEntry>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct BackoffEntry {
+    /// Consecutive `apply_sync_response` calls that returned the
+    /// same tail (no events applied) while the believed leader's
+    /// advertised `tail_seq` was still strictly greater than ours.
+    consecutive_empty: u32,
+    /// Wall-clock instant the backoff window ends. `None` while
+    /// the counter is below `CATCHUP_BACKOFF_THRESHOLD`.
+    backoff_until: Option<Instant>,
+}
+
+/// Strikes before backoff kicks in. The first 3 empty responses
+/// are absorbed without delay so a transient leader-retention edge
+/// doesn't trigger a backoff.
+pub const CATCHUP_BACKOFF_THRESHOLD: u32 = 3;
+
+/// First backoff window after the threshold is crossed.
+pub const CATCHUP_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+
+/// Upper bound on the exponential backoff. A wedged leader stays
+/// reachable for re-evaluation at least every cap.
+pub const CATCHUP_BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+impl CatchupBackoff {
+    /// Construct an empty backoff tracker.
+    pub fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record an empty `SyncResponse` from `leader` (events vec was
+    /// empty or apply returned the same tail). Increments the
+    /// consecutive counter; once past `CATCHUP_BACKOFF_THRESHOLD`,
+    /// stamps `backoff_until = now + min(initial << k, cap)` where
+    /// `k = consecutive_empty - threshold - 1`.
+    pub fn record_empty(&mut self, leader: NodeId, now: Instant) {
+        let entry = self.entries.entry(leader).or_default();
+        entry.consecutive_empty = entry.consecutive_empty.saturating_add(1);
+        if entry.consecutive_empty > CATCHUP_BACKOFF_THRESHOLD {
+            let shift = entry
+                .consecutive_empty
+                .saturating_sub(CATCHUP_BACKOFF_THRESHOLD + 1)
+                .min(20);
+            let multiplier: u32 = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+            let backoff = CATCHUP_BACKOFF_INITIAL
+                .saturating_mul(multiplier)
+                .min(CATCHUP_BACKOFF_CAP);
+            entry.backoff_until = Some(now + backoff);
+        }
+    }
+
+    /// Record a productive response (events applied, tail advanced)
+    /// from `leader`. Clears any backoff state so the next request
+    /// can fire immediately.
+    pub fn record_progress(&mut self, leader: NodeId) {
+        self.entries.remove(&leader);
+    }
+
+    /// True when `now` is strictly before the recorded
+    /// `backoff_until` for `leader`. Out-of-backoff leaders (no
+    /// entry, or entry below threshold) always return `false`.
+    pub fn is_in_backoff(&self, leader: NodeId, now: Instant) -> bool {
+        self.entries
+            .get(&leader)
+            .and_then(|e| e.backoff_until)
+            .is_some_and(|until| now < until)
+    }
+}
+
 impl Drop for ReplicationRuntimeHandle {
     /// Best-effort cleanup if a handle is dropped without an
     /// explicit `cancel().await`. Aborts the task synchronously so
@@ -448,6 +532,7 @@ pub fn spawn_replication_runtime(
     budget: Arc<Mutex<BandwidthBudget>>,
 ) -> ReplicationRuntimeHandle {
     let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(inputs.heartbeat_ms)));
+    let backoff = Arc::new(Mutex::new(CatchupBackoff::new()));
     let (tx, rx) = mpsc::channel::<Inbound>(RUNTIME_INBOX_CAPACITY);
     let (priority_tx, priority_rx) =
         mpsc::channel::<Inbound>(RUNTIME_PRIORITY_INBOX_CAPACITY);
@@ -458,6 +543,7 @@ pub fn spawn_replication_runtime(
         dispatcher,
         tracker,
         budget,
+        backoff,
         rx,
         priority_rx,
     ));
@@ -476,6 +562,7 @@ async fn run(
     dispatcher: Arc<dyn ReplicationDispatcher>,
     tracker: Arc<Mutex<HeartbeatTracker>>,
     budget: Arc<Mutex<BandwidthBudget>>,
+    backoff: Arc<Mutex<CatchupBackoff>>,
     mut inbox: mpsc::Receiver<Inbound>,
     mut priority_inbox: mpsc::Receiver<Inbound>,
 ) {
@@ -511,12 +598,12 @@ async fn run(
                         return;
                     }
                     Some(event) => {
-                        on_inbound(&inputs, &coordinator, &dispatcher, &tracker, &budget, event).await;
+                        on_inbound(&inputs, &coordinator, &dispatcher, &tracker, &budget, &backoff, event).await;
                     }
                 }
             }
             _ = interval.tick() => {
-                on_tick(&inputs, &coordinator, &dispatcher, &tracker).await;
+                on_tick(&inputs, &coordinator, &dispatcher, &tracker, &backoff).await;
             }
             event = inbox.recv() => {
                 match event {
@@ -534,7 +621,7 @@ async fn run(
                         return;
                     }
                     Some(event) => {
-                        on_inbound(&inputs, &coordinator, &dispatcher, &tracker, &budget, event).await;
+                        on_inbound(&inputs, &coordinator, &dispatcher, &tracker, &budget, &backoff, event).await;
                     }
                 }
             }
@@ -601,6 +688,7 @@ async fn on_tick(
     coordinator: &Arc<ReplicationCoordinator>,
     dispatcher: &Arc<dyn ReplicationDispatcher>,
     tracker: &Arc<Mutex<HeartbeatTracker>>,
+    backoff: &Arc<Mutex<CatchupBackoff>>,
 ) {
     // Source `now` from tokio's clock so the silence-detection
     // pass inside the tracker tick honors tokio::time::pause() in
@@ -670,6 +758,22 @@ async fn on_tick(
                 }
             }
             OutboundMessage::SyncRequest { target, msg } => {
+                // R-28 catchup backoff: a buggy/byzantine leader that
+                // advertises an ever-growing tail but ships empty
+                // responses would otherwise loop this branch at the
+                // heartbeat cadence forever. Once the empty-response
+                // count crosses `CATCHUP_BACKOFF_THRESHOLD` (3), the
+                // tracker stamps `backoff_until`; ticks within that
+                // window skip the send entirely. A non-empty response
+                // resets the counter through `record_progress` on the
+                // apply path.
+                if backoff.lock().is_in_backoff(target, now) {
+                    tracing::trace!(
+                        target = target,
+                        "replication: skipping SyncRequest — leader is in catchup backoff"
+                    );
+                    continue;
+                }
                 if let Err(e) = dispatcher.send_sync_request(target, msg).await {
                     tracing::trace!(target=?target, error=?e, "replication: sync_request send failed");
                 }
@@ -756,6 +860,7 @@ async fn on_inbound(
     dispatcher: &Arc<dyn ReplicationDispatcher>,
     tracker: &Arc<Mutex<HeartbeatTracker>>,
     budget: &Arc<Mutex<BandwidthBudget>>,
+    backoff: &Arc<Mutex<CatchupBackoff>>,
     event: Inbound,
 ) {
     // Peer-auth gate. Every inbound replication message must come
@@ -994,6 +1099,12 @@ async fn on_inbound(
                 );
                 return;
             }
+            // Snapshot the pre-apply tail so the post-apply
+            // result can be classified as "empty" (apply returned
+            // the same tail, no events landed) vs "progress"
+            // (tail advanced). Drives the R-28 catchup-backoff
+            // accounting below.
+            let pre_apply_tail = inputs.file.next_seq();
             match apply_sync_response(&inputs.file, &msg, inputs.channel_id) {
                 Ok(new_tail) => {
                     // Record the post-apply tail on the coordinator
@@ -1004,6 +1115,30 @@ async fn on_inbound(
                     // every Leader/Replica advertised tip_seq=0
                     // and lex-smallest holder won selection.
                     coordinator.record_tail_seq(new_tail);
+                    // R-28 catchup-backoff accounting. If the
+                    // response advanced our tail, the leader is
+                    // making progress — clear any backoff state so
+                    // the next tick can issue another SyncRequest
+                    // immediately. If the response was empty
+                    // (apply returned the same tail) while the
+                    // leader's advertised tail is still strictly
+                    // greater than ours, record an empty strike.
+                    // After `CATCHUP_BACKOFF_THRESHOLD` consecutive
+                    // empties, the tracker stamps a backoff window
+                    // that the outbound dispatch consults.
+                    if new_tail > pre_apply_tail {
+                        backoff.lock().record_progress(from);
+                    } else {
+                        let leader_tail = tracker
+                            .lock()
+                            .peer_state(from)
+                            .map(|p| p.tail_seq)
+                            .unwrap_or(0);
+                        if leader_tail > new_tail {
+                            let now = tokio::time::Instant::now().into_std();
+                            backoff.lock().record_empty(from, now);
+                        }
+                    }
                     tracing::trace!(
                         from = from,
                         new_tail = new_tail,
@@ -1440,6 +1575,10 @@ mod tests {
         Arc::new(Mutex::new(BandwidthBudget::new(0.5, 10_000_000, now)))
     }
 
+    fn build_backoff() -> Arc<Mutex<CatchupBackoff>> {
+        Arc::new(Mutex::new(CatchupBackoff::new()))
+    }
+
     #[tokio::test]
     async fn leader_emits_heartbeat_to_peers_each_tick() {
         let inputs = build_inputs(0x10, vec![0x10, 0x20, 0x30], 100);
@@ -1572,6 +1711,7 @@ mod tests {
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
             &tracker,
             &budget,
+            &build_backoff(),
             Inbound::Heartbeat {
                 from: 0x20,
                 msg: SyncHeartbeat {
@@ -1629,6 +1769,7 @@ mod tests {
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
             &tracker,
             &budget,
+            &build_backoff(),
             Inbound::Heartbeat {
                 from: 0x20,
                 msg: SyncHeartbeat {
@@ -1817,6 +1958,36 @@ mod tests {
         assert!(handle.is_stopped());
         // Final state must be Idle (ChannelClose transition).
         assert_eq!(coordinator.role(), ReplicaRole::Idle);
+    }
+
+    /// R-28 unit test: the backoff structure records empties up to
+    /// the threshold without setting a backoff window, then stamps
+    /// an exponentially-growing window once the threshold is
+    /// crossed. A non-empty response resets the entry.
+    #[test]
+    fn catchup_backoff_threshold_and_reset() {
+        let now = Instant::now();
+        let mut b = CatchupBackoff::new();
+        // Up to the threshold: no backoff yet.
+        for _ in 0..CATCHUP_BACKOFF_THRESHOLD {
+            b.record_empty(0x20, now);
+        }
+        assert!(
+            !b.is_in_backoff(0x20, now),
+            "backoff must not engage before the threshold is crossed"
+        );
+        // Crossing the threshold sets a backoff window.
+        b.record_empty(0x20, now);
+        assert!(
+            b.is_in_backoff(0x20, now),
+            "backoff must engage once the empty count crosses the threshold"
+        );
+        // A productive response clears the entry.
+        b.record_progress(0x20);
+        assert!(
+            !b.is_in_backoff(0x20, now),
+            "record_progress must clear the backoff window"
+        );
     }
 
     /// R-25 regression: a saturated low-priority lane (Heartbeat
@@ -2429,6 +2600,7 @@ mod tests {
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
             &Arc::new(Mutex::new(HeartbeatTracker::new(100))),
             &budget,
+            &build_backoff(),
             event,
         )
         .await;
@@ -2488,6 +2660,7 @@ mod tests {
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
             &Arc::new(Mutex::new(HeartbeatTracker::new(100))),
             &budget,
+            &build_backoff(),
             event,
         )
         .await;
@@ -2541,6 +2714,7 @@ mod tests {
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
             &tracker,
             &budget,
+            &build_backoff(),
             event,
         )
         .await;
@@ -2568,6 +2742,7 @@ mod tests {
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
             &tracker,
             &budget,
+            &build_backoff(),
             event,
         )
         .await;
@@ -2618,6 +2793,7 @@ mod tests {
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
             &tracker,
             &budget,
+            &build_backoff(),
             event,
         )
         .await;
@@ -2693,6 +2869,7 @@ mod tests {
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
             &tracker,
             &budget,
+            &build_backoff(),
             event,
         )
         .await;
@@ -2747,6 +2924,7 @@ mod tests {
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
             &tracker,
             &budget,
+            &build_backoff(),
             event,
         )
         .await;

@@ -258,11 +258,11 @@ missed despite covering `meshos/executor.rs` directly.
 - **Impact:** Slow socket → repeated send failures → budget consumed but no traffic shipped → leader nacks subsequent requests with Backpressure even on an idle wire.
 - **Fix sketch:** Refund the budget on send failure, or move `try_consume` after a successful send. Same applies to the heartbeat path (which isn't budgeted at all — separate sub-finding).
 
-### R-28 — Catchup busy-loops if leader heartbeats advertise tail past actual log
+### R-28 — Catchup busy-loops if leader heartbeats advertise tail past actual log — **Landed**
 - **File:** `src/adapter/net/redex/replication_step.rs:227-251`
 - **What:** Each tick emits one `SyncRequest` if `peer.tail_seq > local_tail`. A buggy/byzantine leader that emits ever-increasing `tail_seq` but ships `Response{events: []}` (empty because `since_seq >= local_next` on leader) makes the replica spam-request every tick forever. No backoff, no max-attempts.
 - **Trigger:** Buggy leader reports `tail_seq=999_999` but file has no such entries. Replica busy-loops at heartbeat cadence (100 ms). Combined with R-25, saturates the leader's inbox.
-- **Fix sketch:** Track per-leader "consecutive empty responses with advertised gap" counter; back off exponentially after 3 empty replies despite advertised lag.
+- **Fix:** Added `CatchupBackoff` struct (per-leader `consecutive_empty` counter + `backoff_until: Option<Instant>`) and threaded `Arc<Mutex<CatchupBackoff>>` through `spawn_replication_runtime` → `run` → `on_tick` / `on_inbound`. The `SyncResponse` apply arm snapshots the pre-apply tail; if the apply advanced the tail, `record_progress(from)` clears any backoff entry. If the apply did not advance the tail while the believed leader's `tail_seq > new_tail`, `record_empty(from, now)` increments the counter. Once `CATCHUP_BACKOFF_THRESHOLD` (3) is crossed, the entry stamps `backoff_until = now + min(1s << k, 30s)` where `k = consecutive_empty - threshold - 1`. The outbound dispatch loop in `on_tick` consults `is_in_backoff(target, now)` before each `SyncRequest` send and skips with a trace log. Unit test `catchup_backoff_threshold_and_reset` covers threshold + reset; the wire path is exercised by the existing replication-runtime test suite.
 
 ### R-31 — Replication coordinator: state advances before async sink completes on `* → Idle`
 - **File:** `src/adapter/net/redex/replication_coordinator.rs:370-385` (sync state flip) and `:414-423` (async `withdraw_chain` / `announce_chain`).
