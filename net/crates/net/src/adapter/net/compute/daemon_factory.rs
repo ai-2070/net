@@ -41,6 +41,20 @@ pub struct FactoryEntry {
     pub keypair: Option<EntityKeypair>,
     /// Host configuration to apply to the restored daemon.
     pub config: DaemonHostConfig,
+    /// Optional orchestrator-node binding for the daemon. When
+    /// `Some(node)`, the subprotocol handler rejects any
+    /// `SnapshotReady` for this origin whose `from_node` is not
+    /// `node` AND for which neither orchestrator-side nor target-
+    /// side state already records a principal. Without this
+    /// binding, the first `SnapshotReady` for a not-yet-known
+    /// daemon_origin TOFUs the sender as the orchestrator — any
+    /// session peer that beats the legitimate orchestrator becomes
+    /// the bound principal and can drive subsequent control
+    /// messages past the peer-auth gates. Operators that know the
+    /// orchestrator out-of-band (the common case) should set this
+    /// via [`DaemonFactoryRegistry::bind_expected_orchestrator`]
+    /// after register; `None` preserves the back-compat TOFU.
+    pub expected_orchestrator: Option<u64>,
 }
 
 /// Freshly built inputs for a single restore attempt. Produced by
@@ -109,6 +123,7 @@ impl DaemonFactoryRegistry {
                     factory: Box::new(factory),
                     keypair: Some(keypair),
                     config,
+                    expected_orchestrator: None,
                 });
                 Ok(())
             }
@@ -146,10 +161,46 @@ impl DaemonFactoryRegistry {
                     factory: Box::new(factory),
                     keypair: None,
                     config,
+                    expected_orchestrator: None,
                 });
                 Ok(())
             }
         }
+    }
+
+    /// Pin an expected orchestrator node for `origin_hash`. A
+    /// subsequent `SnapshotReady` whose `from_node` does not match
+    /// — and for which neither orchestrator-side nor target-side
+    /// state already records a principal — will be rejected at
+    /// the subprotocol gate. Returns `false` if no factory entry
+    /// is registered for `origin_hash` (call after `register` /
+    /// `register_placeholder`).
+    ///
+    /// Idempotent on re-bind to the same orchestrator; rejects a
+    /// re-bind to a different orchestrator so an attacker who
+    /// holds a write surface here cannot quietly swap the
+    /// expected principal before the source even tries to migrate.
+    pub fn bind_expected_orchestrator(&self, origin_hash: u64, orchestrator: u64) -> bool {
+        match self.entries.get_mut(&origin_hash) {
+            Some(mut entry) => match entry.expected_orchestrator {
+                Some(existing) if existing != orchestrator => false,
+                _ => {
+                    entry.expected_orchestrator = Some(orchestrator);
+                    true
+                }
+            },
+            None => false,
+        }
+    }
+
+    /// Recorded orchestrator binding for `origin_hash`, if any.
+    /// Used by the subprotocol handler's `SnapshotReady` gate as a
+    /// third-tier fallback after orchestrator-side and target-side
+    /// state.
+    pub fn expected_orchestrator(&self, origin_hash: u64) -> Option<u64> {
+        self.entries
+            .get(&origin_hash)
+            .and_then(|e| e.expected_orchestrator)
     }
 
     /// Build fresh restore inputs (daemon instance + keypair + config) for

@@ -621,6 +621,105 @@ fn test_regression_dispatch_arms_reject_unrelated_from_node() {
     }
 }
 
+/// Regression: SnapshotReady for an unbound `daemon_origin` used to
+/// TOFU the sender as the orchestrator inside `restore_on_target` —
+/// any session peer that beat the legitimate orchestrator became the
+/// bound principal and could drive subsequent control messages past
+/// the peer-auth gates. Operators that know the orchestrator out of
+/// band can pre-bind it via
+/// `DaemonFactoryRegistry::bind_expected_orchestrator`; when bound,
+/// a mismatching sender must be rejected at the SnapshotReady gate
+/// rather than recorded.
+#[test]
+fn snapshot_ready_rejects_unexpected_orchestrator_when_bound() {
+    use net::adapter::net::compute::orchestrator::wire;
+    use net::adapter::net::compute::{DaemonFactoryRegistry, MigrationError};
+    use net::adapter::net::subprotocol::MigrationSubprotocolHandler;
+
+    // Setup: target node with a factory registered AND an expected
+    // orchestrator binding. No prior orchestrator/target-side
+    // migration record exists for `origin` — this is the TOFU
+    // window the bind closes.
+    let target_reg = Arc::new(DaemonRegistry::new());
+    let factories = Arc::new(DaemonFactoryRegistry::new());
+    let kp = EntityKeypair::generate();
+    let origin = kp.origin_hash();
+    factories
+        .register(kp.clone(), DaemonHostConfig::default(), || {
+            Box::new(CounterDaemon::new())
+        })
+        .unwrap();
+
+    let expected_orchestrator: u64 = 0x3333;
+    let attacker: u64 = 0x9999;
+    assert!(
+        factories.bind_expected_orchestrator(origin, expected_orchestrator),
+        "bind must succeed once factory is registered",
+    );
+
+    let target_node: u64 = 0x2222;
+    let target_handler = Arc::new(
+        net::adapter::net::compute::MigrationTargetHandler::new_with_factories(
+            target_reg.clone(),
+            factories.clone(),
+        ),
+    );
+    let orch = Arc::new(MigrationOrchestrator::new(target_reg.clone(), target_node));
+    let source = Arc::new(MigrationSourceHandler::new(target_reg.clone()));
+    let handler =
+        MigrationSubprotocolHandler::new(orch.clone(), source, target_handler.clone(), target_node);
+
+    // Build a real snapshot that the attacker forges.
+    let chain_head = {
+        let mut chain = net::adapter::net::state::causal::CausalChainBuilder::new(origin);
+        chain.append(Bytes::from_static(b"x"), 0).unwrap();
+        *chain.head()
+    };
+    let snapshot = StateSnapshot::new(
+        kp.entity_id().clone(),
+        chain_head,
+        Bytes::from(0u64.to_le_bytes().to_vec()),
+        net::adapter::net::state::horizon::ObservedHorizon::new(),
+    );
+    let snapshot_msg = MigrationMessage::SnapshotReady {
+        daemon_origin: origin,
+        snapshot_bytes: snapshot.to_bytes(),
+        seq_through: snapshot.through_seq,
+        chunk_index: 0,
+        total_chunks: 1,
+    };
+
+    // Attacker SnapshotReady is rejected with WrongPeer.
+    match handler.handle_message(&wire::encode(&snapshot_msg).unwrap(), attacker) {
+        Err(MigrationError::WrongPeer {
+            daemon_origin: o,
+            from,
+            expected,
+        }) => {
+            assert_eq!(o, origin);
+            assert_eq!(from, attacker);
+            assert_eq!(expected, expected_orchestrator);
+        }
+        other => panic!("expected WrongPeer rejection, got {:?}", other),
+    }
+
+    // Nothing was recorded: target_handler has no orchestrator binding
+    // for this origin, so the next legitimate SnapshotReady from the
+    // bound orchestrator still succeeds (no attacker-set state to
+    // poison it). The forwarded result is target-handler internals;
+    // confirming no migration record was created is sufficient.
+    assert!(
+        !target_handler.is_migrating(origin),
+        "attacker SnapshotReady must NOT register a migration record",
+    );
+
+    // Bind sanity: re-binding to the SAME orchestrator is idempotent;
+    // re-binding to a DIFFERENT orchestrator fails so an attacker who
+    // gains a write surface here can't quietly swap the principal.
+    assert!(factories.bind_expected_orchestrator(origin, expected_orchestrator));
+    assert!(!factories.bind_expected_orchestrator(origin, attacker));
+}
+
 // ── 6. Reassembler with out-of-order chunks ──────────────────────────────────
 
 #[test]
@@ -2502,8 +2601,17 @@ impl WireNode {
     fn new(node_id: u64) -> Self {
         let reg = Arc::new(DaemonRegistry::new());
         let factories = Arc::new(DaemonFactoryRegistry::new());
-        let orch = Arc::new(MigrationOrchestrator::new(reg.clone(), node_id));
         let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        // Wire the source handler into the orchestrator so a local
+        // `start_migration` routes through `source_handler.start_snapshot`
+        // — without this, the source-side migration record is never
+        // created and the eventual cleanup path can't tell whether
+        // this node authored the migration (the `migrations.get` miss
+        // makes cleanup a no-op rather than unregistering the daemon).
+        let orch = Arc::new(
+            MigrationOrchestrator::new(reg.clone(), node_id)
+                .with_source_handler(source.clone()),
+        );
         let target = Arc::new(MigrationTargetHandler::new_with_factories(
             reg.clone(),
             factories.clone(),

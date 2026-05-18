@@ -402,6 +402,18 @@ impl MigrationSubprotocolHandler {
                 // binding from its own start path. Reject if the
                 // sender doesn't match the recorded principal for
                 // whichever role we are in.
+                //
+                // Third-tier fallback closes a TOFU window: when
+                // neither orchestrator-side nor target-side state
+                // has a record (the orchestrator lives on a remote
+                // node and we've not yet received any messages for
+                // this origin), the first `SnapshotReady` would
+                // otherwise bind whoever sent it as the orchestrator
+                // inside `restore_on_target`. Operators who know
+                // the orchestrator out-of-band can pre-bind it via
+                // `DaemonFactoryRegistry::bind_expected_orchestrator`;
+                // when bound, a mismatching sender is rejected
+                // here, before `restore_on_target` records them.
                 if let Some(expected) = self.orchestrator.source_node(daemon_origin) {
                     if expected != from_node {
                         return Err(MigrationError::WrongPeer {
@@ -412,6 +424,18 @@ impl MigrationSubprotocolHandler {
                     }
                 } else if let Some(expected) =
                     self.target_handler.orchestrator_node(daemon_origin)
+                {
+                    if expected != from_node {
+                        return Err(MigrationError::WrongPeer {
+                            daemon_origin,
+                            from: from_node,
+                            expected,
+                        });
+                    }
+                } else if let Some(expected) = self
+                    .target_handler
+                    .factories()
+                    .expected_orchestrator(daemon_origin)
                 {
                     if expected != from_node {
                         return Err(MigrationError::WrongPeer {
