@@ -131,32 +131,64 @@ impl RecoveryRegistry {
 
     /// Run every registered handler once. Concatenates the
     /// recovered slot indices each handler reports so callers can
-    /// observe total recovery work this tick. Held under a single
-    /// lock for the duration — handlers are expected to be cheap;
-    /// heavy work should be deferred to the action executor.
+    /// observe total recovery work this tick.
+    ///
+    /// Handlers run OUTSIDE the registry lock — the registry briefly
+    /// takes the lock to swap the handler vector out, runs each
+    /// handler in `catch_unwind` against the local vector, then
+    /// re-takes the lock to merge survivors back. This prevents two
+    /// hazards:
+    ///   - **Reentrancy deadlock.** `parking_lot::Mutex` is non-
+    ///     reentrant; a handler that calls back into `register` /
+    ///     `len` / `is_empty` (directly or via the meshos tick path)
+    ///     would self-deadlock if the registry lock were held across
+    ///     the invocation.
+    ///   - **Concurrent registration.** A new handler installed
+    ///     mid-run lands on the now-empty registry vector and runs
+    ///     on the next tick; pre-fix the register lock would have
+    ///     blocked until the long handler chain finished.
     ///
     /// A handler that panics is caught with `catch_unwind` and its
     /// slot is dropped from the registry, mirroring how
     /// `poll_probes` handles third-party-installed probe panics.
     pub fn try_run_all(&self) -> Vec<u8> {
-        let mut guard = self.handlers.lock();
+        // Swap the handler vec out under a brief lock so we can
+        // invoke each handler with the registry lock released.
+        let handlers_to_run = {
+            let mut guard = self.handlers.lock();
+            std::mem::take(&mut *guard)
+        };
+        let mut survivors: Vec<RecoveryHandler> = Vec::with_capacity(handlers_to_run.len());
         let mut all = Vec::new();
-        guard.retain_mut(|h| {
+        for mut h in handlers_to_run {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h()));
             match result {
                 Ok(recovered) => {
                     all.extend(recovered);
-                    true
+                    survivors.push(h);
                 }
                 Err(_) => {
                     tracing::warn!(
                         target: "meshos",
                         "RecoveryRegistry: handler panicked; evicting"
                     );
-                    false
+                    // h drops here; handler evicted.
                 }
             }
-        });
+        }
+        // Merge survivors back. Any handler installed concurrently
+        // landed on the now-non-empty vector; append survivors
+        // before the new entries so registration order roughly
+        // matches the pre-fix iteration order (new entries run on
+        // the next tick, not this one).
+        let mut guard = self.handlers.lock();
+        if guard.is_empty() {
+            *guard = survivors;
+        } else {
+            let mut combined = survivors;
+            combined.extend(guard.drain(..));
+            *guard = combined;
+        }
         all
     }
 }
@@ -242,5 +274,105 @@ mod recovery_registry_tests {
         assert_eq!(calls_a.load(Ordering::Relaxed), 2);
         // B did NOT run again — evicted on first tick.
         assert_eq!(calls_b.load(Ordering::Relaxed), 1);
+    }
+
+    /// Regression: `try_run_all` must not hold the registry mutex
+    /// across handler invocation, otherwise a handler that
+    /// reentrantly touches the registry (calls `register` /
+    /// `len` / `is_empty`) would self-deadlock —
+    /// `parking_lot::Mutex` is non-reentrant. The fix swaps the
+    /// handler vec out under a brief lock, runs handlers with
+    /// the lock released, then merges survivors back.
+    #[test]
+    fn try_run_all_allows_handler_to_register_new_handler() {
+        let reg = RecoveryRegistry::new();
+        let reg_for_handler = reg.clone();
+        let invoked = Arc::new(AtomicU32::new(0));
+        let invoked_for_handler = invoked.clone();
+
+        reg.register(Box::new(move || {
+            // Reentrant call into the same registry. Pre-fix
+            // this would deadlock because `try_run_all` held the
+            // mutex across this invocation; `register` then
+            // blocked on the same non-reentrant lock.
+            reg_for_handler.register(Box::new(|| vec![99]));
+            invoked_for_handler.fetch_add(1, Ordering::Relaxed);
+            vec![7]
+        }));
+        assert_eq!(reg.len(), 1);
+
+        let recovered = reg.try_run_all();
+        assert_eq!(recovered, vec![7]);
+        assert_eq!(invoked.load(Ordering::Relaxed), 1);
+        // The handler installed a second handler during its run;
+        // that one runs on the NEXT tick (not this one).
+        assert_eq!(
+            reg.len(),
+            2,
+            "concurrently-registered handler must land in the registry",
+        );
+
+        // Next tick: both handlers run. The original registers
+        // ANOTHER handler each tick, so this grows by one per
+        // tick — which is the user's design choice and proves
+        // the no-deadlock contract holds across repeated runs.
+        let recovered = reg.try_run_all();
+        // Handler order between survivors and the freshly-installed
+        // one is unspecified; sort to make the assertion robust.
+        let mut got = recovered;
+        got.sort();
+        assert_eq!(got, vec![7, 99]);
+    }
+
+    /// Regression: handlers registered concurrently with `try_run_all`
+    /// land in the registry without blocking on a long handler
+    /// chain. With the swap-and-merge fix, `register` only briefly
+    /// contends with the take + merge steps; in the prior code it
+    /// blocked for the entire handler-run duration.
+    #[test]
+    fn register_during_try_run_all_does_not_block_indefinitely() {
+        use std::sync::Barrier;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let reg = Arc::new(RecoveryRegistry::new());
+        let barrier_start = Arc::new(Barrier::new(2));
+        let in_handler = Arc::new(AtomicU32::new(0));
+
+        // Slow handler: bumps in_handler then sleeps. The thread
+        // calling try_run_all spins inside this for the sleep
+        // duration.
+        let in_handler_for_h = in_handler.clone();
+        let barrier_for_h = barrier_start.clone();
+        reg.register(Box::new(move || {
+            in_handler_for_h.fetch_add(1, Ordering::SeqCst);
+            barrier_for_h.wait();
+            std::thread::sleep(Duration::from_millis(200));
+            vec![0]
+        }));
+
+        let reg_runner = reg.clone();
+        let runner = thread::spawn(move || reg_runner.try_run_all());
+
+        // Wait until the handler is mid-execution.
+        barrier_start.wait();
+
+        // Try to register a fresh handler. With the fix this
+        // returns quickly (no contention on the handlers lock past
+        // the brief swap). Pre-fix it would block for the full
+        // 200 ms sleep before returning.
+        let reg_writer = reg.clone();
+        let started = Instant::now();
+        reg_writer.register(Box::new(|| vec![42]));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "register must not block on a long-running handler — \
+             elapsed = {elapsed:?}; pre-fix this would have been ~200 ms",
+        );
+
+        runner.join().unwrap();
+        // Handler chain landed correctly.
+        assert_eq!(in_handler.load(Ordering::SeqCst), 1);
     }
 }
