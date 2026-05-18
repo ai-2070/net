@@ -154,11 +154,22 @@ impl BandwidthBudget {
     /// returned tokens never exceed `capacity_bytes`.
     ///
     /// `bytes == 0` is a no-op.
+    ///
+    /// Floors `available_bytes` to whole-byte precision before
+    /// adding the refunded amount so accumulated fractional refill
+    /// from [`Self::refill`] cannot compound across many refunds.
+    /// `try_consume`'s `>=` compares `available_bytes` against
+    /// `cost as f64`; without the floor, drift accumulating tens
+    /// of millibits per refund could admit one extra byte over a
+    /// long sequence of small refunds. The sub-byte fractional
+    /// credit lost on each refund is recovered on the next refill
+    /// tick.
     pub fn refund(&mut self, bytes: u64) {
         if bytes == 0 {
             return;
         }
-        self.available_bytes = (self.available_bytes + bytes as f64).min(self.capacity_bytes);
+        let floored = self.available_bytes.max(0.0).floor();
+        self.available_bytes = (floored + bytes as f64).min(self.capacity_bytes);
     }
 
     /// Current available token count in bytes. Useful for
