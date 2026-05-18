@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/compute/standby_group.rs
+  s_2571835e05521c::t_01ce7096fa6e5a 983-993
+  s_2571835e05521c::t_1ad95952253687 2154-2266
+  s_2571835e05521c::t_75f514767c8430 857-863,874,879
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "1699507bb376ba4145c50f63497cb6ea22cba657",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
