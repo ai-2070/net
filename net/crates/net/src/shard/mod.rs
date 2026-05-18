@@ -509,6 +509,15 @@ impl ShardManager {
                     // contract (the
                     // legitimate consumer is the batch worker, on a
                     // different task / thread).
+                    //
+                    // Transient stats note: a concurrent reader of
+                    // `manager.stats().events_dropped` between the
+                    // `fetch_sub` and the second `fetch_add` would
+                    // briefly observe the pre-correction value
+                    // (one less than reality). The net delta over
+                    // the whole retry is `+1`, matching the real
+                    // drop. Documented as snapshot-not-coherent
+                    // per `ShardCounters::snapshot`'s contract.
                     shard
                         .counters
                         .events_dropped

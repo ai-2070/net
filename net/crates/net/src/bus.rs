@@ -466,6 +466,17 @@ impl EventBus {
             producer_nonce: self.producer_nonce,
         });
 
+        // Order of publish here matters. Today `select_shard`
+        // filters on `state == Active` and a shard is still
+        // `Provisioning` at this point, so producers cannot route
+        // to it yet — but the pattern (insert sender → spawn drain
+        // worker → activate_shard) is ordering-fragile: a future
+        // refactor that flips `activate_shard` ahead of the drain-
+        // worker spawn would leave a window where producers can
+        // push but no drain worker is polling. Pin the order by
+        // installing the sender BEFORE the drain worker (existing
+        // behaviour) so the worker observes a fully-published
+        // sender at spawn time; `activate_shard` runs further down.
         self.batch_senders.write().insert(new_id, tx.clone());
 
         let drain = spawn_drain_worker_for_shard(
@@ -1581,6 +1592,26 @@ impl EventBus {
         if let Some((stranded, ingested_at_deadline, _dispatched_at_deadline)) = deadline_snapshot {
             let ingested_after = self.stats.events_ingested.load(AtomicOrdering::Acquire);
             let post_deadline_ingests = ingested_after.saturating_sub(ingested_at_deadline);
+            // Known under-count window: a producer that completed
+            // `shard_manager.ingest()` and bumped `events_ingested`
+            // just BEFORE its `IngestGuard` decremented
+            // `in_flight_ingests` will be counted in
+            // `ingested_at_deadline` (already past the bump) AND in
+            // `stranded` (still pending the decrement on that same
+            // spin). That single event contributes `+1` to both
+            // sides of the subtraction, so the saturating_sub
+            // under-counts the drop by 1 per such interleaving.
+            // The opposite direction (producer in-flight at
+            // deadline that never completed ingest) is correctly
+            // counted as a drop, so the bias is one-sided and
+            // small (bounded by the number of producers mid-push
+            // at the exact deadline moment — typically 0–1 even
+            // under heavy load). Operators reading
+            // `shutdown_was_lossy` get the right boolean; the
+            // numeric `events_dropped` may under-count by a few
+            // events on a lossy shutdown. Acceptable; the cost of
+            // closing the window is paired-SeqCst reloads under
+            // the spin which would dominate the shutdown path.
             let actual_drops = stranded.saturating_sub(post_deadline_ingests);
             if actual_drops > 0 {
                 self.stats
