@@ -204,3 +204,64 @@ The crate is well-engineered — automated passes are clean, concurrency primiti
 2. **A handful of mechanical bugs** (C-1, H-1, A-4) that escaped clippy because they're "the right thing isn't called" rather than "the wrong thing is called."
 
 Total: 4 highs + 6 mediums + 19 lows + 25 null-result categories. Highest leverage is the A-series; together with C-1, H-1, A-4 they're under a day's work to fix.
+
+## Fix status (post-audit)
+
+Every high + medium finding plus the high-impact lows have been
+fixed; commits are on the `bugfixes-15` branch.
+
+| ID | Status | Commit (short SHA) |
+|---|---|---|
+| A-1 (channel hash collision) | ✅ fixed | `446f5ebf` |
+| A-2 (no token revocation) | ✅ fixed | `74f558ab` |
+| A-3 (TOFU pin vs dedup) | ✅ fixed | `8c8a3fc9` |
+| A-4 (Redis dedup_id round-trip) | ✅ fixed | `2a2846fb` |
+| C-1 (shard metrics wiring) | ✅ fixed | `7ac0c395` |
+| H-1 (14 FFI length guards) | ✅ fixed | `c39c7275` |
+| M-1 (snapshot reassembler) | ✅ fixed | `8dc40851` |
+| M-2 (consumer dedup) | ✅ fixed | `b662fd8c` |
+| M-3 (cursor format guard) | ✅ fixed | `5262e8c0` |
+| M-4 (tokio Instant) | ✅ fixed | `a4ea6c28` |
+| M-5 (Drop mutex) | ✅ fixed | `42143c40` |
+| M-6 (FFI allocator) | ✅ fixed | `d9d0f56b` |
+| M-7 (OpaqueCtx contract) | ✅ fixed | `4d9877b4` |
+| M-8 (JetStream drain timeout) | ✅ fixed | `bf288f1f` |
+| M-9 (Redis health-check reuse) | ✅ fixed | `fca86c01` |
+| M-10 (typed Shutdown error) | ✅ fixed | `b0530ef4` |
+| L-1 (`from_utf8_unchecked`) | ✅ fixed | `4993c3f7` |
+| L-2 (`alloc_bytes` null check) | ✅ fixed | `4993c3f7` |
+| L-4 (`Ordering::None` non-determinism doc) | ✅ fixed | `2955aa08` |
+| L-5 (`failed_shards` recovery-latency doc) | ✅ fixed | `2955aa08` |
+| L-6 (workspace profiles) | ✅ fixed | `4993c3f7` |
+| L-8 (`RouteFlags` mask forward-compat doc) | ✅ fixed | `2955aa08` |
+| L-9 (`BufferedEvents` 32-bit wrap) | ✅ fixed | `1fc8bf1c` |
+| L-10 (per-event payload cap) | ✅ fixed | `1fc8bf1c` |
+| L-11 (zero-byte reassembler chunks) | ✅ fixed | `1fc8bf1c` |
+| L-12 (`signed_payload` empty-on-error) | ✅ fixed | `1fc8bf1c` |
+| L-15 (TokenCache subject re-check) | ✅ fixed | `1fc8bf1c` |
+| L-18 (JetStream 2× wall-clock doc) | ✅ fixed | `2955aa08` |
+| L-19 (credential log redaction) | ✅ fixed | `b87cb309` |
+| **L-3, L-7, L-13, L-14, L-16, L-17** | **deferred** | see below |
+
+**Deferred, with rationale:**
+
+- **L-3** (`blob.rs` uses `pub unsafe extern "C" fn`; sibling modules use plain `pub extern "C" fn`): pure style. The 2024-edition-accurate direction is to add `unsafe` everywhere — that's a 200-entry-point sweep across `ffi/mesh.rs`, `ffi/cortex.rs`, etc., not a one-file fix. Defer to a dedicated normalization pass.
+- **L-7** (bus/shard F-5..F-8 subtleties — publish-then-spawn ordering, lossy-shutdown reconciliation off-by-one, transient `events_dropped` overcount during `DropOldest`, `collect_and_reset` cross-field non-atomicity): the bus/shard reviewer concluded each is not reachable as a production bug today. Worth tightening if the surrounding code is touched, but no concrete fix without a behavior change.
+- **L-13** (capability `with_metadata` exact-match reserved keys writable from inbound peers): real behavior change. Filtering reserved keys from inbound deserialization could break operators who legitimately publish them today. Needs a policy decision (substrate-only? per-key allowlist?) before code.
+- **L-14** (`ChannelName::new` admits case-folded duplicates: `foo.bar` and `FOO.BAR` hash differently): real behavior change. Lowercasing on construction breaks every test fixture that asserts exact-case channel names, plus existing-deployment channel identifiers. Needs a policy decision (lowercase-on-construction vs reject mixed-case vs accept as-is) before code.
+- **L-16** (no clock-skew tolerance in `PermissionToken::is_valid`): real behavior change. Adding a `CLOCK_SKEW_TOLERANCE_SECS` window relaxes expiry — a peer with a slow clock starts honouring tokens the rest of the mesh treats as expired. The right value is operationally specific (typically 30-60 s for NTP-synced fleets; longer for edge deployments). Needs a config knob added with sensible defaults; deferred for that design.
+- **L-17** (capability wildcard-slot scan is `O(slot_size)` per check): pure perf, not correctness. The wildcard fallback walks up to `MAX_TOKENS_PER_SLOT = 32` entries on every cache miss. The agent's suggested cache (a per-slot "any token here has WILDCARD" bool) is an internal optimization with no behavior change; deferred to a perf-focused commit rather than mixed into a bug-fix sprint.
+
+Regression tests were added inline where a meaningful assertion could
+be made at unit-test scale: the metrics-collector wiring, the FFI
+length guard, the merger shard dedup, the snapshot reassembler
+substitution refusal, the Redis dedup_id round-trip and order
+independence, the cursor backend-format guard, the non-blocking
+shard accounting, the URL redaction, the Shutdown error
+classification, the channel-hash widening (u32-aliased u64
+hashes), and the three token revocation invariants
+(floor-bump invalidates, monotonic floor, delegate inherits
+generation). The A-3 dedup-key change is covered by the existing
+capability_multihop integration suite — that test was already
+running the diamond / forwarded paths the fix is concerned with;
+no new mesh-setup duplication was warranted.
