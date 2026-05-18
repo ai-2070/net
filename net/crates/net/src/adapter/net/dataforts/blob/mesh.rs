@@ -281,6 +281,16 @@ pub struct MeshBlobAdapter {
     /// path is needed.
     tree_node_cache:
         Option<Arc<parking_lot::Mutex<super::blob_tree_cache::TreeNodeCache>>>,
+    /// Optional override for the `max_memory_bytes` field of every
+    /// per-chunk `RedexFileConfig`. The default 64 MiB upstream
+    /// default pre-reserves a 64 MiB heap `Vec` per opened chunk
+    /// channel, which is fine for a handful of chunks but blows
+    /// the commit limit for blobs with thousands of small chunks
+    /// (e.g. a 100 MiB blob at 8 KiB chunks opens 12 K channels →
+    /// 800 GiB of reservation). When `Some(n)`, the adapter passes
+    /// `n` through `with_max_memory_bytes` on every chunk-file
+    /// open; the upstream `min(n, 64 MiB)` clamp still applies.
+    chunk_file_max_memory_bytes: Option<usize>,
 }
 
 impl MeshBlobAdapter {
@@ -306,6 +316,7 @@ impl MeshBlobAdapter {
             overflow: Arc::new(parking_lot::RwLock::new(OverflowConfig::default())),
             overflow_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tree_node_cache: None,
+            chunk_file_max_memory_bytes: None,
         }
     }
 
@@ -337,6 +348,23 @@ impl MeshBlobAdapter {
         self.tree_node_cache = Some(Arc::new(parking_lot::Mutex::new(
             super::blob_tree_cache::TreeNodeCache::with_capacity_bytes(cap_bytes),
         )));
+        self
+    }
+
+    /// Override the per-chunk-file `max_memory_bytes` reservation.
+    ///
+    /// `RedexFileConfig` defaults to 64 MiB per channel; for blobs
+    /// stored as many small chunks (e.g. 8 KiB chunks of a multi-
+    /// MiB blob) that reservation is multiplied by the chunk
+    /// count, easily blowing the process commit limit even though
+    /// each channel only ever holds a few KiB of live bytes.
+    /// Operators with chunk-heavy blobs pass a smaller value here
+    /// (e.g. `1 << 20` = 1 MiB) to bound the reservation.
+    ///
+    /// The upstream `min(value, 64 MiB)` clamp still applies — a
+    /// larger value than the default has no effect.
+    pub fn with_chunk_file_max_memory_bytes(mut self, bytes: usize) -> Self {
+        self.chunk_file_max_memory_bytes = Some(bytes);
         self
     }
 
@@ -990,13 +1018,18 @@ impl MeshBlobAdapter {
 
     /// Body of [`Self::store_stream_tree`] without the
     /// production-only chunk-size + encoding gates. Reachable
-    /// from `#[cfg(test)]` so the test harness can drive the
-    /// tree path with a smaller chunk size (test fixtures need
-    /// the depth-2 boundary at FANOUT chunks, which at the
-    /// production 4 MiB chunk size would allocate ~500 MiB of
-    /// payload per test and OOM the Windows test runner under
+    /// from `#[cfg(test)]` and integration tests so the harness
+    /// can drive the tree path with a smaller chunk size (test
+    /// fixtures need the depth-2 boundary at FANOUT chunks, which
+    /// at the production 4 MiB chunk size would allocate ~500 MiB
+    /// of payload per test and OOM the Windows test runner under
     /// parallel execution).
-    pub(crate) async fn store_stream_tree_internal(
+    ///
+    /// Not part of the supported public API — kept `pub` only so
+    /// the conformance integration test in `tests/` can build
+    /// memory-feasible fixtures.
+    #[doc(hidden)]
+    pub async fn store_stream_tree_internal(
         &self,
         mut stream: BlobByteStream,
         encoding: Encoding,
@@ -1385,6 +1418,9 @@ impl MeshBlobAdapter {
         let mut cfg = RedexFileConfig::new().with_persistent(self.persistent);
         if let Some(rep) = self.replication.clone() {
             cfg = cfg.with_replication(Some(rep));
+        }
+        if let Some(bytes) = self.chunk_file_max_memory_bytes {
+            cfg = cfg.with_max_memory_bytes(bytes);
         }
         cfg
     }
