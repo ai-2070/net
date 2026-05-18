@@ -1,0 +1,25 @@
+net/crates/net/bindings/python/README.md
+  s_aa8bb6e2c88c9e::t_a8e4a96869b3d0 489-490
+net/crates/net/sdk-ts/src/identity.ts
+  s_aa8bb6e2c88c9e::t_378b1bff952b86 131-135
+net/crates/net/sdk-ts/README.md
+  s_aa8bb6e2c88c9e::t_51fbfcd5bd49bf 1038-1039
+net/crates/net/sdk-ts/test/identity.test.ts
+  s_aa8bb6e2c88c9e::t_1351c99022f449 58-61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "72fd75aabcd9e2d1de6583fc3ce94f8b9db7204b",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
