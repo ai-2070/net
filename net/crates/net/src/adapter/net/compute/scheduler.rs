@@ -335,7 +335,21 @@ impl Scheduler {
         // short-circuit here so both entry points behave
         // identically.
         if self.local_node_id != source_node && candidates.contains(&self.local_node_id) {
-            return Some(self.local_node_id);
+            // Score local through the supplied PlacementFilter
+            // FIRST so a filter that hard-vetoes local (returns
+            // None for local, Some(_) only for remotes) can
+            // actually veto. Pre-fix this branch short-circuited
+            // unconditionally and silently ignored the filter —
+            // the strict-veto operator could never keep work off
+            // a local that the substrate decided to prefer. If
+            // local scores Some(_), keep the fast-path; otherwise
+            // fall through to the regular tie-breaker.
+            if placement
+                .placement_score(&self.local_node_id, artifact)
+                .is_some()
+            {
+                return Some(self.local_node_id);
+            }
         }
         Self::pick_best_candidate(candidates, artifact, placement, tie_break)
     }
