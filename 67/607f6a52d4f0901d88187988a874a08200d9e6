@@ -1,0 +1,33 @@
+net/crates/net/src/adapter/net/identity/token.rs
+  s_2571835e05521c::t_55768f2b68d84b 1357
+  s_2571835e05521c::t_9b2d592ec97882 2533
+net/crates/net/src/adapter/net/channel/name.rs
+  s_2571835e05521c::t_a60dffd95d7a30 614
+net/crates/net/src/adapter/net/mesh.rs
+  s_2571835e05521c::t_04e509a7af6196 6373
+  s_2571835e05521c::t_7fa393a8fa46ce 6637
+  s_2571835e05521c::t_f81ac97a1a891e 6631
+net/crates/net/src/adapter/net/channel/config.rs
+  s_2571835e05521c::t_3ca81a3dac033e 242,245
+  s_2571835e05521c::t_9545af6bf57abd 160
+net/crates/net/src/adapter/net/channel/guard.rs
+  s_2571835e05521c::t_0e4214ff77d57f 13-14
+net/crates/net/src/adapter/net/redex/manager.rs
+  s_2571835e05521c::t_7ddd42e292de51 999
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "67607f6a52d4f0901d88187988a874a08200d9e6",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
