@@ -142,6 +142,23 @@ pub enum ReplicaTransitionEvent {
         /// Monotonic timestamp of the transition.
         at: Instant,
     },
+    /// Symmetric to [`Self::LeaderLostAndIdled`] for the
+    /// promotion side: this coordinator entered `Leader` directly
+    /// from `Idle`, so the node BOTH became a holder AND became
+    /// leader in one transition. Bundled into one event so a
+    /// downstream sink can't drop half of the (holder add,
+    /// leader set) pair under backpressure — pre-bundle the
+    /// observer fired `BecameHolder` then `LeaderChanged` as two
+    /// `try_publish`es, and a `QueueFull` between them left the
+    /// snapshot with a holder set but no leader (or vice versa).
+    /// `Replica → Leader` / `Candidate → Leader` still fire only
+    /// `LeaderChanged` because the node was already a holder.
+    BecameHolderAndLeader {
+        /// Substrate-level chain identifier.
+        origin_hash: u64,
+        /// Monotonic timestamp of the transition.
+        at: Instant,
+    },
 }
 
 /// Observer hook for replication-coordinator state changes.
@@ -411,6 +428,7 @@ impl ReplicationCoordinator {
         // protocol role byte on the heartbeat). Withdrawal happens
         // on every `* → Idle`.
         let origin = self.channel.origin_hash;
+        let is_withdraw = transition.to == ReplicaRole::Idle;
         let result = match (transition.from, transition.to) {
             (ReplicaRole::Idle, ReplicaRole::Replica)
             | (ReplicaRole::Candidate, ReplicaRole::Leader) => {
@@ -420,7 +438,26 @@ impl ReplicationCoordinator {
             (_, ReplicaRole::Idle) => self.sink.withdraw_chain(origin).await,
             _ => Ok(()),
         };
-        result.map_err(CoordinatorError::TagSink)?;
+        if let Err(e) = result {
+            if is_withdraw {
+                // Local state already flipped to Idle but the
+                // mesh-side withdraw failed — the mesh may still
+                // advertise this node as a chain holder until
+                // something else trips a re-announce. Bump the
+                // divergence counter so operators can spot the
+                // gap; recovery is opportunistic on the next
+                // transition_to call.
+                self.metrics.incr_announce_divergence();
+                tracing::warn!(
+                    origin = format!("{:#x}", origin),
+                    from = ?transition.from,
+                    error = %e,
+                    "replication coordinator: state advanced to Idle but sink withdraw failed; \
+                     advertised-vs-local divergence until next transition_to or cancel()",
+                );
+            }
+            return Err(CoordinatorError::TagSink(e));
+        }
 
         // Fire the observer AFTER the sink call succeeds. If the
         // sink call fails we don't fire — the state mutation
@@ -431,16 +468,23 @@ impl ReplicationCoordinator {
         // again including the observer.)
         let at = Instant::now();
         match (transition.from, transition.to) {
-            (ReplicaRole::Idle, ReplicaRole::Replica)
-            | (ReplicaRole::Idle, ReplicaRole::Leader) => {
+            (ReplicaRole::Idle, ReplicaRole::Replica) => {
                 self.fire_transition(ReplicaTransitionEvent::BecameHolder {
                     origin_hash: origin,
                     at,
                 });
             }
-            // Leader → Idle: fire ONE bundled event so a
-            // downstream sink can't drop half of the (holder
-            // removal, leader clear) pair under backpressure.
+            // Idle → Leader: bundle the (holder add, leader set)
+            // pair so a backpressured sink can't drop one half and
+            // leave the snapshot with a phantom holder or leader.
+            (ReplicaRole::Idle, ReplicaRole::Leader) => {
+                self.fire_transition(ReplicaTransitionEvent::BecameHolderAndLeader {
+                    origin_hash: origin,
+                    at,
+                });
+            }
+            // Leader → Idle: bundle the (holder removal, leader
+            // clear) pair, symmetric to BecameHolderAndLeader above.
             (ReplicaRole::Leader, ReplicaRole::Idle) => {
                 self.fire_transition(ReplicaTransitionEvent::LeaderLostAndIdled {
                     origin_hash: origin,
@@ -455,11 +499,13 @@ impl ReplicationCoordinator {
             }
             _ => {}
         }
+        // Replica → Leader / Candidate → Leader: already a holder,
+        // so only the leader bit changes. Idle → Leader is handled
+        // atomically above by BecameHolderAndLeader.
         if matches!(
             (transition.from, transition.to),
             (ReplicaRole::Replica, ReplicaRole::Leader)
                 | (ReplicaRole::Candidate, ReplicaRole::Leader)
-                | (ReplicaRole::Idle, ReplicaRole::Leader)
         ) {
             self.fire_transition(ReplicaTransitionEvent::LeaderChanged {
                 origin_hash: origin,
@@ -923,5 +969,43 @@ mod tests {
         // State HAS advanced — withdraw "happened locally" even
         // though the wire side missed.
         assert_eq!(c.role(), ReplicaRole::Idle);
+    }
+
+    /// Pin that a `* → Idle` sink failure bumps
+    /// `announce_divergence_total` on the channel's metrics so
+    /// operators see the gap between local state and advertised
+    /// holder set. Recovery is opportunistic on the next
+    /// `transition_to` call; the counter is the observability
+    /// surface for the window in between.
+    #[tokio::test]
+    async fn tag_sink_failure_bumps_divergence_counter() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let (sink, _, c) = build_coordinator();
+        c.transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+            .await
+            .unwrap();
+        let before = c
+            .metrics()
+            .announce_divergence_total
+            .load(AtomicOrdering::Relaxed);
+
+        sink.arm_failure(AdapterError::Transient(
+            "simulated network blip".to_string(),
+        ));
+        let _ = c
+            .transition_to(ReplicaRole::Idle, TransitionSignal::DiskPressureWithdraw)
+            .await
+            .expect_err("must surface sink failure");
+
+        let after = c
+            .metrics()
+            .announce_divergence_total
+            .load(AtomicOrdering::Relaxed);
+        assert_eq!(
+            after,
+            before + 1,
+            "announce_divergence_total must bump by exactly 1 on the failed withdraw"
+        );
     }
 }

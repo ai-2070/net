@@ -739,6 +739,75 @@ impl Redex {
         Ok(())
     }
 
+    /// Close the file (as [`Self::close_file`]) AND unlink any
+    /// persistent on-disk segment for the channel. Idempotent: a
+    /// channel that has no persistent dir or is unknown to the
+    /// manager returns Ok. Used by the blob GC sweep so a swept
+    /// chunk doesn't accumulate as an orphaned segment directory
+    /// on `with_persistent(true)` deployments.
+    ///
+    /// Holds the dashmap entry write guard for the channel name
+    /// across the close-then-unlink sequence. Pre-fix the entry
+    /// was dropped between `close_file` (which removes from the
+    /// map) and `remove_dir_all`; a concurrent `open_file` for the
+    /// same name landed a fresh entry in the gap, then the unlink
+    /// blew away the new segment dir and the next append hit
+    /// ENOENT. Holding the entry guard blocks any concurrent
+    /// `open_file` on the same name until both phases complete.
+    pub fn close_and_unlink_file(&self, name: &ChannelName) -> Result<(), RedexError> {
+        // Shut the replication runtime down first — same as
+        // `close_file`. This call doesn't touch the `files` map so
+        // it's safe to run before taking the entry guard.
+        if let Some(wiring) = self.replication.read().as_ref().cloned() {
+            let channel_id = ChannelId::from_name(name);
+            if let Some(handle) = wiring.router.unregister(&channel_id) {
+                let _ = handle.try_dispatch(super::replication_runtime::Inbound::Shutdown);
+            }
+        }
+        // Hold the entry guard across close + unlink so a
+        // concurrent `open_file` for the same name blocks until
+        // both phases complete. The Entry holds the per-shard
+        // write lock; performing the disk unlink inside the
+        // Occupied arm before the final `occ.remove()` keeps the
+        // map slot locked across the entire sequence. A vacant
+        // slot still acquires the lock (via `entry()`); we drop
+        // the guard immediately so the no-op path doesn't block
+        // longer than necessary.
+        match self.files.entry(name.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(occ) => {
+                let file = occ.get().clone();
+                file.close()?;
+                #[cfg(feature = "redex-disk")]
+                if let Some(base) = self.persistent_dir.as_ref() {
+                    let dir = super::disk::channel_dir(base, name);
+                    match std::fs::remove_dir_all(&dir) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(RedexError::io(e)),
+                    }
+                }
+                occ.remove();
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => {
+                // No live heap entry; still attempt the disk
+                // unlink for the persistent-only case (an
+                // operator-restart cycle could have left the
+                // dir behind without an open file).
+                #[cfg(feature = "redex-disk")]
+                if let Some(base) = self.persistent_dir.as_ref() {
+                    let dir = super::disk::channel_dir(base, name);
+                    match std::fs::remove_dir_all(&dir) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(RedexError::io(e)),
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Snapshot list of currently open files. Cheap clone.
     pub fn open_files(&self) -> Vec<RedexFile> {
         self.files.iter().map(|r| r.value().clone()).collect()
@@ -853,6 +922,51 @@ mod tests {
         assert!(r.get_file(&cn("missing")).is_none());
     }
 
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn close_and_unlink_file_removes_persistent_segment_dir() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base =
+            std::env::temp_dir().join(format!("net-redex-unlink-{}-{}", std::process::id(), n));
+        let _ = std::fs::create_dir_all(&base);
+        let r = Redex::new().with_persistent_dir(&base);
+        let name = cn("dataforts/blob/abc");
+        let f = r
+            .open_file(&name, RedexFileConfig::default().with_persistent(true))
+            .unwrap();
+        f.append(b"hello").unwrap();
+        let dir = super::super::disk::channel_dir(&base, &name);
+        assert!(
+            dir.exists(),
+            "channel dir must exist after persistent append"
+        );
+
+        r.close_and_unlink_file(&name).unwrap();
+        assert!(
+            !dir.exists(),
+            "channel dir must be unlinked after close_and_unlink_file"
+        );
+
+        // Idempotent on a second call (file already gone, dir gone).
+        r.close_and_unlink_file(&name).unwrap();
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn close_and_unlink_file_noop_when_unknown_or_heap_only() {
+        let r = Redex::new();
+        // unknown channel — no error
+        r.close_and_unlink_file(&cn("never_opened")).unwrap();
+        // heap-only channel — closes file, no unlink branch
+        let name = cn("heap_only");
+        let _f = r.open_file(&name, RedexFileConfig::default()).unwrap();
+        r.close_and_unlink_file(&name).unwrap();
+        assert!(r.get_file(&name).is_none());
+    }
+
     #[test]
     fn test_auth_denies_unknown_origin() {
         let guard = Arc::new(AuthGuard::new());
@@ -885,7 +999,7 @@ mod tests {
         // unauthorized storage access. The fix requires the canonical
         // channel name in the exact ACL, so a fast-path-only
         // authorization is insufficient — independent of the hash
-        // width on the fast path (now `ChannelHash` / u32).
+        // width on the fast path (now `ChannelHash` / u64).
         let guard = Arc::new(AuthGuard::new());
         let name = cn("sensitive");
         // Authorize the fast path ONLY (no allow_channel).

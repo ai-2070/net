@@ -307,7 +307,7 @@ impl RedexHandle {
 /// heap-only. Returns a heap-allocated handle the caller must free
 /// with `net_redex_free`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_new(persistent_dir: *const c_char) -> *mut RedexHandle {
+pub unsafe extern "C" fn net_redex_new(persistent_dir: *const c_char) -> *mut RedexHandle {
     let dir = if persistent_dir.is_null() {
         None
     } else {
@@ -324,7 +324,7 @@ pub extern "C" fn net_redex_new(persistent_dir: *const c_char) -> *mut RedexHand
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_free(handle: *mut RedexHandle) {
+pub unsafe extern "C" fn net_redex_free(handle: *mut RedexHandle) {
     if handle.is_null() {
         return;
     }
@@ -425,7 +425,7 @@ impl Drop for MeshArcOwned {
 /// `Redex` is in `_free`-quiesce.
 #[cfg(feature = "net")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_enable_replication(
+pub unsafe extern "C" fn net_redex_enable_replication(
     redex: *mut RedexHandle,
     mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
 ) -> c_int {
@@ -457,7 +457,7 @@ pub extern "C" fn net_redex_enable_replication(
 /// NULL handle (defensive — the Go side typically validates the
 /// handle is non-NULL before calling).
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_replication_runtime_count(redex: *const RedexHandle) -> u32 {
+pub unsafe extern "C" fn net_redex_replication_runtime_count(redex: *const RedexHandle) -> u32 {
     let Some(h) = (unsafe { redex.as_ref() }) else {
         return 0;
     };
@@ -482,7 +482,9 @@ pub extern "C" fn net_redex_replication_runtime_count(redex: *const RedexHandle)
 /// `*_under_capacity_total`, `*_skip_ahead_total`,
 /// `*_election_thrash_total`, `*_witness_withdrawals_total`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_replication_prometheus_text(redex: *const RedexHandle) -> *mut c_char {
+pub unsafe extern "C" fn net_redex_replication_prometheus_text(
+    redex: *const RedexHandle,
+) -> *mut c_char {
     let Some(h) = (unsafe { redex.as_ref() }) else {
         return std::ptr::null_mut();
     };
@@ -613,7 +615,7 @@ impl RedexGreedyConfigJson {
 /// config; `NET_ERR_REDEX` for validation errors.
 #[cfg(all(feature = "net", feature = "dataforts"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_enable_greedy_dataforts(
+pub unsafe extern "C" fn net_redex_enable_greedy_dataforts(
     redex: *mut RedexHandle,
     mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
     config_json: *const c_char,
@@ -665,7 +667,7 @@ pub extern "C" fn net_redex_enable_greedy_dataforts(
 /// Uninstall greedy wiring. Idempotent.
 #[cfg(feature = "dataforts")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_disable_greedy_dataforts(redex: *mut RedexHandle) -> c_int {
+pub unsafe extern "C" fn net_redex_disable_greedy_dataforts(redex: *mut RedexHandle) -> c_int {
     let Some(h) = (unsafe { redex.as_ref() }) else {
         return NetError::NullPointer.into();
     };
@@ -681,7 +683,7 @@ pub extern "C" fn net_redex_disable_greedy_dataforts(redex: *mut RedexHandle) ->
 /// when greedy isn't enabled or on a NULL handle.
 #[cfg(feature = "dataforts")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_greedy_cached_channel_count(redex: *const RedexHandle) -> u32 {
+pub unsafe extern "C" fn net_redex_greedy_cached_channel_count(redex: *const RedexHandle) -> u32 {
     let Some(h) = (unsafe { redex.as_ref() }) else {
         return 0;
     };
@@ -700,7 +702,9 @@ pub extern "C" fn net_redex_greedy_cached_channel_count(redex: *const RedexHandl
 /// isn't enabled; NULL on a NULL handle or shutting-down Redex.
 #[cfg(feature = "dataforts")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_greedy_prometheus_text(redex: *const RedexHandle) -> *mut c_char {
+pub unsafe extern "C" fn net_redex_greedy_prometheus_text(
+    redex: *const RedexHandle,
+) -> *mut c_char {
     let Some(h) = (unsafe { redex.as_ref() }) else {
         return std::ptr::null_mut();
     };
@@ -782,7 +786,7 @@ impl RedexGravityConfigJson {
 /// first or the policy fails validation.
 #[cfg(all(feature = "net", feature = "dataforts"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_enable_gravity_for_greedy(
+pub unsafe extern "C" fn net_redex_enable_gravity_for_greedy(
     redex: *mut RedexHandle,
     mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
     config_json: *const c_char,
@@ -829,7 +833,7 @@ pub extern "C" fn net_redex_enable_gravity_for_greedy(
 /// Uninstall gravity. Idempotent. Greedy stays running.
 #[cfg(feature = "dataforts")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_disable_gravity_for_greedy(redex: *mut RedexHandle) -> c_int {
+pub unsafe extern "C" fn net_redex_disable_gravity_for_greedy(redex: *mut RedexHandle) -> c_int {
     let Some(h) = (unsafe { redex.as_ref() }) else {
         return NetError::NullPointer.into();
     };
@@ -855,7 +859,7 @@ pub extern "C" fn net_redex_disable_gravity_for_greedy(redex: *mut RedexHandle) 
 
 #[cfg(not(feature = "dataforts"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_enable_greedy_dataforts(
+pub unsafe extern "C" fn net_redex_enable_greedy_dataforts(
     _redex: *mut RedexHandle,
     mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
     _config_json: *const c_char,
@@ -868,25 +872,27 @@ pub extern "C" fn net_redex_enable_greedy_dataforts(
 
 #[cfg(not(feature = "dataforts"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_disable_greedy_dataforts(_redex: *mut RedexHandle) -> c_int {
+pub unsafe extern "C" fn net_redex_disable_greedy_dataforts(_redex: *mut RedexHandle) -> c_int {
     NET_ERR_FEATURE_NOT_BUILT
 }
 
 #[cfg(not(feature = "dataforts"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_greedy_cached_channel_count(_redex: *const RedexHandle) -> u32 {
+pub unsafe extern "C" fn net_redex_greedy_cached_channel_count(_redex: *const RedexHandle) -> u32 {
     0
 }
 
 #[cfg(not(feature = "dataforts"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_greedy_prometheus_text(_redex: *const RedexHandle) -> *mut c_char {
+pub unsafe extern "C" fn net_redex_greedy_prometheus_text(
+    _redex: *const RedexHandle,
+) -> *mut c_char {
     std::ptr::null_mut()
 }
 
 #[cfg(not(feature = "dataforts"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_enable_gravity_for_greedy(
+pub unsafe extern "C" fn net_redex_enable_gravity_for_greedy(
     _redex: *mut RedexHandle,
     mesh_arc: *mut Arc<crate::adapter::net::MeshNode>,
     _config_json: *const c_char,
@@ -899,7 +905,7 @@ pub extern "C" fn net_redex_enable_gravity_for_greedy(
 
 #[cfg(not(feature = "dataforts"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_disable_gravity_for_greedy(_redex: *mut RedexHandle) -> c_int {
+pub unsafe extern "C" fn net_redex_disable_gravity_for_greedy(_redex: *mut RedexHandle) -> c_int {
     NET_ERR_FEATURE_NOT_BUILT
 }
 
@@ -1018,7 +1024,7 @@ pub struct RedexFileHandle {
 // a struct literal because several fields need conditional logic
 // (fsync policy validation) that inlines awkwardly.
 #[allow(clippy::field_reassign_with_default)]
-pub extern "C" fn net_redex_open_file(
+pub unsafe extern "C" fn net_redex_open_file(
     redex: *mut RedexHandle,
     name: *const c_char,
     config_json: *const c_char,
@@ -1107,7 +1113,7 @@ pub extern "C" fn net_redex_open_file(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_file_free(handle: *mut RedexFileHandle) {
+pub unsafe extern "C" fn net_redex_file_free(handle: *mut RedexFileHandle) {
     if handle.is_null() {
         return;
     }
@@ -1150,7 +1156,7 @@ pub extern "C" fn net_redex_file_free(handle: *mut RedexFileHandle) {
 
 /// Append one payload. Writes the assigned seq to `*out_seq`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_file_append(
+pub unsafe extern "C" fn net_redex_file_append(
     handle: *mut RedexFileHandle,
     payload: *const u8,
     len: usize,
@@ -1168,6 +1174,11 @@ pub extern "C" fn net_redex_file_append(
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
     };
+    // `slice::from_raw_parts` requires `len <= isize::MAX`. A caller
+    // passing a sign-extended `-1` would immediately UB otherwise.
+    if len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let slice = unsafe { std::slice::from_raw_parts(payload, len) };
     match file.inner.append(slice) {
         Ok(seq) => {
@@ -1211,7 +1222,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_file_len(handle: *mut RedexFileHandle) -> u64 {
+pub unsafe extern "C" fn net_redex_file_len(handle: *mut RedexFileHandle) -> u64 {
     if handle.is_null() {
         return 0;
     }
@@ -1229,7 +1240,7 @@ pub extern "C" fn net_redex_file_len(handle: *mut RedexFileHandle) -> u64 {
 
 /// Read the half-open range `[start, end)` into a JSON array.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_file_read_range(
+pub unsafe extern "C" fn net_redex_file_read_range(
     handle: *mut RedexFileHandle,
     start: u64,
     end: u64,
@@ -1254,7 +1265,7 @@ pub extern "C" fn net_redex_file_read_range(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_file_sync(handle: *mut RedexFileHandle) -> c_int {
+pub unsafe extern "C" fn net_redex_file_sync(handle: *mut RedexFileHandle) -> c_int {
     if handle.is_null() {
         return NetError::NullPointer.into();
     }
@@ -1270,7 +1281,7 @@ pub extern "C" fn net_redex_file_sync(handle: *mut RedexFileHandle) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_file_close(handle: *mut RedexFileHandle) -> c_int {
+pub unsafe extern "C" fn net_redex_file_close(handle: *mut RedexFileHandle) -> c_int {
     if handle.is_null() {
         return NetError::NullPointer.into();
     }
@@ -1305,7 +1316,7 @@ pub struct RedexTailHandle {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_file_tail(
+pub unsafe extern "C" fn net_redex_file_tail(
     handle: *mut RedexFileHandle,
     from_seq: u64,
     out_cursor: *mut *mut RedexTailHandle,
@@ -1343,7 +1354,7 @@ pub extern "C" fn net_redex_file_tail(
 /// * `2`  — stream ended (file closed or dropped).
 /// * negative — error.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_tail_next(
+pub unsafe extern "C" fn net_redex_tail_next(
     cursor: *mut RedexTailHandle,
     timeout_ms: u32,
     out_json: *mut *mut c_char,
@@ -1413,7 +1424,7 @@ pub extern "C" fn net_redex_tail_next(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redex_tail_free(cursor: *mut RedexTailHandle) {
+pub unsafe extern "C" fn net_redex_tail_free(cursor: *mut RedexTailHandle) {
     if cursor.is_null() {
         return;
     }
@@ -1453,7 +1464,7 @@ pub struct TasksAdapterHandle {
 /// writes through the Redex's persistent directory (requires the
 /// Redex to have been created with a `persistent_dir`).
 #[unsafe(no_mangle)]
-pub extern "C" fn net_tasks_adapter_open(
+pub unsafe extern "C" fn net_tasks_adapter_open(
     redex: *mut RedexHandle,
     origin_hash: u64,
     persistent: c_int,
@@ -1494,7 +1505,7 @@ pub extern "C" fn net_tasks_adapter_open(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_tasks_adapter_close(handle: *mut TasksAdapterHandle) -> c_int {
+pub unsafe extern "C" fn net_tasks_adapter_close(handle: *mut TasksAdapterHandle) -> c_int {
     if handle.is_null() {
         return NetError::NullPointer.into();
     }
@@ -1510,7 +1521,7 @@ pub extern "C" fn net_tasks_adapter_close(handle: *mut TasksAdapterHandle) -> c_
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_tasks_adapter_free(handle: *mut TasksAdapterHandle) {
+pub unsafe extern "C" fn net_tasks_adapter_free(handle: *mut TasksAdapterHandle) {
     if handle.is_null() {
         return;
     }
@@ -1555,7 +1566,7 @@ impl From<Task> for TaskJson {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_tasks_create(
+pub unsafe extern "C" fn net_tasks_create(
     handle: *mut TasksAdapterHandle,
     id: u64,
     title: *const c_char,
@@ -1585,7 +1596,7 @@ pub extern "C" fn net_tasks_create(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_tasks_rename(
+pub unsafe extern "C" fn net_tasks_rename(
     handle: *mut TasksAdapterHandle,
     id: u64,
     new_title: *const c_char,
@@ -1615,7 +1626,7 @@ pub extern "C" fn net_tasks_rename(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_tasks_complete(
+pub unsafe extern "C" fn net_tasks_complete(
     handle: *mut TasksAdapterHandle,
     id: u64,
     now_ns: u64,
@@ -1641,7 +1652,7 @@ pub extern "C" fn net_tasks_complete(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_tasks_delete(
+pub unsafe extern "C" fn net_tasks_delete(
     handle: *mut TasksAdapterHandle,
     id: u64,
     out_seq: *mut u64,
@@ -1670,7 +1681,7 @@ pub extern "C" fn net_tasks_delete(
 /// `1` on timeout, `NET_ERR_FOLD_STOPPED` (`-106`) if the fold task
 /// stopped before reaching `seq`, or negative on other errors.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_tasks_wait_for_seq(
+pub unsafe extern "C" fn net_tasks_wait_for_seq(
     handle: *mut TasksAdapterHandle,
     seq: u64,
     timeout_ms: u32,
@@ -1708,7 +1719,7 @@ pub extern "C" fn net_tasks_wait_for_seq(
 /// origin does not match this adapter, or `NET_ERR_QUEUE_FULL`
 /// (`-105`) if the per-channel wait queue is saturated.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_tasks_wait_for_token(
+pub unsafe extern "C" fn net_tasks_wait_for_token(
     handle: *mut TasksAdapterHandle,
     origin_hash: u64,
     seq: u64,
@@ -1888,7 +1899,7 @@ fn run_tasks_list(tasks: &InnerTasksAdapter, filter: &TasksFilter) -> Vec<Task> 
 /// List tasks matching `filter_json` (may be NULL). Writes a JSON
 /// array of tasks to `*out_json`; caller frees via `net_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_tasks_list(
+pub unsafe extern "C" fn net_tasks_list(
     handle: *mut TasksAdapterHandle,
     filter_json: *const c_char,
     out_json: *mut *mut c_char,
@@ -1931,7 +1942,7 @@ pub struct TasksWatchHandle {
 /// * `*out_cursor` — watch cursor; iterate via `net_tasks_watch_next`
 ///   and free via `net_tasks_watch_free`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_tasks_snapshot_and_watch(
+pub unsafe extern "C" fn net_tasks_snapshot_and_watch(
     handle: *mut TasksAdapterHandle,
     filter_json: *const c_char,
     out_snapshot: *mut *mut c_char,
@@ -1977,7 +1988,7 @@ pub extern "C" fn net_tasks_snapshot_and_watch(
 /// [`net_redex_tail_next`] — `0` on event (JSON array written),
 /// `1` on timeout, `2` on stream end, negative on error.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_tasks_watch_next(
+pub unsafe extern "C" fn net_tasks_watch_next(
     cursor: *mut TasksWatchHandle,
     timeout_ms: u32,
     out_json: *mut *mut c_char,
@@ -2024,7 +2035,7 @@ pub extern "C" fn net_tasks_watch_next(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_tasks_watch_free(cursor: *mut TasksWatchHandle) {
+pub unsafe extern "C" fn net_tasks_watch_free(cursor: *mut TasksWatchHandle) {
     if cursor.is_null() {
         return;
     }
@@ -2057,7 +2068,7 @@ pub struct MemoriesAdapterHandle {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_adapter_open(
+pub unsafe extern "C" fn net_memories_adapter_open(
     redex: *mut RedexHandle,
     origin_hash: u64,
     persistent: c_int,
@@ -2096,7 +2107,7 @@ pub extern "C" fn net_memories_adapter_open(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_adapter_close(handle: *mut MemoriesAdapterHandle) -> c_int {
+pub unsafe extern "C" fn net_memories_adapter_close(handle: *mut MemoriesAdapterHandle) -> c_int {
     if handle.is_null() {
         return NetError::NullPointer.into();
     }
@@ -2112,7 +2123,7 @@ pub extern "C" fn net_memories_adapter_close(handle: *mut MemoriesAdapterHandle)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_adapter_free(handle: *mut MemoriesAdapterHandle) {
+pub unsafe extern "C" fn net_memories_adapter_free(handle: *mut MemoriesAdapterHandle) {
     if handle.is_null() {
         return;
     }
@@ -2169,7 +2180,7 @@ struct MemoryStoreInput {
 /// Store a memory. Input is a JSON object
 /// `{id, content, tags, source, now_ns}`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_store(
+pub unsafe extern "C" fn net_memories_store(
     handle: *mut MemoriesAdapterHandle,
     input_json: *const c_char,
     out_seq: *mut u64,
@@ -2214,7 +2225,7 @@ struct MemoryRetagInput {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_retag(
+pub unsafe extern "C" fn net_memories_retag(
     handle: *mut MemoriesAdapterHandle,
     input_json: *const c_char,
     out_seq: *mut u64,
@@ -2246,7 +2257,7 @@ pub extern "C" fn net_memories_retag(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_pin(
+pub unsafe extern "C" fn net_memories_pin(
     handle: *mut MemoriesAdapterHandle,
     id: u64,
     now_ns: u64,
@@ -2272,7 +2283,7 @@ pub extern "C" fn net_memories_pin(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_unpin(
+pub unsafe extern "C" fn net_memories_unpin(
     handle: *mut MemoriesAdapterHandle,
     id: u64,
     now_ns: u64,
@@ -2298,7 +2309,7 @@ pub extern "C" fn net_memories_unpin(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_delete(
+pub unsafe extern "C" fn net_memories_delete(
     handle: *mut MemoriesAdapterHandle,
     id: u64,
     out_seq: *mut u64,
@@ -2323,7 +2334,7 @@ pub extern "C" fn net_memories_delete(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_wait_for_seq(
+pub unsafe extern "C" fn net_memories_wait_for_seq(
     handle: *mut MemoriesAdapterHandle,
     seq: u64,
     timeout_ms: u32,
@@ -2359,7 +2370,7 @@ pub extern "C" fn net_memories_wait_for_seq(
 /// Read-your-writes wait. See [`net_tasks_wait_for_token`] for the
 /// return-code contract.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_wait_for_token(
+pub unsafe extern "C" fn net_memories_wait_for_token(
     handle: *mut MemoriesAdapterHandle,
     origin_hash: u64,
     seq: u64,
@@ -2561,7 +2572,7 @@ fn run_memories_list(mem: &InnerMemoriesAdapter, filter: &MemoriesFilter) -> Vec
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_list(
+pub unsafe extern "C" fn net_memories_list(
     handle: *mut MemoriesAdapterHandle,
     filter_json: *const c_char,
     out_json: *mut *mut c_char,
@@ -2594,7 +2605,7 @@ pub struct MemoriesWatchHandle {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_snapshot_and_watch(
+pub unsafe extern "C" fn net_memories_snapshot_and_watch(
     handle: *mut MemoriesAdapterHandle,
     filter_json: *const c_char,
     out_snapshot: *mut *mut c_char,
@@ -2635,7 +2646,7 @@ pub extern "C" fn net_memories_snapshot_and_watch(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_watch_next(
+pub unsafe extern "C" fn net_memories_watch_next(
     cursor: *mut MemoriesWatchHandle,
     timeout_ms: u32,
     out_json: *mut *mut c_char,
@@ -2682,7 +2693,7 @@ pub extern "C" fn net_memories_watch_next(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_memories_watch_free(cursor: *mut MemoriesWatchHandle) {
+pub unsafe extern "C" fn net_memories_watch_free(cursor: *mut MemoriesWatchHandle) {
     if cursor.is_null() {
         return;
     }
@@ -2801,7 +2812,7 @@ fn build_netdb_handle(
 ///   * `NetError::ShuttingDown` when the parent Redex is in `_free`.
 ///   * `NET_ERR_NETDB` when any adapter open fails.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_netdb_open(
+pub unsafe extern "C" fn net_netdb_open(
     redex: *mut RedexHandle,
     config_json: *const c_char,
     out_handle: *mut *mut NetDbHandle,
@@ -2871,7 +2882,7 @@ pub extern "C" fn net_netdb_open(
 /// as [`net_netdb_open`]. `bundle_len == 0` is treated as a no-op
 /// "open from scratch" — equivalent to `net_netdb_open`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_netdb_open_from_snapshot(
+pub unsafe extern "C" fn net_netdb_open_from_snapshot(
     redex: *mut RedexHandle,
     config_json: *const c_char,
     bundle: *const u8,
@@ -2894,6 +2905,10 @@ pub extern "C" fn net_netdb_open_from_snapshot(
     let snapshot: Option<NetDbSnapshot> = if bundle_len == 0 {
         None
     } else {
+        // `slice::from_raw_parts` requires `len <= isize::MAX`.
+        if bundle_len > isize::MAX as usize {
+            return NetError::InvalidJson.into();
+        }
         let slice = unsafe { std::slice::from_raw_parts(bundle, bundle_len) };
         match NetDbSnapshot::decode(slice) {
             Ok(s) => Some(s),
@@ -2989,7 +3004,7 @@ pub extern "C" fn net_netdb_open_from_snapshot(
 /// of `NetDbSnapshot` and round-trips with the Rust + napi + PyO3
 /// snapshot calls.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_netdb_snapshot(
+pub unsafe extern "C" fn net_netdb_snapshot(
     handle: *mut NetDbHandle,
     out_bytes: *mut *mut u8,
     out_len: *mut usize,
@@ -3043,7 +3058,7 @@ pub extern "C" fn net_netdb_snapshot(
 /// call; passing a different `len` or a pointer not originated from
 /// `net_netdb_snapshot` is undefined behavior.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_netdb_free_bundle(bytes: *mut u8, len: usize) {
+pub unsafe extern "C" fn net_netdb_free_bundle(bytes: *mut u8, len: usize) {
     if bytes.is_null() || len == 0 {
         return;
     }
@@ -3062,7 +3077,7 @@ pub extern "C" fn net_netdb_free_bundle(bytes: *mut u8, len: usize) {
 /// underlying adapter (the NetDb still holds its own clone). Returns
 /// `NET_ERR_NETDB` if the tasks model wasn't enabled at open time.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_netdb_tasks(
+pub unsafe extern "C" fn net_netdb_tasks(
     handle: *mut NetDbHandle,
     out_handle: *mut *mut TasksAdapterHandle,
 ) -> c_int {
@@ -3093,7 +3108,7 @@ pub extern "C" fn net_netdb_tasks(
 
 /// Mirror of [`net_netdb_tasks`] for the memories model.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_netdb_memories(
+pub unsafe extern "C" fn net_netdb_memories(
     handle: *mut NetDbHandle,
     out_handle: *mut *mut MemoriesAdapterHandle,
 ) -> c_int {
@@ -3127,7 +3142,7 @@ pub extern "C" fn net_netdb_memories(
 /// observable — matches the Rust core's `NetDb::close()` semantics. The
 /// underlying RedEX files stay open on the parent manager.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_netdb_close(handle: *mut NetDbHandle) -> c_int {
+pub unsafe extern "C" fn net_netdb_close(handle: *mut NetDbHandle) -> c_int {
     if handle.is_null() {
         return NetError::NullPointer.into();
     }
@@ -3164,7 +3179,7 @@ pub extern "C" fn net_netdb_close(handle: *mut NetDbHandle) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_netdb_free(handle: *mut NetDbHandle) {
+pub unsafe extern "C" fn net_netdb_free(handle: *mut NetDbHandle) {
     if handle.is_null() {
         return;
     }
@@ -3219,7 +3234,7 @@ mod tests {
     use std::thread;
 
     fn redex() -> *mut RedexHandle {
-        net_redex_new(ptr::null())
+        unsafe { net_redex_new(ptr::null()) }
     }
 
     fn open_file(redex: *mut RedexHandle, name: &str, cfg_json: Option<&str>) -> c_int {
@@ -3227,11 +3242,13 @@ mod tests {
         let cfg_c = cfg_json.map(|s| CString::new(s).unwrap());
         let cfg_ptr = cfg_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null());
         let mut handle: *mut RedexFileHandle = ptr::null_mut();
-        let rc = net_redex_open_file(redex, name_c.as_ptr(), cfg_ptr, &mut handle);
-        if rc == 0 && !handle.is_null() {
-            net_redex_file_free(handle);
+        unsafe {
+            let rc = net_redex_open_file(redex, name_c.as_ptr(), cfg_ptr, &mut handle);
+            if rc == 0 && !handle.is_null() {
+                net_redex_file_free(handle);
+            }
+            rc
         }
-        rc
     }
 
     /// Conflicting `fsync_every_n` AND `fsync_interval_ms`, as well
@@ -3270,7 +3287,7 @@ mod tests {
             );
         }
 
-        net_redex_free(r);
+        unsafe { net_redex_free(r) };
     }
 
     /// Pin: `net_redex_open_file` rejects `Some(0)` for any
@@ -3315,7 +3332,7 @@ mod tests {
             );
         }
 
-        net_redex_free(r);
+        unsafe { net_redex_free(r) };
     }
 
     /// `net_redex_open_file` must pre-zero `*out_handle` on entry so
@@ -3334,13 +3351,13 @@ mod tests {
         // sentinel in place after the InvalidJson return.
         let sentinel = 0xDEAD_BEEF_usize as *mut RedexFileHandle;
         let mut handle: *mut RedexFileHandle = sentinel;
-        let rc = net_redex_open_file(r, name.as_ptr(), cfg.as_ptr(), &mut handle);
+        let rc = unsafe { net_redex_open_file(r, name.as_ptr(), cfg.as_ptr(), &mut handle) };
         assert_eq!(rc, NetError::InvalidJson as c_int);
         assert!(
             handle.is_null(),
             "out_handle must be null after rc != 0; got {handle:?}"
         );
-        net_redex_free(r);
+        unsafe { net_redex_free(r) };
     }
 
     /// `net_redex_file_tail` must pre-zero `*out_cursor` on entry
@@ -3353,24 +3370,26 @@ mod tests {
         let r = redex();
         let name = CString::new("tail-zero").unwrap();
         let mut file: *mut RedexFileHandle = ptr::null_mut();
-        assert_eq!(
-            net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
-            0
-        );
-        // Free the file. begin_free flips freeing=true; the outer
-        // box stays leaked, so subsequent calls go through but
-        // try_enter bails with ShuttingDown.
-        net_redex_file_free(file);
+        unsafe {
+            assert_eq!(
+                net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
+                0
+            );
+            // Free the file. begin_free flips freeing=true; the outer
+            // box stays leaked, so subsequent calls go through but
+            // try_enter bails with ShuttingDown.
+            net_redex_file_free(file);
+        }
 
         let sentinel = 0xDEAD_BEEF_usize as *mut RedexTailHandle;
         let mut cursor: *mut RedexTailHandle = sentinel;
-        let rc = net_redex_file_tail(file, 0, &mut cursor);
+        let rc = unsafe { net_redex_file_tail(file, 0, &mut cursor) };
         assert_eq!(rc, NetError::ShuttingDown as c_int);
         assert!(
             cursor.is_null(),
             "out_cursor must be null after rc != 0; got {cursor:?}"
         );
-        net_redex_free(r);
+        unsafe { net_redex_free(r) };
     }
 
     /// `net_redex_open_file` with non-JSON config must return
@@ -3382,10 +3401,10 @@ mod tests {
         let name = CString::new("bad-json").unwrap();
         let cfg = CString::new("not-json {").unwrap();
         let mut handle: *mut RedexFileHandle = ptr::null_mut();
-        let rc = net_redex_open_file(r, name.as_ptr(), cfg.as_ptr(), &mut handle);
+        let rc = unsafe { net_redex_open_file(r, name.as_ptr(), cfg.as_ptr(), &mut handle) };
         assert_eq!(rc, NetError::InvalidJson as c_int);
         assert!(handle.is_null());
-        net_redex_free(r);
+        unsafe { net_redex_free(r) };
     }
 
     /// Once the underlying RedexFile is closed, an outstanding tail
@@ -3399,31 +3418,37 @@ mod tests {
         let r = redex();
         let name = CString::new("tail-close").unwrap();
         let mut file: *mut RedexFileHandle = ptr::null_mut();
-        assert_eq!(
-            net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
-            0
-        );
+        unsafe {
+            assert_eq!(
+                net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
+                0
+            );
+        }
 
         let mut cursor: *mut RedexTailHandle = ptr::null_mut();
-        assert_eq!(net_redex_file_tail(file, 0, &mut cursor), 0);
+        unsafe {
+            assert_eq!(net_redex_file_tail(file, 0, &mut cursor), 0);
 
-        // Close the file while the cursor is live.
-        assert_eq!(net_redex_file_close(file), 0);
+            // Close the file while the cursor is live.
+            assert_eq!(net_redex_file_close(file), 0);
+        }
 
         // Next call on the cursor must return STREAM_ENDED, not
         // block, not panic, not return an error code.
         let mut out_json: *mut c_char = ptr::null_mut();
         let mut out_len: usize = 0;
-        let rc = net_redex_tail_next(cursor, 1_000, &mut out_json, &mut out_len);
+        let rc = unsafe { net_redex_tail_next(cursor, 1_000, &mut out_json, &mut out_len) };
         assert_eq!(
             rc, NET_ERR_STREAM_ENDED,
             "expected STREAM_ENDED after file close (got {rc})"
         );
         assert!(out_json.is_null(), "no event payload should be written");
 
-        net_redex_tail_free(cursor);
-        net_redex_file_free(file);
-        net_redex_free(r);
+        unsafe {
+            net_redex_tail_free(cursor);
+            net_redex_file_free(file);
+            net_redex_free(r);
+        }
     }
 
     /// A Go cgo / Python-thread caller racing
@@ -3450,22 +3475,25 @@ mod tests {
         let r = redex();
         let name = CString::new("free-then-op").unwrap();
         let mut file: *mut RedexFileHandle = ptr::null_mut();
-        assert_eq!(
-            net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
-            0
-        );
+        unsafe {
+            assert_eq!(
+                net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
+                0
+            );
+        }
         assert!(!file.is_null());
 
         // Free the file. begin_free drains immediately (no in-flight
         // ops), takes the inner, leaks the outer box.
-        net_redex_file_free(file);
+        unsafe { net_redex_file_free(file) };
 
         // Subsequent ops via the same handle must bail with
         // ShuttingDown — try_enter sees freeing=true, decrements,
         // returns None. They must NOT touch the taken inner.
         let payload = b"x";
         let mut out_seq: u64 = 0;
-        let rc = net_redex_file_append(file, payload.as_ptr(), payload.len(), &mut out_seq);
+        let rc =
+            unsafe { net_redex_file_append(file, payload.as_ptr(), payload.len(), &mut out_seq) };
         assert_eq!(
             rc,
             NetError::ShuttingDown as c_int,
@@ -3475,17 +3503,19 @@ mod tests {
 
         // _len takes the silent path (returns 0 — same as the absent
         // case) per its contract.
-        assert_eq!(net_redex_file_len(file), 0);
+        assert_eq!(unsafe { net_redex_file_len(file) }, 0);
 
         // _read_range / _sync / _close also bail with ShuttingDown.
         let mut out_json: *mut c_char = ptr::null_mut();
         let mut out_len: usize = 0;
-        let rc = net_redex_file_read_range(file, 0, 1, &mut out_json, &mut out_len);
-        assert_eq!(rc, NetError::ShuttingDown as c_int);
-        assert_eq!(net_redex_file_sync(file), NetError::ShuttingDown as c_int);
-        assert_eq!(net_redex_file_close(file), NetError::ShuttingDown as c_int);
+        unsafe {
+            let rc = net_redex_file_read_range(file, 0, 1, &mut out_json, &mut out_len);
+            assert_eq!(rc, NetError::ShuttingDown as c_int);
+            assert_eq!(net_redex_file_sync(file), NetError::ShuttingDown as c_int);
+            assert_eq!(net_redex_file_close(file), NetError::ShuttingDown as c_int);
 
-        net_redex_free(r);
+            net_redex_free(r);
+        }
     }
 
     /// Pin: `net_redex_file_free` is idempotent under the post-fix
@@ -3500,15 +3530,17 @@ mod tests {
         let r = redex();
         let name = CString::new("free-twice").unwrap();
         let mut file: *mut RedexFileHandle = ptr::null_mut();
-        assert_eq!(
-            net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
-            0
-        );
-        net_redex_file_free(file);
-        // Second free: must not panic, must not double-take the
-        // ManuallyDrop, must not deallocate the outer box.
-        net_redex_file_free(file);
-        net_redex_free(r);
+        unsafe {
+            assert_eq!(
+                net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
+                0
+            );
+            net_redex_file_free(file);
+            // Second free: must not panic, must not double-take the
+            // ManuallyDrop, must not deallocate the outer box.
+            net_redex_file_free(file);
+            net_redex_free(r);
+        }
     }
 
     /// A `net_redex_file_free` racing an in-flight
@@ -3528,10 +3560,12 @@ mod tests {
         let r = redex();
         let name = CString::new("free-races-append").unwrap();
         let mut file: *mut RedexFileHandle = ptr::null_mut();
-        assert_eq!(
-            net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
-            0
-        );
+        unsafe {
+            assert_eq!(
+                net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
+                0
+            );
+        }
 
         // Smuggle the raw pointer across threads via usize. The
         // contract: pre- and during-the-append, no `_free` runs;
@@ -3557,7 +3591,8 @@ mod tests {
             // longer-running op. In production a long op is e.g.
             // a large read_range with serialization.
             std::thread::sleep(std::time::Duration::from_millis(30));
-            let rc = net_redex_file_append(h, payload.as_ptr(), payload.len(), &mut out_seq);
+            let rc =
+                unsafe { net_redex_file_append(h, payload.as_ptr(), payload.len(), &mut out_seq) };
             done_w.store(true, Ordering::SeqCst);
             // The append should succeed if it ran before _free's
             // begin_free flipped freeing. If it ran after, it
@@ -3578,7 +3613,7 @@ mod tests {
         // worker's append (which the worker holds via try_enter)
         // releases; pre-fix it would proceed immediately and the
         // worker's subsequent inner-deref would UAF.
-        net_redex_file_free(file);
+        unsafe { net_redex_file_free(file) };
 
         worker.join().unwrap();
         assert!(
@@ -3587,7 +3622,7 @@ mod tests {
              past the watchdog if free's begin_free deadlocked",
         );
 
-        net_redex_free(r);
+        unsafe { net_redex_free(r) };
     }
 
     /// `runtime()` is a process-wide `OnceLock<Arc<Runtime>>`. Many
@@ -3631,8 +3666,10 @@ mod tests {
     #[test]
     fn replication_runtime_count_zero_when_not_enabled() {
         let r = redex();
-        assert_eq!(net_redex_replication_runtime_count(r), 0);
-        net_redex_free(r);
+        unsafe {
+            assert_eq!(net_redex_replication_runtime_count(r), 0);
+            net_redex_free(r);
+        }
     }
 
     /// `replication_prometheus_text` returns the empty string
@@ -3642,19 +3679,21 @@ mod tests {
     #[test]
     fn replication_prometheus_text_empty_when_not_enabled() {
         let r = redex();
-        let p = net_redex_replication_prometheus_text(r);
+        let p = unsafe { net_redex_replication_prometheus_text(r) };
         assert!(!p.is_null());
         let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap();
         assert_eq!(s, "");
-        crate::ffi::net_free_string(p);
-        net_redex_free(r);
+        unsafe {
+            crate::ffi::net_free_string(p);
+            net_redex_free(r);
+        }
     }
 
     /// `replication_prometheus_text` returns NULL on a NULL handle —
     /// defensive; the Go side typically guards before calling.
     #[test]
     fn replication_prometheus_text_null_handle_returns_null() {
-        let p = net_redex_replication_prometheus_text(ptr::null());
+        let p = unsafe { net_redex_replication_prometheus_text(ptr::null()) };
         assert!(p.is_null());
     }
 
@@ -3667,7 +3706,7 @@ mod tests {
         let cfg = r#"{"replication":{"factor":3,"heartbeat_ms":500}}"#;
         let rc = open_file(r, "ffi/repl_unconfigured", Some(cfg));
         assert_eq!(rc, NET_ERR_REDEX);
-        net_redex_free(r);
+        unsafe { net_redex_free(r) };
     }
 
     /// Invalid replication config (factor below MIN, unknown
@@ -3691,16 +3730,18 @@ mod tests {
         let rc = open_file(r, "ffi/repl_invalid_policy", Some(cfg));
         assert_eq!(rc, NET_ERR_REDEX);
 
-        net_redex_free(r);
+        unsafe { net_redex_free(r) };
     }
 
     /// NULL `redex` to the replication functions surfaces 0 /
     /// NULL respectively (the documented defensive shape).
     #[test]
     fn replication_functions_idempotent_on_null_redex() {
-        assert_eq!(net_redex_replication_runtime_count(ptr::null()), 0);
-        let p = net_redex_replication_prometheus_text(ptr::null());
-        assert!(p.is_null());
+        unsafe {
+            assert_eq!(net_redex_replication_runtime_count(ptr::null()), 0);
+            let p = net_redex_replication_prometheus_text(ptr::null());
+            assert!(p.is_null());
+        }
     }
 
     /// R-8 regression: `net_redex_enable_replication` must drop
@@ -3734,7 +3775,7 @@ mod tests {
 
         // NULL redex, valid mesh_arc — must drop boxed_arc and
         // surface NullPointer.
-        let rc = net_redex_enable_replication(ptr::null_mut(), boxed_arc);
+        let rc = unsafe { net_redex_enable_replication(ptr::null_mut(), boxed_arc) };
         let expected: c_int = NetError::NullPointer.into();
         assert_eq!(rc, expected);
         assert_eq!(
@@ -3767,7 +3808,8 @@ mod tests {
         let boxed_arc: *mut Arc<MeshNode> = Box::into_raw(Box::new(mesh.clone()));
         assert_eq!(Arc::strong_count(&mesh), pre_count + 1);
 
-        let rc = net_redex_enable_greedy_dataforts(ptr::null_mut(), boxed_arc, ptr::null());
+        let rc =
+            unsafe { net_redex_enable_greedy_dataforts(ptr::null_mut(), boxed_arc, ptr::null()) };
         let expected: c_int = NetError::NullPointer.into();
         assert_eq!(rc, expected);
         assert_eq!(
@@ -3802,39 +3844,39 @@ mod tests {
         // Minimal config — just disable intent matching so the
         // empty-registry path doesn't gate us.
         let cfg_json = CString::new(r#"{"intent_match":"disabled"}"#).unwrap();
-        let rc = net_redex_enable_greedy_dataforts(r, boxed_arc, cfg_json.as_ptr());
+        let rc = unsafe { net_redex_enable_greedy_dataforts(r, boxed_arc, cfg_json.as_ptr()) };
         assert_eq!(rc, 0, "enable must succeed");
 
         // No channels yet — count is 0.
-        assert_eq!(net_redex_greedy_cached_channel_count(r), 0);
+        assert_eq!(unsafe { net_redex_greedy_cached_channel_count(r) }, 0);
 
         // Prometheus text is non-null and contains the metric
         // family header.
-        let p = net_redex_greedy_prometheus_text(r);
+        let p = unsafe { net_redex_greedy_prometheus_text(r) };
         assert!(!p.is_null());
         let text = unsafe { std::ffi::CStr::from_ptr(p) }
             .to_string_lossy()
             .into_owned();
-        super::super::net_free_string(p);
+        unsafe { super::super::net_free_string(p) };
         assert!(
             text.contains("dataforts_greedy_admit_rejected_total"),
             "Prometheus text must include the admit-rejected metric family"
         );
 
         // Uninstall + verify.
-        assert_eq!(net_redex_disable_greedy_dataforts(r), 0);
-        let p_after = net_redex_greedy_prometheus_text(r);
+        assert_eq!(unsafe { net_redex_disable_greedy_dataforts(r) }, 0);
+        let p_after = unsafe { net_redex_greedy_prometheus_text(r) };
         assert!(!p_after.is_null());
         let after_text = unsafe { std::ffi::CStr::from_ptr(p_after) }
             .to_string_lossy()
             .into_owned();
-        super::super::net_free_string(p_after);
+        unsafe { super::super::net_free_string(p_after) };
         assert!(
             after_text.is_empty(),
             "post-disable Prometheus text must be empty; got {after_text:?}"
         );
 
-        net_redex_free(r);
+        unsafe { net_redex_free(r) };
     }
 
     // =====================================================================
@@ -3850,7 +3892,7 @@ mod tests {
         );
         let cfg_c = CString::new(cfg).unwrap();
         let mut h: *mut NetDbHandle = ptr::null_mut();
-        let rc = net_netdb_open(r, cfg_c.as_ptr(), &mut h);
+        let rc = unsafe { net_netdb_open(r, cfg_c.as_ptr(), &mut h) };
         assert_eq!(rc, 0, "net_netdb_open should succeed (rc={rc})");
         assert!(!h.is_null());
         h
@@ -3865,10 +3907,10 @@ mod tests {
         let bad = CString::new("not json").unwrap();
         let sentinel = 0xDEAD_BEEF_usize as *mut NetDbHandle;
         let mut h: *mut NetDbHandle = sentinel;
-        let rc = net_netdb_open(r, bad.as_ptr(), &mut h);
+        let rc = unsafe { net_netdb_open(r, bad.as_ptr(), &mut h) };
         assert_eq!(rc, NetError::InvalidJson as c_int);
         assert!(h.is_null(), "expected null on error, got {h:?}");
-        net_redex_free(r);
+        unsafe { net_redex_free(r) };
     }
 
     /// Asking `net_netdb_tasks` for a model that wasn't enabled at open
@@ -3879,23 +3921,29 @@ mod tests {
         let cfg =
             CString::new(r#"{"origin_hash":42,"with_tasks":true,"with_memories":false}"#).unwrap();
         let mut db: *mut NetDbHandle = ptr::null_mut();
-        assert_eq!(net_netdb_open(r, cfg.as_ptr(), &mut db), 0);
+        unsafe {
+            assert_eq!(net_netdb_open(r, cfg.as_ptr(), &mut db), 0);
+        }
 
         // Tasks was enabled → accessor succeeds.
         let mut t: *mut TasksAdapterHandle = ptr::null_mut();
-        assert_eq!(net_netdb_tasks(db, &mut t), 0);
+        unsafe {
+            assert_eq!(net_netdb_tasks(db, &mut t), 0);
+        }
         assert!(!t.is_null());
-        net_tasks_adapter_free(t);
+        unsafe { net_tasks_adapter_free(t) };
 
         // Memories was NOT enabled → accessor returns NET_ERR_NETDB.
         let sentinel = 0xDEAD_BEEF_usize as *mut MemoriesAdapterHandle;
         let mut m: *mut MemoriesAdapterHandle = sentinel;
-        let rc = net_netdb_memories(db, &mut m);
+        let rc = unsafe { net_netdb_memories(db, &mut m) };
         assert_eq!(rc, NET_ERR_NETDB);
         assert!(m.is_null(), "expected null on error, got {m:?}");
 
-        net_netdb_free(db);
-        net_redex_free(r);
+        unsafe {
+            net_netdb_free(db);
+            net_redex_free(r);
+        }
     }
 
     /// Snapshot bytes round-trip: capture a bundle from a populated
@@ -3909,60 +3957,70 @@ mod tests {
 
         // Seed: create one task on the source DB.
         let mut t: *mut TasksAdapterHandle = ptr::null_mut();
-        assert_eq!(net_netdb_tasks(db, &mut t), 0);
         let title = CString::new("first").unwrap();
         let mut seq: u64 = 0;
-        assert_eq!(
-            net_tasks_create(t, 1, title.as_ptr(), 1_000_000, &mut seq),
-            0
-        );
-        // Wait for the fold to apply so the snapshot has the task baked in.
-        assert_eq!(net_tasks_wait_for_seq(t, seq, 500), 0);
-        net_tasks_adapter_free(t);
+        unsafe {
+            assert_eq!(net_netdb_tasks(db, &mut t), 0);
+            assert_eq!(
+                net_tasks_create(t, 1, title.as_ptr(), 1_000_000, &mut seq),
+                0
+            );
+            // Wait for the fold to apply so the snapshot has the task baked in.
+            assert_eq!(net_tasks_wait_for_seq(t, seq, 500), 0);
+            net_tasks_adapter_free(t);
+        }
 
         // Capture snapshot.
         let mut bytes: *mut u8 = ptr::null_mut();
         let mut len: usize = 0;
-        assert_eq!(net_netdb_snapshot(db, &mut bytes, &mut len), 0);
+        unsafe {
+            assert_eq!(net_netdb_snapshot(db, &mut bytes, &mut len), 0);
+        }
         assert!(!bytes.is_null());
         assert!(len > 0, "snapshot bundle should not be empty");
 
         // Close + free the source DB; the task survives in the bundle.
-        let _ = net_netdb_close(db);
-        net_netdb_free(db);
+        unsafe {
+            let _ = net_netdb_close(db);
+            net_netdb_free(db);
+        }
 
         // Restore into a fresh DB.
         let cfg =
             CString::new(r#"{"origin_hash":3735928559,"with_tasks":true,"with_memories":true}"#)
                 .unwrap();
         let mut db2: *mut NetDbHandle = ptr::null_mut();
-        let rc = net_netdb_open_from_snapshot(r, cfg.as_ptr(), bytes, len, &mut db2);
+        let rc = unsafe { net_netdb_open_from_snapshot(r, cfg.as_ptr(), bytes, len, &mut db2) };
         assert_eq!(rc, 0, "restore should succeed (rc={rc})");
         assert!(!db2.is_null());
 
         // Read back tasks and verify the original task is present.
         let mut t2: *mut TasksAdapterHandle = ptr::null_mut();
-        assert_eq!(net_netdb_tasks(db2, &mut t2), 0);
         let filter = CString::new("{}").unwrap();
         let mut list_json: *mut c_char = ptr::null_mut();
         let mut list_len: usize = 0;
-        assert_eq!(
-            net_tasks_list(t2, filter.as_ptr(), &mut list_json, &mut list_len),
-            0
-        );
+        unsafe {
+            assert_eq!(net_netdb_tasks(db2, &mut t2), 0);
+            assert_eq!(
+                net_tasks_list(t2, filter.as_ptr(), &mut list_json, &mut list_len),
+                0
+            );
+        }
         let list = unsafe { CStr::from_ptr(list_json) }
             .to_string_lossy()
             .into_owned();
-        super::super::net_free_string(list_json);
+        unsafe { super::super::net_free_string(list_json) };
         assert!(
             list.contains("\"first\""),
             "restored task list should contain the seeded title; got {list}"
         );
-        net_tasks_adapter_free(t2);
+        unsafe {
+            net_tasks_adapter_free(t2);
 
-        net_netdb_free_bundle(bytes, len);
-        net_netdb_free(db2);
-        net_redex_free(r);
+            net_netdb_free_bundle(bytes, len);
+            net_netdb_free(db2);
+            net_redex_free(r);
+        }
     }
 
     /// `net_netdb_free_bundle` must NULL-safe-accept null / zero-len
@@ -3971,10 +4029,12 @@ mod tests {
     #[test]
     fn netdb_free_bundle_is_null_safe() {
         // Both no-ops; the test passes if neither aborts.
-        net_netdb_free_bundle(ptr::null_mut(), 0);
-        net_netdb_free_bundle(ptr::null_mut(), 16);
-        let mut buf: Vec<u8> = vec![0u8; 4];
-        net_netdb_free_bundle(buf.as_mut_ptr(), 0);
+        unsafe {
+            net_netdb_free_bundle(ptr::null_mut(), 0);
+            net_netdb_free_bundle(ptr::null_mut(), 16);
+            let mut buf: Vec<u8> = vec![0u8; 4];
+            net_netdb_free_bundle(buf.as_mut_ptr(), 0);
+        }
     }
 
     /// `net_netdb_open_from_snapshot` with `bundle_len == 0` opens from
@@ -3985,10 +4045,12 @@ mod tests {
         let cfg =
             CString::new(r#"{"origin_hash":1,"with_tasks":true,"with_memories":false}"#).unwrap();
         let mut db: *mut NetDbHandle = ptr::null_mut();
-        let rc = net_netdb_open_from_snapshot(r, cfg.as_ptr(), ptr::null(), 0, &mut db);
+        let rc = unsafe { net_netdb_open_from_snapshot(r, cfg.as_ptr(), ptr::null(), 0, &mut db) };
         assert_eq!(rc, 0);
         assert!(!db.is_null());
-        net_netdb_free(db);
-        net_redex_free(r);
+        unsafe {
+            net_netdb_free(db);
+            net_redex_free(r);
+        }
     }
 }

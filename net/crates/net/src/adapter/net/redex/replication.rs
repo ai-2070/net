@@ -60,7 +60,7 @@ pub const DISPATCH_REPLICA_SYNC_RESERVED_END: u8 = 0x30;
 
 /// Fixed encoded size of a [`SyncRequest`] message including the
 /// 3-byte subprotocol header.
-pub const SYNC_REQUEST_SIZE: usize = 3 + 32 + 8 + 4; // 47
+pub const SYNC_REQUEST_SIZE: usize = 3 + 32 + 8 + 4 + 8; // 55
 
 /// Fixed encoded size of a [`SyncHeartbeat`] message including the
 /// 3-byte subprotocol header.
@@ -190,7 +190,7 @@ pub struct SyncEvent {
 }
 
 /// Replica → leader: pull request for events
-/// `[since_seq, since_seq + chunk_max)`. Fixed 47-byte size.
+/// `[since_seq, since_seq + chunk_max)`. Fixed 55-byte size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncRequest {
     /// 32-byte BLAKE2s hash of the channel name.
@@ -201,6 +201,15 @@ pub struct SyncRequest {
     /// Maximum payload bytes the leader may send in the matching
     /// [`SyncResponse`].
     pub chunk_max: u32,
+    /// Replica-minted correlation token. The leader echoes it
+    /// verbatim on the matching `SyncResponse` / `SyncNack`. The
+    /// replica's `OutstandingRequests` set holds the minted token
+    /// until the response lands; responses or NACKs whose token
+    /// is not in the set are dropped. Random 64-bit value drawn
+    /// from `getrandom` per request so a stale NACK from a prior
+    /// epoch (or any peer that observed wire traffic) cannot match
+    /// an in-flight request the replica is currently waiting on.
+    pub request_id: u64,
 }
 
 /// Leader → replica: bounded chunk of events answering the matching
@@ -225,6 +234,12 @@ pub struct SyncResponse {
     /// observability-wise the divergence case is flagged with a
     /// distinct metric for operator review.
     pub leader_first_retained_seq: u64,
+    /// Echo of the matching `SyncRequest::request_id`. Replicas
+    /// drop responses whose token is not in their in-flight set
+    /// (per-leader pending state). Without this, a stale response
+    /// from a prior request the replica had already timed out and
+    /// re-issued would land on the current request's apply path.
+    pub request_id: u64,
     /// In-order event records. `event_seq` increases monotonically
     /// across the slice; no gaps within a chunk.
     pub events: Vec<SyncEvent>,
@@ -264,6 +279,19 @@ pub struct SyncNack {
     pub since_seq: u64,
     /// Typed rejection reason. Replicas key their retry policy here.
     pub error_code: SyncNackError,
+    /// Leader's first-retained sequence at the time of the reject.
+    /// Populated by the leader on `BadRange` so the replica can
+    /// `skip_to(leader_first_retained_seq)` in one round trip
+    /// instead of advancing by one per `BadRange` cycle. Set to
+    /// `0` on other error codes; receivers ignore it outside the
+    /// `BadRange` arm.
+    pub leader_first_retained_seq: u64,
+    /// Echo of the matching `SyncRequest::request_id`. Replicas
+    /// drop NACKs whose token is not in their in-flight set.
+    /// Without this, a stale `BadRange` NACK from a prior request
+    /// the replica had timed out and re-issued would still drive
+    /// `skip_to` on the local file — destructive on retry.
+    pub request_id: u64,
     /// Optional human-readable diagnostic. UTF-8 encoded; may be
     /// empty. The replica's retry policy keys off `error_code` only —
     /// `detail` is for operator logs.
@@ -356,13 +384,14 @@ fn get_channel_id(cursor: &mut &[u8]) -> ChannelId {
 // ============================================================================
 
 impl SyncRequest {
-    /// Serialize to bytes. Fixed [`SYNC_REQUEST_SIZE`] (47) bytes.
+    /// Serialize to bytes. Fixed [`SYNC_REQUEST_SIZE`] (55) bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(SYNC_REQUEST_SIZE);
         put_header(&mut buf, DISPATCH_SYNC_REQUEST);
         buf.put_slice(self.channel_id.as_bytes());
         buf.put_u64_le(self.since_seq);
         buf.put_u32_le(self.chunk_max);
+        buf.put_u64_le(self.request_id);
         debug_assert_eq!(buf.len(), SYNC_REQUEST_SIZE);
         buf
     }
@@ -382,10 +411,12 @@ impl SyncRequest {
         let channel_id = get_channel_id(&mut cursor);
         let since_seq = cursor.get_u64_le();
         let chunk_max = cursor.get_u32_le();
+        let request_id = cursor.get_u64_le();
         Ok(Self {
             channel_id,
             since_seq,
             chunk_max,
+            request_id,
         })
     }
 }
@@ -395,20 +426,21 @@ impl SyncRequest {
 // ============================================================================
 
 impl SyncResponse {
-    /// Serialize to bytes. Variable size: header + 32 + 8 + 8 + 4 +
-    /// Σ(8 + 4 + payload.len()) over events.
-    /// (R-5: added 8 bytes for `leader_first_retained_seq`.)
+    /// Serialize to bytes. Variable size: header + 32 + 8 + 8 + 8 +
+    /// 4 + Σ(8 + 4 + payload.len()) over events.
+    /// (R-23: added 8 bytes for `request_id` echo.)
     pub fn to_bytes(&self) -> Vec<u8> {
         // Cap the pre-allocation against `u32::MAX` — `event_count`
         // is the wire-format width, so we can't honestly encode
         // more than `u32::MAX` events anyway, and on 32-bit hosts
         // the multiplication below would overflow `usize` otherwise.
         let events_size: usize = self.events.iter().map(|e| 8 + 4 + e.payload.len()).sum();
-        let mut buf = Vec::with_capacity(3 + 32 + 8 + 8 + 4 + events_size);
+        let mut buf = Vec::with_capacity(3 + 32 + 8 + 8 + 8 + 4 + events_size);
         put_header(&mut buf, DISPATCH_SYNC_RESPONSE);
         buf.put_slice(self.channel_id.as_bytes());
         buf.put_u64_le(self.first_seq);
         buf.put_u64_le(self.leader_first_retained_seq);
+        buf.put_u64_le(self.request_id);
         // `events.len()` wider than u32::MAX is impossible to
         // represent on the wire — clamp via saturating cast. In
         // practice callers honor `chunk_max` (bounded u32) so the
@@ -436,7 +468,7 @@ impl SyncResponse {
     /// can't trigger a panic.
     pub fn from_bytes(data: &[u8]) -> Result<Self, WireError> {
         let payload = check_header(data, DISPATCH_SYNC_RESPONSE)?;
-        let prefix_needed = 32 + 8 + 8 + 4;
+        let prefix_needed = 32 + 8 + 8 + 8 + 4;
         if payload.len() < prefix_needed {
             return Err(WireError::Truncated {
                 need: 3 + prefix_needed,
@@ -447,6 +479,7 @@ impl SyncResponse {
         let channel_id = get_channel_id(&mut cursor);
         let first_seq = cursor.get_u64_le();
         let leader_first_retained_seq = cursor.get_u64_le();
+        let request_id = cursor.get_u64_le();
         let event_count = cursor.get_u32_le() as usize;
         // R-36: cap the pre-allocation at 4096 events to bound a
         // hostile `event_count` (e.g. peer sending a maximum-u32
@@ -458,7 +491,7 @@ impl SyncResponse {
         let mut events = Vec::with_capacity(event_count.min(4096));
         for _ in 0..event_count {
             if cursor.remaining() < 8 + 4 {
-                // R-23: report total bytes needed correctly —
+                // Report total bytes needed correctly —
                 // consumed-so-far + still-needed.
                 let consumed = data.len() - cursor.remaining();
                 return Err(WireError::Truncated {
@@ -470,8 +503,19 @@ impl SyncResponse {
             let payload_len = cursor.get_u32_le() as usize;
             if cursor.remaining() < payload_len {
                 let consumed = data.len() - cursor.remaining();
+                // checked_add — on 32-bit targets a u32 payload_len
+                // close to u32::MAX would overflow the plain `+`
+                // expression (consumed ≥ payload_len lower-bound
+                // doesn't shrink the danger window). Same fix shape
+                // as the umbrella's L-9 for BufferedEvents.
+                let need = consumed
+                    .checked_add(payload_len)
+                    .ok_or(WireError::Truncated {
+                        need: usize::MAX,
+                        have: data.len(),
+                    })?;
                 return Err(WireError::Truncated {
-                    need: consumed + payload_len,
+                    need,
                     have: data.len(),
                 });
             }
@@ -486,6 +530,7 @@ impl SyncResponse {
             channel_id,
             first_seq,
             leader_first_retained_seq,
+            request_id,
             events,
         })
     }
@@ -545,11 +590,12 @@ impl SyncHeartbeat {
 pub const SYNC_NACK_DETAIL_MAX: usize = u16::MAX as usize;
 
 impl SyncNack {
-    /// Serialize to bytes. Variable size: header + 32 + 8 + 1 + 2 +
-    /// detail.len(). Truncates `detail` to [`SYNC_NACK_DETAIL_MAX`]
-    /// if longer — the protocol can't represent a longer string and
-    /// silently truncating the diagnostic is preferable to losing
-    /// the structured error code entirely.
+    /// Serialize to bytes. Variable size: header + 32 + 8 + 1 + 8 +
+    /// 8 + 2 + detail.len(). Truncates `detail` to
+    /// [`SYNC_NACK_DETAIL_MAX`] if longer — the protocol can't
+    /// represent a longer string and silently truncating the
+    /// diagnostic is preferable to losing the structured error
+    /// code entirely.
     pub fn to_bytes(&self) -> Vec<u8> {
         // Truncate `detail` at a UTF-8 char boundary ≤ the wire cap.
         // A byte-aligned cut can split a multi-byte codepoint,
@@ -566,11 +612,13 @@ impl SyncNack {
         };
         let detail_bytes = detail_str.as_bytes();
         let detail_len = detail_bytes.len();
-        let mut buf = Vec::with_capacity(3 + 32 + 8 + 1 + 2 + detail_len);
+        let mut buf = Vec::with_capacity(3 + 32 + 8 + 1 + 8 + 8 + 2 + detail_len);
         put_header(&mut buf, DISPATCH_SYNC_NACK);
         buf.put_slice(self.channel_id.as_bytes());
         buf.put_u64_le(self.since_seq);
         buf.put_u8(self.error_code.to_wire());
+        buf.put_u64_le(self.leader_first_retained_seq);
+        buf.put_u64_le(self.request_id);
         buf.put_u16_le(detail_len as u16);
         buf.put_slice(detail_bytes);
         buf
@@ -580,7 +628,7 @@ impl SyncNack {
     /// mismatch, `error_code` outside `1..=4`, or non-UTF-8 detail.
     pub fn from_bytes(data: &[u8]) -> Result<Self, WireError> {
         let payload = check_header(data, DISPATCH_SYNC_NACK)?;
-        let prefix_needed = 32 + 8 + 1 + 2;
+        let prefix_needed = 32 + 8 + 1 + 8 + 8 + 2;
         if payload.len() < prefix_needed {
             return Err(WireError::Truncated {
                 need: 3 + prefix_needed,
@@ -593,6 +641,8 @@ impl SyncNack {
         let code_byte = cursor.get_u8();
         let error_code =
             SyncNackError::from_wire(code_byte).ok_or(WireError::BadErrorCode(code_byte))?;
+        let leader_first_retained_seq = cursor.get_u64_le();
+        let request_id = cursor.get_u64_le();
         let detail_len = cursor.get_u16_le() as usize;
         if cursor.remaining() < detail_len {
             // Report total bytes needed correctly: consumed-so-far +
@@ -612,6 +662,8 @@ impl SyncNack {
             channel_id,
             since_seq,
             error_code,
+            leader_first_retained_seq,
+            request_id,
             detail,
         })
     }
@@ -653,6 +705,7 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0xDEAD_BEEF_CAFE_BABE,
             chunk_max: 1_048_576,
+            request_id: 0xAA55_AA55_AA55_AA55,
         };
         let bytes = original.to_bytes();
         assert_eq!(bytes.len(), SYNC_REQUEST_SIZE);
@@ -668,6 +721,7 @@ mod tests {
             channel_id: ChannelId::from_bytes([0xAB; 32]),
             since_seq: 0x0102_0304_0506_0708,
             chunk_max: 0x1122_3344,
+            request_id: 0,
         };
         let bytes = req.to_bytes();
         // Subprotocol header is u16 LE = 0x0E00 → bytes [0x00, 0x0E];
@@ -687,6 +741,7 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0,
             chunk_max: 1,
+            request_id: 0,
         }
         .to_bytes();
         bytes[2] = DISPATCH_SYNC_RESPONSE; // wrong code
@@ -700,6 +755,7 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0,
             chunk_max: 1,
+            request_id: 0,
         }
         .to_bytes();
         bytes[0] = 0x00;
@@ -717,6 +773,7 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0,
             chunk_max: 1,
+            request_id: 0,
         }
         .to_bytes();
         for cut in 0..bytes.len() {
@@ -736,6 +793,7 @@ mod tests {
             first_seq: 42,
             leader_first_retained_seq: 42,
             events: vec![],
+            request_id: 7,
         };
         let bytes = original.to_bytes();
         let decoded = SyncResponse::from_bytes(&bytes).expect("decode");
@@ -762,6 +820,7 @@ mod tests {
                     payload: vec![], // empty payload — explicitly representable
                 },
             ],
+            request_id: 123,
         };
         let bytes = original.to_bytes();
         let decoded = SyncResponse::from_bytes(&bytes).expect("decode");
@@ -778,6 +837,7 @@ mod tests {
             first_seq: 0x0102_0304_0506_0708,
             leader_first_retained_seq: 0x1112_1314_1516_1718,
             events: vec![],
+            request_id: 0,
         };
         let bytes = original.to_bytes();
         // Header (3) + channel_id (32) = 35; first_seq (8) at 35..43;
@@ -802,6 +862,7 @@ mod tests {
                 event_seq: 1,
                 payload: b"truncated".to_vec(),
             }],
+            request_id: 0,
         }
         .to_bytes();
         // Cut off the last 3 bytes of the payload.
@@ -865,7 +926,9 @@ mod tests {
                 channel_id: sample_channel_id(),
                 since_seq: 12345,
                 error_code,
+                leader_first_retained_seq: 9999,
                 detail: format!("test detail for {:?}", error_code),
+                request_id: 0,
             };
             let bytes = original.to_bytes();
             let decoded = SyncNack::from_bytes(&bytes).expect("decode");
@@ -879,7 +942,9 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0,
             error_code: SyncNackError::NotLeader,
+            leader_first_retained_seq: 0,
             detail: String::new(),
+            request_id: 0,
         };
         let bytes = original.to_bytes();
         let decoded = SyncNack::from_bytes(&bytes).expect("decode");
@@ -896,7 +961,9 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0,
             error_code: SyncNackError::Backpressure,
+            leader_first_retained_seq: 0,
             detail: huge.clone(),
+            request_id: 0,
         };
         let bytes = original.to_bytes();
         let decoded = SyncNack::from_bytes(&bytes).expect("decode");
@@ -910,7 +977,9 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0,
             error_code: SyncNackError::NotLeader,
+            leader_first_retained_seq: 0,
             detail: String::new(),
+            request_id: 0,
         }
         .to_bytes();
         // error_code byte is at offset 3 + 32 + 8 = 43
@@ -929,7 +998,9 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0x4242_4242_4242_4242,
             error_code: SyncNackError::BadRange,
+            leader_first_retained_seq: 100,
             detail: "hello".to_string(),
+            request_id: 0,
         };
         let full = original.to_bytes();
         // Lop one byte off so the detail body is short. We expect
@@ -960,7 +1031,9 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0,
             error_code: SyncNackError::Backpressure,
+            leader_first_retained_seq: 0,
             detail,
+            request_id: 0,
         };
         let bytes = original.to_bytes();
         let decoded = SyncNack::from_bytes(&bytes).expect("decode after truncate");
@@ -973,12 +1046,16 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0,
             error_code: SyncNackError::BadRange,
+            leader_first_retained_seq: 0,
             detail: "ascii".to_string(),
+            request_id: 0,
         }
         .to_bytes();
-        // detail starts at offset 3 + 32 + 8 + 1 + 2 = 46; replace
-        // with an invalid UTF-8 byte sequence of the same length.
-        let detail_start = 46;
+        // detail starts at offset 3 + 32 + 8 + 1 + 8 + 8 + 2 = 62
+        // (the extra 8 is the request_id echo);
+        // replace with an invalid UTF-8 byte sequence of the same
+        // length.
+        let detail_start = 62;
         let detail_len = bytes.len() - detail_start;
         for i in 0..detail_len {
             bytes[detail_start + i] = 0xC0; // invalid lead byte

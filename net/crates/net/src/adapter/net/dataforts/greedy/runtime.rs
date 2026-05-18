@@ -637,7 +637,7 @@ impl GreedyRuntime {
         // back to per-chain calls; the MeshNode impl rewrites the
         // full capability set once and rebroadcasts once.
         let mut batch: Vec<(u64, Option<f64>)> = Vec::new();
-        for (origin_hash, emission) in emissions {
+        for (origin_hash, emission) in &emissions {
             match emission {
                 super::super::gravity::HeatEmission::Suppress => {}
                 super::super::gravity::HeatEmission::Emit { rate } => {
@@ -648,21 +648,41 @@ impl GreedyRuntime {
                     // chain looked identical to "blazing"); the
                     // log form stretches the wire range across
                     // useful operating rates.
-                    let normalized = policy.normalize_rate_for_wire(rate);
-                    batch.push((origin_hash, Some(normalized)));
+                    let normalized = policy.normalize_rate_for_wire(*rate);
+                    batch.push((*origin_hash, Some(normalized)));
                 }
                 super::super::gravity::HeatEmission::Withdraw => {
-                    batch.push((origin_hash, None));
+                    batch.push((*origin_hash, None));
                 }
             }
         }
+        // D-17: commit `last_emitted` mutations only after the sink
+        // confirms. On error the candidates stay pending and the
+        // next tick recomputes against the unchanged state, so a
+        // transient sink failure no longer permanently strands
+        // updates by suppressing them against a stale
+        // `last_emitted ≈ rate`.
+        let mut committed = false;
         if !batch.is_empty() {
-            if let Err(e) = sink.announce_heat_batch(&batch).await {
-                tracing::trace!(
-                    error = ?e,
-                    batch_len = batch.len(),
-                    "gravity: announce_heat_batch failed"
-                );
+            match sink.announce_heat_batch(&batch).await {
+                Ok(()) => committed = true,
+                Err(e) => {
+                    tracing::trace!(
+                        error = ?e,
+                        batch_len = batch.len(),
+                        "gravity: announce_heat_batch failed"
+                    );
+                }
+            }
+        } else {
+            // No wire frame to ship — commit the no-op candidates
+            // (Suppress decisions) so any pruning still happens.
+            committed = true;
+        }
+        if committed {
+            let gravity = self.inner.gravity.read();
+            if let Some(gravity) = gravity.as_ref() {
+                gravity.heat.lock().commit_emissions(&emissions);
             }
         }
     }

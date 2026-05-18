@@ -146,6 +146,32 @@ impl BandwidthBudget {
         false
     }
 
+    /// Return previously-consumed `bytes` to the bucket. Called
+    /// when a wire send fails after `try_consume` already deducted
+    /// the cost — otherwise repeated send failures over a flaky
+    /// link would drift the budget toward permanent backpressure
+    /// without shipping any traffic. Idempotent saturation: the
+    /// returned tokens never exceed `capacity_bytes`.
+    ///
+    /// `bytes == 0` is a no-op.
+    ///
+    /// Floors `available_bytes` to whole-byte precision before
+    /// adding the refunded amount so accumulated fractional refill
+    /// from [`Self::refill`] cannot compound across many refunds.
+    /// `try_consume`'s `>=` compares `available_bytes` against
+    /// `cost as f64`; without the floor, drift accumulating tens
+    /// of millibits per refund could admit one extra byte over a
+    /// long sequence of small refunds. The sub-byte fractional
+    /// credit lost on each refund is recovered on the next refill
+    /// tick.
+    pub fn refund(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let floored = self.available_bytes.max(0.0).floor();
+        self.available_bytes = (floored + bytes as f64).min(self.capacity_bytes);
+    }
+
     /// Current available token count in bytes. Useful for
     /// observability — operators can graph "how much catch-up
     /// budget is unused?" to spot under-utilized links.

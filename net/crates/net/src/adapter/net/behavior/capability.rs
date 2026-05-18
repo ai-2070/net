@@ -2069,11 +2069,27 @@ impl CapabilityAnnouncement {
     /// envelope is what lets downstream forwarders bump it without
     /// invalidating the origin's signature — standard multi-hop
     /// gossip design (libp2p gossipsub, Chord, etc.).
+    ///
+    /// Pre-fix this called `to_bytes()` (= `unwrap_or_default`) on
+    /// the canonical clone. A `serde_json::to_vec` failure produced
+    /// an empty `Vec` that signer + verifier both observed as the
+    /// same constant transcript, defeating the signature for every
+    /// affected announcement and making a single captured signature
+    /// replay across every other failing call. The failure mode is
+    /// unreachable today (none of the `CapabilityAnnouncement`
+    /// fields have a fallible `Serialize`), but propagating the
+    /// error explicitly with a panic gives a loud diagnostic if a
+    /// future refactor ever adds one — strictly better than silent
+    /// signature-compromise.
     fn signed_payload(&self) -> Vec<u8> {
         let mut canonical = self.clone();
         canonical.signature = None;
         canonical.hop_count = 0;
-        canonical.to_bytes()
+        serde_json::to_vec(&canonical).expect(
+            "CapabilityAnnouncement::signed_payload: serde_json::to_vec is infallible \
+             over the current field set; if this ever fires, a fallible Serialize impl \
+             was added and the signed transcript must be re-designed before merging",
+        )
     }
 
     /// Sign this announcement in place with `keypair`. The resulting
@@ -2108,6 +2124,35 @@ impl CapabilityAnnouncement {
     /// Deserialize from bytes
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         serde_json::from_slice(data).ok()
+    }
+
+    /// Drop every metadata key that the substrate reserves for
+    /// local use (`intent`, `colocate-with`, `priority`, `owner`,
+    /// `tool::*`, …). Call this on every announcement decoded from
+    /// an inbound peer before its metadata is consulted by greedy
+    /// admission, placement scoring, or anything else that lets a
+    /// metadata value steer substrate decisions: pre-fix a peer
+    /// could stamp `intent = "high-priority-tenant-X"` on its own
+    /// announcement and steer the receiver's admission to itself.
+    ///
+    /// The schema's `metadata_reserved` doc says these keys are
+    /// **writable by user code on the local node** — the local
+    /// node knows its own legitimate intent. But the same wire
+    /// shape carries inbound peer announcements that the
+    /// substrate must NOT trust for those decisions. This method
+    /// is the boundary that draws the distinction; callers on the
+    /// receive path invoke it after `from_bytes`.
+    pub fn strip_reserved_metadata(&mut self) {
+        use super::schema::AXIS_SCHEMA;
+        self.capabilities.metadata.retain(|key, _| {
+            if AXIS_SCHEMA.metadata_reserved.contains(&key.as_str()) {
+                return false;
+            }
+            !AXIS_SCHEMA
+                .metadata_reserved_prefixes
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+        });
     }
 
     /// Check if expired
@@ -3654,6 +3699,104 @@ mod tests {
     /// should construct a real `EntityKeypair` instead.
     fn test_entity() -> super::super::super::identity::EntityId {
         super::super::super::identity::EntityId::from_bytes([0u8; 32])
+    }
+
+    /// `strip_reserved_metadata` drops every exact-match reserved
+    /// key and every key under a reserved prefix, leaves all other
+    /// keys intact. The substrate calls this on every inbound peer
+    /// announcement before downstream consumers (greedy admission,
+    /// placement scoring) read metadata, so a peer can't steer
+    /// receiver decisions by stamping `intent`, `colocate-with`,
+    /// `priority`, `owner`, or any `tool::*` key.
+    #[test]
+    fn strip_reserved_metadata_drops_reserved_keys() {
+        let mut ann = CapabilityAnnouncement::new(0xDEAD, test_entity(), 7, CapabilitySet::new());
+        ann.capabilities
+            .metadata
+            .insert("intent".into(), "evil-tenant".into());
+        ann.capabilities
+            .metadata
+            .insert("colocate-with".into(), "0xdeadbeef".into());
+        ann.capabilities
+            .metadata
+            .insert("priority".into(), "9999".into());
+        ann.capabilities
+            .metadata
+            .insert("owner".into(), "attacker".into());
+        ann.capabilities
+            .metadata
+            .insert("tool::pwn".into(), "go-brrr".into());
+        ann.capabilities
+            .metadata
+            .insert("app::region".into(), "us-east".into());
+        ann.capabilities
+            .metadata
+            .insert("user_tag".into(), "fine".into());
+
+        ann.strip_reserved_metadata();
+
+        assert!(!ann.capabilities.metadata.contains_key("intent"));
+        assert!(!ann.capabilities.metadata.contains_key("colocate-with"));
+        assert!(!ann.capabilities.metadata.contains_key("priority"));
+        assert!(!ann.capabilities.metadata.contains_key("owner"));
+        assert!(!ann.capabilities.metadata.contains_key("tool::pwn"));
+        // Non-reserved keys survive — substrate only filters its
+        // own reserved namespace, not the caller's app namespace.
+        assert_eq!(
+            ann.capabilities
+                .metadata
+                .get("app::region")
+                .map(String::as_str),
+            Some("us-east"),
+        );
+        assert_eq!(
+            ann.capabilities
+                .metadata
+                .get("user_tag")
+                .map(String::as_str),
+            Some("fine"),
+        );
+    }
+
+    /// The signature transcript covers `capabilities.metadata`, so
+    /// `strip_reserved_metadata` invalidates the signature. The
+    /// inbound dispatch path must therefore re-broadcast the
+    /// announcement BEFORE stripping; otherwise a multi-hop
+    /// receiver with `require_signed_capabilities = true` would
+    /// reject every forwarded announcement that originally carried
+    /// a reserved metadata key.
+    #[test]
+    fn strip_reserved_metadata_invalidates_signature() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+        let mut ann =
+            CapabilityAnnouncement::new(1, keypair.entity_id().clone(), 1, sample_capability_set());
+        ann.capabilities
+            .metadata
+            .insert("intent".into(), "compute".into());
+        ann.sign(&keypair);
+
+        // Baseline: signed announcement verifies, and the bytes a
+        // forwarder would re-broadcast also verify (the bug a
+        // pre-forward strip would cause).
+        assert!(ann.verify().is_ok());
+        let forward_bytes = ann.to_bytes();
+        let forwarded =
+            CapabilityAnnouncement::from_bytes(&forward_bytes).expect("forwarded parses");
+        assert!(
+            forwarded.verify().is_ok(),
+            "downstream verifier must accept the un-stripped wire bytes"
+        );
+
+        // After strip the signature transcript no longer matches —
+        // pins the invariant the inbound dispatch order in
+        // `mesh.rs::process_capability_announcement` relies on.
+        ann.strip_reserved_metadata();
+        assert!(
+            ann.verify().is_err(),
+            "strip must invalidate the signature so the substrate is forced \
+             to strip the local copy AFTER any re-broadcast"
+        );
     }
 
     fn sample_capability_set() -> CapabilitySet {

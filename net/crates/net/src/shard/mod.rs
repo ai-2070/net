@@ -37,6 +37,7 @@ use crate::timestamp::TimestampGenerator;
 use serde_json::Value as JsonValue;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Atomic counters for a single shard. Kept outside `Shard` as `Arc`s
 /// so `ShardManager::stats()` can aggregate them without locking each
@@ -144,6 +145,7 @@ impl Shard {
     /// This is the fastest ingestion path - no serialization or hashing needed.
     #[inline]
     pub fn try_push_raw(&mut self, raw: Bytes) -> Result<u64, IngestionError> {
+        let push_start = self.metrics_collector.as_ref().map(|_| Instant::now());
         let ts = self.timestamp_gen.next();
         let event = InternalEvent::new(raw, ts, self.id);
 
@@ -152,6 +154,10 @@ impl Shard {
                 self.counters
                     .events_ingested
                     .fetch_add(1, AtomicOrdering::Relaxed);
+                if let (Some(collector), Some(start)) = (&self.metrics_collector, push_start) {
+                    collector.record_push(start.elapsed().as_nanos() as u64);
+                    collector.record_buffer_len(self.ring_buffer.len());
+                }
                 Ok(ts)
             }
             Err(_) => {
@@ -169,6 +175,7 @@ impl Shard {
     /// This serializes the value once before storing.
     #[inline]
     pub fn try_push(&mut self, raw: JsonValue) -> Result<u64, IngestionError> {
+        let push_start = self.metrics_collector.as_ref().map(|_| Instant::now());
         let ts = self.timestamp_gen.next();
         let event = InternalEvent::from_value(raw, ts, self.id);
 
@@ -177,6 +184,10 @@ impl Shard {
                 self.counters
                     .events_ingested
                     .fetch_add(1, AtomicOrdering::Relaxed);
+                if let (Some(collector), Some(start)) = (&self.metrics_collector, push_start) {
+                    collector.record_push(start.elapsed().as_nanos() as u64);
+                    collector.record_buffer_len(self.ring_buffer.len());
+                }
                 Ok(ts)
             }
             Err(_) => {
@@ -197,7 +208,11 @@ impl Shard {
     /// [`pop_batch_into`]: Self::pop_batch_into
     #[inline]
     pub fn pop_batch(&mut self, max: usize) -> Vec<InternalEvent> {
-        self.ring_buffer.pop_batch(max)
+        let out = self.ring_buffer.pop_batch(max);
+        if let Some(collector) = &self.metrics_collector {
+            collector.record_buffer_len(self.ring_buffer.len());
+        }
+        out
     }
 
     /// Pop a batch of events into a caller-owned buffer.
@@ -210,13 +225,21 @@ impl Shard {
     /// of the consumer's critical section.
     #[inline]
     pub fn pop_batch_into(&mut self, dst: &mut Vec<InternalEvent>, max: usize) -> usize {
-        self.ring_buffer.pop_batch_into(dst, max)
+        let n = self.ring_buffer.pop_batch_into(dst, max);
+        if let Some(collector) = &self.metrics_collector {
+            collector.record_buffer_len(self.ring_buffer.len());
+        }
+        n
     }
 
     /// Try to pop a single event from the ring buffer.
     #[inline]
     pub fn try_pop(&mut self) -> Option<InternalEvent> {
-        self.ring_buffer.try_pop()
+        let out = self.ring_buffer.try_pop();
+        if let Some(collector) = &self.metrics_collector {
+            collector.record_buffer_len(self.ring_buffer.len());
+        }
+        out
     }
 
     /// Producer-side eviction of the oldest event.
@@ -498,6 +521,15 @@ impl ShardManager {
                     // contract (the
                     // legitimate consumer is the batch worker, on a
                     // different task / thread).
+                    //
+                    // Transient stats note: a concurrent reader of
+                    // `manager.stats().events_dropped` between the
+                    // `fetch_sub` and the second `fetch_add` would
+                    // briefly observe the pre-correction value
+                    // (one less than reality). The net delta over
+                    // the whole retry is `+1`, matching the real
+                    // drop. Documented as snapshot-not-coherent
+                    // per `ShardCounters::snapshot`'s contract.
                     shard
                         .counters
                         .events_dropped
@@ -694,6 +726,29 @@ impl ShardManager {
     pub fn total_pending_in_rings(&self) -> u64 {
         let table = self.table.load();
         table.shards.iter().map(|s| s.lock().len() as u64).sum()
+    }
+
+    /// Best-effort variant of [`Self::total_pending_in_rings`] that
+    /// never blocks: every shard whose mutex is currently held is
+    /// skipped (counted as zero). Use this from `Drop` or any path
+    /// that may run on a thread already holding a shard lock
+    /// (single-thread runtime + panic during shutdown is the
+    /// canonical hazard); the blocking variant would self-deadlock
+    /// there.
+    ///
+    /// Returns `(sum_counted, uncounted_shard_count)` so the caller
+    /// can log the uncertainty in the result.
+    pub fn try_total_pending_in_rings(&self) -> (u64, usize) {
+        let table = self.table.load();
+        let mut sum: u64 = 0;
+        let mut uncounted: usize = 0;
+        for s in table.shards.iter() {
+            match s.try_lock() {
+                Some(guard) => sum += guard.len() as u64,
+                None => uncounted += 1,
+            }
+        }
+        (sum, uncounted)
     }
 
     /// Get aggregated statistics from all shards.
@@ -1009,6 +1064,84 @@ mod tests {
         assert_eq!(event.shard_id, 0);
         assert_eq!(event.insertion_ts, ts);
         assert!(shard.is_empty());
+    }
+
+    /// A `Shard` configured with a `ShardMetricsCollector` must feed every
+    /// successful push into the collector so the dynamic-scaling and
+    /// drain-finalize paths see non-zero counters. Without this wiring
+    /// `evaluate_scaling` reads `fill_ratio == 0` for every shard and
+    /// `finalize_draining`'s "is the ring actually empty" predicate is a
+    /// no-op (it sees `pushes_since_drain_start == 0` regardless of
+    /// contents).
+    #[test]
+    fn try_push_feeds_metrics_collector() {
+        let collector = Arc::new(ShardMetricsCollector::new(0, 1024));
+        let mut shard = Shard::with_metrics(0, 1024, Arc::clone(&collector));
+
+        for i in 0..16 {
+            shard.try_push(json!({"i": i})).unwrap();
+        }
+
+        let metrics = collector.collect_and_reset();
+        assert_eq!(
+            metrics.event_rate, 16,
+            "every push must increment event_rate"
+        );
+        assert!(metrics.fill_ratio > 0.0, "buffer length must be observable");
+        assert!(
+            metrics.avg_push_latency_ns > 0,
+            "push latency must be recorded"
+        );
+    }
+
+    /// `try_total_pending_in_rings` must never block, must skip
+    /// shards whose mutex is currently held, and must report how
+    /// many it skipped. This is what makes `EventBus::Drop`
+    /// safe to call on a thread that already holds a shard lock.
+    #[test]
+    fn try_total_pending_in_rings_skips_held_shards() {
+        let manager = ShardManager::new(2, 1024, BackpressureMode::DropNewest);
+        // Push some events so a non-zero count is observable.
+        manager.ingest(json!({"i": 1})).unwrap();
+        manager.ingest(json!({"i": 2})).unwrap();
+        manager.ingest(json!({"i": 3})).unwrap();
+
+        // Uncontended: all shards counted, uncounted_shards == 0.
+        let (sum, uncounted) = manager.try_total_pending_in_rings();
+        assert_eq!(uncounted, 0);
+        let baseline_sum = sum;
+        assert!(baseline_sum > 0, "events should be pending in some shard");
+
+        // Hold one shard's mutex and re-check: that shard must be
+        // skipped, uncounted must be 1, and the call must return
+        // immediately (this test would hang on the blocking
+        // `total_pending_in_rings` variant).
+        let table = manager.table.load();
+        let _guard = table.shards[0].lock();
+        let (sum2, uncounted2) = manager.try_total_pending_in_rings();
+        assert_eq!(uncounted2, 1, "the locked shard must be uncounted");
+        assert!(
+            sum2 <= baseline_sum,
+            "sum must not include events from the locked shard"
+        );
+    }
+
+    /// Same wiring for `try_push_raw` — the byte-oriented hot path.
+    #[test]
+    fn try_push_raw_feeds_metrics_collector() {
+        let collector = Arc::new(ShardMetricsCollector::new(0, 1024));
+        let mut shard = Shard::with_metrics(0, 1024, Arc::clone(&collector));
+
+        for i in 0..16 {
+            shard
+                .try_push_raw(bytes::Bytes::from(format!("event-{i}")))
+                .unwrap();
+        }
+
+        let metrics = collector.collect_and_reset();
+        assert_eq!(metrics.event_rate, 16);
+        assert!(metrics.fill_ratio > 0.0);
+        assert!(metrics.avg_push_latency_ns > 0);
     }
 
     #[test]

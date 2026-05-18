@@ -59,6 +59,11 @@ pub enum SyncRequestOutcome {
     Nack {
         /// Typed error code per `REDEX_DISTRIBUTED_PLAN.md` §2.
         error_code: SyncNackError,
+        /// Leader's first retained seq at the time of the reject.
+        /// Set for every error code so the runtime can forward it
+        /// verbatim; the replica only consults it on `BadRange`,
+        /// where it drives the one-shot `skip_to` recovery.
+        leader_first_retained_seq: u64,
         /// Operator-facing diagnostic; safe to pass through to a
         /// `SyncNack::detail`. May be empty.
         detail: String,
@@ -165,9 +170,18 @@ pub fn handle_sync_request(
     request: &SyncRequest,
     expected_channel: ChannelId,
 ) -> SyncRequestOutcome {
+    // Capture leader's first retained seq for both the success
+    // path (R-5: disambiguate retention-trim from split-brain
+    // divergence) and the NACK path (R-40: drive the replica's
+    // one-shot `skip_to` recovery so a below-retention replica
+    // doesn't BadRange-thrash by advancing one seq per round trip).
+    // `None` means "the leader has no events yet" → use 0.
+    let leader_first_retained_seq = file.lowest_retained_seq().unwrap_or(0);
+
     if request.channel_id != expected_channel {
         return SyncRequestOutcome::Nack {
             error_code: SyncNackError::ChannelClosed,
+            leader_first_retained_seq,
             detail: format!(
                 "channel mismatch: request {:?} vs expected {:?}",
                 request.channel_id, expected_channel,
@@ -176,17 +190,13 @@ pub fn handle_sync_request(
     }
 
     let local_next = file.next_seq();
-    // R-5: capture leader's first retained seq so the replica can
-    // disambiguate retention-trim from split-brain divergence on
-    // the apply side. `None` means "the leader has no events yet"
-    // → use 0 as the wire value.
-    let leader_first_retained_seq = file.lowest_retained_seq().unwrap_or(0);
     if request.since_seq >= local_next {
         // Replica is caught up. Empty chunk is the signal.
         return SyncRequestOutcome::Response(SyncResponse {
             channel_id: expected_channel,
             first_seq: request.since_seq,
             leader_first_retained_seq,
+            request_id: request.request_id,
             events: Vec::new(),
         });
     }
@@ -211,6 +221,7 @@ pub fn handle_sync_request(
         // been retention-evicted. Replica must skip ahead.
         return SyncRequestOutcome::Nack {
             error_code: SyncNackError::BadRange,
+            leader_first_retained_seq,
             detail: format!("since_seq {} below first retained event", request.since_seq,),
         };
     }
@@ -240,6 +251,7 @@ pub fn handle_sync_request(
         if out.is_empty() && cost > CHUNK_MAX_HARD_CEILING_BYTES as u64 {
             return SyncRequestOutcome::Nack {
                 error_code: SyncNackError::BadRange,
+                leader_first_retained_seq,
                 detail: format!(
                     "event at seq {} exceeds hard ceiling ({} bytes > {})",
                     ev.entry.seq, cost, CHUNK_MAX_HARD_CEILING_BYTES,
@@ -255,7 +267,11 @@ pub fn handle_sync_request(
             // the ceiling get rejected above.
             break;
         }
-        acc += cost;
+        // saturating_add matches the predicate above and the
+        // function's `acc.saturating_add(cost)` style. Plain `+=`
+        // diverged from the surrounding pattern; future reviewers
+        // copying the loop body would carry the unguarded version.
+        acc = acc.saturating_add(cost);
         out.push(SyncEvent {
             event_seq: ev.entry.seq,
             payload: ev.payload.to_vec(),
@@ -266,6 +282,7 @@ pub fn handle_sync_request(
         channel_id: expected_channel,
         first_seq,
         leader_first_retained_seq,
+        request_id: request.request_id,
         events: out,
     })
 }
@@ -373,6 +390,28 @@ pub fn apply_sync_response(
         .collect();
     file.append_batch(&payloads)
         .map_err(|e| ApplyError::AppendFailed(format!("{e:?}")))?;
+    // Force a disk sync before returning the new tail so the
+    // replica's next heartbeat advertises a durable seq. Without
+    // this, the runtime broadcasts `tail_seq = post-append` while
+    // the underlying file is still buffered; a crash before the
+    // background `FsyncPolicy::Interval`/`EveryN` fires leaves the
+    // replica returning with a lower tail. The leader, having
+    // already relaxed retention based on the advertised tail,
+    // can't re-supply the gap and the replica hits
+    // `GapBeforeChunk{divergence_suspected}` on rejoin — `skip_to`
+    // then silently overwrites the gap.
+    //
+    // `RedexFile::sync()` is a no-op for heap-only files (no disk
+    // segment) and for the `FsyncPolicy::Never` policy, so the
+    // perf cost is paid only on disk-backed channels that already
+    // opted into durability. The runtime task blocks on this
+    // fsync, which is acceptable: the alternative is the silent
+    // divergence path above.
+    #[cfg(feature = "redex-disk")]
+    {
+        file.sync()
+            .map_err(|e| ApplyError::AppendFailed(format!("durable-sync: {e:?}")))?;
+    }
     Ok(file.next_seq())
 }
 
@@ -413,6 +452,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 4096,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -432,6 +472,7 @@ mod tests {
             channel_id: cid,
             since_seq: f.next_seq(),
             chunk_max: 4096,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -449,6 +490,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 4096,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -470,6 +512,7 @@ mod tests {
             channel_id: wrong,
             since_seq: 0,
             chunk_max: 4096,
+            request_id: 0,
         };
         let SyncRequestOutcome::Nack { error_code, .. } = handle_sync_request(&f, &req, expected)
         else {
@@ -487,6 +530,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 0,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -511,6 +555,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 60,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -535,6 +580,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 50, // smaller than the first event alone
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -574,6 +620,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 100,
+            request_id: 0,
         };
         // Confirm the normal-size path still works (i.e. our
         // new guard didn't break shipping legitimate events).
@@ -594,6 +641,7 @@ mod tests {
             channel_id: cid,
             since_seq: 100, // well past tail
             chunk_max: 4096,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -628,6 +676,7 @@ mod tests {
                     payload: b"third".to_vec(),
                 },
             ],
+            request_id: 0,
         };
         let new_tail = apply_sync_response(&dst, &response, cid).expect("apply");
         assert_eq!(new_tail, 3);
@@ -644,6 +693,7 @@ mod tests {
             first_seq: 100,
             leader_first_retained_seq: 0,
             events: vec![],
+            request_id: 0,
         };
         let new_tail = apply_sync_response(&dst, &response, cid).expect("apply");
         assert_eq!(new_tail, 2);
@@ -662,6 +712,7 @@ mod tests {
                 event_seq: 0,
                 payload: b"x".to_vec(),
             }],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, local_cid).expect_err("mismatch");
         assert!(matches!(err, ApplyError::ChannelMismatch { .. }));
@@ -679,6 +730,7 @@ mod tests {
                 event_seq: 5, // declared 0 but actually 5
                 payload: b"x".to_vec(),
             }],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("mismatch");
         assert!(matches!(err, ApplyError::FirstSeqMismatch { .. }));
@@ -706,6 +758,7 @@ mod tests {
                     payload: b"c".to_vec(),
                 },
             ],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
         assert!(matches!(err, ApplyError::NonMonotonic { index: 2 }));
@@ -740,6 +793,7 @@ mod tests {
                     payload: b"wraparound".to_vec(),
                 },
             ],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
         assert!(
@@ -766,6 +820,7 @@ mod tests {
                     payload: b"a-dup".to_vec(),
                 },
             ],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
         assert!(matches!(err, ApplyError::NonMonotonic { index: 1 }));
@@ -785,6 +840,7 @@ mod tests {
                 event_seq: 2,
                 payload: b"stale".to_vec(),
             }],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
         assert!(matches!(
@@ -813,6 +869,7 @@ mod tests {
                 event_seq: 5,
                 payload: b"future".to_vec(),
             }],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
         match err {
@@ -853,6 +910,7 @@ mod tests {
                 event_seq: 5,
                 payload: b"future".to_vec(),
             }],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must gap");
         match err {
@@ -881,6 +939,7 @@ mod tests {
             first_seq: 2,
             leader_first_retained_seq: 0,
             events: vec![],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
         assert!(matches!(
@@ -907,6 +966,7 @@ mod tests {
                 event_seq: 5,
                 payload: b"future".to_vec(),
             }],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must gap");
         match err {
@@ -941,6 +1001,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 4096,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&leader, &req, cid) else {
             panic!("expected Response");
@@ -974,6 +1035,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 60,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(r1) = handle_sync_request(&leader, &req1, cid) else {
             panic!();
@@ -986,6 +1048,7 @@ mod tests {
             channel_id: cid,
             since_seq: replica.next_seq(),
             chunk_max: 60,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(r2) = handle_sync_request(&leader, &req2, cid) else {
             panic!();
@@ -1037,6 +1100,7 @@ mod tests {
                     payload: vec![b'B'],
                 },
             ],
+            request_id: 0,
         };
 
         // First apply rejects with GapBeforeChunk.

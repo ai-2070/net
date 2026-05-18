@@ -74,6 +74,15 @@ pub struct MeshOsRuntime {
     /// pre-built registry via [`Self::start_with_daemon_registry`]
     /// to share state with code already managing daemons.
     daemon_registry: Arc<DaemonRegistry>,
+    /// `MeshOsConfig::this_node` captured at construction so the
+    /// SDK can stamp it on per-daemon metadata views without
+    /// re-routing through the loop's private config. Pre-fix the
+    /// SDK's `MetadataView::node_id` was always `0`.
+    this_node: super::event::NodeId,
+    /// X-13 recovery registry — clone of the one the loop owns.
+    /// SDK consumers register per-group recovery handlers here;
+    /// the loop's tick handler calls `try_run_all` once per tick.
+    recovery_registry: crate::adapter::net::compute::RecoveryRegistry,
 }
 
 /// Plain-value rollup of the runtime's join statistics. Returned
@@ -500,6 +509,7 @@ impl MeshOsRuntime {
             Arc<dyn super::migration_snapshot_source::MigrationSnapshotSource>,
         >,
     ) -> Self {
+        let this_node = config.this_node;
         let super::event_loop::MeshOsLoopParts {
             mesh_loop,
             handle,
@@ -570,6 +580,11 @@ impl MeshOsRuntime {
             );
         }
         let dropped_actions = mesh_loop.dropped_actions_counter();
+        // Clone the recovery registry off the loop BEFORE the
+        // tokio::spawn moves the loop. The runtime surface
+        // exposes this clone so SDK consumers can register
+        // handlers after `start` lands.
+        let recovery_registry = mesh_loop.recovery_registry().clone();
         let loop_task = tokio::spawn(mesh_loop.run());
         let exec_task = tokio::spawn(exec.run());
         Self {
@@ -582,6 +597,8 @@ impl MeshOsRuntime {
             scheduler,
             dropped_actions,
             daemon_registry,
+            this_node,
+            recovery_registry,
         }
     }
 
@@ -591,6 +608,14 @@ impl MeshOsRuntime {
     /// dispatcher.
     pub fn dropped_actions(&self) -> u64 {
         self.dropped_actions.load(AtomicOrdering::Relaxed)
+    }
+
+    /// `MeshOsConfig::this_node` captured at construction. SDK
+    /// consumers use this to stamp per-daemon metadata views so
+    /// `MetadataView::node_id` reflects the runtime's identity
+    /// instead of the previous hard-coded `0`.
+    pub fn this_node(&self) -> super::event::NodeId {
+        self.this_node
     }
 
     /// Install / replace the active placement scorer. Subsequent
@@ -668,6 +693,15 @@ impl MeshOsRuntime {
         &self.daemon_registry
     }
 
+    /// Borrow the X-13 recovery registry. SDK consumers register
+    /// per-group `RecoveryHandler` closures here; the loop runs
+    /// them once per tick from inside the tick handler (after
+    /// `poll_probes`, before `run_reconcile`). Cheap to clone the
+    /// returned reference — the registry is Arc-wrapped.
+    pub fn recovery_registry(&self) -> &crate::adapter::net::compute::RecoveryRegistry {
+        &self.recovery_registry
+    }
+
     /// Borrow the publish handle. Source converters
     /// (`attach_to_daemon_registry`, etc.) clone this to push
     /// events into the loop.
@@ -717,6 +751,10 @@ impl MeshOsRuntime {
             cluster_backpressure_releases: self
                 .stats
                 .cluster_backpressure_releases
+                .load(std::sync::atomic::Ordering::Relaxed),
+            chain_append_failures: self
+                .stats
+                .chain_append_failures
                 .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -791,6 +829,10 @@ impl MeshOsRuntime {
                 cluster_backpressure_releases: self
                     .stats
                     .cluster_backpressure_releases
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                chain_append_failures: self
+                    .stats
+                    .chain_append_failures
                     .load(std::sync::atomic::Ordering::Relaxed),
             },
             dropped_actions: self.dropped_actions.load(AtomicOrdering::Relaxed),

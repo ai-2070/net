@@ -94,6 +94,15 @@ pub struct MeshOsLoop {
     /// after `run()`.
     scheduler: SchedulerRegistry,
 
+    /// X-13 recovery registry — pluggable per-tick recovery
+    /// handlers for groups whose slots were marked unhealthy
+    /// after a placement failure. The tick handler calls
+    /// `try_run_all` after `poll_probes` so the very next
+    /// reconcile pass sees the recovered slots. Empty by default;
+    /// SDK consumers register handlers via
+    /// `MeshOsRuntime::recovery_registry()`.
+    recovery_registry: crate::adapter::net::compute::RecoveryRegistry,
+
     /// Reconcile-pass counter — used by tests / diagnostics to
     /// confirm reconcile fired exactly once per Tick.
     reconcile_count: u64,
@@ -472,19 +481,46 @@ impl MeshOsLoop {
         let (actions_tx, actions_rx) = mpsc::channel(config.action_queue_capacity);
         let handle = MeshOsHandle { events: events_tx };
         // Stamp a unique runtime epoch id at construction.
-        // Wall-clock nanoseconds + a static counter is the
-        // cheapest source of monotonic-enough uniqueness —
-        // even back-to-back runtimes spawned in the same
-        // nanosecond (e.g. test parallelism) get distinct
-        // ids. SDK consumers read this off
-        // `MeshOsSnapshot::runtime_epoch_id` and reset their
-        // `since(seq)` watermarks on observed change.
-        static RUNTIME_EPOCH_COUNTER: AtomicU64 = AtomicU64::new(1);
-        let runtime_epoch_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
-            ^ RUNTIME_EPOCH_COUNTER.fetch_add(1, Ordering::SeqCst);
+        // 64-bit random per-runtime stamp. Pre-fix this was
+        // `SystemTime::now().as_nanos() ^ static_counter.fetch_add(1)`,
+        // but the static counter resets to 1 each process start —
+        // two processes booting in the same nanosecond (CI parallel,
+        // VM resume) XOR identical `(epoch, counter)` and produced
+        // identical runtime_epoch_ids. The SDK's watermark-reset
+        // gate (snapshot's `runtime_epoch_id` vs last-seen) was then
+        // defeated: post-restart admin_audit_seq / log_seq /
+        // failure_seq start back at 1 and pass the consumer's dedup
+        // gate as "already seen," silently filtering valid post-
+        // restart audit records. A `getrandom::fill` u64 has a
+        // 2⁻⁶⁴ collision probability across all process restarts
+        // in the fleet. The fallback path on a getrandom failure
+        // preserves the prior (epoch ^ counter) shape so the SDK
+        // gate still gets a non-zero stamp under the (extremely
+        // rare) getrandom failure mode rather than panicking
+        // through the substrate's loop construction.
+        let runtime_epoch_id: u64 = {
+            let mut buf = [0u8; 8];
+            if getrandom::fill(&mut buf).is_ok() {
+                u64::from_le_bytes(buf)
+            } else {
+                // Fallback only on `getrandom` failure (vanishingly
+                // rare: seccomp-jailed environments without the
+                // syscall). Mix the process ID into the (epoch ^
+                // counter) shape so two same-nanosecond boots in
+                // a CI parallel matrix still produce distinct
+                // ids — the pre-fix shape collided here exactly.
+                // `std::process::id()` is a u32 on every supported
+                // platform; rotated into the upper bits so it
+                // doesn't trivially XOR-cancel against the counter.
+                static RUNTIME_EPOCH_COUNTER: AtomicU64 = AtomicU64::new(1);
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                let pid = (std::process::id() as u64).rotate_left(32);
+                nanos ^ RUNTIME_EPOCH_COUNTER.fetch_add(1, Ordering::SeqCst) ^ pid
+            }
+        };
         let initial_snapshot = MeshOsSnapshot {
             runtime_epoch_id,
             ..Default::default()
@@ -504,6 +540,7 @@ impl MeshOsLoop {
             recent_emissions: Vec::new(),
             probes: ProbeRegistryInner::default(),
             scheduler: SchedulerRegistry::new(),
+            recovery_registry: crate::adapter::net::compute::RecoveryRegistry::new(),
             reconcile_count: 0,
             admin_audit_seq: 0,
             log_seq: 0,
@@ -553,6 +590,26 @@ impl MeshOsLoop {
     pub fn with_scheduler_registry(mut self, registry: SchedulerRegistry) -> Self {
         self.scheduler = registry;
         self
+    }
+
+    /// Attach a recovery registry. SDK consumers register one
+    /// `RecoveryHandler` per group whose slots can be
+    /// re-placed; the tick handler runs them all once per Tick
+    /// (after `poll_probes`, before `run_reconcile`) so the
+    /// reconcile pass sees the recovered slot states.
+    pub fn with_recovery_registry(
+        mut self,
+        registry: crate::adapter::net::compute::RecoveryRegistry,
+    ) -> Self {
+        self.recovery_registry = registry;
+        self
+    }
+
+    /// Borrow the recovery registry — SDK consumers `register`
+    /// new handlers post-build. The `MeshOsRuntime` accessor
+    /// surfaces this so callers don't have to retain a clone.
+    pub fn recovery_registry(&self) -> &crate::adapter::net::compute::RecoveryRegistry {
+        &self.recovery_registry
     }
 
     /// Attach the executor's recent-failures ring. The loop reads
@@ -706,8 +763,95 @@ impl MeshOsLoop {
         // pass per tick" guarantee is designed to prevent.
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+        // Bound how many events get drained between ticks so a
+        // heavy reconcile + 100 ms tick can't starve `events_rx`
+        // under the `biased;` priority below. The pre-fix
+        // `biased; tick.tick() ⇒ events_rx.recv()` ordering
+        // correctly defends event-burst-starves-tick (the original
+        // bug), but in the other direction a long `run_reconcile`
+        // that yields mid-await re-enters the select and tick
+        // wins again — events sit in the queue until the queue
+        // saturates the sender or the system idles. Drain up to
+        // `EVENTS_PER_TICK` events in a non-blocking pass after
+        // each tick so both directions make bounded progress.
+        const EVENTS_PER_TICK: usize = 32;
+        let mut shutdown = false;
         loop {
             tokio::select! {
+                // `biased` polls arms in source order, so a
+                // saturated `events_rx` cannot starve the reconcile
+                // tick. The previous (random) order let a sustained
+                // event burst defer reconcile / poll_probes / gc_freeze
+                // for the duration of the burst — `local_maintenance`
+                // went stale, `applied_backoffs` stuck, and
+                // `freeze_until` never GC'd because gc_freeze only
+                // runs on Tick.
+                biased;
+                _ = tick.tick() => {
+                    // The Tick event drives reconcile; we route
+                    // it through the same `apply` path so the
+                    // `last_tick` fold field updates uniformly.
+                    self.apply(&MeshOsEvent::Tick);
+                    // Pull-via-tick probes — folded BEFORE
+                    // reconcile so the reconcile pass sees the
+                    // latest samples in this tick window.
+                    self.poll_probes();
+                    // X-13: run the recovery handlers between
+                    // probe samples and reconcile. Probes refresh
+                    // the per-peer healthy view, then recovery
+                    // re-places any unhealthy slots against the
+                    // current healthy node pool, then reconcile
+                    // sees the post-recovery state. Empty
+                    // registry → no-op; handlers that report
+                    // recovered slots are logged at debug for
+                    // operator visibility.
+                    let recovered = self.recovery_registry.try_run_all();
+                    if !recovered.is_empty() {
+                        tracing::debug!(
+                            target: "meshos",
+                            slots = ?recovered,
+                            "X-13: recovery registry placed unhealthy slots"
+                        );
+                    }
+                    self.run_reconcile().await;
+
+                    // Drain a bounded batch of events from the
+                    // queue before the next tick can re-fire. This
+                    // is the inverse-direction starvation guard
+                    // for the `biased;` above. `try_recv` is non-
+                    // blocking, so an empty queue costs one Err
+                    // each iteration and the loop falls through to
+                    // the next select.
+                    for _ in 0..EVENTS_PER_TICK {
+                        match self.events_rx.try_recv() {
+                            Ok(event) => {
+                                if matches!(event, MeshOsEvent::Shutdown) {
+                                    tracing::debug!(
+                                        target: "meshos",
+                                        reconcile_count = self.reconcile_count,
+                                        "MeshOsLoop exiting — Shutdown drained post-tick",
+                                    );
+                                    shutdown = true;
+                                    break;
+                                }
+                                self.apply(&event);
+                            }
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                tracing::debug!(
+                                    target: "meshos",
+                                    reconcile_count = self.reconcile_count,
+                                    "MeshOsLoop exiting — all handles dropped (drained post-tick)",
+                                );
+                                shutdown = true;
+                                break;
+                            }
+                        }
+                    }
+                    if shutdown {
+                        break;
+                    }
+                }
                 event = self.events_rx.recv() => {
                     let Some(event) = event else {
                         tracing::debug!(
@@ -726,17 +870,6 @@ impl MeshOsLoop {
                         break;
                     }
                     self.apply(&event);
-                }
-                _ = tick.tick() => {
-                    // The Tick event drives reconcile; we route
-                    // it through the same `apply` path so the
-                    // `last_tick` fold field updates uniformly.
-                    self.apply(&MeshOsEvent::Tick);
-                    // Pull-via-tick probes — folded BEFORE
-                    // reconcile so the reconcile pass sees the
-                    // latest samples in this tick window.
-                    self.poll_probes();
-                    self.run_reconcile().await;
                 }
             }
         }
@@ -1074,29 +1207,55 @@ impl MeshOsLoop {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         // Stamp a monotonic per-runtime seq starting at 1 so a
-        // `0` seq downstream reads as "unset."
-        self.admin_audit_seq += 1;
+        // `0` seq downstream reads as "unset." Panic on overflow:
+        // the SDK dedup gate keys on `seq`, so a saturating add
+        // would pin every record past `u64::MAX` at the cap and
+        // silently collapse them all into a single ring entry —
+        // permanent audit-loss disguised as routine. `checked_add`
+        // is the loud signal an operator wants: at 100 µs/event
+        // we'd reach the overflow ~58 million years in, so the
+        // panic surfaces only a true runaway bug, not a real
+        // production condition.
+        self.admin_audit_seq = self
+            .admin_audit_seq
+            .checked_add(1)
+            .expect("admin_audit_seq overflowed u64 — runaway producer or counter corruption");
         let record = super::ice::AdminAuditRecord {
             seq: self.admin_audit_seq,
             committed_at_ms,
             event: event.clone(),
             operator_ids,
             outcome,
+            chain_pending: false,
         };
-        // Dual-write: chain first, ring second. The chain
-        // append is non-fatal — a hiccup there must never
-        // wedge the in-memory audit surface. Log + continue.
+        // Ring-first then chain. The ring is the immediate
+        // user-visible surface that the Deck SDK polls; the chain
+        // is durability backup for cluster-lifetime replay. If the
+        // chain append fails, mark the ring entry's chain_pending
+        // flag so chain consumers (replaying after restart) can
+        // distinguish "entry never landed" from "entry hasn't
+        // reached me yet." Pre-fix the chain attempt ran BEFORE
+        // the ring push and the ring entry never recorded the
+        // chain-side outcome — chain consumers saw a gap with no
+        // way to know it was permanent.
+        self.admin_audit_ring.push_back(record.clone());
+        while self.admin_audit_ring.len() > super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS {
+            self.admin_audit_ring.pop_front();
+        }
         if let Err(err) = self.admin_audit_appender.append(&record) {
             tracing::warn!(
                 target: "meshos",
                 seq = record.seq,
                 error = %err,
-                "admin-audit-chain append failed — record kept on in-memory ring only",
+                "admin-audit-chain append failed — ring entry marked chain_pending",
             );
-        }
-        self.admin_audit_ring.push_back(record);
-        while self.admin_audit_ring.len() > super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS {
-            self.admin_audit_ring.pop_front();
+            // Locate the just-pushed entry (back of the ring; cap
+            // protects against an empty back() but we just pushed)
+            // and flip its chain_pending flag so the ring surface
+            // reports the gap.
+            if let Some(last) = self.admin_audit_ring.back_mut() {
+                last.chain_pending = true;
+            }
         }
     }
 
@@ -1109,7 +1268,15 @@ impl MeshOsLoop {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        self.log_seq += 1;
+        // Checked add mirrors admin_audit_seq above: panic on the
+        // (astronomical) u64::MAX boundary rather than silently
+        // collapse every subsequent record into the saturating
+        // cap, which the SDK dedup gate would treat as a single
+        // duplicate.
+        self.log_seq = self
+            .log_seq
+            .checked_add(1)
+            .expect("log_seq overflowed u64 — runaway producer or counter corruption");
         let record = super::logs::LogRecord {
             seq: self.log_seq,
             ts_ms,
@@ -1117,21 +1284,27 @@ impl MeshOsLoop {
             daemon_id: line.daemon_id,
             node_id: Some(self.config.this_node),
             message: line.message.clone(),
+            chain_pending: false,
         };
-        // Dual-write: chain first, ring second. The chain
-        // append is non-fatal — a hiccup there must never
-        // wedge the in-memory log surface.
+        // Ring-first then chain. Same rationale as record_admin_audit:
+        // the ring is the immediate user surface; the chain is
+        // durability backup. Mark chain_pending on the just-pushed
+        // ring entry when the chain append fails so chain consumers
+        // can distinguish "gap" from "haven't replicated yet."
+        self.log_ring.push_back(record.clone());
+        while self.log_ring.len() > super::logs::DEFAULT_MAX_LOG_RING_RECORDS {
+            self.log_ring.pop_front();
+        }
         if let Err(err) = self.log_appender.append(&record) {
             tracing::warn!(
                 target: "meshos",
                 seq = record.seq,
                 error = %err,
-                "log-chain append failed — record kept on in-memory ring only",
+                "log-chain append failed — ring entry marked chain_pending",
             );
-        }
-        self.log_ring.push_back(record);
-        while self.log_ring.len() > super::logs::DEFAULT_MAX_LOG_RING_RECORDS {
-            self.log_ring.pop_front();
+            if let Some(last) = self.log_ring.back_mut() {
+                last.chain_pending = true;
+            }
         }
     }
 
@@ -1339,14 +1512,28 @@ impl MeshOsLoop {
             // the executor's job is to apply admit(); reconcile
             // staying responsive is the higher-order property.
             // Count + log drops so the silent-loss path is
-            // observable.
-            self.recent_emissions.push(pending.clone());
-            if let Err(mpsc::error::TrySendError::Full(rejected)) =
-                self.actions_tx.try_send(pending)
-            {
-                dropped_this_tick += 1;
-                if first_dropped_kind.is_none() {
-                    first_dropped_kind = Some(super::snapshot::action_kind_str(&rejected.action));
+            // observable. recent_emissions only gets the action
+            // on try_send success — pre-fix every action landed in
+            // recent_emissions (and surfaced as `recently_emitted`
+            // on the snapshot) even when the executor's queue was
+            // full and the action would never run, double-counting
+            // the drop in dropped_actions while painting a misleading
+            // "emitted" picture in the snapshot.
+            let pending_clone = pending.clone();
+            match self.actions_tx.try_send(pending) {
+                Ok(()) => self.recent_emissions.push(pending_clone),
+                Err(mpsc::error::TrySendError::Full(rejected)) => {
+                    dropped_this_tick += 1;
+                    if first_dropped_kind.is_none() {
+                        first_dropped_kind =
+                            Some(super::snapshot::action_kind_str(&rejected.action));
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Executor task is gone — count as dropped and
+                    // skip recent_emissions; subsequent reconciles
+                    // will keep counting until the loop tears down.
+                    dropped_this_tick += 1;
                 }
             }
         }
@@ -2240,7 +2427,12 @@ mod tests {
         let MeshOsLoopParts {
             mesh_loop: loop_,
             handle,
-            actions_rx: _,
+            // Keep the receiver alive so the reconciler's try_send
+            // succeeds and the action lands in recent_emissions —
+            // pre-fix recent_emissions populated regardless of
+            // try_send outcome (an actions_tx.Closed would still
+            // mark the action as "emitted" in the snapshot).
+            actions_rx: _actions_rx,
             reader,
         } = MeshOsLoop::new(cfg);
         let task = tokio::spawn(loop_.run());
@@ -2362,8 +2554,62 @@ mod tests {
         assert_eq!(snap.admin_audit.len(), 1, "ring should hold one record");
         // The appender + ring see the SAME record (seq + content match).
         assert_eq!(snap.admin_audit[0].seq, captured[0].seq);
+        // Successful append → ring entry has chain_pending == false.
+        assert!(
+            !snap.admin_audit[0].chain_pending,
+            "ring entry must NOT be marked chain_pending when the appender succeeded"
+        );
 
         // Tidy.
+        drop(handle);
+        let _ = tokio::time::timeout(StdDuration::from_secs(1), task).await;
+    }
+
+    /// Pin that ring-first + mark-chain_pending kicks in when the
+    /// audit chain appender returns an error: ring still records
+    /// the entry but flags it so chain consumers can distinguish
+    /// "permanent gap" from "haven't replicated yet."
+    #[tokio::test]
+    async fn audit_ring_flags_chain_pending_on_appender_failure() {
+        use super::super::audit_chain::{AdminAuditAppendError, AdminAuditChainAppender};
+        use super::super::event::AdminEvent;
+        use super::super::ice::AdminAuditRecord;
+
+        struct FailingAuditAppender;
+        impl AdminAuditChainAppender for FailingAuditAppender {
+            fn append(&self, _record: &AdminAuditRecord) -> Result<(), AdminAuditAppendError> {
+                Err(AdminAuditAppendError {
+                    reason: "test-injected appender failure".into(),
+                })
+            }
+        }
+
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader,
+        } = MeshOsLoop::new(fast_test_config());
+        let loop_ = loop_.with_admin_audit_appender(Arc::new(FailingAuditAppender));
+        let task = tokio::spawn(loop_.run());
+
+        handle
+            .publish(MeshOsEvent::AdminEvent(AdminEvent::Cordon { node: 99 }))
+            .await
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(60)).await;
+
+        let snap = reader.read();
+        assert_eq!(
+            snap.admin_audit.len(),
+            1,
+            "ring must still record the entry"
+        );
+        assert!(
+            snap.admin_audit[0].chain_pending,
+            "ring entry must be flagged chain_pending after the appender returned Err"
+        );
+
         drop(handle);
         let _ = tokio::time::timeout(StdDuration::from_secs(1), task).await;
     }

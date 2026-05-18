@@ -395,6 +395,55 @@ impl MigrationSubprotocolHandler {
                 chunk_index,
                 total_chunks,
             } => {
+                // Peer-auth gate. SnapshotReady is always source→
+                // {orchestrator,target}. The orchestrator records
+                // source_node at start_migration time; the target's
+                // local record (if any) keeps the orchestrator
+                // binding from its own start path. Reject if the
+                // sender doesn't match the recorded principal for
+                // whichever role we are in.
+                //
+                // Third-tier fallback closes a TOFU window: when
+                // neither orchestrator-side nor target-side state
+                // has a record (the orchestrator lives on a remote
+                // node and we've not yet received any messages for
+                // this origin), the first `SnapshotReady` would
+                // otherwise bind whoever sent it as the orchestrator
+                // inside `restore_on_target`. Operators who know
+                // the orchestrator out-of-band can pre-bind it via
+                // `DaemonFactoryRegistry::bind_expected_orchestrator`;
+                // when bound, a mismatching sender is rejected
+                // here, before `restore_on_target` records them.
+                if let Some(expected) = self.orchestrator.source_node(daemon_origin) {
+                    if expected != from_node {
+                        return Err(MigrationError::WrongPeer {
+                            daemon_origin,
+                            from: from_node,
+                            expected,
+                        });
+                    }
+                } else if let Some(expected) = self.target_handler.orchestrator_node(daemon_origin)
+                {
+                    if expected != from_node {
+                        return Err(MigrationError::WrongPeer {
+                            daemon_origin,
+                            from: from_node,
+                            expected,
+                        });
+                    }
+                } else if let Some(expected) = self
+                    .target_handler
+                    .factories()
+                    .expected_orchestrator(daemon_origin)
+                {
+                    if expected != from_node {
+                        return Err(MigrationError::WrongPeer {
+                            daemon_origin,
+                            from: from_node,
+                            expected,
+                        });
+                    }
+                }
                 // If the orchestrator is local, let it record this chunk and
                 // forward to target. `target_node` identifies where the
                 // snapshot should be restored; if that's us, we reassemble
@@ -502,11 +551,14 @@ impl MigrationSubprotocolHandler {
             MigrationMessage::ReplayComplete {
                 daemon_origin,
                 replayed_seq,
+                target_head,
             } => {
                 // Target finished replay — orchestrator initiates cutover
-                let cutover_msg = self
-                    .orchestrator
-                    .on_replay_complete(daemon_origin, replayed_seq)?;
+                let cutover_msg = self.orchestrator.on_replay_complete(
+                    daemon_origin,
+                    replayed_seq,
+                    target_head,
+                )?;
 
                 // Send CutoverNotify to source (from_node is the target that reported)
                 if let MigrationMessage::CutoverNotify { .. } = &cutover_msg {
@@ -585,9 +637,12 @@ impl MigrationSubprotocolHandler {
                     cb(daemon_origin);
                 }
 
-                // Cleanup source — also tolerant of missing source_handler
-                // state, and unregisters the local daemon even if no
-                // `source_handler.start_snapshot` was called.
+                // Cleanup source. No-op if this node never authored the
+                // migration (e.g. a replayed CutoverNotify after the
+                // record was already cleared); only an authored
+                // migration in Cutover phase actually unregisters the
+                // local daemon. A forged CutoverNotify for an origin
+                // we never migrated leaves the local daemon untouched.
                 let _ = self.source_handler.cleanup(daemon_origin);
 
                 let cleanup_msg = MigrationMessage::CleanupComplete { daemon_origin };
@@ -598,6 +653,20 @@ impl MigrationSubprotocolHandler {
             }
 
             MigrationMessage::CleanupComplete { daemon_origin } => {
+                // Peer-auth gate. CleanupComplete is source→
+                // orchestrator. Without binding, a forged
+                // CleanupComplete from any peer makes the
+                // orchestrator emit ActivateTarget to a target that
+                // hasn't necessarily finished restore.
+                if let Some(expected) = self.orchestrator.source_node(daemon_origin) {
+                    if expected != from_node {
+                        return Err(MigrationError::WrongPeer {
+                            daemon_origin,
+                            from: from_node,
+                            expected,
+                        });
+                    }
+                }
                 // Source reports its cleanup done. The orchestrator now
                 // tells the target to activate.
                 let activate = self.orchestrator.on_cleanup_complete(daemon_origin)?;
@@ -613,6 +682,22 @@ impl MigrationSubprotocolHandler {
             }
 
             MigrationMessage::ActivateTarget { daemon_origin } => {
+                // Peer-auth gate. ActivateTarget is orchestrator→
+                // target. Without binding, any peer with subprotocol
+                // reach forces the target to flip live while the
+                // source still believes it owns the daemon —
+                // divergent chain heads. The target_handler records
+                // the orchestrator at restore_snapshot time; reject
+                // unless from_node matches.
+                if let Some(expected) = self.target_handler.orchestrator_node(daemon_origin) {
+                    if expected != from_node {
+                        return Err(MigrationError::WrongPeer {
+                            daemon_origin,
+                            from: from_node,
+                            expected,
+                        });
+                    }
+                }
                 // We are the target — drain remaining events and go live.
                 // Retry-safe: `activate()` is idempotent once the migration
                 // has been completed, and we route the ack to the recorded
@@ -655,6 +740,29 @@ impl MigrationSubprotocolHandler {
                 daemon_origin,
                 reason,
             } => {
+                // Peer-auth gate. MigrationFailed can come from any
+                // participant (orchestrator, source, or target).
+                // Without binding, a forged MigrationFailed from any
+                // peer drives a rollback after a legitimate
+                // cutover. Accept only when from_node matches a
+                // recorded principal on at least one of the local
+                // handler views; if no record exists at all (e.g.,
+                // late-arriving for a migration already cleaned up),
+                // drop silently rather than abort phantom state.
+                let recorded = [
+                    self.orchestrator.source_node(daemon_origin),
+                    self.orchestrator.target_node(daemon_origin),
+                    self.source_handler.orchestrator_node(daemon_origin),
+                    self.target_handler.orchestrator_node(daemon_origin),
+                ];
+                let known = recorded.iter().any(|p| p.is_some());
+                if known && !recorded.contains(&Some(from_node)) {
+                    return Err(MigrationError::WrongPeer {
+                        daemon_origin,
+                        from: from_node,
+                        expected: recorded.iter().find_map(|p| *p).unwrap_or(0),
+                    });
+                }
                 // Fire the SDK's observer BEFORE abort, so the
                 // observer sees the structured reason while the
                 // migration record is still alive — the SDK uses
@@ -715,10 +823,19 @@ impl MigrationSubprotocolHandler {
                 // We are the target — replay events
                 let replayed_seq = self.target_handler.replay_events(daemon_origin, events)?;
 
+                // Ship the freshly-replayed daemon's chain head to
+                // the orchestrator so its `SuperpositionState`'s
+                // continuity-proof anchor is the real cryptographic
+                // head, not a synthetic placeholder the orchestrator
+                // would have to fabricate when it lives on a third
+                // node and has no local registry entry to read from.
+                let target_head = self.target_handler.host_head_link(daemon_origin)?;
+
                 // Tell orchestrator we're done replaying
                 let reply = MigrationMessage::ReplayComplete {
                     daemon_origin,
                     replayed_seq,
+                    target_head,
                 };
                 let dest = self
                     .target_handler

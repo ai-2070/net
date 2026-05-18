@@ -947,12 +947,49 @@ fn federated_sort_merge(
     Ok(out)
 }
 
+/// Maximum bytes a single federated drain will accumulate before
+/// surfacing `QueryBudgetExceeded`. Mirrors the hash-join memory
+/// budget (`HASH_JOIN_MEMORY_BYTES = 256 MiB`); the federated
+/// aggregate and window operators previously drained their inner
+/// `ResultStream` into a `Vec<ResultRow>` with no per-call cap, so
+/// a remote peer (or a misconfigured federation target) returning
+/// millions of rows OOM'd the aggregator before the grouped
+/// processing surfaced any output. The cap lands on the consumer
+/// side rather than the producer so a misestimating planner can
+/// be caught at runtime.
+const AGGREGATE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Approximate byte cost of a single `ResultRow`. Used by
+/// `drain_rows` to maintain an O(1) running budget — the row
+/// payload itself plus a small constant for the envelope. We
+/// don't try to walk the row's fields here; the constant is a
+/// generous over-approximation that keeps `AGGREGATE_MAX_BYTES`
+/// the cap that bites.
+fn approximate_row_bytes(row: &ResultRow) -> usize {
+    // `ResultRow.payload` is the per-row Bytes column; everything
+    // else (entity_id, seq, timestamp) sits inside a fixed-shape
+    // header. 64 bytes covers the header + alignment slack.
+    row.payload.len().saturating_add(64)
+}
+
 /// Drain a [`ResultStream`] into a `Vec<ResultRow>`. Errors
 /// short-circuit the drain with the first encountered error.
+/// Bounded by [`AGGREGATE_MAX_BYTES`] so a remote peer that
+/// returns millions of rows can't OOM the aggregator.
 async fn drain_rows(mut s: ResultStream) -> Result<Vec<ResultRow>, MeshError> {
     let mut out = Vec::new();
+    let mut bytes: usize = 0;
     while let Some(item) = s.next().await {
-        out.push(item?);
+        let row = item?;
+        bytes = bytes.saturating_add(approximate_row_bytes(&row));
+        if bytes > AGGREGATE_MAX_BYTES {
+            return Err(MeshError::QueryBudgetExceeded {
+                metric: super::error::BudgetMetric::MaxBytesScanned,
+                used: bytes as u64,
+                limit: AGGREGATE_MAX_BYTES as u64,
+            });
+        }
+        out.push(row);
     }
     Ok(out)
 }

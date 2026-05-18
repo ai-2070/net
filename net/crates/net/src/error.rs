@@ -52,6 +52,16 @@ pub enum AdapterError {
     #[error("connection error: {0}")]
     Connection(String),
 
+    /// The adapter has been shut down. Distinct from `Connection`
+    /// so callers (and the bus's retry classifier) can tell a "we
+    /// asked this adapter to stop" reject from a transport failure;
+    /// pre-fix every post-shutdown `on_batch` returned `Connection`,
+    /// which classified as non-retryable and silently dropped the
+    /// batch instead of either re-routing or surfacing the shutdown
+    /// as a distinct state to the caller.
+    #[error("adapter is shut down")]
+    Shutdown,
+
     /// Serialization/deserialization error. Wraps the underlying
     /// `serde_json::Error` so callers can read the category, line, and
     /// column via `source()`.
@@ -70,6 +80,14 @@ impl AdapterError {
     #[inline]
     pub fn is_fatal(&self) -> bool {
         matches!(self, Self::Fatal(_))
+    }
+
+    /// Returns true if this error means the adapter has been shut
+    /// down. Callers can react to this without scraping the
+    /// `Connection` message string.
+    #[inline]
+    pub fn is_shutdown(&self) -> bool {
+        matches!(self, Self::Shutdown)
     }
 }
 
@@ -112,7 +130,20 @@ mod tests {
         assert!(AdapterError::Backpressure.is_retryable());
         assert!(!AdapterError::Fatal("dead".into()).is_retryable());
         assert!(!AdapterError::Connection("refused".into()).is_retryable());
+        assert!(!AdapterError::Shutdown.is_retryable());
         assert!(!AdapterError::Serialization(make_serde_error()).is_retryable());
+    }
+
+    /// `Shutdown` is its own filterable category — distinct from
+    /// generic `Connection` errors so observability tools can tell
+    /// "sending to a stopped adapter" from "transport failure".
+    #[test]
+    fn test_adapter_error_is_shutdown_only_for_shutdown() {
+        assert!(AdapterError::Shutdown.is_shutdown());
+        assert!(!AdapterError::Connection("refused".into()).is_shutdown());
+        assert!(!AdapterError::Fatal("dead".into()).is_shutdown());
+        assert!(!AdapterError::Transient("temp".into()).is_shutdown());
+        assert!(!AdapterError::Backpressure.is_shutdown());
     }
 
     /// Regression: BUG_REPORT.md #18 — `Serialization` previously stored

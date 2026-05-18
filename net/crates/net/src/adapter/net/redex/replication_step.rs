@@ -178,13 +178,21 @@ pub fn tick(inputs: TickInputs<'_>) -> StepOutcome {
         return outcome;
     }
 
-    // Emit one heartbeat per replica-set member other than self.
-    // Skip self even if it's listed in replica_set — emitting a
-    // self-heartbeat over the wire would be wasted bytes + a
-    // broadcast-loop hazard. The local lag-from-self is always
-    // zero by definition.
+    // Emit one heartbeat per UNIQUE replica-set member other
+    // than self. The replica_set is currently a Vec<NodeId>; a
+    // misconfigured or buggy producer that lists the same peer
+    // twice would otherwise generate duplicate heartbeats every
+    // tick. Deduping at the iteration site keeps the call-site
+    // type signature stable while preventing the wire amplification.
+    // Skip self even if it's listed — emitting a self-heartbeat
+    // over the wire would be wasted bytes + a broadcast-loop
+    // hazard. The local lag-from-self is always zero by definition.
+    let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     for &peer in inputs.replica_set {
         if peer == inputs.self_node_id {
+            continue;
+        }
+        if !seen.insert(peer) {
             continue;
         }
         outcome.outbound.push(OutboundMessage::Heartbeat {
@@ -243,6 +251,13 @@ pub fn tick(inputs: TickInputs<'_>) -> StepOutcome {
                             channel_id: inputs.channel_id,
                             since_seq: inputs.tail_seq,
                             chunk_max: inputs.chunk_max_bytes,
+                            // Placeholder. The runtime mints a
+                            // random request_id and records it in
+                            // the per-leader OutstandingRequests
+                            // set before dispatching; tick is pure
+                            // and cannot draw entropy or mutate the
+                            // pending state.
+                            request_id: 0,
                         },
                     });
                 }

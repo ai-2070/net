@@ -936,7 +936,7 @@ def delegate_token(
     ...
 
 def channel_hash(channel: str) -> int:
-    """Hash a channel name to its canonical 32-bit substrate identifier.
+    """Hash a channel name to its canonical 64-bit substrate identifier.
 
     Used as the ACL/storage/config key (matches the ``channel_hash``
     field on ``PermissionToken``). The wire ``NetHeader`` fast-path

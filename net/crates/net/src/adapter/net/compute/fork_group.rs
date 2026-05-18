@@ -81,6 +81,11 @@ pub struct ForkGroup {
     forks: Vec<ForkInfo>,
     /// Shared coordination (LB, members, health).
     coord: GroupCoordinator,
+    /// X-1 epoch — bumped on every recovery-driven re-placement
+    /// of a fork slot. See `StandbyGroup::term` for the cross-
+    /// node-fencing intent; the wire integration is a separate
+    /// change.
+    term: u64,
 }
 
 impl ForkGroup {
@@ -129,7 +134,7 @@ impl ForkGroup {
             // Create daemon host with the forked chain
             let daemon = daemon_factory();
             let host =
-                DaemonHost::from_fork(daemon, keypair, chain_builder, config.host_config.clone());
+                DaemonHost::from_fork(daemon, keypair, chain_builder, config.host_config.clone())?;
             registry.register(host)?;
 
             coord.add_member(MemberInfo {
@@ -153,12 +158,20 @@ impl ForkGroup {
             config,
             forks,
             coord,
+            term: 1,
         })
     }
 
     /// Route an inbound event to the best available fork.
     pub fn route_event(&self, ctx: &RequestContext) -> Result<u64, GroupError> {
         self.coord.route_event(ctx)
+    }
+
+    /// X-1 epoch counter. Bumped on every successful slot
+    /// re-placement via `try_recover` after a node failure.
+    /// See `StandbyGroup::term` for the fencing rationale.
+    pub fn term(&self) -> u64 {
+        self.term
     }
 
     /// Resize the fork group to `n` forks.
@@ -205,7 +218,7 @@ impl ForkGroup {
                     keypair,
                     chain_builder,
                     self.config.host_config.clone(),
-                );
+                )?;
                 registry.register(host)?;
 
                 self.coord.add_member(MemberInfo {
@@ -289,14 +302,6 @@ impl ForkGroup {
         for index in affected {
             self.coord.mark_unhealthy(index);
 
-            let old_origin_hash = self
-                .coord
-                .members()
-                .iter()
-                .find(|m| m.index == index)
-                .unwrap()
-                .origin_hash;
-
             // Try `place_with_spread` BEFORE touching the registry
             // so a placement failure doesn't leave the slot
             // unregistered (and therefore unrecoverable via
@@ -337,15 +342,13 @@ impl ForkGroup {
             // between callers (the older `unregister` →
             // `register` sequence had a small window where the
             // second step could fail and orphan the slot).
-            let _ = old_origin_hash;
-
             let daemon = daemon_factory();
             let host = DaemonHost::from_fork(
                 daemon,
                 keypair,
                 chain_builder,
                 self.config.host_config.clone(),
-            );
+            )?;
             registry.replace(host);
 
             self.coord
@@ -430,7 +433,7 @@ impl ForkGroup {
 
             let daemon = daemon_factory();
             let host =
-                DaemonHost::from_fork(daemon, keypair, chain_builder, config.host_config.clone());
+                DaemonHost::from_fork(daemon, keypair, chain_builder, config.host_config.clone())?;
             registry.register(host)?;
 
             coord.add_member(MemberInfo {
@@ -454,6 +457,7 @@ impl ForkGroup {
             config,
             forks,
             coord,
+            term: 1,
         })
     }
 
@@ -520,7 +524,7 @@ impl ForkGroup {
                     keypair,
                     chain_builder,
                     self.config.host_config.clone(),
-                );
+                )?;
                 registry.register(host)?;
 
                 self.coord.add_member(MemberInfo {
@@ -646,7 +650,7 @@ impl ForkGroup {
                 keypair,
                 chain_builder,
                 self.config.host_config.clone(),
-            );
+            )?;
             registry.replace(host);
 
             self.coord
@@ -705,6 +709,118 @@ impl ForkGroup {
     /// Number of healthy forks.
     pub fn healthy_count(&self) -> u8 {
         self.coord.healthy_count()
+    }
+
+    /// Retry placement against the current healthy node pool for
+    /// every fork slot currently marked unhealthy. Caps at
+    /// `MAX_RECOVERIES_PER_TICK` so a pathological "every slot
+    /// unhealthy" state makes progress without wedging the caller.
+    /// Returns the slot indices that were successfully placed.
+    fn try_recover_inner<F>(
+        &mut self,
+        scheduler: &Scheduler,
+        registry: &DaemonRegistry,
+        daemon_factory: F,
+    ) -> Vec<u8>
+    where
+        F: Fn() -> Box<dyn MeshDaemon>,
+    {
+        const MAX_RECOVERIES_PER_TICK: usize = 4;
+        let unhealthy: Vec<u8> = self
+            .coord
+            .members()
+            .iter()
+            .filter(|m| !m.healthy)
+            .map(|m| m.index)
+            .take(MAX_RECOVERIES_PER_TICK)
+            .collect();
+        if unhealthy.is_empty() {
+            return Vec::new();
+        }
+
+        let requirements = daemon_factory().requirements();
+        let mut exclude: HashSet<u64> = self
+            .coord
+            .members()
+            .iter()
+            .filter(|m| m.healthy)
+            .map(|m| m.node_id)
+            .collect();
+        let mut recovered = Vec::with_capacity(unhealthy.len());
+
+        for index in unhealthy {
+            let fork_info = match self.forks.get(index as usize) {
+                Some(info) => info.clone(),
+                None => continue,
+            };
+            let keypair = EntityKeypair::from_bytes(fork_info.keypair_secret);
+            let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
+            let chain_builder =
+                CausalChainBuilder::from_head(fork_info.record.fork_genesis, bytes::Bytes::new());
+
+            let placement =
+                match GroupCoordinator::place_with_spread(scheduler, &requirements, &exclude) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::trace!(
+                            index,
+                            error = %e,
+                            "ForkGroup::try_recover: place_with_spread still failing; \
+                             slot remains unhealthy for next tick"
+                        );
+                        continue;
+                    }
+                };
+
+            let daemon = daemon_factory();
+            let host = match DaemonHost::from_fork(
+                daemon,
+                keypair,
+                chain_builder,
+                self.config.host_config.clone(),
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(
+                        index,
+                        error = %e,
+                        "ForkGroup::try_recover: DaemonHost::from_fork failed; \
+                         slot remains unhealthy"
+                    );
+                    continue;
+                }
+            };
+            registry.replace(host);
+
+            self.coord
+                .update_member_placement(index, placement.node_id, entity_id_bytes);
+            exclude.insert(placement.node_id);
+            recovered.push(index);
+        }
+
+        // X-1 epoch bump: every successful recovery advances the
+        // term. A future cross-node wire-fencing layer can use
+        // this to reject routed events from a slot that observed
+        // a stale `term` at the issuer's end of the partition.
+        if !recovered.is_empty() {
+            self.term = self.term.saturating_add(1);
+        }
+        recovered
+    }
+}
+
+impl crate::adapter::net::compute::UnhealthySlotRecovery for ForkGroup {
+    fn has_unhealthy_slots(&self) -> bool {
+        self.coord.members().iter().any(|m| !m.healthy)
+    }
+
+    fn try_recover(
+        &mut self,
+        scheduler: &Scheduler,
+        registry: &DaemonRegistry,
+        daemon_factory: &dyn Fn() -> Box<dyn MeshDaemon>,
+    ) -> Vec<u8> {
+        self.try_recover_inner(scheduler, registry, daemon_factory)
     }
 }
 

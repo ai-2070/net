@@ -463,6 +463,15 @@ pub struct StoredEvent {
 
     /// Shard this event belongs to.
     pub shard_id: u16,
+
+    /// Application-level idempotency key as written by the producer.
+    /// Adapters carry an opaque dedup token on the wire (Redis Streams
+    /// uses a `dedup_id` field; JetStream uses `Nats-Msg-Id`). The
+    /// trait-level consumer ([`crate::adapter::Adapter::poll_shard`])
+    /// surfaces it here so callers can drive their own dedup table
+    /// without re-reading the raw broker payload. `None` when the
+    /// adapter or the wire entry doesn't carry one.
+    pub dedup_id: Option<String>,
 }
 
 impl StoredEvent {
@@ -474,6 +483,7 @@ impl StoredEvent {
             raw,
             insertion_ts,
             shard_id,
+            dedup_id: None,
         }
     }
 
@@ -489,7 +499,17 @@ impl StoredEvent {
             raw,
             insertion_ts,
             shard_id,
+            dedup_id: None,
         }
+    }
+
+    /// Attach an application-level dedup identifier (the producer's
+    /// `dedup_id` / `Nats-Msg-Id`). Returns `self` for chaining.
+    #[inline]
+    #[must_use]
+    pub fn with_dedup_id(mut self, dedup_id: Option<String>) -> Self {
+        self.dedup_id = dedup_id;
+        self
     }
 
     /// Parse the raw bytes into a JSON value on demand.
@@ -514,7 +534,18 @@ impl Serialize for StoredEvent {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("StoredEvent", 4)?;
+        // Always emit `dedup_id` (as `null` when absent) so the
+        // on-wire shape is stable. Pre-fix the field count flipped
+        // between 4 and 5 based on whether `dedup_id` was populated;
+        // downstream Node / Python / Go consumers using
+        // `deny_unknown_fields` (or strict schema validators)
+        // accepted the 4-field shape but rejected events whose
+        // adapter populated the 5th, making the wire compatibility
+        // *data-dependent*. Stable shape > byte-optimal: an extra
+        // `"dedup_id":null` per legacy event is cheap, the rejection
+        // hazard is not.
+        let field_count = 5;
+        let mut state = serializer.serialize_struct("StoredEvent", field_count)?;
         state.serialize_field("id", &self.id)?;
         // Serialize raw bytes as a `RawValue` so the on-wire JSON
         // is byte-for-byte the same as the input. Pre-fix the
@@ -540,6 +571,9 @@ impl Serialize for StoredEvent {
         state.serialize_field("raw", &*raw_value)?;
         state.serialize_field("insertion_ts", &self.insertion_ts)?;
         state.serialize_field("shard_id", &self.shard_id)?;
+        // Always emit `dedup_id` to keep the wire shape stable —
+        // `None` serializes as JSON `null`.
+        state.serialize_field("dedup_id", &self.dedup_id)?;
         state.end()
     }
 }
@@ -816,6 +850,32 @@ mod tests {
                  output: {json}"
             );
         }
+    }
+
+    /// Regression: `dedup_id` is always emitted (as `null` when
+    /// absent) so the on-wire shape is stable. Pre-fix the field
+    /// was omitted on `None`, making the shape data-dependent:
+    /// downstream Node / Python / Go consumers using
+    /// `deny_unknown_fields` accepted the 4-field shape but
+    /// rejected events whose adapter happened to populate the 5th.
+    #[test]
+    fn stored_event_serialize_always_emits_dedup_id() {
+        // None → expect `"dedup_id":null` in output.
+        let none_event = StoredEvent::new("id-none".into(), Bytes::from(r#"{"x":1}"#), 0, 0);
+        let none_json = serde_json::to_string(&none_event).unwrap();
+        assert!(
+            none_json.contains("\"dedup_id\":null"),
+            "absent dedup_id must serialize as null, not be omitted; got {none_json}",
+        );
+
+        // Some → expect `"dedup_id":"value"`.
+        let some_event = StoredEvent::new("id-some".into(), Bytes::from(r#"{"x":1}"#), 0, 0)
+            .with_dedup_id(Some("abc".into()));
+        let some_json = serde_json::to_string(&some_event).unwrap();
+        assert!(
+            some_json.contains("\"dedup_id\":\"abc\""),
+            "populated dedup_id must serialize as the string value; got {some_json}",
+        );
     }
 
     /// Pin that `Batch::with_nonce` writes the passed value into the

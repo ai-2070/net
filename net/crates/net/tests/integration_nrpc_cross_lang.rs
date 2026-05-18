@@ -163,7 +163,7 @@ impl Loopback {
 
     async fn call_json(&self, body: Vec<u8>) -> RpcResponsePayload {
         let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
-        let rx = self.pending.register(call_id);
+        let rx = self.pending.register(call_id, 0);
         let req = RpcRequestPayload {
             service: SERVICE_NAME.to_string(),
             deadline_ns: 0,

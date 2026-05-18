@@ -42,9 +42,9 @@ Per-node speculative caching of in-scope chains observed via the tail-subscripti
 ### Wire-up
 
 ```rust
-use ai2070_net::adapter::net::{Redex, MeshNode};
-use ai2070_net::adapter::net::dataforts::{GreedyConfig, IntentMatchPolicy};
-use ai2070_net::adapter::net::behavior::capability::CapabilitySet;
+use net::adapter::net::{Redex, MeshNode};
+use net::adapter::net::dataforts::{GreedyConfig, IntentMatchPolicy};
+use net::adapter::net::behavior::capability::CapabilitySet;
 use std::sync::Arc;
 
 let redex = Arc::new(Redex::new());
@@ -109,7 +109,7 @@ Per-chain read-rate counters with exponential decay. Threshold-crossing emission
 ### Wire-up
 
 ```rust
-use ai2070_net::adapter::net::dataforts::DataGravityPolicy;
+use net::adapter::net::dataforts::DataGravityPolicy;
 use std::time::Duration;
 
 redex.enable_gravity_for_greedy(
@@ -180,7 +180,7 @@ Adapter dispatch is **URI-scheme keyed**, not channel-config keyed. `BlobAdapter
 ### Wire-up
 
 ```rust
-use ai2070_net::adapter::net::dataforts::{
+use net::adapter::net::dataforts::{
     register_filesystem_blob_adapter, publish_blob, resolve_payload, BlobRef,
 };
 

@@ -169,9 +169,10 @@ async fn keepalive_triggers_ack_via_observer() {
     // Install ack waiters before firing. Both sides' observer
     // machinery needs the coordinator session to emit an ack.
     let a_clone = a.clone();
-    let a_task = tokio::spawn(async move { a_clone.await_punch_ack(b_id).await });
+    let r_id = r.node_id();
+    let a_task = tokio::spawn(async move { a_clone.await_punch_ack(b_id, r_id).await });
     let b_clone = b.clone();
-    let b_task = tokio::spawn(async move { b_clone.await_punch_ack(a_id).await });
+    let b_task = tokio::spawn(async move { b_clone.await_punch_ack(a_id, r_id).await });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let _intro = a

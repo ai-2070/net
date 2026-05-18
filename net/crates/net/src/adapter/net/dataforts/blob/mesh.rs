@@ -606,9 +606,44 @@ impl MeshBlobAdapter {
             }
         }
         if !updates.is_empty() {
-            sink.announce_blob_heat_batch(&updates).await.map_err(|e| {
-                BlobError::Backend(format!("blob heat tick: announce batch failed: {}", e))
-            })?;
+            match sink.announce_blob_heat_batch(&updates).await {
+                Ok(()) => {}
+                Err(e) => {
+                    // Sink failed — roll the in-flight markers
+                    // back so the next tick reissues these same
+                    // emissions, matching the retry-on-failure
+                    // semantic the audit asks for. Without the
+                    // rollback the in-flight set would pin the
+                    // hashes forever (no commit to clear, no other
+                    // path to remove), and subsequent ticks would
+                    // silently skip them.
+                    let mut guard = reg.lock();
+                    for (hash, _) in &emissions {
+                        guard.rollback_emission(hash);
+                    }
+                    return Err(BlobError::Backend(format!(
+                        "blob heat tick: announce batch failed: {}",
+                        e
+                    )));
+                }
+            }
+        }
+        // D-17: commit `last_emitted` mutations only after the sink
+        // confirmed the announcement. Pre-fix the registry's `tick`
+        // mutated state inline and a transient sink error stranded
+        // the chain's heat updates forever (next tick's
+        // `should_emit_heat` returned Suppress against the
+        // already-advanced `last_emitted`). The registry's
+        // in-flight set defends against the inverse race — a
+        // concurrent `tick_blob_heat` landing in the lock-release
+        // window between this `tick` and the `commit_emissions`
+        // below would otherwise re-emit the same candidates
+        // because `last_emitted` hasn't been mutated yet.
+        // `tick`'s in-flight check skips those hashes; `commit`
+        // clears the markers.
+        {
+            let mut guard = reg.lock();
+            guard.commit_emissions(&emissions);
         }
         Ok(updates.len() as u64)
     }
@@ -748,36 +783,87 @@ impl MeshBlobAdapter {
         );
         let mut swept: u64 = 0;
         for hash in candidates {
-            // delete_chunk drops the refcount entry on success
-            // and preserves it on error so the next sweep can
-            // retry.
-            if self.delete_chunk(&hash).await.is_ok() {
-                swept = swept.saturating_add(1);
+            // Atomic re-check + remove closes the TOCTOU window
+            // between the deletable_hashes snapshot and the actual
+            // delete — a concurrent `incr` (e.g. a freshly-folded
+            // chain event taking a new reference on `hash`) would
+            // otherwise lose its refcount entry to the unconditional
+            // `remove` that delete_chunk used to issue. If the
+            // re-check fails the chunk stays around for the next
+            // sweep to retry.
+            //
+            // `take_if_deletable` returns the removed entry so we
+            // can re-insert it on close-failure — without that
+            // restore path, a transient `close_and_unlink_file`
+            // error would leave the file on disk while the refcount
+            // entry is gone, orphaning the chunk: future sweeps
+            // can't find it (they enumerate refcounts) and the
+            // only recovery is the out-of-band scanner. Restore-
+            // on-failure means the very next sweep tick retries.
+            let entry_snapshot = match self.refcount.take_if_deletable(
+                &hash,
+                now_unix_ms,
+                self.retention_floor,
+                disk_pressure_critical,
+            ) {
+                Some(entry) => entry,
+                None => continue,
+            };
+            let channel = Self::chunk_channel(&hash);
+            // close_and_unlink_file also removes any on-disk
+            // segment dir, so swept chunks don't accumulate as
+            // orphaned segments on with_persistent(true) deployments.
+            // Heap-only channels (with_persistent(false)) skip the
+            // unlink branch and behave exactly like close_file.
+            if let Err(e) = self.redex.close_and_unlink_file(&channel) {
+                // Re-insert the refcount entry so a subsequent
+                // sweep tick retries. `restore_if_absent` is a no-
+                // op if a concurrent `incr` raced in and re-created
+                // the slot — their refcount > 0 is authoritative
+                // and the next sweep correctly skips the hash.
+                let restored = self.refcount.restore_if_absent(hash, entry_snapshot);
+                tracing::warn!(
+                    hash = ?hash,
+                    error = %e,
+                    restored,
+                    "mesh blob: sweep close_and_unlink_file failed; \
+                     refcount entry restored for next sweep retry \
+                     (restored=false means a concurrent incr re-created the slot)"
+                );
+                continue;
             }
+            swept = swept.saturating_add(1);
         }
         self.metrics.record_gc_swept(swept);
         Ok(swept)
     }
 
     /// Delete a single chunk file by content hash. The chunk's
-    /// `RedexFile` is closed + removed from the Redex manager,
-    /// and the refcount table entry is dropped on success so
-    /// `stat()` stops surfacing a stale `last_seen_unix_ms` for a
-    /// deleted blob and any subsequent re-store starts a fresh
-    /// retention-floor clock. Idempotent on the success path —
-    /// closing an already-closed file returns `Ok(())` from the
-    /// Redex layer. Used internally by [`Self::sweep_gc`] and by
-    /// the peer-initiated [`Self::delete_chunk_authorized`];
-    /// reachable directly for operators running batched / dry-run
-    /// flows against [`BlobRefcountTable::deletable_hashes`].
+    /// `RedexFile` is closed + removed from the Redex manager
+    /// (including any on-disk segment dir for persistent
+    /// deployments), and the refcount table entry is dropped on
+    /// success so `stat()` stops surfacing a stale
+    /// `last_seen_unix_ms` for a deleted blob and any subsequent
+    /// re-store starts a fresh retention-floor clock. Idempotent
+    /// on the success path — closing an already-closed file
+    /// returns `Ok(())` from the Redex layer. Used by the
+    /// peer-initiated [`Self::delete_chunk_authorized`] as a
+    /// force-delete; reachable directly for operators running
+    /// batched / dry-run flows against
+    /// [`BlobRefcountTable::deletable_hashes`].
     ///
     /// On `Err` the refcount entry is preserved so the next sweep
     /// can retry — chunk-file close failures shouldn't strand the
     /// retention clock.
+    ///
+    /// The GC sweep does NOT route through this method: it uses
+    /// [`BlobRefcountTable::remove_if_deletable`] + a direct
+    /// `close_and_unlink_file` so an `incr` racing the sweep can
+    /// rescue the entry without losing data.
     pub async fn delete_chunk(&self, hash: &[u8; 32]) -> Result<(), BlobError> {
         let channel = Self::chunk_channel(hash);
         self.redex
-            .close_file(&channel)
+            .close_and_unlink_file(&channel)
             .map_err(|e| BlobError::Backend(format!("mesh blob: close chunk: {}", e)))?;
         self.refcount.remove(hash);
         Ok(())
@@ -1047,13 +1133,30 @@ impl BlobAdapter for MeshBlobAdapter {
     }
 
     async fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
+        // Per-fetch byte ceiling for the Manifest path. Pre-fix
+        // an attacker-controllable manifest pointing at locally-
+        // resident chunks let a handful of concurrent `fetch`
+        // calls exhaust process memory — the per-chunk hash
+        // verify defends against wrong-content but not against
+        // wrong-size aggregate. 256 MiB is a generous bulk-fetch
+        // upper bound; callers needing streaming on larger
+        // payloads should route through `fetch_range` per-chunk
+        // or `fetch_chunk` directly. Surfaces as a typed
+        // BlobError::Backend so callers can fall back to the
+        // streaming path on the same error.
+        const MAX_BULK_FETCH_BYTES: u64 = 256 * 1024 * 1024;
         let result = match blob_ref {
             BlobRef::Small { hash, .. } => self.fetch_chunk(hash).await,
             BlobRef::Manifest {
-                chunks,
-                total_size: _,
-                ..
+                chunks, total_size, ..
             } => {
+                if *total_size > MAX_BULK_FETCH_BYTES {
+                    return Err(BlobError::Backend(format!(
+                        "mesh blob: Manifest total_size {} exceeds bulk-fetch cap {}; \
+                         use fetch_range or per-chunk fetch_chunk for large payloads",
+                        total_size, MAX_BULK_FETCH_BYTES
+                    )));
+                }
                 // Let Vec grow as we extend. The declared
                 // `total_size` is bounded by `BLOB_REF_MAX_SIZE`
                 // (16 GiB) — pre-allocating that on a fetch of a
@@ -1124,6 +1227,17 @@ impl BlobAdapter for MeshBlobAdapter {
         if len == 0 {
             return Ok(Vec::new());
         }
+        // Guard against `u64 -> usize` truncation on 32-bit targets.
+        // The Small arm indexes `bytes[range.start as usize..range.end as usize]`
+        // and the Manifest arm calls `Vec::with_capacity(len as usize)`; both
+        // silently truncate on 32-bit unless we reject here. Mirror of
+        // FileSystemAdapter::fetch_range's guard in fs.rs.
+        if len > usize::MAX as u64 || range.end > usize::MAX as u64 {
+            return Err(BlobError::Backend(format!(
+                "mesh blob: range length {} or end {} exceeds usize::MAX on this target",
+                len, range.end
+            )));
+        }
         let (result, touched): (Result<Vec<u8>, BlobError>, Vec<[u8; 32]>) = match blob_ref {
             BlobRef::Small { hash, size, .. } => {
                 if range.end > *size {
@@ -1150,10 +1264,33 @@ impl BlobAdapter for MeshBlobAdapter {
                     let chunk = &chunks[req.chunk_index];
                     match self.fetch_chunk(&chunk.hash).await {
                         Ok(chunk_bytes) => {
-                            out.extend_from_slice(
-                                &chunk_bytes
-                                    [req.start_in_chunk as usize..req.end_in_chunk as usize],
-                            );
+                            // Defensive `get` rather than panicking
+                            // slice — the manifest is peer-supplied
+                            // and even with the decoder's chunk-size
+                            // validation the actually-fetched bytes
+                            // could in principle be shorter (e.g. a
+                            // future content-addressed-but-truncated
+                            // backend); panic across `.await` in the
+                            // adapter is worse than a typed error.
+                            //
+                            // `ShortChunk` is the right surface here:
+                            // the cause is a size disagreement, not
+                            // a content disagreement. Pre-fix this
+                            // returned `HashMismatch` where `actual`
+                            // could equal `expected` for a truncated
+                            // tail aligned to a block boundary —
+                            // retry logic that distinguishes
+                            // truncation from divergence couldn't
+                            // tell the cases apart.
+                            let slice = chunk_bytes
+                                .get(req.start_in_chunk as usize..req.end_in_chunk as usize)
+                                .ok_or(BlobError::ShortChunk {
+                                    hash: chunk.hash,
+                                    requested_start: req.start_in_chunk as u64,
+                                    requested_end: req.end_in_chunk as u64,
+                                    actual_len: chunk_bytes.len() as u64,
+                                })?;
+                            out.extend_from_slice(slice);
                             touched.push(chunk.hash);
                         }
                         Err(e) => {

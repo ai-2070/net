@@ -127,6 +127,39 @@ fn graph_id_to_node_id(graph_id: &[u8; 32]) -> u64 {
 /// as if the network link is severed.
 pub type PartitionFilter = Arc<dashmap::DashSet<SocketAddr>>;
 
+/// Waiter map for incoming `PunchIntroduce` messages keyed by the
+/// counterpart endpoint's `node_id`. Value is `(generation,
+/// expected coordinator node id, oneshot sender)`. Used by the
+/// rendezvous-coordinated punch flow to bind introduce delivery
+/// to the relay the local node sent `PunchRequest` to.
+#[cfg(feature = "nat-traversal")]
+type PendingPunchIntroduces = Arc<
+    DashMap<
+        u64,
+        (
+            u64,
+            u64,
+            oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>,
+        ),
+    >,
+>;
+
+/// Waiter map for incoming `PunchAck` messages keyed by the sender
+/// endpoint's `node_id`. Value is `(generation, expected coordinator
+/// node id, oneshot sender)`. Used by `connect_direct`'s
+/// `SinglePunch` path to confirm the counterpart's side of the punch.
+#[cfg(feature = "nat-traversal")]
+type PendingPunchAcks = Arc<
+    DashMap<
+        u64,
+        (
+            u64,
+            u64,
+            oneshot::Sender<super::traversal::rendezvous::PunchAck>,
+        ),
+    >,
+>;
+
 /// Cancellation-safe rollback for a freshly registered peer
 /// session + addr map + routing entry.
 ///
@@ -368,7 +401,7 @@ struct DispatchCtx {
     /// `None` disables channel-level ACL checks (any caller accepted).
     channel_configs: Option<Arc<ChannelConfigRegistry>>,
     /// In-flight Subscribe/Unsubscribe requests awaiting an Ack, keyed by nonce.
-    pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
+    pending_membership_acks: Arc<DashMap<u64, (u64, oneshot::Sender<MembershipAck>)>>,
     /// In-flight reflex probes keyed by the responder's `node_id`.
     /// Populated by `MeshNode::probe_reflex`; the dispatch branch
     /// for `SUBPROTOCOL_REFLEX` completes the oneshot with the
@@ -381,33 +414,28 @@ struct DispatchCtx {
         Arc<DashMap<u64, (u64, tokio::sync::oneshot::Sender<std::net::SocketAddr>)>>,
     /// Waiters for incoming `PunchIntroduce` messages, keyed by
     /// the counterpart endpoint's `node_id` (the `peer` field in
-    /// the introduce). Mirrors `pending_reflex_probes` — the
-    /// dispatcher completes the oneshot when a matching introduce
-    /// lands; a message with no waiter is dropped silently.
+    /// the introduce). The value tuple is `(generation, expected
+    /// coordinator node, oneshot sender)`. The coordinator binding
+    /// is the session peer the local node *expects* to forward the
+    /// introduce (the relay it sent `PunchRequest` to). Without
+    /// this binding any session peer could send a forged introduce
+    /// for any in-flight target and steer the local node's punch
+    /// flow at an attacker-chosen reflex address.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_introduces: Arc<
-        DashMap<
-            u64,
-            (
-                u64,
-                tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>,
-            ),
-        >,
-    >,
+    pending_punch_introduces: PendingPunchIntroduces,
     /// Waiters for incoming `PunchAck` messages, keyed by the
     /// sender's `node_id` (the `from_peer` field in the ack).
     /// `connect_direct`'s `SinglePunch` path awaits on this map
     /// to confirm the peer completed their side of the punch.
+    /// The value tuple is `(generation, expected coordinator node,
+    /// oneshot sender)`. The coordinator forwards the
+    /// counterpart's ack to us; binding to that node id at insert
+    /// time prevents any other session peer from forging a
+    /// `PunchAck { from_peer: counterpart, ... }` and resolving
+    /// the local node's connect_direct future with attacker-chosen
+    /// payload.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_acks: Arc<
-        DashMap<
-            u64,
-            (
-                u64,
-                tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchAck>,
-            ),
-        >,
-    >,
+    pending_punch_acks: PendingPunchAcks,
     /// Keep-alive observers, keyed by the `SocketAddr` of the
     /// counterpart's `peer_reflex`. Fired by the receive loop
     /// when a matching `Keepalive`-formatted packet arrives;
@@ -432,7 +460,19 @@ struct DispatchCtx {
     /// `(origin_node_id, version)`. Written by the dispatch handler
     /// before indexing + forwarding so a `(origin, version)` tuple
     /// is processed at most once per node.
-    seen_announcements: Arc<DashMap<(u64, u64), std::time::Instant>>,
+    /// Per-(node_id, version, is_direct) dedup of capability
+    /// announcements. The `is_direct` axis (`hop_count == 0`)
+    /// keeps a forwarded ann's dedup from suppressing the same
+    /// peer's later direct announcement — the TOFU pin runs only
+    /// on the direct path, so a forwarder cannot poison the
+    /// dedup table for a peer's `(node_id, version)` and stop
+    /// the victim's `peer_entity_ids` mapping from populating.
+    /// Two diamond-arrived forwarded anns still dedup against
+    /// each other (both `is_direct == false`); two diamond-
+    /// arrived direct anns is a non-sequitur (`from_node ==
+    /// ann.node_id` on the direct path, so there's only one peer
+    /// that can produce one).
+    seen_announcements: Arc<DashMap<(u64, u64, bool), std::time::Instant>>,
     /// Whether inbound `CapabilityAnnouncement` packets without a
     /// signature are dropped. Validity is not enforced yet.
     require_signed_capabilities: bool,
@@ -1164,18 +1204,13 @@ pub struct MeshNode {
     /// awaiting future.
     #[cfg(feature = "cortex")]
     rpc_client_pending: Arc<crate::adapter::net::cortex::RpcClientPending>,
-    /// Per-caller monotonic call id allocator. Used as the
-    /// `EventMeta::seq_or_ts` correlation id on outgoing REQUEST
-    /// events.
-    #[cfg(feature = "cortex")]
-    rpc_next_call_id: Arc<std::sync::atomic::AtomicU64>,
     /// Independent fetch_add counter used by `RoutingPolicy::
-    /// RoundRobin` and `Random` so two concurrent `call_service`
-    /// invocations don't observe the same value (which would have
-    /// happened if we consulted `rpc_next_call_id` via `load` —
-    /// since the actual call_id allocation happens later in
-    /// `call(...)`, two concurrent selections could read the same
-    /// pre-bump value and pick the same target).
+    /// RoundRobin` and `Random` to pick the next target node.
+    /// Sequential is correct here — the cursor is local-only and
+    /// never leaves the process, so predictability from another
+    /// peer is not a concern. (Distinct from `mint_random_call_id`,
+    /// which generates the per-call correlation token that DOES
+    /// cross the wire and so must be unpredictable.)
     #[cfg(feature = "cortex")]
     rpc_round_robin_cursor: Arc<std::sync::atomic::AtomicU64>,
     /// Tracks `(target_node_id, service)` pairs we've already
@@ -1243,7 +1278,7 @@ pub struct MeshNode {
     /// are accepted — used by tests and by nodes that don't run channels.
     channel_configs: Option<Arc<ChannelConfigRegistry>>,
     /// In-flight Subscribe/Unsubscribe requests keyed by nonce.
-    pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
+    pending_membership_acks: Arc<DashMap<u64, (u64, oneshot::Sender<MembershipAck>)>>,
     /// In-flight reflex probes keyed by the responder's `node_id`.
     /// Shared with `DispatchCtx` via `Arc` clone so the dispatcher
     /// can complete oneshots without routing back through
@@ -1259,23 +1294,14 @@ pub struct MeshNode {
     /// observe an introduce install an entry here via the
     /// stage-3c surface before calling the coordinator.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_introduces: Arc<
-        DashMap<
-            u64,
-            (
-                u64,
-                oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>,
-            ),
-        >,
-    >,
+    pending_punch_introduces: PendingPunchIntroduces,
     /// In-flight punch acknowledgements keyed by the *sender*
     /// endpoint's `node_id` — i.e. the `from_peer` field on the
     /// arriving `PunchAck`. `connect_direct` awaits this map on
     /// the `SinglePunch` path so `punches_succeeded` only bumps
     /// when the peer actually confirmed the punch.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_acks:
-        Arc<DashMap<u64, (u64, oneshot::Sender<super::traversal::rendezvous::PunchAck>)>>,
+    pending_punch_acks: PendingPunchAcks,
     /// Monotonic counter for waiter generations used by the
     /// three `pending_*` maps above. Each insert stamps its
     /// entry with a unique `gen`; removal is a `remove_if` check
@@ -1371,7 +1397,19 @@ pub struct MeshNode {
     /// announcement's effective lifetime (2× `ttl_secs`) has
     /// elapsed. Mirrors the `seen_pingwaves` cache in
     /// [`ProximityGraph`].
-    seen_announcements: Arc<DashMap<(u64, u64), std::time::Instant>>,
+    /// Per-(node_id, version, is_direct) dedup of capability
+    /// announcements. The `is_direct` axis (`hop_count == 0`)
+    /// keeps a forwarded ann's dedup from suppressing the same
+    /// peer's later direct announcement — the TOFU pin runs only
+    /// on the direct path, so a forwarder cannot poison the
+    /// dedup table for a peer's `(node_id, version)` and stop
+    /// the victim's `peer_entity_ids` mapping from populating.
+    /// Two diamond-arrived forwarded anns still dedup against
+    /// each other (both `is_direct == false`); two diamond-
+    /// arrived direct anns is a non-sequitur (`from_node ==
+    /// ann.node_id` on the direct path, so there's only one peer
+    /// that can produce one).
+    seen_announcements: Arc<DashMap<(u64, u64, bool), std::time::Instant>>,
     /// Timestamp of the most recent outbound capability-announcement
     /// broadcast from this origin. Compared against
     /// `config.min_announce_interval` on every `announce_capabilities_with`
@@ -1705,8 +1743,6 @@ impl MeshNode {
             rpc_inbound_dispatchers: Arc::new(DashMap::new()),
             #[cfg(feature = "cortex")]
             rpc_client_pending: Arc::new(crate::adapter::net::cortex::RpcClientPending::new()),
-            #[cfg(feature = "cortex")]
-            rpc_next_call_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             #[cfg(feature = "cortex")]
             rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
@@ -3797,10 +3833,35 @@ impl MeshNode {
                         // sees inbound traffic from `peer_reflex`
                         // (or — on localhost — at the punch_deadline
                         // fallback). Plan §3 endpoint semantics.
-                        if let Some((_, (_gen, tx))) =
-                            ctx.pending_punch_introduces.remove(&intro.peer)
-                        {
+                        //
+                        // Bind the introduce to the recorded
+                        // coordinator. Pre-binding, any session peer
+                        // could forge a PunchIntroduce for any peer
+                        // the local node was currently waiting on
+                        // (target id learned via session-establishment
+                        // traffic patterns) and steer the local
+                        // node's punch flow at an attacker-chosen
+                        // reflex. The legit coordinator's later
+                        // introduce found the entry already removed
+                        // and was silently dropped.
+                        let took = ctx
+                            .pending_punch_introduces
+                            .remove_if(&intro.peer, |_, (_gen, expected_coord, _)| {
+                                *expected_coord == from_node
+                            });
+                        if let Some((_, (_gen, _expected, tx))) = took {
                             let _ = tx.send(intro);
+                        } else if ctx.pending_punch_introduces.contains_key(&intro.peer) {
+                            // A waiter exists but the coordinator
+                            // mismatched. Drop without completing
+                            // and without scheduling a punch — this
+                            // is the forged-introduce path.
+                            tracing::trace!(
+                                from = from_node,
+                                target = intro.peer,
+                                "rendezvous: PunchIntroduce from non-coordinator session peer; dropping"
+                            );
+                            continue;
                         }
                         Self::schedule_punch(from_node, intro, ctx);
                     }
@@ -3810,10 +3871,32 @@ impl MeshNode {
                             // oneshot keyed by `from_peer`. A late ack
                             // for an abandoned `connect_direct` is
                             // dropped silently.
-                            if let Some((_, (_gen, tx))) =
-                                ctx.pending_punch_acks.remove(&ack.from_peer)
-                            {
+                            //
+                            // Bind to the recorded coordinator. The
+                            // ack always reaches the final recipient
+                            // via the coordinator's forwarding role
+                            // (`forward_punch_ack`); the original
+                            // sender's session-peer identity is
+                            // intentionally NOT the wire sender at
+                            // this hop. Pre-binding, any session
+                            // peer could ship a forged
+                            // `PunchAck { from_peer: counterpart, .. }`
+                            // and resolve the local connect_direct
+                            // future with attacker-chosen payload.
+                            let took = ctx
+                                .pending_punch_acks
+                                .remove_if(&ack.from_peer, |_, (_gen, expected_coord, _)| {
+                                    *expected_coord == from_node
+                                });
+                            if let Some((_, (_gen, _expected, tx))) = took {
                                 let _ = tx.send(ack);
+                            } else if ctx.pending_punch_acks.contains_key(&ack.from_peer) {
+                                tracing::trace!(
+                                    from = from_node,
+                                    claimed = ack.from_peer,
+                                    "rendezvous: PunchAck not forwarded by recorded coordinator; dropping"
+                                );
+                                continue;
                             }
                         } else {
                             // Coordinator role: forward verbatim to
@@ -3966,12 +4049,51 @@ impl MeshNode {
             };
             drop(entry);
             let origin_hash = parsed.header.origin_hash;
+            // S-4 part 2: resolve the wire-session peer's NodeId so
+            // the cortex RPC client fold can bind RESPONSE delivery
+            // to the recorded target. Fast path: `addr_to_node` →
+            // peers; fall back to a session_id scan. If neither
+            // path resolves a NodeId we drop the event rather than
+            // fall through to sentinel `0` — a loopback test fold
+            // that registered with `target=0` would otherwise have
+            // the deliver gate satisfied unconditionally, mixing
+            // unrelated real-peer events into a loopback expecting
+            // only its own. Real production callbacks register
+            // with non-zero targets and already fail closed on a
+            // mismatch; the drop here closes the loopback hole
+            // without affecting production routing.
+            let session_id = session.session_id();
+            let from_node = ctx
+                .addr_to_node
+                .get(&session.peer_addr())
+                .and_then(|nid| {
+                    ctx.peers.get(&*nid).and_then(|p| {
+                        (p.value().session.session_id() == session_id).then_some(*nid)
+                    })
+                })
+                .or_else(|| {
+                    ctx.peers
+                        .iter()
+                        .find(|e| e.value().session.session_id() == session_id)
+                        .map(|e| e.value().node_id)
+                });
+            let Some(from_node) = from_node else {
+                tracing::warn!(
+                    target: "mesh.rpc",
+                    session_id = session_id,
+                    peer_addr = ?session.peer_addr(),
+                    "dropping cortex-RPC event: wire session has no resolvable NodeId; \
+                     refusing to deliver under sentinel binding"
+                );
+                return;
+            };
             match snapshot {
                 Snapshot::Single(canonical, disp) => {
                     for event_data in events.into_iter() {
                         disp(crate::adapter::net::cortex::RpcInboundEvent {
                             channel_hash: canonical,
                             origin_hash,
+                            from_node,
                             payload: event_data,
                         });
                     }
@@ -3982,6 +4104,7 @@ impl MeshNode {
                             disp(crate::adapter::net::cortex::RpcInboundEvent {
                                 channel_hash: *canonical,
                                 origin_hash,
+                                from_node,
                                 payload: event_data.clone(),
                             });
                         }
@@ -4580,13 +4703,6 @@ impl MeshNode {
         self.rpc_client_pending.clone()
     }
 
-    /// Per-Mesh monotonic call-id allocator. Accessor for
-    /// `mesh_rpc::Mesh::call`.
-    #[cfg(feature = "cortex")]
-    pub(super) fn rpc_next_call_id_arc(&self) -> Arc<std::sync::atomic::AtomicU64> {
-        self.rpc_next_call_id.clone()
-    }
-
     /// Independent rotation counter for `RoutingPolicy::RoundRobin`
     /// / `Random`. See the field's doc-comment on `MeshNode` for
     /// the rationale (avoid concurrent `select_target` calls
@@ -4875,11 +4991,20 @@ impl MeshNode {
             peer.addr
         };
 
-        let nonce = {
-            use std::sync::atomic::AtomicU64;
-            static COUNTER: AtomicU64 = AtomicU64::new(1);
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        };
+        // Random nonces: a process-global sequential counter lets
+        // any session peer that observes one nonce predict the next
+        // ones and ship spoofed `Ack{nonce: N+k, accepted: false}`
+        // frames at small offsets, satisfying a victim's in-flight
+        // Subscribe/Unsubscribe with a forged denial. random u64
+        // has 2^-64 collision probability per call and is
+        // unguessable from another session.
+        let mut nonce_bytes = [0u8; 8];
+        if let Err(e) = getrandom::fill(&mut nonce_bytes) {
+            return Err(AdapterError::Connection(format!(
+                "membership nonce generation failed: {e}"
+            )));
+        }
+        let nonce = u64::from_le_bytes(nonce_bytes);
         let msg = if subscribe {
             MembershipMsg::Subscribe {
                 channel: channel.clone(),
@@ -4896,7 +5021,10 @@ impl MeshNode {
         let bytes = membership::encode(&msg);
 
         let (tx, rx) = oneshot::channel::<MembershipAck>();
-        self.pending_membership_acks.insert(nonce, tx);
+        // Bind to publisher_node_id — the node we're sending the
+        // Subscribe/Unsubscribe to is the only legitimate Ack source.
+        self.pending_membership_acks
+            .insert(nonce, (publisher_node_id, tx));
 
         // Scoped send; if it fails, drop the pending entry so memory
         // doesn't accumulate.
@@ -5006,8 +5134,23 @@ impl MeshNode {
                 accepted,
                 reason,
             } => {
-                if let Some((_, tx)) = ctx.pending_membership_acks.remove(&nonce) {
+                // Peer-auth gate. The pending entry records the
+                // publisher we sent Subscribe/Unsubscribe to —
+                // only that node is authorized to ack. Without
+                // this check, any session peer that guessed the
+                // nonce (sequential, before this fix) could ship
+                // a forged Ack.
+                let took = ctx
+                    .pending_membership_acks
+                    .remove_if(&nonce, |_, (expected, _)| *expected == from_node);
+                if let Some((_, (_expected, tx))) = took {
                     let _ = tx.send(MembershipAck { accepted, reason });
+                } else if ctx.pending_membership_acks.contains_key(&nonce) {
+                    tracing::trace!(
+                        nonce,
+                        from = from_node,
+                        "membership ack from non-publisher session peer; dropping"
+                    );
                 } else {
                     tracing::debug!(
                         nonce,
@@ -5112,7 +5255,7 @@ impl MeshNode {
     }
 
     fn handle_capability_announcement(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
-        let Some(ann) = CapabilityAnnouncement::from_bytes(payload) else {
+        let Some(mut ann) = CapabilityAnnouncement::from_bytes(payload) else {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
                 len = payload.len(),
@@ -5142,12 +5285,20 @@ impl MeshNode {
             return;
         }
 
-        // Dedup on (origin, version). A `(node_id, version)` tuple
-        // is processed at most once — protects against diamond
-        // topologies where the same announcement arrives twice via
-        // different paths. Insert happens AFTER validation so a
-        // malformed announcement doesn't poison the cache.
-        let dedup_key = (ann.node_id, ann.version);
+        // Dedup on (origin, version, is_direct). The third axis is
+        // `hop_count == 0` — without it, a forwarder that ships an
+        // announcement claiming a victim's `(node_id, version)`
+        // primes the cache and the victim's own direct ann arriving
+        // later is silently dropped, leaving `peer_entity_ids` un-
+        // populated for that peer and breaking subsequent
+        // channel-auth (TOFU pin runs only on the direct path).
+        // Diamond topologies are still protected: a forwarded ann
+        // dedups against any later forwarded ann for the same key;
+        // the direct path is a distinct key processed exactly once.
+        // Insert happens AFTER validation so a malformed
+        // announcement doesn't poison the cache.
+        let is_direct = ann.hop_count == 0;
+        let dedup_key = (ann.node_id, ann.version, is_direct);
         if ctx.seen_announcements.contains_key(&dedup_key) {
             return;
         }
@@ -5313,14 +5464,31 @@ impl MeshNode {
             Self::forward_capability_announcement(fwd_bytes, ann.node_id, from_node, ctx);
         }
 
+        // Strip substrate-reserved metadata keys from the local copy
+        // now that the forward (if any) has already shipped the
+        // signature-covered bytes verbatim. A peer must not be able
+        // to steer the receiver's greedy admission / placement
+        // decisions by stamping `intent`, `colocate-with`,
+        // `priority`, `owner`, or any `tool::*` key on its own
+        // announcement. Strip must run AFTER the forward block — the
+        // signature transcript covers `metadata`, so stripping before
+        // re-broadcast would invalidate the signature for any
+        // downstream peer that re-verifies. Strip is also applied to
+        // unsigned anns because their metadata is even more
+        // attacker-controlled. The only consumer between the forward
+        // block and here is `policy.assign(&ann.capabilities)` above,
+        // which reads `caps.tags` only, not `caps.metadata`.
+        ann.strip_reserved_metadata();
+
         // Strip unauthorized `heat:<hex>=...` tags before indexing.
         // A peer can only annotate heat for chains it *also* claims
         // to hold (i.e. advertises `causal:<hex>` for the same
         // origin). Otherwise an arbitrary peer could publish
         // `heat:<any_origin>=0.99` and poison gravity decisions on
         // every other node. Self-announcements (from this node)
-        // skip the filter — we trust our own emit path.
-        let mut ann = ann;
+        // skip the filter — we trust our own emit path. `ann` is
+        // already `mut` at the outer binding (the inbound-metadata
+        // reserved-key strip needed it), so no re-binding required.
         if from_node != ctx.local_node_id {
             Self::filter_unauthorized_heat_tags(&mut ann.capabilities);
         }
@@ -6208,7 +6376,7 @@ impl MeshNode {
         //
         // - `Allowed`: bloom hit + verified-cache entry says yes.
         //   The verified cache is keyed on the canonical
-        //   [`ChannelHash`] (u32) — collision-resistant at realistic
+        //   [`ChannelHash`] (u64) — collision-resistant at realistic
         //   deployment scale (~65 K channels before birthday-collision
         //   threshold), but a sufficiently adversarial name selection
         //   could still alias two channels. The exact-name ACL is
@@ -6384,10 +6552,11 @@ impl MeshNode {
     /// are possible but harmless here — streams are opaque u64 to the
     /// transport and have no ACL meaning.
     pub(super) fn publish_stream_id(channel: &ChannelId) -> u64 {
-        // Place channel hash in the low 16 bits; the upper bits stay zero
-        // so that channel-keyed publisher streams don't alias the common
-        // subprotocol range (0x0400..0x0A00).
-        0x0001_0000_0000_0000 | (channel.hash() as u64)
+        // Pack channel hash with the bit-48 discriminator so that
+        // channel-keyed publisher streams don't alias the common
+        // subprotocol range (0x0400..0x0A00). `channel.hash()` is
+        // u64 (per ChannelHash = u64), so no widening cast needed.
+        0x0001_0000_0000_0000 | channel.hash()
     }
 
     /// Send one per-peer leg of a publish. Reuses the same packet-build
@@ -6465,13 +6634,13 @@ impl MeshNode {
         // channel dispatcher is registered).
         //
         // The wire `NetHeader::channel_hash` is a `u16` fast-path hint
-        // — narrow the canonical [`ChannelHash`] (u32) to 16 bits for
+        // — narrow the canonical [`ChannelHash`] (u64) to 16 bits for
         // the wire. Wire-side collisions are benign (the receiver
         // disambiguates via `ChannelConfigRegistry::get_by_wire_hash`
         // (Option, None on collision — collision-safe policy) /
         // `ChannelRegistry::get_all_by_wire_hash` (Vec, full collision
         // set — used by receive-side dispatch fan-out) and re-keys on
-        // the canonical 32-bit hash for ACL / storage decisions).
+        // the canonical 64-bit hash for ACL / storage decisions).
         builder.set_channel_hash(channel_hash as u16);
         // Stamp our identity's origin_hash so the receiver can
         // route per-chain logic (greedy cache, gravity heat
@@ -7742,8 +7911,12 @@ impl MeshNode {
                 let ack_gen = self
                     .next_waiter_gen
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Bind to `coordinator` — the node that will
+                // forward the counterpart's ack to us. The
+                // dispatch arm requires the session peer to match
+                // this id before completing the oneshot.
                 self.pending_punch_acks
-                    .insert(peer_node_id, (ack_gen, ack_tx));
+                    .insert(peer_node_id, (ack_gen, coordinator, ack_tx));
 
                 let punch_outcome = self
                     .request_punch(coordinator, peer_node_id, self_reflex)
@@ -7776,7 +7949,7 @@ impl MeshNode {
                         // `connect_via_coordinator` actually
                         // succeeds.
                         self.pending_punch_acks
-                            .remove_if(&peer_node_id, |_, (g, _)| *g == ack_gen);
+                            .remove_if(&peer_node_id, |_, (g, _, _)| *g == ack_gen);
                         let id = connect_via_coordinator(coord).await?;
                         self.traversal_stats.record_relay_fallback();
                         return Ok(id);
@@ -7826,7 +7999,7 @@ impl MeshNode {
                     }
                     Err(_) => {
                         self.pending_punch_acks
-                            .remove_if(&peer_node_id, |_, (g, _)| *g == ack_gen);
+                            .remove_if(&peer_node_id, |_, (g, _, _)| *g == ack_gen);
                         let id = connect_via_coordinator(coord).await?;
                         self.traversal_stats.record_relay_fallback();
                         Ok(id)
@@ -8869,7 +9042,13 @@ impl MeshNode {
         let gen = self
             .next_waiter_gen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.pending_punch_introduces.insert(target, (gen, tx));
+        // Bind to the relay we're sending PunchRequest to — only
+        // that node is authorized to send the matching introduce
+        // back. Without this, any session peer could forge a
+        // PunchIntroduce for `target` and complete this oneshot
+        // with attacker-chosen reflex data.
+        self.pending_punch_introduces
+            .insert(target, (gen, relay, tx));
 
         let body = RendezvousMsg::PunchRequest(PunchRequest {
             target,
@@ -8881,7 +9060,7 @@ impl MeshNode {
             .await
         {
             self.pending_punch_introduces
-                .remove_if(&target, |_, (g, _)| *g == gen);
+                .remove_if(&target, |_, (g, _, _)| *g == gen);
             return Err(TraversalError::Transport(e.to_string()));
         }
 
@@ -8896,28 +9075,33 @@ impl MeshNode {
             }
             Err(_elapsed) => {
                 self.pending_punch_introduces
-                    .remove_if(&target, |_, (g, _)| *g == gen);
+                    .remove_if(&target, |_, (g, _, _)| *g == gen);
                 Err(TraversalError::PunchFailed)
             }
         }
     }
 
     /// Install a waiter for an incoming `PunchIntroduce` from
-    /// `counterpart`. The returned future resolves when the
+    /// `counterpart`, brokered by `coordinator`. The dispatch arm
+    /// admits the introduce only when the session peer matches
+    /// `coordinator`. The returned future resolves when the
     /// dispatcher decodes a matching introduce, or with
     /// [`super::traversal::TraversalError::PunchFailed`] after
     /// [`super::traversal::TraversalConfig::punch_deadline`].
     ///
     /// Stage-3b responder-side primitive: the peer being punched
     /// *into* uses this to observe the introduce without
-    /// initiating the flow itself. Stage 3c wires the keep-alive
-    /// train onto the returned introduce.
+    /// initiating the flow itself. The responder must know which
+    /// coordinator will forward the introduce — supply that node's
+    /// id as `coordinator`. Stage 3c wires the keep-alive train
+    /// onto the returned introduce.
     ///
     /// Requires the `nat-traversal` cargo feature.
     #[cfg(feature = "nat-traversal")]
     pub async fn await_punch_introduce(
         &self,
         counterpart: u64,
+        coordinator: u64,
     ) -> Result<super::traversal::rendezvous::PunchIntroduce, super::traversal::TraversalError>
     {
         use super::traversal::TraversalError;
@@ -8925,14 +9109,15 @@ impl MeshNode {
         let gen = self
             .next_waiter_gen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.pending_punch_introduces.insert(counterpart, (gen, tx));
+        self.pending_punch_introduces
+            .insert(counterpart, (gen, coordinator, tx));
         let deadline = self.traversal_config.punch_deadline;
         match tokio::time::timeout(deadline, rx).await {
             Ok(Ok(intro)) => Ok(intro),
             Ok(Err(_)) => Err(TraversalError::PunchFailed),
             Err(_) => {
                 self.pending_punch_introduces
-                    .remove_if(&counterpart, |_, (g, _)| *g == gen);
+                    .remove_if(&counterpart, |_, (g, _, _)| *g == gen);
                 Err(TraversalError::PunchFailed)
             }
         }
@@ -8956,20 +9141,22 @@ impl MeshNode {
     pub async fn await_punch_ack(
         &self,
         counterpart: u64,
+        coordinator: u64,
     ) -> Result<super::traversal::rendezvous::PunchAck, super::traversal::TraversalError> {
         use super::traversal::TraversalError;
         let (tx, rx) = oneshot::channel();
         let gen = self
             .next_waiter_gen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.pending_punch_acks.insert(counterpart, (gen, tx));
+        self.pending_punch_acks
+            .insert(counterpart, (gen, coordinator, tx));
         let deadline = self.traversal_config.punch_deadline;
         match tokio::time::timeout(deadline, rx).await {
             Ok(Ok(ack)) => Ok(ack),
             Ok(Err(_)) => Err(TraversalError::PunchFailed),
             Err(_) => {
                 self.pending_punch_acks
-                    .remove_if(&counterpart, |_, (g, _)| *g == gen);
+                    .remove_if(&counterpart, |_, (g, _, _)| *g == gen);
                 Err(TraversalError::PunchFailed)
             }
         }
@@ -10401,6 +10588,7 @@ mod replication_dispatch_tests {
             channel_id: cid,
             since_seq: 100,
             chunk_max: 4096,
+            request_id: 0,
         };
         let payload = req.to_bytes();
         let router = RecorderRouter::default();
@@ -10420,6 +10608,7 @@ mod replication_dispatch_tests {
             first_seq: 0,
             leader_first_retained_seq: 0,
             events: vec![],
+            request_id: 0,
         };
         let payload = resp.to_bytes();
         let router = RecorderRouter::default();
@@ -10438,7 +10627,9 @@ mod replication_dispatch_tests {
             channel_id: cid,
             since_seq: 50,
             error_code: SyncNackError::NotLeader,
+            leader_first_retained_seq: 0,
             detail: "re-resolve leader".to_string(),
+            request_id: 0,
         };
         let payload = nack.to_bytes();
         let router = RecorderRouter::default();

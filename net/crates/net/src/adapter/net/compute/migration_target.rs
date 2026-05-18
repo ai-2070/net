@@ -33,9 +33,73 @@ struct TargetMigrationState {
     replayed_through: u64,
     /// Events pending replay, keyed by sequence for ordered replay.
     pending_events: BTreeMap<u64, CausalEvent>,
-    /// Causal chain head on target after restore.
-    target_head: CausalLink,
+    /// Running byte total of `pending_events` payload sizes for
+    /// the BufferFull cap below. Tracked alongside the map so the
+    /// cap check is O(1) — otherwise a wire-driven OOM would
+    /// pre-empt by walking the map on every insert.
+    pending_bytes: usize,
     started_at: Instant,
+}
+
+/// Maximum bytes worth of out-of-order events the target will
+/// hold for a single daemon before refusing further inserts with
+/// `MigrationError::BufferFull`. Mirrors the `MAX_PENDING_REASSEMBLY_BYTES`
+/// budget the snapshot reassembler uses (64 MiB). A peer that
+/// skips `replayed_through + 1` indefinitely would otherwise grow
+/// this map without bound — a targeted DoS reachable from any peer
+/// that can address migration traffic to this node.
+const MAX_PENDING_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+/// Companion event-count cap. Mirrors `MAX_BUFFERED_EVENTS` in
+/// the orchestrator's wire-decode path (1_000_000).
+const MAX_PENDING_EVENTS: usize = 1_000_000;
+
+impl TargetMigrationState {
+    /// Insert a pending event after checking the per-daemon byte
+    /// + count caps. Caller surfaces `MigrationError::BufferFull`
+    ///   to the wire so the source can back off rather than wedging
+    ///   the target's RSS.
+    fn try_insert_pending(&mut self, event: CausalEvent) -> Result<(), MigrationError> {
+        let event_bytes = event.payload.len();
+        if self.pending_events.len() >= MAX_PENDING_EVENTS
+            || self.pending_bytes.saturating_add(event_bytes) > MAX_PENDING_BUFFER_BYTES
+        {
+            return Err(MigrationError::BufferFull {
+                events: self.pending_events.len(),
+                bytes: self.pending_bytes,
+            });
+        }
+        if let Some(prev) = self.pending_events.insert(event.link.sequence, event) {
+            // Same-seq overwrite — net byte delta is (new - old).
+            // Subtract the old size; the new size was already
+            // pre-checked against the cap above.
+            self.pending_bytes = self.pending_bytes.saturating_sub(prev.payload.len());
+        }
+        self.pending_bytes = self.pending_bytes.saturating_add(event_bytes);
+        Ok(())
+    }
+
+    /// Remove a pending event by sequence and decrement the byte
+    /// counter. Idempotent on a miss. Used by drain_pending.
+    fn remove_pending(&mut self, seq: u64) -> Option<CausalEvent> {
+        let removed = self.pending_events.remove(&seq)?;
+        self.pending_bytes = self.pending_bytes.saturating_sub(removed.payload.len());
+        Some(removed)
+    }
+
+    /// Re-insert an event into pending without re-checking the cap
+    /// — used by drain_pending's restore-tail path, where the
+    /// events were already counted before being drained for the
+    /// delivery attempt that failed mid-batch.
+    fn reinsert_pending(&mut self, event: CausalEvent) {
+        let bytes = event.payload.len();
+        if self
+            .pending_events
+            .insert(event.link.sequence, event)
+            .is_none()
+        {
+            self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+        }
+    }
 }
 
 /// Target-side state retained after a successful migration completes,
@@ -126,6 +190,22 @@ impl MigrationTargetHandler {
         &self.factories
     }
 
+    /// Fetch the locally-restored daemon's chain head. Used by the
+    /// subprotocol handler to stamp `ReplayComplete.target_head`
+    /// so the orchestrator's continuity-proof anchor carries the
+    /// real cryptographic head even when the orchestrator lives on
+    /// a third node and has no local registry entry to consult.
+    pub fn host_head_link(&self, daemon_origin: u64) -> Result<CausalLink, MigrationError> {
+        self.daemon_registry
+            .with_host(daemon_origin, |host| host.head_link())
+            .map_err(|e| {
+                MigrationError::StateFailed(format!(
+                    "host_head_link({:#x}): {:?}",
+                    daemon_origin, e
+                ))
+            })
+    }
+
     /// Phase 2: Restore a daemon from a snapshot.
     ///
     /// Creates a new `DaemonHost` from the snapshot and registers it in the
@@ -172,7 +252,6 @@ impl MigrationTargetHandler {
         let host = DaemonHost::from_snapshot(daemon, keypair, snapshot, config)
             .map_err(|e| MigrationError::StateFailed(e.to_string()))?;
 
-        let target_head = snapshot.chain_link;
         let replayed_through = snapshot.through_seq;
 
         // Register in local daemon registry
@@ -190,7 +269,7 @@ impl MigrationTargetHandler {
                 phase: MigrationPhase::Restore,
                 replayed_through,
                 pending_events: BTreeMap::new(),
-                target_head,
+                pending_bytes: 0,
                 started_at: Instant::now(),
             }),
         );
@@ -224,11 +303,27 @@ impl MigrationTargetHandler {
             .ok_or(MigrationError::DaemonNotFound(daemon_origin))?;
 
         let mut state = entry.lock();
+        // Phase guard mirrors buffer_event below: a wire-level retry
+        // of BufferedEvents (source re-transmits after a dropped ack)
+        // arriving after activate() flipped state to Cutover would
+        // otherwise rewind phase to Replay and re-open the duplicate-
+        // delivery window — a subsequent buffer_event for a fresh
+        // event would pass its phase != Cutover guard and deliver
+        // alongside the normal path. Return the recorded
+        // replayed_through so the source sees the retried payload as
+        // already-handled.
+        if state.phase == MigrationPhase::Cutover {
+            return Ok(state.replayed_through);
+        }
         state.phase = MigrationPhase::Replay;
 
-        // Insert into BTreeMap for ordered replay
+        // Insert into BTreeMap for ordered replay, with per-daemon
+        // byte + count caps. A source that ships more than the cap
+        // gets BufferFull and must back off; partial inserts that
+        // already landed are kept (no rollback) so subsequent
+        // contiguous drain still makes progress on the prefix.
         for event in events {
-            state.pending_events.insert(event.link.sequence, event);
+            state.try_insert_pending(event)?;
         }
 
         // Replay in order
@@ -271,7 +366,7 @@ impl MigrationTargetHandler {
         if state.phase == MigrationPhase::Cutover {
             return Ok(false);
         }
-        state.pending_events.insert(event.link.sequence, event);
+        state.try_insert_pending(event)?;
 
         // Try to drain any contiguous events
         self.drain_pending(&mut state)?;
@@ -295,8 +390,25 @@ impl MigrationTargetHandler {
     pub fn activate(&self, daemon_origin: u64) -> Result<u64, MigrationError> {
         if let Some(entry) = self.migrations.get(&daemon_origin) {
             let mut state = entry.lock();
-            state.phase = MigrationPhase::Cutover;
+            // Drain first; only flip to Cutover on success.
+            //
+            // Pre-fix the phase was flipped before `drain_pending`. A
+            // mid-batch delivery failure left the state in `Cutover`
+            // with the undelivered tail restored to `pending_events`
+            // — but both `replay_events` and `buffer_event` reject in
+            // `Cutover`, so no new wire-arriving events could push the
+            // drain along. The only path that re-drained was a
+            // retried `ActivateTarget`, which still worked because
+            // `activate` itself does not reject in `Cutover`; the
+            // hazard was that any *new* source-side event in flight
+            // when activate first ran (e.g. a re-sent BufferedEvents
+            // batch the source emitted before observing the cutover
+            // ack) was dropped on arrival rather than absorbed into
+            // pending_events. Holding off the phase flip until drain
+            // succeeds keeps the absorb-then-drain window open across
+            // a transient delivery failure.
             self.drain_pending(&mut state)?;
+            state.phase = MigrationPhase::Cutover;
             return Ok(state.replayed_through);
         }
         if let Some(done) = self.completed.get(&daemon_origin) {
@@ -451,7 +563,7 @@ impl MigrationTargetHandler {
         let mut to_replay = Vec::new();
         let mut next_seq = state.replayed_through.saturating_add(1);
 
-        while let Some(event) = state.pending_events.remove(&next_seq) {
+        while let Some(event) = state.remove_pending(next_seq) {
             to_replay.push(event);
             // saturating_add: same rationale as above.
             next_seq = next_seq.saturating_add(1);
@@ -465,7 +577,7 @@ impl MigrationTargetHandler {
             .cloned()
             .collect();
         for seq in stale {
-            state.pending_events.remove(&seq);
+            state.remove_pending(seq);
         }
 
         // Deliver events to daemon via registry. Track how many actually
@@ -485,7 +597,6 @@ impl MigrationTargetHandler {
         if delivered > 0 {
             let last = &to_replay[delivered - 1];
             state.replayed_through = last.link.sequence;
-            state.target_head = last.link;
         }
 
         if let Some(err) = failure {
@@ -495,7 +606,7 @@ impl MigrationTargetHandler {
             // upstream — would be lost forever, since the source has
             // moved on and won't re-send it.
             for event in to_replay.into_iter().skip(delivered) {
-                state.pending_events.insert(event.link.sequence, event);
+                state.reinsert_pending(event);
             }
             return Err(err);
         }
@@ -518,7 +629,7 @@ mod tests {
     use crate::adapter::net::behavior::capability::CapabilityFilter;
     use crate::adapter::net::compute::{DaemonError, MeshDaemon};
     use crate::adapter::net::identity::EntityKeypair;
-    use crate::adapter::net::state::causal::CausalChainBuilder;
+    use crate::adapter::net::state::causal::{CausalChainBuilder, CausalLink};
     use crate::adapter::net::state::horizon::ObservedHorizon;
     use bytes::Bytes;
 
@@ -637,6 +748,67 @@ mod tests {
         assert!(err.to_string().contains("does not match"));
     }
 
+    /// The migration subprotocol is wire-driven: any peer that can
+    /// address migration traffic to this node can ship a stream of
+    /// non-contiguous CausalEvents that skip `replayed_through + 1`
+    /// indefinitely. Without a cap, `pending_events` would grow
+    /// without bound until OOM. Post-fix the per-daemon byte cap
+    /// surfaces as a typed `BufferFull` error and `pending_events`
+    /// stays bounded.
+    #[test]
+    fn buffer_event_rejects_oversize_pending_with_buffer_full() {
+        use bytes::Bytes;
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+        let snapshot = make_snapshot(&kp, 0, 0);
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+
+        // Each event carries ~1 MiB of payload; 64 events would just
+        // hit the 64 MiB cap. Skip seq=1 so nothing drains. Insert 70.
+        let payload = Bytes::from(vec![0u8; 1024 * 1024]);
+        let mut last_ok = 0u64;
+        let mut hit_full = false;
+        for seq in 2..=80 {
+            let ev = CausalEvent {
+                link: CausalLink {
+                    origin_hash: 0xBBBB,
+                    horizon_encoded: 0,
+                    sequence: seq,
+                    parent_hash: 0,
+                },
+                payload: payload.clone(),
+                received_at: 0,
+            };
+            match handler.buffer_event(origin, ev) {
+                Ok(_) => last_ok = seq,
+                Err(MigrationError::BufferFull { .. }) => {
+                    hit_full = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected error: {:?}", other),
+            }
+        }
+        assert!(hit_full, "expected BufferFull before exhausting 70 inserts");
+        assert!(
+            last_ok < 80,
+            "cap should have rejected before all 70 inserts landed",
+        );
+    }
+
     #[test]
     fn test_out_of_order_buffering() {
         let reg = Arc::new(DaemonRegistry::new());
@@ -677,6 +849,49 @@ mod tests {
     /// the same sequence. The fix returns `Ok(false)` (the same
     /// surface as a missing migration entry), telling the caller to
     /// treat the event as already-handled.
+    /// `replay_events` had no phase guard, so a wire-level retry of
+    /// a `BufferedEvents` packet arriving after `activate()` flipped
+    /// the migration to `Cutover` would rewind phase to `Replay` and
+    /// re-open the duplicate-delivery window that
+    /// `buffer_event_rejects_post_cutover_events` was protecting.
+    /// Post-fix the call is a no-op that returns the recorded
+    /// `replayed_through` so the source treats the retried payload
+    /// as already-handled.
+    #[test]
+    fn replay_events_no_op_after_cutover() {
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+
+        let snapshot = make_snapshot(&kp, 5, 5);
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+
+        handler.activate(origin).unwrap();
+        let replayed_at_cutover = handler.replayed_through(origin).unwrap();
+
+        // Wire-retried BufferedEvents arrive after cutover. Pre-fix
+        // this rewound phase to Replay; post-fix it is a no-op
+        // returning the recorded cursor.
+        let result = handler
+            .replay_events(origin, vec![make_event(0xBBBB, replayed_at_cutover + 1)])
+            .unwrap();
+        assert_eq!(result, replayed_at_cutover);
+        assert_eq!(handler.phase(origin), Some(MigrationPhase::Cutover));
+    }
+
     #[test]
     fn buffer_event_rejects_post_cutover_events() {
         let reg = Arc::new(DaemonRegistry::new());
@@ -1433,5 +1648,130 @@ mod tests {
              (seq 3, 4, 5). Anything more means the already-delivered \
              prefix (seq 1, 2) was redelivered — duplicate-delivery hazard"
         );
+    }
+
+    /// Regression: `activate` must not flip `MigrationPhase::Cutover`
+    /// until `drain_pending` actually succeeds. Pre-fix, the phase was
+    /// flipped before drain ran — a mid-batch delivery failure left
+    /// the state in `Cutover` with the undelivered tail restored to
+    /// `pending_events`. Both `buffer_event` and `replay_events`
+    /// reject in `Cutover`, so any *new* source-side event arriving
+    /// in the gap between the failed activate and the eventual retry
+    /// was silently dropped on arrival, never absorbed into pending.
+    ///
+    /// Post-fix: a failed activate leaves the state in `Replay`, so
+    /// late-arriving wire events still flow into `pending_events` and
+    /// the next activate retry drains them all.
+    #[test]
+    fn activate_keeps_replay_phase_on_drain_failure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Daemon that fails until `ok` is flipped to true. Lets the
+        // test arrange "drain fails, then we add more events, then
+        // drain succeeds" deterministically.
+        struct FailUntilFlipped {
+            ok: Arc<AtomicBool>,
+            state: u64,
+        }
+        impl MeshDaemon for FailUntilFlipped {
+            fn name(&self) -> &str {
+                "fail-until-flipped"
+            }
+            fn requirements(&self) -> CapabilityFilter {
+                CapabilityFilter::default()
+            }
+            fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+                if !self.ok.load(Ordering::SeqCst) {
+                    return Err(DaemonError::ProcessFailed("blocked".into()));
+                }
+                self.state += 1;
+                Ok(vec![])
+            }
+            fn snapshot(&self) -> Option<Bytes> {
+                Some(Bytes::from(self.state.to_le_bytes().to_vec()))
+            }
+            fn restore(&mut self, state: Bytes) -> Result<(), DaemonError> {
+                self.state = u64::from_le_bytes(state[..8].try_into().unwrap());
+                Ok(())
+            }
+        }
+
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+        let snapshot = make_snapshot(&kp, 0, 0);
+        let ok = Arc::new(AtomicBool::new(false));
+
+        let ok_for_factory = ok.clone();
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                move || {
+                    Box::new(FailUntilFlipped {
+                        ok: ok_for_factory.clone(),
+                        state: 0,
+                    })
+                },
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+
+        // Seed pending with contiguous seq 1..=3. Daemon is still in
+        // fail mode, so every buffer_event triggers drain → fail.
+        for seq in 1..=3 {
+            let _ = handler.buffer_event(origin, make_event(0xBBBB, seq));
+        }
+        assert_eq!(handler.replayed_through(origin), Some(0));
+
+        // Activate while daemon still fails — drain fails mid-batch.
+        let err = handler.activate(origin).unwrap_err();
+        assert!(
+            err.to_string().contains("blocked"),
+            "expected the simulated process() failure, got: {err}"
+        );
+        // Pre-fix the phase was flipped to Cutover before drain ran;
+        // post-fix it stays in Replay because activate sets Cutover
+        // only on a successful drain. We verify the post-fix invariant
+        // through behaviour, not by reading state.phase directly:
+        // a NEW buffer_event in this window must reach pending_events
+        // (Cutover would have returned Ok(false), silently dropping
+        // the event before insert).
+        //
+        // `buffer_event` may surface the same blocked-daemon error
+        // because its own drain still runs and still fails; what we
+        // care about is whether `try_insert_pending` ran (which the
+        // pre-fix Cutover branch skipped). The retry below proves it
+        // by drainING through seq 4 on the post-fix path and only
+        // through seq 3 on the pre-fix path.
+        let late_event_result = handler.buffer_event(origin, make_event(0xBBBB, 4));
+        match late_event_result {
+            Ok(true) | Err(_) => { /* event was inserted; drain may or may not have failed */ }
+            Ok(false) => panic!(
+                "post-fix: buffer_event in the activate-failed window must NOT \
+                 silently drop the event as Ok(false) — that is the Cutover-set-\
+                 too-early bug this test pins"
+            ),
+        }
+
+        // Flip the daemon to OK and retry activate. The drain now
+        // succeeds and Cutover is finally set; replayed_through covers
+        // every event including the late seq 4 that arrived after the
+        // failed activate.
+        ok.store(true, Ordering::SeqCst);
+        let replayed = handler.activate(origin).expect("retry activate succeeds");
+        assert_eq!(
+            replayed, 4,
+            "retried activate must drain the full tail (1..=4), \
+             including the late seq 4 buffered after the first failure; \
+             pre-fix this would be 3, with seq 4 silently lost",
+        );
+        assert_eq!(handler.replayed_through(origin), Some(4));
     }
 }

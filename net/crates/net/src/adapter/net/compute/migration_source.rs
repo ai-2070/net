@@ -15,6 +15,15 @@ use super::registry::DaemonRegistry;
 use crate::adapter::net::state::causal::CausalEvent;
 use crate::adapter::net::state::snapshot::StateSnapshot;
 
+/// Maximum bytes of buffered events the source will hold per
+/// daemon before refusing further inserts with
+/// `MigrationError::BufferFull`. Mirrors the target's
+/// `MAX_PENDING_BUFFER_BYTES` (64 MiB).
+const MAX_SOURCE_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
+/// Companion event-count cap. Mirrors `MAX_BUFFERED_EVENTS` in
+/// the orchestrator's wire-decode path (1_000_000).
+const MAX_SOURCE_BUFFERED_EVENTS: usize = 1_000_000;
+
 /// Per-daemon source-side migration state.
 #[allow(dead_code)]
 struct SourceMigrationState {
@@ -29,6 +38,13 @@ struct SourceMigrationState {
     snapshot: Option<StateSnapshot>,
     /// Events buffered between snapshot and cutover, in sequence order.
     buffered_events: Vec<CausalEvent>,
+    /// Running byte total of `buffered_events.payload` sizes. Updated
+    /// on push / drain so `buffer_event`'s cap check is O(1).
+    /// Pre-fix the check recomputed the sum with `iter().map().sum()`
+    /// on every insert — O(N) per call, O(N²) over the lifetime of
+    /// a migration, which is exactly the shape the byte cap exists
+    /// to bound against (a wedged target plus a high-volume daemon).
+    buffered_bytes: usize,
     /// Last buffered event sequence number.
     last_buffered_seq: u64,
     started_at: Instant,
@@ -180,6 +196,7 @@ impl MigrationSourceHandler {
             phase: MigrationPhase::Snapshot,
             snapshot: Some(snapshot.clone()),
             buffered_events: Vec::new(),
+            buffered_bytes: 0,
             last_buffered_seq: snapshot.through_seq,
             started_at: Instant::now(),
         }));
@@ -217,7 +234,41 @@ impl MigrationSourceHandler {
             | MigrationPhase::Transfer
             | MigrationPhase::Restore
             | MigrationPhase::Replay => {
+                // Per-daemon byte + count cap. A stuck migration
+                // (target wedged in Restore/Replay because of an
+                // upstream stall) plus a high-volume daemon would
+                // otherwise grow the buffer without bound on the
+                // source side; the wire-decode cap downstream
+                // (MAX_BUFFERED_EVENTS) is post-encode and never
+                // sees this. Surface BufferFull so the orchestrator
+                // can abort cleanly rather than OOM the node.
+                //
+                // Running `buffered_bytes` counter keeps this O(1)
+                // per insert — mirrors the target's `pending_bytes`
+                // shape. Pre-fix this recomputed the sum on every
+                // call (O(N²) over the migration life), exactly
+                // matching the attack shape the byte cap exists to
+                // bound against.
+                let event_bytes = event.payload.len();
+                let would_be_bytes = state.buffered_bytes.saturating_add(event_bytes);
+                if state.buffered_events.len() >= MAX_SOURCE_BUFFERED_EVENTS
+                    || would_be_bytes > MAX_SOURCE_BUFFERED_BYTES
+                {
+                    // Report `would_be_bytes` (post-insert total)
+                    // rather than `buffered_bytes` (pre-insert). The
+                    // pre-insert value can read `< MAX` for a
+                    // `BufferFull` error, which confuses operator
+                    // dashboards interpreting the field as "the
+                    // size that exceeded the cap." Post-insert
+                    // matches the cap comparison and makes the
+                    // error self-explanatory.
+                    return Err(MigrationError::BufferFull {
+                        events: state.buffered_events.len().saturating_add(1),
+                        bytes: would_be_bytes,
+                    });
+                }
                 state.last_buffered_seq = event.link.sequence;
+                state.buffered_bytes = state.buffered_bytes.saturating_add(event_bytes);
                 state.buffered_events.push(event);
                 Ok(true)
             }
@@ -266,7 +317,10 @@ impl MigrationSourceHandler {
             MigrationPhase::Snapshot
             | MigrationPhase::Transfer
             | MigrationPhase::Restore
-            | MigrationPhase::Replay => Ok(std::mem::take(&mut state.buffered_events)),
+            | MigrationPhase::Replay => {
+                state.buffered_bytes = 0;
+                Ok(std::mem::take(&mut state.buffered_events))
+            }
             other => Err(MigrationError::WrongPhase {
                 expected: MigrationPhase::Replay,
                 got: other,
@@ -284,15 +338,43 @@ impl MigrationSourceHandler {
         let mut state = entry.lock();
         state.phase = MigrationPhase::Cutover;
 
-        // Return any remaining buffered events for final sync
+        // Return any remaining buffered events for final sync.
+        state.buffered_bytes = 0;
         Ok(std::mem::take(&mut state.buffered_events))
     }
 
     /// Phase 5: Cleanup — unregister daemon from this node.
     ///
     /// Removes the daemon from the local registry and clears migration state.
+    /// Requires the migration to be in `Cutover` (the only phase
+    /// after which the source's daemon copy is safe to retire); any
+    /// pre-cutover call would otherwise unregister a live daemon
+    /// while the target is still restoring, stranding new traffic
+    /// in `DaemonNotFound` and losing source-side `buffered_events`.
+    ///
+    /// When no migration record exists for `daemon_origin`, this is
+    /// a no-op success. A forged or replayed `CleanupComplete` for an
+    /// origin we never migrated must NOT unregister an unrelated local
+    /// daemon — the unregister is gated on `migrations` membership and
+    /// the `Cutover` phase, which together prove this handler authored
+    /// the migration whose target now owns the daemon.
     pub fn cleanup(&self, daemon_origin: u64) -> Result<(), MigrationError> {
-        // Unregister daemon from local registry
+        let Some(entry) = self.migrations.get(&daemon_origin) else {
+            return Ok(());
+        };
+        let phase = entry.lock().phase;
+        if phase != MigrationPhase::Cutover {
+            return Err(MigrationError::WrongPhase {
+                expected: MigrationPhase::Cutover,
+                got: phase,
+            });
+        }
+        drop(entry);
+
+        // Unregister daemon from local registry. Only reached when the
+        // migration record exists AND is in Cutover — i.e. the local
+        // source authored this migration and the target has accepted
+        // the cutover, so the source's copy is safe to retire.
         let _ = self.daemon_registry.unregister(daemon_origin);
 
         // Remove migration state
@@ -319,6 +401,16 @@ impl MigrationSourceHandler {
     /// Number of active source-side migrations.
     pub fn active_count(&self) -> usize {
         self.migrations.len()
+    }
+
+    /// Currently-buffered event count for `daemon_origin`'s active
+    /// migration, if one exists. Used by snapshot-source adapters
+    /// to populate `MigrationSnapshot::buffered_events` truthfully
+    /// instead of hardcoding `0`.
+    pub fn buffered_event_count(&self, daemon_origin: u64) -> Option<usize> {
+        self.migrations
+            .get(&daemon_origin)
+            .map(|e| e.lock().buffered_events.len())
     }
 }
 
@@ -482,6 +574,56 @@ mod tests {
 
         assert!(!handler.is_migrating(origin));
         assert!(reg.contains(origin)); // daemon still registered
+    }
+
+    /// `cleanup` invoked before `on_cutover` must NOT unregister
+    /// the source's live daemon — the target is still restoring
+    /// and inbound traffic would otherwise route to a missing
+    /// daemon while source-side buffered events were silently
+    /// dropped. The guard returns `WrongPhase { expected: Cutover }`
+    /// so misuse surfaces at the boundary.
+    #[test]
+    fn cleanup_before_cutover_rejects_with_wrong_phase() {
+        let (reg, origin) = setup();
+        let handler = MigrationSourceHandler::new(reg.clone());
+
+        handler.start_snapshot(origin, 0x2222, 0x1111).unwrap();
+        // Snapshot phase — should reject.
+        let err = handler.cleanup(origin).unwrap_err();
+        match err {
+            MigrationError::WrongPhase { expected, got } => {
+                assert_eq!(expected, MigrationPhase::Cutover);
+                assert_eq!(got, MigrationPhase::Snapshot);
+            }
+            other => panic!("expected WrongPhase, got {:?}", other),
+        }
+        // Live daemon still registered, migration record still present.
+        assert!(reg.contains(origin));
+        assert!(handler.is_migrating(origin));
+    }
+
+    /// Regression: `cleanup` for an unknown `daemon_origin` must be
+    /// a no-op success and must NOT touch the local daemon registry.
+    /// Pre-fix, the unregister ran unconditionally once the early
+    /// `if let Some(entry) = ...` block was skipped, so a forged or
+    /// replayed `CleanupComplete` for an origin we never migrated
+    /// tore down an unrelated live local daemon.
+    #[test]
+    fn cleanup_for_unknown_origin_does_not_unregister_live_daemon() {
+        let (reg, origin) = setup();
+        let handler = MigrationSourceHandler::new(reg.clone());
+
+        // No `start_snapshot` for `origin` — the source handler has
+        // no migration record. A spurious `cleanup` call for it must
+        // leave the local daemon registered.
+        handler
+            .cleanup(origin)
+            .expect("cleanup is idempotent on miss");
+        assert!(
+            reg.contains(origin),
+            "cleanup for an origin with no migration record must not unregister the local daemon",
+        );
+        assert!(!handler.is_migrating(origin));
     }
 
     /// Regression: `take_buffered_events` must refuse to drain

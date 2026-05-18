@@ -181,7 +181,8 @@ async fn coordinator_fans_out_to_both_endpoints() {
     // dispatch branch finds a pending oneshot. A request_punch
     // installs the waiter atomically as part of the call.
     let b_clone = b.clone();
-    let b_wait = tokio::spawn(async move { b_clone.await_punch_introduce(a_id).await });
+    let r_id = r.node_id();
+    let b_wait = tokio::spawn(async move { b_clone.await_punch_introduce(a_id, r_id).await });
 
     // Give B a moment to register its waiter before A fires.
     tokio::time::sleep(Duration::from_millis(50)).await;

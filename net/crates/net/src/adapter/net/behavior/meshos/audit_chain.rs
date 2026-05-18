@@ -147,6 +147,7 @@ mod tests {
             },
             operator_ids: vec![7],
             outcome: VerificationOutcome::Accepted,
+            chain_pending: false,
         }
     }
 

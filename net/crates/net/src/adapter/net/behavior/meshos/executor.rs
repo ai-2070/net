@@ -35,7 +35,8 @@ use tokio::time::sleep_until;
 use super::action::{MeshOsAction, PendingAction};
 use super::backpressure::{AdmissionResult, BackpressureState, ClusterBackpressureChange};
 use super::chain::{
-    append_dispatched, append_failed, append_gated, ActionChainAppender, NoOpActionChainAppender,
+    append_dispatched, append_failed, append_gated, ActionChainAppender, AppendError,
+    NoOpActionChainAppender,
 };
 use super::config::MeshOsConfig;
 use super::snapshot::{FailureRecord, RECENT_FAILURES_CAPACITY};
@@ -175,6 +176,14 @@ pub struct ExecutorStats {
     /// Number of cluster-backpressure release transitions
     /// surfaced to the dispatcher.
     pub cluster_backpressure_releases: AtomicU64,
+    /// Total times an `append_dispatched` / `append_failed` /
+    /// `append_gated` / `append_deferred` call returned an error.
+    /// The dispatch itself already succeeded (or hit its terminal
+    /// state) when this counter ticks — the chain record is
+    /// missing for that action, but the action's effect is real.
+    /// Non-zero indicates the chain appender is dropping records;
+    /// in-memory ring and dispatcher state remain consistent.
+    pub chain_append_failures: AtomicU64,
 }
 
 impl ExecutorStats {
@@ -354,6 +363,15 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
     /// closes (the loop dropped its sender) or the inner
     /// dispatcher panics. Returns the accumulated stats.
     pub async fn run(mut self) -> Arc<ExecutorStats> {
+        // Periodic idle tick. The cluster-backpressure release
+        // edge only fires inside `handle_one_retry`, so a queue
+        // that drains below the low-water mark while no fresh
+        // action arrives would otherwise leave daemons throttled
+        // forever in a quiet steady-state cluster. The tick polls
+        // the live queue depth on every 100 ms boundary so the
+        // release surfaces independently of incoming actions.
+        let mut idle_tick = tokio::time::interval(Duration::from_millis(100));
+        idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let next_deadline = self.deferred.peek().map(|e| e.retry_at);
             tokio::select! {
@@ -366,9 +384,38 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                     let due = self.deferred.pop().expect("deferred heap non-empty");
                     self.handle_one_retry(due.action, due.defer_count).await;
                 }
+                _ = idle_tick.tick() => {
+                    self.poll_cluster_backpressure();
+                }
             }
         }
         Arc::clone(&self.stats)
+    }
+
+    /// Re-evaluate the cluster-backpressure hysteresis with the
+    /// current live queue depth, without consuming an action.
+    /// Used by the idle tick and the post-release path so the
+    /// `Released` edge fires even with zero in-flight actions.
+    /// Pre-fix `update_cluster_backpressure` had only one
+    /// non-test caller (inside `handle_one_retry`); a queue that
+    /// drained below the low-water mark while no fresh action
+    /// arrived left daemons throttled indefinitely.
+    fn poll_cluster_backpressure(&mut self) {
+        let depth = self.actions_rx.len() + self.deferred.len();
+        let change = self
+            .backpressure
+            .update_cluster_backpressure(depth, &self.config.backpressure);
+        match change {
+            ClusterBackpressureChange::Asserted => {
+                ExecutorStats::inc(&self.stats.cluster_backpressure_asserts);
+                self.dispatcher.on_cluster_backpressure(change);
+            }
+            ClusterBackpressureChange::Released => {
+                ExecutorStats::inc(&self.stats.cluster_backpressure_releases);
+                self.dispatcher.on_cluster_backpressure(change);
+            }
+            ClusterBackpressureChange::Steady => {}
+        }
     }
 
     async fn handle_one(&mut self, action: PendingAction) {
@@ -376,7 +423,13 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
     }
 
     async fn handle_one_retry(&mut self, action: PendingAction, prior_defers: u32) {
-        let now = Instant::now();
+        // Source `now` from tokio's clock and convert to std so the
+        // deferred-heap deadlines stay coherent with tokio::time::sleep_until
+        // — under `tokio::time::pause()` the std::Instant::now() formulation
+        // diverged from the paused timer, leaving tests unable to drive
+        // deferred-retry semantics. into_std() round-trips through
+        // tokio::time::Instant::from_std() in sleep_until_opt below.
+        let now = tokio::time::Instant::now().into_std();
         self.backpressure.tick(now);
         // Compute live queue depth (channel + deferred heap) and
         // run hysteresis; surface edge crossings to the
@@ -415,7 +468,8 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                         self.config.backpressure.max_defer_count,
                     );
                     self.record_failure(format!("action-id:{}", action.id.0), reason.clone());
-                    let _ = append_failed(&self.chain_appender, &action, reason, None);
+                    let r = append_failed(&self.chain_appender, &action, reason, None);
+                    self.record_chain_append(action.id.0, "failed_defer_budget", r);
                     return;
                 }
                 ExecutorStats::inc(&self.stats.deferred);
@@ -436,12 +490,13 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                     format!("action-id:{}", action.id.0),
                     format!("gated ({reason}) for {cooldown_ms} ms"),
                 );
-                let _ = append_gated(
+                let r = append_gated(
                     &self.chain_appender,
                     &action,
                     reason.to_string(),
                     Some(cooldown_ms),
                 );
+                self.record_chain_append(action.id.0, "gated", r);
             }
         }
     }
@@ -473,7 +528,8 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
         match result {
             Ok(()) => {
                 ExecutorStats::inc(&self.stats.dispatched);
-                let _ = append_dispatched(&self.chain_appender, &action);
+                let r = append_dispatched(&self.chain_appender, &action);
+                self.record_chain_append(action.id.0, "dispatched", r);
             }
             Err(err) => {
                 // Dispatch did not happen — roll back the
@@ -482,6 +538,12 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                 // gated by a side effect that never occurred.
                 self.backpressure
                     .release_failed_admit(action.id, &action.action);
+                // Refresh cluster-backpressure: the release just
+                // dropped one in-flight action's reservation, so a
+                // queue that was hovering near the release water
+                // mark should surface that edge here rather than
+                // wait for the next idle tick.
+                self.poll_cluster_backpressure();
                 let _ = admit_anchor;
                 if let Some(after) = err.retry_after {
                     // Dispatch-error retries share the
@@ -494,18 +556,21 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                         let reason =
                             format!("dispatch retry budget exhausted after {next_count} attempts",);
                         self.record_failure(format!("action-id:{}", action.id.0), reason.clone());
-                        let _ = append_failed(&self.chain_appender, &action, reason, None);
+                        let r = append_failed(&self.chain_appender, &action, reason, None);
+                        self.record_chain_append(action.id.0, "failed_retry_budget", r);
                         return;
                     }
                     ExecutorStats::inc(&self.stats.dispatch_retries);
                     let retry_ms = after.as_millis() as u64;
-                    let _ = append_failed(
+                    let r = append_failed(
                         &self.chain_appender,
                         &action,
                         err.reason.clone(),
                         Some(retry_ms),
                     );
-                    let now = Instant::now();
+                    self.record_chain_append(action.id.0, "failed_retry", r);
+                    // Same time-source rationale as handle_one_retry above.
+                    let now = tokio::time::Instant::now().into_std();
                     self.deferred.push(DeferredEntry {
                         retry_at: now.checked_add(after).unwrap_or(now),
                         action,
@@ -515,9 +580,36 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                     ExecutorStats::inc(&self.stats.failed);
                     let reason = err.reason.clone();
                     self.record_failure(format!("action-id:{}", action.id.0), err.reason);
-                    let _ = append_failed(&self.chain_appender, &action, reason, None);
+                    let r = append_failed(&self.chain_appender, &action, reason, None);
+                    self.record_chain_append(action.id.0, "failed", r);
                 }
             }
+        }
+    }
+
+    /// Record the outcome of a chain-append call. Bumps the
+    /// `chain_append_failures` counter on `Err` and emits a
+    /// warn log so operators can see the chain is dropping
+    /// records — the dispatch / admit / gate side effect
+    /// already happened either way.
+    fn record_chain_append(
+        &self,
+        action_id: u64,
+        kind: &'static str,
+        result: Result<(), AppendError>,
+    ) {
+        if let Err(e) = result {
+            self.stats
+                .chain_append_failures
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "meshos",
+                action_id,
+                kind,
+                error = %e,
+                "executor chain append failed; in-memory state stayed consistent \
+                 but the action's chain record is missing",
+            );
         }
     }
 
@@ -576,6 +668,7 @@ impl ExecutorHandle {
                 .stats
                 .cluster_backpressure_releases
                 .load(Ordering::Relaxed),
+            chain_append_failures: self.stats.chain_append_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -598,6 +691,13 @@ pub struct ExecutorStatsSnapshot {
     pub cluster_backpressure_asserts: u64,
     /// Number of cluster-backpressure release edges surfaced.
     pub cluster_backpressure_releases: u64,
+    /// Times the chain appender returned `Err` for an action
+    /// the executor was attempting to record (dispatched /
+    /// failed / gated / deferred). Non-zero means the chain is
+    /// missing records — the in-memory ring and dispatcher state
+    /// remain consistent, but downstream chain consumers will
+    /// not see those entries.
+    pub chain_append_failures: u64,
 }
 
 async fn sleep_until_opt(deadline: Option<Instant>) {
@@ -640,6 +740,50 @@ mod tests {
 
     fn fast_cfg() -> Arc<MeshOsConfig> {
         Arc::new(MeshOsConfig::default())
+    }
+
+    /// Chain appender that always returns Err. Used to pin the
+    /// counter-bumping behavior — dispatch must still succeed,
+    /// but `chain_append_failures` records the dropped record.
+    struct FailingChainAppender;
+
+    impl super::super::chain::ActionChainAppender for FailingChainAppender {
+        fn append(
+            &self,
+            _record: super::super::chain::ActionChainRecord,
+        ) -> Result<(), AppendError> {
+            Err(AppendError {
+                reason: "test-injected appender failure".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_append_failure_bumps_counter_but_dispatch_still_succeeds() {
+        let (tx, rx) = mpsc::channel(8);
+        let cfg = fast_cfg();
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let exec = ActionExecutor::new(rx, cfg, Arc::clone(&dispatcher))
+            .with_chain_appender(Arc::new(FailingChainAppender));
+        let task = tokio::spawn(exec.run());
+
+        tx.send(pending(
+            1,
+            MeshOsAction::CommitMaintenanceTransition {
+                node: 1,
+                target: MaintenanceTransition::Maintenance,
+            },
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let stats = task.await.expect("join");
+        // Dispatch still happened — chain miss is not a correctness gap.
+        assert_eq!(stats.dispatched.load(Ordering::Relaxed), 1);
+        assert_eq!(dispatcher.log().len(), 1);
+        // And the counter recorded the dropped chain record.
+        assert_eq!(stats.chain_append_failures.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

@@ -101,6 +101,24 @@ impl BlobAdapterRegistry {
             .map(|entry| entry.key().clone())
             .collect()
     }
+
+    /// Drain every registered adapter, returning the Arcs so the
+    /// caller can decide what to do with them (graceful shutdown,
+    /// drop, etc.). Provides the missing "clear" path for the
+    /// process-wide `global_blob_adapter_registry`: tests that
+    /// share the singleton can reset between cases without tearing
+    /// down the process, and a deliberate shutdown can iterate the
+    /// returned Arcs for adapter-specific drain.
+    pub fn drain(&self) -> Vec<Arc<dyn BlobAdapter>> {
+        let keys: Vec<String> = self.adapters.iter().map(|e| e.key().clone()).collect();
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            if let Some((_, v)) = self.adapters.remove(&k) {
+                out.push(v);
+            }
+        }
+        out
+    }
 }
 
 impl Default for BlobAdapterRegistry {

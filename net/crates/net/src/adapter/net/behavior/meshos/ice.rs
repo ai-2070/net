@@ -486,6 +486,24 @@ impl OperatorRegistry {
         payload: &[u8],
         threshold: usize,
     ) -> Result<(), VerifyError> {
+        // Cap the bundle so a `MeshOsEvent` arriving with a huge
+        // `signatures` vec (e.g. across a future process boundary)
+        // can't pin the verifier's CPU for arbitrarily long.
+        // 64 is well past any realistic operator-quorum and matches
+        // the umbrella shape of "tiny-but-finite operational caps."
+        // Honor the configured threshold when it exceeds 64 so a
+        // legitimately-large operator quorum doesn't fail-closed
+        // against the verifier's own cap — the cap is meant to
+        // bound CPU against hostile bundles, not against the
+        // configured policy.
+        const MAX_SIGNATURES_PER_BUNDLE: usize = 64;
+        let max_signatures = MAX_SIGNATURES_PER_BUNDLE.max(threshold);
+        if signatures.len() > max_signatures {
+            return Err(VerifyError::InsufficientSignatures {
+                got: signatures.len(),
+                required: threshold,
+            });
+        }
         let mut unique_operators: std::collections::BTreeSet<u64> =
             std::collections::BTreeSet::new();
         for sig in signatures {
@@ -735,6 +753,15 @@ pub struct AdminAuditRecord {
     pub operator_ids: Vec<u64>,
     /// The verifier's outcome for this attempt.
     pub outcome: VerificationOutcome,
+    /// `true` when this entry is in the in-memory ring but the
+    /// durable chain append failed. Chain consumers replaying
+    /// the chain after a restart will not see entries with this
+    /// flag — they have to consult the ring directly (which only
+    /// holds a bounded recent window). Default `false` so older
+    /// serialized records that pre-date the field deserialize
+    /// cleanly.
+    #[serde(default)]
+    pub chain_pending: bool,
 }
 
 /// Substrate-side ICE admin verifier — bundles a shared
@@ -2251,6 +2278,7 @@ mod tests {
                 },
                 operator_ids: vec![1, 2, 3],
                 outcome: outcome.clone(),
+                chain_pending: false,
             };
             let bytes = postcard::to_allocvec(&record).expect("encode");
             let decoded: AdminAuditRecord = postcard::from_bytes(&bytes).expect("decode");
@@ -2266,6 +2294,7 @@ mod tests {
             event: AdminEvent::ThawCluster,
             operator_ids: vec![42],
             outcome: VerificationOutcome::Accepted,
+            chain_pending: false,
         };
         let json = serde_json::to_string(&record).expect("encode");
         let decoded: AdminAuditRecord = serde_json::from_str(&json).expect("decode");
@@ -2633,6 +2662,7 @@ mod tests {
             },
             operator_ids: Vec::new(),
             outcome: VerificationOutcome::Unverified,
+            chain_pending: false,
         };
         let bytes = postcard::to_allocvec(&record).expect("encode");
         let decoded: AdminAuditRecord = postcard::from_bytes(&bytes).expect("decode");

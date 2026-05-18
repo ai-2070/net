@@ -15,9 +15,9 @@ use net::adapter::net::behavior::capability::{
 use net::adapter::net::behavior::loadbalance::{RequestContext, Strategy};
 use net::adapter::net::compute::migration_target::RestoreContext;
 use net::adapter::net::compute::{
-    chunk_snapshot, BufferOutcome, DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry,
-    ForkGroup, ForkGroupConfig, GroupCoordinator, GroupError, GroupHealth, MemberInfo, MemberRole,
-    MeshDaemon, MigrationMessage, MigrationOrchestrator, MigrationPhase, MigrationSourceHandler,
+    chunk_snapshot, DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, ForkGroup,
+    ForkGroupConfig, GroupCoordinator, GroupError, GroupHealth, MemberInfo, MemberRole, MeshDaemon,
+    MigrationMessage, MigrationOrchestrator, MigrationPhase, MigrationSourceHandler,
     MigrationTargetHandler, ReplicaGroup, ReplicaGroupConfig, Scheduler, SnapshotReassembler,
     StandbyGroup, StandbyGroupConfig, MAX_SNAPSHOT_CHUNK_SIZE,
 };
@@ -90,6 +90,15 @@ fn make_event(origin: u64, seq: u64) -> CausalEvent {
     }
 }
 
+fn make_link(origin: u64, seq: u64) -> CausalLink {
+    CausalLink {
+        origin_hash: origin,
+        horizon_encoded: 0,
+        sequence: seq,
+        parent_hash: 0,
+    }
+}
+
 fn register_counter_daemon(registry: &DaemonRegistry, initial_count: u64) -> (EntityKeypair, u64) {
     let kp = EntityKeypair::generate();
     let origin = kp.origin_hash();
@@ -126,7 +135,9 @@ fn test_orchestrator_full_phase_chain() {
     assert!(buffered.is_none()); // no events buffered yet
 
     // Phase 3→4: Replay complete → cutover
-    let cutover_msg = orch.on_replay_complete(origin, 42).unwrap();
+    let cutover_msg = orch
+        .on_replay_complete(origin, 42, make_link(origin, 42))
+        .unwrap();
     assert_eq!(orch.status(origin), Some(MigrationPhase::Cutover));
     match cutover_msg {
         MigrationMessage::CutoverNotify { target_node, .. } => {
@@ -153,39 +164,33 @@ fn test_orchestrator_full_phase_chain() {
     assert_eq!(orch.active_count(), 0);
 }
 
-// ── 2. Orchestrator phase chain with buffered events ─────────────────────────
+// ── 2. Orchestrator phase chain ──────────────────────────────────────────────
+//
+// The orchestrator no longer holds an event buffer of its own —
+// MigrationSourceHandler is the only buffering surface (its
+// on_cutover drains real buffered events). on_restore_complete
+// always returns Ok(None).
 
 #[test]
-fn test_orchestrator_phase_chain_with_buffered_events() {
+fn test_orchestrator_phase_chain() {
     let reg = Arc::new(DaemonRegistry::new());
     let (_, origin) = register_counter_daemon(&reg, 10);
     let orch = MigrationOrchestrator::new(reg.clone(), 0x1111);
 
-    // Start migration
     orch.start_migration(origin, 0x1111, 0x2222).unwrap();
 
-    // Buffer events while snapshot is in flight
-    for seq in 1..=5 {
-        assert_eq!(
-            orch.buffer_event(origin, make_event(0xBBBB, seq)),
-            BufferOutcome::Buffered,
-        );
-    }
-
-    // Restore complete → should drain buffered events
-    let buffered = orch.on_restore_complete(origin, 10).unwrap();
-    assert!(buffered.is_some());
-    match buffered.unwrap() {
-        MigrationMessage::BufferedEvents { events, .. } => {
-            assert_eq!(events.len(), 5);
-            assert_eq!(events[0].link.sequence, 1);
-            assert_eq!(events[4].link.sequence, 5);
-        }
-        _ => panic!("expected BufferedEvents"),
-    }
+    // on_restore_complete ships no buffered events — the
+    // orchestrator surface for buffering was deleted because no
+    // production caller ever used it.
+    let result = orch.on_restore_complete(origin, 10).unwrap();
+    assert!(
+        result.is_none(),
+        "on_restore_complete must not emit BufferedEvents from the orchestrator side"
+    );
 
     // Continue through remaining phases
-    orch.on_replay_complete(origin, 15).unwrap();
+    orch.on_replay_complete(origin, 15, make_link(origin, 15))
+        .unwrap();
     orch.on_cutover_acknowledged(origin).unwrap();
     orch.on_cleanup_complete(origin).unwrap();
     orch.on_activate_ack(origin, 15).unwrap();
@@ -275,7 +280,13 @@ fn test_end_to_end_migration_local_source() {
         .unwrap();
 
     // Phase 3→4: Replay complete
-    let cutover_msg = orch.on_replay_complete(origin, replayed_through).unwrap();
+    let cutover_msg = orch
+        .on_replay_complete(
+            origin,
+            replayed_through,
+            make_link(origin, replayed_through),
+        )
+        .unwrap();
     match &cutover_msg {
         MigrationMessage::CutoverNotify { target_node, .. } => {
             assert_eq!(*target_node, 0x2222);
@@ -412,7 +423,7 @@ fn test_subprotocol_handler_snapshot_ready_dispatch() {
 }
 
 #[test]
-fn test_subprotocol_handler_buffered_events_dispatch() {
+fn test_subprotocol_handler_restore_complete_emits_no_buffered_events() {
     use net::adapter::net::compute::orchestrator::wire;
     use net::adapter::net::subprotocol::MigrationSubprotocolHandler;
 
@@ -425,14 +436,11 @@ fn test_subprotocol_handler_buffered_events_dispatch() {
 
     let handler = MigrationSubprotocolHandler::new(orch.clone(), source, target, 0x3333);
 
-    // Start migration on the orchestrator (remote source at 0x1111)
+    // Start migration on the orchestrator (remote source at 0x1111).
+    // The orchestrator no longer maintains a buffer of its own —
+    // MigrationSourceHandler is the only buffering surface.
     orch.start_migration(origin, 0x1111, 0x2222).unwrap();
 
-    // Buffer some events on the orchestrator
-    orch.buffer_event(origin, make_event(0xCCCC, 1));
-    orch.buffer_event(origin, make_event(0xCCCC, 2));
-
-    // Send RestoreComplete → should get BufferedEvents back
     let restore_msg = MigrationMessage::RestoreComplete {
         daemon_origin: origin,
         restored_seq: 10,
@@ -441,15 +449,29 @@ fn test_subprotocol_handler_buffered_events_dispatch() {
         .handle_message(&wire::encode(&restore_msg).unwrap(), 0x2222)
         .unwrap();
 
-    // Should have BufferedEvents response
-    assert!(!outbound.is_empty());
-    let reply = wire::decode(&outbound[0].payload).unwrap();
-    match reply {
-        MigrationMessage::BufferedEvents { events, .. } => {
-            assert_eq!(events.len(), 2);
-        }
-        _ => panic!("expected BufferedEvents, got {:?}", reply),
-    }
+    // The subprotocol handler always sends a BufferedEvents
+    // reply (the target needs the message to advance), but the
+    // orchestrator's contribution is always an empty event list:
+    // the orchestrator no longer holds a buffer of its own;
+    // source-side buffered events surface through
+    // MigrationSourceHandler::on_cutover, not here.
+    let buffered_events: Vec<_> = outbound
+        .iter()
+        .filter_map(|frame| match wire::decode(&frame.payload) {
+            Ok(MigrationMessage::BufferedEvents { events, .. }) => Some(events),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        buffered_events.len(),
+        1,
+        "expected a single BufferedEvents reply"
+    );
+    assert!(
+        buffered_events[0].is_empty(),
+        "orchestrator-driven BufferedEvents must carry zero events — the dead \
+         buffer_event surface was removed; source-side cutover is the only buffer source"
+    );
 }
 
 #[test]
@@ -476,7 +498,8 @@ fn test_subprotocol_handler_cutover_notify_dispatch() {
     orch.start_migration(origin, 0x1111, 0x2222).unwrap();
     // Advance to replay→cutover
     orch.on_restore_complete(origin, 5).unwrap();
-    orch.on_replay_complete(origin, 5).unwrap();
+    orch.on_replay_complete(origin, 5, make_link(origin, 5))
+        .unwrap();
 
     // Now send CutoverNotify to the source via handler
     let cutover_msg = MigrationMessage::CutoverNotify {
@@ -517,7 +540,8 @@ fn test_subprotocol_handler_cleanup_complete_dispatch() {
     // Setup: start and advance migration to Complete
     orch.start_migration(origin, 0x1111, 0x2222).unwrap();
     orch.on_restore_complete(origin, 1).unwrap();
-    orch.on_replay_complete(origin, 1).unwrap();
+    orch.on_replay_complete(origin, 1, make_link(origin, 1))
+        .unwrap();
     orch.on_cutover_acknowledged(origin).unwrap();
     assert!(orch.is_migrating(origin));
 
@@ -548,6 +572,180 @@ fn test_subprotocol_handler_cleanup_complete_dispatch() {
         .unwrap();
     assert!(outbound.is_empty());
     assert!(!orch.is_migrating(origin));
+}
+
+#[test]
+fn test_regression_dispatch_arms_reject_unrelated_from_node() {
+    use net::adapter::net::compute::orchestrator::wire;
+    use net::adapter::net::compute::MigrationError;
+    use net::adapter::net::subprotocol::MigrationSubprotocolHandler;
+
+    // Peer-auth regression: each state-mutating dispatch arm must
+    // reject messages from a peer who is not the recorded principal
+    // for that role. Without binding, any peer with subprotocol reach
+    // could drive cutover or abort by forging ActivateTarget /
+    // CleanupComplete / MigrationFailed / SnapshotReady.
+    let reg = Arc::new(DaemonRegistry::new());
+    let (_, origin) = register_counter_daemon(&reg, 1);
+
+    let orch = Arc::new(MigrationOrchestrator::new(reg.clone(), 0x1111));
+    let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
+    let target = Arc::new(MigrationTargetHandler::new(reg.clone()));
+
+    let handler = MigrationSubprotocolHandler::new(orch.clone(), source, target, 0x1111);
+
+    // Source 0x1111, target 0x2222. 0x9999 is an attacker peer.
+    orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+    orch.on_restore_complete(origin, 1).unwrap();
+    orch.on_replay_complete(origin, 1, make_link(origin, 1))
+        .unwrap();
+    orch.on_cutover_acknowledged(origin).unwrap();
+
+    // CleanupComplete from a non-source peer must be rejected — the
+    // orchestrator recorded 0x1111 as the source.
+    let forged = MigrationMessage::CleanupComplete {
+        daemon_origin: origin,
+    };
+    match handler.handle_message(&wire::encode(&forged).unwrap(), 0x9999) {
+        Err(MigrationError::WrongPeer {
+            daemon_origin: o,
+            from,
+            expected,
+        }) => {
+            assert_eq!(o, origin);
+            assert_eq!(from, 0x9999);
+            assert_eq!(expected, 0x1111);
+        }
+        other => panic!("expected WrongPeer rejection, got {:?}", other),
+    }
+    // No state advance: still mid-migration.
+    assert!(
+        orch.is_migrating(origin),
+        "forged CleanupComplete must not advance orchestrator state"
+    );
+
+    // The legitimate CleanupComplete from 0x1111 still works.
+    let outbound = handler
+        .handle_message(&wire::encode(&forged).unwrap(), 0x1111)
+        .expect("recorded source can drive CleanupComplete");
+    assert_eq!(outbound.len(), 1);
+
+    // MigrationFailed from an entirely unrelated peer must be
+    // rejected; recorded participants are 0x1111 / 0x2222 / local.
+    let failed = MigrationMessage::MigrationFailed {
+        daemon_origin: origin,
+        reason: net::adapter::net::compute::MigrationFailureReason::StateFailed(
+            "synthetic".to_string(),
+        ),
+    };
+    match handler.handle_message(&wire::encode(&failed).unwrap(), 0x9999) {
+        Err(MigrationError::WrongPeer { from, .. }) => {
+            assert_eq!(from, 0x9999);
+        }
+        other => panic!(
+            "expected WrongPeer rejection for forged MigrationFailed, got {:?}",
+            other
+        ),
+    }
+}
+
+/// Regression: SnapshotReady for an unbound `daemon_origin` used to
+/// TOFU the sender as the orchestrator inside `restore_on_target` —
+/// any session peer that beat the legitimate orchestrator became the
+/// bound principal and could drive subsequent control messages past
+/// the peer-auth gates. Operators that know the orchestrator out of
+/// band can pre-bind it via
+/// `DaemonFactoryRegistry::bind_expected_orchestrator`; when bound,
+/// a mismatching sender must be rejected at the SnapshotReady gate
+/// rather than recorded.
+#[test]
+fn snapshot_ready_rejects_unexpected_orchestrator_when_bound() {
+    use net::adapter::net::compute::orchestrator::wire;
+    use net::adapter::net::compute::{DaemonFactoryRegistry, MigrationError};
+    use net::adapter::net::subprotocol::MigrationSubprotocolHandler;
+
+    // Setup: target node with a factory registered AND an expected
+    // orchestrator binding. No prior orchestrator/target-side
+    // migration record exists for `origin` — this is the TOFU
+    // window the bind closes.
+    let target_reg = Arc::new(DaemonRegistry::new());
+    let factories = Arc::new(DaemonFactoryRegistry::new());
+    let kp = EntityKeypair::generate();
+    let origin = kp.origin_hash();
+    factories
+        .register(kp.clone(), DaemonHostConfig::default(), || {
+            Box::new(CounterDaemon::new())
+        })
+        .unwrap();
+
+    let expected_orchestrator: u64 = 0x3333;
+    let attacker: u64 = 0x9999;
+    assert!(
+        factories.bind_expected_orchestrator(origin, expected_orchestrator),
+        "bind must succeed once factory is registered",
+    );
+
+    let target_node: u64 = 0x2222;
+    let target_handler = Arc::new(
+        net::adapter::net::compute::MigrationTargetHandler::new_with_factories(
+            target_reg.clone(),
+            factories.clone(),
+        ),
+    );
+    let orch = Arc::new(MigrationOrchestrator::new(target_reg.clone(), target_node));
+    let source = Arc::new(MigrationSourceHandler::new(target_reg.clone()));
+    let handler =
+        MigrationSubprotocolHandler::new(orch.clone(), source, target_handler.clone(), target_node);
+
+    // Build a real snapshot that the attacker forges.
+    let chain_head = {
+        let mut chain = net::adapter::net::state::causal::CausalChainBuilder::new(origin);
+        chain.append(Bytes::from_static(b"x"), 0).unwrap();
+        *chain.head()
+    };
+    let snapshot = StateSnapshot::new(
+        kp.entity_id().clone(),
+        chain_head,
+        Bytes::from(0u64.to_le_bytes().to_vec()),
+        net::adapter::net::state::horizon::ObservedHorizon::new(),
+    );
+    let snapshot_msg = MigrationMessage::SnapshotReady {
+        daemon_origin: origin,
+        snapshot_bytes: snapshot.to_bytes(),
+        seq_through: snapshot.through_seq,
+        chunk_index: 0,
+        total_chunks: 1,
+    };
+
+    // Attacker SnapshotReady is rejected with WrongPeer.
+    match handler.handle_message(&wire::encode(&snapshot_msg).unwrap(), attacker) {
+        Err(MigrationError::WrongPeer {
+            daemon_origin: o,
+            from,
+            expected,
+        }) => {
+            assert_eq!(o, origin);
+            assert_eq!(from, attacker);
+            assert_eq!(expected, expected_orchestrator);
+        }
+        other => panic!("expected WrongPeer rejection, got {:?}", other),
+    }
+
+    // Nothing was recorded: target_handler has no orchestrator binding
+    // for this origin, so the next legitimate SnapshotReady from the
+    // bound orchestrator still succeeds (no attacker-set state to
+    // poison it). The forwarded result is target-handler internals;
+    // confirming no migration record was created is sufficient.
+    assert!(
+        !target_handler.is_migrating(origin),
+        "attacker SnapshotReady must NOT register a migration record",
+    );
+
+    // Bind sanity: re-binding to the SAME orchestrator is idempotent;
+    // re-binding to a DIFFERENT orchestrator fails so an attacker who
+    // gains a write surface here can't quietly swap the principal.
+    assert!(factories.bind_expected_orchestrator(origin, expected_orchestrator));
+    assert!(!factories.bind_expected_orchestrator(origin, attacker));
 }
 
 // ── 6. Reassembler with out-of-order chunks ──────────────────────────────────
@@ -754,7 +952,8 @@ fn test_concurrent_migrations_no_interference() {
 
     // Advance A through all phases
     orch.on_restore_complete(origin_a, 100).unwrap();
-    orch.on_replay_complete(origin_a, 100).unwrap();
+    orch.on_replay_complete(origin_a, 100, make_link(origin_a, 100))
+        .unwrap();
     orch.on_cutover_acknowledged(origin_a).unwrap();
     orch.on_cleanup_complete(origin_a).unwrap();
     orch.on_activate_ack(origin_a, 100).unwrap();
@@ -766,7 +965,8 @@ fn test_concurrent_migrations_no_interference() {
 
     // Advance B
     orch.on_restore_complete(origin_b, 200).unwrap();
-    orch.on_replay_complete(origin_b, 200).unwrap();
+    orch.on_replay_complete(origin_b, 200, make_link(origin_b, 200))
+        .unwrap();
     orch.on_cutover_acknowledged(origin_b).unwrap();
     orch.on_cleanup_complete(origin_b).unwrap();
     orch.on_activate_ack(origin_b, 200).unwrap();
@@ -840,6 +1040,12 @@ fn test_wire_roundtrip_all_message_types() {
         MigrationMessage::ReplayComplete {
             daemon_origin: 0x5555,
             replayed_seq: 200,
+            target_head: CausalLink {
+                origin_hash: 0x5555,
+                horizon_encoded: 0,
+                sequence: 200,
+                parent_hash: 0xDEAD_BEEF,
+            },
         },
         MigrationMessage::CutoverNotify {
             daemon_origin: 0x6666,
@@ -920,7 +1126,8 @@ fn test_abort_at_each_phase() {
         let orch = MigrationOrchestrator::new(reg.clone(), 0x1111);
         orch.start_migration(origin, 0x1111, 0x2222).unwrap();
         orch.on_restore_complete(origin, 4).unwrap();
-        orch.on_replay_complete(origin, 4).unwrap();
+        orch.on_replay_complete(origin, 4, make_link(origin, 4))
+            .unwrap();
         assert_eq!(orch.status(origin), Some(MigrationPhase::Cutover));
         orch.abort_migration(origin, "abort at cutover".into())
             .unwrap();
@@ -964,6 +1171,12 @@ fn test_regression_cutover_routed_to_source_not_target() {
     let replay_msg = MigrationMessage::ReplayComplete {
         daemon_origin: origin,
         replayed_seq: 10,
+        target_head: CausalLink {
+            origin_hash: origin,
+            horizon_encoded: 0,
+            sequence: 10,
+            parent_hash: 0,
+        },
     };
     let outbound = handler
         .handle_message(&wire::encode(&replay_msg).unwrap(), target_node)
@@ -1198,6 +1411,12 @@ fn test_regression_full_handler_routing_chain() {
     let replay_msg = MigrationMessage::ReplayComplete {
         daemon_origin: origin,
         replayed_seq: 20,
+        target_head: CausalLink {
+            origin_hash: origin,
+            horizon_encoded: 0,
+            sequence: 20,
+            parent_hash: 0,
+        },
     };
     let outbound = handler
         .handle_message(&wire::encode(&replay_msg).unwrap(), target_node)
@@ -1246,6 +1465,53 @@ fn test_regression_full_handler_routing_chain() {
             );
         }
     }
+}
+
+/// Regression: third-party orchestrator (a node that is neither source
+/// nor target) used to fail `on_replay_complete` with `StateFailed`
+/// because it looked up `target_head` in its local daemon registry
+/// and found nothing. The target now ships `target_head` over the
+/// wire in `ReplayComplete`, so the orchestrator no longer needs the
+/// daemon to be locally registered.
+#[test]
+fn test_regression_on_replay_complete_third_party_orchestrator_no_local_daemon() {
+    // Set up an orchestrator on `local_node_id` with the daemon in
+    // its registry just so `start_migration` (local-source path) can
+    // advance phase. We then unregister the daemon — mirroring the
+    // production topology where A=orchestrator, B=source, C=target
+    // and A's registry never had the daemon — and verify
+    // `on_replay_complete` no longer requires the local lookup.
+    let orch_reg = Arc::new(DaemonRegistry::new());
+    let (_kp, origin) = register_counter_daemon(&orch_reg, 0);
+    let target_node: u64 = 0xBBBB;
+    let orch_node: u64 = 0xCCCC;
+
+    let orch = MigrationOrchestrator::new(orch_reg.clone(), orch_node);
+    orch.start_migration(origin, orch_node, target_node)
+        .unwrap();
+    orch.on_restore_complete(origin, 42).unwrap();
+    assert_eq!(orch.status(origin), Some(MigrationPhase::Replay));
+
+    // Drop the daemon to simulate a third-party orchestrator whose
+    // registry has no entry. Pre-fix this would have caused
+    // `on_replay_complete` to return `StateFailed`.
+    orch_reg.unregister(origin).unwrap();
+
+    // Target ships its head in ReplayComplete. The orchestrator
+    // accepts it without needing to consult any local registry.
+    let cutover_msg = orch
+        .on_replay_complete(origin, 42, make_link(origin, 42))
+        .expect("third-party orchestrator must advance past Replay");
+
+    match cutover_msg {
+        MigrationMessage::CutoverNotify {
+            target_node: tn, ..
+        } => {
+            assert_eq!(tn, target_node);
+        }
+        other => panic!("expected CutoverNotify, got {:?}", other),
+    }
+    assert_eq!(orch.status(origin), Some(MigrationPhase::Cutover));
 }
 
 /// Regression: CutoverNotify handler used to call `source_handler.cleanup()`
@@ -1345,19 +1611,30 @@ fn test_regression_reassembler_rejects_mixed_seq_through() {
 /// Regression: Multi-chunk snapshot path in on_snapshot_ready never advanced
 /// MigrationState out of Snapshot phase, breaking subsequent phase transitions
 /// (on_restore_complete would fail with WrongPhase).
+///
+/// Chunk 0 of a multi-chunk SnapshotReady now requires the snapshot wire
+/// envelope (magic + version + entity_id) so the orchestrator can catch
+/// header-level corruption symmetrically with the single-chunk path. Build a
+/// chunk 0 carrying the right entity_id; chunks 1+ are raw payload fragments
+/// and skip envelope validation.
 #[test]
 fn test_regression_multi_chunk_advances_past_snapshot_phase() {
     let reg = Arc::new(DaemonRegistry::new());
-    let (_, origin) = register_counter_daemon(&reg, 10);
+    let (kp, origin) = register_counter_daemon(&reg, 10);
     let orch = MigrationOrchestrator::new(reg.clone(), 0x3333);
 
     // Start migration (remote source)
     orch.start_migration(origin, 0x1111, 0x2222).unwrap();
     assert_eq!(orch.status(origin), Some(MigrationPhase::Snapshot));
 
-    // Simulate first chunk of a multi-chunk snapshot
-    orch.on_snapshot_ready(origin, vec![1, 2, 3], 10, 0, 3)
-        .unwrap();
+    // Build a chunk 0 that satisfies the envelope validator:
+    // [magic(4) "CDS1"][version(1)=2][entity_id(32)][padding].
+    let mut chunk0 = Vec::with_capacity(48);
+    chunk0.extend_from_slice(b"CDS1");
+    chunk0.push(2); // SNAPSHOT_VERSION
+    chunk0.extend_from_slice(kp.entity_id().as_bytes());
+    chunk0.extend_from_slice(&[0u8; 11]); // padding to satisfy len >= 37
+    orch.on_snapshot_ready(origin, chunk0, 10, 0, 3).unwrap();
 
     // Phase MUST have advanced past Snapshot — otherwise on_restore_complete
     // would fail because it expects Transfer phase
@@ -1368,7 +1645,7 @@ fn test_regression_multi_chunk_advances_past_snapshot_phase() {
     );
     assert_eq!(orch.status(origin), Some(MigrationPhase::Transfer));
 
-    // Subsequent chunks should not error
+    // Subsequent chunks are raw fragments — no envelope check.
     orch.on_snapshot_ready(origin, vec![4, 5, 6], 10, 1, 3)
         .unwrap();
     orch.on_snapshot_ready(origin, vec![7, 8], 10, 2, 3)
@@ -2031,10 +2308,11 @@ fn test_gap_promote_no_healthy_standbys() {
     assert_eq!(err, GroupError::NoHealthyMember);
 }
 
-/// Gap 3: DaemonHost::from_fork panics on origin mismatch.
+/// Gap 3: DaemonHost::from_fork returns Err on origin mismatch.
+/// Was a panic via assert_eq! pre-fix; now a typed RestoreFailed
+/// so SDK/FFI consumers can't UB-panic across the boundary.
 #[test]
-#[should_panic(expected = "fork chain origin")]
-fn test_gap_from_fork_origin_mismatch_panics() {
+fn test_gap_from_fork_origin_mismatch_returns_err() {
     use net::adapter::net::state::causal::CausalChainBuilder;
 
     let keypair_a = EntityKeypair::generate();
@@ -2056,13 +2334,14 @@ fn test_gap_from_fork_origin_mismatch_panics() {
         }
     }
 
-    // Pass keypair_b but chain for keypair_a — should panic
-    let _host = DaemonHost::from_fork(
+    // Pass keypair_b but chain for keypair_a — should return Err
+    let result = DaemonHost::from_fork(
         Box::new(NoopDaemon),
         keypair_b,
         chain,
         DaemonHostConfig::default(),
     );
+    assert!(matches!(result, Err(DaemonError::RestoreFailed(_))));
 }
 
 /// Gap 4: Reassembler with mismatched total_chunks across chunks.
@@ -2418,8 +2697,16 @@ impl WireNode {
     fn new(node_id: u64) -> Self {
         let reg = Arc::new(DaemonRegistry::new());
         let factories = Arc::new(DaemonFactoryRegistry::new());
-        let orch = Arc::new(MigrationOrchestrator::new(reg.clone(), node_id));
         let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        // Wire the source handler into the orchestrator so a local
+        // `start_migration` routes through `source_handler.start_snapshot`
+        // — without this, the source-side migration record is never
+        // created and the eventual cleanup path can't tell whether
+        // this node authored the migration (the `migrations.get` miss
+        // makes cleanup a no-op rather than unregistering the daemon).
+        let orch = Arc::new(
+            MigrationOrchestrator::new(reg.clone(), node_id).with_source_handler(source.clone()),
+        );
         let target = Arc::new(MigrationTargetHandler::new_with_factories(
             reg.clone(),
             factories.clone(),

@@ -101,6 +101,7 @@ impl MaintenanceState {
     /// when the new state is `Active` (the `Recovery → Active`
     /// terminal arc wraps to `0`). Same-position transitions
     /// stay idempotent.
+    #[allow(dead_code)]
     fn rank(&self) -> u8 {
         match self {
             MaintenanceState::Active => 0,
@@ -118,15 +119,56 @@ impl MaintenanceState {
     /// arriving `Maintenance` observed event after `Recovery`)
     /// are not. Same-rank transitions are valid (idempotent
     /// replay of the same observed state).
+    ///
+    /// The maintenance graph isn't totally ordered: `ExitingMaintenance`
+    /// and `DrainFailed` share the same `rank()` (both come out
+    /// of `Maintenance`), so a pure rank-ladder admitted the
+    /// `ExitingMaintenance → DrainFailed` regression: an operator
+    /// `ExitMaintenance { force=true }` could be silently undone
+    /// by a delayed `MaintenanceTransitionObserved(DrainFailed)`
+    /// from chain replay. The explicit match-table below rejects
+    /// that specific cross-rank arc while still allowing every
+    /// legitimate forward arc.
     pub fn is_valid_successor(&self, new: &MaintenanceState) -> bool {
-        if matches!(new, MaintenanceState::Active) {
-            // Only Recovery → Active is the legal way to land
-            // back at Active. Other states transitioning to
-            // Active is a backward jump.
-            return matches!(self, MaintenanceState::Recovery { .. })
-                || matches!(self, MaintenanceState::Active);
+        use MaintenanceState::*;
+        // Idempotent same-variant transitions are always allowed.
+        // This is REPLAY TOLERANCE, not strict field equality: an
+        // `EnteringMaintenance { since: a, deadline: X }` →
+        // `EnteringMaintenance { since: b, deadline: Y }` returns
+        // true even though the inner fields differ. Chain replays
+        // and operator re-publishes legitimately produce same-
+        // variant observations with refreshed timestamps; the fold
+        // downstream takes the most-recent value and does NOT key
+        // ordering on `is_valid_successor`'s yes/no answer — so
+        // accepting inner-field drift here is the correct behavior.
+        // A future fold that depended on strict same-variant
+        // equality would need to compare fields itself; this
+        // function answers a different question ("is this
+        // transition legal at the rank graph level?").
+        if std::mem::discriminant(self) == std::mem::discriminant(new) {
+            return true;
         }
-        new.rank() >= self.rank()
+        match (self, new) {
+            // Forward path.
+            (Active, EnteringMaintenance { .. }) => true,
+            (EnteringMaintenance { .. }, Maintenance { .. }) => true,
+            // Drain can fail during the entering window OR once
+            // steady-state maintenance is established.
+            (EnteringMaintenance { .. }, DrainFailed { .. }) => true,
+            (Maintenance { .. }, ExitingMaintenance { .. }) => true,
+            (Maintenance { .. }, DrainFailed { .. }) => true,
+            (ExitingMaintenance { .. }, Recovery { .. }) => true,
+            // Recovery from a stuck drain — operator can force
+            // exit out of DrainFailed back into ExitingMaintenance,
+            // and a subsequent retry can reach Recovery from there.
+            (DrainFailed { .. }, ExitingMaintenance { .. }) => true,
+            // Terminal arc.
+            (Recovery { .. }, Active) => true,
+            // Everything else (including the documented regression
+            // ExitingMaintenance → DrainFailed) is rejected. Two
+            // states at the same rank are no longer indistinguishable.
+            _ => false,
+        }
     }
 
     /// `true` when the node is in any state other than
@@ -229,5 +271,26 @@ mod tests {
         // Active is only reachable from Recovery (or Active).
         assert!(!maintenance.is_valid_successor(&active));
         assert!(!entering.is_valid_successor(&active));
+    }
+
+    /// `ExitingMaintenance` and `DrainFailed` share the same
+    /// `rank()`, so the pre-fix rank ladder admitted the
+    /// backward arc `ExitingMaintenance → DrainFailed`. A
+    /// delayed `MaintenanceTransitionObserved(DrainFailed)`
+    /// arriving from chain replay would silently undo an
+    /// operator's `ExitMaintenance { force=true }`. The
+    /// match-table rejects that specific cross-rank arc.
+    #[test]
+    fn is_valid_successor_rejects_exiting_to_drain_failed() {
+        let base = Instant::now();
+        let exiting = MaintenanceState::ExitingMaintenance { since: base };
+        let drain_failed = MaintenanceState::DrainFailed {
+            since: base,
+            reason: "late replay".into(),
+        };
+        assert!(
+            !exiting.is_valid_successor(&drain_failed),
+            "operator force-exit must not be regressed by a late DrainFailed observation",
+        );
     }
 }

@@ -463,12 +463,18 @@ impl VirtualCluster {
                             },
                         ));
                     }
-                    SyncRequestOutcome::Nack { error_code, detail } => {
+                    SyncRequestOutcome::Nack {
+                        error_code,
+                        leader_first_retained_seq,
+                        detail,
+                    } => {
                         let nack = SyncNack {
                             channel_id: self.channel_id,
                             since_seq: msg.since_seq,
                             error_code,
+                            leader_first_retained_seq,
                             detail,
+                            request_id: msg.request_id,
                         };
                         self.pending.push_back((
                             id,

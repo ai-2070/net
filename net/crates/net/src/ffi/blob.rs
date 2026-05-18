@@ -117,6 +117,14 @@ fn err_to_code(e: &InnerBlobError) -> c_int {
         InnerBlobError::AdapterNotConfigured => NET_ERR_BLOB_ADAPTER_NOT_CONFIGURED,
         InnerBlobError::AdapterNotRegistered(_) => NET_ERR_BLOB_ADAPTER_NOT_REGISTERED,
         InnerBlobError::Unauthorized(_) => NET_ERR_BLOB_UNAUTHORIZED,
+        // `ShortChunk` is a size disagreement (backend truncated
+        // the chunk); route through `NET_ERR_BLOB_BACKEND` rather
+        // than `NET_ERR_BLOB_HASH_MISMATCH` so retry logic that
+        // distinguishes truncation from content divergence keeps
+        // the existing classifier intact. A dedicated code can be
+        // added later when a binding consumer needs to fork on the
+        // distinction at the FFI surface.
+        InnerBlobError::ShortChunk { .. } => NET_ERR_BLOB_BACKEND,
     }
 }
 
@@ -233,6 +241,10 @@ pub unsafe extern "C" fn net_blob_publish(
     if data.is_null() && data_len > 0 {
         return NetError::NullPointer.into();
     }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if data_len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let data_slice = if data_len == 0 {
         &[][..]
     } else {
@@ -256,12 +268,7 @@ pub unsafe extern "C" fn net_blob_publish(
         Err(_) => return NET_ERR_BLOB_PANIC,
     };
 
-    let boxed = bytes.into_boxed_slice();
-    let len = boxed.len();
-    let ptr = Box::into_raw(boxed) as *mut u8;
-    *out_payload = ptr;
-    *out_payload_len = len;
-    0
+    write_bytes_out(&bytes, out_payload, out_payload_len)
 }
 
 /// Resolve a payload to its content bytes. Inline payloads round-
@@ -301,6 +308,10 @@ pub unsafe extern "C" fn net_blob_resolve(
     if payload.is_null() && payload_len > 0 {
         return NetError::NullPointer.into();
     }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if payload_len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let payload_slice = if payload_len == 0 {
         &[][..]
     } else {
@@ -321,16 +332,56 @@ pub unsafe extern "C" fn net_blob_resolve(
         Err(_) => return NET_ERR_BLOB_PANIC,
     };
 
-    let boxed = bytes.into_boxed_slice();
-    let len = boxed.len();
-    let ptr = Box::into_raw(boxed) as *mut u8;
-    *out_content = ptr;
-    *out_content_len = len;
+    write_bytes_out(&bytes, out_content, out_content_len)
+}
+
+/// Allocate a Rust-owned buffer with an explicit `Layout::array::<u8>(len)`,
+/// copy `src` into it, and write `(ptr, len)` to the caller's out-pointers.
+/// Pairs with [`net_blob_free_buffer`], which deallocates with the matching
+/// layout. Pre-fix this path went `Vec → into_boxed_slice → Box::into_raw`,
+/// freed via `Box::from_raw(slice_from_raw_parts_mut(ptr, len))`. That
+/// worked because `into_boxed_slice` happens to shrink-to-fit today, but
+/// relied on a `Vec` / `Box<[u8]>` allocator-internals coincidence. A
+/// future refactor to `Vec::leak` (which does NOT shrink) would have
+/// silently mismatched the dealloc layout. Using an explicit
+/// `Layout::array::<u8>` on both sides makes the contract self-evident.
+///
+/// # Safety
+/// `out_ptr` and `out_len` must be writable.
+unsafe fn write_bytes_out(src: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) -> c_int {
+    let len = src.len();
+    if len == 0 {
+        unsafe {
+            *out_ptr = ptr::null_mut();
+            *out_len = 0;
+        }
+        return 0;
+    }
+    let layout = match std::alloc::Layout::array::<u8>(len) {
+        Ok(l) => l,
+        // `Layout::array::<u8>` only fails when `len > isize::MAX`.
+        // The publish/resolve paths have already rejected that range
+        // (slice::from_raw_parts shares the same cap), so this is
+        // unreachable from the existing call sites — but defending it
+        // here keeps `write_bytes_out` safe to reuse from any future
+        // caller. Returning a typed code beats panicking across the
+        // surrounding `extern "C"` frame.
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    let alloc_ptr = unsafe { std::alloc::alloc(layout) };
+    if alloc_ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), alloc_ptr, len);
+        *out_ptr = alloc_ptr;
+        *out_len = len;
+    }
     0
 }
 
 /// Free a buffer returned by [`net_blob_publish`] or
-/// [`net_blob_resolve`]. Calling with `(null, 0)` is a no-op.
+/// [`net_blob_resolve`]. Calling with `(null, _)` or `(_, 0)` is a no-op.
 ///
 /// # Safety
 /// `ptr` MUST be a buffer that the substrate previously returned
@@ -340,10 +391,19 @@ pub unsafe extern "C" fn net_blob_resolve(
 /// behaviour.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_blob_free_buffer(ptr: *mut u8, len: usize) {
-    if ptr.is_null() {
+    if ptr.is_null() || len == 0 {
         return;
     }
-    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len));
+    // Match the `Layout::array::<u8>(len)` used by `write_bytes_out`.
+    // Any `len > isize::MAX` could not have come from us — the
+    // allocating side would have rejected the same layout — so the
+    // safest response is to abandon the free rather than unwind
+    // across the FFI boundary.
+    let layout = match std::alloc::Layout::array::<u8>(len) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    std::alloc::dealloc(ptr, layout);
 }
 
 // Ensure the unused-import lint stays quiet under feature gates that
@@ -435,17 +495,39 @@ pub struct NetBlobAdapterVtable {
     pub free_buffer: NetBlobAdapterFreeFn,
 }
 
-/// Opaque caller-context pointer. The pointer is set once at
-/// adapter registration and never mutated; the caller is
-/// responsible for the pointee's thread-safety, the substrate
-/// just shuttles it across calls. `Send + Sync` are asserted
-/// unconditionally — the C-side caller is the trust boundary
-/// for cross-thread access to whatever the pointer references.
+/// Opaque caller-context pointer.
+///
+/// # Concurrency contract (caller MUST uphold)
+///
+/// The substrate dispatches every vtable call from a
+/// `tokio::task::spawn_blocking` worker, which means the same
+/// `ctx` pointer is observed from **multiple OS threads over the
+/// lifetime of the registration** and may be observed
+/// **concurrently** if two events for the same adapter are
+/// in-flight. `Send + Sync` are asserted unconditionally because
+/// the substrate has no visibility into what the pointer
+/// references — the C-side registrant is the trust boundary.
+///
+/// In practical terms, this means a registrant **MUST** pass a
+/// `ctx` whose pointee is:
+///
+/// - **`Send` across threads**: any per-thread state (e.g. a
+///   thread-local OS handle, a goroutine-local pointer, a
+///   Python `PyObject*` held without the GIL) is unsafe.
+/// - **`Sync` for concurrent dispatch**: any state mutated
+///   inside vtable callbacks must be protected against
+///   data races by the registrant (lock, atomic, etc.).
+///
+/// Wrappers that cannot meet the `Sync` requirement (e.g. a
+/// Python adapter that uses the GIL) MUST serialize their own
+/// dispatch behind a `Mutex` before passing control to the
+/// language runtime.
 struct OpaqueCtx(*mut c_void);
 
-// SAFETY: opaque-pointer transport. Cross-thread coherence of the
-// pointee is the C-side caller's responsibility; the substrate
-// only reads and forwards the same address verbatim.
+// SAFETY: opaque-pointer transport — see `OpaqueCtx` doc above.
+// Cross-thread coherence of the pointee is the C-side caller's
+// responsibility; the substrate only reads and forwards the
+// same address verbatim.
 unsafe impl Send for OpaqueCtx {}
 unsafe impl Sync for OpaqueCtx {}
 
@@ -690,7 +772,28 @@ impl BlobAdapter for CallbackBlobAdapter {
 ///   AND any in-flight calls have completed).
 /// - `ctx` is an opaque pointer the substrate passes through unchanged
 ///   to every vtable call; the caller is responsible for keeping the
-///   pointee alive and thread-safe for the same lifetime as `vtable`.
+///   pointee alive for the same lifetime as `vtable`.
+///
+/// # Concurrency contract (caller MUST uphold)
+///
+/// The substrate dispatches every vtable call from a
+/// `tokio::task::spawn_blocking` worker. The same `ctx` will be
+/// observed from **multiple OS threads** over the lifetime of the
+/// registration and may be observed **concurrently** when two
+/// in-flight calls are dispatched to the same adapter.
+///
+/// The pointee of `ctx` therefore MUST be:
+/// - safely transferable across threads (`Send`-equivalent in the
+///   caller's runtime); and
+/// - safely accessed concurrently (`Sync`-equivalent), or guarded
+///   inside the vtable callbacks by a caller-owned lock.
+///
+/// Passing a thread-local pointer (an OS thread handle, a Go
+/// goroutine-local pointer, a Python `PyObject*` held outside the
+/// GIL, etc.) is **undefined behaviour**. Wrappers whose runtime
+/// cannot meet the `Sync` requirement MUST serialize vtable
+/// dispatch inside the callback before crossing into the
+/// language runtime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_blob_register_callback_adapter(
     adapter_id: *const c_char,
@@ -934,6 +1037,10 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_store(
     if handle.is_null() || blob_ref_bytes.is_null() {
         return NetError::NullPointer.into();
     }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if blob_ref_len > isize::MAX as usize || data_len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
     let blob_ref = match InnerBlobRef::decode(blob_slice) {
         Ok(Some(b)) => b,
@@ -973,6 +1080,10 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_fetch(
     if handle.is_null() || blob_ref_bytes.is_null() || out_data.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
     }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if blob_ref_len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
     let blob_ref = match InnerBlobRef::decode(blob_slice) {
         Ok(Some(b)) => b,
@@ -981,17 +1092,12 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_fetch(
     let adapter = unsafe { (*handle).inner.clone() };
     let result = block_on(async move { (*adapter).fetch(&blob_ref).await });
     match result {
-        Ok(bytes) => {
-            let mut boxed = bytes.into_boxed_slice();
-            let ptr_out = boxed.as_mut_ptr();
-            let len_out = boxed.len();
-            std::mem::forget(boxed);
-            unsafe {
-                *out_data = ptr_out;
-                *out_len = len_out;
-            }
-            0
-        }
+        // Allocate with the same explicit `Layout::array::<u8>(len)`
+        // path that `net_blob_free_buffer` deallocates with, so the
+        // pair is layout-symmetric regardless of any future
+        // `Vec::leak` / `into_boxed_slice` refactor inside the
+        // adapter.
+        Ok(bytes) => unsafe { write_bytes_out(&bytes, out_data, out_len) },
         Err(e) => err_to_code(&e),
     }
 }
@@ -1012,6 +1118,10 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_exists(
 ) -> c_int {
     if handle.is_null() || blob_ref_bytes.is_null() || out_exists.is_null() {
         return NetError::NullPointer.into();
+    }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if blob_ref_len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
     }
     let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
     let blob_ref = match InnerBlobRef::decode(blob_slice) {

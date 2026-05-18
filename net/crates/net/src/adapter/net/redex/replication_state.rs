@@ -56,8 +56,23 @@ pub enum TransitionSignal {
     /// Local disk pressure tripped `UnderCapacity::Withdraw`.
     /// Drives `Replica → Idle`.
     DiskPressureWithdraw,
+    /// Disk-pressure withdraw from `Leader`. Lets the transition
+    /// metric label this case as disk-pressure rather than the
+    /// `ChannelClose` fallback the FSM used pre-fix, which made
+    /// operator dashboards triage it as "graceful channel close."
+    LeaderDiskPressureWithdraw,
+    /// Disk-pressure withdraw from `Candidate`. Same labeling
+    /// rationale as `LeaderDiskPressureWithdraw`.
+    CandidateDiskPressureWithdraw,
     /// Channel was closed. Drives `* → Idle` from any state.
     ChannelClose,
+    /// This Leader observed another peer also claiming Leader for
+    /// the same channel (inbound Heartbeat with `role=Leader`) and
+    /// lost the deterministic tiebreak (lower tail_seq, or equal
+    /// tail with greater node id). Drives `Leader → Replica` so a
+    /// partition-heal converges to one leader rather than leaving
+    /// both partitions claiming authority indefinitely.
+    PeerLeaderObserved,
 }
 
 /// Result of validating + applying a state transition.
@@ -145,6 +160,18 @@ impl StateTransition {
                 ReplicaRole::Replica,
                 ReplicaRole::Idle,
                 TransitionSignal::DiskPressureWithdraw,
+            ) | (
+                ReplicaRole::Leader,
+                ReplicaRole::Idle,
+                TransitionSignal::LeaderDiskPressureWithdraw,
+            ) | (
+                ReplicaRole::Candidate,
+                ReplicaRole::Idle,
+                TransitionSignal::CandidateDiskPressureWithdraw,
+            ) | (
+                ReplicaRole::Leader,
+                ReplicaRole::Replica,
+                TransitionSignal::PeerLeaderObserved,
             )
         );
         if !permitted {
@@ -175,6 +202,7 @@ fn pair_is_valid_for_some_signal(from: ReplicaRole, to: ReplicaRole) -> bool {
             | (ReplicaRole::Replica, ReplicaRole::Candidate)
             | (ReplicaRole::Candidate, ReplicaRole::Leader)
             | (ReplicaRole::Candidate, ReplicaRole::Replica)
+            | (ReplicaRole::Leader, ReplicaRole::Replica)
     )
 }
 

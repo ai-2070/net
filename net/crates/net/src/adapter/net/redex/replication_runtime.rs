@@ -64,21 +64,45 @@ use std::time::Duration;
 /// through the substrate. Production sink routes through
 /// [`crate::adapter::net::MeshNode`]'s `SUBPROTOCOL_REDEX`
 /// dispatch; unit tests use a recorder mock.
+/// Bandwidth-budget accounting note that applies to every send
+/// method below: `Ok(())` means **queued to the transport**, not
+/// **delivered to the peer**. Implementations whose underlying
+/// transport buffers without ack (UDP, lossy QUIC streams under
+/// link failure, etc.) MUST surface delivery-loss through their
+/// own back-channel (heartbeat lag, peer-reported tail seq,
+/// out-of-band ack) — the replication runtime's bandwidth budget
+/// refund path keys on the synchronous `Err` return only. A
+/// silently-dropped frame still drains the budget; the
+/// flaky-link case is dampened by R-28 catchup-backoff once
+/// empty responses accrue past the threshold, but the budget
+/// itself cannot self-correct on transport-internal loss
+/// without an end-to-end ack the trait deliberately does not
+/// demand (the cost would be a per-response ack-RTT that the
+/// underlying QUIC reliable streams already provide for in-spec
+/// transports).
+///
+/// In short: trait callers MAY treat `Ok(())` as "the bytes
+/// reached the wire layer." If your transport doesn't guarantee
+/// delivery on `Ok(())`, document that on your impl and
+/// understand that the budget over-counts under loss.
 #[async_trait::async_trait]
 pub trait ReplicationDispatcher: Send + Sync {
-    /// Send a [`SyncHeartbeat`] to `target`.
+    /// Send a [`SyncHeartbeat`] to `target`. See trait-level note
+    /// on `Ok(())` semantics.
     async fn send_heartbeat(&self, target: NodeId, msg: SyncHeartbeat) -> Result<(), AdapterError>;
     /// Send a [`SyncRequest`] to `target` (typically a leader).
+    /// See trait-level note on `Ok(())` semantics.
     async fn send_sync_request(&self, target: NodeId, msg: SyncRequest)
         -> Result<(), AdapterError>;
     /// Send a [`SyncResponse`] to `target` (typically a replica
-    /// catching up).
+    /// catching up). See trait-level note on `Ok(())` semantics.
     async fn send_sync_response(
         &self,
         target: NodeId,
         msg: SyncResponse,
     ) -> Result<(), AdapterError>;
-    /// Send a [`SyncNack`] to `target`.
+    /// Send a [`SyncNack`] to `target`. See trait-level note on
+    /// `Ok(())` semantics.
     async fn send_sync_nack(&self, target: NodeId, msg: SyncNack) -> Result<(), AdapterError>;
 }
 
@@ -246,7 +270,19 @@ pub struct RuntimeInputs {
 /// observe the role, drive `transition_to`, and read the channel
 /// metrics without going through the inbox.
 pub struct ReplicationRuntimeHandle {
+    /// Low-priority inbox: Heartbeat + SyncRequest. A peer flood
+    /// fills this lane first; under saturation the high-priority
+    /// lane keeps draining so Shutdown, SyncResponse, and SyncNack
+    /// still make forward progress.
     inbox: mpsc::Sender<Inbound>,
+    /// High-priority inbox: Shutdown + SyncResponse + SyncNack.
+    /// Catchup-critical events ride this lane so a Heartbeat
+    /// flood from many peers (50 peers × 100 ms = 500 evt/s plus a
+    /// momentary slow `await` in `on_inbound` can saturate the
+    /// single lane to 1024 in two seconds) doesn't strand the
+    /// leader's response to the local replica or block graceful
+    /// shutdown.
+    priority_inbox: mpsc::Sender<Inbound>,
     task: Mutex<Option<JoinHandle<()>>>,
     coordinator: Arc<ReplicationCoordinator>,
     /// R-11: explicit "task has joined" flag. `is_stopped()`
@@ -256,6 +292,14 @@ pub struct ReplicationRuntimeHandle {
     /// surviving caller's `.await` returns. The flag is flipped
     /// only after the join completes.
     stopped: AtomicBool,
+}
+
+#[inline]
+fn is_priority_event(event: &Inbound) -> bool {
+    matches!(
+        event,
+        Inbound::Shutdown | Inbound::SyncResponse { .. } | Inbound::SyncNack { .. }
+    )
 }
 
 impl ReplicationRuntimeHandle {
@@ -271,8 +315,16 @@ impl ReplicationRuntimeHandle {
 
     /// Push an inbound event into the runtime's inbox. Errors
     /// when the runtime has already exited (drained channel).
+    /// Routes catchup-critical events (Shutdown, SyncResponse,
+    /// SyncNack) to the priority lane so a Heartbeat flood on
+    /// the standard lane can't starve them.
     pub async fn dispatch(&self, event: Inbound) -> Result<(), AdapterError> {
-        self.inbox
+        let sender = if is_priority_event(&event) {
+            &self.priority_inbox
+        } else {
+            &self.inbox
+        };
+        sender
             .send(event)
             .await
             .map_err(|_| AdapterError::Transient("replication runtime task exited".to_string()))
@@ -283,7 +335,12 @@ impl ReplicationRuntimeHandle {
     /// Returns the event back on full-buffer rejection so the
     /// caller can decide whether to drop, log, or block.
     pub fn try_dispatch(&self, event: Inbound) -> Result<(), Inbound> {
-        self.inbox.try_send(event).map_err(|e| e.into_inner())
+        let sender = if is_priority_event(&event) {
+            &self.priority_inbox
+        } else {
+            &self.inbox
+        };
+        sender.try_send(event).map_err(|e| e.into_inner())
     }
 
     /// Send `Shutdown` and await the task to exit. Idempotent —
@@ -297,26 +354,31 @@ impl ReplicationRuntimeHandle {
     pub async fn cancel(&self) {
         let handle = self.task.lock().take();
         if let Some(h) = handle {
-            match self.inbox.try_send(Inbound::Shutdown) {
+            // Shutdown rides the priority lane; that's the same
+            // lane the run loop drains first under the biased
+            // select, so even a saturated low-priority lane can't
+            // delay the graceful exit.
+            match self.priority_inbox.try_send(Inbound::Shutdown) {
                 Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
                     // Graceful path: the task observes Shutdown (or
                     // already exited). Await the join.
                     let _ = h.await;
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Task is wedged on a slow await with a saturated
-                    // inbox. Abort directly so cancel() can't block
-                    // the caller waiting on a buffer that the wedged
-                    // task may never drain.
+                    // Priority lane is itself saturated. Abort
+                    // directly so cancel() can't block the caller.
                     h.abort();
                     let _ = h.await;
                 }
             }
+            // Only the holder of the JoinHandle flips `stopped`,
+            // and only after `.await` returns. Pre-fix, a concurrent
+            // cancel() racer that lost the `take()` skipped the if-let
+            // block and then unconditionally stored `true` — before
+            // the winner's await had completed. `is_stopped()` then
+            // reported "joined" while the task was still running.
+            self.stopped.store(true, AtomicOrdering::Release);
         }
-        // Flip the "joined" flag only after the await returns.
-        // Concurrent cancel() racers that lost the handle take():
-        // poll `stopped` until our await completes.
-        self.stopped.store(true, AtomicOrdering::Release);
     }
 
     /// Returns `true` if the runtime has stopped (task joined).
@@ -333,6 +395,166 @@ impl ReplicationRuntimeHandle {
     }
 }
 
+/// Per-leader catchup state — tracks consecutive empty SyncResponses
+/// in the face of an advertised tail gap. A buggy or byzantine
+/// leader that advertises ever-increasing `tail_seq` but ships
+/// `Response{events: []}` would otherwise loop the replica at
+/// heartbeat cadence forever; the backoff suppresses outbound
+/// SyncRequests once the threshold is crossed, with exponential
+/// growth capped at [`CATCHUP_BACKOFF_CAP`]. A non-empty response
+/// resets the counter so a transient stall doesn't permanently
+/// pause catchup.
+#[derive(Debug, Default)]
+pub struct CatchupBackoff {
+    entries: std::collections::HashMap<NodeId, BackoffEntry>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct BackoffEntry {
+    /// Consecutive `apply_sync_response` calls that returned the
+    /// same tail (no events applied) while the believed leader's
+    /// advertised `tail_seq` was still strictly greater than ours.
+    consecutive_empty: u32,
+    /// Wall-clock instant the backoff window ends. `None` while
+    /// the counter is below `CATCHUP_BACKOFF_THRESHOLD`.
+    backoff_until: Option<Instant>,
+}
+
+/// Strikes before backoff kicks in. The first 3 empty responses
+/// are absorbed without delay so a transient leader-retention edge
+/// doesn't trigger a backoff.
+pub const CATCHUP_BACKOFF_THRESHOLD: u32 = 3;
+
+/// First backoff window after the threshold is crossed.
+pub const CATCHUP_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+
+/// Upper bound on the exponential backoff. A wedged leader stays
+/// reachable for re-evaluation at least every cap.
+pub const CATCHUP_BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+/// Per-leader in-flight SyncRequest registry. Each outbound
+/// SyncRequest mints a random `request_id` from `getrandom`; the
+/// id is inserted here keyed by `(leader_node_id, request_id)`
+/// before the wire send. Inbound SyncResponse / SyncNack must
+/// carry an id present in the set; otherwise it's a stale
+/// response from a request the replica already timed out (or a
+/// forged frame from any peer that happens to be the recorded
+/// leader). Entries auto-expire after [`REQUEST_TTL`] so the set
+/// can't grow without bound under leader silence.
+#[derive(Debug, Default)]
+pub struct OutstandingRequests {
+    entries: std::collections::HashMap<(NodeId, u64), Instant>,
+}
+
+/// TTL on entries in [`OutstandingRequests`]. Bounded by the
+/// catchup deadline so a one-tick-late response still lands.
+pub const REQUEST_TTL: Duration = Duration::from_secs(30);
+
+/// Soft cap on per-replica outstanding requests across all
+/// leaders. A degraded leader that never responds shouldn't
+/// let the set grow without bound; once the cap is hit, GC
+/// kicks in and the oldest entries are dropped.
+pub const REQUEST_REGISTRY_SOFT_CAP: usize = 256;
+
+impl OutstandingRequests {
+    /// Construct an empty registry.
+    pub fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record a freshly-minted `request_id` against `leader`.
+    /// Best-effort GC of expired entries runs at insert time so
+    /// the set stays bounded without a separate sweeper task.
+    pub fn record(&mut self, leader: NodeId, request_id: u64, now: Instant) {
+        if self.entries.len() >= REQUEST_REGISTRY_SOFT_CAP {
+            self.entries
+                .retain(|_, &mut inserted| now.saturating_duration_since(inserted) < REQUEST_TTL);
+        }
+        self.entries.insert((leader, request_id), now);
+    }
+
+    /// Take the entry for `(leader, request_id)` if present and
+    /// not yet expired. Returns `true` when an in-flight request
+    /// matched; the caller proceeds with the apply path. `false`
+    /// means the response is stale / forged / past TTL — drop.
+    pub fn take(&mut self, leader: NodeId, request_id: u64, now: Instant) -> bool {
+        match self.entries.remove(&(leader, request_id)) {
+            Some(inserted) => now.saturating_duration_since(inserted) < REQUEST_TTL,
+            None => false,
+        }
+    }
+
+    /// Drop every entry recorded against `leader`. Called when
+    /// the believed leader changes so a re-elected peer doesn't
+    /// inherit the prior leader's in-flight token set.
+    pub fn clear_leader(&mut self, leader: NodeId) {
+        self.entries.retain(|(l, _), _| *l != leader);
+    }
+}
+
+impl CatchupBackoff {
+    /// Construct an empty backoff tracker.
+    pub fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record an empty `SyncResponse` from `leader` (events vec was
+    /// empty or apply returned the same tail). Increments the
+    /// consecutive counter; once past `CATCHUP_BACKOFF_THRESHOLD`,
+    /// stamps `backoff_until = now + min(initial << k, cap)` where
+    /// `k = consecutive_empty - threshold - 1`.
+    pub fn record_empty(&mut self, leader: NodeId, now: Instant) {
+        let entry = self.entries.entry(leader).or_default();
+        entry.consecutive_empty = entry.consecutive_empty.saturating_add(1);
+        if entry.consecutive_empty > CATCHUP_BACKOFF_THRESHOLD {
+            let shift = entry
+                .consecutive_empty
+                .saturating_sub(CATCHUP_BACKOFF_THRESHOLD + 1)
+                .min(20);
+            let multiplier: u32 = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+            let backoff = CATCHUP_BACKOFF_INITIAL
+                .saturating_mul(multiplier)
+                .min(CATCHUP_BACKOFF_CAP);
+            entry.backoff_until = Some(now + backoff);
+        }
+    }
+
+    /// Record a productive response (events applied, tail advanced)
+    /// from `leader`. Clears any backoff state so the next request
+    /// can fire immediately.
+    pub fn record_progress(&mut self, leader: NodeId) {
+        self.entries.remove(&leader);
+    }
+
+    /// True when `now` is strictly before the recorded
+    /// `backoff_until` for `leader`. Out-of-backoff leaders (no
+    /// entry, or entry below threshold) always return `false`.
+    pub fn is_in_backoff(&self, leader: NodeId, now: Instant) -> bool {
+        self.entries
+            .get(&leader)
+            .and_then(|e| e.backoff_until)
+            .is_some_and(|until| now < until)
+    }
+
+    /// Drop entries for leaders whose backoff window expired more
+    /// than `cap` ago. Called from `on_tick` to keep the map
+    /// bounded under leader churn: a leader demoted after
+    /// accruing strikes never has `record_progress` called for it
+    /// again, so without expiry the entry persists indefinitely.
+    /// Below-threshold entries (no `backoff_until` stamp) are
+    /// retained — they represent active counting state.
+    pub fn gc_expired(&mut self, now: Instant, cap: Duration) {
+        self.entries.retain(|_, e| match e.backoff_until {
+            Some(until) => now.saturating_duration_since(until) < cap,
+            None => true,
+        });
+    }
+}
+
 impl Drop for ReplicationRuntimeHandle {
     /// Best-effort cleanup if a handle is dropped without an
     /// explicit `cancel().await`. Aborts the task synchronously so
@@ -344,8 +566,18 @@ impl Drop for ReplicationRuntimeHandle {
     /// that need the announce/withdraw side-effects to land must
     /// still `cancel().await` before drop.
     fn drop(&mut self) {
-        if let Some(h) = self.task.lock().take() {
-            h.abort();
+        // try_lock — pre-fix this took the parking_lot mutex
+        // unconditionally; on a single-thread runtime panic during
+        // shutdown, drop could fire on a thread already holding
+        // self.task (e.g. mid-cancel() when the future is dropped on
+        // panic), producing a deadlock. The best-effort abort can
+        // wait for the next normal cleanup if we lose the lock race
+        // — losing it means somebody else is already inside cancel()
+        // or another drop, and they will abort/await the task.
+        if let Some(mut guard) = self.task.try_lock() {
+            if let Some(h) = guard.take() {
+                h.abort();
+            }
         }
     }
 }
@@ -356,6 +588,27 @@ impl Drop for ReplicationRuntimeHandle {
 /// dispatcher's `try_dispatch` returns the event back and the
 /// caller (mesh dispatch loop) drops + logs.
 pub const RUNTIME_INBOX_CAPACITY: usize = 1024;
+
+/// Per-channel mutable state the runtime task threads through
+/// `on_tick` / `on_inbound`. Replaces the four-`Arc<Mutex<…>>` arg
+/// soup that pushed those functions over clippy's
+/// `too_many_arguments` limit. All four members are reference-
+/// counted internally so cloning the struct is a handful of
+/// atomic increments — cheap and lock-free.
+struct RuntimeState {
+    tracker: Arc<Mutex<HeartbeatTracker>>,
+    budget: Arc<Mutex<BandwidthBudget>>,
+    backoff: Arc<Mutex<CatchupBackoff>>,
+    outstanding: Arc<Mutex<OutstandingRequests>>,
+}
+
+/// Priority-lane inbox capacity. Smaller than the standard lane
+/// because the events that ride it (Shutdown, SyncResponse,
+/// SyncNack) are bounded by the local replica's in-flight
+/// catchup window plus a handful of NACKs — not a per-peer
+/// heartbeat flood. Sized to absorb a burst without back-
+/// pressuring the leader-side dispatcher.
+pub const RUNTIME_PRIORITY_INBOX_CAPACITY: usize = 128;
 
 /// Spawn a per-channel replication runtime task. Returns a
 /// handle the mesh dispatcher uses to push inbound events and
@@ -391,19 +644,26 @@ pub fn spawn_replication_runtime(
     dispatcher: Arc<dyn ReplicationDispatcher>,
     budget: Arc<Mutex<BandwidthBudget>>,
 ) -> ReplicationRuntimeHandle {
-    let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(inputs.heartbeat_ms)));
+    let state = RuntimeState {
+        tracker: Arc::new(Mutex::new(HeartbeatTracker::new(inputs.heartbeat_ms))),
+        budget,
+        backoff: Arc::new(Mutex::new(CatchupBackoff::new())),
+        outstanding: Arc::new(Mutex::new(OutstandingRequests::new())),
+    };
     let (tx, rx) = mpsc::channel::<Inbound>(RUNTIME_INBOX_CAPACITY);
+    let (priority_tx, priority_rx) = mpsc::channel::<Inbound>(RUNTIME_PRIORITY_INBOX_CAPACITY);
     let coordinator_for_task = coordinator.clone();
     let task = tokio::spawn(run(
         inputs,
         coordinator_for_task,
         dispatcher,
-        tracker,
-        budget,
+        state,
         rx,
+        priority_rx,
     ));
     ReplicationRuntimeHandle {
         inbox: tx,
+        priority_inbox: priority_tx,
         task: Mutex::new(Some(task)),
         coordinator,
         stopped: AtomicBool::new(false),
@@ -414,9 +674,9 @@ async fn run(
     inputs: RuntimeInputs,
     coordinator: Arc<ReplicationCoordinator>,
     dispatcher: Arc<dyn ReplicationDispatcher>,
-    tracker: Arc<Mutex<HeartbeatTracker>>,
-    budget: Arc<Mutex<BandwidthBudget>>,
+    state: RuntimeState,
     mut inbox: mpsc::Receiver<Inbound>,
+    mut priority_inbox: mpsc::Receiver<Inbound>,
 ) {
     let heartbeat_interval = Duration::from_millis(inputs.heartbeat_ms);
     let mut interval = tokio::time::interval(heartbeat_interval);
@@ -430,14 +690,17 @@ async fn run(
     interval.tick().await;
 
     loop {
+        // `biased;` makes tokio::select poll branches top-to-
+        // bottom rather than randomly. Priority lane is checked
+        // first, then the tick, then the low-priority lane. A
+        // heartbeat flood saturating the low-priority lane can't
+        // starve SyncResponse / SyncNack / Shutdown — they ride
+        // the priority lane and get drained ahead of the flood.
         tokio::select! {
-            _ = interval.tick() => {
-                on_tick(&inputs, &coordinator, &dispatcher, &tracker).await;
-            }
-            event = inbox.recv() => {
+            biased;
+            event = priority_inbox.recv() => {
                 match event {
                     Some(Inbound::Shutdown) | None => {
-                        // Run the graceful-shutdown transition + bail.
                         let _ = coordinator
                             .transition_to(
                                 ReplicaRole::Idle,
@@ -447,7 +710,30 @@ async fn run(
                         return;
                     }
                     Some(event) => {
-                        on_inbound(&inputs, &coordinator, &dispatcher, &tracker, &budget, event).await;
+                        on_inbound(&inputs, &coordinator, &dispatcher, &state, event).await;
+                    }
+                }
+            }
+            _ = interval.tick() => {
+                on_tick(&inputs, &coordinator, &dispatcher, &state).await;
+            }
+            event = inbox.recv() => {
+                match event {
+                    Some(Inbound::Shutdown) | None => {
+                        // Shutdown normally rides the priority lane;
+                        // a None here means the low-priority sender
+                        // dropped (caller closed the handle without
+                        // calling cancel). Treat as graceful exit.
+                        let _ = coordinator
+                            .transition_to(
+                                ReplicaRole::Idle,
+                                super::replication_state::TransitionSignal::ChannelClose,
+                            )
+                            .await;
+                        return;
+                    }
+                    Some(event) => {
+                        on_inbound(&inputs, &coordinator, &dispatcher, &state, event).await;
                     }
                 }
             }
@@ -509,14 +795,92 @@ fn observe_lag(
     }
 }
 
+/// Drop the believed-leader belief AND the outstanding-request
+/// tokens recorded against that leader. Sites that previously
+/// only called `clear_believed_leader` would leave the prior
+/// leader's in-flight tokens in `OutstandingRequests` until TTL
+/// (30 s). Under role thrash or rapid leader churn, the soft-cap
+/// GC then evicted entries from OTHER leaders to make room — the
+/// documented invariant on `OutstandingRequests::clear_leader`.
+fn clear_leader_belief_and_tokens(
+    tracker: &Arc<Mutex<HeartbeatTracker>>,
+    outstanding: &Arc<Mutex<OutstandingRequests>>,
+) {
+    let prior = tracker.lock().believed_leader();
+    tracker.lock().clear_believed_leader();
+    if let Some(prior) = prior {
+        outstanding.lock().clear_leader(prior);
+    }
+}
+
 async fn on_tick(
     inputs: &RuntimeInputs,
     coordinator: &Arc<ReplicationCoordinator>,
     dispatcher: &Arc<dyn ReplicationDispatcher>,
-    tracker: &Arc<Mutex<HeartbeatTracker>>,
+    state: &RuntimeState,
 ) {
-    let now = Instant::now();
+    let RuntimeState {
+        tracker,
+        budget: _,
+        backoff,
+        outstanding,
+    } = state;
+    // Source `now` from tokio's clock so the silence-detection
+    // pass inside the tracker tick honors tokio::time::pause() in
+    // tests and stays coherent with the tokio::time::interval that
+    // drives this on_tick call. Pre-fix std::Instant::now() kept
+    // moving while virtual time was paused.
+    let now = tokio::time::Instant::now().into_std();
+    // Drop CatchupBackoff entries whose backoff window expired
+    // more than a cap ago — protects the map from unbounded
+    // growth under leader churn (a demoted leader's entry has
+    // no other clearance path; `record_progress` only fires for
+    // the current believed leader).
+    backoff
+        .lock()
+        .gc_expired(now, CATCHUP_BACKOFF_CAP.saturating_mul(2));
     let tail_seq = (inputs.tail_provider)();
+    // Bump the coordinator's cached tail at every tick so the next
+    // transition's announce_chain advertises the real tip. The
+    // CAS-monotonic guard inside record_tail_seq drops the write if
+    // tail_provider went backward (it shouldn't — tail_provider
+    // wraps next_seq()), so this is also idempotent. Without this
+    // the leader path's tail_seq atomic stays at the value the
+    // last apply_sync_response recorded (which only Replicas run),
+    // and a leader's announce_chain at promotion time ships
+    // tip_seq=0.
+    //
+    // For the LEADER role specifically, `tail_provider` returns the
+    // raw local-file `next_seq()`, which the leader bumps the moment
+    // a write lands locally — pre-replication. Advertising that
+    // value via capability tags biases `find_chain_holders` (which
+    // picks the freshest holder by `tip_seq` during failover)
+    // toward a partition that may have un-replicated writes; a
+    // crash before those writes ship loses them.
+    //
+    // Clamp the advertised tail to the highest tail any peer has
+    // confirmed via heartbeat. That tail is, by construction,
+    // "replicated at least once" — a safe minimum for failover
+    // discovery. When NO peer has reported yet (fresh leader, no
+    // replicas), fall back to the raw local tail: there is no
+    // safer value to advertise and a sole leader has authority
+    // over its own writes by tautology.
+    let advertised_tail = if coordinator.role() == ReplicaRole::Leader {
+        let max_peer_tail = tracker
+            .lock()
+            .peer_tail_seqs()
+            .into_iter()
+            .filter(|(id, _)| *id != inputs.self_node_id)
+            .map(|(_, t)| t)
+            .max();
+        match max_peer_tail {
+            Some(p) => tail_seq.min(p),
+            None => tail_seq,
+        }
+    } else {
+        tail_seq
+    };
+    coordinator.record_tail_seq(advertised_tail);
     let wall_clock_ms = (inputs.wall_clock_provider)();
     // R-10: capture `current_role` inside the same critical
     // section that holds the tracker lock so a concurrent
@@ -567,7 +931,44 @@ async fn on_tick(
                     tracing::trace!(target=?target, error=?e, "replication: heartbeat send failed");
                 }
             }
-            OutboundMessage::SyncRequest { target, msg } => {
+            OutboundMessage::SyncRequest { target, mut msg } => {
+                // R-28 catchup backoff: a buggy/byzantine leader that
+                // advertises an ever-growing tail but ships empty
+                // responses would otherwise loop this branch at the
+                // heartbeat cadence forever. Once the empty-response
+                // count crosses `CATCHUP_BACKOFF_THRESHOLD` (3), the
+                // tracker stamps `backoff_until`; ticks within that
+                // window skip the send entirely. A non-empty response
+                // resets the counter through `record_progress` on the
+                // apply path.
+                if backoff.lock().is_in_backoff(target, now) {
+                    tracing::trace!(
+                        target = target,
+                        "replication: skipping SyncRequest — leader is in catchup backoff"
+                    );
+                    continue;
+                }
+                // R-23 request-token correlation. `tick` emits the
+                // SyncRequest with `request_id = 0` placeholder; the
+                // runtime mints a random 64-bit token from
+                // `getrandom` here, records `(leader, token)` in the
+                // outstanding-requests set, and stamps the wire frame
+                // with the minted value before send. Inbound
+                // SyncResponse / SyncNack must carry a token still
+                // in the set; stale responses (re-issue races, late-
+                // arriving NACKs from prior requests the replica
+                // already timed out) drop on the apply path.
+                let mut id_bytes = [0u8; 8];
+                if getrandom::fill(&mut id_bytes).is_err() {
+                    tracing::trace!(
+                        target = target,
+                        "replication: getrandom failure; skipping SyncRequest this tick"
+                    );
+                    continue;
+                }
+                let token = u64::from_le_bytes(id_bytes);
+                msg.request_id = token;
+                outstanding.lock().record(target, token, now);
                 if let Err(e) = dispatcher.send_sync_request(target, msg).await {
                     tracing::trace!(target=?target, error=?e, "replication: sync_request send failed");
                 }
@@ -608,7 +1009,7 @@ async fn on_tick(
                         // Shutdown drove us to Idle first), wiping
                         // the believed leader would leave the
                         // coordinator with no recovery signal.
-                        tracker.lock().clear_believed_leader();
+                        clear_leader_belief_and_tokens(tracker, outstanding);
                     }
                     Err(CoordinatorError::TagSink(e)) => {
                         // State moved to the target (Leader /
@@ -626,7 +1027,7 @@ async fn on_tick(
                             target = ?pt.target,
                             "replication: post-election chain-tag side-effect failed; state advanced"
                         );
-                        tracker.lock().clear_believed_leader();
+                        clear_leader_belief_and_tokens(tracker, outstanding);
                     }
                     Err(CoordinatorError::Transition(e)) => {
                         // State did not move (typically because a
@@ -640,7 +1041,7 @@ async fn on_tick(
                             target = ?pt.target,
                             "replication: post-election transition rejected; state moved out from under us"
                         );
-                        tracker.lock().clear_believed_leader();
+                        clear_leader_belief_and_tokens(tracker, outstanding);
                     }
                 }
             }
@@ -648,14 +1049,50 @@ async fn on_tick(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn on_inbound(
     inputs: &RuntimeInputs,
     coordinator: &Arc<ReplicationCoordinator>,
     dispatcher: &Arc<dyn ReplicationDispatcher>,
-    tracker: &Arc<Mutex<HeartbeatTracker>>,
-    budget: &Arc<Mutex<BandwidthBudget>>,
+    state: &RuntimeState,
     event: Inbound,
 ) {
+    let RuntimeState {
+        tracker,
+        budget,
+        backoff,
+        outstanding,
+    } = state;
+    // Peer-auth gate. Every inbound replication message must come
+    // from a peer in the channel's configured replica_set; any
+    // other sender has no business driving the state machine for
+    // this channel. Pre-fix the handlers below only checked the
+    // channel_id, so any mesh peer with SUBPROTOCOL_REDEX reach
+    // could ship Heartbeat / SyncRequest / SyncResponse / SyncNack
+    // and the runtime would apply them. SyncResponse hijack was
+    // the worst case — a non-leader peer could write attacker-
+    // chosen bytes to the replica's local log via append_batch.
+    //
+    // Shutdown is local-only (never crosses the wire), so it
+    // bypasses the membership check; the from field on a Shutdown
+    // event is the local node's id.
+    let from_node = match &event {
+        Inbound::Shutdown => None,
+        Inbound::Heartbeat { from, .. } => Some(*from),
+        Inbound::SyncRequest { from, .. } => Some(*from),
+        Inbound::SyncResponse { from, .. } => Some(*from),
+        Inbound::SyncNack { from, .. } => Some(*from),
+    };
+    if let Some(from) = from_node {
+        if !inputs.replica_set.contains(&from) {
+            tracing::trace!(
+                from = from,
+                channel = ?inputs.channel_id,
+                "replication: dropping inbound from peer not in replica_set"
+            );
+            return;
+        }
+    }
     match event {
         Inbound::Shutdown => {
             // Handled by the main loop; never reaches here.
@@ -673,9 +1110,54 @@ async fn on_inbound(
                 );
                 return;
             }
-            tracker
-                .lock()
-                .record_heartbeat(from, msg.role, msg.tail_seq, Instant::now());
+            // Source from tokio's clock so silence detection works
+            // under tokio::time::pause() — std::Instant::now()
+            // wouldn't advance with virtual time and the tick-driven
+            // silence check would never fire deterministically.
+            tracker.lock().record_heartbeat(
+                from,
+                msg.role,
+                msg.tail_seq,
+                tokio::time::Instant::now().into_std(),
+            );
+            // Dual-leader convergence. A symmetric-RTT election or
+            // a partition heal can leave two peers both believing
+            // they are Leader for the same channel. Without
+            // convergence, both partitions keep writing — divergent
+            // histories accrete and `apply_sync_response` eventually
+            // logs `GapBeforeChunk{divergence_suspected:true}` while
+            // `skip_to` silently overwrites the loser's tail.
+            //
+            // On any inbound Heartbeat with role=Leader while self
+            // is Leader, run the deterministic tiebreak: the side
+            // with the higher tail_seq keeps Leader; on a tie, the
+            // numerically smaller node_id keeps Leader. The loser
+            // concedes via `Leader → Replica` so the next tick
+            // re-resolves through the heartbeat cycle.
+            if msg.role == ReplicaRole::Leader
+                && coordinator.role() == ReplicaRole::Leader
+                && from != inputs.self_node_id
+            {
+                let local_tail = (inputs.tail_provider)();
+                let peer_tail = msg.tail_seq;
+                let local_wins = local_tail > peer_tail
+                    || (local_tail == peer_tail && inputs.self_node_id < from);
+                if !local_wins {
+                    tracing::warn!(
+                        from = from,
+                        peer_tail = peer_tail,
+                        local_tail = local_tail,
+                        local = inputs.self_node_id,
+                        "replication: peer-leader observed; conceding via Leader → Replica"
+                    );
+                    let _ = coordinator
+                        .transition_to(
+                            ReplicaRole::Replica,
+                            super::replication_state::TransitionSignal::PeerLeaderObserved,
+                        )
+                        .await;
+                }
+            }
         }
         Inbound::SyncRequest { from, msg } => {
             // R-12: defense-in-depth — validate channel_id at the
@@ -697,6 +1179,8 @@ async fn on_inbound(
                     channel_id: inputs.channel_id,
                     since_seq: msg.since_seq,
                     error_code: super::replication::SyncNackError::NotLeader,
+                    leader_first_retained_seq: 0,
+                    request_id: msg.request_id,
                     detail: String::new(),
                 };
                 if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
@@ -713,13 +1197,15 @@ async fn on_inbound(
                     // Backpressure so the replica backs off.
                     let admitted = {
                         let mut bb = budget.lock();
-                        bb.try_consume(byte_estimate, Instant::now())
+                        bb.try_consume(byte_estimate, tokio::time::Instant::now().into_std())
                     };
                     if !admitted {
                         let nack = SyncNack {
                             channel_id: inputs.channel_id,
                             since_seq: msg.since_seq,
                             error_code: super::replication::SyncNackError::Backpressure,
+                            leader_first_retained_seq: 0,
+                            request_id: msg.request_id,
                             detail: String::new(),
                         };
                         if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
@@ -738,6 +1224,8 @@ async fn on_inbound(
                             channel_id: inputs.channel_id,
                             since_seq: msg.since_seq,
                             error_code: super::replication::SyncNackError::NotLeader,
+                            leader_first_retained_seq: 0,
+                            request_id: msg.request_id,
                             detail: String::new(),
                         };
                         if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
@@ -751,14 +1239,44 @@ async fn on_inbound(
                     // would still have been read off disk).
                     coordinator.metrics().incr_sync_bytes(byte_estimate);
                     if let Err(e) = dispatcher.send_sync_response(from, resp).await {
+                        // Refund the budget — pre-fix repeated
+                        // send failures over a flaky link drained
+                        // the bucket toward permanent backpressure
+                        // without shipping any traffic. The cumul-
+                        // ative bytes metric stays incremented
+                        // (operators still see "we tried to send
+                        // these bytes") but the rate budget can
+                        // recover.
+                        //
+                        // Per the dispatcher trait's `Ok(())`
+                        // semantics: a transport that returns
+                        // `Ok(())` after queueing-without-delivery
+                        // (UDP, lossy QUIC under link failure) will
+                        // NOT trigger this refund and the budget
+                        // over-counts on silent loss. R-28
+                        // catchup-backoff dampens the wedged-link
+                        // case once empty responses accrue past
+                        // threshold, but the budget itself cannot
+                        // self-correct without an end-to-end ack
+                        // the trait deliberately does not demand.
+                        {
+                            let mut bb = budget.lock();
+                            bb.refund(byte_estimate);
+                        }
                         tracing::trace!(from = from, error = ?e, "replication: SyncResponse send failed");
                     }
                 }
-                SyncRequestOutcome::Nack { error_code, detail } => {
+                SyncRequestOutcome::Nack {
+                    error_code,
+                    leader_first_retained_seq,
+                    detail,
+                } => {
                     let nack = SyncNack {
                         channel_id: inputs.channel_id,
                         since_seq: msg.since_seq,
                         error_code,
+                        leader_first_retained_seq,
+                        request_id: msg.request_id,
                         detail,
                     };
                     if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
@@ -777,6 +1295,57 @@ async fn on_inbound(
                 );
                 return;
             }
+            // R-23 request-token correlation. The replica's
+            // outstanding-request set tracks `(leader, request_id)`
+            // tuples for every SyncRequest the runtime has shipped.
+            // A response whose `request_id` is not in the set is
+            // stale (the replica timed out and re-issued) or
+            // forged (leader echoed a non-matching token). Drop
+            // without applying so a stale chunk can't land on the
+            // current request's apply path.
+            //
+            // Take FIRST, before the role / believed-leader gates,
+            // so a response that arrives while we're briefly out
+            // of `Replica` (role thrash, post-election) still
+            // consumes its outstanding-token entry. Pre-fix the
+            // role gate returned early without `take`, and the
+            // token sat in the per-leader set until TTL (30 s) —
+            // under role thrash the SOFT_CAP GC then dropped
+            // entries from OTHER leaders to make room, evicting
+            // legitimately in-flight tokens.
+            //
+            // Consuming a token in the dropped-response path is
+            // safe: request_ids are random 64-bit (collision
+            // negligible), so a subsequent re-issue uses a fresh
+            // id and the consumed entry isn't reachable.
+            {
+                let now = tokio::time::Instant::now().into_std();
+                if !outstanding.lock().take(from, msg.request_id, now) {
+                    tracing::trace!(
+                        from = from,
+                        request_id = msg.request_id,
+                        "replication: dropping SyncResponse with unknown request_id"
+                    );
+                    return;
+                }
+            }
+            // SyncResponse is the state-mutating wire input — only
+            // the believed leader is allowed to ship it. A peer that
+            // is in the replica_set but is not the current leader
+            // could otherwise forge `append_batch`-bound payloads
+            // into a replica's log. The replica_set gate at entry
+            // narrows the surface to configured members; the
+            // believed_leader gate here narrows further to the
+            // single peer the replica is currently following.
+            let leader_belief = tracker.lock().believed_leader();
+            if leader_belief != Some(from) {
+                tracing::trace!(
+                    from = from,
+                    believed_leader = ?leader_belief,
+                    "replication: dropping SyncResponse from non-leader peer"
+                );
+                return;
+            }
             // Replica-side: apply the chunk to our local file.
             // Only honor responses when we believe we're a
             // Replica — other roles ignore them.
@@ -788,8 +1357,72 @@ async fn on_inbound(
                 );
                 return;
             }
+            // Snapshot the pre-apply tail so the post-apply
+            // result can be classified as "empty" (apply returned
+            // the same tail, no events landed) vs "progress"
+            // (tail advanced). Drives the R-28 catchup-backoff
+            // accounting below.
+            let pre_apply_tail = inputs.file.next_seq();
             match apply_sync_response(&inputs.file, &msg, inputs.channel_id) {
                 Ok(new_tail) => {
+                    // Record the post-apply tail on the coordinator
+                    // so capability-tag advertisements ride
+                    // `tip_seq=new_tail` instead of the dead-default
+                    // 0. find_chain_holders picks the freshest
+                    // holder by tip_seq during failover; pre-fix
+                    // every Leader/Replica advertised tip_seq=0
+                    // and lex-smallest holder won selection.
+                    coordinator.record_tail_seq(new_tail);
+                    // R-28 catchup-backoff accounting. If the
+                    // response advanced our tail, the leader is
+                    // making progress — clear any backoff state so
+                    // the next tick can issue another SyncRequest
+                    // immediately. If the response was empty
+                    // (apply returned the same tail) while the
+                    // leader's advertised tail is still strictly
+                    // greater than ours, record an empty strike.
+                    // After `CATCHUP_BACKOFF_THRESHOLD` consecutive
+                    // empties, the tracker stamps a backoff window
+                    // that the outbound dispatch consults.
+                    if new_tail > pre_apply_tail {
+                        backoff.lock().record_progress(from);
+                    } else {
+                        // Pre-fix the strike fired whenever the
+                        // CACHED heartbeat tail was still above ours
+                        // — the cached value can be hundreds of ms
+                        // stale, so a replica that caught up between
+                        // the heartbeat and the response would
+                        // strike against a leader that has nothing
+                        // to send. After
+                        // `CATCHUP_BACKOFF_THRESHOLD` such false
+                        // strikes the leader sat in a 1–30 s
+                        // backoff while nothing was actually wrong.
+                        //
+                        // Guard the strike on heartbeat freshness:
+                        // only when the leader's most recent
+                        // heartbeat is inside the miss-threshold
+                        // window do we trust its claimed `tail_seq`
+                        // as evidence the leader has more data to
+                        // ship. A stale heartbeat is no signal —
+                        // skip the strike entirely.
+                        let now = tokio::time::Instant::now().into_std();
+                        let strike = {
+                            let t = tracker.lock();
+                            let peer = t.peer_state(from);
+                            let lag = t.peer_lag(from, now);
+                            let fresh_window = std::time::Duration::from_millis(
+                                t.heartbeat_ms().saturating_mul(t.miss_threshold() as u64),
+                            );
+                            matches!(
+                                (peer, lag),
+                                (Some(p), Some(elapsed))
+                                    if elapsed < fresh_window && p.tail_seq > new_tail
+                            )
+                        };
+                        if strike {
+                            backoff.lock().record_empty(from, now);
+                        }
+                    }
                     tracing::trace!(
                         from = from,
                         new_tail = new_tail,
@@ -853,6 +1486,7 @@ async fn on_inbound(
                             // tail matches first_seq.
                             match apply_sync_response(&inputs.file, &msg, inputs.channel_id) {
                                 Ok(new_tail) => {
+                                    coordinator.record_tail_seq(new_tail);
                                     tracing::trace!(
                                         from = from,
                                         new_tail = new_tail,
@@ -901,6 +1535,39 @@ async fn on_inbound(
                 );
                 return;
             }
+            // Only the believed leader can NACK; otherwise a non-
+            // leader replica_set peer could spam NotLeader nacks to
+            // make us clear our believed_leader, or BadRange to
+            // skip-ahead our local file's tail past in-flight
+            // events. The replica_set gate at entry handles
+            // outsider rejection; this narrows further to the
+            // single peer the replica is currently following.
+            let leader_belief = tracker.lock().believed_leader();
+            if leader_belief != Some(from) {
+                tracing::trace!(
+                    from = from,
+                    believed_leader = ?leader_belief,
+                    "replication: dropping SyncNack from non-leader peer"
+                );
+                return;
+            }
+            // R-23 request-token correlation. A NACK with a token
+            // not in the outstanding set is stale (from a request
+            // the replica already timed out) — the BadRange arm
+            // below mutates the local file via skip_to, and a
+            // stale BadRange could destroy data on retry. Drop
+            // unmatched NACKs.
+            {
+                let now = tokio::time::Instant::now().into_std();
+                if !outstanding.lock().take(from, msg.request_id, now) {
+                    tracing::trace!(
+                        from = from,
+                        request_id = msg.request_id,
+                        "replication: dropping SyncNack with unknown request_id"
+                    );
+                    return;
+                }
+            }
             // Replicas key their retry policy on `error_code`.
             // Phase D §2 retry policy:
             //   1 NotLeader   → re-resolve leader (clear tracker
@@ -917,39 +1584,40 @@ async fn on_inbound(
                     // the next tick re-resolves via the heartbeat
                     // cycle instead of looping on the stale leader
                     // belief until 3 missed heartbeats trip.
-                    tracker.lock().clear_believed_leader();
+                    clear_leader_belief_and_tokens(tracker, outstanding);
                     tracing::trace!(
                         from = from,
                         "replication: NACK NotLeader — cleared believed leader"
                     );
                 }
                 SyncNackError::BadRange => {
-                    // R-4: skip-ahead path — the leader's retention
-                    // trimmed past our local tail. The NACK carries
-                    // `since_seq` (what the replica requested) but
-                    // not the leader's actual first retained seq,
-                    // so the cleanest recovery is: clear our local
-                    // tail so the next SyncRequest re-issues from
-                    // 0; the leader's response will then carry
-                    // first_seq > 0 and the replica skips through
-                    // the GapBeforeChunk path. Bump the metric so
-                    // operators can see the retention-skew
-                    // recovery happening.
+                    // R-40: skip directly to the leader's
+                    // first-retained seq carried in the NACK. Pre-
+                    // fix the replica advanced one seq per round
+                    // trip (skip_to(since_seq + 1)) which thrashed
+                    // when the retention floor was many seqs above
+                    // `since_seq` — every retry re-asked below the
+                    // floor and re-NACKed. With the wire field, one
+                    // round trip suffices: `skip_to(leader_first_
+                    // retained_seq)` puts local tail at the floor
+                    // and the next SyncRequest re-asks exactly
+                    // there. Fall back to `since_seq + 1` if the
+                    // leader sent `0` (legacy / never-retained
+                    // channels) so an out-of-band sender can't
+                    // make us no-op on the retry.
                     coordinator.metrics().incr_skip_ahead();
-                    // The cleanest "trim local tail" we can do
-                    // without knowing the leader's first available
-                    // seq is `skip_to(msg.since_seq + 1)` — the
-                    // replica had asked for `since_seq` so anything
-                    // <= since_seq is gone on the leader. Bumping
-                    // local next_seq forward forces the next
-                    // SyncRequest to ask above the bad range.
-                    // On persistent files skip_to is unsupported;
-                    // fall back to the heartbeat-cycle retry.
-                    match inputs.file.skip_to(msg.since_seq.saturating_add(1)) {
+                    let target = if msg.leader_first_retained_seq > 0 {
+                        msg.leader_first_retained_seq
+                    } else {
+                        msg.since_seq.saturating_add(1)
+                    };
+                    match inputs.file.skip_to(target) {
                         Ok(()) => tracing::warn!(
                             from = from,
                             since_seq = msg.since_seq,
-                            "replication: NACK BadRange — local tail skipped past trimmed range"
+                            leader_first_retained_seq = msg.leader_first_retained_seq,
+                            target = target,
+                            "replication: NACK BadRange — local tail skipped to leader's first-retained seq"
                         ),
                         Err(e) => tracing::trace!(
                             from = from,
@@ -1040,11 +1708,15 @@ async fn handle_disk_pressure(
                     // counters twice on a benign race.
                     super::replication_state::TransitionSignal::ChannelClose
                 }
-                ReplicaRole::Leader | ReplicaRole::Candidate => {
-                    // Disk pressure observed from a non-Replica
-                    // role — withdraw via ChannelClose, the only
-                    // signal valid from any state.
-                    super::replication_state::TransitionSignal::ChannelClose
+                ReplicaRole::Leader => {
+                    // Role-specific signal so the transition metric
+                    // labels this as disk-pressure withdraw instead
+                    // of the ChannelClose fallback (which operator
+                    // dashboards triage as "graceful channel close").
+                    super::replication_state::TransitionSignal::LeaderDiskPressureWithdraw
+                }
+                ReplicaRole::Candidate => {
+                    super::replication_state::TransitionSignal::CandidateDiskPressureWithdraw
                 }
             };
             if let Err(e) = coordinator.transition_to(ReplicaRole::Idle, signal).await {
@@ -1205,6 +1877,27 @@ mod tests {
         Arc::new(Mutex::new(BandwidthBudget::new(0.5, 10_000_000, now)))
     }
 
+    fn build_backoff() -> Arc<Mutex<CatchupBackoff>> {
+        Arc::new(Mutex::new(CatchupBackoff::new()))
+    }
+
+    /// Bundle the four per-channel state pieces into the
+    /// `RuntimeState` the on_tick / on_inbound functions take.
+    /// Tests construct tracker + budget explicitly; backoff and
+    /// outstanding are stock fresh instances. Pre-refactor these
+    /// were passed as four separate arguments.
+    fn build_state(
+        tracker: Arc<Mutex<HeartbeatTracker>>,
+        budget: Arc<Mutex<BandwidthBudget>>,
+    ) -> RuntimeState {
+        RuntimeState {
+            tracker,
+            budget,
+            backoff: Arc::new(Mutex::new(CatchupBackoff::new())),
+            outstanding: Arc::new(Mutex::new(OutstandingRequests::new())),
+        }
+    }
+
     #[tokio::test]
     async fn leader_emits_heartbeat_to_peers_each_tick() {
         let inputs = build_inputs(0x10, vec![0x10, 0x20, 0x30], 100);
@@ -1295,6 +1988,120 @@ mod tests {
         let _heartbeats = dispatcher.heartbeats.lock().clone();
         // The coordinator stays in Replica.
         handle.cancel().await;
+    }
+
+    /// R-21 regression: when a Leader observes another peer also
+    /// claiming Leader for the same channel, the deterministic
+    /// tiebreak demotes the loser to Replica so the partition heal
+    /// converges to one leader. Without `Leader → Replica`, both
+    /// partitions stay Leader permanently and accrete divergent
+    /// histories silently overwritten via `skip_to`.
+    #[tokio::test]
+    async fn peer_leader_observation_demotes_loser_to_replica() {
+        // Local node 0x10 has tail_seq 42 (from build_inputs);
+        // peer 0x20 advertises tail_seq 99 — peer wins on tail.
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 60_000);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        for (role, signal) in [
+            (
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            ),
+            (
+                ReplicaRole::Candidate,
+                super::super::replication_state::TransitionSignal::MissedHeartbeats,
+            ),
+            (
+                ReplicaRole::Leader,
+                super::super::replication_state::TransitionSignal::ElectionWon,
+            ),
+        ] {
+            coordinator.transition_to(role, signal).await.unwrap();
+        }
+        assert_eq!(coordinator.role(), ReplicaRole::Leader);
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        let budget = build_budget();
+
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &build_state(tracker.clone(), budget.clone()),
+            Inbound::Heartbeat {
+                from: 0x20,
+                msg: SyncHeartbeat {
+                    channel_id: cid,
+                    tail_seq: 99,
+                    role: ReplicaRole::Leader,
+                    wall_clock_ms: 0,
+                },
+            },
+        )
+        .await;
+
+        // Local tail 42 < peer tail 99 → local loses, demotes.
+        assert_eq!(
+            coordinator.role(),
+            ReplicaRole::Replica,
+            "Leader with lower tail must concede on PeerLeaderObserved"
+        );
+    }
+
+    /// R-21 regression: tail-tie tiebreak favors the lower node id.
+    /// Without the symmetric tiebreak the matrix could leave one
+    /// side as Leader and the other still claiming Leader after
+    /// the heal — both must agree on the winner.
+    #[tokio::test]
+    async fn peer_leader_tail_tie_lower_node_id_wins() {
+        // Local 0x10 tail = peer 0x20 tail (both 42). Local wins
+        // because 0x10 < 0x20.
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 60_000);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        for (role, signal) in [
+            (
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            ),
+            (
+                ReplicaRole::Candidate,
+                super::super::replication_state::TransitionSignal::MissedHeartbeats,
+            ),
+            (
+                ReplicaRole::Leader,
+                super::super::replication_state::TransitionSignal::ElectionWon,
+            ),
+        ] {
+            coordinator.transition_to(role, signal).await.unwrap();
+        }
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        let budget = build_budget();
+
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &build_state(tracker.clone(), budget.clone()),
+            Inbound::Heartbeat {
+                from: 0x20,
+                msg: SyncHeartbeat {
+                    channel_id: cid,
+                    tail_seq: 42,
+                    role: ReplicaRole::Leader,
+                    wall_clock_ms: 0,
+                },
+            },
+        )
+        .await;
+
+        assert_eq!(
+            coordinator.role(),
+            ReplicaRole::Leader,
+            "tail-tie tiebreak: lower node id keeps Leader"
+        );
     }
 
     #[tokio::test]
@@ -1466,6 +2273,352 @@ mod tests {
         assert!(handle.is_stopped());
         // Final state must be Idle (ChannelClose transition).
         assert_eq!(coordinator.role(), ReplicaRole::Idle);
+    }
+
+    /// Regression: a Leader's `on_tick`-driven `record_tail_seq`
+    /// must clamp the advertised tail to the highest tail any
+    /// peer has confirmed via heartbeat — never advertise
+    /// pre-replication local tail. The capability-tag layer reads
+    /// this value as `tip_seq` for `find_chain_holders` failover
+    /// selection; advertising un-replicated writes biases
+    /// failover toward a partition whose tail may not survive a
+    /// crash.
+    ///
+    /// Pre-fix: leader at local tail = 100, replica reported tail
+    /// = 50 → advertised_tail = 100.
+    /// Post-fix: advertised_tail = 50 (clamped to max peer tail).
+    #[tokio::test]
+    async fn leader_on_tick_clamps_advertised_tail_to_max_peer_tail() {
+        // Build inputs with a deterministic tail_provider returning
+        // 100 (the leader's local tail).
+        let self_id: NodeId = 0x10;
+        let peer_id: NodeId = 0x20;
+        let inputs = RuntimeInputs {
+            channel: ChannelIdentity {
+                channel_name: "test/runtime".to_string(),
+                origin_hash: 0xCAFE_BABE,
+            },
+            channel_id: channel_id_for("test/runtime"),
+            self_node_id: self_id,
+            replica_set: vec![self_id, peer_id],
+            heartbeat_ms: 100,
+            wall_clock_provider: Arc::new(|| 1_700_000_000_000),
+            // Local tail is 100 — well above what the peer has
+            // reported.
+            tail_provider: Arc::new(|| 100),
+            rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
+            file: build_file_for_tests(),
+        };
+        let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, peer_id]);
+        // Promote to Leader via the state machine.
+        for (role, signal) in [
+            (
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            ),
+            (
+                ReplicaRole::Candidate,
+                super::super::replication_state::TransitionSignal::MissedHeartbeats,
+            ),
+            (
+                ReplicaRole::Leader,
+                super::super::replication_state::TransitionSignal::ElectionWon,
+            ),
+        ] {
+            coordinator.transition_to(role, signal).await.unwrap();
+        }
+        // Seed the peer's heartbeat at tail=50 — only HALF of what
+        // the leader has locally. The other 50 events are
+        // unreplicated.
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        tracker
+            .lock()
+            .record_heartbeat(peer_id, ReplicaRole::Replica, 50, Instant::now());
+
+        let dispatcher: Arc<dyn ReplicationDispatcher> = Arc::new(RecorderDispatcher::default());
+        on_tick(
+            &inputs,
+            &coordinator,
+            &dispatcher,
+            &build_state(tracker.clone(), build_budget()),
+        )
+        .await;
+
+        // record_tail_seq is monotonic; the coordinator's cached
+        // tail should be the clamped value (50), NOT the raw
+        // local-file tail (100).
+        assert_eq!(
+            coordinator.tail_seq(),
+            50,
+            "leader must advertise the highest peer-confirmed tail (50), \
+             not the pre-replication local tail (100); pre-fix this would \
+             be 100 and a crash here would lose the 50 un-replicated events \
+             while failover discovery still thought tip_seq=100",
+        );
+    }
+
+    /// Companion: with NO peer heartbeats observed (fresh leader),
+    /// `on_tick` falls back to the raw local tail. A sole leader has
+    /// authority over its own writes by tautology — clamping to 0
+    /// would otherwise prevent any progress on a single-node
+    /// configuration.
+    #[tokio::test]
+    async fn leader_on_tick_falls_back_to_local_tail_with_no_peers() {
+        let self_id: NodeId = 0x10;
+        let peer_id: NodeId = 0x20;
+        let inputs = RuntimeInputs {
+            channel: ChannelIdentity {
+                channel_name: "test/runtime".to_string(),
+                origin_hash: 0xCAFE_BABE,
+            },
+            channel_id: channel_id_for("test/runtime"),
+            self_node_id: self_id,
+            replica_set: vec![self_id, peer_id],
+            heartbeat_ms: 100,
+            wall_clock_provider: Arc::new(|| 1_700_000_000_000),
+            tail_provider: Arc::new(|| 77),
+            rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
+            file: build_file_for_tests(),
+        };
+        let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, peer_id]);
+        for (role, signal) in [
+            (
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            ),
+            (
+                ReplicaRole::Candidate,
+                super::super::replication_state::TransitionSignal::MissedHeartbeats,
+            ),
+            (
+                ReplicaRole::Leader,
+                super::super::replication_state::TransitionSignal::ElectionWon,
+            ),
+        ] {
+            coordinator.transition_to(role, signal).await.unwrap();
+        }
+
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        let dispatcher: Arc<dyn ReplicationDispatcher> = Arc::new(RecorderDispatcher::default());
+        on_tick(
+            &inputs,
+            &coordinator,
+            &dispatcher,
+            &build_state(tracker.clone(), build_budget()),
+        )
+        .await;
+        assert_eq!(
+            coordinator.tail_seq(),
+            77,
+            "no peer heartbeats → no clamp, raw local tail is advertised",
+        );
+    }
+
+    /// Regression: empty-response backoff must NOT strike when the
+    /// leader's heartbeat is stale. Pre-fix the strike fired whenever
+    /// `tracker.peer_state(from).tail_seq > new_tail`, but
+    /// `peer_state.tail_seq` is the cached value from the last
+    /// received heartbeat — minutes-stale in a degenerate case. A
+    /// replica that caught up between an old heartbeat and the
+    /// current response struck against a leader that had nothing
+    /// to send. After `CATCHUP_BACKOFF_THRESHOLD` such false
+    /// strikes the leader sat in a 1–30 s backoff while nothing
+    /// was actually wrong.
+    ///
+    /// Post-fix: skip the strike when the heartbeat is older than
+    /// the miss-threshold window — a stale heartbeat is no signal.
+    #[tokio::test]
+    async fn empty_response_does_not_strike_on_stale_heartbeat() {
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 100);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        coordinator
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let budget = build_budget();
+        let backoff = build_backoff();
+        let outstanding = Arc::new(Mutex::new(OutstandingRequests::new()));
+
+        // Seed the tracker with a STALE heartbeat: leader 0x20
+        // claimed tail=200 well outside the miss-threshold window
+        // (heartbeat_ms = 100, miss_threshold defaults to 3 ⇒ a
+        // last_seen older than 300 ms is stale). Build the
+        // heartbeat with a `last_seen` from 10 seconds ago so it's
+        // definitively stale by the time on_inbound runs.
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        let stale_when = Instant::now() - Duration::from_secs(10);
+        tracker
+            .lock()
+            .record_heartbeat(0x20, ReplicaRole::Leader, 200, stale_when);
+
+        // Pre-record the request so the binding gate admits the
+        // response.
+        outstanding.lock().record(0x20, 0, Instant::now());
+
+        // Empty SyncResponse from the (now-stale-heartbeat) leader.
+        // The local file is empty (next_seq = 0); apply on an empty
+        // response leaves next_seq = 0, so `new_tail == pre_apply_tail`.
+        let event = Inbound::SyncResponse {
+            from: 0x20,
+            msg: SyncResponse {
+                channel_id: cid,
+                first_seq: 0,
+                leader_first_retained_seq: 0,
+                events: Vec::new(),
+                request_id: 0,
+            },
+        };
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &RuntimeState {
+                tracker: tracker.clone(),
+                budget: budget.clone(),
+                backoff: backoff.clone(),
+                outstanding: outstanding.clone(),
+            },
+            event,
+        )
+        .await;
+
+        // Pre-fix: backoff would have recorded an empty strike
+        // because `peer_state.tail_seq (200) > new_tail (0)`.
+        // Post-fix: stale heartbeat → no strike, no backoff state.
+        assert!(
+            !backoff.lock().is_in_backoff(0x20, Instant::now()),
+            "stale-heartbeat empty must NOT engage backoff"
+        );
+        // Drive THRESHOLD+1 more stale-heartbeat empties to prove
+        // that the strike NEVER fires on stale heartbeats — even
+        // accumulated over many attempts.
+        for _ in 0..CATCHUP_BACKOFF_THRESHOLD + 1 {
+            // Re-register the request_id (consumed by the binding
+            // gate on each call).
+            outstanding.lock().record(0x20, 0, Instant::now());
+            let event = Inbound::SyncResponse {
+                from: 0x20,
+                msg: SyncResponse {
+                    channel_id: cid,
+                    first_seq: 0,
+                    leader_first_retained_seq: 0,
+                    events: Vec::new(),
+                    request_id: 0,
+                },
+            };
+            on_inbound(
+                &inputs,
+                &coordinator,
+                &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+                &RuntimeState {
+                    tracker: tracker.clone(),
+                    budget: budget.clone(),
+                    backoff: backoff.clone(),
+                    outstanding: outstanding.clone(),
+                },
+                event,
+            )
+            .await;
+        }
+        assert!(
+            !backoff.lock().is_in_backoff(0x20, Instant::now()),
+            "accumulated stale-heartbeat empties must NEVER engage backoff",
+        );
+    }
+
+    /// R-28 unit test: the backoff structure records empties up to
+    /// the threshold without setting a backoff window, then stamps
+    /// an exponentially-growing window once the threshold is
+    /// crossed. A non-empty response resets the entry.
+    #[test]
+    fn catchup_backoff_threshold_and_reset() {
+        let now = Instant::now();
+        let mut b = CatchupBackoff::new();
+        // Up to the threshold: no backoff yet.
+        for _ in 0..CATCHUP_BACKOFF_THRESHOLD {
+            b.record_empty(0x20, now);
+        }
+        assert!(
+            !b.is_in_backoff(0x20, now),
+            "backoff must not engage before the threshold is crossed"
+        );
+        // Crossing the threshold sets a backoff window.
+        b.record_empty(0x20, now);
+        assert!(
+            b.is_in_backoff(0x20, now),
+            "backoff must engage once the empty count crosses the threshold"
+        );
+        // A productive response clears the entry.
+        b.record_progress(0x20);
+        assert!(
+            !b.is_in_backoff(0x20, now),
+            "record_progress must clear the backoff window"
+        );
+    }
+
+    /// R-25 regression: a saturated low-priority lane (Heartbeat
+    /// flood) must not starve catchup-critical events on the
+    /// priority lane (SyncResponse / SyncNack / Shutdown).
+    ///
+    /// Drives the failure shape from the audit: many peers
+    /// flood the low-priority inbox to its 1024 cap while a
+    /// SyncResponse is also in-flight. With the biased select
+    /// on the priority lane, the priority entry is drained
+    /// even though the low-priority lane is saturated.
+    #[tokio::test]
+    async fn priority_lane_drains_under_low_priority_saturation() {
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 60_000);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        coordinator
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let handle =
+            spawn_replication_runtime(inputs, coordinator.clone(), dispatcher, build_budget());
+
+        // Saturate the low-priority lane with heartbeats. The
+        // runtime task will drain them slowly under heavy lock
+        // contention; what matters is that the priority lane
+        // continues to make progress.
+        for _ in 0..RUNTIME_INBOX_CAPACITY * 2 {
+            let _ = handle.try_dispatch(Inbound::Heartbeat {
+                from: 0x20,
+                msg: SyncHeartbeat {
+                    channel_id: cid,
+                    tail_seq: 0,
+                    role: ReplicaRole::Replica,
+                    wall_clock_ms: 0,
+                },
+            });
+        }
+
+        // Ship a Shutdown on the priority lane and confirm the
+        // runtime exits within a short bound. Under the pre-fix
+        // single-inbox design this would block on the saturated
+        // queue indefinitely (cancel falls back to JoinHandle::
+        // abort but the Idle transition wouldn't run).
+        let cancel_fut = handle.cancel();
+        let bounded = tokio::time::timeout(Duration::from_secs(2), cancel_fut).await;
+        assert!(
+            bounded.is_ok(),
+            "shutdown on priority lane must drain under low-priority saturation"
+        );
+        // Idle transition ran via the graceful path, not the abort.
+        assert_eq!(
+            coordinator.role(),
+            ReplicaRole::Idle,
+            "graceful Idle transition must complete via priority-lane Shutdown"
+        );
     }
 
     #[tokio::test]
@@ -1991,6 +3144,7 @@ mod tests {
                 channel_id: cid,
                 since_seq: 0,
                 chunk_max: 1024,
+                request_id: 0,
             },
         };
         // Simulate the role flipping between the entry check and
@@ -2008,12 +3162,12 @@ mod tests {
             )
             .await
             .unwrap();
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
         on_inbound(
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &Arc::new(Mutex::new(HeartbeatTracker::new(100))),
-            &budget,
+            &build_state(tracker.clone(), budget.clone()),
             event,
         )
         .await;
@@ -2065,14 +3219,15 @@ mod tests {
                 channel_id: wrong,
                 since_seq: 0,
                 chunk_max: 1024,
+                request_id: 0,
             },
         };
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
         on_inbound(
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &Arc::new(Mutex::new(HeartbeatTracker::new(100))),
-            &budget,
+            &build_state(tracker.clone(), budget.clone()),
             event,
         )
         .await;
@@ -2083,6 +3238,132 @@ mod tests {
         assert!(
             dispatcher.sync_responses.lock().is_empty(),
             "no SyncResponse on wrong-channel"
+        );
+    }
+
+    /// Peer-auth gate regression: an inbound message whose `from`
+    /// node is not in `replica_set` must be dropped at on_inbound
+    /// entry. Without the gate any mesh peer with SUBPROTOCOL_REDEX
+    /// reach could drive the runtime — the worst case being a forged
+    /// SyncResponse that writes attacker-chosen bytes into the
+    /// replica's local log via `append_batch`.
+    #[tokio::test]
+    async fn inbound_from_non_replica_set_peer_is_dropped() {
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 60_000);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        coordinator
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let budget = build_budget();
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        let baseline_next = inputs.file.next_seq();
+        // 0x99 is NOT in replica_set [0x10, 0x20]. Even with valid
+        // channel_id and a payload the apply path would accept, the
+        // membership gate must drop it.
+        let event = Inbound::SyncResponse {
+            from: 0x99,
+            msg: SyncResponse {
+                channel_id: cid,
+                first_seq: 0,
+                leader_first_retained_seq: 0,
+                events: Vec::new(),
+                request_id: 0,
+            },
+        };
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &build_state(tracker.clone(), budget.clone()),
+            event,
+        )
+        .await;
+        // No state mutation on the local file from an out-of-set
+        // peer's SyncResponse.
+        assert_eq!(
+            inputs.file.next_seq(),
+            baseline_next,
+            "out-of-set peer must not advance local tail"
+        );
+        // A Heartbeat from the same out-of-set peer must not seed
+        // the tracker either — the gate runs before record_heartbeat.
+        let event = Inbound::Heartbeat {
+            from: 0x99,
+            msg: SyncHeartbeat {
+                channel_id: cid,
+                tail_seq: 7,
+                role: ReplicaRole::Leader,
+                wall_clock_ms: 0,
+            },
+        };
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &build_state(tracker.clone(), budget.clone()),
+            event,
+        )
+        .await;
+        assert!(
+            tracker.lock().believed_leader().is_none(),
+            "out-of-set heartbeat must not seed believed_leader"
+        );
+    }
+
+    /// Peer-auth gate regression: a SyncResponse from a replica_set
+    /// peer who is not the believed_leader must be dropped. Without
+    /// this check, a non-leader replica could ship forged chunks
+    /// once they're inside the replica_set.
+    #[tokio::test]
+    async fn sync_response_from_non_leader_replica_peer_is_dropped() {
+        let inputs = build_inputs(0x10, vec![0x10, 0x20, 0x30], 60_000);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20, 0x30]);
+        coordinator
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let budget = build_budget();
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        // Seed believed_leader = 0x20 via a Leader heartbeat.
+        tracker
+            .lock()
+            .record_heartbeat(0x20, ReplicaRole::Leader, 0, Instant::now());
+        assert_eq!(tracker.lock().believed_leader(), Some(0x20));
+        let baseline_next = inputs.file.next_seq();
+        // 0x30 IS in replica_set but is NOT the believed leader.
+        let event = Inbound::SyncResponse {
+            from: 0x30,
+            msg: SyncResponse {
+                channel_id: cid,
+                first_seq: 0,
+                leader_first_retained_seq: 0,
+                events: Vec::new(),
+                request_id: 0,
+            },
+        };
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &build_state(tracker.clone(), budget.clone()),
+            event,
+        )
+        .await;
+        assert_eq!(
+            inputs.file.next_seq(),
+            baseline_next,
+            "non-leader replica_set peer must not advance local tail via SyncResponse"
         );
     }
 
@@ -2135,22 +3416,32 @@ mod tests {
             .lock()
             .record_heartbeat(0x20, ReplicaRole::Leader, 99, Instant::now());
         assert_eq!(tracker.lock().believed_leader(), Some(0x20));
-        // NACK NotLeader from the believed leader.
+        // NACK NotLeader from the believed leader. Pre-record an
+        // in-flight request_id so the response-binding gate admits
+        // the NACK to the apply path.
+        let outstanding = Arc::new(Mutex::new(OutstandingRequests::new()));
+        outstanding.lock().record(0x20, 0, Instant::now());
         let event = Inbound::SyncNack {
             from: 0x20,
             msg: SyncNack {
                 channel_id: cid,
                 since_seq: 0,
                 error_code: super::super::replication::SyncNackError::NotLeader,
+                leader_first_retained_seq: 0,
                 detail: String::new(),
+                request_id: 0,
             },
         };
         on_inbound(
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &tracker,
-            &budget,
+            &RuntimeState {
+                tracker: tracker.clone(),
+                budget: budget.clone(),
+                backoff: build_backoff(),
+                outstanding: outstanding.clone(),
+            },
             event,
         )
         .await;
@@ -2180,26 +3471,45 @@ mod tests {
         let dispatcher = Arc::new(RecorderDispatcher::default());
         let budget = build_budget();
         let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        // Seed the tracker with a believed leader heartbeat so the
+        // peer-auth gate at on_inbound entry admits the NACK below.
+        tracker
+            .lock()
+            .record_heartbeat(0x20, ReplicaRole::Leader, 41, Instant::now());
 
         // Local file is empty (next_seq = 0). NACK with since_seq=42
         // means "the leader trimmed up to 42; you asked for 42 but
         // it's gone." Local tail must advance to 43.
         let baseline_next = inputs.file.next_seq();
+        // Pre-record the in-flight request_id so the response-binding
+        // gate admits this NACK rather than dropping it as stale.
+        let outstanding = Arc::new(Mutex::new(OutstandingRequests::new()));
+        outstanding.lock().record(0x20, 0, Instant::now());
         let event = Inbound::SyncNack {
             from: 0x20,
             msg: SyncNack {
                 channel_id: cid,
                 since_seq: 42,
+                // Pre-fix: replica advanced one seq at a time via
+                // `since_seq + 1 = 43`. R-40 wire field instructs
+                // the replica to jump straight to the leader's
+                // first-retained seq (here, 100) in one round trip.
                 error_code: super::super::replication::SyncNackError::BadRange,
+                leader_first_retained_seq: 100,
                 detail: String::new(),
+                request_id: 0,
             },
         };
         on_inbound(
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &tracker,
-            &budget,
+            &RuntimeState {
+                tracker: tracker.clone(),
+                budget: budget.clone(),
+                backoff: build_backoff(),
+                outstanding: outstanding.clone(),
+            },
             event,
         )
         .await;
@@ -2210,6 +3520,15 @@ mod tests {
         assert!(
             after > baseline_next,
             "BadRange must advance local next_seq (got {after}, baseline {baseline_next})"
+        );
+        // R-40 regression: with leader_first_retained_seq = 100,
+        // skip_to must jump straight to 100 in one round trip, not
+        // creep up by one per BadRange cycle (since_seq + 1 = 43
+        // would otherwise re-trigger BadRange when retention floor
+        // is much higher).
+        assert_eq!(
+            after, 100,
+            "BadRange with leader_first_retained_seq must jump local tail to the floor"
         );
         // skip_ahead metric advanced.
         assert_eq!(

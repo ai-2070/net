@@ -128,9 +128,11 @@ function runMapped<T>(fn: () => T): T {
  * A signed, delegatable permission token. Construct via
  * `Identity.issueToken` (locally) or `Token.parse` (from wire bytes).
  *
- * The wire form is 161 bytes: issuer (32) + subject (32) + scope (4)
- * + channel hash (4, canonical 32-bit) + not-before (8) + not-after
- * (8) + delegation depth (1) + nonce (8) + ed25519 signature (64).
+ * The wire form is 169 bytes: issuer (32) + subject (32) + scope (4)
+ * + channel hash (8, canonical 64-bit) + issuer generation (4) +
+ * not-before (8) + not-after (8) + delegation depth (1) + nonce (8)
+ * + ed25519 signature (64). Matches `PermissionToken::WIRE_SIZE` in
+ * the Rust core.
  */
 export class Token {
   /** Raw serialized bytes. Safe to send over the wire. */
@@ -139,12 +141,12 @@ export class Token {
   readonly subject: Buffer;
   readonly scope: ReadonlySet<TokenScope>;
   /**
-   * Canonical 32-bit hash of the channel name this token authorizes
+   * Canonical 64-bit hash of the channel name this token authorizes
    * (combine with `wildcard` scope for cross-channel grants). Compare
    * against `channelHash(name)` to check whether a token applies to a
    * named channel.
    */
-  readonly channelHash: number;
+  readonly channelHash: bigint;
   readonly notBefore: Date;
   readonly notAfter: Date;
   readonly delegationDepth: number;
@@ -187,7 +189,7 @@ interface TokenFields {
   issuer: Buffer;
   subject: Buffer;
   scope: ReadonlySet<TokenScope>;
-  channelHash: number;
+  channelHash: bigint;
   notBefore: Date;
   notAfter: Date;
   delegationDepth: number;
@@ -218,7 +220,8 @@ export interface IssueTokenOptions {
   subject: Buffer;
   /** Scopes granted; union of `'publish' | 'subscribe' | 'admin' | 'delegate'`. */
   scope: readonly TokenScope[];
-  /** Channel name. Hashed to u16 for on-wire packing. */
+  /** Channel name. Hashed to u64 canonical; the wire-side fast-path
+   *  hint is the low 16 bits of that hash. */
   channel: string;
   /** Validity window in seconds. Pick a short TTL + re-issue instead of building a revocation list. */
   ttlSeconds: number;
@@ -329,11 +332,12 @@ export class Identity {
 // ----------------------------------------------------------------------------
 
 /**
- * Hash a channel name to its u16 representation. Compare against
- * `token.channelHash` to check whether a token applies to a named
- * channel without trial-decoding.
+ * Hash a channel name to its canonical 64-bit substrate identifier.
+ * Compare against `token.channelHash` to check whether a token
+ * applies to a named channel without trial-decoding. The per-packet
+ * wire `NetHeader` fast-path hint is the low 16 bits of this value.
  */
-export function channelHash(channel: string): number {
+export function channelHash(channel: string): bigint {
   return runMapped(() => napiChannelHash(channel));
 }
 

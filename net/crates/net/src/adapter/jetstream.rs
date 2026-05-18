@@ -26,7 +26,17 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::OnceCell;
+
+/// Upper bound on `Client::drain().await` calls inside `init` and
+/// `shutdown`. NATS' drain has no internal deadline — a slow broker
+/// or network partition can wedge it indefinitely, pinning adapter
+/// init or shutdown forever. 10 s is generous for a healthy broker
+/// (drain flushes outstanding publishes + reads — milliseconds in
+/// practice) and short enough that a misconfigured deploy is
+/// observable instead of a silent hang.
+const JETSTREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 use crate::adapter::{Adapter, ShardPollResult};
 use crate::config::JetStreamAdapterConfig;
@@ -197,10 +207,7 @@ impl JetStreamAdapter {
         let stream = cell
             .get_or_try_init(|| async {
                 let stream_name = self.stream_name(shard_id);
-                let js = self
-                    .jetstream
-                    .as_ref()
-                    .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))?;
+                let js = self.jetstream.as_ref().ok_or(AdapterError::Shutdown)?;
 
                 // Try to get existing stream first; only create if missing.
                 match js.get_stream(&stream_name).await {
@@ -249,7 +256,7 @@ impl JetStreamAdapter {
 impl std::fmt::Debug for JetStreamAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JetStreamAdapter")
-            .field("url", &self.config.url)
+            .field("url", &crate::adapter::redact_url(&self.config.url))
             .field("prefix", &self.config.prefix)
             .field("initialized", &self.initialized.load(Ordering::Relaxed))
             .finish()
@@ -288,13 +295,23 @@ impl Adapter for JetStreamAdapter {
         // silently lost. Drain the prior client first so the
         // overwrite is safe regardless of whether `shutdown` ran.
         if let Some(prior) = self.client.take() {
-            if let Err(e) = prior.drain().await {
-                tracing::warn!(
-                    adapter = "jetstream",
-                    error = %e,
-                    "init: failed to drain prior client before overwrite \
-                     (may have been already drained by shutdown)"
-                );
+            match tokio::time::timeout(JETSTREAM_DRAIN_TIMEOUT, prior.drain()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        adapter = "jetstream",
+                        error = %e,
+                        "init: failed to drain prior client before overwrite \
+                         (may have been already drained by shutdown)"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        adapter = "jetstream",
+                        timeout_secs = JETSTREAM_DRAIN_TIMEOUT.as_secs(),
+                        "init: prior client drain timed out; overwriting anyway"
+                    );
+                }
             }
             // Drop the prior jetstream context too; it borrows
             // a clone of the now-drained client.
@@ -316,7 +333,7 @@ impl Adapter for JetStreamAdapter {
 
         tracing::info!(
             adapter = "jetstream",
-            url = %self.config.url,
+            url = %crate::adapter::redact_url(&self.config.url),
             prefix = %self.config.prefix,
             "JetStream adapter initialized"
         );
@@ -336,13 +353,13 @@ impl Adapter for JetStreamAdapter {
         // would proceed against a drained client, typically erroring
         // and sometimes hanging depending on async-nats internals.
         if !self.initialized.load(Ordering::Acquire) {
-            return Err(AdapterError::Connection("adapter not initialized".into()));
+            return Err(AdapterError::Shutdown);
         }
 
         let js = self
             .jetstream
             .as_ref()
-            .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))?;
+            .ok_or_else(|| AdapterError::Shutdown)?;
 
         // Convert to `async_nats::Subject` once — internally `Bytes`-
         // backed, so per-iteration `subject.clone()` is an Arc-style
@@ -524,13 +541,28 @@ impl Adapter for JetStreamAdapter {
         // flush", and a silent failure here means in-flight messages
         // are quietly lost.
         if let Some(client) = &self.client {
-            if let Err(e) = client.drain().await {
-                tracing::error!(
-                    adapter = "jetstream",
-                    error = %e,
-                    "drain() failed during JetStream shutdown"
-                );
-                return Err(AdapterError::Transient(format!("nats drain: {e}")));
+            match tokio::time::timeout(JETSTREAM_DRAIN_TIMEOUT, client.drain()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!(
+                        adapter = "jetstream",
+                        error = %e,
+                        "drain() failed during JetStream shutdown"
+                    );
+                    return Err(AdapterError::Transient(format!("nats drain: {e}")));
+                }
+                Err(_) => {
+                    tracing::error!(
+                        adapter = "jetstream",
+                        timeout_secs = JETSTREAM_DRAIN_TIMEOUT.as_secs(),
+                        "drain() timed out during JetStream shutdown — may have lost \
+                         in-flight messages"
+                    );
+                    return Err(AdapterError::Transient(format!(
+                        "nats drain timed out after {}s",
+                        JETSTREAM_DRAIN_TIMEOUT.as_secs()
+                    )));
+                }
             }
         }
 
@@ -548,7 +580,7 @@ impl Adapter for JetStreamAdapter {
         // clear `self.client` / `self.jetstream` from `&self`, so
         // we consult the flag instead.
         if !self.initialized.load(Ordering::Acquire) {
-            return Err(AdapterError::Connection("adapter not initialized".into()));
+            return Err(AdapterError::Shutdown);
         }
         let mut stream = self.get_or_create_stream(shard_id).await?;
 

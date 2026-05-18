@@ -10,8 +10,8 @@
 //! The guard keeps two parallel ACLs:
 //!
 //! - **Fast path** (`check_fast`, `authorize`, `is_authorized`): keyed
-//!   on the canonical [`ChannelHash`] (`u32`). Used by the packet data
-//!   plane. The 32-bit canonical hash is collision-resistant at realistic
+//!   on the canonical [`ChannelHash`] (`u64`). Used by the packet data
+//!   plane. The 64-bit canonical hash is collision-resistant at realistic
 //!   deployment scale (~65 K channels before birthday-collision threshold);
 //!   AEAD still enforces payload integrity end-to-end, so a residual
 //!   bloom false positive costs at most a full check further up the
@@ -435,9 +435,9 @@ impl std::fmt::Debug for AuthGuard {
 /// Compute bloom filter key from (origin_hash, channel_hash).
 #[inline]
 fn bloom_key(origin_hash: u64, channel_hash: ChannelHash) -> u64 {
-    let mut buf = [0u8; 12];
+    let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&origin_hash.to_le_bytes());
-    buf[8..12].copy_from_slice(&channel_hash.to_le_bytes());
+    buf[8..16].copy_from_slice(&channel_hash.to_le_bytes());
     xxh3_64(&buf)
 }
 

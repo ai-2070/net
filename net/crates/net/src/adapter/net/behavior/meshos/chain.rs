@@ -244,7 +244,12 @@ impl BufferingActionChainAppender {
     }
 
     /// Construct an empty buffer capped at `capacity` records.
+    /// A `capacity` of `0` is clamped to `1` to match the sibling
+    /// `BufferingAdminAuditChainAppender::with_capacity` behaviour:
+    /// otherwise every `append` would increment `dropped_count`
+    /// against an empty deque, making the metric meaningless.
     pub fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             records: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
                 capacity.min(64),

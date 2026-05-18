@@ -297,28 +297,59 @@ impl HeatRegistry {
         for (channel, counter) in self.counters.iter_mut() {
             counter.decay_to(now);
             let decision = super::should_emit_heat(counter.rate, counter.last_emitted, policy);
+            // D-17: candidate/commit split. Pre-fix `tick` mutated
+            // `last_emitted` inline, before the async sink had
+            // confirmed the announcement. One transient sink error
+            // would leave `last_emitted ≈ rate` and the next tick's
+            // `should_emit_heat` returned `Suppress` forever — the
+            // chain's heat update silently stranded. The mutation
+            // now lives in `commit_emissions`, which the caller
+            // invokes only on `Ok(())` from the sink. A failure
+            // simply skips commit; the next tick reruns
+            // `should_emit_heat` against the unchanged
+            // `last_emitted` and re-emits.
             let emission = match decision {
                 super::EmissionDecision::Suppress => HeatEmission::Suppress,
-                super::EmissionDecision::Emit { rate } => {
-                    counter.record_emission(rate);
-                    HeatEmission::Emit { rate }
-                }
-                super::EmissionDecision::Withdraw => {
-                    counter.record_withdrawal();
-                    HeatEmission::Withdraw
-                }
+                super::EmissionDecision::Emit { rate } => HeatEmission::Emit { rate },
+                super::EmissionDecision::Withdraw => HeatEmission::Withdraw,
             };
             if !matches!(emission, HeatEmission::Suppress) {
                 out.push((*channel, emission));
             }
         }
+        // Pruning is deferred to commit so a sink failure doesn't
+        // evict counters the next tick should be retrying against.
+        out
+    }
+
+    /// Commit the emissions returned by [`Self::tick`] after the
+    /// async sink has confirmed delivery. Mutates each counter's
+    /// `last_emitted` so the next tick computes its
+    /// `should_emit_heat` against the durable state, and prunes
+    /// fully-decayed + already-withdrawn entries. Callers that
+    /// observed a sink error skip this call; the candidates stay
+    /// pending and the next tick reissues them naturally because
+    /// no state mutation happened.
+    pub fn commit_emissions(&mut self, emissions: &[(u64, HeatEmission)]) {
+        for (channel, emission) in emissions {
+            if let Some(counter) = self.counters.get_mut(channel) {
+                match emission {
+                    HeatEmission::Emit { rate } => counter.record_emission(*rate),
+                    HeatEmission::Withdraw => counter.record_withdrawal(),
+                    HeatEmission::Suppress => {}
+                }
+            }
+        }
         // Prune fully-decayed + already-withdrawn entries. A future
         // bump for the same origin re-enters the registry via
         // `entry_mut`; the LRU cap protects against unbounded
-        // re-entries.
+        // re-entries. Use `<= 0.0` rather than `== 0.0` so a future
+        // caller writing `-0.0` (e.g. a clamped-from-negative rate)
+        // still prunes — `-0.0 == 0.0` is true in IEEE-754 but the
+        // explicit comparator is more obviously robust to a future
+        // refactor that swaps in `<=` elsewhere.
         self.counters
-            .retain(|_, c| !(c.rate == 0.0 && c.last_emitted == Some(0.0)));
-        out
+            .retain(|_, c| !(c.rate <= 0.0 && c.last_emitted.is_some_and(|v| v <= 0.0)));
     }
 }
 
@@ -333,6 +364,18 @@ impl HeatRegistry {
 pub struct BlobHeatRegistry {
     counters: HashMap<[u8; 32], HeatCounter>,
     cap: usize,
+    /// Hashes whose emission is currently in-flight to the sink
+    /// but has not yet been committed. The mesh-blob driver
+    /// releases the registry mutex between `tick` and
+    /// `commit_emissions` so the async sink call can run without
+    /// holding a `!Send` parking_lot guard across `.await`. A
+    /// concurrent `tick` landing in that window would otherwise
+    /// recompute `should_emit_heat` against the still-unmutated
+    /// `last_emitted` and re-emit the same candidates over the
+    /// sink — duplicates downstream. Excluding in-flight hashes
+    /// here prevents the duplicate emission; `commit_emissions`
+    /// clears the entry once the sink has confirmed.
+    in_flight: std::collections::HashSet<[u8; 32]>,
 }
 
 impl Default for BlobHeatRegistry {
@@ -340,6 +383,7 @@ impl Default for BlobHeatRegistry {
         Self {
             counters: HashMap::new(),
             cap: DEFAULT_HEAT_REGISTRY_CAP,
+            in_flight: std::collections::HashSet::new(),
         }
     }
 }
@@ -363,6 +407,7 @@ impl BlobHeatRegistry {
         Self {
             counters: HashMap::new(),
             cap,
+            in_flight: std::collections::HashSet::new(),
         }
     }
 
@@ -418,6 +463,15 @@ impl BlobHeatRegistry {
             .map(|(k, _)| *k);
         if let Some(key) = victim {
             self.counters.remove(&key);
+            // Clear any stale `in_flight` marker for the evicted
+            // hash. Without this, a later reintroduction (re-bump
+            // via `entry_mut`) creates a fresh counter that
+            // `tick` permanently suppresses because
+            // `in_flight.contains(&key)` is still true — the
+            // emission was issued for the prior counter but
+            // never `commit_emissions`'d after eviction wiped
+            // the registry entry.
+            self.in_flight.remove(&key);
         }
     }
 
@@ -430,6 +484,11 @@ impl BlobHeatRegistry {
     /// GC sweep.
     pub fn remove(&mut self, hash: &[u8; 32]) {
         self.counters.remove(hash);
+        // Same in-flight cleanup as `evict_lru` — a removed hash
+        // that re-enters later via `entry_mut` must start with a
+        // clean `in_flight` slot, otherwise `tick` suppresses
+        // every emission for the new counter forever.
+        self.in_flight.remove(hash);
     }
 
     /// Iterate `(hash, counter)` pairs. Read-only.
@@ -449,27 +508,81 @@ impl BlobHeatRegistry {
         now: Instant,
     ) -> Vec<([u8; 32], HeatEmission)> {
         let mut out = Vec::new();
+        // Two-step iter so we can mutate `in_flight` after we're
+        // done reading `counters` — both are `&mut self` fields.
         for (hash, counter) in self.counters.iter_mut() {
             counter.decay_to(now);
+            if self.in_flight.contains(hash) {
+                // A prior `tick` already emitted this hash and the
+                // caller hasn't yet `commit_emissions`'d it. Don't
+                // re-emit — `commit_emissions` will mutate the
+                // `last_emitted` snapshot, after which a future tick
+                // computes against the durable state cleanly.
+                continue;
+            }
             let decision = super::should_emit_heat(counter.rate, counter.last_emitted, policy);
+            // D-17 candidate/commit split: see `HeatRegistry::tick`
+            // for the rationale. `last_emitted` mutates only after
+            // the sink confirms via `commit_emissions`.
             let emission = match decision {
                 super::EmissionDecision::Suppress => HeatEmission::Suppress,
-                super::EmissionDecision::Emit { rate } => {
-                    counter.record_emission(rate);
-                    HeatEmission::Emit { rate }
-                }
-                super::EmissionDecision::Withdraw => {
-                    counter.record_withdrawal();
-                    HeatEmission::Withdraw
-                }
+                super::EmissionDecision::Emit { rate } => HeatEmission::Emit { rate },
+                super::EmissionDecision::Withdraw => HeatEmission::Withdraw,
             };
             if !matches!(emission, HeatEmission::Suppress) {
                 out.push((*hash, emission));
             }
         }
-        self.counters
-            .retain(|_, c| !(c.rate == 0.0 && c.last_emitted == Some(0.0)));
+        for (hash, _) in &out {
+            self.in_flight.insert(*hash);
+        }
         out
+    }
+
+    /// Commit the emissions from [`Self::tick`] after the sink
+    /// confirms. See [`HeatRegistry::commit_emissions`] for the
+    /// candidate/commit rationale. Also clears the in-flight
+    /// marker so a subsequent `tick` can re-evaluate the hash.
+    pub fn commit_emissions(&mut self, emissions: &[([u8; 32], HeatEmission)]) {
+        for (hash, emission) in emissions {
+            if let Some(counter) = self.counters.get_mut(hash) {
+                match emission {
+                    HeatEmission::Emit { rate } => counter.record_emission(*rate),
+                    HeatEmission::Withdraw => counter.record_withdrawal(),
+                    HeatEmission::Suppress => {}
+                }
+            }
+            self.in_flight.remove(hash);
+        }
+        // Prune fully-decayed + already-withdrawn entries. Same
+        // `<= 0.0` rationale as HeatRegistry::tick above. Also
+        // clear any `in_flight` marker associated with a pruned
+        // hash so a future reintroduction starts clean — pre-fix
+        // the prune dropped the counter but left `in_flight`
+        // dangling, suppressing the new counter's emissions until
+        // a manual `rollback_emission` cleared the stale marker.
+        let mut pruned: Vec<[u8; 32]> = Vec::new();
+        self.counters.retain(|hash, c| {
+            let keep = !(c.rate <= 0.0 && c.last_emitted.is_some_and(|v| v <= 0.0));
+            if !keep {
+                pruned.push(*hash);
+            }
+            keep
+        });
+        for hash in &pruned {
+            self.in_flight.remove(hash);
+        }
+    }
+
+    /// Clear the in-flight marker for `hash` without committing
+    /// the emission — used by the sink-failure path so the
+    /// caller's retry on the next tick reissues the same
+    /// emission. Pre-fix the caller could only `commit` (apply
+    /// the mutation) or do nothing (leak the in-flight marker);
+    /// neither matched the "retry on failure" semantic the audit
+    /// asked for.
+    pub fn rollback_emission(&mut self, hash: &[u8; 32]) {
+        self.in_flight.remove(hash);
     }
 }
 
@@ -635,10 +748,13 @@ mod tests {
         let half = policy.decay_half_life;
 
         // Bump once, emit, then let the rate decay to zero and
-        // tick again to emit the withdrawal.
+        // tick again to emit the withdrawal. D-17: callers now
+        // commit_emissions after the sink confirms; tests mirror
+        // the new contract by committing inline.
         let counter = r.entry_mut(channel(0xA), half, base);
         counter.bump(base);
-        let _ = r.tick(&policy, base);
+        let e0 = r.tick(&policy, base);
+        r.commit_emissions(&e0);
         assert_eq!(r.len(), 1);
 
         // 100 half-lives → rate clamps to zero; next tick emits
@@ -648,8 +764,10 @@ mod tests {
         assert!(emissions
             .iter()
             .any(|(_, e)| matches!(e, HeatEmission::Withdraw)));
+        r.commit_emissions(&emissions);
         let after = r.tick(&policy, later + Duration::from_secs(1));
         assert!(after.is_empty(), "no further emissions");
+        r.commit_emissions(&after);
         assert_eq!(r.len(), 0, "fully-decayed withdrawn entry pruned");
     }
 
@@ -666,6 +784,9 @@ mod tests {
             HeatEmission::Emit { rate } => assert!(rate > 0.0),
             other => panic!("expected Emit, got {other:?}"),
         }
+        // D-17: commit so the second tick's `should_emit_heat`
+        // sees `last_emitted ≈ rate` and suppresses.
+        r.commit_emissions(&emissions);
         // Subsequent tick suppresses (rate hasn't moved).
         let emissions2 = r.tick(&policy, base);
         assert!(emissions2.is_empty());
@@ -678,8 +799,10 @@ mod tests {
         let policy = super::super::DataGravityPolicy::default();
         let counter = r.entry_mut(channel(0xA), policy.decay_half_life, base);
         counter.bump(base);
-        // First tick — emit.
-        let _ = r.tick(&policy, base);
+        // First tick — emit. D-17: commit so the next tick sees
+        // the post-emit `last_emitted`.
+        let first = r.tick(&policy, base);
+        r.commit_emissions(&first);
         // 100 half-lives later — rate decays to zero; withdraw.
         let later = base + policy.decay_half_life * 100;
         let emissions = r.tick(&policy, later);
@@ -694,9 +817,11 @@ mod tests {
         let policy = super::super::DataGravityPolicy::default();
         let counter = r.entry_mut(channel(0xA), policy.decay_half_life, base);
         counter.bump(base);
-        // First tick — emit at rate ≈ 1.0.
+        // First tick — emit at rate ≈ 1.0. Commit so the second
+        // tick's `should_emit_heat` sees `last_emitted ≈ 1.0`.
         let first = r.tick(&policy, base);
         assert_eq!(first.len(), 1);
+        r.commit_emissions(&first);
         // More bumps — rate climbs.
         for _ in 0..3 {
             r.entry_mut(channel(0xA), policy.decay_half_life, base)
@@ -709,6 +834,38 @@ mod tests {
             HeatEmission::Emit { rate } => assert!(rate >= 4.0 * 0.99),
             other => panic!("expected Emit, got {other:?}"),
         }
+    }
+
+    /// D-17 regression: a sink failure (caller skips
+    /// `commit_emissions`) must NOT silently mark the counter as
+    /// already-emitted. The next tick must reissue the same
+    /// candidate so a transient sink error doesn't permanently
+    /// strand the chain's heat advertisement.
+    #[test]
+    fn tick_without_commit_reissues_on_next_tick() {
+        let base = t0();
+        let mut r = HeatRegistry::new();
+        let policy = super::super::DataGravityPolicy::default();
+        let counter = r.entry_mut(channel(0xA), policy.decay_half_life, base);
+        counter.bump(base);
+
+        // First tick produces a candidate Emit; caller simulates
+        // a sink failure and does NOT call commit_emissions.
+        let candidates = r.tick(&policy, base);
+        assert_eq!(candidates.len(), 1);
+        assert!(matches!(candidates[0].1, HeatEmission::Emit { .. }));
+
+        // Next tick must re-emit because `last_emitted` is still
+        // `None`. Pre-fix, the inline `record_emission` inside
+        // tick() would have advanced `last_emitted ≈ rate` and
+        // this second tick would have returned empty (Suppress).
+        let candidates2 = r.tick(&policy, base);
+        assert_eq!(
+            candidates2.len(),
+            1,
+            "transient sink failure (no commit) must not silence the next tick"
+        );
+        assert!(matches!(candidates2[0].1, HeatEmission::Emit { .. }));
     }
 
     // --- BlobHeatRegistry coverage (PR-5j-a) ---
@@ -769,6 +926,165 @@ mod tests {
                 .iter()
                 .any(|(k, e)| *k == h && matches!(e, HeatEmission::Emit { rate } if *rate > 0.0)),
             "tick must emit for a heated hash; got {emissions:?}"
+        );
+    }
+
+    /// Regression: `tick_blob_heat` releases the registry mutex
+    /// between `tick` and `commit_emissions` so the async sink
+    /// call can run without holding a `!Send` parking_lot guard
+    /// across `.await`. A concurrent `tick` landing in that
+    /// window must NOT re-emit the same candidates — `tick`'s
+    /// in-flight set tracks emitted hashes until
+    /// `commit_emissions` (or `rollback_emission`) clears them.
+    #[test]
+    fn blob_heat_concurrent_tick_skips_in_flight_candidates() {
+        let mut r = BlobHeatRegistry::new();
+        let policy = super::super::policy::DataGravityPolicy::default();
+        let half = policy.decay_half_life;
+        let h = hash(0x42);
+        let now = t0();
+        for _ in 0..8 {
+            r.entry_mut(h, half, now).bump(now);
+        }
+
+        // First tick: emits the candidate and marks it in-flight.
+        let emissions = r.tick(&policy, now);
+        assert!(emissions.iter().any(|(k, _)| *k == h));
+
+        // Second tick BEFORE commit: must NOT re-emit the same
+        // hash; the in-flight set protects against the duplicate.
+        let emissions2 = r.tick(&policy, now);
+        assert!(
+            !emissions2.iter().any(|(k, _)| *k == h),
+            "concurrent tick in the pre-commit window must skip in-flight hashes; \
+             pre-fix this would re-emit and the sink would receive duplicates"
+        );
+
+        // Commit clears the in-flight marker. A subsequent bump
+        // can then re-emit normally (rate-doubling re-emit policy).
+        r.commit_emissions(&emissions);
+        for _ in 0..8 {
+            r.entry_mut(h, half, now).bump(now);
+        }
+        let emissions3 = r.tick(&policy, now);
+        assert!(
+            emissions3.iter().any(|(k, _)| *k == h),
+            "post-commit + further heat must re-enter emission",
+        );
+    }
+
+    /// Regression: `rollback_emission` (used by the mesh-blob
+    /// driver on sink failure) clears the in-flight marker so the
+    /// next tick reissues the same emission. Without it, a
+    /// transient sink failure would pin the hash in-flight
+    /// forever and the chain's heat update would silently stop
+    /// reaching the sink.
+    #[test]
+    fn blob_heat_rollback_emission_lets_next_tick_reissue() {
+        let mut r = BlobHeatRegistry::new();
+        let policy = super::super::policy::DataGravityPolicy::default();
+        let half = policy.decay_half_life;
+        let h = hash(0x55);
+        let now = t0();
+        for _ in 0..8 {
+            r.entry_mut(h, half, now).bump(now);
+        }
+        let emissions = r.tick(&policy, now);
+        assert!(emissions.iter().any(|(k, _)| *k == h));
+
+        // Simulate sink failure: caller calls rollback_emission
+        // instead of commit_emissions.
+        r.rollback_emission(&h);
+
+        let emissions2 = r.tick(&policy, now);
+        assert!(
+            emissions2.iter().any(|(k, _)| *k == h),
+            "rollback_emission must re-enable emission on the next tick",
+        );
+    }
+
+    /// Review regression: when a hash is `remove`d while it has
+    /// an outstanding `in_flight` marker (tick fired but the
+    /// caller hasn't yet `commit_emissions`'d), the marker must
+    /// be cleared. A later reintroduction (re-bump → `entry_mut`)
+    /// creates a fresh counter; pre-fix, `tick` would suppress
+    /// every emission for the new counter because
+    /// `in_flight.contains(hash)` was still true from the prior
+    /// counter's lifetime.
+    #[test]
+    fn blob_heat_remove_clears_in_flight_so_reintroduced_hash_emits() {
+        let mut r = BlobHeatRegistry::new();
+        let policy = super::super::policy::DataGravityPolicy::default();
+        let half = policy.decay_half_life;
+        let h = hash(0x77);
+        let now = t0();
+
+        // Heat + tick: marks the hash in-flight.
+        for _ in 0..8 {
+            r.entry_mut(h, half, now).bump(now);
+        }
+        let _ = r.tick(&policy, now);
+
+        // Remove without committing — simulates a GC sweep or
+        // chunk-delete that fires after `tick` returned but before
+        // the caller could `commit_emissions`. Pre-fix the marker
+        // leaked here.
+        r.remove(&h);
+        assert!(r.is_empty());
+
+        // Reintroduce via fresh bumps.
+        for _ in 0..8 {
+            r.entry_mut(h, half, now).bump(now);
+        }
+
+        // The new counter must be able to emit. Pre-fix this
+        // tick returned empty because `in_flight.contains(&h)`
+        // still held from the removed-counter's lifetime.
+        let emissions = r.tick(&policy, now);
+        assert!(
+            emissions.iter().any(|(k, _)| *k == h),
+            "reintroduced hash must emit again; pre-fix in_flight leak suppressed it forever"
+        );
+    }
+
+    /// Same regression for the LRU-eviction path. A counter at
+    /// the cap that gets evicted mid-flight must not leak its
+    /// `in_flight` marker.
+    #[test]
+    fn blob_heat_evict_clears_in_flight() {
+        let mut r = BlobHeatRegistry::with_cap(2);
+        let policy = super::super::policy::DataGravityPolicy::default();
+        let half = policy.decay_half_life;
+        let now = t0();
+        let h_a = hash(0xA1);
+        let h_b = hash(0xB2);
+        let h_c = hash(0xC3);
+
+        for _ in 0..8 {
+            r.entry_mut(h_a, half, now).bump(now);
+        }
+        let _ = r.tick(&policy, now); // h_a in flight
+
+        // Insert h_b then h_c — at cap=2, h_a (LRU) evicts when
+        // h_c lands.
+        for _ in 0..8 {
+            r.entry_mut(h_b, half, now).bump(now);
+        }
+        for _ in 0..8 {
+            r.entry_mut(h_c, half, now).bump(now);
+        }
+        assert!(r.get(&h_a).is_none(), "h_a must have been evicted");
+
+        // Reintroduce h_a. The eviction-cleared in_flight
+        // marker lets the new counter emit on next tick.
+        for _ in 0..8 {
+            r.entry_mut(h_a, half, now).bump(now);
+        }
+        let emissions = r.tick(&policy, now);
+        assert!(
+            emissions.iter().any(|(k, _)| *k == h_a),
+            "reintroduced-after-eviction hash must emit; pre-fix the eviction leak \
+             pinned the new counter as in-flight forever"
         );
     }
 
@@ -872,6 +1188,21 @@ mod tests {
         let target = hash(0xCD);
         let stop = Arc::new(AtomicBool::new(false));
         let start = Arc::new(Barrier::new(2));
+
+        // Pre-seed the target. Under mutex contention the ticker can
+        // sweep all 200 iterations before the bumper ever grabs the
+        // lock — without a pre-seed the post-storm `get(&target)`
+        // would observe a never-inserted hash. Pre-seeding makes the
+        // assertion test the storm's effect on a live entry, not
+        // whether the bumper got scheduled at all.
+        {
+            let now = Instant::now();
+            registry
+                .lock()
+                .unwrap()
+                .entry_mut(target, half, now)
+                .bump(now);
+        }
 
         // Bump storm.
         let bumper = {

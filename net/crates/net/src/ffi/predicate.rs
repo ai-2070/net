@@ -65,7 +65,7 @@ use crate::adapter::net::behavior::{
 /// at NUL-terminated UTF-8 strings valid for the duration of the
 /// call. The buffers are not retained after return.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_predicate_evaluate(
+pub unsafe extern "C" fn net_predicate_evaluate(
     predicate_json: *const c_char,
     tags_json: *const c_char,
     metadata_json: *const c_char,
@@ -170,7 +170,7 @@ pub extern "C" fn net_predicate_evaluate(
 /// writable; on success the caller owns both buffers and frees
 /// them via `net_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_predicate_to_where_header(
+pub unsafe extern "C" fn net_predicate_to_where_header(
     predicate_json: *const c_char,
     out_header_name: *mut *mut c_char,
     out_header_name_len: *mut usize,
@@ -216,8 +216,17 @@ pub extern "C" fn net_predicate_to_where_header(
     if name_rc != 0 {
         return name_rc;
     }
-    // SAFETY: serde_json output is guaranteed valid UTF-8.
-    let value_string = unsafe { String::from_utf8_unchecked(value_bytes) };
+    // serde_json output is guaranteed valid UTF-8, so the checked
+    // conversion is infallible today. Use the checked variant
+    // anyway so a future refactor that swaps the encoder for a
+    // length-prefixed / postcard / non-text format surfaces a
+    // typed error instead of building a String with invalid UTF-8
+    // (which is unsound to even hold, never mind use). Cost is one
+    // byte-validate pass over a short header value.
+    let value_string = match String::from_utf8(value_bytes) {
+        Ok(s) => s,
+        Err(_) => return NetError::InvalidUtf8.into(),
+    };
     let value_rc = super::mesh::write_string_out(value_string, out_value_ptr, out_value_len);
     if value_rc != 0 {
         // CR-17: defensive cleanup. If the value-side write fails
@@ -262,7 +271,7 @@ mod tests {
         let tags = CString::new(r#"["hardware.gpu"]"#).unwrap();
         let meta = CString::new(r#"{"region":"us-east"}"#).unwrap();
 
-        let rc = net_predicate_evaluate(pred.as_ptr(), tags.as_ptr(), meta.as_ptr());
+        let rc = unsafe { net_predicate_evaluate(pred.as_ptr(), tags.as_ptr(), meta.as_ptr()) };
         assert_eq!(rc, 1);
     }
 
@@ -277,7 +286,7 @@ mod tests {
         let tags = CString::new(r#"[]"#).unwrap();
         let meta = CString::new(r#"{"region":"us-west"}"#).unwrap();
 
-        let rc = net_predicate_evaluate(pred.as_ptr(), tags.as_ptr(), meta.as_ptr());
+        let rc = unsafe { net_predicate_evaluate(pred.as_ptr(), tags.as_ptr(), meta.as_ptr()) };
         assert_eq!(rc, 0);
     }
 
@@ -287,11 +296,11 @@ mod tests {
         let tags = CString::new(r#"[]"#).unwrap();
         let meta = CString::new(r#"{}"#).unwrap();
 
-        let rc = net_predicate_evaluate(std::ptr::null(), tags.as_ptr(), meta.as_ptr());
+        let rc = unsafe { net_predicate_evaluate(std::ptr::null(), tags.as_ptr(), meta.as_ptr()) };
         assert!(rc < 0);
-        let rc = net_predicate_evaluate(pred.as_ptr(), std::ptr::null(), meta.as_ptr());
+        let rc = unsafe { net_predicate_evaluate(pred.as_ptr(), std::ptr::null(), meta.as_ptr()) };
         assert!(rc < 0);
-        let rc = net_predicate_evaluate(pred.as_ptr(), tags.as_ptr(), std::ptr::null());
+        let rc = unsafe { net_predicate_evaluate(pred.as_ptr(), tags.as_ptr(), std::ptr::null()) };
         assert!(rc < 0);
     }
 
@@ -301,7 +310,7 @@ mod tests {
         let tags = CString::new(r#"[]"#).unwrap();
         let meta = CString::new(r#"{}"#).unwrap();
 
-        let rc = net_predicate_evaluate(pred.as_ptr(), tags.as_ptr(), meta.as_ptr());
+        let rc = unsafe { net_predicate_evaluate(pred.as_ptr(), tags.as_ptr(), meta.as_ptr()) };
         assert!(rc < 0);
     }
 
@@ -326,7 +335,7 @@ mod tests {
         let tags = CString::new(r#"["scope:tenant:foo","hardware.gpu"]"#).unwrap();
         let meta = CString::new(r#"{}"#).unwrap();
 
-        let rc = net_predicate_evaluate(pred.as_ptr(), tags.as_ptr(), meta.as_ptr());
+        let rc = unsafe { net_predicate_evaluate(pred.as_ptr(), tags.as_ptr(), meta.as_ptr()) };
         // `>= 0` = the tag array parsed cleanly. `< 0` means we
         // hit `InvalidJson` on the tag parse, which would mean
         // `Tag::parse` is rejecting the reserved prefix
@@ -357,13 +366,15 @@ mod tests {
         let mut out_value: *mut c_char = std::ptr::null_mut();
         let mut value_len: usize = 0;
 
-        let rc = net_predicate_to_where_header(
-            pred.as_ptr(),
-            &mut out_name,
-            &mut name_len,
-            &mut out_value,
-            &mut value_len,
-        );
+        let rc = unsafe {
+            net_predicate_to_where_header(
+                pred.as_ptr(),
+                &mut out_name,
+                &mut name_len,
+                &mut out_value,
+                &mut value_len,
+            )
+        };
         assert_eq!(rc, 0);
 
         // Header name == "net-where".
@@ -406,13 +417,15 @@ mod tests {
         let mut out_value: *mut c_char = std::ptr::null_mut();
         let mut value_len: usize = 0;
 
-        let rc = net_predicate_to_where_header(
-            pred.as_ptr(),
-            &mut out_name,
-            &mut name_len,
-            &mut out_value,
-            &mut value_len,
-        );
+        let rc = unsafe {
+            net_predicate_to_where_header(
+                pred.as_ptr(),
+                &mut out_name,
+                &mut name_len,
+                &mut out_value,
+                &mut value_len,
+            )
+        };
         assert!(rc < 0);
         // Out-pointers should remain NULL since we returned early.
         assert!(out_name.is_null());
@@ -429,23 +442,27 @@ mod tests {
         let mut value_len: usize = 0;
 
         // predicate NULL
-        let rc = net_predicate_to_where_header(
-            std::ptr::null(),
-            &mut out_name,
-            &mut name_len,
-            &mut out_value,
-            &mut value_len,
-        );
+        let rc = unsafe {
+            net_predicate_to_where_header(
+                std::ptr::null(),
+                &mut out_name,
+                &mut name_len,
+                &mut out_value,
+                &mut value_len,
+            )
+        };
         assert!(rc < 0);
 
         // out_name NULL
-        let rc = net_predicate_to_where_header(
-            pred.as_ptr(),
-            std::ptr::null_mut(),
-            &mut name_len,
-            &mut out_value,
-            &mut value_len,
-        );
+        let rc = unsafe {
+            net_predicate_to_where_header(
+                pred.as_ptr(),
+                std::ptr::null_mut(),
+                &mut name_len,
+                &mut out_value,
+                &mut value_len,
+            )
+        };
         assert!(rc < 0);
     }
 }

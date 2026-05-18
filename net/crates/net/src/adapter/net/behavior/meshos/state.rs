@@ -232,6 +232,14 @@ impl MeshOsState {
                     entry.remove(holder);
                 }
             }
+            MeshOsEvent::ReplicaBecameHolderAndLeader { chain, holder } => {
+                // Atomic pair (symmetric to LeaderLostAndRemoved):
+                // add the holder AND set the leader in one fold
+                // call so a backpressured event channel can't
+                // surface a phantom holder or phantom leader.
+                self.replicas.entry(*chain).or_default().insert(*holder);
+                self.replica_leader.insert(*chain, *holder);
+            }
             MeshOsEvent::RttSample { peer, rtt } => {
                 self.rtt.insert(*peer, *rtt);
             }
@@ -761,6 +769,19 @@ mod tests {
         const THIS_NODE: NodeId = 42;
         let mut state = MeshOsState::default();
         let base = Instant::now();
+        // Active → EnteringMaintenance → Maintenance: the
+        // is_valid_successor match-table forbids skipping
+        // EnteringMaintenance, so drive both arcs in order.
+        state.apply(
+            &MeshOsEvent::MaintenanceTransitionObserved {
+                node: THIS_NODE,
+                state: MaintenanceState::EnteringMaintenance {
+                    since: base,
+                    deadline: None,
+                },
+            },
+            THIS_NODE,
+        );
         state.apply(
             &MeshOsEvent::MaintenanceTransitionObserved {
                 node: THIS_NODE,

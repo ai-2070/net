@@ -189,11 +189,19 @@ impl RedisAdapter {
     /// Consult `initialized` first to refuse cleanly.
     async fn get_conn(&self) -> Result<ConnectionManager, AdapterError> {
         if !self.initialized.load(Ordering::Acquire) {
-            return Err(AdapterError::Fatal("adapter not initialized".into()));
+            return Err(AdapterError::Shutdown);
         }
+        // `initialized` is true but `conn` is None: this only happens
+        // during a re-init race where another caller has flipped
+        // initialized=true but not yet stored the new conn. Surface
+        // as `Transient` (not `Shutdown`) so retry-aware callers
+        // back off and retry instead of giving up — `Shutdown`
+        // means the adapter is gone, but here it's actually mid-
+        // (re)initialization and the next call moments later will
+        // succeed once the new conn lands.
         self.conn
             .clone()
-            .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))
+            .ok_or_else(|| AdapterError::Transient("redis: re-init race; conn not yet set".into()))
     }
 
     /// Parse an XRANGE response into a `ShardPollResult`.
@@ -231,34 +239,59 @@ impl RedisAdapter {
             let Value::Array(fields) = &parts[1] else {
                 continue;
             };
-            // Find the "d" field. Compare against the byte literal directly
-            // — no allocation for what is otherwise a constant-name probe
-            // on every entry.
+            // Find the "d" (data) and "dedup_id" fields. Compare
+            // against byte literals directly — no allocation for
+            // what is otherwise a constant-name probe on every entry.
+            // The XADD producer at on_batch writes both fields; the
+            // documented consumer contract at the top of this module
+            // requires us to surface dedup_id so callers can drive
+            // their own dedup table.
+            let mut data_bytes: Option<&[u8]> = None;
+            let mut dedup_id: Option<String> = None;
             let mut i = 0;
             while i + 1 < fields.len() {
-                let is_data_field = match &fields[i] {
-                    Value::BulkString(bytes) => bytes.as_slice() == b"d",
-                    Value::SimpleString(s) => s == "d",
-                    _ => false,
-                };
-
-                if is_data_field {
-                    if let Value::BulkString(data) = &fields[i + 1] {
-                        match Self::deserialize_event(&id, data) {
-                            Ok(event) => events.push(event),
-                            Err(e) => {
-                                tracing::warn!(
-                                    stream = %stream_key,
-                                    id = %id,
-                                    error = %e,
-                                    "Failed to deserialize event, skipping"
-                                );
-                            }
+                match &fields[i] {
+                    Value::BulkString(bytes) if bytes.as_slice() == b"d" => {
+                        if let Value::BulkString(data) = &fields[i + 1] {
+                            data_bytes = Some(data.as_slice());
                         }
                     }
-                    break;
+                    Value::SimpleString(s) if s == "d" => {
+                        if let Value::BulkString(data) = &fields[i + 1] {
+                            data_bytes = Some(data.as_slice());
+                        }
+                    }
+                    Value::BulkString(bytes) if bytes.as_slice() == b"dedup_id" => {
+                        if let Value::BulkString(v) = &fields[i + 1] {
+                            dedup_id = Some(String::from_utf8_lossy(v).into_owned());
+                        } else if let Value::SimpleString(v) = &fields[i + 1] {
+                            dedup_id = Some(v.clone());
+                        }
+                    }
+                    Value::SimpleString(s) if s == "dedup_id" => {
+                        if let Value::BulkString(v) = &fields[i + 1] {
+                            dedup_id = Some(String::from_utf8_lossy(v).into_owned());
+                        } else if let Value::SimpleString(v) = &fields[i + 1] {
+                            dedup_id = Some(v.clone());
+                        }
+                    }
+                    _ => {}
                 }
                 i += 2;
+            }
+
+            if let Some(data) = data_bytes {
+                match Self::deserialize_event(&id, data) {
+                    Ok(event) => events.push(event.with_dedup_id(dedup_id)),
+                    Err(e) => {
+                        tracing::warn!(
+                            stream = %stream_key,
+                            id = %id,
+                            error = %e,
+                            "Failed to deserialize event, skipping"
+                        );
+                    }
+                }
             }
         }
 
@@ -281,7 +314,7 @@ impl RedisAdapter {
 impl std::fmt::Debug for RedisAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedisAdapter")
-            .field("url", &self.config.url)
+            .field("url", &crate::adapter::redact_url(&self.config.url))
             .field("prefix", &self.config.prefix)
             .field("initialized", &self.initialized.load(Ordering::Relaxed))
             .finish()
@@ -324,7 +357,7 @@ impl Adapter for RedisAdapter {
 
         tracing::info!(
             adapter = "redis",
-            url = %self.config.url,
+            url = %crate::adapter::redact_url(&self.config.url),
             prefix = %self.config.prefix,
             "Redis adapter initialized"
         );
@@ -540,36 +573,30 @@ impl Adapter for RedisAdapter {
             return false;
         }
 
-        // Use a dedicated single-shot multiplexed connection for
-        // the health check rather than the shared
-        // `ConnectionManager` used by `on_batch` / `poll_shard`.
-        // `tokio::time::timeout` cancels the PING future locally
-        // but does NOT roll back bytes already on the wire (same
-        // hazard documented for `on_batch` above). On the SHARED
-        // connection a leftover PING reply could in principle
-        // confuse the multiplexed correlation when followed by
-        // a real command — using a fresh connection that's
-        // dropped after the PING means any leftover bytes go to
-        // a connection that's already being torn down.
+        // Reuse the pooled `ConnectionManager` from `init` rather
+        // than opening a fresh TCP+TLS handshake on every probe.
+        // ConnectionManager owns one long-lived connection and
+        // transparently reconnects with backoff on failure — a
+        // healthcheck timeout that left bytes on the wire is the
+        // exact scenario its reconnect logic exists for, and the
+        // next `on_batch` / `poll_shard` would have triggered the
+        // same reconnect path. Pre-fix every probe did a full
+        // TCP+TLS handshake (a real cost under TLS), and a high-
+        // frequency orchestrator liveness probe could meaningfully
+        // load the broker.
         //
-        // Also bounds the check by `command_timeout` so an
+        // `command_timeout` still bounds the wall-time so an
         // unhealthy backend always returns `false` within a
-        // predictable window (orchestrator liveness probes
-        // require a deterministic cap).
-        let conn_fut = self.client.get_multiplexed_async_connection();
-        let mut conn = match tokio::time::timeout(self.config.command_timeout, conn_fut).await {
-            Ok(Ok(c)) => c,
-            _ => return false,
-        };
+        // predictable window (orchestrator liveness probes need
+        // a deterministic cap).
+        let Some(conn) = &self.conn else { return false };
+        let mut conn = conn.clone();
         let cmd = redis::cmd("PING");
         let fut = cmd.query_async::<String>(&mut conn);
         matches!(
             tokio::time::timeout(self.config.command_timeout, fut).await,
             Ok(Ok(_))
         )
-        // `conn` is dropped here, so any leftover PING reply
-        // ends up on a torn-down connection rather than the
-        // shared multiplex.
     }
 }
 
@@ -744,6 +771,72 @@ mod tests {
         assert!(result.events.is_empty());
         assert!(result.next_id.is_none());
         assert!(!result.has_more);
+    }
+
+    /// Build a synthetic XRANGE entry carrying both `d` and `dedup_id`
+    /// fields — mirroring exactly what `on_batch` writes.
+    fn xrange_entry_with_dedup(id: &str, payload: &[u8], dedup_id: &str) -> Value {
+        Value::Array(vec![
+            Value::BulkString(id.as_bytes().to_vec()),
+            Value::Array(vec![
+                Value::BulkString(b"d".to_vec()),
+                Value::BulkString(payload.to_vec()),
+                Value::BulkString(b"dedup_id".to_vec()),
+                Value::BulkString(dedup_id.as_bytes().to_vec()),
+            ]),
+        ])
+    }
+
+    /// The producer-side dedup_id contract documented at the top of
+    /// this module says consumers MUST be able to extract dedup_id
+    /// from the field map. Pre-fix parse_xrange_response only probed
+    /// for the "d" field and silently dropped dedup_id, leaving every
+    /// trait-level consumer with no way to dedup retries without
+    /// re-decoding the raw broker entry. This round-trip test pins
+    /// the field through the parser.
+    #[test]
+    fn parse_xrange_response_surfaces_dedup_id() {
+        let good = br#"{"r":{"k":"v"},"t":1,"s":0}"#;
+        let response = Value::Array(vec![
+            xrange_entry_with_dedup("1-0", good, "nonce123:0:42:0"),
+            // Entry with no dedup_id — backwards compatibility.
+            xrange_entry("2-0", good),
+        ]);
+
+        let result = RedisAdapter::parse_xrange_response(response, 10, "myapp:shard:0");
+
+        assert_eq!(result.events.len(), 2);
+        assert_eq!(
+            result.events[0].dedup_id.as_deref(),
+            Some("nonce123:0:42:0"),
+            "dedup_id must round-trip from wire field through StoredEvent"
+        );
+        assert!(
+            result.events[1].dedup_id.is_none(),
+            "missing dedup_id field must surface as None, not panic or fabricate"
+        );
+    }
+
+    /// Field-order independence: dedup_id may precede `d` on the wire.
+    /// The parser must not depend on emission order from the producer.
+    #[test]
+    fn parse_xrange_response_dedup_id_order_independent() {
+        let good = br#"{"r":{"k":"v"},"t":1,"s":0}"#;
+        let entry = Value::Array(vec![
+            Value::BulkString(b"5-0".to_vec()),
+            Value::Array(vec![
+                Value::BulkString(b"dedup_id".to_vec()),
+                Value::BulkString(b"abc:0:1:0".to_vec()),
+                Value::BulkString(b"d".to_vec()),
+                Value::BulkString(good.to_vec()),
+            ]),
+        ]);
+
+        let result =
+            RedisAdapter::parse_xrange_response(Value::Array(vec![entry]), 10, "myapp:shard:0");
+
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].dedup_id.as_deref(), Some("abc:0:1:0"));
     }
 
     /// Pin: Redis Cluster topology errors (`MOVED`, `ASK`,

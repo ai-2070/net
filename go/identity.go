@@ -356,7 +356,7 @@ type ParsedToken struct {
 	IssuerHex       string   `json:"issuer_hex"`
 	SubjectHex      string   `json:"subject_hex"`
 	Scope           []string `json:"scope"`
-	ChannelHash     uint32   `json:"channel_hash"`
+	ChannelHash     uint64   `json:"channel_hash"`
 	NotBefore       uint64   `json:"not_before"`
 	NotAfter        uint64   `json:"not_after"`
 	DelegationDepth uint8    `json:"delegation_depth"`
@@ -489,18 +489,18 @@ func DelegateToken(
 	return consumeBytes(outPtr, outLen), nil
 }
 
-// ChannelHash hashes a channel name to its canonical 32-bit substrate
+// ChannelHash hashes a channel name to its canonical 64-bit substrate
 // identifier (used for ACL/storage/config keys; the wire NetHeader
 // fast-path hint is the low 16 bits of this value).
-func ChannelHash(channel string) (uint32, error) {
+func ChannelHash(channel string) (uint64, error) {
 	cChannel := C.CString(channel)
 	defer C.free(unsafe.Pointer(cChannel))
-	var hash C.uint32_t
+	var hash C.uint64_t
 	code := C.net_channel_hash(cChannel, &hash)
 	if err := identityErrorFromCode(code); err != nil {
 		return 0, err
 	}
-	return uint32(hash), nil
+	return uint64(hash), nil
 }
 
 // ---------------------------------------------------------------------------

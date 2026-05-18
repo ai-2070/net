@@ -540,6 +540,16 @@ pub struct JetStreamAdapterConfig {
 
     /// Request timeout for publish/fetch operations.
     /// Default: 5 seconds.
+    ///
+    /// **Worst-case wall-clock note:** `on_batch` applies this timeout
+    /// independently to (1) the publish-enqueue phase and (2) the
+    /// per-message ack-wait phase, so a single `on_batch` call can
+    /// take up to **2 × request_timeout** before returning. Operators
+    /// sizing the bus-side dispatch timeout
+    /// (`EventBusConfig::adapter_timeout`) should account for this
+    /// 2× factor; setting `adapter_timeout < 2 * request_timeout`
+    /// classifies as a timeout-induced drop even on healthy
+    /// JetStream nodes under load.
     pub request_timeout: Duration,
 
     /// Maximum messages per stream (oldest are discarded when exceeded).

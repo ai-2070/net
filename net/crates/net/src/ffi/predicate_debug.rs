@@ -132,7 +132,7 @@ fn parse_metadata(metadata_json_str: &str) -> Option<BTreeMap<String, String>> {
 /// writable; on success the caller owns the trace buffer and
 /// frees it via `net_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_predicate_evaluate_with_trace(
+pub unsafe extern "C" fn net_predicate_evaluate_with_trace(
     predicate_json: *const c_char,
     tags_json: *const c_char,
     metadata_json: *const c_char,
@@ -235,7 +235,7 @@ pub extern "C" fn net_predicate_evaluate_with_trace(
 /// On success the caller owns the report buffer and frees it via
 /// `net_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_predicate_aggregate_debug_report(
+pub unsafe extern "C" fn net_predicate_aggregate_debug_report(
     predicate_json: *const c_char,
     contexts_json: *const c_char,
     out_report_json: *mut *mut c_char,
@@ -432,7 +432,7 @@ fn redact_label(label: &str, keys: &BTreeSet<String>) -> String {
 /// On success the caller owns the redacted-report buffer and
 /// frees it via `net_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_predicate_redact_metadata_keys(
+pub unsafe extern "C" fn net_predicate_redact_metadata_keys(
     report_json: *const c_char,
     keys_json: *const c_char,
     out_redacted_json: *mut *mut c_char,
@@ -574,7 +574,7 @@ fn redact_trace_value(node: &Value, keys: &BTreeSet<String>) -> Value {
 /// On success the caller owns the redacted-trace buffer and frees
 /// it via `net_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_predicate_redact_trace_metadata_keys(
+pub unsafe extern "C" fn net_predicate_redact_trace_metadata_keys(
     trace_json: *const c_char,
     keys_json: *const c_char,
     out_redacted_json: *mut *mut c_char,
@@ -649,14 +649,16 @@ mod tests {
         let mut result: c_int = -1;
         let mut out_ptr: *mut c_char = std::ptr::null_mut();
         let mut out_len: usize = 0;
-        let rc = net_predicate_evaluate_with_trace(
-            pred.as_ptr(),
-            tags.as_ptr(),
-            meta.as_ptr(),
-            &mut result,
-            &mut out_ptr,
-            &mut out_len,
-        );
+        let rc = unsafe {
+            net_predicate_evaluate_with_trace(
+                pred.as_ptr(),
+                tags.as_ptr(),
+                meta.as_ptr(),
+                &mut result,
+                &mut out_ptr,
+                &mut out_len,
+            )
+        };
         assert_eq!(rc, 0);
         assert_eq!(result, 1);
 
@@ -692,12 +694,14 @@ mod tests {
 
         let mut out_ptr: *mut c_char = std::ptr::null_mut();
         let mut out_len: usize = 0;
-        let rc = net_predicate_aggregate_debug_report(
-            pred.as_ptr(),
-            contexts.as_ptr(),
-            &mut out_ptr,
-            &mut out_len,
-        );
+        let rc = unsafe {
+            net_predicate_aggregate_debug_report(
+                pred.as_ptr(),
+                contexts.as_ptr(),
+                &mut out_ptr,
+                &mut out_len,
+            )
+        };
         assert_eq!(rc, 0);
 
         let report_json = read_and_free(out_ptr);
@@ -731,12 +735,14 @@ mod tests {
 
         let mut out_ptr: *mut c_char = std::ptr::null_mut();
         let mut out_len: usize = 0;
-        let rc = net_predicate_redact_metadata_keys(
-            report.as_ptr(),
-            keys.as_ptr(),
-            &mut out_ptr,
-            &mut out_len,
-        );
+        let rc = unsafe {
+            net_predicate_redact_metadata_keys(
+                report.as_ptr(),
+                keys.as_ptr(),
+                &mut out_ptr,
+                &mut out_len,
+            )
+        };
         assert_eq!(rc, 0);
 
         let redacted = read_and_free(out_ptr);
@@ -769,14 +775,23 @@ mod tests {
         // First pass.
         let mut out1: *mut c_char = std::ptr::null_mut();
         let mut len1: usize = 0;
-        net_predicate_redact_metadata_keys(report.as_ptr(), keys.as_ptr(), &mut out1, &mut len1);
+        unsafe {
+            net_predicate_redact_metadata_keys(report.as_ptr(), keys.as_ptr(), &mut out1, &mut len1)
+        };
         let pass1 = read_and_free(out1);
 
         // Second pass over the already-redacted output.
         let pass1_cs = CString::new(pass1.clone()).unwrap();
         let mut out2: *mut c_char = std::ptr::null_mut();
         let mut len2: usize = 0;
-        net_predicate_redact_metadata_keys(pass1_cs.as_ptr(), keys.as_ptr(), &mut out2, &mut len2);
+        unsafe {
+            net_predicate_redact_metadata_keys(
+                pass1_cs.as_ptr(),
+                keys.as_ptr(),
+                &mut out2,
+                &mut len2,
+            )
+        };
         let pass2 = read_and_free(out2);
 
         assert_eq!(pass1, pass2, "redaction must be idempotent");
@@ -842,12 +857,14 @@ mod tests {
 
         let mut out_ptr: *mut c_char = std::ptr::null_mut();
         let mut out_len: usize = 0;
-        let rc = net_predicate_redact_trace_metadata_keys(
-            trace.as_ptr(),
-            keys.as_ptr(),
-            &mut out_ptr,
-            &mut out_len,
-        );
+        let rc = unsafe {
+            net_predicate_redact_trace_metadata_keys(
+                trace.as_ptr(),
+                keys.as_ptr(),
+                &mut out_ptr,
+                &mut out_len,
+            )
+        };
         assert_eq!(rc, 0);
 
         let redacted = read_and_free(out_ptr);
@@ -886,23 +903,27 @@ mod tests {
 
         let mut out1: *mut c_char = std::ptr::null_mut();
         let mut len1: usize = 0;
-        net_predicate_redact_trace_metadata_keys(
-            trace.as_ptr(),
-            keys.as_ptr(),
-            &mut out1,
-            &mut len1,
-        );
+        unsafe {
+            net_predicate_redact_trace_metadata_keys(
+                trace.as_ptr(),
+                keys.as_ptr(),
+                &mut out1,
+                &mut len1,
+            )
+        };
         let pass1 = read_and_free(out1);
         let pass1_cs = CString::new(pass1.clone()).unwrap();
 
         let mut out2: *mut c_char = std::ptr::null_mut();
         let mut len2: usize = 0;
-        net_predicate_redact_trace_metadata_keys(
-            pass1_cs.as_ptr(),
-            keys.as_ptr(),
-            &mut out2,
-            &mut len2,
-        );
+        unsafe {
+            net_predicate_redact_trace_metadata_keys(
+                pass1_cs.as_ptr(),
+                keys.as_ptr(),
+                &mut out2,
+                &mut len2,
+            )
+        };
         let pass2 = read_and_free(out2);
         assert_eq!(pass1, pass2);
     }
@@ -924,43 +945,51 @@ mod tests {
 
         // evaluate_with_trace
         assert!(
-            net_predicate_evaluate_with_trace(
-                std::ptr::null(),
-                tags.as_ptr(),
-                meta.as_ptr(),
-                &mut result,
-                &mut out_ptr,
-                &mut out_len,
-            ) < 0
+            unsafe {
+                net_predicate_evaluate_with_trace(
+                    std::ptr::null(),
+                    tags.as_ptr(),
+                    meta.as_ptr(),
+                    &mut result,
+                    &mut out_ptr,
+                    &mut out_len,
+                )
+            } < 0
         );
 
         // aggregate_debug_report
         assert!(
-            net_predicate_aggregate_debug_report(
-                pred.as_ptr(),
-                std::ptr::null(),
-                &mut out_ptr,
-                &mut out_len,
-            ) < 0
+            unsafe {
+                net_predicate_aggregate_debug_report(
+                    pred.as_ptr(),
+                    std::ptr::null(),
+                    &mut out_ptr,
+                    &mut out_len,
+                )
+            } < 0
         );
 
         // redact_metadata_keys
         assert!(
-            net_predicate_redact_metadata_keys(
-                report.as_ptr(),
-                std::ptr::null(),
-                &mut out_ptr,
-                &mut out_len,
-            ) < 0
+            unsafe {
+                net_predicate_redact_metadata_keys(
+                    report.as_ptr(),
+                    std::ptr::null(),
+                    &mut out_ptr,
+                    &mut out_len,
+                )
+            } < 0
         );
         // Also check report null
         assert!(
-            net_predicate_redact_metadata_keys(
-                std::ptr::null(),
-                keys.as_ptr(),
-                &mut out_ptr,
-                &mut out_len,
-            ) < 0
+            unsafe {
+                net_predicate_redact_metadata_keys(
+                    std::ptr::null(),
+                    keys.as_ptr(),
+                    &mut out_ptr,
+                    &mut out_len,
+                )
+            } < 0
         );
         // Avoid `unused` on ctxs
         let _ = ctxs;

@@ -466,6 +466,17 @@ impl EventBus {
             producer_nonce: self.producer_nonce,
         });
 
+        // Order of publish here matters. Today `select_shard`
+        // filters on `state == Active` and a shard is still
+        // `Provisioning` at this point, so producers cannot route
+        // to it yet — but the pattern (insert sender → spawn drain
+        // worker → activate_shard) is ordering-fragile: a future
+        // refactor that flips `activate_shard` ahead of the drain-
+        // worker spawn would leave a window where producers can
+        // push but no drain worker is polling. Pin the order by
+        // installing the sender BEFORE the drain worker (existing
+        // behaviour) so the worker observes a fully-published
+        // sender at spawn time; `activate_shard` runs further down.
         self.batch_senders.write().insert(new_id, tx.clone());
 
         let drain = spawn_drain_worker_for_shard(
@@ -1581,11 +1592,45 @@ impl EventBus {
         if let Some((stranded, ingested_at_deadline, _dispatched_at_deadline)) = deadline_snapshot {
             let ingested_after = self.stats.events_ingested.load(AtomicOrdering::Acquire);
             let post_deadline_ingests = ingested_after.saturating_sub(ingested_at_deadline);
+            // Known under-count window: a producer that completed
+            // `shard_manager.ingest()` and bumped `events_ingested`
+            // just BEFORE its `IngestGuard` decremented
+            // `in_flight_ingests` will be counted in
+            // `ingested_at_deadline` (already past the bump) AND in
+            // `stranded` (still pending the decrement on that same
+            // spin). That single event contributes `+1` to both
+            // sides of the subtraction, so the saturating_sub
+            // under-counts the drop by 1 per such interleaving.
+            // The opposite direction (producer in-flight at
+            // deadline that never completed ingest) is correctly
+            // counted as a drop, so the bias is one-sided and
+            // small (bounded by the number of producers mid-push
+            // at the exact deadline moment — typically 0–1 even
+            // under heavy load). Operators reading
+            // `shutdown_was_lossy` get the right boolean; the
+            // numeric `events_dropped` may under-count by a few
+            // events on a lossy shutdown. Acceptable; the cost of
+            // closing the window is paired-SeqCst reloads under
+            // the spin which would dominate the shutdown path.
             let actual_drops = stranded.saturating_sub(post_deadline_ingests);
             if actual_drops > 0 {
                 self.stats
                     .events_dropped
                     .fetch_add(actual_drops, AtomicOrdering::Relaxed);
+            } else {
+                // The deadline tripped the eager
+                // `shutdown_was_lossy = true` set above, but the
+                // final drain ingested every stranded event so
+                // nothing was actually lost. Clear the flag so
+                // operator dashboards alerting on
+                // `was_lossy && events_dropped == 0` don't see a
+                // false positive. Pre-fix the boolean stayed
+                // `true` against `events_dropped == 0` for any
+                // deadline-triggered shutdown whose drain
+                // happened to catch up.
+                self.stats
+                    .shutdown_was_lossy
+                    .store(false, AtomicOrdering::Release);
             }
             tracing::warn!(
                 stranded_at_deadline = stranded,
@@ -1676,12 +1721,15 @@ impl EventBus {
         // Draining for >100ms with an empty ring buffer and no
         // pushes since drain start. Poll until every requested
         // shard finalizes, capped by an outer deadline so a wedged
-        // producer can't pin this method forever.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // producer can't pin this method forever. Use
+        // `tokio::time::Instant` so tests under `tokio::time::pause()`
+        // advance the virtual clock via `sleep` rather than spinning
+        // until wall-clock catches up.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut finalized: std::collections::HashSet<u16> = std::collections::HashSet::new();
         let target: std::collections::HashSet<u16> = drained_ids.iter().copied().collect();
 
-        while finalized.len() < target.len() && std::time::Instant::now() < deadline {
+        while finalized.len() < target.len() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let stopped = mapper.finalize_draining();
             // `finalize_draining` is destructive — every qualifying
@@ -1790,7 +1838,23 @@ impl Drop for EventBus {
             // observe the shutdown flag and exit, but we have no
             // synchronous way from Drop to enumerate them. The ring-
             // buffer count is a lower bound on the stranded total.
-            let stranded_in_rings = self.shard_manager.total_pending_in_rings();
+            //
+            // Use the non-blocking accessor: if `Drop` runs on a
+            // thread that already holds a shard mutex (single-thread
+            // runtime + panic during shutdown is the canonical
+            // hazard), the blocking `total_pending_in_rings` would
+            // self-deadlock. Best-effort accounting is the right
+            // trade-off here — we'd rather under-report stranded
+            // events than wedge the drop forever.
+            let (stranded_in_rings, uncounted_shards) =
+                self.shard_manager.try_total_pending_in_rings();
+            if uncounted_shards > 0 {
+                tracing::warn!(
+                    uncounted_shards,
+                    "EventBus::drop: {uncounted_shards} shard(s) were locked at \
+                     drop time and could not be accounted for in stranded_in_rings"
+                );
+            }
             if stranded_in_rings > 0 {
                 self.stats
                     .events_dropped
@@ -2028,12 +2092,22 @@ async fn dispatch_batch(
                     // Tag with a `reason` field so this
                     // distinct drop cause is separately filterable
                     // from retry-exhausted and timeout in
-                    // observability tools.
+                    // observability tools. Shutdown is distinguished
+                    // from generic non-retryable so an operator
+                    // chasing "why are batches being dropped" can
+                    // immediately tell a sequencing bug (sending to
+                    // a stopped adapter) from a transport / config
+                    // failure.
+                    let reason = if e.is_shutdown() {
+                        "adapter_shutdown"
+                    } else {
+                        "non_retryable"
+                    };
                     tracing::error!(
                         shard_id,
                         error = %e,
                         attempt,
-                        reason = "non_retryable",
+                        reason,
                         "Non-retryable error from adapter, dropping batch"
                     );
                     return false;
@@ -2267,9 +2341,13 @@ fn spawn_drain_worker_for_shard(
                 // and `EventBus::drop`, transitively making every
                 // producer push that happened-before its `in_flight`
                 // decrement visible to the subsequent `pop_batch_into`.
-                let finalize_deadline = std::time::Instant::now() + DRAIN_FINALIZE_TIMEOUT;
+                // `tokio::time::Instant` so virtualized-clock tests
+                // (`tokio::time::pause`) advance the deadline via
+                // `sleep` rather than spinning until wall-clock catches
+                // up.
+                let finalize_deadline = tokio::time::Instant::now() + DRAIN_FINALIZE_TIMEOUT;
                 while !drain_finalize_ready.load(AtomicOrdering::Acquire) {
-                    if std::time::Instant::now() >= finalize_deadline {
+                    if tokio::time::Instant::now() >= finalize_deadline {
                         tracing::warn!(
                             shard_id,
                             "drain worker timed out waiting for finalize gate; \

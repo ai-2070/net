@@ -129,7 +129,47 @@ impl HeartbeatTracker {
             },
         );
         if role == ReplicaRole::Leader {
-            self.believed_leader = Some(peer);
+            // Tiebreak must match the dual-leader convergence rule in
+            // `replication_runtime.rs::on_inbound`: a Leader claim
+            // beats the current believed leader when its `(tail_seq,
+            // -node_id)` is strictly larger — i.e. higher tail wins,
+            // and on a tail tie the numerically smaller `node_id`
+            // wins.
+            //
+            // The two sites used to disagree. Runtime used
+            // `(higher tail, lower id)`; heartbeat used `lower id
+            // only, sticky`. A local Leader L1 (high tail, high id)
+            // and a peer Leader L2 (low tail, low id) heartbeating
+            // each other would:
+            //   - L1 stays Leader (runtime tiebreak: higher tail wins),
+            //   - L1 records L2 as believed_leader (heartbeat tiebreak:
+            //     lower id wins).
+            // L1's replica-side gates (`leader_belief != Some(from)`)
+            // then trusted L2's SyncResponses while L1 itself kept
+            // emitting Leader heartbeats. Aligning the rules closes
+            // that split-brain window.
+            //
+            // Stickiness is preserved in the form "current wins ties
+            // below the strict-beat threshold," so two peers with
+            // identical `(tail, id)` claims don't flap. That isn't
+            // weaker than the prior lex-only sticky variant — a
+            // higher-id claimant only displaces when it brings a
+            // strictly newer tail, exactly the condition under which
+            // we want the replica to follow the more-current peer.
+            match self.believed_leader {
+                None => self.believed_leader = Some(peer),
+                Some(existing) if existing == peer => {
+                    // Re-affirmation of the same leader — no change.
+                }
+                Some(existing) => {
+                    let existing_tail = self.peers.get(&existing).map(|p| p.tail_seq).unwrap_or(0);
+                    let peer_beats =
+                        tail_seq > existing_tail || (tail_seq == existing_tail && peer < existing);
+                    if peer_beats {
+                        self.believed_leader = Some(peer);
+                    }
+                }
+            }
         }
     }
 
@@ -276,17 +316,78 @@ mod tests {
     }
 
     #[test]
-    fn most_recent_leader_role_heartbeat_wins() {
+    fn leader_tiebreak_prefers_higher_tail_then_lower_id() {
         let base = t0();
         let mut t = HeartbeatTracker::new(500);
-        t.record_heartbeat(0x42, ReplicaRole::Leader, 100, base);
-        assert_eq!(t.believed_leader(), Some(0x42));
-        // Second peer claims leader role — replaces the believed
-        // leader. (In a real partition the two peers' heartbeats
-        // arrive at different witnesses; here we model the
-        // observation from one witness's perspective.)
-        t.record_heartbeat(0x43, ReplicaRole::Leader, 200, at(base, 100));
+        // First Leader heartbeat establishes believed_leader.
+        t.record_heartbeat(0x43, ReplicaRole::Leader, 200, base);
         assert_eq!(t.believed_leader(), Some(0x43));
+        // A second peer claims Leader with LOWER tail. Even though
+        // its node_id is lex-smaller, the higher-tail peer keeps
+        // believed-leader — matching the runtime's dual-leader
+        // convergence rule. Without alignment, a peer with stale
+        // tail could displace a leader holding fresher data.
+        t.record_heartbeat(0x42, ReplicaRole::Leader, 100, at(base, 100));
+        assert_eq!(
+            t.believed_leader(),
+            Some(0x43),
+            "higher-tail Leader should keep believed-leader against a lower-id claimant with lower tail",
+        );
+        // The same peer 0x42 now claims Leader with a STRICTLY
+        // HIGHER tail than the current believed leader — it
+        // displaces 0x43.
+        t.record_heartbeat(0x42, ReplicaRole::Leader, 300, at(base, 200));
+        assert_eq!(
+            t.believed_leader(),
+            Some(0x42),
+            "strictly higher tail wins the tiebreak",
+        );
+        // Tail tie: lex-smaller id wins. 0x41 with the same tail
+        // (300) as the current 0x42 displaces.
+        t.record_heartbeat(0x41, ReplicaRole::Leader, 300, at(base, 300));
+        assert_eq!(
+            t.believed_leader(),
+            Some(0x41),
+            "on a tail tie the lex-smaller id wins",
+        );
+    }
+
+    /// Regression: the heartbeat tiebreak and the runtime's
+    /// dual-leader convergence rule must agree. When they don't, a
+    /// local Leader can simultaneously (a) stay Leader because it
+    /// wins the runtime rule (`higher tail`) and (b) believe a peer
+    /// is the leader because the heartbeat rule picked the peer
+    /// (`lower id, sticky`). The local node's replica-side gates
+    /// then trust the peer's SyncResponses while it also keeps
+    /// emitting Leader heartbeats — a split-brain window.
+    ///
+    /// This test pins the alignment from the heartbeat side: a
+    /// peer that LOSES the runtime tiebreak (lower tail) must NOT
+    /// be recorded as the believed leader on the local node.
+    #[test]
+    fn heartbeat_tiebreak_aligns_with_runtime_convergence_rule() {
+        let base = t0();
+        let mut t = HeartbeatTracker::new(500);
+
+        // Local node is implicitly "Leader" (the heartbeat tracker
+        // tracks peers, not self). Simulate L1 (peer 0xAA, high
+        // tail) claiming Leader. We expect believed_leader == L1.
+        t.record_heartbeat(0xAA, ReplicaRole::Leader, 500, base);
+        assert_eq!(t.believed_leader(), Some(0xAA));
+
+        // Now L2 (peer 0x11, low id, LOWER tail) claims Leader. The
+        // runtime would say L1 wins (higher tail) and ask L2 to
+        // concede. The heartbeat tracker must agree — believed
+        // leader stays L1, NOT L2.
+        t.record_heartbeat(0x11, ReplicaRole::Leader, 100, at(base, 50));
+        assert_eq!(
+            t.believed_leader(),
+            Some(0xAA),
+            "lower-tail Leader claimant must NOT win the heartbeat tiebreak; \
+             pre-fix the lex-only rule made L2 win here and the local node \
+             ended up treating L2's SyncResponses as authoritative while \
+             still emitting Leader heartbeats itself — split brain",
+        );
     }
 
     #[test]

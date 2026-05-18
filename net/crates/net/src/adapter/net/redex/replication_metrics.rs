@@ -97,6 +97,13 @@ pub struct ChannelMetricsAtomic {
     /// Cumulative witness `Mesh::withdraw_chain` calls issued by
     /// this node when it observed a leadership transition.
     pub witness_withdrawals_total: AtomicU64,
+    /// Cumulative `* → Idle` coordinator transitions where the
+    /// sink-side `withdraw_chain` call failed AFTER the state
+    /// cell flipped. While this counter is non-zero, the mesh
+    /// may still be advertising this node as the chain holder
+    /// even though local state is Idle. Recovery is opportunistic
+    /// on the next `transition_to` call.
+    pub announce_divergence_total: AtomicU64,
 }
 
 impl Default for ChannelMetricsAtomic {
@@ -118,6 +125,7 @@ impl ChannelMetricsAtomic {
             skip_ahead_total: AtomicU64::new(0),
             election_thrash_total: AtomicU64::new(0),
             witness_withdrawals_total: AtomicU64::new(0),
+            announce_divergence_total: AtomicU64::new(0),
         }
     }
 
@@ -181,6 +189,17 @@ impl ChannelMetricsAtomic {
         self.witness_withdrawals_total
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Bump the announce-divergence counter when a `* → Idle`
+    /// transition's withdraw_chain sink call fails AFTER the
+    /// state cell already flipped to Idle. While non-zero, the
+    /// mesh may still be advertising this node as the chain
+    /// holder; recovery is opportunistic on the next
+    /// `transition_to` call.
+    pub fn incr_announce_divergence(&self) {
+        self.announce_divergence_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Per-channel registry. Bounded by [`MAX_TRACKED_CHANNELS`];
@@ -211,24 +230,42 @@ impl ReplicationMetricsRegistry {
     /// Channels past [`MAX_TRACKED_CHANNELS`] fold into the
     /// `__overflow__` bucket.
     pub fn for_channel(&self, channel: &str) -> Arc<ChannelMetricsAtomic> {
+        // Fast path for the common case — channel already tracked.
         if let Some(m) = self.channels.get(channel) {
             return m.clone();
         }
-        // Cap check BEFORE the entry-API insert: if we're at the
-        // limit, fold this call into the overflow bucket. The
-        // overflow bucket itself counts as one slot and is created
-        // lazily on first overflow — net: at most cap+1 entries.
-        if self.channels.len() >= MAX_TRACKED_CHANNELS && !self.channels.contains_key(channel) {
+        // Speculative insert via the entry API (atomic under
+        // dashmap's per-shard write lock). Pre-fix the path was
+        // `len() < cap` → `contains_key` → `entry().or_insert_with`:
+        // two concurrent callers with the map at `cap - 1` both
+        // passed the `len()` check, both probed, both inserted —
+        // exceeding the cardinality bomb defense by the number of
+        // racers. The entry API's atomic insert lets us post-check
+        // and undo our overflow contribution.
+        //
+        // The clone-and-drop pattern releases the dashmap shard
+        // write lock BEFORE we call `self.channels.len()` — len
+        // walks every shard and would deadlock against our held
+        // shard lock if we kept the entry alive across the call.
+        let metrics = self
+            .channels
+            .entry(channel.to_string())
+            .or_insert_with(|| Arc::new(ChannelMetricsAtomic::new()))
+            .clone();
+        if self.channels.len() > MAX_TRACKED_CHANNELS {
+            // Our insert pushed us over the cap. Remove the
+            // speculative entry (idempotent if a concurrent caller
+            // already pruned it) and fall through to the overflow
+            // bucket. Convergence is at most `cap + 1` because the
+            // overflow bucket itself counts as a slot.
+            self.channels.remove(channel);
             return self
                 .channels
                 .entry(OVERFLOW_CHANNEL_LABEL.to_string())
                 .or_insert_with(|| Arc::new(ChannelMetricsAtomic::new()))
                 .clone();
         }
-        self.channels
-            .entry(channel.to_string())
-            .or_insert_with(|| Arc::new(ChannelMetricsAtomic::new()))
-            .clone()
+        metrics
     }
 
     /// Read-only snapshot — copies the atomic counters into plain
@@ -248,6 +285,7 @@ impl ReplicationMetricsRegistry {
                 skip_ahead_total: m.skip_ahead_total.load(Ordering::Relaxed),
                 election_thrash_total: m.election_thrash_total.load(Ordering::Relaxed),
                 witness_withdrawals_total: m.witness_withdrawals_total.load(Ordering::Relaxed),
+                announce_divergence_total: m.announce_divergence_total.load(Ordering::Relaxed),
             });
         }
         // Stable order — the snapshot's serialized form (and
@@ -302,6 +340,13 @@ pub struct ChannelMetrics {
     pub election_thrash_total: u64,
     /// Cumulative witness `Mesh::withdraw_chain` calls.
     pub witness_withdrawals_total: u64,
+    /// Cumulative `* → Idle` coordinator transitions whose sink
+    /// `withdraw_chain` call failed AFTER the local state cell
+    /// flipped. Non-zero values mean the mesh may still be
+    /// advertising this node as a chain holder while local state
+    /// says otherwise; recovery is opportunistic on the next
+    /// `transition_to` call.
+    pub announce_divergence_total: u64,
 }
 
 /// Read-side snapshot of every tracked channel, sorted by channel
@@ -389,6 +434,7 @@ impl ReplicationMetricsSnapshot {
             bump("skip_ahead_total", c.skip_ahead_total);
             bump("election_thrash_total", c.election_thrash_total);
             bump("witness_withdrawals_total", c.witness_withdrawals_total);
+            bump("announce_divergence_total", c.announce_divergence_total);
         }
         totals
     }
@@ -427,6 +473,12 @@ const COUNTER_DESCRIPTORS: &[(&str, &str, CounterGetter)] = &[
         "Times a peer replica issued a witness Mesh::withdraw_chain for a deposed leader's tag.",
         "dataforts_replication_witness_withdrawals_total",
         |c| c.witness_withdrawals_total,
+    ),
+    (
+        "Times a coordinator transitioned to Idle but its mesh-side withdraw_chain call failed; \
+         non-zero values mean the mesh may still advertise this node as a chain holder.",
+        "dataforts_replication_announce_divergence_total",
+        |c| c.announce_divergence_total,
     ),
 ];
 
@@ -596,6 +648,50 @@ mod tests {
         assert_eq!(original.leader_changes_total, 0);
     }
 
+    /// Concurrent callers racing on for_channel near the cap
+    /// must not exceed `cap + 1` (cap plus the overflow bucket
+    /// itself). Pre-fix the path was len < cap → contains_key →
+    /// entry().or_insert_with: two callers both passed len check,
+    /// both inserted, net cardinality `cap + N` for N racers.
+    /// Post-fix the speculative insert + post-cap check undoes
+    /// our overflow contribution so convergence is bounded.
+    #[test]
+    fn concurrent_inserts_at_cap_converge_within_one_extra_slot() {
+        use std::sync::Arc as StdArc;
+        use std::sync::Barrier;
+        use std::thread;
+        let reg = StdArc::new(ReplicationMetricsRegistry::new());
+        // Fill to one below the cap.
+        for i in 0..MAX_TRACKED_CHANNELS - 1 {
+            reg.for_channel(&format!("seed-{i}"));
+        }
+        // Race N threads each inserting a distinct channel into
+        // the last cap-1 → cap+N window.
+        let racers = 8;
+        let barrier = StdArc::new(Barrier::new(racers));
+        let mut handles = Vec::with_capacity(racers);
+        for t in 0..racers {
+            let reg = StdArc::clone(&reg);
+            let barrier = StdArc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                reg.for_channel(&format!("racer-{t}"));
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // The map must hold at most MAX_TRACKED_CHANNELS + 1
+        // entries (cap real channels + the overflow bucket).
+        // Pre-fix this exceeded the cap by N for N racers.
+        assert!(
+            reg.len() <= MAX_TRACKED_CHANNELS + 1,
+            "racers blew the cap: len = {}, expected <= {}",
+            reg.len(),
+            MAX_TRACKED_CHANNELS + 1,
+        );
+    }
+
     #[test]
     fn previously_seen_channel_skips_overflow_after_cap() {
         let reg = ReplicationMetricsRegistry::new();
@@ -638,6 +734,7 @@ mod tests {
             "dataforts_replication_skip_ahead_total",
             "dataforts_replication_election_thrash_total",
             "dataforts_replication_witness_withdrawals_total",
+            "dataforts_replication_announce_divergence_total",
         ] {
             assert!(
                 text.contains(name),
@@ -660,8 +757,8 @@ mod tests {
         // HELP + TYPE blocks per metric.
         let help_lines = text.matches("# HELP ").count();
         let type_lines = text.matches("# TYPE ").count();
-        assert_eq!(help_lines, 7, "expected 7 HELP lines, got {help_lines}");
-        assert_eq!(type_lines, 7, "expected 7 TYPE lines, got {type_lines}");
+        assert_eq!(help_lines, 8, "expected 8 HELP lines, got {help_lines}");
+        assert_eq!(type_lines, 8, "expected 8 TYPE lines, got {type_lines}");
     }
 
     #[test]

@@ -149,5 +149,9 @@ postcard = { version = "1", default-features = false, features = ["alloc"], opti
 [build-dependencies]
 napi-build = "2.3.1"
 
-[profile.release]
-lto = true
+# `[profile.release]` is intentionally NOT declared here. Cargo
+# ignores non-root profiles with a warning ("profiles for the non
+# root package will be ignored"). The workspace root Cargo.toml
+# already sets `lto = true` (plus codegen-units = 1, panic = abort,
+# opt-level = 3) under `[profile.release]`, and that's what governs
+# this binding's release build.

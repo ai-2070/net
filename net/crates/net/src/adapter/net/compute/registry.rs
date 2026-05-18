@@ -143,12 +143,35 @@ impl DaemonRegistry {
     pub fn replace(&self, host: DaemonHost) {
         let origin_hash = host.origin_hash();
         let name = host.name().to_string();
-        self.daemons.insert(origin_hash, Arc::new(Mutex::new(host)));
-        // `replace` is the swap path used by group lifecycles
-        // (replica/fork/standby). Fire a `Registered` event for
-        // the new host; if there was a prior host at this slot,
-        // the caller is responsible for firing `Unregistered`
-        // first (the registry can't observe the swap mid-call).
+        // Read prior name (if any) before the insert so the
+        // Unregistered event we fire below carries the right
+        // identity. dashmap::insert returns the previous value
+        // atomically, so the fire order is guaranteed:
+        //   Unregistered(old_name) → Registered(new_name).
+        // Pre-fix replace() only fired Registered, leaving any
+        // DaemonLifecycleObserver that pairs Registered/Unregistered
+        // (operator audit log, MeshOS dashboard) leaking one entry
+        // per node-failure-recovery cycle.
+        let prior = self.daemons.insert(origin_hash, Arc::new(Mutex::new(host)));
+        if let Some(prior_arc) = prior {
+            // Non-blocking name read — same posture as
+            // `unregister`. The prior host could be locked by a
+            // same-origin re-entrant caller (e.g. a daemon whose
+            // `process` triggers a `replace` for its own origin
+            // via an indirect path); blocking here would
+            // self-deadlock. The name is operator-facing
+            // observability only — falling back to an empty
+            // string under contention is acceptable.
+            let prior_name = prior_arc
+                .try_lock()
+                .map(|h| h.name().to_string())
+                .unwrap_or_default();
+            self.fire(DaemonLifecycleEvent::Unregistered {
+                id: origin_hash,
+                name: prior_name,
+                at: Instant::now(),
+            });
+        }
         self.fire(DaemonLifecycleEvent::Registered {
             id: origin_hash,
             name,
@@ -788,6 +811,79 @@ mod tests {
         let reg = DaemonRegistry::new();
         let result = reg.unregister(0xDEAD);
         assert_eq!(result, Err(DaemonError::NotFound(0xDEAD)));
+    }
+
+    /// Regression for the P1 review finding: `replace` previously
+    /// did `prior_arc.lock().name()` against the OLD host's mutex.
+    /// If anything was already holding that lock (a same-origin
+    /// re-entrant callback, contention with another `with_host`),
+    /// `replace` would deadlock indefinitely. The fix swaps the
+    /// blocking `lock()` for `try_lock()` with an empty-name
+    /// fallback — name is operator-facing observability, not
+    /// load-bearing.
+    ///
+    /// The test holds the prior host's lock from a worker thread,
+    /// then calls `replace` from the main thread with a bounded
+    /// wait; pre-fix the call would never return.
+    #[test]
+    fn replace_does_not_deadlock_when_prior_arc_is_locked() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc as StdArc;
+        use std::time::Duration;
+
+        let reg = StdArc::new(DaemonRegistry::new());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+        reg.register(make_host_with_keypair(kp.clone())).unwrap();
+
+        // Worker thread: hold the prior host's lock until signaled.
+        let release = StdArc::new(AtomicBool::new(false));
+        let release_clone = release.clone();
+        let reg_clone = reg.clone();
+        let worker = std::thread::spawn(move || {
+            // `with_host` takes the per-daemon mutex inside its
+            // closure. Spin until `release` is set.
+            let _ = reg_clone.with_host(origin, |_host| {
+                while !release_clone.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+        });
+
+        // Wait until the worker is actually inside `with_host`. A
+        // brief sleep is sufficient — the closure spins immediately.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Pre-fix: this call would block on `prior_arc.lock()`
+        // forever. Post-fix: `try_lock()` returns `None`, the name
+        // falls back to "" and `replace` returns promptly.
+        let main_done = StdArc::new(AtomicBool::new(false));
+        let main_done_clone = main_done.clone();
+        let kp_for_replace = kp.clone();
+        let reg_for_main = reg.clone();
+        let replace_thread = std::thread::spawn(move || {
+            reg_for_main.replace(make_host_with_keypair(kp_for_replace));
+            main_done_clone.store(true, Ordering::Release);
+        });
+
+        // Poll up to 2 seconds for the replace to complete while
+        // the worker still holds the lock.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if main_done.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            main_done.load(Ordering::Acquire),
+            "replace must not block on prior host's mutex"
+        );
+
+        // Release the worker so the test can clean up.
+        release.store(true, Ordering::Release);
+        let _ = worker.join();
+        let _ = replace_thread.join();
     }
 
     /// End-to-end pin: after a `replace`, a brand-new

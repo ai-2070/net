@@ -81,15 +81,20 @@ impl DaemonHost {
         keypair: EntityKeypair,
         chain: CausalChainBuilder,
         config: DaemonHostConfig,
-    ) -> Self {
-        assert_eq!(
-            chain.origin_hash(),
-            keypair.origin_hash(),
-            "fork chain origin {:#x} does not match keypair origin {:#x}",
-            chain.origin_hash(),
-            keypair.origin_hash(),
-        );
-        Self {
+    ) -> Result<Self, DaemonError> {
+        // Result, not assert_eq! — `from_fork` is `pub` and reachable
+        // through SDK / FFI callers who may construct it with
+        // mismatched inputs. A panic across FFI is UB on Windows
+        // MSVC and aborts the host on Unix. Same shape as
+        // `from_snapshot`'s entity_id check above.
+        if chain.origin_hash() != keypair.origin_hash() {
+            return Err(DaemonError::RestoreFailed(format!(
+                "fork chain origin {:#x} does not match keypair origin {:#x}",
+                chain.origin_hash(),
+                keypair.origin_hash(),
+            )));
+        }
+        Ok(Self {
             daemon,
             keypair,
             chain,
@@ -97,7 +102,7 @@ impl DaemonHost {
             config,
             stats: DaemonStats::default(),
             subscriptions: Arc::new(DashMap::new()),
-        }
+        })
     }
 
     /// Restore from an L4 `StateSnapshot`.

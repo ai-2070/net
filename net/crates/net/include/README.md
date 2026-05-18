@@ -1020,14 +1020,20 @@ Callers that depended on partial-completion no longer get it.
 
 ### Length validation on every wide-input entry point
 
-`net_ingest`, `net_ingest_raw`, `net_ingest_raw_batch`,
-`net_ingest_raw_ex`, `net_mesh_publish`, `net_redex_file_append`,
-`net_identity_sign`, `net_identity_install_token`, and
-`net_parse_token` now reject `len > isize::MAX as usize` (i.e.
-`SSIZE_MAX` on 64-bit; `INT_MAX` on 32-bit) before constructing the
-slice. A C caller passing a stray sign-extended `-1` previously
-triggered immediate UB before any guard fired — now it returns an
+Every FFI entry point that constructs a slice from a caller-supplied
+`(ptr, len)` now rejects `len > isize::MAX as usize` (i.e. `SSIZE_MAX`
+on 64-bit; `INT_MAX` on 32-bit) before calling `slice::from_raw_parts`.
+A C caller passing a stray sign-extended `-1` previously triggered
+immediate UB before any other validation ran — now it returns an
 error.
+
+Functions covered: `net_ingest`, `net_ingest_raw`, `net_ingest_raw_batch`,
+`net_ingest_raw_ex`, `net_mesh_publish`, `net_redex_file_append`,
+`net_netdb_open_from_snapshot`, `net_mesh_subscribe_channel_with_token`,
+`net_identity_sign`, `net_identity_install_token`, `net_parse_token`,
+`net_verify_token`, `net_token_is_expired`, `net_delegate_token`,
+`net_blob_publish`, `net_blob_resolve`, `net_mesh_blob_adapter_store`,
+`net_mesh_blob_adapter_fetch`, and `net_mesh_blob_adapter_exists`.
 
 ### Alignment checks on handle dereferences
 

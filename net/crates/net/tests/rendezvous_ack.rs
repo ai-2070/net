@@ -151,7 +151,8 @@ async fn punch_ack_round_trips_through_coordinator() {
     // Install A's PunchAck waiter BEFORE firing the request so
     // the round-trip can't beat the await onto the map.
     let a_clone = a.clone();
-    let ack_task = tokio::spawn(async move { a_clone.await_punch_ack(b_id).await });
+    let r_id = r.node_id();
+    let ack_task = tokio::spawn(async move { a_clone.await_punch_ack(b_id, r_id).await });
     // Let the waiter register before triggering the flow.
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -201,11 +202,12 @@ async fn both_endpoints_see_counterpart_ack() {
     );
 
     // Both sides install waiters. A waits on B's ack; B waits
-    // on A's ack.
+    // on A's ack. Both are forwarded by R.
     let a_clone = a.clone();
-    let a_task = tokio::spawn(async move { a_clone.await_punch_ack(b_id).await });
+    let r_id = r.node_id();
+    let a_task = tokio::spawn(async move { a_clone.await_punch_ack(b_id, r_id).await });
     let b_clone = b.clone();
-    let b_task = tokio::spawn(async move { b_clone.await_punch_ack(a_id).await });
+    let b_task = tokio::spawn(async move { b_clone.await_punch_ack(a_id, r_id).await });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let _intro = a
@@ -228,6 +230,57 @@ async fn both_endpoints_see_counterpart_ack() {
     assert_eq!(b_ack.to_peer, b_id);
 }
 
+/// Peer-auth regression: a forged `PunchAck` from a session
+/// peer that is NOT the recorded coordinator must NOT complete
+/// the local node's pending ack waiter. Pre-binding, any session
+/// peer could ship `PunchAck { from_peer: <victim>, to_peer:
+/// <local> }` and the local `connect_direct` future would
+/// resolve with the attacker's payload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn punch_ack_forged_by_non_coordinator_session_peer_is_dropped() {
+    use net::adapter::net::traversal::rendezvous::{PunchAck, RendezvousMsg};
+    use net::adapter::net::traversal::SUBPROTOCOL_RENDEZVOUS;
+
+    let (a, r, b, x) = rendezvous_topology().await;
+
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let r_id = r.node_id();
+
+    // A installs an ack waiter expecting forwarding via R. The
+    // gate at the dispatch arm requires `from_node == r_id`
+    // before completing the oneshot.
+    let a_clone = a.clone();
+    let ack_task = tokio::spawn(async move { a_clone.await_punch_ack(b_id, r_id).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // X forges a PunchAck claiming to come from B. X has a
+    // legitimate session with A (rendezvous_topology connects
+    // every pair) so the encrypted send path lands.
+    let forged = RendezvousMsg::PunchAck(PunchAck {
+        from_peer: b_id,
+        to_peer: a_id,
+        punch_id: 0,
+    })
+    .encode();
+    x.send_subprotocol(a.local_addr(), SUBPROTOCOL_RENDEZVOUS, &forged)
+        .await
+        .expect("forged subprotocol send should reach a");
+
+    // The forged ack must NOT resolve A's waiter. await with a
+    // short fudge — the deadline-based PunchFailed is the
+    // expected outcome; a successful Ok(PunchAck) would mean the
+    // gate failed.
+    let outcome = tokio::time::timeout(Duration::from_secs(7), ack_task).await;
+    let ack_result = outcome
+        .expect("ack task should finish within the punch_deadline window")
+        .expect("ack task panicked");
+    assert!(
+        ack_result.is_err(),
+        "forged ack from non-coordinator session peer must not complete the waiter"
+    );
+}
+
 /// Punch target isn't in R's index → A gets a timeout, and A's
 /// own ack waiter times out too (no counterpart to ack).
 /// Timing budget: ~punch_deadline (5s default).
@@ -245,7 +298,8 @@ async fn ack_wait_times_out_when_punch_uncoordinated() {
     let b_id = b.node_id();
 
     let a_clone = a.clone();
-    let ack_task = tokio::spawn(async move { a_clone.await_punch_ack(b_id).await });
+    let r_id = r.node_id();
+    let ack_task = tokio::spawn(async move { a_clone.await_punch_ack(b_id, r_id).await });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // request_punch will itself time out because R has no

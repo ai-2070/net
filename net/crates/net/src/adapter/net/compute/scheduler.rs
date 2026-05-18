@@ -94,21 +94,56 @@ impl Scheduler {
 
     /// Place a daemon given its capability requirements.
     ///
+    /// Forwarder over [`Self::place_with_locality`] with
+    /// `local_drained = false`. Callers that know the local
+    /// node's drain state should call `place_with_locality`
+    /// directly so the LocalPreferred fast-path can be gated.
+    pub fn place(&self, filter: &CapabilityFilter) -> Result<PlacementDecision, SchedulerError> {
+        self.place_with_locality(filter, false)
+    }
+
+    /// Like [`Self::place`], but accepts an explicit
+    /// `local_drained` signal. The LocalPreferred fast-path is
+    /// gated on `!local_drained` so a caller in mid-shutdown or
+    /// operator-drained state can route fresh placements off the
+    /// local node instead of piling them on a node that's about
+    /// to disappear. The scheduler stays stateless w.r.t.
+    /// node-lifecycle — the caller (which knows about maintenance
+    /// state, drain status, and process lifecycle) supplies the
+    /// bit.
+    ///
     /// Strategy:
-    /// 1. If local node matches, prefer local (zero network hop).
+    /// 1. If local node matches AND `!local_drained`, prefer local
+    ///    (zero network hop).
     /// 2. Otherwise, query the capability index for candidates.
     /// 3. Return the first match (future: least-loaded via LoadBalancer).
-    pub fn place(&self, filter: &CapabilityFilter) -> Result<PlacementDecision, SchedulerError> {
-        // Fast path: try local
-        if self.can_run_locally(filter) {
+    pub fn place_with_locality(
+        &self,
+        filter: &CapabilityFilter,
+        local_drained: bool,
+    ) -> Result<PlacementDecision, SchedulerError> {
+        // Fast path: try local only when not drained.
+        if !local_drained && self.can_run_locally(filter) {
             return Ok(PlacementDecision {
                 node_id: self.local_node_id,
                 reason: PlacementReason::LocalPreferred,
             });
         }
 
-        // Query the index for matching nodes
-        let candidates = self.capability_index.query(filter);
+        // Query the index for matching nodes. When drained, also
+        // strip the local node from the candidate pool — a drained
+        // node shouldn't receive work via either path; skipping the
+        // fast-path alone would let the index query surface local
+        // anyway when it's also published there.
+        let candidates: Vec<u64> = if local_drained {
+            self.capability_index
+                .query(filter)
+                .into_iter()
+                .filter(|&id| id != self.local_node_id)
+                .collect()
+        } else {
+            self.capability_index.query(filter)
+        };
 
         if candidates.is_empty() {
             return Err(SchedulerError::NoCandidate);
@@ -160,10 +195,17 @@ impl Scheduler {
         daemon_filter: &CapabilityFilter,
         source_node: u64,
     ) -> Vec<u64> {
-        // Build a combined filter: must support migration AND daemon requirements
-        let mut combined = daemon_filter.clone();
-        combined =
-            combined.require_tag(format!("subprotocol:{:#06x}", super::SUBPROTOCOL_MIGRATION,));
+        // Build a combined filter: must support migration AND daemon requirements.
+        // The migration-subprotocol tag is constant — hoist it out of
+        // the format! per-call (pre-fix this allocated a tag string
+        // on every find_migration_targets invocation).
+        const MIGRATION_TAG: &str = "subprotocol:0x0500";
+        debug_assert_eq!(
+            MIGRATION_TAG,
+            format!("subprotocol:{:#06x}", super::SUBPROTOCOL_MIGRATION),
+            "hoisted MIGRATION_TAG must match SUBPROTOCOL_MIGRATION format",
+        );
+        let combined = daemon_filter.clone().require_tag(MIGRATION_TAG.to_string());
 
         self.capability_index
             .query(&combined)
@@ -335,7 +377,21 @@ impl Scheduler {
         // short-circuit here so both entry points behave
         // identically.
         if self.local_node_id != source_node && candidates.contains(&self.local_node_id) {
-            return Some(self.local_node_id);
+            // Score local through the supplied PlacementFilter
+            // FIRST so a filter that hard-vetoes local (returns
+            // None for local, Some(_) only for remotes) can
+            // actually veto. Pre-fix this branch short-circuited
+            // unconditionally and silently ignored the filter —
+            // the strict-veto operator could never keep work off
+            // a local that the substrate decided to prefer. If
+            // local scores Some(_), keep the fast-path; otherwise
+            // fall through to the regular tie-breaker.
+            if placement
+                .placement_score(&self.local_node_id, artifact)
+                .is_some()
+            {
+                return Some(self.local_node_id);
+            }
         }
         Self::pick_best_candidate(candidates, artifact, placement, tie_break)
     }
@@ -536,6 +592,55 @@ mod tests {
 
         assert!(scheduler.can_run_locally(&CapabilityFilter::new().require_gpu()));
         assert!(scheduler.can_run_locally(&CapabilityFilter::default()));
+    }
+
+    /// Local node has matching caps + a remote candidate also
+    /// matches. The drained-local case skips the LocalPreferred
+    /// fast-path and routes to the remote so a node mid-shutdown
+    /// or operator-drained doesn't keep absorbing new daemons.
+    #[test]
+    fn place_with_locality_skips_local_when_drained() {
+        let index =
+            make_index_with_nodes(vec![(0x1111, caps_with_gpu()), (0x2222, caps_with_gpu())]);
+        let scheduler = Scheduler::new(index, 0x1111, caps_with_gpu());
+        let filter = CapabilityFilter::new().require_gpu();
+        let decision = scheduler.place_with_locality(&filter, true).unwrap();
+        assert_ne!(
+            decision.node_id, 0x1111,
+            "drained local must not win the placement"
+        );
+        assert_eq!(decision.node_id, 0x2222);
+    }
+
+    /// Baseline: non-drained local still takes the LocalPreferred
+    /// fast-path. Confirms the new method's default behavior
+    /// matches the existing `place()` semantics.
+    #[test]
+    fn place_with_locality_picks_local_when_not_drained() {
+        let index =
+            make_index_with_nodes(vec![(0x1111, caps_with_gpu()), (0x2222, caps_with_gpu())]);
+        let scheduler = Scheduler::new(index, 0x1111, caps_with_gpu());
+        let filter = CapabilityFilter::new().require_gpu();
+        let decision = scheduler.place_with_locality(&filter, false).unwrap();
+        assert_eq!(decision.node_id, 0x1111);
+        assert_eq!(decision.reason, PlacementReason::LocalPreferred);
+    }
+
+    /// Drained-local plus no remote candidate in the capability
+    /// index surfaces `NoCandidate` rather than silently
+    /// returning the drained local. The local node is not in
+    /// the index here — the substrate publishes its own caps
+    /// separately — so skipping the fast-path leaves an empty
+    /// candidate pool.
+    #[test]
+    fn place_with_locality_returns_no_candidate_when_drained_and_no_remote() {
+        let index = make_index_with_nodes(vec![]);
+        let scheduler = Scheduler::new(index, 0x1111, caps_with_gpu());
+        let filter = CapabilityFilter::new().require_gpu();
+        let err = scheduler
+            .place_with_locality(&filter, true)
+            .expect_err("drained local with no remote must fail closed");
+        assert_eq!(err, SchedulerError::NoCandidate);
     }
 
     fn caps_with_migration_tag() -> CapabilitySet {

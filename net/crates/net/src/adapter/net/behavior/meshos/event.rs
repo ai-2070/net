@@ -194,6 +194,20 @@ pub enum MeshOsEvent {
         holder: NodeId,
     },
 
+    /// Symmetric to [`Self::ReplicaLeaderLostAndRemoved`] for the
+    /// promotion side: an `Idle → Leader` transition adds the
+    /// holder AND sets the leader in one event so a backpressured
+    /// sink cannot leave the snapshot with a phantom holder (no
+    /// leader) or a phantom leader (no holder). The fold updates
+    /// both `replicas[chain]` and `replica_leader[chain]`
+    /// atomically.
+    ReplicaBecameHolderAndLeader {
+        /// Chain whose holder + leader both changed.
+        chain: ChainId,
+        /// Node that became both holder and leader.
+        holder: NodeId,
+    },
+
     /// A maintenance-state transition was confirmed on the
     /// admin chain. Source (Phase E): the action executor's
     /// `CommitMaintenanceTransition` commit, re-observed via

@@ -7,6 +7,8 @@
 
 use dashmap::DashMap;
 use ed25519_dalek::Signature;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::entity::{EntityId, EntityKeypair};
@@ -106,19 +108,28 @@ pub struct ScopedToken {
 
 /// A signed, delegatable permission token.
 ///
-/// Wire format (161 bytes):
+/// Wire format (169 bytes):
 /// ```text
-/// issuer:           32 bytes (EntityId)
-/// subject:          32 bytes (EntityId)
-/// scope:             4 bytes (u32)
-/// channel_hash:      4 bytes (ChannelHash, u32; combine with WILDCARD scope for "all channels")
-/// not_before:        8 bytes (u64 unix timestamp)
-/// not_after:         8 bytes (u64 unix timestamp)
-/// delegation_depth:  1 byte  (u8)
-/// nonce:             8 bytes (u64)
+/// issuer:             32 bytes (EntityId)
+/// subject:            32 bytes (EntityId)
+/// scope:               4 bytes (u32)
+/// channel_hash:        8 bytes (ChannelHash, u64; combine with WILDCARD scope for "all channels")
+/// issuer_generation:   4 bytes (u32; floor below which the issuer revokes outstanding tokens)
+/// not_before:          8 bytes (u64 unix timestamp)
+/// not_after:           8 bytes (u64 unix timestamp)
+/// delegation_depth:    1 byte  (u8)
+/// nonce:               8 bytes (u64)
 /// --- signed above ---
-/// signature:        64 bytes (ed25519)
+/// signature:          64 bytes (ed25519)
 /// ```
+///
+/// `issuer_generation` participates in revocation: an issuer that
+/// wants to invalidate every outstanding token (including delegated
+/// children) bumps its floor in the [`RevocationRegistry`]; the
+/// cache rejects any token whose generation is below the current
+/// floor. Children inherit their parent's generation at delegation
+/// time, so revoking a parent transitively revokes its descendants
+/// without a parent-chain walk.
 #[derive(Clone)]
 pub struct PermissionToken {
     /// Who issued this token.
@@ -130,6 +141,12 @@ pub struct PermissionToken {
     /// Channel restriction (canonical [`ChannelHash`]; combine with
     /// [`TokenScope::WILDCARD`] for cross-channel grants).
     pub channel_hash: ChannelHash,
+    /// Issuer-rotation floor. Tokens with `issuer_generation < current
+    /// floor` in the [`RevocationRegistry`] are rejected by
+    /// [`TokenCache::check`]; bumping the floor invalidates every
+    /// outstanding token from that issuer (including delegated
+    /// children, which inherit the value from their parent).
+    pub issuer_generation: u32,
     /// Valid from (unix timestamp seconds).
     pub not_before: u64,
     /// Valid until (unix timestamp seconds).
@@ -144,10 +161,10 @@ pub struct PermissionToken {
 
 impl PermissionToken {
     /// Size of the signed payload (everything before the signature).
-    const SIGNED_PAYLOAD_SIZE: usize = 32 + 32 + 4 + 4 + 8 + 8 + 1 + 8; // 97 bytes
+    const SIGNED_PAYLOAD_SIZE: usize = 32 + 32 + 4 + 8 + 4 + 8 + 8 + 1 + 8; // 105 bytes
 
     /// Total serialized size.
-    pub const WIRE_SIZE: usize = Self::SIGNED_PAYLOAD_SIZE + 64; // 161 bytes
+    pub const WIRE_SIZE: usize = Self::SIGNED_PAYLOAD_SIZE + 64; // 169 bytes
 
     /// Issue a new token.
     ///
@@ -244,6 +261,12 @@ impl PermissionToken {
             subject,
             scope,
             channel_hash,
+            // Default to generation 0. Callers that maintain a
+            // RevocationRegistry can mint a token bound to a specific
+            // generation via direct struct construction, or rotate
+            // by bumping their floor and re-issuing with a higher
+            // value — see `try_issue_with_generation`.
+            issuer_generation: 0,
             not_before: now,
             not_after: now.saturating_add(duration_secs),
             delegation_depth,
@@ -283,13 +306,33 @@ impl PermissionToken {
     /// Aligning everything on strict "< not_after" removes the
     /// off-by-one and makes the token lifetime exactly
     /// `duration_secs` seconds as `issue()` promises.
+    ///
     pub fn is_valid(&self) -> Result<(), TokenError> {
+        self.is_valid_with_skew(0)
+    }
+
+    /// Same as [`Self::is_valid`] but applies `skew_secs` of clock-
+    /// skew tolerance to both bounds. A token is accepted while
+    /// `now >= not_before - skew` AND `now < not_after + skew`.
+    /// [`TokenCache::check`] uses this via the cache's configured
+    /// `clock_skew_secs` (default 0); direct FFI / UI callers stick
+    /// with [`Self::is_valid`].
+    pub fn is_valid_with_skew(&self, skew_secs: u64) -> Result<(), TokenError> {
         self.verify()?;
         let now = current_timestamp();
-        if now < self.not_before {
+        // Lower bound: accept tokens whose `not_before` is up to
+        // `skew_secs` in our future. `saturating_sub` pins the
+        // comparison at 0 if a token's `not_before` is smaller
+        // than the tolerance (issuer set `not_before` very early
+        // or used 0); without saturating, the subtraction would
+        // underflow on u64.
+        if now < self.not_before.saturating_sub(skew_secs) {
             return Err(TokenError::NotYetValid);
         }
-        if now >= self.not_after {
+        // Upper bound: reject only when wall-clock exceeds
+        // `not_after + skew_secs`. `saturating_add` clamps to
+        // u64::MAX (issuer-saturated TTL stays forever-valid).
+        if now >= self.not_after.saturating_add(skew_secs) {
             return Err(TokenError::Expired);
         }
         Ok(())
@@ -401,6 +444,13 @@ impl PermissionToken {
             subject: new_subject,
             scope: new_scope,
             channel_hash: self.channel_hash,
+            // Children inherit the parent's issuer_generation. When the
+            // signer's floor is bumped in the RevocationRegistry, every
+            // outstanding token from that issuer — including this
+            // child — falls below the floor and TokenCache::check
+            // rejects them. That makes a single floor bump transitively
+            // invalidate the chain without a per-link revocation walk.
+            issuer_generation: self.issuer_generation,
             not_before: now,
             not_after: self.not_after,
             delegation_depth: self.delegation_depth - 1,
@@ -430,7 +480,15 @@ impl PermissionToken {
     /// Returning `[u8; SIGNED_PAYLOAD_SIZE]` keeps the layout
     /// identical to the heap version (the existing callers'
     /// `&payload` still resolves to a `&[u8]`).
-    fn signed_payload(&self) -> [u8; Self::SIGNED_PAYLOAD_SIZE] {
+    /// Materialise the canonical byte payload the signature covers
+    /// (every field except the signature itself). `pub(crate)` so
+    /// only in-crate mint / verify paths can construct a transcript
+    /// for an arbitrary token; a `pub` surface would let any caller
+    /// holding a private key produce signed bytes the API otherwise
+    /// only ships via [`Self::issue`] / [`Self::try_issue`] /
+    /// [`Self::delegate`]. Test harnesses and key-rotation flows
+    /// stay in-crate (or use a `pub` wrapper that enforces invariants).
+    pub(crate) fn signed_payload(&self) -> [u8; Self::SIGNED_PAYLOAD_SIZE] {
         let mut buf = [0u8; Self::SIGNED_PAYLOAD_SIZE];
         let mut off = 0;
         buf[off..off + 32].copy_from_slice(self.issuer.as_bytes());
@@ -439,7 +497,11 @@ impl PermissionToken {
         off += 32;
         buf[off..off + 4].copy_from_slice(&self.scope.bits().to_le_bytes());
         off += 4;
-        buf[off..off + 4].copy_from_slice(&self.channel_hash.to_le_bytes());
+        // 8 bytes for channel_hash (u64) — see WIRE_SIZE comment.
+        buf[off..off + 8].copy_from_slice(&self.channel_hash.to_le_bytes());
+        off += 8;
+        // 4 bytes for issuer_generation (revocation floor).
+        buf[off..off + 4].copy_from_slice(&self.issuer_generation.to_le_bytes());
         off += 4;
         buf[off..off + 8].copy_from_slice(&self.not_before.to_le_bytes());
         off += 8;
@@ -473,22 +535,26 @@ impl PermissionToken {
             return Err(TokenError::InvalidFormat);
         }
 
+        // Offsets reflect channel_hash (8 bytes) at byte 68 and
+        // issuer_generation (4 bytes) at byte 76.
         let issuer = EntityId::from_bytes(data[0..32].try_into().unwrap());
         let subject = EntityId::from_bytes(data[32..64].try_into().unwrap());
         let scope = TokenScope::from_bits(u32::from_le_bytes(data[64..68].try_into().unwrap()));
-        let channel_hash = ChannelHash::from_le_bytes(data[68..72].try_into().unwrap());
-        let not_before = u64::from_le_bytes(data[72..80].try_into().unwrap());
-        let not_after = u64::from_le_bytes(data[80..88].try_into().unwrap());
-        let delegation_depth = data[88];
-        let nonce = u64::from_le_bytes(data[89..97].try_into().unwrap());
+        let channel_hash = ChannelHash::from_le_bytes(data[68..76].try_into().unwrap());
+        let issuer_generation = u32::from_le_bytes(data[76..80].try_into().unwrap());
+        let not_before = u64::from_le_bytes(data[80..88].try_into().unwrap());
+        let not_after = u64::from_le_bytes(data[88..96].try_into().unwrap());
+        let delegation_depth = data[96];
+        let nonce = u64::from_le_bytes(data[97..105].try_into().unwrap());
         let mut signature = [0u8; 64];
-        signature.copy_from_slice(&data[97..161]);
+        signature.copy_from_slice(&data[105..169]);
 
         Ok(Self {
             issuer,
             subject,
             scope,
             channel_hash,
+            issuer_generation,
             not_before,
             not_after,
             delegation_depth,
@@ -531,6 +597,24 @@ pub const MAX_TOKEN_SLOTS: usize = 65_536;
 /// past real usage while bounding within-slot growth.
 pub const MAX_TOKENS_PER_SLOT: usize = 32;
 
+/// Recommended default clock-skew tolerance for [`TokenCache`]
+/// (production deployments).
+///
+/// Apply this via [`TokenCache::with_clock_skew`] when a node may
+/// observe wall-clock drift against the rest of the mesh — typical
+/// NTP-synced fleets stay within seconds, but containerized edge
+/// deployments routinely drift tens of seconds and would otherwise
+/// reject freshly-issued tokens or honour tokens others treat as
+/// expired. The constant is recommended-not-default because
+/// `TokenCache::new` defaults to **strict** (skew = 0) to preserve
+/// the existing-deployment expiry contract; operators opt in by
+/// constructing `TokenCache::with_clock_skew(TOKEN_CLOCK_SKEW_SECS_RECOMMENDED)`.
+///
+/// The tolerance applies only through [`TokenCache::check`].
+/// [`PermissionToken::is_valid`] and [`PermissionToken::is_expired`]
+/// remain strict wall-clock checks for FFI / UI callers.
+pub const TOKEN_CLOCK_SKEW_SECS_RECOMMENDED: u64 = 60;
+
 /// Fast permission lookup cache.
 ///
 /// Keyed by `(subject EntityId, channel_hash)`. Each slot holds a
@@ -550,14 +634,137 @@ pub const MAX_TOKENS_PER_SLOT: usize = 32;
 /// [`MAX_TOKENS_PER_SLOT`] (tokens-with-distinct-scope per slot).
 pub struct TokenCache {
     tokens: DashMap<([u8; 32], ChannelHash), Vec<PermissionToken>>,
+    /// Per-issuer revocation floor. A token whose
+    /// `issuer_generation` is strictly below the floor stored here
+    /// for its issuer is rejected by [`Self::check`]. None = the
+    /// cache shares the process-wide registry it was created with;
+    /// callers that want isolated revocation state (test harnesses,
+    /// multiple tenants in the same process) inject their own via
+    /// [`Self::with_revocation_registry`].
+    revocation: Arc<RevocationRegistry>,
+    /// Wall-clock skew tolerance applied when `check` evaluates a
+    /// token's time bounds. Default 0 (strict). Operators whose
+    /// fleet may observe clock drift opt in by constructing the
+    /// cache via [`Self::with_clock_skew`] — see
+    /// [`TOKEN_CLOCK_SKEW_SECS_RECOMMENDED`] for the recommended
+    /// value.
+    clock_skew_secs: u64,
+    /// Set the first time a WILDCARD-scoped token is inserted.
+    /// [`Self::check`] consults this before falling through to
+    /// the wildcard slot — caches that never receive a wildcard
+    /// (the common case for most subjects) skip the second
+    /// `tokens.get` entirely on every miss. Monotonic: never
+    /// cleared; a wildcard later evicted by `evict_expired` just
+    /// means the fallback walks an empty slot, which is cheap.
+    wildcard_inserted: AtomicBool,
+}
+
+/// Per-issuer revocation floor. Bumping an issuer's floor invalidates
+/// every outstanding token from that issuer — including delegated
+/// children — without needing to enumerate them. Issuers ship the
+/// floor out-of-band alongside their public key when rotation matters.
+#[derive(Debug, Default)]
+pub struct RevocationRegistry {
+    floors: DashMap<[u8; 32], u32>,
+}
+
+impl RevocationRegistry {
+    /// Create an empty registry (every issuer's floor is implicitly 0).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the floor for an issuer. Tokens with
+    /// `issuer_generation < generation` are rejected on the next
+    /// [`TokenCache::check`]. The call is monotonic: bumping with a
+    /// value <= the current floor is a no-op (prevents accidental
+    /// un-revocation).
+    pub fn revoke_below(&self, issuer: &EntityId, generation: u32) {
+        let key = *issuer.as_bytes();
+        // Use entry::and_modify + or_insert so the merge is atomic
+        // against concurrent revoke_below calls on the same issuer.
+        self.floors
+            .entry(key)
+            .and_modify(|cur| {
+                if generation > *cur {
+                    *cur = generation;
+                }
+            })
+            .or_insert(generation);
+    }
+
+    /// Current floor for an issuer (0 if unset).
+    pub fn floor(&self, issuer: &EntityId) -> u32 {
+        self.floors
+            .get(issuer.as_bytes())
+            .map(|r| *r.value())
+            .unwrap_or(0)
+    }
+
+    /// Returns true if `token` is below its issuer's floor.
+    #[inline]
+    pub fn is_revoked(&self, token: &PermissionToken) -> bool {
+        token.issuer_generation < self.floor(&token.issuer)
+    }
 }
 
 impl TokenCache {
-    /// Create an empty token cache.
+    /// Create an empty token cache with a fresh revocation registry
+    /// and strict (zero) clock-skew tolerance.
     pub fn new() -> Self {
         Self {
             tokens: DashMap::new(),
+            revocation: Arc::new(RevocationRegistry::new()),
+            clock_skew_secs: 0,
+            wildcard_inserted: AtomicBool::new(false),
         }
+    }
+
+    /// Create an empty token cache with the supplied clock-skew
+    /// tolerance (in seconds) applied to every [`Self::check`]
+    /// time-bound evaluation. See
+    /// [`TOKEN_CLOCK_SKEW_SECS_RECOMMENDED`] for the production-
+    /// recommended value.
+    pub fn with_clock_skew(skew_secs: u64) -> Self {
+        Self {
+            tokens: DashMap::new(),
+            revocation: Arc::new(RevocationRegistry::new()),
+            clock_skew_secs: skew_secs,
+            wildcard_inserted: AtomicBool::new(false),
+        }
+    }
+
+    /// Create an empty token cache that shares the supplied
+    /// revocation registry. Use this when several caches in the
+    /// same process must observe the same revocation floors (e.g.
+    /// per-channel caches that all need to honour issuer-wide
+    /// rotation).
+    pub fn with_revocation_registry(revocation: Arc<RevocationRegistry>) -> Self {
+        Self {
+            tokens: DashMap::new(),
+            revocation,
+            clock_skew_secs: 0,
+            wildcard_inserted: AtomicBool::new(false),
+        }
+    }
+
+    /// Set the cache's clock-skew tolerance. Tokens cleared the
+    /// freshness checks in [`Self::check`] are admitted while
+    /// `now >= not_before - skew` AND `now < not_after + skew`.
+    /// Default is 0 (strict).
+    pub fn set_clock_skew(&mut self, skew_secs: u64) {
+        self.clock_skew_secs = skew_secs;
+    }
+
+    /// Current clock-skew tolerance (seconds).
+    pub fn clock_skew_secs(&self) -> u64 {
+        self.clock_skew_secs
+    }
+
+    /// Borrow the cache's revocation registry. Use this to drive
+    /// floor bumps without holding a separate handle.
+    pub fn revocation(&self) -> &Arc<RevocationRegistry> {
+        &self.revocation
     }
 
     /// Insert a token into the cache after verifying its signature.
@@ -594,12 +801,16 @@ impl TokenCache {
     /// still wins). `evict_expired` reclaims slots as tokens
     /// lapse, restoring admission.
     pub fn insert_unchecked(&self, token: PermissionToken) {
-        let slot_channel = if token.scope.contains(TokenScope::WILDCARD) {
-            0
-        } else {
-            token.channel_hash
-        };
+        let is_wildcard = token.scope.contains(TokenScope::WILDCARD);
+        let slot_channel = if is_wildcard { 0 } else { token.channel_hash };
         let key = (*token.subject.as_bytes(), slot_channel);
+        if is_wildcard {
+            // Latch the wildcard-present flag so `check` knows to
+            // walk the wildcard slot. Once set, never cleared:
+            // a subsequent eviction just means the fallback walks
+            // an empty slot, which is cheap.
+            self.wildcard_inserted.store(true, AtomicOrdering::Relaxed);
+        }
 
         // Slot cap: only refuse NOVEL keys at the cap so existing
         // peers' token refreshes still work under flood pressure.
@@ -654,21 +865,39 @@ impl TokenCache {
     ) -> Result<(), TokenError> {
         // Try exact channel match first
         if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), channel_hash)) {
-            if slot
-                .value()
-                .iter()
-                .any(|t| t.is_valid().is_ok() && t.authorizes(action, channel_hash))
-            {
+            if slot.value().iter().any(|t| {
+                t.is_valid_with_skew(self.clock_skew_secs).is_ok()
+                        && !self.revocation.is_revoked(t)
+                        // Defence-in-depth: cross-check the token's
+                        // signed `subject` field matches the lookup
+                        // key. Inserts already key by
+                        // `token.subject.as_bytes()`, so this is
+                        // strictly redundant today — but a future
+                        // refactor that ever inserts under a derived
+                        // or aliased key would silently authorize the
+                        // wrong entity here without this check.
+                        && t.subject.as_bytes() == subject.as_bytes()
+                        && t.authorizes(action, channel_hash)
+            }) {
                 return Ok(());
             }
         }
+        // Wildcard fast path: skip the second DashMap probe + iter
+        // when no wildcard token has ever been inserted in this
+        // cache. The common case (subject has only channel-bound
+        // tokens) returns NotAuthorized without ever touching the
+        // wildcard slot.
+        if !self.wildcard_inserted.load(AtomicOrdering::Relaxed) {
+            return Err(TokenError::NotAuthorized);
+        }
         // Try wildcard (channel_hash = 0)
         if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), 0)) {
-            if slot
-                .value()
-                .iter()
-                .any(|t| t.is_valid().is_ok() && t.authorizes(action, channel_hash))
-            {
+            if slot.value().iter().any(|t| {
+                t.is_valid_with_skew(self.clock_skew_secs).is_ok()
+                    && !self.revocation.is_revoked(t)
+                    && t.subject.as_bytes() == subject.as_bytes()
+                    && t.authorizes(action, channel_hash)
+            }) {
                 return Ok(());
             }
         }
@@ -972,8 +1201,8 @@ mod tests {
     /// (drops at the boundary), so tokens survived one second longer
     /// in the "hot" caller-facing checks than in the sweep — a
     /// quiet mismatch that also gave every `issue(duration=N)` an
-    /// effective lifetime of `N+1` seconds. This test pins the
-    /// inclusive boundary: at `not_after` exactly, expired.
+    /// effective lifetime of `N+1` seconds.
+    ///
     #[test]
     fn is_valid_and_is_expired_agree_at_not_after_boundary() {
         let issuer = EntityKeypair::generate();
@@ -1000,7 +1229,7 @@ mod tests {
         );
         assert!(
             matches!(token.is_valid(), Err(TokenError::Expired)),
-            "is_valid must agree: Expired at now == not_after",
+            "is_valid must agree: Expired at now == not_after (strict)",
         );
 
         // And the cache eviction path must also drop it — same
@@ -1125,7 +1354,7 @@ mod tests {
         // narrowly-scoped token into a universal grant — and since
         // xxh3 is non-cryptographic, an attacker able to register
         // names could brute-force such a collision (cheap at the
-        // wire u16, but reachable at the canonical u32 too with
+        // wire u16, but reachable at the canonical u64 too with
         // enough names).
         let issuer = EntityKeypair::generate();
         let subject = EntityKeypair::generate();
@@ -1330,6 +1559,362 @@ mod tests {
         assert!(cache
             .check(unknown.entity_id(), TokenScope::PUBLISH, 0xABCD)
             .is_err());
+    }
+
+    /// Bumping an issuer's revocation floor invalidates every
+    /// outstanding token from that issuer (including delegated
+    /// children, which inherit `issuer_generation` from their
+    /// parent). Pre-fix there was no revocation at all — a leaked
+    /// parent token's children outlived any "rotate" intent on the
+    /// parent's key.
+    #[test]
+    fn revocation_floor_bump_invalidates_outstanding_tokens() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+
+        let cache = TokenCache::new();
+        let token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0xABCD_EF00_AAAA_BBBB,
+            3600,
+            0,
+        );
+        // Tokens issued via try_issue default to generation 0.
+        assert_eq!(token.issuer_generation, 0);
+        cache.insert(token).expect("token should verify");
+
+        // Pre-revoke: check passes.
+        assert!(cache
+            .check(
+                subject.entity_id(),
+                TokenScope::PUBLISH,
+                0xABCD_EF00_AAAA_BBBB,
+            )
+            .is_ok());
+
+        // Bump the floor to 1 — every outstanding gen-0 token is now
+        // below the floor.
+        cache.revocation().revoke_below(issuer.entity_id(), 1);
+
+        // Same check now fails.
+        assert!(cache
+            .check(
+                subject.entity_id(),
+                TokenScope::PUBLISH,
+                0xABCD_EF00_AAAA_BBBB,
+            )
+            .is_err());
+    }
+
+    /// `is_valid_with_skew` widens both bounds by the supplied
+    /// tolerance. Pinned at the boundary: half-a-window in admits;
+    /// just past the window rejects. Both the past (Expired) and
+    /// future (NotYetValid) sides are exercised — the skew applies
+    /// symmetrically.
+    #[test]
+    fn is_valid_with_skew_accepts_inside_window_rejects_outside() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let skew: u64 = 60;
+
+        let mut token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            3600,
+            0,
+        );
+
+        // Token expired half-a-skew-window ago: still valid under
+        // the configured skew, but strict `is_valid` rejects.
+        token.not_after = current_timestamp() - skew / 2;
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
+        assert!(
+            token.is_valid_with_skew(skew).is_ok(),
+            "is_valid_with_skew must accept tokens inside the past-skew window",
+        );
+        assert!(
+            matches!(token.is_valid(), Err(TokenError::Expired)),
+            "strict is_valid must reject the same token",
+        );
+
+        // Token expired past the window: must reject under both.
+        token.not_after = current_timestamp() - skew - 5;
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
+        assert!(
+            matches!(token.is_valid_with_skew(skew), Err(TokenError::Expired)),
+            "is_valid_with_skew must reject tokens past the past-skew window",
+        );
+
+        // Token not-yet-valid by half a window: accept under skew,
+        // reject under strict.
+        token.not_after = current_timestamp() + 3600;
+        token.not_before = current_timestamp() + skew / 2;
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
+        assert!(
+            token.is_valid_with_skew(skew).is_ok(),
+            "is_valid_with_skew must accept tokens inside the future-skew window",
+        );
+        assert!(
+            matches!(token.is_valid(), Err(TokenError::NotYetValid)),
+            "strict is_valid must reject the same token",
+        );
+
+        // Token not-yet-valid past the window: must reject under both.
+        token.not_before = current_timestamp() + skew + 5;
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
+        assert!(
+            matches!(token.is_valid_with_skew(skew), Err(TokenError::NotYetValid),),
+            "is_valid_with_skew must reject tokens past the future-skew window",
+        );
+    }
+
+    /// Caches that never receive a WILDCARD token skip the
+    /// wildcard-slot fallback on `check` miss. The fast path is
+    /// observable via the public `len` / `check` API: insert a
+    /// channel-bound token, query for the wrong channel, and
+    /// confirm both the answer and (indirectly) that the
+    /// wildcard-slot probe was elided.
+    #[test]
+    fn check_skips_wildcard_slot_when_no_wildcard_ever_inserted() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let cache = TokenCache::new();
+
+        let token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0xAAAA,
+            3600,
+            0,
+        );
+        cache.insert(token).unwrap();
+
+        // Wrong channel: must NotAuthorize. Pre-fix this took the
+        // wildcard fallback path; post-fix it returns immediately
+        // after the exact-slot miss because no wildcard was ever
+        // inserted. Behaviour is identical (the slow path would
+        // also have miss-then-deny), but cost is one DashMap probe
+        // + iter cheaper.
+        assert!(cache
+            .check(subject.entity_id(), TokenScope::PUBLISH, 0xBBBB)
+            .is_err());
+    }
+
+    /// Once a wildcard token has been inserted, `check` always
+    /// walks the wildcard slot — the fast-path flag is set on
+    /// insert and never cleared, so a later eviction doesn't
+    /// disable the wildcard scan.
+    #[test]
+    fn check_walks_wildcard_slot_after_any_wildcard_insert() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let cache = TokenCache::new();
+
+        let wildcard = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH.union(TokenScope::WILDCARD),
+            0,
+            3600,
+            0,
+        );
+        cache.insert(wildcard).unwrap();
+
+        // The wildcard token authorizes every channel, so a check
+        // for any channel succeeds.
+        assert!(cache
+            .check(subject.entity_id(), TokenScope::PUBLISH, 0xDEAD)
+            .is_ok());
+        assert!(cache
+            .check(subject.entity_id(), TokenScope::PUBLISH, 0xBEEF)
+            .is_ok());
+    }
+
+    /// TokenCache::with_clock_skew applies the configured tolerance
+    /// to every `check` call. A token whose `not_after` is just
+    /// past now is rejected by a strict cache but admitted by a
+    /// cache constructed with sufficient skew.
+    #[test]
+    fn token_cache_with_clock_skew_admits_inside_window() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let channel: ChannelHash = 0x1234_5678_9ABC_DEF0;
+
+        let mut token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            channel,
+            3600,
+            0,
+        );
+        // Expired 5 s ago.
+        token.not_after = current_timestamp() - 5;
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
+
+        // Strict cache rejects.
+        let strict = TokenCache::new();
+        strict.insert_unchecked(token.clone());
+        assert!(strict
+            .check(subject.entity_id(), TokenScope::PUBLISH, channel)
+            .is_err());
+
+        // Lenient cache admits.
+        let lenient = TokenCache::with_clock_skew(60);
+        lenient.insert_unchecked(token);
+        assert!(lenient
+            .check(subject.entity_id(), TokenScope::PUBLISH, channel)
+            .is_ok());
+    }
+
+    /// Defence-in-depth: `TokenCache::check` cross-checks the
+    /// token's signed `subject` field against the lookup key. The
+    /// invariant holds today because inserts key by
+    /// `token.subject.as_bytes()`, but a future refactor that ever
+    /// keys by a derived value would otherwise silently authorize
+    /// the wrong entity. The check fires here by directly inserting
+    /// a token under a foreign subject — `insert_unchecked` is
+    /// deliberately deliberate enough to bypass the normal keying
+    /// invariant.
+    #[test]
+    fn check_rejects_token_keyed_under_mismatched_subject() {
+        let issuer = EntityKeypair::generate();
+        let real_subject = EntityKeypair::generate();
+        let foreign_subject = EntityKeypair::generate();
+        let channel: ChannelHash = 0x1234_5678_9ABC_DEF0;
+
+        let token = PermissionToken::issue(
+            &issuer,
+            real_subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            channel,
+            3600,
+            0,
+        );
+
+        // Manually inject the token into the slot keyed by the
+        // foreign subject's bytes. This is what a buggy refactor of
+        // the keying scheme would produce.
+        let cache = TokenCache::new();
+        cache
+            .tokens
+            .entry((*foreign_subject.entity_id().as_bytes(), channel))
+            .or_default()
+            .push(token);
+
+        // The cache slot exists for foreign_subject, but the inner
+        // token's signed `subject` is real_subject. Check must
+        // refuse — pre-fix the predicate matched any token in the
+        // slot regardless of the inner field.
+        assert!(cache
+            .check(foreign_subject.entity_id(), TokenScope::PUBLISH, channel)
+            .is_err());
+    }
+
+    /// Revocation floor is monotonic: bumping with a lower value is
+    /// a no-op. Prevents accidental un-revocation under racing
+    /// rotation attempts.
+    #[test]
+    fn revocation_floor_is_monotonic() {
+        let issuer = EntityKeypair::generate();
+        let registry = RevocationRegistry::new();
+        registry.revoke_below(issuer.entity_id(), 5);
+        assert_eq!(registry.floor(issuer.entity_id()), 5);
+        // Lower value: no-op.
+        registry.revoke_below(issuer.entity_id(), 2);
+        assert_eq!(registry.floor(issuer.entity_id()), 5);
+        // Higher value: advances.
+        registry.revoke_below(issuer.entity_id(), 10);
+        assert_eq!(registry.floor(issuer.entity_id()), 10);
+    }
+
+    /// A delegated child must inherit its parent's
+    /// `issuer_generation` so a floor bump on the issuer's key
+    /// invalidates the child transitively without a chain walk.
+    #[test]
+    fn delegate_inherits_parent_issuer_generation() {
+        let issuer = EntityKeypair::generate();
+        let intermediate = EntityKeypair::generate();
+        let leaf = EntityKeypair::generate();
+
+        let mut parent = PermissionToken::issue(
+            &issuer,
+            intermediate.entity_id().clone(),
+            TokenScope::PUBLISH.union(TokenScope::DELEGATE),
+            0xCAFE_BABE,
+            3600,
+            2,
+        );
+        // Simulate a parent issued at generation 7.
+        parent.issuer_generation = 7;
+        // Re-sign so the modified payload still verifies — bypass
+        // the public `delegate` because it's the issuer's keypair
+        // that signs the parent.
+        let payload = parent.signed_payload();
+        parent.signature = issuer.sign(&payload).to_bytes();
+
+        let child = parent
+            .delegate(&intermediate, leaf.entity_id().clone(), TokenScope::PUBLISH)
+            .expect("delegate should succeed");
+        assert_eq!(
+            child.issuer_generation, 7,
+            "child must inherit parent's issuer_generation"
+        );
+    }
+
+    /// A token bound to channel hash `H_a` (u64) must NOT authorize a
+    /// channel whose hash `H_b` collides with `H_a` only in the low
+    /// 32 bits. Pre-widening, ChannelHash was xxh3_64(name) as u32, so
+    /// any two names sharing the low 32 bits of the xxh3_64 digest
+    /// hashed equal. Now the cache and `authorizes` consume the full
+    /// u64, so two hashes that differ in the high 32 bits cannot
+    /// authorize each other — closing the targeted-collision attack
+    /// on the token fast path.
+    #[test]
+    fn token_cache_check_distinguishes_u32_aliased_u64_hashes() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+
+        let cache = TokenCache::new();
+        // Two hashes that share the low 32 bits but differ in the high
+        // 32 bits — exactly the shape a 2^32 grinding attack would have
+        // produced under the old `as u32` cast.
+        let h_a: ChannelHash = 0x0000_0001_DEAD_BEEF;
+        let h_b: ChannelHash = 0xDEAD_BEEF_DEAD_BEEF;
+        assert_ne!(h_a, h_b);
+        assert_eq!(h_a as u32, h_b as u32, "test setup: low 32 must alias");
+
+        let token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            h_a,
+            3600,
+            0,
+        );
+        cache.insert(token).expect("token should verify");
+
+        // The legitimate channel admits the token.
+        assert!(cache
+            .check(subject.entity_id(), TokenScope::PUBLISH, h_a)
+            .is_ok());
+        // The u32-aliased channel must NOT admit it.
+        assert!(
+            cache
+                .check(subject.entity_id(), TokenScope::PUBLISH, h_b)
+                .is_err(),
+            "token bound to h_a must not authorize h_b that aliases on low 32 bits"
+        );
     }
 
     #[test]
@@ -1839,14 +2424,21 @@ mod tests {
         let subject_id = subject_kp.entity_id().clone();
         let channel_hash: ChannelHash = 0xBEEF;
 
-        // Short-lived token: 1 s TTL. Insert it then let it
+        // Short-lived token: 3 s TTL. Insert it then let it
         // expire naturally during the race.
+        //
+        // `current_timestamp` is second-resolution, so a 1 s TTL has
+        // a ~1 s race window: insert at the very end of second T can
+        // produce `not_after == T + 1` while the immediate post-
+        // insert check already runs in second T + 1 (`now >=
+        // not_after` → Expired). 3 s of headroom keeps the pre-
+        // expiry check robust without lengthening the race body.
         let token = PermissionToken::issue(
             &issuer,
             subject_id.clone(),
             TokenScope::PUBLISH,
             channel_hash,
-            1, // 1-second TTL
+            3, // 3-second TTL
             0,
         );
         cache.insert_unchecked(token);
@@ -1885,9 +2477,9 @@ mod tests {
         };
 
         // Wait for TTL to elapse. `current_timestamp` is
-        // second-resolution, so 1.5 s of wall clock guarantees
-        // `not_after` < `now`.
-        thread::sleep(Duration::from_millis(1_500));
+        // second-resolution, so 3.5 s of wall clock guarantees
+        // `not_after` < `now` for the 3 s TTL above.
+        thread::sleep(Duration::from_millis(3_500));
 
         checker.join().expect("checker panicked");
         evictor.join().expect("evictor panicked");
@@ -1945,7 +2537,7 @@ mod tests {
 
         // Fill the cache to capacity using the same subject with
         // varying channel_hash. `MAX_TOKEN_SLOTS` is 65_536; channel
-        // hash is `ChannelHash` (u32, ~4 B distinct values), so we
+        // hash is `ChannelHash` (u64, ~18 EB distinct values), so we
         // pack the cache to capacity by varying the low bits.
         // Building 65_536 PermissionTokens would do 65_536 ed25519
         // signs, which is too slow for a unit test — instead we

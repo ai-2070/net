@@ -6,18 +6,27 @@
 //! # Safety
 //!
 //! All public FFI functions in this module accept raw pointers from C code.
-//! While they are not marked `unsafe` (to maintain C ABI compatibility),
-//! callers must ensure:
+//! Each is declared `pub unsafe extern "C" fn` so the unsafety is
+//! explicit at the type level; the module-wide contract callers
+//! must uphold is:
 //! - Pointers are valid and properly aligned
 //! - String pointers point to valid UTF-8 data
 //! - Buffer sizes are accurate
 //! - Handles are not used after `net_shutdown`
+//!
+//! The per-function `# Safety` rustdoc is intentionally suppressed
+//! at the module level — every entry point shares the same contract
+//! and the module doc-comment above (plus `include/README.md`) is
+//! the source of truth. Adding individual `# Safety` blocks would
+//! duplicate the same wording 200 times without adding signal.
 //!
 //! # Thread Safety
 //!
 //! All FFI functions are thread-safe. The event bus handle can be shared
 //! across threads.
 //!
+#![allow(clippy::missing_safety_doc)]
+
 //! # Tokio runtime restriction
 //!
 //! Internal FFI ops (`net_poll`, `net_flush`, `net_shutdown`,
@@ -429,7 +438,7 @@ fn enter_ffi_op(handle: &NetHandle) -> Result<FfiOpGuard<'_>, c_int> {
 /// }
 /// ```
 #[unsafe(no_mangle)]
-pub extern "C" fn net_init(config_json: *const c_char) -> *mut NetHandle {
+pub unsafe extern "C" fn net_init(config_json: *const c_char) -> *mut NetHandle {
     // Parse and validate the config BEFORE constructing the tokio
     // runtime. Building the runtime first would let any subsequent
     // early-return path (`CStr::to_str` Err, `parse_config_json`
@@ -713,7 +722,7 @@ fn create_with_config(runtime: Runtime, config: EventBusConfig) -> *mut NetHandl
 /// - `0` on success
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn net_ingest(
+pub unsafe extern "C" fn net_ingest(
     handle: *mut NetHandle,
     event_json: *const c_char,
     len: usize,
@@ -772,7 +781,11 @@ pub extern "C" fn net_ingest(
 /// - `0` on success
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn net_ingest_raw(handle: *mut NetHandle, json: *const c_char, len: usize) -> c_int {
+pub unsafe extern "C" fn net_ingest_raw(
+    handle: *mut NetHandle,
+    json: *const c_char,
+    len: usize,
+) -> c_int {
     if !handle_is_valid(handle) || json.is_null() {
         return NetError::NullPointer.into();
     }
@@ -814,7 +827,7 @@ pub extern "C" fn net_ingest_raw(handle: *mut NetHandle, json: *const c_char, le
 ///
 /// Number of successfully ingested events, or negative error code.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_ingest_raw_batch(
+pub unsafe extern "C" fn net_ingest_raw_batch(
     handle: *mut NetHandle,
     jsons: *const *const c_char,
     lens: *const usize,
@@ -924,7 +937,10 @@ pub extern "C" fn net_ingest_raw_batch(
 ///
 /// Number of successfully ingested events, or negative error code.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_ingest_batch(handle: *mut NetHandle, events_json: *const c_char) -> c_int {
+pub unsafe extern "C" fn net_ingest_batch(
+    handle: *mut NetHandle,
+    events_json: *const c_char,
+) -> c_int {
     if !handle_is_valid(handle) || events_json.is_null() {
         return NetError::NullPointer.into();
     }
@@ -1004,7 +1020,7 @@ fn parse_poll_request_json(json_str: &str) -> Result<ConsumeRequest, c_int> {
 /// - Number of bytes written to buffer on success
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn net_poll(
+pub unsafe extern "C" fn net_poll(
     handle: *mut NetHandle,
     request_json: *const c_char,
     out_buffer: *mut c_char,
@@ -1153,7 +1169,7 @@ pub extern "C" fn net_poll(
 ///
 /// Number of bytes written, or negative error code.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_stats(
+pub unsafe extern "C" fn net_stats(
     handle: *mut NetHandle,
     out_buffer: *mut c_char,
     buffer_len: usize,
@@ -1214,7 +1230,7 @@ pub extern "C" fn net_stats(
 /// - `0` on success
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn net_flush(handle: *mut NetHandle) -> c_int {
+pub unsafe extern "C" fn net_flush(handle: *mut NetHandle) -> c_int {
     if !handle_is_valid(handle) {
         return NetError::NullPointer.into();
     }
@@ -1251,7 +1267,7 @@ pub extern "C" fn net_flush(handle: *mut NetHandle) -> c_int {
 /// a one-time cost per shutdown — typically per-process, since most C
 /// callers initialize the bus once and shut down once.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
+pub unsafe extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
     if !handle_is_valid(handle) {
         return NetError::NullPointer.into();
     }
@@ -1409,7 +1425,7 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
 ///
 /// Number of shards, or 0 if handle is null.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_num_shards(handle: *mut NetHandle) -> u16 {
+pub unsafe extern "C" fn net_num_shards(handle: *mut NetHandle) -> u16 {
     if !handle_is_valid(handle) {
         return 0;
     }
@@ -1427,7 +1443,7 @@ pub extern "C" fn net_num_shards(handle: *mut NetHandle) -> u16 {
 ///
 /// Version string (static, do not free).
 #[unsafe(no_mangle)]
-pub extern "C" fn net_version() -> *const c_char {
+pub unsafe extern "C" fn net_version() -> *const c_char {
     static VERSION: &[u8] = b"0.8.0\0";
     VERSION.as_ptr() as *const c_char
 }
@@ -1441,7 +1457,7 @@ pub extern "C" fn net_version() -> *const c_char {
 /// Returns NULL if Net feature is not enabled.
 #[cfg(feature = "net")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_generate_keypair() -> *mut c_char {
+pub unsafe extern "C" fn net_generate_keypair() -> *mut c_char {
     let keypair = StaticKeypair::generate();
     let json = serde_json::json!({
         "public_key": hex::encode(keypair.public_key()),
@@ -1461,7 +1477,7 @@ pub extern "C" fn net_generate_keypair() -> *mut c_char {
 /// - `s`: String pointer returned by `net_generate_keypair` or similar.
 #[cfg(feature = "net")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_free_string(s: *mut c_char) {
+pub unsafe extern "C" fn net_free_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
             drop(CString::from_raw(s));
@@ -1484,7 +1500,7 @@ pub extern "C" fn net_free_string(s: *mut c_char) {
 /// Returns NULL since keypair generation requires the net feature.
 #[cfg(not(feature = "net"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_generate_keypair() -> *mut c_char {
+pub unsafe extern "C" fn net_generate_keypair() -> *mut c_char {
     ptr::null_mut()
 }
 
@@ -1494,7 +1510,7 @@ pub extern "C" fn net_generate_keypair() -> *mut c_char {
 /// CString-allocated pointer if non-null.
 #[cfg(not(feature = "net"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_free_string(s: *mut c_char) {
+pub unsafe extern "C" fn net_free_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
             drop(std::ffi::CString::from_raw(s));
@@ -1617,7 +1633,7 @@ pub struct NetStats {
 
 /// Ingest raw JSON with structured receipt.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_ingest_raw_ex(
+pub unsafe extern "C" fn net_ingest_raw_ex(
     handle: *mut NetHandle,
     json: *const c_char,
     len: usize,
@@ -1663,7 +1679,7 @@ pub extern "C" fn net_ingest_raw_ex(
 ///
 /// The caller must free the result with `net_free_poll_result`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_poll_ex(
+pub unsafe extern "C" fn net_poll_ex(
     handle: *mut NetHandle,
     limit: usize,
     cursor: *const c_char,
@@ -1859,7 +1875,7 @@ fn free_events_array_partial(events: *mut NetEvent, walk_count: usize, alloc_cou
 /// itself, which is caller-provided (typically stack-allocated or managed by
 /// the caller).
 #[unsafe(no_mangle)]
-pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
+pub unsafe extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
     if result.is_null() {
         return;
     }
@@ -1890,7 +1906,7 @@ pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
 
 /// Get stats without JSON serialization.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_stats_ex(handle: *mut NetHandle, out: *mut NetStats) -> c_int {
+pub unsafe extern "C" fn net_stats_ex(handle: *mut NetHandle, out: *mut NetStats) -> c_int {
     if !handle_is_valid(handle) || out.is_null() {
         return NetError::NullPointer.into();
     }

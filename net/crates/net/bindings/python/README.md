@@ -481,13 +481,13 @@ print(redex.greedy_cached_channel_count())
 print(redex.greedy_prometheus_text())
 ```
 
-The canonical channel hash is 32-bit (`channel_hash(name)` returns
-`int` in the u32 range). The per-packet wire `NetHeader`
+The canonical channel hash is 64-bit (`channel_hash(name)` returns
+`int` in the u64 range). The per-packet wire `NetHeader`
 `channel_hash` stays `u16` — fast-path filter hint, may
 bucket-collide at scale; ACL / config / cache / RYW decisions key
-on the canonical 32-bit hash via registry disambiguation. The
-`PermissionToken` wire form is 161 bytes (the channel-hash
-widening grew it from 159).
+on the canonical 64-bit hash via registry disambiguation. The
+`PermissionToken` wire form is 169 bytes (`PermissionToken::WIRE_SIZE`
+in the Rust core).
 
 ## Redis Streams consumer-side dedup helper
 

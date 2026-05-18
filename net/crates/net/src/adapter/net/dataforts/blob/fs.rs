@@ -58,6 +58,38 @@ pub const DEFAULT_FS_ADAPTER_CONCURRENCY: usize = 64;
 
 /// Filesystem-backed blob adapter. Content-addressed by BLAKE3 hash
 /// under a caller-supplied root directory.
+///
+/// # Threat model
+///
+/// The adapter assumes the configured `root` directory is writable
+/// **only by the substrate process** (and any process running with
+/// the same uid). Operators MUST enforce this contract via filesystem
+/// permissions — typically `chown <daemon-user> <root>` plus mode
+/// `0700` on Unix, or an equivalent ACL on Windows.
+///
+/// Cross-process write access inside `root` by a non-substrate user
+/// enables a symlink-swap window between the in-store `canonicalize`
+/// check and the `rename(tmp, path)` system call. An attacker who
+/// can pre-create or replace `<root>/<shard>/` between those two
+/// operations can redirect the rename target outside the root.
+///
+/// In-code defenses are defense-in-depth, not a complete sandbox:
+///
+/// - `store` canonicalizes the parent directory and rejects writes
+///   whose parent isn't `starts_with(root)`. Closes the obvious
+///   "shard pre-created as a symlink before any write" case but
+///   not the post-canonicalize swap.
+/// - `store` falls back on rename failure to reading the existing
+///   file and verifying its content hash against the expected
+///   `BlobRef`. Mitigates the case where a concurrent legitimate
+///   writer landed first but not the case where an attacker swaps
+///   the parent under us.
+///
+/// If a deployment ever needs to host the root in a shared-scratch
+/// environment, adopt platform-specific path-confinement primitives
+/// (Linux `openat2` with `RESOLVE_BENEATH`, Windows
+/// `FILE_FLAG_OPEN_REPARSE_POINT`) behind a feature flag rather
+/// than relying on the documented exclusive-ownership contract.
 #[derive(Debug, Clone)]
 pub struct FileSystemAdapter {
     id: String,
@@ -114,10 +146,18 @@ fn backend(e: impl std::fmt::Display) -> BlobError {
 /// and `0x7F`) escape to `\xNN`, length caps at 256 bytes.
 fn sanitize_uri_for_error(uri: &str) -> String {
     const MAX_LEN: usize = 256;
-    let trimmed = if uri.len() > MAX_LEN {
-        &uri[..MAX_LEN]
+    // Slice on a char boundary — a publisher-supplied URI that's
+    // valid UTF-8 can still have a multi-byte codepoint straddling
+    // byte 256; `&uri[..MAX_LEN]` would panic mid-codepoint and crash
+    // inside `spawn_blocking`.
+    let (trimmed, truncated) = if uri.len() > MAX_LEN {
+        let cut = (0..=MAX_LEN)
+            .rev()
+            .find(|&i| uri.is_char_boundary(i))
+            .unwrap_or(0);
+        (&uri[..cut], true)
     } else {
-        uri
+        (uri, false)
     };
     let mut out = String::with_capacity(trimmed.len());
     for c in trimmed.chars() {
@@ -127,7 +167,7 @@ fn sanitize_uri_for_error(uri: &str) -> String {
             out.push(c);
         }
     }
-    if uri.len() > MAX_LEN {
+    if truncated {
         out.push('…');
     }
     out
@@ -508,6 +548,34 @@ impl BlobAdapter for FileSystemAdapter {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// `sanitize_uri_for_error` is called from error paths inside
+    /// `spawn_blocking`. A publisher-controlled URI with a multi-byte
+    /// UTF-8 codepoint straddling the truncation boundary must NOT
+    /// panic — the previous byte-slice formulation crashed the
+    /// blocking task and surfaced as a `JoinError` on the caller.
+    #[test]
+    fn sanitize_uri_handles_multibyte_at_boundary() {
+        // 255 ASCII bytes followed by a 4-byte UTF-8 codepoint — the
+        // emoji's first byte lands at index 255, its last at 258, so
+        // a byte slice at index 256 would split the codepoint.
+        let uri = format!("{}{}", "a".repeat(255), "🦀");
+        let out = sanitize_uri_for_error(&uri);
+        // Must not panic, and must end with the truncation marker
+        // since the input exceeded MAX_LEN.
+        assert!(
+            out.ends_with('…'),
+            "expected truncation marker, got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn sanitize_uri_preserves_short_input() {
+        let uri = "file:///🦀/path";
+        let out = sanitize_uri_for_error(uri);
+        assert_eq!(out, uri);
+    }
 
     fn unique_root() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);

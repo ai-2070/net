@@ -107,6 +107,14 @@ pub fn parse_blob_heat_tag(tag: &Tag) -> Option<([u8; 32], f64)> {
     if hex.len() != 64 {
         return None;
     }
+    // Reject mixed-case hex — the producer-side encoder writes
+    // lowercase, and accepting uppercase here lets two tags with
+    // the same logical hash but different cased representations
+    // create distinct gravity-decision entries downstream. Tighten
+    // the wire shape to the encoder's canonical form.
+    if hex.bytes().any(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
     let mut hash = [0u8; 32];
     for (i, byte) in hash.iter_mut().enumerate() {
         let pair = hex.get(i * 2..i * 2 + 2)?;

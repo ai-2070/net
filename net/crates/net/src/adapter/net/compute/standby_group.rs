@@ -96,6 +96,16 @@ pub struct StandbyGroup {
     buffered_since_sync: Vec<CausalEvent>,
     /// Shared coordination (member tracking, placement).
     coord: GroupCoordinator,
+    /// X-1 epoch — bumped on every `promote` /
+    /// `promote_with_placement`. The first active starts at 1; each
+    /// subsequent promotion increments. The intended use is
+    /// cross-node fencing: routed events should carry the issuing
+    /// active's `term`, and a receiver that observes a strictly-
+    /// higher `term` than its own demotes to standby. The cross-
+    /// node wire integration is a separate change; this counter is
+    /// the local scaffolding it builds on, and `term()` exposes it
+    /// to operators / future wire layers.
+    term: u64,
 }
 
 impl StandbyGroup {
@@ -175,7 +185,19 @@ impl StandbyGroup {
             members,
             buffered_since_sync: Vec::new(),
             coord,
+            // Spawn-time active is term 1; every subsequent
+            // `promote` increments.
+            term: 1,
         })
+    }
+
+    /// Current epoch counter. Bumped on every successful
+    /// `promote` / `promote_with_placement`. Cross-node fencing
+    /// (X-1) consumes this to reject events from a stale active
+    /// after a partition heal; the wire integration is a
+    /// separate change.
+    pub fn term(&self) -> u64 {
+        self.term
     }
 
     /// Get the origin_hash of the active member.
@@ -363,12 +385,43 @@ impl StandbyGroup {
         // Promote
         self.active_index = best_standby;
         self.members[best_standby as usize].role = MemberRole::Active;
+        // X-1 epoch bump. Every promotion advances the term; a
+        // future wire-fencing layer compares an incoming event's
+        // term against the receiver's recorded term and rejects
+        // strictly-lower-term events (stale active still
+        // emitting after partition heal) or self-demotes on a
+        // strictly-higher-term observation. `saturating_add`
+        // pins the post-u64::MAX case at the cap rather than
+        // wrapping — an astronomical precondition, but cheap to
+        // bound.
+        self.term = self.term.saturating_add(1);
 
         let new_active_origin = self.coord.members()[best_standby as usize].origin_hash;
 
-        // Replay buffered events on the new active
+        // Replay buffered events on the new active — but only the
+        // ones strictly above the new active's last `synced_through`.
+        //
+        // `buffered_since_sync` is preserved verbatim across partial
+        // sync rounds so a failed standby can catch up next cycle
+        // (line ~286); succeeded standbys have their
+        // `synced_through` advanced to the snapshot's through_seq
+        // but the buffer keeps its older entries. Without the
+        // filter, a succeeded-then-promoted standby has already
+        // applied events in `[old_synced_through, new_synced_through]`
+        // via the snapshot — replaying the full buffer here re-
+        // invokes the daemon's `on_event` for each, doubling
+        // counters, re-issuing idempotency keys, and re-firing
+        // side effects. The new sequence-aware filter restricts
+        // the replay to `event.link.sequence > synced_through` so
+        // every event lands on the promoted daemon exactly once
+        // (covered by the snapshot's pre-state, then extended by
+        // the post-snapshot tail). Per-event check is cheap; the
+        // buffer is bounded by the sync cadence.
+        let synced_through = self.members[best_standby as usize].synced_through;
         for event in &self.buffered_since_sync {
-            let _ = registry.deliver(new_active_origin, event);
+            if event.link.sequence > synced_through {
+                let _ = registry.deliver(new_active_origin, event);
+            }
         }
         self.buffered_since_sync.clear();
 
@@ -560,6 +613,7 @@ impl StandbyGroup {
             members,
             buffered_since_sync: Vec::new(),
             coord,
+            term: 1,
         })
     }
 
@@ -666,11 +720,24 @@ impl StandbyGroup {
 
         self.active_index = best_standby;
         self.members[best_standby as usize].role = MemberRole::Active;
+        // X-1 epoch bump — see promote() above for rationale.
+        self.term = self.term.saturating_add(1);
 
         let new_active_origin = self.coord.members()[best_standby as usize].origin_hash;
 
+        // Filter the replay to events strictly past the new
+        // active's `synced_through`. See the equivalent block in
+        // `promote` for the partial-sync corruption it prevents:
+        // a succeeded-then-promoted standby has already applied
+        // events up to `synced_through` via the snapshot, and
+        // replaying the full buffer here would double every
+        // counter / idempotency key / side effect inside that
+        // already-applied range.
+        let synced_through = self.members[best_standby as usize].synced_through;
         for event in &self.buffered_since_sync {
-            let _ = registry.deliver(new_active_origin, event);
+            if event.link.sequence > synced_through {
+                let _ = registry.deliver(new_active_origin, event);
+            }
         }
         self.buffered_since_sync.clear();
 
@@ -782,6 +849,94 @@ impl StandbyGroup {
         self.coord.on_node_recovery(recovered_node_id, registry);
     }
 
+    /// Retry placement against the current healthy node pool for
+    /// every member slot currently marked unhealthy. Caps at
+    /// `MAX_RECOVERIES_PER_TICK` so a pathological "every slot
+    /// unhealthy" state makes progress without wedging the caller.
+    /// Returns the slot indices that were successfully placed.
+    ///
+    /// Skips `active_index` even when it is marked unhealthy: a
+    /// blank `DaemonHost::new` here would `registry.replace` the
+    /// live active and wipe its committed state. An unhealthy
+    /// active requires `promote` (which transfers the latest
+    /// standby snapshot + replays buffered events), not slot
+    /// re-placement.
+    fn try_recover_inner<F>(
+        &mut self,
+        scheduler: &Scheduler,
+        registry: &DaemonRegistry,
+        daemon_factory: F,
+    ) -> Vec<u8>
+    where
+        F: Fn() -> Box<dyn MeshDaemon>,
+    {
+        const MAX_RECOVERIES_PER_TICK: usize = 4;
+        let active_index = self.active_index;
+        let unhealthy: Vec<u8> = self
+            .coord
+            .members()
+            .iter()
+            .filter(|m| !m.healthy && m.index != active_index)
+            .map(|m| m.index)
+            .take(MAX_RECOVERIES_PER_TICK)
+            .collect();
+        if unhealthy.is_empty() {
+            return Vec::new();
+        }
+
+        let requirements = daemon_factory().requirements();
+        let mut exclude: HashSet<u64> = self
+            .coord
+            .members()
+            .iter()
+            .filter(|m| m.healthy)
+            .map(|m| m.node_id)
+            .collect();
+        let mut recovered = Vec::with_capacity(unhealthy.len());
+
+        for index in unhealthy {
+            let keypair = EntityKeypair::from_bytes(self.members[index as usize].keypair_secret);
+            let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
+
+            let placement =
+                match GroupCoordinator::place_with_spread(scheduler, &requirements, &exclude) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::trace!(
+                            index,
+                            error = %e,
+                            "StandbyGroup::try_recover: place_with_spread still failing; \
+                             slot remains unhealthy for next tick"
+                        );
+                        continue;
+                    }
+                };
+
+            let daemon = daemon_factory();
+            let host = DaemonHost::new(daemon, keypair, self.config.host_config.clone());
+            registry.replace(host);
+
+            self.coord
+                .update_member_placement(index, placement.node_id, entity_id_bytes);
+            self.members[index as usize].synced_through = 0;
+            self.members[index as usize].last_sync = None;
+            exclude.insert(placement.node_id);
+            recovered.push(index);
+        }
+
+        // X-1 epoch bump on any successful slot re-placement, matching
+        // `ForkGroup::try_recover_inner` / `ReplicaGroup::try_recover_inner`.
+        // A standby placed on a new node here is a membership change;
+        // peers that still believe the slot lives on its old node must
+        // observe a higher term so they can refresh routing before the
+        // fenced wire-layer rejects their stale-term snapshot syncs.
+        // No-op if every placement attempt failed.
+        if !recovered.is_empty() {
+            self.term = self.term.saturating_add(1);
+        }
+        recovered
+    }
+
     /// Aggregate health.
     pub fn health(&self) -> GroupHealth {
         self.coord.health()
@@ -830,6 +985,31 @@ impl StandbyGroup {
     /// Number of standbys (total - 1 active).
     pub fn standby_count(&self) -> u8 {
         self.coord.member_count().saturating_sub(1)
+    }
+}
+
+impl crate::adapter::net::compute::UnhealthySlotRecovery for StandbyGroup {
+    fn has_unhealthy_slots(&self) -> bool {
+        // Only standby slots are recoverable here; an unhealthy
+        // active must go through `promote`, not slot re-placement
+        // (see `try_recover_inner`). Returning `true` for an
+        // unhealthy-active-only state would make the recovery
+        // tick fire repeatedly with nothing to do, since the
+        // active slot is skipped inside `try_recover`.
+        let active_index = self.active_index;
+        self.coord
+            .members()
+            .iter()
+            .any(|m| !m.healthy && m.index != active_index)
+    }
+
+    fn try_recover(
+        &mut self,
+        scheduler: &Scheduler,
+        registry: &DaemonRegistry,
+        daemon_factory: &dyn Fn() -> Box<dyn MeshDaemon>,
+    ) -> Vec<u8> {
+        self.try_recover_inner(scheduler, registry, daemon_factory)
     }
 }
 
@@ -1197,6 +1377,115 @@ mod tests {
         assert!(
             group.buffered_event_count() > 0,
             "buffered_since_sync must be retained on partial failure",
+        );
+    }
+
+    /// X-1 epoch scaffolding: every successful `promote` bumps
+    /// the `term` counter. A future cross-node fencing layer uses
+    /// this to reject events from a stale active after a
+    /// partition heal; this test pins the local bump semantic.
+    #[test]
+    fn promote_bumps_term_counter() {
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+
+        // Spawn-time active is term 1.
+        assert_eq!(group.term(), 1);
+
+        // First promote → term 2.
+        let _ = group
+            .promote(|| Box::new(StatefulDaemon::new()), &reg, &sched)
+            .expect("first promote");
+        assert_eq!(group.term(), 2);
+
+        // Second promote → term 3. Drives the term advancement
+        // documented for partition-heal fencing.
+        let _ = group
+            .promote(|| Box::new(StatefulDaemon::new()), &reg, &sched)
+            .expect("second promote");
+        assert_eq!(group.term(), 3);
+    }
+
+    /// X-19 regression: a `promote` that picks a succeeded standby
+    /// after a partial `sync_standbys` must NOT replay buffered
+    /// events that the chosen standby already received via the
+    /// snapshot. The pre-fix path replayed the entire buffer
+    /// unconditionally, doubling every side-effect inside the
+    /// `[old_synced_through, new_synced_through]` range — silent
+    /// state corruption on the promoted daemon.
+    #[test]
+    fn promote_does_not_double_apply_events_within_synced_range() {
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+
+        // Baseline: drive 5 events through the active and sync
+        // both standbys cleanly. Each successful event bumps
+        // StatefulDaemon::value by 1, so the active's value is 5
+        // and both standbys' snapshots restore to value=5.
+        for seq in 1..=5 {
+            let event = make_event(seq);
+            reg.deliver(group.active_origin(), &event).unwrap();
+            group.on_event_delivered(event);
+        }
+        group.sync_standbys(&reg).unwrap();
+
+        // Buffer events 6..=10 on the active, then drop standby 2
+        // so its restore fails inside the next sync — exactly the
+        // partial-failure shape the audit calls out.
+        for seq in 6..=10 {
+            let event = make_event(seq);
+            reg.deliver(group.active_origin(), &event).unwrap();
+            group.on_event_delivered(event);
+        }
+        let standby_2_origin = group
+            .members
+            .iter()
+            .find(|m| m.role == MemberRole::Standby && m.index == 2)
+            .map(|m| group.coord.members()[m.index as usize].origin_hash)
+            .expect("standby 2");
+        reg.unregister(standby_2_origin).unwrap();
+
+        // Partial sync: standby 1 receives the snapshot (value=10
+        // post-restore), standby 2 errors out mid-loop. Buffer is
+        // retained so a future cycle can still recover standby 2.
+        let _ = group.sync_standbys(&reg);
+        assert_eq!(group.synced_through(1), Some(10));
+        assert!(group.buffered_event_count() > 0);
+
+        // Promote — must pick standby 1 (highest synced_through).
+        let new_active = group
+            .promote(|| Box::new(StatefulDaemon::new()), &reg, &sched)
+            .expect("promote should pick the succeeded standby");
+
+        // With the fix: every buffered event has sequence ≤ 10
+        // (the new active's synced_through), so all are filtered.
+        // StatefulDaemon::value stays at 10. Pre-fix the replay
+        // unconditionally fired `process` for each of events
+        // 6..=10, pushing value to 15.
+        let value = reg
+            .with_host(new_active, |host| {
+                let snap = host.take_snapshot().expect("snapshot");
+                u64::from_le_bytes(snap.state[..8].try_into().expect("8 bytes"))
+            })
+            .expect("with_host");
+        assert_eq!(
+            value, 10,
+            "promote must not double-apply events already in the new active's snapshot"
         );
     }
 
@@ -1870,6 +2159,165 @@ mod tests {
             "active failure → promote returns Some"
         );
         assert_ne!(group.active_index(), 0, "active is no longer index 0");
+    }
+
+    /// Regression: `try_recover` must skip the active slot even when
+    /// `coord.mark_unhealthy(active_index)` is set. Pre-fix the
+    /// recovery path constructed a fresh `DaemonHost::new` and
+    /// `registry.replace`d the live active, wiping committed state
+    /// and resetting `synced_through` / `last_sync`. Active recovery
+    /// belongs to `promote`, not slot re-placement; the recovery
+    /// trait must also report `has_unhealthy_slots() == false` when
+    /// only the active is unhealthy, so the meshos tick doesn't busy-
+    /// loop calling `try_recover` with nothing to do.
+    #[test]
+    fn try_recover_skips_unhealthy_active_and_preserves_state() {
+        use crate::adapter::net::compute::UnhealthySlotRecovery;
+
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+
+        // Advance the active's state so a clobber is detectable.
+        let active_origin_before = group.active_origin();
+        for seq in 1..=5 {
+            let event = make_event(seq);
+            reg.deliver(active_origin_before, &event).unwrap();
+            group.on_event_delivered(event);
+        }
+        group.sync_standbys(&reg).unwrap();
+        let snapshot_before = reg.snapshot(active_origin_before).unwrap().unwrap();
+
+        // Simulate active node being briefly flagged unhealthy.
+        let active_index = group.active_index();
+        group.coord.mark_unhealthy(active_index);
+
+        // Recovery probe must NOT advertise work when only the active
+        // is unhealthy — promote, not recover, is the right tool.
+        assert!(
+            !group.has_unhealthy_slots(),
+            "has_unhealthy_slots must skip the active slot; only standby slots are recoverable",
+        );
+
+        let recovered = group.try_recover(&sched, &reg, &|| Box::new(StatefulDaemon::new()));
+        assert!(
+            !recovered.contains(&active_index),
+            "try_recover must NOT include the active index in the recovered set",
+        );
+
+        // Active's daemon-host state is untouched: same origin, same
+        // serialized snapshot bytes.
+        assert_eq!(
+            group.active_origin(),
+            active_origin_before,
+            "active origin must be unchanged after a try_recover on the active slot",
+        );
+        let snapshot_after = reg.snapshot(active_origin_before).unwrap().unwrap();
+        assert_eq!(
+            snapshot_before.state, snapshot_after.state,
+            "active's daemon state must be preserved; try_recover must not replace the live active",
+        );
+
+        // The standby slots remain healthy too, so no spurious work.
+        assert_eq!(
+            group.members().iter().filter(|m| m.healthy).count(),
+            2,
+            "two standbys still healthy",
+        );
+    }
+
+    /// Regression: every successful standby-slot re-placement in
+    /// `try_recover` must bump `term`, matching
+    /// `ForkGroup::try_recover_inner` / `ReplicaGroup::try_recover_inner`.
+    /// Pre-fix the bump was missing — a sibling that still routed
+    /// snapshot syncs to the slot's old node would never observe a
+    /// higher term and would keep targeting the wrong node.
+    #[test]
+    fn try_recover_bumps_term_on_standby_replacement() {
+        use crate::adapter::net::compute::UnhealthySlotRecovery;
+
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+        let term_before = group.term();
+
+        // Mark a standby unhealthy so try_recover has work to do.
+        let active_index = group.active_index();
+        let standby_index: u8 = (0u8..group.member_count())
+            .find(|i| *i != active_index)
+            .unwrap();
+        group.coord.mark_unhealthy(standby_index);
+
+        let recovered = group.try_recover(&sched, &reg, &|| Box::new(StatefulDaemon::new()));
+        assert!(
+            !recovered.is_empty(),
+            "test fixture's scheduler must be able to re-place the standby",
+        );
+        assert_eq!(
+            group.term(),
+            term_before.saturating_add(1),
+            "term must advance once on successful slot re-placement",
+        );
+
+        // Idle try_recover (no unhealthy slots) does NOT bump.
+        let term_after_first = group.term();
+        let _ = group.try_recover(&sched, &reg, &|| Box::new(StatefulDaemon::new()));
+        assert_eq!(
+            group.term(),
+            term_after_first,
+            "no-op try_recover must not advance term",
+        );
+    }
+
+    /// Companion: when a standby IS unhealthy alongside an unhealthy
+    /// active, `try_recover` repairs the standby and leaves the active
+    /// alone. `has_unhealthy_slots` returns true on account of the
+    /// standby, not the active.
+    #[test]
+    fn try_recover_repairs_standby_even_when_active_also_unhealthy() {
+        use crate::adapter::net::compute::UnhealthySlotRecovery;
+
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+        let active_index = group.active_index();
+        let active_origin_before = group.active_origin();
+
+        // Mark the active AND a standby unhealthy.
+        group.coord.mark_unhealthy(active_index);
+        let standby_index: u8 = (0u8..group.member_count())
+            .find(|i| *i != active_index)
+            .unwrap();
+        group.coord.mark_unhealthy(standby_index);
+
+        assert!(group.has_unhealthy_slots(), "standby slot is recoverable");
+        let recovered = group.try_recover(&sched, &reg, &|| Box::new(StatefulDaemon::new()));
+        assert!(!recovered.contains(&active_index), "active still skipped",);
+        assert_eq!(
+            group.active_origin(),
+            active_origin_before,
+            "active origin preserved",
+        );
     }
 
     /// `spawn` (v1) is unchanged after the v2 surface lands.

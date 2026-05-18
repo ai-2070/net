@@ -237,8 +237,16 @@ impl BlobMetrics {
         // 10.0 is a generous ceiling — `disk_used > disk_total`
         // shouldn't happen but defends against an operator
         // misconfiguring `set_disk_capacity_bytes(small)` with
-        // an already-large `disk_used`.
-        let ratio = report.disk_ratio_at_end.clamp(0.0, 10.0);
+        // an already-large `disk_used`. Defend against `f64::NAN`
+        // by replacing with 0 — `(NaN * 1000.0) as u64` casts to
+        // 0 in Rust today but the spec is unsettled and a future
+        // change would silently corrupt the gauge.
+        let raw = report.disk_ratio_at_end;
+        let ratio = if raw.is_nan() {
+            0.0
+        } else {
+            raw.clamp(0.0, 10.0)
+        };
         inner
             .overflow_disk_ratio_x1000
             .store((ratio * 1000.0) as u64, Ordering::Relaxed);

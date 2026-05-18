@@ -157,7 +157,7 @@ impl ChannelConfig {
 /// Registry of channel configurations.
 ///
 /// Keyed by channel name (not hash) to prevent hash collisions from silently
-/// overwriting security policies. The canonical [`ChannelHash`] (`u32`) is
+/// overwriting security policies. The canonical [`ChannelHash`] (`u64`) is
 /// collision-resistant at realistic scale (~65 K channels), and `by_hash`
 /// gives O(1) canonical-hash lookup; `by_wire_hash` resolves the wire
 /// `u16` fast-path hint into a list of canonical channels for receive-side
@@ -239,10 +239,10 @@ impl ChannelConfigRegistry {
         self.by_wire_hash.entry(wire_hash).or_default().push(name);
     }
 
-    /// Look up a channel config by canonical [`ChannelHash`] (`u32`).
+    /// Look up a channel config by canonical [`ChannelHash`] (`u64`).
     ///
     /// Returns `None` if the hash is unknown **or** if multiple channels
-    /// share the same canonical hash (rare at u32 — ~65 K channels before
+    /// share the same canonical hash (rare at u64 — ~65 K channels before
     /// birthday-collision threshold). Callers that need collision-safe
     /// lookups should use [`Self::get_by_name`] with the full channel name.
     ///

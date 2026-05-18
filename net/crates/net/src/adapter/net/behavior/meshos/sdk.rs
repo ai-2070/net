@@ -504,8 +504,8 @@ impl MeshOsDaemonHandle {
     /// Drive a graceful shutdown. Sends
     /// `DaemonControl::Shutdown { grace_period_ms }` to the
     /// daemon's control channel, parks for `grace` (or until
-    /// the daemon's task exits — whichever sooner), then
-    /// unregisters from the registry + router.
+    /// the daemon unregisters itself — whichever sooner), then
+    /// runs the failsafe unregister.
     pub async fn graceful_shutdown(mut self, grace: Duration) -> Result<(), SdkError> {
         // Inject a shutdown event so the daemon's `next_control`
         // loop wakes up.
@@ -516,10 +516,30 @@ impl MeshOsDaemonHandle {
                 grace_period_ms: grace_ms,
             },
         );
-        // Wait for the grace window; daemons that exit early
-        // can drop their handle to short-circuit (Drop runs
-        // unregister too).
-        tokio::time::sleep(grace).await;
+        // Park for the grace window, but short-circuit as soon as
+        // the daemon clears itself from the registry — a clean
+        // exit shouldn't be indistinguishable from a hung daemon.
+        // Pre-fix this was a blind `sleep(grace)`, multiplying
+        // shutdown latency across a fleet during rolling restarts
+        // for every daemon that exits faster than its grace
+        // window. 50 ms poll cadence is a compromise between
+        // wake-up latency on clean exit and CPU overhead during
+        // the grace window.
+        let deadline = tokio::time::Instant::now() + grace;
+        let mut poll = tokio::time::interval(Duration::from_millis(50));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if !self.registry.contains(self.daemon_id) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = poll.tick() => {}
+            }
+        }
         self.unregister_inner();
         Ok(())
     }
@@ -729,21 +749,12 @@ impl MeshOsDaemonSdk {
         self.runtime.shutdown().await
     }
 
-    /// Read `MeshOsConfig::this_node` off the runtime. The
-    /// runtime doesn't currently expose the full config, so we
-    /// read the latest snapshot's first peer key if available,
-    /// falling back to `0` — the metadata's `node_id` is
-    /// available either way, but consumers that care should
-    /// pass a `this_node` to the runtime config explicitly.
+    /// Read `MeshOsConfig::this_node` off the runtime. Sourced
+    /// directly from the field the runtime captured at
+    /// construction; the SDK's `MetadataView::node_id` now
+    /// reflects the deployment's identity instead of always 0.
     fn runtime_this_node(&self) -> NodeId {
-        // The runtime config is private; consumers passed a
-        // `this_node` into `MeshOsConfig` at construction. We
-        // don't have direct access here — defer to a future
-        // slice that adds a `runtime.this_node()` accessor.
-        // For now, surface a placeholder so `metadata.node_id`
-        // is present even if zero. Tests pass their own
-        // verification value via the handle.
-        0
+        self.runtime.this_node()
     }
 }
 
