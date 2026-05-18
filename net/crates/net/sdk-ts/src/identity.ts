@@ -128,9 +128,11 @@ function runMapped<T>(fn: () => T): T {
  * A signed, delegatable permission token. Construct via
  * `Identity.issueToken` (locally) or `Token.parse` (from wire bytes).
  *
- * The wire form is 161 bytes: issuer (32) + subject (32) + scope (4)
- * + channel hash (4, canonical 32-bit) + not-before (8) + not-after
- * (8) + delegation depth (1) + nonce (8) + ed25519 signature (64).
+ * The wire form is 169 bytes: issuer (32) + subject (32) + scope (4)
+ * + channel hash (8, canonical 64-bit) + issuer generation (4) +
+ * not-before (8) + not-after (8) + delegation depth (1) + nonce (8)
+ * + ed25519 signature (64). Matches `PermissionToken::WIRE_SIZE` in
+ * the Rust core.
  */
 export class Token {
   /** Raw serialized bytes. Safe to send over the wire. */

@@ -1035,9 +1035,8 @@ The canonical channel hash is 64-bit (`channelHash(name)` returns
 `channel_hash` stays `u16` — fast-path filter hint, may
 bucket-collide at scale; ACL / config / cache / RYW decisions key on
 the canonical 64-bit hash via registry disambiguation. The
-`PermissionToken` wire form is 165 bytes (the u32 → u64 channel-
-hash widening grew it from 161; the original u16 → u32 widening
-had grown it from 159).
+`PermissionToken` wire form is 169 bytes (`PermissionToken::WIRE_SIZE`
+in the Rust core).
 
 ## nRPC (request / response over the mesh)
 
