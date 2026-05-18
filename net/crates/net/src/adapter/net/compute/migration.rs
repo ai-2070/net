@@ -384,6 +384,20 @@ pub enum MigrationError {
         /// Current buffered byte total (sum of payload lengths).
         bytes: usize,
     },
+    /// Inbound migration message arrived from a peer that is not the
+    /// recorded principal for this migration's role. The wire layer
+    /// authenticates the session; this layer authenticates that the
+    /// authenticated peer is actually a participant in the recorded
+    /// migration (source / target / orchestrator). Mismatches are
+    /// silently dropped at the dispatch boundary rather than acted on.
+    WrongPeer {
+        /// The daemon-origin the migration is keyed on.
+        daemon_origin: u64,
+        /// The peer that delivered the message.
+        from: u64,
+        /// The principal recorded for this role.
+        expected: u64,
+    },
 }
 
 impl std::fmt::Display for MigrationError {
@@ -418,6 +432,17 @@ impl std::fmt::Display for MigrationError {
                     f,
                     "migration buffer full: {} events / {} bytes",
                     events, bytes
+                )
+            }
+            Self::WrongPeer {
+                daemon_origin,
+                from,
+                expected,
+            } => {
+                write!(
+                    f,
+                    "migration {:#x}: peer {:#x} not the recorded principal {:#x}",
+                    daemon_origin, from, expected
                 )
             }
         }

@@ -472,12 +472,17 @@ existing per-module sequences (X-17 → X-18, O-19 → O-20).
 
 ### High
 
-#### X-18 — Migration dispatch arms accept arbitrary `from_node`; any peer forces cutover / abort
+#### X-18 — Migration dispatch arms accept arbitrary `from_node`; any peer forces cutover / abort — **Landed**
 - **File:** `src/adapter/net/subprotocol/migration_handler.rs:600-642` (`CleanupComplete`, `ActivateTarget`); `:654-690` (`MigrationFailed`); `:558-598` (`SnapshotReady`); `src/adapter/net/compute/migration_target.rs:295-306` (`activate`).
 - **What:** The subprotocol's `ActivateTarget` arm invokes `target_handler.activate(daemon_origin)` without comparing the inbound `from_node` against the migration's recorded `orchestrator_node`. The recorded orchestrator is consulted only when routing the *ack reply* (`:626-629`); it is not used to gate entry. The companion arms `CleanupComplete`, `MigrationFailed`, and `SnapshotReady` likewise dispatch state-mutating handler calls without binding `from_node` to the recorded orchestrator. Only the `TakeSnapshot` arm records the orchestrator (`start_snapshot(..., from_node)` at `:312`).
 - **Trigger / Attack:** Any peer with subprotocol-0x0500 reach ships `MigrationMessage::ActivateTarget{daemon_origin}` for a migration that is mid-Replay. The target flips to `Cutover` and goes live while the source still believes it owns the daemon → both nodes accept writes to the same origin → divergent chain heads. Same shape as **X-1** (StandbyGroup fencing) but driven by a single wire message rather than a partition heal. Symmetric variants: a forged `MigrationFailed` from any peer drives source rollback after legitimate cutover; a forged `CleanupComplete` makes the orchestrator emit `ActivateTarget` to a target that hasn't fully restored.
 - **Same shape as R-20:** R-20 is "no replica-set membership check on replication-subprotocol inbound." X-18 is the migration-subprotocol equivalent. The umbrella's A-1..A-3 capability fixes landed on the publish path; neither subprotocol was in their scope.
-- **Fix sketch:** In `dispatch()` for every state-mutating arm (`ActivateTarget`, `CleanupComplete`, `MigrationFailed`, `SnapshotReady`), look up the recorded `orchestrator_node(daemon_origin)`; reject with `MigrationError::WrongPeer` if it's `Some(n) && n != from_node`. The source-side `TakeSnapshot` arm already establishes the binding at `:312`; the symmetric check on later arms enforces "only the recorded orchestrator drives this migration forward." Add a regression test covering forged `ActivateTarget` from a non-orchestrator peer.
+- **Fix:** Added `MigrationError::WrongPeer { daemon_origin, from, expected }` and gated four state-mutating dispatch arms:
+  - **`SnapshotReady`** — orchestrator-side requires `orchestrator.source_node(daemon_origin) == Some(from_node)`; target-side requires `target_handler.orchestrator_node(daemon_origin) == Some(from_node)`. Falls through unchecked only on the no-record path (first chunk to a fresh target with no orchestrator-on-this-node).
+  - **`CleanupComplete`** — orchestrator-side requires `orchestrator.source_node == Some(from_node)`.
+  - **`ActivateTarget`** — target-side requires `target_handler.orchestrator_node == Some(from_node)`.
+  - **`MigrationFailed`** — collects the four possible principals (`orch.source_node`, `orch.target_node`, `source_handler.orchestrator_node`, `target_handler.orchestrator_node`); when *any* is recorded, `from_node` must match at least one. Migrations with no local record drop silently — no phantom abort.
+- **Regression test:** `test_regression_dispatch_arms_reject_unrelated_from_node` in `tests/migration_integration.rs` covers forged `CleanupComplete` and `MigrationFailed` from a non-participant; asserts `WrongPeer` is returned and that orchestrator state is unchanged. The legitimate source still drives cleanup forward.
 
 ### Medium
 

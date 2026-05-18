@@ -550,6 +550,77 @@ fn test_subprotocol_handler_cleanup_complete_dispatch() {
     assert!(!orch.is_migrating(origin));
 }
 
+#[test]
+fn test_regression_dispatch_arms_reject_unrelated_from_node() {
+    use net::adapter::net::compute::orchestrator::wire;
+    use net::adapter::net::compute::MigrationError;
+    use net::adapter::net::subprotocol::MigrationSubprotocolHandler;
+
+    // Peer-auth regression: each state-mutating dispatch arm must
+    // reject messages from a peer who is not the recorded principal
+    // for that role. Without binding, any peer with subprotocol reach
+    // could drive cutover or abort by forging ActivateTarget /
+    // CleanupComplete / MigrationFailed / SnapshotReady.
+    let reg = Arc::new(DaemonRegistry::new());
+    let (_, origin) = register_counter_daemon(&reg, 1);
+
+    let orch = Arc::new(MigrationOrchestrator::new(reg.clone(), 0x1111));
+    let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
+    let target = Arc::new(MigrationTargetHandler::new(reg.clone()));
+
+    let handler = MigrationSubprotocolHandler::new(orch.clone(), source, target, 0x1111);
+
+    // Source 0x1111, target 0x2222. 0x9999 is an attacker peer.
+    orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+    orch.on_restore_complete(origin, 1).unwrap();
+    orch.on_replay_complete(origin, 1).unwrap();
+    orch.on_cutover_acknowledged(origin).unwrap();
+
+    // CleanupComplete from a non-source peer must be rejected — the
+    // orchestrator recorded 0x1111 as the source.
+    let forged = MigrationMessage::CleanupComplete {
+        daemon_origin: origin,
+    };
+    match handler.handle_message(&wire::encode(&forged).unwrap(), 0x9999) {
+        Err(MigrationError::WrongPeer {
+            daemon_origin: o,
+            from,
+            expected,
+        }) => {
+            assert_eq!(o, origin);
+            assert_eq!(from, 0x9999);
+            assert_eq!(expected, 0x1111);
+        }
+        other => panic!("expected WrongPeer rejection, got {:?}", other),
+    }
+    // No state advance: still mid-migration.
+    assert!(
+        orch.is_migrating(origin),
+        "forged CleanupComplete must not advance orchestrator state"
+    );
+
+    // The legitimate CleanupComplete from 0x1111 still works.
+    let outbound = handler
+        .handle_message(&wire::encode(&forged).unwrap(), 0x1111)
+        .expect("recorded source can drive CleanupComplete");
+    assert_eq!(outbound.len(), 1);
+
+    // MigrationFailed from an entirely unrelated peer must be
+    // rejected; recorded participants are 0x1111 / 0x2222 / local.
+    let failed = MigrationMessage::MigrationFailed {
+        daemon_origin: origin,
+        reason: net::adapter::net::compute::MigrationFailureReason::StateFailed(
+            "synthetic".to_string(),
+        ),
+    };
+    match handler.handle_message(&wire::encode(&failed).unwrap(), 0x9999) {
+        Err(MigrationError::WrongPeer { from, .. }) => {
+            assert_eq!(from, 0x9999);
+        }
+        other => panic!("expected WrongPeer rejection for forged MigrationFailed, got {:?}", other),
+    }
+}
+
 // ── 6. Reassembler with out-of-order chunks ──────────────────────────────────
 
 #[test]
