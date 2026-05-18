@@ -249,6 +249,67 @@ int go_net_rpc_handler_trampoline(
     size_t* out_resp_len,
     char** out_err
 );
+
+// ABI 0x0002 — server-side dispatcher hooks (Phase B11-2).
+typedef struct RpcRequestStreamHandleC RpcRequestStreamHandleC;
+typedef struct RpcResponseSinkHandleC RpcResponseSinkHandleC;
+extern int net_rpc_request_stream_next(
+    RpcRequestStreamHandleC* handle,
+    uint8_t** out_chunk_ptr, size_t* out_chunk_len
+);
+extern int net_rpc_response_sink_send(
+    RpcResponseSinkHandleC* handle,
+    const uint8_t* body_ptr, size_t body_len
+);
+
+typedef int (*RpcClientStreamingHandlerFn)(
+    uint64_t handler_id,
+    RpcRequestStreamHandleC* request_stream,
+    uint8_t** out_resp_ptr,
+    size_t* out_resp_len,
+    char** out_err
+);
+typedef int (*RpcDuplexHandlerFn)(
+    uint64_t handler_id,
+    RpcRequestStreamHandleC* request_stream,
+    RpcResponseSinkHandleC* response_sink,
+    char** out_err
+);
+extern void net_rpc_set_client_streaming_handler_dispatcher(
+    RpcClientStreamingHandlerFn dispatcher
+);
+extern void net_rpc_set_duplex_handler_dispatcher(
+    RpcDuplexHandlerFn dispatcher
+);
+
+extern ServeHandleC* net_rpc_serve_client_stream(
+    MeshRpcHandle* handle,
+    const char* service_ptr, size_t service_len,
+    uint64_t handler_id, uint64_t handler_timeout_ms,
+    char** out_err
+);
+extern ServeHandleC* net_rpc_serve_duplex(
+    MeshRpcHandle* handle,
+    const char* service_ptr, size_t service_len,
+    uint64_t handler_id, uint64_t handler_timeout_ms,
+    char** out_err
+);
+
+// Trampolines for the two new dispatcher slots. Defined below
+// as `//export` functions.
+int go_net_rpc_client_streaming_trampoline(
+    uint64_t handler_id,
+    RpcRequestStreamHandleC* request_stream,
+    uint8_t** out_resp_ptr,
+    size_t* out_resp_len,
+    char** out_err
+);
+int go_net_rpc_duplex_trampoline(
+    uint64_t handler_id,
+    RpcRequestStreamHandleC* request_stream,
+    RpcResponseSinkHandleC* response_sink,
+    char** out_err
+);
 */
 import "C"
 
@@ -1698,3 +1759,302 @@ func (s *DuplexStream) Close() {
 }
 
 func (s *DuplexStream) finalize() { s.Close() }
+
+// =====================================================================
+// ABI 0x0002 — Server-side handlers (Phase B11-2)
+// =====================================================================
+
+// RequestStreamRecv is the Go-side view of an inbound
+// client-streaming or duplex request stream. The handler's
+// callback receives a *RequestStreamRecv and pulls request
+// chunks via Recv until ErrStreamDone.
+//
+// Lifetime: bounded by the handler callback. The underlying C
+// handle is owned by the Rust FFI side; the Go wrapper here is
+// just a thin reference. After the callback returns, the
+// underlying handle is freed by Rust — the Go wrapper MUST NOT
+// be retained past the callback.
+type RequestStreamRecv struct {
+	handle *C.RpcRequestStreamHandleC
+}
+
+// Recv blocks until the next inbound chunk arrives. Returns
+// ErrStreamDone on caller-side REQUEST_END or CANCEL.
+func (r *RequestStreamRecv) Recv() ([]byte, error) {
+	if r == nil || r.handle == nil {
+		return nil, ErrStreamDone
+	}
+	var outChunk *C.uint8_t
+	var outChunkLen C.size_t
+	code := C.net_rpc_request_stream_next(r.handle, &outChunk, &outChunkLen)
+	switch code {
+	case 0:
+		if outChunkLen == 0 || outChunk == nil {
+			return []byte{}, nil
+		}
+		defer C.net_rpc_response_free(outChunk, outChunkLen)
+		src := unsafe.Slice((*byte)(unsafe.Pointer(outChunk)), int(outChunkLen))
+		out := make([]byte, int(outChunkLen))
+		copy(out, src)
+		return out, nil
+	case -6: // STREAM_DONE
+		return nil, ErrStreamDone
+	case -1: // NULL
+		return nil, ErrStreamDone
+	default:
+		return nil, fmt.Errorf("net_rpc_request_stream_next returned %d", int(code))
+	}
+}
+
+// ResponseSinkSend is the Go-side view of an outbound duplex
+// response sink. The duplex handler's callback receives a
+// *ResponseSinkSend and pushes response chunks via Send. Same
+// lifetime contract as *RequestStreamRecv.
+type ResponseSinkSend struct {
+	handle *C.RpcResponseSinkHandleC
+}
+
+// Send emits one response chunk. Non-blocking — the SDK's
+// underlying try_send drops on overflow. Returns ErrStreamDone
+// only if the sink has already been torn down (caller cancelled
+// mid-stream).
+func (s *ResponseSinkSend) Send(body []byte) error {
+	if s == nil || s.handle == nil {
+		return ErrStreamDone
+	}
+	cBody, freeBody := bytesToCBytes(body)
+	defer freeBody()
+	code := C.net_rpc_response_sink_send(s.handle, cBody.ptr, cBody.len)
+	switch code {
+	case 0:
+		return nil
+	case -6:
+		return ErrStreamDone
+	case -1:
+		return ErrStreamDone
+	default:
+		return fmt.Errorf("net_rpc_response_sink_send returned %d", int(code))
+	}
+}
+
+// ClientStreamingHandler is the user-facing signature for a
+// client-streaming nRPC handler. Drains the request stream,
+// returns one terminal response body (or an error). Errors are
+// surfaced to the caller as Application(NRPC_TYPED_HANDLER_ERROR)
+// per the typed-handler contract.
+type ClientStreamingHandler func(stream *RequestStreamRecv) ([]byte, error)
+
+// DuplexHandler is the user-facing signature for a duplex nRPC
+// handler. Drains the request stream AND emits response chunks
+// via the sink. Returns nil for clean close, an error otherwise.
+type DuplexHandler func(stream *RequestStreamRecv, sink *ResponseSinkSend) error
+
+var (
+	clientStreamingDispatcherOnce sync.Once
+	duplexDispatcherOnce          sync.Once
+)
+
+func registerClientStreamingDispatcher() {
+	clientStreamingDispatcherOnce.Do(func() {
+		C.net_rpc_set_client_streaming_handler_dispatcher(
+			(C.RpcClientStreamingHandlerFn)(C.go_net_rpc_client_streaming_trampoline),
+		)
+	})
+}
+
+func registerDuplexDispatcher() {
+	duplexDispatcherOnce.Do(func() {
+		C.net_rpc_set_duplex_handler_dispatcher(
+			(C.RpcDuplexHandlerFn)(C.go_net_rpc_duplex_trampoline),
+		)
+	})
+}
+
+//export go_net_rpc_client_streaming_trampoline
+func go_net_rpc_client_streaming_trampoline(
+	handlerID C.uint64_t,
+	requestStream *C.RpcRequestStreamHandleC,
+	outRespPtr **C.uint8_t,
+	outRespLen *C.size_t,
+	outErr **C.char,
+) C.int {
+	val, ok := handlerRegistry.Load(uint64(handlerID))
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("no client-streaming handler registered for id %d", uint64(handlerID)))
+		return -1
+	}
+	handler, ok := val.(ClientStreamingHandler)
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("handler id %d is not a ClientStreamingHandler", uint64(handlerID)))
+		return -1
+	}
+	stream := &RequestStreamRecv{handle: requestStream}
+	resp, err := safeCallClientStreamingHandler(handler, stream)
+	if err != nil {
+		writeCError(outErr, err.Error())
+		return -1
+	}
+	if len(resp) == 0 {
+		*outRespPtr = nil
+		*outRespLen = 0
+		return 0
+	}
+	cBuf := C.malloc(C.size_t(len(resp)))
+	if cBuf == nil {
+		writeCError(outErr, "C.malloc returned NULL for response buffer")
+		return -1
+	}
+	C.memmove(cBuf, unsafe.Pointer(&resp[0]), C.size_t(len(resp)))
+	*outRespPtr = (*C.uint8_t)(cBuf)
+	*outRespLen = C.size_t(len(resp))
+	return 0
+}
+
+func safeCallClientStreamingHandler(h ClientStreamingHandler, s *RequestStreamRecv) (resp []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("nrpc client-streaming handler panicked: %v", r)
+		}
+	}()
+	return h(s)
+}
+
+//export go_net_rpc_duplex_trampoline
+func go_net_rpc_duplex_trampoline(
+	handlerID C.uint64_t,
+	requestStream *C.RpcRequestStreamHandleC,
+	responseSink *C.RpcResponseSinkHandleC,
+	outErr **C.char,
+) C.int {
+	val, ok := handlerRegistry.Load(uint64(handlerID))
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("no duplex handler registered for id %d", uint64(handlerID)))
+		return -1
+	}
+	handler, ok := val.(DuplexHandler)
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("handler id %d is not a DuplexHandler", uint64(handlerID)))
+		return -1
+	}
+	stream := &RequestStreamRecv{handle: requestStream}
+	sink := &ResponseSinkSend{handle: responseSink}
+	if err := safeCallDuplexHandler(handler, stream, sink); err != nil {
+		writeCError(outErr, err.Error())
+		return -1
+	}
+	return 0
+}
+
+func safeCallDuplexHandler(h DuplexHandler, s *RequestStreamRecv, sk *ResponseSinkSend) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("nrpc duplex handler panicked: %v", r)
+		}
+	}()
+	return h(s, sk)
+}
+
+// ServeClientStream registers a client-streaming handler for
+// `service`. Same pre-registration discipline as Serve — the
+// callable is inserted into the registry BEFORE crossing the
+// FFI, so an early-arriving request always finds it.
+func (r *MeshRpc) ServeClientStream(service string, handler ClientStreamingHandler) (*ServeHandle, error) {
+	return r.ServeClientStreamWithOptions(service, handler, ServeOptions{})
+}
+
+// ServeClientStreamWithOptions is the variant of ServeClientStream
+// that accepts a per-handler timeout.
+func (r *MeshRpc) ServeClientStreamWithOptions(service string, handler ClientStreamingHandler, opts ServeOptions) (*ServeHandle, error) {
+	if handler == nil {
+		return nil, errors.New("net.ServeClientStream: handler must be non-nil")
+	}
+	registerClientStreamingDispatcher()
+	hID := uint64(C.net_rpc_reserve_handler_id())
+	handlerRegistry.Store(hID, handler)
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+	var timeoutMs uint64
+	if opts.HandlerTimeout > 0 {
+		ms := opts.HandlerTimeout.Milliseconds()
+		if ms < 0 {
+			ms = 0
+		}
+		timeoutMs = uint64(ms)
+	}
+	var outErr *C.char
+	var handle *C.ServeHandleC
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		handle = C.net_rpc_serve_client_stream(
+			h,
+			(*C.char)(cService.ptr), cService.len,
+			C.uint64_t(hID),
+			C.uint64_t(timeoutMs),
+			&outErr,
+		)
+	}); err != nil {
+		handlerRegistry.Delete(hID)
+		return nil, err
+	}
+	if handle == nil {
+		handlerRegistry.Delete(hID)
+		msg := readCError(outErr)
+		if strings.Contains(msg, "already serving") {
+			return nil, fmt.Errorf("%w: %s", ErrAlreadyServing, msg)
+		}
+		return nil, fmt.Errorf("serve_client_stream failed: %s", msg)
+	}
+	sh := &ServeHandle{rpc: r, handle: handle, handlerID: hID}
+	runtime.SetFinalizer(sh, (*ServeHandle).finalize)
+	return sh, nil
+}
+
+// ServeDuplex registers a duplex handler for `service`.
+func (r *MeshRpc) ServeDuplex(service string, handler DuplexHandler) (*ServeHandle, error) {
+	return r.ServeDuplexWithOptions(service, handler, ServeOptions{})
+}
+
+// ServeDuplexWithOptions is the variant of ServeDuplex that
+// accepts a per-handler timeout.
+func (r *MeshRpc) ServeDuplexWithOptions(service string, handler DuplexHandler, opts ServeOptions) (*ServeHandle, error) {
+	if handler == nil {
+		return nil, errors.New("net.ServeDuplex: handler must be non-nil")
+	}
+	registerDuplexDispatcher()
+	hID := uint64(C.net_rpc_reserve_handler_id())
+	handlerRegistry.Store(hID, handler)
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+	var timeoutMs uint64
+	if opts.HandlerTimeout > 0 {
+		ms := opts.HandlerTimeout.Milliseconds()
+		if ms < 0 {
+			ms = 0
+		}
+		timeoutMs = uint64(ms)
+	}
+	var outErr *C.char
+	var handle *C.ServeHandleC
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		handle = C.net_rpc_serve_duplex(
+			h,
+			(*C.char)(cService.ptr), cService.len,
+			C.uint64_t(hID),
+			C.uint64_t(timeoutMs),
+			&outErr,
+		)
+	}); err != nil {
+		handlerRegistry.Delete(hID)
+		return nil, err
+	}
+	if handle == nil {
+		handlerRegistry.Delete(hID)
+		msg := readCError(outErr)
+		if strings.Contains(msg, "already serving") {
+			return nil, fmt.Errorf("%w: %s", ErrAlreadyServing, msg)
+		}
+		return nil, fmt.Errorf("serve_duplex failed: %s", msg)
+	}
+	sh := &ServeHandle{rpc: r, handle: handle, handlerID: hID}
+	runtime.SetFinalizer(sh, (*ServeHandle).finalize)
+	return sh, nil
+}
