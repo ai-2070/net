@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/channel/name.rs
+  s_f641e31a81af58::t_ac673a4d9b18f3 436-461
+  s_f641e31a81af58::t_ab1f1be643d18d 108-122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "34ab95bbb283ac9473f216d0706ebe5791a0d2a6",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
