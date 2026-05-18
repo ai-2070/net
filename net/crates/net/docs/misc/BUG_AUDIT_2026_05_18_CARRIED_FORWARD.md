@@ -24,10 +24,20 @@ The replication subprotocol is the highest-leverage surface in this batch — **
 | Severity | Count | Top items |
 |---|---|---|
 | Critical | 3 | R-20, R-21, X-1 |
-| High | 8 | R-22, R-23, R-24, R-25, X-2, X-3, D-1, D-2 |
-| Medium | 15 | (see body) |
-| Low | 19 | (counts only at the end) |
+| High | 11 | A-5, R-22, R-23, R-24, R-25, X-2, X-3, X-9, D-1, D-2, D-11 |
+| Medium | 19 | (see body) |
+| Low | 27 | (counts only at the end) |
 | Null | 1 module | `netdb/` clean |
+
+## Second-pass note (2026-05-18, later same day)
+
+A second parallel-agent pass added the eight new findings prefixed below
+(A-5, X-9, X-10, X-11, X-12, D-11, D-12, D-13, R-31, R-32, R-33, R-34,
+O-17, O-18, O-19). The same pass independently re-derived R-20
+(no replica-set membership check), R-23 (NACK `since_seq` trust),
+and D-5 (Manifest fetch OOM) from the same source lines — those three
+are not duplicated below; their independent re-discovery is a
+confirmation signal rather than a new finding.
 
 ---
 
@@ -54,6 +64,12 @@ The replication subprotocol is the highest-leverage surface in this batch — **
 ---
 
 ## High
+
+### A-5 — In-progress L-13 fix strips reserved metadata before re-forwarding, breaking multi-hop signed propagation
+- **File:** `src/adapter/net/mesh.rs:5239` (uncommitted on `bugfixes-15`); `src/adapter/net/behavior/capability.rs:2145-2156` (new `strip_reserved_metadata`); `src/adapter/net/behavior/capability.rs:2084-2093` (`signed_payload`).
+- **What:** The uncommitted L-13 fix calls `ann.strip_reserved_metadata()` immediately after the signature verify and TOFU pin, then *later* clones `ann`, bumps `hop_count`, and reserializes via `to_bytes()` to forward to other peers (`mesh.rs:5343-5358`). `signed_payload()` covers the `metadata` field — so the forwarded wire bytes no longer match the signature transcript. Any peer two-plus hops downstream with `require_signed_capabilities = true` rejects the forwarded announcement at the verify step (`mesh.rs:5200`).
+- **Impact:** Functional regression in the new fix. Multi-hop signed capability discovery breaks for any receiver that requires signed caps. Fails *closed* (announcement is dropped, not accepted) so it's not an auth bypass — but the feature stops working. The existing strip test (`capability.rs:3712`) only exercises strip in isolation; no multi-hop round-trip test catches it.
+- **Fix sketch:** Move `ann.strip_reserved_metadata()` to between the forward block (after `mesh.rs:5358`) and `capability_index.index(ann)` at `:5371`. The only consumer in between — `policy.assign(&ann.capabilities)` at `:5305` — reads `caps.tags` only, not `caps.metadata`, so it's unaffected by the move. Add a multi-hop signed-propagation round-trip test before merging.
 
 ### R-22 — Replica acks tail_seq before fsync; crash loses claimed-applied data
 - **File:** `src/adapter/net/redex/replication_runtime.rs:519,791-797`; `replication_catchup.rs:368-376`
@@ -91,6 +107,12 @@ The replication subprotocol is the highest-leverage surface in this batch — **
 - **Trigger:** A retry path, malformed dispatcher, or future caller invokes `cleanup` during Snapshot/Transfer/Restore/Replay — source's live daemon is unregistered while the target is still restoring. Events arriving for that origin hit `DaemonNotFound`; buffered events in `SourceMigrationState` are lost; target eventually fails restore and aborts; source has nothing to roll back to.
 - **Fix sketch:** Reject `cleanup` unless `phase == Cutover` (or `Complete`). Return `WrongPhase`. Mirrors the guard `take_buffered_events` got at `:265-274`.
 
+### X-9 — `MigrationTargetHandler::pending_events` unbounded; wire-reachable OOM
+- **File:** `src/adapter/net/compute/migration_target.rs:274` (`buffer_event`) and `:231` (`replay_events`).
+- **What:** `pending_events: BTreeMap<u64, CausalEvent>` is inserted into on every call with no length or byte cap. `drain_pending` only evicts events that form a contiguous run starting at `replayed_through + 1`; out-of-order seq numbers stay parked indefinitely. The migration subprotocol is wire-driven — any peer that can address migration traffic to this node can ship monotonically increasing-but-non-contiguous `CausalEvent`s (skip `replayed_through + 1` forever). Per-event payload is up to `MAX_SNAPSHOT_CHUNK_SIZE = 7000` bytes.
+- **Impact:** Targeted resource-exhaustion DoS on any node accepting migration traffic. Grows RSS without bound until OOM.
+- **Fix sketch:** Maintain `pending_bytes: usize` alongside the map; add `MAX_PENDING_BUFFER_BYTES` (e.g. 64 MiB, mirroring `MAX_PENDING_REASSEMBLY_BYTES`) and `MAX_PENDING_EVENTS` (e.g. 1_000_000, mirroring `MAX_BUFFERED_EVENTS`). Refuse insertions that would exceed either with a typed `BufferFull` error so the source can back off.
+
 ### D-1 — Blob `sweep_gc` TOCTOU: concurrent `incr` lost; chunk + refcount silently dropped
 - **File:** `src/adapter/net/dataforts/blob/mesh.rs:739-760` (`sweep_gc`) + `:777-784` (`delete_chunk`)
 - **What:** `sweep_gc` snapshots `deletable_hashes()` then loops `delete_chunk(hash).await`. `delete_chunk` calls `redex.close_file(...)` then unconditionally `self.refcount.remove(hash)`. Between snapshot and per-hash delete, another caller can `refcount.incr(hash, ...)` (e.g. a freshly-folded chain event). The sweep deletes the chunk file AND removes the brand-new refcount entry — a subsequent `fetch` returns `NotFound`, and the refcount table no longer remembers the hash was referenced.
@@ -102,6 +124,12 @@ The replication subprotocol is the highest-leverage surface in this batch — **
 - **What:** `len = range.end - range.start` is `u64`; `Vec::with_capacity(len as usize)` (line 1145) and `bytes[range.start as usize..range.end as usize]` (line 1137) cast `u64 → usize` without the `len > usize::MAX as u64` guard that `FileSystemAdapter::fetch_range` has at `fs.rs:326`. `byte_range_to_chunks` only bounds against `total_size` ≤ 16 GiB; on a 32-bit target, 16 GiB > `usize::MAX` (4 GiB).
 - **Impact:** 32-bit only. Peer-supplied `BlobRef::Small`/`Manifest` plus a wide caller-supplied range trips truncation: capacity is wrong, slice indices alias to a different offset (silent wrong-bytes for the Small path), or `Vec` extend later panics.
 - **Fix sketch:** Mirror `fs.rs:326-331` — return `BlobError::Backend(...)` when `len > usize::MAX as u64`, likewise for `range.start`/`range.end` casts in the Small arm.
+
+### D-11 — `BlobRef::Manifest` decoder accepts arbitrary per-chunk sizes; slice panic in `fetch_range` on untrusted input
+- **File:** `src/adapter/net/dataforts/blob/blob_ref.rs:485-553` (`decode_manifest` / `manifest()` constructor); `src/adapter/net/dataforts/blob/blob_ref.rs:746-798` (`byte_range_to_chunks`); `src/adapter/net/dataforts/blob/mesh.rs:1143-1170` (`fetch_range` Manifest arm).
+- **What:** The decoder validates `iterated_sum == total_size`, chunk count ≤ `BLOB_MANIFEST_MAX_CHUNKS`, and `total_size ≤ BLOB_REF_MAX_SIZE` (16 GiB) — but never that non-last chunks have `size == BLOB_CHUNK_SIZE_BYTES` (4 MiB). `byte_range_to_chunks` computes chunk positions from the fixed 4 MiB stride at `:776,786` while clamping `local_end` against the attacker-stamped `chunk.size as u64` at `:790`. Then `mesh.rs:1155` slices `chunk_bytes[start_in_chunk..end_in_chunk]` against the actually-fetched bytes (verified only by hash to *some* length).
+- **Trigger:** Peer publishes a `BlobRef::Manifest` with one chunk `{hash: H, size: u32::MAX}` and `total_size = u32::MAX`. The decoder accepts it. A consumer calling `fetch_range(blob, 0..total_size)` produces a request with `end_in_chunk = u32::MAX`. The actually-fetched bytes under hash `H` can be any length (say 100 bytes — hash matches what the peer stored); slicing `chunk_bytes[0..u32::MAX as usize]` panics across the `await`. A subtler variant — chunks `[{size: 1}, {size: 1}]` — silently returns wrong-window bytes because the position math still assumes 4 MiB stride.
+- **Fix sketch:** In `decode_manifest()` and `manifest()`, reject manifests where any non-last chunk has `size != BLOB_CHUNK_SIZE_BYTES`, or the last chunk has `size > BLOB_CHUNK_SIZE_BYTES`. Independently, replace the panicking slice at `mesh.rs:1155` with `chunk_bytes.get(start..end).ok_or(BlobError::HashMismatch)?`.
 
 ---
 
@@ -143,6 +171,18 @@ The replication subprotocol is the highest-leverage surface in this batch — **
 - **Trigger:** Buggy leader reports `tail_seq=999_999` but file has no such entries. Replica busy-loops at heartbeat cadence (100 ms). Combined with R-25, saturates the leader's inbox.
 - **Fix sketch:** Track per-leader "consecutive empty responses with advertised gap" counter; back off exponentially after 3 empty replies despite advertised lag.
 
+### R-31 — Replication coordinator: state advances before async sink completes on `* → Idle`
+- **File:** `src/adapter/net/redex/replication_coordinator.rs:370-385` (sync state flip) and `:414-423` (async `withdraw_chain` / `announce_chain`).
+- **What:** The state cell flips to `target` inside the sync block (line 383). The mesh-side announce/withdraw runs *after* the lock drops, across an `.await`. On `Leader → Idle` graceful relinquish, if `withdraw_chain` fails (mesh queue full, transient error), local state is already `Idle` but the mesh continues advertising this node as the chain holder. The existing regression test (`tag_sink_failure_surfaces_but_state_mutated`) pins this exact divergence.
+- **Impact:** Inbound `SyncRequest` traffic from peers that still believe this node leads gets NACKed `NotLeader` (the runtime gates on `coordinator.role() != Leader` at `:695`), peers re-resolve to a phantom holder. The comment ("next heartbeat cycle will retry") is wrong — `Idle` doesn't run heartbeats, so there is no retry. The divergence persists until something else trips a re-announce.
+- **Fix sketch:** Roll back the state on sink failure for `* → Idle` transitions, or maintain an explicit retry queue tied to the coordinator's lifetime (not the role state). At minimum, document the divergence window length so operators have a published recovery upper bound.
+
+### R-32 — Replication metrics: TOCTOU on `MAX_TRACKED_CHANNELS` cap
+- **File:** `src/adapter/net/redex/replication_metrics.rs:213-232` (`for_channel`).
+- **What:** The path is `len() < cap` → `contains_key` probe → `entry().or_insert_with`. Two concurrent callers with the channels map at `cap - 1` both pass the `len()` check, both probe, both insert — net cardinality exceeds the cap by the number of racers.
+- **Impact:** A burst of distinct channel-name lookups under contention bypasses the cardinality bomb defense. Defeats the bound the rest of the crate trusts. No data loss — just a memory growth amplifier.
+- **Fix sketch:** Use `entry().or_insert_with` first, then post-check `len() > cap`; if exceeded, remove the just-inserted entry and route the caller into the overflow bucket. Or maintain a separate atomic counter CAS'd before insert.
+
 ### X-4 — Group `on_node_failure` skips `Unregistered` event on `registry.replace`
 - **File:** `src/adapter/net/compute/standby_group.rs:454`; `replica_group.rs:284`; `fork_group.rs:349`; `registry.rs:143-157` (`replace`)
 - **What:** `registry.replace(host)` does `daemons.insert` which silently overwrites the old slot AND only fires `Registered` (doc at `registry.rs:147-156` explicitly says "the caller is responsible for firing `Unregistered` first"). None of the three group `on_node_failure` paths fire it.
@@ -154,6 +194,18 @@ The replication subprotocol is the highest-leverage surface in this batch — **
 - **What:** `assert_eq!(chain.origin_hash(), keypair.origin_hash(), ...)`. The only in-tree caller derives chain from the keypair so the assert is unreachable in production today, but `DaemonHost::from_fork` is `pub` and SDK/FFI consumers may construct it with mismatched inputs.
 - **Impact:** Panic across FFI is undefined behavior on Windows MSVC and aborts the host on Unix.
 - **Fix sketch:** Convert to `Result<Self, DaemonError>` returning `DaemonError::RestoreFailed`. Same pattern `from_snapshot` already uses at `:119-125`.
+
+### X-10 — Orchestrator forwards wire `seq_through` without checking it against `snapshot.through_seq`
+- **File:** `src/adapter/net/compute/orchestrator.rs:1340-1387` (`on_snapshot_ready`).
+- **What:** The orchestrator accepts a wire-supplied `seq_through: u64`, never compares it against `snapshot.through_seq` inside the parsed payload, and forwards it verbatim in the `MigrationMessage::SnapshotReady` it emits to the target (`:1383`). Single-chunk path validates `snapshot.entity_id.origin_hash()` only; `seq_through` is a free parameter. In the multi-chunk path the orchestrator commits to the wire `seq_through` as the reassembly key without validating it against any source-of-truth.
+- **Impact:** A buggy or malicious source can ship `SnapshotReady` whose wire `seq_through` disagrees with the payload's `snapshot.through_seq`. The disagreement propagates to the target — `restore_snapshot` consumes `snapshot.through_seq` for `replayed_through` but logs/retry decisions/audit using the wire field see a different number. Multi-chunk surfaces a split-state debugging trap.
+- **Fix sketch:** In the single-chunk validation branch, assert `snapshot.through_seq == seq_through` and reject as `StateFailed` on mismatch. For multi-chunk, defer the assertion to the target after reassembly; or strip `seq_through` from the wire layout once chunks are reassembled (it's redundant with `snapshot.through_seq`).
+
+### X-11 — `MigrationSourceHandler::buffered_events` unbounded
+- **File:** `src/adapter/net/compute/migration_source.rs:182, 221` (`SourceMigrationState.buffered_events`, `buffer_event`).
+- **What:** Mirror of X-9 on the source side. The pre-encode `Vec<CausalEvent>` has no cap. If a long-running migration stalls (target stuck in Restore/Replay because of upstream stall), the source-side buffer grows without bound for as long as the migration stays open. The wire-decode cap on `BufferedEvents` (1_000_000 at `orchestrator.rs:436`) is post-encode; the source-side in-memory vec never sees it.
+- **Impact:** Threat surface is lower than X-9 (local control plane drives writes), but a stuck migration plus a high-volume daemon produces unbounded memory growth on the source node.
+- **Fix sketch:** Add `MAX_SOURCE_BUFFERED_EVENTS` / `MAX_SOURCE_BUFFERED_BYTES`; on overflow, fail the migration with `MigrationFailureReason::StateFailed("source buffer exhausted")` so the orchestrator can abort cleanly rather than OOM'ing the node.
 
 ### O-1 — `runtime_epoch_id` collides across same-nanosecond restarts; SDK dedup-reset defeated
 - **File:** `src/adapter/net/behavior/meshos/event_loop.rs:482-487, 1078, 1112`
@@ -196,23 +248,28 @@ The replication subprotocol is the highest-leverage surface in this batch — **
 
 Counts and one-liners only; full text in the agent reports.
 
-**Dataforts (D-6..D-10):**
+**Dataforts (D-6..D-10, D-12, D-13):**
 - D-6 — `BlobAdapter::store_stream` default impl trusts `size_hint` only; concatenates unbounded stream into `buf` (`adapter.rs:155-170`)
 - D-7 — `BlobMetrics::set_disk_capacity_bytes` writes `0` for NaN ratio silently (`metrics.rs:244`)
 - D-8 — `parse_blob_heat_tag` admits mixed-case hex; canonicalization drift risk (`migration.rs:98-120`)
 - D-9 — `chain_blob_refs` ↔ refcount lock ordering asymmetric between callers (`greedy/runtime.rs:419-437`)
 - D-10 — `global_blob_adapter_registry` process-static `OnceLock`; no clear path (`registry.rs:112-117`)
+- D-12 — `GreedyCacheRegistry::next_lru_pos` `saturating_add(1)`; once saturated every `touch`/`upsert` returns the same `lru_pos` and LRU ordering silently collapses. Unreachable today; fragile under test fixtures that seed the counter (`greedy/cache.rs:218-222`)
+- D-13 — `HeatRegistry::tick` prune predicate compares f64 with `==` against `Some(0.0)`; a future caller writing `-0.0` (clamped-from-negative rate) breaks pruning. Use `map_or(false, |v| v <= 0.0)` (`gravity/counter.rs:319-320`)
 
-**Compute (X-6..X-8):**
+**Compute (X-6..X-8, X-12):**
 - X-6 — `Scheduler::find_migration_targets` allocates const tag string per call (`scheduler.rs:158-173`)
 - X-7 — `fork_group.rs:292-298` dead `.unwrap()` lookup discarded via `let _ = ...`
 - X-8 — `SnapshotReassembler::feed` sweeps before validating malformed chunks → DoS amplifier (`orchestrator.rs:843-857`)
+- X-12 — `MAX_SNAPSHOT_SIZE: usize = u32::MAX as usize * MAX_SNAPSHOT_CHUNK_SIZE` overflows in const on 32-bit (cosmetic — wrong "max" in the `SnapshotTooLarge` error doc-comment, "~28 TB" is then a lie); separately, `record.started_at.elapsed().as_millis() as u64` at `:1710` wraps instead of saturating, inconsistent with the canonical helper `state.elapsed_ms()` used in `migration.rs:283` (`orchestrator.rs:595, 1710`)
 
-**Replication (R-29, R-30):**
+**Replication (R-29, R-30, R-33, R-34):**
 - R-29 — `replica_set` admits duplicates → double heartbeats; should be `BTreeSet` (`replication_step.rs:186-189`)
 - R-30 — `wall_clock_ms` collected from heartbeats but never used; either implement the skew gauge or drop the field (`replication.rs:237-244`)
+- R-33 — `consumed + payload_len` (where `payload_len` came from a u32 on the wire) is plain `usize` addition; on 32-bit targets it can overflow. Same shape as the umbrella's L-9 fix for `BufferedEvents`; fold into the same commit. Use `checked_add → WireError::Truncated` (`replication.rs:465, 474`)
+- R-34 — `acc += cost` is plain addition while the surrounding function at `:249` uses `saturating_add`. Practically unreachable given the 64 MiB hard ceiling; the asymmetry itself is the bug — reviewers will copy the unguarded pattern (`replication_catchup.rs:258`)
 
-**MeshOS (O-6, O-9..O-16):**
+**MeshOS (O-6, O-9..O-19):**
 - O-6 — `Defer` re-queue never emits a chain record; long-deferred history invisible (`executor.rs:409-427`)
 - O-9 — `gc_drain_window` 1-second hardcode disregards `BackpressureConfig` semantics (`backpressure.rs:273-276`)
 - O-10 — `BackoffTracker::observe_crash` window-slide non-monotonic on out-of-order crashes (`supervision.rs:186-229`)
@@ -222,6 +279,9 @@ Counts and one-liners only; full text in the agent reports.
 - O-14 — `MigrationSnapshotSource::list()` called inside loop hot path; slow source stalls reconcile (`event_loop.rs:1383`)
 - O-15 — `last_pull_admitted_by` rollback only clears most-recent slot (`backpressure.rs:212-215`)
 - O-16 — `WIRE_FORMAT_VERSION = 1` with no migration path documented (`chain.rs:51-79`)
+- O-17 — `AdminVerifier::verify_bundle` has no cap on `signatures.len()`; verifier-CPU DoS if `MeshOsEvent` ever crosses a process boundary. Add `MAX_SIGNATURES_PER_BUNDLE = 64` (or whatever exceeds the realistic operator-quorum) (`ice.rs:483-502`, event def `event.rs:82-117`)
+- O-18 — `AdminVerifier::verify_commit` drops the `ice_state` mutex between `check_ice_cooldown` and `record_ice_cooldown`. `AdminVerifier: Clone`; two concurrent callers (or any future "verify-from-admin-API while loop runs") fail-open through the cooldown gate. Hold the lock for the whole `verify_commit` body, or split into "reserve / commit" pair (`ice.rs:858-877`)
+- O-19 — `BufferingActionChainAppender::with_capacity(0)` accepted; every `append` increments `dropped_count` against an empty deque. Sibling `BufferingAdminAuditChainAppender::with_capacity` clamps to `max(1)` at `audit_chain.rs:97`; mirror that here (`chain.rs:247-289`)
 
 ---
 
@@ -261,18 +321,23 @@ The four `.expect()`/`unwrap_or` sites in `db.rs` are documented or trivially sa
 
 ## Suggested action order
 
+0. **A-5** (capability strip vs. forward order) — regression in the currently-staged L-13 fix on `bugfixes-15`. Block the commit until the strip moves below the forward block and a multi-hop signed-propagation regression test exists. Cheap fix; expensive miss.
 1. **R-20** (peer auth) + **R-21** (dual-leader FSM) — the replication subprotocol can be hijacked or wedged by any mesh peer. Wire-protocol change; do them together with a single coordinated rollout.
 2. **X-1** (StandbyGroup fencing) — same class of bug as R-21 in a different layer. The fix (epoch/generation token) is a primitive both can share.
 3. **R-22, R-23, R-24** (replication durability + NACK trust + partial-append accounting) — bundle with the R-20/R-21 wire change.
-4. **D-1** (sweep TOCTOU) — quiet data-loss bug; trivial fix via `remove_if`.
-5. **D-2** (32-bit `usize::MAX` guard on `MeshBlobAdapter::fetch_range`) — mechanical, mirrors existing `fs.rs` pattern.
-6. **R-25** (priority lane) and **R-28** (catchup backoff) — replication availability hardening.
-7. **X-2, X-3** (migration phase guards) — close `pub` API misuse paths.
-8. **O-1, O-2** (epoch_id collision + node_id hardcode) — SDK correctness; small but real consumer-facing bugs.
-9. **O-3, O-7, O-8** (tick starvation, phantom emissions, atomic-pair publishing) — meshos observability + reconcile correctness.
-10. **D-3, D-4, D-5** (blob hardening) and **X-4, X-5** (group lifecycle, panic-across-FFI).
-11. **O-4, O-5** (audit-chain durability ordering) — pick one source of truth; document loudly.
-12. **R-26, R-27** (dead tip_seq, budget refund) and the remaining lows can batch into a single cleanup commit.
+4. **X-9** (`pending_events` unbounded) — wire-reachable OOM on every node accepting migration traffic; ~10-line fix.
+5. **D-11** (`BlobRef::Manifest` chunk-size validation) — wire-reachable slice panic on untrusted input; mechanical fix in the decoder plus a defensive `get(..)` in the consumer.
+6. **D-1** (sweep TOCTOU) — quiet data-loss bug; trivial fix via `remove_if`.
+7. **D-2** (32-bit `usize::MAX` guard on `MeshBlobAdapter::fetch_range`) — mechanical, mirrors existing `fs.rs` pattern.
+8. **R-25** (priority lane) and **R-28** (catchup backoff) — replication availability hardening.
+9. **X-2, X-3** (migration phase guards) — close `pub` API misuse paths.
+10. **X-10** (orchestrator `seq_through` validation) + **X-11** (source buffered-events cap) — migration correctness/availability.
+11. **R-31** (coordinator state vs. sink decoupling) + **R-32** (metrics TOCTOU) — replication self-consistency.
+12. **O-1, O-2** (epoch_id collision + node_id hardcode) — SDK correctness; small but real consumer-facing bugs.
+13. **O-3, O-7, O-8** (tick starvation, phantom emissions, atomic-pair publishing) — meshos observability + reconcile correctness.
+14. **D-3, D-4, D-5** (blob hardening) and **X-4, X-5** (group lifecycle, panic-across-FFI).
+15. **O-4, O-5** (audit-chain durability ordering) — pick one source of truth; document loudly.
+16. **R-26, R-27** (dead tip_seq, budget refund) and the remaining lows can batch into a single cleanup commit. Fold **R-33** (replication wire 32-bit add) into the same commit as the umbrella's L-9 fix; **R-34** (catchup saturating-add symmetry) lands alongside.
 
 ## Coverage gaps still carried forward
 
