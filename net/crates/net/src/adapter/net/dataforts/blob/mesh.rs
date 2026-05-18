@@ -48,11 +48,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use dashmap::DashMap;
 
-use super::adapter::{BlobAdapter, BlobStat};
+use super::adapter::{BlobAdapter, BlobByteStream, BlobStat};
 use super::admission::auth_allows_blob_op;
 use super::blob_ref::{
     byte_range_to_chunks, chunk_payload, BlobRef, ChunkRef, ChunkedPayload, Encoding,
+    BLOB_CHUNK_SIZE_BYTES,
 };
+use super::blob_tree::{ChunkRefV3, ChunkingStrategy, TreeBuilder, TREE_LEAF_CHUNK_MAX_BYTES};
 use super::error::BlobError;
 use super::metrics::BlobMetrics;
 use super::refcount::{BlobRefcountTable, DEFAULT_RETENTION_FLOOR};
@@ -866,6 +868,167 @@ impl MeshBlobAdapter {
             .close_and_unlink_file(&channel)
             .map_err(|e| BlobError::Backend(format!("mesh blob: close chunk: {}", e)))?;
         self.refcount.remove(hash);
+        Ok(())
+    }
+
+    /// Store a byte stream as a hierarchical-manifest blob
+    /// ([`BlobRef::Tree`]). Returns the constructed reference;
+    /// every constituent chunk + tree node is persisted before
+    /// the return.
+    ///
+    /// Streams are consumed chunk-by-chunk against the supplied
+    /// [`ChunkingStrategy`]. v0.3 Phase A accepts only
+    /// [`ChunkingStrategy::Fixed`] at exactly
+    /// [`BLOB_CHUNK_SIZE_BYTES`] (4 MiB) — CDC lands in Phase B,
+    /// other fixed sizes break v0.2 chunk-level dedup and are
+    /// rejected. Each chunk is hashed (BLAKE3), persisted via
+    /// the existing `store_chunk` path (idempotent on hash
+    /// collision), then fed into a [`TreeBuilder`] that
+    /// accumulates the manifest tree incrementally.
+    ///
+    /// Memory bound: O(chunk_size + TREE_FANOUT × MAX_TREE_DEPTH
+    /// × entry_size) — roughly 4 MiB + 20 KiB at the v0.3a
+    /// defaults. Independent of total stream size; a 1 TiB
+    /// stream uses the same peak memory as a 1 GiB stream.
+    ///
+    /// Phase A ships with sequential `store_chunk` dispatch —
+    /// each chunk is awaited before the next is requested.
+    /// Phase D's [`BandwidthClass`] surface adds dynamic
+    /// in-flight parallelism (~256 MB target). For TB-scale
+    /// streams on a fast link, the sequential path may not
+    /// saturate the wire; that's an acknowledged Phase A
+    /// trade-off.
+    pub async fn store_stream_tree(
+        &self,
+        mut stream: BlobByteStream,
+        encoding: Encoding,
+        chunking: ChunkingStrategy,
+    ) -> Result<BlobRef, BlobError> {
+        // v0.3a accepts only `Fixed` at the v0.2-compatible chunk
+        // size. The CDC path lands in Phase B; other fixed sizes
+        // break wire-level dedup with v0.2 Manifest blobs.
+        let chunk_size: u32 = match chunking {
+            ChunkingStrategy::Fixed { size } => {
+                if size as u64 != BLOB_CHUNK_SIZE_BYTES {
+                    return Err(BlobError::Backend(format!(
+                        "store_stream_tree: ChunkingStrategy::Fixed {{ size: {} }} \
+                         does not match v0.2-compatible BLOB_CHUNK_SIZE_BYTES ({}); \
+                         other fixed sizes break chunk-level dedup with v0.2 blobs",
+                        size, BLOB_CHUNK_SIZE_BYTES
+                    )));
+                }
+                size
+            }
+            ChunkingStrategy::Cdc { .. } => {
+                return Err(BlobError::Backend(
+                    "store_stream_tree: ChunkingStrategy::Cdc is reserved for Phase B; \
+                     v0.3a accepts only ChunkingStrategy::Fixed"
+                        .to_owned(),
+                ));
+            }
+        };
+        // Reed-Solomon encoding lands in Phase C with the striper.
+        // v0.3a Phase A accepts only Replicated.
+        if !matches!(encoding, Encoding::Replicated) {
+            return Err(BlobError::Backend(format!(
+                "store_stream_tree: encoding {:?} is reserved for Phase C; \
+                 v0.3a Phase A accepts only Encoding::Replicated",
+                encoding
+            )));
+        }
+
+        use futures::StreamExt;
+        let chunk_size_usize = chunk_size as usize;
+        let mut buffer: Vec<u8> = Vec::with_capacity(chunk_size_usize);
+        let mut builder = TreeBuilder::new();
+
+        // Stream-driven chunker. The producer's input chunks
+        // (the `BlobByteStream` items) don't have to align to
+        // our chunk boundary; buffer them and emit a chunk every
+        // time we accumulate `chunk_size` bytes. The final
+        // partial chunk lands in `finalize`.
+        while let Some(maybe) = stream.next().await {
+            let bytes = maybe?;
+            let mut remaining: &[u8] = bytes.as_ref();
+            while !remaining.is_empty() {
+                let needed = chunk_size_usize - buffer.len();
+                let take = needed.min(remaining.len());
+                buffer.extend_from_slice(&remaining[..take]);
+                remaining = &remaining[take..];
+                if buffer.len() == chunk_size_usize {
+                    self.emit_tree_chunk(&mut builder, std::mem::replace(
+                        &mut buffer,
+                        Vec::with_capacity(chunk_size_usize),
+                    ))
+                    .await?;
+                }
+            }
+        }
+        // Final partial chunk (length 1..chunk_size).
+        if !buffer.is_empty() {
+            self.emit_tree_chunk(&mut builder, std::mem::take(&mut buffer))
+                .await?;
+        }
+        if builder.chunk_count() == 0 {
+            return Err(BlobError::Backend(
+                "store_stream_tree: empty stream; use BlobRef::Small for zero-byte payloads"
+                    .to_owned(),
+            ));
+        }
+
+        // Finalize the tree. Persist every trailing node + the
+        // root before returning the BlobRef.
+        let output = builder.finalize()?;
+        for node in &output.trailing_nodes {
+            self.store_chunk(&node.hash, &node.bytes).await?;
+        }
+        self.store_chunk(&output.root_hash, &output.root_bytes)
+            .await?;
+
+        BlobRef::tree(
+            format!("mesh://{}", super::hex32(&output.root_hash)),
+            encoding,
+            output.root_hash,
+            output.total_bytes,
+            output.root_depth,
+        )
+    }
+
+    /// Internal: persist a single tree chunk + push it into the
+    /// builder + persist any cascade-closed nodes. Centralised so
+    /// the chunker loop above stays compact.
+    async fn emit_tree_chunk(
+        &self,
+        builder: &mut TreeBuilder,
+        chunk_bytes: Vec<u8>,
+    ) -> Result<(), BlobError> {
+        if chunk_bytes.is_empty() {
+            return Err(BlobError::Backend(
+                "emit_tree_chunk: zero-byte chunk".to_owned(),
+            ));
+        }
+        if (chunk_bytes.len() as u64) > TREE_LEAF_CHUNK_MAX_BYTES {
+            return Err(BlobError::Backend(format!(
+                "emit_tree_chunk: chunk {} bytes exceeds leaf cap {}",
+                chunk_bytes.len(),
+                TREE_LEAF_CHUNK_MAX_BYTES
+            )));
+        }
+        let hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
+        let chunk_size = chunk_bytes.len() as u32;
+        // Persist the chunk bytes first so a crash between this
+        // and the tree-builder push leaves the chunk content-
+        // addressed and reachable for any future re-attempt
+        // (the chunk's hash matches its bytes regardless of
+        // whether a tree references it yet).
+        self.store_chunk(&hash, &chunk_bytes).await?;
+        drop(chunk_bytes); // release memory now that store has it.
+        // Push into the builder; persist any cascade-closed nodes
+        // before returning.
+        let closed = builder.push_chunk(ChunkRefV3::data(hash, chunk_size))?;
+        for node in &closed {
+            self.store_chunk(&node.hash, &node.bytes).await?;
+        }
         Ok(())
     }
 
@@ -2819,5 +2982,319 @@ mod tests {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(!adapter.overflow_active());
         assert!(!clone.overflow_active());
+    }
+
+    // ────────────────────────────────────────────────────────
+    // store_stream_tree (Phase A3)
+    // ────────────────────────────────────────────────────────
+
+    use super::super::blob_tree::{
+        ChunkingStrategy, TreeNode, MAX_TREE_DEPTH, TREE_FANOUT,
+    };
+    use bytes::Bytes;
+
+    /// Build a `BlobByteStream` from a single byte buffer. Helps
+    /// keep the tree tests compact without spinning up a real
+    /// async source. The stream emits exactly one item, so all
+    /// chunking happens inside `store_stream_tree`'s buffer logic.
+    fn stream_one(bytes: Vec<u8>) -> BlobByteStream {
+        Box::pin(futures::stream::once(async move { Ok(Bytes::from(bytes)) }))
+    }
+
+    /// Build a `BlobByteStream` from many small byte slices to
+    /// exercise the buffering logic in `store_stream_tree` (where
+    /// the producer doesn't align to the 4 MiB chunk boundary).
+    fn stream_many(slices: Vec<Vec<u8>>) -> BlobByteStream {
+        let items: Vec<Result<Bytes, BlobError>> = slices
+            .into_iter()
+            .map(|s| Ok(Bytes::from(s)))
+            .collect();
+        Box::pin(futures::stream::iter(items))
+    }
+
+    fn deterministic_bytes(seed: u8, len: usize) -> Vec<u8> {
+        // Use a tiny LCG so the bytes are content-distinct per
+        // seed but cheap to produce — no rand crate dependency
+        // in the test path.
+        let mut state: u64 = seed as u64;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// A two-chunk blob (just over BLOB_CHUNK_SIZE_BYTES) round-
+    /// trips: store_stream_tree returns a BlobRef::Tree; every
+    /// chunk + the root node lands locally.
+    #[tokio::test]
+    async fn store_stream_tree_two_chunk_round_trip() {
+        let adapter = make_adapter();
+        let len = BLOB_CHUNK_SIZE_BYTES as usize + 1024; // one full + one tiny
+        let payload = deterministic_bytes(0x11, len);
+        let stream = stream_one(payload.clone());
+
+        let blob_ref = adapter
+            .store_stream_tree(stream, Encoding::Replicated, ChunkingStrategy::default())
+            .await
+            .expect("store_stream_tree succeeds");
+
+        // The returned ref is a Tree.
+        assert!(matches!(blob_ref, BlobRef::Tree { .. }));
+        assert_eq!(blob_ref.size(), len as u64);
+        // depth=1 for a single-leaf tree (since both chunks fit
+        // in one leaf with TREE_FANOUT=128).
+        assert_eq!(blob_ref.tree_depth(), Some(1));
+
+        // Root node is locally fetchable.
+        let root_hash = *blob_ref.tree_root_hash().unwrap();
+        let root_bytes = adapter
+            .fetch_chunk(&root_hash)
+            .await
+            .expect("root node locally fetchable");
+        let root_decoded = TreeNode::decode(&root_bytes).expect("root decodes");
+        assert!(root_decoded.is_leaf());
+        // Root is a 2-chunk leaf.
+        if let TreeNode::Leaf { chunks } = root_decoded {
+            assert_eq!(chunks.len(), 2);
+            assert_eq!(chunks[0].size, BLOB_CHUNK_SIZE_BYTES as u32);
+            assert_eq!(chunks[1].size, 1024);
+            // Each chunk is locally fetchable.
+            for chunk in &chunks {
+                let bytes = adapter
+                    .fetch_chunk(&chunk.hash)
+                    .await
+                    .expect("chunk fetchable");
+                assert_eq!(bytes.len(), chunk.size as usize);
+                // BLAKE3 cross-check matches the manifest.
+                let computed: [u8; 32] = blake3::hash(&bytes).into();
+                assert_eq!(computed, chunk.hash);
+            }
+        }
+    }
+
+    /// Empty stream is rejected (use BlobRef::Small for zero-byte).
+    #[tokio::test]
+    async fn store_stream_tree_rejects_empty_stream() {
+        let adapter = make_adapter();
+        let empty = stream_one(Vec::new());
+        let err = adapter
+            .store_stream_tree(empty, Encoding::Replicated, ChunkingStrategy::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("empty stream"), "got: {err}");
+    }
+
+    /// CDC strategy is rejected (reserved for Phase B).
+    #[tokio::test]
+    async fn store_stream_tree_rejects_cdc_strategy() {
+        let adapter = make_adapter();
+        let bytes = deterministic_bytes(0x22, BLOB_CHUNK_SIZE_BYTES as usize);
+        let err = adapter
+            .store_stream_tree(
+                stream_one(bytes),
+                Encoding::Replicated,
+                ChunkingStrategy::Cdc {
+                    avg: 4 * 1024 * 1024,
+                    min: 1 * 1024 * 1024,
+                    max: 16 * 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Phase B"), "got: {err}");
+    }
+
+    /// Reed-Solomon encoding is rejected (reserved for Phase C).
+    #[tokio::test]
+    async fn store_stream_tree_rejects_reed_solomon_encoding() {
+        let adapter = make_adapter();
+        let bytes = deterministic_bytes(0x33, BLOB_CHUNK_SIZE_BYTES as usize);
+        let err = adapter
+            .store_stream_tree(
+                stream_one(bytes),
+                Encoding::ReedSolomon { k: 10, m: 4 },
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Phase C"), "got: {err}");
+    }
+
+    /// Fixed strategy with a non-v0.2-compatible chunk size is
+    /// rejected — keeps chunk-level dedup consistent with the
+    /// v0.2 Manifest path.
+    #[tokio::test]
+    async fn store_stream_tree_rejects_non_v0_2_chunk_size() {
+        let adapter = make_adapter();
+        let bytes = deterministic_bytes(0x44, 1024 * 1024);
+        let err = adapter
+            .store_stream_tree(
+                stream_one(bytes),
+                Encoding::Replicated,
+                ChunkingStrategy::Fixed { size: 1024 * 1024 }, // 1 MiB, not 4 MiB
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("dedup"), "got: {err}");
+    }
+
+    /// Determinism: storing the same bytes via two separate
+    /// store_stream_tree calls produces the same root hash —
+    /// content-addressed dedup at the tree level.
+    #[tokio::test]
+    async fn store_stream_tree_is_deterministic_across_calls() {
+        let adapter_a = make_adapter();
+        let adapter_b = make_adapter();
+        // 3 chunks + a tail.
+        let len = (BLOB_CHUNK_SIZE_BYTES * 3) as usize + 12345;
+        let payload = deterministic_bytes(0x55, len);
+        let r_a = adapter_a
+            .store_stream_tree(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        let r_b = adapter_b
+            .store_stream_tree(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_a.tree_root_hash(), r_b.tree_root_hash());
+        assert_eq!(r_a.size(), r_b.size());
+        assert_eq!(r_a.tree_depth(), r_b.tree_depth());
+    }
+
+    /// Input that arrives as many small slices (not aligned to
+    /// the chunk boundary) chunks identically to the same content
+    /// as one big slice — proves the buffer logic in
+    /// store_stream_tree handles producer-side fragmentation.
+    #[tokio::test]
+    async fn store_stream_tree_chunks_consistently_across_input_fragmentation() {
+        let adapter_a = make_adapter();
+        let adapter_b = make_adapter();
+        let len = (BLOB_CHUNK_SIZE_BYTES * 2) as usize + 100;
+        let payload = deterministic_bytes(0x66, len);
+        let r_a = adapter_a
+            .store_stream_tree(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        // Fragment the same payload into 17-byte slices.
+        let slices: Vec<Vec<u8>> = payload.chunks(17).map(|c| c.to_vec()).collect();
+        let r_b = adapter_b
+            .store_stream_tree(
+                stream_many(slices),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_a.tree_root_hash(),
+            r_b.tree_root_hash(),
+            "fragmented vs single-slice input must produce identical roots"
+        );
+    }
+
+    /// A 3-chunk blob produces a single-leaf tree (depth=1).
+    /// All chunks reachable, root decodes as Leaf.
+    #[tokio::test]
+    async fn store_stream_tree_three_chunks_yields_depth_one() {
+        let adapter = make_adapter();
+        let len = BLOB_CHUNK_SIZE_BYTES as usize * 3;
+        let payload = deterministic_bytes(0x77, len);
+        let blob_ref = adapter
+            .store_stream_tree(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blob_ref.tree_depth(), Some(1));
+        let root = TreeNode::decode(
+            &adapter
+                .fetch_chunk(blob_ref.tree_root_hash().unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(root.is_leaf());
+        assert_eq!(root.arity(), 3);
+    }
+
+    /// A `TREE_FANOUT + 1`-chunk blob produces a depth-2 tree
+    /// (one full leaf streamed mid-flight + a partial-leaf
+    /// finalize → both lifted into a root internal). The root
+    /// internal has 2 children: one full leaf (FANOUT chunks)
+    /// and one partial leaf (1 chunk).
+    #[tokio::test]
+    async fn store_stream_tree_fanout_plus_one_yields_depth_two() {
+        let adapter = make_adapter();
+        let len = BLOB_CHUNK_SIZE_BYTES as usize * (TREE_FANOUT + 1);
+        let payload = deterministic_bytes(0x88, len);
+        let blob_ref = adapter
+            .store_stream_tree(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blob_ref.tree_depth(), Some(2));
+        assert_eq!(blob_ref.size(), len as u64);
+        let root = TreeNode::decode(
+            &adapter
+                .fetch_chunk(blob_ref.tree_root_hash().unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(root.is_internal());
+        assert_eq!(root.arity(), 2);
+        // Each child references a leaf node that's also locally
+        // fetchable + decodable.
+        if let TreeNode::Internal { children } = root {
+            let (full_leaf_hash, full_leaf_size) = children[0];
+            let leaf_bytes = adapter.fetch_chunk(&full_leaf_hash).await.unwrap();
+            let leaf = TreeNode::decode(&leaf_bytes).unwrap();
+            assert!(leaf.is_leaf());
+            assert_eq!(leaf.arity(), TREE_FANOUT);
+            assert_eq!(full_leaf_size, BLOB_CHUNK_SIZE_BYTES * TREE_FANOUT as u64);
+        }
+    }
+
+    /// `store_stream_tree`'s root_depth always lies in
+    /// `1..=MAX_TREE_DEPTH`.
+    #[tokio::test]
+    async fn store_stream_tree_root_depth_in_range() {
+        let adapter = make_adapter();
+        let len = BLOB_CHUNK_SIZE_BYTES as usize + 1;
+        let payload = deterministic_bytes(0x99, len);
+        let blob_ref = adapter
+            .store_stream_tree(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        let depth = blob_ref.tree_depth().unwrap();
+        assert!(
+            depth >= 1 && depth <= MAX_TREE_DEPTH,
+            "depth {} out of range 1..={}",
+            depth,
+            MAX_TREE_DEPTH,
+        );
     }
 }

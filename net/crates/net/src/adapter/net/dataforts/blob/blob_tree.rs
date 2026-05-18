@@ -46,6 +46,52 @@ use super::error::BlobError;
 #[cfg(test)]
 use super::blob_ref::BLOB_CHUNK_SIZE_BYTES;
 
+// `ChunkingStrategy::Default` references `BLOB_CHUNK_SIZE_BYTES`
+// via the fully-qualified `super::blob_ref::` path so the
+// test-only import above doesn't shadow it for production paths.
+
+/// Chunking strategy for `MeshBlobAdapter::store_stream_tree`.
+///
+/// v0.3 Phase A ships [`ChunkingStrategy::Fixed`] only —
+/// deterministic fixed-size chunks matching v0.2's chunker so
+/// content stored via Tree can dedup at the chunk level against
+/// content stored via the v0.2 Manifest path.
+///
+/// [`ChunkingStrategy::Cdc`] is reserved on the surface for
+/// Phase B (content-defined chunking). Constructing a `Cdc`
+/// variant is allowed; passing it to `store_stream_tree` in v0.3a
+/// returns `BlobError::Backend` until Phase B lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkingStrategy {
+    /// Fixed-size chunks. `size` is the chunk size in bytes;
+    /// only the last chunk may be smaller. Default value
+    /// matches v0.2's [`super::blob_ref::BLOB_CHUNK_SIZE_BYTES`].
+    Fixed {
+        /// Chunk size in bytes. Must equal
+        /// `BLOB_CHUNK_SIZE_BYTES` (4 MiB) in v0.3a — other
+        /// values are wire-incompatible with v0.2 dedup and
+        /// rejected by `store_stream_tree`.
+        size: u32,
+    },
+    /// Content-defined chunking via FastCDC. Reserved for Phase B.
+    Cdc {
+        /// Target average chunk size in bytes.
+        avg: u32,
+        /// Minimum chunk size in bytes.
+        min: u32,
+        /// Maximum chunk size in bytes (enforced as hard cut).
+        max: u32,
+    },
+}
+
+impl Default for ChunkingStrategy {
+    fn default() -> Self {
+        Self::Fixed {
+            size: super::blob_ref::BLOB_CHUNK_SIZE_BYTES as u32,
+        }
+    }
+}
+
 /// Per-level fanout. A leaf carries up to [`TREE_FANOUT`] chunks;
 /// an internal node carries up to [`TREE_FANOUT`] children.
 ///
