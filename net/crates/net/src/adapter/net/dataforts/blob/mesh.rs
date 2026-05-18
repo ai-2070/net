@@ -769,14 +769,24 @@ impl MeshBlobAdapter {
             // `remove` that delete_chunk used to issue. If the
             // re-check fails the chunk stays around for the next
             // sweep to retry.
-            if !self.refcount.remove_if_deletable(
+            //
+            // `take_if_deletable` returns the removed entry so we
+            // can re-insert it on close-failure — without that
+            // restore path, a transient `close_and_unlink_file`
+            // error would leave the file on disk while the refcount
+            // entry is gone, orphaning the chunk: future sweeps
+            // can't find it (they enumerate refcounts) and the
+            // only recovery is the out-of-band scanner. Restore-
+            // on-failure means the very next sweep tick retries.
+            let entry_snapshot = match self.refcount.take_if_deletable(
                 &hash,
                 now_unix_ms,
                 self.retention_floor,
                 disk_pressure_critical,
             ) {
-                continue;
-            }
+                Some(entry) => entry,
+                None => continue,
+            };
             let channel = Self::chunk_channel(&hash);
             // close_and_unlink_file also removes any on-disk
             // segment dir, so swept chunks don't accumulate as
@@ -784,10 +794,19 @@ impl MeshBlobAdapter {
             // Heap-only channels (with_persistent(false)) skip the
             // unlink branch and behave exactly like close_file.
             if let Err(e) = self.redex.close_and_unlink_file(&channel) {
+                // Re-insert the refcount entry so a subsequent
+                // sweep tick retries. `restore_if_absent` is a no-
+                // op if a concurrent `incr` raced in and re-created
+                // the slot — their refcount > 0 is authoritative
+                // and the next sweep correctly skips the hash.
+                let restored = self.refcount.restore_if_absent(hash, entry_snapshot);
                 tracing::warn!(
                     hash = ?hash,
                     error = %e,
-                    "mesh blob: sweep close_and_unlink_file failed; refcount entry already gone, chunk file may persist until next store"
+                    restored,
+                    "mesh blob: sweep close_and_unlink_file failed; \
+                     refcount entry restored for next sweep retry \
+                     (restored=false means a concurrent incr re-created the slot)"
                 );
                 continue;
             }

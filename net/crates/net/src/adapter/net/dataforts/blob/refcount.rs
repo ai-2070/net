@@ -319,11 +319,51 @@ impl BlobRefcountTable {
         retention_floor: Duration,
         disk_pressure_critical: bool,
     ) -> bool {
+        self.take_if_deletable(hash, now_unix_ms, retention_floor, disk_pressure_critical)
+            .is_some()
+    }
+
+    /// Variant of [`Self::remove_if_deletable`] that returns the removed
+    /// entry so a caller whose post-remove work fails can route the
+    /// snapshot back into [`Self::restore_if_absent`] for retry.
+    ///
+    /// The sweep driver uses this to avoid orphaning chunks on
+    /// `close_and_unlink_file` failure: without a retry path, the
+    /// refcount entry is gone (so future `deletable_hashes` snapshots
+    /// can't find it) while the on-disk file persists — silently
+    /// stranded until the out-of-band scanner rebuilds the refcount
+    /// from a directory walk.
+    pub fn take_if_deletable(
+        &self,
+        hash: &[u8; 32],
+        now_unix_ms: u64,
+        retention_floor: Duration,
+        disk_pressure_critical: bool,
+    ) -> Option<RefcountEntry> {
         self.inner
             .remove_if(hash, |_, entry| {
                 should_sweep(entry, now_unix_ms, retention_floor, disk_pressure_critical)
             })
-            .is_some()
+            .map(|(_, entry)| entry)
+    }
+
+    /// Re-insert a previously-removed refcount entry, but only if
+    /// the slot is still vacant. Used by the sweep driver on a
+    /// `close_and_unlink_file` failure: the entry was atomically
+    /// removed by [`Self::take_if_deletable`]; if a concurrent
+    /// `incr` already raced in and re-created the slot with a real
+    /// refcount, leave their entry alone (their `refcount > 0` is
+    /// authoritative and means the next sweep won't touch this
+    /// hash anyway). Returns `true` if our entry was restored.
+    pub fn restore_if_absent(&self, hash: [u8; 32], entry: RefcountEntry) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.inner.entry(hash) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(entry);
+                true
+            }
+        }
     }
 }
 
@@ -620,6 +660,64 @@ mod tests {
         let removed =
             t.remove_if_deletable(&h(1), 25 * ONE_HOUR_MS, DEFAULT_RETENTION_FLOOR, false);
         assert!(!removed);
+    }
+
+    /// `take_if_deletable` returns the removed snapshot so a sweep
+    /// driver whose post-remove work fails (e.g. `close_and_unlink_file`)
+    /// can route it back through `restore_if_absent` for retry,
+    /// closing the orphan-chunk hazard: the refcount entry is the
+    /// only handle future sweeps have on the hash, so removing it
+    /// without successfully deleting the file would leave the file
+    /// stranded on disk.
+    #[test]
+    fn take_if_deletable_returns_entry_for_retry_path() {
+        let t = BlobRefcountTable::new();
+        t.store_observed(h(1), 1234, 0);
+        let now = 25 * ONE_HOUR_MS;
+        let snapshot = t
+            .take_if_deletable(&h(1), now, DEFAULT_RETENTION_FLOOR, false)
+            .expect("eligible entry must be returned");
+        assert_eq!(snapshot.size_bytes, Some(1234));
+        assert_eq!(snapshot.refcount, 0);
+        assert!(t.get(&h(1)).is_none(), "entry has been removed");
+
+        // Restore in the absent slot — the next sweep tick will
+        // pick the entry up and retry.
+        let restored = t.restore_if_absent(h(1), snapshot);
+        assert!(restored);
+        assert_eq!(
+            t.get(&h(1)).map(|e| e.size_bytes),
+            Some(Some(1234)),
+            "restored entry preserves the original size_bytes",
+        );
+    }
+
+    /// `restore_if_absent` must NOT clobber an entry that a
+    /// concurrent `incr` re-created in the gap between `take` and
+    /// `restore`. Their refcount > 0 is authoritative; we don't want
+    /// our refcount=0 snapshot wiping it out and re-opening the
+    /// sweep-eligible window.
+    #[test]
+    fn restore_if_absent_does_not_clobber_concurrent_incr() {
+        let t = BlobRefcountTable::new();
+        t.store_observed(h(1), 0, 0);
+        let now = 25 * ONE_HOUR_MS;
+        let snapshot = t
+            .take_if_deletable(&h(1), now, DEFAULT_RETENTION_FLOOR, false)
+            .expect("eligible entry must be returned");
+        assert_eq!(snapshot.refcount, 0);
+
+        // Concurrent incr lands BEFORE our restore.
+        t.incr(h(1), now);
+        assert_eq!(t.get(&h(1)).unwrap().refcount, 1);
+
+        let restored = t.restore_if_absent(h(1), snapshot);
+        assert!(!restored, "incr-occupied slot must not be overwritten");
+        assert_eq!(
+            t.get(&h(1)).unwrap().refcount,
+            1,
+            "concurrent incr's refcount=1 must survive the restore attempt",
+        );
     }
 
     #[test]
