@@ -216,8 +216,24 @@ impl GreedyCacheRegistry {
     }
 
     fn allocate_lru_pos(&mut self) -> u64 {
+        // Detect saturation BEFORE handing out a position so a
+        // future caller seeding `next_lru_pos` at u64::MAX (the
+        // pre-fix saturating_add silently collapsed every
+        // subsequent touch/upsert to the same value, destroying
+        // the LRU ordering). On overflow, panic in debug and
+        // refuse the alloc with u64::MAX in release — touch/upsert
+        // calls that fall after the panic produce a degraded but
+        // visible eviction order rather than silent collapse.
+        if self.next_lru_pos == u64::MAX {
+            debug_assert!(
+                false,
+                "GreedyCacheRegistry::next_lru_pos saturated at u64::MAX — \
+                 LRU ordering would silently collapse",
+            );
+            return u64::MAX;
+        }
         let pos = self.next_lru_pos;
-        self.next_lru_pos = self.next_lru_pos.saturating_add(1);
+        self.next_lru_pos += 1;
         pos
     }
 

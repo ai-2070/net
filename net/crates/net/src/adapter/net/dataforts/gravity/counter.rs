@@ -315,9 +315,14 @@ impl HeatRegistry {
         // Prune fully-decayed + already-withdrawn entries. A future
         // bump for the same origin re-enters the registry via
         // `entry_mut`; the LRU cap protects against unbounded
-        // re-entries.
-        self.counters
-            .retain(|_, c| !(c.rate == 0.0 && c.last_emitted == Some(0.0)));
+        // re-entries. Use `<= 0.0` rather than `== 0.0` so a future
+        // caller writing `-0.0` (e.g. a clamped-from-negative rate)
+        // still prunes — `-0.0 == 0.0` is true in IEEE-754 but the
+        // explicit comparator is more obviously robust to a future
+        // refactor that swaps in `<=` elsewhere.
+        self.counters.retain(|_, c| {
+            !(c.rate <= 0.0 && c.last_emitted.map_or(false, |v| v <= 0.0))
+        });
         out
     }
 }
@@ -467,8 +472,10 @@ impl BlobHeatRegistry {
                 out.push((*hash, emission));
             }
         }
-        self.counters
-            .retain(|_, c| !(c.rate == 0.0 && c.last_emitted == Some(0.0)));
+        // Same `<= 0.0` rationale as HeatRegistry::tick above.
+        self.counters.retain(|_, c| {
+            !(c.rate <= 0.0 && c.last_emitted.map_or(false, |v| v <= 0.0))
+        });
         out
     }
 }
