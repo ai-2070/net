@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/compute/daemon_factory.rs
+  s_2571835e05521c::t_2d5bdfc8814273 126
+  s_2571835e05521c::t_5d894a47e0d5e0 164,171-203
+  s_2571835e05521c::t_d9ac06727f1c75 44-57
+net/crates/net/src/adapter/net/subprotocol/migration_handler.rs
+  s_2571835e05521c::t_b78cccb9534e47 405-416,435-438
+net/crates/net/tests/migration_integration.rs
+  s_2571835e05521c::t_1267c905d2d414 624-722
+  s_2571835e05521c::t_3824d287676e29 2605-2614
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "c8758caefd05d913388e8ea8731e2d3fea0f0187",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
