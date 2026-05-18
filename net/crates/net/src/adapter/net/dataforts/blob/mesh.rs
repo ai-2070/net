@@ -980,11 +980,20 @@ impl MeshBlobAdapter {
         encoding: Encoding,
         chunking: ChunkingStrategy,
     ) -> Result<BlobRef, BlobError> {
-        // v0.3a accepts only `Fixed` at the v0.2-compatible chunk
-        // size. The CDC path lands in Phase B; other fixed sizes
-        // break wire-level dedup with v0.2 Manifest blobs.
-        let chunk_size: u32 = match chunking {
+        // Reed-Solomon encoding lands in Phase C with the striper.
+        // v0.3a/B accept only Replicated.
+        if !matches!(encoding, Encoding::Replicated) {
+            return Err(BlobError::Backend(format!(
+                "store_stream_tree: encoding {:?} is reserved for Phase C; \
+                 v0.3 accepts only Encoding::Replicated",
+                encoding
+            )));
+        }
+        match chunking {
             ChunkingStrategy::Fixed { size } => {
+                // Fixed: only the v0.2-compatible chunk size; other
+                // sizes break wire-level dedup with v0.2 Manifest
+                // blobs.
                 if size as u64 != BLOB_CHUNK_SIZE_BYTES {
                     return Err(BlobError::Backend(format!(
                         "store_stream_tree: ChunkingStrategy::Fixed {{ size: {} }} \
@@ -993,27 +1002,30 @@ impl MeshBlobAdapter {
                         size, BLOB_CHUNK_SIZE_BYTES
                     )));
                 }
-                size
+                self.store_stream_tree_internal(stream, encoding, size).await
             }
-            ChunkingStrategy::Cdc { .. } => {
-                return Err(BlobError::Backend(
-                    "store_stream_tree: ChunkingStrategy::Cdc is reserved for Phase B; \
-                     v0.3a accepts only ChunkingStrategy::Fixed"
-                        .to_owned(),
-                ));
+            ChunkingStrategy::Cdc { min, avg, max } => {
+                // CDC: only the production parameter triple
+                // (`PRODUCTION_CDC_PARAMS`); other triples break
+                // cross-blob dedup on the cluster. Tests that want
+                // a smaller-scale CDC fixture call the test-only
+                // `store_stream_tree_cdc_internal` path.
+                let params = super::cdc::CdcParams { min, avg, max };
+                if params != super::cdc::PRODUCTION_CDC_PARAMS {
+                    return Err(BlobError::Backend(format!(
+                        "store_stream_tree: ChunkingStrategy::Cdc {{ min: {}, avg: {}, \
+                         max: {} }} does not match the v0.3 production parameter triple \
+                         (min={}, avg={}, max={}); arbitrary CDC params break cross-blob \
+                         dedup on the cluster",
+                        min, avg, max,
+                        super::cdc::PRODUCTION_CDC_PARAMS.min,
+                        super::cdc::PRODUCTION_CDC_PARAMS.avg,
+                        super::cdc::PRODUCTION_CDC_PARAMS.max
+                    )));
+                }
+                self.store_stream_tree_cdc_internal(stream, encoding, params).await
             }
-        };
-        // Reed-Solomon encoding lands in Phase C with the striper.
-        // v0.3a Phase A accepts only Replicated.
-        if !matches!(encoding, Encoding::Replicated) {
-            return Err(BlobError::Backend(format!(
-                "store_stream_tree: encoding {:?} is reserved for Phase C; \
-                 v0.3a Phase A accepts only Encoding::Replicated",
-                encoding
-            )));
         }
-        self.store_stream_tree_internal(stream, encoding, chunk_size)
-            .await
     }
 
     /// Body of [`Self::store_stream_tree`] without the
@@ -1076,6 +1088,76 @@ impl MeshBlobAdapter {
 
         // Finalize the tree. Persist every trailing node + the
         // root before returning the BlobRef.
+        let output = builder.finalize()?;
+        for node in &output.trailing_nodes {
+            self.store_chunk(&node.hash, &node.bytes).await?;
+        }
+        self.store_chunk(&output.root_hash, &output.root_bytes)
+            .await?;
+
+        BlobRef::tree(
+            format!("mesh://{}", super::hex32(&output.root_hash)),
+            encoding,
+            output.root_hash,
+            output.total_bytes,
+            output.root_depth,
+        )
+    }
+
+    /// CDC counterpart to [`Self::store_stream_tree_internal`].
+    /// Drives a [`CdcStreamChunker`](super::cdc::CdcStreamChunker)
+    /// over the stream and persists each content-defined chunk
+    /// through the same `emit_tree_chunk` path the Fixed variant
+    /// uses. Accepts arbitrary CDC parameters (no production-spec
+    /// clamp), so tests can run a meaningful CDC fixture at
+    /// kilobyte-scale; the public [`Self::store_stream_tree`]
+    /// pins the params to [`PRODUCTION_CDC_PARAMS`].
+    ///
+    /// Memory bound: O(params.max + TREE_FANOUT × MAX_TREE_DEPTH
+    /// × entry_size) ≈ 16 MiB + 20 KiB at production params.
+    /// Independent of total stream size.
+    ///
+    /// Not part of the supported public API — `pub` only so the
+    /// Phase B conformance integration test can run at
+    /// memory-feasible scale.
+    #[doc(hidden)]
+    pub async fn store_stream_tree_cdc_internal(
+        &self,
+        mut stream: BlobByteStream,
+        encoding: Encoding,
+        params: super::cdc::CdcParams,
+    ) -> Result<BlobRef, BlobError> {
+        use futures::StreamExt;
+        params.validate()?;
+        let mut chunker = super::cdc::CdcStreamChunker::new(params);
+        let mut builder = TreeBuilder::new();
+
+        while let Some(maybe) = stream.next().await {
+            let bytes = maybe?;
+            chunker.extend(bytes.as_ref());
+            // Drain every confirmed content-defined chunk before
+            // requesting more input. Bounds memory at params.max
+            // + the typical stream-item size.
+            while let Some(chunk) = chunker.try_next_chunk() {
+                self.emit_tree_chunk(&mut builder, chunk).await?;
+            }
+        }
+        // End-of-stream: flush whatever's left in the chunker
+        // buffer. May emit one or more chunks; the last one may
+        // be smaller than `params.min` (standard FastCDC EOF
+        // allowance).
+        for chunk in chunker.finalize() {
+            self.emit_tree_chunk(&mut builder, chunk).await?;
+        }
+
+        if builder.chunk_count() == 0 {
+            return Err(BlobError::Backend(
+                "store_stream_tree (CDC): empty stream; use BlobRef::Small for \
+                 zero-byte payloads"
+                    .to_owned(),
+            ));
+        }
+
         let output = builder.finalize()?;
         for node in &output.trailing_nodes {
             self.store_chunk(&node.hash, &node.bytes).await?;
@@ -3461,24 +3543,35 @@ mod tests {
         assert!(err.to_string().contains("empty stream"), "got: {err}");
     }
 
-    /// CDC strategy is rejected (reserved for Phase B).
+    /// CDC strategy with off-spec parameters is rejected — the
+    /// public surface accepts only the pinned
+    /// `PRODUCTION_CDC_PARAMS` triple (4 MiB avg, 1 MiB min,
+    /// 16 MiB max) so all CDC-stored blobs in a cluster can
+    /// dedup against each other.
     #[tokio::test]
-    async fn store_stream_tree_rejects_cdc_strategy() {
+    async fn store_stream_tree_rejects_off_spec_cdc_params() {
         let adapter = make_adapter();
-        let bytes = deterministic_bytes(0x22, BLOB_CHUNK_SIZE_BYTES as usize);
+        let bytes = deterministic_bytes(0x22, 1024);
         let err = adapter
             .store_stream_tree(
                 stream_one(bytes),
                 Encoding::Replicated,
                 ChunkingStrategy::Cdc {
-                    avg: 4 * 1024 * 1024,
-                    min: 1 * 1024 * 1024,
-                    max: 16 * 1024 * 1024,
+                    // Off-spec: smaller than production for any
+                    // would-be tuner. The error must surface so
+                    // callers know to use the test-only internal
+                    // path or the production triple.
+                    avg: 2048,
+                    min: 512,
+                    max: 8192,
                 },
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Phase B"), "got: {err}");
+        assert!(
+            err.to_string().contains("does not match the v0.3 production parameter triple"),
+            "got: {err}"
+        );
     }
 
     /// Reed-Solomon encoding is rejected (reserved for Phase C).
@@ -3513,6 +3606,77 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("dedup"), "got: {err}");
+    }
+
+    /// CDC end-to-end at test-friendly scale: store a
+    /// deterministic blob via the test-internal CDC path, fetch
+    /// the full range back, assert byte-equality. Uses the
+    /// `store_stream_tree_cdc_internal` helper with small params
+    /// (256 / 1024 / 4096 byte triple) so the test allocates
+    /// kilobytes, not megabytes. Pins B1's wiring: the CDC
+    /// chunker drives `emit_tree_chunk` through the same path
+    /// the Fixed variant uses.
+    #[tokio::test]
+    async fn store_stream_tree_cdc_round_trips_at_small_scale() {
+        let adapter = make_adapter();
+        let payload = deterministic_bytes(0x77, 32 * 1024);
+        let params = super::super::cdc::CdcParams {
+            min: 256,
+            avg: 1024,
+            max: 4096,
+        };
+        let blob_ref = adapter
+            .store_stream_tree_cdc_internal(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                params,
+            )
+            .await
+            .expect("CDC store_stream_tree round trip");
+        assert!(matches!(blob_ref, BlobRef::Tree { .. }));
+        assert_eq!(blob_ref.size(), payload.len() as u64);
+        let fetched = adapter
+            .fetch_range(&blob_ref, 0..payload.len() as u64)
+            .await
+            .expect("CDC fetch_range");
+        assert_eq!(fetched, payload, "CDC round-trip must be byte-identical");
+    }
+
+    /// CDC determinism through the adapter: two independent
+    /// adapters storing the same bytes via CDC produce identical
+    /// root hashes. Pins that the CDC chunker's boundary
+    /// decisions are reproducible end-to-end.
+    #[tokio::test]
+    async fn store_stream_tree_cdc_is_deterministic_across_adapters() {
+        let adapter_a = make_adapter();
+        let adapter_b = make_adapter();
+        let payload = deterministic_bytes(0x88, 16 * 1024);
+        let params = super::super::cdc::CdcParams {
+            min: 256,
+            avg: 1024,
+            max: 4096,
+        };
+        let r_a = adapter_a
+            .store_stream_tree_cdc_internal(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                params,
+            )
+            .await
+            .unwrap();
+        let r_b = adapter_b
+            .store_stream_tree_cdc_internal(
+                stream_one(payload),
+                Encoding::Replicated,
+                params,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_a.tree_root_hash(),
+            r_b.tree_root_hash(),
+            "two independent CDC stores of the same content must agree on the root hash"
+        );
     }
 
     /// Determinism: storing the same bytes via two separate
