@@ -142,6 +142,23 @@ pub enum ReplicaTransitionEvent {
         /// Monotonic timestamp of the transition.
         at: Instant,
     },
+    /// Symmetric to [`Self::LeaderLostAndIdled`] for the
+    /// promotion side: this coordinator entered `Leader` directly
+    /// from `Idle`, so the node BOTH became a holder AND became
+    /// leader in one transition. Bundled into one event so a
+    /// downstream sink can't drop half of the (holder add,
+    /// leader set) pair under backpressure — pre-bundle the
+    /// observer fired `BecameHolder` then `LeaderChanged` as two
+    /// `try_publish`es, and a `QueueFull` between them left the
+    /// snapshot with a holder set but no leader (or vice versa).
+    /// `Replica → Leader` / `Candidate → Leader` still fire only
+    /// `LeaderChanged` because the node was already a holder.
+    BecameHolderAndLeader {
+        /// Substrate-level chain identifier.
+        origin_hash: u64,
+        /// Monotonic timestamp of the transition.
+        at: Instant,
+    },
 }
 
 /// Observer hook for replication-coordinator state changes.
@@ -431,16 +448,23 @@ impl ReplicationCoordinator {
         // again including the observer.)
         let at = Instant::now();
         match (transition.from, transition.to) {
-            (ReplicaRole::Idle, ReplicaRole::Replica)
-            | (ReplicaRole::Idle, ReplicaRole::Leader) => {
+            (ReplicaRole::Idle, ReplicaRole::Replica) => {
                 self.fire_transition(ReplicaTransitionEvent::BecameHolder {
                     origin_hash: origin,
                     at,
                 });
             }
-            // Leader → Idle: fire ONE bundled event so a
-            // downstream sink can't drop half of the (holder
-            // removal, leader clear) pair under backpressure.
+            // Idle → Leader: bundle the (holder add, leader set)
+            // pair so a backpressured sink can't drop one half and
+            // leave the snapshot with a phantom holder or leader.
+            (ReplicaRole::Idle, ReplicaRole::Leader) => {
+                self.fire_transition(ReplicaTransitionEvent::BecameHolderAndLeader {
+                    origin_hash: origin,
+                    at,
+                });
+            }
+            // Leader → Idle: bundle the (holder removal, leader
+            // clear) pair, symmetric to BecameHolderAndLeader above.
             (ReplicaRole::Leader, ReplicaRole::Idle) => {
                 self.fire_transition(ReplicaTransitionEvent::LeaderLostAndIdled {
                     origin_hash: origin,
@@ -455,11 +479,13 @@ impl ReplicationCoordinator {
             }
             _ => {}
         }
+        // Replica → Leader / Candidate → Leader: already a holder,
+        // so only the leader bit changes. Idle → Leader is handled
+        // atomically above by BecameHolderAndLeader.
         if matches!(
             (transition.from, transition.to),
             (ReplicaRole::Replica, ReplicaRole::Leader)
                 | (ReplicaRole::Candidate, ReplicaRole::Leader)
-                | (ReplicaRole::Idle, ReplicaRole::Leader)
         ) {
             self.fire_transition(ReplicaTransitionEvent::LeaderChanged {
                 origin_hash: origin,

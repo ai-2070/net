@@ -708,6 +708,26 @@ impl MeshOsLoop {
 
         loop {
             tokio::select! {
+                // `biased` polls arms in source order, so a
+                // saturated `events_rx` cannot starve the reconcile
+                // tick. The previous (random) order let a sustained
+                // event burst defer reconcile / poll_probes / gc_freeze
+                // for the duration of the burst — `local_maintenance`
+                // went stale, `applied_backoffs` stuck, and
+                // `freeze_until` never GC'd because gc_freeze only
+                // runs on Tick.
+                biased;
+                _ = tick.tick() => {
+                    // The Tick event drives reconcile; we route
+                    // it through the same `apply` path so the
+                    // `last_tick` fold field updates uniformly.
+                    self.apply(&MeshOsEvent::Tick);
+                    // Pull-via-tick probes — folded BEFORE
+                    // reconcile so the reconcile pass sees the
+                    // latest samples in this tick window.
+                    self.poll_probes();
+                    self.run_reconcile().await;
+                }
                 event = self.events_rx.recv() => {
                     let Some(event) = event else {
                         tracing::debug!(
@@ -726,17 +746,6 @@ impl MeshOsLoop {
                         break;
                     }
                     self.apply(&event);
-                }
-                _ = tick.tick() => {
-                    // The Tick event drives reconcile; we route
-                    // it through the same `apply` path so the
-                    // `last_tick` fold field updates uniformly.
-                    self.apply(&MeshOsEvent::Tick);
-                    // Pull-via-tick probes — folded BEFORE
-                    // reconcile so the reconcile pass sees the
-                    // latest samples in this tick window.
-                    self.poll_probes();
-                    self.run_reconcile().await;
                 }
             }
         }
@@ -1345,14 +1354,28 @@ impl MeshOsLoop {
             // the executor's job is to apply admit(); reconcile
             // staying responsive is the higher-order property.
             // Count + log drops so the silent-loss path is
-            // observable.
-            self.recent_emissions.push(pending.clone());
-            if let Err(mpsc::error::TrySendError::Full(rejected)) =
-                self.actions_tx.try_send(pending)
-            {
-                dropped_this_tick += 1;
-                if first_dropped_kind.is_none() {
-                    first_dropped_kind = Some(super::snapshot::action_kind_str(&rejected.action));
+            // observable. recent_emissions only gets the action
+            // on try_send success — pre-fix every action landed in
+            // recent_emissions (and surfaced as `recently_emitted`
+            // on the snapshot) even when the executor's queue was
+            // full and the action would never run, double-counting
+            // the drop in dropped_actions while painting a misleading
+            // "emitted" picture in the snapshot.
+            let pending_clone = pending.clone();
+            match self.actions_tx.try_send(pending) {
+                Ok(()) => self.recent_emissions.push(pending_clone),
+                Err(mpsc::error::TrySendError::Full(rejected)) => {
+                    dropped_this_tick += 1;
+                    if first_dropped_kind.is_none() {
+                        first_dropped_kind =
+                            Some(super::snapshot::action_kind_str(&rejected.action));
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Executor task is gone — count as dropped and
+                    // skip recent_emissions; subsequent reconciles
+                    // will keep counting until the loop tears down.
+                    dropped_this_tick += 1;
                 }
             }
         }
@@ -2246,7 +2269,12 @@ mod tests {
         let MeshOsLoopParts {
             mesh_loop: loop_,
             handle,
-            actions_rx: _,
+            // Keep the receiver alive so the reconciler's try_send
+            // succeeds and the action lands in recent_emissions —
+            // pre-fix recent_emissions populated regardless of
+            // try_send outcome (an actions_tx.Closed would still
+            // mark the action as "emitted" in the snapshot).
+            actions_rx: _actions_rx,
             reader,
         } = MeshOsLoop::new(cfg);
         let task = tokio::spawn(loop_.run());

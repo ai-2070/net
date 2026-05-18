@@ -177,6 +177,13 @@ impl ReplicaTransitionObserver for MeshOsReplicaTransitionSink {
                     holder: self.this_node,
                 }
             }
+            ReplicaTransitionEvent::BecameHolderAndLeader { origin_hash, .. } => {
+                // Symmetric atomic pair on the promotion side.
+                MeshOsEvent::ReplicaBecameHolderAndLeader {
+                    chain: origin_hash,
+                    holder: self.this_node,
+                }
+            }
         };
 
         match self.handle.try_publish(mesh_event) {
