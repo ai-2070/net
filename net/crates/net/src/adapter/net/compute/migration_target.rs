@@ -220,6 +220,18 @@ impl MigrationTargetHandler {
             .ok_or(MigrationError::DaemonNotFound(daemon_origin))?;
 
         let mut state = entry.lock();
+        // Phase guard mirrors buffer_event below: a wire-level retry
+        // of BufferedEvents (source re-transmits after a dropped ack)
+        // arriving after activate() flipped state to Cutover would
+        // otherwise rewind phase to Replay and re-open the duplicate-
+        // delivery window — a subsequent buffer_event for a fresh
+        // event would pass its phase != Cutover guard and deliver
+        // alongside the normal path. Return the recorded
+        // replayed_through so the source sees the retried payload as
+        // already-handled.
+        if state.phase == MigrationPhase::Cutover {
+            return Ok(state.replayed_through);
+        }
         state.phase = MigrationPhase::Replay;
 
         // Insert into BTreeMap for ordered replay
@@ -513,7 +525,7 @@ mod tests {
     use crate::adapter::net::behavior::capability::CapabilityFilter;
     use crate::adapter::net::compute::{DaemonError, MeshDaemon};
     use crate::adapter::net::identity::EntityKeypair;
-    use crate::adapter::net::state::causal::CausalChainBuilder;
+    use crate::adapter::net::state::causal::{CausalChainBuilder, CausalLink};
     use crate::adapter::net::state::horizon::ObservedHorizon;
     use bytes::Bytes;
 
@@ -672,6 +684,49 @@ mod tests {
     /// the same sequence. The fix returns `Ok(false)` (the same
     /// surface as a missing migration entry), telling the caller to
     /// treat the event as already-handled.
+    /// `replay_events` had no phase guard, so a wire-level retry of
+    /// a `BufferedEvents` packet arriving after `activate()` flipped
+    /// the migration to `Cutover` would rewind phase to `Replay` and
+    /// re-open the duplicate-delivery window that
+    /// `buffer_event_rejects_post_cutover_events` was protecting.
+    /// Post-fix the call is a no-op that returns the recorded
+    /// `replayed_through` so the source treats the retried payload
+    /// as already-handled.
+    #[test]
+    fn replay_events_no_op_after_cutover() {
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+
+        let snapshot = make_snapshot(&kp, 5, 5);
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+
+        handler.activate(origin).unwrap();
+        let replayed_at_cutover = handler.replayed_through(origin).unwrap();
+
+        // Wire-retried BufferedEvents arrive after cutover. Pre-fix
+        // this rewound phase to Replay; post-fix it is a no-op
+        // returning the recorded cursor.
+        let result = handler
+            .replay_events(origin, vec![make_event(0xBBBB, replayed_at_cutover + 1)])
+            .unwrap();
+        assert_eq!(result, replayed_at_cutover);
+        assert_eq!(handler.phase(origin), Some(MigrationPhase::Cutover));
+    }
+
     #[test]
     fn buffer_event_rejects_post_cutover_events() {
         let reg = Arc::new(DaemonRegistry::new());

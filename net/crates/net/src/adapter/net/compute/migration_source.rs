@@ -291,7 +291,22 @@ impl MigrationSourceHandler {
     /// Phase 5: Cleanup — unregister daemon from this node.
     ///
     /// Removes the daemon from the local registry and clears migration state.
+    /// Requires the migration to be in `Cutover` (the only phase
+    /// after which the source's daemon copy is safe to retire); any
+    /// pre-cutover call would otherwise unregister a live daemon
+    /// while the target is still restoring, stranding new traffic
+    /// in `DaemonNotFound` and losing source-side `buffered_events`.
     pub fn cleanup(&self, daemon_origin: u64) -> Result<(), MigrationError> {
+        if let Some(entry) = self.migrations.get(&daemon_origin) {
+            let phase = entry.lock().phase;
+            if phase != MigrationPhase::Cutover {
+                return Err(MigrationError::WrongPhase {
+                    expected: MigrationPhase::Cutover,
+                    got: phase,
+                });
+            }
+        }
+
         // Unregister daemon from local registry
         let _ = self.daemon_registry.unregister(daemon_origin);
 
@@ -482,6 +497,32 @@ mod tests {
 
         assert!(!handler.is_migrating(origin));
         assert!(reg.contains(origin)); // daemon still registered
+    }
+
+    /// `cleanup` invoked before `on_cutover` must NOT unregister
+    /// the source's live daemon — the target is still restoring
+    /// and inbound traffic would otherwise route to a missing
+    /// daemon while source-side buffered events were silently
+    /// dropped. The guard returns `WrongPhase { expected: Cutover }`
+    /// so misuse surfaces at the boundary.
+    #[test]
+    fn cleanup_before_cutover_rejects_with_wrong_phase() {
+        let (reg, origin) = setup();
+        let handler = MigrationSourceHandler::new(reg.clone());
+
+        handler.start_snapshot(origin, 0x2222, 0x1111).unwrap();
+        // Snapshot phase — should reject.
+        let err = handler.cleanup(origin).unwrap_err();
+        match err {
+            MigrationError::WrongPhase { expected, got } => {
+                assert_eq!(expected, MigrationPhase::Cutover);
+                assert_eq!(got, MigrationPhase::Snapshot);
+            }
+            other => panic!("expected WrongPhase, got {:?}", other),
+        }
+        // Live daemon still registered, migration record still present.
+        assert!(reg.contains(origin));
+        assert!(handler.is_migrating(origin));
     }
 
     /// Regression: `take_buffered_events` must refuse to drain
