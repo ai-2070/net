@@ -366,9 +366,30 @@ impl StandbyGroup {
 
         let new_active_origin = self.coord.members()[best_standby as usize].origin_hash;
 
-        // Replay buffered events on the new active
+        // Replay buffered events on the new active — but only the
+        // ones strictly above the new active's last `synced_through`.
+        //
+        // `buffered_since_sync` is preserved verbatim across partial
+        // sync rounds so a failed standby can catch up next cycle
+        // (line ~286); succeeded standbys have their
+        // `synced_through` advanced to the snapshot's through_seq
+        // but the buffer keeps its older entries. Without the
+        // filter, a succeeded-then-promoted standby has already
+        // applied events in `[old_synced_through, new_synced_through]`
+        // via the snapshot — replaying the full buffer here re-
+        // invokes the daemon's `on_event` for each, doubling
+        // counters, re-issuing idempotency keys, and re-firing
+        // side effects. The new sequence-aware filter restricts
+        // the replay to `event.link.sequence > synced_through` so
+        // every event lands on the promoted daemon exactly once
+        // (covered by the snapshot's pre-state, then extended by
+        // the post-snapshot tail). Per-event check is cheap; the
+        // buffer is bounded by the sync cadence.
+        let synced_through = self.members[best_standby as usize].synced_through;
         for event in &self.buffered_since_sync {
-            let _ = registry.deliver(new_active_origin, event);
+            if event.link.sequence > synced_through {
+                let _ = registry.deliver(new_active_origin, event);
+            }
         }
         self.buffered_since_sync.clear();
 
@@ -669,8 +690,19 @@ impl StandbyGroup {
 
         let new_active_origin = self.coord.members()[best_standby as usize].origin_hash;
 
+        // Filter the replay to events strictly past the new
+        // active's `synced_through`. See the equivalent block in
+        // `promote` for the partial-sync corruption it prevents:
+        // a succeeded-then-promoted standby has already applied
+        // events up to `synced_through` via the snapshot, and
+        // replaying the full buffer here would double every
+        // counter / idempotency key / side effect inside that
+        // already-applied range.
+        let synced_through = self.members[best_standby as usize].synced_through;
         for event in &self.buffered_since_sync {
-            let _ = registry.deliver(new_active_origin, event);
+            if event.link.sequence > synced_through {
+                let _ = registry.deliver(new_active_origin, event);
+            }
         }
         self.buffered_since_sync.clear();
 
@@ -1282,6 +1314,82 @@ mod tests {
         assert!(
             group.buffered_event_count() > 0,
             "buffered_since_sync must be retained on partial failure",
+        );
+    }
+
+    /// X-19 regression: a `promote` that picks a succeeded standby
+    /// after a partial `sync_standbys` must NOT replay buffered
+    /// events that the chosen standby already received via the
+    /// snapshot. The pre-fix path replayed the entire buffer
+    /// unconditionally, doubling every side-effect inside the
+    /// `[old_synced_through, new_synced_through]` range — silent
+    /// state corruption on the promoted daemon.
+    #[test]
+    fn promote_does_not_double_apply_events_within_synced_range() {
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+
+        // Baseline: drive 5 events through the active and sync
+        // both standbys cleanly. Each successful event bumps
+        // StatefulDaemon::value by 1, so the active's value is 5
+        // and both standbys' snapshots restore to value=5.
+        for seq in 1..=5 {
+            let event = make_event(seq);
+            reg.deliver(group.active_origin(), &event).unwrap();
+            group.on_event_delivered(event);
+        }
+        group.sync_standbys(&reg).unwrap();
+
+        // Buffer events 6..=10 on the active, then drop standby 2
+        // so its restore fails inside the next sync — exactly the
+        // partial-failure shape the audit calls out.
+        for seq in 6..=10 {
+            let event = make_event(seq);
+            reg.deliver(group.active_origin(), &event).unwrap();
+            group.on_event_delivered(event);
+        }
+        let standby_2_origin = group
+            .members
+            .iter()
+            .find(|m| m.role == MemberRole::Standby && m.index == 2)
+            .map(|m| group.coord.members()[m.index as usize].origin_hash)
+            .expect("standby 2");
+        reg.unregister(standby_2_origin).unwrap();
+
+        // Partial sync: standby 1 receives the snapshot (value=10
+        // post-restore), standby 2 errors out mid-loop. Buffer is
+        // retained so a future cycle can still recover standby 2.
+        let _ = group.sync_standbys(&reg);
+        assert_eq!(group.synced_through(1), Some(10));
+        assert!(group.buffered_event_count() > 0);
+
+        // Promote — must pick standby 1 (highest synced_through).
+        let new_active = group
+            .promote(|| Box::new(StatefulDaemon::new()), &reg, &sched)
+            .expect("promote should pick the succeeded standby");
+
+        // With the fix: every buffered event has sequence ≤ 10
+        // (the new active's synced_through), so all are filtered.
+        // StatefulDaemon::value stays at 10. Pre-fix the replay
+        // unconditionally fired `process` for each of events
+        // 6..=10, pushing value to 15.
+        let value = reg
+            .with_host(new_active, |host| {
+                let snap = host.take_snapshot().expect("snapshot");
+                u64::from_le_bytes(snap.state[..8].try_into().expect("8 bytes"))
+            })
+            .expect("with_host");
+        assert_eq!(
+            value, 10,
+            "promote must not double-apply events already in the new active's snapshot"
         );
     }
 
