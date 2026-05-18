@@ -2069,11 +2069,27 @@ impl CapabilityAnnouncement {
     /// envelope is what lets downstream forwarders bump it without
     /// invalidating the origin's signature — standard multi-hop
     /// gossip design (libp2p gossipsub, Chord, etc.).
+    ///
+    /// Pre-fix this called `to_bytes()` (= `unwrap_or_default`) on
+    /// the canonical clone. A `serde_json::to_vec` failure produced
+    /// an empty `Vec` that signer + verifier both observed as the
+    /// same constant transcript, defeating the signature for every
+    /// affected announcement and making a single captured signature
+    /// replay across every other failing call. The failure mode is
+    /// unreachable today (none of the `CapabilityAnnouncement`
+    /// fields have a fallible `Serialize`), but propagating the
+    /// error explicitly with a panic gives a loud diagnostic if a
+    /// future refactor ever adds one — strictly better than silent
+    /// signature-compromise.
     fn signed_payload(&self) -> Vec<u8> {
         let mut canonical = self.clone();
         canonical.signature = None;
         canonical.hop_count = 0;
-        canonical.to_bytes()
+        serde_json::to_vec(&canonical).expect(
+            "CapabilityAnnouncement::signed_payload: serde_json::to_vec is infallible \
+             over the current field set; if this ever fires, a fallible Serialize impl \
+             was added and the signed transcript must be re-designed before merging",
+        )
     }
 
     /// Sign this announcement in place with `keypair`. The resulting

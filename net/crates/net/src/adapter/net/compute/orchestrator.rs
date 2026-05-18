@@ -458,7 +458,29 @@ pub mod wire {
                     let link = CausalLink::from_bytes(&link_bytes)
                         .ok_or_else(|| MigrationError::StateFailed("invalid causal link".into()))?;
                     let payload_len = cur.get_u32_le() as usize;
-                    if cur.remaining() < payload_len + 8 {
+                    // Per-event payload cap. Defence-in-depth against
+                    // a peer that ships a buffered-events message
+                    // declaring a max-u32 (4 GiB) payload — without
+                    // the cap, `Vec::with_capacity(payload_len)` 30
+                    // lines below would attempt the allocation. Cap
+                    // at MAX_SNAPSHOT_CHUNK_SIZE, the same byte limit
+                    // every other per-event wire surface uses; a real
+                    // BufferedEvents stream never carries payloads
+                    // larger than the snapshot chunk size.
+                    if payload_len > MAX_SNAPSHOT_CHUNK_SIZE {
+                        return Err(MigrationError::StateFailed(format!(
+                            "buffered event payload {} exceeds per-event cap {}",
+                            payload_len, MAX_SNAPSHOT_CHUNK_SIZE
+                        )));
+                    }
+                    // Saturate-add so `payload_len + 8` can't wrap on
+                    // 32-bit targets and cause the `<` check below to
+                    // pass against an attacker-shaped length. The
+                    // crate's primary deployment is 64-bit, but the
+                    // type is `usize` and a 32-bit cdylib build would
+                    // expose the wrap.
+                    let need = payload_len.saturating_add(8);
+                    if cur.remaining() < need {
                         return Err(MigrationError::StateFailed(
                             "truncated event payload".into(),
                         ));
@@ -845,6 +867,19 @@ impl SnapshotReassembler {
             return Err(ReassemblyError::ChunkIndexOutOfRange {
                 chunk_index,
                 total_chunks,
+            });
+        }
+        // Zero-byte chunks are nonsensical: every legitimate
+        // SnapshotReady carries at least one byte of state (an empty
+        // snapshot would be a 1-byte length-prefixed empty payload,
+        // not a 0-byte chunk). Pre-fix a peer could ship
+        // MAX_TOTAL_CHUNKS = 700_000 zero-byte chunks per reassembly
+        // without ever consuming the documented byte-budget guard,
+        // bookkeeping `BTreeMap` entries until `MAX_TOTAL_CHUNKS`
+        // alone bounded the abuse. Refuse them at the boundary.
+        if snapshot_bytes.is_empty() {
+            return Err(ReassemblyError::ChunkTooLarge {
+                len: 0,
             });
         }
         if snapshot_bytes.len() > MAX_SNAPSHOT_CHUNK_SIZE {
@@ -2469,6 +2504,23 @@ mod tests {
             result
         );
         assert_eq!(reassembler.pending_count(), 1);
+    }
+
+    /// Zero-byte chunks are rejected at the boundary. Pre-fix
+    /// `MAX_TOTAL_CHUNKS = 700_000` zero-byte chunks could be
+    /// admitted per reassembly without the byte-budget cap firing —
+    /// nonsensical for legitimate snapshots and a cheap way to
+    /// inflate BTreeMap bookkeeping.
+    #[test]
+    fn reassembler_refuses_zero_byte_chunk() {
+        let mut reassembler = SnapshotReassembler::new();
+        let result = reassembler.feed(0xAAAA, vec![], 1, 0, 3);
+        assert!(
+            matches!(result, Err(ReassemblyError::ChunkTooLarge { len: 0 })),
+            "got {:?}",
+            result
+        );
+        assert_eq!(reassembler.pending_count(), 0);
     }
 
     /// The total_chunks==1 fast path must not bypass the

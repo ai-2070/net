@@ -773,6 +773,15 @@ impl TokenCache {
                 .any(|t| {
                     t.is_valid().is_ok()
                         && !self.revocation.is_revoked(t)
+                        // Defence-in-depth: cross-check the token's
+                        // signed `subject` field matches the lookup
+                        // key. Inserts already key by
+                        // `token.subject.as_bytes()`, so this is
+                        // strictly redundant today — but a future
+                        // refactor that ever inserts under a derived
+                        // or aliased key would silently authorize the
+                        // wrong entity here without this check.
+                        && t.subject.as_bytes() == subject.as_bytes()
                         && t.authorizes(action, channel_hash)
                 })
             {
@@ -787,6 +796,7 @@ impl TokenCache {
                 .any(|t| {
                     t.is_valid().is_ok()
                         && !self.revocation.is_revoked(t)
+                        && t.subject.as_bytes() == subject.as_bytes()
                         && t.authorizes(action, channel_hash)
                 })
             {
@@ -1497,6 +1507,50 @@ mod tests {
                 TokenScope::PUBLISH,
                 0xABCD_EF00_AAAA_BBBB,
             )
+            .is_err());
+    }
+
+    /// Defence-in-depth: `TokenCache::check` cross-checks the
+    /// token's signed `subject` field against the lookup key. The
+    /// invariant holds today because inserts key by
+    /// `token.subject.as_bytes()`, but a future refactor that ever
+    /// keys by a derived value would otherwise silently authorize
+    /// the wrong entity. The check fires here by directly inserting
+    /// a token under a foreign subject — `insert_unchecked` is
+    /// deliberately deliberate enough to bypass the normal keying
+    /// invariant.
+    #[test]
+    fn check_rejects_token_keyed_under_mismatched_subject() {
+        let issuer = EntityKeypair::generate();
+        let real_subject = EntityKeypair::generate();
+        let foreign_subject = EntityKeypair::generate();
+        let channel: ChannelHash = 0x1234_5678_9ABC_DEF0;
+
+        let token = PermissionToken::issue(
+            &issuer,
+            real_subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            channel,
+            3600,
+            0,
+        );
+
+        // Manually inject the token into the slot keyed by the
+        // foreign subject's bytes. This is what a buggy refactor of
+        // the keying scheme would produce.
+        let cache = TokenCache::new();
+        cache
+            .tokens
+            .entry((*foreign_subject.entity_id().as_bytes(), channel))
+            .or_default()
+            .push(token);
+
+        // The cache slot exists for foreign_subject, but the inner
+        // token's signed `subject` is real_subject. Check must
+        // refuse — pre-fix the predicate matched any token in the
+        // slot regardless of the inner field.
+        assert!(cache
+            .check(foreign_subject.entity_id(), TokenScope::PUBLISH, channel)
             .is_err());
     }
 
