@@ -1,0 +1,36 @@
+net/crates/net/src/adapter/net/dataforts/blob/erasure.rs
+  s_2571835e05521c::t_43790d00bd51fb 769-933
+  s_2571835e05521c::t_4a2cc1b1b8860d 46
+  s_2571835e05521c::t_8fc42d9feb6324 520-522,528-534,536,551,565
+  s_2571835e05521c::t_488c7f554253f8 462-463,469-478,494,501-506,511
+  s_2571835e05521c::t_02666b3396112b 377-461,464-468,479-493,495-500,507-510,512-519,523-527,535,537-550,552-564,566-586
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_2571835e05521c::t_d263b7335138f9 3848-3852,3854,3856-3865,3868-3908
+  s_2571835e05521c::t_030ce2bc16523e 1176-1381
+  s_2571835e05521c::t_13175f46f5762b 1638-1696
+  s_2571835e05521c::t_c5cdbbd211962d 983-989
+net/crates/net/src/adapter/net/dataforts/blob/blob_tree.rs
+  s_2571835e05521c::t_5677dbf3d346d2 293-384,411-412,418-432
+  s_2571835e05521c::t_2208a40ae61579 620-622
+  s_2571835e05521c::t_a63960c73dcd6b 795-829
+  s_2571835e05521c::t_c21b370c592ec3 1185
+  s_2571835e05521c::t_e6580f9d69effa 538-571
+  s_2571835e05521c::t_7cdd69f09de4b1 455-464
+  s_2571835e05521c::t_3f61076c7a8f22 636-638,641-644
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "c6e19dc59763def3ff7c4f331d8844fc9b7a01d6",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
