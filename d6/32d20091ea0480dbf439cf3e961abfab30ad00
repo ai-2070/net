@@ -1,0 +1,33 @@
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_18_CARRIED_FORWARD.md
+  s_aa8bb6e2c88c9e::t_9d85c503348b98 261,265
+net/crates/net/src/adapter/net/redex/replication_runtime.rs
+  s_aa8bb6e2c88c9e::t_d93609331ab55d 606
+  s_aa8bb6e2c88c9e::t_b240d39249f366 535,546
+  s_aa8bb6e2c88c9e::t_59b60605354cba 761-776
+  s_aa8bb6e2c88c9e::t_18beb98f25d61b 863
+  s_aa8bb6e2c88c9e::t_971609f844954f 1578-1581
+  s_aa8bb6e2c88c9e::t_ffab69d4035927 1102-1107,1118-1141
+  s_aa8bb6e2c88c9e::t_4f1d8106e4c001 374-457
+  s_aa8bb6e2c88c9e::t_60b97daaf527e2 601,624
+  s_aa8bb6e2c88c9e::t_d7446c9c5b50ba 565
+  s_aa8bb6e2c88c9e::t_b62b98d7bff614 691
+  s_aa8bb6e2c88c9e::t_464d8c5f9e4b1a 1714,1772
+  s_aa8bb6e2c88c9e::t_40e1e07db4d84c 1963-1992
+  s_aa8bb6e2c88c9e::t_3e1b642e5d2353 2603,2663,2717,2745,2796,2872,2927
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "d632d20091ea0480dbf439cf3e961abfab30ad00",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
