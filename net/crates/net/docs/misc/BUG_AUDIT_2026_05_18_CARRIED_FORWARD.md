@@ -176,11 +176,11 @@ missed despite covering `meshos/executor.rs` directly.
 - **Impact:** A late-arriving stale NACK from a prior epoch (old leader timed out a request the replica already retried) makes the replica forget local data. Combined with R-20, any peer ships `SyncNack{BadRange, since_seq: <large>}` and the victim wipes local entries up to that seq.
 - **Fix sketch:** Add a u64 request token to `SyncRequest`/`SyncResponse`/`SyncNack`; the replica drops NACKs whose token isn't in its in-flight set. Also require `from == believed_leader()`.
 
-### R-24 — `apply_sync_response` advances tail past a partially-failed `append_batch`
+### R-24 — `apply_sync_response` advances tail past a partially-failed `append_batch` — **Verified clean**
 - **File:** `src/adapter/net/redex/replication_catchup.rs:369-376`
 - **What:** `append_batch(&payloads)` is called with the entire chunk's payloads. On partial failure (e.g., disk pressure between event 5 and 6 of a 10-event chunk) the function returns `ApplyError::AppendFailed`. The error handler routes to `handle_disk_pressure` which may `sweep_retention()` and continue OR `Withdraw` to Idle. No code reads back what was actually persisted — `file.next_seq()` could be at event-6's seq, but the caller doesn't see this; the next inbound chunk may re-supply event 6+ and produce `StaleChunk` or duplicate the first 5.
-- **Impact:** Disk pressure during a multi-event chunk + `UnderCapacity::EvictOldest` policy produces lost-write or duplicate-apply depending on `append_batch`'s atomicity guarantees (undocumented).
-- **Fix sketch:** Make `append_batch` atomic per chunk, or have `ApplyError::AppendFailed` carry the count actually persisted so the apply path can rebuild the next request from the correct seq.
+- **Audit re-examination:** `RedexFile::append_batch` (`file.rs:602`) is documented as failure-atomic and the implementation matches: capacity is pre-validated under the state lock; seq allocation is post-validation; for persistent files the disk write runs **before** any in-memory commit, and the disk-level helper `DiskSegment::append_entries_inner` (`disk.rs:1001`) writes dat → idx → ts with cascading rollback on every failure path (`rollback_truncate` per file at `:1077-1088`, `:1110-1117`, `:1119-1128`) and a `poisoned` segment flag if rollback itself fails. The seq-allocation `fetch_sub` rollback on disk failure (`file.rs:669-671`) ensures `next_seq` is restored before the error returns. The in-memory `segment.append_many` after the successful disk write is `.expect("pre-validated capacity")` — infallible. The pre-condition for R-24's failure mode (partial batch persisted, seq advanced) does not occur.
+- **No code change.** Atomicity invariant is now documented in the file's source comment; no separate landing commit.
 
 ### R-25 — Inbox saturation: heartbeat flood starves catchup (no priority lane)
 - **File:** `src/adapter/net/redex/replication_runtime.rs:358,395,432-455`
