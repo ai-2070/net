@@ -327,18 +327,30 @@ impl MigrationSourceHandler {
     /// pre-cutover call would otherwise unregister a live daemon
     /// while the target is still restoring, stranding new traffic
     /// in `DaemonNotFound` and losing source-side `buffered_events`.
+    ///
+    /// When no migration record exists for `daemon_origin`, this is
+    /// a no-op success. A forged or replayed `CleanupComplete` for an
+    /// origin we never migrated must NOT unregister an unrelated local
+    /// daemon — the unregister is gated on `migrations` membership and
+    /// the `Cutover` phase, which together prove this handler authored
+    /// the migration whose target now owns the daemon.
     pub fn cleanup(&self, daemon_origin: u64) -> Result<(), MigrationError> {
-        if let Some(entry) = self.migrations.get(&daemon_origin) {
-            let phase = entry.lock().phase;
-            if phase != MigrationPhase::Cutover {
-                return Err(MigrationError::WrongPhase {
-                    expected: MigrationPhase::Cutover,
-                    got: phase,
-                });
-            }
+        let Some(entry) = self.migrations.get(&daemon_origin) else {
+            return Ok(());
+        };
+        let phase = entry.lock().phase;
+        if phase != MigrationPhase::Cutover {
+            return Err(MigrationError::WrongPhase {
+                expected: MigrationPhase::Cutover,
+                got: phase,
+            });
         }
+        drop(entry);
 
-        // Unregister daemon from local registry
+        // Unregister daemon from local registry. Only reached when the
+        // migration record exists AND is in Cutover — i.e. the local
+        // source authored this migration and the target has accepted
+        // the cutover, so the source's copy is safe to retire.
         let _ = self.daemon_registry.unregister(daemon_origin);
 
         // Remove migration state
@@ -554,6 +566,28 @@ mod tests {
         // Live daemon still registered, migration record still present.
         assert!(reg.contains(origin));
         assert!(handler.is_migrating(origin));
+    }
+
+    /// Regression: `cleanup` for an unknown `daemon_origin` must be
+    /// a no-op success and must NOT touch the local daemon registry.
+    /// Pre-fix, the unregister ran unconditionally once the early
+    /// `if let Some(entry) = ...` block was skipped, so a forged or
+    /// replayed `CleanupComplete` for an origin we never migrated
+    /// tore down an unrelated live local daemon.
+    #[test]
+    fn cleanup_for_unknown_origin_does_not_unregister_live_daemon() {
+        let (reg, origin) = setup();
+        let handler = MigrationSourceHandler::new(reg.clone());
+
+        // No `start_snapshot` for `origin` — the source handler has
+        // no migration record. A spurious `cleanup` call for it must
+        // leave the local daemon registered.
+        handler.cleanup(origin).expect("cleanup is idempotent on miss");
+        assert!(
+            reg.contains(origin),
+            "cleanup for an origin with no migration record must not unregister the local daemon",
+        );
+        assert!(!handler.is_migrating(origin));
     }
 
     /// Regression: `take_buffered_events` must refuse to drain

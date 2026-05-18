@@ -611,9 +611,12 @@ impl MigrationSubprotocolHandler {
                     cb(daemon_origin);
                 }
 
-                // Cleanup source — also tolerant of missing source_handler
-                // state, and unregisters the local daemon even if no
-                // `source_handler.start_snapshot` was called.
+                // Cleanup source. No-op if this node never authored the
+                // migration (e.g. a replayed CutoverNotify after the
+                // record was already cleared); only an authored
+                // migration in Cutover phase actually unregisters the
+                // local daemon. A forged CutoverNotify for an origin
+                // we never migrated leaves the local daemon untouched.
                 let _ = self.source_handler.cleanup(daemon_origin);
 
                 let cleanup_msg = MigrationMessage::CleanupComplete { daemon_origin };
