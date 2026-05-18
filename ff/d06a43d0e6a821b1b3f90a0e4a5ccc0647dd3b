@@ -1,0 +1,25 @@
+net/crates/net/bindings/python/tests/test_meshos.py
+  s_aa8bb6e2c88c9e::t_1f809413aaeb44 63-64,75
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_aa8bb6e2c88c9e::t_a0c2e7a74d9642 939
+net/crates/net/bindings/python/README.md
+  s_aa8bb6e2c88c9e::t_c354d64213c79a 484-485,488-491
+net/crates/net/bindings/python/tests/test_identity.py
+  s_aa8bb6e2c88c9e::t_f80f466b3cae89 322-326
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "ffd06a43d0e6a821b1b3f90a0e4a5ccc0647dd3b",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
