@@ -10,8 +10,8 @@
 //! The guard keeps two parallel ACLs:
 //!
 //! - **Fast path** (`check_fast`, `authorize`, `is_authorized`): keyed
-//!   on the canonical [`ChannelHash`] (`u32`). Used by the packet data
-//!   plane. The 32-bit canonical hash is collision-resistant at realistic
+//!   on the canonical [`ChannelHash`] (`u64`). Used by the packet data
+//!   plane. The 64-bit canonical hash is collision-resistant at realistic
 //!   deployment scale (~65 K channels before birthday-collision threshold);
 //!   AEAD still enforces payload integrity end-to-end, so a residual
 //!   bloom false positive costs at most a full check further up the

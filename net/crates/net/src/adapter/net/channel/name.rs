@@ -611,7 +611,7 @@ mod tests {
     fn test_registry_disambiguates_wire_hash() {
         // Two channels that may share a u16 wire bucket (high probability
         // with crafted input) must be uniquely separable by the canonical
-        // u32 hash. With random inputs we can't reliably force a u16
+        // u64 hash. With random inputs we can't reliably force a u16
         // collision, so this test exercises the wire-hash lookup API
         // for the non-colliding case and asserts both lookup paths agree.
         let reg = ChannelRegistry::new();

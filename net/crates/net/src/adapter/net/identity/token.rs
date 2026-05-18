@@ -1354,7 +1354,7 @@ mod tests {
         // narrowly-scoped token into a universal grant — and since
         // xxh3 is non-cryptographic, an attacker able to register
         // names could brute-force such a collision (cheap at the
-        // wire u16, but reachable at the canonical u32 too with
+        // wire u16, but reachable at the canonical u64 too with
         // enough names).
         let issuer = EntityKeypair::generate();
         let subject = EntityKeypair::generate();
@@ -2530,7 +2530,7 @@ mod tests {
 
         // Fill the cache to capacity using the same subject with
         // varying channel_hash. `MAX_TOKEN_SLOTS` is 65_536; channel
-        // hash is `ChannelHash` (u32, ~4 B distinct values), so we
+        // hash is `ChannelHash` (u64, ~18 EB distinct values), so we
         // pack the cache to capacity by varying the low bits.
         // Building 65_536 PermissionTokens would do 65_536 ed25519
         // signs, which is too slow for a unit test — instead we

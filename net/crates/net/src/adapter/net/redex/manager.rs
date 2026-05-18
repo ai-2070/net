@@ -996,7 +996,7 @@ mod tests {
         // unauthorized storage access. The fix requires the canonical
         // channel name in the exact ACL, so a fast-path-only
         // authorization is insufficient — independent of the hash
-        // width on the fast path (now `ChannelHash` / u32).
+        // width on the fast path (now `ChannelHash` / u64).
         let guard = Arc::new(AuthGuard::new());
         let name = cn("sensitive");
         // Authorize the fast path ONLY (no allow_channel).

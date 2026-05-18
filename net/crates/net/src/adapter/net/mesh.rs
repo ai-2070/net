@@ -6370,7 +6370,7 @@ impl MeshNode {
         //
         // - `Allowed`: bloom hit + verified-cache entry says yes.
         //   The verified cache is keyed on the canonical
-        //   [`ChannelHash`] (u32) — collision-resistant at realistic
+        //   [`ChannelHash`] (u64) — collision-resistant at realistic
         //   deployment scale (~65 K channels before birthday-collision
         //   threshold), but a sufficiently adversarial name selection
         //   could still alias two channels. The exact-name ACL is
@@ -6628,13 +6628,13 @@ impl MeshNode {
         // channel dispatcher is registered).
         //
         // The wire `NetHeader::channel_hash` is a `u16` fast-path hint
-        // — narrow the canonical [`ChannelHash`] (u32) to 16 bits for
+        // — narrow the canonical [`ChannelHash`] (u64) to 16 bits for
         // the wire. Wire-side collisions are benign (the receiver
         // disambiguates via `ChannelConfigRegistry::get_by_wire_hash`
         // (Option, None on collision — collision-safe policy) /
         // `ChannelRegistry::get_all_by_wire_hash` (Vec, full collision
         // set — used by receive-side dispatch fan-out) and re-keys on
-        // the canonical 32-bit hash for ACL / storage decisions).
+        // the canonical 64-bit hash for ACL / storage decisions).
         builder.set_channel_hash(channel_hash as u16);
         // Stamp our identity's origin_hash so the receiver can
         // route per-chain logic (greedy cache, gravity heat
