@@ -121,6 +121,16 @@ fn format_migration_error(err: &SdkMigrationError) -> String {
         SdkMigrationError::SnapshotTooLarge { size, max } => {
             format!("snapshot-too-large: {size}: {max}")
         }
+        SdkMigrationError::BufferFull { events, bytes } => {
+            format!("buffer-full: {events} events / {bytes} bytes")
+        }
+        SdkMigrationError::WrongPeer {
+            daemon_origin,
+            from,
+            expected,
+        } => {
+            format!("wrong-peer: {daemon_origin:#x}: from={from:#x} expected={expected:#x}")
+        }
     }
 }
 
