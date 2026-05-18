@@ -1197,11 +1197,19 @@ impl MeshOsLoop {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         // Stamp a monotonic per-runtime seq starting at 1 so a
-        // `0` seq downstream reads as "unset." Saturating add so
-        // a runaway wrap at u64::MAX preserves the monotonic
-        // invariant the SDK dedup gate keys on; collision at
-        // wrapped seq=1 would silently drop the new record.
-        self.admin_audit_seq = self.admin_audit_seq.saturating_add(1);
+        // `0` seq downstream reads as "unset." Panic on overflow:
+        // the SDK dedup gate keys on `seq`, so a saturating add
+        // would pin every record past `u64::MAX` at the cap and
+        // silently collapse them all into a single ring entry —
+        // permanent audit-loss disguised as routine. `checked_add`
+        // is the loud signal an operator wants: at 100 µs/event
+        // we'd reach the overflow ~58 million years in, so the
+        // panic surfaces only a true runaway bug, not a real
+        // production condition.
+        self.admin_audit_seq = self
+            .admin_audit_seq
+            .checked_add(1)
+            .expect("admin_audit_seq overflowed u64 — runaway producer or counter corruption");
         let record = super::ice::AdminAuditRecord {
             seq: self.admin_audit_seq,
             committed_at_ms,
@@ -1250,10 +1258,15 @@ impl MeshOsLoop {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        // Saturating add mirrors admin_audit_seq above; preserves
-        // monotonicity past the (astronomical) u64::MAX boundary
-        // so the SDK dedup key never collides via wrap.
-        self.log_seq = self.log_seq.saturating_add(1);
+        // Checked add mirrors admin_audit_seq above: panic on the
+        // (astronomical) u64::MAX boundary rather than silently
+        // collapse every subsequent record into the saturating
+        // cap, which the SDK dedup gate would treat as a single
+        // duplicate.
+        self.log_seq = self
+            .log_seq
+            .checked_add(1)
+            .expect("log_seq overflowed u64 — runaway producer or counter corruption");
         let record = super::logs::LogRecord {
             seq: self.log_seq,
             ts_ms,
