@@ -136,6 +136,7 @@ mod tests {
                 channel_id,
                 tail_seq: 0,
                 role: ReplicaRole::Replica,
+                wall_clock_ms: 0,
             },
         }
     }
@@ -303,6 +304,7 @@ mod tests {
             self_node_id: 0x10,
             replica_set: vec![0x10, 0x20],
             heartbeat_ms: 60_000, // very slow tick for tests
+            wall_clock_provider: Arc::new(|| 0),
             tail_provider: Arc::new(|| 0),
             rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
             file,

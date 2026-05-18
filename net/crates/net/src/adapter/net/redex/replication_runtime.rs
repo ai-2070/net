@@ -218,6 +218,11 @@ pub struct RuntimeInputs {
     /// `ReplicationConfig::heartbeat_ms`). The tokio interval
     /// drives at this cadence.
     pub heartbeat_ms: u64,
+    /// Function returning the wall-clock milliseconds for the
+    /// outbound heartbeat's `wall_clock_ms` field. Operator-
+    /// facing drift detection only; abstracted so tests can
+    /// inject a deterministic value.
+    pub wall_clock_provider: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// Function returning the current local `tail_seq`. Called
     /// each tick before emission so heartbeats carry the freshest
     /// value.
@@ -568,8 +573,8 @@ pub const RUNTIME_PRIORITY_INBOX_CAPACITY: usize = 128;
 /// 5. Exits cleanly on `Inbound::Shutdown` after running
 ///    `coordinator.transition_to(Idle, ChannelClose)`.
 ///
-/// `dispatcher` ships every outbound message; `tail_provider`
-/// gives the task a fresh value per tick.
+/// `dispatcher` ships every outbound message; `tail_provider` /
+/// `wall_clock_provider` give the task fresh values per tick.
 ///
 /// **R-14 — Arc cycle invariant.** Production wiring has
 /// `MeshNode → ReplicationInboundRouter → ReplicationRuntimeHandle
@@ -768,6 +773,7 @@ async fn on_tick(
     // and a leader's announce_chain at promotion time ships
     // tip_seq=0.
     coordinator.record_tail_seq(tail_seq);
+    let wall_clock_ms = (inputs.wall_clock_provider)();
     // R-10: capture `current_role` inside the same critical
     // section that holds the tracker lock so a concurrent
     // transition can't land between the role read and the
@@ -791,6 +797,7 @@ async fn on_tick(
             tail_seq,
             replica_set: &inputs.replica_set,
             tracker: &t,
+            wall_clock_ms,
             chunk_max_bytes: SYNC_REQUEST_CHUNK_MAX_DEFAULT,
             now,
         });
@@ -1674,6 +1681,7 @@ mod tests {
             self_node_id: self_id,
             replica_set: replicas,
             heartbeat_ms: hb_ms,
+            wall_clock_provider: Arc::new(|| 1_700_000_000_000),
             tail_provider: Arc::new(|| 42),
             rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
             file: build_file_for_tests(),
@@ -1784,6 +1792,7 @@ mod tests {
                     channel_id: cid,
                     tail_seq: 99,
                     role: ReplicaRole::Leader,
+                    wall_clock_ms: 1_700_000_000_000,
                 },
             })
             .await
@@ -1847,6 +1856,7 @@ mod tests {
                     channel_id: cid,
                     tail_seq: 99,
                     role: ReplicaRole::Leader,
+                    wall_clock_ms: 0,
                 },
             },
         )
@@ -1905,6 +1915,7 @@ mod tests {
                     channel_id: cid,
                     tail_seq: 42,
                     role: ReplicaRole::Leader,
+                    wall_clock_ms: 0,
                 },
             },
         )
@@ -1946,6 +1957,7 @@ mod tests {
                     channel_id: cid,
                     tail_seq: 99,
                     role: ReplicaRole::Leader,
+                    wall_clock_ms: 1_700_000_000_000,
                 },
             })
             .await
@@ -2048,6 +2060,7 @@ mod tests {
                     channel_id: cid,
                     tail_seq: 99,
                     role: ReplicaRole::Leader,
+                    wall_clock_ms: 1_700_000_000_000,
                 },
             })
             .await
@@ -2156,6 +2169,7 @@ mod tests {
                     channel_id: cid,
                     tail_seq: 0,
                     role: ReplicaRole::Replica,
+                    wall_clock_ms: 0,
                 },
             });
         }
@@ -2205,6 +2219,7 @@ mod tests {
                     channel_id: cid,
                     tail_seq: 0,
                     role: ReplicaRole::Replica,
+                    wall_clock_ms: 0,
                 },
             };
             // try_dispatch returns the event back when buffer
@@ -2248,6 +2263,7 @@ mod tests {
                     channel_id: cid,
                     tail_seq: 0,
                     role: ReplicaRole::Replica,
+                    wall_clock_ms: 0,
                 },
             });
         }
@@ -2312,6 +2328,7 @@ mod tests {
                     channel_id: cid,
                     tail_seq: 0,
                     role: ReplicaRole::Replica,
+                    wall_clock_ms: 0,
                 },
             })
             .await;
@@ -2342,6 +2359,7 @@ mod tests {
                     channel_id: wrong,
                     tail_seq: 99,
                     role: ReplicaRole::Leader,
+                    wall_clock_ms: 0,
                 },
             })
             .await
@@ -2860,6 +2878,7 @@ mod tests {
                 channel_id: cid,
                 tail_seq: 7,
                 role: ReplicaRole::Leader,
+                wall_clock_ms: 0,
             },
         };
         on_inbound(
@@ -3135,6 +3154,7 @@ mod tests {
                     channel_id: cid,
                     tail_seq: 99,
                     role: ReplicaRole::Leader,
+                    wall_clock_ms: 1_700_000_000_000,
                 },
             })
             .await

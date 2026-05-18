@@ -121,6 +121,10 @@ pub struct TickInputs<'a> {
     /// `Replica → Candidate` transition. The post-tick caller
     /// records inbound heartbeats; this method only reads.
     pub tracker: &'a HeartbeatTracker,
+    /// Wall-clock millis snapshot for the outbound
+    /// `SyncHeartbeat::wall_clock_ms` field. Operator-facing
+    /// drift detection only; not consumed for ordering.
+    pub wall_clock_ms: u64,
     /// Maximum bytes the replica's `SyncRequest` asks for in the
     /// leader's matching response. Carried on every replica-side
     /// catch-up emission; `0` lets the leader pick (subject to
@@ -197,6 +201,7 @@ pub fn tick(inputs: TickInputs<'_>) -> StepOutcome {
                 channel_id: inputs.channel_id,
                 tail_seq: inputs.tail_seq,
                 role: inputs.current_role,
+                wall_clock_ms: inputs.wall_clock_ms,
             },
         });
     }
@@ -368,6 +373,7 @@ mod tests {
             tail_seq: 0,
             replica_set: &[0x1, 0x2, 0x3],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now: t0(),
         };
@@ -386,6 +392,7 @@ mod tests {
             tail_seq: 0,
             replica_set: &[0x1, 0x2, 0x3],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now: t0(),
         };
@@ -405,6 +412,7 @@ mod tests {
             tail_seq: 42,
             replica_set: &[0x10, 0x20, 0x30, 0x40],
             tracker: &tracker,
+            wall_clock_ms: 1_700_000_000_000,
             chunk_max_bytes: 0,
             now: t0(),
         };
@@ -418,6 +426,7 @@ mod tests {
             assert_eq!(msg.channel_id, cid);
             assert_eq!(msg.tail_seq, 42);
             assert_eq!(msg.role, ReplicaRole::Leader);
+            assert_eq!(msg.wall_clock_ms, 1_700_000_000_000);
         }
         assert!(outcome.transition.is_none());
     }
@@ -433,6 +442,7 @@ mod tests {
             tail_seq: 99,
             replica_set: &[0x10, 0x20, 0x30],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now: t0(),
         };
@@ -464,6 +474,7 @@ mod tests {
             tail_seq: 0,
             replica_set: &[0x1],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now: t0(),
         };
@@ -485,6 +496,7 @@ mod tests {
             tail_seq: 0,
             replica_set: &[0x10, 0x10, 0x20, 0x10],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now: t0(),
         };
@@ -512,6 +524,7 @@ mod tests {
             tail_seq: 0,
             replica_set: &[0x10, leader_id],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now,
         };
@@ -543,6 +556,7 @@ mod tests {
             tail_seq: 0,
             replica_set: &[0x10, leader_id],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now,
         };
@@ -571,6 +585,7 @@ mod tests {
             tail_seq: 0,
             replica_set: &[0x10, 0x20],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now,
         };
@@ -597,6 +612,7 @@ mod tests {
             tail_seq: 0,
             replica_set: &[0x10, leader_id],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now,
         };
@@ -670,6 +686,7 @@ mod tests {
             tail_seq: 7,
             replica_set: &[0x10, 0x20, 0x30],
             tracker: &tracker,
+            wall_clock_ms: 1234,
             chunk_max_bytes: 0,
             now: t0(),
         };
@@ -692,6 +709,7 @@ mod tests {
             tail_seq: u64::MAX - 1,
             replica_set: &[0x1, 0x2],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now: t0(),
         };
@@ -722,6 +740,7 @@ mod tests {
             tail_seq: 10,
             replica_set: &[0x10, leader_id],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 256 * 1024,
             now: at(base, 100),
         };
@@ -757,6 +776,7 @@ mod tests {
             tail_seq: 100, // exactly the leader's tail
             replica_set: &[0x10, leader_id],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 256 * 1024,
             now: at(base, 100),
         };
@@ -780,6 +800,7 @@ mod tests {
             tail_seq: 0,
             replica_set: &[0x10, 0x42],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 256 * 1024,
             now: t0(),
         };
@@ -811,6 +832,7 @@ mod tests {
             tail_seq: 0,
             replica_set: &[0x10, peer],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 256 * 1024,
             now: at(base, 100),
         };
@@ -841,6 +863,7 @@ mod tests {
             tail_seq: 10, // significantly behind
             replica_set: &[0x10, leader_id],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 256 * 1024,
             now,
         };
@@ -878,6 +901,7 @@ mod tests {
             tail_seq: 0,
             replica_set: &[0x10, 0x42],
             tracker: &tracker,
+            wall_clock_ms: 0,
             chunk_max_bytes: 256 * 1024,
             now: at(base, 100),
         };
