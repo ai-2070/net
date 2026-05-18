@@ -54,10 +54,10 @@ describe('Token — issue / parse / verify', () => {
     });
 
     // Token wire size: 32 (issuer) + 32 (subject) + 4 (scope) +
-    // 4 (channel_hash, widened from 2 to 4 bytes — canonical
+    // 8 (channel_hash, widened from 2 → 4 → 8 bytes — canonical
     // ChannelHash) + 8 (not_before) + 8 (not_after) + 1
-    // (delegation_depth) + 8 (nonce) + 64 (signature) = 161.
-    expect(token.bytes.length).toBe(161);
+    // (delegation_depth) + 8 (nonce) + 64 (signature) = 165.
+    expect(token.bytes.length).toBe(165);
     expect(token.issuer.equals(pub.entityId)).toBe(true);
     expect(token.subject.equals(sub.entityId)).toBe(true);
     expect(token.channelHash).toBe(channelHash('sensors/temp'));

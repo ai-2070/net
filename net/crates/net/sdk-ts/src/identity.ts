@@ -139,12 +139,12 @@ export class Token {
   readonly subject: Buffer;
   readonly scope: ReadonlySet<TokenScope>;
   /**
-   * Canonical 32-bit hash of the channel name this token authorizes
+   * Canonical 64-bit hash of the channel name this token authorizes
    * (combine with `wildcard` scope for cross-channel grants). Compare
    * against `channelHash(name)` to check whether a token applies to a
    * named channel.
    */
-  readonly channelHash: number;
+  readonly channelHash: bigint;
   readonly notBefore: Date;
   readonly notAfter: Date;
   readonly delegationDepth: number;
@@ -187,7 +187,7 @@ interface TokenFields {
   issuer: Buffer;
   subject: Buffer;
   scope: ReadonlySet<TokenScope>;
-  channelHash: number;
+  channelHash: bigint;
   notBefore: Date;
   notAfter: Date;
   delegationDepth: number;
@@ -218,7 +218,8 @@ export interface IssueTokenOptions {
   subject: Buffer;
   /** Scopes granted; union of `'publish' | 'subscribe' | 'admin' | 'delegate'`. */
   scope: readonly TokenScope[];
-  /** Channel name. Hashed to u16 for on-wire packing. */
+  /** Channel name. Hashed to u64 canonical; the wire-side fast-path
+   *  hint is the low 16 bits of that hash. */
   channel: string;
   /** Validity window in seconds. Pick a short TTL + re-issue instead of building a revocation list. */
   ttlSeconds: number;
@@ -329,11 +330,12 @@ export class Identity {
 // ----------------------------------------------------------------------------
 
 /**
- * Hash a channel name to its u16 representation. Compare against
- * `token.channelHash` to check whether a token applies to a named
- * channel without trial-decoding.
+ * Hash a channel name to its canonical 64-bit substrate identifier.
+ * Compare against `token.channelHash` to check whether a token
+ * applies to a named channel without trial-decoding. The per-packet
+ * wire `NetHeader` fast-path hint is the low 16 bits of this value.
  */
-export function channelHash(channel: string): number {
+export function channelHash(channel: string): bigint {
   return runMapped(() => napiChannelHash(channel));
 }
 
