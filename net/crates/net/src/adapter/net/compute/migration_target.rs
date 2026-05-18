@@ -17,7 +17,7 @@ use super::host::DaemonHost;
 use super::migration::{MigrationError, MigrationPhase};
 use super::registry::DaemonRegistry;
 use crate::adapter::net::identity::EntityKeypair;
-use crate::adapter::net::state::causal::{CausalEvent, CausalLink};
+use crate::adapter::net::state::causal::CausalEvent;
 use crate::adapter::net::state::snapshot::StateSnapshot;
 
 /// Per-daemon target-side migration state.
@@ -33,8 +33,6 @@ struct TargetMigrationState {
     replayed_through: u64,
     /// Events pending replay, keyed by sequence for ordered replay.
     pending_events: BTreeMap<u64, CausalEvent>,
-    /// Causal chain head on target after restore.
-    target_head: CausalLink,
     started_at: Instant,
 }
 
@@ -172,7 +170,6 @@ impl MigrationTargetHandler {
         let host = DaemonHost::from_snapshot(daemon, keypair, snapshot, config)
             .map_err(|e| MigrationError::StateFailed(e.to_string()))?;
 
-        let target_head = snapshot.chain_link;
         let replayed_through = snapshot.through_seq;
 
         // Register in local daemon registry
@@ -190,7 +187,6 @@ impl MigrationTargetHandler {
                 phase: MigrationPhase::Restore,
                 replayed_through,
                 pending_events: BTreeMap::new(),
-                target_head,
                 started_at: Instant::now(),
             }),
         );
@@ -485,7 +481,6 @@ impl MigrationTargetHandler {
         if delivered > 0 {
             let last = &to_replay[delivered - 1];
             state.replayed_through = last.link.sequence;
-            state.target_head = last.link;
         }
 
         if let Some(err) = failure {

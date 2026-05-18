@@ -208,9 +208,14 @@ impl ReplicaGroup {
             }
         } else if n < current {
             while self.coord.member_count() > n {
-                if let Some(info) = self.coord.remove_last() {
-                    let _ = registry.unregister(info.origin_hash);
-                }
+                let Some(info) = self.coord.remove_last() else {
+                    debug_assert!(
+                        false,
+                        "member_count > n but remove_last is None — coord invariant violation",
+                    );
+                    break;
+                };
+                let _ = registry.unregister(info.origin_hash);
             }
         }
 
@@ -452,9 +457,14 @@ impl ReplicaGroup {
             }
         } else if n < current {
             while self.coord.member_count() > n {
-                if let Some(info) = self.coord.remove_last() {
-                    let _ = registry.unregister(info.origin_hash);
-                }
+                let Some(info) = self.coord.remove_last() else {
+                    debug_assert!(
+                        false,
+                        "member_count > n but remove_last is None — coord invariant violation",
+                    );
+                    break;
+                };
+                let _ = registry.unregister(info.origin_hash);
             }
         }
 
