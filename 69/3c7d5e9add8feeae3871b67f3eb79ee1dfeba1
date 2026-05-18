@@ -1,0 +1,41 @@
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_18_CARRIED_FORWARD.md
+  s_aa8bb6e2c88c9e::t_bf8c47789ed2af 626-627
+  s_aa8bb6e2c88c9e::t_a3250dab43e694 619
+net/crates/net/tests/integration_nrpc_cross_lang.rs
+  s_aa8bb6e2c88c9e::t_22d3100ed68160 166
+net/crates/net/src/adapter/net/mesh.rs
+  s_aa8bb6e2c88c9e::t_65e414b2387536 4046-4068,4075,4086
+net/crates/net/tests/integration_nrpc_loopback.rs
+  s_aa8bb6e2c88c9e::t_79ab0c269b06b2 130-133
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_aa8bb6e2c88c9e::t_de50238e45ce64 802-806
+  s_aa8bb6e2c88c9e::t_22e65dba2039bc 1383-1387,1389
+  s_aa8bb6e2c88c9e::t_197dc681b22153 1105-1107,1109
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_aa8bb6e2c88c9e::t_0af4c1ed51a861 716-729
+  s_aa8bb6e2c88c9e::t_156df8433be008 3383
+  s_aa8bb6e2c88c9e::t_d4b8446cd82149 3526-3527
+  s_aa8bb6e2c88c9e::t_4335dadc81b860 2000-2007,2018-2023,2029-2044,2046,2048,2052
+  s_aa8bb6e2c88c9e::t_9be4e49ac652d6 3456
+  s_aa8bb6e2c88c9e::t_7055f0872dc7dc 3536-3577
+  s_aa8bb6e2c88c9e::t_eac757f6d215cd 3430
+  s_aa8bb6e2c88c9e::t_b046821efa6af5 3487
+  s_aa8bb6e2c88c9e::t_88061209592db4 2144-2174,2178-2183,2204
+  s_aa8bb6e2c88c9e::t_75b409fda3f959 1930-1936,1953-1957,1963-1967,1969-1970,1981,1984-1985
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "693c7d5e9add8feeae3871b67f3eb79ee1dfeba1",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
