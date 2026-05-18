@@ -1,0 +1,32 @@
+net/crates/net/src/adapter/net/behavior/meshos/event_loop.rs
+  s_aa8bb6e2c88c9e::t_6ebfe66d49be0a 533
+  s_aa8bb6e2c88c9e::t_f1aaa4d72d9227 776-792
+  s_aa8bb6e2c88c9e::t_75c3a6da3c90d5 585-604
+  s_aa8bb6e2c88c9e::t_72fba29bf4387d 97-105
+net/crates/net/src/adapter/net/behavior/meshos/runtime.rs
+  s_aa8bb6e2c88c9e::t_35f64c29c783c5 82-85
+  s_aa8bb6e2c88c9e::t_a27d981a8a17d6 696-704
+  s_aa8bb6e2c88c9e::t_5d826835e54542 583-587,601
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_18_CARRIED_FORWARD.md
+  s_aa8bb6e2c88c9e::t_78ebd34dad389a 416,420-424
+net/crates/net/src/adapter/net/compute/mod.rs
+  s_aa8bb6e2c88c9e::t_fe59179cb82510 200-246
+  s_aa8bb6e2c88c9e::t_6a83ab4b4ce111 172-177
+  s_aa8bb6e2c88c9e::t_d2fb73252986b6 65-171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "900592bc26380992908fd37ad332005d4e8231fe",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
