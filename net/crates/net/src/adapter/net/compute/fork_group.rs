@@ -305,11 +305,7 @@ impl ForkGroup {
             // Try `place_with_spread` BEFORE touching the registry
             // so a placement failure doesn't leave the slot
             // unregistered (and therefore unrecoverable via
-            // `on_node_recovery`). The pre-fix `old_origin_hash`
-            // lookup with .unwrap() was dead — its value was
-            // discarded with `let _ = old_origin_hash;` below.
-            // Deleted along with the discard to remove the
-            // unreachable-via-design panic.
+            // `on_node_recovery`).
 
             // Recover the same keypair from stored secret
             let fork_info = match self.forks.get(index as usize) {
