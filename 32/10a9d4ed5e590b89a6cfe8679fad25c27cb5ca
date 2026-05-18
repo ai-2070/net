@@ -1,0 +1,32 @@
+net/crates/net/src/adapter/net/behavior/meshos/executor.rs
+  s_aa8bb6e2c88c9e::t_404532242c422b 38-39
+  s_aa8bb6e2c88c9e::t_10f39584232f23 531-532
+  s_aa8bb6e2c88c9e::t_ca1000a21e879d 671
+  s_aa8bb6e2c88c9e::t_f700cd5cd4a6e3 694-700
+  s_aa8bb6e2c88c9e::t_3ac3f7a3f129b8 745-788
+  s_aa8bb6e2c88c9e::t_db6d1c181f603d 493,499
+  s_aa8bb6e2c88c9e::t_2126eb60387bfb 590-615
+  s_aa8bb6e2c88c9e::t_42199aaffdb762 179-186
+  s_aa8bb6e2c88c9e::t_652be6c35f31fb 471-472
+  s_aa8bb6e2c88c9e::t_2a31e0d434a1f6 583-584
+  s_aa8bb6e2c88c9e::t_9738f20ff94e0a 559-560,565,571
+net/crates/net/src/adapter/net/behavior/meshos/runtime.rs
+  s_aa8bb6e2c88c9e::t_2a6d39eda3e235 736-739
+  s_aa8bb6e2c88c9e::t_7caa62bca88032 814-817
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "3210a9d4ed5e590b89a6cfe8679fad25c27cb5ca",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
