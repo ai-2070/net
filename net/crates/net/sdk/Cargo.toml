@@ -8,6 +8,10 @@ repository = "https://github.com/ai-2070/net"
 readme = "README.md"
 keywords = ["net", "mesh", "event-bus", "streaming"]
 categories = ["asynchronous", "network-programming"]
+# Disable bench auto-discovery so shared helpers under
+# `benches/nrpc_common/` aren't picked up as bench targets. Every
+# bench is listed explicitly below.
+autobenches = false
 
 [lib]
 # Keep the crate name as `net_sdk` so `use net_sdk::...` resolves
@@ -30,6 +34,10 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
+hdrhistogram = "7"
+postcard = { version = "1", features = ["use-std"] }
+rand = "0.10"
 
 [features]
 # Out-of-the-box "I downloaded the SDK and it just works": real
@@ -175,4 +183,57 @@ full = ["local", "nat-traversal", "redis", "jetstream", "meshos", "deck"]
 # nRPC quickstart — requires net + cortex.
 [[example]]
 name = "nrpc_echo"
+required-features = ["net", "cortex"]
+
+# ============================================================================
+# nRPC benchmark suite. See `benches/nrpc_common/mod.rs` for the
+# shared in-process two-node harness, payload generators, and codec
+# wrappers. All six benches require `net` + `cortex` (same gate as
+# the typed RPC surface).
+# ============================================================================
+
+# Item 1 — unary round-trip latency (empty / 32 B / 1 KiB) across
+# two routing paths (direct + discovery) and three codecs
+# (json / postcard / raw). Headline screenshot bench.
+[[bench]]
+name = "nrpc_unary"
+harness = false
+required-features = ["net", "cortex"]
+
+# Item 2 — unary throughput (QPS) at 1 / 16 / 128 concurrent
+# callers × 32 B / 1 KiB / 16 KiB payloads.
+[[bench]]
+name = "nrpc_qps"
+harness = false
+required-features = ["net", "cortex"]
+
+# Item 3 — server-streaming msgs/sec via `call_streaming_typed`.
+# Client-streaming and full duplex are channel-layer features and
+# bench separately (not here).
+[[bench]]
+name = "nrpc_streaming"
+harness = false
+required-features = ["net", "cortex"]
+
+# Item 4 — tail latency under load. Custom main + hdrhistogram
+# (Criterion is mediocre at p99.9). 16 / 64 / 256 in-flight.
+[[bench]]
+name = "nrpc_tail"
+harness = false
+required-features = ["net", "cortex"]
+
+# Item 5 — connection / handshake churn. 1000 peer pairs, full
+# latency histogram for pair-creation + handshake + first RPC.
+# Custom main + hdrhistogram.
+[[bench]]
+name = "nrpc_churn"
+harness = false
+required-features = ["net", "cortex"]
+
+# Item 6 — large-payload efficiency. 1 MiB / 4 MiB / 16 MiB
+# unary, `Throughput::Bytes` for MB/s reporting. CPU% / alloc
+# tracking is deferred to a follow-up profiling binary.
+[[bench]]
+name = "nrpc_payload"
+harness = false
 required-features = ["net", "cortex"]
