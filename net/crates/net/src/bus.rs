@@ -1617,6 +1617,20 @@ impl EventBus {
                 self.stats
                     .events_dropped
                     .fetch_add(actual_drops, AtomicOrdering::Relaxed);
+            } else {
+                // The deadline tripped the eager
+                // `shutdown_was_lossy = true` set above, but the
+                // final drain ingested every stranded event so
+                // nothing was actually lost. Clear the flag so
+                // operator dashboards alerting on
+                // `was_lossy && events_dropped == 0` don't see a
+                // false positive. Pre-fix the boolean stayed
+                // `true` against `events_dropped == 0` for any
+                // deadline-triggered shutdown whose drain
+                // happened to catch up.
+                self.stats
+                    .shutdown_was_lossy
+                    .store(false, AtomicOrdering::Release);
             }
             tracing::warn!(
                 stranded_at_deadline = stranded,
