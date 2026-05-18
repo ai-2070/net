@@ -1,0 +1,37 @@
+net/crates/net/src/adapter/net/dataforts/blob/fs.rs
+  s_aa8bb6e2c88c9e::t_aaf8be1eafca91 61-88
+  s_aa8bb6e2c88c9e::t_3a270c12137ceb 89-92
+net/crates/net/src/adapter/net/redex/replication_coordinator.rs
+  s_aa8bb6e2c88c9e::t_d9dcd73c4fa5ad 431,441-460
+  s_aa8bb6e2c88c9e::t_3fa48f647e6674 973-981,984-989,992-1002,1005-1010
+  s_aa8bb6e2c88c9e::t_074cd46c386c00 982-983,990-991,1003-1004
+net/crates/net/src/adapter/net/behavior/meshos/backpressure.rs
+  s_aa8bb6e2c88c9e::t_1f8e07cdf876cb 274-281
+net/crates/net/src/adapter/net/redex/replication_metrics.rs
+  s_aa8bb6e2c88c9e::t_4624df07535eac 477-482
+  s_aa8bb6e2c88c9e::t_eb5a0c29caf876 100-104,106
+  s_aa8bb6e2c88c9e::t_ddddd90e78801f 105
+  s_aa8bb6e2c88c9e::t_c9cd65a907a6e8 343-349
+  s_aa8bb6e2c88c9e::t_9247f1bf2f7b62 128
+  s_aa8bb6e2c88c9e::t_a87aa92b0f7219 760-761
+  s_aa8bb6e2c88c9e::t_c7a5615578ae65 437
+  s_aa8bb6e2c88c9e::t_c0e37346e8061d 288
+  s_aa8bb6e2c88c9e::t_01221ca4212f1c 192-202
+  s_aa8bb6e2c88c9e::t_dba33d4cae022b 737
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "d61ee36ab2c861aa0423f8321a95c9a7a3beb862",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
