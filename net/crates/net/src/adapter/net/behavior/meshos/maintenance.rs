@@ -131,6 +131,19 @@ impl MaintenanceState {
     pub fn is_valid_successor(&self, new: &MaintenanceState) -> bool {
         use MaintenanceState::*;
         // Idempotent same-variant transitions are always allowed.
+        // This is REPLAY TOLERANCE, not strict field equality: an
+        // `EnteringMaintenance { since: a, deadline: X }` →
+        // `EnteringMaintenance { since: b, deadline: Y }` returns
+        // true even though the inner fields differ. Chain replays
+        // and operator re-publishes legitimately produce same-
+        // variant observations with refreshed timestamps; the fold
+        // downstream takes the most-recent value and does NOT key
+        // ordering on `is_valid_successor`'s yes/no answer — so
+        // accepting inner-field drift here is the correct behavior.
+        // A future fold that depended on strict same-variant
+        // equality would need to compare fields itself; this
+        // function answers a different question ("is this
+        // transition legal at the rank graph level?").
         if std::mem::discriminant(self) == std::mem::discriminant(new) {
             return true;
         }
