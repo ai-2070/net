@@ -15,8 +15,75 @@ use super::migration::{MigrationError, MigrationFailureReason, MigrationPhase, M
 use super::migration_source::MigrationSourceHandler;
 use super::registry::DaemonRegistry;
 use crate::adapter::net::continuity::superposition::SuperpositionState;
+use crate::adapter::net::identity::EntityId;
 use crate::adapter::net::state::causal::{CausalEvent, CausalLink};
-use crate::adapter::net::state::snapshot::StateSnapshot;
+use crate::adapter::net::state::snapshot::{StateSnapshot, SNAPSHOT_VERSION};
+
+/// Snapshot wire-format magic bytes — duplicated locally from
+/// `crate::adapter::net::state::snapshot` (the constant is
+/// module-private there). Mirror of `V1_MAGIC = *b"CDS1"`.
+const SNAPSHOT_WIRE_MAGIC: &[u8; 4] = b"CDS1";
+
+/// Validate a chunk's wire envelope without forcing the
+/// orchestrator to reassemble the full snapshot.
+///
+/// On `chunk_index == 0` (the chunk that carries the snapshot
+/// header — single-chunk OR first piece of a multi-chunk send),
+/// confirm:
+/// - The first 4 bytes match the snapshot wire magic.
+/// - Byte 4 is the expected SNAPSHOT_VERSION.
+/// - Bytes 5..37 carry an `entity_id` whose `origin_hash()` matches
+///   the migration's recorded `daemon_origin`.
+///
+/// On `chunk_index > 0`, the chunk is a raw payload fragment with
+/// no envelope — return Ok and let the target's reassembler verify
+/// the assembled snapshot.
+///
+/// Strictly weaker than `StateSnapshot::from_bytes` for the
+/// single-chunk path (from_bytes parses everything past byte 37
+/// too), but matters for multi-chunk where from_bytes can't run
+/// at the orchestrator. Closes the asymmetry where single-chunk
+/// corruption caught at the orchestrator while multi-chunk
+/// corruption deferred entirely to the target.
+fn validate_chunk_header(
+    chunk_index: u32,
+    snapshot_bytes: &[u8],
+    expected_daemon_origin: u64,
+) -> Result<(), MigrationError> {
+    if chunk_index != 0 {
+        return Ok(());
+    }
+    // Magic (4) + version (1) + entity_id (32) = 37 bytes minimum
+    // for the validator to do anything useful.
+    if snapshot_bytes.len() < 37 {
+        return Err(MigrationError::StateFailed(format!(
+            "SnapshotReady chunk 0 is {} bytes — too short for snapshot envelope (need >= 37)",
+            snapshot_bytes.len()
+        )));
+    }
+    if &snapshot_bytes[..4] != SNAPSHOT_WIRE_MAGIC {
+        return Err(MigrationError::StateFailed(format!(
+            "SnapshotReady chunk 0 has wrong magic bytes: {:?}",
+            &snapshot_bytes[..4]
+        )));
+    }
+    let version = snapshot_bytes[4];
+    if version != SNAPSHOT_VERSION {
+        return Err(MigrationError::StateFailed(format!(
+            "SnapshotReady chunk 0 carries snapshot version {} (expected {})",
+            version, SNAPSHOT_VERSION
+        )));
+    }
+    let entity_bytes: [u8; 32] = snapshot_bytes[5..37].try_into().expect("range is 32 bytes");
+    let claimed_origin = EntityId::from_bytes(entity_bytes).origin_hash();
+    if claimed_origin != expected_daemon_origin {
+        return Err(MigrationError::StateFailed(format!(
+            "SnapshotReady chunk 0 entity_id origin {:#x} does not match daemon_origin {:#x}",
+            claimed_origin, expected_daemon_origin
+        )));
+    }
+    Ok(())
+}
 
 // ── Migration message protocol ──────────────────────────────────────────────
 
@@ -1356,6 +1423,17 @@ impl MigrationOrchestrator {
 
         let mut record = entry.lock();
 
+        // Per-chunk envelope validation. Runs on chunk_index == 0
+        // for both single-chunk and multi-chunk paths so the
+        // orchestrator catches header-level corruption symmetrically.
+        // Single-chunk's later `from_bytes` is a strictly stronger
+        // check; the helper is a fast pre-decode rejection.
+        // Multi-chunk used to defer ALL validation to the target
+        // after reassembly — chunk 0 of a multi-chunk send with the
+        // wrong magic / version / origin would only be caught after
+        // reassembly finished.
+        validate_chunk_header(chunk_index, &snapshot_bytes, daemon_origin)?;
+
         // Only validate and advance phase on the first chunk
         if chunk_index == 0 && total_chunks == 1 {
             // Single-chunk: validate immediately and set snapshot
@@ -1785,6 +1863,78 @@ mod tests {
     };
     use crate::adapter::net::identity::EntityKeypair;
     use bytes::{BufMut, Bytes};
+
+    /// Build a minimal chunk-0-shaped buffer:
+    /// `[magic(4)][version(1)][entity_id(32)][... padding ...]`.
+    /// Validator only looks at the first 37 bytes; padding to
+    /// 64 is for visual clarity.
+    fn synth_chunk_header(magic: &[u8; 4], version: u8, entity_bytes: &[u8; 32]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(magic);
+        buf.push(version);
+        buf.extend_from_slice(entity_bytes);
+        buf.extend_from_slice(&[0u8; 27]);
+        buf
+    }
+
+    #[test]
+    fn validate_chunk_header_accepts_well_formed_chunk_0() {
+        let kp = EntityKeypair::generate();
+        let bytes = synth_chunk_header(
+            SNAPSHOT_WIRE_MAGIC,
+            SNAPSHOT_VERSION,
+            kp.entity_id().as_bytes(),
+        );
+        let res = validate_chunk_header(0, &bytes, kp.origin_hash());
+        assert!(res.is_ok(), "well-formed chunk 0 must validate: {res:?}");
+    }
+
+    #[test]
+    fn validate_chunk_header_rejects_wrong_magic() {
+        let kp = EntityKeypair::generate();
+        let bytes = synth_chunk_header(b"XXXX", SNAPSHOT_VERSION, kp.entity_id().as_bytes());
+        let err = validate_chunk_header(0, &bytes, kp.origin_hash()).unwrap_err();
+        assert!(matches!(err, MigrationError::StateFailed(_)));
+    }
+
+    #[test]
+    fn validate_chunk_header_rejects_wrong_version() {
+        let kp = EntityKeypair::generate();
+        let bytes = synth_chunk_header(SNAPSHOT_WIRE_MAGIC, 0xFE, kp.entity_id().as_bytes());
+        let err = validate_chunk_header(0, &bytes, kp.origin_hash()).unwrap_err();
+        assert!(matches!(err, MigrationError::StateFailed(_)));
+    }
+
+    #[test]
+    fn validate_chunk_header_rejects_wrong_origin_claim() {
+        let kp_a = EntityKeypair::generate();
+        let kp_b = EntityKeypair::generate();
+        let bytes = synth_chunk_header(
+            SNAPSHOT_WIRE_MAGIC,
+            SNAPSHOT_VERSION,
+            kp_a.entity_id().as_bytes(),
+        );
+        // Expect kp_b's origin but the chunk carries kp_a's entity.
+        let err = validate_chunk_header(0, &bytes, kp_b.origin_hash()).unwrap_err();
+        assert!(matches!(err, MigrationError::StateFailed(_)));
+    }
+
+    #[test]
+    fn validate_chunk_header_rejects_too_short_chunk_0() {
+        let bytes = [0u8; 12]; // < 37 envelope-min
+        let err = validate_chunk_header(0, &bytes, 0xDEAD_BEEF).unwrap_err();
+        assert!(matches!(err, MigrationError::StateFailed(_)));
+    }
+
+    #[test]
+    fn validate_chunk_header_passes_non_chunk_0_unchecked() {
+        // Subsequent chunks carry no envelope — validator no-ops.
+        let bytes = [0u8; 8]; // arbitrary short payload
+        for idx in [1u32, 2, 47, u32::MAX] {
+            let res = validate_chunk_header(idx, &bytes, 0xDEAD_BEEF);
+            assert!(res.is_ok(), "chunk_index {idx} must pass through");
+        }
+    }
 
     struct CounterDaemon {
         count: u64,
