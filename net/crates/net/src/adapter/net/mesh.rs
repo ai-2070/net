@@ -4046,10 +4046,16 @@ impl MeshNode {
             // S-4 part 2: resolve the wire-session peer's NodeId so
             // the cortex RPC client fold can bind RESPONSE delivery
             // to the recorded target. Fast path: `addr_to_node` →
-            // peers; fall back to a session_id scan. Sentinel `0`
-            // when no peer maps (best-effort — the fold's deliver
-            // gate treats `from_node=0` as no-binding, matching the
-            // loopback test path).
+            // peers; fall back to a session_id scan. If neither
+            // path resolves a NodeId we drop the event rather than
+            // fall through to sentinel `0` — a loopback test fold
+            // that registered with `target=0` would otherwise have
+            // the deliver gate satisfied unconditionally, mixing
+            // unrelated real-peer events into a loopback expecting
+            // only its own. Real production callbacks register
+            // with non-zero targets and already fail closed on a
+            // mismatch; the drop here closes the loopback hole
+            // without affecting production routing.
             let session_id = session.session_id();
             let from_node = ctx
                 .addr_to_node
@@ -4064,8 +4070,17 @@ impl MeshNode {
                         .iter()
                         .find(|e| e.value().session.session_id() == session_id)
                         .map(|e| e.value().node_id)
-                })
-                .unwrap_or(0);
+                });
+            let Some(from_node) = from_node else {
+                tracing::warn!(
+                    target: "mesh.rpc",
+                    session_id = session_id,
+                    peer_addr = ?session.peer_addr(),
+                    "dropping cortex-RPC event: wire session has no resolvable NodeId; \
+                     refusing to deliver under sentinel binding"
+                );
+                return;
+            };
             match snapshot {
                 Snapshot::Single(canonical, disp) => {
                     for event_data in events.into_iter() {
