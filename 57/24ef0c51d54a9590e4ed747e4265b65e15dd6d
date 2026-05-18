@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/compute/fork_group.rs
+  s_2571835e05521c::t_5cd9967178bde3 308
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "5724ef0c51d54a9590e4ed747e4265b65e15dd6d",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
