@@ -341,10 +341,12 @@ pub fn delegate_token(
     Ok(child.to_bytes())
 }
 
-/// Hash a channel name to its canonical 32-bit substrate identifier
+/// Hash a channel name to its canonical 64-bit substrate identifier
 /// (used for ACL / config / storage keys; the wire `NetHeader`
-/// fast-path hint is the low 16 bits of this value).
+/// fast-path hint is the low 16 bits of this value). Python's
+/// `int` is arbitrary-precision so the full u64 round-trips
+/// without truncation.
 #[pyfunction]
-pub fn channel_hash(channel: &str) -> PyResult<u32> {
+pub fn channel_hash(channel: &str) -> PyResult<u64> {
     channel_to_hash(channel)
 }

@@ -313,17 +313,17 @@ impl Identity {
 // =========================================================================
 
 /// Parsed token view. All byte fields are 32 bytes except `signature`
-/// (64 bytes). `not_before` / `not_after` are unix seconds as
-/// `BigInt` to avoid JS number-precision loss. `scope` is the decoded
-/// string array; `channel_hash` is the canonical 32-bit substrate
-/// identifier (used for ACL/storage/config keys; the wire
-/// `NetHeader` fast-path hint is the low 16 bits of this value).
+/// (64 bytes). `not_before` / `not_after` / `channel_hash` are
+/// `BigInt` to avoid JS number-precision loss (canonical
+/// `channel_hash` is 64-bit; the wire `NetHeader` fast-path hint
+/// is the low 16 bits of this value). `scope` is the decoded
+/// string array.
 #[napi(object)]
 pub struct TokenInfo {
     pub issuer: Buffer,
     pub subject: Buffer,
     pub scope: Vec<String>,
-    pub channel_hash: u32,
+    pub channel_hash: BigInt,
     pub not_before: BigInt,
     pub not_after: BigInt,
     pub delegation_depth: u8,
@@ -341,7 +341,7 @@ pub fn parse_token(bytes: Buffer) -> Result<TokenInfo> {
         issuer: Buffer::from(token.issuer.as_bytes().to_vec()),
         subject: Buffer::from(token.subject.as_bytes().to_vec()),
         scope: scope_to_strings(token.scope),
-        channel_hash: token.channel_hash,
+        channel_hash: BigInt::from(token.channel_hash),
         not_before: BigInt::from(token.not_before),
         not_after: BigInt::from(token.not_after),
         delegation_depth: token.delegation_depth,
@@ -388,12 +388,14 @@ pub fn delegate_token(
     Ok(Buffer::from(child.to_bytes()))
 }
 
-/// Hash a channel name to its canonical 32-bit substrate identifier
+/// Hash a channel name to its canonical 64-bit substrate identifier
 /// (matches `PermissionToken::channel_hash`). The wire `NetHeader`
-/// fast-path hint is the low 16 bits of this value. Exposed so TS
-/// callers can compare their channel-name against a parsed token's
-/// `channel_hash` without reaching for a library.
+/// fast-path hint is the low 16 bits of this value. Returned as
+/// `BigInt` because the canonical value is a full xxh3_64 (a
+/// 53-bit-truncating cast through a JS `number` is unsafe). Exposed
+/// so TS callers can compare their channel-name against a parsed
+/// token's `channel_hash` without reaching for a library.
 #[napi]
-pub fn channel_hash(channel: String) -> Result<u32> {
-    channel_to_hash(&channel)
+pub fn channel_hash(channel: String) -> Result<BigInt> {
+    channel_to_hash(&channel).map(BigInt::from)
 }
