@@ -1,0 +1,30 @@
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  s_aa8bb6e2c88c9e::t_fb747864a1ac60 1485-1490
+  s_aa8bb6e2c88c9e::t_653e2812a2ff04 2299-2305,2307,2312-2313,2317,2320-2324
+net/crates/net/src/adapter/net/behavior/meshos/migration_snapshot_source.rs
+  s_aa8bb6e2c88c9e::t_dbc5741f49da52 79-84
+net/crates/net/tests/migration_integration.rs
+  s_aa8bb6e2c88c9e::t_2e5c6b11620912 434-447,449-451
+  s_aa8bb6e2c88c9e::t_7972ff603c6a6b 156-161,164,171-178
+  s_aa8bb6e2c88c9e::t_e11a95921a1271 408,421-423,448,452
+  s_aa8bb6e2c88c9e::t_cac8c9ab331787 1348-1353,1357,1364-1371,1382
+  s_aa8bb6e2c88c9e::t_988603d8d2d5cd 18-20
+net/crates/net/src/adapter/net/compute/mod.rs
+  s_aa8bb6e2c88c9e::t_e292d93e79e711 38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "d271e15cd5ae196cef67f5f076055a9bd9733d52",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
