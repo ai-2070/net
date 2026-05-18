@@ -745,18 +745,67 @@ impl Redex {
     /// manager returns Ok. Used by the blob GC sweep so a swept
     /// chunk doesn't accumulate as an orphaned segment directory
     /// on `with_persistent(true)` deployments.
+    ///
+    /// Holds the dashmap entry write guard for the channel name
+    /// across the close-then-unlink sequence. Pre-fix the entry
+    /// was dropped between `close_file` (which removes from the
+    /// map) and `remove_dir_all`; a concurrent `open_file` for the
+    /// same name landed a fresh entry in the gap, then the unlink
+    /// blew away the new segment dir and the next append hit
+    /// ENOENT. Holding the entry guard blocks any concurrent
+    /// `open_file` on the same name until both phases complete.
     pub fn close_and_unlink_file(&self, name: &ChannelName) -> Result<(), RedexError> {
-        self.close_file(name)?;
-        #[cfg(feature = "redex-disk")]
-        if let Some(base) = self.persistent_dir.as_ref() {
-            let dir = super::disk::channel_dir(base, name);
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(RedexError::io(e)),
+        // Shut the replication runtime down first — same as
+        // `close_file`. This call doesn't touch the `files` map so
+        // it's safe to run before taking the entry guard.
+        if let Some(wiring) = self.replication.read().as_ref().cloned() {
+            let channel_id = ChannelId::from_name(name);
+            if let Some(handle) = wiring.router.unregister(&channel_id) {
+                let _ = handle.try_dispatch(super::replication_runtime::Inbound::Shutdown);
             }
         }
-        Ok(())
+        // Hold the entry guard across close + unlink so a
+        // concurrent `open_file` for the same name blocks until
+        // both phases complete. The Entry holds the per-shard
+        // write lock; performing the disk unlink inside the
+        // Occupied arm before the final `occ.remove()` keeps the
+        // map slot locked across the entire sequence. A vacant
+        // slot still acquires the lock (via `entry()`); we drop
+        // the guard immediately so the no-op path doesn't block
+        // longer than necessary.
+        match self.files.entry(name.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(occ) => {
+                let file = occ.get().clone();
+                file.close()?;
+                #[cfg(feature = "redex-disk")]
+                if let Some(base) = self.persistent_dir.as_ref() {
+                    let dir = super::disk::channel_dir(base, name);
+                    match std::fs::remove_dir_all(&dir) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(RedexError::io(e)),
+                    }
+                }
+                occ.remove();
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => {
+                // No live heap entry; still attempt the disk
+                // unlink for the persistent-only case (an
+                // operator-restart cycle could have left the
+                // dir behind without an open file).
+                #[cfg(feature = "redex-disk")]
+                if let Some(base) = self.persistent_dir.as_ref() {
+                    let dir = super::disk::channel_dir(base, name);
+                    match std::fs::remove_dir_all(&dir) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(RedexError::io(e)),
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Snapshot list of currently open files. Cheap clone.
