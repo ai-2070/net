@@ -271,6 +271,14 @@ impl BackpressureState {
     }
 
     fn gc_drain_window(&mut self, now: Instant) {
+        // 1-second window is by definition the denominator of
+        // `BackpressureConfig::drain_rate_per_zone_per_sec`. The
+        // hardcode here matches the config field's name; changing
+        // the window without renaming the config field would
+        // silently invert the operator-facing rate semantic. If
+        // operator-tunable drain windows are ever wanted, add a
+        // separate `drain_window_duration: Duration` config rather
+        // than reinterpreting the existing rate field.
         let cutoff = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
         self.drain_window.retain(|(_, t)| *t > cutoff);
     }

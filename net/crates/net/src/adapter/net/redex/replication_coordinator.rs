@@ -428,6 +428,7 @@ impl ReplicationCoordinator {
         // protocol role byte on the heartbeat). Withdrawal happens
         // on every `* → Idle`.
         let origin = self.channel.origin_hash;
+        let is_withdraw = transition.to == ReplicaRole::Idle;
         let result = match (transition.from, transition.to) {
             (ReplicaRole::Idle, ReplicaRole::Replica)
             | (ReplicaRole::Candidate, ReplicaRole::Leader) => {
@@ -437,7 +438,26 @@ impl ReplicationCoordinator {
             (_, ReplicaRole::Idle) => self.sink.withdraw_chain(origin).await,
             _ => Ok(()),
         };
-        result.map_err(CoordinatorError::TagSink)?;
+        if let Err(e) = result {
+            if is_withdraw {
+                // Local state already flipped to Idle but the
+                // mesh-side withdraw failed — the mesh may still
+                // advertise this node as a chain holder until
+                // something else trips a re-announce. Bump the
+                // divergence counter so operators can spot the
+                // gap; recovery is opportunistic on the next
+                // transition_to call.
+                self.metrics.incr_announce_divergence();
+                tracing::warn!(
+                    origin = format!("{:#x}", origin),
+                    from = ?transition.from,
+                    error = %e,
+                    "replication coordinator: state advanced to Idle but sink withdraw failed; \
+                     advertised-vs-local divergence until next transition_to or cancel()",
+                );
+            }
+            return Err(CoordinatorError::TagSink(e));
+        }
 
         // Fire the observer AFTER the sink call succeeds. If the
         // sink call fails we don't fire — the state mutation
@@ -949,5 +969,43 @@ mod tests {
         // State HAS advanced — withdraw "happened locally" even
         // though the wire side missed.
         assert_eq!(c.role(), ReplicaRole::Idle);
+    }
+
+    /// Pin that a `* → Idle` sink failure bumps
+    /// `announce_divergence_total` on the channel's metrics so
+    /// operators see the gap between local state and advertised
+    /// holder set. Recovery is opportunistic on the next
+    /// `transition_to` call; the counter is the observability
+    /// surface for the window in between.
+    #[tokio::test]
+    async fn tag_sink_failure_bumps_divergence_counter() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let (sink, _, c) = build_coordinator();
+        c.transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+            .await
+            .unwrap();
+        let before = c
+            .metrics()
+            .announce_divergence_total
+            .load(AtomicOrdering::Relaxed);
+
+        sink.arm_failure(AdapterError::Transient(
+            "simulated network blip".to_string(),
+        ));
+        let _ = c
+            .transition_to(ReplicaRole::Idle, TransitionSignal::DiskPressureWithdraw)
+            .await
+            .expect_err("must surface sink failure");
+
+        let after = c
+            .metrics()
+            .announce_divergence_total
+            .load(AtomicOrdering::Relaxed);
+        assert_eq!(
+            after,
+            before + 1,
+            "announce_divergence_total must bump by exactly 1 on the failed withdraw"
+        );
     }
 }

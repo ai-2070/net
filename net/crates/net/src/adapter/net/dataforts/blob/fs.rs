@@ -58,6 +58,38 @@ pub const DEFAULT_FS_ADAPTER_CONCURRENCY: usize = 64;
 
 /// Filesystem-backed blob adapter. Content-addressed by BLAKE3 hash
 /// under a caller-supplied root directory.
+///
+/// # Threat model
+///
+/// The adapter assumes the configured `root` directory is writable
+/// **only by the substrate process** (and any process running with
+/// the same uid). Operators MUST enforce this contract via filesystem
+/// permissions — typically `chown <daemon-user> <root>` plus mode
+/// `0700` on Unix, or an equivalent ACL on Windows.
+///
+/// Cross-process write access inside `root` by a non-substrate user
+/// enables a symlink-swap window between the in-store `canonicalize`
+/// check and the `rename(tmp, path)` system call. An attacker who
+/// can pre-create or replace `<root>/<shard>/` between those two
+/// operations can redirect the rename target outside the root.
+///
+/// In-code defenses are defense-in-depth, not a complete sandbox:
+///
+/// - `store` canonicalizes the parent directory and rejects writes
+///   whose parent isn't `starts_with(root)`. Closes the obvious
+///   "shard pre-created as a symlink before any write" case but
+///   not the post-canonicalize swap.
+/// - `store` falls back on rename failure to reading the existing
+///   file and verifying its content hash against the expected
+///   `BlobRef`. Mitigates the case where a concurrent legitimate
+///   writer landed first but not the case where an attacker swaps
+///   the parent under us.
+///
+/// If a deployment ever needs to host the root in a shared-scratch
+/// environment, adopt platform-specific path-confinement primitives
+/// (Linux `openat2` with `RESOLVE_BENEATH`, Windows
+/// `FILE_FLAG_OPEN_REPARSE_POINT`) behind a feature flag rather
+/// than relying on the documented exclusive-ownership contract.
 #[derive(Debug, Clone)]
 pub struct FileSystemAdapter {
     id: String,

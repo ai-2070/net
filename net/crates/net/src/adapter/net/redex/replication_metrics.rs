@@ -97,6 +97,13 @@ pub struct ChannelMetricsAtomic {
     /// Cumulative witness `Mesh::withdraw_chain` calls issued by
     /// this node when it observed a leadership transition.
     pub witness_withdrawals_total: AtomicU64,
+    /// Cumulative `* → Idle` coordinator transitions where the
+    /// sink-side `withdraw_chain` call failed AFTER the state
+    /// cell flipped. While this counter is non-zero, the mesh
+    /// may still be advertising this node as the chain holder
+    /// even though local state is Idle. Recovery is opportunistic
+    /// on the next `transition_to` call.
+    pub announce_divergence_total: AtomicU64,
 }
 
 impl Default for ChannelMetricsAtomic {
@@ -118,6 +125,7 @@ impl ChannelMetricsAtomic {
             skip_ahead_total: AtomicU64::new(0),
             election_thrash_total: AtomicU64::new(0),
             witness_withdrawals_total: AtomicU64::new(0),
+            announce_divergence_total: AtomicU64::new(0),
         }
     }
 
@@ -179,6 +187,17 @@ impl ChannelMetricsAtomic {
     /// `Mesh::withdraw_chain`.
     pub fn incr_witness_withdrawal(&self) {
         self.witness_withdrawals_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump the announce-divergence counter when a `* → Idle`
+    /// transition's withdraw_chain sink call fails AFTER the
+    /// state cell already flipped to Idle. While non-zero, the
+    /// mesh may still be advertising this node as the chain
+    /// holder; recovery is opportunistic on the next
+    /// `transition_to` call.
+    pub fn incr_announce_divergence(&self) {
+        self.announce_divergence_total
             .fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -266,6 +285,7 @@ impl ReplicationMetricsRegistry {
                 skip_ahead_total: m.skip_ahead_total.load(Ordering::Relaxed),
                 election_thrash_total: m.election_thrash_total.load(Ordering::Relaxed),
                 witness_withdrawals_total: m.witness_withdrawals_total.load(Ordering::Relaxed),
+                announce_divergence_total: m.announce_divergence_total.load(Ordering::Relaxed),
             });
         }
         // Stable order — the snapshot's serialized form (and
@@ -320,6 +340,13 @@ pub struct ChannelMetrics {
     pub election_thrash_total: u64,
     /// Cumulative witness `Mesh::withdraw_chain` calls.
     pub witness_withdrawals_total: u64,
+    /// Cumulative `* → Idle` coordinator transitions whose sink
+    /// `withdraw_chain` call failed AFTER the local state cell
+    /// flipped. Non-zero values mean the mesh may still be
+    /// advertising this node as a chain holder while local state
+    /// says otherwise; recovery is opportunistic on the next
+    /// `transition_to` call.
+    pub announce_divergence_total: u64,
 }
 
 /// Read-side snapshot of every tracked channel, sorted by channel
@@ -407,6 +434,7 @@ impl ReplicationMetricsSnapshot {
             bump("skip_ahead_total", c.skip_ahead_total);
             bump("election_thrash_total", c.election_thrash_total);
             bump("witness_withdrawals_total", c.witness_withdrawals_total);
+            bump("announce_divergence_total", c.announce_divergence_total);
         }
         totals
     }
@@ -445,6 +473,12 @@ const COUNTER_DESCRIPTORS: &[(&str, &str, CounterGetter)] = &[
         "Times a peer replica issued a witness Mesh::withdraw_chain for a deposed leader's tag.",
         "dataforts_replication_witness_withdrawals_total",
         |c| c.witness_withdrawals_total,
+    ),
+    (
+        "Times a coordinator transitioned to Idle but its mesh-side withdraw_chain call failed; \
+         non-zero values mean the mesh may still advertise this node as a chain holder.",
+        "dataforts_replication_announce_divergence_total",
+        |c| c.announce_divergence_total,
     ),
 ];
 
@@ -700,6 +734,7 @@ mod tests {
             "dataforts_replication_skip_ahead_total",
             "dataforts_replication_election_thrash_total",
             "dataforts_replication_witness_withdrawals_total",
+            "dataforts_replication_announce_divergence_total",
         ] {
             assert!(
                 text.contains(name),
@@ -722,8 +757,8 @@ mod tests {
         // HELP + TYPE blocks per metric.
         let help_lines = text.matches("# HELP ").count();
         let type_lines = text.matches("# TYPE ").count();
-        assert_eq!(help_lines, 7, "expected 7 HELP lines, got {help_lines}");
-        assert_eq!(type_lines, 7, "expected 7 TYPE lines, got {type_lines}");
+        assert_eq!(help_lines, 8, "expected 8 HELP lines, got {help_lines}");
+        assert_eq!(type_lines, 8, "expected 8 TYPE lines, got {type_lines}");
     }
 
     #[test]
