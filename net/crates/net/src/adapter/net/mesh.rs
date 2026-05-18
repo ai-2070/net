@@ -1189,18 +1189,13 @@ pub struct MeshNode {
     /// awaiting future.
     #[cfg(feature = "cortex")]
     rpc_client_pending: Arc<crate::adapter::net::cortex::RpcClientPending>,
-    /// Per-caller monotonic call id allocator. Used as the
-    /// `EventMeta::seq_or_ts` correlation id on outgoing REQUEST
-    /// events.
-    #[cfg(feature = "cortex")]
-    rpc_next_call_id: Arc<std::sync::atomic::AtomicU64>,
     /// Independent fetch_add counter used by `RoutingPolicy::
-    /// RoundRobin` and `Random` so two concurrent `call_service`
-    /// invocations don't observe the same value (which would have
-    /// happened if we consulted `rpc_next_call_id` via `load` —
-    /// since the actual call_id allocation happens later in
-    /// `call(...)`, two concurrent selections could read the same
-    /// pre-bump value and pick the same target).
+    /// RoundRobin` and `Random` to pick the next target node.
+    /// Sequential is correct here — the cursor is local-only and
+    /// never leaves the process, so predictability from another
+    /// peer is not a concern. (Distinct from `mint_random_call_id`,
+    /// which generates the per-call correlation token that DOES
+    /// cross the wire and so must be unpredictable.)
     #[cfg(feature = "cortex")]
     rpc_round_robin_cursor: Arc<std::sync::atomic::AtomicU64>,
     /// Tracks `(target_node_id, service)` pairs we've already
@@ -1744,8 +1739,6 @@ impl MeshNode {
             rpc_inbound_dispatchers: Arc::new(DashMap::new()),
             #[cfg(feature = "cortex")]
             rpc_client_pending: Arc::new(crate::adapter::net::cortex::RpcClientPending::new()),
-            #[cfg(feature = "cortex")]
-            rpc_next_call_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             #[cfg(feature = "cortex")]
             rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
@@ -4662,13 +4655,6 @@ impl MeshNode {
         &self,
     ) -> Arc<crate::adapter::net::cortex::RpcClientPending> {
         self.rpc_client_pending.clone()
-    }
-
-    /// Per-Mesh monotonic call-id allocator. Accessor for
-    /// `mesh_rpc::Mesh::call`.
-    #[cfg(feature = "cortex")]
-    pub(super) fn rpc_next_call_id_arc(&self) -> Arc<std::sync::atomic::AtomicU64> {
-        self.rpc_next_call_id.clone()
     }
 
     /// Independent rotation counter for `RoutingPolicy::RoundRobin`

@@ -797,7 +797,7 @@ impl MeshNode {
         self.ensure_reply_subscription(target_node_id, service, reply_channel.clone(), reply_hash)
             .await?;
 
-        let call_id = self.rpc_next_call_id().fetch_add(1, Ordering::Relaxed);
+        let call_id = mint_random_call_id();
         let pending = self.rpc_client_pending();
         let rx = pending.register_streaming(call_id);
 
@@ -1087,8 +1087,14 @@ impl MeshNode {
             return Err(e);
         }
 
-        // Allocate a fresh call_id. Per-caller monotonic.
-        let call_id = self.rpc_next_call_id().fetch_add(1, Ordering::Relaxed);
+        // Allocate a fresh call_id. Random u64 from getrandom; a
+        // sequential counter would let any session peer that
+        // observed one of their own call_ids predict the next-
+        // allocated ids and ship spoofed RESPONSE frames on the
+        // victim's reply channel. Random u64 collides with
+        // probability 2^-64 per call and is unguessable from
+        // another peer's perspective.
+        let call_id = mint_random_call_id();
 
         // Register the oneshot before publishing the REQUEST so a
         // very-fast RESPONSE doesn't arrive before we're ready.
@@ -1405,6 +1411,29 @@ impl MeshNode {
 /// more should reuse existing reply paths.
 pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
 
+/// Mint a random 64-bit call_id from `getrandom` entropy. Used as
+/// the correlation token for REQUEST/RESPONSE pairing. The fold
+/// keys pending oneshots on this value; any session peer with
+/// publish access to the reply channel could ship a forged
+/// RESPONSE if it could guess the value. Sequential u64s are
+/// predictable from any peer that observes a single allocation;
+/// random u64s collide with 2^-64 probability per call and are
+/// independent across peers.
+///
+/// Falls back to a zero call_id on entropy failure — that
+/// effectively disables correlation for this call (the oneshot
+/// will time out) rather than panic, but in practice
+/// `getrandom::fill` failure is a fatal-environment signal
+/// (no `/dev/urandom`, broken syscall) and the broader stack
+/// won't be functional anyway.
+fn mint_random_call_id() -> u64 {
+    let mut buf = [0u8; 8];
+    if getrandom::fill(&mut buf).is_err() {
+        return 0;
+    }
+    u64::from_le_bytes(buf)
+}
+
 // ============================================================================
 // Internal: tiny shims so the `serve_rpc` / `call` impls stay
 // readable. The underlying state lives on `MeshNode`; these just
@@ -1414,9 +1443,6 @@ pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
 impl MeshNode {
     fn rpc_client_pending(&self) -> Arc<super::cortex::RpcClientPending> {
         self.rpc_client_pending_arc()
-    }
-    fn rpc_next_call_id(&self) -> Arc<std::sync::atomic::AtomicU64> {
-        self.rpc_next_call_id_arc()
     }
     fn identity_origin_hash(&self) -> u64 {
         self.public_key_origin_hash()
