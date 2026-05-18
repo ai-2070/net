@@ -2126,6 +2126,35 @@ impl CapabilityAnnouncement {
         serde_json::from_slice(data).ok()
     }
 
+    /// Drop every metadata key that the substrate reserves for
+    /// local use (`intent`, `colocate-with`, `priority`, `owner`,
+    /// `tool::*`, …). Call this on every announcement decoded from
+    /// an inbound peer before its metadata is consulted by greedy
+    /// admission, placement scoring, or anything else that lets a
+    /// metadata value steer substrate decisions: pre-fix a peer
+    /// could stamp `intent = "high-priority-tenant-X"` on its own
+    /// announcement and steer the receiver's admission to itself.
+    ///
+    /// The schema's `metadata_reserved` doc says these keys are
+    /// **writable by user code on the local node** — the local
+    /// node knows its own legitimate intent. But the same wire
+    /// shape carries inbound peer announcements that the
+    /// substrate must NOT trust for those decisions. This method
+    /// is the boundary that draws the distinction; callers on the
+    /// receive path invoke it after `from_bytes`.
+    pub fn strip_reserved_metadata(&mut self) {
+        use super::schema::AXIS_SCHEMA;
+        self.capabilities.metadata.retain(|key, _| {
+            if AXIS_SCHEMA.metadata_reserved.contains(&key.as_str()) {
+                return false;
+            }
+            !AXIS_SCHEMA
+                .metadata_reserved_prefixes
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+        });
+    }
+
     /// Check if expired
     pub fn is_expired(&self) -> bool {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -3670,6 +3699,57 @@ mod tests {
     /// should construct a real `EntityKeypair` instead.
     fn test_entity() -> super::super::super::identity::EntityId {
         super::super::super::identity::EntityId::from_bytes([0u8; 32])
+    }
+
+    /// `strip_reserved_metadata` drops every exact-match reserved
+    /// key and every key under a reserved prefix, leaves all other
+    /// keys intact. The substrate calls this on every inbound peer
+    /// announcement before downstream consumers (greedy admission,
+    /// placement scoring) read metadata, so a peer can't steer
+    /// receiver decisions by stamping `intent`, `colocate-with`,
+    /// `priority`, `owner`, or any `tool::*` key.
+    #[test]
+    fn strip_reserved_metadata_drops_reserved_keys() {
+        let mut ann = CapabilityAnnouncement::new(0xDEAD, test_entity(), 7, CapabilitySet::new());
+        ann.capabilities
+            .metadata
+            .insert("intent".into(), "evil-tenant".into());
+        ann.capabilities
+            .metadata
+            .insert("colocate-with".into(), "0xdeadbeef".into());
+        ann.capabilities
+            .metadata
+            .insert("priority".into(), "9999".into());
+        ann.capabilities
+            .metadata
+            .insert("owner".into(), "attacker".into());
+        ann.capabilities
+            .metadata
+            .insert("tool::pwn".into(), "go-brrr".into());
+        ann.capabilities
+            .metadata
+            .insert("app::region".into(), "us-east".into());
+        ann.capabilities
+            .metadata
+            .insert("user_tag".into(), "fine".into());
+
+        ann.strip_reserved_metadata();
+
+        assert!(!ann.capabilities.metadata.contains_key("intent"));
+        assert!(!ann.capabilities.metadata.contains_key("colocate-with"));
+        assert!(!ann.capabilities.metadata.contains_key("priority"));
+        assert!(!ann.capabilities.metadata.contains_key("owner"));
+        assert!(!ann.capabilities.metadata.contains_key("tool::pwn"));
+        // Non-reserved keys survive — substrate only filters its
+        // own reserved namespace, not the caller's app namespace.
+        assert_eq!(
+            ann.capabilities.metadata.get("app::region").map(String::as_str),
+            Some("us-east"),
+        );
+        assert_eq!(
+            ann.capabilities.metadata.get("user_tag").map(String::as_str),
+            Some("fine"),
+        );
     }
 
     fn sample_capability_set() -> CapabilitySet {

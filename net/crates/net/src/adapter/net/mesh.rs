@@ -5136,7 +5136,7 @@ impl MeshNode {
     }
 
     fn handle_capability_announcement(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
-        let Some(ann) = CapabilityAnnouncement::from_bytes(payload) else {
+        let Some(mut ann) = CapabilityAnnouncement::from_bytes(payload) else {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
                 len = payload.len(),
@@ -5225,6 +5225,18 @@ impl MeshNode {
             );
             return;
         }
+
+        // Strip substrate-reserved metadata keys from the inbound
+        // announcement now that the signature has been verified
+        // and the (node_id, entity_id) binding has been confirmed.
+        // A peer must not be able to steer the receiver's greedy
+        // admission / placement decisions by stamping `intent`,
+        // `colocate-with`, `priority`, `owner`, or any `tool::*`
+        // key on its own announcement. Strip is post-verify so the
+        // signature transcript stays intact for the verify above;
+        // strip is also applied to unsigned anns because their
+        // metadata is even more attacker-controlled.
+        ann.strip_reserved_metadata();
 
         // First-seen identity pin — TOFU. A peer that tries to
         // rebind its `entity_id` in a later announcement is
