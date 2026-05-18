@@ -695,6 +695,86 @@ int net_rpc_duplex_stream_next(
 uint64_t net_rpc_duplex_stream_call_id(const DuplexStreamHandleC* handle);
 void net_rpc_duplex_stream_free(DuplexStreamHandleC* handle);
 
+/* =========================================================================
+ * ABI 0x0002 — server-side handlers for client-streaming + duplex (B8-5).
+ *
+ * Per-call handle types handed to the Go dispatcher:
+ *   - RpcRequestStreamHandleC: drain via _request_stream_next.
+ *   - RpcResponseSinkHandleC:  emit via _response_sink_send (duplex).
+ *
+ * Both are owned by the Rust FFI; the Go dispatcher borrows them
+ * for the duration of the callback and MUST NOT call any _free
+ * on them.
+ *
+ * Two new dispatcher function-pointer types + two registration
+ * helpers, separate from the unary RpcHandlerFn / DISPATCHER:
+ *   - RpcClientStreamingHandlerFn returns ONE terminal Resp body.
+ *   - RpcDuplexHandlerFn pushes Resp chunks via the sink and
+ *     returns OK/Err. No terminal body — the substrate fold
+ *     emits the terminator after the Go handler returns.
+ * ========================================================================= */
+
+typedef struct RpcRequestStreamHandleC RpcRequestStreamHandleC;
+typedef struct RpcResponseSinkHandleC  RpcResponseSinkHandleC;
+
+/* Go-registered dispatcher signatures. */
+typedef int (*RpcClientStreamingHandlerFn)(
+    uint64_t handler_id,
+    RpcRequestStreamHandleC* request_stream,
+    uint8_t** out_resp_ptr,
+    size_t* out_resp_len,
+    char** out_err);
+
+typedef int (*RpcDuplexHandlerFn)(
+    uint64_t handler_id,
+    RpcRequestStreamHandleC* request_stream,
+    RpcResponseSinkHandleC* response_sink,
+    char** out_err);
+
+void net_rpc_set_client_streaming_handler_dispatcher(
+    RpcClientStreamingHandlerFn dispatcher);
+void net_rpc_set_duplex_handler_dispatcher(RpcDuplexHandlerFn dispatcher);
+
+/* Pull the next request chunk inside a Go dispatcher callback.
+ * Blocks the calling thread. Returns NET_RPC_OK with the chunk,
+ * NET_RPC_ERR_STREAM_DONE on REQUEST_END / CANCEL, or
+ * NET_RPC_ERR_NULL on NULL handle. Caller frees out_chunk_ptr
+ * via net_rpc_response_free. */
+int net_rpc_request_stream_next(
+    RpcRequestStreamHandleC* handle,
+    uint8_t** out_chunk_ptr,
+    size_t* out_chunk_len);
+
+/* Emit one response chunk via the sink (duplex handlers). Non-
+ * blocking; SDK try_send semantics. Returns NET_RPC_OK on success
+ * or NET_RPC_ERR_NULL on NULL handle. */
+int net_rpc_response_sink_send(
+    RpcResponseSinkHandleC* handle,
+    const uint8_t* body_ptr,
+    size_t body_len);
+
+/* Register a client-streaming handler for `service`. Same pre-
+ * registration discipline as net_rpc_serve. Returns a
+ * ServeHandleC (closed via net_rpc_serve_handle_close, freed via
+ * net_rpc_serve_handle_free — shared with the unary surface). */
+ServeHandleC* net_rpc_serve_client_stream(
+    MeshRpcHandle* handle,
+    const char* service_ptr,
+    size_t service_len,
+    uint64_t handler_id,
+    uint64_t handler_timeout_ms,
+    char** out_err);
+
+/* Register a duplex handler. Same shape as
+ * net_rpc_serve_client_stream. */
+ServeHandleC* net_rpc_serve_duplex(
+    MeshRpcHandle* handle,
+    const char* service_ptr,
+    size_t service_len,
+    uint64_t handler_id,
+    uint64_t handler_timeout_ms,
+    char** out_err);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
