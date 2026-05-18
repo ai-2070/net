@@ -54,7 +54,10 @@ use super::blob_ref::{
     byte_range_to_chunks, chunk_payload, BlobRef, ChunkRef, ChunkedPayload, Encoding,
     BLOB_CHUNK_SIZE_BYTES,
 };
-use super::blob_tree::{ChunkRefV3, ChunkingStrategy, TreeBuilder, TREE_LEAF_CHUNK_MAX_BYTES};
+use super::blob_tree::{
+    ChunkRefV3, ChunkingStrategy, TreeBuilder, TreeSupportProbe, TREE_LEAF_CHUNK_MAX_BYTES,
+    TREE_THRESHOLD_BYTES,
+};
 use super::error::BlobError;
 use super::metrics::BlobMetrics;
 use super::refcount::{BlobRefcountTable, DEFAULT_RETENTION_FLOOR};
@@ -1054,6 +1057,91 @@ impl MeshBlobAdapter {
             output.total_bytes,
             output.root_depth,
         )
+    }
+
+    /// Publish a byte stream, choosing
+    /// [`BlobRef::Tree`] vs [`BlobRef::Manifest`] based on a
+    /// [`TreeSupportProbe`] + the [`TREE_THRESHOLD_BYTES`]
+    /// producer hint.
+    ///
+    /// Decision flow:
+    /// 1. If `probe.check() == false`, force the Manifest path
+    ///    (Tree-incompatible peer). Caps at 16 GiB; oversize
+    ///    streams return `BlobError::Backend`.
+    /// 2. Else if `size_hint < TREE_THRESHOLD_BYTES`, prefer
+    ///    the Manifest path for round-trip efficiency.
+    /// 3. Else use the Tree path.
+    ///
+    /// `size_hint` is the producer's best estimate of total
+    /// bytes — `None` defaults to "above threshold," routing
+    /// the stream through Tree. The decision is one-way: a
+    /// stream routed to Manifest can't switch to Tree
+    /// mid-stream because Manifest's buffered path has already
+    /// committed to in-memory accumulation.
+    ///
+    /// Phase A6: the [`TreeSupportProbe::Dynamic`] arm wires
+    /// future capability-tag advertisement; v0.3a callers
+    /// without that substrate use `AlwaysSupported` for
+    /// single-cluster deployments or `ForceManifest` for
+    /// cross-version cluster rollouts.
+    pub async fn publish_stream_with_downgrade(
+        &self,
+        stream: BlobByteStream,
+        encoding: Encoding,
+        chunking: ChunkingStrategy,
+        size_hint: Option<u64>,
+        probe: &TreeSupportProbe,
+    ) -> Result<BlobRef, BlobError> {
+        let tree_supported = probe.check();
+        let above_threshold = size_hint.map(|s| s >= TREE_THRESHOLD_BYTES).unwrap_or(true);
+        if tree_supported && above_threshold {
+            self.store_stream_tree(stream, encoding, chunking).await
+        } else {
+            // Downgrade path: buffer the whole stream (capped
+            // at 16 GiB by the existing v0.2 store_stream
+            // default), then publish via the Manifest path.
+            use futures::StreamExt;
+            const MAX_DOWNGRADE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+            let mut buf: Vec<u8> = match size_hint {
+                Some(n) if n <= 16 * 1024 * 1024 => Vec::with_capacity(n as usize),
+                _ => Vec::new(),
+            };
+            let mut s = stream;
+            while let Some(maybe) = s.next().await {
+                let bytes = maybe?;
+                if (buf.len() as u64).saturating_add(bytes.len() as u64) > MAX_DOWNGRADE_BYTES {
+                    return Err(BlobError::Backend(format!(
+                        "publish_stream_with_downgrade: downgrade buffer exceeds {} \
+                         (peer does not support Tree, but stream is too large for Manifest)",
+                        MAX_DOWNGRADE_BYTES
+                    )));
+                }
+                buf.extend_from_slice(&bytes);
+            }
+            if buf.is_empty() {
+                return Err(BlobError::Backend(
+                    "publish_stream_with_downgrade: empty stream".to_owned(),
+                ));
+            }
+            // Construct a Manifest BlobRef from the buffered
+            // payload (chunks it via the v0.2 chunker), then
+            // call the existing Manifest store path.
+            let chunked = chunk_payload(&buf)?;
+            let total = chunked.size();
+            let blob_ref = chunked.into_blob_ref(
+                format!("mesh://{}", super::hex32(&blake3::hash(&buf).into())),
+                encoding,
+            )?;
+            // Persist via the existing store path; for the
+            // Small (inline) case, falls back to a Small blob
+            // store cleanly.
+            self.store(&blob_ref, &buf).await?;
+            // Tag the chunking arg as consumed (Phase A only
+            // supports Fixed-default chunking on the Manifest
+            // downgrade path; CDC lands in Phase B).
+            let _ = (chunking, total);
+            Ok(blob_ref)
+        }
     }
 
     /// Internal: walk the tree from a node, fetching every
@@ -3706,6 +3794,157 @@ mod tests {
         // path surfaces a typed error. Pin that we DO surface an
         // error rather than returning empty bytes.
         let _ = err; // any error is fine; assert we got one
+    }
+
+    // ────────────────────────────────────────────────────────
+    // publish_stream_with_downgrade (Phase A6)
+    // ────────────────────────────────────────────────────────
+
+    use super::super::blob_tree::TreeSupportProbe;
+
+    /// Probe `AlwaysSupported` + above-threshold size hint
+    /// routes to the Tree path.
+    #[tokio::test]
+    async fn publish_downgrade_routes_to_tree_when_supported_and_above_threshold() {
+        let adapter = make_adapter();
+        let payload = deterministic_bytes(0xD1, BLOB_CHUNK_SIZE_BYTES as usize);
+        let blob_ref = adapter
+            .publish_stream_with_downgrade(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+                Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
+                &TreeSupportProbe::AlwaysSupported,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(blob_ref, BlobRef::Tree { .. }));
+    }
+
+    /// Probe `ForceManifest` always downgrades to Manifest,
+    /// even when the stream is large enough that Tree would win.
+    #[tokio::test]
+    async fn publish_downgrade_force_manifest_routes_to_manifest_regardless_of_size() {
+        let adapter = make_adapter();
+        let payload = deterministic_bytes(0xD2, BLOB_CHUNK_SIZE_BYTES as usize * 2);
+        let blob_ref = adapter
+            .publish_stream_with_downgrade(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+                Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
+                &TreeSupportProbe::ForceManifest,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(blob_ref, BlobRef::Manifest { .. }),
+            "ForceManifest must always produce a Manifest"
+        );
+    }
+
+    /// Below-threshold size hint downgrades to Manifest even
+    /// when the peer supports Tree — round-trip efficiency.
+    #[tokio::test]
+    async fn publish_downgrade_below_threshold_prefers_manifest() {
+        let adapter = make_adapter();
+        let payload = deterministic_bytes(0xD3, BLOB_CHUNK_SIZE_BYTES as usize * 2);
+        let blob_ref = adapter
+            .publish_stream_with_downgrade(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+                Some(BLOB_CHUNK_SIZE_BYTES * 2),
+                &TreeSupportProbe::AlwaysSupported,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(blob_ref, BlobRef::Manifest { .. }),
+            "below-threshold + Tree-supported should still pick Manifest"
+        );
+    }
+
+    /// Below-threshold inline-size payload routes to Manifest
+    /// (or Small, depending on the chunker's Inline branch).
+    /// Either way, NOT a Tree.
+    #[tokio::test]
+    async fn publish_downgrade_small_payload_does_not_produce_tree() {
+        let adapter = make_adapter();
+        let payload = deterministic_bytes(0xD4, 1024);
+        let blob_ref = adapter
+            .publish_stream_with_downgrade(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+                Some(1024),
+                &TreeSupportProbe::AlwaysSupported,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !matches!(blob_ref, BlobRef::Tree { .. }),
+            "small payload must not produce a Tree"
+        );
+    }
+
+    /// Empty stream is rejected from the downgrade path.
+    #[tokio::test]
+    async fn publish_downgrade_rejects_empty_stream() {
+        let adapter = make_adapter();
+        let err = adapter
+            .publish_stream_with_downgrade(
+                stream_one(Vec::new()),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+                Some(0),
+                &TreeSupportProbe::AlwaysSupported,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("empty stream"), "got: {err}");
+    }
+
+    /// Dynamic probe arm — closure evaluated per call.
+    #[tokio::test]
+    async fn publish_downgrade_dynamic_probe_consults_closure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc as StdArc;
+        let adapter = make_adapter();
+        let allow = StdArc::new(AtomicBool::new(false));
+        let allow_for_probe = allow.clone();
+        let probe = TreeSupportProbe::Dynamic(Box::new(move || {
+            allow_for_probe.load(Ordering::Relaxed)
+        }));
+        // First call: probe says false → downgrade away from
+        // Tree. Use a payload > BLOB_CHUNK_SIZE_BYTES so the
+        // chunker actually returns a Manifest (not a Small).
+        let payload1 = deterministic_bytes(0xD5, BLOB_CHUNK_SIZE_BYTES as usize + 1);
+        let r1 = adapter
+            .publish_stream_with_downgrade(
+                stream_one(payload1),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+                Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
+                &probe,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(r1, BlobRef::Manifest { .. }));
+        // Flip the flag; second call: probe says true → Tree.
+        allow.store(true, Ordering::Relaxed);
+        let payload2 = deterministic_bytes(0xD6, BLOB_CHUNK_SIZE_BYTES as usize);
+        let r2 = adapter
+            .publish_stream_with_downgrade(
+                stream_one(payload2),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+                Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
+                &probe,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(r2, BlobRef::Tree { .. }));
     }
 
     // ────────────────────────────────────────────────────────

@@ -50,6 +50,78 @@ use super::blob_ref::BLOB_CHUNK_SIZE_BYTES;
 // via the fully-qualified `super::blob_ref::` path so the
 // test-only import above doesn't shadow it for production paths.
 
+/// Capability tag advertised by nodes that support the v0.3
+/// hierarchical-manifest tree path (`BlobRef::Tree`). Producers
+/// targeting a peer that does NOT advertise this tag must
+/// downgrade to the v0.2 `BlobRef::Manifest` (capped at 16 GiB)
+/// — a v0.2-only reader returns `BlobError::UnsupportedVersion(3)`
+/// on a `BlobRef::Tree` wire frame.
+///
+/// The capability-advertisement substrate ships independently of
+/// the blob layer; v0.3 Phase A declares the tag string and
+/// exposes a [`TreeSupportProbe`] hook so producers can wire
+/// the check without depending on a specific advertisement
+/// transport.
+pub const DATAFORTS_BLOB_TREE_SUPPORTED: &str = "dataforts:blob-tree-supported";
+
+/// Producer-side hook for the cross-version downgrade decision.
+///
+/// Implementations decide whether a destination peer supports
+/// the v0.3 [`BlobRef::Tree`](super::blob_ref::BlobRef::Tree)
+/// shape. The default [`TreeSupportProbe::AlwaysSupported`] is
+/// correct for single-cluster all-v0.3 deployments;
+/// [`TreeSupportProbe::ForceManifest`] is correct for cross-
+/// version deployments where every Tree publish must downgrade;
+/// the dynamic [`TreeSupportProbe::Dynamic`] arm lets callers
+/// wire the substrate's capability-tag advertisement once that
+/// surface lands.
+///
+/// Producers consult the probe BEFORE calling
+/// `store_stream_tree` — on `false`, they fall back to
+/// `store_stream` + `BlobRef::Manifest` (capped at 16 GiB).
+pub enum TreeSupportProbe {
+    /// All targets support Tree. Default for single-cluster
+    /// v0.3-only deployments.
+    AlwaysSupported,
+    /// No target supports Tree. Forces every publish to
+    /// downgrade to v0.2 Manifest. Useful during cluster-wide
+    /// rollouts before every node has been upgraded.
+    ForceManifest,
+    /// Dynamic check — call into a caller-supplied closure
+    /// that consults the capability-tag advertisement layer.
+    /// The boxed closure returns `true` iff the destination
+    /// advertises [`DATAFORTS_BLOB_TREE_SUPPORTED`].
+    Dynamic(Box<dyn Fn() -> bool + Send + Sync>),
+}
+
+impl TreeSupportProbe {
+    /// Evaluate the probe. Cheap for the static variants;
+    /// invokes the closure for `Dynamic`.
+    pub fn check(&self) -> bool {
+        match self {
+            TreeSupportProbe::AlwaysSupported => true,
+            TreeSupportProbe::ForceManifest => false,
+            TreeSupportProbe::Dynamic(f) => f(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TreeSupportProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TreeSupportProbe::AlwaysSupported => f.write_str("TreeSupportProbe::AlwaysSupported"),
+            TreeSupportProbe::ForceManifest => f.write_str("TreeSupportProbe::ForceManifest"),
+            TreeSupportProbe::Dynamic(_) => f.write_str("TreeSupportProbe::Dynamic(..)"),
+        }
+    }
+}
+
+impl Default for TreeSupportProbe {
+    fn default() -> Self {
+        Self::AlwaysSupported
+    }
+}
+
 /// Chunking strategy for `MeshBlobAdapter::store_stream_tree`.
 ///
 /// v0.3 Phase A ships [`ChunkingStrategy::Fixed`] only —
