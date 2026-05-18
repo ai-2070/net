@@ -1,0 +1,48 @@
+net/crates/net/src/adapter/net/redex/replication_runtime.rs
+  s_aa8bb6e2c88c9e::t_62aef0ab2376af 982
+  s_aa8bb6e2c88c9e::t_7cb8868ecadf77 2954-2962
+  s_aa8bb6e2c88c9e::t_a283f7de303788 1006
+  s_aa8bb6e2c88c9e::t_c24684de2e78c7 1301-1314,1316-1321,1325-1327
+  s_aa8bb6e2c88c9e::t_f21a3f19352d82 2872
+  s_aa8bb6e2c88c9e::t_f76255e1ee2942 1025
+  s_aa8bb6e2c88c9e::t_24bf9cc00e5828 1054-1058,1063
+  s_aa8bb6e2c88c9e::t_d629c5e4ff0fab 2927-2930,2932
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_18_CARRIED_FORWARD.md
+  s_aa8bb6e2c88c9e::t_1ab275f9bef7db 747,751
+net/crates/net/src/adapter/net/redex/replication_catchup.rs
+  s_aa8bb6e2c88c9e::t_16282250e4436f 62-66
+  s_aa8bb6e2c88c9e::t_083deba3ae6463 253
+  s_aa8bb6e2c88c9e::t_635f13ee80540c 223
+  s_aa8bb6e2c88c9e::t_1c13fc825641d2 173-180,184
+net/crates/net/tests/redex_replication_dst.rs
+  s_aa8bb6e2c88c9e::t_18cfceecefa06a 466-470,475
+net/crates/net/src/adapter/net/mesh.rs
+  s_aa8bb6e2c88c9e::t_51c01e0fe534b9 10582
+net/crates/net/src/adapter/net/redex/replication.rs
+  s_aa8bb6e2c88c9e::t_55b4b9a3738993 566-571,588,593,603,616,636
+  s_aa8bb6e2c88c9e::t_f2df7cb70919c9 1008-1011
+  s_aa8bb6e2c88c9e::t_23806d3c28ec5d 890
+  s_aa8bb6e2c88c9e::t_d4796d1ce8b270 990
+  s_aa8bb6e2c88c9e::t_f9412a35c71886 270-272
+  s_aa8bb6e2c88c9e::t_04a3c2e6f0039c 905,923
+  s_aa8bb6e2c88c9e::t_f0f349176aaf40 267-269,273
+  s_aa8bb6e2c88c9e::t_8d00646a209aa6 1004
+  s_aa8bb6e2c88c9e::t_16b854c18de3a0 938
+  s_aa8bb6e2c88c9e::t_6b413c4c130909 958
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "4f9294c3fdec7b6dae11408646bd4649c104f0a3",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
