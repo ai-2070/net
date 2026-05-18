@@ -377,6 +377,28 @@ pub fn apply_sync_response(
         .collect();
     file.append_batch(&payloads)
         .map_err(|e| ApplyError::AppendFailed(format!("{e:?}")))?;
+    // Force a disk sync before returning the new tail so the
+    // replica's next heartbeat advertises a durable seq. Without
+    // this, the runtime broadcasts `tail_seq = post-append` while
+    // the underlying file is still buffered; a crash before the
+    // background `FsyncPolicy::Interval`/`EveryN` fires leaves the
+    // replica returning with a lower tail. The leader, having
+    // already relaxed retention based on the advertised tail,
+    // can't re-supply the gap and the replica hits
+    // `GapBeforeChunk{divergence_suspected}` on rejoin — `skip_to`
+    // then silently overwrites the gap.
+    //
+    // `RedexFile::sync()` is a no-op for heap-only files (no disk
+    // segment) and for the `FsyncPolicy::Never` policy, so the
+    // perf cost is paid only on disk-backed channels that already
+    // opted into durability. The runtime task blocks on this
+    // fsync, which is acceptable: the alternative is the silent
+    // divergence path above.
+    #[cfg(feature = "redex-disk")]
+    {
+        file.sync()
+            .map_err(|e| ApplyError::AppendFailed(format!("durable-sync: {e:?}")))?;
+    }
     Ok(file.next_seq())
 }
 
