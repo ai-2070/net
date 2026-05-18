@@ -24,7 +24,7 @@ The replication subprotocol is the highest-leverage surface in this batch — **
 | Severity | Count | Top items |
 |---|---|---|
 | Critical | 3 | R-20, R-21, X-1 |
-| High | 18 | A-5, R-22, R-23, R-24, R-25, X-2, X-3, X-9, X-18, X-19, D-1, D-2, D-11, D-14, D-17, O-21, S-1, S-2 |
+| High | 19 | A-5, R-22, R-23, R-24, R-25, X-2, X-3, X-9, X-18, X-19, D-1, D-2, D-11, D-14, D-17, O-21, S-1, S-2, S-4 |
 | Medium | 31 | (see body) |
 | Low | 39 | (counts only at the end) |
 | Latent | 1 | MD-3 |
@@ -47,6 +47,13 @@ Sixth pass — targeted subprotocol `from_node`-binding sweep — added
 queue-to-application subprotocols and 5 reserved-unwired IDs as
 follow-up audit candidates. See "Sixth pass — targeted subprotocol
 sweep" section.
+
+Seventh pass — closes the two sixth-pass follow-ups — added 1 H (S-4
+nRPC response spoofing) and 1 architectural carry-forward (A-CON-1
+queue-boundary identity loss). Verified clean: MeshDB
+`FEDERATED_CALL_ID_COUNTER` (transport binds peer), `next_waiter_gen`
+(local-only), `LocalMeshQueryExecutor::next_id` (local-only),
+`rpc_round_robin_cursor` (local-only). See "Seventh pass" section.
 
 ## Second-pass note (2026-05-18, later same day)
 
@@ -591,6 +598,57 @@ can act for/about a different node than itself.
 
 ---
 
+## Seventh pass — sixth-pass follow-ups (2026-05-18)
+
+Closes the two follow-up items the sixth pass surfaced. **One real high
+(S-4 — nRPC response spoofing).** MeshDB's matching counter (the agent's
+initial second hit) turned out to be already-mitigated by the transport
+peer-check; downgraded to "verified clean." The queue-to-application
+consumer audit returned an architectural concern rather than a specific
+bug: the `StoredEvent` queue boundary drops `from_node`, so any future
+consumer of CAUSAL/SNAPSHOT/NEGOTIATION/CONTINUITY events cannot bind
+without retro-fitting the queue.
+
+### High
+
+#### S-4 — nRPC response delivery keyed on call_id alone; sequential counter lets any session peer spoof responses to in-flight calls
+- **File:** `src/adapter/net/cortex/rpc.rs:2105-2106` (`RpcClientFold::apply` delivery path); `:1978-2070` (`RpcClientPending::deliver`); call-id generator at `src/adapter/net/mesh_rpc.rs:800` (and `:1095`); counter init at `src/adapter/net/mesh.rs:1733` (`rpc_next_call_id: Arc<AtomicU64>::new(1)`).
+- **What:** Caller allocates `call_id = self.rpc_next_call_id().fetch_add(1, Ordering::Relaxed)` (predictable, process-global sequential u64 starting at 1). The caller subscribes to its own reply channel, ships the REQUEST to `target_node_id`, and registers a oneshot in `RpcClientPending::register(call_id)`. Inbound RESPONSE events on the reply channel are processed by `RpcClientFold::apply`: at `:2106` it pulls `meta.seq_or_ts` (the call_id) and calls `self.pending.deliver(call_id, resp)`. `RpcClientPending::deliver` (`:1978`) keys the `senders` `DashMap` on `call_id` alone — **no `from_node` parameter, no peer-binding check.** Any session peer that can publish on the caller's reply channel can ship a forged `RpcResponsePayload` with a guessed/sequential call_id and have it delivered to the caller's oneshot.
+- **Trigger / Attack:** Attacker establishes a session, issues a self-targeted RPC (observes their own call_id `N`), then publishes spoofed RESPONSE frames on a victim's reply channel for `N+k` at small offsets. Spoofed responses with non-Ok status inject false errors into the victim's nRPC results; with Ok status + crafted body, inject false success values. Reach depends on the victim's reply-channel publish ACL — open channels (the default) admit any session peer; channels with `require_token` restrict to authorized publishers.
+- **Same shape as S-3** in the rendezvous/membership layer, but **higher impact**: nRPC is a primary data-plane call mechanism. RPC-result corruption propagates straight into application state, unlike membership-Ack spoofing (which is a one-way denial primitive). Sequential `AtomicU64` makes call_ids cheaply predictable from any session peer.
+- **Note on streaming:** The streaming-RPC path at `:1991-2050` uses the same key (`call_id`); spoofed frames during a streaming call inject false chunks into the caller's stream.
+- **Fix sketch:**
+  1. Replace `AtomicU64::new(1)` + `fetch_add` with `rand::random::<u64>()` for `rpc_next_call_id`. The doc at `mesh.rs:1183-1186` claims uniqueness is the only requirement; random u64 satisfies that with collision probability 2⁻⁶⁴ per call.
+  2. Carry `from_node` (or `source_node_id`) into `RpcClientFold::apply` from the event envelope. Store `(call_id, expected_target_node)` on `RpcClientPending::register` and verify `from_node == expected_target_node` in `deliver` before completing the oneshot. Same pattern MeshDB already uses (`behavior/meshdb/transport.rs:323`).
+  3. Independently, set the default reply channel's publish ACL to `{target_node_id}`-only so a different peer cannot publish to it even with the right call_id.
+- **Regression test:** publish a forged RESPONSE on a known caller's reply channel with the predicted next call_id; assert the caller does NOT observe the forged value.
+
+### Verified clean
+
+- **`FEDERATED_CALL_ID_COUNTER` (MeshDB federated executor)** at `src/adapter/net/behavior/meshdb/federated.rs:123` — the sequential counter looks identical to the S-3 / S-4 shape, but the transport layer at `src/adapter/net/behavior/meshdb/transport.rs:319-329` verifies `entry.target_node == from_node` *before* delivering the response to the caller's stream. Spoofed responses with a guessed call_id are rejected with `MeshDbRouteError::WrongPeer`. The sequential counter is safe here because correlation is `(call_id, peer)` at the demux, not call_id alone.
+- **`next_waiter_gen` (NAT-traversal pending-map race-prevention)** at `src/adapter/net/mesh.rs:1761` — generation stamp on `pending_punch_acks` / `pending_reflex_probes` / `pending_punch_introduces` entries. **Local-only**; never sent on the wire, never used for cross-peer correlation. Sequential is correct.
+- **`LocalMeshQueryExecutor::next_id`** at `src/adapter/net/behavior/meshdb/executor.rs:206` — local query-handle id for cancellation tracking. Never crosses a process boundary. Sequential is fine.
+- **`rpc_round_robin_cursor`** at `src/adapter/net/mesh.rs:1735` — load-balancing cursor for `RoutingPolicy::RoundRobin` / `Random`. Selects the next target; the value never goes on the wire. Sequential is fine.
+
+### Architectural concern (carry forward)
+
+#### A-CON-1 — `StoredEvent` queue boundary discards `from_node`; future CAUSAL / SNAPSHOT / NEGOTIATION / CONTINUITY consumers cannot bind
+- **File:** event-frame fallthrough at `src/adapter/net/mesh.rs:3857-3897`; `StoredEvent` definition (carries `id`, `raw_payload`, `insertion_ts`, `shard_id`, `dedup_id` — no `from_node`); poll-shard consumer surface at `mesh.rs:~6185-6220`.
+- **What:** Events for the four queue-to-application subprotocols (CAUSAL 0x0400, SNAPSHOT 0x0401, NEGOTIATION 0x0600, CONTINUITY 0x0700) are queued into `inbound[shard_id]` as `StoredEvent`s without the cryptographic session peer. A future daemon consumer that drains the queue cannot tell which peer sent each event, and therefore cannot bind any payload-side principal field (`origin_hash`, `entity_id`, fork-origin claim, snapshot-target claim) against `from_node`. The R-20 / X-18 / S-1..3 fix shape (verify `from_node == claimed_principal`) is *structurally unavailable* at the consumer until the queue boundary is updated.
+- **Impact:** Latent. There are no production consumers of these four subprotocols today — `CAUSAL` and `SNAPSHOT` queue ingestion is unowned, `NEGOTIATION` has only the local-side `negotiate()` API, and `CONTINUITY` data structures exist without an inbound handler. **No exploit today**, but every future implementation will either (a) skip the binding check (recreating the S-3/S-4 class of bug), (b) carry the binding check at the cost of routing `from_node` through the queue (architectural fix), or (c) demux from a separate non-queue path.
+- **Recommendation:**
+  1. Either extend `StoredEvent` (or its delivery envelope) with `from_node`, or
+  2. Route these four subprotocols through `mesh.rs` dispatch arms (like REDEX/MIGRATION/REFLEX/RENDEZVOUS already are) instead of the standard event-frame fallthrough.
+  Pick before the first consumer of any of the four lands.
+- **Tracking:** This is not an `S-*` bug — there is no extant code path that mutates state on a forgeable principal — but it shapes how the next implementer must approach the four subprotocols. Cross-reference from the design docs for each.
+
+### Sixth-pass follow-up status
+
+- **Queue-to-application consumer audit (CAUSAL/SNAPSHOT/NEGOTIATION/CONTINUITY)** — Complete. No exploit bugs (no consumers exist); architectural concern documented as **A-CON-1**.
+- **Sequential-nonce pattern reuse** — Complete. One real bug (**S-4** nRPC); MeshDB's matching counter verified clean (transport binds peer); three other sequential counters (`next_waiter_gen`, `next_id`, `rpc_round_robin_cursor`) verified local-only and safe.
+
+---
+
 `src/adapter/net/netdb/{db.rs, error.rs, mod.rs}` (399 LOC) is a thin builder + façade. All query/predicate/filter logic lives in `cortex::tasks` / `cortex::memories` (covered in `PHASE3_CORTEX_RPC_DROP.md`). No query expression is parsed, evaluated, or locked inside `netdb/`.
 
 Categories explicitly checked and clean: query injection (no string DSL parsed here), authorization (delegated to the channel layer per the documented model), TOCTOU (no plan/execute split), float/integer/locale predicate hazards (no arithmetic in this module), result-set resource bounds (per-model snapshot delegates downward), lock ordering (no locks held), read-your-writes (no caching layer), Debug/Display panic or unbounded alloc.
@@ -731,7 +789,9 @@ per-module sequences (D-16 → D-17, X-18 → X-19, O-20 → O-21, R-39 → R-40
 21. **Fifth-pass highs** — **X-19** (`StandbyGroup::promote` partial-sync double-execution) lands alongside the **X-1** fencing fix; both are silent-corruption bugs in the same file and the regression test for X-1's epoch token should also cover the X-19 replay-filter. **O-21** (cluster-backpressure release never fires while idle) is independent and small — drive the existing snapshot publish tick to also call `update_cluster_backpressure`. **D-17** (heat-emission ordering vs. async sink) is the dataforts analogue of **R-31**; fix both in the same commit by introducing a "candidate / commit" pattern shared between the heat registry and the replication coordinator.
 22. **Fifth-pass mediums** — **D-18** (FS adapter UTF-8 boundary panic) is publisher-controllable and trivial to fix; ship a same-day patch with the `char_indices` fix and the `format!("{}🦀", "a".repeat(255))` unit test. **O-22** (maintenance rank-ladder regression), **O-23** (executor `std::Instant` vs tokio sleep — fold into the same M-4 commit as R-35 and the original bus.rs fix), **O-24** (graceful_shutdown unconditional sleep), and **X-20** (dead `MigrationOrchestrator::buffer_event`) are independent; X-20 should be deletion not redirection.
 23. **Fifth-pass lows** — **R-40** (NACK BadRange thrash) folds into the same wire-protocol change as R-22/R-23. **O-25** (release backpressure refresh) and **X-21** (LocalPreferred liveness) pair with O-21 and X-16 respectively. **X-22** (third-party orchestrator `parent_hash: 0`) is the only stand-alone fifth-pass low; it breaks the continuity-proof feature in exactly the topology its docs describe, so worth lifting to medium if any deployment uses that topology today.
-24. **Sixth-pass subprotocol-binding fixes** — **S-1** (`PunchIntroduce` coordinator binding) + **S-2** (`PunchAck` from-peer binding) land together in `mesh.rs` rendezvous dispatch; both are mechanical (record the expected peer at registration time, verify on dispatch). **S-3** (membership `Ack` peer binding + random-nonce replacement) is independent; the nonce change is a one-line `rand::random()` swap and the peer-binding tuple change is local to `pending_membership_acks`. All three fixes are pure-local and do not require a wire-protocol change. The sweep also surfaced **two follow-up audits** the next pass should pick up: (a) the four queue-to-application subprotocols (CAUSAL, SNAPSHOT, NEGOTIATION, CONTINUITY) at their *consumer* layers, and (b) the same `AtomicU64::new(1)` sequential-nonce pattern wherever else it appears in the crate.
+24. **Sixth-pass subprotocol-binding fixes** — **S-1** (`PunchIntroduce` coordinator binding) + **S-2** (`PunchAck` from-peer binding) land together in `mesh.rs` rendezvous dispatch; both are mechanical (record the expected peer at registration time, verify on dispatch). **S-3** (membership `Ack` peer binding + random-nonce replacement) is independent; the nonce change is a one-line `rand::random()` swap and the peer-binding tuple change is local to `pending_membership_acks`. All three fixes are pure-local and do not require a wire-protocol change.
+25. **Seventh-pass highs** — **S-4** (nRPC response delivery keyed on call_id alone; sequential `rpc_next_call_id` makes spoofing cheap). Highest-leverage of the S-series because nRPC is a primary data-plane mechanism. Fix in three parts: (a) `rand::random::<u64>()` for `rpc_next_call_id`; (b) store `(call_id, expected_target_node)` in `RpcClientPending` and verify `from_node` on `deliver` (mirror `behavior/meshdb/transport.rs:323`); (c) tighten the default reply channel publish ACL to `{target_node_id}`-only. Land together with a regression test that publishes a forged RESPONSE on a known reply channel and asserts the caller doesn't observe the forged value.
+26. **Seventh-pass architectural** — **A-CON-1** (`StoredEvent` queue boundary discards `from_node`) is not an exploit today (no production consumers of the four affected subprotocols) but blocks correct first-implementation of CAUSAL / SNAPSHOT / NEGOTIATION / CONTINUITY. Decide between (a) carrying `from_node` through the queue, or (b) routing the four through `mesh.rs` dispatch arms like the other subprotocols. Pick before the first consumer of any of the four lands.
 
 ## Coverage gaps still carried forward
 
