@@ -504,8 +504,8 @@ impl MeshOsDaemonHandle {
     /// Drive a graceful shutdown. Sends
     /// `DaemonControl::Shutdown { grace_period_ms }` to the
     /// daemon's control channel, parks for `grace` (or until
-    /// the daemon's task exits — whichever sooner), then
-    /// unregisters from the registry + router.
+    /// the daemon unregisters itself — whichever sooner), then
+    /// runs the failsafe unregister.
     pub async fn graceful_shutdown(mut self, grace: Duration) -> Result<(), SdkError> {
         // Inject a shutdown event so the daemon's `next_control`
         // loop wakes up.
@@ -516,10 +516,30 @@ impl MeshOsDaemonHandle {
                 grace_period_ms: grace_ms,
             },
         );
-        // Wait for the grace window; daemons that exit early
-        // can drop their handle to short-circuit (Drop runs
-        // unregister too).
-        tokio::time::sleep(grace).await;
+        // Park for the grace window, but short-circuit as soon as
+        // the daemon clears itself from the registry — a clean
+        // exit shouldn't be indistinguishable from a hung daemon.
+        // Pre-fix this was a blind `sleep(grace)`, multiplying
+        // shutdown latency across a fleet during rolling restarts
+        // for every daemon that exits faster than its grace
+        // window. 50 ms poll cadence is a compromise between
+        // wake-up latency on clean exit and CPU overhead during
+        // the grace window.
+        let deadline = tokio::time::Instant::now() + grace;
+        let mut poll = tokio::time::interval(Duration::from_millis(50));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if !self.registry.contains(self.daemon_id) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = poll.tick() => {}
+            }
+        }
         self.unregister_inner();
         Ok(())
     }

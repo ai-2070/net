@@ -376,7 +376,13 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
     }
 
     async fn handle_one_retry(&mut self, action: PendingAction, prior_defers: u32) {
-        let now = Instant::now();
+        // Source `now` from tokio's clock and convert to std so the
+        // deferred-heap deadlines stay coherent with tokio::time::sleep_until
+        // — under `tokio::time::pause()` the std::Instant::now() formulation
+        // diverged from the paused timer, leaving tests unable to drive
+        // deferred-retry semantics. into_std() round-trips through
+        // tokio::time::Instant::from_std() in sleep_until_opt below.
+        let now = tokio::time::Instant::now().into_std();
         self.backpressure.tick(now);
         // Compute live queue depth (channel + deferred heap) and
         // run hysteresis; surface edge crossings to the
@@ -505,7 +511,8 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                         err.reason.clone(),
                         Some(retry_ms),
                     );
-                    let now = Instant::now();
+                    // Same time-source rationale as handle_one_retry above.
+                    let now = tokio::time::Instant::now().into_std();
                     self.deferred.push(DeferredEntry {
                         retry_at: now.checked_add(after).unwrap_or(now),
                         action,
