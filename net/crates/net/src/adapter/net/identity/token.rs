@@ -305,13 +305,33 @@ impl PermissionToken {
     /// Aligning everything on strict "< not_after" removes the
     /// off-by-one and makes the token lifetime exactly
     /// `duration_secs` seconds as `issue()` promises.
+    ///
     pub fn is_valid(&self) -> Result<(), TokenError> {
+        self.is_valid_with_skew(0)
+    }
+
+    /// Same as [`Self::is_valid`] but applies `skew_secs` of clock-
+    /// skew tolerance to both bounds. A token is accepted while
+    /// `now >= not_before - skew` AND `now < not_after + skew`.
+    /// [`TokenCache::check`] uses this via the cache's configured
+    /// `clock_skew_secs` (default 0); direct FFI / UI callers stick
+    /// with [`Self::is_valid`].
+    pub fn is_valid_with_skew(&self, skew_secs: u64) -> Result<(), TokenError> {
         self.verify()?;
         let now = current_timestamp();
-        if now < self.not_before {
+        // Lower bound: accept tokens whose `not_before` is up to
+        // `skew_secs` in our future. `saturating_sub` pins the
+        // comparison at 0 if a token's `not_before` is smaller
+        // than the tolerance (issuer set `not_before` very early
+        // or used 0); without saturating, the subtraction would
+        // underflow on u64.
+        if now < self.not_before.saturating_sub(skew_secs) {
             return Err(TokenError::NotYetValid);
         }
-        if now >= self.not_after {
+        // Upper bound: reject only when wall-clock exceeds
+        // `not_after + skew_secs`. `saturating_add` clamps to
+        // u64::MAX (issuer-saturated TTL stays forever-valid).
+        if now >= self.not_after.saturating_add(skew_secs) {
             return Err(TokenError::Expired);
         }
         Ok(())
@@ -459,7 +479,15 @@ impl PermissionToken {
     /// Returning `[u8; SIGNED_PAYLOAD_SIZE]` keeps the layout
     /// identical to the heap version (the existing callers'
     /// `&payload` still resolves to a `&[u8]`).
-    fn signed_payload(&self) -> [u8; Self::SIGNED_PAYLOAD_SIZE] {
+    /// Materialise the canonical byte payload the signature covers
+    /// (every field except the signature itself). Exposed publicly
+    /// so tools that need to re-sign a token after editing a field
+    /// — test harnesses, key-rotation flows, migration paths —
+    /// can do so without re-implementing the field-layout layout.
+    /// Production paths that mint tokens go through
+    /// [`Self::issue`] / [`Self::try_issue`] / [`Self::delegate`];
+    /// `signed_payload` is the lower-level primitive those use.
+    pub fn signed_payload(&self) -> [u8; Self::SIGNED_PAYLOAD_SIZE] {
         let mut buf = [0u8; Self::SIGNED_PAYLOAD_SIZE];
         let mut off = 0;
         buf[off..off + 32].copy_from_slice(self.issuer.as_bytes());
@@ -568,6 +596,24 @@ pub const MAX_TOKEN_SLOTS: usize = 65_536;
 /// past real usage while bounding within-slot growth.
 pub const MAX_TOKENS_PER_SLOT: usize = 32;
 
+/// Recommended default clock-skew tolerance for [`TokenCache`]
+/// (production deployments).
+///
+/// Apply this via [`TokenCache::with_clock_skew`] when a node may
+/// observe wall-clock drift against the rest of the mesh — typical
+/// NTP-synced fleets stay within seconds, but containerized edge
+/// deployments routinely drift tens of seconds and would otherwise
+/// reject freshly-issued tokens or honour tokens others treat as
+/// expired. The constant is recommended-not-default because
+/// `TokenCache::new` defaults to **strict** (skew = 0) to preserve
+/// the existing-deployment expiry contract; operators opt in by
+/// constructing `TokenCache::with_clock_skew(TOKEN_CLOCK_SKEW_SECS_RECOMMENDED)`.
+///
+/// The tolerance applies only through [`TokenCache::check`].
+/// [`PermissionToken::is_valid`] and [`PermissionToken::is_expired`]
+/// remain strict wall-clock checks for FFI / UI callers.
+pub const TOKEN_CLOCK_SKEW_SECS_RECOMMENDED: u64 = 60;
+
 /// Fast permission lookup cache.
 ///
 /// Keyed by `(subject EntityId, channel_hash)`. Each slot holds a
@@ -595,6 +641,13 @@ pub struct TokenCache {
     /// multiple tenants in the same process) inject their own via
     /// [`Self::with_revocation_registry`].
     revocation: Arc<RevocationRegistry>,
+    /// Wall-clock skew tolerance applied when `check` evaluates a
+    /// token's time bounds. Default 0 (strict). Operators whose
+    /// fleet may observe clock drift opt in by constructing the
+    /// cache via [`Self::with_clock_skew`] — see
+    /// [`TOKEN_CLOCK_SKEW_SECS_RECOMMENDED`] for the recommended
+    /// value.
+    clock_skew_secs: u64,
 }
 
 /// Per-issuer revocation floor. Bumping an issuer's floor invalidates
@@ -647,11 +700,26 @@ impl RevocationRegistry {
 }
 
 impl TokenCache {
-    /// Create an empty token cache with a fresh revocation registry.
+    /// Create an empty token cache with a fresh revocation registry
+    /// and strict (zero) clock-skew tolerance.
     pub fn new() -> Self {
         Self {
             tokens: DashMap::new(),
             revocation: Arc::new(RevocationRegistry::new()),
+            clock_skew_secs: 0,
+        }
+    }
+
+    /// Create an empty token cache with the supplied clock-skew
+    /// tolerance (in seconds) applied to every [`Self::check`]
+    /// time-bound evaluation. See
+    /// [`TOKEN_CLOCK_SKEW_SECS_RECOMMENDED`] for the production-
+    /// recommended value.
+    pub fn with_clock_skew(skew_secs: u64) -> Self {
+        Self {
+            tokens: DashMap::new(),
+            revocation: Arc::new(RevocationRegistry::new()),
+            clock_skew_secs: skew_secs,
         }
     }
 
@@ -664,7 +732,21 @@ impl TokenCache {
         Self {
             tokens: DashMap::new(),
             revocation,
+            clock_skew_secs: 0,
         }
+    }
+
+    /// Set the cache's clock-skew tolerance. Tokens cleared the
+    /// freshness checks in [`Self::check`] are admitted while
+    /// `now >= not_before - skew` AND `now < not_after + skew`.
+    /// Default is 0 (strict).
+    pub fn set_clock_skew(&mut self, skew_secs: u64) {
+        self.clock_skew_secs = skew_secs;
+    }
+
+    /// Current clock-skew tolerance (seconds).
+    pub fn clock_skew_secs(&self) -> u64 {
+        self.clock_skew_secs
     }
 
     /// Borrow the cache's revocation registry. Use this to drive
@@ -771,7 +853,7 @@ impl TokenCache {
                 .value()
                 .iter()
                 .any(|t| {
-                    t.is_valid().is_ok()
+                    t.is_valid_with_skew(self.clock_skew_secs).is_ok()
                         && !self.revocation.is_revoked(t)
                         // Defence-in-depth: cross-check the token's
                         // signed `subject` field matches the lookup
@@ -1103,8 +1185,8 @@ mod tests {
     /// (drops at the boundary), so tokens survived one second longer
     /// in the "hot" caller-facing checks than in the sweep — a
     /// quiet mismatch that also gave every `issue(duration=N)` an
-    /// effective lifetime of `N+1` seconds. This test pins the
-    /// inclusive boundary: at `not_after` exactly, expired.
+    /// effective lifetime of `N+1` seconds.
+    ///
     #[test]
     fn is_valid_and_is_expired_agree_at_not_after_boundary() {
         let issuer = EntityKeypair::generate();
@@ -1131,7 +1213,7 @@ mod tests {
         );
         assert!(
             matches!(token.is_valid(), Err(TokenError::Expired)),
-            "is_valid must agree: Expired at now == not_after",
+            "is_valid must agree: Expired at now == not_after (strict)",
         );
 
         // And the cache eviction path must also drop it — same
@@ -1508,6 +1590,115 @@ mod tests {
                 0xABCD_EF00_AAAA_BBBB,
             )
             .is_err());
+    }
+
+    /// `is_valid_with_skew` widens both bounds by the supplied
+    /// tolerance. Pinned at the boundary: half-a-window in admits;
+    /// just past the window rejects. Both the past (Expired) and
+    /// future (NotYetValid) sides are exercised — the skew applies
+    /// symmetrically.
+    #[test]
+    fn is_valid_with_skew_accepts_inside_window_rejects_outside() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let skew: u64 = 60;
+
+        let mut token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            3600,
+            0,
+        );
+
+        // Token expired half-a-skew-window ago: still valid under
+        // the configured skew, but strict `is_valid` rejects.
+        token.not_after = current_timestamp() - skew / 2;
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
+        assert!(
+            token.is_valid_with_skew(skew).is_ok(),
+            "is_valid_with_skew must accept tokens inside the past-skew window",
+        );
+        assert!(
+            matches!(token.is_valid(), Err(TokenError::Expired)),
+            "strict is_valid must reject the same token",
+        );
+
+        // Token expired past the window: must reject under both.
+        token.not_after = current_timestamp() - skew - 5;
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
+        assert!(
+            matches!(token.is_valid_with_skew(skew), Err(TokenError::Expired)),
+            "is_valid_with_skew must reject tokens past the past-skew window",
+        );
+
+        // Token not-yet-valid by half a window: accept under skew,
+        // reject under strict.
+        token.not_after = current_timestamp() + 3600;
+        token.not_before = current_timestamp() + skew / 2;
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
+        assert!(
+            token.is_valid_with_skew(skew).is_ok(),
+            "is_valid_with_skew must accept tokens inside the future-skew window",
+        );
+        assert!(
+            matches!(token.is_valid(), Err(TokenError::NotYetValid)),
+            "strict is_valid must reject the same token",
+        );
+
+        // Token not-yet-valid past the window: must reject under both.
+        token.not_before = current_timestamp() + skew + 5;
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
+        assert!(
+            matches!(
+                token.is_valid_with_skew(skew),
+                Err(TokenError::NotYetValid),
+            ),
+            "is_valid_with_skew must reject tokens past the future-skew window",
+        );
+    }
+
+    /// TokenCache::with_clock_skew applies the configured tolerance
+    /// to every `check` call. A token whose `not_after` is just
+    /// past now is rejected by a strict cache but admitted by a
+    /// cache constructed with sufficient skew.
+    #[test]
+    fn token_cache_with_clock_skew_admits_inside_window() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let channel: ChannelHash = 0x1234_5678_9ABC_DEF0;
+
+        let mut token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            channel,
+            3600,
+            0,
+        );
+        // Expired 5 s ago.
+        token.not_after = current_timestamp() - 5;
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
+
+        // Strict cache rejects.
+        let strict = TokenCache::new();
+        strict.insert_unchecked(token.clone());
+        assert!(strict
+            .check(subject.entity_id(), TokenScope::PUBLISH, channel)
+            .is_err());
+
+        // Lenient cache admits.
+        let lenient = TokenCache::with_clock_skew(60);
+        lenient.insert_unchecked(token);
+        assert!(lenient
+            .check(subject.entity_id(), TokenScope::PUBLISH, channel)
+            .is_ok());
     }
 
     /// Defence-in-depth: `TokenCache::check` cross-checks the
