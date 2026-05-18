@@ -924,6 +924,16 @@ impl StandbyGroup {
             recovered.push(index);
         }
 
+        // X-1 epoch bump on any successful slot re-placement, matching
+        // `ForkGroup::try_recover_inner` / `ReplicaGroup::try_recover_inner`.
+        // A standby placed on a new node here is a membership change;
+        // peers that still believe the slot lives on its old node must
+        // observe a higher term so they can refresh routing before the
+        // fenced wire-layer rejects their stale-term snapshot syncs.
+        // No-op if every placement attempt failed.
+        if !recovered.is_empty() {
+            self.term = self.term.saturating_add(1);
+        }
         recovered
     }
 
@@ -2220,6 +2230,55 @@ mod tests {
             group.members().iter().filter(|m| m.healthy).count(),
             2,
             "two standbys still healthy",
+        );
+    }
+
+    /// Regression: every successful standby-slot re-placement in
+    /// `try_recover` must bump `term`, matching
+    /// `ForkGroup::try_recover_inner` / `ReplicaGroup::try_recover_inner`.
+    /// Pre-fix the bump was missing — a sibling that still routed
+    /// snapshot syncs to the slot's old node would never observe a
+    /// higher term and would keep targeting the wrong node.
+    #[test]
+    fn try_recover_bumps_term_on_standby_replacement() {
+        use crate::adapter::net::compute::UnhealthySlotRecovery;
+
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+        let term_before = group.term();
+
+        // Mark a standby unhealthy so try_recover has work to do.
+        let active_index = group.active_index();
+        let standby_index: u8 = (0u8..group.member_count())
+            .find(|i| *i != active_index)
+            .unwrap();
+        group.coord.mark_unhealthy(standby_index);
+
+        let recovered = group.try_recover(&sched, &reg, &|| Box::new(StatefulDaemon::new()));
+        assert!(
+            !recovered.is_empty(),
+            "test fixture's scheduler must be able to re-place the standby",
+        );
+        assert_eq!(
+            group.term(),
+            term_before.saturating_add(1),
+            "term must advance once on successful slot re-placement",
+        );
+
+        // Idle try_recover (no unhealthy slots) does NOT bump.
+        let term_after_first = group.term();
+        let _ = group.try_recover(&sched, &reg, &|| Box::new(StatefulDaemon::new()));
+        assert_eq!(
+            group.term(),
+            term_after_first,
+            "no-op try_recover must not advance term",
         );
     }
 
