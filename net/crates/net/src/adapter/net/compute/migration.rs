@@ -395,6 +395,16 @@ pub enum MigrationError {
         /// Maximum allowed size in bytes.
         max: usize,
     },
+    /// Wire-driven event-buffering surface refused an insert because
+    /// the per-daemon out-of-order pending buffer is at its byte or
+    /// event-count cap. Source must back off; the migration is not
+    /// failed but the offending event was not accepted.
+    BufferFull {
+        /// Current buffered event count.
+        events: usize,
+        /// Current buffered byte total (sum of payload lengths).
+        bytes: usize,
+    },
 }
 
 impl std::fmt::Display for MigrationError {
@@ -422,6 +432,13 @@ impl std::fmt::Display for MigrationError {
                     f,
                     "snapshot too large: {} bytes exceeds max {} bytes",
                     size, max
+                )
+            }
+            Self::BufferFull { events, bytes } => {
+                write!(
+                    f,
+                    "migration buffer full: {} events / {} bytes",
+                    events, bytes
                 )
             }
         }

@@ -33,7 +33,76 @@ struct TargetMigrationState {
     replayed_through: u64,
     /// Events pending replay, keyed by sequence for ordered replay.
     pending_events: BTreeMap<u64, CausalEvent>,
+    /// Running byte total of `pending_events` payload sizes for
+    /// the BufferFull cap below. Tracked alongside the map so the
+    /// cap check is O(1) — otherwise a wire-driven OOM would
+    /// pre-empt by walking the map on every insert.
+    pending_bytes: usize,
     started_at: Instant,
+}
+
+/// Maximum bytes worth of out-of-order events the target will
+/// hold for a single daemon before refusing further inserts with
+/// `MigrationError::BufferFull`. Mirrors the `MAX_PENDING_REASSEMBLY_BYTES`
+/// budget the snapshot reassembler uses (64 MiB). A peer that
+/// skips `replayed_through + 1` indefinitely would otherwise grow
+/// this map without bound — a targeted DoS reachable from any peer
+/// that can address migration traffic to this node.
+const MAX_PENDING_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+/// Companion event-count cap. Mirrors `MAX_BUFFERED_EVENTS` in
+/// the orchestrator's wire-decode path (1_000_000).
+const MAX_PENDING_EVENTS: usize = 1_000_000;
+
+impl TargetMigrationState {
+    /// Insert a pending event after checking the per-daemon byte
+    /// + count caps. Caller surfaces `MigrationError::BufferFull`
+    /// to the wire so the source can back off rather than wedging
+    /// the target's RSS.
+    fn try_insert_pending(&mut self, event: CausalEvent) -> Result<(), MigrationError> {
+        let event_bytes = event.payload.len();
+        if self.pending_events.len() >= MAX_PENDING_EVENTS
+            || self.pending_bytes.saturating_add(event_bytes) > MAX_PENDING_BUFFER_BYTES
+        {
+            return Err(MigrationError::BufferFull {
+                events: self.pending_events.len(),
+                bytes: self.pending_bytes,
+            });
+        }
+        if let Some(prev) = self
+            .pending_events
+            .insert(event.link.sequence, event)
+        {
+            // Same-seq overwrite — net byte delta is (new - old).
+            // Subtract the old size; the new size was already
+            // pre-checked against the cap above.
+            self.pending_bytes = self.pending_bytes.saturating_sub(prev.payload.len());
+        }
+        self.pending_bytes = self.pending_bytes.saturating_add(event_bytes);
+        Ok(())
+    }
+
+    /// Remove a pending event by sequence and decrement the byte
+    /// counter. Idempotent on a miss. Used by drain_pending.
+    fn remove_pending(&mut self, seq: u64) -> Option<CausalEvent> {
+        let removed = self.pending_events.remove(&seq)?;
+        self.pending_bytes = self.pending_bytes.saturating_sub(removed.payload.len());
+        Some(removed)
+    }
+
+    /// Re-insert an event into pending without re-checking the cap
+    /// — used by drain_pending's restore-tail path, where the
+    /// events were already counted before being drained for the
+    /// delivery attempt that failed mid-batch.
+    fn reinsert_pending(&mut self, event: CausalEvent) {
+        let bytes = event.payload.len();
+        if self
+            .pending_events
+            .insert(event.link.sequence, event)
+            .is_none()
+        {
+            self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+        }
+    }
 }
 
 /// Target-side state retained after a successful migration completes,
@@ -187,6 +256,7 @@ impl MigrationTargetHandler {
                 phase: MigrationPhase::Restore,
                 replayed_through,
                 pending_events: BTreeMap::new(),
+                pending_bytes: 0,
                 started_at: Instant::now(),
             }),
         );
@@ -234,9 +304,13 @@ impl MigrationTargetHandler {
         }
         state.phase = MigrationPhase::Replay;
 
-        // Insert into BTreeMap for ordered replay
+        // Insert into BTreeMap for ordered replay, with per-daemon
+        // byte + count caps. A source that ships more than the cap
+        // gets BufferFull and must back off; partial inserts that
+        // already landed are kept (no rollback) so subsequent
+        // contiguous drain still makes progress on the prefix.
         for event in events {
-            state.pending_events.insert(event.link.sequence, event);
+            state.try_insert_pending(event)?;
         }
 
         // Replay in order
@@ -279,7 +353,7 @@ impl MigrationTargetHandler {
         if state.phase == MigrationPhase::Cutover {
             return Ok(false);
         }
-        state.pending_events.insert(event.link.sequence, event);
+        state.try_insert_pending(event)?;
 
         // Try to drain any contiguous events
         self.drain_pending(&mut state)?;
@@ -459,7 +533,7 @@ impl MigrationTargetHandler {
         let mut to_replay = Vec::new();
         let mut next_seq = state.replayed_through.saturating_add(1);
 
-        while let Some(event) = state.pending_events.remove(&next_seq) {
+        while let Some(event) = state.remove_pending(next_seq) {
             to_replay.push(event);
             // saturating_add: same rationale as above.
             next_seq = next_seq.saturating_add(1);
@@ -473,7 +547,7 @@ impl MigrationTargetHandler {
             .cloned()
             .collect();
         for seq in stale {
-            state.pending_events.remove(&seq);
+            state.remove_pending(seq);
         }
 
         // Deliver events to daemon via registry. Track how many actually
@@ -502,7 +576,7 @@ impl MigrationTargetHandler {
             // upstream — would be lost forever, since the source has
             // moved on and won't re-send it.
             for event in to_replay.into_iter().skip(delivered) {
-                state.pending_events.insert(event.link.sequence, event);
+                state.reinsert_pending(event);
             }
             return Err(err);
         }
@@ -642,6 +716,68 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("does not match"));
+    }
+
+    #[test]
+    /// The migration subprotocol is wire-driven: any peer that can
+    /// address migration traffic to this node can ship a stream of
+    /// non-contiguous CausalEvents that skip `replayed_through + 1`
+    /// indefinitely. Without a cap, `pending_events` would grow
+    /// without bound until OOM. Post-fix the per-daemon byte cap
+    /// surfaces as a typed `BufferFull` error and `pending_events`
+    /// stays bounded.
+    #[test]
+    fn buffer_event_rejects_oversize_pending_with_buffer_full() {
+        use bytes::Bytes;
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+        let snapshot = make_snapshot(&kp, 0, 0);
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+
+        // Each event carries ~1 MiB of payload; 64 events would just
+        // hit the 64 MiB cap. Skip seq=1 so nothing drains. Insert 70.
+        let payload = Bytes::from(vec![0u8; 1024 * 1024]);
+        let mut last_ok = 0u64;
+        let mut hit_full = false;
+        for seq in 2..=80 {
+            let ev = CausalEvent {
+                link: CausalLink {
+                    origin_hash: 0xBBBB,
+                    horizon_encoded: 0,
+                    sequence: seq,
+                    parent_hash: 0,
+                },
+                payload: payload.clone(),
+                received_at: 0,
+            };
+            match handler.buffer_event(origin, ev) {
+                Ok(_) => last_ok = seq,
+                Err(MigrationError::BufferFull { .. }) => {
+                    hit_full = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected error: {:?}", other),
+            }
+        }
+        assert!(hit_full, "expected BufferFull before exhausting 70 inserts");
+        assert!(
+            last_ok < 80,
+            "cap should have rejected before all 70 inserts landed",
+        );
     }
 
     #[test]
