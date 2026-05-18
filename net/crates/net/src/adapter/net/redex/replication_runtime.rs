@@ -539,6 +539,20 @@ impl CatchupBackoff {
             .and_then(|e| e.backoff_until)
             .is_some_and(|until| now < until)
     }
+
+    /// Drop entries for leaders whose backoff window expired more
+    /// than `cap` ago. Called from `on_tick` to keep the map
+    /// bounded under leader churn: a leader demoted after
+    /// accruing strikes never has `record_progress` called for it
+    /// again, so without expiry the entry persists indefinitely.
+    /// Below-threshold entries (no `backoff_until` stamp) are
+    /// retained — they represent active counting state.
+    pub fn gc_expired(&mut self, now: Instant, cap: Duration) {
+        self.entries.retain(|_, e| match e.backoff_until {
+            Some(until) => now.saturating_duration_since(until) < cap,
+            None => true,
+        });
+    }
 }
 
 impl Drop for ReplicationRuntimeHandle {
@@ -804,6 +818,14 @@ async fn on_tick(
     // drives this on_tick call. Pre-fix std::Instant::now() kept
     // moving while virtual time was paused.
     let now = tokio::time::Instant::now().into_std();
+    // Drop CatchupBackoff entries whose backoff window expired
+    // more than a cap ago — protects the map from unbounded
+    // growth under leader churn (a demoted leader's entry has
+    // no other clearance path; `record_progress` only fires for
+    // the current believed leader).
+    backoff
+        .lock()
+        .gc_expired(now, CATCHUP_BACKOFF_CAP.saturating_mul(2));
     let tail_seq = (inputs.tail_provider)();
     // Bump the coordinator's cached tail at every tick so the next
     // transition's announce_chain advertises the real tip. The
