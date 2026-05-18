@@ -2533,22 +2533,31 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(
                     STREAMING_REQUEST_PUMP_CAPACITY,
                 );
-                // Push the initial REQUEST body as the first item
-                // (even if empty — empty bodies are valid stream
-                // items, the application decides what they mean).
-                if tx.try_send(bytes::Bytes::from(payload.body)).is_err() {
-                    tracing::warn!(
-                        caller_origin = format!("{:#x}", meta.origin_hash),
-                        call_id = meta.seq_or_ts,
-                        "rpc client-streaming server fold: failed to push initial REQUEST body to fresh mpsc",
-                    );
+                // Terminator-semantics rule: an empty body
+                // combined with FLAG_REQUEST_END is a pure
+                // terminator — the caller's `finish()` emits it
+                // to close the stream without yielding a phantom
+                // empty item to the handler. A non-empty body on
+                // a FLAG_END frame IS a final item (used by the
+                // "single-item degenerate path": initial REQUEST
+                // with FLAG_END + a real body sends one item +
+                // closes in a single frame).
+                let end_on_initial = payload.flags & FLAG_RPC_REQUEST_END != 0;
+                let is_pure_terminator = end_on_initial && payload.body.is_empty();
+                if !is_pure_terminator {
+                    if tx.try_send(bytes::Bytes::from(payload.body)).is_err() {
+                        tracing::warn!(
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc client-streaming server fold: failed to push initial REQUEST body to fresh mpsc",
+                        );
+                    }
                 }
                 // If the initial REQUEST also set FLAG_REQUEST_END,
                 // close the stream immediately — degenerate case of
                 // "one-item upload" where the caller didn't bother
                 // with a trailing REQUEST_CHUNK. Don't even insert
                 // the sender into the map; just drop it here.
-                let end_on_initial = payload.flags & FLAG_RPC_REQUEST_END != 0;
                 if !end_on_initial {
                     self.senders.lock().insert(key, tx);
                 }
@@ -2705,11 +2714,17 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                     );
                     return Ok(());
                 };
-                // Push the chunk body. Empty bodies on the END
-                // frame are common (caller closing without
-                // additional payload); empty bodies on non-END
-                // frames are unusual but valid.
-                if sender.try_send(bytes::Bytes::from(payload.body)).is_err() {
+                // Terminator-semantics rule (mirror of the initial
+                // REQUEST handling above): empty body + FLAG_END
+                // is a pure terminator and is NOT yielded as a
+                // stream item. Non-empty body + FLAG_END is a
+                // valid final item. Empty body without FLAG_END
+                // is a regular (rare) item the application
+                // decides what to do with.
+                let is_pure_terminator = is_end && payload.body.is_empty();
+                if !is_pure_terminator
+                    && sender.try_send(bytes::Bytes::from(payload.body)).is_err()
+                {
                     tracing::debug!(
                         caller_origin = format!("{:#x}", meta.origin_hash),
                         call_id = meta.seq_or_ts,
