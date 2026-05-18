@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/compute/standby_group.rs
+  s_aa8bb6e2c88c9e::t_a8abe446b936c1 785-854
+  s_aa8bb6e2c88c9e::t_9d2c75f585a3d2 906-920
+net/crates/net/src/adapter/net/compute/mod.rs
+  s_aa8bb6e2c88c9e::t_2ae540d4f6aac0 45-86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "a148dcaabf09b6842f10fc22fb5f52a68ac3d502",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
