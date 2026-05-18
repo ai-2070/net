@@ -1601,7 +1601,14 @@ impl MeshBlobAdapter {
 
     /// Fetch a single chunk by hash. Returns `BlobError::NotFound`
     /// when the chunk file is absent or empty.
-    async fn fetch_chunk(&self, hash: &[u8; 32]) -> Result<Vec<u8>, BlobError> {
+    ///
+    /// `pub` + `#[doc(hidden)]` so the v0.3 Phase B conformance
+    /// integration test can walk a `BlobRef::Tree` and collect
+    /// every reachable chunk hash for the dedup-after-edit
+    /// assertion. Not part of the supported public API — the
+    /// standard fetch path is `fetch_range` over a `BlobRef`.
+    #[doc(hidden)]
+    pub async fn fetch_chunk(&self, hash: &[u8; 32]) -> Result<Vec<u8>, BlobError> {
         let channel = Self::chunk_channel(hash);
         let cfg = self.chunk_file_config();
         let file = self
