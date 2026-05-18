@@ -1238,6 +1238,40 @@ async fn on_inbound(
                 );
                 return;
             }
+            // R-23 request-token correlation. The replica's
+            // outstanding-request set tracks `(leader, request_id)`
+            // tuples for every SyncRequest the runtime has shipped.
+            // A response whose `request_id` is not in the set is
+            // stale (the replica timed out and re-issued) or
+            // forged (leader echoed a non-matching token). Drop
+            // without applying so a stale chunk can't land on the
+            // current request's apply path.
+            //
+            // Take FIRST, before the role / believed-leader gates,
+            // so a response that arrives while we're briefly out
+            // of `Replica` (role thrash, post-election) still
+            // consumes its outstanding-token entry. Pre-fix the
+            // role gate returned early without `take`, and the
+            // token sat in the per-leader set until TTL (30 s) —
+            // under role thrash the SOFT_CAP GC then dropped
+            // entries from OTHER leaders to make room, evicting
+            // legitimately in-flight tokens.
+            //
+            // Consuming a token in the dropped-response path is
+            // safe: request_ids are random 64-bit (collision
+            // negligible), so a subsequent re-issue uses a fresh
+            // id and the consumed entry isn't reachable.
+            {
+                let now = tokio::time::Instant::now().into_std();
+                if !outstanding.lock().take(from, msg.request_id, now) {
+                    tracing::trace!(
+                        from = from,
+                        request_id = msg.request_id,
+                        "replication: dropping SyncResponse with unknown request_id"
+                    );
+                    return;
+                }
+            }
             // SyncResponse is the state-mutating wire input — only
             // the believed leader is allowed to ship it. A peer that
             // is in the replica_set but is not the current leader
@@ -1265,25 +1299,6 @@ async fn on_inbound(
                     coordinator.role(),
                 );
                 return;
-            }
-            // R-23 request-token correlation. The replica's
-            // outstanding-request set tracks `(leader, request_id)`
-            // tuples for every SyncRequest the runtime has shipped.
-            // A response whose `request_id` is not in the set is
-            // stale (the replica timed out and re-issued) or
-            // forged (leader echoed a non-matching token). Drop
-            // without applying so a stale chunk can't land on the
-            // current request's apply path.
-            {
-                let now = tokio::time::Instant::now().into_std();
-                if !outstanding.lock().take(from, msg.request_id, now) {
-                    tracing::trace!(
-                        from = from,
-                        request_id = msg.request_id,
-                        "replication: dropping SyncResponse with unknown request_id"
-                    );
-                    return;
-                }
             }
             // Snapshot the pre-apply tail so the post-apply
             // result can be classified as "empty" (apply returned
