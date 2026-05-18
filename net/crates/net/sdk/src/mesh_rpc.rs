@@ -24,13 +24,14 @@ use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
 
 pub use net::adapter::net::cortex::{
-    RpcCallEvent, RpcCallStatus, RpcContext, RpcDirection, RpcHandler, RpcHandlerError,
-    RpcObserver, RpcObserverHandle, RpcResponsePayload, RpcResponseSink, RpcStatus,
-    RpcStreamingHandler, StreamItem,
+    RequestStream, RpcCallEvent, RpcCallStatus, RpcClientStreamingHandler, RpcContext,
+    RpcDirection, RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcObserver, RpcObserverHandle,
+    RpcResponsePayload, RpcResponseSink, RpcStatus, RpcStreamingContext, RpcStreamingHandler,
+    StreamItem,
 };
 pub use net::adapter::net::mesh_rpc::{
-    CallOptions, CodecDirection, RoutingPolicy, RpcError, RpcReply, RpcStream, ServeError,
-    ServeHandle,
+    CallOptions, ClientStreamCallRaw, CodecDirection, DuplexCallRaw, DuplexSink, DuplexStream,
+    RoutingPolicy, RpcError, RpcReply, RpcStream, ServeError, ServeHandle,
 };
 pub use net::adapter::net::mesh_rpc_metrics::{
     RpcMetricsSnapshot, ServiceMetrics, DEFAULT_LATENCY_BUCKETS_SECS,
@@ -512,6 +513,161 @@ impl Mesh {
             _resp: std::marker::PhantomData,
         })
     }
+
+    // ---- Client-streaming (raw + typed) — Phase C / E ----
+
+    /// Register a raw-bytes client-streaming RPC handler on
+    /// `service`. The handler receives the request stream (raw
+    /// chunk bodies) and returns one terminal response payload.
+    /// Wire codec is the user's concern; for typed handlers use
+    /// [`Self::serve_rpc_client_stream_typed`].
+    pub fn serve_rpc_client_stream<H: RpcClientStreamingHandler>(
+        &self,
+        service: &str,
+        handler: Arc<H>,
+    ) -> std::result::Result<ServeHandle, ServeError> {
+        self.auto_register_rpc_channels(service);
+        self.node().serve_rpc_client_stream(service, handler)
+    }
+
+    /// Direct-addressed raw client-streaming call. Returns a
+    /// [`ClientStreamCallRaw`] handle. Push chunks via `send`,
+    /// then `finish` to await the terminal RESPONSE.
+    pub async fn call_client_stream(
+        &self,
+        target_node_id: u64,
+        service: &str,
+        opts: CallOptions,
+    ) -> std::result::Result<ClientStreamCallRaw, RpcError> {
+        self.node().call_client_stream(target_node_id, service, opts).await
+    }
+
+    /// Register a typed client-streaming handler. Mirror of
+    /// [`Self::serve_rpc_typed`] for the multi-request shape.
+    /// Receives a [`RequestStreamTyped<Req>`] (auto-decodes each
+    /// inbound chunk via `codec`), returns one terminal `Resp`
+    /// (auto-encoded). `Err(String)` surfaces as
+    /// `RpcError::ServerError(Application(NRPC_TYPED_HANDLER_ERROR))`.
+    pub fn serve_rpc_client_stream_typed<Req, Resp, F, Fut>(
+        &self,
+        service: &str,
+        codec: Codec,
+        handler: F,
+    ) -> std::result::Result<ServeHandle, ServeError>
+    where
+        Req: DeserializeOwned + Send + Sync + Unpin + 'static,
+        Resp: Serialize + Send + Sync + 'static,
+        F: Fn(RequestStreamTyped<Req>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<Resp, String>> + Send + 'static,
+    {
+        let typed = TypedClientStreamingRpcHandler {
+            codec,
+            inner: Arc::new(handler),
+            _req: std::marker::PhantomData::<Req>,
+            _resp: std::marker::PhantomData::<Resp>,
+        };
+        self.auto_register_rpc_channels(service);
+        self.node().serve_rpc_client_stream(service, Arc::new(typed))
+    }
+
+    /// Direct-addressed typed client-streaming call. Returns a
+    /// [`ClientStreamCallTyped<Req, Resp>`] handle.
+    pub async fn call_client_stream_typed<Req, Resp>(
+        &self,
+        target_node_id: u64,
+        service: &str,
+        opts: CallOptionsTyped,
+    ) -> std::result::Result<ClientStreamCallTyped<Req, Resp>, RpcError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let inner = self.call_client_stream(target_node_id, service, opts.raw).await?;
+        Ok(ClientStreamCallTyped {
+            inner,
+            codec: opts.codec,
+            _req: std::marker::PhantomData,
+            _resp: std::marker::PhantomData,
+        })
+    }
+
+    // ---- Duplex (raw + typed) — Phase D / E ----
+
+    /// Register a raw-bytes duplex RPC handler on `service`. The
+    /// handler receives both a request stream AND a response sink
+    /// for emitting multi-fire response chunks. Returns `Ok(())`
+    /// to close cleanly; `Err(RpcHandlerError)` for failure
+    /// mapping. For typed handlers use [`Self::serve_rpc_duplex_typed`].
+    pub fn serve_rpc_duplex<H: RpcDuplexHandler>(
+        &self,
+        service: &str,
+        handler: Arc<H>,
+    ) -> std::result::Result<ServeHandle, ServeError> {
+        self.auto_register_rpc_channels(service);
+        self.node().serve_rpc_duplex(service, handler)
+    }
+
+    /// Direct-addressed raw duplex call. Returns a
+    /// [`DuplexCallRaw`] handle with both send and receive
+    /// surfaces. Use `into_split` to peel off the two halves.
+    pub async fn call_duplex(
+        &self,
+        target_node_id: u64,
+        service: &str,
+        opts: CallOptions,
+    ) -> std::result::Result<DuplexCallRaw, RpcError> {
+        self.node().call_duplex(target_node_id, service, opts).await
+    }
+
+    /// Register a typed duplex handler. Receives a
+    /// [`RequestStreamTyped<Req>`] (auto-decodes inbound chunks)
+    /// and a [`ResponseSinkTyped<Resp>`] (auto-encodes outbound
+    /// chunks). Returns `Ok(())` for clean close.
+    pub fn serve_rpc_duplex_typed<Req, Resp, F, Fut>(
+        &self,
+        service: &str,
+        codec: Codec,
+        handler: F,
+    ) -> std::result::Result<ServeHandle, ServeError>
+    where
+        Req: DeserializeOwned + Send + Sync + Unpin + 'static,
+        Resp: Serialize + Send + Sync + 'static,
+        F: Fn(RequestStreamTyped<Req>, ResponseSinkTyped<Resp>) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
+    {
+        let typed = TypedDuplexRpcHandler {
+            codec,
+            inner: Arc::new(handler),
+            _req: std::marker::PhantomData::<Req>,
+            _resp: std::marker::PhantomData::<Resp>,
+        };
+        self.auto_register_rpc_channels(service);
+        self.node().serve_rpc_duplex(service, Arc::new(typed))
+    }
+
+    /// Direct-addressed typed duplex call. Returns a
+    /// [`DuplexCallTyped<Req, Resp>`] handle.
+    pub async fn call_duplex_typed<Req, Resp>(
+        &self,
+        target_node_id: u64,
+        service: &str,
+        opts: CallOptionsTyped,
+    ) -> std::result::Result<DuplexCallTyped<Req, Resp>, RpcError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let inner = self.call_duplex(target_node_id, service, opts.raw).await?;
+        Ok(DuplexCallTyped {
+            inner,
+            codec: opts.codec,
+            _req: std::marker::PhantomData,
+            _resp: std::marker::PhantomData,
+        })
+    }
 }
 
 // ============================================================================
@@ -723,3 +879,469 @@ where
 // The `crate::mesh::Mesh` type holds `node: Arc<MeshNode>` (private).
 // We expose a `pub(crate) fn node(&self) -> &Arc<MeshNode>` accessor
 // on `Mesh` in the same commit so this module can delegate.
+
+// ============================================================================
+// Phase E — SDK veneer for client-streaming / duplex.
+//
+// Substrate types (RequestStream, ClientStreamCallRaw,
+// DuplexCallRaw, etc.) yield raw `Bytes`. The veneer wraps them in
+// typed primitives that auto-encode on send and auto-decode on
+// poll via a captured `Codec`. Adds zero new wire bits — every
+// frame on the wire is exactly what the substrate emits.
+//
+// `Chunk<T>` is the SDK-internal classification of inbound
+// request frames: `Init` for the first item (whose body came
+// from the initial REQUEST), `Data` for subsequent items (whose
+// bodies came from REQUEST_CHUNKs). Pure SDK abstraction — the
+// wire only knows flag bits.
+// ============================================================================
+
+/// SDK-internal classification of an inbound typed request frame.
+/// NOT a wire encoding — the wire stays flag-bit-tagged. The
+/// veneer constructs `Chunk<T>` values by tracking "have I seen
+/// the first item yet" on the substrate's `RequestStream`.
+///
+/// Users typically don't see this type — [`RequestStreamTyped<Req>`]
+/// yields the bare `Req` flattened. The opt-in
+/// [`ChunkedRequestStream<Req>`] (via
+/// [`RequestStreamTyped::into_chunked`]) exposes the
+/// distinction for callers that need it.
+///
+/// Bidi streaming plan (Phase E).
+#[derive(Debug, Clone)]
+pub enum Chunk<T> {
+    /// First decoded item on the request stream — corresponds to
+    /// the initial REQUEST's body.
+    Init(T),
+    /// Subsequent decoded item — corresponds to a REQUEST_CHUNK
+    /// body.
+    Data(T),
+}
+
+/// Typed counterpart of [`RequestStream`] for the **flattened**
+/// API. Yields `Req` (both `Init` and `Data` collapse to a bare
+/// `Req`); EOF when the substrate stream closes (REQUEST_END or
+/// CANCEL).
+///
+/// Decode failure terminates the stream with a single
+/// `Err(RpcError::Codec)` then closes — mirror of
+/// [`RpcStreamTyped`]'s contract on the response side.
+///
+/// For callers that need to distinguish "first request from this
+/// upload session" from "subsequent chunks" (sessions with
+/// explicit init handshake, rolling-window aggregation, etc.),
+/// call [`Self::into_chunked`] to get a [`ChunkedRequestStream<Req>`]
+/// instead.
+///
+/// Bidi streaming plan (Phase E).
+pub struct RequestStreamTyped<Req> {
+    inner: RequestStream,
+    codec: Codec,
+    done: bool,
+    _req: std::marker::PhantomData<fn() -> Req>,
+}
+
+impl<Req> RequestStreamTyped<Req> {
+    /// Convert this flattened stream into a [`ChunkedRequestStream<Req>`]
+    /// that distinguishes [`Chunk::Init`] from [`Chunk::Data`].
+    /// Same underlying substrate stream — no extra wire traffic,
+    /// no replay.
+    pub fn into_chunked(self) -> ChunkedRequestStream<Req> {
+        ChunkedRequestStream {
+            inner: self.inner,
+            codec: self.codec,
+            done: self.done,
+            seen_first: false,
+            _req: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<Req: DeserializeOwned + Unpin> futures::Stream for RequestStreamTyped<Req> {
+    type Item = std::result::Result<Req, RpcError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        let codec = self.codec;
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(bytes)) => match codec.decode::<Req>(&bytes) {
+                Ok(value) => std::task::Poll::Ready(Some(Ok(value))),
+                Err(e) => {
+                    self.done = true;
+                    std::task::Poll::Ready(Some(Err(RpcError::Codec {
+                        direction: CodecDirection::Decode,
+                        message: format!("typed request stream decode: {e}"),
+                    })))
+                }
+            },
+            std::task::Poll::Ready(None) => {
+                self.done = true;
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Opt-in variant of [`RequestStreamTyped`] that yields
+/// [`Chunk<Req>`] values, distinguishing the first request item
+/// ([`Chunk::Init`]) from subsequent items ([`Chunk::Data`]).
+/// EOF is signaled by the stream returning `None`, same as the
+/// flattened variant.
+///
+/// Bidi streaming plan (Phase E).
+pub struct ChunkedRequestStream<Req> {
+    inner: RequestStream,
+    codec: Codec,
+    done: bool,
+    seen_first: bool,
+    _req: std::marker::PhantomData<fn() -> Req>,
+}
+
+impl<Req: DeserializeOwned + Unpin> futures::Stream for ChunkedRequestStream<Req> {
+    type Item = std::result::Result<Chunk<Req>, RpcError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        let codec = self.codec;
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(bytes)) => match codec.decode::<Req>(&bytes) {
+                Ok(value) => {
+                    let chunk = if self.seen_first {
+                        Chunk::Data(value)
+                    } else {
+                        self.seen_first = true;
+                        Chunk::Init(value)
+                    };
+                    std::task::Poll::Ready(Some(Ok(chunk)))
+                }
+                Err(e) => {
+                    self.done = true;
+                    std::task::Poll::Ready(Some(Err(RpcError::Codec {
+                        direction: CodecDirection::Decode,
+                        message: format!("typed request stream decode: {e}"),
+                    })))
+                }
+            },
+            std::task::Poll::Ready(None) => {
+                self.done = true;
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Typed caller-side handle for a client-streaming call. Encodes
+/// each `send(&Req)` via the captured `Codec`; decodes the
+/// terminal RESPONSE body into `Resp` on `finish`.
+///
+/// Bidi streaming plan (Phase E).
+pub struct ClientStreamCallTyped<Req, Resp> {
+    inner: ClientStreamCallRaw,
+    codec: Codec,
+    _req: std::marker::PhantomData<fn(Req)>,
+    _resp: std::marker::PhantomData<fn() -> Resp>,
+}
+
+impl<Req: Serialize, Resp: DeserializeOwned> ClientStreamCallTyped<Req, Resp> {
+    /// Encode `value` via the captured codec and publish it as
+    /// the next REQUEST / REQUEST_CHUNK frame.
+    pub async fn send(&mut self, value: &Req) -> std::result::Result<(), RpcError> {
+        let bytes = self.codec.encode(value).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!("client stream typed encode: {e}"),
+        })?;
+        self.inner.send(Bytes::from(bytes)).await
+    }
+
+    /// Close the upload and await the typed terminal response.
+    pub async fn finish(self) -> std::result::Result<Resp, RpcError> {
+        let reply = self.inner.finish().await?;
+        self.codec.decode(&reply.body).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Decode,
+            message: format!("client stream typed decode: {e}"),
+        })
+    }
+
+    /// Server-assigned `call_id` of the underlying call.
+    pub fn call_id(&self) -> u64 {
+        self.inner.call_id()
+    }
+
+    /// Whether the upload side is flow-controlled.
+    pub fn flow_controlled(&self) -> bool {
+        self.inner.flow_controlled()
+    }
+}
+
+/// Typed caller-side handle for a duplex call. Combines a
+/// [`DuplexSinkTyped<Req>`] (upload) and [`DuplexStreamTyped<Resp>`]
+/// (download). For the "encoder task + decoder task" use case,
+/// call [`Self::into_split`] to peel off the two halves.
+///
+/// Bidi streaming plan (Phase E).
+pub struct DuplexCallTyped<Req, Resp> {
+    inner: DuplexCallRaw,
+    codec: Codec,
+    _req: std::marker::PhantomData<fn(Req)>,
+    _resp: std::marker::PhantomData<fn() -> Resp>,
+}
+
+impl<Req: Serialize, Resp: DeserializeOwned + Unpin> DuplexCallTyped<Req, Resp> {
+    /// Encode and publish one request frame.
+    pub async fn send(&mut self, value: &Req) -> std::result::Result<(), RpcError> {
+        let bytes = self.codec.encode(value).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!("duplex typed encode: {e}"),
+        })?;
+        self.inner.send(Bytes::from(bytes)).await
+    }
+
+    /// Close the upload direction. Response stream stays open.
+    pub async fn finish_sending(&mut self) -> std::result::Result<(), RpcError> {
+        self.inner.finish_sending().await
+    }
+
+    /// Server-assigned `call_id`.
+    pub fn call_id(&self) -> u64 {
+        self.inner.call_id()
+    }
+
+    /// Whether the upload side is flow-controlled.
+    pub fn flow_controlled(&self) -> bool {
+        self.inner.flow_controlled()
+    }
+
+    /// Split into independent typed halves. Both halves hold an
+    /// `Arc<DuplexInner>` (via the substrate types); CANCEL fires
+    /// only when BOTH halves drop without a clean close.
+    pub fn into_split(self) -> (DuplexSinkTyped<Req>, DuplexStreamTyped<Resp>) {
+        let (sink, stream) = self.inner.into_split();
+        (
+            DuplexSinkTyped {
+                inner: sink,
+                codec: self.codec,
+                _req: std::marker::PhantomData,
+            },
+            DuplexStreamTyped {
+                inner: stream,
+                codec: self.codec,
+                done: false,
+                _resp: std::marker::PhantomData,
+            },
+        )
+    }
+}
+
+impl<Req, Resp: DeserializeOwned + Unpin> futures::Stream for DuplexCallTyped<Req, Resp> {
+    type Item = std::result::Result<Resp, RpcError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let codec = self.codec;
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => match codec.decode::<Resp>(&bytes) {
+                Ok(value) => std::task::Poll::Ready(Some(Ok(value))),
+                Err(e) => std::task::Poll::Ready(Some(Err(RpcError::Codec {
+                    direction: CodecDirection::Decode,
+                    message: format!("duplex typed decode: {e}"),
+                }))),
+            },
+            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Typed send-half of a split duplex call.
+pub struct DuplexSinkTyped<Req> {
+    inner: DuplexSink,
+    codec: Codec,
+    _req: std::marker::PhantomData<fn(Req)>,
+}
+
+impl<Req: Serialize> DuplexSinkTyped<Req> {
+    /// Encode + send one request frame.
+    pub async fn send(&mut self, value: &Req) -> std::result::Result<(), RpcError> {
+        let bytes = self.codec.encode(value).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!("duplex typed encode: {e}"),
+        })?;
+        self.inner.send(Bytes::from(bytes)).await
+    }
+
+    /// Close the upload direction.
+    pub async fn finish_sending(self) -> std::result::Result<(), RpcError> {
+        self.inner.finish_sending().await
+    }
+
+    /// Server-assigned `call_id`.
+    pub fn call_id(&self) -> u64 {
+        self.inner.call_id()
+    }
+}
+
+/// Typed receive-half of a split duplex call. Implements
+/// `futures::Stream<Item = Result<Resp, RpcError>>`. Decode
+/// failure surfaces one `Err(RpcError::Codec)` then closes.
+pub struct DuplexStreamTyped<Resp> {
+    inner: DuplexStream,
+    codec: Codec,
+    done: bool,
+    _resp: std::marker::PhantomData<fn() -> Resp>,
+}
+
+impl<Resp> DuplexStreamTyped<Resp> {
+    /// Server-assigned `call_id`.
+    pub fn call_id(&self) -> u64 {
+        self.inner.call_id()
+    }
+}
+
+impl<Resp: DeserializeOwned + Unpin> futures::Stream for DuplexStreamTyped<Resp> {
+    type Item = std::result::Result<Resp, RpcError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        let codec = self.codec;
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => match codec.decode::<Resp>(&bytes) {
+                Ok(value) => std::task::Poll::Ready(Some(Ok(value))),
+                Err(e) => {
+                    self.done = true;
+                    std::task::Poll::Ready(Some(Err(RpcError::Codec {
+                        direction: CodecDirection::Decode,
+                        message: format!("duplex typed decode: {e}"),
+                    })))
+                }
+            },
+            std::task::Poll::Ready(Some(Err(e))) => {
+                self.done = true;
+                std::task::Poll::Ready(Some(Err(e)))
+            }
+            std::task::Poll::Ready(None) => {
+                self.done = true;
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+// ============================================================================
+// Internal: typed client-streaming-handler adapter.
+//
+// Bridges `Fn(RequestStreamTyped<Req>) -> Future<Result<Resp, String>>`
+// to the raw `RpcClientStreamingHandler` trait.
+// ============================================================================
+
+struct TypedClientStreamingRpcHandler<Req, Resp, F> {
+    codec: Codec,
+    inner: Arc<F>,
+    _req: std::marker::PhantomData<Req>,
+    _resp: std::marker::PhantomData<Resp>,
+}
+
+#[async_trait]
+impl<Req, Resp, F, Fut> RpcClientStreamingHandler for TypedClientStreamingRpcHandler<Req, Resp, F>
+where
+    Req: DeserializeOwned + Send + Sync + Unpin + 'static,
+    Resp: Serialize + Send + Sync + 'static,
+    F: Fn(RequestStreamTyped<Req>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::result::Result<Resp, String>> + Send + 'static,
+{
+    async fn call(
+        &self,
+        _ctx: RpcStreamingContext,
+        requests: RequestStream,
+    ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
+        let typed_requests = RequestStreamTyped {
+            inner: requests,
+            codec: self.codec,
+            done: false,
+            _req: std::marker::PhantomData,
+        };
+        let resp = (self.inner)(typed_requests)
+            .await
+            .map_err(|message| RpcHandlerError::Application {
+                code: NRPC_TYPED_HANDLER_ERROR,
+                message,
+            })?;
+        let body = self
+            .codec
+            .encode(&resp)
+            .map_err(|e| RpcHandlerError::Internal(format!("typed handler encode: {e}")))?;
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body,
+        })
+    }
+}
+
+// ============================================================================
+// Internal: typed duplex-handler adapter.
+//
+// Bridges `Fn(RequestStreamTyped<Req>, ResponseSinkTyped<Resp>) ->
+// Future<Result<(), String>>` to the raw `RpcDuplexHandler` trait.
+// ============================================================================
+
+struct TypedDuplexRpcHandler<Req, Resp, F> {
+    codec: Codec,
+    inner: Arc<F>,
+    _req: std::marker::PhantomData<Req>,
+    _resp: std::marker::PhantomData<Resp>,
+}
+
+#[async_trait]
+impl<Req, Resp, F, Fut> RpcDuplexHandler for TypedDuplexRpcHandler<Req, Resp, F>
+where
+    Req: DeserializeOwned + Send + Sync + Unpin + 'static,
+    Resp: Serialize + Send + Sync + 'static,
+    F: Fn(RequestStreamTyped<Req>, ResponseSinkTyped<Resp>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
+{
+    async fn call(
+        &self,
+        _ctx: RpcStreamingContext,
+        requests: RequestStream,
+        responses: RpcResponseSink,
+    ) -> std::result::Result<(), RpcHandlerError> {
+        let typed_requests = RequestStreamTyped {
+            inner: requests,
+            codec: self.codec,
+            done: false,
+            _req: std::marker::PhantomData,
+        };
+        let typed_sink = ResponseSinkTyped {
+            inner: responses,
+            codec: self.codec,
+            _resp: std::marker::PhantomData,
+        };
+        (self.inner)(typed_requests, typed_sink)
+            .await
+            .map_err(|message| RpcHandlerError::Application {
+                code: NRPC_TYPED_HANDLER_ERROR,
+                message,
+            })
+    }
+}
