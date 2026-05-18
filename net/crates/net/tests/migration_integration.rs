@@ -281,7 +281,11 @@ fn test_end_to_end_migration_local_source() {
 
     // Phase 3→4: Replay complete
     let cutover_msg = orch
-        .on_replay_complete(origin, replayed_through, make_link(origin, replayed_through))
+        .on_replay_complete(
+            origin,
+            replayed_through,
+            make_link(origin, replayed_through),
+        )
         .unwrap();
     match &cutover_msg {
         MigrationMessage::CutoverNotify { target_node, .. } => {
@@ -1483,7 +1487,8 @@ fn test_regression_on_replay_complete_third_party_orchestrator_no_local_daemon()
     let orch_node: u64 = 0xCCCC;
 
     let orch = MigrationOrchestrator::new(orch_reg.clone(), orch_node);
-    orch.start_migration(origin, orch_node, target_node).unwrap();
+    orch.start_migration(origin, orch_node, target_node)
+        .unwrap();
     orch.on_restore_complete(origin, 42).unwrap();
     assert_eq!(orch.status(origin), Some(MigrationPhase::Replay));
 
