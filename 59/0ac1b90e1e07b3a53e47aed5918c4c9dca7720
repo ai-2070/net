@@ -1,0 +1,22 @@
+net/crates/net/docs/misc/NRPC_BINDINGS_PLAN.md
+  s_906a82c67213dc::t_b0f52cf2959eef 48
+  s_906a82c67213dc::t_838c9bd38a5a7d 1,3-5,9-27
+  s_906a82c67213dc::t_5f1debb85afd0f 316
+  s_906a82c67213dc::t_b23a9107611b83 323-511,514-515,522-524,526-535
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "590ac1b90e1e07b3a53e47aed5918c4c9dca7720",
+  "prompts": {},
+  "sessions": {
+    "s_906a82c67213dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a83a8d29-a399-4785-986d-1bd45ba15ab6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
