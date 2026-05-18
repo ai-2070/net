@@ -250,13 +250,21 @@ impl MigrationSourceHandler {
                 // matching the attack shape the byte cap exists to
                 // bound against.
                 let event_bytes = event.payload.len();
+                let would_be_bytes = state.buffered_bytes.saturating_add(event_bytes);
                 if state.buffered_events.len() >= MAX_SOURCE_BUFFERED_EVENTS
-                    || state.buffered_bytes.saturating_add(event_bytes)
-                        > MAX_SOURCE_BUFFERED_BYTES
+                    || would_be_bytes > MAX_SOURCE_BUFFERED_BYTES
                 {
+                    // Report `would_be_bytes` (post-insert total)
+                    // rather than `buffered_bytes` (pre-insert). The
+                    // pre-insert value can read `< MAX` for a
+                    // `BufferFull` error, which confuses operator
+                    // dashboards interpreting the field as "the
+                    // size that exceeded the cap." Post-insert
+                    // matches the cap comparison and makes the
+                    // error self-explanatory.
                     return Err(MigrationError::BufferFull {
-                        events: state.buffered_events.len(),
-                        bytes: state.buffered_bytes,
+                        events: state.buffered_events.len().saturating_add(1),
+                        bytes: would_be_bytes,
                     });
                 }
                 state.last_buffered_seq = event.link.sequence;
