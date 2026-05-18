@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/redex/disk.rs
+  s_aa8bb6e2c88c9e::t_59fee31fd26225 1514
+net/crates/net/src/adapter/net/redex/manager.rs
+  s_aa8bb6e2c88c9e::t_b77b16d08608bb 742-761
+  s_aa8bb6e2c88c9e::t_85688e0ea40c82 876-917
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_aa8bb6e2c88c9e::t_f7ae380979325e 768-773,777
+  s_aa8bb6e2c88c9e::t_bd5e5ebcde8b32 788-799,804-808,812
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "e91d3207dd5ef3ffebbfefb842cdbb20c2926bf9",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
