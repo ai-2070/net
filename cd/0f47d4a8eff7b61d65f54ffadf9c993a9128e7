@@ -1,0 +1,21 @@
+net/crates/net/src/shard/mod.rs
+  s_f641e31a81af58::t_c8f52874008d76 719-725
+net/crates/net/src/event.rs
+  s_f641e31a81af58::t_e0456909fd3267 470-473
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "cd0f47d4a8eff7b61d65f54ffadf9c993a9128e7",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
