@@ -105,7 +105,21 @@ impl ChannelName {
             return Err(ChannelError::InvalidFormat("must not contain '//'".into()));
         }
         for ch in name.chars() {
-            if !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '/') {
+            // ASCII uppercase rejected to eliminate the split-
+            // namespace footgun: `foo.bar` and `FOO.BAR` would
+            // otherwise be distinct channels (different xxh3
+            // hashes, different registry entries, different ACL
+            // entries) and an operator who registered `prod.deploy`
+            // with strict caps would silently leave `Prod.deploy`
+            // unprotected. Mirror DNS / typical message-bus naming
+            // conventions: lowercase-only.
+            if ch.is_ascii_uppercase() {
+                return Err(ChannelError::InvalidFormat(format!(
+                    "uppercase character {:?} not allowed — channel names are lowercase only",
+                    ch
+                )));
+            }
+            if !matches!(ch, 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '/') {
                 return Err(ChannelError::InvalidChar(ch));
             }
         }
@@ -417,6 +431,32 @@ mod tests {
             ChannelName::new("has@symbol"),
             Err(ChannelError::InvalidChar('@'))
         );
+    }
+
+    /// Uppercase ASCII rejected. Pre-fix `foo.bar` and `FOO.BAR`
+    /// were distinct channels with distinct hashes; an operator
+    /// who registered `prod.deploy` with strict caps silently left
+    /// `Prod.deploy` unprotected. Mirror DNS / typical message-bus
+    /// naming: lowercase-only.
+    #[test]
+    fn rejects_ascii_uppercase() {
+        for n in [
+            "Foo",
+            "foo/Bar",
+            "FOO",
+            "prod.Deploy",
+            "Prod.deploy",
+            "a/B/c",
+        ] {
+            assert!(
+                matches!(ChannelName::new(n), Err(ChannelError::InvalidFormat(_))),
+                "uppercase variant {n:?} must be rejected",
+            );
+        }
+        // Lowercase + digits + permitted punctuation still accepted.
+        for n in ["foo", "foo/bar", "prod.deploy", "a-b_c.d", "v2/0"] {
+            assert!(ChannelName::new(n).is_ok(), "lowercase {n:?} must be accepted");
+        }
     }
 
     #[test]
