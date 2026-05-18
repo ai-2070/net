@@ -15,6 +15,15 @@ use super::registry::DaemonRegistry;
 use crate::adapter::net::state::causal::CausalEvent;
 use crate::adapter::net::state::snapshot::StateSnapshot;
 
+/// Maximum bytes of buffered events the source will hold per
+/// daemon before refusing further inserts with
+/// `MigrationError::BufferFull`. Mirrors the target's
+/// `MAX_PENDING_BUFFER_BYTES` (64 MiB).
+const MAX_SOURCE_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
+/// Companion event-count cap. Mirrors `MAX_BUFFERED_EVENTS` in
+/// the orchestrator's wire-decode path (1_000_000).
+const MAX_SOURCE_BUFFERED_EVENTS: usize = 1_000_000;
+
 /// Per-daemon source-side migration state.
 #[allow(dead_code)]
 struct SourceMigrationState {
@@ -217,6 +226,28 @@ impl MigrationSourceHandler {
             | MigrationPhase::Transfer
             | MigrationPhase::Restore
             | MigrationPhase::Replay => {
+                // Per-daemon byte + count cap. A stuck migration
+                // (target wedged in Restore/Replay because of an
+                // upstream stall) plus a high-volume daemon would
+                // otherwise grow the buffer without bound on the
+                // source side; the wire-decode cap downstream
+                // (MAX_BUFFERED_EVENTS) is post-encode and never
+                // sees this. Surface BufferFull so the orchestrator
+                // can abort cleanly rather than OOM the node.
+                let event_bytes = event.payload.len();
+                let used: usize = state
+                    .buffered_events
+                    .iter()
+                    .map(|e| e.payload.len())
+                    .sum();
+                if state.buffered_events.len() >= MAX_SOURCE_BUFFERED_EVENTS
+                    || used.saturating_add(event_bytes) > MAX_SOURCE_BUFFERED_BYTES
+                {
+                    return Err(MigrationError::BufferFull {
+                        events: state.buffered_events.len(),
+                        bytes: used,
+                    });
+                }
                 state.last_buffered_seq = event.link.sequence;
                 state.buffered_events.push(event);
                 Ok(true)

@@ -1357,6 +1357,21 @@ impl MigrationOrchestrator {
                 MigrationError::StateFailed("failed to parse snapshot bytes".into())
             })?;
 
+            // Cross-check the wire-supplied seq_through against the
+            // payload's snapshot.through_seq. Pre-fix a buggy or
+            // malicious source could ship a SnapshotReady whose wire
+            // seq_through disagreed with the snapshot's through_seq;
+            // the disagreement then propagated to the target where
+            // restore_snapshot consumed snapshot.through_seq for
+            // replayed_through but logs / retry decisions / audit
+            // used the wire field, producing a debugging trap.
+            if snapshot.through_seq != seq_through {
+                return Err(MigrationError::StateFailed(format!(
+                    "SnapshotReady: wire seq_through {} disagrees with snapshot.through_seq {}",
+                    seq_through, snapshot.through_seq,
+                )));
+            }
+
             if record.state.phase() == MigrationPhase::Snapshot {
                 record.state.set_snapshot(snapshot)?;
             }
