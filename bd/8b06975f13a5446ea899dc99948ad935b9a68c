@@ -1,0 +1,24 @@
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_18_CARRIED_FORWARD.md
+  s_392e1800b24d92::t_82def42d418caf 517
+  s_392e1800b24d92::t_fa54f7a04a57d5 741
+  s_392e1800b24d92::t_a3700087369d83 27-28
+  s_392e1800b24d92::t_1ea20192f43c1d 734
+  s_392e1800b24d92::t_6d89cbb593b6f1 518-559,561-592
+  s_392e1800b24d92::t_9ca6f12c972ac0 45-50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "bd8b06975f13a5446ea899dc99948ad935b9a68c",
+  "prompts": {},
+  "sessions": {
+    "s_392e1800b24d92": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "356f86ff-d39c-434b-a62b-7c07402d8769",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
