@@ -1,0 +1,29 @@
+net/crates/net/src/ffi/mesh.rs
+  s_f641e31a81af58::t_dd09c20f4b2a23 1969-1975,1977-1979
+net/crates/net/bindings/python/Cargo.toml
+  s_f641e31a81af58::t_6e332f7455905f 132-135
+net/crates/net/bindings/node/Cargo.toml
+  s_f641e31a81af58::t_4e22dcb53c4299 152-157
+net/crates/net/src/ffi/predicate.rs
+  s_f641e31a81af58::t_8cbe57ed64c63e 219-229
+net/crates/net/bindings/go/compute-ffi/Cargo.toml
+  s_f641e31a81af58::t_637433cb779f0e 67-70
+net/crates/net/bindings/go/rpc-ffi/Cargo.toml
+  s_f641e31a81af58::t_be0c210d0d4a7f 42-45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "4993c3f731322efbf9faa3904b167bf12638521a",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
