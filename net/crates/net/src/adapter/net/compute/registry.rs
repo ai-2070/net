@@ -143,12 +143,26 @@ impl DaemonRegistry {
     pub fn replace(&self, host: DaemonHost) {
         let origin_hash = host.origin_hash();
         let name = host.name().to_string();
-        self.daemons.insert(origin_hash, Arc::new(Mutex::new(host)));
-        // `replace` is the swap path used by group lifecycles
-        // (replica/fork/standby). Fire a `Registered` event for
-        // the new host; if there was a prior host at this slot,
-        // the caller is responsible for firing `Unregistered`
-        // first (the registry can't observe the swap mid-call).
+        // Read prior name (if any) before the insert so the
+        // Unregistered event we fire below carries the right
+        // identity. dashmap::insert returns the previous value
+        // atomically, so the fire order is guaranteed:
+        //   Unregistered(old_name) → Registered(new_name).
+        // Pre-fix replace() only fired Registered, leaving any
+        // DaemonLifecycleObserver that pairs Registered/Unregistered
+        // (operator audit log, MeshOS dashboard) leaking one entry
+        // per node-failure-recovery cycle.
+        let prior = self
+            .daemons
+            .insert(origin_hash, Arc::new(Mutex::new(host)));
+        if let Some(prior_arc) = prior {
+            let prior_name = prior_arc.lock().name().to_string();
+            self.fire(DaemonLifecycleEvent::Unregistered {
+                id: origin_hash,
+                name: prior_name,
+                at: Instant::now(),
+            });
+        }
         self.fire(DaemonLifecycleEvent::Registered {
             id: origin_hash,
             name,

@@ -482,10 +482,26 @@ impl MeshOsLoop {
         // defeated: post-restart admin_audit_seq / log_seq /
         // failure_seq start back at 1 and pass the consumer's dedup
         // gate as "already seen," silently filtering valid post-
-        // restart audit records. rand::random() has a 2⁻⁶⁴
-        // collision probability across all process restarts in the
-        // fleet.
-        let runtime_epoch_id: u64 = rand::random();
+        // restart audit records. A `getrandom::fill` u64 has a
+        // 2⁻⁶⁴ collision probability across all process restarts
+        // in the fleet. The fallback path on a getrandom failure
+        // preserves the prior (epoch ^ counter) shape so the SDK
+        // gate still gets a non-zero stamp under the (extremely
+        // rare) getrandom failure mode rather than panicking
+        // through the substrate's loop construction.
+        let runtime_epoch_id: u64 = {
+            let mut buf = [0u8; 8];
+            if getrandom::fill(&mut buf).is_ok() {
+                u64::from_le_bytes(buf)
+            } else {
+                static RUNTIME_EPOCH_COUNTER: AtomicU64 = AtomicU64::new(1);
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0)
+                    ^ RUNTIME_EPOCH_COUNTER.fetch_add(1, Ordering::SeqCst)
+            }
+        };
         let initial_snapshot = MeshOsSnapshot {
             runtime_epoch_id,
             ..Default::default()

@@ -129,7 +129,7 @@ impl ForkGroup {
             // Create daemon host with the forked chain
             let daemon = daemon_factory();
             let host =
-                DaemonHost::from_fork(daemon, keypair, chain_builder, config.host_config.clone());
+                DaemonHost::from_fork(daemon, keypair, chain_builder, config.host_config.clone())?;
             registry.register(host)?;
 
             coord.add_member(MemberInfo {
@@ -205,7 +205,7 @@ impl ForkGroup {
                     keypair,
                     chain_builder,
                     self.config.host_config.clone(),
-                );
+                )?;
                 registry.register(host)?;
 
                 self.coord.add_member(MemberInfo {
@@ -345,7 +345,7 @@ impl ForkGroup {
                 keypair,
                 chain_builder,
                 self.config.host_config.clone(),
-            );
+            )?;
             registry.replace(host);
 
             self.coord
@@ -430,7 +430,7 @@ impl ForkGroup {
 
             let daemon = daemon_factory();
             let host =
-                DaemonHost::from_fork(daemon, keypair, chain_builder, config.host_config.clone());
+                DaemonHost::from_fork(daemon, keypair, chain_builder, config.host_config.clone())?;
             registry.register(host)?;
 
             coord.add_member(MemberInfo {
@@ -520,7 +520,7 @@ impl ForkGroup {
                     keypair,
                     chain_builder,
                     self.config.host_config.clone(),
-                );
+                )?;
                 registry.register(host)?;
 
                 self.coord.add_member(MemberInfo {
@@ -646,7 +646,7 @@ impl ForkGroup {
                 keypair,
                 chain_builder,
                 self.config.host_config.clone(),
-            );
+            )?;
             registry.replace(host);
 
             self.coord

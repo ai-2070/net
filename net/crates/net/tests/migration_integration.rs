@@ -2031,10 +2031,11 @@ fn test_gap_promote_no_healthy_standbys() {
     assert_eq!(err, GroupError::NoHealthyMember);
 }
 
-/// Gap 3: DaemonHost::from_fork panics on origin mismatch.
+/// Gap 3: DaemonHost::from_fork returns Err on origin mismatch.
+/// Was a panic via assert_eq! pre-fix; now a typed RestoreFailed
+/// so SDK/FFI consumers can't UB-panic across the boundary.
 #[test]
-#[should_panic(expected = "fork chain origin")]
-fn test_gap_from_fork_origin_mismatch_panics() {
+fn test_gap_from_fork_origin_mismatch_returns_err() {
     use net::adapter::net::state::causal::CausalChainBuilder;
 
     let keypair_a = EntityKeypair::generate();
@@ -2056,13 +2057,14 @@ fn test_gap_from_fork_origin_mismatch_panics() {
         }
     }
 
-    // Pass keypair_b but chain for keypair_a — should panic
-    let _host = DaemonHost::from_fork(
+    // Pass keypair_b but chain for keypair_a — should return Err
+    let result = DaemonHost::from_fork(
         Box::new(NoopDaemon),
         keypair_b,
         chain,
         DaemonHostConfig::default(),
     );
+    assert!(matches!(result, Err(DaemonError::RestoreFailed(_))));
 }
 
 /// Gap 4: Reassembler with mismatched total_chunks across chunks.
