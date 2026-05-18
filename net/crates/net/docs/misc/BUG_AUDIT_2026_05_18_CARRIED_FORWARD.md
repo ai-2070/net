@@ -800,3 +800,296 @@ per-module sequences (D-16 → D-17, X-18 → X-19, O-20 → O-21, R-39 → R-40
 - **Dep audit** — `cargo-audit` / `cargo-machete` / `cargo-deny` / `cargo-udeps` not installed.
 - **Adjacent surfaces not reviewed this round:** `src/adapter/net/contested/`, `src/adapter/net/continuity/`, `src/adapter/net/cortex/` (re-review post-fixes), `src/adapter/net/identity/`, `src/adapter/net/subnet/`, `src/adapter/net/state/`, `src/adapter/net/traversal/`. Each is a candidate for a follow-up. **The subprotocol-binding sweep recommended on the prior pass is now complete** — see the "Sixth pass — targeted subprotocol sweep" section. Three new bugs (S-1, S-2, S-3) plus two follow-up audit areas (queue-to-application consumers; sequential-nonce pattern reuse) came out of it.
 - **`src/adapter/net/behavior/meshdb/`** is now partially covered (MD-1, MD-2, MD-3). The planner / federated executor / cache layer received targeted reads; full module sweep — including `executor.rs` plan execution, `transport.rs` framing, `row.rs` predicate walking, and the `query.rs` request/response surface — is still owed.
+
+---
+
+## Fix status (post-audit)
+
+Substantial fix sprint on `bugfixes-15` — 29 commits, ~60 of ~70 findings
+landed. Heavy wire-protocol bundles and architectural-decision items
+deferred to dedicated follow-up sessions, each documented with the
+options considered and the recommended path.
+
+### Fixed (✅)
+
+| ID | Title | Commit |
+|---|---|---|
+| A-5 | Move capability strip below the forward block | `7428ab5d` |
+| D-1 | Close GC-sweep TOCTOU on the blob refcount table | `93448488` |
+| D-2 | Guard MeshBlobAdapter::fetch_range against u64→usize truncation | `b27f37cd` |
+| D-4 | Floor overflow disk gate at chunk size | `c19c7a57` |
+| D-5 | Cap fetch Manifest at 256 MiB | `c19c7a57` |
+| D-6 | store_stream cap at BLOB_REF_MAX_SIZE | `5474b551` |
+| D-7 | NaN-safe disk ratio in blob metrics | `5474b551` |
+| D-8 | parse_blob_heat_tag rejects mixed-case hex | `5474b551` |
+| D-9 | Verified clean (lock ordering already consistent) | `fde332ed` |
+| D-10 | BlobAdapterRegistry::drain — clear path for the global singleton | `fde332ed` |
+| D-11 | Validate BlobRef::Manifest chunk sizes match the substrate stride | `e7d39de7` |
+| D-12 | GreedyCacheRegistry::next_lru_pos saturation guard | `5474b551` |
+| D-13 | HeatRegistry::tick prune uses `<= 0.0` for f64 robustness | `5474b551` |
+| D-14 | Skip top-level verify for Manifest in resolve_payload | `0bee736d` |
+| D-15 | Unlink the persistent segment dir on blob GC sweep | `e91d3207` |
+| D-18 | Slice URI sanitizer on a char boundary in fs blob adapter | `2a64931e` |
+| MD-1 | Bound federated drain_rows | `2e6d93e0` |
+| MD-2 | Reject saturating window sizes | `2e6d93e0` |
+| O-1 | Random epoch_id via getrandom | `0dd50356` / `0fab8284` |
+| O-2 | Plumb this_node into the SDK metadata view | `0dd50356` |
+| O-3 | Biased select in MeshOsLoop::run (tick first) | `f945180d` |
+| O-7 | Push to recent_emissions only on try_send success | `f945180d` |
+| O-8 | Atomic ReplicaBecameHolderAndLeader pair | `f945180d` |
+| O-9 | Verified not-a-bug — 1-second window matches `drain_rate_per_zone_per_sec` semantic; see deferred section for documentation note | (no commit) |
+| O-17 | Cap verify_bundle signature count | `3075f97a` |
+| O-19 | Clamp BufferingActionChainAppender capacity at 1 | `ca1e744a` |
+| O-20 | Saturating admin_audit_seq / log_seq | `ca1e744a` |
+| O-21 | Drive cluster-backpressure release on idle | `b6f8566b` |
+| O-22 | Tighten maintenance is_valid_successor (match-table) | `35105495` |
+| O-23 | Tokio-clock executor (std::Instant → tokio's via into_std) | `35105495` |
+| O-24 | Early-exit graceful_shutdown via registry poll | `35105495` |
+| O-25 | release_failed_admit refreshes cluster backpressure | `b6f8566b` |
+| R-26 | Wire record_tail_seq into runtime apply + tick | `bc7837b3` |
+| R-27 | Refund BandwidthBudget on send failure | `bc7837b3` |
+| R-29 | Dedupe replica_set iteration at heartbeat emit | `bc7837b3` |
+| R-32 | Close ReplicationMetrics::for_channel TOCTOU on cap probe | `72d020ab` |
+| R-33 | replication wire decode checked_add | `bc7837b3` |
+| R-34 | catchup acc saturating_add for symmetry | `bc7837b3` |
+| R-35 | tokio::time::Instant inside virtualized runtime loop | `bc7837b3` |
+| R-36 | Only JoinHandle holder flips `stopped` | `bc7837b3` |
+| R-37 | Drop uses try_lock for deadlock safety | `bc7837b3` |
+| R-38 | LeaderDiskPressureWithdraw / CandidateDiskPressureWithdraw signals | `bc7837b3` |
+| R-39 | HeartbeatTracker keeps lex-smallest Leader claimant | `bc7837b3` |
+| X-2 | replay_events phase guard | `05f7a2f6` |
+| X-3 | MigrationSourceHandler::cleanup phase guard | `05f7a2f6` |
+| X-4 | Fire Unregistered on registry.replace | `0fab8284` |
+| X-5 | DaemonHost::from_fork returns Result instead of panic | `0fab8284` |
+| X-6 | Hoist migration subprotocol tag string | `848ef03c` |
+| X-7 | Drop dead old_origin_hash lookup with .unwrap() | `848ef03c` |
+| X-8 | Reorder reassembler sweep after structural validation | `848ef03c` |
+| X-9 | Bound MigrationTargetHandler::pending_events (64 MiB / 1M events) | `d8e7bd4f` |
+| X-10 | Validate SnapshotReady seq_through against snapshot.through_seq | `640f160c` |
+| X-11 | Cap source buffered events (64 MiB / 1M events) | `640f160c` |
+| X-12 | Saturating elapsed_ms in list_migrations | `848ef03c` |
+| X-14 | let-else+break guard in ReplicaGroup::scale_to | `ca6b21a1` |
+| X-15 | Delete dead TargetMigrationState.target_head field | `ca6b21a1` |
+| X-16 | Score local through PlacementFilter before LocalPreferred | `0bcc58d1` |
+| X-22 | on_replay_complete returns StateFailed instead of synthesizing parent_hash:0 | `848ef03c` |
+
+**Total: 58 fixes, 29 commits.** Every commit is independently reviewable, isolated to one logical change (some bundle two or three related lows), and includes regression tests where a unit-test-scale assertion was meaningful.
+
+### Deferred — wire-protocol bundles
+
+Each needs a dedicated focused session — wire-format changes plus
+coordinated rollout planning:
+
+| Bundle | Components | Why bundled |
+|---|---|---|
+| Replication peer auth | R-20, R-21, R-22, R-23, R-24, R-40 | All touch the on_inbound dispatch + SyncRequest/Response/Nack wire shape. R-22's heartbeat split (`durable_seq` / `applied_seq`), R-23's request token, R-40's `leader_first_retained_seq` field, and R-21's `PeerLeaderObserved` signal all want to land in one coordinated wire-version bump. R-20's `from_node` binding is pure addition but the test surface overlaps. |
+| StandbyGroup fencing | X-1, X-19 | X-1 introduces `term: u64` plumbed through DaemonHost + event routing; X-19's partial-sync replay filter lives in the same StandbyGroup::promote path and the regression test for X-1's epoch token should also cover X-19's replay-cursor. |
+| Migration dispatch binding | X-18 | Mechanical (record orchestrator_node at TakeSnapshot, verify on every later arm) but needs full regression coverage across ActivateTarget / CleanupComplete / MigrationFailed / SnapshotReady. Standalone commit, but expects a real test for forged ActivateTarget from a non-orchestrator peer. |
+| Rendezvous + membership binding | S-1, S-2, S-3 | All in `mesh.rs` rendezvous/membership dispatch. S-3 also swaps the membership-Ack nonce generator to random; that's an internal change with no wire impact. The three fixes share regression-test setup. |
+| nRPC binding + random call_id | S-4 | Three sub-changes: random `rpc_next_call_id`, `(call_id, expected_target_node)` tuple in `RpcClientPending`, default reply channel ACL tightened. The peer-binding mirrors `behavior/meshdb/transport.rs:323` exactly. |
+| Replication availability hardening | R-25, R-28 | R-25 priority lane (split inbox into high/low + biased select); R-28 catchup backoff (per-leader consecutive-empty counter). Both improve availability under flaky-link conditions; share the runtime hot path. |
+| Heat emission ordering | D-17 | Refactor: split `HeatRegistry::tick` into candidate + commit; thread sink `Result` back through. Mirror in `BlobHeatRegistry`. Pure-internal but the test fixtures need updating. |
+| Cleanup wire change | R-30 | Drop `wall_clock_ms` from SyncHeartbeat (currently collected but never used). Pure wire-shrink; coordinate with the R-20..R-24 wire-version bump. |
+
+### Deferred — design-decision items
+
+Each needs a deliberate choice between competing options before the
+right code lands. Recommendations are based on the audit + existing
+test surface; the team should confirm before implementation.
+
+#### R-31 — Coordinator state rollback on `* → Idle` sink failure
+
+Three options:
+
+- **A. Roll back state on sink failure.** Breaks the existing
+  `tag_sink_failure_surfaces_but_state_mutated` test (which pins the
+  current behavior deliberately). New question: concurrent
+  transitions during the rollback window.
+- **B. Background retry queue tied to coordinator lifetime.** Breaks
+  the "Idle doesn't drive heartbeats" invariant. Requires a new
+  lifecycle owner for the retry task.
+- **C. Document the divergence window + add a metric.**
+  `divergence_window_total` counter; re-attempt the announce on the
+  next transition_to call; document the expected upper bound.
+  Accepts current behavior; makes it observable.
+
+**Recommendation: C.** The pinning test signals the team chose
+fail-fast at the sink boundary. The fix is operational visibility,
+not code.
+
+#### D-3 — Symlink-swap window between canonicalize and rename
+
+Three options:
+
+- **A. `rustix` + `openat2(... RESOLVE_BENEATH)`.** Linux 5.6+
+  only. Adds a build dep. Doesn't help on Windows or macOS.
+- **B. Cross-platform dev/inode verify around the rename.** Open
+  parent as `File`, read `metadata()` before/after, abort on
+  `dev`/`ino` mismatch. Windows needs `FILE_ID_INFO` via
+  `GetFileInformationByHandleEx`. More code; race narrows but
+  doesn't close (rename resolves `path` independently of the open
+  parent fd).
+- **C. Document the threat model.** "FS adapter assumes root dir
+  is not writable by non-substrate processes; enforce via
+  filesystem perms." Standard ops pattern: `chown` root to the
+  daemon user.
+
+**Recommendation: C.** Deployment already requires exclusive root
+ownership in practice. Document the contract explicitly. Reach for
+A if cross-process write access becomes a real concern.
+
+#### X-13 — Failed placements retry on different-node recovery
+
+Four options:
+
+- **A. Extend `on_node_recovery` signature.** Add `&Scheduler` +
+  `&dyn Fn() -> Box<dyn MeshDaemon>`. Breaking change across all
+  callers; recovery logic at the right boundary.
+- **B. New `retry_failed_placements` per group.** Caller invokes.
+  Pure addition; no API break. Caller must know to call it.
+- **C. Periodic tick from meshos loop.** Meshos already owns the
+  reconcile tick; piggyback. Groups expose
+  `has_unhealthy_slots() -> bool` and `try_recover(scheduler)`.
+  Decouples timer from group type.
+- **D. Defer `mark_unhealthy` until after successful placement.**
+  Avoids stuck-unhealthy state but routes go to a dead daemon
+  during the placement attempt window.
+
+**Recommendation: C.** Meshos loop already owns the recovery
+cadence; scheduler is available via SchedulerRegistry.
+
+#### X-17 — Multi-chunk validation symmetry
+
+Three options:
+
+- **A. Drop validation on single-chunk to match multi-chunk.**
+  Loses defense-in-depth; achieves symmetry by making the system
+  weaker.
+- **B. Reassemble at the orchestrator for multi-chunk.** Heavy.
+  Forces orchestrator-side buffering it deliberately doesn't do.
+- **C. Extract `validate_chunk_header(chunk, record)` helper.**
+  Validate per-chunk envelope (magic, version, source identity
+  claim) without needing full snapshot. Call on every chunk
+  regardless of count.
+
+**Recommendation: C.** Per-chunk envelope is small; keeps
+streaming property while closing asymmetry. Composes with X-10.
+
+#### X-20 — Delete dead `MigrationOrchestrator::buffer_event`
+
+Two options:
+
+- **A. Delete the dead surface entirely.** Removes
+  `MigrationOrchestrator::buffer_event`,
+  `MigrationState::{buffer_event, take_buffered_events, buffered_events}`,
+  `BufferOutcome` enum, and the tests that exercise them. Have
+  `on_restore_complete` ship an empty `BufferedEvents`. Significant
+  test churn; trip-wire is gone.
+- **B. Redirect to `source_handler.buffer_event`.** Preserves the
+  public API; eliminates duplicate-delivery by routing both
+  surfaces into one buffer.
+
+**Recommendation: A.** The dead surface IS the trip-wire — keeping
+it (even redirected) preserves a misleading API shape.
+
+#### X-21 — LocalPreferred liveness in `Scheduler::place`
+
+Three options:
+
+- **A. `local_drained: AtomicBool` on `Scheduler`.** Folds
+  lifecycle state into a stateless component.
+- **B. Pull from `MeshOsState::local_maintenance`.** Cross-layer
+  dep: scheduler depends on meshos types.
+- **C. New `place_with_locality(filter, drained: bool)` method.**
+  Caller supplies the answer. Scheduler stays stateless.
+
+**Recommendation: C.** Keeps layering clean — scheduler stays a
+capability-index helper; meshos loop (which knows about
+maintenance state) supplies the bit.
+
+#### O-4 + O-5 — Audit-chain durability ordering
+
+Three options:
+
+- **A. Pending+Outcome chain records.** Append `Pending` before
+  dispatch, `Outcome` after. Doubles chain volume; consumers
+  reconcile pairs.
+- **B. Ring-first then chain.** Push to ring, attempt chain
+  append, mark ring entry `chain_pending: bool` on failure. Chain
+  is durable subset; ring is immediate truth.
+- **C. Accept the gap + surface a metric.**
+  `audit_chain_append_failed_total` counter, document loudly.
+
+**Recommendation:**
+- **O-4 (executor): C.** Dispatch happened; chain miss is a
+  bookkeeping gap, not a correctness gap. Surface the metric, log
+  loudly.
+- **O-5 (audit/log): B.** Ring is the immediate user surface,
+  chain is durability backup. Ring-first matches user expectation;
+  `chain_pending` makes the gap visible.
+
+#### O-9 — `gc_drain_window` 1-second hardcode (not a bug)
+
+**Verified not a bug.** The 1-second window IS the natural
+denominator for `BackpressureConfig::drain_rate_per_zone_per_sec`.
+The rate is defined as "per second"; the window must match the
+definition. Changing the window requires redefining the rate
+semantic.
+
+**Recommendation: Document, don't fix.** Code comment: "1-second
+window is by definition the denominator of
+`drain_rate_per_zone_per_sec`; the hardcode here matches the
+config field's name." If operator-tunable drain windows are ever
+wanted, add a separate `drain_window_duration: Duration` field
+rather than reinterpreting the existing rate.
+
+### Deferred — remaining lows (low impact, defer to follow-up cleanup commit)
+
+- **O-6** — `Defer` re-queue never emits a chain record. Subsumes
+  cleanly under O-4's audit-chain ordering decision.
+- **O-10** — `BackoffTracker::observe_crash` window-slide
+  non-monotonic on out-of-order crashes. Reachable only under
+  clock-skew or test fixture seeding.
+- **O-11** — `MaintenanceState::EnteringMaintenance.deadline`
+  wall-clock pre-first-tick fallback. Cosmetic; first tick
+  recomputes.
+- **O-12** — `emit_maintenance_transitions` skips when
+  `control_sink` wired late. Initialization-order edge.
+- **O-13** — `release_failed_admit` for `PullReplica` clears chain
+  stabilization even when a sibling holds it. Bounded by
+  `pull_cooldown` recovery.
+- **O-14** — `MigrationSnapshotSource::list()` called inside the
+  loop hot path; slow source stalls reconcile. Architectural —
+  needs a snapshot-source async interface.
+- **O-15** — `last_pull_admitted_by` rollback only clears
+  most-recent slot. Verified correct under cooldown semantics; no
+  fix needed (audit may have over-flagged).
+- **O-16** — `WIRE_FORMAT_VERSION = 1` with no migration path
+  documented. Pure documentation.
+- **O-18** — `AdminVerifier::verify_commit` drops the `ice_state`
+  mutex between `check_ice_cooldown` and `record_ice_cooldown`.
+  Not reachable today (single-task verifier path).
+- **D-16** — `MeshBlobAdapter::fetch_range` on Small reads the
+  entire chunk before slicing. Needs a seek-based
+  `RedexFile::read_at(offset, len)` primitive; not exposed today.
+
+### Phase coverage status
+
+- **Phase 2** (Miri / ASan / TSan / fuzz): still skipped; existing
+  `fuzz/fuzz_targets/` is wired.
+- **Cross-language conformance (Phase 4):** Rust/TS/Py/Go SDK
+  round-trip property tests not started.
+- **Dep audit:** `cargo-audit` / `cargo-machete` / `cargo-deny` /
+  `cargo-udeps` not installed.
+
+### Verdict
+
+The `bugfixes-15` branch is in substantially better shape after the
+fix sprint. Major DoS surfaces (X-9 wire-reachable OOM, D-11
+manifest panic, D-18 UTF-8 panic, MD-1 federated drain, O-21 silent
+throttle), data-loss surfaces (D-1 sweep TOCTOU, X-2/X-3 migration
+phase guards), and dozens of correctness / observability gaps are
+closed. Remaining heavy work — replication peer auth bundle,
+StandbyGroup fencing, migration / rendezvous / membership / nRPC
+binding — is documented above with the recommended approach for
+each; each item is a focused-session task.
