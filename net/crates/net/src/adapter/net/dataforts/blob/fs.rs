@@ -114,10 +114,18 @@ fn backend(e: impl std::fmt::Display) -> BlobError {
 /// and `0x7F`) escape to `\xNN`, length caps at 256 bytes.
 fn sanitize_uri_for_error(uri: &str) -> String {
     const MAX_LEN: usize = 256;
-    let trimmed = if uri.len() > MAX_LEN {
-        &uri[..MAX_LEN]
+    // Slice on a char boundary — a publisher-supplied URI that's
+    // valid UTF-8 can still have a multi-byte codepoint straddling
+    // byte 256; `&uri[..MAX_LEN]` would panic mid-codepoint and crash
+    // inside `spawn_blocking`.
+    let (trimmed, truncated) = if uri.len() > MAX_LEN {
+        let cut = (0..=MAX_LEN)
+            .rev()
+            .find(|&i| uri.is_char_boundary(i))
+            .unwrap_or(0);
+        (&uri[..cut], true)
     } else {
-        uri
+        (uri, false)
     };
     let mut out = String::with_capacity(trimmed.len());
     for c in trimmed.chars() {
@@ -127,7 +135,7 @@ fn sanitize_uri_for_error(uri: &str) -> String {
             out.push(c);
         }
     }
-    if uri.len() > MAX_LEN {
+    if truncated {
         out.push('…');
     }
     out
@@ -508,6 +516,30 @@ impl BlobAdapter for FileSystemAdapter {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// `sanitize_uri_for_error` is called from error paths inside
+    /// `spawn_blocking`. A publisher-controlled URI with a multi-byte
+    /// UTF-8 codepoint straddling the truncation boundary must NOT
+    /// panic — the previous byte-slice formulation crashed the
+    /// blocking task and surfaced as a `JoinError` on the caller.
+    #[test]
+    fn sanitize_uri_handles_multibyte_at_boundary() {
+        // 255 ASCII bytes followed by a 4-byte UTF-8 codepoint — the
+        // emoji's first byte lands at index 255, its last at 258, so
+        // a byte slice at index 256 would split the codepoint.
+        let uri = format!("{}{}", "a".repeat(255), "🦀");
+        let out = sanitize_uri_for_error(&uri);
+        // Must not panic, and must end with the truncation marker
+        // since the input exceeded MAX_LEN.
+        assert!(out.ends_with('…'), "expected truncation marker, got {:?}", out);
+    }
+
+    #[test]
+    fn sanitize_uri_preserves_short_input() {
+        let uri = "file:///🦀/path";
+        let out = sanitize_uri_for_error(uri);
+        assert_eq!(out, uri);
+    }
 
     fn unique_root() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
