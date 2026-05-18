@@ -130,6 +130,12 @@ fn verify_manifest_chunks(
         // so this branch is unreachable in production. Guard
         // anyway for forward-compat with new BlobRef variants.
         BlobRef::Small { .. } => return Ok(()),
+        // Tree blobs verify per-chunk during the tree walk
+        // (A4 `TreeWalker`); the flat-buffer verifier here
+        // doesn't apply. Return Ok so the caller's reassembly
+        // path is uniform; the tree walk is the authoritative
+        // verifier for Tree blobs.
+        BlobRef::Tree { .. } => return Ok(()),
     };
     let total: u64 = chunks.iter().map(|c| c.size as u64).sum();
     if total != fetched.len() as u64 {

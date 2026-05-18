@@ -15,6 +15,7 @@
 pub mod adapter;
 pub mod admission;
 pub mod blob_ref;
+pub mod blob_tree;
 pub mod conformance;
 pub mod dispatch;
 pub mod error;

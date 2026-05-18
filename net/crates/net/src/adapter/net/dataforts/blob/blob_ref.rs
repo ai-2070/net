@@ -72,6 +72,30 @@ pub const BLOB_REF_VERSION_V1: u8 = 0x01;
 /// independently via [`BLOB_MANIFEST_BODY_VERSION`].
 pub const BLOB_REF_VERSION_V2_MANIFEST: u8 = 0x02;
 
+/// `BlobRef::Tree` wire-encoding version. Lands in v0.3 alongside
+/// the hierarchical-manifest terabyte-scale track. Tree body
+/// schema evolves independently via [`BLOB_TREE_BODY_VERSION`].
+pub const BLOB_REF_VERSION_V3_TREE: u8 = 0x03;
+
+/// Inner-version prefix on the postcard-encoded tree body. Bumps
+/// independently of the outer wire discriminator
+/// ([`BLOB_REF_VERSION_V3_TREE`]) so the tree body schema can
+/// evolve without re-cutting the outer version space.
+pub const BLOB_TREE_BODY_VERSION: u8 = 0x01;
+
+/// Hard ceiling on the postcard-encoded `BlobRef::Tree` body.
+/// Tree bodies are tiny by design (a few hashes + ints), so a
+/// 1 KiB cap is generous and bounds the decoder's allocator
+/// before per-field validation runs.
+pub const BLOB_REF_TREE_BODY_MAX_BYTES: usize = 1024;
+
+/// Hard ceiling on `BlobRef::Tree::total_size`. Equals the
+/// fanout 128 + depth 4 + 4 MiB chunk maximum: 128 × 128 × 128
+/// × 128 × 4 MiB = 128 PiB = 2^57 bytes. Bounded so a malicious
+/// or buggy publisher can't stamp `total_size = u64::MAX` and
+/// propagate it into `Vec::with_capacity` allocations downstream.
+pub const BLOB_TREE_MAX_TOTAL_SIZE: u64 = 128 * (1u64 << 50);
+
 /// Inner-version prefix on the postcard-encoded manifest body. Bumps
 /// independently of the outer wire discriminator
 /// ([`BLOB_REF_VERSION_V2_MANIFEST`]) so the manifest schema can
@@ -156,6 +180,40 @@ pub struct ChunkRef {
     pub size: u32,
 }
 
+/// Postcard-encoded tree body. Lives inside the
+/// [`BlobRef::Tree`] wire form after the four-byte magic +
+/// version discriminator. The body itself is tiny — fixed-size
+/// fields only; no embedded chunk list (the chunks live at the
+/// referenced [`TreeNode`](super::blob_tree::TreeNode) leaves).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TreeBody {
+    /// Body schema version; bumps independently of the outer
+    /// `BlobRef::Tree` discriminant.
+    body_version: u8,
+    /// Adapter-routed URI. For the mesh-native path this is
+    /// `mesh://<hex-of-root_hash>`; external adapters use their
+    /// own scheme.
+    uri: String,
+    /// Replication / erasure encoding for the chunks. Tree
+    /// inherits the same enum surface as Manifest.
+    encoding: Encoding,
+    /// BLAKE3 hash of the root
+    /// [`TreeNode`](super::blob_tree::TreeNode) body. The
+    /// substrate fetches the root, verifies its bytes hash to
+    /// this value, then walks down.
+    root_hash: [u8; 32],
+    /// Total reconstructed payload size in bytes. The decoder
+    /// trusts this value (same trust model as Manifest's
+    /// `total_size`); the tree walk cross-checks against the
+    /// sum of leaf chunk sizes at the bottom of each descent.
+    total_size: u64,
+    /// Tree depth — `0` is a single-leaf tree (root IS the leaf,
+    /// degenerate), `1` is root + leaves, `2` is root + internals
+    /// + leaves, etc. Capped at [`super::blob_tree::MAX_TREE_DEPTH`]
+    /// (= 4).
+    depth: u8,
+}
+
 /// Postcard-encoded manifest body. Lives inside the
 /// [`BlobRef::Manifest`] wire form after the four-byte magic +
 /// version discriminator.
@@ -234,6 +292,36 @@ pub enum BlobRef {
         /// the iterated sum.
         total_size: u64,
     },
+    /// Tree-manifest path (v0.3). Wire version
+    /// [`BLOB_REF_VERSION_V3_TREE`]; body schema version
+    /// [`BLOB_TREE_BODY_VERSION`]. Lifts the addressable size
+    /// from the v0.2 16 GiB cap to 128 PiB at fanout 128 + depth
+    /// 4 + 4 MiB chunks. The blob's actual chunk references live
+    /// at the [`TreeNode`](super::blob_tree::TreeNode) leaves,
+    /// reachable via the tree walk starting from `root_hash`.
+    Tree {
+        /// Outer wire discriminator (always
+        /// [`BLOB_REF_VERSION_V3_TREE`] on fresh constructions).
+        version: u8,
+        /// Adapter-routed URI. For the mesh-native path this is
+        /// `mesh://<hex-of-root_hash>`; external adapters use
+        /// their own scheme.
+        uri: String,
+        /// Replication / erasure encoding (inherits the same
+        /// enum surface as `Manifest`).
+        encoding: Encoding,
+        /// BLAKE3 hash of the root
+        /// [`TreeNode`](super::blob_tree::TreeNode) body — the
+        /// substrate fetches this hash to start the tree walk.
+        root_hash: [u8; 32],
+        /// Total payload size in bytes (sum of every leaf
+        /// chunk's `size` across the whole tree). Cached for
+        /// cheap [`Self::size`].
+        total_size: u64,
+        /// Tree depth — `1` for root-as-leaf, up to
+        /// [`super::blob_tree::MAX_TREE_DEPTH`].
+        depth: u8,
+    },
 }
 
 impl BlobRef {
@@ -302,16 +390,65 @@ impl BlobRef {
         })
     }
 
+    /// Construct a v3 [`BlobRef::Tree`]. The caller is responsible
+    /// for `root_hash` matching the BLAKE3 of the root
+    /// [`TreeNode`](super::blob_tree::TreeNode)'s encoded bytes,
+    /// and for `total_size` matching the sum of every leaf
+    /// chunk's `size` across the tree — the substrate verifies the
+    /// hash on tree-walk descent and cross-checks total_size at
+    /// the leaves.
+    ///
+    /// Validates:
+    /// - `total_size > 0` (use [`BlobRef::Small`] for zero-byte payloads).
+    /// - `total_size <= BLOB_TREE_MAX_TOTAL_SIZE` (~128 PiB ceiling).
+    /// - `depth` in `1..=MAX_TREE_DEPTH`.
+    pub fn tree(
+        uri: impl Into<String>,
+        encoding: Encoding,
+        root_hash: [u8; 32],
+        total_size: u64,
+        depth: u8,
+    ) -> Result<Self, BlobError> {
+        if total_size == 0 {
+            return Err(BlobError::Decode(
+                "tree total_size must be > 0; use BlobRef::Small for empty payloads".to_owned(),
+            ));
+        }
+        if total_size > BLOB_TREE_MAX_TOTAL_SIZE {
+            return Err(BlobError::Decode(format!(
+                "tree total_size {} exceeds cap {}",
+                total_size, BLOB_TREE_MAX_TOTAL_SIZE
+            )));
+        }
+        if depth == 0 || depth > super::blob_tree::MAX_TREE_DEPTH {
+            return Err(BlobError::Decode(format!(
+                "tree depth {} out of range 1..={}",
+                depth,
+                super::blob_tree::MAX_TREE_DEPTH
+            )));
+        }
+        Ok(Self::Tree {
+            version: BLOB_REF_VERSION_V3_TREE,
+            uri: uri.into(),
+            encoding,
+            root_hash,
+            total_size,
+            depth,
+        })
+    }
+
     // -----------------------------------------------------------
     // Accessors (uniform across variants)
     // -----------------------------------------------------------
 
     /// Outer wire version discriminator —
     /// [`BLOB_REF_VERSION_V1`] for Small, [`BLOB_REF_VERSION_V2_MANIFEST`]
-    /// for Manifest.
+    /// for Manifest, [`BLOB_REF_VERSION_V3_TREE`] for Tree.
     pub fn version(&self) -> u8 {
         match self {
-            Self::Small { version, .. } | Self::Manifest { version, .. } => *version,
+            Self::Small { version, .. }
+            | Self::Manifest { version, .. }
+            | Self::Tree { version, .. } => *version,
         }
     }
 
@@ -319,48 +456,79 @@ impl BlobRef {
     /// passed through opaque.
     pub fn uri(&self) -> &str {
         match self {
-            Self::Small { uri, .. } | Self::Manifest { uri, .. } => uri.as_str(),
+            Self::Small { uri, .. } | Self::Manifest { uri, .. } | Self::Tree { uri, .. } => {
+                uri.as_str()
+            }
         }
     }
 
     /// Total payload size in bytes — `size` for Small,
-    /// `total_size` for Manifest.
+    /// `total_size` for Manifest, `total_size` for Tree.
     pub fn size(&self) -> u64 {
         match self {
             Self::Small { size, .. } => *size,
-            Self::Manifest { total_size, .. } => *total_size,
+            Self::Manifest { total_size, .. } | Self::Tree { total_size, .. } => *total_size,
         }
     }
 
-    /// `true` if this is a chunked-blob manifest.
+    /// `true` if this is a chunked-blob manifest (flat
+    /// [`Self::Manifest`] or hierarchical [`Self::Tree`]).
     pub fn is_chunked(&self) -> bool {
-        matches!(self, Self::Manifest { .. })
+        matches!(self, Self::Manifest { .. } | Self::Tree { .. })
+    }
+
+    /// `true` if this is a hierarchical-manifest tree.
+    pub fn is_tree(&self) -> bool {
+        matches!(self, Self::Tree { .. })
     }
 
     /// The single content hash for a Small blob; `None` for a
-    /// Manifest (manifests reference many chunks, each with its own
-    /// hash — use [`Self::chunks`]).
+    /// Manifest or Tree (manifests reference many chunks, each
+    /// with its own hash — use [`Self::chunks`] for Manifest or
+    /// [`Self::tree_root_hash`] for Tree).
     pub fn small_hash(&self) -> Option<&[u8; 32]> {
         match self {
             Self::Small { hash, .. } => Some(hash),
-            Self::Manifest { .. } => None,
+            Self::Manifest { .. } | Self::Tree { .. } => None,
         }
     }
 
-    /// The chunk list for a Manifest; empty slice for a Small.
+    /// The root [`TreeNode`](super::blob_tree::TreeNode) hash for
+    /// a [`Self::Tree`]; `None` for [`Self::Small`] or
+    /// [`Self::Manifest`].
+    pub fn tree_root_hash(&self) -> Option<&[u8; 32]> {
+        match self {
+            Self::Tree { root_hash, .. } => Some(root_hash),
+            Self::Small { .. } | Self::Manifest { .. } => None,
+        }
+    }
+
+    /// The tree depth for a [`Self::Tree`]; `None` for
+    /// [`Self::Small`] or [`Self::Manifest`].
+    pub fn tree_depth(&self) -> Option<u8> {
+        match self {
+            Self::Tree { depth, .. } => Some(*depth),
+            Self::Small { .. } | Self::Manifest { .. } => None,
+        }
+    }
+
+    /// The chunk list for a Manifest; empty slice for a Small or
+    /// Tree (Tree chunks live at the leaf [`TreeNode`](super::blob_tree::TreeNode)s,
+    /// reachable via tree walk — not flattened here).
     pub fn chunks(&self) -> &[ChunkRef] {
         match self {
-            Self::Small { .. } => &[],
+            Self::Small { .. } | Self::Tree { .. } => &[],
             Self::Manifest { chunks, .. } => chunks,
         }
     }
 
-    /// The encoding tag for a Manifest; `None` for a Small (Small
-    /// has no encoding because the bytes are stored directly).
+    /// The encoding tag for a Manifest or Tree; `None` for a
+    /// Small (Small has no encoding because the bytes are stored
+    /// directly).
     pub fn encoding(&self) -> Option<Encoding> {
         match self {
             Self::Small { .. } => None,
-            Self::Manifest { encoding, .. } => Some(*encoding),
+            Self::Manifest { encoding, .. } | Self::Tree { encoding, .. } => Some(*encoding),
         }
     }
 
@@ -379,7 +547,7 @@ impl BlobRef {
     pub fn encoded_len(&self) -> usize {
         match self {
             Self::Small { uri, .. } => BLOB_REF_SMALL_HEADER_LEN + uri.len(),
-            Self::Manifest { .. } => self.encode().len(),
+            Self::Manifest { .. } | Self::Tree { .. } => self.encode().len(),
         }
     }
 
@@ -428,6 +596,30 @@ impl BlobRef {
                 buf.extend_from_slice(&body_bytes);
                 buf
             }
+            Self::Tree {
+                version,
+                uri,
+                encoding,
+                root_hash,
+                total_size,
+                depth,
+            } => {
+                let body = TreeBody {
+                    body_version: BLOB_TREE_BODY_VERSION,
+                    uri: uri.clone(),
+                    encoding: *encoding,
+                    root_hash: *root_hash,
+                    total_size: *total_size,
+                    depth: *depth,
+                };
+                let body_bytes = postcard::to_allocvec(&body)
+                    .expect("tree body postcard-encodes infallibly");
+                let mut buf = Vec::with_capacity(5 + body_bytes.len());
+                buf.extend_from_slice(&BLOB_REF_MAGIC);
+                buf.push(*version);
+                buf.extend_from_slice(&body_bytes);
+                buf
+            }
         }
     }
 
@@ -449,6 +641,7 @@ impl BlobRef {
         match version {
             BLOB_REF_VERSION_V1 => Self::decode_small(version, &bytes[5..]).map(Some),
             BLOB_REF_VERSION_V2_MANIFEST => Self::decode_manifest(version, &bytes[5..]).map(Some),
+            BLOB_REF_VERSION_V3_TREE => Self::decode_tree(version, &bytes[5..]).map(Some),
             other => Err(BlobError::UnsupportedVersion(other)),
         }
     }
@@ -554,13 +747,62 @@ impl BlobRef {
         })
     }
 
+    fn decode_tree(version: u8, rest: &[u8]) -> Result<Self, BlobError> {
+        // Bound the wire size BEFORE postcard allocates. The Tree
+        // body carries only fixed-size fields (root_hash, sizes,
+        // depth) plus a URI string — 1 KiB is generous for the
+        // legitimate shape and bounds malicious oversize payloads
+        // before the URI's String allocation runs.
+        if rest.len() > BLOB_REF_TREE_BODY_MAX_BYTES {
+            return Err(BlobError::Decode(format!(
+                "tree body {} bytes exceeds cap {}",
+                rest.len(),
+                BLOB_REF_TREE_BODY_MAX_BYTES
+            )));
+        }
+        let body: TreeBody = postcard::from_bytes(rest)
+            .map_err(|e| BlobError::Decode(format!("tree body decode failed: {}", e)))?;
+        if body.body_version != BLOB_TREE_BODY_VERSION {
+            return Err(BlobError::UnsupportedVersion(body.body_version));
+        }
+        if body.total_size == 0 {
+            return Err(BlobError::Decode(
+                "tree total_size must be > 0; empty payloads use BlobRef::Small".to_owned(),
+            ));
+        }
+        if body.total_size > BLOB_TREE_MAX_TOTAL_SIZE {
+            return Err(BlobError::Decode(format!(
+                "tree total_size {} exceeds cap {}",
+                body.total_size, BLOB_TREE_MAX_TOTAL_SIZE
+            )));
+        }
+        if body.depth == 0 || body.depth > super::blob_tree::MAX_TREE_DEPTH {
+            return Err(BlobError::Decode(format!(
+                "tree depth {} out of range 1..={}",
+                body.depth,
+                super::blob_tree::MAX_TREE_DEPTH
+            )));
+        }
+        Ok(Self::Tree {
+            version,
+            uri: body.uri,
+            encoding: body.encoding,
+            root_hash: body.root_hash,
+            total_size: body.total_size,
+            depth: body.depth,
+        })
+    }
+
     /// Verify `bytes` resolves to this `BlobRef`'s hash. Only
     /// defined for [`BlobRef::Small`] — call sites holding a
-    /// Manifest verify chunk-by-chunk via [`Self::chunks`].
+    /// Manifest verify chunk-by-chunk via [`Self::chunks`]; call
+    /// sites holding a Tree verify via tree-walk descent (each
+    /// [`TreeNode`](super::blob_tree::TreeNode)'s bytes hash to
+    /// the parent's stored child-hash entry).
     /// Returns `Ok(())` on match,
     /// `Err(BlobError::HashMismatch)` otherwise, `Err(BlobError::Decode)`
-    /// on a Manifest. Runs inside the substrate, not the adapter, so
-    /// an adversarial adapter cannot fake-verify.
+    /// on a Manifest / Tree. Runs inside the substrate, not the
+    /// adapter, so an adversarial adapter cannot fake-verify.
     pub fn verify(&self, bytes: &[u8]) -> Result<(), BlobError> {
         match self {
             Self::Small { hash, .. } => {
@@ -576,6 +818,10 @@ impl BlobRef {
             }
             Self::Manifest { .. } => Err(BlobError::Decode(
                 "verify is undefined on a Manifest variant; verify chunks individually".to_owned(),
+            )),
+            Self::Tree { .. } => Err(BlobError::Decode(
+                "verify is undefined on a Tree variant; verify chunks individually via tree walk"
+                    .to_owned(),
             )),
         }
     }
@@ -787,6 +1033,18 @@ pub fn byte_range_to_chunks(
         BlobRef::Small { .. } => {
             return Err(BlobError::Decode(
                 "byte_range_to_chunks called on a Small BlobRef".to_owned(),
+            ));
+        }
+        BlobRef::Tree { .. } => {
+            // Tree blobs resolve ranges via tree walk
+            // (A4 `TreeWalker`), not via the flat-manifest
+            // helper. Callers holding a Tree BlobRef route
+            // through `MeshBlobAdapter::fetch_range`'s tree
+            // path directly.
+            return Err(BlobError::Decode(
+                "byte_range_to_chunks called on a Tree BlobRef — \
+                 use the tree-walker path instead"
+                    .to_owned(),
             ));
         }
     };
@@ -1419,5 +1677,294 @@ mod tests {
                 end
             );
         }
+    }
+
+    // -----------------------------------------------------------
+    // BlobRef::Tree (v0.3) constructor + wire round-trip
+    // -----------------------------------------------------------
+
+    fn tree_root() -> [u8; 32] {
+        [0xAB; 32]
+    }
+
+    #[test]
+    fn tree_constructor_sets_version_and_fields() {
+        let r = BlobRef::tree(
+            "mesh://ab".to_string(),
+            Encoding::Replicated,
+            tree_root(),
+            1024 * 1024 * 1024 * 64, // 64 GiB
+            2,
+        )
+        .unwrap();
+        assert_eq!(r.version(), BLOB_REF_VERSION_V3_TREE);
+        assert_eq!(r.uri(), "mesh://ab");
+        assert_eq!(r.size(), 1024 * 1024 * 1024 * 64);
+        assert_eq!(r.tree_depth(), Some(2));
+        assert_eq!(r.tree_root_hash(), Some(&tree_root()));
+        assert_eq!(r.encoding(), Some(Encoding::Replicated));
+        assert!(r.is_chunked());
+        assert!(r.is_tree());
+        assert!(r.small_hash().is_none());
+        assert!(r.chunks().is_empty());
+    }
+
+    #[test]
+    fn tree_constructor_rejects_zero_total_size() {
+        let err = BlobRef::tree(
+            "mesh://aa",
+            Encoding::Replicated,
+            tree_root(),
+            0,
+            1,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must be > 0"), "got: {msg}");
+    }
+
+    #[test]
+    fn tree_constructor_rejects_total_size_above_cap() {
+        let err = BlobRef::tree(
+            "mesh://aa",
+            Encoding::Replicated,
+            tree_root(),
+            BLOB_TREE_MAX_TOTAL_SIZE + 1,
+            4,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("exceeds cap"), "got: {msg}");
+    }
+
+    #[test]
+    fn tree_constructor_rejects_zero_depth() {
+        let err = BlobRef::tree(
+            "mesh://aa",
+            Encoding::Replicated,
+            tree_root(),
+            1024,
+            0,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("depth"), "got: {msg}");
+    }
+
+    #[test]
+    fn tree_constructor_rejects_depth_above_cap() {
+        let err = BlobRef::tree(
+            "mesh://aa",
+            Encoding::Replicated,
+            tree_root(),
+            1024,
+            super::super::blob_tree::MAX_TREE_DEPTH + 1,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("depth"), "got: {msg}");
+    }
+
+    #[test]
+    fn tree_encode_decode_round_trips() {
+        let original = BlobRef::tree(
+            "mesh://cafe".to_string(),
+            Encoding::Replicated,
+            tree_root(),
+            1024 * 1024 * 1024, // 1 GiB
+            1,
+        )
+        .unwrap();
+        let bytes = original.encode();
+        let decoded = BlobRef::decode(&bytes).unwrap().unwrap();
+        assert_eq!(original, decoded);
+        match decoded {
+            BlobRef::Tree {
+                version,
+                uri,
+                encoding,
+                root_hash,
+                total_size,
+                depth,
+            } => {
+                assert_eq!(version, BLOB_REF_VERSION_V3_TREE);
+                assert_eq!(uri, "mesh://cafe");
+                assert_eq!(encoding, Encoding::Replicated);
+                assert_eq!(root_hash, tree_root());
+                assert_eq!(total_size, 1024 * 1024 * 1024);
+                assert_eq!(depth, 1);
+            }
+            other => panic!("expected Tree, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tree_decode_preserves_reedsolomon_encoding_tag() {
+        let original = BlobRef::tree(
+            "mesh://ff",
+            Encoding::ReedSolomon { k: 10, m: 4 },
+            tree_root(),
+            1u64 << 40, // 1 TiB
+            3,
+        )
+        .unwrap();
+        let bytes = original.encode();
+        let decoded = BlobRef::decode(&bytes).unwrap().unwrap();
+        assert_eq!(decoded.encoding(), Some(Encoding::ReedSolomon { k: 10, m: 4 }));
+    }
+
+    #[test]
+    fn tree_decode_rejects_unknown_outer_version() {
+        // Hand-craft magic + an unknown version byte + arbitrary
+        // postcard body bytes. Must surface UnsupportedVersion
+        // rather than mis-decode as Small or Manifest.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&BLOB_REF_MAGIC);
+        bytes.push(0xFE); // not 0x01/0x02/0x03
+        bytes.extend_from_slice(&[0u8; 64]);
+        let err = BlobRef::decode(&bytes).unwrap_err();
+        assert!(
+            matches!(err, BlobError::UnsupportedVersion(0xFE)),
+            "expected UnsupportedVersion(0xFE), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn tree_decode_rejects_unknown_body_version() {
+        // Encode a tree, then hand-mutate the body_version field
+        // (first byte after magic+outer-version) to an unknown
+        // value. Decoder must surface UnsupportedVersion for the
+        // body, not silently accept.
+        let original = BlobRef::tree(
+            "mesh://aa",
+            Encoding::Replicated,
+            tree_root(),
+            1024,
+            1,
+        )
+        .unwrap();
+        let mut bytes = original.encode();
+        // The postcard body starts at offset 5. The body's first
+        // field is `body_version: u8`, which postcard emits as a
+        // single byte (no leading length prefix on `u8`). Mutate
+        // it to an unknown value.
+        bytes[5] = 0xEF;
+        let err = BlobRef::decode(&bytes).unwrap_err();
+        assert!(
+            matches!(err, BlobError::UnsupportedVersion(0xEF)),
+            "expected UnsupportedVersion(0xEF), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn tree_decode_rejects_oversize_body() {
+        // Hand-construct magic + outer version + a body whose
+        // length exceeds BLOB_REF_TREE_BODY_MAX_BYTES. Decoder
+        // must reject BEFORE postcard allocates so a malicious
+        // peer can't force a large allocation.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&BLOB_REF_MAGIC);
+        bytes.push(BLOB_REF_VERSION_V3_TREE);
+        bytes.extend(std::iter::repeat(0u8).take(BLOB_REF_TREE_BODY_MAX_BYTES + 1));
+        let err = BlobRef::decode(&bytes).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("exceeds cap"), "got: {msg}");
+    }
+
+    #[test]
+    fn tree_decode_rejects_total_size_above_cap() {
+        // Hand-encode a TreeBody with a u64 total_size past
+        // BLOB_TREE_MAX_TOTAL_SIZE. Decoder catches it via the
+        // post-decode validation, not via the constructor.
+        let body = TreeBody {
+            body_version: BLOB_TREE_BODY_VERSION,
+            uri: "mesh://x".to_string(),
+            encoding: Encoding::Replicated,
+            root_hash: tree_root(),
+            total_size: BLOB_TREE_MAX_TOTAL_SIZE + 1,
+            depth: 4,
+        };
+        let body_bytes = postcard::to_allocvec(&body).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&BLOB_REF_MAGIC);
+        bytes.push(BLOB_REF_VERSION_V3_TREE);
+        bytes.extend_from_slice(&body_bytes);
+        let err = BlobRef::decode(&bytes).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("exceeds cap"), "got: {msg}");
+    }
+
+    #[test]
+    fn tree_decode_rejects_depth_above_cap() {
+        let body = TreeBody {
+            body_version: BLOB_TREE_BODY_VERSION,
+            uri: "mesh://x".to_string(),
+            encoding: Encoding::Replicated,
+            root_hash: tree_root(),
+            total_size: 1024,
+            depth: super::super::blob_tree::MAX_TREE_DEPTH + 1,
+        };
+        let body_bytes = postcard::to_allocvec(&body).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&BLOB_REF_MAGIC);
+        bytes.push(BLOB_REF_VERSION_V3_TREE);
+        bytes.extend_from_slice(&body_bytes);
+        let err = BlobRef::decode(&bytes).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("depth"), "got: {msg}");
+    }
+
+    #[test]
+    fn verify_on_tree_returns_typed_error() {
+        let r = BlobRef::tree(
+            "mesh://aa",
+            Encoding::Replicated,
+            tree_root(),
+            1024,
+            1,
+        )
+        .unwrap();
+        let err = r.verify(b"any bytes").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Tree variant"),
+            "Tree verify should surface a typed Decode error pointing at tree-walk; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn tree_does_not_alias_small_or_manifest_via_decode() {
+        // Round-trip three variants and assert each decodes back
+        // to its own shape. Pre-fix the version-byte gate ensures
+        // a Tree wire form is never mis-decoded as Small/Manifest.
+        let small = BlobRef::small("mesh://aa", [0xAA; 32], 100);
+        let manifest = BlobRef::manifest(
+            "mesh://bb",
+            Encoding::Replicated,
+            vec![ChunkRef {
+                hash: [0xBB; 32],
+                size: 1024,
+            }],
+        )
+        .unwrap();
+        let tree = BlobRef::tree(
+            "mesh://cc",
+            Encoding::Replicated,
+            [0xCC; 32],
+            1024 * 1024 * 1024,
+            1,
+        )
+        .unwrap();
+
+        let s_decoded = BlobRef::decode(&small.encode()).unwrap().unwrap();
+        let m_decoded = BlobRef::decode(&manifest.encode()).unwrap().unwrap();
+        let t_decoded = BlobRef::decode(&tree.encode()).unwrap().unwrap();
+
+        assert!(matches!(s_decoded, BlobRef::Small { .. }));
+        assert!(matches!(m_decoded, BlobRef::Manifest { .. }));
+        assert!(matches!(t_decoded, BlobRef::Tree { .. }));
+        assert_eq!(s_decoded.version(), BLOB_REF_VERSION_V1);
+        assert_eq!(m_decoded.version(), BLOB_REF_VERSION_V2_MANIFEST);
+        assert_eq!(t_decoded.version(), BLOB_REF_VERSION_V3_TREE);
     }
 }

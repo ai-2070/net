@@ -982,6 +982,16 @@ impl GreedyRuntime {
             super::super::blob::BlobRef::Manifest { chunks, .. } => {
                 chunks.iter().map(|c| c.hash).collect()
             }
+            super::super::blob::BlobRef::Tree { root_hash, .. } => {
+                // Refcount the root node only — sub-tree refcounts
+                // require walking the tree, which the A4 walker
+                // surface adds. Until then, refcounting the root
+                // keeps the GC sweep from collecting the manifest
+                // tree's entry point; per-leaf-chunk refcounts
+                // ride on the v0.2 chain-fold path once chains
+                // emit events referencing leaf chunks directly.
+                vec![*root_hash]
+            }
         };
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

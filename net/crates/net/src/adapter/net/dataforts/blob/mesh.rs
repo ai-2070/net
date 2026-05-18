@@ -1125,6 +1125,19 @@ impl BlobAdapter for MeshBlobAdapter {
                 }
                 Ok(())
             }
+            BlobRef::Tree { .. } => {
+                // Tree-shaped publish lands in Phase A3
+                // (`store_stream` tree path) which writes
+                // chunk-by-chunk and accretes the manifest
+                // tree incrementally. The bulk `store` surface
+                // does not accept Tree BlobRefs — callers
+                // route through `store_stream` instead.
+                Err(BlobError::Backend(
+                    "mesh blob: store(BlobRef::Tree, &[u8]) is not supported; \
+                     use store_stream for Tree blobs"
+                        .to_owned(),
+                ))
+            }
         };
         if result.is_ok() {
             self.metrics.record_store(bytes.len() as u64);
@@ -1195,6 +1208,18 @@ impl BlobAdapter for MeshBlobAdapter {
                     Ok(out)
                 }
             }
+            BlobRef::Tree { .. } => {
+                // Tree-shaped bulk fetch lands in Phase A4
+                // (`TreeWalker` via `fetch_range`). The bulk
+                // surface here doesn't accept Tree BlobRefs —
+                // callers route through `fetch_range`'s tree
+                // path or per-chunk `fetch_chunk` directly.
+                return Err(BlobError::Backend(
+                    "mesh blob: fetch(BlobRef::Tree) is not supported; \
+                     use fetch_range for Tree blobs"
+                        .to_owned(),
+                ));
+            }
         };
         if result.is_ok() {
             self.metrics.record_fetch();
@@ -1205,6 +1230,8 @@ impl BlobAdapter for MeshBlobAdapter {
                 let hashes: Vec<[u8; 32]> = match blob_ref {
                     BlobRef::Small { hash, .. } => vec![*hash],
                     BlobRef::Manifest { chunks, .. } => chunks.iter().map(|c| c.hash).collect(),
+                    // Tree path errored above; unreachable here.
+                    BlobRef::Tree { .. } => Vec::new(),
                 };
                 self.bump_heat(&hashes);
             }
@@ -1305,6 +1332,20 @@ impl BlobAdapter for MeshBlobAdapter {
                     (Ok(out), touched)
                 }
             }
+            BlobRef::Tree { .. } => {
+                // Tree path lands in Phase A4 (`TreeWalker`).
+                // Until then, surface a typed error so callers
+                // upgrade their fetch path explicitly rather
+                // than receiving misleading data.
+                (
+                    Err(BlobError::Backend(
+                        "mesh blob: fetch_range(BlobRef::Tree) is not yet implemented \
+                         (Phase A4 / `TreeWalker`)"
+                            .to_owned(),
+                    )),
+                    Vec::new(),
+                )
+            }
         };
         if result.is_ok() && !touched.is_empty() {
             self.bump_heat(&touched);
@@ -1322,6 +1363,20 @@ impl BlobAdapter for MeshBlobAdapter {
                     }
                 }
                 Ok(true)
+            }
+            BlobRef::Tree { root_hash, .. } => {
+                // Tree `exists` is approximated by root-node
+                // presence: the root must be locally present for
+                // the tree walk to start. Sub-tree completeness
+                // requires actually walking the manifest, which
+                // is A4 scope. Returning `true` only on root-
+                // present is a conservative under-report (a tree
+                // whose root exists but a subtree is missing
+                // returns `true` here), but the alternative —
+                // walking the tree — duplicates A4 logic. Phase
+                // A4 will override this with the walker-based
+                // implementation.
+                self.chunk_exists(root_hash)
             }
         }
     }
@@ -1358,6 +1413,15 @@ impl BlobAdapter for MeshBlobAdapter {
         let hashes: Vec<[u8; 32]> = match blob_ref {
             BlobRef::Small { hash, .. } => vec![*hash],
             BlobRef::Manifest { chunks, .. } => chunks.iter().map(|c| c.hash).collect(),
+            BlobRef::Tree { root_hash, .. } => {
+                // Tree prefetch lands in A4 with the walker —
+                // a full prefetch needs to descend the tree and
+                // open every leaf chunk's channel. For A1, open
+                // the root only so a subsequent walker call
+                // starts with the root locally resident. The
+                // post-A4 implementation walks the full tree.
+                vec![*root_hash]
+            }
         };
         for hash in hashes {
             let channel = Self::chunk_channel(&hash);
@@ -1382,6 +1446,14 @@ impl BlobAdapter for MeshBlobAdapter {
                 .iter()
                 .filter_map(|c| self.refcount.get(&c.hash).map(|e| e.last_seen_unix_ms))
                 .max(),
+            BlobRef::Tree { root_hash, .. } => {
+                // Surface the root node's last_seen as a
+                // proxy. A full max-over-tree requires walking
+                // the tree (A4); this gives operators the
+                // right shape today without the walker
+                // overhead.
+                self.refcount.get(root_hash).map(|e| e.last_seen_unix_ms)
+            }
         };
         Ok(BlobStat {
             size: blob_ref.size(),
@@ -1579,6 +1651,18 @@ impl MeshBlobAdapter {
         let hashes: Vec<[u8; 32]> = match blob_ref {
             BlobRef::Small { hash, .. } => vec![*hash],
             BlobRef::Manifest { chunks, .. } => chunks.iter().map(|c| c.hash).collect(),
+            BlobRef::Tree { .. } => {
+                // sync_blob for Tree blobs requires walking the
+                // tree to enumerate every leaf chunk. Lands with
+                // the A4 `TreeWalker`; for A1 we surface the
+                // un-implemented case as a typed error so callers
+                // don't silently skip sync on a Tree blob.
+                return Err(BlobError::Backend(
+                    "mesh blob: sync_blob(BlobRef::Tree) is not yet implemented \
+                     (Phase A4 / `TreeWalker`)"
+                        .to_owned(),
+                ));
+            }
         };
         for hash in hashes {
             let channel = Self::chunk_channel(&hash);

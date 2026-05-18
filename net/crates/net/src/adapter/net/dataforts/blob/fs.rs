@@ -42,7 +42,7 @@ pub const FS_STREAM_CHUNK_BYTES: usize = 256 * 1024;
 fn expect_small(blob_ref: &BlobRef) -> Result<([u8; 32], &str), BlobError> {
     match blob_ref {
         BlobRef::Small { hash, uri, .. } => Ok((*hash, uri.as_str())),
-        BlobRef::Manifest { .. } => Err(BlobError::Backend(
+        BlobRef::Manifest { .. } | BlobRef::Tree { .. } => Err(BlobError::Backend(
             "FileSystemAdapter operates on Small blobs only; \
              chunked blobs are handled by the layer above"
                 .to_owned(),
