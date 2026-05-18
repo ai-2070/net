@@ -684,6 +684,36 @@ async fn on_inbound(
     budget: &Arc<Mutex<BandwidthBudget>>,
     event: Inbound,
 ) {
+    // Peer-auth gate. Every inbound replication message must come
+    // from a peer in the channel's configured replica_set; any
+    // other sender has no business driving the state machine for
+    // this channel. Pre-fix the handlers below only checked the
+    // channel_id, so any mesh peer with SUBPROTOCOL_REDEX reach
+    // could ship Heartbeat / SyncRequest / SyncResponse / SyncNack
+    // and the runtime would apply them. SyncResponse hijack was
+    // the worst case — a non-leader peer could write attacker-
+    // chosen bytes to the replica's local log via append_batch.
+    //
+    // Shutdown is local-only (never crosses the wire), so it
+    // bypasses the membership check; the from field on a Shutdown
+    // event is the local node's id.
+    let from_node = match &event {
+        Inbound::Shutdown => None,
+        Inbound::Heartbeat { from, .. } => Some(*from),
+        Inbound::SyncRequest { from, .. } => Some(*from),
+        Inbound::SyncResponse { from, .. } => Some(*from),
+        Inbound::SyncNack { from, .. } => Some(*from),
+    };
+    if let Some(from) = from_node {
+        if !inputs.replica_set.contains(&from) {
+            tracing::trace!(
+                from = from,
+                channel = ?inputs.channel_id,
+                "replication: dropping inbound from peer not in replica_set"
+            );
+            return;
+        }
+    }
     match event {
         Inbound::Shutdown => {
             // Handled by the main loop; never reaches here.
@@ -824,6 +854,23 @@ async fn on_inbound(
                 );
                 return;
             }
+            // SyncResponse is the state-mutating wire input — only
+            // the believed leader is allowed to ship it. A peer that
+            // is in the replica_set but is not the current leader
+            // could otherwise forge `append_batch`-bound payloads
+            // into a replica's log. The replica_set gate at entry
+            // narrows the surface to configured members; the
+            // believed_leader gate here narrows further to the
+            // single peer the replica is currently following.
+            let leader_belief = tracker.lock().believed_leader();
+            if leader_belief != Some(from) {
+                tracing::trace!(
+                    from = from,
+                    believed_leader = ?leader_belief,
+                    "replication: dropping SyncResponse from non-leader peer"
+                );
+                return;
+            }
             // Replica-side: apply the chunk to our local file.
             // Only honor responses when we believe we're a
             // Replica — other roles ignore them.
@@ -954,6 +1001,22 @@ async fn on_inbound(
                 tracing::trace!(
                     from = from,
                     "replication: dropping SyncNack for wrong channel"
+                );
+                return;
+            }
+            // Only the believed leader can NACK; otherwise a non-
+            // leader replica_set peer could spam NotLeader nacks to
+            // make us clear our believed_leader, or BadRange to
+            // skip-ahead our local file's tail past in-flight
+            // events. The replica_set gate at entry handles
+            // outsider rejection; this narrows further to the
+            // single peer the replica is currently following.
+            let leader_belief = tracker.lock().believed_leader();
+            if leader_belief != Some(from) {
+                tracing::trace!(
+                    from = from,
+                    believed_leader = ?leader_belief,
+                    "replication: dropping SyncNack from non-leader peer"
                 );
                 return;
             }
@@ -2146,6 +2209,133 @@ mod tests {
         );
     }
 
+    /// Peer-auth gate regression: an inbound message whose `from`
+    /// node is not in `replica_set` must be dropped at on_inbound
+    /// entry. Without the gate any mesh peer with SUBPROTOCOL_REDEX
+    /// reach could drive the runtime — the worst case being a forged
+    /// SyncResponse that writes attacker-chosen bytes into the
+    /// replica's local log via `append_batch`.
+    #[tokio::test]
+    async fn inbound_from_non_replica_set_peer_is_dropped() {
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 60_000);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        coordinator
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let budget = build_budget();
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        let baseline_next = inputs.file.next_seq();
+        // 0x99 is NOT in replica_set [0x10, 0x20]. Even with valid
+        // channel_id and a payload the apply path would accept, the
+        // membership gate must drop it.
+        let event = Inbound::SyncResponse {
+            from: 0x99,
+            msg: SyncResponse {
+                channel_id: cid,
+                first_seq: 0,
+                leader_first_retained_seq: 0,
+                events: Vec::new(),
+            },
+        };
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &tracker,
+            &budget,
+            event,
+        )
+        .await;
+        // No state mutation on the local file from an out-of-set
+        // peer's SyncResponse.
+        assert_eq!(
+            inputs.file.next_seq(),
+            baseline_next,
+            "out-of-set peer must not advance local tail"
+        );
+        // A Heartbeat from the same out-of-set peer must not seed
+        // the tracker either — the gate runs before record_heartbeat.
+        let event = Inbound::Heartbeat {
+            from: 0x99,
+            msg: SyncHeartbeat {
+                channel_id: cid,
+                tail_seq: 7,
+                role: ReplicaRole::Leader,
+                wall_clock_ms: 0,
+            },
+        };
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &tracker,
+            &budget,
+            event,
+        )
+        .await;
+        assert!(
+            tracker.lock().believed_leader().is_none(),
+            "out-of-set heartbeat must not seed believed_leader"
+        );
+    }
+
+    /// Peer-auth gate regression: a SyncResponse from a replica_set
+    /// peer who is not the believed_leader must be dropped. Without
+    /// this check, a non-leader replica could ship forged chunks
+    /// once they're inside the replica_set.
+    #[tokio::test]
+    async fn sync_response_from_non_leader_replica_peer_is_dropped() {
+        let inputs = build_inputs(0x10, vec![0x10, 0x20, 0x30], 60_000);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20, 0x30]);
+        coordinator
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let budget = build_budget();
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        // Seed believed_leader = 0x20 via a Leader heartbeat.
+        tracker
+            .lock()
+            .record_heartbeat(0x20, ReplicaRole::Leader, 0, Instant::now());
+        assert_eq!(tracker.lock().believed_leader(), Some(0x20));
+        let baseline_next = inputs.file.next_seq();
+        // 0x30 IS in replica_set but is NOT the believed leader.
+        let event = Inbound::SyncResponse {
+            from: 0x30,
+            msg: SyncResponse {
+                channel_id: cid,
+                first_seq: 0,
+                leader_first_retained_seq: 0,
+                events: Vec::new(),
+            },
+        };
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &tracker,
+            &budget,
+            event,
+        )
+        .await;
+        assert_eq!(
+            inputs.file.next_seq(),
+            baseline_next,
+            "non-leader replica_set peer must not advance local tail via SyncResponse"
+        );
+    }
+
     /// R-11 regression: `is_stopped()` returns `false` until
     /// `cancel()`'s await completes, even if a parallel
     /// `cancel()` raced and took the JoinHandle out of the
@@ -2240,6 +2430,11 @@ mod tests {
         let dispatcher = Arc::new(RecorderDispatcher::default());
         let budget = build_budget();
         let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        // Seed the tracker with a believed leader heartbeat so the
+        // peer-auth gate at on_inbound entry admits the NACK below.
+        tracker
+            .lock()
+            .record_heartbeat(0x20, ReplicaRole::Leader, 41, Instant::now());
 
         // Local file is empty (next_seq = 0). NACK with since_seq=42
         // means "the leader trimmed up to 42; you asked for 42 but
