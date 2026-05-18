@@ -136,11 +136,11 @@ missed despite covering `meshos/executor.rs` directly.
 
 ## Critical
 
-### R-20 — No replication-peer authentication; any mesh peer can hijack channel state
+### R-20 — No replication-peer authentication; any mesh peer can hijack channel state — **Landed**
 - **File:** `src/adapter/net/redex/replication_runtime.rs:651-989` (`on_inbound`)
 - **What:** All four inbound handlers (`Heartbeat`, `SyncRequest`, `SyncResponse`, `SyncNack`) validate `msg.channel_id` against `inputs.channel_id` but never check that `from` is in `inputs.replica_set`. `record_heartbeat` accepts any peer; if `role=Leader`, that peer becomes `believed_leader`. A `SyncResponse` from a non-leader peer is applied to disk after only a `coordinator.role() == Replica` check (line 791).
 - **Attack/Impact:** Any node with `SUBPROTOCOL_REDEX` reachability can (a) become `believed_leader` for any replicated channel, suppressing real-leader election; (b) ship arbitrary `SyncResponse` chunks that `apply_sync_response` writes to the local log via `append_batch`; (c) inject `SyncNack{BadRange}` to make replicas `skip_to(since_seq+1)`, deleting local log segments. The earlier capability/auth fixes (A-1..A-3) landed on the publish path; the replication subprotocol was not in their scope.
-- **Fix sketch:** Gate every `on_inbound` entry on `inputs.replica_set.contains(&from)`; for `SyncResponse`/`SyncNack` additionally require `from == tracker.believed_leader()`.
+- **Fix:** `on_inbound` builds a `from_node: Option<NodeId>` per Inbound variant (Shutdown is local-only and skipped); membership-checks against `inputs.replica_set` at function entry. SyncResponse and SyncNack additionally require `from == tracker.believed_leader()`. Regression tests: `inbound_from_non_replica_set_peer_is_dropped` (out-of-set heartbeat must not seed believed_leader; out-of-set SyncResponse must not advance local tail); `sync_response_from_non_leader_replica_peer_is_dropped` (in-set non-leader peer cannot ship state-mutating chunks). Two-layer gate keeps the surface narrow even if replica_set membership itself is later compromised. Commit `c62998e3`.
 
 ### R-21 — Permanent dual-leader: FSM has no `Leader → Replica` transition
 - **File:** `src/adapter/net/redex/replication_state.rs:122-149`; `replication_election.rs:494-532`; `replication_runtime.rs:651-989`
