@@ -106,12 +106,12 @@ pub struct ScopedToken {
 
 /// A signed, delegatable permission token.
 ///
-/// Wire format (161 bytes):
+/// Wire format (165 bytes):
 /// ```text
 /// issuer:           32 bytes (EntityId)
 /// subject:          32 bytes (EntityId)
 /// scope:             4 bytes (u32)
-/// channel_hash:      4 bytes (ChannelHash, u32; combine with WILDCARD scope for "all channels")
+/// channel_hash:      8 bytes (ChannelHash, u64; combine with WILDCARD scope for "all channels")
 /// not_before:        8 bytes (u64 unix timestamp)
 /// not_after:         8 bytes (u64 unix timestamp)
 /// delegation_depth:  1 byte  (u8)
@@ -119,6 +119,15 @@ pub struct ScopedToken {
 /// --- signed above ---
 /// signature:        64 bytes (ed25519)
 /// ```
+///
+/// The `channel_hash` width was widened from 4 bytes (u32) to 8
+/// bytes (u64) to close a targeted-collision attack on
+/// `TokenCache::check`: under the prior width, an attacker willing
+/// to do ~2^32 work could grind a channel name whose `xxh3_64 as u32`
+/// matched a victim channel's, get a permissive issuer to sign a
+/// token for the grinded name, and use it against the victim
+/// channel via the hash-keyed fast-path cache. The full xxh3_64
+/// keyspace raises the attack cost to ~2^64.
 #[derive(Clone)]
 pub struct PermissionToken {
     /// Who issued this token.
@@ -144,10 +153,10 @@ pub struct PermissionToken {
 
 impl PermissionToken {
     /// Size of the signed payload (everything before the signature).
-    const SIGNED_PAYLOAD_SIZE: usize = 32 + 32 + 4 + 4 + 8 + 8 + 1 + 8; // 97 bytes
+    const SIGNED_PAYLOAD_SIZE: usize = 32 + 32 + 4 + 8 + 8 + 8 + 1 + 8; // 101 bytes
 
     /// Total serialized size.
-    pub const WIRE_SIZE: usize = Self::SIGNED_PAYLOAD_SIZE + 64; // 161 bytes
+    pub const WIRE_SIZE: usize = Self::SIGNED_PAYLOAD_SIZE + 64; // 165 bytes
 
     /// Issue a new token.
     ///
@@ -439,8 +448,10 @@ impl PermissionToken {
         off += 32;
         buf[off..off + 4].copy_from_slice(&self.scope.bits().to_le_bytes());
         off += 4;
-        buf[off..off + 4].copy_from_slice(&self.channel_hash.to_le_bytes());
-        off += 4;
+        // 8 bytes for channel_hash (u64) — see WIRE_SIZE comment for
+        // why the width was raised from 4.
+        buf[off..off + 8].copy_from_slice(&self.channel_hash.to_le_bytes());
+        off += 8;
         buf[off..off + 8].copy_from_slice(&self.not_before.to_le_bytes());
         off += 8;
         buf[off..off + 8].copy_from_slice(&self.not_after.to_le_bytes());
@@ -473,16 +484,17 @@ impl PermissionToken {
             return Err(TokenError::InvalidFormat);
         }
 
+        // Offsets reflect the widened channel_hash (8 bytes) at byte 68.
         let issuer = EntityId::from_bytes(data[0..32].try_into().unwrap());
         let subject = EntityId::from_bytes(data[32..64].try_into().unwrap());
         let scope = TokenScope::from_bits(u32::from_le_bytes(data[64..68].try_into().unwrap()));
-        let channel_hash = ChannelHash::from_le_bytes(data[68..72].try_into().unwrap());
-        let not_before = u64::from_le_bytes(data[72..80].try_into().unwrap());
-        let not_after = u64::from_le_bytes(data[80..88].try_into().unwrap());
-        let delegation_depth = data[88];
-        let nonce = u64::from_le_bytes(data[89..97].try_into().unwrap());
+        let channel_hash = ChannelHash::from_le_bytes(data[68..76].try_into().unwrap());
+        let not_before = u64::from_le_bytes(data[76..84].try_into().unwrap());
+        let not_after = u64::from_le_bytes(data[84..92].try_into().unwrap());
+        let delegation_depth = data[92];
+        let nonce = u64::from_le_bytes(data[93..101].try_into().unwrap());
         let mut signature = [0u8; 64];
-        signature.copy_from_slice(&data[97..161]);
+        signature.copy_from_slice(&data[101..165]);
 
         Ok(Self {
             issuer,
@@ -1330,6 +1342,51 @@ mod tests {
         assert!(cache
             .check(unknown.entity_id(), TokenScope::PUBLISH, 0xABCD)
             .is_err());
+    }
+
+    /// A token bound to channel hash `H_a` (u64) must NOT authorize a
+    /// channel whose hash `H_b` collides with `H_a` only in the low
+    /// 32 bits. Pre-widening, ChannelHash was xxh3_64(name) as u32, so
+    /// any two names sharing the low 32 bits of the xxh3_64 digest
+    /// hashed equal. Now the cache and `authorizes` consume the full
+    /// u64, so two hashes that differ in the high 32 bits cannot
+    /// authorize each other — closing the targeted-collision attack
+    /// on the token fast path.
+    #[test]
+    fn token_cache_check_distinguishes_u32_aliased_u64_hashes() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+
+        let cache = TokenCache::new();
+        // Two hashes that share the low 32 bits but differ in the high
+        // 32 bits — exactly the shape a 2^32 grinding attack would have
+        // produced under the old `as u32` cast.
+        let h_a: ChannelHash = 0x0000_0001_DEAD_BEEF;
+        let h_b: ChannelHash = 0xDEAD_BEEF_DEAD_BEEF;
+        assert_ne!(h_a, h_b);
+        assert_eq!(h_a as u32, h_b as u32, "test setup: low 32 must alias");
+
+        let token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            h_a,
+            3600,
+            0,
+        );
+        cache.insert(token).expect("token should verify");
+
+        // The legitimate channel admits the token.
+        assert!(cache
+            .check(subject.entity_id(), TokenScope::PUBLISH, h_a)
+            .is_ok());
+        // The u32-aliased channel must NOT admit it.
+        assert!(
+            cache
+                .check(subject.entity_id(), TokenScope::PUBLISH, h_b)
+                .is_err(),
+            "token bound to h_a must not authorize h_b that aliases on low 32 bits"
+        );
     }
 
     #[test]

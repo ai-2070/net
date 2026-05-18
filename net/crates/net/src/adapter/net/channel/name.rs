@@ -3,11 +3,15 @@
 //! Channels are hierarchical named endpoints (e.g. `"sensors/lidar/front"`).
 //! Two hashes are derived from the name via xxh3:
 //!
-//! - **Canonical [`ChannelHash`] (`u32`)** — used as the substrate-wide key
+//! - **Canonical [`ChannelHash`] (`u64`)** — used as the substrate-wide key
 //!   for auth (`AuthGuard`, `PermissionToken`), config (`ChannelConfigMap`),
-//!   storage (`RedexFile`), and metrics. ~4B buckets; birthday-collision
-//!   threshold ~65 K channels per process is well above realistic deployment
-//!   sizes, so this key is treated as collision-free in fast paths.
+//!   storage (`RedexFile`), and metrics. Full xxh3_64 keyspace; targeted
+//!   second-preimage attacks need ~2^64 work even with a non-cryptographic
+//!   hash. Pre-fix the canonical key was a `u32` truncation of xxh3_64;
+//!   an attacker willing to do ~2^32 work could grind a channel-name
+//!   collision and use a token issued for the grinded name to bypass the
+//!   `TokenCache::check` fast path for an unrelated victim channel that
+//!   happened to hash to the same `u32` bucket.
 //! - **Wire `u16`** — the fast-path hint stamped on every outgoing packet
 //!   header for wire-speed filtering by forwarding nodes. 65 K buckets;
 //!   routine collisions at scale. Mirrors the
@@ -24,11 +28,11 @@ pub const MAX_NAME_LEN: usize = 255;
 
 /// Substrate-wide canonical hash for a [`ChannelName`].
 ///
-/// 32-bit. Used as the canonical key for ACL, storage, and config decisions.
+/// 64-bit. Used as the canonical key for ACL, storage, and config decisions.
 /// Distinct from the wire `u16` hash on `NetHeader::channel_hash`, which is
 /// a per-packet fast-path filter hint and may collide; the canonical
 /// `ChannelHash` is what auth and storage decisions must key on.
-pub type ChannelHash = u32;
+pub type ChannelHash = u64;
 
 /// A validated channel name.
 ///
@@ -51,11 +55,11 @@ impl ChannelName {
         &self.0
     }
 
-    /// Compute the canonical [`ChannelHash`] (32-bit) for the name.
+    /// Compute the canonical [`ChannelHash`] (64-bit) for the name.
     ///
     /// This is the substrate-wide key used for ACL, storage, and config
-    /// decisions. Collision-resistant at realistic deployment scale
-    /// (~65 K channels before birthday-collision threshold).
+    /// decisions. Targeted second-preimage attacks require ~2^64 work
+    /// even though xxh3 is non-cryptographic.
     #[inline]
     pub fn hash(&self) -> ChannelHash {
         channel_hash(&self.0)
@@ -137,12 +141,12 @@ impl std::fmt::Display for ChannelName {
 
 /// Compute the canonical [`ChannelHash`] (32-bit) from a name string.
 ///
-/// Uses xxh3_64 truncated to 32 bits. This is the substrate-wide canonical
-/// key for ACL, storage, and config — collision-resistant at realistic
-/// deployment scale.
+/// Full xxh3_64. This is the substrate-wide canonical key for ACL,
+/// storage, and config. Targeted second-preimage attacks need ~2^64
+/// work even though xxh3 is non-cryptographic.
 #[inline]
 pub fn channel_hash(name: &str) -> ChannelHash {
-    xxh3_64(name.as_bytes()) as u32
+    xxh3_64(name.as_bytes())
 }
 
 /// Compute the wire `u16` channel hash from a name string.
@@ -548,15 +552,15 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_hash_is_u32_and_wire_is_u16() {
-        // The canonical hash is u32 (4 bytes); the wire hash is u16
+    fn test_canonical_hash_is_u64_and_wire_is_u16() {
+        // The canonical hash is u64 (8 bytes); the wire hash is u16
         // (2 bytes) and equals the low 16 bits of the canonical hash.
         let name = "sensors/lidar";
         let canonical: ChannelHash = channel_hash(name);
         let wire: u16 = wire_channel_hash(name);
         assert_eq!(canonical as u16, wire);
         // Width assertions.
-        assert_eq!(std::mem::size_of::<ChannelHash>(), 4);
+        assert_eq!(std::mem::size_of::<ChannelHash>(), 8);
         assert_eq!(std::mem::size_of_val(&wire), 2);
     }
 

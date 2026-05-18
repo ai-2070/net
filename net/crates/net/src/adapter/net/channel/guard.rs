@@ -435,9 +435,9 @@ impl std::fmt::Debug for AuthGuard {
 /// Compute bloom filter key from (origin_hash, channel_hash).
 #[inline]
 fn bloom_key(origin_hash: u64, channel_hash: ChannelHash) -> u64 {
-    let mut buf = [0u8; 12];
+    let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&origin_hash.to_le_bytes());
-    buf[8..12].copy_from_slice(&channel_hash.to_le_bytes());
+    buf[8..16].copy_from_slice(&channel_hash.to_le_bytes());
     xxh3_64(&buf)
 }
 

@@ -2561,12 +2561,12 @@ pub extern "C" fn net_delegate_token(
     }
 }
 
-/// Hash a channel name to its canonical 32-bit [`ChannelHash`]
+/// Hash a channel name to its canonical 64-bit [`ChannelHash`]
 /// (substrate-wide ACL / config / storage key). The 16-bit wire
 /// hash used by `NetHeader::channel_hash` is the low 16 bits of
 /// the returned value. Returns `NET_ERR_IDENTITY` for invalid names.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_channel_hash(channel: *const c_char, out_hash: *mut u32) -> c_int {
+pub extern "C" fn net_channel_hash(channel: *const c_char, out_hash: *mut u64) -> c_int {
     if channel.is_null() || out_hash.is_null() {
         return NetError::NullPointer.into();
     }
