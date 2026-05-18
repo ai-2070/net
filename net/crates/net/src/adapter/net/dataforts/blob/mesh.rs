@@ -994,6 +994,160 @@ impl MeshBlobAdapter {
         )
     }
 
+    /// Internal: walk the tree from a node, fetching every
+    /// `TreeNode` along the descent + the spanning chunks at the
+    /// leaves. Each node is BLAKE3-verified against the parent's
+    /// stored child-hash entry (tree-walk integrity); each chunk
+    /// is verified by the existing `fetch_chunk` path.
+    ///
+    /// `residual_depth` is the number of internal-node levels
+    /// still expected below this point. A leaf reached at any
+    /// `residual_depth >= 0` is accepted (shorter-than-claimed
+    /// trees read cleanly); an internal node at `residual_depth
+    /// == 0` is rejected (the producer claimed a depth shallower
+    /// than the actual structure).
+    ///
+    /// `range_start` / `range_end` are byte offsets WITHIN this
+    /// subtree (0..subtree_size). The caller normalises before
+    /// the first call (root subtree spans [0, total_size)).
+    ///
+    /// Returns the requested byte slice in order. `touched` is
+    /// extended with every `TreeNode` hash + every leaf chunk
+    /// hash walked — used by the data-gravity heat-bump path.
+    fn walk_tree_range<'a>(
+        &'a self,
+        node_hash: [u8; 32],
+        subtree_size: u64,
+        residual_depth: u8,
+        range_start: u64,
+        range_end: u64,
+        touched: &'a mut Vec<[u8; 32]>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, BlobError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // Cheap guard: empty range short-circuits the fetch.
+            if range_end <= range_start {
+                return Ok(Vec::new());
+            }
+            if range_end > subtree_size {
+                return Err(BlobError::Backend(format!(
+                    "tree walk: range.end {} exceeds subtree_size {}",
+                    range_end, subtree_size
+                )));
+            }
+            // Fetch the node's bytes (each tree node is itself a
+            // chunk-shaped Small blob at `dataforts/blob/<hex32>`).
+            let node_bytes = self.fetch_chunk(&node_hash).await?;
+            // BLAKE3 cross-check against the parent's stored
+            // child hash. `fetch_chunk` already verifies; the
+            // re-check here is defense-in-depth + makes the
+            // tree-walk integrity invariant explicit at this
+            // layer.
+            let computed: [u8; 32] = blake3::hash(&node_bytes).into();
+            if computed != node_hash {
+                return Err(BlobError::HashMismatch {
+                    expected: node_hash,
+                    actual: computed,
+                });
+            }
+            touched.push(node_hash);
+            let node = super::blob_tree::TreeNode::decode(&node_bytes)?;
+            // Cross-check: the node's covered_bytes must match
+            // what the parent advertised for this subtree.
+            // Catches a peer-supplied node whose body decoded
+            // cleanly but doesn't actually cover the claimed
+            // byte range.
+            if node.covered_bytes() != subtree_size {
+                return Err(BlobError::Decode(format!(
+                    "tree walk: node covers {} bytes but parent advertised {}",
+                    node.covered_bytes(),
+                    subtree_size
+                )));
+            }
+            match node {
+                super::blob_tree::TreeNode::Internal { children } => {
+                    if residual_depth == 0 {
+                        // BlobRef::Tree.depth claimed the tree
+                        // ends at this level; finding an internal
+                        // here means the actual structure is
+                        // deeper. Reject as malformed.
+                        return Err(BlobError::Decode(
+                            "tree walk: internal node at residual_depth=0 — \
+                             actual tree deeper than BlobRef::Tree.depth claims"
+                                .to_owned(),
+                        ));
+                    }
+                    let mut out: Vec<u8> = Vec::new();
+                    let mut offset: u64 = 0;
+                    for (child_hash, child_size) in children {
+                        let child_start = offset;
+                        let child_end = offset.saturating_add(child_size);
+                        offset = child_end;
+                        // Skip children outside the requested range.
+                        if child_end <= range_start || child_start >= range_end {
+                            continue;
+                        }
+                        // Translate the global range into the
+                        // child's local range.
+                        let sub_start = range_start.saturating_sub(child_start);
+                        let sub_end = range_end
+                            .saturating_sub(child_start)
+                            .min(child_size);
+                        let child_bytes = self
+                            .walk_tree_range(
+                                child_hash,
+                                child_size,
+                                residual_depth - 1,
+                                sub_start,
+                                sub_end,
+                                touched,
+                            )
+                            .await?;
+                        out.extend_from_slice(&child_bytes);
+                    }
+                    Ok(out)
+                }
+                super::blob_tree::TreeNode::Leaf { chunks } => {
+                    let mut out: Vec<u8> = Vec::new();
+                    let mut offset: u64 = 0;
+                    for chunk in chunks {
+                        let chunk_start = offset;
+                        let chunk_size_u64 = chunk.size as u64;
+                        let chunk_end = offset.saturating_add(chunk_size_u64);
+                        offset = chunk_end;
+                        if chunk_end <= range_start || chunk_start >= range_end {
+                            continue;
+                        }
+                        let sub_start = range_start.saturating_sub(chunk_start);
+                        let sub_end = range_end
+                            .saturating_sub(chunk_start)
+                            .min(chunk_size_u64);
+                        let chunk_bytes = self.fetch_chunk(&chunk.hash).await?;
+                        if (chunk_bytes.len() as u64) != chunk_size_u64 {
+                            return Err(BlobError::ShortChunk {
+                                hash: chunk.hash,
+                                requested_start: sub_start,
+                                requested_end: sub_end,
+                                actual_len: chunk_bytes.len() as u64,
+                            });
+                        }
+                        let slice = chunk_bytes
+                            .get(sub_start as usize..sub_end as usize)
+                            .ok_or(BlobError::ShortChunk {
+                                hash: chunk.hash,
+                                requested_start: sub_start,
+                                requested_end: sub_end,
+                                actual_len: chunk_bytes.len() as u64,
+                            })?;
+                        out.extend_from_slice(slice);
+                        touched.push(chunk.hash);
+                    }
+                    Ok(out)
+                }
+            }
+        })
+    }
+
     /// Internal: persist a single tree chunk + push it into the
     /// builder + persist any cascade-closed nodes. Centralised so
     /// the chunker loop above stays compact.
@@ -1495,19 +1649,33 @@ impl BlobAdapter for MeshBlobAdapter {
                     (Ok(out), touched)
                 }
             }
-            BlobRef::Tree { .. } => {
-                // Tree path lands in Phase A4 (`TreeWalker`).
-                // Until then, surface a typed error so callers
-                // upgrade their fetch path explicitly rather
-                // than receiving misleading data.
-                (
-                    Err(BlobError::Backend(
-                        "mesh blob: fetch_range(BlobRef::Tree) is not yet implemented \
-                         (Phase A4 / `TreeWalker`)"
-                            .to_owned(),
-                    )),
-                    Vec::new(),
-                )
+            BlobRef::Tree {
+                root_hash,
+                total_size,
+                depth,
+                ..
+            } => {
+                if range.end > *total_size {
+                    return Err(BlobError::Backend(format!(
+                        "mesh blob: range.end {} exceeds Tree total_size {}",
+                        range.end, total_size
+                    )));
+                }
+                let mut touched = Vec::new();
+                let walk_result = self
+                    .walk_tree_range(
+                        *root_hash,
+                        *total_size,
+                        *depth,
+                        range.start,
+                        range.end,
+                        &mut touched,
+                    )
+                    .await;
+                match walk_result {
+                    Ok(bytes) => (Ok(bytes), touched),
+                    Err(e) => (Err(e), Vec::new()),
+                }
             }
         };
         if result.is_ok() && !touched.is_empty() {
@@ -3272,6 +3440,181 @@ mod tests {
             assert_eq!(leaf.arity(), TREE_FANOUT);
             assert_eq!(full_leaf_size, BLOB_CHUNK_SIZE_BYTES * TREE_FANOUT as u64);
         }
+    }
+
+    // ────────────────────────────────────────────────────────
+    // fetch_range tree walk (Phase A4)
+    // ────────────────────────────────────────────────────────
+
+    /// Full round-trip: store via tree, fetch back byte-for-byte
+    /// via fetch_range with range = 0..total_size.
+    #[tokio::test]
+    async fn fetch_range_tree_full_blob_round_trips() {
+        let adapter = make_adapter();
+        let len = BLOB_CHUNK_SIZE_BYTES as usize * 2 + 12345;
+        let payload = deterministic_bytes(0xA1, len);
+        let blob_ref = adapter
+            .store_stream_tree(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        // Fetch the entire range.
+        let fetched = adapter
+            .fetch_range(&blob_ref, 0..len as u64)
+            .await
+            .expect("full-range fetch succeeds");
+        assert_eq!(fetched, payload, "byte-for-byte match");
+    }
+
+    /// Range query that lands entirely inside one chunk returns
+    /// the matching slice.
+    #[tokio::test]
+    async fn fetch_range_tree_intra_chunk_slice() {
+        let adapter = make_adapter();
+        let len = BLOB_CHUNK_SIZE_BYTES as usize * 3;
+        let payload = deterministic_bytes(0xA2, len);
+        let blob_ref = adapter
+            .store_stream_tree(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        // Pick a range inside the middle chunk.
+        let start = BLOB_CHUNK_SIZE_BYTES + 1000;
+        let end = BLOB_CHUNK_SIZE_BYTES + 5000;
+        let fetched = adapter.fetch_range(&blob_ref, start..end).await.unwrap();
+        assert_eq!(fetched.len() as u64, end - start);
+        assert_eq!(fetched, &payload[start as usize..end as usize]);
+    }
+
+    /// Range query that straddles a chunk boundary fetches both
+    /// chunks and stitches the slice correctly.
+    #[tokio::test]
+    async fn fetch_range_tree_cross_chunk_boundary() {
+        let adapter = make_adapter();
+        let len = BLOB_CHUNK_SIZE_BYTES as usize * 3;
+        let payload = deterministic_bytes(0xA3, len);
+        let blob_ref = adapter
+            .store_stream_tree(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        // Range that crosses the first/second chunk boundary.
+        let start = BLOB_CHUNK_SIZE_BYTES - 1000;
+        let end = BLOB_CHUNK_SIZE_BYTES + 1000;
+        let fetched = adapter.fetch_range(&blob_ref, start..end).await.unwrap();
+        assert_eq!(fetched, &payload[start as usize..end as usize]);
+    }
+
+    /// Range query at a depth-2 tree that straddles a child-
+    /// subtree boundary (different LEAVES) fetches both leaves
+    /// and stitches correctly.
+    #[tokio::test]
+    async fn fetch_range_tree_cross_leaf_boundary_depth_two() {
+        let adapter = make_adapter();
+        let len = BLOB_CHUNK_SIZE_BYTES as usize * (TREE_FANOUT + 1);
+        let payload = deterministic_bytes(0xA4, len);
+        let blob_ref = adapter
+            .store_stream_tree(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blob_ref.tree_depth(), Some(2));
+        // The first leaf covers FANOUT chunks = FANOUT * 4 MiB.
+        // The second leaf covers the trailing 1 chunk.
+        // Range crosses the leaf boundary.
+        let leaf_boundary = BLOB_CHUNK_SIZE_BYTES * TREE_FANOUT as u64;
+        let start = leaf_boundary - 500;
+        let end = leaf_boundary + 500;
+        let fetched = adapter.fetch_range(&blob_ref, start..end).await.unwrap();
+        assert_eq!(fetched, &payload[start as usize..end as usize]);
+    }
+
+    /// Zero-length range short-circuits without any fetches.
+    #[tokio::test]
+    async fn fetch_range_tree_zero_length_returns_empty() {
+        let adapter = make_adapter();
+        let len = BLOB_CHUNK_SIZE_BYTES as usize;
+        let payload = deterministic_bytes(0xA5, len);
+        let blob_ref = adapter
+            .store_stream_tree(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        let fetched = adapter.fetch_range(&blob_ref, 100..100).await.unwrap();
+        assert_eq!(fetched.len(), 0);
+    }
+
+    /// Range that exceeds total_size is rejected with a typed
+    /// error (the BlobRef pre-check fires before the walk).
+    #[tokio::test]
+    async fn fetch_range_tree_rejects_out_of_bounds() {
+        let adapter = make_adapter();
+        let len = BLOB_CHUNK_SIZE_BYTES as usize;
+        let payload = deterministic_bytes(0xA6, len);
+        let blob_ref = adapter
+            .store_stream_tree(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        let err = adapter
+            .fetch_range(&blob_ref, 0..(len as u64 + 1))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Tree total_size"), "got: {msg}");
+    }
+
+    /// Tree-walk integrity: a node fetched from disk whose bytes
+    /// don't BLAKE3-match the parent's stored child hash is
+    /// rejected. We synthesize this by storing a tree, then
+    /// corrupting the root by replacing it with a different
+    /// node's bytes — fetch_range then catches the mismatch.
+    ///
+    /// (We can't easily corrupt the chunk file in-place from
+    /// the test; instead we construct a BlobRef::Tree with a
+    /// root_hash that doesn't match any stored content. The
+    /// walker's first `fetch_chunk` call surfaces a NotFound.
+    /// That's the existing v0.2 store-side integrity — the
+    /// explicit hash recheck inside walk_tree_range adds
+    /// defense-in-depth.)
+    #[tokio::test]
+    async fn fetch_range_tree_rejects_unknown_root() {
+        let adapter = make_adapter();
+        // Construct a BlobRef::Tree referencing a hash no chunk
+        // store has ever seen.
+        let bogus_root = [0xDE; 32];
+        let blob_ref = BlobRef::tree(
+            "mesh://deadbeef",
+            Encoding::Replicated,
+            bogus_root,
+            1024,
+            1,
+        )
+        .unwrap();
+        let err = adapter.fetch_range(&blob_ref, 0..512).await.unwrap_err();
+        // Either NotFound or HashMismatch is acceptable here —
+        // the chunk file doesn't exist, so the underlying fetch
+        // path surfaces a typed error. Pin that we DO surface an
+        // error rather than returning empty bytes.
+        let _ = err; // any error is fine; assert we got one
     }
 
     /// `store_stream_tree`'s root_depth always lies in
