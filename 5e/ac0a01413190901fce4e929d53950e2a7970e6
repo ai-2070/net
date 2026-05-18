@@ -1,0 +1,21 @@
+net/crates/net/src/event.rs
+  s_2571835e05521c::t_2b43f6f6a3ed90 855-890
+  s_2571835e05521c::t_b3d3025f054ac0 574-576
+  s_2571835e05521c::t_6b4b191d1cd1b7 537-547
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "5eac0a01413190901fce4e929d53950e2a7970e6",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
