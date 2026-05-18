@@ -85,21 +85,87 @@ impl PyBlobRef {
         self.inner.uri()
     }
 
-    /// 32-byte BLAKE3 hash of the content. For Small (the only
-    /// variant the Python constructor produces today); v0.2 will
-    /// surface chunked manifests via a separate accessor.
+    /// 32-byte BLAKE3 hash of the content. Defined for the v0.15
+    /// `Small` variant; returns 32 zero bytes for `Manifest` /
+    /// `Tree` (chunked variants reference many hashes — use
+    /// `tree_root_hash` for `Tree`, or walk the manifest's chunk
+    /// list for `Manifest`). Callers should check `is_chunked`
+    /// first to know whether this getter is meaningful.
     #[getter]
     fn hash<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        let hash = self
-            .inner
-            .small_hash()
-            .expect("PyBlobRef constructor only produces Small variants");
-        PyBytes::new(py, hash)
+        let hash = self.inner.small_hash().copied().unwrap_or([0; 32]);
+        PyBytes::new(py, &hash)
     }
 
     #[getter]
     fn size(&self) -> u64 {
         self.inner.size()
+    }
+
+    /// `True` for the v0.3 `Tree` variant; `False` for `Small`
+    /// or `Manifest`.
+    #[getter]
+    fn is_tree(&self) -> bool {
+        self.inner.is_tree()
+    }
+
+    /// `True` for any chunked variant (`Manifest` or `Tree`);
+    /// `False` for `Small`.
+    #[getter]
+    fn is_chunked(&self) -> bool {
+        self.inner.is_chunked()
+    }
+
+    /// 32-byte BLAKE3 hash of the root `TreeNode` body. Defined
+    /// only for the v0.3 `Tree` variant; returns 32 zero bytes
+    /// for `Small` / `Manifest`. Check `is_tree` first.
+    #[getter]
+    fn tree_root_hash<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        let hash = self.inner.tree_root_hash().copied().unwrap_or([0; 32]);
+        PyBytes::new(py, &hash)
+    }
+
+    /// Tree depth (1..=MAX_TREE_DEPTH = 4). Defined only for the
+    /// v0.3 `Tree` variant; returns `0` for `Small` / `Manifest`.
+    /// Check `is_tree` first.
+    #[getter]
+    fn tree_depth(&self) -> u8 {
+        self.inner.tree_depth().unwrap_or(0)
+    }
+
+    /// Construct a v0.3 `Tree` `BlobRef` from `(uri, root_hash,
+    /// total_size, depth)`. `root_hash` must be exactly 32 bytes;
+    /// `depth` must be in `1..=4`; `total_size` must be in
+    /// `1..=128 PiB`. Encoding defaults to `Replicated`.
+    ///
+    /// Producers usually build trees implicitly via
+    /// `MeshBlobAdapter.store_stream_tree`; this static method
+    /// exists for callers that hold pre-built tree state
+    /// (e.g. tests, cross-language migration tooling).
+    #[staticmethod]
+    fn tree_from_parts(
+        uri: String,
+        root_hash: Vec<u8>,
+        total_size: u64,
+        depth: u8,
+    ) -> PyResult<Self> {
+        if root_hash.len() != 32 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "tree_from_parts root_hash must be 32 bytes, got {}",
+                root_hash.len()
+            )));
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&root_hash);
+        InnerBlobRef::tree(
+            uri,
+            ::net::adapter::net::dataforts::Encoding::Replicated,
+            hash,
+            total_size,
+            depth,
+        )
+        .map(|inner| Self { inner })
+        .map_err(map_blob_err)
     }
 
     /// Emit the wire-encoded form (discriminator + version + hash +
@@ -123,13 +189,32 @@ impl PyBlobRef {
     }
 
     fn __repr__(&self) -> String {
-        let hash = self.inner.small_hash().copied().unwrap_or([0; 32]);
-        format!(
-            "BlobRef(uri={:?}, size={}, hash={})",
-            self.inner.uri(),
-            self.inner.size(),
-            hex32(&hash)
-        )
+        // Discriminate by variant so chunked refs don't render
+        // a misleading all-zeros `hash=` field.
+        if let Some(root) = self.inner.tree_root_hash() {
+            format!(
+                "BlobRef(Tree, uri={:?}, size={}, depth={}, root_hash={})",
+                self.inner.uri(),
+                self.inner.size(),
+                self.inner.tree_depth().unwrap_or(0),
+                hex32(root)
+            )
+        } else if self.inner.is_chunked() {
+            format!(
+                "BlobRef(Manifest, uri={:?}, size={}, chunks={})",
+                self.inner.uri(),
+                self.inner.size(),
+                self.inner.chunks().len()
+            )
+        } else {
+            let hash = self.inner.small_hash().copied().unwrap_or([0; 32]);
+            format!(
+                "BlobRef(Small, uri={:?}, size={}, hash={})",
+                self.inner.uri(),
+                self.inner.size(),
+                hex32(&hash)
+            )
+        }
     }
 }
 

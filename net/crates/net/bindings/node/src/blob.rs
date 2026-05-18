@@ -131,6 +131,83 @@ impl BlobRef {
             )),
         }
     }
+
+    /// `true` for the v0.3 [`BlobRef::Tree`] variant; `false` for
+    /// Small or Manifest.
+    #[napi(getter)]
+    pub fn is_tree(&self) -> bool {
+        self.inner.is_tree()
+    }
+
+    /// `true` for any chunked variant (Manifest or Tree); `false`
+    /// for Small.
+    #[napi(getter)]
+    pub fn is_chunked(&self) -> bool {
+        self.inner.is_chunked()
+    }
+
+    /// 32-byte BLAKE3 hash of the root `TreeNode` body. Defined
+    /// only for the v0.3 `Tree` variant; returns an empty Buffer
+    /// (zeros) for Small / Manifest. JS callers should check
+    /// `isTree` first.
+    #[napi(getter)]
+    pub fn tree_root_hash(&self) -> Buffer {
+        Buffer::from(
+            self.inner
+                .tree_root_hash()
+                .copied()
+                .unwrap_or([0; 32])
+                .to_vec(),
+        )
+    }
+
+    /// Tree depth (1..=`MAX_TREE_DEPTH`). Defined only for the
+    /// v0.3 `Tree` variant; returns `0` for Small / Manifest.
+    /// JS callers should check `isTree` first.
+    #[napi(getter)]
+    pub fn tree_depth(&self) -> u8 {
+        self.inner.tree_depth().unwrap_or(0)
+    }
+
+    /// Construct a v0.3 [`BlobRef::Tree`] from `(uri,
+    /// rootHash, totalSize, depth)`. `rootHash` must be exactly
+    /// 32 bytes; `depth` must be in `1..=MAX_TREE_DEPTH` (= 4);
+    /// `totalSize` must be in `1..=128 PiB`. Encoding defaults
+    /// to `Replicated` (only encoding supported in v0.3 Phase A).
+    ///
+    /// Producers usually construct trees implicitly via
+    /// `MeshBlobAdapter::store_stream_tree`; this factory exists
+    /// for callers that hold pre-built tree state (e.g. tests,
+    /// cross-language migration tooling).
+    #[napi(factory, js_name = "treeFromParts")]
+    pub fn tree_from_parts(
+        uri: String,
+        root_hash: Buffer,
+        total_size: BigInt,
+        depth: u8,
+    ) -> Result<Self> {
+        if root_hash.len() != 32 {
+            return Err(blob_err(
+                "treeFromParts",
+                format!("rootHash must be 32 bytes, got {}", root_hash.len()),
+            ));
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&root_hash);
+        let (signed, total_u64, _losses) = total_size.get_u64();
+        if signed {
+            return Err(blob_err("treeFromParts", "totalSize must be non-negative"));
+        }
+        InnerBlobRef::tree(
+            uri,
+            ::net::adapter::net::dataforts::Encoding::Replicated,
+            hash,
+            total_u64,
+            depth,
+        )
+        .map(|inner| Self { inner })
+        .map_err(map_blob_err)
+    }
 }
 
 impl BlobRef {
