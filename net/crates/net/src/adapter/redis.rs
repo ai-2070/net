@@ -193,10 +193,15 @@ impl RedisAdapter {
         }
         // `initialized` is true but `conn` is None: this only happens
         // during a re-init race where another caller has flipped
-        // initialized=true but not yet stored the new conn. Treat as
-        // Shutdown since the adapter isn't currently ready to accept
-        // traffic.
-        self.conn.clone().ok_or(AdapterError::Shutdown)
+        // initialized=true but not yet stored the new conn. Surface
+        // as `Transient` (not `Shutdown`) so retry-aware callers
+        // back off and retry instead of giving up — `Shutdown`
+        // means the adapter is gone, but here it's actually mid-
+        // (re)initialization and the next call moments later will
+        // succeed once the new conn lands.
+        self.conn
+            .clone()
+            .ok_or_else(|| AdapterError::Transient("redis: re-init race; conn not yet set".into()))
     }
 
     /// Parse an XRANGE response into a `ShardPollResult`.
