@@ -551,11 +551,14 @@ impl MigrationSubprotocolHandler {
             MigrationMessage::ReplayComplete {
                 daemon_origin,
                 replayed_seq,
+                target_head,
             } => {
                 // Target finished replay — orchestrator initiates cutover
-                let cutover_msg = self
-                    .orchestrator
-                    .on_replay_complete(daemon_origin, replayed_seq)?;
+                let cutover_msg = self.orchestrator.on_replay_complete(
+                    daemon_origin,
+                    replayed_seq,
+                    target_head,
+                )?;
 
                 // Send CutoverNotify to source (from_node is the target that reported)
                 if let MigrationMessage::CutoverNotify { .. } = &cutover_msg {
@@ -820,10 +823,19 @@ impl MigrationSubprotocolHandler {
                 // We are the target — replay events
                 let replayed_seq = self.target_handler.replay_events(daemon_origin, events)?;
 
+                // Ship the freshly-replayed daemon's chain head to
+                // the orchestrator so its `SuperpositionState`'s
+                // continuity-proof anchor is the real cryptographic
+                // head, not a synthetic placeholder the orchestrator
+                // would have to fabricate when it lives on a third
+                // node and has no local registry entry to read from.
+                let target_head = self.target_handler.host_head_link(daemon_origin)?;
+
                 // Tell orchestrator we're done replaying
                 let reply = MigrationMessage::ReplayComplete {
                     daemon_origin,
                     replayed_seq,
+                    target_head,
                 };
                 let dest = self
                     .target_handler

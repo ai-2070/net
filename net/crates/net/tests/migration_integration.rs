@@ -90,6 +90,15 @@ fn make_event(origin: u64, seq: u64) -> CausalEvent {
     }
 }
 
+fn make_link(origin: u64, seq: u64) -> CausalLink {
+    CausalLink {
+        origin_hash: origin,
+        horizon_encoded: 0,
+        sequence: seq,
+        parent_hash: 0,
+    }
+}
+
 fn register_counter_daemon(registry: &DaemonRegistry, initial_count: u64) -> (EntityKeypair, u64) {
     let kp = EntityKeypair::generate();
     let origin = kp.origin_hash();
@@ -126,7 +135,9 @@ fn test_orchestrator_full_phase_chain() {
     assert!(buffered.is_none()); // no events buffered yet
 
     // Phase 3→4: Replay complete → cutover
-    let cutover_msg = orch.on_replay_complete(origin, 42).unwrap();
+    let cutover_msg = orch
+        .on_replay_complete(origin, 42, make_link(origin, 42))
+        .unwrap();
     assert_eq!(orch.status(origin), Some(MigrationPhase::Cutover));
     match cutover_msg {
         MigrationMessage::CutoverNotify { target_node, .. } => {
@@ -178,7 +189,8 @@ fn test_orchestrator_phase_chain() {
     );
 
     // Continue through remaining phases
-    orch.on_replay_complete(origin, 15).unwrap();
+    orch.on_replay_complete(origin, 15, make_link(origin, 15))
+        .unwrap();
     orch.on_cutover_acknowledged(origin).unwrap();
     orch.on_cleanup_complete(origin).unwrap();
     orch.on_activate_ack(origin, 15).unwrap();
@@ -268,7 +280,9 @@ fn test_end_to_end_migration_local_source() {
         .unwrap();
 
     // Phase 3→4: Replay complete
-    let cutover_msg = orch.on_replay_complete(origin, replayed_through).unwrap();
+    let cutover_msg = orch
+        .on_replay_complete(origin, replayed_through, make_link(origin, replayed_through))
+        .unwrap();
     match &cutover_msg {
         MigrationMessage::CutoverNotify { target_node, .. } => {
             assert_eq!(*target_node, 0x2222);
@@ -480,7 +494,8 @@ fn test_subprotocol_handler_cutover_notify_dispatch() {
     orch.start_migration(origin, 0x1111, 0x2222).unwrap();
     // Advance to replay→cutover
     orch.on_restore_complete(origin, 5).unwrap();
-    orch.on_replay_complete(origin, 5).unwrap();
+    orch.on_replay_complete(origin, 5, make_link(origin, 5))
+        .unwrap();
 
     // Now send CutoverNotify to the source via handler
     let cutover_msg = MigrationMessage::CutoverNotify {
@@ -521,7 +536,8 @@ fn test_subprotocol_handler_cleanup_complete_dispatch() {
     // Setup: start and advance migration to Complete
     orch.start_migration(origin, 0x1111, 0x2222).unwrap();
     orch.on_restore_complete(origin, 1).unwrap();
-    orch.on_replay_complete(origin, 1).unwrap();
+    orch.on_replay_complete(origin, 1, make_link(origin, 1))
+        .unwrap();
     orch.on_cutover_acknowledged(origin).unwrap();
     assert!(orch.is_migrating(origin));
 
@@ -577,7 +593,8 @@ fn test_regression_dispatch_arms_reject_unrelated_from_node() {
     // Source 0x1111, target 0x2222. 0x9999 is an attacker peer.
     orch.start_migration(origin, 0x1111, 0x2222).unwrap();
     orch.on_restore_complete(origin, 1).unwrap();
-    orch.on_replay_complete(origin, 1).unwrap();
+    orch.on_replay_complete(origin, 1, make_link(origin, 1))
+        .unwrap();
     orch.on_cutover_acknowledged(origin).unwrap();
 
     // CleanupComplete from a non-source peer must be rejected — the
@@ -931,7 +948,8 @@ fn test_concurrent_migrations_no_interference() {
 
     // Advance A through all phases
     orch.on_restore_complete(origin_a, 100).unwrap();
-    orch.on_replay_complete(origin_a, 100).unwrap();
+    orch.on_replay_complete(origin_a, 100, make_link(origin_a, 100))
+        .unwrap();
     orch.on_cutover_acknowledged(origin_a).unwrap();
     orch.on_cleanup_complete(origin_a).unwrap();
     orch.on_activate_ack(origin_a, 100).unwrap();
@@ -943,7 +961,8 @@ fn test_concurrent_migrations_no_interference() {
 
     // Advance B
     orch.on_restore_complete(origin_b, 200).unwrap();
-    orch.on_replay_complete(origin_b, 200).unwrap();
+    orch.on_replay_complete(origin_b, 200, make_link(origin_b, 200))
+        .unwrap();
     orch.on_cutover_acknowledged(origin_b).unwrap();
     orch.on_cleanup_complete(origin_b).unwrap();
     orch.on_activate_ack(origin_b, 200).unwrap();
@@ -1017,6 +1036,12 @@ fn test_wire_roundtrip_all_message_types() {
         MigrationMessage::ReplayComplete {
             daemon_origin: 0x5555,
             replayed_seq: 200,
+            target_head: CausalLink {
+                origin_hash: 0x5555,
+                horizon_encoded: 0,
+                sequence: 200,
+                parent_hash: 0xDEAD_BEEF,
+            },
         },
         MigrationMessage::CutoverNotify {
             daemon_origin: 0x6666,
@@ -1097,7 +1122,8 @@ fn test_abort_at_each_phase() {
         let orch = MigrationOrchestrator::new(reg.clone(), 0x1111);
         orch.start_migration(origin, 0x1111, 0x2222).unwrap();
         orch.on_restore_complete(origin, 4).unwrap();
-        orch.on_replay_complete(origin, 4).unwrap();
+        orch.on_replay_complete(origin, 4, make_link(origin, 4))
+            .unwrap();
         assert_eq!(orch.status(origin), Some(MigrationPhase::Cutover));
         orch.abort_migration(origin, "abort at cutover".into())
             .unwrap();
@@ -1141,6 +1167,12 @@ fn test_regression_cutover_routed_to_source_not_target() {
     let replay_msg = MigrationMessage::ReplayComplete {
         daemon_origin: origin,
         replayed_seq: 10,
+        target_head: CausalLink {
+            origin_hash: origin,
+            horizon_encoded: 0,
+            sequence: 10,
+            parent_hash: 0,
+        },
     };
     let outbound = handler
         .handle_message(&wire::encode(&replay_msg).unwrap(), target_node)
@@ -1375,6 +1407,12 @@ fn test_regression_full_handler_routing_chain() {
     let replay_msg = MigrationMessage::ReplayComplete {
         daemon_origin: origin,
         replayed_seq: 20,
+        target_head: CausalLink {
+            origin_hash: origin,
+            horizon_encoded: 0,
+            sequence: 20,
+            parent_hash: 0,
+        },
     };
     let outbound = handler
         .handle_message(&wire::encode(&replay_msg).unwrap(), target_node)
@@ -1423,6 +1461,52 @@ fn test_regression_full_handler_routing_chain() {
             );
         }
     }
+}
+
+/// Regression: third-party orchestrator (a node that is neither source
+/// nor target) used to fail `on_replay_complete` with `StateFailed`
+/// because it looked up `target_head` in its local daemon registry
+/// and found nothing. The target now ships `target_head` over the
+/// wire in `ReplayComplete`, so the orchestrator no longer needs the
+/// daemon to be locally registered.
+#[test]
+fn test_regression_on_replay_complete_third_party_orchestrator_no_local_daemon() {
+    // Set up an orchestrator on `local_node_id` with the daemon in
+    // its registry just so `start_migration` (local-source path) can
+    // advance phase. We then unregister the daemon — mirroring the
+    // production topology where A=orchestrator, B=source, C=target
+    // and A's registry never had the daemon — and verify
+    // `on_replay_complete` no longer requires the local lookup.
+    let orch_reg = Arc::new(DaemonRegistry::new());
+    let (_kp, origin) = register_counter_daemon(&orch_reg, 0);
+    let target_node: u64 = 0xBBBB;
+    let orch_node: u64 = 0xCCCC;
+
+    let orch = MigrationOrchestrator::new(orch_reg.clone(), orch_node);
+    orch.start_migration(origin, orch_node, target_node).unwrap();
+    orch.on_restore_complete(origin, 42).unwrap();
+    assert_eq!(orch.status(origin), Some(MigrationPhase::Replay));
+
+    // Drop the daemon to simulate a third-party orchestrator whose
+    // registry has no entry. Pre-fix this would have caused
+    // `on_replay_complete` to return `StateFailed`.
+    orch_reg.unregister(origin).unwrap();
+
+    // Target ships its head in ReplayComplete. The orchestrator
+    // accepts it without needing to consult any local registry.
+    let cutover_msg = orch
+        .on_replay_complete(origin, 42, make_link(origin, 42))
+        .expect("third-party orchestrator must advance past Replay");
+
+    match cutover_msg {
+        MigrationMessage::CutoverNotify {
+            target_node: tn, ..
+        } => {
+            assert_eq!(tn, target_node);
+        }
+        other => panic!("expected CutoverNotify, got {:?}", other),
+    }
+    assert_eq!(orch.status(origin), Some(MigrationPhase::Cutover));
 }
 
 /// Regression: CutoverNotify handler used to call `source_handler.cleanup()`

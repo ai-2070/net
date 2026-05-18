@@ -131,6 +131,12 @@ pub enum MigrationMessage {
         daemon_origin: u64,
         /// Sequence number replayed through.
         replayed_seq: u64,
+        /// Target's chain head after replay. The orchestrator stamps
+        /// this into its `SuperpositionState` so continuity proofs
+        /// carry the real cryptographic anchor even when the
+        /// orchestrator lives on a third node and has no local
+        /// daemon registry entry to read from.
+        target_head: CausalLink,
     },
 
     /// Phase 4: Source stops accepting writes, routing switches.
@@ -264,10 +270,12 @@ pub mod wire {
             MigrationMessage::ReplayComplete {
                 daemon_origin,
                 replayed_seq,
+                target_head,
             } => {
                 buf.put_u8(MSG_REPLAY_COMPLETE);
                 buf.put_u64_le(*daemon_origin);
                 buf.put_u64_le(*replayed_seq);
+                buf.extend_from_slice(&target_head.to_bytes());
             }
             MigrationMessage::CutoverNotify {
                 daemon_origin,
@@ -433,14 +441,25 @@ pub mod wire {
                 })
             }
             MSG_REPLAY_COMPLETE => {
-                if cur.remaining() < 16 {
+                // 8 (origin) + 8 (seq) + 32 (target_head) = 48
+                if cur.remaining() < 48 {
                     return Err(MigrationError::StateFailed(
                         "truncated ReplayComplete".into(),
                     ));
                 }
+                let daemon_origin = cur.get_u64_le();
+                let replayed_seq = cur.get_u64_le();
+                let mut head_bytes = [0u8; 32];
+                cur.copy_to_slice(&mut head_bytes);
+                let target_head = CausalLink::from_bytes(&head_bytes).ok_or_else(|| {
+                    MigrationError::StateFailed(
+                        "ReplayComplete: malformed target_head bytes".into(),
+                    )
+                })?;
                 Ok(MigrationMessage::ReplayComplete {
-                    daemon_origin: cur.get_u64_le(),
-                    replayed_seq: cur.get_u64_le(),
+                    daemon_origin,
+                    replayed_seq,
+                    target_head,
                 })
             }
             MSG_CUTOVER_NOTIFY => {
@@ -1492,11 +1511,19 @@ impl MigrationOrchestrator {
 
     /// Handle replay complete on target (phase 3→4).
     ///
+    /// `target_head` is the target's chain head after replay, shipped
+    /// over the wire by the target node. The orchestrator stamps it
+    /// into `SuperpositionState::target_replayed` so the continuity
+    /// proof carries the real cryptographic anchor even when the
+    /// orchestrator lives on a third node and has no local daemon
+    /// registry entry to read from.
+    ///
     /// Returns `CutoverNotify` to send to the source node.
     pub fn on_replay_complete(
         &self,
         daemon_origin: u64,
         replayed_seq: u64,
+        target_head: CausalLink,
     ) -> Result<MigrationMessage, MigrationError> {
         let entry = self
             .migrations
@@ -1505,68 +1532,20 @@ impl MigrationOrchestrator {
 
         let mut record = entry.lock();
 
-        // Query the freshly-replayed daemon for its *real* head
-        // link so the superposition's `target_head` carries the
-        // actual cryptographic anchor (parent_hash) — not a
-        // synthetic `parent_hash: 0` that no downstream verifier
-        // could ever reconcile against the chain. The replay just
-        // landed on this node's daemon
-        // registry, so the local host's chain head is by
-        // construction the head we just produced.
-        //
-        // If the daemon registry doesn't have the host (a Stale
-        // race after register/replace, or a snapshot-only path
-        // that didn't actually populate state), fall back to a
-        // synthetic link with `parent_hash: 0` and a
-        // `tracing::warn!`. The continuity proof from a synthetic
-        // link is unverifiable downstream — same failure mode as
-        // pre-fix — but at least the operator sees the gap.
-        let target_head = match self
-            .daemon_registry
-            .with_host(daemon_origin, |host| host.head_link())
-        {
-            Ok(link) => {
-                // Sanity: the host's head sequence should equal
-                // `replayed_seq`. If it doesn't, the replay
-                // pipeline diverged from what `on_replay_complete`
-                // was told. Use the host's head (it's the source
-                // of truth) but log so operators can spot the
-                // pipeline disagreement.
-                if link.sequence != replayed_seq {
-                    tracing::warn!(
-                        daemon_origin = format_args!("{:#x}", daemon_origin),
-                        host_seq = link.sequence,
-                        replayed_seq,
-                        "on_replay_complete: replayed_seq disagrees with host's chain \
-                         head sequence; using host's head as the authoritative anchor"
-                    );
-                }
-                link
-            }
-            Err(e) => {
-                // Pre-fix this fell through to a synthetic
-                // CausalLink { parent_hash: 0, ... } and a warn —
-                // every migration in a third-party-orchestrator
-                // topology shipped a known-wrong anchor that no
-                // downstream verifier could reconcile against the
-                // real chain, breaking the continuity-proof
-                // feature in exactly the topology the module docs
-                // claim it supports. Return a typed StateFailed
-                // instead so callers see the architectural gap and
-                // either move to a target-shipped target_head in
-                // ReplayComplete (the right long-term fix) or
-                // arrange to run on_replay_complete on the target
-                // node (which always has the host).
-                return Err(MigrationError::StateFailed(format!(
-                    "on_replay_complete: daemon {:#x} not registered locally — \
-                     orchestrator cannot synthesize a verifiable target_head. \
-                     Either run on_replay_complete on the target node, or \
-                     extend ReplayComplete with a target-shipped head_link \
-                     (underlying error: {:?})",
-                    daemon_origin, e
-                )));
-            }
-        };
+        // Sanity-check the wire-shipped head against the wire-shipped
+        // replayed_seq. A mismatch signals either a buggy target or a
+        // wire-level tamper; either way the link is no longer
+        // trustworthy as the migration's authoritative anchor.
+        if target_head.sequence != replayed_seq {
+            tracing::warn!(
+                daemon_origin = format_args!("{:#x}", daemon_origin),
+                head_seq = target_head.sequence,
+                replayed_seq,
+                "on_replay_complete: target_head.sequence disagrees with replayed_seq; \
+                 using target_head as-is but the continuity proof anchor may not match \
+                 the post-replay chain head"
+            );
+        }
         record.superposition.target_replayed(target_head);
 
         // Advance to Cutover

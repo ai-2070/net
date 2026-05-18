@@ -17,7 +17,7 @@ use super::host::DaemonHost;
 use super::migration::{MigrationError, MigrationPhase};
 use super::registry::DaemonRegistry;
 use crate::adapter::net::identity::EntityKeypair;
-use crate::adapter::net::state::causal::CausalEvent;
+use crate::adapter::net::state::causal::{CausalEvent, CausalLink};
 use crate::adapter::net::state::snapshot::StateSnapshot;
 
 /// Per-daemon target-side migration state.
@@ -188,6 +188,22 @@ impl MigrationTargetHandler {
     /// Access the factory registry (for the subprotocol handler).
     pub fn factories(&self) -> &Arc<DaemonFactoryRegistry> {
         &self.factories
+    }
+
+    /// Fetch the locally-restored daemon's chain head. Used by the
+    /// subprotocol handler to stamp `ReplayComplete.target_head`
+    /// so the orchestrator's continuity-proof anchor carries the
+    /// real cryptographic head even when the orchestrator lives on
+    /// a third node and has no local registry entry to consult.
+    pub fn host_head_link(&self, daemon_origin: u64) -> Result<CausalLink, MigrationError> {
+        self.daemon_registry
+            .with_host(daemon_origin, |host| host.head_link())
+            .map_err(|e| {
+                MigrationError::StateFailed(format!(
+                    "host_head_link({:#x}): {:?}",
+                    daemon_origin, e
+                ))
+            })
     }
 
     /// Phase 2: Restore a daemon from a snapshot.
