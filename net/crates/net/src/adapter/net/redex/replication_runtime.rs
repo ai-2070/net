@@ -635,8 +635,7 @@ pub fn spawn_replication_runtime(
     let backoff = Arc::new(Mutex::new(CatchupBackoff::new()));
     let outstanding = Arc::new(Mutex::new(OutstandingRequests::new()));
     let (tx, rx) = mpsc::channel::<Inbound>(RUNTIME_INBOX_CAPACITY);
-    let (priority_tx, priority_rx) =
-        mpsc::channel::<Inbound>(RUNTIME_PRIORITY_INBOX_CAPACITY);
+    let (priority_tx, priority_rx) = mpsc::channel::<Inbound>(RUNTIME_PRIORITY_INBOX_CAPACITY);
     let coordinator_for_task = coordinator.clone();
     let task = tokio::spawn(run(
         inputs,
@@ -1394,8 +1393,7 @@ async fn on_inbound(
                             let peer = t.peer_state(from);
                             let lag = t.peer_lag(from, now);
                             let fresh_window = std::time::Duration::from_millis(
-                                t.heartbeat_ms()
-                                    .saturating_mul(t.miss_threshold() as u64),
+                                t.heartbeat_ms().saturating_mul(t.miss_threshold() as u64),
                             );
                             match (peer, lag) {
                                 (Some(p), Some(elapsed))
@@ -2311,8 +2309,7 @@ mod tests {
             .lock()
             .record_heartbeat(peer_id, ReplicaRole::Replica, 50, Instant::now());
 
-        let dispatcher: Arc<dyn ReplicationDispatcher> =
-            Arc::new(RecorderDispatcher::default());
+        let dispatcher: Arc<dyn ReplicationDispatcher> = Arc::new(RecorderDispatcher::default());
         on_tick(
             &inputs,
             &coordinator,
@@ -2378,8 +2375,7 @@ mod tests {
         }
 
         let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
-        let dispatcher: Arc<dyn ReplicationDispatcher> =
-            Arc::new(RecorderDispatcher::default());
+        let dispatcher: Arc<dyn ReplicationDispatcher> = Arc::new(RecorderDispatcher::default());
         on_tick(
             &inputs,
             &coordinator,
@@ -2561,12 +2557,8 @@ mod tests {
             .await
             .unwrap();
         let dispatcher = Arc::new(RecorderDispatcher::default());
-        let handle = spawn_replication_runtime(
-            inputs,
-            coordinator.clone(),
-            dispatcher,
-            build_budget(),
-        );
+        let handle =
+            spawn_replication_runtime(inputs, coordinator.clone(), dispatcher, build_budget());
 
         // Saturate the low-priority lane with heartbeats. The
         // runtime task will drain them slowly under heavy lock

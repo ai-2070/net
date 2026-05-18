@@ -3194,7 +3194,12 @@ mod tests {
         // shard 1 emits numeric (JetStream-format) ids
         events_by_shard.insert(
             1,
-            vec![StoredEvent::from_value("42".to_string(), json!({"shard": 1}), 100, 1)],
+            vec![StoredEvent::from_value(
+                "42".to_string(),
+                json!({"shard": 1}),
+                100,
+                1,
+            )],
         );
 
         let adapter: Arc<dyn Adapter> = Arc::new(FormatAdapter { events_by_shard });

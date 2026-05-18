@@ -205,9 +205,7 @@ impl Scheduler {
             format!("subprotocol:{:#06x}", super::SUBPROTOCOL_MIGRATION),
             "hoisted MIGRATION_TAG must match SUBPROTOCOL_MIGRATION format",
         );
-        let combined = daemon_filter
-            .clone()
-            .require_tag(MIGRATION_TAG.to_string());
+        let combined = daemon_filter.clone().require_tag(MIGRATION_TAG.to_string());
 
         self.capability_index
             .query(&combined)
@@ -602,10 +600,8 @@ mod tests {
     /// or operator-drained doesn't keep absorbing new daemons.
     #[test]
     fn place_with_locality_skips_local_when_drained() {
-        let index = make_index_with_nodes(vec![
-            (0x1111, caps_with_gpu()),
-            (0x2222, caps_with_gpu()),
-        ]);
+        let index =
+            make_index_with_nodes(vec![(0x1111, caps_with_gpu()), (0x2222, caps_with_gpu())]);
         let scheduler = Scheduler::new(index, 0x1111, caps_with_gpu());
         let filter = CapabilityFilter::new().require_gpu();
         let decision = scheduler.place_with_locality(&filter, true).unwrap();
@@ -621,10 +617,8 @@ mod tests {
     /// matches the existing `place()` semantics.
     #[test]
     fn place_with_locality_picks_local_when_not_drained() {
-        let index = make_index_with_nodes(vec![
-            (0x1111, caps_with_gpu()),
-            (0x2222, caps_with_gpu()),
-        ]);
+        let index =
+            make_index_with_nodes(vec![(0x1111, caps_with_gpu()), (0x2222, caps_with_gpu())]);
         let scheduler = Scheduler::new(index, 0x1111, caps_with_gpu());
         let filter = CapabilityFilter::new().require_gpu();
         let decision = scheduler.place_with_locality(&filter, false).unwrap();

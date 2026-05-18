@@ -271,8 +271,7 @@ async fn punch_ack_forged_by_non_coordinator_session_peer_is_dropped() {
     // short fudge — the deadline-based PunchFailed is the
     // expected outcome; a successful Ok(PunchAck) would mean the
     // gate failed.
-    let outcome =
-        tokio::time::timeout(Duration::from_secs(7), ack_task).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(7), ack_task).await;
     let ack_result = outcome
         .expect("ack task should finish within the punch_deadline window")
         .expect("ack task panicked");

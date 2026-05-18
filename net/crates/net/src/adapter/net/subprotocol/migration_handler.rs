@@ -422,8 +422,7 @@ impl MigrationSubprotocolHandler {
                             expected,
                         });
                     }
-                } else if let Some(expected) =
-                    self.target_handler.orchestrator_node(daemon_origin)
+                } else if let Some(expected) = self.target_handler.orchestrator_node(daemon_origin)
                 {
                     if expected != from_node {
                         return Err(MigrationError::WrongPeer {
@@ -758,10 +757,7 @@ impl MigrationSubprotocolHandler {
                     return Err(MigrationError::WrongPeer {
                         daemon_origin,
                         from: from_node,
-                        expected: recorded
-                            .iter()
-                            .find_map(|p| *p)
-                            .unwrap_or(0),
+                        expected: recorded.iter().find_map(|p| *p).unwrap_or(0),
                     });
                 }
                 // Fire the SDK's observer BEFORE abort, so the

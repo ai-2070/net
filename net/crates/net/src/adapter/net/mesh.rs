@@ -1296,7 +1296,14 @@ pub struct MeshNode {
     /// when the peer actually confirmed the punch.
     #[cfg(feature = "nat-traversal")]
     pending_punch_acks: Arc<
-        DashMap<u64, (u64, u64, oneshot::Sender<super::traversal::rendezvous::PunchAck>)>,
+        DashMap<
+            u64,
+            (
+                u64,
+                u64,
+                oneshot::Sender<super::traversal::rendezvous::PunchAck>,
+            ),
+        >,
     >,
     /// Monotonic counter for waiter generations used by the
     /// three `pending_*` maps above. Each insert stamps its
@@ -3840,10 +3847,11 @@ impl MeshNode {
                         // reflex. The legit coordinator's later
                         // introduce found the entry already removed
                         // and was silently dropped.
-                        let took = ctx.pending_punch_introduces.remove_if(
-                            &intro.peer,
-                            |_, (_gen, expected_coord, _)| *expected_coord == from_node,
-                        );
+                        let took = ctx
+                            .pending_punch_introduces
+                            .remove_if(&intro.peer, |_, (_gen, expected_coord, _)| {
+                                *expected_coord == from_node
+                            });
                         if let Some((_, (_gen, _expected, tx))) = took {
                             let _ = tx.send(intro);
                         } else if ctx.pending_punch_introduces.contains_key(&intro.peer) {
@@ -3878,10 +3886,11 @@ impl MeshNode {
                             // `PunchAck { from_peer: counterpart, .. }`
                             // and resolve the local connect_direct
                             // future with attacker-chosen payload.
-                            let took = ctx.pending_punch_acks.remove_if(
-                                &ack.from_peer,
-                                |_, (_gen, expected_coord, _)| *expected_coord == from_node,
-                            );
+                            let took = ctx
+                                .pending_punch_acks
+                                .remove_if(&ack.from_peer, |_, (_gen, expected_coord, _)| {
+                                    *expected_coord == from_node
+                                });
                             if let Some((_, (_gen, _expected, tx))) = took {
                                 let _ = tx.send(ack);
                             } else if ctx.pending_punch_acks.contains_key(&ack.from_peer) {

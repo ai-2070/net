@@ -68,10 +68,7 @@ impl TargetMigrationState {
                 bytes: self.pending_bytes,
             });
         }
-        if let Some(prev) = self
-            .pending_events
-            .insert(event.link.sequence, event)
-        {
+        if let Some(prev) = self.pending_events.insert(event.link.sequence, event) {
             // Same-seq overwrite — net byte delta is (new - old).
             // Subtract the old size; the new size was already
             // pre-checked against the cap above.

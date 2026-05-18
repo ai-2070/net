@@ -563,7 +563,11 @@ mod tests {
         let out = sanitize_uri_for_error(&uri);
         // Must not panic, and must end with the truncation marker
         // since the input exceeded MAX_LEN.
-        assert!(out.ends_with('…'), "expected truncation marker, got {:?}", out);
+        assert!(
+            out.ends_with('…'),
+            "expected truncation marker, got {:?}",
+            out
+        );
     }
 
     #[test]

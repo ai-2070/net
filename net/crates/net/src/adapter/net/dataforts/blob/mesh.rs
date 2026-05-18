@@ -1148,9 +1148,7 @@ impl BlobAdapter for MeshBlobAdapter {
         let result = match blob_ref {
             BlobRef::Small { hash, .. } => self.fetch_chunk(hash).await,
             BlobRef::Manifest {
-                chunks,
-                total_size,
-                ..
+                chunks, total_size, ..
             } => {
                 if *total_size > MAX_BULK_FETCH_BYTES {
                     return Err(BlobError::Backend(format!(

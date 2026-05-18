@@ -352,8 +352,12 @@ mod tests {
         struct StubManifestAdapter(Vec<u8>);
         #[async_trait::async_trait]
         impl BlobAdapter for StubManifestAdapter {
-            fn adapter_id(&self) -> &str { "stub-manifest" }
-            async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> { Ok(()) }
+            fn adapter_id(&self) -> &str {
+                "stub-manifest"
+            }
+            async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> {
+                Ok(())
+            }
             async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
                 Ok(self.0.clone())
             }
@@ -364,7 +368,9 @@ mod tests {
             ) -> Result<Vec<u8>, BlobError> {
                 Ok(self.0[range.start as usize..range.end as usize].to_vec())
             }
-            async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> { Ok(true) }
+            async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> {
+                Ok(true)
+            }
         }
 
         let payload = vec![0x5A; (BLOB_CHUNK_SIZE_BYTES as usize) + 16];
@@ -410,8 +416,12 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl BlobAdapter for TamperingAdapter {
-            fn adapter_id(&self) -> &str { "tampering" }
-            async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> { Ok(()) }
+            fn adapter_id(&self) -> &str {
+                "tampering"
+            }
+            async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> {
+                Ok(())
+            }
             async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
                 Ok(self.payload.clone())
             }
@@ -422,7 +432,9 @@ mod tests {
             ) -> Result<Vec<u8>, BlobError> {
                 Ok(self.payload[range.start as usize..range.end as usize].to_vec())
             }
-            async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> { Ok(true) }
+            async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> {
+                Ok(true)
+            }
         }
 
         // Legitimate manifest: first chunk all 0xAA, second chunk
@@ -472,8 +484,12 @@ mod tests {
         struct LegitAdapter(Vec<u8>);
         #[async_trait::async_trait]
         impl BlobAdapter for LegitAdapter {
-            fn adapter_id(&self) -> &str { "legit" }
-            async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> { Ok(()) }
+            fn adapter_id(&self) -> &str {
+                "legit"
+            }
+            async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> {
+                Ok(())
+            }
             async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
                 Ok(self.0.clone())
             }
@@ -484,7 +500,9 @@ mod tests {
             ) -> Result<Vec<u8>, BlobError> {
                 Ok(self.0[range.start as usize..range.end as usize].to_vec())
             }
-            async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> { Ok(true) }
+            async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> {
+                Ok(true)
+            }
         }
 
         let chunk_1 = vec![0x11; BLOB_CHUNK_SIZE_BYTES as usize];

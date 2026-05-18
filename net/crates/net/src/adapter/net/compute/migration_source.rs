@@ -268,8 +268,7 @@ impl MigrationSourceHandler {
                     });
                 }
                 state.last_buffered_seq = event.link.sequence;
-                state.buffered_bytes =
-                    state.buffered_bytes.saturating_add(event_bytes);
+                state.buffered_bytes = state.buffered_bytes.saturating_add(event_bytes);
                 state.buffered_events.push(event);
                 Ok(true)
             }
@@ -617,7 +616,9 @@ mod tests {
         // No `start_snapshot` for `origin` — the source handler has
         // no migration record. A spurious `cleanup` call for it must
         // leave the local daemon registered.
-        handler.cleanup(origin).expect("cleanup is idempotent on miss");
+        handler
+            .cleanup(origin)
+            .expect("cleanup is idempotent on miss");
         assert!(
             reg.contains(origin),
             "cleanup for an origin with no migration record must not unregister the local daemon",

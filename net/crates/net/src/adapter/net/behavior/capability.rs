@@ -3769,12 +3769,8 @@ mod tests {
     fn strip_reserved_metadata_invalidates_signature() {
         use super::super::super::identity::EntityKeypair;
         let keypair = EntityKeypair::generate();
-        let mut ann = CapabilityAnnouncement::new(
-            1,
-            keypair.entity_id().clone(),
-            1,
-            sample_capability_set(),
-        );
+        let mut ann =
+            CapabilityAnnouncement::new(1, keypair.entity_id().clone(), 1, sample_capability_set());
         ann.capabilities
             .metadata
             .insert("intent".into(), "compute".into());

@@ -152,9 +152,7 @@ impl DaemonRegistry {
         // DaemonLifecycleObserver that pairs Registered/Unregistered
         // (operator audit log, MeshOS dashboard) leaking one entry
         // per node-failure-recovery cycle.
-        let prior = self
-            .daemons
-            .insert(origin_hash, Arc::new(Mutex::new(host)));
+        let prior = self.daemons.insert(origin_hash, Arc::new(Mutex::new(host)));
         if let Some(prior_arc) = prior {
             // Non-blocking name read — same posture as
             // `unregister`. The prior host could be locked by a

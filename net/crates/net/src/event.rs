@@ -861,12 +861,7 @@ mod tests {
     #[test]
     fn stored_event_serialize_always_emits_dedup_id() {
         // None → expect `"dedup_id":null` in output.
-        let none_event = StoredEvent::new(
-            "id-none".into(),
-            Bytes::from(r#"{"x":1}"#),
-            0,
-            0,
-        );
+        let none_event = StoredEvent::new("id-none".into(), Bytes::from(r#"{"x":1}"#), 0, 0);
         let none_json = serde_json::to_string(&none_event).unwrap();
         assert!(
             none_json.contains("\"dedup_id\":null"),
@@ -874,13 +869,8 @@ mod tests {
         );
 
         // Some → expect `"dedup_id":"value"`.
-        let some_event = StoredEvent::new(
-            "id-some".into(),
-            Bytes::from(r#"{"x":1}"#),
-            0,
-            0,
-        )
-        .with_dedup_id(Some("abc".into()));
+        let some_event = StoredEvent::new("id-some".into(), Bytes::from(r#"{"x":1}"#), 0, 0)
+            .with_dedup_id(Some("abc".into()));
         let some_json = serde_json::to_string(&some_event).unwrap();
         assert!(
             some_json.contains("\"dedup_id\":\"abc\""),

@@ -58,8 +58,7 @@ impl MigrationSnapshotSource for NoOpMigrationSnapshotSource {
 /// every migration regardless of actual queue pressure.
 pub struct OrchestratorMigrationSnapshotSource {
     orchestrator: Arc<crate::adapter::net::compute::MigrationOrchestrator>,
-    source_handler:
-        Option<Arc<crate::adapter::net::compute::MigrationSourceHandler>>,
+    source_handler: Option<Arc<crate::adapter::net::compute::MigrationSourceHandler>>,
 }
 
 impl OrchestratorMigrationSnapshotSource {

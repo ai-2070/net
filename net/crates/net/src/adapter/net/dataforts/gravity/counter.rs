@@ -348,9 +348,8 @@ impl HeatRegistry {
         // still prunes — `-0.0 == 0.0` is true in IEEE-754 but the
         // explicit comparator is more obviously robust to a future
         // refactor that swaps in `<=` elsewhere.
-        self.counters.retain(|_, c| {
-            !(c.rate <= 0.0 && c.last_emitted.map_or(false, |v| v <= 0.0))
-        });
+        self.counters
+            .retain(|_, c| !(c.rate <= 0.0 && c.last_emitted.map_or(false, |v| v <= 0.0)));
     }
 }
 

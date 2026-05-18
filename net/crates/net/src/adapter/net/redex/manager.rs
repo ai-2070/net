@@ -928,11 +928,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!(
-            "net-redex-unlink-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let base =
+            std::env::temp_dir().join(format!("net-redex-unlink-{}-{}", std::process::id(), n));
         let _ = std::fs::create_dir_all(&base);
         let r = Redex::new().with_persistent_dir(&base);
         let name = cn("dataforts/blob/abc");
@@ -941,10 +938,16 @@ mod tests {
             .unwrap();
         f.append(b"hello").unwrap();
         let dir = super::super::disk::channel_dir(&base, &name);
-        assert!(dir.exists(), "channel dir must exist after persistent append");
+        assert!(
+            dir.exists(),
+            "channel dir must exist after persistent append"
+        );
 
         r.close_and_unlink_file(&name).unwrap();
-        assert!(!dir.exists(), "channel dir must be unlinked after close_and_unlink_file");
+        assert!(
+            !dir.exists(),
+            "channel dir must be unlinked after close_and_unlink_file"
+        );
 
         // Idempotent on a second call (file already gone, dir gone).
         r.close_and_unlink_file(&name).unwrap();

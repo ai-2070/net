@@ -233,8 +233,8 @@ pub trait UnhealthySlotRecovery: Send + Sync {
 #[cfg(test)]
 mod recovery_registry_tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn try_run_all_collects_recovered_slots_and_drops_panicking_handlers() {

@@ -444,7 +444,11 @@ fn test_subprotocol_handler_restore_complete_emits_no_buffered_events() {
             _ => None,
         })
         .collect();
-    assert_eq!(buffered_events.len(), 1, "expected a single BufferedEvents reply");
+    assert_eq!(
+        buffered_events.len(),
+        1,
+        "expected a single BufferedEvents reply"
+    );
     assert!(
         buffered_events[0].is_empty(),
         "orchestrator-driven BufferedEvents must carry zero events — the dead \
@@ -617,7 +621,10 @@ fn test_regression_dispatch_arms_reject_unrelated_from_node() {
         Err(MigrationError::WrongPeer { from, .. }) => {
             assert_eq!(from, 0x9999);
         }
-        other => panic!("expected WrongPeer rejection for forged MigrationFailed, got {:?}", other),
+        other => panic!(
+            "expected WrongPeer rejection for forged MigrationFailed, got {:?}",
+            other
+        ),
     }
 }
 
@@ -2609,8 +2616,7 @@ impl WireNode {
         // this node authored the migration (the `migrations.get` miss
         // makes cleanup a no-op rather than unregistering the daemon).
         let orch = Arc::new(
-            MigrationOrchestrator::new(reg.clone(), node_id)
-                .with_source_handler(source.clone()),
+            MigrationOrchestrator::new(reg.clone(), node_id).with_source_handler(source.clone()),
         );
         let target = Arc::new(MigrationTargetHandler::new_with_factories(
             reg.clone(),

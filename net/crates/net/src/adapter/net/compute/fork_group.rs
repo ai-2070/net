@@ -755,10 +755,8 @@ impl ForkGroup {
             };
             let keypair = EntityKeypair::from_bytes(fork_info.keypair_secret);
             let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
-            let chain_builder = CausalChainBuilder::from_head(
-                fork_info.record.fork_genesis,
-                bytes::Bytes::new(),
-            );
+            let chain_builder =
+                CausalChainBuilder::from_head(fork_info.record.fork_genesis, bytes::Bytes::new());
 
             let placement =
                 match GroupCoordinator::place_with_spread(scheduler, &requirements, &exclude) {

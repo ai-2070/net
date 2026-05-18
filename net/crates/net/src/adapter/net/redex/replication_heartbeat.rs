@@ -162,10 +162,9 @@ impl HeartbeatTracker {
                     // Re-affirmation of the same leader — no change.
                 }
                 Some(existing) => {
-                    let existing_tail =
-                        self.peers.get(&existing).map(|p| p.tail_seq).unwrap_or(0);
-                    let peer_beats = tail_seq > existing_tail
-                        || (tail_seq == existing_tail && peer < existing);
+                    let existing_tail = self.peers.get(&existing).map(|p| p.tail_seq).unwrap_or(0);
+                    let peer_beats =
+                        tail_seq > existing_tail || (tail_seq == existing_tail && peer < existing);
                     if peer_beats {
                         self.believed_leader = Some(peer);
                     }

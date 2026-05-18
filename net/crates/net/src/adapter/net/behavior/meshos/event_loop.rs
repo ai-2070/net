@@ -2600,7 +2600,11 @@ mod tests {
         tokio::time::sleep(StdDuration::from_millis(60)).await;
 
         let snap = reader.read();
-        assert_eq!(snap.admin_audit.len(), 1, "ring must still record the entry");
+        assert_eq!(
+            snap.admin_audit.len(),
+            1,
+            "ring must still record the entry"
+        );
         assert!(
             snap.admin_audit[0].chain_pending,
             "ring entry must be flagged chain_pending after the appender returned Err"
