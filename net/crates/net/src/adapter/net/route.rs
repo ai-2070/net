@@ -65,6 +65,21 @@ impl RouteFlags {
     ///    one peer reads the bit and another masks it off silently
     ///    diverges on routing semantics.
     pub fn from_u8(v: u8) -> Self {
+        // Emit a warn when the high nibble is set so a future
+        // flag's silent strip doesn't go invisible. The doc-
+        // comment above documents the constraint; this log makes
+        // the skew observable in production rather than only
+        // visible via post-mortem code review.
+        if v & 0xF0 != 0 {
+            tracing::warn!(
+                wire_byte = format_args!("0x{:02x}", v),
+                high_nibble = format_args!("0x{:02x}", v & 0xF0),
+                "route flags: high-nibble bits set on inbound wire byte and \
+                 silently stripped — peer may be running a newer schema. \
+                 Widen RouteFlags::from_u8's mask in lock-step before any \
+                 production peer relies on a high-nibble bit."
+            );
+        }
         Self(v & 0x0F)
     }
 
