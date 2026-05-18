@@ -1,0 +1,31 @@
+net/crates/net/docs/plans/DATAFORTS_BLOB_STORAGE_PLAN_V2.md
+  s_2571835e05521c::t_65f68a51ceab70 233
+  s_2571835e05521c::t_3b2138412ca955 566,568-571,573,575,577,579-585
+  s_2571835e05521c::t_4eff2c89174ab1 107,111
+  s_2571835e05521c::t_e1cfd9c3d878bd 129-143,147-215
+  s_2571835e05521c::t_7e3ed91c9f5b14 429-440
+  s_2571835e05521c::t_45e5fe8cf5ef3c 308-311,321-322,326-328,338,342-364
+  s_2571835e05521c::t_55ea74c756823a 241
+  s_2571835e05521c::t_cbe8da86a8a426 445-449,451,454
+  s_2571835e05521c::t_b79c0f564d63fd 544,546,548,552-556,558,560
+  s_2571835e05521c::t_97ff282f6feb5e 625-631,634-640,642,645
+  s_2571835e05521c::t_d14832e7550c7f 646-696
+  s_2571835e05521c::t_7f36197e43a9b0 5-6
+  s_2571835e05521c::t_ee265866c9b59e 280-295
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "c6f99553d9fb474f9a13a7344a3e189ab8f1bf0f",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
