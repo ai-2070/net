@@ -2759,20 +2759,42 @@ impl RedexFold<()> for RpcStreamingRequestFold {
 // when the matching RESPONSE arrives.
 // ============================================================================
 
-/// One pending entry — either a unary oneshot or a streaming
-/// mpsc. The fold dispatches to the right variant based on
+/// One pending entry — unary oneshot, server-streaming mpsc, or
+/// client-streaming (one terminal oneshot + a separate grant
+/// mpsc). The fold dispatches to the right variant based on
 /// what's registered for the `call_id`.
 enum PendingEntry {
     /// Unary call — exactly one RESPONSE expected. Completes the
     /// oneshot with the decoded payload.
     Unary(tokio::sync::oneshot::Sender<RpcResponsePayload>),
-    /// Streaming call — multiple non-terminal `Continue` chunks
-    /// followed by one terminal frame. Each non-terminal chunk
-    /// pushes a `StreamItem::Chunk(body)` onto the mpsc; the
-    /// terminal frame pushes `StreamItem::End` (Ok) or
+    /// Server-streaming call — multiple non-terminal `Continue`
+    /// chunks followed by one terminal frame. Each non-terminal
+    /// chunk pushes a `StreamItem::Chunk(body)` onto the mpsc;
+    /// the terminal frame pushes `StreamItem::End` (Ok) or
     /// `StreamItem::Error(payload)` (non-Ok status) and the
     /// pending entry is removed.
     Streaming(tokio::sync::mpsc::UnboundedSender<StreamItem>),
+    /// Client-streaming or duplex call. Two sender halves:
+    ///
+    /// - `terminal_tx`: oneshot that completes when the server's
+    ///   single terminal RESPONSE arrives. Response shape and
+    ///   delivery semantics are identical to the unary variant —
+    ///   the caller awaits one payload, success or failure status.
+    /// - `grant_tx`: mpsc that ferries REQUEST_GRANT credit values
+    ///   from the client fold to the caller's send sink. Each
+    ///   `DISPATCH_RPC_REQUEST_GRANT` event for this call_id
+    ///   pushes one `u32` credit onto the mpsc; the caller's send
+    ///   sink consumes credits to gate `send(...).await`.
+    ///
+    /// Bidi streaming plan (Phase C). Used for both pure client-
+    /// streaming and full duplex; for duplex the `terminal_tx` is
+    /// the same shape (one terminal RESPONSE closes the call),
+    /// the inbound response stream is a separate construct
+    /// (Phase D).
+    ClientStreaming {
+        terminal_tx: tokio::sync::oneshot::Sender<RpcResponsePayload>,
+        grant_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    },
 }
 
 /// One item delivered to a streaming caller. The caller's
@@ -2858,6 +2880,43 @@ impl RpcClientPending {
         rx
     }
 
+    /// Register a client-streaming (or duplex) entry for
+    /// `call_id`. Returns BOTH the terminal-response receiver
+    /// (the caller awaits on this for the single terminal
+    /// RESPONSE that ends the call) AND a grant receiver (the
+    /// caller's send sink consumes this to gate `send().await`
+    /// when the caller opted into request-direction flow
+    /// control).
+    ///
+    /// Same registration ordering rules as `register` /
+    /// `register_streaming` — publisher must call this BEFORE
+    /// publishing the REQUEST so a fast server's RESPONSE /
+    /// REQUEST_GRANT can't arrive while no pending entry exists.
+    ///
+    /// Bidi streaming plan (Phase C).
+    pub fn register_client_streaming(
+        &self,
+        call_id: u64,
+        target_node: super::super::behavior::placement::NodeId,
+    ) -> (
+        tokio::sync::oneshot::Receiver<RpcResponsePayload>,
+        tokio::sync::mpsc::UnboundedReceiver<u32>,
+    ) {
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let (grant_tx, grant_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.senders.insert(
+            call_id,
+            (
+                target_node,
+                PendingEntry::ClientStreaming {
+                    terminal_tx,
+                    grant_tx,
+                },
+            ),
+        );
+        (terminal_rx, grant_rx)
+    }
+
     /// Drop the pending entry for `call_id`. Called by the
     /// caller-side cancellation path (e.g. `Mesh::call`'s future
     /// being dropped, the stream being dropped, or a deadline
@@ -2921,6 +2980,28 @@ impl RpcClientPending {
                     let _ = tx.send(resp);
                 }
             }
+            (_, PendingEntry::ClientStreaming { .. }) => {
+                // Terminal RESPONSE for a client-streaming /
+                // duplex call. Same delivery shape as Unary —
+                // complete the oneshot, remove the entry. The
+                // grant_tx half drops with the entry, which is
+                // fine (no more grants will arrive after the
+                // terminal frame).
+                drop(entry);
+                if let Some((
+                    _,
+                    (
+                        _,
+                        PendingEntry::ClientStreaming {
+                            terminal_tx,
+                            grant_tx: _,
+                        },
+                    ),
+                )) = self.senders.remove(&call_id)
+                {
+                    let _ = terminal_tx.send(resp);
+                }
+            }
             (_, PendingEntry::Streaming(tx)) => {
                 let kind = classify_streaming_chunk(&resp);
                 match kind {
@@ -2977,6 +3058,44 @@ impl RpcClientPending {
         }
     }
 
+    /// Deliver a request-direction grant credit to the waiter
+    /// for `call_id`, if it's a client-streaming / duplex entry.
+    /// Silently no-op for unknown call_ids, for unary entries
+    /// (caller bug — grant for a unary call makes no sense),
+    /// and for server-streaming entries (grants apply only to
+    /// the upload direction).
+    ///
+    /// `from_node` is gated by the same target-binding check
+    /// as `deliver`: a grant from a non-target session peer is
+    /// dropped (a forged grant on a shared reply channel can't
+    /// inject credit into a victim's call).
+    ///
+    /// Bidi streaming plan (Phase C).
+    fn deliver_grant(
+        &self,
+        call_id: u64,
+        from_node: super::super::behavior::placement::NodeId,
+        credits: u32,
+    ) {
+        let entry = self.senders.get(&call_id);
+        let Some(entry) = entry else { return };
+        let (target_node, _entry_value) = entry.value();
+        if *target_node != 0 && *target_node != from_node {
+            tracing::trace!(
+                call_id,
+                from_node,
+                expected = *target_node,
+                "rpc client: dropping REQUEST_GRANT from non-target session peer"
+            );
+            return;
+        }
+        if let (_, PendingEntry::ClientStreaming { grant_tx, .. }) = entry.value() {
+            let _ = grant_tx.send(credits);
+        }
+        // Unary / Streaming entries silently ignore — see method
+        // docs for the rationale.
+    }
+
     /// Test-only: how many pending calls are registered. Used by
     /// integration tests to confirm cleanup after happy-path / cancel.
     #[cfg(test)]
@@ -3030,17 +3149,48 @@ impl RpcClientFold {
             );
             return;
         };
-        if meta.dispatch != DISPATCH_RPC_RESPONSE {
-            return;
-        }
-        match RpcResponsePayload::decode(&ev.payload[EVENT_META_SIZE..]) {
-            Ok(resp) => self.pending.deliver(meta.seq_or_ts, ev.from_node, resp),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    call_id = meta.seq_or_ts,
-                    "rpc client fold: malformed response payload",
-                );
+        match meta.dispatch {
+            DISPATCH_RPC_RESPONSE => {
+                match RpcResponsePayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                    Ok(resp) => self.pending.deliver(meta.seq_or_ts, ev.from_node, resp),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            call_id = meta.seq_or_ts,
+                            "rpc client fold: malformed response payload",
+                        );
+                    }
+                }
+            }
+            DISPATCH_RPC_REQUEST_GRANT => {
+                // Server granted upload credit for a
+                // client-streaming / duplex call. Route it to the
+                // matching pending entry's grant mpsc; non-client-
+                // streaming entries silently ignore (see
+                // RpcClientPending::deliver_grant docs).
+                match decode_request_grant(&ev.payload[EVENT_META_SIZE..]) {
+                    Some(grant) => {
+                        if grant.credits == 0 {
+                            return;
+                        }
+                        self.pending.deliver_grant(
+                            grant.call_id,
+                            ev.from_node,
+                            grant.credits,
+                        );
+                    }
+                    None => {
+                        tracing::debug!(
+                            call_id = meta.seq_or_ts,
+                            "rpc client fold: malformed REQUEST_GRANT payload"
+                        );
+                    }
+                }
+            }
+            _ => {
+                // Unknown / unexpected dispatch on the reply
+                // channel — ignore (a misconfigured publisher
+                // shouldn't take down the fold).
             }
         }
     }
@@ -3065,28 +3215,50 @@ impl RedexFold<()> for RpcClientFold {
             );
             return Ok(());
         };
-        // Only RESPONSE events are routed; the caller's reply
-        // channel shouldn't carry REQUEST/CANCEL traffic, but if a
-        // misconfigured publisher sent some, ignore them rather
-        // than killing the fold.
-        if meta.dispatch != DISPATCH_RPC_RESPONSE {
-            return Ok(());
-        }
-        match RpcResponsePayload::decode(&ev.payload[EVENT_META_SIZE..]) {
-            Ok(resp) => self.pending.deliver(meta.seq_or_ts, 0, resp),
-            Err(e) => {
-                // Malformed RESPONSE on the reply channel. We can't
-                // fabricate a synthetic response (the call_id might
-                // be valid; we just can't tell what it was supposed
-                // to mean). Log and leave the pending entry intact
-                // — the caller's deadline / cancellation path will
-                // eventually clean it up.
-                tracing::warn!(
-                    error = %e,
-                    call_id = meta.seq_or_ts,
-                    "rpc client fold: malformed response payload",
-                );
+        // Route RESPONSE and REQUEST_GRANT events; ignore other
+        // dispatches a misconfigured publisher might send. The
+        // loopback path uses `from_node = 0` which the pending
+        // registry treats as "no binding" — see the apply_inbound
+        // production-path counterpart above for the AEAD-verified
+        // peer routing.
+        match meta.dispatch {
+            DISPATCH_RPC_RESPONSE => {
+                match RpcResponsePayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                    Ok(resp) => self.pending.deliver(meta.seq_or_ts, 0, resp),
+                    Err(e) => {
+                        // Malformed RESPONSE on the reply channel.
+                        // We can't fabricate a synthetic response
+                        // (the call_id might be valid; we just
+                        // can't tell what it was supposed to
+                        // mean). Log and leave the pending entry
+                        // intact — the caller's deadline /
+                        // cancellation path will eventually clean
+                        // it up.
+                        tracing::warn!(
+                            error = %e,
+                            call_id = meta.seq_or_ts,
+                            "rpc client fold: malformed response payload",
+                        );
+                    }
+                }
             }
+            DISPATCH_RPC_REQUEST_GRANT => {
+                match decode_request_grant(&ev.payload[EVENT_META_SIZE..]) {
+                    Some(grant) => {
+                        if grant.credits == 0 {
+                            return Ok(());
+                        }
+                        self.pending.deliver_grant(grant.call_id, 0, grant.credits);
+                    }
+                    None => {
+                        tracing::debug!(
+                            call_id = meta.seq_or_ts,
+                            "rpc client fold: malformed REQUEST_GRANT payload"
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -4631,6 +4803,167 @@ mod tests {
             .expect("must complete")
             .expect("must receive");
         assert_eq!(delivered.body, b"ok");
+    }
+
+    // ====================================================================
+    // Phase C — RpcClientPending + RpcClientFold for client-streaming.
+    // ====================================================================
+
+    /// Build a REQUEST_GRANT event for tests. Mirror of
+    /// `rpc_stream_grant_event` for the request direction.
+    fn rpc_request_grant_event(
+        caller_origin: u64,
+        call_id: u64,
+        credits: u32,
+    ) -> RedexEvent {
+        let meta =
+            EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, caller_origin, call_id, 0);
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&encode_request_grant(call_id, credits));
+        RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        }
+    }
+
+    /// `register_client_streaming` returns two halves: a terminal
+    /// oneshot and a grant mpsc. A terminal RESPONSE resolves the
+    /// oneshot (same shape as unary delivery); a REQUEST_GRANT
+    /// for the same call_id pushes its credit onto the mpsc.
+    #[tokio::test]
+    async fn client_pending_client_streaming_routes_terminal_and_grants() {
+        let pending = Arc::new(RpcClientPending::new());
+        let (terminal_rx, mut grant_rx) =
+            pending.register_client_streaming(0xCAFE_F00D, 0);
+        // Push two grants — both should land on the mpsc.
+        pending.deliver_grant(0xCAFE_F00D, 0, 3);
+        pending.deliver_grant(0xCAFE_F00D, 0, 7);
+        assert_eq!(grant_rx.recv().await, Some(3));
+        assert_eq!(grant_rx.recv().await, Some(7));
+        // Terminal RESPONSE resolves the oneshot and removes the
+        // entry. Grant mpsc closes too (its sender drops with
+        // the entry).
+        let resp = RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: b"done".to_vec(),
+        };
+        pending.deliver(0xCAFE_F00D, 0, resp.clone());
+        let delivered = tokio::time::timeout(Duration::from_millis(50), terminal_rx)
+            .await
+            .expect("terminal must complete")
+            .expect("terminal must receive");
+        assert_eq!(delivered.body, b"done");
+        // Grant mpsc now closed.
+        assert_eq!(grant_rx.recv().await, None);
+        assert_eq!(pending.pending_count(), 0);
+    }
+
+    /// REQUEST_GRANT from a non-target session peer is dropped
+    /// without injecting credit. Same S-4-style binding gate as
+    /// the RESPONSE delivery path — a forged grant on a shared
+    /// reply channel can't inflate a victim's credit budget.
+    #[tokio::test]
+    async fn client_pending_grant_from_wrong_target_is_dropped() {
+        let pending = Arc::new(RpcClientPending::new());
+        let (_terminal_rx, mut grant_rx) =
+            pending.register_client_streaming(0xCAFE_F00D, 0x42);
+        // Forged grant from a different session peer — must drop.
+        pending.deliver_grant(0xCAFE_F00D, 0x99, 100);
+        let parked =
+            tokio::time::timeout(Duration::from_millis(50), grant_rx.recv()).await;
+        assert!(
+            parked.is_err(),
+            "forged REQUEST_GRANT from wrong target must not inject credit"
+        );
+        // Legitimate grant from the recorded target lands.
+        pending.deliver_grant(0xCAFE_F00D, 0x42, 5);
+        let delivered =
+            tokio::time::timeout(Duration::from_millis(50), grant_rx.recv())
+                .await
+                .expect("must complete")
+                .expect("must receive");
+        assert_eq!(delivered, 5);
+    }
+
+    /// `deliver_grant` for an unknown call_id is a silent no-op.
+    /// Same harmless-drop semantics as a STREAM_GRANT for an
+    /// unknown / non-flow-controlled call (CANCEL/GRANT race is
+    /// always possible).
+    #[tokio::test]
+    async fn client_pending_grant_for_unknown_call_id_is_no_op() {
+        let pending = Arc::new(RpcClientPending::new());
+        // No entry registered for this call_id.
+        pending.deliver_grant(0xDEAD, 0, 42);
+        // No panics, no entries created.
+        assert_eq!(pending.pending_count(), 0);
+    }
+
+    /// `deliver_grant` for a unary entry is silently dropped
+    /// (grants only apply to client-streaming / duplex calls).
+    #[tokio::test]
+    async fn client_pending_grant_for_unary_entry_is_no_op() {
+        let pending = Arc::new(RpcClientPending::new());
+        let _rx = pending.register(0xDEAD, 0);
+        pending.deliver_grant(0xDEAD, 0, 42);
+        // No state changes — entry still pending, no leak.
+        assert_eq!(pending.pending_count(), 1);
+    }
+
+    /// `RpcClientFold::apply` (legacy / loopback path) routes
+    /// DISPATCH_RPC_REQUEST_GRANT events through to the matching
+    /// ClientStreaming entry's grant mpsc. Pins the second
+    /// dispatch arm the fold gained for Phase C.
+    #[tokio::test]
+    async fn client_fold_routes_request_grant_to_registered_waiter() {
+        let pending = Arc::new(RpcClientPending::new());
+        let mut fold = RpcClientFold::new(pending.clone());
+        let (_terminal_rx, mut grant_rx) =
+            pending.register_client_streaming(0xC0DE, 0);
+        let ev = rpc_request_grant_event(0xCAFE, 0xC0DE, 9);
+        fold.apply(&ev, &mut ()).unwrap();
+        let delivered =
+            tokio::time::timeout(Duration::from_millis(50), grant_rx.recv())
+                .await
+                .expect("must complete")
+                .expect("must receive");
+        assert_eq!(delivered, 9);
+    }
+
+    /// `RpcClientFold::apply` ignores REQUEST_GRANT events whose
+    /// payload is malformed (wrong length): no panic, no entry
+    /// state change, fold returns Ok and keeps going. Mirror of
+    /// the response-side malformed-payload regression.
+    #[tokio::test]
+    async fn client_fold_malformed_request_grant_is_logged_not_fatal() {
+        let pending = Arc::new(RpcClientPending::new());
+        let mut fold = RpcClientFold::new(pending.clone());
+        let (_terminal_rx, mut grant_rx) =
+            pending.register_client_streaming(0xC0DE, 0);
+        // Build a GRANT event whose payload is only 4 bytes
+        // (truncated — codec needs 12).
+        let meta =
+            EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, 0xCAFE, 0xC0DE, 0);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let ev = RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        };
+        let result = fold.apply(&ev, &mut ());
+        assert!(
+            result.is_ok(),
+            "malformed REQUEST_GRANT must NOT kill the fold"
+        );
+        // No credit landed on the mpsc.
+        let parked =
+            tokio::time::timeout(Duration::from_millis(30), grant_rx.recv()).await;
+        assert!(
+            parked.is_err(),
+            "malformed REQUEST_GRANT must not inject credit"
+        );
     }
 
     // ====================================================================
