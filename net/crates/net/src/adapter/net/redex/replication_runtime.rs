@@ -246,7 +246,19 @@ pub struct RuntimeInputs {
 /// observe the role, drive `transition_to`, and read the channel
 /// metrics without going through the inbox.
 pub struct ReplicationRuntimeHandle {
+    /// Low-priority inbox: Heartbeat + SyncRequest. A peer flood
+    /// fills this lane first; under saturation the high-priority
+    /// lane keeps draining so Shutdown, SyncResponse, and SyncNack
+    /// still make forward progress.
     inbox: mpsc::Sender<Inbound>,
+    /// High-priority inbox: Shutdown + SyncResponse + SyncNack.
+    /// Catchup-critical events ride this lane so a Heartbeat
+    /// flood from many peers (50 peers × 100 ms = 500 evt/s plus a
+    /// momentary slow `await` in `on_inbound` can saturate the
+    /// single lane to 1024 in two seconds) doesn't strand the
+    /// leader's response to the local replica or block graceful
+    /// shutdown.
+    priority_inbox: mpsc::Sender<Inbound>,
     task: Mutex<Option<JoinHandle<()>>>,
     coordinator: Arc<ReplicationCoordinator>,
     /// R-11: explicit "task has joined" flag. `is_stopped()`
@@ -256,6 +268,14 @@ pub struct ReplicationRuntimeHandle {
     /// surviving caller's `.await` returns. The flag is flipped
     /// only after the join completes.
     stopped: AtomicBool,
+}
+
+#[inline]
+fn is_priority_event(event: &Inbound) -> bool {
+    matches!(
+        event,
+        Inbound::Shutdown | Inbound::SyncResponse { .. } | Inbound::SyncNack { .. }
+    )
 }
 
 impl ReplicationRuntimeHandle {
@@ -271,8 +291,16 @@ impl ReplicationRuntimeHandle {
 
     /// Push an inbound event into the runtime's inbox. Errors
     /// when the runtime has already exited (drained channel).
+    /// Routes catchup-critical events (Shutdown, SyncResponse,
+    /// SyncNack) to the priority lane so a Heartbeat flood on
+    /// the standard lane can't starve them.
     pub async fn dispatch(&self, event: Inbound) -> Result<(), AdapterError> {
-        self.inbox
+        let sender = if is_priority_event(&event) {
+            &self.priority_inbox
+        } else {
+            &self.inbox
+        };
+        sender
             .send(event)
             .await
             .map_err(|_| AdapterError::Transient("replication runtime task exited".to_string()))
@@ -283,7 +311,12 @@ impl ReplicationRuntimeHandle {
     /// Returns the event back on full-buffer rejection so the
     /// caller can decide whether to drop, log, or block.
     pub fn try_dispatch(&self, event: Inbound) -> Result<(), Inbound> {
-        self.inbox.try_send(event).map_err(|e| e.into_inner())
+        let sender = if is_priority_event(&event) {
+            &self.priority_inbox
+        } else {
+            &self.inbox
+        };
+        sender.try_send(event).map_err(|e| e.into_inner())
     }
 
     /// Send `Shutdown` and await the task to exit. Idempotent —
@@ -297,17 +330,19 @@ impl ReplicationRuntimeHandle {
     pub async fn cancel(&self) {
         let handle = self.task.lock().take();
         if let Some(h) = handle {
-            match self.inbox.try_send(Inbound::Shutdown) {
+            // Shutdown rides the priority lane; that's the same
+            // lane the run loop drains first under the biased
+            // select, so even a saturated low-priority lane can't
+            // delay the graceful exit.
+            match self.priority_inbox.try_send(Inbound::Shutdown) {
                 Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
                     // Graceful path: the task observes Shutdown (or
                     // already exited). Await the join.
                     let _ = h.await;
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Task is wedged on a slow await with a saturated
-                    // inbox. Abort directly so cancel() can't block
-                    // the caller waiting on a buffer that the wedged
-                    // task may never drain.
+                    // Priority lane is itself saturated. Abort
+                    // directly so cancel() can't block the caller.
                     h.abort();
                     let _ = h.await;
                 }
@@ -370,6 +405,14 @@ impl Drop for ReplicationRuntimeHandle {
 /// caller (mesh dispatch loop) drops + logs.
 pub const RUNTIME_INBOX_CAPACITY: usize = 1024;
 
+/// Priority-lane inbox capacity. Smaller than the standard lane
+/// because the events that ride it (Shutdown, SyncResponse,
+/// SyncNack) are bounded by the local replica's in-flight
+/// catchup window plus a handful of NACKs — not a per-peer
+/// heartbeat flood. Sized to absorb a burst without back-
+/// pressuring the leader-side dispatcher.
+pub const RUNTIME_PRIORITY_INBOX_CAPACITY: usize = 128;
+
 /// Spawn a per-channel replication runtime task. Returns a
 /// handle the mesh dispatcher uses to push inbound events and
 /// the lifecycle code uses to cancel.
@@ -406,6 +449,8 @@ pub fn spawn_replication_runtime(
 ) -> ReplicationRuntimeHandle {
     let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(inputs.heartbeat_ms)));
     let (tx, rx) = mpsc::channel::<Inbound>(RUNTIME_INBOX_CAPACITY);
+    let (priority_tx, priority_rx) =
+        mpsc::channel::<Inbound>(RUNTIME_PRIORITY_INBOX_CAPACITY);
     let coordinator_for_task = coordinator.clone();
     let task = tokio::spawn(run(
         inputs,
@@ -414,9 +459,11 @@ pub fn spawn_replication_runtime(
         tracker,
         budget,
         rx,
+        priority_rx,
     ));
     ReplicationRuntimeHandle {
         inbox: tx,
+        priority_inbox: priority_tx,
         task: Mutex::new(Some(task)),
         coordinator,
         stopped: AtomicBool::new(false),
@@ -430,6 +477,7 @@ async fn run(
     tracker: Arc<Mutex<HeartbeatTracker>>,
     budget: Arc<Mutex<BandwidthBudget>>,
     mut inbox: mpsc::Receiver<Inbound>,
+    mut priority_inbox: mpsc::Receiver<Inbound>,
 ) {
     let heartbeat_interval = Duration::from_millis(inputs.heartbeat_ms);
     let mut interval = tokio::time::interval(heartbeat_interval);
@@ -443,14 +491,40 @@ async fn run(
     interval.tick().await;
 
     loop {
+        // `biased;` makes tokio::select poll branches top-to-
+        // bottom rather than randomly. Priority lane is checked
+        // first, then the tick, then the low-priority lane. A
+        // heartbeat flood saturating the low-priority lane can't
+        // starve SyncResponse / SyncNack / Shutdown — they ride
+        // the priority lane and get drained ahead of the flood.
         tokio::select! {
+            biased;
+            event = priority_inbox.recv() => {
+                match event {
+                    Some(Inbound::Shutdown) | None => {
+                        let _ = coordinator
+                            .transition_to(
+                                ReplicaRole::Idle,
+                                super::replication_state::TransitionSignal::ChannelClose,
+                            )
+                            .await;
+                        return;
+                    }
+                    Some(event) => {
+                        on_inbound(&inputs, &coordinator, &dispatcher, &tracker, &budget, event).await;
+                    }
+                }
+            }
             _ = interval.tick() => {
                 on_tick(&inputs, &coordinator, &dispatcher, &tracker).await;
             }
             event = inbox.recv() => {
                 match event {
                     Some(Inbound::Shutdown) | None => {
-                        // Run the graceful-shutdown transition + bail.
+                        // Shutdown normally rides the priority lane;
+                        // a None here means the low-priority sender
+                        // dropped (caller closed the handle without
+                        // calling cancel). Treat as graceful exit.
                         let _ = coordinator
                             .transition_to(
                                 ReplicaRole::Idle,
@@ -1743,6 +1817,70 @@ mod tests {
         assert!(handle.is_stopped());
         // Final state must be Idle (ChannelClose transition).
         assert_eq!(coordinator.role(), ReplicaRole::Idle);
+    }
+
+    /// R-25 regression: a saturated low-priority lane (Heartbeat
+    /// flood) must not starve catchup-critical events on the
+    /// priority lane (SyncResponse / SyncNack / Shutdown).
+    ///
+    /// Drives the failure shape from the audit: many peers
+    /// flood the low-priority inbox to its 1024 cap while a
+    /// SyncResponse is also in-flight. With the biased select
+    /// on the priority lane, the priority entry is drained
+    /// even though the low-priority lane is saturated.
+    #[tokio::test]
+    async fn priority_lane_drains_under_low_priority_saturation() {
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 60_000);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        coordinator
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let handle = spawn_replication_runtime(
+            inputs,
+            coordinator.clone(),
+            dispatcher,
+            build_budget(),
+        );
+
+        // Saturate the low-priority lane with heartbeats. The
+        // runtime task will drain them slowly under heavy lock
+        // contention; what matters is that the priority lane
+        // continues to make progress.
+        for _ in 0..RUNTIME_INBOX_CAPACITY * 2 {
+            let _ = handle.try_dispatch(Inbound::Heartbeat {
+                from: 0x20,
+                msg: SyncHeartbeat {
+                    channel_id: cid,
+                    tail_seq: 0,
+                    role: ReplicaRole::Replica,
+                    wall_clock_ms: 0,
+                },
+            });
+        }
+
+        // Ship a Shutdown on the priority lane and confirm the
+        // runtime exits within a short bound. Under the pre-fix
+        // single-inbox design this would block on the saturated
+        // queue indefinitely (cancel falls back to JoinHandle::
+        // abort but the Idle transition wouldn't run).
+        let cancel_fut = handle.cancel();
+        let bounded = tokio::time::timeout(Duration::from_secs(2), cancel_fut).await;
+        assert!(
+            bounded.is_ok(),
+            "shutdown on priority lane must drain under low-priority saturation"
+        );
+        // Idle transition ran via the graceful path, not the abort.
+        assert_eq!(
+            coordinator.role(),
+            ReplicaRole::Idle,
+            "graceful Idle transition must complete via priority-lane Shutdown"
+        );
     }
 
     #[tokio::test]
