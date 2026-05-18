@@ -165,6 +165,79 @@ extern uint64_t net_rpc_stream_call_id(const RpcStreamHandleC* stream);
 extern void net_rpc_stream_close(RpcStreamHandleC* stream);
 extern void net_rpc_stream_free(RpcStreamHandleC* stream);
 
+// ABI 0x0002 — client-streaming caller-side (Phase B11-1).
+typedef struct ClientStreamCallHandleC ClientStreamCallHandleC;
+extern int net_rpc_call_client_stream(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr, size_t service_len,
+    uint64_t deadline_ms,
+    uint32_t request_window,
+    ClientStreamCallHandleC** out_handle,
+    char** out_err
+);
+extern int net_rpc_client_stream_send(
+    ClientStreamCallHandleC* handle,
+    const uint8_t* body_ptr, size_t body_len,
+    char** out_err
+);
+extern int net_rpc_client_stream_finish(
+    ClientStreamCallHandleC* handle,
+    uint8_t** out_body_ptr, size_t* out_body_len,
+    char** out_err
+);
+extern uint64_t net_rpc_client_stream_call_id(const ClientStreamCallHandleC* handle);
+extern void net_rpc_client_stream_free(ClientStreamCallHandleC* handle);
+
+// ABI 0x0002 — duplex caller-side (Phase B11-1).
+typedef struct DuplexCallHandleC DuplexCallHandleC;
+typedef struct DuplexSinkHandleC DuplexSinkHandleC;
+typedef struct DuplexStreamHandleC DuplexStreamHandleC;
+extern int net_rpc_call_duplex(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr, size_t service_len,
+    uint64_t deadline_ms,
+    uint32_t request_window,
+    uint32_t stream_window,
+    DuplexCallHandleC** out_handle,
+    char** out_err
+);
+extern int net_rpc_duplex_send(
+    DuplexCallHandleC* handle,
+    const uint8_t* body_ptr, size_t body_len,
+    char** out_err
+);
+extern int net_rpc_duplex_finish_sending(DuplexCallHandleC* handle, char** out_err);
+extern int net_rpc_duplex_next(
+    DuplexCallHandleC* handle,
+    uint8_t** out_chunk_ptr, size_t* out_chunk_len,
+    char** out_err
+);
+extern int net_rpc_duplex_into_split(
+    DuplexCallHandleC* handle,
+    DuplexSinkHandleC** out_sink,
+    DuplexStreamHandleC** out_stream,
+    char** out_err
+);
+extern uint64_t net_rpc_duplex_call_id(const DuplexCallHandleC* handle);
+extern void net_rpc_duplex_free(DuplexCallHandleC* handle);
+extern int net_rpc_duplex_sink_send(
+    DuplexSinkHandleC* handle,
+    const uint8_t* body_ptr, size_t body_len,
+    char** out_err
+);
+extern int net_rpc_duplex_sink_finish(DuplexSinkHandleC* handle, char** out_err);
+extern uint64_t net_rpc_duplex_sink_call_id(const DuplexSinkHandleC* handle);
+extern void net_rpc_duplex_sink_free(DuplexSinkHandleC* handle);
+extern int net_rpc_duplex_stream_next(
+    DuplexStreamHandleC* handle,
+    uint8_t** out_chunk_ptr, size_t* out_chunk_len,
+    char** out_err
+);
+extern uint64_t net_rpc_duplex_stream_call_id(const DuplexStreamHandleC* handle);
+extern void net_rpc_duplex_stream_free(DuplexStreamHandleC* handle);
+
 // Trampoline that Rust calls back through. Defined below as a Go
 // `//export` function and registered via
 // `net_rpc_set_handler_dispatcher` during package init.
@@ -1113,3 +1186,515 @@ func contextDeadlineMs(ctx context.Context) uint64 {
 // directly here, downstream extensions of this file (e.g. attaching
 // arbitrary user_data to a handler beyond the simple registry) will.
 var _ = cgo.Handle(0)
+
+// =====================================================================
+// ABI 0x0002 — Client-streaming caller-side (Phase B11-1)
+// =====================================================================
+
+// ClientStreamOptions configures a client-streaming call's
+// upload-direction flow control. Zero value disables flow
+// control (caller sends as fast as the publish path can take).
+type ClientStreamOptions struct {
+	// RequestWindow installs `nrpc-request-window-initial=<n>` on
+	// the initial REQUEST. Caller's Send blocks until credit
+	// becomes available; server refills via REQUEST_GRANT after
+	// each consumed chunk. Zero == no flow control.
+	RequestWindow uint32
+}
+
+// ClientStreamCall is an open client-streaming RPC call. Push
+// chunks via Send, then call Finish to await the terminal
+// response. Close MUST be called eventually (defer is fine) if
+// Finish wasn't reached.
+type ClientStreamCall struct {
+	rpc         *MeshRpc
+	handle      *C.ClientStreamCallHandleC
+	callID      uint64
+	closed      atomic.Bool
+	cancel      context.CancelFunc
+	watcherDone chan struct{}
+}
+
+// CallClientStream opens a client-streaming RPC. The returned
+// *ClientStreamCall MUST be Finished or Closed; dropping without
+// either leaks the C handle until the finalizer runs.
+//
+// `ctx` is honored two ways: the deadline (if set) is forwarded
+// to the SDK as the call deadline; if `ctx` cancels before the
+// caller calls Finish / Close, a watcher goroutine fires
+// Close() on the call.
+func (r *MeshRpc) CallClientStream(
+	ctx context.Context,
+	targetNodeID uint64,
+	service string,
+	opts ClientStreamOptions,
+) (*ClientStreamCall, error) {
+	deadlineMs := contextDeadlineMs(ctx)
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+
+	var outHandle *C.ClientStreamCallHandleC
+	var outErr *C.char
+	var code C.int
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		code = C.net_rpc_call_client_stream(
+			h,
+			C.uint64_t(targetNodeID),
+			(*C.char)(cService.ptr), cService.len,
+			C.uint64_t(deadlineMs),
+			C.uint32_t(opts.RequestWindow),
+			&outHandle,
+			&outErr,
+		)
+	}); err != nil {
+		return nil, err
+	}
+	if code != 0 {
+		msg := readCError(outErr)
+		return nil, parseRpcError(msg)
+	}
+	call := &ClientStreamCall{
+		rpc:    r,
+		handle: outHandle,
+		callID: uint64(C.net_rpc_client_stream_call_id(outHandle)),
+	}
+	runtime.SetFinalizer(call, (*ClientStreamCall).finalize)
+
+	// ctx-cancel watcher — mirrors CallStreaming's watcher.
+	if ctx != nil && ctx.Done() != nil {
+		watchCtx, cancel := context.WithCancel(ctx)
+		call.cancel = cancel
+		call.watcherDone = make(chan struct{})
+		go func(c *ClientStreamCall, watchCtx context.Context) {
+			<-watchCtx.Done()
+			close(c.watcherDone)
+			c.Close()
+		}(call, watchCtx)
+	}
+	return call, nil
+}
+
+// CallID returns the server-assigned id for diagnostics.
+func (c *ClientStreamCall) CallID() uint64 { return c.callID }
+
+// Send pushes one body chunk. Encodes as the initial REQUEST
+// (first call) or as a REQUEST_CHUNK (subsequent). Returns
+// ErrStreamDone if Finish or Close already terminated the call.
+func (c *ClientStreamCall) Send(body []byte) error {
+	if c.closed.Load() {
+		return ErrStreamDone
+	}
+	cBody, freeBody := bytesToCBytes(body)
+	defer freeBody()
+	var outErr *C.char
+	code := C.net_rpc_client_stream_send(c.handle, cBody.ptr, cBody.len, &outErr)
+	switch code {
+	case 0:
+		return nil
+	case -6: // STREAM_DONE
+		return ErrStreamDone
+	case -2: // CALL_FAILED
+		return parseRpcError(readCError(outErr))
+	default:
+		return fmt.Errorf("net_rpc_client_stream_send returned %d: %s", int(code), readCError(outErr))
+	}
+}
+
+// Finish closes the upload direction (emits REQUEST_END) and
+// awaits the server's terminal response. Returns the response
+// body on success. Consumes the call — subsequent Send / Finish
+// return ErrStreamDone, and Close becomes a no-op.
+func (c *ClientStreamCall) Finish() ([]byte, error) {
+	if c.closed.Load() {
+		return nil, ErrStreamDone
+	}
+	var outBody *C.uint8_t
+	var outBodyLen C.size_t
+	var outErr *C.char
+	code := C.net_rpc_client_stream_finish(c.handle, &outBody, &outBodyLen, &outErr)
+	// Whatever the outcome, the call is done.
+	c.closed.Store(true)
+	runtime.SetFinalizer(c, nil)
+	defer func() {
+		C.net_rpc_client_stream_free(c.handle)
+		c.handle = nil
+		if c.cancel != nil {
+			c.cancel()
+		}
+	}()
+	switch code {
+	case 0:
+		if outBodyLen == 0 || outBody == nil {
+			return []byte{}, nil
+		}
+		defer C.net_rpc_response_free(outBody, outBodyLen)
+		src := unsafe.Slice((*byte)(unsafe.Pointer(outBody)), int(outBodyLen))
+		out := make([]byte, int(outBodyLen))
+		copy(out, src)
+		return out, nil
+	case -2: // CALL_FAILED
+		return nil, parseRpcError(readCError(outErr))
+	case -6: // STREAM_DONE
+		return nil, ErrStreamDone
+	default:
+		return nil, fmt.Errorf("net_rpc_client_stream_finish returned %d: %s", int(code), readCError(outErr))
+	}
+}
+
+// Close releases the call. Implicit CANCEL via the SDK's Drop
+// impl if Finish hasn't completed. Idempotent.
+func (c *ClientStreamCall) Close() {
+	if c.closed.Swap(true) {
+		return
+	}
+	runtime.SetFinalizer(c, nil)
+	C.net_rpc_client_stream_free(c.handle)
+	c.handle = nil
+	if c.cancel != nil {
+		c.cancel()
+	}
+}
+
+func (c *ClientStreamCall) finalize() { c.Close() }
+
+// =====================================================================
+// ABI 0x0002 — Duplex caller-side (Phase B11-1)
+// =====================================================================
+
+// DuplexOptions configures a duplex call's flow control. Both
+// directions are independently opt-in.
+type DuplexOptions struct {
+	// RequestWindow — upload-direction credit window. Same
+	// semantics as ClientStreamOptions.RequestWindow.
+	RequestWindow uint32
+	// StreamWindow — response-direction credit window. Same
+	// semantics as StreamOptions.Window on the existing
+	// CallStreaming path.
+	StreamWindow uint32
+}
+
+// DuplexCall is an open duplex RPC call (combined send +
+// receive). Push request chunks via Send, drain response chunks
+// via Recv. FinishSending closes the upload side but keeps the
+// response stream open. Split peels the call into independent
+// Sink + Stream halves.
+//
+// Close MUST be called eventually if neither FinishSending+Recv
+// drains nor Split was used (Split transfers ownership to the
+// two halves; calling Close on the original after Split is a
+// no-op).
+type DuplexCall struct {
+	rpc         *MeshRpc
+	handle      *C.DuplexCallHandleC
+	callID      uint64
+	closed      atomic.Bool
+	cancel      context.CancelFunc
+	watcherDone chan struct{}
+}
+
+// CallDuplex opens a duplex call. ctx semantics same as
+// CallClientStream.
+func (r *MeshRpc) CallDuplex(
+	ctx context.Context,
+	targetNodeID uint64,
+	service string,
+	opts DuplexOptions,
+) (*DuplexCall, error) {
+	deadlineMs := contextDeadlineMs(ctx)
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+
+	var outHandle *C.DuplexCallHandleC
+	var outErr *C.char
+	var code C.int
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		code = C.net_rpc_call_duplex(
+			h,
+			C.uint64_t(targetNodeID),
+			(*C.char)(cService.ptr), cService.len,
+			C.uint64_t(deadlineMs),
+			C.uint32_t(opts.RequestWindow),
+			C.uint32_t(opts.StreamWindow),
+			&outHandle,
+			&outErr,
+		)
+	}); err != nil {
+		return nil, err
+	}
+	if code != 0 {
+		msg := readCError(outErr)
+		return nil, parseRpcError(msg)
+	}
+	call := &DuplexCall{
+		rpc:    r,
+		handle: outHandle,
+		callID: uint64(C.net_rpc_duplex_call_id(outHandle)),
+	}
+	runtime.SetFinalizer(call, (*DuplexCall).finalize)
+
+	if ctx != nil && ctx.Done() != nil {
+		watchCtx, cancel := context.WithCancel(ctx)
+		call.cancel = cancel
+		call.watcherDone = make(chan struct{})
+		go func(c *DuplexCall, watchCtx context.Context) {
+			<-watchCtx.Done()
+			close(c.watcherDone)
+			c.Close()
+		}(call, watchCtx)
+	}
+	return call, nil
+}
+
+// CallID returns the server-assigned id for diagnostics.
+func (d *DuplexCall) CallID() uint64 { return d.callID }
+
+// Send pushes one body chunk to the server.
+func (d *DuplexCall) Send(body []byte) error {
+	if d.closed.Load() {
+		return ErrStreamDone
+	}
+	cBody, freeBody := bytesToCBytes(body)
+	defer freeBody()
+	var outErr *C.char
+	code := C.net_rpc_duplex_send(d.handle, cBody.ptr, cBody.len, &outErr)
+	switch code {
+	case 0:
+		return nil
+	case -6:
+		return ErrStreamDone
+	case -2:
+		return parseRpcError(readCError(outErr))
+	default:
+		return fmt.Errorf("net_rpc_duplex_send returned %d: %s", int(code), readCError(outErr))
+	}
+}
+
+// FinishSending closes the upload direction. The response stream
+// stays open for subsequent Recv calls until the server's
+// terminal frame arrives.
+func (d *DuplexCall) FinishSending() error {
+	if d.closed.Load() {
+		return ErrStreamDone
+	}
+	var outErr *C.char
+	code := C.net_rpc_duplex_finish_sending(d.handle, &outErr)
+	switch code {
+	case 0:
+		return nil
+	case -6:
+		return ErrStreamDone
+	case -2:
+		return parseRpcError(readCError(outErr))
+	default:
+		return fmt.Errorf("net_rpc_duplex_finish_sending returned %d: %s", int(code), readCError(outErr))
+	}
+}
+
+// Recv blocks until the next response chunk arrives or the
+// stream terminates. Returns ErrStreamDone on clean end.
+func (d *DuplexCall) Recv() ([]byte, error) {
+	if d.closed.Load() {
+		return nil, ErrStreamDone
+	}
+	var outChunk *C.uint8_t
+	var outChunkLen C.size_t
+	var outErr *C.char
+	code := C.net_rpc_duplex_next(d.handle, &outChunk, &outChunkLen, &outErr)
+	switch code {
+	case 0:
+		if outChunkLen == 0 || outChunk == nil {
+			return []byte{}, nil
+		}
+		defer C.net_rpc_response_free(outChunk, outChunkLen)
+		src := unsafe.Slice((*byte)(unsafe.Pointer(outChunk)), int(outChunkLen))
+		out := make([]byte, int(outChunkLen))
+		copy(out, src)
+		return out, nil
+	case -6:
+		return nil, ErrStreamDone
+	case -2:
+		return nil, parseRpcError(readCError(outErr))
+	default:
+		return nil, fmt.Errorf("net_rpc_duplex_next returned %d: %s", int(code), readCError(outErr))
+	}
+}
+
+// Split peels the duplex call into independent send + receive
+// halves. After Split returns successfully the original call is
+// "done" — Send / FinishSending / Recv / Close on it become
+// no-ops. CANCEL fires only when BOTH split halves drop without
+// a clean close.
+func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
+	if d.closed.Load() {
+		return nil, nil, ErrStreamDone
+	}
+	var outSink *C.DuplexSinkHandleC
+	var outStream *C.DuplexStreamHandleC
+	var outErr *C.char
+	code := C.net_rpc_duplex_into_split(d.handle, &outSink, &outStream, &outErr)
+	if code != 0 {
+		msg := readCError(outErr)
+		switch code {
+		case -6:
+			return nil, nil, ErrStreamDone
+		default:
+			return nil, nil, fmt.Errorf("net_rpc_duplex_into_split returned %d: %s", int(code), msg)
+		}
+	}
+	// Latch the original handle done — the FFI side already did
+	// this, but mirror it in Go so a stray Recv / Send on the
+	// original returns ErrStreamDone quickly without a cgo trip.
+	d.closed.Store(true)
+	runtime.SetFinalizer(d, nil)
+	// The original's C handle is still valid (it's an empty shell
+	// after into_split); free it explicitly so we don't rely on
+	// the finalizer.
+	C.net_rpc_duplex_free(d.handle)
+	d.handle = nil
+	if d.cancel != nil {
+		d.cancel()
+	}
+	sink := &DuplexSink{rpc: d.rpc, handle: outSink, callID: d.callID}
+	stream := &DuplexStream{rpc: d.rpc, handle: outStream, callID: d.callID}
+	runtime.SetFinalizer(sink, (*DuplexSink).finalize)
+	runtime.SetFinalizer(stream, (*DuplexStream).finalize)
+	return sink, stream, nil
+}
+
+// Close releases the call. Idempotent.
+func (d *DuplexCall) Close() {
+	if d.closed.Swap(true) {
+		return
+	}
+	runtime.SetFinalizer(d, nil)
+	C.net_rpc_duplex_free(d.handle)
+	d.handle = nil
+	if d.cancel != nil {
+		d.cancel()
+	}
+}
+
+func (d *DuplexCall) finalize() { d.Close() }
+
+// DuplexSink is the send-half of a Split'd duplex call.
+type DuplexSink struct {
+	rpc    *MeshRpc
+	handle *C.DuplexSinkHandleC
+	callID uint64
+	closed atomic.Bool
+}
+
+// CallID returns the server-assigned id.
+func (s *DuplexSink) CallID() uint64 { return s.callID }
+
+// Send pushes one body chunk.
+func (s *DuplexSink) Send(body []byte) error {
+	if s.closed.Load() {
+		return ErrStreamDone
+	}
+	cBody, freeBody := bytesToCBytes(body)
+	defer freeBody()
+	var outErr *C.char
+	code := C.net_rpc_duplex_sink_send(s.handle, cBody.ptr, cBody.len, &outErr)
+	switch code {
+	case 0:
+		return nil
+	case -6:
+		return ErrStreamDone
+	case -2:
+		return parseRpcError(readCError(outErr))
+	default:
+		return fmt.Errorf("net_rpc_duplex_sink_send returned %d: %s", int(code), readCError(outErr))
+	}
+}
+
+// Finish closes the upload direction (emits REQUEST_END).
+// Consumes the sink — subsequent Send returns ErrStreamDone.
+func (s *DuplexSink) Finish() error {
+	if s.closed.Load() {
+		return ErrStreamDone
+	}
+	var outErr *C.char
+	code := C.net_rpc_duplex_sink_finish(s.handle, &outErr)
+	s.closed.Store(true)
+	runtime.SetFinalizer(s, nil)
+	defer func() {
+		C.net_rpc_duplex_sink_free(s.handle)
+		s.handle = nil
+	}()
+	switch code {
+	case 0:
+		return nil
+	case -6:
+		return ErrStreamDone
+	case -2:
+		return parseRpcError(readCError(outErr))
+	default:
+		return fmt.Errorf("net_rpc_duplex_sink_finish returned %d: %s", int(code), readCError(outErr))
+	}
+}
+
+// Close releases the sink half without explicitly emitting
+// REQUEST_END. Idempotent.
+func (s *DuplexSink) Close() {
+	if s.closed.Swap(true) {
+		return
+	}
+	runtime.SetFinalizer(s, nil)
+	C.net_rpc_duplex_sink_free(s.handle)
+	s.handle = nil
+}
+
+func (s *DuplexSink) finalize() { s.Close() }
+
+// DuplexStream is the receive-half of a Split'd duplex call.
+type DuplexStream struct {
+	rpc    *MeshRpc
+	handle *C.DuplexStreamHandleC
+	callID uint64
+	closed atomic.Bool
+}
+
+// CallID returns the server-assigned id.
+func (s *DuplexStream) CallID() uint64 { return s.callID }
+
+// Recv blocks until the next response chunk arrives or the
+// stream terminates. Returns ErrStreamDone on clean end.
+func (s *DuplexStream) Recv() ([]byte, error) {
+	if s.closed.Load() {
+		return nil, ErrStreamDone
+	}
+	var outChunk *C.uint8_t
+	var outChunkLen C.size_t
+	var outErr *C.char
+	code := C.net_rpc_duplex_stream_next(s.handle, &outChunk, &outChunkLen, &outErr)
+	switch code {
+	case 0:
+		if outChunkLen == 0 || outChunk == nil {
+			return []byte{}, nil
+		}
+		defer C.net_rpc_response_free(outChunk, outChunkLen)
+		src := unsafe.Slice((*byte)(unsafe.Pointer(outChunk)), int(outChunkLen))
+		out := make([]byte, int(outChunkLen))
+		copy(out, src)
+		return out, nil
+	case -6:
+		return nil, ErrStreamDone
+	case -2:
+		return nil, parseRpcError(readCError(outErr))
+	default:
+		return nil, fmt.Errorf("net_rpc_duplex_stream_next returned %d: %s", int(code), readCError(outErr))
+	}
+}
+
+// Close releases the stream half. Idempotent.
+func (s *DuplexStream) Close() {
+	if s.closed.Swap(true) {
+		return
+	}
+	runtime.SetFinalizer(s, nil)
+	C.net_rpc_duplex_stream_free(s.handle)
+	s.handle = nil
+}
+
+func (s *DuplexStream) finalize() { s.Close() }
