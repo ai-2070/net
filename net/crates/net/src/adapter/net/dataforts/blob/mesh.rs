@@ -1124,6 +1124,17 @@ impl BlobAdapter for MeshBlobAdapter {
         if len == 0 {
             return Ok(Vec::new());
         }
+        // Guard against `u64 -> usize` truncation on 32-bit targets.
+        // The Small arm indexes `bytes[range.start as usize..range.end as usize]`
+        // and the Manifest arm calls `Vec::with_capacity(len as usize)`; both
+        // silently truncate on 32-bit unless we reject here. Mirror of
+        // FileSystemAdapter::fetch_range's guard in fs.rs.
+        if len > usize::MAX as u64 || range.end > usize::MAX as u64 {
+            return Err(BlobError::Backend(format!(
+                "mesh blob: range length {} or end {} exceeds usize::MAX on this target",
+                len, range.end
+            )));
+        }
         let (result, touched): (Result<Vec<u8>, BlobError>, Vec<[u8; 32]>) = match blob_ref {
             BlobRef::Small { hash, size, .. } => {
                 if range.end > *size {
