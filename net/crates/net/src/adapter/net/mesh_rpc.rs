@@ -37,14 +37,14 @@ use super::channel::{ChannelHash, ChannelId, ChannelName, ChannelPublisher, Publ
 use super::cortex::{
     build_trace_headers, encode_request_grant, encode_stream_grant, EventMeta,
     RpcAsyncResponseEmitter, RpcCancellationToken, RpcClientFold, RpcClientStreamingHandler,
-    RpcContext, RpcHandler, RpcHandlerError, RpcInboundDispatcher, RpcInboundEvent,
-    RpcRequestChunkPayload, RpcRequestGrantEmitter, RpcRequestPayload, RpcResponseEmitter,
-    RpcResponsePayload, RpcServerFold, RpcServerStreamingFold, RpcStatus, RpcStreamingHandler,
-    RpcStreamingRequestFold, StreamItem, TraceContext, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST,
-    DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_REQUEST_GRANT, DISPATCH_RPC_STREAM_GRANT,
-    EVENT_META_SIZE, FLAG_RPC_CLIENT_STREAMING_REQUEST, FLAG_RPC_PROPAGATE_TRACE,
-    FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE, HEADER_NRPC_REQUEST_WINDOW_INITIAL,
-    HEADER_NRPC_STREAM_WINDOW_INITIAL,
+    RpcContext, RpcDuplexFold, RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcInboundDispatcher,
+    RpcInboundEvent, RpcRequestChunkPayload, RpcRequestGrantEmitter, RpcRequestPayload,
+    RpcResponseEmitter, RpcResponsePayload, RpcServerFold, RpcServerStreamingFold, RpcStatus,
+    RpcStreamingHandler, RpcStreamingRequestFold, StreamItem, TraceContext, DISPATCH_RPC_CANCEL,
+    DISPATCH_RPC_REQUEST, DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_REQUEST_GRANT,
+    DISPATCH_RPC_STREAM_GRANT, EVENT_META_SIZE, FLAG_RPC_CLIENT_STREAMING_REQUEST,
+    FLAG_RPC_PROPAGATE_TRACE, FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE,
+    HEADER_NRPC_REQUEST_WINDOW_INITIAL, HEADER_NRPC_STREAM_WINDOW_INITIAL,
 };
 use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome};
 use crate::error::AdapterError;
@@ -828,6 +828,367 @@ impl Drop for ClientStreamCallRaw {
 }
 
 // ============================================================================
+// Phase D — caller-side duplex primitive.
+// ============================================================================
+
+/// Shared state between a `DuplexSink` and its sibling
+/// `DuplexStream`. Both halves hold an `Arc<DuplexInner>`; when
+/// the refcount hits zero (i.e. both halves dropped) the Drop
+/// fires CANCEL to the server unless the call was cleanly closed
+/// (`clean_close = true`).
+struct DuplexInner {
+    mesh: Arc<MeshNode>,
+    target_node_id: u64,
+    request_channel: ChannelName,
+    self_origin: u64,
+    call_id: u64,
+    /// Whether the initial REQUEST was successfully published.
+    /// `false` means we never reached the wire — no CANCEL needed
+    /// (server doesn't know about the call).
+    initial_sent: std::sync::atomic::AtomicBool,
+    /// Set true when the call closes cleanly — terminal RESPONSE
+    /// (or terminal Error) was observed on the response stream.
+    /// Suppresses CANCEL-on-drop.
+    clean_close: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for DuplexInner {
+    fn drop(&mut self) {
+        self.mesh.rpc_client_pending_arc().cancel(self.call_id);
+        if self.clean_close.load(Ordering::SeqCst) {
+            return;
+        }
+        if !self.initial_sent.load(Ordering::SeqCst) {
+            return;
+        }
+        spawn_cancel_publish(
+            Arc::clone(&self.mesh),
+            self.target_node_id,
+            self.request_channel.clone(),
+            self.self_origin,
+            self.call_id,
+        );
+    }
+}
+
+/// Send half of a duplex call. Push items via `send`; emit the
+/// terminal REQUEST_END frame via `finish_sending`. After
+/// `finish_sending` the upload side is closed but the sibling
+/// `DuplexStream` continues yielding response chunks until the
+/// server's terminal frame arrives.
+///
+/// Bidi streaming plan (Phase D).
+pub struct DuplexSink {
+    inner: Arc<DuplexInner>,
+    service: String,
+    initial_headers: Vec<(String, Vec<u8>)>,
+    initial_flags: u16,
+    deadline_ns: u64,
+    credit_sem: Option<Arc<tokio::sync::Semaphore>>,
+    grant_pump: Option<JoinHandle<()>>,
+    state: ClientStreamState,
+}
+
+impl DuplexSink {
+    /// Push one body chunk to the server. Same semantics as
+    /// [`ClientStreamCallRaw::send`].
+    pub async fn send(&mut self, body: Bytes) -> Result<(), RpcError> {
+        match self.state {
+            ClientStreamState::Finishing | ClientStreamState::Done => {
+                return Err(RpcError::Codec {
+                    direction: CodecDirection::Encode,
+                    message: "send() called after finish_sending()".to_string(),
+                });
+            }
+            _ => {}
+        }
+        if let Some(sem) = self.credit_sem.as_ref() {
+            let permit = sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| RpcError::Transport(AdapterError::Connection(
+                    "credit semaphore closed".into(),
+                )))?;
+            permit.forget();
+        }
+        match self.state {
+            ClientStreamState::JustOpened => {
+                let req = RpcRequestPayload {
+                    service: self.service.clone(),
+                    deadline_ns: self.deadline_ns,
+                    flags: self.initial_flags,
+                    headers: std::mem::take(&mut self.initial_headers),
+                    body: body.to_vec(),
+                };
+                self.publish_initial_request(&req).await?;
+                self.inner
+                    .initial_sent
+                    .store(true, Ordering::SeqCst);
+                self.state = ClientStreamState::Sending;
+            }
+            ClientStreamState::Sending => {
+                let chunk = RpcRequestChunkPayload {
+                    call_id: self.inner.call_id,
+                    flags: 0,
+                    headers: vec![],
+                    body: body.to_vec(),
+                };
+                publish_request_chunk(
+                    &self.inner.mesh,
+                    self.inner.target_node_id,
+                    &self.inner.request_channel,
+                    self.inner.self_origin,
+                    &chunk,
+                )
+                .await?;
+            }
+            ClientStreamState::Finishing | ClientStreamState::Done => unreachable!(),
+        }
+        Ok(())
+    }
+
+    /// Close the upload direction. Emits the terminal REQUEST_END
+    /// frame. The response stream continues until the server's
+    /// terminal RESPONSE arrives (use the sibling `DuplexStream`).
+    pub async fn finish_sending(mut self) -> Result<(), RpcError> {
+        match self.state {
+            ClientStreamState::JustOpened => {
+                let req = RpcRequestPayload {
+                    service: self.service.clone(),
+                    deadline_ns: self.deadline_ns,
+                    flags: self.initial_flags | FLAG_RPC_REQUEST_END,
+                    headers: std::mem::take(&mut self.initial_headers),
+                    body: vec![],
+                };
+                self.publish_initial_request(&req).await?;
+                self.inner
+                    .initial_sent
+                    .store(true, Ordering::SeqCst);
+            }
+            ClientStreamState::Sending => {
+                let chunk = RpcRequestChunkPayload {
+                    call_id: self.inner.call_id,
+                    flags: FLAG_RPC_REQUEST_END,
+                    headers: vec![],
+                    body: vec![],
+                };
+                publish_request_chunk(
+                    &self.inner.mesh,
+                    self.inner.target_node_id,
+                    &self.inner.request_channel,
+                    self.inner.self_origin,
+                    &chunk,
+                )
+                .await?;
+            }
+            ClientStreamState::Finishing | ClientStreamState::Done => {
+                return Err(RpcError::Codec {
+                    direction: CodecDirection::Encode,
+                    message: "finish_sending() called twice".to_string(),
+                });
+            }
+        }
+        self.state = ClientStreamState::Finishing;
+        Ok(())
+    }
+
+    /// Server-assigned `call_id`. Same value on the sibling
+    /// `DuplexStream`.
+    pub fn call_id(&self) -> u64 {
+        self.inner.call_id
+    }
+
+    /// Whether this call is flow-controlled on the upload side.
+    pub fn flow_controlled(&self) -> bool {
+        self.credit_sem.is_some()
+    }
+
+    async fn publish_initial_request(
+        &self,
+        req: &RpcRequestPayload,
+    ) -> Result<(), RpcError> {
+        let meta = EventMeta::new(
+            DISPATCH_RPC_REQUEST,
+            0,
+            self.inner.self_origin,
+            self.inner.call_id,
+            0,
+        );
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.encoded_len());
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&req.encode());
+        let request_channel_id = ChannelId::new(self.inner.request_channel.clone());
+        let request_channel_hash = request_channel_id.hash();
+        let stream_id = MeshNode::publish_stream_id(&request_channel_id);
+        let payload = Bytes::from(buf);
+        self.inner
+            .mesh
+            .publish_to_peer(
+                self.inner.target_node_id,
+                request_channel_hash,
+                stream_id,
+                /* reliable */ true,
+                std::slice::from_ref(&payload),
+            )
+            .await
+            .map_err(RpcError::Transport)
+    }
+}
+
+impl Drop for DuplexSink {
+    fn drop(&mut self) {
+        if let Some(task) = self.grant_pump.take() {
+            task.abort();
+        }
+        // The shared DuplexInner's Drop (when refcount hits 0)
+        // does the CANCEL — nothing to do here beyond aborting
+        // the grant pump.
+    }
+}
+
+/// Receive half of a duplex call. Implements `futures::Stream`
+/// yielding `Result<Bytes, RpcError>` per inbound RESPONSE chunk.
+/// EOF on terminal Ok; one final `Err(RpcError::ServerError)` on
+/// terminal non-Ok.
+///
+/// Bidi streaming plan (Phase D).
+pub struct DuplexStream {
+    inner: Arc<DuplexInner>,
+    chunks_rx: tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
+    done: bool,
+}
+
+impl DuplexStream {
+    /// Server-assigned `call_id`. Same value on the sibling
+    /// `DuplexSink`.
+    pub fn call_id(&self) -> u64 {
+        self.inner.call_id
+    }
+}
+
+impl futures::Stream for DuplexStream {
+    type Item = Result<Bytes, RpcError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        match self.chunks_rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(StreamItem::Chunk(body))) => {
+                std::task::Poll::Ready(Some(Ok(body)))
+            }
+            std::task::Poll::Ready(Some(StreamItem::End)) => {
+                self.done = true;
+                self.inner
+                    .clean_close
+                    .store(true, Ordering::SeqCst);
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(Some(StreamItem::Error(resp))) => {
+                self.done = true;
+                self.inner
+                    .clean_close
+                    .store(true, Ordering::SeqCst);
+                let status = resp.status.to_wire();
+                let message = String::from_utf8(resp.body).unwrap_or_else(|e| {
+                    format!("<{} bytes of non-utf8 body>", e.into_bytes().len())
+                });
+                std::task::Poll::Ready(Some(Err(RpcError::ServerError { status, message })))
+            }
+            std::task::Poll::Ready(None) => {
+                self.done = true;
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Caller-side handle for a duplex RPC. Combines a `DuplexSink`
+/// (upload) and `DuplexStream` (download). For application code
+/// that wants to encode requests in one task and decode responses
+/// in another, use [`into_split`] to peel off the two halves.
+///
+/// Bidi streaming plan (Phase D).
+pub struct DuplexCallRaw {
+    sink: DuplexSink,
+    stream: DuplexStream,
+}
+
+impl DuplexCallRaw {
+    /// Server-assigned `call_id`.
+    pub fn call_id(&self) -> u64 {
+        self.sink.call_id()
+    }
+
+    /// Whether the upload side is flow-controlled.
+    pub fn flow_controlled(&self) -> bool {
+        self.sink.flow_controlled()
+    }
+
+    /// Push one body chunk to the server. Delegates to the inner
+    /// `DuplexSink::send`.
+    pub async fn send(&mut self, body: Bytes) -> Result<(), RpcError> {
+        self.sink.send(body).await
+    }
+
+    /// Close the upload direction. Delegates to the inner
+    /// `DuplexSink::finish_sending` but keeps the receive side
+    /// alive so the caller can keep polling response chunks.
+    ///
+    /// NOTE: consumes the sink half but not the stream half.
+    /// Internally, we replace `self.sink` with a no-op
+    /// placeholder so subsequent send() / finish_sending()
+    /// surface a clear error (`send() after finish_sending()`).
+    pub async fn finish_sending(&mut self) -> Result<(), RpcError> {
+        // Take the sink out by swapping in a placeholder whose
+        // state is `Done` so subsequent sends error cleanly.
+        let placeholder = DuplexSink {
+            inner: Arc::clone(&self.sink.inner),
+            service: String::new(),
+            initial_headers: Vec::new(),
+            initial_flags: 0,
+            deadline_ns: 0,
+            credit_sem: None,
+            grant_pump: None,
+            state: ClientStreamState::Done,
+        };
+        let sink = std::mem::replace(&mut self.sink, placeholder);
+        sink.finish_sending().await
+    }
+
+    /// Pull the next response chunk. `None` on terminal Ok;
+    /// `Some(Err)` then `None` on terminal non-Ok. Same shape as
+    /// `futures::StreamExt::next`.
+    pub async fn next(&mut self) -> Option<Result<Bytes, RpcError>> {
+        use futures::StreamExt;
+        self.stream.next().await
+    }
+
+    /// Split into independent send / receive halves. Both halves
+    /// hold an `Arc<DuplexInner>`; CANCEL fires only when BOTH
+    /// halves drop without a clean close.
+    pub fn into_split(self) -> (DuplexSink, DuplexStream) {
+        (self.sink, self.stream)
+    }
+}
+
+impl futures::Stream for DuplexCallRaw {
+    type Item = Result<Bytes, RpcError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.stream).poll_next(cx)
+    }
+}
+
+// ============================================================================
 // Unary call: CANCEL-on-drop guard.
 // ============================================================================
 
@@ -1376,6 +1737,252 @@ impl MeshNode {
             state: ClientStreamState::JustOpened,
             started: Instant::now(),
         })
+    }
+
+    /// Register a duplex nRPC handler for `service`. Composes
+    /// [`Self::serve_rpc_client_stream`] (request-side stream)
+    /// with [`Self::serve_rpc_streaming`] (response-side multi-
+    /// fire emit) via [`RpcDuplexFold`].
+    ///
+    /// Wires THREE emit callbacks:
+    /// - Async [`RpcAsyncResponseEmitter`] for response chunks +
+    ///   the terminal frame (per-call ordering required because
+    ///   the response side is multi-fire).
+    /// - [`RpcRequestGrantEmitter`] for upload-direction credit
+    ///   grants (one per consumed request chunk when flow
+    ///   control is opted into).
+    ///
+    /// Bidi streaming plan (Phase D).
+    pub fn serve_rpc_duplex<H: RpcDuplexHandler>(
+        self: &Arc<Self>,
+        service: &str,
+        handler: Arc<H>,
+    ) -> Result<ServeHandle, ServeError> {
+        let request_channel = ChannelName::new(&format!("{service}.requests"))
+            .map_err(|e| ServeError::InvalidServiceName(e.to_string()))?;
+        let channel_hash = request_channel.hash();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RpcInboundEvent>(1024);
+
+        let mesh_for_emit = Arc::clone(self);
+        let service_for_emit = service.to_string();
+        let server_origin = self.identity_origin_hash();
+
+        // Async response emitter — per-call ordering matters here
+        // because the response side is multi-fire (same rationale
+        // as serve_rpc_streaming).
+        let emit_resp_mesh = Arc::clone(&mesh_for_emit);
+        let emit_resp_service = service_for_emit.clone();
+        let emit_resp: RpcAsyncResponseEmitter =
+            Arc::new(move |caller_origin, call_id, resp| {
+                let mesh = Arc::clone(&emit_resp_mesh);
+                let service = emit_resp_service.clone();
+                Box::pin(async move {
+                    let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
+                    let reply_channel = match ChannelName::new(&reply_channel_name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(error = %e, channel = %reply_channel_name,
+                                "rpc serve_rpc_duplex: invalid reply channel name");
+                            return;
+                        }
+                    };
+                    let meta = EventMeta::new(
+                        super::cortex::DISPATCH_RPC_RESPONSE,
+                        0,
+                        server_origin,
+                        call_id,
+                        0,
+                    );
+                    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
+                    buf.extend_from_slice(&meta.to_bytes());
+                    buf.extend_from_slice(&resp.encode());
+                    let publisher =
+                        ChannelPublisher::new(reply_channel, PublishConfig::default());
+                    if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
+                        tracing::warn!(error = %e,
+                            caller_origin = format!("{:#x}", caller_origin),
+                            call_id,
+                            "rpc serve_rpc_duplex: chunk publish failed");
+                    }
+                })
+            });
+
+        // Request-direction grant emitter — same shape as
+        // serve_rpc_client_stream.
+        let emit_grant_mesh = Arc::clone(&mesh_for_emit);
+        let emit_grant_service = service_for_emit.clone();
+        let emit_grant: RpcRequestGrantEmitter =
+            Arc::new(move |caller_origin, call_id, credits| {
+                let mesh = Arc::clone(&emit_grant_mesh);
+                let service = emit_grant_service.clone();
+                tokio::spawn(async move {
+                    let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
+                    let reply_channel = match ChannelName::new(&reply_channel_name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(error = %e, channel = %reply_channel_name,
+                                "rpc serve_rpc_duplex: invalid reply channel name (grant)");
+                            return;
+                        }
+                    };
+                    let meta = EventMeta::new(
+                        DISPATCH_RPC_REQUEST_GRANT,
+                        0,
+                        server_origin,
+                        call_id,
+                        0,
+                    );
+                    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
+                    buf.extend_from_slice(&meta.to_bytes());
+                    buf.extend_from_slice(&encode_request_grant(call_id, credits));
+                    let publisher =
+                        ChannelPublisher::new(reply_channel, PublishConfig::default());
+                    if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
+                        tracing::warn!(error = %e,
+                            caller_origin = format!("{:#x}", caller_origin),
+                            call_id,
+                            "rpc serve_rpc_duplex: REQUEST_GRANT publish failed");
+                    }
+                });
+            });
+
+        let metrics_handle = self.rpc_metrics_arc().for_service(service);
+        let fold = Arc::new(Mutex::new(
+            RpcDuplexFold::new(handler as Arc<dyn RpcDuplexHandler>, emit_resp)
+                .with_grant_emitter(emit_grant)
+                .with_metrics(metrics_handle),
+        ));
+        let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
+            let _ = tx.try_send(ev);
+        });
+        if self
+            .register_rpc_inbound(channel_hash, dispatcher)
+            .is_some()
+        {
+            return Err(ServeError::AlreadyServing(service.to_string()));
+        }
+        let bridge = tokio::spawn(async move {
+            while let Some(inbound) = rx.recv().await {
+                let payload = inbound.payload;
+                let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
+                let ev = RedexEvent { entry, payload };
+                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                    tracing::warn!(error = %e,
+                        "rpc serve_rpc_duplex: fold apply error");
+                }
+            }
+        });
+        self.rpc_local_services_arc().insert(service.to_string());
+        Ok(ServeHandle {
+            channel_hash,
+            service: service.to_string(),
+            _bridge: bridge,
+            mesh: Arc::clone(self),
+        })
+    }
+
+    /// Duplex variant of [`Self::call`]. Returns a
+    /// [`DuplexCallRaw`] handle with both upload (`send`,
+    /// `finish_sending`) and download (`next`, or impl
+    /// `futures::Stream`) surfaces. Use `into_split` to peel off
+    /// the two halves for the "encoder task + decoder task"
+    /// shape.
+    ///
+    /// Initial REQUEST sets BOTH `FLAG_RPC_CLIENT_STREAMING_REQUEST`
+    /// AND `FLAG_RPC_STREAMING_RESPONSE`. Lazy publish — the
+    /// initial REQUEST flies on the first `send` (or on
+    /// `finish_sending` for the zero-item degenerate path).
+    ///
+    /// Bidi streaming plan (Phase D).
+    pub async fn call_duplex(
+        self: &Arc<Self>,
+        target_node_id: u64,
+        service: &str,
+        opts: CallOptions,
+    ) -> Result<DuplexCallRaw, RpcError> {
+        let request_channel =
+            ChannelName::new(&format!("{service}.requests")).map_err(|e| RpcError::NoRoute {
+                target: target_node_id,
+                reason: format!("invalid service name: {e}"),
+            })?;
+        let self_origin = self.identity_origin_hash();
+        let reply_channel_name = format!("{service}.replies.{self_origin:016x}");
+        let reply_channel =
+            ChannelName::new(&reply_channel_name).map_err(|e| RpcError::NoRoute {
+                target: target_node_id,
+                reason: format!("invalid reply channel name: {e}"),
+            })?;
+        let reply_hash = reply_channel.hash();
+        self.ensure_reply_subscription(target_node_id, service, reply_channel.clone(), reply_hash)
+            .await?;
+
+        let call_id = mint_random_call_id();
+        let pending = self.rpc_client_pending();
+        let (chunks_rx, mut grant_rx) =
+            pending.register_duplex(call_id, target_node_id);
+
+        let mut initial_flags = FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_STREAMING_RESPONSE;
+        let mut initial_headers: Vec<(String, Vec<u8>)> = Vec::new();
+        if let Some(tc) = opts.trace_context.as_ref() {
+            initial_flags |= FLAG_RPC_PROPAGATE_TRACE;
+            initial_headers.extend(build_trace_headers(tc));
+        }
+        if let Some(window) = opts.request_window_initial {
+            initial_headers.push((
+                HEADER_NRPC_REQUEST_WINDOW_INITIAL.to_string(),
+                window.to_string().into_bytes(),
+            ));
+        }
+        if let Some(window) = opts.stream_window_initial {
+            initial_headers.push((
+                HEADER_NRPC_STREAM_WINDOW_INITIAL.to_string(),
+                window.to_string().into_bytes(),
+            ));
+        }
+        initial_headers.extend(opts.request_headers.iter().cloned());
+
+        let credit_sem = opts.request_window_initial.map(|n| {
+            Arc::new(tokio::sync::Semaphore::new(n as usize))
+        });
+        let grant_pump = credit_sem.as_ref().map(|sem| {
+            let sem = Arc::clone(sem);
+            tokio::spawn(async move {
+                while let Some(credits) = grant_rx.recv().await {
+                    if credits == 0 {
+                        continue;
+                    }
+                    let safe = (credits as usize).min(usize::MAX >> 4);
+                    sem.add_permits(safe);
+                }
+            })
+        });
+
+        let deadline_ns = opts.deadline.map(instant_to_unix_nanos).unwrap_or(0);
+        let inner = Arc::new(DuplexInner {
+            mesh: Arc::clone(self),
+            target_node_id,
+            request_channel,
+            self_origin,
+            call_id,
+            initial_sent: std::sync::atomic::AtomicBool::new(false),
+            clean_close: std::sync::atomic::AtomicBool::new(false),
+        });
+        let sink = DuplexSink {
+            inner: Arc::clone(&inner),
+            service: service.to_string(),
+            initial_headers,
+            initial_flags,
+            deadline_ns,
+            credit_sem,
+            grant_pump,
+            state: ClientStreamState::JustOpened,
+        };
+        let stream = DuplexStream {
+            inner,
+            chunks_rx,
+            done: false,
+        };
+        Ok(DuplexCallRaw { sink, stream })
     }
 
     /// Streaming variant of [`Self::call`]. Returns an
