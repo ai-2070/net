@@ -1966,7 +1966,17 @@ pub struct IdentityHandle {
 /// — both sides pin the capacity to `len`, so there is no reliance on
 /// `Vec::shrink_to_fit` producing `capacity == len` (which is not
 /// guaranteed by the allocator API).
+///
+/// Returns `NetError::NullPointer` (the FFI-safe sentinel) if either
+/// out-pointer is null. Every current call site filters nulls at the
+/// public `extern "C"` entry before reaching here, so this check is
+/// defence-in-depth — its purpose is to make `alloc_bytes` safe to
+/// reuse from future call sites without retracing the null-handling
+/// contract.
 fn alloc_bytes(src: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) -> c_int {
+    if out_ptr.is_null() || out_len.is_null() {
+        return NetError::NullPointer.into();
+    }
     let len = src.len();
     if len == 0 {
         unsafe {

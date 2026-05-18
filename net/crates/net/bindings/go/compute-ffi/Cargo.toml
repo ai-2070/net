@@ -64,5 +64,7 @@ libc = "0.2"
 # tree uses for cap diff / predicate IR.
 serde_json = "1"
 
-[profile.release]
-lto = true
+# `[profile.release]` intentionally omitted — cargo ignores non-root
+# profiles ("profiles for the non root package will be ignored"). The
+# workspace root governs release-profile settings (lto = true and
+# friends) for every member crate.

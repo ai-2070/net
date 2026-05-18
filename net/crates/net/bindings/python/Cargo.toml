@@ -129,5 +129,7 @@ postcard = { version = "1", default-features = false, features = ["alloc"], opti
 [build-dependencies]
 pyo3-build-config = "0.28.0"
 
-[profile.release]
-lto = true
+# `[profile.release]` intentionally omitted — cargo ignores non-root
+# profiles ("profiles for the non root package will be ignored"). The
+# workspace root governs release-profile settings (lto = true and
+# friends) for every member crate.

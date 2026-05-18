@@ -39,5 +39,7 @@ libc = "0.2"
 # C-ABI's blocking `net_rpc_stream_next` entry point.
 futures = "0.3"
 
-[profile.release]
-lto = true
+# `[profile.release]` intentionally omitted — cargo ignores non-root
+# profiles ("profiles for the non root package will be ignored"). The
+# workspace root governs release-profile settings (lto = true and
+# friends) for every member crate.

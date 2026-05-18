@@ -216,8 +216,17 @@ pub extern "C" fn net_predicate_to_where_header(
     if name_rc != 0 {
         return name_rc;
     }
-    // SAFETY: serde_json output is guaranteed valid UTF-8.
-    let value_string = unsafe { String::from_utf8_unchecked(value_bytes) };
+    // serde_json output is guaranteed valid UTF-8, so the checked
+    // conversion is infallible today. Use the checked variant
+    // anyway so a future refactor that swaps the encoder for a
+    // length-prefixed / postcard / non-text format surfaces a
+    // typed error instead of building a String with invalid UTF-8
+    // (which is unsound to even hold, never mind use). Cost is one
+    // byte-validate pass over a short header value.
+    let value_string = match String::from_utf8(value_bytes) {
+        Ok(s) => s,
+        Err(_) => return NetError::InvalidUtf8.into(),
+    };
     let value_rc = super::mesh::write_string_out(value_string, out_value_ptr, out_value_len);
     if value_rc != 0 {
         // CR-17: defensive cleanup. If the value-side write fails
