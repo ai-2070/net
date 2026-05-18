@@ -772,6 +772,24 @@ fn observe_lag(
     }
 }
 
+/// Drop the believed-leader belief AND the outstanding-request
+/// tokens recorded against that leader. Sites that previously
+/// only called `clear_believed_leader` would leave the prior
+/// leader's in-flight tokens in `OutstandingRequests` until TTL
+/// (30 s). Under role thrash or rapid leader churn, the soft-cap
+/// GC then evicted entries from OTHER leaders to make room — the
+/// documented invariant on `OutstandingRequests::clear_leader`.
+fn clear_leader_belief_and_tokens(
+    tracker: &Arc<Mutex<HeartbeatTracker>>,
+    outstanding: &Arc<Mutex<OutstandingRequests>>,
+) {
+    let prior = tracker.lock().believed_leader();
+    tracker.lock().clear_believed_leader();
+    if let Some(prior) = prior {
+        outstanding.lock().clear_leader(prior);
+    }
+}
+
 async fn on_tick(
     inputs: &RuntimeInputs,
     coordinator: &Arc<ReplicationCoordinator>,
@@ -956,7 +974,7 @@ async fn on_tick(
                         // Shutdown drove us to Idle first), wiping
                         // the believed leader would leave the
                         // coordinator with no recovery signal.
-                        tracker.lock().clear_believed_leader();
+                        clear_leader_belief_and_tokens(tracker, outstanding);
                     }
                     Err(CoordinatorError::TagSink(e)) => {
                         // State moved to the target (Leader /
@@ -974,7 +992,7 @@ async fn on_tick(
                             target = ?pt.target,
                             "replication: post-election chain-tag side-effect failed; state advanced"
                         );
-                        tracker.lock().clear_believed_leader();
+                        clear_leader_belief_and_tokens(tracker, outstanding);
                     }
                     Err(CoordinatorError::Transition(e)) => {
                         // State did not move (typically because a
@@ -988,7 +1006,7 @@ async fn on_tick(
                             target = ?pt.target,
                             "replication: post-election transition rejected; state moved out from under us"
                         );
-                        tracker.lock().clear_believed_leader();
+                        clear_leader_belief_and_tokens(tracker, outstanding);
                     }
                 }
             }
@@ -1531,7 +1549,7 @@ async fn on_inbound(
                     // the next tick re-resolves via the heartbeat
                     // cycle instead of looping on the stale leader
                     // belief until 3 missed heartbeats trip.
-                    tracker.lock().clear_believed_leader();
+                    clear_leader_belief_and_tokens(tracker, outstanding);
                     tracing::trace!(
                         from = from,
                         "replication: NACK NotLeader — cleared believed leader"
