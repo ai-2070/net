@@ -733,6 +733,10 @@ impl MeshOsRuntime {
                 .stats
                 .cluster_backpressure_releases
                 .load(std::sync::atomic::Ordering::Relaxed),
+            chain_append_failures: self
+                .stats
+                .chain_append_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -806,6 +810,10 @@ impl MeshOsRuntime {
                 cluster_backpressure_releases: self
                     .stats
                     .cluster_backpressure_releases
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                chain_append_failures: self
+                    .stats
+                    .chain_append_failures
                     .load(std::sync::atomic::Ordering::Relaxed),
             },
             dropped_actions: self.dropped_actions.load(AtomicOrdering::Relaxed),
