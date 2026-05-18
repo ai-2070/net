@@ -747,6 +747,15 @@ pub struct AdminAuditRecord {
     pub operator_ids: Vec<u64>,
     /// The verifier's outcome for this attempt.
     pub outcome: VerificationOutcome,
+    /// `true` when this entry is in the in-memory ring but the
+    /// durable chain append failed. Chain consumers replaying
+    /// the chain after a restart will not see entries with this
+    /// flag — they have to consult the ring directly (which only
+    /// holds a bounded recent window). Default `false` so older
+    /// serialized records that pre-date the field deserialize
+    /// cleanly.
+    #[serde(default)]
+    pub chain_pending: bool,
 }
 
 /// Substrate-side ICE admin verifier — bundles a shared
@@ -2263,6 +2272,7 @@ mod tests {
                 },
                 operator_ids: vec![1, 2, 3],
                 outcome: outcome.clone(),
+                chain_pending: false,
             };
             let bytes = postcard::to_allocvec(&record).expect("encode");
             let decoded: AdminAuditRecord = postcard::from_bytes(&bytes).expect("decode");
@@ -2278,6 +2288,7 @@ mod tests {
             event: AdminEvent::ThawCluster,
             operator_ids: vec![42],
             outcome: VerificationOutcome::Accepted,
+            chain_pending: false,
         };
         let json = serde_json::to_string(&record).expect("encode");
         let decoded: AdminAuditRecord = serde_json::from_str(&json).expect("decode");
@@ -2645,6 +2656,7 @@ mod tests {
             },
             operator_ids: Vec::new(),
             outcome: VerificationOutcome::Unverified,
+            chain_pending: false,
         };
         let bytes = postcard::to_allocvec(&record).expect("encode");
         let decoded: AdminAuditRecord = postcard::from_bytes(&bytes).expect("decode");

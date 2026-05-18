@@ -1111,21 +1111,36 @@ impl MeshOsLoop {
             event: event.clone(),
             operator_ids,
             outcome,
+            chain_pending: false,
         };
-        // Dual-write: chain first, ring second. The chain
-        // append is non-fatal — a hiccup there must never
-        // wedge the in-memory audit surface. Log + continue.
+        // Ring-first then chain. The ring is the immediate
+        // user-visible surface that the Deck SDK polls; the chain
+        // is durability backup for cluster-lifetime replay. If the
+        // chain append fails, mark the ring entry's chain_pending
+        // flag so chain consumers (replaying after restart) can
+        // distinguish "entry never landed" from "entry hasn't
+        // reached me yet." Pre-fix the chain attempt ran BEFORE
+        // the ring push and the ring entry never recorded the
+        // chain-side outcome — chain consumers saw a gap with no
+        // way to know it was permanent.
+        self.admin_audit_ring.push_back(record.clone());
+        while self.admin_audit_ring.len() > super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS {
+            self.admin_audit_ring.pop_front();
+        }
         if let Err(err) = self.admin_audit_appender.append(&record) {
             tracing::warn!(
                 target: "meshos",
                 seq = record.seq,
                 error = %err,
-                "admin-audit-chain append failed — record kept on in-memory ring only",
+                "admin-audit-chain append failed — ring entry marked chain_pending",
             );
-        }
-        self.admin_audit_ring.push_back(record);
-        while self.admin_audit_ring.len() > super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS {
-            self.admin_audit_ring.pop_front();
+            // Locate the just-pushed entry (back of the ring; cap
+            // protects against an empty back() but we just pushed)
+            // and flip its chain_pending flag so the ring surface
+            // reports the gap.
+            if let Some(last) = self.admin_audit_ring.back_mut() {
+                last.chain_pending = true;
+            }
         }
     }
 
@@ -1149,21 +1164,27 @@ impl MeshOsLoop {
             daemon_id: line.daemon_id,
             node_id: Some(self.config.this_node),
             message: line.message.clone(),
+            chain_pending: false,
         };
-        // Dual-write: chain first, ring second. The chain
-        // append is non-fatal — a hiccup there must never
-        // wedge the in-memory log surface.
+        // Ring-first then chain. Same rationale as record_admin_audit:
+        // the ring is the immediate user surface; the chain is
+        // durability backup. Mark chain_pending on the just-pushed
+        // ring entry when the chain append fails so chain consumers
+        // can distinguish "gap" from "haven't replicated yet."
+        self.log_ring.push_back(record.clone());
+        while self.log_ring.len() > super::logs::DEFAULT_MAX_LOG_RING_RECORDS {
+            self.log_ring.pop_front();
+        }
         if let Err(err) = self.log_appender.append(&record) {
             tracing::warn!(
                 target: "meshos",
                 seq = record.seq,
                 error = %err,
-                "log-chain append failed — record kept on in-memory ring only",
+                "log-chain append failed — ring entry marked chain_pending",
             );
-        }
-        self.log_ring.push_back(record);
-        while self.log_ring.len() > super::logs::DEFAULT_MAX_LOG_RING_RECORDS {
-            self.log_ring.pop_front();
+            if let Some(last) = self.log_ring.back_mut() {
+                last.chain_pending = true;
+            }
         }
     }
 
@@ -2413,8 +2434,58 @@ mod tests {
         assert_eq!(snap.admin_audit.len(), 1, "ring should hold one record");
         // The appender + ring see the SAME record (seq + content match).
         assert_eq!(snap.admin_audit[0].seq, captured[0].seq);
+        // Successful append → ring entry has chain_pending == false.
+        assert!(
+            !snap.admin_audit[0].chain_pending,
+            "ring entry must NOT be marked chain_pending when the appender succeeded"
+        );
 
         // Tidy.
+        drop(handle);
+        let _ = tokio::time::timeout(StdDuration::from_secs(1), task).await;
+    }
+
+    /// Pin that ring-first + mark-chain_pending kicks in when the
+    /// audit chain appender returns an error: ring still records
+    /// the entry but flags it so chain consumers can distinguish
+    /// "permanent gap" from "haven't replicated yet."
+    #[tokio::test]
+    async fn audit_ring_flags_chain_pending_on_appender_failure() {
+        use super::super::audit_chain::{AdminAuditAppendError, AdminAuditChainAppender};
+        use super::super::event::AdminEvent;
+        use super::super::ice::AdminAuditRecord;
+
+        struct FailingAuditAppender;
+        impl AdminAuditChainAppender for FailingAuditAppender {
+            fn append(&self, _record: &AdminAuditRecord) -> Result<(), AdminAuditAppendError> {
+                Err(AdminAuditAppendError {
+                    reason: "test-injected appender failure".into(),
+                })
+            }
+        }
+
+        let MeshOsLoopParts {
+            mesh_loop: loop_,
+            handle,
+            actions_rx: _,
+            reader,
+        } = MeshOsLoop::new(fast_test_config());
+        let loop_ = loop_.with_admin_audit_appender(Arc::new(FailingAuditAppender));
+        let task = tokio::spawn(loop_.run());
+
+        handle
+            .publish(MeshOsEvent::AdminEvent(AdminEvent::Cordon { node: 99 }))
+            .await
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(60)).await;
+
+        let snap = reader.read();
+        assert_eq!(snap.admin_audit.len(), 1, "ring must still record the entry");
+        assert!(
+            snap.admin_audit[0].chain_pending,
+            "ring entry must be flagged chain_pending after the appender returned Err"
+        );
+
         drop(handle);
         let _ = tokio::time::timeout(StdDuration::from_secs(1), task).await;
     }

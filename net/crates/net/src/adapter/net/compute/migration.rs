@@ -432,19 +432,6 @@ mod tests {
     use crate::adapter::net::state::causal::CausalLink;
     use bytes::Bytes;
 
-    fn make_event(seq: u64) -> CausalEvent {
-        CausalEvent {
-            link: CausalLink {
-                origin_hash: 0xAAAA,
-                horizon_encoded: 0,
-                sequence: seq,
-                parent_hash: 0,
-            },
-            payload: Bytes::from_static(b"data"),
-            received_at: 0,
-        }
-    }
-
     #[test]
     fn test_migration_phase_progression() {
         let kp = crate::adapter::net::identity::EntityKeypair::generate();

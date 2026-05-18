@@ -78,6 +78,14 @@ pub struct LogRecord {
     pub node_id: Option<NodeId>,
     /// The log message body.
     pub message: String,
+    /// `true` when this entry is in the in-memory ring but the
+    /// durable chain append failed. Chain consumers replaying
+    /// the chain after a restart will not see entries with this
+    /// flag — they have to consult the ring directly (which only
+    /// holds a bounded recent window). Default `false` so older
+    /// serialized records deserialize cleanly.
+    #[serde(default)]
+    pub chain_pending: bool,
 }
 
 /// Input form a publisher constructs and sends through the
@@ -137,6 +145,7 @@ mod tests {
             daemon_id: Some(7),
             node_id: Some(100),
             message: "drain timeout".into(),
+            chain_pending: false,
         };
         let bytes = postcard::to_allocvec(&record).expect("encode");
         let decoded: LogRecord = postcard::from_bytes(&bytes).expect("decode");

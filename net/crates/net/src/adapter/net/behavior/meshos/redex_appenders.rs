@@ -162,6 +162,7 @@ mod tests {
             },
             operator_ids: vec![7],
             outcome: VerificationOutcome::Accepted,
+            chain_pending: false,
         };
         appender.append(&record).expect("append");
 
@@ -184,6 +185,7 @@ mod tests {
             daemon_id: Some(7),
             node_id: Some(100),
             message: "throttling".into(),
+            chain_pending: false,
         };
         appender.append(&record).expect("append");
 
