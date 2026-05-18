@@ -167,17 +167,24 @@ pub trait BlobAdapter: Send + Sync + 'static {
         // sender-stream loads still pass while runaway streams
         // fail loudly.
         const MAX_STREAM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+        // Clamp the cap to `usize::MAX` on 32-bit targets where the
+        // 16 GiB constant exceeds the usize range — without the
+        // clamp, `Vec`'s allocator would OOM-panic past `usize::MAX`
+        // bytes before the `> MAX_STREAM_BYTES` comparison ever
+        // returned the typed error. Mirror of `mesh.rs:1188-1197`'s
+        // u64→usize range guard.
+        let effective_cap = MAX_STREAM_BYTES.min(usize::MAX as u64);
         let mut buf: Vec<u8> = match size_hint {
             Some(n) if (n as usize) <= 16 * 1024 * 1024 => Vec::with_capacity(n as usize),
             _ => Vec::new(),
         };
         while let Some(chunk) = stream.next().await {
             let bytes = chunk?;
-            if (buf.len() as u64).saturating_add(bytes.len() as u64) > MAX_STREAM_BYTES {
+            if (buf.len() as u64).saturating_add(bytes.len() as u64) > effective_cap {
                 return Err(BlobError::Backend(format!(
                     "store_stream: accumulated {} bytes exceeds {} cap",
                     buf.len(),
-                    MAX_STREAM_BYTES
+                    effective_cap
                 )));
             }
             buf.extend_from_slice(&bytes);
