@@ -872,8 +872,20 @@ options considered and the recommended path.
 | X-15 | Delete dead TargetMigrationState.target_head field | `ca6b21a1` |
 | X-16 | Score local through PlacementFilter before LocalPreferred | `0bcc58d1` |
 | X-22 | on_replay_complete returns StateFailed instead of synthesizing parent_hash:0 | `848ef03c` |
+| R-31 | Coordinator divergence counter on `* → Idle` sink failure | `d61ee36a` |
+| D-3 | FS adapter threat-model docs | `d61ee36a` |
+| O-9 | gc_drain_window 1-second hardcode (commented, not a bug) | `d61ee36a` |
+| X-21 | `Scheduler::place_with_locality(filter, drained: bool)` | `951085e2` |
+| O-4 | Executor chain_append_failures counter | `3210a9d4` |
+| X-17 | `validate_chunk_header` on every SnapshotReady chunk 0 | `96d5fba4` |
+| X-20 | Delete dead `MigrationOrchestrator::buffer_event` surface | `d271e15c` |
+| O-5 | Ring-first + `chain_pending` flag on AdminAuditRecord / LogRecord | `a88e46b4` |
+| X-13 (partial) | `UnhealthySlotRecovery` trait + StandbyGroup impl (ForkGroup, ReplicaGroup, meshos tick deferred) | `a148dcaa` |
 
-**Total: 58 fixes, 29 commits.** Every commit is independently reviewable, isolated to one logical change (some bundle two or three related lows), and includes regression tests where a unit-test-scale assertion was meaningful.
+**Total: 66 fixes, 35 commits** (58 original + 8 locked-decision-driven landings).
+Every commit is independently reviewable, isolated to one logical change
+(some bundle two or three related lows), and includes regression tests
+where a unit-test-scale assertion was meaningful.
 
 ### Deferred — wire-protocol bundles
 
@@ -898,6 +910,19 @@ Decisions below are **locked** — implementation can proceed without
 re-litigation. Each entry records the chosen path, the rejected
 alternatives (so future readers can see why we didn't take them),
 and a concrete implementation plan.
+
+**Implementation status (commits on `bugfixes-15`):**
+
+| ID | Status | Commit |
+|---|---|---|
+| R-31 | ✅ Implemented | `d61ee36a` |
+| D-3 | ✅ Implemented (docs) | `d61ee36a` |
+| X-13 | 🟡 Partial — trait + StandbyGroup impl landed; ForkGroup, ReplicaGroup, and meshos tick integration deferred | `a148dcaa` |
+| X-17 | ✅ Implemented | `96d5fba4` |
+| X-20 | ✅ Implemented | `d271e15c` |
+| X-21 | ✅ Implemented | `951085e2` |
+| O-4 + O-5 | ✅ Both implemented (O-4: `3210a9d4`, O-5: `a88e46b4`) | — |
+| O-9 | ✅ Comment landed (no code change) | `d61ee36a` |
 
 ---
 
