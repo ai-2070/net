@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/dataforts/blob/mod.rs
+  s_2571835e05521c::t_ef8f17c65f025e 23
+net/crates/net/Cargo.toml
+  s_2571835e05521c::t_bc90b6104f38c8 108-114
+  s_2571835e05521c::t_61ad9ecf62333e 194-205
+net/crates/net/src/adapter/net/dataforts/blob/erasure.rs
+  s_2571835e05521c::t_eae9395ac8d994 1-388,390-571
+  s_2571835e05521c::t_3105869099854e 389
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "1726debd0b3767fa1a9144e3f358fbc9a32fa30a",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
