@@ -503,12 +503,22 @@ impl MeshOsLoop {
             if getrandom::fill(&mut buf).is_ok() {
                 u64::from_le_bytes(buf)
             } else {
+                // Fallback only on `getrandom` failure (vanishingly
+                // rare: seccomp-jailed environments without the
+                // syscall). Mix the process ID into the (epoch ^
+                // counter) shape so two same-nanosecond boots in
+                // a CI parallel matrix still produce distinct
+                // ids — the pre-fix shape collided here exactly.
+                // `std::process::id()` is a u32 on every supported
+                // platform; rotated into the upper bits so it
+                // doesn't trivially XOR-cancel against the counter.
                 static RUNTIME_EPOCH_COUNTER: AtomicU64 = AtomicU64::new(1);
-                std::time::SystemTime::now()
+                let nanos = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0)
-                    ^ RUNTIME_EPOCH_COUNTER.fetch_add(1, Ordering::SeqCst)
+                    .unwrap_or(0);
+                let pid = (std::process::id() as u64).rotate_left(32);
+                nanos ^ RUNTIME_EPOCH_COUNTER.fetch_add(1, Ordering::SeqCst) ^ pid
             }
         };
         let initial_snapshot = MeshOsSnapshot {
