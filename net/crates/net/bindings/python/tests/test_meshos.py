@@ -60,10 +60,8 @@ def test_start_and_shutdown_via_context_manager() -> None:
 
 def test_start_with_config_dict_does_not_raise() -> None:
     """The binding accepts a config dict and the SDK builds against
-    it. The substrate-side metadata's `node_id` is hardcoded to `0`
-    today (substrate `runtime_this_node()` is a placeholder pending
-    a `runtime.this_node()` accessor — `sdk.rs:738`). Once that
-    lands, switch this back to asserting the configured value.
+    it. The substrate now plumbs `runtime.this_node()` through to the
+    daemon metadata, so the configured `this_node` round-trips.
     """
     cfg = {
         "this_node": 0xABCD_1234,
@@ -74,9 +72,7 @@ def test_start_with_config_dict_does_not_raise() -> None:
     with MeshOsDaemonSdk.start(cfg) as sdk:
         with sdk.register_daemon(_EchoDaemon(), Identity.generate()) as handle:
             md = handle.metadata()
-            # Today's substrate placeholder; pin to keep the test
-            # honest as the substrate matures.
-            assert md["node_id"] == 0
+            assert md["node_id"] == 0xABCD_1234
             assert md["daemon_name"] == "echo"
 
 

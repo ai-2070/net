@@ -319,10 +319,11 @@ def test_channel_hash_is_stable() -> None:
     h1 = channel_hash("sensors/temp")
     h2 = channel_hash("sensors/temp")
     assert h1 == h2
-    # Canonical 32-bit ChannelHash range (was u16 before the
-    # substrate-wide widening; the wire NetHeader fast-path hint is
-    # still u16 and equals the low 16 bits of this value).
-    assert 0 <= h1 <= 0xFFFFFFFF
+    # Canonical 64-bit ChannelHash range (widened from u32 to lift the
+    # targeted-collision cost off ~2^32 up to ~2^64; the wire NetHeader
+    # fast-path hint is still u16 and equals the low 16 bits of this
+    # value).
+    assert 0 <= h1 <= 0xFFFFFFFFFFFFFFFF
 
 
 def test_channel_hash_differs_across_names() -> None:
