@@ -1079,13 +1079,32 @@ impl BlobAdapter for MeshBlobAdapter {
     }
 
     async fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
+        // Per-fetch byte ceiling for the Manifest path. Pre-fix
+        // an attacker-controllable manifest pointing at locally-
+        // resident chunks let a handful of concurrent `fetch`
+        // calls exhaust process memory — the per-chunk hash
+        // verify defends against wrong-content but not against
+        // wrong-size aggregate. 256 MiB is a generous bulk-fetch
+        // upper bound; callers needing streaming on larger
+        // payloads should route through `fetch_range` per-chunk
+        // or `fetch_chunk` directly. Surfaces as a typed
+        // BlobError::Backend so callers can fall back to the
+        // streaming path on the same error.
+        const MAX_BULK_FETCH_BYTES: u64 = 256 * 1024 * 1024;
         let result = match blob_ref {
             BlobRef::Small { hash, .. } => self.fetch_chunk(hash).await,
             BlobRef::Manifest {
                 chunks,
-                total_size: _,
+                total_size,
                 ..
             } => {
+                if *total_size > MAX_BULK_FETCH_BYTES {
+                    return Err(BlobError::Backend(format!(
+                        "mesh blob: Manifest total_size {} exceeds bulk-fetch cap {}; \
+                         use fetch_range or per-chunk fetch_chunk for large payloads",
+                        total_size, MAX_BULK_FETCH_BYTES
+                    )));
+                }
                 // Let Vec grow as we extend. The declared
                 // `total_size` is bounded by `BLOB_REF_MAX_SIZE`
                 // (16 GiB) — pre-allocating that on a fetch of a
