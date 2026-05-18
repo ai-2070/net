@@ -1248,13 +1248,43 @@ async fn on_inbound(
                     if new_tail > pre_apply_tail {
                         backoff.lock().record_progress(from);
                     } else {
-                        let leader_tail = tracker
-                            .lock()
-                            .peer_state(from)
-                            .map(|p| p.tail_seq)
-                            .unwrap_or(0);
-                        if leader_tail > new_tail {
-                            let now = tokio::time::Instant::now().into_std();
+                        // Pre-fix the strike fired whenever the
+                        // CACHED heartbeat tail was still above ours
+                        // — the cached value can be hundreds of ms
+                        // stale, so a replica that caught up between
+                        // the heartbeat and the response would
+                        // strike against a leader that has nothing
+                        // to send. After
+                        // `CATCHUP_BACKOFF_THRESHOLD` such false
+                        // strikes the leader sat in a 1–30 s
+                        // backoff while nothing was actually wrong.
+                        //
+                        // Guard the strike on heartbeat freshness:
+                        // only when the leader's most recent
+                        // heartbeat is inside the miss-threshold
+                        // window do we trust its claimed `tail_seq`
+                        // as evidence the leader has more data to
+                        // ship. A stale heartbeat is no signal —
+                        // skip the strike entirely.
+                        let now = tokio::time::Instant::now().into_std();
+                        let strike = {
+                            let t = tracker.lock();
+                            let peer = t.peer_state(from);
+                            let lag = t.peer_lag(from, now);
+                            let fresh_window = std::time::Duration::from_millis(
+                                t.heartbeat_ms()
+                                    .saturating_mul(t.miss_threshold() as u64),
+                            );
+                            match (peer, lag) {
+                                (Some(p), Some(elapsed))
+                                    if elapsed < fresh_window && p.tail_seq > new_tail =>
+                                {
+                                    true
+                                }
+                                _ => false,
+                            }
+                        };
+                        if strike {
                             backoff.lock().record_empty(from, now);
                         }
                     }
@@ -2097,6 +2127,119 @@ mod tests {
         assert!(handle.is_stopped());
         // Final state must be Idle (ChannelClose transition).
         assert_eq!(coordinator.role(), ReplicaRole::Idle);
+    }
+
+    /// Regression: empty-response backoff must NOT strike when the
+    /// leader's heartbeat is stale. Pre-fix the strike fired whenever
+    /// `tracker.peer_state(from).tail_seq > new_tail`, but
+    /// `peer_state.tail_seq` is the cached value from the last
+    /// received heartbeat — minutes-stale in a degenerate case. A
+    /// replica that caught up between an old heartbeat and the
+    /// current response struck against a leader that had nothing
+    /// to send. After `CATCHUP_BACKOFF_THRESHOLD` such false
+    /// strikes the leader sat in a 1–30 s backoff while nothing
+    /// was actually wrong.
+    ///
+    /// Post-fix: skip the strike when the heartbeat is older than
+    /// the miss-threshold window — a stale heartbeat is no signal.
+    #[tokio::test]
+    async fn empty_response_does_not_strike_on_stale_heartbeat() {
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 100);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        coordinator
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let budget = build_budget();
+        let backoff = build_backoff();
+        let outstanding = Arc::new(Mutex::new(OutstandingRequests::new()));
+
+        // Seed the tracker with a STALE heartbeat: leader 0x20
+        // claimed tail=200 well outside the miss-threshold window
+        // (heartbeat_ms = 100, miss_threshold defaults to 3 ⇒ a
+        // last_seen older than 300 ms is stale). Build the
+        // heartbeat with a `last_seen` from 10 seconds ago so it's
+        // definitively stale by the time on_inbound runs.
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        let stale_when = Instant::now() - Duration::from_secs(10);
+        tracker
+            .lock()
+            .record_heartbeat(0x20, ReplicaRole::Leader, 200, stale_when);
+
+        // Pre-record the request so the binding gate admits the
+        // response.
+        outstanding.lock().record(0x20, 0, Instant::now());
+
+        // Empty SyncResponse from the (now-stale-heartbeat) leader.
+        // The local file is empty (next_seq = 0); apply on an empty
+        // response leaves next_seq = 0, so `new_tail == pre_apply_tail`.
+        let event = Inbound::SyncResponse {
+            from: 0x20,
+            msg: SyncResponse {
+                channel_id: cid,
+                first_seq: 0,
+                leader_first_retained_seq: 0,
+                events: Vec::new(),
+                request_id: 0,
+            },
+        };
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &tracker,
+            &budget,
+            &backoff,
+            &outstanding,
+            event,
+        )
+        .await;
+
+        // Pre-fix: backoff would have recorded an empty strike
+        // because `peer_state.tail_seq (200) > new_tail (0)`.
+        // Post-fix: stale heartbeat → no strike, no backoff state.
+        assert!(
+            !backoff.lock().is_in_backoff(0x20, Instant::now()),
+            "stale-heartbeat empty must NOT engage backoff"
+        );
+        // Drive THRESHOLD+1 more stale-heartbeat empties to prove
+        // that the strike NEVER fires on stale heartbeats — even
+        // accumulated over many attempts.
+        for _ in 0..CATCHUP_BACKOFF_THRESHOLD + 1 {
+            // Re-register the request_id (consumed by the binding
+            // gate on each call).
+            outstanding.lock().record(0x20, 0, Instant::now());
+            let event = Inbound::SyncResponse {
+                from: 0x20,
+                msg: SyncResponse {
+                    channel_id: cid,
+                    first_seq: 0,
+                    leader_first_retained_seq: 0,
+                    events: Vec::new(),
+                    request_id: 0,
+                },
+            };
+            on_inbound(
+                &inputs,
+                &coordinator,
+                &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+                &tracker,
+                &budget,
+                &backoff,
+                &outstanding,
+                event,
+            )
+            .await;
+        }
+        assert!(
+            !backoff.lock().is_in_backoff(0x20, Instant::now()),
+            "accumulated stale-heartbeat empties must NEVER engage backoff",
+        );
     }
 
     /// R-28 unit test: the backoff structure records empties up to
