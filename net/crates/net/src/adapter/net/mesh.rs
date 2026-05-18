@@ -10579,6 +10579,7 @@ mod replication_dispatch_tests {
             channel_id: cid,
             since_seq: 50,
             error_code: SyncNackError::NotLeader,
+            leader_first_retained_seq: 0,
             detail: "re-resolve leader".to_string(),
         };
         let payload = nack.to_bytes();

@@ -744,11 +744,11 @@ per-module sequences (D-16 → D-17, X-18 → X-19, O-20 → O-21, R-39 → R-40
 
 ### Low
 
-#### R-40 — `SyncNack::BadRange` retry can thrash without making progress
+#### R-40 — `SyncNack::BadRange` retry can thrash without making progress — **Landed**
 - **File:** `src/adapter/net/redex/replication_runtime.rs:948` (NACK handler); contrast **R-23** (NACK trust) and **R-28** (catchup busy-loop on phantom tail).
 - **What:** On `BadRange`, the runtime calls `inputs.file.skip_to(msg.since_seq.saturating_add(1))`. `since_seq` is the *replica's* asked-for seq, not the leader's first-retained seq. If the leader's retention floor is many seqs above `since_seq`, the next `SyncRequest` is still below the floor and NACKs again. The replica's `skip_to` advances by one per round-trip.
 - **Impact:** A replica that fell below retention pins the leader's reject loop until the heartbeat-cycle `SyncResponse` carries `first_seq > local_next` and the `GapBeforeChunk` path catches up. Burns leader CPU + replication-bandwidth budget for no progress; produces high NACK-rate noise on operator dashboards.
-- **Fix sketch:** Extend `SyncNack` with `leader_first_retained_seq`; the replica's `skip_to` jumps directly to it. One-round-trip recovery; cheap wire change. Fold into the same wire-protocol change as R-22/R-23.
+- **Fix:** Added `leader_first_retained_seq: u64` field to `SyncNack` (wire layout: header + channel_id(32) + since_seq(8) + error_code(1) + leader_first_retained_seq(8) + detail_len(2) + detail). The leader populates the field from `file.lowest_retained_seq()` in `handle_sync_request` (catchup module's `SyncRequestOutcome::Nack`) and the runtime forwards it verbatim. The replica's `BadRange` handler now calls `skip_to(leader_first_retained_seq)` directly when non-zero, falling back to `since_seq + 1` if the leader sent `0` (channel that never retained data). Regression test in `replication_runtime.rs` asserts `skip_to(100)` lands when `leader_first_retained_seq = 100`, not the pre-fix one-per-round-trip `since_seq + 1 = 43`.
 
 #### O-25 — `release_failed_admit` does not refresh cluster backpressure
 - **File:** `src/adapter/net/behavior/meshos/backpressure.rs:210-233`; paired with **O-21** (no idle-tick refresh) and **O-13** (sibling chain-stabilization clear).

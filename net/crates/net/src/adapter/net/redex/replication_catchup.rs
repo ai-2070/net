@@ -59,6 +59,11 @@ pub enum SyncRequestOutcome {
     Nack {
         /// Typed error code per `REDEX_DISTRIBUTED_PLAN.md` §2.
         error_code: SyncNackError,
+        /// Leader's first retained seq at the time of the reject.
+        /// Set for every error code so the runtime can forward it
+        /// verbatim; the replica only consults it on `BadRange`,
+        /// where it drives the one-shot `skip_to` recovery.
+        leader_first_retained_seq: u64,
         /// Operator-facing diagnostic; safe to pass through to a
         /// `SyncNack::detail`. May be empty.
         detail: String,
@@ -165,9 +170,18 @@ pub fn handle_sync_request(
     request: &SyncRequest,
     expected_channel: ChannelId,
 ) -> SyncRequestOutcome {
+    // Capture leader's first retained seq for both the success
+    // path (R-5: disambiguate retention-trim from split-brain
+    // divergence) and the NACK path (R-40: drive the replica's
+    // one-shot `skip_to` recovery so a below-retention replica
+    // doesn't BadRange-thrash by advancing one seq per round trip).
+    // `None` means "the leader has no events yet" → use 0.
+    let leader_first_retained_seq = file.lowest_retained_seq().unwrap_or(0);
+
     if request.channel_id != expected_channel {
         return SyncRequestOutcome::Nack {
             error_code: SyncNackError::ChannelClosed,
+            leader_first_retained_seq,
             detail: format!(
                 "channel mismatch: request {:?} vs expected {:?}",
                 request.channel_id, expected_channel,
@@ -176,11 +190,6 @@ pub fn handle_sync_request(
     }
 
     let local_next = file.next_seq();
-    // R-5: capture leader's first retained seq so the replica can
-    // disambiguate retention-trim from split-brain divergence on
-    // the apply side. `None` means "the leader has no events yet"
-    // → use 0 as the wire value.
-    let leader_first_retained_seq = file.lowest_retained_seq().unwrap_or(0);
     if request.since_seq >= local_next {
         // Replica is caught up. Empty chunk is the signal.
         return SyncRequestOutcome::Response(SyncResponse {
@@ -211,6 +220,7 @@ pub fn handle_sync_request(
         // been retention-evicted. Replica must skip ahead.
         return SyncRequestOutcome::Nack {
             error_code: SyncNackError::BadRange,
+            leader_first_retained_seq,
             detail: format!("since_seq {} below first retained event", request.since_seq,),
         };
     }
@@ -240,6 +250,7 @@ pub fn handle_sync_request(
         if out.is_empty() && cost > CHUNK_MAX_HARD_CEILING_BYTES as u64 {
             return SyncRequestOutcome::Nack {
                 error_code: SyncNackError::BadRange,
+                leader_first_retained_seq,
                 detail: format!(
                     "event at seq {} exceeds hard ceiling ({} bytes > {})",
                     ev.entry.seq, cost, CHUNK_MAX_HARD_CEILING_BYTES,

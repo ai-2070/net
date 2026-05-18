@@ -264,6 +264,13 @@ pub struct SyncNack {
     pub since_seq: u64,
     /// Typed rejection reason. Replicas key their retry policy here.
     pub error_code: SyncNackError,
+    /// Leader's first-retained sequence at the time of the reject.
+    /// Populated by the leader on `BadRange` so the replica can
+    /// `skip_to(leader_first_retained_seq)` in one round trip
+    /// instead of advancing by one per `BadRange` cycle. Set to
+    /// `0` on other error codes; receivers ignore it outside the
+    /// `BadRange` arm.
+    pub leader_first_retained_seq: u64,
     /// Optional human-readable diagnostic. UTF-8 encoded; may be
     /// empty. The replica's retry policy keys off `error_code` only —
     /// `detail` is for operator logs.
@@ -556,11 +563,12 @@ impl SyncHeartbeat {
 pub const SYNC_NACK_DETAIL_MAX: usize = u16::MAX as usize;
 
 impl SyncNack {
-    /// Serialize to bytes. Variable size: header + 32 + 8 + 1 + 2 +
-    /// detail.len(). Truncates `detail` to [`SYNC_NACK_DETAIL_MAX`]
-    /// if longer — the protocol can't represent a longer string and
-    /// silently truncating the diagnostic is preferable to losing
-    /// the structured error code entirely.
+    /// Serialize to bytes. Variable size: header + 32 + 8 + 1 + 8 +
+    /// 2 + detail.len(). Truncates `detail` to
+    /// [`SYNC_NACK_DETAIL_MAX`] if longer — the protocol can't
+    /// represent a longer string and silently truncating the
+    /// diagnostic is preferable to losing the structured error
+    /// code entirely.
     pub fn to_bytes(&self) -> Vec<u8> {
         // Truncate `detail` at a UTF-8 char boundary ≤ the wire cap.
         // A byte-aligned cut can split a multi-byte codepoint,
@@ -577,11 +585,12 @@ impl SyncNack {
         };
         let detail_bytes = detail_str.as_bytes();
         let detail_len = detail_bytes.len();
-        let mut buf = Vec::with_capacity(3 + 32 + 8 + 1 + 2 + detail_len);
+        let mut buf = Vec::with_capacity(3 + 32 + 8 + 1 + 8 + 2 + detail_len);
         put_header(&mut buf, DISPATCH_SYNC_NACK);
         buf.put_slice(self.channel_id.as_bytes());
         buf.put_u64_le(self.since_seq);
         buf.put_u8(self.error_code.to_wire());
+        buf.put_u64_le(self.leader_first_retained_seq);
         buf.put_u16_le(detail_len as u16);
         buf.put_slice(detail_bytes);
         buf
@@ -591,7 +600,7 @@ impl SyncNack {
     /// mismatch, `error_code` outside `1..=4`, or non-UTF-8 detail.
     pub fn from_bytes(data: &[u8]) -> Result<Self, WireError> {
         let payload = check_header(data, DISPATCH_SYNC_NACK)?;
-        let prefix_needed = 32 + 8 + 1 + 2;
+        let prefix_needed = 32 + 8 + 1 + 8 + 2;
         if payload.len() < prefix_needed {
             return Err(WireError::Truncated {
                 need: 3 + prefix_needed,
@@ -604,6 +613,7 @@ impl SyncNack {
         let code_byte = cursor.get_u8();
         let error_code =
             SyncNackError::from_wire(code_byte).ok_or(WireError::BadErrorCode(code_byte))?;
+        let leader_first_retained_seq = cursor.get_u64_le();
         let detail_len = cursor.get_u16_le() as usize;
         if cursor.remaining() < detail_len {
             // Report total bytes needed correctly: consumed-so-far +
@@ -623,6 +633,7 @@ impl SyncNack {
             channel_id,
             since_seq,
             error_code,
+            leader_first_retained_seq,
             detail,
         })
     }
@@ -876,6 +887,7 @@ mod tests {
                 channel_id: sample_channel_id(),
                 since_seq: 12345,
                 error_code,
+                leader_first_retained_seq: 9999,
                 detail: format!("test detail for {:?}", error_code),
             };
             let bytes = original.to_bytes();
@@ -890,6 +902,7 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0,
             error_code: SyncNackError::NotLeader,
+            leader_first_retained_seq: 0,
             detail: String::new(),
         };
         let bytes = original.to_bytes();
@@ -907,6 +920,7 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0,
             error_code: SyncNackError::Backpressure,
+            leader_first_retained_seq: 0,
             detail: huge.clone(),
         };
         let bytes = original.to_bytes();
@@ -921,6 +935,7 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0,
             error_code: SyncNackError::NotLeader,
+            leader_first_retained_seq: 0,
             detail: String::new(),
         }
         .to_bytes();
@@ -940,6 +955,7 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0x4242_4242_4242_4242,
             error_code: SyncNackError::BadRange,
+            leader_first_retained_seq: 100,
             detail: "hello".to_string(),
         };
         let full = original.to_bytes();
@@ -971,6 +987,7 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0,
             error_code: SyncNackError::Backpressure,
+            leader_first_retained_seq: 0,
             detail,
         };
         let bytes = original.to_bytes();
@@ -984,12 +1001,14 @@ mod tests {
             channel_id: sample_channel_id(),
             since_seq: 0,
             error_code: SyncNackError::BadRange,
+            leader_first_retained_seq: 0,
             detail: "ascii".to_string(),
         }
         .to_bytes();
-        // detail starts at offset 3 + 32 + 8 + 1 + 2 = 46; replace
-        // with an invalid UTF-8 byte sequence of the same length.
-        let detail_start = 46;
+        // detail starts at offset 3 + 32 + 8 + 1 + 8 + 2 = 54;
+        // replace with an invalid UTF-8 byte sequence of the same
+        // length.
+        let detail_start = 54;
         let detail_len = bytes.len() - detail_start;
         for i in 0..detail_len {
             bytes[detail_start + i] = 0xC0; // invalid lead byte

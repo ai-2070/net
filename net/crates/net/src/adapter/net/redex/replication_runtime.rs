@@ -979,6 +979,7 @@ async fn on_inbound(
                     channel_id: inputs.channel_id,
                     since_seq: msg.since_seq,
                     error_code: super::replication::SyncNackError::NotLeader,
+                    leader_first_retained_seq: 0,
                     detail: String::new(),
                 };
                 if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
@@ -1002,6 +1003,7 @@ async fn on_inbound(
                             channel_id: inputs.channel_id,
                             since_seq: msg.since_seq,
                             error_code: super::replication::SyncNackError::Backpressure,
+                            leader_first_retained_seq: 0,
                             detail: String::new(),
                         };
                         if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
@@ -1020,6 +1022,7 @@ async fn on_inbound(
                             channel_id: inputs.channel_id,
                             since_seq: msg.since_seq,
                             error_code: super::replication::SyncNackError::NotLeader,
+                            leader_first_retained_seq: 0,
                             detail: String::new(),
                         };
                         if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
@@ -1048,11 +1051,16 @@ async fn on_inbound(
                         tracing::trace!(from = from, error = ?e, "replication: SyncResponse send failed");
                     }
                 }
-                SyncRequestOutcome::Nack { error_code, detail } => {
+                SyncRequestOutcome::Nack {
+                    error_code,
+                    leader_first_retained_seq,
+                    detail,
+                } => {
                     let nack = SyncNack {
                         channel_id: inputs.channel_id,
                         since_seq: msg.since_seq,
                         error_code,
+                        leader_first_retained_seq,
                         detail,
                     };
                     if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
@@ -1290,32 +1298,33 @@ async fn on_inbound(
                     );
                 }
                 SyncNackError::BadRange => {
-                    // R-4: skip-ahead path — the leader's retention
-                    // trimmed past our local tail. The NACK carries
-                    // `since_seq` (what the replica requested) but
-                    // not the leader's actual first retained seq,
-                    // so the cleanest recovery is: clear our local
-                    // tail so the next SyncRequest re-issues from
-                    // 0; the leader's response will then carry
-                    // first_seq > 0 and the replica skips through
-                    // the GapBeforeChunk path. Bump the metric so
-                    // operators can see the retention-skew
-                    // recovery happening.
+                    // R-40: skip directly to the leader's
+                    // first-retained seq carried in the NACK. Pre-
+                    // fix the replica advanced one seq per round
+                    // trip (skip_to(since_seq + 1)) which thrashed
+                    // when the retention floor was many seqs above
+                    // `since_seq` — every retry re-asked below the
+                    // floor and re-NACKed. With the wire field, one
+                    // round trip suffices: `skip_to(leader_first_
+                    // retained_seq)` puts local tail at the floor
+                    // and the next SyncRequest re-asks exactly
+                    // there. Fall back to `since_seq + 1` if the
+                    // leader sent `0` (legacy / never-retained
+                    // channels) so an out-of-band sender can't
+                    // make us no-op on the retry.
                     coordinator.metrics().incr_skip_ahead();
-                    // The cleanest "trim local tail" we can do
-                    // without knowing the leader's first available
-                    // seq is `skip_to(msg.since_seq + 1)` — the
-                    // replica had asked for `since_seq` so anything
-                    // <= since_seq is gone on the leader. Bumping
-                    // local next_seq forward forces the next
-                    // SyncRequest to ask above the bad range.
-                    // On persistent files skip_to is unsupported;
-                    // fall back to the heartbeat-cycle retry.
-                    match inputs.file.skip_to(msg.since_seq.saturating_add(1)) {
+                    let target = if msg.leader_first_retained_seq > 0 {
+                        msg.leader_first_retained_seq
+                    } else {
+                        msg.since_seq.saturating_add(1)
+                    };
+                    match inputs.file.skip_to(target) {
                         Ok(()) => tracing::warn!(
                             from = from,
                             since_seq = msg.since_seq,
-                            "replication: NACK BadRange — local tail skipped past trimmed range"
+                            leader_first_retained_seq = msg.leader_first_retained_seq,
+                            target = target,
+                            "replication: NACK BadRange — local tail skipped to leader's first-retained seq"
                         ),
                         Err(e) => tracing::trace!(
                             from = from,
@@ -2860,6 +2869,7 @@ mod tests {
                 channel_id: cid,
                 since_seq: 0,
                 error_code: super::super::replication::SyncNackError::NotLeader,
+                leader_first_retained_seq: 0,
                 detail: String::new(),
             },
         };
@@ -2914,7 +2924,12 @@ mod tests {
             msg: SyncNack {
                 channel_id: cid,
                 since_seq: 42,
+                // Pre-fix: replica advanced one seq at a time via
+                // `since_seq + 1 = 43`. R-40 wire field instructs
+                // the replica to jump straight to the leader's
+                // first-retained seq (here, 100) in one round trip.
                 error_code: super::super::replication::SyncNackError::BadRange,
+                leader_first_retained_seq: 100,
                 detail: String::new(),
             },
         };
@@ -2935,6 +2950,15 @@ mod tests {
         assert!(
             after > baseline_next,
             "BadRange must advance local next_seq (got {after}, baseline {baseline_next})"
+        );
+        // R-40 regression: with leader_first_retained_seq = 100,
+        // skip_to must jump straight to 100 in one round trip, not
+        // creep up by one per BadRange cycle (since_seq + 1 = 43
+        // would otherwise re-trigger BadRange when retention floor
+        // is much higher).
+        assert_eq!(
+            after, 100,
+            "BadRange with leader_first_retained_seq must jump local tail to the floor"
         );
         // skip_ahead metric advanced.
         assert_eq!(
