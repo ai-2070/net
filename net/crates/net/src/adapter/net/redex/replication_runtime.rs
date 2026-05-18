@@ -741,6 +741,44 @@ async fn on_inbound(
                 msg.tail_seq,
                 tokio::time::Instant::now().into_std(),
             );
+            // Dual-leader convergence. A symmetric-RTT election or
+            // a partition heal can leave two peers both believing
+            // they are Leader for the same channel. Without
+            // convergence, both partitions keep writing — divergent
+            // histories accrete and `apply_sync_response` eventually
+            // logs `GapBeforeChunk{divergence_suspected:true}` while
+            // `skip_to` silently overwrites the loser's tail.
+            //
+            // On any inbound Heartbeat with role=Leader while self
+            // is Leader, run the deterministic tiebreak: the side
+            // with the higher tail_seq keeps Leader; on a tie, the
+            // numerically smaller node_id keeps Leader. The loser
+            // concedes via `Leader → Replica` so the next tick
+            // re-resolves through the heartbeat cycle.
+            if msg.role == ReplicaRole::Leader
+                && coordinator.role() == ReplicaRole::Leader
+                && from != inputs.self_node_id
+            {
+                let local_tail = (inputs.tail_provider)();
+                let peer_tail = msg.tail_seq;
+                let local_wins = local_tail > peer_tail
+                    || (local_tail == peer_tail && inputs.self_node_id < from);
+                if !local_wins {
+                    tracing::warn!(
+                        from = from,
+                        peer_tail = peer_tail,
+                        local_tail = local_tail,
+                        local = inputs.self_node_id,
+                        "replication: peer-leader observed; conceding via Leader → Replica"
+                    );
+                    let _ = coordinator
+                        .transition_to(
+                            ReplicaRole::Replica,
+                            super::replication_state::TransitionSignal::PeerLeaderObserved,
+                        )
+                        .await;
+                }
+            }
         }
         Inbound::SyncRequest { from, msg } => {
             // R-12: defense-in-depth — validate channel_id at the
@@ -1418,6 +1456,122 @@ mod tests {
         let _heartbeats = dispatcher.heartbeats.lock().clone();
         // The coordinator stays in Replica.
         handle.cancel().await;
+    }
+
+    /// R-21 regression: when a Leader observes another peer also
+    /// claiming Leader for the same channel, the deterministic
+    /// tiebreak demotes the loser to Replica so the partition heal
+    /// converges to one leader. Without `Leader → Replica`, both
+    /// partitions stay Leader permanently and accrete divergent
+    /// histories silently overwritten via `skip_to`.
+    #[tokio::test]
+    async fn peer_leader_observation_demotes_loser_to_replica() {
+        // Local node 0x10 has tail_seq 42 (from build_inputs);
+        // peer 0x20 advertises tail_seq 99 — peer wins on tail.
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 60_000);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        for (role, signal) in [
+            (
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            ),
+            (
+                ReplicaRole::Candidate,
+                super::super::replication_state::TransitionSignal::MissedHeartbeats,
+            ),
+            (
+                ReplicaRole::Leader,
+                super::super::replication_state::TransitionSignal::ElectionWon,
+            ),
+        ] {
+            coordinator.transition_to(role, signal).await.unwrap();
+        }
+        assert_eq!(coordinator.role(), ReplicaRole::Leader);
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        let budget = build_budget();
+
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &tracker,
+            &budget,
+            Inbound::Heartbeat {
+                from: 0x20,
+                msg: SyncHeartbeat {
+                    channel_id: cid,
+                    tail_seq: 99,
+                    role: ReplicaRole::Leader,
+                    wall_clock_ms: 0,
+                },
+            },
+        )
+        .await;
+
+        // Local tail 42 < peer tail 99 → local loses, demotes.
+        assert_eq!(
+            coordinator.role(),
+            ReplicaRole::Replica,
+            "Leader with lower tail must concede on PeerLeaderObserved"
+        );
+    }
+
+    /// R-21 regression: tail-tie tiebreak favors the lower node id.
+    /// Without the symmetric tiebreak the matrix could leave one
+    /// side as Leader and the other still claiming Leader after
+    /// the heal — both must agree on the winner.
+    #[tokio::test]
+    async fn peer_leader_tail_tie_lower_node_id_wins() {
+        // Local 0x10 tail = peer 0x20 tail (both 42). Local wins
+        // because 0x10 < 0x20.
+        let inputs = build_inputs(0x10, vec![0x10, 0x20], 60_000);
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        for (role, signal) in [
+            (
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            ),
+            (
+                ReplicaRole::Candidate,
+                super::super::replication_state::TransitionSignal::MissedHeartbeats,
+            ),
+            (
+                ReplicaRole::Leader,
+                super::super::replication_state::TransitionSignal::ElectionWon,
+            ),
+        ] {
+            coordinator.transition_to(role, signal).await.unwrap();
+        }
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        let budget = build_budget();
+
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &tracker,
+            &budget,
+            Inbound::Heartbeat {
+                from: 0x20,
+                msg: SyncHeartbeat {
+                    channel_id: cid,
+                    tail_seq: 42,
+                    role: ReplicaRole::Leader,
+                    wall_clock_ms: 0,
+                },
+            },
+        )
+        .await;
+
+        assert_eq!(
+            coordinator.role(),
+            ReplicaRole::Leader,
+            "tail-tie tiebreak: lower node id keeps Leader"
+        );
     }
 
     #[tokio::test]
