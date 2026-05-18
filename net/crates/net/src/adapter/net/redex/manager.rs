@@ -739,6 +739,26 @@ impl Redex {
         Ok(())
     }
 
+    /// Close the file (as [`Self::close_file`]) AND unlink any
+    /// persistent on-disk segment for the channel. Idempotent: a
+    /// channel that has no persistent dir or is unknown to the
+    /// manager returns Ok. Used by the blob GC sweep so a swept
+    /// chunk doesn't accumulate as an orphaned segment directory
+    /// on `with_persistent(true)` deployments.
+    pub fn close_and_unlink_file(&self, name: &ChannelName) -> Result<(), RedexError> {
+        self.close_file(name)?;
+        #[cfg(feature = "redex-disk")]
+        if let Some(base) = self.persistent_dir.as_ref() {
+            let dir = super::disk::channel_dir(base, name);
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(RedexError::io(e)),
+            }
+        }
+        Ok(())
+    }
+
     /// Snapshot list of currently open files. Cheap clone.
     pub fn open_files(&self) -> Vec<RedexFile> {
         self.files.iter().map(|r| r.value().clone()).collect()
@@ -851,6 +871,48 @@ mod tests {
     fn test_get_file_missing_returns_none() {
         let r = Redex::new();
         assert!(r.get_file(&cn("missing")).is_none());
+    }
+
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn close_and_unlink_file_removes_persistent_segment_dir() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "net-redex-unlink-{}-{}",
+            std::process::id(),
+            n
+        ));
+        let _ = std::fs::create_dir_all(&base);
+        let r = Redex::new().with_persistent_dir(&base);
+        let name = cn("dataforts/blob/abc");
+        let f = r
+            .open_file(&name, RedexFileConfig::default().with_persistent(true))
+            .unwrap();
+        f.append(b"hello").unwrap();
+        let dir = super::super::disk::channel_dir(&base, &name);
+        assert!(dir.exists(), "channel dir must exist after persistent append");
+
+        r.close_and_unlink_file(&name).unwrap();
+        assert!(!dir.exists(), "channel dir must be unlinked after close_and_unlink_file");
+
+        // Idempotent on a second call (file already gone, dir gone).
+        r.close_and_unlink_file(&name).unwrap();
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn close_and_unlink_file_noop_when_unknown_or_heap_only() {
+        let r = Redex::new();
+        // unknown channel — no error
+        r.close_and_unlink_file(&cn("never_opened")).unwrap();
+        // heap-only channel — closes file, no unlink branch
+        let name = cn("heap_only");
+        let _f = r.open_file(&name, RedexFileConfig::default()).unwrap();
+        r.close_and_unlink_file(&name).unwrap();
+        assert!(r.get_file(&name).is_none());
     }
 
     #[test]

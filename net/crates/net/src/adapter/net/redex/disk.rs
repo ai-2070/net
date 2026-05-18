@@ -1511,7 +1511,7 @@ fn now_ns_disk() -> u64 {
         .unwrap_or(0)
 }
 
-fn channel_dir(base_dir: &Path, name: &ChannelName) -> PathBuf {
+pub(super) fn channel_dir(base_dir: &Path, name: &ChannelName) -> PathBuf {
     let mut p = base_dir.to_path_buf();
     for seg in name.as_str().split('/') {
         p.push(seg);
