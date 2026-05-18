@@ -1,0 +1,22 @@
+go/net.h
+  s_aa8bb6e2c88c9e::t_4b02d555c4f5da 605,608
+go/identity.go
+  s_aa8bb6e2c88c9e::t_f2a5bcfb6fdfb4 359
+  s_aa8bb6e2c88c9e::t_70a3629e092277 492,495,498,503
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "5685710b02c5808c33b10744a929dd6669579cdb",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
