@@ -474,6 +474,7 @@ impl VirtualCluster {
                             error_code,
                             leader_first_retained_seq,
                             detail,
+                            request_id: msg.request_id,
                         };
                         self.pending.push_back((
                             id,

@@ -196,6 +196,7 @@ pub fn handle_sync_request(
             channel_id: expected_channel,
             first_seq: request.since_seq,
             leader_first_retained_seq,
+            request_id: request.request_id,
             events: Vec::new(),
         });
     }
@@ -281,6 +282,7 @@ pub fn handle_sync_request(
         channel_id: expected_channel,
         first_seq,
         leader_first_retained_seq,
+        request_id: request.request_id,
         events: out,
     })
 }
@@ -450,6 +452,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 4096,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -469,6 +472,7 @@ mod tests {
             channel_id: cid,
             since_seq: f.next_seq(),
             chunk_max: 4096,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -486,6 +490,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 4096,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -507,6 +512,7 @@ mod tests {
             channel_id: wrong,
             since_seq: 0,
             chunk_max: 4096,
+            request_id: 0,
         };
         let SyncRequestOutcome::Nack { error_code, .. } = handle_sync_request(&f, &req, expected)
         else {
@@ -524,6 +530,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 0,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -548,6 +555,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 60,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -572,6 +580,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 50, // smaller than the first event alone
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -611,6 +620,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 100,
+            request_id: 0,
         };
         // Confirm the normal-size path still works (i.e. our
         // new guard didn't break shipping legitimate events).
@@ -631,6 +641,7 @@ mod tests {
             channel_id: cid,
             since_seq: 100, // well past tail
             chunk_max: 4096,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -665,6 +676,7 @@ mod tests {
                     payload: b"third".to_vec(),
                 },
             ],
+            request_id: 0,
         };
         let new_tail = apply_sync_response(&dst, &response, cid).expect("apply");
         assert_eq!(new_tail, 3);
@@ -681,6 +693,7 @@ mod tests {
             first_seq: 100,
             leader_first_retained_seq: 0,
             events: vec![],
+            request_id: 0,
         };
         let new_tail = apply_sync_response(&dst, &response, cid).expect("apply");
         assert_eq!(new_tail, 2);
@@ -699,6 +712,7 @@ mod tests {
                 event_seq: 0,
                 payload: b"x".to_vec(),
             }],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, local_cid).expect_err("mismatch");
         assert!(matches!(err, ApplyError::ChannelMismatch { .. }));
@@ -716,6 +730,7 @@ mod tests {
                 event_seq: 5, // declared 0 but actually 5
                 payload: b"x".to_vec(),
             }],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("mismatch");
         assert!(matches!(err, ApplyError::FirstSeqMismatch { .. }));
@@ -743,6 +758,7 @@ mod tests {
                     payload: b"c".to_vec(),
                 },
             ],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
         assert!(matches!(err, ApplyError::NonMonotonic { index: 2 }));
@@ -777,6 +793,7 @@ mod tests {
                     payload: b"wraparound".to_vec(),
                 },
             ],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
         assert!(
@@ -803,6 +820,7 @@ mod tests {
                     payload: b"a-dup".to_vec(),
                 },
             ],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
         assert!(matches!(err, ApplyError::NonMonotonic { index: 1 }));
@@ -822,6 +840,7 @@ mod tests {
                 event_seq: 2,
                 payload: b"stale".to_vec(),
             }],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
         assert!(matches!(
@@ -850,6 +869,7 @@ mod tests {
                 event_seq: 5,
                 payload: b"future".to_vec(),
             }],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
         match err {
@@ -890,6 +910,7 @@ mod tests {
                 event_seq: 5,
                 payload: b"future".to_vec(),
             }],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must gap");
         match err {
@@ -918,6 +939,7 @@ mod tests {
             first_seq: 2,
             leader_first_retained_seq: 0,
             events: vec![],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must reject");
         assert!(matches!(
@@ -944,6 +966,7 @@ mod tests {
                 event_seq: 5,
                 payload: b"future".to_vec(),
             }],
+            request_id: 0,
         };
         let err = apply_sync_response(&dst, &response, cid).expect_err("must gap");
         match err {
@@ -978,6 +1001,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 4096,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&leader, &req, cid) else {
             panic!("expected Response");
@@ -1011,6 +1035,7 @@ mod tests {
             channel_id: cid,
             since_seq: 0,
             chunk_max: 60,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(r1) = handle_sync_request(&leader, &req1, cid) else {
             panic!();
@@ -1023,6 +1048,7 @@ mod tests {
             channel_id: cid,
             since_seq: replica.next_seq(),
             chunk_max: 60,
+            request_id: 0,
         };
         let SyncRequestOutcome::Response(r2) = handle_sync_request(&leader, &req2, cid) else {
             panic!();
@@ -1074,6 +1100,7 @@ mod tests {
                     payload: vec![b'B'],
                 },
             ],
+            request_id: 0,
         };
 
         // First apply rejects with GapBeforeChunk.

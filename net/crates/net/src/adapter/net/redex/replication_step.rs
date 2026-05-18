@@ -251,6 +251,13 @@ pub fn tick(inputs: TickInputs<'_>) -> StepOutcome {
                             channel_id: inputs.channel_id,
                             since_seq: inputs.tail_seq,
                             chunk_max: inputs.chunk_max_bytes,
+                            // Placeholder. The runtime mints a
+                            // random request_id and records it in
+                            // the per-leader OutstandingRequests
+                            // set before dispatching; tick is pure
+                            // and cannot draw entropy or mutate the
+                            // pending state.
+                            request_id: 0,
                         },
                     });
                 }

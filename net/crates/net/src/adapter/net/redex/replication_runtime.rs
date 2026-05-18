@@ -408,6 +408,68 @@ pub const CATCHUP_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 /// reachable for re-evaluation at least every cap.
 pub const CATCHUP_BACKOFF_CAP: Duration = Duration::from_secs(30);
 
+/// Per-leader in-flight SyncRequest registry. Each outbound
+/// SyncRequest mints a random `request_id` from `getrandom`; the
+/// id is inserted here keyed by `(leader_node_id, request_id)`
+/// before the wire send. Inbound SyncResponse / SyncNack must
+/// carry an id present in the set; otherwise it's a stale
+/// response from a request the replica already timed out (or a
+/// forged frame from any peer that happens to be the recorded
+/// leader). Entries auto-expire after [`REQUEST_TTL`] so the set
+/// can't grow without bound under leader silence.
+#[derive(Debug, Default)]
+pub struct OutstandingRequests {
+    entries: std::collections::HashMap<(NodeId, u64), Instant>,
+}
+
+/// TTL on entries in [`OutstandingRequests`]. Bounded by the
+/// catchup deadline so a one-tick-late response still lands.
+pub const REQUEST_TTL: Duration = Duration::from_secs(30);
+
+/// Soft cap on per-replica outstanding requests across all
+/// leaders. A degraded leader that never responds shouldn't
+/// let the set grow without bound; once the cap is hit, GC
+/// kicks in and the oldest entries are dropped.
+pub const REQUEST_REGISTRY_SOFT_CAP: usize = 256;
+
+impl OutstandingRequests {
+    /// Construct an empty registry.
+    pub fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record a freshly-minted `request_id` against `leader`.
+    /// Best-effort GC of expired entries runs at insert time so
+    /// the set stays bounded without a separate sweeper task.
+    pub fn record(&mut self, leader: NodeId, request_id: u64, now: Instant) {
+        if self.entries.len() >= REQUEST_REGISTRY_SOFT_CAP {
+            self.entries
+                .retain(|_, &mut inserted| now.saturating_duration_since(inserted) < REQUEST_TTL);
+        }
+        self.entries.insert((leader, request_id), now);
+    }
+
+    /// Take the entry for `(leader, request_id)` if present and
+    /// not yet expired. Returns `true` when an in-flight request
+    /// matched; the caller proceeds with the apply path. `false`
+    /// means the response is stale / forged / past TTL — drop.
+    pub fn take(&mut self, leader: NodeId, request_id: u64, now: Instant) -> bool {
+        match self.entries.remove(&(leader, request_id)) {
+            Some(inserted) => now.saturating_duration_since(inserted) < REQUEST_TTL,
+            None => false,
+        }
+    }
+
+    /// Drop every entry recorded against `leader`. Called when
+    /// the believed leader changes so a re-elected peer doesn't
+    /// inherit the prior leader's in-flight token set.
+    pub fn clear_leader(&mut self, leader: NodeId) {
+        self.entries.retain(|(l, _), _| *l != leader);
+    }
+}
+
 impl CatchupBackoff {
     /// Construct an empty backoff tracker.
     pub fn new() -> Self {
@@ -533,6 +595,7 @@ pub fn spawn_replication_runtime(
 ) -> ReplicationRuntimeHandle {
     let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(inputs.heartbeat_ms)));
     let backoff = Arc::new(Mutex::new(CatchupBackoff::new()));
+    let outstanding = Arc::new(Mutex::new(OutstandingRequests::new()));
     let (tx, rx) = mpsc::channel::<Inbound>(RUNTIME_INBOX_CAPACITY);
     let (priority_tx, priority_rx) =
         mpsc::channel::<Inbound>(RUNTIME_PRIORITY_INBOX_CAPACITY);
@@ -544,6 +607,7 @@ pub fn spawn_replication_runtime(
         tracker,
         budget,
         backoff,
+        outstanding,
         rx,
         priority_rx,
     ));
@@ -563,6 +627,7 @@ async fn run(
     tracker: Arc<Mutex<HeartbeatTracker>>,
     budget: Arc<Mutex<BandwidthBudget>>,
     backoff: Arc<Mutex<CatchupBackoff>>,
+    outstanding: Arc<Mutex<OutstandingRequests>>,
     mut inbox: mpsc::Receiver<Inbound>,
     mut priority_inbox: mpsc::Receiver<Inbound>,
 ) {
@@ -598,12 +663,12 @@ async fn run(
                         return;
                     }
                     Some(event) => {
-                        on_inbound(&inputs, &coordinator, &dispatcher, &tracker, &budget, &backoff, event).await;
+                        on_inbound(&inputs, &coordinator, &dispatcher, &tracker, &budget, &backoff, &outstanding, event).await;
                     }
                 }
             }
             _ = interval.tick() => {
-                on_tick(&inputs, &coordinator, &dispatcher, &tracker, &backoff).await;
+                on_tick(&inputs, &coordinator, &dispatcher, &tracker, &backoff, &outstanding).await;
             }
             event = inbox.recv() => {
                 match event {
@@ -621,7 +686,7 @@ async fn run(
                         return;
                     }
                     Some(event) => {
-                        on_inbound(&inputs, &coordinator, &dispatcher, &tracker, &budget, &backoff, event).await;
+                        on_inbound(&inputs, &coordinator, &dispatcher, &tracker, &budget, &backoff, &outstanding, event).await;
                     }
                 }
             }
@@ -689,6 +754,7 @@ async fn on_tick(
     dispatcher: &Arc<dyn ReplicationDispatcher>,
     tracker: &Arc<Mutex<HeartbeatTracker>>,
     backoff: &Arc<Mutex<CatchupBackoff>>,
+    outstanding: &Arc<Mutex<OutstandingRequests>>,
 ) {
     // Source `now` from tokio's clock so the silence-detection
     // pass inside the tracker tick honors tokio::time::pause() in
@@ -757,7 +823,7 @@ async fn on_tick(
                     tracing::trace!(target=?target, error=?e, "replication: heartbeat send failed");
                 }
             }
-            OutboundMessage::SyncRequest { target, msg } => {
+            OutboundMessage::SyncRequest { target, mut msg } => {
                 // R-28 catchup backoff: a buggy/byzantine leader that
                 // advertises an ever-growing tail but ships empty
                 // responses would otherwise loop this branch at the
@@ -774,6 +840,27 @@ async fn on_tick(
                     );
                     continue;
                 }
+                // R-23 request-token correlation. `tick` emits the
+                // SyncRequest with `request_id = 0` placeholder; the
+                // runtime mints a random 64-bit token from
+                // `getrandom` here, records `(leader, token)` in the
+                // outstanding-requests set, and stamps the wire frame
+                // with the minted value before send. Inbound
+                // SyncResponse / SyncNack must carry a token still
+                // in the set; stale responses (re-issue races, late-
+                // arriving NACKs from prior requests the replica
+                // already timed out) drop on the apply path.
+                let mut id_bytes = [0u8; 8];
+                if getrandom::fill(&mut id_bytes).is_err() {
+                    tracing::trace!(
+                        target = target,
+                        "replication: getrandom failure; skipping SyncRequest this tick"
+                    );
+                    continue;
+                }
+                let token = u64::from_le_bytes(id_bytes);
+                msg.request_id = token;
+                outstanding.lock().record(target, token, now);
                 if let Err(e) = dispatcher.send_sync_request(target, msg).await {
                     tracing::trace!(target=?target, error=?e, "replication: sync_request send failed");
                 }
@@ -861,6 +948,7 @@ async fn on_inbound(
     tracker: &Arc<Mutex<HeartbeatTracker>>,
     budget: &Arc<Mutex<BandwidthBudget>>,
     backoff: &Arc<Mutex<CatchupBackoff>>,
+    outstanding: &Arc<Mutex<OutstandingRequests>>,
     event: Inbound,
 ) {
     // Peer-auth gate. Every inbound replication message must come
@@ -980,6 +1068,7 @@ async fn on_inbound(
                     since_seq: msg.since_seq,
                     error_code: super::replication::SyncNackError::NotLeader,
                     leader_first_retained_seq: 0,
+                    request_id: msg.request_id,
                     detail: String::new(),
                 };
                 if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
@@ -1004,6 +1093,7 @@ async fn on_inbound(
                             since_seq: msg.since_seq,
                             error_code: super::replication::SyncNackError::Backpressure,
                             leader_first_retained_seq: 0,
+                            request_id: msg.request_id,
                             detail: String::new(),
                         };
                         if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
@@ -1023,6 +1113,7 @@ async fn on_inbound(
                             since_seq: msg.since_seq,
                             error_code: super::replication::SyncNackError::NotLeader,
                             leader_first_retained_seq: 0,
+                            request_id: msg.request_id,
                             detail: String::new(),
                         };
                         if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
@@ -1061,6 +1152,7 @@ async fn on_inbound(
                         since_seq: msg.since_seq,
                         error_code,
                         leader_first_retained_seq,
+                        request_id: msg.request_id,
                         detail,
                     };
                     if let Err(e) = dispatcher.send_sync_nack(from, nack).await {
@@ -1106,6 +1198,25 @@ async fn on_inbound(
                     coordinator.role(),
                 );
                 return;
+            }
+            // R-23 request-token correlation. The replica's
+            // outstanding-request set tracks `(leader, request_id)`
+            // tuples for every SyncRequest the runtime has shipped.
+            // A response whose `request_id` is not in the set is
+            // stale (the replica timed out and re-issued) or
+            // forged (leader echoed a non-matching token). Drop
+            // without applying so a stale chunk can't land on the
+            // current request's apply path.
+            {
+                let now = tokio::time::Instant::now().into_std();
+                if !outstanding.lock().take(from, msg.request_id, now) {
+                    tracing::trace!(
+                        from = from,
+                        request_id = msg.request_id,
+                        "replication: dropping SyncResponse with unknown request_id"
+                    );
+                    return;
+                }
             }
             // Snapshot the pre-apply tail so the post-apply
             // result can be classified as "empty" (apply returned
@@ -1274,6 +1385,23 @@ async fn on_inbound(
                     "replication: dropping SyncNack from non-leader peer"
                 );
                 return;
+            }
+            // R-23 request-token correlation. A NACK with a token
+            // not in the outstanding set is stale (from a request
+            // the replica already timed out) — the BadRange arm
+            // below mutates the local file via skip_to, and a
+            // stale BadRange could destroy data on retry. Drop
+            // unmatched NACKs.
+            {
+                let now = tokio::time::Instant::now().into_std();
+                if !outstanding.lock().take(from, msg.request_id, now) {
+                    tracing::trace!(
+                        from = from,
+                        request_id = msg.request_id,
+                        "replication: dropping SyncNack with unknown request_id"
+                    );
+                    return;
+                }
             }
             // Replicas key their retry policy on `error_code`.
             // Phase D §2 retry policy:
@@ -1721,6 +1849,7 @@ mod tests {
             &tracker,
             &budget,
             &build_backoff(),
+            &Arc::new(Mutex::new(OutstandingRequests::new())),
             Inbound::Heartbeat {
                 from: 0x20,
                 msg: SyncHeartbeat {
@@ -1779,6 +1908,7 @@ mod tests {
             &tracker,
             &budget,
             &build_backoff(),
+            &Arc::new(Mutex::new(OutstandingRequests::new())),
             Inbound::Heartbeat {
                 from: 0x20,
                 msg: SyncHeartbeat {
@@ -2586,6 +2716,7 @@ mod tests {
                 channel_id: cid,
                 since_seq: 0,
                 chunk_max: 1024,
+                request_id: 0,
             },
         };
         // Simulate the role flipping between the entry check and
@@ -2610,6 +2741,7 @@ mod tests {
             &Arc::new(Mutex::new(HeartbeatTracker::new(100))),
             &budget,
             &build_backoff(),
+            &Arc::new(Mutex::new(OutstandingRequests::new())),
             event,
         )
         .await;
@@ -2661,6 +2793,7 @@ mod tests {
                 channel_id: wrong,
                 since_seq: 0,
                 chunk_max: 1024,
+                request_id: 0,
             },
         };
         on_inbound(
@@ -2670,6 +2803,7 @@ mod tests {
             &Arc::new(Mutex::new(HeartbeatTracker::new(100))),
             &budget,
             &build_backoff(),
+            &Arc::new(Mutex::new(OutstandingRequests::new())),
             event,
         )
         .await;
@@ -2715,6 +2849,7 @@ mod tests {
                 first_seq: 0,
                 leader_first_retained_seq: 0,
                 events: Vec::new(),
+                request_id: 0,
             },
         };
         on_inbound(
@@ -2724,6 +2859,7 @@ mod tests {
             &tracker,
             &budget,
             &build_backoff(),
+            &Arc::new(Mutex::new(OutstandingRequests::new())),
             event,
         )
         .await;
@@ -2752,6 +2888,7 @@ mod tests {
             &tracker,
             &budget,
             &build_backoff(),
+            &Arc::new(Mutex::new(OutstandingRequests::new())),
             event,
         )
         .await;
@@ -2794,6 +2931,7 @@ mod tests {
                 first_seq: 0,
                 leader_first_retained_seq: 0,
                 events: Vec::new(),
+                request_id: 0,
             },
         };
         on_inbound(
@@ -2803,6 +2941,7 @@ mod tests {
             &tracker,
             &budget,
             &build_backoff(),
+            &Arc::new(Mutex::new(OutstandingRequests::new())),
             event,
         )
         .await;
@@ -2862,7 +3001,11 @@ mod tests {
             .lock()
             .record_heartbeat(0x20, ReplicaRole::Leader, 99, Instant::now());
         assert_eq!(tracker.lock().believed_leader(), Some(0x20));
-        // NACK NotLeader from the believed leader.
+        // NACK NotLeader from the believed leader. Pre-record an
+        // in-flight request_id so the response-binding gate admits
+        // the NACK to the apply path.
+        let outstanding = Arc::new(Mutex::new(OutstandingRequests::new()));
+        outstanding.lock().record(0x20, 0, Instant::now());
         let event = Inbound::SyncNack {
             from: 0x20,
             msg: SyncNack {
@@ -2871,6 +3014,7 @@ mod tests {
                 error_code: super::super::replication::SyncNackError::NotLeader,
                 leader_first_retained_seq: 0,
                 detail: String::new(),
+                request_id: 0,
             },
         };
         on_inbound(
@@ -2880,6 +3024,7 @@ mod tests {
             &tracker,
             &budget,
             &build_backoff(),
+            &outstanding,
             event,
         )
         .await;
@@ -2919,6 +3064,10 @@ mod tests {
         // means "the leader trimmed up to 42; you asked for 42 but
         // it's gone." Local tail must advance to 43.
         let baseline_next = inputs.file.next_seq();
+        // Pre-record the in-flight request_id so the response-binding
+        // gate admits this NACK rather than dropping it as stale.
+        let outstanding = Arc::new(Mutex::new(OutstandingRequests::new()));
+        outstanding.lock().record(0x20, 0, Instant::now());
         let event = Inbound::SyncNack {
             from: 0x20,
             msg: SyncNack {
@@ -2931,6 +3080,7 @@ mod tests {
                 error_code: super::super::replication::SyncNackError::BadRange,
                 leader_first_retained_seq: 100,
                 detail: String::new(),
+                request_id: 0,
             },
         };
         on_inbound(
@@ -2940,6 +3090,7 @@ mod tests {
             &tracker,
             &budget,
             &build_backoff(),
+            &outstanding,
             event,
         )
         .await;

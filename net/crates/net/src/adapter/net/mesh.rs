@@ -10542,6 +10542,7 @@ mod replication_dispatch_tests {
             channel_id: cid,
             since_seq: 100,
             chunk_max: 4096,
+            request_id: 0,
         };
         let payload = req.to_bytes();
         let router = RecorderRouter::default();
@@ -10561,6 +10562,7 @@ mod replication_dispatch_tests {
             first_seq: 0,
             leader_first_retained_seq: 0,
             events: vec![],
+            request_id: 0,
         };
         let payload = resp.to_bytes();
         let router = RecorderRouter::default();
@@ -10581,6 +10583,7 @@ mod replication_dispatch_tests {
             error_code: SyncNackError::NotLeader,
             leader_first_retained_seq: 0,
             detail: "re-resolve leader".to_string(),
+            request_id: 0,
         };
         let payload = nack.to_bytes();
         let router = RecorderRouter::default();
