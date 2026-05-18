@@ -748,12 +748,32 @@ impl MeshBlobAdapter {
         );
         let mut swept: u64 = 0;
         for hash in candidates {
-            // delete_chunk drops the refcount entry on success
-            // and preserves it on error so the next sweep can
-            // retry.
-            if self.delete_chunk(&hash).await.is_ok() {
-                swept = swept.saturating_add(1);
+            // Atomic re-check + remove closes the TOCTOU window
+            // between the deletable_hashes snapshot and the actual
+            // delete — a concurrent `incr` (e.g. a freshly-folded
+            // chain event taking a new reference on `hash`) would
+            // otherwise lose its refcount entry to the unconditional
+            // `remove` that delete_chunk used to issue. If the
+            // re-check fails the chunk stays around for the next
+            // sweep to retry.
+            if !self.refcount.remove_if_deletable(
+                &hash,
+                now_unix_ms,
+                self.retention_floor,
+                disk_pressure_critical,
+            ) {
+                continue;
             }
+            let channel = Self::chunk_channel(&hash);
+            if let Err(e) = self.redex.close_file(&channel) {
+                tracing::warn!(
+                    hash = ?hash,
+                    error = %e,
+                    "mesh blob: sweep close_file failed; refcount entry already gone, chunk file may persist until next store"
+                );
+                continue;
+            }
+            swept = swept.saturating_add(1);
         }
         self.metrics.record_gc_swept(swept);
         Ok(swept)

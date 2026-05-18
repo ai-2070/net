@@ -298,6 +298,33 @@ impl BlobRefcountTable {
     pub fn remove(&self, hash: &[u8; 32]) {
         self.inner.remove(hash);
     }
+
+    /// Atomic "re-check then remove" used by the GC sweep path.
+    /// Closes the TOCTOU window between [`Self::deletable_hashes`]
+    /// (which takes a non-locking snapshot) and the actual delete:
+    /// a concurrent `incr` for the same hash that lands inside the
+    /// sweep window would otherwise have its refcount entry blown
+    /// away by an unconditional `remove`. dashmap's `remove_if`
+    /// runs the predicate under the per-shard write lock, so the
+    /// re-check is atomic with the removal.
+    ///
+    /// Returns `true` if the entry was removed (still sweep-eligible);
+    /// `false` if the entry was already gone or a concurrent `incr`
+    /// rescued it. The sweep driver only proceeds to `close_file`
+    /// when this returns `true`.
+    pub fn remove_if_deletable(
+        &self,
+        hash: &[u8; 32],
+        now_unix_ms: u64,
+        retention_floor: Duration,
+        disk_pressure_critical: bool,
+    ) -> bool {
+        self.inner
+            .remove_if(hash, |_, entry| {
+                should_sweep(entry, now_unix_ms, retention_floor, disk_pressure_critical)
+            })
+            .is_some()
+    }
 }
 
 /// Pure-logic sweep predicate. Returns `true` iff the entry is
@@ -548,6 +575,51 @@ mod tests {
         t.remove(&h(1));
         assert_eq!(t.len(), 0);
         assert!(t.get(&h(1)).is_none());
+    }
+
+    /// Atomic re-check rejects sweep when the entry has been
+    /// rescued by a concurrent `incr` (refcount > 0) between the
+    /// sweep snapshot and the actual delete — the GC-sweep TOCTOU
+    /// the unconditional `remove` used to lose data through.
+    #[test]
+    fn remove_if_deletable_skips_when_incr_rescues_entry() {
+        let t = BlobRefcountTable::new();
+        t.store_observed(h(1), 0, 0);
+        let now = 25 * ONE_HOUR_MS;
+        // Snapshot says deletable, but a fresh incr lands before
+        // the per-hash delete fires.
+        t.incr(h(1), now);
+        let removed = t.remove_if_deletable(&h(1), now, DEFAULT_RETENTION_FLOOR, false);
+        assert!(!removed, "incr-rescued entry must survive the sweep");
+        assert!(t.get(&h(1)).is_some(), "refcount entry must persist");
+    }
+
+    #[test]
+    fn remove_if_deletable_removes_when_still_eligible() {
+        let t = BlobRefcountTable::new();
+        t.store_observed(h(1), 0, 0);
+        let now = 25 * ONE_HOUR_MS;
+        let removed = t.remove_if_deletable(&h(1), now, DEFAULT_RETENTION_FLOOR, false);
+        assert!(removed, "unmodified eligible entry must be removed");
+        assert!(t.get(&h(1)).is_none());
+    }
+
+    #[test]
+    fn remove_if_deletable_skips_under_disk_pressure() {
+        let t = BlobRefcountTable::new();
+        t.store_observed(h(1), 0, 0);
+        let now = 25 * ONE_HOUR_MS;
+        let removed = t.remove_if_deletable(&h(1), now, DEFAULT_RETENTION_FLOOR, true);
+        assert!(!removed, "critical disk pressure aborts the sweep delete");
+        assert!(t.get(&h(1)).is_some());
+    }
+
+    #[test]
+    fn remove_if_deletable_idempotent_when_absent() {
+        let t = BlobRefcountTable::new();
+        let removed =
+            t.remove_if_deletable(&h(1), 25 * ONE_HOUR_MS, DEFAULT_RETENTION_FLOOR, false);
+        assert!(!removed);
     }
 
     #[test]
