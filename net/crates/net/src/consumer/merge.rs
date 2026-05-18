@@ -97,6 +97,14 @@ type CursorPos = Arc<str>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Ordering {
     /// Return events in arbitrary order (fastest).
+    ///
+    /// **Cross-shard order is non-deterministic.** Events from a
+    /// given shard preserve their per-shard arrival order, but the
+    /// interleaving across shards depends on `futures::join_all`'s
+    /// completion order — which varies with runtime scheduling,
+    /// adapter latency, and concurrent load. Callers that need a
+    /// stable order across polls must use [`Ordering::InsertionTs`]
+    /// or sort the response themselves (e.g. by `(shard_id, id)`).
     #[default]
     None,
     /// Sort events by insertion timestamp (cross-shard ordering).
@@ -416,6 +424,16 @@ pub struct ConsumeResponse {
     /// were missing, in contrast to `stalled_shards` which IS
     /// surfaced. Empty on the happy path; populated only when at
     /// least one shard's poll errored.
+    ///
+    /// **Recovery-latency note:** when a previously-failed shard
+    /// returns to health, its backlog drains at the per-shard limit
+    /// of the next poll (`limit / shards.len() * over_fetch_factor`).
+    /// A 4-shard poll where one shard was down for 60 s and the
+    /// others kept ingesting can take several normal-cadence polls
+    /// to fully drain the recovered shard. No backlog-size hint is
+    /// surfaced on the response; callers that need to detect a
+    /// stuck-recovery condition should monitor cursor advance per
+    /// shard across consecutive polls.
     pub failed_shards: Vec<u16>,
 }
 

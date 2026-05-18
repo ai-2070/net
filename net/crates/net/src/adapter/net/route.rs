@@ -47,7 +47,23 @@ impl RouteFlags {
     /// Last packet in stream
     pub const END_OF_STREAM: Self = Self(0x08);
 
-    /// Parse flags from u8 (preserves all set bits in the lower nibble)
+    /// Parse flags from u8.
+    ///
+    /// The `& 0x0F` mask drops the high nibble. Today the defined
+    /// flags fit in the low nibble (`CONTROL`, `REQUIRES_ACK`,
+    /// `PRIORITY`, `END_OF_STREAM`), so 16 distinct wire bytes
+    /// alias to the same `RouteFlags`. **The high nibble is
+    /// reserved**: any future flag added there will be silently
+    /// stripped by old peers running this codepath. When a new flag
+    /// is introduced:
+    ///
+    /// 1. Allocate it in the **low nibble** if any bit is still
+    ///    free, OR
+    /// 2. Widen this mask in the same release that defines the new
+    ///    flag, in lock-step across every peer that decodes routing
+    ///    headers (Rust + cross-language bindings). A skew where
+    ///    one peer reads the bit and another masks it off silently
+    ///    diverges on routing semantics.
     pub fn from_u8(v: u8) -> Self {
         Self(v & 0x0F)
     }
