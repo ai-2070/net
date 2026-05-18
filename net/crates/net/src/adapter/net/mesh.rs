@@ -10517,7 +10517,6 @@ mod replication_dispatch_tests {
             channel_id: cid,
             tail_seq: 42,
             role: ReplicaRole::Leader,
-            wall_clock_ms: 0,
         };
         let payload = hb.to_bytes();
         let router = RecorderRouter::default();
@@ -10629,7 +10628,6 @@ mod replication_dispatch_tests {
             channel_id: cid,
             tail_seq: 0,
             role: ReplicaRole::Leader,
-            wall_clock_ms: 0,
         };
         let mut payload = hb.to_bytes();
         payload[0] = 0x00;
@@ -10649,7 +10647,6 @@ mod replication_dispatch_tests {
             channel_id: cid,
             tail_seq: 0,
             role: ReplicaRole::Leader,
-            wall_clock_ms: 0,
         };
         let payload = hb.to_bytes();
         let router = RecorderRouter::default();

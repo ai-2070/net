@@ -651,13 +651,6 @@ impl Redex {
             self_node_id,
             replica_set,
             heartbeat_ms,
-            wall_clock_provider: Arc::new(|| {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0)
-            }),
             tail_provider,
             rtt_lookup,
             file: file.clone(),

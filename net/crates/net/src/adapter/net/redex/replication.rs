@@ -64,7 +64,7 @@ pub const SYNC_REQUEST_SIZE: usize = 3 + 32 + 8 + 4 + 8; // 55
 
 /// Fixed encoded size of a [`SyncHeartbeat`] message including the
 /// 3-byte subprotocol header.
-pub const SYNC_HEARTBEAT_SIZE: usize = 3 + 32 + 8 + 1 + 8; // 52
+pub const SYNC_HEARTBEAT_SIZE: usize = 3 + 32 + 8 + 1; // 44
 
 /// Domain-separation label for the BLAKE2s hash that turns a channel
 /// name into a 32-byte `ChannelId`. Picked once, frozen — changing it
@@ -258,11 +258,6 @@ pub struct SyncHeartbeat {
     /// receivers don't make routing decisions on this field (those
     /// route through the capability layer's `causal:` tags).
     pub role: ReplicaRole,
-    /// Sender's monotonic-clock milliseconds. Used **only** for drift
-    /// detection (operator-facing); never consumed for ordering or
-    /// liveness logic — those route through `tail_seq` + reliable-
-    /// stream ack accounting.
-    pub wall_clock_ms: u64,
 }
 
 /// Leader → replica: structured rejection. The leader MUST emit this
@@ -541,14 +536,13 @@ impl SyncResponse {
 // ============================================================================
 
 impl SyncHeartbeat {
-    /// Serialize to bytes. Fixed [`SYNC_HEARTBEAT_SIZE`] (52) bytes.
+    /// Serialize to bytes. Fixed [`SYNC_HEARTBEAT_SIZE`] (44) bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(SYNC_HEARTBEAT_SIZE);
         put_header(&mut buf, DISPATCH_SYNC_HEARTBEAT);
         buf.put_slice(self.channel_id.as_bytes());
         buf.put_u64_le(self.tail_seq);
         buf.put_u8(self.role.to_wire());
-        buf.put_u64_le(self.wall_clock_ms);
         debug_assert_eq!(buf.len(), SYNC_HEARTBEAT_SIZE);
         buf
     }
@@ -568,12 +562,10 @@ impl SyncHeartbeat {
         let tail_seq = cursor.get_u64_le();
         let role_byte = cursor.get_u8();
         let role = ReplicaRole::from_wire(role_byte).ok_or(WireError::BadRole(role_byte))?;
-        let wall_clock_ms = cursor.get_u64_le();
         Ok(Self {
             channel_id,
             tail_seq,
             role,
-            wall_clock_ms,
         })
     }
 }
@@ -886,7 +878,6 @@ mod tests {
                 channel_id: sample_channel_id(),
                 tail_seq: 0xCAFE,
                 role,
-                wall_clock_ms: 1_700_000_000_000,
             };
             let bytes = original.to_bytes();
             assert_eq!(bytes.len(), SYNC_HEARTBEAT_SIZE);
@@ -901,7 +892,6 @@ mod tests {
             channel_id: sample_channel_id(),
             tail_seq: 0,
             role: ReplicaRole::Leader,
-            wall_clock_ms: 0,
         }
         .to_bytes();
         // role byte is at offset 3 + 32 + 8 = 43

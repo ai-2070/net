@@ -358,7 +358,7 @@ Counts and one-liners only; full text in the agent reports.
 
 **Replication (R-29, R-30, R-33, R-34):**
 - R-29 — `replica_set` admits duplicates → double heartbeats; should be `BTreeSet` (`replication_step.rs:186-189`)
-- R-30 — `wall_clock_ms` collected from heartbeats but never used; either implement the skew gauge or drop the field (`replication.rs:237-244`)
+- R-30 — `wall_clock_ms` collected from heartbeats but never used; either implement the skew gauge or drop the field (`replication.rs:237-244`) — **Landed.** Dropped from `SyncHeartbeat` wire (size 52 → 44 bytes); `TickInputs::wall_clock_ms` and `RuntimeInputs::wall_clock_provider` removed; all callers / test fixtures updated; the now-meaningless `wall_clock_ms_is_deterministic_function_of_step_counter` DST regression test was removed.
 - R-33 — `consumed + payload_len` (where `payload_len` came from a u32 on the wire) is plain `usize` addition; on 32-bit targets it can overflow. Same shape as the umbrella's L-9 fix for `BufferedEvents`; fold into the same commit. Use `checked_add → WireError::Truncated` (`replication.rs:465, 474`)
 - R-34 — `acc += cost` is plain addition while the surrounding function at `:249` uses `saturating_add`. Practically unreachable given the 64 MiB hard ceiling; the asymmetry itself is the bug — reviewers will copy the unguarded pattern (`replication_catchup.rs:258`)
 
