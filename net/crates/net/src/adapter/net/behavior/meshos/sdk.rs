@@ -729,21 +729,12 @@ impl MeshOsDaemonSdk {
         self.runtime.shutdown().await
     }
 
-    /// Read `MeshOsConfig::this_node` off the runtime. The
-    /// runtime doesn't currently expose the full config, so we
-    /// read the latest snapshot's first peer key if available,
-    /// falling back to `0` — the metadata's `node_id` is
-    /// available either way, but consumers that care should
-    /// pass a `this_node` to the runtime config explicitly.
+    /// Read `MeshOsConfig::this_node` off the runtime. Sourced
+    /// directly from the field the runtime captured at
+    /// construction; the SDK's `MetadataView::node_id` now
+    /// reflects the deployment's identity instead of always 0.
     fn runtime_this_node(&self) -> NodeId {
-        // The runtime config is private; consumers passed a
-        // `this_node` into `MeshOsConfig` at construction. We
-        // don't have direct access here — defer to a future
-        // slice that adds a `runtime.this_node()` accessor.
-        // For now, surface a placeholder so `metadata.node_id`
-        // is present even if zero. Tests pass their own
-        // verification value via the handle.
-        0
+        self.runtime.this_node()
     }
 }
 

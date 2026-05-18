@@ -472,19 +472,20 @@ impl MeshOsLoop {
         let (actions_tx, actions_rx) = mpsc::channel(config.action_queue_capacity);
         let handle = MeshOsHandle { events: events_tx };
         // Stamp a unique runtime epoch id at construction.
-        // Wall-clock nanoseconds + a static counter is the
-        // cheapest source of monotonic-enough uniqueness —
-        // even back-to-back runtimes spawned in the same
-        // nanosecond (e.g. test parallelism) get distinct
-        // ids. SDK consumers read this off
-        // `MeshOsSnapshot::runtime_epoch_id` and reset their
-        // `since(seq)` watermarks on observed change.
-        static RUNTIME_EPOCH_COUNTER: AtomicU64 = AtomicU64::new(1);
-        let runtime_epoch_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
-            ^ RUNTIME_EPOCH_COUNTER.fetch_add(1, Ordering::SeqCst);
+        // 64-bit random per-runtime stamp. Pre-fix this was
+        // `SystemTime::now().as_nanos() ^ static_counter.fetch_add(1)`,
+        // but the static counter resets to 1 each process start —
+        // two processes booting in the same nanosecond (CI parallel,
+        // VM resume) XOR identical `(epoch, counter)` and produced
+        // identical runtime_epoch_ids. The SDK's watermark-reset
+        // gate (snapshot's `runtime_epoch_id` vs last-seen) was then
+        // defeated: post-restart admin_audit_seq / log_seq /
+        // failure_seq start back at 1 and pass the consumer's dedup
+        // gate as "already seen," silently filtering valid post-
+        // restart audit records. rand::random() has a 2⁻⁶⁴
+        // collision probability across all process restarts in the
+        // fleet.
+        let runtime_epoch_id: u64 = rand::random();
         let initial_snapshot = MeshOsSnapshot {
             runtime_epoch_id,
             ..Default::default()

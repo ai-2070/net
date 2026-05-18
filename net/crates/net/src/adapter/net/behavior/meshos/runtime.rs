@@ -74,6 +74,11 @@ pub struct MeshOsRuntime {
     /// pre-built registry via [`Self::start_with_daemon_registry`]
     /// to share state with code already managing daemons.
     daemon_registry: Arc<DaemonRegistry>,
+    /// `MeshOsConfig::this_node` captured at construction so the
+    /// SDK can stamp it on per-daemon metadata views without
+    /// re-routing through the loop's private config. Pre-fix the
+    /// SDK's `MetadataView::node_id` was always `0`.
+    this_node: super::event::NodeId,
 }
 
 /// Plain-value rollup of the runtime's join statistics. Returned
@@ -500,6 +505,7 @@ impl MeshOsRuntime {
             Arc<dyn super::migration_snapshot_source::MigrationSnapshotSource>,
         >,
     ) -> Self {
+        let this_node = config.this_node;
         let super::event_loop::MeshOsLoopParts {
             mesh_loop,
             handle,
@@ -582,6 +588,7 @@ impl MeshOsRuntime {
             scheduler,
             dropped_actions,
             daemon_registry,
+            this_node,
         }
     }
 
@@ -591,6 +598,14 @@ impl MeshOsRuntime {
     /// dispatcher.
     pub fn dropped_actions(&self) -> u64 {
         self.dropped_actions.load(AtomicOrdering::Relaxed)
+    }
+
+    /// `MeshOsConfig::this_node` captured at construction. SDK
+    /// consumers use this to stamp per-daemon metadata views so
+    /// `MetadataView::node_id` reflects the runtime's identity
+    /// instead of the previous hard-coded `0`.
+    pub fn this_node(&self) -> super::event::NodeId {
+        self.this_node
     }
 
     /// Install / replace the active placement scorer. Subsequent
