@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/NRPC_BIDI_STREAMING_PLAN.md
+  s_906a82c67213dc::t_628b6138ff3134 12-32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "02deefa64ca7a9786c23d80181b7b9400e7aae36",
+  "prompts": {},
+  "sessions": {
+    "s_906a82c67213dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a83a8d29-a399-4785-986d-1bd45ba15ab6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

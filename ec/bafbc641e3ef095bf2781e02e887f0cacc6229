@@ -1,0 +1,27 @@
+net/crates/net/sdk/benches/nrpc_client_streaming.rs
+  s_906a82c67213dc::t_b6a07eb77ba7b9 1-72
+net/crates/net/sdk/Cargo.toml
+  s_906a82c67213dc::t_83a22043d2170c 240-255
+net/crates/net/sdk/benches/nrpc_common/mod.rs
+  s_906a82c67213dc::t_2367fa8efc446a 152-189,213
+  s_906a82c67213dc::t_8a7c4d1ad46a29 42-43
+net/crates/net/sdk/benches/nrpc_duplex.rs
+  s_906a82c67213dc::t_83fa175f3a22cb 1-45,47-81
+  s_906a82c67213dc::t_ad6b51518941db 46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "ecbafbc641e3ef095bf2781e02e887f0cacc6229",
+  "prompts": {},
+  "sessions": {
+    "s_906a82c67213dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a83a8d29-a399-4785-986d-1bd45ba15ab6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
