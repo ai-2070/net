@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/compute/migration_source.rs
+  s_2571835e05521c::t_aa6aa713f92e9c 334-335
+  s_2571835e05521c::t_e4c925950397b5 199
+  s_2571835e05521c::t_1592ade34cd311 245-251,254-255,259,263-264
+  s_2571835e05521c::t_84f72e6afb4a45 41-47
+  s_2571835e05521c::t_85e251fbd51ea2 313-316
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "ea1ad3caa4e869a9ae21a1bda13bd2d24b1d4785",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
