@@ -94,6 +94,15 @@ pub struct MeshOsLoop {
     /// after `run()`.
     scheduler: SchedulerRegistry,
 
+    /// X-13 recovery registry — pluggable per-tick recovery
+    /// handlers for groups whose slots were marked unhealthy
+    /// after a placement failure. The tick handler calls
+    /// `try_run_all` after `poll_probes` so the very next
+    /// reconcile pass sees the recovered slots. Empty by default;
+    /// SDK consumers register handlers via
+    /// `MeshOsRuntime::recovery_registry()`.
+    recovery_registry: crate::adapter::net::compute::RecoveryRegistry,
+
     /// Reconcile-pass counter — used by tests / diagnostics to
     /// confirm reconcile fired exactly once per Tick.
     reconcile_count: u64,
@@ -521,6 +530,7 @@ impl MeshOsLoop {
             recent_emissions: Vec::new(),
             probes: ProbeRegistryInner::default(),
             scheduler: SchedulerRegistry::new(),
+            recovery_registry: crate::adapter::net::compute::RecoveryRegistry::new(),
             reconcile_count: 0,
             admin_audit_seq: 0,
             log_seq: 0,
@@ -570,6 +580,26 @@ impl MeshOsLoop {
     pub fn with_scheduler_registry(mut self, registry: SchedulerRegistry) -> Self {
         self.scheduler = registry;
         self
+    }
+
+    /// Attach a recovery registry. SDK consumers register one
+    /// `RecoveryHandler` per group whose slots can be
+    /// re-placed; the tick handler runs them all once per Tick
+    /// (after `poll_probes`, before `run_reconcile`) so the
+    /// reconcile pass sees the recovered slot states.
+    pub fn with_recovery_registry(
+        mut self,
+        registry: crate::adapter::net::compute::RecoveryRegistry,
+    ) -> Self {
+        self.recovery_registry = registry;
+        self
+    }
+
+    /// Borrow the recovery registry — SDK consumers `register`
+    /// new handlers post-build. The `MeshOsRuntime` accessor
+    /// surfaces this so callers don't have to retain a clone.
+    pub fn recovery_registry(&self) -> &crate::adapter::net::compute::RecoveryRegistry {
+        &self.recovery_registry
     }
 
     /// Attach the executor's recent-failures ring. The loop reads
@@ -743,6 +773,23 @@ impl MeshOsLoop {
                     // reconcile so the reconcile pass sees the
                     // latest samples in this tick window.
                     self.poll_probes();
+                    // X-13: run the recovery handlers between
+                    // probe samples and reconcile. Probes refresh
+                    // the per-peer healthy view, then recovery
+                    // re-places any unhealthy slots against the
+                    // current healthy node pool, then reconcile
+                    // sees the post-recovery state. Empty
+                    // registry → no-op; handlers that report
+                    // recovered slots are logged at debug for
+                    // operator visibility.
+                    let recovered = self.recovery_registry.try_run_all();
+                    if !recovered.is_empty() {
+                        tracing::debug!(
+                            target: "meshos",
+                            slots = ?recovered,
+                            "X-13: recovery registry placed unhealthy slots"
+                        );
+                    }
                     self.run_reconcile().await;
                 }
                 event = self.events_rx.recv() => {

@@ -79,6 +79,10 @@ pub struct MeshOsRuntime {
     /// re-routing through the loop's private config. Pre-fix the
     /// SDK's `MetadataView::node_id` was always `0`.
     this_node: super::event::NodeId,
+    /// X-13 recovery registry — clone of the one the loop owns.
+    /// SDK consumers register per-group recovery handlers here;
+    /// the loop's tick handler calls `try_run_all` once per tick.
+    recovery_registry: crate::adapter::net::compute::RecoveryRegistry,
 }
 
 /// Plain-value rollup of the runtime's join statistics. Returned
@@ -576,6 +580,11 @@ impl MeshOsRuntime {
             );
         }
         let dropped_actions = mesh_loop.dropped_actions_counter();
+        // Clone the recovery registry off the loop BEFORE the
+        // tokio::spawn moves the loop. The runtime surface
+        // exposes this clone so SDK consumers can register
+        // handlers after `start` lands.
+        let recovery_registry = mesh_loop.recovery_registry().clone();
         let loop_task = tokio::spawn(mesh_loop.run());
         let exec_task = tokio::spawn(exec.run());
         Self {
@@ -589,6 +598,7 @@ impl MeshOsRuntime {
             dropped_actions,
             daemon_registry,
             this_node,
+            recovery_registry,
         }
     }
 
@@ -681,6 +691,15 @@ impl MeshOsRuntime {
     /// daemons through this handle.
     pub fn daemon_registry(&self) -> &Arc<DaemonRegistry> {
         &self.daemon_registry
+    }
+
+    /// Borrow the X-13 recovery registry. SDK consumers register
+    /// per-group `RecoveryHandler` closures here; the loop runs
+    /// them once per tick from inside the tick handler (after
+    /// `poll_probes`, before `run_reconcile`). Cheap to clone the
+    /// returned reference — the registry is Arc-wrapped.
+    pub fn recovery_registry(&self) -> &crate::adapter::net::compute::RecoveryRegistry {
+        &self.recovery_registry
     }
 
     /// Borrow the publish handle. Source converters
