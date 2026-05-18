@@ -266,6 +266,18 @@ pub struct MeshBlobAdapter {
     /// fine — the tick driver is the single writer; reads are
     /// observer-only.
     overflow_active: Arc<std::sync::atomic::AtomicBool>,
+    /// In-process LRU cache for v0.3 manifest tree nodes
+    /// (`BlobRef::Tree` walk path). Bytes-bounded so the memory
+    /// budget is operator-set in MiB rather than tied to the
+    /// per-deployment node-shape distribution. `None` (the
+    /// default) disables caching entirely; wire via
+    /// [`Self::with_tree_node_cache`].
+    ///
+    /// Cache is content-addressed (keys are immutable BLAKE3
+    /// hashes), so hits are always correct — no invalidation
+    /// path is needed.
+    tree_node_cache:
+        Option<Arc<parking_lot::Mutex<super::blob_tree_cache::TreeNodeCache>>>,
 }
 
 impl MeshBlobAdapter {
@@ -290,6 +302,7 @@ impl MeshBlobAdapter {
             in_flight_stores: Arc::new(DashMap::new()),
             overflow: Arc::new(parking_lot::RwLock::new(OverflowConfig::default())),
             overflow_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tree_node_cache: None,
         }
     }
 
@@ -299,6 +312,38 @@ impl MeshBlobAdapter {
     pub fn with_persistent(mut self, persistent: bool) -> Self {
         self.persistent = persistent;
         self
+    }
+
+    /// Attach a manifest-tree LRU cache for `BlobRef::Tree` walks.
+    /// `cap_bytes` sets the byte budget — every `walk_tree_range`
+    /// fetch consults the cache first and stores the fetched node
+    /// bytes on miss. A second range read on the same blob whose
+    /// path overlaps the prior walk's path skips the
+    /// `fetch_chunk` for the cached nodes.
+    ///
+    /// Default 64 MiB cap ≈ 13 K nodes at the typical ~5 KiB
+    /// postcard-encoded per-node size. Operators with tighter or
+    /// looser memory budgets pass an explicit `cap_bytes`. Pass
+    /// `0` to disable caching entirely (every lookup misses,
+    /// every insert is a no-op — useful for ablation testing).
+    ///
+    /// Cache hits stay correct under the content-addressed model
+    /// (BLAKE3 hashes are immutable by construction); no
+    /// invalidation surface is exposed.
+    pub fn with_tree_node_cache(mut self, cap_bytes: usize) -> Self {
+        self.tree_node_cache = Some(Arc::new(parking_lot::Mutex::new(
+            super::blob_tree_cache::TreeNodeCache::with_capacity_bytes(cap_bytes),
+        )));
+        self
+    }
+
+    /// Snapshot of the tree-node cache's `(hits, misses, bytes,
+    /// len)` for operator metrics. Returns `None` when no cache
+    /// is wired.
+    pub fn tree_node_cache_stats(&self) -> Option<(u64, u64, usize, usize)> {
+        let cache = self.tree_node_cache.as_ref()?;
+        let guard = cache.lock();
+        Some((guard.hits(), guard.misses(), guard.bytes(), guard.len()))
     }
 
     /// Per-chunk replication config applied to every newly-opened
@@ -900,7 +945,7 @@ impl MeshBlobAdapter {
     /// trade-off.
     pub async fn store_stream_tree(
         &self,
-        mut stream: BlobByteStream,
+        stream: BlobByteStream,
         encoding: Encoding,
         chunking: ChunkingStrategy,
     ) -> Result<BlobRef, BlobError> {
@@ -936,7 +981,24 @@ impl MeshBlobAdapter {
                 encoding
             )));
         }
+        self.store_stream_tree_internal(stream, encoding, chunk_size)
+            .await
+    }
 
+    /// Body of [`Self::store_stream_tree`] without the
+    /// production-only chunk-size + encoding gates. Reachable
+    /// from `#[cfg(test)]` so the test harness can drive the
+    /// tree path with a smaller chunk size (test fixtures need
+    /// the depth-2 boundary at FANOUT chunks, which at the
+    /// production 4 MiB chunk size would allocate ~500 MiB of
+    /// payload per test and OOM the Windows test runner under
+    /// parallel execution).
+    pub(crate) async fn store_stream_tree_internal(
+        &self,
+        mut stream: BlobByteStream,
+        encoding: Encoding,
+        chunk_size: u32,
+    ) -> Result<BlobRef, BlobError> {
         use futures::StreamExt;
         let chunk_size_usize = chunk_size as usize;
         let mut buffer: Vec<u8> = Vec::with_capacity(chunk_size_usize);
@@ -1035,21 +1097,42 @@ impl MeshBlobAdapter {
                     range_end, subtree_size
                 )));
             }
-            // Fetch the node's bytes (each tree node is itself a
-            // chunk-shaped Small blob at `dataforts/blob/<hex32>`).
-            let node_bytes = self.fetch_chunk(&node_hash).await?;
-            // BLAKE3 cross-check against the parent's stored
-            // child hash. `fetch_chunk` already verifies; the
-            // re-check here is defense-in-depth + makes the
-            // tree-walk integrity invariant explicit at this
-            // layer.
-            let computed: [u8; 32] = blake3::hash(&node_bytes).into();
-            if computed != node_hash {
-                return Err(BlobError::HashMismatch {
-                    expected: node_hash,
-                    actual: computed,
-                });
-            }
+            // Manifest-cache lookup. On hit, skip the
+            // `fetch_chunk` round trip — cache stores are
+            // content-addressed (immutable BLAKE3-keyed) so a
+            // hit is always correct.
+            let cached = self
+                .tree_node_cache
+                .as_ref()
+                .and_then(|c| c.lock().get(&node_hash));
+            let node_bytes = if let Some(bytes) = cached {
+                bytes
+            } else {
+                // Fetch the node's bytes (each tree node is
+                // itself a chunk-shaped Small blob at
+                // `dataforts/blob/<hex32>`).
+                let bytes = self.fetch_chunk(&node_hash).await?;
+                // BLAKE3 cross-check against the parent's
+                // stored child hash. `fetch_chunk` already
+                // verifies; the re-check here is defense-in-
+                // depth + makes the tree-walk integrity
+                // invariant explicit at this layer.
+                let computed: [u8; 32] = blake3::hash(&bytes).into();
+                if computed != node_hash {
+                    return Err(BlobError::HashMismatch {
+                        expected: node_hash,
+                        actual: computed,
+                    });
+                }
+                // Populate the cache for the next walk that
+                // touches this node. Bytes are cloned only on
+                // the miss path; the hit path returns the
+                // cached clone directly.
+                if let Some(cache) = self.tree_node_cache.as_ref() {
+                    cache.lock().insert(node_hash, bytes.clone());
+                }
+                bytes
+            };
             touched.push(node_hash);
             let node = super::blob_tree::TreeNode::decode(&node_bytes)?;
             // Cross-check: the node's covered_bytes must match
@@ -3406,16 +3489,22 @@ mod tests {
     /// finalize → both lifted into a root internal). The root
     /// internal has 2 children: one full leaf (FANOUT chunks)
     /// and one partial leaf (1 chunk).
+    ///
+    /// Uses the test-internal store path with a 1 KiB chunk
+    /// size so the test allocates ~130 KiB instead of ~516 MiB
+    /// — the production-gate's 4 MiB chunk size would OOM
+    /// parallel test threads on the Windows runner.
     #[tokio::test]
     async fn store_stream_tree_fanout_plus_one_yields_depth_two() {
         let adapter = make_adapter();
-        let len = BLOB_CHUNK_SIZE_BYTES as usize * (TREE_FANOUT + 1);
+        let small_chunk: u32 = 1024;
+        let len = small_chunk as usize * (TREE_FANOUT + 1);
         let payload = deterministic_bytes(0x88, len);
         let blob_ref = adapter
-            .store_stream_tree(
+            .store_stream_tree_internal(
                 stream_one(payload),
                 Encoding::Replicated,
-                ChunkingStrategy::default(),
+                small_chunk,
             )
             .await
             .unwrap();
@@ -3438,7 +3527,7 @@ mod tests {
             let leaf = TreeNode::decode(&leaf_bytes).unwrap();
             assert!(leaf.is_leaf());
             assert_eq!(leaf.arity(), TREE_FANOUT);
-            assert_eq!(full_leaf_size, BLOB_CHUNK_SIZE_BYTES * TREE_FANOUT as u64);
+            assert_eq!(full_leaf_size, small_chunk as u64 * TREE_FANOUT as u64);
         }
     }
 
@@ -3516,27 +3605,29 @@ mod tests {
 
     /// Range query at a depth-2 tree that straddles a child-
     /// subtree boundary (different LEAVES) fetches both leaves
-    /// and stitches correctly.
+    /// and stitches correctly. Uses the test-internal store
+    /// path with a 1 KiB chunk so the test allocates ~130 KiB
+    /// instead of ~516 MiB.
     #[tokio::test]
     async fn fetch_range_tree_cross_leaf_boundary_depth_two() {
         let adapter = make_adapter();
-        let len = BLOB_CHUNK_SIZE_BYTES as usize * (TREE_FANOUT + 1);
+        let small_chunk: u32 = 1024;
+        let len = small_chunk as usize * (TREE_FANOUT + 1);
         let payload = deterministic_bytes(0xA4, len);
         let blob_ref = adapter
-            .store_stream_tree(
+            .store_stream_tree_internal(
                 stream_one(payload.clone()),
                 Encoding::Replicated,
-                ChunkingStrategy::default(),
+                small_chunk,
             )
             .await
             .unwrap();
         assert_eq!(blob_ref.tree_depth(), Some(2));
-        // The first leaf covers FANOUT chunks = FANOUT * 4 MiB.
-        // The second leaf covers the trailing 1 chunk.
-        // Range crosses the leaf boundary.
-        let leaf_boundary = BLOB_CHUNK_SIZE_BYTES * TREE_FANOUT as u64;
-        let start = leaf_boundary - 500;
-        let end = leaf_boundary + 500;
+        // The first leaf covers FANOUT chunks; the second leaf
+        // covers the trailing 1 chunk. Range crosses boundary.
+        let leaf_boundary = small_chunk as u64 * TREE_FANOUT as u64;
+        let start = leaf_boundary - 100;
+        let end = leaf_boundary + 100;
         let fetched = adapter.fetch_range(&blob_ref, start..end).await.unwrap();
         assert_eq!(fetched, &payload[start as usize..end as usize]);
     }
@@ -3615,6 +3706,106 @@ mod tests {
         // path surfaces a typed error. Pin that we DO surface an
         // error rather than returning empty bytes.
         let _ = err; // any error is fine; assert we got one
+    }
+
+    // ────────────────────────────────────────────────────────
+    // Manifest LRU cache (Phase A5)
+    // ────────────────────────────────────────────────────────
+
+    /// With the cache attached, two adjacent range reads on the
+    /// same blob's tree must observe at least one cache hit
+    /// on the second walk — the root + spanning leaf are reused.
+    ///
+    /// Uses the test-internal store path with 1 KiB chunks so
+    /// the FANOUT-spanning test allocates ~140 KiB instead of
+    /// the production 4 MiB chunker's ~540 MiB.
+    #[tokio::test]
+    async fn fetch_range_tree_cache_hits_on_adjacent_reads() {
+        let redex = Arc::new(Redex::new());
+        let adapter = MeshBlobAdapter::new("mesh-tree-cache", redex)
+            .with_tree_node_cache(64 * 1024 * 1024);
+        // Build a depth-2 tree so a walk fetches root + at
+        // least one leaf — both cacheable.
+        let small_chunk: u32 = 1024;
+        let len = small_chunk as usize * (TREE_FANOUT + 5);
+        let payload = deterministic_bytes(0xC1, len);
+        let blob_ref = adapter
+            .store_stream_tree_internal(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                small_chunk,
+            )
+            .await
+            .unwrap();
+        assert_eq!(blob_ref.tree_depth(), Some(2));
+        // First fetch — populates the cache.
+        let _ = adapter
+            .fetch_range(&blob_ref, 0..small_chunk as u64)
+            .await
+            .unwrap();
+        let (hits_1, _, _, _) = adapter.tree_node_cache_stats().unwrap();
+        // Second fetch in the same byte range — should hit the
+        // cache for the root + the first leaf.
+        let _ = adapter
+            .fetch_range(&blob_ref, 100..(small_chunk as u64 - 100))
+            .await
+            .unwrap();
+        let (hits_2, _, _, _) = adapter.tree_node_cache_stats().unwrap();
+        assert!(
+            hits_2 > hits_1,
+            "second adjacent fetch must observe at least one cache hit; \
+             hits_1={hits_1} hits_2={hits_2}"
+        );
+        let (_, _, _, entries) = adapter.tree_node_cache_stats().unwrap();
+        assert!(entries >= 1, "cache should have populated entries");
+    }
+
+    /// Cache hit returns byte-identical content to the chunk-
+    /// store fetch. Content-addressed → no consistency loss.
+    #[tokio::test]
+    async fn fetch_range_tree_cache_hit_byte_identical() {
+        let redex = Arc::new(Redex::new());
+        let adapter = MeshBlobAdapter::new("mesh-tree-cache-bytes", redex)
+            .with_tree_node_cache(64 * 1024 * 1024);
+        let len = BLOB_CHUNK_SIZE_BYTES as usize * 2;
+        let payload = deterministic_bytes(0xC2, len);
+        let blob_ref = adapter
+            .store_stream_tree(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        // Two identical fetches; second one hits the cache for
+        // the root. Both must return identical bytes.
+        let a = adapter.fetch_range(&blob_ref, 0..len as u64).await.unwrap();
+        let b = adapter.fetch_range(&blob_ref, 0..len as u64).await.unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, payload);
+    }
+
+    /// Cache disabled (`with_tree_node_cache(0)`) → no entries
+    /// land, every walk takes the fetch_chunk path.
+    #[tokio::test]
+    async fn fetch_range_tree_cache_can_be_disabled() {
+        let redex = Arc::new(Redex::new());
+        let adapter = MeshBlobAdapter::new("mesh-tree-cache-disabled", redex)
+            .with_tree_node_cache(0);
+        let len = BLOB_CHUNK_SIZE_BYTES as usize;
+        let payload = deterministic_bytes(0xC3, len);
+        let blob_ref = adapter
+            .store_stream_tree(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        let _ = adapter.fetch_range(&blob_ref, 0..len as u64).await.unwrap();
+        let (_, _, bytes_total, len_count) = adapter.tree_node_cache_stats().unwrap();
+        assert_eq!(bytes_total, 0);
+        assert_eq!(len_count, 0);
     }
 
     /// `store_stream_tree`'s root_depth always lies in
