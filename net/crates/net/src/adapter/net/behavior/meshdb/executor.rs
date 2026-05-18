@@ -859,6 +859,22 @@ pub(super) fn execute_window(
             detail: "Window size must be >= 1".to_string(),
         });
     }
+    // Reject window sizes above u64::MAX / 2: the bucket bounds
+    // below compute `start = bucket * size` and `end = start + size`
+    // with saturating arithmetic. Two adjacent buckets near
+    // u64::MAX both saturate to `end = u64::MAX`, producing
+    // indistinguishable WindowBoundary envelopes — downstream
+    // OrderBy / cache-key disambiguation treats boundary tuples
+    // as unique, and the collision would silently corrupt those
+    // surfaces.
+    if size > u64::MAX / 2 {
+        return Err(MeshError::PlannerError {
+            detail: format!(
+                "Window size {} exceeds u64::MAX / 2; adjacent buckets would saturate to identical bounds",
+                size
+            ),
+        });
+    }
 
     let mut buckets: BTreeMap<u64, Vec<ResultRow>> = BTreeMap::new();
     for row in rows {
