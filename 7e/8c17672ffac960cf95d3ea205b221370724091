@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/identity/token.rs
+  s_f641e31a81af58::t_345d4d39841e37 652-659
+  s_f641e31a81af58::t_80ab17aebe2911 719
+  s_f641e31a81af58::t_7da6def299684c 904
+  s_f641e31a81af58::t_87c930c0c72d3b 747
+  s_f641e31a81af58::t_a98c24ed554a41 890-897
+  s_f641e31a81af58::t_3dbdb1b777de57 733
+  s_f641e31a81af58::t_89e8b982ab7358 10
+  s_f641e31a81af58::t_60462633f6821e 1691-1753
+  s_f641e31a81af58::t_839f34991a4725 804-805,807-814
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "7e8c17672ffac960cf95d3ea205b221370724091",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
