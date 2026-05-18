@@ -35,8 +35,8 @@ If you want to query across multiple CortEX adapters as one handle, see **NetDB*
 ## Rust
 
 ```rust
-use ai2070_net::adapter::net::{Redex, RedexFileConfig};
-use ai2070_net::adapter::net::cortex::tasks::{Tasks, TasksState, TaskStatus};
+use net::adapter::net::{Redex, RedexFileConfig};
+use net::adapter::net::cortex::tasks::{Tasks, TasksState, TaskStatus};
 use std::sync::Arc;
 
 let redex = Arc::new(Redex::with_persistent_dir("/var/lib/net/redex"));
@@ -217,7 +217,7 @@ net_tasks_close(tasks);
 When you want to query across Tasks + Memories (or your own adapters) under one handle, use NetDB. It bundles enabled adapters behind per-model accessors and exposes a Prisma-ish surface on each.
 
 ```rust
-use ai2070_net::adapter::net::{NetDb, Redex, TasksFilter, TaskStatus};
+use net::adapter::net::{NetDb, Redex, TasksFilter, TaskStatus};
 
 let db = NetDb::builder(Redex::new())
     .origin(origin_hash)
