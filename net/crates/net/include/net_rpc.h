@@ -94,11 +94,15 @@ extern "C" {
  *            streaming caller-side surface
  *            (net_rpc_call_client_stream, _client_stream_send,
  *            _client_stream_finish, _client_stream_free,
- *            _client_stream_call_id). Duplex caller surface and
- *            both server-side handlers ship in follow-up commits.
- *            ADDITIVE: every 0x0001 function keeps identical
- *            signature + semantics, so a 0x0001 consumer compiled
- *            against a 0x0002 library still works. */
+ *            _client_stream_call_id) plus the duplex caller-side
+ *            surface (net_rpc_call_duplex, _duplex_send,
+ *            _duplex_finish_sending, _duplex_next, _duplex_into_split,
+ *            _duplex_sink_send / _sink_finish / _sink_free,
+ *            _duplex_stream_next / _stream_free,
+ *            _duplex_*_call_id, _duplex_free). Server-side
+ *            handlers ship in B8-5. ADDITIVE: every 0x0001 function
+ *            keeps identical signature + semantics, so a 0x0001
+ *            consumer compiled against a 0x0002 library still works. */
 #define NET_RPC_ABI_VERSION 0x0002
 
 uint32_t net_rpc_abi_version(void);
@@ -124,6 +128,13 @@ typedef struct ServeHandleC               ServeHandleC;
 typedef struct RpcStreamHandleC           RpcStreamHandleC;
 /* ABI 0x0002 — client-streaming caller-side handle. */
 typedef struct ClientStreamCallHandleC    ClientStreamCallHandleC;
+/* ABI 0x0002 — duplex caller-side handles. The "combined" form
+ * `DuplexCallHandleC` exposes both send + receive; `into_split`
+ * peels it into independent `DuplexSinkHandleC` + `DuplexStreamHandleC`
+ * for the encoder-task + decoder-task pattern. */
+typedef struct DuplexCallHandleC          DuplexCallHandleC;
+typedef struct DuplexSinkHandleC          DuplexSinkHandleC;
+typedef struct DuplexStreamHandleC        DuplexStreamHandleC;
 
 /* =========================================================================
  * Free helpers
@@ -589,6 +600,100 @@ uint64_t net_rpc_client_stream_call_id(const ClientStreamCallHandleC* handle);
  * via the SDK's Drop impl if finish hasn't completed. Idempotent
  * on NULL. */
 void net_rpc_client_stream_free(ClientStreamCallHandleC* handle);
+
+/* =========================================================================
+ * ABI 0x0002 — duplex caller-side surface (Phase B8-2).
+ *
+ * Three opaque handles:
+ *   - DuplexCallHandleC: combined send + receive.
+ *   - DuplexSinkHandleC: send-half after into_split.
+ *   - DuplexStreamHandleC: receive-half after into_split.
+ *
+ * Shared CANCEL semantics: the underlying SDK types share an
+ * Arc<DuplexInner>. CANCEL fires only when BOTH halves drop
+ * without observing the response stream's terminal frame.
+ * After into_split, the original DuplexCallHandleC's inner is
+ * empty and subsequent send/finish_sending/next return
+ * NET_RPC_ERR_STREAM_DONE.
+ * ========================================================================= */
+
+/* Direct-addressed duplex call. Initial REQUEST carries BOTH
+ * FLAG_RPC_CLIENT_STREAMING_REQUEST AND FLAG_RPC_STREAMING_RESPONSE
+ * (one wire frame, both shapes active). Lazy publish — no REQUEST
+ * flies until the first send.
+ *
+ * request_window of 0 disables upload-direction flow control;
+ * non-zero installs an initial credit window. Same for
+ * stream_window (response direction). */
+int net_rpc_call_duplex(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr,
+    size_t service_len,
+    uint64_t deadline_ms,
+    uint32_t request_window,
+    uint32_t stream_window,
+    DuplexCallHandleC** out_handle,
+    char** out_err);
+
+/* Push one body chunk via the combined duplex handle. Awaits
+ * one upload credit when flow control is opted in. */
+int net_rpc_duplex_send(
+    DuplexCallHandleC* handle,
+    const uint8_t* body_ptr,
+    size_t body_len,
+    char** out_err);
+
+/* Close the upload direction (emits REQUEST_END) but keep the
+ * response stream open for subsequent _duplex_next calls. */
+int net_rpc_duplex_finish_sending(DuplexCallHandleC* handle, char** out_err);
+
+/* Pull the next response chunk. Returns NET_RPC_OK with a chunk,
+ * NET_RPC_ERR_STREAM_DONE on clean end, or NET_RPC_ERR_CALL_FAILED
+ * on mid-stream error. */
+int net_rpc_duplex_next(
+    DuplexCallHandleC* handle,
+    uint8_t** out_chunk_ptr,
+    size_t* out_chunk_len,
+    char** out_err);
+
+/* Split the combined handle into independent sink + stream
+ * halves. Consumes the inner DuplexCallRaw — subsequent
+ * send/finish_sending/next on the original handle return
+ * NET_RPC_ERR_STREAM_DONE. Each half holds its own
+ * Arc<DuplexInner>; CANCEL fires only when both drop. */
+int net_rpc_duplex_into_split(
+    DuplexCallHandleC* handle,
+    DuplexSinkHandleC** out_sink,
+    DuplexStreamHandleC** out_stream,
+    char** out_err);
+
+/* Diagnostic accessor. Returns 0 on NULL. */
+uint64_t net_rpc_duplex_call_id(const DuplexCallHandleC* handle);
+
+/* Free the combined duplex handle. Fires CANCEL if the call
+ * hasn't cleanly closed AND both halves of into_split haven't
+ * been drained. Idempotent on NULL. */
+void net_rpc_duplex_free(DuplexCallHandleC* handle);
+
+/* Sink half (post-into_split). */
+int net_rpc_duplex_sink_send(
+    DuplexSinkHandleC* handle,
+    const uint8_t* body_ptr,
+    size_t body_len,
+    char** out_err);
+int net_rpc_duplex_sink_finish(DuplexSinkHandleC* handle, char** out_err);
+uint64_t net_rpc_duplex_sink_call_id(const DuplexSinkHandleC* handle);
+void net_rpc_duplex_sink_free(DuplexSinkHandleC* handle);
+
+/* Stream half (post-into_split). */
+int net_rpc_duplex_stream_next(
+    DuplexStreamHandleC* handle,
+    uint8_t** out_chunk_ptr,
+    size_t* out_chunk_len,
+    char** out_err);
+uint64_t net_rpc_duplex_stream_call_id(const DuplexStreamHandleC* handle);
+void net_rpc_duplex_stream_free(DuplexStreamHandleC* handle);
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -55,7 +55,9 @@ use net::adapter::net::cortex::{
 };
 use net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
-    RpcError as InnerRpcError, RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
+    DuplexCallRaw as InnerDuplexCallRaw, DuplexSink as InnerDuplexSink,
+    DuplexStream as InnerDuplexStream, RpcError as InnerRpcError, RpcStream as InnerRpcStream,
+    ServeHandle as InnerServeHandle,
 };
 use net::adapter::net::MeshNode;
 
@@ -106,11 +108,16 @@ pub const NET_RPC_ERR_STREAM_DONE: c_int = -6;
 ///     client-streaming caller-side surface
 ///     (`net_rpc_call_client_stream`, `net_rpc_client_stream_send`,
 ///     `net_rpc_client_stream_finish`, `net_rpc_client_stream_free`)
-///     plus the duplex caller-side surface in the follow-up
-///     commit. Server-side handlers for both shapes land
-///     separately. ADDITIVE — every 0x0001 function keeps
-///     identical signature + semantics, so a 0x0001 consumer
-///     compiled against a 0x0002 library still works.
+///     plus the duplex caller-side surface
+///     (`net_rpc_call_duplex`, `net_rpc_duplex_send`,
+///     `net_rpc_duplex_finish_sending`, `net_rpc_duplex_next`,
+///     `net_rpc_duplex_into_split`, `net_rpc_duplex_sink_send`,
+///     `net_rpc_duplex_sink_finish`, `net_rpc_duplex_stream_next`,
+///     `net_rpc_duplex_*_free`). Server-side handlers for both
+///     shapes land separately (B8-5). ADDITIVE — every 0x0001
+///     function keeps identical signature + semantics, so a
+///     0x0001 consumer compiled against a 0x0002 library still
+///     works.
 pub const NET_RPC_ABI_VERSION: u32 = 0x0002;
 
 /// Returns the current ABI version. Consumers SHOULD call this at
@@ -1567,6 +1574,531 @@ pub extern "C" fn net_rpc_client_stream_free(handle: *mut ClientStreamCallHandle
 }
 
 // =========================================================================
+// ABI 0x0002 — Duplex caller-side surface (Phase B8-2).
+//
+// Three opaque handle types:
+//
+//   - DuplexCallHandleC: combined send + receive, mirrors
+//     `DuplexCallRaw`. The send half can be "consumed by
+//     finish_sending" without consuming the receive half — the
+//     SDK's `finish_sending` takes `&mut self`, leaving the
+//     response stream alive. After `into_split`, the inner is
+//     `None` and subsequent send/finish_sending/next return
+//     STREAM_DONE.
+//
+//   - DuplexSinkHandleC: send-half after `into_split`. Mirrors
+//     `DuplexSink`. `sink_finish` consumes the inner DuplexSink.
+//
+//   - DuplexStreamHandleC: receive-half after `into_split`.
+//     Mirrors `DuplexStream`. Drains via `_stream_next`.
+//
+// Shared CANCEL semantics: the underlying SDK types share an
+// `Arc<DuplexInner>`. CANCEL fires only when BOTH halves drop
+// without observing the response stream's terminal frame —
+// `into_split` distributes the Arc into the two sub-handles,
+// and the original DuplexCallHandleC's Option becomes None.
+// =========================================================================
+
+/// Opaque caller-side handle for a duplex call (combined send +
+/// receive). Mirrors `RpcStreamHandleC` shape: an inner
+/// `Option<DuplexCallRaw>` behind a Mutex, with a captured
+/// call_id and a `done` AtomicBool latch.
+///
+/// State transitions:
+///   - JustOpened → Sending (first `send`)
+///   - Sending → Finishing (after `finish_sending`)
+///   - Finishing → Done (after response stream's terminal frame
+///     observed via `next` returning `None` / Error item)
+///   - Any → split (after `into_split`)
+///
+/// After `into_split` or `free`, the inner Option is None and
+/// subsequent `send` / `finish_sending` / `next` calls return
+/// `NET_RPC_ERR_STREAM_DONE`.
+pub struct DuplexCallHandleC {
+    inner: Arc<Mutex<Option<InnerDuplexCallRaw>>>,
+    call_id: u64,
+    done: AtomicBool,
+}
+
+/// Opaque caller-side handle for the send-half of a split duplex
+/// call. Constructed by [`net_rpc_duplex_into_split`].
+/// `sink_finish` consumes the inner sink.
+pub struct DuplexSinkHandleC {
+    inner: Arc<Mutex<Option<InnerDuplexSink>>>,
+    call_id: u64,
+    done: AtomicBool,
+}
+
+/// Opaque caller-side handle for the receive-half of a split
+/// duplex call. Constructed by [`net_rpc_duplex_into_split`].
+/// Drains chunks via `_stream_next` until terminal End / Error.
+pub struct DuplexStreamHandleC {
+    inner: Arc<Mutex<Option<InnerDuplexStream>>>,
+    call_id: u64,
+    done: AtomicBool,
+}
+
+/// Direct-addressed duplex call. Constructs the underlying
+/// `DuplexCallRaw` via block_on (reply subscription setup; no
+/// REQUEST flies yet — lazy publish as with client-streaming).
+///
+/// Initial REQUEST carries BOTH `FLAG_RPC_CLIENT_STREAMING_REQUEST`
+/// AND `FLAG_RPC_STREAMING_RESPONSE`. Both request_window and
+/// stream_window are independently opt-in: 0 disables flow
+/// control for that direction.
+///
+/// Returns: same shape as [`net_rpc_call_client_stream`].
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_duplex(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    deadline_ms: u64,
+    request_window: u32,
+    stream_window: u32,
+    out_handle: *mut *mut DuplexCallHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if request_window > 0 {
+        opts.request_window_initial = Some(request_window);
+    }
+    if stream_window > 0 {
+        opts.stream_window_initial = Some(stream_window);
+    }
+    let node = h.node.clone();
+    let result = runtime().block_on(async move {
+        node.call_duplex(target_node_id, &service, opts).await
+    });
+    match result {
+        Ok(call) => {
+            let call_id = call.call_id();
+            let boxed = Box::new(DuplexCallHandleC {
+                inner: Arc::new(Mutex::new(Some(call))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_handle = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Push one body chunk to the server. Same semantics as
+/// [`net_rpc_client_stream_send`] but for the duplex shape: the
+/// response stream stays alive after `finish_sending`, so a
+/// successful `send` doesn't preclude future `next` calls.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_send(
+    handle: *mut DuplexCallHandleC,
+    body_ptr: *const u8,
+    body_len: usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let inner_opt = h.inner.lock().take();
+    let mut call = match inner_opt {
+        Some(c) => c,
+        None => {
+            h.done.store(true, Ordering::Relaxed);
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    let body = if body_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
+    };
+    let result = runtime().block_on(async { call.send(body).await });
+    match result {
+        Ok(()) => {
+            *h.inner.lock() = Some(call);
+            NET_RPC_OK
+        }
+        Err(e) => {
+            drop(call);
+            h.done.store(true, Ordering::Relaxed);
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Close the upload direction. Emits REQUEST_END but does NOT
+/// consume the call — the response stream stays open and the
+/// caller drains it via `_duplex_next`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_finish_sending(
+    handle: *mut DuplexCallHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let inner_opt = h.inner.lock().take();
+    let mut call = match inner_opt {
+        Some(c) => c,
+        None => {
+            h.done.store(true, Ordering::Relaxed);
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    let result = runtime().block_on(async { call.finish_sending().await });
+    match result {
+        Ok(()) => {
+            // Restore the call so subsequent `next` can drain
+            // the response stream.
+            *h.inner.lock() = Some(call);
+            NET_RPC_OK
+        }
+        Err(e) => {
+            drop(call);
+            h.done.store(true, Ordering::Relaxed);
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Pull the next response chunk from the duplex call.
+///
+/// Returns: same shape as [`net_rpc_stream_next`]. `NET_RPC_OK`
+/// with a chunk, `NET_RPC_ERR_STREAM_DONE` on clean end,
+/// `NET_RPC_ERR_CALL_FAILED` on mid-stream error.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_next(
+    handle: *mut DuplexCallHandleC,
+    out_chunk_ptr: *mut *mut u8,
+    out_chunk_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        unsafe {
+            *out_chunk_ptr = std::ptr::null_mut();
+            *out_chunk_len = 0;
+        }
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let inner_opt = h.inner.lock().take();
+    let mut call = match inner_opt {
+        Some(c) => c,
+        None => {
+            h.done.store(true, Ordering::Relaxed);
+            unsafe {
+                *out_chunk_ptr = std::ptr::null_mut();
+                *out_chunk_len = 0;
+            }
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    let result = runtime().block_on(async { call.next().await });
+    match result {
+        Some(Ok(chunk)) => {
+            *h.inner.lock() = Some(call);
+            write_response(chunk.to_vec(), out_chunk_ptr, out_chunk_len);
+            NET_RPC_OK
+        }
+        Some(Err(e)) => {
+            drop(call);
+            h.done.store(true, Ordering::Relaxed);
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        None => {
+            drop(call);
+            h.done.store(true, Ordering::Relaxed);
+            unsafe {
+                *out_chunk_ptr = std::ptr::null_mut();
+                *out_chunk_len = 0;
+            }
+            NET_RPC_ERR_STREAM_DONE
+        }
+    }
+}
+
+/// Split the duplex call into independent sink + stream halves.
+/// Consumes the inner `DuplexCallRaw` — subsequent send /
+/// finish_sending / next on the original handle return
+/// `NET_RPC_ERR_STREAM_DONE`.
+///
+/// Each returned half holds its own `Arc<DuplexInner>` (via the
+/// SDK types) so CANCEL fires only when BOTH halves drop
+/// without observing the response stream's terminal frame.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_into_split(
+    handle: *mut DuplexCallHandleC,
+    out_sink: *mut *mut DuplexSinkHandleC,
+    out_stream: *mut *mut DuplexStreamHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let inner_opt = h.inner.lock().take();
+    let call = match inner_opt {
+        Some(c) => c,
+        None => {
+            h.done.store(true, Ordering::Relaxed);
+            write_err(
+                out_err,
+                "duplex_into_split called on already-split or freed handle".into(),
+            );
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    let call_id = h.call_id;
+    let (sink, stream) = call.into_split();
+    let sink_boxed = Box::new(DuplexSinkHandleC {
+        inner: Arc::new(Mutex::new(Some(sink))),
+        call_id,
+        done: AtomicBool::new(false),
+    });
+    let stream_boxed = Box::new(DuplexStreamHandleC {
+        inner: Arc::new(Mutex::new(Some(stream))),
+        call_id,
+        done: AtomicBool::new(false),
+    });
+    unsafe {
+        *out_sink = Box::into_raw(sink_boxed);
+        *out_stream = Box::into_raw(stream_boxed);
+    }
+    // Latch the original handle so a stray send/next on it
+    // returns STREAM_DONE cleanly.
+    h.done.store(true, Ordering::Relaxed);
+    NET_RPC_OK
+}
+
+/// Diagnostic accessor — server-assigned call_id. Returns 0 on
+/// NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_call_id(handle: *const DuplexCallHandleC) -> u64 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    h.call_id
+}
+
+/// Free the duplex handle. Fires CANCEL via the SDK's shared
+/// `Arc<DuplexInner>` if the call hasn't cleanly closed and both
+/// halves of an `into_split` haven't been independently drained.
+/// Idempotent on NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_free(handle: *mut DuplexCallHandleC) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle));
+    }
+}
+
+// ---- Sink half (post-into_split) ----
+
+/// Push one body chunk via the sink half. Same semantics as
+/// [`net_rpc_duplex_send`].
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_sink_send(
+    handle: *mut DuplexSinkHandleC,
+    body_ptr: *const u8,
+    body_len: usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let inner_opt = h.inner.lock().take();
+    let mut sink = match inner_opt {
+        Some(s) => s,
+        None => {
+            h.done.store(true, Ordering::Relaxed);
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    let body = if body_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
+    };
+    let result = runtime().block_on(async { sink.send(body).await });
+    match result {
+        Ok(()) => {
+            *h.inner.lock() = Some(sink);
+            NET_RPC_OK
+        }
+        Err(e) => {
+            drop(sink);
+            h.done.store(true, Ordering::Relaxed);
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Close the sink half (emits REQUEST_END). Consumes the inner
+/// `DuplexSink`; subsequent `sink_send` returns STREAM_DONE.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_sink_finish(
+    handle: *mut DuplexSinkHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let inner_opt = h.inner.lock().take();
+    let sink = match inner_opt {
+        Some(s) => s,
+        None => {
+            h.done.store(true, Ordering::Relaxed);
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    h.done.store(true, Ordering::Relaxed);
+    let result = runtime().block_on(async { sink.finish_sending().await });
+    match result {
+        Ok(()) => NET_RPC_OK,
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Diagnostic accessor for the sink half's call_id.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_sink_call_id(handle: *const DuplexSinkHandleC) -> u64 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    h.call_id
+}
+
+/// Free the sink half. Drop fires nothing (CANCEL only when the
+/// shared Arc<DuplexInner> refcount hits zero AND clean_close
+/// wasn't observed — see the SDK's `DuplexInner::Drop`).
+/// Idempotent on NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_sink_free(handle: *mut DuplexSinkHandleC) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle));
+    }
+}
+
+// ---- Stream half (post-into_split) ----
+
+/// Pull the next response chunk from the stream half. Same
+/// semantics as [`net_rpc_duplex_next`].
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_stream_next(
+    handle: *mut DuplexStreamHandleC,
+    out_chunk_ptr: *mut *mut u8,
+    out_chunk_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        unsafe {
+            *out_chunk_ptr = std::ptr::null_mut();
+            *out_chunk_len = 0;
+        }
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let inner_opt = h.inner.lock().take();
+    let mut stream = match inner_opt {
+        Some(s) => s,
+        None => {
+            h.done.store(true, Ordering::Relaxed);
+            unsafe {
+                *out_chunk_ptr = std::ptr::null_mut();
+                *out_chunk_len = 0;
+            }
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    use futures::StreamExt;
+    let result = runtime().block_on(async { stream.next().await });
+    match result {
+        Some(Ok(chunk)) => {
+            *h.inner.lock() = Some(stream);
+            write_response(chunk.to_vec(), out_chunk_ptr, out_chunk_len);
+            NET_RPC_OK
+        }
+        Some(Err(e)) => {
+            drop(stream);
+            h.done.store(true, Ordering::Relaxed);
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        None => {
+            drop(stream);
+            h.done.store(true, Ordering::Relaxed);
+            unsafe {
+                *out_chunk_ptr = std::ptr::null_mut();
+                *out_chunk_len = 0;
+            }
+            NET_RPC_ERR_STREAM_DONE
+        }
+    }
+}
+
+/// Diagnostic accessor for the stream half's call_id.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_stream_call_id(handle: *const DuplexStreamHandleC) -> u64 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    h.call_id
+}
+
+/// Free the stream half. Same Arc-refcount-based CANCEL semantics
+/// as `_sink_free`. Idempotent on NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_stream_free(handle: *mut DuplexStreamHandleC) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle));
+    }
+}
+
+// =========================================================================
 // Header-bearing call variants (Phase 9b end-to-end).
 //
 // The legacy `net_rpc_call` / `_call_service` / `_call_streaming`
@@ -2079,6 +2611,75 @@ mod tests {
         assert_eq!(code, NET_RPC_ERR_STREAM_DONE);
         assert!(err_ptr.is_null());
         unsafe { net_rpc_client_stream_free(handle) };
+    }
+
+    // ----- B8-2 duplex null-safety pins. -----
+
+    #[test]
+    fn duplex_send_on_null_handle_is_safe() {
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let body = b"x";
+        let code = net_rpc_duplex_send(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            body.len(),
+            &mut err_ptr,
+        );
+        assert_eq!(code, NET_RPC_ERR_NULL);
+        assert!(err_ptr.is_null());
+    }
+
+    #[test]
+    fn duplex_finish_sending_on_null_handle_is_safe() {
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let code = net_rpc_duplex_finish_sending(std::ptr::null_mut(), &mut err_ptr);
+        assert_eq!(code, NET_RPC_ERR_NULL);
+        assert!(err_ptr.is_null());
+    }
+
+    #[test]
+    fn duplex_next_on_null_handle_is_safe() {
+        let mut body_ptr: *mut u8 = std::ptr::null_mut();
+        let mut body_len: usize = 0;
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let code = net_rpc_duplex_next(
+            std::ptr::null_mut(),
+            &mut body_ptr,
+            &mut body_len,
+            &mut err_ptr,
+        );
+        assert_eq!(code, NET_RPC_ERR_NULL);
+        assert!(body_ptr.is_null());
+        assert_eq!(body_len, 0);
+        assert!(err_ptr.is_null());
+    }
+
+    #[test]
+    fn duplex_into_split_on_null_handle_is_safe() {
+        let mut out_sink: *mut DuplexSinkHandleC = std::ptr::null_mut();
+        let mut out_stream: *mut DuplexStreamHandleC = std::ptr::null_mut();
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let code = net_rpc_duplex_into_split(
+            std::ptr::null_mut(),
+            &mut out_sink,
+            &mut out_stream,
+            &mut err_ptr,
+        );
+        assert_eq!(code, NET_RPC_ERR_NULL);
+    }
+
+    #[test]
+    fn duplex_call_id_on_null_returns_zero() {
+        assert_eq!(net_rpc_duplex_call_id(std::ptr::null()), 0);
+        assert_eq!(net_rpc_duplex_sink_call_id(std::ptr::null()), 0);
+        assert_eq!(net_rpc_duplex_stream_call_id(std::ptr::null()), 0);
+    }
+
+    #[test]
+    fn duplex_free_on_null_is_no_op() {
+        net_rpc_duplex_free(std::ptr::null_mut());
+        net_rpc_duplex_sink_free(std::ptr::null_mut());
+        net_rpc_duplex_stream_free(std::ptr::null_mut());
     }
 
     /// `net_rpc_stream_next` on a `done`-latched handle returns
