@@ -20,6 +20,7 @@ pub mod blob_tree_cache;
 pub mod cdc;
 pub mod conformance;
 pub mod dispatch;
+pub mod erasure;
 pub mod error;
 pub mod fs;
 pub mod mesh;
