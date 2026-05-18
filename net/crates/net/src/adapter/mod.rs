@@ -77,7 +77,15 @@ pub(crate) fn redact_url(url: &str) -> std::borrow::Cow<'_, str> {
         .find(['/', '?', '#'])
         .map_or(url.len(), |i| after_scheme + i);
     let authority = &url[after_scheme..authority_end];
-    let Some(at_pos) = authority.find('@') else {
+    // Find the LAST `@` in the authority. The URI spec says
+    // userinfo terminates at the rightmost `@` in the authority,
+    // not the first — an unencoded `@` inside the password (a
+    // common operator mistake the redactor is here to catch)
+    // splits the userinfo only at the trailing delimiter.
+    // Pre-fix `find('@')` left the password tail visible: e.g.
+    // `nats://admin:p@ss@nats.svc:4222` redacted to
+    // `nats://[REDACTED]@ss@nats.svc:4222`, leaking `ss`.
+    let Some(at_pos) = authority.rfind('@') else {
         return std::borrow::Cow::Borrowed(url);
     };
     let mut redacted = String::with_capacity(url.len());
@@ -340,14 +348,47 @@ mod tests {
         );
         assert_eq!(
             redact_url("nats://admin:p@ss@nats.svc:4222/path?foo=1"),
-            // Password contains an unencoded '@' — URI spec says it
-            // must be percent-encoded; the userinfo terminator is
-            // the first '@', so this is the most-permissive split.
-            "nats://[REDACTED]@ss@nats.svc:4222/path?foo=1"
+            // Password contains an unencoded '@' — URI spec says
+            // userinfo terminates at the LAST `@` in the
+            // authority, so the full `admin:p@ss` redacts.
+            // Pre-fix used `find('@')` and emitted
+            // `nats://[REDACTED]@ss@nats.svc:4222/...`, leaking
+            // the password tail `ss`.
+            "nats://[REDACTED]@nats.svc:4222/path?foo=1"
         );
         assert_eq!(
             redact_url("rediss://:tokenonly@host:6379"),
             "rediss://[REDACTED]@host:6379"
+        );
+    }
+
+    /// Regression: `redact_url` must split on the LAST `@` in the
+    /// authority, not the first. Pre-fix `find('@')` left any
+    /// password suffix after an unencoded inner `@` visible in
+    /// every log line — exactly the leak the redactor is here to
+    /// prevent.
+    #[cfg(any(feature = "redis", feature = "jetstream"))]
+    #[test]
+    fn redact_url_splits_on_last_at_in_authority() {
+        // Password with an unencoded `@` mid-string.
+        assert_eq!(
+            redact_url("redis://user:p@ss:word@redis.svc:6379"),
+            "redis://[REDACTED]@redis.svc:6379",
+            "the entire userinfo `user:p@ss:word` must redact, not just the first segment",
+        );
+        // Username + multi-`@` password.
+        assert_eq!(
+            redact_url("nats://op:a@b@c@nats.svc:4222"),
+            "nats://[REDACTED]@nats.svc:4222",
+        );
+        // Authority terminator (first `/` after `://`) bounds the
+        // search — a `@` inside the path must NOT be the split
+        // point. Without scoping to the authority, the path's `@`
+        // would steal the rfind result and the userinfo would
+        // leak through.
+        assert_eq!(
+            redact_url("https://user:p@ss@host.example/foo@bar"),
+            "https://[REDACTED]@host.example/foo@bar",
         );
     }
 
