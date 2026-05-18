@@ -772,7 +772,38 @@ async fn on_tick(
     // last apply_sync_response recorded (which only Replicas run),
     // and a leader's announce_chain at promotion time ships
     // tip_seq=0.
-    coordinator.record_tail_seq(tail_seq);
+    //
+    // For the LEADER role specifically, `tail_provider` returns the
+    // raw local-file `next_seq()`, which the leader bumps the moment
+    // a write lands locally — pre-replication. Advertising that
+    // value via capability tags biases `find_chain_holders` (which
+    // picks the freshest holder by `tip_seq` during failover)
+    // toward a partition that may have un-replicated writes; a
+    // crash before those writes ship loses them.
+    //
+    // Clamp the advertised tail to the highest tail any peer has
+    // confirmed via heartbeat. That tail is, by construction,
+    // "replicated at least once" — a safe minimum for failover
+    // discovery. When NO peer has reported yet (fresh leader, no
+    // replicas), fall back to the raw local tail: there is no
+    // safer value to advertise and a sole leader has authority
+    // over its own writes by tautology.
+    let advertised_tail = if coordinator.role() == ReplicaRole::Leader {
+        let max_peer_tail = tracker
+            .lock()
+            .peer_tail_seqs()
+            .into_iter()
+            .filter(|(id, _)| *id != inputs.self_node_id)
+            .map(|(_, t)| t)
+            .max();
+        match max_peer_tail {
+            Some(p) => tail_seq.min(p),
+            None => tail_seq,
+        }
+    } else {
+        tail_seq
+    };
+    coordinator.record_tail_seq(advertised_tail);
     let wall_clock_ms = (inputs.wall_clock_provider)();
     // R-10: capture `current_role` inside the same critical
     // section that holds the tracker lock so a concurrent
@@ -2127,6 +2158,151 @@ mod tests {
         assert!(handle.is_stopped());
         // Final state must be Idle (ChannelClose transition).
         assert_eq!(coordinator.role(), ReplicaRole::Idle);
+    }
+
+    /// Regression: a Leader's `on_tick`-driven `record_tail_seq`
+    /// must clamp the advertised tail to the highest tail any
+    /// peer has confirmed via heartbeat — never advertise
+    /// pre-replication local tail. The capability-tag layer reads
+    /// this value as `tip_seq` for `find_chain_holders` failover
+    /// selection; advertising un-replicated writes biases
+    /// failover toward a partition whose tail may not survive a
+    /// crash.
+    ///
+    /// Pre-fix: leader at local tail = 100, replica reported tail
+    /// = 50 → advertised_tail = 100.
+    /// Post-fix: advertised_tail = 50 (clamped to max peer tail).
+    #[tokio::test]
+    async fn leader_on_tick_clamps_advertised_tail_to_max_peer_tail() {
+        // Build inputs with a deterministic tail_provider returning
+        // 100 (the leader's local tail).
+        let self_id: NodeId = 0x10;
+        let peer_id: NodeId = 0x20;
+        let inputs = RuntimeInputs {
+            channel: ChannelIdentity {
+                channel_name: "test/runtime".to_string(),
+                origin_hash: 0xCAFE_BABE,
+            },
+            channel_id: channel_id_for("test/runtime"),
+            self_node_id: self_id,
+            replica_set: vec![self_id, peer_id],
+            heartbeat_ms: 100,
+            wall_clock_provider: Arc::new(|| 1_700_000_000_000),
+            // Local tail is 100 — well above what the peer has
+            // reported.
+            tail_provider: Arc::new(|| 100),
+            rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
+            file: build_file_for_tests(),
+        };
+        let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, peer_id]);
+        // Promote to Leader via the state machine.
+        for (role, signal) in [
+            (
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            ),
+            (
+                ReplicaRole::Candidate,
+                super::super::replication_state::TransitionSignal::MissedHeartbeats,
+            ),
+            (
+                ReplicaRole::Leader,
+                super::super::replication_state::TransitionSignal::ElectionWon,
+            ),
+        ] {
+            coordinator.transition_to(role, signal).await.unwrap();
+        }
+        // Seed the peer's heartbeat at tail=50 — only HALF of what
+        // the leader has locally. The other 50 events are
+        // unreplicated.
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        tracker
+            .lock()
+            .record_heartbeat(peer_id, ReplicaRole::Replica, 50, Instant::now());
+
+        let dispatcher: Arc<dyn ReplicationDispatcher> =
+            Arc::new(RecorderDispatcher::default());
+        on_tick(
+            &inputs,
+            &coordinator,
+            &dispatcher,
+            &tracker,
+            &build_backoff(),
+            &Arc::new(Mutex::new(OutstandingRequests::new())),
+        )
+        .await;
+
+        // record_tail_seq is monotonic; the coordinator's cached
+        // tail should be the clamped value (50), NOT the raw
+        // local-file tail (100).
+        assert_eq!(
+            coordinator.tail_seq(),
+            50,
+            "leader must advertise the highest peer-confirmed tail (50), \
+             not the pre-replication local tail (100); pre-fix this would \
+             be 100 and a crash here would lose the 50 un-replicated events \
+             while failover discovery still thought tip_seq=100",
+        );
+    }
+
+    /// Companion: with NO peer heartbeats observed (fresh leader),
+    /// `on_tick` falls back to the raw local tail. A sole leader has
+    /// authority over its own writes by tautology — clamping to 0
+    /// would otherwise prevent any progress on a single-node
+    /// configuration.
+    #[tokio::test]
+    async fn leader_on_tick_falls_back_to_local_tail_with_no_peers() {
+        let self_id: NodeId = 0x10;
+        let peer_id: NodeId = 0x20;
+        let inputs = RuntimeInputs {
+            channel: ChannelIdentity {
+                channel_name: "test/runtime".to_string(),
+                origin_hash: 0xCAFE_BABE,
+            },
+            channel_id: channel_id_for("test/runtime"),
+            self_node_id: self_id,
+            replica_set: vec![self_id, peer_id],
+            heartbeat_ms: 100,
+            wall_clock_provider: Arc::new(|| 1_700_000_000_000),
+            tail_provider: Arc::new(|| 77),
+            rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
+            file: build_file_for_tests(),
+        };
+        let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, peer_id]);
+        for (role, signal) in [
+            (
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            ),
+            (
+                ReplicaRole::Candidate,
+                super::super::replication_state::TransitionSignal::MissedHeartbeats,
+            ),
+            (
+                ReplicaRole::Leader,
+                super::super::replication_state::TransitionSignal::ElectionWon,
+            ),
+        ] {
+            coordinator.transition_to(role, signal).await.unwrap();
+        }
+
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        let dispatcher: Arc<dyn ReplicationDispatcher> =
+            Arc::new(RecorderDispatcher::default());
+        on_tick(
+            &inputs,
+            &coordinator,
+            &dispatcher,
+            &tracker,
+            &build_backoff(),
+            &Arc::new(Mutex::new(OutstandingRequests::new())),
+        )
+        .await;
+        assert_eq!(
+            coordinator.tail_seq(),
+            77,
+            "no peer heartbeats → no clamp, raw local tail is advertised",
+        );
     }
 
     /// Regression: empty-response backoff must NOT strike when the
