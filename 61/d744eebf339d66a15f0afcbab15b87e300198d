@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/compute/migration_source.rs
+  s_2571835e05521c::t_635d371c3d0e22 398-407
+net/crates/net/src/adapter/net/behavior/meshos/migration_snapshot_source.rs
+  s_2571835e05521c::t_037e89f9a9e3ee 51-58,61-62,66-68,70-84,95-99,110
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "61d744eebf339d66a15f0afcbab15b87e300198d",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
