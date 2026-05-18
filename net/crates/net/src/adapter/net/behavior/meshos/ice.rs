@@ -486,6 +486,18 @@ impl OperatorRegistry {
         payload: &[u8],
         threshold: usize,
     ) -> Result<(), VerifyError> {
+        // Cap the bundle so a `MeshOsEvent` arriving with a huge
+        // `signatures` vec (e.g. across a future process boundary)
+        // can't pin the verifier's CPU for arbitrarily long.
+        // 64 is well past any realistic operator-quorum and matches
+        // the umbrella shape of "tiny-but-finite operational caps."
+        const MAX_SIGNATURES_PER_BUNDLE: usize = 64;
+        if signatures.len() > MAX_SIGNATURES_PER_BUNDLE {
+            return Err(VerifyError::InsufficientSignatures {
+                got: signatures.len(),
+                required: threshold,
+            });
+        }
         let mut unique_operators: std::collections::BTreeSet<u64> =
             std::collections::BTreeSet::new();
         for sig in signatures {
