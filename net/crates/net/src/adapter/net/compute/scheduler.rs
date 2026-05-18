@@ -160,10 +160,19 @@ impl Scheduler {
         daemon_filter: &CapabilityFilter,
         source_node: u64,
     ) -> Vec<u64> {
-        // Build a combined filter: must support migration AND daemon requirements
-        let mut combined = daemon_filter.clone();
-        combined =
-            combined.require_tag(format!("subprotocol:{:#06x}", super::SUBPROTOCOL_MIGRATION,));
+        // Build a combined filter: must support migration AND daemon requirements.
+        // The migration-subprotocol tag is constant — hoist it out of
+        // the format! per-call (pre-fix this allocated a tag string
+        // on every find_migration_targets invocation).
+        const MIGRATION_TAG: &str = "subprotocol:0x0500";
+        debug_assert_eq!(
+            MIGRATION_TAG,
+            format!("subprotocol:{:#06x}", super::SUBPROTOCOL_MIGRATION),
+            "hoisted MIGRATION_TAG must match SUBPROTOCOL_MIGRATION format",
+        );
+        let combined = daemon_filter
+            .clone()
+            .require_tag(MIGRATION_TAG.to_string());
 
         self.capability_index
             .query(&combined)

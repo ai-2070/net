@@ -848,15 +848,13 @@ impl SnapshotReassembler {
         chunk_index: u32,
         total_chunks: u32,
     ) -> Result<Option<Vec<u8>>, ReassemblyError> {
-        // Opportunistic age sweep. Even without an external scheduler
-        // driving `sweep_stale`, the pending map self-heals as new
-        // traffic arrives, so a hostile peer who parks an entry at
-        // the byte cap and goes silent can't keep it alive
-        // indefinitely. Cheap: `pending` is bounded to one entry
-        // per daemon and the retain is O(n) over a small map.
-        self.sweep_stale(self.max_pending_age);
-
         // ---- Per-chunk validation (no mutation until we've passed these) ----
+        // Pre-fix the opportunistic age sweep ran BEFORE these
+        // structural checks, so a peer that shipped a torrent of
+        // malformed chunks (total_chunks=0, oversize, etc.) forced
+        // an O(n) sweep on every reject — amplifying the malformed-
+        // chunk DoS. Move the sweep after validation so attacker
+        // junk is rejected for O(1) instead.
         if total_chunks == 0 {
             return Err(ReassemblyError::ZeroTotalChunks);
         }
@@ -869,6 +867,14 @@ impl SnapshotReassembler {
                 total_chunks,
             });
         }
+
+        // Opportunistic age sweep. Even without an external scheduler
+        // driving `sweep_stale`, the pending map self-heals as new
+        // traffic arrives, so a hostile peer who parks an entry at
+        // the byte cap and goes silent can't keep it alive
+        // indefinitely. Cheap: `pending` is bounded to one entry
+        // per daemon and the retain is O(n) over a small map.
+        self.sweep_stale(self.max_pending_age);
         // Zero-byte chunks are nonsensical: every legitimate
         // SnapshotReady carries at least one byte of state (an empty
         // snapshot would be a 1-byte length-prefixed empty payload,
@@ -1491,20 +1497,27 @@ impl MigrationOrchestrator {
                 link
             }
             Err(e) => {
-                tracing::warn!(
-                    daemon_origin = format_args!("{:#x}", daemon_origin),
-                    error = ?e,
-                    replayed_seq,
-                    "on_replay_complete: daemon not registered locally; \
-                     falling back to synthetic target_head with parent_hash=0 — \
-                     downstream continuity-proof verification will fail"
-                );
-                CausalLink {
-                    origin_hash: daemon_origin,
-                    horizon_encoded: 0,
-                    sequence: replayed_seq,
-                    parent_hash: 0,
-                }
+                // Pre-fix this fell through to a synthetic
+                // CausalLink { parent_hash: 0, ... } and a warn —
+                // every migration in a third-party-orchestrator
+                // topology shipped a known-wrong anchor that no
+                // downstream verifier could reconcile against the
+                // real chain, breaking the continuity-proof
+                // feature in exactly the topology the module docs
+                // claim it supports. Return a typed StateFailed
+                // instead so callers see the architectural gap and
+                // either move to a target-shipped target_head in
+                // ReplayComplete (the right long-term fix) or
+                // arrange to run on_replay_complete on the target
+                // node (which always has the host).
+                return Err(MigrationError::StateFailed(format!(
+                    "on_replay_complete: daemon {:#x} not registered locally — \
+                     orchestrator cannot synthesize a verifiable target_head. \
+                     Either run on_replay_complete on the target node, or \
+                     extend ReplayComplete with a target-shipped head_link \
+                     (underlying error: {:?})",
+                    daemon_origin, e
+                )));
             }
         };
         record.superposition.target_replayed(target_head);
@@ -1720,7 +1733,13 @@ impl MigrationOrchestrator {
             .iter()
             .map(|entry| {
                 let record = entry.lock();
-                let elapsed = record.started_at.elapsed().as_millis() as u64;
+                // Saturating cast through the same helper migration.rs
+                // already publishes. Pre-fix the raw `as u64` wrapped
+                // instead of saturating on a (theoretical) u128 over
+                // u64::MAX milliseconds — inconsistent with the
+                // canonical state.elapsed_ms() used in migration.rs:283.
+                let elapsed =
+                    u64::try_from(record.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
                 MigrationListItem {
                     daemon_origin: *entry.key(),
                     source_node: record.state.source_node(),

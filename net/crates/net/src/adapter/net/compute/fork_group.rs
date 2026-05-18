@@ -289,18 +289,14 @@ impl ForkGroup {
         for index in affected {
             self.coord.mark_unhealthy(index);
 
-            let old_origin_hash = self
-                .coord
-                .members()
-                .iter()
-                .find(|m| m.index == index)
-                .unwrap()
-                .origin_hash;
-
             // Try `place_with_spread` BEFORE touching the registry
             // so a placement failure doesn't leave the slot
             // unregistered (and therefore unrecoverable via
-            // `on_node_recovery`).
+            // `on_node_recovery`). The pre-fix `old_origin_hash`
+            // lookup with .unwrap() was dead — its value was
+            // discarded with `let _ = old_origin_hash;` below.
+            // Deleted along with the discard to remove the
+            // unreachable-via-design panic.
 
             // Recover the same keypair from stored secret
             let fork_info = match self.forks.get(index as usize) {
@@ -337,8 +333,6 @@ impl ForkGroup {
             // between callers (the older `unregister` →
             // `register` sequence had a small window where the
             // second step could fail and orphan the slot).
-            let _ = old_origin_hash;
-
             let daemon = daemon_factory();
             let host = DaemonHost::from_fork(
                 daemon,
