@@ -1,0 +1,25 @@
+net/crates/net/include/net.go.h
+  s_f641e31a81af58::t_63479a4ca9a605 611,614
+net/crates/net/bindings/node/src/identity.rs
+  s_f641e31a81af58::t_a7a6927c4949e4 316-320,326
+  s_f641e31a81af58::t_e560c1012d30e8 391,393-397,399-400
+  s_f641e31a81af58::t_0386ed02faa9da 344
+net/crates/net/bindings/python/src/identity.rs
+  s_f641e31a81af58::t_d480eaf0acd6b9 344,346-348,350
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "c1afda86bd0f044c165370fab65071ee30397a73",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
