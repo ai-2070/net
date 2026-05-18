@@ -1,0 +1,26 @@
+net/crates/net/src/consumer/merge.rs
+  s_2571835e05521c::t_922b85926309e5 3142-3187,3194-3195,3200
+  s_2571835e05521c::t_f397b06bbaec8b 3126-3141,3188-3193,3196-3199,3201-3216,3224-3248,3292-3299,3301-3316,3318-3320,3328-3339
+  s_2571835e05521c::t_dd7e209f42455b 614-623
+  s_2571835e05521c::t_060bc145a0ea7f 883-896
+  s_2571835e05521c::t_94985deeeeaef0 3217-3223,3321-3327
+  s_2571835e05521c::t_23b3adc0804d5d 864-874
+  s_2571835e05521c::t_db8950d2824104 643-667
+  s_2571835e05521c::t_4b39d25a2733cc 3249-3291,3300,3317
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "fcb5cd7bcc7edd143e63665a926a36e0c5ff9542",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
