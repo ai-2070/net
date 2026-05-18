@@ -606,19 +606,41 @@ impl MeshBlobAdapter {
             }
         }
         if !updates.is_empty() {
-            sink.announce_blob_heat_batch(&updates).await.map_err(|e| {
-                BlobError::Backend(format!("blob heat tick: announce batch failed: {}", e))
-            })?;
+            match sink.announce_blob_heat_batch(&updates).await {
+                Ok(()) => {}
+                Err(e) => {
+                    // Sink failed — roll the in-flight markers
+                    // back so the next tick reissues these same
+                    // emissions, matching the retry-on-failure
+                    // semantic the audit asks for. Without the
+                    // rollback the in-flight set would pin the
+                    // hashes forever (no commit to clear, no other
+                    // path to remove), and subsequent ticks would
+                    // silently skip them.
+                    let mut guard = reg.lock();
+                    for (hash, _) in &emissions {
+                        guard.rollback_emission(hash);
+                    }
+                    return Err(BlobError::Backend(format!(
+                        "blob heat tick: announce batch failed: {}",
+                        e
+                    )));
+                }
+            }
         }
         // D-17: commit `last_emitted` mutations only after the sink
         // confirmed the announcement. Pre-fix the registry's `tick`
         // mutated state inline and a transient sink error stranded
         // the chain's heat updates forever (next tick's
         // `should_emit_heat` returned Suppress against the
-        // already-advanced `last_emitted`). On the `?` error path
-        // above this code is unreachable, so commit only runs on
-        // successful announce — exactly the retry-on-failure
-        // semantic the audit asks for.
+        // already-advanced `last_emitted`). The registry's
+        // in-flight set defends against the inverse race — a
+        // concurrent `tick_blob_heat` landing in the lock-release
+        // window between this `tick` and the `commit_emissions`
+        // below would otherwise re-emit the same candidates
+        // because `last_emitted` hasn't been mutated yet.
+        // `tick`'s in-flight check skips those hashes; `commit`
+        // clears the markers.
         {
             let mut guard = reg.lock();
             guard.commit_emissions(&emissions);
