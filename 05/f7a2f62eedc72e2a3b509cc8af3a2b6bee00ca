@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/compute/migration_target.rs
+  s_aa8bb6e2c88c9e::t_419619ae4ebd73 223-234
+  s_aa8bb6e2c88c9e::t_9cdebcd30b978b 528
+  s_aa8bb6e2c88c9e::t_4b388e4f8116fc 687-729
+net/crates/net/src/adapter/net/compute/migration_source.rs
+  s_aa8bb6e2c88c9e::t_ca3a02d25acc17 502-527
+  s_aa8bb6e2c88c9e::t_73a671041920f0 294-298,300-309
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "05f7a2f62eedc72e2a3b509cc8af3a2b6bee00ca",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
