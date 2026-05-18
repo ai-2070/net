@@ -42,3 +42,45 @@ pub use registry::DaemonRegistry;
 pub use replica_group::{ReplicaGroup, ReplicaGroupConfig, SUBPROTOCOL_REPLICA_GROUP};
 pub use scheduler::{PlacementDecision, PlacementReason, Scheduler, SchedulerError};
 pub use standby_group::{MemberRole, StandbyGroup, StandbyGroupConfig};
+
+/// Recovery hook for replication / fork / standby groups whose
+/// slots got marked unhealthy after a placement failure.
+///
+/// `on_node_failure*` paths in all three group types `mark_unhealthy`
+/// the affected slot BEFORE attempting placement so traffic stops
+/// routing to a dead node immediately. On a placement failure
+/// (no healthy candidate at the moment) the slot stays unhealthy
+/// with the dead node's `origin_hash` in the registry. The group's
+/// per-node `on_node_recovery` only re-marks the slot healthy when
+/// the recovered node id matches the FAILED node id — recovery of
+/// a DIFFERENT spare node (which arrives later and could host the
+/// slot) silently never retries placement.
+///
+/// Groups that opt in implement this trait and register themselves
+/// with the meshos runtime's recovery registry; the loop's
+/// reconcile tick walks every registered group, checks
+/// `has_unhealthy_slots`, and calls `try_recover` with the live
+/// scheduler. The cap per tick lets a pathological "every slot
+/// unhealthy" state make progress without wedging the loop.
+pub trait UnhealthySlotRecovery: Send + Sync {
+    /// `true` when at least one slot is marked unhealthy and a
+    /// `try_recover` call could attempt placement. Cheap probe so
+    /// the recovery tick can skip groups with nothing to do.
+    fn has_unhealthy_slots(&self) -> bool;
+
+    /// Attempt to place every unhealthy slot against the current
+    /// healthy node pool. Returns the slot indices that were
+    /// successfully recovered. Implementations cap the recovery
+    /// work per call (e.g. at most 4 slots) so a pathological
+    /// "every slot unhealthy" state doesn't wedge the caller.
+    ///
+    /// `daemon_factory` produces a fresh boxed `MeshDaemon` per
+    /// recovered slot — the group's existing daemon-keypair /
+    /// chain plumbing rebuilds around it.
+    fn try_recover(
+        &mut self,
+        scheduler: &Scheduler,
+        registry: &DaemonRegistry,
+        daemon_factory: &dyn Fn() -> Box<dyn MeshDaemon>,
+    ) -> Vec<u8>;
+}
