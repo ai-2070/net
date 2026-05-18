@@ -1189,6 +1189,21 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let start = Arc::new(Barrier::new(2));
 
+        // Pre-seed the target. Under mutex contention the ticker can
+        // sweep all 200 iterations before the bumper ever grabs the
+        // lock — without a pre-seed the post-storm `get(&target)`
+        // would observe a never-inserted hash. Pre-seeding makes the
+        // assertion test the storm's effect on a live entry, not
+        // whether the bumper got scheduled at all.
+        {
+            let now = Instant::now();
+            registry
+                .lock()
+                .unwrap()
+                .entry_mut(target, half, now)
+                .bump(now);
+        }
+
         // Bump storm.
         let bumper = {
             let registry = registry.clone();
