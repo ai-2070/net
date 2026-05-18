@@ -2424,14 +2424,21 @@ mod tests {
         let subject_id = subject_kp.entity_id().clone();
         let channel_hash: ChannelHash = 0xBEEF;
 
-        // Short-lived token: 1 s TTL. Insert it then let it
+        // Short-lived token: 3 s TTL. Insert it then let it
         // expire naturally during the race.
+        //
+        // `current_timestamp` is second-resolution, so a 1 s TTL has
+        // a ~1 s race window: insert at the very end of second T can
+        // produce `not_after == T + 1` while the immediate post-
+        // insert check already runs in second T + 1 (`now >=
+        // not_after` → Expired). 3 s of headroom keeps the pre-
+        // expiry check robust without lengthening the race body.
         let token = PermissionToken::issue(
             &issuer,
             subject_id.clone(),
             TokenScope::PUBLISH,
             channel_hash,
-            1, // 1-second TTL
+            3, // 3-second TTL
             0,
         );
         cache.insert_unchecked(token);
@@ -2470,9 +2477,9 @@ mod tests {
         };
 
         // Wait for TTL to elapse. `current_timestamp` is
-        // second-resolution, so 1.5 s of wall clock guarantees
-        // `not_after` < `now`.
-        thread::sleep(Duration::from_millis(1_500));
+        // second-resolution, so 3.5 s of wall clock guarantees
+        // `not_after` < `now` for the 3 s TTL above.
+        thread::sleep(Duration::from_millis(3_500));
 
         checker.join().expect("checker panicked");
         evictor.join().expect("evictor panicked");
