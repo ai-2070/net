@@ -753,6 +753,19 @@ impl MeshOsLoop {
         // pass per tick" guarantee is designed to prevent.
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+        // Bound how many events get drained between ticks so a
+        // heavy reconcile + 100 ms tick can't starve `events_rx`
+        // under the `biased;` priority below. The pre-fix
+        // `biased; tick.tick() ⇒ events_rx.recv()` ordering
+        // correctly defends event-burst-starves-tick (the original
+        // bug), but in the other direction a long `run_reconcile`
+        // that yields mid-await re-enters the select and tick
+        // wins again — events sit in the queue until the queue
+        // saturates the sender or the system idles. Drain up to
+        // `EVENTS_PER_TICK` events in a non-blocking pass after
+        // each tick so both directions make bounded progress.
+        const EVENTS_PER_TICK: usize = 32;
+        let mut shutdown = false;
         loop {
             tokio::select! {
                 // `biased` polls arms in source order, so a
@@ -791,6 +804,43 @@ impl MeshOsLoop {
                         );
                     }
                     self.run_reconcile().await;
+
+                    // Drain a bounded batch of events from the
+                    // queue before the next tick can re-fire. This
+                    // is the inverse-direction starvation guard
+                    // for the `biased;` above. `try_recv` is non-
+                    // blocking, so an empty queue costs one Err
+                    // each iteration and the loop falls through to
+                    // the next select.
+                    for _ in 0..EVENTS_PER_TICK {
+                        match self.events_rx.try_recv() {
+                            Ok(event) => {
+                                if matches!(event, MeshOsEvent::Shutdown) {
+                                    tracing::debug!(
+                                        target: "meshos",
+                                        reconcile_count = self.reconcile_count,
+                                        "MeshOsLoop exiting — Shutdown drained post-tick",
+                                    );
+                                    shutdown = true;
+                                    break;
+                                }
+                                self.apply(&event);
+                            }
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                tracing::debug!(
+                                    target: "meshos",
+                                    reconcile_count = self.reconcile_count,
+                                    "MeshOsLoop exiting — all handles dropped (drained post-tick)",
+                                );
+                                shutdown = true;
+                                break;
+                            }
+                        }
+                    }
+                    if shutdown {
+                        break;
+                    }
                 }
                 event = self.events_rx.recv() => {
                     let Some(event) = event else {
