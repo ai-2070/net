@@ -34,7 +34,7 @@ The bus is transient. RedEX is what you reach for when "I need to survive a node
 ## Rust
 
 ```rust
-use ai2070_net::adapter::net::{Redex, RedexFile, RedexFileConfig};
+use net::adapter::net::{Redex, RedexFile, RedexFileConfig};
 use std::sync::Arc;
 use futures::StreamExt;
 
