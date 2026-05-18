@@ -24,9 +24,9 @@ The replication subprotocol is the highest-leverage surface in this batch — **
 | Severity | Count | Top items |
 |---|---|---|
 | Critical | 3 | R-20, R-21, X-1 |
-| High | 13 | A-5, R-22, R-23, R-24, R-25, X-2, X-3, X-9, X-18, D-1, D-2, D-11, D-14 |
-| Medium | 25 | (see body) |
-| Low | 35 | (counts only at the end) |
+| High | 16 | A-5, R-22, R-23, R-24, R-25, X-2, X-3, X-9, X-18, X-19, D-1, D-2, D-11, D-14, D-17, O-21 |
+| Medium | 30 | (see body) |
+| Low | 39 | (counts only at the end) |
 | Latent | 1 | MD-3 |
 | Null | 1 module | `netdb/` clean |
 
@@ -36,6 +36,11 @@ Third pass added 1 H (D-14) + 4 M (D-15, D-16, R-35, X-13) + 8 L
 Fourth pass added 1 H (X-18) + 2 M (O-20, MD-1) + 1 L (MD-2) + 1 latent
 (MD-3) — see "Fourth-pass additions" section. `behavior/meshdb/` was
 newly in-scope for the fourth pass; the MD-* prefix names that module.
+
+Fifth pass added 3 H (D-17, X-19, O-21) + 5 M (D-18, O-22, O-23, O-24,
+X-20) + 4 L (R-40, O-25, X-21, X-22) — see "Fifth-pass additions"
+section. The pass independently re-derived R-26, D-11, and O-19 from
+the same source lines (confirmation signals, not duplicates).
 
 ## Second-pass note (2026-05-18, later same day)
 
@@ -95,6 +100,24 @@ Each requires exceptional preconditions (u64::MAX-events, very narrow
 race windows, or compound failures); they're listed under "Fourth-pass
 edges (not promoted)" rather than threaded into the main severity
 buckets.
+
+## Fifth-pass note (2026-05-18 night)
+
+A fifth parallel-agent pass over the same five modules surfaced 12 new
+findings: **D-17, D-18, X-19, X-20, X-21, X-22, O-21, O-22, O-23, O-24,
+O-25, R-40.** Severity 3 H + 5 M + 4 L. The pass independently
+re-derived **R-26** (`record_tail_seq` dead; tag advertisements ship
+`tip_seq=0` — verified: only call sites are inside `#[cfg(test)]`
+blocks at `manager.rs:1217`, `replication_coordinator.rs:570,594,733,
+735,737`), **D-11** (`BlobRef::Manifest` decoder admits arbitrary
+per-chunk sizes; `byte_range_to_chunks` returns wrong-offset bytes for
+non-4 MiB strides), and **O-19** (`BufferingActionChainAppender::with_capacity(0)`
+silently increments `dropped_count` on every append because the
+`max(1)` clamp the three sibling appenders apply was missed here) from
+the same source lines — confirmation signals, not duplicates. The
+fifth-pass scope notably caught O-21 (cluster-backpressure stays
+asserted indefinitely in a quiet cluster), which the prior four passes
+missed despite covering `meshos/executor.rs` directly.
 
 ---
 
@@ -517,6 +540,89 @@ The four `.expect()`/`unwrap_or` sites in `db.rs` are documented or trivially sa
 
 ---
 
+## Fifth-pass additions
+
+Findings from the 2026-05-18 night pass. IDs continue the existing
+per-module sequences (D-16 → D-17, X-18 → X-19, O-20 → O-21, R-39 → R-40).
+
+### High
+
+#### D-17 — Heat emission marks `last_emitted` before async sink confirms; one transient error permanently strands updates
+- **File:** `src/adapter/net/dataforts/gravity/counter.rs:291-322` (`HeatRegistry::tick`) and `:441-471` (`BlobHeatRegistry::tick`); call sites at `src/adapter/net/dataforts/blob/mesh.rs:596-613` (`tick_blob_heat`) and `src/adapter/net/dataforts/greedy/runtime.rs:625-667` (chain heat).
+- **What:** `tick()` calls `counter.record_emission(rate)` at `counter.rs:303` (and `:458`) *inside* the registry mutex, before returning the emissions list. The caller then awaits `sink.announce_blob_heat_batch(...)` / `sink.announce_heat_batch(...)`; on error `?` propagates but `last_emitted` has already advanced. The next tick's `should_emit_heat(rate, last_emitted ≈ rate, policy)` returns `Suppress` and the rate change is never re-attempted.
+- **Impact:** A single `AdapterError` (peer offline mid-tick, RPC blip, queue-full at the sink) silences that chain or blob's heat advertisement indefinitely — `Suppress` until rate decays to zero, at which point Withdraw eventually fires but every intermediate update is lost. The gravity / migration loop downstream stops migrating hot blobs to local nodes that would have qualified; no operator-visible counter surfaces the regression. Same shape as **R-31** (replication state advance before async sink completes) but in the dataforts/gravity subsystem.
+- **Fix sketch:** Split tick into "candidate" + "commit" — return the candidate emissions without mutating `last_emitted`; have the caller commit candidates only on `Ok(())` from the sink via a new `commit_emissions(&[Hash], Instant)` method. Or thread the sink call's `Result` back into the registry so the rollback is automatic on failure.
+
+#### X-19 — `StandbyGroup::promote` double-executes events after a partial `sync_standbys`
+- **File:** `src/adapter/net/compute/standby_group.rs:230-298` (`sync_standbys`), `:305-381` (`promote`), and the v2 path at `:585-682`.
+- **What:** When `sync_standbys` partially fails, succeeded standbys have `synced_through` advanced to the snapshot's `through_seq` but `buffered_since_sync` is intentionally preserved (line 286-290) so the failed standby can catch up later. On a subsequent `promote`, the code picks the highest-`synced_through` standby (a succeeded one) and replays the *entire* `buffered_since_sync` vec onto it via `registry.deliver` — but those events have already been applied via the snapshot.
+- **Impact:** Silent state corruption on the promoted daemon — counters double, idempotency keys re-issued, side effects re-fired. Output events re-emitted into the causal chain with new sequence numbers; observers see duplicates. Distinct from **X-1** (partition-heal fencing / split-brain across the *active* member); X-19 is double-execution *within* the promotion path under a partial-sync precondition. Reachable in production any time a partial standby outage is followed by an active-node failure.
+- **Fix sketch:** Filter the replay to `event.link.sequence > self.members[promoted].synced_through` before calling `registry.deliver`; or maintain per-standby `buffered_since_sync` vectors so each standby's outstanding catch-up reflects only what *it* hasn't applied; or refuse promotion to a partially-synced standby in favor of a never-synced one when `buffered_since_sync` is fresh.
+
+#### O-21 — Cluster-backpressure release never fires while the executor is idle
+- **File:** `src/adapter/net/behavior/meshos/executor.rs:357-400` (only non-test call site at `:389`, inside `handle_one_retry`); state at `behavior/meshos/backpressure.rs:247` (`update_cluster_backpressure`).
+- **What:** `update_cluster_backpressure` is only invoked when the executor is processing an action. If the queue drains below the low-water mark while no new action arrives, the `Released` edge never surfaces and `DaemonControl::BackpressureOff` never fans out. Verified: grep across `src` confirms `:389` is the single non-test call site.
+- **Impact:** Daemons stay throttled (cache warmup paused, background indexing off, retry budgets withheld) indefinitely after a burst clears — the very condition `BackpressureOff` exists to relieve. A quiet steady-state cluster is exactly when daemons should be running their optional work; recovery requires *any* fresh action to arrive on the executor queue. Operator visible only via daemon-side gauges; the meshos loop itself shows "queue drained" while daemons remain in suppression.
+- **Fix sketch:** Drive `update_cluster_backpressure(actions_rx.len() + deferred.len(), …)` from a periodic tick (e.g. the snapshot publish loop, or a dedicated `tokio::time::interval`) so the release edge fires with zero in-flight actions. Tie release into the same tick that already runs `gc_freeze` to avoid adding new timer overhead. Fixing this also subsumes **O-25**.
+
+### Medium
+
+#### D-18 — `FileSystemAdapter::sanitize_uri_for_error` byte-slices a UTF-8 URI; publisher-crafted multi-byte char straddling byte 256 panics inside `spawn_blocking`
+- **File:** `src/adapter/net/dataforts/blob/fs.rs:117-121`.
+- **What:** `let trimmed = if uri.len() > MAX_LEN { &uri[..MAX_LEN] } else { uri };` with `MAX_LEN = 256`. The URI passes `from_utf8` on decode but a multi-byte UTF-8 codepoint can straddle byte 256, so the slice indexes mid-char and panics.
+- **Trigger:** Any publisher whose channel resolves to an FS adapter ships a `BlobRef` whose URI is 255 ASCII bytes + a 3-byte emoji (or any 2-4-byte UTF-8 sequence at the boundary). Any error path through `sanitize_uri_for_error` — fetch on missing, range out-of-bounds, refcount mismatch — panics inside `spawn_blocking`; the task crashes and the caller observes a `JoinError`. Repeatable DoS via crafted `BlobRef`.
+- **Fix sketch:** `uri.char_indices().take_while(|(i, _)| *i < MAX_LEN).last().map_or("", |(end, c)| &uri[..end + c.len_utf8()])`, or `uri.get(..MAX_LEN).unwrap_or(uri)` (returns `None` on a mid-codepoint cut and falls back to the full URI). Add a unit test with `format!("{}{}", "a".repeat(255), "🦀")`.
+
+#### O-22 — `MaintenanceState::is_valid_successor` rank ladder admits `ExitingMaintenance → DrainFailed` regression
+- **File:** `src/adapter/net/behavior/meshos/maintenance.rs:104-113`; consumer at `behavior/meshos/state.rs:294`.
+- **What:** Both `ExitingMaintenance` and `DrainFailed` resolve to `rank() == 3`, so the rank-based "successor must be ≥" check accepts the backward arc.
+- **Trigger:** Operator issues `ExitMaintenance { force: true }` after a stuck drain; a delayed `MaintenanceTransitionObserved(DrainFailed)` arrives seconds later (chain replay, redundant source) and regresses local state to `DrainFailed`. The node refuses fresh placements and the operator's manual override silently undoes itself.
+- **Fix sketch:** Replace the rank ladder with an explicit match-table of allowed transitions (e.g. `(ExitingMaintenance, DrainFailed) => false`, `(DrainFailed, ExitingMaintenance) => true`). The ladder is the wrong shape for non-totally-ordered transitions.
+
+#### O-23 — Executor mixes `std::time::Instant` with `tokio::time::sleep_until`
+- **File:** `src/adapter/net/behavior/meshos/executor.rs:379-380, 423, 508-513, 603-605`.
+- **What:** `DeferredEntry.retry_at` is `std::time::Instant`; the sleep at `sleep_until_opt` calls `tokio::time::Instant::from_std(deadline)`. Same M-4 anti-pattern fixed in `bus.rs` and flagged for replication at **R-35** — different file, same shape.
+- **Impact:** Tests using `tokio::time::pause()` (e.g. for `pull_cooldown`) cannot exercise deferred-retry semantics; under heavy load `std::time::Instant` drifts from tokio's monotonic and the deferred-heap deadline diverges from the timer wakeup.
+- **Fix sketch:** Swap `std::time::Instant` → `tokio::time::Instant` throughout `BackpressureState` (admit timestamps, deferred-heap entries, daemon gate timestamps). All consumers of the field are already tokio-side.
+
+#### O-24 — `MeshOsDaemonHandle::graceful_shutdown` unconditionally sleeps the full grace
+- **File:** `src/adapter/net/behavior/meshos/sdk.rs:509-525`.
+- **What:** Doc comment claims "park for `grace` (or until the daemon's task exits — whichever sooner)"; body is `tokio::time::sleep(grace).await; self.unregister_inner();` with no early-exit signal. The handle is consumed by value so a sibling drop cannot shorten the wait.
+- **Impact:** Operators issuing a 30 s drain wait the full 30 s on every clean exit — multiplies shutdown latency across a fleet during rolling restarts. A clean exit looks identical to a hung daemon from the operator's vantage.
+- **Fix sketch:** Hold a `oneshot::Receiver` plumbed from `DaemonHost`'s task completion (or have the registry expose `wait_for_unregister(origin) -> oneshot::Receiver<()>`). `tokio::select!` between that receiver and the `sleep(grace)` so an early exit returns immediately.
+
+#### X-20 — `MigrationOrchestrator::buffer_event` is plumbed but never used in production
+- **File:** `src/adapter/net/compute/orchestrator.rs:1607-1619` (`buffer_event`); state field at `MigrationState::buffered_events`; consumer at `:1416` (`on_restore_complete`).
+- **What:** `MigrationOrchestrator::buffer_event` writes into `record.state.buffered_events`, and `on_restore_complete` drains them via `take_buffered_events()` and ships them to the target. A grep across `src` finds no production caller — only tests. The actual buffering goes through `source_handler.buffer_event` and `on_cutover`'s drain.
+- **Impact:** Dead API trip-wire on a hot orchestration surface. An SDK consumer reading the public API and wiring `orchestrator.buffer_event` expecting symmetry with `source_handler.buffer_event` would have their events delivered through the migration pipeline a second time — once via `on_restore_complete` (pre-Cutover) and again via the source-handler's `on_cutover` drain. Compounds **X-2**'s duplicate-delivery risk.
+- **Fix sketch:** Delete `MigrationOrchestrator::buffer_event` and `MigrationState::{buffer_event, take_buffered_events}`; have `on_restore_complete` ship an empty `BufferedEvents` placeholder. Alternatively, redirect `MigrationOrchestrator::buffer_event` to `self.source_handler.buffer_event` so there is one buffer of record. The dead-code option is preferable — the trip-wire is the bug.
+
+### Low
+
+#### R-40 — `SyncNack::BadRange` retry can thrash without making progress
+- **File:** `src/adapter/net/redex/replication_runtime.rs:948` (NACK handler); contrast **R-23** (NACK trust) and **R-28** (catchup busy-loop on phantom tail).
+- **What:** On `BadRange`, the runtime calls `inputs.file.skip_to(msg.since_seq.saturating_add(1))`. `since_seq` is the *replica's* asked-for seq, not the leader's first-retained seq. If the leader's retention floor is many seqs above `since_seq`, the next `SyncRequest` is still below the floor and NACKs again. The replica's `skip_to` advances by one per round-trip.
+- **Impact:** A replica that fell below retention pins the leader's reject loop until the heartbeat-cycle `SyncResponse` carries `first_seq > local_next` and the `GapBeforeChunk` path catches up. Burns leader CPU + replication-bandwidth budget for no progress; produces high NACK-rate noise on operator dashboards.
+- **Fix sketch:** Extend `SyncNack` with `leader_first_retained_seq`; the replica's `skip_to` jumps directly to it. One-round-trip recovery; cheap wire change. Fold into the same wire-protocol change as R-22/R-23.
+
+#### O-25 — `release_failed_admit` does not refresh cluster backpressure
+- **File:** `src/adapter/net/behavior/meshos/backpressure.rs:210-233`; paired with **O-21** (no idle-tick refresh) and **O-13** (sibling chain-stabilization clear).
+- **What:** A failed dispatch rolls back the per-chain reservation but leaves `cluster_backpressure` asserted. Effective load dropped; daemons stay throttled.
+- **Fix sketch:** Call `update_cluster_backpressure(self.queue_depth.saturating_sub(1), …)` from `release_failed_admit`, or have the executor re-evaluate after the release. Fixing O-21 with a periodic tick subsumes this; if O-21 is deferred, this stands alone.
+
+#### X-21 — `Scheduler::place` LocalPreferred fast-path skips liveness / drained check
+- **File:** `src/adapter/net/compute/scheduler.rs:101-129` (`place`); sibling **X-16** at `:317-341` (`select_migration_target`).
+- **What:** The fast-path `if self.can_run_locally(filter)` only checks `CapabilityFilter::matches(&self.local_caps)`; no liveness, saturation, or drained-state signal. A node mid-shutdown or operator-drained continues to get new daemon placements until the process dies. Same fast-path shape as X-16; both miss the same gate.
+- **Fix sketch:** Gate the LocalPreferred fast-path on a `local_drained.load(Acquire) == false`, or feed local through the same `PlacementFilter::placement_score` machinery and accept the fast-path only when local scores non-`None` and above a floor. Fix together with X-16 for symmetry.
+
+#### X-22 — `on_replay_complete` falls back to synthetic `parent_hash: 0` when the orchestrator is third-party
+- **File:** `src/adapter/net/compute/orchestrator.rs:1458-1496`.
+- **What:** The "real head link" lookup goes through `self.daemon_registry.with_host(daemon_origin, …)` — the *orchestrator's* registry, not the target's. When the orchestrator is neither source nor target (the documented third-party-coordinator topology in the module header), the lookup returns `Err`, and `target_head` is synthesized with `parent_hash: 0`. The `warn!` acknowledges the fallback.
+- **Impact:** Every migration in a coordinator-as-third-party deployment ships a `SuperpositionState::target_head` whose anchor no downstream verifier can reconcile against the real chain. The continuity-proof feature is unusable for the topology its docs describe.
+- **Fix sketch:** Have the target ship its real `head_link` inside `ReplayComplete`'s payload (the target has the live host) so `on_replay_complete` doesn't need a local lookup. Or drop the synthetic-fallback branch and propagate the error so callers explicitly handle the topology mismatch rather than carrying a known-wrong anchor.
+
+---
+
 ## Suggested action order
 
 0. **A-5** (capability strip vs. forward order) — regression in the currently-staged L-13 fix on `bugfixes-15`. Block the commit until the strip moves below the forward block and a multi-hop signed-propagation regression test exists. Cheap fix; expensive miss.
@@ -541,6 +647,9 @@ The four `.expect()`/`unwrap_or` sites in `db.rs` are documented or trivially sa
 18. **Third-pass lows** — **R-36..R-39** (is_stopped race, Drop mutex, Leader disk-pressure signal label, believed_leader tiebreak), **X-14..X-17** (`scale_to` guard, dead `target_head`, scheduler vs `PlacementFilter`, multi-chunk validation asymmetry). Batch into the same cleanup commit as the other lows.
 19. **Fourth-pass mediums** — **MD-1** (federated `drain_rows` unbounded → aggregator OOM) + **O-20** (sequence-counter saturating-add). Each is an isolated change. MD-1 is the user-visible one (peer-controllable response can OOM the local aggregator); add a planner-driven byte budget. O-20 is a two-line trivial saturating swap matching sibling counters.
 20. **Fourth-pass lows + latent** — **MD-2** (window saturating-add near `u64::MAX`) and the four edges under "Fourth-pass edges (not promoted)" batch into a single defensive commit. **MD-3** (unsigned `ContinuationToken`) is a design issue to fix *during* Phase B-4 implementation rather than after; reference this entry from the Phase B-4 plan.
+21. **Fifth-pass highs** — **X-19** (`StandbyGroup::promote` partial-sync double-execution) lands alongside the **X-1** fencing fix; both are silent-corruption bugs in the same file and the regression test for X-1's epoch token should also cover the X-19 replay-filter. **O-21** (cluster-backpressure release never fires while idle) is independent and small — drive the existing snapshot publish tick to also call `update_cluster_backpressure`. **D-17** (heat-emission ordering vs. async sink) is the dataforts analogue of **R-31**; fix both in the same commit by introducing a "candidate / commit" pattern shared between the heat registry and the replication coordinator.
+22. **Fifth-pass mediums** — **D-18** (FS adapter UTF-8 boundary panic) is publisher-controllable and trivial to fix; ship a same-day patch with the `char_indices` fix and the `format!("{}🦀", "a".repeat(255))` unit test. **O-22** (maintenance rank-ladder regression), **O-23** (executor `std::Instant` vs tokio sleep — fold into the same M-4 commit as R-35 and the original bus.rs fix), **O-24** (graceful_shutdown unconditional sleep), and **X-20** (dead `MigrationOrchestrator::buffer_event`) are independent; X-20 should be deletion not redirection.
+23. **Fifth-pass lows** — **R-40** (NACK BadRange thrash) folds into the same wire-protocol change as R-22/R-23. **O-25** (release backpressure refresh) and **X-21** (LocalPreferred liveness) pair with O-21 and X-16 respectively. **X-22** (third-party orchestrator `parent_hash: 0`) is the only stand-alone fifth-pass low; it breaks the continuity-proof feature in exactly the topology its docs describe, so worth lifting to medium if any deployment uses that topology today.
 
 ## Coverage gaps still carried forward
 
