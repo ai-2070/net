@@ -118,8 +118,8 @@ async fn register_and_unregister_round_trip() {
 async fn unregister_preserves_sibling_in_same_wire_bucket() {
     let node = build_node().await;
     // Two canonical hashes whose low 16 bits collide.
-    let canonical_a: u32 = 0xDEAD_BEEF;
-    let canonical_b: u32 = 0xCAFE_BEEF;
+    let canonical_a: u64 = 0x0000_0000_DEAD_BEEF;
+    let canonical_b: u64 = 0x0000_0000_CAFE_BEEF;
     assert_eq!(canonical_a as u16, canonical_b as u16);
     assert_ne!(canonical_a, canonical_b);
 
@@ -160,8 +160,8 @@ async fn unregister_preserves_sibling_in_same_wire_bucket() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unregister_race_does_not_drop_concurrent_sibling_registration() {
     let node = build_node().await;
-    let canonical_a: u32 = 0xAAAA_1234;
-    let canonical_b: u32 = 0xBBBB_1234;
+    let canonical_a: u64 = 0x0000_0000_AAAA_1234;
+    let canonical_b: u64 = 0x0000_0000_BBBB_1234;
     assert_eq!(canonical_a as u16, canonical_b as u16);
 
     // Pin B for the duration of the test.

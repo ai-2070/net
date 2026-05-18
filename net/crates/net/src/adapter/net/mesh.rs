@@ -5363,8 +5363,9 @@ impl MeshNode {
         // origin). Otherwise an arbitrary peer could publish
         // `heat:<any_origin>=0.99` and poison gravity decisions on
         // every other node. Self-announcements (from this node)
-        // skip the filter — we trust our own emit path.
-        let mut ann = ann;
+        // skip the filter — we trust our own emit path. `ann` is
+        // already `mut` at the outer binding (the inbound-metadata
+        // reserved-key strip needed it), so no re-binding required.
         if from_node != ctx.local_node_id {
             Self::filter_unauthorized_heat_tags(&mut ann.capabilities);
         }
@@ -6428,10 +6429,11 @@ impl MeshNode {
     /// are possible but harmless here — streams are opaque u64 to the
     /// transport and have no ACL meaning.
     pub(super) fn publish_stream_id(channel: &ChannelId) -> u64 {
-        // Place channel hash in the low 16 bits; the upper bits stay zero
-        // so that channel-keyed publisher streams don't alias the common
-        // subprotocol range (0x0400..0x0A00).
-        0x0001_0000_0000_0000 | (channel.hash() as u64)
+        // Pack channel hash with the bit-48 discriminator so that
+        // channel-keyed publisher streams don't alias the common
+        // subprotocol range (0x0400..0x0A00). `channel.hash()` is
+        // u64 (per ChannelHash = u64), so no widening cast needed.
+        0x0001_0000_0000_0000 | channel.hash()
     }
 
     /// Send one per-peer leg of a publish. Reuses the same packet-build

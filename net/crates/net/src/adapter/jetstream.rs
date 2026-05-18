@@ -207,10 +207,7 @@ impl JetStreamAdapter {
         let stream = cell
             .get_or_try_init(|| async {
                 let stream_name = self.stream_name(shard_id);
-                let js = self
-                    .jetstream
-                    .as_ref()
-                    .ok_or_else(|| AdapterError::Shutdown)?;
+                let js = self.jetstream.as_ref().ok_or(AdapterError::Shutdown)?;
 
                 // Try to get existing stream first; only create if missing.
                 match js.get_stream(&stream_name).await {

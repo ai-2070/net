@@ -6,18 +6,27 @@
 //! # Safety
 //!
 //! All public FFI functions in this module accept raw pointers from C code.
-//! While they are not marked `unsafe` (to maintain C ABI compatibility),
-//! callers must ensure:
+//! Each is declared `pub unsafe extern "C" fn` so the unsafety is
+//! explicit at the type level; the module-wide contract callers
+//! must uphold is:
 //! - Pointers are valid and properly aligned
 //! - String pointers point to valid UTF-8 data
 //! - Buffer sizes are accurate
 //! - Handles are not used after `net_shutdown`
+//!
+//! The per-function `# Safety` rustdoc is intentionally suppressed
+//! at the module level — every entry point shares the same contract
+//! and the module doc-comment above (plus `include/README.md`) is
+//! the source of truth. Adding individual `# Safety` blocks would
+//! duplicate the same wording 200 times without adding signal.
 //!
 //! # Thread Safety
 //!
 //! All FFI functions are thread-safe. The event bus handle can be shared
 //! across threads.
 //!
+#![allow(clippy::missing_safety_doc)]
+
 //! # Tokio runtime restriction
 //!
 //! Internal FFI ops (`net_poll`, `net_flush`, `net_shutdown`,

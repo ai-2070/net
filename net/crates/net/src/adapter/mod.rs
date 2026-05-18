@@ -74,7 +74,7 @@ pub(crate) fn redact_url(url: &str) -> std::borrow::Cow<'_, str> {
     // Only scan within the authority component — anything past the
     // first '/' (path) or '?' (query) terminates it.
     let authority_end = url[after_scheme..]
-        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .find(['/', '?', '#'])
         .map_or(url.len(), |i| after_scheme + i);
     let authority = &url[after_scheme..authority_end];
     let Some(at_pos) = authority.find('@') else {
