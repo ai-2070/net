@@ -611,6 +611,16 @@ impl PollMerger {
         // alerts with specific Redis / JetStream nodes (parallel
         // to the existing `stalled_shards` field).
         let mut failed_shards: Vec<u16> = Vec::new();
+        // Shards whose `set_checked` cursor write was refused due to
+        // a backend-format change mid-stream. Their fetched events
+        // MUST be dropped from the response and excluded from any
+        // subsequent cursor override; otherwise the caller would
+        // receive events whose cursor never advances, re-fetch the
+        // same events on the next poll, and burn into an infinite
+        // duplicate-delivery loop. Surface them through the same
+        // `failed_shards` channel so operators see the migration.
+        let mut format_refused_shards: std::collections::HashSet<u16> =
+            std::collections::HashSet::new();
         // `new_cursor` (fetched-position tracking) is only consulted on the
         // filter path — building it for unfiltered polls wastes a full
         // HashMap clone plus a `set()` per shard every poll.
@@ -630,13 +640,31 @@ impl PollMerger {
                         next_id,
                         has_more,
                     } = shard_result;
-                    if let (Some(nc), Some(next_id)) = (new_cursor.as_mut(), next_id) {
-                        // Route through set_checked so a mid-stream
-                        // backend migration (JetStream→Redis cursor
-                        // format change) is refused with a loud error
-                        // log rather than silently overwriting the
-                        // format on the cursor.
-                        nc.set_checked(shard_id, &next_id);
+                    // Route through set_checked so a mid-stream
+                    // backend migration (JetStream → Redis cursor
+                    // format change) is refused with a loud error
+                    // log rather than silently overwriting the
+                    // format on the cursor. On refusal, the shard's
+                    // events must not enter the response — otherwise
+                    // the caller would receive events without a
+                    // matching cursor advance and re-fetch them
+                    // forever. Track the refusal and skip merging.
+                    let refused = if let (Some(nc), Some(next_id)) =
+                        (new_cursor.as_mut(), next_id.as_ref())
+                    {
+                        !nc.set_checked(shard_id, next_id)
+                    } else {
+                        false
+                    };
+                    if refused {
+                        format_refused_shards.insert(shard_id);
+                        failed_shards.push(shard_id);
+                        // Drop the shard's events for this poll.
+                        // The error log was emitted inside
+                        // `set_checked`; the operator-facing
+                        // failed_shards entry above is the
+                        // structured signal.
+                        continue;
                     }
                     if has_more {
                         any_has_more = true;
@@ -833,14 +861,37 @@ impl PollMerger {
                     // Same backend-format guard as the Step-1
                     // adapter-cursor write site above. Surfaces a
                     // mid-stream backend migration deterministically
-                    // rather than overwriting silently.
-                    final_cursor.set_checked(event.shard_id, &event.id);
+                    // rather than overwriting silently. If the
+                    // write is refused, surface the shard in
+                    // failed_shards so the caller sees the
+                    // migration as a structured signal rather than
+                    // only as an event-mismatched cursor.
+                    if !final_cursor.set_checked(event.shard_id, &event.id)
+                        && !format_refused_shards.contains(&event.shard_id)
+                    {
+                        format_refused_shards.insert(event.shard_id);
+                        failed_shards.push(event.shard_id);
+                    }
                 }
                 // Else: the adapter's `next_id` (already in
                 // `final_cursor` via the `new_cursor` initial
                 // value) is more advanced than the last matched
                 // event — preserve it.
             }
+        }
+
+        // Drop events for any shard whose Step-1 OR Step-2 cursor
+        // write was refused due to a backend-format mismatch.
+        // Returning these events without a matching cursor advance
+        // would burn the caller into an infinite duplicate-delivery
+        // loop on the next poll. `failed_shards` already carries the
+        // structured signal to the caller.
+        //
+        // No-op when `format_refused_shards` is empty (the common
+        // case), so the retain is a single bool check per event in
+        // the happy path.
+        if !format_refused_shards.is_empty() {
+            all_events.retain(|e| !format_refused_shards.contains(&e.shard_id));
         }
 
         let cursor_advanced = final_cursor.positions != cursor.positions;
@@ -3070,6 +3121,220 @@ mod tests {
         // None (preserving the prior behavior of #50).
         let response_no_cursor = merger.poll(ConsumeRequest::new(100)).await.unwrap();
         assert!(response_no_cursor.next_id.is_none());
+    }
+
+    /// Regression: a shard whose `set_checked` cursor write is refused
+    /// because of a backend-format mismatch (e.g. a JetStream → Redis
+    /// migration mid-stream) must NOT have its events delivered to
+    /// the caller. Pre-fix `nc.set_checked(...)`'s `bool` return was
+    /// discarded — events were merged into the response while the
+    /// cursor stayed pinned at the old format, so every subsequent
+    /// poll re-fetched and re-delivered the same events forever.
+    ///
+    /// Post-fix:
+    ///   - the refused shard's events are dropped from the response,
+    ///   - its id is surfaced in `failed_shards` so the caller sees
+    ///     the migration as a structured signal, and
+    ///   - a shard whose write was accepted is unaffected (events
+    ///     still flow through, cursor still advances).
+    #[tokio::test]
+    async fn refused_set_checked_drops_shard_events_and_surfaces_failure() {
+        // Adapter that ignores `from_id` and always emits the same
+        // events with the same next_id. The test seeds an input
+        // cursor in a different format so set_checked refuses.
+        struct FormatAdapter {
+            events_by_shard: HashMap<u16, Vec<StoredEvent>>,
+        }
+        #[async_trait]
+        impl Adapter for FormatAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                shard_id: u16,
+                _from_id: Option<&str>,
+                _limit: usize,
+            ) -> Result<ShardPollResult, AdapterError> {
+                let events = self
+                    .events_by_shard
+                    .get(&shard_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let next_id = events.last().map(|e| e.id.clone());
+                Ok(ShardPollResult {
+                    events,
+                    next_id,
+                    has_more: false,
+                })
+            }
+            fn name(&self) -> &'static str {
+                "format-adapter"
+            }
+        }
+
+        let mut events_by_shard: HashMap<u16, Vec<StoredEvent>> = HashMap::new();
+        // shard 0 emits Redis-format ids
+        events_by_shard.insert(
+            0,
+            vec![
+                StoredEvent::from_value("1700-0".to_string(), json!({"shard": 0}), 100, 0),
+                StoredEvent::from_value("1701-0".to_string(), json!({"shard": 0}), 101, 0),
+            ],
+        );
+        // shard 1 emits numeric (JetStream-format) ids
+        events_by_shard.insert(
+            1,
+            vec![StoredEvent::from_value("42".to_string(), json!({"shard": 1}), 100, 1)],
+        );
+
+        let adapter: Arc<dyn Adapter> = Arc::new(FormatAdapter { events_by_shard });
+        let merger = PollMerger::new(adapter, vec![0, 1]);
+
+        // Seed the input cursor in the OPPOSITE format for each
+        // shard so set_checked is guaranteed to refuse both writes.
+        // - shard 0 cursor in Numeric format; adapter wants Redis  → refused
+        // - shard 1 cursor in Redis format;   adapter wants Numeric → refused
+        let mut cursor = CompositeCursor::new();
+        cursor.set(0, "41".to_string());
+        cursor.set(1, "1600-0".to_string());
+        let encoded = cursor.encode().unwrap();
+
+        // Use a filter so `new_cursor` is populated (set_checked
+        // path #1 only fires on the filter branch). The filter
+        // matches every event so it doesn't drop them on its own.
+        let mut req = ConsumeRequest::new(10);
+        req.from_id = Some(encoded.clone());
+        // NOT(empty-AND) is a tautology — `Filter::and(vec![])`
+        // matches nothing, so the negation matches everything.
+        // We only need filter=Some(...) so the `new_cursor` clone
+        // is built and the Step-1 set_checked path runs.
+        req.filter = Some(crate::consumer::Filter::not(crate::consumer::Filter::and(
+            Vec::new(),
+        )));
+
+        let response = merger.poll(req).await.unwrap();
+
+        assert!(
+            response.events.is_empty(),
+            "events from refused shards must be dropped; got {} \
+             event(s) — pre-fix this is where the duplicate-delivery \
+             loop began",
+            response.events.len(),
+        );
+        let mut failed = response.failed_shards.clone();
+        failed.sort_unstable();
+        assert_eq!(
+            failed,
+            vec![0u16, 1],
+            "both shards must surface in failed_shards so the caller \
+             sees the backend-format mismatch as a structured signal",
+        );
+    }
+
+    /// Companion: when set_checked is refused for ONE shard but
+    /// accepted for another, only the refused shard is dropped — the
+    /// accepted shard's events flow through normally.
+    #[tokio::test]
+    async fn refused_set_checked_does_not_drop_unaffected_shards() {
+        struct FormatAdapter {
+            events_by_shard: HashMap<u16, Vec<StoredEvent>>,
+        }
+        #[async_trait]
+        impl Adapter for FormatAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                shard_id: u16,
+                _from_id: Option<&str>,
+                _limit: usize,
+            ) -> Result<ShardPollResult, AdapterError> {
+                let events = self
+                    .events_by_shard
+                    .get(&shard_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let next_id = events.last().map(|e| e.id.clone());
+                Ok(ShardPollResult {
+                    events,
+                    next_id,
+                    has_more: false,
+                })
+            }
+            fn name(&self) -> &'static str {
+                "format-adapter-partial"
+            }
+        }
+
+        let mut events_by_shard: HashMap<u16, Vec<StoredEvent>> = HashMap::new();
+        // Both shards emit Redis-format ids on the adapter side.
+        events_by_shard.insert(
+            0,
+            vec![StoredEvent::from_value(
+                "1700-0".to_string(),
+                json!({"shard": 0}),
+                100,
+                0,
+            )],
+        );
+        events_by_shard.insert(
+            1,
+            vec![StoredEvent::from_value(
+                "1700-0".to_string(),
+                json!({"shard": 1}),
+                100,
+                1,
+            )],
+        );
+
+        // Seed cursor: shard 0 in Numeric format (will be refused),
+        // shard 1 in Redis format (will be accepted).
+        let mut cursor = CompositeCursor::new();
+        cursor.set(0, "41".to_string());
+        cursor.set(1, "1600-0".to_string());
+        let encoded = cursor.encode().unwrap();
+
+        let adapter: Arc<dyn Adapter> = Arc::new(FormatAdapter { events_by_shard });
+        let merger = PollMerger::new(adapter, vec![0, 1]);
+        let mut req = ConsumeRequest::new(10);
+        req.from_id = Some(encoded);
+        // NOT(empty-AND) is a tautology — `Filter::and(vec![])`
+        // matches nothing, so the negation matches everything.
+        // We only need filter=Some(...) so the `new_cursor` clone
+        // is built and the Step-1 set_checked path runs.
+        req.filter = Some(crate::consumer::Filter::not(crate::consumer::Filter::and(
+            Vec::new(),
+        )));
+
+        let response = merger.poll(req).await.unwrap();
+
+        assert_eq!(
+            response.events.len(),
+            1,
+            "shard 1's event must still be delivered; shard 0's must be dropped",
+        );
+        assert_eq!(response.events[0].shard_id, 1);
+        assert_eq!(response.failed_shards, vec![0u16]);
     }
 
     /// Regression: BUG_REPORT.md #52 — `sort_by_key(|e| e.insertion_ts)`
