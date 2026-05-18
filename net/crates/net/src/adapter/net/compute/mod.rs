@@ -161,7 +161,7 @@ impl RecoveryRegistry {
         let mut survivors: Vec<RecoveryHandler> = Vec::with_capacity(handlers_to_run.len());
         let mut all = Vec::new();
         for mut h in handlers_to_run {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h()));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut h));
             match result {
                 Ok(recovered) => {
                     all.extend(recovered);

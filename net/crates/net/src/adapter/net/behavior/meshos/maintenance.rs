@@ -101,6 +101,7 @@ impl MaintenanceState {
     /// when the new state is `Active` (the `Recovery → Active`
     /// terminal arc wraps to `0`). Same-position transitions
     /// stay idempotent.
+    #[allow(dead_code)]
     fn rank(&self) -> u8 {
         match self {
             MaintenanceState::Active => 0,

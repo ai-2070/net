@@ -56,8 +56,8 @@ const MAX_PENDING_EVENTS: usize = 1_000_000;
 impl TargetMigrationState {
     /// Insert a pending event after checking the per-daemon byte
     /// + count caps. Caller surfaces `MigrationError::BufferFull`
-    /// to the wire so the source can back off rather than wedging
-    /// the target's RSS.
+    ///   to the wire so the source can back off rather than wedging
+    ///   the target's RSS.
     fn try_insert_pending(&mut self, event: CausalEvent) -> Result<(), MigrationError> {
         let event_bytes = event.payload.len();
         if self.pending_events.len() >= MAX_PENDING_EVENTS
@@ -732,7 +732,6 @@ mod tests {
         assert!(err.to_string().contains("does not match"));
     }
 
-    #[test]
     /// The migration subprotocol is wire-driven: any peer that can
     /// address migration traffic to this node can ship a stream of
     /// non-contiguous CausalEvents that skip `replayed_through + 1`

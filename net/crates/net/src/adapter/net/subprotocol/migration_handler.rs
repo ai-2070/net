@@ -753,7 +753,7 @@ impl MigrationSubprotocolHandler {
                     self.target_handler.orchestrator_node(daemon_origin),
                 ];
                 let known = recorded.iter().any(|p| p.is_some());
-                if known && !recorded.iter().any(|p| *p == Some(from_node)) {
+                if known && !recorded.contains(&Some(from_node)) {
                     return Err(MigrationError::WrongPeer {
                         daemon_origin,
                         from: from_node,

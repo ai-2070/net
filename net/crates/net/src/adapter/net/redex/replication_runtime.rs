@@ -589,6 +589,19 @@ impl Drop for ReplicationRuntimeHandle {
 /// caller (mesh dispatch loop) drops + logs.
 pub const RUNTIME_INBOX_CAPACITY: usize = 1024;
 
+/// Per-channel mutable state the runtime task threads through
+/// `on_tick` / `on_inbound`. Replaces the four-`Arc<Mutex<…>>` arg
+/// soup that pushed those functions over clippy's
+/// `too_many_arguments` limit. All four members are reference-
+/// counted internally so cloning the struct is a handful of
+/// atomic increments — cheap and lock-free.
+struct RuntimeState {
+    tracker: Arc<Mutex<HeartbeatTracker>>,
+    budget: Arc<Mutex<BandwidthBudget>>,
+    backoff: Arc<Mutex<CatchupBackoff>>,
+    outstanding: Arc<Mutex<OutstandingRequests>>,
+}
+
 /// Priority-lane inbox capacity. Smaller than the standard lane
 /// because the events that ride it (Shutdown, SyncResponse,
 /// SyncNack) are bounded by the local replica's in-flight
@@ -631,9 +644,12 @@ pub fn spawn_replication_runtime(
     dispatcher: Arc<dyn ReplicationDispatcher>,
     budget: Arc<Mutex<BandwidthBudget>>,
 ) -> ReplicationRuntimeHandle {
-    let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(inputs.heartbeat_ms)));
-    let backoff = Arc::new(Mutex::new(CatchupBackoff::new()));
-    let outstanding = Arc::new(Mutex::new(OutstandingRequests::new()));
+    let state = RuntimeState {
+        tracker: Arc::new(Mutex::new(HeartbeatTracker::new(inputs.heartbeat_ms))),
+        budget,
+        backoff: Arc::new(Mutex::new(CatchupBackoff::new())),
+        outstanding: Arc::new(Mutex::new(OutstandingRequests::new())),
+    };
     let (tx, rx) = mpsc::channel::<Inbound>(RUNTIME_INBOX_CAPACITY);
     let (priority_tx, priority_rx) = mpsc::channel::<Inbound>(RUNTIME_PRIORITY_INBOX_CAPACITY);
     let coordinator_for_task = coordinator.clone();
@@ -641,10 +657,7 @@ pub fn spawn_replication_runtime(
         inputs,
         coordinator_for_task,
         dispatcher,
-        tracker,
-        budget,
-        backoff,
-        outstanding,
+        state,
         rx,
         priority_rx,
     ));
@@ -661,10 +674,7 @@ async fn run(
     inputs: RuntimeInputs,
     coordinator: Arc<ReplicationCoordinator>,
     dispatcher: Arc<dyn ReplicationDispatcher>,
-    tracker: Arc<Mutex<HeartbeatTracker>>,
-    budget: Arc<Mutex<BandwidthBudget>>,
-    backoff: Arc<Mutex<CatchupBackoff>>,
-    outstanding: Arc<Mutex<OutstandingRequests>>,
+    state: RuntimeState,
     mut inbox: mpsc::Receiver<Inbound>,
     mut priority_inbox: mpsc::Receiver<Inbound>,
 ) {
@@ -700,12 +710,12 @@ async fn run(
                         return;
                     }
                     Some(event) => {
-                        on_inbound(&inputs, &coordinator, &dispatcher, &tracker, &budget, &backoff, &outstanding, event).await;
+                        on_inbound(&inputs, &coordinator, &dispatcher, &state, event).await;
                     }
                 }
             }
             _ = interval.tick() => {
-                on_tick(&inputs, &coordinator, &dispatcher, &tracker, &backoff, &outstanding).await;
+                on_tick(&inputs, &coordinator, &dispatcher, &state).await;
             }
             event = inbox.recv() => {
                 match event {
@@ -723,7 +733,7 @@ async fn run(
                         return;
                     }
                     Some(event) => {
-                        on_inbound(&inputs, &coordinator, &dispatcher, &tracker, &budget, &backoff, &outstanding, event).await;
+                        on_inbound(&inputs, &coordinator, &dispatcher, &state, event).await;
                     }
                 }
             }
@@ -807,10 +817,14 @@ async fn on_tick(
     inputs: &RuntimeInputs,
     coordinator: &Arc<ReplicationCoordinator>,
     dispatcher: &Arc<dyn ReplicationDispatcher>,
-    tracker: &Arc<Mutex<HeartbeatTracker>>,
-    backoff: &Arc<Mutex<CatchupBackoff>>,
-    outstanding: &Arc<Mutex<OutstandingRequests>>,
+    state: &RuntimeState,
 ) {
+    let RuntimeState {
+        tracker,
+        budget: _,
+        backoff,
+        outstanding,
+    } = state;
     // Source `now` from tokio's clock so the silence-detection
     // pass inside the tracker tick honors tokio::time::pause() in
     // tests and stays coherent with the tokio::time::interval that
@@ -1035,16 +1049,20 @@ async fn on_tick(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn on_inbound(
     inputs: &RuntimeInputs,
     coordinator: &Arc<ReplicationCoordinator>,
     dispatcher: &Arc<dyn ReplicationDispatcher>,
-    tracker: &Arc<Mutex<HeartbeatTracker>>,
-    budget: &Arc<Mutex<BandwidthBudget>>,
-    backoff: &Arc<Mutex<CatchupBackoff>>,
-    outstanding: &Arc<Mutex<OutstandingRequests>>,
+    state: &RuntimeState,
     event: Inbound,
 ) {
+    let RuntimeState {
+        tracker,
+        budget,
+        backoff,
+        outstanding,
+    } = state;
     // Peer-auth gate. Every inbound replication message must come
     // from a peer in the channel's configured replica_set; any
     // other sender has no business driving the state machine for
@@ -1395,14 +1413,11 @@ async fn on_inbound(
                             let fresh_window = std::time::Duration::from_millis(
                                 t.heartbeat_ms().saturating_mul(t.miss_threshold() as u64),
                             );
-                            match (peer, lag) {
+                            matches!(
+                                (peer, lag),
                                 (Some(p), Some(elapsed))
-                                    if elapsed < fresh_window && p.tail_seq > new_tail =>
-                                {
-                                    true
-                                }
-                                _ => false,
-                            }
+                                    if elapsed < fresh_window && p.tail_seq > new_tail
+                            )
                         };
                         if strike {
                             backoff.lock().record_empty(from, now);
@@ -1866,6 +1881,23 @@ mod tests {
         Arc::new(Mutex::new(CatchupBackoff::new()))
     }
 
+    /// Bundle the four per-channel state pieces into the
+    /// `RuntimeState` the on_tick / on_inbound functions take.
+    /// Tests construct tracker + budget explicitly; backoff and
+    /// outstanding are stock fresh instances. Pre-refactor these
+    /// were passed as four separate arguments.
+    fn build_state(
+        tracker: Arc<Mutex<HeartbeatTracker>>,
+        budget: Arc<Mutex<BandwidthBudget>>,
+    ) -> RuntimeState {
+        RuntimeState {
+            tracker,
+            budget,
+            backoff: Arc::new(Mutex::new(CatchupBackoff::new())),
+            outstanding: Arc::new(Mutex::new(OutstandingRequests::new())),
+        }
+    }
+
     #[tokio::test]
     async fn leader_emits_heartbeat_to_peers_each_tick() {
         let inputs = build_inputs(0x10, vec![0x10, 0x20, 0x30], 100);
@@ -1996,10 +2028,7 @@ mod tests {
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &tracker,
-            &budget,
-            &build_backoff(),
-            &Arc::new(Mutex::new(OutstandingRequests::new())),
+            &build_state(tracker.clone(), budget.clone()),
             Inbound::Heartbeat {
                 from: 0x20,
                 msg: SyncHeartbeat {
@@ -2055,10 +2084,7 @@ mod tests {
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &tracker,
-            &budget,
-            &build_backoff(),
-            &Arc::new(Mutex::new(OutstandingRequests::new())),
+            &build_state(tracker.clone(), budget.clone()),
             Inbound::Heartbeat {
                 from: 0x20,
                 msg: SyncHeartbeat {
@@ -2314,9 +2340,7 @@ mod tests {
             &inputs,
             &coordinator,
             &dispatcher,
-            &tracker,
-            &build_backoff(),
-            &Arc::new(Mutex::new(OutstandingRequests::new())),
+            &build_state(tracker.clone(), build_budget()),
         )
         .await;
 
@@ -2380,9 +2404,7 @@ mod tests {
             &inputs,
             &coordinator,
             &dispatcher,
-            &tracker,
-            &build_backoff(),
-            &Arc::new(Mutex::new(OutstandingRequests::new())),
+            &build_state(tracker.clone(), build_budget()),
         )
         .await;
         assert_eq!(
@@ -2455,10 +2477,12 @@ mod tests {
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &tracker,
-            &budget,
-            &backoff,
-            &outstanding,
+            &RuntimeState {
+                tracker: tracker.clone(),
+                budget: budget.clone(),
+                backoff: backoff.clone(),
+                outstanding: outstanding.clone(),
+            },
             event,
         )
         .await;
@@ -2491,10 +2515,12 @@ mod tests {
                 &inputs,
                 &coordinator,
                 &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-                &tracker,
-                &budget,
-                &backoff,
-                &outstanding,
+                &RuntimeState {
+                    tracker: tracker.clone(),
+                    budget: budget.clone(),
+                    backoff: backoff.clone(),
+                    outstanding: outstanding.clone(),
+                },
                 event,
             )
             .await;
@@ -3136,14 +3162,12 @@ mod tests {
             )
             .await
             .unwrap();
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
         on_inbound(
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &Arc::new(Mutex::new(HeartbeatTracker::new(100))),
-            &budget,
-            &build_backoff(),
-            &Arc::new(Mutex::new(OutstandingRequests::new())),
+            &build_state(tracker.clone(), budget.clone()),
             event,
         )
         .await;
@@ -3198,14 +3222,12 @@ mod tests {
                 request_id: 0,
             },
         };
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
         on_inbound(
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &Arc::new(Mutex::new(HeartbeatTracker::new(100))),
-            &budget,
-            &build_backoff(),
-            &Arc::new(Mutex::new(OutstandingRequests::new())),
+            &build_state(tracker.clone(), budget.clone()),
             event,
         )
         .await;
@@ -3258,10 +3280,7 @@ mod tests {
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &tracker,
-            &budget,
-            &build_backoff(),
-            &Arc::new(Mutex::new(OutstandingRequests::new())),
+            &build_state(tracker.clone(), budget.clone()),
             event,
         )
         .await;
@@ -3287,10 +3306,7 @@ mod tests {
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &tracker,
-            &budget,
-            &build_backoff(),
-            &Arc::new(Mutex::new(OutstandingRequests::new())),
+            &build_state(tracker.clone(), budget.clone()),
             event,
         )
         .await;
@@ -3340,10 +3356,7 @@ mod tests {
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &tracker,
-            &budget,
-            &build_backoff(),
-            &Arc::new(Mutex::new(OutstandingRequests::new())),
+            &build_state(tracker.clone(), budget.clone()),
             event,
         )
         .await;
@@ -3423,10 +3436,12 @@ mod tests {
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &tracker,
-            &budget,
-            &build_backoff(),
-            &outstanding,
+            &RuntimeState {
+                tracker: tracker.clone(),
+                budget: budget.clone(),
+                backoff: build_backoff(),
+                outstanding: outstanding.clone(),
+            },
             event,
         )
         .await;
@@ -3489,10 +3504,12 @@ mod tests {
             &inputs,
             &coordinator,
             &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
-            &tracker,
-            &budget,
-            &build_backoff(),
-            &outstanding,
+            &RuntimeState {
+                tracker: tracker.clone(),
+                budget: budget.clone(),
+                backoff: build_backoff(),
+                outstanding: outstanding.clone(),
+            },
             event,
         )
         .await;

@@ -349,7 +349,7 @@ impl HeatRegistry {
         // explicit comparator is more obviously robust to a future
         // refactor that swaps in `<=` elsewhere.
         self.counters
-            .retain(|_, c| !(c.rate <= 0.0 && c.last_emitted.map_or(false, |v| v <= 0.0)));
+            .retain(|_, c| !(c.rate <= 0.0 && c.last_emitted.is_some_and(|v| v <= 0.0)));
     }
 }
 
@@ -563,7 +563,7 @@ impl BlobHeatRegistry {
         // a manual `rollback_emission` cleared the stale marker.
         let mut pruned: Vec<[u8; 32]> = Vec::new();
         self.counters.retain(|hash, c| {
-            let keep = !(c.rate <= 0.0 && c.last_emitted.map_or(false, |v| v <= 0.0));
+            let keep = !(c.rate <= 0.0 && c.last_emitted.is_some_and(|v| v <= 0.0));
             if !keep {
                 pruned.push(*hash);
             }

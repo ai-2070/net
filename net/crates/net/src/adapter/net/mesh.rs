@@ -127,6 +127,39 @@ fn graph_id_to_node_id(graph_id: &[u8; 32]) -> u64 {
 /// as if the network link is severed.
 pub type PartitionFilter = Arc<dashmap::DashSet<SocketAddr>>;
 
+/// Waiter map for incoming `PunchIntroduce` messages keyed by the
+/// counterpart endpoint's `node_id`. Value is `(generation,
+/// expected coordinator node id, oneshot sender)`. Used by the
+/// rendezvous-coordinated punch flow to bind introduce delivery
+/// to the relay the local node sent `PunchRequest` to.
+#[cfg(feature = "nat-traversal")]
+type PendingPunchIntroduces = Arc<
+    DashMap<
+        u64,
+        (
+            u64,
+            u64,
+            oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>,
+        ),
+    >,
+>;
+
+/// Waiter map for incoming `PunchAck` messages keyed by the sender
+/// endpoint's `node_id`. Value is `(generation, expected coordinator
+/// node id, oneshot sender)`. Used by `connect_direct`'s
+/// `SinglePunch` path to confirm the counterpart's side of the punch.
+#[cfg(feature = "nat-traversal")]
+type PendingPunchAcks = Arc<
+    DashMap<
+        u64,
+        (
+            u64,
+            u64,
+            oneshot::Sender<super::traversal::rendezvous::PunchAck>,
+        ),
+    >,
+>;
+
 /// Cancellation-safe rollback for a freshly registered peer
 /// session + addr map + routing entry.
 ///
@@ -389,16 +422,7 @@ struct DispatchCtx {
     /// for any in-flight target and steer the local node's punch
     /// flow at an attacker-chosen reflex address.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_introduces: Arc<
-        DashMap<
-            u64,
-            (
-                u64,
-                u64,
-                tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>,
-            ),
-        >,
-    >,
+    pending_punch_introduces: PendingPunchIntroduces,
     /// Waiters for incoming `PunchAck` messages, keyed by the
     /// sender's `node_id` (the `from_peer` field in the ack).
     /// `connect_direct`'s `SinglePunch` path awaits on this map
@@ -411,16 +435,7 @@ struct DispatchCtx {
     /// the local node's connect_direct future with attacker-chosen
     /// payload.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_acks: Arc<
-        DashMap<
-            u64,
-            (
-                u64,
-                u64,
-                tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchAck>,
-            ),
-        >,
-    >,
+    pending_punch_acks: PendingPunchAcks,
     /// Keep-alive observers, keyed by the `SocketAddr` of the
     /// counterpart's `peer_reflex`. Fired by the receive loop
     /// when a matching `Keepalive`-formatted packet arrives;
@@ -1279,32 +1294,14 @@ pub struct MeshNode {
     /// observe an introduce install an entry here via the
     /// stage-3c surface before calling the coordinator.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_introduces: Arc<
-        DashMap<
-            u64,
-            (
-                u64,
-                u64,
-                oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>,
-            ),
-        >,
-    >,
+    pending_punch_introduces: PendingPunchIntroduces,
     /// In-flight punch acknowledgements keyed by the *sender*
     /// endpoint's `node_id` — i.e. the `from_peer` field on the
     /// arriving `PunchAck`. `connect_direct` awaits this map on
     /// the `SinglePunch` path so `punches_succeeded` only bumps
     /// when the peer actually confirmed the punch.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_acks: Arc<
-        DashMap<
-            u64,
-            (
-                u64,
-                u64,
-                oneshot::Sender<super::traversal::rendezvous::PunchAck>,
-            ),
-        >,
-    >,
+    pending_punch_acks: PendingPunchAcks,
     /// Monotonic counter for waiter generations used by the
     /// three `pending_*` maps above. Each insert stamps its
     /// entry with a unique `gen`; removal is a `remove_if` check

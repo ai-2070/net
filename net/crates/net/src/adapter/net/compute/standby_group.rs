@@ -2208,7 +2208,7 @@ mod tests {
 
         let recovered = group.try_recover(&sched, &reg, &|| Box::new(StatefulDaemon::new()));
         assert!(
-            !recovered.iter().any(|i| *i == active_index),
+            !recovered.contains(&active_index),
             "try_recover must NOT include the active index in the recovered set",
         );
 
@@ -2312,10 +2312,7 @@ mod tests {
 
         assert!(group.has_unhealthy_slots(), "standby slot is recoverable");
         let recovered = group.try_recover(&sched, &reg, &|| Box::new(StatefulDaemon::new()));
-        assert!(
-            !recovered.iter().any(|i| *i == active_index),
-            "active still skipped",
-        );
+        assert!(!recovered.contains(&active_index), "active still skipped",);
         assert_eq!(
             group.active_origin(),
             active_origin_before,
