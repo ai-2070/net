@@ -354,6 +354,15 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
     /// closes (the loop dropped its sender) or the inner
     /// dispatcher panics. Returns the accumulated stats.
     pub async fn run(mut self) -> Arc<ExecutorStats> {
+        // Periodic idle tick. The cluster-backpressure release
+        // edge only fires inside `handle_one_retry`, so a queue
+        // that drains below the low-water mark while no fresh
+        // action arrives would otherwise leave daemons throttled
+        // forever in a quiet steady-state cluster. The tick polls
+        // the live queue depth on every 100 ms boundary so the
+        // release surfaces independently of incoming actions.
+        let mut idle_tick = tokio::time::interval(Duration::from_millis(100));
+        idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let next_deadline = self.deferred.peek().map(|e| e.retry_at);
             tokio::select! {
@@ -366,9 +375,38 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                     let due = self.deferred.pop().expect("deferred heap non-empty");
                     self.handle_one_retry(due.action, due.defer_count).await;
                 }
+                _ = idle_tick.tick() => {
+                    self.poll_cluster_backpressure();
+                }
             }
         }
         Arc::clone(&self.stats)
+    }
+
+    /// Re-evaluate the cluster-backpressure hysteresis with the
+    /// current live queue depth, without consuming an action.
+    /// Used by the idle tick and the post-release path so the
+    /// `Released` edge fires even with zero in-flight actions.
+    /// Pre-fix `update_cluster_backpressure` had only one
+    /// non-test caller (inside `handle_one_retry`); a queue that
+    /// drained below the low-water mark while no fresh action
+    /// arrived left daemons throttled indefinitely.
+    fn poll_cluster_backpressure(&mut self) {
+        let depth = self.actions_rx.len() + self.deferred.len();
+        let change = self
+            .backpressure
+            .update_cluster_backpressure(depth, &self.config.backpressure);
+        match change {
+            ClusterBackpressureChange::Asserted => {
+                ExecutorStats::inc(&self.stats.cluster_backpressure_asserts);
+                self.dispatcher.on_cluster_backpressure(change);
+            }
+            ClusterBackpressureChange::Released => {
+                ExecutorStats::inc(&self.stats.cluster_backpressure_releases);
+                self.dispatcher.on_cluster_backpressure(change);
+            }
+            ClusterBackpressureChange::Steady => {}
+        }
     }
 
     async fn handle_one(&mut self, action: PendingAction) {
@@ -488,6 +526,12 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
                 // gated by a side effect that never occurred.
                 self.backpressure
                     .release_failed_admit(action.id, &action.action);
+                // Refresh cluster-backpressure: the release just
+                // dropped one in-flight action's reservation, so a
+                // queue that was hovering near the release water
+                // mark should surface that edge here rather than
+                // wait for the next idle tick.
+                self.poll_cluster_backpressure();
                 let _ = admit_anchor;
                 if let Some(after) = err.retry_after {
                     // Dispatch-error retries share the
