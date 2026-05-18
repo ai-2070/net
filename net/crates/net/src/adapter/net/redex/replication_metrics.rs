@@ -211,24 +211,42 @@ impl ReplicationMetricsRegistry {
     /// Channels past [`MAX_TRACKED_CHANNELS`] fold into the
     /// `__overflow__` bucket.
     pub fn for_channel(&self, channel: &str) -> Arc<ChannelMetricsAtomic> {
+        // Fast path for the common case — channel already tracked.
         if let Some(m) = self.channels.get(channel) {
             return m.clone();
         }
-        // Cap check BEFORE the entry-API insert: if we're at the
-        // limit, fold this call into the overflow bucket. The
-        // overflow bucket itself counts as one slot and is created
-        // lazily on first overflow — net: at most cap+1 entries.
-        if self.channels.len() >= MAX_TRACKED_CHANNELS && !self.channels.contains_key(channel) {
+        // Speculative insert via the entry API (atomic under
+        // dashmap's per-shard write lock). Pre-fix the path was
+        // `len() < cap` → `contains_key` → `entry().or_insert_with`:
+        // two concurrent callers with the map at `cap - 1` both
+        // passed the `len()` check, both probed, both inserted —
+        // exceeding the cardinality bomb defense by the number of
+        // racers. The entry API's atomic insert lets us post-check
+        // and undo our overflow contribution.
+        //
+        // The clone-and-drop pattern releases the dashmap shard
+        // write lock BEFORE we call `self.channels.len()` — len
+        // walks every shard and would deadlock against our held
+        // shard lock if we kept the entry alive across the call.
+        let metrics = self
+            .channels
+            .entry(channel.to_string())
+            .or_insert_with(|| Arc::new(ChannelMetricsAtomic::new()))
+            .clone();
+        if self.channels.len() > MAX_TRACKED_CHANNELS {
+            // Our insert pushed us over the cap. Remove the
+            // speculative entry (idempotent if a concurrent caller
+            // already pruned it) and fall through to the overflow
+            // bucket. Convergence is at most `cap + 1` because the
+            // overflow bucket itself counts as a slot.
+            self.channels.remove(channel);
             return self
                 .channels
                 .entry(OVERFLOW_CHANNEL_LABEL.to_string())
                 .or_insert_with(|| Arc::new(ChannelMetricsAtomic::new()))
                 .clone();
         }
-        self.channels
-            .entry(channel.to_string())
-            .or_insert_with(|| Arc::new(ChannelMetricsAtomic::new()))
-            .clone()
+        metrics
     }
 
     /// Read-only snapshot — copies the atomic counters into plain
@@ -594,6 +612,50 @@ mod tests {
         // Original channels still tracked under their own keys.
         let original = snap.channel("channel-0").expect("channel-0 row");
         assert_eq!(original.leader_changes_total, 0);
+    }
+
+    /// Concurrent callers racing on for_channel near the cap
+    /// must not exceed `cap + 1` (cap plus the overflow bucket
+    /// itself). Pre-fix the path was len < cap → contains_key →
+    /// entry().or_insert_with: two callers both passed len check,
+    /// both inserted, net cardinality `cap + N` for N racers.
+    /// Post-fix the speculative insert + post-cap check undoes
+    /// our overflow contribution so convergence is bounded.
+    #[test]
+    fn concurrent_inserts_at_cap_converge_within_one_extra_slot() {
+        use std::sync::Arc as StdArc;
+        use std::sync::Barrier;
+        use std::thread;
+        let reg = StdArc::new(ReplicationMetricsRegistry::new());
+        // Fill to one below the cap.
+        for i in 0..MAX_TRACKED_CHANNELS - 1 {
+            reg.for_channel(&format!("seed-{i}"));
+        }
+        // Race N threads each inserting a distinct channel into
+        // the last cap-1 → cap+N window.
+        let racers = 8;
+        let barrier = StdArc::new(Barrier::new(racers));
+        let mut handles = Vec::with_capacity(racers);
+        for t in 0..racers {
+            let reg = StdArc::clone(&reg);
+            let barrier = StdArc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                reg.for_channel(&format!("racer-{t}"));
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // The map must hold at most MAX_TRACKED_CHANNELS + 1
+        // entries (cap real channels + the overflow bucket).
+        // Pre-fix this exceeded the cap by N for N racers.
+        assert!(
+            reg.len() <= MAX_TRACKED_CHANNELS + 1,
+            "racers blew the cap: len = {}, expected <= {}",
+            reg.len(),
+            MAX_TRACKED_CHANNELS + 1,
+        );
     }
 
     #[test]
