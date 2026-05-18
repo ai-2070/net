@@ -377,8 +377,25 @@ impl MigrationTargetHandler {
     pub fn activate(&self, daemon_origin: u64) -> Result<u64, MigrationError> {
         if let Some(entry) = self.migrations.get(&daemon_origin) {
             let mut state = entry.lock();
-            state.phase = MigrationPhase::Cutover;
+            // Drain first; only flip to Cutover on success.
+            //
+            // Pre-fix the phase was flipped before `drain_pending`. A
+            // mid-batch delivery failure left the state in `Cutover`
+            // with the undelivered tail restored to `pending_events`
+            // — but both `replay_events` and `buffer_event` reject in
+            // `Cutover`, so no new wire-arriving events could push the
+            // drain along. The only path that re-drained was a
+            // retried `ActivateTarget`, which still worked because
+            // `activate` itself does not reject in `Cutover`; the
+            // hazard was that any *new* source-side event in flight
+            // when activate first ran (e.g. a re-sent BufferedEvents
+            // batch the source emitted before observing the cutover
+            // ack) was dropped on arrival rather than absorbed into
+            // pending_events. Holding off the phase flip until drain
+            // succeeds keeps the absorb-then-drain window open across
+            // a transient delivery failure.
             self.drain_pending(&mut state)?;
+            state.phase = MigrationPhase::Cutover;
             return Ok(state.replayed_through);
         }
         if let Some(done) = self.completed.get(&daemon_origin) {
@@ -1619,5 +1636,130 @@ mod tests {
              (seq 3, 4, 5). Anything more means the already-delivered \
              prefix (seq 1, 2) was redelivered — duplicate-delivery hazard"
         );
+    }
+
+    /// Regression: `activate` must not flip `MigrationPhase::Cutover`
+    /// until `drain_pending` actually succeeds. Pre-fix, the phase was
+    /// flipped before drain ran — a mid-batch delivery failure left
+    /// the state in `Cutover` with the undelivered tail restored to
+    /// `pending_events`. Both `buffer_event` and `replay_events`
+    /// reject in `Cutover`, so any *new* source-side event arriving
+    /// in the gap between the failed activate and the eventual retry
+    /// was silently dropped on arrival, never absorbed into pending.
+    ///
+    /// Post-fix: a failed activate leaves the state in `Replay`, so
+    /// late-arriving wire events still flow into `pending_events` and
+    /// the next activate retry drains them all.
+    #[test]
+    fn activate_keeps_replay_phase_on_drain_failure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Daemon that fails until `ok` is flipped to true. Lets the
+        // test arrange "drain fails, then we add more events, then
+        // drain succeeds" deterministically.
+        struct FailUntilFlipped {
+            ok: Arc<AtomicBool>,
+            state: u64,
+        }
+        impl MeshDaemon for FailUntilFlipped {
+            fn name(&self) -> &str {
+                "fail-until-flipped"
+            }
+            fn requirements(&self) -> CapabilityFilter {
+                CapabilityFilter::default()
+            }
+            fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+                if !self.ok.load(Ordering::SeqCst) {
+                    return Err(DaemonError::ProcessFailed("blocked".into()));
+                }
+                self.state += 1;
+                Ok(vec![])
+            }
+            fn snapshot(&self) -> Option<Bytes> {
+                Some(Bytes::from(self.state.to_le_bytes().to_vec()))
+            }
+            fn restore(&mut self, state: Bytes) -> Result<(), DaemonError> {
+                self.state = u64::from_le_bytes(state[..8].try_into().unwrap());
+                Ok(())
+            }
+        }
+
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+        let snapshot = make_snapshot(&kp, 0, 0);
+        let ok = Arc::new(AtomicBool::new(false));
+
+        let ok_for_factory = ok.clone();
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                move || {
+                    Box::new(FailUntilFlipped {
+                        ok: ok_for_factory.clone(),
+                        state: 0,
+                    })
+                },
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+
+        // Seed pending with contiguous seq 1..=3. Daemon is still in
+        // fail mode, so every buffer_event triggers drain → fail.
+        for seq in 1..=3 {
+            let _ = handler.buffer_event(origin, make_event(0xBBBB, seq));
+        }
+        assert_eq!(handler.replayed_through(origin), Some(0));
+
+        // Activate while daemon still fails — drain fails mid-batch.
+        let err = handler.activate(origin).unwrap_err();
+        assert!(
+            err.to_string().contains("blocked"),
+            "expected the simulated process() failure, got: {err}"
+        );
+        // Pre-fix the phase was flipped to Cutover before drain ran;
+        // post-fix it stays in Replay because activate sets Cutover
+        // only on a successful drain. We verify the post-fix invariant
+        // through behaviour, not by reading state.phase directly:
+        // a NEW buffer_event in this window must reach pending_events
+        // (Cutover would have returned Ok(false), silently dropping
+        // the event before insert).
+        //
+        // `buffer_event` may surface the same blocked-daemon error
+        // because its own drain still runs and still fails; what we
+        // care about is whether `try_insert_pending` ran (which the
+        // pre-fix Cutover branch skipped). The retry below proves it
+        // by drainING through seq 4 on the post-fix path and only
+        // through seq 3 on the pre-fix path.
+        let late_event_result = handler.buffer_event(origin, make_event(0xBBBB, 4));
+        match late_event_result {
+            Ok(true) | Err(_) => { /* event was inserted; drain may or may not have failed */ }
+            Ok(false) => panic!(
+                "post-fix: buffer_event in the activate-failed window must NOT \
+                 silently drop the event as Ok(false) — that is the Cutover-set-\
+                 too-early bug this test pins"
+            ),
+        }
+
+        // Flip the daemon to OK and retry activate. The drain now
+        // succeeds and Cutover is finally set; replayed_through covers
+        // every event including the late seq 4 that arrived after the
+        // failed activate.
+        ok.store(true, Ordering::SeqCst);
+        let replayed = handler.activate(origin).expect("retry activate succeeds");
+        assert_eq!(
+            replayed, 4,
+            "retried activate must drain the full tail (1..=4), \
+             including the late seq 4 buffered after the first failure; \
+             pre-fix this would be 3, with seq 4 silently lost",
+        );
+        assert_eq!(handler.replayed_through(origin), Some(4));
     }
 }
