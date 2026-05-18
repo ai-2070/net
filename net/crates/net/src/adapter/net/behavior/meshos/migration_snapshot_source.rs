@@ -48,14 +48,40 @@ impl MigrationSnapshotSource for NoOpMigrationSnapshotSource {
 /// translates each in-flight migration into a wire-form
 /// [`MigrationSnapshot`] for the snapshot's
 /// `in_flight_migrations` field.
+///
+/// Optionally wraps a
+/// [`crate::adapter::net::compute::MigrationSourceHandler`] so
+/// the `buffered_events` field reflects the source-side queue
+/// depth instead of a hardcoded `0`. Without the handler,
+/// snapshot consumers (the ICE simulator's blast-radius
+/// projection, operator dashboards) see `buffered_events=0` for
+/// every migration regardless of actual queue pressure.
 pub struct OrchestratorMigrationSnapshotSource {
     orchestrator: Arc<crate::adapter::net::compute::MigrationOrchestrator>,
+    source_handler:
+        Option<Arc<crate::adapter::net::compute::MigrationSourceHandler>>,
 }
 
 impl OrchestratorMigrationSnapshotSource {
-    /// Wrap an orchestrator.
+    /// Wrap an orchestrator. `buffered_events` will read 0 on
+    /// every migration unless [`Self::with_source_handler`] is
+    /// chained.
     pub fn new(orchestrator: Arc<crate::adapter::net::compute::MigrationOrchestrator>) -> Self {
-        Self { orchestrator }
+        Self {
+            orchestrator,
+            source_handler: None,
+        }
+    }
+
+    /// Attach the local source handler so per-origin buffered
+    /// event counts are surfaced truthfully on the snapshot.
+    #[must_use]
+    pub fn with_source_handler(
+        mut self,
+        handler: Arc<crate::adapter::net::compute::MigrationSourceHandler>,
+    ) -> Self {
+        self.source_handler = Some(handler);
+        self
     }
 }
 
@@ -66,6 +92,11 @@ impl MigrationSnapshotSource for OrchestratorMigrationSnapshotSource {
             .into_iter()
             .map(|item| {
                 let phase = MigrationPhaseSnapshot::from(item.phase);
+                let buffered_events = self
+                    .source_handler
+                    .as_ref()
+                    .and_then(|sh| sh.buffered_event_count(item.daemon_origin))
+                    .unwrap_or(0) as u32;
                 MigrationSnapshot {
                     daemon_origin: item.daemon_origin,
                     phase,
@@ -76,12 +107,7 @@ impl MigrationSnapshotSource for OrchestratorMigrationSnapshotSource {
                     snapshot_bytes: item.snapshot_bytes,
                     retries: item.retries,
                     progress_pct: phase_progress_pct(phase),
-                    // Orchestrator no longer tracks a buffer of its
-                    // own (it never did in production — source-side
-                    // buffering happens at MigrationSourceHandler).
-                    // The wire field is kept for back-compat on
-                    // existing snapshots; new writes are always 0.
-                    buffered_events: 0,
+                    buffered_events,
                 }
             })
             .collect()

@@ -395,6 +395,16 @@ impl MigrationSourceHandler {
     pub fn active_count(&self) -> usize {
         self.migrations.len()
     }
+
+    /// Currently-buffered event count for `daemon_origin`'s active
+    /// migration, if one exists. Used by snapshot-source adapters
+    /// to populate `MigrationSnapshot::buffered_events` truthfully
+    /// instead of hardcoding `0`.
+    pub fn buffered_event_count(&self, daemon_origin: u64) -> Option<usize> {
+        self.migrations
+            .get(&daemon_origin)
+            .map(|e| e.lock().buffered_events.len())
+    }
 }
 
 impl std::fmt::Debug for MigrationSourceHandler {
