@@ -241,16 +241,19 @@ fixed; commits are on the `bugfixes-15` branch.
 | L-15 (TokenCache subject re-check) | ✅ fixed | `1fc8bf1c` |
 | L-18 (JetStream 2× wall-clock doc) | ✅ fixed | `2955aa08` |
 | L-19 (credential log redaction) | ✅ fixed | `b87cb309` |
-| **L-3, L-7, L-13, L-14, L-16, L-17** | **deferred** | see below |
+| L-3 (FFI fn `unsafe extern "C"` style sweep) | ✅ fixed | `f71cfa87` |
+| L-7 (bus/shard F-5..F-8 doc'd invariants) | ✅ fixed | `fff88b74` |
+| L-13 (inbound metadata reserved-key filter) | ✅ fixed | `d30b316b` |
+| L-14 (ChannelName rejects ASCII uppercase) | ✅ fixed | `34ab95bb` |
+| L-16 (TokenCache configurable clock-skew) | ✅ fixed | `0610c036` |
+| L-17 (TokenCache wildcard fast path) | ✅ fixed | `7e8c1767` |
 
-**Deferred, with rationale:**
+**All 19 lows fixed.** Decisions made along the way:
 
-- **L-3** (`blob.rs` uses `pub unsafe extern "C" fn`; sibling modules use plain `pub extern "C" fn`): pure style. The 2024-edition-accurate direction is to add `unsafe` everywhere — that's a 200-entry-point sweep across `ffi/mesh.rs`, `ffi/cortex.rs`, etc., not a one-file fix. Defer to a dedicated normalization pass.
-- **L-7** (bus/shard F-5..F-8 subtleties — publish-then-spawn ordering, lossy-shutdown reconciliation off-by-one, transient `events_dropped` overcount during `DropOldest`, `collect_and_reset` cross-field non-atomicity): the bus/shard reviewer concluded each is not reachable as a production bug today. Worth tightening if the surrounding code is touched, but no concrete fix without a behavior change.
-- **L-13** (capability `with_metadata` exact-match reserved keys writable from inbound peers): real behavior change. Filtering reserved keys from inbound deserialization could break operators who legitimately publish them today. Needs a policy decision (substrate-only? per-key allowlist?) before code.
-- **L-14** (`ChannelName::new` admits case-folded duplicates: `foo.bar` and `FOO.BAR` hash differently): real behavior change. Lowercasing on construction breaks every test fixture that asserts exact-case channel names, plus existing-deployment channel identifiers. Needs a policy decision (lowercase-on-construction vs reject mixed-case vs accept as-is) before code.
-- **L-16** (no clock-skew tolerance in `PermissionToken::is_valid`): real behavior change. Adding a `CLOCK_SKEW_TOLERANCE_SECS` window relaxes expiry — a peer with a slow clock starts honouring tokens the rest of the mesh treats as expired. The right value is operationally specific (typically 30-60 s for NTP-synced fleets; longer for edge deployments). Needs a config knob added with sensible defaults; deferred for that design.
-- **L-17** (capability wildcard-slot scan is `O(slot_size)` per check): pure perf, not correctness. The wildcard fallback walks up to `MAX_TOKENS_PER_SLOT = 32` entries on every cache miss. The agent's suggested cache (a per-slot "any token here has WILDCARD" bool) is an internal optimization with no behavior change; deferred to a perf-focused commit rather than mixed into a bug-fix sprint.
+- **L-14** rejects mixed-case at construction (loud diagnostic) rather than silently lowercasing — operators reading back `as_str()` get an honest answer about what was stored.
+- **L-16** lives on `TokenCache` as a per-cache opt-in (default 0 = strict) rather than on `PermissionToken::is_valid` directly — that preserves the strict expiry contract for FFI / UI callers and lets operators dial skew per-deployment via `TokenCache::with_clock_skew(secs)`. The recommended production value is `TOKEN_CLOCK_SKEW_SECS_RECOMMENDED = 60`.
+- **L-13** strips reserved metadata keys post-signature-verify (the verify transcript stays intact) and post-entity-binding — peers can't steer the receiver's greedy-admission decisions, local-self announcements still emit the keys normally.
+- **L-7** added doc-comments at each surfaced site rather than mechanical refactors: each finding was judged not-reachable as a production bug, but the invariant is now written down at the call site so a future refactor can't accidentally break it without seeing the rationale.
 
 Regression tests were added inline where a meaningful assertion could
 be made at unit-test scale: the metrics-collector wiring, the FFI
