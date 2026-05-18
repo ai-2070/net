@@ -1,0 +1,37 @@
+net/crates/net/src/adapter/net/compute/fork_group.rs
+  s_aa8bb6e2c88c9e::t_3ed3b708d35f34 161,464
+  s_aa8bb6e2c88c9e::t_cfa5ddc3319f7d 807-813
+  s_aa8bb6e2c88c9e::t_65908ffa89613e 84-88
+  s_aa8bb6e2c88c9e::t_0467713f8f6891 170-176
+net/crates/net/src/adapter/net/compute/replica_group.rs
+  s_aa8bb6e2c88c9e::t_23f06a86d403c1 667-671
+  s_aa8bb6e2c88c9e::t_d30fcd55add41f 94-98
+  s_aa8bb6e2c88c9e::t_41432b95fef63b 163-169
+  s_aa8bb6e2c88c9e::t_adcdd803f81be5 154,399
+net/crates/net/src/adapter/net/compute/standby_group.rs
+  s_aa8bb6e2c88c9e::t_b1ba65db5c4af1 616
+  s_aa8bb6e2c88c9e::t_d237b228c72cb4 388-397
+  s_aa8bb6e2c88c9e::t_33fc00775221cf 723-724
+  s_aa8bb6e2c88c9e::t_bfc5582cdffae7 188-190,194-200
+  s_aa8bb6e2c88c9e::t_56c388f8784e08 99-108
+  s_aa8bb6e2c88c9e::t_5884a65859af0a 1355-1387
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_18_CARRIED_FORWARD.md
+  s_aa8bb6e2c88c9e::t_b1febd1560426f 151
+  s_aa8bb6e2c88c9e::t_b78b0fd75e1cff 155-157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "aab6b4736f2b92c61d8923cfa148cee736ad4d26",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
