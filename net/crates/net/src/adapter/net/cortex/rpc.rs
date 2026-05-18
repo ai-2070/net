@@ -73,6 +73,33 @@ pub const DISPATCH_RPC_DEADLINE_EXCEEDED: u8 = 0x13;
 /// Phase 3.
 pub const DISPATCH_RPC_STREAM_GRANT: u8 = 0x14;
 
+/// Caller → server. Continuation chunk of a client-streaming or
+/// duplex REQUEST. Carries an [`RpcRequestChunkPayload`] after the
+/// `EventMeta` prefix. `EventMeta::seq_or_ts` matches the initial
+/// REQUEST's `call_id`. Non-terminal chunks have
+/// `flags & FLAG_RPC_REQUEST_END == 0`; the terminal upload chunk
+/// sets [`FLAG_RPC_REQUEST_END`].
+///
+/// Only meaningful for calls whose initial REQUEST set
+/// [`FLAG_RPC_CLIENT_STREAMING_REQUEST`]; otherwise the server
+/// silently drops the chunk (caller bug; no observable effect).
+pub const DISPATCH_RPC_REQUEST_CHUNK: u8 = 0x15;
+
+/// Server → caller. Request-direction stream-credit grant. Mirror
+/// of [`DISPATCH_RPC_STREAM_GRANT`] for the upload direction.
+/// Carries an [`RpcRequestGrantPayload`] after `EventMeta`: a
+/// `call_id` plus a `u32` credit count. `EventMeta::seq_or_ts`
+/// matches the call's `call_id` (redundant with the payload, but
+/// kept symmetric with the rest of the dispatch family).
+///
+/// Only meaningful when the caller opted into request-direction
+/// flow control via the `nrpc-request-window-initial` header
+/// ([`HEADER_NRPC_REQUEST_WINDOW_INITIAL`]). Caller's sink
+/// awaits one credit per `REQUEST_CHUNK`; absent header →
+/// unbounded credit (sink emits as fast as the publish path can
+/// take it).
+pub const DISPATCH_RPC_REQUEST_GRANT: u8 = 0x16;
+
 // ============================================================================
 // `RpcRequestPayload::flags` bit assignments.
 // ============================================================================
@@ -97,7 +124,36 @@ pub const FLAG_RPC_STREAMING_RESPONSE: u16 = 1 << 1;
 /// span emission. Phase 3.
 pub const FLAG_RPC_PROPAGATE_TRACE: u16 = 1 << 2;
 
-// Bits `3..=15` reserved; producers MUST write zero, consumers MUST
+// Bit `1 << 3` reserved — symmetric to the reserved bit 0 above,
+// kept as breathing room for a future protocol-level flag without
+// pushing every existing live bit.
+
+/// Set on the initial REQUEST if the caller will follow up with
+/// one or more [`DISPATCH_RPC_REQUEST_CHUNK`] events. Distinguishes
+/// client-streaming / duplex calls from unary at the very first
+/// frame so the server's fold knows to open a request-side stream
+/// instead of treating the REQUEST as complete.
+///
+/// Combined with [`FLAG_RPC_STREAMING_RESPONSE`] on the same
+/// REQUEST: full duplex.
+///
+/// Bidi streaming plan (Phase A).
+pub const FLAG_RPC_CLIENT_STREAMING_REQUEST: u16 = 1 << 4;
+
+/// Set on a [`DISPATCH_RPC_REQUEST_CHUNK`] (or on the initial
+/// REQUEST itself) to signal the terminal upload frame for a
+/// client-streaming or duplex call. After receiving this, the
+/// server's request-side stream yields `None` and the handler
+/// proceeds to its terminal response.
+///
+/// Setting this on the initial REQUEST is the degenerate "client-
+/// streaming with exactly one item" path — saves a round-trip
+/// for the trivial case.
+///
+/// Bidi streaming plan (Phase A).
+pub const FLAG_RPC_REQUEST_END: u16 = 1 << 5;
+
+// Bits `6..=15` reserved; producers MUST write zero, consumers MUST
 // ignore unknown bits (forward-compat with future flags).
 
 // ============================================================================
@@ -247,6 +303,65 @@ pub struct RpcRequestPayload {
     /// Application-defined request body. Caller and server agree on
     /// the codec out-of-band; nRPC doesn't interpret these bytes.
     pub body: Vec<u8>,
+}
+
+/// Continuation chunk for a client-streaming or duplex REQUEST.
+/// Lives after the 24-byte `EventMeta` prefix in a
+/// [`DISPATCH_RPC_REQUEST_CHUNK`] event.
+///
+/// Unlike the initial [`RpcRequestPayload`] there is no
+/// `service` field (server already routed by service at the
+/// initial REQUEST) and no `deadline_ns` (the initial REQUEST's
+/// deadline applies to the whole call). The `call_id` field is
+/// redundant with `EventMeta::seq_or_ts` but kept on the
+/// payload so the codec is self-contained — a reader handed a
+/// chunk's bytes without the meta header can still recover its
+/// correlation id.
+///
+/// Bidi streaming plan (Phase A).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcRequestChunkPayload {
+    /// Matches `EventMeta::seq_or_ts` and the original REQUEST's
+    /// `call_id`. Kept on the payload so the codec round-trips
+    /// in isolation.
+    pub call_id: u64,
+    /// Bitfield of `FLAG_RPC_*` constants. The only flag that
+    /// makes sense on a chunk today is [`FLAG_RPC_REQUEST_END`];
+    /// other flags MUST be zero on the wire so future protocol
+    /// extensions can claim them without colliding with
+    /// existing chunks.
+    pub flags: u16,
+    /// Per-chunk metadata. Typically empty; reserved for
+    /// trace-span continuity across long uploads, content-type
+    /// changes mid-stream, or other rare per-chunk concerns.
+    /// Capped at `MAX_RPC_HEADERS` entries with the same
+    /// per-field caps as `RpcRequestPayload::headers`.
+    pub headers: Vec<RpcHeader>,
+    /// Application-defined chunk body. Cap is `MAX_RPC_BODY_LEN`
+    /// (4 MiB), same as the initial REQUEST body — clients that
+    /// need >4 MiB total payload chunk their upload across
+    /// multiple `REQUEST_CHUNK` events.
+    pub body: Vec<u8>,
+}
+
+/// Request-direction credit grant. Lives after the 24-byte
+/// `EventMeta` prefix in a [`DISPATCH_RPC_REQUEST_GRANT`] event.
+/// Mirror of the response-direction [`encode_stream_grant`] /
+/// [`decode_stream_grant`] pair, but with an explicit `call_id`
+/// in the payload (instead of relying solely on
+/// `EventMeta::seq_or_ts`) so the codec is self-contained — same
+/// rationale as [`RpcRequestChunkPayload::call_id`].
+///
+/// Bidi streaming plan (Phase A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcRequestGrantPayload {
+    /// Matches the call's `call_id`.
+    pub call_id: u64,
+    /// Additional REQUEST_CHUNK frames the server is willing to
+    /// admit beyond the current credit. Server's incoming-credit
+    /// counter is capped defensively (see PHASE-B server fold)
+    /// so a misbehaving grant can't overflow.
+    pub credits: u32,
 }
 
 /// nRPC response payload. Lives after the 24-byte `EventMeta`
@@ -425,6 +540,94 @@ impl RpcRequestPayload {
         Ok(Self {
             service,
             deadline_ns,
+            flags,
+            headers,
+            body,
+        })
+    }
+}
+
+impl RpcRequestChunkPayload {
+    /// Compute the encoded byte length WITHOUT actually encoding.
+    /// See [`RpcRequestPayload::encoded_len`] for the rationale.
+    pub fn encoded_len(&self) -> usize {
+        // call_id: u64
+        8
+            // flags: u16
+            + 2
+            // headers: u8 count + per-header (u8 name_len + name + u16 value_len + value)
+            + 1
+            + self
+                .headers
+                .iter()
+                .map(|(n, v)| 1 + n.len() + 2 + v.len())
+                .sum::<usize>()
+            // body: u32 length + bytes
+            + 4
+            + self.body.len()
+    }
+
+    /// Encode to the wire bytes that follow the 24-byte `EventMeta`
+    /// prefix in a [`DISPATCH_RPC_REQUEST_CHUNK`] event. Same
+    /// encoder-bounds policy as [`RpcRequestPayload::encode`]:
+    /// oversize fields panic in debug, the decoder enforces in
+    /// release.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + self.body.len());
+        // call_id
+        buf.put_u64_le(self.call_id);
+        // flags
+        buf.put_u16_le(self.flags);
+        // headers
+        encode_headers(&self.headers, &mut buf);
+        // body
+        debug_assert!(
+            self.body.len() <= MAX_RPC_BODY_LEN,
+            "body length {} exceeds MAX_RPC_BODY_LEN ({})",
+            self.body.len(),
+            MAX_RPC_BODY_LEN,
+        );
+        buf.put_u32_le(self.body.len() as u32);
+        buf.extend_from_slice(&self.body);
+        buf
+    }
+
+    /// Decode from the wire bytes following the `EventMeta` prefix.
+    /// Bounded by the same `MAX_RPC_*` caps as the initial REQUEST.
+    pub fn decode(data: &[u8]) -> Result<Self, RpcCodecError> {
+        let mut cur = std::io::Cursor::new(data);
+        // call_id
+        if cur.remaining() < 8 {
+            return Err(RpcCodecError::Truncated("call_id"));
+        }
+        let call_id = cur.get_u64_le();
+        // flags
+        if cur.remaining() < 2 {
+            return Err(RpcCodecError::Truncated("flags"));
+        }
+        let flags = cur.get_u16_le();
+        // headers
+        let headers = decode_headers(&mut cur, data)?;
+        // body
+        if cur.remaining() < 4 {
+            return Err(RpcCodecError::Truncated("body length"));
+        }
+        let body_len = cur.get_u32_le() as usize;
+        if body_len > MAX_RPC_BODY_LEN {
+            return Err(RpcCodecError::TooLarge {
+                field: "body",
+                actual: body_len,
+                limit: MAX_RPC_BODY_LEN,
+            });
+        }
+        if cur.remaining() < body_len {
+            return Err(RpcCodecError::Truncated("body bytes"));
+        }
+        let body_start = cur.position() as usize;
+        let body_end = body_start + body_len;
+        let body = data[body_start..body_end].to_vec();
+        Ok(Self {
+            call_id,
             flags,
             headers,
             body,
@@ -808,6 +1011,66 @@ pub fn decode_stream_grant(payload: &[u8]) -> Option<u32> {
 pub fn parse_stream_window_initial(headers: &[RpcHeader]) -> Option<u32> {
     for (name, value) in headers {
         if name.eq_ignore_ascii_case(HEADER_NRPC_STREAM_WINDOW_INITIAL) {
+            return std::str::from_utf8(value).ok()?.parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+/// Header on the initial REQUEST of a client-streaming or duplex
+/// call that opts the upload direction into flow control with the
+/// given initial credit window. Value is the ASCII decimal
+/// representation of a `u32`. When present, the server's
+/// streaming-request fold creates a per-call semaphore and the
+/// caller's sink awaits one credit per `REQUEST_CHUNK`. The server
+/// refills via [`DISPATCH_RPC_REQUEST_GRANT`] events.
+///
+/// Absent → unbounded credit (caller's sink emits as fast as the
+/// publish path can take it). Long client-streaming calls that
+/// could outpace a slow handler SHOULD opt into flow control —
+/// without it, the server's chunk mpsc grows unbounded under a
+/// stalled handler.
+///
+/// Bidi streaming plan (Phase A).
+pub const HEADER_NRPC_REQUEST_WINDOW_INITIAL: &str = "nrpc-request-window-initial";
+
+/// Encode a request-grant payload — `call_id` (u64 little-endian)
+/// followed by additional credit (u32 big-endian). Big-endian on
+/// the credit field matches [`encode_stream_grant`]; little-endian
+/// on `call_id` matches the rest of the RPC codec's u64 fields.
+///
+/// Pair with [`decode_request_grant`] on the caller side.
+pub fn encode_request_grant(call_id: u64, credits: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(12);
+    buf.put_u64_le(call_id);
+    buf.extend_from_slice(&credits.to_be_bytes());
+    buf
+}
+
+/// Decode a request-grant payload. Returns `None` if the slice is
+/// not exactly 12 bytes — defends the caller's fold against
+/// malformed grants without killing the cortex adapter.
+pub fn decode_request_grant(payload: &[u8]) -> Option<RpcRequestGrantPayload> {
+    if payload.len() != 12 {
+        return None;
+    }
+    let mut cid = [0u8; 8];
+    cid.copy_from_slice(&payload[..8]);
+    let call_id = u64::from_le_bytes(cid);
+    let mut credits = [0u8; 4];
+    credits.copy_from_slice(&payload[8..]);
+    Some(RpcRequestGrantPayload {
+        call_id,
+        credits: u32::from_be_bytes(credits),
+    })
+}
+
+/// Parse the `nrpc-request-window-initial` header from a request's
+/// header list. Same semantics as [`parse_stream_window_initial`]
+/// but for the upload direction.
+pub fn parse_request_window_initial(headers: &[RpcHeader]) -> Option<u32> {
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case(HEADER_NRPC_REQUEST_WINDOW_INITIAL) {
             return std::str::from_utf8(value).ok()?.parse::<u32>().ok();
         }
     }
@@ -2290,6 +2553,9 @@ mod tests {
         assert_eq!(DISPATCH_RPC_RESPONSE, 0x11);
         assert_eq!(DISPATCH_RPC_CANCEL, 0x12);
         assert_eq!(DISPATCH_RPC_DEADLINE_EXCEEDED, 0x13);
+        assert_eq!(DISPATCH_RPC_STREAM_GRANT, 0x14);
+        assert_eq!(DISPATCH_RPC_REQUEST_CHUNK, 0x15);
+        assert_eq!(DISPATCH_RPC_REQUEST_GRANT, 0x16);
     }
 
     /// Regression: encoder bounds. Encoding a service name longer
@@ -2388,11 +2654,194 @@ mod tests {
     /// reuse it without breaking existing senders.
     #[test]
     fn flag_bit_assignments_leave_idempotent_slot_reserved() {
-        // Bit 0 (1 << 0) is reserved; the live flags occupy higher bits.
+        // Bit 0 (1 << 0) and bit 3 (1 << 3) are reserved; live flags
+        // occupy other bits. Pinning the exact assignments here so
+        // a renumber that collides with bit 0 (future `IDEMPOTENT`
+        // re-add) or bit 3 (held in reserve for a future protocol
+        // flag) surfaces in the test suite before it ships.
         assert_eq!(FLAG_RPC_STREAMING_RESPONSE, 1 << 1);
         assert_eq!(FLAG_RPC_PROPAGATE_TRACE, 1 << 2);
-        assert_eq!(FLAG_RPC_STREAMING_RESPONSE & 1, 0);
-        assert_eq!(FLAG_RPC_PROPAGATE_TRACE & 1, 0);
+        assert_eq!(FLAG_RPC_CLIENT_STREAMING_REQUEST, 1 << 4);
+        assert_eq!(FLAG_RPC_REQUEST_END, 1 << 5);
+        for flag in [
+            FLAG_RPC_STREAMING_RESPONSE,
+            FLAG_RPC_PROPAGATE_TRACE,
+            FLAG_RPC_CLIENT_STREAMING_REQUEST,
+            FLAG_RPC_REQUEST_END,
+        ] {
+            assert_eq!(flag & (1 << 0), 0, "flag {flag:#06x} collides with reserved bit 0");
+            assert_eq!(flag & (1 << 3), 0, "flag {flag:#06x} collides with reserved bit 3");
+        }
+    }
+
+    // --------------------------------------------------------------------
+    // Bidi streaming (Phase A) — RpcRequestChunkPayload and
+    // RpcRequestGrantPayload wire-stability tests.
+    // --------------------------------------------------------------------
+
+    /// 1/5 — RequestChunk round-trip with realistic header set and
+    /// 1 KiB body. Pins the encode/decode loop on the full shape.
+    #[test]
+    fn request_chunk_roundtrip_with_headers_and_body() {
+        let mut headers = Vec::new();
+        for i in 0..10u8 {
+            headers.push(header(
+                &format!("x-chunk-meta-{i}"),
+                &[0xAA, 0xBB, i, !i],
+            ));
+        }
+        let body: Vec<u8> = (0..1024u32).map(|n| (n & 0xFF) as u8).collect();
+        let p = RpcRequestChunkPayload {
+            call_id: 0xCAFE_F00D_DEAD_BEEF,
+            flags: FLAG_RPC_REQUEST_END | FLAG_RPC_PROPAGATE_TRACE,
+            headers,
+            body,
+        };
+        let bytes = p.encode();
+        assert_eq!(
+            p.encoded_len(),
+            bytes.len(),
+            "encoded_len must agree with encode().len()"
+        );
+        let decoded = RpcRequestChunkPayload::decode(&bytes).expect("decode");
+        assert_eq!(decoded, p);
+    }
+
+    /// 2/5 — truncation rejection at every field boundary. The
+    /// codec must error rather than panic / allocate-unbounded on
+    /// any short slice.
+    #[test]
+    fn request_chunk_decode_rejects_truncation_at_every_boundary() {
+        let p = RpcRequestChunkPayload {
+            call_id: 0x1234,
+            flags: 0,
+            headers: vec![header("x", b"y")],
+            body: b"hello".to_vec(),
+        };
+        let full = p.encode();
+        // Walk every prefix shorter than the full encoding; every
+        // one must produce a Truncated / TooLarge / InvalidUtf8
+        // error, not panic.
+        for n in 0..full.len() {
+            let prefix = &full[..n];
+            let result = RpcRequestChunkPayload::decode(prefix);
+            assert!(
+                result.is_err(),
+                "n={n}: expected Err, got Ok({:?})",
+                result
+            );
+        }
+        // Full length must decode cleanly.
+        assert!(RpcRequestChunkPayload::decode(&full).is_ok());
+    }
+
+    /// 3/5 — body length cap rejection. A wire-claimed body length
+    /// over `MAX_RPC_BODY_LEN` must error rather than try to
+    /// allocate 4+ MiB of garbage.
+    #[test]
+    fn request_chunk_decode_rejects_oversized_body_length() {
+        // Build a synthetic encoding by hand: small valid prefix
+        // up to body_len, then claim body_len = MAX_RPC_BODY_LEN + 1.
+        let mut buf = Vec::new();
+        buf.put_u64_le(0x42); // call_id
+        buf.put_u16_le(0); // flags
+        buf.put_u8(0); // headers count = 0
+        buf.put_u32_le((MAX_RPC_BODY_LEN + 1) as u32);
+        // (no body bytes follow — we want the decoder to reject at
+        // the length check before it even tries to read body bytes)
+        let err = RpcRequestChunkPayload::decode(&buf)
+            .expect_err("oversized body length must reject");
+        match err {
+            RpcCodecError::TooLarge {
+                field,
+                actual,
+                limit,
+            } => {
+                assert_eq!(field, "body");
+                assert_eq!(actual, MAX_RPC_BODY_LEN + 1);
+                assert_eq!(limit, MAX_RPC_BODY_LEN);
+            }
+            other => panic!("expected TooLarge {{ field=body }}, got {other:?}"),
+        }
+    }
+
+    /// 4/5 — header count cap rejection. A header count over
+    /// `MAX_RPC_HEADERS` must error before the per-header decode
+    /// loop even starts.
+    #[test]
+    fn request_chunk_decode_rejects_oversized_header_count() {
+        let mut buf = Vec::new();
+        buf.put_u64_le(0x42); // call_id
+        buf.put_u16_le(0); // flags
+        buf.put_u8((MAX_RPC_HEADERS + 1) as u8); // over the cap
+        let err = RpcRequestChunkPayload::decode(&buf)
+            .expect_err("oversized header count must reject");
+        match err {
+            RpcCodecError::TooLarge {
+                field,
+                actual,
+                limit,
+            } => {
+                // The shared `decode_headers` helper reports this
+                // field as "headers".
+                assert_eq!(field, "headers");
+                assert_eq!(actual, MAX_RPC_HEADERS + 1);
+                assert_eq!(limit, MAX_RPC_HEADERS);
+            }
+            other => panic!("expected TooLarge {{ field=headers }}, got {other:?}"),
+        }
+    }
+
+    /// 5/5 — RequestGrant round-trip + truncation rejection. The
+    /// payload is fixed-size (12 bytes), so the test surface is
+    /// "exactly 12 bytes decodes" + "any other length errors".
+    #[test]
+    fn request_grant_roundtrip_and_truncation_rejection() {
+        // Round-trip across the full u32 range corners + an
+        // arbitrary mid-value.
+        for (call_id, credits) in [
+            (0u64, 0u32),
+            (1, 1),
+            (0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF),
+            (0xCAFE_F00D, 0x10203040),
+        ] {
+            let bytes = encode_request_grant(call_id, credits);
+            assert_eq!(bytes.len(), 12, "request grant is always 12 bytes");
+            let decoded = decode_request_grant(&bytes).expect("decode");
+            assert_eq!(decoded.call_id, call_id);
+            assert_eq!(decoded.credits, credits);
+        }
+        // Wrong-length payloads must reject (return None), not
+        // panic. Empty, short, long, off-by-one each get covered.
+        assert!(decode_request_grant(&[]).is_none());
+        assert!(decode_request_grant(&[0u8; 11]).is_none());
+        assert!(decode_request_grant(&[0u8; 13]).is_none());
+    }
+
+    /// Bonus pin: `parse_request_window_initial` extracts a valid
+    /// u32 ASCII-decimal header and rejects everything else.
+    /// Same coverage shape as `parse_stream_window_initial`'s
+    /// implicit contract, made explicit here so the request-side
+    /// helper doesn't drift away from the response-side one.
+    #[test]
+    fn parse_request_window_initial_matches_response_side_semantics() {
+        // Happy path.
+        let headers = vec![header(HEADER_NRPC_REQUEST_WINDOW_INITIAL, b"32")];
+        assert_eq!(parse_request_window_initial(&headers), Some(32));
+        // Case-insensitive on header name.
+        let headers = vec![header("Nrpc-Request-Window-Initial", b"7")];
+        assert_eq!(parse_request_window_initial(&headers), Some(7));
+        // Absent.
+        assert_eq!(parse_request_window_initial(&[]), None);
+        // Malformed value (non-numeric).
+        let headers = vec![header(HEADER_NRPC_REQUEST_WINDOW_INITIAL, b"twelve")];
+        assert_eq!(parse_request_window_initial(&headers), None);
+        // Malformed value (non-utf8 bytes).
+        let headers = vec![header(HEADER_NRPC_REQUEST_WINDOW_INITIAL, &[0xFF, 0xFE])];
+        assert_eq!(parse_request_window_initial(&headers), None);
+        // Empty value.
+        let headers = vec![header(HEADER_NRPC_REQUEST_WINDOW_INITIAL, b"")];
+        assert_eq!(parse_request_window_initial(&headers), None);
     }
 
     // --------------------------------------------------------------------
