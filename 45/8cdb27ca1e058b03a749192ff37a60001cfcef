@@ -1,0 +1,20 @@
+net/crates/net/tests/integration_nrpc_duplex.rs
+  s_906a82c67213dc::t_9d40d67b870ba2 32
+  s_906a82c67213dc::t_8642aed2c9d96d 1-31,33-388
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "458cdb27ca1e058b03a749192ff37a60001cfcef",
+  "prompts": {},
+  "sessions": {
+    "s_906a82c67213dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a83a8d29-a399-4785-986d-1bd45ba15ab6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
