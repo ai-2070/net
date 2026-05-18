@@ -5226,18 +5226,6 @@ impl MeshNode {
             return;
         }
 
-        // Strip substrate-reserved metadata keys from the inbound
-        // announcement now that the signature has been verified
-        // and the (node_id, entity_id) binding has been confirmed.
-        // A peer must not be able to steer the receiver's greedy
-        // admission / placement decisions by stamping `intent`,
-        // `colocate-with`, `priority`, `owner`, or any `tool::*`
-        // key on its own announcement. Strip is post-verify so the
-        // signature transcript stays intact for the verify above;
-        // strip is also applied to unsigned anns because their
-        // metadata is even more attacker-controlled.
-        ann.strip_reserved_metadata();
-
         // First-seen identity pin — TOFU. A peer that tries to
         // rebind its `entity_id` in a later announcement is
         // silently rejected. Two preconditions must hold before we
@@ -5356,6 +5344,22 @@ impl MeshNode {
             let fwd_bytes = forwarded.to_bytes();
             Self::forward_capability_announcement(fwd_bytes, ann.node_id, from_node, ctx);
         }
+
+        // Strip substrate-reserved metadata keys from the local copy
+        // now that the forward (if any) has already shipped the
+        // signature-covered bytes verbatim. A peer must not be able
+        // to steer the receiver's greedy admission / placement
+        // decisions by stamping `intent`, `colocate-with`,
+        // `priority`, `owner`, or any `tool::*` key on its own
+        // announcement. Strip must run AFTER the forward block — the
+        // signature transcript covers `metadata`, so stripping before
+        // re-broadcast would invalidate the signature for any
+        // downstream peer that re-verifies. Strip is also applied to
+        // unsigned anns because their metadata is even more
+        // attacker-controlled. The only consumer between the forward
+        // block and here is `policy.assign(&ann.capabilities)` above,
+        // which reads `caps.tags` only, not `caps.metadata`.
+        ann.strip_reserved_metadata();
 
         // Strip unauthorized `heat:<hex>=...` tags before indexing.
         // A peer can only annotate heat for chains it *also* claims

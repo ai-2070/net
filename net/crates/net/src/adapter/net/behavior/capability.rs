@@ -3758,6 +3758,51 @@ mod tests {
         );
     }
 
+    /// The signature transcript covers `capabilities.metadata`, so
+    /// `strip_reserved_metadata` invalidates the signature. The
+    /// inbound dispatch path must therefore re-broadcast the
+    /// announcement BEFORE stripping; otherwise a multi-hop
+    /// receiver with `require_signed_capabilities = true` would
+    /// reject every forwarded announcement that originally carried
+    /// a reserved metadata key.
+    #[test]
+    fn strip_reserved_metadata_invalidates_signature() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+        let mut ann = CapabilityAnnouncement::new(
+            1,
+            keypair.entity_id().clone(),
+            1,
+            sample_capability_set(),
+        );
+        ann.capabilities
+            .metadata
+            .insert("intent".into(), "compute".into());
+        ann.sign(&keypair);
+
+        // Baseline: signed announcement verifies, and the bytes a
+        // forwarder would re-broadcast also verify (the bug a
+        // pre-forward strip would cause).
+        assert!(ann.verify().is_ok());
+        let forward_bytes = ann.to_bytes();
+        let forwarded =
+            CapabilityAnnouncement::from_bytes(&forward_bytes).expect("forwarded parses");
+        assert!(
+            forwarded.verify().is_ok(),
+            "downstream verifier must accept the un-stripped wire bytes"
+        );
+
+        // After strip the signature transcript no longer matches —
+        // pins the invariant the inbound dispatch order in
+        // `mesh.rs::process_capability_announcement` relies on.
+        ann.strip_reserved_metadata();
+        assert!(
+            ann.verify().is_err(),
+            "strip must invalidate the signature so the substrate is forced \
+             to strip the local copy AFTER any re-broadcast"
+        );
+    }
+
     fn sample_capability_set() -> CapabilitySet {
         let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24)
             .with_compute_units(128)
