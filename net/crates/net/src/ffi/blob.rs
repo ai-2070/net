@@ -117,6 +117,14 @@ fn err_to_code(e: &InnerBlobError) -> c_int {
         InnerBlobError::AdapterNotConfigured => NET_ERR_BLOB_ADAPTER_NOT_CONFIGURED,
         InnerBlobError::AdapterNotRegistered(_) => NET_ERR_BLOB_ADAPTER_NOT_REGISTERED,
         InnerBlobError::Unauthorized(_) => NET_ERR_BLOB_UNAUTHORIZED,
+        // `ShortChunk` is a size disagreement (backend truncated
+        // the chunk); route through `NET_ERR_BLOB_BACKEND` rather
+        // than `NET_ERR_BLOB_HASH_MISMATCH` so retry logic that
+        // distinguishes truncation from content divergence keeps
+        // the existing classifier intact. A dedicated code can be
+        // added later when a binding consumer needs to fork on the
+        // distinction at the FFI surface.
+        InnerBlobError::ShortChunk { .. } => NET_ERR_BLOB_BACKEND,
     }
 }
 

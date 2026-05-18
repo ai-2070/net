@@ -66,6 +66,28 @@ pub enum BlobError {
     /// authorization-side context; do not leak channel names or
     /// principal identifiers if they're sensitive.
     Unauthorized(String),
+    /// Backend returned a chunk whose length is shorter than the
+    /// manifest's recorded chunk size — distinct from
+    /// [`Self::HashMismatch`] so retry logic can tell a
+    /// truncated tail (where the *content* may still hash
+    /// correctly over its visible prefix) from a fundamental
+    /// content disagreement. Pre-fix, an over-short chunk
+    /// surfaced as `HashMismatch { expected, actual: blake3(short_bytes) }`,
+    /// where `actual` could even equal `expected` for a
+    /// truncated tail aligned to a block boundary, confusing
+    /// retry / divergence-detection callers.
+    ShortChunk {
+        /// Hash recorded on the `BlobRef::Manifest` chunk entry.
+        hash: [u8; 32],
+        /// Bytes the request asked the chunk to span past
+        /// (`req.start_in_chunk`).
+        requested_start: u64,
+        /// Bytes the request asked the chunk to span up to
+        /// (`req.end_in_chunk`).
+        requested_end: u64,
+        /// Bytes the backend actually delivered for this chunk.
+        actual_len: u64,
+    },
 }
 
 impl fmt::Display for BlobError {
@@ -90,6 +112,19 @@ impl fmt::Display for BlobError {
                 write!(f, "blob adapter \"{}\" not registered", id)
             }
             Self::Unauthorized(msg) => write!(f, "blob op unauthorized: {}", msg),
+            Self::ShortChunk {
+                hash,
+                requested_start,
+                requested_end,
+                actual_len,
+            } => write!(
+                f,
+                "blob chunk {} too short: requested bytes [{}, {}); backend returned {} bytes",
+                hex32(hash),
+                requested_start,
+                requested_end,
+                actual_len
+            ),
         }
     }
 }

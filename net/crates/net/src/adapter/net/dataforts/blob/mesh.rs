@@ -1274,11 +1274,23 @@ impl BlobAdapter for MeshBlobAdapter {
                             // future content-addressed-but-truncated
                             // backend); panic across `.await` in the
                             // adapter is worse than a typed error.
+                            //
+                            // `ShortChunk` is the right surface here:
+                            // the cause is a size disagreement, not
+                            // a content disagreement. Pre-fix this
+                            // returned `HashMismatch` where `actual`
+                            // could equal `expected` for a truncated
+                            // tail aligned to a block boundary —
+                            // retry logic that distinguishes
+                            // truncation from divergence couldn't
+                            // tell the cases apart.
                             let slice = chunk_bytes
                                 .get(req.start_in_chunk as usize..req.end_in_chunk as usize)
-                                .ok_or(BlobError::HashMismatch {
-                                    expected: chunk.hash,
-                                    actual: blake3::hash(&chunk_bytes).into(),
+                                .ok_or(BlobError::ShortChunk {
+                                    hash: chunk.hash,
+                                    requested_start: req.start_in_chunk as u64,
+                                    requested_end: req.end_in_chunk as u64,
+                                    actual_len: chunk_bytes.len() as u64,
                                 })?;
                             out.extend_from_slice(slice);
                             touched.push(chunk.hash);
