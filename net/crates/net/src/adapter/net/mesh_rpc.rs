@@ -799,7 +799,11 @@ impl MeshNode {
 
         let call_id = mint_random_call_id();
         let pending = self.rpc_client_pending();
-        let rx = pending.register_streaming(call_id);
+        // S-4 part 2: bind the pending entry to the wire-session
+        // peer the request is dispatched to. The fold's deliver
+        // gate rejects RESPONSE frames whose from_node doesn't
+        // match, so a leaked call_id alone can't spoof a reply.
+        let rx = pending.register_streaming(call_id, target_node_id);
 
         // Build the REQUEST: STREAMING_RESPONSE flag plus optional
         // trace-context headers / propagate-trace flag, same as
@@ -1098,8 +1102,11 @@ impl MeshNode {
 
         // Register the oneshot before publishing the REQUEST so a
         // very-fast RESPONSE doesn't arrive before we're ready.
+        // S-4 part 2: bind the pending entry to target_node_id so
+        // the fold's deliver gate rejects spoofed RESPONSE frames
+        // arriving from any other session peer.
         let pending = self.rpc_client_pending();
-        let rx = pending.register(call_id);
+        let rx = pending.register(call_id, target_node_id);
 
         // Build the REQUEST envelope. If a trace context is set,
         // emit `traceparent` / `tracestate` headers and signal
@@ -1373,15 +1380,13 @@ impl MeshNode {
         if !self.rpc_inbound_dispatcher_registered(reply_hash) {
             let pending = self.rpc_client_pending();
             let fold = Arc::new(Mutex::new(RpcClientFold::new(pending)));
+            // S-4 part 2: use `apply_inbound` so the wire-session
+            // peer's NodeId (resolved in mesh.rs's dispatch site)
+            // flows into the fold's deliver gate. The legacy
+            // `RedexFold::apply` shim delivers with from_node=0,
+            // which would defeat the binding.
             let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
-                let entry = RedexEntry::new_heap(0, 0, ev.payload.len() as u32, 0, 0);
-                let redex_event = RedexEvent {
-                    entry,
-                    payload: ev.payload,
-                };
-                if let Err(e) = fold.lock().apply(&redex_event, &mut ()) {
-                    tracing::warn!(error = %e, "rpc client fold: apply error");
-                }
+                fold.lock().apply_inbound(&ev);
             });
             // Race-safe: a concurrent caller might have just
             // registered between our check and our insert. In that

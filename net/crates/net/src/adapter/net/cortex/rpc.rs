@@ -713,6 +713,20 @@ pub struct RpcInboundEvent {
     /// The dispatcher should treat this as routing metadata, not
     /// identity authentication.
     pub origin_hash: u32,
+    /// Wire-session peer's `NodeId` resolved at packet receive
+    /// time from the AEAD-verified session_id. Distinct from
+    /// `origin_hash`: this is the full 64-bit network identity
+    /// of the peer that delivered the packet, not a 32-bit
+    /// routing projection. Used by `RpcClientPending::deliver`
+    /// to reject spoofed RESPONSE frames whose call_id happens
+    /// to match an in-flight request but whose session peer
+    /// isn't the recorded target.
+    ///
+    /// Set to `0` on test / loopback paths that don't have a
+    /// session to resolve against; callers that register
+    /// pending entries with `target_node = 0` opt out of the
+    /// binding gate (and trust the call_id randomness alone).
+    pub from_node: super::super::behavior::placement::NodeId,
     /// Event payload bytes — the same bytes that would have been
     /// pushed onto the shard inbound queue. For RPC events these
     /// start with a 24-byte `EventMeta` followed by the
@@ -1913,7 +1927,13 @@ pub enum StreamItem {
 /// on `call_id` — the entry's enum variant tells the fold how
 /// to dispatch incoming RESPONSE events.
 pub struct RpcClientPending {
-    senders: dashmap::DashMap<u64, PendingEntry>,
+    /// Map keyed on `call_id`, value carries `(expected_target,
+    /// PendingEntry)`. `expected_target` is the `NodeId` of the
+    /// peer the request was dispatched to; `deliver` rejects
+    /// frames whose wire `from_node` doesn't match. A
+    /// `expected_target == 0` entry opts out of the binding
+    /// (loopback tests + paths with no session).
+    senders: dashmap::DashMap<u64, (super::super::behavior::placement::NodeId, PendingEntry)>,
 }
 
 impl RpcClientPending {
@@ -1930,14 +1950,24 @@ impl RpcClientPending {
     /// matching RESPONSE can't arrive while the pending entry is
     /// missing.
     ///
+    /// `target_node` is the wire-session peer the request will
+    /// be sent to; `deliver` rejects RESPONSE frames whose
+    /// `from_node` doesn't match. Pass `0` for loopback / no-
+    /// session test paths to opt out of the binding gate.
+    ///
     /// If a sender already exists for `call_id` (improperly reused
     /// id), it is replaced and the old receiver gets a
     /// `RecvError::Closed` — surfacing the misuse as a hard error
     /// at the caller rather than silently delivering the response
     /// to the wrong waiter.
-    pub fn register(&self, call_id: u64) -> tokio::sync::oneshot::Receiver<RpcResponsePayload> {
+    pub fn register(
+        &self,
+        call_id: u64,
+        target_node: super::super::behavior::placement::NodeId,
+    ) -> tokio::sync::oneshot::Receiver<RpcResponsePayload> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.senders.insert(call_id, PendingEntry::Unary(tx));
+        self.senders
+            .insert(call_id, (target_node, PendingEntry::Unary(tx)));
         rx
     }
 
@@ -1948,9 +1978,11 @@ impl RpcClientPending {
     pub fn register_streaming(
         &self,
         call_id: u64,
+        target_node: super::super::behavior::placement::NodeId,
     ) -> tokio::sync::mpsc::UnboundedReceiver<StreamItem> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.senders.insert(call_id, PendingEntry::Streaming(tx));
+        self.senders
+            .insert(call_id, (target_node, PendingEntry::Streaming(tx)));
         rx
     }
 
@@ -1965,6 +1997,14 @@ impl RpcClientPending {
 
     /// Deliver `resp` to the waiter for `call_id`, if any.
     ///
+    /// `from_node` is the wire-session peer of the inbound
+    /// RESPONSE. If the pending entry's recorded `target_node`
+    /// is non-zero and does not match `from_node`, the frame is
+    /// dropped with a trace log and the pending entry stays
+    /// intact — a forged response on a shared reply channel
+    /// can't resolve a victim's call. A recorded `target_node
+    /// == 0` opts the call out of the binding (loopback paths).
+    ///
     /// For a unary entry: completes the oneshot and removes the
     /// entry.
     ///
@@ -1975,20 +2015,41 @@ impl RpcClientPending {
     /// remove the entry).
     ///
     /// Idempotent on subsequent deliveries to a removed entry.
-    fn deliver(&self, call_id: u64, resp: RpcResponsePayload) {
+    fn deliver(
+        &self,
+        call_id: u64,
+        from_node: super::super::behavior::placement::NodeId,
+        resp: RpcResponsePayload,
+    ) {
         // Look up the entry — but DON'T remove it yet, because for
         // streaming we may want to keep it for non-terminal chunks.
         // The remove decision is per-variant.
         let entry = self.senders.get(&call_id);
         let Some(entry) = entry else { return };
+        // S-4 part 2 gate. The pending registry binds each call
+        // to the AEAD-verified `target_node` the request was
+        // dispatched to; any other session peer publishing on the
+        // shared reply channel with a guessed call_id is dropped
+        // here without touching the waiter. `0` opts out — used
+        // by loopback paths that have no session peer.
+        let (target_node, _entry_value) = entry.value();
+        if *target_node != 0 && *target_node != from_node {
+            tracing::trace!(
+                call_id,
+                from_node,
+                expected = *target_node,
+                "rpc client: dropping RESPONSE from non-target session peer"
+            );
+            return;
+        }
         match entry.value() {
-            PendingEntry::Unary(_) => {
+            (_, PendingEntry::Unary(_)) => {
                 drop(entry);
-                if let Some((_, PendingEntry::Unary(tx))) = self.senders.remove(&call_id) {
+                if let Some((_, (_, PendingEntry::Unary(tx)))) = self.senders.remove(&call_id) {
                     let _ = tx.send(resp);
                 }
             }
-            PendingEntry::Streaming(tx) => {
+            (_, PendingEntry::Streaming(tx)) => {
                 let kind = classify_streaming_chunk(&resp);
                 match kind {
                     StreamingChunkKind::Continue => {
@@ -2080,9 +2141,46 @@ impl RpcClientFold {
     pub fn new(pending: Arc<RpcClientPending>) -> Self {
         Self { pending }
     }
+
+    /// Production-path entry point. Mesh dispatch calls this with
+    /// the AEAD-verified session peer's `NodeId` in
+    /// `ev.from_node`; the pending registry's S-4 binding gate
+    /// uses it to reject responses from the wrong target.
+    pub fn apply_inbound(&mut self, ev: &RpcInboundEvent) {
+        let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
+            EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
+        } else {
+            None
+        }) else {
+            tracing::warn!(
+                payload_len = ev.payload.len(),
+                "rpc client fold: event payload too short for EventMeta; skipping",
+            );
+            return;
+        };
+        if meta.dispatch != DISPATCH_RPC_RESPONSE {
+            return;
+        }
+        match RpcResponsePayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+            Ok(resp) => self.pending.deliver(meta.seq_or_ts, ev.from_node, resp),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    call_id = meta.seq_or_ts,
+                    "rpc client fold: malformed response payload",
+                );
+            }
+        }
+    }
 }
 
 impl RedexFold<()> for RpcClientFold {
+    /// Legacy entry point used by loopback / test paths that
+    /// don't have a session peer to resolve. Calls `deliver`
+    /// with `from_node = 0`, which the pending registry treats
+    /// as "no binding" — callers that registered with
+    /// `target_node = 0` accept it, callers that registered
+    /// with a real target reject it.
     fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
         let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
             EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
@@ -2103,7 +2201,7 @@ impl RedexFold<()> for RpcClientFold {
             return Ok(());
         }
         match RpcResponsePayload::decode(&ev.payload[EVENT_META_SIZE..]) {
-            Ok(resp) => self.pending.deliver(meta.seq_or_ts, resp),
+            Ok(resp) => self.pending.deliver(meta.seq_or_ts, 0, resp),
             Err(e) => {
                 // Malformed RESPONSE on the reply channel. We can't
                 // fabricate a synthetic response (the call_id might
@@ -3282,7 +3380,7 @@ mod tests {
     async fn client_fold_routes_response_to_registered_waiter() {
         let pending = Arc::new(RpcClientPending::new());
         let mut fold = RpcClientFold::new(pending.clone());
-        let rx = pending.register(42);
+        let rx = pending.register(42, 0);
         assert_eq!(pending.pending_count(), 1);
 
         let resp = RpcResponsePayload {
@@ -3329,7 +3427,7 @@ mod tests {
     async fn client_fold_ignores_non_response_dispatches() {
         let pending = Arc::new(RpcClientPending::new());
         let mut fold = RpcClientFold::new(pending.clone());
-        let _rx = pending.register(7);
+        let _rx = pending.register(7, 0);
 
         // REQUEST event landing on the caller's reply channel is
         // ignored.
@@ -3355,7 +3453,7 @@ mod tests {
     async fn client_pending_cancel_drops_subsequent_response() {
         let pending = Arc::new(RpcClientPending::new());
         let mut fold = RpcClientFold::new(pending.clone());
-        let rx = pending.register(5);
+        let rx = pending.register(5, 0);
         pending.cancel(5);
         assert_eq!(pending.pending_count(), 0);
 
@@ -3386,7 +3484,7 @@ mod tests {
     async fn client_fold_malformed_response_is_logged_not_fatal() {
         let pending = Arc::new(RpcClientPending::new());
         let mut fold = RpcClientFold::new(pending.clone());
-        let rx = pending.register(11);
+        let rx = pending.register(11, 0);
 
         // Build a malformed RESPONSE: valid meta, garbage tail
         // (just `[0xFF]`, which is shorter than the required 2-byte
@@ -3425,14 +3523,56 @@ mod tests {
     #[tokio::test]
     async fn client_pending_re_register_closes_prior_receiver() {
         let pending = Arc::new(RpcClientPending::new());
-        let rx_a = pending.register(99);
-        let _rx_b = pending.register(99);
+        let rx_a = pending.register(99, 0);
+        let _rx_b = pending.register(99, 0);
         // The first receiver is now closed (sender dropped on
         // re-insert).
         let result = tokio::time::timeout(Duration::from_secs(1), rx_a).await;
         let inner = result.expect("must complete within 1s");
         assert!(inner.is_err(), "re-register must close prior receiver");
         assert_eq!(pending.pending_count(), 1);
+    }
+
+    /// S-4 part 2 regression: a RESPONSE whose wire `from_node`
+    /// doesn't match the recorded `target_node` must not resolve
+    /// the call. Without the gate, any peer with publish access
+    /// to the caller's reply channel could ship a spoofed
+    /// response (random call_ids from S-4 part 1 narrow the
+    /// attack surface, but this gate closes the residual case
+    /// of an attacker who has observed the victim's call_id via
+    /// some side channel).
+    #[tokio::test]
+    async fn client_pending_drops_response_from_wrong_target() {
+        let pending = Arc::new(RpcClientPending::new());
+        let rx = pending.register(0xDEAD_BEEF, 0x42);
+        let resp = RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: Vec::new(),
+            body: b"forged".to_vec(),
+        };
+        // Forged from a different session peer — must drop.
+        pending.deliver(0xDEAD_BEEF, 0x99, resp.clone());
+        // Receiver is still parked; pending entry is intact.
+        let parked = tokio::time::timeout(Duration::from_millis(50), rx).await;
+        assert!(
+            parked.is_err(),
+            "forged RESPONSE from wrong target must not resolve the call"
+        );
+        assert_eq!(pending.pending_count(), 1);
+
+        // Legitimate RESPONSE from the recorded target resolves.
+        let rx2 = pending.register(0xCAFE, 0x42);
+        let ok_resp = RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: Vec::new(),
+            body: b"ok".to_vec(),
+        };
+        pending.deliver(0xCAFE, 0x42, ok_resp);
+        let delivered = tokio::time::timeout(Duration::from_millis(50), rx2)
+            .await
+            .expect("must complete")
+            .expect("must receive");
+        assert_eq!(delivered.body, b"ok");
     }
 
     // ====================================================================

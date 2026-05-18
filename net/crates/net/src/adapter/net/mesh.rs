@@ -4043,12 +4043,36 @@ impl MeshNode {
             };
             drop(entry);
             let origin_hash = parsed.header.origin_hash;
+            // S-4 part 2: resolve the wire-session peer's NodeId so
+            // the cortex RPC client fold can bind RESPONSE delivery
+            // to the recorded target. Fast path: `addr_to_node` →
+            // peers; fall back to a session_id scan. Sentinel `0`
+            // when no peer maps (best-effort — the fold's deliver
+            // gate treats `from_node=0` as no-binding, matching the
+            // loopback test path).
+            let session_id = session.session_id();
+            let from_node = ctx
+                .addr_to_node
+                .get(&session.peer_addr())
+                .and_then(|nid| {
+                    ctx.peers.get(&*nid).and_then(|p| {
+                        (p.value().session.session_id() == session_id).then_some(*nid)
+                    })
+                })
+                .or_else(|| {
+                    ctx.peers
+                        .iter()
+                        .find(|e| e.value().session.session_id() == session_id)
+                        .map(|e| e.value().node_id)
+                })
+                .unwrap_or(0);
             match snapshot {
                 Snapshot::Single(canonical, disp) => {
                     for event_data in events.into_iter() {
                         disp(crate::adapter::net::cortex::RpcInboundEvent {
                             channel_hash: canonical,
                             origin_hash,
+                            from_node,
                             payload: event_data,
                         });
                     }
@@ -4059,6 +4083,7 @@ impl MeshNode {
                             disp(crate::adapter::net::cortex::RpcInboundEvent {
                                 channel_hash: *canonical,
                                 origin_hash,
+                                from_node,
                                 payload: event_data.clone(),
                             });
                         }

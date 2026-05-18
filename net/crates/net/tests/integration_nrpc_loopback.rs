@@ -127,7 +127,10 @@ impl<H: RpcHandler> Loopback<H> {
         payload: RpcRequestPayload,
     ) -> Result<RpcResponsePayload, tokio::sync::oneshot::error::RecvError> {
         let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
-        let rx = self.pending.register(call_id);
+        // Loopback: no wire session peer; register with
+        // target_node=0 so the fold's deliver gate accepts the
+        // loopback `RedexFold::apply` path (from_node=0).
+        let rx = self.pending.register(call_id, 0);
         let ev = request_event(self.caller_origin, call_id, &payload);
         // Drive the server fold; the spawned handler will eventually
         // call our emit closure, which feeds the RESPONSE through
