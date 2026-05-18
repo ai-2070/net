@@ -464,6 +464,15 @@ impl BlobHeatRegistry {
             .map(|(k, _)| *k);
         if let Some(key) = victim {
             self.counters.remove(&key);
+            // Clear any stale `in_flight` marker for the evicted
+            // hash. Without this, a later reintroduction (re-bump
+            // via `entry_mut`) creates a fresh counter that
+            // `tick` permanently suppresses because
+            // `in_flight.contains(&key)` is still true — the
+            // emission was issued for the prior counter but
+            // never `commit_emissions`'d after eviction wiped
+            // the registry entry.
+            self.in_flight.remove(&key);
         }
     }
 
@@ -476,6 +485,11 @@ impl BlobHeatRegistry {
     /// GC sweep.
     pub fn remove(&mut self, hash: &[u8; 32]) {
         self.counters.remove(hash);
+        // Same in-flight cleanup as `evict_lru` — a removed hash
+        // that re-enters later via `entry_mut` must start with a
+        // clean `in_flight` slot, otherwise `tick` suppresses
+        // every emission for the new counter forever.
+        self.in_flight.remove(hash);
     }
 
     /// Iterate `(hash, counter)` pairs. Read-only.
@@ -541,10 +555,24 @@ impl BlobHeatRegistry {
             }
             self.in_flight.remove(hash);
         }
-        // Same `<= 0.0` rationale as HeatRegistry::tick above.
-        self.counters.retain(|_, c| {
-            !(c.rate <= 0.0 && c.last_emitted.map_or(false, |v| v <= 0.0))
+        // Prune fully-decayed + already-withdrawn entries. Same
+        // `<= 0.0` rationale as HeatRegistry::tick above. Also
+        // clear any `in_flight` marker associated with a pruned
+        // hash so a future reintroduction starts clean — pre-fix
+        // the prune dropped the counter but left `in_flight`
+        // dangling, suppressing the new counter's emissions until
+        // a manual `rollback_emission` cleared the stale marker.
+        let mut pruned: Vec<[u8; 32]> = Vec::new();
+        self.counters.retain(|hash, c| {
+            let keep = !(c.rate <= 0.0 && c.last_emitted.map_or(false, |v| v <= 0.0));
+            if !keep {
+                pruned.push(*hash);
+            }
+            keep
         });
+        for hash in &pruned {
+            self.in_flight.remove(hash);
+        }
     }
 
     /// Clear the in-flight marker for `hash` without committing
@@ -973,6 +1001,91 @@ mod tests {
         assert!(
             emissions2.iter().any(|(k, _)| *k == h),
             "rollback_emission must re-enable emission on the next tick",
+        );
+    }
+
+    /// Review regression: when a hash is `remove`d while it has
+    /// an outstanding `in_flight` marker (tick fired but the
+    /// caller hasn't yet `commit_emissions`'d), the marker must
+    /// be cleared. A later reintroduction (re-bump → `entry_mut`)
+    /// creates a fresh counter; pre-fix, `tick` would suppress
+    /// every emission for the new counter because
+    /// `in_flight.contains(hash)` was still true from the prior
+    /// counter's lifetime.
+    #[test]
+    fn blob_heat_remove_clears_in_flight_so_reintroduced_hash_emits() {
+        let mut r = BlobHeatRegistry::new();
+        let policy = super::super::policy::DataGravityPolicy::default();
+        let half = policy.decay_half_life;
+        let h = hash(0x77);
+        let now = t0();
+
+        // Heat + tick: marks the hash in-flight.
+        for _ in 0..8 {
+            r.entry_mut(h, half, now).bump(now);
+        }
+        let _ = r.tick(&policy, now);
+
+        // Remove without committing — simulates a GC sweep or
+        // chunk-delete that fires after `tick` returned but before
+        // the caller could `commit_emissions`. Pre-fix the marker
+        // leaked here.
+        r.remove(&h);
+        assert!(r.is_empty());
+
+        // Reintroduce via fresh bumps.
+        for _ in 0..8 {
+            r.entry_mut(h, half, now).bump(now);
+        }
+
+        // The new counter must be able to emit. Pre-fix this
+        // tick returned empty because `in_flight.contains(&h)`
+        // still held from the removed-counter's lifetime.
+        let emissions = r.tick(&policy, now);
+        assert!(
+            emissions.iter().any(|(k, _)| *k == h),
+            "reintroduced hash must emit again; pre-fix in_flight leak suppressed it forever"
+        );
+    }
+
+    /// Same regression for the LRU-eviction path. A counter at
+    /// the cap that gets evicted mid-flight must not leak its
+    /// `in_flight` marker.
+    #[test]
+    fn blob_heat_evict_clears_in_flight() {
+        let mut r = BlobHeatRegistry::with_cap(2);
+        let policy = super::super::policy::DataGravityPolicy::default();
+        let half = policy.decay_half_life;
+        let now = t0();
+        let h_a = hash(0xA1);
+        let h_b = hash(0xB2);
+        let h_c = hash(0xC3);
+
+        for _ in 0..8 {
+            r.entry_mut(h_a, half, now).bump(now);
+        }
+        let _ = r.tick(&policy, now); // h_a in flight
+
+        // Insert h_b then h_c — at cap=2, h_a (LRU) evicts when
+        // h_c lands.
+        for _ in 0..8 {
+            r.entry_mut(h_b, half, now).bump(now);
+        }
+        for _ in 0..8 {
+            r.entry_mut(h_c, half, now).bump(now);
+        }
+        assert!(r.get(&h_a).is_none(), "h_a must have been evicted");
+
+        // Reintroduce h_a. The eviction-cleared in_flight
+        // marker lets the new counter emit on next tick.
+        for _ in 0..8 {
+            r.entry_mut(h_a, half, now).bump(now);
+        }
+        let emissions = r.tick(&policy, now);
+        assert!(
+            emissions.iter().any(|(k, _)| *k == h_a),
+            "reintroduced-after-eviction hash must emit; pre-fix the eviction leak \
+             pinned the new counter as in-flight forever"
         );
     }
 
