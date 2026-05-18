@@ -208,7 +208,11 @@ impl Shard {
     /// [`pop_batch_into`]: Self::pop_batch_into
     #[inline]
     pub fn pop_batch(&mut self, max: usize) -> Vec<InternalEvent> {
-        self.ring_buffer.pop_batch(max)
+        let out = self.ring_buffer.pop_batch(max);
+        if let Some(collector) = &self.metrics_collector {
+            collector.record_buffer_len(self.ring_buffer.len());
+        }
+        out
     }
 
     /// Pop a batch of events into a caller-owned buffer.
@@ -221,13 +225,21 @@ impl Shard {
     /// of the consumer's critical section.
     #[inline]
     pub fn pop_batch_into(&mut self, dst: &mut Vec<InternalEvent>, max: usize) -> usize {
-        self.ring_buffer.pop_batch_into(dst, max)
+        let n = self.ring_buffer.pop_batch_into(dst, max);
+        if let Some(collector) = &self.metrics_collector {
+            collector.record_buffer_len(self.ring_buffer.len());
+        }
+        n
     }
 
     /// Try to pop a single event from the ring buffer.
     #[inline]
     pub fn try_pop(&mut self) -> Option<InternalEvent> {
-        self.ring_buffer.try_pop()
+        let out = self.ring_buffer.try_pop();
+        if let Some(collector) = &self.metrics_collector {
+            collector.record_buffer_len(self.ring_buffer.len());
+        }
+        out
     }
 
     /// Producer-side eviction of the oldest event.
