@@ -92,7 +92,7 @@ fn ffi_guard<R>(name: &'static str, fallback: R, f: impl FnOnce() -> R) -> R {
 /// only fails on global allocator failure, which aborts the
 /// process (same as every other crate-internal `Box::new` path).
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redis_dedup_new(capacity: usize) -> *mut RedisStreamDedupHandle {
+pub unsafe extern "C" fn net_redis_dedup_new(capacity: usize) -> *mut RedisStreamDedupHandle {
     ffi_guard("net_redis_dedup_new", std::ptr::null_mut(), || {
         let inner = if capacity == 0 {
             crate::adapter::RedisStreamDedup::new()
@@ -108,7 +108,7 @@ pub extern "C" fn net_redis_dedup_new(capacity: usize) -> *mut RedisStreamDedupH
 
 /// Free a helper handle. NULL is a no-op.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redis_dedup_free(handle: *mut RedisStreamDedupHandle) {
+pub unsafe extern "C" fn net_redis_dedup_free(handle: *mut RedisStreamDedupHandle) {
     ffi_guard("net_redis_dedup_free", (), || {
         if handle.is_null() {
             return;
@@ -136,7 +136,7 @@ pub extern "C" fn net_redis_dedup_free(handle: *mut RedisStreamDedupHandle) {
 /// error (-1 NULL, -2 invalid UTF-8). See module docs for the
 /// canonical consumer pattern.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redis_dedup_is_duplicate(
+pub unsafe extern "C" fn net_redis_dedup_is_duplicate(
     handle: *mut RedisStreamDedupHandle,
     dedup_id: *const c_char,
 ) -> c_int {
@@ -172,7 +172,7 @@ pub extern "C" fn net_redis_dedup_is_duplicate(
 /// Number of distinct ids currently tracked. Returns 0 on NULL
 /// handle (mirrors the "no ids" semantic).
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redis_dedup_len(handle: *mut RedisStreamDedupHandle) -> usize {
+pub unsafe extern "C" fn net_redis_dedup_len(handle: *mut RedisStreamDedupHandle) -> usize {
     ffi_guard("net_redis_dedup_len", 0, || {
         if handle.is_null() {
             return 0;
@@ -192,7 +192,7 @@ pub extern "C" fn net_redis_dedup_len(handle: *mut RedisStreamDedupHandle) -> us
 
 /// Configured maximum capacity. Returns 0 on NULL handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redis_dedup_capacity(handle: *mut RedisStreamDedupHandle) -> usize {
+pub unsafe extern "C" fn net_redis_dedup_capacity(handle: *mut RedisStreamDedupHandle) -> usize {
     ffi_guard("net_redis_dedup_capacity", 0, || {
         if handle.is_null() {
             return 0;
@@ -213,7 +213,7 @@ pub extern "C" fn net_redis_dedup_capacity(handle: *mut RedisStreamDedupHandle) 
 /// Returns 1 if no ids are tracked, 0 if the helper has at least
 /// one id, -1 on NULL handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redis_dedup_is_empty(handle: *mut RedisStreamDedupHandle) -> c_int {
+pub unsafe extern "C" fn net_redis_dedup_is_empty(handle: *mut RedisStreamDedupHandle) -> c_int {
     ffi_guard("net_redis_dedup_is_empty", -1, || {
         if handle.is_null() {
             return -1;
@@ -237,7 +237,7 @@ pub extern "C" fn net_redis_dedup_is_empty(handle: *mut RedisStreamDedupHandle) 
 
 /// Clear all tracked ids. NULL is a no-op.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_redis_dedup_clear(handle: *mut RedisStreamDedupHandle) {
+pub unsafe extern "C" fn net_redis_dedup_clear(handle: *mut RedisStreamDedupHandle) {
     ffi_guard("net_redis_dedup_clear", (), || {
         if handle.is_null() {
             return;
@@ -292,62 +292,62 @@ mod tests {
     fn null_handle_returns_negative() {
         let id = CString::new("anything").unwrap();
         assert_eq!(
-            net_redis_dedup_is_duplicate(ptr::null_mut(), id.as_ptr()),
+            unsafe { net_redis_dedup_is_duplicate(ptr::null_mut(), id.as_ptr()) },
             -1,
         );
-        assert_eq!(net_redis_dedup_len(ptr::null_mut()), 0);
-        assert_eq!(net_redis_dedup_capacity(ptr::null_mut()), 0);
-        assert_eq!(net_redis_dedup_is_empty(ptr::null_mut()), -1);
+        assert_eq!(unsafe { net_redis_dedup_len(ptr::null_mut()) }, 0);
+        assert_eq!(unsafe { net_redis_dedup_capacity(ptr::null_mut()) }, 0);
+        assert_eq!(unsafe { net_redis_dedup_is_empty(ptr::null_mut()) }, -1);
         // free + clear are no-ops; just verify they don't crash.
-        net_redis_dedup_free(ptr::null_mut());
-        net_redis_dedup_clear(ptr::null_mut());
+        unsafe { net_redis_dedup_free(ptr::null_mut()) };
+        unsafe { net_redis_dedup_clear(ptr::null_mut()) };
     }
 
     #[test]
     fn null_dedup_id_returns_negative() {
-        let h = net_redis_dedup_new(8);
-        assert_eq!(net_redis_dedup_is_duplicate(h, ptr::null()), -1);
-        net_redis_dedup_free(h);
+        let h = unsafe { net_redis_dedup_new(8) };
+        assert_eq!(unsafe { net_redis_dedup_is_duplicate(h, ptr::null()) }, -1);
+        unsafe { net_redis_dedup_free(h) };
     }
 
     #[test]
     fn lifecycle_round_trip_filters_duplicates() {
-        let h = net_redis_dedup_new(0); // 0 → default 4096
-        assert_eq!(net_redis_dedup_capacity(h), 4096);
-        assert_eq!(net_redis_dedup_is_empty(h), 1);
+        let h = unsafe { net_redis_dedup_new(0) }; // 0 → default 4096
+        assert_eq!(unsafe { net_redis_dedup_capacity(h) }, 4096);
+        assert_eq!(unsafe { net_redis_dedup_is_empty(h) }, 1);
 
         let id_a = CString::new("deadbeef:0:0:0").unwrap();
         let id_b = CString::new("deadbeef:0:0:1").unwrap();
 
         // First observation: 0 (not duplicate).
-        assert_eq!(net_redis_dedup_is_duplicate(h, id_a.as_ptr()), 0);
-        assert_eq!(net_redis_dedup_is_duplicate(h, id_b.as_ptr()), 0);
-        assert_eq!(net_redis_dedup_len(h), 2);
-        assert_eq!(net_redis_dedup_is_empty(h), 0);
+        assert_eq!(unsafe { net_redis_dedup_is_duplicate(h, id_a.as_ptr()) }, 0);
+        assert_eq!(unsafe { net_redis_dedup_is_duplicate(h, id_b.as_ptr()) }, 0);
+        assert_eq!(unsafe { net_redis_dedup_len(h) }, 2);
+        assert_eq!(unsafe { net_redis_dedup_is_empty(h) }, 0);
 
         // Retry path: 1 (duplicate).
-        assert_eq!(net_redis_dedup_is_duplicate(h, id_a.as_ptr()), 1);
-        assert_eq!(net_redis_dedup_is_duplicate(h, id_b.as_ptr()), 1);
+        assert_eq!(unsafe { net_redis_dedup_is_duplicate(h, id_a.as_ptr()) }, 1);
+        assert_eq!(unsafe { net_redis_dedup_is_duplicate(h, id_b.as_ptr()) }, 1);
 
-        net_redis_dedup_clear(h);
-        assert_eq!(net_redis_dedup_len(h), 0);
-        assert_eq!(net_redis_dedup_is_empty(h), 1);
+        unsafe { net_redis_dedup_clear(h) };
+        assert_eq!(unsafe { net_redis_dedup_len(h) }, 0);
+        assert_eq!(unsafe { net_redis_dedup_is_empty(h) }, 1);
 
-        net_redis_dedup_free(h);
+        unsafe { net_redis_dedup_free(h) };
     }
 
     #[test]
     fn capacity_zero_is_clamped_to_default() {
-        let h = net_redis_dedup_new(0);
-        assert_eq!(net_redis_dedup_capacity(h), 4096);
-        net_redis_dedup_free(h);
+        let h = unsafe { net_redis_dedup_new(0) };
+        assert_eq!(unsafe { net_redis_dedup_capacity(h) }, 4096);
+        unsafe { net_redis_dedup_free(h) };
     }
 
     #[test]
     fn explicit_capacity_round_trips() {
-        let h = net_redis_dedup_new(8192);
-        assert_eq!(net_redis_dedup_capacity(h), 8192);
-        net_redis_dedup_free(h);
+        let h = unsafe { net_redis_dedup_new(8192) };
+        assert_eq!(unsafe { net_redis_dedup_capacity(h) }, 8192);
+        unsafe { net_redis_dedup_free(h) };
     }
 
     /// Invalid UTF-8 in the dedup_id pointer surfaces as `-2`,
@@ -364,7 +364,7 @@ mod tests {
     fn invalid_utf8_dedup_id_returns_minus_two() {
         use std::ffi::CString;
 
-        let h = net_redis_dedup_new(8);
+        let h = unsafe { net_redis_dedup_new(8) };
 
         // `CString::new` rejects interior NULs but accepts arbitrary
         // bytes. Build a NUL-terminated buffer with a stray 0xC0
@@ -375,13 +375,13 @@ mod tests {
         // contract is "no interior NULs," which holds for the bytes
         // below.
         let bad: CString = unsafe { CString::from_vec_unchecked(vec![0xC0, 0x41]) };
-        let rc = net_redis_dedup_is_duplicate(h, bad.as_ptr());
+        let rc = unsafe { net_redis_dedup_is_duplicate(h, bad.as_ptr()) };
         assert_eq!(rc, -2, "invalid UTF-8 dedup_id must return -2, got {rc}");
 
         // The bad input did NOT mutate the helper.
-        assert_eq!(net_redis_dedup_len(h), 0);
+        assert_eq!(unsafe { net_redis_dedup_len(h) }, 0);
 
-        net_redis_dedup_free(h);
+        unsafe { net_redis_dedup_free(h) };
     }
 
     /// Pin that the C FFI's Mutex wrapping correctly serializes
@@ -407,7 +407,7 @@ mod tests {
         const PER_THREAD: usize = 100;
         const TOTAL: usize = THREADS * PER_THREAD;
 
-        let h = net_redis_dedup_new(TOTAL);
+        let h = unsafe { net_redis_dedup_new(TOTAL) };
         // Wrap the raw pointer in something `Send` — the pointer
         // itself isn't `Send` due to its `*mut` shape, but the
         // documented C-side contract is "you may share this handle
@@ -424,7 +424,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 for i in 0..PER_THREAD {
                     let id = CString::new(format!("t{tid}-id{i}")).unwrap();
-                    let rc = net_redis_dedup_is_duplicate(shared.0, id.as_ptr());
+                    let rc = unsafe { net_redis_dedup_is_duplicate(shared.0, id.as_ptr()) };
                     assert!(
                         rc == 0 || rc == 1,
                         "thread {tid} id {i}: rc {rc} ∉ {{0, 1}} — \
@@ -446,12 +446,12 @@ mod tests {
 
         // Every insert reached the helper.
         assert_eq!(
-            net_redis_dedup_len(h),
+            unsafe { net_redis_dedup_len(h) },
             TOTAL,
             "expected {TOTAL} ids tracked after concurrent inserts; \
              missing ids → concurrent calls dropped mutations",
         );
 
-        net_redis_dedup_free(h);
+        unsafe { net_redis_dedup_free(h) };
     }
 }

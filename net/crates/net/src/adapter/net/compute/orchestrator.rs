@@ -878,9 +878,7 @@ impl SnapshotReassembler {
         // bookkeeping `BTreeMap` entries until `MAX_TOTAL_CHUNKS`
         // alone bounded the abuse. Refuse them at the boundary.
         if snapshot_bytes.is_empty() {
-            return Err(ReassemblyError::ChunkTooLarge {
-                len: 0,
-            });
+            return Err(ReassemblyError::ChunkTooLarge { len: 0 });
         }
         if snapshot_bytes.len() > MAX_SNAPSHOT_CHUNK_SIZE {
             return Err(ReassemblyError::ChunkTooLarge {

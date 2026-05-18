@@ -1635,7 +1635,7 @@ mod tests {
     fn composite_cursor_set_checked_refuses_format_change() {
         let mut cursor = CompositeCursor::new();
         cursor.set(0, "42".to_string()); // JetStream numeric
-        // Same shard, new id in Redis stream format.
+                                         // Same shard, new id in Redis stream format.
         let accepted = cursor.set_checked(0, "1700000000000-0");
         assert!(
             !accepted,
@@ -1696,11 +1696,7 @@ mod tests {
         // 2 events from shard 0 (not 4 — i.e. not fetched twice) plus
         // 1 event from shard 1 = 3 total. Pre-fix this was 5.
         assert_eq!(response.events.len(), 3);
-        let s0_count = response
-            .events
-            .iter()
-            .filter(|e| e.shard_id == 0)
-            .count();
+        let s0_count = response.events.iter().filter(|e| e.shard_id == 0).count();
         assert_eq!(s0_count, 2, "shard 0 events must not be duplicated");
     }
 

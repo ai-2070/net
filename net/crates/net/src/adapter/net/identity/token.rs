@@ -809,8 +809,7 @@ impl TokenCache {
             // walk the wildcard slot. Once set, never cleared:
             // a subsequent eviction just means the fallback walks
             // an empty slot, which is cheap.
-            self.wildcard_inserted
-                .store(true, AtomicOrdering::Relaxed);
+            self.wildcard_inserted.store(true, AtomicOrdering::Relaxed);
         }
 
         // Slot cap: only refuse NOVEL keys at the cap so existing
@@ -866,11 +865,8 @@ impl TokenCache {
     ) -> Result<(), TokenError> {
         // Try exact channel match first
         if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), channel_hash)) {
-            if slot
-                .value()
-                .iter()
-                .any(|t| {
-                    t.is_valid_with_skew(self.clock_skew_secs).is_ok()
+            if slot.value().iter().any(|t| {
+                t.is_valid_with_skew(self.clock_skew_secs).is_ok()
                         && !self.revocation.is_revoked(t)
                         // Defence-in-depth: cross-check the token's
                         // signed `subject` field matches the lookup
@@ -882,8 +878,7 @@ impl TokenCache {
                         // wrong entity here without this check.
                         && t.subject.as_bytes() == subject.as_bytes()
                         && t.authorizes(action, channel_hash)
-                })
-            {
+            }) {
                 return Ok(());
             }
         }
@@ -897,16 +892,12 @@ impl TokenCache {
         }
         // Try wildcard (channel_hash = 0)
         if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), 0)) {
-            if slot
-                .value()
-                .iter()
-                .any(|t| {
-                    t.is_valid_with_skew(self.clock_skew_secs).is_ok()
-                        && !self.revocation.is_revoked(t)
-                        && t.subject.as_bytes() == subject.as_bytes()
-                        && t.authorizes(action, channel_hash)
-                })
-            {
+            if slot.value().iter().any(|t| {
+                t.is_valid_with_skew(self.clock_skew_secs).is_ok()
+                    && !self.revocation.is_revoked(t)
+                    && t.subject.as_bytes() == subject.as_bytes()
+                    && t.authorizes(action, channel_hash)
+            }) {
                 return Ok(());
             }
         }
@@ -1680,10 +1671,7 @@ mod tests {
         let payload = token.signed_payload();
         token.signature = issuer.sign(&payload).to_bytes();
         assert!(
-            matches!(
-                token.is_valid_with_skew(skew),
-                Err(TokenError::NotYetValid),
-            ),
+            matches!(token.is_valid_with_skew(skew), Err(TokenError::NotYetValid),),
             "is_valid_with_skew must reject tokens past the future-skew window",
         );
     }
@@ -1876,11 +1864,7 @@ mod tests {
         parent.signature = issuer.sign(&payload).to_bytes();
 
         let child = parent
-            .delegate(
-                &intermediate,
-                leaf.entity_id().clone(),
-                TokenScope::PUBLISH,
-            )
+            .delegate(&intermediate, leaf.entity_id().clone(), TokenScope::PUBLISH)
             .expect("delegate should succeed");
         assert_eq!(
             child.issuer_generation, 7,

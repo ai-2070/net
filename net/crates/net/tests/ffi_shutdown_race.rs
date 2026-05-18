@@ -97,7 +97,7 @@ fn ffi_shutdown_dekker_handshake_holds_under_contention() {
     let total_saw_shutdown = Arc::new(AtomicU64::new(0));
 
     for iter in 0..ITERATIONS {
-        let handle = net_init(ptr::null());
+        let handle = unsafe { net_init(ptr::null()) };
         assert!(!handle.is_null(), "net_init failed on iter {iter}");
         let h = HandlePtr(handle);
 
@@ -122,12 +122,14 @@ fn ffi_shutdown_dekker_handshake_holds_under_contention() {
                         shard_id: 0,
                         timestamp: 0,
                     };
-                    let code = net_ingest_raw_ex(
-                        h.0,
-                        json_bytes.as_ptr() as *const c_char,
-                        json_bytes.len(),
-                        &mut receipt as *mut NetReceipt,
-                    );
+                    let code = unsafe {
+                        net_ingest_raw_ex(
+                            h.0,
+                            json_bytes.as_ptr() as *const c_char,
+                            json_bytes.len(),
+                            &mut receipt as *mut NetReceipt,
+                        )
+                    };
                     assert!(
                         is_acceptable_ingest_code(code),
                         "ingest worker {worker_id} got unexpected code {code} on iter {iter}"
@@ -139,18 +141,20 @@ fn ffi_shutdown_dekker_handshake_holds_under_contention() {
                     local_acceptable += 1;
 
                     let mut result = empty_poll_result();
-                    let code = net_poll_ex(
-                        h.0,
-                        16,
-                        ptr::null::<c_char>(),
-                        &mut result as *mut NetPollResult,
-                    );
+                    let code = unsafe {
+                        net_poll_ex(
+                            h.0,
+                            16,
+                            ptr::null::<c_char>(),
+                            &mut result as *mut NetPollResult,
+                        )
+                    };
                     assert!(
                         is_acceptable_poll_code(code),
                         "poll worker {worker_id} got unexpected code {code} on iter {iter}"
                     );
                     if code == NET_ERR_SUCCESS {
-                        net_free_poll_result(&mut result as *mut NetPollResult);
+                        unsafe { net_free_poll_result(&mut result as *mut NetPollResult) };
                     }
                     if code == NET_ERR_SHUTTING_DOWN {
                         saw_shutdown = true;
@@ -172,7 +176,7 @@ fn ffi_shutdown_dekker_handshake_holds_under_contention() {
         let delay_ms = rand::rng().random_range(0..=5);
         thread::sleep(Duration::from_millis(delay_ms));
 
-        let rc = net_shutdown(h.0);
+        let rc = unsafe { net_shutdown(h.0) };
         assert_eq!(rc, 0, "net_shutdown failed on iter {iter} (rc={rc})");
 
         // After net_shutdown returns, every worker must have either
@@ -234,11 +238,11 @@ fn ffi_shutdown_dekker_handshake_holds_under_contention() {
 /// `ShuttingDown` and the process must remain stable.
 #[test]
 fn ffi_calls_after_shutdown_return_shutting_down_not_uaf() {
-    let handle = net_init(ptr::null());
+    let handle = unsafe { net_init(ptr::null()) };
     assert!(!handle.is_null());
 
     // Clean shutdown with no in-flight ops.
-    let code = net_shutdown(handle);
+    let code = unsafe { net_shutdown(handle) };
     assert_eq!(code, NET_ERR_SUCCESS);
 
     // Now intentionally violate the "don't use after shutdown"
@@ -261,12 +265,14 @@ fn ffi_calls_after_shutdown_return_shutting_down_not_uaf() {
                     shard_id: 0,
                     timestamp: 0,
                 };
-                let code = net_ingest_raw_ex(
-                    h.0,
-                    json.as_ptr() as *const c_char,
-                    json.len(),
-                    &mut receipt as *mut NetReceipt,
-                );
+                let code = unsafe {
+                    net_ingest_raw_ex(
+                        h.0,
+                        json.as_ptr() as *const c_char,
+                        json.len(),
+                        &mut receipt as *mut NetReceipt,
+                    )
+                };
                 assert_eq!(
                     code, NET_ERR_SHUTTING_DOWN,
                     "post-shutdown ingest must return ShuttingDown, got {code}"
@@ -282,7 +288,7 @@ fn ffi_calls_after_shutdown_return_shutting_down_not_uaf() {
     // crash. It returns Unknown because the bus has already been
     // taken out, but that's fine — the contract violation is
     // calling FFI after shutdown, and the caller has been told.
-    let code = net_shutdown(handle);
+    let code = unsafe { net_shutdown(handle) };
     // Either Success (if a no-op fast path) or Unknown is acceptable;
     // the only thing that must not happen is a crash.
     assert!(code == NET_ERR_SUCCESS || code == -99, "got {code}");

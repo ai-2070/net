@@ -1070,7 +1070,10 @@ mod tests {
         }
 
         let metrics = collector.collect_and_reset();
-        assert_eq!(metrics.event_rate, 16, "every push must increment event_rate");
+        assert_eq!(
+            metrics.event_rate, 16,
+            "every push must increment event_rate"
+        );
         assert!(metrics.fill_ratio > 0.0, "buffer length must be observable");
         assert!(
             metrics.avg_push_latency_ns > 0,

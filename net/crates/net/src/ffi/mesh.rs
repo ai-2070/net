@@ -430,7 +430,7 @@ pub struct MeshNodeHandle {
 /// Installs an empty `ChannelConfigRegistry` at creation time so
 /// `net_mesh_register_channel` can insert without a mutable ref.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_new(
+pub unsafe extern "C" fn net_mesh_new(
     config_json: *const c_char,
     out_handle: *mut *mut MeshNodeHandle,
 ) -> c_int {
@@ -558,7 +558,7 @@ pub extern "C" fn net_mesh_new(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_free(handle: *mut MeshNodeHandle) {
+pub unsafe extern "C" fn net_mesh_free(handle: *mut MeshNodeHandle) {
     if handle.is_null() {
         return;
     }
@@ -592,7 +592,7 @@ pub extern "C" fn net_mesh_free(handle: *mut MeshNodeHandle) {
 /// Caller takes ownership of the returned pointer and MUST free it
 /// with [`net_mesh_arc_free`]. Returns NULL if `handle` is NULL.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_arc_clone(handle: *mut MeshNodeHandle) -> *mut Arc<MeshNode> {
+pub unsafe extern "C" fn net_mesh_arc_clone(handle: *mut MeshNodeHandle) -> *mut Arc<MeshNode> {
     if handle.is_null() {
         return std::ptr::null_mut();
     }
@@ -613,7 +613,7 @@ pub extern "C" fn net_mesh_arc_clone(handle: *mut MeshNodeHandle) -> *mut Arc<Me
 /// Caller takes ownership and MUST free with
 /// [`net_mesh_channel_configs_arc_free`].
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_channel_configs_arc_clone(
+pub unsafe extern "C" fn net_mesh_channel_configs_arc_clone(
     handle: *mut MeshNodeHandle,
 ) -> *mut Arc<ChannelConfigRegistry> {
     if handle.is_null() {
@@ -632,7 +632,7 @@ pub extern "C" fn net_mesh_channel_configs_arc_clone(
 /// Free an `Arc<MeshNode>` handle produced by
 /// [`net_mesh_arc_clone`]. Idempotent on NULL.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_arc_free(p: *mut Arc<MeshNode>) {
+pub unsafe extern "C" fn net_mesh_arc_free(p: *mut Arc<MeshNode>) {
     if p.is_null() {
         return;
     }
@@ -644,7 +644,7 @@ pub extern "C" fn net_mesh_arc_free(p: *mut Arc<MeshNode>) {
 /// Free an `Arc<ChannelConfigRegistry>` handle produced by
 /// [`net_mesh_channel_configs_arc_clone`]. Idempotent on NULL.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_channel_configs_arc_free(p: *mut Arc<ChannelConfigRegistry>) {
+pub unsafe extern "C" fn net_mesh_channel_configs_arc_free(p: *mut Arc<ChannelConfigRegistry>) {
     if p.is_null() {
         return;
     }
@@ -656,7 +656,7 @@ pub extern "C" fn net_mesh_channel_configs_arc_free(p: *mut Arc<ChannelConfigReg
 /// Write the hex-encoded 32-byte Noise static public key of this
 /// node to `*out`. Caller frees via `net_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_public_key_hex(
+pub unsafe extern "C" fn net_mesh_public_key_hex(
     handle: *mut MeshNodeHandle,
     out_ptr: *mut *mut c_char,
     out_len: *mut usize,
@@ -674,7 +674,7 @@ pub extern "C" fn net_mesh_public_key_hex(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_node_id(handle: *mut MeshNodeHandle) -> u64 {
+pub unsafe extern "C" fn net_mesh_node_id(handle: *mut MeshNodeHandle) -> u64 {
     if handle.is_null() {
         return 0;
     }
@@ -691,7 +691,7 @@ pub extern "C" fn net_mesh_node_id(handle: *mut MeshNodeHandle) -> u64 {
 /// Matches `Identity::from_seed(seed).entity_id` when the mesh was
 /// constructed with `identity_seed_hex = hex::encode(seed)`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_entity_id(handle: *mut MeshNodeHandle, out: *mut u8) -> c_int {
+pub unsafe extern "C" fn net_mesh_entity_id(handle: *mut MeshNodeHandle, out: *mut u8) -> c_int {
     if handle.is_null() || out.is_null() {
         return NetError::NullPointer.into();
     }
@@ -709,7 +709,7 @@ pub extern "C" fn net_mesh_entity_id(handle: *mut MeshNodeHandle, out: *mut u8) 
 
 /// Connect (initiator). Blocks until the handshake completes.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_connect(
+pub unsafe extern "C" fn net_mesh_connect(
     handle: *mut MeshNodeHandle,
     peer_addr: *const c_char,
     peer_pubkey_hex: *const c_char,
@@ -753,7 +753,7 @@ pub extern "C" fn net_mesh_connect(
 /// Accept an incoming connection (responder). Writes the peer's wire
 /// address to `*out_addr` (caller frees via `net_free_string`).
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_accept(
+pub unsafe extern "C" fn net_mesh_accept(
     handle: *mut MeshNodeHandle,
     peer_node_id: u64,
     out_addr: *mut *mut c_char,
@@ -775,7 +775,7 @@ pub extern "C" fn net_mesh_accept(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_start(handle: *mut MeshNodeHandle) -> c_int {
+pub unsafe extern "C" fn net_mesh_start(handle: *mut MeshNodeHandle) -> c_int {
     if handle.is_null() {
         return NetError::NullPointer.into();
     }
@@ -803,7 +803,7 @@ pub extern "C" fn net_mesh_start(handle: *mut MeshNodeHandle) -> c_int {
 /// stopping — the node kept running until every stream was
 /// dropped. Callers now always get the real shutdown outcome.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_shutdown(handle: *mut MeshNodeHandle) -> c_int {
+pub unsafe extern "C" fn net_mesh_shutdown(handle: *mut MeshNodeHandle) -> c_int {
     if handle.is_null() {
         return NetError::NullPointer.into();
     }
@@ -841,7 +841,7 @@ pub extern "C" fn net_mesh_shutdown(handle: *mut MeshNodeHandle) -> c_int {
 /// present when the crate is built with `--features nat-traversal`.
 #[cfg(feature = "nat-traversal")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_nat_type(
+pub unsafe extern "C" fn net_mesh_nat_type(
     handle: *mut MeshNodeHandle,
     out_str: *mut *mut c_char,
     out_len: *mut usize,
@@ -867,7 +867,7 @@ pub extern "C" fn net_mesh_nat_type(
 /// string and still returns `0`.
 #[cfg(feature = "nat-traversal")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_reflex_addr(
+pub unsafe extern "C" fn net_mesh_reflex_addr(
     handle: *mut MeshNodeHandle,
     out_str: *mut *mut c_char,
     out_len: *mut usize,
@@ -893,7 +893,7 @@ pub extern "C" fn net_mesh_reflex_addr(
 /// `"unknown"` when we have no announcement from that peer.
 #[cfg(feature = "nat-traversal")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_peer_nat_type(
+pub unsafe extern "C" fn net_mesh_peer_nat_type(
     handle: *mut MeshNodeHandle,
     peer_node_id: u64,
     out_str: *mut *mut c_char,
@@ -924,7 +924,7 @@ pub extern "C" fn net_mesh_peer_nat_type(
 /// means we have no session with `peer_node_id`.
 #[cfg(feature = "nat-traversal")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_probe_reflex(
+pub unsafe extern "C" fn net_mesh_probe_reflex(
     handle: *mut MeshNodeHandle,
     peer_node_id: u64,
     out_str: *mut *mut c_char,
@@ -951,7 +951,7 @@ pub extern "C" fn net_mesh_probe_reflex(
 /// `reflex_addr` afterward.
 #[cfg(feature = "nat-traversal")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_reclassify_nat(handle: *mut MeshNodeHandle) -> c_int {
+pub unsafe extern "C" fn net_mesh_reclassify_nat(handle: *mut MeshNodeHandle) -> c_int {
     if handle.is_null() {
         return NetError::NullPointer.into();
     }
@@ -971,7 +971,7 @@ pub extern "C" fn net_mesh_reclassify_nat(handle: *mut MeshNodeHandle) -> c_int 
 /// counters never decrease or reset.
 #[cfg(feature = "nat-traversal")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_traversal_stats(
+pub unsafe extern "C" fn net_mesh_traversal_stats(
     handle: *mut MeshNodeHandle,
     out_punches_attempted: *mut u64,
     out_punches_succeeded: *mut u64,
@@ -1013,7 +1013,7 @@ pub extern "C" fn net_mesh_traversal_stats(
 /// `NET_ERR_MESH_HANDSHAKE` code on failure.
 #[cfg(feature = "nat-traversal")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_connect_direct(
+pub unsafe extern "C" fn net_mesh_connect_direct(
     handle: *mut MeshNodeHandle,
     peer_node_id: u64,
     peer_pubkey_hex: *const c_char,
@@ -1056,7 +1056,7 @@ pub extern "C" fn net_mesh_connect_direct(
 /// address.
 #[cfg(feature = "nat-traversal")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_set_reflex_override(
+pub unsafe extern "C" fn net_mesh_set_reflex_override(
     handle: *mut MeshNodeHandle,
     external: *const c_char,
 ) -> c_int {
@@ -1087,7 +1087,7 @@ pub extern "C" fn net_mesh_set_reflex_override(
 /// live handle.
 #[cfg(feature = "nat-traversal")]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_clear_reflex_override(handle: *mut MeshNodeHandle) -> c_int {
+pub unsafe extern "C" fn net_mesh_clear_reflex_override(handle: *mut MeshNodeHandle) -> c_int {
     if handle.is_null() {
         return NetError::NullPointer.into();
     }
@@ -1124,7 +1124,7 @@ pub extern "C" fn net_mesh_clear_reflex_override(handle: *mut MeshNodeHandle) ->
 
 #[cfg(not(feature = "nat-traversal"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_nat_type(
+pub unsafe extern "C" fn net_mesh_nat_type(
     _handle: *mut MeshNodeHandle,
     _out_str: *mut *mut c_char,
     _out_len: *mut usize,
@@ -1134,7 +1134,7 @@ pub extern "C" fn net_mesh_nat_type(
 
 #[cfg(not(feature = "nat-traversal"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_reflex_addr(
+pub unsafe extern "C" fn net_mesh_reflex_addr(
     _handle: *mut MeshNodeHandle,
     _out_str: *mut *mut c_char,
     _out_len: *mut usize,
@@ -1144,18 +1144,7 @@ pub extern "C" fn net_mesh_reflex_addr(
 
 #[cfg(not(feature = "nat-traversal"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_peer_nat_type(
-    _handle: *mut MeshNodeHandle,
-    _peer_node_id: u64,
-    _out_str: *mut *mut c_char,
-    _out_len: *mut usize,
-) -> c_int {
-    NET_ERR_TRAVERSAL_UNSUPPORTED
-}
-
-#[cfg(not(feature = "nat-traversal"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_probe_reflex(
+pub unsafe extern "C" fn net_mesh_peer_nat_type(
     _handle: *mut MeshNodeHandle,
     _peer_node_id: u64,
     _out_str: *mut *mut c_char,
@@ -1166,13 +1155,24 @@ pub extern "C" fn net_mesh_probe_reflex(
 
 #[cfg(not(feature = "nat-traversal"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_reclassify_nat(_handle: *mut MeshNodeHandle) -> c_int {
+pub unsafe extern "C" fn net_mesh_probe_reflex(
+    _handle: *mut MeshNodeHandle,
+    _peer_node_id: u64,
+    _out_str: *mut *mut c_char,
+    _out_len: *mut usize,
+) -> c_int {
     NET_ERR_TRAVERSAL_UNSUPPORTED
 }
 
 #[cfg(not(feature = "nat-traversal"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_traversal_stats(
+pub unsafe extern "C" fn net_mesh_reclassify_nat(_handle: *mut MeshNodeHandle) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_traversal_stats(
     _handle: *mut MeshNodeHandle,
     _out_punches_attempted: *mut u64,
     _out_punches_succeeded: *mut u64,
@@ -1183,7 +1183,7 @@ pub extern "C" fn net_mesh_traversal_stats(
 
 #[cfg(not(feature = "nat-traversal"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_connect_direct(
+pub unsafe extern "C" fn net_mesh_connect_direct(
     _handle: *mut MeshNodeHandle,
     _peer_node_id: u64,
     _peer_pubkey_hex: *const c_char,
@@ -1194,7 +1194,7 @@ pub extern "C" fn net_mesh_connect_direct(
 
 #[cfg(not(feature = "nat-traversal"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_set_reflex_override(
+pub unsafe extern "C" fn net_mesh_set_reflex_override(
     _handle: *mut MeshNodeHandle,
     _external: *const c_char,
 ) -> c_int {
@@ -1203,7 +1203,7 @@ pub extern "C" fn net_mesh_set_reflex_override(
 
 #[cfg(not(feature = "nat-traversal"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_clear_reflex_override(_handle: *mut MeshNodeHandle) -> c_int {
+pub unsafe extern "C" fn net_mesh_clear_reflex_override(_handle: *mut MeshNodeHandle) -> c_int {
     NET_ERR_TRAVERSAL_UNSUPPORTED
 }
 
@@ -1244,7 +1244,7 @@ pub struct MeshStreamHandle {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_open_stream(
+pub unsafe extern "C" fn net_mesh_open_stream(
     handle: *mut MeshNodeHandle,
     peer_node_id: u64,
     stream_id: u64,
@@ -1299,7 +1299,7 @@ pub extern "C" fn net_mesh_open_stream(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_stream_free(handle: *mut MeshStreamHandle) {
+pub unsafe extern "C" fn net_mesh_stream_free(handle: *mut MeshStreamHandle) {
     if handle.is_null() {
         return;
     }
@@ -1373,7 +1373,7 @@ fn handles_match(sh: &MeshStreamHandle, nh: &MeshNodeHandle) -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_send(
+pub unsafe extern "C" fn net_mesh_send(
     handle: *mut MeshStreamHandle,
     payloads: *const *const u8,
     lens: *const usize,
@@ -1414,7 +1414,7 @@ pub extern "C" fn net_mesh_send(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_send_with_retry(
+pub unsafe extern "C" fn net_mesh_send_with_retry(
     handle: *mut MeshStreamHandle,
     payloads: *const *const u8,
     lens: *const usize,
@@ -1459,7 +1459,7 @@ pub extern "C" fn net_mesh_send_with_retry(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_send_blocking(
+pub unsafe extern "C" fn net_mesh_send_blocking(
     handle: *mut MeshStreamHandle,
     payloads: *const *const u8,
     lens: *const usize,
@@ -1514,7 +1514,7 @@ struct StreamStatsJson {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_stream_stats(
+pub unsafe extern "C" fn net_mesh_stream_stats(
     node_handle: *mut MeshNodeHandle,
     peer_node_id: u64,
     stream_id: u64,
@@ -1567,7 +1567,7 @@ struct RecvEventJson {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_recv_shard(
+pub unsafe extern "C" fn net_mesh_recv_shard(
     handle: *mut MeshNodeHandle,
     shard_id: u16,
     limit: u32,
@@ -1666,7 +1666,7 @@ fn parse_visibility(s: &str) -> Option<InnerVisibility> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_register_channel(
+pub unsafe extern "C" fn net_mesh_register_channel(
     handle: *mut MeshNodeHandle,
     config_json: *const c_char,
 ) -> c_int {
@@ -1719,7 +1719,7 @@ pub extern "C" fn net_mesh_register_channel(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_subscribe_channel(
+pub unsafe extern "C" fn net_mesh_subscribe_channel(
     handle: *mut MeshNodeHandle,
     publisher_node_id: u64,
     channel: *const c_char,
@@ -1728,7 +1728,7 @@ pub extern "C" fn net_mesh_subscribe_channel(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_unsubscribe_channel(
+pub unsafe extern "C" fn net_mesh_unsubscribe_channel(
     handle: *mut MeshNodeHandle,
     publisher_node_id: u64,
     channel: *const c_char,
@@ -1743,7 +1743,7 @@ pub extern "C" fn net_mesh_unsubscribe_channel(
 /// publisher side; a tampered token will surface as
 /// `NET_ERR_CHANNEL_AUTH` rather than a token error in this call.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_subscribe_channel_with_token(
+pub unsafe extern "C" fn net_mesh_subscribe_channel_with_token(
     handle: *mut MeshNodeHandle,
     publisher_node_id: u64,
     channel: *const c_char,
@@ -1865,7 +1865,7 @@ fn to_publish_report_json(r: InnerPublishReport) -> PublishReportJson {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_publish(
+pub unsafe extern "C" fn net_mesh_publish(
     handle: *mut MeshNodeHandle,
     channel: *const c_char,
     payload: *const u8,
@@ -2029,7 +2029,7 @@ fn alloc_bytes(src: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) -> c_int 
 /// boundary into a C / Go-cgo / NAPI / PyO3 caller — undefined
 /// behaviour.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_free_bytes(ptr: *mut u8, len: usize) {
+pub unsafe extern "C" fn net_free_bytes(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
         return;
     }
@@ -2099,7 +2099,7 @@ fn channel_name_to_hash(channel: &str) -> Option<ChannelHash> {
 /// Generate a fresh ed25519 identity. Writes an owned handle to
 /// `*out_handle`. Free via `net_identity_free`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_identity_generate(out_handle: *mut *mut IdentityHandle) -> c_int {
+pub unsafe extern "C" fn net_identity_generate(out_handle: *mut *mut IdentityHandle) -> c_int {
     if out_handle.is_null() {
         return NetError::NullPointer.into();
     }
@@ -2118,7 +2118,7 @@ pub extern "C" fn net_identity_generate(out_handle: *mut *mut IdentityHandle) ->
 /// Installs a fresh, empty `TokenCache` — reinstall tokens via
 /// `net_identity_install_token` after rehydrating from disk.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_identity_from_seed(
+pub unsafe extern "C" fn net_identity_from_seed(
     seed: *const u8,
     seed_len: usize,
     out_handle: *mut *mut IdentityHandle,
@@ -2143,7 +2143,7 @@ pub extern "C" fn net_identity_from_seed(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_identity_free(handle: *mut IdentityHandle) {
+pub unsafe extern "C" fn net_identity_free(handle: *mut IdentityHandle) {
     if handle.is_null() {
         return;
     }
@@ -2169,7 +2169,7 @@ pub extern "C" fn net_identity_free(handle: *mut IdentityHandle) {
 /// Write the 32-byte ed25519 seed into `out[32]`. Caller must pass
 /// a buffer of at least 32 bytes.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_identity_to_seed(handle: *mut IdentityHandle, out: *mut u8) -> c_int {
+pub unsafe extern "C" fn net_identity_to_seed(handle: *mut IdentityHandle, out: *mut u8) -> c_int {
     if handle.is_null() || out.is_null() {
         return NetError::NullPointer.into();
     }
@@ -2187,7 +2187,10 @@ pub extern "C" fn net_identity_to_seed(handle: *mut IdentityHandle, out: *mut u8
 
 /// Write the 32-byte entity id into `out[32]`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_identity_entity_id(handle: *mut IdentityHandle, out: *mut u8) -> c_int {
+pub unsafe extern "C" fn net_identity_entity_id(
+    handle: *mut IdentityHandle,
+    out: *mut u8,
+) -> c_int {
     if handle.is_null() || out.is_null() {
         return NetError::NullPointer.into();
     }
@@ -2204,7 +2207,7 @@ pub extern "C" fn net_identity_entity_id(handle: *mut IdentityHandle, out: *mut 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_identity_node_id(handle: *mut IdentityHandle) -> u64 {
+pub unsafe extern "C" fn net_identity_node_id(handle: *mut IdentityHandle) -> u64 {
     if handle.is_null() {
         return 0;
     }
@@ -2218,7 +2221,7 @@ pub extern "C" fn net_identity_node_id(handle: *mut IdentityHandle) -> u64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_identity_origin_hash(handle: *mut IdentityHandle) -> u64 {
+pub unsafe extern "C" fn net_identity_origin_hash(handle: *mut IdentityHandle) -> u64 {
     if handle.is_null() {
         return 0;
     }
@@ -2234,7 +2237,7 @@ pub extern "C" fn net_identity_origin_hash(handle: *mut IdentityHandle) -> u64 {
 /// Sign `msg[len]` with the identity's ed25519 secret key. Writes a
 /// 64-byte signature into `out_sig[64]`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_identity_sign(
+pub unsafe extern "C" fn net_identity_sign(
     handle: *mut IdentityHandle,
     msg: *const u8,
     len: usize,
@@ -2269,7 +2272,7 @@ pub extern "C" fn net_identity_sign(
 /// Issue a token to `subject`. Writes a newly-allocated blob to
 /// `*out_token`; caller frees via `net_free_bytes(ptr, *out_len)`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_identity_issue_token(
+pub unsafe extern "C" fn net_identity_issue_token(
     signer: *mut IdentityHandle,
     subject: *const u8,
     subject_len: usize,
@@ -2329,7 +2332,7 @@ pub extern "C" fn net_identity_issue_token(
 /// structural checks run on insert; malformed or tampered tokens
 /// return the relevant `NET_ERR_TOKEN_*` code.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_identity_install_token(
+pub unsafe extern "C" fn net_identity_install_token(
     handle: *mut IdentityHandle,
     token: *const u8,
     len: usize,
@@ -2361,7 +2364,7 @@ pub extern "C" fn net_identity_install_token(
 /// allocated blob to `*out_token` on hit; writes `NULL` / `0` on
 /// miss. Caller must always free on hit via `net_free_bytes`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_identity_lookup_token(
+pub unsafe extern "C" fn net_identity_lookup_token(
     handle: *mut IdentityHandle,
     subject: *const u8,
     subject_len: usize,
@@ -2399,7 +2402,7 @@ pub extern "C" fn net_identity_lookup_token(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_identity_token_cache_len(handle: *mut IdentityHandle) -> u32 {
+pub unsafe extern "C" fn net_identity_token_cache_len(handle: *mut IdentityHandle) -> u32 {
     if handle.is_null() {
         return 0;
     }
@@ -2434,7 +2437,7 @@ struct ParsedTokenJson {
 /// `signature_hex`) so the JSON round-trips cleanly. Binary variants
 /// live on the `Identity` handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_parse_token(
+pub unsafe extern "C" fn net_parse_token(
     token: *const u8,
     len: usize,
     out_json: *mut *mut c_char,
@@ -2470,7 +2473,11 @@ pub extern "C" fn net_parse_token(
 /// valid / `0` for tampered-or-wrong-subject. Time-bound validity is
 /// a separate check — see `net_token_is_expired`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_verify_token(token: *const u8, len: usize, out_ok: *mut c_int) -> c_int {
+pub unsafe extern "C" fn net_verify_token(
+    token: *const u8,
+    len: usize,
+    out_ok: *mut c_int,
+) -> c_int {
     if token.is_null() || out_ok.is_null() {
         return NetError::NullPointer.into();
     }
@@ -2494,7 +2501,7 @@ pub extern "C" fn net_verify_token(token: *const u8, len: usize, out_ok: *mut c_
 /// token still reports `1`. Use `net_verify_token` for signature
 /// integrity.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_token_is_expired(
+pub unsafe extern "C" fn net_token_is_expired(
     token: *const u8,
     len: usize,
     out_expired: *mut c_int,
@@ -2520,7 +2527,7 @@ pub extern "C" fn net_token_is_expired(
 /// Delegate a token to a new subject. Returns the child token blob;
 /// caller frees via `net_free_bytes`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_delegate_token(
+pub unsafe extern "C" fn net_delegate_token(
     signer: *mut IdentityHandle,
     parent: *const u8,
     parent_len: usize,
@@ -2576,7 +2583,7 @@ pub extern "C" fn net_delegate_token(
 /// hash used by `NetHeader::channel_hash` is the low 16 bits of
 /// the returned value. Returns `NET_ERR_IDENTITY` for invalid names.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_channel_hash(channel: *const c_char, out_hash: *mut u64) -> c_int {
+pub unsafe extern "C" fn net_channel_hash(channel: *const c_char, out_hash: *mut u64) -> c_int {
     if channel.is_null() || out_hash.is_null() {
         return NetError::NullPointer.into();
     }
@@ -3082,7 +3089,7 @@ pub(crate) const NET_ERR_CAPABILITY: c_int = -128;
 /// `caps_json` is the same POJO shape as PyO3 / NAPI:
 /// `{hardware, software, models, tools, tags, limits}`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_announce_capabilities(
+pub unsafe extern "C" fn net_mesh_announce_capabilities(
     handle: *mut MeshNodeHandle,
     caps_json: *const c_char,
 ) -> c_int {
@@ -3112,7 +3119,7 @@ pub extern "C" fn net_mesh_announce_capabilities(
 /// Query the local capability index. Writes a JSON array of node
 /// ids (u64) to `*out_json`; caller frees via `net_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_find_nodes(
+pub unsafe extern "C" fn net_mesh_find_nodes(
     handle: *mut MeshNodeHandle,
     filter_json: *const c_char,
     out_json: *mut *mut c_char,
@@ -3276,7 +3283,7 @@ fn with_scope_filter<R>(
 /// Result: JSON array of u64 node ids written to `*out_json`;
 /// caller frees via `net_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_find_nodes_scoped(
+pub unsafe extern "C" fn net_mesh_find_nodes_scoped(
     handle: *mut MeshNodeHandle,
     filter_json: *const c_char,
     scope_json: *const c_char,
@@ -3367,7 +3374,7 @@ fn capability_requirement_from_json(
 /// `CapabilityRequirementJson` struct above — a `filter` object
 /// plus four optional `prefer_*` weights in `[0.0, 1.0]`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_find_best_node(
+pub unsafe extern "C" fn net_mesh_find_best_node(
     handle: *mut MeshNodeHandle,
     requirement_json: *const c_char,
     out_node_id: *mut u64,
@@ -3414,7 +3421,7 @@ pub extern "C" fn net_mesh_find_best_node(
 /// `*out_has_match = 1` + `*out_node_id = winner` on hit;
 /// `*out_has_match = 0` on no match.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_find_best_node_scoped(
+pub unsafe extern "C" fn net_mesh_find_best_node_scoped(
     handle: *mut MeshNodeHandle,
     requirement_json: *const c_char,
     scope_json: *const c_char,
@@ -3465,7 +3472,7 @@ pub extern "C" fn net_mesh_find_best_node_scoped(
 
 /// Normalize a GPU vendor string to its canonical lowercase form.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_normalize_gpu_vendor(
+pub unsafe extern "C" fn net_normalize_gpu_vendor(
     raw: *const c_char,
     out_json: *mut *mut c_char,
     out_len: *mut usize,
@@ -3626,19 +3633,19 @@ mod tests {
             }
             // Freeing with a null or zero-len must be a no-op; freeing
             // a real buffer must not abort or corrupt the allocator.
-            net_free_bytes(ptr, len);
+            unsafe { net_free_bytes(ptr, len) };
         }
     }
 
     #[test]
     fn net_free_bytes_null_and_zero_len_are_noops() {
         // Both explicitly documented as safe no-ops.
-        net_free_bytes(std::ptr::null_mut(), 0);
-        net_free_bytes(std::ptr::null_mut(), 42);
+        unsafe { net_free_bytes(std::ptr::null_mut(), 0) };
+        unsafe { net_free_bytes(std::ptr::null_mut(), 42) };
         // A non-null pointer with len == 0 is also a no-op — we must
         // not try to free it, since we never allocated.
         let mut sentinel: u8 = 0;
-        net_free_bytes(&mut sentinel as *mut u8, 0);
+        unsafe { net_free_bytes(&mut sentinel as *mut u8, 0) };
     }
 
     /// `net_free_bytes` must NOT panic when called with a
@@ -3665,7 +3672,7 @@ mod tests {
         let ptr = &mut sentinel as *mut u8;
         // `usize::MAX` is well past `isize::MAX`, so
         // `Layout::array::<u8>(usize::MAX)` is `Err(LayoutError)`.
-        net_free_bytes(ptr, usize::MAX);
+        unsafe { net_free_bytes(ptr, usize::MAX) };
         // If we got here without panicking, the fix is in place.
         // Sentinel must still be untouched (we never tried to free).
         assert_eq!(sentinel, 0, "sentinel must not have been written through");
@@ -3687,7 +3694,7 @@ mod tests {
         });
         let cfg_c = CString::new(cfg.to_string()).unwrap();
         let mut out: *mut MeshNodeHandle = std::ptr::null_mut();
-        let rc = net_mesh_new(cfg_c.as_ptr(), &mut out);
+        let rc = unsafe { net_mesh_new(cfg_c.as_ptr(), &mut out) };
         assert_eq!(rc, 0, "net_mesh_new failed: {rc}");
         assert!(!out.is_null());
 
@@ -3700,7 +3707,7 @@ mod tests {
         assert!(Arc::strong_count(&inner_clone) >= 2);
         assert!(!inner_clone.is_shutdown());
 
-        let rc = net_mesh_shutdown(out);
+        let rc = unsafe { net_mesh_shutdown(out) };
         assert_eq!(rc, 0, "net_mesh_shutdown returned {rc}");
         assert!(
             inner_clone.is_shutdown(),
@@ -3711,7 +3718,7 @@ mod tests {
         // Use the production _free; it drains via HandleGuard and
         // takes inner. The outer box is intentionally leaked
         // (small per-call leak; acceptable in tests).
-        net_mesh_free(out);
+        unsafe { net_mesh_free(out) };
     }
 
     /// Regression: BUG_REPORT.md #19 — `net_mesh_send` family
@@ -3734,7 +3741,7 @@ mod tests {
             });
             let cfg_c = CString::new(cfg.to_string()).unwrap();
             let mut out: *mut MeshNodeHandle = std::ptr::null_mut();
-            let rc = net_mesh_new(cfg_c.as_ptr(), &mut out);
+            let rc = unsafe { net_mesh_new(cfg_c.as_ptr(), &mut out) };
             assert_eq!(rc, 0);
             assert!(!out.is_null());
             out
@@ -3789,8 +3796,8 @@ mod tests {
             let _ = ManuallyDrop::take(&mut sh_a.stream);
             let _ = ManuallyDrop::take(&mut sh_a._node);
         }
-        net_mesh_free(nh_a);
-        net_mesh_free(nh_b);
+        unsafe { net_mesh_free(nh_a) };
+        unsafe { net_mesh_free(nh_b) };
     }
 
     /// `net_mesh_free` must be idempotent — the post-fix protocol
@@ -3807,14 +3814,14 @@ mod tests {
         });
         let cfg_c = CString::new(cfg.to_string()).unwrap();
         let mut nh: *mut MeshNodeHandle = std::ptr::null_mut();
-        assert_eq!(net_mesh_new(cfg_c.as_ptr(), &mut nh), 0);
+        assert_eq!(unsafe { net_mesh_new(cfg_c.as_ptr(), &mut nh) }, 0);
         assert!(!nh.is_null());
 
-        net_mesh_free(nh);
+        unsafe { net_mesh_free(nh) };
         // Second free: must not panic, must not double-take the
         // ManuallyDrop fields, must not deallocate the (leaked)
         // outer box.
-        net_mesh_free(nh);
+        unsafe { net_mesh_free(nh) };
     }
 
     /// `net_identity_free` must be idempotent; same wiring check
@@ -3823,12 +3830,12 @@ mod tests {
     #[test]
     fn net_identity_free_is_idempotent() {
         let mut h: *mut IdentityHandle = std::ptr::null_mut();
-        assert_eq!(net_identity_generate(&mut h), 0);
+        assert_eq!(unsafe { net_identity_generate(&mut h) }, 0);
         assert!(!h.is_null());
 
-        net_identity_free(h);
+        unsafe { net_identity_free(h) };
         // Second free: must not panic.
-        net_identity_free(h);
+        unsafe { net_identity_free(h) };
     }
 
     /// `net_mesh_free` racing an in-flight op via the same handle
@@ -3853,7 +3860,7 @@ mod tests {
         });
         let cfg_c = CString::new(cfg.to_string()).unwrap();
         let mut nh: *mut MeshNodeHandle = std::ptr::null_mut();
-        assert_eq!(net_mesh_new(cfg_c.as_ptr(), &mut nh), 0);
+        assert_eq!(unsafe { net_mesh_new(cfg_c.as_ptr(), &mut nh) }, 0);
         assert!(!nh.is_null());
 
         // Smuggle the raw pointer to the worker via usize (same
@@ -3892,7 +3899,7 @@ mod tests {
 
         // _free MUST block until the worker drops its op.
         let t0 = Instant::now();
-        net_mesh_free(nh);
+        unsafe { net_mesh_free(nh) };
         let elapsed = t0.elapsed();
         assert!(
             elapsed >= Duration::from_millis(40),
@@ -3917,16 +3924,16 @@ mod tests {
         });
         let cfg_c = CString::new(cfg.to_string()).unwrap();
         let mut nh: *mut MeshNodeHandle = std::ptr::null_mut();
-        assert_eq!(net_mesh_new(cfg_c.as_ptr(), &mut nh), 0);
+        assert_eq!(unsafe { net_mesh_new(cfg_c.as_ptr(), &mut nh) }, 0);
         assert!(!nh.is_null());
 
         // Free first; subsequent stream_stats must bail before
         // touching the taken-out inner.
-        net_mesh_free(nh);
+        unsafe { net_mesh_free(nh) };
 
         let mut out_json: *mut c_char = std::ptr::null_mut();
         let mut out_len: usize = 0;
-        let rc = net_mesh_stream_stats(nh, 0xDEAD, 1, &mut out_json, &mut out_len);
+        let rc = unsafe { net_mesh_stream_stats(nh, 0xDEAD, 1, &mut out_json, &mut out_len) };
         assert_eq!(
             rc,
             NetError::ShuttingDown as c_int,
@@ -3945,9 +3952,9 @@ mod tests {
     #[test]
     fn net_identity_issue_token_returns_shutting_down_after_free() {
         let mut signer: *mut IdentityHandle = std::ptr::null_mut();
-        assert_eq!(net_identity_generate(&mut signer), 0);
+        assert_eq!(unsafe { net_identity_generate(&mut signer) }, 0);
         assert!(!signer.is_null());
-        net_identity_free(signer);
+        unsafe { net_identity_free(signer) };
 
         // Well-formed inputs (so we reach the guard rather than
         // bailing on parse).
@@ -3956,17 +3963,19 @@ mod tests {
         let channel = CString::new("test-channel").unwrap();
         let mut out_token: *mut u8 = std::ptr::null_mut();
         let mut out_token_len: usize = 0;
-        let rc = net_identity_issue_token(
-            signer,
-            subject.as_ptr(),
-            subject.len(),
-            scope.as_ptr(),
-            channel.as_ptr(),
-            60,
-            0,
-            &mut out_token,
-            &mut out_token_len,
-        );
+        let rc = unsafe {
+            net_identity_issue_token(
+                signer,
+                subject.as_ptr(),
+                subject.len(),
+                scope.as_ptr(),
+                channel.as_ptr(),
+                60,
+                0,
+                &mut out_token,
+                &mut out_token_len,
+            )
+        };
         assert_eq!(
             rc,
             NetError::ShuttingDown as c_int,
@@ -3983,7 +3992,7 @@ mod tests {
     #[test]
     fn net_delegate_token_returns_shutting_down_after_free() {
         let mut signer: *mut IdentityHandle = std::ptr::null_mut();
-        assert_eq!(net_identity_generate(&mut signer), 0);
+        assert_eq!(unsafe { net_identity_generate(&mut signer) }, 0);
         assert!(!signer.is_null());
 
         // Issue a real parent token while signer is alive.
@@ -3993,38 +4002,42 @@ mod tests {
         let mut parent_bytes: *mut u8 = std::ptr::null_mut();
         let mut parent_len: usize = 0;
         assert_eq!(
-            net_identity_issue_token(
-                signer,
-                subject.as_ptr(),
-                subject.len(),
-                scope.as_ptr(),
-                channel.as_ptr(),
-                60,
-                1,
-                &mut parent_bytes,
-                &mut parent_len,
-            ),
+            unsafe {
+                net_identity_issue_token(
+                    signer,
+                    subject.as_ptr(),
+                    subject.len(),
+                    scope.as_ptr(),
+                    channel.as_ptr(),
+                    60,
+                    1,
+                    &mut parent_bytes,
+                    &mut parent_len,
+                )
+            },
             0,
         );
         assert!(!parent_bytes.is_null());
 
         // Now free the signer and try to delegate using it.
-        net_identity_free(signer);
+        unsafe { net_identity_free(signer) };
 
         let new_subject = [1u8; 32];
         let restricted = CString::new("[\"publish\"]").unwrap();
         let mut child_bytes: *mut u8 = std::ptr::null_mut();
         let mut child_len: usize = 0;
-        let rc = net_delegate_token(
-            signer,
-            parent_bytes,
-            parent_len,
-            new_subject.as_ptr(),
-            new_subject.len(),
-            restricted.as_ptr(),
-            &mut child_bytes,
-            &mut child_len,
-        );
+        let rc = unsafe {
+            net_delegate_token(
+                signer,
+                parent_bytes,
+                parent_len,
+                new_subject.as_ptr(),
+                new_subject.len(),
+                restricted.as_ptr(),
+                &mut child_bytes,
+                &mut child_len,
+            )
+        };
         assert_eq!(
             rc,
             NetError::ShuttingDown as c_int,
@@ -4033,7 +4046,7 @@ mod tests {
         assert!(child_bytes.is_null(), "no child token may be allocated");
 
         // Cleanup: free the parent token bytes.
-        net_free_bytes(parent_bytes, parent_len);
+        unsafe { net_free_bytes(parent_bytes, parent_len) };
     }
 
     #[test]
@@ -4070,20 +4083,20 @@ mod tests {
         let mut out_json: *mut c_char = std::ptr::null_mut();
         let mut out_len: usize = 0;
         assert_eq!(
-            net_parse_token(token, usize::MAX, &mut out_json, &mut out_len),
+            unsafe { net_parse_token(token, usize::MAX, &mut out_json, &mut out_len) },
             invalid_json,
         );
         assert!(out_json.is_null());
 
         let mut out_ok: c_int = -42;
         assert_eq!(
-            net_verify_token(token, usize::MAX, &mut out_ok),
+            unsafe { net_verify_token(token, usize::MAX, &mut out_ok) },
             invalid_json,
         );
 
         let mut out_expired: c_int = -42;
         assert_eq!(
-            net_token_is_expired(token, usize::MAX, &mut out_expired),
+            unsafe { net_token_is_expired(token, usize::MAX, &mut out_expired) },
             invalid_json,
         );
 

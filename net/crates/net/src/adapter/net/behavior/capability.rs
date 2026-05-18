@@ -3743,11 +3743,17 @@ mod tests {
         // Non-reserved keys survive — substrate only filters its
         // own reserved namespace, not the caller's app namespace.
         assert_eq!(
-            ann.capabilities.metadata.get("app::region").map(String::as_str),
+            ann.capabilities
+                .metadata
+                .get("app::region")
+                .map(String::as_str),
             Some("us-east"),
         );
         assert_eq!(
-            ann.capabilities.metadata.get("user_tag").map(String::as_str),
+            ann.capabilities
+                .metadata
+                .get("user_tag")
+                .map(String::as_str),
             Some("fine"),
         );
     }

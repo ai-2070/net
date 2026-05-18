@@ -42,7 +42,7 @@ pub struct MeshBlobAdapterHandle {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_blob_adapter_new(
+pub unsafe extern "C" fn net_mesh_blob_adapter_new(
     _redex: *mut super::cortex::RedexHandle,
     _adapter_id: *const c_char,
     _persistent: c_int,
@@ -52,10 +52,10 @@ pub extern "C" fn net_mesh_blob_adapter_new(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_blob_adapter_free(_handle: *mut MeshBlobAdapterHandle) {}
+pub unsafe extern "C" fn net_mesh_blob_adapter_free(_handle: *mut MeshBlobAdapterHandle) {}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_blob_adapter_store(
+pub unsafe extern "C" fn net_mesh_blob_adapter_store(
     _handle: *const MeshBlobAdapterHandle,
     _blob_ref_bytes: *const u8,
     _blob_ref_len: usize,
@@ -66,7 +66,7 @@ pub extern "C" fn net_mesh_blob_adapter_store(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_blob_adapter_fetch(
+pub unsafe extern "C" fn net_mesh_blob_adapter_fetch(
     _handle: *const MeshBlobAdapterHandle,
     _blob_ref_bytes: *const u8,
     _blob_ref_len: usize,
@@ -77,7 +77,7 @@ pub extern "C" fn net_mesh_blob_adapter_fetch(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_blob_adapter_exists(
+pub unsafe extern "C" fn net_mesh_blob_adapter_exists(
     _handle: *const MeshBlobAdapterHandle,
     _blob_ref_bytes: *const u8,
     _blob_ref_len: usize,
@@ -87,35 +87,35 @@ pub extern "C" fn net_mesh_blob_adapter_exists(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_blob_adapter_prometheus_text(
+pub unsafe extern "C" fn net_mesh_blob_adapter_prometheus_text(
     _handle: *const MeshBlobAdapterHandle,
 ) -> *mut c_char {
     ptr::null_mut()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_blob_adapter_overflow_enabled(
+pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_enabled(
     _handle: *const MeshBlobAdapterHandle,
 ) -> c_int {
     NET_ERR_FEATURE_NOT_BUILT
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_blob_adapter_overflow_active(
+pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_active(
     _handle: *const MeshBlobAdapterHandle,
 ) -> c_int {
     NET_ERR_FEATURE_NOT_BUILT
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_blob_adapter_overflow_config(
+pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_config(
     _handle: *const MeshBlobAdapterHandle,
 ) -> *mut c_char {
     ptr::null_mut()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_blob_adapter_set_overflow_enabled(
+pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_enabled(
     _handle: *const MeshBlobAdapterHandle,
     _enabled: c_int,
 ) -> c_int {
@@ -123,7 +123,7 @@ pub extern "C" fn net_mesh_blob_adapter_set_overflow_enabled(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_blob_adapter_set_overflow_config(
+pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_config(
     _handle: *const MeshBlobAdapterHandle,
     _config_json: *const c_char,
 ) -> c_int {
@@ -143,7 +143,7 @@ pub extern "C" fn net_mesh_blob_adapter_set_overflow_config(
 /// matching `_fetch` call (which on this build never happens —
 /// the function then deliberately does nothing).
 #[unsafe(no_mangle)]
-pub extern "C" fn net_blob_free_buffer(_ptr: *mut u8, _len: usize) {}
+pub unsafe extern "C" fn net_blob_free_buffer(_ptr: *mut u8, _len: usize) {}
 
 #[cfg(test)]
 mod tests {

@@ -455,7 +455,10 @@ mod tests {
         }
         // Lowercase + digits + permitted punctuation still accepted.
         for n in ["foo", "foo/bar", "prod.deploy", "a-b_c.d", "v2/0"] {
-            assert!(ChannelName::new(n).is_ok(), "lowercase {n:?} must be accepted");
+            assert!(
+                ChannelName::new(n).is_ok(),
+                "lowercase {n:?} must be accepted"
+            );
         }
     }
 

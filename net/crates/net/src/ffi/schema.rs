@@ -91,7 +91,7 @@ use crate::adapter::net::behavior::{
 /// must point to writable memory; on success the caller owns the
 /// returned buffer and must free it via `net_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_validate_capabilities(
+pub unsafe extern "C" fn net_validate_capabilities(
     caps_json: *const c_char,
     out_report_json: *mut *mut c_char,
     out_report_len: *mut usize,
@@ -237,7 +237,7 @@ mod tests {
         let cs = CString::new(caps_json).unwrap();
         let mut out_ptr: *mut c_char = std::ptr::null_mut();
         let mut out_len: usize = 0;
-        let rc = net_validate_capabilities(cs.as_ptr(), &mut out_ptr, &mut out_len);
+        let rc = unsafe { net_validate_capabilities(cs.as_ptr(), &mut out_ptr, &mut out_len) };
         assert_eq!(rc, 0, "expected ok, got {rc}");
         assert!(!out_ptr.is_null());
         // Read back as &str (NUL-terminated; out_len is just the
@@ -305,11 +305,13 @@ mod tests {
         let mut out_ptr: *mut c_char = std::ptr::null_mut();
         let mut out_len: usize = 0;
 
-        let rc = net_validate_capabilities(std::ptr::null(), &mut out_ptr, &mut out_len);
+        let rc = unsafe { net_validate_capabilities(std::ptr::null(), &mut out_ptr, &mut out_len) };
         assert!(rc < 0);
-        let rc = net_validate_capabilities(cs.as_ptr(), std::ptr::null_mut(), &mut out_len);
+        let rc =
+            unsafe { net_validate_capabilities(cs.as_ptr(), std::ptr::null_mut(), &mut out_len) };
         assert!(rc < 0);
-        let rc = net_validate_capabilities(cs.as_ptr(), &mut out_ptr, std::ptr::null_mut());
+        let rc =
+            unsafe { net_validate_capabilities(cs.as_ptr(), &mut out_ptr, std::ptr::null_mut()) };
         assert!(rc < 0);
     }
 
@@ -319,7 +321,7 @@ mod tests {
         let cs = CString::new(r#"{"tags": [not-json"#).unwrap();
         let mut out_ptr: *mut c_char = std::ptr::null_mut();
         let mut out_len: usize = 0;
-        let rc = net_validate_capabilities(cs.as_ptr(), &mut out_ptr, &mut out_len);
+        let rc = unsafe { net_validate_capabilities(cs.as_ptr(), &mut out_ptr, &mut out_len) };
         assert!(rc < 0);
     }
 }

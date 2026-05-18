@@ -358,10 +358,7 @@ mod tests {
             redact_url("redis://redis.svc:6379"),
             "redis://redis.svc:6379"
         );
-        assert_eq!(
-            redact_url("nats://nats.svc:4222"),
-            "nats://nats.svc:4222"
-        );
+        assert_eq!(redact_url("nats://nats.svc:4222"), "nats://nats.svc:4222");
         // '@' in the path / query is not userinfo — must not redact.
         assert_eq!(
             redact_url("https://example.com/path/@handle"),
