@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/mod.rs
+  s_2571835e05521c::t_e791088b211e26 80-88
+  s_2571835e05521c::t_4a7a289606f18f 351-357
+  s_2571835e05521c::t_984aefbc4e99c9 365-394
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "c76a796ab74adfad291ecfdf23bb43f749c909c7",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
