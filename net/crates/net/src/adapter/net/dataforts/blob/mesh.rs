@@ -1161,10 +1161,21 @@ impl BlobAdapter for MeshBlobAdapter {
                     let chunk = &chunks[req.chunk_index];
                     match self.fetch_chunk(&chunk.hash).await {
                         Ok(chunk_bytes) => {
-                            out.extend_from_slice(
-                                &chunk_bytes
-                                    [req.start_in_chunk as usize..req.end_in_chunk as usize],
-                            );
+                            // Defensive `get` rather than panicking
+                            // slice — the manifest is peer-supplied
+                            // and even with the decoder's chunk-size
+                            // validation the actually-fetched bytes
+                            // could in principle be shorter (e.g. a
+                            // future content-addressed-but-truncated
+                            // backend); panic across `.await` in the
+                            // adapter is worse than a typed error.
+                            let slice = chunk_bytes
+                                .get(req.start_in_chunk as usize..req.end_in_chunk as usize)
+                                .ok_or(BlobError::HashMismatch {
+                                    expected: chunk.hash,
+                                    actual: blake3::hash(&chunk_bytes).into(),
+                                })?;
+                            out.extend_from_slice(slice);
                             touched.push(chunk.hash);
                         }
                         Err(e) => {

@@ -285,6 +285,7 @@ impl BlobRef {
                 BLOB_MANIFEST_MAX_CHUNKS
             )));
         }
+        validate_chunk_sizes(&chunks)?;
         let total_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
         if total_size > BLOB_REF_MAX_SIZE {
             return Err(BlobError::Decode(format!(
@@ -527,6 +528,7 @@ impl BlobRef {
                 BLOB_MANIFEST_MAX_CHUNKS
             )));
         }
+        validate_chunk_sizes(&body.chunks)?;
         // Validate the cached total_size matches the iterated sum —
         // a malicious peer could otherwise lie about total_size to
         // mislead range math without flipping any chunk's hash.
@@ -582,6 +584,36 @@ impl BlobRef {
 // -------------------------------------------------------------------
 // Chunking + range math (pure logic — no I/O)
 // -------------------------------------------------------------------
+
+/// Reject manifests where any chunk size disagrees with the substrate's
+/// fixed [`BLOB_CHUNK_SIZE_BYTES`] stride. Every non-last chunk MUST
+/// be exactly `BLOB_CHUNK_SIZE_BYTES`; the last chunk MAY be smaller
+/// but must be at least one byte. `byte_range_to_chunks` and the
+/// adapter's range slicer rely on the fixed stride; an attacker-stamped
+/// `{size: u32::MAX}` chunk would otherwise either return wrong-window
+/// bytes silently or trip a panicking slice in the consumer.
+fn validate_chunk_sizes(chunks: &[ChunkRef]) -> Result<(), BlobError> {
+    let last = chunks.len() - 1;
+    for (i, chunk) in chunks.iter().enumerate() {
+        let size = chunk.size as u64;
+        if i < last {
+            if size != BLOB_CHUNK_SIZE_BYTES {
+                return Err(BlobError::Decode(format!(
+                    "manifest non-last chunk {} has size {} (expected {})",
+                    i, size, BLOB_CHUNK_SIZE_BYTES
+                )));
+            }
+        } else {
+            if size == 0 || size > BLOB_CHUNK_SIZE_BYTES {
+                return Err(BlobError::Decode(format!(
+                    "manifest last chunk {} has size {} (expected 1..={})",
+                    i, size, BLOB_CHUNK_SIZE_BYTES
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Outcome of [`chunk_payload`] — either the payload fit below the
 /// threshold (single Small blob shape) or it split into N chunks
@@ -963,9 +995,96 @@ mod tests {
             };
             5
         ];
-        // 5 × 4 GiB ≈ 20 GiB > 16 GiB cap
+        // 5 × 4 GiB ≈ 20 GiB > 16 GiB cap (also fails chunk-size validator)
         let err = BlobRef::manifest("mesh://", Encoding::Replicated, chunks).unwrap_err();
         assert!(matches!(err, BlobError::Decode(_)));
+    }
+
+    /// `byte_range_to_chunks` and the adapter's range slicer rely on
+    /// the substrate's fixed `BLOB_CHUNK_SIZE_BYTES` stride. A
+    /// peer-crafted manifest with non-stride chunk sizes makes the
+    /// position math return wrong-window bytes silently, so both
+    /// `manifest()` and `decode_manifest()` must reject those shapes.
+    #[test]
+    fn manifest_rejects_non_last_chunk_smaller_than_stride() {
+        let chunks = vec![
+            ChunkRef {
+                hash: [1; 32],
+                size: 1, // first chunk must be exactly BLOB_CHUNK_SIZE_BYTES
+            },
+            ChunkRef {
+                hash: [2; 32],
+                size: BLOB_CHUNK_SIZE_BYTES as u32,
+            },
+        ];
+        let err = BlobRef::manifest("mesh://", Encoding::Replicated, chunks).unwrap_err();
+        assert!(matches!(err, BlobError::Decode(_)));
+    }
+
+    #[test]
+    fn manifest_rejects_non_last_chunk_larger_than_stride() {
+        let chunks = vec![
+            ChunkRef {
+                hash: [1; 32],
+                size: (BLOB_CHUNK_SIZE_BYTES as u32) + 1,
+            },
+            ChunkRef {
+                hash: [2; 32],
+                size: BLOB_CHUNK_SIZE_BYTES as u32,
+            },
+        ];
+        let err = BlobRef::manifest("mesh://", Encoding::Replicated, chunks).unwrap_err();
+        assert!(matches!(err, BlobError::Decode(_)));
+    }
+
+    #[test]
+    fn manifest_rejects_last_chunk_above_stride() {
+        let chunks = vec![ChunkRef {
+            hash: [1; 32],
+            size: (BLOB_CHUNK_SIZE_BYTES as u32) + 1,
+        }];
+        let err = BlobRef::manifest("mesh://", Encoding::Replicated, chunks).unwrap_err();
+        assert!(matches!(err, BlobError::Decode(_)));
+    }
+
+    #[test]
+    fn manifest_rejects_zero_size_chunk() {
+        let chunks = vec![ChunkRef {
+            hash: [1; 32],
+            size: 0,
+        }];
+        let err = BlobRef::manifest("mesh://", Encoding::Replicated, chunks).unwrap_err();
+        assert!(matches!(err, BlobError::Decode(_)));
+    }
+
+    #[test]
+    fn manifest_accepts_single_short_chunk_as_last() {
+        // A single chunk smaller than the stride is the valid
+        // single-chunk last-chunk case (a payload less than 4 MiB
+        // would normally ride as Small, but Manifest with one short
+        // chunk is structurally legal).
+        let chunks = vec![ChunkRef {
+            hash: [1; 32],
+            size: 1024,
+        }];
+        let blob = BlobRef::manifest("mesh://", Encoding::Replicated, chunks).unwrap();
+        assert_eq!(blob.size(), 1024);
+    }
+
+    #[test]
+    fn manifest_accepts_multichunk_with_short_last() {
+        let chunks = vec![
+            ChunkRef {
+                hash: [1; 32],
+                size: BLOB_CHUNK_SIZE_BYTES as u32,
+            },
+            ChunkRef {
+                hash: [2; 32],
+                size: 1024,
+            },
+        ];
+        let blob = BlobRef::manifest("mesh://", Encoding::Replicated, chunks).unwrap();
+        assert_eq!(blob.size(), BLOB_CHUNK_SIZE_BYTES + 1024);
     }
 
     #[test]
