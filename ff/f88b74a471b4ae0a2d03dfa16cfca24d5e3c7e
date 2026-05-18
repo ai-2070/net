@@ -1,0 +1,22 @@
+net/crates/net/src/bus.rs
+  s_f641e31a81af58::t_cea3d51a5fa6bf 1595-1614
+  s_f641e31a81af58::t_6f4f1fc05085f4 469-479
+net/crates/net/src/shard/mod.rs
+  s_f641e31a81af58::t_439caf4af3c9b6 512-520
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "fff88b74a471b4ae0a2d03dfa16cfca24d5e3c7e",
+  "prompts": {},
+  "sessions": {
+    "s_f641e31a81af58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6947e73-3691-4fac-86f9-a58c79816f7c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
