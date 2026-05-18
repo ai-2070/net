@@ -1,0 +1,84 @@
+net/crates/net/src/adapter/net/subprotocol/migration_handler.rs
+  s_aa8bb6e2c88c9e::t_7a5076beb8ff08 756
+net/crates/net/src/adapter/net/mesh.rs
+  s_aa8bb6e2c88c9e::t_cd971cd91afa3d 425,438
+  s_aa8bb6e2c88c9e::t_990e92af71eacc 1297,1304
+  s_aa8bb6e2c88c9e::t_56a49be4ab2c94 130-162
+net/crates/net/src/adapter/net/compute/migration_target.rs
+  s_aa8bb6e2c88c9e::t_03a2eddb826cc3 59-60
+net/crates/net/src/adapter/net/compute/mod.rs
+  s_aa8bb6e2c88c9e::t_6286305a535774 164
+net/crates/net/src/ffi/cortex.rs
+  s_aa8bb6e2c88c9e::t_904b47825c3404 3237,3245-3250
+  s_aa8bb6e2c88c9e::t_cc1c3323d37605 3924-3926,3930-3932,3934,3939,3943-3946
+  s_aa8bb6e2c88c9e::t_3c697dc2b76672 3962-3971,3976-3978,3983-3986,3993,4002-4008,4012,4017-4018,4020-4023
+  s_aa8bb6e2c88c9e::t_05cb633a605266 3404,3407
+  s_aa8bb6e2c88c9e::t_61394910b43fad 4048
+  s_aa8bb6e2c88c9e::t_0c0f5855843fdb 3533-3543
+  s_aa8bb6e2c88c9e::t_2d269103cf9024 3563-3568,3594-3595
+  s_aa8bb6e2c88c9e::t_b5188b5e78ae2d 3478-3483,3488,3495-3496,3506,3511-3515,3517-3518
+  s_aa8bb6e2c88c9e::t_fb93755ca190f7 3895
+  s_aa8bb6e2c88c9e::t_2aca3af49352d1 3709
+  s_aa8bb6e2c88c9e::t_1997d2a06d76b9 3847,3851,3855,3860,3867-3868,3873,3879
+  s_aa8bb6e2c88c9e::t_d4a100617ae059 3290,3335
+  s_aa8bb6e2c88c9e::t_2c3c810626b893 3778
+  s_aa8bb6e2c88c9e::t_5bc4284f5897b1 3811-3812
+  s_aa8bb6e2c88c9e::t_161f44e344d4c1 3421-3426,3429-3430,3432-3434,3440,3447-3451
+  s_aa8bb6e2c88c9e::t_b2ad6e2c7b4b6a 3669-3672
+  s_aa8bb6e2c88c9e::t_748457697a1bc3 3354,3360,3373-3382,3386,3392
+  s_aa8bb6e2c88c9e::t_cdf48b169ca577 3733,3740-3744
+  s_aa8bb6e2c88c9e::t_5ecdd894569732 3616,3625
+  s_aa8bb6e2c88c9e::t_6e798e9936a2bc 3696
+  s_aa8bb6e2c88c9e::t_37a1904ecdeec1 3910,3913
+  s_aa8bb6e2c88c9e::t_ac139b1637c1af 4032-4037
+  s_aa8bb6e2c88c9e::t_e045f0fdd4b99e 4051-4054
+  s_aa8bb6e2c88c9e::t_fb4dff068f19dc 3682,3686-3689
+net/crates/net/src/adapter/net/behavior/meshos/maintenance.rs
+  s_aa8bb6e2c88c9e::t_aa8eb17ce8a0f5 104
+net/crates/net/src/adapter/net/dataforts/gravity/counter.rs
+  s_aa8bb6e2c88c9e::t_3eb5d64a768192 352
+  s_aa8bb6e2c88c9e::t_bfa36be3e85504 566
+net/crates/net/src/adapter/net/compute/standby_group.rs
+  s_aa8bb6e2c88c9e::t_61394910b43fad 2315
+  s_aa8bb6e2c88c9e::t_f747cb5d5876d3 2211
+net/crates/net/src/adapter/net/redex/replication_runtime.rs
+  s_aa8bb6e2c88c9e::t_78bee90d33daf1 3359
+  s_aa8bb6e2c88c9e::t_61b5acb9e8994b 3439-3444
+  s_aa8bb6e2c88c9e::t_fcc7442aa54592 1052
+  s_aa8bb6e2c88c9e::t_f7857ca7a79d07 647-652,660
+  s_aa8bb6e2c88c9e::t_de43f05ceafd37 2087
+  s_aa8bb6e2c88c9e::t_1c8bb59387ee3c 2343
+  s_aa8bb6e2c88c9e::t_e2bf1d90f39c34 718
+  s_aa8bb6e2c88c9e::t_9b406a7bdf51e3 592-604
+  s_aa8bb6e2c88c9e::t_e89ca9edeff34a 2031
+  s_aa8bb6e2c88c9e::t_bd0651331cecc1 2407
+  s_aa8bb6e2c88c9e::t_1e2925a58a1546 713,736
+  s_aa8bb6e2c88c9e::t_a9230dc0729450 677
+  s_aa8bb6e2c88c9e::t_d5c3eb691d8604 1884-1900
+  s_aa8bb6e2c88c9e::t_7b5c6bedf6b462 820,822-827
+  s_aa8bb6e2c88c9e::t_c933a48a0f06e9 1057,1060-1065
+  s_aa8bb6e2c88c9e::t_fd978365f81d50 2480-2485
+  s_aa8bb6e2c88c9e::t_91c120c6c8651d 2518-2523
+  s_aa8bb6e2c88c9e::t_f76f61da13e522 3165,3170
+  s_aa8bb6e2c88c9e::t_fd55db527928d8 3225,3230
+  s_aa8bb6e2c88c9e::t_3e67d30124d496 3283
+  s_aa8bb6e2c88c9e::t_7a5fcf8ef61de5 1416-1417,1419-1420
+  s_aa8bb6e2c88c9e::t_f9e114a24a9150 3309
+  s_aa8bb6e2c88c9e::t_d5e6af7e3d4516 3507-3512
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "923a100cfd2e4f5716aee089d05218a78751fb75",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
