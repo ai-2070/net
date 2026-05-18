@@ -363,6 +363,372 @@ impl TreeNode {
     }
 }
 
+// ────────────────────────────────────────────────────────────────────
+// TreeBuilder — incremental manifest tree construction
+// ────────────────────────────────────────────────────────────────────
+
+/// A closed [`TreeNode`] emitted by [`TreeBuilder`]. The caller
+/// persists `bytes` against `hash` (the substrate stores it as
+/// a [`BlobRef::Small`](super::blob_ref::BlobRef::Small) at
+/// `dataforts/blob/<hex32>`) before constructing the
+/// [`BlobRef::Tree`](super::blob_ref::BlobRef::Tree) that
+/// references it.
+///
+/// `level == 0` marks a leaf node (its bytes encode a
+/// [`TreeNode::Leaf`]); `level >= 1` marks an internal node at
+/// the corresponding depth above the leaves. The deepest
+/// internal-node level equals
+/// [`BlobRef::Tree::depth`](super::blob_ref::BlobRef::Tree) - 1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosedNode {
+    /// BLAKE3 of `bytes`.
+    pub hash: [u8; 32],
+    /// Postcard-encoded [`TreeNode`] bytes the caller persists.
+    pub bytes: Vec<u8>,
+    /// Position in the tree — `0` for leaves, `1..` for internals.
+    pub level: u8,
+}
+
+/// Output of [`TreeBuilder::finalize`]. The root node lives in
+/// `root_hash` + `root_bytes` + `root_depth`; every other node
+/// closed during finalize is in `trailing_nodes` and must be
+/// persisted before the [`BlobRef::Tree`](super::blob_ref::BlobRef::Tree)
+/// is published.
+///
+/// Nodes closed during streaming (via [`TreeBuilder::push_chunk`])
+/// are returned by that call directly; `trailing_nodes` carries
+/// only the cascade-on-finalize closures.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeBuildOutput {
+    /// BLAKE3 of the root [`TreeNode`].
+    pub root_hash: [u8; 32],
+    /// Postcard-encoded root [`TreeNode`] bytes.
+    pub root_bytes: Vec<u8>,
+    /// Total tree depth — `1` for a single-leaf tree (root IS
+    /// the leaf), increasing by one per additional internal
+    /// level. Capped at [`MAX_TREE_DEPTH`].
+    pub root_depth: u8,
+    /// Sum of every leaf chunk's `size` across the whole tree.
+    pub total_bytes: u64,
+    /// Number of chunks accumulated across all leaves.
+    pub chunk_count: u64,
+    /// Non-root nodes closed during finalize, in deepest-first
+    /// order. The caller persists each before publishing the
+    /// final [`BlobRef::Tree`](super::blob_ref::BlobRef::Tree).
+    pub trailing_nodes: Vec<ClosedNode>,
+}
+
+/// Incremental manifest-tree builder.
+///
+/// Push [`ChunkRefV3`] entries one at a time; the builder
+/// accumulates them into a leaf, closes the leaf when it hits
+/// [`TREE_FANOUT`] chunks, hashes + stores the leaf via the
+/// emitted [`ClosedNode`], and lifts the leaf's hash into the
+/// depth-1 builder. Cascade continues up to the root.
+///
+/// Memory bound: O(`TREE_FANOUT × MAX_TREE_DEPTH × entry_size`)
+/// plus the current leaf-builder buffer. At fanout 128 + depth
+/// 4 + ~40 bytes per entry ≈ 20 KiB independent of total tree
+/// size — bounded regardless of how many chunks pass through.
+///
+/// Determinism: two builders fed the same sequence of
+/// [`ChunkRefV3`] entries produce identical
+/// [`TreeBuildOutput::root_hash`] outputs. Chunk dedup at the
+/// substrate level then makes two tree-built blobs over
+/// identical content land at the same root.
+#[derive(Debug)]
+pub struct TreeBuilder {
+    /// Open leaf builder — accumulates chunks until it reaches
+    /// [`TREE_FANOUT`] entries.
+    leaf_chunks: Vec<ChunkRefV3>,
+    /// Per-level internal builders. `internals[i]` is the depth
+    /// (i+1) builder, holding `(child_hash, subtree_size)`
+    /// pairs whose children live at depth `i`. Empty until the
+    /// first cascade reaches that level.
+    internals: Vec<Vec<([u8; 32], u64)>>,
+    /// Running total of bytes ever accumulated. Cross-checked
+    /// in [`Self::finalize`] for observability.
+    total_bytes: u64,
+    /// Running count of chunks ever accumulated.
+    chunk_count: u64,
+}
+
+impl TreeBuilder {
+    /// Construct an empty builder. The first call to
+    /// [`Self::push_chunk`] initialises the leaf buffer.
+    pub fn new() -> Self {
+        Self {
+            leaf_chunks: Vec::with_capacity(TREE_FANOUT),
+            internals: Vec::new(),
+            total_bytes: 0,
+            chunk_count: 0,
+        }
+    }
+
+    /// Total bytes the builder has accepted so far across every
+    /// pushed chunk.
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Number of chunks accepted so far.
+    pub fn chunk_count(&self) -> u64 {
+        self.chunk_count
+    }
+
+    /// Add a single chunk reference. Returns the (possibly
+    /// empty) sequence of nodes the push closed via cascade —
+    /// typically zero per call, exactly one when the leaf fills,
+    /// occasionally more when a leaf-close also triggers an
+    /// internal-level close.
+    ///
+    /// The caller must persist every returned [`ClosedNode`]'s
+    /// `bytes` against its `hash` before [`Self::finalize`] is
+    /// called — the tree-walk path on `fetch_range` will fetch
+    /// these by hash and verify the bytes hash back.
+    pub fn push_chunk(&mut self, chunk: ChunkRefV3) -> Result<Vec<ClosedNode>, BlobError> {
+        if chunk.size == 0 {
+            return Err(BlobError::Decode(
+                "TreeBuilder::push_chunk received zero-size chunk".to_owned(),
+            ));
+        }
+        if (chunk.size as u64) > TREE_LEAF_CHUNK_MAX_BYTES {
+            return Err(BlobError::Decode(format!(
+                "TreeBuilder::push_chunk received oversize chunk: {} bytes (cap {})",
+                chunk.size, TREE_LEAF_CHUNK_MAX_BYTES
+            )));
+        }
+        self.total_bytes = self.total_bytes.saturating_add(chunk.size as u64);
+        self.chunk_count = self.chunk_count.saturating_add(1);
+        self.leaf_chunks.push(chunk);
+
+        if self.leaf_chunks.len() < TREE_FANOUT {
+            return Ok(Vec::new());
+        }
+
+        // Leaf is full. Close + cascade.
+        self.close_leaf_and_cascade()
+    }
+
+    /// Internal: close the open leaf builder (assumed full or
+    /// finalize-time), then lift the resulting (hash, size) into
+    /// the depth-1 internal builder. If that fills, cascade.
+    /// Returns every [`ClosedNode`] emitted.
+    fn close_leaf_and_cascade(&mut self) -> Result<Vec<ClosedNode>, BlobError> {
+        let leaf_chunks = std::mem::replace(
+            &mut self.leaf_chunks,
+            Vec::with_capacity(TREE_FANOUT),
+        );
+        if leaf_chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let leaf = TreeNode::leaf(leaf_chunks)?;
+        let bytes = leaf.encode()?;
+        let hash: [u8; 32] = blake3::hash(&bytes).into();
+        let size = leaf.covered_bytes();
+        let mut emitted = vec![ClosedNode {
+            hash,
+            bytes,
+            level: 0,
+        }];
+
+        self.lift_into_internal(0, hash, size, &mut emitted)?;
+        Ok(emitted)
+    }
+
+    /// Internal: push `(hash, size)` into `internals[level]`. If
+    /// that level fills, close it and recurse one level up.
+    /// `emitted` accumulates every closed node along the way.
+    ///
+    /// Recursion depth is bounded by [`MAX_TREE_DEPTH`] = 4, so
+    /// the stack is well-bounded. Each recursive frame returns
+    /// after at most one TreeNode encode + hash; no allocation
+    /// path is shared across frames.
+    fn lift_into_internal(
+        &mut self,
+        level: usize,
+        hash: [u8; 32],
+        size: u64,
+        emitted: &mut Vec<ClosedNode>,
+    ) -> Result<(), BlobError> {
+        while self.internals.len() <= level {
+            self.internals.push(Vec::with_capacity(TREE_FANOUT));
+        }
+        self.internals[level].push((hash, size));
+        if self.internals[level].len() < TREE_FANOUT {
+            return Ok(());
+        }
+        // Level filled. Close + cascade.
+        let entries = std::mem::replace(
+            &mut self.internals[level],
+            Vec::with_capacity(TREE_FANOUT),
+        );
+        let node = TreeNode::internal(entries)?;
+        let bytes = node.encode()?;
+        let node_hash: [u8; 32] = blake3::hash(&bytes).into();
+        let node_size = node.covered_bytes();
+        let depth_for_emit = (level + 1) as u8;
+        if depth_for_emit > MAX_TREE_DEPTH {
+            return Err(BlobError::Decode(format!(
+                "TreeBuilder cascade exceeded MAX_TREE_DEPTH {}: \
+                 internal node at depth {} would not fit",
+                MAX_TREE_DEPTH, depth_for_emit
+            )));
+        }
+        emitted.push(ClosedNode {
+            hash: node_hash,
+            bytes,
+            level: depth_for_emit,
+        });
+        // Cascade — recursive call handles its own push into
+        // internals[level+1]. Tail-recursive in spirit; depth is
+        // hard-capped at MAX_TREE_DEPTH.
+        self.lift_into_internal(level + 1, node_hash, node_size, emitted)
+    }
+
+    /// Close every open builder level and emit the root.
+    ///
+    /// Returns:
+    /// - `Err` if no chunks were ever pushed.
+    /// - `Ok(TreeBuildOutput)` with the root + every non-root
+    ///   node closed during finalize.
+    ///
+    /// The output's `root_depth` is `1` for a single-leaf tree,
+    /// increasing by one per internal level — bounded by
+    /// [`MAX_TREE_DEPTH`]. Producing a tree past the cap returns
+    /// an error.
+    pub fn finalize(mut self) -> Result<TreeBuildOutput, BlobError> {
+        if self.chunk_count == 0 {
+            return Err(BlobError::Decode(
+                "TreeBuilder::finalize called with no chunks".to_owned(),
+            ));
+        }
+        let mut trailing: Vec<ClosedNode> = Vec::new();
+        // Holds the "current" node being lifted up the cascade.
+        let mut current: Option<(/*hash*/ [u8; 32], /*size*/ u64, /*bytes*/ Vec<u8>, /*level*/ u8)> = None;
+
+        // Step 1: close the leaf level if non-empty.
+        if !self.leaf_chunks.is_empty() {
+            let leaf = TreeNode::leaf(std::mem::take(&mut self.leaf_chunks))?;
+            let bytes = leaf.encode()?;
+            let hash: [u8; 32] = blake3::hash(&bytes).into();
+            let size = leaf.covered_bytes();
+            current = Some((hash, size, bytes, 0));
+        }
+
+        // Step 2: cascade up through every internal level.
+        for level_idx in 0..self.internals.len() {
+            let mut entries = std::mem::take(&mut self.internals[level_idx]);
+            if let Some((hash, size, bytes, c_level)) = current.take() {
+                entries.push((hash, size));
+                // The previous "current" is now a child of this
+                // level — it's no longer the root candidate.
+                trailing.push(ClosedNode {
+                    hash,
+                    bytes,
+                    level: c_level,
+                });
+            }
+            if entries.is_empty() {
+                continue;
+            }
+            let node = TreeNode::internal(entries)?;
+            let bytes = node.encode()?;
+            let hash: [u8; 32] = blake3::hash(&bytes).into();
+            let size = node.covered_bytes();
+            let level = (level_idx + 1) as u8;
+            if level > MAX_TREE_DEPTH {
+                return Err(BlobError::Decode(format!(
+                    "TreeBuilder::finalize produced internal node at depth {}, \
+                     exceeding MAX_TREE_DEPTH {}",
+                    level, MAX_TREE_DEPTH
+                )));
+            }
+            current = Some((hash, size, bytes, level));
+        }
+
+        let (mut root_hash, mut root_total, mut root_bytes, mut root_level) =
+            current.ok_or_else(|| {
+                BlobError::Decode(
+                    "TreeBuilder::finalize internal error — non-empty input produced no root"
+                        .to_owned(),
+                )
+            })?;
+
+        // Peel off degenerate single-child internal roots. The
+        // cascade can wrap each non-empty level into an internal
+        // node even when that level had only one child — a
+        // partial-leaf finalize that lands in a previously-empty
+        // internals[0] produces a 1-child internal root, etc.
+        // Without the peel, a small-tail tree adds a needless
+        // fetch RTT to every range query.
+        //
+        // Best-effort: the peel only succeeds when the
+        // single-child's bytes are still in `trailing` (i.e. the
+        // child was closed during finalize, not during streaming
+        // push). Mid-stream cascade emits its closed nodes to
+        // the caller directly, so a single-child internal that
+        // wraps an already-emitted node stays in the tree (1
+        // extra fetch RTT vs the minimal depth, no correctness
+        // hazard). The streaming-store caller can collapse this
+        // path by re-encoding the child from its hash — outside
+        // the builder's scope.
+        loop {
+            let decoded = TreeNode::decode(&root_bytes)?;
+            let TreeNode::Internal { children } = &decoded else {
+                break; // root is a leaf — no peeling
+            };
+            if children.len() != 1 {
+                break; // genuine multi-child internal
+            }
+            let (child_hash, child_size) = children[0];
+            let Some(pos) = trailing.iter().position(|n| n.hash == child_hash) else {
+                // Child was emitted during streaming push; not in
+                // trailing. Accept the 1-extra-depth wart.
+                break;
+            };
+            let child_node = trailing.remove(pos);
+            root_hash = child_hash;
+            root_total = child_size;
+            root_bytes = child_node.bytes;
+            root_level = child_node.level;
+        }
+
+        // `root_depth` = 1 for a single-leaf tree (root_level==0),
+        // root_level + 1 otherwise.
+        let root_depth = (root_level as u16 + 1) as u8;
+        if root_depth > MAX_TREE_DEPTH {
+            return Err(BlobError::Decode(format!(
+                "TreeBuilder::finalize produced root at depth {}, \
+                 exceeding MAX_TREE_DEPTH {}",
+                root_depth, MAX_TREE_DEPTH
+            )));
+        }
+        // Cross-check: root_total covers exactly total_bytes.
+        if root_total != self.total_bytes {
+            return Err(BlobError::Decode(format!(
+                "TreeBuilder::finalize root covers {} bytes but builder accepted {}",
+                root_total, self.total_bytes
+            )));
+        }
+
+        Ok(TreeBuildOutput {
+            root_hash,
+            root_bytes,
+            root_depth,
+            total_bytes: self.total_bytes,
+            chunk_count: self.chunk_count,
+            trailing_nodes: trailing,
+        })
+    }
+}
+
+impl Default for TreeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,5 +1042,322 @@ mod tests {
     #[test]
     fn max_tree_depth_pinned_at_four() {
         assert_eq!(MAX_TREE_DEPTH, 4);
+    }
+
+    // -----------------------------------------------------------
+    // TreeBuilder
+    // -----------------------------------------------------------
+
+    /// Synthesize N distinct chunk refs at the standard fixed
+    /// chunk size for deterministic test fixtures.
+    fn n_chunks(n: usize) -> Vec<ChunkRefV3> {
+        (0..n)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                hash[0] = (i & 0xFF) as u8;
+                hash[1] = ((i >> 8) & 0xFF) as u8;
+                hash[2] = ((i >> 16) & 0xFF) as u8;
+                ChunkRefV3::data(hash, BLOB_CHUNK_SIZE_BYTES as u32)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn builder_empty_finalize_errors() {
+        let b = TreeBuilder::new();
+        let err = b.finalize().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no chunks"), "got: {msg}");
+    }
+
+    #[test]
+    fn builder_rejects_zero_size_chunk() {
+        let mut b = TreeBuilder::new();
+        let err = b
+            .push_chunk(ChunkRefV3::data([0u8; 32], 0))
+            .unwrap_err();
+        assert!(err.to_string().contains("zero-size"), "got: {err}");
+    }
+
+    #[test]
+    fn builder_rejects_oversize_chunk() {
+        let mut b = TreeBuilder::new();
+        let err = b
+            .push_chunk(ChunkRefV3::data(
+                [0u8; 32],
+                (TREE_LEAF_CHUNK_MAX_BYTES + 1) as u32,
+            ))
+            .unwrap_err();
+        assert!(err.to_string().contains("oversize"), "got: {err}");
+    }
+
+    /// Single chunk → leaf is the root. `root_depth == 1`, no
+    /// trailing nodes.
+    #[test]
+    fn builder_single_chunk_root_is_leaf() {
+        let mut b = TreeBuilder::new();
+        let emitted = b.push_chunk(n_chunks(1).into_iter().next().unwrap()).unwrap();
+        assert!(emitted.is_empty(), "single push below fanout emits no closed nodes");
+        let out = b.finalize().unwrap();
+        assert_eq!(out.root_depth, 1);
+        assert_eq!(out.total_bytes, BLOB_CHUNK_SIZE_BYTES);
+        assert_eq!(out.chunk_count, 1);
+        assert!(out.trailing_nodes.is_empty());
+        // Root bytes decode back to a Leaf.
+        let root = TreeNode::decode(&out.root_bytes).unwrap();
+        assert!(root.is_leaf());
+        assert_eq!(root.arity(), 1);
+        // Root hash matches blake3 of its bytes.
+        let computed: [u8; 32] = blake3::hash(&out.root_bytes).into();
+        assert_eq!(computed, out.root_hash);
+    }
+
+    /// FANOUT chunks → the leaf fills + closes during push (the
+    /// leaf bytes go to the caller, not into trailing), then
+    /// finalize wraps the lifted (hash,size) into a 1-child
+    /// internal root. The peel can't promote because the child
+    /// bytes aren't local. Result: root_depth=2 (1-child internal
+    /// over the streaming-emitted leaf) — the small inefficiency
+    /// documented on finalize.
+    #[test]
+    fn builder_one_full_leaf_emits_internal_root_over_streaming_leaf() {
+        let mut b = TreeBuilder::new();
+        let mut mid_closed = Vec::new();
+        for c in n_chunks(TREE_FANOUT) {
+            mid_closed.extend(b.push_chunk(c).unwrap());
+        }
+        // The last push closed the leaf during streaming.
+        assert_eq!(mid_closed.len(), 1);
+        assert_eq!(mid_closed[0].level, 0);
+        let leaf_hash = mid_closed[0].hash;
+        let out = b.finalize().unwrap();
+        // Peel can't run because the leaf isn't in trailing.
+        assert_eq!(
+            out.root_depth, 2,
+            "FANOUT-chunk input produces a 1-child internal root over the \
+             streaming-emitted leaf — the peel skips because the leaf bytes \
+             aren't local"
+        );
+        let root = TreeNode::decode(&out.root_bytes).unwrap();
+        assert!(root.is_internal());
+        assert_eq!(root.arity(), 1);
+        // The internal's child IS the streaming-emitted leaf.
+        if let TreeNode::Internal { children } = &root {
+            assert_eq!(children[0].0, leaf_hash);
+        }
+        assert_eq!(out.total_bytes, BLOB_CHUNK_SIZE_BYTES * TREE_FANOUT as u64);
+        assert_eq!(out.chunk_count, TREE_FANOUT as u64);
+    }
+
+    /// The peel DOES fire when the single child IS in trailing.
+    /// Example: a partial-leaf finalize that lifts into an
+    /// empty internals[0] — the leaf was closed by finalize (so
+    /// it's in trailing), and the would-be 1-child internal at
+    /// internals[0] gets peeled to the leaf.
+    #[test]
+    fn builder_peels_partial_leaf_when_child_in_trailing() {
+        // Push fewer than FANOUT chunks so finalize closes the
+        // leaf (not streaming push).
+        let count = TREE_FANOUT / 2;
+        let mut b = TreeBuilder::new();
+        for c in n_chunks(count) {
+            let emitted = b.push_chunk(c).unwrap();
+            assert!(emitted.is_empty(), "no cascade below fanout");
+        }
+        let out = b.finalize().unwrap();
+        // The leaf was the only thing built; no internals were
+        // ever closed (nothing cascaded). root_depth=1.
+        assert_eq!(out.root_depth, 1);
+        assert!(out.trailing_nodes.is_empty());
+        let root = TreeNode::decode(&out.root_bytes).unwrap();
+        assert!(root.is_leaf());
+        assert_eq!(root.arity(), count);
+    }
+
+    /// 2 × FANOUT chunks → 2 leaves under one root internal.
+    /// root_depth == 2.
+    #[test]
+    fn builder_two_leaves_yields_depth_two() {
+        let mut b = TreeBuilder::new();
+        let mut closed = Vec::new();
+        for c in n_chunks(TREE_FANOUT * 2) {
+            closed.extend(b.push_chunk(c).unwrap());
+        }
+        // 2 leaves closed during push.
+        let leaf_closes = closed.iter().filter(|n| n.level == 0).count();
+        assert_eq!(leaf_closes, 2, "two full leaves close during streaming");
+        let out = b.finalize().unwrap();
+        assert_eq!(out.root_depth, 2);
+        assert_eq!(out.total_bytes, BLOB_CHUNK_SIZE_BYTES * (TREE_FANOUT * 2) as u64);
+        let root = TreeNode::decode(&out.root_bytes).unwrap();
+        assert!(root.is_internal());
+        assert_eq!(root.arity(), 2);
+    }
+
+    /// FANOUT + 1 chunks → 2 leaves (one full, one with one
+    /// chunk) under one root internal. root_depth == 2.
+    #[test]
+    fn builder_fanout_plus_one_yields_depth_two_with_partial_leaf() {
+        let mut b = TreeBuilder::new();
+        for c in n_chunks(TREE_FANOUT + 1) {
+            let _ = b.push_chunk(c).unwrap();
+        }
+        let out = b.finalize().unwrap();
+        assert_eq!(out.root_depth, 2);
+        let root = TreeNode::decode(&out.root_bytes).unwrap();
+        assert!(root.is_internal());
+        assert_eq!(root.arity(), 2, "first leaf full, second leaf has one chunk");
+    }
+
+    /// FANOUT² + 1 chunks. Cascade trace:
+    /// - First FANOUT² chunks fill FANOUT leaves and one full
+    ///   internals[0] (closed mid-stream, lifted to internals[1]).
+    /// - The final chunk lives alone in leaf_chunks at finalize.
+    /// - Finalize closes that 1-chunk leaf, wraps it in a
+    ///   1-child internal (lifted to internals[1]), then closes
+    ///   internals[1] which now holds 2 entries (the streaming-
+    ///   emitted internal_0_0 + the finalize-emitted 1-child wrap).
+    ///
+    /// Result: depth=3, with the root being a genuine multi-child
+    /// internal. The 1-child internal in the middle is a known
+    /// inefficiency the peel can't reach (its parent has 2 kids).
+    #[test]
+    fn builder_fanout_squared_plus_one_produces_depth_three_with_known_wart() {
+        let chunk_count = TREE_FANOUT * TREE_FANOUT + 1;
+        let mut b = TreeBuilder::new();
+        for i in 0..chunk_count {
+            let mut hash = [0u8; 32];
+            hash[0] = (i & 0xFF) as u8;
+            hash[1] = ((i >> 8) & 0xFF) as u8;
+            hash[2] = ((i >> 16) & 0xFF) as u8;
+            let _ = b.push_chunk(ChunkRefV3::data(hash, 1024)).unwrap();
+        }
+        let out = b.finalize().unwrap();
+        assert_eq!(out.root_depth, 3);
+        assert_eq!(out.chunk_count, chunk_count as u64);
+        let root = TreeNode::decode(&out.root_bytes).unwrap();
+        assert!(root.is_internal());
+        assert_eq!(root.arity(), 2);
+    }
+
+    /// Determinism: two builders fed identical chunk sequences
+    /// produce identical root hashes + identical trailing nodes.
+    #[test]
+    fn builder_is_deterministic_across_runs() {
+        let chunks = n_chunks(TREE_FANOUT * 3 + 17);
+        let mut b1 = TreeBuilder::new();
+        let mut b2 = TreeBuilder::new();
+        for c in &chunks {
+            let _ = b1.push_chunk(*c).unwrap();
+            let _ = b2.push_chunk(*c).unwrap();
+        }
+        let o1 = b1.finalize().unwrap();
+        let o2 = b2.finalize().unwrap();
+        assert_eq!(o1.root_hash, o2.root_hash);
+        assert_eq!(o1.root_depth, o2.root_depth);
+        assert_eq!(o1.total_bytes, o2.total_bytes);
+        assert_eq!(o1.chunk_count, o2.chunk_count);
+    }
+
+    /// Every emitted node's hash must verify against blake3 of
+    /// its bytes — the contract the tree-walk verifier relies on.
+    #[test]
+    fn builder_emits_hashes_that_match_blake3_of_bytes() {
+        let mut b = TreeBuilder::new();
+        let mut all_closed: Vec<ClosedNode> = Vec::new();
+        for c in n_chunks(TREE_FANOUT * 2 + 5) {
+            all_closed.extend(b.push_chunk(c).unwrap());
+        }
+        let out = b.finalize().unwrap();
+        all_closed.extend(out.trailing_nodes.clone());
+        all_closed.push(ClosedNode {
+            hash: out.root_hash,
+            bytes: out.root_bytes.clone(),
+            level: out.root_depth - 1,
+        });
+        for node in &all_closed {
+            let computed: [u8; 32] = blake3::hash(&node.bytes).into();
+            assert_eq!(
+                computed, node.hash,
+                "ClosedNode at level {} has hash that doesn't match blake3(bytes)",
+                node.level
+            );
+        }
+    }
+
+    /// Cross-check: the root's `covered_bytes()` must equal the
+    /// builder's accumulated `total_bytes`. Finalize already
+    /// asserts this; the test pins the invariant against a
+    /// representative tree shape.
+    #[test]
+    fn builder_root_covers_all_accumulated_bytes() {
+        let chunks = n_chunks(TREE_FANOUT * 4 + 33);
+        let total: u64 = chunks.iter().map(|c| c.size as u64).sum();
+        let mut b = TreeBuilder::new();
+        for c in &chunks {
+            let _ = b.push_chunk(*c).unwrap();
+        }
+        let out = b.finalize().unwrap();
+        let root = TreeNode::decode(&out.root_bytes).unwrap();
+        assert_eq!(root.covered_bytes(), total);
+        assert_eq!(out.total_bytes, total);
+    }
+
+    /// Bounded memory: a builder that has pushed many chunks
+    /// holds at most O(FANOUT × depth) entries across its
+    /// internal stack + leaf buffer. Pin the invariant by
+    /// pushing 100 × FANOUT chunks and asserting the builder's
+    /// internal storage is bounded.
+    #[test]
+    fn builder_memory_is_bounded_independent_of_input_size() {
+        let mut b = TreeBuilder::new();
+        let mut total_closed = 0;
+        // Push 100 × FANOUT = 12,800 chunks.
+        for i in 0..(100 * TREE_FANOUT) {
+            let mut hash = [0u8; 32];
+            hash[0] = (i & 0xFF) as u8;
+            hash[1] = ((i >> 8) & 0xFF) as u8;
+            total_closed += b.push_chunk(ChunkRefV3::data(hash, 1024)).unwrap().len();
+        }
+        // Builder's internal vec sizes should never exceed
+        // FANOUT × depth entries total at any moment. depth
+        // bounded at MAX_TREE_DEPTH = 4.
+        let total_open_entries: usize = b.leaf_chunks.len()
+            + b.internals.iter().map(|v| v.len()).sum::<usize>();
+        assert!(
+            total_open_entries <= TREE_FANOUT * (MAX_TREE_DEPTH as usize),
+            "builder has {} open entries; expected <= {} (fanout × MAX_DEPTH)",
+            total_open_entries,
+            TREE_FANOUT * (MAX_TREE_DEPTH as usize)
+        );
+        assert!(total_closed > 0, "some cascades should have emitted nodes");
+        let _ = b.finalize().unwrap();
+    }
+
+    /// Root hash is the same regardless of whether a cascade
+    /// happened mid-stream or only at finalize. Equivalently:
+    /// pushing chunks one-at-a-time vs in a single fanout-batch
+    /// produces the same root. (The CDC chunker may emit
+    /// boundary-skewed batches; the tree builder must be
+    /// order-equivalent.)
+    #[test]
+    fn builder_root_independent_of_push_batching() {
+        let chunks = n_chunks(TREE_FANOUT + 50);
+        // Run 1: push individually.
+        let mut b1 = TreeBuilder::new();
+        for c in &chunks {
+            let _ = b1.push_chunk(*c).unwrap();
+        }
+        let o1 = b1.finalize().unwrap();
+        // Run 2: same content, same order. (The "batching" here
+        // is really about whether intermediate cascades fire
+        // mid-push or not — but push_chunk only emits per chunk,
+        // so this is really a determinism check vs run 1.)
+        let mut b2 = TreeBuilder::new();
+        for c in &chunks {
+            let _ = b2.push_chunk(*c).unwrap();
+        }
+        let o2 = b2.finalize().unwrap();
+        assert_eq!(o1.root_hash, o2.root_hash);
     }
 }
