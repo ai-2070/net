@@ -3,7 +3,6 @@
 //! Migration uses L4 `StateSnapshot` to move a daemon between nodes while
 //! preserving causal chain continuity. The process is a 6-phase state machine.
 
-use crate::adapter::net::state::causal::CausalEvent;
 use crate::adapter::net::state::snapshot::StateSnapshot;
 
 /// Subprotocol ID for migration control messages.
@@ -133,8 +132,6 @@ pub struct MigrationState {
     phase: MigrationPhase,
     /// Snapshot taken from source (set in Snapshot phase).
     snapshot: Option<StateSnapshot>,
-    /// Events buffered between snapshot and cutover.
-    buffered_events: Vec<CausalEvent>,
     /// Monotonic instant when migration started. Pre-fix this
     /// was a `u64` of wall-clock nanoseconds, and `elapsed_ms`
     /// did `current_timestamp().saturating_sub(self.started_at)`
@@ -169,16 +166,10 @@ impl MigrationState {
             target_node,
             phase: MigrationPhase::Snapshot,
             snapshot: None,
-            buffered_events: Vec::new(),
             started_at: now,
             phase_entered_at: now,
             retry_count: 0,
         }
-    }
-
-    /// Buffer an event that arrived during migration.
-    pub fn buffer_event(&mut self, event: CausalEvent) {
-        self.buffered_events.push(event);
     }
 
     /// Set the snapshot and advance to Transfer phase.
@@ -227,11 +218,6 @@ impl MigrationState {
         self.phase = MigrationPhase::Replay;
         self.phase_entered_at = std::time::Instant::now();
         Ok(())
-    }
-
-    /// Take buffered events for replay (drains the buffer).
-    pub fn take_buffered_events(&mut self) -> Vec<CausalEvent> {
-        std::mem::take(&mut self.buffered_events)
     }
 
     /// Mark replay complete, advance to Cutover.
@@ -304,12 +290,6 @@ impl MigrationState {
         self.retry_count = self.retry_count.saturating_add(1);
     }
 
-    /// Number of events currently buffered awaiting replay.
-    #[inline]
-    pub fn buffered_event_count(&self) -> usize {
-        self.buffered_events.len()
-    }
-
     /// Payload byte count of the snapshot once set; `None`
     /// while the snapshot phase is still in progress (or
     /// when the orchestrator advanced past Snapshot via
@@ -356,7 +336,6 @@ impl std::fmt::Debug for MigrationState {
             .field("source", &format!("{:#x}", self.source_node))
             .field("target", &format!("{:#x}", self.target_node))
             .field("phase", &self.phase)
-            .field("buffered", &self.buffered_events.len())
             .field("has_snapshot", &self.snapshot.is_some())
             .finish()
     }
@@ -499,19 +478,6 @@ mod tests {
         state.cutover_complete().unwrap();
         assert_eq!(state.phase(), MigrationPhase::Complete);
         assert!(state.is_complete());
-    }
-
-    #[test]
-    fn test_event_buffering() {
-        let mut state = MigrationState::new(0xAAAA, 0x1111, 0x2222);
-
-        state.buffer_event(make_event(1));
-        state.buffer_event(make_event(2));
-        state.buffer_event(make_event(3));
-
-        let events = state.take_buffered_events();
-        assert_eq!(events.len(), 3);
-        assert!(state.buffered_events.is_empty());
     }
 
     #[test]

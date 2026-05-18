@@ -35,7 +35,7 @@ pub use migration::{
 pub use migration_source::MigrationSourceHandler;
 pub use migration_target::MigrationTargetHandler;
 pub use orchestrator::{
-    chunk_snapshot, BufferOutcome, MigrationMessage, MigrationOrchestrator, SnapshotReassembler,
+    chunk_snapshot, MigrationMessage, MigrationOrchestrator, SnapshotReassembler,
     MAX_SNAPSHOT_CHUNK_SIZE, MAX_SNAPSHOT_SIZE,
 };
 pub use registry::DaemonRegistry;

@@ -1145,33 +1145,6 @@ pub struct MigrationListItem {
     pub snapshot_bytes: Option<u64>,
     /// Retry attempts accumulated by orchestrator-driven retries.
     pub retries: u32,
-    /// Events buffered awaiting replay.
-    pub buffered_events: u32,
-}
-
-/// Outcome of [`MigrationOrchestrator::buffer_event`].
-///
-/// A `bool` return conflated two distinct caller responses
-/// ("no migration → route to source" vs. "post-cutover →
-/// route to target"); see the method's doc-comment for the
-/// concrete failure mode the bool produced. Branch on this
-/// enum instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BufferOutcome {
-    /// Event was added to the daemon's migration buffer.
-    /// The migration is between Snapshot and Replay phases.
-    Buffered,
-    /// A migration record exists for this daemon but it has
-    /// already entered Cutover or Complete — the source has
-    /// stopped accepting writes and the target is now (or
-    /// will shortly become) the authoritative copy. Caller
-    /// should route the event to the target node, not the
-    /// source.
-    PostCutover,
-    /// No migration record exists for this daemon. Caller
-    /// should route the event normally (to the source, which
-    /// is still authoritative).
-    NoMigration,
 }
 
 /// Coordinates all 6 phases of daemon migration.
@@ -1509,16 +1482,12 @@ impl MigrationOrchestrator {
 
         record.superposition.advance(MigrationPhase::Replay);
 
-        // Drain buffered events for replay
-        let events = record.state.take_buffered_events();
-        if events.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(MigrationMessage::BufferedEvents {
-                daemon_origin,
-                events,
-            }))
-        }
+        // No buffered events ride here — buffering goes through the
+        // source-side handler exclusively (`MigrationSourceHandler::buffer_event`
+        // / `on_cutover`'s drain). The orchestrator never holds a
+        // buffer of its own; the only buffered-events surface is
+        // the source's drain at cutover time.
+        Ok(None)
     }
 
     /// Handle replay complete on target (phase 3→4).
@@ -1693,35 +1662,6 @@ impl MigrationOrchestrator {
         Ok(())
     }
 
-    /// Buffer an event for a daemon that is currently migrating.
-    ///
-    /// Pre-fix this returned a `bool`: `true` if buffered,
-    /// `false` for both "no migration" AND "migration past
-    /// cutover." A caller checking `if !buffer_event(...)
-    /// { route_to_source(...) }` would, post-cutover, route the
-    /// event to a source that has stopped accepting writes for
-    /// this daemon — silently lost. The two `false` cases need
-    /// different remediation: no-migration means "route to the
-    /// source as normal," post-cutover means "route to the
-    /// target (the new authoritative copy)."
-    ///
-    /// Return a typed [`BufferOutcome`] so the caller can branch
-    /// on the actual state instead of inferring the wrong
-    /// behavior from an ambiguous bool.
-    pub fn buffer_event(&self, daemon_origin: u64, event: CausalEvent) -> BufferOutcome {
-        if let Some(entry) = self.migrations.get(&daemon_origin) {
-            let mut record = entry.lock();
-            let phase = record.state.phase();
-            // Buffer during Snapshot through Replay phases
-            if phase != MigrationPhase::Cutover && phase != MigrationPhase::Complete {
-                record.state.buffer_event(event);
-                return BufferOutcome::Buffered;
-            }
-            return BufferOutcome::PostCutover;
-        }
-        BufferOutcome::NoMigration
-    }
-
     /// Abort a migration at any phase.
     ///
     /// Returns the abort message to broadcast to involved nodes.
@@ -1827,13 +1767,6 @@ impl MigrationOrchestrator {
                     age_in_phase_ms: record.state.age_in_phase_ms(),
                     snapshot_bytes: record.state.snapshot_size_bytes(),
                     retries: record.state.retry_count(),
-                    // Saturate at `u32::MAX` instead of a raw cast.
-                    // The whole point of surfacing this is to flag
-                    // stuck-in-Replay migrations buffering without
-                    // bound; a wrap to a small number would read as
-                    // forward progress when reality is the opposite.
-                    buffered_events: u32::try_from(record.state.buffered_event_count())
-                        .unwrap_or(u32::MAX),
                 }
             })
             .collect()
@@ -2363,86 +2296,32 @@ mod tests {
         orch.start_migration(origin, 0x1111, 0x3333).unwrap();
     }
 
+    /// After deleting `MigrationOrchestrator::buffer_event` (the
+    /// dead surface that no production caller ever used),
+    /// `on_restore_complete` ships a `MigrationMessage` that
+    /// always carries no buffered events. The source-side
+    /// `MigrationSourceHandler::on_cutover` is the only path
+    /// that drains real buffered events; the orchestrator
+    /// surface is dead and removed.
     #[test]
-    fn test_event_buffering() {
+    fn on_restore_complete_ships_no_buffered_events() {
         let (reg, origin) = setup_registry();
         let orch = MigrationOrchestrator::new(reg, 0x3333);
 
         orch.start_migration(origin, 0x1111, 0x2222).unwrap();
-
-        let event = CausalEvent {
-            link: CausalLink::genesis(origin, 0),
-            payload: Bytes::from_static(b"test"),
-            received_at: 0,
-        };
-
-        assert_eq!(orch.buffer_event(origin, event), BufferOutcome::Buffered);
-        assert_eq!(
-            orch.buffer_event(
-                0xDEAD,
-                CausalEvent {
-                    link: CausalLink::genesis(0xDEAD, 0),
-                    payload: Bytes::from_static(b"nope"),
-                    received_at: 0,
-                }
-            ),
-            BufferOutcome::NoMigration,
-        );
-    }
-
-    /// Regression: `buffer_event` must distinguish "no
-    /// migration" from "migration past cutover" via the
-    /// `BufferOutcome` enum. Pre-fix both cases collapsed to
-    /// `false`, so a caller running
-    /// `if !orch.buffer_event(...) { route_to_source(...) }`
-    /// would, post-cutover, route the event to the source —
-    /// which has stopped accepting writes for this daemon, so
-    /// the event was silently lost.
-    #[test]
-    fn buffer_event_distinguishes_post_cutover_from_no_migration() {
-        let (reg, origin) = setup_registry();
-        let orch = MigrationOrchestrator::new(reg, 0x3333);
-
-        let event = || CausalEvent {
-            link: CausalLink::genesis(origin, 0),
-            payload: Bytes::from_static(b"test"),
-            received_at: 0,
-        };
-
-        // Case A: no migration record at all.
-        assert_eq!(
-            orch.buffer_event(origin, event()),
-            BufferOutcome::NoMigration,
-            "buffer_event with no migration must surface as NoMigration"
-        );
-
-        // Case B: migration in Snapshot phase — event buffered.
-        orch.start_migration(origin, 0x1111, 0x2222).unwrap();
-        assert_eq!(
-            orch.buffer_event(origin, event()),
-            BufferOutcome::Buffered,
-            "buffer_event during Snapshot must surface as Buffered"
-        );
-
-        // Force the migration into Cutover via the test-only
-        // phase setter. We can't drive a real cutover here
-        // without going through the full handler protocol, but
-        // BufferOutcome only inspects `state.phase()`.
+        // Drive Snapshot → Transfer → Restore by force-phase so
+        // we don't need a real source-side handshake.
         {
             let entry = orch.migrations.get(&origin).unwrap();
             let mut record = entry.lock();
-            record.state.force_phase(MigrationPhase::Cutover);
+            record.state.force_phase(MigrationPhase::Restore);
         }
 
-        // Case C: migration past cutover — must NOT collapse
-        // to NoMigration. Caller needs to route to target.
-        assert_eq!(
-            orch.buffer_event(origin, event()),
-            BufferOutcome::PostCutover,
-            "buffer_event in Cutover phase must surface as PostCutover, \
-             not NoMigration. Pre-fix the bool conflated these and \
-             callers routed post-cutover events to the source, where \
-             they were silently lost."
+        let result = orch.on_restore_complete(origin, 0).unwrap();
+        assert!(
+            result.is_none(),
+            "on_restore_complete must never emit BufferedEvents — \
+             that buffer is exclusively a source-handler surface"
         );
     }
 
@@ -3218,27 +3097,5 @@ mod tests {
         assert_eq!(list[0].source_node, 0x1111);
         assert_eq!(list[0].target_node, 0x2222);
         assert_eq!(list[0].retries, 0);
-        assert_eq!(list[0].buffered_events, 0);
-    }
-
-    /// The conversion used at the `list_migrations` call site
-    /// (a raw `as u32` would wrap silently). A stuck-in-Replay
-    /// migration buffering past `u32::MAX` must report
-    /// `u32::MAX`, not a wrapped small number, so operators
-    /// reading the Deck don't mistake overflow for drain.
-    #[test]
-    fn buffered_events_saturates_at_u32_max() {
-        let cast = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-        assert_eq!(cast(0), 0);
-        assert_eq!(cast(1), 1);
-        assert_eq!(cast(u32::MAX as usize), u32::MAX);
-        // On 64-bit hosts these are strictly above u32::MAX;
-        // on a hypothetical 32-bit host the saturating
-        // conversion is a no-op and the assertion still
-        // holds.
-        assert_eq!(cast(usize::MAX), u32::MAX);
-        if let Some(overflow) = (u32::MAX as usize).checked_add(1) {
-            assert_eq!(cast(overflow), u32::MAX);
-        }
     }
 }

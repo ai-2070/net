@@ -15,9 +15,9 @@ use net::adapter::net::behavior::capability::{
 use net::adapter::net::behavior::loadbalance::{RequestContext, Strategy};
 use net::adapter::net::compute::migration_target::RestoreContext;
 use net::adapter::net::compute::{
-    chunk_snapshot, BufferOutcome, DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry,
-    ForkGroup, ForkGroupConfig, GroupCoordinator, GroupError, GroupHealth, MemberInfo, MemberRole,
-    MeshDaemon, MigrationMessage, MigrationOrchestrator, MigrationPhase, MigrationSourceHandler,
+    chunk_snapshot, DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, ForkGroup,
+    ForkGroupConfig, GroupCoordinator, GroupError, GroupHealth, MemberInfo, MemberRole, MeshDaemon,
+    MigrationMessage, MigrationOrchestrator, MigrationPhase, MigrationSourceHandler,
     MigrationTargetHandler, ReplicaGroup, ReplicaGroupConfig, Scheduler, SnapshotReassembler,
     StandbyGroup, StandbyGroupConfig, MAX_SNAPSHOT_CHUNK_SIZE,
 };
@@ -153,36 +153,29 @@ fn test_orchestrator_full_phase_chain() {
     assert_eq!(orch.active_count(), 0);
 }
 
-// ── 2. Orchestrator phase chain with buffered events ─────────────────────────
+// ── 2. Orchestrator phase chain ──────────────────────────────────────────────
+//
+// The orchestrator no longer holds an event buffer of its own —
+// MigrationSourceHandler is the only buffering surface (its
+// on_cutover drains real buffered events). on_restore_complete
+// always returns Ok(None).
 
 #[test]
-fn test_orchestrator_phase_chain_with_buffered_events() {
+fn test_orchestrator_phase_chain() {
     let reg = Arc::new(DaemonRegistry::new());
     let (_, origin) = register_counter_daemon(&reg, 10);
     let orch = MigrationOrchestrator::new(reg.clone(), 0x1111);
 
-    // Start migration
     orch.start_migration(origin, 0x1111, 0x2222).unwrap();
 
-    // Buffer events while snapshot is in flight
-    for seq in 1..=5 {
-        assert_eq!(
-            orch.buffer_event(origin, make_event(0xBBBB, seq)),
-            BufferOutcome::Buffered,
-        );
-    }
-
-    // Restore complete → should drain buffered events
-    let buffered = orch.on_restore_complete(origin, 10).unwrap();
-    assert!(buffered.is_some());
-    match buffered.unwrap() {
-        MigrationMessage::BufferedEvents { events, .. } => {
-            assert_eq!(events.len(), 5);
-            assert_eq!(events[0].link.sequence, 1);
-            assert_eq!(events[4].link.sequence, 5);
-        }
-        _ => panic!("expected BufferedEvents"),
-    }
+    // on_restore_complete ships no buffered events — the
+    // orchestrator surface for buffering was deleted because no
+    // production caller ever used it.
+    let result = orch.on_restore_complete(origin, 10).unwrap();
+    assert!(
+        result.is_none(),
+        "on_restore_complete must not emit BufferedEvents from the orchestrator side"
+    );
 
     // Continue through remaining phases
     orch.on_replay_complete(origin, 15).unwrap();
@@ -412,7 +405,7 @@ fn test_subprotocol_handler_snapshot_ready_dispatch() {
 }
 
 #[test]
-fn test_subprotocol_handler_buffered_events_dispatch() {
+fn test_subprotocol_handler_restore_complete_emits_no_buffered_events() {
     use net::adapter::net::compute::orchestrator::wire;
     use net::adapter::net::subprotocol::MigrationSubprotocolHandler;
 
@@ -425,14 +418,11 @@ fn test_subprotocol_handler_buffered_events_dispatch() {
 
     let handler = MigrationSubprotocolHandler::new(orch.clone(), source, target, 0x3333);
 
-    // Start migration on the orchestrator (remote source at 0x1111)
+    // Start migration on the orchestrator (remote source at 0x1111).
+    // The orchestrator no longer maintains a buffer of its own —
+    // MigrationSourceHandler is the only buffering surface.
     orch.start_migration(origin, 0x1111, 0x2222).unwrap();
 
-    // Buffer some events on the orchestrator
-    orch.buffer_event(origin, make_event(0xCCCC, 1));
-    orch.buffer_event(origin, make_event(0xCCCC, 2));
-
-    // Send RestoreComplete → should get BufferedEvents back
     let restore_msg = MigrationMessage::RestoreComplete {
         daemon_origin: origin,
         restored_seq: 10,
@@ -441,15 +431,25 @@ fn test_subprotocol_handler_buffered_events_dispatch() {
         .handle_message(&wire::encode(&restore_msg).unwrap(), 0x2222)
         .unwrap();
 
-    // Should have BufferedEvents response
-    assert!(!outbound.is_empty());
-    let reply = wire::decode(&outbound[0].payload).unwrap();
-    match reply {
-        MigrationMessage::BufferedEvents { events, .. } => {
-            assert_eq!(events.len(), 2);
-        }
-        _ => panic!("expected BufferedEvents, got {:?}", reply),
-    }
+    // The subprotocol handler always sends a BufferedEvents
+    // reply (the target needs the message to advance), but the
+    // orchestrator's contribution is always an empty event list:
+    // the orchestrator no longer holds a buffer of its own;
+    // source-side buffered events surface through
+    // MigrationSourceHandler::on_cutover, not here.
+    let buffered_events: Vec<_> = outbound
+        .iter()
+        .filter_map(|frame| match wire::decode(&frame.payload) {
+            Ok(MigrationMessage::BufferedEvents { events, .. }) => Some(events),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(buffered_events.len(), 1, "expected a single BufferedEvents reply");
+    assert!(
+        buffered_events[0].is_empty(),
+        "orchestrator-driven BufferedEvents must carry zero events — the dead \
+         buffer_event surface was removed; source-side cutover is the only buffer source"
+    );
 }
 
 #[test]
@@ -1345,19 +1345,30 @@ fn test_regression_reassembler_rejects_mixed_seq_through() {
 /// Regression: Multi-chunk snapshot path in on_snapshot_ready never advanced
 /// MigrationState out of Snapshot phase, breaking subsequent phase transitions
 /// (on_restore_complete would fail with WrongPhase).
+///
+/// Chunk 0 of a multi-chunk SnapshotReady now requires the snapshot wire
+/// envelope (magic + version + entity_id) so the orchestrator can catch
+/// header-level corruption symmetrically with the single-chunk path. Build a
+/// chunk 0 carrying the right entity_id; chunks 1+ are raw payload fragments
+/// and skip envelope validation.
 #[test]
 fn test_regression_multi_chunk_advances_past_snapshot_phase() {
     let reg = Arc::new(DaemonRegistry::new());
-    let (_, origin) = register_counter_daemon(&reg, 10);
+    let (kp, origin) = register_counter_daemon(&reg, 10);
     let orch = MigrationOrchestrator::new(reg.clone(), 0x3333);
 
     // Start migration (remote source)
     orch.start_migration(origin, 0x1111, 0x2222).unwrap();
     assert_eq!(orch.status(origin), Some(MigrationPhase::Snapshot));
 
-    // Simulate first chunk of a multi-chunk snapshot
-    orch.on_snapshot_ready(origin, vec![1, 2, 3], 10, 0, 3)
-        .unwrap();
+    // Build a chunk 0 that satisfies the envelope validator:
+    // [magic(4) "CDS1"][version(1)=2][entity_id(32)][padding].
+    let mut chunk0 = Vec::with_capacity(48);
+    chunk0.extend_from_slice(b"CDS1");
+    chunk0.push(2); // SNAPSHOT_VERSION
+    chunk0.extend_from_slice(kp.entity_id().as_bytes());
+    chunk0.extend_from_slice(&[0u8; 11]); // padding to satisfy len >= 37
+    orch.on_snapshot_ready(origin, chunk0, 10, 0, 3).unwrap();
 
     // Phase MUST have advanced past Snapshot — otherwise on_restore_complete
     // would fail because it expects Transfer phase
@@ -1368,7 +1379,7 @@ fn test_regression_multi_chunk_advances_past_snapshot_phase() {
     );
     assert_eq!(orch.status(origin), Some(MigrationPhase::Transfer));
 
-    // Subsequent chunks should not error
+    // Subsequent chunks are raw fragments — no envelope check.
     orch.on_snapshot_ready(origin, vec![4, 5, 6], 10, 1, 3)
         .unwrap();
     orch.on_snapshot_ready(origin, vec![7, 8], 10, 2, 3)

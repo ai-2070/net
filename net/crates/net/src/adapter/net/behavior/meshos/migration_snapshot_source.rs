@@ -76,7 +76,12 @@ impl MigrationSnapshotSource for OrchestratorMigrationSnapshotSource {
                     snapshot_bytes: item.snapshot_bytes,
                     retries: item.retries,
                     progress_pct: phase_progress_pct(phase),
-                    buffered_events: item.buffered_events,
+                    // Orchestrator no longer tracks a buffer of its
+                    // own (it never did in production — source-side
+                    // buffering happens at MigrationSourceHandler).
+                    // The wire field is kept for back-compat on
+                    // existing snapshots; new writes are always 0.
+                    buffered_events: 0,
                 }
             })
             .collect()
