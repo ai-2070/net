@@ -81,6 +81,11 @@ pub struct ForkGroup {
     forks: Vec<ForkInfo>,
     /// Shared coordination (LB, members, health).
     coord: GroupCoordinator,
+    /// X-1 epoch — bumped on every recovery-driven re-placement
+    /// of a fork slot. See `StandbyGroup::term` for the cross-
+    /// node-fencing intent; the wire integration is a separate
+    /// change.
+    term: u64,
 }
 
 impl ForkGroup {
@@ -153,12 +158,20 @@ impl ForkGroup {
             config,
             forks,
             coord,
+            term: 1,
         })
     }
 
     /// Route an inbound event to the best available fork.
     pub fn route_event(&self, ctx: &RequestContext) -> Result<u64, GroupError> {
         self.coord.route_event(ctx)
+    }
+
+    /// X-1 epoch counter. Bumped on every successful slot
+    /// re-placement via `try_recover` after a node failure.
+    /// See `StandbyGroup::term` for the fencing rationale.
+    pub fn term(&self) -> u64 {
+        self.term
     }
 
     /// Resize the fork group to `n` forks.
@@ -448,6 +461,7 @@ impl ForkGroup {
             config,
             forks,
             coord,
+            term: 1,
         })
     }
 
@@ -790,6 +804,13 @@ impl ForkGroup {
             recovered.push(index);
         }
 
+        // X-1 epoch bump: every successful recovery advances the
+        // term. A future cross-node wire-fencing layer can use
+        // this to reject routed events from a slot that observed
+        // a stale `term` at the issuer's end of the partition.
+        if !recovered.is_empty() {
+            self.term = self.term.saturating_add(1);
+        }
         recovered
     }
 }

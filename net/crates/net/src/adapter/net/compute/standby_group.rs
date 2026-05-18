@@ -96,6 +96,16 @@ pub struct StandbyGroup {
     buffered_since_sync: Vec<CausalEvent>,
     /// Shared coordination (member tracking, placement).
     coord: GroupCoordinator,
+    /// X-1 epoch — bumped on every `promote` /
+    /// `promote_with_placement`. The first active starts at 1; each
+    /// subsequent promotion increments. The intended use is
+    /// cross-node fencing: routed events should carry the issuing
+    /// active's `term`, and a receiver that observes a strictly-
+    /// higher `term` than its own demotes to standby. The cross-
+    /// node wire integration is a separate change; this counter is
+    /// the local scaffolding it builds on, and `term()` exposes it
+    /// to operators / future wire layers.
+    term: u64,
 }
 
 impl StandbyGroup {
@@ -175,7 +185,19 @@ impl StandbyGroup {
             members,
             buffered_since_sync: Vec::new(),
             coord,
+            // Spawn-time active is term 1; every subsequent
+            // `promote` increments.
+            term: 1,
         })
+    }
+
+    /// Current epoch counter. Bumped on every successful
+    /// `promote` / `promote_with_placement`. Cross-node fencing
+    /// (X-1) consumes this to reject events from a stale active
+    /// after a partition heal; the wire integration is a
+    /// separate change.
+    pub fn term(&self) -> u64 {
+        self.term
     }
 
     /// Get the origin_hash of the active member.
@@ -363,6 +385,16 @@ impl StandbyGroup {
         // Promote
         self.active_index = best_standby;
         self.members[best_standby as usize].role = MemberRole::Active;
+        // X-1 epoch bump. Every promotion advances the term; a
+        // future wire-fencing layer compares an incoming event's
+        // term against the receiver's recorded term and rejects
+        // strictly-lower-term events (stale active still
+        // emitting after partition heal) or self-demotes on a
+        // strictly-higher-term observation. `saturating_add`
+        // pins the post-u64::MAX case at the cap rather than
+        // wrapping — an astronomical precondition, but cheap to
+        // bound.
+        self.term = self.term.saturating_add(1);
 
         let new_active_origin = self.coord.members()[best_standby as usize].origin_hash;
 
@@ -581,6 +613,7 @@ impl StandbyGroup {
             members,
             buffered_since_sync: Vec::new(),
             coord,
+            term: 1,
         })
     }
 
@@ -687,6 +720,8 @@ impl StandbyGroup {
 
         self.active_index = best_standby;
         self.members[best_standby as usize].role = MemberRole::Active;
+        // X-1 epoch bump — see promote() above for rationale.
+        self.term = self.term.saturating_add(1);
 
         let new_active_origin = self.coord.members()[best_standby as usize].origin_hash;
 
@@ -1315,6 +1350,39 @@ mod tests {
             group.buffered_event_count() > 0,
             "buffered_since_sync must be retained on partial failure",
         );
+    }
+
+    /// X-1 epoch scaffolding: every successful `promote` bumps
+    /// the `term` counter. A future cross-node fencing layer uses
+    /// this to reject events from a stale active after a
+    /// partition heal; this test pins the local bump semantic.
+    #[test]
+    fn promote_bumps_term_counter() {
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+
+        // Spawn-time active is term 1.
+        assert_eq!(group.term(), 1);
+
+        // First promote → term 2.
+        let _ = group
+            .promote(|| Box::new(StatefulDaemon::new()), &reg, &sched)
+            .expect("first promote");
+        assert_eq!(group.term(), 2);
+
+        // Second promote → term 3. Drives the term advancement
+        // documented for partition-heal fencing.
+        let _ = group
+            .promote(|| Box::new(StatefulDaemon::new()), &reg, &sched)
+            .expect("second promote");
+        assert_eq!(group.term(), 3);
     }
 
     /// X-19 regression: a `promote` that picks a succeeded standby

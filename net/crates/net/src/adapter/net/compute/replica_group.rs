@@ -91,6 +91,11 @@ pub struct ReplicaGroup {
     config: ReplicaGroupConfig,
     /// Shared coordination (LB, members, health).
     coord: GroupCoordinator,
+    /// X-1 epoch — bumped on every recovery-driven re-placement
+    /// of a replica slot. See `StandbyGroup::term` for the
+    /// fencing intent; the cross-node wire integration is a
+    /// separate change.
+    term: u64,
 }
 
 impl ReplicaGroup {
@@ -146,12 +151,20 @@ impl ReplicaGroup {
             group_id,
             config,
             coord,
+            term: 1,
         })
     }
 
     /// Route an inbound event to the best available replica.
     pub fn route_event(&self, ctx: &RequestContext) -> Result<u64, GroupError> {
         self.coord.route_event(ctx)
+    }
+
+    /// X-1 epoch counter. Bumped on every successful slot
+    /// re-placement via `try_recover` after a node failure.
+    /// See `StandbyGroup::term` for the fencing rationale.
+    pub fn term(&self) -> u64 {
+        self.term
     }
 
     /// Resize the group to `n` replicas.
@@ -383,6 +396,7 @@ impl ReplicaGroup {
             group_id,
             config,
             coord,
+            term: 1,
         })
     }
 
@@ -650,6 +664,11 @@ impl ReplicaGroup {
             recovered.push(index);
         }
 
+        // X-1 epoch bump on successful recovery — see
+        // ForkGroup::try_recover_inner for rationale.
+        if !recovered.is_empty() {
+            self.term = self.term.saturating_add(1);
+        }
         recovered
     }
 }
