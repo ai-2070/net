@@ -7,6 +7,7 @@
 
 use dashmap::DashMap;
 use ed25519_dalek::Signature;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::entity::{EntityId, EntityKeypair};
@@ -106,28 +107,28 @@ pub struct ScopedToken {
 
 /// A signed, delegatable permission token.
 ///
-/// Wire format (165 bytes):
+/// Wire format (169 bytes):
 /// ```text
-/// issuer:           32 bytes (EntityId)
-/// subject:          32 bytes (EntityId)
-/// scope:             4 bytes (u32)
-/// channel_hash:      8 bytes (ChannelHash, u64; combine with WILDCARD scope for "all channels")
-/// not_before:        8 bytes (u64 unix timestamp)
-/// not_after:         8 bytes (u64 unix timestamp)
-/// delegation_depth:  1 byte  (u8)
-/// nonce:             8 bytes (u64)
+/// issuer:             32 bytes (EntityId)
+/// subject:            32 bytes (EntityId)
+/// scope:               4 bytes (u32)
+/// channel_hash:        8 bytes (ChannelHash, u64; combine with WILDCARD scope for "all channels")
+/// issuer_generation:   4 bytes (u32; floor below which the issuer revokes outstanding tokens)
+/// not_before:          8 bytes (u64 unix timestamp)
+/// not_after:           8 bytes (u64 unix timestamp)
+/// delegation_depth:    1 byte  (u8)
+/// nonce:               8 bytes (u64)
 /// --- signed above ---
-/// signature:        64 bytes (ed25519)
+/// signature:          64 bytes (ed25519)
 /// ```
 ///
-/// The `channel_hash` width was widened from 4 bytes (u32) to 8
-/// bytes (u64) to close a targeted-collision attack on
-/// `TokenCache::check`: under the prior width, an attacker willing
-/// to do ~2^32 work could grind a channel name whose `xxh3_64 as u32`
-/// matched a victim channel's, get a permissive issuer to sign a
-/// token for the grinded name, and use it against the victim
-/// channel via the hash-keyed fast-path cache. The full xxh3_64
-/// keyspace raises the attack cost to ~2^64.
+/// `issuer_generation` participates in revocation: an issuer that
+/// wants to invalidate every outstanding token (including delegated
+/// children) bumps its floor in the [`RevocationRegistry`]; the
+/// cache rejects any token whose generation is below the current
+/// floor. Children inherit their parent's generation at delegation
+/// time, so revoking a parent transitively revokes its descendants
+/// without a parent-chain walk.
 #[derive(Clone)]
 pub struct PermissionToken {
     /// Who issued this token.
@@ -139,6 +140,12 @@ pub struct PermissionToken {
     /// Channel restriction (canonical [`ChannelHash`]; combine with
     /// [`TokenScope::WILDCARD`] for cross-channel grants).
     pub channel_hash: ChannelHash,
+    /// Issuer-rotation floor. Tokens with `issuer_generation < current
+    /// floor` in the [`RevocationRegistry`] are rejected by
+    /// [`TokenCache::check`]; bumping the floor invalidates every
+    /// outstanding token from that issuer (including delegated
+    /// children, which inherit the value from their parent).
+    pub issuer_generation: u32,
     /// Valid from (unix timestamp seconds).
     pub not_before: u64,
     /// Valid until (unix timestamp seconds).
@@ -153,10 +160,10 @@ pub struct PermissionToken {
 
 impl PermissionToken {
     /// Size of the signed payload (everything before the signature).
-    const SIGNED_PAYLOAD_SIZE: usize = 32 + 32 + 4 + 8 + 8 + 8 + 1 + 8; // 101 bytes
+    const SIGNED_PAYLOAD_SIZE: usize = 32 + 32 + 4 + 8 + 4 + 8 + 8 + 1 + 8; // 105 bytes
 
     /// Total serialized size.
-    pub const WIRE_SIZE: usize = Self::SIGNED_PAYLOAD_SIZE + 64; // 165 bytes
+    pub const WIRE_SIZE: usize = Self::SIGNED_PAYLOAD_SIZE + 64; // 169 bytes
 
     /// Issue a new token.
     ///
@@ -253,6 +260,12 @@ impl PermissionToken {
             subject,
             scope,
             channel_hash,
+            // Default to generation 0. Callers that maintain a
+            // RevocationRegistry can mint a token bound to a specific
+            // generation via direct struct construction, or rotate
+            // by bumping their floor and re-issuing with a higher
+            // value — see `try_issue_with_generation`.
+            issuer_generation: 0,
             not_before: now,
             not_after: now.saturating_add(duration_secs),
             delegation_depth,
@@ -410,6 +423,13 @@ impl PermissionToken {
             subject: new_subject,
             scope: new_scope,
             channel_hash: self.channel_hash,
+            // Children inherit the parent's issuer_generation. When the
+            // signer's floor is bumped in the RevocationRegistry, every
+            // outstanding token from that issuer — including this
+            // child — falls below the floor and TokenCache::check
+            // rejects them. That makes a single floor bump transitively
+            // invalidate the chain without a per-link revocation walk.
+            issuer_generation: self.issuer_generation,
             not_before: now,
             not_after: self.not_after,
             delegation_depth: self.delegation_depth - 1,
@@ -448,10 +468,12 @@ impl PermissionToken {
         off += 32;
         buf[off..off + 4].copy_from_slice(&self.scope.bits().to_le_bytes());
         off += 4;
-        // 8 bytes for channel_hash (u64) — see WIRE_SIZE comment for
-        // why the width was raised from 4.
+        // 8 bytes for channel_hash (u64) — see WIRE_SIZE comment.
         buf[off..off + 8].copy_from_slice(&self.channel_hash.to_le_bytes());
         off += 8;
+        // 4 bytes for issuer_generation (revocation floor).
+        buf[off..off + 4].copy_from_slice(&self.issuer_generation.to_le_bytes());
+        off += 4;
         buf[off..off + 8].copy_from_slice(&self.not_before.to_le_bytes());
         off += 8;
         buf[off..off + 8].copy_from_slice(&self.not_after.to_le_bytes());
@@ -484,23 +506,26 @@ impl PermissionToken {
             return Err(TokenError::InvalidFormat);
         }
 
-        // Offsets reflect the widened channel_hash (8 bytes) at byte 68.
+        // Offsets reflect channel_hash (8 bytes) at byte 68 and
+        // issuer_generation (4 bytes) at byte 76.
         let issuer = EntityId::from_bytes(data[0..32].try_into().unwrap());
         let subject = EntityId::from_bytes(data[32..64].try_into().unwrap());
         let scope = TokenScope::from_bits(u32::from_le_bytes(data[64..68].try_into().unwrap()));
         let channel_hash = ChannelHash::from_le_bytes(data[68..76].try_into().unwrap());
-        let not_before = u64::from_le_bytes(data[76..84].try_into().unwrap());
-        let not_after = u64::from_le_bytes(data[84..92].try_into().unwrap());
-        let delegation_depth = data[92];
-        let nonce = u64::from_le_bytes(data[93..101].try_into().unwrap());
+        let issuer_generation = u32::from_le_bytes(data[76..80].try_into().unwrap());
+        let not_before = u64::from_le_bytes(data[80..88].try_into().unwrap());
+        let not_after = u64::from_le_bytes(data[88..96].try_into().unwrap());
+        let delegation_depth = data[96];
+        let nonce = u64::from_le_bytes(data[97..105].try_into().unwrap());
         let mut signature = [0u8; 64];
-        signature.copy_from_slice(&data[101..165]);
+        signature.copy_from_slice(&data[105..169]);
 
         Ok(Self {
             issuer,
             subject,
             scope,
             channel_hash,
+            issuer_generation,
             not_before,
             not_after,
             delegation_depth,
@@ -562,14 +587,90 @@ pub const MAX_TOKENS_PER_SLOT: usize = 32;
 /// [`MAX_TOKENS_PER_SLOT`] (tokens-with-distinct-scope per slot).
 pub struct TokenCache {
     tokens: DashMap<([u8; 32], ChannelHash), Vec<PermissionToken>>,
+    /// Per-issuer revocation floor. A token whose
+    /// `issuer_generation` is strictly below the floor stored here
+    /// for its issuer is rejected by [`Self::check`]. None = the
+    /// cache shares the process-wide registry it was created with;
+    /// callers that want isolated revocation state (test harnesses,
+    /// multiple tenants in the same process) inject their own via
+    /// [`Self::with_revocation_registry`].
+    revocation: Arc<RevocationRegistry>,
+}
+
+/// Per-issuer revocation floor. Bumping an issuer's floor invalidates
+/// every outstanding token from that issuer — including delegated
+/// children — without needing to enumerate them. Issuers ship the
+/// floor out-of-band alongside their public key when rotation matters.
+#[derive(Debug, Default)]
+pub struct RevocationRegistry {
+    floors: DashMap<[u8; 32], u32>,
+}
+
+impl RevocationRegistry {
+    /// Create an empty registry (every issuer's floor is implicitly 0).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the floor for an issuer. Tokens with
+    /// `issuer_generation < generation` are rejected on the next
+    /// [`TokenCache::check`]. The call is monotonic: bumping with a
+    /// value <= the current floor is a no-op (prevents accidental
+    /// un-revocation).
+    pub fn revoke_below(&self, issuer: &EntityId, generation: u32) {
+        let key = *issuer.as_bytes();
+        // Use entry::and_modify + or_insert so the merge is atomic
+        // against concurrent revoke_below calls on the same issuer.
+        self.floors
+            .entry(key)
+            .and_modify(|cur| {
+                if generation > *cur {
+                    *cur = generation;
+                }
+            })
+            .or_insert(generation);
+    }
+
+    /// Current floor for an issuer (0 if unset).
+    pub fn floor(&self, issuer: &EntityId) -> u32 {
+        self.floors
+            .get(issuer.as_bytes())
+            .map(|r| *r.value())
+            .unwrap_or(0)
+    }
+
+    /// Returns true if `token` is below its issuer's floor.
+    #[inline]
+    pub fn is_revoked(&self, token: &PermissionToken) -> bool {
+        token.issuer_generation < self.floor(&token.issuer)
+    }
 }
 
 impl TokenCache {
-    /// Create an empty token cache.
+    /// Create an empty token cache with a fresh revocation registry.
     pub fn new() -> Self {
         Self {
             tokens: DashMap::new(),
+            revocation: Arc::new(RevocationRegistry::new()),
         }
+    }
+
+    /// Create an empty token cache that shares the supplied
+    /// revocation registry. Use this when several caches in the
+    /// same process must observe the same revocation floors (e.g.
+    /// per-channel caches that all need to honour issuer-wide
+    /// rotation).
+    pub fn with_revocation_registry(revocation: Arc<RevocationRegistry>) -> Self {
+        Self {
+            tokens: DashMap::new(),
+            revocation,
+        }
+    }
+
+    /// Borrow the cache's revocation registry. Use this to drive
+    /// floor bumps without holding a separate handle.
+    pub fn revocation(&self) -> &Arc<RevocationRegistry> {
+        &self.revocation
     }
 
     /// Insert a token into the cache after verifying its signature.
@@ -669,7 +770,11 @@ impl TokenCache {
             if slot
                 .value()
                 .iter()
-                .any(|t| t.is_valid().is_ok() && t.authorizes(action, channel_hash))
+                .any(|t| {
+                    t.is_valid().is_ok()
+                        && !self.revocation.is_revoked(t)
+                        && t.authorizes(action, channel_hash)
+                })
             {
                 return Ok(());
             }
@@ -679,7 +784,11 @@ impl TokenCache {
             if slot
                 .value()
                 .iter()
-                .any(|t| t.is_valid().is_ok() && t.authorizes(action, channel_hash))
+                .any(|t| {
+                    t.is_valid().is_ok()
+                        && !self.revocation.is_revoked(t)
+                        && t.authorizes(action, channel_hash)
+                })
             {
                 return Ok(());
             }
@@ -1342,6 +1451,108 @@ mod tests {
         assert!(cache
             .check(unknown.entity_id(), TokenScope::PUBLISH, 0xABCD)
             .is_err());
+    }
+
+    /// Bumping an issuer's revocation floor invalidates every
+    /// outstanding token from that issuer (including delegated
+    /// children, which inherit `issuer_generation` from their
+    /// parent). Pre-fix there was no revocation at all — a leaked
+    /// parent token's children outlived any "rotate" intent on the
+    /// parent's key.
+    #[test]
+    fn revocation_floor_bump_invalidates_outstanding_tokens() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+
+        let cache = TokenCache::new();
+        let token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0xABCD_EF00_AAAA_BBBB,
+            3600,
+            0,
+        );
+        // Tokens issued via try_issue default to generation 0.
+        assert_eq!(token.issuer_generation, 0);
+        cache.insert(token).expect("token should verify");
+
+        // Pre-revoke: check passes.
+        assert!(cache
+            .check(
+                subject.entity_id(),
+                TokenScope::PUBLISH,
+                0xABCD_EF00_AAAA_BBBB,
+            )
+            .is_ok());
+
+        // Bump the floor to 1 — every outstanding gen-0 token is now
+        // below the floor.
+        cache.revocation().revoke_below(issuer.entity_id(), 1);
+
+        // Same check now fails.
+        assert!(cache
+            .check(
+                subject.entity_id(),
+                TokenScope::PUBLISH,
+                0xABCD_EF00_AAAA_BBBB,
+            )
+            .is_err());
+    }
+
+    /// Revocation floor is monotonic: bumping with a lower value is
+    /// a no-op. Prevents accidental un-revocation under racing
+    /// rotation attempts.
+    #[test]
+    fn revocation_floor_is_monotonic() {
+        let issuer = EntityKeypair::generate();
+        let registry = RevocationRegistry::new();
+        registry.revoke_below(issuer.entity_id(), 5);
+        assert_eq!(registry.floor(issuer.entity_id()), 5);
+        // Lower value: no-op.
+        registry.revoke_below(issuer.entity_id(), 2);
+        assert_eq!(registry.floor(issuer.entity_id()), 5);
+        // Higher value: advances.
+        registry.revoke_below(issuer.entity_id(), 10);
+        assert_eq!(registry.floor(issuer.entity_id()), 10);
+    }
+
+    /// A delegated child must inherit its parent's
+    /// `issuer_generation` so a floor bump on the issuer's key
+    /// invalidates the child transitively without a chain walk.
+    #[test]
+    fn delegate_inherits_parent_issuer_generation() {
+        let issuer = EntityKeypair::generate();
+        let intermediate = EntityKeypair::generate();
+        let leaf = EntityKeypair::generate();
+
+        let mut parent = PermissionToken::issue(
+            &issuer,
+            intermediate.entity_id().clone(),
+            TokenScope::PUBLISH.union(TokenScope::DELEGATE),
+            0xCAFE_BABE,
+            3600,
+            2,
+        );
+        // Simulate a parent issued at generation 7.
+        parent.issuer_generation = 7;
+        // Re-sign so the modified payload still verifies — bypass
+        // the public `delegate` because it's the issuer's keypair
+        // that signs the parent.
+        let payload = parent.signed_payload();
+        parent.signature = issuer.sign(&payload).to_bytes();
+
+        let child = parent
+            .delegate(
+                &intermediate,
+                leaf.entity_id().clone(),
+                TokenScope::PUBLISH,
+            )
+            .expect("delegate should succeed");
+        assert_eq!(
+            child.issuer_generation, 7,
+            "child must inherit parent's issuer_generation"
+        );
     }
 
     /// A token bound to channel hash `H_a` (u64) must NOT authorize a

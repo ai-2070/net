@@ -15,5 +15,6 @@ pub use envelope::{
 };
 pub use origin::OriginStamp;
 pub use token::{
-    PermissionToken, TokenCache, TokenError, TokenScope, MAX_TOKENS_PER_SLOT, MAX_TOKEN_SLOTS,
+    PermissionToken, RevocationRegistry, TokenCache, TokenError, TokenScope, MAX_TOKENS_PER_SLOT,
+    MAX_TOKEN_SLOTS,
 };
