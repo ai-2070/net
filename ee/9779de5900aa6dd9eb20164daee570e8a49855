@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/redex/replication_heartbeat.rs
+  s_2571835e05521c::t_af48afbf3910b8 132-158,161-171
+  s_2571835e05521c::t_a20d33e647ee22 320,326-330,334-335,337-340,344-390
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "ee9779de5900aa6dd9eb20164daee570e8a49855",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
