@@ -24,8 +24,8 @@ The replication subprotocol is the highest-leverage surface in this batch — **
 | Severity | Count | Top items |
 |---|---|---|
 | Critical | 3 | R-20, R-21, X-1 |
-| High | 16 | A-5, R-22, R-23, R-24, R-25, X-2, X-3, X-9, X-18, X-19, D-1, D-2, D-11, D-14, D-17, O-21 |
-| Medium | 30 | (see body) |
+| High | 18 | A-5, R-22, R-23, R-24, R-25, X-2, X-3, X-9, X-18, X-19, D-1, D-2, D-11, D-14, D-17, O-21, S-1, S-2 |
+| Medium | 31 | (see body) |
 | Low | 39 | (counts only at the end) |
 | Latent | 1 | MD-3 |
 | Null | 1 module | `netdb/` clean |
@@ -41,6 +41,12 @@ Fifth pass added 3 H (D-17, X-19, O-21) + 5 M (D-18, O-22, O-23, O-24,
 X-20) + 4 L (R-40, O-25, X-21, X-22) — see "Fifth-pass additions"
 section. The pass independently re-derived R-26, D-11, and O-19 from
 the same source lines (confirmation signals, not duplicates).
+
+Sixth pass — targeted subprotocol `from_node`-binding sweep — added
+2 H (S-1, S-2) + 1 M (S-3). Cleared 7 subprotocols outright; flagged 4
+queue-to-application subprotocols and 5 reserved-unwired IDs as
+follow-up audit candidates. See "Sixth pass — targeted subprotocol
+sweep" section.
 
 ## Second-pass note (2026-05-18, later same day)
 
@@ -508,7 +514,82 @@ than threaded into the main severity buckets.
 
 ---
 
+## Sixth pass — targeted subprotocol sweep (2026-05-18)
 
+Follow-up to R-20 + X-18 + the umbrella's coverage-gap recommendation:
+*"for every subprotocol arm that mutates state, verify `from_node` is
+bound to a recorded principal before the mutation."* Audit covers the
+15 remaining subprotocols (REDEX and MIGRATION already covered by R-20
+and X-18 respectively):
+
+- `SUBPROTOCOL_CAUSAL` (0x0400), `SUBPROTOCOL_SNAPSHOT` (0x0401)
+- `SUBPROTOCOL_NEGOTIATION` (0x0600)
+- `SUBPROTOCOL_CONTINUITY` (0x0700), `SUBPROTOCOL_FORK_ANNOUNCE` (0x0701), `SUBPROTOCOL_CONTINUITY_PROOF` (0x0702)
+- `SUBPROTOCOL_PARTITION` (0x0800), `SUBPROTOCOL_RECONCILE` (0x0801)
+- `SUBPROTOCOL_REPLICA_GROUP` (0x0900)
+- `SUBPROTOCOL_CHANNEL_MEMBERSHIP` (0x0A00)
+- `SUBPROTOCOL_STREAM_WINDOW` (0x0B00)
+- `SUBPROTOCOL_CAPABILITY_ANN` (0x0C00)
+- `SUBPROTOCOL_REFLEX` (0x0D00), `SUBPROTOCOL_RENDEZVOUS` (0x0D01)
+- `SUBPROTOCOL_MESHDB` (0x0F00)
+
+**Findings: 1 M + 2 H** plus several null results documented for
+durability. `S-*` prefix names the subprotocol sweep.
+
+`from_node` is always the *cryptographic* session peer — extracted from
+`ctx.peers` by matching `session.session_id()` at the dispatch sites in
+`mesh.rs`. A non-session peer cannot inject any of these messages. The
+findings below are about session peers whose `from_node` is *unbound*
+to the message's logical principal — i.e. a legitimate session peer
+can act for/about a different node than itself.
+
+### High
+
+#### S-1 — `RendezvousMsg::PunchIntroduce` correlates on payload-only `intro.peer`; any session peer cancels a victim's introduce waiter
+- **File:** `src/adapter/net/mesh.rs:3815-3830`
+- **What:** The endpoint-side branch of `PunchIntroduce` does `ctx.pending_punch_introduces.remove(&intro.peer)` and sends the payload through the oneshot, then calls `schedule_punch(from_node, intro, ctx)`. The map key is the *peer* the local node is waiting for an introduce *about* — not the coordinator that should be forwarding it. There is no check that `from_node` is the expected coordinator (the node the local `register_punch_introduce_waiter` was set up against).
+- **Trigger / Attack:** Any peer with an established session to the local node sends `PunchIntroduce{peer: V}` where `V` is the node the local node is currently waiting on (for example, learned via prior session-establishment traffic patterns). The local node's oneshot waiter is satisfied with the attacker's payload (`peer_reflex` set to an attacker-chosen address); `schedule_punch` then drives a punch toward that address with `from_node = attacker`. The genuine coordinator's later `PunchIntroduce` finds the entry gone and is silently dropped.
+- **Fix sketch:** Bind the pending entry to a `(coordinator_node, peer)` pair. `register_punch_introduce_waiter` records the coordinator (the node `PunchRequest` was sent to); the dispatch arm rejects unless `from_node == recorded_coordinator`. Cancel/replace if a new register lands for the same peer with a different coordinator.
+
+#### S-2 — `RendezvousMsg::PunchAck` correlates on payload-only `ack.from_peer`; any session peer hijacks an ack
+- **File:** `src/adapter/net/mesh.rs:3831-3841`
+- **What:** The final-recipient branch of `PunchAck` does `ctx.pending_punch_acks.remove(&ack.from_peer)`. The key is the *claimed sender* in the payload, not `from_node`. No validation that the session peer is actually `ack.from_peer` (which they should be in the direct-ack final-leg case).
+- **Trigger / Attack:** Local node calls `connect_direct(V)`, registering a pending ack waiter keyed on `V`. Any peer with a session sends `PunchAck{from_peer: V, to_peer: local_id, ...}`. The local node's `connect_direct` future resolves with the attacker's ack data — the attacker effectively impersonates `V` for the purpose of completing the local node's punch handshake. The legitimate ack from `V`, if it arrives later, finds nothing to complete and is dropped.
+- **Note:** The forwarded-ack path at `:3842-3849` is unaffected — the *coordinator* role forwards verbatim to `to_peer`, and the trust decision lands at that recipient (which is then the S-2 case).
+- **Fix sketch:** Validate `from_node == ack.from_peer` on the final-recipient branch before the `remove`. Drop the ack otherwise. (Local node never expects an ack from anyone other than the punch target.)
+
+### Medium
+
+#### S-3 — `MembershipMsg::Ack` correlates on nonce alone; sequential nonces let any session peer spoof Subscribe/Unsubscribe responses
+- **File:** `src/adapter/net/mesh.rs:5028-5041` (Ack arm); nonce generation at `:4902-4906`
+- **What:** Ack is correlated by `ctx.pending_membership_acks.remove(&nonce)` — keyed on `u64` nonce only, not `(nonce, from_node)`. Combined with the nonce generator at `:4902-4906`:
+  ```rust
+  static COUNTER: AtomicU64 = AtomicU64::new(1);
+  COUNTER.fetch_add(1, Ordering::Relaxed)
+  ```
+  Nonces are a process-global monotonically increasing u64 starting at 1. A peer that establishes a session and triggers its own Subscribe observes its issued nonce, then knows the next-issued nonces will be sequential. Any session peer can send a spoofed `Ack{nonce: N+k, accepted: false, reason: Unauthorized}` for a small `k` to satisfy a victim's in-flight `Subscribe`/`Unsubscribe` request issued from the same process.
+- **Trigger / Attack:** Attacker establishes a session, issues a Subscribe (observes nonce `N`), then sends `Ack{nonce: N+1, accepted: false}` repeatedly at small offsets. Any local-process subscribe that issues near that window receives the spoofed denial and reports a false "Unauthorized" to its caller. Cannot grant unauthorized subscribe (the Subscribe arm path runs `authorize_subscribe`, which the attacker cannot influence); the bug is a DoS / fault-injection primitive against in-flight membership flows.
+- **Severity choice:** Medium rather than high because the attacker cannot grant access — the bug is a one-way denial primitive. Sequential nonces make it cheaply reachable from any session peer, which is why it isn't low.
+- **Fix sketch:** Store `(nonce, expected_responder_node)` tuples in `pending_membership_acks`; verify `from_node == expected_responder` before completing the oneshot. The expected responder is known at insert time (it's the same node the Subscribe is being sent to). Independently, use `rand::random::<u64>()` for nonces — sequential u64s are wrong for any cross-peer correlation primitive.
+
+### Verified clean
+
+- **STREAM_WINDOW (0x0B00)** — Grants land *inside* the encrypted session that carried them; `from_node` is the cryptographic session peer by construction, and grants only mutate stream state belonging to that same session. No additional binding needed.
+- **CHANNEL_MEMBERSHIP `Subscribe` (`mesh.rs:4973-5014`)** — `authorize_subscribe` validates `from_node` against `peer_entity_ids`, `peer_caps`, `peer_subnets`, tokens, and the registry ACL *before* the `auth_guard.allow_channel` + `roster.add_with_mode` mutations.
+- **CHANNEL_MEMBERSHIP `Unsubscribe` (`mesh.rs:5016-5027`)** — Although the arm has no payload-side principal field, the mutations apply only to the *session peer's own* subscription (`subscriber_origin_hash(from_node)` and `roster.remove(&id, from_node)`). A peer cannot unsubscribe a different peer this way; the worst they can do is unsubscribe themselves, which is the intended use.
+- **CAPABILITY_ANN (0x0C00)** — Direct announcements (`hop_count == 0`) are rejected at `mesh.rs:5153` unless `ann.node_id == from_node`; signature-verified direct anns drive the TOFU pin (`:5265-5276`) and subnet binding (`:5303-5308`). Forwarded announcements (`hop_count > 0`) install a routing-table hint keyed `ann.node_id → from_node` *as a relay route* — the entity identity itself is still signature-bound, the relay route is a discovery hint. This is a design choice (peer discovery accepts weak routing info) rather than the R-20/X-18 class of bug; flagged here for future review if the relay hint ever becomes load-bearing for auth decisions.
+- **REFLEX (0x0D00)** — Echo subprotocol; the pending-probe map is keyed by `from_node` (the *responder*) and the response only completes that key's waiter. No payload-side principal field to spoof. Resource-cap question (no per-peer limit on `pending_reflex_probes` map size) is bounded by peer count and is not the R-20/X-18 class.
+- **MESHDB (0x0F00)** — In-flight calls are tracked by `(peer, call_id)` and `Cancel` / `Response` arms key on the tuple, not on `call_id` alone (`transport.rs`). `Resume` is currently a stub (`federated.rs:1152`); the latent design issue is already tracked as **MD-3**.
+- **CAUSAL (0x0400), SNAPSHOT (0x0401), NEGOTIATION (0x0600), CONTINUITY (0x0700)** — These are *registered* in `SubprotocolRegistry::with_defaults` (`subprotocol/registry.rs`) but are NOT pre-dispatched by `mesh.rs` — they fall through to the standard event-frame path at `:3857-3897` and queue into the application-level `inbound[]` for daemon consumption. The binding check, if any, belongs at the daemon-consumer layer, not the dispatch layer. Each consumer needs its own audit; this sweep covers only the dispatch surface.
+- **FORK_ANNOUNCE (0x0701), CONTINUITY_PROOF (0x0702), PARTITION (0x0800), RECONCILE (0x0801), REPLICA_GROUP (0x0900)** — These IDs are *defined* but *no inbound dispatcher* exists in `mesh.rs`, no router, no application consumer. `REPLICA_GROUP` is explicitly documented as "Intentionally NOT in `SubprotocolRegistry::with_defaults()`" with a "register when cross-node group coordination is implemented" comment (`replica_group.rs:35-44`). The others appear to be similar reservations. **No attack surface today** — but when these IDs are wired up, every state-mutating arm needs an R-20/X-18-style `from_node` binding check from the outset.
+
+### Carry-forward audit recommendations
+
+1. **The four queue-to-application subprotocols (CAUSAL, SNAPSHOT, NEGOTIATION, CONTINUITY)** need a follow-up audit at the *consumer* layer. The dispatch is clean; the binding question is whether the daemons that read from `inbound[]` re-key by `from_node` or accept payload-side principal fields verbatim.
+2. **The five reserved-but-unwired subprotocols (FORK_ANNOUNCE, CONTINUITY_PROOF, PARTITION, RECONCILE, REPLICA_GROUP)** should each have the `from_node`-binding pattern (R-20 / X-18 / S-1..3 fix shape) baked in at first-implementation time, not retrofit. Reference this sweep in the design docs for each.
+3. **Sequential `AtomicU64` nonces** appear elsewhere — every nonce/correlation-id generator in the crate should be re-checked. If correlation depends on the value being unpredictable to other session peers, sequential is wrong.
+
+---
 
 `src/adapter/net/netdb/{db.rs, error.rs, mod.rs}` (399 LOC) is a thin builder + façade. All query/predicate/filter logic lives in `cortex::tasks` / `cortex::memories` (covered in `PHASE3_CORTEX_RPC_DROP.md`). No query expression is parsed, evaluated, or locked inside `netdb/`.
 
@@ -650,11 +731,12 @@ per-module sequences (D-16 → D-17, X-18 → X-19, O-20 → O-21, R-39 → R-40
 21. **Fifth-pass highs** — **X-19** (`StandbyGroup::promote` partial-sync double-execution) lands alongside the **X-1** fencing fix; both are silent-corruption bugs in the same file and the regression test for X-1's epoch token should also cover the X-19 replay-filter. **O-21** (cluster-backpressure release never fires while idle) is independent and small — drive the existing snapshot publish tick to also call `update_cluster_backpressure`. **D-17** (heat-emission ordering vs. async sink) is the dataforts analogue of **R-31**; fix both in the same commit by introducing a "candidate / commit" pattern shared between the heat registry and the replication coordinator.
 22. **Fifth-pass mediums** — **D-18** (FS adapter UTF-8 boundary panic) is publisher-controllable and trivial to fix; ship a same-day patch with the `char_indices` fix and the `format!("{}🦀", "a".repeat(255))` unit test. **O-22** (maintenance rank-ladder regression), **O-23** (executor `std::Instant` vs tokio sleep — fold into the same M-4 commit as R-35 and the original bus.rs fix), **O-24** (graceful_shutdown unconditional sleep), and **X-20** (dead `MigrationOrchestrator::buffer_event`) are independent; X-20 should be deletion not redirection.
 23. **Fifth-pass lows** — **R-40** (NACK BadRange thrash) folds into the same wire-protocol change as R-22/R-23. **O-25** (release backpressure refresh) and **X-21** (LocalPreferred liveness) pair with O-21 and X-16 respectively. **X-22** (third-party orchestrator `parent_hash: 0`) is the only stand-alone fifth-pass low; it breaks the continuity-proof feature in exactly the topology its docs describe, so worth lifting to medium if any deployment uses that topology today.
+24. **Sixth-pass subprotocol-binding fixes** — **S-1** (`PunchIntroduce` coordinator binding) + **S-2** (`PunchAck` from-peer binding) land together in `mesh.rs` rendezvous dispatch; both are mechanical (record the expected peer at registration time, verify on dispatch). **S-3** (membership `Ack` peer binding + random-nonce replacement) is independent; the nonce change is a one-line `rand::random()` swap and the peer-binding tuple change is local to `pending_membership_acks`. All three fixes are pure-local and do not require a wire-protocol change. The sweep also surfaced **two follow-up audits** the next pass should pick up: (a) the four queue-to-application subprotocols (CAUSAL, SNAPSHOT, NEGOTIATION, CONTINUITY) at their *consumer* layers, and (b) the same `AtomicU64::new(1)` sequential-nonce pattern wherever else it appears in the crate.
 
 ## Coverage gaps still carried forward
 
 - **Phase 2** (Miri / ASan / TSan / fuzz) — still skipped; existing `fuzz/fuzz_targets/` is wired.
 - **Cross-language conformance (Phase 4)** — Rust/TS/Py/Go SDK round-trip property tests not started.
 - **Dep audit** — `cargo-audit` / `cargo-machete` / `cargo-deny` / `cargo-udeps` not installed.
-- **Adjacent surfaces not reviewed this round:** `src/adapter/net/contested/`, `src/adapter/net/continuity/`, `src/adapter/net/cortex/` (re-review post-fixes), `src/adapter/net/identity/`, `src/adapter/net/subnet/`, `src/adapter/net/state/`, `src/adapter/net/traversal/`. Each is a candidate for a follow-up. `src/adapter/net/subprotocol/` was partially covered by X-18 (migration handler) but the other subprotocol handlers (`redex_handler`, `capability_handler`, `meshdb_handler`, etc.) were not audited for the same "no `from_node` binding" class of issue R-20 + X-18 both share. **Recommend a targeted sweep:** for every subprotocol arm that mutates state, verify `from_node` is bound to a recorded principal before the mutation.
+- **Adjacent surfaces not reviewed this round:** `src/adapter/net/contested/`, `src/adapter/net/continuity/`, `src/adapter/net/cortex/` (re-review post-fixes), `src/adapter/net/identity/`, `src/adapter/net/subnet/`, `src/adapter/net/state/`, `src/adapter/net/traversal/`. Each is a candidate for a follow-up. **The subprotocol-binding sweep recommended on the prior pass is now complete** — see the "Sixth pass — targeted subprotocol sweep" section. Three new bugs (S-1, S-2, S-3) plus two follow-up audit areas (queue-to-application consumers; sequential-nonce pattern reuse) came out of it.
 - **`src/adapter/net/behavior/meshdb/`** is now partially covered (MD-1, MD-2, MD-3). The planner / federated executor / cache layer received targeted reads; full module sweep — including `executor.rs` plan execution, `transport.rs` framing, `row.rs` predicate walking, and the `query.rs` request/response surface — is still owed.
