@@ -64,21 +64,45 @@ use std::time::Duration;
 /// through the substrate. Production sink routes through
 /// [`crate::adapter::net::MeshNode`]'s `SUBPROTOCOL_REDEX`
 /// dispatch; unit tests use a recorder mock.
+/// Bandwidth-budget accounting note that applies to every send
+/// method below: `Ok(())` means **queued to the transport**, not
+/// **delivered to the peer**. Implementations whose underlying
+/// transport buffers without ack (UDP, lossy QUIC streams under
+/// link failure, etc.) MUST surface delivery-loss through their
+/// own back-channel (heartbeat lag, peer-reported tail seq,
+/// out-of-band ack) — the replication runtime's bandwidth budget
+/// refund path keys on the synchronous `Err` return only. A
+/// silently-dropped frame still drains the budget; the
+/// flaky-link case is dampened by R-28 catchup-backoff once
+/// empty responses accrue past the threshold, but the budget
+/// itself cannot self-correct on transport-internal loss
+/// without an end-to-end ack the trait deliberately does not
+/// demand (the cost would be a per-response ack-RTT that the
+/// underlying QUIC reliable streams already provide for in-spec
+/// transports).
+///
+/// In short: trait callers MAY treat `Ok(())` as "the bytes
+/// reached the wire layer." If your transport doesn't guarantee
+/// delivery on `Ok(())`, document that on your impl and
+/// understand that the budget over-counts under loss.
 #[async_trait::async_trait]
 pub trait ReplicationDispatcher: Send + Sync {
-    /// Send a [`SyncHeartbeat`] to `target`.
+    /// Send a [`SyncHeartbeat`] to `target`. See trait-level note
+    /// on `Ok(())` semantics.
     async fn send_heartbeat(&self, target: NodeId, msg: SyncHeartbeat) -> Result<(), AdapterError>;
     /// Send a [`SyncRequest`] to `target` (typically a leader).
+    /// See trait-level note on `Ok(())` semantics.
     async fn send_sync_request(&self, target: NodeId, msg: SyncRequest)
         -> Result<(), AdapterError>;
     /// Send a [`SyncResponse`] to `target` (typically a replica
-    /// catching up).
+    /// catching up). See trait-level note on `Ok(())` semantics.
     async fn send_sync_response(
         &self,
         target: NodeId,
         msg: SyncResponse,
     ) -> Result<(), AdapterError>;
-    /// Send a [`SyncNack`] to `target`.
+    /// Send a [`SyncNack`] to `target`. See trait-level note on
+    /// `Ok(())` semantics.
     async fn send_sync_nack(&self, target: NodeId, msg: SyncNack) -> Result<(), AdapterError>;
 }
 
@@ -1166,6 +1190,18 @@ async fn on_inbound(
                         // (operators still see "we tried to send
                         // these bytes") but the rate budget can
                         // recover.
+                        //
+                        // Per the dispatcher trait's `Ok(())`
+                        // semantics: a transport that returns
+                        // `Ok(())` after queueing-without-delivery
+                        // (UDP, lossy QUIC under link failure) will
+                        // NOT trigger this refund and the budget
+                        // over-counts on silent loss. R-28
+                        // catchup-backoff dampens the wedged-link
+                        // case once empty responses accrue past
+                        // threshold, but the budget itself cannot
+                        // self-correct without an end-to-end ack
+                        // the trait deliberately does not demand.
                         {
                             let mut bb = budget.lock();
                             bb.refund(byte_estimate);
