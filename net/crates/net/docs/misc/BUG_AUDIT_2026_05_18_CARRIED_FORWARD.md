@@ -24,10 +24,13 @@ The replication subprotocol is the highest-leverage surface in this batch — **
 | Severity | Count | Top items |
 |---|---|---|
 | Critical | 3 | R-20, R-21, X-1 |
-| High | 11 | A-5, R-22, R-23, R-24, R-25, X-2, X-3, X-9, D-1, D-2, D-11 |
-| Medium | 19 | (see body) |
-| Low | 27 | (counts only at the end) |
+| High | 12 | A-5, R-22, R-23, R-24, R-25, X-2, X-3, X-9, D-1, D-2, D-11, D-14 |
+| Medium | 23 | (see body) |
+| Low | 35 | (counts only at the end) |
 | Null | 1 module | `netdb/` clean |
+
+Third pass added 1 H (D-14) + 4 M (D-15, D-16, R-35, X-13) + 8 L
+(R-36..R-39, X-14..X-17) — see "Third-pass additions" section.
 
 ## Second-pass note (2026-05-18, later same day)
 
@@ -38,6 +41,21 @@ O-17, O-18, O-19). The same pass independently re-derived R-20
 and D-5 (Manifest fetch OOM) from the same source lines — those three
 are not duplicated below; their independent re-discovery is a
 confirmation signal rather than a new finding.
+
+## Third-pass note (2026-05-18 evening)
+
+A third parallel-agent pass over the same four modules (skipping the
+already-clean `netdb/`) was scoped narrower — "name bug classes the
+prior passes did not enumerate" — and surfaced 13 new findings:
+**D-14, D-15, D-16, R-35, R-36, R-37, R-38, R-39, X-13, X-14, X-15,
+X-16, X-17.** Severity 1 H + 4 M + 8 L. The pass independently
+re-derived **R-21** (no `Leader → Replica` transition; "split-brain
+after partition heal") and **R-31** (state advances before async
+sink completes; "transition_to side-effect failure is unretryable")
+from the same source lines — confirmation signals, not duplicates.
+The new findings are listed in the "Third-pass additions" section
+below rather than threaded through the existing severity buckets
+so the prior numbering stays stable.
 
 ---
 
@@ -285,9 +303,93 @@ Counts and one-liners only; full text in the agent reports.
 
 ---
 
-## Null results
+## Third-pass additions
 
-### `netdb/` — clean
+Findings from the 2026-05-18 evening pass. IDs continue the existing
+per-module sequences (D-13 → D-14, R-34 → R-35, X-12 → X-13).
+
+### High
+
+#### D-14 — `resolve_payload` unconditionally fails on every `BlobRef::Manifest`
+- **File:** `src/adapter/net/dataforts/blob/dispatch.rs:82`; `src/adapter/net/dataforts/blob/blob_ref.rs:562-579`
+- **What:** `resolve_payload` calls `blob.verify(&fetched)` on the assembled bytes. `BlobRef::verify` hard-errors on the `Manifest` arm with `BlobError::Decode("verify is undefined on a Manifest variant; verify chunks individually")`. Every payload that took the chunked path through `publish_with_blob` (i.e. anything larger than `BLOB_CHUNK_SIZE_BYTES = 4 MiB`) returns that error, even though `MeshBlobAdapter::fetch_chunk` already per-chunk-verified each piece against its manifest entry at `mesh.rs:937-943`.
+- **Impact:** Functional regression on any consumer that resolves an event payload via `resolve_payload` — including the FFI surface `src/ffi/blob.rs:319`. Any chunked publish is un-fetchable through the documented helper. Fails closed (Decode error, not silent corruption), so this is availability not safety, but it is end-to-end broken for large payloads.
+- **Fix sketch:** Branch on `blob.is_chunked()` in `resolve_payload`: for Manifest, skip the top-level verify (per-chunk hashes were checked at fetch time); for Small, keep the current verify. Or add `BlobRef::verify_manifest(bytes, &chunks)` that recomputes per-chunk hashes against the concatenated buffer. Add a round-trip test exercising the chunked path through `resolve_payload`.
+
+### Medium
+
+#### D-15 — GC `delete_chunk` does not unlink the persistent segment file
+- **File:** `src/adapter/net/dataforts/blob/mesh.rs:777-784`; cf. `src/adapter/net/redex/manager.rs:729-740` → `src/adapter/net/redex/file.rs:1399-1435`
+- **What:** `delete_chunk` calls `redex.close_file(channel)` and unconditionally `self.refcount.remove(hash)`. `close_file` fsyncs and drops the in-memory `RedexFile` but never `std::fs::remove_file`s the segment on disk. The docstring claims "the chunk's `RedexFile` is closed + removed from the Redex manager"; the on-disk file is *not* removed.
+- **Impact:** Slow disk leak on `MeshBlobAdapter::with_persistent(true)` deployments — refcount metadata says the chunk is reclaimed, GC metrics report bytes freed, but the segment file accumulates indefinitely. A future re-store under the same hash stamps fresh `first_seen`, restarting the retention clock; until then the orphaned segment is dead weight.
+- **Fix sketch:** Expose `remove_file_and_unlink` (or `unlink_segment_path`) from `RedexManager` and call it after `close_file` returns Ok. Alternatively have `MeshBlobAdapter` retain the segment path and `std::fs::remove_file(path)` directly. Update the docstring to match the actual semantics either way.
+
+#### D-16 — `MeshBlobAdapter::fetch_range` on Small reads the entire chunk before slicing
+- **File:** `src/adapter/net/dataforts/blob/mesh.rs:1135-1141`
+- **What:** The Small arm calls `self.fetch_chunk(hash)` (which reads the *whole* chunk into a `Vec<u8>`) and then slices `bytes[range.start..range.end]`. A `0..16` range against a 16 GiB Small blob allocates 16 GiB. The early `range.end <= size` check only validates the upper bound, not that the requested slice is small relative to the chunk.
+- **Impact:** DoS amplifier — a tiny range request consumes adapter-side RAM proportional to the *blob*, not the *range*. Reachable wherever a peer-controllable `BlobRef::Small` lands and a caller does range-fetches against it (web range requests, partial reassembly, lazy decoders).
+- **Fix sketch:** Route the Small arm through a seek-based `read_range` analogous to `FileSystemAdapter::fetch_range` (`fs.rs:288-336`). For the RedEX-backed path that means a `RedexFile::read_at(offset, len)` primitive that doesn't materialize the whole segment.
+
+#### R-35 — Wall-clock `std::time::Instant::now()` inside tokio-virtualized runtime loop
+- **File:** `src/adapter/net/redex/replication_runtime.rs:518, 678, 716`
+- **What:** Same M-4 anti-pattern fixed elsewhere on this branch. The runtime tick is driven by `tokio::time::interval`, which honors `tokio::time::pause()` for deterministic tests, but the handler at `:518` (silence detection), `:678` (`record_heartbeat`), and `:716` (`BandwidthBudget::try_consume`) feeds `std::time::Instant::now()` into the time-domain calls. Under `tokio::time::pause()` virtual time advances while wall-clock doesn't — silence detection never fires, the bandwidth budget never refills, election logic becomes untestable deterministically.
+- **Impact:** Tests under `tokio::time::pause()` get inconsistent behavior between time domains; in production the timer wakeups and clock readings can diverge across sleep/resume or VM migration in subtle ways.
+- **Fix sketch:** `tokio::time::Instant::now().into_std()` at all three sites, or thread a `Clock` trait through `inputs` so the tracker / budget take the same time source the interval timer uses.
+
+#### X-13 — Failed placements don't retry on different-node recovery
+- **File:** `src/adapter/net/compute/fork_group.rs:289-355`; `replica_group.rs:241-290`; `standby_group.rs:400-461`
+- **What:** All three group `on_node_failure*` paths mark the affected slot `mark_unhealthy` *before* attempting placement. On placement failure (`continue`), the slot stays unhealthy with the dead node's `origin_hash` still in the registry. `on_node_recovery` only re-marks the slot healthy when the recovered node id matches the FAILED node id — recovery of a *different* spare node (which arrives later and could host the slot) never retries placement. The slot stays permanently degraded until either the originally-failed node recovers, or another `on_node_failure*` for the same slot fires (which it won't, because the node is already marked unhealthy).
+- **Impact:** Hot spares coming online during a partial-outage incident are silently ignored. The group's effective replica count drops and stays dropped past the operator-visible "all nodes recovered" signal. Composes badly with X-1's fencing gap because the still-unhealthy slot looks like an active replica to anything reading group membership.
+- **Fix sketch:** Add a `retry_failed_placements(&scheduler, &registry)` helper called from `on_node_recovery` (or driven by a periodic tick) that iterates unhealthy slots and retries `place_with_spread` / `place_member` against the current healthy-node pool. Alternatively, defer `mark_unhealthy` until *after* a successful placement.
+
+### Low
+
+#### R-36 — `ReplicationRuntimeHandle::is_stopped()` flips `true` before joiner's `.await` returns
+- **File:** `src/adapter/net/redex/replication_runtime.rs:297-320`
+- **What:** The R-11 comment at `:316-318` claims this is fixed: "Flip the 'joined' flag only after the await returns. Concurrent cancel() racers that lost the handle take(): poll `stopped` until our await completes." But the implementation has the bug: the loser of `self.task.lock().take()` enters `cancel()`, sees `handle = None`, skips the entire `if let Some(h)` block, and then unconditionally executes `self.stopped.store(true, Release)` at `:319` — while the winner is still inside `h.await`. The doc on `is_stopped()` (`:322-333`) says "task joined"; the actual semantics is "shutdown initiated."
+- **Impact:** Tests / observability racing two `cancel()` calls can observe `is_stopped() == true` before the join completes — but the actual practical risk is small because the winner's join still completes correctly afterward.
+- **Fix sketch:** Only the holder of the `JoinHandle` writes `stopped`. Loser races spin on `is_stopped()` or wait on a `tokio::sync::Notify` armed by the winner after `h.await` returns.
+
+#### R-37 — `Drop for ReplicationRuntimeHandle` takes a parking_lot mutex
+- **File:** `src/adapter/net/redex/replication_runtime.rs:346-350`
+- **What:** Same M-5 anti-pattern fixed in `bus.rs`. `Drop` calls `self.task.lock().take()`. On a single-thread runtime panicking during shutdown, drop can run on a thread already holding `self.task` (e.g. mid-`cancel()` when the future is dropped on panic), producing a deadlock.
+- **Fix sketch:** `try_lock` with a short timeout, or store the `JoinHandle` in an `ArcSwapOption` so Drop can swap-and-take without locking.
+
+#### R-38 — Leader disk-pressure transitions through `ChannelClose` signal
+- **File:** `src/adapter/net/redex/replication_runtime.rs:1043-1048`
+- **What:** When a `Leader` or `Candidate` hits disk pressure, the runtime transitions through `ChannelClose` rather than a disk-pressure-specific signal (the FSM only permits `Replica → Idle` via `DiskPressureWithdraw`; Leader/Candidate fall back to the universal `ChannelClose → Idle` arm). `under_capacity_total` is bumped at `:1018` but the *transition* metric is labeled "channel closed," so operator dashboards see "graceful channel close" rather than "disk-pressure withdraw." Incident triage misroutes.
+- **Fix sketch:** Add `LeaderDiskPressure` / `CandidateDiskPressure` signals valid from those roles to Idle, OR document the metric semantic conflation prominently.
+
+#### R-39 — Concurrent `Leader` heartbeats overwrite `believed_leader` without tiebreak
+- **File:** `src/adapter/net/redex/replication_heartbeat.rs:131-133`
+- **What:** `HeartbeatTracker::record_heartbeat` sets `believed_leader = from` on every heartbeat that arrives with `role == Leader`. Two peers each legitimately claiming Leader during a failover (or one malicious peer asserting Leader against a real Leader's heartbeats) flip `believed_leader` every tick. The replica's `tick()` then issues `SyncRequest` against whichever leader was last seen; if the two have divergent `tail_seq`s, alternating chunks land. No tiebreaker, no fencing token, no two-heartbeat confirmation.
+- **Impact:** Mostly subsumed by R-21 once that's fixed (a properly-converging FSM removes the dual-leader scenario), but the race window exists today and amplifies R-21's data-divergence consequences.
+- **Fix sketch:** Keep the lex-smallest `NodeId` among concurrent Leader claimants in `believed_leader`, OR require two consecutive heartbeats from the new leader before switching.
+
+#### X-14 — `ReplicaGroup::scale_to` scale-down loop lacks the `let-else+break` guard
+- **File:** `src/adapter/net/compute/replica_group.rs:210-215`
+- **What:** `while self.coord.member_count() > n { if let Some(info) = self.coord.remove_last() { ... } }`. If `remove_last()` ever returns `None` while `member_count() > n` (i.e. an invariant violation introduced elsewhere), the loop spins forever. The sibling `fork_group.rs:244-260` was hardened against this with `let Some(info) = ... else { debug_assert!(false, ...); break; }`; this sibling missed the same defense.
+- **Fix sketch:** Mirror the fork-group pattern. `let Some(info) = self.coord.remove_last() else { debug_assert!(false, "member_count > n but remove_last is None"); break; };`.
+
+#### X-15 — `TargetMigrationState.target_head` is dead-but-misleading state
+- **File:** `src/adapter/net/compute/migration_target.rs:37, 175, 193, 488`
+- **What:** The field is initialized to `snapshot.chain_link` in `restore_snapshot` and reassigned in `drain_pending` to `last.link` — but `last.link` lives on the SOURCE's chain, not the target daemon's chain, and the field is never *read* anywhere. Dead storage with a misleading value. A future reader wiring it to a continuity check would silently use the wrong chain head.
+- **Fix sketch:** Either delete the field, or compute the actual target-chain head via `daemon_registry.with_host(origin, |h| h.head_link())` after each `deliver` so the name matches the value.
+
+#### X-16 — `Scheduler::select_migration_target` v2 short-circuits to local before `PlacementFilter`
+- **File:** `src/adapter/net/compute/scheduler.rs:337-339` (and the LocalPreferred branch at `:281-285`)
+- **What:** `select_migration_target` returns `local_node_id` immediately whenever local is in the candidate pool and isn't the source, *before* invoking the `PlacementFilter`. A filter that hard-vetoes local (returns `Some(_)` only for remotes, `None` for local) is silently ignored — local always wins. The docstring documents this as a "LocalPreferred fast-path," but a strict-veto filter cannot actually veto the local node, defeating the point of plugging in a filter.
+- **Fix sketch:** Score local through the filter first; only short-circuit when its filter result is `Some(_)`. The fast-path then becomes "if local is permitted, pick local."
+
+#### X-17 — `on_snapshot_ready` multi-chunk path skips `set_snapshot` validation
+- **File:** `src/adapter/net/compute/orchestrator.rs:1356-1372`
+- **What:** The orchestrator validates and calls `set_snapshot` only on the single-chunk path (`chunk_index == 0 && total_chunks == 1`); the multi-chunk path only calls `force_phase(Transfer)` and forwards. Structural validation of any chunk header is deferred entirely to the target after reassembly. Single-chunk corruption is caught at the orchestrator; multi-chunk corruption is not.
+- **Impact:** Defense-in-depth gap, not a correctness break (target reassembly + final verify still catches the corrupt snapshot). The asymmetry is the bug: single-chunk and multi-chunk should validate at the same layer. Composes with X-10 (`seq_through` not cross-checked against `snapshot.through_seq`) to make multi-chunk a debugging trap.
+- **Fix sketch:** Either drop validation on the single-chunk path to match multi-chunk, or extract a `validate_chunk_header(chunk, record)` helper and call it on every chunk regardless of count.
+
+---
+
+
 
 `src/adapter/net/netdb/{db.rs, error.rs, mod.rs}` (399 LOC) is a thin builder + façade. All query/predicate/filter logic lives in `cortex::tasks` / `cortex::memories` (covered in `PHASE3_CORTEX_RPC_DROP.md`). No query expression is parsed, evaluated, or locked inside `netdb/`.
 
@@ -327,6 +429,7 @@ The four `.expect()`/`unwrap_or` sites in `db.rs` are documented or trivially sa
 3. **R-22, R-23, R-24** (replication durability + NACK trust + partial-append accounting) — bundle with the R-20/R-21 wire change.
 4. **X-9** (`pending_events` unbounded) — wire-reachable OOM on every node accepting migration traffic; ~10-line fix.
 5. **D-11** (`BlobRef::Manifest` chunk-size validation) — wire-reachable slice panic on untrusted input; mechanical fix in the decoder plus a defensive `get(..)` in the consumer.
+5a. **D-14** (`resolve_payload` always fails on `BlobRef::Manifest`) — end-to-end-broken FFI surface for any payload >4 MiB; one-line branch on `is_chunked()` plus a chunked-path round-trip test. Highest user-visibility item in the third pass.
 6. **D-1** (sweep TOCTOU) — quiet data-loss bug; trivial fix via `remove_if`.
 7. **D-2** (32-bit `usize::MAX` guard on `MeshBlobAdapter::fetch_range`) — mechanical, mirrors existing `fs.rs` pattern.
 8. **R-25** (priority lane) and **R-28** (catchup backoff) — replication availability hardening.
@@ -338,6 +441,8 @@ The four `.expect()`/`unwrap_or` sites in `db.rs` are documented or trivially sa
 14. **D-3, D-4, D-5** (blob hardening) and **X-4, X-5** (group lifecycle, panic-across-FFI).
 15. **O-4, O-5** (audit-chain durability ordering) — pick one source of truth; document loudly.
 16. **R-26, R-27** (dead tip_seq, budget refund) and the remaining lows can batch into a single cleanup commit. Fold **R-33** (replication wire 32-bit add) into the same commit as the umbrella's L-9 fix; **R-34** (catchup saturating-add symmetry) lands alongside.
+17. **Third-pass mediums** — **D-15** (GC segment-file unlink), **D-16** (Small `fetch_range` whole-chunk alloc), **R-35** (wall-clock `Instant` in tokio-tick'd loop, same M-4 anti-pattern), **X-13** (failed placements never retried on different-node recovery). Each is independent of the wire-protocol changes above and can land out of order.
+18. **Third-pass lows** — **R-36..R-39** (is_stopped race, Drop mutex, Leader disk-pressure signal label, believed_leader tiebreak), **X-14..X-17** (`scale_to` guard, dead `target_head`, scheduler vs `PlacementFilter`, multi-chunk validation asymmetry). Batch into the same cleanup commit as the other lows.
 
 ## Coverage gaps still carried forward
 
