@@ -1,0 +1,106 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_aa8bb6e2c88c9e::t_cb61e3eb580e51 10545
+  s_aa8bb6e2c88c9e::t_09eeca7604e333 10565
+  s_aa8bb6e2c88c9e::t_a898bdbabc1cfc 10586
+net/crates/net/src/adapter/net/redex/replication.rs
+  s_aa8bb6e2c88c9e::t_bdc08ca7a758e4 237-242
+  s_aa8bb6e2c88c9e::t_4c191673bed0ea 533
+  s_aa8bb6e2c88c9e::t_564d5f52b873cb 471,482
+  s_aa8bb6e2c88c9e::t_a56d153b9f8940 931
+  s_aa8bb6e2c88c9e::t_d76e1760eb314d 776
+  s_aa8bb6e2c88c9e::t_c47dae43d85173 966
+  s_aa8bb6e2c88c9e::t_d4dde21fb8a93a 1003
+  s_aa8bb6e2c88c9e::t_574f327a5f3a02 823
+  s_aa8bb6e2c88c9e::t_dc05fb439616f8 1036
+  s_aa8bb6e2c88c9e::t_027f1c2318b180 1054-1055,1058
+  s_aa8bb6e2c88c9e::t_ce6638fb8aa9a1 387,394,414,419
+  s_aa8bb6e2c88c9e::t_2f346e4c30817d 594,615,621,631,645,666
+  s_aa8bb6e2c88c9e::t_4604d8b30cf85b 947
+  s_aa8bb6e2c88c9e::t_955ced413fc85a 758
+  s_aa8bb6e2c88c9e::t_e2c6db92a19774 63
+  s_aa8bb6e2c88c9e::t_533fd0eda4fcff 796
+  s_aa8bb6e2c88c9e::t_4f3f8a9caf6c28 724
+  s_aa8bb6e2c88c9e::t_5a412ab852a829 840
+  s_aa8bb6e2c88c9e::t_1cf934fcc4c916 865
+  s_aa8bb6e2c88c9e::t_a2562e048feaa7 1051
+  s_aa8bb6e2c88c9e::t_74cd09603dcbf8 289-294
+  s_aa8bb6e2c88c9e::t_24ce28cb06ce1c 744
+  s_aa8bb6e2c88c9e::t_2253462038380e 193,204-212
+  s_aa8bb6e2c88c9e::t_07edb4ff156f00 708
+  s_aa8bb6e2c88c9e::t_c2d6b698cc839f 982
+  s_aa8bb6e2c88c9e::t_a2292cca839b2a 429-431,438,443
+net/crates/net/tests/redex_replication_dst.rs
+  s_aa8bb6e2c88c9e::t_b4cc89ecbab6c7 477
+net/crates/net/src/adapter/net/redex/replication_catchup.rs
+  s_aa8bb6e2c88c9e::t_977f6650854f6e 696
+  s_aa8bb6e2c88c9e::t_2bb04b30c9cd70 644
+  s_aa8bb6e2c88c9e::t_2371ee48369a0e 455
+  s_aa8bb6e2c88c9e::t_0510207c5845a0 872
+  s_aa8bb6e2c88c9e::t_cbec4fc7de9a69 583
+  s_aa8bb6e2c88c9e::t_0694f98706036b 558
+  s_aa8bb6e2c88c9e::t_553f6f885e3f74 623
+  s_aa8bb6e2c88c9e::t_2181fefc6514eb 796
+  s_aa8bb6e2c88c9e::t_2c7f5770311f1c 493
+  s_aa8bb6e2c88c9e::t_4ec7393c0640d9 969
+  s_aa8bb6e2c88c9e::t_f2aabcb5cef95c 1051
+  s_aa8bb6e2c88c9e::t_dece6f5405dbb2 533
+  s_aa8bb6e2c88c9e::t_0e1bf455ff6d7b 1103
+  s_aa8bb6e2c88c9e::t_39b41c0635415a 475
+  s_aa8bb6e2c88c9e::t_9877e0f264d89e 761
+  s_aa8bb6e2c88c9e::t_516ba22fefe3f0 199
+  s_aa8bb6e2c88c9e::t_97a5449a75ecee 1004
+  s_aa8bb6e2c88c9e::t_bb3dde6a1e359e 715
+  s_aa8bb6e2c88c9e::t_f472bb2909b2b5 942
+  s_aa8bb6e2c88c9e::t_9833b5ec430363 679
+  s_aa8bb6e2c88c9e::t_4936dc859d99d4 285
+  s_aa8bb6e2c88c9e::t_9458564718b3f8 515
+  s_aa8bb6e2c88c9e::t_47914d39b0d4df 823
+  s_aa8bb6e2c88c9e::t_7cf0fda765c143 733
+  s_aa8bb6e2c88c9e::t_13f9d92e069dd8 843
+  s_aa8bb6e2c88c9e::t_beb71d1b20f1be 913
+  s_aa8bb6e2c88c9e::t_196f7839c24a8b 1038
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_18_CARRIED_FORWARD.md
+  s_aa8bb6e2c88c9e::t_0bf07577556740 173,177
+net/crates/net/src/adapter/net/redex/replication_runtime.rs
+  s_aa8bb6e2c88c9e::t_b48249ffb59cac 3083
+  s_aa8bb6e2c88c9e::t_f6b8662b4acae1 951
+  s_aa8bb6e2c88c9e::t_3cbf680ec6f403 1096
+  s_aa8bb6e2c88c9e::t_4a77a68087ba50 826,843-863
+  s_aa8bb6e2c88c9e::t_efdb16c86db97f 1852,1911,2744,2806,2862,2891,2944
+  s_aa8bb6e2c88c9e::t_f239bf5e052d61 666,689
+  s_aa8bb6e2c88c9e::t_d744595cae0520 411-472
+  s_aa8bb6e2c88c9e::t_5e9ce598d7056f 3017
+  s_aa8bb6e2c88c9e::t_56339c9f799f5b 1071
+  s_aa8bb6e2c88c9e::t_275b84b86ae186 630
+  s_aa8bb6e2c88c9e::t_7482f4b04d9a8f 2796
+  s_aa8bb6e2c88c9e::t_0355fa51445321 598,610
+  s_aa8bb6e2c88c9e::t_266e09bdbd41d2 1389-1405
+  s_aa8bb6e2c88c9e::t_d801f8e779b7e3 2852
+  s_aa8bb6e2c88c9e::t_b8bfe5748e4554 671
+  s_aa8bb6e2c88c9e::t_0de71c466adf16 1202-1220
+  s_aa8bb6e2c88c9e::t_1a185574d6ee75 1155
+  s_aa8bb6e2c88c9e::t_2edbd5b100174b 2719
+  s_aa8bb6e2c88c9e::t_9c72d2364a731a 1116
+  s_aa8bb6e2c88c9e::t_3afa33e7e7b66e 2934
+  s_aa8bb6e2c88c9e::t_abc223ea18d1dc 3004-3008,3027
+  s_aa8bb6e2c88c9e::t_6409b1dfbb3faf 3067-3070,3093
+  s_aa8bb6e2c88c9e::t_0f195e3f3b35e9 757
+net/crates/net/src/adapter/net/redex/replication_step.rs
+  s_aa8bb6e2c88c9e::t_4922cec092f93c 254-260
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "43be145eb8376b6c781932d2cddb1cb52c13c0c6",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
