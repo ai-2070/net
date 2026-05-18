@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/cortex/mod.rs
+  s_906a82c67213dc::t_e30e5fee84748d 47-63
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_906a82c67213dc::t_f26f6e4d0978cc 1132-1380
+  s_906a82c67213dc::t_eeaa99e58a6dd5 138-149,176
+  s_906a82c67213dc::t_3cbb4454ef2c4d 38-41,43-46
+  s_906a82c67213dc::t_f78e334cbd7d0d 480-829
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "e051fbe3d3c10d6e92fd42f27edb1f4f8a22b1c1",
+  "prompts": {},
+  "sessions": {
+    "s_906a82c67213dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a83a8d29-a399-4785-986d-1bd45ba15ab6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
