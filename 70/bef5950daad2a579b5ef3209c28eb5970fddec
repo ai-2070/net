@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_aa8bb6e2c88c9e::t_615b5e2ae07f51 1090-1097
+  s_aa8bb6e2c88c9e::t_d52e2a563a288a 800
+  s_aa8bb6e2c88c9e::t_298134cbd977c8 1414-1436
+net/crates/net/src/adapter/net/mesh.rs
+  s_aa8bb6e2c88c9e::t_b20ae95b17bed9 1193-1198
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_18_CARRIED_FORWARD.md
+  s_aa8bb6e2c88c9e::t_372e06ec239a56 619
+  s_aa8bb6e2c88c9e::t_d32489e2b1c665 625-630
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "70bef5950daad2a579b5ef3209c28eb5970fddec",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
