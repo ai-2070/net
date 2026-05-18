@@ -239,6 +239,110 @@ fn hex32(bytes: &[u8; 32]) -> String {
     s
 }
 
+/// Capability tag a node advertises when it supports the v0.3
+/// hierarchical-manifest tree path (`BlobRef::Tree`). Compare
+/// advertisement payloads against this string to decide whether
+/// to publish via `BlobRef::Tree` or downgrade to v0.2 Manifest.
+pub const DATAFORTS_BLOB_TREE_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::blob_tree::DATAFORTS_BLOB_TREE_SUPPORTED;
+
+/// Capability tag a node advertises when it supports the v0.3
+/// Phase B content-defined-chunking store path
+/// (`ChunkingStrategy.cdc(...)`). Independent of the Tree tag —
+/// a node can run Phase A (Tree + Fixed) without Phase B (CDC).
+pub const DATAFORTS_BLOB_CDC_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::cdc::DATAFORTS_BLOB_CDC_SUPPORTED;
+
+/// Producer-facing chunking-strategy value type for the v0.3
+/// Tree store path. Construct via the `fixed(size)` /
+/// `cdc(min, avg, max)` / `production_cdc()` classmethods and
+/// pass to the future chunking-aware binding store call. The
+/// Rust core's `MeshBlobAdapter::store_stream_tree` already
+/// consumes the corresponding `ChunkingStrategy` enum; this is
+/// the binding-side mirror surfaced as a Python class with the
+/// `kind` discriminant + per-shape fields, so SDK consumers can
+/// build strategies declaratively without depending on the Rust
+/// enum repr.
+#[pyclass(name = "ChunkingStrategy", frozen, eq, from_py_object)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct PyChunkingStrategy {
+    /// Discriminant: `"fixed"` for fixed-size chunks, `"cdc"`
+    /// for content-defined chunking.
+    #[pyo3(get)]
+    pub kind: String,
+    /// Chunk size in bytes — populated iff `kind == "fixed"`.
+    #[pyo3(get)]
+    pub size: Option<u32>,
+    /// CDC minimum chunk size in bytes — populated iff
+    /// `kind == "cdc"`.
+    #[pyo3(get)]
+    pub min: Option<u32>,
+    /// CDC target average chunk size in bytes — populated iff
+    /// `kind == "cdc"`.
+    #[pyo3(get)]
+    pub avg: Option<u32>,
+    /// CDC maximum chunk size in bytes — populated iff
+    /// `kind == "cdc"`.
+    #[pyo3(get)]
+    pub max: Option<u32>,
+}
+
+#[pymethods]
+impl PyChunkingStrategy {
+    /// Fixed-size chunks. `size` must equal the v0.2-compatible
+    /// `BLOB_CHUNK_SIZE_BYTES` (4 MiB) for cluster-wide dedup.
+    #[staticmethod]
+    pub fn fixed(size: u32) -> Self {
+        Self {
+            kind: "fixed".to_owned(),
+            size: Some(size),
+            min: None,
+            avg: None,
+            max: None,
+        }
+    }
+
+    /// Content-defined chunking (FastCDC). For cluster-wide CDC
+    /// dedup, pass the spec'd production triple — see
+    /// `production_cdc()` for the convenience factory.
+    #[staticmethod]
+    pub fn cdc(min: u32, avg: u32, max: u32) -> Self {
+        Self {
+            kind: "cdc".to_owned(),
+            size: None,
+            min: Some(min),
+            avg: Some(avg),
+            max: Some(max),
+        }
+    }
+
+    /// Production CDC parameters pinned by Phase B of the v0.3
+    /// blob plan: `min = 1 MiB`, `avg = 4 MiB`, `max = 16 MiB`.
+    /// All CDC-stored blobs on a cluster must use these exact
+    /// values to dedup against each other.
+    #[staticmethod]
+    pub fn production_cdc() -> Self {
+        let p = ::net::adapter::net::dataforts::blob::cdc::PRODUCTION_CDC_PARAMS;
+        Self::cdc(p.min, p.avg, p.max)
+    }
+
+    fn __repr__(&self) -> String {
+        match self.kind.as_str() {
+            "fixed" => format!(
+                "ChunkingStrategy.fixed(size={})",
+                self.size.unwrap_or(0)
+            ),
+            "cdc" => format!(
+                "ChunkingStrategy.cdc(min={}, avg={}, max={})",
+                self.min.unwrap_or(0),
+                self.avg.unwrap_or(0),
+                self.max.unwrap_or(0)
+            ),
+            other => format!("ChunkingStrategy(kind={:?})", other),
+        }
+    }
+}
+
 /// Register a filesystem-backed BlobAdapter under `adapter_id`.
 /// `root` is the on-disk directory the adapter content-addresses
 /// blobs under. Raises `BlobError` if `adapter_id` is already in

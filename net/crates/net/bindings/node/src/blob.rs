@@ -46,6 +46,98 @@ use ::net::adapter::net::dataforts::{
 /// `Error`. The full shape is `"blob: <context>: <detail>"`.
 pub(crate) const ERR_BLOB_PREFIX: &str = "blob:";
 
+/// Capability tag a node advertises when it supports the v0.3
+/// hierarchical-manifest tree path (`BlobRef::Tree`). SDK
+/// consumers compare advertisement payloads against this string
+/// to decide whether to publish via `BlobRef::Tree` or downgrade
+/// to the v0.2 `BlobRef::Manifest` shape.
+#[napi]
+pub const DATAFORTS_BLOB_TREE_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::blob_tree::DATAFORTS_BLOB_TREE_SUPPORTED;
+
+/// Capability tag a node advertises when it supports the v0.3
+/// Phase B content-defined-chunking store path
+/// (`ChunkingStrategy::Cdc`). Independent of the Tree tag — a
+/// node can run Phase A (Tree + Fixed) without Phase B (CDC).
+#[napi]
+pub const DATAFORTS_BLOB_CDC_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::cdc::DATAFORTS_BLOB_CDC_SUPPORTED;
+
+/// Producer-facing chunking-strategy value type for the v0.3
+/// Tree store path. SDK consumers construct an instance via the
+/// `fixed(size)` or `cdc(min, avg, max)` factories and pass it
+/// to the future chunking-aware binding store call. The Rust
+/// core's `MeshBlobAdapter::store_stream_tree` already consumes
+/// the corresponding `ChunkingStrategy` enum — the binding-side
+/// value is a discriminated record that round-trips through
+/// JS without exposing a Rust enum directly (napi-rs has no
+/// native discriminated-union encoding).
+///
+/// `kind` is the discriminant ("fixed" or "cdc"). The
+/// shape-relevant fields are populated based on the
+/// discriminant; the others are `None`. SDK consumers do not
+/// hand-construct the struct — the factories ensure consistency.
+#[napi]
+#[derive(Clone)]
+pub struct ChunkingStrategy {
+    /// Discriminant: `"fixed"` for fixed-size chunks,
+    /// `"cdc"` for content-defined chunking.
+    pub kind: String,
+    /// Chunk size in bytes. Populated iff `kind == "fixed"`.
+    pub size: Option<u32>,
+    /// CDC minimum chunk size in bytes. Populated iff
+    /// `kind == "cdc"`.
+    pub min: Option<u32>,
+    /// CDC target average chunk size in bytes. Populated iff
+    /// `kind == "cdc"`.
+    pub avg: Option<u32>,
+    /// CDC maximum chunk size in bytes. Populated iff
+    /// `kind == "cdc"`.
+    pub max: Option<u32>,
+}
+
+#[napi]
+impl ChunkingStrategy {
+    /// Fixed-size chunks. `size` must equal the v0.2-compatible
+    /// `BLOB_CHUNK_SIZE_BYTES` (4 MiB) when stored via the
+    /// production Tree path — other sizes fragment the cluster's
+    /// chunk-level dedup pool against v0.2 blobs.
+    #[napi(factory, js_name = "fixed")]
+    pub fn fixed(size: u32) -> Self {
+        Self {
+            kind: "fixed".to_owned(),
+            size: Some(size),
+            min: None,
+            avg: None,
+            max: None,
+        }
+    }
+
+    /// Content-defined chunking (FastCDC). For cluster-wide
+    /// CDC dedup, pass the spec'd production triple — see
+    /// `productionCdc()` for the convenience factory.
+    #[napi(factory, js_name = "cdc")]
+    pub fn cdc(min: u32, avg: u32, max: u32) -> Self {
+        Self {
+            kind: "cdc".to_owned(),
+            size: None,
+            min: Some(min),
+            avg: Some(avg),
+            max: Some(max),
+        }
+    }
+
+    /// Production CDC parameters pinned by Phase B of the v0.3
+    /// blob plan: `min = 1 MiB`, `avg = 4 MiB`, `max = 16 MiB`.
+    /// All CDC-stored blobs on a cluster must use these exact
+    /// values to dedup against each other.
+    #[napi(factory, js_name = "productionCdc")]
+    pub fn production_cdc() -> Self {
+        let p = ::net::adapter::net::dataforts::blob::cdc::PRODUCTION_CDC_PARAMS;
+        Self::cdc(p.min, p.avg, p.max)
+    }
+}
+
 #[inline]
 fn blob_err(context: &str, detail: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("{} {}: {}", ERR_BLOB_PREFIX, context, detail))
