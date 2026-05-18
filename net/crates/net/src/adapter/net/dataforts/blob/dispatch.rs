@@ -79,7 +79,16 @@ pub async fn resolve_payload<A: BlobAdapter + ?Sized>(
                 }
             }
             let fetched = adapter.fetch(&blob).await?;
-            blob.verify(&fetched)?;
+            // `BlobRef::verify` is defined only for Small — Manifest
+            // has no top-level hash, and chunk hashes were already
+            // checked inside the adapter on a per-chunk basis (see
+            // MeshBlobAdapter::fetch_chunk). Re-verifying here on a
+            // Manifest would hard-error every chunked payload, which
+            // is exactly the failure the resolve_payload helper was
+            // expected to avoid for SDK / FFI consumers.
+            if !blob.is_chunked() {
+                blob.verify(&fetched)?;
+            }
             Ok(fetched)
         }
     }
@@ -262,6 +271,62 @@ mod tests {
         blob.verify(&fetched).unwrap();
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `BlobRef::verify` hard-errors on the Manifest arm because
+    /// Manifest has no top-level hash; chunk hashes are verified
+    /// per-chunk inside the adapter (`MeshBlobAdapter::fetch_chunk`).
+    /// resolve_payload must skip the top-level verify for Manifest,
+    /// otherwise every chunked payload (anything over 4 MiB) is
+    /// un-fetchable through the documented helper.
+    #[tokio::test]
+    async fn resolve_passes_chunked_manifest_through_without_top_level_verify() {
+        use super::super::adapter::BlobAdapter;
+        use super::super::blob_ref::{ChunkRef, Encoding, BLOB_CHUNK_SIZE_BYTES};
+
+        // Adapter that returns the same payload for any Manifest
+        // fetch. resolve_payload must NOT try to BlobRef::verify
+        // those bytes against the (non-existent) top-level hash.
+        #[derive(Debug)]
+        struct StubManifestAdapter(Vec<u8>);
+        #[async_trait::async_trait]
+        impl BlobAdapter for StubManifestAdapter {
+            fn adapter_id(&self) -> &str { "stub-manifest" }
+            async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> { Ok(()) }
+            async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
+                Ok(self.0.clone())
+            }
+            async fn fetch_range(
+                &self,
+                _: &BlobRef,
+                range: std::ops::Range<u64>,
+            ) -> Result<Vec<u8>, BlobError> {
+                Ok(self.0[range.start as usize..range.end as usize].to_vec())
+            }
+            async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> { Ok(true) }
+        }
+
+        let payload = vec![0x5A; (BLOB_CHUNK_SIZE_BYTES as usize) + 16];
+        let chunk_1 = vec![0x5A; BLOB_CHUNK_SIZE_BYTES as usize];
+        let chunk_2 = vec![0x5A; 16];
+        let chunks = vec![
+            ChunkRef {
+                hash: blake3::hash(&chunk_1).into(),
+                size: BLOB_CHUNK_SIZE_BYTES as u32,
+            },
+            ChunkRef {
+                hash: blake3::hash(&chunk_2).into(),
+                size: 16,
+            },
+        ];
+        let blob = BlobRef::manifest("mesh://chunked-resolve", Encoding::Replicated, chunks)
+            .expect("manifest construct");
+        let encoded = blob.encode();
+        let adapter = StubManifestAdapter(payload.clone());
+        let resolved = resolve_payload(&encoded, &adapter)
+            .await
+            .expect("resolve must accept Manifest without top-level verify");
+        assert_eq!(resolved, payload);
     }
 
     #[tokio::test]
