@@ -610,6 +610,19 @@ impl MeshBlobAdapter {
                 BlobError::Backend(format!("blob heat tick: announce batch failed: {}", e))
             })?;
         }
+        // D-17: commit `last_emitted` mutations only after the sink
+        // confirmed the announcement. Pre-fix the registry's `tick`
+        // mutated state inline and a transient sink error stranded
+        // the chain's heat updates forever (next tick's
+        // `should_emit_heat` returned Suppress against the
+        // already-advanced `last_emitted`). On the `?` error path
+        // above this code is unreachable, so commit only runs on
+        // successful announce — exactly the retry-on-failure
+        // semantic the audit asks for.
+        {
+            let mut guard = reg.lock();
+            guard.commit_emissions(&emissions);
+        }
         Ok(updates.len() as u64)
     }
 

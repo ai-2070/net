@@ -297,19 +297,47 @@ impl HeatRegistry {
         for (channel, counter) in self.counters.iter_mut() {
             counter.decay_to(now);
             let decision = super::should_emit_heat(counter.rate, counter.last_emitted, policy);
+            // D-17: candidate/commit split. Pre-fix `tick` mutated
+            // `last_emitted` inline, before the async sink had
+            // confirmed the announcement. One transient sink error
+            // would leave `last_emitted ≈ rate` and the next tick's
+            // `should_emit_heat` returned `Suppress` forever — the
+            // chain's heat update silently stranded. The mutation
+            // now lives in `commit_emissions`, which the caller
+            // invokes only on `Ok(())` from the sink. A failure
+            // simply skips commit; the next tick reruns
+            // `should_emit_heat` against the unchanged
+            // `last_emitted` and re-emits.
             let emission = match decision {
                 super::EmissionDecision::Suppress => HeatEmission::Suppress,
-                super::EmissionDecision::Emit { rate } => {
-                    counter.record_emission(rate);
-                    HeatEmission::Emit { rate }
-                }
-                super::EmissionDecision::Withdraw => {
-                    counter.record_withdrawal();
-                    HeatEmission::Withdraw
-                }
+                super::EmissionDecision::Emit { rate } => HeatEmission::Emit { rate },
+                super::EmissionDecision::Withdraw => HeatEmission::Withdraw,
             };
             if !matches!(emission, HeatEmission::Suppress) {
                 out.push((*channel, emission));
+            }
+        }
+        // Pruning is deferred to commit so a sink failure doesn't
+        // evict counters the next tick should be retrying against.
+        out
+    }
+
+    /// Commit the emissions returned by [`Self::tick`] after the
+    /// async sink has confirmed delivery. Mutates each counter's
+    /// `last_emitted` so the next tick computes its
+    /// `should_emit_heat` against the durable state, and prunes
+    /// fully-decayed + already-withdrawn entries. Callers that
+    /// observed a sink error skip this call; the candidates stay
+    /// pending and the next tick reissues them naturally because
+    /// no state mutation happened.
+    pub fn commit_emissions(&mut self, emissions: &[(u64, HeatEmission)]) {
+        for (channel, emission) in emissions {
+            if let Some(counter) = self.counters.get_mut(channel) {
+                match emission {
+                    HeatEmission::Emit { rate } => counter.record_emission(*rate),
+                    HeatEmission::Withdraw => counter.record_withdrawal(),
+                    HeatEmission::Suppress => {}
+                }
             }
         }
         // Prune fully-decayed + already-withdrawn entries. A future
@@ -323,7 +351,6 @@ impl HeatRegistry {
         self.counters.retain(|_, c| {
             !(c.rate <= 0.0 && c.last_emitted.map_or(false, |v| v <= 0.0))
         });
-        out
     }
 }
 
@@ -457,26 +484,38 @@ impl BlobHeatRegistry {
         for (hash, counter) in self.counters.iter_mut() {
             counter.decay_to(now);
             let decision = super::should_emit_heat(counter.rate, counter.last_emitted, policy);
+            // D-17 candidate/commit split: see `HeatRegistry::tick`
+            // for the rationale. `last_emitted` mutates only after
+            // the sink confirms via `commit_emissions`.
             let emission = match decision {
                 super::EmissionDecision::Suppress => HeatEmission::Suppress,
-                super::EmissionDecision::Emit { rate } => {
-                    counter.record_emission(rate);
-                    HeatEmission::Emit { rate }
-                }
-                super::EmissionDecision::Withdraw => {
-                    counter.record_withdrawal();
-                    HeatEmission::Withdraw
-                }
+                super::EmissionDecision::Emit { rate } => HeatEmission::Emit { rate },
+                super::EmissionDecision::Withdraw => HeatEmission::Withdraw,
             };
             if !matches!(emission, HeatEmission::Suppress) {
                 out.push((*hash, emission));
+            }
+        }
+        out
+    }
+
+    /// Commit the emissions from [`Self::tick`] after the sink
+    /// confirms. See [`HeatRegistry::commit_emissions`] for the
+    /// candidate/commit rationale.
+    pub fn commit_emissions(&mut self, emissions: &[([u8; 32], HeatEmission)]) {
+        for (hash, emission) in emissions {
+            if let Some(counter) = self.counters.get_mut(hash) {
+                match emission {
+                    HeatEmission::Emit { rate } => counter.record_emission(*rate),
+                    HeatEmission::Withdraw => counter.record_withdrawal(),
+                    HeatEmission::Suppress => {}
+                }
             }
         }
         // Same `<= 0.0` rationale as HeatRegistry::tick above.
         self.counters.retain(|_, c| {
             !(c.rate <= 0.0 && c.last_emitted.map_or(false, |v| v <= 0.0))
         });
-        out
     }
 }
 
@@ -642,10 +681,13 @@ mod tests {
         let half = policy.decay_half_life;
 
         // Bump once, emit, then let the rate decay to zero and
-        // tick again to emit the withdrawal.
+        // tick again to emit the withdrawal. D-17: callers now
+        // commit_emissions after the sink confirms; tests mirror
+        // the new contract by committing inline.
         let counter = r.entry_mut(channel(0xA), half, base);
         counter.bump(base);
-        let _ = r.tick(&policy, base);
+        let e0 = r.tick(&policy, base);
+        r.commit_emissions(&e0);
         assert_eq!(r.len(), 1);
 
         // 100 half-lives → rate clamps to zero; next tick emits
@@ -655,8 +697,10 @@ mod tests {
         assert!(emissions
             .iter()
             .any(|(_, e)| matches!(e, HeatEmission::Withdraw)));
+        r.commit_emissions(&emissions);
         let after = r.tick(&policy, later + Duration::from_secs(1));
         assert!(after.is_empty(), "no further emissions");
+        r.commit_emissions(&after);
         assert_eq!(r.len(), 0, "fully-decayed withdrawn entry pruned");
     }
 
@@ -673,6 +717,9 @@ mod tests {
             HeatEmission::Emit { rate } => assert!(rate > 0.0),
             other => panic!("expected Emit, got {other:?}"),
         }
+        // D-17: commit so the second tick's `should_emit_heat`
+        // sees `last_emitted ≈ rate` and suppresses.
+        r.commit_emissions(&emissions);
         // Subsequent tick suppresses (rate hasn't moved).
         let emissions2 = r.tick(&policy, base);
         assert!(emissions2.is_empty());
@@ -685,8 +732,10 @@ mod tests {
         let policy = super::super::DataGravityPolicy::default();
         let counter = r.entry_mut(channel(0xA), policy.decay_half_life, base);
         counter.bump(base);
-        // First tick — emit.
-        let _ = r.tick(&policy, base);
+        // First tick — emit. D-17: commit so the next tick sees
+        // the post-emit `last_emitted`.
+        let first = r.tick(&policy, base);
+        r.commit_emissions(&first);
         // 100 half-lives later — rate decays to zero; withdraw.
         let later = base + policy.decay_half_life * 100;
         let emissions = r.tick(&policy, later);
@@ -701,9 +750,11 @@ mod tests {
         let policy = super::super::DataGravityPolicy::default();
         let counter = r.entry_mut(channel(0xA), policy.decay_half_life, base);
         counter.bump(base);
-        // First tick — emit at rate ≈ 1.0.
+        // First tick — emit at rate ≈ 1.0. Commit so the second
+        // tick's `should_emit_heat` sees `last_emitted ≈ 1.0`.
         let first = r.tick(&policy, base);
         assert_eq!(first.len(), 1);
+        r.commit_emissions(&first);
         // More bumps — rate climbs.
         for _ in 0..3 {
             r.entry_mut(channel(0xA), policy.decay_half_life, base)
@@ -716,6 +767,38 @@ mod tests {
             HeatEmission::Emit { rate } => assert!(rate >= 4.0 * 0.99),
             other => panic!("expected Emit, got {other:?}"),
         }
+    }
+
+    /// D-17 regression: a sink failure (caller skips
+    /// `commit_emissions`) must NOT silently mark the counter as
+    /// already-emitted. The next tick must reissue the same
+    /// candidate so a transient sink error doesn't permanently
+    /// strand the chain's heat advertisement.
+    #[test]
+    fn tick_without_commit_reissues_on_next_tick() {
+        let base = t0();
+        let mut r = HeatRegistry::new();
+        let policy = super::super::DataGravityPolicy::default();
+        let counter = r.entry_mut(channel(0xA), policy.decay_half_life, base);
+        counter.bump(base);
+
+        // First tick produces a candidate Emit; caller simulates
+        // a sink failure and does NOT call commit_emissions.
+        let candidates = r.tick(&policy, base);
+        assert_eq!(candidates.len(), 1);
+        assert!(matches!(candidates[0].1, HeatEmission::Emit { .. }));
+
+        // Next tick must re-emit because `last_emitted` is still
+        // `None`. Pre-fix, the inline `record_emission` inside
+        // tick() would have advanced `last_emitted ≈ rate` and
+        // this second tick would have returned empty (Suppress).
+        let candidates2 = r.tick(&policy, base);
+        assert_eq!(
+            candidates2.len(),
+            1,
+            "transient sink failure (no commit) must not silence the next tick"
+        );
+        assert!(matches!(candidates2[0].1, HeatEmission::Emit { .. }));
     }
 
     // --- BlobHeatRegistry coverage (PR-5j-a) ---

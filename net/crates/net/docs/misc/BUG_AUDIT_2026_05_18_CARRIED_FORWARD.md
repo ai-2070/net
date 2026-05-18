@@ -158,11 +158,11 @@ missed despite covering `meshos/executor.rs` directly.
 
 ## High
 
-### A-5 — In-progress L-13 fix strips reserved metadata before re-forwarding, breaking multi-hop signed propagation
+### A-5 — In-progress L-13 fix strips reserved metadata before re-forwarding, breaking multi-hop signed propagation — **Landed**
 - **File:** `src/adapter/net/mesh.rs:5239` (uncommitted on `bugfixes-15`); `src/adapter/net/behavior/capability.rs:2145-2156` (new `strip_reserved_metadata`); `src/adapter/net/behavior/capability.rs:2084-2093` (`signed_payload`).
 - **What:** The uncommitted L-13 fix calls `ann.strip_reserved_metadata()` immediately after the signature verify and TOFU pin, then *later* clones `ann`, bumps `hop_count`, and reserializes via `to_bytes()` to forward to other peers (`mesh.rs:5343-5358`). `signed_payload()` covers the `metadata` field — so the forwarded wire bytes no longer match the signature transcript. Any peer two-plus hops downstream with `require_signed_capabilities = true` rejects the forwarded announcement at the verify step (`mesh.rs:5200`).
 - **Impact:** Functional regression in the new fix. Multi-hop signed capability discovery breaks for any receiver that requires signed caps. Fails *closed* (announcement is dropped, not accepted) so it's not an auth bypass — but the feature stops working. The existing strip test (`capability.rs:3712`) only exercises strip in isolation; no multi-hop round-trip test catches it.
-- **Fix sketch:** Move `ann.strip_reserved_metadata()` to between the forward block (after `mesh.rs:5358`) and `capability_index.index(ann)` at `:5371`. The only consumer in between — `policy.assign(&ann.capabilities)` at `:5305` — reads `caps.tags` only, not `caps.metadata`, so it's unaffected by the move. Add a multi-hop signed-propagation round-trip test before merging.
+- **Fix:** `ann.strip_reserved_metadata()` now runs at `mesh.rs:5435` — between the forward block (which ships the signature-covered bytes verbatim to downstream peers) and `capability_index.index(ann)` at `:5449`. The local copy is sanitized post-forward so attacker metadata can't steer local placement/admission, while the signature transcript on the wire remains intact for downstream re-verification. The only consumer in the gap is `policy.assign(&ann.capabilities)`, which reads `caps.tags` only — unaffected by the move.
 
 ### R-22 — Replica acks tail_seq before fsync; crash loses claimed-applied data — **Landed**
 - **File:** `src/adapter/net/redex/replication_runtime.rs:519,791-797`; `replication_catchup.rs:368-376`
@@ -315,15 +315,15 @@ missed despite covering `meshos/executor.rs` directly.
 - **What:** Two-arm `tokio::select!` over `events_rx.recv()` and `tick.tick()` uses default (pseudo-random) arm selection. With `MissedTickBehavior::Delay` and a saturated source channel, the events arm wins repeatedly; reconcile passes are deferred until the channel drains. The `dropped_actions` counter only covers executor-side drops, not reconcile starvation. Manifests as stale `local_maintenance`, stuck `applied_backoffs`, and `freeze_until` never GC'd because `gc_freeze` only runs on Tick.
 - **Fix sketch:** `tokio::select! { biased; _ = tick.tick() => ...; event = ... }` or force a reconcile every N events.
 
-### O-4 — Chain record appended AFTER dispatch → audit gap on appender failure
+### O-4 — Chain record appended AFTER dispatch → audit gap on appender failure — **Landed**
 - **File:** `src/adapter/net/behavior/meshos/executor.rs:473-477` (also `:497-498, :502-507, :518`)
 - **What:** Executor calls `self.dispatcher.dispatch(...).await` first; on `Ok(())` then `append_dispatched(&self.chain_appender, &action)`. If the chain appender's write fails (disk full, RedEX hiccup), the action *was* executed but the chain has no record. The chain is documented as the "cluster-lifetime replay" of the action stream — a missed entry breaks replay correctness. Current code only logs via `let _ = append_dispatched(...)`.
-- **Fix sketch:** Append the record with a `Pending` disposition before dispatch, then a follow-up `Outcome` record after — or accept the gap and document it loudly.
+- **Fix:** Took the "accept the gap and document it loudly" branch of the fix sketch. Added `ExecutorStats::chain_append_failures: AtomicU64` and a `record_chain_append(action_id, kind, result)` helper that bumps the counter and warn-logs every failed chain-append (`executor.rs:595-604`). All five append sites (`failed_defer_budget`, `gated`, `dispatched`, `failed_retry_budget`, `failed_retry`, `failed`) route through the helper. The counter is surfaced in `ExecutorStatsSnapshot.chain_append_failures` and the runtime's reconcile snapshot so operators can dashboard the audit-gap rate. Two-phase commit (the alternative branch) was rejected as too invasive — the chain layer would need a `Pending` disposition new variant and a deterministic outcome-stamp pass.
 
-### O-5 — `record_admin_audit` chain append before ring push → ring/chain divergence
+### O-5 — `record_admin_audit` chain append before ring push → ring/chain divergence — **Landed**
 - **File:** `src/adapter/net/behavior/meshos/event_loop.rs:1086-1100` (also `record_log_line:1121-1135`)
 - **What:** Loop bumps `admin_audit_seq`, appends to chain, then pushes to in-memory ring. If the chain append fails (e.g., RedEX appender returns Err), the warn log fires and we *still* push to the ring → chain says "seq N missing" but ring says "seq N present." If the chain append panics (OOM in the appender), `seq` has already been incremented and chain holds an entry the ring will never reflect.
-- **Fix sketch:** Pick one source of truth or two-phase commit. Easiest: push to ring first, attempt chain append second; on chain failure, mark the ring entry with a "chain_pending" flag so consumers can distinguish.
+- **Fix:** Took the "ring-first + chain_pending flag" branch of the fix sketch. The loop in `event_loop.rs` now pushes to the ring first, then attempts the chain append; on chain failure it sets `chain_pending = true` on the ring entry so consumers can distinguish "ring committed, chain still catching up." Both `AdminAuditRecord` and `LogRecord` gained a `chain_pending: bool` field with `#[serde(default)]` so cross-version replay decodes consistently. Sites that construct these records pre-populate `chain_pending: false`; the runtime flips it to `true` on the chain-failure path.
 
 ### O-7 — `recent_emissions.push()` runs even when `try_send` fails → phantom snapshot entries
 - **File:** `src/adapter/net/behavior/meshos/event_loop.rs:1332-1352`
@@ -692,11 +692,14 @@ per-module sequences (D-16 → D-17, X-18 → X-19, O-20 → O-21, R-39 → R-40
 
 ### High
 
-#### D-17 — Heat emission marks `last_emitted` before async sink confirms; one transient error permanently strands updates
+#### D-17 — Heat emission marks `last_emitted` before async sink confirms; one transient error permanently strands updates — **Landed**
 - **File:** `src/adapter/net/dataforts/gravity/counter.rs:291-322` (`HeatRegistry::tick`) and `:441-471` (`BlobHeatRegistry::tick`); call sites at `src/adapter/net/dataforts/blob/mesh.rs:596-613` (`tick_blob_heat`) and `src/adapter/net/dataforts/greedy/runtime.rs:625-667` (chain heat).
 - **What:** `tick()` calls `counter.record_emission(rate)` at `counter.rs:303` (and `:458`) *inside* the registry mutex, before returning the emissions list. The caller then awaits `sink.announce_blob_heat_batch(...)` / `sink.announce_heat_batch(...)`; on error `?` propagates but `last_emitted` has already advanced. The next tick's `should_emit_heat(rate, last_emitted ≈ rate, policy)` returns `Suppress` and the rate change is never re-attempted.
 - **Impact:** A single `AdapterError` (peer offline mid-tick, RPC blip, queue-full at the sink) silences that chain or blob's heat advertisement indefinitely — `Suppress` until rate decays to zero, at which point Withdraw eventually fires but every intermediate update is lost. The gravity / migration loop downstream stops migrating hot blobs to local nodes that would have qualified; no operator-visible counter surfaces the regression. Same shape as **R-31** (replication state advance before async sink completes) but in the dataforts/gravity subsystem.
-- **Fix sketch:** Split tick into "candidate" + "commit" — return the candidate emissions without mutating `last_emitted`; have the caller commit candidates only on `Ok(())` from the sink via a new `commit_emissions(&[Hash], Instant)` method. Or thread the sink call's `Result` back into the registry so the rollback is automatic on failure.
+- **Fix:** Took the candidate/commit split branch of the fix sketch. `HeatRegistry::tick` and `BlobHeatRegistry::tick` now return the candidate emissions list **without** mutating `last_emitted` or pruning quiescent entries. Callers invoke a new `commit_emissions(&[(K, HeatEmission)])` method only after the async sink confirms `Ok(())`. Mutation paths updated:
+  - `tick_blob_heat` (`blob/mesh.rs`): commit runs after `announce_blob_heat_batch` returns Ok; on `?` error path, no commit, next tick reissues.
+  - `emit_heat` (`greedy/runtime.rs`): commit runs after `announce_heat_batch` returns Ok; on error path, candidates stay pending. Empty-batch (all Suppress) commits the no-op so pruning still happens.
+- **Regression test:** `tick_without_commit_reissues_on_next_tick` simulates a sink failure (caller skips commit), then ticks again and asserts the same `Emit` candidate is reissued — pre-fix the inline `record_emission` had already advanced `last_emitted` and the second tick returned empty (Suppress).
 
 #### X-19 — `StandbyGroup::promote` double-executes events after a partial `sync_standbys` — **Landed**
 - **File:** `src/adapter/net/compute/standby_group.rs:230-298` (`sync_standbys`), `:305-381` (`promote`), and the v2 path at `:585-682`.
