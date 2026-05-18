@@ -491,8 +491,14 @@ impl OperatorRegistry {
         // can't pin the verifier's CPU for arbitrarily long.
         // 64 is well past any realistic operator-quorum and matches
         // the umbrella shape of "tiny-but-finite operational caps."
+        // Honor the configured threshold when it exceeds 64 so a
+        // legitimately-large operator quorum doesn't fail-closed
+        // against the verifier's own cap — the cap is meant to
+        // bound CPU against hostile bundles, not against the
+        // configured policy.
         const MAX_SIGNATURES_PER_BUNDLE: usize = 64;
-        if signatures.len() > MAX_SIGNATURES_PER_BUNDLE {
+        let max_signatures = MAX_SIGNATURES_PER_BUNDLE.max(threshold);
+        if signatures.len() > max_signatures {
             return Err(VerifyError::InsufficientSignatures {
                 got: signatures.len(),
                 required: threshold,

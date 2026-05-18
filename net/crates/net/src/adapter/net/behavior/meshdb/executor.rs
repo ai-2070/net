@@ -859,23 +859,17 @@ pub(super) fn execute_window(
             detail: "Window size must be >= 1".to_string(),
         });
     }
-    // Reject window sizes above u64::MAX / 2: the bucket bounds
-    // below compute `start = bucket * size` and `end = start + size`
-    // with saturating arithmetic. Two adjacent buckets near
-    // u64::MAX both saturate to `end = u64::MAX`, producing
-    // indistinguishable WindowBoundary envelopes — downstream
-    // OrderBy / cache-key disambiguation treats boundary tuples
-    // as unique, and the collision would silently corrupt those
-    // surfaces.
-    if size > u64::MAX / 2 {
-        return Err(MeshError::PlannerError {
-            detail: format!(
-                "Window size {} exceeds u64::MAX / 2; adjacent buckets would saturate to identical bounds",
-                size
-            ),
-        });
-    }
-
+    // No upper-bound check on `size` beyond the size == 0 guard.
+    // A prior commit rejected `size > u64::MAX / 2` on the theory
+    // that adjacent buckets' saturating boundaries would collide
+    // — that's true only for bucket indices unreachable from any
+    // u64 seq. The populated buckets `seq / size` for `seq ∈
+    // [0, u64::MAX]` always have distinguishable `(start, end)`
+    // tuples regardless of `size`, because at most two such
+    // buckets land for any size > u64::MAX / 2 (bucket 0 and
+    // bucket 1) and their bounds never collapse. Rejecting the
+    // size made legitimately-large window specs unusable for
+    // dataset shapes that span the seq range.
     let mut buckets: BTreeMap<u64, Vec<ResultRow>> = BTreeMap::new();
     for row in rows {
         let bucket = row.seq.0 / size;
@@ -2582,6 +2576,53 @@ mod tests {
                 assert!(detail.contains("Window size"));
             }
             other => panic!("expected PlannerError; got {other:?}"),
+        }
+    }
+
+    /// Review regression: a prior commit rejected
+    /// `WindowSpec::TumblingSeq { size }` when `size > u64::MAX/2`
+    /// on the theory that adjacent buckets' saturating bounds
+    /// would collide. The check was overly restrictive — the
+    /// populated buckets `seq / size` for `seq ∈ [0, u64::MAX]`
+    /// always produce distinguishable `(start, end)` tuples for
+    /// any `size > u64::MAX/2` (at most two such buckets land).
+    /// The check was removed; this test pins that large sizes
+    /// are accepted at plan time.
+    #[tokio::test]
+    async fn execute_window_accepts_size_above_u64_max_half() {
+        use crate::adapter::net::behavior::meshdb::planner::CostEstimate;
+        use crate::adapter::net::behavior::meshdb::query::WindowSpec;
+
+        let reader = Arc::new(InMemoryChainReader::default());
+        let executor = LocalMeshQueryExecutor::new(reader);
+        for size in [u64::MAX / 2 + 1, u64::MAX - 1, u64::MAX] {
+            let plan = ExecutionPlan {
+                root: OperatorNode {
+                    operator: OperatorPlan::Window {
+                        input: Box::new(OperatorNode {
+                            operator: OperatorPlan::LatestRead { origin: 0xAA },
+                            target_nodes: vec![],
+                            cost: CostEstimate::default(),
+                        }),
+                        spec: WindowSpec::TumblingSeq { size },
+                    },
+                    target_nodes: vec![],
+                    cost: CostEstimate::default(),
+                },
+                total_cost: CostEstimate::default(),
+            };
+            // The plan executes against an empty reader; the
+            // important property is that the planner / executor
+            // do NOT reject the `size` at gate time. Empty input
+            // → empty output is fine; the failure mode pre-fix
+            // was a hard `PlannerError`.
+            let result = executor.execute(plan).await;
+            assert!(
+                result.is_ok(),
+                "size={} must be accepted (no adjacent-bucket collision in practice), got {:?}",
+                size,
+                result
+            );
         }
     }
 

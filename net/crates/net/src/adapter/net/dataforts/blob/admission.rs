@@ -272,12 +272,13 @@ pub fn should_accept_overflow_from(
     // (a malicious sender stamping size_bytes=1 to pass the disk
     // gate, then shipping a 16 GiB chunk). We can't trust it for
     // the actual byte count, so under-floor the gate at
-    // BLOB_CHUNK_SIZE_BYTES = 4 MiB — a sender that gets through
-    // the gate still has to fit at least one chunk of headroom.
-    // Above-floor values are taken as-is because over-reporting
-    // can only make the gate stricter, not weaker.
-    const BLOB_CHUNK_SIZE_BYTES: u64 = 4 * 1024 * 1024;
-    let effective_size = blob_size_bytes.max(BLOB_CHUNK_SIZE_BYTES);
+    // BLOB_CHUNK_SIZE_BYTES — a sender that gets through the gate
+    // still has to fit at least one chunk of headroom. Above-floor
+    // values are taken as-is because over-reporting can only make
+    // the gate stricter, not weaker. Pull the canonical constant
+    // from `blob_ref` rather than re-declaring it so admission
+    // tracks the chunking rules verbatim if the rules ever change.
+    let effective_size = blob_size_bytes.max(super::blob_ref::BLOB_CHUNK_SIZE_BYTES);
     let required_gb = effective_size.div_ceil(1 << 30);
     if local_blob.disk_free_gb < required_gb {
         return OverflowVerdict::Reject(OverflowReject::InsufficientDisk);

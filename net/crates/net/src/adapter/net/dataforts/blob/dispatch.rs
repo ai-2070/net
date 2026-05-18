@@ -79,19 +79,80 @@ pub async fn resolve_payload<A: BlobAdapter + ?Sized>(
                 }
             }
             let fetched = adapter.fetch(&blob).await?;
-            // `BlobRef::verify` is defined only for Small — Manifest
-            // has no top-level hash, and chunk hashes were already
-            // checked inside the adapter on a per-chunk basis (see
-            // MeshBlobAdapter::fetch_chunk). Re-verifying here on a
-            // Manifest would hard-error every chunked payload, which
-            // is exactly the failure the resolve_payload helper was
-            // expected to avoid for SDK / FFI consumers.
+            // Verification posture is different for the two BlobRef
+            // shapes:
+            //   * `Small` — single top-level BLAKE3 hash. The
+            //     substrate runs `BlobRef::verify` here, independent
+            //     of the adapter, so an adversarial / buggy adapter
+            //     can't fake-verify by returning bytes that match a
+            //     hash it computed itself.
+            //   * `Manifest` — no top-level hash. The substrate
+            //     runs the chunk-by-chunk verification here too:
+            //     slice `fetched` at `chunks[i].size` boundaries,
+            //     hash each region, compare against the manifest's
+            //     `chunks[i].hash`. This used to be left to the
+            //     adapter (e.g. `MeshBlobAdapter::fetch_chunk`
+            //     internally), but `resolve_payload` accepts any
+            //     `BlobAdapter`-impl and adapters that don't verify
+            //     chunk-by-chunk (or are adversarial) could
+            //     otherwise return tampered bytes here. Doing the
+            //     check at the dispatch layer keeps the substrate-
+            //     side guarantee uniform across both shapes.
             if !blob.is_chunked() {
                 blob.verify(&fetched)?;
+            } else {
+                verify_manifest_chunks(&blob, &fetched)?;
             }
             Ok(fetched)
         }
     }
+}
+
+/// Verify a `Manifest`-shape `BlobRef` against the reassembled
+/// `fetched` byte stream. Walks the manifest's `chunks` list,
+/// slices `fetched` at the recorded chunk sizes, hashes each
+/// slice with BLAKE3, and compares against the recorded
+/// `chunks[i].hash`. Surface a typed error on any mismatch so the
+/// caller surfaces a verification failure instead of returning
+/// tampered bytes.
+///
+/// Independent of any adapter-side verification — adversarial or
+/// buggy adapters that return manipulated bytes here will fail
+/// the substrate-side check.
+fn verify_manifest_chunks(
+    blob: &super::blob_ref::BlobRef,
+    fetched: &[u8],
+) -> Result<(), BlobError> {
+    use super::blob_ref::BlobRef;
+    let chunks = match blob {
+        BlobRef::Manifest { chunks, .. } => chunks,
+        // The caller only invokes this on `is_chunked() == true`,
+        // so this branch is unreachable in production. Guard
+        // anyway for forward-compat with new BlobRef variants.
+        BlobRef::Small { .. } => return Ok(()),
+    };
+    let total: u64 = chunks.iter().map(|c| c.size as u64).sum();
+    if total != fetched.len() as u64 {
+        return Err(BlobError::Backend(format!(
+            "manifest reassembled length {} != sum of chunk sizes {}",
+            fetched.len(),
+            total
+        )));
+    }
+    let mut offset: usize = 0;
+    for chunk in chunks.iter() {
+        let end = offset + chunk.size as usize;
+        let region = &fetched[offset..end];
+        let computed: [u8; 32] = blake3::hash(region).into();
+        if computed != chunk.hash {
+            return Err(BlobError::HashMismatch {
+                expected: chunk.hash,
+                actual: computed,
+            });
+        }
+        offset = end;
+    }
+    Ok(())
 }
 
 /// Extract the URI scheme (everything before the first `:`), or
@@ -327,6 +388,127 @@ mod tests {
             .await
             .expect("resolve must accept Manifest without top-level verify");
         assert_eq!(resolved, payload);
+    }
+
+    /// Review P1 regression: a chunked Manifest fetched via
+    /// `resolve_payload` must verify each chunk against the
+    /// manifest's recorded hashes — adversarial adapters that
+    /// return tampered chunk bytes must fail with `HashMismatch`
+    /// at the dispatch layer (independent of any adapter-side
+    /// verification, which third-party impls may or may not do).
+    #[tokio::test]
+    async fn resolve_rejects_chunked_manifest_with_tampered_chunk_bytes() {
+        use super::super::adapter::BlobAdapter;
+        use super::super::blob_ref::{ChunkRef, Encoding, BLOB_CHUNK_SIZE_BYTES};
+
+        // Stub that returns the legitimate first chunk but flips
+        // the second chunk's payload — simulates an adversarial
+        // / buggy adapter.
+        #[derive(Debug)]
+        struct TamperingAdapter {
+            payload: Vec<u8>,
+        }
+        #[async_trait::async_trait]
+        impl BlobAdapter for TamperingAdapter {
+            fn adapter_id(&self) -> &str { "tampering" }
+            async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> { Ok(()) }
+            async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
+                Ok(self.payload.clone())
+            }
+            async fn fetch_range(
+                &self,
+                _: &BlobRef,
+                range: std::ops::Range<u64>,
+            ) -> Result<Vec<u8>, BlobError> {
+                Ok(self.payload[range.start as usize..range.end as usize].to_vec())
+            }
+            async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> { Ok(true) }
+        }
+
+        // Legitimate manifest: first chunk all 0xAA, second chunk
+        // all 0xBB. Hashes are recorded against the legitimate
+        // bytes.
+        let legit_chunk_1 = vec![0xAA; BLOB_CHUNK_SIZE_BYTES as usize];
+        let legit_chunk_2 = vec![0xBB; 16];
+        let chunks = vec![
+            ChunkRef {
+                hash: blake3::hash(&legit_chunk_1).into(),
+                size: BLOB_CHUNK_SIZE_BYTES as u32,
+            },
+            ChunkRef {
+                hash: blake3::hash(&legit_chunk_2).into(),
+                size: 16,
+            },
+        ];
+        let blob = BlobRef::manifest("mesh://tampered", Encoding::Replicated, chunks)
+            .expect("manifest construct");
+        let encoded = blob.encode();
+
+        // Tampered payload: first chunk matches the manifest's
+        // recorded hash; second chunk is flipped to all 0xCC.
+        let mut tampered = legit_chunk_1.clone();
+        tampered.extend(vec![0xCC; 16]);
+        let adapter = TamperingAdapter { payload: tampered };
+        let err = resolve_payload(&encoded, &adapter)
+            .await
+            .expect_err("tampered chunk must fail verification");
+        assert!(
+            matches!(err, BlobError::HashMismatch { .. }),
+            "expected HashMismatch on tampered chunk 2, got {:?}",
+            err
+        );
+    }
+
+    /// Companion to the legitimate-path test above: a Manifest
+    /// fetched via `resolve_payload` whose adapter returns the
+    /// genuine bytes must still succeed (the chunk-by-chunk
+    /// verifier accepts every matching chunk hash).
+    #[tokio::test]
+    async fn resolve_accepts_chunked_manifest_with_matching_chunk_bytes() {
+        use super::super::adapter::BlobAdapter;
+        use super::super::blob_ref::{ChunkRef, Encoding, BLOB_CHUNK_SIZE_BYTES};
+
+        #[derive(Debug)]
+        struct LegitAdapter(Vec<u8>);
+        #[async_trait::async_trait]
+        impl BlobAdapter for LegitAdapter {
+            fn adapter_id(&self) -> &str { "legit" }
+            async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> { Ok(()) }
+            async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
+                Ok(self.0.clone())
+            }
+            async fn fetch_range(
+                &self,
+                _: &BlobRef,
+                range: std::ops::Range<u64>,
+            ) -> Result<Vec<u8>, BlobError> {
+                Ok(self.0[range.start as usize..range.end as usize].to_vec())
+            }
+            async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> { Ok(true) }
+        }
+
+        let chunk_1 = vec![0x11; BLOB_CHUNK_SIZE_BYTES as usize];
+        let chunk_2 = vec![0x22; 32];
+        let mut full = chunk_1.clone();
+        full.extend(&chunk_2);
+        let chunks = vec![
+            ChunkRef {
+                hash: blake3::hash(&chunk_1).into(),
+                size: BLOB_CHUNK_SIZE_BYTES as u32,
+            },
+            ChunkRef {
+                hash: blake3::hash(&chunk_2).into(),
+                size: 32,
+            },
+        ];
+        let blob = BlobRef::manifest("mesh://legit", Encoding::Replicated, chunks)
+            .expect("manifest construct");
+        let encoded = blob.encode();
+        let adapter = LegitAdapter(full.clone());
+        let resolved = resolve_payload(&encoded, &adapter)
+            .await
+            .expect("legitimate manifest must verify");
+        assert_eq!(resolved, full);
     }
 
     #[tokio::test]
