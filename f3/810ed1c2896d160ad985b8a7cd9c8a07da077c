@@ -1,0 +1,39 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_aa8bb6e2c88c9e::t_fc373beea221a2 3839-3854,3856-3866,3876,3895-3897,3899-3900
+  s_aa8bb6e2c88c9e::t_2ae62718008b49 8986-8992,9004,9019
+  s_aa8bb6e2c88c9e::t_6a1cbf96073073 3877-3892,3894,3898
+  s_aa8bb6e2c88c9e::t_5e8dfaef4371c1 384-390,396
+  s_aa8bb6e2c88c9e::t_11f73f65eb5b17 406-412,418
+  s_aa8bb6e2c88c9e::t_aee6aa22025b2f 1303-1305
+  s_aa8bb6e2c88c9e::t_30965c4f34ccaf 9026-9028,9035-9038,9045,9053-9054,9061
+  s_aa8bb6e2c88c9e::t_828ae45206eeb7 9085,9092-9093,9100
+  s_aa8bb6e2c88c9e::t_8e56392c5e6968 7855-7858,7860
+  s_aa8bb6e2c88c9e::t_68111849c71ed4 7893,7943
+net/crates/net/tests/rendezvous_ack.rs
+  s_aa8bb6e2c88c9e::t_2b06e5eb2e9952 154-155
+  s_aa8bb6e2c88c9e::t_8bba41fd2452b5 302-303
+  s_aa8bb6e2c88c9e::t_a42ad521120e80 205,207-208,210
+  s_aa8bb6e2c88c9e::t_028b69974f0601 233-284
+net/crates/net/tests/punch_keepalive.rs
+  s_aa8bb6e2c88c9e::t_9fa077e7c0a1ff 172-173,175
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_18_CARRIED_FORWARD.md
+  s_aa8bb6e2c88c9e::t_7ebd3cbb009505 560,564,566,570-571
+net/crates/net/tests/rendezvous_coordinator.rs
+  s_aa8bb6e2c88c9e::t_46919a91e4ef1f 184-186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "f3810ed1c2896d160ad985b8a7cd9c8a07da077c",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
