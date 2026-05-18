@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_aa8bb6e2c88c9e::t_0657f14e065782 613-625
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_aa8bb6e2c88c9e::t_0b717400ea83ae 640,651-652,655,659-665,667-685
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_18_CARRIED_FORWARD.md
+  s_aa8bb6e2c88c9e::t_88f1e968c55f95 318,321,323,326
+  s_aa8bb6e2c88c9e::t_db46d9e84028f5 161,165
+  s_aa8bb6e2c88c9e::t_6f96398fdcc749 695,699-702
+net/crates/net/src/adapter/net/dataforts/gravity/counter.rs
+  s_aa8bb6e2c88c9e::t_8ede498f403c0e 753-754,757,772-801
+  s_aa8bb6e2c88c9e::t_e50f11e3bae386 300-310,313-314,320-340
+  s_aa8bb6e2c88c9e::t_f853103d55492f 684-686,689-690,700,703
+  s_aa8bb6e2c88c9e::t_99f4bd93f7453d 487-489,492-493,499-512
+  s_aa8bb6e2c88c9e::t_03922a53e49af6 720-722,735-738
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "c43a3121b80d01d892d47ac7ae710f77f84021da",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
