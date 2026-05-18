@@ -358,7 +358,7 @@ Counts and one-liners only; full text in the agent reports.
 
 **Replication (R-29, R-30, R-33, R-34):**
 - R-29 — `replica_set` admits duplicates → double heartbeats; should be `BTreeSet` (`replication_step.rs:186-189`)
-- R-30 — `wall_clock_ms` collected from heartbeats but never used; either implement the skew gauge or drop the field (`replication.rs:237-244`)
+- R-30 — `wall_clock_ms` collected from heartbeats but never used; either implement the skew gauge or drop the field (`replication.rs:237-244`) — **Kept as reserved.** Dropping is a wire-format break, and a future drift-gauge feature would need the same 8-byte slot back. Leave the field in place; receivers ignore the value until the gauge ships.
 - R-33 — `consumed + payload_len` (where `payload_len` came from a u32 on the wire) is plain `usize` addition; on 32-bit targets it can overflow. Same shape as the umbrella's L-9 fix for `BufferedEvents`; fold into the same commit. Use `checked_add → WireError::Truncated` (`replication.rs:465, 474`)
 - R-34 — `acc += cost` is plain addition while the surrounding function at `:249` uses `saturating_add`. Practically unreachable given the 64 MiB hard ceiling; the asymmetry itself is the bug — reviewers will copy the unguarded pattern (`replication_catchup.rs:258`)
 
