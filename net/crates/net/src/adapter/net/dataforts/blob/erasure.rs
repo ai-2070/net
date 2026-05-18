@@ -43,6 +43,7 @@ use reed_solomon_erasure::galois_8;
 use reed_solomon_erasure::ReedSolomon;
 
 use super::blob_ref::Encoding;
+use super::blob_tree::{ChunkRefV3, StripeBlock};
 use super::error::BlobError;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -373,6 +374,216 @@ impl RsEncoder {
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// RsStriper — accumulates data chunks into stripes, emits StripeBlocks
+// ───────────────────────────────────────────────────────────────────────────
+
+/// One unit of output the [`RsStriper`] emits when a stripe
+/// closes: the [`StripeBlock`] (data + parity chunk refs) plus
+/// the bytes of every newly-computed parity chunk that the
+/// caller must persist before the stripe is fetchable.
+///
+/// Data chunks were already persisted by the caller before being
+/// pushed into the striper; only parity bytes are new.
+pub struct ClosedStripe {
+    /// The fully-populated stripe descriptor — drop into a
+    /// [`super::blob_tree::TreeNode::ErasureLeaf`].
+    pub block: StripeBlock,
+    /// Newly-computed parity bytes the caller must persist via
+    /// `store_chunk` before the stripe is recoverable. Pairs
+    /// 1:1 with the parity entries at the tail of `block.chunks`.
+    pub parity_bytes: Vec<Vec<u8>>,
+}
+
+/// Reed-Solomon striper: byte-bounded stripe accumulation +
+/// parity generation.
+///
+/// The caller feeds the striper a stream of data chunks via
+/// [`Self::push_chunk`]. The striper accumulates them until the
+/// total data bytes reach [`RS_STRIPE_TARGET_BYTES`], then closes
+/// the stripe: zero-pads every data chunk to the maximum data
+/// chunk length, computes `m` parity chunks via
+/// [`RsEncoder::encode`], and emits a [`ClosedStripe`] with the
+/// fully-populated [`StripeBlock`] + the parity bytes that must
+/// be persisted.
+///
+/// At end-of-stream, [`Self::finalize`] flushes whatever's left:
+/// - If the trailing partial stripe has data bytes ≥
+///   [`RS_STRIPE_MIN_BYTES`], it RS-encodes like a full stripe
+///   (padding the data chunks to make exactly `k` data
+///   shards — short trailing chunks get zero-filled, missing
+///   trailing chunks are added as all-zero data shards with
+///   `size = 0`; the latter case keeps the wire shape consistent
+///   without claiming data bytes the caller never sent).
+/// - If the trailing partial is below the min-bytes threshold,
+///   it falls back to [`Encoding::Replicated`] for that stripe:
+///   every accumulated data chunk is emitted as a Replicated
+///   stripe with no parity, so the operator pays no parity
+///   overhead on tiny trailing data.
+///
+/// # Memory bound
+///
+/// O(`RS_STRIPE_TARGET_BYTES` × overhead) ≈ 40 MiB chunk-byte
+/// shadows + 16 MiB parity. The striper keeps one in-flight
+/// stripe; closed stripes are emitted immediately and drop out
+/// of the striper's working set.
+pub struct RsStriper {
+    rs_params: RsParams,
+    encoder: RsEncoder,
+    /// Chunks accumulated for the in-flight stripe. Each entry
+    /// is `(bytes, chunk_ref)` — the bytes are kept around so
+    /// `encode` can produce parity over them (since data chunks
+    /// must be padded to equal length for the GF(2^8) encoder,
+    /// the striper needs the raw bytes, not just the ref).
+    in_flight: Vec<(Vec<u8>, ChunkRefV3)>,
+    /// Running total of *data bytes* (sum of in-flight chunk
+    /// sizes) — drives the stripe-close decision.
+    in_flight_data_bytes: u64,
+    /// Closed-stripe counter for operator metrics.
+    closed_count: u64,
+}
+
+impl RsStriper {
+    /// Construct a striper for the supplied RS parameters.
+    /// Validates and constructs the underlying encoder once;
+    /// per-stripe `close` calls are encode-only.
+    pub fn new(rs_params: RsParams) -> Result<Self, BlobError> {
+        let encoder = RsEncoder::new(rs_params)?;
+        Ok(Self {
+            rs_params,
+            encoder,
+            in_flight: Vec::new(),
+            in_flight_data_bytes: 0,
+            closed_count: 0,
+        })
+    }
+
+    /// Push a single data chunk. Returns `Some(ClosedStripe)` if
+    /// this push completed a stripe (`k`-th chunk arrived),
+    /// otherwise `None`.
+    ///
+    /// The chunk's `bytes` MUST hash to `chunk_ref.hash` and have
+    /// length equal to `chunk_ref.size` — the caller (the store
+    /// path) is responsible for that pairing; the striper
+    /// doesn't re-hash.
+    ///
+    /// v0.3 Phase C2 closes stripes at exactly `k` chunks rather
+    /// than at the plan's [`RS_STRIPE_TARGET_BYTES`] byte target.
+    /// The chunk-count rule keeps the encoder input shape uniform
+    /// (always exactly `k` data shards, no synthetic-padding
+    /// edge cases) while approximating the plan's byte target at
+    /// `k × avg_chunk_size` ≈ 40 MiB for the (10, 4) production
+    /// default. A future commit may re-introduce the byte target
+    /// with explicit synthetic-shard handling for the
+    /// fewer-than-`k`-chunks-at-byte-target CDC edge case.
+    pub fn push_chunk(
+        &mut self,
+        bytes: Vec<u8>,
+        chunk_ref: ChunkRefV3,
+    ) -> Result<Option<ClosedStripe>, BlobError> {
+        if !chunk_ref.is_data() {
+            return Err(BlobError::Backend(
+                "RsStriper::push_chunk received a non-data chunk; striper only \
+                 accepts Data role chunks (parity is computed internally)"
+                    .to_owned(),
+            ));
+        }
+        let chunk_bytes = chunk_ref.size as u64;
+        self.in_flight_data_bytes = self.in_flight_data_bytes.saturating_add(chunk_bytes);
+        self.in_flight.push((bytes, chunk_ref));
+        if self.in_flight.len() >= self.rs_params.k as usize {
+            let closed = self.close_stripe_with_rs()?;
+            return Ok(Some(closed));
+        }
+        Ok(None)
+    }
+
+    /// End-of-stream: flush the in-flight stripe. The trailing
+    /// partial stripe (1..k chunks) always emits as
+    /// [`Encoding::Replicated`] regardless of size — the v0.3
+    /// Phase C2 simplification of the plan's byte-threshold
+    /// fallback. The operator pays no parity overhead on the
+    /// trailing 0..k chunks of any blob.
+    pub fn finalize(mut self) -> Result<Option<ClosedStripe>, BlobError> {
+        if self.in_flight.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.close_stripe_as_replicated()))
+    }
+
+    /// Stats helper for tests + operator metrics.
+    pub fn closed_stripe_count(&self) -> u64 {
+        self.closed_count
+    }
+
+    /// Internal: close the in-flight stripe as an RS-encoded
+    /// stripe. Always called with exactly `k` data chunks (the
+    /// push-side close trigger); pads each data shard to the
+    /// max length and computes `m` parity shards.
+    fn close_stripe_with_rs(&mut self) -> Result<ClosedStripe, BlobError> {
+        let k = self.rs_params.k as usize;
+        let m = self.rs_params.m as usize;
+        let in_flight = std::mem::take(&mut self.in_flight);
+        self.in_flight_data_bytes = 0;
+        if in_flight.len() != k {
+            return Err(BlobError::Backend(format!(
+                "RS striper: stripe close expected exactly {} data shards, got {}",
+                k,
+                in_flight.len()
+            )));
+        }
+
+        let max_len = in_flight.iter().map(|(b, _)| b.len()).max().unwrap_or(1).max(1);
+        let mut padded: Vec<Vec<u8>> = Vec::with_capacity(k);
+        let mut data_refs: Vec<ChunkRefV3> = Vec::with_capacity(k);
+        for (mut bytes, chunk_ref) in in_flight {
+            if bytes.len() < max_len {
+                bytes.resize(max_len, 0);
+            }
+            padded.push(bytes);
+            data_refs.push(chunk_ref);
+        }
+
+        let parity_bytes = self.encoder.encode(&padded)?;
+        let mut parity_refs: Vec<ChunkRefV3> = Vec::with_capacity(m);
+        for (i, pbytes) in parity_bytes.iter().enumerate() {
+            let phash: [u8; 32] = blake3::hash(pbytes).into();
+            parity_refs.push(ChunkRefV3::parity(phash, pbytes.len() as u32, i as u8));
+        }
+
+        let mut chunks: Vec<ChunkRefV3> = data_refs;
+        chunks.extend(parity_refs);
+        let block = StripeBlock {
+            encoding: Encoding::ReedSolomon {
+                k: self.rs_params.k,
+                m: self.rs_params.m,
+            },
+            chunks,
+        };
+        block.validate()?;
+        self.closed_count = self.closed_count.saturating_add(1);
+        Ok(ClosedStripe { block, parity_bytes })
+    }
+
+    /// Internal: close the in-flight stripe as the Replicated
+    /// fallback (small-stripe case). No parity is computed; the
+    /// stripe's `chunks` is just the accumulated data refs.
+    fn close_stripe_as_replicated(&mut self) -> ClosedStripe {
+        let in_flight = std::mem::take(&mut self.in_flight);
+        self.in_flight_data_bytes = 0;
+        let chunks: Vec<ChunkRefV3> = in_flight.into_iter().map(|(_, r)| r).collect();
+        let block = StripeBlock {
+            encoding: Encoding::Replicated,
+            chunks,
+        };
+        self.closed_count = self.closed_count.saturating_add(1);
+        ClosedStripe {
+            block,
+            parity_bytes: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +764,171 @@ mod tests {
             erasure_downgrade(rep, &ErasureSupportProbe::ForceReplicated),
             rep
         );
+    }
+
+    fn det_bytes(seed: u8, len: usize) -> Vec<u8> {
+        let mut state: u64 = seed as u64;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// Push exactly k chunks → striper closes one RS stripe with
+    /// k data + m parity refs, all data sizes preserved.
+    #[test]
+    fn striper_closes_at_k_chunks_into_rs_stripe() {
+        let params = RsParams { k: 4, m: 2 };
+        let mut striper = RsStriper::new(params).unwrap();
+        for i in 0..3u8 {
+            let bytes = det_bytes(i, 100);
+            let hash: [u8; 32] = blake3::hash(&bytes).into();
+            let cref = ChunkRefV3::data(hash, 100);
+            assert!(striper.push_chunk(bytes, cref).unwrap().is_none());
+        }
+        let bytes = det_bytes(3, 100);
+        let hash: [u8; 32] = blake3::hash(&bytes).into();
+        let cref = ChunkRefV3::data(hash, 100);
+        let closed = striper.push_chunk(bytes, cref).unwrap().unwrap();
+        assert_eq!(closed.block.chunks.len(), 6); // 4 data + 2 parity
+        assert_eq!(closed.parity_bytes.len(), 2);
+        assert_eq!(
+            closed.block.chunks.iter().filter(|c| c.is_data()).count(),
+            4
+        );
+        assert_eq!(
+            closed.block.chunks.iter().filter(|c| c.is_parity()).count(),
+            2
+        );
+    }
+
+    /// Mixed-size data chunks get zero-padded to the max length
+    /// before parity computation; the resulting StripeBlock
+    /// preserves the original pre-padding sizes in ChunkRefV3.size.
+    #[test]
+    fn striper_preserves_pre_padding_sizes_in_chunk_refs() {
+        let params = RsParams { k: 3, m: 2 };
+        let mut striper = RsStriper::new(params).unwrap();
+        let sizes = [200, 100, 150];
+        let mut sent = Vec::new();
+        for (i, &size) in sizes.iter().enumerate() {
+            let bytes = det_bytes(i as u8, size);
+            let hash: [u8; 32] = blake3::hash(&bytes).into();
+            let cref = ChunkRefV3::data(hash, size as u32);
+            sent.push(cref);
+            let result = striper.push_chunk(bytes, cref).unwrap();
+            if i + 1 == sizes.len() {
+                let closed = result.unwrap();
+                for (j, &expected_size) in sizes.iter().enumerate() {
+                    assert_eq!(closed.block.chunks[j].size as usize, expected_size);
+                }
+                // Parity shard size = max(data sizes) = 200.
+                for parity in closed.block.chunks.iter().filter(|c| c.is_parity()) {
+                    assert_eq!(parity.size as usize, 200);
+                }
+            } else {
+                assert!(result.is_none());
+            }
+        }
+    }
+
+    /// Finalize with < k chunks falls back to Replicated stripe.
+    #[test]
+    fn striper_finalize_with_partial_emits_replicated_stripe() {
+        let params = RsParams { k: 5, m: 2 };
+        let mut striper = RsStriper::new(params).unwrap();
+        for i in 0..3u8 {
+            let bytes = det_bytes(i, 50);
+            let hash: [u8; 32] = blake3::hash(&bytes).into();
+            let cref = ChunkRefV3::data(hash, 50);
+            assert!(striper.push_chunk(bytes, cref).unwrap().is_none());
+        }
+        let closed = striper.finalize().unwrap().unwrap();
+        assert_eq!(closed.block.encoding, Encoding::Replicated);
+        assert_eq!(closed.block.chunks.len(), 3);
+        assert!(closed.parity_bytes.is_empty());
+        assert!(closed.block.chunks.iter().all(|c| c.is_data()));
+    }
+
+    /// Finalize with zero in-flight chunks returns None.
+    #[test]
+    fn striper_finalize_with_no_chunks_returns_none() {
+        let params = RsParams { k: 4, m: 2 };
+        let striper = RsStriper::new(params).unwrap();
+        assert!(striper.finalize().unwrap().is_none());
+    }
+
+    /// Two full stripes back-to-back: 2k chunks → 2 closed
+    /// stripes, each k data + m parity.
+    #[test]
+    fn striper_closes_multiple_stripes() {
+        let params = RsParams { k: 3, m: 2 };
+        let mut striper = RsStriper::new(params).unwrap();
+        let mut closed_count = 0u64;
+        for i in 0..6u8 {
+            let bytes = det_bytes(i, 64);
+            let hash: [u8; 32] = blake3::hash(&bytes).into();
+            let cref = ChunkRefV3::data(hash, 64);
+            if striper.push_chunk(bytes, cref).unwrap().is_some() {
+                closed_count += 1;
+            }
+        }
+        assert_eq!(closed_count, 2);
+        assert_eq!(striper.closed_stripe_count(), 2);
+    }
+
+    /// Striper rejects parity-role chunks (only Data accepted).
+    #[test]
+    fn striper_rejects_parity_role_inputs() {
+        let mut striper = RsStriper::new(RsParams { k: 3, m: 2 }).unwrap();
+        let bytes = vec![0u8; 10];
+        let parity_ref = ChunkRefV3::parity([0u8; 32], 10, 0);
+        assert!(striper.push_chunk(bytes, parity_ref).is_err());
+    }
+
+    /// End-to-end RS round trip through the striper: push k
+    /// data chunks, drop one data chunk + one parity chunk,
+    /// reconstruct via RsEncoder, assert byte-equality.
+    #[test]
+    fn striper_output_round_trips_through_rs_encoder() {
+        let params = RsParams { k: 3, m: 2 };
+        let mut striper = RsStriper::new(params).unwrap();
+        let originals: Vec<Vec<u8>> = (0..3u8).map(|i| det_bytes(i, 128)).collect();
+        let mut closed: Option<ClosedStripe> = None;
+        for (i, bytes) in originals.iter().enumerate() {
+            let hash: [u8; 32] = blake3::hash(bytes).into();
+            let cref = ChunkRefV3::data(hash, bytes.len() as u32);
+            let result = striper.push_chunk(bytes.clone(), cref).unwrap();
+            if i + 1 == originals.len() {
+                closed = Some(result.unwrap());
+            }
+        }
+        let closed = closed.unwrap();
+        // Rebuild shards: data + parity, drop one of each.
+        let shard_len = closed.parity_bytes[0].len();
+        let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(5);
+        for orig in &originals {
+            let mut padded = orig.clone();
+            padded.resize(shard_len, 0);
+            shards.push(Some(padded));
+        }
+        for p in &closed.parity_bytes {
+            shards.push(Some(p.clone()));
+        }
+        shards[1] = None; // drop data shard 1
+        shards[4] = None; // drop parity shard 1
+
+        let encoder = RsEncoder::new(params).unwrap();
+        encoder.reconstruct_data(&mut shards).unwrap();
+        // Reconstructed data shard 1 should match original (after
+        // accounting for the zero-padding).
+        let mut expected = originals[1].clone();
+        expected.resize(shard_len, 0);
+        assert_eq!(shards[1].as_ref().unwrap(), &expected);
     }
 
     /// Production constants match the v0.3 plan §6: `(10, 4)`

@@ -290,6 +290,98 @@ impl ChunkRefV3 {
     }
 }
 
+/// One Reed-Solomon stripe inside a [`TreeNode::ErasureLeaf`].
+/// Carries its own [`Encoding`](super::blob_ref::Encoding) so the
+/// small-stripe fallback (a trailing partial stripe under the
+/// `RS_STRIPE_MIN_BYTES` threshold) can record itself as
+/// `Replicated` while the parent blob's encoding is
+/// `ReedSolomon { k, m }`.
+///
+/// `chunks` lists data chunks first, then parity chunks. The
+/// reader consults `encoding`:
+/// - `Encoding::Replicated` → every chunk is data; concatenate
+///   to reconstruct the stripe.
+/// - `Encoding::ReedSolomon { k, m }` → first `k` chunks are
+///   data (each `ChunkRefV3::size` = pre-padding actual data
+///   size); next `m` chunks are parity (size = post-padding
+///   data shard length, equal across the stripe).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StripeBlock {
+    /// Per-stripe encoding override. Allows mixed RS + Replicated
+    /// stripes within one RS-encoded blob.
+    pub encoding: super::blob_ref::Encoding,
+    /// Chunk references in stripe order: data first, then parity.
+    pub chunks: Vec<ChunkRefV3>,
+}
+
+impl StripeBlock {
+    /// Number of bytes the stripe covers when read out — sum of
+    /// the data chunks' sizes. Parity chunks contribute zero
+    /// because they're never returned to the caller verbatim
+    /// (they only exist for reconstruction).
+    pub fn covered_bytes(&self) -> u64 {
+        self.chunks
+            .iter()
+            .filter(|c| c.is_data())
+            .map(|c| c.size as u64)
+            .sum()
+    }
+
+    /// Stripe-shape validation. Catches encoder bugs early:
+    /// - Replicated stripe must have zero parity chunks.
+    /// - RS stripe must have exactly `k` data + `m` parity chunks.
+    /// - Every parity chunk's `stripe_index` is unused at the
+    ///   `StripeBlock` level (stripes are now positionally
+    ///   identified by index inside `ErasureLeaf::stripes`); a
+    ///   stale non-zero `stripe_index` is tolerated for forward
+    ///   compatibility.
+    pub fn validate(&self) -> Result<(), BlobError> {
+        let data_count = self.chunks.iter().filter(|c| c.is_data()).count();
+        let parity_count = self.chunks.iter().filter(|c| c.is_parity()).count();
+        match self.encoding {
+            super::blob_ref::Encoding::Replicated => {
+                if parity_count != 0 {
+                    return Err(BlobError::Decode(format!(
+                        "StripeBlock(Replicated) has {} parity chunks; expected 0",
+                        parity_count
+                    )));
+                }
+                if data_count == 0 {
+                    return Err(BlobError::Decode(
+                        "StripeBlock(Replicated) has no data chunks".to_owned(),
+                    ));
+                }
+            }
+            super::blob_ref::Encoding::ReedSolomon { k, m } => {
+                if data_count != k as usize || parity_count != m as usize {
+                    return Err(BlobError::Decode(format!(
+                        "StripeBlock(RS k={}, m={}) has {} data + {} parity; expected {} + {}",
+                        k, m, data_count, parity_count, k, m
+                    )));
+                }
+                // Data chunks must precede parity in the encoded
+                // order (positional invariant the fetch path relies
+                // on for stripe-relative chunk addressing).
+                for (i, c) in self.chunks.iter().enumerate() {
+                    if i < k as usize && !c.is_data() {
+                        return Err(BlobError::Decode(format!(
+                            "StripeBlock(RS): chunk at position {} should be Data, got Parity",
+                            i
+                        )));
+                    }
+                    if i >= k as usize && !c.is_parity() {
+                        return Err(BlobError::Decode(format!(
+                            "StripeBlock(RS): chunk at position {} should be Parity, got Data",
+                            i
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A node in the manifest tree. Stored as a v0.15
 /// [`BlobRef::Small`](super::blob_ref::BlobRef::Small) at
 /// `dataforts/blob/<hex32>` — same channel naming + GC lifecycle
@@ -316,11 +408,28 @@ pub enum TreeNode {
         children: Vec<([u8; 32], u64)>,
     },
     /// Leaf node — carries the actual chunk references that the
-    /// fetch path resolves into bytes.
+    /// fetch path resolves into bytes. Used by Replicated-encoded
+    /// blobs (Phase A + B).
     Leaf {
         /// Chunk references in byte-order. Position N corresponds
         /// to the byte range starting at `sum(chunks[0..N].size)`.
         chunks: Vec<ChunkRefV3>,
+    },
+    /// Erasure-coded leaf — one or more Reed-Solomon stripes.
+    /// Used by [`Encoding::ReedSolomon`](super::blob_ref::Encoding::ReedSolomon)
+    /// blobs (Phase C). Postcard variant discriminant 2 (Internal
+    /// is 0, Leaf is 1, ErasureLeaf is 2) — additive to the wire
+    /// format, so Phase A/B readers cleanly fail decode on a
+    /// Phase C ErasureLeaf rather than silently mis-interpreting
+    /// it.
+    ErasureLeaf {
+        /// Stripes in covered-byte order. Stripe N covers bytes
+        /// `sum(stripes[0..N].covered_bytes())..sum(stripes[0..=N].covered_bytes())`.
+        /// Each stripe carries its own [`Encoding`](super::blob_ref::Encoding)
+        /// so the small-stripe fallback (trailing partial stripe
+        /// below `RS_STRIPE_MIN_BYTES`) can mix Replicated stripes
+        /// with RS stripes inside one leaf.
+        stripes: Vec<StripeBlock>,
     },
 }
 
@@ -339,6 +448,16 @@ impl TreeNode {
     /// invariants at construction.
     pub fn leaf(chunks: Vec<ChunkRefV3>) -> Result<Self, BlobError> {
         let node = TreeNode::Leaf { chunks };
+        node.validate()?;
+        Ok(node)
+    }
+
+    /// Construct an [`ErasureLeaf`](TreeNode::ErasureLeaf) from
+    /// [`StripeBlock`] entries. Validates per-stripe invariants
+    /// plus the leaf-level fanout cap (sum of stripe chunk counts
+    /// ≤ [`TREE_FANOUT`]).
+    pub fn erasure_leaf(stripes: Vec<StripeBlock>) -> Result<Self, BlobError> {
+        let node = TreeNode::ErasureLeaf { stripes };
         node.validate()?;
         Ok(node)
     }
@@ -416,6 +535,40 @@ impl TreeNode {
                 }
                 let _ = sum; // future cross-check vs BlobRef::Tree::total_size.
             }
+            TreeNode::ErasureLeaf { stripes } => {
+                if stripes.is_empty() {
+                    return Err(BlobError::Decode(
+                        "TreeNode::ErasureLeaf must have at least one stripe".to_owned(),
+                    ));
+                }
+                let mut chunk_total: usize = 0;
+                for (i, stripe) in stripes.iter().enumerate() {
+                    stripe.validate().map_err(|e| {
+                        BlobError::Decode(format!("stripe {}: {}", i, e))
+                    })?;
+                    chunk_total = chunk_total.saturating_add(stripe.chunks.len());
+                    for (j, chunk) in stripe.chunks.iter().enumerate() {
+                        if chunk.size == 0 {
+                            return Err(BlobError::Decode(format!(
+                                "TreeNode::ErasureLeaf stripe {} chunk {} has zero size",
+                                i, j
+                            )));
+                        }
+                        if (chunk.size as u64) > TREE_LEAF_CHUNK_MAX_BYTES {
+                            return Err(BlobError::Decode(format!(
+                                "TreeNode::ErasureLeaf stripe {} chunk {} size {} exceeds cap {}",
+                                i, j, chunk.size, TREE_LEAF_CHUNK_MAX_BYTES
+                            )));
+                        }
+                    }
+                }
+                if chunk_total > TREE_FANOUT {
+                    return Err(BlobError::Decode(format!(
+                        "TreeNode::ErasureLeaf total chunk count {} exceeds fanout cap {}",
+                        chunk_total, TREE_FANOUT
+                    )));
+                }
+            }
             TreeNode::Leaf { chunks } => {
                 if chunks.is_empty() {
                     return Err(BlobError::Decode(
@@ -464,6 +617,9 @@ impl TreeNode {
     /// the parent's `subtree_size` entry.
     pub fn covered_bytes(&self) -> u64 {
         match self {
+            TreeNode::ErasureLeaf { stripes } => {
+                stripes.iter().map(|s| s.covered_bytes()).sum::<u64>()
+            }
             TreeNode::Internal { children } => {
                 children.iter().map(|(_, sz)| *sz).sum::<u64>()
             }
@@ -477,7 +633,15 @@ impl TreeNode {
         match self {
             TreeNode::Internal { children } => children.len(),
             TreeNode::Leaf { chunks } => chunks.len(),
+            TreeNode::ErasureLeaf { stripes } => {
+                stripes.iter().map(|s| s.chunks.len()).sum()
+            }
         }
+    }
+
+    /// `true` if this is an erasure-coded leaf (Phase C RS path).
+    pub fn is_erasure_leaf(&self) -> bool {
+        matches!(self, TreeNode::ErasureLeaf { .. })
     }
 }
 
@@ -626,6 +790,41 @@ impl TreeBuilder {
 
         // Leaf is full. Close + cascade.
         self.close_leaf_and_cascade()
+    }
+
+    /// Inject a pre-built leaf into the internal-cascade. Used
+    /// by the v0.3 Phase C Reed-Solomon path: the RS store flow
+    /// produces [`TreeNode::ErasureLeaf`] nodes outside the
+    /// builder's chunk-driven flow, and this entry point lifts
+    /// them into the same internal hierarchy `push_chunk` builds.
+    ///
+    /// `leaf_hash` MUST be the BLAKE3 of `leaf_bytes` and
+    /// `leaf_covered_bytes` MUST be the leaf's `covered_bytes()`
+    /// — the caller (the RS striper consumer) is responsible for
+    /// supplying coherent values. The builder appends a
+    /// [`ClosedNode`] for the leaf itself (level 0) followed by
+    /// any internal nodes the cascade closes.
+    ///
+    /// The builder's `chunk_count` is bumped by `synthetic_chunks`
+    /// — pass the number of logical data chunks the leaf covers
+    /// so [`Self::chunk_count`] reports a meaningful figure for
+    /// the RS path's [`Self::finalize`] non-empty check.
+    pub fn push_prebuilt_leaf(
+        &mut self,
+        leaf_hash: [u8; 32],
+        leaf_bytes: Vec<u8>,
+        leaf_covered_bytes: u64,
+        synthetic_chunks: u64,
+    ) -> Result<Vec<ClosedNode>, BlobError> {
+        self.total_bytes = self.total_bytes.saturating_add(leaf_covered_bytes);
+        self.chunk_count = self.chunk_count.saturating_add(synthetic_chunks);
+        let mut emitted = vec![ClosedNode {
+            hash: leaf_hash,
+            bytes: leaf_bytes,
+            level: 0,
+        }];
+        self.lift_into_internal(0, leaf_hash, leaf_covered_bytes, &mut emitted)?;
+        Ok(emitted)
     }
 
     /// Internal: close the open leaf builder (assumed full or
@@ -983,6 +1182,7 @@ mod tests {
         match decoded {
             TreeNode::Internal { children: c } => assert_eq!(c, children),
             TreeNode::Leaf { .. } => panic!("expected Internal"),
+            TreeNode::ErasureLeaf { .. } => panic!("expected Internal"),
         }
     }
 

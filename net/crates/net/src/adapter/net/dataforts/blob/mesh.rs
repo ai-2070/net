@@ -980,14 +980,13 @@ impl MeshBlobAdapter {
         encoding: Encoding,
         chunking: ChunkingStrategy,
     ) -> Result<BlobRef, BlobError> {
-        // Reed-Solomon encoding lands in Phase C with the striper.
-        // v0.3a/B accept only Replicated.
-        if !matches!(encoding, Encoding::Replicated) {
-            return Err(BlobError::Backend(format!(
-                "store_stream_tree: encoding {:?} is reserved for Phase C; \
-                 v0.3 accepts only Encoding::Replicated",
-                encoding
-            )));
+        // Reed-Solomon encoding ships in Phase C: dispatch into
+        // the striper-driven write path. Other encodings remain
+        // Replicated (Phase A/B).
+        if let Some(rs_params) = super::erasure::RsParams::from_encoding(encoding) {
+            return self
+                .store_stream_tree_rs_internal(stream, chunking, rs_params)
+                .await;
         }
         match chunking {
             ChunkingStrategy::Fixed { size } => {
@@ -1164,6 +1163,212 @@ impl MeshBlobAdapter {
         }
         self.store_chunk(&output.root_hash, &output.root_bytes)
             .await?;
+
+        BlobRef::tree(
+            format!("mesh://{}", super::hex32(&output.root_hash)),
+            encoding,
+            output.root_hash,
+            output.total_bytes,
+            output.root_depth,
+        )
+    }
+
+    /// Reed-Solomon Tree store. Drives the chunker (Fixed or CDC)
+    /// to produce data chunks, feeds them through an
+    /// [`RsStriper`](super::erasure::RsStriper) that closes
+    /// stripes at exactly `k` chunks (the v0.3 Phase C2
+    /// simplification — the trailing partial stripe falls back to
+    /// [`Encoding::Replicated`] regardless of size). Each closed
+    /// stripe becomes one [`TreeNode::ErasureLeaf`] containing a
+    /// single [`StripeBlock`]; the leaves cascade upward through
+    /// [`TreeBuilder::push_prebuilt_leaf`] using the same internal-
+    /// node hierarchy the Replicated path builds.
+    ///
+    /// Fetch path: `walk_tree_range` handles `ErasureLeaf` by
+    /// fetching the data chunks of each overlapping stripe. Phase
+    /// C2 ships the *happy path* — every data chunk must be
+    /// present. Reconstruction from parity on a missing-data-chunk
+    /// fetch failure lands in Phase C5.
+    ///
+    /// Not part of the supported public API — `pub` so the future
+    /// Phase C9 conformance integration test can drive RS at
+    /// memory-feasible scale.
+    #[doc(hidden)]
+    pub async fn store_stream_tree_rs_internal(
+        &self,
+        mut stream: BlobByteStream,
+        chunking: ChunkingStrategy,
+        rs_params: super::erasure::RsParams,
+    ) -> Result<BlobRef, BlobError> {
+        use futures::StreamExt;
+
+        rs_params.validate()?;
+        let mut striper = super::erasure::RsStriper::new(rs_params)?;
+        let mut builder = TreeBuilder::new();
+        let mut data_chunk_count: u64 = 0;
+        let encoding = Encoding::ReedSolomon {
+            k: rs_params.k,
+            m: rs_params.m,
+        };
+
+        // Helper: persist one ClosedStripe — store parity chunks,
+        // encode the ErasureLeaf, persist the leaf, lift the leaf
+        // into the tree builder. Bumps `data_chunk_count` by the
+        // stripe's data chunks (used for builder bookkeeping +
+        // finalize non-empty check).
+        async fn flush_stripe(
+            adapter: &MeshBlobAdapter,
+            closed: super::erasure::ClosedStripe,
+            builder: &mut TreeBuilder,
+            data_chunk_count: &mut u64,
+        ) -> Result<(), BlobError> {
+            // Persist parity bytes (data chunks were already
+            // persisted via emit_tree_chunk before being pushed
+            // into the striper).
+            let parity_iter = closed
+                .block
+                .chunks
+                .iter()
+                .filter(|c| c.is_parity());
+            for (p_ref, p_bytes) in parity_iter.zip(closed.parity_bytes.iter()) {
+                adapter.store_chunk(&p_ref.hash, p_bytes).await?;
+            }
+            let data_count = closed
+                .block
+                .chunks
+                .iter()
+                .filter(|c| c.is_data())
+                .count() as u64;
+            *data_chunk_count = data_chunk_count.saturating_add(data_count);
+
+            // Build the ErasureLeaf, persist as a Small blob.
+            let leaf = super::blob_tree::TreeNode::erasure_leaf(vec![closed.block])?;
+            let leaf_bytes = leaf.encode()?;
+            let leaf_hash: [u8; 32] = blake3::hash(&leaf_bytes).into();
+            let leaf_size = leaf.covered_bytes();
+            // Persist the leaf as a tree-node chunk (same channel
+            // shape as data chunks).
+            adapter.store_chunk(&leaf_hash, &leaf_bytes).await?;
+            // Lift into the internal-cascade builder. The
+            // emitted nodes (the leaf itself + any internal
+            // closures) are returned but the leaf bytes we
+            // already persisted; internals get persisted in
+            // finalize via output.trailing_nodes.
+            let emitted = builder.push_prebuilt_leaf(
+                leaf_hash, leaf_bytes, leaf_size, data_count,
+            )?;
+            // Persist every internal-level closure (the leaf
+            // emission at level 0 is already stored; only the
+            // level > 0 internals need separate persistence).
+            for node in &emitted {
+                if node.level > 0 {
+                    adapter.store_chunk(&node.hash, &node.bytes).await?;
+                }
+            }
+            Ok(())
+        }
+
+        // Run the chunker per the user's strategy and feed every
+        // produced data chunk through the striper.
+        match chunking {
+            ChunkingStrategy::Fixed { size } => {
+                let chunk_size_usize = size as usize;
+                if chunk_size_usize == 0 {
+                    return Err(BlobError::Backend(
+                        "store_stream_tree_rs_internal: Fixed chunk size must be > 0".to_owned(),
+                    ));
+                }
+                let mut buffer: Vec<u8> = Vec::with_capacity(chunk_size_usize);
+                while let Some(maybe) = stream.next().await {
+                    let bytes = maybe?;
+                    let mut remaining: &[u8] = bytes.as_ref();
+                    while !remaining.is_empty() {
+                        let needed = chunk_size_usize - buffer.len();
+                        let take = needed.min(remaining.len());
+                        buffer.extend_from_slice(&remaining[..take]);
+                        remaining = &remaining[take..];
+                        if buffer.len() == chunk_size_usize {
+                            let chunk_bytes = std::mem::replace(
+                                &mut buffer,
+                                Vec::with_capacity(chunk_size_usize),
+                            );
+                            let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
+                            self.store_chunk(&chunk_hash, &chunk_bytes).await?;
+                            let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
+                            if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
+                                flush_stripe(
+                                    self, closed, &mut builder, &mut data_chunk_count,
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                }
+                if !buffer.is_empty() {
+                    let chunk_bytes = std::mem::take(&mut buffer);
+                    let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
+                    self.store_chunk(&chunk_hash, &chunk_bytes).await?;
+                    let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
+                    if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
+                        flush_stripe(
+                            self, closed, &mut builder, &mut data_chunk_count,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            ChunkingStrategy::Cdc { min, avg, max } => {
+                let params = super::cdc::CdcParams { min, avg, max };
+                params.validate()?;
+                let mut chunker = super::cdc::CdcStreamChunker::new(params);
+                while let Some(maybe) = stream.next().await {
+                    let bytes = maybe?;
+                    chunker.extend(bytes.as_ref());
+                    while let Some(chunk_bytes) = chunker.try_next_chunk() {
+                        let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
+                        self.store_chunk(&chunk_hash, &chunk_bytes).await?;
+                        let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
+                        if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
+                            flush_stripe(
+                                self, closed, &mut builder, &mut data_chunk_count,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                for chunk_bytes in chunker.finalize() {
+                    let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
+                    self.store_chunk(&chunk_hash, &chunk_bytes).await?;
+                    let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
+                    if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
+                        flush_stripe(
+                            self, closed, &mut builder, &mut data_chunk_count,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+
+        // End-of-stream: drain the striper. The trailing partial
+        // stripe (if any) emits as a Replicated stripe.
+        if let Some(closed) = striper.finalize()? {
+            flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
+        }
+
+        if data_chunk_count == 0 {
+            return Err(BlobError::Backend(
+                "store_stream_tree_rs_internal: empty stream; use BlobRef::Small for \
+                 zero-byte payloads"
+                    .to_owned(),
+            ));
+        }
+
+        let output = builder.finalize()?;
+        for node in &output.trailing_nodes {
+            self.store_chunk(&node.hash, &node.bytes).await?;
+        }
+        self.store_chunk(&output.root_hash, &output.root_bytes).await?;
 
         BlobRef::tree(
             format!("mesh://{}", super::hex32(&output.root_hash)),
@@ -1427,6 +1632,65 @@ impl MeshBlobAdapter {
                             })?;
                         out.extend_from_slice(slice);
                         touched.push(chunk.hash);
+                    }
+                    Ok(out)
+                }
+                super::blob_tree::TreeNode::ErasureLeaf { stripes } => {
+                    // Walk stripes in covered-byte order. For each
+                    // stripe overlapping the requested range, fetch
+                    // the data chunks (parity chunks are only used
+                    // when a data chunk is missing — that
+                    // reconstruction lands in v0.3 Phase C5).
+                    let mut out: Vec<u8> = Vec::new();
+                    let mut offset: u64 = 0;
+                    for stripe in stripes {
+                        let stripe_size = stripe.covered_bytes();
+                        let stripe_start = offset;
+                        let stripe_end = offset.saturating_add(stripe_size);
+                        offset = stripe_end;
+                        if stripe_end <= range_start || stripe_start >= range_end {
+                            continue;
+                        }
+                        // Iterate data chunks within the stripe.
+                        let mut local_offset: u64 = 0;
+                        for chunk in stripe.chunks.iter().filter(|c| c.is_data()) {
+                            let chunk_size_u64 = chunk.size as u64;
+                            let chunk_abs_start = stripe_start.saturating_add(local_offset);
+                            let chunk_abs_end = chunk_abs_start.saturating_add(chunk_size_u64);
+                            local_offset = local_offset.saturating_add(chunk_size_u64);
+                            if chunk_abs_end <= range_start || chunk_abs_start >= range_end {
+                                continue;
+                            }
+                            let sub_start = range_start.saturating_sub(chunk_abs_start);
+                            let sub_end = range_end
+                                .saturating_sub(chunk_abs_start)
+                                .min(chunk_size_u64);
+                            let chunk_bytes = self.fetch_chunk(&chunk.hash).await?;
+                            // RS data chunks are zero-padded on disk to
+                            // the post-padding shard size, but the
+                            // `ChunkRef::size` field carries the pre-
+                            // padding logical size. Slice only the
+                            // logical bytes — anything past
+                            // `chunk.size` on disk is padding.
+                            if (chunk_bytes.len() as u64) < chunk_size_u64 {
+                                return Err(BlobError::ShortChunk {
+                                    hash: chunk.hash,
+                                    requested_start: sub_start,
+                                    requested_end: sub_end,
+                                    actual_len: chunk_bytes.len() as u64,
+                                });
+                            }
+                            let slice = chunk_bytes
+                                .get(sub_start as usize..sub_end as usize)
+                                .ok_or(BlobError::ShortChunk {
+                                    hash: chunk.hash,
+                                    requested_start: sub_start,
+                                    requested_end: sub_end,
+                                    actual_len: chunk_bytes.len() as u64,
+                                })?;
+                            out.extend_from_slice(slice);
+                            touched.push(chunk.hash);
+                        }
                     }
                     Ok(out)
                 }
@@ -3581,20 +3845,67 @@ mod tests {
         );
     }
 
-    /// Reed-Solomon encoding is rejected (reserved for Phase C).
+    /// Reed-Solomon Tree round-trip via the test-internal RS
+    /// store: store a deterministic blob long enough to fill at
+    /// least one stripe, fetch the full range back, assert
+    /// byte-equality. Pins the Phase C2 happy-path encode +
+    /// decode (no reconstruction — all chunks present).
     #[tokio::test]
-    async fn store_stream_tree_rejects_reed_solomon_encoding() {
+    async fn store_stream_tree_rs_round_trips_when_all_chunks_present() {
         let adapter = make_adapter();
-        let bytes = deterministic_bytes(0x33, BLOB_CHUNK_SIZE_BYTES as usize);
-        let err = adapter
-            .store_stream_tree(
-                stream_one(bytes),
-                Encoding::ReedSolomon { k: 10, m: 4 },
-                ChunkingStrategy::default(),
+        // 4 KiB chunks × 6 = 24 KiB payload = 1 full RS(4,2)
+        // stripe + 2 trailing chunks (Replicated fallback).
+        let chunk_size: u32 = 4 * 1024;
+        let payload = deterministic_bytes(0xE0, chunk_size as usize * 6);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let blob_ref = adapter
+            .store_stream_tree_rs_internal(
+                stream_one(payload.clone()),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
             )
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("Phase C"), "got: {err}");
+            .expect("RS store_stream_tree round trip");
+        assert!(matches!(blob_ref, BlobRef::Tree { .. }));
+        assert_eq!(blob_ref.size(), payload.len() as u64);
+        let fetched = adapter
+            .fetch_range(&blob_ref, 0..payload.len() as u64)
+            .await
+            .expect("RS fetch_range");
+        assert_eq!(fetched, payload, "RS happy-path round-trip must be byte-identical");
+    }
+
+    /// RS storing the same content on two adapters lands on the
+    /// same root hash — determinism through the striper +
+    /// ErasureLeaf encoding.
+    #[tokio::test]
+    async fn store_stream_tree_rs_is_deterministic_across_adapters() {
+        let adapter_a = make_adapter();
+        let adapter_b = make_adapter();
+        let chunk_size: u32 = 4 * 1024;
+        let payload = deterministic_bytes(0xE1, chunk_size as usize * 8);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let r_a = adapter_a
+            .store_stream_tree_rs_internal(
+                stream_one(payload.clone()),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+        let r_b = adapter_b
+            .store_stream_tree_rs_internal(
+                stream_one(payload),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_a.tree_root_hash(),
+            r_b.tree_root_hash(),
+            "two independent RS stores of the same content must agree on the root hash"
+        );
     }
 
     /// Fixed strategy with a non-v0.2-compatible chunk size is
