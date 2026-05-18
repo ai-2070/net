@@ -7,6 +7,7 @@
 
 use dashmap::DashMap;
 use ed25519_dalek::Signature;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -648,6 +649,14 @@ pub struct TokenCache {
     /// [`TOKEN_CLOCK_SKEW_SECS_RECOMMENDED`] for the recommended
     /// value.
     clock_skew_secs: u64,
+    /// Set the first time a WILDCARD-scoped token is inserted.
+    /// [`Self::check`] consults this before falling through to
+    /// the wildcard slot — caches that never receive a wildcard
+    /// (the common case for most subjects) skip the second
+    /// `tokens.get` entirely on every miss. Monotonic: never
+    /// cleared; a wildcard later evicted by `evict_expired` just
+    /// means the fallback walks an empty slot, which is cheap.
+    wildcard_inserted: AtomicBool,
 }
 
 /// Per-issuer revocation floor. Bumping an issuer's floor invalidates
@@ -707,6 +716,7 @@ impl TokenCache {
             tokens: DashMap::new(),
             revocation: Arc::new(RevocationRegistry::new()),
             clock_skew_secs: 0,
+            wildcard_inserted: AtomicBool::new(false),
         }
     }
 
@@ -720,6 +730,7 @@ impl TokenCache {
             tokens: DashMap::new(),
             revocation: Arc::new(RevocationRegistry::new()),
             clock_skew_secs: skew_secs,
+            wildcard_inserted: AtomicBool::new(false),
         }
     }
 
@@ -733,6 +744,7 @@ impl TokenCache {
             tokens: DashMap::new(),
             revocation,
             clock_skew_secs: 0,
+            wildcard_inserted: AtomicBool::new(false),
         }
     }
 
@@ -789,12 +801,17 @@ impl TokenCache {
     /// still wins). `evict_expired` reclaims slots as tokens
     /// lapse, restoring admission.
     pub fn insert_unchecked(&self, token: PermissionToken) {
-        let slot_channel = if token.scope.contains(TokenScope::WILDCARD) {
-            0
-        } else {
-            token.channel_hash
-        };
+        let is_wildcard = token.scope.contains(TokenScope::WILDCARD);
+        let slot_channel = if is_wildcard { 0 } else { token.channel_hash };
         let key = (*token.subject.as_bytes(), slot_channel);
+        if is_wildcard {
+            // Latch the wildcard-present flag so `check` knows to
+            // walk the wildcard slot. Once set, never cleared:
+            // a subsequent eviction just means the fallback walks
+            // an empty slot, which is cheap.
+            self.wildcard_inserted
+                .store(true, AtomicOrdering::Relaxed);
+        }
 
         // Slot cap: only refuse NOVEL keys at the cap so existing
         // peers' token refreshes still work under flood pressure.
@@ -870,13 +887,21 @@ impl TokenCache {
                 return Ok(());
             }
         }
+        // Wildcard fast path: skip the second DashMap probe + iter
+        // when no wildcard token has ever been inserted in this
+        // cache. The common case (subject has only channel-bound
+        // tokens) returns NotAuthorized without ever touching the
+        // wildcard slot.
+        if !self.wildcard_inserted.load(AtomicOrdering::Relaxed) {
+            return Err(TokenError::NotAuthorized);
+        }
         // Try wildcard (channel_hash = 0)
         if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), 0)) {
             if slot
                 .value()
                 .iter()
                 .any(|t| {
-                    t.is_valid().is_ok()
+                    t.is_valid_with_skew(self.clock_skew_secs).is_ok()
                         && !self.revocation.is_revoked(t)
                         && t.subject.as_bytes() == subject.as_bytes()
                         && t.authorizes(action, channel_hash)
@@ -1661,6 +1686,69 @@ mod tests {
             ),
             "is_valid_with_skew must reject tokens past the future-skew window",
         );
+    }
+
+    /// Caches that never receive a WILDCARD token skip the
+    /// wildcard-slot fallback on `check` miss. The fast path is
+    /// observable via the public `len` / `check` API: insert a
+    /// channel-bound token, query for the wrong channel, and
+    /// confirm both the answer and (indirectly) that the
+    /// wildcard-slot probe was elided.
+    #[test]
+    fn check_skips_wildcard_slot_when_no_wildcard_ever_inserted() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let cache = TokenCache::new();
+
+        let token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0xAAAA,
+            3600,
+            0,
+        );
+        cache.insert(token).unwrap();
+
+        // Wrong channel: must NotAuthorize. Pre-fix this took the
+        // wildcard fallback path; post-fix it returns immediately
+        // after the exact-slot miss because no wildcard was ever
+        // inserted. Behaviour is identical (the slow path would
+        // also have miss-then-deny), but cost is one DashMap probe
+        // + iter cheaper.
+        assert!(cache
+            .check(subject.entity_id(), TokenScope::PUBLISH, 0xBBBB)
+            .is_err());
+    }
+
+    /// Once a wildcard token has been inserted, `check` always
+    /// walks the wildcard slot — the fast-path flag is set on
+    /// insert and never cleared, so a later eviction doesn't
+    /// disable the wildcard scan.
+    #[test]
+    fn check_walks_wildcard_slot_after_any_wildcard_insert() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let cache = TokenCache::new();
+
+        let wildcard = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH.union(TokenScope::WILDCARD),
+            0,
+            3600,
+            0,
+        );
+        cache.insert(wildcard).unwrap();
+
+        // The wildcard token authorizes every channel, so a check
+        // for any channel succeeds.
+        assert!(cache
+            .check(subject.entity_id(), TokenScope::PUBLISH, 0xDEAD)
+            .is_ok());
+        assert!(cache
+            .check(subject.entity_id(), TokenScope::PUBLISH, 0xBEEF)
+            .is_ok());
     }
 
     /// TokenCache::with_clock_skew applies the configured tolerance
