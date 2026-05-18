@@ -89,8 +89,17 @@ extern "C" {
  *            call_service / find_service_nodes / serve / serve
  *            handle plus streaming (call_streaming, stream_next,
  *            stream_grant, stream_close, stream_free) and
- *            cancellation tokens. */
-#define NET_RPC_ABI_VERSION 0x0001
+ *            cancellation tokens.
+ *   0x0002 — Phase 2 of NRPC_BINDINGS_PLAN: adds the client-
+ *            streaming caller-side surface
+ *            (net_rpc_call_client_stream, _client_stream_send,
+ *            _client_stream_finish, _client_stream_free,
+ *            _client_stream_call_id). Duplex caller surface and
+ *            both server-side handlers ship in follow-up commits.
+ *            ADDITIVE: every 0x0001 function keeps identical
+ *            signature + semantics, so a 0x0001 consumer compiled
+ *            against a 0x0002 library still works. */
+#define NET_RPC_ABI_VERSION 0x0002
 
 uint32_t net_rpc_abi_version(void);
 
@@ -110,9 +119,11 @@ uint32_t net_rpc_abi_version(void);
  * Opaque handle types
  * ========================================================================= */
 
-typedef struct MeshRpcHandle      MeshRpcHandle;
-typedef struct ServeHandleC       ServeHandleC;
-typedef struct RpcStreamHandleC   RpcStreamHandleC;
+typedef struct MeshRpcHandle              MeshRpcHandle;
+typedef struct ServeHandleC               ServeHandleC;
+typedef struct RpcStreamHandleC           RpcStreamHandleC;
+/* ABI 0x0002 — client-streaming caller-side handle. */
+typedef struct ClientStreamCallHandleC    ClientStreamCallHandleC;
 
 /* =========================================================================
  * Free helpers
@@ -490,6 +501,94 @@ void net_rpc_stream_close(RpcStreamHandleC* stream);
 /* Free the stream handle. Implicitly closes if not already
  * closed. Idempotent on NULL. */
 void net_rpc_stream_free(RpcStreamHandleC* stream);
+
+/* =========================================================================
+ * ABI 0x0002 — client-streaming caller-side surface (Phase B8-1).
+ *
+ * Lifecycle:
+ *   net_rpc_call_client_stream(...)            -> handle (JustOpened)
+ *   net_rpc_client_stream_send(handle, ...)    // 0..N times
+ *   net_rpc_client_stream_finish(handle, ...)  // consumes handle's call;
+ *                                              // returns terminal Resp body
+ *   net_rpc_client_stream_free(handle)         // idempotent
+ *
+ * The initial REQUEST does NOT fly until the first send (or
+ * finish for the zero-item degenerate path) — opening the call
+ * just allocates the reply subscription + pending entry. See
+ * net/crates/net/src/adapter/net/mesh_rpc.rs (Phase C glue) for
+ * the lazy-publish details.
+ * ========================================================================= */
+
+/* Direct-addressed client-streaming call. Constructs the
+ * underlying ClientStreamCallRaw via block_on (reply
+ * subscription setup; no REQUEST flies yet).
+ *
+ * request_window of 0 disables upload-direction flow control;
+ * non-zero installs an initial credit window equal to that value
+ * (CallOptions::request_window_initial).
+ *
+ * Returns:
+ *   - NET_RPC_OK; *out_handle is a fresh ClientStreamCallHandleC*.
+ *     Caller frees via net_rpc_client_stream_free.
+ *   - NET_RPC_ERR_NULL if handle is NULL.
+ *   - NET_RPC_ERR_INVALID_UTF8 if service_ptr is NULL or non-UTF-8.
+ *   - NET_RPC_ERR_CALL_FAILED on SDK error; *out_err is set. */
+int net_rpc_call_client_stream(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr,
+    size_t service_len,
+    uint64_t deadline_ms,
+    uint32_t request_window,
+    ClientStreamCallHandleC** out_handle,
+    char** out_err);
+
+/* Push one body chunk into the call. Encodes as the initial
+ * REQUEST (first call) or as a REQUEST_CHUNK (subsequent). Awaits
+ * one upload credit when flow control is opted in.
+ *
+ * Returns:
+ *   - NET_RPC_OK on success.
+ *   - NET_RPC_ERR_NULL on NULL handle.
+ *   - NET_RPC_ERR_STREAM_DONE if finish already consumed the
+ *     call, or if free latched it done.
+ *   - NET_RPC_ERR_CALL_FAILED on transport / credit-closed
+ *     errors; *out_err carries the diagnostic. */
+int net_rpc_client_stream_send(
+    ClientStreamCallHandleC* handle,
+    const uint8_t* body_ptr,
+    size_t body_len,
+    char** out_err);
+
+/* Close the upload direction (emits REQUEST_END) and await the
+ * server's terminal RESPONSE. Consumes the underlying call.
+ *
+ * On success the response body is written to *out_body_ptr /
+ * *out_body_len. Caller frees the buffer via net_rpc_response_free.
+ * *out_body_len == 0 is valid (handler returned empty body).
+ *
+ * Returns:
+ *   - NET_RPC_OK on success; *out_body_ptr / *out_body_len set.
+ *   - NET_RPC_ERR_NULL on NULL handle.
+ *   - NET_RPC_ERR_STREAM_DONE if finish was already called or
+ *     free latched it.
+ *   - NET_RPC_ERR_CALL_FAILED on any SDK error (deadline elapsed,
+ *     server returned non-Ok, transport failure); *out_err
+ *     carries the diagnostic. */
+int net_rpc_client_stream_finish(
+    ClientStreamCallHandleC* handle,
+    uint8_t** out_body_ptr,
+    size_t* out_body_len,
+    char** out_err);
+
+/* Diagnostic accessor — server-assigned call_id captured at
+ * construction. Returns 0 on NULL handle. */
+uint64_t net_rpc_client_stream_call_id(const ClientStreamCallHandleC* handle);
+
+/* Free the client-streaming call handle. Implicitly fires CANCEL
+ * via the SDK's Drop impl if finish hasn't completed. Idempotent
+ * on NULL. */
+void net_rpc_client_stream_free(ClientStreamCallHandleC* handle);
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -54,8 +54,8 @@ use net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
 use net::adapter::net::mesh_rpc::{
-    CallOptions as InnerCallOptions, RpcError as InnerRpcError, RpcStream as InnerRpcStream,
-    ServeHandle as InnerServeHandle,
+    CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
+    RpcError as InnerRpcError, RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
 };
 use net::adapter::net::MeshNode;
 
@@ -102,7 +102,16 @@ pub const NET_RPC_ERR_STREAM_DONE: c_int = -6;
 ///     `call_service` / `find_service_nodes` / `serve` plus
 ///     Phase B6 streaming (`call_streaming`, `stream_next`,
 ///     `stream_grant`, `stream_close`, `stream_free`).
-pub const NET_RPC_ABI_VERSION: u32 = 0x0001;
+///   - **0002** — Phase 2 of NRPC_BINDINGS_PLAN: adds the
+///     client-streaming caller-side surface
+///     (`net_rpc_call_client_stream`, `net_rpc_client_stream_send`,
+///     `net_rpc_client_stream_finish`, `net_rpc_client_stream_free`)
+///     plus the duplex caller-side surface in the follow-up
+///     commit. Server-side handlers for both shapes land
+///     separately. ADDITIVE — every 0x0001 function keeps
+///     identical signature + semantics, so a 0x0001 consumer
+///     compiled against a 0x0002 library still works.
+pub const NET_RPC_ABI_VERSION: u32 = 0x0002;
 
 /// Returns the current ABI version. Consumers SHOULD call this at
 /// init and compare against their expected value.
@@ -1316,6 +1325,248 @@ pub extern "C" fn net_rpc_stream_free(stream: *mut RpcStreamHandleC) {
 }
 
 // =========================================================================
+// ABI 0x0002 — Client-streaming caller-side surface (Phase B8-1).
+//
+// Mirrors `RpcStreamHandleC` shape: opaque handle wrapping an
+// `Option<ClientStreamCallRaw>` behind a `Mutex` so `send` /
+// `finish` can take ownership for state transitions. `done` is
+// latched separately so subsequent calls after finish/free
+// return clean error codes instead of panicking.
+//
+// Lifecycle:
+//   net_rpc_call_client_stream(...) -> handle (state JustOpened)
+//   net_rpc_client_stream_send(handle, ...)        // 0..N times
+//   net_rpc_client_stream_finish(handle, ...)      // consumes handle
+//                                                  // returns terminal Resp body
+//   net_rpc_client_stream_free(handle)             // idempotent
+// =========================================================================
+
+/// Opaque caller-side handle for a client-streaming call.
+///
+/// The inner `ClientStreamCallRaw` is held inside an `Option`
+/// behind a `Mutex` so the state machine (`JustOpened` → `Sending`
+/// → `Finishing` → `Done`) can be driven across multiple FFI
+/// calls without re-entry hazards. `finish` `take()`s the inner
+/// value permanently; subsequent `send` / `finish` calls observe
+/// `None` and return `NET_RPC_ERR_STREAM_DONE`.
+///
+/// `call_id` is captured at construction so `net_rpc_client_stream_call_id`
+/// doesn't need to lock the mutex. `done` is the same latch as
+/// `RpcStreamHandleC`: set on terminal observation OR explicit
+/// `free`, so a Go consumer can race a deferred-free with a
+/// stray send/finish cleanly.
+pub struct ClientStreamCallHandleC {
+    inner: Arc<Mutex<Option<InnerClientStreamCallRaw>>>,
+    call_id: u64,
+    done: AtomicBool,
+}
+
+/// Direct-addressed client-streaming call. Constructs the
+/// underlying `ClientStreamCallRaw` via `runtime.block_on` (which
+/// performs the reply-subscription setup; no REQUEST flies until
+/// the first `send` or `finish` — see `MeshNode::call_client_stream`).
+///
+/// `request_window` of `0` disables upload-direction flow control;
+/// non-zero installs an initial credit window via
+/// `CallOptions::request_window_initial`.
+///
+/// Returns:
+///   - `NET_RPC_OK` on success; `*out_handle` set to a fresh
+///     `ClientStreamCallHandleC*`. Caller frees via
+///     [`net_rpc_client_stream_free`].
+///   - `NET_RPC_ERR_NULL` if `handle` is NULL.
+///   - `NET_RPC_ERR_INVALID_UTF8` if `service` is NULL or non-UTF-8.
+///   - `NET_RPC_ERR_CALL_FAILED` on any SDK-level error; `*out_err`
+///     is set to a heap-allocated UTF-8 diagnostic.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_client_stream(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    deadline_ms: u64,
+    request_window: u32,
+    out_handle: *mut *mut ClientStreamCallHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if request_window > 0 {
+        opts.request_window_initial = Some(request_window);
+    }
+    let node = h.node.clone();
+    let result = runtime().block_on(async move {
+        node.call_client_stream(target_node_id, &service, opts).await
+    });
+    match result {
+        Ok(call) => {
+            let call_id = call.call_id();
+            let boxed = Box::new(ClientStreamCallHandleC {
+                inner: Arc::new(Mutex::new(Some(call))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_handle = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Push one body chunk into the client-streaming call. Encodes
+/// as the initial REQUEST (first call) or as a REQUEST_CHUNK
+/// (subsequent calls) — the underlying `ClientStreamCallRaw`
+/// handles the state transition. Awaits one upload credit when
+/// flow control is opted into.
+///
+/// Returns:
+///   - `NET_RPC_OK` on success.
+///   - `NET_RPC_ERR_NULL` on NULL handle.
+///   - `NET_RPC_ERR_STREAM_DONE` if `finish` already consumed
+///     the call, or if `free` has latched it done.
+///   - `NET_RPC_ERR_CALL_FAILED` on transport / credit-closed
+///     errors; `*out_err` carries the diagnostic.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_client_stream_send(
+    handle: *mut ClientStreamCallHandleC,
+    body_ptr: *const u8,
+    body_len: usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    // Take the inner call out across the await so a concurrent
+    // free() can race cleanly (same pattern as
+    // `net_rpc_stream_next`). After the await, restore the call
+    // for the next send unless finish/error consumed it.
+    let inner_opt = h.inner.lock().take();
+    let mut call = match inner_opt {
+        Some(c) => c,
+        None => {
+            h.done.store(true, Ordering::Relaxed);
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    let body = if body_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
+    };
+    let result = runtime().block_on(async { call.send(body).await });
+    match result {
+        Ok(()) => {
+            // Put the call back for the next send / finish.
+            *h.inner.lock() = Some(call);
+            NET_RPC_OK
+        }
+        Err(e) => {
+            // SDK-level error. Drop the call (CANCEL fires via
+            // `ClientStreamCallRaw::Drop` if the initial REQUEST
+            // already flew) and latch done.
+            drop(call);
+            h.done.store(true, Ordering::Relaxed);
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Close the upload direction (emits REQUEST_END) and await the
+/// server's terminal RESPONSE. Consumes the call.
+///
+/// On success, the response body is written to
+/// `(*out_body_ptr, *out_body_len)`. Caller frees the buffer via
+/// [`net_rpc_response_free`].
+///
+/// Returns:
+///   - `NET_RPC_OK` on success; `*out_body_ptr` / `*out_body_len`
+///     set; `*out_body_len == 0` is valid (handler returned an
+///     empty body).
+///   - `NET_RPC_ERR_NULL` on NULL handle.
+///   - `NET_RPC_ERR_STREAM_DONE` if `finish` was already called
+///     or `free` latched it.
+///   - `NET_RPC_ERR_CALL_FAILED` on any SDK error (deadline
+///     elapsed, server returned non-Ok, transport failure);
+///     `*out_err` carries the diagnostic.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_client_stream_finish(
+    handle: *mut ClientStreamCallHandleC,
+    out_body_ptr: *mut *mut u8,
+    out_body_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let inner_opt = h.inner.lock().take();
+    let call = match inner_opt {
+        Some(c) => c,
+        None => {
+            h.done.store(true, Ordering::Relaxed);
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    // Latch done BEFORE the await so concurrent sends/frees
+    // observe the latch promptly.
+    h.done.store(true, Ordering::Relaxed);
+    let result = runtime().block_on(async { call.finish().await });
+    match result {
+        Ok(reply) => {
+            write_response(reply.body.to_vec(), out_body_ptr, out_body_len);
+            NET_RPC_OK
+        }
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Diagnostic accessor: server-assigned `call_id` for this call.
+/// Returns `0` on NULL handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_client_stream_call_id(
+    handle: *const ClientStreamCallHandleC,
+) -> u64 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    h.call_id
+}
+
+/// Free the client-streaming call handle. Implicitly fires
+/// CANCEL via `ClientStreamCallRaw::Drop` if `finish` hasn't
+/// completed. Idempotent on NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_client_stream_free(handle: *mut ClientStreamCallHandleC) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle));
+    }
+}
+
+// =========================================================================
 // Header-bearing call variants (Phase 9b end-to-end).
 //
 // The legacy `net_rpc_call` / `_call_service` / `_call_streaming`
@@ -1751,7 +2002,83 @@ mod tests {
     #[test]
     fn abi_version_matches_constant() {
         assert_eq!(net_rpc_abi_version(), NET_RPC_ABI_VERSION);
-        assert_eq!(NET_RPC_ABI_VERSION, 0x0001);
+        // Phase B8-1 bumps to 0x0002 — adds client-streaming
+        // caller-side surface. Pin so a regression to 0x0001
+        // (or skipping ahead to 0x0003 without B8-2 landing)
+        // surfaces in tests.
+        assert_eq!(NET_RPC_ABI_VERSION, 0x0002);
+    }
+
+    /// `net_rpc_client_stream_send` on a NULL handle returns
+    /// `NET_RPC_ERR_NULL` without dereferencing — same safety
+    /// contract as every other handle-taking function.
+    #[test]
+    fn client_stream_send_on_null_handle_is_safe() {
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let body = b"x";
+        let code = net_rpc_client_stream_send(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            body.len(),
+            &mut err_ptr,
+        );
+        assert_eq!(code, NET_RPC_ERR_NULL);
+        assert!(err_ptr.is_null());
+    }
+
+    /// `net_rpc_client_stream_finish` on a NULL handle returns
+    /// `NET_RPC_ERR_NULL`; out-params untouched.
+    #[test]
+    fn client_stream_finish_on_null_handle_is_safe() {
+        let mut body_ptr: *mut u8 = std::ptr::null_mut();
+        let mut body_len: usize = 0;
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let code = net_rpc_client_stream_finish(
+            std::ptr::null_mut(),
+            &mut body_ptr,
+            &mut body_len,
+            &mut err_ptr,
+        );
+        assert_eq!(code, NET_RPC_ERR_NULL);
+        assert!(body_ptr.is_null());
+        assert_eq!(body_len, 0);
+        assert!(err_ptr.is_null());
+    }
+
+    /// `net_rpc_client_stream_call_id` on a NULL handle returns
+    /// `0` (matches the existing `_stream_call_id` convention —
+    /// `0` is a reserved no-call sentinel).
+    #[test]
+    fn client_stream_call_id_on_null_handle_returns_zero() {
+        assert_eq!(net_rpc_client_stream_call_id(std::ptr::null()), 0);
+    }
+
+    /// `net_rpc_client_stream_free` on NULL is a no-op (matches
+    /// every other free function's idempotency contract).
+    #[test]
+    fn client_stream_free_on_null_is_no_op() {
+        net_rpc_client_stream_free(std::ptr::null_mut());
+    }
+
+    /// Sends to an already-done handle (latched done by setting
+    /// the AtomicBool directly) return `NET_RPC_ERR_STREAM_DONE`
+    /// without touching the inner mutex. Pin: a stray `send`
+    /// after a successful `finish` is harmless, not UB.
+    #[test]
+    fn client_stream_send_after_done_returns_stream_done() {
+        let handle = Box::into_raw(Box::new(ClientStreamCallHandleC {
+            inner: Arc::new(Mutex::new(None)),
+            call_id: 42,
+            done: AtomicBool::new(true),
+        }));
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let body = b"x";
+        let code = unsafe {
+            net_rpc_client_stream_send(handle, body.as_ptr(), body.len(), &mut err_ptr)
+        };
+        assert_eq!(code, NET_RPC_ERR_STREAM_DONE);
+        assert!(err_ptr.is_null());
+        unsafe { net_rpc_client_stream_free(handle) };
     }
 
     /// `net_rpc_stream_next` on a `done`-latched handle returns
