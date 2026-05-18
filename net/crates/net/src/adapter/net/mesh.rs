@@ -368,7 +368,7 @@ struct DispatchCtx {
     /// `None` disables channel-level ACL checks (any caller accepted).
     channel_configs: Option<Arc<ChannelConfigRegistry>>,
     /// In-flight Subscribe/Unsubscribe requests awaiting an Ack, keyed by nonce.
-    pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
+    pending_membership_acks: Arc<DashMap<u64, (u64, oneshot::Sender<MembershipAck>)>>,
     /// In-flight reflex probes keyed by the responder's `node_id`.
     /// Populated by `MeshNode::probe_reflex`; the dispatch branch
     /// for `SUBPROTOCOL_REFLEX` completes the oneshot with the
@@ -1268,7 +1268,7 @@ pub struct MeshNode {
     /// are accepted — used by tests and by nodes that don't run channels.
     channel_configs: Option<Arc<ChannelConfigRegistry>>,
     /// In-flight Subscribe/Unsubscribe requests keyed by nonce.
-    pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
+    pending_membership_acks: Arc<DashMap<u64, (u64, oneshot::Sender<MembershipAck>)>>,
     /// In-flight reflex probes keyed by the responder's `node_id`.
     /// Shared with `DispatchCtx` via `Arc` clone so the dispatcher
     /// can complete oneshots without routing back through
@@ -4959,11 +4959,20 @@ impl MeshNode {
             peer.addr
         };
 
-        let nonce = {
-            use std::sync::atomic::AtomicU64;
-            static COUNTER: AtomicU64 = AtomicU64::new(1);
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        };
+        // Random nonces: a process-global sequential counter lets
+        // any session peer that observes one nonce predict the next
+        // ones and ship spoofed `Ack{nonce: N+k, accepted: false}`
+        // frames at small offsets, satisfying a victim's in-flight
+        // Subscribe/Unsubscribe with a forged denial. random u64
+        // has 2^-64 collision probability per call and is
+        // unguessable from another session.
+        let mut nonce_bytes = [0u8; 8];
+        if let Err(e) = getrandom::fill(&mut nonce_bytes) {
+            return Err(AdapterError::Connection(format!(
+                "membership nonce generation failed: {e}"
+            )));
+        }
+        let nonce = u64::from_le_bytes(nonce_bytes);
         let msg = if subscribe {
             MembershipMsg::Subscribe {
                 channel: channel.clone(),
@@ -4980,7 +4989,10 @@ impl MeshNode {
         let bytes = membership::encode(&msg);
 
         let (tx, rx) = oneshot::channel::<MembershipAck>();
-        self.pending_membership_acks.insert(nonce, tx);
+        // Bind to publisher_node_id — the node we're sending the
+        // Subscribe/Unsubscribe to is the only legitimate Ack source.
+        self.pending_membership_acks
+            .insert(nonce, (publisher_node_id, tx));
 
         // Scoped send; if it fails, drop the pending entry so memory
         // doesn't accumulate.
@@ -5090,8 +5102,23 @@ impl MeshNode {
                 accepted,
                 reason,
             } => {
-                if let Some((_, tx)) = ctx.pending_membership_acks.remove(&nonce) {
+                // Peer-auth gate. The pending entry records the
+                // publisher we sent Subscribe/Unsubscribe to —
+                // only that node is authorized to ack. Without
+                // this check, any session peer that guessed the
+                // nonce (sequential, before this fix) could ship
+                // a forged Ack.
+                let took = ctx
+                    .pending_membership_acks
+                    .remove_if(&nonce, |_, (expected, _)| *expected == from_node);
+                if let Some((_, (_expected, tx))) = took {
                     let _ = tx.send(MembershipAck { accepted, reason });
+                } else if ctx.pending_membership_acks.contains_key(&nonce) {
+                    tracing::trace!(
+                        nonce,
+                        from = from_node,
+                        "membership ack from non-publisher session peer; dropping"
+                    );
                 } else {
                     tracing::debug!(
                         nonce,

@@ -572,7 +572,7 @@ can act for/about a different node than itself.
 
 ### Medium
 
-#### S-3 — `MembershipMsg::Ack` correlates on nonce alone; sequential nonces let any session peer spoof Subscribe/Unsubscribe responses
+#### S-3 — `MembershipMsg::Ack` correlates on nonce alone; sequential nonces let any session peer spoof Subscribe/Unsubscribe responses — **Landed**
 - **File:** `src/adapter/net/mesh.rs:5028-5041` (Ack arm); nonce generation at `:4902-4906`
 - **What:** Ack is correlated by `ctx.pending_membership_acks.remove(&nonce)` — keyed on `u64` nonce only, not `(nonce, from_node)`. Combined with the nonce generator at `:4902-4906`:
   ```rust
@@ -582,7 +582,7 @@ can act for/about a different node than itself.
   Nonces are a process-global monotonically increasing u64 starting at 1. A peer that establishes a session and triggers its own Subscribe observes its issued nonce, then knows the next-issued nonces will be sequential. Any session peer can send a spoofed `Ack{nonce: N+k, accepted: false, reason: Unauthorized}` for a small `k` to satisfy a victim's in-flight `Subscribe`/`Unsubscribe` request issued from the same process.
 - **Trigger / Attack:** Attacker establishes a session, issues a Subscribe (observes nonce `N`), then sends `Ack{nonce: N+1, accepted: false}` repeatedly at small offsets. Any local-process subscribe that issues near that window receives the spoofed denial and reports a false "Unauthorized" to its caller. Cannot grant unauthorized subscribe (the Subscribe arm path runs `authorize_subscribe`, which the attacker cannot influence); the bug is a DoS / fault-injection primitive against in-flight membership flows.
 - **Severity choice:** Medium rather than high because the attacker cannot grant access — the bug is a one-way denial primitive. Sequential nonces make it cheaply reachable from any session peer, which is why it isn't low.
-- **Fix sketch:** Store `(nonce, expected_responder_node)` tuples in `pending_membership_acks`; verify `from_node == expected_responder` before completing the oneshot. The expected responder is known at insert time (it's the same node the Subscribe is being sent to). Independently, use `rand::random::<u64>()` for nonces — sequential u64s are wrong for any cross-peer correlation primitive.
+- **Fix:** `pending_membership_acks` value extended to `(expected_responder, sender)`. The Subscribe/Unsubscribe issue site at `mesh.rs:4983` stores `publisher_node_id` (the node we sent the request to) as the expected responder. The dispatch arm uses `remove_if` guarded by `expected == from_node` — non-publisher session peers' acks drop with a trace log. Independently, nonces now come from `getrandom::fill` (8 random bytes → u64 LE) instead of the process-global sequential `AtomicU64::new(1)`; failure of the entropy source surfaces as `AdapterError::Connection`. Both halves are necessary: peer-binding alone closes the spoof; random nonces also remove the "observe one nonce, predict the next K" predictability of the pre-fix counter.
 
 ### Verified clean
 
