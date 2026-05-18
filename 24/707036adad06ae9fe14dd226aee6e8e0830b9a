@@ -1,0 +1,28 @@
+net/crates/net/sdk-ts/src/identity.ts
+  s_aa8bb6e2c88c9e::t_80bab93e94c219 190
+  s_aa8bb6e2c88c9e::t_822981c9bead0b 142,147
+  s_aa8bb6e2c88c9e::t_43e81e09a2ff73 221-222
+  s_aa8bb6e2c88c9e::t_71e4d14ea6b432 333-336,338
+net/crates/net/sdk-ts/tsconfig.json
+  s_aa8bb6e2c88c9e::t_cd6c3bf4432559 6
+net/crates/net/sdk-ts/test/identity.test.ts
+  s_aa8bb6e2c88c9e::t_e2c65feb87746a 57,59-60
+net/crates/net/sdk-ts/README.md
+  s_aa8bb6e2c88c9e::t_5e9c52504d6729 1033-1034,1037-1040
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "24707036adad06ae9fe14dd226aee6e8e0830b9a",
+  "prompts": {},
+  "sessions": {
+    "s_aa8bb6e2c88c9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca10d5dd-94e1-4d8f-9817-203af9485b88",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
