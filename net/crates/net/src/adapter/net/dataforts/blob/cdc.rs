@@ -43,6 +43,123 @@ use fastcdc::v2020::{FastCDC, Normalization};
 use super::blob_tree::ChunkingStrategy;
 use super::error::BlobError;
 
+/// Capability tag advertised by nodes that support the v0.3
+/// Phase B content-defined-chunking store path
+/// ([`ChunkingStrategy::Cdc`]).
+///
+/// Independent of [`super::blob_tree::DATAFORTS_BLOB_TREE_SUPPORTED`]:
+/// a node that runs Phase A only (Tree + Fixed) advertises the
+/// Tree tag but NOT the CDC tag. Producers targeting a peer that
+/// advertises Tree but not CDC must pass
+/// [`ChunkingStrategy::Fixed`] to `store_stream_tree`; passing
+/// `Cdc` would either succeed locally and break when the peer
+/// later tries to chunk-walk the blob (no error, just silent
+/// dedup-pool fragmentation) or — on a v0.3 Phase A reader —
+/// succeed transparently since CDC chunks are wire-equivalent
+/// to Fixed chunks at the `ChunkRef` level.
+///
+/// The advertisement substrate ships independently of the blob
+/// layer; v0.3 Phase B declares the tag string and exposes a
+/// [`CdcSupportProbe`] hook so producers can wire the check
+/// without depending on a specific advertisement transport. The
+/// probe parallels [`super::blob_tree::TreeSupportProbe`] one-
+/// for-one.
+pub const DATAFORTS_BLOB_CDC_SUPPORTED: &str = "dataforts:blob-cdc-supported";
+
+/// Producer-side hook for the CDC downgrade decision.
+///
+/// Implementations decide whether a destination peer advertises
+/// [`DATAFORTS_BLOB_CDC_SUPPORTED`]. The default
+/// [`CdcSupportProbe::AlwaysSupported`] is correct for single-
+/// cluster all-Phase-B deployments;
+/// [`CdcSupportProbe::ForceFixed`] is correct for cross-version
+/// deployments where every publish must use Fixed chunking; the
+/// dynamic [`CdcSupportProbe::Dynamic`] arm lets callers wire
+/// the substrate's capability-tag advertisement once that
+/// surface lands.
+///
+/// Producers consult the probe BEFORE calling `store_stream_tree`
+/// with [`ChunkingStrategy::Cdc`] — on `false`, they substitute
+/// [`ChunkingStrategy::Fixed`] at
+/// [`super::blob_ref::BLOB_CHUNK_SIZE_BYTES`].
+pub enum CdcSupportProbe {
+    /// All targets support CDC. Default for single-cluster
+    /// all-Phase-B deployments.
+    AlwaysSupported,
+    /// No target supports CDC. Forces every publish to use Fixed
+    /// chunking. Useful during cluster-wide rollouts before
+    /// every node has been upgraded.
+    ForceFixed,
+    /// Dynamic check — call into a caller-supplied closure that
+    /// consults the capability-tag advertisement layer. The
+    /// boxed closure returns `true` iff the destination
+    /// advertises [`DATAFORTS_BLOB_CDC_SUPPORTED`].
+    Dynamic(Box<dyn Fn() -> bool + Send + Sync>),
+}
+
+impl CdcSupportProbe {
+    /// Evaluate the probe. Cheap for the static variants; invokes
+    /// the closure for `Dynamic`.
+    pub fn check(&self) -> bool {
+        match self {
+            CdcSupportProbe::AlwaysSupported => true,
+            CdcSupportProbe::ForceFixed => false,
+            CdcSupportProbe::Dynamic(f) => f(),
+        }
+    }
+}
+
+impl std::fmt::Debug for CdcSupportProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CdcSupportProbe::AlwaysSupported => f.write_str("CdcSupportProbe::AlwaysSupported"),
+            CdcSupportProbe::ForceFixed => f.write_str("CdcSupportProbe::ForceFixed"),
+            CdcSupportProbe::Dynamic(_) => f.write_str("CdcSupportProbe::Dynamic(..)"),
+        }
+    }
+}
+
+impl Default for CdcSupportProbe {
+    fn default() -> Self {
+        Self::AlwaysSupported
+    }
+}
+
+/// Producer-side downgrade helper: if `chunking` is
+/// [`ChunkingStrategy::Cdc`] and `probe.check()` returns `false`,
+/// substitute the v0.2-compatible
+/// [`ChunkingStrategy::Fixed`] at
+/// [`super::blob_ref::BLOB_CHUNK_SIZE_BYTES`]. Otherwise pass
+/// `chunking` through unchanged.
+///
+/// Composes with
+/// [`super::mesh::MeshBlobAdapter::publish_stream_with_downgrade`]
+/// — callers wire both the Tree probe (chooses Tree vs Manifest)
+/// and the CDC probe (chooses CDC vs Fixed within Tree) by
+/// calling this helper first:
+///
+/// ```ignore
+/// let chunking = cdc_downgrade(intended_chunking, &cdc_probe);
+/// adapter
+///     .publish_stream_with_downgrade(stream, encoding, chunking, size_hint, &tree_probe)
+///     .await?;
+/// ```
+///
+/// Keeping the downgrade out of the adapter method preserves the
+/// existing v0.3 Phase A6 signature; callers who don't care
+/// about CDC downgrade simply don't call this helper.
+pub fn cdc_downgrade(
+    chunking: ChunkingStrategy,
+    probe: &CdcSupportProbe,
+) -> ChunkingStrategy {
+    match chunking {
+        ChunkingStrategy::Cdc { .. } if !probe.check() => ChunkingStrategy::Fixed {
+            size: super::blob_ref::BLOB_CHUNK_SIZE_BYTES as u32,
+        },
+        other => other,
+    }
+}
+
 /// Producer-supplied CDC parameters: target average chunk size +
 /// hard min / max bounds. Matches the public
 /// [`ChunkingStrategy::Cdc`] variant; carried separately so the
@@ -429,6 +546,54 @@ mod tests {
         assert!(CdcParams { min: 4096, avg: 1024, max: 8192 }.validate().is_err());
         // production defaults pass
         assert!(PRODUCTION_CDC_PARAMS.validate().is_ok());
+    }
+
+    /// `CdcSupportProbe` evaluates to the expected boolean for
+    /// each static variant.
+    #[test]
+    fn cdc_support_probe_static_variants() {
+        assert!(CdcSupportProbe::AlwaysSupported.check());
+        assert!(!CdcSupportProbe::ForceFixed.check());
+        assert!(CdcSupportProbe::default().check()); // AlwaysSupported
+    }
+
+    /// `CdcSupportProbe::Dynamic` actually invokes the closure on
+    /// each `check()`, so caller-supplied dynamic state (a flag
+    /// flipped by the capability-tag substrate) propagates.
+    #[test]
+    fn cdc_support_probe_dynamic_consults_closure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let flag = Arc::new(AtomicBool::new(false));
+        let f = flag.clone();
+        let probe = CdcSupportProbe::Dynamic(Box::new(move || f.load(Ordering::Relaxed)));
+        assert!(!probe.check());
+        flag.store(true, Ordering::Relaxed);
+        assert!(probe.check());
+    }
+
+    /// `cdc_downgrade` substitutes `Fixed` when the probe rejects
+    /// CDC, passes `Cdc` through when accepted, and leaves
+    /// `Fixed` untouched in both probe arms.
+    #[test]
+    fn cdc_downgrade_substitutes_only_for_cdc_on_reject() {
+        let cdc = ChunkingStrategy::Cdc {
+            min: 1024 * 1024,
+            avg: 4 * 1024 * 1024,
+            max: 16 * 1024 * 1024,
+        };
+        let fixed = ChunkingStrategy::Fixed { size: 4 * 1024 * 1024 };
+        // Probe accepts: pass through unchanged.
+        assert_eq!(cdc_downgrade(cdc, &CdcSupportProbe::AlwaysSupported), cdc);
+        assert_eq!(cdc_downgrade(fixed, &CdcSupportProbe::AlwaysSupported), fixed);
+        // Probe rejects: CDC → Fixed-at-BLOB_CHUNK_SIZE_BYTES,
+        // Fixed → Fixed (unchanged).
+        let downgraded = cdc_downgrade(cdc, &CdcSupportProbe::ForceFixed);
+        assert_eq!(
+            downgraded,
+            ChunkingStrategy::Fixed { size: super::super::blob_ref::BLOB_CHUNK_SIZE_BYTES as u32 }
+        );
+        assert_eq!(cdc_downgrade(fixed, &CdcSupportProbe::ForceFixed), fixed);
     }
 
     /// Buffer never exceeds `max` bytes between confirmed cuts —
