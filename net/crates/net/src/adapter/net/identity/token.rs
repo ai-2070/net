@@ -481,14 +481,14 @@ impl PermissionToken {
     /// identical to the heap version (the existing callers'
     /// `&payload` still resolves to a `&[u8]`).
     /// Materialise the canonical byte payload the signature covers
-    /// (every field except the signature itself). Exposed publicly
-    /// so tools that need to re-sign a token after editing a field
-    /// — test harnesses, key-rotation flows, migration paths —
-    /// can do so without re-implementing the field-layout layout.
-    /// Production paths that mint tokens go through
-    /// [`Self::issue`] / [`Self::try_issue`] / [`Self::delegate`];
-    /// `signed_payload` is the lower-level primitive those use.
-    pub fn signed_payload(&self) -> [u8; Self::SIGNED_PAYLOAD_SIZE] {
+    /// (every field except the signature itself). `pub(crate)` so
+    /// only in-crate mint / verify paths can construct a transcript
+    /// for an arbitrary token; a `pub` surface would let any caller
+    /// holding a private key produce signed bytes the API otherwise
+    /// only ships via [`Self::issue`] / [`Self::try_issue`] /
+    /// [`Self::delegate`]. Test harnesses and key-rotation flows
+    /// stay in-crate (or use a `pub` wrapper that enforces invariants).
+    pub(crate) fn signed_payload(&self) -> [u8; Self::SIGNED_PAYLOAD_SIZE] {
         let mut buf = [0u8; Self::SIGNED_PAYLOAD_SIZE];
         let mut off = 0;
         buf[off..off + 32].copy_from_slice(self.issuer.as_bytes());
