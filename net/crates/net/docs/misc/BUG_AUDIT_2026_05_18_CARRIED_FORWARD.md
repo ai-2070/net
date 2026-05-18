@@ -891,157 +891,495 @@ coordinated rollout planning:
 | Heat emission ordering | D-17 | Refactor: split `HeatRegistry::tick` into candidate + commit; thread sink `Result` back through. Mirror in `BlobHeatRegistry`. Pure-internal but the test fixtures need updating. |
 | Cleanup wire change | R-30 | Drop `wall_clock_ms` from SyncHeartbeat (currently collected but never used). Pure wire-shrink; coordinate with the R-20..R-24 wire-version bump. |
 
-### Deferred — design-decision items
+### Locked design decisions
 
-Each needs a deliberate choice between competing options before the
-right code lands. Recommendations are based on the audit + existing
-test surface; the team should confirm before implementation.
+These items needed a deliberate choice between competing approaches.
+Decisions below are **locked** — implementation can proceed without
+re-litigation. Each entry records the chosen path, the rejected
+alternatives (so future readers can see why we didn't take them),
+and a concrete implementation plan.
+
+---
 
 #### R-31 — Coordinator state rollback on `* → Idle` sink failure
 
-Three options:
+**Decision: Option C — Document the divergence window + add a metric.**
 
-- **A. Roll back state on sink failure.** Breaks the existing
-  `tag_sink_failure_surfaces_but_state_mutated` test (which pins the
-  current behavior deliberately). New question: concurrent
-  transitions during the rollback window.
-- **B. Background retry queue tied to coordinator lifetime.** Breaks
-  the "Idle doesn't drive heartbeats" invariant. Requires a new
-  lifecycle owner for the retry task.
-- **C. Document the divergence window + add a metric.**
-  `divergence_window_total` counter; re-attempt the announce on the
-  next transition_to call; document the expected upper bound.
-  Accepts current behavior; makes it observable.
+The existing `tag_sink_failure_surfaces_but_state_mutated` test
+deliberately pins the fail-fast-at-sink-boundary semantic. The
+team chose that semantic; the operational visibility gap is the
+real fix surface, not the code path.
 
-**Recommendation: C.** The pinning test signals the team chose
-fail-fast at the sink boundary. The fix is operational visibility,
-not code.
+**Rejected: A (state rollback).** Breaks the pinning test and
+introduces a new failure mode — concurrent transitions during the
+rollback window become observable. The `transition_lock`
+serializes them, but the rollback's intermediate state is still a
+new race surface.
+
+**Rejected: B (background retry queue).** Breaks the "Idle doesn't
+drive heartbeats" invariant. Adds a new lifecycle owner (the
+retry task) that has to be tied to coordinator lifetime; the task's
+stop semantics on Drop are non-trivial.
+
+**Implementation plan:**
+
+1. Add `coordinator_announce_divergence_total: AtomicU64` to
+   `ReplicationMetricsAtomic` (sibling of `leader_changes_total`).
+   Increment from the failing `* → Idle` sink-call branch in
+   `transition_to`.
+2. In the same branch, emit a `tracing::warn!` with:
+   `daemon_origin`, `from_role`, `error`, and the literal text
+   `"coordinator state advanced to Idle but sink withdraw failed; \
+   advertised-vs-local divergence until next transition_to"`.
+3. On every successful `transition_to(_, target_role)` where
+   `from_role == Idle`, the upstream announce path naturally
+   re-aligns the cache — opportunistic recovery, no new code needed.
+4. In `docs/REDEX.md` (the operator-facing replication doc), add
+   a "Divergence between local role and advertised holder set"
+   subsection. State the upper-bound recovery time:
+   `divergence_until_next(transition_to) | cancel()`.
+5. Regression test:
+   `tag_sink_failure_bumps_divergence_counter` — install a sink
+   that returns `Err`, call `transition_to(Idle, GracefulRelinquish)`,
+   assert the counter incremented by 1 and the state cell IS
+   still `Idle` (preserves existing test invariant).
+6. Update the existing `tag_sink_failure_surfaces_but_state_mutated`
+   test's doc-comment to point at the new counter as the
+   observability surface.
+
+**Surface change:** new metric only; no behavior change.
+
+---
 
 #### D-3 — Symlink-swap window between canonicalize and rename
 
-Three options:
+**Decision: Option C — Document the threat model.**
 
-- **A. `rustix` + `openat2(... RESOLVE_BENEATH)`.** Linux 5.6+
-  only. Adds a build dep. Doesn't help on Windows or macOS.
-- **B. Cross-platform dev/inode verify around the rename.** Open
-  parent as `File`, read `metadata()` before/after, abort on
-  `dev`/`ino` mismatch. Windows needs `FILE_ID_INFO` via
-  `GetFileInformationByHandleEx`. More code; race narrows but
-  doesn't close (rename resolves `path` independently of the open
-  parent fd).
-- **C. Document the threat model.** "FS adapter assumes root dir
-  is not writable by non-substrate processes; enforce via
-  filesystem perms." Standard ops pattern: `chown` root to the
-  daemon user.
+The FS adapter's deployment story already requires exclusive root
+ownership in practice — the daemon process needs write access to
+the root, and the standard ops pattern is `chown <daemon-user>
+<root>` plus restrictive permissions. The symlink-swap attack
+assumes write access inside the root by a non-daemon process,
+which violates that contract.
 
-**Recommendation: C.** Deployment already requires exclusive root
-ownership in practice. Document the contract explicitly. Reach for
-A if cross-process write access becomes a real concern.
+**Rejected: A (`rustix` + `openat2`).** Linux 5.6+ only. Adds a
+build dep that's only effective on Linux. Doesn't help Windows or
+macOS deployments. If we eventually need this, it should be gated
+behind the documented threat model rather than offered as a
+catch-all.
+
+**Rejected: B (cross-platform dev/inode verify).** Narrows the
+race window but doesn't close it — `rename(tmp, path)` resolves
+`path` independently of the open parent fd. The added code
+complexity doesn't deliver the security property cleanly enough
+to justify it.
+
+**Implementation plan:**
+
+1. In `src/adapter/net/dataforts/blob/fs.rs`'s `FileSystemAdapter`
+   struct docstring, add a "**Threat model**" section stating:
+   - The adapter assumes the configured `root` directory is
+     writable only by the substrate process (and any process
+     running with the same uid).
+   - Cross-process write access inside `root` by a non-substrate
+     user enables the documented symlink-swap window between
+     canonicalize and rename.
+   - Operators MUST enforce the contract via filesystem
+     permissions: `chown <daemon-user> <root>` plus mode `0700`
+     (or equivalent ACL on Windows).
+2. Document the existing in-code defenses (parent-canonicalize
+   `starts_with(root)` + per-store hash-verify-on-rename-failure)
+   as defense-in-depth — they close the most-obvious paths but
+   are not a complete sandbox.
+3. Reference the umbrella audit's D-3 entry from the docstring so
+   a future review picks up the deliberate decision rather than
+   re-flagging.
+4. Cross-link from `docs/DATAFORTS.md`'s "Persistent backends"
+   section.
+5. If a deployment ever needs to host the root in a shared-scratch
+   environment, escalate to a follow-up project that adopts
+   `rustix::fs::openat2` behind a `unix-strict-sandbox` feature
+   flag.
+
+**Surface change:** none. Pure documentation.
+
+---
 
 #### X-13 — Failed placements retry on different-node recovery
 
-Four options:
+**Decision: Option C — Periodic tick from the meshos loop.**
 
-- **A. Extend `on_node_recovery` signature.** Add `&Scheduler` +
-  `&dyn Fn() -> Box<dyn MeshDaemon>`. Breaking change across all
-  callers; recovery logic at the right boundary.
-- **B. New `retry_failed_placements` per group.** Caller invokes.
-  Pure addition; no API break. Caller must know to call it.
-- **C. Periodic tick from meshos loop.** Meshos already owns the
-  reconcile tick; piggyback. Groups expose
-  `has_unhealthy_slots() -> bool` and `try_recover(scheduler)`.
-  Decouples timer from group type.
-- **D. Defer `mark_unhealthy` until after successful placement.**
-  Avoids stuck-unhealthy state but routes go to a dead daemon
-  during the placement attempt window.
+Meshos already owns the reconcile cadence and already has access
+to the scheduler registry. Decoupling the recovery timer from the
+group type itself keeps each group's API surface stable while
+landing the retry behavior in one place.
 
-**Recommendation: C.** Meshos loop already owns the recovery
-cadence; scheduler is available via SchedulerRegistry.
+**Rejected: A (extend `on_node_recovery` signature).** Breaking
+API change across every caller. Forces the scheduler + factory
+dependency into the recovery boundary even where it doesn't
+belong.
+
+**Rejected: B (new `retry_failed_placements` per group).** Pure
+addition but pushes the cadence question onto every caller. Most
+callers don't know when to call it, so it'd sit unused.
+
+**Rejected: D (defer `mark_unhealthy` until after placement).**
+Avoids the stuck-unhealthy state but introduces a worse failure
+mode — routes go to a known-dead daemon during the placement-
+attempt window. The current pre-mark-unhealthy ordering correctly
+quiesces the slot before the placement attempt; the bug is purely
+"recovery never retries," not "we shouldn't mark unhealthy."
+
+**Implementation plan:**
+
+1. Add a small trait in `src/adapter/net/compute/mod.rs`:
+   ```rust
+   pub trait UnhealthySlotRecovery: Send + Sync {
+       fn has_unhealthy_slots(&self) -> bool;
+       fn try_recover<F>(
+           &mut self,
+           scheduler: &Scheduler,
+           registry: &DaemonRegistry,
+           daemon_factory: F,
+       ) -> Vec<u8>
+       where
+           F: Fn() -> Box<dyn MeshDaemon>;
+   }
+   ```
+2. Implement for `ForkGroup`, `ReplicaGroup`, `StandbyGroup`.
+   Each impl walks its `coord.members()`, picks slots marked
+   `!healthy`, runs `place_with_spread` / `place_member` against
+   the current healthy node pool, and returns the recovered slot
+   indices.
+3. Add a registry on `MeshOsRuntime` for groups that opt in:
+   `pub fn register_group_for_recovery(&self, group: Arc<Mutex<dyn UnhealthySlotRecovery>>)`.
+   Stores in a `parking_lot::Mutex<Vec<Weak<...>>>` so dropped
+   groups are GC'd automatically on the next pass.
+4. In `event_loop.rs`'s tick handler (right after `gc_freeze`),
+   walk the recovery registry. For each live group with
+   unhealthy slots, call `try_recover` with the scheduler from
+   `SchedulerRegistry` and the daemon-factory from the group's
+   stored config.
+5. Cap the recovery work per tick (e.g. 4 slots / tick) so a
+   pathological "every slot unhealthy" state doesn't wedge the
+   loop. Continue on next tick.
+6. Regression tests (one per group type):
+   `<group>_recovers_failed_placement_after_different_node_comes_online`
+   — set up a 3-replica group, fail a node, observe the slot
+   stays unhealthy, bring a different spare online, drive one
+   reconcile tick, assert the slot is now healthy + placed on the
+   spare.
+
+**Surface change:** new trait + new opt-in registration. Existing
+callers that don't register get current behavior.
+
+---
 
 #### X-17 — Multi-chunk validation symmetry
 
-Three options:
+**Decision: Option C — Extract `validate_chunk_header(chunk, record)`
+helper.**
 
-- **A. Drop validation on single-chunk to match multi-chunk.**
-  Loses defense-in-depth; achieves symmetry by making the system
-  weaker.
-- **B. Reassemble at the orchestrator for multi-chunk.** Heavy.
-  Forces orchestrator-side buffering it deliberately doesn't do.
-- **C. Extract `validate_chunk_header(chunk, record)` helper.**
-  Validate per-chunk envelope (magic, version, source identity
-  claim) without needing full snapshot. Call on every chunk
-  regardless of count.
+The per-chunk envelope (magic, version, source identity claim)
+can be validated without forcing the orchestrator to reassemble
+the full snapshot. Calling the helper on every chunk regardless
+of count closes the asymmetry without breaking the orchestrator's
+streaming property.
 
-**Recommendation: C.** Per-chunk envelope is small; keeps
-streaming property while closing asymmetry. Composes with X-10.
+**Rejected: A (drop single-chunk validation).** Achieves symmetry
+by making the system weaker. Single-chunk corruption already
+catches at the orchestrator today; we shouldn't lose that just to
+match multi-chunk.
+
+**Rejected: B (orchestrator-side reassembly for multi-chunk).**
+Heavy. The orchestrator deliberately streams chunks; forcing
+buffering per in-flight migration changes its memory profile and
+introduces a new OOM surface.
+
+**Implementation plan:**
+
+1. Define `validate_chunk_header(chunk_bytes: &[u8], expected_daemon_origin: u64) -> Result<(), MigrationError>`
+   as a free function in `src/adapter/net/compute/orchestrator.rs`.
+   Validates:
+   - Snapshot magic byte at offset 0 (mirror of what
+     `StateSnapshot::from_bytes` does on the single-chunk path,
+     but without the postcard decode).
+   - Version byte at offset 1 matches `SNAPSHOT_VERSION`.
+   - Source-identity claim (`entity_id.origin_hash()` projection
+     bytes at the documented offset) matches
+     `expected_daemon_origin`.
+2. Call from `on_snapshot_ready` on every chunk:
+   - For `chunk_index == 0 && total_chunks == 1` (single-chunk
+     path), call before the full `StateSnapshot::from_bytes`
+     decode (the helper is strictly weaker than the full decode,
+     so a failure here fails faster).
+   - For multi-chunk paths, call on every chunk header before
+     `force_phase(Transfer)` / forwarding.
+3. On failure, return `MigrationError::StateFailed(format!(
+   "SnapshotReady chunk {} of {} failed header validation: {}",
+   ...))`.
+4. Regression test:
+   `on_snapshot_ready_rejects_multichunk_header_corruption` —
+   ship a 3-chunk SnapshotReady where chunk 0 has the wrong
+   magic byte; assert StateFailed at orchestrator, not deferred
+   to target reassembly.
+
+**Surface change:** new internal helper; on the failure path, a
+new orchestrator-side error variant message. Wire format
+unchanged.
+
+**Composes with X-10.** The `seq_through` cross-check landed for
+single-chunk in commit `640f160c` extends naturally — once
+multi-chunk has per-chunk header validation, the same
+`seq_through` field can be carried inside the chunk header and
+validated against `snapshot.through_seq` after reassembly.
+
+---
 
 #### X-20 — Delete dead `MigrationOrchestrator::buffer_event`
 
-Two options:
+**Decision: Option A — Delete the dead surface entirely.**
 
-- **A. Delete the dead surface entirely.** Removes
-  `MigrationOrchestrator::buffer_event`,
-  `MigrationState::{buffer_event, take_buffered_events, buffered_events}`,
-  `BufferOutcome` enum, and the tests that exercise them. Have
-  `on_restore_complete` ship an empty `BufferedEvents`. Significant
-  test churn; trip-wire is gone.
-- **B. Redirect to `source_handler.buffer_event`.** Preserves the
-  public API; eliminates duplicate-delivery by routing both
-  surfaces into one buffer.
+The dead surface IS the trip-wire. Keeping it (even redirected)
+preserves a misleading API shape that an SDK consumer reading
+the public API would wire up expecting symmetry with
+`source_handler.buffer_event`.
 
-**Recommendation: A.** The dead surface IS the trip-wire — keeping
-it (even redirected) preserves a misleading API shape.
+**Rejected: B (redirect to source_handler.buffer_event).**
+Preserves the public API but doesn't remove the conceptual
+trip-wire. A consumer who reads the orchestrator's docs and
+wires `orchestrator.buffer_event` still has a strictly worse
+mental model than one who reads `source_handler.buffer_event`
+directly. The API-stability argument doesn't apply because nobody
+in production calls this.
+
+**Implementation plan:**
+
+1. Delete from `src/adapter/net/compute/orchestrator.rs`:
+   - `pub fn MigrationOrchestrator::buffer_event` (line ~1605).
+   - `pub enum BufferOutcome` variants and the enum itself.
+2. Delete from `src/adapter/net/compute/migration.rs`'s
+   `MigrationState`:
+   - `pub buffered_events: Vec<CausalEvent>` field.
+   - `pub fn buffer_event(...)` method.
+   - `pub fn take_buffered_events(...)` method.
+   - `pub fn buffered_event_count(...)` method.
+3. Update `MigrationOrchestrator::on_restore_complete` (line
+   ~1414): instead of draining `record.state.buffered_events`,
+   return `Ok(None)` directly. Document that the
+   `BufferedEvents` wire message originates exclusively from
+   `MigrationSourceHandler::on_cutover` going forward.
+4. Update `list_migrations` to drop the `buffered_events: u32`
+   field on `MigrationListItem` (no production consumer reads
+   it; tests that assert against `buffered_events: 0` will be
+   updated alongside).
+5. Delete tests in `orchestrator.rs::tests`:
+   - `test_buffer_event_*` (every `orch.buffer_event(...)` call
+     site).
+   - `buffered_events_saturates_at_u32_max`.
+   - `buffer_event_distinguishes_post_cutover_from_no_migration`
+     (move the underlying assertion into
+     `source_handler.rs::tests` if it's not already pinned there).
+6. Audit the SDK / FFI bindings: `sdk-ts`, `sdk-py`, `bindings/`
+   for any wire-up that references `BufferOutcome` or the
+   removed methods. Should be zero (this is dead code), but
+   verify.
+7. Regression test: `on_restore_complete_ships_empty_buffered_events`
+   — pin that the only buffered-events source is now
+   `source_handler.on_cutover`.
+
+**Surface change:** breaking. `MigrationOrchestrator::buffer_event`,
+`BufferOutcome`, and the related `MigrationState` methods are
+removed. Document in the next version bump's CHANGELOG.
+
+---
 
 #### X-21 — LocalPreferred liveness in `Scheduler::place`
 
-Three options:
+**Decision: Option C — New `place_with_locality(filter, drained: bool)`
+method.**
 
-- **A. `local_drained: AtomicBool` on `Scheduler`.** Folds
-  lifecycle state into a stateless component.
-- **B. Pull from `MeshOsState::local_maintenance`.** Cross-layer
-  dep: scheduler depends on meshos types.
-- **C. New `place_with_locality(filter, drained: bool)` method.**
-  Caller supplies the answer. Scheduler stays stateless.
+`Scheduler` is positioned as a stateless capability-index helper.
+Folding node-lifecycle state into it is a layering violation; the
+caller (which knows about maintenance state, drain status, and
+process lifecycle) is the right place to supply the answer.
 
-**Recommendation: C.** Keeps layering clean — scheduler stays a
-capability-index helper; meshos loop (which knows about
-maintenance state) supplies the bit.
+**Rejected: A (`local_drained: AtomicBool` on Scheduler).**
+Schedulers across the codebase deliberately keep no lifecycle
+state. Adding this one field invites future creep (saturation
+levels, RTT cache, etc.) until the scheduler owns mutable
+node-state.
+
+**Rejected: B (pull from MeshOsState).** Cross-layer dependency
+in the wrong direction. Scheduler would have to depend on
+meshos types it currently has no awareness of.
+
+**Implementation plan:**
+
+1. In `src/adapter/net/compute/scheduler.rs`, add a new method:
+   ```rust
+   /// Like [`Self::place`], but with an explicit `local_drained`
+   /// signal. The LocalPreferred fast-path is gated on
+   /// `!local_drained` so a caller in mid-shutdown / operator-
+   /// drained state can route fresh placements off the local node.
+   pub fn place_with_locality(
+       &self,
+       filter: &CapabilityFilter,
+       local_drained: bool,
+   ) -> Result<PlacementDecision, SchedulerError> {
+       if !local_drained && self.can_run_locally(filter) {
+           return Ok(PlacementDecision {
+               node_id: self.local_node_id,
+               reason: PlacementReason::LocalPreferred,
+           });
+       }
+       // ... rest matches Self::place
+   }
+   ```
+2. Keep `Self::place` as a forwarder for backward compatibility:
+   `pub fn place(...) -> ... { self.place_with_locality(filter, false) }`.
+   The default (non-drained) preserves current behavior for
+   callers that don't know about drain state.
+3. In `src/adapter/net/behavior/meshos/reconcile.rs`'s
+   placement-issuing path, read `MeshOsState::local_maintenance`
+   and translate to a bool: `local_drained = matches!(local_maintenance,
+   MaintenanceState::EnteringMaintenance { .. } | Maintenance { .. } |
+   ExitingMaintenance { .. } | DrainFailed { .. })` (everything
+   except `Active` and `Recovery`).
+4. Have the reconcile-driven placement caller route through
+   `place_with_locality(filter, local_drained)`.
+5. Regression tests on `Scheduler`:
+   - `place_with_locality_skips_local_when_drained` — local has
+     matching caps, `local_drained == true`, decision routes to
+     a remote.
+   - `place_with_locality_picks_local_when_not_drained` —
+     baseline.
+   - `place_with_locality_returns_no_candidate_when_drained_and_no_remote`
+     — local drained + no remote candidates → SchedulerError::NoCandidate.
+
+**Surface change:** new public method; `Scheduler::place`
+forwarder preserves existing behavior. No breaks.
+
+---
 
 #### O-4 + O-5 — Audit-chain durability ordering
 
-Three options:
+**Decision (O-4, executor): Option C — accept the gap + surface a metric.**
 
-- **A. Pending+Outcome chain records.** Append `Pending` before
-  dispatch, `Outcome` after. Doubles chain volume; consumers
-  reconcile pairs.
-- **B. Ring-first then chain.** Push to ring, attempt chain
-  append, mark ring entry `chain_pending: bool` on failure. Chain
-  is durable subset; ring is immediate truth.
-- **C. Accept the gap + surface a metric.**
-  `audit_chain_append_failed_total` counter, document loudly.
+**Decision (O-5, audit/log loop): Option B — ring-first then chain,
+with `chain_pending` flag on failure.**
 
-**Recommendation:**
-- **O-4 (executor): C.** Dispatch happened; chain miss is a
-  bookkeeping gap, not a correctness gap. Surface the metric, log
-  loudly.
-- **O-5 (audit/log): B.** Ring is the immediate user surface,
-  chain is durability backup. Ring-first matches user expectation;
-  `chain_pending` makes the gap visible.
+The two surfaces have different invariants:
 
-#### O-9 — `gc_drain_window` 1-second hardcode (not a bug)
+- **O-4 (executor):** the dispatch already happened. A chain miss
+  is a record-keeping gap, not a correctness gap. The action ran;
+  the operator just doesn't have a chain record of it. Surface
+  the metric so the gap is observable.
+- **O-5 (audit/log loop):** the ring is the immediate user-visible
+  surface. Users read from the ring directly. The chain is
+  durability backup that consumers replay later. Ring-first
+  matches the user expectation and `chain_pending` lets chain
+  consumers distinguish "this entry never landed" from "this
+  entry didn't reach me yet."
 
-**Verified not a bug.** The 1-second window IS the natural
-denominator for `BackpressureConfig::drain_rate_per_zone_per_sec`.
-The rate is defined as "per second"; the window must match the
-definition. Changing the window requires redefining the rate
-semantic.
+**Rejected for both: A (Pending+Outcome chain records).** Doubles
+chain volume. Forces chain consumers to reconcile pending+outcome
+pairs. The complexity isn't justified by the failure mode.
 
-**Recommendation: Document, don't fix.** Code comment: "1-second
-window is by definition the denominator of
-`drain_rate_per_zone_per_sec`; the hardcode here matches the
-config field's name." If operator-tunable drain windows are ever
-wanted, add a separate `drain_window_duration: Duration` field
-rather than reinterpreting the existing rate.
+**Implementation plan — O-4 (executor):**
+
+1. In `src/adapter/net/behavior/meshos/executor.rs`, add
+   `chain_append_failures: AtomicU64` to `ExecutorStats`.
+2. In `ActionExecutor::handle_one_retry` (line ~470), where
+   `append_dispatched` is called and the result is currently
+   ignored via `let _ = append_dispatched(...)`:
+   - Capture the result.
+   - On `Err`: increment `chain_append_failures` and emit a
+     `tracing::warn!` with `action_id`, `error`, and the literal
+     `"executor: chain_append_failed; dispatch already succeeded \
+     — chain record missing for this action"`.
+3. Mirror at `:497`, `:502`, and `:518` (the other
+   `append_dispatched` / `append_failed` / `append_gated` sites).
+4. Expose via `ExecutorStatsSnapshot::chain_append_failures: u64`
+   so the Prometheus surface picks it up automatically.
+5. In `docs/MESHOS.md`'s "Operability" section, document the new
+   metric and what triggers it.
+6. Regression test:
+   `chain_append_failure_bumps_counter_but_dispatch_still_succeeds`
+   — install a chain appender that returns Err, dispatch a
+   successful action, assert (a) dispatch succeeded, (b) the
+   counter incremented, (c) the warn log fired.
+
+**Implementation plan — O-5 (audit/log loop):**
+
+1. In `src/adapter/net/behavior/meshos/ice.rs`, add
+   `chain_pending: bool` to `AdminAuditRecord`.
+2. In `src/adapter/net/behavior/meshos/logs.rs`, add
+   `chain_pending: bool` to `LogRecord`.
+3. In `src/adapter/net/behavior/meshos/event_loop.rs`'s
+   `record_admin_audit` (line ~1078) and `record_log_line`
+   (line ~1106):
+   - Push to the ring FIRST with `chain_pending: false`.
+   - Attempt chain append.
+   - On `Err`: re-read the just-pushed ring entry (it's the
+     newest, at `back()`) and set `chain_pending = true` so
+     consumers reading the ring see the gap.
+4. Update SDK consumers of these records (any FFI bindings,
+   `MeshOsSnapshot::admin_audit` reader path) to surface the
+   `chain_pending` field. Default `false` if absent in
+   serialization for backward compat.
+5. Update `MeshOsSnapshot` doc to say: "Entries with
+   `chain_pending: true` did not make it to the durable chain;
+   chain consumers replaying the chain after a restart will
+   miss them."
+6. Regression test:
+   `record_admin_audit_marks_chain_pending_on_append_failure`
+   — install an audit appender that returns Err, call
+   `record_admin_audit`, assert the ring entry exists with
+   `chain_pending == true` and the audit_audit_seq has
+   advanced (idempotent on retry isn't a concern here — the
+   record IS authoritative; the chain just doesn't have it).
+
+**Surface change:**
+- O-4: new metric counter + log line. No data shape change.
+- O-5: new `chain_pending: bool` field on `AdminAuditRecord` and
+  `LogRecord`. Serialization is forward-compatible (default
+  `false` if absent).
+
+---
+
+#### O-9 — `gc_drain_window` 1-second hardcode (verified not-a-bug)
+
+**Decision: Document, don't fix.**
+
+The 1-second window IS the natural denominator for
+`BackpressureConfig::drain_rate_per_zone_per_sec`. The rate config
+field's name says "per second"; the window matches that
+definition. There's no bug; the audit over-flagged a config-shape
+question as a code-shape question.
+
+**Rejected: change the window.** Doing so requires redefining the
+rate config semantic. If we want a tunable drain window, we
+should add a separate `drain_window_duration: Duration` field
+rather than reinterpreting `drain_rate_per_zone_per_sec`.
+
+**Implementation plan:**
+
+1. In `src/adapter/net/behavior/meshos/backpressure.rs`'s
+   `gc_drain_window` (line ~273), add a code comment:
+   ```rust
+   // 1-second window is by definition the denominator of
+   // BackpressureConfig::drain_rate_per_zone_per_sec. The
+   // hardcode here matches the config field's name; changing
+   // the window without renaming the config field would
+   // silently invert the operator-facing rate semantic. If
+   // operator-tunable drain windows are ever wanted, add a
+   // separate `drain_window_duration: Duration` config rather
+   // than reinterpreting the existing rate field.
+   ```
+2. No code change. No metric. No test.
+
+**Surface change:** none. Pure comment.
 
 ### Deferred — remaining lows (low impact, defer to follow-up cleanup commit)
 
