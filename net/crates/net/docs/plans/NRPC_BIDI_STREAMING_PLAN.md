@@ -9,9 +9,27 @@ Spec for the three missing nRPC streaming shapes. Reference:
 
 - ✅ **Unary** `Mesh::call_typed` / `serve_rpc_typed` — one Req, one Resp.
 - ✅ **Server-streaming** `Mesh::call_streaming_typed` / `serve_rpc_streaming_typed` — one Req, many Resp. Window-grant flow control wired (`DISPATCH_RPC_STREAM_GRANT`, header `nrpc-stream-window-initial`).
-- ❌ **Client-streaming** — many Req, one Resp. No SDK surface, no wire support.
-- ❌ **Duplex** — many Req ↔ many Resp interleaved. No SDK surface, no wire support.
-- ❌ **Server-side handler for client-streamed requests** — `RpcHandler` today only receives a single decoded `RpcRequestPayload`. No stream-of-requests primitive on the fold.
+- ✅ **Client-streaming** `Mesh::call_client_stream_typed` / `serve_rpc_client_stream_typed` — many Req, one Resp. Wire format: `DISPATCH_RPC_REQUEST_CHUNK` + `FLAG_RPC_CLIENT_STREAMING_REQUEST` + `FLAG_RPC_REQUEST_END`. Request-direction flow control via `DISPATCH_RPC_REQUEST_GRANT` + header `nrpc-request-window-initial`. Substrate `ClientStreamCallRaw` and SDK veneer `ClientStreamCallTyped<Req, Resp>`.
+- ✅ **Duplex** `Mesh::call_duplex_typed` / `serve_rpc_duplex_typed` — many Req ↔ many Resp interleaved. Reuses both `FLAG_RPC_CLIENT_STREAMING_REQUEST` (request side) and `FLAG_RPC_STREAMING_RESPONSE` (response side) on the initial REQUEST. Substrate `DuplexCallRaw` (with `into_split` → `DuplexSink` + `DuplexStream`), SDK veneer `DuplexCallTyped<Req, Resp>` plus typed `DuplexSinkTyped<Req>` / `DuplexStreamTyped<Resp>`. Shared `Arc<DuplexInner>` so CANCEL fires only when both halves drop without clean close.
+- ✅ **Server-side handler for client-streamed requests** — `RpcClientStreamingHandler` async-trait taking `(ctx: RpcStreamingContext, requests: RequestStream) -> Result<RpcResponsePayload, RpcHandlerError>`. `RpcDuplexHandler` adds the response sink. Both implemented by `RpcStreamingRequestFold` / `RpcDuplexFold` in `cortex::rpc`. SDK veneer adds `RequestStreamTyped<Req>` (flattened) and the opt-in `ChunkedRequestStream<Req>` via `into_chunked()` for callers that need to distinguish `Chunk::Init` from `Chunk::Data`.
+
+### Delivered commits on `nrpc-streaming` (branched off master after the `nrpc-benchmarks` PR merged)
+
+| Commit | Phase | Notes |
+|---|---|---|
+| `1a35864d` | A — wire format | 7 new public items in `cortex/rpc.rs`, 6 codec / pin tests |
+| `20a94366` | B — server fold | `RpcStreamingRequestFold` + `RpcClientStreamingHandler` + `RequestStream` + 6 unit tests |
+| `bb53262e` | C-substrate | `PendingEntry::ClientStreaming`, `RpcClientPending::register_client_streaming`, `deliver_grant`, REQUEST_GRANT routing on `RpcClientFold` + 6 unit tests |
+| `e051fbe3` | C-glue | `MeshNode::serve_rpc_client_stream` + `MeshNode::call_client_stream` + `ClientStreamCallRaw` |
+| `f8f054bd` | C-tests | 5 real-network integration tests + the empty-body-on-`FLAG_END` terminator-semantics fix |
+| `60446024` | D — substrate + glue | `RpcDuplexHandler`, `RpcDuplexFold`, `PendingEntry::Duplex`, `MeshNode::serve_rpc_duplex` / `call_duplex`, `DuplexCallRaw` / `DuplexSink` / `DuplexStream`, shared `Arc<DuplexInner>` CANCEL semantics |
+| `458cdb27` | D-tests | 5 real-network duplex integration tests |
+| `e70b93e8` | E — SDK veneer | All four `*_typed` methods on `Mesh`, `Chunk<T>`, `RequestStreamTyped` + `ChunkedRequestStream`, `ClientStreamCallTyped`, `DuplexCallTyped` + split halves, 5 SDK-level tests |
+| `ecbafbc6` | F — benches | `nrpc_client_streaming` + `nrpc_duplex` Criterion benches extending the existing nRPC suite |
+
+Test totals on the branch: **23 new unit tests + 10 real-network integration tests + 5 SDK-level typed tests = 38 added**, all green. Existing typed tests (`mesh_rpc_typed.rs`, `mesh_rpc_streaming_typed.rs`) regression-swept post-Phase-E: 7/7 still pass — Phase E only ADDED methods, didn't modify existing ones.
+
+Phases G (Node / Python / Go binding parity) remains deferred per this plan's original scope; it gets its own follow-up plan once the wire contract has had real cross-binding usage.
 
 Existing Phase 3 prerequisites that this plan composes against (no rework needed):
 
@@ -23,20 +41,22 @@ Existing Phase 3 prerequisites that this plan composes against (no rework needed
 
 ## Goal & scope
 
-Add three surfaces that together close the streaming matrix:
+This plan was the design + delivery record for closing the streaming matrix
+with three new surfaces. All four shipped behind the substrate/veneer split
+described below:
 
-1. **`Mesh::call_client_stream_typed<Req, Resp>(target, service, opts) -> ClientStreamCall<Req, Resp>`** — caller-side primitive: push N `Req`s into a sink, then await one terminal `Resp`. Direct routing only; capability-based variant follows the existing `_service_` naming.
+1. **`Mesh::call_client_stream_typed<Req, Resp>(target, service, opts) -> ClientStreamCallTyped<Req, Resp>`** — caller-side primitive: push N `Req`s into a sink, then await one terminal `Resp`. Direct routing only; capability-based variant follows the existing `_service_` naming.
 2. **`Mesh::serve_rpc_client_stream_typed<Req, Resp, F, Fut>(service, codec, handler)`** — server-side handler shape: receives a `RequestStreamTyped<Req>` (futures::Stream), returns one `Resp`. Mirrors the streaming-response handler shape.
-3. **`Mesh::call_duplex_typed<Req, Resp>(target, service, opts) -> DuplexCall<Req, Resp>`** — full duplex: caller has both a `RequestSink<Req>` and a `RpcStreamTyped<Resp>`, can interleave freely.
+3. **`Mesh::call_duplex_typed<Req, Resp>(target, service, opts) -> DuplexCallTyped<Req, Resp>`** — full duplex: caller has both a `DuplexSinkTyped<Req>` and a `DuplexStreamTyped<Resp>`, can interleave freely.
 4. **`Mesh::serve_rpc_duplex_typed<Req, Resp, F, Fut>(service, codec, handler)`** — server-side full duplex: handler receives `(RequestStreamTyped<Req>, ResponseSinkTyped<Resp>)`.
 
 In every case the **rust-channel abstraction** (mpsc-style sender + receiver wrapped in `futures::Sink` / `futures::Stream`) is the application-facing API, NOT a literal `Mesh::publish` channel. The channel layer's pub/sub is a transport detail, same as it is today for server-streaming responses.
 
-Out of scope:
+Out of scope (still deferred, follow-up tracking elsewhere):
 
 - Schema-validated payloads / IDL codegen — deferred (matches NRPC_BINDINGS_PLAN.md stance).
-- Non-typed raw-bytes variants for duplex / client-streaming — will exist as the substrate the typed wrappers compose on, but won't get first-class SDK ergonomics in v1.
-- Cross-language binding support (Node / Python / Go) — separate plan; this plan ships Rust SDK + wire format only.
+- Non-typed raw-bytes variants for duplex / client-streaming — exist as the substrate the typed wrappers compose on, but didn't get first-class SDK ergonomics in v1.
+- Cross-language binding support — this plan shipped Rust SDK + wire format only; Node/Python/Go/C parity tracked in `NRPC_BINDINGS_PLAN.md` Phase 2 (B8–B12, also shipped).
 
 ## Architecture: substrate + veneer
 

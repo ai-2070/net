@@ -51,11 +51,14 @@ use tokio::runtime::Runtime;
 
 use futures::StreamExt;
 use net::adapter::net::cortex::{
-    RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+    RequestStream as InnerRequestStream, RpcClientStreamingHandler, RpcContext, RpcDuplexHandler,
+    RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink,
+    RpcStatus, RpcStreamingContext,
 };
 use net::adapter::net::mesh_rpc::{
-    CallOptions as InnerCallOptions, RpcError as InnerRpcError, RpcStream as InnerRpcStream,
-    ServeHandle as InnerServeHandle,
+    CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
+    DuplexSink as InnerDuplexSink, DuplexStream as InnerDuplexStream, RpcError as InnerRpcError,
+    RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
 };
 use net::adapter::net::MeshNode;
 
@@ -102,13 +105,41 @@ pub const NET_RPC_ERR_STREAM_DONE: c_int = -6;
 ///     `call_service` / `find_service_nodes` / `serve` plus
 ///     Phase B6 streaming (`call_streaming`, `stream_next`,
 ///     `stream_grant`, `stream_close`, `stream_free`).
-pub const NET_RPC_ABI_VERSION: u32 = 0x0001;
+///   - **0002** — Phase 2 of NRPC_BINDINGS_PLAN: adds the
+///     client-streaming caller-side surface
+///     (`net_rpc_call_client_stream`, `net_rpc_client_stream_send`,
+///     `net_rpc_client_stream_finish`, `net_rpc_client_stream_free`)
+///     plus the duplex caller-side surface
+///     (`net_rpc_call_duplex`, `net_rpc_duplex_send`,
+///     `net_rpc_duplex_finish_sending`, `net_rpc_duplex_next`,
+///     `net_rpc_duplex_into_split`, `net_rpc_duplex_sink_send`,
+///     `net_rpc_duplex_sink_finish`, `net_rpc_duplex_stream_next`,
+///     `net_rpc_duplex_*_free`). Server-side handlers for both
+///     shapes land separately (B8-5). ADDITIVE — every 0x0001
+///     function keeps identical signature + semantics, so a
+///     0x0001 consumer compiled against a 0x0002 library still
+///     works.
+pub const NET_RPC_ABI_VERSION: u32 = 0x0002;
 
 /// Returns the current ABI version. Consumers SHOULD call this at
 /// init and compare against their expected value.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_abi_version() -> u32 {
     NET_RPC_ABI_VERSION
+}
+
+/// Returns `NET_RPC_OK` (0) iff the running library's ABI version
+/// is greater than or equal to `expected`. Otherwise returns
+/// `NET_RPC_ERR_CALL_FAILED`. Consumers MAY call this at process
+/// init to wedge a hard-fail before touching any other surface
+/// when the loaded library is older than the compile-time headers.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_check_abi_version(expected: u32) -> c_int {
+    if NET_RPC_ABI_VERSION >= expected {
+        NET_RPC_OK
+    } else {
+        NET_RPC_ERR_CALL_FAILED
+    }
 }
 
 // =========================================================================
@@ -1316,6 +1347,894 @@ pub extern "C" fn net_rpc_stream_free(stream: *mut RpcStreamHandleC) {
 }
 
 // =========================================================================
+// ABI 0x0002 — Client-streaming caller-side surface (Phase B8-1).
+//
+// Mirrors `RpcStreamHandleC` shape: opaque handle wrapping an
+// `Option<ClientStreamCallRaw>` behind a `Mutex` so `send` /
+// `finish` can take ownership for state transitions. `done` is
+// latched separately so subsequent calls after finish/free
+// return clean error codes instead of panicking.
+//
+// Lifecycle:
+//   net_rpc_call_client_stream(...) -> handle (state JustOpened)
+//   net_rpc_client_stream_send(handle, ...)        // 0..N times
+//   net_rpc_client_stream_finish(handle, ...)      // consumes handle
+//                                                  // returns terminal Resp body
+//   net_rpc_client_stream_free(handle)             // idempotent
+// =========================================================================
+
+/// Opaque caller-side handle for a client-streaming call.
+///
+/// The inner `ClientStreamCallRaw` is held inside an `Option`
+/// behind a `Mutex` so the state machine (`JustOpened` → `Sending`
+/// → `Finishing` → `Done`) can be driven across multiple FFI
+/// calls without re-entry hazards. `finish` `take()`s the inner
+/// value permanently; subsequent `send` / `finish` calls observe
+/// `None` and return `NET_RPC_ERR_STREAM_DONE`.
+///
+/// `call_id` is captured at construction so `net_rpc_client_stream_call_id`
+/// doesn't need to lock the mutex. `done` is the same latch as
+/// `RpcStreamHandleC`: set on terminal observation OR explicit
+/// `free`, so a Go consumer can race a deferred-free with a
+/// stray send/finish cleanly.
+pub struct ClientStreamCallHandleC {
+    inner: Arc<Mutex<Option<InnerClientStreamCallRaw>>>,
+    call_id: u64,
+    done: AtomicBool,
+}
+
+/// Direct-addressed client-streaming call. Constructs the
+/// underlying `ClientStreamCallRaw` via `runtime.block_on` (which
+/// performs the reply-subscription setup; no REQUEST flies until
+/// the first `send` or `finish` — see `MeshNode::call_client_stream`).
+///
+/// `request_window` of `0` disables upload-direction flow control;
+/// non-zero installs an initial credit window via
+/// `CallOptions::request_window_initial`.
+///
+/// Returns:
+///   - `NET_RPC_OK` on success; `*out_handle` set to a fresh
+///     `ClientStreamCallHandleC*`. Caller frees via
+///     [`net_rpc_client_stream_free`].
+///   - `NET_RPC_ERR_NULL` if `handle` is NULL.
+///   - `NET_RPC_ERR_INVALID_UTF8` if `service` is NULL or non-UTF-8.
+///   - `NET_RPC_ERR_CALL_FAILED` on any SDK-level error; `*out_err`
+///     is set to a heap-allocated UTF-8 diagnostic.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_client_stream(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    deadline_ms: u64,
+    request_window: u32,
+    out_handle: *mut *mut ClientStreamCallHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if request_window > 0 {
+        opts.request_window_initial = Some(request_window);
+    }
+    let node = h.node.clone();
+    let result = runtime().block_on(async move {
+        node.call_client_stream(target_node_id, &service, opts)
+            .await
+    });
+    match result {
+        Ok(call) => {
+            let call_id = call.call_id();
+            let boxed = Box::new(ClientStreamCallHandleC {
+                inner: Arc::new(Mutex::new(Some(call))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_handle = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Cancellable variant of [`net_rpc_call_client_stream`].
+/// Identical contract; adds a `cancel_token` parameter so the
+/// construction `block_on` (which awaits reply-subscription setup
+/// + the peer's initial-frame ACK) can be aborted by
+/// [`net_rpc_cancel_call`] from another thread — matching the
+/// discipline `net_rpc_call_streaming_cancellable` shipped with.
+/// `cancel_token == 0` short-circuits to the plain
+/// `net_rpc_call_client_stream` semantics (no registry overhead).
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_client_stream_cancellable(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    deadline_ms: u64,
+    request_window: u32,
+    cancel_token: u64,
+    out_handle: *mut *mut ClientStreamCallHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if request_window > 0 {
+        opts.request_window_initial = Some(request_window);
+    }
+    let node = h.node.clone();
+    let result = run_cancellable(cancel_token, async move {
+        node.call_client_stream(target_node_id, &service, opts)
+            .await
+    });
+    match result {
+        Ok(Ok(call)) => {
+            let call_id = call.call_id();
+            let boxed = Box::new(ClientStreamCallHandleC {
+                inner: Arc::new(Mutex::new(Some(call))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_handle = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Ok(Err(e)) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        Err(CancelledError) => {
+            write_err(out_err, "call cancelled".into());
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Push one body chunk into the client-streaming call. Encodes
+/// as the initial REQUEST (first call) or as a REQUEST_CHUNK
+/// (subsequent calls) — the underlying `ClientStreamCallRaw`
+/// handles the state transition. Awaits one upload credit when
+/// flow control is opted into.
+///
+/// Returns:
+///   - `NET_RPC_OK` on success.
+///   - `NET_RPC_ERR_NULL` on NULL handle.
+///   - `NET_RPC_ERR_STREAM_DONE` if `finish` already consumed
+///     the call, or if `free` has latched it done.
+///   - `NET_RPC_ERR_CALL_FAILED` on transport / credit-closed
+///     errors; `*out_err` carries the diagnostic.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_client_stream_send(
+    handle: *mut ClientStreamCallHandleC,
+    body_ptr: *const u8,
+    body_len: usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let body = if body_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
+    };
+    // Hold the lock across block_on so concurrent sends serialize
+    // cleanly. `send` takes &mut self so we use as_mut on the
+    // Option's Some, leaving the call in place for the next caller.
+    let mut guard = h.inner.lock();
+    let Some(call_ref) = guard.as_mut() else {
+        return NET_RPC_ERR_STREAM_DONE;
+    };
+    let result = runtime().block_on(call_ref.send(body));
+    match result {
+        Ok(()) => NET_RPC_OK,
+        Err(e) => {
+            // SDK-level error. Drop the call (CANCEL fires via
+            // `ClientStreamCallRaw::Drop` if the initial REQUEST
+            // already flew) and latch done.
+            *guard = None;
+            h.done.store(true, Ordering::Relaxed);
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Close the upload direction (emits REQUEST_END) and await the
+/// server's terminal RESPONSE. Consumes the call.
+///
+/// On success, the response body is written to
+/// `(*out_body_ptr, *out_body_len)`. Caller frees the buffer via
+/// [`net_rpc_response_free`].
+///
+/// Returns:
+///   - `NET_RPC_OK` on success; `*out_body_ptr` / `*out_body_len`
+///     set; `*out_body_len == 0` is valid (handler returned an
+///     empty body).
+///   - `NET_RPC_ERR_NULL` on NULL handle.
+///   - `NET_RPC_ERR_STREAM_DONE` if `finish` was already called
+///     or `free` latched it.
+///   - `NET_RPC_ERR_CALL_FAILED` on any SDK error (deadline
+///     elapsed, server returned non-Ok, transport failure);
+///     `*out_err` carries the diagnostic.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_client_stream_finish(
+    handle: *mut ClientStreamCallHandleC,
+    out_body_ptr: *mut *mut u8,
+    out_body_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let inner_opt = h.inner.lock().take();
+    let call = match inner_opt {
+        Some(c) => c,
+        None => {
+            h.done.store(true, Ordering::Relaxed);
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    // Latch done BEFORE the await so concurrent sends/frees
+    // observe the latch promptly.
+    h.done.store(true, Ordering::Relaxed);
+    let result = runtime().block_on(async { call.finish().await });
+    match result {
+        Ok(reply) => {
+            write_response(reply.body.to_vec(), out_body_ptr, out_body_len);
+            NET_RPC_OK
+        }
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Diagnostic accessor: server-assigned `call_id` for this call.
+/// Returns `0` on NULL handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_client_stream_call_id(handle: *const ClientStreamCallHandleC) -> u64 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    h.call_id
+}
+
+/// Free the client-streaming call handle. Implicitly fires
+/// CANCEL via `ClientStreamCallRaw::Drop` if `finish` hasn't
+/// completed. Idempotent on NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_client_stream_free(handle: *mut ClientStreamCallHandleC) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle));
+    }
+}
+
+// =========================================================================
+// ABI 0x0002 — Duplex caller-side surface (Phase B8-2).
+//
+// Three opaque handle types:
+//
+//   - DuplexCallHandleC: combined send + receive, mirrors
+//     `DuplexCallRaw`. The send half can be "consumed by
+//     finish_sending" without consuming the receive half — the
+//     SDK's `finish_sending` takes `&mut self`, leaving the
+//     response stream alive. After `into_split`, the inner is
+//     `None` and subsequent send/finish_sending/next return
+//     STREAM_DONE.
+//
+//   - DuplexSinkHandleC: send-half after `into_split`. Mirrors
+//     `DuplexSink`. `sink_finish` consumes the inner DuplexSink.
+//
+//   - DuplexStreamHandleC: receive-half after `into_split`.
+//     Mirrors `DuplexStream`. Drains via `_stream_next`.
+//
+// Shared CANCEL semantics: the underlying SDK types share an
+// `Arc<DuplexInner>`. CANCEL fires only when BOTH halves drop
+// without observing the response stream's terminal frame —
+// `into_split` distributes the Arc into the two sub-handles,
+// and the original DuplexCallHandleC's Option becomes None.
+// =========================================================================
+
+/// Opaque caller-side handle for a duplex call (combined send +
+/// receive). Mirrors `RpcStreamHandleC` shape: an inner
+/// `Option<DuplexCallRaw>` behind a Mutex, with a captured
+/// call_id and a `done` AtomicBool latch.
+///
+/// State transitions:
+///   - JustOpened → Sending (first `send`)
+///   - Sending → Finishing (after `finish_sending`)
+///   - Finishing → Done (after response stream's terminal frame
+///     observed via `next` returning `None` / Error item)
+///   - Any → split (after `into_split`)
+///
+/// After `into_split` or `free`, both inner Options are None and
+/// subsequent `send` / `finish_sending` / `next` calls return
+/// `NET_RPC_ERR_STREAM_DONE`.
+///
+/// **Auto-split.** The combined `DuplexCallRaw` is split into a
+/// `DuplexSink` + `DuplexStream` at construction so concurrent
+/// send + recv from Go (the primary duplex use case) do NOT
+/// contend on the same mutex. Both halves share the underlying
+/// `Arc<DuplexInner>`, so CANCEL-on-Drop semantics are preserved:
+/// the wire CANCEL fires only after both halves have been
+/// dropped without a clean close.
+pub struct DuplexCallHandleC {
+    sink: Arc<Mutex<Option<InnerDuplexSink>>>,
+    stream: Arc<Mutex<Option<InnerDuplexStream>>>,
+    call_id: u64,
+    done: AtomicBool,
+}
+
+/// Opaque caller-side handle for the send-half of a split duplex
+/// call. Constructed by [`net_rpc_duplex_into_split`].
+/// `sink_finish` consumes the inner sink.
+pub struct DuplexSinkHandleC {
+    inner: Arc<Mutex<Option<InnerDuplexSink>>>,
+    call_id: u64,
+    done: AtomicBool,
+}
+
+/// Opaque caller-side handle for the receive-half of a split
+/// duplex call. Constructed by [`net_rpc_duplex_into_split`].
+/// Drains chunks via `_stream_next` until terminal End / Error.
+pub struct DuplexStreamHandleC {
+    inner: Arc<Mutex<Option<InnerDuplexStream>>>,
+    call_id: u64,
+    done: AtomicBool,
+}
+
+/// Direct-addressed duplex call. Constructs the underlying
+/// `DuplexCallRaw` via block_on (reply subscription setup; no
+/// REQUEST flies yet — lazy publish as with client-streaming).
+///
+/// Initial REQUEST carries BOTH `FLAG_RPC_CLIENT_STREAMING_REQUEST`
+/// AND `FLAG_RPC_STREAMING_RESPONSE`. Both request_window and
+/// stream_window are independently opt-in: 0 disables flow
+/// control for that direction.
+///
+/// Returns: same shape as [`net_rpc_call_client_stream`].
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_duplex(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    deadline_ms: u64,
+    request_window: u32,
+    stream_window: u32,
+    out_handle: *mut *mut DuplexCallHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if request_window > 0 {
+        opts.request_window_initial = Some(request_window);
+    }
+    if stream_window > 0 {
+        opts.stream_window_initial = Some(stream_window);
+    }
+    let node = h.node.clone();
+    let result =
+        runtime().block_on(async move { node.call_duplex(target_node_id, &service, opts).await });
+    match result {
+        Ok(call) => {
+            let call_id = call.call_id();
+            // Auto-split at construction so concurrent send + recv
+            // from Go don't contend on a single mutex. Both halves
+            // share Arc<DuplexInner>; CANCEL-on-Drop remains gated
+            // on both-halves-dropped via the SDK's refcount.
+            let (sink, stream) = call.into_split();
+            let boxed = Box::new(DuplexCallHandleC {
+                sink: Arc::new(Mutex::new(Some(sink))),
+                stream: Arc::new(Mutex::new(Some(stream))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_handle = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Cancellable variant of [`net_rpc_call_duplex`]. Adds a
+/// `cancel_token` so the construction `block_on` (reply-channel
+/// subscription setup; no REQUEST flies yet thanks to the lazy
+/// initial-publish) can be aborted by [`net_rpc_cancel_call`].
+/// `cancel_token == 0` short-circuits to the plain
+/// [`net_rpc_call_duplex`] semantics.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_duplex_cancellable(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    deadline_ms: u64,
+    request_window: u32,
+    stream_window: u32,
+    cancel_token: u64,
+    out_handle: *mut *mut DuplexCallHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if request_window > 0 {
+        opts.request_window_initial = Some(request_window);
+    }
+    if stream_window > 0 {
+        opts.stream_window_initial = Some(stream_window);
+    }
+    let node = h.node.clone();
+    let result = run_cancellable(cancel_token, async move {
+        node.call_duplex(target_node_id, &service, opts).await
+    });
+    match result {
+        Ok(Ok(call)) => {
+            let call_id = call.call_id();
+            let (sink, stream) = call.into_split();
+            let boxed = Box::new(DuplexCallHandleC {
+                sink: Arc::new(Mutex::new(Some(sink))),
+                stream: Arc::new(Mutex::new(Some(stream))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_handle = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Ok(Err(e)) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        Err(CancelledError) => {
+            write_err(out_err, "call cancelled".into());
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Push one body chunk to the server. Same semantics as
+/// [`net_rpc_client_stream_send`] but for the duplex shape: the
+/// response stream stays alive after `finish_sending`, so a
+/// successful `send` doesn't preclude future `next` calls.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_send(
+    handle: *mut DuplexCallHandleC,
+    body_ptr: *const u8,
+    body_len: usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let body = if body_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
+    };
+    // Hold the sink lock across block_on so concurrent sends
+    // serialize cleanly without the take/restore race. The recv
+    // side uses an independent lock so send + recv never contend.
+    let mut guard = h.sink.lock();
+    let Some(sink_ref) = guard.as_mut() else {
+        return NET_RPC_ERR_STREAM_DONE;
+    };
+    let result = runtime().block_on(sink_ref.send(body));
+    match result {
+        Ok(()) => NET_RPC_OK,
+        Err(e) => {
+            *guard = None;
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Close the upload direction. Emits REQUEST_END but does NOT
+/// consume the call — the response stream stays open and the
+/// caller drains it via `_duplex_next`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_finish_sending(
+    handle: *mut DuplexCallHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    // `DuplexSink::finish_sending` consumes self. Take the sink
+    // out of the Option under the sink lock — a concurrent `send`
+    // will see None on its next acquisition and return STREAM_DONE.
+    // The stream lock stays untouched: response drain via _next
+    // continues unaffected.
+    let sink_opt = h.sink.lock().take();
+    let Some(sink) = sink_opt else {
+        return NET_RPC_ERR_STREAM_DONE;
+    };
+    let result = runtime().block_on(sink.finish_sending());
+    match result {
+        Ok(()) => NET_RPC_OK,
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Pull the next response chunk from the duplex call.
+///
+/// Returns: same shape as [`net_rpc_stream_next`]. `NET_RPC_OK`
+/// with a chunk, `NET_RPC_ERR_STREAM_DONE` on clean end,
+/// `NET_RPC_ERR_CALL_FAILED` on mid-stream error.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_next(
+    handle: *mut DuplexCallHandleC,
+    out_chunk_ptr: *mut *mut u8,
+    out_chunk_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        unsafe {
+            *out_chunk_ptr = std::ptr::null_mut();
+            *out_chunk_len = 0;
+        }
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    use futures::StreamExt;
+    // Hold the stream lock for the duration of the poll. Send
+    // operations take the sink lock independently — concurrent
+    // send + recv from Go no longer race on a shared mutex.
+    let mut guard = h.stream.lock();
+    let Some(stream_ref) = guard.as_mut() else {
+        unsafe {
+            *out_chunk_ptr = std::ptr::null_mut();
+            *out_chunk_len = 0;
+        }
+        return NET_RPC_ERR_STREAM_DONE;
+    };
+    let result = runtime().block_on(stream_ref.next());
+    match result {
+        Some(Ok(chunk)) => {
+            write_response(chunk.to_vec(), out_chunk_ptr, out_chunk_len);
+            NET_RPC_OK
+        }
+        Some(Err(e)) => {
+            *guard = None;
+            h.done.store(true, Ordering::Relaxed);
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        None => {
+            *guard = None;
+            h.done.store(true, Ordering::Relaxed);
+            unsafe {
+                *out_chunk_ptr = std::ptr::null_mut();
+                *out_chunk_len = 0;
+            }
+            NET_RPC_ERR_STREAM_DONE
+        }
+    }
+}
+
+/// Split the duplex call into independent sink + stream halves.
+/// Consumes the inner `DuplexCallRaw` — subsequent send /
+/// finish_sending / next on the original handle return
+/// `NET_RPC_ERR_STREAM_DONE`.
+///
+/// Each returned half holds its own `Arc<DuplexInner>` (via the
+/// SDK types) so CANCEL fires only when BOTH halves drop
+/// without observing the response stream's terminal frame.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_into_split(
+    handle: *mut DuplexCallHandleC,
+    out_sink: *mut *mut DuplexSinkHandleC,
+    out_stream: *mut *mut DuplexStreamHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    // The handle was already split at construction. `into_split`
+    // here just transfers ownership of the two halves into the
+    // caller's separately-managed handles. Atomic latch via `done`
+    // prevents a concurrent split + free from racing on the take.
+    if h.done.swap(true, Ordering::Relaxed) {
+        write_err(
+            out_err,
+            "duplex_into_split called on already-split or freed handle".into(),
+        );
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let sink = h.sink.lock().take();
+    let stream = h.stream.lock().take();
+    let (sink, stream) = match (sink, stream) {
+        (Some(s), Some(st)) => (s, st),
+        _ => {
+            write_err(
+                out_err,
+                "duplex_into_split called on partially-consumed handle".into(),
+            );
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    let call_id = h.call_id;
+    let sink_boxed = Box::new(DuplexSinkHandleC {
+        inner: Arc::new(Mutex::new(Some(sink))),
+        call_id,
+        done: AtomicBool::new(false),
+    });
+    let stream_boxed = Box::new(DuplexStreamHandleC {
+        inner: Arc::new(Mutex::new(Some(stream))),
+        call_id,
+        done: AtomicBool::new(false),
+    });
+    unsafe {
+        *out_sink = Box::into_raw(sink_boxed);
+        *out_stream = Box::into_raw(stream_boxed);
+    }
+    // Latch the original handle so a stray send/next on it
+    // returns STREAM_DONE cleanly.
+    h.done.store(true, Ordering::Relaxed);
+    NET_RPC_OK
+}
+
+/// Diagnostic accessor — server-assigned call_id. Returns 0 on
+/// NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_call_id(handle: *const DuplexCallHandleC) -> u64 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    h.call_id
+}
+
+/// Free the duplex handle. Fires CANCEL via the SDK's shared
+/// `Arc<DuplexInner>` if the call hasn't cleanly closed and both
+/// halves of an `into_split` haven't been independently drained.
+/// Idempotent on NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_free(handle: *mut DuplexCallHandleC) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle));
+    }
+}
+
+// ---- Sink half (post-into_split) ----
+
+/// Push one body chunk via the sink half. Same semantics as
+/// [`net_rpc_duplex_send`].
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_sink_send(
+    handle: *mut DuplexSinkHandleC,
+    body_ptr: *const u8,
+    body_len: usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let body = if body_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
+    };
+    // Hold the lock across block_on so concurrent sends serialize
+    // cleanly. `send` takes &mut self so we use as_mut, leaving
+    // the Option populated for the next caller.
+    let mut guard = h.inner.lock();
+    let Some(sink_ref) = guard.as_mut() else {
+        return NET_RPC_ERR_STREAM_DONE;
+    };
+    let result = runtime().block_on(sink_ref.send(body));
+    match result {
+        Ok(()) => NET_RPC_OK,
+        Err(e) => {
+            *guard = None;
+            h.done.store(true, Ordering::Relaxed);
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Close the sink half (emits REQUEST_END). Consumes the inner
+/// `DuplexSink`; subsequent `sink_send` returns STREAM_DONE.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_sink_finish(
+    handle: *mut DuplexSinkHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let inner_opt = h.inner.lock().take();
+    let sink = match inner_opt {
+        Some(s) => s,
+        None => {
+            h.done.store(true, Ordering::Relaxed);
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    h.done.store(true, Ordering::Relaxed);
+    let result = runtime().block_on(async { sink.finish_sending().await });
+    match result {
+        Ok(()) => NET_RPC_OK,
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Diagnostic accessor for the sink half's call_id.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_sink_call_id(handle: *const DuplexSinkHandleC) -> u64 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    h.call_id
+}
+
+/// Free the sink half. Drop fires nothing (CANCEL only when the
+/// shared Arc<DuplexInner> refcount hits zero AND clean_close
+/// wasn't observed — see the SDK's `DuplexInner::Drop`).
+/// Idempotent on NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_sink_free(handle: *mut DuplexSinkHandleC) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle));
+    }
+}
+
+// ---- Stream half (post-into_split) ----
+
+/// Pull the next response chunk from the stream half. Same
+/// semantics as [`net_rpc_duplex_next`].
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_stream_next(
+    handle: *mut DuplexStreamHandleC,
+    out_chunk_ptr: *mut *mut u8,
+    out_chunk_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        unsafe {
+            *out_chunk_ptr = std::ptr::null_mut();
+            *out_chunk_len = 0;
+        }
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    use futures::StreamExt;
+    // Hold the lock across block_on so concurrent `stream_next`
+    // calls serialize cleanly. Each call gets one chunk OR the
+    // terminal frame; the take/restore race is gone.
+    let mut guard = h.inner.lock();
+    let Some(stream_ref) = guard.as_mut() else {
+        unsafe {
+            *out_chunk_ptr = std::ptr::null_mut();
+            *out_chunk_len = 0;
+        }
+        return NET_RPC_ERR_STREAM_DONE;
+    };
+    let result = runtime().block_on(stream_ref.next());
+    match result {
+        Some(Ok(chunk)) => {
+            write_response(chunk.to_vec(), out_chunk_ptr, out_chunk_len);
+            NET_RPC_OK
+        }
+        Some(Err(e)) => {
+            *guard = None;
+            h.done.store(true, Ordering::Relaxed);
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        None => {
+            *guard = None;
+            h.done.store(true, Ordering::Relaxed);
+            unsafe {
+                *out_chunk_ptr = std::ptr::null_mut();
+                *out_chunk_len = 0;
+            }
+            NET_RPC_ERR_STREAM_DONE
+        }
+    }
+}
+
+/// Diagnostic accessor for the stream half's call_id.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_stream_call_id(handle: *const DuplexStreamHandleC) -> u64 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    h.call_id
+}
+
+/// Free the stream half. Same Arc-refcount-based CANCEL semantics
+/// as `_sink_free`. Idempotent on NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_duplex_stream_free(handle: *mut DuplexStreamHandleC) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle));
+    }
+}
+
+// =========================================================================
 // Header-bearing call variants (Phase 9b end-to-end).
 //
 // The legacy `net_rpc_call` / `_call_service` / `_call_streaming`
@@ -1604,6 +2523,522 @@ pub extern "C" fn net_rpc_call_streaming_with_headers_cancellable(
 }
 
 // =========================================================================
+// ABI 0x0002 — Server-side handlers for client-streaming + duplex (B8-5).
+//
+// Two new dispatcher function-pointer types, two new global
+// dispatchers (separate from the unary `DISPATCHER`), and two new
+// `serve` glue functions.
+//
+// Per-call handles handed to the Go dispatcher:
+//
+//   - RpcRequestStreamHandleC: wraps RequestStream. Go-side
+//     handler calls net_rpc_request_stream_next repeatedly until
+//     STREAM_DONE.
+//   - RpcResponseSinkHandleC: wraps RpcResponseSink. Go-side
+//     duplex handler calls net_rpc_response_sink_send to emit
+//     response chunks.
+//
+// Both handles are owned by the Rust side; they're created
+// before the dispatcher call and freed when the dispatcher
+// returns. The Go side MUST NOT call _free on them; they're
+// not heap-allocated on the Go-owned side.
+//
+// Lifecycle (per call, from the substrate fold's perspective):
+//   1. Substrate fold spawns GoClientStreamingHandler::call / GoDuplexHandler::call.
+//   2. Handler builds Box<RpcRequestStreamHandleC>, optionally Box<RpcResponseSinkHandleC>.
+//   3. Handler spawn_blocking → Go dispatcher → blocks until Go returns.
+//   4. Go-side handler drains stream + (for duplex) sends chunks.
+//   5. Go dispatcher returns; Rust frees the handles.
+// =========================================================================
+
+/// Function pointer the Go side registers via
+/// [`net_rpc_set_client_streaming_handler_dispatcher`].
+///
+/// Called once per inbound client-streaming REQUEST. The Go side
+/// drains the request stream via [`net_rpc_request_stream_next`]
+/// and returns one terminal response body (or an error). The
+/// terminal body is heap-allocated by the Go side (typically via
+/// `C.malloc`); Rust copies into a `Bytes` and `libc::free`s the
+/// Go buffer — same convention as the unary `RpcHandlerFn`.
+pub type RpcClientStreamingHandlerFn = unsafe extern "C" fn(
+    handler_id: u64,
+    request_stream: *mut RpcRequestStreamHandleC,
+    out_resp_ptr: *mut *mut u8,
+    out_resp_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int;
+
+/// Function pointer the Go side registers via
+/// [`net_rpc_set_duplex_handler_dispatcher`].
+///
+/// Called once per inbound duplex REQUEST. The Go side drains the
+/// request stream AND pushes response chunks via the sink. Returns
+/// `NET_RPC_OK` on clean close, non-zero with `*out_err` set on
+/// failure. There is NO terminal response body to return — the
+/// response stream's terminal frame is the call's terminator,
+/// emitted by the substrate fold after the Go handler returns.
+pub type RpcDuplexHandlerFn = unsafe extern "C" fn(
+    handler_id: u64,
+    request_stream: *mut RpcRequestStreamHandleC,
+    response_sink: *mut RpcResponseSinkHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int;
+
+/// Process-global Go-side dispatcher for client-streaming
+/// handlers. Set once via
+/// [`net_rpc_set_client_streaming_handler_dispatcher`].
+static CLIENT_STREAMING_DISPATCHER: OnceLock<RpcClientStreamingHandlerFn> = OnceLock::new();
+
+/// Process-global Go-side dispatcher for duplex handlers. Set
+/// once via [`net_rpc_set_duplex_handler_dispatcher`].
+static DUPLEX_DISPATCHER: OnceLock<RpcDuplexHandlerFn> = OnceLock::new();
+
+/// Register the process-wide client-streaming handler dispatcher.
+/// Idempotent — first registration wins (OnceLock semantics).
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_set_client_streaming_handler_dispatcher(
+    dispatcher: RpcClientStreamingHandlerFn,
+) {
+    let _ = CLIENT_STREAMING_DISPATCHER.set(dispatcher);
+}
+
+/// Register the process-wide duplex handler dispatcher.
+/// Idempotent — first registration wins.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_set_duplex_handler_dispatcher(dispatcher: RpcDuplexHandlerFn) {
+    let _ = DUPLEX_DISPATCHER.set(dispatcher);
+}
+
+/// Per-call opaque handle wrapping the SDK's `RequestStream`. The
+/// Go-side handler pulls request chunks via
+/// [`net_rpc_request_stream_next`] until it sees `STREAM_DONE`.
+///
+/// Lifetime is bounded by the dispatcher call — Rust constructs
+/// the handle, passes it to the Go dispatcher, and frees it
+/// after the dispatcher returns. The Go side MUST NOT call any
+/// `_free` on this handle.
+pub struct RpcRequestStreamHandleC {
+    inner: Mutex<Option<InnerRequestStream>>,
+    done: AtomicBool,
+}
+
+/// Pull the next inbound request chunk on this stream. Blocks
+/// the calling thread on `block_on(stream.next())` — the Go side
+/// is expected to call this from inside its dispatcher callback,
+/// which is already running on a `spawn_blocking` thread.
+///
+/// Returns:
+///   - `NET_RPC_OK`: `*out_chunk_ptr / *out_chunk_len` set.
+///     Caller frees the buffer via [`net_rpc_response_free`].
+///   - `NET_RPC_ERR_STREAM_DONE`: caller sent REQUEST_END, OR
+///     a CANCEL closed the stream early. `out_chunk_ptr` is
+///     `NULL`, `out_chunk_len` is `0`.
+///   - `NET_RPC_ERR_NULL`: handle is NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_request_stream_next(
+    handle: *mut RpcRequestStreamHandleC,
+    out_chunk_ptr: *mut *mut u8,
+    out_chunk_len: *mut usize,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if h.done.load(Ordering::Relaxed) {
+        unsafe {
+            *out_chunk_ptr = std::ptr::null_mut();
+            *out_chunk_len = 0;
+        }
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let inner_opt = h.inner.lock().take();
+    let mut stream = match inner_opt {
+        Some(s) => s,
+        None => {
+            h.done.store(true, Ordering::Relaxed);
+            unsafe {
+                *out_chunk_ptr = std::ptr::null_mut();
+                *out_chunk_len = 0;
+            }
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    use futures::StreamExt;
+    let result = runtime().block_on(async { stream.next().await });
+    match result {
+        Some(bytes) => {
+            *h.inner.lock() = Some(stream);
+            write_response(bytes.to_vec(), out_chunk_ptr, out_chunk_len);
+            NET_RPC_OK
+        }
+        None => {
+            drop(stream);
+            h.done.store(true, Ordering::Relaxed);
+            unsafe {
+                *out_chunk_ptr = std::ptr::null_mut();
+                *out_chunk_len = 0;
+            }
+            NET_RPC_ERR_STREAM_DONE
+        }
+    }
+}
+
+/// Per-call opaque handle wrapping the SDK's `RpcResponseSink`.
+/// Used by duplex handlers to emit response chunks. Same
+/// lifetime contract as `RpcRequestStreamHandleC` — Rust owns,
+/// Go borrows for the dispatcher call.
+pub struct RpcResponseSinkHandleC {
+    inner: Mutex<Option<InnerRpcResponseSink>>,
+}
+
+/// Emit one response chunk via the sink. Non-blocking
+/// (`try_send` semantics in the underlying SDK). Returns
+/// `NET_RPC_OK` on success; the SDK silently drops the chunk
+/// when the per-call mpsc is full (and bumps
+/// `streaming_chunks_dropped_total` in the per-service metrics).
+///
+/// Returns `NET_RPC_ERR_NULL` on NULL handle; doesn't write to
+/// `out_err`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_response_sink_send(
+    handle: *mut RpcResponseSinkHandleC,
+    body_ptr: *const u8,
+    body_len: usize,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let guard = h.inner.lock();
+    let sink = match guard.as_ref() {
+        Some(s) => s,
+        None => return NET_RPC_ERR_STREAM_DONE,
+    };
+    let body = if body_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
+    };
+    sink.send(body);
+    NET_RPC_OK
+}
+
+/// `RpcClientStreamingHandler` impl that bridges to the Go side.
+///
+/// **spawn_blocking lifecycle on timeout.** When
+/// `tokio::time::timeout` elapses, the outer future is cancelled
+/// and an Internal error returns to the substrate fold. The
+/// substrate then drops the per-call request mpsc sender as part
+/// of `senders.lock().remove(&key)` in the fold's spawn closure
+/// — at which point the Go handler's next `Recv()` call sees the
+/// receiver closed and returns `ErrStreamDone`. A cooperative Go
+/// handler exits naturally and `spawn_blocking` completes.
+///
+/// `spawn_blocking` tasks are NOT abort-on-handle-drop (tokio
+/// runs them on the blocking pool until the closure returns), so
+/// a misbehaving Go handler that ignores `ErrStreamDone` and
+/// loops on `Recv()` cannot be force-stopped from the Rust side.
+/// That is a Go-handler-correctness issue, not a Rust bug —
+/// document and let the operator's monitoring catch a runaway.
+struct GoClientStreamingRpcHandler {
+    handler_id: u64,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl RpcClientStreamingHandler for GoClientStreamingRpcHandler {
+    async fn call(
+        &self,
+        _ctx: RpcStreamingContext,
+        requests: InnerRequestStream,
+    ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
+        let dispatcher = match CLIENT_STREAMING_DISPATCHER.get() {
+            Some(d) => *d,
+            None => {
+                return Err(RpcHandlerError::Internal(
+                    "net_rpc_set_client_streaming_handler_dispatcher never called".into(),
+                ));
+            }
+        };
+        let handler_id = self.handler_id;
+        let timeout = self.timeout;
+        let stream_handle = Box::into_raw(Box::new(RpcRequestStreamHandleC {
+            inner: Mutex::new(Some(requests)),
+            done: AtomicBool::new(false),
+        }));
+        // `*mut T` is not `Send`. Smuggle the raw address through
+        // the closure boundary as a `usize`, then materialize it
+        // back into a pointer inside. Safe because (a) the box
+        // is uniquely owned (we just allocated it), (b) the
+        // address is opaque, (c) we drop the Box at the end of
+        // the closure on the same OS thread that ran the
+        // dispatcher (no cross-thread access during the call).
+        let stream_handle_addr = stream_handle as usize;
+
+        let join = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+                let stream_handle = stream_handle_addr as *mut RpcRequestStreamHandleC;
+                let mut resp_ptr: *mut u8 = std::ptr::null_mut();
+                let mut resp_len: usize = 0;
+                let mut err_ptr: *mut c_char = std::ptr::null_mut();
+                let code = unsafe {
+                    dispatcher(
+                        handler_id,
+                        stream_handle,
+                        &mut resp_ptr,
+                        &mut resp_len,
+                        &mut err_ptr,
+                    )
+                };
+                // Free the per-call request-stream handle. Drops
+                // any unconsumed RequestStream; CANCEL is the
+                // substrate fold's responsibility, not ours.
+                unsafe { drop(Box::from_raw(stream_handle)) };
+                if code == NET_RPC_OK {
+                    if resp_ptr.is_null() {
+                        return Ok(Vec::new());
+                    }
+                    let bytes =
+                        unsafe { std::slice::from_raw_parts(resp_ptr, resp_len).to_vec() };
+                    unsafe { libc::free(resp_ptr as *mut libc::c_void) };
+                    Ok(bytes)
+                } else {
+                    let msg = if err_ptr.is_null() {
+                        format!("Go client-streaming handler returned code {code} with no error message")
+                    } else {
+                        let s = unsafe { std::ffi::CStr::from_ptr(err_ptr) }
+                            .to_string_lossy()
+                            .into_owned();
+                        unsafe { libc::free(err_ptr as *mut libc::c_void) };
+                        s
+                    };
+                    Err(msg)
+                }
+            }),
+        )
+        .await;
+        let body = match join {
+            Ok(Ok(Ok(body))) => body,
+            Ok(Ok(Err(msg))) => return Err(RpcHandlerError::Internal(msg)),
+            Ok(Err(join_err)) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "Go client-streaming blocking task panicked: {join_err}"
+                )));
+            }
+            Err(_elapsed) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "Go client-streaming handler timed out after {}ms",
+                    timeout.as_millis()
+                )));
+            }
+        };
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body,
+        })
+    }
+}
+
+/// `RpcDuplexHandler` impl that bridges to the Go side. Same
+/// `spawn_blocking` lifecycle contract as
+/// [`GoClientStreamingRpcHandler`] — a cooperative Go handler
+/// that observes `ErrStreamDone` on its stream's `Recv()` exits
+/// naturally after Rust-side timeout; a non-cooperative one
+/// cannot be force-stopped.
+struct GoDuplexRpcHandler {
+    handler_id: u64,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl RpcDuplexHandler for GoDuplexRpcHandler {
+    async fn call(
+        &self,
+        _ctx: RpcStreamingContext,
+        requests: InnerRequestStream,
+        responses: InnerRpcResponseSink,
+    ) -> std::result::Result<(), RpcHandlerError> {
+        let dispatcher = match DUPLEX_DISPATCHER.get() {
+            Some(d) => *d,
+            None => {
+                return Err(RpcHandlerError::Internal(
+                    "net_rpc_set_duplex_handler_dispatcher never called".into(),
+                ));
+            }
+        };
+        let handler_id = self.handler_id;
+        let timeout = self.timeout;
+        let stream_handle = Box::into_raw(Box::new(RpcRequestStreamHandleC {
+            inner: Mutex::new(Some(requests)),
+            done: AtomicBool::new(false),
+        }));
+        let sink_handle = Box::into_raw(Box::new(RpcResponseSinkHandleC {
+            inner: Mutex::new(Some(responses)),
+        }));
+        // Same Send-smuggling pattern as the client-streaming
+        // handler — convert raw pointers to usize so the closure
+        // is Send.
+        let stream_handle_addr = stream_handle as usize;
+        let sink_handle_addr = sink_handle as usize;
+
+        let join = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let stream_handle = stream_handle_addr as *mut RpcRequestStreamHandleC;
+                let sink_handle = sink_handle_addr as *mut RpcResponseSinkHandleC;
+                let mut err_ptr: *mut c_char = std::ptr::null_mut();
+                let code =
+                    unsafe { dispatcher(handler_id, stream_handle, sink_handle, &mut err_ptr) };
+                // Free both per-call handles. Dropping the sink
+                // closes the response mpsc — the substrate fold's
+                // pump drains any final chunks then emits the
+                // terminal frame.
+                unsafe { drop(Box::from_raw(stream_handle)) };
+                unsafe { drop(Box::from_raw(sink_handle)) };
+                if code == NET_RPC_OK {
+                    Ok(())
+                } else {
+                    let msg = if err_ptr.is_null() {
+                        format!("Go duplex handler returned code {code} with no error message")
+                    } else {
+                        let s = unsafe { std::ffi::CStr::from_ptr(err_ptr) }
+                            .to_string_lossy()
+                            .into_owned();
+                        unsafe { libc::free(err_ptr as *mut libc::c_void) };
+                        s
+                    };
+                    Err(msg)
+                }
+            }),
+        )
+        .await;
+        match join {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
+            Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
+                "Go duplex blocking task panicked: {join_err}"
+            ))),
+            Err(_elapsed) => Err(RpcHandlerError::Internal(format!(
+                "Go duplex handler timed out after {}ms",
+                timeout.as_millis()
+            ))),
+        }
+    }
+}
+
+/// Register a client-streaming handler for `service`. Same
+/// pre-registration discipline as [`net_rpc_serve`] — the Go
+/// side reserves a handler_id, inserts its callable into its
+/// registry under that id, THEN calls this function. Returns
+/// NULL with `out_err` set on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_serve_client_stream(
+    handle: *mut MeshRpcHandle,
+    service_ptr: *const c_char,
+    service_len: usize,
+    handler_id: u64,
+    handler_timeout_ms: u64,
+    out_err: *mut *mut c_char,
+) -> *mut ServeHandleC {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        write_err(out_err, "MeshRpc handle is NULL".into());
+        return std::ptr::null_mut();
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return std::ptr::null_mut();
+    };
+    if CLIENT_STREAMING_DISPATCHER.get().is_none() {
+        write_err(
+            out_err,
+            "net_rpc_set_client_streaming_handler_dispatcher must be called before net_rpc_serve_client_stream".into(),
+        );
+        return std::ptr::null_mut();
+    }
+    if handler_id == 0 {
+        write_err(
+            out_err,
+            "handler_id must be non-zero (reserve via net_rpc_reserve_handler_id)".into(),
+        );
+        return std::ptr::null_mut();
+    }
+    let timeout = if handler_timeout_ms == 0 {
+        DEFAULT_HANDLER_TIMEOUT
+    } else {
+        Duration::from_millis(handler_timeout_ms)
+    };
+    let rust_handler = Arc::new(GoClientStreamingRpcHandler {
+        handler_id,
+        timeout,
+    });
+    match h.node.serve_rpc_client_stream(&service, rust_handler) {
+        Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            handler_id,
+        })),
+        Err(e) => {
+            write_err(out_err, format!("serve failed: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Register a duplex handler for `service`. Same pre-registration
+/// discipline as [`net_rpc_serve`] / [`net_rpc_serve_client_stream`].
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_serve_duplex(
+    handle: *mut MeshRpcHandle,
+    service_ptr: *const c_char,
+    service_len: usize,
+    handler_id: u64,
+    handler_timeout_ms: u64,
+    out_err: *mut *mut c_char,
+) -> *mut ServeHandleC {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        write_err(out_err, "MeshRpc handle is NULL".into());
+        return std::ptr::null_mut();
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return std::ptr::null_mut();
+    };
+    if DUPLEX_DISPATCHER.get().is_none() {
+        write_err(
+            out_err,
+            "net_rpc_set_duplex_handler_dispatcher must be called before net_rpc_serve_duplex"
+                .into(),
+        );
+        return std::ptr::null_mut();
+    }
+    if handler_id == 0 {
+        write_err(
+            out_err,
+            "handler_id must be non-zero (reserve via net_rpc_reserve_handler_id)".into(),
+        );
+        return std::ptr::null_mut();
+    }
+    let timeout = if handler_timeout_ms == 0 {
+        DEFAULT_HANDLER_TIMEOUT
+    } else {
+        Duration::from_millis(handler_timeout_ms)
+    };
+    let rust_handler = Arc::new(GoDuplexRpcHandler {
+        handler_id,
+        timeout,
+    });
+    match h.node.serve_rpc_duplex(&service, rust_handler) {
+        Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            handler_id,
+        })),
+        Err(e) => {
+            write_err(out_err, format!("serve failed: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// =========================================================================
 // Tests for pure-logic helpers.
 // =========================================================================
 
@@ -1751,7 +3186,206 @@ mod tests {
     #[test]
     fn abi_version_matches_constant() {
         assert_eq!(net_rpc_abi_version(), NET_RPC_ABI_VERSION);
-        assert_eq!(NET_RPC_ABI_VERSION, 0x0001);
+        // Phase B8-1 bumps to 0x0002 — adds client-streaming
+        // caller-side surface. Pin so a regression to 0x0001
+        // (or skipping ahead to 0x0003 without B8-2 landing)
+        // surfaces in tests.
+        assert_eq!(NET_RPC_ABI_VERSION, 0x0002);
+    }
+
+    /// `net_rpc_client_stream_send` on a NULL handle returns
+    /// `NET_RPC_ERR_NULL` without dereferencing — same safety
+    /// contract as every other handle-taking function.
+    #[test]
+    fn client_stream_send_on_null_handle_is_safe() {
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let body = b"x";
+        let code = net_rpc_client_stream_send(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            body.len(),
+            &mut err_ptr,
+        );
+        assert_eq!(code, NET_RPC_ERR_NULL);
+        assert!(err_ptr.is_null());
+    }
+
+    /// `net_rpc_client_stream_finish` on a NULL handle returns
+    /// `NET_RPC_ERR_NULL`; out-params untouched.
+    #[test]
+    fn client_stream_finish_on_null_handle_is_safe() {
+        let mut body_ptr: *mut u8 = std::ptr::null_mut();
+        let mut body_len: usize = 0;
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let code = net_rpc_client_stream_finish(
+            std::ptr::null_mut(),
+            &mut body_ptr,
+            &mut body_len,
+            &mut err_ptr,
+        );
+        assert_eq!(code, NET_RPC_ERR_NULL);
+        assert!(body_ptr.is_null());
+        assert_eq!(body_len, 0);
+        assert!(err_ptr.is_null());
+    }
+
+    /// `net_rpc_client_stream_call_id` on a NULL handle returns
+    /// `0` (matches the existing `_stream_call_id` convention —
+    /// `0` is a reserved no-call sentinel).
+    #[test]
+    fn client_stream_call_id_on_null_handle_returns_zero() {
+        assert_eq!(net_rpc_client_stream_call_id(std::ptr::null()), 0);
+    }
+
+    /// `net_rpc_client_stream_free` on NULL is a no-op (matches
+    /// every other free function's idempotency contract).
+    #[test]
+    fn client_stream_free_on_null_is_no_op() {
+        net_rpc_client_stream_free(std::ptr::null_mut());
+    }
+
+    /// Sends to an already-done handle (latched done by setting
+    /// the AtomicBool directly) return `NET_RPC_ERR_STREAM_DONE`
+    /// without touching the inner mutex. Pin: a stray `send`
+    /// after a successful `finish` is harmless, not UB.
+    #[test]
+    fn client_stream_send_after_done_returns_stream_done() {
+        let handle = Box::into_raw(Box::new(ClientStreamCallHandleC {
+            inner: Arc::new(Mutex::new(None)),
+            call_id: 42,
+            done: AtomicBool::new(true),
+        }));
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let body = b"x";
+        let code = net_rpc_client_stream_send(handle, body.as_ptr(), body.len(), &mut err_ptr);
+        assert_eq!(code, NET_RPC_ERR_STREAM_DONE);
+        assert!(err_ptr.is_null());
+        net_rpc_client_stream_free(handle);
+    }
+
+    // ----- B8-2 duplex null-safety pins. -----
+
+    #[test]
+    fn duplex_send_on_null_handle_is_safe() {
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let body = b"x";
+        let code = net_rpc_duplex_send(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            body.len(),
+            &mut err_ptr,
+        );
+        assert_eq!(code, NET_RPC_ERR_NULL);
+        assert!(err_ptr.is_null());
+    }
+
+    #[test]
+    fn duplex_finish_sending_on_null_handle_is_safe() {
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let code = net_rpc_duplex_finish_sending(std::ptr::null_mut(), &mut err_ptr);
+        assert_eq!(code, NET_RPC_ERR_NULL);
+        assert!(err_ptr.is_null());
+    }
+
+    #[test]
+    fn duplex_next_on_null_handle_is_safe() {
+        let mut body_ptr: *mut u8 = std::ptr::null_mut();
+        let mut body_len: usize = 0;
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let code = net_rpc_duplex_next(
+            std::ptr::null_mut(),
+            &mut body_ptr,
+            &mut body_len,
+            &mut err_ptr,
+        );
+        assert_eq!(code, NET_RPC_ERR_NULL);
+        assert!(body_ptr.is_null());
+        assert_eq!(body_len, 0);
+        assert!(err_ptr.is_null());
+    }
+
+    #[test]
+    fn duplex_into_split_on_null_handle_is_safe() {
+        let mut out_sink: *mut DuplexSinkHandleC = std::ptr::null_mut();
+        let mut out_stream: *mut DuplexStreamHandleC = std::ptr::null_mut();
+        let mut err_ptr: *mut c_char = std::ptr::null_mut();
+        let code = net_rpc_duplex_into_split(
+            std::ptr::null_mut(),
+            &mut out_sink,
+            &mut out_stream,
+            &mut err_ptr,
+        );
+        assert_eq!(code, NET_RPC_ERR_NULL);
+    }
+
+    #[test]
+    fn duplex_call_id_on_null_returns_zero() {
+        assert_eq!(net_rpc_duplex_call_id(std::ptr::null()), 0);
+        assert_eq!(net_rpc_duplex_sink_call_id(std::ptr::null()), 0);
+        assert_eq!(net_rpc_duplex_stream_call_id(std::ptr::null()), 0);
+    }
+
+    #[test]
+    fn duplex_free_on_null_is_no_op() {
+        net_rpc_duplex_free(std::ptr::null_mut());
+        net_rpc_duplex_sink_free(std::ptr::null_mut());
+        net_rpc_duplex_stream_free(std::ptr::null_mut());
+    }
+
+    // ----- B8-5 server-side null-safety pins. -----
+
+    #[test]
+    fn request_stream_next_on_null_is_safe() {
+        let mut chunk_ptr: *mut u8 = std::ptr::null_mut();
+        let mut chunk_len: usize = 0;
+        let code =
+            net_rpc_request_stream_next(std::ptr::null_mut(), &mut chunk_ptr, &mut chunk_len);
+        assert_eq!(code, NET_RPC_ERR_NULL);
+        assert!(chunk_ptr.is_null());
+        assert_eq!(chunk_len, 0);
+    }
+
+    #[test]
+    fn response_sink_send_on_null_is_safe() {
+        let body = b"x";
+        let code = net_rpc_response_sink_send(std::ptr::null_mut(), body.as_ptr(), body.len());
+        assert_eq!(code, NET_RPC_ERR_NULL);
+    }
+
+    /// `request_stream_next` on a handle whose inner is `None`
+    /// (already consumed / never populated) returns
+    /// `NET_RPC_ERR_STREAM_DONE` without panicking. Direct
+    /// construction lets the test cover the path without
+    /// standing up a real Mesh.
+    #[test]
+    fn request_stream_next_on_consumed_handle_returns_stream_done() {
+        let handle = Box::into_raw(Box::new(RpcRequestStreamHandleC {
+            inner: Mutex::new(None),
+            done: AtomicBool::new(false),
+        }));
+        let mut chunk_ptr: *mut u8 = std::ptr::null_mut();
+        let mut chunk_len: usize = 0;
+        let code = net_rpc_request_stream_next(handle, &mut chunk_ptr, &mut chunk_len);
+        assert_eq!(code, NET_RPC_ERR_STREAM_DONE);
+        assert!(chunk_ptr.is_null());
+        assert_eq!(chunk_len, 0);
+        unsafe { drop(Box::from_raw(handle)) };
+    }
+
+    /// `response_sink_send` on a handle whose inner is `None`
+    /// returns `NET_RPC_ERR_STREAM_DONE`. Pin: a duplex handler
+    /// that emits chunks AFTER the underlying sink has been
+    /// dropped (race with the substrate fold's terminal-frame
+    /// emission) gets a clean error code, not UB.
+    #[test]
+    fn response_sink_send_on_consumed_handle_returns_stream_done() {
+        let handle = Box::into_raw(Box::new(RpcResponseSinkHandleC {
+            inner: Mutex::new(None),
+        }));
+        let body = b"x";
+        let code = net_rpc_response_sink_send(handle, body.as_ptr(), body.len());
+        assert_eq!(code, NET_RPC_ERR_STREAM_DONE);
+        unsafe { drop(Box::from_raw(handle)) };
     }
 
     /// `net_rpc_stream_next` on a `done`-latched handle returns

@@ -1,13 +1,14 @@
-//! `net rpc (call|stream|discover|services)` — typed-RPC client
-//! surface.
+//! `net rpc (call|stream|client-stream|duplex|discover|services)` —
+//! typed-RPC client surface.
 //!
 //! **Phase 2 status: design stub.** The clap router intentionally
 //! does not yet expose these subcommands. nRPC routing
 //! (`MeshAdapter::call_service`, `find_service_nodes`,
-//! `call_streaming`) requires a live `Mesh` instance — a real
-//! UDP-bound socket plus the NAT-classifier task — not the
-//! in-process `MeshOsDaemonSdk` Phase 1's commands use. The two
-//! runtimes are structurally distinct:
+//! `call_streaming`, `call_client_stream`, `call_duplex`)
+//! requires a live `Mesh` instance — a real UDP-bound socket plus
+//! the NAT-classifier task — not the in-process
+//! `MeshOsDaemonSdk` Phase 1's commands use. The two runtimes
+//! are structurally distinct:
 //!
 //! - `MeshOsDaemonSdk` (Phase 1) — a fold over substrate events;
 //!   no socket, no peer transport. Suitable for snapshot reads

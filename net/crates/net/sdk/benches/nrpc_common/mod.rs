@@ -39,6 +39,8 @@ pub const SVC_JSON: &str = "bench_echo_json";
 pub const SVC_POSTCARD: &str = "bench_echo_postcard";
 pub const SVC_RAW: &str = "bench_echo_raw";
 pub const SVC_JSON_STREAM: &str = "bench_stream_json";
+pub const SVC_JSON_CLIENT_STREAM: &str = "bench_client_stream_json";
+pub const SVC_JSON_DUPLEX: &str = "bench_duplex_json";
 
 // ============================================================================
 // Echo wire types — the same logical `String` body across all
@@ -147,6 +149,44 @@ impl Pair {
             )
             .expect("serve stream");
 
+        // Client-streaming echo — collects N typed requests and
+        // returns a count. Used by the Phase F client-streaming
+        // bench.
+        let h_client_stream = server
+            .serve_rpc_client_stream_typed(
+                SVC_JSON_CLIENT_STREAM,
+                Codec::Json,
+                |mut requests: net_sdk::mesh_rpc::RequestStreamTyped<EchoReq>| async move {
+                    use futures::StreamExt;
+                    let mut count = 0u64;
+                    while let Some(item) = requests.next().await {
+                        std::hint::black_box(item.map_err(|e| format!("decode: {e}"))?);
+                        count += 1;
+                    }
+                    Ok::<_, String>(EchoResp {
+                        body: count.to_string(),
+                    })
+                },
+            )
+            .expect("serve client_stream");
+
+        // Duplex echo — emits one Resp per inbound Req. Used by
+        // the Phase F duplex bench.
+        let h_duplex = server
+            .serve_rpc_duplex_typed(
+                SVC_JSON_DUPLEX,
+                Codec::Json,
+                |mut requests: net_sdk::mesh_rpc::RequestStreamTyped<EchoReq>, sink| async move {
+                    use futures::StreamExt;
+                    while let Some(item) = requests.next().await {
+                        let item: EchoReq = item.map_err(|e| format!("decode: {e}"))?;
+                        sink.send(&EchoResp { body: item.body })?;
+                    }
+                    Ok::<_, String>(())
+                },
+            )
+            .expect("serve duplex");
+
         // Announce + wait for discovery — required for the
         // `call_service_typed` (discovery) path.
         server
@@ -170,7 +210,7 @@ impl Pair {
             server,
             caller,
             server_node_id: server_id,
-            _handles: vec![h_json, h_post, h_raw, h_stream],
+            _handles: vec![h_json, h_post, h_raw, h_stream, h_client_stream, h_duplex],
         }
     }
 }

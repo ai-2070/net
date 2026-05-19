@@ -54,10 +54,14 @@ use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 
 use ::net::adapter::net::cortex::{
-    RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+    RequestStream as InnerRequestStream, RpcClientStreamingHandler, RpcContext, RpcDuplexHandler,
+    RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink,
+    RpcStatus, RpcStreamingContext,
 };
 use ::net::adapter::net::mesh_rpc::{
-    CallOptions as InnerCallOptions, RpcError as InnerRpcError, RpcStream as InnerRpcStream,
+    CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
+    DuplexCallRaw as InnerDuplexCallRaw, DuplexSink as InnerDuplexSink,
+    DuplexStream as InnerDuplexStream, RpcError as InnerRpcError, RpcStream as InnerRpcStream,
     ServeHandle as InnerServeHandle,
 };
 use ::net::adapter::net::MeshNode;
@@ -296,6 +300,19 @@ fn call_options_from_dict(opts: Option<&Bound<'_, PyDict>>) -> PyResult<InnerCal
             pyo3::exceptions::PyTypeError::new_err(format!("{key} must be int: {e}"))
         })?;
         inner.stream_window_initial = Some(n);
+    }
+    // ABI 0x0002 — request-direction credit window for client-
+    // streaming + duplex. Same canonical / alias treatment as the
+    // response-side window key.
+    let request_window = match d.get_item("request_window_initial")? {
+        Some(v) => Some(("request_window_initial", v)),
+        None => d.get_item("request_window")?.map(|v| ("request_window", v)),
+    };
+    if let Some((key, v)) = request_window {
+        let n: u32 = v.extract().map_err(|e| {
+            pyo3::exceptions::PyTypeError::new_err(format!("{key} must be int: {e}"))
+        })?;
+        inner.request_window_initial = Some(n);
     }
     // Phase 9b: caller-supplied request headers. Accepts a
     // `List[Tuple[str, bytes]]` — each entry's name is a
@@ -608,6 +625,792 @@ impl PyRpcStream {
     }
 }
 
+// ============================================================================
+// ABI 0x0002 — Client-streaming caller-side (Phase B10-1).
+//
+// Same Arc<Mutex<Option<InnerClientStreamCallRaw>>> pattern as
+// PyRpcStream — take the inner across each block_on so close()
+// can race cleanly. finish() takes the inner permanently
+// (consumes the call); close() releases without REQUEST_END.
+// ============================================================================
+
+/// Open client-streaming call. Push chunks via ``send(bytes)``,
+/// then ``finish()`` to await the terminal response. ``close()``
+/// fires CANCEL via the SDK's Drop if finish wasn't reached.
+#[pyclass(name = "ClientStreamCall", module = "_net")]
+pub struct PyClientStreamCall {
+    inner: Arc<Mutex<Option<InnerClientStreamCallRaw>>>,
+    runtime: Arc<Runtime>,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+    /// Lets ``close()`` interrupt a pending ``send()`` blocked on
+    /// flow-control credit. Same role as the Node binding's
+    /// ``close_notify`` — a Notify permit fires the select branch
+    /// in send and the call is dropped (CANCEL fires from Drop).
+    close_notify: Arc<tokio::sync::Notify>,
+}
+
+#[pymethods]
+impl PyClientStreamCall {
+    /// Push one body chunk. Encodes as the initial REQUEST (first
+    /// call) or as a REQUEST_CHUNK (subsequent). Blocks until the
+    /// SDK accepts the chunk (under flow control, blocks for one
+    /// upload credit).
+    ///
+    /// Concurrent ``close()`` interrupts the await — send returns
+    /// ``RpcError("send aborted by close()")`` instead of hanging
+    /// forever on a credit grant that will never arrive.
+    fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        let notify = self.close_notify.clone();
+        py.detach(|| {
+            runtime.block_on(async move {
+                let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(c) => c,
+                    None => return Err(RpcError::new_err("client-stream call already closed")),
+                };
+                let result = tokio::select! {
+                    r = call.send(body_bytes) => r,
+                    _ = notify.notified() => {
+                        // close() fired. Drop the call (which
+                        // fires CANCEL via SDK's Drop).
+                        drop(call);
+                        return Err(RpcError::new_err("send aborted by close()"));
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        drop(call);
+                        Err(rpc_error_to_pyerr(e))
+                    }
+                }
+            })
+        })
+    }
+
+    /// Close the upload direction (emit REQUEST_END) and await
+    /// the server's terminal response. Consumes the call.
+    fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let result = py.detach(|| {
+            runtime.block_on(async move {
+                let call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(c) => c,
+                    None => return Err(RpcError::new_err("client-stream call already closed")),
+                };
+                call.finish().await.map_err(rpc_error_to_pyerr)
+            })
+        })?;
+        Ok(PyBytes::new(py, result.body.as_ref()))
+    }
+
+    /// Server-assigned `call_id` for diagnostics / trace
+    /// correlation.
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+
+    /// ``True`` if the call was opened with a non-``None``
+    /// ``request_window_initial``.
+    fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close without finishing. Fires CANCEL via the SDK's Drop
+    /// if the initial REQUEST has already flown. Idempotent.
+    /// Concurrent in-flight ``send()`` waiting on credit is
+    /// interrupted via the close-notify.
+    fn close(&self) {
+        self.close_notify.notify_one();
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = guard.take();
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+    fn __exit__(
+        &self,
+        _exc_type: Option<Bound<'_, PyAny>>,
+        _exc_value: Option<Bound<'_, PyAny>>,
+        _traceback: Option<Bound<'_, PyAny>>,
+    ) -> bool {
+        self.close();
+        false
+    }
+}
+
+// ============================================================================
+// ABI 0x0002 — Duplex caller-side (Phase B10-1).
+// ============================================================================
+
+/// Open duplex call. Combined send + receive surface. Use
+/// ``into_split()`` to get independent ``DuplexSink`` +
+/// ``DuplexStream`` halves.
+#[pyclass(name = "DuplexCall", module = "_net")]
+pub struct PyDuplexCall {
+    inner: Arc<Mutex<Option<InnerDuplexCallRaw>>>,
+    runtime: Arc<Runtime>,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+    /// Same role as ``PyClientStreamCall::close_notify`` — lets
+    /// ``close()`` interrupt a pending ``send()`` blocked on
+    /// flow-control credit.
+    close_notify: Arc<tokio::sync::Notify>,
+}
+
+#[pymethods]
+impl PyDuplexCall {
+    /// Push one body chunk to the server.
+    ///
+    /// Concurrent ``close()`` interrupts the await via the
+    /// close-notify (same shape as ``ClientStreamCall.send``).
+    fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        let notify = self.close_notify.clone();
+        py.detach(|| {
+            runtime.block_on(async move {
+                let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(c) => c,
+                    None => return Err(RpcError::new_err("duplex call already closed")),
+                };
+                let result = tokio::select! {
+                    r = call.send(body_bytes) => r,
+                    _ = notify.notified() => {
+                        drop(call);
+                        return Err(RpcError::new_err("send aborted by close()"));
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        drop(call);
+                        Err(rpc_error_to_pyerr(e))
+                    }
+                }
+            })
+        })
+    }
+
+    /// Close the upload direction (emit REQUEST_END). Response
+    /// stream stays open for subsequent ``next()`` calls.
+    fn finish_sending(&self, py: Python<'_>) -> PyResult<()> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        py.detach(|| {
+            runtime.block_on(async move {
+                let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(c) => c,
+                    None => return Err(RpcError::new_err("duplex call already closed")),
+                };
+                let result = call.finish_sending().await;
+                *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                result.map_err(rpc_error_to_pyerr)
+            })
+        })
+    }
+
+    /// Pull the next response chunk. Returns ``bytes`` on success;
+    /// raises ``StopIteration`` on clean EOF; raises an
+    /// ``RpcError`` subclass on terminal non-Ok status.
+    ///
+    /// Python iter protocol — ``DuplexCall`` is iterable. Use it
+    /// either as ``for chunk in call:`` or via explicit
+    /// ``next(call)``.
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let result = py.detach(|| {
+            runtime.block_on(async move {
+                let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(c) => c,
+                    None => return Err(RpcError::new_err("duplex call already closed")),
+                };
+                let next = call.next().await;
+                match next {
+                    Some(Ok(bytes)) => {
+                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                        Ok::<Option<Bytes>, PyErr>(Some(bytes))
+                    }
+                    Some(Err(e)) => {
+                        drop(call);
+                        Err(rpc_error_to_pyerr(e))
+                    }
+                    None => {
+                        drop(call);
+                        Ok(None)
+                    }
+                }
+            })
+        })?;
+        match result {
+            Some(bytes) => Ok(PyBytes::new(py, &bytes)),
+            None => Err(pyo3::exceptions::PyStopIteration::new_err(())),
+        }
+    }
+
+    /// Split the call into independent send + receive halves.
+    /// Returns ``(sink, stream)``. After ``into_split``, the
+    /// original ``DuplexCall`` is "done" — subsequent ``send`` /
+    /// ``finish_sending`` / ``__next__`` raise ``RpcError``.
+    #[pyo3(name = "into_split")]
+    fn split(&self) -> PyResult<(PyDuplexSink, PyDuplexStream)> {
+        let call = self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .ok_or_else(|| RpcError::new_err("duplex call already closed"))?;
+        let call_id = call.call_id();
+        let flow_controlled = call.flow_controlled();
+        let (sink, stream) = call.into_split();
+        Ok((
+            PyDuplexSink {
+                inner: Arc::new(Mutex::new(Some(sink))),
+                runtime: self.runtime.clone(),
+                call_id_cached: call_id,
+                flow_controlled_cached: flow_controlled,
+                close_notify: Arc::new(tokio::sync::Notify::new()),
+            },
+            PyDuplexStream {
+                inner: Arc::new(Mutex::new(Some(stream))),
+                runtime: self.runtime.clone(),
+                call_id_cached: call_id,
+            },
+        ))
+    }
+
+    /// Server-assigned `call_id`.
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+
+    /// ``True`` if the call was opened with a non-``None``
+    /// ``request_window_initial``.
+    fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close the call. Fires CANCEL via the SDK's Drop.
+    /// Idempotent. Concurrent in-flight ``send()`` waiting on
+    /// credit is interrupted via the close-notify.
+    fn close(&self) {
+        self.close_notify.notify_one();
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = guard.take();
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+    fn __exit__(
+        &self,
+        _exc_type: Option<Bound<'_, PyAny>>,
+        _exc_value: Option<Bound<'_, PyAny>>,
+        _traceback: Option<Bound<'_, PyAny>>,
+    ) -> bool {
+        self.close();
+        false
+    }
+}
+
+/// Send-half of a ``DuplexCall`` after ``into_split``.
+#[pyclass(name = "DuplexSink", module = "_net")]
+pub struct PyDuplexSink {
+    inner: Arc<Mutex<Option<InnerDuplexSink>>>,
+    runtime: Arc<Runtime>,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+    /// Same role as ``PyClientStreamCall::close_notify``.
+    close_notify: Arc<tokio::sync::Notify>,
+}
+
+#[pymethods]
+impl PyDuplexSink {
+    /// Push one body chunk to the server. Concurrent ``close()``
+    /// interrupts the await via the close-notify (same shape as
+    /// ``DuplexCall.send``).
+    fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        let notify = self.close_notify.clone();
+        py.detach(|| {
+            runtime.block_on(async move {
+                let mut sink = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(s) => s,
+                    None => return Err(RpcError::new_err("duplex sink already closed")),
+                };
+                let result = tokio::select! {
+                    r = sink.send(body_bytes) => r,
+                    _ = notify.notified() => {
+                        drop(sink);
+                        return Err(RpcError::new_err("send aborted by close()"));
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        drop(sink);
+                        Err(rpc_error_to_pyerr(e))
+                    }
+                }
+            })
+        })
+    }
+
+    /// Close the upload direction (emit REQUEST_END). Consumes
+    /// the sink — subsequent ``send`` raises.
+    fn finish(&self, py: Python<'_>) -> PyResult<()> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        py.detach(|| {
+            runtime.block_on(async move {
+                let sink = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(s) => s,
+                    None => return Err(RpcError::new_err("duplex sink already closed")),
+                };
+                sink.finish_sending().await.map_err(rpc_error_to_pyerr)
+            })
+        })
+    }
+
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+    fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+    fn close(&self) {
+        self.close_notify.notify_one();
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = guard.take();
+    }
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+    fn __exit__(
+        &self,
+        _exc_type: Option<Bound<'_, PyAny>>,
+        _exc_value: Option<Bound<'_, PyAny>>,
+        _traceback: Option<Bound<'_, PyAny>>,
+    ) -> bool {
+        self.close();
+        false
+    }
+}
+
+/// Receive-half of a ``DuplexCall`` after ``into_split``.
+/// Python iterator over response chunks.
+#[pyclass(name = "DuplexStream", module = "_net")]
+pub struct PyDuplexStream {
+    inner: Arc<Mutex<Option<InnerDuplexStream>>>,
+    runtime: Arc<Runtime>,
+    call_id_cached: u64,
+}
+
+#[pymethods]
+impl PyDuplexStream {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let result = py.detach(|| {
+            runtime.block_on(async move {
+                let mut stream = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(s) => s,
+                    None => return Err(RpcError::new_err("duplex stream already closed")),
+                };
+                use futures::StreamExt;
+                let next = stream.next().await;
+                match next {
+                    Some(Ok(bytes)) => {
+                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(stream);
+                        Ok::<Option<Bytes>, PyErr>(Some(bytes))
+                    }
+                    Some(Err(e)) => {
+                        drop(stream);
+                        Err(rpc_error_to_pyerr(e))
+                    }
+                    None => {
+                        drop(stream);
+                        Ok(None)
+                    }
+                }
+            })
+        })?;
+        match result {
+            Some(bytes) => Ok(PyBytes::new(py, &bytes)),
+            None => Err(pyo3::exceptions::PyStopIteration::new_err(())),
+        }
+    }
+
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+    fn close(&self) {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = guard.take();
+    }
+}
+
+// ============================================================================
+// ABI 0x0002 — Server-side handler primitives (Phase B10-2).
+//
+// PyRequestStreamRecv wraps the SDK's RequestStream and is
+// handed to Python handlers as a Python iterator over inbound
+// chunk bodies. PyResponseSinkSend wraps RpcResponseSink for
+// duplex handlers.
+//
+// Python handler signatures:
+//
+//   # Client-streaming
+//   def handler(stream):
+//       total = 0
+//       for chunk in stream:
+//           total += len(chunk)
+//       return total.to_bytes(8, "little")
+//
+//   # Duplex
+//   def handler(stream, sink):
+//       for chunk in stream:
+//           sink.send(b"echo:" + chunk)
+//
+// Lifetime: bounded by the handler callback. The SDK's
+// underlying RequestStream / RpcResponseSink are taken into
+// these wrappers at handler dispatch and dropped when the
+// wrappers are dropped (which happens when Python releases its
+// references after the handler returns).
+// ============================================================================
+
+/// Inbound request-stream iterable for client-streaming + duplex
+/// server handlers. Use the Python iter protocol:
+/// ``for chunk in stream: ...`` or explicit ``next(stream)``.
+/// Raises ``StopIteration`` on EOF (REQUEST_END / CANCEL).
+///
+/// Carries the per-call streaming context as attributes:
+/// ``caller_origin`` (peer identity hash), ``call_id`` (substrate
+/// call id), ``deadline_ns`` (Unix-nanos absolute, 0 means
+/// "no deadline"), and ``headers`` (list of [name, bytes] tuples).
+///
+/// **Asyncio adapter.** The class is intentionally a sync
+/// iterator — ``__next__`` blocks the calling thread on
+/// ``runtime.block_on`` (with the GIL released). Asyncio
+/// consumers should bridge via ``asyncio.to_thread``:
+///
+/// ```python
+/// import asyncio
+///
+/// async def consume_stream(stream):
+///     # `asyncio.to_thread(next, stream, None)` runs the
+///     # blocking `next()` on the default executor's thread
+///     # pool and returns control to the event loop until a
+///     # chunk arrives. Once None comes back the stream is done.
+///     while (chunk := await asyncio.to_thread(next, stream, None)) is not None:
+///         handle(chunk)
+/// ```
+///
+/// This keeps the binding surface minimal (no pyo3-asyncio
+/// dependency, no async-method machinery) while still letting
+/// asyncio-native handlers drain the stream without blocking
+/// their event loop.
+#[pyclass(name = "RequestStreamRecv", module = "_net")]
+pub struct PyRequestStreamRecv {
+    inner: Arc<Mutex<Option<InnerRequestStream>>>,
+    runtime: Arc<Runtime>,
+    caller_origin: u64,
+    call_id: u64,
+    deadline_ns: u64,
+    headers: Arc<Vec<(String, Vec<u8>)>>,
+}
+
+#[pymethods]
+impl PyRequestStreamRecv {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Caller's peer origin hash.
+    #[getter]
+    fn caller_origin(&self) -> u64 {
+        self.caller_origin
+    }
+
+    /// Substrate-minted call id (stable for the call lifetime).
+    #[getter]
+    fn call_id(&self) -> u64 {
+        self.call_id
+    }
+
+    /// Caller's declared deadline as Unix-nanos absolute; 0 means
+    /// no deadline. Handlers MAY observe it to short-circuit
+    /// slow work past the wire deadline.
+    #[getter]
+    fn deadline_ns(&self) -> u64 {
+        self.deadline_ns
+    }
+
+    /// Initial-REQUEST headers as a list of (name, bytes) tuples.
+    /// Names are lowercase per the substrate convention.
+    #[getter]
+    fn headers<'py>(&self, py: Python<'py>) -> Vec<(String, Bound<'py, PyBytes>)> {
+        self.headers
+            .iter()
+            .map(|(n, v)| (n.clone(), PyBytes::new(py, v)))
+            .collect()
+    }
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let result: Option<Bytes> = py.detach(|| {
+            runtime.block_on(async move {
+                let mut stream = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(s) => s,
+                    None => return None,
+                };
+                use futures::StreamExt;
+                let next = stream.next().await;
+                match next {
+                    Some(bytes) => {
+                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(stream);
+                        Some(bytes)
+                    }
+                    None => {
+                        drop(stream);
+                        None
+                    }
+                }
+            })
+        });
+        match result {
+            Some(bytes) => Ok(PyBytes::new(py, &bytes)),
+            None => Err(pyo3::exceptions::PyStopIteration::new_err(())),
+        }
+    }
+}
+
+/// Outbound response sink for duplex handlers. Emit chunks via
+/// ``sink.send(bytes)``. Non-blocking (SDK try_send under the
+/// hood); returns ``True`` on success, ``False`` if the sink
+/// was already torn down.
+#[pyclass(name = "ResponseSinkSend", module = "_net")]
+pub struct PyResponseSinkSend {
+    inner: Arc<Mutex<Option<InnerRpcResponseSink>>>,
+}
+
+#[pymethods]
+impl PyResponseSinkSend {
+    /// Emit one chunk. Returns ``True`` on success.
+    ///
+    /// Non-blocking by design — this is `try_send` into a bounded
+    /// 1024-chunk mpsc feeding the response pump. The pump itself
+    /// awaits per-call credit (`stream_window_initial` opt-in)
+    /// before publishing to the wire; if the pump stalls on
+    /// credit, the mpsc fills and excess chunks are dropped (and
+    /// counted via `streaming_chunks_dropped_total`). Handlers
+    /// honor flow control by pacing their emits to the protocol's
+    /// REQUEST_GRANT cadence rather than burst-pushing. Matches
+    /// the Rust SDK's `ResponseSinkTyped::send` contract.
+    fn send<'py>(&self, body: &Bound<'py, PyBytes>) -> bool {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.as_ref() {
+            Some(sink) => {
+                sink.send(Bytes::copy_from_slice(body.as_bytes()));
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// `RpcClientStreamingHandler` impl bridging to a Python
+/// callable.
+struct PyRpcClientStreamingHandler {
+    callable: Py<PyAny>,
+    timeout: Duration,
+    runtime: Arc<Runtime>,
+}
+
+#[async_trait::async_trait]
+impl RpcClientStreamingHandler for PyRpcClientStreamingHandler {
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        requests: InnerRequestStream,
+    ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
+        let callable = Python::attach(|py| self.callable.clone_ref(py));
+        let runtime = self.runtime.clone();
+        let stream_inner = Arc::new(Mutex::new(Some(requests)));
+        let ctx_caller_origin = ctx.caller_origin;
+        let ctx_call_id = ctx.call_id;
+        let ctx_deadline_ns = ctx.deadline_ns;
+        let ctx_headers = Arc::new(ctx.headers);
+        let result = tokio::time::timeout(
+            self.timeout,
+            tokio::task::spawn_blocking(move || -> Result<HandlerOutcome, String> {
+                Python::attach(|py| -> Result<HandlerOutcome, String> {
+                    let stream_obj = Py::new(
+                        py,
+                        PyRequestStreamRecv {
+                            inner: stream_inner,
+                            runtime,
+                            caller_origin: ctx_caller_origin,
+                            call_id: ctx_call_id,
+                            deadline_ns: ctx_deadline_ns,
+                            headers: ctx_headers,
+                        },
+                    )
+                    .map_err(|e| format!("failed to build request stream: {e}"))?;
+                    let args = PyTuple::new(py, [stream_obj.into_any()])
+                        .map_err(|e| format!("failed to build args: {e}"))?;
+                    match callable.call1(py, args) {
+                        Ok(ret) => {
+                            let bound = ret.into_bound(py);
+                            let bytes_vec: Vec<u8> = bound.extract().map_err(|e| {
+                                format!("Python client-streaming handler must return bytes: {e}")
+                            })?;
+                            Ok(HandlerOutcome::Ok(bytes_vec))
+                        }
+                        Err(pyerr) => {
+                            if let Some((code, body)) = extract_app_error(py, &pyerr) {
+                                Ok(HandlerOutcome::AppError { code, body })
+                            } else {
+                                Err(format!("Python client-streaming handler raised: {pyerr}"))
+                            }
+                        }
+                    }
+                })
+            }),
+        )
+        .await;
+        match result {
+            Ok(Ok(Ok(HandlerOutcome::Ok(body)))) => Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body,
+            }),
+            Ok(Ok(Ok(HandlerOutcome::AppError { code, body }))) => {
+                Err(RpcHandlerError::Application {
+                    code,
+                    message: String::from_utf8_lossy(&body).into_owned(),
+                })
+            }
+            Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
+            Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
+                "spawn_blocking task panicked: {join_err}"
+            ))),
+            Err(_) => Err(RpcHandlerError::Internal(format!(
+                "Python client-streaming handler did not respond within {} ms",
+                self.timeout.as_millis()
+            ))),
+        }
+    }
+}
+
+/// `RpcDuplexHandler` impl bridging to a Python callable.
+struct PyRpcDuplexHandler {
+    callable: Py<PyAny>,
+    timeout: Duration,
+    runtime: Arc<Runtime>,
+}
+
+#[async_trait::async_trait]
+impl RpcDuplexHandler for PyRpcDuplexHandler {
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        requests: InnerRequestStream,
+        responses: InnerRpcResponseSink,
+    ) -> std::result::Result<(), RpcHandlerError> {
+        let callable = Python::attach(|py| self.callable.clone_ref(py));
+        let runtime = self.runtime.clone();
+        let stream_inner = Arc::new(Mutex::new(Some(requests)));
+        let sink_inner = Arc::new(Mutex::new(Some(responses)));
+        let ctx_caller_origin = ctx.caller_origin;
+        let ctx_call_id = ctx.call_id;
+        let ctx_deadline_ns = ctx.deadline_ns;
+        let ctx_headers = Arc::new(ctx.headers);
+        let result = tokio::time::timeout(
+            self.timeout,
+            tokio::task::spawn_blocking(move || -> Result<HandlerOutcome, String> {
+                Python::attach(|py| -> Result<HandlerOutcome, String> {
+                    let stream_obj = Py::new(
+                        py,
+                        PyRequestStreamRecv {
+                            inner: stream_inner,
+                            runtime,
+                            caller_origin: ctx_caller_origin,
+                            call_id: ctx_call_id,
+                            deadline_ns: ctx_deadline_ns,
+                            headers: ctx_headers,
+                        },
+                    )
+                    .map_err(|e| format!("failed to build request stream: {e}"))?;
+                    let sink_obj = Py::new(py, PyResponseSinkSend { inner: sink_inner })
+                        .map_err(|e| format!("failed to build response sink: {e}"))?;
+                    let args = PyTuple::new(py, [stream_obj.into_any(), sink_obj.into_any()])
+                        .map_err(|e| format!("failed to build args: {e}"))?;
+                    match callable.call1(py, args) {
+                        Ok(_) => Ok(HandlerOutcome::Ok(Vec::new())),
+                        Err(pyerr) => {
+                            // Same Application-error mapping the
+                            // client-streaming path uses — a Python
+                            // handler raising the typed Application
+                            // exception surfaces as
+                            // RpcStatus::Application(code) on the
+                            // caller side rather than collapsing to
+                            // Internal.
+                            if let Some((code, body)) = extract_app_error(py, &pyerr) {
+                                Ok(HandlerOutcome::AppError { code, body })
+                            } else {
+                                Err(format!("Python duplex handler raised: {pyerr}"))
+                            }
+                        }
+                    }
+                })
+            }),
+        )
+        .await;
+        match result {
+            Ok(Ok(Ok(HandlerOutcome::Ok(_)))) => Ok(()),
+            Ok(Ok(Ok(HandlerOutcome::AppError { code, body }))) => {
+                Err(RpcHandlerError::Application {
+                    code,
+                    message: String::from_utf8_lossy(&body).into_owned(),
+                })
+            }
+            Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
+            Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
+                "spawn_blocking task panicked: {join_err}"
+            ))),
+            Err(_) => Err(RpcHandlerError::Internal(format!(
+                "Python duplex handler did not respond within {} ms",
+                self.timeout.as_millis()
+            ))),
+        }
+    }
+}
+
 /// Sentinel for the abort path of `block_until_cancellable`. The
 /// caller maps this to ``RpcCancelledError`` after re-acquiring
 /// the GIL.
@@ -833,6 +1636,135 @@ impl PyMeshRpc {
         Ok(PyRpcStream {
             inner: Arc::new(Mutex::new(Some(inner))),
             runtime: self.runtime.clone(),
+        })
+    }
+
+    /// Open a client-streaming call. Returns a
+    /// :class:`ClientStreamCall`; push chunks via ``call.send(bytes)``
+    /// then ``call.finish()`` to await the terminal response. The
+    /// initial REQUEST is published lazily on the first ``send``
+    /// (or on ``finish`` for the degenerate zero-send path).
+    #[pyo3(signature = (target_node_id, service, opts=None))]
+    fn call_client_stream(
+        &self,
+        py: Python<'_>,
+        target_node_id: u64,
+        service: String,
+        opts: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyClientStreamCall> {
+        let opts = call_options_from_dict(opts)?;
+        let runtime = self.runtime.clone();
+        let node = self.node.clone();
+        let inner = py.detach(|| {
+            runtime.block_on(async move {
+                node.call_client_stream(target_node_id, &service, opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)
+            })
+        })?;
+        let call_id = inner.call_id();
+        let flow_controlled = inner.flow_controlled();
+        Ok(PyClientStreamCall {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
+            call_id_cached: call_id,
+            flow_controlled_cached: flow_controlled,
+            close_notify: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    /// Open a duplex call. Returns a :class:`DuplexCall` with both
+    /// send + receive surfaces. Pass
+    /// ``opts={'request_window_initial': N}`` / ``opts={'stream_window_initial': N}``
+    /// to enable per-direction flow control.
+    #[pyo3(signature = (target_node_id, service, opts=None))]
+    fn call_duplex(
+        &self,
+        py: Python<'_>,
+        target_node_id: u64,
+        service: String,
+        opts: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyDuplexCall> {
+        let opts = call_options_from_dict(opts)?;
+        let runtime = self.runtime.clone();
+        let node = self.node.clone();
+        let inner = py.detach(|| {
+            runtime.block_on(async move {
+                node.call_duplex(target_node_id, &service, opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)
+            })
+        })?;
+        let call_id = inner.call_id();
+        let flow_controlled = inner.flow_controlled();
+        Ok(PyDuplexCall {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
+            call_id_cached: call_id,
+            flow_controlled_cached: flow_controlled,
+            close_notify: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    /// Register a Python client-streaming handler on ``service``.
+    /// ``handler`` must be callable as
+    /// ``handler(stream: RequestStreamRecv) -> bytes``. Iterate
+    /// ``stream`` to drain inbound chunks; return ``bytes`` as the
+    /// terminal response.
+    #[pyo3(signature = (service, handler, handler_timeout_ms=None))]
+    fn serve_client_stream(
+        &self,
+        service: String,
+        handler: Py<PyAny>,
+        handler_timeout_ms: Option<u64>,
+    ) -> PyResult<PyServeHandle> {
+        let timeout = match handler_timeout_ms {
+            Some(0) => Duration::from_secs(u64::MAX / 1000),
+            Some(ms) => Duration::from_millis(ms),
+            None => DEFAULT_HANDLER_TIMEOUT,
+        };
+        let rust_handler = Arc::new(PyRpcClientStreamingHandler {
+            callable: handler,
+            timeout,
+            runtime: self.runtime.clone(),
+        });
+        let inner = self
+            .node
+            .serve_rpc_client_stream(&service, rust_handler)
+            .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
+        Ok(PyServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        })
+    }
+
+    /// Register a Python duplex handler on ``service``. ``handler``
+    /// must be callable as
+    /// ``handler(stream: RequestStreamRecv, sink: ResponseSinkSend) -> None``.
+    /// Drain ``stream`` for inbound chunks; emit response chunks
+    /// via ``sink.send(bytes)``.
+    #[pyo3(signature = (service, handler, handler_timeout_ms=None))]
+    fn serve_duplex(
+        &self,
+        service: String,
+        handler: Py<PyAny>,
+        handler_timeout_ms: Option<u64>,
+    ) -> PyResult<PyServeHandle> {
+        let timeout = match handler_timeout_ms {
+            Some(0) => Duration::from_secs(u64::MAX / 1000),
+            Some(ms) => Duration::from_millis(ms),
+            None => DEFAULT_HANDLER_TIMEOUT,
+        };
+        let rust_handler = Arc::new(PyRpcDuplexHandler {
+            callable: handler,
+            timeout,
+            runtime: self.runtime.clone(),
+        });
+        let inner = self
+            .node
+            .serve_rpc_duplex(&service, rust_handler)
+            .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
+        Ok(PyServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
         })
     }
 
