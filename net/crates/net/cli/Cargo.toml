@@ -32,7 +32,7 @@ clap = { version = "4", features = ["derive", "env"] }
 # post-build to capture the output into `share/bash-completion/...`
 # and `share/man/man1/net-mesh.1`.
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 
 # Multi-thread tokio for the SDK; macros for `#[tokio::main]`.
 tokio = { version = "1", features = [
