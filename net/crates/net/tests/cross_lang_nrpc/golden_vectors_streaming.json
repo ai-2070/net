@@ -1,0 +1,97 @@
+{
+  "abi_version_expected": 2,
+  "description": "Canonical cross-binding nRPC compatibility fixture for the client-streaming + duplex shapes shipped under NET_RPC_ABI_VERSION = 0x0002 (NRPC_BINDINGS_PLAN.md Phase 2). Two services, each with a documented contract and a fixed set of ok_cases. Every binding's wire-format compat test loads this file and asserts: encoding the request stream on each side, dispatching through the canonical handler, and decoding the response stream yields outputs that semantically match the fixture. Status codes, header names, and the JSON shapes are all part of the contract.",
+  "services": [
+    {
+      "service": "cross_lang_client_stream_sum",
+      "shape": "client_streaming",
+      "description": "Drain a stream of {text, numbers} request items. Return a single response: { echo: concatenation of all text fields joined by ' ', total: sum of all numbers across all items, count: number of items consumed }.",
+      "request_item_shape": {
+        "text": "str",
+        "numbers": "List[i64]"
+      },
+      "response_shape": {
+        "echo": "str — items' text joined by ' '",
+        "total": "i64 — sum of all numbers across items",
+        "count": "u64 — number of items consumed"
+      },
+      "ok_cases": [
+        {
+          "name": "single_item",
+          "request_items": [
+            { "text": "hello", "numbers": [42] }
+          ],
+          "expected_response_json": { "echo": "hello", "total": 42, "count": 1 }
+        },
+        {
+          "name": "three_items",
+          "request_items": [
+            { "text": "alpha", "numbers": [1, 2] },
+            { "text": "beta", "numbers": [3] },
+            { "text": "gamma", "numbers": [4, 5, 6] }
+          ],
+          "expected_response_json": { "echo": "alpha beta gamma", "total": 21, "count": 3 }
+        },
+        {
+          "name": "empty_stream",
+          "request_items": [],
+          "expected_response_json": { "echo": "", "total": 0, "count": 0 }
+        },
+        {
+          "name": "unicode_and_negatives",
+          "request_items": [
+            { "text": "héllo", "numbers": [-1, 1] },
+            { "text": "世界", "numbers": [10, -5] }
+          ],
+          "expected_response_json": { "echo": "héllo 世界", "total": 5, "count": 2 }
+        }
+      ]
+    },
+    {
+      "service": "cross_lang_duplex_echo",
+      "shape": "duplex",
+      "description": "Drain a stream of {text, numbers} request items. Emit one response per request item: { echo: item.text, sum: sum of item.numbers }. After processing all items, emit one final summary response: { echo: 'summary', sum: count_of_items }. Handler returns Ok after EOF on the request stream.",
+      "request_item_shape": {
+        "text": "str",
+        "numbers": "List[i64]"
+      },
+      "response_shape": {
+        "echo": "str — item's text, or 'summary' for the final frame",
+        "sum": "i64 — item's numbers summed, or count_of_items for the summary"
+      },
+      "ok_cases": [
+        {
+          "name": "single_in_single_out",
+          "request_items": [
+            { "text": "ping", "numbers": [3, 4] }
+          ],
+          "expected_response_items": [
+            { "echo": "ping", "sum": 7 },
+            { "echo": "summary", "sum": 1 }
+          ]
+        },
+        {
+          "name": "three_in_three_plus_summary",
+          "request_items": [
+            { "text": "a", "numbers": [1] },
+            { "text": "b", "numbers": [2, 3] },
+            { "text": "c", "numbers": [] }
+          ],
+          "expected_response_items": [
+            { "echo": "a", "sum": 1 },
+            { "echo": "b", "sum": 5 },
+            { "echo": "c", "sum": 0 },
+            { "echo": "summary", "sum": 3 }
+          ]
+        },
+        {
+          "name": "empty_stream_summary_only",
+          "request_items": [],
+          "expected_response_items": [
+            { "echo": "summary", "sum": 0 }
+          ]
+        }
+      ]
+    }
+  ]
+}
