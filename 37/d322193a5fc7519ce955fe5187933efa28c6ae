@@ -1,0 +1,23 @@
+net/crates/net/tests/cross_lang_nrpc/golden_vectors_streaming.json
+  s_c46a4f2a71242f::t_3348da2f194813 4-64
+net/crates/net/tests/integration_nrpc_cross_lang_streaming.rs
+  s_c46a4f2a71242f::t_6d58a7a5ec4a03 661-665
+  s_c46a4f2a71242f::t_d2926c8856d038 439-442,452-472
+  s_c46a4f2a71242f::t_ad0d0d336d5235 530-590
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "37d322193a5fc7519ce955fe5187933efa28c6ae",
+  "prompts": {},
+  "sessions": {
+    "s_c46a4f2a71242f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c40a4b97-f9fb-4ca1-a55c-ca0f5316ac30",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
