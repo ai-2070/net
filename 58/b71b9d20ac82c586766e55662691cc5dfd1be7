@@ -1,0 +1,27 @@
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_c46a4f2a71242f::t_143efd88b1af96 728-729,731
+  s_c46a4f2a71242f::t_40e9cec145b0f4 646-650,659-662,667,674-692
+  s_c46a4f2a71242f::t_f2af98f269350f 763-766,772-774,779,786-802
+  s_c46a4f2a71242f::t_56ef5b653c8e07 888
+  s_c46a4f2a71242f::t_6328ace97a0b7f 939-940,945-947,952,959-975
+  s_c46a4f2a71242f::t_8e1f0ff3c38726 910-911,913
+  s_c46a4f2a71242f::t_bc4b4f05a39c1e 1705
+  s_c46a4f2a71242f::t_99d4a919e79e06 1672
+  s_c46a4f2a71242f::t_88344d56973749 1003
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "58b71b9d20ac82c586766e55662691cc5dfd1be7",
+  "prompts": {},
+  "sessions": {
+    "s_c46a4f2a71242f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c40a4b97-f9fb-4ca1-a55c-ca0f5316ac30",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
