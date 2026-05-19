@@ -13,7 +13,7 @@ name: Release Python SDK
 # pending publisher with:
 #   - PyPI project name: net-mesh-sdk
 #   - Owner: ai-2070
-#   - Repository: cyberdeck
+#   - Repository: net
 #   - Workflow: release-pypi-sdk.yml
 #   - Environment: pypi
 # This MUST be done before the first run, otherwise publish fails
