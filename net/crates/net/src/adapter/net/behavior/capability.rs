@@ -5301,12 +5301,8 @@ mod tests {
     fn signature_byte_identity_with_pre_v04_unrestricted_announcement() {
         use super::super::super::identity::EntityKeypair;
         let keypair = EntityKeypair::generate();
-        let ann = CapabilityAnnouncement::new(
-            5,
-            keypair.entity_id().clone(),
-            1,
-            sample_capability_set(),
-        );
+        let ann =
+            CapabilityAnnouncement::new(5, keypair.entity_id().clone(), 1, sample_capability_set());
         // Build the canonical signed payload via the production
         // `signed_payload()` helper.
         let v04_canonical = ann.signed_payload();
@@ -5318,8 +5314,7 @@ mod tests {
         // when empty), and re-serialising. If our
         // `skip_serializing_if = Vec::is_empty` is wired right,
         // the two should be byte-identical.
-        let mut v: serde_json::Value =
-            serde_json::from_slice(&v04_canonical).expect("parse");
+        let mut v: serde_json::Value = serde_json::from_slice(&v04_canonical).expect("parse");
         let obj = v.as_object_mut().expect("object");
         assert!(
             !obj.contains_key("allowed_nodes"),
@@ -5342,12 +5337,8 @@ mod tests {
     fn signed_announcement_with_allow_lists_verifies_after_round_trip() {
         use super::super::super::identity::EntityKeypair;
         let keypair = EntityKeypair::generate();
-        let mut ann = CapabilityAnnouncement::new(
-            9,
-            keypair.entity_id().clone(),
-            1,
-            sample_capability_set(),
-        );
+        let mut ann =
+            CapabilityAnnouncement::new(9, keypair.entity_id().clone(), 1, sample_capability_set());
         ann.allowed_nodes = vec![1, 2, 3];
         ann.allowed_subnets = vec![super::super::subnet::SubnetId([0x55; 16])];
         ann.allowed_groups = vec![super::super::group::GroupId([0x66; 32])];
@@ -5380,8 +5371,12 @@ mod tests {
             // Tamper post-sign.
             match *which {
                 "nodes" => ann.allowed_nodes.push(999),
-                "subnets" => ann.allowed_subnets.push(super::super::subnet::SubnetId([0x99; 16])),
-                "groups" => ann.allowed_groups.push(super::super::group::GroupId([0xAA; 32])),
+                "subnets" => ann
+                    .allowed_subnets
+                    .push(super::super::subnet::SubnetId([0x99; 16])),
+                "groups" => ann
+                    .allowed_groups
+                    .push(super::super::group::GroupId([0xAA; 32])),
                 _ => unreachable!(),
             }
             assert!(
