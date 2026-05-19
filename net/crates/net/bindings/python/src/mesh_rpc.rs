@@ -1033,16 +1033,55 @@ impl PyDuplexStream {
 /// server handlers. Use the Python iter protocol:
 /// ``for chunk in stream: ...`` or explicit ``next(stream)``.
 /// Raises ``StopIteration`` on EOF (REQUEST_END / CANCEL).
+///
+/// Carries the per-call streaming context as attributes:
+/// ``caller_origin`` (peer identity hash), ``call_id`` (substrate
+/// call id), ``deadline_ns`` (Unix-nanos absolute, 0 means
+/// "no deadline"), and ``headers`` (list of [name, bytes] tuples).
 #[pyclass(name = "RequestStreamRecv", module = "_net")]
 pub struct PyRequestStreamRecv {
     inner: Arc<Mutex<Option<InnerRequestStream>>>,
     runtime: Arc<Runtime>,
+    caller_origin: u64,
+    call_id: u64,
+    deadline_ns: u64,
+    headers: Arc<Vec<(String, Vec<u8>)>>,
 }
 
 #[pymethods]
 impl PyRequestStreamRecv {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
+    }
+
+    /// Caller's peer origin hash.
+    #[getter]
+    fn caller_origin(&self) -> u64 {
+        self.caller_origin
+    }
+
+    /// Substrate-minted call id (stable for the call lifetime).
+    #[getter]
+    fn call_id(&self) -> u64 {
+        self.call_id
+    }
+
+    /// Caller's declared deadline as Unix-nanos absolute; 0 means
+    /// no deadline. Handlers MAY observe it to short-circuit
+    /// slow work past the wire deadline.
+    #[getter]
+    fn deadline_ns(&self) -> u64 {
+        self.deadline_ns
+    }
+
+    /// Initial-REQUEST headers as a list of (name, bytes) tuples.
+    /// Names are lowercase per the substrate convention.
+    #[getter]
+    fn headers<'py>(&self, py: Python<'py>) -> Vec<(String, Bound<'py, PyBytes>)> {
+        self.headers
+            .iter()
+            .map(|(n, v)| (n.clone(), PyBytes::new(py, v)))
+            .collect()
     }
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let runtime = self.runtime.clone();
@@ -1120,12 +1159,16 @@ struct PyRpcClientStreamingHandler {
 impl RpcClientStreamingHandler for PyRpcClientStreamingHandler {
     async fn call(
         &self,
-        _ctx: RpcStreamingContext,
+        ctx: RpcStreamingContext,
         requests: InnerRequestStream,
     ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
         let callable = Python::attach(|py| self.callable.clone_ref(py));
         let runtime = self.runtime.clone();
         let stream_inner = Arc::new(Mutex::new(Some(requests)));
+        let ctx_caller_origin = ctx.caller_origin;
+        let ctx_call_id = ctx.call_id;
+        let ctx_deadline_ns = ctx.deadline_ns;
+        let ctx_headers = Arc::new(ctx.headers);
         let result = tokio::time::timeout(
             self.timeout,
             tokio::task::spawn_blocking(move || -> Result<HandlerOutcome, String> {
@@ -1135,6 +1178,10 @@ impl RpcClientStreamingHandler for PyRpcClientStreamingHandler {
                         PyRequestStreamRecv {
                             inner: stream_inner,
                             runtime,
+                            caller_origin: ctx_caller_origin,
+                            call_id: ctx_call_id,
+                            deadline_ns: ctx_deadline_ns,
+                            headers: ctx_headers,
                         },
                     )
                     .map_err(|e| format!("failed to build request stream: {e}"))?;
@@ -1195,7 +1242,7 @@ struct PyRpcDuplexHandler {
 impl RpcDuplexHandler for PyRpcDuplexHandler {
     async fn call(
         &self,
-        _ctx: RpcStreamingContext,
+        ctx: RpcStreamingContext,
         requests: InnerRequestStream,
         responses: InnerRpcResponseSink,
     ) -> std::result::Result<(), RpcHandlerError> {
@@ -1203,6 +1250,10 @@ impl RpcDuplexHandler for PyRpcDuplexHandler {
         let runtime = self.runtime.clone();
         let stream_inner = Arc::new(Mutex::new(Some(requests)));
         let sink_inner = Arc::new(Mutex::new(Some(responses)));
+        let ctx_caller_origin = ctx.caller_origin;
+        let ctx_call_id = ctx.call_id;
+        let ctx_deadline_ns = ctx.deadline_ns;
+        let ctx_headers = Arc::new(ctx.headers);
         let result = tokio::time::timeout(
             self.timeout,
             tokio::task::spawn_blocking(move || -> Result<HandlerOutcome, String> {
@@ -1212,6 +1263,10 @@ impl RpcDuplexHandler for PyRpcDuplexHandler {
                         PyRequestStreamRecv {
                             inner: stream_inner,
                             runtime,
+                            caller_origin: ctx_caller_origin,
+                            call_id: ctx_call_id,
+                            deadline_ns: ctx_deadline_ns,
+                            headers: ctx_headers,
                         },
                     )
                     .map_err(|e| format!("failed to build request stream: {e}"))?;

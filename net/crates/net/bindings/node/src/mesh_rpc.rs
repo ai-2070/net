@@ -921,10 +921,62 @@ impl DuplexStream {
 #[napi]
 pub struct JsRequestStream {
     inner: Arc<tokio::sync::Mutex<Option<InnerRequestStream>>>,
+    /// Caller's identity hash (peer origin). Surfaced to JS
+    /// via the `callerOrigin` getter; 0 on the loopback / no-peer
+    /// fast path.
+    caller_origin: u64,
+    /// Per-call id (mints from the substrate). JS handlers may
+    /// thread it into per-call logging / tracing.
+    call_id: u64,
+    /// Caller's declared deadline as a Unix-nanos absolute
+    /// timestamp. `0` means "no deadline declared".
+    deadline_ns: u64,
+    /// Initial-REQUEST headers, name/value pairs. Names are
+    /// lowercase per the substrate convention. Empty when the
+    /// REQUEST carried no application headers.
+    headers: Arc<Vec<(String, Vec<u8>)>>,
 }
 
 #[napi]
 impl JsRequestStream {
+    /// Caller's peer origin hash. Surfaced as a bigint to JS so
+    /// the full u64 round-trips. `0n` on the loopback fast path
+    /// where there's no remote peer.
+    #[napi(getter)]
+    pub fn caller_origin(&self) -> BigInt {
+        BigInt::from(self.caller_origin)
+    }
+
+    /// The call_id minted by the substrate for this call. Stable
+    /// across the call's lifetime; useful for handler-side logging
+    /// and trace correlation.
+    #[napi(getter)]
+    pub fn call_id(&self) -> BigInt {
+        BigInt::from(self.call_id)
+    }
+
+    /// Caller's declared deadline as a Unix-nanoseconds absolute
+    /// timestamp. `0n` means no deadline was declared; otherwise
+    /// the handler MAY use it to short-circuit slow processing
+    /// past the wire deadline.
+    #[napi(getter)]
+    pub fn deadline_ns(&self) -> BigInt {
+        BigInt::from(self.deadline_ns)
+    }
+
+    /// Initial-REQUEST headers carried by the caller. Each entry
+    /// is `[name, value]` with `name` lowercase and `value` as a
+    /// raw Buffer (per the substrate's bytes contract — values
+    /// are not required to be UTF-8). Empty array if the REQUEST
+    /// carried no headers.
+    #[napi(getter)]
+    pub fn headers(&self) -> Vec<(String, Buffer)> {
+        self.headers
+            .iter()
+            .map(|(n, v)| (n.clone(), Buffer::from(v.as_slice())))
+            .collect()
+    }
+
     /// Pull the next inbound chunk. Returns `null` on EOF
     /// (REQUEST_END / CANCEL). Multiple `next()` calls in
     /// parallel from the same JS task serialize through the
@@ -1060,11 +1112,15 @@ struct NodeClientStreamingRpcHandler {
 impl RpcClientStreamingHandler for NodeClientStreamingRpcHandler {
     async fn call(
         &self,
-        _ctx: RpcStreamingContext,
+        ctx: RpcStreamingContext,
         requests: InnerRequestStream,
     ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
         let stream_handle = JsRequestStream {
             inner: Arc::new(tokio::sync::Mutex::new(Some(requests))),
+            caller_origin: ctx.caller_origin,
+            call_id: ctx.call_id,
+            deadline_ns: ctx.deadline_ns,
+            headers: Arc::new(ctx.headers),
         };
         let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
         let status = self.tsfn.call_with_return_value(
@@ -1145,13 +1201,17 @@ struct NodeDuplexRpcHandler {
 impl RpcDuplexHandler for NodeDuplexRpcHandler {
     async fn call(
         &self,
-        _ctx: RpcStreamingContext,
+        ctx: RpcStreamingContext,
         requests: InnerRequestStream,
         responses: InnerRpcResponseSink,
     ) -> std::result::Result<(), RpcHandlerError> {
         let args = DuplexHandlerArgs {
             stream: JsRequestStream {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(requests))),
+                caller_origin: ctx.caller_origin,
+                call_id: ctx.call_id,
+                deadline_ns: ctx.deadline_ns,
+                headers: Arc::new(ctx.headers),
             },
             sink: JsResponseSink {
                 inner: Arc::new(Mutex::new(Some(responses))),
