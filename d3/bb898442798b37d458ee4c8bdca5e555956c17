@@ -1,0 +1,23 @@
+net/crates/net/docs/misc/NRPC_BINDINGS_PLAN.md
+  s_c46a4f2a71242f::t_b6cef3eaa0ca0e 22-25,27
+  s_c46a4f2a71242f::t_1561ef3b72f990 316
+  s_c46a4f2a71242f::t_251f5092623c66 333
+net/crates/net/docs/plans/NRPC_BIDI_STREAMING_PLAN.md
+  s_c46a4f2a71242f::t_efc3c9134a94a2 44-46,48,50,55,58-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "d3bb898442798b37d458ee4c8bdca5e555956c17",
+  "prompts": {},
+  "sessions": {
+    "s_c46a4f2a71242f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c40a4b97-f9fb-4ca1-a55c-ca0f5316ac30",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
