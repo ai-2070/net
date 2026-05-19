@@ -1,23 +1,44 @@
-//! Cross-binding nRPC wire-format compat — Phase B12.
+//! Cross-binding nRPC wire-format compat — Rust-side reference
+//! implementation (Phase B12).
 //!
-//! Loads `tests/cross_lang_nrpc/golden_vectors_streaming.json`
-//! and asserts the two canonical Phase-2 services round-trip
-//! correctly through the Rust runtime:
+//! **Scope:** this file is the Rust-side *reference* test against
+//! `tests/cross_lang_nrpc/golden_vectors_streaming.json`. It does
+//! NOT spawn Node / Python / Go processes — the cross-binding
+//! harness is each language's own test suite running the same
+//! assertions against the same fixture. The shared bytes-on-wire
+//! contract lives in the fixture; this file proves the Rust side
+//! honors it.
 //!
-//!   - `cross_lang_client_stream_sum` — drain a stream of
-//!     `{text, numbers}` items, return one `{echo, total, count}`
-//!     response.
-//!   - `cross_lang_duplex_echo` — drain a stream, emit one
-//!     response per item plus a final `{echo: "summary", sum: N}`
-//!     frame.
+//! **Coverage:**
 //!
-//! The same fixture is the source-of-truth for the Node, Python,
-//! and Go binding compat tests (B9 / B10 / B11 ports — separate
-//! commits).
+//!   - `client_streaming_ok_cases_match_fixture` — round-trip
+//!     the documented `cross_lang_client_stream_sum` cases through
+//!     the in-process fold (drain a stream of `{text, numbers}`
+//!     items → one `{echo, total, count}` response).
+//!   - `duplex_ok_cases_match_fixture` — same for
+//!     `cross_lang_duplex_echo` (drain a stream, emit one
+//!     response per item plus a final summary frame).
+//!   - `wire_snapshots_match_fixture` — byte-exact assertion
+//!     that the substrate codec produces the canonical hex
+//!     bytes documented in `wire_snapshots`. The most load-bearing
+//!     check: catches endianness / padding / flag-bit-layout
+//!     drift that the JSON-only ok_cases miss. Each binding port
+//!     runs the same hex-equality assertion against its own
+//!     native encoder.
+//!   - `error_cases_fixture_is_well_formed` — structural
+//!     validation of the `error_cases` matrix so each binding's
+//!     port consumes a consistent shape.
+//!   - `fixture_metadata_matches_canonical_contract` — sanity
+//!     check on the fixture's top-level shape.
 //!
-//! The contract is documented in `golden_vectors_streaming.json`
-//! itself; this file is the load-bearing Rust-side reference
-//! implementation that defines what "correct" looks like.
+//! **Why not spawn other bindings here?** Each binding's test
+//! suite already runs in its own host (`cargo test` for Node /
+//! Python / Go FFI Rust source; native `npm test` / `pytest` /
+//! `go test` for the idiomatic wrappers). Adding a Rust harness
+//! that forks them would duplicate that infrastructure without
+//! adding coverage. The fixture is the source of truth; each
+//! language's reference assertion lives where that language is
+//! naturally tested.
 //!
 //! Same direct-fold-dispatch pattern as the existing
 //! `integration_nrpc_cross_lang.rs` (no real network — the
