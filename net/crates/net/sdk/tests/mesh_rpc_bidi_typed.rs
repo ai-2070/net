@@ -518,6 +518,56 @@ async fn request_stream_into_chunked_preserves_seen_first() {
     );
 }
 
+/// High-N round-trip — pushes 1000 typed Items through the
+/// flattened RequestStreamTyped and asserts the handler observes
+/// all 1000 in order. The N=10 happy-path test would miss credit-
+/// replenishment, mpsc-saturation, and pump-coalescing regressions
+/// that only appear under sustained traffic. Per the Phase E
+/// acceptance criteria.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_stream_typed_thousand_chunk_round_trip() {
+    let psk = [0x42u8; 32];
+    let (caller, server, addr_server) = two_meshes(&psk).await;
+    handshake(&caller, &server, addr_server).await;
+
+    let _serve = server
+        .serve_rpc_client_stream_typed("aggregate_1k", Codec::Json, |mut requests| async move {
+            let mut count = 0u32;
+            let mut last_n = 0u32;
+            let mut last_label = String::new();
+            while let Some(item) = requests.next().await {
+                let item: Item = item.map_err(|e| format!("decode: {e}"))?;
+                count += 1;
+                last_n = item.n;
+                last_label = item.label;
+            }
+            Ok::<_, String>(Summary { count }).inspect(|_| {
+                std::hint::black_box((last_n, last_label));
+            })
+        })
+        .expect("serve_rpc_client_stream_typed");
+
+    let mut call = caller
+        .call_client_stream_typed::<Item, Summary>(
+            server.inner().node_id(),
+            "aggregate_1k",
+            CallOptionsTyped::default(),
+        )
+        .await
+        .expect("call_client_stream_typed");
+    const N: u32 = 1000;
+    for i in 0..N {
+        call.send(&Item {
+            n: i,
+            label: format!("item-{i}"),
+        })
+        .await
+        .expect("typed send");
+    }
+    let summary = call.finish().await.expect("typed finish");
+    assert_eq!(summary, Summary { count: N });
+}
+
 // Suppress unused-import warnings for the tests that only use a
 // subset of the imports.
 #[allow(dead_code)]
