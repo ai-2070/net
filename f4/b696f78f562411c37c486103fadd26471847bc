@@ -1,0 +1,61 @@
+net/crates/net/src/adapter/net/redex/bandwidth.rs
+  s_2571835e05521c::t_8eba15b94bf3e5 33,36
+net/crates/net/sdk/benches/nrpc_qps.rs
+  s_2571835e05521c::t_5911bf7256d0e8 9-12
+net/crates/net/tests/dataforts_blob_v3_tree_conformance.rs
+  s_2571835e05521c::t_a1b42c3e362ff4 123
+net/crates/net/bindings/go/deck-ffi/src/lib.rs
+  s_2571835e05521c::t_3844274663d00f 1797-1805
+  s_2571835e05521c::t_62b33da131347d 48
+  s_2571835e05521c::t_618e8bf167da9b 49-50
+  s_2571835e05521c::t_7af6879345c471 2628-2630
+  s_2571835e05521c::t_d73280659b0bca 1208-1210,1307-1309,1663-1665
+  s_2571835e05521c::t_4bf3741006d3fd 766-768,882-884
+  s_2571835e05521c::t_40f9930ab5cb71 1579
+net/crates/net/src/bin/net-blob.rs
+  s_2571835e05521c::t_cdb37aca9170c9 913
+  s_2571835e05521c::t_3bf9375c2feff9 781
+  s_2571835e05521c::t_cc6c364529999c 673-680
+net/crates/net/src/adapter/net/dataforts/blob/cdc.rs
+  s_2571835e05521c::t_4a22a0b1cec317 85,89
+net/crates/net/sdk/benches/nrpc_payload.rs
+  s_2571835e05521c::t_28d3a158fb58bc 13-14
+net/crates/net/src/adapter/net/dataforts/blob/blob_ref.rs
+  s_2571835e05521c::t_07c9a76a0dba56 213
+  s_2571835e05521c::t_909612bb4a9687 211-212
+  s_2571835e05521c::t_2bea10eaec8bd3 1868
+net/crates/net/src/adapter/net/dataforts/blob/erasure.rs
+  s_2571835e05521c::t_542ca0ecffc3ed 125,129
+net/crates/net/src/adapter/net/dataforts/blob/blob_tree_cache.rs
+  s_2571835e05521c::t_83922702a44450 86
+net/crates/net/bindings/go/meshos-ffi/src/lib.rs
+  s_2571835e05521c::t_a5ad9e71aac3df 60-61
+  s_2571835e05521c::t_0de54f3dc4a4fc 1022,1024
+  s_2571835e05521c::t_8584aec5205b3b 59
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_2571835e05521c::t_7fabcd43135af1 5744
+  s_2571835e05521c::t_7845b4fa1fc954 1920
+net/crates/net/sdk/benches/nrpc_unary.rs
+  s_2571835e05521c::t_281b335d983064 5,7
+net/crates/net/src/adapter/net/dataforts/blob/blob_tree.rs
+  s_2571835e05521c::t_07e73efc0d0428 219,222
+  s_2571835e05521c::t_5d5167c7df5fa2 82,86
+net/crates/net/src/adapter/net/dataforts/blob/bandwidth.rs
+  s_2571835e05521c::t_5b97b5da34fdd8 71,75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "f4b696f78f562411c37c486103fadd26471847bc",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
