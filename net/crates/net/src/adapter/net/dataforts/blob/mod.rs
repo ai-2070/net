@@ -65,7 +65,7 @@ pub use dispatch::{
 pub use error::BlobError;
 pub use fs::FileSystemAdapter;
 pub use mesh::{
-    MeshBlobAdapter, OverflowConfig, DEFAULT_BLOB_HEAT_HALF_LIFE,
+    MeshBlobAdapter, OverflowConfig, RepairReport, DEFAULT_BLOB_HEAT_HALF_LIFE,
     DEFAULT_OVERFLOW_HIGH_WATER_RATIO, DEFAULT_OVERFLOW_LOW_WATER_RATIO,
     DEFAULT_OVERFLOW_MAX_PUSHES_PER_TICK, DEFAULT_OVERFLOW_TICK_INTERVAL_MS,
 };

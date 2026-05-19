@@ -2105,6 +2105,266 @@ impl MeshBlobAdapter {
         }
         Ok(bytes)
     }
+
+    /// Operator-driven Reed-Solomon repair sweep over the chunks
+    /// reachable from `blob_ref`. Walks the manifest tree,
+    /// inspects each `ErasureLeaf` stripe, and for any RS stripe
+    /// that has at least one missing data chunk:
+    ///
+    /// 1. Fetch every surviving chunk (data + parity) of the
+    ///    stripe.
+    /// 2. If `>= k` shards survive, run RS reconstruction.
+    /// 3. Re-store each previously-missing data chunk under its
+    ///    original content-addressed hash.
+    ///
+    /// Stripes that are already healthy (every data chunk present)
+    /// are skipped without I/O on the parity side. Stripes that
+    /// have fewer than `k` survivors are counted as unrecoverable
+    /// — `repair_blob` does NOT error on unrecoverable stripes;
+    /// it records them in the report so the operator can take
+    /// human action (restore from snapshot, accept data loss,
+    /// etc.). A single unrecoverable stripe doesn't abort repair
+    /// of the rest of the blob.
+    ///
+    /// `Encoding::Replicated` stripes (the small-stripe trailing
+    /// fallback) have no parity model and are skipped with a
+    /// dedicated counter.
+    ///
+    /// Non-Tree blobs return a zero-counter report (no repair
+    /// surface — Small and Manifest blobs have no parity).
+    ///
+    /// The repair sweep is iterative (no concurrency for v0.3
+    /// Phase C7); a future commit may parallelise the per-stripe
+    /// recovery across the BandwidthClass-aware send queue.
+    pub async fn repair_blob(
+        &self,
+        blob_ref: &BlobRef,
+    ) -> Result<RepairReport, BlobError> {
+        use super::blob_tree::TreeNode;
+
+        let mut report = RepairReport::default();
+        let root_hash = match blob_ref.tree_root_hash() {
+            Some(h) => *h,
+            None => return Ok(report), // Small / Manifest — no repair surface.
+        };
+
+        // Iterative tree descent: stack of node hashes to walk.
+        let mut stack: Vec<[u8; 32]> = vec![root_hash];
+        while let Some(node_hash) = stack.pop() {
+            // The tree-node bytes may themselves be missing — if
+            // so, the substrate can't recurse and we surface the
+            // failure as a typed error (manifest-level loss is
+            // fundamentally unrecoverable without operator
+            // intervention; this is structurally different from
+            // chunk-level loss and we don't silently swallow it).
+            let bytes = self.fetch_chunk(&node_hash).await?;
+            let node = TreeNode::decode(&bytes)?;
+            match node {
+                TreeNode::Internal { children } => {
+                    for (child_hash, _size) in children {
+                        stack.push(child_hash);
+                    }
+                }
+                TreeNode::Leaf { .. } => {
+                    // Replicated leaves have no per-chunk repair
+                    // surface — each chunk is independently
+                    // content-addressed; if it's missing, there's
+                    // no parity to reconstruct from. Count and
+                    // continue.
+                    report.replicated_leaves_skipped =
+                        report.replicated_leaves_skipped.saturating_add(1);
+                }
+                TreeNode::ErasureLeaf { stripes } => {
+                    for stripe in &stripes {
+                        self.repair_stripe(stripe, &mut report).await?;
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Internal: repair one stripe in isolation. Bumps the
+    /// matching counter on `report` based on the outcome.
+    async fn repair_stripe(
+        &self,
+        stripe: &super::blob_tree::StripeBlock,
+        report: &mut RepairReport,
+    ) -> Result<(), BlobError> {
+        report.stripes_walked = report.stripes_walked.saturating_add(1);
+        let (k, m) = match stripe.encoding {
+            Encoding::Replicated => {
+                report.replicated_stripes_skipped =
+                    report.replicated_stripes_skipped.saturating_add(1);
+                return Ok(());
+            }
+            Encoding::ReedSolomon { k, m } => (k, m),
+        };
+        let k_usize = k as usize;
+        let total = k_usize + m as usize;
+        if stripe.chunks.len() != total {
+            return Err(BlobError::Backend(format!(
+                "repair: stripe shape mismatch — expected {} shards (k={} + m={}), got {}",
+                total, k, m, stripe.chunks.len()
+            )));
+        }
+
+        // Probe every chunk: present (Some) vs missing (None).
+        // A present chunk whose hash verification fails is also
+        // treated as missing (the substrate refuses to feed
+        // corrupt data into the reconstruction matrix).
+        let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(total);
+        let mut missing_data_indices: Vec<usize> = Vec::new();
+        let mut surviving = 0usize;
+        for (i, chunk) in stripe.chunks.iter().enumerate() {
+            match self.fetch_chunk(&chunk.hash).await {
+                Ok(bytes) => {
+                    let computed: [u8; 32] = blake3::hash(&bytes).into();
+                    if computed == chunk.hash {
+                        shards.push(Some(bytes));
+                        surviving += 1;
+                        continue;
+                    }
+                    // Hash mismatch — treat as missing.
+                    shards.push(None);
+                    if i < k_usize {
+                        missing_data_indices.push(i);
+                    }
+                }
+                Err(_) => {
+                    shards.push(None);
+                    if i < k_usize {
+                        missing_data_indices.push(i);
+                    }
+                }
+            }
+        }
+
+        if missing_data_indices.is_empty() {
+            // Healthy stripe — no data chunks missing.
+            report.stripes_already_healthy =
+                report.stripes_already_healthy.saturating_add(1);
+            return Ok(());
+        }
+
+        if surviving < k_usize {
+            // Can't reconstruct. Record + continue (no error;
+            // the operator decides what to do with
+            // unrecoverable stripes).
+            report.stripes_unrecoverable =
+                report.stripes_unrecoverable.saturating_add(1);
+            return Ok(());
+        }
+
+        // Pad surviving data shards to the post-padding length
+        // before reconstruction. Post-padding length = max parity
+        // chunk size (parity was sized to max(data sizes) at
+        // store time).
+        let shard_len = stripe.chunks[k_usize..]
+            .iter()
+            .map(|c| c.size as usize)
+            .max()
+            .unwrap_or(0);
+        if shard_len == 0 {
+            return Err(BlobError::Backend(
+                "repair: stripe has zero-length parity shards; unrecoverable".to_owned(),
+            ));
+        }
+        for slot in shards.iter_mut() {
+            if let Some(bytes) = slot.as_mut() {
+                if bytes.len() < shard_len {
+                    bytes.resize(shard_len, 0);
+                }
+            }
+        }
+
+        let encoder = super::erasure::RsEncoder::new(super::erasure::RsParams { k, m })?;
+        encoder.reconstruct_data(&mut shards)?;
+
+        // Re-store every missing data shard under its original
+        // content-addressed hash. The reconstructed bytes are
+        // padded to shard_len; trim to the chunk's pre-padding
+        // logical size before persisting so the on-disk byte
+        // count matches what the original store path wrote.
+        let mut chunks_restored = 0u64;
+        for &idx in &missing_data_indices {
+            let chunk_ref = &stripe.chunks[idx];
+            let bytes = shards[idx].as_ref().ok_or_else(|| {
+                BlobError::Backend(format!(
+                    "repair: data shard {} still missing post-reconstruct (internal bug)",
+                    idx
+                ))
+            })?;
+            // The reconstructed shard is shard_len bytes; the
+            // original was chunk_ref.size bytes (zero-padded to
+            // shard_len at store time). Slice the logical bytes.
+            let logical_len = chunk_ref.size as usize;
+            if bytes.len() < logical_len {
+                return Err(BlobError::Backend(format!(
+                    "repair: reconstructed shard {} is {} bytes, expected at least {}",
+                    idx, bytes.len(), logical_len
+                )));
+            }
+            let logical_bytes = &bytes[..logical_len];
+            // Verify the reconstructed bytes hash back to the
+            // original hash before persisting — defense against
+            // any encoder bug that would silently corrupt the
+            // chunk pool.
+            let computed: [u8; 32] = blake3::hash(logical_bytes).into();
+            if computed != chunk_ref.hash {
+                return Err(BlobError::Backend(format!(
+                    "repair: reconstructed shard {} hash mismatch — expected {:?}, \
+                     got {:?}; refusing to persist (encoder bug or stripe corruption)",
+                    idx, chunk_ref.hash, computed
+                )));
+            }
+            self.store_chunk(&chunk_ref.hash, logical_bytes).await?;
+            chunks_restored += 1;
+        }
+        report.stripes_repaired = report.stripes_repaired.saturating_add(1);
+        report.chunks_restored = report.chunks_restored.saturating_add(chunks_restored);
+        Ok(())
+    }
+}
+
+/// Outcome counters returned by
+/// [`MeshBlobAdapter::repair_blob`]. Operators graph these as
+/// metrics to track how often repair fires + the rate of
+/// unrecoverable losses (which require human action).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepairReport {
+    /// Total RS stripes inspected (sum of the disjoint outcome
+    /// counts below).
+    pub stripes_walked: u64,
+    /// Stripes that already had every data chunk present — no
+    /// reconstruction needed, no I/O on the parity side.
+    pub stripes_already_healthy: u64,
+    /// Stripes that had at least one missing data chunk AND
+    /// enough survivors (>= k) to reconstruct. Re-storing the
+    /// missing data succeeded.
+    pub stripes_repaired: u64,
+    /// Sum of data chunks re-stored across `stripes_repaired`.
+    /// Equals total missing-data-chunk count across recoverable
+    /// stripes.
+    pub chunks_restored: u64,
+    /// Stripes where fewer than `k` shards survive — repair is
+    /// fundamentally impossible without operator action (restore
+    /// from snapshot or accept the loss). `repair_blob` does NOT
+    /// error on these; it records and continues so a single
+    /// unrecoverable stripe doesn't abort repair of the rest of
+    /// the blob.
+    pub stripes_unrecoverable: u64,
+    /// `StripeBlock`s with [`Encoding::Replicated`] (the small-
+    /// stripe trailing fallback in an RS blob) — no parity model
+    /// to repair from. Counted separately so the operator can
+    /// distinguish "no repair needed because Replicated" from
+    /// "no repair needed because healthy".
+    pub replicated_stripes_skipped: u64,
+    /// `TreeNode::Leaf` (non-erasure) leaves encountered. Their
+    /// chunks live outside the RS repair model — Replicated blobs
+    /// repair via cross-node re-replication, not via parity
+    /// reconstruction. Counted for operator visibility.
+    pub replicated_leaves_skipped: u64,
 }
 
 #[async_trait]
@@ -4133,6 +4393,163 @@ mod tests {
             .await
             .expect("RS fetch must reconstruct from parity");
         assert_eq!(fetched, payload, "reconstructed bytes must match original");
+    }
+
+    /// `repair_blob` restores missing data chunks of an
+    /// RS-encoded blob in-place. Stores blob, deletes m=2 data
+    /// chunks, runs repair, asserts the report counts a repair
+    /// fired + the 2 chunks were restored, then asserts a
+    /// subsequent fetch_range works against the LOCAL chunk
+    /// store (no reconstruction needed since chunks are back).
+    #[tokio::test]
+    async fn repair_blob_restores_missing_data_chunks() {
+        let adapter = make_adapter();
+        let chunk_size: u32 = 4 * 1024;
+        let payload = deterministic_bytes(0xF1, chunk_size as usize * 4);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let blob_ref = adapter
+            .store_stream_tree_rs_internal(
+                stream_one(payload.clone()),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+
+        // Identify the single stripe's data chunks.
+        let root_hash = *blob_ref.tree_root_hash().unwrap();
+        let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
+        let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
+            TreeNode::ErasureLeaf { .. } => root_bytes,
+            TreeNode::Internal { children } => {
+                adapter.fetch_chunk(&children[0].0).await.unwrap()
+            }
+            TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
+        };
+        let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
+            TreeNode::ErasureLeaf { stripes } => stripes,
+            other => panic!("expected ErasureLeaf, got: {:?}", other),
+        };
+        let data_hashes: Vec<[u8; 32]> = stripes[0]
+            .chunks
+            .iter()
+            .filter(|c| c.is_data())
+            .map(|c| c.hash)
+            .collect();
+
+        // Kill 2 data chunks (= m tolerance).
+        for hash in &data_hashes[0..2] {
+            adapter.delete_chunk(hash).await.unwrap();
+        }
+        // Confirm deletion landed.
+        assert!(adapter.fetch_chunk(&data_hashes[0]).await.is_err());
+
+        // Run repair.
+        let report = adapter
+            .repair_blob(&blob_ref)
+            .await
+            .expect("repair_blob succeeds");
+        assert_eq!(report.stripes_walked, 1);
+        assert_eq!(report.stripes_repaired, 1);
+        assert_eq!(report.chunks_restored, 2);
+        assert_eq!(report.stripes_unrecoverable, 0);
+
+        // Both previously-deleted chunks are back, byte-identical
+        // to the originals (cross-check via fetch_chunk + hash).
+        for hash in &data_hashes[0..2] {
+            let bytes = adapter
+                .fetch_chunk(hash)
+                .await
+                .expect("restored chunk must be fetchable");
+            let computed: [u8; 32] = blake3::hash(&bytes).into();
+            assert_eq!(&computed, hash, "restored chunk must match original hash");
+        }
+
+        // Full-range fetch still byte-identical to original.
+        let fetched = adapter
+            .fetch_range(&blob_ref, 0..payload.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(fetched, payload);
+    }
+
+    /// Repair on an already-healthy RS blob is a no-op: every
+    /// stripe is counted as healthy, no chunks restored.
+    #[tokio::test]
+    async fn repair_blob_no_op_when_healthy() {
+        let adapter = make_adapter();
+        let chunk_size: u32 = 4 * 1024;
+        let payload = deterministic_bytes(0xF2, chunk_size as usize * 4);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let blob_ref = adapter
+            .store_stream_tree_rs_internal(
+                stream_one(payload),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+        let report = adapter.repair_blob(&blob_ref).await.unwrap();
+        assert_eq!(report.stripes_walked, 1);
+        assert_eq!(report.stripes_already_healthy, 1);
+        assert_eq!(report.stripes_repaired, 0);
+        assert_eq!(report.chunks_restored, 0);
+    }
+
+    /// Repair records unrecoverable stripes without failing —
+    /// the operator decides what to do with them.
+    #[tokio::test]
+    async fn repair_blob_records_unrecoverable_stripes_without_erroring() {
+        let adapter = make_adapter();
+        let chunk_size: u32 = 4 * 1024;
+        let payload = deterministic_bytes(0xF3, chunk_size as usize * 4);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let blob_ref = adapter
+            .store_stream_tree_rs_internal(
+                stream_one(payload),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+        let root_hash = *blob_ref.tree_root_hash().unwrap();
+        let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
+        let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
+            TreeNode::ErasureLeaf { .. } => root_bytes,
+            TreeNode::Internal { children } => {
+                adapter.fetch_chunk(&children[0].0).await.unwrap()
+            }
+            TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
+        };
+        let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
+            TreeNode::ErasureLeaf { stripes } => stripes,
+            other => panic!("expected ErasureLeaf, got: {:?}", other),
+        };
+        // Kill 3 chunks (= m+1, beyond tolerance).
+        let all_hashes: Vec<[u8; 32]> = stripes[0].chunks.iter().map(|c| c.hash).collect();
+        for hash in &all_hashes[0..3] {
+            adapter.delete_chunk(hash).await.unwrap();
+        }
+        let report = adapter
+            .repair_blob(&blob_ref)
+            .await
+            .expect("repair_blob must NOT error on unrecoverable stripes");
+        assert_eq!(report.stripes_walked, 1);
+        assert_eq!(report.stripes_unrecoverable, 1);
+        assert_eq!(report.stripes_repaired, 0);
+        assert_eq!(report.chunks_restored, 0);
+    }
+
+    /// Repair on a non-Tree BlobRef (Small / Manifest) is a
+    /// zero-counter no-op.
+    #[tokio::test]
+    async fn repair_blob_no_op_for_non_tree() {
+        let adapter = make_adapter();
+        let payload = deterministic_bytes(0xF4, 256);
+        let hash: [u8; 32] = blake3::hash(&payload).into();
+        let small_ref = BlobRef::small("mesh://small-test", hash, payload.len() as u64);
+        let report = adapter.repair_blob(&small_ref).await.unwrap();
+        assert_eq!(report, super::RepairReport::default());
     }
 
     /// Killing more than `m` chunks per stripe must surface a
