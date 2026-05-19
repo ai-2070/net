@@ -109,6 +109,14 @@ impl StripeMembershipIndex {
         // members but different orders are treated as distinct
         // (the position determines data-vs-parity role in
         // reconstruction; the index doesn't reorder).
+        //
+        // `m` is NOT folded into the fingerprint because it's
+        // structurally implied: `members.len() == k + m`, so given
+        // identical `members.len()` and identical `k`, `m` is
+        // determined. A bug that produced fingerprint collisions
+        // by varying `m` independently would also produce
+        // `members.len()` collisions, which the encoder rejects
+        // before this method runs.
         let mut hasher = blake3::Hasher::new();
         for h in &members {
             hasher.update(h);
