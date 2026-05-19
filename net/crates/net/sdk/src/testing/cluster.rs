@@ -641,7 +641,7 @@ impl ClusterHarness {
     /// `anchor_index` chooses which node hosts the group's
     /// coordinator state; member daemons may land on remote
     /// nodes depending on placement. For the deck demo this is
-    /// node[0]; tests can pick another to exercise the spread.
+    /// `node[0]`; tests can pick another to exercise the spread.
     pub fn spawn_replica_group<D, F>(
         &self,
         anchor_index: usize,

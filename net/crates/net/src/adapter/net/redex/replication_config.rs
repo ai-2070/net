@@ -63,6 +63,13 @@ pub const HEARTBEAT_MS_DEFAULT: u64 = 500;
 /// [`ReplicationConfig::with_replication_budget_fraction`].
 pub const REPLICATION_BUDGET_FRACTION_DEFAULT: f32 = 0.5;
 
+/// v0.3 Phase D2 default: fraction of bucket capacity reserved
+/// against `Background` admission. With the default 0.3, a
+/// `Background` request needs `available >= 0.7 * capacity` to
+/// pass the gate — preserving ~70% headroom for Foreground bursts
+/// against sustained Background load.
+pub const BACKGROUND_FRACTION_DEFAULT: f32 = 0.3;
+
 /// Where replicas live and how they're chosen at channel-open time
 /// and on roster change. Mirrors the four-axis intent the plan §1
 /// pins:
@@ -152,6 +159,27 @@ pub struct ReplicationConfig {
     /// measured NIC peak. Must lie in `(0.0, 1.0]` and be finite.
     /// Default [`REPLICATION_BUDGET_FRACTION_DEFAULT`].
     pub replication_budget_fraction: f32,
+    /// v0.3 Phase D2: per-channel default
+    /// [`BandwidthClass`](super::bandwidth::BandwidthClass) the
+    /// runtime stamps on every emitted `SyncRequest` unless the
+    /// caller explicitly overrides it. Receivers honor the
+    /// per-request value in preference to this default. Default
+    /// [`BandwidthClass::Foreground`](super::bandwidth::BandwidthClass::Foreground).
+    pub default_bandwidth_class: super::bandwidth::BandwidthClass,
+    /// v0.3 Phase D2: admission-gate parameter — the fraction of
+    /// the bandwidth bucket reserved against `Background`
+    /// requests. A `Background` request is admitted only when
+    /// `available >= (1 - background_fraction) * capacity`.
+    /// Operators tune per channel: hot channels set this low
+    /// (tight Background bound, more Foreground headroom);
+    /// archival channels set it high (give Background more
+    /// room). Must lie in `[0.0, 1.0)` and be finite (1.0
+    /// would deny every Background request unconditionally and
+    /// is rejected; the v0.3 Phase D4 anti-starvation hatch one-
+    /// shot bypasses the gate after 60 s starve regardless of
+    /// the configured value). Default
+    /// [`BACKGROUND_FRACTION_DEFAULT`].
+    pub background_fraction: f32,
 }
 
 impl Default for ReplicationConfig {
@@ -172,6 +200,8 @@ impl ReplicationConfig {
             leader_pinned: None,
             on_under_capacity: UnderCapacity::default(),
             replication_budget_fraction: REPLICATION_BUDGET_FRACTION_DEFAULT,
+            default_bandwidth_class: super::bandwidth::BandwidthClass::Foreground,
+            background_fraction: BACKGROUND_FRACTION_DEFAULT,
         }
     }
 
@@ -211,6 +241,26 @@ impl ReplicationConfig {
     /// NIC peak.
     pub fn with_replication_budget_fraction(mut self, fraction: f32) -> Self {
         self.replication_budget_fraction = fraction;
+        self
+    }
+
+    /// Set the per-channel default
+    /// [`BandwidthClass`](super::bandwidth::BandwidthClass) the
+    /// runtime stamps on emitted `SyncRequest` frames. v0.3 Phase
+    /// D2 — defaults to `Foreground`.
+    pub fn with_default_bandwidth_class(mut self, class: super::bandwidth::BandwidthClass) -> Self {
+        self.default_bandwidth_class = class;
+        self
+    }
+
+    /// Set the per-channel `background_fraction` — the share of
+    /// the bandwidth bucket reserved against `Background`
+    /// admission. Must lie in `[0.0, 1.0)` and be finite (1.0 is
+    /// rejected as it would deny every Background request
+    /// unconditionally). Default
+    /// [`BACKGROUND_FRACTION_DEFAULT`] (0.3).
+    pub fn with_background_fraction(mut self, fraction: f32) -> Self {
+        self.background_fraction = fraction;
         self
     }
 
@@ -263,6 +313,19 @@ impl ReplicationConfig {
         {
             return Err(ReplicationConfigError::BudgetFractionOutOfRange {
                 got: self.replication_budget_fraction,
+            });
+        }
+        // v0.3 Phase D2: background_fraction lives in [0.0, 1.0).
+        // 1.0 would deny every Background request unconditionally
+        // (the gate check would require `available >= 0` which
+        // every empty bucket satisfies — but the math overflows
+        // the intent; reject explicitly).
+        if !self.background_fraction.is_finite()
+            || self.background_fraction < 0.0
+            || self.background_fraction >= 1.0
+        {
+            return Err(ReplicationConfigError::BackgroundFractionOutOfRange {
+                got: self.background_fraction,
             });
         }
         if let PlacementStrategy::Pinned(nodes) = &self.placement {
@@ -344,6 +407,14 @@ pub enum ReplicationConfigError {
     #[error("replication_budget_fraction {got} outside (0.0, 1.0] or non-finite")]
     BudgetFractionOutOfRange {
         /// Configured budget fraction.
+        got: f32,
+    },
+    /// `background_fraction` is outside `[0.0, 1.0)` or non-finite.
+    /// 1.0 is rejected because it would deny every Background
+    /// request unconditionally.
+    #[error("background_fraction {got} outside [0.0, 1.0) or non-finite")]
+    BackgroundFractionOutOfRange {
+        /// Configured background fraction.
         got: f32,
     },
     /// [`PlacementStrategy::Pinned`] supplied an empty `Vec<NodeId>`.

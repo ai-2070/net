@@ -369,16 +369,18 @@ Without this pin, the GC could sweep the only remaining parity chunk of a degrad
 
 This is correct by accident in v0.2 too — but at TB scale the "10 hours into a 12 hour download" failure mode becomes the common case, so v0.3 ships an explicit operator-facing **resume metrics** surface: `blob_fetch_resumed_total`, `blob_fetch_chunks_skipped_on_resume_total`, `blob_fetch_bytes_skipped_on_resume_total`. Operators see the resume effectiveness on the dashboard without instrumenting per-fetch.
 
+> **v0.3 ship status.** Resume metrics deferred — the current `MeshBlobAdapter::fetch_chunk` reads local storage only, so there's no cross-node "pull-and-store" instrumentation site. The metrics land alongside the first concrete cross-node blob-fetch path (post-v0.3), where the substrate has an explicit "did I have to pull this chunk over the wire?" decision point worth counting.
+
 **Bandwidth class.** Per-stream priority lets a 1 TiB background backfill share the replication budget with interactive 10 MiB chunk fetches without starving them. New `BandwidthClass`:
 
 ```rust
 pub enum BandwidthClass {
+    /// Default. Interactive fetches, normal user workload.
+    Foreground,
     /// Long-running TB-scale background work. Bounded to the
     /// configured `replication_budget.background_fraction` of the
     /// per-channel rate. Default: 30 %.
     Background,
-    /// Default. Interactive fetches, normal user workload.
-    Foreground,
     /// Operator-pinned. Bypasses budget if disk pressure allows.
     /// Reserved for control-plane traffic (config publish, ACL
     /// updates) and operator-triggered repair sweeps.
@@ -386,9 +388,24 @@ pub enum BandwidthClass {
 }
 ```
 
-Each `store_stream` / `fetch` / `fetch_range` accepts a `BandwidthClass` (defaulting to `Foreground` for source-compat). The replication budget consults the class to gate `try_consume`: a `Background` stream is admitted only when the budget has at least `(1 - background_fraction) × capacity` available; a `Foreground` stream is admitted normally; a `Realtime` stream bypasses the rate limit but still respects disk-pressure circuit-breakers.
+**Locked design (D2-D4):**
 
-Per-stream queues at the dispatcher level keep classes from inter-blocking: `Foreground` always polls before `Background` in the per-channel send loop. A `Background` stream that's been starved for > 60 s gets promoted to `Foreground` temporarily so a wedged backfill recovers without operator intervention (anti-starvation hatch).
+| Decision | Choice | Rationale |
+|---|---|---|
+| Propagation | **Per-channel default in `ReplicationConfig` + per-request override on the `SyncRequest` wire frame** | Channels carry baseline policy; the override exists for the "this specific fetch is interactive" case (CLI / Deck operations). A request-only model is too chaotic; channel-only is too coarse. |
+| Admission denial | **Defer to next tick** (same path as today's no-budget-credit case) | Matches `replication_runtime`'s existing backpressure semantics; no API churn; callers don't need to handle a new typed error. |
+| `background_fraction` | **Per-channel `ReplicationConfig` field**, default 0.3 | Same tuning granularity as `max_replicas`, `drain_rate`, etc. |
+| Anti-starvation hatch | **Per-channel timer, one-shot promotion** | Streams don't have stable identity. One-shot bounds the "now foreground is starved" risk and matches the per-channel budget unit. |
+| Blob-layer surface | **NOT exposed in v0.3** | Blob layer is a local contract; the cross-node hop is the replication path. Adding the parameter to `MeshBlobAdapter::fetch_range` muddies responsibilities and pre-commits public API before there's a cross-node blob-fetch path to plumb it through. Wires in alongside that path. |
+
+**Admission-gate semantics:** the replication runtime's `tick` consults the class before calling `BandwidthBudget::try_consume`:
+
+- `Foreground` and `Realtime` requests call `try_consume` unchanged. `Realtime` requests further bypass the rate-limit failure path (still subject to disk-pressure circuit-breakers).
+- `Background` requests are admitted only when the bucket has at least `(1 - background_fraction) × capacity` available. Insufficient credit → defer (same as today's path).
+
+**Anti-starvation hatch:** each per-channel `ReplicationBudget` tracks a `last_background_admission: Instant`. When a `Background` request is denied AND `Instant::now() - last_background_admission > 60 s`, the gate is bypassed for that single admission attempt and the timer resets. Bounded promotion (one request) prevents the gate from flipping into "Foreground starved" during a long backlog drain.
+
+**Queue priority (D3 deferred).** The plan's "per-channel send loop polls Foreground before Background" requires either (a) splitting `replication_runtime`'s current single-queue dispatch into per-class channels with a priority-poll, or (b) restructuring the inline-handler loop with a `BinaryHeap` sort. Both are >150 LoC of dispatcher rework and risk reordering / race bugs in the v0.3 ship. **v0.3 ships D2 (admission gating) + D4 (anti-starvation hatch) only**; D3 lands in a follow-up release once the dispatcher refactor is scoped independently. Without D3, admission-gate denial under sustained Background load still bounds Background's throughput, but Background and Foreground requests interleave FIFO instead of priority-ordered. The D4 hatch ensures Background doesn't starve indefinitely even without D3's strict ordering.
 
 ### 8. Operator surface
 
@@ -467,6 +484,8 @@ This mirrors how operators roll out other "all-or-nothing" capability changes (e
 
 Phase A → D below are designed for incremental ship — each phase delivers operator-visible value and ships behind a feature gate so v0.2 wire compatibility never breaks.
 
+> **v0.3 ship status (branch `dataforts-blob-v2`).** Phases A and B are complete. Phase C ships C1, C2, C5, C6, C7, C8, C9 + opt-in fetch-path auto-repair; byte-target stripe close, persistent stripe index, and scheduled repair cadence deferred (see Phase C section). Phase D ships D1, D2, D4, D6 (`repair` / `tree` / `verify` / `path` subcommands); D3 queue priority sort and D5 resume metrics deferred (see Phase D section).
+
 ### Phase A — Hierarchical manifests (BlobRef::Tree)
 
 **Goal:** lift the 16 GiB cap. Ship `Tree` wire variant + streaming store/fetch + cache.
@@ -508,16 +527,23 @@ Phase A → D below are designed for incremental ship — each phase delivers op
 
 **Goal:** storage cost reduction at the same durability.
 
-**Deliverables:**
-- `ChunkRef::role` field + `ChunkRole` enum.
-- `Encoding::ReedSolomon { k, m }` implementation (encode at store, decode at fetch).
-- Repair sweep (`net blob repair`).
-- `dataforts:blob-erasure-supported` capability tag.
-- Conformance fixtures: store a 100 GiB blob with `(10, 4)`; kill 3 chunks per stripe; assert fetch succeeds via reconstruction; kill 5 chunks per stripe; assert fetch fails cleanly.
+**Ships in C (v0.3):**
+- **C1.** RS primitives: `RsParams`, `RsEncoder` wrapping `reed-solomon-erasure` v6 over `GF(2^8)`, `RS_STRIPE_TARGET_BYTES` / `RS_STRIPE_MIN_BYTES` / `DEFAULT_RS_K=10` / `DEFAULT_RS_M=4` constants, `DATAFORTS_BLOB_ERASURE_SUPPORTED` capability tag + `ErasureSupportProbe` downgrade hook + `erasure_downgrade` helper.
+- **C2.** RS striper + store-path dispatch + wire format: new `TreeNode::ErasureLeaf { stripes: Vec<StripeBlock> }` variant (postcard discriminant 2); `RsStriper` accumulates exactly `k` data chunks per stripe (chunk-count rule; plan's byte-target rule deferred — see below), zero-pads data shards, computes `m` parity. Trailing partial stripe (1..k chunks) falls back to `Encoding::Replicated`. Fetch-path happy-path handles `ErasureLeaf` (data-only walk with no reconstruction).
+- **C5.** Fetch-path RS reconstruction: on any data-chunk fetch failure, fetch surviving shards (data + parity), run `RsEncoder::reconstruct_data`, slice from reconstructed shards. Returns `BlobError::Backend("erasure: stripe unrecoverable …")` on `< k` survivors. Defensively BLAKE3-verifies every fetched shard before treating it as reconstruction input.
+- **C6.** GC stripe-membership pin: `StripeMembershipIndex` keyed by chunk hash; `sweep_gc` skips chunks belonging to currently-degraded stripes. Lazy population on read (every `ErasureLeaf` decoded during `fetch_range` registers its stripes) + dedup on register so repeated reads don't bloat the index. Closes the cold-start gap.
+- **C7.** Operator-driven `MeshBlobAdapter::repair_blob(&BlobRef) -> RepairReport`. Walks the tree, reconstructs missing data chunks per RS stripe, re-stores under original hashes. Hash-verifies reconstructed bytes before persist. Records unrecoverable stripes in the report without aborting the sweep.
+- **C8.** Bindings: `DATAFORTS_BLOB_ERASURE_SUPPORTED` constant + `Encoding.replicated()` / `reedSolomon(k, m)` / `defaultReedSolomon()` factories in Node and Python.
+- **C9.** Conformance integration test: multi-stripe RS round-trip, m-chunk-loss reconstruction, m+1-loss unrecoverable, cross-adapter root determinism.
+- **C-follow-up.** Opt-in fetch-path auto-repair (`with_auto_repair_on_fetch(true)`): reconstruction re-stores missing data chunks under their original hashes. Default off — preserves "fetch never writes" semantic.
 
-**Doesn't ship in C:** auto-repair (operator must run `net blob repair` explicitly).
+**Deferred to v0.4 / follow-up:**
+- **Byte-target stripe close.** The plan's `RS_STRIPE_TARGET_BYTES` close trigger (40 MiB of accumulated data, regardless of chunk count) is simplified in C2 to "close at exactly `k` chunks." Under Fixed 4 MiB × k=10 the two rules produce the same ~40 MiB stripe; under CDC with variable chunk sizes, the chunk-count rule keeps the encoder input uniform (always exactly `k` data shards) and avoids synthetic-padding edge cases. The byte-target rule re-lands when synthetic-shard handling is designed for the < k-chunks-at-byte-target case.
+- **Small-stripe `RS_STRIPE_MIN_BYTES` threshold.** The plan's 8 MiB threshold for the Replicated-fallback decision collapses in C2 to "trailing partial stripe always Replicated." Operator pays no parity overhead on the trailing 0..k chunks of any blob regardless of size — acceptable trade for ship simplicity.
+- **On-disk stripe-index journal.** `StripeMembershipIndex` is per-adapter in-memory only. After a process restart, the lazy on-read registration re-populates the index as blobs are accessed (closing the cold-start gap for hot blobs). A persistent journal at `<dir>/stripe_index.bin` rebuilds the full index on startup — substantial; lands when chunk-store layout sees its next disk-format pass.
+- **Scheduled repair cadence.** Plan-spec'd `RedexFileConfig::blob_repair_cadence` (opt-in background timer that runs `repair_blob` on known roots) needs a central blob-root registry that doesn't exist yet. Operators run `net blob repair <hash>` per-blob today; the scheduled variant lands alongside the registry.
 
-**Test plan:** stripe-boundary correctness on the chunk-fan-out path; reconstruction byte-identical to original; repair sweep doesn't restore parity chunks (only data); concurrent fetch + repair doesn't corrupt the reconstruction.
+**Test plan:** stripe-boundary correctness on the chunk-fan-out path (✓ C2 unit + C9 integration); reconstruction byte-identical to original (✓ C5 unit + C9 integration); repair sweep doesn't restore parity chunks (only data) (✓ C7 unit); concurrent fetch + repair doesn't corrupt the reconstruction (uncovered — the in-memory test adapter is single-task; lands when the cross-node fetch path does).
 
 **Effort estimate:** 2-3 weeks. Largest risk: Galois-field reconstruction edge cases. Mitigated by leaning on the well-tested `reed-solomon-erasure` crate and pinning fixture vectors from its test suite.
 
@@ -525,15 +551,18 @@ Phase A → D below are designed for incremental ship — each phase delivers op
 
 **Goal:** make TB-scale fetches operationally sane.
 
-**Deliverables:**
-- `BandwidthClass` enum + per-call parameter on `store_stream` / `fetch`.
-- Replication-budget integration: per-class admission gating.
-- Per-channel send-queue priority by class.
-- Anti-starvation hatch: `Background` → `Foreground` promotion at 60s starve.
-- Resume metrics (`blob_fetch_resumed_total`, etc.).
-- CLI: `net blob throughput`, `net blob tree`, `net blob path`, `net blob verify`.
+**Ships in D (v0.3):**
+- **D1.** `BandwidthClass` enum + `dataforts:blob-bandwidth-class-supported` capability tag + `BandwidthClassSupportProbe` downgrade hook + Node/Python bindings. Declarative surface — substrate treats the class as a hint until D2/D4 wire it.
+- **D2.** Replication-budget integration: per-class admission gating in `replication_runtime::tick`. `Background` requests gated at `(1 - background_fraction) × capacity`; insufficient credit → defer to next tick (matches existing no-credit semantic). `background_fraction` lives on `ReplicationConfig` (default 0.3). Propagation is per-channel default + per-request override on the `SyncRequest` wire frame.
+- **D4.** Anti-starvation hatch on `BandwidthBudget`: per-channel `last_background_admission: Instant`; on `Background` denial past 60s starve, one-shot bypass + timer reset.
+- **D6.** Operator CLI subcommands: `net blob repair` (calls `repair_blob`), `net blob tree` (manifest hierarchy + per-stripe encoding), `net blob verify` (BLAKE3-walk every chunk), `net blob path <offset>` (resolve a byte offset to its chunk).
 
-**Test plan:** background + foreground co-existence test (background starves to bound; foreground unaffected); resume metric correctness across a fetch interrupted at 50%; starvation hatch fires at 60s mark.
+**Deferred to v0.4 / follow-up:**
+- **D3.** Per-channel send-queue priority sort by class. Requires restructuring `replication_runtime`'s dispatch loop into per-class channels with priority-poll, or a `BinaryHeap` over the current single queue. Both are >150 LoC of intrusive dispatcher rework that risks reordering / race bugs in v0.3. D2 admission gating + D4 starvation hatch bound the worst-case behavior without strict ordering: Background can't dominate the budget; Foreground throughput is preserved by the gate; Background can't starve forever. Strict priority lands once the dispatcher refactor is scoped independently.
+- **D5.** Resume metrics (`blob_fetch_resumed_total`, etc.). The current `MeshBlobAdapter::fetch_chunk` is local-storage-only; there's no cross-node pull instrumentation site that gives the counter a meaningful "did I have to pull this?" decision point. Lands alongside the first concrete cross-node blob-fetch path.
+- **D6 (`throughput` subcommand).** Depends on D5's counters.
+
+**Test plan:** background + foreground co-existence test (background starves to bound; foreground unaffected); starvation hatch fires at 60s mark; CLI subcommands' negative-path tests cover bad input / missing root / malformed hash.
 
 **Effort estimate:** 1-2 weeks. Largest risk: tuning the starvation thresholds. Mitigated by making them `RedexFileConfig` knobs with conservative defaults.
 

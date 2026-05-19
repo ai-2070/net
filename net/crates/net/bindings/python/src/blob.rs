@@ -85,21 +85,87 @@ impl PyBlobRef {
         self.inner.uri()
     }
 
-    /// 32-byte BLAKE3 hash of the content. For Small (the only
-    /// variant the Python constructor produces today); v0.2 will
-    /// surface chunked manifests via a separate accessor.
+    /// 32-byte BLAKE3 hash of the content. Defined for the v0.15
+    /// `Small` variant; returns 32 zero bytes for `Manifest` /
+    /// `Tree` (chunked variants reference many hashes — use
+    /// `tree_root_hash` for `Tree`, or walk the manifest's chunk
+    /// list for `Manifest`). Callers should check `is_chunked`
+    /// first to know whether this getter is meaningful.
     #[getter]
     fn hash<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        let hash = self
-            .inner
-            .small_hash()
-            .expect("PyBlobRef constructor only produces Small variants");
-        PyBytes::new(py, hash)
+        let hash = self.inner.small_hash().copied().unwrap_or([0; 32]);
+        PyBytes::new(py, &hash)
     }
 
     #[getter]
     fn size(&self) -> u64 {
         self.inner.size()
+    }
+
+    /// `True` for the v0.3 `Tree` variant; `False` for `Small`
+    /// or `Manifest`.
+    #[getter]
+    fn is_tree(&self) -> bool {
+        self.inner.is_tree()
+    }
+
+    /// `True` for any chunked variant (`Manifest` or `Tree`);
+    /// `False` for `Small`.
+    #[getter]
+    fn is_chunked(&self) -> bool {
+        self.inner.is_chunked()
+    }
+
+    /// 32-byte BLAKE3 hash of the root `TreeNode` body. Defined
+    /// only for the v0.3 `Tree` variant; returns 32 zero bytes
+    /// for `Small` / `Manifest`. Check `is_tree` first.
+    #[getter]
+    fn tree_root_hash<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        let hash = self.inner.tree_root_hash().copied().unwrap_or([0; 32]);
+        PyBytes::new(py, &hash)
+    }
+
+    /// Tree depth (1..=MAX_TREE_DEPTH = 4). Defined only for the
+    /// v0.3 `Tree` variant; returns `0` for `Small` / `Manifest`.
+    /// Check `is_tree` first.
+    #[getter]
+    fn tree_depth(&self) -> u8 {
+        self.inner.tree_depth().unwrap_or(0)
+    }
+
+    /// Construct a v0.3 `Tree` `BlobRef` from `(uri, root_hash,
+    /// total_size, depth)`. `root_hash` must be exactly 32 bytes;
+    /// `depth` must be in `1..=4`; `total_size` must be in
+    /// `1..=128 PiB`. Encoding defaults to `Replicated`.
+    ///
+    /// Producers usually build trees implicitly via
+    /// `MeshBlobAdapter.store_stream_tree`; this static method
+    /// exists for callers that hold pre-built tree state
+    /// (e.g. tests, cross-language migration tooling).
+    #[staticmethod]
+    fn tree_from_parts(
+        uri: String,
+        root_hash: Vec<u8>,
+        total_size: u64,
+        depth: u8,
+    ) -> PyResult<Self> {
+        if root_hash.len() != 32 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "tree_from_parts root_hash must be 32 bytes, got {}",
+                root_hash.len()
+            )));
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&root_hash);
+        InnerBlobRef::tree(
+            uri,
+            ::net::adapter::net::dataforts::Encoding::Replicated,
+            hash,
+            total_size,
+            depth,
+        )
+        .map(|inner| Self { inner })
+        .map_err(map_blob_err)
     }
 
     /// Emit the wire-encoded form (discriminator + version + hash +
@@ -123,13 +189,32 @@ impl PyBlobRef {
     }
 
     fn __repr__(&self) -> String {
-        let hash = self.inner.small_hash().copied().unwrap_or([0; 32]);
-        format!(
-            "BlobRef(uri={:?}, size={}, hash={})",
-            self.inner.uri(),
-            self.inner.size(),
-            hex32(&hash)
-        )
+        // Discriminate by variant so chunked refs don't render
+        // a misleading all-zeros `hash=` field.
+        if let Some(root) = self.inner.tree_root_hash() {
+            format!(
+                "BlobRef(Tree, uri={:?}, size={}, depth={}, root_hash={})",
+                self.inner.uri(),
+                self.inner.size(),
+                self.inner.tree_depth().unwrap_or(0),
+                hex32(root)
+            )
+        } else if self.inner.is_chunked() {
+            format!(
+                "BlobRef(Manifest, uri={:?}, size={}, chunks={})",
+                self.inner.uri(),
+                self.inner.size(),
+                self.inner.chunks().len()
+            )
+        } else {
+            let hash = self.inner.small_hash().copied().unwrap_or([0; 32]);
+            format!(
+                "BlobRef(Small, uri={:?}, size={}, hash={})",
+                self.inner.uri(),
+                self.inner.size(),
+                hex32(&hash)
+            )
+        }
     }
 }
 
@@ -143,6 +228,13 @@ impl PyBlobRef {
     pub(crate) fn as_inner(&self) -> &InnerBlobRef {
         &self.inner
     }
+
+    /// Internal: wrap a Rust `BlobRef` into the Python facade.
+    /// Used by adapter methods (e.g. `store_stream_tree_from_bytes`)
+    /// that produce a fresh BlobRef on the Rust side.
+    pub(crate) fn from_inner(inner: InnerBlobRef) -> Self {
+        Self { inner }
+    }
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -152,6 +244,232 @@ fn hex32(bytes: &[u8; 32]) -> String {
         let _ = write!(s, "{:02x}", b);
     }
     s
+}
+
+/// Capability tag a node advertises when it supports the v0.3
+/// hierarchical-manifest tree path (`BlobRef::Tree`). Compare
+/// advertisement payloads against this string to decide whether
+/// to publish via `BlobRef::Tree` or downgrade to v0.2 Manifest.
+pub const DATAFORTS_BLOB_TREE_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::blob_tree::DATAFORTS_BLOB_TREE_SUPPORTED;
+
+/// Capability tag a node advertises when it supports the v0.3
+/// Phase B content-defined-chunking store path
+/// (`ChunkingStrategy.cdc(...)`). Independent of the Tree tag —
+/// a node can run Phase A (Tree + Fixed) without Phase B (CDC).
+pub const DATAFORTS_BLOB_CDC_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::cdc::DATAFORTS_BLOB_CDC_SUPPORTED;
+
+/// Capability tag a node advertises when it supports the v0.3
+/// Phase C Reed-Solomon erasure-coding store path
+/// (`Encoding.reed_solomon(k, m)`). Independent of Tree/CDC tags:
+/// a node can run Phase A + B without Phase C (RS). Producers
+/// targeting a peer that doesn't advertise this tag must
+/// downgrade to `Encoding.replicated()`.
+pub const DATAFORTS_BLOB_ERASURE_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::erasure::DATAFORTS_BLOB_ERASURE_SUPPORTED;
+
+/// Capability tag a node advertises when it accepts the v0.3
+/// Phase D per-stream `BandwidthClass` hint. A peer that
+/// doesn't advertise it silently drops the hint and serves
+/// every call uniformly.
+pub const DATAFORTS_BLOB_BANDWIDTH_CLASS_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::bandwidth::DATAFORTS_BLOB_BANDWIDTH_CLASS_SUPPORTED;
+
+/// Per-stream bandwidth class hint for the v0.3 Phase D blob
+/// path. Construct via `foreground()` / `background()` /
+/// `realtime()` staticmethods; future chunking-aware binding
+/// store/fetch calls accept it as a hint.
+#[pyclass(name = "BandwidthClass", frozen, eq, from_py_object)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct PyBandwidthClass {
+    /// Discriminant: `"foreground"`, `"background"`, or
+    /// `"realtime"`.
+    #[pyo3(get)]
+    pub kind: String,
+}
+
+#[pymethods]
+impl PyBandwidthClass {
+    #[staticmethod]
+    pub fn foreground() -> Self {
+        Self {
+            kind: "foreground".to_owned(),
+        }
+    }
+
+    #[staticmethod]
+    pub fn background() -> Self {
+        Self {
+            kind: "background".to_owned(),
+        }
+    }
+
+    #[staticmethod]
+    pub fn realtime() -> Self {
+        Self {
+            kind: "realtime".to_owned(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("BandwidthClass.{}()", self.kind)
+    }
+}
+
+/// Producer-facing encoding-strategy value type. Mirrors the
+/// Rust `Encoding` enum (`Replicated` vs `ReedSolomon { k, m }`)
+/// as a Python class with a `kind` discriminant. Construct via
+/// the `replicated()` / `reed_solomon(k, m)` /
+/// `default_reed_solomon()` staticmethods.
+#[pyclass(name = "Encoding", frozen, eq, from_py_object)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct PyEncoding {
+    /// Discriminant: `"replicated"` or `"reed_solomon"`.
+    #[pyo3(get)]
+    pub kind: String,
+    /// RS data shards per stripe — populated iff
+    /// `kind == "reed_solomon"`.
+    #[pyo3(get)]
+    pub k: Option<u8>,
+    /// RS parity shards per stripe — populated iff
+    /// `kind == "reed_solomon"`.
+    #[pyo3(get)]
+    pub m: Option<u8>,
+}
+
+#[pymethods]
+impl PyEncoding {
+    /// Replication-only encoding. Each chunk stored verbatim;
+    /// cross-node replication provides redundancy.
+    #[staticmethod]
+    pub fn replicated() -> Self {
+        Self {
+            kind: "replicated".to_owned(),
+            k: None,
+            m: None,
+        }
+    }
+
+    /// Reed-Solomon erasure encoding: each stripe of `k` data
+    /// chunks gets `m` parity chunks; stripe survives any `m`
+    /// chunk losses.
+    #[staticmethod]
+    pub fn reed_solomon(k: u8, m: u8) -> Self {
+        Self {
+            kind: "reed_solomon".to_owned(),
+            k: Some(k),
+            m: Some(m),
+        }
+    }
+
+    /// Production RS defaults: `(k=10, m=4)`.
+    #[staticmethod]
+    pub fn default_reed_solomon() -> Self {
+        Self::reed_solomon(
+            ::net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_K,
+            ::net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_M,
+        )
+    }
+
+    fn __repr__(&self) -> String {
+        match self.kind.as_str() {
+            "replicated" => "Encoding.replicated()".to_owned(),
+            "reed_solomon" => format!(
+                "Encoding.reed_solomon(k={}, m={})",
+                self.k.unwrap_or(0),
+                self.m.unwrap_or(0)
+            ),
+            other => format!("Encoding(kind={:?})", other),
+        }
+    }
+}
+
+/// Producer-facing chunking-strategy value type for the v0.3
+/// Tree store path. Construct via the `fixed(size)` /
+/// `cdc(min, avg, max)` / `production_cdc()` classmethods and
+/// pass to the future chunking-aware binding store call. The
+/// Rust core's `MeshBlobAdapter::store_stream_tree` already
+/// consumes the corresponding `ChunkingStrategy` enum; this is
+/// the binding-side mirror surfaced as a Python class with the
+/// `kind` discriminant + per-shape fields, so SDK consumers can
+/// build strategies declaratively without depending on the Rust
+/// enum repr.
+#[pyclass(name = "ChunkingStrategy", frozen, eq, from_py_object)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct PyChunkingStrategy {
+    /// Discriminant: `"fixed"` for fixed-size chunks, `"cdc"`
+    /// for content-defined chunking.
+    #[pyo3(get)]
+    pub kind: String,
+    /// Chunk size in bytes — populated iff `kind == "fixed"`.
+    #[pyo3(get)]
+    pub size: Option<u32>,
+    /// CDC minimum chunk size in bytes — populated iff
+    /// `kind == "cdc"`.
+    #[pyo3(get)]
+    pub min: Option<u32>,
+    /// CDC target average chunk size in bytes — populated iff
+    /// `kind == "cdc"`.
+    #[pyo3(get)]
+    pub avg: Option<u32>,
+    /// CDC maximum chunk size in bytes — populated iff
+    /// `kind == "cdc"`.
+    #[pyo3(get)]
+    pub max: Option<u32>,
+}
+
+#[pymethods]
+impl PyChunkingStrategy {
+    /// Fixed-size chunks. `size` must equal the v0.2-compatible
+    /// `BLOB_CHUNK_SIZE_BYTES` (4 MiB) for cluster-wide dedup.
+    #[staticmethod]
+    pub fn fixed(size: u32) -> Self {
+        Self {
+            kind: "fixed".to_owned(),
+            size: Some(size),
+            min: None,
+            avg: None,
+            max: None,
+        }
+    }
+
+    /// Content-defined chunking (FastCDC). For cluster-wide CDC
+    /// dedup, pass the spec'd production triple — see
+    /// `production_cdc()` for the convenience factory.
+    #[staticmethod]
+    pub fn cdc(min: u32, avg: u32, max: u32) -> Self {
+        Self {
+            kind: "cdc".to_owned(),
+            size: None,
+            min: Some(min),
+            avg: Some(avg),
+            max: Some(max),
+        }
+    }
+
+    /// Production CDC parameters pinned by Phase B of the v0.3
+    /// blob plan: `min = 1 MiB`, `avg = 4 MiB`, `max = 16 MiB`.
+    /// All CDC-stored blobs on a cluster must use these exact
+    /// values to dedup against each other.
+    #[staticmethod]
+    pub fn production_cdc() -> Self {
+        let p = ::net::adapter::net::dataforts::blob::cdc::PRODUCTION_CDC_PARAMS;
+        Self::cdc(p.min, p.avg, p.max)
+    }
+
+    fn __repr__(&self) -> String {
+        match self.kind.as_str() {
+            "fixed" => format!("ChunkingStrategy.fixed(size={})", self.size.unwrap_or(0)),
+            "cdc" => format!(
+                "ChunkingStrategy.cdc(min={}, avg={}, max={})",
+                self.min.unwrap_or(0),
+                self.avg.unwrap_or(0),
+                self.max.unwrap_or(0)
+            ),
+            other => format!("ChunkingStrategy(kind={:?})", other),
+        }
+    }
 }
 
 /// Register a filesystem-backed BlobAdapter under `adapter_id`.
@@ -655,19 +973,30 @@ impl PyMeshBlobAdapter {
     ///   `"mesh"`), `tick_interval_ms` (int). Missing keys
     ///   inherit defaults.
     #[new]
-    #[pyo3(signature = (redex, adapter_id, *, persistent = false, overflow = None))]
+    #[pyo3(signature = (
+        redex,
+        adapter_id,
+        *,
+        persistent = false,
+        overflow = None,
+        tree_node_cache_bytes = None,
+    ))]
     fn new(
         py: Python<'_>,
         redex: &PyRedex,
         adapter_id: String,
         persistent: bool,
         overflow: Option<Bound<'_, PyAny>>,
+        tree_node_cache_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let mut builder = InnerMeshBlobAdapter::new(adapter_id.clone(), redex.inner_arc())
             .with_persistent(persistent);
         if let Some(spec) = overflow {
             let cfg = parse_overflow_spec(py, spec)?;
             builder = builder.with_overflow(cfg);
+        }
+        if let Some(cap) = tree_node_cache_bytes {
+            builder = builder.with_tree_node_cache(cap);
         }
         Ok(Self {
             inner: Arc::new(builder),
@@ -818,6 +1147,107 @@ impl PyMeshBlobAdapter {
     /// the result into an HTTP scrape endpoint.
     pub fn prometheus_text(&self) -> String {
         self.inner.prometheus_text()
+    }
+
+    /// v0.3: store `data` as a hierarchical-manifest blob
+    /// ([`BlobRef::Tree`]). Returns the resulting BlobRef.
+    /// Wraps `MeshBlobAdapter::store_stream_tree` for callers
+    /// that have the bytes in memory; for true streaming Python
+    /// consumers should chunk into multiple stores via the
+    /// substrate's streaming-store-token API (post-v0.3).
+    ///
+    /// `encoding` defaults to `Encoding::replicated()`. Pass
+    /// `Encoding::reed_solomon(k, m)` for RS-encoded storage.
+    ///
+    /// Returns a Python `BlobRef` carrying the Tree's (uri,
+    /// root_hash, total_size, depth).
+    #[pyo3(signature = (data, *, encoding = None))]
+    pub fn store_stream_tree_from_bytes(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        encoding: Option<&PyEncoding>,
+    ) -> PyResult<PyBlobRef> {
+        use bytes::Bytes;
+        use futures::stream;
+        use net::adapter::net::dataforts::blob::blob_tree::ChunkingStrategy;
+        use net::adapter::net::dataforts::Encoding;
+
+        let rt = shared_runtime()?;
+        let adapter = self.inner.clone();
+        let enc = match encoding {
+            Some(e) if e.kind == "reed_solomon" => Encoding::ReedSolomon {
+                k: e.k
+                    .unwrap_or(net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_K),
+                m: e.m
+                    .unwrap_or(net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_M),
+            },
+            _ => Encoding::Replicated,
+        };
+        let owned = data.to_vec();
+        let blob = py
+            .detach(
+                || -> Result<net::adapter::net::dataforts::BlobRef, InnerBlobError> {
+                    rt.block_on(async move {
+                        let s = stream::once(
+                            async move { Ok::<_, InnerBlobError>(Bytes::from(owned)) },
+                        );
+                        adapter
+                            .store_stream_tree(Box::pin(s), enc, ChunkingStrategy::default())
+                            .await
+                    })
+                },
+            )
+            .map_err(map_blob_err)?;
+        Ok(PyBlobRef::from_inner(blob))
+    }
+
+    /// v0.3: repair a Tree-encoded RS blob in-place. Walks every
+    /// stripe, reconstructs missing data chunks from parity, and
+    /// re-stores them under their original content-addressed
+    /// hashes. Returns a dict carrying the `RepairReport` counts.
+    ///
+    /// This is the unauthenticated system-internal entry point;
+    /// callers behind a network surface should route through
+    /// `repair_blob_authorized` (not yet exposed in bindings).
+    pub fn repair_blob<'py>(
+        &self,
+        py: Python<'py>,
+        blob_ref: &PyBlobRef,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let rt = shared_runtime()?;
+        let adapter = self.inner.clone();
+        let blob = blob_ref.as_inner().clone();
+        let report = py
+            .detach(
+                || -> Result<net::adapter::net::dataforts::blob::RepairReport, InnerBlobError> {
+                    rt.block_on(async move { adapter.repair_blob(&blob).await })
+                },
+            )
+            .map_err(map_blob_err)?;
+        let out = PyDict::new(py);
+        out.set_item("stripes_walked", report.stripes_walked)?;
+        out.set_item("stripes_already_healthy", report.stripes_already_healthy)?;
+        out.set_item("stripes_repaired", report.stripes_repaired)?;
+        out.set_item("chunks_restored", report.chunks_restored)?;
+        out.set_item("stripes_unrecoverable", report.stripes_unrecoverable)?;
+        out.set_item(
+            "replicated_stripes_skipped",
+            report.replicated_stripes_skipped,
+        )?;
+        out.set_item(
+            "replicated_leaves_skipped",
+            report.replicated_leaves_skipped,
+        )?;
+        Ok(out)
+    }
+
+    /// v0.3 tree-walker LRU cache statistics. Returns
+    /// `(hits, misses, bytes, entries)` when the cache is wired
+    /// (constructor `tree_node_cache_bytes` kwarg), `None`
+    /// otherwise.
+    pub fn tree_node_cache_stats(&self) -> Option<(u64, u64, usize, usize)> {
+        self.inner.tree_node_cache_stats()
     }
 }
 

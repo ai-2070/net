@@ -10589,6 +10589,7 @@ mod replication_dispatch_tests {
             since_seq: 100,
             chunk_max: 4096,
             request_id: 0,
+            class: Default::default(),
         };
         let payload = req.to_bytes();
         let router = RecorderRouter::default();

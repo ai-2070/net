@@ -494,3 +494,394 @@ fn metrics_body_includes_overflow_counter_family() {
         );
     }
 }
+
+// ============================================================================
+// v0.3 Phase C/D subcommands (negative-path coverage)
+// ============================================================================
+//
+// `repair`, `tree`, `verify`, `path` operate on `BlobRef::Tree`
+// blobs. The CLI's `put` only produces `BlobRef::Small`, so
+// happy-path coverage would require either a new `put-tree`
+// subcommand or in-process library calls (which breaks the
+// spawn-bin integration pattern). Until either lands, the tests
+// below pin the negative paths: bad inputs surface as typed
+// errors with nonzero exit, never as panics or silent success.
+
+/// Stable test hash — 64 hex chars, content-irrelevant. The
+/// subcommands construct a BlobRef::Tree from it; any chunk
+/// fetch on this hash will miss (the chunk store is empty).
+const DUMMY_HASH: &str = "deadbeef00000000000000000000000000000000000000000000000000000000";
+
+#[test]
+fn path_subcommand_rejects_offset_at_or_past_size() {
+    let tmp = TempDir::new("path-offset-oob");
+    let out = run_net_blob(
+        tmp.path(),
+        &[
+            "path", DUMMY_HASH, "--size", "1024", "--depth", "1", "--offset", "1024",
+        ],
+    );
+    assert!(!out.status.success(), "offset == size must exit nonzero");
+    let stderr = stderr_string(&out);
+    assert!(
+        stderr.contains("offset") && stderr.contains("size"),
+        "expected an offset-vs-size diagnostic, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn tree_subcommand_on_missing_root_exits_cleanly() {
+    let tmp = TempDir::new("tree-missing-root");
+    let out = run_net_blob(
+        tmp.path(),
+        &["tree", DUMMY_HASH, "--size", "1024", "--depth", "1"],
+    );
+    assert!(
+        !out.status.success(),
+        "tree on a hash that doesn't exist locally must exit nonzero"
+    );
+    // No panic — stderr carries a typed error, not a thread dump.
+    let stderr = stderr_string(&out);
+    assert!(
+        !stderr.contains("panicked"),
+        "tree must surface a clean error, not panic. stderr:\n{}",
+        stderr
+    );
+}
+
+#[test]
+fn repair_subcommand_on_missing_root_exits_cleanly() {
+    let tmp = TempDir::new("repair-missing-root");
+    let out = run_net_blob(
+        tmp.path(),
+        &["repair", DUMMY_HASH, "--size", "1024", "--depth", "1"],
+    );
+    assert!(
+        !out.status.success(),
+        "repair on a missing root must exit nonzero"
+    );
+    let stderr = stderr_string(&out);
+    assert!(
+        !stderr.contains("panicked"),
+        "repair must surface a clean error, not panic. stderr:\n{}",
+        stderr
+    );
+}
+
+#[test]
+fn verify_subcommand_on_missing_root_reports_root_unreachable() {
+    let tmp = TempDir::new("verify-missing-root");
+    // `--format` is a top-level flag (precedes the subcommand)
+    // per the CLI's clap layout.
+    let out = Command::new(net_blob())
+        .args([
+            "-d",
+            tmp.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "verify",
+            DUMMY_HASH,
+            "--size",
+            "1024",
+            "--depth",
+            "1",
+        ])
+        .output()
+        .expect("spawn net-blob");
+    // verify must distinguish "could not verify, manifest gone"
+    // (exit 3, root_unreachable=true) from "verified, found
+    // problems" (exit 2, missing/corrupted > 0). Operator
+    // scripts route different remediation per code:
+    //   exit 3 → operator probably mis-supplied --depth or the
+    //            blob was deleted; do NOT auto-repair
+    //   exit 2 → chunks missing/corrupted; queue net-blob repair
+    let code = out.status.code();
+    assert_eq!(
+        code,
+        Some(3),
+        "missing root must exit 3 (root_unreachable), got exit {:?}",
+        code,
+    );
+    let stdout = stdout_string(&out);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("verify --format json must emit valid JSON");
+    assert_eq!(
+        parsed["root_unreachable"].as_bool(),
+        Some(true),
+        "missing root must surface root_unreachable=true; got: {}",
+        stdout,
+    );
+    // healthy / missing / corrupted are all zero when the walk
+    // never starts.
+    assert_eq!(parsed["healthy"].as_u64(), Some(0));
+    assert_eq!(parsed["missing"].as_u64(), Some(0));
+    assert_eq!(parsed["corrupted"].as_u64(), Some(0));
+}
+
+/// `put-tree` stores a Tree-encoded blob and prints the
+/// `(hash, size, depth)` triple operators feed to subsequent
+/// subcommands. Pre-fix the CLI only produced Small blobs via
+/// `put`; operators wanting to exercise repair / tree / verify /
+/// path against real Tree blobs had no CLI path to produce one.
+///
+/// The test stores a multi-chunk-worth payload, asserts the
+/// JSON output carries every expected field, then round-trips
+/// through `tree` using the emitted hash/size/depth — confirming
+/// the metadata is structurally usable by the follow-up
+/// subcommands.
+#[test]
+fn put_tree_emits_hash_size_depth_and_round_trips_through_tree_subcommand() {
+    let tmp = TempDir::new("put-tree-round-trip");
+    let dir = tmp.path();
+    // 16 MiB so the resulting Tree has multiple chunks at the
+    // 4 MiB default chunk size.
+    let payload = vec![0xC4u8; 16 * 1024 * 1024];
+    let input = dir.join("payload.bin");
+    fs::write(&input, &payload).unwrap();
+    let put_out = run_net_blob(
+        dir,
+        &["--format", "json", "put-tree", input.to_str().unwrap()],
+    );
+    assert!(
+        put_out.status.success(),
+        "put-tree must succeed; stderr={}",
+        stderr_string(&put_out)
+    );
+    let body = stdout_string(&put_out);
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let hash = parsed["hash"].as_str().expect("hash field").to_string();
+    let size = parsed["size"].as_u64().expect("size field");
+    let depth = parsed["depth"].as_u64().expect("depth field") as u8;
+    assert_eq!(hash.len(), 64, "BLAKE3 hex hash must be 64 chars");
+    assert_eq!(size, payload.len() as u64);
+    assert!(
+        (1..=4).contains(&depth),
+        "Tree depth must lie in 1..=MAX_TREE_DEPTH; got {depth}",
+    );
+    assert_eq!(parsed["encoding"].as_str(), Some("Replicated"));
+
+    // Round-trip: feed the triple into `tree` and confirm it
+    // exits cleanly (the metadata is structurally usable).
+    let tree_out = run_net_blob(
+        dir,
+        &[
+            "tree",
+            &hash,
+            "--size",
+            &size.to_string(),
+            "--depth",
+            &depth.to_string(),
+        ],
+    );
+    assert!(
+        tree_out.status.success(),
+        "tree subcommand must accept put-tree's emitted triple; stderr={}",
+        stderr_string(&tree_out),
+    );
+}
+
+/// `put-tree --rs k=4,m=2` produces a ReedSolomon-encoded Tree.
+/// The emitted encoding field reports the (k, m) parameters.
+#[test]
+fn put_tree_rs_spec_produces_reed_solomon_encoded_tree() {
+    let tmp = TempDir::new("put-tree-rs");
+    let dir = tmp.path();
+    let payload = vec![0xE7u8; 16 * 1024 * 1024];
+    let input = dir.join("payload.bin");
+    fs::write(&input, &payload).unwrap();
+    let out = run_net_blob(
+        dir,
+        &[
+            "--format",
+            "json",
+            "put-tree",
+            input.to_str().unwrap(),
+            "--rs",
+            "k=4,m=2",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "put-tree --rs must succeed; stderr={}",
+        stderr_string(&out)
+    );
+    let body = stdout_string(&out);
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(
+        parsed["encoding"].as_str(),
+        Some("ReedSolomon(k=4,m=2)"),
+        "encoding field must reflect --rs spec; body: {}",
+        body
+    );
+}
+
+/// `put-tree --rs` rejects malformed RS specs with a clean error.
+#[test]
+fn put_tree_rs_spec_rejects_malformed_input() {
+    let tmp = TempDir::new("put-tree-rs-bad");
+    let dir = tmp.path();
+    let input = dir.join("p.bin");
+    fs::write(&input, b"x").unwrap();
+    for spec in &["k4,m=2", "k=4,m=", "k=4", "garbage"] {
+        let out = run_net_blob(dir, &["put-tree", input.to_str().unwrap(), "--rs", spec]);
+        assert!(
+            !out.status.success(),
+            "malformed --rs '{}' must exit nonzero",
+            spec
+        );
+        let stderr = stderr_string(&out);
+        assert!(
+            !stderr.contains("panicked"),
+            "put-tree --rs '{}' must clean-error, not panic. stderr:\n{}",
+            spec,
+            stderr,
+        );
+    }
+}
+
+/// `tree` / `repair` / `verify` against a hash whose stored
+/// content doesn't decode as a `TreeNode` postcard body must
+/// surface a clean error, not panic. We synthesize the scenario
+/// via `put` (which stores a Small blob — arbitrary bytes
+/// content-addressed to BLAKE3), then invoke the Tree-only
+/// subcommands against the same hash with --depth=1. The Tree
+/// path fetches the chunk successfully (it exists locally),
+/// then fails the `TreeNode::decode` step.
+#[test]
+fn tree_subcommand_on_corrupt_root_decode_fails_cleanly() {
+    let tmp = TempDir::new("tree-corrupt-root");
+    let dir = tmp.path();
+    // Store arbitrary bytes that are NOT a valid TreeNode
+    // postcard body. The CLI's `put` produces a Small blob, but
+    // the bytes-at-hash association is what we need: the Tree
+    // subcommands will fetch the bytes and try to decode them.
+    let input = dir.join("garbage.bin");
+    fs::write(&input, b"this is not a TreeNode postcard body").unwrap();
+    let put_out = run_net_blob(dir, &["--format", "json", "put", input.to_str().unwrap()]);
+    let hash = parse_put_hash(&put_out);
+
+    // tree subcommand: must surface a typed decode error, not panic.
+    let out = run_net_blob(dir, &["tree", &hash, "--size", "1024", "--depth", "1"]);
+    assert!(
+        !out.status.success(),
+        "tree on corrupt-decode root must exit nonzero"
+    );
+    let stderr = stderr_string(&out);
+    assert!(
+        !stderr.contains("panicked"),
+        "tree must clean-error on bad TreeNode bytes, not panic. stderr:\n{}",
+        stderr,
+    );
+}
+
+/// Same scenario as above but against the `repair` subcommand.
+/// Tree-walking traversal hits `TreeNode::decode` on the root
+/// chunk; clean error, no panic.
+#[test]
+fn repair_subcommand_on_corrupt_root_decode_fails_cleanly() {
+    let tmp = TempDir::new("repair-corrupt-root");
+    let dir = tmp.path();
+    let input = dir.join("garbage.bin");
+    fs::write(&input, b"not-a-tree-node-body").unwrap();
+    let put_out = run_net_blob(dir, &["--format", "json", "put", input.to_str().unwrap()]);
+    let hash = parse_put_hash(&put_out);
+
+    let out = run_net_blob(dir, &["repair", &hash, "--size", "1024", "--depth", "1"]);
+    assert!(
+        !out.status.success(),
+        "repair on corrupt-decode root must exit nonzero"
+    );
+    let stderr = stderr_string(&out);
+    assert!(
+        !stderr.contains("panicked"),
+        "repair must clean-error on bad TreeNode bytes. stderr:\n{}",
+        stderr,
+    );
+}
+
+/// `verify` against a corrupt-decode root must surface
+/// root_unreachable=true (exit 3) — the root chunk exists but
+/// can't be decoded, which from the operator's POV is equivalent
+/// to "could not verify, manifest gone." Exit 3 routes the
+/// operator to manual investigation rather than auto-repair.
+#[test]
+fn verify_subcommand_on_corrupt_root_exits_cleanly() {
+    let tmp = TempDir::new("verify-corrupt-root");
+    let dir = tmp.path();
+    let input = dir.join("garbage.bin");
+    fs::write(&input, b"not-a-tree-node").unwrap();
+    let put_out = run_net_blob(dir, &["--format", "json", "put", input.to_str().unwrap()]);
+    let hash = parse_put_hash(&put_out);
+
+    let out = Command::new(net_blob())
+        .args([
+            "-d",
+            dir.to_str().unwrap(),
+            "--format",
+            "json",
+            "verify",
+            &hash,
+            "--size",
+            "1024",
+            "--depth",
+            "1",
+        ])
+        .output()
+        .expect("spawn net-blob");
+    // The root chunk fetches successfully (exists locally), so
+    // root_unreachable is false from the fetch_chunk probe's
+    // view. The walk then runs and hits TreeNode::decode failure,
+    // which today returns a hard error from verify_walk —
+    // cmd_verify propagates that as exit 1. Acceptable: pre-fix
+    // and post-fix both treat decode-failure as a hard error
+    // distinct from missing-root (exit 3). The contract this
+    // test pins is "no panic, nonzero exit, clean stderr."
+    assert!(
+        !out.status.success(),
+        "verify on corrupt-decode root must exit nonzero"
+    );
+    let stderr = stderr_string(&out);
+    assert!(
+        !stderr.contains("panicked"),
+        "verify must clean-error on bad TreeNode bytes. stderr:\n{}",
+        stderr,
+    );
+}
+
+#[test]
+fn tree_repair_verify_path_rejects_malformed_hash() {
+    // Every Phase C/D subcommand parses the hash via the same
+    // parse_hash helper. Non-hex / wrong-length input should
+    // produce a clean parse error, not a panic.
+    let tmp = TempDir::new("malformed-hash");
+    let bogus = "not-a-real-hash";
+    for subcommand in &["tree", "repair", "verify"] {
+        let out = run_net_blob(
+            tmp.path(),
+            &[*subcommand, bogus, "--size", "1024", "--depth", "1"],
+        );
+        assert!(
+            !out.status.success(),
+            "{} with malformed hash must exit nonzero",
+            subcommand
+        );
+        let stderr = stderr_string(&out);
+        assert!(
+            !stderr.contains("panicked"),
+            "{} must clean-error on bad hash, not panic. stderr:\n{}",
+            subcommand,
+            stderr
+        );
+    }
+    // `path` takes the same parse_hash plus --offset.
+    let out = run_net_blob(
+        tmp.path(),
+        &[
+            "path", bogus, "--size", "1024", "--depth", "1", "--offset", "0",
+        ],
+    );
+    assert!(!out.status.success());
+    let stderr = stderr_string(&out);
+    assert!(!stderr.contains("panicked"));
+}

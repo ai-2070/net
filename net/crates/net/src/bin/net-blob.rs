@@ -63,8 +63,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
+use net::adapter::net::dataforts::blob::blob_tree::TreeNode;
 use net::adapter::net::dataforts::blob::{
-    BlobAdapter, BlobRef, BlobStat, MeshBlobAdapter, RefcountEntry,
+    BlobAdapter, BlobRef, BlobStat, Encoding, MeshBlobAdapter, RefcountEntry, RepairReport,
 };
 use net::adapter::net::redex::Redex;
 
@@ -181,6 +182,97 @@ enum Cmd {
         #[command(subcommand)]
         action: OverflowCmd,
     },
+    /// Repair a v0.3 `BlobRef::Tree` blob with
+    /// `Encoding::ReedSolomon` encoding: walk every stripe,
+    /// reconstruct any missing data chunks from parity, re-store
+    /// them under their original content-addressed hashes. Prints
+    /// the `RepairReport` (stripes walked / repaired /
+    /// unrecoverable, chunks restored).
+    Repair {
+        /// 64-char lowercase hex of the BLAKE3-256 root hash.
+        hash: String,
+        /// Total blob size in bytes — required to construct the
+        /// BlobRef::Tree. Available from `stat` on the original
+        /// store.
+        #[arg(long)]
+        size: u64,
+        /// Tree depth (1..=4). Required to construct the
+        /// BlobRef::Tree; the depth lives in the wire BlobRef
+        /// but isn't recoverable from the root hash alone.
+        #[arg(long)]
+        depth: u8,
+    },
+    /// Walk a v0.3 `BlobRef::Tree` blob and print the manifest
+    /// node hierarchy: depth + arity + per-stripe shape for
+    /// erasure-coded leaves. Useful for diagnosing manifest-tree
+    /// shape regressions and verifying tree depth claims match
+    /// actual structure.
+    Tree {
+        /// 64-char lowercase hex of the BLAKE3-256 root hash.
+        hash: String,
+        #[arg(long)]
+        size: u64,
+        #[arg(long)]
+        depth: u8,
+    },
+    /// Walk every reachable chunk of a v0.3 `BlobRef::Tree`,
+    /// fetch its bytes, and verify the BLAKE3 hash matches the
+    /// manifest's recorded hash. Reports the count of healthy /
+    /// missing / corrupted chunks. Operators run after a
+    /// suspected disk corruption event to identify which blobs
+    /// need `repair`.
+    Verify {
+        /// 64-char lowercase hex of the BLAKE3-256 root hash.
+        hash: String,
+        #[arg(long)]
+        size: u64,
+        #[arg(long)]
+        depth: u8,
+    },
+    /// Store a file as a v0.3 `BlobRef::Tree` blob and print the
+    /// `(hash, size, depth)` triple operators can later feed to
+    /// `repair`, `tree`, `verify`, and `path`. `put` produces a
+    /// `BlobRef::Small`; this subcommand is the corresponding
+    /// Tree-producing path so operators don't need to track Tree
+    /// metadata out-of-band.
+    ///
+    /// Reads the entire file into memory and pipes through
+    /// `MeshBlobAdapter::store_stream_tree` with the default
+    /// chunking strategy. RS encoding is opt-in; default emits
+    /// `Encoding::Replicated`.
+    PutTree {
+        /// Path to read. Pass `-` to read stdin.
+        path: String,
+        /// URI prefix to stamp on the BlobRef. Defaults to
+        /// `mesh://<hex>`.
+        #[arg(long)]
+        uri: Option<String>,
+        /// Encode with Reed-Solomon at `k` data + `m` parity per
+        /// stripe. When omitted, the blob stores as Replicated
+        /// (no parity). Operators wanting RS pass e.g.
+        /// `--rs k=10,m=4`.
+        #[arg(long)]
+        rs: Option<String>,
+    },
+    /// Walk a v0.3 `BlobRef::Tree` to a specific byte offset and
+    /// print the chunk + sub-offset that byte lives in. Reports
+    /// the manifest-tree path (root → internal nodes → leaf) and
+    /// the resolved chunk's hash + offset-within-chunk. For RS-
+    /// encoded blobs, the stripe index + per-stripe encoding are
+    /// included so the operator can correlate a byte offset with
+    /// its parity-protected stripe.
+    Path {
+        /// 64-char lowercase hex of the BLAKE3-256 root hash.
+        hash: String,
+        #[arg(long)]
+        size: u64,
+        #[arg(long)]
+        depth: u8,
+        /// Byte offset within the logical blob to resolve.
+        /// `0..size`.
+        #[arg(long)]
+        offset: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -235,6 +327,22 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Overflow { action } => match action {
             OverflowCmd::Status => cmd_overflow_status(&adapter, cli.format),
         },
+        Cmd::Repair { hash, size, depth } => {
+            cmd_repair(&adapter, &hash, size, depth, cli.format).await
+        }
+        Cmd::PutTree { path, uri, rs } => {
+            cmd_put_tree(&adapter, &path, uri.as_deref(), rs.as_deref(), cli.format).await
+        }
+        Cmd::Tree { hash, size, depth } => cmd_tree(&adapter, &hash, size, depth, cli.format).await,
+        Cmd::Verify { hash, size, depth } => {
+            cmd_verify(&adapter, &hash, size, depth, cli.format).await
+        }
+        Cmd::Path {
+            hash,
+            size,
+            depth,
+            offset,
+        } => cmd_path(&adapter, &hash, size, depth, offset, cli.format).await,
     }
 }
 
@@ -272,6 +380,132 @@ async fn cmd_put(
             println!("stored: {}", out.uri);
             println!("hash:   {}", out.hash);
             println!("size:   {} bytes", out.size);
+        }
+        OutputFormat::Json => println!("{}", serde_json::to_string(&out)?),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Parse `--rs k=N,m=M` into `RsParams`. Returns `Err` with an
+/// operator-friendly message on malformed input.
+fn parse_rs_spec(s: &str) -> Result<(u8, u8), Box<dyn std::error::Error>> {
+    let mut k: Option<u8> = None;
+    let mut m: Option<u8> = None;
+    for kv in s.split(',') {
+        let (key, val) = kv
+            .split_once('=')
+            .ok_or_else(|| format!("--rs spec '{}' missing '=' in component '{}'", s, kv))?;
+        let val: u8 = val
+            .trim()
+            .parse()
+            .map_err(|e| format!("--rs spec '{}' has non-numeric value '{}': {}", s, val, e))?;
+        match key.trim() {
+            "k" => k = Some(val),
+            "m" => m = Some(val),
+            other => {
+                return Err(
+                    format!("--rs spec unknown key '{}'; expected 'k' or 'm'", other).into(),
+                )
+            }
+        }
+    }
+    let k = k.ok_or("--rs spec missing 'k='")?;
+    let m = m.ok_or("--rs spec missing 'm='")?;
+    Ok((k, m))
+}
+
+async fn cmd_put_tree(
+    adapter: &MeshBlobAdapter,
+    path: &str,
+    uri_hint: Option<&str>,
+    rs_spec: Option<&str>,
+    fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    use bytes::Bytes;
+    use futures::stream;
+    use net::adapter::net::dataforts::blob::blob_tree::ChunkingStrategy;
+    use net::adapter::net::dataforts::Encoding;
+
+    let bytes = read_input(path)?;
+    let total_size = bytes.len() as u64;
+    if bytes.is_empty() {
+        return Err(
+            "put-tree: refusing to store an empty input as a Tree; use `put` for empty payloads"
+                .into(),
+        );
+    }
+    let encoding = match rs_spec {
+        None => Encoding::Replicated,
+        Some(spec) => {
+            let (k, m) = parse_rs_spec(spec)?;
+            Encoding::ReedSolomon { k, m }
+        }
+    };
+
+    let bytes_for_stream = bytes.clone();
+    let s = stream::once(async move {
+        Ok::<_, net::adapter::net::dataforts::BlobError>(Bytes::from(bytes_for_stream))
+    });
+    let blob_ref = adapter
+        .store_stream_tree(Box::pin(s), encoding, ChunkingStrategy::default())
+        .await
+        .map_err(|e| format!("put-tree: store_stream_tree failed: {}", e))?;
+
+    // The adapter constructs the BlobRef::Tree with its own URI
+    // shape (`mesh://<root-hex>`). If the operator supplied a
+    // --uri, we don't override the adapter's choice — the adapter
+    // already used the wire-canonical form. The output prints both
+    // for clarity.
+    let _ = uri_hint;
+    let (uri, root_hash, depth) = match &blob_ref {
+        BlobRef::Tree {
+            uri,
+            root_hash,
+            depth,
+            ..
+        } => (uri.clone(), *root_hash, *depth),
+        other => {
+            return Err(format!(
+                "put-tree: expected Tree BlobRef from store_stream_tree, got: {:?}",
+                other
+            )
+            .into());
+        }
+    };
+
+    #[derive(Serialize)]
+    struct PutTreeOut<'a> {
+        uri: &'a str,
+        hash: String,
+        size: u64,
+        depth: u8,
+        encoding: String,
+    }
+    let encoding_str = match encoding {
+        Encoding::Replicated => "Replicated".to_string(),
+        Encoding::ReedSolomon { k, m } => format!("ReedSolomon(k={},m={})", k, m),
+    };
+    let out = PutTreeOut {
+        uri: &uri,
+        hash: hex32(&root_hash),
+        size: total_size,
+        depth,
+        encoding: encoding_str,
+    };
+    match fmt {
+        OutputFormat::Human => {
+            println!("stored: {}", out.uri);
+            println!("hash:   {}", out.hash);
+            println!("size:   {} bytes", out.size);
+            println!("depth:  {}", out.depth);
+            println!("encoding: {}", out.encoding);
+            // Operator-friendly hint: the next subcommand needs
+            // the (size, depth) pair, so print it as a one-liner
+            // copy-pasteable into a follow-up invocation.
+            println!(
+                "(reproduce: net-blob <subcmd> {} --size {} --depth {})",
+                out.hash, out.size, out.depth,
+            );
         }
         OutputFormat::Json => println!("{}", serde_json::to_string(&out)?),
     }
@@ -578,6 +812,542 @@ fn cmd_overflow_status(
                     "low_water_cleared_total": o.low_water_cleared_total,
                     "disk_ratio": o.disk_ratio,
                 },
+            })
+        ),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ============================================================================
+// v0.3 Phase C/D subcommands: repair, tree, verify
+// ============================================================================
+
+/// Boxed pinned future the recursive `walk_tree_print` /
+/// `verify_walk` helpers return — async-recursion in stable
+/// Rust requires the boxed return type. Aliased here so the
+/// signature stays readable.
+type RecursiveWalkFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>,
+>;
+
+/// Construct a `BlobRef::Tree` from operator-supplied parts. The
+/// CLI takes (hash, size, depth) because the depth lives in the
+/// wire BlobRef envelope and isn't recoverable from the root
+/// chunk alone. Stamps `Encoding::Replicated` by default — the
+/// repair/tree/verify subcommands re-derive per-leaf encoding
+/// from the manifest itself, so the BlobRef-level encoding here
+/// only affects the repair report's `replicated_leaves_skipped`
+/// counter (and that path is robust to a mismatch).
+fn build_tree_ref(
+    hash_hex: &str,
+    size: u64,
+    depth: u8,
+) -> Result<BlobRef, Box<dyn std::error::Error>> {
+    let hash = parse_hash(hash_hex)?;
+    let uri = format!("mesh://{}", hex32(&hash));
+    let blob_ref = BlobRef::tree(uri, Encoding::Replicated, hash, size, depth)
+        .map_err(|e| format!("invalid BlobRef::Tree parts: {}", e))?;
+    Ok(blob_ref)
+}
+
+async fn cmd_repair(
+    adapter: &MeshBlobAdapter,
+    hash_hex: &str,
+    size: u64,
+    depth: u8,
+    fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let blob_ref = build_tree_ref(hash_hex, size, depth)?;
+    let report: RepairReport = adapter.repair_blob(&blob_ref).await?;
+    match fmt {
+        OutputFormat::Human => {
+            println!("repair: {}", hash_hex);
+            println!("  stripes_walked:              {}", report.stripes_walked);
+            println!(
+                "  stripes_already_healthy:     {}",
+                report.stripes_already_healthy
+            );
+            println!("  stripes_repaired:            {}", report.stripes_repaired);
+            println!("  chunks_restored:             {}", report.chunks_restored);
+            println!(
+                "  stripes_unrecoverable:       {}",
+                report.stripes_unrecoverable
+            );
+            println!(
+                "  replicated_stripes_skipped:  {}",
+                report.replicated_stripes_skipped
+            );
+            println!(
+                "  replicated_leaves_skipped:   {}",
+                report.replicated_leaves_skipped
+            );
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "hash": hash_hex,
+                "stripes_walked": report.stripes_walked,
+                "stripes_already_healthy": report.stripes_already_healthy,
+                "stripes_repaired": report.stripes_repaired,
+                "chunks_restored": report.chunks_restored,
+                "stripes_unrecoverable": report.stripes_unrecoverable,
+                "replicated_stripes_skipped": report.replicated_stripes_skipped,
+                "replicated_leaves_skipped": report.replicated_leaves_skipped,
+            })
+        ),
+    }
+    // Exit 0 when nothing unrecoverable — operators commonly chain
+    // `repair --format json | jq` and rely on exit status for
+    // "did this need human attention".
+    if report.stripes_unrecoverable > 0 {
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+async fn cmd_tree(
+    adapter: &MeshBlobAdapter,
+    hash_hex: &str,
+    size: u64,
+    depth: u8,
+    fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let blob_ref = build_tree_ref(hash_hex, size, depth)?;
+    let root_hash = *blob_ref.tree_root_hash().expect("Tree built above");
+    let mut json_nodes: Vec<serde_json::Value> = Vec::new();
+    walk_tree_print(adapter, root_hash, 0, fmt, &mut json_nodes).await?;
+    if matches!(fmt, OutputFormat::Json) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "root_hash": hash_hex,
+                "size": size,
+                "depth": depth,
+                "nodes": json_nodes,
+            })
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Recursive helper for `cmd_tree`. Walks down from `node_hash`,
+/// printing one line per node in Human mode or appending one
+/// JSON entry per node in JSON mode.
+fn walk_tree_print<'a>(
+    adapter: &'a MeshBlobAdapter,
+    node_hash: [u8; 32],
+    indent: usize,
+    fmt: OutputFormat,
+    json_nodes: &'a mut Vec<serde_json::Value>,
+) -> RecursiveWalkFuture<'a> {
+    Box::pin(async move {
+        let bytes = adapter.fetch_chunk(&node_hash).await?;
+        let node = TreeNode::decode(&bytes)?;
+        let pad = "  ".repeat(indent);
+        match &node {
+            TreeNode::Internal { children } => {
+                match fmt {
+                    OutputFormat::Human => println!(
+                        "{}internal[{}] {} ({} bytes covered)",
+                        pad,
+                        children.len(),
+                        hex32(&node_hash),
+                        node.covered_bytes()
+                    ),
+                    OutputFormat::Json => json_nodes.push(serde_json::json!({
+                        "hash": hex32(&node_hash),
+                        "kind": "internal",
+                        "depth": indent,
+                        "arity": children.len(),
+                        "covered_bytes": node.covered_bytes(),
+                    })),
+                }
+                for (child_hash, _) in children {
+                    walk_tree_print(adapter, *child_hash, indent + 1, fmt, json_nodes).await?;
+                }
+            }
+            TreeNode::Leaf { chunks } => match fmt {
+                OutputFormat::Human => println!(
+                    "{}leaf[{}] {} ({} bytes covered)",
+                    pad,
+                    chunks.len(),
+                    hex32(&node_hash),
+                    node.covered_bytes()
+                ),
+                OutputFormat::Json => json_nodes.push(serde_json::json!({
+                    "hash": hex32(&node_hash),
+                    "kind": "leaf",
+                    "depth": indent,
+                    "chunks": chunks.len(),
+                    "covered_bytes": node.covered_bytes(),
+                })),
+            },
+            TreeNode::ErasureLeaf { stripes } => match fmt {
+                OutputFormat::Human => {
+                    println!(
+                        "{}erasure_leaf[{} stripes] {} ({} bytes covered)",
+                        pad,
+                        stripes.len(),
+                        hex32(&node_hash),
+                        node.covered_bytes()
+                    );
+                    for (i, stripe) in stripes.iter().enumerate() {
+                        let pad2 = "  ".repeat(indent + 1);
+                        let data_count = stripe.chunks.iter().filter(|c| c.is_data()).count();
+                        let parity_count = stripe.chunks.iter().filter(|c| c.is_parity()).count();
+                        println!(
+                            "{}stripe[{}] {:?}: {} data + {} parity ({} bytes)",
+                            pad2,
+                            i,
+                            stripe.encoding,
+                            data_count,
+                            parity_count,
+                            stripe.covered_bytes()
+                        );
+                    }
+                }
+                OutputFormat::Json => json_nodes.push(serde_json::json!({
+                    "hash": hex32(&node_hash),
+                    "kind": "erasure_leaf",
+                    "depth": indent,
+                    "stripes": stripes.len(),
+                    "covered_bytes": node.covered_bytes(),
+                })),
+            },
+        }
+        Ok(())
+    })
+}
+
+async fn cmd_verify(
+    adapter: &MeshBlobAdapter,
+    hash_hex: &str,
+    size: u64,
+    depth: u8,
+    fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let blob_ref = build_tree_ref(hash_hex, size, depth)?;
+    let root_hash = *blob_ref.tree_root_hash().expect("Tree built above");
+    // Probe the root explicitly so we can distinguish "could not
+    // verify, manifest gone" from "verified, found problems."
+    // Operator scripts grep for `root_unreachable` (human) or the
+    // bool field (JSON) to take different remediation paths —
+    // root_unreachable means the operator probably mis-supplied
+    // `--depth` or the blob was deleted; chunks-missing means
+    // run `repair`.
+    let root_unreachable = adapter.fetch_chunk(&root_hash).await.is_err();
+    let mut healthy = 0u64;
+    let mut missing = 0u64;
+    let mut corrupted = 0u64;
+    if !root_unreachable {
+        verify_walk(
+            adapter,
+            root_hash,
+            &mut healthy,
+            &mut missing,
+            &mut corrupted,
+        )
+        .await?;
+    }
+    match fmt {
+        OutputFormat::Human => {
+            println!("verify: {}", hash_hex);
+            if root_unreachable {
+                println!(
+                    "  root_unreachable: true (cannot verify; manifest absent or wrong depth)"
+                );
+            } else {
+                println!("  healthy:    {}", healthy);
+                println!("  missing:    {}", missing);
+                println!("  corrupted:  {}", corrupted);
+            }
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "hash": hash_hex,
+                "root_unreachable": root_unreachable,
+                "healthy": healthy,
+                "missing": missing,
+                "corrupted": corrupted,
+            })
+        ),
+    }
+    // Exit code shape:
+    //   0 → verified clean
+    //   2 → verified, found problems (missing / corrupted chunks)
+    //   3 → could not verify (root unreachable)
+    if root_unreachable {
+        Ok(ExitCode::from(3))
+    } else if missing > 0 || corrupted > 0 {
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// Recursive walker for `cmd_verify`. Counts every reachable
+/// chunk — data, parity, manifest nodes — and verifies each
+/// fetched byte sequence hashes back to its expected hash.
+fn verify_walk<'a>(
+    adapter: &'a MeshBlobAdapter,
+    node_hash: [u8; 32],
+    healthy: &'a mut u64,
+    missing: &'a mut u64,
+    corrupted: &'a mut u64,
+) -> RecursiveWalkFuture<'a> {
+    Box::pin(async move {
+        // First verify the manifest node itself.
+        let bytes = match adapter.fetch_chunk(&node_hash).await {
+            Ok(b) => b,
+            Err(_) => {
+                *missing = missing.saturating_add(1);
+                return Ok(());
+            }
+        };
+        let computed: [u8; 32] = blake3::hash(&bytes).into();
+        if computed != node_hash {
+            *corrupted = corrupted.saturating_add(1);
+            return Ok(());
+        }
+        *healthy = healthy.saturating_add(1);
+
+        let node = TreeNode::decode(&bytes)?;
+        match node {
+            TreeNode::Internal { children } => {
+                for (child_hash, _) in children {
+                    verify_walk(adapter, child_hash, healthy, missing, corrupted).await?;
+                }
+            }
+            TreeNode::Leaf { chunks } => {
+                for chunk in chunks {
+                    verify_chunk(adapter, &chunk.hash, healthy, missing, corrupted).await;
+                }
+            }
+            TreeNode::ErasureLeaf { stripes } => {
+                for stripe in stripes {
+                    for chunk in stripe.chunks {
+                        verify_chunk(adapter, &chunk.hash, healthy, missing, corrupted).await;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+async fn verify_chunk(
+    adapter: &MeshBlobAdapter,
+    hash: &[u8; 32],
+    healthy: &mut u64,
+    missing: &mut u64,
+    corrupted: &mut u64,
+) {
+    match adapter.fetch_chunk(hash).await {
+        Ok(bytes) => {
+            let computed: [u8; 32] = blake3::hash(&bytes).into();
+            if computed == *hash {
+                *healthy = healthy.saturating_add(1);
+            } else {
+                *corrupted = corrupted.saturating_add(1);
+            }
+        }
+        Err(_) => *missing = missing.saturating_add(1),
+    }
+}
+
+async fn cmd_path(
+    adapter: &MeshBlobAdapter,
+    hash_hex: &str,
+    size: u64,
+    depth: u8,
+    offset: u64,
+    fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    if offset >= size {
+        return Err(format!(
+            "path: offset {} is at or past the blob's logical size {}",
+            offset, size
+        )
+        .into());
+    }
+    let blob_ref = build_tree_ref(hash_hex, size, depth)?;
+    let root_hash = *blob_ref.tree_root_hash().expect("Tree built above");
+
+    // Descend through internal nodes, tracking the visited path
+    // hashes for the operator's report. The descent stops when
+    // we reach a leaf (Replicated or ErasureLeaf).
+    let mut path_hashes: Vec<String> = vec![hex32(&root_hash)];
+    let mut current_hash = root_hash;
+    let mut current_base: u64 = 0;
+    let mut current_size: u64 = size;
+    loop {
+        let bytes = adapter.fetch_chunk(&current_hash).await?;
+        let node = TreeNode::decode(&bytes)?;
+        match node {
+            TreeNode::Internal { children } => {
+                // Pick the child whose subtree contains the offset.
+                let mut child_offset: u64 = current_base;
+                let mut picked: Option<([u8; 32], u64, u64)> = None;
+                for (child_hash, child_size) in children {
+                    let child_end = child_offset.saturating_add(child_size);
+                    if offset >= child_offset && offset < child_end {
+                        picked = Some((child_hash, child_offset, child_size));
+                        break;
+                    }
+                    child_offset = child_end;
+                }
+                let (next_hash, next_base, next_size) = picked.ok_or_else(|| {
+                    format!(
+                        "path: internal node at {} has no child covering offset {} \
+                         (subtree spans [{}, {}))",
+                        hex32(&current_hash),
+                        offset,
+                        current_base,
+                        current_base.saturating_add(current_size)
+                    )
+                })?;
+                path_hashes.push(hex32(&next_hash));
+                current_hash = next_hash;
+                current_base = next_base;
+                current_size = next_size;
+            }
+            TreeNode::Leaf { chunks } => {
+                let mut chunk_offset = current_base;
+                for chunk in chunks {
+                    let chunk_size_u64 = chunk.size as u64;
+                    let chunk_end = chunk_offset.saturating_add(chunk_size_u64);
+                    if offset >= chunk_offset && offset < chunk_end {
+                        let sub_offset = offset - chunk_offset;
+                        return print_path_result(
+                            hash_hex,
+                            offset,
+                            &path_hashes,
+                            &PathResult {
+                                leaf_kind: "leaf",
+                                stripe_index: None,
+                                stripe_encoding: None,
+                                chunk_hash: hex32(&chunk.hash),
+                                chunk_size: chunk.size,
+                                chunk_role: "data".to_owned(),
+                                sub_offset,
+                            },
+                            fmt,
+                        );
+                    }
+                    chunk_offset = chunk_end;
+                }
+                return Err(format!(
+                    "path: leaf at {} had no chunk covering offset {} (offset \
+                     past last chunk)",
+                    hex32(&current_hash),
+                    offset
+                )
+                .into());
+            }
+            TreeNode::ErasureLeaf { stripes } => {
+                let mut stripe_offset = current_base;
+                for (i, stripe) in stripes.iter().enumerate() {
+                    let stripe_size = stripe.covered_bytes();
+                    let stripe_end = stripe_offset.saturating_add(stripe_size);
+                    if offset >= stripe_offset && offset < stripe_end {
+                        let mut chunk_offset = stripe_offset;
+                        for chunk in stripe.chunks.iter().filter(|c| c.is_data()) {
+                            let chunk_size_u64 = chunk.size as u64;
+                            let chunk_end = chunk_offset.saturating_add(chunk_size_u64);
+                            if offset >= chunk_offset && offset < chunk_end {
+                                let sub_offset = offset - chunk_offset;
+                                let enc_label = match stripe.encoding {
+                                    Encoding::Replicated => "Replicated".to_owned(),
+                                    Encoding::ReedSolomon { k, m } => {
+                                        format!("ReedSolomon(k={}, m={})", k, m)
+                                    }
+                                };
+                                return print_path_result(
+                                    hash_hex,
+                                    offset,
+                                    &path_hashes,
+                                    &PathResult {
+                                        leaf_kind: "erasure_leaf",
+                                        stripe_index: Some(i),
+                                        stripe_encoding: Some(enc_label),
+                                        chunk_hash: hex32(&chunk.hash),
+                                        chunk_size: chunk.size,
+                                        chunk_role: "data".to_owned(),
+                                        sub_offset,
+                                    },
+                                    fmt,
+                                );
+                            }
+                            chunk_offset = chunk_end;
+                        }
+                    }
+                    stripe_offset = stripe_end;
+                }
+                return Err(format!(
+                    "path: erasure leaf at {} had no stripe covering offset {}",
+                    hex32(&current_hash),
+                    offset
+                )
+                .into());
+            }
+        }
+    }
+}
+
+struct PathResult {
+    leaf_kind: &'static str,
+    stripe_index: Option<usize>,
+    stripe_encoding: Option<String>,
+    chunk_hash: String,
+    chunk_size: u32,
+    chunk_role: String,
+    sub_offset: u64,
+}
+
+fn print_path_result(
+    blob_hash_hex: &str,
+    offset: u64,
+    path_hashes: &[String],
+    result: &PathResult,
+    fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    match fmt {
+        OutputFormat::Human => {
+            println!("path: blob={} offset={}", blob_hash_hex, offset);
+            println!("  manifest path:");
+            for (depth, h) in path_hashes.iter().enumerate() {
+                println!("    [{}] {}", depth, h);
+            }
+            println!("  leaf_kind:      {}", result.leaf_kind);
+            if let Some(i) = result.stripe_index {
+                println!("  stripe_index:   {}", i);
+            }
+            if let Some(enc) = &result.stripe_encoding {
+                println!("  encoding:       {}", enc);
+            }
+            println!("  chunk_hash:     {}", result.chunk_hash);
+            println!("  chunk_size:     {} bytes", result.chunk_size);
+            println!("  chunk_role:     {}", result.chunk_role);
+            println!(
+                "  sub_offset:     {} (byte within the chunk)",
+                result.sub_offset
+            );
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "blob_hash": blob_hash_hex,
+                "offset": offset,
+                "manifest_path": path_hashes,
+                "leaf_kind": result.leaf_kind,
+                "stripe_index": result.stripe_index,
+                "stripe_encoding": result.stripe_encoding,
+                "chunk_hash": result.chunk_hash,
+                "chunk_size": result.chunk_size,
+                "chunk_role": result.chunk_role,
+                "sub_offset": result.sub_offset,
             })
         ),
     }

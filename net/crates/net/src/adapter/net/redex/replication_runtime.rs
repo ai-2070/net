@@ -260,6 +260,16 @@ pub struct RuntimeInputs {
     /// `SyncResponse` frames (replica path). The
     /// `tail_provider` closure typically wraps `file.next_seq()`.
     pub file: RedexFile,
+    /// Per-channel default [`super::bandwidth::BandwidthClass`] — stamped on every
+    /// `SyncRequest` the runtime emits. v0.3 Phase D2. Sourced
+    /// from
+    /// [`ReplicationConfig::default_bandwidth_class`](super::replication_config::ReplicationConfig).
+    pub default_bandwidth_class: super::bandwidth::BandwidthClass,
+    /// v0.3 Phase D2 admission-gate parameter: fraction of the
+    /// bandwidth bucket capacity reserved against `Background`.
+    /// Default 0.3 via
+    /// [`ReplicationConfig::background_fraction`](super::replication_config::ReplicationConfig).
+    pub background_fraction: f32,
 }
 
 /// Handle the spawned task produces. Holds the inbox sender so
@@ -908,6 +918,7 @@ async fn on_tick(
             wall_clock_ms,
             chunk_max_bytes: SYNC_REQUEST_CHUNK_MAX_DEFAULT,
             now,
+            default_bandwidth_class: inputs.default_bandwidth_class,
         });
         let lag = observe_lag(
             current_role,
@@ -1197,7 +1208,12 @@ async fn on_inbound(
                     // Backpressure so the replica backs off.
                     let admitted = {
                         let mut bb = budget.lock();
-                        bb.try_consume(byte_estimate, tokio::time::Instant::now().into_std())
+                        bb.try_consume_with_class(
+                            byte_estimate,
+                            msg.class,
+                            tokio::time::Instant::now().into_std(),
+                            inputs.background_fraction,
+                        )
                     };
                     if !admitted {
                         let nack = SyncNack {
@@ -1850,6 +1866,8 @@ mod tests {
             tail_provider: Arc::new(|| 42),
             rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
             file: build_file_for_tests(),
+            default_bandwidth_class: Default::default(),
+            background_fraction: 0.3,
         }
     }
 
@@ -2308,6 +2326,8 @@ mod tests {
             tail_provider: Arc::new(|| 100),
             rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
             file: build_file_for_tests(),
+            default_bandwidth_class: Default::default(),
+            background_fraction: 0.3,
         };
         let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, peer_id]);
         // Promote to Leader via the state machine.
@@ -2379,6 +2399,8 @@ mod tests {
             tail_provider: Arc::new(|| 77),
             rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
             file: build_file_for_tests(),
+            default_bandwidth_class: Default::default(),
+            background_fraction: 0.3,
         };
         let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, peer_id]);
         for (role, signal) in [
@@ -3145,6 +3167,7 @@ mod tests {
                 since_seq: 0,
                 chunk_max: 1024,
                 request_id: 0,
+                class: Default::default(),
             },
         };
         // Simulate the role flipping between the entry check and
@@ -3220,6 +3243,7 @@ mod tests {
                 since_seq: 0,
                 chunk_max: 1024,
                 request_id: 0,
+                class: Default::default(),
             },
         };
         let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
@@ -3604,5 +3628,255 @@ mod tests {
         assert_eq!(coordinator.role(), ReplicaRole::Idle);
 
         handle.cancel().await;
+    }
+
+    /// The replica's `on_tick` must stamp `inputs.default_bandwidth_class`
+    /// on every emitted `SyncRequest` — not `Default::default()`. Without
+    /// this, the per-channel default configured via
+    /// `ReplicationConfig::default_bandwidth_class` is silently dropped
+    /// and every replica catchup ships as `Foreground`, regardless of
+    /// operator policy.
+    #[tokio::test]
+    async fn replica_on_tick_stamps_inputs_default_bandwidth_class_on_sync_request() {
+        use crate::adapter::net::redex::bandwidth::BandwidthClass;
+
+        let self_id: NodeId = 0x10;
+        let leader_id: NodeId = 0x20;
+        let inputs = RuntimeInputs {
+            channel: ChannelIdentity {
+                channel_name: "test/runtime".to_string(),
+                origin_hash: 0xCAFE_BABE,
+            },
+            channel_id: channel_id_for("test/runtime"),
+            self_node_id: self_id,
+            replica_set: vec![self_id, leader_id],
+            heartbeat_ms: 100,
+            wall_clock_provider: Arc::new(|| 1_700_000_000_000),
+            // Local tail = 0; leader's heartbeat will advertise 50,
+            // forcing `tick()` to emit a SyncRequest.
+            tail_provider: Arc::new(|| 0),
+            rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
+            file: build_file_for_tests(),
+            // Non-default class — must round-trip onto the wire.
+            default_bandwidth_class: BandwidthClass::Background,
+            background_fraction: 0.3,
+        };
+        let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, leader_id]);
+        coordinator
+            .transition_to(
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            )
+            .await
+            .unwrap();
+
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        // Seed a leader heartbeat with tail_seq > local so `tick()`
+        // generates a catchup SyncRequest.
+        tracker
+            .lock()
+            .record_heartbeat(leader_id, ReplicaRole::Leader, 50, Instant::now());
+
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let dyn_dispatcher: Arc<dyn ReplicationDispatcher> = dispatcher.clone();
+        on_tick(
+            &inputs,
+            &coordinator,
+            &dyn_dispatcher,
+            &build_state(tracker.clone(), build_budget()),
+        )
+        .await;
+
+        let sync_requests = dispatcher.sync_requests.lock().clone();
+        assert_eq!(
+            sync_requests.len(),
+            1,
+            "expected exactly one catchup SyncRequest"
+        );
+        let (target, req) = &sync_requests[0];
+        assert_eq!(*target, leader_id);
+        assert_eq!(
+            req.class,
+            BandwidthClass::Background,
+            "emitted SyncRequest must carry inputs.default_bandwidth_class, \
+             not Default::default()",
+        );
+    }
+
+    /// The leader's serve path must consult `msg.class` and
+    /// `inputs.background_fraction` when admitting a SyncRequest —
+    /// not the class-blind legacy `try_consume`. Without this, every
+    /// Phase D2/D4 admission threshold is dead code.
+    ///
+    /// Configures `background_fraction = 0.3` and a tiny budget
+    /// (100-byte capacity). The reserve threshold becomes
+    /// `(1 - 0.3) * 100 = 70` bytes. A Background SyncRequest whose
+    /// response costs 47 bytes (empty-response header) leaves
+    /// `available - cost = 53 < 70`, so the class-aware gate rejects
+    /// it with `Backpressure`. The legacy class-blind path would
+    /// have admitted (it sees `Foreground` semantics and `available
+    /// >= cost`).
+    #[tokio::test]
+    async fn leader_serve_path_uses_class_aware_admission_for_background_request() {
+        use crate::adapter::net::redex::bandwidth::BandwidthClass;
+
+        let inputs = RuntimeInputs {
+            channel: ChannelIdentity {
+                channel_name: "test/runtime".to_string(),
+                origin_hash: 0xCAFE_BABE,
+            },
+            channel_id: channel_id_for("test/runtime"),
+            self_node_id: 0x10,
+            replica_set: vec![0x10, 0x20],
+            heartbeat_ms: 60_000,
+            wall_clock_provider: Arc::new(|| 1_700_000_000_000),
+            tail_provider: Arc::new(|| 0),
+            rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
+            file: build_file_for_tests(),
+            default_bandwidth_class: BandwidthClass::Foreground,
+            background_fraction: 0.3,
+        };
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        // Promote to Leader so the serve path runs.
+        for (role, signal) in [
+            (
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            ),
+            (
+                ReplicaRole::Candidate,
+                super::super::replication_state::TransitionSignal::MissedHeartbeats,
+            ),
+            (
+                ReplicaRole::Leader,
+                super::super::replication_state::TransitionSignal::ElectionWon,
+            ),
+        ] {
+            coordinator.transition_to(role, signal).await.unwrap();
+        }
+
+        // Build a budget whose reserve gate will reject a 47-byte
+        // Background response. capacity=100, fraction=0.3 → reserve=70;
+        // available - cost = 100 - 47 = 53 < 70 → denied.
+        let budget = Arc::new(Mutex::new(BandwidthBudget::new(1.0, 100, Instant::now())));
+
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let event = Inbound::SyncRequest {
+            from: 0x20,
+            msg: SyncRequest {
+                channel_id: cid,
+                since_seq: 0,
+                chunk_max: 1024,
+                request_id: 0,
+                class: BandwidthClass::Background,
+            },
+        };
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &build_state(tracker.clone(), budget.clone()),
+            event,
+        )
+        .await;
+
+        let nacks = dispatcher.sync_nacks.lock().clone();
+        assert_eq!(
+            nacks.len(),
+            1,
+            "Background admission must be denied by the class-aware reserve gate; \
+             pre-fix this admitted via the class-blind try_consume path",
+        );
+        let (target, nack) = &nacks[0];
+        assert_eq!(*target, 0x20);
+        assert_eq!(
+            nack.error_code,
+            super::super::replication::SyncNackError::Backpressure,
+            "denial must surface as Backpressure NACK so the replica backs off",
+        );
+        // No SyncResponse should have been shipped under denial.
+        assert!(
+            dispatcher.sync_responses.lock().is_empty(),
+            "denied requests must not leak a SyncResponse",
+        );
+    }
+
+    /// Companion to the Background-denial test: with the same tiny
+    /// budget, a Foreground request of the same size IS admitted —
+    /// confirms the reserve gate is the discriminator, not the cost.
+    /// Without this paired assertion a regression that always-denies
+    /// would look like the right behavior.
+    #[tokio::test]
+    async fn leader_serve_path_admits_foreground_under_tight_budget() {
+        use crate::adapter::net::redex::bandwidth::BandwidthClass;
+
+        let inputs = RuntimeInputs {
+            channel: ChannelIdentity {
+                channel_name: "test/runtime".to_string(),
+                origin_hash: 0xCAFE_BABE,
+            },
+            channel_id: channel_id_for("test/runtime"),
+            self_node_id: 0x10,
+            replica_set: vec![0x10, 0x20],
+            heartbeat_ms: 60_000,
+            wall_clock_provider: Arc::new(|| 1_700_000_000_000),
+            tail_provider: Arc::new(|| 0),
+            rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
+            file: build_file_for_tests(),
+            default_bandwidth_class: BandwidthClass::Foreground,
+            background_fraction: 0.3,
+        };
+        let cid = inputs.channel_id;
+        let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
+        for (role, signal) in [
+            (
+                ReplicaRole::Replica,
+                super::super::replication_state::TransitionSignal::CapabilitySelected,
+            ),
+            (
+                ReplicaRole::Candidate,
+                super::super::replication_state::TransitionSignal::MissedHeartbeats,
+            ),
+            (
+                ReplicaRole::Leader,
+                super::super::replication_state::TransitionSignal::ElectionWon,
+            ),
+        ] {
+            coordinator.transition_to(role, signal).await.unwrap();
+        }
+        let budget = Arc::new(Mutex::new(BandwidthBudget::new(1.0, 100, Instant::now())));
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let event = Inbound::SyncRequest {
+            from: 0x20,
+            msg: SyncRequest {
+                channel_id: cid,
+                since_seq: 0,
+                chunk_max: 1024,
+                request_id: 0,
+                class: BandwidthClass::Foreground,
+            },
+        };
+        let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));
+        on_inbound(
+            &inputs,
+            &coordinator,
+            &(dispatcher.clone() as Arc<dyn ReplicationDispatcher>),
+            &build_state(tracker.clone(), budget.clone()),
+            event,
+        )
+        .await;
+        // No NACK — Foreground admits because available >= cost.
+        assert!(
+            dispatcher.sync_nacks.lock().is_empty(),
+            "Foreground under the same budget must admit (available >= cost)",
+        );
+        // Exactly one SyncResponse must have been shipped.
+        assert_eq!(
+            dispatcher.sync_responses.lock().len(),
+            1,
+            "Foreground admit must ship a SyncResponse",
+        );
     }
 }

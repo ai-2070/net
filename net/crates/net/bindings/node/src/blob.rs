@@ -46,6 +46,217 @@ use ::net::adapter::net::dataforts::{
 /// `Error`. The full shape is `"blob: <context>: <detail>"`.
 pub(crate) const ERR_BLOB_PREFIX: &str = "blob:";
 
+/// Capability tag a node advertises when it supports the v0.3
+/// hierarchical-manifest tree path (`BlobRef::Tree`). SDK
+/// consumers compare advertisement payloads against this string
+/// to decide whether to publish via `BlobRef::Tree` or downgrade
+/// to the v0.2 `BlobRef::Manifest` shape.
+#[napi]
+pub const DATAFORTS_BLOB_TREE_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::blob_tree::DATAFORTS_BLOB_TREE_SUPPORTED;
+
+/// Capability tag a node advertises when it supports the v0.3
+/// Phase B content-defined-chunking store path
+/// (`ChunkingStrategy::Cdc`). Independent of the Tree tag — a
+/// node can run Phase A (Tree + Fixed) without Phase B (CDC).
+#[napi]
+pub const DATAFORTS_BLOB_CDC_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::cdc::DATAFORTS_BLOB_CDC_SUPPORTED;
+
+/// Capability tag a node advertises when it supports the v0.3
+/// Phase C Reed-Solomon erasure-coding store path
+/// (`Encoding.reedSolomon(k, m)`). Independent of Tree/CDC tags:
+/// a node can run Phase A + B without Phase C (RS). Producers
+/// targeting a peer that doesn't advertise this tag must
+/// downgrade to `Encoding.replicated()`.
+#[napi]
+pub const DATAFORTS_BLOB_ERASURE_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::erasure::DATAFORTS_BLOB_ERASURE_SUPPORTED;
+
+/// Capability tag a node advertises when it accepts the v0.3
+/// Phase D per-stream `BandwidthClass` hint on store/fetch
+/// calls. A peer that doesn't advertise this tag silently
+/// drops the hint and serves every call uniformly (graceful
+/// degradation — no fetch/store ever fails for missing the
+/// capability).
+#[napi]
+pub const DATAFORTS_BLOB_BANDWIDTH_CLASS_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::bandwidth::DATAFORTS_BLOB_BANDWIDTH_CLASS_SUPPORTED;
+
+/// Per-stream bandwidth class hint for the v0.3 Phase D
+/// blob path. SDK consumers pass an instance into future
+/// chunking-aware store/fetch calls; the substrate uses it to
+/// pick admission priority + send-queue ordering when D2/D3
+/// land. Today it's accepted as a hint with no behavioral wiring.
+#[napi]
+#[derive(Clone)]
+pub struct BandwidthClass {
+    /// Discriminant: `"foreground"`, `"background"`, or
+    /// `"realtime"`.
+    pub kind: String,
+}
+
+#[napi]
+impl BandwidthClass {
+    /// Interactive workloads — user-driven fetches, normal RPC
+    /// responses. Default class.
+    #[napi(factory, js_name = "foreground")]
+    pub fn foreground() -> Self {
+        Self {
+            kind: "foreground".to_owned(),
+        }
+    }
+
+    /// Long-running TB-scale background work. Bounded to a
+    /// configured fraction of per-channel rate so it can't
+    /// starve Foreground.
+    #[napi(factory, js_name = "background")]
+    pub fn background() -> Self {
+        Self {
+            kind: "background".to_owned(),
+        }
+    }
+
+    /// Operator-pinned. Bypasses per-class rate budget but
+    /// still respects disk-pressure circuit-breakers.
+    #[napi(factory, js_name = "realtime")]
+    pub fn realtime() -> Self {
+        Self {
+            kind: "realtime".to_owned(),
+        }
+    }
+}
+
+/// Producer-facing encoding-strategy value type. Mirrors the
+/// Rust `Encoding` enum (`Replicated` vs `ReedSolomon { k, m }`)
+/// as a flat napi class with a `kind` discriminant. Construct
+/// via the `replicated()` / `reedSolomon(k, m)` /
+/// `defaultReedSolomon()` factories.
+#[napi]
+#[derive(Clone)]
+pub struct Encoding {
+    /// Discriminant: `"replicated"` or `"reedSolomon"`.
+    pub kind: String,
+    /// RS data shards per stripe — populated iff
+    /// `kind == "reedSolomon"`.
+    pub k: Option<u8>,
+    /// RS parity shards per stripe — populated iff
+    /// `kind == "reedSolomon"`.
+    pub m: Option<u8>,
+}
+
+#[napi]
+impl Encoding {
+    /// Replication-only encoding. Each chunk stored verbatim;
+    /// cross-node replication provides redundancy. Default for
+    /// Phase A + B blobs.
+    #[napi(factory, js_name = "replicated")]
+    pub fn replicated() -> Self {
+        Self {
+            kind: "replicated".to_owned(),
+            k: None,
+            m: None,
+        }
+    }
+
+    /// Reed-Solomon erasure encoding: each stripe of `k` data
+    /// chunks gets `m` parity chunks; stripe survives any `m`
+    /// chunk losses.
+    #[napi(factory, js_name = "reedSolomon")]
+    pub fn reed_solomon(k: u8, m: u8) -> Self {
+        Self {
+            kind: "reedSolomon".to_owned(),
+            k: Some(k),
+            m: Some(m),
+        }
+    }
+
+    /// Production RS defaults: `(k=10, m=4)` — 1.4× storage
+    /// overhead, 4-loss tolerance.
+    #[napi(factory, js_name = "defaultReedSolomon")]
+    pub fn default_reed_solomon() -> Self {
+        Self::reed_solomon(
+            ::net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_K,
+            ::net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_M,
+        )
+    }
+}
+
+/// Producer-facing chunking-strategy value type for the v0.3
+/// Tree store path. SDK consumers construct an instance via the
+/// `fixed(size)` or `cdc(min, avg, max)` factories and pass it
+/// to the future chunking-aware binding store call. The Rust
+/// core's `MeshBlobAdapter::store_stream_tree` already consumes
+/// the corresponding `ChunkingStrategy` enum — the binding-side
+/// value is a discriminated record that round-trips through
+/// JS without exposing a Rust enum directly (napi-rs has no
+/// native discriminated-union encoding).
+///
+/// `kind` is the discriminant ("fixed" or "cdc"). The
+/// shape-relevant fields are populated based on the
+/// discriminant; the others are `None`. SDK consumers do not
+/// hand-construct the struct — the factories ensure consistency.
+#[napi]
+#[derive(Clone)]
+pub struct ChunkingStrategy {
+    /// Discriminant: `"fixed"` for fixed-size chunks,
+    /// `"cdc"` for content-defined chunking.
+    pub kind: String,
+    /// Chunk size in bytes. Populated iff `kind == "fixed"`.
+    pub size: Option<u32>,
+    /// CDC minimum chunk size in bytes. Populated iff
+    /// `kind == "cdc"`.
+    pub min: Option<u32>,
+    /// CDC target average chunk size in bytes. Populated iff
+    /// `kind == "cdc"`.
+    pub avg: Option<u32>,
+    /// CDC maximum chunk size in bytes. Populated iff
+    /// `kind == "cdc"`.
+    pub max: Option<u32>,
+}
+
+#[napi]
+impl ChunkingStrategy {
+    /// Fixed-size chunks. `size` must equal the v0.2-compatible
+    /// `BLOB_CHUNK_SIZE_BYTES` (4 MiB) when stored via the
+    /// production Tree path — other sizes fragment the cluster's
+    /// chunk-level dedup pool against v0.2 blobs.
+    #[napi(factory, js_name = "fixed")]
+    pub fn fixed(size: u32) -> Self {
+        Self {
+            kind: "fixed".to_owned(),
+            size: Some(size),
+            min: None,
+            avg: None,
+            max: None,
+        }
+    }
+
+    /// Content-defined chunking (FastCDC). For cluster-wide
+    /// CDC dedup, pass the spec'd production triple — see
+    /// `productionCdc()` for the convenience factory.
+    #[napi(factory, js_name = "cdc")]
+    pub fn cdc(min: u32, avg: u32, max: u32) -> Self {
+        Self {
+            kind: "cdc".to_owned(),
+            size: None,
+            min: Some(min),
+            avg: Some(avg),
+            max: Some(max),
+        }
+    }
+
+    /// Production CDC parameters pinned by Phase B of the v0.3
+    /// blob plan: `min = 1 MiB`, `avg = 4 MiB`, `max = 16 MiB`.
+    /// All CDC-stored blobs on a cluster must use these exact
+    /// values to dedup against each other.
+    #[napi(factory, js_name = "productionCdc")]
+    pub fn production_cdc() -> Self {
+        let p = ::net::adapter::net::dataforts::blob::cdc::PRODUCTION_CDC_PARAMS;
+        Self::cdc(p.min, p.avg, p.max)
+    }
+}
+
 #[inline]
 fn blob_err(context: &str, detail: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("{} {}: {}", ERR_BLOB_PREFIX, context, detail))
@@ -131,12 +342,109 @@ impl BlobRef {
             )),
         }
     }
+
+    /// `true` for the v0.3 [`BlobRef::Tree`] variant; `false` for
+    /// Small or Manifest.
+    #[napi(getter)]
+    pub fn is_tree(&self) -> bool {
+        self.inner.is_tree()
+    }
+
+    /// `true` for any chunked variant (Manifest or Tree); `false`
+    /// for Small.
+    #[napi(getter)]
+    pub fn is_chunked(&self) -> bool {
+        self.inner.is_chunked()
+    }
+
+    /// 32-byte BLAKE3 hash of the root `TreeNode` body. Defined
+    /// only for the v0.3 `Tree` variant; returns an empty Buffer
+    /// (zeros) for Small / Manifest. JS callers should check
+    /// `isTree` first.
+    #[napi(getter)]
+    pub fn tree_root_hash(&self) -> Buffer {
+        Buffer::from(
+            self.inner
+                .tree_root_hash()
+                .copied()
+                .unwrap_or([0; 32])
+                .to_vec(),
+        )
+    }
+
+    /// Tree depth (1..=`MAX_TREE_DEPTH`). Defined only for the
+    /// v0.3 `Tree` variant; returns `0` for Small / Manifest.
+    /// JS callers should check `isTree` first.
+    #[napi(getter)]
+    pub fn tree_depth(&self) -> u8 {
+        self.inner.tree_depth().unwrap_or(0)
+    }
+
+    /// Construct a v0.3 [`BlobRef::Tree`] from `(uri,
+    /// rootHash, totalSize, depth)`. `rootHash` must be exactly
+    /// 32 bytes; `depth` must be in `1..=MAX_TREE_DEPTH` (= 4);
+    /// `totalSize` must be in `1..=128 PiB`. Encoding defaults
+    /// to `Replicated` (only encoding supported in v0.3 Phase A).
+    ///
+    /// Producers usually construct trees implicitly via
+    /// `MeshBlobAdapter::store_stream_tree`; this factory exists
+    /// for callers that hold pre-built tree state (e.g. tests,
+    /// cross-language migration tooling).
+    #[napi(factory, js_name = "treeFromParts")]
+    pub fn tree_from_parts(
+        uri: String,
+        root_hash: Buffer,
+        total_size: BigInt,
+        depth: u8,
+    ) -> Result<Self> {
+        if root_hash.len() != 32 {
+            return Err(blob_err(
+                "treeFromParts",
+                format!("rootHash must be 32 bytes, got {}", root_hash.len()),
+            ));
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&root_hash);
+        // `get_u64()` returns `(signed, value, lossless)`. The
+        // lossless flag is `true` only when the JS BigInt
+        // round-trips through u64 without truncation. JS BigInts
+        // can hold arbitrarily large integers; a value above
+        // u64::MAX would silently truncate without this check,
+        // letting the constructor accept a forged "small" Tree
+        // shape derived from a producer's accidental 2^64+1.
+        let (signed, total_u64, lossless) = total_size.get_u64();
+        if signed {
+            return Err(blob_err("treeFromParts", "totalSize must be non-negative"));
+        }
+        if !lossless {
+            return Err(blob_err(
+                "treeFromParts",
+                "totalSize exceeds u64::MAX; tree total_size is a u64 field",
+            ));
+        }
+        InnerBlobRef::tree(
+            uri,
+            ::net::adapter::net::dataforts::Encoding::Replicated,
+            hash,
+            total_u64,
+            depth,
+        )
+        .map(|inner| Self { inner })
+        .map_err(map_blob_err)
+    }
 }
 
 impl BlobRef {
     #[allow(dead_code)]
     pub(crate) fn as_inner(&self) -> &InnerBlobRef {
         &self.inner
+    }
+
+    /// Wrap a Rust `BlobRef` into the napi facade. Used by
+    /// adapter methods (e.g. `store_stream_tree_from_bytes`)
+    /// that produce a fresh BlobRef on the Rust side.
+    pub(crate) fn from_inner(inner: InnerBlobRef) -> Self {
+        Self { inner }
     }
 }
 
@@ -891,6 +1199,37 @@ pub struct MeshBlobAdapterOptions {
     /// [`OverflowConfigJs`] to tune. Omit entirely for the v0.2
     /// pull-only posture (the default).
     pub overflow: Option<OverflowConfigJs>,
+    /// v0.3 tree-walker LRU cache byte cap. `None` disables the
+    /// cache; `Some(n)` wires a byte-bounded LRU at cap = n.
+    /// Default `None`. Operators size this in MiB at construction
+    /// time; the per-fetch promotion/eviction stays O(1)
+    /// regardless of cap.
+    pub tree_node_cache_bytes: Option<u32>,
+}
+
+/// v0.3 RepairReport surfaced to JS as a plain object. Counter
+/// fields mirror the Rust struct one-for-one.
+#[cfg(feature = "dataforts")]
+#[napi(object)]
+pub struct RepairReportJs {
+    pub stripes_walked: BigInt,
+    pub stripes_already_healthy: BigInt,
+    pub stripes_repaired: BigInt,
+    pub chunks_restored: BigInt,
+    pub stripes_unrecoverable: BigInt,
+    pub replicated_stripes_skipped: BigInt,
+    pub replicated_leaves_skipped: BigInt,
+}
+
+/// v0.3 tree-walker cache stats surfaced to JS. `null` means the
+/// cache wasn't wired at construction.
+#[cfg(feature = "dataforts")]
+#[napi(object)]
+pub struct TreeNodeCacheStatsJs {
+    pub hits: BigInt,
+    pub misses: BigInt,
+    pub bytes: BigInt,
+    pub entries: BigInt,
 }
 
 /// Substrate-owned blob storage adapter. Stores chunks as
@@ -924,6 +1263,7 @@ impl MeshBlobAdapter {
         let opts = options.unwrap_or(MeshBlobAdapterOptions {
             persistent: None,
             overflow: None,
+            tree_node_cache_bytes: None,
         });
         let persistent = opts.persistent.unwrap_or(false);
         let mut builder = InnerMeshBlobAdapter::new(adapter_id.clone(), redex.inner_arc())
@@ -931,6 +1271,9 @@ impl MeshBlobAdapter {
         if let Some(overflow_cfg) = opts.overflow {
             let cfg = overflow_config_to_inner(overflow_cfg)?;
             builder = builder.with_overflow(cfg);
+        }
+        if let Some(cap) = opts.tree_node_cache_bytes {
+            builder = builder.with_tree_node_cache(cap as usize);
         }
         Ok(Self {
             inner: Arc::new(builder),
@@ -1005,6 +1348,85 @@ impl MeshBlobAdapter {
     #[napi]
     pub fn prometheus_text(&self) -> String {
         self.inner.prometheus_text()
+    }
+
+    /// v0.3: store `data` as a hierarchical-manifest blob
+    /// (`BlobRef::Tree`). Wraps the substrate's
+    /// `store_stream_tree` for the in-memory case; true streaming
+    /// from JS callers requires the substrate's streaming-store-
+    /// token API (post-v0.3 work).
+    ///
+    /// `encoding` is optional. Omit for `Replicated`; pass an
+    /// `Encoding.reedSolomon(k, m)` value for RS-encoded storage.
+    /// Returns a fresh `BlobRef` carrying the Tree's (uri,
+    /// rootHash, totalSize, depth).
+    #[napi]
+    pub async fn store_stream_tree_from_bytes(
+        &self,
+        data: Buffer,
+        encoding: Option<&Encoding>,
+    ) -> Result<BlobRef> {
+        use bytes::Bytes;
+        use futures::stream;
+        use net::adapter::net::dataforts::blob::blob_tree::ChunkingStrategy;
+        use net::adapter::net::dataforts::Encoding as InnerEncoding;
+
+        let enc = match encoding {
+            Some(e) if e.kind == "reedSolomon" => InnerEncoding::ReedSolomon {
+                k: e.k
+                    .unwrap_or(net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_K),
+                m: e.m
+                    .unwrap_or(net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_M),
+            },
+            _ => InnerEncoding::Replicated,
+        };
+        let adapter = self.inner.clone();
+        let owned: Vec<u8> = data.to_vec();
+        let s = stream::once(async move { Ok::<_, InnerBlobError>(Bytes::from(owned)) });
+        let blob = adapter
+            .store_stream_tree(Box::pin(s), enc, ChunkingStrategy::default())
+            .await
+            .map_err(map_blob_err)?;
+        Ok(BlobRef::from_inner(blob))
+    }
+
+    /// v0.3: repair a Tree-encoded RS blob in-place. Walks every
+    /// stripe, reconstructs missing data chunks from parity, and
+    /// re-stores them under their original content-addressed
+    /// hashes. Returns the report's counter fields.
+    ///
+    /// This is the unauthenticated system-internal entry point;
+    /// callers behind a network surface should route through
+    /// `repair_blob_authorized` (not yet exposed in bindings).
+    #[napi]
+    pub async fn repair_blob(&self, blob_ref: &BlobRef) -> Result<RepairReportJs> {
+        let adapter = self.inner.clone();
+        let blob = blob_ref.inner.clone();
+        let report = adapter.repair_blob(&blob).await.map_err(map_blob_err)?;
+        Ok(RepairReportJs {
+            stripes_walked: BigInt::from(report.stripes_walked),
+            stripes_already_healthy: BigInt::from(report.stripes_already_healthy),
+            stripes_repaired: BigInt::from(report.stripes_repaired),
+            chunks_restored: BigInt::from(report.chunks_restored),
+            stripes_unrecoverable: BigInt::from(report.stripes_unrecoverable),
+            replicated_stripes_skipped: BigInt::from(report.replicated_stripes_skipped),
+            replicated_leaves_skipped: BigInt::from(report.replicated_leaves_skipped),
+        })
+    }
+
+    /// v0.3 tree-walker LRU cache statistics. Returns `null`
+    /// when the cache wasn't wired at construction; otherwise
+    /// `{ hits, misses, bytes, entries }`.
+    #[napi]
+    pub fn tree_node_cache_stats(&self) -> Option<TreeNodeCacheStatsJs> {
+        self.inner
+            .tree_node_cache_stats()
+            .map(|(hits, misses, bytes, entries)| TreeNodeCacheStatsJs {
+                hits: BigInt::from(hits),
+                misses: BigInt::from(misses),
+                bytes: BigInt::from(bytes as u64),
+                entries: BigInt::from(entries as u64),
+            })
     }
 
     // ---- v0.3 active-overflow surface ----

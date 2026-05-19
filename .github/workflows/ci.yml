@@ -207,6 +207,29 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo nextest run --no-fail-fast --features "dataforts cli" --test net_blob_cli
 
+      # === Dataforts blob v0.3 conformance (Tree + CDC + RS) ==============
+      # Phase-pinned end-to-end conformance tests for the v0.3 blob
+      # storage track. Each test runs at CI-feasible scale (default
+      # parameters tuned for the runner's per-test memory budget; the
+      # 100 GiB real-scale variant in the Tree test is `#[ignore]`'d
+      # and opt-in via `-- --ignored` for release validators):
+      #
+      # - Tree (Phase A8): byte-identical round-trip, determinism,
+      #   manifest LRU effectiveness, manifest-body-explosion guard.
+      # - CDC (Phase B4): end-to-end determinism, dedup-after-edit
+      #   ratio under one-byte flip + suffix-shift insert.
+      # - RS (Phase C9): round-trip with all chunks present, m-chunk-
+      #   loss reconstruction, m+1-loss unrecoverable, cross-adapter
+      #   determinism.
+      - name: Dataforts blob v0.3 conformance
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --features dataforts
+          --test dataforts_blob_v3_tree_conformance
+          --test dataforts_blob_v3_cdc_conformance
+          --test dataforts_blob_v3_rs_conformance
+          --test dataforts_blob_v3_composed_conformance
+
       # === MeshDB =========================================================
       # `meshdb` chains to cortex → redex → net, so a single
       # --features meshdb covers the test's `feature = "net" + "meshdb"`

@@ -58,9 +58,19 @@ pub const DISPATCH_SYNC_NACK: u8 = 0x23;
 /// code in `SUBPROTOCOLS.md` as it lands.
 pub const DISPATCH_REPLICA_SYNC_RESERVED_END: u8 = 0x30;
 
-/// Fixed encoded size of a [`SyncRequest`] message including the
-/// 3-byte subprotocol header.
+/// Fixed encoded size of a v0.2 [`SyncRequest`] message including
+/// the 3-byte subprotocol header. Legacy peers serialize at this
+/// size; v0.3 Phase D adds one trailing class byte (see
+/// [`SYNC_REQUEST_SIZE_V2_CLASS`]). The decoder accepts both
+/// sizes — frames missing the trailing byte decode as
+/// [`BandwidthClass::Foreground`](super::bandwidth::BandwidthClass::Foreground).
 pub const SYNC_REQUEST_SIZE: usize = 3 + 32 + 8 + 4 + 8; // 55
+
+/// v0.3 Phase D encoded size — `SYNC_REQUEST_SIZE` plus one byte
+/// for the wire-encoded [`BandwidthClass`](super::bandwidth::BandwidthClass).
+/// New senders always emit this size; new readers accept both
+/// sizes (legacy 55-byte frames degrade to `Foreground`).
+pub const SYNC_REQUEST_SIZE_V2_CLASS: usize = SYNC_REQUEST_SIZE + 1; // 56
 
 /// Fixed encoded size of a [`SyncHeartbeat`] message including the
 /// 3-byte subprotocol header.
@@ -190,7 +200,8 @@ pub struct SyncEvent {
 }
 
 /// Replica → leader: pull request for events
-/// `[since_seq, since_seq + chunk_max)`. Fixed 55-byte size.
+/// `[since_seq, since_seq + chunk_max)`. 55 bytes (v0.2 legacy)
+/// or 56 bytes (v0.3 Phase D with trailing class byte).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncRequest {
     /// 32-byte BLAKE2s hash of the channel name.
@@ -210,6 +221,14 @@ pub struct SyncRequest {
     /// epoch (or any peer that observed wire traffic) cannot match
     /// an in-flight request the replica is currently waiting on.
     pub request_id: u64,
+    /// v0.3 Phase D per-request bandwidth-class hint. Receiver-
+    /// stamped; the leader's admission gate honors this in
+    /// preference to the channel's
+    /// [`ReplicationConfig::default_bandwidth_class`](super::replication_config::ReplicationConfig).
+    /// Encoded as a 1-byte trailing field on the wire; legacy
+    /// 55-byte frames omit it and decode as
+    /// [`BandwidthClass::Foreground`](super::bandwidth::BandwidthClass::Foreground).
+    pub class: super::bandwidth::BandwidthClass,
 }
 
 /// Leader → replica: bounded chunk of events answering the matching
@@ -384,21 +403,28 @@ fn get_channel_id(cursor: &mut &[u8]) -> ChannelId {
 // ============================================================================
 
 impl SyncRequest {
-    /// Serialize to bytes. Fixed [`SYNC_REQUEST_SIZE`] (55) bytes.
+    /// Serialize to bytes. v0.3 Phase D senders always emit
+    /// [`SYNC_REQUEST_SIZE_V2_CLASS`] (56 bytes) — the trailing
+    /// class byte is the only delta from the v0.2 layout.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(SYNC_REQUEST_SIZE);
+        let mut buf = Vec::with_capacity(SYNC_REQUEST_SIZE_V2_CLASS);
         put_header(&mut buf, DISPATCH_SYNC_REQUEST);
         buf.put_slice(self.channel_id.as_bytes());
         buf.put_u64_le(self.since_seq);
         buf.put_u32_le(self.chunk_max);
         buf.put_u64_le(self.request_id);
-        debug_assert_eq!(buf.len(), SYNC_REQUEST_SIZE);
+        buf.put_u8(self.class.as_u8());
+        debug_assert_eq!(buf.len(), SYNC_REQUEST_SIZE_V2_CLASS);
         buf
     }
 
-    /// Deserialize from bytes. Errors on truncation, header
-    /// mismatch, or trailing bytes beyond the fixed size (which
-    /// would indicate a protocol-version skew worth flagging).
+    /// Deserialize from bytes. Accepts both v0.2 (55 bytes) and
+    /// v0.3 Phase D (56 bytes) frames — a v0.2 frame missing
+    /// the trailing class byte decodes as
+    /// [`BandwidthClass::Foreground`](super::bandwidth::BandwidthClass::Foreground)
+    /// for backward compat. An unknown class discriminant value
+    /// (forward-compat) also decodes as `Foreground` — see
+    /// [`BandwidthClass::from_wire_or_default`](super::bandwidth::BandwidthClass::from_wire_or_default).
     pub fn from_bytes(data: &[u8]) -> Result<Self, WireError> {
         let payload = check_header(data, DISPATCH_SYNC_REQUEST)?;
         if payload.len() < SYNC_REQUEST_SIZE - 3 {
@@ -412,11 +438,19 @@ impl SyncRequest {
         let since_seq = cursor.get_u64_le();
         let chunk_max = cursor.get_u32_le();
         let request_id = cursor.get_u64_le();
+        // Trailing class byte (v0.3+ Phase D). Absent on legacy
+        // 55-byte frames; defaults to Foreground.
+        let class = if cursor.has_remaining() {
+            super::bandwidth::BandwidthClass::from_wire_or_default(cursor.get_u8())
+        } else {
+            super::bandwidth::BandwidthClass::default()
+        };
         Ok(Self {
             channel_id,
             since_seq,
             chunk_max,
             request_id,
+            class,
         })
     }
 }
@@ -706,11 +740,46 @@ mod tests {
             since_seq: 0xDEAD_BEEF_CAFE_BABE,
             chunk_max: 1_048_576,
             request_id: 0xAA55_AA55_AA55_AA55,
+            class: super::super::bandwidth::BandwidthClass::Background,
         };
         let bytes = original.to_bytes();
-        assert_eq!(bytes.len(), SYNC_REQUEST_SIZE);
+        // v0.3 Phase D2: new senders emit the v2 56-byte frame
+        // (trailing class byte). Legacy 55-byte frames decode
+        // cleanly too — covered by
+        // `sync_request_decodes_legacy_55_byte_frame_as_foreground`
+        // below.
+        assert_eq!(bytes.len(), SYNC_REQUEST_SIZE_V2_CLASS);
         let decoded = SyncRequest::from_bytes(&bytes).expect("decode");
         assert_eq!(decoded, original);
+    }
+
+    /// v0.3 Phase D2 backward-compat: a legacy 55-byte
+    /// SyncRequest (no trailing class byte) decodes cleanly with
+    /// `class = BandwidthClass::Foreground` defaulted in.
+    #[test]
+    fn sync_request_decodes_legacy_55_byte_frame_as_foreground() {
+        let original = SyncRequest {
+            channel_id: sample_channel_id(),
+            since_seq: 7,
+            chunk_max: 1024,
+            request_id: 0xBEEF,
+            class: super::super::bandwidth::BandwidthClass::Realtime,
+        };
+        // Encode v2 then truncate the trailing class byte to
+        // simulate a legacy 55-byte frame.
+        let mut bytes = original.to_bytes();
+        bytes.pop(); // drop the class byte
+        assert_eq!(bytes.len(), SYNC_REQUEST_SIZE);
+        let decoded = SyncRequest::from_bytes(&bytes).expect("legacy decode");
+        // Everything else round-trips; class defaults to Foreground.
+        assert_eq!(decoded.channel_id, original.channel_id);
+        assert_eq!(decoded.since_seq, original.since_seq);
+        assert_eq!(decoded.chunk_max, original.chunk_max);
+        assert_eq!(decoded.request_id, original.request_id);
+        assert_eq!(
+            decoded.class,
+            super::super::bandwidth::BandwidthClass::Foreground
+        );
     }
 
     #[test]
@@ -722,6 +791,7 @@ mod tests {
             since_seq: 0x0102_0304_0506_0708,
             chunk_max: 0x1122_3344,
             request_id: 0,
+            class: Default::default(),
         };
         let bytes = req.to_bytes();
         // Subprotocol header is u16 LE = 0x0E00 → bytes [0x00, 0x0E];
@@ -742,6 +812,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 1,
             request_id: 0,
+            class: Default::default(),
         }
         .to_bytes();
         bytes[2] = DISPATCH_SYNC_RESPONSE; // wrong code
@@ -756,6 +827,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 1,
             request_id: 0,
+            class: Default::default(),
         }
         .to_bytes();
         bytes[0] = 0x00;
@@ -774,12 +846,22 @@ mod tests {
             since_seq: 0,
             chunk_max: 1,
             request_id: 0,
+            class: Default::default(),
         }
         .to_bytes();
-        for cut in 0..bytes.len() {
+        // v0.3 Phase D2 backward-compat: cuts at or above the
+        // legacy SYNC_REQUEST_SIZE (55 bytes) are valid frames
+        // — the v0.3 56-byte size includes a trailing class
+        // byte that legacy peers don't emit, so the decoder
+        // accepts both lengths. Only cuts below the legacy
+        // size are true truncations.
+        for cut in 0..SYNC_REQUEST_SIZE {
             let err = SyncRequest::from_bytes(&bytes[..cut]).expect_err("must reject");
             assert!(matches!(err, WireError::Truncated { .. }));
         }
+        // Cut at SYNC_REQUEST_SIZE (legacy form) decodes cleanly.
+        let _legacy =
+            SyncRequest::from_bytes(&bytes[..SYNC_REQUEST_SIZE]).expect("legacy length decodes");
     }
 
     // ----------------------------------------------------------------

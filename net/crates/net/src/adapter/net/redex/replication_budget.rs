@@ -21,7 +21,54 @@
 //! starve foreground publish traffic. Both mechanisms compose:
 //! whichever is more restrictive at the moment wins.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use super::bandwidth::BandwidthClass;
+
+/// v0.3 Phase D4 anti-starvation hatch threshold: if a
+/// `Background` request has been denied for at least this
+/// long, the next denial is converted to a one-shot admission
+/// regardless of the `background_fraction` gate. Resets on each
+/// successful Background admission.
+///
+/// 60 seconds matches the v0.3 plan §7. Tunable via
+/// [`BandwidthBudget::with_background_starve_window`] for tests.
+pub const BACKGROUND_STARVE_WINDOW_DEFAULT: Duration = Duration::from_secs(60);
+
+/// v0.3 Phase D4 anti-starvation hatch grant cap, as a fraction of
+/// `capacity_bytes`. The hatch guarantees Background a periodic
+/// admission, but without an upper-bound on the per-shot grant, an
+/// adversarial `chunk_max = u32::MAX` Background request that's
+/// been starved past the window can floor the bucket to zero in a
+/// single shot — the exact "Foreground starved by Background"
+/// failure D4 was supposed to prevent.
+///
+/// 10% of capacity caps the worst-case Foreground impact per hatch
+/// firing at one-tenth of one second's refill. Combined with the
+/// 60-second starve window, Background's hatch-driven share is at
+/// most ~0.17% of capacity over any 60-second window (10% / 60),
+/// well below the plan's "≥ 10% guaranteed minimum" floor (which
+/// is targeting steady-state share, not per-hatch grant size).
+pub const BACKGROUND_HATCH_MAX_GRANT_FRACTION: f64 = 0.10;
+
+/// v0.3 Phase D2 `Realtime` admission cap, as a fraction of
+/// `capacity_bytes`. Realtime requests bypass the rate-limit
+/// failure path, but the `class` byte on each `SyncRequest` is
+/// untrusted from the wire (the request-binding token does not
+/// cover the trailing class byte). A hostile peer in the
+/// replica-set can stamp `Realtime` on every outbound request and
+/// would otherwise drain the bucket to zero on every call.
+///
+/// Cap Realtime grants at 50% of capacity per call: large enough
+/// to admit any honest interactive operation (Realtime is intended
+/// for control-plane sweeps with chunk_max bounded by
+/// `SYNC_REQUEST_CHUNK_MAX_DEFAULT`), small enough that an
+/// adversarial peer can't drain the bucket in one shot.
+/// Oversized Realtime requests are denied — a misbehaving peer
+/// has to send many small requests, each of which still drains
+/// the bucket per the existing semantic, but the per-shot floor
+/// is now bounded.
+pub const REALTIME_MAX_GRANT_FRACTION: f64 = 0.50;
 
 /// Token-bucket rate limiter scaled to a fraction of measured NIC
 /// peak. Caller mutates via [`Self::try_consume`]; refill is
@@ -45,6 +92,41 @@ pub struct BandwidthBudget {
     /// Last time we refilled the bucket. Caller-supplied `Instant`
     /// drives this; no system-clock reads inside the limiter.
     last_refill: Instant,
+    /// v0.3 Phase D4: last time a `Background` request was
+    /// admitted (either through the gate or via the anti-
+    /// starvation hatch). `None` until the first Background
+    /// admission. Drives the 60 s starve detector: if a
+    /// Background request is denied AND `now -
+    /// last_background_admission > background_starve_window`,
+    /// the next denial is converted to a one-shot admission +
+    /// resets the timer.
+    ///
+    /// Initialised to `Some(now)` at construction so the very
+    /// first request doesn't trip the hatch — operators expect
+    /// the gate to fire normally before starvation logic kicks
+    /// in.
+    last_background_admission: Option<Instant>,
+    /// v0.3 Phase D4 starve threshold. Default
+    /// [`BACKGROUND_STARVE_WINDOW_DEFAULT`] (60 s); tests inject
+    /// shorter windows via
+    /// [`Self::with_background_starve_window`].
+    background_starve_window: Duration,
+    /// v0.3 Phase D2: outstanding bytes attributed to past
+    /// `Realtime` admissions. Tracks the *cumulative* bytes
+    /// Realtime has drained-but-not-yet-refunded so the next
+    /// refund (which is class-blind on the wire layer — the
+    /// dispatcher only sees "the send failed; refund N bytes")
+    /// repays the Realtime debt FIRST before crediting the
+    /// general `available_bytes` pool. Without this, a Realtime
+    /// drain followed by a Foreground send-failure refund would
+    /// credit Foreground for the cost Realtime imposed, giving
+    /// Realtime a permanent free pass.
+    ///
+    /// The accountant is monotonic-increasing on Realtime admit
+    /// and monotonic-decreasing on refund; clamped at 0 so an
+    /// over-refund (refund > debt) credits the remainder to the
+    /// general pool.
+    realtime_debt: f64,
 }
 
 impl BandwidthBudget {
@@ -85,7 +167,23 @@ impl BandwidthBudget {
             refill_bps,
             capacity_bytes,
             last_refill: now,
+            // Seed `last_background_admission` to `now` so the
+            // anti-starvation hatch doesn't trip on the very
+            // first Background request (60 s starve from
+            // construction-time).
+            last_background_admission: Some(now),
+            background_starve_window: BACKGROUND_STARVE_WINDOW_DEFAULT,
+            realtime_debt: 0.0,
         }
+    }
+
+    /// Override the v0.3 Phase D4 anti-starvation window
+    /// (default [`BACKGROUND_STARVE_WINDOW_DEFAULT`] = 60 s).
+    /// Tests inject a short window (e.g. 100 ms) to exercise the
+    /// hatch deterministically without sleeping for 60 seconds.
+    pub fn with_background_starve_window(mut self, window: Duration) -> Self {
+        self.background_starve_window = window;
+        self
     }
 
     /// Refill the bucket given `now`. Called internally by
@@ -121,29 +219,145 @@ impl BandwidthBudget {
     /// catches up. Without this clamp the channel would deadlock
     /// trying to send a single event it can never afford.
     pub fn try_consume(&mut self, bytes: u64, now: Instant) -> bool {
+        // Routes through the class-aware path with `Foreground`
+        // semantics. The `background_fraction` argument is inert
+        // on the Foreground branch — the gate only consults the
+        // fraction for `Background` requests — so any value works
+        // here; `0.0` keeps the call site explicit. Existing call
+        // sites stay backward-compatible without code change.
+        self.try_consume_with_class(bytes, BandwidthClass::Foreground, now, 0.0)
+    }
+
+    /// Class-aware admission gate. v0.3 Phase D2.
+    ///
+    /// Per-class semantics:
+    ///
+    /// - `Foreground` (default): identical to the v0.2
+    ///   `try_consume` — admit when the bucket has enough credit;
+    ///   the oversize-event escape hatch still fires.
+    /// - `Background`: admit only when the bucket has at least
+    ///   `(1 - background_fraction) * capacity` available. The
+    ///   reservation preserves Foreground headroom against
+    ///   sustained Background load. **v0.3 Phase D4** anti-
+    ///   starvation hatch: when a Background request is denied
+    ///   AND the time since the last Background admission exceeds
+    ///   `background_starve_window`, the denial is
+    ///   one-shot-converted to an admission + the starve timer
+    ///   resets. Bounded promotion (one request) prevents the
+    ///   gate from flipping into "Foreground starved" during a
+    ///   long backlog drain.
+    /// - `Realtime`: bypasses the rate-limit failure path
+    ///   entirely. Disk-pressure circuit-breakers still apply
+    ///   above this layer; this gate doesn't consider them.
+    ///   Drains the bucket on admission so the next non-Realtime
+    ///   request feels the cost.
+    ///
+    /// `background_fraction` lives in `[0.0, 1.0)` — values at
+    /// the edge of the range are permitted but degenerate (0.0
+    /// gives Background full Foreground parity; ~1.0 makes
+    /// Background practically unadmittable absent the anti-
+    /// starvation hatch). The
+    /// [`ReplicationConfig::validate`](super::replication_config::ReplicationConfig::validate)
+    /// pass rejects out-of-range values at config time.
+    pub fn try_consume_with_class(
+        &mut self,
+        bytes: u64,
+        class: BandwidthClass,
+        now: Instant,
+        background_fraction: f32,
+    ) -> bool {
         if bytes == 0 {
             return true;
         }
         self.refill(now);
         let cost = bytes as f64;
-        if self.available_bytes >= cost {
-            self.available_bytes -= cost;
-            return true;
+
+        match class {
+            BandwidthClass::Realtime => {
+                // Bypass the rate-limit failure path — but cap
+                // per-shot cost at `REALTIME_MAX_GRANT_FRACTION ×
+                // capacity` so an adversarial peer that stamps
+                // `Realtime` on a u32::MAX-byte SyncRequest can't
+                // drain the bucket to zero in one call. Hostile-
+                // peer caveat: the `class` byte on the wire isn't
+                // covered by the R-23 request-binding token, so
+                // any replica-set peer can forge `Realtime`.
+                // Higher layers (capability-tag advertisement of
+                // who may use Realtime) are the proper place for
+                // class-authz; this cap is the rate-limiter's
+                // defense-in-depth.
+                let realtime_cap = REALTIME_MAX_GRANT_FRACTION * self.capacity_bytes;
+                if cost > realtime_cap {
+                    return false;
+                }
+                self.available_bytes = (self.available_bytes - cost).max(0.0);
+                // Track the Realtime drain so the next refund
+                // pays this debt back first. Pre-fix the refund
+                // path credited the general pool — i.e. a
+                // Realtime drain followed by a Foreground send-
+                // failure refund credited Foreground for the
+                // Realtime cost.
+                self.realtime_debt += cost;
+                true
+            }
+            BandwidthClass::Foreground => {
+                // v0.2 behavior preserved.
+                if self.available_bytes >= cost {
+                    self.available_bytes -= cost;
+                    return true;
+                }
+                if bytes > self.capacity_bytes as u64
+                    && self.available_bytes >= self.capacity_bytes - f64::EPSILON
+                {
+                    self.available_bytes = 0.0;
+                    return true;
+                }
+                false
+            }
+            BandwidthClass::Background => {
+                // Gate threshold: bucket must hold at least
+                // `(1 - background_fraction) * capacity` to
+                // satisfy the reservation against Foreground.
+                let reserve = (1.0 - background_fraction as f64).max(0.0) * self.capacity_bytes;
+                let gated_ok =
+                    self.available_bytes >= cost && self.available_bytes - cost >= reserve;
+                if gated_ok {
+                    self.available_bytes -= cost;
+                    self.last_background_admission = Some(now);
+                    return true;
+                }
+                // Anti-starvation hatch: if Background has been
+                // denied for too long, force a one-shot admission
+                // regardless of the reserve gate. The hatch grant
+                // is capped at `BACKGROUND_HATCH_MAX_GRANT_FRACTION
+                // * capacity_bytes` so an adversarial chunk_max =
+                // u32::MAX Background request can't floor the
+                // bucket in a single shot. Requests larger than
+                // the hatch cap are denied — the producer must
+                // resubmit a smaller chunk (the request-side
+                // chunking already caps SyncRequest::chunk_max to
+                // SYNC_REQUEST_CHUNK_MAX_DEFAULT, so in practice
+                // honest requests fit comfortably below the cap).
+                let starved = self
+                    .last_background_admission
+                    .map(|t| now.saturating_duration_since(t) > self.background_starve_window)
+                    .unwrap_or(true);
+                if starved {
+                    let hatch_cap = BACKGROUND_HATCH_MAX_GRANT_FRACTION * self.capacity_bytes;
+                    if cost > hatch_cap {
+                        // Oversized hatch attempt — deny without
+                        // resetting the starve timer so a
+                        // subsequent right-sized Background request
+                        // can still take the next hatch firing.
+                        return false;
+                    }
+                    self.available_bytes = (self.available_bytes - cost).max(0.0);
+                    self.last_background_admission = Some(now);
+                    return true;
+                }
+                false
+            }
         }
-        // Oversize-event escape hatch: if the request itself is
-        // larger than capacity AND the bucket is at full credit,
-        // admit it once and drain. This prevents a per-channel
-        // deadlock when a single event exceeds one-second's
-        // refill — coordinator-side chunk splitting is preferred,
-        // but the budget should never be the reason an event is
-        // permanently un-shippable.
-        if bytes > self.capacity_bytes as u64
-            && self.available_bytes >= self.capacity_bytes - f64::EPSILON
-        {
-            self.available_bytes = 0.0;
-            return true;
-        }
-        false
     }
 
     /// Return previously-consumed `bytes` to the bucket. Called
@@ -164,12 +378,30 @@ impl BandwidthBudget {
     /// long sequence of small refunds. The sub-byte fractional
     /// credit lost on each refund is recovered on the next refill
     /// tick.
+    ///
+    /// **Realtime debt repayment.** Refunds pay down the
+    /// `realtime_debt` accountant FIRST before crediting the
+    /// general `available_bytes` pool. Without this, a sequence
+    /// like (Realtime admit → drain → Foreground admit → send
+    /// fails → refund) credits the refund to Foreground's pool
+    /// — giving Realtime a free pass on the bytes it imposed.
+    /// Once the debt is zero, any remaining refund credits
+    /// available_bytes as before.
     pub fn refund(&mut self, bytes: u64) {
         if bytes == 0 {
             return;
         }
+        let mut credit = bytes as f64;
+        if self.realtime_debt > 0.0 {
+            let repay = credit.min(self.realtime_debt);
+            self.realtime_debt -= repay;
+            credit -= repay;
+        }
+        if credit <= 0.0 {
+            return;
+        }
         let floored = self.available_bytes.max(0.0).floor();
-        self.available_bytes = (floored + bytes as f64).min(self.capacity_bytes);
+        self.available_bytes = (floored + credit).min(self.capacity_bytes);
     }
 
     /// Current available token count in bytes. Useful for
@@ -219,6 +451,16 @@ impl BandwidthBudget {
         self.refill_bps = new_refill;
         self.capacity_bytes = new_refill;
         self.available_bytes = (new_refill * prev_proportion).min(new_refill);
+        // Reset the D4 starve timer to `now`. Pre-fix, the prior
+        // bucket's `last_background_admission` survived the
+        // re-scale: an operator shrinking the NIC peak (e.g. to
+        // throttle under congestion) inherited a stale timer that
+        // could fire the hatch immediately after the new tighter
+        // budget took effect — defeating the operator's intent.
+        // Seeding to `now` mirrors the constructor's initial seed:
+        // the hatch only fires after a full `background_starve_window`
+        // has elapsed under the new budget.
+        self.last_background_admission = Some(now);
     }
 }
 
@@ -414,5 +656,285 @@ mod tests {
         let before = bb.available_bytes();
         bb.refill(base); // same instant
         assert_eq!(bb.available_bytes(), before);
+    }
+}
+
+// ============================================================================
+// v0.3 Phase D2 + D4 class-aware admission tests
+// ============================================================================
+
+#[cfg(test)]
+mod class_tests {
+    use super::*;
+
+    fn at(base: Instant, millis: u64) -> Instant {
+        base + Duration::from_millis(millis)
+    }
+
+    fn fresh(capacity_bps: u64) -> (BandwidthBudget, Instant) {
+        let base = Instant::now();
+        (BandwidthBudget::new(1.0, capacity_bps, base), base)
+    }
+
+    /// `Foreground` matches the legacy `try_consume` path —
+    /// admits up to capacity, rejects past it.
+    #[test]
+    fn foreground_admits_up_to_capacity_then_rejects() {
+        let (mut bb, base) = fresh(1000);
+        assert!(bb.try_consume_with_class(600, BandwidthClass::Foreground, base, 0.3,));
+        assert!(bb.try_consume_with_class(400, BandwidthClass::Foreground, base, 0.3,));
+        // Bucket empty — next Foreground request fails.
+        assert!(!bb.try_consume_with_class(1, BandwidthClass::Foreground, base, 0.3,));
+    }
+
+    /// `Background` is gated at `(1 - fraction) * capacity` —
+    /// fraction 0.3 means Background needs `available >= 700`.
+    /// Below that it's denied.
+    #[test]
+    fn background_admits_only_when_above_reserve() {
+        let (mut bb, base) = fresh(1000);
+        // Fresh bucket: available=1000. Background admitted
+        // because 1000 - 200 = 800 >= reserve(700).
+        assert!(bb.try_consume_with_class(200, BandwidthClass::Background, base, 0.3,));
+        // available=800, request 200 → would leave 600 < reserve(700).
+        // Denied (and the D4 starve timer hasn't tripped yet).
+        assert!(!bb.try_consume_with_class(200, BandwidthClass::Background, at(base, 1), 0.3,));
+    }
+
+    /// `Background` with fraction 1.0 behaves like `Foreground`
+    /// — the reserve threshold collapses to 0 so Background can
+    /// drain the bucket up to capacity. Fraction is the share
+    /// of capacity Background is ALLOWED to consume.
+    #[test]
+    fn background_with_full_fraction_acts_like_foreground() {
+        let (mut bb, base) = fresh(1000);
+        assert!(bb.try_consume_with_class(900, BandwidthClass::Background, base, 1.0,));
+        assert!(bb.try_consume_with_class(100, BandwidthClass::Background, base, 1.0,));
+    }
+
+    /// `Background` with fraction 0.0 means "Background gets no
+    /// allocation" — the reserve threshold equals capacity so
+    /// even a tiny request on a full bucket is denied (until the
+    /// anti-starvation hatch fires).
+    #[test]
+    fn background_with_zero_fraction_denied_on_any_credit() {
+        let (mut bb, base) = fresh(1000);
+        // Fresh bucket, fraction=0.0 → reserve = capacity =
+        // 1000. Need `available - cost >= 1000`, but available
+        // starts at 1000 and any cost takes it below. Denied.
+        assert!(!bb.try_consume_with_class(1, BandwidthClass::Background, base, 0.0,));
+    }
+
+    /// `Realtime` bypasses the failure path entirely. Drains
+    /// the bucket but admits even when capacity is exhausted —
+    /// up to the per-shot cap.
+    #[test]
+    fn realtime_bypasses_failure_path() {
+        let (mut bb, base) = fresh(1000);
+        // Drain the bucket.
+        assert!(bb.try_consume_with_class(1000, BandwidthClass::Foreground, base, 0.3,));
+        // Foreground denied.
+        assert!(!bb.try_consume_with_class(1, BandwidthClass::Foreground, base, 0.3,));
+        // Realtime admitted regardless of empty bucket; 500 byte
+        // request is under the 50% cap (500 of 1000).
+        assert!(bb.try_consume_with_class(500, BandwidthClass::Realtime, base, 0.3,));
+    }
+
+    /// set_nic_peak must reset the D4 starve timer so an operator
+    /// throttling the NIC peak under congestion doesn't inherit a
+    /// stale "Background has been starved for X seconds" state
+    /// from the prior bucket. The first hatch firing under the
+    /// new budget must wait a fresh `background_starve_window`.
+    #[test]
+    fn set_nic_peak_resets_d4_starve_timer() {
+        let base = Instant::now();
+        let mut bb = BandwidthBudget::new(1.0, 10_000, base)
+            .with_background_starve_window(Duration::from_millis(100));
+        // Drain via Foreground.
+        assert!(bb.try_consume_with_class(10_000, BandwidthClass::Foreground, base, 0.3));
+        // Wait long enough that the original starve timer expires.
+        let post_window = at(base, 200);
+        // Re-scale NIC peak. Without the reset, the next
+        // Background request at `post_window` would observe
+        // `now - base > window` and fire the hatch immediately.
+        bb.set_nic_peak(20_000, 1.0, post_window);
+        // A Background request RIGHT AFTER set_nic_peak should be
+        // denied — the starve timer was reset to post_window, so
+        // the window hasn't yet elapsed under the new budget.
+        let small_request = 100u64; // well under reserve gate
+        assert!(
+            !bb.try_consume_with_class(
+                small_request,
+                BandwidthClass::Background,
+                at(post_window, 1),
+                0.3,
+            ),
+            "Background must be denied within fresh window after set_nic_peak",
+        );
+    }
+
+    /// Refunds first pay down the Realtime debt accountant
+    /// before crediting the general available_bytes pool. Pre-fix
+    /// a refund following a Realtime drain credited Foreground
+    /// for the Realtime cost — a permanent free pass for
+    /// Realtime that the gate was supposed to prevent.
+    #[test]
+    fn refund_repays_realtime_debt_before_crediting_general_pool() {
+        let base = Instant::now();
+        let mut bb = BandwidthBudget::new(1.0, 1000, base);
+        // Realtime drains 400 bytes. Realtime debt = 400;
+        // available = 600.
+        assert!(bb.try_consume_with_class(400, BandwidthClass::Realtime, base, 0.3));
+        let after_rt = bb.available_bytes();
+        assert!((599..=600).contains(&after_rt));
+        // Foreground send + failure → refund 100. Pre-fix this
+        // credited available_bytes to 700 (refund of cost the
+        // Realtime path imposed); post-fix it pays down the
+        // Realtime debt (now 300) and available_bytes stays
+        // unchanged.
+        assert!(bb.try_consume_with_class(100, BandwidthClass::Foreground, base, 0.3));
+        // available = 500 after Foreground draw
+        bb.refund(100);
+        // After refund: debt = 300 (was 400, minus 100), avail
+        // unchanged at 500 (refund went entirely to debt, none
+        // to general pool).
+        let after_refund = bb.available_bytes();
+        assert!(
+            (499..=501).contains(&after_refund),
+            "refund must pay debt FIRST; expected ~500, got {after_refund}",
+        );
+        // A subsequent refund of 500 pays the remaining 300 of
+        // debt and credits 200 to available_bytes.
+        bb.refund(500);
+        let after_big_refund = bb.available_bytes();
+        assert!(
+            (699..=701).contains(&after_big_refund),
+            "second refund must credit overflow after debt; expected ~700, got {after_big_refund}",
+        );
+    }
+
+    /// `Realtime` per-shot cost is capped at
+    /// REALTIME_MAX_GRANT_FRACTION × capacity so an adversarial
+    /// peer can't drain the bucket to zero in one shot. The
+    /// class byte on the wire is unauthenticated, so any
+    /// replica-set peer can forge `Realtime`; this cap is the
+    /// rate-limiter's defense-in-depth.
+    #[test]
+    fn realtime_denies_oversized_request_to_prevent_drain_in_one_shot() {
+        let (mut bb, base) = fresh(1000);
+        // Realtime request larger than the 50% cap (= 500 bytes).
+        assert!(
+            !bb.try_consume_with_class(750, BandwidthClass::Realtime, base, 0.3),
+            "oversized Realtime request must be denied",
+        );
+        // Bucket untouched on denial.
+        assert_eq!(bb.available_bytes(), 1000);
+        // Right-sized Realtime request admits.
+        assert!(bb.try_consume_with_class(500, BandwidthClass::Realtime, base, 0.3));
+    }
+
+    /// D4 anti-starvation hatch: a Background request denied
+    /// past the starve window converts to a one-shot admission
+    /// and resets the timer.
+    #[test]
+    fn d4_background_starve_hatch_one_shot_admit() {
+        let base = Instant::now();
+        // 10_000 capacity → hatch cap = 1_000. Request sizes
+        // below the cap so the hatch admits; pre-cap-fix this
+        // test used 200-byte requests against a 1_000-byte
+        // bucket, which now exceeds the 100-byte hatch cap.
+        let mut bb = BandwidthBudget::new(1.0, 10_000, base)
+            .with_background_starve_window(Duration::from_millis(100));
+        // Drain the bucket via Foreground so Background hits
+        // the gate cleanly.
+        assert!(bb.try_consume_with_class(10_000, BandwidthClass::Foreground, base, 0.3,));
+        // First Background within the starve window: denied.
+        assert!(!bb.try_consume_with_class(500, BandwidthClass::Background, at(base, 50), 0.3,));
+        // Past the starve window: one-shot admitted (500 <
+        // 1_000 hatch cap).
+        assert!(bb.try_consume_with_class(500, BandwidthClass::Background, at(base, 200), 0.3,));
+        // Next Background within the starve window after the
+        // hatch firing: denied again (one-shot, not "open the
+        // floodgates"). Use a tight gap so refill doesn't restore
+        // the bucket past the reserve.
+        assert!(!bb.try_consume_with_class(500, BandwidthClass::Background, at(base, 201), 0.3,));
+    }
+
+    /// D4 timer resets on every successful Background admission
+    /// (whether via the gate or via the hatch). A successful
+    /// gated admission means the next denial doesn't immediately
+    /// re-trip the hatch.
+    #[test]
+    fn d4_starve_timer_resets_on_successful_gated_admission() {
+        let base = Instant::now();
+        let mut bb = BandwidthBudget::new(1.0, 1000, base)
+            .with_background_starve_window(Duration::from_millis(100));
+        // Fresh bucket: Background admitted via gate.
+        assert!(bb.try_consume_with_class(200, BandwidthClass::Background, base, 0.3,));
+        // Drain via Foreground.
+        assert!(bb.try_consume_with_class(800, BandwidthClass::Foreground, at(base, 1), 0.3,));
+        // 50 ms in (< 100 ms window): Background denied,
+        // hatch doesn't fire (timer was just reset).
+        assert!(!bb.try_consume_with_class(200, BandwidthClass::Background, at(base, 50), 0.3,));
+    }
+
+    /// Legacy `try_consume` still works identically — it routes
+    /// through the class-aware path with Foreground semantics.
+    #[test]
+    fn legacy_try_consume_unchanged_behavior() {
+        let (mut bb, base) = fresh(1000);
+        assert!(bb.try_consume(500, base));
+        assert!(bb.try_consume(500, base));
+        assert!(!bb.try_consume(1, base));
+    }
+
+    /// D4 hatch must cap per-shot grants at
+    /// BACKGROUND_HATCH_MAX_GRANT_FRACTION × capacity. An
+    /// adversarial Background request whose cost exceeds the cap
+    /// is denied even after starvation — no single hatch firing
+    /// can floor the bucket to zero. Pre-fix, the hatch admitted
+    /// unbounded bytes per shot.
+    #[test]
+    fn d4_hatch_denies_oversized_background_request() {
+        let base = Instant::now();
+        // 10 KB capacity → 1 KB hatch cap.
+        let mut bb = BandwidthBudget::new(1.0, 10_000, base)
+            .with_background_starve_window(Duration::from_millis(50));
+        // Drain so the gate denies.
+        assert!(bb.try_consume_with_class(10_000, BandwidthClass::Foreground, base, 0.3));
+        // Wait past the starve window.
+        let later = at(base, 100);
+        // Adversarial Background request of 5 KB — well above
+        // the 1 KB hatch cap. Must be denied.
+        assert!(
+            !bb.try_consume_with_class(5_000, BandwidthClass::Background, later, 0.3),
+            "oversized Background hatch attempt (5 KB > 10% × 10 KB) must be denied"
+        );
+        // A right-sized Background request (under the cap) IS
+        // admitted by the hatch on a subsequent attempt — the
+        // failed oversized attempt didn't consume the starve
+        // timer reset.
+        assert!(
+            bb.try_consume_with_class(500, BandwidthClass::Background, later, 0.3),
+            "right-sized Background request under hatch cap must be admitted"
+        );
+    }
+
+    /// Companion: a right-sized Background request through the
+    /// hatch admits even when refill has restored some balance,
+    /// and never drains the bucket below zero.
+    #[test]
+    fn d4_hatch_admits_within_cap() {
+        let base = Instant::now();
+        let mut bb = BandwidthBudget::new(1.0, 10_000, base)
+            .with_background_starve_window(Duration::from_millis(50));
+        // Drain via Foreground.
+        assert!(bb.try_consume_with_class(10_000, BandwidthClass::Foreground, base, 0.3));
+        let later = at(base, 100);
+        // Right-sized hatch (50 bytes, well below 1 KB cap).
+        assert!(bb.try_consume_with_class(50, BandwidthClass::Background, later, 0.3));
+        // Bucket stays non-negative; refill restored some bytes,
+        // hatch drained 50 more.
+        assert!(bb.available_bytes() <= 10_000);
     }
 }

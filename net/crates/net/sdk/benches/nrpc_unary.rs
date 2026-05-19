@@ -2,7 +2,7 @@
 //!
 //! Axes:
 //! - Payload: 0 B (empty) / 32 B / 1 KiB
-//! - Codec:   json / postcard / raw bytes
+//! - Codec: json / postcard / raw bytes
 //! - Routing: direct (`call_typed` with known node id) /
 //!   discovery (`call_service_typed` via capability index)
 //!

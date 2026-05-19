@@ -1050,37 +1050,51 @@ mod tests {
     /// Same regression for the LRU-eviction path. A counter at
     /// the cap that gets evicted mid-flight must not leak its
     /// `in_flight` marker.
+    ///
+    /// Time-stagger each bump-group so `evict_lru`'s
+    /// `min_by_key(last_update)` is unambiguous. Pre-fix the
+    /// test used a single `now` instant for everything;
+    /// `evict_lru` then resolved the tie via `HashMap`
+    /// iteration order, making which entry evicted depend on
+    /// the hashbrown random seed and turning this into a flake
+    /// (~50% fail rate under parallel test execution).
     #[test]
     fn blob_heat_evict_clears_in_flight() {
         let mut r = BlobHeatRegistry::with_cap(2);
         let policy = super::super::policy::DataGravityPolicy::default();
         let half = policy.decay_half_life;
-        let now = t0();
+        let t_a = t0();
+        let t_b = t_a + Duration::from_millis(10);
+        let t_c = t_a + Duration::from_millis(20);
         let h_a = hash(0xA1);
         let h_b = hash(0xB2);
         let h_c = hash(0xC3);
 
         for _ in 0..8 {
-            r.entry_mut(h_a, half, now).bump(now);
+            r.entry_mut(h_a, half, t_a).bump(t_a);
         }
-        let _ = r.tick(&policy, now); // h_a in flight
+        let _ = r.tick(&policy, t_a); // h_a in flight
 
-        // Insert h_b then h_c — at cap=2, h_a (LRU) evicts when
-        // h_c lands.
+        // Insert h_b then h_c at strictly-increasing instants so
+        // h_a is unambiguously LRU when h_c lands past cap=2.
         for _ in 0..8 {
-            r.entry_mut(h_b, half, now).bump(now);
+            r.entry_mut(h_b, half, t_b).bump(t_b);
         }
         for _ in 0..8 {
-            r.entry_mut(h_c, half, now).bump(now);
+            r.entry_mut(h_c, half, t_c).bump(t_c);
         }
-        assert!(r.get(&h_a).is_none(), "h_a must have been evicted");
+        assert!(
+            r.get(&h_a).is_none(),
+            "h_a must have been evicted (LRU by last_update)"
+        );
 
         // Reintroduce h_a. The eviction-cleared in_flight
         // marker lets the new counter emit on next tick.
+        let t_d = t_a + Duration::from_millis(30);
         for _ in 0..8 {
-            r.entry_mut(h_a, half, now).bump(now);
+            r.entry_mut(h_a, half, t_d).bump(t_d);
         }
-        let emissions = r.tick(&policy, now);
+        let emissions = r.tick(&policy, t_d);
         assert!(
             emissions.iter().any(|(k, _)| *k == h_a),
             "reintroduced-after-eviction hash must emit; pre-fix the eviction leak \

@@ -14,9 +14,14 @@
 
 pub mod adapter;
 pub mod admission;
+pub mod bandwidth;
 pub mod blob_ref;
+pub mod blob_tree;
+pub mod blob_tree_cache;
+pub mod cdc;
 pub mod conformance;
 pub mod dispatch;
+pub mod erasure;
 pub mod error;
 pub mod fs;
 pub mod mesh;
@@ -27,6 +32,7 @@ pub mod overflow;
 pub mod publish_with_blob;
 pub mod refcount;
 pub mod registry;
+pub mod stripe_index;
 
 /// Format a 32-byte content hash as the lowercase 64-char hex
 /// string used throughout the blob layer for channel names,
@@ -60,7 +66,7 @@ pub use dispatch::{
 pub use error::BlobError;
 pub use fs::FileSystemAdapter;
 pub use mesh::{
-    MeshBlobAdapter, OverflowConfig, DEFAULT_BLOB_HEAT_HALF_LIFE,
+    MeshBlobAdapter, OverflowConfig, RepairReport, DEFAULT_BLOB_HEAT_HALF_LIFE,
     DEFAULT_OVERFLOW_HIGH_WATER_RATIO, DEFAULT_OVERFLOW_LOW_WATER_RATIO,
     DEFAULT_OVERFLOW_MAX_PUSHES_PER_TICK, DEFAULT_OVERFLOW_TICK_INTERVAL_MS,
 };
