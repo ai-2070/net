@@ -600,6 +600,13 @@ pub struct ClientStreamCall {
     call_id_cached: u64,
     /// Cached `flow_controlled` flag for the same reason.
     flow_controlled_cached: bool,
+    /// Lets `close()` interrupt a pending `send()` that's
+    /// awaiting flow-control credit. send `select!`s on this; a
+    /// concurrent close fires it, the select picks the close arm,
+    /// the call is dropped (CANCEL fires from Drop), and the
+    /// pending send returns `stream_closed` instead of hanging
+    /// forever on credit that will never arrive.
+    close_notify: Arc<tokio::sync::Notify>,
 }
 
 #[napi]
@@ -607,15 +614,45 @@ impl ClientStreamCall {
     /// Push one body chunk to the server. Encodes as the initial
     /// REQUEST (first call) or as a REQUEST_CHUNK (subsequent).
     /// Awaits one credit when flow control was opted in.
+    ///
+    /// Concurrent `close()` interrupts the await: `send`
+    /// `select!`s on the close-notify, so the upload doesn't
+    /// queue behind credit that never arrives.
     #[napi]
     pub async fn send(&self, body: Buffer) -> Result<()> {
+        let body = napi_buffer_to_bytes(body);
+        // Take the inner out under a brief lock so the long-lived
+        // tokio mutex isn't held across the credit await; a
+        // racing `close()` can then acquire the lock cleanly to
+        // signal cancellation.
+        let mut call = {
+            let mut guard = self.inner.lock().await;
+            guard
+                .take()
+                .ok_or_else(|| nrpc_err("stream_closed", "client-stream call already closed"))?
+        };
+        let notify = self.close_notify.clone();
+        let result = tokio::select! {
+            r = call.send(body) => r,
+            _ = notify.notified() => {
+                // close() fired. Drop the call (which drops its
+                // credit semaphore + fires CANCEL via the SDK's
+                // Drop impl) and report stream_closed to JS.
+                drop(call);
+                return Err(nrpc_err("stream_closed", "send aborted by close()"));
+            }
+        };
         let mut guard = self.inner.lock().await;
-        let call = guard
-            .as_mut()
-            .ok_or_else(|| nrpc_err("stream_closed", "client-stream call already closed"))?;
-        call.send(napi_buffer_to_bytes(body))
-            .await
-            .map_err(nrpc_err_from_inner)
+        match result {
+            Ok(()) => {
+                *guard = Some(call);
+                Ok(())
+            }
+            Err(e) => {
+                drop(call);
+                Err(nrpc_err_from_inner(e))
+            }
+        }
     }
 
     /// Close the upload direction (emit REQUEST_END) and await
@@ -649,8 +686,16 @@ impl ClientStreamCall {
 
     /// Close without finishing. Fires CANCEL via the SDK's Drop
     /// if the initial REQUEST has already flown. Idempotent.
+    ///
+    /// Concurrent in-flight `send()` calls awaiting credit are
+    /// interrupted via the close-notify — they observe
+    /// `stream_closed` instead of hanging.
     #[napi]
     pub async fn close(&self) {
+        // Wake any in-flight `send` waiting on credit. notify_one
+        // stores a permit so subsequent `notified()` consumes it
+        // immediately — fine even if send hasn't started yet.
+        self.close_notify.notify_one();
         let _ = self.inner.lock().await.take();
     }
 }
@@ -676,20 +721,46 @@ pub struct DuplexCall {
     inner: Arc<tokio::sync::Mutex<Option<InnerDuplexCallRaw>>>,
     call_id_cached: u64,
     flow_controlled_cached: bool,
+    /// Same role as `ClientStreamCall::close_notify` — lets
+    /// `close()` interrupt a pending `send()` blocked on credit.
+    close_notify: Arc<tokio::sync::Notify>,
 }
 
 #[napi]
 impl DuplexCall {
     /// Push one body chunk to the server.
+    ///
+    /// Concurrent `close()` interrupts the await via the
+    /// close-notify (same shape as `ClientStreamCall::send`),
+    /// so a stuck flow-control await doesn't pin the call.
     #[napi]
     pub async fn send(&self, body: Buffer) -> Result<()> {
+        let body = napi_buffer_to_bytes(body);
+        let mut call = {
+            let mut guard = self.inner.lock().await;
+            guard
+                .take()
+                .ok_or_else(|| nrpc_err("stream_closed", "duplex call already closed"))?
+        };
+        let notify = self.close_notify.clone();
+        let result = tokio::select! {
+            r = call.send(body) => r,
+            _ = notify.notified() => {
+                drop(call);
+                return Err(nrpc_err("stream_closed", "send aborted by close()"));
+            }
+        };
         let mut guard = self.inner.lock().await;
-        let call = guard
-            .as_mut()
-            .ok_or_else(|| nrpc_err("stream_closed", "duplex call already closed"))?;
-        call.send(napi_buffer_to_bytes(body))
-            .await
-            .map_err(nrpc_err_from_inner)
+        match result {
+            Ok(()) => {
+                *guard = Some(call);
+                Ok(())
+            }
+            Err(e) => {
+                drop(call);
+                Err(nrpc_err_from_inner(e))
+            }
+        }
     }
 
     /// Close the upload direction (emit REQUEST_END). Does NOT
@@ -749,6 +820,7 @@ impl DuplexCall {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(sink))),
                 call_id_cached: call_id,
                 flow_controlled_cached: flow_controlled,
+                close_notify: Arc::new(tokio::sync::Notify::new()),
             },
             DuplexStream {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
@@ -772,9 +844,12 @@ impl DuplexCall {
     }
 
     /// Close without observing the response terminator. Fires
-    /// CANCEL via the SDK's Drop. Idempotent.
+    /// CANCEL via the SDK's Drop. Idempotent. Concurrent
+    /// in-flight `send()` waiting on credit is interrupted via
+    /// the close-notify.
     #[napi]
     pub async fn close(&self) {
+        self.close_notify.notify_one();
         let _ = self.inner.lock().await.take();
     }
 }
@@ -785,20 +860,45 @@ pub struct DuplexSink {
     inner: Arc<tokio::sync::Mutex<Option<InnerDuplexSink>>>,
     call_id_cached: u64,
     flow_controlled_cached: bool,
+    /// Same role as `ClientStreamCall::close_notify` —
+    /// interrupts a pending `send()` blocked on credit.
+    close_notify: Arc<tokio::sync::Notify>,
 }
 
 #[napi]
 impl DuplexSink {
     /// Push one body chunk to the server.
+    ///
+    /// Concurrent `close()` interrupts the await via the
+    /// close-notify (same shape as `DuplexCall::send`).
     #[napi]
     pub async fn send(&self, body: Buffer) -> Result<()> {
+        let body = napi_buffer_to_bytes(body);
+        let mut sink = {
+            let mut guard = self.inner.lock().await;
+            guard
+                .take()
+                .ok_or_else(|| nrpc_err("stream_closed", "duplex sink already closed"))?
+        };
+        let notify = self.close_notify.clone();
+        let result = tokio::select! {
+            r = sink.send(body) => r,
+            _ = notify.notified() => {
+                drop(sink);
+                return Err(nrpc_err("stream_closed", "send aborted by close()"));
+            }
+        };
         let mut guard = self.inner.lock().await;
-        let sink = guard
-            .as_mut()
-            .ok_or_else(|| nrpc_err("stream_closed", "duplex sink already closed"))?;
-        sink.send(napi_buffer_to_bytes(body))
-            .await
-            .map_err(nrpc_err_from_inner)
+        match result {
+            Ok(()) => {
+                *guard = Some(sink);
+                Ok(())
+            }
+            Err(e) => {
+                drop(sink);
+                Err(nrpc_err_from_inner(e))
+            }
+        }
     }
 
     /// Close the upload direction (emit REQUEST_END). Consumes
@@ -825,9 +925,12 @@ impl DuplexSink {
         self.flow_controlled_cached
     }
 
-    /// Close without emitting REQUEST_END. Idempotent.
+    /// Close without emitting REQUEST_END. Idempotent. Concurrent
+    /// in-flight `send()` waiting on credit is interrupted via
+    /// the close-notify.
     #[napi]
     pub async fn close(&self) {
+        self.close_notify.notify_one();
         let _ = self.inner.lock().await.take();
     }
 }
@@ -1484,6 +1587,7 @@ impl MeshRpc {
             inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
             call_id_cached,
             flow_controlled_cached,
+            close_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -1510,6 +1614,7 @@ impl MeshRpc {
             inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
             call_id_cached,
             flow_controlled_cached,
+            close_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
