@@ -170,9 +170,12 @@ jobs:
           --test integration_nrpc_loopback
           --test integration_nrpc_mesh
           --test integration_nrpc_streaming
+          --test integration_nrpc_client_streaming
+          --test integration_nrpc_duplex
           --test integration_nrpc_service_discovery
           --test integration_nrpc_predicate_header
           --test integration_nrpc_cross_lang
+          --test integration_nrpc_cross_lang_streaming
           --test nrpc_inbound_dispatcher
           --test queue_group_dispatch
 
