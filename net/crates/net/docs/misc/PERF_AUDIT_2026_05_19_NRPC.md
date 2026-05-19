@@ -25,6 +25,74 @@ returning a ranked list with `file:line` refs. The reviews independently
 identified overlapping costs, which increases confidence in the ranking
 below.
 
+The conclusions are further backed by **layer-baseline decomposition**
+(see next section) using the lower-layer microbenches in
+`benches/{net,cortex,mesh}.rs`, which establish the physics floor below
+nRPC. Per Kyra's architectural framing (ring buffers → RedEX → CortEX →
+nRPC), nRPC sits at the top of a stack, and most of the 70 µs lives
+*below* nRPC's own code. The baselines pin where, and let us rule out
+several initial suspects (notably the AEAD layer).
+
+## Layer-baseline decomposition
+
+Numbers from `benchmarks/BENCHMARK_RESULTS_14900K.md` (Intel 14900K, the
+project's reference machine). Each row is the floor cost of the named
+layer in isolation; the per-RT column scales it by the number of times
+that op runs in a single unary RPC.
+
+| Layer / op | Cost per op | Times per RT | Per-RT cost |
+|---|---|---|---|
+| Packet header ser/de | 1.2 ns | ~4 | ~5 ns |
+| Event frame write_single (64 B) | 35.6 ns | 2 | ~70 ns |
+| Event frame read_batch_10 (per event) | ~16 ns | 2 | ~30 ns |
+| Packet pool get/return | 53 ns | ~4 | ~200 ns |
+| Auth guard check_fast hit | 24.6 ns | ~2 | ~50 ns |
+| **Build packet (1 event, w/ AEAD encrypt)** | **1.14 µs** | 2 legs | **~2.3 µs** |
+| ChaCha20-Poly1305 decrypt (64 B) | ~1.14 µs (symmetric) | 2 legs | ~2.3 µs |
+| CortEX ingest (tasks_create) | 192 ns | 1–2 | ~0.4 µs |
+| CortEX fold_barrier (write→wait) | 1.85 µs | up to 1 | ≤1.8 µs |
+
+**Physics floor for transport + crypto + framing: ~5 µs per RT.**
+
+**Remaining ~65 µs (93% of the c1/32 B budget) lives above transport**
+— in dispatch, scheduling, the `tokio::spawn` storm, the RedEX
+publish→subscribe wake path, the mpsc bridge hops, and the nRPC layer's
+own allocation + encoding overhead. Rough envelope of where the 65 µs
+goes (to be refined by flamegraph if needed):
+
+- UDP `send_to` / `recv_from` syscalls — ~5–10 µs (2 syscalls per leg
+  on Windows, ~1–3 µs each including kernel transition)
+- Tokio scheduling + spawns — ~10–20 µs (4–6 spawns per RT × ~2 µs)
+- RedEX dispatcher → subscriber wake — ~5–10 µs (mpsc wake latency)
+- nRPC encode/decode + alloc churn — ~10–15 µs (3 memcpys + ~8 allocs)
+- Mesh routing — ~5–10 µs (peer lookup, `publish_to_peer` setup,
+  response-leg roster fan-out)
+- Bookkeeping — ~5 µs (metrics, observer fire, `CallMetricsGuard`)
+
+### Cipher comparison data — AEAD is NOT the bottleneck
+
+The `cipher_comparison` bench at every payload size:
+
+| Payload | ChaCha20 (current `shared_pool` path) | `fast_chacha20` (unwrapped baseline) |
+|---|---|---|
+| 64 B | 1.12 µs | 1.14 µs |
+| 256 B | 1.20 µs | 1.20 µs |
+| 1 KiB | 1.58 µs | 1.55 µs |
+| 4 KiB | 3.08 µs | 3.02 µs |
+
+The two paths are statistically identical. ChaCha20 is already near-
+optimal on this CPU and even switching to AES-GCM-NI could shave at most
+~1–2 µs off the round-trip — well below the ~65 µs of dispatch
+overhead. **T4.1 is dropped from the plan** (see Tier 4 below).
+
+### Why the 32 B-vs-1 KiB flat curve
+
+64 B encrypt = 1.14 µs; 1 KiB encrypt = 1.58 µs. A 16× payload bump
+only adds 0.44 µs to the AEAD. At 32 B vs 1 KiB, that's under 0.5 µs
+of the 70 µs budget — well within bench noise. The flat curve doesn't
+say "AEAD is heavy"; it says **AEAD is so light that payload scaling
+disappears under everything else**.
+
 ## What the audit found
 
 Three cost categories dominate the per-call overhead:
@@ -244,16 +312,21 @@ Three cost categories dominate the per-call overhead:
 
 ### Tier 4 — wire/protocol changes (deferred)
 
-#### T4.1 — AES-GCM-NI cipher option
+#### T4.1 — AES-GCM-NI cipher option *(DROPPED)*
 
-ChaCha20-Poly1305 keystream init dominates short payloads (one full
-64-byte block of keystream regardless of body size — exactly matching
-the observed flat 32 B vs 1 KiB curve). Feature-gated AES-GCM via AES-NI
-would be ~3–5× faster on tiny payloads on AES-capable hosts. Wire-format
-negotiation required.
+**Initial hypothesis:** the 32 B-vs-1 KiB flat curve suggested
+ChaCha20-Poly1305 keystream init was wasting cycles on short payloads,
+and feature-gating AES-GCM-NI on AES-capable hosts would be 3–5× faster.
 
-- **Win:** 2–4 µs / round-trip on AES hosts.
-- **Difficulty:** hard.
+**Why we dropped it:** the `cipher_comparison` bench at
+`benches/net.rs:305` directly measures this and shows the ChaCha20 path
+is already near-optimal on the reference 14900K — `shared_pool` and
+`fast_chacha20` are statistically identical at every payload size. The
+AEAD only accounts for ~2.3 µs of the 70 µs RT budget (under 4%); even
+a hypothetical 3× cipher speedup buys at most ~1.5 µs. Not worth a wire
+format negotiation. The flat curve isn't telling us AEAD is heavy —
+it's telling us AEAD is so light that payload scaling vanishes under
+everything else.
 
 #### T4.2 — Shrink the per-frame AAD
 
@@ -261,6 +334,11 @@ negotiation required.
 header.aad()`), so Poly1305 absorbs header + payload (~122 B / ~2
 blocks). Shrinking to a 16 B sub-header roughly halves Poly1305 work.
 Wire-format change.
+
+By the same logic as T4.1, the headroom here is also small — Poly1305
+on 2 blocks vs 1 block at this payload size is sub-microsecond. Keep
+deferred unless a future protocol revision touches the frame layout
+for unrelated reasons.
 
 ## Non-findings (cleared by the audit)
 
@@ -287,16 +365,17 @@ These were initial suspicions that did not pan out:
 - **StreamWindow grant cost on unary RPC** (T1.1). Single biggest
   claimed win, but it's a flow-control mechanism intended for the
   streaming path. Verify it actually fires on unary RPC before
-  building a coalescer.
-- **AEAD vs syscall vs scheduling share.** The 32 B-vs-1 KiB flat
-  curve strongly suggests scheduling / spawn dominates over AEAD, but
-  without a `samply` / `flamegraph` profile we cannot rule out
-  ChaCha20 stage init being a meaningful slice. Profile would
-  disambiguate.
+  building a coalescer. Use a quick `samply` or `printf` probe before
+  cutting code.
+- ~~**AEAD vs syscall vs scheduling share.**~~ **RESOLVED** by the
+  cipher_comparison data above — AEAD is ~5% of the budget, not the
+  bottleneck. The remaining 65 µs is in scheduling + dispatch + nRPC
+  layer.
 - **Inbound bridge mpsc wake latency.** Could be 1 µs (same-thread
   hand-off) or 5 µs (cross-worker wake) depending on tokio runtime
   scheduler state. Localhost benchmarks under criterion may park
-  workers between iters, biasing the result.
+  workers between iters, biasing the result. Flamegraph would
+  disambiguate if a measured Tier 1 delta diverges from prediction.
 
 ## Expected outcome
 
@@ -312,19 +391,32 @@ once the bigger wins are in.
 
 ## Recommended implementation order
 
-1. **Get a flamegraph first.** `samply record` against the bench
-   binary (lighter than `cargo flamegraph` on Windows) — pins the
-   StreamWindow-grant claim and the AEAD share with real data, costs
-   one bench run.
-2. **Tier 1.2** (response → `publish_to_peer` direct). Confirmed
+The layer baselines (above) make the flamegraph step optional rather
+than mandatory — we already know the AEAD/transport floor is ~5 µs and
+the remaining ~65 µs is in dispatch/scheduling/nRPC. The flamegraph
+would refine the breakdown of that 65 µs but isn't required to start
+implementing the top-ranked wins.
+
+1. **Tier 1.2** (response → `publish_to_peer` direct). Confirmed
    path, contained change, 3–8 µs win, three commits possible
    (unary, server-streaming, client-streaming reply emits).
-3. **Tier 1.3** (per-service route cache). Independent of #2,
+2. **Tier 1.3** (per-service route cache). Independent of #1,
    ~2 µs + 5 allocs. Easy diff.
-4. **Tier 1.1** (StreamWindow coalesce), *after* flamegraph confirms.
-   Biggest claimed win but riskiest to land without verification.
-5. **Re-bench.** Measure the c1 and c128 deltas.
-6. **Decide on Tier 2** based on whether headroom remains.
+3. **Re-bench `nrpc_qps`.** Measure the c1/32 B + c128/32 B deltas
+   so far.
+4. **Tier 1.1** (StreamWindow coalesce). The biggest claimed single
+   win but the most architecturally invasive. The layer baselines
+   confirm the spawn-storm magnitude (4–6 spawns × ~2 µs ≈ 10–15 µs)
+   matches the size of the gap that #1+#2 won't close, so this is
+   the natural follow-up. Verify on the way in that the unary RPC
+   path actually traverses the StreamWindow grant path — that's the
+   one structural unknown remaining.
+5. **Re-bench.** Decide whether Tier 2 is needed based on whether
+   c1/32 B has reached the 30–35 µs target.
+
+If at any point the deltas don't match the audit's predictions, drop
+in a `samply` flamegraph run before the next change to pin attribution
+on actual data.
 
 Each Tier 1 item is independent and lands as one commit. Tier 2 items
 are larger refactors and benefit from individual commits and re-benches.
