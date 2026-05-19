@@ -1854,21 +1854,23 @@ impl MeshNode {
                     .to_string(),
             });
         }
-        let request_channel =
-            ChannelName::new(&format!("{service}.requests")).map_err(|e| RpcError::NoRoute {
+        // T1.3: per-service route cache (see PERF_AUDIT
+        // 2026-05-19). One DashMap::get + Arc::clone instead of
+        // 2 format! + 2 ChannelName::new + xxhash per call.
+        let route = self
+            .rpc_route_for_service(service)
+            .map_err(|reason| RpcError::NoRoute {
                 target: target_node_id,
-                reason: format!("invalid service name: {e}"),
+                reason,
             })?;
         let self_origin = self.identity_origin_hash();
-        let reply_channel_name = format!("{service}.replies.{self_origin:016x}");
-        let reply_channel =
-            ChannelName::new(&reply_channel_name).map_err(|e| RpcError::NoRoute {
-                target: target_node_id,
-                reason: format!("invalid reply channel name: {e}"),
-            })?;
-        let reply_hash = reply_channel.hash();
-        self.ensure_reply_subscription(target_node_id, service, reply_channel.clone(), reply_hash)
-            .await?;
+        self.ensure_reply_subscription(
+            target_node_id,
+            service,
+            route.reply_channel.clone(),
+            route.reply_hash,
+        )
+        .await?;
 
         let call_id = mint_random_call_id();
         let pending = self.rpc_client_pending();
@@ -1912,7 +1914,7 @@ impl MeshNode {
         Ok(ClientStreamCallRaw {
             mesh: Arc::clone(self),
             target_node_id,
-            request_channel,
+            request_channel: route.request_channel.clone(),
             self_origin,
             call_id,
             service: service.to_string(),
@@ -2067,21 +2069,23 @@ impl MeshNode {
                     .to_string(),
             });
         }
-        let request_channel =
-            ChannelName::new(&format!("{service}.requests")).map_err(|e| RpcError::NoRoute {
+        // T1.3: per-service route cache (see PERF_AUDIT
+        // 2026-05-19). One DashMap::get + Arc::clone instead of
+        // 2 format! + 2 ChannelName::new + xxhash per call.
+        let route = self
+            .rpc_route_for_service(service)
+            .map_err(|reason| RpcError::NoRoute {
                 target: target_node_id,
-                reason: format!("invalid service name: {e}"),
+                reason,
             })?;
         let self_origin = self.identity_origin_hash();
-        let reply_channel_name = format!("{service}.replies.{self_origin:016x}");
-        let reply_channel =
-            ChannelName::new(&reply_channel_name).map_err(|e| RpcError::NoRoute {
-                target: target_node_id,
-                reason: format!("invalid reply channel name: {e}"),
-            })?;
-        let reply_hash = reply_channel.hash();
-        self.ensure_reply_subscription(target_node_id, service, reply_channel.clone(), reply_hash)
-            .await?;
+        self.ensure_reply_subscription(
+            target_node_id,
+            service,
+            route.reply_channel.clone(),
+            route.reply_hash,
+        )
+        .await?;
 
         let call_id = mint_random_call_id();
         let pending = self.rpc_client_pending();
@@ -2124,7 +2128,7 @@ impl MeshNode {
         let inner = Arc::new(DuplexInner {
             mesh: Arc::clone(self),
             target_node_id,
-            request_channel,
+            request_channel: route.request_channel.clone(),
             self_origin,
             call_id,
             initial_sent: std::sync::atomic::AtomicBool::new(false),
@@ -2182,21 +2186,23 @@ impl MeshNode {
                     .to_string(),
             });
         }
-        let request_channel =
-            ChannelName::new(&format!("{service}.requests")).map_err(|e| RpcError::NoRoute {
+        // T1.3: per-service route cache. One DashMap::get + Arc::clone
+        // on the hot path instead of 2 format! + 2 ChannelName::new +
+        // xxhash per call.
+        let route = self
+            .rpc_route_for_service(service)
+            .map_err(|reason| RpcError::NoRoute {
                 target: target_node_id,
-                reason: format!("invalid service name: {e}"),
+                reason,
             })?;
         let self_origin = self.identity_origin_hash();
-        let reply_channel_name = format!("{service}.replies.{self_origin:016x}");
-        let reply_channel =
-            ChannelName::new(&reply_channel_name).map_err(|e| RpcError::NoRoute {
-                target: target_node_id,
-                reason: format!("invalid reply channel name: {e}"),
-            })?;
-        let reply_hash = reply_channel.hash();
-        self.ensure_reply_subscription(target_node_id, service, reply_channel.clone(), reply_hash)
-            .await?;
+        self.ensure_reply_subscription(
+            target_node_id,
+            service,
+            route.reply_channel.clone(),
+            route.reply_hash,
+        )
+        .await?;
 
         let call_id = mint_random_call_id();
         let pending = self.rpc_client_pending();
@@ -2238,15 +2244,12 @@ impl MeshNode {
         buf.extend_from_slice(&meta.to_bytes());
         buf.extend_from_slice(&req.encode());
 
-        let request_channel_id = ChannelId::new(request_channel.clone());
-        let request_channel_hash = request_channel_id.hash();
-        let stream_id = MeshNode::publish_stream_id(&request_channel_id);
         let payload_bytes = Bytes::from(buf);
         if let Err(e) = self
             .publish_to_peer(
                 target_node_id,
-                request_channel_hash,
-                stream_id,
+                route.request_channel_hash,
+                route.request_stream_id,
                 /* reliable */ true,
                 std::slice::from_ref(&payload_bytes),
             )
@@ -2260,7 +2263,7 @@ impl MeshNode {
         Ok(RpcStream {
             mesh: Arc::clone(self),
             target_node_id,
-            request_channel,
+            request_channel: route.request_channel.clone(),
             self_origin,
             call_id,
             inner: rx,
