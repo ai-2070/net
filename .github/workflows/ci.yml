@@ -118,6 +118,8 @@ jobs:
           --test capability_broadcast
           --test capability_multihop
           --test capability_scope
+          --test capability_auth_call_path
+          --test capability_auth_conformance
           --test capability_schema_doc_guard
           --test chain_discovery
           --test cross_lang_capability_fixtures
