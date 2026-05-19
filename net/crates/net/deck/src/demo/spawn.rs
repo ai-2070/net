@@ -9,7 +9,7 @@
 //! 3. Spawn one tokio task per node that drives the heartbeat
 //!    daemon's `publish_log` at the cadence locked in
 //!    `DECK_DEMO_PLAN.md` (~800 ms with jitter).
-//! 4. Build a `DeckClient` against node[0]'s `MeshOsRuntime` —
+//! 4. Build a `DeckClient` against `node[0]`'s `MeshOsRuntime` —
 //!    that's the operator's view of the cluster.
 //! 5. Return a [`Harness`] that mirrors the shape of
 //!    [`crate::runtime::Harness`] so `main.rs` can branch on
@@ -63,7 +63,7 @@ pub struct Harness {
     /// (auto-unregisters via `MeshOsDaemonHandle::Drop`).
     _heartbeat_handles: Vec<MeshOsDaemonHandle>,
     /// Handles for the replica / fork / standby trios pinned
-    /// to node[0]. Same lifetime semantics as the heartbeat
+    /// to `node[0]`. Same lifetime semantics as the heartbeat
     /// handles — dropping them on shutdown auto-unregisters.
     _group_handles: Vec<MeshOsDaemonHandle>,
     /// Tokio tasks driving the per-node heartbeat log emits.
@@ -71,7 +71,7 @@ pub struct Harness {
     /// handles, the spawned futures are cancelled).
     _heartbeat_tasks: Vec<JoinHandle<()>>,
     /// Phase 3 migration driver task — spawns a fresh
-    /// compute-layer daemon on node[0] every ~30 s and
+    /// compute-layer daemon on `node[0]` every ~30 s and
     /// migrates it to a rotating peer. Aborted on Drop.
     _migration_task: JoinHandle<()>,
     /// Phase 4: typed-RPC responder handles parked on nodes
@@ -81,14 +81,14 @@ pub struct Harness {
     /// Phase 4: per-requester loop tasks (nodes 2..N).
     /// Aborted on Drop.
     _rpc_requester_tasks: Vec<JoinHandle<()>>,
-    /// `DeckClient` anchored on node[0]'s `MeshOsRuntime`. The
-    /// deck observes node[0]'s snapshot fold (which includes
+    /// `DeckClient` anchored on `node[0]`'s `MeshOsRuntime`. The
+    /// deck observes `node[0]`'s snapshot fold (which includes
     /// the other peers via the bridge probes).
     deck: Arc<DeckClient>,
     /// No blob adapters in Phase 1; Phase 2 wires per-node
     /// in-memory `Redex`-backed adapters.
     blob_adapters: Vec<Arc<MeshBlobAdapter>>,
-    /// Node[0]'s 64-bit node id. The deck's UI uses this to
+    /// `Node[0]`'s 64-bit node id. The deck's UI uses this to
     /// disambiguate "this node" from remote peers.
     this_node: NodeId,
 }

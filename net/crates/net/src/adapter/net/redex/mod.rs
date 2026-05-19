@@ -61,16 +61,18 @@ pub use replication::{
     SyncResponse, WireError as ReplicationWireError, DISPATCH_REPLICA_SYNC_RESERVED_END,
     DISPATCH_SYNC_HEARTBEAT, DISPATCH_SYNC_NACK, DISPATCH_SYNC_REQUEST, DISPATCH_SYNC_RESPONSE,
     SUBPROTOCOL_REDEX, SYNC_HEARTBEAT_SIZE, SYNC_NACK_DETAIL_MAX, SYNC_REQUEST_SIZE,
+    SYNC_REQUEST_SIZE_V2_CLASS,
 };
-pub use replication_budget::BandwidthBudget;
+pub use replication_budget::{BandwidthBudget, BACKGROUND_STARVE_WINDOW_DEFAULT};
 pub use replication_catchup::{
     apply_sync_response, handle_sync_request, ApplyError, SyncRequestOutcome,
     CHUNK_MAX_HARD_CEILING_BYTES,
 };
 pub use replication_config::{
     PlacementStrategy, ReplicationConfig, ReplicationConfigError, UnderCapacity,
-    HEARTBEAT_MS_DEFAULT, HEARTBEAT_MS_MAX, HEARTBEAT_MS_MIN, REPLICATION_BUDGET_FRACTION_DEFAULT,
-    REPLICATION_FACTOR_DEFAULT, REPLICATION_FACTOR_MAX, REPLICATION_FACTOR_MIN,
+    BACKGROUND_FRACTION_DEFAULT, HEARTBEAT_MS_DEFAULT, HEARTBEAT_MS_MAX, HEARTBEAT_MS_MIN,
+    REPLICATION_BUDGET_FRACTION_DEFAULT, REPLICATION_FACTOR_DEFAULT, REPLICATION_FACTOR_MAX,
+    REPLICATION_FACTOR_MIN,
 };
 pub use replication_coordinator::{
     ChainTagSink, ChannelIdentity, CoordinatorError, ReplicaTransitionEvent,

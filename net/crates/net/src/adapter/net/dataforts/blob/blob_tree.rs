@@ -17,7 +17,7 @@
 //! [`BlobRef::Small`](super::blob_ref::BlobRef::Small) at
 //! `dataforts/blob/<hex32>` (same channel naming as v0.2 chunks).
 //! The node's bytes are postcard-encoded; the parent
-//! ([`TreeNode::Internal`] or [`BlobRef::Tree::root_hash`])
+//! ([`TreeNode::Internal`] or [`super::blob_ref::BlobRef::Tree`])
 //! carries the hash that authenticates the node. Tree-walk
 //! verification (BLAKE3 of fetched bytes == parent's stored hash)
 //! extends the v0.2 single-chunk verification model up the tree.
@@ -32,12 +32,12 @@
 //!
 //! # Producer hint
 //!
-//! Producers SHOULD emit [`BlobRef::Tree`] above
+//! Producers SHOULD emit [`super::blob_ref::BlobRef::Tree`] above
 //! [`TREE_THRESHOLD_BYTES`] (32 GiB) — the breakeven where the
 //! flat manifest body exceeds ~1 MB. Below threshold, emit the
-//! v0.2 [`BlobRef::Manifest`] for round-trip efficiency. The
-//! threshold is policy, not a wire requirement; well-formed
-//! `Tree`s of any size decode cleanly.
+//! v0.2 [`super::blob_ref::BlobRef::Manifest`] for round-trip
+//! efficiency. The threshold is policy, not a wire requirement;
+//! well-formed `Tree`s of any size decode cleanly.
 
 use serde::{Deserialize, Serialize};
 
@@ -202,7 +202,7 @@ pub const TREE_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 pub const TREE_NODE_MAX_WIRE_BYTES: usize = 64 * 1024;
 
 /// Maximum permissible chunk size under v0.3 CDC. The fixed-
-/// chunk path uses [`BLOB_CHUNK_SIZE_BYTES`] (4 MiB); CDC pins
+/// chunk path uses [`super::blob_ref::BLOB_CHUNK_SIZE_BYTES`] (4 MiB); CDC pins
 /// `max = 16 MiB`. Leaf decoding rejects any chunk past this so
 /// a malicious peer can't stamp a `size = u32::MAX` chunk that
 /// then overflows a per-chunk buffer on fetch.

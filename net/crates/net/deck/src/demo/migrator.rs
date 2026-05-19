@@ -2,7 +2,7 @@
 //!
 //! Registers a `"migratable"` factory on every node's
 //! `DaemonRuntime` and runs a background tokio task that
-//! spawns a fresh daemon on node[0] every ~30 s and calls
+//! spawns a fresh daemon on `node[0]` every ~30 s and calls
 //! `start_migration` to ship it to a rotating target peer.
 //! The substrate's `MigrationOrchestrator` drives the
 //! 6-phase machine; the `OrchestratorMigrationSnapshotSource`

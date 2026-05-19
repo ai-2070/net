@@ -260,7 +260,7 @@ pub struct RuntimeInputs {
     /// `SyncResponse` frames (replica path). The
     /// `tail_provider` closure typically wraps `file.next_seq()`.
     pub file: RedexFile,
-    /// Per-channel default [`BandwidthClass`] — stamped on every
+    /// Per-channel default [`super::bandwidth::BandwidthClass`] — stamped on every
     /// `SyncRequest` the runtime emits. v0.3 Phase D2. Sourced
     /// from
     /// [`ReplicationConfig::default_bandwidth_class`](super::replication_config::ReplicationConfig).

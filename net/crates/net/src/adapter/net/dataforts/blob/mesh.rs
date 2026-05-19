@@ -1034,7 +1034,7 @@ impl MeshBlobAdapter {
     ///
     /// Phase A ships with sequential `store_chunk` dispatch —
     /// each chunk is awaited before the next is requested.
-    /// Phase D's [`BandwidthClass`] surface adds dynamic
+    /// Phase D's [`crate::adapter::net::redex::BandwidthClass`] surface adds dynamic
     /// in-flight parallelism (~256 MB target). For TB-scale
     /// streams on a fast link, the sequential path may not
     /// saturate the wire; that's an acknowledged Phase A

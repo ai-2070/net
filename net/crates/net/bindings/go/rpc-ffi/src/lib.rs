@@ -1112,7 +1112,7 @@ pub extern "C" fn net_rpc_call_streaming(
 /// Identical contract; adds a `cancel_token` parameter so the
 /// construction `block_on` (which awaits the peer's initial-frame
 /// ACK) can be aborted by [`net_rpc_cancel_call`] from another
-/// thread. The unary [`net_rpc_call_cancellable`] path got this
+/// thread. The unary `net_rpc_call` path got this
 /// discipline as CR-13; the streaming variant lost the cancel hook
 /// because [`net_rpc_stream_close`] only takes effect AFTER the
 /// stream handle is constructed — a Go consumer's `ctx.Done()`
@@ -1529,7 +1529,7 @@ pub extern "C" fn net_rpc_call_streaming_with_headers(
 /// N-16: cancellable variant of
 /// [`net_rpc_call_streaming_with_headers`]. Same cancellation
 /// contract as [`net_rpc_call_streaming_cancellable`]: routes the
-/// construction `block_on` through [`run_cancellable`] so an
+/// construction `block_on` through `run_cancellable` so an
 /// in-flight [`net_rpc_cancel_call`] aborts mid-construction.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]

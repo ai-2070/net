@@ -2,7 +2,7 @@
 //! blob store path.
 //!
 //! v0.3 Phase A + B store every chunk in full (the
-//! [`Encoding::Replicated`](super::blob_ref::Encoding::Replicated)
+//! [`Encoding::Replicated`]
 //! path); chunk-level redundancy comes from cross-node replication.
 //! Phase C adds the
 //! [`Encoding::ReedSolomon { k, m }`](super::blob_ref::Encoding::ReedSolomon)

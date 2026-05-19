@@ -199,7 +199,7 @@ impl BandwidthBudget {
     ///   sustained Background load. **v0.3 Phase D4** anti-
     ///   starvation hatch: when a Background request is denied
     ///   AND the time since the last Background admission exceeds
-    ///   [`Self::background_starve_window`], the denial is
+    ///   `background_starve_window`, the denial is
     ///   one-shot-converted to an admission + the starve timer
     ///   resets. Bounded promotion (one request) prevents the
     ///   gate from flipping into "Foreground starved" during a

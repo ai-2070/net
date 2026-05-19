@@ -1,7 +1,7 @@
 //! `TreeNodeCache` — per-node LRU cache for v0.3 manifest tree
 //! walks.
 //!
-//! `MeshBlobAdapter::fetch_range` walks the [`TreeNode`] tree
+//! `MeshBlobAdapter::fetch_range` walks the [`super::blob_tree::TreeNode`] tree
 //! lazily for every range query. Without caching, two adjacent
 //! range reads on the same blob fetch the root + every spanning
 //! internal node twice. Pinning the recently-walked nodes in an
@@ -91,7 +91,7 @@ impl TreeNodeCache {
     }
 
     /// Look up `hash`. On hit, returns a clone of the cached
-    /// bytes (the caller decodes them as a [`TreeNode`]) and
+    /// bytes (the caller decodes them as a [`super::blob_tree::TreeNode`]) and
     /// promotes the entry to most-recently-used. On miss,
     /// returns `None`.
     pub fn get(&mut self, hash: &[u8; 32]) -> Option<Vec<u8>> {
