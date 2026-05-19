@@ -1,0 +1,29 @@
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  s_c46a4f2a71242f::t_943290a1a2c9b8 1947-1954,1956,1958
+  s_c46a4f2a71242f::t_32837ec7b4ac4a 1685-1689,1691-1692
+  s_c46a4f2a71242f::t_58c7de27afba66 60-61
+  s_c46a4f2a71242f::t_1f107c0d3baaa0 1606,1609-1616,1618-1619
+  s_c46a4f2a71242f::t_3b3913c62d0e60 1730-1737,1739,1741
+  s_c46a4f2a71242f::t_f1c5a72e16e158 1857-1872,1875
+  s_c46a4f2a71242f::t_2e8b7bdaa4725b 1803-1811,1813,1815,1822,1828
+  s_c46a4f2a71242f::t_aa91fb6f3e9a58 1469-1476,1478,1483
+  s_c46a4f2a71242f::t_36d903c5e55fcf 1769,1773
+  s_c46a4f2a71242f::t_7e76624f2e0306 2042-2050,2052,2054,2061,2067
+  s_c46a4f2a71242f::t_225cf4fa4ebf52 1762-1768,1771
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "1a4af9c1c6f7406f67bd3a0c9dfc824845227882",
+  "prompts": {},
+  "sessions": {
+    "s_c46a4f2a71242f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c40a4b97-f9fb-4ca1-a55c-ca0f5316ac30",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
