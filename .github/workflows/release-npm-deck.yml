@@ -144,41 +144,30 @@ jobs:
           EOF
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
+      # Cross-compile to musl via cargo-zigbuild. The hand-rolled
+      # zig-cc wrapper used by `release-npm.yml` works for cdylibs
+      # but breaks here: linking a static-PIE executable for musl,
+      # Rust passes its self-contained `rcrt1.o` while zig cc also
+      # injects its own `crt1.o`, producing a `duplicate symbol:
+      # _start` link error. cargo-zigbuild handles the
+      # `link-self-contained=no` + cc-rs `--target=` quirks for us.
       - name: Install zig (musl cross compiler)
         if: contains(matrix.target, 'musl')
         uses: goto-bus-stop/setup-zig@v2
 
-      - name: Wrap zig as the musl cross-compiler
+      - name: Install cargo-zigbuild
         if: contains(matrix.target, 'musl')
-        shell: bash
-        run: |
-          case "${{ matrix.target }}" in
-            x86_64-unknown-linux-musl) ZIG_TARGET=x86_64-linux-musl; ENV_TGT=x86_64_unknown_linux_musl ;;
-            aarch64-unknown-linux-musl) ZIG_TARGET=aarch64-linux-musl; ENV_TGT=aarch64_unknown_linux_musl ;;
-          esac
-          WRAPPER="$HOME/zig-cc-${ZIG_TARGET}.sh"
-          cat > "$WRAPPER" <<EOF
-          #!/bin/bash
-          args=()
-          for arg in "\$@"; do
-            case "\$arg" in
-              --target=*) ;;
-              *) args+=("\$arg") ;;
-            esac
-          done
-          exec zig cc -target ${ZIG_TARGET} "\${args[@]}"
-          EOF
-          chmod +x "$WRAPPER"
-          UPPER=$(echo "$ENV_TGT" | tr '[:lower:]' '[:upper:]')
-          {
-            echo "CC_${ENV_TGT}=$WRAPPER"
-            echo "CXX_${ENV_TGT}=$WRAPPER"
-            echo "CARGO_TARGET_${UPPER}_LINKER=$WRAPPER"
-          } >> "$GITHUB_ENV"
+        run: cargo install --locked cargo-zigbuild
 
       - name: Build deck
         working-directory: net/crates/net
-        run: cargo build --release -p net-deck --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *musl* ]]; then
+            cargo zigbuild --release -p net-deck --target ${{ matrix.target }}
+          else
+            cargo build --release -p net-deck --target ${{ matrix.target }}
+          fi
 
       - name: Assemble per-platform npm package
         shell: bash
