@@ -419,6 +419,16 @@ impl BandwidthBudget {
         self.refill_bps = new_refill;
         self.capacity_bytes = new_refill;
         self.available_bytes = (new_refill * prev_proportion).min(new_refill);
+        // Reset the D4 starve timer to `now`. Pre-fix, the prior
+        // bucket's `last_background_admission` survived the
+        // re-scale: an operator shrinking the NIC peak (e.g. to
+        // throttle under congestion) inherited a stale timer that
+        // could fire the hatch immediately after the new tighter
+        // budget took effect — defeating the operator's intent.
+        // Seeding to `now` mirrors the constructor's initial seed:
+        // the hatch only fires after a full `background_starve_window`
+        // has elapsed under the new budget.
+        self.last_background_admission = Some(now);
     }
 }
 
@@ -696,6 +706,39 @@ mod class_tests {
         // Realtime admitted regardless of empty bucket; 500 byte
         // request is under the 50% cap (500 of 1000).
         assert!(bb.try_consume_with_class(500, BandwidthClass::Realtime, base, 0.3,));
+    }
+
+    /// set_nic_peak must reset the D4 starve timer so an operator
+    /// throttling the NIC peak under congestion doesn't inherit a
+    /// stale "Background has been starved for X seconds" state
+    /// from the prior bucket. The first hatch firing under the
+    /// new budget must wait a fresh `background_starve_window`.
+    #[test]
+    fn set_nic_peak_resets_d4_starve_timer() {
+        let base = Instant::now();
+        let mut bb = BandwidthBudget::new(1.0, 10_000, base)
+            .with_background_starve_window(Duration::from_millis(100));
+        // Drain via Foreground.
+        assert!(bb.try_consume_with_class(10_000, BandwidthClass::Foreground, base, 0.3));
+        // Wait long enough that the original starve timer expires.
+        let post_window = at(base, 200);
+        // Re-scale NIC peak. Without the reset, the next
+        // Background request at `post_window` would observe
+        // `now - base > window` and fire the hatch immediately.
+        bb.set_nic_peak(20_000, 1.0, post_window);
+        // A Background request RIGHT AFTER set_nic_peak should be
+        // denied — the starve timer was reset to post_window, so
+        // the window hasn't yet elapsed under the new budget.
+        let small_request = 100u64; // well under reserve gate
+        assert!(
+            !bb.try_consume_with_class(
+                small_request,
+                BandwidthClass::Background,
+                at(post_window, 1),
+                0.3,
+            ),
+            "Background must be denied within fresh window after set_nic_peak",
+        );
     }
 
     /// `Realtime` per-shot cost is capped at
