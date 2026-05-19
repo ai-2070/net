@@ -42,6 +42,7 @@
 //!   mesh-side advertisement integration lands; `replica_target`
 //!   reflects the operator's `ReplicationConfig::factor` when set.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -322,6 +323,15 @@ pub struct MeshBlobAdapter {
     /// `n` through `with_max_memory_bytes` on every chunk-file
     /// open; the upstream `min(n, 64 MiB)` clamp still applies.
     chunk_file_max_memory_bytes: Option<usize>,
+    /// Cached `RsEncoder` instances, keyed by `(k, m)`. The
+    /// underlying matrix construction is the expensive part of
+    /// `RsEncoder::new` — for a degraded blob with N stripes, the
+    /// pre-fix read + repair paths constructed an encoder per
+    /// stripe (N matrix-builds). Cache them on the adapter so
+    /// reconstruction over many stripes pays the build cost
+    /// exactly once per distinct `(k, m)`. Adapter clones share
+    /// the same cache via `Arc`.
+    rs_encoder_cache: Arc<parking_lot::Mutex<HashMap<(u8, u8), Arc<super::erasure::RsEncoder>>>>,
 }
 
 impl MeshBlobAdapter {
@@ -351,6 +361,7 @@ impl MeshBlobAdapter {
             stripe_index: Arc::new(parking_lot::Mutex::new(
                 super::stripe_index::StripeMembershipIndex::new(),
             )),
+            rs_encoder_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             auto_repair_on_fetch: false,
         }
     }
@@ -2116,7 +2127,7 @@ impl MeshBlobAdapter {
         }
 
         // Run the reconstruction.
-        let encoder = super::erasure::RsEncoder::new(super::erasure::RsParams { k, m })?;
+        let encoder = self.get_or_build_rs_encoder(k, m)?;
         encoder.reconstruct_data(&mut shards)?;
 
         // Opt-in fetch-path auto-repair: re-store the
@@ -2481,6 +2492,35 @@ impl MeshBlobAdapter {
         self.repair_blob(blob_ref).await
     }
 
+    /// Internal: return a cached `RsEncoder` for `(k, m)`,
+    /// constructing on first use. The underlying matrix
+    /// construction is the expensive part of `RsEncoder::new`;
+    /// caching per `(k, m)` keeps reconstruction across many
+    /// stripes of the same shape cheap. Adapter clones share the
+    /// same cache.
+    fn get_or_build_rs_encoder(
+        &self,
+        k: u8,
+        m: u8,
+    ) -> Result<Arc<super::erasure::RsEncoder>, BlobError> {
+        // Fast path: lock + clone the Arc out.
+        if let Some(enc) = self.rs_encoder_cache.lock().get(&(k, m)).cloned() {
+            return Ok(enc);
+        }
+        // Build outside the lock — `RsEncoder::new`'s matrix
+        // construction is potentially expensive and we don't want
+        // to serialise concurrent builds for different (k, m)
+        // configurations.
+        let built = Arc::new(super::erasure::RsEncoder::new(
+            super::erasure::RsParams { k, m },
+        )?);
+        // Re-acquire and insert. If a concurrent caller built the
+        // same (k, m) first, prefer their entry (drop our local
+        // build) so the cache stays canonical.
+        let mut cache = self.rs_encoder_cache.lock();
+        Ok(cache.entry((k, m)).or_insert(built).clone())
+    }
+
     /// Internal: repair one stripe in isolation. Bumps the
     /// matching counter on `report` based on the outcome.
     async fn repair_stripe(
@@ -2591,7 +2631,7 @@ impl MeshBlobAdapter {
         // backend rejects, or reconstruct_data refusing because of
         // a malformed shard set). Treat as unrecoverable so a
         // single broken stripe doesn't abort the whole blob.
-        let encoder = match super::erasure::RsEncoder::new(super::erasure::RsParams { k, m }) {
+        let encoder = match self.get_or_build_rs_encoder(k, m) {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(
