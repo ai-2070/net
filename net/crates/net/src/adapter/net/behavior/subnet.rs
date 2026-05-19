@@ -47,51 +47,28 @@ impl SubnetId {
     }
 
     /// Parse a `subnet:<hex32>` capability-tag value into a
-    /// `SubnetId`. Returns `None` on:
-    /// - missing prefix,
-    /// - wrong hex length (must be exactly 32 chars),
-    /// - non-hex characters.
+    /// `SubnetId`. Returns `None` on missing prefix, wrong hex
+    /// length (must be exactly 32 chars), or non-hex characters.
     pub fn from_tag(tag: &str) -> Option<Self> {
         let hex_part = tag.strip_prefix(SUBNET_TAG_PREFIX)?;
-        if hex_part.len() != 32 {
-            return None;
-        }
         let mut out = [0u8; 16];
-        for (i, chunk) in hex_part.as_bytes().chunks(2).enumerate() {
-            let hi = hex_nibble(chunk[0])?;
-            let lo = hex_nibble(chunk[1])?;
-            out[i] = (hi << 4) | lo;
-        }
+        // `decode_to_slice` requires hex_part.len() == 2 *
+        // out.len() (=32) and only ASCII hex digits — both length
+        // and charset failures collapse to `Err`, mirroring the
+        // hand-rolled predecessor's reject set exactly.
+        hex::decode_to_slice(hex_part, &mut out).ok()?;
         Some(Self(out))
     }
 
     /// Render as the canonical `subnet:<hex32>` tag form.
     pub fn to_tag(self) -> String {
-        let mut s = String::with_capacity(SUBNET_TAG_PREFIX.len() + 32);
-        s.push_str(SUBNET_TAG_PREFIX);
-        for b in &self.0 {
-            use std::fmt::Write;
-            let _ = write!(s, "{:02x}", b);
-        }
-        s
+        format!("{SUBNET_TAG_PREFIX}{}", hex::encode(self.0))
     }
 }
 
 impl std::fmt::Display for SubnetId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for b in &self.0 {
-            write!(f, "{:02x}", b)?;
-        }
-        Ok(())
-    }
-}
-
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
+        f.write_str(&hex::encode(self.0))
     }
 }
 
