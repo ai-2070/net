@@ -5885,6 +5885,65 @@ mod tests {
         let _ = err; // any error is fine; assert we got one
     }
 
+    /// Tree depth-lengthening attack: a peer advertises a Tree
+    /// blob with `depth` ONE GREATER than the actual structure.
+    /// The walker traverses N-1 Internal nodes (where N is the
+    /// claim) and expects a Leaf at residual_depth=1 — but the
+    /// actual structure has Leaves at residual_depth=2 because
+    /// the real depth is N-1. B-3's Leaf-at-rd==1 check rejects
+    /// the structurally-shallower tree.
+    ///
+    /// This pins the symmetric case to B-3's depth-shortening
+    /// test (`fetch_range_tree_rejects_leaf_at_unexpected_residual_depth`)
+    /// and the cubic finding that suggested
+    /// `depth.saturating_sub(1)` (which would have broken
+    /// legitimate depth=1 trees).
+    #[tokio::test]
+    async fn fetch_range_tree_rejects_depth_advertised_one_greater_than_actual() {
+        let adapter = make_adapter();
+        let small_chunk: u32 = 1024;
+        // FANOUT + 1 chunks → genuine depth-2 tree (Internal root
+        // pointing at 2 Leaves).
+        let len = small_chunk as usize * (TREE_FANOUT + 1);
+        let payload = deterministic_bytes(0xCD, len);
+        let blob_ref = adapter
+            .store_stream_tree_internal(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                small_chunk,
+            )
+            .await
+            .unwrap();
+        assert_eq!(blob_ref.tree_depth(), Some(2), "real tree is depth=2");
+        let (uri, root_hash, total_size) = match &blob_ref {
+            BlobRef::Tree {
+                uri,
+                root_hash,
+                total_size,
+                ..
+            } => (uri.clone(), *root_hash, *total_size),
+            _ => panic!("expected Tree"),
+        };
+        // Forged BlobRef::Tree claiming depth=3 against the same
+        // real-depth-2 root. The walker traverses two Internal
+        // levels (residual_depth 3 → 2 → 1), then expects a Leaf
+        // at residual_depth=1 — but the actual tree has Leaves at
+        // the rd=2 step (one level shallower than claimed).
+        // B-3's Leaf-at-rd!=1 check catches this.
+        let forged =
+            BlobRef::tree(&uri, Encoding::Replicated, root_hash, total_size, 3).unwrap();
+        let err = adapter
+            .fetch_range(&forged, 0..total_size)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Leaf at residual_depth=")
+                && msg.contains("disagrees with BlobRef::Tree.depth"),
+            "expected depth-disagreement decode error from Leaf-arm rejection; got: {msg}",
+        );
+    }
+
     /// fetch_range rejects requests larger than MAX_FETCH_RANGE_BYTES
     /// (1 GiB). v0.3 Tree blobs can address up to 128 PiB but
     /// returning a single Vec<u8> for a multi-GiB range would OOM
