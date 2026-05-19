@@ -1038,6 +1038,28 @@ impl PyDuplexStream {
 /// ``caller_origin`` (peer identity hash), ``call_id`` (substrate
 /// call id), ``deadline_ns`` (Unix-nanos absolute, 0 means
 /// "no deadline"), and ``headers`` (list of [name, bytes] tuples).
+///
+/// **Asyncio adapter.** The class is intentionally a sync
+/// iterator — ``__next__`` blocks the calling thread on
+/// ``runtime.block_on`` (with the GIL released). Asyncio
+/// consumers should bridge via ``asyncio.to_thread``:
+///
+/// ```python
+/// import asyncio
+///
+/// async def consume_stream(stream):
+///     # `asyncio.to_thread(next, stream, None)` runs the
+///     # blocking `next()` on the default executor's thread
+///     # pool and returns control to the event loop until a
+///     # chunk arrives. Once None comes back the stream is done.
+///     while (chunk := await asyncio.to_thread(next, stream, None)) is not None:
+///         handle(chunk)
+/// ```
+///
+/// This keeps the binding surface minimal (no pyo3-asyncio
+/// dependency, no async-method machinery) while still letting
+/// asyncio-native handlers drain the stream without blocking
+/// their event loop.
 #[pyclass(name = "RequestStreamRecv", module = "_net")]
 pub struct PyRequestStreamRecv {
     inner: Arc<Mutex<Option<InnerRequestStream>>>,
