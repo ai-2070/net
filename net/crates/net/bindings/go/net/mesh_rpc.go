@@ -1785,12 +1785,20 @@ func (s *DuplexStream) finalize() { s.Close() }
 // be retained past the callback.
 type RequestStreamRecv struct {
 	handle *C.RpcRequestStreamHandleC
+	// invalidated is flipped to 1 by the trampoline after the
+	// handler returns; Recv checks it before any cgo call so a
+	// user goroutine that captures the wrapper past the callback
+	// returns ErrStreamDone instead of dereferencing a freed C
+	// handle. Use atomic.Int32 — the Go runtime guarantees
+	// happens-before between the trampoline's Store and the
+	// reader's Load.
+	invalidated atomic.Int32
 }
 
 // Recv blocks until the next inbound chunk arrives. Returns
 // ErrStreamDone on caller-side REQUEST_END or CANCEL.
 func (r *RequestStreamRecv) Recv() ([]byte, error) {
-	if r == nil || r.handle == nil {
+	if r == nil || r.handle == nil || r.invalidated.Load() != 0 {
 		return nil, ErrStreamDone
 	}
 	var outChunk *C.uint8_t
@@ -1821,6 +1829,10 @@ func (r *RequestStreamRecv) Recv() ([]byte, error) {
 // lifetime contract as *RequestStreamRecv.
 type ResponseSinkSend struct {
 	handle *C.RpcResponseSinkHandleC
+	// Same invalidation gate as RequestStreamRecv: flipped after
+	// the handler returns so a goroutine that captures the sink
+	// can't UAF on the freed C handle.
+	invalidated atomic.Int32
 }
 
 // Send emits one response chunk. Non-blocking — the SDK's
@@ -1828,7 +1840,7 @@ type ResponseSinkSend struct {
 // only if the sink has already been torn down (caller cancelled
 // mid-stream).
 func (s *ResponseSinkSend) Send(body []byte) error {
-	if s == nil || s.handle == nil {
+	if s == nil || s.handle == nil || s.invalidated.Load() != 0 {
 		return ErrStreamDone
 	}
 	cBody, freeBody := bytesToCBytes(body)
@@ -1899,6 +1911,11 @@ func go_net_rpc_client_streaming_trampoline(
 	}
 	stream := &RequestStreamRecv{handle: requestStream}
 	resp, err := safeCallClientStreamingHandler(handler, stream)
+	// Invalidate the wrapper BEFORE returning to Rust — anything
+	// the handler captured into a goroutine will now see
+	// ErrStreamDone on Recv instead of dereferencing the C handle
+	// that Rust is about to free.
+	stream.invalidated.Store(1)
 	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1
@@ -1947,7 +1964,14 @@ func go_net_rpc_duplex_trampoline(
 	}
 	stream := &RequestStreamRecv{handle: requestStream}
 	sink := &ResponseSinkSend{handle: responseSink}
-	if err := safeCallDuplexHandler(handler, stream, sink); err != nil {
+	err := safeCallDuplexHandler(handler, stream, sink)
+	// Invalidate BOTH wrappers before returning — Rust is about
+	// to free the underlying handles, and any goroutine the
+	// handler spawned that captured them must see ErrStreamDone
+	// on subsequent Recv / Send instead of UAF.
+	stream.invalidated.Store(1)
+	sink.invalidated.Store(1)
+	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1
 	}
