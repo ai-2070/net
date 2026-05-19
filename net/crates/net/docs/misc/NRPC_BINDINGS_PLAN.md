@@ -19,12 +19,12 @@ The C target is the C ABI exported by `bindings/go/rpc-ffi/` and declared in `ne
 
 | Binding | Unary | Server-streaming | Client-streaming | Duplex |
 |---|---|---|---|---|
-| Node (`bindings/node/src/mesh_rpc.rs`) | ✅ | ✅ | ❌ | ❌ |
-| Python (`bindings/python/src/mesh_rpc.rs`) | ✅ | ✅ | ❌ | ❌ |
-| Go (`bindings/go/rpc-ffi/src/lib.rs` + idiomatic Go wrapper) | ✅ | ✅ | ❌ | ❌ |
-| C ABI (`include/net_rpc.h` — current `NET_RPC_ABI_VERSION = 0x0001`) | ✅ | ✅ | ❌ | ❌ |
+| Node (`bindings/node/src/mesh_rpc.rs`) | ✅ | ✅ | ✅ | ✅ |
+| Python (`bindings/python/src/mesh_rpc.rs`) | ✅ | ✅ | ✅ | ✅ |
+| Go (`bindings/go/rpc-ffi/src/lib.rs` + idiomatic Go wrapper) | ✅ | ✅ | ✅ | ✅ |
+| C ABI (`include/net_rpc.h` — `NET_RPC_ABI_VERSION = 0x0002`) | ✅ | ✅ | ✅ | ✅ |
 
-Phase 1 of this plan (B1–B7 below) brought unary + server-streaming online across all four targets. Phase 2 (B8–B12 below) adds client-streaming + duplex now that the wire contract has shipped in the Rust SDK.
+Phase 1 of this plan (B1–B7 below) brought unary + server-streaming online across all four targets. Phase 2 (B8–B12 below) added client-streaming + duplex; the C ABI version was bumped to `0x0002` and the cross-binding compat fixture (`tests/cross_lang_nrpc/golden_vectors_streaming.json`) pins the streaming wire contract.
 
 ## Goal & scope
 
@@ -313,7 +313,7 @@ Cross-binding test matrix (B7):
 
 3. **Go context cancellation propagation** — when `ctx` cancels mid-stream, Rust's `RpcStream::Drop` already fires CANCEL. The Go binding's job is just "watcher goroutine that calls `net_rpc_stream_close` when `ctx.Done()` fires." Pin the watcher goroutine's lifetime to the stream's `Close()` to avoid leaking goroutines past stream lifetime.
 
-4. **C ABI version-stamping** — RESOLVED. `net_rpc_abi_version() -> u32` constant + `NET_RPC_ABI_VERSION` macro shipped in `net_rpc.h` at version `0x0001` for the unary + server-streaming surface. Bumps to `0x0002` when Phase 2 (B8 below) lands the client-streaming + duplex extensions; consumers MUST check the runtime constant against their compile-time expectation before opening calls that use the new shapes.
+4. **C ABI version-stamping** — RESOLVED. `net_rpc_abi_version() -> u32` constant + `NET_RPC_ABI_VERSION` macro now at `0x0002` in `net_rpc.h`, covering unary + server-streaming + client-streaming + duplex. Consumers compiled against `0x0001` SHALL NOT call the client-streaming/duplex functions; a runtime check via `net_rpc_abi_version()` is the supported way to gate.
 
 ## Out of scope (carry-forward from NRPC_DESIGN.md)
 
@@ -330,7 +330,7 @@ The wire contract is locked. Each binding's work is purely "expose the new surfa
 
 **File:** `net/crates/net/bindings/go/rpc-ffi/src/lib.rs` (Rust source); `net/crates/net/include/net_rpc.h` (hand-written declarations).
 
-**ABI bump:** `NET_RPC_ABI_VERSION` rises from `0x0001` to `0x0002`. Consumers compiled against `0x0001` SHALL NOT call the new functions; a runtime check via `net_rpc_abi_version()` is the supported way to gate.
+**ABI bump:** `NET_RPC_ABI_VERSION` has been raised from `0x0001` to `0x0002` (shipped in `net_rpc.h`). Consumers compiled against `0x0001` SHALL NOT call the new functions; a runtime check via `net_rpc_abi_version()` is the supported way to gate.
 
 **New opaque handle types:**
 

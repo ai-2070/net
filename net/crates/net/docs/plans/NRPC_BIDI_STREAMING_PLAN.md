@@ -41,20 +41,22 @@ Existing Phase 3 prerequisites that this plan composes against (no rework needed
 
 ## Goal & scope
 
-Add three surfaces that together close the streaming matrix:
+This plan was the design + delivery record for closing the streaming matrix
+with three new surfaces. All four shipped behind the substrate/veneer split
+described below:
 
-1. **`Mesh::call_client_stream_typed<Req, Resp>(target, service, opts) -> ClientStreamCall<Req, Resp>`** — caller-side primitive: push N `Req`s into a sink, then await one terminal `Resp`. Direct routing only; capability-based variant follows the existing `_service_` naming.
+1. **`Mesh::call_client_stream_typed<Req, Resp>(target, service, opts) -> ClientStreamCallTyped<Req, Resp>`** — caller-side primitive: push N `Req`s into a sink, then await one terminal `Resp`. Direct routing only; capability-based variant follows the existing `_service_` naming.
 2. **`Mesh::serve_rpc_client_stream_typed<Req, Resp, F, Fut>(service, codec, handler)`** — server-side handler shape: receives a `RequestStreamTyped<Req>` (futures::Stream), returns one `Resp`. Mirrors the streaming-response handler shape.
-3. **`Mesh::call_duplex_typed<Req, Resp>(target, service, opts) -> DuplexCall<Req, Resp>`** — full duplex: caller has both a `RequestSink<Req>` and a `RpcStreamTyped<Resp>`, can interleave freely.
+3. **`Mesh::call_duplex_typed<Req, Resp>(target, service, opts) -> DuplexCallTyped<Req, Resp>`** — full duplex: caller has both a `DuplexSinkTyped<Req>` and a `DuplexStreamTyped<Resp>`, can interleave freely.
 4. **`Mesh::serve_rpc_duplex_typed<Req, Resp, F, Fut>(service, codec, handler)`** — server-side full duplex: handler receives `(RequestStreamTyped<Req>, ResponseSinkTyped<Resp>)`.
 
 In every case the **rust-channel abstraction** (mpsc-style sender + receiver wrapped in `futures::Sink` / `futures::Stream`) is the application-facing API, NOT a literal `Mesh::publish` channel. The channel layer's pub/sub is a transport detail, same as it is today for server-streaming responses.
 
-Out of scope:
+Out of scope (still deferred, follow-up tracking elsewhere):
 
 - Schema-validated payloads / IDL codegen — deferred (matches NRPC_BINDINGS_PLAN.md stance).
-- Non-typed raw-bytes variants for duplex / client-streaming — will exist as the substrate the typed wrappers compose on, but won't get first-class SDK ergonomics in v1.
-- Cross-language binding support (Node / Python / Go) — separate plan; this plan ships Rust SDK + wire format only.
+- Non-typed raw-bytes variants for duplex / client-streaming — exist as the substrate the typed wrappers compose on, but didn't get first-class SDK ergonomics in v1.
+- Cross-language binding support — this plan shipped Rust SDK + wire format only; Node/Python/Go/C parity tracked in `NRPC_BINDINGS_PLAN.md` Phase 2 (B8–B12, also shipped).
 
 ## Architecture: substrate + veneer
 
