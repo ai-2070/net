@@ -297,6 +297,16 @@ const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
 const JS_APP_ERROR_PREFIX: &str = "nrpc:app_error:";
 
 /// Parse a JS-thrown `nrpc:app_error:0x<code>:<body>` message
+/// Convert an owned napi `Buffer` into `bytes::Bytes` without
+/// an extra copy. napi-rs 3.x backs `Buffer` with an `Arc<Vec<u8>>`
+/// internally; `Bytes::from_owner` takes ownership of the Buffer
+/// (preserving the Arc clone) so the resulting `Bytes` borrows the
+/// same allocation. Replaces the previous `Bytes::copy_from_slice`
+/// pattern that paid a per-chunk memcpy at the JS↔Rust boundary.
+fn napi_buffer_to_bytes(buf: Buffer) -> Bytes {
+    Bytes::from_owner(buf)
+}
+
 /// into the (code, body) pair the SDK expects for
 /// `RpcHandlerError::Application`. Returns `None` if the prefix
 /// is absent or the format is malformed (caller falls through to
@@ -603,7 +613,7 @@ impl ClientStreamCall {
         let call = guard
             .as_mut()
             .ok_or_else(|| nrpc_err("stream_closed", "client-stream call already closed"))?;
-        call.send(Bytes::copy_from_slice(body.as_ref()))
+        call.send(napi_buffer_to_bytes(body))
             .await
             .map_err(nrpc_err_from_inner)
     }
@@ -677,7 +687,7 @@ impl DuplexCall {
         let call = guard
             .as_mut()
             .ok_or_else(|| nrpc_err("stream_closed", "duplex call already closed"))?;
-        call.send(Bytes::copy_from_slice(body.as_ref()))
+        call.send(napi_buffer_to_bytes(body))
             .await
             .map_err(nrpc_err_from_inner)
     }
@@ -786,7 +796,7 @@ impl DuplexSink {
         let sink = guard
             .as_mut()
             .ok_or_else(|| nrpc_err("stream_closed", "duplex sink already closed"))?;
-        sink.send(Bytes::copy_from_slice(body.as_ref()))
+        sink.send(napi_buffer_to_bytes(body))
             .await
             .map_err(nrpc_err_from_inner)
     }
@@ -976,7 +986,7 @@ impl JsResponseSink {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match guard.as_ref() {
             Some(sink) => {
-                sink.send(Bytes::copy_from_slice(body.as_ref()));
+                sink.send(napi_buffer_to_bytes(body));
                 true
             }
             None => false,
