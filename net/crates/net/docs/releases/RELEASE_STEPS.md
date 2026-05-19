@@ -2,13 +2,15 @@
 
 1. Update version
 
-2. Merge version branch
+2. Update codename
 
-3. Draft release note
+3. Merge version branch
 
-4. Pull master
+4. Draft release note
 
-5. Run commands
+5. Pull master
+
+6. Run commands
 
 ```bash
 # Main release
