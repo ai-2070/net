@@ -2458,19 +2458,17 @@ impl MeshNode {
         // within their own surface.
         let started_total = Instant::now();
         let request_bytes_len = payload.len() as u32;
-        let request_channel =
-            ChannelName::new(&format!("{service}.requests")).map_err(|e| RpcError::NoRoute {
+        // Per-service route cache: one `DashMap::get(&str)` +
+        // `Arc::clone` on the hot path instead of 2 `format!` +
+        // 2 `ChannelName::new` + xxhash per call (T1.3 perf audit
+        // — `docs/misc/PERF_AUDIT_2026_05_19_NRPC.md`).
+        let route = self
+            .rpc_route_for_service(service)
+            .map_err(|reason| RpcError::NoRoute {
                 target: target_node_id,
-                reason: format!("invalid service name: {e}"),
+                reason,
             })?;
         let self_origin = self.identity_origin_hash();
-        let reply_channel_name = format!("{service}.replies.{self_origin:016x}");
-        let reply_channel =
-            ChannelName::new(&reply_channel_name).map_err(|e| RpcError::NoRoute {
-                target: target_node_id,
-                reason: format!("invalid reply channel name: {e}"),
-            })?;
-        let reply_hash = reply_channel.hash();
 
         // Caller-side metrics guard. Bumps `in_flight` immediately;
         // each early-return path calls `metrics_guard.record(...)`
@@ -2483,8 +2481,16 @@ impl MeshNode {
         let mut metrics_guard = CallMetricsGuard::new(metrics_registry.for_service(service));
 
         // Lazy reply-channel subscription. Once per (target, service).
+        // Reply channel + hash come from the cached `RpcRoute`; we
+        // only `.clone()` the `ChannelName` (cheap — internally an
+        // Arc<str>) instead of building it from scratch.
         if let Err(e) = self
-            .ensure_reply_subscription(target_node_id, service, reply_channel.clone(), reply_hash)
+            .ensure_reply_subscription(
+                target_node_id,
+                service,
+                route.reply_channel.clone(),
+                route.reply_hash,
+            )
             .await
         {
             metrics_guard.record(CallOutcome::NoRoute);
@@ -2557,15 +2563,14 @@ impl MeshNode {
         // hook (channel_hash is stamped on the wire by
         // publish_to_peer).
         let started = Instant::now();
-        let request_channel_id = ChannelId::new(request_channel.clone());
-        let request_channel_hash = request_channel_id.hash();
-        let stream_id = MeshNode::publish_stream_id(&request_channel_id);
+        // Request channel hash + stream_id come from the cached
+        // route — no `ChannelId::new` clone + xxhash per call.
         let payload_bytes = Bytes::from(buf);
         if let Err(e) = self
             .publish_to_peer(
                 target_node_id,
-                request_channel_hash,
-                stream_id,
+                route.request_channel_hash,
+                route.request_stream_id,
                 /* reliable */ true,
                 std::slice::from_ref(&payload_bytes),
             )
@@ -2612,7 +2617,7 @@ impl MeshNode {
             pending: Arc::clone(&pending),
             mesh: Arc::clone(self),
             target_node_id,
-            request_channel: request_channel.clone(),
+            request_channel: route.request_channel.clone(),
             self_origin,
             call_id,
             completed: false,

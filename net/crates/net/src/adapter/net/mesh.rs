@@ -921,6 +921,40 @@ fn subscriber_origin_hash(node_id: u64) -> u64 {
     node_id
 }
 
+/// Per-service nRPC routing primitives, cached on `MeshNode` to
+/// avoid the per-call `format!` + `ChannelName::new` + xxhash
+/// derivation on every `Mesh::call` / `_streaming` / `_typed`.
+///
+/// Both the request channel (`<service>.requests`) and the reply
+/// channel (`<service>.replies.<self_origin>`) are deterministic
+/// functions of `service` (the reply channel additionally depends
+/// on the node's own `self_origin`, which is constant for the
+/// node's lifetime). Computing them once per service and reusing
+/// the `Arc<RpcRoute>` saves ~5 allocations and ~2 µs per call.
+///
+/// Constructed lazily on first lookup via
+/// `MeshNode::rpc_route_for_service`; held in the
+/// `rpc_route_cache: DashMap<String, Arc<RpcRoute>>` field.
+#[cfg(feature = "cortex")]
+pub(super) struct RpcRoute {
+    /// `<service>.requests` channel name. Held for the `CANCEL`
+    /// emission path (`UnaryCallGuard` needs the name to construct
+    /// the cancel publisher).
+    pub request_channel: ChannelName,
+    /// `ChannelId::new(request_channel.clone()).hash()` —
+    /// pre-computed so the publish path doesn't re-hash.
+    pub request_channel_hash: ChannelHash,
+    /// `MeshNode::publish_stream_id(&request_channel_id)` —
+    /// pre-derived stream id for per-channel ordering within a
+    /// session.
+    pub request_stream_id: u64,
+    /// `<service>.replies.<self_origin:016x>` channel name.
+    pub reply_channel: ChannelName,
+    /// `reply_channel.hash()` — pre-computed for the reply
+    /// subscription check.
+    pub reply_hash: ChannelHash,
+}
+
 /// Replace a zero `Duration` with a 1 s floor.
 /// `tokio::time::interval` panics on a zero period; this is the
 /// guard every `spawn_*_loop` call site applies before handing the
@@ -1233,6 +1267,19 @@ pub struct MeshNode {
     /// Prometheus exposure or custom observability.
     #[cfg(feature = "cortex")]
     rpc_metrics: Arc<crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry>,
+    /// Per-service nRPC route cache. Each entry holds the
+    /// pre-computed `ChannelName` / `ChannelId` / `ChannelHash` /
+    /// `stream_id` for both the request channel
+    /// (`<service>.requests`) and the reply channel
+    /// (`<service>.replies.<self_origin>`). Both are functions of
+    /// `service` (and the node's constant `self_origin` for the
+    /// reply side), so the build cost — 2 `format!` + 2
+    /// `ChannelName::new` + 2 xxhash + `publish_stream_id`
+    /// derivation — only pays on the first call per service.
+    /// Subsequent calls do one `DashMap::get(&str)` + `Arc::clone`,
+    /// saving ~5 allocations per `Mesh::call`.
+    #[cfg(feature = "cortex")]
+    rpc_route_cache: Arc<DashMap<String, Arc<RpcRoute>>>,
     /// Optional caller-side nRPC observer. Fired from `Mesh::call`
     /// on each call boundary (success / server-error / timeout /
     /// transport error). `Arc<ArcSwapOption<...>>` so a hot-path
@@ -1751,6 +1798,8 @@ impl MeshNode {
             rpc_local_services: Arc::new(dashmap::DashSet::new()),
             #[cfg(feature = "cortex")]
             rpc_metrics: Arc::new(crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry::new()),
+            #[cfg(feature = "cortex")]
+            rpc_route_cache: Arc::new(DashMap::new()),
             #[cfg(feature = "cortex")]
             rpc_observer: Arc::new(ArcSwapOption::empty()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
@@ -4729,6 +4778,52 @@ impl MeshNode {
     #[cfg(feature = "cortex")]
     pub(super) fn public_key_origin_hash(&self) -> u64 {
         self.identity.entity_id().origin_hash()
+    }
+
+    /// Per-service nRPC route lookup with lazy build.
+    ///
+    /// Hot path: one `DashMap::get(&str)` + `Arc::clone` — no
+    /// allocations on the cached-hit case.
+    ///
+    /// Cold path (first call per service): runs `format!` ×2 +
+    /// `ChannelName::new` ×2 (which validates the name) +
+    /// `ChannelId::new` + `publish_stream_id` derivation, then
+    /// inserts the `Arc<RpcRoute>` into the cache. Returns
+    /// `Err(reason)` if either channel name fails validation
+    /// (caller maps to `RpcError::NoRoute`).
+    ///
+    /// Service names are constant strings in practice (one
+    /// `nrpc:<service>` registration per service for the node's
+    /// lifetime), so cache size is bounded by the number of
+    /// distinct services this node ever calls.
+    #[cfg(feature = "cortex")]
+    pub(super) fn rpc_route_for_service(&self, service: &str) -> Result<Arc<RpcRoute>, String> {
+        if let Some(r) = self.rpc_route_cache.get(service) {
+            return Ok(Arc::clone(r.value()));
+        }
+        // Cold path — build and insert.
+        let request_channel = ChannelName::new(&format!("{service}.requests"))
+            .map_err(|e| format!("invalid service name: {e}"))?;
+        let request_channel_id = ChannelId::new(request_channel.clone());
+        let request_channel_hash = request_channel_id.hash();
+        let request_stream_id = Self::publish_stream_id(&request_channel_id);
+        let self_origin = self.public_key_origin_hash();
+        let reply_channel = ChannelName::new(&format!("{service}.replies.{self_origin:016x}"))
+            .map_err(|e| format!("invalid reply channel name: {e}"))?;
+        let reply_hash = reply_channel.hash();
+        let route = Arc::new(RpcRoute {
+            request_channel,
+            request_channel_hash,
+            request_stream_id,
+            reply_channel,
+            reply_hash,
+        });
+        // `entry().or_insert_with` would also work; we just lost a
+        // race if some other thread populated meanwhile — both
+        // routes encode the same bytes, so either Arc is correct.
+        self.rpc_route_cache
+            .insert(service.to_string(), Arc::clone(&route));
+        Ok(route)
     }
 
     /// Registry of nRPC services this node currently serves.
