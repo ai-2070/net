@@ -1,0 +1,45 @@
+net/crates/net/src/adapter/net/redex/replication_budget.rs
+  s_2571835e05521c::t_6c69a1e2fe1bac 202
+net/crates/net/sdk/src/testing/cluster.rs
+  s_2571835e05521c::t_7e524cc0c1bc24 644
+net/crates/net/deck/src/demo/spawn.rs
+  s_2571835e05521c::t_57b9ccd9109a50 12,66,74,84-85,91
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  s_2571835e05521c::t_7f3298647d8914 1115
+  s_2571835e05521c::t_69504a0ee67db6 1532
+net/crates/net/src/adapter/net/redex/mod.rs
+  s_2571835e05521c::t_27c2556ce6cf4d 64
+  s_2571835e05521c::t_e8579c6dd043da 73-75
+  s_2571835e05521c::t_6c47521d07a329 66
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_2571835e05521c::t_70ebc585da8212 1037
+net/crates/net/src/adapter/net/dataforts/blob/blob_tree.rs
+  s_2571835e05521c::t_095fce5f12fe43 20
+  s_2571835e05521c::t_cc9299dc611863 205
+  s_2571835e05521c::t_e42f644e68d798 35,38-40
+net/crates/net/src/adapter/net/dataforts/blob/erasure.rs
+  s_2571835e05521c::t_1e624788c92813 5
+net/crates/net/src/adapter/net/dataforts/blob/blob_tree_cache.rs
+  s_2571835e05521c::t_200c997d10109b 94
+  s_2571835e05521c::t_a48b3e775e7fd9 4
+net/crates/net/deck/src/demo/migrator.rs
+  s_2571835e05521c::t_ba26902d152368 5
+net/crates/net/src/adapter/net/redex/replication_runtime.rs
+  s_2571835e05521c::t_212d25dfcc5a11 263
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "062b0f5c91e424afd55e68daf3d5bcbb99f1428a",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
