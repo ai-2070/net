@@ -54,7 +54,9 @@ use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 
 use ::net::adapter::net::cortex::{
-    RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+    RequestStream as InnerRequestStream, RpcClientStreamingHandler, RpcContext, RpcDuplexHandler,
+    RpcHandler, RpcHandlerError, RpcResponsePayload,
+    RpcResponseSink as InnerRpcResponseSink, RpcStatus, RpcStreamingContext,
 };
 use ::net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
@@ -997,6 +999,237 @@ impl PyDuplexStream {
     }
 }
 
+// ============================================================================
+// ABI 0x0002 — Server-side handler primitives (Phase B10-2).
+//
+// PyRequestStreamRecv wraps the SDK's RequestStream and is
+// handed to Python handlers as a Python iterator over inbound
+// chunk bodies. PyResponseSinkSend wraps RpcResponseSink for
+// duplex handlers.
+//
+// Python handler signatures:
+//
+//   # Client-streaming
+//   def handler(stream):
+//       total = 0
+//       for chunk in stream:
+//           total += len(chunk)
+//       return total.to_bytes(8, "little")
+//
+//   # Duplex
+//   def handler(stream, sink):
+//       for chunk in stream:
+//           sink.send(b"echo:" + chunk)
+//
+// Lifetime: bounded by the handler callback. The SDK's
+// underlying RequestStream / RpcResponseSink are taken into
+// these wrappers at handler dispatch and dropped when the
+// wrappers are dropped (which happens when Python releases its
+// references after the handler returns).
+// ============================================================================
+
+/// Inbound request-stream iterable for client-streaming + duplex
+/// server handlers. Use the Python iter protocol:
+/// ``for chunk in stream: ...`` or explicit ``next(stream)``.
+/// Raises ``StopIteration`` on EOF (REQUEST_END / CANCEL).
+#[pyclass(name = "RequestStreamRecv", module = "_net")]
+pub struct PyRequestStreamRecv {
+    inner: Arc<Mutex<Option<InnerRequestStream>>>,
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyRequestStreamRecv {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let result: Option<Bytes> = py.detach(|| {
+            runtime.block_on(async move {
+                let mut stream = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(s) => s,
+                    None => return None,
+                };
+                use futures::StreamExt;
+                let next = stream.next().await;
+                match next {
+                    Some(bytes) => {
+                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(stream);
+                        Some(bytes)
+                    }
+                    None => {
+                        drop(stream);
+                        None
+                    }
+                }
+            })
+        });
+        match result {
+            Some(bytes) => Ok(PyBytes::new(py, &bytes)),
+            None => Err(pyo3::exceptions::PyStopIteration::new_err(())),
+        }
+    }
+}
+
+/// Outbound response sink for duplex handlers. Emit chunks via
+/// ``sink.send(bytes)``. Non-blocking (SDK try_send under the
+/// hood); returns ``True`` on success, ``False`` if the sink
+/// was already torn down.
+#[pyclass(name = "ResponseSinkSend", module = "_net")]
+pub struct PyResponseSinkSend {
+    inner: Arc<Mutex<Option<InnerRpcResponseSink>>>,
+}
+
+#[pymethods]
+impl PyResponseSinkSend {
+    /// Emit one chunk. Returns ``True`` on success.
+    fn send<'py>(&self, body: &Bound<'py, PyBytes>) -> bool {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.as_ref() {
+            Some(sink) => {
+                sink.send(Bytes::copy_from_slice(body.as_bytes()));
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// `RpcClientStreamingHandler` impl bridging to a Python
+/// callable.
+struct PyRpcClientStreamingHandler {
+    callable: Py<PyAny>,
+    timeout: Duration,
+    runtime: Arc<Runtime>,
+}
+
+#[async_trait::async_trait]
+impl RpcClientStreamingHandler for PyRpcClientStreamingHandler {
+    async fn call(
+        &self,
+        _ctx: RpcStreamingContext,
+        requests: InnerRequestStream,
+    ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
+        let callable = Python::attach(|py| self.callable.clone_ref(py));
+        let runtime = self.runtime.clone();
+        let stream_inner = Arc::new(Mutex::new(Some(requests)));
+        let result = tokio::time::timeout(
+            self.timeout,
+            tokio::task::spawn_blocking(move || -> Result<HandlerOutcome, String> {
+                Python::attach(|py| -> Result<HandlerOutcome, String> {
+                    let stream_obj = Py::new(
+                        py,
+                        PyRequestStreamRecv {
+                            inner: stream_inner,
+                            runtime,
+                        },
+                    )
+                    .map_err(|e| format!("failed to build request stream: {e}"))?;
+                    let args = PyTuple::new(py, [stream_obj.into_any()])
+                        .map_err(|e| format!("failed to build args: {e}"))?;
+                    match callable.call1(py, args) {
+                        Ok(ret) => {
+                            let bound = ret.into_bound(py);
+                            let bytes_vec: Vec<u8> = bound.extract().map_err(|e| {
+                                format!("Python client-streaming handler must return bytes: {e}")
+                            })?;
+                            Ok(HandlerOutcome::Ok(bytes_vec))
+                        }
+                        Err(pyerr) => {
+                            if let Some((code, body)) = extract_app_error(py, &pyerr) {
+                                Ok(HandlerOutcome::AppError { code, body })
+                            } else {
+                                Err(format!("Python client-streaming handler raised: {pyerr}"))
+                            }
+                        }
+                    }
+                })
+            }),
+        )
+        .await;
+        match result {
+            Ok(Ok(Ok(HandlerOutcome::Ok(body)))) => Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body,
+            }),
+            Ok(Ok(Ok(HandlerOutcome::AppError { code, body }))) => {
+                Err(RpcHandlerError::Application {
+                    code,
+                    message: String::from_utf8_lossy(&body).into_owned(),
+                })
+            }
+            Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
+            Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
+                "spawn_blocking task panicked: {join_err}"
+            ))),
+            Err(_) => Err(RpcHandlerError::Internal(format!(
+                "Python client-streaming handler did not respond within {} ms",
+                self.timeout.as_millis()
+            ))),
+        }
+    }
+}
+
+/// `RpcDuplexHandler` impl bridging to a Python callable.
+struct PyRpcDuplexHandler {
+    callable: Py<PyAny>,
+    timeout: Duration,
+    runtime: Arc<Runtime>,
+}
+
+#[async_trait::async_trait]
+impl RpcDuplexHandler for PyRpcDuplexHandler {
+    async fn call(
+        &self,
+        _ctx: RpcStreamingContext,
+        requests: InnerRequestStream,
+        responses: InnerRpcResponseSink,
+    ) -> std::result::Result<(), RpcHandlerError> {
+        let callable = Python::attach(|py| self.callable.clone_ref(py));
+        let runtime = self.runtime.clone();
+        let stream_inner = Arc::new(Mutex::new(Some(requests)));
+        let sink_inner = Arc::new(Mutex::new(Some(responses)));
+        let result = tokio::time::timeout(
+            self.timeout,
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                Python::attach(|py| -> Result<(), String> {
+                    let stream_obj = Py::new(
+                        py,
+                        PyRequestStreamRecv {
+                            inner: stream_inner,
+                            runtime,
+                        },
+                    )
+                    .map_err(|e| format!("failed to build request stream: {e}"))?;
+                    let sink_obj = Py::new(py, PyResponseSinkSend { inner: sink_inner })
+                        .map_err(|e| format!("failed to build response sink: {e}"))?;
+                    let args = PyTuple::new(py, [stream_obj.into_any(), sink_obj.into_any()])
+                        .map_err(|e| format!("failed to build args: {e}"))?;
+                    match callable.call1(py, args) {
+                        Ok(_) => Ok(()),
+                        Err(pyerr) => Err(format!("Python duplex handler raised: {pyerr}")),
+                    }
+                })
+            }),
+        )
+        .await;
+        match result {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
+            Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
+                "spawn_blocking task panicked: {join_err}"
+            ))),
+            Err(_) => Err(RpcHandlerError::Internal(format!(
+                "Python duplex handler did not respond within {} ms",
+                self.timeout.as_millis()
+            ))),
+        }
+    }
+}
+
 /// Sentinel for the abort path of `block_until_cancellable`. The
 /// caller maps this to ``RpcCancelledError`` after re-acquiring
 /// the GIL.
@@ -1287,6 +1520,68 @@ impl PyMeshRpc {
             runtime: self.runtime.clone(),
             call_id_cached: call_id,
             flow_controlled_cached: flow_controlled,
+        })
+    }
+
+    /// Register a Python client-streaming handler on ``service``.
+    /// ``handler`` must be callable as
+    /// ``handler(stream: RequestStreamRecv) -> bytes``. Iterate
+    /// ``stream`` to drain inbound chunks; return ``bytes`` as the
+    /// terminal response.
+    #[pyo3(signature = (service, handler, handler_timeout_ms=None))]
+    fn serve_client_stream(
+        &self,
+        service: String,
+        handler: Py<PyAny>,
+        handler_timeout_ms: Option<u64>,
+    ) -> PyResult<PyServeHandle> {
+        let timeout = match handler_timeout_ms {
+            Some(0) => Duration::from_secs(u64::MAX / 1000),
+            Some(ms) => Duration::from_millis(ms),
+            None => DEFAULT_HANDLER_TIMEOUT,
+        };
+        let rust_handler = Arc::new(PyRpcClientStreamingHandler {
+            callable: handler,
+            timeout,
+            runtime: self.runtime.clone(),
+        });
+        let inner = self
+            .node
+            .serve_rpc_client_stream(&service, rust_handler)
+            .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
+        Ok(PyServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        })
+    }
+
+    /// Register a Python duplex handler on ``service``. ``handler``
+    /// must be callable as
+    /// ``handler(stream: RequestStreamRecv, sink: ResponseSinkSend) -> None``.
+    /// Drain ``stream`` for inbound chunks; emit response chunks
+    /// via ``sink.send(bytes)``.
+    #[pyo3(signature = (service, handler, handler_timeout_ms=None))]
+    fn serve_duplex(
+        &self,
+        service: String,
+        handler: Py<PyAny>,
+        handler_timeout_ms: Option<u64>,
+    ) -> PyResult<PyServeHandle> {
+        let timeout = match handler_timeout_ms {
+            Some(0) => Duration::from_secs(u64::MAX / 1000),
+            Some(ms) => Duration::from_millis(ms),
+            None => DEFAULT_HANDLER_TIMEOUT,
+        };
+        let rust_handler = Arc::new(PyRpcDuplexHandler {
+            callable: handler,
+            timeout,
+            runtime: self.runtime.clone(),
+        });
+        let inner = self
+            .node
+            .serve_rpc_duplex(&service, rust_handler)
+            .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
+        Ok(PyServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
         })
     }
 
