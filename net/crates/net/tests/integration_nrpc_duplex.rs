@@ -400,12 +400,14 @@ async fn duplex_cancel_from_caller_closes_both_halves() {
 async fn call_duplex_rejects_zero_request_window() {
     let caller = build_node().await;
     let target = 0xC0DE_u64;
-    let mut opts = CallOptions::default();
-    opts.request_window_initial = Some(0);
-    let err = caller
-        .call_duplex(target, "anything", opts)
-        .await
-        .expect_err("Some(0) must be rejected before any wire traffic");
+    let opts = CallOptions {
+        request_window_initial: Some(0),
+        ..CallOptions::default()
+    };
+    let err = match caller.call_duplex(target, "anything", opts).await {
+        Ok(_) => panic!("Some(0) must be rejected before any wire traffic"),
+        Err(e) => e,
+    };
     match err {
         RpcError::Codec { direction, message } => {
             assert_eq!(direction, CodecDirection::Encode);

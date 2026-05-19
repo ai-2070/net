@@ -417,12 +417,14 @@ async fn client_streaming_window_throttles_caller_send() {
 async fn call_client_stream_rejects_zero_request_window() {
     let caller = build_node().await;
     let target = 0xC0DE_u64;
-    let mut opts = CallOptions::default();
-    opts.request_window_initial = Some(0);
-    let err = caller
-        .call_client_stream(target, "anything", opts)
-        .await
-        .expect_err("Some(0) must be rejected before any wire traffic");
+    let opts = CallOptions {
+        request_window_initial: Some(0),
+        ..CallOptions::default()
+    };
+    let err = match caller.call_client_stream(target, "anything", opts).await {
+        Ok(_) => panic!("Some(0) must be rejected before any wire traffic"),
+        Err(e) => e,
+    };
     match err {
         RpcError::Codec { direction, message } => {
             assert_eq!(direction, CodecDirection::Encode);
@@ -437,12 +439,14 @@ async fn call_client_stream_rejects_zero_request_window() {
     // Sanity: Some(1) still works (or at least gets past the
     // validation — it'll later fail with NoRoute because no peer
     // is wired up; we only care that we passed the deadlock guard).
-    let mut opts = CallOptions::default();
-    opts.request_window_initial = Some(1);
-    let err = caller
-        .call_client_stream(target, "anything", opts)
-        .await
-        .expect_err("no peer is connected; must fail with NoRoute, not Codec");
+    let opts = CallOptions {
+        request_window_initial: Some(1),
+        ..CallOptions::default()
+    };
+    let err = match caller.call_client_stream(target, "anything", opts).await {
+        Ok(_) => panic!("no peer is connected; must fail with NoRoute, not Codec"),
+        Err(e) => e,
+    };
     assert!(
         !matches!(err, RpcError::Codec { .. }),
         "Some(1) must clear the deadlock guard; got {err:?}",
