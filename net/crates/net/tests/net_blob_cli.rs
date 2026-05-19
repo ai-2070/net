@@ -570,7 +570,7 @@ fn repair_subcommand_on_missing_root_exits_cleanly() {
 }
 
 #[test]
-fn verify_subcommand_on_missing_root_reports_missing_count() {
+fn verify_subcommand_on_missing_root_reports_root_unreachable() {
     let tmp = TempDir::new("verify-missing-root");
     // `--format` is a top-level flag (precedes the subcommand)
     // per the CLI's clap layout.
@@ -589,23 +589,34 @@ fn verify_subcommand_on_missing_root_reports_missing_count() {
         ])
         .output()
         .expect("spawn net-blob");
-    // verify treats a missing root as `missing: 1` rather than
-    // a hard error — the verify CLI's job is to count, not to
-    // panic on absence. Exit 2 signals the operator that
-    // something needs attention.
-    assert!(
-        !out.status.success(),
-        "verify with anything missing/corrupted must exit nonzero"
+    // verify must distinguish "could not verify, manifest gone"
+    // (exit 3, root_unreachable=true) from "verified, found
+    // problems" (exit 2, missing/corrupted > 0). Operator
+    // scripts route different remediation per code:
+    //   exit 3 → operator probably mis-supplied --depth or the
+    //            blob was deleted; do NOT auto-repair
+    //   exit 2 → chunks missing/corrupted; queue net-blob repair
+    let code = out.status.code();
+    assert_eq!(
+        code,
+        Some(3),
+        "missing root must exit 3 (root_unreachable), got exit {:?}",
+        code,
     );
     let stdout = stdout_string(&out);
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("verify --format json must emit valid JSON");
-    let missing = parsed["missing"].as_u64().expect("missing field");
-    assert!(
-        missing >= 1,
-        "missing root must be counted; got: {}",
-        stdout
+    assert_eq!(
+        parsed["root_unreachable"].as_bool(),
+        Some(true),
+        "missing root must surface root_unreachable=true; got: {}",
+        stdout,
     );
+    // healthy / missing / corrupted are all zero when the walk
+    // never starts.
+    assert_eq!(parsed["healthy"].as_u64(), Some(0));
+    assert_eq!(parsed["missing"].as_u64(), Some(0));
+    assert_eq!(parsed["corrupted"].as_u64(), Some(0));
 }
 
 #[test]

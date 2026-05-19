@@ -875,35 +875,56 @@ async fn cmd_verify(
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let blob_ref = build_tree_ref(hash_hex, size, depth)?;
     let root_hash = *blob_ref.tree_root_hash().expect("Tree built above");
+    // Probe the root explicitly so we can distinguish "could not
+    // verify, manifest gone" from "verified, found problems."
+    // Operator scripts grep for `root_unreachable` (human) or the
+    // bool field (JSON) to take different remediation paths —
+    // root_unreachable means the operator probably mis-supplied
+    // `--depth` or the blob was deleted; chunks-missing means
+    // run `repair`.
+    let root_unreachable = adapter.fetch_chunk(&root_hash).await.is_err();
     let mut healthy = 0u64;
     let mut missing = 0u64;
     let mut corrupted = 0u64;
-    verify_walk(
-        adapter,
-        root_hash,
-        &mut healthy,
-        &mut missing,
-        &mut corrupted,
-    )
-    .await?;
+    if !root_unreachable {
+        verify_walk(
+            adapter,
+            root_hash,
+            &mut healthy,
+            &mut missing,
+            &mut corrupted,
+        )
+        .await?;
+    }
     match fmt {
         OutputFormat::Human => {
             println!("verify: {}", hash_hex);
-            println!("  healthy:    {}", healthy);
-            println!("  missing:    {}", missing);
-            println!("  corrupted:  {}", corrupted);
+            if root_unreachable {
+                println!("  root_unreachable: true (cannot verify; manifest absent or wrong depth)");
+            } else {
+                println!("  healthy:    {}", healthy);
+                println!("  missing:    {}", missing);
+                println!("  corrupted:  {}", corrupted);
+            }
         }
         OutputFormat::Json => println!(
             "{}",
             serde_json::json!({
                 "hash": hash_hex,
+                "root_unreachable": root_unreachable,
                 "healthy": healthy,
                 "missing": missing,
                 "corrupted": corrupted,
             })
         ),
     }
-    if missing > 0 || corrupted > 0 {
+    // Exit code shape:
+    //   0 → verified clean
+    //   2 → verified, found problems (missing / corrupted chunks)
+    //   3 → could not verify (root unreachable)
+    if root_unreachable {
+        Ok(ExitCode::from(3))
+    } else if missing > 0 || corrupted > 0 {
         Ok(ExitCode::from(2))
     } else {
         Ok(ExitCode::SUCCESS)
