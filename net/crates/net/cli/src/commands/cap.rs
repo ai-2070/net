@@ -1,6 +1,6 @@
 //! `net cap (show|query|nodes|announce)` — capability advertisement
-//! + discovery from the local snapshot, plus offline compose-and-sign
-//! for v0.4 capability-auth (see `docs/plans/CAPABILITY_AUTH_PLAN.md`).
+//!   + discovery from the local snapshot, plus offline compose-and-sign
+//!   for v0.4 capability-auth (see `docs/plans/CAPABILITY_AUTH_PLAN.md`).
 //!
 //! `show` / `query` / `nodes` read `DeckClient::status()` and filter
 //! the snapshot's per-peer `capability_set`. `announce` builds a
@@ -341,10 +341,14 @@ fn parse_subnets(values: &[String]) -> Result<Vec<SubnetId>, CliError> {
     values
         .iter()
         .map(|v| {
-            let tag_form = if v.starts_with("subnet:") {
-                v.clone()
+            // Trim once at the top so trailing whitespace (e.g.
+            // from shell-pasted hex) behaves the same way it does
+            // on `--allow-node`, where `parse_node_id` also trims.
+            let trimmed = v.trim();
+            let tag_form = if trimmed.starts_with("subnet:") {
+                trimmed.to_string()
             } else {
-                format!("subnet:{v}")
+                format!("subnet:{trimmed}")
             };
             SubnetId::from_tag(&tag_form).ok_or_else(|| {
                 invalid_args(format!(
@@ -360,10 +364,12 @@ fn parse_groups(values: &[String]) -> Result<Vec<GroupId>, CliError> {
     values
         .iter()
         .map(|v| {
-            let tag_form = if v.starts_with("group:") {
-                v.clone()
+            // Symmetric with `parse_subnets` and `parse_node_id`.
+            let trimmed = v.trim();
+            let tag_form = if trimmed.starts_with("group:") {
+                trimmed.to_string()
             } else {
-                format!("group:{v}")
+                format!("group:{trimmed}")
             };
             GroupId::from_tag(&tag_form).ok_or_else(|| {
                 invalid_args(format!(

@@ -246,3 +246,56 @@ fn cap_announce_accepts_node_id_matching_signing_key() {
         .assert()
         .success();
 }
+
+/// `parse_node_id` trims leading/trailing whitespace before parsing
+/// hex, so `--allow-node " 0xDEADBEEF "` round-trips cleanly.
+/// `parse_subnets` / `parse_groups` carry the same normalization so
+/// a shell-pasted hex with trailing whitespace doesn't fail one
+/// flag while passing another. Three-axis test pins the contract
+/// across all three parsers.
+#[test]
+fn cap_announce_normalizes_whitespace_across_allow_list_parsers() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = generate_identity(&dir);
+    let out_path = dir.path().join("ann.json");
+
+    // Whitespace-padded inputs on all three allow-list axes.
+    let node_padded = "  0xCAFEF00D  ";
+    let subnet_padded = "   00112233445566778899aabbccddeeff   ";
+    let group_padded =
+        "   ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100   ";
+
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["cap", "announce"])
+        .arg("--key")
+        .arg(&key_path)
+        .args(["--tag", "nrpc:echo"])
+        .args(["--allow-node", node_padded])
+        .args(["--allow-subnet", subnet_padded])
+        .args(["--allow-group", group_padded])
+        .arg("--out")
+        .arg(&out_path)
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&out_path).unwrap();
+    let ann = CapabilityAnnouncement::from_bytes(&bytes).expect("decode wire bytes");
+    assert_eq!(ann.allowed_nodes, vec![0xCAFE_F00Du64]);
+    assert_eq!(
+        ann.allowed_subnets,
+        vec![CapabilitySubnetId::from_tag(&format!(
+            "subnet:{}",
+            subnet_padded.trim()
+        ))
+        .unwrap()]
+    );
+    assert_eq!(
+        ann.allowed_groups,
+        vec![CapabilityGroupId::from_tag(&format!(
+            "group:{}",
+            group_padded.trim()
+        ))
+        .unwrap()]
+    );
+}
