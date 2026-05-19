@@ -70,12 +70,6 @@ pub const BACKGROUND_HATCH_MAX_GRANT_FRACTION: f64 = 0.10;
 /// is now bounded.
 pub const REALTIME_MAX_GRANT_FRACTION: f64 = 0.50;
 
-/// Inert `background_fraction` used by the legacy
-/// [`BandwidthBudget::try_consume`] path. Foreground admission
-/// doesn't consult the value, so it's effectively unused; named
-/// so the call site in `try_consume` reads explicitly.
-const BACKGROUND_FRACTION_DEFAULT_FOR_FOREGROUND: f32 = 0.3;
-
 /// Token-bucket rate limiter scaled to a fraction of measured NIC
 /// peak. Caller mutates via [`Self::try_consume`]; refill is
 /// time-driven (passing the current `Instant` each call).
@@ -209,16 +203,12 @@ impl BandwidthBudget {
     /// trying to send a single event it can never afford.
     pub fn try_consume(&mut self, bytes: u64, now: Instant) -> bool {
         // Routes through the class-aware path with `Foreground`
-        // semantics + the default background_fraction (0.3). The
-        // class arg is ignored on the Foreground branch, so the
-        // value of `background_fraction` here is inert. Existing
-        // call sites stay backward-compatible without code change.
-        self.try_consume_with_class(
-            bytes,
-            BandwidthClass::Foreground,
-            now,
-            BACKGROUND_FRACTION_DEFAULT_FOR_FOREGROUND,
-        )
+        // semantics. The `background_fraction` argument is inert
+        // on the Foreground branch — the gate only consults the
+        // fraction for `Background` requests — so any value works
+        // here; `0.0` keeps the call site explicit. Existing call
+        // sites stay backward-compatible without code change.
+        self.try_consume_with_class(bytes, BandwidthClass::Foreground, now, 0.0)
     }
 
     /// Class-aware admission gate. v0.3 Phase D2.
