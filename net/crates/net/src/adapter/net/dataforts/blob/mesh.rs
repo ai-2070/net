@@ -995,6 +995,16 @@ impl MeshBlobAdapter {
                 );
                 continue;
             }
+            // Invalidate the manifest cache entry — same reasoning
+            // as in delete_chunk: stale cache hits decode to a
+            // tree node whose underlying chunk file just vanished,
+            // which would confuse the operator-visible error
+            // attribution on a subsequent fetch_range. Cache
+            // integrity isn't compromised either way (bytes hash
+            // to key), but error-path clarity is.
+            if let Some(cache) = self.tree_node_cache.as_ref() {
+                cache.lock().remove(&hash);
+            }
             swept = swept.saturating_add(1);
         }
         self.metrics.record_gc_swept(swept);
@@ -1029,6 +1039,18 @@ impl MeshBlobAdapter {
             .close_and_unlink_file(&channel)
             .map_err(|e| BlobError::Backend(format!("mesh blob: close chunk: {}", e)))?;
         self.refcount.remove(hash);
+        // Drop the cached tree-node bytes for this hash. Cache
+        // integrity (bytes hash to key) is preserved either way,
+        // but a stale entry means a subsequent fetch_range walk
+        // descends through the cached node and only discovers
+        // the missing chunks at the leaf — confusing the operator-
+        // visible error attribution. Most deleted chunks aren't
+        // tree nodes (the manifest manifest path stores chunks
+        // directly under hash too, so a single remove() suffices
+        // either way); the cache lookup is O(1) on the miss path.
+        if let Some(cache) = self.tree_node_cache.as_ref() {
+            cache.lock().remove(hash);
+        }
         Ok(())
     }
 
@@ -4918,40 +4940,30 @@ mod tests {
         let _ = report;
     }
 
-    /// GC stripe-pin race regression. Pre-fix, the pin check
-    /// (`should_pin_against_gc`) released the stripe-index lock
-    /// before `take_if_deletable`, so a concurrent
-    /// `register_stripe` from a reader could land between the
-    /// two: pin-check returned false (stripe not registered yet),
-    /// the reader registered the stripe (which is now degraded
-    /// because the hash about to be swept is one of its members),
-    /// and GC proceeded to delete the chunk a moment after it
-    /// was promoted into the pin set.
-    ///
-    /// The fix holds the index lock across both steps so any
-    /// concurrent registrar serialises before observing the
-    /// take. This test stresses the path with many concurrent
-    /// register_stripe + sweep_gc invocations: even under
-    /// contention, every parity chunk of a degraded stripe must
-    /// survive the sweep.
+    /// Degraded-stripe pin protects every surviving member when
+    /// the sweep actually runs (`disk_pressure_critical=false`).
+    /// The atomicity fix in sweep_gc ensures the pin-check and
+    /// take_if_deletable cannot interleave with a concurrent
+    /// register_stripe — proven structurally by holding the
+    /// stripe-index lock across both steps. This test asserts
+    /// the pin's end-to-end effect on a genuinely degraded
+    /// stripe: with k=2, m=2 and 3 of 4 members deleted,
+    /// `present_count=1 < k=2` so the lone survivor must NOT be
+    /// swept.
     #[tokio::test]
-    async fn sweep_gc_race_with_concurrent_register_stripe_does_not_lose_parity() {
-        let adapter = Arc::new(make_adapter());
+    async fn sweep_gc_pins_surviving_member_of_genuinely_degraded_stripe() {
+        let adapter = make_adapter();
         let chunk_size: u32 = 4 * 1024;
-        let payload = deterministic_bytes(0xC7, chunk_size as usize * 4);
-        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let payload = deterministic_bytes(0xC7, chunk_size as usize * 2);
+        let rs_params = super::super::erasure::RsParams { k: 2, m: 2 };
         let blob_ref = adapter
             .store_stream_tree_rs_internal(
-                stream_one(payload.clone()),
+                stream_one(payload),
                 ChunkingStrategy::Fixed { size: chunk_size },
                 rs_params,
             )
             .await
             .unwrap();
-
-        // Resolve the stripe so we can re-register its members from
-        // the reader-task, and so we know which parity chunks must
-        // survive the sweep.
         let root_hash = *blob_ref.tree_root_hash().unwrap();
         let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
         let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
@@ -4964,94 +4976,31 @@ mod tests {
             other => panic!("expected ErasureLeaf, got: {:?}", other),
         };
         let stripe = stripes[0].clone();
-        let stripe_members: Vec<[u8; 32]> = stripe.chunks.iter().map(|c| c.hash).collect();
-        let parity_hashes: Vec<[u8; 32]> = stripe
-            .chunks
-            .iter()
-            .filter(|c| c.is_parity())
-            .map(|c| c.hash)
-            .collect();
-        let data_hashes: Vec<[u8; 32]> = stripe
-            .chunks
-            .iter()
-            .filter(|c| c.is_data())
-            .map(|c| c.hash)
-            .collect();
-
-        // Degrade the stripe so the pin must fire.
-        adapter.delete_chunk(&data_hashes[0]).await.unwrap();
-
-        // Wipe the existing stripe registration so the reader-task
-        // has work to do: re-register from scratch under the lock
-        // while the sweeper races to delete.
-        adapter.stripe_index.lock().clear_for_tests();
-
+        let all_hashes: Vec<[u8; 32]> = stripe.chunks.iter().map(|c| c.hash).collect();
+        assert_eq!(all_hashes.len(), 4, "k=2 + m=2 → 4 members");
+        // Delete 3 members; the lone survivor is index 3. After
+        // delete_chunk, present_count = 1 < k=2 → pin must hold.
+        for h in &all_hashes[..3] {
+            adapter.delete_chunk(h).await.unwrap();
+        }
+        let survivor = all_hashes[3];
+        // Sweep with disk_pressure_critical=false so the sweep
+        // actually runs (true SUPPRESSES via should_sweep — see
+        // refcount.rs).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
             + (DEFAULT_RETENTION_FLOOR.as_millis() as u64 * 2);
-
-        // Sweep loop and register loop racing in parallel. With
-        // the lock held across pin_check + take_if_deletable,
-        // every iteration where the register lands first must
-        // pin every member; every iteration where the register
-        // lands after the sweep is fine because there's no stripe
-        // registered yet. The bad outcome we're guarding against
-        // is "register lands BETWEEN pin_check and take_if_deletable"
-        // — once eliminated, parity chunks survive.
-        let registers: u32 = 50;
-        let sweeps: u32 = 50;
-        let adapter_r = adapter.clone();
-        let stripe_members_r = stripe_members.clone();
-        let register_task = tokio::spawn(async move {
-            for _ in 0..registers {
-                adapter_r
-                    .stripe_index
-                    .lock()
-                    .register_stripe(stripe_members_r.clone(), 4);
-                tokio::task::yield_now().await;
-                // Clear so the next iteration genuinely re-registers
-                // rather than hitting the dedup fast-path.
-                adapter_r.stripe_index.lock().clear_for_tests();
-            }
-        });
-        let adapter_s = adapter.clone();
-        let sweep_task = tokio::spawn(async move {
-            for _ in 0..sweeps {
-                let _ = adapter_s.sweep_gc(now, true).await;
-                tokio::task::yield_now().await;
-            }
-        });
-        let _ = tokio::join!(register_task, sweep_task);
-
-        // Final state: re-register the stripe so the post-sweep
-        // pin-check is meaningful, and run one more sweep.
-        adapter
-            .stripe_index
-            .lock()
-            .register_stripe(stripe_members.clone(), 4);
-        let _ = adapter.sweep_gc(now, true).await;
-
-        // Invariant: every parity chunk must still exist locally.
-        // If the race had swept any of them, this assertion would
-        // fire and `repair_blob` could never reconstruct the
-        // missing data chunk.
-        for phash in &parity_hashes {
-            assert!(
-                adapter.chunk_exists(phash).unwrap_or(false),
-                "parity chunk {:?} swept under concurrent register/sweep race",
-                phash
-            );
-        }
-        // And surviving data chunks (1..k) likewise.
-        for dhash in &data_hashes[1..] {
-            assert!(
-                adapter.chunk_exists(dhash).unwrap_or(false),
-                "surviving data chunk {:?} swept under concurrent register/sweep race",
-                dhash
-            );
-        }
+        let _ = adapter.sweep_gc(now, false).await.unwrap();
+        // The survivor MUST still be present — the stripe is
+        // degraded and the C6 pin (now held under the atomic
+        // pin_check + take_if_deletable critical section) keeps
+        // it alive against the otherwise-eligible sweep.
+        assert!(
+            adapter.chunk_exists(&survivor).unwrap_or(false),
+            "surviving stripe member must survive sweep when stripe is degraded",
+        );
     }
 
     /// `repair_blob` restores missing data chunks of an
@@ -6114,6 +6063,88 @@ mod tests {
         let b = adapter.fetch_range(&blob_ref, 0..len as u64).await.unwrap();
         assert_eq!(a, b);
         assert_eq!(a, payload);
+    }
+
+    /// Manifest cache must be invalidated when a chunk leaves the
+    /// store via delete_chunk. Without invalidation, a subsequent
+    /// fetch_range traverses the cached tree node and only
+    /// discovers the missing leaf chunks at the bottom of the
+    /// descent, confusing the operator-visible error attribution
+    /// (NotFound on a leaf vs "blob was deleted out from under
+    /// us"). Cache integrity (bytes hash to key) is preserved
+    /// either way — this fix targets error-path clarity, not
+    /// soundness.
+    #[tokio::test]
+    async fn delete_chunk_invalidates_cached_tree_node() {
+        let redex = Arc::new(Redex::new());
+        let adapter = MeshBlobAdapter::new("mesh-cache-invalidate", redex)
+            .with_tree_node_cache(64 * 1024 * 1024);
+        let len = BLOB_CHUNK_SIZE_BYTES as usize * 2;
+        let payload = deterministic_bytes(0xCA, len);
+        let blob_ref = adapter
+            .store_stream_tree(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        let root_hash = *blob_ref.tree_root_hash().unwrap();
+        // Populate the cache.
+        let _ = adapter.fetch_range(&blob_ref, 0..len as u64).await.unwrap();
+        let (_, _, _, entries_before) = adapter.tree_node_cache_stats().unwrap();
+        assert!(
+            entries_before >= 1,
+            "cache should hold at least the root node"
+        );
+        // Delete the root chunk directly — simulates a sweep
+        // landing on the manifest node.
+        adapter.delete_chunk(&root_hash).await.unwrap();
+        // The cache entry for the deleted root hash must be gone.
+        // Probe via a fresh fetch — pre-fix it would cache-hit on
+        // the root, decode, then NotFound on a child; post-fix it
+        // misses and surfaces the absence directly.
+        let cache = adapter.tree_node_cache.as_ref().unwrap();
+        assert!(
+            cache.lock().get(&root_hash).is_none(),
+            "deleted root must be evicted from the manifest cache"
+        );
+    }
+
+    /// `sweep_gc` deletes chunks via close_and_unlink_file
+    /// directly (not through delete_chunk), so it has its own
+    /// cache-invalidation site. Test pins that path.
+    #[tokio::test]
+    async fn sweep_gc_invalidates_cached_tree_node() {
+        let redex = Arc::new(Redex::new());
+        let adapter = MeshBlobAdapter::new("mesh-cache-sweep-invalidate", redex)
+            .with_tree_node_cache(64 * 1024 * 1024);
+        let len = BLOB_CHUNK_SIZE_BYTES as usize * 2;
+        let payload = deterministic_bytes(0xCB, len);
+        let blob_ref = adapter
+            .store_stream_tree(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+            )
+            .await
+            .unwrap();
+        let root_hash = *blob_ref.tree_root_hash().unwrap();
+        let _ = adapter.fetch_range(&blob_ref, 0..len as u64).await.unwrap();
+        // Far-future timestamp pushes age >= retention floor;
+        // disk_pressure_critical=false (under pressure the sweep
+        // is rejected outright per `should_sweep`).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + (DEFAULT_RETENTION_FLOOR.as_millis() as u64 * 2);
+        let _ = adapter.sweep_gc(now, false).await.unwrap();
+        let cache = adapter.tree_node_cache.as_ref().unwrap();
+        assert!(
+            cache.lock().get(&root_hash).is_none(),
+            "sweep_gc must evict every swept hash from the manifest cache"
+        );
     }
 
     /// Cache disabled (`with_tree_node_cache(0)`) → no entries

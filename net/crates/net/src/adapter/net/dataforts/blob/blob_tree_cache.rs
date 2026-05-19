@@ -198,6 +198,26 @@ impl TreeNodeCache {
         self.hits = 0;
         self.misses = 0;
     }
+
+    /// Drop a single entry by hash. Used by the chunk-delete /
+    /// GC sweep paths to keep the cache in sync with the on-disk
+    /// chunk store: a manifest node whose chunk file just went
+    /// away must not survive in cache, otherwise subsequent
+    /// fetch_range walks descend through the cached node and
+    /// only discover the missing chunks at the leaf, confusing
+    /// operator error attribution. Cache integrity (bytes hash
+    /// to key) is preserved either way — this fix is for error-
+    /// path clarity, not for soundness.
+    ///
+    /// No-op if the hash isn't cached.
+    pub fn remove(&mut self, hash: &[u8; 32]) {
+        if let Some(bytes) = self.entries.remove(hash) {
+            self.bytes = self.bytes.saturating_sub(bytes.len());
+            if let Some(pos) = self.order.iter().position(|k| k == hash) {
+                self.order.remove(pos);
+            }
+        }
+    }
 }
 
 impl Default for TreeNodeCache {
