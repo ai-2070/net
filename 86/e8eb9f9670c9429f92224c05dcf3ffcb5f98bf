@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/dataforts/blob/cdc.rs
+  s_1d50b1bfb9695d::t_3262a58ace3f01 231-237,239
+  s_1d50b1bfb9695d::t_4b4c22d1b51ffe 719,727-740
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "86e8eb9f9670c9429f92224c05dcf3ffcb5f98bf",
+  "prompts": {},
+  "sessions": {
+    "s_1d50b1bfb9695d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9503e0d0-18d5-41d8-b49a-965f66c4843c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

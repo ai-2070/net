@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/dataforts/blob/erasure.rs
+  s_1d50b1bfb9695d::t_2a0eaf3869f048 60-68,79-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "da0f34e361605eae250e1192f97973fee723ef89",
+  "prompts": {},
+  "sessions": {
+    "s_1d50b1bfb9695d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9503e0d0-18d5-41d8-b49a-965f66c4843c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
