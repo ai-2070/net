@@ -1,0 +1,25 @@
+net/crates/net/tests/redex_replication_dst.rs
+  s_1d50b1bfb9695d::t_6a912ac9c1dbf6 1381-1425,1428-1432,1442-1448
+  s_1d50b1bfb9695d::t_e0ff257609c69d 1109
+  s_1d50b1bfb9695d::t_659d5ada122e6d 1426-1427,1433-1441
+  s_1d50b1bfb9695d::t_c6dd1b4d3fba28 214,218-228
+  s_1d50b1bfb9695d::t_803242d7dc13f9 179-183
+  s_1d50b1bfb9695d::t_3385d31510c488 357
+  s_1d50b1bfb9695d::t_4d9b1d7f4da183 184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "34ba9e75c930b1692fdde6b362e09b795f334942",
+  "prompts": {},
+  "sessions": {
+    "s_1d50b1bfb9695d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9503e0d0-18d5-41d8-b49a-965f66c4843c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
