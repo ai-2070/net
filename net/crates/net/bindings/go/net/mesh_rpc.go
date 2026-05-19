@@ -859,7 +859,11 @@ type RpcStream struct {
 	rpc    *MeshRpc
 	handle *C.RpcStreamHandleC
 	callID uint64
-	closed atomic.Bool
+	// Heap-allocated so the watcher goroutine can hold a reference
+	// without keeping the RpcStream struct alive — required so
+	// the finalizer can run when the user drops the stream
+	// reference without explicitly Close()ing.
+	closed *atomic.Bool
 	// cancel fires the ctx-cancel watcher goroutine's parent
 	// context so it unblocks and exits when Close() runs even
 	// if the user-supplied ctx never cancels.
@@ -916,6 +920,7 @@ func (r *MeshRpc) CallStreaming(
 		rpc:    r,
 		handle: outStream,
 		callID: uint64(C.net_rpc_stream_call_id(outStream)),
+		closed: new(atomic.Bool),
 	}
 	runtime.SetFinalizer(stream, (*RpcStream).finalize)
 
@@ -924,31 +929,30 @@ func (r *MeshRpc) CallStreaming(
 	// waits on it so the user can drop the *RpcStream reference
 	// immediately after Close returns without a transient
 	// goroutine still poking at fields.
+	//
+	// CRITICAL: the goroutine captures only heap-allocated cells
+	// (closed, handle, watcherDone) — never `stream`. Capturing
+	// `stream` would prevent GC and defeat the finalizer if the
+	// user neither cancels ctx nor calls Close. The cleanup chain
+	// is: user-drops-ref → GC → finalizer → finalizer-calls-Close
+	// → Close-calls-cancel → goroutine-wakes-and-exits.
 	if ctx != nil && ctx.Done() != nil {
 		watchCtx, cancel := context.WithCancel(ctx)
 		stream.cancel = cancel
 		stream.watcherDone = make(chan struct{})
-		go func(s *RpcStream, watchCtx context.Context) {
+		closedPtr := stream.closed
+		handlePtr := outStream
+		watcherDone := stream.watcherDone
+		go func() {
 			<-watchCtx.Done()
-			// Either ctx fired (user canceled) or Close() called
-			// our cancel(); both paths lead to s.Close().
-			//
-			// Signal watcherDone BEFORE calling Close — Close
-			// waits on watcherDone, so closing it after the call
-			// would self-deadlock when the watcher races to
-			// Close before any user-side Close. With this order:
-			//   - watcher reaches here, closes watcherDone, then
-			//     calls Close. The Close path observes
-			//     watcherDone already closed → its wait returns
-			//     immediately.
-			//   - A concurrent user-side Close races on the
-			//     `closed.Swap` flag (only one wins); whichever
-			//     loses no-ops. The winner blocks on watcherDone
-			//     until the watcher closes it just below — a
-			//     bounded wait of "watcher unblock latency."
-			close(s.watcherDone)
-			s.Close()
-		}(stream, watchCtx)
+			// closed.Swap is the single source of truth for "who
+			// owns the free." Whoever wins (Swap returns false)
+			// performs the C.free; the other path no-ops.
+			if !closedPtr.Swap(true) {
+				C.net_rpc_stream_free(handlePtr)
+			}
+			close(watcherDone)
+		}()
 	}
 	return stream, nil
 }
@@ -1267,11 +1271,24 @@ type ClientStreamOptions struct {
 // chunks via Send, then call Finish to await the terminal
 // response. Close MUST be called eventually (defer is fine) if
 // Finish wasn't reached.
+//
+// **Lifecycle note.** If `ctx != nil && ctx.Done() != nil` (i.e.
+// a cancellable parent context), a watcher goroutine is spawned to
+// propagate ctx-cancel into a CANCEL on the wire. The goroutine
+// references only heap-allocated cells (the shared `closed`
+// pointer, the C handle pointer, the watcherDone channel) — NOT
+// the ClientStreamCall itself. This is load-bearing: capturing
+// `call` in the goroutine would prevent GC, defeat the finalizer,
+// and leak a goroutine + call forever if the user neither cancels
+// ctx nor calls Close. The shared-cell pattern lets the finalizer
+// run on user-dropped calls; the finalizer then invokes Close,
+// which cancels watchCtx, which wakes the goroutine, which exits
+// cleanly.
 type ClientStreamCall struct {
 	rpc         *MeshRpc
 	handle      *C.ClientStreamCallHandleC
 	callID      uint64
-	closed      atomic.Bool
+	closed      *atomic.Bool
 	cancel      context.CancelFunc
 	watcherDone chan struct{}
 }
@@ -1318,6 +1335,7 @@ func (r *MeshRpc) CallClientStream(
 		rpc:    r,
 		handle: outHandle,
 		callID: uint64(C.net_rpc_client_stream_call_id(outHandle)),
+		closed: new(atomic.Bool),
 	}
 	runtime.SetFinalizer(call, (*ClientStreamCall).finalize)
 
@@ -1326,11 +1344,22 @@ func (r *MeshRpc) CallClientStream(
 		watchCtx, cancel := context.WithCancel(ctx)
 		call.cancel = cancel
 		call.watcherDone = make(chan struct{})
-		go func(c *ClientStreamCall, watchCtx context.Context) {
+		// CAPTURE ONLY HEAP-ALLOCATED CELLS, NOT `call`. Capturing
+		// call here would prevent GC, defeat the finalizer, and
+		// leak the goroutine + call forever if ctx never cancels
+		// AND user never calls Close. With the closed pointer +
+		// raw handle pointer the goroutine is fully decoupled from
+		// the Go-side call struct.
+		closedPtr := call.closed
+		handlePtr := outHandle
+		watcherDone := call.watcherDone
+		go func() {
 			<-watchCtx.Done()
-			close(c.watcherDone)
-			c.Close()
-		}(call, watchCtx)
+			if !closedPtr.Swap(true) {
+				C.net_rpc_client_stream_free(handlePtr)
+			}
+			close(watcherDone)
+		}()
 	}
 	return call, nil
 }
@@ -1450,7 +1479,10 @@ type DuplexCall struct {
 	rpc         *MeshRpc
 	handle      *C.DuplexCallHandleC
 	callID      uint64
-	closed      atomic.Bool
+	// Heap-allocated so the watcher goroutine can hold a reference
+	// without keeping the DuplexCall struct alive. See the
+	// equivalent note on ClientStreamCall.
+	closed      *atomic.Bool
 	cancel      context.CancelFunc
 	watcherDone chan struct{}
 }
@@ -1492,6 +1524,7 @@ func (r *MeshRpc) CallDuplex(
 		rpc:    r,
 		handle: outHandle,
 		callID: uint64(C.net_rpc_duplex_call_id(outHandle)),
+		closed: new(atomic.Bool),
 	}
 	runtime.SetFinalizer(call, (*DuplexCall).finalize)
 
@@ -1499,11 +1532,18 @@ func (r *MeshRpc) CallDuplex(
 		watchCtx, cancel := context.WithCancel(ctx)
 		call.cancel = cancel
 		call.watcherDone = make(chan struct{})
-		go func(c *DuplexCall, watchCtx context.Context) {
+		// Capture heap cells only — never `call`. See the
+		// ClientStreamCall watcher note for the lifecycle proof.
+		closedPtr := call.closed
+		handlePtr := outHandle
+		watcherDone := call.watcherDone
+		go func() {
 			<-watchCtx.Done()
-			close(c.watcherDone)
-			c.Close()
-		}(call, watchCtx)
+			if !closedPtr.Swap(true) {
+				C.net_rpc_duplex_free(handlePtr)
+			}
+			close(watcherDone)
+		}()
 	}
 	return call, nil
 }
