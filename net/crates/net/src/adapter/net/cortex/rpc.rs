@@ -3702,6 +3702,23 @@ impl RpcClientFold {
                 // RpcClientPending::deliver_grant docs).
                 match decode_request_grant(&ev.payload[EVENT_META_SIZE..]) {
                     Some(grant) => {
+                        // The payload's `call_id` MUST agree with
+                        // the EventMeta's `seq_or_ts`: producer
+                        // encodes both to the same value (see
+                        // `RpcRequestGrantPayload::call_id` docs).
+                        // If they disagree, the frame is malformed
+                        // or forged — drop it. Otherwise a peer
+                        // could publish a GRANT whose meta names
+                        // one call but whose payload credits a
+                        // different in-flight call_id.
+                        if grant.call_id != meta.seq_or_ts {
+                            tracing::debug!(
+                                meta_call_id = meta.seq_or_ts,
+                                payload_call_id = grant.call_id,
+                                "rpc client fold: REQUEST_GRANT meta/payload call_id mismatch; dropping",
+                            );
+                            return;
+                        }
                         if grant.credits == 0 {
                             return;
                         }
@@ -3774,6 +3791,16 @@ impl RedexFold<()> for RpcClientFold {
             DISPATCH_RPC_REQUEST_GRANT => {
                 match decode_request_grant(&ev.payload[EVENT_META_SIZE..]) {
                     Some(grant) => {
+                        // See `apply_inbound` REQUEST_GRANT arm for
+                        // the meta/payload call_id invariant.
+                        if grant.call_id != meta.seq_or_ts {
+                            tracing::debug!(
+                                meta_call_id = meta.seq_or_ts,
+                                payload_call_id = grant.call_id,
+                                "rpc client fold: REQUEST_GRANT meta/payload call_id mismatch; dropping",
+                            );
+                            return Ok(());
+                        }
                         if grant.credits == 0 {
                             return Ok(());
                         }
@@ -5479,6 +5506,54 @@ mod tests {
         assert!(
             parked.is_err(),
             "malformed REQUEST_GRANT must not inject credit"
+        );
+    }
+
+    /// REQUEST_GRANT frames where the payload `call_id` does NOT
+    /// agree with `EventMeta::seq_or_ts` must be dropped: the
+    /// producer is contracted to encode both fields to the same
+    /// value (see `RpcRequestGrantPayload::call_id` doc), so a
+    /// mismatch is either a malformed frame or an attempted
+    /// cross-call credit-injection. Without this check, a peer
+    /// could publish a GRANT whose meta names one call but whose
+    /// payload credits a different in-flight call_id.
+    ///
+    /// Regression: cubic-dev-ai bot P2 review comment on the
+    /// `nrpc-streaming` branch.
+    #[tokio::test]
+    async fn client_fold_drops_request_grant_with_mismatched_call_ids() {
+        let pending = Arc::new(RpcClientPending::new());
+        let mut fold = RpcClientFold::new(pending.clone());
+        let (_terminal_rx_victim, mut grant_rx_victim) =
+            pending.register_client_streaming(0xC0DE, 0);
+        let (_terminal_rx_other, mut grant_rx_other) =
+            pending.register_client_streaming(0xBEEF, 0);
+
+        // Build a hand-rolled frame: meta names call 0xC0DE,
+        // payload encodes credit for call 0xBEEF. Either the
+        // producer is broken or this is a forged frame; the
+        // consumer must drop, not deliver.
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, 0xCAFE, 0xC0DE, 0);
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&encode_request_grant(0xBEEF, 5));
+        let ev = RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        };
+        fold.apply(&ev, &mut ()).unwrap();
+
+        let parked_victim =
+            tokio::time::timeout(Duration::from_millis(30), grant_rx_victim.recv()).await;
+        assert!(
+            parked_victim.is_err(),
+            "mismatched REQUEST_GRANT must not credit the call named in meta",
+        );
+        let parked_other =
+            tokio::time::timeout(Duration::from_millis(30), grant_rx_other.recv()).await;
+        assert!(
+            parked_other.is_err(),
+            "mismatched REQUEST_GRANT must not credit the call named in payload either",
         );
     }
 
