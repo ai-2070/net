@@ -228,9 +228,15 @@ impl CdcParams {
                 self.max, MAX_MIN, MAX_MAX
             )));
         }
-        if self.min > self.avg || self.avg > self.max {
+        // Strict ordering — `min == avg` or `avg == max` collapses
+        // the Normalization::Level2 mask logic (the FastCDC paper's
+        // normalization shifts mask bits relative to avg; when min
+        // equals avg there is no below-avg region where the
+        // harder mask applies). The plan spec calls for strict
+        // inequality.
+        if self.min >= self.avg || self.avg >= self.max {
             return Err(BlobError::Backend(format!(
-                "CDC params: must hold min <= avg <= max; got min={} avg={} max={}",
+                "CDC params: must hold min < avg < max; got min={} avg={} max={}",
                 self.min, self.avg, self.max
             )));
         }
@@ -710,11 +716,28 @@ mod tests {
         }
         .validate()
         .is_err());
-        // ordering violation
+        // ordering violation (min > avg)
         assert!(CdcParams {
             min: 4096,
             avg: 1024,
             max: 8192
+        }
+        .validate()
+        .is_err());
+        // Strict ordering — `min == avg` collapses the
+        // Normalization::Level2 mask logic, so `validate` rejects
+        // even when the values are otherwise in-range.
+        assert!(CdcParams {
+            min: 1024,
+            avg: 1024,
+            max: 4096
+        }
+        .validate()
+        .is_err());
+        assert!(CdcParams {
+            min: 1024,
+            avg: 4096,
+            max: 4096
         }
         .validate()
         .is_err());
