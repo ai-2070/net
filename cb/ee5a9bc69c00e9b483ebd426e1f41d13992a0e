@@ -1,0 +1,30 @@
+net/crates/net/cli/src/commands/cap.rs
+  s_7424fcffb5b392::t_9bb8d437b0ac72 344-349,351,367-370,372
+  s_2571835e05521c::t_ec6af3bf8bb434 2-3
+net/crates/net/cli/tests/cap_announce.rs
+  s_7424fcffb5b392::t_63c75ae2ec3733 249-301
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "cbee5a9bc69c00e9b483ebd426e1f41d13992a0e",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_7424fcffb5b392": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c0d8a275-b575-47c6-8af6-ebb68c51ff8e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
