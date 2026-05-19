@@ -24,7 +24,7 @@
 //! Phase 2 will add `call_service(name, ...)` over the existing
 //! capability-announcement registry.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -330,6 +330,11 @@ pub struct RpcStream {
     /// credit at roughly the initial window. `None` → no flow
     /// control; `poll_next` does not emit grants.
     stream_window: Option<u32>,
+    /// Observer-fire bookkeeping. Latched on terminal observation
+    /// in `poll_next`; fired once from `Drop` so the Deck NRPC
+    /// tab + every other `RpcObserver` consumer sees one event
+    /// per streaming-response call.
+    observer: StreamingObserverState,
 }
 
 impl RpcStream {
@@ -436,10 +441,12 @@ impl futures::Stream for RpcStream {
                         1,
                     );
                 }
+                self.observer.add_response_bytes(body.len() as u32);
                 std::task::Poll::Ready(Some(Ok(body)))
             }
             std::task::Poll::Ready(Some(StreamItem::End)) => {
                 self.done = true;
+                self.observer.latch_ok();
                 std::task::Poll::Ready(None)
             }
             std::task::Poll::Ready(Some(StreamItem::Error(resp))) => {
@@ -448,6 +455,9 @@ impl futures::Stream for RpcStream {
                 let message = String::from_utf8(resp.body).unwrap_or_else(|e| {
                     format!("<{} bytes of non-utf8 body>", e.into_bytes().len())
                 });
+                self.observer.latch_error(format!(
+                    "server returned status {status:#06x}: {message}"
+                ));
                 std::task::Poll::Ready(Some(Err(RpcError::ServerError { status, message })))
             }
             std::task::Poll::Ready(None) => {
@@ -473,6 +483,9 @@ impl Drop for RpcStream {
             self.self_origin,
             self.call_id,
         );
+        // Fire the observer with the latched status (Ok / Error /
+        // Canceled). Idempotent — only the first fire emits.
+        self.observer.fire();
     }
 }
 
@@ -596,6 +609,11 @@ pub struct ClientStreamCallRaw {
     state: ClientStreamState,
     /// Wall-clock start (for `RpcReply::latency_ns` reporting).
     started: Instant,
+    /// Observer-fire bookkeeping. Latched on terminal observation
+    /// in `finish`; fired once from `Drop` so the Deck NRPC tab +
+    /// every `RpcObserver` consumer sees one event per
+    /// client-streaming call.
+    observer: StreamingObserverState,
 }
 
 impl ClientStreamCallRaw {
@@ -638,6 +656,7 @@ impl ClientStreamCallRaw {
                 )))?;
             permit.forget();
         }
+        self.observer.add_request_bytes(body.len() as u32);
         match self.state {
             ClientStreamState::JustOpened => {
                 // First send → initial REQUEST.
@@ -735,32 +754,42 @@ impl ClientStreamCallRaw {
             {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) => {
-                    return Err(RpcError::Transport(AdapterError::Connection(
-                        "terminal sender dropped before response arrived".into(),
-                    )));
+                    let msg = "terminal sender dropped before response arrived";
+                    self.observer.latch_error(msg);
+                    return Err(RpcError::Transport(AdapterError::Connection(msg.into())));
                 }
                 Err(_elapsed) => {
                     let elapsed_ms = self.started.elapsed().as_millis() as u64;
+                    self.observer.latch_timeout();
                     return Err(RpcError::Timeout { elapsed_ms });
                 }
             }
         } else {
-            terminal_rx.await.map_err(|_| RpcError::Transport(
-                AdapterError::Connection(
-                    "terminal sender dropped before response arrived".into(),
-                ),
-            ))?
+            match terminal_rx.await {
+                Ok(r) => r,
+                Err(_) => {
+                    let msg = "terminal sender dropped before response arrived";
+                    self.observer.latch_error(msg);
+                    return Err(RpcError::Transport(AdapterError::Connection(msg.into())));
+                }
+            }
         };
         self.state = ClientStreamState::Done;
+        self.observer.add_response_bytes(resp.body.len() as u32);
         if !resp.status.is_ok() {
             let message = String::from_utf8(resp.body.clone()).unwrap_or_else(|e| {
                 format!("<{} bytes of non-utf8 body>", e.into_bytes().len())
             });
+            self.observer.latch_error(format!(
+                "server returned status {:#06x}: {message}",
+                resp.status.to_wire()
+            ));
             return Err(RpcError::ServerError {
                 status: resp.status.to_wire(),
                 message,
             });
         }
+        self.observer.latch_ok();
         let latency_ns = self.started.elapsed().as_nanos() as u64;
         Ok(RpcReply {
             body: Bytes::from(resp.body),
@@ -805,6 +834,10 @@ impl Drop for ClientStreamCallRaw {
         if let Some(task) = self.grant_pump.take() {
             task.abort();
         }
+        // Fire the observer with whatever status was latched
+        // (Ok / Error / Timeout / Canceled). Idempotent — only
+        // the first call emits.
+        self.observer.fire();
         if matches!(self.state, ClientStreamState::Done) {
             // Successful completion — pending entry already gone,
             // no CANCEL needed.
@@ -850,11 +883,20 @@ struct DuplexInner {
     /// (or terminal Error) was observed on the response stream.
     /// Suppresses CANCEL-on-drop.
     clean_close: std::sync::atomic::AtomicBool,
+    /// Observer-fire bookkeeping. Latched from the various
+    /// terminal-observation sites (DuplexCall::next /
+    /// DuplexStream::poll_next yielding End or Error); fired
+    /// once on Drop. The DuplexCall / DuplexSink / DuplexStream
+    /// each share access via the surrounding Arc<DuplexInner>.
+    observer: StreamingObserverState,
 }
 
 impl Drop for DuplexInner {
     fn drop(&mut self) {
         self.mesh.rpc_client_pending_arc().cancel(self.call_id);
+        // Fire the observer with the latched status (Ok / Error /
+        // Canceled). Idempotent — only the first call emits.
+        self.observer.fire();
         if self.clean_close.load(Ordering::SeqCst) {
             return;
         }
@@ -912,6 +954,7 @@ impl DuplexSink {
                 )))?;
             permit.forget();
         }
+        self.inner.observer.add_request_bytes(body.len() as u32);
         match self.state {
             ClientStreamState::JustOpened => {
                 let req = RpcRequestPayload {
@@ -1079,6 +1122,7 @@ impl futures::Stream for DuplexStream {
         }
         match self.chunks_rx.poll_recv(cx) {
             std::task::Poll::Ready(Some(StreamItem::Chunk(body))) => {
+                self.inner.observer.add_response_bytes(body.len() as u32);
                 std::task::Poll::Ready(Some(Ok(body)))
             }
             std::task::Poll::Ready(Some(StreamItem::End)) => {
@@ -1086,6 +1130,7 @@ impl futures::Stream for DuplexStream {
                 self.inner
                     .clean_close
                     .store(true, Ordering::SeqCst);
+                self.inner.observer.latch_ok();
                 std::task::Poll::Ready(None)
             }
             std::task::Poll::Ready(Some(StreamItem::Error(resp))) => {
@@ -1097,6 +1142,9 @@ impl futures::Stream for DuplexStream {
                 let message = String::from_utf8(resp.body).unwrap_or_else(|e| {
                     format!("<{} bytes of non-utf8 body>", e.into_bytes().len())
                 });
+                self.inner.observer.latch_error(format!(
+                    "server returned status {status:#06x}: {message}"
+                ));
                 std::task::Poll::Ready(Some(Err(RpcError::ServerError { status, message })))
             }
             std::task::Poll::Ready(None) => {
@@ -1229,6 +1277,118 @@ impl Drop for UnaryCallGuard {
                 self.call_id,
             );
         }
+    }
+}
+
+// ============================================================================
+// Streaming/duplex observer-fire bookkeeping.
+//
+// The unary `MeshNode::call` fires `RpcObserver::on_call` at each
+// terminal return path (see line ~2306). The streaming /
+// client-streaming / duplex paths have multiple terminal points
+// (poll_next sees End / Error; finish() returns; Drop without
+// terminal observation). To avoid sprinkling `fire_rpc_observer_outbound`
+// at every terminal site, each handle holds a
+// `StreamingObserverState` that latches the terminal status on
+// observation and fires exactly once on Drop. The Deck NRPC tab
+// + every consumer of `RpcObserver` get one event per streaming
+// / duplex call, same as for unary today.
+// ============================================================================
+
+/// Per-call observer-fire bookkeeping shared between the
+/// streaming + client-streaming + duplex caller-side handles.
+/// Latches terminal status on observation; `fire()` (called from
+/// the handle's Drop) emits one `RpcCallEvent` with the latched
+/// status (or `Canceled` if nothing latched — i.e. the handle
+/// was dropped before observing its terminator).
+///
+/// Status discriminator:
+///   0 = none latched (Drop → Canceled)
+///   1 = Ok
+///   2 = Error (message in `observer_msg`)
+///   3 = Timeout
+pub(crate) struct StreamingObserverState {
+    mesh: Arc<MeshNode>,
+    target_node_id: u64,
+    service: String,
+    started: Instant,
+    request_bytes: AtomicU32,
+    response_bytes: AtomicU32,
+    observer_status: AtomicU8,
+    observer_msg: parking_lot::Mutex<Option<String>>,
+    fired: AtomicBool,
+}
+
+impl StreamingObserverState {
+    pub(crate) fn new(
+        mesh: Arc<MeshNode>,
+        target_node_id: u64,
+        service: impl Into<String>,
+        request_bytes: u32,
+    ) -> Self {
+        Self {
+            mesh,
+            target_node_id,
+            service: service.into(),
+            started: Instant::now(),
+            request_bytes: AtomicU32::new(request_bytes),
+            response_bytes: AtomicU32::new(0),
+            observer_status: AtomicU8::new(0),
+            observer_msg: parking_lot::Mutex::new(None),
+            fired: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn add_request_bytes(&self, n: u32) {
+        self.request_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_response_bytes(&self, n: u32) {
+        self.response_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub(crate) fn latch_ok(&self) {
+        self.observer_status.store(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn latch_error(&self, msg: impl Into<String>) {
+        *self.observer_msg.lock() = Some(msg.into());
+        self.observer_status.store(2, Ordering::Relaxed);
+    }
+
+    pub(crate) fn latch_timeout(&self) {
+        self.observer_status.store(3, Ordering::Relaxed);
+    }
+
+    /// Fire the observer event. Idempotent — only the first call
+    /// actually emits; subsequent are no-ops. Called from each
+    /// streaming handle's Drop.
+    pub(crate) fn fire(&self) {
+        if self.fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let status_code = self.observer_status.load(Ordering::Relaxed);
+        let status = match status_code {
+            1 => crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Ok,
+            2 => {
+                let msg = self
+                    .observer_msg
+                    .lock()
+                    .clone()
+                    .unwrap_or_default();
+                crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Error(msg)
+            }
+            3 => crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Timeout,
+            _ => crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Canceled,
+        };
+        self.mesh.fire_rpc_observer_outbound(
+            self.target_node_id,
+            &self.service,
+            self.started.elapsed().as_millis() as u32,
+            status,
+            self.request_bytes.load(Ordering::Relaxed),
+            self.response_bytes.load(Ordering::Relaxed),
+        );
     }
 }
 
@@ -1721,6 +1881,12 @@ impl MeshNode {
         });
 
         let deadline_ns = opts.deadline.map(instant_to_unix_nanos).unwrap_or(0);
+        let observer = StreamingObserverState::new(
+            Arc::clone(self),
+            target_node_id,
+            service,
+            0,
+        );
         Ok(ClientStreamCallRaw {
             mesh: Arc::clone(self),
             target_node_id,
@@ -1736,6 +1902,7 @@ impl MeshNode {
             terminal_rx: Some(terminal_rx),
             state: ClientStreamState::JustOpened,
             started: Instant::now(),
+            observer,
         })
     }
 
@@ -1958,6 +2125,12 @@ impl MeshNode {
         });
 
         let deadline_ns = opts.deadline.map(instant_to_unix_nanos).unwrap_or(0);
+        let observer = StreamingObserverState::new(
+            Arc::clone(self),
+            target_node_id,
+            service,
+            0,
+        );
         let inner = Arc::new(DuplexInner {
             mesh: Arc::clone(self),
             target_node_id,
@@ -1966,6 +2139,7 @@ impl MeshNode {
             call_id,
             initial_sent: std::sync::atomic::AtomicBool::new(false),
             clean_close: std::sync::atomic::AtomicBool::new(false),
+            observer,
         });
         let sink = DuplexSink {
             inner: Arc::clone(&inner),
@@ -2078,6 +2252,7 @@ impl MeshNode {
             return Err(RpcError::Transport(e));
         }
 
+        let request_bytes_len = payload_bytes.len() as u32;
         Ok(RpcStream {
             mesh: Arc::clone(self),
             target_node_id,
@@ -2087,6 +2262,12 @@ impl MeshNode {
             inner: rx,
             done: false,
             stream_window: opts.stream_window_initial,
+            observer: StreamingObserverState::new(
+                Arc::clone(self),
+                target_node_id,
+                service,
+                request_bytes_len,
+            ),
         })
     }
 
