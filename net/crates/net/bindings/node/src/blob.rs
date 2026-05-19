@@ -405,9 +405,22 @@ impl BlobRef {
         }
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&root_hash);
-        let (signed, total_u64, _losses) = total_size.get_u64();
+        // `get_u64()` returns `(signed, value, lossless)`. The
+        // lossless flag is `true` only when the JS BigInt
+        // round-trips through u64 without truncation. JS BigInts
+        // can hold arbitrarily large integers; a value above
+        // u64::MAX would silently truncate without this check,
+        // letting the constructor accept a forged "small" Tree
+        // shape derived from a producer's accidental 2^64+1.
+        let (signed, total_u64, lossless) = total_size.get_u64();
         if signed {
             return Err(blob_err("treeFromParts", "totalSize must be non-negative"));
+        }
+        if !lossless {
+            return Err(blob_err(
+                "treeFromParts",
+                "totalSize exceeds u64::MAX; tree total_size is a u64 field",
+            ));
         }
         InnerBlobRef::tree(
             uri,
