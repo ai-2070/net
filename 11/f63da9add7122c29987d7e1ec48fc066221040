@@ -1,0 +1,19 @@
+.github/workflows/release-binaries-cli.yml
+  s_8697fa1d214abc::t_54e1bcdc72de3d 165-171,176,178,182-188
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "11f63da9add7122c29987d7e1ec48fc066221040",
+  "prompts": {},
+  "sessions": {
+    "s_8697fa1d214abc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6ced4740-56a4-48e6-b981-727d0b40a63a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
