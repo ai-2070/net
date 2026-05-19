@@ -392,6 +392,69 @@ async fn duplex_cancel_from_caller_closes_both_halves() {
     );
 }
 
+/// `into_split` CANCEL semantics: dropping ONE half (sink OR
+/// stream) must NOT fire CANCEL on the wire — the surviving half
+/// keeps the call alive. The server only observes CANCEL after
+/// BOTH halves have dropped without a clean close.
+#[tokio::test]
+async fn duplex_into_split_one_half_drop_does_not_cancel() {
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    let observed = Arc::new(AtomicBool::new(false));
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc_duplex(
+            "no_cancel_on_one_drop",
+            Arc::new(ForeverHandler {
+                observed_cancel: observed.clone(),
+                consumed: consumed.clone(),
+            }),
+        )
+        .expect("serve_rpc_duplex");
+
+    let call = caller
+        .call_duplex(
+            server.node_id(),
+            "no_cancel_on_one_drop",
+            CallOptions::default(),
+        )
+        .await
+        .expect("call_duplex");
+    let (mut sink, stream) = call.into_split();
+    // Publish the initial REQUEST so the server registers the
+    // call — without this the server doesn't know about the call
+    // and "no CANCEL observed" would be a vacuous pass.
+    sink.send(Bytes::from_static(b"keepalive"))
+        .await
+        .expect("send");
+
+    // Drop the sink half ONLY. The stream stays alive — Arc
+    // refcount is still > 0 inside DuplexInner.
+    drop(sink);
+
+    // Wait long enough that, if CANCEL were going to fire, it
+    // would have arrived by now (the server publishes
+    // cancellation on the receive path very quickly).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !observed.load(Ordering::SeqCst),
+        "server must NOT observe CANCEL while the stream half is alive",
+    );
+
+    // Now drop the stream too — both halves gone → CANCEL fires.
+    drop(stream);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !observed.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "server must observe CANCEL once BOTH halves drop",
+    );
+}
+
 /// Regression (cubic-dev-ai bot P2): mirror of the client-stream
 /// guard for duplex. `Some(0)` would deadlock the upload sink the
 /// same way (initial REQUEST is lazy → server never sees the call
