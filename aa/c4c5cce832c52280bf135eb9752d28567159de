@@ -1,0 +1,33 @@
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_0fbf11385c7e18::t_c266397390221d 2851-2867
+  s_0fbf11385c7e18::t_1bd11282e3871e 1860,2070
+  s_0fbf11385c7e18::t_615affe69f7953 2182
+  s_0fbf11385c7e18::t_33b81d4337bf0c 2453
+net/crates/net/src/adapter/net/mesh.rs
+  s_0fbf11385c7e18::t_a9732984c23cbd 924-940,954-955
+  s_0fbf11385c7e18::t_9afd38bc85b079 4809-4819,4825-4857,4867,4873
+  s_0fbf11385c7e18::t_2e03c06cea5140 11180-11309
+net/crates/net/src/adapter/net/channel/name.rs
+  s_0fbf11385c7e18::t_a15d93b6d1b035 23-24
+  s_0fbf11385c7e18::t_7cc1e970534747 102
+  s_0fbf11385c7e18::t_9620af2cef7beb 44-54,56,62
+net/crates/net/docs/misc/PERF_AUDIT_2026_05_19_NRPC.md
+  s_0fbf11385c7e18::t_600584fb899f82 180-186
+  s_0fbf11385c7e18::t_02ebdb8304dec6 187-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "aac4c5cce832c52280bf135eb9752d28567159de",
+  "prompts": {},
+  "sessions": {
+    "s_0fbf11385c7e18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a8bdccec-0b4b-4752-bdbb-5cbde7a9c958",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
