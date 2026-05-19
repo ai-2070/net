@@ -2295,6 +2295,16 @@ impl MeshBlobAdapter {
     /// The repair sweep is iterative (no concurrency for v0.3
     /// Phase C7); a future commit may parallelise the per-stripe
     /// recovery across the BandwidthClass-aware send queue.
+    ///
+    /// **Trust model.** This entry point is unauthenticated and
+    /// intended for system-internal callers: the operator CLI
+    /// running against a local store, an in-process scheduled
+    /// repair cadence (if one ever lands), and unit tests. A peer-
+    /// initiated / network-exposed repair must route through
+    /// [`Self::repair_blob_authorized`] instead, because the sweep
+    /// walks every chunk of the blob (full disk + CPU cost) and is
+    /// trivially amplifiable into a DoS by an attacker who can
+    /// reach this surface without a capability check.
     pub async fn repair_blob(&self, blob_ref: &BlobRef) -> Result<RepairReport, BlobError> {
         use super::blob_tree::TreeNode;
 
@@ -2338,6 +2348,35 @@ impl MeshBlobAdapter {
             }
         }
         Ok(report)
+    }
+
+    /// Capability-gated wrapper around [`Self::repair_blob`].
+    /// Mirrors the [`Self::pin_authorized`] / [`Self::unpin_authorized`]
+    /// / [`Self::delete_chunk_authorized`] pattern: the adapter must
+    /// have an [`AuthGuard`] configured, and the caller must be
+    /// authorized for `(origin_hash, channel)` per
+    /// [`auth_allows_blob_op`]. Returns [`BlobError::Unauthorized`]
+    /// on either failure.
+    ///
+    /// This is the peer-initiated / network-exposed repair entry.
+    /// `repair_blob` walks the entire tree, fetches every chunk,
+    /// hashes each, constructs an RS encoder per stripe, and may
+    /// re-store reconstructed bytes — a hostile caller running it
+    /// across many blobs amplifies I/O and CPU substantially, so it
+    /// must not be reachable without the capability check.
+    pub async fn repair_blob_authorized(
+        &self,
+        blob_ref: &BlobRef,
+        origin_hash: u64,
+        channel: &ChannelName,
+    ) -> Result<RepairReport, BlobError> {
+        let guard = self.auth_guard.as_ref().ok_or_else(|| {
+            BlobError::Unauthorized(
+                "repair_blob_authorized requires AuthGuard wiring".to_string(),
+            )
+        })?;
+        auth_allows_blob_op(guard, origin_hash, channel)?;
+        self.repair_blob(blob_ref).await
     }
 
     /// Internal: repair one stripe in isolation. Bumps the
@@ -4988,6 +5027,58 @@ mod tests {
         let hash: [u8; 32] = blake3::hash(&payload).into();
         let small_ref = BlobRef::small("mesh://small-test", hash, payload.len() as u64);
         let report = adapter.repair_blob(&small_ref).await.unwrap();
+        assert_eq!(report, super::RepairReport::default());
+    }
+
+    /// `repair_blob_authorized` rejects when no AuthGuard is wired —
+    /// repair walks the entire tree + runs RS reconstruction per
+    /// stripe, so it must be unreachable on a network-facing path
+    /// absent a capability check.
+    #[tokio::test]
+    async fn repair_blob_authorized_rejects_when_no_guard_configured() {
+        let adapter = make_adapter();
+        let payload = deterministic_bytes(0xF5, 64);
+        let hash: [u8; 32] = blake3::hash(&payload).into();
+        let small_ref = BlobRef::small("mesh://repair-noauth", hash, payload.len() as u64);
+        let channel = auth_channel();
+        let err = adapter
+            .repair_blob_authorized(&small_ref, 0xCAFE_BABE, &channel)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::Unauthorized(_)));
+    }
+
+    /// `repair_blob_authorized` rejects an origin that the AuthGuard
+    /// doesn't list for the channel.
+    #[tokio::test]
+    async fn repair_blob_authorized_rejects_unauthorized_origin() {
+        let origin: u64 = 0xC0FFEE;
+        let (adapter, channel) = adapter_with_authorized_origin(origin);
+        let payload = deterministic_bytes(0xF6, 64);
+        let hash: [u8; 32] = blake3::hash(&payload).into();
+        let small_ref = BlobRef::small("mesh://repair-intruder", hash, payload.len() as u64);
+        let intruder: u64 = 0xDEAD_BEEF;
+        let err = adapter
+            .repair_blob_authorized(&small_ref, intruder, &channel)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::Unauthorized(_)));
+    }
+
+    /// `repair_blob_authorized` admits and round-trips to
+    /// `repair_blob` once an origin is authorized.
+    #[tokio::test]
+    async fn repair_blob_authorized_admits_authorized_origin() {
+        let origin: u64 = 0xCAFE_BABE;
+        let (adapter, channel) = adapter_with_authorized_origin(origin);
+        // Non-Tree blob → repair is a zero-counter no-op.
+        let payload = deterministic_bytes(0xF7, 64);
+        let hash: [u8; 32] = blake3::hash(&payload).into();
+        let small_ref = BlobRef::small("mesh://repair-ok", hash, payload.len() as u64);
+        let report = adapter
+            .repair_blob_authorized(&small_ref, origin, &channel)
+            .await
+            .unwrap();
         assert_eq!(report, super::RepairReport::default());
     }
 
