@@ -1493,7 +1493,13 @@ impl MeshBlobAdapter {
                         let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
                         self.store_chunk(&chunk_hash, &chunk_bytes).await?;
                         let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
-                        if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
+                        // RS striper still owns Vec<u8> internally; one
+                        // copy here is the cost of routing CDC output
+                        // into the RS path. The non-RS CDC path skips
+                        // this — see store_stream_tree_cdc_internal
+                        // where emit_tree_chunk consumes Bytes
+                        // directly.
+                        if let Some(closed) = striper.push_chunk(chunk_bytes.to_vec(), cref)? {
                             flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
                         }
                     }
@@ -1502,7 +1508,7 @@ impl MeshBlobAdapter {
                     let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
                     self.store_chunk(&chunk_hash, &chunk_bytes).await?;
                     let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
-                    if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
+                    if let Some(closed) = striper.push_chunk(chunk_bytes.to_vec(), cref)? {
                         flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
                     }
                 }
@@ -1897,8 +1903,9 @@ impl MeshBlobAdapter {
     async fn emit_tree_chunk(
         &self,
         builder: &mut TreeBuilder,
-        chunk_bytes: Vec<u8>,
+        chunk_bytes: impl AsRef<[u8]>,
     ) -> Result<(), BlobError> {
+        let chunk_bytes = chunk_bytes.as_ref();
         if chunk_bytes.is_empty() {
             return Err(BlobError::Backend(
                 "emit_tree_chunk: zero-byte chunk".to_owned(),
@@ -1911,15 +1918,14 @@ impl MeshBlobAdapter {
                 TREE_LEAF_CHUNK_MAX_BYTES
             )));
         }
-        let hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
+        let hash: [u8; 32] = blake3::hash(chunk_bytes).into();
         let chunk_size = chunk_bytes.len() as u32;
         // Persist the chunk bytes first so a crash between this
         // and the tree-builder push leaves the chunk content-
         // addressed and reachable for any future re-attempt
         // (the chunk's hash matches its bytes regardless of
         // whether a tree references it yet).
-        self.store_chunk(&hash, &chunk_bytes).await?;
-        drop(chunk_bytes); // release memory now that store has it.
+        self.store_chunk(&hash, chunk_bytes).await?;
                            // Push into the builder; persist any cascade-closed nodes
                            // before returning.
         let closed = builder.push_chunk(ChunkRefV3::data(hash, chunk_size))?;

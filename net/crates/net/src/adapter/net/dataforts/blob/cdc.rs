@@ -38,6 +38,7 @@
 //! Production defaults (`max = 16 MiB`) bound the buffer at
 //! 16 MiB.
 
+use bytes::{Bytes, BytesMut};
 use fastcdc::v2020::{FastCDC, Normalization};
 
 use super::blob_tree::ChunkingStrategy;
@@ -251,8 +252,12 @@ impl CdcParams {
 pub struct CdcStreamChunker {
     /// Bytes appended via `extend` that haven't yet been emitted
     /// as confirmed chunks. Grows up to `params.max` between
-    /// cuts.
-    buffer: Vec<u8>,
+    /// cuts. `BytesMut` lets `try_next_chunk` `split_to` the
+    /// emitted prefix in O(1) — pre-fix, every emit copied
+    /// `chunk.length` bytes via `drain(..n).collect::<Vec<u8>>()`,
+    /// so a 16 MiB max-cap CDC blob paid ~16 MiB of memcpy per
+    /// chunk on top of the FastCDC scan.
+    buffer: BytesMut,
     params: CdcParams,
     /// Buffer length at the last `try_next_chunk` call that
     /// returned `None` without finding a confirmed cut. Used to
@@ -281,7 +286,7 @@ impl CdcStreamChunker {
     /// Construct a new chunker with the supplied parameter triple.
     pub fn new(params: CdcParams) -> Self {
         Self {
-            buffer: Vec::with_capacity(params.max as usize),
+            buffer: BytesMut::with_capacity(params.max as usize),
             params,
             last_unsuccessful_scan_len: None,
         }
@@ -319,7 +324,7 @@ impl CdcStreamChunker {
     ///    after it can't change the cut, OR
     /// 2. The buffer has reached `params.max` and the chunker
     ///    forced a hard cut at the maximum.
-    pub fn try_next_chunk(&mut self) -> Option<Vec<u8>> {
+    pub fn try_next_chunk(&mut self) -> Option<Bytes> {
         if self.buffer.is_empty() {
             return None;
         }
@@ -361,9 +366,11 @@ impl CdcStreamChunker {
             self.last_unsuccessful_scan_len = Some(self.buffer.len());
             return None;
         }
-        // `Vec::split_off` would also work but `drain` keeps
-        // capacity, avoiding the realloc churn between chunks.
-        let payload: Vec<u8> = self.buffer.drain(..chunk.length).collect();
+        // O(1) split — `BytesMut::split_to` adjusts the buffer's
+        // start cursor without copying the emitted bytes. Pre-fix
+        // the `drain(..n).collect::<Vec<u8>>()` pattern paid a
+        // full memcpy per chunk on top of the FastCDC scan.
+        let payload = self.buffer.split_to(chunk.length).freeze();
         // A productive emit invalidates the no-cut cache — the
         // post-drain buffer is structurally different and any
         // earlier "no cut" finding no longer applies.
@@ -378,7 +385,7 @@ impl CdcStreamChunker {
     ///
     /// Returns an empty `Vec` if `try_next_chunk` already drained
     /// the buffer dry.
-    pub fn finalize(&mut self) -> Vec<Vec<u8>> {
+    pub fn finalize(&mut self) -> Vec<Bytes> {
         let mut out = Vec::new();
         while !self.buffer.is_empty() {
             let chunker = FastCDC::with_level(
@@ -398,7 +405,9 @@ impl CdcStreamChunker {
                 // already rules out.
                 None => break,
             };
-            let payload: Vec<u8> = self.buffer.drain(..chunk.length).collect();
+            // Same O(1) split as `try_next_chunk` — see comment
+            // there for rationale.
+            let payload = self.buffer.split_to(chunk.length).freeze();
             out.push(payload);
         }
         out
@@ -544,7 +553,7 @@ mod tests {
     #[test]
     fn determinism_across_runs() {
         let payload = deterministic_bytes(3, 32 * 1024);
-        let chunk_run = |params: CdcParams, data: &[u8]| -> Vec<Vec<u8>> {
+        let chunk_run = |params: CdcParams, data: &[u8]| -> Vec<Bytes> {
             let mut c = CdcStreamChunker::new(params);
             c.extend(data);
             let mut out = Vec::new();
@@ -621,7 +630,7 @@ mod tests {
         let original = payload.clone();
         // Flip a byte at the rough midpoint.
         payload[64 * 1024] ^= 0xFF;
-        let chunk_set = |data: &[u8]| -> std::collections::HashSet<Vec<u8>> {
+        let chunk_set = |data: &[u8]| -> std::collections::HashSet<Bytes> {
             let mut c = CdcStreamChunker::new(TEST_PARAMS);
             c.extend(data);
             let mut out = std::collections::HashSet::new();
