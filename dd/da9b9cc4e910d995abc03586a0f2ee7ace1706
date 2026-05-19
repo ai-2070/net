@@ -1,0 +1,27 @@
+net/crates/net/bindings/python/src/blob.rs
+  s_2571835e05521c::t_1ca6fe9bc46ee0 265-306
+net/crates/net/src/adapter/net/dataforts/blob/mod.rs
+  s_2571835e05521c::t_51777e6b07b43f 17
+net/crates/net/bindings/python/src/lib.rs
+  s_2571835e05521c::t_4d13bac73d1029 2302,2309-2312
+net/crates/net/src/adapter/net/dataforts/blob/bandwidth.rs
+  s_2571835e05521c::t_bc34fda9132173 1-231
+net/crates/net/bindings/node/src/blob.rs
+  s_2571835e05521c::t_1fad8ba7ddc9f0 76-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "ddda9b9cc4e910d995abc03586a0f2ee7ace1706",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
