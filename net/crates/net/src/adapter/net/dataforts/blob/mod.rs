@@ -32,6 +32,7 @@ pub mod overflow;
 pub mod publish_with_blob;
 pub mod refcount;
 pub mod registry;
+pub mod stripe_index;
 
 /// Format a 32-byte content hash as the lowercase 64-char hex
 /// string used throughout the blob layer for channel names,

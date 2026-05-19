@@ -281,6 +281,14 @@ pub struct MeshBlobAdapter {
     /// path is needed.
     tree_node_cache:
         Option<Arc<parking_lot::Mutex<super::blob_tree_cache::TreeNodeCache>>>,
+    /// Per-adapter stripe-membership index for the v0.3 Phase C6
+    /// GC pin. RS stripes written via
+    /// [`Self::store_stream_tree_rs_internal`] register here;
+    /// [`Self::sweep_gc`] consults the index before sweeping any
+    /// chunk so a degraded-stripe parity chunk's refcount=0
+    /// briefly dropping doesn't lose the only thing keeping the
+    /// stripe recoverable.
+    stripe_index: Arc<parking_lot::Mutex<super::stripe_index::StripeMembershipIndex>>,
     /// Optional override for the `max_memory_bytes` field of every
     /// per-chunk `RedexFileConfig`. The default 64 MiB upstream
     /// default pre-reserves a 64 MiB heap `Vec` per opened chunk
@@ -317,6 +325,9 @@ impl MeshBlobAdapter {
             overflow_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tree_node_cache: None,
             chunk_file_max_memory_bytes: None,
+            stripe_index: Arc::new(parking_lot::Mutex::new(
+                super::stripe_index::StripeMembershipIndex::new(),
+            )),
         }
     }
 
@@ -861,6 +872,30 @@ impl MeshBlobAdapter {
         );
         let mut swept: u64 = 0;
         for hash in candidates {
+            // v0.3 Phase C6 GC stripe-membership pin. Before
+            // even attempting to take the refcount entry, check
+            // whether the chunk is a member of any registered RS
+            // stripe that's currently degraded. If yes, pin —
+            // skip the sweep so the only thing keeping a
+            // recoverable stripe alive doesn't vanish between
+            // dereference and operator-driven `repair_blob`.
+            //
+            // The presence-probe is the existing `chunk_exists`
+            // check (open-file probe). Acceptable cost — pin
+            // checks run only on chunks already past the
+            // refcount + retention gates.
+            //
+            // Index lookup misses (chunk not registered) fall
+            // through to the v0.2 sweep path unchanged.
+            let pinned_by_stripe = {
+                let idx = self.stripe_index.lock();
+                idx.should_pin_against_gc(&hash, |h| {
+                    self.chunk_exists(h).unwrap_or(false)
+                })
+            };
+            if pinned_by_stripe {
+                continue;
+            }
             // Atomic re-check + remove closes the TOCTOU window
             // between the deletable_hashes snapshot and the actual
             // delete — a concurrent `incr` (e.g. a freshly-folded
@@ -1240,6 +1275,16 @@ impl MeshBlobAdapter {
                 .filter(|c| c.is_data())
                 .count() as u64;
             *data_chunk_count = data_chunk_count.saturating_add(data_count);
+
+            // Register stripe membership for the v0.3 Phase C6
+            // GC pin. Only RS stripes need this — Replicated
+            // stripes have no parity dependency so the v0.2
+            // refcount + retention model is sufficient.
+            if let Encoding::ReedSolomon { k, .. } = closed.block.encoding {
+                let members: Vec<[u8; 32]> =
+                    closed.block.chunks.iter().map(|c| c.hash).collect();
+                adapter.stripe_index.lock().register_stripe(members, k);
+            }
 
             // Build the ErasureLeaf, persist as a Small blob.
             let leaf = super::blob_tree::TreeNode::erasure_leaf(vec![closed.block])?;
@@ -4393,6 +4438,109 @@ mod tests {
             .await
             .expect("RS fetch must reconstruct from parity");
         assert_eq!(fetched, payload, "reconstructed bytes must match original");
+    }
+
+    /// GC stripe-membership pin: when an RS stripe is degraded
+    /// (a data chunk is missing), every other member chunk in
+    /// the stripe — including parity chunks whose refcount is
+    /// zero and would otherwise be GC-eligible — is pinned
+    /// against the sweep. Validates v0.3 Phase C6 end-to-end.
+    #[tokio::test]
+    async fn sweep_gc_pins_parity_chunks_of_degraded_rs_stripe() {
+        let adapter = make_adapter();
+        let chunk_size: u32 = 4 * 1024;
+        let payload = deterministic_bytes(0xC6, chunk_size as usize * 4);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let blob_ref = adapter
+            .store_stream_tree_rs_internal(
+                stream_one(payload),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+
+        // Find the stripe's parity chunks.
+        let root_hash = *blob_ref.tree_root_hash().unwrap();
+        let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
+        let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
+            TreeNode::ErasureLeaf { .. } => root_bytes,
+            TreeNode::Internal { children } => {
+                adapter.fetch_chunk(&children[0].0).await.unwrap()
+            }
+            TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
+        };
+        let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
+            TreeNode::ErasureLeaf { stripes } => stripes,
+            other => panic!("expected ErasureLeaf, got: {:?}", other),
+        };
+        let parity_hashes: Vec<[u8; 32]> = stripes[0]
+            .chunks
+            .iter()
+            .filter(|c| c.is_parity())
+            .map(|c| c.hash)
+            .collect();
+        let data_hashes: Vec<[u8; 32]> = stripes[0]
+            .chunks
+            .iter()
+            .filter(|c| c.is_data())
+            .map(|c| c.hash)
+            .collect();
+
+        // Degrade the stripe by deleting 1 data chunk.
+        adapter.delete_chunk(&data_hashes[0]).await.unwrap();
+
+        // Force refcounts to zero on the parity chunks so they
+        // become GC candidates (otherwise sweep_gc wouldn't even
+        // consider them). `store_observed` from store_chunk only
+        // updates last_seen; refcount stays at whatever the
+        // table tracks. The default test fixture doesn't pin
+        // chunks, so they ARE refcount=0 already — just need to
+        // bypass the retention floor.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + (DEFAULT_RETENTION_FLOOR.as_millis() as u64 * 2);
+
+        // Run sweep with the future-stamped clock + disk-pressure
+        // bypass so every refcount=0 chunk is eligible. Without
+        // the C6 pin, every parity chunk would be swept here.
+        let _swept = adapter
+            .sweep_gc(now, /* disk_pressure_critical = */ true)
+            .await
+            .unwrap();
+
+        // Assert parity chunks still locally present — the C6
+        // pin prevented sweep because the stripe is degraded.
+        for phash in &parity_hashes {
+            assert!(
+                adapter.chunk_exists(phash).unwrap_or(false),
+                "parity chunk {:?} of a degraded stripe must be pinned against sweep",
+                phash
+            );
+        }
+        // And: the remaining data chunks (1..k) — same pin.
+        for dhash in &data_hashes[1..] {
+            assert!(
+                adapter.chunk_exists(dhash).unwrap_or(false),
+                "surviving data chunk {:?} of a degraded stripe must be pinned",
+                dhash
+            );
+        }
+
+        // Run repair: stripe goes from degraded back to healthy.
+        let report = adapter.repair_blob(&blob_ref).await.unwrap();
+        assert_eq!(report.stripes_repaired, 1);
+
+        // Now the same sweep run — with the stripe healthy — is
+        // free to proceed (no pin), so parity chunks become
+        // eligible if their refcount + retention says so.
+        // Re-checking that they're eligible post-repair would
+        // require driving a sweep that actually deletes; what
+        // matters for the C6 contract is the pin DID fire while
+        // degraded, which the assertions above confirmed.
+        let _ = report;
     }
 
     /// `repair_blob` restores missing data chunks of an
