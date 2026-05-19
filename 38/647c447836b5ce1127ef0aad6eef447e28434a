@@ -1,0 +1,92 @@
+net/crates/net/cli/src/commands/netdb.rs
+  s_418b910fc0e80b::t_629d91a5f21052 1008
+net/crates/net/cli/src/main.rs
+  s_418b910fc0e80b::t_2b463e68124c89 44-45,48
+  s_418b910fc0e80b::t_af36b9057a5ebf 180
+  s_418b910fc0e80b::t_78cfd1cfe6fac6 56-57,61-66
+  s_418b910fc0e80b::t_484923a2b5b58f 231
+net/crates/net/cli/src/config.rs
+  s_418b910fc0e80b::t_93f80c14cd8851 21
+  s_418b910fc0e80b::t_e9389ae7b86e42 97-98,101
+.github/workflows/release-npm.yml
+  s_418b910fc0e80b::t_14229aaae87717 3
+  s_418b910fc0e80b::t_0dcab8da40fd52 4
+.github/workflows/release-crates.yml
+  s_418b910fc0e80b::t_a43fb20223ca53 3,6,11,27,51,54,58,67
+  s_418b910fc0e80b::t_ebb8d5bddcc51e 7,71
+net/crates/net/deck/Cargo.toml
+  s_418b910fc0e80b::t_5b0c80332405a7 2,7-8,11,19
+  s_418b910fc0e80b::t_b35f040815c918 51-52
+net/crates/net/cli/src/commands/identity.rs
+  s_418b910fc0e80b::t_392bb8f4f2420c 402
+net/crates/net/bindings/go/compute-ffi/Cargo.toml
+  s_418b910fc0e80b::t_67425551571d78 48,52
+net/crates/net/fuzz/Cargo.toml
+  s_418b910fc0e80b::t_65154729e26d3e 34
+net/crates/net/bindings/python/pyproject.toml
+  s_418b910fc0e80b::t_7e50011319a69c 9
+.github/workflows/release-net-cli.yml
+  s_418b910fc0e80b::t_ee6de45e296e16 1-62
+net/crates/net/bindings/node/Cargo.toml
+  s_418b910fc0e80b::t_13db9255fee119 7
+  s_418b910fc0e80b::t_7bbf5ec997469c 19
+  s_418b910fc0e80b::t_362ebae6ceb6ea 124-125
+net/crates/net/bindings/go/meshdb-ffi/Cargo.toml
+  s_418b910fc0e80b::t_c5abce24440abe 29
+net/crates/net/sdk/Cargo.toml
+  s_418b910fc0e80b::t_97f39bc626a265 25
+  s_418b910fc0e80b::t_0b994486b1f88b 2
+  s_418b910fc0e80b::t_d969b623043509 18
+net/crates/net/bindings/go/meshos-ffi/Cargo.toml
+  s_418b910fc0e80b::t_b086c193100f3b 26
+.github/workflows/release-npm-sdk.yml
+  s_418b910fc0e80b::t_d271f542f26ac9 4
+  s_418b910fc0e80b::t_c92f92884c2171 3
+net/crates/net/deck/src/bookmarks.rs
+  s_418b910fc0e80b::t_18843c5efd94c2 287-288,292
+net/crates/net/Cargo.toml
+  s_418b910fc0e80b::t_e932e7f61ef39b 42
+  s_418b910fc0e80b::t_1cf6f9ee2701db 17
+  s_418b910fc0e80b::t_11b2e3ccc41238 35,37
+net/crates/net/sdk-ts/package.json
+  s_418b910fc0e80b::t_83aefea8b3795d 2
+  s_418b910fc0e80b::t_2dd500c6346ddc 32,35
+net/crates/net/bindings/node/package.json
+  s_418b910fc0e80b::t_101198d2adaf3c 2
+.github/workflows/release-net-deck.yml
+  s_418b910fc0e80b::t_d7566ae767badf 1-62
+.github/workflows/release-python.yml
+  s_418b910fc0e80b::t_62da9f449c0b30 5
+  s_418b910fc0e80b::t_0cc743597dbcc2 3,13
+net/crates/net/bindings/go/rpc-ffi/Cargo.toml
+  s_418b910fc0e80b::t_d2bf8cd570c2ce 30
+net/crates/net/sdk-py/pyproject.toml
+  s_418b910fc0e80b::t_80bb71129be0f1 9,14
+.github/workflows/release-pypi-sdk.yml
+  s_418b910fc0e80b::t_96be38e1b79906 4
+  s_418b910fc0e80b::t_93945685e516f5 3,14
+net/crates/net/bindings/python/Cargo.toml
+  s_418b910fc0e80b::t_7c71379421115d 20
+  s_418b910fc0e80b::t_61a017329e8066 106-107
+  s_418b910fc0e80b::t_3b4c7576d89a9f 7
+net/crates/net/cli/Cargo.toml
+  s_418b910fc0e80b::t_53a6efc7066063 5,7-8,11,15
+net/crates/net/bindings/go/deck-ffi/Cargo.toml
+  s_418b910fc0e80b::t_e323c882c0fe77 27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "38647c447836b5ce1127ef0aad6eef447e28434a",
+  "prompts": {},
+  "sessions": {
+    "s_418b910fc0e80b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c203d89c-8611-4800-ad8f-a767549fb906",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
