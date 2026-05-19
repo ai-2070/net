@@ -34,7 +34,7 @@ use net::adapter::net::cortex::{
     RequestStream, RpcClientStreamingHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
     RpcStreamingContext,
 };
-use net::adapter::net::mesh_rpc::{CallOptions, RpcError};
+use net::adapter::net::mesh_rpc::{CallOptions, CodecDirection, RpcError};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
@@ -402,5 +402,49 @@ async fn client_streaming_window_throttles_caller_send() {
     assert!(
         final_count >= 2,
         "server must observe at least 2 chunks (the two pre-block sends); got {final_count}"
+    );
+}
+
+/// Regression (cubic-dev-ai bot P2): `CallOptions::request_window_initial
+/// = Some(0)` must be rejected up front. The initial REQUEST is
+/// lazy (deferred until the first `send`), so a Some(0) caller
+/// would deadlock — `send().await` blocks waiting for a credit
+/// but the server never even sees the call, so it can never
+/// publish a REQUEST_GRANT. `None` means "no flow control" /
+/// unbounded credit and stays accepted; `Some(n>=1)` is the
+/// normal flow-control case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_client_stream_rejects_zero_request_window() {
+    let caller = build_node().await;
+    let target = 0xC0DE_u64;
+    let mut opts = CallOptions::default();
+    opts.request_window_initial = Some(0);
+    let err = caller
+        .call_client_stream(target, "anything", opts)
+        .await
+        .expect_err("Some(0) must be rejected before any wire traffic");
+    match err {
+        RpcError::Codec { direction, message } => {
+            assert_eq!(direction, CodecDirection::Encode);
+            assert!(
+                message.contains("request_window_initial"),
+                "diagnostic must name the offending option: {message}",
+            );
+        }
+        other => panic!("expected RpcError::Codec(Encode), got {other:?}"),
+    }
+
+    // Sanity: Some(1) still works (or at least gets past the
+    // validation — it'll later fail with NoRoute because no peer
+    // is wired up; we only care that we passed the deadlock guard).
+    let mut opts = CallOptions::default();
+    opts.request_window_initial = Some(1);
+    let err = caller
+        .call_client_stream(target, "anything", opts)
+        .await
+        .expect_err("no peer is connected; must fail with NoRoute, not Codec");
+    assert!(
+        !matches!(err, RpcError::Codec { .. }),
+        "Some(1) must clear the deadlock guard; got {err:?}",
     );
 }

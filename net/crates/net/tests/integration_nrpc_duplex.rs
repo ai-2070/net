@@ -29,7 +29,7 @@ use futures::StreamExt;
 use net::adapter::net::cortex::{
     RequestStream, RpcDuplexHandler, RpcHandlerError, RpcResponseSink, RpcStreamingContext,
 };
-use net::adapter::net::mesh_rpc::CallOptions;
+use net::adapter::net::mesh_rpc::{CallOptions, CodecDirection, RpcError};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
@@ -390,4 +390,30 @@ async fn duplex_cancel_from_caller_closes_both_halves() {
         observed.load(Ordering::SeqCst),
         "handler must observe ctx.cancellation after caller drops the handle"
     );
+}
+
+/// Regression (cubic-dev-ai bot P2): mirror of the client-stream
+/// guard for duplex. `Some(0)` would deadlock the upload sink the
+/// same way (initial REQUEST is lazy → server never sees the call
+/// → no GRANT ever lands); reject before any wire traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_duplex_rejects_zero_request_window() {
+    let caller = build_node().await;
+    let target = 0xC0DE_u64;
+    let mut opts = CallOptions::default();
+    opts.request_window_initial = Some(0);
+    let err = caller
+        .call_duplex(target, "anything", opts)
+        .await
+        .expect_err("Some(0) must be rejected before any wire traffic");
+    match err {
+        RpcError::Codec { direction, message } => {
+            assert_eq!(direction, CodecDirection::Encode);
+            assert!(
+                message.contains("request_window_initial"),
+                "diagnostic must name the offending option: {message}",
+            );
+        }
+        other => panic!("expected RpcError::Codec(Encode), got {other:?}"),
+    }
 }

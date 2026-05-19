@@ -1766,6 +1766,19 @@ impl MeshNode {
         service: &str,
         opts: CallOptions,
     ) -> Result<ClientStreamCallRaw, RpcError> {
+        // `request_window_initial = Some(0)` would deadlock the
+        // caller: every `send` awaits a credit, but the initial
+        // REQUEST is lazy (not emitted until the first send), so
+        // the server never sees the call and never publishes a
+        // GRANT. Reject up front — `None` means "unbounded credit",
+        // any positive value opts into flow control.
+        if matches!(opts.request_window_initial, Some(0)) {
+            return Err(RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: "request_window_initial must be None or >= 1; Some(0) deadlocks send"
+                    .to_string(),
+            });
+        }
         let request_channel =
             ChannelName::new(&format!("{service}.requests")).map_err(|e| RpcError::NoRoute {
                 target: target_node_id,
@@ -2002,6 +2015,16 @@ impl MeshNode {
         service: &str,
         opts: CallOptions,
     ) -> Result<DuplexCallRaw, RpcError> {
+        // Same deadlock guard as `call_client_stream`: Some(0)
+        // means "send must await a credit that can never arrive"
+        // because the initial REQUEST is lazy.
+        if matches!(opts.request_window_initial, Some(0)) {
+            return Err(RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: "request_window_initial must be None or >= 1; Some(0) deadlocks send"
+                    .to_string(),
+            });
+        }
         let request_channel =
             ChannelName::new(&format!("{service}.requests")).map_err(|e| RpcError::NoRoute {
                 target: target_node_id,
