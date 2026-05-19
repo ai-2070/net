@@ -1,0 +1,71 @@
+net/crates/net/src/adapter/net/redex/replication_budget.rs
+  s_2571835e05521c::t_d954d3ab1c705e 176-226,232-286
+  s_2571835e05521c::t_9ae34d57c3eb4d 66-84
+  s_2571835e05521c::t_fc10fe4160a379 560-627,632,634-638,640-642,661-779
+  s_2571835e05521c::t_983e580350de36 24-36
+  s_2571835e05521c::t_44607403282478 38-42
+  s_2571835e05521c::t_579686578a9640 628-631,633,639,643-660
+  s_2571835e05521c::t_858401c225bf47 125-130,134-140
+net/crates/net/src/adapter/net/redex/replication_runtime.rs
+  s_2571835e05521c::t_6ecb5f11f4b957 263-272
+  s_2571835e05521c::t_8fef9cecba5a85 3165,3241
+  s_2571835e05521c::t_e098c86c64aa81 921,2324-2325,2397-2398
+  s_2571835e05521c::t_f335cdb0a540e6 1864-1865
+net/crates/net/src/adapter/net/redex/bandwidth.rs
+  s_2571835e05521c::t_12fedf4ffc55cd 1-123
+net/crates/net/src/adapter/net/redex/replication_catchup.rs
+  s_2571835e05521c::t_42d5c04d4463e9 456,477,496,519,538,564,590,631,653,1014,1049,1063
+net/crates/net/src/adapter/net/redex/manager.rs
+  s_2571835e05521c::t_90d7a9aaecd083 605-608
+  s_2571835e05521c::t_a8bbc4d8b40309 668-669
+  s_2571835e05521c::t_2da10706eafe67 670-673
+net/crates/net/tests/redex_replication_dst.rs
+  s_2571835e05521c::t_e098c86c64aa81 337,1089
+net/crates/net/src/adapter/net/redex/replication_step.rs
+  s_2571835e05521c::t_1d0d016fbe5027 136-138
+  s_2571835e05521c::t_16fea72e260ce5 264
+  s_2571835e05521c::t_e098c86c64aa81 383,403,424,455,488,511,540,573,603,631,706,730,762,799,824,857,889,928
+net/crates/net/src/adapter/net/dataforts/blob/bandwidth.rs
+  s_2571835e05521c::t_a321cc8315bbd5 48-53
+net/crates/net/src/adapter/net/mesh.rs
+  s_2571835e05521c::t_42d5c04d4463e9 10592
+net/crates/net/tests/dataforts_blob_v3_cdc_conformance.rs
+  s_2571835e05521c::t_7d12905061f491 119-125
+net/crates/net/src/adapter/net/redex/replication_router.rs
+  s_2571835e05521c::t_e098c86c64aa81 311-312
+net/crates/net/tests/dataforts_blob_e2e.rs
+  s_2571835e05521c::t_1830e9ae488510 99-105
+net/crates/net/src/adapter/net/redex/replication_config.rs
+  s_2571835e05521c::t_0ce7d9ee72856a 321-333
+  s_2571835e05521c::t_dd10c55115164d 203-204
+  s_2571835e05521c::t_ceb5f2ca62adbd 162-182
+  s_2571835e05521c::t_6aaa92212a18af 247-269
+  s_2571835e05521c::t_2c6e0466737b43 66-72
+  s_2571835e05521c::t_282a3527c99884 415-422
+net/crates/net/src/adapter/net/redex/replication.rs
+  s_2571835e05521c::t_0e182433df7ae8 61-66,69-73
+  s_2571835e05521c::t_dda53d3773b333 203-204,224-231
+  s_2571835e05521c::t_75a91ed8e3f19c 406-408,410,416-417,421-427,441-447,453
+  s_2571835e05521c::t_42d5c04d4463e9 794,815,830,849
+  s_2571835e05521c::t_08ab1127f8ae8e 852-858,862-864
+  s_2571835e05521c::t_c6f9abe6a05618 743,746-751,756-782
+net/crates/net/src/adapter/net/redex/mod.rs
+  s_2571835e05521c::t_f2418ce9285b89 20
+  s_2571835e05521c::t_79005114081d39 49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "f906175f45f0fbf029b56454e60f262abed27c13",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
