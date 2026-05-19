@@ -602,6 +602,10 @@ impl Redex {
 
         let heartbeat_ms = cfg.heartbeat_ms;
         let budget_fraction = cfg.replication_budget_fraction;
+        // v0.3 Phase D2: snapshot the bandwidth-class config
+        // before `cfg` moves into the coordinator below.
+        let default_bandwidth_class = cfg.default_bandwidth_class;
+        let background_fraction = cfg.background_fraction;
         // TODO(plan-§6): wire the measured NIC peak from the
         // proximity-graph throughput probe here. Until that
         // lands, use a 1 Gbps placeholder (125_000_000 B/s).
@@ -661,6 +665,12 @@ impl Redex {
             tail_provider,
             rtt_lookup,
             file: file.clone(),
+            // v0.3 Phase D2: per-channel bandwidth-class default
+            // + background-fraction admission threshold, sourced
+            // from the ReplicationConfig fields (snapshotted
+            // above before `cfg` moved into the coordinator).
+            default_bandwidth_class,
+            background_fraction,
         };
 
         let handle = Arc::new(spawn_replication_runtime(

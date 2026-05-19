@@ -308,6 +308,8 @@ mod tests {
             tail_provider: Arc::new(|| 0),
             rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
             file,
+            default_bandwidth_class: Default::default(),
+            background_fraction: 0.3,
         };
         let budget = Arc::new(Mutex::new(BandwidthBudget::new(
             0.5,

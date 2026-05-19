@@ -45,39 +45,12 @@
 pub const DATAFORTS_BLOB_BANDWIDTH_CLASS_SUPPORTED: &str =
     "dataforts:blob-bandwidth-class-supported";
 
-/// Per-stream bandwidth class hint. Drives the replication-budget
-/// admission gate + per-channel send-queue priority + anti-
-/// starvation hatch in v0.3 Phase D's blob path.
-///
-/// All three variants exist on the wire surface today; the
-/// behavioral wiring (admission, priority, starvation) lands in
-/// Phase D2-D4 as separate commits. Until then, the substrate
-/// treats the class as a hint and serves every fetch/store
-/// uniformly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BandwidthClass {
-    /// Default for interactive workloads — user-driven fetches,
-    /// normal RPC responses, anything a person is waiting on.
-    /// Polls before [`Background`](Self::Background) in the
-    /// per-channel send loop (once D3 lands).
-    Foreground,
-    /// Long-running TB-scale background work — backfills,
-    /// migrations, cold-blob warming. Bounded to a configured
-    /// fraction (plan default 30 %) of the per-channel rate so
-    /// it can't saturate the budget and starve Foreground.
-    Background,
-    /// Operator-pinned. Bypasses the per-class rate budget but
-    /// still respects disk-pressure circuit-breakers. Reserved
-    /// for control-plane traffic and operator-triggered repair
-    /// sweeps.
-    Realtime,
-}
-
-impl Default for BandwidthClass {
-    fn default() -> Self {
-        Self::Foreground
-    }
-}
+// `BandwidthClass` lives canonically in the redex layer (see
+// `crate::adapter::net::redex::bandwidth`) so the replication
+// runtime can consume it without a dataforts→replication
+// dependency. Re-exported here so existing dataforts-blob
+// consumers see no surface change.
+pub use crate::adapter::net::redex::BandwidthClass;
 
 /// Producer-side hook for the bandwidth-class downgrade decision.
 ///

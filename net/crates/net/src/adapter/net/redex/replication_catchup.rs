@@ -453,6 +453,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 4096,
             request_id: 0,
+            class: Default::default(),
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -473,6 +474,7 @@ mod tests {
             since_seq: f.next_seq(),
             chunk_max: 4096,
             request_id: 0,
+            class: Default::default(),
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -491,6 +493,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 4096,
             request_id: 0,
+            class: Default::default(),
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -513,6 +516,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 4096,
             request_id: 0,
+            class: Default::default(),
         };
         let SyncRequestOutcome::Nack { error_code, .. } = handle_sync_request(&f, &req, expected)
         else {
@@ -531,6 +535,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 0,
             request_id: 0,
+            class: Default::default(),
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -556,6 +561,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 60,
             request_id: 0,
+            class: Default::default(),
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -581,6 +587,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 50, // smaller than the first event alone
             request_id: 0,
+            class: Default::default(),
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -621,6 +628,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 100,
             request_id: 0,
+            class: Default::default(),
         };
         // Confirm the normal-size path still works (i.e. our
         // new guard didn't break shipping legitimate events).
@@ -642,6 +650,7 @@ mod tests {
             since_seq: 100, // well past tail
             chunk_max: 4096,
             request_id: 0,
+            class: Default::default(),
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
             panic!("expected Response");
@@ -1002,6 +1011,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 4096,
             request_id: 0,
+            class: Default::default(),
         };
         let SyncRequestOutcome::Response(resp) = handle_sync_request(&leader, &req, cid) else {
             panic!("expected Response");
@@ -1036,6 +1046,7 @@ mod tests {
             since_seq: 0,
             chunk_max: 60,
             request_id: 0,
+            class: Default::default(),
         };
         let SyncRequestOutcome::Response(r1) = handle_sync_request(&leader, &req1, cid) else {
             panic!();
@@ -1049,6 +1060,7 @@ mod tests {
             since_seq: replica.next_seq(),
             chunk_max: 60,
             request_id: 0,
+            class: Default::default(),
         };
         let SyncRequestOutcome::Response(r2) = handle_sync_request(&leader, &req2, cid) else {
             panic!();

@@ -260,6 +260,16 @@ pub struct RuntimeInputs {
     /// `SyncResponse` frames (replica path). The
     /// `tail_provider` closure typically wraps `file.next_seq()`.
     pub file: RedexFile,
+    /// Per-channel default [`BandwidthClass`] — stamped on every
+    /// `SyncRequest` the runtime emits. v0.3 Phase D2. Sourced
+    /// from
+    /// [`ReplicationConfig::default_bandwidth_class`](super::replication_config::ReplicationConfig).
+    pub default_bandwidth_class: super::bandwidth::BandwidthClass,
+    /// v0.3 Phase D2 admission-gate parameter: fraction of the
+    /// bandwidth bucket capacity reserved against `Background`.
+    /// Default 0.3 via
+    /// [`ReplicationConfig::background_fraction`](super::replication_config::ReplicationConfig).
+    pub background_fraction: f32,
 }
 
 /// Handle the spawned task produces. Holds the inbox sender so
@@ -908,6 +918,7 @@ async fn on_tick(
             wall_clock_ms,
             chunk_max_bytes: SYNC_REQUEST_CHUNK_MAX_DEFAULT,
             now,
+            default_bandwidth_class: Default::default(),
         });
         let lag = observe_lag(
             current_role,
@@ -1850,6 +1861,8 @@ mod tests {
             tail_provider: Arc::new(|| 42),
             rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
             file: build_file_for_tests(),
+            default_bandwidth_class: Default::default(),
+            background_fraction: 0.3,
         }
     }
 
@@ -2308,6 +2321,8 @@ mod tests {
             tail_provider: Arc::new(|| 100),
             rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
             file: build_file_for_tests(),
+            default_bandwidth_class: Default::default(),
+            background_fraction: 0.3,
         };
         let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, peer_id]);
         // Promote to Leader via the state machine.
@@ -2379,6 +2394,8 @@ mod tests {
             tail_provider: Arc::new(|| 77),
             rtt_lookup: Arc::new(|_| Some(Duration::from_millis(5))),
             file: build_file_for_tests(),
+            default_bandwidth_class: Default::default(),
+            background_fraction: 0.3,
         };
         let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, peer_id]);
         for (role, signal) in [
@@ -3145,6 +3162,7 @@ mod tests {
                 since_seq: 0,
                 chunk_max: 1024,
                 request_id: 0,
+                class: Default::default(),
             },
         };
         // Simulate the role flipping between the entry check and
@@ -3220,6 +3238,7 @@ mod tests {
                 since_seq: 0,
                 chunk_max: 1024,
                 request_id: 0,
+                class: Default::default(),
             },
         };
         let tracker = Arc::new(Mutex::new(HeartbeatTracker::new(100)));

@@ -116,6 +116,13 @@ async fn collect_chunk_hashes(
                     stack.push(child_hash);
                 }
             }
+            TreeNode::ErasureLeaf { stripes } => {
+                for stripe in stripes {
+                    for chunk in stripe.chunks {
+                        out.insert(chunk.hash);
+                    }
+                }
+            }
             TreeNode::Leaf { chunks } => {
                 for chunk in chunks {
                     out.insert(chunk.hash);

@@ -334,6 +334,7 @@ impl VirtualCluster {
                 wall_clock_ms: self.now.duration_since(self.initial_now).as_millis() as u64,
                 chunk_max_bytes: DST_CHUNK_MAX_BYTES,
                 now: self.now,
+                default_bandwidth_class: Default::default(),
             })
         };
 
@@ -1085,6 +1086,7 @@ fn wall_clock_ms_is_deterministic_function_of_step_counter() {
                 wall_clock_ms: cluster.now.duration_since(cluster.initial_now).as_millis() as u64,
                 chunk_max_bytes: DST_CHUNK_MAX_BYTES,
                 now: cluster.now,
+                default_bandwidth_class: Default::default(),
             });
             for msg in outcome.outbound {
                 if let OutboundMessage::Heartbeat { msg, .. } = msg {

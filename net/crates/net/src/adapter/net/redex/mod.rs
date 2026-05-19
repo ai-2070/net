@@ -17,6 +17,7 @@
 //! `ReplicationCoordinator`, heartbeat loop, and election
 //! integration land in later phases.
 
+mod bandwidth;
 mod config;
 #[cfg(feature = "redex-disk")]
 mod disk;
@@ -45,6 +46,7 @@ mod segment;
 mod typed;
 mod write_token;
 
+pub use bandwidth::BandwidthClass;
 pub use config::{FsyncPolicy, RedexFileConfig};
 pub use entry::{RedexEntry, RedexFlags, REDEX_ENTRY_SIZE};
 pub use error::RedexError;

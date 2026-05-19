@@ -96,6 +96,13 @@ async fn drive_chunk_roles_for(blob_ref: &BlobRef, redex_a: &Arc<Redex>, redex_b
     let hashes: Vec<[u8; 32]> = match blob_ref {
         BlobRef::Small { hash, .. } => vec![*hash],
         BlobRef::Manifest { chunks, .. } => chunks.iter().map(|c| c.hash).collect(),
+        BlobRef::Tree { .. } => {
+            // v0.3 Tree-encoded blobs traverse the per-chunk
+            // replication coordinators via the substrate's
+            // manifest walk; the e2e test only exercises v0.2
+            // Manifest/Small flavors today.
+            panic!("Tree BlobRef not exercised by drive_chunk_roles_for in this e2e harness");
+        }
     };
     for hash in hashes {
         let channel = MeshBlobAdapter::chunk_channel_for_hash(&hash);

@@ -133,6 +133,9 @@ pub struct TickInputs<'a> {
     /// Current instant — passed to [`HeartbeatTracker`] for
     /// silence checks.
     pub now: Instant,
+    /// Per-channel default bandwidth class. Stamped on every
+    /// emitted `SyncRequest`. v0.3 Phase D2.
+    pub default_bandwidth_class: super::bandwidth::BandwidthClass,
 }
 
 /// What [`tick`] returns.
@@ -258,6 +261,7 @@ pub fn tick(inputs: TickInputs<'_>) -> StepOutcome {
                             // and cannot draw entropy or mutate the
                             // pending state.
                             request_id: 0,
+                            class: inputs.default_bandwidth_class,
                         },
                     });
                 }
@@ -376,6 +380,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now: t0(),
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         assert!(outcome.outbound.is_empty());
@@ -395,6 +400,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now: t0(),
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         assert!(outcome.outbound.is_empty());
@@ -415,6 +421,7 @@ mod tests {
             wall_clock_ms: 1_700_000_000_000,
             chunk_max_bytes: 0,
             now: t0(),
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         assert_eq!(outcome.outbound.len(), 3);
@@ -445,6 +452,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now: t0(),
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         assert_eq!(outcome.outbound.len(), 2);
@@ -477,6 +485,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now: t0(),
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         // Self is the only member; no peer to send to.
@@ -499,6 +508,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now: t0(),
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         assert_eq!(outcome.outbound.len(), 1);
@@ -527,6 +537,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now,
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         // Heartbeat emitted to the (now-silent) leader.
@@ -559,6 +570,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now,
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         assert!(outcome.transition.is_none());
@@ -588,6 +600,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now,
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         assert!(outcome.transition.is_none());
@@ -615,6 +628,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now,
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         assert!(outcome.transition.is_none());
@@ -689,6 +703,7 @@ mod tests {
             wall_clock_ms: 1234,
             chunk_max_bytes: 0,
             now: t0(),
+            default_bandwidth_class: Default::default(),
         };
         let a = tick(mk_inputs());
         let b = tick(mk_inputs());
@@ -712,6 +727,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 0,
             now: t0(),
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         let OutboundMessage::Heartbeat { msg, .. } = &outcome.outbound[0] else {
@@ -743,6 +759,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 256 * 1024,
             now: at(base, 100),
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         // One heartbeat to the leader + one SyncRequest to the
@@ -779,6 +796,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 256 * 1024,
             now: at(base, 100),
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         // Only the heartbeat — no SyncRequest, no transition.
@@ -803,6 +821,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 256 * 1024,
             now: t0(),
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         // Heartbeat to peer 0x42, but no SyncRequest (no leader
@@ -835,6 +854,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 256 * 1024,
             now: at(base, 100),
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         assert!(outcome
@@ -866,6 +886,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 256 * 1024,
             now,
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         // Heartbeat is still emitted (Replica heartbeats regardless),
@@ -904,6 +925,7 @@ mod tests {
             wall_clock_ms: 0,
             chunk_max_bytes: 256 * 1024,
             now: at(base, 100),
+            default_bandwidth_class: Default::default(),
         };
         let outcome = tick(inputs);
         // No SyncRequest addressed to anyone; the believed
