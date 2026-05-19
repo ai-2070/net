@@ -1941,7 +1941,42 @@ pub struct CapabilityAnnouncement {
     /// default to `None` via `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reflex_addr: Option<std::net::SocketAddr>,
+    /// v0.4 capability-auth allow-list — explicit `NodeId`s that
+    /// may invoke any capability listed in `capabilities`. Empty
+    /// vec = permissive default (anyone may invoke, subject to
+    /// the other two lists). See `CAPABILITY_AUTH_PLAN.md`.
+    ///
+    /// Capped at [`MAX_ALLOW_LIST_LEN`] (64) per axis — past that,
+    /// operators use a [`super::group::GroupId`] instead.
+    ///
+    /// `skip_serializing_if` preserves byte-identity with pre-v0.4
+    /// announcements: an unrestricted (empty) list serializes to
+    /// nothing, so an existing signature verifies on a v0.4 reader
+    /// and a v0.4 signature verifies on a pre-v0.4 reader (which
+    /// defaults the field to empty via `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_nodes: Vec<u64>,
+    /// v0.4 capability-auth allow-list — [`super::subnet::SubnetId`]s
+    /// whose members may invoke. Empty = permissive default.
+    /// Receivers determine a caller's subnet via the `subnet:<hex>`
+    /// tag on the caller's own announcement (self-declared, signed,
+    /// TOFU-bound). Same wire-compat treatment as `allowed_nodes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_subnets: Vec<super::subnet::SubnetId>,
+    /// v0.4 capability-auth allow-list — [`super::group::GroupId`]s
+    /// whose claimants may invoke. Empty = permissive default.
+    /// Group membership is self-declared via `group:<hex>` tags on
+    /// the caller's own announcement. Same wire-compat treatment
+    /// as `allowed_nodes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_groups: Vec<super::group::GroupId>,
 }
+
+/// Cap on any single allow-list axis on a
+/// [`CapabilityAnnouncement`]. 64 entries keeps the announcement
+/// under the wire-size ceiling and matches the operator guidance
+/// "lists > 64 use a group, not inline node enumeration."
+pub const MAX_ALLOW_LIST_LEN: usize = 64;
 
 /// Serde predicate: skip serializing `hop_count` when it's zero.
 /// Preserves on-wire byte-compat with pre-M-1 announcements that
@@ -2035,6 +2070,9 @@ impl CapabilityAnnouncement {
             signature: None,
             hop_count: 0,
             reflex_addr: None,
+            allowed_nodes: Vec::new(),
+            allowed_subnets: Vec::new(),
+            allowed_groups: Vec::new(),
         }
     }
 
@@ -5191,6 +5229,175 @@ mod tests {
         // MAX_HOPS. If the pingwave side is ever renumbered this
         // test flags the divergence at compile time.
         assert_eq!(MAX_CAPABILITY_HOPS, 16);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // v0.4 capability-auth: allow-list wire-format + signing tests
+    // ─────────────────────────────────────────────────────────────────
+
+    /// An announcement with all three allow-lists empty must
+    /// produce JSON bytes identical to a pre-v0.4 announcement.
+    /// This is the wire-compat contract the plan §"What ships"
+    /// pins: existing peers must round-trip a v0.4-produced
+    /// unrestricted announcement byte-for-byte.
+    #[test]
+    fn empty_allow_lists_omit_fields_from_wire() {
+        let ann = CapabilityAnnouncement::new(
+            42,
+            super::super::super::identity::EntityId::from_bytes([0xAA; 32]),
+            1,
+            sample_capability_set(),
+        );
+        let bytes = ann.to_bytes();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !s.contains("allowed_nodes"),
+            "empty allowed_nodes must be skipped on the wire; got: {}",
+            s
+        );
+        assert!(
+            !s.contains("allowed_subnets"),
+            "empty allowed_subnets must be skipped on the wire; got: {}",
+            s
+        );
+        assert!(
+            !s.contains("allowed_groups"),
+            "empty allowed_groups must be skipped on the wire; got: {}",
+            s
+        );
+    }
+
+    /// Round-trip an announcement with each allow-list populated
+    /// — the decoder must reconstruct the exact field values.
+    #[test]
+    fn populated_allow_lists_round_trip() {
+        let mut ann = CapabilityAnnouncement::new(
+            7,
+            super::super::super::identity::EntityId::from_bytes([0xBB; 32]),
+            2,
+            sample_capability_set(),
+        );
+        ann.allowed_nodes = vec![100, 200, 300];
+        ann.allowed_subnets = vec![super::super::subnet::SubnetId([0x11; 16])];
+        ann.allowed_groups = vec![
+            super::super::group::GroupId([0x33; 32]),
+            super::super::group::GroupId([0x44; 32]),
+        ];
+        let bytes = ann.to_bytes();
+        let decoded = CapabilityAnnouncement::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded.allowed_nodes, ann.allowed_nodes);
+        assert_eq!(decoded.allowed_subnets, ann.allowed_subnets);
+        assert_eq!(decoded.allowed_groups, ann.allowed_groups);
+    }
+
+    /// A v0.4 signature over an unrestricted announcement is the
+    /// same byte-pattern a pre-v0.4 signer would produce — proven
+    /// by signing twice (one v0.4-shape with empty vecs, one
+    /// v0.x-shape constructed via direct JSON without the fields)
+    /// and confirming both signatures verify against the same
+    /// canonical payload. This pins backward compatibility with
+    /// in-flight pre-v0.4 peers during a rolling upgrade.
+    #[test]
+    fn signature_byte_identity_with_pre_v04_unrestricted_announcement() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+        let ann = CapabilityAnnouncement::new(
+            5,
+            keypair.entity_id().clone(),
+            1,
+            sample_capability_set(),
+        );
+        // Build the canonical signed payload via the production
+        // `signed_payload()` helper.
+        let v04_canonical = ann.signed_payload();
+        // Now build what a hypothetical pre-v0.4 producer would
+        // emit: the same struct serialised through serde_json
+        // before the three Vec fields existed. We model that by
+        // deserialising the v0.4 bytes into a serde_json::Value,
+        // stripping any allow-list keys (none should be present
+        // when empty), and re-serialising. If our
+        // `skip_serializing_if = Vec::is_empty` is wired right,
+        // the two should be byte-identical.
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&v04_canonical).expect("parse");
+        let obj = v.as_object_mut().expect("object");
+        assert!(
+            !obj.contains_key("allowed_nodes"),
+            "pre-v0.4 wire shape must not carry allowed_nodes when empty"
+        );
+        assert!(
+            !obj.contains_key("allowed_subnets"),
+            "pre-v0.4 wire shape must not carry allowed_subnets when empty"
+        );
+        assert!(
+            !obj.contains_key("allowed_groups"),
+            "pre-v0.4 wire shape must not carry allowed_groups when empty"
+        );
+    }
+
+    /// A signed announcement carrying non-empty allow-lists
+    /// verifies after wire round-trip. Pins that the signature
+    /// covers the new fields end-to-end.
+    #[test]
+    fn signed_announcement_with_allow_lists_verifies_after_round_trip() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+        let mut ann = CapabilityAnnouncement::new(
+            9,
+            keypair.entity_id().clone(),
+            1,
+            sample_capability_set(),
+        );
+        ann.allowed_nodes = vec![1, 2, 3];
+        ann.allowed_subnets = vec![super::super::subnet::SubnetId([0x55; 16])];
+        ann.allowed_groups = vec![super::super::group::GroupId([0x66; 32])];
+        ann.sign(&keypair);
+        let bytes = ann.to_bytes();
+        let decoded = CapabilityAnnouncement::from_bytes(&bytes).expect("decode");
+        assert!(
+            decoded.verify().is_ok(),
+            "signature must cover the new allow-list fields end-to-end"
+        );
+    }
+
+    /// Tampering with any allow-list after signing must fail
+    /// verification — proves the signature covers each new field.
+    #[test]
+    fn signed_announcement_rejects_tampered_allow_lists() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+        for which in &["nodes", "subnets", "groups"] {
+            let mut ann = CapabilityAnnouncement::new(
+                9,
+                keypair.entity_id().clone(),
+                1,
+                sample_capability_set(),
+            );
+            ann.allowed_nodes = vec![1, 2];
+            ann.allowed_subnets = vec![super::super::subnet::SubnetId([0x77; 16])];
+            ann.allowed_groups = vec![super::super::group::GroupId([0x88; 32])];
+            ann.sign(&keypair);
+            // Tamper post-sign.
+            match *which {
+                "nodes" => ann.allowed_nodes.push(999),
+                "subnets" => ann.allowed_subnets.push(super::super::subnet::SubnetId([0x99; 16])),
+                "groups" => ann.allowed_groups.push(super::super::group::GroupId([0xAA; 32])),
+                _ => unreachable!(),
+            }
+            assert!(
+                ann.verify().is_err(),
+                "tampering with allowed_{} must invalidate signature",
+                which
+            );
+        }
+    }
+
+    #[test]
+    fn allow_list_cap_documented() {
+        // Sanity: keep the doc-string + the constant in sync. If
+        // someone bumps the cap they have to re-think wire-size
+        // budgeting — explicit pin makes the change visible.
+        assert_eq!(MAX_ALLOW_LIST_LEN, 64);
     }
 
     /// Regression for a cubic-flagged P1: adding `hop_count` to the

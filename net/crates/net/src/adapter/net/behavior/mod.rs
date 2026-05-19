@@ -17,6 +17,8 @@ pub mod broadcast;
 pub mod capability;
 pub mod context;
 pub mod dataforts_capabilities;
+pub mod group;
+pub mod subnet;
 #[cfg(feature = "meshos")]
 pub mod deck;
 pub mod diff;
