@@ -324,22 +324,31 @@ upgrade ceremony.
 
 ---
 
-## Open questions
+## Locked design points
 
-1. **Should `may_execute` also check the *caller's* announcement
-   (the receiver's view of "is this caller real"), or just trust
-   the wire-level entity binding?** Default: trust the wire-level
-   binding (which `handle_capability_announcement` already
-   establishes via TOFU). The caller's announcement isn't needed
-   because the execute-gate doesn't care about the caller's
-   capabilities, just their identity + subnet/group membership.
+These three were open in an earlier draft and are now confirmed.
+Recorded inline so the implementation doesn't re-litigate them.
 
-2. **Should the allow-list checks short-circuit on first match (per
-   the pseudocode above) or scan all three in case of operator
-   intent ambiguity?** Default: short-circuit. The three lists are
-   union-semantics, so any match suffices; there's no precedence
-   issue because there are no deny rules.
+1. **Caller identity comes from the wire binding only.**
+   `may_execute` does NOT consult the caller's own
+   `CapabilityAnnouncement`. The TOFU + signature path in
+   `handle_capability_announcement` already binds `EntityId →
+   NodeId` cryptographically; that's the identity the gate trusts.
+   The execute-gate cares about *who the caller is*, not *what
+   capabilities they offer* — checking the caller's announcement
+   would add a dependency cycle (a peer needs to publish an
+   announcement just to call anything) for no gain in safety.
 
-3. **Do we need a `net cap revoke` CLI shortcut, or is `net cap
-   announce` with a tighter allow-list good enough?** Default:
-   no shortcut — `announce` is the only verb.
+2. **Allow-list scans short-circuit on first match.** Semantics
+   are union — node OR subnet OR group — and there are no deny
+   rules, so any match suffices and there's no operator ambiguity
+   to resolve. The pseudocode in §3 reflects this: return `true`
+   the moment any list matches, fall through to `false` otherwise.
+
+3. **One CLI verb: `net cap announce`. No `revoke`.**
+   Revocation IS a new announcement with a tighter allow-list (or
+   `[only_me]` to deny everyone else). A separate `revoke` verb
+   adds operator surface area without adding semantics — every
+   revocation is just an announce with different bytes, so
+   collapsing it into one command keeps the audit trail uniform
+   and the CLI minimal.
