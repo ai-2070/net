@@ -494,3 +494,146 @@ fn metrics_body_includes_overflow_counter_family() {
         );
     }
 }
+
+// ============================================================================
+// v0.3 Phase C/D subcommands (negative-path coverage)
+// ============================================================================
+//
+// `repair`, `tree`, `verify`, `path` operate on `BlobRef::Tree`
+// blobs. The CLI's `put` only produces `BlobRef::Small`, so
+// happy-path coverage would require either a new `put-tree`
+// subcommand or in-process library calls (which breaks the
+// spawn-bin integration pattern). Until either lands, the tests
+// below pin the negative paths: bad inputs surface as typed
+// errors with nonzero exit, never as panics or silent success.
+
+/// Stable test hash — 64 hex chars, content-irrelevant. The
+/// subcommands construct a BlobRef::Tree from it; any chunk
+/// fetch on this hash will miss (the chunk store is empty).
+const DUMMY_HASH: &str =
+    "deadbeef00000000000000000000000000000000000000000000000000000000";
+
+#[test]
+fn path_subcommand_rejects_offset_at_or_past_size() {
+    let tmp = TempDir::new("path-offset-oob");
+    let out = run_net_blob(
+        tmp.path(),
+        &["path", DUMMY_HASH, "--size", "1024", "--depth", "1", "--offset", "1024"],
+    );
+    assert!(!out.status.success(), "offset == size must exit nonzero");
+    let stderr = stderr_string(&out);
+    assert!(
+        stderr.contains("offset") && stderr.contains("size"),
+        "expected an offset-vs-size diagnostic, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn tree_subcommand_on_missing_root_exits_cleanly() {
+    let tmp = TempDir::new("tree-missing-root");
+    let out = run_net_blob(
+        tmp.path(),
+        &["tree", DUMMY_HASH, "--size", "1024", "--depth", "1"],
+    );
+    assert!(
+        !out.status.success(),
+        "tree on a hash that doesn't exist locally must exit nonzero"
+    );
+    // No panic — stderr carries a typed error, not a thread dump.
+    let stderr = stderr_string(&out);
+    assert!(
+        !stderr.contains("panicked"),
+        "tree must surface a clean error, not panic. stderr:\n{}",
+        stderr
+    );
+}
+
+#[test]
+fn repair_subcommand_on_missing_root_exits_cleanly() {
+    let tmp = TempDir::new("repair-missing-root");
+    let out = run_net_blob(
+        tmp.path(),
+        &["repair", DUMMY_HASH, "--size", "1024", "--depth", "1"],
+    );
+    assert!(
+        !out.status.success(),
+        "repair on a missing root must exit nonzero"
+    );
+    let stderr = stderr_string(&out);
+    assert!(
+        !stderr.contains("panicked"),
+        "repair must surface a clean error, not panic. stderr:\n{}",
+        stderr
+    );
+}
+
+#[test]
+fn verify_subcommand_on_missing_root_reports_missing_count() {
+    let tmp = TempDir::new("verify-missing-root");
+    // `--format` is a top-level flag (precedes the subcommand)
+    // per the CLI's clap layout.
+    let out = Command::new(net_blob())
+        .args([
+            "-d",
+            tmp.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "verify",
+            DUMMY_HASH,
+            "--size",
+            "1024",
+            "--depth",
+            "1",
+        ])
+        .output()
+        .expect("spawn net-blob");
+    // verify treats a missing root as `missing: 1` rather than
+    // a hard error — the verify CLI's job is to count, not to
+    // panic on absence. Exit 2 signals the operator that
+    // something needs attention.
+    assert!(
+        !out.status.success(),
+        "verify with anything missing/corrupted must exit nonzero"
+    );
+    let stdout = stdout_string(&out);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("verify --format json must emit valid JSON");
+    let missing = parsed["missing"].as_u64().expect("missing field");
+    assert!(missing >= 1, "missing root must be counted; got: {}", stdout);
+}
+
+#[test]
+fn tree_repair_verify_path_rejects_malformed_hash() {
+    // Every Phase C/D subcommand parses the hash via the same
+    // parse_hash helper. Non-hex / wrong-length input should
+    // produce a clean parse error, not a panic.
+    let tmp = TempDir::new("malformed-hash");
+    let bogus = "not-a-real-hash";
+    for subcommand in &["tree", "repair", "verify"] {
+        let out = run_net_blob(
+            tmp.path(),
+            &[*subcommand, bogus, "--size", "1024", "--depth", "1"],
+        );
+        assert!(
+            !out.status.success(),
+            "{} with malformed hash must exit nonzero",
+            subcommand
+        );
+        let stderr = stderr_string(&out);
+        assert!(
+            !stderr.contains("panicked"),
+            "{} must clean-error on bad hash, not panic. stderr:\n{}",
+            subcommand,
+            stderr
+        );
+    }
+    // `path` takes the same parse_hash plus --offset.
+    let out = run_net_blob(
+        tmp.path(),
+        &["path", bogus, "--size", "1024", "--depth", "1", "--offset", "0"],
+    );
+    assert!(!out.status.success());
+    let stderr = stderr_string(&out);
+    assert!(!stderr.contains("panicked"));
+}
