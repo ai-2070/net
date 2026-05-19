@@ -892,6 +892,34 @@ impl MeshBlobAdapter {
     /// than `deletable_hashes` if some chunk-file deletes failed —
     /// the failures are logged but the refcount entry is left in
     /// place so the next sweep retries).
+    // WARNING: cold-start parity-pin gap.
+    //
+    // The stripe-membership index that protects degraded-stripe
+    // parity chunks from sweep is **per-adapter and in-memory**
+    // (see `stripe_index.rs` module doc). After a process restart,
+    // stripes only re-register lazily — when a `fetch_range` walk
+    // reaches an `ErasureLeaf` and calls `register_stripe` inside
+    // the walker.
+    //
+    // A blob that hasn't been read since the restart has NO
+    // entries in the index. If GC fires before any reader touches
+    // that cold blob, parity chunks that ARE in degraded stripes
+    // (e.g. data chunks lost during the previous process's
+    // uptime) will be swept — the pin can't fire because the
+    // index has nothing to consult.
+    //
+    // Operator-driven `repair_blob` is the durable recovery for
+    // this exposure: it walks the tree, which both registers
+    // the stripe AND reconstructs missing chunks. Operators with
+    // archival / cold-blob workloads should schedule periodic
+    // `repair_blob` invocations against every known blob root
+    // before running aggressive sweeps post-restart.
+    //
+    // A future commit closes this gap with a persistent stripe-
+    // index journal (see `DATAFORTS_BLOB_STORAGE_PLAN_V2_DEFERRED.md`
+    // §"Persistent stripe-index journal"). Removing this comment
+    // OR the lazy on-read registration in `walk_stripe_range`
+    // before the journal lands silently widens the exposure.
     pub async fn sweep_gc(
         &self,
         now_unix_ms: u64,
