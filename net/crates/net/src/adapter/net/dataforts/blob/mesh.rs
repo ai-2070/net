@@ -1460,15 +1460,25 @@ impl MeshBlobAdapter {
     /// Publish a byte stream, choosing
     /// [`BlobRef::Tree`] vs [`BlobRef::Manifest`] based on a
     /// [`TreeSupportProbe`] + the [`TREE_THRESHOLD_BYTES`]
-    /// producer hint.
+    /// producer hint, AND applying CDC + erasure downgrades from
+    /// the matching capability probes before any store work runs.
     ///
     /// Decision flow:
-    /// 1. If `probe.check() == false`, force the Manifest path
-    ///    (Tree-incompatible peer). Caps at 16 GiB; oversize
-    ///    streams return `BlobError::Backend`.
-    /// 2. Else if `size_hint < TREE_THRESHOLD_BYTES`, prefer
+    /// 1. Apply [`super::cdc::cdc_downgrade`] to `chunking` —
+    ///    peers that don't advertise CDC support get the
+    ///    `Fixed` fallback so their chunk-store can recompute
+    ///    leaf boundaries.
+    /// 2. Apply [`super::erasure::erasure_downgrade`] to
+    ///    `encoding` — peers that don't advertise Reed-Solomon
+    ///    support get `Replicated` so they don't see a stripe
+    ///    layout they can't reconstruct.
+    /// 3. If `tree_probe.check() == false`, force the Manifest
+    ///    path (Tree-incompatible peer). Caps at 16 GiB;
+    ///    oversize streams return `BlobError::Backend`.
+    /// 4. Else if `size_hint < TREE_THRESHOLD_BYTES`, prefer
     ///    the Manifest path for round-trip efficiency.
-    /// 3. Else use the Tree path.
+    /// 5. Else use the Tree path with the (possibly downgraded)
+    ///    encoding + chunking.
     ///
     /// `size_hint` is the producer's best estimate of total
     /// bytes — `None` defaults to "above threshold," routing
@@ -1481,16 +1491,27 @@ impl MeshBlobAdapter {
     /// future capability-tag advertisement; v0.3a callers
     /// without that substrate use `AlwaysSupported` for
     /// single-cluster deployments or `ForceManifest` for
-    /// cross-version cluster rollouts.
+    /// cross-version cluster rollouts. The CDC + erasure
+    /// probes mirror the same shape one-for-one.
     pub async fn publish_stream_with_downgrade(
         &self,
         stream: BlobByteStream,
         encoding: Encoding,
         chunking: ChunkingStrategy,
         size_hint: Option<u64>,
-        probe: &TreeSupportProbe,
+        tree_probe: &TreeSupportProbe,
+        cdc_probe: &super::cdc::CdcSupportProbe,
+        erasure_probe: &super::erasure::ErasureSupportProbe,
     ) -> Result<BlobRef, BlobError> {
-        let tree_supported = probe.check();
+        // Apply CDC + erasure downgrades up-front so the Tree /
+        // Manifest decision below sees the final effective values.
+        // Without this gate a caller can request `ChunkingStrategy::Cdc`
+        // + `Encoding::ReedSolomon` against a cluster where only some
+        // peers advertise the matching capability tags and silently
+        // emit a Tree blob the legacy peers cannot reconstruct.
+        let chunking = super::cdc::cdc_downgrade(chunking, cdc_probe);
+        let encoding = super::erasure::erasure_downgrade(encoding, erasure_probe);
+        let tree_supported = tree_probe.check();
         let above_threshold = size_hint.map(|s| s >= TREE_THRESHOLD_BYTES).unwrap_or(true);
         if tree_supported && above_threshold {
             self.store_stream_tree(stream, encoding, chunking).await
@@ -5767,6 +5788,8 @@ mod tests {
     // ────────────────────────────────────────────────────────
 
     use super::super::blob_tree::TreeSupportProbe;
+    use super::super::cdc::CdcSupportProbe;
+    use super::super::erasure::ErasureSupportProbe;
 
     /// Probe `AlwaysSupported` + above-threshold size hint
     /// routes to the Tree path.
@@ -5781,6 +5804,8 @@ mod tests {
                 ChunkingStrategy::default(),
                 Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
                 &TreeSupportProbe::AlwaysSupported,
+                &CdcSupportProbe::AlwaysSupported,
+                &ErasureSupportProbe::AlwaysSupported,
             )
             .await
             .unwrap();
@@ -5800,6 +5825,8 @@ mod tests {
                 ChunkingStrategy::default(),
                 Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
                 &TreeSupportProbe::ForceManifest,
+                &CdcSupportProbe::AlwaysSupported,
+                &ErasureSupportProbe::AlwaysSupported,
             )
             .await
             .unwrap();
@@ -5822,6 +5849,8 @@ mod tests {
                 ChunkingStrategy::default(),
                 Some(BLOB_CHUNK_SIZE_BYTES * 2),
                 &TreeSupportProbe::AlwaysSupported,
+                &CdcSupportProbe::AlwaysSupported,
+                &ErasureSupportProbe::AlwaysSupported,
             )
             .await
             .unwrap();
@@ -5845,6 +5874,8 @@ mod tests {
                 ChunkingStrategy::default(),
                 Some(1024),
                 &TreeSupportProbe::AlwaysSupported,
+                &CdcSupportProbe::AlwaysSupported,
+                &ErasureSupportProbe::AlwaysSupported,
             )
             .await
             .unwrap();
@@ -5865,6 +5896,8 @@ mod tests {
                 ChunkingStrategy::default(),
                 Some(0),
                 &TreeSupportProbe::AlwaysSupported,
+                &CdcSupportProbe::AlwaysSupported,
+                &ErasureSupportProbe::AlwaysSupported,
             )
             .await
             .unwrap_err();
@@ -5892,6 +5925,8 @@ mod tests {
                 ChunkingStrategy::default(),
                 Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
                 &probe,
+                &CdcSupportProbe::AlwaysSupported,
+                &ErasureSupportProbe::AlwaysSupported,
             )
             .await
             .unwrap();
@@ -5906,10 +5941,102 @@ mod tests {
                 ChunkingStrategy::default(),
                 Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
                 &probe,
+                &CdcSupportProbe::AlwaysSupported,
+                &ErasureSupportProbe::AlwaysSupported,
             )
             .await
             .unwrap();
         assert!(matches!(r2, BlobRef::Tree { .. }));
+    }
+
+    /// CDC probe set to `ForceFixed` collapses a `ChunkingStrategy::Cdc`
+    /// request to `Fixed` before any leaf bytes hit disk — peers without
+    /// the `dataforts:blob-cdc-supported` capability can re-derive
+    /// boundaries against the resulting Tree.
+    #[tokio::test]
+    async fn publish_downgrade_force_fixed_collapses_cdc_to_fixed() {
+        let adapter = make_adapter();
+        // Reference: produce a Tree under CDC (probe AlwaysSupported)
+        // and under Fixed (the downgraded request). The downgraded
+        // request lands on the SAME root hash as a manually-fixed
+        // chunking would have, proving the downgrade applied before
+        // the leaf-emission path saw a CDC parameter.
+        let payload = deterministic_bytes(0xD7, BLOB_CHUNK_SIZE_BYTES as usize * 3);
+        let cdc_blob = adapter
+            .publish_stream_with_downgrade(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                ChunkingStrategy::Cdc {
+                    min: super::super::cdc::PRODUCTION_CDC_PARAMS.min,
+                    avg: super::super::cdc::PRODUCTION_CDC_PARAMS.avg,
+                    max: super::super::cdc::PRODUCTION_CDC_PARAMS.max,
+                },
+                Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
+                &TreeSupportProbe::AlwaysSupported,
+                &CdcSupportProbe::ForceFixed,
+                &ErasureSupportProbe::AlwaysSupported,
+            )
+            .await
+            .unwrap();
+        let fixed_blob = adapter
+            .publish_stream_with_downgrade(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+                Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
+                &TreeSupportProbe::AlwaysSupported,
+                &CdcSupportProbe::AlwaysSupported,
+                &ErasureSupportProbe::AlwaysSupported,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cdc_blob.tree_root_hash(),
+            fixed_blob.tree_root_hash(),
+            "ForceFixed must produce a Tree whose root matches the Fixed-chunked baseline; \
+             this proves the downgrade applied before any leaf bytes were emitted",
+        );
+    }
+
+    /// Erasure probe set to `ForceReplicated` collapses a
+    /// `Encoding::ReedSolomon` request to `Replicated` before any
+    /// stripe layout is committed. The resulting Tree has no
+    /// `ErasureLeaf` nodes — peers without RS support can still
+    /// reconstruct from replicated leaves alone.
+    #[tokio::test]
+    async fn publish_downgrade_force_replicated_collapses_rs_to_replicated() {
+        let adapter = make_adapter();
+        let payload = deterministic_bytes(0xD8, BLOB_CHUNK_SIZE_BYTES as usize * 3);
+        let rs_blob = adapter
+            .publish_stream_with_downgrade(
+                stream_one(payload.clone()),
+                Encoding::ReedSolomon { k: 4, m: 2 },
+                ChunkingStrategy::default(),
+                Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
+                &TreeSupportProbe::AlwaysSupported,
+                &CdcSupportProbe::AlwaysSupported,
+                &ErasureSupportProbe::ForceReplicated,
+            )
+            .await
+            .unwrap();
+        // The downgraded blob is a Tree with Replicated encoding; no
+        // ErasureLeaf nodes anywhere.
+        let root_hash = *rs_blob.tree_root_hash().unwrap();
+        let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
+        let mut stack: Vec<Vec<u8>> = vec![root_bytes];
+        while let Some(bytes) = stack.pop() {
+            match TreeNode::decode(&bytes).unwrap() {
+                TreeNode::Internal { children } => {
+                    for (child_hash, _) in children {
+                        stack.push(adapter.fetch_chunk(&child_hash).await.unwrap());
+                    }
+                }
+                TreeNode::Leaf { .. } => { /* expected */ }
+                TreeNode::ErasureLeaf { .. } => {
+                    panic!("ForceReplicated must not emit ErasureLeaf");
+                }
+            }
+        }
     }
 
     // ────────────────────────────────────────────────────────
