@@ -720,6 +720,39 @@ pub(crate) fn scope_from_tags(tags: &HashSet<Tag>) -> CapabilityScope {
     }
 }
 
+/// Parse `subnet:<hex32>` and `group:<hex64>` tags out of an
+/// announcement's tag set. Used at index time so the
+/// capability-auth `may_execute` gate can look up a peer's
+/// declared membership in O(1) without re-walking tags per call.
+///
+/// First valid `subnet:` tag wins — multiple subnet tags on one
+/// announcement are not in the model. All distinct `group:` tags
+/// accumulate; duplicates (Eq) are removed.
+pub(crate) fn parse_membership_tags(
+    tags: &HashSet<Tag>,
+) -> (
+    Option<super::subnet::SubnetId>,
+    Vec<super::group::GroupId>,
+) {
+    let mut subnet: Option<super::subnet::SubnetId> = None;
+    let mut groups: Vec<super::group::GroupId> = Vec::new();
+    for tag in tags {
+        let rendered = tag.to_string();
+        if subnet.is_none() {
+            if let Some(s) = super::subnet::SubnetId::from_tag(&rendered) {
+                subnet = Some(s);
+                continue;
+            }
+        }
+        if let Some(g) = super::group::GroupId::from_tag(&rendered) {
+            if !groups.contains(&g) {
+                groups.push(g);
+            }
+        }
+    }
+    (subnet, groups)
+}
+
 /// Caller's intent for narrowing peer discovery by reserved scope
 /// tags, paired with [`CapabilityIndex::find_nodes_scoped`] /
 /// [`CapabilityIndex::find_best_node_scoped`].
@@ -2526,6 +2559,28 @@ pub struct IndexedNode {
     /// projection (which would require either an `EntityId` clone
     /// on every entry or a re-keying scan).
     pub origin_hash: u64,
+    /// v0.4 capability-auth allow-list — explicit `NodeId`s that
+    /// may invoke any capability listed on this announcement.
+    /// Empty = permissive default. Carried verbatim from
+    /// [`CapabilityAnnouncement::allowed_nodes`].
+    pub allowed_nodes: Vec<u64>,
+    /// v0.4 capability-auth allow-list — subnet ids whose members
+    /// may invoke. Empty = permissive default. Carried from
+    /// [`CapabilityAnnouncement::allowed_subnets`].
+    pub allowed_subnets: Vec<super::subnet::SubnetId>,
+    /// v0.4 capability-auth allow-list — group ids whose
+    /// claimants may invoke. Empty = permissive default. Carried
+    /// from [`CapabilityAnnouncement::allowed_groups`].
+    pub allowed_groups: Vec<super::group::GroupId>,
+    /// Self-declared subnet membership parsed from a `subnet:<hex32>`
+    /// tag on the announcement. The first valid tag wins (lookup
+    /// during index time); peers that declare zero or more than
+    /// one resolve to `None`.
+    pub subnet: Option<super::subnet::SubnetId>,
+    /// Self-declared group memberships parsed from every
+    /// `group:<hex64>` tag on the announcement. Order matches the
+    /// announcement's set iteration order; duplicates are removed.
+    pub groups: Vec<super::group::GroupId>,
 }
 
 /// One entry in the `by_origin_hash` side index.
@@ -2802,6 +2857,15 @@ impl CapabilityIndex {
         // truncation in NetHeader); reproduce that here so the
         // side index keys match what receivers compute.
         let origin_hash = (ann.entity_id.origin_hash() as u32) as u64;
+        // Parse subnet/group membership from the announcement's
+        // own tags so the capability-auth gate (`may_execute`) can
+        // resolve caller membership without re-walking the tag set
+        // on every check. First valid `subnet:<hex32>` tag wins —
+        // operators publishing multiple subnet tags are not in the
+        // model (the v0.4 gate treats them as opaque so picking
+        // the first one keeps lookups deterministic). All distinct
+        // `group:<hex64>` tags accumulate, deduplicated by Eq.
+        let (parsed_subnet, parsed_groups) = parse_membership_tags(&ann.capabilities.tags);
         let indexed = IndexedNode {
             node_id,
             capabilities: ann.capabilities,
@@ -2810,6 +2874,11 @@ impl CapabilityIndex {
             ttl: effective_ttl,
             reflex_addr: ann.reflex_addr,
             origin_hash,
+            allowed_nodes: ann.allowed_nodes,
+            allowed_subnets: ann.allowed_subnets,
+            allowed_groups: ann.allowed_groups,
+            subnet: parsed_subnet,
+            groups: parsed_groups,
         };
         self.nodes.insert(node_id, indexed);
         // Track collisions on the side index. A fresh Single
@@ -3486,6 +3555,99 @@ impl CapabilityIndex {
     /// punch target's public `SocketAddr` here.
     pub fn reflex_addr(&self, node_id: u64) -> Option<std::net::SocketAddr> {
         self.nodes.get(&node_id).and_then(|n| n.reflex_addr)
+    }
+
+    /// Caller's self-declared subnet membership, parsed from a
+    /// `subnet:<hex32>` tag on the caller's own announcement.
+    /// Returns `None` when the caller has no announcement yet or
+    /// emitted no `subnet:` tag. v0.4 capability-auth uses this
+    /// inside [`Self::may_execute`].
+    pub fn subnet_of(
+        &self,
+        node_id: u64,
+    ) -> Option<super::subnet::SubnetId> {
+        self.nodes.get(&node_id).and_then(|n| n.subnet)
+    }
+
+    /// Caller's self-declared group memberships, parsed from
+    /// every `group:<hex64>` tag on the caller's own
+    /// announcement. Returns an empty Vec when the caller has no
+    /// announcement yet or emitted no `group:` tags. Order
+    /// matches the announcement's tag-set iteration order
+    /// (deterministic for a given index entry but not stable
+    /// across rebuilds).
+    pub fn groups_of(&self, node_id: u64) -> Vec<super::group::GroupId> {
+        self.nodes
+            .get(&node_id)
+            .map(|n| n.groups.clone())
+            .unwrap_or_default()
+    }
+
+    /// v0.4 capability-auth execute-gate. Returns `true` when
+    /// `caller_node` is allowed to invoke `capability_tag` on
+    /// `target_node`.
+    ///
+    /// See `docs/plans/CAPABILITY_AUTH_PLAN.md` §3 for the model.
+    /// The gate is permissive by default — an announcement with
+    /// all three allow-lists empty admits any caller. Once any
+    /// list is non-empty, the union of all three is enforced
+    /// (node OR subnet OR group); the scan short-circuits on the
+    /// first match.
+    ///
+    /// Returns `false` when:
+    /// - the target has no indexed announcement (you can't
+    ///   address what you can't see);
+    /// - the target's announcement doesn't list the requested
+    ///   `capability_tag`;
+    /// - the target restricts and the caller matches no axis.
+    ///
+    /// The caller's identity is taken from the wire binding only —
+    /// the gate does NOT consult the caller's own announcement
+    /// for capability claims. It does consult it for subnet /
+    /// group membership lookup, because that's the only place
+    /// self-declared membership lives.
+    pub fn may_execute(
+        &self,
+        target_node: u64,
+        capability_tag: &str,
+        caller_node: u64,
+    ) -> bool {
+        let Some(target) = self.nodes.get(&target_node) else {
+            return false;
+        };
+        if !target.capabilities.has_tag(capability_tag) {
+            return false;
+        }
+        if target.allowed_nodes.is_empty()
+            && target.allowed_subnets.is_empty()
+            && target.allowed_groups.is_empty()
+        {
+            return true;
+        }
+        if target.allowed_nodes.contains(&caller_node) {
+            return true;
+        }
+        if !target.allowed_subnets.is_empty() {
+            if let Some(caller_subnet) = self
+                .nodes
+                .get(&caller_node)
+                .and_then(|n| n.subnet)
+            {
+                if target.allowed_subnets.contains(&caller_subnet) {
+                    return true;
+                }
+            }
+        }
+        if !target.allowed_groups.is_empty() {
+            if let Some(caller_entry) = self.nodes.get(&caller_node) {
+                for group in &caller_entry.groups {
+                    if target.allowed_groups.contains(group) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Get all node IDs
@@ -5393,6 +5555,286 @@ mod tests {
         // someone bumps the cap they have to re-think wire-size
         // budgeting — explicit pin makes the change visible.
         assert_eq!(MAX_ALLOW_LIST_LEN, 64);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // v0.4 capability-auth: may_execute gate semantics
+    // (CAPABILITY_AUTH_PLAN.md §3 / §7 conformance scenarios)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Build an announcement carrying a single capability tag,
+    /// optional `subnet:` / `group:` membership tags, and the three
+    /// allow-lists. Helper used across the gate tests.
+    fn auth_ann(
+        node_id: u64,
+        version: u64,
+        capability_tag: &str,
+        membership_subnet: Option<super::super::subnet::SubnetId>,
+        membership_groups: &[super::super::group::GroupId],
+        allowed_nodes: Vec<u64>,
+        allowed_subnets: Vec<super::super::subnet::SubnetId>,
+        allowed_groups: Vec<super::super::group::GroupId>,
+    ) -> CapabilityAnnouncement {
+        let mut caps = CapabilitySet::new().add_tag(capability_tag);
+        if let Some(s) = membership_subnet {
+            caps = caps.add_tag(&s.to_tag());
+        }
+        for g in membership_groups {
+            caps = caps.add_tag(&g.to_tag());
+        }
+        let entity = super::super::super::identity::EntityId::from_bytes(
+            [node_id as u8; 32],
+        );
+        let mut ann = CapabilityAnnouncement::new(node_id, entity, version, caps);
+        ann.allowed_nodes = allowed_nodes;
+        ann.allowed_subnets = allowed_subnets;
+        ann.allowed_groups = allowed_groups;
+        ann
+    }
+
+    #[test]
+    fn may_execute_permissive_default_when_all_lists_empty() {
+        let index = CapabilityIndex::new();
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        // Caller has no announcement; permissive default still
+        // admits — the gate trusts the wire-level binding for
+        // the caller's identity, not its announcement.
+        assert!(index.may_execute(1, "nrpc:echo", 2));
+    }
+
+    #[test]
+    fn may_execute_denies_when_target_unknown() {
+        let index = CapabilityIndex::new();
+        assert!(!index.may_execute(99, "nrpc:echo", 2));
+    }
+
+    #[test]
+    fn may_execute_denies_when_target_lacks_tag() {
+        let index = CapabilityIndex::new();
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        assert!(!index.may_execute(1, "nrpc:other", 2));
+    }
+
+    #[test]
+    fn may_execute_allow_by_node_admits_listed_caller_only() {
+        let index = CapabilityIndex::new();
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![2],
+            vec![],
+            vec![],
+        ));
+        assert!(index.may_execute(1, "nrpc:echo", 2));
+        assert!(!index.may_execute(1, "nrpc:echo", 3));
+    }
+
+    #[test]
+    fn may_execute_allow_by_subnet_uses_caller_announcement_tag() {
+        let index = CapabilityIndex::new();
+        let subnet = super::super::subnet::SubnetId([0x42; 16]);
+        // Target restricts to a subnet.
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![],
+            vec![subnet],
+            vec![],
+        ));
+        // Caller declares membership via its own announcement.
+        index.index(auth_ann(
+            2,
+            1,
+            "nrpc:other-caller-tag",
+            Some(subnet),
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        // Outsider declares no subnet.
+        index.index(auth_ann(
+            3,
+            1,
+            "nrpc:other-caller-tag",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        assert!(index.may_execute(1, "nrpc:echo", 2));
+        assert!(!index.may_execute(1, "nrpc:echo", 3));
+    }
+
+    #[test]
+    fn may_execute_allow_by_group_admits_any_member() {
+        let index = CapabilityIndex::new();
+        let group = super::super::group::GroupId([0x77; 32]);
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![group],
+        ));
+        index.index(auth_ann(
+            2,
+            1,
+            "nrpc:caller-x",
+            None,
+            &[group],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        index.index(auth_ann(
+            3,
+            1,
+            "nrpc:caller-y",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        assert!(index.may_execute(1, "nrpc:echo", 2));
+        assert!(!index.may_execute(1, "nrpc:echo", 3));
+    }
+
+    #[test]
+    fn may_execute_union_semantics_short_circuit() {
+        // All three lists non-empty; caller matches only the
+        // node list. Pin that we return true on the first axis
+        // match (we don't require all axes to agree).
+        let index = CapabilityIndex::new();
+        let unmatched_subnet = super::super::subnet::SubnetId([0xAA; 16]);
+        let unmatched_group = super::super::group::GroupId([0xBB; 32]);
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![2],
+            vec![unmatched_subnet],
+            vec![unmatched_group],
+        ));
+        // Caller declares neither the allowed subnet nor the
+        // allowed group, but is in `allowed_nodes`.
+        index.index(auth_ann(
+            2,
+            1,
+            "nrpc:caller",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        assert!(index.may_execute(1, "nrpc:echo", 2));
+    }
+
+    #[test]
+    fn may_execute_revocation_via_new_announcement_supersedes() {
+        // v1 is permissive; B can execute. v2 tightens to
+        // [only target] and B is locked out — revocation is
+        // just a new announcement with a stricter allow-list.
+        let index = CapabilityIndex::new();
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        assert!(index.may_execute(1, "nrpc:echo", 2));
+        index.index(auth_ann(
+            1,
+            2,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![1],
+            vec![],
+            vec![],
+        ));
+        assert!(!index.may_execute(1, "nrpc:echo", 2));
+    }
+
+    #[test]
+    fn may_execute_caller_with_no_announcement_can_still_match_node_list() {
+        // Caller's identity is the wire `node_id`; no caller
+        // announcement is required for the node-list axis (only
+        // for subnet/group lookup, where membership self-
+        // declaration lives).
+        let index = CapabilityIndex::new();
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![999],
+            vec![],
+            vec![],
+        ));
+        assert!(index.may_execute(1, "nrpc:echo", 999));
+    }
+
+    #[test]
+    fn subnet_of_and_groups_of_parse_self_declared_tags() {
+        let index = CapabilityIndex::new();
+        let subnet = super::super::subnet::SubnetId([0x11; 16]);
+        let g1 = super::super::group::GroupId([0x22; 32]);
+        let g2 = super::super::group::GroupId([0x33; 32]);
+        index.index(auth_ann(
+            7,
+            1,
+            "nrpc:echo",
+            Some(subnet),
+            &[g1, g2],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        assert_eq!(index.subnet_of(7), Some(subnet));
+        let mut groups = index.groups_of(7);
+        groups.sort_by_key(|g| g.0);
+        assert_eq!(groups, vec![g1, g2]);
+        // Unknown node returns None / empty — never a panic.
+        assert_eq!(index.subnet_of(999), None);
+        assert!(index.groups_of(999).is_empty());
     }
 
     /// Regression for a cubic-flagged P1: adding `hop_count` to the

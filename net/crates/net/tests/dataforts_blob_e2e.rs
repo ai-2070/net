@@ -875,6 +875,18 @@ async fn overflow_push_nudge_round_trips_through_mesh_rpc() {
     let adapter_b =
         Arc::new(MeshBlobAdapter::new("mesh-b", redex_b.clone()).with_replication(rep_cfg.clone()));
 
+    // Receiver registers the overflow-push handler FIRST so the
+    // subsequent `announce_capabilities` call merges the
+    // `nrpc:dataforts.blob.overflow_push` tag (without it, the
+    // v0.4 capability-auth callee-side gate would deny the
+    // inbound REQUEST — A's announcement of B in A's index has
+    // the nrpc tag too, but B's local self-announcement is the
+    // ground truth the bridge consults). The ServeHandle drops
+    // when the test ends, deregistering the handler automatically.
+    let _handle = node_b
+        .serve_overflow_push(Arc::clone(&adapter_b))
+        .expect("serve overflow push");
+
     // Both nodes advertise overflow-participating caps. The
     // admission gate reads from `user_caps_snapshot` on B and
     // from the capability index for the sender — both must be
@@ -887,13 +899,6 @@ async fn overflow_push_nudge_round_trips_through_mesh_rpc() {
         .announce_capabilities(overflow_enabled_caps(90))
         .await
         .expect("B announce");
-
-    // Receiver registers the overflow-push handler. The
-    // ServeHandle drops when the test ends, deregistering the
-    // handler automatically.
-    let _handle = node_b
-        .serve_overflow_push(Arc::clone(&adapter_b))
-        .expect("serve overflow push");
 
     // Wait for gossip to settle so A's caps land in B's
     // capability index (B's admission needs to see A's
@@ -943,6 +948,14 @@ async fn overflow_push_rejected_when_receiver_not_participating() {
 
     let adapter_b = Arc::new(MeshBlobAdapter::new("mesh-b", redex_b.clone()));
 
+    // Receiver registers the overflow-push handler FIRST so the
+    // subsequent `announce_capabilities` call merges the
+    // `nrpc:dataforts.blob.overflow_push` tag — required by the
+    // v0.4 capability-auth callee-side gate.
+    let _handle = node_b
+        .serve_overflow_push(Arc::clone(&adapter_b))
+        .expect("serve overflow push");
+
     // A opts in; B does NOT.
     node_a
         .announce_capabilities(overflow_enabled_caps(80))
@@ -962,10 +975,6 @@ async fn overflow_push_rejected_when_receiver_not_participating() {
         .announce_capabilities(b_caps)
         .await
         .expect("B announce");
-
-    let _handle = node_b
-        .serve_overflow_push(Arc::clone(&adapter_b))
-        .expect("serve overflow push");
 
     // Wait for A's caps to propagate to B (admission reads
     // sender_caps from B's index).
