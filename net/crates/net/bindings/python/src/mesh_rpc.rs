@@ -1086,6 +1086,16 @@ pub struct PyResponseSinkSend {
 #[pymethods]
 impl PyResponseSinkSend {
     /// Emit one chunk. Returns ``True`` on success.
+    ///
+    /// Non-blocking by design — this is `try_send` into a bounded
+    /// 1024-chunk mpsc feeding the response pump. The pump itself
+    /// awaits per-call credit (`stream_window_initial` opt-in)
+    /// before publishing to the wire; if the pump stalls on
+    /// credit, the mpsc fills and excess chunks are dropped (and
+    /// counted via `streaming_chunks_dropped_total`). Handlers
+    /// honor flow control by pacing their emits to the protocol's
+    /// REQUEST_GRANT cadence rather than burst-pushing. Matches
+    /// the Rust SDK's `ResponseSinkTyped::send` contract.
     fn send<'py>(&self, body: &Bound<'py, PyBytes>) -> bool {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match guard.as_ref() {

@@ -951,6 +951,17 @@ impl JsResponseSink {
     /// Emit one response chunk. Returns `true` on success.
     /// Returns `false` if the sink has been closed (handler
     /// raced with the substrate fold's terminal-frame emission).
+    ///
+    /// **Flow control.** This call is non-blocking — it `try_send`s
+    /// into a bounded 1024-chunk mpsc that feeds the response pump.
+    /// The pump itself awaits per-call credit before publishing to
+    /// the wire (the `stream_window_initial` opt-in). If the pump
+    /// stalls on credit, the mpsc fills, and excess chunks are
+    /// dropped (counted via `streaming_chunks_dropped_total`). To
+    /// honor flow control, JS handlers should pace their emits via
+    /// the protocol's REQUEST_GRANT cadence rather than burst-
+    /// pushing past the credit window. This mirrors the Rust SDK's
+    /// `ResponseSinkTyped::send` contract — both are non-async.
     #[napi]
     pub fn send(&self, body: Buffer) -> bool {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
