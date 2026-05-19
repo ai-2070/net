@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_906a82c67213dc::t_ae8174c24934a6 140
+  s_906a82c67213dc::t_e895b9369c6a33 549-550
+  s_906a82c67213dc::t_130453b2c195eb 630
+  s_906a82c67213dc::t_827ed1970872dd 1125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "94ba71ad4a7f19401741f0a4caa2253b8d28bf4c",
+  "prompts": {},
+  "sessions": {
+    "s_906a82c67213dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a83a8d29-a399-4785-986d-1bd45ba15ab6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
