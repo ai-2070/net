@@ -1,0 +1,25 @@
+.github/workflows/release-python.yml
+  s_f95ee10350efa6::t_cdffffe9ffb2f1 8
+.github/workflows/release-pypi-deck.yml
+  s_f95ee10350efa6::t_cdffffe9ffb2f1 25
+.github/workflows/release-pypi-sdk.yml
+  s_f95ee10350efa6::t_cdffffe9ffb2f1 8
+.github/workflows/ci.yml
+  s_f95ee10350efa6::t_cdffffe9ffb2f1 565
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "2d6228e249d3013b69222886a7fabd00e33544da",
+  "prompts": {},
+  "sessions": {
+    "s_f95ee10350efa6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "be955835-c5da-4fe8-a0f5-cb77f72dfda9",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
