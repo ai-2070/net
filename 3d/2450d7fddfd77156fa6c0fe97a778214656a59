@@ -1,0 +1,23 @@
+net/crates/net/src/bin/net-blob.rs
+  s_1d50b1bfb9695d::t_9ba980e413d85d 389-507
+  s_1d50b1bfb9695d::t_43da793e39bff6 232-256
+  s_1d50b1bfb9695d::t_4e45b5e46b5d1f 333-335
+net/crates/net/tests/net_blob_cli.rs
+  s_1d50b1bfb9695d::t_ded37689600487 622-758
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "3d2450d7fddfd77156fa6c0fe97a778214656a59",
+  "prompts": {},
+  "sessions": {
+    "s_1d50b1bfb9695d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9503e0d0-18d5-41d8-b49a-965f66c4843c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
