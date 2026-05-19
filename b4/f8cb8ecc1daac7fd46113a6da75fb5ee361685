@@ -1,0 +1,22 @@
+net/crates/net/tests/capability_auth_conformance.rs
+  s_f95ee10350efa6::t_0dd701f9208e42 541-574
+net/crates/net/src/adapter/net/behavior/capability.rs
+  s_f95ee10350efa6::t_79fe5af8fd431d 5851-5854,5860-5908
+  s_f95ee10350efa6::t_c6a22299068afa 728-737,744,748-750,752,760-771
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "b4f8cb8ecc1daac7fd46113a6da75fb5ee361685",
+  "prompts": {},
+  "sessions": {
+    "s_f95ee10350efa6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "be955835-c5da-4fe8-a0f5-cb77f72dfda9",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
