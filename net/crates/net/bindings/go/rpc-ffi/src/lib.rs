@@ -57,8 +57,8 @@ use net::adapter::net::cortex::{
 };
 use net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
-    DuplexCallRaw as InnerDuplexCallRaw, DuplexSink as InnerDuplexSink,
-    DuplexStream as InnerDuplexStream, RpcError as InnerRpcError, RpcStream as InnerRpcStream,
+    DuplexSink as InnerDuplexSink, DuplexStream as InnerDuplexStream,
+    RpcError as InnerRpcError, RpcStream as InnerRpcStream,
     ServeHandle as InnerServeHandle,
 };
 use net::adapter::net::MeshNode;
@@ -1461,35 +1461,26 @@ pub extern "C" fn net_rpc_client_stream_send(
     if h.done.load(Ordering::Relaxed) {
         return NET_RPC_ERR_STREAM_DONE;
     }
-    // Take the inner call out across the await so a concurrent
-    // free() can race cleanly (same pattern as
-    // `net_rpc_stream_next`). After the await, restore the call
-    // for the next send unless finish/error consumed it.
-    let inner_opt = h.inner.lock().take();
-    let mut call = match inner_opt {
-        Some(c) => c,
-        None => {
-            h.done.store(true, Ordering::Relaxed);
-            return NET_RPC_ERR_STREAM_DONE;
-        }
-    };
     let body = if body_ptr.is_null() {
         Bytes::new()
     } else {
         Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
     };
-    let result = runtime().block_on(async { call.send(body).await });
+    // Hold the lock across block_on so concurrent sends serialize
+    // cleanly. `send` takes &mut self so we use as_mut on the
+    // Option's Some, leaving the call in place for the next caller.
+    let mut guard = h.inner.lock();
+    let Some(call_ref) = guard.as_mut() else {
+        return NET_RPC_ERR_STREAM_DONE;
+    };
+    let result = runtime().block_on(call_ref.send(body));
     match result {
-        Ok(()) => {
-            // Put the call back for the next send / finish.
-            *h.inner.lock() = Some(call);
-            NET_RPC_OK
-        }
+        Ok(()) => NET_RPC_OK,
         Err(e) => {
             // SDK-level error. Drop the call (CANCEL fires via
             // `ClientStreamCallRaw::Drop` if the initial REQUEST
             // already flew) and latch done.
-            drop(call);
+            *guard = None;
             h.done.store(true, Ordering::Relaxed);
             write_err(out_err, format_rpc_error(&e));
             NET_RPC_ERR_CALL_FAILED
@@ -1612,11 +1603,20 @@ pub extern "C" fn net_rpc_client_stream_free(handle: *mut ClientStreamCallHandle
 ///     observed via `next` returning `None` / Error item)
 ///   - Any → split (after `into_split`)
 ///
-/// After `into_split` or `free`, the inner Option is None and
+/// After `into_split` or `free`, both inner Options are None and
 /// subsequent `send` / `finish_sending` / `next` calls return
 /// `NET_RPC_ERR_STREAM_DONE`.
+///
+/// **Auto-split.** The combined `DuplexCallRaw` is split into a
+/// `DuplexSink` + `DuplexStream` at construction so concurrent
+/// send + recv from Go (the primary duplex use case) do NOT
+/// contend on the same mutex. Both halves share the underlying
+/// `Arc<DuplexInner>`, so CANCEL-on-Drop semantics are preserved:
+/// the wire CANCEL fires only after both halves have been
+/// dropped without a clean close.
 pub struct DuplexCallHandleC {
-    inner: Arc<Mutex<Option<InnerDuplexCallRaw>>>,
+    sink: Arc<Mutex<Option<InnerDuplexSink>>>,
+    stream: Arc<Mutex<Option<InnerDuplexStream>>>,
     call_id: u64,
     done: AtomicBool,
 }
@@ -1682,8 +1682,14 @@ pub extern "C" fn net_rpc_call_duplex(
     match result {
         Ok(call) => {
             let call_id = call.call_id();
+            // Auto-split at construction so concurrent send + recv
+            // from Go don't contend on a single mutex. Both halves
+            // share Arc<DuplexInner>; CANCEL-on-Drop remains gated
+            // on both-halves-dropped via the SDK's refcount.
+            let (sink, stream) = call.into_split();
             let boxed = Box::new(DuplexCallHandleC {
-                inner: Arc::new(Mutex::new(Some(call))),
+                sink: Arc::new(Mutex::new(Some(sink))),
+                stream: Arc::new(Mutex::new(Some(stream))),
                 call_id,
                 done: AtomicBool::new(false),
             });
@@ -1716,28 +1722,23 @@ pub extern "C" fn net_rpc_duplex_send(
     if h.done.load(Ordering::Relaxed) {
         return NET_RPC_ERR_STREAM_DONE;
     }
-    let inner_opt = h.inner.lock().take();
-    let mut call = match inner_opt {
-        Some(c) => c,
-        None => {
-            h.done.store(true, Ordering::Relaxed);
-            return NET_RPC_ERR_STREAM_DONE;
-        }
-    };
     let body = if body_ptr.is_null() {
         Bytes::new()
     } else {
         Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
     };
-    let result = runtime().block_on(async { call.send(body).await });
+    // Hold the sink lock across block_on so concurrent sends
+    // serialize cleanly without the take/restore race. The recv
+    // side uses an independent lock so send + recv never contend.
+    let mut guard = h.sink.lock();
+    let Some(sink_ref) = guard.as_mut() else {
+        return NET_RPC_ERR_STREAM_DONE;
+    };
+    let result = runtime().block_on(sink_ref.send(body));
     match result {
-        Ok(()) => {
-            *h.inner.lock() = Some(call);
-            NET_RPC_OK
-        }
+        Ok(()) => NET_RPC_OK,
         Err(e) => {
-            drop(call);
-            h.done.store(true, Ordering::Relaxed);
+            *guard = None;
             write_err(out_err, format_rpc_error(&e));
             NET_RPC_ERR_CALL_FAILED
         }
@@ -1758,25 +1759,19 @@ pub extern "C" fn net_rpc_duplex_finish_sending(
     if h.done.load(Ordering::Relaxed) {
         return NET_RPC_ERR_STREAM_DONE;
     }
-    let inner_opt = h.inner.lock().take();
-    let mut call = match inner_opt {
-        Some(c) => c,
-        None => {
-            h.done.store(true, Ordering::Relaxed);
-            return NET_RPC_ERR_STREAM_DONE;
-        }
+    // `DuplexSink::finish_sending` consumes self. Take the sink
+    // out of the Option under the sink lock — a concurrent `send`
+    // will see None on its next acquisition and return STREAM_DONE.
+    // The stream lock stays untouched: response drain via _next
+    // continues unaffected.
+    let sink_opt = h.sink.lock().take();
+    let Some(sink) = sink_opt else {
+        return NET_RPC_ERR_STREAM_DONE;
     };
-    let result = runtime().block_on(async { call.finish_sending().await });
+    let result = runtime().block_on(sink.finish_sending());
     match result {
-        Ok(()) => {
-            // Restore the call so subsequent `next` can drain
-            // the response stream.
-            *h.inner.lock() = Some(call);
-            NET_RPC_OK
-        }
+        Ok(()) => NET_RPC_OK,
         Err(e) => {
-            drop(call);
-            h.done.store(true, Ordering::Relaxed);
             write_err(out_err, format_rpc_error(&e));
             NET_RPC_ERR_CALL_FAILED
         }
@@ -1805,33 +1800,32 @@ pub extern "C" fn net_rpc_duplex_next(
         }
         return NET_RPC_ERR_STREAM_DONE;
     }
-    let inner_opt = h.inner.lock().take();
-    let mut call = match inner_opt {
-        Some(c) => c,
-        None => {
-            h.done.store(true, Ordering::Relaxed);
-            unsafe {
-                *out_chunk_ptr = std::ptr::null_mut();
-                *out_chunk_len = 0;
-            }
-            return NET_RPC_ERR_STREAM_DONE;
+    use futures::StreamExt;
+    // Hold the stream lock for the duration of the poll. Send
+    // operations take the sink lock independently — concurrent
+    // send + recv from Go no longer race on a shared mutex.
+    let mut guard = h.stream.lock();
+    let Some(stream_ref) = guard.as_mut() else {
+        unsafe {
+            *out_chunk_ptr = std::ptr::null_mut();
+            *out_chunk_len = 0;
         }
+        return NET_RPC_ERR_STREAM_DONE;
     };
-    let result = runtime().block_on(async { call.next().await });
+    let result = runtime().block_on(stream_ref.next());
     match result {
         Some(Ok(chunk)) => {
-            *h.inner.lock() = Some(call);
             write_response(chunk.to_vec(), out_chunk_ptr, out_chunk_len);
             NET_RPC_OK
         }
         Some(Err(e)) => {
-            drop(call);
+            *guard = None;
             h.done.store(true, Ordering::Relaxed);
             write_err(out_err, format_rpc_error(&e));
             NET_RPC_ERR_CALL_FAILED
         }
         None => {
-            drop(call);
+            *guard = None;
             h.done.store(true, Ordering::Relaxed);
             unsafe {
                 *out_chunk_ptr = std::ptr::null_mut();
@@ -1860,20 +1854,30 @@ pub extern "C" fn net_rpc_duplex_into_split(
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_RPC_ERR_NULL;
     };
-    let inner_opt = h.inner.lock().take();
-    let call = match inner_opt {
-        Some(c) => c,
-        None => {
-            h.done.store(true, Ordering::Relaxed);
+    // The handle was already split at construction. `into_split`
+    // here just transfers ownership of the two halves into the
+    // caller's separately-managed handles. Atomic latch via `done`
+    // prevents a concurrent split + free from racing on the take.
+    if h.done.swap(true, Ordering::Relaxed) {
+        write_err(
+            out_err,
+            "duplex_into_split called on already-split or freed handle".into(),
+        );
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let sink = h.sink.lock().take();
+    let stream = h.stream.lock().take();
+    let (sink, stream) = match (sink, stream) {
+        (Some(s), Some(st)) => (s, st),
+        _ => {
             write_err(
                 out_err,
-                "duplex_into_split called on already-split or freed handle".into(),
+                "duplex_into_split called on partially-consumed handle".into(),
             );
             return NET_RPC_ERR_STREAM_DONE;
         }
     };
     let call_id = h.call_id;
-    let (sink, stream) = call.into_split();
     let sink_boxed = Box::new(DuplexSinkHandleC {
         inner: Arc::new(Mutex::new(Some(sink))),
         call_id,
@@ -1935,27 +1939,23 @@ pub extern "C" fn net_rpc_duplex_sink_send(
     if h.done.load(Ordering::Relaxed) {
         return NET_RPC_ERR_STREAM_DONE;
     }
-    let inner_opt = h.inner.lock().take();
-    let mut sink = match inner_opt {
-        Some(s) => s,
-        None => {
-            h.done.store(true, Ordering::Relaxed);
-            return NET_RPC_ERR_STREAM_DONE;
-        }
-    };
     let body = if body_ptr.is_null() {
         Bytes::new()
     } else {
         Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
     };
-    let result = runtime().block_on(async { sink.send(body).await });
+    // Hold the lock across block_on so concurrent sends serialize
+    // cleanly. `send` takes &mut self so we use as_mut, leaving
+    // the Option populated for the next caller.
+    let mut guard = h.inner.lock();
+    let Some(sink_ref) = guard.as_mut() else {
+        return NET_RPC_ERR_STREAM_DONE;
+    };
+    let result = runtime().block_on(sink_ref.send(body));
     match result {
-        Ok(()) => {
-            *h.inner.lock() = Some(sink);
-            NET_RPC_OK
-        }
+        Ok(()) => NET_RPC_OK,
         Err(e) => {
-            drop(sink);
+            *guard = None;
             h.done.store(true, Ordering::Relaxed);
             write_err(out_err, format_rpc_error(&e));
             NET_RPC_ERR_CALL_FAILED
@@ -2039,34 +2039,32 @@ pub extern "C" fn net_rpc_duplex_stream_next(
         }
         return NET_RPC_ERR_STREAM_DONE;
     }
-    let inner_opt = h.inner.lock().take();
-    let mut stream = match inner_opt {
-        Some(s) => s,
-        None => {
-            h.done.store(true, Ordering::Relaxed);
-            unsafe {
-                *out_chunk_ptr = std::ptr::null_mut();
-                *out_chunk_len = 0;
-            }
-            return NET_RPC_ERR_STREAM_DONE;
-        }
-    };
     use futures::StreamExt;
-    let result = runtime().block_on(async { stream.next().await });
+    // Hold the lock across block_on so concurrent `stream_next`
+    // calls serialize cleanly. Each call gets one chunk OR the
+    // terminal frame; the take/restore race is gone.
+    let mut guard = h.inner.lock();
+    let Some(stream_ref) = guard.as_mut() else {
+        unsafe {
+            *out_chunk_ptr = std::ptr::null_mut();
+            *out_chunk_len = 0;
+        }
+        return NET_RPC_ERR_STREAM_DONE;
+    };
+    let result = runtime().block_on(stream_ref.next());
     match result {
         Some(Ok(chunk)) => {
-            *h.inner.lock() = Some(stream);
             write_response(chunk.to_vec(), out_chunk_ptr, out_chunk_len);
             NET_RPC_OK
         }
         Some(Err(e)) => {
-            drop(stream);
+            *guard = None;
             h.done.store(true, Ordering::Relaxed);
             write_err(out_err, format_rpc_error(&e));
             NET_RPC_ERR_CALL_FAILED
         }
         None => {
-            drop(stream);
+            *guard = None;
             h.done.store(true, Ordering::Relaxed);
             unsafe {
                 *out_chunk_ptr = std::ptr::null_mut();
