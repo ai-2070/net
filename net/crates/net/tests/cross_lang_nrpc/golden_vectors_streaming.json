@@ -1,6 +1,67 @@
 {
   "abi_version_expected": 2,
   "description": "Canonical cross-binding nRPC compatibility fixture for the client-streaming + duplex shapes shipped under NET_RPC_ABI_VERSION = 0x0002 (NRPC_BINDINGS_PLAN.md Phase 2). Two services, each with a documented contract and a fixed set of ok_cases. Every binding's wire-format compat test loads this file and asserts: encoding the request stream on each side, dispatching through the canonical handler, and decoding the response stream yields outputs that semantically match the fixture. Status codes, header names, and the JSON shapes are all part of the contract.",
+  "canonical_flag_end_placement": {
+    "rule": "FLAG_RPC_REQUEST_END is carried by the LAST chunk that contains user data, not a trailing empty-body terminator. Bindings emitting `request_items = [a, b, c]` MUST set FLAG_END on the chunk carrying `c` (not on a fourth empty chunk). For the 1-item case the FLAG_END rides on the ONE chunk that carries that item. For the empty-items case, the initial REQUEST itself carries FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_REQUEST_END with an empty body (the 'pure terminator' fast path).",
+    "rationale": "Trailing-empty-FLAG_END was tolerated by the Rust substrate's terminator-semantics rule (empty body + FLAG_END = pure terminator, suppressed from the handler's stream) but it costs an extra event per call. Pinning the data-bearing-FLAG_END as canonical keeps all bindings byte-identical on the wire and avoids the substrate's 'is_pure_terminator' branch.",
+    "examples": {
+      "zero_items": "REQUEST(flags = CLIENT_STREAMING_REQUEST | REQUEST_END, body = []). Zero REQUEST_CHUNKs.",
+      "one_item":  "REQUEST(flags = CLIENT_STREAMING_REQUEST | REQUEST_END, body = encode(item_0)). Zero REQUEST_CHUNKs.",
+      "n_items":   "REQUEST(flags = CLIENT_STREAMING_REQUEST, body = encode(item_0)). REQUEST_CHUNK(flags = 0, body = encode(item_1)) ... REQUEST_CHUNK(flags = REQUEST_END, body = encode(item_{N-1}))."
+    }
+  },
+  "error_cases": {
+    "description": "Cross-binding-pinned error paths. Bindings MUST surface the codes/status documented here for the given trigger; the cross_lang_streaming integration test exercises each via the same direct-fold-dispatch pattern as the ok_cases.",
+    "cases": [
+      {
+        "name": "client_stream_decode_failure",
+        "shape": "client_streaming",
+        "service": "cross_lang_client_stream_sum",
+        "trigger": "Caller emits a REQUEST_CHUNK whose body is not valid JSON for the request_item_shape (e.g., the raw bytes `not-json-shape`).",
+        "expected_status": "Application",
+        "expected_application_code": "0x8000",
+        "expected_application_code_constant": "NRPC_TYPED_BAD_REQUEST",
+        "diagnostic_substring": "typed streaming handler: bad request body"
+      },
+      {
+        "name": "client_stream_handler_application_error",
+        "shape": "client_streaming",
+        "service": "cross_lang_client_stream_sum",
+        "trigger": "Server-side handler returns Err(String) (typed) or raises the typed application exception (Node/Python).",
+        "expected_status": "Application",
+        "expected_application_code": "0x8001",
+        "expected_application_code_constant": "NRPC_TYPED_HANDLER_ERROR",
+        "diagnostic_substring": "(handler-supplied message, propagated verbatim)"
+      },
+      {
+        "name": "client_stream_cancel_mid_send",
+        "shape": "client_streaming",
+        "service": "cross_lang_client_stream_sum",
+        "trigger": "Caller drops the call handle after sending at least one chunk and before finish().",
+        "expected_status": "Cancelled",
+        "expected_application_code": null,
+        "diagnostic_substring": "server observed CANCEL"
+      },
+      {
+        "name": "duplex_cancel_from_caller",
+        "shape": "duplex",
+        "service": "cross_lang_duplex_echo",
+        "trigger": "Caller drops BOTH halves (or the combined DuplexCall) before clean close.",
+        "expected_status": "Cancelled",
+        "expected_application_code": null,
+        "diagnostic_substring": "server observed CANCEL during duplex handler execution"
+      },
+      {
+        "name": "duplex_decode_failure",
+        "shape": "duplex",
+        "service": "cross_lang_duplex_echo",
+        "trigger": "Server emits a RESPONSE chunk whose body is not valid JSON for response_shape.",
+        "expected_status": "ClientCodec",
+        "expected_application_code": null,
+        "diagnostic_substring": "typed stream decode"
+      }
+    ]
+  },
   "services": [
     {
       "service": "cross_lang_client_stream_sum",

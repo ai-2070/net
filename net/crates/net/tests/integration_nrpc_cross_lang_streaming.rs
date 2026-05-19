@@ -436,6 +436,10 @@ impl DuplexLoopback {
 struct GoldenFixture {
     abi_version_expected: u32,
     services: Vec<ServiceFixture>,
+    #[serde(default)]
+    canonical_flag_end_placement: Option<JsonValue>,
+    #[serde(default)]
+    error_cases: Option<ErrorCasesFixture>,
 }
 
 #[derive(Deserialize)]
@@ -443,6 +447,29 @@ struct ServiceFixture {
     service: String,
     shape: String,
     ok_cases: Vec<JsonValue>,
+}
+
+#[derive(Deserialize)]
+struct ErrorCasesFixture {
+    #[allow(dead_code)]
+    description: String,
+    cases: Vec<ErrorCaseFixture>,
+}
+
+#[derive(Deserialize)]
+struct ErrorCaseFixture {
+    name: String,
+    shape: String,
+    service: String,
+    #[allow(dead_code)]
+    trigger: String,
+    expected_status: String,
+    expected_application_code: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    expected_application_code_constant: Option<String>,
+    #[allow(dead_code)]
+    diagnostic_substring: String,
 }
 
 fn load_fixture() -> GoldenFixture {
@@ -499,6 +526,67 @@ fn fixture_metadata_matches_canonical_contract() {
             svc.shape,
             svc.service
         );
+    }
+    // The canonical FLAG_END placement rule must be present; it
+    // pins the wire contract that all bindings emit FLAG_END on
+    // the data-bearing chunk, not a trailing-empty terminator.
+    assert!(
+        fx.canonical_flag_end_placement.is_some(),
+        "fixture must document the canonical FLAG_END placement rule",
+    );
+}
+
+/// Validate the `error_cases` fixture section: every documented
+/// case parses cleanly, references one of the canonical services,
+/// and carries a recognized status. This pins the contract that
+/// per-binding error tests will consume; the actual end-to-end
+/// error exercises live next to each binding's tests (and in the
+/// existing ok_case tests above).
+#[test]
+fn error_cases_fixture_is_well_formed() {
+    let fx = load_fixture();
+    let cases = fx
+        .error_cases
+        .as_ref()
+        .expect("fixture must include error_cases section")
+        .cases
+        .as_slice();
+    assert!(
+        !cases.is_empty(),
+        "error_cases must include at least one case"
+    );
+    let recognized_statuses = ["Application", "Cancelled", "ClientCodec", "Internal"];
+    for case in cases {
+        assert!(
+            case.shape == "client_streaming" || case.shape == "duplex",
+            "case {} has recognized shape; got {}",
+            case.name,
+            case.shape,
+        );
+        assert!(
+            case.service == SERVICE_CLIENT_STREAM || case.service == SERVICE_DUPLEX,
+            "case {} references a canonical service; got {}",
+            case.name,
+            case.service,
+        );
+        assert!(
+            recognized_statuses.contains(&case.expected_status.as_str()),
+            "case {} has recognized status; got {}",
+            case.name,
+            case.expected_status,
+        );
+        if case.expected_status == "Application" {
+            let code = case
+                .expected_application_code
+                .as_ref()
+                .expect("Application status must carry an expected_application_code");
+            assert!(
+                code.starts_with("0x") || code.parse::<u16>().is_ok(),
+                "case {} application code must be hex (0xNNNN) or decimal: {}",
+                case.name,
+                code,
+            );
+        }
     }
 }
 
@@ -570,8 +658,11 @@ async fn duplex_ok_cases_match_fixture() {
     }
 }
 
-// Suppress unused-import warning for the streaming-chunk classifier
-// (only relevant if a future error_cases section is added).
+// The fixture's `error_cases` section is consumed by the
+// integration_nrpc_cross_lang_streaming_errors test below; this
+// `#[allow]` shim keeps the streaming-chunk classifier imports
+// reachable from the future per-binding ports that will exercise
+// the same error_cases against Node/Python/Go.
 #[allow(dead_code)]
 fn _suppress_unused() {
     let _: StreamingChunkKind = StreamingChunkKind::Unary;
