@@ -228,6 +228,13 @@ impl PyBlobRef {
     pub(crate) fn as_inner(&self) -> &InnerBlobRef {
         &self.inner
     }
+
+    /// Internal: wrap a Rust `BlobRef` into the Python facade.
+    /// Used by adapter methods (e.g. `store_stream_tree_from_bytes`)
+    /// that produce a fresh BlobRef on the Rust side.
+    pub(crate) fn from_inner(inner: InnerBlobRef) -> Self {
+        Self { inner }
+    }
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -966,19 +973,30 @@ impl PyMeshBlobAdapter {
     ///   `"mesh"`), `tick_interval_ms` (int). Missing keys
     ///   inherit defaults.
     #[new]
-    #[pyo3(signature = (redex, adapter_id, *, persistent = false, overflow = None))]
+    #[pyo3(signature = (
+        redex,
+        adapter_id,
+        *,
+        persistent = false,
+        overflow = None,
+        tree_node_cache_bytes = None,
+    ))]
     fn new(
         py: Python<'_>,
         redex: &PyRedex,
         adapter_id: String,
         persistent: bool,
         overflow: Option<Bound<'_, PyAny>>,
+        tree_node_cache_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let mut builder = InnerMeshBlobAdapter::new(adapter_id.clone(), redex.inner_arc())
             .with_persistent(persistent);
         if let Some(spec) = overflow {
             let cfg = parse_overflow_spec(py, spec)?;
             builder = builder.with_overflow(cfg);
+        }
+        if let Some(cap) = tree_node_cache_bytes {
+            builder = builder.with_tree_node_cache(cap);
         }
         Ok(Self {
             inner: Arc::new(builder),
@@ -1129,6 +1147,102 @@ impl PyMeshBlobAdapter {
     /// the result into an HTTP scrape endpoint.
     pub fn prometheus_text(&self) -> String {
         self.inner.prometheus_text()
+    }
+
+    /// v0.3: store `data` as a hierarchical-manifest blob
+    /// ([`BlobRef::Tree`]). Returns the resulting BlobRef.
+    /// Wraps `MeshBlobAdapter::store_stream_tree` for callers
+    /// that have the bytes in memory; for true streaming Python
+    /// consumers should chunk into multiple stores via the
+    /// substrate's streaming-store-token API (post-v0.3).
+    ///
+    /// `encoding` defaults to `Encoding::replicated()`. Pass
+    /// `Encoding::reed_solomon(k, m)` for RS-encoded storage.
+    ///
+    /// Returns a Python `BlobRef` carrying the Tree's (uri,
+    /// root_hash, total_size, depth).
+    #[pyo3(signature = (data, *, encoding = None))]
+    pub fn store_stream_tree_from_bytes(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        encoding: Option<&PyEncoding>,
+    ) -> PyResult<PyBlobRef> {
+        use bytes::Bytes;
+        use futures::stream;
+        use net::adapter::net::dataforts::blob::blob_tree::ChunkingStrategy;
+        use net::adapter::net::dataforts::Encoding;
+
+        let rt = shared_runtime()?;
+        let adapter = self.inner.clone();
+        let enc = match encoding {
+            Some(e) if e.kind == "reed_solomon" => Encoding::ReedSolomon {
+                k: e.k.unwrap_or(net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_K),
+                m: e.m.unwrap_or(net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_M),
+            },
+            _ => Encoding::Replicated,
+        };
+        let owned = data.to_vec();
+        let blob = py
+            .detach(|| -> Result<net::adapter::net::dataforts::BlobRef, InnerBlobError> {
+                rt.block_on(async move {
+                    let s = stream::once(async move {
+                        Ok::<_, InnerBlobError>(Bytes::from(owned))
+                    });
+                    adapter
+                        .store_stream_tree(Box::pin(s), enc, ChunkingStrategy::default())
+                        .await
+                })
+            })
+            .map_err(map_blob_err)?;
+        Ok(PyBlobRef::from_inner(blob))
+    }
+
+    /// v0.3: repair a Tree-encoded RS blob in-place. Walks every
+    /// stripe, reconstructs missing data chunks from parity, and
+    /// re-stores them under their original content-addressed
+    /// hashes. Returns a dict carrying the `RepairReport` counts.
+    ///
+    /// This is the unauthenticated system-internal entry point;
+    /// callers behind a network surface should route through
+    /// `repair_blob_authorized` (not yet exposed in bindings).
+    pub fn repair_blob<'py>(
+        &self,
+        py: Python<'py>,
+        blob_ref: &PyBlobRef,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let rt = shared_runtime()?;
+        let adapter = self.inner.clone();
+        let blob = blob_ref.as_inner().clone();
+        let report = py
+            .detach(|| -> Result<
+                net::adapter::net::dataforts::blob::RepairReport,
+                InnerBlobError,
+            > { rt.block_on(async move { adapter.repair_blob(&blob).await }) })
+            .map_err(map_blob_err)?;
+        let out = PyDict::new(py);
+        out.set_item("stripes_walked", report.stripes_walked)?;
+        out.set_item("stripes_already_healthy", report.stripes_already_healthy)?;
+        out.set_item("stripes_repaired", report.stripes_repaired)?;
+        out.set_item("chunks_restored", report.chunks_restored)?;
+        out.set_item("stripes_unrecoverable", report.stripes_unrecoverable)?;
+        out.set_item(
+            "replicated_stripes_skipped",
+            report.replicated_stripes_skipped,
+        )?;
+        out.set_item(
+            "replicated_leaves_skipped",
+            report.replicated_leaves_skipped,
+        )?;
+        Ok(out)
+    }
+
+    /// v0.3 tree-walker LRU cache statistics. Returns
+    /// `(hits, misses, bytes, entries)` when the cache is wired
+    /// (constructor `tree_node_cache_bytes` kwarg), `None`
+    /// otherwise.
+    pub fn tree_node_cache_stats(&self) -> Option<(u64, u64, usize, usize)> {
+        self.inner.tree_node_cache_stats()
     }
 }
 

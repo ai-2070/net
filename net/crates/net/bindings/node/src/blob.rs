@@ -426,6 +426,13 @@ impl BlobRef {
     pub(crate) fn as_inner(&self) -> &InnerBlobRef {
         &self.inner
     }
+
+    /// Wrap a Rust `BlobRef` into the napi facade. Used by
+    /// adapter methods (e.g. `store_stream_tree_from_bytes`)
+    /// that produce a fresh BlobRef on the Rust side.
+    pub(crate) fn from_inner(inner: InnerBlobRef) -> Self {
+        Self { inner }
+    }
 }
 
 /// Peek the first byte to determine whether `bytes` is a wire-
@@ -1179,6 +1186,37 @@ pub struct MeshBlobAdapterOptions {
     /// [`OverflowConfigJs`] to tune. Omit entirely for the v0.2
     /// pull-only posture (the default).
     pub overflow: Option<OverflowConfigJs>,
+    /// v0.3 tree-walker LRU cache byte cap. `None` disables the
+    /// cache; `Some(n)` wires a byte-bounded LRU at cap = n.
+    /// Default `None`. Operators size this in MiB at construction
+    /// time; the per-fetch promotion/eviction stays O(1)
+    /// regardless of cap.
+    pub tree_node_cache_bytes: Option<u32>,
+}
+
+/// v0.3 RepairReport surfaced to JS as a plain object. Counter
+/// fields mirror the Rust struct one-for-one.
+#[cfg(feature = "dataforts")]
+#[napi(object)]
+pub struct RepairReportJs {
+    pub stripes_walked: BigInt,
+    pub stripes_already_healthy: BigInt,
+    pub stripes_repaired: BigInt,
+    pub chunks_restored: BigInt,
+    pub stripes_unrecoverable: BigInt,
+    pub replicated_stripes_skipped: BigInt,
+    pub replicated_leaves_skipped: BigInt,
+}
+
+/// v0.3 tree-walker cache stats surfaced to JS. `null` means the
+/// cache wasn't wired at construction.
+#[cfg(feature = "dataforts")]
+#[napi(object)]
+pub struct TreeNodeCacheStatsJs {
+    pub hits: BigInt,
+    pub misses: BigInt,
+    pub bytes: BigInt,
+    pub entries: BigInt,
 }
 
 /// Substrate-owned blob storage adapter. Stores chunks as
@@ -1212,6 +1250,7 @@ impl MeshBlobAdapter {
         let opts = options.unwrap_or(MeshBlobAdapterOptions {
             persistent: None,
             overflow: None,
+            tree_node_cache_bytes: None,
         });
         let persistent = opts.persistent.unwrap_or(false);
         let mut builder = InnerMeshBlobAdapter::new(adapter_id.clone(), redex.inner_arc())
@@ -1219,6 +1258,9 @@ impl MeshBlobAdapter {
         if let Some(overflow_cfg) = opts.overflow {
             let cfg = overflow_config_to_inner(overflow_cfg)?;
             builder = builder.with_overflow(cfg);
+        }
+        if let Some(cap) = opts.tree_node_cache_bytes {
+            builder = builder.with_tree_node_cache(cap as usize);
         }
         Ok(Self {
             inner: Arc::new(builder),
@@ -1293,6 +1335,92 @@ impl MeshBlobAdapter {
     #[napi]
     pub fn prometheus_text(&self) -> String {
         self.inner.prometheus_text()
+    }
+
+    /// v0.3: store `data` as a hierarchical-manifest blob
+    /// (`BlobRef::Tree`). Wraps the substrate's
+    /// `store_stream_tree` for the in-memory case; true streaming
+    /// from JS callers requires the substrate's streaming-store-
+    /// token API (post-v0.3 work).
+    ///
+    /// `encoding` is optional. Omit for `Replicated`; pass an
+    /// `Encoding.reedSolomon(k, m)` value for RS-encoded storage.
+    /// Returns a fresh `BlobRef` carrying the Tree's (uri,
+    /// rootHash, totalSize, depth).
+    #[napi]
+    pub async fn store_stream_tree_from_bytes(
+        &self,
+        data: Buffer,
+        encoding: Option<&Encoding>,
+    ) -> Result<BlobRef> {
+        use bytes::Bytes;
+        use futures::stream;
+        use net::adapter::net::dataforts::blob::blob_tree::ChunkingStrategy;
+        use net::adapter::net::dataforts::Encoding as InnerEncoding;
+
+        let enc = match encoding {
+            Some(e) if e.kind == "reedSolomon" => InnerEncoding::ReedSolomon {
+                k: e.k.unwrap_or(
+                    net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_K,
+                ),
+                m: e.m.unwrap_or(
+                    net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_M,
+                ),
+            },
+            _ => InnerEncoding::Replicated,
+        };
+        let adapter = self.inner.clone();
+        let owned: Vec<u8> = data.to_vec();
+        let s = stream::once(async move {
+            Ok::<_, InnerBlobError>(Bytes::from(owned))
+        });
+        let blob = adapter
+            .store_stream_tree(Box::pin(s), enc, ChunkingStrategy::default())
+            .await
+            .map_err(map_blob_err)?;
+        Ok(BlobRef::from_inner(blob))
+    }
+
+    /// v0.3: repair a Tree-encoded RS blob in-place. Walks every
+    /// stripe, reconstructs missing data chunks from parity, and
+    /// re-stores them under their original content-addressed
+    /// hashes. Returns the report's counter fields.
+    ///
+    /// This is the unauthenticated system-internal entry point;
+    /// callers behind a network surface should route through
+    /// `repair_blob_authorized` (not yet exposed in bindings).
+    #[napi]
+    pub async fn repair_blob(&self, blob_ref: &BlobRef) -> Result<RepairReportJs> {
+        let adapter = self.inner.clone();
+        let blob = blob_ref.inner.clone();
+        let report = adapter
+            .repair_blob(&blob)
+            .await
+            .map_err(map_blob_err)?;
+        Ok(RepairReportJs {
+            stripes_walked: BigInt::from(report.stripes_walked),
+            stripes_already_healthy: BigInt::from(report.stripes_already_healthy),
+            stripes_repaired: BigInt::from(report.stripes_repaired),
+            chunks_restored: BigInt::from(report.chunks_restored),
+            stripes_unrecoverable: BigInt::from(report.stripes_unrecoverable),
+            replicated_stripes_skipped: BigInt::from(report.replicated_stripes_skipped),
+            replicated_leaves_skipped: BigInt::from(report.replicated_leaves_skipped),
+        })
+    }
+
+    /// v0.3 tree-walker LRU cache statistics. Returns `null`
+    /// when the cache wasn't wired at construction; otherwise
+    /// `{ hits, misses, bytes, entries }`.
+    #[napi]
+    pub fn tree_node_cache_stats(&self) -> Option<TreeNodeCacheStatsJs> {
+        self.inner
+            .tree_node_cache_stats()
+            .map(|(hits, misses, bytes, entries)| TreeNodeCacheStatsJs {
+                hits: BigInt::from(hits),
+                misses: BigInt::from(misses),
+                bytes: BigInt::from(bytes as u64),
+                entries: BigInt::from(entries as u64),
+            })
     }
 
     // ---- v0.3 active-overflow surface ----
