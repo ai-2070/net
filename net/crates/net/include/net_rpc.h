@@ -568,6 +568,23 @@ int net_rpc_call_client_stream(
     ClientStreamCallHandleC** out_handle,
     char** out_err);
 
+/* Cancellable variant of net_rpc_call_client_stream. Adds a
+ * cancel_token so the construction block_on can be aborted by
+ * net_rpc_cancel_call from another thread — same discipline as
+ * net_rpc_call_streaming_cancellable. cancel_token == 0
+ * short-circuits to the plain net_rpc_call_client_stream
+ * semantics. */
+int net_rpc_call_client_stream_cancellable(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr,
+    size_t service_len,
+    uint64_t deadline_ms,
+    uint32_t request_window,
+    uint64_t cancel_token,
+    ClientStreamCallHandleC** out_handle,
+    char** out_err);
+
 /* Push one body chunk into the call. Encodes as the initial
  * REQUEST (first call) or as a REQUEST_CHUNK (subsequent). Awaits
  * one upload credit when flow control is opted in.
@@ -647,6 +664,22 @@ int net_rpc_call_duplex(
     uint64_t deadline_ms,
     uint32_t request_window,
     uint32_t stream_window,
+    DuplexCallHandleC** out_handle,
+    char** out_err);
+
+/* Cancellable variant of net_rpc_call_duplex. Adds a cancel_token
+ * so the construction block_on (reply-subscription setup) can be
+ * aborted by net_rpc_cancel_call. cancel_token == 0 short-circuits
+ * to the plain net_rpc_call_duplex semantics. */
+int net_rpc_call_duplex_cancellable(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr,
+    size_t service_len,
+    uint64_t deadline_ms,
+    uint32_t request_window,
+    uint32_t stream_window,
+    uint64_t cancel_token,
     DuplexCallHandleC** out_handle,
     char** out_err);
 

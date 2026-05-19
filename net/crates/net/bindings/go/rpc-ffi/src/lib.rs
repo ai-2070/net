@@ -1449,6 +1449,67 @@ pub extern "C" fn net_rpc_call_client_stream(
     }
 }
 
+/// Cancellable variant of [`net_rpc_call_client_stream`].
+/// Identical contract; adds a `cancel_token` parameter so the
+/// construction `block_on` (which awaits reply-subscription setup
+/// + the peer's initial-frame ACK) can be aborted by
+/// [`net_rpc_cancel_call`] from another thread — matching the
+/// discipline `net_rpc_call_streaming_cancellable` shipped with.
+/// `cancel_token == 0` short-circuits to the plain
+/// `net_rpc_call_client_stream` semantics (no registry overhead).
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_client_stream_cancellable(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    deadline_ms: u64,
+    request_window: u32,
+    cancel_token: u64,
+    out_handle: *mut *mut ClientStreamCallHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if request_window > 0 {
+        opts.request_window_initial = Some(request_window);
+    }
+    let node = h.node.clone();
+    let result = run_cancellable(cancel_token, async move {
+        node.call_client_stream(target_node_id, &service, opts)
+            .await
+    });
+    match result {
+        Ok(Ok(call)) => {
+            let call_id = call.call_id();
+            let boxed = Box::new(ClientStreamCallHandleC {
+                inner: Arc::new(Mutex::new(Some(call))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_handle = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Ok(Err(e)) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        Err(CancelledError) => {
+            write_err(out_err, "call cancelled".into());
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
 /// Push one body chunk into the client-streaming call. Encodes
 /// as the initial REQUEST (first call) or as a REQUEST_CHUNK
 /// (subsequent calls) — the underlying `ClientStreamCallRaw`
@@ -1714,6 +1775,70 @@ pub extern "C" fn net_rpc_call_duplex(
         }
         Err(e) => {
             write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Cancellable variant of [`net_rpc_call_duplex`]. Adds a
+/// `cancel_token` so the construction `block_on` (reply-channel
+/// subscription setup; no REQUEST flies yet thanks to the lazy
+/// initial-publish) can be aborted by [`net_rpc_cancel_call`].
+/// `cancel_token == 0` short-circuits to the plain
+/// [`net_rpc_call_duplex`] semantics.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_duplex_cancellable(
+    handle: *mut MeshRpcHandle,
+    target_node_id: u64,
+    service_ptr: *const c_char,
+    service_len: usize,
+    deadline_ms: u64,
+    request_window: u32,
+    stream_window: u32,
+    cancel_token: u64,
+    out_handle: *mut *mut DuplexCallHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if request_window > 0 {
+        opts.request_window_initial = Some(request_window);
+    }
+    if stream_window > 0 {
+        opts.stream_window_initial = Some(stream_window);
+    }
+    let node = h.node.clone();
+    let result = run_cancellable(cancel_token, async move {
+        node.call_duplex(target_node_id, &service, opts).await
+    });
+    match result {
+        Ok(Ok(call)) => {
+            let call_id = call.call_id();
+            let (sink, stream) = call.into_split();
+            let boxed = Box::new(DuplexCallHandleC {
+                sink: Arc::new(Mutex::new(Some(sink))),
+                stream: Arc::new(Mutex::new(Some(stream))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_handle = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Ok(Err(e)) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+        Err(CancelledError) => {
+            write_err(out_err, "call cancelled".into());
             NET_RPC_ERR_CALL_FAILED
         }
     }
