@@ -14,7 +14,7 @@ Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-net-mesh-sdk = "0.19.0"
+net-mesh-sdk = "0.20.0"
 ```
 
 The crate publishes as `net-mesh-sdk` on crates.io but imports as `use net_sdk::...` (the in-source crate name is preserved via package aliasing).

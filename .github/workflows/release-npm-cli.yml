@@ -6,7 +6,7 @@ name: Release @net-mesh/cli
 # users reference, npm fetches only the platform package whose
 # os/cpu/libc match via the parent's optionalDependencies.
 #
-# Tag schema: `cli-v<semver>` (e.g. `cli-v0.19.0`) — same tag that
+# Tag schema: `cli-v<semver>` — same tag that
 # fires the crates.io publish (`release-net-cli.yml`) + the
 # tarball workflow (`release-binaries-cli.yml`).
 #
@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g. cli-v0.19.0)"
+        description: "Tag to release"
         required: true
 
 env:

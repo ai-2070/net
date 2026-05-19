@@ -31,7 +31,7 @@ libfuzzer-sys = "0.4"
 # Depend on the parent crate with every feature the fuzz
 # targets need. `port-mapping` pulls in NAT-PMP + UPnP decoders;
 # `nat-traversal` surfaces classify + reflex types.
-net = { package = "net-mesh", version = "0.19.0", path = "..", features = ["net", "nat-traversal", "port-mapping"] }
+net = { package = "net-mesh", version = "0.20.0", path = "..", features = ["net", "nat-traversal", "port-mapping"] }
 
 # Prevent this from being pulled into the parent workspace —
 # cargo-fuzz is designed to be invoked from inside this dir.
