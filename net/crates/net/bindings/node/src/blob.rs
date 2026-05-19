@@ -1373,20 +1373,16 @@ impl MeshBlobAdapter {
 
         let enc = match encoding {
             Some(e) if e.kind == "reedSolomon" => InnerEncoding::ReedSolomon {
-                k: e.k.unwrap_or(
-                    net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_K,
-                ),
-                m: e.m.unwrap_or(
-                    net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_M,
-                ),
+                k: e.k
+                    .unwrap_or(net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_K),
+                m: e.m
+                    .unwrap_or(net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_M),
             },
             _ => InnerEncoding::Replicated,
         };
         let adapter = self.inner.clone();
         let owned: Vec<u8> = data.to_vec();
-        let s = stream::once(async move {
-            Ok::<_, InnerBlobError>(Bytes::from(owned))
-        });
+        let s = stream::once(async move { Ok::<_, InnerBlobError>(Bytes::from(owned)) });
         let blob = adapter
             .store_stream_tree(Box::pin(s), enc, ChunkingStrategy::default())
             .await
@@ -1406,10 +1402,7 @@ impl MeshBlobAdapter {
     pub async fn repair_blob(&self, blob_ref: &BlobRef) -> Result<RepairReportJs> {
         let adapter = self.inner.clone();
         let blob = blob_ref.inner.clone();
-        let report = adapter
-            .repair_blob(&blob)
-            .await
-            .map_err(map_blob_err)?;
+        let report = adapter.repair_blob(&blob).await.map_err(map_blob_err)?;
         Ok(RepairReportJs {
             stripes_walked: BigInt::from(report.stripes_walked),
             stripes_already_healthy: BigInt::from(report.stripes_already_healthy),

@@ -105,9 +105,7 @@ async fn collect_erasure_leaves(
                 }
             }
             TreeNode::Leaf { .. } => {
-                panic!(
-                    "composed conformance: RS-encoded Tree must NOT contain a Replicated Leaf"
-                );
+                panic!("composed conformance: RS-encoded Tree must NOT contain a Replicated Leaf");
             }
             TreeNode::ErasureLeaf { stripes } => {
                 leaves.push(stripes);
@@ -246,8 +244,7 @@ async fn tree_rs_cdc_fails_cleanly_when_more_than_m_chunks_lost() {
             if !matches!(stripe.encoding, Encoding::ReedSolomon { .. }) {
                 continue;
             }
-            let all_hashes: Vec<[u8; 32]> =
-                stripe.chunks.iter().map(|c| c.hash).collect();
+            let all_hashes: Vec<[u8; 32]> = stripe.chunks.iter().map(|c| c.hash).collect();
             for h in &all_hashes[0..3] {
                 adapter.delete_chunk(h).await.unwrap();
             }

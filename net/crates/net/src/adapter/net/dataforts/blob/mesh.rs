@@ -339,8 +339,7 @@ pub struct MeshBlobAdapter {
     /// fetch path into reconstruction on every range read, and
     /// `auto_repair_on_fetch=true` then storms `store_chunk`
     /// calls for the same stripe at fetch rate.
-    repair_cooldown:
-        Arc<parking_lot::Mutex<HashMap<[u8; 32], std::time::Instant>>>,
+    repair_cooldown: Arc<parking_lot::Mutex<HashMap<[u8; 32], std::time::Instant>>>,
 }
 
 impl MeshBlobAdapter {
@@ -994,9 +993,7 @@ impl MeshBlobAdapter {
             // pair is observed as one step.
             let entry_snapshot = {
                 let idx = self.stripe_index.lock();
-                if idx
-                    .should_pin_against_gc(&hash, |h| self.chunk_exists(h).unwrap_or(false))
-                {
+                if idx.should_pin_against_gc(&hash, |h| self.chunk_exists(h).unwrap_or(false)) {
                     continue;
                 }
                 // Atomic re-check + remove closes the TOCTOU window
@@ -1940,8 +1937,8 @@ impl MeshBlobAdapter {
         // (the chunk's hash matches its bytes regardless of
         // whether a tree references it yet).
         self.store_chunk(&hash, chunk_bytes).await?;
-                           // Push into the builder; persist any cascade-closed nodes
-                           // before returning.
+        // Push into the builder; persist any cascade-closed nodes
+        // before returning.
         let closed = builder.push_chunk(ChunkRefV3::data(hash, chunk_size))?;
         for node in &closed {
             self.store_chunk(&node.hash, &node.bytes).await?;
@@ -2514,9 +2511,7 @@ impl MeshBlobAdapter {
         channel: &ChannelName,
     ) -> Result<RepairReport, BlobError> {
         let guard = self.auth_guard.as_ref().ok_or_else(|| {
-            BlobError::Unauthorized(
-                "repair_blob_authorized requires AuthGuard wiring".to_string(),
-            )
+            BlobError::Unauthorized("repair_blob_authorized requires AuthGuard wiring".to_string())
         })?;
         auth_allows_blob_op(guard, origin_hash, channel)?;
         self.repair_blob(blob_ref).await
@@ -2535,10 +2530,7 @@ impl MeshBlobAdapter {
     /// force the optimistic path into reconstruction on every
     /// range read, and auto-repair then storms `store_chunk`
     /// calls for the same stripe at fetch rate.
-    fn auto_repair_cooldown_elapsed(
-        &self,
-        stripe: &super::blob_tree::StripeBlock,
-    ) -> bool {
+    fn auto_repair_cooldown_elapsed(&self, stripe: &super::blob_tree::StripeBlock) -> bool {
         const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
         let mut hasher = blake3::Hasher::new();
         for c in &stripe.chunks {
@@ -2576,9 +2568,10 @@ impl MeshBlobAdapter {
         // construction is potentially expensive and we don't want
         // to serialise concurrent builds for different (k, m)
         // configurations.
-        let built = Arc::new(super::erasure::RsEncoder::new(
-            super::erasure::RsParams { k, m },
-        )?);
+        let built = Arc::new(super::erasure::RsEncoder::new(super::erasure::RsParams {
+            k,
+            m,
+        })?);
         // Re-acquire and insert. If a concurrent caller built the
         // same (k, m) first, prefer their entry (drop our local
         // build) so the cache stays canonical.
@@ -2729,8 +2722,7 @@ impl MeshBlobAdapter {
                     idx,
                     "repair: data shard still missing post-reconstruct — recording stripe as unrecoverable",
                 );
-                report.stripes_unrecoverable =
-                    report.stripes_unrecoverable.saturating_add(1);
+                report.stripes_unrecoverable = report.stripes_unrecoverable.saturating_add(1);
                 return Ok(());
             };
             // The reconstructed shard is shard_len bytes; the
@@ -2744,8 +2736,7 @@ impl MeshBlobAdapter {
                     logical_len,
                     "repair: reconstructed shard short — recording stripe as unrecoverable",
                 );
-                report.stripes_unrecoverable =
-                    report.stripes_unrecoverable.saturating_add(1);
+                report.stripes_unrecoverable = report.stripes_unrecoverable.saturating_add(1);
                 return Ok(());
             }
             let logical_bytes = &bytes[..logical_len];
@@ -2762,8 +2753,7 @@ impl MeshBlobAdapter {
                     "repair: reconstructed shard hash mismatch — recording stripe as \
                      unrecoverable (encoder bug or stripe corruption); refusing to persist",
                 );
-                report.stripes_unrecoverable =
-                    report.stripes_unrecoverable.saturating_add(1);
+                report.stripes_unrecoverable = report.stripes_unrecoverable.saturating_add(1);
                 return Ok(());
             }
             // store_chunk failure remains a hard error — a
@@ -5932,8 +5922,7 @@ mod tests {
         // at residual_depth=1 — but the actual tree has Leaves at
         // the rd=2 step (one level shallower than claimed).
         // B-3's Leaf-at-rd!=1 check catches this.
-        let forged =
-            BlobRef::tree(&uri, Encoding::Replicated, root_hash, total_size, 3).unwrap();
+        let forged = BlobRef::tree(&uri, Encoding::Replicated, root_hash, total_size, 3).unwrap();
         let err = adapter
             .fetch_range(&forged, 0..total_size)
             .await
@@ -6016,8 +6005,7 @@ mod tests {
         // root. Pre-fix the walker fetched the Leaf, found
         // covered_bytes == total_size, and silently sliced bytes
         // from a tree shallower than advertised.
-        let forged =
-            BlobRef::tree(&uri, Encoding::Replicated, root_hash, total_size, 2).unwrap();
+        let forged = BlobRef::tree(&uri, Encoding::Replicated, root_hash, total_size, 2).unwrap();
         let err = adapter
             .fetch_range(&forged, 0..total_size)
             .await

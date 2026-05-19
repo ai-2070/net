@@ -641,12 +641,7 @@ fn put_tree_emits_hash_size_depth_and_round_trips_through_tree_subcommand() {
     fs::write(&input, &payload).unwrap();
     let put_out = run_net_blob(
         dir,
-        &[
-            "--format",
-            "json",
-            "put-tree",
-            input.to_str().unwrap(),
-        ],
+        &["--format", "json", "put-tree", input.to_str().unwrap()],
     );
     assert!(
         put_out.status.success(),
@@ -655,10 +650,7 @@ fn put_tree_emits_hash_size_depth_and_round_trips_through_tree_subcommand() {
     );
     let body = stdout_string(&put_out);
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    let hash = parsed["hash"]
-        .as_str()
-        .expect("hash field")
-        .to_string();
+    let hash = parsed["hash"].as_str().expect("hash field").to_string();
     let size = parsed["size"].as_u64().expect("size field");
     let depth = parsed["depth"].as_u64().expect("depth field") as u8;
     assert_eq!(hash.len(), 64, "BLAKE3 hex hash must be 64 chars");
@@ -732,15 +724,7 @@ fn put_tree_rs_spec_rejects_malformed_input() {
     let input = dir.join("p.bin");
     fs::write(&input, b"x").unwrap();
     for spec in &["k4,m=2", "k=4,m=", "k=4", "garbage"] {
-        let out = run_net_blob(
-            dir,
-            &[
-                "put-tree",
-                input.to_str().unwrap(),
-                "--rs",
-                spec,
-            ],
-        );
+        let out = run_net_blob(dir, &["put-tree", input.to_str().unwrap(), "--rs", spec]);
         assert!(
             !out.status.success(),
             "malformed --rs '{}' must exit nonzero",
@@ -778,10 +762,7 @@ fn tree_subcommand_on_corrupt_root_decode_fails_cleanly() {
     let hash = parse_put_hash(&put_out);
 
     // tree subcommand: must surface a typed decode error, not panic.
-    let out = run_net_blob(
-        dir,
-        &["tree", &hash, "--size", "1024", "--depth", "1"],
-    );
+    let out = run_net_blob(dir, &["tree", &hash, "--size", "1024", "--depth", "1"]);
     assert!(
         !out.status.success(),
         "tree on corrupt-decode root must exit nonzero"
@@ -806,10 +787,7 @@ fn repair_subcommand_on_corrupt_root_decode_fails_cleanly() {
     let put_out = run_net_blob(dir, &["--format", "json", "put", input.to_str().unwrap()]);
     let hash = parse_put_hash(&put_out);
 
-    let out = run_net_blob(
-        dir,
-        &["repair", &hash, "--size", "1024", "--depth", "1"],
-    );
+    let out = run_net_blob(dir, &["repair", &hash, "--size", "1024", "--depth", "1"]);
     assert!(
         !out.status.success(),
         "repair on corrupt-decode root must exit nonzero"

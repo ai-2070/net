@@ -1177,23 +1177,27 @@ impl PyMeshBlobAdapter {
         let adapter = self.inner.clone();
         let enc = match encoding {
             Some(e) if e.kind == "reed_solomon" => Encoding::ReedSolomon {
-                k: e.k.unwrap_or(net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_K),
-                m: e.m.unwrap_or(net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_M),
+                k: e.k
+                    .unwrap_or(net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_K),
+                m: e.m
+                    .unwrap_or(net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_M),
             },
             _ => Encoding::Replicated,
         };
         let owned = data.to_vec();
         let blob = py
-            .detach(|| -> Result<net::adapter::net::dataforts::BlobRef, InnerBlobError> {
-                rt.block_on(async move {
-                    let s = stream::once(async move {
-                        Ok::<_, InnerBlobError>(Bytes::from(owned))
-                    });
-                    adapter
-                        .store_stream_tree(Box::pin(s), enc, ChunkingStrategy::default())
-                        .await
-                })
-            })
+            .detach(
+                || -> Result<net::adapter::net::dataforts::BlobRef, InnerBlobError> {
+                    rt.block_on(async move {
+                        let s = stream::once(
+                            async move { Ok::<_, InnerBlobError>(Bytes::from(owned)) },
+                        );
+                        adapter
+                            .store_stream_tree(Box::pin(s), enc, ChunkingStrategy::default())
+                            .await
+                    })
+                },
+            )
             .map_err(map_blob_err)?;
         Ok(PyBlobRef::from_inner(blob))
     }
@@ -1215,10 +1219,11 @@ impl PyMeshBlobAdapter {
         let adapter = self.inner.clone();
         let blob = blob_ref.as_inner().clone();
         let report = py
-            .detach(|| -> Result<
-                net::adapter::net::dataforts::blob::RepairReport,
-                InnerBlobError,
-            > { rt.block_on(async move { adapter.repair_blob(&blob).await }) })
+            .detach(
+                || -> Result<net::adapter::net::dataforts::blob::RepairReport, InnerBlobError> {
+                    rt.block_on(async move { adapter.repair_blob(&blob).await })
+                },
+            )
             .map_err(map_blob_err)?;
         let out = PyDict::new(py);
         out.set_item("stripes_walked", report.stripes_walked)?;

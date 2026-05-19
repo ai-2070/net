@@ -617,14 +617,8 @@ mod tests {
 
         // Plausible Tree BlobRef — the wire bytes are valid even
         // though no chunk store carries the root.
-        let tree = BlobRef::tree(
-            "test://tree",
-            Encoding::Replicated,
-            [0xAB; 32],
-            64,
-            1,
-        )
-        .expect("tree ref");
+        let tree = BlobRef::tree("test://tree", Encoding::Replicated, [0xAB; 32], 64, 1)
+            .expect("tree ref");
         let encoded = tree.encode();
         let adapter = UnverifiedTreeAdapter(vec![0u8; 64]);
         let err = resolve_payload(&encoded, &adapter).await.unwrap_err();

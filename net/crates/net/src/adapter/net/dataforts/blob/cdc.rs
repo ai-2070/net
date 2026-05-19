@@ -726,10 +726,7 @@ mod tests {
             max: 4096,
         };
         let res = CdcStreamChunker::new(bad);
-        assert!(
-            res.is_err(),
-            "CdcStreamChunker::new must reject min == avg",
-        );
+        assert!(res.is_err(), "CdcStreamChunker::new must reject min == avg",);
         // Out-of-range avg: AVG_MAX caps below this.
         let bad = CdcParams {
             min: 1024,

@@ -339,11 +339,8 @@ async fn mesh_blob_tree_chunk_role_drive_does_not_panic() {
     // tree references. With 3 leaf chunks at chunk_size, the
     // root is a depth=1 Leaf carrying 3 ChunkRefs → 4 total
     // hashes (root + 3 data chunks).
-    let all_hashes = walk_tree_hashes_on_a(
-        *blob_ref.tree_root_hash().expect("Tree has root"),
-        &redex_a,
-    )
-    .await;
+    let all_hashes =
+        walk_tree_hashes_on_a(*blob_ref.tree_root_hash().expect("Tree has root"), &redex_a).await;
     assert!(
         all_hashes.len() >= 4,
         "expected at least 4 hashes (root + 3 leaves); got {}",

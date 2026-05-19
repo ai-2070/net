@@ -227,10 +227,7 @@ pub fn handle_sync_request(
     // only to have the bandwidth-admission gate reject the
     // response. The hard ceiling still applies to the other
     // classes; only Background gets the tightened cap.
-    if matches!(
-        request.class,
-        super::bandwidth::BandwidthClass::Background
-    ) {
+    if matches!(request.class, super::bandwidth::BandwidthClass::Background) {
         effective_budget = effective_budget.min(CHUNK_MAX_BACKGROUND_SOFT_CAP_BYTES);
     }
 

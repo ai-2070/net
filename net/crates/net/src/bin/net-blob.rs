@@ -402,7 +402,11 @@ fn parse_rs_spec(s: &str) -> Result<(u8, u8), Box<dyn std::error::Error>> {
         match key.trim() {
             "k" => k = Some(val),
             "m" => m = Some(val),
-            other => return Err(format!("--rs spec unknown key '{}'; expected 'k' or 'm'", other).into()),
+            other => {
+                return Err(
+                    format!("--rs spec unknown key '{}'; expected 'k' or 'm'", other).into(),
+                )
+            }
         }
     }
     let k = k.ok_or("--rs spec missing 'k='")?;
@@ -425,7 +429,10 @@ async fn cmd_put_tree(
     let bytes = read_input(path)?;
     let total_size = bytes.len() as u64;
     if bytes.is_empty() {
-        return Err("put-tree: refusing to store an empty input as a Tree; use `put` for empty payloads".into());
+        return Err(
+            "put-tree: refusing to store an empty input as a Tree; use `put` for empty payloads"
+                .into(),
+        );
     }
     let encoding = match rs_spec {
         None => Encoding::Replicated,
@@ -1047,7 +1054,9 @@ async fn cmd_verify(
         OutputFormat::Human => {
             println!("verify: {}", hash_hex);
             if root_unreachable {
-                println!("  root_unreachable: true (cannot verify; manifest absent or wrong depth)");
+                println!(
+                    "  root_unreachable: true (cannot verify; manifest absent or wrong depth)"
+                );
             } else {
                 println!("  healthy:    {}", healthy);
                 println!("  missing:    {}", missing);

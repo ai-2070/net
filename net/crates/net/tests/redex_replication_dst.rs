@@ -1397,26 +1397,14 @@ fn dst_emitted_sync_request_carries_configured_bandwidth_class() {
     // 5 events. b's next tick should emit a SyncRequest stamped
     // with Background.
     let node_a = cluster.nodes.get_mut(&a).unwrap();
-    node_a.force_transition(
-        ReplicaRole::Replica,
-        TransitionSignal::CapabilitySelected,
-    );
-    node_a.force_transition(
-        ReplicaRole::Candidate,
-        TransitionSignal::MissedHeartbeats,
-    );
+    node_a.force_transition(ReplicaRole::Replica, TransitionSignal::CapabilitySelected);
+    node_a.force_transition(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats);
     node_a.force_transition(ReplicaRole::Leader, TransitionSignal::ElectionWon);
     for i in 0..5 {
-        node_a
-            .file
-            .append(format!("evt-{i}").as_bytes())
-            .unwrap();
+        node_a.file.append(format!("evt-{i}").as_bytes()).unwrap();
     }
     let node_b = cluster.nodes.get_mut(&b).unwrap();
-    node_b.force_transition(
-        ReplicaRole::Replica,
-        TransitionSignal::CapabilitySelected,
-    );
+    node_b.force_transition(ReplicaRole::Replica, TransitionSignal::CapabilitySelected);
     // Seed b's tracker with a believed-leader heartbeat so the
     // catchup-emit path fires.
     node_b
