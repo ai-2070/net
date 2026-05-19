@@ -941,6 +941,21 @@ pub struct RpcInboundEvent {
     /// session to resolve against; callers that register
     /// pending entries with `target_node = 0` opt out of the
     /// binding gate (and trust the call_id randomness alone).
+    ///
+    /// **Production wire-path invariant**: real over-the-wire
+    /// inbound delivery MUST NOT produce `from_node = 0`. The
+    /// dispatcher in `mesh.rs` (`handle_inbound_user_payload`)
+    /// drops the event when the wire session has no resolvable
+    /// `NodeId`, rather than forwarding under the sentinel — see
+    /// the explicit drop + warn at the
+    /// `dropping cortex-RPC event: wire session has no resolvable NodeId`
+    /// log site. The v0.4 capability-auth callee-side gate in
+    /// `MeshNode::serve_rpc`'s bridge relies on this: it skips
+    /// permissively when `from_node == 0` (loopback compat), so
+    /// a wire-path leak of the sentinel would silently re-open
+    /// the gate. If you change the dispatcher to fall back to 0
+    /// instead of dropping, you ALSO have to teach the bridge
+    /// to deny on the sentinel.
     pub from_node: super::super::behavior::placement::NodeId,
     /// Event payload bytes — the same bytes that would have been
     /// pushed onto the shard inbound queue. For RPC events these
