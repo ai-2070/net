@@ -107,6 +107,20 @@ extern "C" {
 
 uint32_t net_rpc_abi_version(void);
 
+/* Returns 0 (NET_RPC_OK) iff `net_rpc_abi_version()` is >=
+ * `expected`. Otherwise returns NET_RPC_ERR_CALL_FAILED — letting
+ * consumers wedge a hard fail at process init when the loaded
+ * library is older than what the compile-time headers declared.
+ *
+ *   if (net_rpc_check_abi_version(NET_RPC_ABI_VERSION) != 0) {
+ *       fprintf(stderr, "net_rpc: ABI version mismatch\n");
+ *       abort();
+ *   }
+ *
+ * Idiomatic for the cross-language bindings — they want to reject
+ * an old shared library before any call surface is touched. */
+int net_rpc_check_abi_version(uint32_t expected);
+
 /* =========================================================================
  * Error codes
  * ========================================================================= */

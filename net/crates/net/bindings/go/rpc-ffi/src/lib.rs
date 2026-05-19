@@ -129,6 +129,20 @@ pub extern "C" fn net_rpc_abi_version() -> u32 {
     NET_RPC_ABI_VERSION
 }
 
+/// Returns `NET_RPC_OK` (0) iff the running library's ABI version
+/// is greater than or equal to `expected`. Otherwise returns
+/// `NET_RPC_ERR_CALL_FAILED`. Consumers MAY call this at process
+/// init to wedge a hard-fail before touching any other surface
+/// when the loaded library is older than the compile-time headers.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_check_abi_version(expected: u32) -> c_int {
+    if NET_RPC_ABI_VERSION >= expected {
+        NET_RPC_OK
+    } else {
+        NET_RPC_ERR_CALL_FAILED
+    }
+}
+
 // =========================================================================
 // Runtime + counters.
 // =========================================================================
