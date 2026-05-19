@@ -71,7 +71,11 @@ fn bench_duplex(c: &mut Criterion) {
                         received += 1;
                     }
                     sender.await.expect("sender task");
-                    debug_assert_eq!(received, count);
+                    // assert_eq, not debug_assert_eq: benches run
+                    // in release mode where debug_assert is
+                    // stripped. A silent send/recv mismatch would
+                    // poison the throughput numbers (cubic P2).
+                    assert_eq!(received, count);
                 });
             });
         }
