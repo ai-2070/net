@@ -940,6 +940,12 @@ pub struct RequestStreamTyped<Req> {
     inner: RequestStream,
     codec: Codec,
     done: bool,
+    /// Tracks whether at least one decoded request has already been
+    /// yielded from this handle. Carried into `ChunkedRequestStream`
+    /// by [`Self::into_chunked`] so a conversion AFTER partial
+    /// consumption does not misclassify the next chunk as
+    /// [`Chunk::Init`].
+    seen_first: bool,
     _req: std::marker::PhantomData<fn() -> Req>,
 }
 
@@ -948,12 +954,16 @@ impl<Req> RequestStreamTyped<Req> {
     /// that distinguishes [`Chunk::Init`] from [`Chunk::Data`].
     /// Same underlying substrate stream — no extra wire traffic,
     /// no replay.
+    ///
+    /// `seen_first` is carried over from the source: if this handle
+    /// has already yielded at least one item, the next chunk from
+    /// the converted stream is [`Chunk::Data`], not [`Chunk::Init`].
     pub fn into_chunked(self) -> ChunkedRequestStream<Req> {
         ChunkedRequestStream {
             inner: self.inner,
             codec: self.codec,
             done: self.done,
-            seen_first: false,
+            seen_first: self.seen_first,
             _req: std::marker::PhantomData,
         }
     }
@@ -972,7 +982,10 @@ impl<Req: DeserializeOwned + Unpin> futures::Stream for RequestStreamTyped<Req> 
         let codec = self.codec;
         match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
             std::task::Poll::Ready(Some(bytes)) => match codec.decode::<Req>(&bytes) {
-                Ok(value) => std::task::Poll::Ready(Some(Ok(value))),
+                Ok(value) => {
+                    self.seen_first = true;
+                    std::task::Poll::Ready(Some(Ok(value)))
+                }
                 Err(e) => {
                     self.done = true;
                     std::task::Poll::Ready(Some(Err(RpcError::Codec {
@@ -1280,6 +1293,7 @@ where
             inner: requests,
             codec: self.codec,
             done: false,
+            seen_first: false,
             _req: std::marker::PhantomData,
         };
         let resp =
@@ -1333,6 +1347,7 @@ where
             inner: requests,
             codec: self.codec,
             done: false,
+            seen_first: false,
             _req: std::marker::PhantomData,
         };
         let typed_sink = ResponseSinkTyped {

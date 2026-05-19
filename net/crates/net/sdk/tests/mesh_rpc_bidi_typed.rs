@@ -345,6 +345,88 @@ async fn duplex_typed_into_split_lets_halves_run_independently() {
     }
 }
 
+/// Regression (cubic-dev-ai bot P2): `into_chunked()` must carry
+/// over the source's `seen_first` state. Before this fix, calling
+/// `into_chunked()` after partially consuming a `RequestStreamTyped`
+/// reset `seen_first` to false — so the next chunk yielded from
+/// the converted stream was misclassified as `Chunk::Init` even
+/// though it was N-th in the conceptual upload session.
+///
+/// Server handler drains 2 items via the flat API, converts to
+/// the chunked API, then drains the remaining 3. The handler
+/// reports whether the first post-conversion chunk surfaced as
+/// `Chunk::Init` (BUG) or `Chunk::Data` (FIXED).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_stream_into_chunked_preserves_seen_first() {
+    use net_sdk::mesh_rpc::Chunk;
+
+    let psk = [0x42u8; 32];
+    let (caller, server, addr_server) = two_meshes(&psk).await;
+    handshake(&caller, &server, addr_server).await;
+
+    let _serve = server
+        .serve_rpc_client_stream_typed(
+            "chunked_split",
+            Codec::Json,
+            |mut requests: net_sdk::mesh_rpc::RequestStreamTyped<Item>| async move {
+                // Drain two items via the flat API.
+                let _first: Item = requests
+                    .next()
+                    .await
+                    .ok_or_else(|| "missing first".to_string())?
+                    .map_err(|e| format!("decode 1: {e}"))?;
+                let _second: Item = requests
+                    .next()
+                    .await
+                    .ok_or_else(|| "missing second".to_string())?
+                    .map_err(|e| format!("decode 2: {e}"))?;
+
+                // Convert. The next chunk MUST be `Chunk::Data` —
+                // chunks 1 + 2 were already consumed, so chunk 3
+                // is chronologically not the "first" of this
+                // session.
+                let mut chunked = requests.into_chunked();
+                let third: Chunk<Item> = chunked
+                    .next()
+                    .await
+                    .ok_or_else(|| "missing third".to_string())?
+                    .map_err(|e| format!("decode 3: {e}"))?;
+                let post_conversion_was_init = matches!(third, Chunk::Init(_));
+
+                // Drain the rest so the call closes cleanly.
+                while chunked.next().await.is_some() {}
+
+                Ok::<_, String>(Summary {
+                    count: if post_conversion_was_init { 1 } else { 0 },
+                })
+            },
+        )
+        .expect("serve_rpc_client_stream_typed");
+
+    let mut call = caller
+        .call_client_stream_typed::<Item, Summary>(
+            server.inner().node_id(),
+            "chunked_split",
+            CallOptionsTyped::default(),
+        )
+        .await
+        .expect("call_client_stream_typed");
+    for i in 0..5u32 {
+        call.send(&Item {
+            n: i,
+            label: format!("item-{i}"),
+        })
+        .await
+        .expect("typed send");
+    }
+    let summary = call.finish().await.expect("typed finish");
+    assert_eq!(
+        summary,
+        Summary { count: 0 },
+        "post-conversion chunk MUST be Chunk::Data; into_chunked reset seen_first incorrectly",
+    );
+}
+
 // Suppress unused-import warnings for the tests that only use a
 // subset of the imports.
 #[allow(dead_code)]
