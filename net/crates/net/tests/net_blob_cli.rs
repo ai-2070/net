@@ -619,6 +619,143 @@ fn verify_subcommand_on_missing_root_reports_root_unreachable() {
     assert_eq!(parsed["corrupted"].as_u64(), Some(0));
 }
 
+/// `put-tree` stores a Tree-encoded blob and prints the
+/// `(hash, size, depth)` triple operators feed to subsequent
+/// subcommands. Pre-fix the CLI only produced Small blobs via
+/// `put`; operators wanting to exercise repair / tree / verify /
+/// path against real Tree blobs had no CLI path to produce one.
+///
+/// The test stores a multi-chunk-worth payload, asserts the
+/// JSON output carries every expected field, then round-trips
+/// through `tree` using the emitted hash/size/depth — confirming
+/// the metadata is structurally usable by the follow-up
+/// subcommands.
+#[test]
+fn put_tree_emits_hash_size_depth_and_round_trips_through_tree_subcommand() {
+    let tmp = TempDir::new("put-tree-round-trip");
+    let dir = tmp.path();
+    // 16 MiB so the resulting Tree has multiple chunks at the
+    // 4 MiB default chunk size.
+    let payload = vec![0xC4u8; 16 * 1024 * 1024];
+    let input = dir.join("payload.bin");
+    fs::write(&input, &payload).unwrap();
+    let put_out = run_net_blob(
+        dir,
+        &[
+            "--format",
+            "json",
+            "put-tree",
+            input.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        put_out.status.success(),
+        "put-tree must succeed; stderr={}",
+        stderr_string(&put_out)
+    );
+    let body = stdout_string(&put_out);
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let hash = parsed["hash"]
+        .as_str()
+        .expect("hash field")
+        .to_string();
+    let size = parsed["size"].as_u64().expect("size field");
+    let depth = parsed["depth"].as_u64().expect("depth field") as u8;
+    assert_eq!(hash.len(), 64, "BLAKE3 hex hash must be 64 chars");
+    assert_eq!(size, payload.len() as u64);
+    assert!(
+        (1..=4).contains(&depth),
+        "Tree depth must lie in 1..=MAX_TREE_DEPTH; got {depth}",
+    );
+    assert_eq!(parsed["encoding"].as_str(), Some("Replicated"));
+
+    // Round-trip: feed the triple into `tree` and confirm it
+    // exits cleanly (the metadata is structurally usable).
+    let tree_out = run_net_blob(
+        dir,
+        &[
+            "tree",
+            &hash,
+            "--size",
+            &size.to_string(),
+            "--depth",
+            &depth.to_string(),
+        ],
+    );
+    assert!(
+        tree_out.status.success(),
+        "tree subcommand must accept put-tree's emitted triple; stderr={}",
+        stderr_string(&tree_out),
+    );
+}
+
+/// `put-tree --rs k=4,m=2` produces a ReedSolomon-encoded Tree.
+/// The emitted encoding field reports the (k, m) parameters.
+#[test]
+fn put_tree_rs_spec_produces_reed_solomon_encoded_tree() {
+    let tmp = TempDir::new("put-tree-rs");
+    let dir = tmp.path();
+    let payload = vec![0xE7u8; 16 * 1024 * 1024];
+    let input = dir.join("payload.bin");
+    fs::write(&input, &payload).unwrap();
+    let out = run_net_blob(
+        dir,
+        &[
+            "--format",
+            "json",
+            "put-tree",
+            input.to_str().unwrap(),
+            "--rs",
+            "k=4,m=2",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "put-tree --rs must succeed; stderr={}",
+        stderr_string(&out)
+    );
+    let body = stdout_string(&out);
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(
+        parsed["encoding"].as_str(),
+        Some("ReedSolomon(k=4,m=2)"),
+        "encoding field must reflect --rs spec; body: {}",
+        body
+    );
+}
+
+/// `put-tree --rs` rejects malformed RS specs with a clean error.
+#[test]
+fn put_tree_rs_spec_rejects_malformed_input() {
+    let tmp = TempDir::new("put-tree-rs-bad");
+    let dir = tmp.path();
+    let input = dir.join("p.bin");
+    fs::write(&input, b"x").unwrap();
+    for spec in &["k4,m=2", "k=4,m=", "k=4", "garbage"] {
+        let out = run_net_blob(
+            dir,
+            &[
+                "put-tree",
+                input.to_str().unwrap(),
+                "--rs",
+                spec,
+            ],
+        );
+        assert!(
+            !out.status.success(),
+            "malformed --rs '{}' must exit nonzero",
+            spec
+        );
+        let stderr = stderr_string(&out);
+        assert!(
+            !stderr.contains("panicked"),
+            "put-tree --rs '{}' must clean-error, not panic. stderr:\n{}",
+            spec,
+            stderr,
+        );
+    }
+}
+
 /// `tree` / `repair` / `verify` against a hash whose stored
 /// content doesn't decode as a `TreeNode` postcard body must
 /// surface a clean error, not panic. We synthesize the scenario
