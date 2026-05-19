@@ -349,15 +349,24 @@ upgrade ceremony.
 These three were open in an earlier draft and are now confirmed.
 Recorded inline so the implementation doesn't re-litigate them.
 
-1. **Caller identity comes from the wire binding only.**
-   `may_execute` does NOT consult the caller's own
-   `CapabilityAnnouncement`. The TOFU + signature path in
-   `handle_capability_announcement` already binds `EntityId →
-   NodeId` cryptographically; that's the identity the gate trusts.
-   The execute-gate cares about *who the caller is*, not *what
-   capabilities they offer* — checking the caller's announcement
-   would add a dependency cycle (a peer needs to publish an
-   announcement just to call anything) for no gain in safety.
+1. **Caller identity comes from the wire binding only; the
+   caller's announcement is consulted ONLY for self-declared
+   membership.** `may_execute` does NOT use the caller's
+   `CapabilityAnnouncement` to derive *who they are* — the TOFU +
+   signature path in `handle_capability_announcement` already
+   binds `EntityId → NodeId` cryptographically, and that's the
+   identity the gate trusts. It also does NOT consult the
+   caller's announcement for *what capabilities they offer* —
+   the execute-gate cares about authorization, not capability
+   claims, and treating offered tags as authority would add a
+   dependency cycle (a peer would need to publish an announcement
+   just to call anything) for no gain in safety. The one thing
+   it DOES read from the caller's announcement is the caller's
+   self-declared `subnet:<hex>` / `group:<hex>` tags, because
+   that's the only place self-declared membership lives — see
+   §3 steps 5–6. The receiver-side TOFU+signature binding makes
+   self-declared membership safe in the same sense as any other
+   signed claim a peer makes about itself.
 
 2. **Allow-list scans short-circuit on first match.** Semantics
    are union — node OR subnet OR group — and there are no deny
