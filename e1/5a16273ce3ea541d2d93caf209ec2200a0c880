@@ -1,0 +1,21 @@
+net/crates/net/cli/tests/cap_announce.rs
+  s_f95ee10350efa6::t_c27ce59ccbe206 145-206
+net/crates/net/cli/src/commands/cap.rs
+  s_f95ee10350efa6::t_8f45b9784ee182 255-263,265-279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "e15a16273ce3ea541d2d93caf209ec2200a0c880",
+  "prompts": {},
+  "sessions": {
+    "s_f95ee10350efa6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "be955835-c5da-4fe8-a0f5-cb77f72dfda9",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
