@@ -137,7 +137,7 @@ pub struct CallOptions {
     pub stream_window_initial: Option<u32>,
     /// **Client-streaming / duplex only.** Initial credit window
     /// for per-call request-direction flow control. Mirror of
-    /// [`stream_window_initial`] for the upload direction. When
+    /// [`Self::stream_window_initial`] for the upload direction. When
     /// `Some(n)`, the caller emits `nrpc-request-window-initial: n`
     /// on the REQUEST and its `send().await` sink awaits one
     /// credit per pushed chunk; the server refills via
@@ -546,8 +546,8 @@ enum ClientStreamState {
 }
 
 /// Caller-side handle for a client-streaming (or duplex Phase D)
-/// RPC. Push N items via [`send`], then [`finish`] to await the
-/// terminal RESPONSE.
+/// RPC. Push N items via [`ClientStreamCallRaw::send`], then
+/// [`ClientStreamCallRaw::finish`] to await the terminal RESPONSE.
 ///
 /// **Lazy initial REQUEST.** The initial REQUEST is published on
 /// the FIRST `send()` (or on `finish()` if the caller sends nothing
@@ -627,7 +627,7 @@ impl ClientStreamCallRaw {
     /// calls). When flow control is opted into, awaits one credit
     /// before publishing.
     ///
-    /// Returns `Err(RpcError::Codec)` if called after [`finish`].
+    /// Returns `Err(RpcError::Codec)` if called after [`Self::finish`].
     pub async fn send(&mut self, body: Bytes) -> Result<(), RpcError> {
         match self.state {
             ClientStreamState::Finishing | ClientStreamState::Done => {
@@ -1122,7 +1122,7 @@ impl futures::Stream for DuplexStream {
 /// Caller-side handle for a duplex RPC. Combines a `DuplexSink`
 /// (upload) and `DuplexStream` (download). For application code
 /// that wants to encode requests in one task and decode responses
-/// in another, use [`into_split`] to peel off the two halves.
+/// in another, use [`Self::into_split`] to peel off the two halves.
 ///
 /// Bidi streaming plan (Phase D).
 pub struct DuplexCallRaw {
