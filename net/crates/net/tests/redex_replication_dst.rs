@@ -176,6 +176,12 @@ struct VirtualCluster {
     /// fixed for the lifetime of the scenario unless the scenario
     /// explicitly mutates it.
     rtt: BTreeMap<(NodeId, NodeId), Duration>,
+    /// v0.3 Phase D2: bandwidth-class stamped on every emitted
+    /// SyncRequest. Defaults to `Foreground` (matches
+    /// `RuntimeInputs::default_bandwidth_class`'s default), but
+    /// scenarios that want to exercise the class plumbing on the
+    /// wire override via [`Self::with_default_bandwidth_class`].
+    default_bandwidth_class: net::adapter::net::redex::BandwidthClass,
 }
 
 impl VirtualCluster {
@@ -205,7 +211,21 @@ impl VirtualCluster {
             initial_now: now,
             pending: VecDeque::new(),
             rtt,
+            default_bandwidth_class: net::adapter::net::redex::BandwidthClass::Foreground,
         }
+    }
+
+    /// Override the bandwidth class stamped on every emitted
+    /// SyncRequest. Scenarios that want to exercise Background
+    /// / Realtime class plumbing on the wire flip this before
+    /// stepping.
+    #[allow(dead_code)]
+    fn with_default_bandwidth_class(
+        mut self,
+        class: net::adapter::net::redex::BandwidthClass,
+    ) -> Self {
+        self.default_bandwidth_class = class;
+        self
     }
 
     /// Sorted-pair key for partitions + rtt lookups. Avoids
@@ -334,7 +354,7 @@ impl VirtualCluster {
                 wall_clock_ms: self.now.duration_since(self.initial_now).as_millis() as u64,
                 chunk_max_bytes: DST_CHUNK_MAX_BYTES,
                 now: self.now,
-                default_bandwidth_class: Default::default(),
+                default_bandwidth_class: self.default_bandwidth_class,
             })
         };
 
@@ -1086,7 +1106,7 @@ fn wall_clock_ms_is_deterministic_function_of_step_counter() {
                 wall_clock_ms: cluster.now.duration_since(cluster.initial_now).as_millis() as u64,
                 chunk_max_bytes: DST_CHUNK_MAX_BYTES,
                 now: cluster.now,
-                default_bandwidth_class: Default::default(),
+                default_bandwidth_class: cluster.default_bandwidth_class,
             });
             for msg in outcome.outbound {
                 if let OutboundMessage::Heartbeat { msg, .. } = msg {
@@ -1357,4 +1377,72 @@ fn divergence_freedom_after_replica_revival() {
             "revival: event {i} payload bytes differ"
         );
     }
+}
+
+/// v0.3 Phase D2 plumbing: when the cluster's
+/// `default_bandwidth_class` is set to non-default (e.g.
+/// Background), every emitted SyncRequest on the wire must
+/// carry that class. Pre-fix the DST harness hard-coded
+/// `Default::default()` (Foreground), so any future DST
+/// scenario asserting class behavior would have looked like it
+/// worked while testing nothing.
+#[test]
+fn dst_emitted_sync_request_carries_configured_bandwidth_class() {
+    let a: NodeId = 0xA0;
+    let b: NodeId = 0xB0;
+    let mut cluster = VirtualCluster::new(&[a, b], "dst-class-plumbing")
+        .with_default_bandwidth_class(net::adapter::net::redex::BandwidthClass::Background);
+
+    // Promote a to Leader, b to Replica. b's tail is 0; a has
+    // 5 events. b's next tick should emit a SyncRequest stamped
+    // with Background.
+    let node_a = cluster.nodes.get_mut(&a).unwrap();
+    node_a.force_transition(
+        ReplicaRole::Replica,
+        TransitionSignal::CapabilitySelected,
+    );
+    node_a.force_transition(
+        ReplicaRole::Candidate,
+        TransitionSignal::MissedHeartbeats,
+    );
+    node_a.force_transition(ReplicaRole::Leader, TransitionSignal::ElectionWon);
+    for i in 0..5 {
+        node_a
+            .file
+            .append(format!("evt-{i}").as_bytes())
+            .unwrap();
+    }
+    let node_b = cluster.nodes.get_mut(&b).unwrap();
+    node_b.force_transition(
+        ReplicaRole::Replica,
+        TransitionSignal::CapabilitySelected,
+    );
+    // Seed b's tracker with a believed-leader heartbeat so the
+    // catchup-emit path fires.
+    node_b
+        .tracker
+        .record_heartbeat(a, ReplicaRole::Leader, 5, cluster.now);
+
+    // Tick b — should emit a SyncRequest in pending.
+    cluster.tick_node(b);
+
+    // Pull the staged SyncRequest out of `pending`. With Background
+    // wired through tick, the request's class field is Background.
+    let mut saw_request = false;
+    while let Some((src, dst, inbound)) = cluster.pending.pop_front() {
+        if src == b && dst == a {
+            if let net::adapter::net::redex::Inbound::SyncRequest { msg, .. } = &inbound {
+                assert_eq!(
+                    msg.class,
+                    net::adapter::net::redex::BandwidthClass::Background,
+                    "DST: emitted SyncRequest must carry the cluster's configured class",
+                );
+                saw_request = true;
+            }
+        }
+    }
+    assert!(
+        saw_request,
+        "expected at least one SyncRequest to be staged for delivery"
+    );
 }
