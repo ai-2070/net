@@ -50,6 +50,12 @@ jobs:
   publish-platforms:
     needs: resolve-version
     name: Publish @net-mesh/cli-${{ matrix.npm-suffix }}
+    permissions:
+      contents: read
+      # Required for `npm publish --provenance`: npm exchanges a
+      # GitHub Actions OIDC token for a Sigstore signing certificate
+      # and attaches a signed attestation to the package.
+      id-token: write
     strategy:
       # Stop on first failure: a partial publish leaves npm in a
       # broken state (some platform packages published, others
@@ -250,6 +256,9 @@ jobs:
     needs: [resolve-version, publish-platforms]
     name: Publish parent @net-mesh/cli
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     defaults:
       run:
         working-directory: net/crates/net/cli/npm
