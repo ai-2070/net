@@ -39,7 +39,7 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -68,7 +68,7 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Build musllinux wheels
         uses: PyO3/maturin-action@v1
@@ -95,7 +95,7 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -127,7 +127,7 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           architecture: ${{ matrix.py-arch }}
 
       - name: Build wheels
