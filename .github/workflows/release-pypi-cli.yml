@@ -1,0 +1,189 @@
+name: Release PyPI CLI
+
+# Publishes `net-mesh-cli` to PyPI — the `net-mesh` Rust binary
+# packaged as a maturin-built wheel (`bindings = "bin"`). The wheel
+# bundles the binary as a console script so `pip install
+# net-mesh-cli && net-mesh ...` works on the user's $PATH with no
+# Python shim layer.
+#
+# Tag schema: `cli-v<semver>` (same tag that fires
+# `release-net-cli.yml` for crates.io and the two
+# `release-{binaries,npm}-cli.yml` workflows).
+#
+# Authentication: PyPI Trusted Publishing — `pypi` environment +
+# `id-token: write`. Configure on PyPI under Account → Publishing
+# before the first run:
+#   - PyPI project name: net-mesh-cli
+#   - Owner: ai-2070
+#   - Repository: cyberdeck
+#   - Workflow: release-pypi-cli.yml
+#   - Environment: pypi
+
+on:
+  push:
+    tags:
+      - "cli-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. cli-v0.19.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          sccache: "true"
+          # Match the existing `release-python.yml` baseline so the
+          # CLI wheels work everywhere the PyO3 bindings do.
+          manylinux: 2_28
+          before-script-linux: |
+            export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
+          working-directory: net/crates/net/cli/python
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: net/crates/net/cli/python/dist
+
+  linux-musl:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build musllinux wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          sccache: "true"
+          manylinux: musllinux_1_2
+          working-directory: net/crates/net/cli/python
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-musllinux-${{ matrix.target }}
+          path: net/crates/net/cli/python/dist
+
+  macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          sccache: "true"
+          working-directory: net/crates/net/cli/python
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: net/crates/net/cli/python/dist
+
+  windows:
+    strategy:
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x64
+            py-arch: x64
+          - runner: windows-11-arm
+            target: aarch64
+            py-arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.py-arch }}
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          sccache: "true"
+          working-directory: net/crates/net/cli/python
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-windows-${{ matrix.target }}
+          path: net/crates/net/cli/python/dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: net/crates/net/cli/python
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-sdist
+          path: net/crates/net/cli/python/dist
+
+  publish:
+    needs: [linux, linux-musl, macos, windows, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: List distributions
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

@@ -1,0 +1,47 @@
+[build-system]
+requires = ["maturin>=1.10.2,<2.0"]
+build-backend = "maturin"
+
+[project]
+# PyPI distribution name. `net-cli` itself is taken on PyPI (and
+# the registry's similarity check rejected the bare name on
+# attempted publish), so the CLI lands as `net-mesh-cli` while
+# the deck keeps the bare `net-deck` name — see the cross-registry
+# table in the top-level README.
+name = "net-mesh-cli"
+version = "0.19.0"
+description = "net-mesh — unified command-line interface for the Net mesh"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+    "Topic :: Software Development :: Libraries",
+]
+keywords = ["net-mesh", "mesh", "cli", "event-bus", "operator"]
+
+[project.urls]
+Homepage = "https://github.com/ai-2070/net"
+Repository = "https://github.com/ai-2070/net"
+
+[tool.maturin]
+# `bindings = "bin"` tells maturin this is a Rust binary, not a
+# PyO3 extension — it builds the `[[bin]]` targets in the linked
+# Cargo.toml and installs them as console scripts. `pip install
+# net-mesh-cli` puts `net-mesh` on the user's `$PATH` directly;
+# no Python shim, no wheel-side wrapper code.
+bindings = "bin"
+# Point at the Rust crate one directory up. The wheel build copies
+# the binary out of `target/<triple>/release/` into the wheel's
+# `scripts/` directory.
+manifest-path = "../Cargo.toml"
+# Strip the binary in release wheels to keep wheel size down. The
+# tarball workflow ships unstripped binaries for operators who
+# want symbols; pip users have always grabbed stripped binaries.
+strip = true

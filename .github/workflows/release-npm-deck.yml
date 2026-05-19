@@ -1,0 +1,257 @@
+name: Release @net-mesh/deck
+
+# Publishes the `@net-mesh/deck` parent shim + every
+# `@net-mesh/deck-<triple>` per-platform binary package to npm.
+# Sibling of `release-npm-cli.yml` — see that file's header for
+# the design notes (the two workflows are deliberately parallel).
+#
+# Tag schema: `deck-v<semver>` (e.g. `deck-v0.19.0`).
+#
+# Required repository secret: `NPM_TOKEN` (Automation token with
+# publish scope on the @net-mesh org).
+
+on:
+  push:
+    tags:
+      - "deck-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. deck-v0.19.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  resolve-version:
+    name: Resolve version from tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Extract version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#deck-v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  publish-platforms:
+    needs: resolve-version
+    name: Publish @net-mesh/deck-${{ matrix.npm-suffix }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            npm-suffix: linux-x64-gnu
+            node-os: linux
+            node-cpu: x64
+            node-libc: glibc
+            bin-name: net-deck
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            npm-suffix: linux-x64-musl
+            node-os: linux
+            node-cpu: x64
+            node-libc: musl
+            bin-name: net-deck
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            npm-suffix: linux-arm64-gnu
+            node-os: linux
+            node-cpu: arm64
+            node-libc: glibc
+            bin-name: net-deck
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            npm-suffix: linux-arm64-musl
+            node-os: linux
+            node-cpu: arm64
+            node-libc: musl
+            bin-name: net-deck
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            npm-suffix: darwin-x64
+            node-os: darwin
+            node-cpu: x64
+            node-libc: ""
+            bin-name: net-deck
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            npm-suffix: darwin-arm64
+            node-os: darwin
+            node-cpu: arm64
+            node-libc: ""
+            bin-name: net-deck
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            npm-suffix: win32-x64
+            node-os: win32
+            node-cpu: x64
+            node-libc: ""
+            bin-name: net-deck.exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            npm-suffix: win32-arm64
+            node-os: win32
+            node-cpu: arm64
+            node-libc: ""
+            bin-name: net-deck.exe
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Add target to pinned toolchain
+        working-directory: net/crates/net
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (aarch64-linux-gnu)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p "$HOME/.cargo"
+          cat >> "$HOME/.cargo/config.toml" <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Install zig (musl cross compiler)
+        if: contains(matrix.target, 'musl')
+        uses: goto-bus-stop/setup-zig@v2
+
+      - name: Wrap zig as the musl cross-compiler
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl) ZIG_TARGET=x86_64-linux-musl; ENV_TGT=x86_64_unknown_linux_musl ;;
+            aarch64-unknown-linux-musl) ZIG_TARGET=aarch64-linux-musl; ENV_TGT=aarch64_unknown_linux_musl ;;
+          esac
+          WRAPPER="$HOME/zig-cc-${ZIG_TARGET}.sh"
+          cat > "$WRAPPER" <<EOF
+          #!/bin/bash
+          args=()
+          for arg in "\$@"; do
+            case "\$arg" in
+              --target=*) ;;
+              *) args+=("\$arg") ;;
+            esac
+          done
+          exec zig cc -target ${ZIG_TARGET} "\${args[@]}"
+          EOF
+          chmod +x "$WRAPPER"
+          UPPER=$(echo "$ENV_TGT" | tr '[:lower:]' '[:upper:]')
+          {
+            echo "CC_${ENV_TGT}=$WRAPPER"
+            echo "CXX_${ENV_TGT}=$WRAPPER"
+            echo "CARGO_TARGET_${UPPER}_LINKER=$WRAPPER"
+          } >> "$GITHUB_ENV"
+
+      - name: Build deck
+        working-directory: net/crates/net
+        run: cargo build --release -p net-deck --target ${{ matrix.target }}
+
+      - name: Assemble per-platform npm package
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+          NPM_SUFFIX: ${{ matrix.npm-suffix }}
+          NODE_OS: ${{ matrix.node-os }}
+          NODE_CPU: ${{ matrix.node-cpu }}
+          NODE_LIBC: ${{ matrix.node-libc }}
+          TARGET: ${{ matrix.target }}
+          BIN_NAME: ${{ matrix.bin-name }}
+        run: |
+          PKG_DIR="pkg-${NPM_SUFFIX}"
+          mkdir -p "${PKG_DIR}/bin"
+          cp "net/crates/net/target/${TARGET}/release/${BIN_NAME}" "${PKG_DIR}/bin/"
+          chmod +x "${PKG_DIR}/bin/${BIN_NAME}" || true
+          cp net/crates/net/deck/npm/LICENSE "${PKG_DIR}/"
+          cat > "${PKG_DIR}/README.md" <<EOF
+          # @net-mesh/deck-${NPM_SUFFIX}
+
+          Prebuilt \`net-deck\` binary for ${NODE_OS}-${NODE_CPU}${NODE_LIBC:+ ($NODE_LIBC)}.
+
+          You almost certainly want \`@net-mesh/deck\` instead — npm
+          pulls this package in automatically as an optional
+          dependency on matching hosts. See the [parent package
+          README](https://www.npmjs.com/package/@net-mesh/deck) for
+          install instructions.
+          EOF
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const env = process.env;
+          const pkg = {
+            name: `@net-mesh/deck-${env.NPM_SUFFIX}`,
+            version: env.VERSION,
+            description: `Prebuilt net-deck binary for ${env.NODE_OS}-${env.NODE_CPU}${env.NODE_LIBC ? ' (' + env.NODE_LIBC + ')' : ''}`,
+            license: 'Apache-2.0',
+            repository: { type: 'git', url: 'https://github.com/ai-2070/net' },
+            os: [env.NODE_OS],
+            cpu: [env.NODE_CPU],
+            files: [`bin/${env.BIN_NAME}`, 'README.md', 'LICENSE'],
+          };
+          if (env.NODE_LIBC) pkg.libc = [env.NODE_LIBC];
+          fs.writeFileSync(`pkg-${env.NPM_SUFFIX}/package.json`, JSON.stringify(pkg, null, 2) + '\n');
+          NODE
+
+      - name: Publish to npm
+        working-directory: pkg-${{ matrix.npm-suffix }}
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-parent:
+    needs: [resolve-version, publish-platforms]
+    name: Publish parent @net-mesh/deck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net/deck/npm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Verify parent version matches tag
+        shell: bash
+        env:
+          EXPECTED: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          ACTUAL=$(node -e "process.stdout.write(require('./package.json').version)")
+          if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+            echo "Parent package.json version ($ACTUAL) doesn't match tag ($EXPECTED)" >&2
+            exit 1
+          fi
+
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

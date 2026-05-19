@@ -50,3 +50,15 @@ default = []
 #
 #   cargo run -p net-deck --features demo
 demo = ["net-mesh-sdk/testing", "net-mesh-sdk/cortex"]
+
+# `cargo binstall net-deck` resolves prebuilt tarballs against the
+# `release-binaries-deck.yml` workflow's GitHub Release assets.
+# Defaults except for the tag prefix (`deck-v*`, not
+# `net-deck-v*`); the binary name matches the crate name so the
+# default `bin-dir` template Just Works.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/deck-v{ version }/{ name }-v{ version }-{ target }.{ archive-suffix }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"

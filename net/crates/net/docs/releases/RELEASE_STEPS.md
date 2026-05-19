@@ -28,6 +28,16 @@ git tag node-vX && git push origin node-vX
 
 # TS SDK → npm (`@net-mesh/sdk`)
 git tag npm-sdk-vX && git push origin npm-sdk-vX
+
+# CLI → crates.io (`net-cli`) + GitHub Release tarballs +
+# npm (`@net-mesh/cli`) + PyPI (`net-mesh-cli`).
+# One tag fans out to four parallel workflows.
+git tag cli-vX && git push origin cli-vX
+
+# Deck → crates.io (`net-deck`) + GitHub Release tarballs +
+# npm (`@net-mesh/deck`) + PyPI (`net-deck`).
+# One tag fans out to four parallel workflows.
+git tag deck-vX && git push origin deck-vX
 ```
 
 
