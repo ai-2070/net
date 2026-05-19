@@ -111,6 +111,22 @@ pub struct BandwidthBudget {
     /// shorter windows via
     /// [`Self::with_background_starve_window`].
     background_starve_window: Duration,
+    /// v0.3 Phase D2: outstanding bytes attributed to past
+    /// `Realtime` admissions. Tracks the *cumulative* bytes
+    /// Realtime has drained-but-not-yet-refunded so the next
+    /// refund (which is class-blind on the wire layer — the
+    /// dispatcher only sees "the send failed; refund N bytes")
+    /// repays the Realtime debt FIRST before crediting the
+    /// general `available_bytes` pool. Without this, a Realtime
+    /// drain followed by a Foreground send-failure refund would
+    /// credit Foreground for the cost Realtime imposed, giving
+    /// Realtime a permanent free pass.
+    ///
+    /// The accountant is monotonic-increasing on Realtime admit
+    /// + monotonic-decreasing on refund; clamped at 0 so an
+    /// over-refund (refund > debt) credits the remainder to the
+    /// general pool.
+    realtime_debt: f64,
 }
 
 impl BandwidthBudget {
@@ -157,6 +173,7 @@ impl BandwidthBudget {
             // construction-time).
             last_background_admission: Some(now),
             background_starve_window: BACKGROUND_STARVE_WINDOW_DEFAULT,
+            realtime_debt: 0.0,
         }
     }
 
@@ -274,6 +291,13 @@ impl BandwidthBudget {
                     return false;
                 }
                 self.available_bytes = (self.available_bytes - cost).max(0.0);
+                // Track the Realtime drain so the next refund
+                // pays this debt back first. Pre-fix the refund
+                // path credited the general pool — i.e. a
+                // Realtime drain followed by a Foreground send-
+                // failure refund credited Foreground for the
+                // Realtime cost.
+                self.realtime_debt += cost;
                 true
             }
             BandwidthClass::Foreground => {
@@ -354,12 +378,30 @@ impl BandwidthBudget {
     /// long sequence of small refunds. The sub-byte fractional
     /// credit lost on each refund is recovered on the next refill
     /// tick.
+    ///
+    /// **Realtime debt repayment.** Refunds pay down the
+    /// `realtime_debt` accountant FIRST before crediting the
+    /// general `available_bytes` pool. Without this, a sequence
+    /// like (Realtime admit → drain → Foreground admit → send
+    /// fails → refund) credits the refund to Foreground's pool
+    /// — giving Realtime a free pass on the bytes it imposed.
+    /// Once the debt is zero, any remaining refund credits
+    /// available_bytes as before.
     pub fn refund(&mut self, bytes: u64) {
         if bytes == 0 {
             return;
         }
+        let mut credit = bytes as f64;
+        if self.realtime_debt > 0.0 {
+            let repay = credit.min(self.realtime_debt);
+            self.realtime_debt -= repay;
+            credit -= repay;
+        }
+        if credit <= 0.0 {
+            return;
+        }
         let floored = self.available_bytes.max(0.0).floor();
-        self.available_bytes = (floored + bytes as f64).min(self.capacity_bytes);
+        self.available_bytes = (floored + credit).min(self.capacity_bytes);
     }
 
     /// Current available token count in bytes. Useful for
@@ -728,6 +770,46 @@ mod class_tests {
                 0.3,
             ),
             "Background must be denied within fresh window after set_nic_peak",
+        );
+    }
+
+    /// Refunds first pay down the Realtime debt accountant
+    /// before crediting the general available_bytes pool. Pre-fix
+    /// a refund following a Realtime drain credited Foreground
+    /// for the Realtime cost — a permanent free pass for
+    /// Realtime that the gate was supposed to prevent.
+    #[test]
+    fn refund_repays_realtime_debt_before_crediting_general_pool() {
+        let base = Instant::now();
+        let mut bb = BandwidthBudget::new(1.0, 1000, base);
+        // Realtime drains 400 bytes. Realtime debt = 400;
+        // available = 600.
+        assert!(bb.try_consume_with_class(400, BandwidthClass::Realtime, base, 0.3));
+        let after_rt = bb.available_bytes();
+        assert!((599..=600).contains(&after_rt));
+        // Foreground send + failure → refund 100. Pre-fix this
+        // credited available_bytes to 700 (refund of cost the
+        // Realtime path imposed); post-fix it pays down the
+        // Realtime debt (now 300) and available_bytes stays
+        // unchanged.
+        assert!(bb.try_consume_with_class(100, BandwidthClass::Foreground, base, 0.3));
+        // available = 500 after Foreground draw
+        bb.refund(100);
+        // After refund: debt = 300 (was 400, minus 100), avail
+        // unchanged at 500 (refund went entirely to debt, none
+        // to general pool).
+        let after_refund = bb.available_bytes();
+        assert!(
+            (499..=501).contains(&after_refund),
+            "refund must pay debt FIRST; expected ~500, got {after_refund}",
+        );
+        // A subsequent refund of 500 pays the remaining 300 of
+        // debt and credits 200 to available_bytes.
+        bb.refund(500);
+        let after_big_refund = bb.available_bytes();
+        assert!(
+            (699..=701).contains(&after_big_refund),
+            "second refund must credit overflow after debt; expected ~700, got {after_big_refund}",
         );
     }
 
