@@ -1636,14 +1636,9 @@ impl MeshBlobAdapter {
                     Ok(out)
                 }
                 super::blob_tree::TreeNode::ErasureLeaf { stripes } => {
-                    // Walk stripes in covered-byte order. For each
-                    // stripe overlapping the requested range, fetch
-                    // the data chunks (parity chunks are only used
-                    // when a data chunk is missing — that
-                    // reconstruction lands in v0.3 Phase C5).
                     let mut out: Vec<u8> = Vec::new();
                     let mut offset: u64 = 0;
-                    for stripe in stripes {
+                    for stripe in &stripes {
                         let stripe_size = stripe.covered_bytes();
                         let stripe_start = offset;
                         let stripe_end = offset.saturating_add(stripe_size);
@@ -1651,46 +1646,16 @@ impl MeshBlobAdapter {
                         if stripe_end <= range_start || stripe_start >= range_end {
                             continue;
                         }
-                        // Iterate data chunks within the stripe.
-                        let mut local_offset: u64 = 0;
-                        for chunk in stripe.chunks.iter().filter(|c| c.is_data()) {
-                            let chunk_size_u64 = chunk.size as u64;
-                            let chunk_abs_start = stripe_start.saturating_add(local_offset);
-                            let chunk_abs_end = chunk_abs_start.saturating_add(chunk_size_u64);
-                            local_offset = local_offset.saturating_add(chunk_size_u64);
-                            if chunk_abs_end <= range_start || chunk_abs_start >= range_end {
-                                continue;
-                            }
-                            let sub_start = range_start.saturating_sub(chunk_abs_start);
-                            let sub_end = range_end
-                                .saturating_sub(chunk_abs_start)
-                                .min(chunk_size_u64);
-                            let chunk_bytes = self.fetch_chunk(&chunk.hash).await?;
-                            // RS data chunks are zero-padded on disk to
-                            // the post-padding shard size, but the
-                            // `ChunkRef::size` field carries the pre-
-                            // padding logical size. Slice only the
-                            // logical bytes — anything past
-                            // `chunk.size` on disk is padding.
-                            if (chunk_bytes.len() as u64) < chunk_size_u64 {
-                                return Err(BlobError::ShortChunk {
-                                    hash: chunk.hash,
-                                    requested_start: sub_start,
-                                    requested_end: sub_end,
-                                    actual_len: chunk_bytes.len() as u64,
-                                });
-                            }
-                            let slice = chunk_bytes
-                                .get(sub_start as usize..sub_end as usize)
-                                .ok_or(BlobError::ShortChunk {
-                                    hash: chunk.hash,
-                                    requested_start: sub_start,
-                                    requested_end: sub_end,
-                                    actual_len: chunk_bytes.len() as u64,
-                                })?;
-                            out.extend_from_slice(slice);
-                            touched.push(chunk.hash);
-                        }
+                        let stripe_bytes = self
+                            .walk_stripe_range(
+                                stripe,
+                                stripe_start,
+                                range_start,
+                                range_end,
+                                touched,
+                            )
+                            .await?;
+                        out.extend_from_slice(&stripe_bytes);
                     }
                     Ok(out)
                 }
@@ -1734,6 +1699,240 @@ impl MeshBlobAdapter {
             self.store_chunk(&node.hash, &node.bytes).await?;
         }
         Ok(())
+    }
+
+    /// Walk a single stripe inside an `ErasureLeaf` and return the
+    /// bytes covered by `[range_start, range_end)` relative to the
+    /// whole blob. The stripe's data covers
+    /// `[stripe_start, stripe_start + stripe.covered_bytes())`.
+    ///
+    /// Optimistic path: fetch each intersecting data chunk; if all
+    /// succeed, slice + return. On any data-chunk fetch failure
+    /// (`NotFound`, `HashMismatch`, `ShortChunk`) for an
+    /// `Encoding::ReedSolomon` stripe, fall back to reconstruction:
+    /// fetch the remaining data + parity chunks until `k` total
+    /// survivors are available, run [`RsEncoder::reconstruct_data`],
+    /// then slice from the reconstructed data shards.
+    ///
+    /// Reconstruction fails (`BlobError::Backend("erasure: stripe
+    /// unrecoverable …")`) when fewer than `k` chunks survive in
+    /// the stripe (data + parity combined).
+    async fn walk_stripe_range(
+        &self,
+        stripe: &super::blob_tree::StripeBlock,
+        stripe_start: u64,
+        range_start: u64,
+        range_end: u64,
+        touched: &mut Vec<[u8; 32]>,
+    ) -> Result<Vec<u8>, BlobError> {
+        match stripe.encoding {
+            Encoding::Replicated => {
+                // Pre-RS stripe (small-stripe fallback): every
+                // chunk is Data, walk in order, no reconstruction
+                // path.
+                self.walk_stripe_data_only(stripe, stripe_start, range_start, range_end, touched)
+                    .await
+            }
+            Encoding::ReedSolomon { k, m } => {
+                // Try optimistic data-only fetch first. If that
+                // succeeds, return. Otherwise reconstruct.
+                match self
+                    .walk_stripe_data_only(
+                        stripe, stripe_start, range_start, range_end, touched,
+                    )
+                    .await
+                {
+                    Ok(bytes) => Ok(bytes),
+                    Err(BlobError::NotFound(_))
+                    | Err(BlobError::HashMismatch { .. })
+                    | Err(BlobError::ShortChunk { .. }) => {
+                        self.walk_stripe_with_reconstruction(
+                            stripe,
+                            k,
+                            m,
+                            stripe_start,
+                            range_start,
+                            range_end,
+                            touched,
+                        )
+                        .await
+                    }
+                    Err(other) => Err(other),
+                }
+            }
+        }
+    }
+
+    /// Data-only stripe walk: iterate data chunks, fetch each,
+    /// slice into the requested range. Errors propagate from
+    /// `fetch_chunk` — the caller (for RS stripes) catches and
+    /// retries via reconstruction.
+    async fn walk_stripe_data_only(
+        &self,
+        stripe: &super::blob_tree::StripeBlock,
+        stripe_start: u64,
+        range_start: u64,
+        range_end: u64,
+        touched: &mut Vec<[u8; 32]>,
+    ) -> Result<Vec<u8>, BlobError> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut local_offset: u64 = 0;
+        for chunk in stripe.chunks.iter().filter(|c| c.is_data()) {
+            let chunk_size_u64 = chunk.size as u64;
+            let chunk_abs_start = stripe_start.saturating_add(local_offset);
+            let chunk_abs_end = chunk_abs_start.saturating_add(chunk_size_u64);
+            local_offset = local_offset.saturating_add(chunk_size_u64);
+            if chunk_abs_end <= range_start || chunk_abs_start >= range_end {
+                continue;
+            }
+            let sub_start = range_start.saturating_sub(chunk_abs_start);
+            let sub_end = range_end
+                .saturating_sub(chunk_abs_start)
+                .min(chunk_size_u64);
+            let chunk_bytes = self.fetch_chunk(&chunk.hash).await?;
+            if (chunk_bytes.len() as u64) < chunk_size_u64 {
+                return Err(BlobError::ShortChunk {
+                    hash: chunk.hash,
+                    requested_start: sub_start,
+                    requested_end: sub_end,
+                    actual_len: chunk_bytes.len() as u64,
+                });
+            }
+            let slice = chunk_bytes
+                .get(sub_start as usize..sub_end as usize)
+                .ok_or(BlobError::ShortChunk {
+                    hash: chunk.hash,
+                    requested_start: sub_start,
+                    requested_end: sub_end,
+                    actual_len: chunk_bytes.len() as u64,
+                })?;
+            out.extend_from_slice(slice);
+            touched.push(chunk.hash);
+        }
+        Ok(out)
+    }
+
+    /// Reconstruction path: fetch every shard slot (data + parity)
+    /// as `Option<Vec<u8>>`. If `>= k` slots populate, run
+    /// `reconstruct_data` to fill missing data shards; slice the
+    /// reconstructed data shards into the requested range. If
+    /// fewer than `k` shards survive, return
+    /// `BlobError::Backend("erasure: stripe unrecoverable …")`.
+    async fn walk_stripe_with_reconstruction(
+        &self,
+        stripe: &super::blob_tree::StripeBlock,
+        k: u8,
+        m: u8,
+        stripe_start: u64,
+        range_start: u64,
+        range_end: u64,
+        touched: &mut Vec<[u8; 32]>,
+    ) -> Result<Vec<u8>, BlobError> {
+        let k_usize = k as usize;
+        let m_usize = m as usize;
+        let total_shards = k_usize + m_usize;
+        if stripe.chunks.len() != total_shards {
+            return Err(BlobError::Backend(format!(
+                "erasure: stripe shape mismatch — expected {} shards (k={} + m={}), got {}",
+                total_shards, k, m, stripe.chunks.len()
+            )));
+        }
+
+        // Determine the post-padding shard length. Parity chunks
+        // were sized to max(data sizes) at store time; that's the
+        // canonical shard length for the stripe.
+        let shard_len = stripe.chunks[k_usize..]
+            .iter()
+            .map(|c| c.size as usize)
+            .max()
+            .unwrap_or(0);
+        if shard_len == 0 {
+            return Err(BlobError::Backend(
+                "erasure: stripe has zero-length parity shards; unrecoverable".to_owned(),
+            ));
+        }
+
+        // Fetch every shard slot; missing slots stay None.
+        let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(total_shards);
+        let mut surviving = 0usize;
+        for chunk in &stripe.chunks {
+            match self.fetch_chunk(&chunk.hash).await {
+                Ok(mut bytes) => {
+                    // Verify hash before trusting the bytes — the
+                    // fetch_chunk path already does this, but
+                    // belt-and-braces for reconstruction inputs.
+                    let computed: [u8; 32] = blake3::hash(&bytes).into();
+                    if computed != chunk.hash {
+                        // Treat as missing for reconstruction
+                        // purposes — the RS encoder requires
+                        // trusted inputs.
+                        shards.push(None);
+                        continue;
+                    }
+                    // Pad data shards to the post-padding length
+                    // before passing to the encoder. Parity
+                    // shards are already at shard_len.
+                    if bytes.len() < shard_len {
+                        bytes.resize(shard_len, 0);
+                    }
+                    touched.push(chunk.hash);
+                    shards.push(Some(bytes));
+                    surviving += 1;
+                }
+                Err(_) => shards.push(None),
+            }
+        }
+
+        if surviving < k_usize {
+            return Err(BlobError::Backend(format!(
+                "erasure: stripe unrecoverable — {} chunks survive, need {} (k); \
+                 lost {} of {}",
+                surviving,
+                k_usize,
+                total_shards - surviving,
+                total_shards
+            )));
+        }
+
+        // Run the reconstruction.
+        let encoder = super::erasure::RsEncoder::new(super::erasure::RsParams { k, m })?;
+        encoder.reconstruct_data(&mut shards)?;
+
+        // Slice the reconstructed data shards into the requested
+        // range. Each data shard's logical size lives in
+        // `stripe.chunks[i].size` (pre-padding); bytes past that
+        // are zero-fill from store time and must NOT be returned.
+        let mut out: Vec<u8> = Vec::new();
+        let mut local_offset: u64 = 0;
+        for (i, chunk) in stripe.chunks.iter().enumerate().take(k_usize) {
+            let chunk_size_u64 = chunk.size as u64;
+            let chunk_abs_start = stripe_start.saturating_add(local_offset);
+            let chunk_abs_end = chunk_abs_start.saturating_add(chunk_size_u64);
+            local_offset = local_offset.saturating_add(chunk_size_u64);
+            if chunk_abs_end <= range_start || chunk_abs_start >= range_end {
+                continue;
+            }
+            let sub_start = range_start.saturating_sub(chunk_abs_start);
+            let sub_end = range_end
+                .saturating_sub(chunk_abs_start)
+                .min(chunk_size_u64);
+            let data_bytes = shards[i].as_ref().ok_or_else(|| {
+                BlobError::Backend(format!(
+                    "erasure: data shard {} still missing post-reconstruct (internal bug)",
+                    i
+                ))
+            })?;
+            let slice = data_bytes
+                .get(sub_start as usize..sub_end as usize)
+                .ok_or(BlobError::ShortChunk {
+                    hash: chunk.hash,
+                    requested_start: sub_start,
+                    requested_end: sub_end,
+                    actual_len: data_bytes.len() as u64,
+                })?;
+            out.extend_from_slice(slice);
+        }
+        Ok(out)
     }
 
     /// Channel name for a given chunk hash. Public accessor so
@@ -3873,6 +4072,114 @@ mod tests {
             .await
             .expect("RS fetch_range");
         assert_eq!(fetched, payload, "RS happy-path round-trip must be byte-identical");
+    }
+
+    /// Killing up to `m` data chunks per stripe still allows the
+    /// fetch path to succeed — reconstruction from parity recovers
+    /// the missing bytes. Pins Phase C5's read-side reconstruction
+    /// contract.
+    #[tokio::test]
+    async fn fetch_range_rs_reconstructs_when_data_chunks_missing() {
+        let adapter = make_adapter();
+        let chunk_size: u32 = 4 * 1024;
+        // Single full stripe: exactly k=4 data chunks, no trailing.
+        let payload = deterministic_bytes(0xE2, chunk_size as usize * 4);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let blob_ref = adapter
+            .store_stream_tree_rs_internal(
+                stream_one(payload.clone()),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+
+        // Walk the tree to find the stripe's data chunk hashes.
+        // The RS path emits leaves via `push_prebuilt_leaf`
+        // mid-stream; the finalize-time peel doesn't fire for
+        // such single-leaf trees, so the root is an Internal
+        // wrapping one ErasureLeaf — walk one level deeper.
+        let root_hash = *blob_ref.tree_root_hash().unwrap();
+        let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
+        let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
+            TreeNode::ErasureLeaf { .. } => root_bytes,
+            TreeNode::Internal { children } => {
+                let (child_hash, _) = children[0];
+                adapter.fetch_chunk(&child_hash).await.unwrap()
+            }
+            TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
+        };
+        let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
+            TreeNode::ErasureLeaf { stripes } => stripes,
+            other => panic!("expected ErasureLeaf, got: {:?}", other),
+        };
+        assert_eq!(stripes.len(), 1);
+        let data_chunk_hashes: Vec<[u8; 32]> = stripes[0]
+            .chunks
+            .iter()
+            .filter(|c| c.is_data())
+            .map(|c| c.hash)
+            .collect();
+        assert_eq!(data_chunk_hashes.len(), 4);
+
+        // Kill 2 data chunks (= m = tolerance).
+        for hash in &data_chunk_hashes[0..2] {
+            adapter.delete_chunk(hash).await.unwrap();
+        }
+
+        // Fetch must still succeed via reconstruction.
+        let fetched = adapter
+            .fetch_range(&blob_ref, 0..payload.len() as u64)
+            .await
+            .expect("RS fetch must reconstruct from parity");
+        assert_eq!(fetched, payload, "reconstructed bytes must match original");
+    }
+
+    /// Killing more than `m` chunks per stripe must surface a
+    /// clean `BlobError::Backend("erasure: stripe unrecoverable")`
+    /// rather than corrupting the fetch or panicking.
+    #[tokio::test]
+    async fn fetch_range_rs_fails_cleanly_when_more_than_m_chunks_lost() {
+        let adapter = make_adapter();
+        let chunk_size: u32 = 4 * 1024;
+        let payload = deterministic_bytes(0xE3, chunk_size as usize * 4);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let blob_ref = adapter
+            .store_stream_tree_rs_internal(
+                stream_one(payload.clone()),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+        let root_hash = *blob_ref.tree_root_hash().unwrap();
+        let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
+        let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
+            TreeNode::ErasureLeaf { .. } => root_bytes,
+            TreeNode::Internal { children } => {
+                adapter.fetch_chunk(&children[0].0).await.unwrap()
+            }
+            TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
+        };
+        let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
+            TreeNode::ErasureLeaf { stripes } => stripes,
+            other => panic!("expected ErasureLeaf, got: {:?}", other),
+        };
+        // Kill 3 chunks total — exceeds m=2 tolerance.
+        let all_hashes: Vec<[u8; 32]> = stripes[0].chunks.iter().map(|c| c.hash).collect();
+        for hash in &all_hashes[0..3] {
+            adapter.delete_chunk(hash).await.unwrap();
+        }
+        let err = adapter
+            .fetch_range(&blob_ref, 0..payload.len() as u64)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unrecoverable") || msg.contains("erasure"),
+            "expected unrecoverable-stripe error, got: {}",
+            msg
+        );
     }
 
     /// RS storing the same content on two adapters lands on the
