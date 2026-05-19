@@ -225,6 +225,7 @@ jobs:
           --test dataforts_blob_v3_tree_conformance
           --test dataforts_blob_v3_cdc_conformance
           --test dataforts_blob_v3_rs_conformance
+          --test dataforts_blob_v3_composed_conformance
 
       # === MeshDB =========================================================
       # `meshdb` chains to cortex → redex → net, so a single
