@@ -338,6 +338,9 @@ fn format_rpc_error(err: &InnerRpcError) -> String {
             };
             format!("{dir}: {message}")
         }
+        InnerRpcError::CapabilityDenied { target, capability } => {
+            format!("capability_denied: target=0x{target:x} capability={capability}")
+        }
     }
 }
 
@@ -1451,7 +1454,7 @@ pub extern "C" fn net_rpc_call_client_stream(
 /// Cancellable variant of [`net_rpc_call_client_stream`].
 /// Identical contract; adds a `cancel_token` parameter so the
 /// construction `block_on` (which awaits reply-subscription setup
-/// + the peer's initial-frame ACK) can be aborted by
+/// AND the peer's initial-frame ACK) can be aborted by
 /// [`net_rpc_cancel_call`] from another thread — matching the
 /// discipline `net_rpc_call_streaming_cancellable` shipped with.
 /// `cancel_token == 0` short-circuits to the plain
@@ -2143,7 +2146,7 @@ pub extern "C" fn net_rpc_duplex_sink_call_id(handle: *const DuplexSinkHandleC) 
 }
 
 /// Free the sink half. Drop fires nothing (CANCEL only when the
-/// shared Arc<DuplexInner> refcount hits zero AND clean_close
+/// shared `Arc<DuplexInner>` refcount hits zero AND clean_close
 /// wasn't observed — see the SDK's `DuplexInner::Drop`).
 /// Idempotent on NULL.
 #[unsafe(no_mangle)]

@@ -131,8 +131,17 @@ pub use net::adapter::net::behavior::capability::{
     AcceleratorInfo, AcceleratorType, CapabilityAnnouncement, CapabilityFilter, CapabilityIndex,
     CapabilityIndexStats, CapabilityRequirement, CapabilitySet, GpuInfo, GpuVendor,
     HardwareCapabilities, IndexedNode, Modality, ModelCapability, ResourceLimits, ScopeFilter,
-    Signature64, SoftwareCapabilities, ToolCapability,
+    Signature64, SoftwareCapabilities, ToolCapability, MAX_ALLOW_LIST_LEN,
 };
+
+// v0.4 capability-auth identity types. Aliased on re-export to
+// avoid clashing with the unrelated bit-packed `SubnetId` exposed
+// by `net_sdk::subnets` — the auth types are 16/32-byte opaque
+// identifiers tied to the `CapabilityAnnouncement` allow-lists,
+// while the existing `SubnetId` is the 32-bit subnet-routing tag.
+// See `docs/plans/CAPABILITY_AUTH_PLAN.md` §"New identity types".
+pub use net::adapter::net::behavior::group::GroupId as CapabilityGroupId;
+pub use net::adapter::net::behavior::subnet::SubnetId as CapabilitySubnetId;
 
 // =============================================================================
 // Typed taxonomy — Phase A.1 of `CAPABILITY_SYSTEM_PLAN.md`.

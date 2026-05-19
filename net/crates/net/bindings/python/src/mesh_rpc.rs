@@ -135,6 +135,17 @@ create_exception!(
      bad-request without going through the generic Internal mapping."
 );
 
+create_exception!(
+    _net,
+    RpcCapabilityDeniedError,
+    RpcError,
+    "v0.4 capability-auth gate denied the call. The target's signed \
+     `CapabilityAnnouncement` either does not list the requested `nrpc:<service>` \
+     tag, or it lists the tag with allow-lists the caller does not match. NOT \
+     retried by the default retry policy — only a fresh (more permissive) \
+     announcement from the target can change the verdict."
+);
+
 // ============================================================================
 // Helpers — convert inner RpcError to the matching Python exception.
 // ============================================================================
@@ -166,6 +177,11 @@ fn rpc_error_to_pyerr(err: InnerRpcError) -> PyErr {
                 ::net::adapter::net::mesh_rpc::CodecDirection::Decode => "codec_decode",
             };
             RpcCodecError::new_err(format!("{ERR_NRPC_PREFIX}{kind}: {message}"))
+        }
+        InnerRpcError::CapabilityDenied { target, capability } => {
+            RpcCapabilityDeniedError::new_err(format!(
+                "{ERR_NRPC_PREFIX}capability_denied: target=0x{target:x} capability={capability}"
+            ))
         }
     }
 }
@@ -1827,6 +1843,9 @@ mod tests {
                     };
                     format!("nrpc:{kind}: {message}")
                 }
+                InnerRpcError::CapabilityDenied { target, capability } => {
+                    format!("nrpc:capability_denied: target=0x{target:x} capability={capability}")
+                }
             }
         };
 
@@ -1868,6 +1887,13 @@ mod tests {
             }),
             "nrpc:codec_decode: trailing"
         );
+        assert_eq!(
+            format(InnerRpcError::CapabilityDenied {
+                target: 0xCAFE_F00D,
+                capability: "echo".into(),
+            }),
+            "nrpc:capability_denied: target=0xcafef00d capability=echo"
+        );
 
         // Every kind starts with the canonical prefix so the JS
         // and Python `classify_error` parsers can match a single
@@ -1888,6 +1914,10 @@ mod tests {
             InnerRpcError::Codec {
                 direction: CodecDirection::Encode,
                 message: "x".into(),
+            },
+            InnerRpcError::CapabilityDenied {
+                target: 1,
+                capability: "x".into(),
             },
         ] {
             assert!(

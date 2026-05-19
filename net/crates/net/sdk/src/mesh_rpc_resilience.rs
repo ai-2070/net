@@ -139,6 +139,12 @@ pub fn default_retryable(err: &RpcError) -> bool {
         // deterministic failure and risks tripping the circuit
         // breaker on a local-only fault.
         RpcError::Codec { .. } => false,
+        // v0.4 capability-auth: the target's signed policy denies
+        // this caller — retry can't change the verdict until the
+        // target publishes a new (more permissive) announcement.
+        // Treat as terminal so the retry budget isn't wasted on
+        // a deterministic deny.
+        RpcError::CapabilityDenied { .. } => false,
     }
 }
 

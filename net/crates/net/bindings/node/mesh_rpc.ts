@@ -527,11 +527,14 @@ export function defaultRetryable(err: unknown): boolean {
     case 'RpcNoRouteError':
     case 'RpcCodecError':
     case 'RpcCancelledError':
+    case 'RpcCapabilityDeniedError':
       // Cancellation is caller-driven — retrying defeats the
       // point. Pinned by `RpcCancelledError`'s class docstring;
       // pre-TS-migration the predicate fell through to the
       // generic `nrpc:` "retry by default" branch and silently
-      // re-issued cancelled calls.
+      // re-issued cancelled calls. CapabilityDenied is a signed
+      // policy verdict from the target — retry can't change it
+      // until the target publishes a more permissive announcement.
       return false
     case 'RpcTimeoutError':
     case 'RpcTransportError':
@@ -558,6 +561,7 @@ export function defaultRetryable(err: unknown): boolean {
   if (msg.startsWith('nrpc:no_route:')) return false
   if (msg.startsWith('nrpc:codec_')) return false
   if (msg.startsWith('nrpc:cancelled:')) return false
+  if (msg.startsWith('nrpc:capability_denied:')) return false
   if (msg.startsWith('nrpc:server_error:')) {
     const status = parseStatusFromMessage(msg)
     return (

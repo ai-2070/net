@@ -110,7 +110,7 @@ impl CliContext {
     }
 }
 
-async fn load_identity_keypair(path: &Path) -> Result<EntityKeypair, CliError> {
+pub(crate) async fn load_identity_keypair(path: &Path) -> Result<EntityKeypair, CliError> {
     let text = tokio::fs::read_to_string(path).await.map_err(|e| {
         generic(format!(
             "failed to read identity file {}: {e}",

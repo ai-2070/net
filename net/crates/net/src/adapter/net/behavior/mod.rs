@@ -20,6 +20,7 @@ pub mod dataforts_capabilities;
 #[cfg(feature = "meshos")]
 pub mod deck;
 pub mod diff;
+pub mod group;
 pub mod loadbalance;
 #[cfg(feature = "meshdb")]
 pub mod meshdb;
@@ -35,6 +36,7 @@ pub mod required_capability;
 pub mod rules;
 pub mod safety;
 pub mod schema;
+pub mod subnet;
 pub mod tag;
 pub mod tag_codec;
 

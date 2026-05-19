@@ -6886,6 +6886,57 @@ impl MeshNode {
     // `CapabilityAnnouncement::to_bytes`. Direct-peer push only in
     // v1; multi-hop gossip is a follow-up.
 
+    /// Self-index a fresh `CapabilityAnnouncement` that merges every
+    /// currently-registered nRPC service from `rpc_local_services`
+    /// into the existing `user_caps` baseline. Used by `serve_rpc`
+    /// so the v0.4 capability-auth callee-side gate (in
+    /// `serve_rpc`'s bridge) observes a self-announcement carrying
+    /// the new `nrpc:<service>` tag the moment the bridge starts
+    /// consuming inbound events. Closes the cold-start hole (H1)
+    /// and the `announce_capabilities` / `serve_rpc` ordering trap
+    /// (H2): the merged self-announcement is in the local index
+    /// regardless of whether the operator called
+    /// `announce_capabilities` first, last, or not at all.
+    ///
+    /// Sync (no broadcast). Peer-side visibility happens via the
+    /// subsequent spawned `announce_capabilities` call in
+    /// `serve_rpc` (or the next operator-issued announce). The
+    /// version bump is cheap and monotonic with the broadcast
+    /// path — receivers always honor the highest version per
+    /// `node_id`.
+    ///
+    /// **Divergence from `announce_capabilities_with`**: this sync
+    /// path intentionally skips the `nat:*` piggyback tag and the
+    /// `reflex_addr` field that the broadcast path adds. The
+    /// capability-auth gate is `nrpc:`-only, so the omission is
+    /// invisible to the gate; the spawned re-announce that
+    /// follows in `serve_rpc` lays down the full
+    /// `nat:` + `reflex_addr` form for peer-visible filtering. If
+    /// a future gate axis keys on `nat:*` (e.g. requiring callers
+    /// to be open-cone), this sync self-index becomes the
+    /// cold-start hole that re-opens it — extend the merged
+    /// `CapabilitySet` here in lockstep.
+    pub(crate) fn index_self_with_local_services(&self) {
+        let baseline = self.user_caps_snapshot();
+        let merged = {
+            let mut m = baseline;
+            for svc in self.rpc_local_services.iter() {
+                m = m.add_tag(format!("nrpc:{}", svc.as_str()));
+            }
+            m
+        };
+        let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut ann = CapabilityAnnouncement::new(
+            self.node_id,
+            self.identity.entity_id().clone(),
+            version,
+            merged,
+        )
+        .with_ttl(300);
+        ann.sign(&self.identity);
+        self.capability_index.index(ann);
+    }
+
     /// Announce this node's capabilities to every directly-connected
     /// peer. Also self-indexes so single-node `find_nodes_by_filter`
     /// queries return us too.

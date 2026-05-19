@@ -38,12 +38,13 @@
 // discriminator matching the stable `nrpc:` prefix convention used
 // by the Node + Python bindings:
 //
-//   - `RpcKindNoRoute`     — `nrpc:no_route: target=0x... reason=...`
-//   - `RpcKindTimeout`     — `nrpc:timeout: elapsed_ms=...`
-//   - `RpcKindServerError` — `nrpc:server_error: status=0x... message=...`
-//   - `RpcKindTransport`   — `nrpc:transport: ...`
-//   - `RpcKindCodecEncode` — `nrpc:codec_encode: ...`
-//   - `RpcKindCodecDecode` — `nrpc:codec_decode: ...`
+//   - `RpcKindNoRoute`          — `nrpc:no_route: target=0x... reason=...`
+//   - `RpcKindTimeout`          — `nrpc:timeout: elapsed_ms=...`
+//   - `RpcKindServerError`      — `nrpc:server_error: status=0x... message=...`
+//   - `RpcKindTransport`        — `nrpc:transport: ...`
+//   - `RpcKindCodecEncode`      — `nrpc:codec_encode: ...`
+//   - `RpcKindCodecDecode`      — `nrpc:codec_decode: ...`
+//   - `RpcKindCapabilityDenied` — `nrpc:capability_denied: target=0x... capability=...`
 //
 // Use `errors.As(err, &rpcErr)` to inspect the kind.
 package net
@@ -337,13 +338,14 @@ import (
 type RpcKind string
 
 const (
-	RpcKindNoRoute     RpcKind = "no_route"
-	RpcKindTimeout     RpcKind = "timeout"
-	RpcKindServerError RpcKind = "server_error"
-	RpcKindTransport   RpcKind = "transport"
-	RpcKindCodecEncode RpcKind = "codec_encode"
-	RpcKindCodecDecode RpcKind = "codec_decode"
-	RpcKindUnknown     RpcKind = "unknown"
+	RpcKindNoRoute          RpcKind = "no_route"
+	RpcKindTimeout          RpcKind = "timeout"
+	RpcKindServerError      RpcKind = "server_error"
+	RpcKindTransport        RpcKind = "transport"
+	RpcKindCodecEncode      RpcKind = "codec_encode"
+	RpcKindCodecDecode      RpcKind = "codec_decode"
+	RpcKindCapabilityDenied RpcKind = "capability_denied"
+	RpcKindUnknown          RpcKind = "unknown"
 )
 
 // RpcError is the typed error surfaced from any Call / CallService
@@ -372,7 +374,8 @@ func parseRpcError(raw string) *RpcError {
 	detail := strings.TrimSpace(raw[colon+1:])
 	switch kind {
 	case RpcKindNoRoute, RpcKindTimeout, RpcKindServerError,
-		RpcKindTransport, RpcKindCodecEncode, RpcKindCodecDecode:
+		RpcKindTransport, RpcKindCodecEncode, RpcKindCodecDecode,
+		RpcKindCapabilityDenied:
 		return &RpcError{Kind: kind, Message: detail}
 	}
 	return &RpcError{Kind: RpcKindUnknown, Message: raw}

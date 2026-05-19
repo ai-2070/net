@@ -242,6 +242,25 @@ pub enum RpcError {
         /// Decode/encode diagnostic from the underlying serde impl.
         message: String,
     },
+    /// v0.4 capability-auth gate denied the call. Either the
+    /// target's latest `CapabilityAnnouncement` does not list
+    /// the requested `nrpc:<service>` tag, or it lists the tag
+    /// with allow-lists the caller does not match. See
+    /// `docs/plans/CAPABILITY_AUTH_PLAN.md` §3 for the model.
+    ///
+    /// Raised by the caller-side gate inside
+    /// [`MeshNode::call_service`] BEFORE the request hits the
+    /// wire, and surfaced by the caller on receipt of a
+    /// `RpcStatus::CapabilityDenied` response (the callee-side
+    /// defense-in-depth path).
+    #[error("capability denied: target {target:#x} does not authorize nrpc:{capability}")]
+    CapabilityDenied {
+        /// Target node id the gate denied.
+        target: u64,
+        /// Service / capability tag (without the `nrpc:` prefix)
+        /// the gate denied.
+        capability: String,
+    },
 }
 
 /// Which side of the call surfaced a [`RpcError::Codec`] failure.
@@ -1566,6 +1585,18 @@ impl MeshNode {
         // `&mut self`). Attach the per-service metrics handle so
         // the spawned handler tasks bump server-side counters.
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
+        // Keep a clone of the emit closure for the callee-side
+        // capability-auth defense-in-depth path in the bridge
+        // below — the fold owns its own clone, this one only
+        // emits the `CapabilityDenied` rejection before the fold
+        // sees the event.
+        let emit_for_bridge = Arc::clone(&emit);
+        // Clone the per-service metrics handle so the bridge can
+        // bump `capability_denied_total` on gate rejection. The
+        // fold's own clone (passed via `with_metrics`) handles the
+        // handler-side counters; this one covers the path BEFORE
+        // the handler runs, which the fold-side metrics never see.
+        let metrics_for_bridge = Arc::clone(&metrics_handle);
         let fold = Arc::new(Mutex::new(
             RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit).with_metrics(metrics_handle),
         ));
@@ -1578,6 +1609,19 @@ impl MeshNode {
             // here would spam.
             let _ = tx.try_send(ev);
         });
+        // Register the service in `rpc_local_services` and refresh
+        // the self-indexed announcement BEFORE installing the
+        // dispatcher so the callee-side gate (in the bridge below)
+        // sees a self-announcement carrying `nrpc:<service>` the
+        // moment the first inbound event lands. Without this, the
+        // gate was either silently permissive (no self-ann) or
+        // silently denying (self-ann from a prior
+        // `announce_capabilities` that pre-dated this service's
+        // registration). See `docs/misc/CODE_REVIEW_2026_05_19_CAPABILITY_AUTH.md`
+        // H1 + H2.
+        self.rpc_local_services_arc().insert(service.to_string());
+        self.index_self_with_local_services();
+
         if self
             .register_rpc_inbound(channel_hash, dispatcher)
             .is_some()
@@ -1585,11 +1629,70 @@ impl MeshNode {
             return Err(ServeError::AlreadyServing(service.to_string()));
         }
 
-        // Spawn the bridge task. It reads inbound events, builds
-        // synthetic `RedexEvent`s carrying the payload, and feeds
-        // them to the fold.
+        // Spawn the bridge task. It reads inbound events, runs
+        // the v0.4 capability-auth callee-side gate (defense in
+        // depth — the caller-side gate inside `call_service`
+        // covers the well-behaved client path), and on accept
+        // feeds them to the fold.
+        let mesh_for_bridge = Arc::clone(self);
+        let service_for_bridge = service.to_string();
         let bridge = tokio::spawn(async move {
+            let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
+                // Defense-in-depth check. Skip only when the wire
+                // session resolved no NodeId (`from_node == 0` is
+                // the loopback / test sentinel per
+                // `RpcInboundEvent::from_node` — production wire
+                // delivery drops events that fail NodeId
+                // resolution rather than passing 0). The cold-
+                // start "no self-ann" skip the original
+                // implementation carried was a permissive hole;
+                // `index_self_with_local_services` above
+                // guarantees a self-ann exists before the
+                // dispatcher is wired, so denying when the gate
+                // says no is now the safe failure mode.
+                let self_node = mesh_for_bridge.node_id();
+                let index = mesh_for_bridge.capability_index_arc();
+                let from_node = inbound.from_node;
+                if from_node != 0 && !index.may_execute(self_node, &tag, from_node) {
+                    // Decode the EventMeta so we can address the
+                    // caller's reply channel (keyed on
+                    // `caller_origin`) and tag the response with
+                    // the correct `call_id`. A garbled meta means
+                    // the request would have been rejected by the
+                    // fold's own decode path too; drop silently
+                    // to match the existing skip-on-malformed
+                    // behavior there.
+                    let Some(meta) = (if inbound.payload.len() >= EVENT_META_SIZE {
+                        EventMeta::from_bytes(&inbound.payload[..EVENT_META_SIZE])
+                    } else {
+                        None
+                    }) else {
+                        continue;
+                    };
+                    let resp = super::cortex::RpcResponsePayload {
+                        status: RpcStatus::CapabilityDenied,
+                        headers: vec![],
+                        body: format!(
+                            "callee-side capability-auth gate denied nrpc:{}",
+                            service_for_bridge
+                        )
+                        .into_bytes(),
+                    };
+                    // Server-side metrics: bump `capability_denied_total`
+                    // on the per-service counter. The fold-side
+                    // metrics never see this path (the handler isn't
+                    // invoked), so without this bump a noisy
+                    // unauthorized caller is invisible to operators
+                    // watching `nrpc_handler_invocations_total` —
+                    // the dashboard sees "0 requests" while the
+                    // caller sees `CapabilityDenied`.
+                    metrics_for_bridge
+                        .capability_denied_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    (emit_for_bridge)(meta.origin_hash, meta.seq_or_ts, resp);
+                    continue;
+                }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
@@ -1599,11 +1702,24 @@ impl MeshNode {
             }
         });
 
-        // Register in the local-services set so the next
-        // `announce_capabilities` call merges an `nrpc:<service>`
-        // tag onto the announced CapabilitySet, making this node
-        // discoverable via `Mesh::find_service_nodes(service)`.
-        self.rpc_local_services_arc().insert(service.to_string());
+        // Spawn an async re-announce so peers also learn about
+        // the new service without the operator having to call
+        // `announce_capabilities` manually. The local self-index
+        // already happened above; this is purely for peer
+        // visibility (the broadcast path also re-runs the
+        // self-index, which is a cheap version bump).
+        let mesh_for_announce = Arc::clone(self);
+        let service_for_log = service.to_string();
+        tokio::spawn(async move {
+            let baseline = mesh_for_announce.user_caps_snapshot();
+            if let Err(e) = mesh_for_announce.announce_capabilities(baseline).await {
+                tracing::warn!(
+                    error = %e,
+                    service = %service_for_log,
+                    "serve_rpc: auto re-announce failed",
+                );
+            }
+        });
 
         Ok(ServeHandle {
             channel_hash,
@@ -2345,6 +2461,40 @@ impl MeshNode {
         // small.
         candidates.sort_unstable();
 
+        // v0.4 capability-auth caller-side gate. Filter the
+        // candidate set BEFORE target selection so the routing
+        // policy never picks a peer the caller can't actually
+        // reach. Pre-fix `select_target` could pick a denied
+        // candidate even when authorized peers existed in the
+        // set, and the resulting `CapabilityDenied` masked the
+        // fact that the call would have succeeded against B or
+        // C. Each candidate's own announcement lists
+        // `nrpc:<service>` (otherwise it wouldn't be a
+        // `find_service_nodes` candidate), so the gate's
+        // `has_tag` arm short-circuits in the common case; the
+        // new work is the allow-list scan. Permissive
+        // announcements (all three lists empty) admit any
+        // caller — the byte-identity wire-compat tests pin that
+        // an unmodified peer's announcement stays unrestricted.
+        // See `docs/plans/CAPABILITY_AUTH_PLAN.md` §3.
+        let tag = format!("nrpc:{service}");
+        let index = self.capability_index_arc();
+        let self_id = self.node_id();
+        let any_candidate = candidates[0];
+        candidates.retain(|c| index.may_execute(*c, &tag, self_id));
+        if candidates.is_empty() {
+            return Err(RpcError::CapabilityDenied {
+                // No authorized target; surface one of the
+                // originally-advertised candidates so the caller
+                // can correlate the denial with a real peer. The
+                // semantic is "no peer advertising `nrpc:<service>`
+                // authorizes this caller" — `any_candidate` is a
+                // representative, not necessarily the strictest.
+                target: any_candidate,
+                capability: service.to_string(),
+            });
+        }
+
         let target = self.select_target(&candidates, &opts.routing_policy);
         self.call(target, service, payload, opts).await
     }
@@ -2692,6 +2842,17 @@ impl MeshNode {
                 request_bytes_len,
                 response_bytes_len,
             );
+            // v0.4 capability-auth: callee-side defense-in-depth
+            // surfaces as a wire `CapabilityDenied` status. Map it
+            // back to the typed `RpcError::CapabilityDenied` so
+            // application code sees the same variant regardless of
+            // which side of the gate fired.
+            if matches!(resp.status, RpcStatus::CapabilityDenied) {
+                return Err(RpcError::CapabilityDenied {
+                    target: target_node_id,
+                    capability: service.to_string(),
+                });
+            }
             Err(RpcError::ServerError { status, message })
         }
     }

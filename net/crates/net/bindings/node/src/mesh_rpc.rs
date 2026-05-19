@@ -93,6 +93,10 @@ fn nrpc_err_from_inner(err: InnerRpcError) -> Error {
             };
             nrpc_err(dir_str, message)
         }
+        InnerRpcError::CapabilityDenied { target, capability } => nrpc_err(
+            "capability_denied",
+            format!("target=0x{target:x} capability={capability}"),
+        ),
     }
 }
 
@@ -1741,6 +1745,9 @@ mod tests {
                     };
                     format!("{ERR_NRPC_PREFIX}{dir}: {message}")
                 }
+                InnerRpcError::CapabilityDenied { target, capability } => format!(
+                    "{ERR_NRPC_PREFIX}capability_denied: target=0x{target:x} capability={capability}"
+                ),
             }
         };
 

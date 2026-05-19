@@ -40,14 +40,15 @@ export class NetDbError extends Error {
 // the napi binding's mesh_rpc.rs::nrpc_err_from_inner emits each
 // variant under a stable kind segment after the `nrpc:` prefix:
 //
-//   nrpc:no_route       -> RpcNoRouteError
-//   nrpc:timeout        -> RpcTimeoutError
-//   nrpc:server_error   -> RpcServerError
-//   nrpc:transport      -> RpcTransportError
-//   nrpc:codec_encode   -> RpcCodecError(direction='encode')
-//   nrpc:codec_decode   -> RpcCodecError(direction='decode')
-//   nrpc:cancelled      -> RpcCancelledError
-//   nrpc:* (anything else) -> RpcError (the base class)
+//   nrpc:no_route           -> RpcNoRouteError
+//   nrpc:timeout            -> RpcTimeoutError
+//   nrpc:server_error       -> RpcServerError
+//   nrpc:transport          -> RpcTransportError
+//   nrpc:codec_encode       -> RpcCodecError(direction='encode')
+//   nrpc:codec_decode       -> RpcCodecError(direction='decode')
+//   nrpc:cancelled          -> RpcCancelledError
+//   nrpc:capability_denied  -> RpcCapabilityDeniedError
+//   nrpc:* (anything else)  -> RpcError (the base class)
 //
 // Catch with `instanceof RpcError` for "any nRPC failure", or
 // drill down to a concrete subclass for specific handling. The
@@ -145,6 +146,22 @@ export class RpcCancelledError extends RpcError {
 }
 
 /**
+ * v0.4 capability-auth gate denied the call. The target's signed
+ * `CapabilityAnnouncement` either does not list the requested
+ * `nrpc:<service>` tag, or it lists the tag with allow-lists the
+ * caller does not match. Terminal — NOT retried by the default
+ * retry policy. Only a fresh (more permissive) announcement from
+ * the target can change the verdict.
+ */
+export class RpcCapabilityDeniedError extends RpcError {
+  constructor(detail?: string) {
+    super(detail ?? 'rpc capability denied')
+    this.name = 'RpcCapabilityDeniedError'
+    Object.setPrototypeOf(this, RpcCapabilityDeniedError.prototype)
+  }
+}
+
+/**
  * Inspect an error's message prefix and return a typed error if it
  * matches the napi binding's contract. Non-matching errors are
  * returned unchanged — caller can `throw` the result unconditionally.
@@ -208,6 +225,8 @@ function classifyRpcError(msg: string): RpcError {
       return new RpcCodecError(msg, 'decode')
     case 'cancelled':
       return new RpcCancelledError(msg)
+    case 'capability_denied':
+      return new RpcCapabilityDeniedError(msg)
     default:
       return new RpcError(msg)
   }

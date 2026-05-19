@@ -720,6 +720,55 @@ pub(crate) fn scope_from_tags(tags: &HashSet<Tag>) -> CapabilityScope {
     }
 }
 
+/// Parse `subnet:<hex32>` and `group:<hex64>` tags out of an
+/// announcement's tag set. Used at index time so the
+/// capability-auth `may_execute` gate can look up a peer's
+/// declared membership in O(1) without re-walking tags per call.
+///
+/// Multiple `subnet:` tags on one announcement are out of model:
+/// the substrate treats subnet membership as single-valued. To
+/// keep the gate verdict deterministic across receivers — a
+/// previous implementation read whichever subnet tag the
+/// `HashSet<Tag>` iterator surfaced first, which is hash-order
+/// dependent — multiple distinct subnet tags collapse to `None`
+/// and the announcement contributes no subnet membership. Single
+/// subnet tag works as expected. All distinct `group:` tags
+/// accumulate (deterministically sorted by byte value so receivers
+/// agree on iteration order); duplicates (Eq) are removed.
+pub(crate) fn parse_membership_tags(
+    tags: &HashSet<Tag>,
+) -> (Option<super::subnet::SubnetId>, Vec<super::group::GroupId>) {
+    let mut subnet_candidates: Vec<super::subnet::SubnetId> = Vec::new();
+    let mut groups: Vec<super::group::GroupId> = Vec::new();
+    for tag in tags {
+        let rendered = tag.to_string();
+        if let Some(s) = super::subnet::SubnetId::from_tag(&rendered) {
+            if !subnet_candidates.contains(&s) {
+                subnet_candidates.push(s);
+            }
+            continue;
+        }
+        if let Some(g) = super::group::GroupId::from_tag(&rendered) {
+            if !groups.contains(&g) {
+                groups.push(g);
+            }
+        }
+    }
+    // Single distinct subnet → use it; zero or multiple → no
+    // subnet membership (multiple is out-of-model malformed and
+    // would otherwise pick a hash-order-dependent winner).
+    let subnet = if subnet_candidates.len() == 1 {
+        Some(subnet_candidates[0])
+    } else {
+        None
+    };
+    // Deterministic group order so receivers agree on iteration
+    // sequence regardless of local hash randomization. Lexicographic
+    // by byte value is stable and cheap on the 32-byte payload.
+    groups.sort_by_key(|g| g.0);
+    (subnet, groups)
+}
+
 /// Caller's intent for narrowing peer discovery by reserved scope
 /// tags, paired with [`CapabilityIndex::find_nodes_scoped`] /
 /// [`CapabilityIndex::find_best_node_scoped`].
@@ -1941,7 +1990,42 @@ pub struct CapabilityAnnouncement {
     /// default to `None` via `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reflex_addr: Option<std::net::SocketAddr>,
+    /// v0.4 capability-auth allow-list — explicit `NodeId`s that
+    /// may invoke any capability listed in `capabilities`. Empty
+    /// vec = permissive default (anyone may invoke, subject to
+    /// the other two lists). See `CAPABILITY_AUTH_PLAN.md`.
+    ///
+    /// Capped at [`MAX_ALLOW_LIST_LEN`] (64) per axis — past that,
+    /// operators use a [`super::group::GroupId`] instead.
+    ///
+    /// `skip_serializing_if` preserves byte-identity with pre-v0.4
+    /// announcements: an unrestricted (empty) list serializes to
+    /// nothing, so an existing signature verifies on a v0.4 reader
+    /// and a v0.4 signature verifies on a pre-v0.4 reader (which
+    /// defaults the field to empty via `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_nodes: Vec<u64>,
+    /// v0.4 capability-auth allow-list — [`super::subnet::SubnetId`]s
+    /// whose members may invoke. Empty = permissive default.
+    /// Receivers determine a caller's subnet via the `subnet:<hex>`
+    /// tag on the caller's own announcement (self-declared, signed,
+    /// TOFU-bound). Same wire-compat treatment as `allowed_nodes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_subnets: Vec<super::subnet::SubnetId>,
+    /// v0.4 capability-auth allow-list — [`super::group::GroupId`]s
+    /// whose claimants may invoke. Empty = permissive default.
+    /// Group membership is self-declared via `group:<hex>` tags on
+    /// the caller's own announcement. Same wire-compat treatment
+    /// as `allowed_nodes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_groups: Vec<super::group::GroupId>,
 }
+
+/// Cap on any single allow-list axis on a
+/// [`CapabilityAnnouncement`]. 64 entries keeps the announcement
+/// under the wire-size ceiling and matches the operator guidance
+/// "lists > 64 use a group, not inline node enumeration."
+pub const MAX_ALLOW_LIST_LEN: usize = 64;
 
 /// Serde predicate: skip serializing `hop_count` when it's zero.
 /// Preserves on-wire byte-compat with pre-M-1 announcements that
@@ -2035,6 +2119,9 @@ impl CapabilityAnnouncement {
             signature: None,
             hop_count: 0,
             reflex_addr: None,
+            allowed_nodes: Vec::new(),
+            allowed_subnets: Vec::new(),
+            allowed_groups: Vec::new(),
         }
     }
 
@@ -2121,9 +2208,24 @@ impl CapabilityAnnouncement {
         serde_json::to_vec(self).unwrap_or_default()
     }
 
-    /// Deserialize from bytes
+    /// Deserialize from bytes. Returns `None` on a JSON parse
+    /// failure OR when any v0.4 capability-auth allow-list exceeds
+    /// [`MAX_ALLOW_LIST_LEN`] — the cap is a wire-level invariant
+    /// (operators above 64 entries per axis must use a group), so
+    /// receivers reject oversized announcements at the deserializer
+    /// boundary rather than scanning unbounded vectors inside
+    /// `may_execute` on every call. Symmetric with the CLI's
+    /// announce-side check; closes the asymmetry where the
+    /// substrate accepted any vector length the wire delivered.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        serde_json::from_slice(data).ok()
+        let ann: Self = serde_json::from_slice(data).ok()?;
+        if ann.allowed_nodes.len() > MAX_ALLOW_LIST_LEN
+            || ann.allowed_subnets.len() > MAX_ALLOW_LIST_LEN
+            || ann.allowed_groups.len() > MAX_ALLOW_LIST_LEN
+        {
+            return None;
+        }
+        Some(ann)
     }
 
     /// Drop every metadata key that the substrate reserves for
@@ -2488,6 +2590,33 @@ pub struct IndexedNode {
     /// projection (which would require either an `EntityId` clone
     /// on every entry or a re-keying scan).
     pub origin_hash: u64,
+    /// v0.4 capability-auth allow-list — explicit `NodeId`s that
+    /// may invoke any capability listed on this announcement.
+    /// Empty = permissive default. Carried verbatim from
+    /// [`CapabilityAnnouncement::allowed_nodes`].
+    pub allowed_nodes: Vec<u64>,
+    /// v0.4 capability-auth allow-list — subnet ids whose members
+    /// may invoke. Empty = permissive default. Carried from
+    /// [`CapabilityAnnouncement::allowed_subnets`].
+    pub allowed_subnets: Vec<super::subnet::SubnetId>,
+    /// v0.4 capability-auth allow-list — group ids whose
+    /// claimants may invoke. Empty = permissive default. Carried
+    /// from [`CapabilityAnnouncement::allowed_groups`].
+    pub allowed_groups: Vec<super::group::GroupId>,
+    /// Self-declared subnet membership parsed from a `subnet:<hex32>`
+    /// tag on the announcement. Resolves to `Some(s)` only when the
+    /// announcement carries exactly one distinct subnet tag; zero
+    /// or two-or-more distinct subnet tags collapse to `None`
+    /// (out-of-model malformed input → no membership). The
+    /// collapse keeps the gate's subnet-axis verdict deterministic
+    /// across receivers — a previous "first valid wins" strategy
+    /// was hash-order-dependent against `HashSet<Tag>` iteration.
+    pub subnet: Option<super::subnet::SubnetId>,
+    /// Self-declared group memberships parsed from every
+    /// `group:<hex64>` tag on the announcement. Sorted by byte
+    /// value so iteration order is stable across receivers
+    /// regardless of local hash randomization; duplicates removed.
+    pub groups: Vec<super::group::GroupId>,
 }
 
 /// One entry in the `by_origin_hash` side index.
@@ -2764,6 +2893,19 @@ impl CapabilityIndex {
         // truncation in NetHeader); reproduce that here so the
         // side index keys match what receivers compute.
         let origin_hash = (ann.entity_id.origin_hash() as u32) as u64;
+        // Parse subnet/group membership from the announcement's
+        // own tags so the capability-auth gate (`may_execute`) can
+        // resolve caller membership without re-walking the tag set
+        // on every check. Subnet membership is single-valued by
+        // design: exactly one distinct `subnet:<hex32>` tag →
+        // `Some(s)`; zero or multiple distinct tags collapse to
+        // `None` (treating multiples as out-of-model malformed
+        // input keeps the gate's verdict deterministic across
+        // receivers — `HashSet<Tag>` iteration order is unspecified
+        // so "first valid wins" would be hash-order-dependent).
+        // All distinct `group:<hex64>` tags accumulate, sorted by
+        // byte value, deduplicated by Eq.
+        let (parsed_subnet, parsed_groups) = parse_membership_tags(&ann.capabilities.tags);
         let indexed = IndexedNode {
             node_id,
             capabilities: ann.capabilities,
@@ -2772,6 +2914,11 @@ impl CapabilityIndex {
             ttl: effective_ttl,
             reflex_addr: ann.reflex_addr,
             origin_hash,
+            allowed_nodes: ann.allowed_nodes,
+            allowed_subnets: ann.allowed_subnets,
+            allowed_groups: ann.allowed_groups,
+            subnet: parsed_subnet,
+            groups: parsed_groups,
         };
         self.nodes.insert(node_id, indexed);
         // Track collisions on the side index. A fresh Single
@@ -3448,6 +3595,87 @@ impl CapabilityIndex {
     /// punch target's public `SocketAddr` here.
     pub fn reflex_addr(&self, node_id: u64) -> Option<std::net::SocketAddr> {
         self.nodes.get(&node_id).and_then(|n| n.reflex_addr)
+    }
+
+    /// Caller's self-declared subnet membership, parsed from a
+    /// `subnet:<hex32>` tag on the caller's own announcement.
+    /// Returns `None` when the caller has no announcement yet or
+    /// emitted no `subnet:` tag. v0.4 capability-auth uses this
+    /// inside [`Self::may_execute`].
+    pub fn subnet_of(&self, node_id: u64) -> Option<super::subnet::SubnetId> {
+        self.nodes.get(&node_id).and_then(|n| n.subnet)
+    }
+
+    /// Caller's self-declared group memberships, parsed from
+    /// every `group:<hex64>` tag on the caller's own
+    /// announcement. Returns an empty Vec when the caller has no
+    /// announcement yet or emitted no `group:` tags. Order
+    /// matches the announcement's tag-set iteration order
+    /// (deterministic for a given index entry but not stable
+    /// across rebuilds).
+    pub fn groups_of(&self, node_id: u64) -> Vec<super::group::GroupId> {
+        self.nodes
+            .get(&node_id)
+            .map(|n| n.groups.clone())
+            .unwrap_or_default()
+    }
+
+    /// v0.4 capability-auth execute-gate. Returns `true` when
+    /// `caller_node` is allowed to invoke `capability_tag` on
+    /// `target_node`.
+    ///
+    /// See `docs/plans/CAPABILITY_AUTH_PLAN.md` §3 for the model.
+    /// The gate is permissive by default — an announcement with
+    /// all three allow-lists empty admits any caller. Once any
+    /// list is non-empty, the union of all three is enforced
+    /// (node OR subnet OR group); the scan short-circuits on the
+    /// first match.
+    ///
+    /// Returns `false` when:
+    /// - the target has no indexed announcement (you can't
+    ///   address what you can't see);
+    /// - the target's announcement doesn't list the requested
+    ///   `capability_tag`;
+    /// - the target restricts and the caller matches no axis.
+    ///
+    /// The caller's identity is taken from the wire binding only —
+    /// the gate does NOT consult the caller's own announcement
+    /// for capability claims. It does consult it for subnet /
+    /// group membership lookup, because that's the only place
+    /// self-declared membership lives.
+    pub fn may_execute(&self, target_node: u64, capability_tag: &str, caller_node: u64) -> bool {
+        let Some(target) = self.nodes.get(&target_node) else {
+            return false;
+        };
+        if !target.capabilities.has_tag(capability_tag) {
+            return false;
+        }
+        if target.allowed_nodes.is_empty()
+            && target.allowed_subnets.is_empty()
+            && target.allowed_groups.is_empty()
+        {
+            return true;
+        }
+        if target.allowed_nodes.contains(&caller_node) {
+            return true;
+        }
+        if !target.allowed_subnets.is_empty() {
+            if let Some(caller_subnet) = self.nodes.get(&caller_node).and_then(|n| n.subnet) {
+                if target.allowed_subnets.contains(&caller_subnet) {
+                    return true;
+                }
+            }
+        }
+        if !target.allowed_groups.is_empty() {
+            if let Some(caller_entry) = self.nodes.get(&caller_node) {
+                for group in &caller_entry.groups {
+                    if target.allowed_groups.contains(group) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Get all node IDs
@@ -5191,6 +5419,549 @@ mod tests {
         // MAX_HOPS. If the pingwave side is ever renumbered this
         // test flags the divergence at compile time.
         assert_eq!(MAX_CAPABILITY_HOPS, 16);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // v0.4 capability-auth: allow-list wire-format + signing tests
+    // ─────────────────────────────────────────────────────────────────
+
+    /// An announcement with all three allow-lists empty must
+    /// produce JSON bytes identical to a pre-v0.4 announcement.
+    /// This is the wire-compat contract the plan §"What ships"
+    /// pins: existing peers must round-trip a v0.4-produced
+    /// unrestricted announcement byte-for-byte.
+    #[test]
+    fn empty_allow_lists_omit_fields_from_wire() {
+        let ann = CapabilityAnnouncement::new(
+            42,
+            super::super::super::identity::EntityId::from_bytes([0xAA; 32]),
+            1,
+            sample_capability_set(),
+        );
+        let bytes = ann.to_bytes();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !s.contains("allowed_nodes"),
+            "empty allowed_nodes must be skipped on the wire; got: {}",
+            s
+        );
+        assert!(
+            !s.contains("allowed_subnets"),
+            "empty allowed_subnets must be skipped on the wire; got: {}",
+            s
+        );
+        assert!(
+            !s.contains("allowed_groups"),
+            "empty allowed_groups must be skipped on the wire; got: {}",
+            s
+        );
+    }
+
+    /// Round-trip an announcement with each allow-list populated
+    /// — the decoder must reconstruct the exact field values.
+    #[test]
+    fn populated_allow_lists_round_trip() {
+        let mut ann = CapabilityAnnouncement::new(
+            7,
+            super::super::super::identity::EntityId::from_bytes([0xBB; 32]),
+            2,
+            sample_capability_set(),
+        );
+        ann.allowed_nodes = vec![100, 200, 300];
+        ann.allowed_subnets = vec![super::super::subnet::SubnetId([0x11; 16])];
+        ann.allowed_groups = vec![
+            super::super::group::GroupId([0x33; 32]),
+            super::super::group::GroupId([0x44; 32]),
+        ];
+        let bytes = ann.to_bytes();
+        let decoded = CapabilityAnnouncement::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded.allowed_nodes, ann.allowed_nodes);
+        assert_eq!(decoded.allowed_subnets, ann.allowed_subnets);
+        assert_eq!(decoded.allowed_groups, ann.allowed_groups);
+    }
+
+    /// The canonical signed payload of an unrestricted
+    /// announcement must NOT carry the three allow-list keys at
+    /// all — that's what keeps the v0.4 signed byte-pattern
+    /// identical to the pre-v0.4 shape, so a pre-v0.4 verifier
+    /// validates a v0.4 unrestricted announcement and vice versa.
+    /// Distinct from `empty_allow_lists_omit_fields_from_wire`,
+    /// which checks the same invariant on the serialized wire
+    /// form (`to_bytes`); this one checks the canonical signed
+    /// payload (`signed_payload`, which also zeroes `hop_count`).
+    #[test]
+    fn signed_payload_omits_empty_allow_lists() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+        let ann =
+            CapabilityAnnouncement::new(5, keypair.entity_id().clone(), 1, sample_capability_set());
+        let canonical = ann.signed_payload();
+        let v: serde_json::Value = serde_json::from_slice(&canonical).expect("parse");
+        let obj = v.as_object().expect("object");
+        assert!(
+            !obj.contains_key("allowed_nodes"),
+            "pre-v0.4 wire shape must not carry allowed_nodes when empty"
+        );
+        assert!(
+            !obj.contains_key("allowed_subnets"),
+            "pre-v0.4 wire shape must not carry allowed_subnets when empty"
+        );
+        assert!(
+            !obj.contains_key("allowed_groups"),
+            "pre-v0.4 wire shape must not carry allowed_groups when empty"
+        );
+    }
+
+    /// A signed announcement carrying non-empty allow-lists
+    /// verifies after wire round-trip. Pins that the signature
+    /// covers the new fields end-to-end.
+    #[test]
+    fn signed_announcement_with_allow_lists_verifies_after_round_trip() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+        let mut ann =
+            CapabilityAnnouncement::new(9, keypair.entity_id().clone(), 1, sample_capability_set());
+        ann.allowed_nodes = vec![1, 2, 3];
+        ann.allowed_subnets = vec![super::super::subnet::SubnetId([0x55; 16])];
+        ann.allowed_groups = vec![super::super::group::GroupId([0x66; 32])];
+        ann.sign(&keypair);
+        let bytes = ann.to_bytes();
+        let decoded = CapabilityAnnouncement::from_bytes(&bytes).expect("decode");
+        assert!(
+            decoded.verify().is_ok(),
+            "signature must cover the new allow-list fields end-to-end"
+        );
+    }
+
+    /// Tampering with any allow-list after signing must fail
+    /// verification — proves the signature covers each new field.
+    #[test]
+    fn signed_announcement_rejects_tampered_allow_lists() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+        for which in &["nodes", "subnets", "groups"] {
+            let mut ann = CapabilityAnnouncement::new(
+                9,
+                keypair.entity_id().clone(),
+                1,
+                sample_capability_set(),
+            );
+            ann.allowed_nodes = vec![1, 2];
+            ann.allowed_subnets = vec![super::super::subnet::SubnetId([0x77; 16])];
+            ann.allowed_groups = vec![super::super::group::GroupId([0x88; 32])];
+            ann.sign(&keypair);
+            // Tamper post-sign.
+            match *which {
+                "nodes" => ann.allowed_nodes.push(999),
+                "subnets" => ann
+                    .allowed_subnets
+                    .push(super::super::subnet::SubnetId([0x99; 16])),
+                "groups" => ann
+                    .allowed_groups
+                    .push(super::super::group::GroupId([0xAA; 32])),
+                _ => unreachable!(),
+            }
+            assert!(
+                ann.verify().is_err(),
+                "tampering with allowed_{} must invalidate signature",
+                which
+            );
+        }
+    }
+
+    #[test]
+    fn allow_list_cap_documented() {
+        // Sanity: keep the doc-string + the constant in sync. If
+        // someone bumps the cap they have to re-think wire-size
+        // budgeting — explicit pin makes the change visible.
+        assert_eq!(MAX_ALLOW_LIST_LEN, 64);
+    }
+
+    /// M1 regression — pre-fix, `from_bytes` accepted any allow-list
+    /// length the wire delivered; a malicious or buggy peer could
+    /// ship a million-entry `allowed_nodes` and the receiver would
+    /// fold it, with every `may_execute` then linearly scanning the
+    /// unbounded vector. Post-fix, the deserializer rejects
+    /// announcements exceeding the documented per-axis cap.
+    #[test]
+    fn from_bytes_rejects_allow_list_over_cap() {
+        for which in ["nodes", "subnets", "groups"] {
+            let mut ann = CapabilityAnnouncement::new(
+                1,
+                super::super::super::identity::EntityId::from_bytes([0xAA; 32]),
+                1,
+                sample_capability_set(),
+            );
+            match which {
+                "nodes" => {
+                    ann.allowed_nodes = (0..(MAX_ALLOW_LIST_LEN as u64) + 1).collect();
+                }
+                "subnets" => {
+                    ann.allowed_subnets = (0..(MAX_ALLOW_LIST_LEN as u8) + 1)
+                        .map(|i| super::super::subnet::SubnetId([i; 16]))
+                        .collect();
+                }
+                "groups" => {
+                    ann.allowed_groups = (0..(MAX_ALLOW_LIST_LEN as u8) + 1)
+                        .map(|i| super::super::group::GroupId([i; 32]))
+                        .collect();
+                }
+                _ => unreachable!(),
+            }
+            let bytes = ann.to_bytes();
+            assert!(
+                CapabilityAnnouncement::from_bytes(&bytes).is_none(),
+                "from_bytes must reject allowed_{which} exceeding MAX_ALLOW_LIST_LEN",
+            );
+        }
+    }
+
+    /// Boundary check — exactly `MAX_ALLOW_LIST_LEN` entries
+    /// must STILL deserialize (the cap is inclusive).
+    #[test]
+    fn from_bytes_accepts_allow_list_at_cap() {
+        let mut ann = CapabilityAnnouncement::new(
+            1,
+            super::super::super::identity::EntityId::from_bytes([0xAB; 32]),
+            1,
+            sample_capability_set(),
+        );
+        ann.allowed_nodes = (0..MAX_ALLOW_LIST_LEN as u64).collect();
+        let bytes = ann.to_bytes();
+        let decoded =
+            CapabilityAnnouncement::from_bytes(&bytes).expect("exactly-at-cap must deserialize");
+        assert_eq!(decoded.allowed_nodes.len(), MAX_ALLOW_LIST_LEN);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // v0.4 capability-auth: may_execute gate semantics
+    // (CAPABILITY_AUTH_PLAN.md §3 / §7 conformance scenarios)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Build an announcement carrying a single capability tag,
+    /// optional `subnet:` / `group:` membership tags, and the three
+    /// allow-lists. Helper used across the gate tests.
+    #[allow(clippy::too_many_arguments)]
+    fn auth_ann(
+        node_id: u64,
+        version: u64,
+        capability_tag: &str,
+        membership_subnet: Option<super::super::subnet::SubnetId>,
+        membership_groups: &[super::super::group::GroupId],
+        allowed_nodes: Vec<u64>,
+        allowed_subnets: Vec<super::super::subnet::SubnetId>,
+        allowed_groups: Vec<super::super::group::GroupId>,
+    ) -> CapabilityAnnouncement {
+        let mut caps = CapabilitySet::new().add_tag(capability_tag);
+        if let Some(s) = membership_subnet {
+            caps = caps.add_tag(s.to_tag());
+        }
+        for g in membership_groups {
+            caps = caps.add_tag(g.to_tag());
+        }
+        let entity = super::super::super::identity::EntityId::from_bytes([node_id as u8; 32]);
+        let mut ann = CapabilityAnnouncement::new(node_id, entity, version, caps);
+        ann.allowed_nodes = allowed_nodes;
+        ann.allowed_subnets = allowed_subnets;
+        ann.allowed_groups = allowed_groups;
+        ann
+    }
+
+    #[test]
+    fn may_execute_permissive_default_when_all_lists_empty() {
+        let index = CapabilityIndex::new();
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        // Caller has no announcement; permissive default still
+        // admits — the gate trusts the wire-level binding for
+        // the caller's identity, not its announcement.
+        assert!(index.may_execute(1, "nrpc:echo", 2));
+    }
+
+    #[test]
+    fn may_execute_denies_when_target_unknown() {
+        let index = CapabilityIndex::new();
+        assert!(!index.may_execute(99, "nrpc:echo", 2));
+    }
+
+    #[test]
+    fn may_execute_denies_when_target_lacks_tag() {
+        let index = CapabilityIndex::new();
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        assert!(!index.may_execute(1, "nrpc:other", 2));
+    }
+
+    #[test]
+    fn may_execute_allow_by_node_admits_listed_caller_only() {
+        let index = CapabilityIndex::new();
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![2],
+            vec![],
+            vec![],
+        ));
+        assert!(index.may_execute(1, "nrpc:echo", 2));
+        assert!(!index.may_execute(1, "nrpc:echo", 3));
+    }
+
+    #[test]
+    fn may_execute_allow_by_subnet_uses_caller_announcement_tag() {
+        let index = CapabilityIndex::new();
+        let subnet = super::super::subnet::SubnetId([0x42; 16]);
+        // Target restricts to a subnet.
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![],
+            vec![subnet],
+            vec![],
+        ));
+        // Caller declares membership via its own announcement.
+        index.index(auth_ann(
+            2,
+            1,
+            "nrpc:other-caller-tag",
+            Some(subnet),
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        // Outsider declares no subnet.
+        index.index(auth_ann(
+            3,
+            1,
+            "nrpc:other-caller-tag",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        assert!(index.may_execute(1, "nrpc:echo", 2));
+        assert!(!index.may_execute(1, "nrpc:echo", 3));
+    }
+
+    #[test]
+    fn may_execute_allow_by_group_admits_any_member() {
+        let index = CapabilityIndex::new();
+        let group = super::super::group::GroupId([0x77; 32]);
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![group],
+        ));
+        index.index(auth_ann(
+            2,
+            1,
+            "nrpc:caller-x",
+            None,
+            &[group],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        index.index(auth_ann(
+            3,
+            1,
+            "nrpc:caller-y",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        assert!(index.may_execute(1, "nrpc:echo", 2));
+        assert!(!index.may_execute(1, "nrpc:echo", 3));
+    }
+
+    #[test]
+    fn may_execute_union_semantics_short_circuit() {
+        // All three lists non-empty; caller matches only the
+        // node list. Pin that we return true on the first axis
+        // match (we don't require all axes to agree).
+        let index = CapabilityIndex::new();
+        let unmatched_subnet = super::super::subnet::SubnetId([0xAA; 16]);
+        let unmatched_group = super::super::group::GroupId([0xBB; 32]);
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![2],
+            vec![unmatched_subnet],
+            vec![unmatched_group],
+        ));
+        // Caller declares neither the allowed subnet nor the
+        // allowed group, but is in `allowed_nodes`.
+        index.index(auth_ann(
+            2,
+            1,
+            "nrpc:caller",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        assert!(index.may_execute(1, "nrpc:echo", 2));
+    }
+
+    #[test]
+    fn may_execute_revocation_via_new_announcement_supersedes() {
+        // v1 is permissive; B can execute. v2 tightens to
+        // [only target] and B is locked out — revocation is
+        // just a new announcement with a stricter allow-list.
+        let index = CapabilityIndex::new();
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        assert!(index.may_execute(1, "nrpc:echo", 2));
+        index.index(auth_ann(
+            1,
+            2,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![1],
+            vec![],
+            vec![],
+        ));
+        assert!(!index.may_execute(1, "nrpc:echo", 2));
+    }
+
+    #[test]
+    fn may_execute_caller_with_no_announcement_can_still_match_node_list() {
+        // Caller's identity is the wire `node_id`; no caller
+        // announcement is required for the node-list axis (only
+        // for subnet/group lookup, where membership self-
+        // declaration lives).
+        let index = CapabilityIndex::new();
+        index.index(auth_ann(
+            1,
+            1,
+            "nrpc:echo",
+            None,
+            &[],
+            vec![999],
+            vec![],
+            vec![],
+        ));
+        assert!(index.may_execute(1, "nrpc:echo", 999));
+    }
+
+    #[test]
+    fn subnet_of_and_groups_of_parse_self_declared_tags() {
+        let index = CapabilityIndex::new();
+        let subnet = super::super::subnet::SubnetId([0x11; 16]);
+        let g1 = super::super::group::GroupId([0x22; 32]);
+        let g2 = super::super::group::GroupId([0x33; 32]);
+        index.index(auth_ann(
+            7,
+            1,
+            "nrpc:echo",
+            Some(subnet),
+            &[g1, g2],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        assert_eq!(index.subnet_of(7), Some(subnet));
+        // Group order is now deterministic (sorted by byte value),
+        // so callers don't need to re-sort to compare against an
+        // expected sequence.
+        assert_eq!(index.groups_of(7), vec![g1, g2]);
+        // Unknown node returns None / empty — never a panic.
+        assert_eq!(index.subnet_of(999), None);
+        assert!(index.groups_of(999).is_empty());
+    }
+
+    /// H4 regression — multiple `subnet:<hex>` tags on one
+    /// announcement used to pick a hash-order-dependent winner,
+    /// making the gate's subnet verdict non-deterministic across
+    /// receivers. The model treats subnet membership as
+    /// single-valued; multiple distinct subnet tags now collapse
+    /// to `None` (out-of-model malformed input → no membership)
+    /// rather than admitting one arbitrarily.
+    #[test]
+    fn subnet_of_returns_none_when_announcement_carries_multiple_subnet_tags() {
+        let index = CapabilityIndex::new();
+        let s1 = super::super::subnet::SubnetId([0x11; 16]);
+        let s2 = super::super::subnet::SubnetId([0x22; 16]);
+        // Hand-build a CapabilitySet with two distinct subnet
+        // tags. `auth_ann` only takes one Option<SubnetId>, so
+        // bypass it.
+        let caps = CapabilitySet::new()
+            .add_tag(s1.to_tag())
+            .add_tag(s2.to_tag())
+            .add_tag("nrpc:echo");
+        let entity = super::super::super::identity::EntityId::from_bytes([0xCD; 32]);
+        let ann = CapabilityAnnouncement::new(5, entity, 1, caps);
+        index.index(ann);
+        assert_eq!(
+            index.subnet_of(5),
+            None,
+            "two distinct subnet tags must collapse to no membership",
+        );
+    }
+
+    /// Duplicate `subnet:<hex>` tags pointing at the SAME subnet
+    /// are not malformed (set semantics dedup them at the wire
+    /// level) — confirm the parser still returns the single value
+    /// when only one distinct subnet survives.
+    #[test]
+    fn subnet_of_picks_single_distinct_value_even_when_set_has_one_entry() {
+        let index = CapabilityIndex::new();
+        let s1 = super::super::subnet::SubnetId([0x33; 16]);
+        // `add_tag` parses and inserts into a HashSet<Tag> — two
+        // identical tag strings collapse to one entry. This pins
+        // that the dedup happens at the tag-set layer, not at
+        // the parser.
+        let caps = CapabilitySet::new()
+            .add_tag(s1.to_tag())
+            .add_tag(s1.to_tag())
+            .add_tag("nrpc:echo");
+        let entity = super::super::super::identity::EntityId::from_bytes([0xCE; 32]);
+        let ann = CapabilityAnnouncement::new(6, entity, 1, caps);
+        index.index(ann);
+        assert_eq!(index.subnet_of(6), Some(s1));
     }
 
     /// Regression for a cubic-flagged P1: adding `hop_count` to the
