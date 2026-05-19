@@ -919,38 +919,58 @@ impl MeshBlobAdapter {
             //
             // Index lookup misses (chunk not registered) fall
             // through to the v0.2 sweep path unchanged.
-            let pinned_by_stripe = {
-                let idx = self.stripe_index.lock();
-                idx.should_pin_against_gc(&hash, |h| self.chunk_exists(h).unwrap_or(false))
-            };
-            if pinned_by_stripe {
-                continue;
-            }
-            // Atomic re-check + remove closes the TOCTOU window
-            // between the deletable_hashes snapshot and the actual
-            // delete — a concurrent `incr` (e.g. a freshly-folded
-            // chain event taking a new reference on `hash`) would
-            // otherwise lose its refcount entry to the unconditional
-            // `remove` that delete_chunk used to issue. If the
-            // re-check fails the chunk stays around for the next
-            // sweep to retry.
             //
-            // `take_if_deletable` returns the removed entry so we
-            // can re-insert it on close-failure — without that
-            // restore path, a transient `close_and_unlink_file`
-            // error would leave the file on disk while the refcount
-            // entry is gone, orphaning the chunk: future sweeps
-            // can't find it (they enumerate refcounts) and the
-            // only recovery is the out-of-band scanner. Restore-
-            // on-failure means the very next sweep tick retries.
-            let entry_snapshot = match self.refcount.take_if_deletable(
-                &hash,
-                now_unix_ms,
-                self.retention_floor,
-                disk_pressure_critical,
-            ) {
-                Some(entry) => entry,
-                None => continue,
+            // **Atomicity with `take_if_deletable`.** The pin
+            // check and the refcount mutation both run under the
+            // stripe-index lock. Pre-fix, a concurrent
+            // `register_stripe` from `walk_stripe_range`'s lazy
+            // population could land between these two steps:
+            // pin-check returned false, the reader then registered
+            // the stripe (now degraded after this hash gets
+            // deleted), and the sweep proceeded to delete a chunk
+            // that was just promoted into a pinned set. Holding
+            // the index lock for both operations serialises with
+            // every read-side registrar so the decision-and-act
+            // pair is observed as one step.
+            let entry_snapshot = {
+                let idx = self.stripe_index.lock();
+                if idx
+                    .should_pin_against_gc(&hash, |h| self.chunk_exists(h).unwrap_or(false))
+                {
+                    continue;
+                }
+                // Atomic re-check + remove closes the TOCTOU window
+                // between the deletable_hashes snapshot and the actual
+                // delete — a concurrent `incr` (e.g. a freshly-folded
+                // chain event taking a new reference on `hash`) would
+                // otherwise lose its refcount entry to the unconditional
+                // `remove` that delete_chunk used to issue. If the
+                // re-check fails the chunk stays around for the next
+                // sweep to retry.
+                //
+                // `take_if_deletable` returns the removed entry so we
+                // can re-insert it on close-failure — without that
+                // restore path, a transient `close_and_unlink_file`
+                // error would leave the file on disk while the refcount
+                // entry is gone, orphaning the chunk: future sweeps
+                // can't find it (they enumerate refcounts) and the
+                // only recovery is the out-of-band scanner. Restore-
+                // on-failure means the very next sweep tick retries.
+                //
+                // `take_if_deletable` is sync + non-blocking; holding
+                // the parking_lot lock across it is cheap. The
+                // expensive I/O step (close_and_unlink_file below)
+                // happens AFTER the lock drops, so concurrent reads
+                // aren't serialised on disk.
+                match self.refcount.take_if_deletable(
+                    &hash,
+                    now_unix_ms,
+                    self.retention_floor,
+                    disk_pressure_critical,
+                ) {
+                    Some(entry) => entry,
+                    None => continue,
+                }
             };
             let channel = Self::chunk_channel(&hash);
             // close_and_unlink_file also removes any on-disk
@@ -4875,6 +4895,142 @@ mod tests {
         // matters for the C6 contract is the pin DID fire while
         // degraded, which the assertions above confirmed.
         let _ = report;
+    }
+
+    /// GC stripe-pin race regression. Pre-fix, the pin check
+    /// (`should_pin_against_gc`) released the stripe-index lock
+    /// before `take_if_deletable`, so a concurrent
+    /// `register_stripe` from a reader could land between the
+    /// two: pin-check returned false (stripe not registered yet),
+    /// the reader registered the stripe (which is now degraded
+    /// because the hash about to be swept is one of its members),
+    /// and GC proceeded to delete the chunk a moment after it
+    /// was promoted into the pin set.
+    ///
+    /// The fix holds the index lock across both steps so any
+    /// concurrent registrar serialises before observing the
+    /// take. This test stresses the path with many concurrent
+    /// register_stripe + sweep_gc invocations: even under
+    /// contention, every parity chunk of a degraded stripe must
+    /// survive the sweep.
+    #[tokio::test]
+    async fn sweep_gc_race_with_concurrent_register_stripe_does_not_lose_parity() {
+        let adapter = Arc::new(make_adapter());
+        let chunk_size: u32 = 4 * 1024;
+        let payload = deterministic_bytes(0xC7, chunk_size as usize * 4);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let blob_ref = adapter
+            .store_stream_tree_rs_internal(
+                stream_one(payload.clone()),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+
+        // Resolve the stripe so we can re-register its members from
+        // the reader-task, and so we know which parity chunks must
+        // survive the sweep.
+        let root_hash = *blob_ref.tree_root_hash().unwrap();
+        let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
+        let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
+            TreeNode::ErasureLeaf { .. } => root_bytes,
+            TreeNode::Internal { children } => adapter.fetch_chunk(&children[0].0).await.unwrap(),
+            TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
+        };
+        let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
+            TreeNode::ErasureLeaf { stripes } => stripes,
+            other => panic!("expected ErasureLeaf, got: {:?}", other),
+        };
+        let stripe = stripes[0].clone();
+        let stripe_members: Vec<[u8; 32]> = stripe.chunks.iter().map(|c| c.hash).collect();
+        let parity_hashes: Vec<[u8; 32]> = stripe
+            .chunks
+            .iter()
+            .filter(|c| c.is_parity())
+            .map(|c| c.hash)
+            .collect();
+        let data_hashes: Vec<[u8; 32]> = stripe
+            .chunks
+            .iter()
+            .filter(|c| c.is_data())
+            .map(|c| c.hash)
+            .collect();
+
+        // Degrade the stripe so the pin must fire.
+        adapter.delete_chunk(&data_hashes[0]).await.unwrap();
+
+        // Wipe the existing stripe registration so the reader-task
+        // has work to do: re-register from scratch under the lock
+        // while the sweeper races to delete.
+        adapter.stripe_index.lock().clear_for_tests();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + (DEFAULT_RETENTION_FLOOR.as_millis() as u64 * 2);
+
+        // Sweep loop and register loop racing in parallel. With
+        // the lock held across pin_check + take_if_deletable,
+        // every iteration where the register lands first must
+        // pin every member; every iteration where the register
+        // lands after the sweep is fine because there's no stripe
+        // registered yet. The bad outcome we're guarding against
+        // is "register lands BETWEEN pin_check and take_if_deletable"
+        // — once eliminated, parity chunks survive.
+        let registers: u32 = 50;
+        let sweeps: u32 = 50;
+        let adapter_r = adapter.clone();
+        let stripe_members_r = stripe_members.clone();
+        let register_task = tokio::spawn(async move {
+            for _ in 0..registers {
+                adapter_r
+                    .stripe_index
+                    .lock()
+                    .register_stripe(stripe_members_r.clone(), 4);
+                tokio::task::yield_now().await;
+                // Clear so the next iteration genuinely re-registers
+                // rather than hitting the dedup fast-path.
+                adapter_r.stripe_index.lock().clear_for_tests();
+            }
+        });
+        let adapter_s = adapter.clone();
+        let sweep_task = tokio::spawn(async move {
+            for _ in 0..sweeps {
+                let _ = adapter_s.sweep_gc(now, true).await;
+                tokio::task::yield_now().await;
+            }
+        });
+        let _ = tokio::join!(register_task, sweep_task);
+
+        // Final state: re-register the stripe so the post-sweep
+        // pin-check is meaningful, and run one more sweep.
+        adapter
+            .stripe_index
+            .lock()
+            .register_stripe(stripe_members.clone(), 4);
+        let _ = adapter.sweep_gc(now, true).await;
+
+        // Invariant: every parity chunk must still exist locally.
+        // If the race had swept any of them, this assertion would
+        // fire and `repair_blob` could never reconstruct the
+        // missing data chunk.
+        for phash in &parity_hashes {
+            assert!(
+                adapter.chunk_exists(phash).unwrap_or(false),
+                "parity chunk {:?} swept under concurrent register/sweep race",
+                phash
+            );
+        }
+        // And surviving data chunks (1..k) likewise.
+        for dhash in &data_hashes[1..] {
+            assert!(
+                adapter.chunk_exists(dhash).unwrap_or(false),
+                "surviving data chunk {:?} swept under concurrent register/sweep race",
+                dhash
+            );
+        }
     }
 
     /// `repair_blob` restores missing data chunks of an

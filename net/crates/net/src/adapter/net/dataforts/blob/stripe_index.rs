@@ -168,6 +168,20 @@ impl StripeMembershipIndex {
     pub fn tracked_chunk_count(&self) -> usize {
         self.by_chunk.len()
     }
+
+    /// Wipe all registered stripe state. Test-only handle used by
+    /// the sweep/register race regression to re-arm the index
+    /// between iterations without standing up a fresh adapter.
+    /// Not exposed for production use — the only legitimate
+    /// "shrink the index" path is the implicit one where the
+    /// member chunks themselves leave the local store.
+    #[cfg(test)]
+    pub fn clear_for_tests(&mut self) {
+        self.by_chunk.clear();
+        self.fingerprints.clear();
+        // Deliberately leave `registered_count` intact — it's a
+        // lifetime-of-process counter, not a state mirror.
+    }
 }
 
 #[cfg(test)]
