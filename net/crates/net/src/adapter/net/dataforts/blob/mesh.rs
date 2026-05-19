@@ -332,6 +332,15 @@ pub struct MeshBlobAdapter {
     /// exactly once per distinct `(k, m)`. Adapter clones share
     /// the same cache via `Arc`.
     rs_encoder_cache: Arc<parking_lot::Mutex<HashMap<(u8, u8), Arc<super::erasure::RsEncoder>>>>,
+    /// Per-stripe cooldown for `auto_repair_on_fetch`. Maps a
+    /// stripe-fingerprint to the last `Instant` at which an
+    /// auto-repair persist fired for it. Without this gate, a
+    /// peer serving corrupted bytes can force the optimistic
+    /// fetch path into reconstruction on every range read, and
+    /// `auto_repair_on_fetch=true` then storms `store_chunk`
+    /// calls for the same stripe at fetch rate.
+    repair_cooldown:
+        Arc<parking_lot::Mutex<HashMap<[u8; 32], std::time::Instant>>>,
 }
 
 impl MeshBlobAdapter {
@@ -362,6 +371,7 @@ impl MeshBlobAdapter {
                 super::stripe_index::StripeMembershipIndex::new(),
             )),
             rs_encoder_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            repair_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             auto_repair_on_fetch: false,
         }
     }
@@ -2139,7 +2149,7 @@ impl MeshBlobAdapter {
         // but DO NOT fail the fetch (the caller already has the
         // reconstructed bytes in memory; the repair is an
         // optimization, not a correctness requirement).
-        if self.auto_repair_on_fetch {
+        if self.auto_repair_on_fetch && self.auto_repair_cooldown_elapsed(stripe) {
             for &idx in &missing_data_indices {
                 let chunk_ref = &stripe.chunks[idx];
                 let Some(reconstructed) = shards[idx].as_ref() else {
@@ -2490,6 +2500,41 @@ impl MeshBlobAdapter {
         })?;
         auth_allows_blob_op(guard, origin_hash, channel)?;
         self.repair_blob(blob_ref).await
+    }
+
+    /// Internal: per-stripe cooldown check for the fetch-path
+    /// auto-repair. Returns `true` iff the stripe has either
+    /// never been auto-repaired or the cooldown window has
+    /// elapsed since the last attempt; updates the cooldown
+    /// timestamp to `now` on `true` so concurrent walks don't
+    /// double-fire. Stripe fingerprint is BLAKE3 of the
+    /// concatenated member hashes, matching the
+    /// `StripeMembershipIndex` canonical form.
+    ///
+    /// Without this gate, a peer serving corrupted bytes can
+    /// force the optimistic path into reconstruction on every
+    /// range read, and auto-repair then storms `store_chunk`
+    /// calls for the same stripe at fetch rate.
+    fn auto_repair_cooldown_elapsed(
+        &self,
+        stripe: &super::blob_tree::StripeBlock,
+    ) -> bool {
+        const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+        let mut hasher = blake3::Hasher::new();
+        for c in &stripe.chunks {
+            hasher.update(&c.hash);
+        }
+        let fingerprint: [u8; 32] = hasher.finalize().into();
+        let now = std::time::Instant::now();
+        let mut cooldown = self.repair_cooldown.lock();
+        let admit = match cooldown.get(&fingerprint) {
+            None => true,
+            Some(last) => now.duration_since(*last) >= COOLDOWN,
+        };
+        if admit {
+            cooldown.insert(fingerprint, now);
+        }
+        admit
     }
 
     /// Internal: return a cached `RsEncoder` for `(k, m)`,
