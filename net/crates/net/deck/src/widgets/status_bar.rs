@@ -117,7 +117,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // env-injected because the deck ships from the same
     // workspace and tracks the same release cadence.
     let version = concat!("v", env!("CARGO_PKG_VERSION"));
-    let codename = "PUSH IT TO THE LIMIT";
+    let codename = "SMOKE ON THE WATER";
     let right = Line::from(vec![
         Span::styled("CODENAME: ", theme::chrome()),
         Span::styled(codename, theme::text()),
