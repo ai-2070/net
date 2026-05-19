@@ -142,3 +142,65 @@ fn cap_announce_rejects_malformed_group() {
         .assert()
         .code(2);
 }
+
+/// H3 regression — `--node-id` that doesn't match the signing
+/// key's derived id used to be silently accepted, producing
+/// announcement bytes that fail receiver-side `node_id ↔
+/// entity_id` binding verification. The CLI must reject the
+/// mismatch up-front so operators don't ship unusable output.
+#[test]
+fn cap_announce_rejects_node_id_mismatch_with_signing_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = generate_identity(&dir);
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["cap", "announce"])
+        .arg("--key")
+        .arg(&key_path)
+        .args(["--tag", "nrpc:echo"])
+        // Synthetic node id distinct from any keypair-derived
+        // value (the derivation is a BLAKE2s projection; this
+        // 0x01 sentinel is vanishingly unlikely to collide).
+        .args(["--node-id", "0x1"])
+        .assert()
+        .code(2);
+}
+
+/// `--node-id` matching the derived value should pass — the
+/// explicit confirmation form is supported, just not a mismatch.
+#[test]
+fn cap_announce_accepts_node_id_matching_signing_key() {
+    use net_sdk::capabilities::CapabilityAnnouncement;
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = generate_identity(&dir);
+
+    // Run an initial announce without --node-id so we can extract
+    // the derived value from the emitted JSON.
+    let baseline_path = dir.path().join("baseline.json");
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["cap", "announce"])
+        .arg("--key")
+        .arg(&key_path)
+        .args(["--tag", "nrpc:echo"])
+        .arg("--out")
+        .arg(&baseline_path)
+        .assert()
+        .success();
+    let baseline = CapabilityAnnouncement::from_bytes(
+        &std::fs::read(&baseline_path).unwrap(),
+    )
+    .expect("decode baseline");
+    let derived_hex = format!("{:#x}", baseline.node_id);
+
+    // Now run with --node-id matching the derived value.
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["cap", "announce"])
+        .arg("--key")
+        .arg(&key_path)
+        .args(["--tag", "nrpc:echo"])
+        .args(["--node-id", &derived_hex])
+        .assert()
+        .success();
+}

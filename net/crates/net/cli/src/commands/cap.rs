@@ -252,12 +252,31 @@ async fn run_announce(args: AnnounceArgs) -> Result<(), CliError> {
     let allowed_subnets = parse_subnets(&args.allow_subnets)?;
     let allowed_groups = parse_groups(&args.allow_groups)?;
 
-    // 3. Resolve target node_id — CLI override wins, otherwise
-    //    derive from the keypair (the right answer for self-
-    //    issued announcements per the plan).
+    // 3. Resolve target node_id. The keypair's derived `node_id`
+    //    is the only value that round-trips through the receiver's
+    //    `handle_capability_announcement` — receivers re-derive the
+    //    expected NodeId from the signed `entity_id` and reject
+    //    announcements where the carried `node_id` doesn't match.
+    //    Allow `--node-id` only as an explicit confirmation (must
+    //    equal the derived value); a mismatch is an operator error
+    //    that would otherwise produce unusable bytes.
+    let derived = keypair.node_id();
     let node_id = match args.node_id.as_deref() {
-        Some(s) => parse_node_id(s)?,
-        None => keypair.node_id(),
+        Some(s) => {
+            let supplied = parse_node_id(s)?;
+            if supplied != derived {
+                return Err(invalid_args(format!(
+                    "--node-id {supplied:#x} does not match the signing key's \
+                     derived node id {derived:#x}; receivers re-derive the \
+                     expected NodeId from the signed entity_id and reject \
+                     announcements with mismatched bindings. Drop the flag \
+                     to use the derived value, or sign with the keypair that \
+                     produces {supplied:#x}."
+                )));
+            }
+            supplied
+        }
+        None => derived,
     };
 
     // 4. Build the CapabilitySet with the user-supplied tags.
