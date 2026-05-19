@@ -98,6 +98,17 @@ pub const DEFAULT_OVERFLOW_LOW_WATER_RATIO: f64 = 0.70;
 /// high-water mark.
 pub const DEFAULT_OVERFLOW_MAX_PUSHES_PER_TICK: usize = 16;
 
+/// Per-call cap on `fetch_range` slice size in bytes (1 GiB). v0.3
+/// `BlobRef::Tree` lifts the effective addressable size from 16 GiB
+/// to 128 PiB, and `fetch_range` returns the whole requested range
+/// as a single `Vec<u8>`. Without an explicit cap, a single
+/// `fetch_range(0, 100 GiB)` would allocate 100 GiB in-process.
+/// 1 GiB is generous for legitimate range reads (well above any
+/// chunk-aligned slice) but small enough that an adversarial peer
+/// or a misconfigured caller can't OOM the substrate. Streaming
+/// consumers needing TB-scale walks page through smaller slices.
+pub const MAX_FETCH_RANGE_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Default tick cadence. Independent of the gravity tick —
 /// overflow is push-driven by local disk state, not by
 /// inbound heat. 30 s is short enough that a node above the
@@ -2937,6 +2948,24 @@ impl BlobAdapter for MeshBlobAdapter {
                 len, range.end
             )));
         }
+        // v0.3 Tree lifts the effective addressable size from 16 GiB
+        // to 128 PiB, and fetch_range returns the whole requested
+        // range as a single `Vec<u8>`. Without an explicit cap, a
+        // single `fetch_range(0, 100 GiB)` against a Tree blob would
+        // allocate 100 GiB in-process. Bound the per-call range to
+        // MAX_FETCH_RANGE_BYTES so a misconfigured caller (or
+        // adversarial inbound) can't OOM the substrate. The cap is
+        // generous (1 GiB) — well above any chunk-aligned read and
+        // every legitimate range fetch — but well below the addressable
+        // ceiling. Streaming consumers needing TB-scale walks should
+        // page through smaller slices.
+        if len > MAX_FETCH_RANGE_BYTES {
+            return Err(BlobError::Backend(format!(
+                "mesh blob: range length {} exceeds per-call cap {} \
+                 (page through smaller slices for streaming reads)",
+                len, MAX_FETCH_RANGE_BYTES,
+            )));
+        }
         let (result, touched): (Result<Vec<u8>, BlobError>, Vec<[u8; 32]>) = match blob_ref {
             BlobRef::Small { hash, size, .. } => {
                 if range.end > *size {
@@ -5751,6 +5780,36 @@ mod tests {
         // path surfaces a typed error. Pin that we DO surface an
         // error rather than returning empty bytes.
         let _ = err; // any error is fine; assert we got one
+    }
+
+    /// fetch_range rejects requests larger than MAX_FETCH_RANGE_BYTES
+    /// (1 GiB). v0.3 Tree blobs can address up to 128 PiB but
+    /// returning a single Vec<u8> for a multi-GiB range would OOM
+    /// the substrate. Streaming consumers must page through
+    /// smaller slices.
+    #[tokio::test]
+    async fn fetch_range_rejects_request_larger_than_cap() {
+        let adapter = make_adapter();
+        // Build a Tree BlobRef advertising 2 GiB. Don't bother
+        // storing the bytes — the cap check fires before any
+        // walk traffic. (The root_hash is bogus; that's fine.)
+        let blob_ref = BlobRef::tree(
+            "mesh://oversize",
+            Encoding::Replicated,
+            [0xEE; 32],
+            2 * 1024 * 1024 * 1024,
+            2,
+        )
+        .unwrap();
+        let err = adapter
+            .fetch_range(&blob_ref, 0..(2 * 1024 * 1024 * 1024))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds per-call cap"),
+            "expected per-call cap error; got: {msg}",
+        );
     }
 
     /// Tree depth-shortening attack: a peer-supplied root that
