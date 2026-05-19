@@ -1,0 +1,24 @@
+net/crates/net/bindings/go/net/mesh_rpc.go
+  s_c46a4f2a71242f::t_97ee9cd667fd31 1527,1535-1540,1542-1546
+  s_c46a4f2a71242f::t_d55586d0a8fbf3 1338,1347-1356,1358-1362
+  s_c46a4f2a71242f::t_bfae0d923cee47 1482-1485
+  s_c46a4f2a71242f::t_88f859b7c8c378 862-866
+  s_c46a4f2a71242f::t_c4c7e886538202 923,932-938,943-946,948-955
+  s_c46a4f2a71242f::t_5624e43e1b21bc 1274-1286,1291
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "f6aca279abf2552c94d126f82de6be1be151d247",
+  "prompts": {},
+  "sessions": {
+    "s_c46a4f2a71242f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c40a4b97-f9fb-4ca1-a55c-ca0f5316ac30",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
