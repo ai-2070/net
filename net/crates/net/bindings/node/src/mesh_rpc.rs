@@ -919,6 +919,15 @@ impl JsRequestStream {
     /// (REQUEST_END / CANCEL). Multiple `next()` calls in
     /// parallel from the same JS task serialize through the
     /// inner mutex.
+    ///
+    /// **Ordering under `Promise.all`.** Issuing
+    /// `Promise.all([s.next(), s.next(), s.next()])` is legal
+    /// but the order in which the three promises resolve is
+    /// **nondeterministic** — they race on the inner mutex.
+    /// Use sequential `await` (e.g. `while ((b = await s.next()))`)
+    /// when chunk order matters. The common case (single
+    /// consumer awaiting one chunk at a time) is always in
+    /// order.
     #[napi]
     pub async fn next(&self) -> Result<Option<Buffer>> {
         let mut guard = self.inner.lock().await;
@@ -1696,5 +1705,41 @@ mod tests {
         assert!(parse_js_app_error("nrpc:app_error:0x10000:body").is_none());
         // Empty (just prefix).
         assert!(parse_js_app_error("nrpc:app_error:").is_none());
+    }
+
+    /// Regression: Rust-side codec error messages (the format
+    /// surfaced by the typed bad-request handler path,
+    /// `RpcError::Codec`'s Display, the various encode/decode
+    /// failure strings) MUST NOT accidentally match the
+    /// `nrpc:app_error:<code>:<body>` shape. If they did, a
+    /// codec failure on the JS side could be misrouted to the
+    /// Application-error arm with bogus code/body.
+    #[test]
+    fn parse_js_app_error_does_not_match_codec_diagnostics() {
+        // The diagnostic strings emitted by the typed wrappers
+        // and substrate codec on various failure paths. Every
+        // one MUST return None — otherwise a codec error would
+        // surface as an Application error on the JS side.
+        let codec_strings = [
+            "typed streaming handler: bad request body: invalid type: integer `1`, expected struct",
+            "typed sink encode: missing field `numbers`",
+            "rpc codec encode: invalid number",
+            "rpc codec decode: trailing data",
+            "decode failed: invalid utf-8 sequence",
+            "typed handler returned Err(String): something went wrong",
+            // Looks vaguely similar but no `nrpc:app_error:` prefix.
+            "Error: app_error 0x8000",
+            "0x8000:body",
+            // Has prefix but is short of the colon-code-colon shape.
+            "nrpc:app_error",
+            // Whitespace-prefixed variants — parser is strict.
+            " nrpc:app_error:0x8000:body",
+        ];
+        for s in codec_strings {
+            assert!(
+                parse_js_app_error(s).is_none(),
+                "codec/diagnostic string MUST NOT match app-error format: {s:?}",
+            );
+        }
     }
 }
