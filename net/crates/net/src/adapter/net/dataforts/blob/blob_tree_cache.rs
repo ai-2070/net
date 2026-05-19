@@ -123,7 +123,17 @@ impl TreeNodeCache {
     /// entries until the cap is satisfied, then inserts.
     /// Re-inserting an existing hash refreshes the access time
     /// without double-counting bytes.
-    pub fn insert(&mut self, hash: [u8; 32], bytes: Vec<u8>) {
+    ///
+    /// **Crate-private.** Cache integrity (a hit returns bytes
+    /// that hash to the key) depends on every insert site having
+    /// already verified `blake3(&bytes) == hash`. The miss path in
+    /// `walk_tree_range` does this re-verification (see
+    /// `MeshBlobAdapter::walk_tree_range`); restricting `insert`
+    /// to `pub(crate)` ensures no external caller can poison the
+    /// cache with a (hash, mismatched_bytes) pair. If a future
+    /// commit needs to expose insert publicly, it MUST first hash-
+    /// validate the bytes argument internally.
+    pub(crate) fn insert(&mut self, hash: [u8; 32], bytes: Vec<u8>) {
         if self.cap_bytes == 0 || bytes.len() > self.cap_bytes {
             return;
         }
