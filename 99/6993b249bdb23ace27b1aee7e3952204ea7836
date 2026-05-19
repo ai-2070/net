@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_f95ee10350efa6::t_b2379670be1b2c 944-958
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "996993b249bdb23ace27b1aee7e3952204ea7836",
+  "prompts": {},
+  "sessions": {
+    "s_f95ee10350efa6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "be955835-c5da-4fe8-a0f5-cb77f72dfda9",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
