@@ -253,6 +253,83 @@ pub const DATAFORTS_BLOB_TREE_SUPPORTED: &str =
 pub const DATAFORTS_BLOB_CDC_SUPPORTED: &str =
     ::net::adapter::net::dataforts::blob::cdc::DATAFORTS_BLOB_CDC_SUPPORTED;
 
+/// Capability tag a node advertises when it supports the v0.3
+/// Phase C Reed-Solomon erasure-coding store path
+/// (`Encoding.reed_solomon(k, m)`). Independent of Tree/CDC tags:
+/// a node can run Phase A + B without Phase C (RS). Producers
+/// targeting a peer that doesn't advertise this tag must
+/// downgrade to `Encoding.replicated()`.
+pub const DATAFORTS_BLOB_ERASURE_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::erasure::DATAFORTS_BLOB_ERASURE_SUPPORTED;
+
+/// Producer-facing encoding-strategy value type. Mirrors the
+/// Rust `Encoding` enum (`Replicated` vs `ReedSolomon { k, m }`)
+/// as a Python class with a `kind` discriminant. Construct via
+/// the `replicated()` / `reed_solomon(k, m)` /
+/// `default_reed_solomon()` staticmethods.
+#[pyclass(name = "Encoding", frozen, eq, from_py_object)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct PyEncoding {
+    /// Discriminant: `"replicated"` or `"reed_solomon"`.
+    #[pyo3(get)]
+    pub kind: String,
+    /// RS data shards per stripe — populated iff
+    /// `kind == "reed_solomon"`.
+    #[pyo3(get)]
+    pub k: Option<u8>,
+    /// RS parity shards per stripe — populated iff
+    /// `kind == "reed_solomon"`.
+    #[pyo3(get)]
+    pub m: Option<u8>,
+}
+
+#[pymethods]
+impl PyEncoding {
+    /// Replication-only encoding. Each chunk stored verbatim;
+    /// cross-node replication provides redundancy.
+    #[staticmethod]
+    pub fn replicated() -> Self {
+        Self {
+            kind: "replicated".to_owned(),
+            k: None,
+            m: None,
+        }
+    }
+
+    /// Reed-Solomon erasure encoding: each stripe of `k` data
+    /// chunks gets `m` parity chunks; stripe survives any `m`
+    /// chunk losses.
+    #[staticmethod]
+    pub fn reed_solomon(k: u8, m: u8) -> Self {
+        Self {
+            kind: "reed_solomon".to_owned(),
+            k: Some(k),
+            m: Some(m),
+        }
+    }
+
+    /// Production RS defaults: `(k=10, m=4)`.
+    #[staticmethod]
+    pub fn default_reed_solomon() -> Self {
+        Self::reed_solomon(
+            ::net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_K,
+            ::net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_M,
+        )
+    }
+
+    fn __repr__(&self) -> String {
+        match self.kind.as_str() {
+            "replicated" => "Encoding.replicated()".to_owned(),
+            "reed_solomon" => format!(
+                "Encoding.reed_solomon(k={}, m={})",
+                self.k.unwrap_or(0),
+                self.m.unwrap_or(0)
+            ),
+            other => format!("Encoding(kind={:?})", other),
+        }
+    }
+}
+
 /// Producer-facing chunking-strategy value type for the v0.3
 /// Tree store path. Construct via the `fixed(size)` /
 /// `cdc(min, avg, max)` / `production_cdc()` classmethods and

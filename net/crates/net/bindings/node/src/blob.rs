@@ -63,6 +63,71 @@ pub const DATAFORTS_BLOB_TREE_SUPPORTED: &str =
 pub const DATAFORTS_BLOB_CDC_SUPPORTED: &str =
     ::net::adapter::net::dataforts::blob::cdc::DATAFORTS_BLOB_CDC_SUPPORTED;
 
+/// Capability tag a node advertises when it supports the v0.3
+/// Phase C Reed-Solomon erasure-coding store path
+/// (`Encoding.reedSolomon(k, m)`). Independent of Tree/CDC tags:
+/// a node can run Phase A + B without Phase C (RS). Producers
+/// targeting a peer that doesn't advertise this tag must
+/// downgrade to `Encoding.replicated()`.
+#[napi]
+pub const DATAFORTS_BLOB_ERASURE_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::erasure::DATAFORTS_BLOB_ERASURE_SUPPORTED;
+
+/// Producer-facing encoding-strategy value type. Mirrors the
+/// Rust `Encoding` enum (`Replicated` vs `ReedSolomon { k, m }`)
+/// as a flat napi class with a `kind` discriminant. Construct
+/// via the `replicated()` / `reedSolomon(k, m)` /
+/// `defaultReedSolomon()` factories.
+#[napi]
+#[derive(Clone)]
+pub struct Encoding {
+    /// Discriminant: `"replicated"` or `"reedSolomon"`.
+    pub kind: String,
+    /// RS data shards per stripe — populated iff
+    /// `kind == "reedSolomon"`.
+    pub k: Option<u8>,
+    /// RS parity shards per stripe — populated iff
+    /// `kind == "reedSolomon"`.
+    pub m: Option<u8>,
+}
+
+#[napi]
+impl Encoding {
+    /// Replication-only encoding. Each chunk stored verbatim;
+    /// cross-node replication provides redundancy. Default for
+    /// Phase A + B blobs.
+    #[napi(factory, js_name = "replicated")]
+    pub fn replicated() -> Self {
+        Self {
+            kind: "replicated".to_owned(),
+            k: None,
+            m: None,
+        }
+    }
+
+    /// Reed-Solomon erasure encoding: each stripe of `k` data
+    /// chunks gets `m` parity chunks; stripe survives any `m`
+    /// chunk losses.
+    #[napi(factory, js_name = "reedSolomon")]
+    pub fn reed_solomon(k: u8, m: u8) -> Self {
+        Self {
+            kind: "reedSolomon".to_owned(),
+            k: Some(k),
+            m: Some(m),
+        }
+    }
+
+    /// Production RS defaults: `(k=10, m=4)` — 1.4× storage
+    /// overhead, 4-loss tolerance.
+    #[napi(factory, js_name = "defaultReedSolomon")]
+    pub fn default_reed_solomon() -> Self {
+        Self::reed_solomon(
+            ::net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_K,
+            ::net::adapter::net::dataforts::blob::erasure::DEFAULT_RS_M,
+        )
+    }
+}
+
 /// Producer-facing chunking-strategy value type for the v0.3
 /// Tree store path. SDK consumers construct an instance via the
 /// `fixed(size)` or `cdc(min, avg, max)` factories and pass it
