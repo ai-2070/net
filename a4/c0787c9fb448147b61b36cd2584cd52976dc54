@@ -1,0 +1,22 @@
+net/crates/net/src/bin/net-blob.rs
+  s_2571835e05521c::t_ac667e7319df2f 67,69
+  s_2571835e05521c::t_fe70f6518de5fb 286-294
+  s_2571835e05521c::t_97648ddefece7a 185-231
+  s_2571835e05521c::t_4d604f8b817a75 645-941
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "a4c0787c9fb448147b61b36cd2584cd52976dc54",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
