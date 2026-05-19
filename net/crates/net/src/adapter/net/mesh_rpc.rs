@@ -2130,6 +2130,20 @@ impl MeshNode {
         payload: Bytes,
         opts: CallOptions,
     ) -> Result<RpcStream, RpcError> {
+        // `stream_window_initial = Some(0)` would deadlock the
+        // RESPONSE direction by default: server's pump awaits one
+        // credit per chunk, the caller's auto-grant only fires on
+        // consumed chunks, and the first chunk can never be
+        // delivered. `None` means "unbounded credit"; any positive
+        // value opts into flow control. Reject up front — symmetric
+        // with the request-direction guard in `call_client_stream`.
+        if matches!(opts.stream_window_initial, Some(0)) {
+            return Err(RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: "stream_window_initial must be None or >= 1; Some(0) deadlocks the response pump"
+                    .to_string(),
+            });
+        }
         let request_channel =
             ChannelName::new(&format!("{service}.requests")).map_err(|e| RpcError::NoRoute {
                 target: target_node_id,

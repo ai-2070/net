@@ -17,7 +17,7 @@ use futures::StreamExt;
 use net::adapter::net::cortex::{
     RpcContext, RpcHandlerError, RpcResponseSink, RpcStreamingHandler,
 };
-use net::adapter::net::mesh_rpc::{CallOptions, RpcError};
+use net::adapter::net::mesh_rpc::{CallOptions, CodecDirection, RpcError};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
@@ -497,4 +497,54 @@ async fn rpc_streaming_terminal_error_after_partial_stream() {
         }
         other => panic!("expected ServerError, got {other:?}"),
     }
+}
+
+/// Regression: `CallOptions::stream_window_initial = Some(0)` must
+/// be rejected up front. Server's response pump awaits one credit
+/// per chunk; the caller's auto-grant only fires on consumed chunks,
+/// so the first chunk can never be delivered. Symmetric with the
+/// request-side `request_window_initial = Some(0)` guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_streaming_rejects_zero_stream_window() {
+    let caller = build_node().await;
+    let target = 0xC0DE_u64;
+    let opts = CallOptions {
+        stream_window_initial: Some(0),
+        ..CallOptions::default()
+    };
+    let err = match caller
+        .call_streaming(target, "anything", Bytes::new(), opts)
+        .await
+    {
+        Ok(_) => panic!("Some(0) must be rejected before any wire traffic"),
+        Err(e) => e,
+    };
+    match err {
+        RpcError::Codec { direction, message } => {
+            assert_eq!(direction, CodecDirection::Encode);
+            assert!(
+                message.contains("stream_window_initial"),
+                "diagnostic must name the offending option: {message}",
+            );
+        }
+        other => panic!("expected RpcError::Codec(Encode), got {other:?}"),
+    }
+
+    // Sanity: Some(1) passes the guard (and will fail later for an
+    // unrelated reason since no peer is wired).
+    let opts = CallOptions {
+        stream_window_initial: Some(1),
+        ..CallOptions::default()
+    };
+    let err = match caller
+        .call_streaming(target, "anything", Bytes::new(), opts)
+        .await
+    {
+        Ok(_) => panic!("no peer connected; must fail with a non-Codec error"),
+        Err(e) => e,
+    };
+    assert!(
+        !matches!(err, RpcError::Codec { .. }),
+        "Some(1) must clear the deadlock guard; got {err:?}",
+    );
 }
