@@ -289,6 +289,19 @@ pub struct MeshBlobAdapter {
     /// briefly dropping doesn't lose the only thing keeping the
     /// stripe recoverable.
     stripe_index: Arc<parking_lot::Mutex<super::stripe_index::StripeMembershipIndex>>,
+    /// Opt-in fetch-path auto-repair. When `true`, every
+    /// successful RS reconstruction in
+    /// [`Self::walk_stripe_with_reconstruction`] re-stores the
+    /// previously-missing data chunks under their original
+    /// content-addressed hashes — so the stripe goes back to
+    /// healthy, the GC stripe-pin lifts naturally, and subsequent
+    /// fetches don't re-pay the reconstruction cost. Default
+    /// `false`: the v0.3 plan's stated semantic is "fetch never
+    /// writes; operator-driven `repair_blob` is the recovery
+    /// path." Enable via [`Self::with_auto_repair_on_fetch`] for
+    /// hot-blob workloads where the repeated-reconstruction cost
+    /// matters.
+    auto_repair_on_fetch: bool,
     /// Optional override for the `max_memory_bytes` field of every
     /// per-chunk `RedexFileConfig`. The default 64 MiB upstream
     /// default pre-reserves a 64 MiB heap `Vec` per opened chunk
@@ -328,7 +341,27 @@ impl MeshBlobAdapter {
             stripe_index: Arc::new(parking_lot::Mutex::new(
                 super::stripe_index::StripeMembershipIndex::new(),
             )),
+            auto_repair_on_fetch: false,
         }
+    }
+
+    /// Enable fetch-path opportunistic auto-repair for RS-encoded
+    /// blobs. When set, every successful reconstruction inside
+    /// `fetch_range` re-stores the missing data chunks under
+    /// their original content-addressed hashes — so the stripe
+    /// goes back to healthy, the v0.3 Phase C6 GC stripe-pin
+    /// lifts naturally, and subsequent fetches don't re-pay the
+    /// reconstruction cost.
+    ///
+    /// Default is `false` — the v0.3 plan's stated semantic is
+    /// that fetch never writes. Enable for hot-blob workloads
+    /// where degraded stripes would otherwise re-reconstruct on
+    /// every read. The operator-driven [`Self::repair_blob`]
+    /// remains the durable, sweep-the-whole-blob recovery path
+    /// regardless of this flag.
+    pub fn with_auto_repair_on_fetch(mut self, enabled: bool) -> Self {
+        self.auto_repair_on_fetch = enabled;
+        self
     }
 
     /// Opt every per-chunk file into disk persistence. Default is
@@ -1898,9 +1931,13 @@ impl MeshBlobAdapter {
         }
 
         // Fetch every shard slot; missing slots stay None.
+        // Track which DATA shard indices (0..k) were missing
+        // pre-reconstruct so we can opportunistically re-store
+        // them if `auto_repair_on_fetch` is enabled.
         let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(total_shards);
         let mut surviving = 0usize;
-        for chunk in &stripe.chunks {
+        let mut missing_data_indices: Vec<usize> = Vec::new();
+        for (i, chunk) in stripe.chunks.iter().enumerate() {
             match self.fetch_chunk(&chunk.hash).await {
                 Ok(mut bytes) => {
                     // Verify hash before trusting the bytes — the
@@ -1912,6 +1949,9 @@ impl MeshBlobAdapter {
                         // purposes — the RS encoder requires
                         // trusted inputs.
                         shards.push(None);
+                        if i < k_usize {
+                            missing_data_indices.push(i);
+                        }
                         continue;
                     }
                     // Pad data shards to the post-padding length
@@ -1924,7 +1964,12 @@ impl MeshBlobAdapter {
                     shards.push(Some(bytes));
                     surviving += 1;
                 }
-                Err(_) => shards.push(None),
+                Err(_) => {
+                    shards.push(None);
+                    if i < k_usize {
+                        missing_data_indices.push(i);
+                    }
+                }
             }
         }
 
@@ -1942,6 +1987,46 @@ impl MeshBlobAdapter {
         // Run the reconstruction.
         let encoder = super::erasure::RsEncoder::new(super::erasure::RsParams { k, m })?;
         encoder.reconstruct_data(&mut shards)?;
+
+        // Opt-in fetch-path auto-repair: re-store the
+        // reconstructed data shards under their original
+        // content-addressed hashes. Each one is BLAKE3-verified
+        // before persisting — defense against any encoder bug
+        // that would silently corrupt the chunk pool. Best-
+        // effort: store_chunk failures are logged via tracing
+        // but DO NOT fail the fetch (the caller already has the
+        // reconstructed bytes in memory; the repair is an
+        // optimization, not a correctness requirement).
+        if self.auto_repair_on_fetch {
+            for &idx in &missing_data_indices {
+                let chunk_ref = &stripe.chunks[idx];
+                let Some(reconstructed) = shards[idx].as_ref() else {
+                    continue;
+                };
+                let logical_len = chunk_ref.size as usize;
+                if reconstructed.len() < logical_len {
+                    continue;
+                }
+                let logical_bytes = &reconstructed[..logical_len];
+                let computed: [u8; 32] = blake3::hash(logical_bytes).into();
+                if computed != chunk_ref.hash {
+                    tracing::warn!(
+                        hash = ?chunk_ref.hash,
+                        "fetch auto-repair: reconstructed shard hash mismatch; \
+                         skipping persist (encoder bug or stripe corruption)"
+                    );
+                    continue;
+                }
+                if let Err(e) = self.store_chunk(&chunk_ref.hash, logical_bytes).await {
+                    tracing::warn!(
+                        hash = ?chunk_ref.hash,
+                        error = %e,
+                        "fetch auto-repair: store_chunk failed; fetch continues, \
+                         operator-driven repair_blob remains available"
+                    );
+                }
+            }
+        }
 
         // Slice the reconstructed data shards into the requested
         // range. Each data shard's logical size lives in
@@ -4438,6 +4523,130 @@ mod tests {
             .await
             .expect("RS fetch must reconstruct from parity");
         assert_eq!(fetched, payload, "reconstructed bytes must match original");
+    }
+
+    /// Opt-in fetch-path auto-repair: when the adapter is
+    /// constructed with `with_auto_repair_on_fetch(true)`, a
+    /// successful reconstruction during `fetch_range` re-stores
+    /// the previously-missing data chunks under their original
+    /// hashes. Subsequent fetches don't re-pay the
+    /// reconstruction cost.
+    #[tokio::test]
+    async fn fetch_range_auto_repair_restores_missing_chunks_when_enabled() {
+        let redex = Arc::new(Redex::new());
+        let adapter = MeshBlobAdapter::new("auto-repair-on", redex)
+            .with_auto_repair_on_fetch(true);
+        let chunk_size: u32 = 4 * 1024;
+        let payload = deterministic_bytes(0xAD, chunk_size as usize * 4);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let blob_ref = adapter
+            .store_stream_tree_rs_internal(
+                stream_one(payload.clone()),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+
+        // Find data chunk hashes via the manifest.
+        let root_hash = *blob_ref.tree_root_hash().unwrap();
+        let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
+        let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
+            TreeNode::ErasureLeaf { .. } => root_bytes,
+            TreeNode::Internal { children } => {
+                adapter.fetch_chunk(&children[0].0).await.unwrap()
+            }
+            TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
+        };
+        let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
+            TreeNode::ErasureLeaf { stripes } => stripes,
+            other => panic!("expected ErasureLeaf, got: {:?}", other),
+        };
+        let data_hashes: Vec<[u8; 32]> = stripes[0]
+            .chunks
+            .iter()
+            .filter(|c| c.is_data())
+            .map(|c| c.hash)
+            .collect();
+
+        // Kill 2 data chunks (= m tolerance).
+        for hash in &data_hashes[0..2] {
+            adapter.delete_chunk(hash).await.unwrap();
+        }
+        // Confirm deletion.
+        assert!(adapter.fetch_chunk(&data_hashes[0]).await.is_err());
+
+        // First fetch reconstructs + re-stores (auto-repair on).
+        let fetched = adapter
+            .fetch_range(&blob_ref, 0..payload.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(fetched, payload);
+
+        // After auto-repair the previously-missing chunks are
+        // back on disk — verify by fetching them directly.
+        for hash in &data_hashes[0..2] {
+            let bytes = adapter
+                .fetch_chunk(hash)
+                .await
+                .expect("auto-repair must have re-stored this chunk");
+            let computed: [u8; 32] = blake3::hash(&bytes).into();
+            assert_eq!(&computed, hash);
+        }
+    }
+
+    /// With auto-repair off (default), fetch returns the
+    /// reconstructed bytes but does NOT re-store missing
+    /// chunks. The chunk-channel state is preserved as-was —
+    /// the plan's stated semantic that "fetch never writes."
+    #[tokio::test]
+    async fn fetch_range_does_not_restore_chunks_when_auto_repair_off() {
+        let adapter = make_adapter(); // default: auto-repair off
+        let chunk_size: u32 = 4 * 1024;
+        let payload = deterministic_bytes(0xAE, chunk_size as usize * 4);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let blob_ref = adapter
+            .store_stream_tree_rs_internal(
+                stream_one(payload.clone()),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+        let root_hash = *blob_ref.tree_root_hash().unwrap();
+        let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
+        let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
+            TreeNode::ErasureLeaf { .. } => root_bytes,
+            TreeNode::Internal { children } => {
+                adapter.fetch_chunk(&children[0].0).await.unwrap()
+            }
+            TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
+        };
+        let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
+            TreeNode::ErasureLeaf { stripes } => stripes,
+            other => panic!("expected ErasureLeaf, got: {:?}", other),
+        };
+        let data_hashes: Vec<[u8; 32]> = stripes[0]
+            .chunks
+            .iter()
+            .filter(|c| c.is_data())
+            .map(|c| c.hash)
+            .collect();
+        adapter.delete_chunk(&data_hashes[0]).await.unwrap();
+
+        // First fetch reconstructs.
+        let fetched = adapter
+            .fetch_range(&blob_ref, 0..payload.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(fetched, payload);
+
+        // Deleted chunk is STILL missing — auto-repair off, so
+        // reconstruction produced bytes in memory only.
+        assert!(
+            adapter.fetch_chunk(&data_hashes[0]).await.is_err(),
+            "auto-repair off: deleted chunk must remain missing after fetch"
+        );
     }
 
     /// GC stripe-membership pin: when an RS stripe is degraded
