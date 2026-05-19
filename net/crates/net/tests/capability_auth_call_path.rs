@@ -138,6 +138,109 @@ async fn call_service_permissive_announcement_admits_any_caller() {
     assert_eq!(reply.body.as_ref(), b"permissive hello");
 }
 
+/// M3 regression — when multiple peers advertise the same
+/// service and only some authorize the caller, `call_service`
+/// must filter out the denying peers BEFORE the routing policy
+/// picks one. Pre-fix the policy could pick a denying peer even
+/// when authorizing peers existed, masking the fact that the
+/// call would have succeeded against B.
+#[tokio::test]
+async fn call_service_filters_unauthorized_candidates_before_target_selection() {
+    use net::adapter::net::behavior::CapabilityAnnouncement;
+
+    let caller = build_node().await;
+    let denying_server = build_node().await;
+    let allowing_server = build_node().await;
+
+    // Build two server-side announcements, both advertising
+    // nrpc:echo. denying_server restricts to a synthetic third-
+    // party id; allowing_server is permissive. Fold both into
+    // the caller's local index — `find_service_nodes` then
+    // returns both as candidates.
+    for (server, allow) in [
+        (&denying_server, vec![0xDEAD_BEEF_BAAD_F00D]),
+        (&allowing_server, vec![]),
+    ] {
+        let caps = CapabilitySet::new().add_tag("nrpc:echo");
+        let mut ann = CapabilityAnnouncement::new(
+            server.node_id(),
+            server.entity_id().clone(),
+            100,
+            caps,
+        );
+        ann.allowed_nodes = allow;
+        caller.capability_index_arc().index(ann);
+    }
+
+    // No RPC handlers are registered on either server; the gate
+    // verdict (filter result) is what we're pinning, not end-to-
+    // end delivery. With the filter in place, call_service must
+    // pick `allowing_server` and attempt the call — the failure
+    // mode is then ANYTHING other than `CapabilityDenied` (the
+    // call will time out or fail at a later step because no
+    // handler is registered + no wire session is open).
+    let err = caller
+        .call_service(
+            "echo",
+            Bytes::from_static(b"x"),
+            CallOptions {
+                deadline: Some(
+                    std::time::Instant::now() + Duration::from_millis(500),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("no handler registered → call must error somehow");
+    assert!(
+        !matches!(err, RpcError::CapabilityDenied { .. }),
+        "filter must steer call_service to allowing_server; \
+         instead got CapabilityDenied which means the denying \
+         candidate was picked. err={err:?}",
+    );
+}
+
+/// Companion to the filter test: when EVERY candidate denies
+/// the caller, `call_service` must surface `CapabilityDenied`
+/// (rather than NoRoute, which would conflate "no peer
+/// advertised the service" with "every peer that did advertise
+/// it refused the caller").
+#[tokio::test]
+async fn call_service_denies_when_every_candidate_rejects_caller() {
+    use net::adapter::net::behavior::CapabilityAnnouncement;
+
+    let caller = build_node().await;
+    let server_a = build_node().await;
+    let server_b = build_node().await;
+
+    for server in [&server_a, &server_b] {
+        let caps = CapabilitySet::new().add_tag("nrpc:echo");
+        let mut ann = CapabilityAnnouncement::new(
+            server.node_id(),
+            server.entity_id().clone(),
+            100,
+            caps,
+        );
+        ann.allowed_nodes = vec![0xDEAD_BEEF_BAAD_F00D];
+        caller.capability_index_arc().index(ann);
+    }
+
+    let err = caller
+        .call_service(
+            "echo",
+            Bytes::from_static(b"x"),
+            CallOptions::default(),
+        )
+        .await
+        .expect_err("every candidate denies → CapabilityDenied");
+    match err {
+        RpcError::CapabilityDenied { capability, .. } => {
+            assert_eq!(capability, "echo");
+        }
+        other => panic!("expected CapabilityDenied, got {other:?}"),
+    }
+}
+
 /// H1 regression — `serve_rpc` must auto-self-index a fresh
 /// announcement carrying the new `nrpc:<service>` tag so the
 /// callee-side gate has a real policy to consult from the very

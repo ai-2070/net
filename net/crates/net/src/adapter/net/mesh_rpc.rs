@@ -2446,27 +2446,41 @@ impl MeshNode {
         // small.
         candidates.sort_unstable();
 
-        let target = self.select_target(&candidates, &opts.routing_policy);
-
-        // v0.4 capability-auth caller-side gate. The target's own
-        // announcement lists `nrpc:<service>` (otherwise it
-        // wouldn't be a `find_service_nodes` candidate), so the
-        // gate's `has_tag` arm short-circuits in the common case;
-        // the new work is the allow-list scan. Permissive
-        // announcements (all three lists empty) admit any caller
-        // — the byte-identity wire-compat tests pin that an
-        // unmodified peer's announcement stays unrestricted.
+        // v0.4 capability-auth caller-side gate. Filter the
+        // candidate set BEFORE target selection so the routing
+        // policy never picks a peer the caller can't actually
+        // reach. Pre-fix `select_target` could pick a denied
+        // candidate even when authorized peers existed in the
+        // set, and the resulting `CapabilityDenied` masked the
+        // fact that the call would have succeeded against B or
+        // C. Each candidate's own announcement lists
+        // `nrpc:<service>` (otherwise it wouldn't be a
+        // `find_service_nodes` candidate), so the gate's
+        // `has_tag` arm short-circuits in the common case; the
+        // new work is the allow-list scan. Permissive
+        // announcements (all three lists empty) admit any
+        // caller — the byte-identity wire-compat tests pin that
+        // an unmodified peer's announcement stays unrestricted.
         // See `docs/plans/CAPABILITY_AUTH_PLAN.md` §3.
         let tag = format!("nrpc:{service}");
-        if !self
-            .capability_index_arc()
-            .may_execute(target, &tag, self.node_id())
-        {
+        let index = self.capability_index_arc();
+        let self_id = self.node_id();
+        let any_candidate = candidates[0];
+        candidates.retain(|c| index.may_execute(*c, &tag, self_id));
+        if candidates.is_empty() {
             return Err(RpcError::CapabilityDenied {
-                target,
+                // No authorized target; surface one of the
+                // originally-advertised candidates so the caller
+                // can correlate the denial with a real peer. The
+                // semantic is "no peer advertising `nrpc:<service>`
+                // authorizes this caller" — `any_candidate` is a
+                // representative, not necessarily the strictest.
+                target: any_candidate,
                 capability: service.to_string(),
             });
         }
+
+        let target = self.select_target(&candidates, &opts.routing_policy);
         self.call(target, service, payload, opts).await
     }
 
