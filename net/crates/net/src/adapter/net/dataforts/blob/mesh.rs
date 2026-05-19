@@ -1601,7 +1601,19 @@ impl MeshBlobAdapter {
         let encoding = super::erasure::erasure_downgrade(encoding, erasure_probe);
         let tree_supported = tree_probe.check();
         let above_threshold = size_hint.map(|s| s >= TREE_THRESHOLD_BYTES).unwrap_or(true);
-        if tree_supported && above_threshold {
+        // The Manifest downgrade path caps at BLOB_REF_MAX_SIZE
+        // (16 GiB). Streams whose size_hint exceeds that cap but
+        // falls under the Tree-preference threshold (32 GiB) need
+        // to take the Tree path anyway — otherwise pre-fix they
+        // routed to the downgrade buffer and failed at the 16 GiB
+        // cap. The size_hint is producer-supplied (may be wrong),
+        // so this is best-effort; an unreliable hint that says
+        // "small" but produces > 16 GiB bytes still errors at the
+        // downgrade cap.
+        let exceeds_manifest_cap = size_hint
+            .map(|s| s > super::blob_ref::BLOB_REF_MAX_SIZE)
+            .unwrap_or(false);
+        if tree_supported && (above_threshold || exceeds_manifest_cap) {
             self.store_stream_tree(stream, encoding, chunking).await
         } else {
             // Downgrade path: buffer the whole stream (capped
@@ -6031,6 +6043,72 @@ mod tests {
         assert!(
             matches!(blob_ref, BlobRef::Manifest { .. }),
             "below-threshold + Tree-supported should still pick Manifest"
+        );
+    }
+
+    /// Size hints between BLOB_REF_MAX_SIZE (16 GiB) and
+    /// TREE_THRESHOLD_BYTES (32 GiB) must route to the Tree path,
+    /// not the Manifest downgrade. Pre-fix the downgrade buffer
+    /// would have failed at the 16 GiB cap on the actual bytes,
+    /// even though Tree support is available. The size_hint is
+    /// the signal the routing layer uses; we drive a smaller
+    /// payload here (the routing decision happens on size_hint,
+    /// not on observed bytes) and assert the result is a Tree.
+    #[tokio::test]
+    async fn publish_downgrade_routes_to_tree_when_hint_exceeds_manifest_cap() {
+        let adapter = make_adapter();
+        // Real payload is tiny — the routing decision is driven
+        // by size_hint. 24 GiB hint sits between BLOB_REF_MAX_SIZE
+        // (16 GiB) and TREE_THRESHOLD_BYTES (32 GiB).
+        let payload = deterministic_bytes(0xD9, BLOB_CHUNK_SIZE_BYTES as usize);
+        let blob_ref = adapter
+            .publish_stream_with_downgrade(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+                Some(24 * 1024 * 1024 * 1024),
+                &TreeSupportProbe::AlwaysSupported,
+                &CdcSupportProbe::AlwaysSupported,
+                &ErasureSupportProbe::AlwaysSupported,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(blob_ref, BlobRef::Tree { .. }),
+            "size_hint above BLOB_REF_MAX_SIZE must take the Tree path even when \
+             under TREE_THRESHOLD_BYTES; pre-fix this routed to Manifest and \
+             the downgrade buffer's 16 GiB cap would have rejected real bytes"
+        );
+    }
+
+    /// ForceManifest still overrides the cap-exceeded fast path —
+    /// the operator's explicit "no Tree" directive is honored,
+    /// even if it means an oversize-stream Backend error later.
+    /// This pins the operator-intent semantic.
+    #[tokio::test]
+    async fn publish_downgrade_force_manifest_overrides_cap_exceeded() {
+        let adapter = make_adapter();
+        // 2 chunks worth so the downgrade path produces Manifest
+        // (single-chunk payloads emit BlobRef::Small).
+        let payload = deterministic_bytes(0xDA, BLOB_CHUNK_SIZE_BYTES as usize * 2);
+        let blob_ref = adapter
+            .publish_stream_with_downgrade(
+                stream_one(payload),
+                Encoding::Replicated,
+                ChunkingStrategy::default(),
+                Some(24 * 1024 * 1024 * 1024),
+                &TreeSupportProbe::ForceManifest,
+                &CdcSupportProbe::AlwaysSupported,
+                &ErasureSupportProbe::AlwaysSupported,
+            )
+            .await
+            .unwrap();
+        // ForceManifest produces Manifest regardless of size hint;
+        // the real bytes here fit under the cap.
+        assert!(
+            matches!(blob_ref, BlobRef::Manifest { .. }),
+            "ForceManifest must still produce Manifest even when size_hint \
+             exceeds BLOB_REF_MAX_SIZE"
         );
     }
 
