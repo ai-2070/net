@@ -921,6 +921,58 @@ fn subscriber_origin_hash(node_id: u64) -> u64 {
     node_id
 }
 
+/// Soft cap on the number of distinct services kept in
+/// `MeshNode::rpc_route_cache`. Past this size, `rpc_route_for_service`
+/// still returns a correct freshly-built `Arc<RpcRoute>` for the
+/// caller — it just skips the insert, so subsequent calls for the
+/// same overflow service rebuild rather than hitting the cache.
+///
+/// The cap exists to make the worst-case memory bounded even if a
+/// caller flows attacker-controlled or otherwise high-cardinality
+/// `service` strings into the nRPC entry points. Well-behaved
+/// production workloads register a small fixed set of services per
+/// node (typically <10), so 256 leaves a wide margin before the
+/// fail-soft path engages and is small enough that even at the cap
+/// the map's resident set is trivial (≈256 × small struct + two
+/// short `String`s per entry).
+#[cfg(feature = "cortex")]
+pub(super) const RPC_ROUTE_CACHE_SOFT_CAP: usize = 256;
+
+/// Per-service nRPC routing primitives, cached on `MeshNode` to
+/// avoid the per-call `format!` + `ChannelName::new` + xxhash
+/// derivation on every `Mesh::call` / `_streaming` / `_typed`.
+///
+/// Both the request channel (`<service>.requests`) and the reply
+/// channel (`<service>.replies.<self_origin>`) are deterministic
+/// functions of `service` (the reply channel additionally depends
+/// on the node's own `self_origin`, which is constant for the
+/// node's lifetime). Computing them once per service and reusing
+/// the `Arc<RpcRoute>` saves ~5 allocations and ~2 µs per call.
+///
+/// Constructed lazily on first lookup via
+/// `MeshNode::rpc_route_for_service`; held in the
+/// `rpc_route_cache: DashMap<String, Arc<RpcRoute>>` field, bounded
+/// by [`RPC_ROUTE_CACHE_SOFT_CAP`].
+#[cfg(feature = "cortex")]
+pub(super) struct RpcRoute {
+    /// `<service>.requests` channel name. Held for the `CANCEL`
+    /// emission path (`UnaryCallGuard` needs the name to construct
+    /// the cancel publisher).
+    pub request_channel: ChannelName,
+    /// `ChannelId::new(request_channel.clone()).hash()` —
+    /// pre-computed so the publish path doesn't re-hash.
+    pub request_channel_hash: ChannelHash,
+    /// `MeshNode::publish_stream_id(&request_channel_id)` —
+    /// pre-derived stream id for per-channel ordering within a
+    /// session.
+    pub request_stream_id: u64,
+    /// `<service>.replies.<self_origin:016x>` channel name.
+    pub reply_channel: ChannelName,
+    /// `reply_channel.hash()` — pre-computed for the reply
+    /// subscription check.
+    pub reply_hash: ChannelHash,
+}
+
 /// Replace a zero `Duration` with a 1 s floor.
 /// `tokio::time::interval` panics on a zero period; this is the
 /// guard every `spawn_*_loop` call site applies before handing the
@@ -1233,6 +1285,19 @@ pub struct MeshNode {
     /// Prometheus exposure or custom observability.
     #[cfg(feature = "cortex")]
     rpc_metrics: Arc<crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry>,
+    /// Per-service nRPC route cache. Each entry holds the
+    /// pre-computed `ChannelName` / `ChannelId` / `ChannelHash` /
+    /// `stream_id` for both the request channel
+    /// (`<service>.requests`) and the reply channel
+    /// (`<service>.replies.<self_origin>`). Both are functions of
+    /// `service` (and the node's constant `self_origin` for the
+    /// reply side), so the build cost — 2 `format!` + 2
+    /// `ChannelName::new` + 2 xxhash + `publish_stream_id`
+    /// derivation — only pays on the first call per service.
+    /// Subsequent calls do one `DashMap::get(&str)` + `Arc::clone`,
+    /// saving ~5 allocations per `Mesh::call`.
+    #[cfg(feature = "cortex")]
+    rpc_route_cache: Arc<DashMap<String, Arc<RpcRoute>>>,
     /// Optional caller-side nRPC observer. Fired from `Mesh::call`
     /// on each call boundary (success / server-error / timeout /
     /// transport error). `Arc<ArcSwapOption<...>>` so a hot-path
@@ -1751,6 +1816,8 @@ impl MeshNode {
             rpc_local_services: Arc::new(dashmap::DashSet::new()),
             #[cfg(feature = "cortex")]
             rpc_metrics: Arc::new(crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry::new()),
+            #[cfg(feature = "cortex")]
+            rpc_route_cache: Arc::new(DashMap::new()),
             #[cfg(feature = "cortex")]
             rpc_observer: Arc::new(ArcSwapOption::empty()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
@@ -4729,6 +4796,81 @@ impl MeshNode {
     #[cfg(feature = "cortex")]
     pub(super) fn public_key_origin_hash(&self) -> u64 {
         self.identity.entity_id().origin_hash()
+    }
+
+    /// Per-service nRPC route lookup with lazy build.
+    ///
+    /// Hot path: one `DashMap::get(&str)` + `Arc::clone` — no
+    /// allocations on the cached-hit case.
+    ///
+    /// Cold path (first call per service): runs `format!` ×2 +
+    /// `ChannelName::new` ×2 (which validates the name) +
+    /// `ChannelId::new` + `publish_stream_id` derivation, then
+    /// either inserts the `Arc<RpcRoute>` into the cache or — past
+    /// [`RPC_ROUTE_CACHE_SOFT_CAP`] — returns the built `Arc`
+    /// without caching it. Returns `Err(reason)` if either channel
+    /// name fails validation (caller maps to `RpcError::NoRoute`).
+    ///
+    /// Soft cap rationale: callers pass `service: &str` that, in
+    /// principle, can flow from outside (typed-RPC traits make it
+    /// effectively static, but the raw-call surface does not enforce
+    /// that). The cap keeps memory worst-case bounded while leaving
+    /// the steady-state path (few distinct services per node)
+    /// untouched.
+    #[cfg(feature = "cortex")]
+    pub(super) fn rpc_route_for_service(&self, service: &str) -> Result<Arc<RpcRoute>, String> {
+        if let Some(r) = self.rpc_route_cache.get(service) {
+            return Ok(Arc::clone(r.value()));
+        }
+        // Cold path. Build first (this is the fallible step — name
+        // validation), then decide whether to insert.
+        let route = Arc::new(self.build_rpc_route(service)?);
+        // Soft cap. We re-check membership inside the cap branch
+        // because another caller may have populated this service
+        // between our initial `get` and here; in that case
+        // `entry().or_insert_with` returns their `Arc` and our
+        // freshly-built one is dropped — both encode the same
+        // bytes, so either is correct, but reusing the cached one
+        // keeps the cache canonical.
+        //
+        // Over the cap we deliberately skip caching but still
+        // return a correct route. A racing inserter could push us
+        // marginally over the cap; that's by design — the cap is
+        // soft, and a sharp boundary would require an extra lock
+        // we don't want on the hot path.
+        if self.rpc_route_cache.len() < RPC_ROUTE_CACHE_SOFT_CAP {
+            let entry = self
+                .rpc_route_cache
+                .entry(service.to_string())
+                .or_insert_with(|| Arc::clone(&route));
+            Ok(Arc::clone(entry.value()))
+        } else {
+            Ok(route)
+        }
+    }
+
+    /// Cold-path constructor for [`RpcRoute`]. Pulled out of
+    /// `rpc_route_for_service` so the cache management logic stays
+    /// readable and so tests can exercise the build path
+    /// independently of cache state.
+    #[cfg(feature = "cortex")]
+    fn build_rpc_route(&self, service: &str) -> Result<RpcRoute, String> {
+        let request_channel = ChannelName::new(&format!("{service}.requests"))
+            .map_err(|e| format!("invalid service name: {e}"))?;
+        let request_channel_id = ChannelId::new(request_channel.clone());
+        let request_channel_hash = request_channel_id.hash();
+        let request_stream_id = Self::publish_stream_id(&request_channel_id);
+        let self_origin = self.public_key_origin_hash();
+        let reply_channel = ChannelName::new(&format!("{service}.replies.{self_origin:016x}"))
+            .map_err(|e| format!("invalid reply channel name: {e}"))?;
+        let reply_hash = reply_channel.hash();
+        Ok(RpcRoute {
+            request_channel,
+            request_channel_hash,
+            request_stream_id,
+            reply_channel,
+            reply_hash,
+        })
     }
 
     /// Registry of nRPC services this node currently serves.
@@ -11034,5 +11176,135 @@ mod chain_helper_tests {
             post_filter, MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE,
             "filter must drop blob-heat tags past the per-announce cap"
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "cortex")]
+mod route_cache_tests {
+    //! Coverage for `MeshNode::rpc_route_for_service` — the
+    //! per-service nRPC route cache landed in T1.3 of the
+    //! 2026-05-19 perf audit. Pins:
+    //!
+    //!   - cache hits return the same `Arc<RpcRoute>` (so the
+    //!     refcount-bump fast path is real, not silently
+    //!     rebuilding);
+    //!   - the cached route is byte-for-byte equivalent to what
+    //!     the removed per-call code produced (any future tweak
+    //!     to channel-name derivation can't silently diverge from
+    //!     server-side service lookup);
+    //!   - distinct services don't alias (the obvious safety
+    //!     property);
+    //!   - the [`RPC_ROUTE_CACHE_SOFT_CAP`] is honored — past
+    //!     the cap, the lookup still returns a correct route but
+    //!     stops growing the cache.
+    use super::*;
+    use std::net::SocketAddr;
+
+    async fn build_node_for_test() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x17u8; 32]);
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cached_lookup_returns_same_arc() {
+        let node = build_node_for_test().await;
+        let a = node.rpc_route_for_service("svc.alpha").expect("first");
+        let b = node.rpc_route_for_service("svc.alpha").expect("second");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "repeat lookup must hit the cache (same Arc), not rebuild"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cached_route_matches_freshly_computed() {
+        let node = build_node_for_test().await;
+        let service = "svc.beta";
+        let cached = node.rpc_route_for_service(service).expect("cached");
+
+        // Re-derive everything from scratch the way the pre-cache
+        // code path did. Any future refactor of channel-name
+        // derivation that diverges from server-side service
+        // lookup will surface here.
+        let expected_request =
+            ChannelName::new(&format!("{service}.requests")).expect("request name");
+        let expected_request_id = ChannelId::new(expected_request.clone());
+        let expected_request_hash = expected_request_id.hash();
+        let expected_stream_id = MeshNode::publish_stream_id(&expected_request_id);
+        let self_origin = node.public_key_origin_hash();
+        let expected_reply =
+            ChannelName::new(&format!("{service}.replies.{self_origin:016x}")).expect("reply name");
+        let expected_reply_hash = expected_reply.hash();
+
+        assert_eq!(cached.request_channel.as_str(), expected_request.as_str());
+        assert_eq!(cached.request_channel_hash, expected_request_hash);
+        assert_eq!(cached.request_stream_id, expected_stream_id);
+        assert_eq!(cached.reply_channel.as_str(), expected_reply.as_str());
+        assert_eq!(cached.reply_hash, expected_reply_hash);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn distinct_services_get_distinct_routes() {
+        let node = build_node_for_test().await;
+        let a = node.rpc_route_for_service("svc.one").expect("one");
+        let b = node.rpc_route_for_service("svc.two").expect("two");
+        assert_ne!(a.request_channel.as_str(), b.request_channel.as_str());
+        assert_ne!(a.request_channel_hash, b.request_channel_hash);
+        assert_ne!(a.reply_channel.as_str(), b.reply_channel.as_str());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_service_name_returns_err() {
+        let node = build_node_for_test().await;
+        // Uppercase is rejected by `ChannelName::validate`.
+        assert!(node.rpc_route_for_service("SVC.Bad").is_err());
+        // And nothing got cached for the rejected name.
+        assert!(node.rpc_route_cache.get("SVC.Bad").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_respects_soft_cap() {
+        let node = build_node_for_test().await;
+        // Push well past the cap, single-threaded, so the
+        // size-then-insert check is non-racy.
+        let overflow = 64usize;
+        for i in 0..(RPC_ROUTE_CACHE_SOFT_CAP + overflow) {
+            let svc = format!("svc.cap.{i:04}");
+            let route = node
+                .rpc_route_for_service(&svc)
+                .expect("build must succeed regardless of cap");
+            // Overflow callers still get a correct route — just
+            // not a cached one.
+            assert_eq!(
+                route.request_channel.as_str(),
+                format!("{svc}.requests").as_str()
+            );
+        }
+        assert!(
+            node.rpc_route_cache.len() <= RPC_ROUTE_CACHE_SOFT_CAP,
+            "cache size {} exceeds soft cap {}",
+            node.rpc_route_cache.len(),
+            RPC_ROUTE_CACHE_SOFT_CAP,
+        );
+        // Past the cap, lookups for new services should *not*
+        // grow the map (they bypass the insert branch). Lookups
+        // for already-cached services still hit.
+        let len_before = node.rpc_route_cache.len();
+        let _ = node.rpc_route_for_service("svc.overflow.new").unwrap();
+        assert_eq!(
+            node.rpc_route_cache.len(),
+            len_before,
+            "post-cap insert must be a no-op for new services"
+        );
+        // And a previously-cached service still returns the same Arc.
+        let first = node.rpc_route_for_service("svc.cap.0000").unwrap();
+        let second = node.rpc_route_for_service("svc.cap.0000").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }
