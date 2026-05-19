@@ -2295,6 +2295,10 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
             "RpcCancelledError",
             m.py().get_type::<mesh_rpc::RpcCancelledError>(),
         )?;
+        m.add(
+            "RpcCapabilityDeniedError",
+            m.py().get_type::<mesh_rpc::RpcCapabilityDeniedError>(),
+        )?;
     }
     #[cfg(feature = "dataforts")]
     {

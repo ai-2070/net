@@ -1654,9 +1654,7 @@ impl MeshNode {
                 let self_node = mesh_for_bridge.node_id();
                 let index = mesh_for_bridge.capability_index_arc();
                 let from_node = inbound.from_node;
-                if from_node != 0
-                    && !index.may_execute(self_node, &tag, from_node)
-                {
+                if from_node != 0 && !index.may_execute(self_node, &tag, from_node) {
                     // Decode the EventMeta so we can address the
                     // caller's reply channel (keyed on
                     // `caller_origin`) and tag the response with

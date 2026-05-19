@@ -1,6 +1,6 @@
 //! `net cap (show|query|nodes|announce)` — capability advertisement
-//!   + discovery from the local snapshot, plus offline compose-and-sign
-//!   for v0.4 capability-auth (see `docs/plans/CAPABILITY_AUTH_PLAN.md`).
+//! and discovery from the local snapshot, plus offline compose-and-sign
+//! for v0.4 capability-auth (see `docs/plans/CAPABILITY_AUTH_PLAN.md`).
 //!
 //! `show` / `query` / `nodes` read `DeckClient::status()` and filter
 //! the snapshot's per-peer `capability_set`. `announce` builds a
@@ -325,7 +325,10 @@ fn parse_node_ids(values: &[String]) -> Result<Vec<u64>, CliError> {
 
 fn parse_node_id(value: &str) -> Result<u64, CliError> {
     let trimmed = value.trim();
-    let parsed = if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    let parsed = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         u64::from_str_radix(hex, 16)
     } else {
         trimmed.parse::<u64>()

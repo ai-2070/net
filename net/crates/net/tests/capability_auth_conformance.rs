@@ -144,12 +144,8 @@ fn target_announcement(
     allowed_groups: Vec<GroupId>,
 ) -> CapabilityAnnouncement {
     let caps = CapabilitySet::new().add_tag(capability_tag);
-    let mut ann = CapabilityAnnouncement::new(
-        target.node_id(),
-        target.entity_id().clone(),
-        version,
-        caps,
-    );
+    let mut ann =
+        CapabilityAnnouncement::new(target.node_id(), target.entity_id().clone(), version, caps);
     ann.allowed_nodes = allowed_nodes;
     ann.allowed_subnets = allowed_subnets;
     ann.allowed_groups = allowed_groups;
@@ -172,12 +168,7 @@ fn caller_announcement(
     for g in membership_groups {
         caps = caps.add_tag(g.to_tag());
     }
-    CapabilityAnnouncement::new(
-        caller.node_id(),
-        caller.entity_id().clone(),
-        version,
-        caps,
-    )
+    CapabilityAnnouncement::new(caller.node_id(), caller.entity_id().clone(), version, caps)
 }
 
 // ---------------------------------------------------------------------------
@@ -280,15 +271,14 @@ async fn scenario_2_allow_by_node_admits_listed_only() {
 
     // Denied caller hits the gate first.
     let err = denied_caller
-        .call_service(
-            "echo",
-            Bytes::from_static(b"hi"),
-            CallOptions::default(),
-        )
+        .call_service("echo", Bytes::from_static(b"hi"), CallOptions::default())
         .await
         .expect_err("denied caller must hit the gate");
     match err {
-        RpcError::CapabilityDenied { target: t, capability } => {
+        RpcError::CapabilityDenied {
+            target: t,
+            capability,
+        } => {
             assert_eq!(t, target.node_id());
             assert_eq!(capability, "echo");
         }
@@ -316,20 +306,10 @@ async fn scenario_3_allow_by_subnet_admits_subnet_members() {
         .expect("serve_rpc");
 
     let subnet = SubnetId::from_bytes([0x42; 16]);
-    let target_ann = target_announcement(
-        &target,
-        200,
-        "nrpc:echo",
-        vec![],
-        vec![subnet],
-        vec![],
-    );
+    let target_ann = target_announcement(&target, 200, "nrpc:echo", vec![], vec![subnet], vec![]);
     let in_subnet_ann = caller_announcement(&in_subnet, 1, Some(subnet), &[]);
     let out_of_subnet_ann = caller_announcement(&out_of_subnet, 1, None, &[]);
-    fold_announcement_everywhere(
-        &[&target, &in_subnet, &out_of_subnet],
-        &target_ann,
-    );
+    fold_announcement_everywhere(&[&target, &in_subnet, &out_of_subnet], &target_ann);
     // Each caller's own subnet membership announcement also needs
     // to land in the target's index (the gate reads caller subnet
     // there) AND in the caller's own index (consistency).
@@ -378,8 +358,7 @@ async fn scenario_4_allow_by_group_admits_group_claimants() {
         .expect("serve_rpc");
 
     let group = GroupId::from_bytes([0x77; 32]);
-    let target_ann =
-        target_announcement(&target, 300, "nrpc:echo", vec![], vec![], vec![group]);
+    let target_ann = target_announcement(&target, 300, "nrpc:echo", vec![], vec![], vec![group]);
     let claimant_ann = caller_announcement(&claimant, 1, None, &[group]);
     let non_claimant_ann = caller_announcement(&non_claimant, 1, None, &[]);
     fold_announcement_everywhere(&[&target, &claimant, &non_claimant], &target_ann);
@@ -457,11 +436,7 @@ async fn scenario_5_revocation_via_new_announcement_supersedes() {
     fold_announcement_everywhere(&[&target, &caller], &v2);
 
     let err = caller
-        .call_service(
-            "echo",
-            Bytes::from_static(b"v2"),
-            CallOptions::default(),
-        )
+        .call_service("echo", Bytes::from_static(b"v2"), CallOptions::default())
         .await
         .expect_err("v2 must deny");
     assert!(matches!(err, RpcError::CapabilityDenied { .. }));
@@ -495,8 +470,7 @@ async fn scenario_6_callee_side_defense_in_depth_rejects() {
     // hold the same signed announcement, but the test simulates a
     // caller that skipped or never received the restrictive
     // version).
-    let permissive =
-        target_announcement(&target, 1, "nrpc:echo", vec![], vec![], vec![]);
+    let permissive = target_announcement(&target, 1, "nrpc:echo", vec![], vec![], vec![]);
     caller.capability_index_arc().index(permissive);
 
     // Target's own index: restrictive — only a synthetic node id
@@ -524,13 +498,14 @@ async fn scenario_6_callee_side_defense_in_depth_rejects() {
         .await
         .expect_err("callee-side gate must deny");
     match err {
-        RpcError::CapabilityDenied { target: t, capability } => {
+        RpcError::CapabilityDenied {
+            target: t,
+            capability,
+        } => {
             assert_eq!(t, target.node_id());
             assert_eq!(capability, "echo");
         }
-        other => panic!(
-            "expected CapabilityDenied surfaced from callee, got {other:?}"
-        ),
+        other => panic!("expected CapabilityDenied surfaced from callee, got {other:?}"),
     }
 }
 
@@ -563,12 +538,7 @@ async fn from_bytes_rejects_oversized_allow_list() {
     use net::adapter::net::behavior::capability::MAX_ALLOW_LIST_LEN;
     let node = build_node().await;
     let caps = CapabilitySet::new().add_tag("nrpc:probe");
-    let mut ann = CapabilityAnnouncement::new(
-        node.node_id(),
-        node.entity_id().clone(),
-        1,
-        caps,
-    );
+    let mut ann = CapabilityAnnouncement::new(node.node_id(), node.entity_id().clone(), 1, caps);
     ann.allowed_nodes = (0..(MAX_ALLOW_LIST_LEN as u64) + 1).collect();
     let bytes = ann.to_bytes();
     assert!(
@@ -597,12 +567,7 @@ async fn membership_parse_returns_no_subnet_when_announcement_has_multiple_subne
         .add_tag(s1.to_tag())
         .add_tag(s2.to_tag())
         .add_tag("nrpc:probe");
-    let ann = CapabilityAnnouncement::new(
-        node.node_id(),
-        node.entity_id().clone(),
-        1,
-        caps,
-    );
+    let ann = CapabilityAnnouncement::new(node.node_id(), node.entity_id().clone(), 1, caps);
     node.capability_index_arc().index(ann);
     assert_eq!(
         node.capability_index_arc().subnet_of(node.node_id()),

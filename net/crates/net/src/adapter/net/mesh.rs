@@ -6925,8 +6925,7 @@ impl MeshNode {
             }
             m
         };
-        let version =
-            self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
+        let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
         let mut ann = CapabilityAnnouncement::new(
             self.node_id,
             self.identity.entity_id().clone(),

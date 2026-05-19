@@ -229,10 +229,8 @@ fn cap_announce_accepts_node_id_matching_signing_key() {
         .arg(&baseline_path)
         .assert()
         .success();
-    let baseline = CapabilityAnnouncement::from_bytes(
-        &std::fs::read(&baseline_path).unwrap(),
-    )
-    .expect("decode baseline");
+    let baseline = CapabilityAnnouncement::from_bytes(&std::fs::read(&baseline_path).unwrap())
+        .expect("decode baseline");
     let derived_hex = format!("{:#x}", baseline.node_id);
 
     // Now run with --node-id matching the derived value.
@@ -262,8 +260,7 @@ fn cap_announce_normalizes_whitespace_across_allow_list_parsers() {
     // Whitespace-padded inputs on all three allow-list axes.
     let node_padded = "  0xCAFEF00D  ";
     let subnet_padded = "   00112233445566778899aabbccddeeff   ";
-    let group_padded =
-        "   ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100   ";
+    let group_padded = "   ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100   ";
 
     Command::cargo_bin("net-mesh")
         .unwrap()
@@ -284,18 +281,10 @@ fn cap_announce_normalizes_whitespace_across_allow_list_parsers() {
     assert_eq!(ann.allowed_nodes, vec![0xCAFE_F00Du64]);
     assert_eq!(
         ann.allowed_subnets,
-        vec![CapabilitySubnetId::from_tag(&format!(
-            "subnet:{}",
-            subnet_padded.trim()
-        ))
-        .unwrap()]
+        vec![CapabilitySubnetId::from_tag(&format!("subnet:{}", subnet_padded.trim())).unwrap()]
     );
     assert_eq!(
         ann.allowed_groups,
-        vec![CapabilityGroupId::from_tag(&format!(
-            "group:{}",
-            group_padded.trim()
-        ))
-        .unwrap()]
+        vec![CapabilityGroupId::from_tag(&format!("group:{}", group_padded.trim())).unwrap()]
     );
 }

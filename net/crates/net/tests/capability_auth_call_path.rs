@@ -162,12 +162,8 @@ async fn call_service_filters_unauthorized_candidates_before_target_selection() 
         (&allowing_server, vec![]),
     ] {
         let caps = CapabilitySet::new().add_tag("nrpc:echo");
-        let mut ann = CapabilityAnnouncement::new(
-            server.node_id(),
-            server.entity_id().clone(),
-            100,
-            caps,
-        );
+        let mut ann =
+            CapabilityAnnouncement::new(server.node_id(), server.entity_id().clone(), 100, caps);
         ann.allowed_nodes = allow;
         caller.capability_index_arc().index(ann);
     }
@@ -184,9 +180,7 @@ async fn call_service_filters_unauthorized_candidates_before_target_selection() 
             "echo",
             Bytes::from_static(b"x"),
             CallOptions {
-                deadline: Some(
-                    std::time::Instant::now() + Duration::from_millis(500),
-                ),
+                deadline: Some(std::time::Instant::now() + Duration::from_millis(500)),
                 ..Default::default()
             },
         )
@@ -215,22 +209,14 @@ async fn call_service_denies_when_every_candidate_rejects_caller() {
 
     for server in [&server_a, &server_b] {
         let caps = CapabilitySet::new().add_tag("nrpc:echo");
-        let mut ann = CapabilityAnnouncement::new(
-            server.node_id(),
-            server.entity_id().clone(),
-            100,
-            caps,
-        );
+        let mut ann =
+            CapabilityAnnouncement::new(server.node_id(), server.entity_id().clone(), 100, caps);
         ann.allowed_nodes = vec![0xDEAD_BEEF_BAAD_F00D];
         caller.capability_index_arc().index(ann);
     }
 
     let err = caller
-        .call_service(
-            "echo",
-            Bytes::from_static(b"x"),
-            CallOptions::default(),
-        )
+        .call_service("echo", Bytes::from_static(b"x"), CallOptions::default())
         .await
         .expect_err("every candidate denies → CapabilityDenied");
     match err {
@@ -326,12 +312,8 @@ async fn call_service_caller_side_gate_denies_when_not_in_allow_list() {
     // the desired allow-list, then fold it into both sides'
     // indexes so the gate sees the restriction.
     let caps = CapabilitySet::new().add_tag("nrpc:echo");
-    let mut ann = CapabilityAnnouncement::new(
-        server.node_id(),
-        server.entity_id().clone(),
-        100,
-        caps,
-    );
+    let mut ann =
+        CapabilityAnnouncement::new(server.node_id(), server.entity_id().clone(), 100, caps);
     // Allow-list a synthetic node id distinct from the caller.
     ann.allowed_nodes = vec![0xDEAD_BEEF_BAAD_F00D];
     // Unsigned is fine here — the index's `index()` path doesn't
@@ -453,9 +435,7 @@ async fn callee_bridge_denial_bumps_capability_denied_metric() {
             "echo",
             Bytes::from_static(b"bypass"),
             CallOptions {
-                deadline: Some(
-                    std::time::Instant::now() + Duration::from_secs(2),
-                ),
+                deadline: Some(std::time::Instant::now() + Duration::from_secs(2)),
                 ..Default::default()
             },
         )

@@ -737,10 +737,7 @@ pub(crate) fn scope_from_tags(tags: &HashSet<Tag>) -> CapabilityScope {
 /// agree on iteration order); duplicates (Eq) are removed.
 pub(crate) fn parse_membership_tags(
     tags: &HashSet<Tag>,
-) -> (
-    Option<super::subnet::SubnetId>,
-    Vec<super::group::GroupId>,
-) {
+) -> (Option<super::subnet::SubnetId>, Vec<super::group::GroupId>) {
     let mut subnet_candidates: Vec<super::subnet::SubnetId> = Vec::new();
     let mut groups: Vec<super::group::GroupId> = Vec::new();
     for tag in tags {
@@ -3605,10 +3602,7 @@ impl CapabilityIndex {
     /// Returns `None` when the caller has no announcement yet or
     /// emitted no `subnet:` tag. v0.4 capability-auth uses this
     /// inside [`Self::may_execute`].
-    pub fn subnet_of(
-        &self,
-        node_id: u64,
-    ) -> Option<super::subnet::SubnetId> {
+    pub fn subnet_of(&self, node_id: u64) -> Option<super::subnet::SubnetId> {
         self.nodes.get(&node_id).and_then(|n| n.subnet)
     }
 
@@ -3649,12 +3643,7 @@ impl CapabilityIndex {
     /// for capability claims. It does consult it for subnet /
     /// group membership lookup, because that's the only place
     /// self-declared membership lives.
-    pub fn may_execute(
-        &self,
-        target_node: u64,
-        capability_tag: &str,
-        caller_node: u64,
-    ) -> bool {
+    pub fn may_execute(&self, target_node: u64, capability_tag: &str, caller_node: u64) -> bool {
         let Some(target) = self.nodes.get(&target_node) else {
             return false;
         };
@@ -3671,11 +3660,7 @@ impl CapabilityIndex {
             return true;
         }
         if !target.allowed_subnets.is_empty() {
-            if let Some(caller_subnet) = self
-                .nodes
-                .get(&caller_node)
-                .and_then(|n| n.subnet)
-            {
+            if let Some(caller_subnet) = self.nodes.get(&caller_node).and_then(|n| n.subnet) {
                 if target.allowed_subnets.contains(&caller_subnet) {
                     return true;
                 }
@@ -5609,8 +5594,7 @@ mod tests {
             );
             match which {
                 "nodes" => {
-                    ann.allowed_nodes =
-                        (0..(MAX_ALLOW_LIST_LEN as u64) + 1).collect();
+                    ann.allowed_nodes = (0..(MAX_ALLOW_LIST_LEN as u64) + 1).collect();
                 }
                 "subnets" => {
                     ann.allowed_subnets = (0..(MAX_ALLOW_LIST_LEN as u8) + 1)
@@ -5644,8 +5628,8 @@ mod tests {
         );
         ann.allowed_nodes = (0..MAX_ALLOW_LIST_LEN as u64).collect();
         let bytes = ann.to_bytes();
-        let decoded = CapabilityAnnouncement::from_bytes(&bytes)
-            .expect("exactly-at-cap must deserialize");
+        let decoded =
+            CapabilityAnnouncement::from_bytes(&bytes).expect("exactly-at-cap must deserialize");
         assert_eq!(decoded.allowed_nodes.len(), MAX_ALLOW_LIST_LEN);
     }
 
@@ -5675,9 +5659,7 @@ mod tests {
         for g in membership_groups {
             caps = caps.add_tag(g.to_tag());
         }
-        let entity = super::super::super::identity::EntityId::from_bytes(
-            [node_id as u8; 32],
-        );
+        let entity = super::super::super::identity::EntityId::from_bytes([node_id as u8; 32]);
         let mut ann = CapabilityAnnouncement::new(node_id, entity, version, caps);
         ann.allowed_nodes = allowed_nodes;
         ann.allowed_subnets = allowed_subnets;
