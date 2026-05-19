@@ -855,7 +855,7 @@ where
             Ok(r) => r,
             Err(e) => {
                 return Err(RpcHandlerError::Application {
-                    code: 0x4000,
+                    code: NRPC_TYPED_BAD_REQUEST,
                     message: format!("typed streaming handler: bad request body: {e}"),
                 })
             }
