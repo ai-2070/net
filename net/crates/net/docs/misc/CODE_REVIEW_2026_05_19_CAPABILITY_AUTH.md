@@ -39,6 +39,38 @@ If reversed, the self-announcement lacks the `nrpc:<service>` tag, `may_execute`
 - Document in the `serve_rpc` / `announce_capabilities` rustdoc with a `# Ordering` section.
 - Better: `serve_rpc` schedules an immediate re-announce so the order doesn't matter to callers.
 
+### H3 — `net cap announce --node-id` allows node/entity binding mismatch
+`net/crates/net/cli/src/commands/cap.rs:258`:
+
+```rust
+let node_id = match args.node_id.as_deref() {
+    Some(s) => parse_node_id(s)?,
+    None => keypair.node_id(),
+};
+```
+
+The `--node-id` override decouples the announcement's `node_id` from the keypair's derived id while still using the keypair's `entity_id` and signature. Receivers reject announcements where the `node_id ↔ entity_id` binding doesn't match the signing key, so any operator who reaches for this override generates unusable bytes that fail silently downstream.
+
+Fix: either validate the override matches `keypair.node_id()` and `invalid_args` if it doesn't, or remove the flag. If a "sign on behalf of another node" workflow is actually wanted, it needs a separate code path that also resolves the other node's `entity_id` and signing key.
+
+### H4 — Subnet parsing is non-deterministic across announcements with multiple `subnet:` tags
+`net/crates/net/src/adapter/net/behavior/capability.rs:737` (`parse_membership_tags`):
+
+```rust
+for tag in tags {       // tags: &HashSet<Tag>
+    let rendered = tag.to_string();
+    if subnet.is_none() {
+        if let Some(s) = SubnetId::from_tag(&rendered) {
+            subnet = Some(s);
+            continue;
+        }
+    }
+    …
+}
+```
+
+`HashSet<Tag>` iteration order is unspecified. If an operator publishes two `subnet:<hex>` tags (against the model's "one per announcement" expectation), which one binds to the gate depends on hash iteration — meaning the same announcement can grant or deny depending on receiver-local hash randomization. The doc comment acknowledges multiple subnet tags are out of model, but the parser silently picks one rather than rejecting. Either reject (treat as malformed) or collect-and-sort before picking so behavior is deterministic across receivers.
+
 ---
 
 ## MED
@@ -49,15 +81,21 @@ If reversed, the self-announcement lacks the `nrpc:<service>` tag, `may_execute`
 ### M2 — Plan §3 vs Locked design point #1 still contradicts
 `net/crates/net/docs/plans/CAPABILITY_AUTH_PLAN.md` §3 step 5/6 reads the caller's announcement for subnet/group membership, but "Locked design point #1" says "may_execute does NOT consult the caller's own `CapabilityAnnouncement`." The implementation goes with §3 (does consult for subnet/group). Reword the locked point to "does not consult for capability claims — only for self-declared membership," or revisit which behavior is wanted.
 
----
+### M3 — `call_service` gates after target selection instead of filtering candidates
+`net/crates/net/src/adapter/net/mesh_rpc.rs:2426-2446`. The flow today is:
 
-## LOW
+```rust
+let target = self.select_target(&candidates, &opts.routing_policy);
+let tag = format!("nrpc:{service}");
+if !self.capability_index_arc().may_execute(target, &tag, self.node_id()) {
+    return Err(RpcError::CapabilityDenied { … });
+}
+```
 
-### L1 — `from_node == 0` skip is safe only by implicit invariant
-`mesh_rpc.rs:1641`. Production wire delivery (`mesh.rs:4147`) drops events with no resolvable NodeId rather than passing 0, so the gate's `from_node != 0` skip is effectively unreachable from over the wire. Good today. The risk is that a future refactor of `mesh.rs:4133-4156` falling back to `from_node = 0` instead of dropping silently opens the gate. Add a doc-comment on `RpcInboundEvent::from_node` (`cortex/rpc.rs:944`) declaring "production wire delivery MUST NOT use 0" so the invariant is recorded next to the field that carries it.
+If `candidates = [A, B, C]` and A denies the caller but B/C admit, `select_target` may pick A and the call fails with `CapabilityDenied` even though two valid targets existed. The routing policy is being applied to a set that includes peers the caller can't actually call. Filter `candidates` by `may_execute` BEFORE selection — and on empty-after-filter, return `CapabilityDenied` (or a new `NoAuthorizedTarget`) so the caller can distinguish "found nobody" from "found peers, none let me in."
 
-### L2 — Duplicate `--tag` CLI arg fires a misleading error
-`cli/cap.rs:198-208`. The size-delta heuristic conflates "tag was rejected by the parser" and "tag was already present in the set":
+### M4 — Duplicate `--tag` CLI arg falsely reported as a parse error
+`net/crates/net/cli/src/commands/cap.rs:272-281`. The size-delta heuristic conflates "tag was rejected by the parser" with "tag was already present in the set":
 
 ```rust
 let before = caps.tags.len();
@@ -69,22 +107,26 @@ if caps.tags.len() == before {
 
 `--tag nrpc:echo --tag nrpc:echo` errors out with the reserved-prefix message. Use the `Tag::parse_user` result directly (return `Err` on parser failure, ignore the dedup case).
 
-### L3 — Conformance scenarios 2/3/4 weak-form-assert the allowed path
+---
+
+## LOW
+
+### L1 — `from_node == 0` skip is safe only by implicit invariant
+`mesh_rpc.rs:1641`. Production wire delivery (`mesh.rs:4147`) drops events with no resolvable NodeId rather than passing 0, so the gate's `from_node != 0` skip is effectively unreachable from over the wire. Good today. The risk is that a future refactor of `mesh.rs:4133-4156` falling back to `from_node = 0` instead of dropping silently opens the gate. Add a doc-comment on `RpcInboundEvent::from_node` (`cortex/rpc.rs:944`) declaring "production wire delivery MUST NOT use 0" so the invariant is recorded next to the field that carries it.
+
+### L2 — Conformance scenarios 2/3/4 weak-form-assert the allowed path
 `net/crates/net/tests/capability_auth_conformance.rs`. The allowed-caller assertion is `!matches!(err, CapabilityDenied { .. })` rather than `Ok(...)`. That pins the gate verdict but not end-to-end RPC delivery. Scenario 1 does register a handler and assert success, so the end-to-end path is covered once — but the per-axis tests could be tightened (or at minimum, note in their docstring that this is intentional to skip the handler-not-registered detour).
 
-### L4 — `parse_membership_tags` "first subnet wins" is unstable
-`behavior/capability.rs:720-752`. `HashSet<Tag>` iteration order is unspecified. If an operator publishes two `subnet:<hex>` tags (against the model's "one per announcement" expectation), which one binds is determined by hash iteration. The doc comment acknowledges multiple subnet tags are out of model, but the parser silently picks one rather than rejecting. Either reject (treat as malformed) or sort the tags before scanning so behavior is deterministic.
-
-### L5 — `signature_byte_identity_with_pre_v04_unrestricted_announcement` overpromises its name
+### L3 — `signature_byte_identity_with_pre_v04_unrestricted_announcement` overpromises its name
 `behavior/capability.rs:5290` (test name). The body never compares against a "pre-v0.4 producer" — it just asserts the v0.4 JSON object lacks the three keys when empty. That's a useful invariant, but it's the same one already pinned by `empty_allow_lists_omit_fields_from_wire`, just through `signed_payload()` instead of `to_bytes()`. Either rename to reflect what it actually checks (e.g. `signed_payload_omits_empty_allow_lists`) or strengthen it by crafting the pre-v0.4 byte form and asserting equality.
 
-### L6 — Duplicated hex codec across `subnet.rs` and `group.rs`
+### L4 — Duplicated hex codec across `subnet.rs` and `group.rs`
 `behavior/subnet.rs` and `behavior/group.rs` ship identical `hex_nibble` + near-identical `from_tag`/`to_tag`. `Signature64` in `behavior/capability.rs` already uses the `hex` crate; reusing it here would delete ~20 lines per file. Pure cleanup.
 
-### L7 — `SubnetId(pub [u8; 16])` / `GroupId(pub [u8; 32])` inner field is public
+### L5 — `SubnetId(pub [u8; 16])` / `GroupId(pub [u8; 32])` inner field is public
 Both types expose the inner array as `pub`. The new tests in `capability.rs` rely on this for `SubnetId([0x55; 16])` construction. Consistent with the existing `Signature64(pub [u8; 64])` style, so probably intentional, but `from_bytes` already exists — the `pub` is redundant API surface.
 
-### L8 — `NodeId` type is fragmented across the crate
+### L6 — `NodeId` type is fragmented across the crate
 `allowed_nodes: Vec<u64>` matches the in-file `node_id: u64` style in `capability.rs`, but the project has `pub type NodeId = u64` in `behavior/placement.rs` AND `pub type NodeId = [u8; 32]` in `behavior/metadata.rs`. Not worth introducing a dependency in this change, just noting that "what is a NodeId?" has two answers in this crate.
 
 ---
@@ -106,4 +148,4 @@ Both types expose the inner array as `pub`. The new tests in `capability.rs` rel
 
 ## Summary
 
-Two real issues — H1 (cold-start permissive hole) and H2 (ordering trap) — both stem from the same place: the callee bridge assumes the self-announcement is the source of truth, but `serve_rpc` doesn't ensure one exists with the right tag set. A small `serve_rpc` change (lazy/forced self-announce that merges the new tag) fixes both at once. M1 (wire-side cap enforcement) is a smaller hardening step. Phases 1–3 are otherwise a clean, well-tested landing.
+Four HIGH issues cluster around two themes: the callee bridge / `serve_rpc` flow (H1, H2) needs a `serve_rpc`-side fix that lazily emits a default-permissive self-announce so `have_self_ann` is always true with the right tag merged; the CLI + index correctness (H3, H4) needs the `--node-id` flag to refuse binding mismatches and the membership-tag parser to behave deterministically across receivers. M3 (target-selection ordering) is the next-most-impactful — today's flow can return `CapabilityDenied` when an authorized peer exists. M1 (wire-side cap enforcement), M2 (plan-doc contradiction), and M4 (CLI dedup heuristic) are small hardening / clarity steps. Phases 1–3 are otherwise a clean, well-tested landing.
