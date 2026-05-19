@@ -149,3 +149,52 @@ Both types expose the inner array as `pub`. The new tests in `capability.rs` rel
 ## Summary
 
 Four HIGH issues cluster around two themes: the callee bridge / `serve_rpc` flow (H1, H2) needs a `serve_rpc`-side fix that lazily emits a default-permissive self-announce so `have_self_ann` is always true with the right tag merged; the CLI + index correctness (H3, H4) needs the `--node-id` flag to refuse binding mismatches and the membership-tag parser to behave deterministically across receivers. M3 (target-selection ordering) is the next-most-impactful — today's flow can return `CapabilityDenied` when an authorized peer exists. M1 (wire-side cap enforcement), M2 (plan-doc contradiction), and M4 (CLI dedup heuristic) are small hardening / clarity steps. Phases 1–3 are otherwise a clean, well-tested landing.
+
+---
+
+# Follow-up pass — post-fix review (2026-05-19)
+
+Branch tip after fixes: `93382058` ("behavior::{subnet,group}: tighten inner-field visibility to pub(crate)"). The first-pass findings above (H1–H4, M1–M4, L1–L5) all have visible fix commits + regression tests on this branch — verified via diff against `master`. New findings below were surfaced on a second read after the fix commits landed; all are LOW.
+
+## LOW
+
+### F1 — Stale doc-comments reference the pre-H4 "first valid tag wins" behavior
+After `parse_membership_tags` was rewritten to collapse multi-subnet announcements to `None`, two doc sites still describe the old strategy:
+
+- `net/crates/net/src/adapter/net/behavior/capability.rs` — `IndexedNode.subnet` field doc says "The first valid tag wins (lookup during index time); peers that declare zero or more than one resolve to `None`." The second clause is the new behavior; the first contradicts it.
+- Same file, inline comment in `CapabilityIndex::index()` — "First valid `subnet:<hex32>` tag wins — operators publishing multiple subnet tags are not in the model (the v0.4 gate treats them as opaque so picking the first one keeps lookups deterministic)." Picking the first one is exactly what H4 rejected.
+
+Fix: reword both to "Single distinct subnet tag → `Some`; zero or multiple distinct tags → `None` (out-of-model malformed input → no membership)." The rationale (determinism across receivers) is correct in both places — only the chosen strategy needs updating.
+
+### F2 — Bridge denial bypasses fold-side metrics
+`net/crates/net/src/adapter/net/mesh_rpc.rs:1626-1655`. The callee-side gate denial emits via the cloned `emit_for_bridge` closure directly, skipping `fold.apply`. The `RpcServerFold` constructed with `.with_metrics(metrics_handle)` increments per-service `RpcMetrics` counters inside its `apply` path — those bumps don't fire on the gate-denied path, so server-side dashboards show "0 requests" while clients see `RpcError::CapabilityDenied`.
+
+Fix: either route the denial through the fold (it already understands `RpcStatus` and can emit), or bump a dedicated `capability_denied` counter in the same closure that emits the rejection.
+
+### F3 — `index_self_with_local_services` diverges from `announce_capabilities_with`
+`net/crates/net/src/adapter/net/mesh.rs:6907-6927`. The sync self-index produces an announcement carrying the merged `user_caps` + `nrpc:<svc>` tags, but **omits** the `nat:*` piggyback tag and the `reflex_addr` field that the broadcast path adds at `mesh.rs:6988-7033`.
+
+Harmless today — the gate only consumes `nrpc:` — but a future change that gates on `nat:*` (e.g., requiring callers to be open-cone) would silently fail until the spawned re-announce lands and overwrites the local self-ann. The window is short but real.
+
+Fix: add a one-line note to the rustdoc on `index_self_with_local_services` calling out the divergence ("Skips the `nat:*` piggyback tag and `reflex_addr` field that `announce_capabilities_with` adds — re-broadcast covers peer-side visibility, and the gate is `nrpc:`-only at present."), so a future reader doesn't extend the gate to nat-based criteria and break the cold-start window.
+
+### F4 — CLI input normalization is inconsistent across allow-list parsers
+`net/crates/net/cli/src/commands/cap.rs`. `parse_node_id` calls `value.trim()` before parsing; `parse_subnets` and `parse_groups` don't — they pass the raw string to `strip_prefix` / `from_tag`. A user with a trailing space on `--allow-subnet "abcd…  "` gets an `invalid_args` rejection, but the same trailing space on `--allow-node` succeeds.
+
+Fix: `trim()` once at the top of each helper, or factor a shared `normalize(s: &str) -> &str` so the contract is uniform.
+
+### F5 — Spawned re-announce is uncovered
+`serve_rpc` spawns a `tokio::spawn(async move { announce_capabilities… })` to publish the merged self-ann to peers. The local self-index is regression-tested directly (`serve_rpc_self_indexes_announcement_with_nrpc_tag`), but no test pins that this task fires and completes. The conformance scenarios that call `serve_rpc` bypass propagation via `fold_announcement_everywhere`, so a refactor that accidentally dropped the spawn would still pass all six.
+
+Fix: short integration test that calls `serve_rpc` on node A, waits for the `nrpc:<service>` tag to appear in node B's `capability_index_arc().query(...)` without A calling `announce_capabilities` manually. Times out → spawn regressed.
+
+### F6 — Conformance tests depend implicitly on the auto-self-index version space
+`net/crates/net/tests/capability_auth_conformance.rs`. Scenarios 2/3/4 fold target announcements at version 100/200/300, specifically chosen to supersede the auto-self-index (v=1) and the spawned auto-announce (v=2). The "100/200/300" is undocumented headroom against an internal counter, so a future "let's start the test fixtures at v=1" cleanup would silently re-introduce a race where the spawned auto-announce overwrites the test's restrictive policy with a permissive one.
+
+Fix: helper-level comment on `target_announcement` (or on each scenario's fold call) — `// version chosen high enough to supersede the auto-self-index (v=1) and the spawned re-announce (v=2)`. Cheap, makes the dependency visible.
+
+---
+
+## Follow-up summary
+
+All six new findings are doc/cleanup-grade — no new HIGH or MED concerns introduced by the fix commits. F1 is the only one that's actively misleading to read; the rest are reinforcement (F2 metrics, F3 nat-tag note, F4 CLI normalization) or test-coverage hardening (F5 spawn coverage, F6 version-space contract). The branch is otherwise ready to ship.
