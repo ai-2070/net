@@ -1,0 +1,23 @@
+net/crates/net/src/bin/net-blob.rs
+  s_2571835e05521c::t_92b9407fbd75be 966-1159
+  s_2571835e05521c::t_0d616919a3bd60 232-250
+  s_2571835e05521c::t_87d119b4afcddf 314-319
+net/crates/net/src/adapter/net/dataforts/blob/stripe_index.rs
+  s_2571835e05521c::t_01147100407369 81-83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "7b8d2329d3073dc3875135c637becd54d7a5a799",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
