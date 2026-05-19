@@ -1351,6 +1351,87 @@ impl StreamingObserverState {
     }
 }
 
+/// Build a coalescing REQUEST_GRANT emitter.
+///
+/// Naive emitters `tokio::spawn` one publish task per consumed
+/// chunk, which becomes a spawn-storm + AEAD-storm under bursting.
+/// This helper hands back an emitter that pushes `(caller_origin,
+/// call_id, credits)` into an unbounded mpsc; a single dedicated
+/// drainer task `try_recv`s the queue to drain whatever is
+/// immediately available, coalesces credits per call_id, and
+/// publishes ONE batched REQUEST_GRANT per call per drain cycle.
+///
+/// Lifecycle: the drainer task lives as long as any clone of the
+/// returned emitter (mpsc sender count > 0). When the fold and all
+/// in-flight handlers release the emitter, `rx.recv` returns `None`
+/// and the drainer exits naturally.
+fn build_request_grant_emitter(
+    mesh: Arc<MeshNode>,
+    service: String,
+    server_origin: u64,
+    diag_tag: &'static str,
+) -> RpcRequestGrantEmitter {
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<(u64, u64, u32)>();
+    tokio::spawn(async move {
+        while let Some(first) = rx.recv().await {
+            let mut summed: std::collections::HashMap<(u64, u64), u32> =
+                std::collections::HashMap::new();
+            let (caller, call_id, credits) = first;
+            summed.insert((caller, call_id), credits);
+            // Coalesce anything immediately queued behind the first
+            // wake. Bounded by what the substrate has produced so
+            // far; doesn't add latency since `try_recv` returns
+            // immediately when the queue is empty.
+            while let Ok((caller, call_id, credits)) = rx.try_recv() {
+                let entry = summed.entry((caller, call_id)).or_insert(0);
+                *entry = entry.saturating_add(credits);
+            }
+            for ((caller, call_id), credits) in summed {
+                let reply_channel_name =
+                    format!("{service}.replies.{caller:016x}");
+                let reply_channel = match ChannelName::new(&reply_channel_name) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            channel = %reply_channel_name,
+                            tag = diag_tag,
+                            "rpc grant drainer: invalid reply channel name");
+                        continue;
+                    }
+                };
+                let meta = EventMeta::new(
+                    DISPATCH_RPC_REQUEST_GRANT,
+                    0,
+                    server_origin,
+                    call_id,
+                    0,
+                );
+                let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
+                buf.extend_from_slice(&meta.to_bytes());
+                buf.extend_from_slice(&encode_request_grant(call_id, credits));
+                let publisher =
+                    ChannelPublisher::new(reply_channel, PublishConfig::default());
+                if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
+                    tracing::warn!(
+                        error = %e,
+                        caller_origin = format!("{:#x}", caller),
+                        call_id,
+                        tag = diag_tag,
+                        "rpc grant drainer: REQUEST_GRANT publish failed");
+                }
+            }
+        }
+    });
+    Arc::new(move |caller_origin, call_id, credits| {
+        // Send failure means the drainer has exited (all sender
+        // clones dropped, then we somehow cloned a stale one).
+        // Treat as a no-op — the call is tearing down anyway.
+        let _ = tx.send((caller_origin, call_id, credits));
+    })
+}
+
 /// Shared CANCEL-publish helper: spawn a task that fires a
 /// CANCEL event for `call_id` to `target` on the request channel.
 /// Both [`RpcStream::Drop`] and [`UnaryCallGuard::Drop`] use it.
@@ -1675,38 +1756,15 @@ impl MeshNode {
             });
         });
 
-        // REQUEST_GRANT emitter — fire-and-forget per consumed
-        // chunk. Same reply-channel routing as the RESPONSE emit.
-        let emit_grant_mesh = Arc::clone(&mesh_for_emit);
-        let emit_grant_service = service_for_emit.clone();
-        let emit_grant: RpcRequestGrantEmitter =
-            Arc::new(move |caller_origin, call_id, credits| {
-                let mesh = Arc::clone(&emit_grant_mesh);
-                let service = emit_grant_service.clone();
-                tokio::spawn(async move {
-                    let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
-                    let reply_channel = match ChannelName::new(&reply_channel_name) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!(error = %e, channel = %reply_channel_name,
-                                "rpc serve_rpc_client_stream: invalid reply channel name (grant)");
-                            return;
-                        }
-                    };
-                    let meta =
-                        EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, server_origin, call_id, 0);
-                    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
-                    buf.extend_from_slice(&meta.to_bytes());
-                    buf.extend_from_slice(&encode_request_grant(call_id, credits));
-                    let publisher = ChannelPublisher::new(reply_channel, PublishConfig::default());
-                    if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
-                        tracing::warn!(error = %e,
-                            caller_origin = format!("{:#x}", caller_origin),
-                            call_id,
-                            "rpc serve_rpc_client_stream: REQUEST_GRANT publish failed");
-                    }
-                });
-            });
+        // REQUEST_GRANT emitter — coalesces per-chunk credits into
+        // a single drainer task that batches by call_id. Avoids the
+        // tokio::spawn-per-emit storm under bursting.
+        let emit_grant = build_request_grant_emitter(
+            Arc::clone(&mesh_for_emit),
+            service_for_emit.clone(),
+            server_origin,
+            "serve_rpc_client_stream",
+        );
 
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
         let fold = Arc::new(Mutex::new(
@@ -1928,38 +1986,14 @@ impl MeshNode {
             })
         });
 
-        // Request-direction grant emitter — same shape as
-        // serve_rpc_client_stream.
-        let emit_grant_mesh = Arc::clone(&mesh_for_emit);
-        let emit_grant_service = service_for_emit.clone();
-        let emit_grant: RpcRequestGrantEmitter =
-            Arc::new(move |caller_origin, call_id, credits| {
-                let mesh = Arc::clone(&emit_grant_mesh);
-                let service = emit_grant_service.clone();
-                tokio::spawn(async move {
-                    let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
-                    let reply_channel = match ChannelName::new(&reply_channel_name) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!(error = %e, channel = %reply_channel_name,
-                                "rpc serve_rpc_duplex: invalid reply channel name (grant)");
-                            return;
-                        }
-                    };
-                    let meta =
-                        EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, server_origin, call_id, 0);
-                    let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
-                    buf.extend_from_slice(&meta.to_bytes());
-                    buf.extend_from_slice(&encode_request_grant(call_id, credits));
-                    let publisher = ChannelPublisher::new(reply_channel, PublishConfig::default());
-                    if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
-                        tracing::warn!(error = %e,
-                            caller_origin = format!("{:#x}", caller_origin),
-                            call_id,
-                            "rpc serve_rpc_duplex: REQUEST_GRANT publish failed");
-                    }
-                });
-            });
+        // Request-direction grant emitter — same coalescing
+        // drainer shape as serve_rpc_client_stream.
+        let emit_grant = build_request_grant_emitter(
+            Arc::clone(&mesh_for_emit),
+            service_for_emit.clone(),
+            server_origin,
+            "serve_rpc_duplex",
+        );
 
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
         let fold = Arc::new(Mutex::new(
