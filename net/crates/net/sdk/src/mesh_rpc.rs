@@ -666,6 +666,7 @@ impl Mesh {
         Ok(DuplexCallTyped {
             inner,
             codec: opts.codec,
+            done: false,
             _req: std::marker::PhantomData,
             _resp: std::marker::PhantomData,
         })
@@ -1109,6 +1110,11 @@ impl<Req: Serialize, Resp: DeserializeOwned> ClientStreamCallTyped<Req, Resp> {
 pub struct DuplexCallTyped<Req, Resp> {
     inner: DuplexCallRaw,
     codec: Codec,
+    /// Latched true after the response stream surfaces a terminal
+    /// state (decode error, raw error, EOF). Subsequent `poll_next`
+    /// calls return `Ready(None)` — matches the contract that
+    /// [`DuplexStreamTyped`] enforces.
+    done: bool,
     _req: std::marker::PhantomData<fn(Req)>,
     _resp: std::marker::PhantomData<fn() -> Resp>,
 }
@@ -1166,17 +1172,29 @@ impl<Req, Resp: DeserializeOwned + Unpin> futures::Stream for DuplexCallTyped<Re
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
         let codec = self.codec;
         match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
             std::task::Poll::Ready(Some(Ok(bytes))) => match codec.decode::<Resp>(&bytes) {
                 Ok(value) => std::task::Poll::Ready(Some(Ok(value))),
-                Err(e) => std::task::Poll::Ready(Some(Err(RpcError::Codec {
-                    direction: CodecDirection::Decode,
-                    message: format!("duplex typed decode: {e}"),
-                }))),
+                Err(e) => {
+                    self.done = true;
+                    std::task::Poll::Ready(Some(Err(RpcError::Codec {
+                        direction: CodecDirection::Decode,
+                        message: format!("duplex typed decode: {e}"),
+                    })))
+                }
             },
-            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Ready(Some(Err(e))) => {
+                self.done = true;
+                std::task::Poll::Ready(Some(Err(e)))
+            }
+            std::task::Poll::Ready(None) => {
+                self.done = true;
+                std::task::Poll::Ready(None)
+            }
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }

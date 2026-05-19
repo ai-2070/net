@@ -345,6 +345,95 @@ async fn duplex_typed_into_split_lets_halves_run_independently() {
     }
 }
 
+/// Regression (cubic-dev-ai bot P2): `DuplexCallTyped` must
+/// terminate after a decode error, matching `DuplexStreamTyped`'s
+/// contract. Before this fix the typed call path never latched
+/// `done`, so a poll after the codec error could return another
+/// item from the inner substrate stream (inconsistent semantics
+/// between the unified and split duplex handles).
+///
+/// Server emits two responses: a well-formed JSON Summary, then a
+/// non-decodable body. The typed caller asserts that the second
+/// poll returns `Err(Codec/Decode)` and the third poll returns
+/// `None` — NOT another item.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplex_typed_call_terminates_after_decode_error() {
+    use net_sdk::mesh_rpc::{CodecDirection, RpcResponseSink};
+
+    let psk = [0x42u8; 32];
+    let (caller, server, addr_server) = two_meshes(&psk).await;
+    handshake(&caller, &server, addr_server).await;
+
+    struct MixedShapeHandler;
+    #[async_trait::async_trait]
+    impl net_sdk::mesh_rpc::RpcDuplexHandler for MixedShapeHandler {
+        async fn call(
+            &self,
+            _ctx: RpcStreamingContext,
+            mut requests: RequestStream,
+            responses: RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            while requests.next().await.is_some() {}
+            // First: valid Summary JSON.
+            responses.send(Bytes::from_static(b"{\"count\":7}"));
+            // Second: non-decodable. Triggers the typed decode err.
+            responses.send(Bytes::from_static(b"not-json"));
+            // Third: another valid Summary — MUST NOT surface
+            // (the typed caller's stream latched done on the
+            // previous decode error).
+            responses.send(Bytes::from_static(b"{\"count\":99}"));
+            Ok(())
+        }
+    }
+
+    let _serve = server
+        .serve_rpc_duplex("mixed_shape", Arc::new(MixedShapeHandler))
+        .expect("serve_rpc_duplex");
+
+    let mut call = caller
+        .call_duplex_typed::<Item, Summary>(
+            server.inner().node_id(),
+            "mixed_shape",
+            CallOptionsTyped::default(),
+        )
+        .await
+        .expect("call_duplex_typed");
+    call.finish_sending().await.expect("finish_sending");
+
+    let ok = call
+        .next()
+        .await
+        .expect("first response")
+        .expect("first decode");
+    assert_eq!(ok, Summary { count: 7 });
+
+    let err = call.next().await.expect("second response").expect_err(
+        "decode error on second response must surface as RpcError::Codec",
+    );
+    match err {
+        RpcError::Codec { direction, message } => {
+            assert_eq!(direction, CodecDirection::Decode);
+            assert!(
+                message.contains("duplex typed decode"),
+                "diagnostic must name the call path: {message}",
+            );
+        }
+        other => panic!("expected Codec(Decode), got {other:?}"),
+    }
+
+    // After the decode error, the next poll MUST return None even
+    // though the substrate stream still has a third frame queued.
+    // This is the cubic-dev-ai regression: previously DuplexCallTyped
+    // would keep polling the substrate and surface the third frame.
+    let next = tokio::time::timeout(Duration::from_millis(200), call.next())
+        .await
+        .expect("must complete (not block)");
+    assert!(
+        next.is_none(),
+        "DuplexCallTyped must latch done after decode error; got: {next:?}",
+    );
+}
+
 /// Regression (cubic-dev-ai bot P2): `into_chunked()` must carry
 /// over the source's `seen_first` state. Before this fix, calling
 /// `into_chunked()` after partially consuming a `RequestStreamTyped`
