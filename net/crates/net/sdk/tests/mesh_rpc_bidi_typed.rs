@@ -407,9 +407,11 @@ async fn duplex_typed_call_terminates_after_decode_error() {
         .expect("first decode");
     assert_eq!(ok, Summary { count: 7 });
 
-    let err = call.next().await.expect("second response").expect_err(
-        "decode error on second response must surface as RpcError::Codec",
-    );
+    let err = call
+        .next()
+        .await
+        .expect("second response")
+        .expect_err("decode error on second response must surface as RpcError::Codec");
     match err {
         RpcError::Codec { direction, message } => {
             assert_eq!(direction, CodecDirection::Decode);

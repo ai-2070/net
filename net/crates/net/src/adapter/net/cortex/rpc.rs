@@ -5526,8 +5526,7 @@ mod tests {
         let mut fold = RpcClientFold::new(pending.clone());
         let (_terminal_rx_victim, mut grant_rx_victim) =
             pending.register_client_streaming(0xC0DE, 0);
-        let (_terminal_rx_other, mut grant_rx_other) =
-            pending.register_client_streaming(0xBEEF, 0);
+        let (_terminal_rx_other, mut grant_rx_other) = pending.register_client_streaming(0xBEEF, 0);
 
         // Build a hand-rolled frame: meta names call 0xC0DE,
         // payload encodes credit for call 0xBEEF. Either the
