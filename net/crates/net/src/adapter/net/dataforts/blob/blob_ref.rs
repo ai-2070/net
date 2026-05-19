@@ -783,6 +783,31 @@ impl BlobRef {
                 super::blob_tree::MAX_TREE_DEPTH
             )));
         }
+        // Defensive depth-vs-size lower bound. A well-formed depth=N
+        // tree (N >= 2) requires AT LEAST TREE_FANOUT^(N-1) bytes
+        // to be productive — depth=2 needs > FANOUT (128) bytes
+        // for an Internal root to be useful, depth=3 needs >
+        // FANOUT^2 = 16 384, depth=4 needs > FANOUT^3 ≈ 2 M. A
+        // manifest claiming depth=4 + total_size=1 is structurally
+        // malformed (a single chunk can't justify three internal
+        // levels) — reject before any walk traffic happens. The
+        // walker's depth-shortening check would catch this too,
+        // but at the cost of a round trip to fetch the root.
+        if body.depth >= 2 {
+            let exp = body.depth as u32 - 1;
+            // Compute FANOUT^exp using checked_pow; on overflow
+            // the depth is at the cap and the lower bound is
+            // satisfied by any reasonable total_size, so skip the
+            // check in that direction.
+            if let Some(min_size) = (super::blob_tree::TREE_FANOUT as u64).checked_pow(exp) {
+                if body.total_size < min_size {
+                    return Err(BlobError::Decode(format!(
+                        "tree depth {} requires total_size >= {} (TREE_FANOUT^(depth-1)); got {}",
+                        body.depth, min_size, body.total_size
+                    )));
+                }
+            }
+        }
         Ok(Self::Tree {
             version,
             uri: body.uri,
@@ -1876,6 +1901,34 @@ mod tests {
         let err = BlobRef::decode(&bytes).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("exceeds cap"), "got: {msg}");
+    }
+
+    #[test]
+    fn tree_decode_rejects_depth_inconsistent_with_total_size() {
+        // depth=4 against a 1-byte total_size is structurally
+        // malformed — TREE_FANOUT^3 ≈ 2 M bytes is the lower bound
+        // for a productive depth-4 tree. Pre-fix the walker
+        // would still catch the mismatch at fetch time, but the
+        // decode-side check short-circuits before any walk traffic.
+        let body = TreeBody {
+            body_version: BLOB_TREE_BODY_VERSION,
+            uri: "mesh://x".to_string(),
+            encoding: Encoding::Replicated,
+            root_hash: tree_root(),
+            total_size: 1,
+            depth: 4,
+        };
+        let body_bytes = postcard::to_allocvec(&body).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&BLOB_REF_MAGIC);
+        bytes.push(BLOB_REF_VERSION_V3_TREE);
+        bytes.extend_from_slice(&body_bytes);
+        let err = BlobRef::decode(&bytes).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires total_size >="),
+            "expected depth-vs-size lower-bound error; got: {msg}",
+        );
     }
 
     #[test]
