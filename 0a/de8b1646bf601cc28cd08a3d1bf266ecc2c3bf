@@ -1,0 +1,21 @@
+net/crates/net/Cargo.toml
+  s_1d50b1bfb9695d::t_57f6faf2546200 211-217
+net/crates/net/src/adapter/net/dataforts/blob/blob_tree_cache.rs
+  s_1d50b1bfb9695d::t_57bf0ba6800808 24-29,41-43,45-46,59-65,79-90,103-105,122-132,157-162,164-172,187,238,250-256,270,274-278,282,286-288,290-298,302-306,308-312,317-320,322,326-334,338-342,344-345,349-354,358-364
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "0ade8b1646bf601cc28cd08a3d1bf266ecc2c3bf",
+  "prompts": {},
+  "sessions": {
+    "s_1d50b1bfb9695d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9503e0d0-18d5-41d8-b49a-965f66c4843c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
