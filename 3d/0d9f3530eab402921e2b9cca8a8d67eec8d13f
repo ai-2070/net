@@ -1,0 +1,39 @@
+net/crates/net/bindings/python/python/net/__init__.py
+  s_2571835e05521c::t_5aaa9010df4fde 120,139
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_2571835e05521c::t_1857a0cb44e637 129-131
+net/crates/net/bindings/go/net/mesh_rpc.go
+  s_2571835e05521c::t_fbce4020bc4fb5 377-378
+  s_2571835e05521c::t_0b647ca1b8718c 41-47
+  s_2571835e05521c::t_3a4304ce97ec58 341-348
+net/crates/net/bindings/python/python/net/mesh_rpc.py
+  s_2571835e05521c::t_1b6572d098e990 459-467
+  s_2571835e05521c::t_c7bd513f72aff1 47,67
+  s_2571835e05521c::t_77ee9cbc098a70 411
+  s_2571835e05521c::t_936f37c95c8805 792
+net/crates/net/bindings/node/errors.ts
+  s_2571835e05521c::t_6de29dc2843864 149-163
+  s_2571835e05521c::t_e2c2d9357bac65 228-229
+  s_2571835e05521c::t_eb3a246d806544 43-51
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  s_2571835e05521c::t_ae2b9a112c1053 2149
+net/crates/net/bindings/node/mesh_rpc.ts
+  s_2571835e05521c::t_5689bc18ccc794 564
+  s_2571835e05521c::t_f7ab6c851d19f6 530,535-537
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "3d0d9f3530eab402921e2b9cca8a8d67eec8d13f",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
