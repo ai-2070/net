@@ -35,12 +35,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use net::adapter::net::cortex::{
-    classify_streaming_chunk, EventMeta, RequestStream, RpcAsyncResponseEmitter, RpcClientFold,
-    RpcClientPending, RpcClientStreamingHandler, RpcDuplexFold, RpcDuplexHandler, RpcHandlerError,
-    RpcRequestChunkPayload, RpcRequestPayload, RpcResponseEmitter, RpcResponsePayload,
-    RpcResponseSink, RpcStatus, RpcStreamingContext, RpcStreamingRequestFold, StreamingChunkKind,
-    DISPATCH_RPC_REQUEST, DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_RESPONSE, EVENT_META_SIZE,
-    FLAG_RPC_CLIENT_STREAMING_REQUEST, FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE,
+    classify_streaming_chunk, encode_request_grant, EventMeta, RequestStream,
+    RpcAsyncResponseEmitter, RpcClientFold, RpcClientPending, RpcClientStreamingHandler,
+    RpcDuplexFold, RpcDuplexHandler, RpcHandlerError, RpcRequestChunkPayload, RpcRequestPayload,
+    RpcResponseEmitter, RpcResponsePayload, RpcResponseSink, RpcStatus, RpcStreamingContext,
+    RpcStreamingRequestFold, StreamingChunkKind, DISPATCH_RPC_REQUEST, DISPATCH_RPC_REQUEST_CHUNK,
+    DISPATCH_RPC_RESPONSE, EVENT_META_SIZE, FLAG_RPC_CLIENT_STREAMING_REQUEST,
+    FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE,
 };
 use net::adapter::net::redex::{RedexEntry, RedexEvent, RedexFold};
 use parking_lot::Mutex;
@@ -534,6 +535,84 @@ fn fixture_metadata_matches_canonical_contract() {
         fx.canonical_flag_end_placement.is_some(),
         "fixture must document the canonical FLAG_END placement rule",
     );
+}
+
+/// Byte-exact wire snapshot pinning. The substrate codec MUST
+/// produce exactly the hex bytes documented in
+/// `golden_vectors_streaming.json::wire_snapshots`. Catches
+/// endianness flips, padding drift, header packing changes, and
+/// flag-bit layout drift that the JSON-only ok_cases would miss.
+/// Per-binding ports run the same assertion against their own
+/// native encoder.
+#[test]
+fn wire_snapshots_match_fixture() {
+    let raw = include_str!("cross_lang_nrpc/golden_vectors_streaming.json");
+    let fixture: JsonValue = serde_json::from_str(raw).expect("fixture parses");
+    let snapshots = fixture
+        .get("wire_snapshots")
+        .expect("fixture has wire_snapshots section");
+
+    // 1. Initial REQUEST payload (client-streaming flag set).
+    let req = RpcRequestPayload {
+        service: "test".to_string(),
+        deadline_ns: 0,
+        flags: FLAG_RPC_CLIENT_STREAMING_REQUEST,
+        headers: vec![],
+        body: b"hello".to_vec(),
+    };
+    let req_bytes = req.encode();
+    let req_hex = hex_string(&req_bytes);
+    let expected_req = snapshots
+        .get("request_payload_minimal_clientstream")
+        .and_then(|v| v.get("hex"))
+        .and_then(|v| v.as_str())
+        .expect("fixture has request_payload_minimal_clientstream.hex");
+    assert_eq!(
+        req_hex, expected_req,
+        "RpcRequestPayload encoding drifted from canonical wire snapshot",
+    );
+
+    // 2. REQUEST_CHUNK payload with FLAG_END set.
+    let chunk = RpcRequestChunkPayload {
+        call_id: 42,
+        flags: FLAG_RPC_REQUEST_END,
+        headers: vec![],
+        body: b"bye".to_vec(),
+    };
+    let chunk_bytes = chunk.encode();
+    let chunk_hex = hex_string(&chunk_bytes);
+    let expected_chunk = snapshots
+        .get("request_chunk_payload_with_end")
+        .and_then(|v| v.get("hex"))
+        .and_then(|v| v.as_str())
+        .expect("fixture has request_chunk_payload_with_end.hex");
+    assert_eq!(
+        chunk_hex, expected_chunk,
+        "RpcRequestChunkPayload encoding drifted from canonical wire snapshot",
+    );
+
+    // 3. REQUEST_GRANT payload (note: call_id is u64 LE, credits
+    //    is u32 BE — bindings MUST preserve the asymmetry).
+    let grant_bytes = encode_request_grant(42, 8);
+    let grant_hex = hex_string(&grant_bytes);
+    let expected_grant = snapshots
+        .get("request_grant_payload")
+        .and_then(|v| v.get("hex"))
+        .and_then(|v| v.as_str())
+        .expect("fixture has request_grant_payload.hex");
+    assert_eq!(
+        grant_hex, expected_grant,
+        "encode_request_grant drifted from canonical wire snapshot",
+    );
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        write!(&mut s, "{b:02x}").expect("write to String");
+    }
+    s
 }
 
 /// Validate the `error_cases` fixture section: every documented

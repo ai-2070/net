@@ -1,6 +1,41 @@
 {
   "abi_version_expected": 2,
   "description": "Canonical cross-binding nRPC compatibility fixture for the client-streaming + duplex shapes shipped under NET_RPC_ABI_VERSION = 0x0002 (NRPC_BINDINGS_PLAN.md Phase 2). Two services, each with a documented contract and a fixed set of ok_cases. Every binding's wire-format compat test loads this file and asserts: encoding the request stream on each side, dispatching through the canonical handler, and decoding the response stream yields outputs that semantically match the fixture. Status codes, header names, and the JSON shapes are all part of the contract.",
+  "wire_snapshots": {
+    "description": "Byte-exact hex snapshots of canonical RPC payload encodings, taken at the wire level (after meta serialization). Bindings re-encoding the same logical inputs MUST produce the same bytes; drift on endianness, padding, header packing, or flag-bit layout is an inter-binding wire bug, not a semantic difference the JSON-only ok_cases would catch. The substrate-side test wire_snapshots_match_fixture exercises the Rust codec against these; per-binding ports run the same assertion against their native encoders.",
+    "request_payload_minimal_clientstream": {
+      "inputs": {
+        "service": "test",
+        "deadline_ns": 0,
+        "flags_hex": "0x0010",
+        "flags_named": ["FLAG_RPC_CLIENT_STREAMING_REQUEST"],
+        "headers": [],
+        "body_utf8": "hello"
+      },
+      "hex": "047465737400000000000000001000000500000068656c6c6f",
+      "byte_count": 25
+    },
+    "request_chunk_payload_with_end": {
+      "inputs": {
+        "call_id": 42,
+        "flags_hex": "0x0020",
+        "flags_named": ["FLAG_RPC_REQUEST_END"],
+        "headers": [],
+        "body_utf8": "bye"
+      },
+      "hex": "2a0000000000000020000003000000627965",
+      "byte_count": 18
+    },
+    "request_grant_payload": {
+      "inputs": {
+        "call_id": 42,
+        "credits": 8
+      },
+      "hex": "2a0000000000000000000008",
+      "byte_count": 12,
+      "endianness_note": "call_id is u64 little-endian; credits is u32 big-endian. The asymmetry mirrors encode_stream_grant from Phase 3 — bindings MUST preserve it."
+    }
+  },
   "canonical_flag_end_placement": {
     "rule": "FLAG_RPC_REQUEST_END is carried by the LAST chunk that contains user data, not a trailing empty-body terminator. Bindings emitting `request_items = [a, b, c]` MUST set FLAG_END on the chunk carrying `c` (not on a fourth empty chunk). For the 1-item case the FLAG_END rides on the ONE chunk that carries that item. For the empty-items case, the initial REQUEST itself carries FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_REQUEST_END with an empty body (the 'pure terminator' fast path).",
     "rationale": "Trailing-empty-FLAG_END was tolerated by the Rust substrate's terminator-semantics rule (empty body + FLAG_END = pure terminator, suppressed from the handler's stream) but it costs an extra event per call. Pinning the data-bearing-FLAG_END as canonical keeps all bindings byte-identical on the wire and avoids the substrate's 'is_pure_terminator' branch.",
