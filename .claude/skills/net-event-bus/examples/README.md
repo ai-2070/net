@@ -6,7 +6,7 @@ All examples use the **memory transport** (no network, no peers needed) and run 
 
 | File | SDK | Run |
 |---|---|---|
-| `hello.ts` | `@ai2070/net-sdk` | `npx tsx hello.ts` |
+| `hello.ts` | `@net-mesh/sdk` | `npx tsx hello.ts` |
 | `hello.py` | `net-sdk` | `python hello.py` |
 | `hello.rs` | `net-sdk` | `cargo run --example hello` (drop into a crate's `examples/` dir) |
 | `hello.go` | `github.com/ai-2070/net/go` | `go run hello.go` |

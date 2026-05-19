@@ -284,12 +284,12 @@ impl BookmarkStore {
 }
 
 /// Resolve the default bookmark-file path:
-/// `$XDG_CONFIG_HOME/deck/bookmarks.toml` (Linux/Mac) or
-/// `%APPDATA%\deck\bookmarks.toml` (Windows). Returns
+/// `$XDG_CONFIG_HOME/net-deck/bookmarks.toml` (Linux/Mac) or
+/// `%APPDATA%\net-deck\bookmarks.toml` (Windows). Returns
 /// [`BookmarkError::NoConfigDir`] when neither resolves.
 pub fn default_path() -> Result<PathBuf, BookmarkError> {
     let mut dir = dirs::config_dir().ok_or(BookmarkError::NoConfigDir)?;
-    dir.push("deck");
+    dir.push("net-deck");
     dir.push("bookmarks.toml");
     Ok(dir)
 }

@@ -28,7 +28,7 @@ use std::process::Stdio;
 
 #[test]
 fn code_0_on_success() {
-    Command::cargo_bin("net")
+    Command::cargo_bin("net-mesh")
         .unwrap()
         .arg("version")
         .assert()
@@ -42,7 +42,7 @@ fn code_1_on_generic_error_missing_identity_file() {
     // operator who happens to have a `this/path/...` folder.
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("definitely-does-not-exist.toml");
-    Command::cargo_bin("net")
+    Command::cargo_bin("net-mesh")
         .unwrap()
         .args(["identity", "show"])
         .arg(&missing)
@@ -52,7 +52,7 @@ fn code_1_on_generic_error_missing_identity_file() {
 
 #[test]
 fn code_2_on_invalid_args_unknown_flag() {
-    Command::cargo_bin("net")
+    Command::cargo_bin("net-mesh")
         .unwrap()
         .args(["snapshot", "get", "--this-flag-does-not-exist"])
         .assert()
@@ -61,7 +61,7 @@ fn code_2_on_invalid_args_unknown_flag() {
 
 #[test]
 fn code_2_on_invalid_args_unknown_subcommand() {
-    Command::cargo_bin("net")
+    Command::cargo_bin("net-mesh")
         .unwrap()
         .arg("this-subcommand-does-not-exist")
         .assert()
@@ -74,7 +74,7 @@ fn code_2_on_invalid_log_level() {
     // own handler, not clap, so it surfaces as code 2
     // (InvalidArgs) — confirms our manual parser routes through
     // the typed error surface.
-    Command::cargo_bin("net")
+    Command::cargo_bin("net-mesh")
         .unwrap()
         .args(["log", "tail", "--min-level", "no-such-level"])
         .assert()
@@ -88,7 +88,7 @@ fn code_8_on_ice_confirmation_refused_non_tty() {
     // refuses to sign with an ephemeral keypair.
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("op.toml");
-    Command::cargo_bin("net")
+    Command::cargo_bin("net-mesh")
         .unwrap()
         .args(["identity", "generate", "--out"])
         .arg(&identity)
@@ -100,7 +100,7 @@ fn code_8_on_ice_confirmation_refused_non_tty() {
     // sets stdin to `Stdio::null()` by default which is already
     // non-TTY, but pinning the configuration explicitly here
     // keeps the test legible.
-    Command::cargo_bin("net")
+    Command::cargo_bin("net-mesh")
         .unwrap()
         .args(["ice", "freeze-cluster", "--ttl", "5m", "--identity"])
         .arg(&identity)

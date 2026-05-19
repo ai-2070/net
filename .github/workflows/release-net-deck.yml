@@ -1,0 +1,62 @@
+name: Release net-deck
+
+# Publishes `net-deck` (the operator cyberdeck TUI at
+# `crates/net/deck/`) to crates.io.
+#
+# Tag schema: `deck-v<semver>` (e.g. `deck-v0.19.0`).
+#
+# Required repository secret: `CARGO_REGISTRY_TOKEN`
+#   Generate at https://crates.io/me with the `publish-update` scope
+#   restricted to `net-deck` after the first publish completes. The
+#   first publish requires a wider scope (or a broader account-level
+#   token) because crates.io scopes can only be set on existing
+#   crates.
+#
+# Prebuilt-binary distribution (tarballs, install script, Homebrew
+# formula, cargo-binstall metadata) + the `@net-mesh/deck` npm shim
+# land in a follow-up release pipeline — out of scope for this
+# crates.io-only first slice.
+
+on:
+  push:
+    tags:
+      - "deck-v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish net-deck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-publish-deck-${{ hashFiles('**/Cargo.lock') }}
+
+      # `net-deck` depends on `net-mesh-sdk` (which depends on
+      # `net-mesh`). Both must already exist on crates.io at the
+      # version this crate's Cargo.toml pins, so run `release-crates`
+      # first when the workspace version bumps.
+      - name: cargo publish --dry-run (net-deck)
+        working-directory: net/crates/net/deck
+        run: cargo publish --dry-run
+
+      - name: Publish net-deck
+        working-directory: net/crates/net/deck
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish

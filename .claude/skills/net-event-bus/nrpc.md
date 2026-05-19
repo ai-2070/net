@@ -123,17 +123,17 @@ let resp: EchoSumResponse = client.call_typed(
 
 Resilience helpers live in `net_sdk::mesh_rpc_resilience`: `RetryPolicy::default()` + `Mesh::call_with_retry`, `HedgePolicy::default()` + the per-target hedge helpers, `CircuitBreaker::new(CircuitBreakerConfig)`.
 
-### TypeScript (`@ai2070/net/mesh_rpc`)
+### TypeScript (`@net-mesh/core/mesh_rpc`)
 
 The SDK's `MeshNode` wraps a `NetMesh` that nRPC consumes directly; the typed surface itself lives in the napi binding (sdk-ts doesn't yet re-export):
 
 ```typescript
-import { MeshNode } from '@ai2070/net-sdk'
-import { classifyError, RpcServerError } from '@ai2070/net/errors'
+import { MeshNode } from '@net-mesh/sdk'
+import { classifyError, RpcServerError } from '@net-mesh/core/errors'
 import {
   CircuitBreaker, HedgePolicy, NRPC_TYPED_BAD_REQUEST,
   RetryPolicy, TypedMeshRpc,
-} from '@ai2070/net/mesh_rpc'
+} from '@net-mesh/core/mesh_rpc'
 
 interface EchoSumRequest  { text: string; numbers: number[] }
 interface EchoSumResponse { echo: string; sum: number }

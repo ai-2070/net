@@ -20,7 +20,7 @@ const SUBCOMMANDS: &[&str] = &[
 
 #[test]
 fn help_succeeds() {
-    Command::cargo_bin("net")
+    Command::cargo_bin("net-mesh")
         .unwrap()
         .arg("--help")
         .assert()
@@ -32,7 +32,7 @@ fn help_succeeds() {
 fn version_flag_succeeds() {
     // Track `Cargo.toml:version` via `env!` so a workspace bump
     // doesn't silently invalidate the assertion.
-    Command::cargo_bin("net")
+    Command::cargo_bin("net-mesh")
         .unwrap()
         .arg("--version")
         .assert()
@@ -43,7 +43,7 @@ fn version_flag_succeeds() {
 #[test]
 fn every_top_level_subcommand_has_help() {
     for sub in SUBCOMMANDS {
-        let assert = Command::cargo_bin("net")
+        let assert = Command::cargo_bin("net-mesh")
             .unwrap()
             .args([sub, "--help"])
             .assert();
@@ -53,7 +53,7 @@ fn every_top_level_subcommand_has_help() {
 
 #[test]
 fn version_subcommand_emits_json() {
-    let output = Command::cargo_bin("net")
+    let output = Command::cargo_bin("net-mesh")
         .unwrap()
         .arg("version")
         .output()

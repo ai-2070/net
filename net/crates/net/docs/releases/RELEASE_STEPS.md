@@ -17,16 +17,16 @@ git tag vX && git push origin vX
 # Rust crates → crates.io
 git tag crates-vX && git push origin crates-vX
 
-# Python binding wheels → PyPI (`ai2070-net`)
+# Python binding wheels → PyPI (`net-mesh`)
 git tag python-vX && git push origin python-vX
 
-# Python SDK → PyPI (`ai2070-net-sdk`)
+# Python SDK → PyPI (`net-mesh-sdk`)
 git tag pypi-sdk-vX && git push origin pypi-sdk-vX
 
-# Node binding → npm (`@ai2070/net`)
+# Node binding → npm (`@net-mesh/core`)
 git tag node-vX && git push origin node-vX
 
-# TS SDK → npm (`@ai2070/net-sdk`)
+# TS SDK → npm (`@net-mesh/sdk`)
 git tag npm-sdk-vX && git push origin npm-sdk-vX
 ```
 

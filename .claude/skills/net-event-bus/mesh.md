@@ -70,7 +70,7 @@ async fn main() -> net_sdk::error::Result<()> {
 ### TypeScript
 
 ```typescript
-import { MeshNode } from '@ai2070/net-sdk';
+import { MeshNode } from '@net-mesh/sdk';
 
 const psk = '0'.repeat(64);                       // 64 hex chars = 32 bytes
 const seed = Buffer.alloc(32, 0x42);              // load from secret store in production
@@ -95,7 +95,7 @@ await nodeA.shutdown();
 - `MeshNode.create(config)` is async; `start()` is async too (napi binding requires the tokio reactor) — both must be `await`ed.
 - `psk` is hex-encoded (`'0'.repeat(64)` = 32 zero bytes). `identitySeed` is a 32-byte `Buffer`; omit to mint an ephemeral one (entity_id changes every restart — almost never what you want).
 - `accept(peerNodeId)` returns the resolved wire address (`bindings/node/index.d.ts:655`). Ordering contract is the same as Rust: every `accept()` must complete before `start()`.
-- The lower-level NAPI surface (`@ai2070/net`'s `NetMesh`) exposes `findNodes`, `connectDirect`, `natType`, etc. The SDK wrapper (`@ai2070/net-sdk`'s `MeshNode`) covers the common pub/sub path — drop down to NAPI for NAT-traversal knobs.
+- The lower-level NAPI surface (`@net-mesh/core`'s `NetMesh`) exposes `findNodes`, `connectDirect`, `natType`, etc. The SDK wrapper (`@net-mesh/sdk`'s `MeshNode`) covers the common pub/sub path — drop down to NAPI for NAT-traversal knobs.
 
 ### Python
 
@@ -208,7 +208,7 @@ The three counters (`punches_attempted`, `punches_succeeded`, `relay_fallbacks`)
 
 `connect_direct` always resolves: on a punch-failed outcome, the session lands on the routed-handshake path. Inspect `traversal_stats` afterward to distinguish a successful punch from a relay fallback (`net/crates/net/sdk/src/mesh.rs:937-973`).
 
-The `nat_type` / `connect_direct` / `traversal_stats` surface is on the lower-level binding (`@ai2070/net`'s `NetMesh` in TS, `from net import NetMesh` in Python). The Rust SDK exposes them on `Mesh` directly behind `#[cfg(feature = "nat-traversal")]`.
+The `nat_type` / `connect_direct` / `traversal_stats` surface is on the lower-level binding (`@net-mesh/core`'s `NetMesh` in TS, `from net import NetMesh` in Python). The Rust SDK exposes them on `Mesh` directly behind `#[cfg(feature = "nat-traversal")]`.
 
 ---
 

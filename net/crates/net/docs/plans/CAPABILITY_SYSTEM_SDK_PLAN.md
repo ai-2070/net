@@ -161,7 +161,7 @@ The substrate ships the `Predicate` enum + the `pred!` macro. Other languages ne
 
 ```typescript
 // sdk-ts — fluent / chainable
-import { p } from '@ai2070/net/capability'
+import { p } from '@net-mesh/core/capability'
 
 const pred = p.and(
   p.exists('hardware.gpu'),
@@ -271,7 +271,7 @@ const placement = placementFilterFromFn((nodeId, artifact, caps) => {
 The substrate ships `IntentRegistry::defaults()` with a baseline mapping. Per-deployment customization happens via `register()`. Bindings expose this directly:
 
 ```typescript
-import { IntentRegistry, requireTag, requireAxisValue } from '@ai2070/net/capability'
+import { IntentRegistry, requireTag, requireAxisValue } from '@net-mesh/core/capability'
 
 const registry = IntentRegistry.defaults()
 registry.register('quantum-research', [
@@ -391,7 +391,7 @@ const AXIS_SCHEMA: AxisSchema = AxisSchema {
 
 ```typescript
 // sdk-ts — `.d.ts` types over `caps.views()` output; tsc enforces at build time
-import type { HardwareView, SoftwareView } from '@ai2070/net/capability/schema'
+import type { HardwareView, SoftwareView } from '@net-mesh/core/capability/schema'
 const v = caps.views()
 const vram: number | null = v.hardware.gpu?.vramGb ?? null   // typed
 ```

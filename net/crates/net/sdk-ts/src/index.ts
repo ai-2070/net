@@ -1,9 +1,9 @@
 /**
- * @ai2070/net-sdk — Ergonomic TypeScript SDK for the Net mesh network.
+ * @net-mesh/sdk — Ergonomic TypeScript SDK for the Net mesh network.
  *
  * @example
  * ```typescript
- * import { NetNode } from '@ai2070/net-sdk';
+ * import { NetNode } from '@net-mesh/sdk';
  *
  * const node = await NetNode.create({ shards: 4 });
  *
@@ -278,7 +278,7 @@ export type {
 
 // Redis Streams consumer-side dedup helper.
 // NAPI re-export so users can `import { RedisStreamDedup } from
-// '@ai2070/net-sdk'` instead of reaching into the underlying NAPI
+// '@net-mesh/sdk'` instead of reaching into the underlying NAPI
 // module directly.
 export { RedisStreamDedup } from './redis-dedup';
 

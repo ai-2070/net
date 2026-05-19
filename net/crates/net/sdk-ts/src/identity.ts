@@ -5,7 +5,7 @@
  *
  * @example
  * ```ts
- * import { Identity, TokenScope } from '@ai2070/net-sdk';
+ * import { Identity, TokenScope } from '@net-mesh/sdk';
  *
  * // Generate once, persist the bytes, reload on subsequent runs.
  * const id = Identity.generate();
@@ -33,7 +33,7 @@ import {
   parseToken as napiParseToken,
   tokenIsExpired as napiTokenIsExpired,
   verifyToken as napiVerifyToken,
-} from '@ai2070/net';
+} from '@net-mesh/core';
 
 // ----------------------------------------------------------------------------
 // Scope — string-array alias with a fixed set of values.

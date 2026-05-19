@@ -4,8 +4,8 @@
 // (`cortex:` / `netdb:` / `nrpc:`) that `classifyError()` inspects to
 // re-throw a typed error. Catch with `instanceof`:
 //
-//   import { NetDb } from '@ai2070/net';
-//   import { CortexError, classifyError } from '@ai2070/net/errors';
+//   import { NetDb } from '@net-mesh/core';
+//   import { CortexError, classifyError } from '@net-mesh/core/errors';
 //
 //   try {
 //     db.tasks.create(1n, 'x', 100n);
@@ -51,7 +51,7 @@ export class NetDbError extends Error {
 //
 // Catch with `instanceof RpcError` for "any nRPC failure", or
 // drill down to a concrete subclass for specific handling. The
-// default retry / circuit-breaker policies in @ai2070/net/mesh_rpc
+// default retry / circuit-breaker policies in @net-mesh/core/mesh_rpc
 // skip RpcCodecError (caller-fixable local bug) by default — same
 // behavior as the Rust SDK's default_retryable predicate.
 
@@ -175,7 +175,7 @@ export function classifyError(e: unknown): unknown {
  * Pull a `message` field off any value, with the same permissive
  * semantics as `(e && e.message) || ''` from the JS source. Used
  * by `classifyError` and by `defaultRetryable` in
- * `@ai2070/net/mesh_rpc` to keep the catch-site contract uniform.
+ * `@net-mesh/core/mesh_rpc` to keep the catch-site contract uniform.
  */
 export function extractMessage(e: unknown): string {
   if (e === null || e === undefined) return ''

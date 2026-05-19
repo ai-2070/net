@@ -7,14 +7,14 @@ Wraps the `net` PyO3 bindings with generators, typed events, typed channels, and
 ## Install
 
 ```bash
-pip install ai2070-net-sdk
+pip install net-mesh-sdk
 ```
 
-The package publishes as `ai2070-net-sdk` on PyPI but imports as `from net_sdk import ...` (the in-source module name is preserved). The native binding `ai2070-net` is pulled in transitively as a dependency.
+The package publishes as `net-mesh-sdk` on PyPI but imports as `from net_sdk import ...` (the in-source module name is preserved). The native binding `net-mesh` is pulled in transitively as a dependency.
 
 ## Cargo features (transitive)
 
-`net_sdk` is pure Python; every method-level surface dispatches into the underlying `net._net` PyO3 binding (the `ai2070-net` package). Which classes are reachable depends on which Cargo features that binding was built with — wheels from PyPI ship every feature enabled, source builds (`maturin develop`) need to ask.
+`net_sdk` is pure Python; every method-level surface dispatches into the underlying `net._net` PyO3 binding (the `net-mesh` package). Which classes are reachable depends on which Cargo features that binding was built with — wheels from PyPI ship every feature enabled, source builds (`maturin develop`) need to ask.
 
 | Cargo feature | sdk-py wrapper module | Reaches into |
 |---|---|---|
@@ -1058,7 +1058,7 @@ widening grew it from 159).
 
 ## Cargo features
 
-`net_sdk` is a pure-Python wrapper over `net._net` (the `ai2070-net` PyO3 extension), so its reachable surface is whatever was compiled into the underlying wheel. The five feature flags relevant to building from source:
+`net_sdk` is a pure-Python wrapper over `net._net` (the `net-mesh` PyO3 extension), so its reachable surface is whatever was compiled into the underlying wheel. The five feature flags relevant to building from source:
 
 | Feature | What it enables on the underlying `net` package |
 |---|---|
@@ -1070,7 +1070,7 @@ widening grew it from 159).
 
 A wheel built without a feature silently omits its symbols — there is no build warning. The `net.__init__` module try-imports each family, so a missing feature surfaces as a clean `ImportError` from `from net import Redex`, not an `AttributeError` deeper in the call stack. `net_sdk` wrappers re-raise the same `ImportError` when a feature they depend on wasn't built in.
 
-Enable at build time (rebuild the underlying `ai2070-net` wheel, then `pip install` it into the same env as `ai2070-net-sdk`):
+Enable at build time (rebuild the underlying `net-mesh` wheel, then `pip install` it into the same env as `net-mesh-sdk`):
 
 ```bash
 cd net/crates/net/bindings/python
@@ -1079,7 +1079,7 @@ maturin develop --features "cortex netdb redex-disk meshdb meshos"
 maturin build --release --features "cortex netdb redex-disk meshdb meshos"
 ```
 
-PyPI wheels of `ai2070-net` ship with every feature enabled; the flags above only matter for source builds.
+PyPI wheels of `net-mesh` ship with every feature enabled; the flags above only matter for source builds.
 
 ## License
 

@@ -19,7 +19,7 @@
 //! direct delta on one axis and the codec delta on the other.
 //!
 //! Run with:
-//!   cargo bench --bench nrpc_unary --features net,cortex -p ai2070-net-sdk
+//!   cargo bench --bench nrpc_unary --features net,cortex -p net-mesh-sdk
 
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};

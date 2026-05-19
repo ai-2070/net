@@ -21,7 +21,7 @@
 //! matters.
 //!
 //! Run with:
-//!   cargo bench --bench nrpc_tail --features net,cortex -p ai2070-net-sdk
+//!   cargo bench --bench nrpc_tail --features net,cortex -p net-mesh-sdk
 
 use std::sync::Arc;
 use std::time::Instant;

@@ -331,7 +331,7 @@ export class MeshOsDaemonHandle {
 ```
 
 ```typescript
-import { MeshOsDaemonSdk, DaemonHealth } from '@ai2070/net-sdk/meshos';
+import { MeshOsDaemonSdk, DaemonHealth } from '@net-mesh/sdk/meshos';
 
 const daemon: MeshOsDaemon = {
   name() { return 'telemetry'; },

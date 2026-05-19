@@ -7,8 +7,8 @@
 // the Rust SDK's defaults.
 //
 // Usage:
-//   import { NetMesh } from '@ai2070/net'
-//   import { TypedMeshRpc, RetryPolicy } from '@ai2070/net/mesh_rpc'
+//   import { NetMesh } from '@net-mesh/core'
+//   import { TypedMeshRpc, RetryPolicy } from '@net-mesh/core/mesh_rpc'
 //
 //   const mesh = await NetMesh.create({ ... })
 //   const rpc = TypedMeshRpc.fromMesh(mesh)
@@ -22,7 +22,7 @@
 
 // Convention: every error this module throws is a plain `Error`
 // with a stable `nrpc:<kind>:` message prefix. User code's catch
-// sites should call `classifyError(e)` from `@ai2070/net/errors`
+// sites should call `classifyError(e)` from `@net-mesh/core/errors`
 // to reconstruct a typed `RpcError` subclass. This matches the
 // pattern used by the rest of the binding (cortex / netdb).
 //
@@ -86,7 +86,7 @@ export interface CallOptions {
    * predicate-pushdown filtering.
    *
    * Convenience: build entries via `whereHeader(pred)` from
-   * `@ai2070/net-sdk` for predicate-pushdown.
+   * `@net-mesh/sdk` for predicate-pushdown.
    */
   requestHeaders?: RpcRequestHeader[]
 }

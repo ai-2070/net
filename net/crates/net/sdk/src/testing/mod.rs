@@ -3,7 +3,7 @@
 //! `MeshOsRuntime`'s probe registry.
 //!
 //! Gated behind the `testing` Cargo feature; consumers opt in via
-//! `[dev-dependencies] ai2070-net-sdk = { ..., features = ["testing"] }`.
+//! `[dev-dependencies] net-mesh-sdk = { ..., features = ["testing"] }`.
 //! Never linked into a release binary.
 //!
 //! # What's here

@@ -158,7 +158,7 @@ Pin these so phase implementations don't relitigate:
 6. **All snapshot-derived rendering uses `Arc<MeshOsSnapshot>` clones.** Reading the snapshot is one atomic `ArcSwap::load` — no locks in the render path. Tabs that need a stable view across a render pass clone the Arc once at frame start and consume the same projection until the next tick.
 7. **Subscription pumps run as separate `tokio` tasks; their output funnels into a bounded `mpsc::Sender<UiEvent>` the app loop drains.** A stalled view (operator paused on the log tab) never wedges the snapshot poll; the bounded channel drops oldest log lines (counter increments) and `StatusBar` surfaces the drop count.
 8. **No async in the render path.** Every render is sync over the current `app_state`. The subscription pumps + commit / sign tasks live elsewhere; the renderer reads the resulting `app_state` and projects it.
-9. **`deck` is a single binary; the workspace member lives at `net/crates/deck/`.** It depends on `ai2070-net-sdk` (with `features = ["meshos", "deck", "meshdb"]`). No "deck-core" library split until a second consumer (e.g. a Python TUI binding) exists.
+9. **`deck` is a single binary; the workspace member lives at `net/crates/deck/`.** It depends on `net-mesh-sdk` (with `features = ["meshos", "deck", "meshdb"]`). No "deck-core" library split until a second consumer (e.g. a Python TUI binding) exists.
 10. **The disk footprint is bounded.** Bookmarks + per-cluster recent-commit log + scrollback caches: under 10 MiB per cluster total. No SQLite, no embedded LMDB — just JSON / TOML files under `$XDG_CONFIG_HOME/deck/` and `$XDG_CACHE_HOME/deck/`. Anything bigger is a metrics-platform problem.
 
 ---

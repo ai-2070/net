@@ -4,7 +4,7 @@ version = "0.19.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Node.js bindings for Net event bus"
-# Distributed via npm as `@ai2070/net` (see package.json), not via
+# Distributed via npm as `@net-mesh/core` (see package.json), not via
 # crates.io. Block accidental `cargo publish`.
 publish = false
 
@@ -16,7 +16,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# Out-of-the-box `npm install @ai2070/net-sdk` ships the full
+# Out-of-the-box `npm install @net-mesh/sdk` ships the full
 # distributed-agent stack: mesh transport + NAT traversal +
 # typed nRPC + capability-based service discovery + daemon
 # supervision + replica/fork/standby coordination + MeshOS
@@ -121,8 +121,8 @@ test-helpers = ["groups"]
 meshdb = ["net/meshdb", "dep:postcard"]
 
 [dependencies]
-net = { package = "ai2070-net", version = "0.19.0", path = "../..", default-features = false }
-net-sdk = { package = "ai2070-net-sdk", version = "0.19.0", path = "../../sdk", default-features = false, optional = true }
+net = { package = "net-mesh", version = "0.19.0", path = "../..", default-features = false }
+net-sdk = { package = "net-mesh-sdk", version = "0.19.0", path = "../../sdk", default-features = false, optional = true }
 dashmap = { version = "6", optional = true }
 napi = { version = "3.7.0", default-features = false, features = ["napi4", "napi6", "async", "tokio_rt"] }
 napi-derive = "3.4.0"

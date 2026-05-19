@@ -2,7 +2,7 @@
  * Async streaming event consumption.
  */
 
-import type { Net as NapiNet } from '@ai2070/net';
+import type { Net as NapiNet } from '@net-mesh/core';
 import type { StoredEvent, SubscribeOpts } from './types';
 
 // Starting backoff for idle polls and the inter-poll wait on

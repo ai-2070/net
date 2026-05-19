@@ -8,7 +8,7 @@
  *
  * @example
  * ```typescript
- * import { MeshNode, BackpressureError, Reliability } from '@ai2070/net-sdk';
+ * import { MeshNode, BackpressureError, Reliability } from '@net-mesh/sdk';
  *
  * const node = await MeshNode.create({
  *   bindAddr: '127.0.0.1:9000',
@@ -36,7 +36,7 @@
  * ```
  */
 
-import { NetMesh as NapiNetMesh } from '@ai2070/net';
+import { NetMesh as NapiNetMesh } from '@net-mesh/core';
 
 import { setNapiMesh } from './_internal.js';
 import {
@@ -247,7 +247,7 @@ export class MeshNode {
    * Not part of the stable API; do NOT use in production code —
    * the real mesh surface is `announceCapabilities`. Gated at the
    * NAPI layer behind the `test-helpers` cargo feature; release
-   * builds of `@ai2070/net` do not export `testInjectSyntheticPeer`
+   * builds of `@net-mesh/core` do not export `testInjectSyntheticPeer`
    * and this method will throw if called against such a build.
    *
    * @internal

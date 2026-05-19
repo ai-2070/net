@@ -18,7 +18,7 @@
 //!
 //! Run with:
 //!   cargo bench --bench nrpc_client_streaming --features net,cortex \
-//!     -p ai2070-net-sdk
+//!     -p net-mesh-sdk
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use net_sdk::mesh_rpc::CallOptionsTyped;

@@ -1005,7 +1005,7 @@ async fn open_netdb(
 }
 
 fn default_netdb_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("net").join("netdb"))
+    dirs::data_dir().map(|d| d.join("net-mesh").join("netdb"))
 }
 
 #[derive(Serialize)]

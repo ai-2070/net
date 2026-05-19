@@ -1,5 +1,5 @@
 {
-  "name": "@ai2070/net",
+  "name": "@net-mesh/core",
   "version": "0.19.0",
   "description": "High-performance, schema-agnostic event bus for AI runtime workloads",
   "main": "index.js",

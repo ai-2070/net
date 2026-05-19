@@ -27,7 +27,7 @@ some pieces are still partial.
 
 The Go gap is purely additive. The NAPI gap is **additive for TS SDK
 consumers** (the wrapper already used `bigint`) but a **breaking type
-change for direct `@ai2070/net` consumers** who passed plain `number`
+change for direct `@net-mesh/core` consumers** who passed plain `number`
 to the affected id parameters — those calls will now throw `"expected
 BigInt"` and must wrap values in `BigInt(x)`. Migration note in
 Stage A below. Each stage is independently shippable; this plan holds
@@ -151,7 +151,7 @@ Any existing user passing a JS `number` to `connect` /
 Runtime: napi-rs rejects `number` where it expects `BigInt` with a
 clear `"expected BigInt"` error — not silent data corruption.
 
-Mitigation: a major-version bump isn't warranted; `@ai2070/net` is
+Mitigation: a major-version bump isn't warranted; `@net-mesh/core` is
 0.5.x, still pre-1.0. Document in CHANGELOG:
 
 > **Breaking:** `NetMesh.nodeId()`, `NetMesh.connect(..., peerNodeId)`,

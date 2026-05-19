@@ -83,7 +83,7 @@ In TS:
 ```ts
 import {
   emptyCapabilities, requireTag, requireAxisValue, withMetadata,
-} from '@ai2070/net-sdk';
+} from '@net-mesh/sdk';
 
 const caps = withMetadata(
   requireAxisValue(
@@ -269,7 +269,7 @@ let (name, value) = predicate_to_rpc_header(&p)?;
 In TS:
 
 ```ts
-import { p, predicateToRpcHeader, RPC_WHERE_HEADER, evaluatePredicate } from '@ai2070/net-sdk';
+import { p, predicateToRpcHeader, RPC_WHERE_HEADER, evaluatePredicate } from '@net-mesh/sdk';
 
 const pred = p.and(
   p.exists({ axis: 'hardware', key: 'gpu' }),
@@ -362,7 +362,7 @@ println!("{}", report.render());
 In TS:
 
 ```ts
-import { predicateDebugReport, redactMetadataKeys, renderDebugReport } from '@ai2070/net-sdk';
+import { predicateDebugReport, redactMetadataKeys, renderDebugReport } from '@net-mesh/sdk';
 
 const report = predicateDebugReport(pred, contexts);
 

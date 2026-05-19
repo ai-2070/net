@@ -399,7 +399,7 @@ async fn check_strict_permissions(path: &Path) -> Result<(), CliError> {
 fn default_identity_path(operator_id: u64) -> PathBuf {
     let base = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("net")
+        .join("net-mesh")
         .join("identities");
     base.join(format!("operator-0x{operator_id:016x}.toml"))
 }

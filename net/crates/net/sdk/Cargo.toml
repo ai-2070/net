@@ -1,5 +1,5 @@
 [package]
-name = "ai2070-net-sdk"
+name = "net-mesh-sdk"
 version = "0.19.0"
 edition = "2021"
 description = "Ergonomic Rust SDK for the Net mesh network"
@@ -15,14 +15,14 @@ autobenches = false
 
 [lib]
 # Keep the crate name as `net_sdk` so `use net_sdk::...` resolves
-# without code changes; the published artifact is `ai2070-net-sdk`
+# without code changes; the published artifact is `net-mesh-sdk`
 # on crates.io.
 name = "net_sdk"
 
 [dependencies]
 # `version` is required for `cargo publish` to resolve the dep on
 # crates.io; the `path` is preferred during local workspace builds.
-net = { package = "ai2070-net", version = "0.19.0", path = "..", features = [] }
+net = { package = "net-mesh", version = "0.19.0", path = "..", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"

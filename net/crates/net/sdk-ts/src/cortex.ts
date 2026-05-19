@@ -1,7 +1,7 @@
 /**
  * CortEX + NetDb — typed event-sourced state with reactive watches.
  *
- * Wraps the native `@ai2070/net` CortEX bindings with ergonomic
+ * Wraps the native `@net-mesh/core` CortEX bindings with ergonomic
  * TypeScript APIs: `AsyncIterable`-shaped watches (so `for await`
  * works naturally), typed errors via `CortexError` / `NetDbError`
  * pattern matching, and the `snapshotAndWatch` primitive whose race
@@ -9,7 +9,7 @@
  *
  * @example
  * ```typescript
- * import { NetDb, TaskStatus, CortexError } from '@ai2070/net-sdk';
+ * import { NetDb, TaskStatus, CortexError } from '@net-mesh/sdk';
  *
  * const db = await NetDb.open({ originHash: 0xABCDEF01, withTasks: true });
  * const tasks = db.tasks!;
@@ -45,7 +45,7 @@ import {
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
-} from '@ai2070/net';
+} from '@net-mesh/core';
 
 import type {
   Task,
@@ -57,7 +57,7 @@ import type {
   CortexSnapshot,
   RedexEventJs,
   RedexFileConfigJs,
-} from '@ai2070/net';
+} from '@net-mesh/core';
 
 // Re-export the NAPI value types so callers get them from one place.
 export {
@@ -77,12 +77,12 @@ export type {
   CortexSnapshot,
 };
 
-// Typed error classes shipped by `@ai2070/net/errors`. Re-exported here
-// so SDK consumers can `import { CortexError } from '@ai2070/net-sdk'`
+// Typed error classes shipped by `@net-mesh/core/errors`. Re-exported here
+// so SDK consumers can `import { CortexError } from '@net-mesh/sdk'`
 // without a second package path. `classifyError` is what the wrappers
 // below use internally.
-export { CortexError, NetDbError } from '@ai2070/net/errors';
-import { classifyError } from '@ai2070/net/errors';
+export { CortexError, NetDbError } from '@net-mesh/core/errors';
+import { classifyError } from '@net-mesh/core/errors';
 
 /**
  * Raised on `redex:` prefixed failures: append / tail / read / sync /
@@ -97,7 +97,7 @@ export class RedexError extends Error {
   }
 }
 
-/** Classify a napi-thrown error. Mirrors `@ai2070/net/errors` for the
+/** Classify a napi-thrown error. Mirrors `@net-mesh/core/errors` for the
  *  `redex:` prefix which that package does not yet recognize. */
 function classifyWithRedex(e: unknown): unknown {
   const classified = classifyError(e);

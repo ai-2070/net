@@ -5,10 +5,10 @@ High-performance, schema-agnostic event bus for AI runtime workloads.
 ## Installation
 
 ```bash
-pip install ai2070-net
+pip install net-mesh
 ```
 
-The package publishes as `ai2070-net` on PyPI but imports as `from net import ...` (the in-source module name is preserved). For the higher-level Pythonic surface (generators, typed channels, dataclass/Pydantic support), install [`ai2070-net-sdk`](../../sdk-py/) instead — it depends on this package.
+The package publishes as `net-mesh` on PyPI but imports as `from net import ...` (the in-source module name is preserved). For the higher-level Pythonic surface (generators, typed channels, dataclass/Pydantic support), install [`net-mesh-sdk`](../../sdk-py/) instead — it depends on this package.
 
 ## Cargo features
 
@@ -1059,7 +1059,7 @@ maturin develop --features "cortex netdb redex-disk meshdb meshos"
 maturin build --release --features "cortex netdb redex-disk meshdb meshos"
 ```
 
-PyPI wheels published as `ai2070-net` ship with every feature enabled; the flags above only matter for source builds.
+PyPI wheels published as `net-mesh` ship with every feature enabled; the flags above only matter for source builds.
 
 ## License
 

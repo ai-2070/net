@@ -49,7 +49,7 @@ jobs:
       # `--bins` compiles them into the binary's test harness.
       - name: Run Deck unit tests
         if: ${{ !cancelled() }}
-        run: cargo test -p deck --bins
+        run: cargo test -p net-deck --bins
 
   integration-tests:
     name: Integration tests (Net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC, Dataforts, MeshDB, MeshOS)
@@ -440,18 +440,18 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-sdk-ts-${{ hashFiles('**/Cargo.lock') }}
 
-      # `sdk-ts/package.json` carries `@ai2070/net: file:../bindings/node`
+      # `sdk-ts/package.json` carries `@net-mesh/core: file:../bindings/node`
       # as a devDependency, so `npm i` over there picks up the sibling
       # binding from the working tree. The binding's `.node` cdylib has
       # to be built first or `npm test` will fail to load it.
       #
       # Feature flags MUST include `redis` even though the suite never
       # opens a Redis connection: `sdk-ts/src/redis-dedup.ts` does a
-      # real `export { RedisStreamDedup } from '@ai2070/net'`, and the
+      # real `export { RedisStreamDedup } from '@net-mesh/core'`, and the
       # napi-generated `index.d.ts` only carries the `RedisStreamDedup`
       # declaration when the binding was built with the `redis`
       # feature. Without it, tsc fails the SDK build with
-      # `Module '"@ai2070/net"' has no exported member
+      # `Module '"@net-mesh/core"' has no exported member
       # 'RedisStreamDedup'`. The runtime side is also satisfied — the
       # `.node` cdylib carries the class — but the runtime never opens
       # a connection because no SDK code instantiates the helper in
@@ -558,11 +558,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      # sdk-py is the pure-Python layer over the `ai2070-net` bindings.
+      # sdk-py is the pure-Python layer over the `net-mesh` bindings.
       # Its `tests/conftest.py` stubs the native `net` extension before
       # any SDK module loads, so the test run does not need maturin or
       # the Rust toolchain. `--no-deps` skips resolving the runtime
-      # `ai2070-net>=0.19.0` requirement against PyPI.
+      # `net-mesh>=0.19.0` requirement against PyPI.
       - name: Install sdk-py (no deps) + test deps
         run: |
           pip install --upgrade pip
@@ -604,7 +604,7 @@ jobs:
           key: ${{ runner.os }}-cargo-go-${{ hashFiles('**/Cargo.lock') }}
 
       # The Go bindings link against FIVE cdylibs via cgo:
-      #   - `-lnet` (libnet.so, the main `ai2070-net` crate) from net.go
+      #   - `-lnet` (libnet.so, the main `net-mesh` crate) from net.go
       #   - `-lnet_compute` (libnet_compute.so, the `net-compute-ffi`
       #     workspace member at bindings/go/compute-ffi) from compute.go
       #   - `-lnet_meshdb` (libnet_meshdb.so, the `net-meshdb-ffi`
@@ -616,7 +616,7 @@ jobs:
       # All five end up in `net/crates/net/target/release/`.
       #
       # Features:
-      #   - `ai2070-net` needs `netdb,dataforts,redex-disk,nat-traversal,redis`
+      #   - `net-mesh` needs `netdb,dataforts,redex-disk,nat-traversal,redis`
       #     for the mesh + cortex + blob + NAT + redis-dedup FFI surfaces
       #     exercised by the Go test suite. `redis` only gates the
       #     `RedisStreamDedup` symbol export — the dedup helper itself is
@@ -628,13 +628,13 @@ jobs:
       #     extra features beyond their defaults.
       #
       # Built as one cargo invocation so feature unification on the
-      # shared `ai2070-net` dep doesn't cause a second compilation pass.
+      # shared `net-mesh` dep doesn't cause a second compilation pass.
       - name: Build net + net_compute + net_meshdb + net_meshos + net_deck cdylibs
         working-directory: net/crates/net
         run: >
           cargo build --release
-          -p ai2070-net -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi
-          --features "ai2070-net/netdb,ai2070-net/dataforts,ai2070-net/redex-disk,ai2070-net/nat-traversal,ai2070-net/redis,net-compute-ffi/test-helpers"
+          -p net-mesh -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi
+          --features "net-mesh/netdb,net-mesh/dataforts,net-mesh/redex-disk,net-mesh/nat-traversal,net-mesh/redis,net-compute-ffi/test-helpers"
 
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
       # so local developers can run quick unit-style passes without the
@@ -1103,7 +1103,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
       # `cargo doc --all-features` only docs the current package
-      # (the root `ai2070-net` crate). Workspace members live in
+      # (the root `net-mesh` crate). Workspace members live in
       # their own crates; `net-cli` and `deck` both have
       # substantial module-level docstrings that document the
       # subcommand / TUI surface contracts — keep them
@@ -1114,6 +1114,6 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
       - name: Build deck documentation
-        run: cargo doc -p deck --no-deps
+        run: cargo doc -p net-deck --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

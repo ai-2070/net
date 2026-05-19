@@ -6,7 +6,7 @@
 
 **Not started.** A `cli/` workspace member exists with an empty `src/` directory and the workspace `cli` feature flag is wired (`crates/net/Cargo.toml:default = []`, `cli = ["dataforts", "redex-disk", "dep:clap"]`). One ad-hoc binary lives today at `src/bin/net-blob.rs` for the blob-storage CLI surface; it stays as-is until the unified CLI absorbs it in Phase 4.
 
-**Activation gate.** The Rust SDK + four-language MeshOS / Deck SDK bindings are feature-complete as of the v0.17 cycle. The CLI sits on top of `ai2070-net-sdk` (no new substrate surface required). A real consumer workflow — a CI bot, a ChatOps script, an SRE runbook — that needs a non-TUI surface drives Phase 1 activation.
+**Activation gate.** The Rust SDK + four-language MeshOS / Deck SDK bindings are feature-complete as of the v0.17 cycle. The CLI sits on top of `net-mesh-sdk` (no new substrate surface required). A real consumer workflow — a CI bot, a ChatOps script, an SRE runbook — that needs a non-TUI surface drives Phase 1 activation.
 
 **Substrate prereqs** (all in code today):
 
@@ -42,7 +42,7 @@ Five reasons for a written plan rather than "we'll wire clap into the cli crate 
 
 ## What ships
 
-A single `net` binary, layered over `ai2070-net-sdk`. Subcommand layout:
+A single `net` binary, layered over `net-mesh-sdk`. Subcommand layout:
 
 ```
 net <subcommand> [<flags>] [<positional>]
@@ -274,7 +274,7 @@ name = "net"
 path = "src/main.rs"
 
 [dependencies]
-ai2070-net-sdk = { path = "../sdk", features = ["meshos", "deck", "meshdb", "dataforts"] }
+net-mesh-sdk = { path = "../sdk", features = ["meshos", "deck", "meshdb", "dataforts"] }
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
@@ -574,7 +574,7 @@ The CLI is **the operator-and-developer command surface, exposed as argv**. Ever
 
 The CLI interacts with one substrate system per layer:
 
-- **Rust SDK** (`ai2070-net-sdk`) — every read + write. The CLI never reaches around the SDK.
+- **Rust SDK** (`net-mesh-sdk`) — every read + write. The CLI never reaches around the SDK.
 - **Local filesystem** — config + identity files; the binary follows XDG.
 - **Local terminal** — TTY detection, ANSI colour, interactive confirm prompts.
 

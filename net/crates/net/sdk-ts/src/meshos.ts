@@ -1,7 +1,7 @@
 /**
  * MeshOS daemon-author SDK — TypeScript wrapper.
  *
- * Sits on top of the napi-rs binding at `@ai2070/net`. Adds:
+ * Sits on top of the napi-rs binding at `@net-mesh/core`. Adds:
  *
  * - {@link MeshOsDaemon} interface for daemon implementors.
  * - Typed {@link DaemonControl} / {@link MaintenanceState} unions
@@ -22,8 +22,8 @@
  *
  * @example
  * ```ts
- * import { Identity } from '@ai2070/net';
- * import { MeshOsDaemonSdk, type MeshOsDaemon } from '@ai2070/net-sdk/meshos';
+ * import { Identity } from '@net-mesh/core';
+ * import { MeshOsDaemonSdk, type MeshOsDaemon } from '@net-mesh/sdk/meshos';
  *
  * const daemon: MeshOsDaemon = {
  *   name: 'echo',
@@ -55,7 +55,7 @@ import {
   type MeshOsConfigJs,
   type Identity,
   type CapabilitySetJs,
-} from '@ai2070/net';
+} from '@net-mesh/core';
 
 // ----------------------------------------------------------------------------
 // Typed error envelope

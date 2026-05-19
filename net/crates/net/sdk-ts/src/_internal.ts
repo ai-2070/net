@@ -26,7 +26,7 @@
 import type {
   DaemonRuntime as NapiDaemonRuntime,
   NetMesh as NapiNetMesh,
-} from '@ai2070/net';
+} from '@net-mesh/core';
 
 // `WeakMap<object, …>` avoids pinning the wrapper in memory — when
 // a DaemonRuntime is garbage-collected the entry evicts automatically.

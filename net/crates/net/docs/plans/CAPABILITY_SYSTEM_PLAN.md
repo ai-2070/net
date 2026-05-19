@@ -551,7 +551,7 @@ impl Mikoshi {
 }
 ```
 
-**Feature flag for backward compatibility.** Behind `mikoshi-placement-v2` feature flag (on-by-default in `ai2070-net`; one minor version of compatibility window). The legacy single-node-logic path is preserved as `Mikoshi::select_migration_target_legacy` and made available via `LegacyPlacement` impl of `PlacementFilter`. Operators with custom Mikoshi placement logic get one minor version to migrate.
+**Feature flag for backward compatibility.** Behind `mikoshi-placement-v2` feature flag (on-by-default in `net-mesh`; one minor version of compatibility window). The legacy single-node-logic path is preserved as `Mikoshi::select_migration_target_legacy` and made available via `LegacyPlacement` impl of `PlacementFilter`. Operators with custom Mikoshi placement logic get one minor version to migrate.
 
 **Replica/fork/standby groups inherit.** Same primitive applies:
 
@@ -683,7 +683,7 @@ Compute path consumes `PlacementFilter` today — `compute/fork_group.rs`, `comp
 
 - `Scheduler::find_migration_targets` (and the existing `place_migration`) consult `PlacementFilter` for scoring + the locked three-step tie-breaker.
 - A wrapping `Scheduler::select_migration_target(daemon, &dyn PlacementFilter) -> Option<NodeId>` returns the highest-scoring candidate; legacy capability-match-only behavior preserved as `LegacyPlacement` impl of `PlacementFilter` for one minor version.
-- Feature flag `mikoshi-placement-v2` (on-by-default in `ai2070-net`); operators with custom legacy placement get one minor version of compatibility window.
+- Feature flag `mikoshi-placement-v2` (on-by-default in `net-mesh`); operators with custom legacy placement get one minor version of compatibility window.
 - `MeshDaemon` trait (`compute/daemon.rs`) extended with `required_capabilities()` / `optional_capabilities()` returning `CapabilitySet`. Empty defaults for backward compat (any node accepts placement).
 - Replica/fork/standby groups (`compute/{replica_group,fork_group,standby_group}.rs`) extended to use `PlacementFilter` for placement via `select_member_node` / `select_promotion_target`. Same tie-breaker.
 - Tests:

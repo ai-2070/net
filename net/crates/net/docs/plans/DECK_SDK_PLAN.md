@@ -393,7 +393,7 @@ export class AuditQuery {
 ```
 
 ```ts
-import { DeckClient, AvoidScope } from '@ai2070/net-sdk/deck';
+import { DeckClient, AvoidScope } from '@net-mesh/sdk/deck';
 
 const client = new DeckClient(runtime, opIdentity, {
   snapshotPollIntervalMs: 100, iceSignatureThreshold: 1,

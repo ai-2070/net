@@ -115,7 +115,7 @@ file.close()
 ## Node
 
 ```ts
-import { Redex } from '@ai2070/net';
+import { Redex } from '@net-mesh/core';
 
 const redex = new Redex({ persistentDir: '/var/lib/net/redex' });
 const file = await redex.openFile('orders/audit', {

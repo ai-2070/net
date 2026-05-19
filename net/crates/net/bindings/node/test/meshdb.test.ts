@@ -5,7 +5,7 @@
 // and the pull-based stream interface (`next()` + `toArray()`).
 //
 // Requires the binding to have been built with the `meshdb` Cargo
-// feature: `pnpm --filter @ai2070/net build --features meshdb` (or
+// feature: `pnpm --filter @net-mesh/core build --features meshdb` (or
 // the equivalent in your build setup). The describe.skipIf below
 // noops the whole suite if MeshDB symbols are absent.
 

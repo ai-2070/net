@@ -12,19 +12,19 @@ Net is what the internet would look like if it were built today, the network sci
 
 ```bash
 # Rust
-cargo add ai2070-net-sdk
+cargo add net-mesh-sdk
 
 # TypeScript / Node
-npm install @ai2070/net-sdk @ai2070/net
+npm install @net-mesh/sdk @net-mesh/core
 
 # Python
-pip install ai2070-net-sdk
+pip install net-mesh-sdk
 
 # Go
 go get github.com/ai-2070/net/go
 ```
 
-The Rust crate, npm scope, and PyPI dist all publish under `ai2070-net*` / `@ai2070/net*`. Source-level imports stay as `net_sdk` / `@ai2070/net-sdk` / `from net_sdk import ...`. See [SDKs](#sdks) for the lower-level core packages and full per-language usage.
+The Rust crate, npm scope, and PyPI dist all publish under `net-mesh*` / `@net-mesh/core*`. Source-level imports stay as `net_sdk` / `@net-mesh/sdk` / `from net_sdk import ...`. See [SDKs](#sdks) for the lower-level core packages and full per-language usage.
 
 ## Contents
 
@@ -480,9 +480,9 @@ All SDKs wrap the same Rust core. The SDK is the developer experience, the engin
 
 | SDK | Package | Install |
 |-----|---------|---------|
-| **Rust** | [`ai2070-net-sdk`](https://crates.io/crates/ai2070-net-sdk) ([source](net/crates/net/sdk)) | `cargo add ai2070-net-sdk` |
-| **TypeScript** | [`@ai2070/net-sdk`](https://www.npmjs.com/package/@ai2070/net-sdk) ([source](net/crates/net/sdk-ts)) | `npm install @ai2070/net-sdk @ai2070/net` |
-| **Python** | [`ai2070-net-sdk`](https://pypi.org/project/ai2070-net-sdk/) ([source](net/crates/net/sdk-py)) | `pip install ai2070-net-sdk` |
+| **Rust** | [`net-mesh-sdk`](https://crates.io/crates/net-mesh-sdk) ([source](net/crates/net/sdk)) | `cargo add net-mesh-sdk` |
+| **TypeScript** | [`@net-mesh/sdk`](https://www.npmjs.com/package/@net-mesh/sdk) ([source](net/crates/net/sdk-ts)) | `npm install @net-mesh/sdk @net-mesh/core` |
+| **Python** | [`net-mesh-sdk`](https://pypi.org/project/net-mesh-sdk/) ([source](net/crates/net/sdk-py)) | `pip install net-mesh-sdk` |
 | **C** | [`net.h`](net/crates/net/include/net.h) | `cargo build --release --features ffi,net` (build cdylib + bundle the header) |
 | **Go** | [`go`](go/) | `go get github.com/ai-2070/net/go` |
 
@@ -490,9 +490,9 @@ Lower-level bindings (skip the SDK ergonomics, talk directly to the engine):
 
 | Binding | Package | Install |
 |---------|---------|---------|
-| **Rust core** | [`ai2070-net`](https://crates.io/crates/ai2070-net) | `cargo add ai2070-net` |
-| **Node binding** | [`@ai2070/net`](https://www.npmjs.com/package/@ai2070/net) | `npm install @ai2070/net` |
-| **Python binding** | [`ai2070-net`](https://pypi.org/project/ai2070-net/) | `pip install ai2070-net` |
+| **Rust core** | [`net-mesh`](https://crates.io/crates/net-mesh) | `cargo add net-mesh` |
+| **Node binding** | [`@net-mesh/core`](https://www.npmjs.com/package/@net-mesh/core) | `npm install @net-mesh/core` |
+| **Python binding** | [`net-mesh`](https://pypi.org/project/net-mesh/) | `pip install net-mesh` |
 
 ## Benchmarks
 

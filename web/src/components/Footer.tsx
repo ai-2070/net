@@ -52,14 +52,14 @@ const FOOTER_RESOURCES: ReadonlyArray<{
   class?: string;
 }> = [
   {
-    href: "https://crates.io/crates/ai2070-net",
+    href: "https://crates.io/crates/net-mesh",
     label: "Rust // crates.io",
   },
   {
-    href: "https://www.npmjs.com/package/@ai2070/net",
+    href: "https://www.npmjs.com/package/@net-mesh/core",
     label: "TypeScript // npm",
   },
-  { href: "https://pypi.org/project/ai2070-net/", label: "Python // PyPI" },
+  { href: "https://pypi.org/project/net-mesh/", label: "Python // PyPI" },
   {
     href: "https://github.com/ai-2070/net/tree/master/go",
     label: "Go // module",

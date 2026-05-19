@@ -1,8 +1,8 @@
 name: Release Python
 
-# Publishes the PyO3 binding wheels for `ai2070-net` (the
+# Publishes the PyO3 binding wheels for `net-mesh` (the
 # native module that exposes `from net import ...`) to PyPI.
-# The pure-Python SDK `ai2070-net-sdk` ships via
+# The pure-Python SDK `net-mesh-sdk` ships via
 # `release-pypi-sdk.yml`.
 #
 # Tag schema: `python-v<semver>` (e.g. `python-v0.19.0`).
@@ -10,7 +10,7 @@ name: Release Python
 # Authentication: PyPI Trusted Publishing — the `pypi`
 # environment + `id-token: write` permission combination below.
 # When the PyPI distribution name changed from `net` to
-# `ai2070-net`, the Trusted Publisher entry on PyPI also has to
+# `net-mesh`, the Trusted Publisher entry on PyPI also has to
 # be re-pinned (Account → Publishing) for the new project name;
 # otherwise the publish step fails with "OIDC token has no
 # associated publisher".

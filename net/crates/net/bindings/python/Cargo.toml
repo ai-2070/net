@@ -4,7 +4,7 @@ version = "0.19.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Python bindings for Net event bus"
-# Distributed via PyPI as `ai2070-net` (see pyproject.toml), not via
+# Distributed via PyPI as `net-mesh` (see pyproject.toml), not via
 # crates.io. Block accidental `cargo publish`.
 publish = false
 
@@ -17,7 +17,7 @@ name = "_net"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# Out-of-the-box `pip install ai2070-net-sdk` ships the full
+# Out-of-the-box `pip install net-mesh-sdk` ships the full
 # distributed-agent stack: mesh transport + NAT traversal +
 # typed nRPC + capability-based service discovery + daemon
 # supervision + replica/fork/standby coordination + MeshOS
@@ -103,8 +103,8 @@ meshos = ["compute", "cortex", "net/meshos", "net-sdk/meshos"]
 deck = ["meshos", "net/meshos", "net-sdk/deck"]
 
 [dependencies]
-net = { package = "ai2070-net", version = "0.19.0", path = "../..", default-features = false }
-net-sdk = { package = "ai2070-net-sdk", version = "0.19.0", path = "../../sdk", default-features = false, optional = true }
+net = { package = "net-mesh", version = "0.19.0", path = "../..", default-features = false }
+net-sdk = { package = "net-mesh-sdk", version = "0.19.0", path = "../../sdk", default-features = false, optional = true }
 dashmap = { version = "6", optional = true }
 pyo3 = { version = "0.28.0", features = ["extension-module"] }
 # Zeroizing wrapper for transient operator-seed copies in the

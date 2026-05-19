@@ -8,13 +8,13 @@ For the design philosophy, architecture rationale, and benchmarks, see the [proj
 
 ```bash
 # Rust SDK
-cargo add ai2070-net-sdk
+cargo add net-mesh-sdk
 
 # TypeScript / Node SDK
-npm install @ai2070/net-sdk @ai2070/net
+npm install @net-mesh/sdk @net-mesh/core
 
 # Python SDK
-pip install ai2070-net-sdk
+pip install net-mesh-sdk
 
 # Go binding
 go get github.com/ai-2070/net/go
@@ -23,12 +23,12 @@ go get github.com/ai-2070/net/go
 Lower-level packages (skip the SDK ergonomics, talk directly to the engine):
 
 ```bash
-cargo add ai2070-net          # Rust core
-npm install @ai2070/net       # NAPI binding
-pip install ai2070-net        # PyO3 binding
+cargo add net-mesh          # Rust core
+npm install @net-mesh/core       # NAPI binding
+pip install net-mesh        # PyO3 binding
 ```
 
-Crate / module names inside source code (`net::`, `net_sdk::`, `from net import`, `from net_sdk import`) stayed stable across the rename via package aliasing. The registry-side names are `ai2070-net*` / `@ai2070/net*`. Per-language usage in [SDKs](#sdks); building the C SDK in [Building](#building).
+Crate / module names inside source code (`net::`, `net_sdk::`, `from net import`, `from net_sdk import`) stayed stable across the rename via package aliasing. The registry-side names are `net-mesh*` / `@net-mesh/core*`. Per-language usage in [SDKs](#sdks); building the C SDK in [Building](#building).
 
 ## Contents
 
@@ -558,7 +558,7 @@ Both models expose a reactive `watch(filter)` that returns a `Stream<Item = Vec<
 
 Tasks and memories coexist on the same `Redex` manager without cross-channel leakage: each model owns a distinct `ChannelName` (`cortex/tasks`, `cortex/memories`) and partitions its dispatches under the CortEX-internal range `0x00..=0x7F` (with static asserts). Application / vendor dispatches get `0x80..=0xFF`.
 
-Typed errors cross the FFI boundary as classes on both Node and Python bindings: `CortexError` for adapter-level failures (`adapter closed`, `fold stopped at seq N`, underlying RedEX errors) and `NetDbError` for handle-level failures (snapshot encode / decode, missing-model accesses). The Node side uses stable `cortex:` / `netdb:` message prefixes classified into typed `Error` subclasses by `@ai2070/net/errors::classifyError`; the Python side exposes `net._net.CortexError` / `net._net.NetDbError` directly via `pyo3::create_exception!`.
+Typed errors cross the FFI boundary as classes on both Node and Python bindings: `CortexError` for adapter-level failures (`adapter closed`, `fold stopped at seq N`, underlying RedEX errors) and `NetDbError` for handle-level failures (snapshot encode / decode, missing-model accesses). The Node side uses stable `cortex:` / `netdb:` message prefixes classified into typed `Error` subclasses by `@net-mesh/core/errors::classifyError`; the Python side exposes `net._net.CortexError` / `net._net.NetDbError` directly via `pyo3::create_exception!`.
 
 ## NetDB
 
@@ -583,7 +583,7 @@ let pending = db.tasks().state().read().find_many(&TasksFilter {
 
 Whole-db snapshot is a single call. `db.snapshot()` walks every enabled model under its own state lock (consistent per-model; there is no cross-model consistency guarantee because each model backs a separate RedEX file), returning a `NetDbSnapshot { tasks, memories }` bundle. `NetDbSnapshot::encode()` produces a single postcard blob for persistence; `NetDbSnapshot::decode(bytes)` round-trips it, and `NetDbBuilder::build_from_snapshot(&bundle)` restores every enabled model in one call. Models enabled via `with_*()` whose bundle entry is `None` are opened from scratch — the same fallback path used by a fresh `build`.
 
-NetDB ships the same surface on Rust, Node (`@ai2070/net` napi bindings), and Python (`net._net` PyO3 bindings). The Node and Python handles carry the same CRUD + query methods; `NetDb.open(config)` on both sides is failure-atomic and supports the same whole-db snapshot bundle cross-language (postcard is stable across the FFI boundary).
+NetDB ships the same surface on Rust, Node (`@net-mesh/core` napi bindings), and Python (`net._net` PyO3 bindings). The Node and Python handles carry the same CRUD + query methods; `NetDb.open(config)` on both sides is failure-atomic and supports the same whole-db snapshot bundle cross-language (postcard is stable across the FFI boundary).
 
 ## Dataforts
 
@@ -860,7 +860,7 @@ MeshDB is the federated query layer above the capability-query primitives and Co
 **Per-binding usage.** Each SDK README documents the language-idiomatic surface:
 
 - **Rust** — [`sdk/README.md`](sdk/README.md): the `MeshQuery` AST + `LocalMeshQueryExecutor` directly from `net::adapter::net::behavior::meshdb`.
-- **TypeScript** — [`sdk-ts/README.md`](sdk-ts/README.md): `MeshQuery` static factories + `MeshQueryRunner` from `@ai2070/net`, with Promise-of-AsyncIterable execution and the `for await` shim from `@ai2070/net/meshdb`.
+- **TypeScript** — [`sdk-ts/README.md`](sdk-ts/README.md): `MeshQuery` static factories + `MeshQueryRunner` from `@net-mesh/core`, with Promise-of-AsyncIterable execution and the `for await` shim from `@net-mesh/core/meshdb`.
 - **Python** — [`sdk-py/README.md`](sdk-py/README.md): `MeshQuery` / `MeshQueryRunner` / `InMemoryChainReader` + the fluent `QueryBuilder` from the `net` package; sync runner around an internal Tokio runtime.
 - **Go** — [`bindings/go/net/meshdb.go`](bindings/go/net/meshdb.go): cgo wrapper over `libnet_meshdb`; `MeshDBQuery*` factories return a channel from `(*MeshDBRunner).Execute`.
 - **C / C++ / etc.** — [`include/net_meshdb.h`](include/net_meshdb.h): drop-in header for the `libnet_meshdb` cdylib (24 `net_meshdb_*` exports, sentinel-envelope JSON decoder at the FFI boundary).
@@ -1112,13 +1112,13 @@ All SDKs wrap the same Rust core. Every language gets the same performance.
 
 | SDK | Package | Install | Highlights |
 |-----|---------|---------|------------|
-| **Rust** | [`ai2070-net-sdk`](https://crates.io/crates/ai2070-net-sdk) | `cargo add ai2070-net-sdk` | Builder pattern, async streams, typed subscriptions |
-| **TypeScript** | [`@ai2070/net-sdk`](https://www.npmjs.com/package/@ai2070/net-sdk) | `npm install @ai2070/net-sdk @ai2070/net` | AsyncIterator, typed channels, Zod support |
-| **Python** | [`ai2070-net-sdk`](https://pypi.org/project/ai2070-net-sdk/) | `pip install ai2070-net-sdk` | Generators, dataclass/Pydantic, context manager |
+| **Rust** | [`net-mesh-sdk`](https://crates.io/crates/net-mesh-sdk) | `cargo add net-mesh-sdk` | Builder pattern, async streams, typed subscriptions |
+| **TypeScript** | [`@net-mesh/sdk`](https://www.npmjs.com/package/@net-mesh/sdk) | `npm install @net-mesh/sdk @net-mesh/core` | AsyncIterator, typed channels, Zod support |
+| **Python** | [`net-mesh-sdk`](https://pypi.org/project/net-mesh-sdk/) | `pip install net-mesh-sdk` | Generators, dataclass/Pydantic, context manager |
 | **Go** | [`go`](../../../go/) | `go get github.com/ai-2070/net/go` | CGO bindings, zero allocations on raw ingest |
 | **C** | [`net.h`](include/net.h) | `cargo build --release --features ffi,net` then bundle the header | One header, structured types, zero JSON overhead |
 
-The Rust SDK imports as `use net_sdk::...`; the TypeScript SDK as `from '@ai2070/net-sdk'`; the Python SDK as `from net_sdk import ...`. The Rust core (`ai2070-net`), Node binding (`@ai2070/net`), and Python binding (`ai2070-net`) are the lower-level packages — useful when you want to skip the SDK ergonomics. Crate / module names inside the code (`net::`, `net._net`) stayed stable across the rename via package aliasing.
+The Rust SDK imports as `use net_sdk::...`; the TypeScript SDK as `from '@net-mesh/sdk'`; the Python SDK as `from net_sdk import ...`. The Rust core (`net-mesh`), Node binding (`@net-mesh/core`), and Python binding (`net-mesh`) are the lower-level packages — useful when you want to skip the SDK ergonomics. Crate / module names inside the code (`net::`, `net._net`) stayed stable across the rename via package aliasing.
 
 ### Rust
 
@@ -1148,7 +1148,7 @@ node.shutdown().await?;
 ### TypeScript
 
 ```typescript
-import { NetNode } from '@ai2070/net-sdk';
+import { NetNode } from '@net-mesh/sdk';
 
 const node = await NetNode.create({ shards: 4 });
 
@@ -1301,7 +1301,7 @@ cargo test --test integration_netdb --features netdb
 # Rust SDK smoke tests (2 async + 3 doctests)
 cargo test --features net -p net-sdk
 
-# Node SDK smoke tests (62 tests — CortEX tasks + memories over napi, plus ABI stability, errors, NetDb handle, RedEX, and integration coverage. Includes watch/AsyncIterator, disk durability, snapshot/restore round-trip, and classified CortexError/NetDbError from @ai2070/net/errors)
+# Node SDK smoke tests (62 tests — CortEX tasks + memories over napi, plus ABI stability, errors, NetDb handle, RedEX, and integration coverage. Includes watch/AsyncIterator, disk durability, snapshot/restore round-trip, and classified CortexError/NetDbError from @net-mesh/core/errors)
 cd bindings/node && npx napi build --platform --no-default-features -F cortex && npx vitest run
 
 # Python SDK smoke tests (~190 collected — CortEX, NetDB, RedEX, channels + auth, capabilities, identity, compute + groups, snapshot/watch, subnets, ABI stability, and the Redis dedup helper. Total varies by enabled features.)
@@ -1315,7 +1315,7 @@ cargo test --test integration_redis --features redis
 cargo test --test integration_jetstream --features jetstream
 ```
 
-**~1,811 tests total across the Rust stack** — lib (1,573) + migration (53) + three_node (66) + integration_net (13) + integration_redex (27) + integration_cortex_{adapter,tasks,memories} (9+32+25) + integration_netdb (13). Plus 62 Node SDK smoke tests (vitest) and ~190 Python SDK smoke tests (pytest), both covering CRUD, filtered queries, reactive watchers, multi-model coexistence, disk-durability round-trips, whole-db `NetDb` snapshot/restore, per-adapter `open_from_snapshot`, and classified `CortexError` / `NetDbError` via the `@ai2070/net/errors` subpath (Node) / `net._net` module (Python).
+**~1,811 tests total across the Rust stack** — lib (1,573) + migration (53) + three_node (66) + integration_net (13) + integration_redex (27) + integration_cortex_{adapter,tasks,memories} (9+32+25) + integration_netdb (13). Plus 62 Node SDK smoke tests (vitest) and ~190 Python SDK smoke tests (pytest), both covering CRUD, filtered queries, reactive watchers, multi-model coexistence, disk-durability round-trips, whole-db `NetDb` snapshot/restore, per-adapter `open_from_snapshot`, and classified `CortexError` / `NetDbError` via the `@net-mesh/core/errors` subpath (Node) / `net._net` module (Python).
 
 ### Test Architecture
 

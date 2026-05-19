@@ -2,7 +2,7 @@
  * Typed channels — strongly typed pub/sub over named channels.
  */
 
-import type { Net as NapiNet } from '@ai2070/net';
+import type { Net as NapiNet } from '@net-mesh/core';
 import type { SubscribeOpts, StoredEvent } from './types';
 import { EventStream, TypedEventStream } from './stream';
 
