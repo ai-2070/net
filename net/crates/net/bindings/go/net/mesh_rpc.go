@@ -1366,15 +1366,17 @@ func (c *ClientStreamCall) Send(body []byte) error {
 // body on success. Consumes the call — subsequent Send / Finish
 // return ErrStreamDone, and Close becomes a no-op.
 func (c *ClientStreamCall) Finish() ([]byte, error) {
-	if c.closed.Load() {
+	// Atomic claim of `closed`. If we lose the race to a concurrent
+	// Close, return ErrStreamDone without touching the handle — the
+	// winner is responsible for free. Load-then-Store would race
+	// with Close.Swap and double-free.
+	if c.closed.Swap(true) {
 		return nil, ErrStreamDone
 	}
 	var outBody *C.uint8_t
 	var outBodyLen C.size_t
 	var outErr *C.char
 	code := C.net_rpc_client_stream_finish(c.handle, &outBody, &outBodyLen, &outErr)
-	// Whatever the outcome, the call is done.
-	c.closed.Store(true)
 	runtime.SetFinalizer(c, nil)
 	defer func() {
 		C.net_rpc_client_stream_free(c.handle)
@@ -1586,7 +1588,9 @@ func (d *DuplexCall) Recv() ([]byte, error) {
 // no-ops. CANCEL fires only when BOTH split halves drop without
 // a clean close.
 func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
-	if d.closed.Load() {
+	// Atomic claim: lose the race to a concurrent Close and the
+	// handle is already freed; bail out without touching it.
+	if d.closed.Swap(true) {
 		return nil, nil, ErrStreamDone
 	}
 	var outSink *C.DuplexSinkHandleC
@@ -1595,6 +1599,14 @@ func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
 	code := C.net_rpc_duplex_into_split(d.handle, &outSink, &outStream, &outErr)
 	if code != 0 {
 		msg := readCError(outErr)
+		// We've already latched closed=true. Release the shell so
+		// it isn't leaked.
+		runtime.SetFinalizer(d, nil)
+		C.net_rpc_duplex_free(d.handle)
+		d.handle = nil
+		if d.cancel != nil {
+			d.cancel()
+		}
 		switch code {
 		case -6:
 			return nil, nil, ErrStreamDone
@@ -1602,10 +1614,6 @@ func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
 			return nil, nil, fmt.Errorf("net_rpc_duplex_into_split returned %d: %s", int(code), msg)
 		}
 	}
-	// Latch the original handle done — the FFI side already did
-	// this, but mirror it in Go so a stray Recv / Send on the
-	// original returns ErrStreamDone quickly without a cgo trip.
-	d.closed.Store(true)
 	runtime.SetFinalizer(d, nil)
 	// The original's C handle is still valid (it's an empty shell
 	// after into_split); free it explicitly so we don't rely on
@@ -1672,12 +1680,13 @@ func (s *DuplexSink) Send(body []byte) error {
 // Finish closes the upload direction (emits REQUEST_END).
 // Consumes the sink — subsequent Send returns ErrStreamDone.
 func (s *DuplexSink) Finish() error {
-	if s.closed.Load() {
+	// Atomic claim: lose the race to a concurrent Close and the
+	// handle is already freed.
+	if s.closed.Swap(true) {
 		return ErrStreamDone
 	}
 	var outErr *C.char
 	code := C.net_rpc_duplex_sink_finish(s.handle, &outErr)
-	s.closed.Store(true)
 	runtime.SetFinalizer(s, nil)
 	defer func() {
 		C.net_rpc_duplex_sink_free(s.handle)
