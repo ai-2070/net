@@ -538,3 +538,37 @@ async fn helper_fold_announcement_lands_in_every_index() {
     assert!(a.capability_index_arc().get(a.node_id()).is_some());
     assert!(b.capability_index_arc().get(a.node_id()).is_some());
 }
+
+/// H4 regression — multiple `subnet:<hex>` tags on one
+/// announcement used to pick a hash-order-dependent winner
+/// (HashSet iteration order is unspecified), so the gate's
+/// subnet-axis verdict diverged across receivers for the same
+/// signed announcement. Post-fix, multiple distinct subnet tags
+/// collapse to `None` (out-of-model malformed input → no
+/// membership). Single subnet tag still parses as expected.
+#[tokio::test]
+async fn membership_parse_returns_no_subnet_when_announcement_has_multiple_subnet_tags() {
+    let node = build_node().await;
+    let s1 = SubnetId([0xAA; 16]);
+    let s2 = SubnetId([0xBB; 16]);
+
+    // Hand-build an announcement carrying two distinct subnet
+    // tags. `caller_announcement` only takes one Option<SubnetId>;
+    // assemble the CapabilitySet directly.
+    let caps = CapabilitySet::new()
+        .add_tag(&s1.to_tag())
+        .add_tag(&s2.to_tag())
+        .add_tag("nrpc:probe");
+    let ann = CapabilityAnnouncement::new(
+        node.node_id(),
+        node.entity_id().clone(),
+        1,
+        caps,
+    );
+    node.capability_index_arc().index(ann);
+    assert_eq!(
+        node.capability_index_arc().subnet_of(node.node_id()),
+        None,
+        "two distinct subnet tags must collapse to no membership for deterministic gate verdicts",
+    );
+}

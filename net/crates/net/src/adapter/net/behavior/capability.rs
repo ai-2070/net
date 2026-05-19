@@ -725,24 +725,31 @@ pub(crate) fn scope_from_tags(tags: &HashSet<Tag>) -> CapabilityScope {
 /// capability-auth `may_execute` gate can look up a peer's
 /// declared membership in O(1) without re-walking tags per call.
 ///
-/// First valid `subnet:` tag wins — multiple subnet tags on one
-/// announcement are not in the model. All distinct `group:` tags
-/// accumulate; duplicates (Eq) are removed.
+/// Multiple `subnet:` tags on one announcement are out of model:
+/// the substrate treats subnet membership as single-valued. To
+/// keep the gate verdict deterministic across receivers — a
+/// previous implementation read whichever subnet tag the
+/// `HashSet<Tag>` iterator surfaced first, which is hash-order
+/// dependent — multiple distinct subnet tags collapse to `None`
+/// and the announcement contributes no subnet membership. Single
+/// subnet tag works as expected. All distinct `group:` tags
+/// accumulate (deterministically sorted by byte value so receivers
+/// agree on iteration order); duplicates (Eq) are removed.
 pub(crate) fn parse_membership_tags(
     tags: &HashSet<Tag>,
 ) -> (
     Option<super::subnet::SubnetId>,
     Vec<super::group::GroupId>,
 ) {
-    let mut subnet: Option<super::subnet::SubnetId> = None;
+    let mut subnet_candidates: Vec<super::subnet::SubnetId> = Vec::new();
     let mut groups: Vec<super::group::GroupId> = Vec::new();
     for tag in tags {
         let rendered = tag.to_string();
-        if subnet.is_none() {
-            if let Some(s) = super::subnet::SubnetId::from_tag(&rendered) {
-                subnet = Some(s);
-                continue;
+        if let Some(s) = super::subnet::SubnetId::from_tag(&rendered) {
+            if !subnet_candidates.contains(&s) {
+                subnet_candidates.push(s);
             }
+            continue;
         }
         if let Some(g) = super::group::GroupId::from_tag(&rendered) {
             if !groups.contains(&g) {
@@ -750,6 +757,18 @@ pub(crate) fn parse_membership_tags(
             }
         }
     }
+    // Single distinct subnet → use it; zero or multiple → no
+    // subnet membership (multiple is out-of-model malformed and
+    // would otherwise pick a hash-order-dependent winner).
+    let subnet = if subnet_candidates.len() == 1 {
+        Some(subnet_candidates[0])
+    } else {
+        None
+    };
+    // Deterministic group order so receivers agree on iteration
+    // sequence regardless of local hash randomization. Lexicographic
+    // by byte value is stable and cheap on the 32-byte payload.
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
     (subnet, groups)
 }
 
@@ -5829,12 +5848,64 @@ mod tests {
             vec![],
         ));
         assert_eq!(index.subnet_of(7), Some(subnet));
-        let mut groups = index.groups_of(7);
-        groups.sort_by_key(|g| g.0);
-        assert_eq!(groups, vec![g1, g2]);
+        // Group order is now deterministic (sorted by byte value),
+        // so callers don't need to re-sort to compare against an
+        // expected sequence.
+        assert_eq!(index.groups_of(7), vec![g1, g2]);
         // Unknown node returns None / empty — never a panic.
         assert_eq!(index.subnet_of(999), None);
         assert!(index.groups_of(999).is_empty());
+    }
+
+    /// H4 regression — multiple `subnet:<hex>` tags on one
+    /// announcement used to pick a hash-order-dependent winner,
+    /// making the gate's subnet verdict non-deterministic across
+    /// receivers. The model treats subnet membership as
+    /// single-valued; multiple distinct subnet tags now collapse
+    /// to `None` (out-of-model malformed input → no membership)
+    /// rather than admitting one arbitrarily.
+    #[test]
+    fn subnet_of_returns_none_when_announcement_carries_multiple_subnet_tags() {
+        let index = CapabilityIndex::new();
+        let s1 = super::super::subnet::SubnetId([0x11; 16]);
+        let s2 = super::super::subnet::SubnetId([0x22; 16]);
+        // Hand-build a CapabilitySet with two distinct subnet
+        // tags. `auth_ann` only takes one Option<SubnetId>, so
+        // bypass it.
+        let caps = CapabilitySet::new()
+            .add_tag(&s1.to_tag())
+            .add_tag(&s2.to_tag())
+            .add_tag("nrpc:echo");
+        let entity = super::super::super::identity::EntityId::from_bytes([0xCD; 32]);
+        let ann = CapabilityAnnouncement::new(5, entity, 1, caps);
+        index.index(ann);
+        assert_eq!(
+            index.subnet_of(5),
+            None,
+            "two distinct subnet tags must collapse to no membership",
+        );
+    }
+
+    /// Duplicate `subnet:<hex>` tags pointing at the SAME subnet
+    /// are not malformed (set semantics dedup them at the wire
+    /// level) — confirm the parser still returns the single value
+    /// when only one distinct subnet survives.
+    #[test]
+    fn subnet_of_picks_single_distinct_value_even_when_set_has_one_entry() {
+        let index = CapabilityIndex::new();
+        let s1 = super::super::subnet::SubnetId([0x33; 16]);
+        // `add_tag` parses and inserts into a HashSet<Tag> — two
+        // identical tag strings collapse to one entry. This pins
+        // that the dedup happens at the tag-set layer, not at
+        // the parser.
+        let caps = CapabilitySet::new()
+            .add_tag(&s1.to_tag())
+            .add_tag(&s1.to_tag())
+            .add_tag("nrpc:echo");
+        let entity = super::super::super::identity::EntityId::from_bytes([0xCE; 32]);
+        let ann = CapabilityAnnouncement::new(6, entity, 1, caps);
+        index.index(ann);
+        assert_eq!(index.subnet_of(6), Some(s1));
     }
 
     /// Regression for a cubic-flagged P1: adding `hop_count` to the
