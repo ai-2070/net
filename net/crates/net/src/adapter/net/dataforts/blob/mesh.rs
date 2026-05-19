@@ -110,6 +110,53 @@ pub const DEFAULT_OVERFLOW_MAX_PUSHES_PER_TICK: usize = 16;
 /// consumers needing TB-scale walks page through smaller slices.
 pub const MAX_FETCH_RANGE_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Type alias for the per-adapter Reed-Solomon encoder cache.
+/// Factored out to keep the field declaration readable and to
+/// satisfy clippy's type-complexity threshold.
+type RsEncoderCache = Arc<parking_lot::Mutex<HashMap<(u8, u8), Arc<super::erasure::RsEncoder>>>>;
+
+/// Three capability probes a producer consults before publishing
+/// a v0.3 blob: Tree-support (used as the Tree-vs-Manifest gate),
+/// CDC-support (used by [`super::cdc::cdc_downgrade`]), and
+/// erasure-support (used by [`super::erasure::erasure_downgrade`]).
+///
+/// Grouped into a struct because every v0.3 publish call site
+/// consults all three together; passing seven flat arguments to
+/// [`MeshBlobAdapter::publish_stream_with_downgrade`] trips
+/// clippy's argument-count threshold AND makes call sites hard
+/// to read.
+///
+/// Construct via [`Self::all_supported`] for the
+/// single-cluster all-Phase-D case, or build the struct directly
+/// with custom probes for the cross-version rollout case.
+#[derive(Debug)]
+pub struct DowngradeProbes<'a> {
+    /// `BlobRef::Tree` capability probe — decides Tree vs
+    /// Manifest at the top of `publish_stream_with_downgrade`.
+    pub tree: &'a TreeSupportProbe,
+    /// Content-defined-chunking capability probe — feeds
+    /// `cdc_downgrade` so peers without CDC support get
+    /// `Fixed` chunks they can re-derive.
+    pub cdc: &'a super::cdc::CdcSupportProbe,
+    /// Reed-Solomon erasure-coding capability probe — feeds
+    /// `erasure_downgrade` so peers without RS support get
+    /// `Replicated` stripes they can reconstruct.
+    pub erasure: &'a super::erasure::ErasureSupportProbe,
+}
+
+impl<'a> DowngradeProbes<'a> {
+    /// Construct a `DowngradeProbes` from a flat triple of
+    /// borrowed probes. Equivalent to writing the struct
+    /// literal directly, but reads better at call sites.
+    pub fn new(
+        tree: &'a TreeSupportProbe,
+        cdc: &'a super::cdc::CdcSupportProbe,
+        erasure: &'a super::erasure::ErasureSupportProbe,
+    ) -> Self {
+        Self { tree, cdc, erasure }
+    }
+}
+
 /// Default tick cadence. Independent of the gravity tick —
 /// overflow is push-driven by local disk state, not by
 /// inbound heat. 30 s is short enough that a node above the
@@ -331,7 +378,7 @@ pub struct MeshBlobAdapter {
     /// reconstruction over many stripes pays the build cost
     /// exactly once per distinct `(k, m)`. Adapter clones share
     /// the same cache via `Arc`.
-    rs_encoder_cache: Arc<parking_lot::Mutex<HashMap<(u8, u8), Arc<super::erasure::RsEncoder>>>>,
+    rs_encoder_cache: RsEncoderCache,
     /// Per-stripe cooldown for `auto_repair_on_fetch`. Maps a
     /// stripe-fingerprint to the last `Instant` at which an
     /// auto-repair persist fired for it. Without this gate, a
@@ -1610,9 +1657,7 @@ impl MeshBlobAdapter {
         encoding: Encoding,
         chunking: ChunkingStrategy,
         size_hint: Option<u64>,
-        tree_probe: &TreeSupportProbe,
-        cdc_probe: &super::cdc::CdcSupportProbe,
-        erasure_probe: &super::erasure::ErasureSupportProbe,
+        probes: &DowngradeProbes<'_>,
     ) -> Result<BlobRef, BlobError> {
         // Apply CDC + erasure downgrades up-front so the Tree /
         // Manifest decision below sees the final effective values.
@@ -1620,9 +1665,9 @@ impl MeshBlobAdapter {
         // + `Encoding::ReedSolomon` against a cluster where only some
         // peers advertise the matching capability tags and silently
         // emit a Tree blob the legacy peers cannot reconstruct.
-        let chunking = super::cdc::cdc_downgrade(chunking, cdc_probe);
-        let encoding = super::erasure::erasure_downgrade(encoding, erasure_probe);
-        let tree_supported = tree_probe.check();
+        let chunking = super::cdc::cdc_downgrade(chunking, probes.cdc);
+        let encoding = super::erasure::erasure_downgrade(encoding, probes.erasure);
+        let tree_supported = probes.tree.check();
         let above_threshold = size_hint.map(|s| s >= TREE_THRESHOLD_BYTES).unwrap_or(true);
         // The Manifest downgrade path caps at BLOB_REF_MAX_SIZE
         // (16 GiB). Streams whose size_hint exceeds that cap but
@@ -6062,9 +6107,11 @@ mod tests {
                 Encoding::Replicated,
                 ChunkingStrategy::default(),
                 Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
-                &TreeSupportProbe::AlwaysSupported,
-                &CdcSupportProbe::AlwaysSupported,
-                &ErasureSupportProbe::AlwaysSupported,
+                &DowngradeProbes::new(
+                    &TreeSupportProbe::AlwaysSupported,
+                    &CdcSupportProbe::AlwaysSupported,
+                    &ErasureSupportProbe::AlwaysSupported,
+                ),
             )
             .await
             .unwrap();
@@ -6083,9 +6130,11 @@ mod tests {
                 Encoding::Replicated,
                 ChunkingStrategy::default(),
                 Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
-                &TreeSupportProbe::ForceManifest,
-                &CdcSupportProbe::AlwaysSupported,
-                &ErasureSupportProbe::AlwaysSupported,
+                &DowngradeProbes::new(
+                    &TreeSupportProbe::ForceManifest,
+                    &CdcSupportProbe::AlwaysSupported,
+                    &ErasureSupportProbe::AlwaysSupported,
+                ),
             )
             .await
             .unwrap();
@@ -6107,9 +6156,11 @@ mod tests {
                 Encoding::Replicated,
                 ChunkingStrategy::default(),
                 Some(BLOB_CHUNK_SIZE_BYTES * 2),
-                &TreeSupportProbe::AlwaysSupported,
-                &CdcSupportProbe::AlwaysSupported,
-                &ErasureSupportProbe::AlwaysSupported,
+                &DowngradeProbes::new(
+                    &TreeSupportProbe::AlwaysSupported,
+                    &CdcSupportProbe::AlwaysSupported,
+                    &ErasureSupportProbe::AlwaysSupported,
+                ),
             )
             .await
             .unwrap();
@@ -6140,9 +6191,11 @@ mod tests {
                 Encoding::Replicated,
                 ChunkingStrategy::default(),
                 Some(24 * 1024 * 1024 * 1024),
-                &TreeSupportProbe::AlwaysSupported,
-                &CdcSupportProbe::AlwaysSupported,
-                &ErasureSupportProbe::AlwaysSupported,
+                &DowngradeProbes::new(
+                    &TreeSupportProbe::AlwaysSupported,
+                    &CdcSupportProbe::AlwaysSupported,
+                    &ErasureSupportProbe::AlwaysSupported,
+                ),
             )
             .await
             .unwrap();
@@ -6170,9 +6223,11 @@ mod tests {
                 Encoding::Replicated,
                 ChunkingStrategy::default(),
                 Some(24 * 1024 * 1024 * 1024),
-                &TreeSupportProbe::ForceManifest,
-                &CdcSupportProbe::AlwaysSupported,
-                &ErasureSupportProbe::AlwaysSupported,
+                &DowngradeProbes::new(
+                    &TreeSupportProbe::ForceManifest,
+                    &CdcSupportProbe::AlwaysSupported,
+                    &ErasureSupportProbe::AlwaysSupported,
+                ),
             )
             .await
             .unwrap();
@@ -6198,9 +6253,11 @@ mod tests {
                 Encoding::Replicated,
                 ChunkingStrategy::default(),
                 Some(1024),
-                &TreeSupportProbe::AlwaysSupported,
-                &CdcSupportProbe::AlwaysSupported,
-                &ErasureSupportProbe::AlwaysSupported,
+                &DowngradeProbes::new(
+                    &TreeSupportProbe::AlwaysSupported,
+                    &CdcSupportProbe::AlwaysSupported,
+                    &ErasureSupportProbe::AlwaysSupported,
+                ),
             )
             .await
             .unwrap();
@@ -6220,9 +6277,11 @@ mod tests {
                 Encoding::Replicated,
                 ChunkingStrategy::default(),
                 Some(0),
-                &TreeSupportProbe::AlwaysSupported,
-                &CdcSupportProbe::AlwaysSupported,
-                &ErasureSupportProbe::AlwaysSupported,
+                &DowngradeProbes::new(
+                    &TreeSupportProbe::AlwaysSupported,
+                    &CdcSupportProbe::AlwaysSupported,
+                    &ErasureSupportProbe::AlwaysSupported,
+                ),
             )
             .await
             .unwrap_err();
@@ -6249,9 +6308,11 @@ mod tests {
                 Encoding::Replicated,
                 ChunkingStrategy::default(),
                 Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
-                &probe,
-                &CdcSupportProbe::AlwaysSupported,
-                &ErasureSupportProbe::AlwaysSupported,
+                &DowngradeProbes::new(
+                    &probe,
+                    &CdcSupportProbe::AlwaysSupported,
+                    &ErasureSupportProbe::AlwaysSupported,
+                ),
             )
             .await
             .unwrap();
@@ -6265,9 +6326,11 @@ mod tests {
                 Encoding::Replicated,
                 ChunkingStrategy::default(),
                 Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
-                &probe,
-                &CdcSupportProbe::AlwaysSupported,
-                &ErasureSupportProbe::AlwaysSupported,
+                &DowngradeProbes::new(
+                    &probe,
+                    &CdcSupportProbe::AlwaysSupported,
+                    &ErasureSupportProbe::AlwaysSupported,
+                ),
             )
             .await
             .unwrap();
@@ -6297,9 +6360,11 @@ mod tests {
                     max: super::super::cdc::PRODUCTION_CDC_PARAMS.max,
                 },
                 Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
-                &TreeSupportProbe::AlwaysSupported,
-                &CdcSupportProbe::ForceFixed,
-                &ErasureSupportProbe::AlwaysSupported,
+                &DowngradeProbes::new(
+                    &TreeSupportProbe::AlwaysSupported,
+                    &CdcSupportProbe::ForceFixed,
+                    &ErasureSupportProbe::AlwaysSupported,
+                ),
             )
             .await
             .unwrap();
@@ -6309,9 +6374,11 @@ mod tests {
                 Encoding::Replicated,
                 ChunkingStrategy::default(),
                 Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
-                &TreeSupportProbe::AlwaysSupported,
-                &CdcSupportProbe::AlwaysSupported,
-                &ErasureSupportProbe::AlwaysSupported,
+                &DowngradeProbes::new(
+                    &TreeSupportProbe::AlwaysSupported,
+                    &CdcSupportProbe::AlwaysSupported,
+                    &ErasureSupportProbe::AlwaysSupported,
+                ),
             )
             .await
             .unwrap();
@@ -6338,9 +6405,11 @@ mod tests {
                 Encoding::ReedSolomon { k: 4, m: 2 },
                 ChunkingStrategy::default(),
                 Some(super::super::blob_tree::TREE_THRESHOLD_BYTES + 1),
-                &TreeSupportProbe::AlwaysSupported,
-                &CdcSupportProbe::AlwaysSupported,
-                &ErasureSupportProbe::ForceReplicated,
+                &DowngradeProbes::new(
+                    &TreeSupportProbe::AlwaysSupported,
+                    &CdcSupportProbe::AlwaysSupported,
+                    &ErasureSupportProbe::ForceReplicated,
+                ),
             )
             .await
             .unwrap();

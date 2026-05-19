@@ -123,7 +123,7 @@ pub struct BandwidthBudget {
     /// Realtime a permanent free pass.
     ///
     /// The accountant is monotonic-increasing on Realtime admit
-    /// + monotonic-decreasing on refund; clamped at 0 so an
+    /// and monotonic-decreasing on refund; clamped at 0 so an
     /// over-refund (refund > debt) credits the remainder to the
     /// general pool.
     realtime_debt: f64,
