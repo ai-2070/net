@@ -539,6 +539,32 @@ async fn helper_fold_announcement_lands_in_every_index() {
     assert!(b.capability_index_arc().get(a.node_id()).is_some());
 }
 
+/// M1 regression — `CapabilityAnnouncement::from_bytes` must
+/// reject announcements whose allow-lists exceed
+/// `MAX_ALLOW_LIST_LEN`. Pre-fix the wire path accepted any
+/// vector length the JSON delivered, asymmetric with the CLI's
+/// announce-side check and letting a malicious peer fold
+/// unbounded allow-lists that `may_execute` would linearly scan
+/// on every call.
+#[tokio::test]
+async fn from_bytes_rejects_oversized_allow_list() {
+    use net::adapter::net::behavior::capability::MAX_ALLOW_LIST_LEN;
+    let node = build_node().await;
+    let caps = CapabilitySet::new().add_tag("nrpc:probe");
+    let mut ann = CapabilityAnnouncement::new(
+        node.node_id(),
+        node.entity_id().clone(),
+        1,
+        caps,
+    );
+    ann.allowed_nodes = (0..(MAX_ALLOW_LIST_LEN as u64) + 1).collect();
+    let bytes = ann.to_bytes();
+    assert!(
+        CapabilityAnnouncement::from_bytes(&bytes).is_none(),
+        "wire-side deserializer must reject oversized allow-list",
+    );
+}
+
 /// H4 regression — multiple `subnet:<hex>` tags on one
 /// announcement used to pick a hash-order-dependent winner
 /// (HashSet iteration order is unspecified), so the gate's

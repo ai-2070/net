@@ -2211,9 +2211,24 @@ impl CapabilityAnnouncement {
         serde_json::to_vec(self).unwrap_or_default()
     }
 
-    /// Deserialize from bytes
+    /// Deserialize from bytes. Returns `None` on a JSON parse
+    /// failure OR when any v0.4 capability-auth allow-list exceeds
+    /// [`MAX_ALLOW_LIST_LEN`] — the cap is a wire-level invariant
+    /// (operators above 64 entries per axis must use a group), so
+    /// receivers reject oversized announcements at the deserializer
+    /// boundary rather than scanning unbounded vectors inside
+    /// `may_execute` on every call. Symmetric with the CLI's
+    /// announce-side check; closes the asymmetry where the
+    /// substrate accepted any vector length the wire delivered.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        serde_json::from_slice(data).ok()
+        let ann: Self = serde_json::from_slice(data).ok()?;
+        if ann.allowed_nodes.len() > MAX_ALLOW_LIST_LEN
+            || ann.allowed_subnets.len() > MAX_ALLOW_LIST_LEN
+            || ann.allowed_groups.len() > MAX_ALLOW_LIST_LEN
+        {
+            return None;
+        }
+        Some(ann)
     }
 
     /// Drop every metadata key that the substrate reserves for
@@ -5574,6 +5589,63 @@ mod tests {
         // someone bumps the cap they have to re-think wire-size
         // budgeting — explicit pin makes the change visible.
         assert_eq!(MAX_ALLOW_LIST_LEN, 64);
+    }
+
+    /// M1 regression — pre-fix, `from_bytes` accepted any allow-list
+    /// length the wire delivered; a malicious or buggy peer could
+    /// ship a million-entry `allowed_nodes` and the receiver would
+    /// fold it, with every `may_execute` then linearly scanning the
+    /// unbounded vector. Post-fix, the deserializer rejects
+    /// announcements exceeding the documented per-axis cap.
+    #[test]
+    fn from_bytes_rejects_allow_list_over_cap() {
+        for which in ["nodes", "subnets", "groups"] {
+            let mut ann = CapabilityAnnouncement::new(
+                1,
+                super::super::super::identity::EntityId::from_bytes([0xAA; 32]),
+                1,
+                sample_capability_set(),
+            );
+            match which {
+                "nodes" => {
+                    ann.allowed_nodes =
+                        (0..(MAX_ALLOW_LIST_LEN as u64) + 1).collect();
+                }
+                "subnets" => {
+                    ann.allowed_subnets = (0..(MAX_ALLOW_LIST_LEN as u8) + 1)
+                        .map(|i| super::super::subnet::SubnetId([i; 16]))
+                        .collect();
+                }
+                "groups" => {
+                    ann.allowed_groups = (0..(MAX_ALLOW_LIST_LEN as u8) + 1)
+                        .map(|i| super::super::group::GroupId([i; 32]))
+                        .collect();
+                }
+                _ => unreachable!(),
+            }
+            let bytes = ann.to_bytes();
+            assert!(
+                CapabilityAnnouncement::from_bytes(&bytes).is_none(),
+                "from_bytes must reject allowed_{which} exceeding MAX_ALLOW_LIST_LEN",
+            );
+        }
+    }
+
+    /// Boundary check — exactly `MAX_ALLOW_LIST_LEN` entries
+    /// must STILL deserialize (the cap is inclusive).
+    #[test]
+    fn from_bytes_accepts_allow_list_at_cap() {
+        let mut ann = CapabilityAnnouncement::new(
+            1,
+            super::super::super::identity::EntityId::from_bytes([0xAB; 32]),
+            1,
+            sample_capability_set(),
+        );
+        ann.allowed_nodes = (0..MAX_ALLOW_LIST_LEN as u64).collect();
+        let bytes = ann.to_bytes();
+        let decoded = CapabilityAnnouncement::from_bytes(&bytes)
+            .expect("exactly-at-cap must deserialize");
+        assert_eq!(decoded.allowed_nodes.len(), MAX_ALLOW_LIST_LEN);
     }
 
     // ─────────────────────────────────────────────────────────────────
