@@ -6904,6 +6904,18 @@ impl MeshNode {
     /// version bump is cheap and monotonic with the broadcast
     /// path — receivers always honor the highest version per
     /// `node_id`.
+    ///
+    /// **Divergence from `announce_capabilities_with`**: this sync
+    /// path intentionally skips the `nat:*` piggyback tag and the
+    /// `reflex_addr` field that the broadcast path adds. The
+    /// capability-auth gate is `nrpc:`-only, so the omission is
+    /// invisible to the gate; the spawned re-announce that
+    /// follows in `serve_rpc` lays down the full
+    /// `nat:` + `reflex_addr` form for peer-visible filtering. If
+    /// a future gate axis keys on `nat:*` (e.g. requiring callers
+    /// to be open-cone), this sync self-index becomes the
+    /// cold-start hole that re-opens it — extend the merged
+    /// `CapabilitySet` here in lockstep.
     pub(crate) fn index_self_with_local_services(&self) {
         let baseline = self.user_caps_snapshot();
         let merged = {
