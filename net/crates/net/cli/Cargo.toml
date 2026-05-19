@@ -25,8 +25,14 @@ net-sdk = { package = "net-mesh-sdk", version = "0.19.0", path = "../sdk", defau
 ] }
 
 # Clap derives the argv parser from typed structs; `env` enables
-# `NET_*` env-var fallback for global flags (`--profile` etc.).
+# `NET_MESH_*` env-var fallback for global flags (`--profile` etc.).
 clap = { version = "4", features = ["derive", "env"] }
+# `clap_complete` powers `net-mesh completion <shell>`; `clap_mangen`
+# powers `net-mesh man`. Release tarballs run those subcommands
+# post-build to capture the output into `share/bash-completion/...`
+# and `share/man/man1/net-mesh.1`.
+clap_complete = "4"
+clap_mangen = "0.2"
 
 # Multi-thread tokio for the SDK; macros for `#[tokio::main]`.
 tokio = { version = "1", features = [
@@ -71,6 +77,19 @@ sha2 = "0.11"
 
 # Typed errors at the config / identity boundary.
 thiserror = "2"
+
+# `cargo binstall net-cli` resolves prebuilt tarballs against the
+# `release-binaries-cli.yml` workflow's GitHub Release assets.
+# Defaults to the binstall convention except for the tag prefix
+# (`cli-v*`, not `net-cli-v*`) and the binary name (the crate is
+# `net-cli` but the binary inside is `net-mesh`).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/cli-v{ version }/{ name }-v{ version }-{ target }.{ archive-suffix }"
+bin-dir = "{ name }-v{ version }-{ target }/net-mesh{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [dev-dependencies]
 # Drive the binary in integration tests.
