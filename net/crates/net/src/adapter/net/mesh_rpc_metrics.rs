@@ -98,6 +98,14 @@ pub struct ServiceMetricsAtomic {
     /// control via `CallOptions::stream_window_initial`. A non-
     /// zero value means data loss.
     pub streaming_chunks_dropped_total: AtomicU64,
+    /// Inbound calls rejected by the v0.4 capability-auth callee-
+    /// side gate inside `MeshNode::serve_rpc`'s bridge — before the
+    /// handler is ever invoked. Bumped per rejected event so a
+    /// noisy unauthorized caller is visible in metrics even though
+    /// `handler_invocations_total` (which counts actual handler
+    /// runs) doesn't move. Pair with the caller-side metric
+    /// `errors_server` on the calling node for a complete picture.
+    pub capability_denied_total: AtomicU64,
 }
 
 impl ServiceMetricsAtomic {
@@ -120,6 +128,7 @@ impl ServiceMetricsAtomic {
             handler_duration_buckets: Default::default(),
             streaming_chunks_emitted_total: AtomicU64::new(0),
             streaming_chunks_dropped_total: AtomicU64::new(0),
+            capability_denied_total: AtomicU64::new(0),
         }
     }
 
@@ -294,6 +303,7 @@ impl RpcMetricsRegistry {
                 streaming_chunks_dropped_total: m
                     .streaming_chunks_dropped_total
                     .load(Ordering::Relaxed),
+                capability_denied_total: m.capability_denied_total.load(Ordering::Relaxed),
             });
         }
         services.sort_by(|a, b| a.service.cmp(&b.service));
@@ -383,6 +393,12 @@ pub struct ServiceMetrics {
     /// the producer rate or have the caller enable per-call flow
     /// control via `CallOptions::stream_window_initial`.
     pub streaming_chunks_dropped_total: u64,
+    /// Inbound calls rejected by the v0.4 capability-auth callee-
+    /// side gate inside `MeshNode::serve_rpc`'s bridge — before
+    /// the handler is ever invoked. A non-zero value paired with
+    /// zero `handler_invocations_total` movement is the
+    /// distinguishing signature of a noisy unauthorized caller.
+    pub capability_denied_total: u64,
 }
 
 impl RpcMetricsSnapshot {
@@ -594,6 +610,21 @@ impl RpcMetricsSnapshot {
             );
         }
 
+        // capability_denied_total — inbound calls rejected by the
+        // callee-side capability-auth gate before the handler runs.
+        out.push_str(
+            "# HELP nrpc_capability_denied_total Inbound nRPC calls rejected by the callee-side capability-auth gate before handler invocation.\n",
+        );
+        out.push_str("# TYPE nrpc_capability_denied_total counter\n");
+        for s in &self.services {
+            let _ = writeln!(
+                out,
+                "nrpc_capability_denied_total{{service=\"{}\"}} {}",
+                escape_label(&s.service),
+                s.capability_denied_total
+            );
+        }
+
         out
     }
 }
@@ -742,7 +773,27 @@ mod tests {
         assert!(text.contains("nrpc_handler_in_flight"));
         assert!(text.contains("nrpc_handler_duration_seconds_bucket"));
         assert!(text.contains("nrpc_streaming_chunks_emitted_total"));
+        assert!(text.contains("nrpc_capability_denied_total"));
         assert!(text.contains("le=\"+Inf\""));
+    }
+
+    /// `capability_denied_total` is bumped on the bridge-rejection
+    /// path in `serve_rpc` and surfaces through the snapshot +
+    /// Prometheus exposition path so operators can see denied
+    /// calls without inferring them from absent
+    /// `handler_invocations_total` growth.
+    #[test]
+    fn capability_denied_counter_surfaces_through_snapshot_and_prometheus() {
+        let r = RpcMetricsRegistry::new();
+        let m = r.for_service("locked");
+        m.capability_denied_total.fetch_add(2, Ordering::Relaxed);
+        let snap = r.snapshot();
+        assert_eq!(snap.services[0].capability_denied_total, 2);
+        let txt = snap.prometheus_text();
+        assert!(
+            txt.contains("nrpc_capability_denied_total{service=\"locked\"} 2"),
+            "prometheus output must surface the counter; got:\n{txt}",
+        );
     }
 
     #[test]

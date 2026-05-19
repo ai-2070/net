@@ -1591,6 +1591,12 @@ impl MeshNode {
         // emits the `CapabilityDenied` rejection before the fold
         // sees the event.
         let emit_for_bridge = Arc::clone(&emit);
+        // Clone the per-service metrics handle so the bridge can
+        // bump `capability_denied_total` on gate rejection. The
+        // fold's own clone (passed via `with_metrics`) handles the
+        // handler-side counters; this one covers the path BEFORE
+        // the handler runs, which the fold-side metrics never see.
+        let metrics_for_bridge = Arc::clone(&metrics_handle);
         let fold = Arc::new(Mutex::new(
             RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit).with_metrics(metrics_handle),
         ));
@@ -1675,6 +1681,17 @@ impl MeshNode {
                         )
                         .into_bytes(),
                     };
+                    // Server-side metrics: bump `capability_denied_total`
+                    // on the per-service counter. The fold-side
+                    // metrics never see this path (the handler isn't
+                    // invoked), so without this bump a noisy
+                    // unauthorized caller is invisible to operators
+                    // watching `nrpc_handler_invocations_total` —
+                    // the dashboard sees "0 requests" while the
+                    // caller sees `CapabilityDenied`.
+                    metrics_for_bridge
+                        .capability_denied_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     (emit_for_bridge)(meta.origin_hash, meta.seq_or_ts, resp);
                     continue;
                 }
