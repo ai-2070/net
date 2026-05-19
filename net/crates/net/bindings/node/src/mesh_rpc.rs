@@ -46,7 +46,9 @@ use ::net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
 use ::net::adapter::net::mesh_rpc::{
-    CallOptions as InnerCallOptions, RoutingPolicy as InnerRoutingPolicy,
+    CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
+    DuplexCallRaw as InnerDuplexCallRaw, DuplexSink as InnerDuplexSink,
+    DuplexStream as InnerDuplexStream, RoutingPolicy as InnerRoutingPolicy,
     RpcError as InnerRpcError, RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
 };
 use ::net::adapter::net::MeshNode;
@@ -182,6 +184,14 @@ pub struct CallOptions {
     /// `RpcStream::grant`." `None` (the default) → unbounded.
     /// Ignored by non-streaming `call` / `callService`.
     pub stream_window_initial: Option<u32>,
+    /// Client-streaming / duplex only: initial credit window for
+    /// per-call request-direction flow control. Mirror of
+    /// [`stream_window_initial`] for the upload direction. The
+    /// SDK's `ClientStreamCallTyped::send` / `DuplexCallTyped::send`
+    /// gate on credit when this is set. Server refills via
+    /// `REQUEST_GRANT` after each consumed chunk. `None`
+    /// (the default) → unbounded.
+    pub request_window_initial: Option<u32>,
     /// Caller-side cancel token for AbortSignal integration. Mint
     /// via `MeshRpc.reserveCancelToken()`, pass here, then call
     /// `MeshRpc.cancelCall(token)` from your AbortSignal listener
@@ -227,6 +237,7 @@ impl CallOptions {
             opts.deadline = Some(Instant::now() + Duration::from_millis(ms as u64));
         }
         opts.stream_window_initial = self.stream_window_initial;
+        opts.request_window_initial = self.request_window_initial;
         opts.routing_policy = InnerRoutingPolicy::default();
         if let Some(headers) = self.request_headers {
             opts.request_headers = headers
@@ -555,6 +566,302 @@ impl RpcStream {
 }
 
 // ============================================================================
+// ABI 0x0002 — Client-streaming caller-side (Phase B9-1)
+//
+// Same Arc<TokioMutex<Option<...>>> pattern as `RpcStream`. send /
+// finish hold the lock across the await; finish takes the inner
+// permanently (consumes the call). close releases without
+// emitting REQUEST_END — used when callers want to cancel
+// without finishing.
+// ============================================================================
+
+/// Open client-streaming RPC call. Push chunks via `send`, then
+/// `finish` to await the terminal response. Drop / `close` fires
+/// CANCEL via the SDK's `ClientStreamCallRaw::Drop` if `finish`
+/// wasn't reached.
+#[napi]
+pub struct ClientStreamCall {
+    inner: Arc<tokio::sync::Mutex<Option<InnerClientStreamCallRaw>>>,
+    /// Captured at construction so `callId()` doesn't take the
+    /// mutex (which `send` / `finish` may be holding across an
+    /// await).
+    call_id_cached: u64,
+    /// Cached `flow_controlled` flag for the same reason.
+    flow_controlled_cached: bool,
+}
+
+#[napi]
+impl ClientStreamCall {
+    /// Push one body chunk to the server. Encodes as the initial
+    /// REQUEST (first call) or as a REQUEST_CHUNK (subsequent).
+    /// Awaits one credit when flow control was opted in.
+    #[napi]
+    pub async fn send(&self, body: Buffer) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let call = guard
+            .as_mut()
+            .ok_or_else(|| nrpc_err("stream_closed", "client-stream call already closed"))?;
+        call.send(Bytes::copy_from_slice(body.as_ref()))
+            .await
+            .map_err(nrpc_err_from_inner)
+    }
+
+    /// Close the upload direction (emit REQUEST_END) and await
+    /// the server's terminal response. Consumes the call —
+    /// subsequent `send` / `finish` throw `stream_closed`.
+    #[napi]
+    pub async fn finish(&self) -> Result<Buffer> {
+        let mut guard = self.inner.lock().await;
+        let call = guard
+            .take()
+            .ok_or_else(|| nrpc_err("stream_closed", "client-stream call already closed"))?;
+        match call.finish().await {
+            Ok(reply) => Ok(Buffer::from(reply.body.as_ref())),
+            Err(e) => Err(nrpc_err_from_inner(e)),
+        }
+    }
+
+    /// Server-assigned `call_id` for diagnostics / trace
+    /// correlation.
+    #[napi]
+    pub async fn call_id(&self) -> BigInt {
+        BigInt::from(self.call_id_cached)
+    }
+
+    /// `true` if the call was opened with a non-`None`
+    /// `requestWindowInitial`.
+    #[napi]
+    pub async fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close without finishing. Fires CANCEL via the SDK's Drop
+    /// if the initial REQUEST has already flown. Idempotent.
+    #[napi]
+    pub async fn close(&self) {
+        let _ = self.inner.lock().await.take();
+    }
+}
+
+// ============================================================================
+// ABI 0x0002 — Duplex caller-side (Phase B9-1)
+//
+// Three classes:
+//   - DuplexCall: combined send + receive surface.
+//   - DuplexSink + DuplexStream: independent halves after `intoSplit()`.
+//
+// All three share the same Arc<TokioMutex<Option<...>>> pattern.
+// CANCEL semantics are inherited from the SDK's Arc<DuplexInner>:
+// fires only when BOTH halves drop without the response stream's
+// terminal frame.
+// ============================================================================
+
+/// Open duplex RPC call. Combined send + receive surface. Use
+/// `intoSplit()` to get independent `DuplexSink` + `DuplexStream`
+/// halves for the encoder-task / decoder-task pattern.
+#[napi]
+pub struct DuplexCall {
+    inner: Arc<tokio::sync::Mutex<Option<InnerDuplexCallRaw>>>,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+}
+
+#[napi]
+impl DuplexCall {
+    /// Push one body chunk to the server.
+    #[napi]
+    pub async fn send(&self, body: Buffer) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let call = guard
+            .as_mut()
+            .ok_or_else(|| nrpc_err("stream_closed", "duplex call already closed"))?;
+        call.send(Bytes::copy_from_slice(body.as_ref()))
+            .await
+            .map_err(nrpc_err_from_inner)
+    }
+
+    /// Close the upload direction (emit REQUEST_END). Does NOT
+    /// close the response stream — the caller drains it via
+    /// `next()` until terminal End.
+    #[napi(js_name = "finishSending")]
+    pub async fn finish_sending(&self) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let call = guard
+            .as_mut()
+            .ok_or_else(|| nrpc_err("stream_closed", "duplex call already closed"))?;
+        call.finish_sending().await.map_err(nrpc_err_from_inner)
+    }
+
+    /// Pull the next inbound response chunk. Returns `null` on
+    /// clean EOF. Throws on terminal non-Ok status.
+    #[napi]
+    pub async fn next(&self) -> Result<Option<Buffer>> {
+        let mut guard = self.inner.lock().await;
+        let call = guard
+            .as_mut()
+            .ok_or_else(|| nrpc_err("stream_closed", "duplex call already closed"))?;
+        match call.next().await {
+            Some(Ok(bytes)) => Ok(Some(Buffer::from(bytes.as_ref()))),
+            Some(Err(e)) => Err(nrpc_err_from_inner(e)),
+            None => {
+                let _ = guard.take();
+                Ok(None)
+            }
+        }
+    }
+
+    /// Split the call into independent send + receive halves.
+    /// Returns `[sink, stream]` — JS destructures as
+    /// `const [sink, stream] = await call.intoSplit()`.
+    ///
+    /// After `intoSplit` returns, this `DuplexCall` is "done" —
+    /// subsequent `send` / `finishSending` / `next` throw.
+    /// CANCEL fires only when BOTH split halves drop without
+    /// observing the response stream's terminal frame.
+    ///
+    /// Returned as a tuple because `#[napi(object)]` (the POD
+    /// wrapper) requires `FromNapiValue` fields, and `#[napi]`
+    /// classes don't implement it. Tuples surface as JS arrays
+    /// directly via napi-rs.
+    #[napi(js_name = "intoSplit")]
+    pub async fn into_split(&self) -> Result<(DuplexSink, DuplexStream)> {
+        let mut guard = self.inner.lock().await;
+        let call = guard
+            .take()
+            .ok_or_else(|| nrpc_err("stream_closed", "duplex call already closed"))?;
+        let call_id = call.call_id();
+        let flow_controlled = call.flow_controlled();
+        let (sink, stream) = call.into_split();
+        Ok((
+            DuplexSink {
+                inner: Arc::new(tokio::sync::Mutex::new(Some(sink))),
+                call_id_cached: call_id,
+                flow_controlled_cached: flow_controlled,
+            },
+            DuplexStream {
+                inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
+                call_id_cached: call_id,
+            },
+        ))
+    }
+
+    /// Server-assigned `call_id` for diagnostics.
+    #[napi]
+    pub async fn call_id(&self) -> BigInt {
+        BigInt::from(self.call_id_cached)
+    }
+
+    /// `true` if the call was opened with a non-`None`
+    /// `requestWindowInitial`. Reports the UPLOAD-direction
+    /// flow-control state.
+    #[napi]
+    pub async fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close without observing the response terminator. Fires
+    /// CANCEL via the SDK's Drop. Idempotent.
+    #[napi]
+    pub async fn close(&self) {
+        let _ = self.inner.lock().await.take();
+    }
+}
+
+/// Send-half of a `DuplexCall` after `intoSplit`.
+#[napi]
+pub struct DuplexSink {
+    inner: Arc<tokio::sync::Mutex<Option<InnerDuplexSink>>>,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+}
+
+#[napi]
+impl DuplexSink {
+    /// Push one body chunk to the server.
+    #[napi]
+    pub async fn send(&self, body: Buffer) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let sink = guard
+            .as_mut()
+            .ok_or_else(|| nrpc_err("stream_closed", "duplex sink already closed"))?;
+        sink.send(Bytes::copy_from_slice(body.as_ref()))
+            .await
+            .map_err(nrpc_err_from_inner)
+    }
+
+    /// Close the upload direction (emit REQUEST_END). Consumes
+    /// the sink — subsequent `send` throws.
+    #[napi]
+    pub async fn finish(&self) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let sink = guard
+            .take()
+            .ok_or_else(|| nrpc_err("stream_closed", "duplex sink already closed"))?;
+        sink.finish_sending().await.map_err(nrpc_err_from_inner)
+    }
+
+    /// Server-assigned `call_id`.
+    #[napi]
+    pub async fn call_id(&self) -> BigInt {
+        BigInt::from(self.call_id_cached)
+    }
+
+    /// `true` if the call was opened with a non-`None`
+    /// `requestWindowInitial`.
+    #[napi]
+    pub async fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close without emitting REQUEST_END. Idempotent.
+    #[napi]
+    pub async fn close(&self) {
+        let _ = self.inner.lock().await.take();
+    }
+}
+
+/// Receive-half of a `DuplexCall` after `intoSplit`.
+#[napi]
+pub struct DuplexStream {
+    inner: Arc<tokio::sync::Mutex<Option<InnerDuplexStream>>>,
+    call_id_cached: u64,
+}
+
+#[napi]
+impl DuplexStream {
+    /// Pull the next response chunk. Returns `null` on clean EOF.
+    /// Throws on terminal non-Ok status.
+    #[napi]
+    pub async fn next(&self) -> Result<Option<Buffer>> {
+        let mut guard = self.inner.lock().await;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| nrpc_err("stream_closed", "duplex stream already closed"))?;
+        use futures::StreamExt;
+        match stream.next().await {
+            Some(Ok(bytes)) => Ok(Some(Buffer::from(bytes.as_ref()))),
+            Some(Err(e)) => Err(nrpc_err_from_inner(e)),
+            None => {
+                let _ = guard.take();
+                Ok(None)
+            }
+        }
+    }
+
+    /// Server-assigned `call_id`.
+    #[napi]
+    pub async fn call_id(&self) -> BigInt {
+        BigInt::from(self.call_id_cached)
+    }
+
+    /// Close the stream. Idempotent.
+    #[napi]
+    pub async fn close(&self) {
+        let _ = self.inner.lock().await.take();
+    }
+}
+
+// ============================================================================
 // MeshRpc — the public envelope class.
 //
 // Constructed via `MeshRpc.fromMesh(mesh)` (matches the compute
@@ -735,6 +1042,62 @@ impl MeshRpc {
         })
     }
 
+    // ---- ABI 0x0002 client-streaming + duplex callers (B9-1) ----
+
+    /// Open a client-streaming call. Push chunks via
+    /// `call.send(buf)`, then `call.finish()` to await the
+    /// terminal response. The initial REQUEST is published
+    /// lazily on the first `send` (or on `finish` for the
+    /// degenerate zero-send path).
+    #[napi(js_name = "callClientStream")]
+    pub async fn call_client_stream(
+        &self,
+        target_node_id: BigInt,
+        service: String,
+        opts: Option<CallOptions>,
+    ) -> Result<ClientStreamCall> {
+        let target = crate::common::bigint_u64(target_node_id)?;
+        let opts = opts.unwrap_or_default().into_inner();
+        let inner = self
+            .node
+            .call_client_stream(target, &service, opts)
+            .await
+            .map_err(nrpc_err_from_inner)?;
+        let call_id_cached = inner.call_id();
+        let flow_controlled_cached = inner.flow_controlled();
+        Ok(ClientStreamCall {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+            call_id_cached,
+            flow_controlled_cached,
+        })
+    }
+
+    /// Open a duplex call. Both `requestWindowInitial` (upload
+    /// flow control) and `streamWindowInitial` (download flow
+    /// control) on `CallOptions` are independently opt-in.
+    #[napi(js_name = "callDuplex")]
+    pub async fn call_duplex(
+        &self,
+        target_node_id: BigInt,
+        service: String,
+        opts: Option<CallOptions>,
+    ) -> Result<DuplexCall> {
+        let target = crate::common::bigint_u64(target_node_id)?;
+        let opts = opts.unwrap_or_default().into_inner();
+        let inner = self
+            .node
+            .call_duplex(target, &service, opts)
+            .await
+            .map_err(nrpc_err_from_inner)?;
+        let call_id_cached = inner.call_id();
+        let flow_controlled_cached = inner.flow_controlled();
+        Ok(DuplexCall {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+            call_id_cached,
+            flow_controlled_cached,
+        })
+    }
+
     // ---- discovery ------------------------------------------------------
 
     /// All node ids currently advertising `nrpc:<service>` in the
@@ -830,6 +1193,7 @@ mod tests {
         let opts = CallOptions {
             deadline_ms: Some(500),
             stream_window_initial: Some(8),
+            request_window_initial: None,
             cancel_token: None,
             request_headers: None,
         };
@@ -859,6 +1223,7 @@ mod tests {
         let opts = CallOptions {
             deadline_ms: None,
             stream_window_initial: None,
+            request_window_initial: None,
             cancel_token: None,
             request_headers: Some(vec![
                 RpcRequestHeader {
