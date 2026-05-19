@@ -96,12 +96,13 @@ async fn drive_chunk_roles_for(blob_ref: &BlobRef, redex_a: &Arc<Redex>, redex_b
     let hashes: Vec<[u8; 32]> = match blob_ref {
         BlobRef::Small { hash, .. } => vec![*hash],
         BlobRef::Manifest { chunks, .. } => chunks.iter().map(|c| c.hash).collect(),
-        BlobRef::Tree { .. } => {
-            // v0.3 Tree-encoded blobs traverse the per-chunk
-            // replication coordinators via the substrate's
-            // manifest walk; the e2e test only exercises v0.2
-            // Manifest/Small flavors today.
-            panic!("Tree BlobRef not exercised by drive_chunk_roles_for in this e2e harness");
+        BlobRef::Tree { root_hash, .. } => {
+            // Walk the local tree on A to enumerate every chunk
+            // hash the blob references (tree nodes + data + parity).
+            // Each hash gets its own per-chunk replication
+            // coordinator transition; without this every Tree-blob
+            // e2e would short-circuit on the original panic.
+            walk_tree_hashes_on_a(*root_hash, redex_a).await
         }
     };
     for hash in hashes {
@@ -129,6 +130,77 @@ async fn drive_chunk_roles_for(blob_ref: &BlobRef, redex_a: &Arc<Redex>, redex_b
             .await
             .expect("B → Replica");
     }
+}
+
+/// Walk a Tree-encoded blob's local representation on A to
+/// collect every chunk hash the blob references: tree-node
+/// chunks (root + internals + leaves) AND the leaves' data /
+/// parity chunks. Used by `drive_chunk_roles_for` so the e2e
+/// drives the per-chunk replication coordinator for every
+/// constituent chunk, mirroring the v0.2 Manifest case.
+async fn walk_tree_hashes_on_a(root_hash: [u8; 32], redex_a: &Arc<Redex>) -> Vec<[u8; 32]> {
+    use net::adapter::net::dataforts::blob::blob_tree::TreeNode;
+    let mut out: Vec<[u8; 32]> = Vec::new();
+    let mut stack: Vec<[u8; 32]> = vec![root_hash];
+    while let Some(node_hash) = stack.pop() {
+        out.push(node_hash);
+        // Each tree node is stored as a chunk under the same
+        // `MeshBlobAdapter::chunk_channel_for_hash` shape as data
+        // chunks. The test exists outside the adapter, so we read
+        // directly off the Redex.
+        let channel = MeshBlobAdapter::chunk_channel_for_hash(&node_hash);
+        let Some(file) = redex_a.get_file(&channel) else {
+            // Some hashes the recursion produces may be data chunks
+            // (not decodable as TreeNode) — the read returns the
+            // bytes; we attempt decode and fall through on parse
+            // error. If the file doesn't exist at all, the blob
+            // is malformed for this test's purposes.
+            panic!(
+                "walk_tree_hashes_on_a: chunk {} missing on A — tree malformed",
+                hex(&node_hash),
+            );
+        };
+        let events = file.read_range(0, file.len() as u64);
+        let Some(payload) = events.into_iter().next() else {
+            // Empty channel — leave node_hash recorded and
+            // continue; the apply-side will surface NotFound if
+            // it's actually needed.
+            continue;
+        };
+        // Try to decode as TreeNode; if it fails, this hash is a
+        // leaf data / parity chunk, not a tree node.
+        let Ok(node) = TreeNode::decode(&payload.payload) else {
+            continue;
+        };
+        match node {
+            TreeNode::Internal { children } => {
+                for (child_hash, _) in children {
+                    stack.push(child_hash);
+                }
+            }
+            TreeNode::Leaf { chunks } => {
+                for c in chunks {
+                    out.push(c.hash);
+                }
+            }
+            TreeNode::ErasureLeaf { stripes } => {
+                for stripe in stripes {
+                    for c in stripe.chunks {
+                        out.push(c.hash);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn hex(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 fn pinned_replication_cfg(a_id: u64, b_id: u64) -> ReplicationConfig {
@@ -204,6 +276,97 @@ async fn mesh_blob_prefetch_replicates_chunks_from_peer() {
     // Adapter-level read on B returns the original bytes.
     let fetched = adapter_b.fetch(&blob_ref).await.expect("B fetch");
     assert_eq!(fetched, payload);
+}
+
+/// v0.3 Tree blobs traverse `drive_chunk_roles_for` without
+/// panicking. Pre-fix the helper hard-panicked on BlobRef::Tree,
+/// blocking every Tree-related e2e from being writable. The
+/// underlying wire path's behavior under multi-chunk Tree
+/// replication is incomplete in v0.3 (the cross-node prefetch
+/// only opens the root channel; leaf channels open lazily as
+/// the walker descends — that requires a substrate hook not yet
+/// wired). This test pins what's currently shipped: a Tree
+/// BlobRef CAN flow through the helper, the tree-walk hash
+/// enumeration produces the expected chunk set, and the
+/// per-chunk replication coordinators can be transitioned for
+/// every hash without panicking.
+///
+/// A follow-up commit pairs this with the cross-node Tree-walk
+/// prefetch path to assert byte-equal round-trips on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mesh_blob_tree_chunk_role_drive_does_not_panic() {
+    use bytes::Bytes;
+    use futures::stream;
+    use net::adapter::net::dataforts::Encoding;
+
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+
+    let redex_a = Arc::new(Redex::new());
+    let redex_b = Arc::new(Redex::new());
+    redex_a.enable_replication(node_a.clone());
+    redex_b.enable_replication(node_b.clone());
+
+    let a_id = node_a.node_id();
+    let b_id = node_b.node_id();
+    let rep_cfg = pinned_replication_cfg(a_id, b_id);
+    let adapter_a =
+        MeshBlobAdapter::new("mesh-a", redex_a.clone()).with_replication(rep_cfg.clone());
+
+    // Small chunk size so the wire layer's per-event u16 size cap
+    // (MAX_PAYLOAD_SIZE) doesn't bite. The internal test helper
+    // takes an explicit chunk size; the production
+    // `store_stream_tree` is fixed at 4 MiB which overflows.
+    let chunk_size: u32 = 16 * 1024;
+    let payload: Vec<u8> = (0..(chunk_size as usize * 3))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let payload_clone = payload.clone();
+    let s = stream::once(async move {
+        Ok::<_, net::adapter::net::dataforts::BlobError>(Bytes::from(payload_clone))
+    });
+    let blob_ref = adapter_a
+        .store_stream_tree_internal(Box::pin(s), Encoding::Replicated, chunk_size)
+        .await
+        .expect("A store_stream_tree_internal");
+    assert!(
+        matches!(blob_ref, BlobRef::Tree { .. }),
+        "store_stream_tree_internal with a multi-chunk payload must emit a Tree BlobRef"
+    );
+
+    // walk_tree_hashes_on_a enumerates every chunk hash the
+    // tree references. With 3 leaf chunks at chunk_size, the
+    // root is a depth=1 Leaf carrying 3 ChunkRefs → 4 total
+    // hashes (root + 3 data chunks).
+    let all_hashes = walk_tree_hashes_on_a(
+        *blob_ref.tree_root_hash().expect("Tree has root"),
+        &redex_a,
+    )
+    .await;
+    assert!(
+        all_hashes.len() >= 4,
+        "expected at least 4 hashes (root + 3 leaves); got {}",
+        all_hashes.len()
+    );
+
+    // Pre-open every chunk channel on B WITH the replication
+    // config (the chunk files on A were opened with replication;
+    // reopens omitting the same config error per the replication
+    // contract).
+    let chunk_cfg =
+        net::adapter::net::redex::RedexFileConfig::new().with_replication(Some(rep_cfg.clone()));
+    for h in &all_hashes {
+        let channel = MeshBlobAdapter::chunk_channel_for_hash(h);
+        redex_b
+            .open_file(&channel, chunk_cfg.clone())
+            .expect("B pre-open chunk channel");
+    }
+
+    // Pre-fix this would panic on the Tree variant in
+    // `drive_chunk_roles_for`. Post-fix, it walks the tree and
+    // transitions every chunk's coordinator without error.
+    drive_chunk_roles_for(&blob_ref, &redex_a, &redex_b).await;
 }
 
 /// A heats a blob via repeated fetches, ticks blob-heat tags
