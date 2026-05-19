@@ -35,6 +35,22 @@ use super::bandwidth::BandwidthClass;
 /// [`BandwidthBudget::with_background_starve_window`] for tests.
 pub const BACKGROUND_STARVE_WINDOW_DEFAULT: Duration = Duration::from_secs(60);
 
+/// v0.3 Phase D4 anti-starvation hatch grant cap, as a fraction of
+/// `capacity_bytes`. The hatch guarantees Background a periodic
+/// admission, but without an upper-bound on the per-shot grant, an
+/// adversarial `chunk_max = u32::MAX` Background request that's
+/// been starved past the window can floor the bucket to zero in a
+/// single shot — the exact "Foreground starved by Background"
+/// failure D4 was supposed to prevent.
+///
+/// 10% of capacity caps the worst-case Foreground impact per hatch
+/// firing at one-tenth of one second's refill. Combined with the
+/// 60-second starve window, Background's hatch-driven share is at
+/// most ~0.17% of capacity over any 60-second window (10% / 60),
+/// well below the plan's "≥ 10% guaranteed minimum" floor (which
+/// is targeting steady-state share, not per-hatch grant size).
+pub const BACKGROUND_HATCH_MAX_GRANT_FRACTION: f64 = 0.10;
+
 /// Inert `background_fraction` used by the legacy
 /// [`BandwidthBudget::try_consume`] path. Foreground admission
 /// doesn't consult the value, so it's effectively unused; named
@@ -267,16 +283,29 @@ impl BandwidthBudget {
                 }
                 // Anti-starvation hatch: if Background has been
                 // denied for too long, force a one-shot admission
-                // regardless of the reserve gate. Drains as much
-                // of the bucket as the request needs but never
-                // below zero (Background's anti-starvation pass
-                // does NOT use the Foreground oversize-event
-                // hatch — its purpose is liveness, not capacity).
+                // regardless of the reserve gate. The hatch grant
+                // is capped at `BACKGROUND_HATCH_MAX_GRANT_FRACTION
+                // * capacity_bytes` so an adversarial chunk_max =
+                // u32::MAX Background request can't floor the
+                // bucket in a single shot. Requests larger than
+                // the hatch cap are denied — the producer must
+                // resubmit a smaller chunk (the request-side
+                // chunking already caps SyncRequest::chunk_max to
+                // SYNC_REQUEST_CHUNK_MAX_DEFAULT, so in practice
+                // honest requests fit comfortably below the cap).
                 let starved = self
                     .last_background_admission
                     .map(|t| now.saturating_duration_since(t) > self.background_starve_window)
                     .unwrap_or(true);
                 if starved {
+                    let hatch_cap = BACKGROUND_HATCH_MAX_GRANT_FRACTION * self.capacity_bytes;
+                    if cost > hatch_cap {
+                        // Oversized hatch attempt — deny without
+                        // resetting the starve timer so a
+                        // subsequent right-sized Background request
+                        // can still take the next hatch firing.
+                        return false;
+                    }
                     self.available_bytes = (self.available_bytes - cost).max(0.0);
                     self.last_background_admission = Some(now);
                     return true;
@@ -642,20 +671,25 @@ mod class_tests {
     #[test]
     fn d4_background_starve_hatch_one_shot_admit() {
         let base = Instant::now();
-        let mut bb = BandwidthBudget::new(1.0, 1000, base)
+        // 10_000 capacity → hatch cap = 1_000. Request sizes
+        // below the cap so the hatch admits; pre-cap-fix this
+        // test used 200-byte requests against a 1_000-byte
+        // bucket, which now exceeds the 100-byte hatch cap.
+        let mut bb = BandwidthBudget::new(1.0, 10_000, base)
             .with_background_starve_window(Duration::from_millis(100));
         // Drain the bucket via Foreground so Background hits
         // the gate cleanly.
-        assert!(bb.try_consume_with_class(1000, BandwidthClass::Foreground, base, 0.3,));
+        assert!(bb.try_consume_with_class(10_000, BandwidthClass::Foreground, base, 0.3,));
         // First Background within the starve window: denied.
-        assert!(!bb.try_consume_with_class(200, BandwidthClass::Background, at(base, 50), 0.3,));
-        // Past the starve window: one-shot admitted.
-        assert!(bb.try_consume_with_class(200, BandwidthClass::Background, at(base, 200), 0.3,));
+        assert!(!bb.try_consume_with_class(500, BandwidthClass::Background, at(base, 50), 0.3,));
+        // Past the starve window: one-shot admitted (500 <
+        // 1_000 hatch cap).
+        assert!(bb.try_consume_with_class(500, BandwidthClass::Background, at(base, 200), 0.3,));
         // Next Background within the starve window after the
         // hatch firing: denied again (one-shot, not "open the
         // floodgates"). Use a tight gap so refill doesn't restore
         // the bucket past the reserve.
-        assert!(!bb.try_consume_with_class(200, BandwidthClass::Background, at(base, 201), 0.3,));
+        assert!(!bb.try_consume_with_class(500, BandwidthClass::Background, at(base, 201), 0.3,));
     }
 
     /// D4 timer resets on every successful Background admission
@@ -684,5 +718,55 @@ mod class_tests {
         assert!(bb.try_consume(500, base));
         assert!(bb.try_consume(500, base));
         assert!(!bb.try_consume(1, base));
+    }
+
+    /// D4 hatch must cap per-shot grants at
+    /// BACKGROUND_HATCH_MAX_GRANT_FRACTION × capacity. An
+    /// adversarial Background request whose cost exceeds the cap
+    /// is denied even after starvation — no single hatch firing
+    /// can floor the bucket to zero. Pre-fix, the hatch admitted
+    /// unbounded bytes per shot.
+    #[test]
+    fn d4_hatch_denies_oversized_background_request() {
+        let base = Instant::now();
+        // 10 KB capacity → 1 KB hatch cap.
+        let mut bb = BandwidthBudget::new(1.0, 10_000, base)
+            .with_background_starve_window(Duration::from_millis(50));
+        // Drain so the gate denies.
+        assert!(bb.try_consume_with_class(10_000, BandwidthClass::Foreground, base, 0.3));
+        // Wait past the starve window.
+        let later = at(base, 100);
+        // Adversarial Background request of 5 KB — well above
+        // the 1 KB hatch cap. Must be denied.
+        assert!(
+            !bb.try_consume_with_class(5_000, BandwidthClass::Background, later, 0.3),
+            "oversized Background hatch attempt (5 KB > 10% × 10 KB) must be denied"
+        );
+        // A right-sized Background request (under the cap) IS
+        // admitted by the hatch on a subsequent attempt — the
+        // failed oversized attempt didn't consume the starve
+        // timer reset.
+        assert!(
+            bb.try_consume_with_class(500, BandwidthClass::Background, later, 0.3),
+            "right-sized Background request under hatch cap must be admitted"
+        );
+    }
+
+    /// Companion: a right-sized Background request through the
+    /// hatch admits even when refill has restored some balance,
+    /// and never drains the bucket below zero.
+    #[test]
+    fn d4_hatch_admits_within_cap() {
+        let base = Instant::now();
+        let mut bb = BandwidthBudget::new(1.0, 10_000, base)
+            .with_background_starve_window(Duration::from_millis(50));
+        // Drain via Foreground.
+        assert!(bb.try_consume_with_class(10_000, BandwidthClass::Foreground, base, 0.3));
+        let later = at(base, 100);
+        // Right-sized hatch (50 bytes, well below 1 KB cap).
+        assert!(bb.try_consume_with_class(50, BandwidthClass::Background, later, 0.3));
+        // Bucket stays non-negative; refill restored some bytes,
+        // hatch drained 50 more.
+        assert!(bb.available_bytes() <= 10_000);
     }
 }
