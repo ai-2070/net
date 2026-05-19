@@ -201,13 +201,21 @@ jobs:
         shell: bash
         run: |
           cd dist
-          cat *.sha256 | sort > SHA256SUMS
+          # Namespaced filename so the cli + deck workflows can
+          # both attach to the same umbrella `v<version>` release
+          # without overwriting each other's checksums file.
+          cat *.sha256 | sort > SHA256SUMS-deck
           rm *.sha256
           ls -la
 
-      - name: Attach archives to release
+      - name: Attach archives to umbrella release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ needs.resolve-version.outputs.tag }}
+          # The umbrella `v<version>` GitHub Release is created
+          # by the main `v*` tag in RELEASE_STEPS.md. This workflow
+          # is triggered by the `deck-v*` fan-out tag but attaches
+          # tarballs to the umbrella release so consumers find all
+          # platform binaries in one place.
+          tag_name: v${{ needs.resolve-version.outputs.version }}
           files: dist/*
           fail_on_unmatched_files: true
