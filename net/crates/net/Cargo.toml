@@ -184,13 +184,18 @@ blake2 = { version = "0.10", optional = true }
 # lets future migrations land without breaking BlobRef wire compat.
 blake3 = { version = "1", optional = true }
 # FastCDC content-defined chunker for the Dataforts blob v0.3 Phase B
-# CDC path. Pinned to v4.x (FastCDC-2020 / normalized-chunking
-# variant) — boundaries are content-defined, so the same input
-# always lands on the same chunk boundaries, enabling dedup-after-
-# edit. The v2020 module exposes `FastCDC::new(buf, min, avg, max)`
-# returning a chunk iterator; we drive it incrementally over an
-# accumulated buffer in [`super::dataforts::blob::cdc::CdcStreamChunker`].
-fastcdc = { version = "4", optional = true, default-features = false }
+# CDC path. Pinned to the v4.0.x patch series (FastCDC-2020 /
+# normalized-chunking variant) — FastCDC determinism is load-bearing
+# for cross-producer content-address dedup, and the crate's gear
+# table / mask-bit derivation could shift between minor releases. A
+# 4.0 → 4.1 bump would silently invalidate every CDC-stored blob
+# across the cluster. The v2020 module exposes
+# `FastCDC::new(buf, min, avg, max)` returning a chunk iterator; we
+# drive it incrementally over an accumulated buffer in
+# `super::dataforts::blob::cdc::CdcStreamChunker`. Boundaries are
+# content-defined, so the same input always lands on the same chunk
+# boundaries, enabling dedup-after-edit.
+fastcdc = { version = "~4.0", optional = true, default-features = false }
 # Reed-Solomon erasure coding for the Dataforts blob v0.3 Phase C
 # storage-cost-reduction path. Pinned to v6.x — provides
 # `ReedSolomon<galois_8::Field>` over `GF(2^8)` with systematic

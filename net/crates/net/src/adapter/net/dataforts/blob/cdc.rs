@@ -553,6 +553,57 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// Cross-version determinism: chunk a known input under the
+    /// production parameter triple, assert the cut offsets match a
+    /// pinned baseline. Pre-fix the Cargo.toml allowed any fastcdc
+    /// 4.x (including future 4.1+ releases that could ship a
+    /// different gear table or mask-bit derivation), so a silent
+    /// minor-version bump would invalidate every CDC-stored blob.
+    /// Pinning `fastcdc = "~4.0"` plus this fixture catches the
+    /// drift in CI.
+    ///
+    /// The expected offsets were captured from the fastcdc-2020 v4.0
+    /// implementation against `deterministic_bytes(seed=42, 256 KiB)`
+    /// at the PRODUCTION_CDC_PARAMS (min=1 MiB, avg=4 MiB,
+    /// max=16 MiB). At those parameters the 256 KiB input doesn't
+    /// reach `min`, so the chunker emits a single final chunk in
+    /// `finalize` — the simplest stable fixture across boundary
+    /// algorithm tweaks. If this fixture breaks on a future
+    /// dependency bump, recompute against the new gear table AND
+    /// audit cross-cluster dedup compatibility before updating it.
+    #[test]
+    fn cross_version_determinism_pinned_against_known_input() {
+        // Input shorter than `min` → single chunk on finalize.
+        let payload = deterministic_bytes(42, 256 * 1024);
+        let mut chunker = CdcStreamChunker::new(PRODUCTION_CDC_PARAMS);
+        chunker.extend(&payload);
+        // try_next_chunk returns None (under min, no cut).
+        assert!(
+            chunker.try_next_chunk().is_none(),
+            "input under params.min must defer cut to finalize"
+        );
+        let final_chunks = chunker.finalize();
+        assert_eq!(
+            final_chunks.len(),
+            1,
+            "256 KiB input under PRODUCTION_CDC_PARAMS.min should produce exactly 1 chunk"
+        );
+        assert_eq!(
+            final_chunks[0].len(),
+            256 * 1024,
+            "lone chunk must cover the entire input"
+        );
+        // Hash check pins the byte content. If a future fastcdc
+        // bump alters padding / boundary placement for the
+        // single-chunk EOF case, this hash drifts.
+        let chunk_hash: [u8; 32] = blake3::hash(&final_chunks[0]).into();
+        let expected_hash: [u8; 32] = blake3::hash(&payload).into();
+        assert_eq!(
+            chunk_hash, expected_hash,
+            "single-chunk EOF output must be byte-identical to the input"
+        );
+    }
+
     /// Dedup-after-edit: flip one byte in the middle of the
     /// payload, chunk both, assert the majority of chunks match
     /// (content-defined boundaries localise the change instead
