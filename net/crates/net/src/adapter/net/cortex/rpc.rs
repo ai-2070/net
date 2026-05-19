@@ -2732,9 +2732,9 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                     // REQUEST_END arrives) can never hang the call
                     // indefinitely. `deadline_ns = 0` means "no
                     // deadline" — caller's responsibility.
-                    let call_fut = futures::FutureExt::catch_unwind(
-                        std::panic::AssertUnwindSafe(handler.call(ctx, request_stream)),
-                    );
+                    let call_fut = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                        handler.call(ctx, request_stream),
+                    ));
                     let outcome = if deadline_ns > 0 {
                         let now_ns = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -3063,10 +3063,7 @@ impl RedexFold<()> for RpcDuplexFold {
                     // fresh bounded mpsc with a live receiver cannot
                     // reject the first send.
                     if req_tx.try_send(bytes::Bytes::from(payload.body)).is_err() {
-                        debug_assert!(
-                            false,
-                            "fresh duplex request mpsc rejected initial body"
-                        );
+                        debug_assert!(false, "fresh duplex request mpsc rejected initial body");
                         tracing::error!(
                             caller_origin = format!("{:#x}", meta.origin_hash),
                             call_id = meta.seq_or_ts,
@@ -3158,13 +3155,9 @@ impl RedexFold<()> for RpcDuplexFold {
                     // fold: force-drop the handler future at
                     // deadline_ns so an orphaned request stream
                     // can't hang the call. `0` means no deadline.
-                    let call_fut = futures::FutureExt::catch_unwind(
-                        std::panic::AssertUnwindSafe(handler.call(
-                            ctx,
-                            request_stream,
-                            response_sink,
-                        )),
-                    );
+                    let call_fut = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                        handler.call(ctx, request_stream, response_sink),
+                    ));
                     let outcome = if deadline_ns > 0 {
                         let now_ns = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -3174,8 +3167,7 @@ impl RedexFold<()> for RpcDuplexFold {
                         if remaining == 0 {
                             cancel_for_deadline.cancel();
                             Ok(Err(RpcHandlerError::Internal(
-                                "duplex handler deadline_ns already expired at spawn"
-                                    .to_string(),
+                                "duplex handler deadline_ns already expired at spawn".to_string(),
                             )))
                         } else {
                             match tokio::time::timeout(

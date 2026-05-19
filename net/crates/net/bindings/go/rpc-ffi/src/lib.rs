@@ -57,9 +57,8 @@ use net::adapter::net::cortex::{
 };
 use net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
-    DuplexSink as InnerDuplexSink, DuplexStream as InnerDuplexStream,
-    RpcError as InnerRpcError, RpcStream as InnerRpcStream,
-    ServeHandle as InnerServeHandle,
+    DuplexSink as InnerDuplexSink, DuplexStream as InnerDuplexStream, RpcError as InnerRpcError,
+    RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
 };
 use net::adapter::net::MeshNode;
 

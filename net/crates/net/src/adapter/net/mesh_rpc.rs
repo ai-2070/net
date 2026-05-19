@@ -1397,8 +1397,7 @@ fn build_request_grant_emitter(
     server_origin: u64,
     diag_tag: &'static str,
 ) -> RpcRequestGrantEmitter {
-    let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<(u64, u64, u32)>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, u32)>();
     tokio::spawn(async move {
         while let Some(first) = rx.recv().await {
             let mut summed: std::collections::HashMap<(u64, u64), u32> =
@@ -1414,8 +1413,7 @@ fn build_request_grant_emitter(
                 *entry = entry.saturating_add(credits);
             }
             for ((caller, call_id), credits) in summed {
-                let reply_channel_name =
-                    format!("{service}.replies.{caller:016x}");
+                let reply_channel_name = format!("{service}.replies.{caller:016x}");
                 let reply_channel = match ChannelName::new(&reply_channel_name) {
                     Ok(c) => c,
                     Err(e) => {
@@ -1427,18 +1425,11 @@ fn build_request_grant_emitter(
                         continue;
                     }
                 };
-                let meta = EventMeta::new(
-                    DISPATCH_RPC_REQUEST_GRANT,
-                    0,
-                    server_origin,
-                    call_id,
-                    0,
-                );
+                let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, server_origin, call_id, 0);
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
                 buf.extend_from_slice(&meta.to_bytes());
                 buf.extend_from_slice(&encode_request_grant(call_id, credits));
-                let publisher =
-                    ChannelPublisher::new(reply_channel, PublishConfig::default());
+                let publisher = ChannelPublisher::new(reply_channel, PublishConfig::default());
                 if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
                     tracing::warn!(
                         error = %e,

@@ -516,7 +516,10 @@ async fn client_streaming_server_deadline_force_drops_hanging_handler() {
     match err {
         RpcError::Timeout { .. } => { /* caller-side deadline beat the server's terminal */ }
         RpcError::ServerError { status, .. } => {
-            assert_eq!(status, 0x0006, "expected Internal (0x0006), got {status:#06x}");
+            assert_eq!(
+                status, 0x0006,
+                "expected Internal (0x0006), got {status:#06x}"
+            );
         }
         other => panic!("expected Timeout or ServerError(Internal), got {other:?}"),
     }
