@@ -64,8 +64,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use net::adapter::net::dataforts::blob::{
-    BlobAdapter, BlobRef, BlobStat, MeshBlobAdapter, RefcountEntry,
+    BlobAdapter, BlobRef, BlobStat, Encoding, MeshBlobAdapter, RefcountEntry, RepairReport,
 };
+use net::adapter::net::dataforts::blob::blob_tree::TreeNode;
 use net::adapter::net::redex::Redex;
 
 /// `net-blob` — operator CLI for dataforts blob storage.
@@ -181,6 +182,53 @@ enum Cmd {
         #[command(subcommand)]
         action: OverflowCmd,
     },
+    /// Repair a v0.3 `BlobRef::Tree` blob with
+    /// `Encoding::ReedSolomon` encoding: walk every stripe,
+    /// reconstruct any missing data chunks from parity, re-store
+    /// them under their original content-addressed hashes. Prints
+    /// the `RepairReport` (stripes walked / repaired /
+    /// unrecoverable, chunks restored).
+    Repair {
+        /// 64-char lowercase hex of the BLAKE3-256 root hash.
+        hash: String,
+        /// Total blob size in bytes — required to construct the
+        /// BlobRef::Tree. Available from `stat` on the original
+        /// store.
+        #[arg(long)]
+        size: u64,
+        /// Tree depth (1..=4). Required to construct the
+        /// BlobRef::Tree; the depth lives in the wire BlobRef
+        /// but isn't recoverable from the root hash alone.
+        #[arg(long)]
+        depth: u8,
+    },
+    /// Walk a v0.3 `BlobRef::Tree` blob and print the manifest
+    /// node hierarchy: depth + arity + per-stripe shape for
+    /// erasure-coded leaves. Useful for diagnosing manifest-tree
+    /// shape regressions and verifying tree depth claims match
+    /// actual structure.
+    Tree {
+        /// 64-char lowercase hex of the BLAKE3-256 root hash.
+        hash: String,
+        #[arg(long)]
+        size: u64,
+        #[arg(long)]
+        depth: u8,
+    },
+    /// Walk every reachable chunk of a v0.3 `BlobRef::Tree`,
+    /// fetch its bytes, and verify the BLAKE3 hash matches the
+    /// manifest's recorded hash. Reports the count of healthy /
+    /// missing / corrupted chunks. Operators run after a
+    /// suspected disk corruption event to identify which blobs
+    /// need `repair`.
+    Verify {
+        /// 64-char lowercase hex of the BLAKE3-256 root hash.
+        hash: String,
+        #[arg(long)]
+        size: u64,
+        #[arg(long)]
+        depth: u8,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -235,6 +283,15 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Overflow { action } => match action {
             OverflowCmd::Status => cmd_overflow_status(&adapter, cli.format),
         },
+        Cmd::Repair { hash, size, depth } => {
+            cmd_repair(&adapter, &hash, size, depth, cli.format).await
+        }
+        Cmd::Tree { hash, size, depth } => {
+            cmd_tree(&adapter, &hash, size, depth, cli.format).await
+        }
+        Cmd::Verify { hash, size, depth } => {
+            cmd_verify(&adapter, &hash, size, depth, cli.format).await
+        }
     }
 }
 
@@ -582,6 +639,303 @@ fn cmd_overflow_status(
         ),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+// ============================================================================
+// v0.3 Phase C/D subcommands: repair, tree, verify
+// ============================================================================
+
+/// Construct a `BlobRef::Tree` from operator-supplied parts. The
+/// CLI takes (hash, size, depth) because the depth lives in the
+/// wire BlobRef envelope and isn't recoverable from the root
+/// chunk alone. Stamps `Encoding::Replicated` by default — the
+/// repair/tree/verify subcommands re-derive per-leaf encoding
+/// from the manifest itself, so the BlobRef-level encoding here
+/// only affects the repair report's `replicated_leaves_skipped`
+/// counter (and that path is robust to a mismatch).
+fn build_tree_ref(hash_hex: &str, size: u64, depth: u8) -> Result<BlobRef, Box<dyn std::error::Error>> {
+    let hash = parse_hash(hash_hex)?;
+    let uri = format!("mesh://{}", hex32(&hash));
+    let blob_ref = BlobRef::tree(uri, Encoding::Replicated, hash, size, depth)
+        .map_err(|e| format!("invalid BlobRef::Tree parts: {}", e))?;
+    Ok(blob_ref)
+}
+
+async fn cmd_repair(
+    adapter: &MeshBlobAdapter,
+    hash_hex: &str,
+    size: u64,
+    depth: u8,
+    fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let blob_ref = build_tree_ref(hash_hex, size, depth)?;
+    let report: RepairReport = adapter.repair_blob(&blob_ref).await?;
+    match fmt {
+        OutputFormat::Human => {
+            println!("repair: {}", hash_hex);
+            println!("  stripes_walked:              {}", report.stripes_walked);
+            println!("  stripes_already_healthy:     {}", report.stripes_already_healthy);
+            println!("  stripes_repaired:            {}", report.stripes_repaired);
+            println!("  chunks_restored:             {}", report.chunks_restored);
+            println!("  stripes_unrecoverable:       {}", report.stripes_unrecoverable);
+            println!(
+                "  replicated_stripes_skipped:  {}",
+                report.replicated_stripes_skipped
+            );
+            println!(
+                "  replicated_leaves_skipped:   {}",
+                report.replicated_leaves_skipped
+            );
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "hash": hash_hex,
+                "stripes_walked": report.stripes_walked,
+                "stripes_already_healthy": report.stripes_already_healthy,
+                "stripes_repaired": report.stripes_repaired,
+                "chunks_restored": report.chunks_restored,
+                "stripes_unrecoverable": report.stripes_unrecoverable,
+                "replicated_stripes_skipped": report.replicated_stripes_skipped,
+                "replicated_leaves_skipped": report.replicated_leaves_skipped,
+            })
+        ),
+    }
+    // Exit 0 when nothing unrecoverable — operators commonly chain
+    // `repair --format json | jq` and rely on exit status for
+    // "did this need human attention".
+    if report.stripes_unrecoverable > 0 {
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+async fn cmd_tree(
+    adapter: &MeshBlobAdapter,
+    hash_hex: &str,
+    size: u64,
+    depth: u8,
+    fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let blob_ref = build_tree_ref(hash_hex, size, depth)?;
+    let root_hash = *blob_ref.tree_root_hash().expect("Tree built above");
+    let mut json_nodes: Vec<serde_json::Value> = Vec::new();
+    walk_tree_print(adapter, root_hash, 0, fmt, &mut json_nodes).await?;
+    if matches!(fmt, OutputFormat::Json) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "root_hash": hash_hex,
+                "size": size,
+                "depth": depth,
+                "nodes": json_nodes,
+            })
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Recursive helper for `cmd_tree`. Walks down from `node_hash`,
+/// printing one line per node in Human mode or appending one
+/// JSON entry per node in JSON mode.
+fn walk_tree_print<'a>(
+    adapter: &'a MeshBlobAdapter,
+    node_hash: [u8; 32],
+    indent: usize,
+    fmt: OutputFormat,
+    json_nodes: &'a mut Vec<serde_json::Value>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>> {
+    Box::pin(async move {
+        let bytes = adapter.fetch_chunk(&node_hash).await?;
+        let node = TreeNode::decode(&bytes)?;
+        let pad = "  ".repeat(indent);
+        match &node {
+            TreeNode::Internal { children } => {
+                match fmt {
+                    OutputFormat::Human => println!(
+                        "{}internal[{}] {} ({} bytes covered)",
+                        pad,
+                        children.len(),
+                        hex32(&node_hash),
+                        node.covered_bytes()
+                    ),
+                    OutputFormat::Json => json_nodes.push(serde_json::json!({
+                        "hash": hex32(&node_hash),
+                        "kind": "internal",
+                        "depth": indent,
+                        "arity": children.len(),
+                        "covered_bytes": node.covered_bytes(),
+                    })),
+                }
+                for (child_hash, _) in children {
+                    walk_tree_print(adapter, *child_hash, indent + 1, fmt, json_nodes).await?;
+                }
+            }
+            TreeNode::Leaf { chunks } => {
+                match fmt {
+                    OutputFormat::Human => println!(
+                        "{}leaf[{}] {} ({} bytes covered)",
+                        pad,
+                        chunks.len(),
+                        hex32(&node_hash),
+                        node.covered_bytes()
+                    ),
+                    OutputFormat::Json => json_nodes.push(serde_json::json!({
+                        "hash": hex32(&node_hash),
+                        "kind": "leaf",
+                        "depth": indent,
+                        "chunks": chunks.len(),
+                        "covered_bytes": node.covered_bytes(),
+                    })),
+                }
+            }
+            TreeNode::ErasureLeaf { stripes } => {
+                match fmt {
+                    OutputFormat::Human => {
+                        println!(
+                            "{}erasure_leaf[{} stripes] {} ({} bytes covered)",
+                            pad,
+                            stripes.len(),
+                            hex32(&node_hash),
+                            node.covered_bytes()
+                        );
+                        for (i, stripe) in stripes.iter().enumerate() {
+                            let pad2 = "  ".repeat(indent + 1);
+                            let data_count =
+                                stripe.chunks.iter().filter(|c| c.is_data()).count();
+                            let parity_count =
+                                stripe.chunks.iter().filter(|c| c.is_parity()).count();
+                            println!(
+                                "{}stripe[{}] {:?}: {} data + {} parity ({} bytes)",
+                                pad2,
+                                i,
+                                stripe.encoding,
+                                data_count,
+                                parity_count,
+                                stripe.covered_bytes()
+                            );
+                        }
+                    }
+                    OutputFormat::Json => json_nodes.push(serde_json::json!({
+                        "hash": hex32(&node_hash),
+                        "kind": "erasure_leaf",
+                        "depth": indent,
+                        "stripes": stripes.len(),
+                        "covered_bytes": node.covered_bytes(),
+                    })),
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+async fn cmd_verify(
+    adapter: &MeshBlobAdapter,
+    hash_hex: &str,
+    size: u64,
+    depth: u8,
+    fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let blob_ref = build_tree_ref(hash_hex, size, depth)?;
+    let root_hash = *blob_ref.tree_root_hash().expect("Tree built above");
+    let mut healthy = 0u64;
+    let mut missing = 0u64;
+    let mut corrupted = 0u64;
+    verify_walk(adapter, root_hash, &mut healthy, &mut missing, &mut corrupted).await?;
+    match fmt {
+        OutputFormat::Human => {
+            println!("verify: {}", hash_hex);
+            println!("  healthy:    {}", healthy);
+            println!("  missing:    {}", missing);
+            println!("  corrupted:  {}", corrupted);
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "hash": hash_hex,
+                "healthy": healthy,
+                "missing": missing,
+                "corrupted": corrupted,
+            })
+        ),
+    }
+    if missing > 0 || corrupted > 0 {
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// Recursive walker for `cmd_verify`. Counts every reachable
+/// chunk — data, parity, manifest nodes — and verifies each
+/// fetched byte sequence hashes back to its expected hash.
+fn verify_walk<'a>(
+    adapter: &'a MeshBlobAdapter,
+    node_hash: [u8; 32],
+    healthy: &'a mut u64,
+    missing: &'a mut u64,
+    corrupted: &'a mut u64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>> {
+    Box::pin(async move {
+        // First verify the manifest node itself.
+        let bytes = match adapter.fetch_chunk(&node_hash).await {
+            Ok(b) => b,
+            Err(_) => {
+                *missing = missing.saturating_add(1);
+                return Ok(());
+            }
+        };
+        let computed: [u8; 32] = blake3::hash(&bytes).into();
+        if computed != node_hash {
+            *corrupted = corrupted.saturating_add(1);
+            return Ok(());
+        }
+        *healthy = healthy.saturating_add(1);
+
+        let node = TreeNode::decode(&bytes)?;
+        match node {
+            TreeNode::Internal { children } => {
+                for (child_hash, _) in children {
+                    verify_walk(adapter, child_hash, healthy, missing, corrupted).await?;
+                }
+            }
+            TreeNode::Leaf { chunks } => {
+                for chunk in chunks {
+                    verify_chunk(adapter, &chunk.hash, healthy, missing, corrupted).await;
+                }
+            }
+            TreeNode::ErasureLeaf { stripes } => {
+                for stripe in stripes {
+                    for chunk in stripe.chunks {
+                        verify_chunk(adapter, &chunk.hash, healthy, missing, corrupted).await;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+async fn verify_chunk(
+    adapter: &MeshBlobAdapter,
+    hash: &[u8; 32],
+    healthy: &mut u64,
+    missing: &mut u64,
+    corrupted: &mut u64,
+) {
+    match adapter.fetch_chunk(hash).await {
+        Ok(bytes) => {
+            let computed: [u8; 32] = blake3::hash(&bytes).into();
+            if computed == *hash {
+                *healthy = healthy.saturating_add(1);
+            } else {
+                *corrupted = corrupted.saturating_add(1);
+            }
+        }
+        Err(_) => *missing = missing.saturating_add(1),
+    }
 }
 
 // ============================================================================
