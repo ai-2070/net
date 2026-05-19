@@ -44,6 +44,7 @@ try:
         MeshRpc as _RawMeshRpc,
         RpcAppError,
         RpcCancelledError,
+        RpcCapabilityDeniedError,
         RpcCodecError,
         RpcError,
         RpcNoRouteError,
@@ -63,6 +64,7 @@ except ImportError:  # pragma: no cover — feature-flag path
     RpcTransportError = RpcError  # type: ignore[misc,assignment]
     RpcCodecError = RpcError  # type: ignore[misc,assignment]
     RpcCancelledError = RpcError  # type: ignore[misc,assignment]
+    RpcCapabilityDeniedError = RpcError  # type: ignore[misc,assignment]
 
     # Fallback `RpcAppError` carries (status, body) on `args` so the
     # cross-binding semantics still hold against test stubs. The
@@ -406,6 +408,7 @@ _NRPC_KINDS = frozenset({
     "codec_decode",
     "breaker_open",
     "cancelled",
+    "capability_denied",
 })
 
 
@@ -453,7 +456,15 @@ def default_retryable(err: BaseException) -> bool:
     if err is None:
         return False
     name = type(err).__name__
-    if name in ("RpcNoRouteError", "RpcCodecError"):
+    # CapabilityDeniedError is a signed policy verdict from the
+    # target — retry can't change it until the target publishes a
+    # more permissive announcement. Treat as terminal.
+    if name in (
+        "RpcNoRouteError",
+        "RpcCodecError",
+        "RpcCancelledError",
+        "RpcCapabilityDeniedError",
+    ):
         return False
     if name in ("RpcTimeoutError", "RpcTransportError"):
         return True
@@ -778,6 +789,7 @@ __all__ = [
     "Cancellable",
     "RpcAppError",
     "RpcCancelledError",
+    "RpcCapabilityDeniedError",
     "RpcCodecError",
     "RpcError",
     "RpcNoRouteError",

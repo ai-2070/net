@@ -126,9 +126,9 @@ type RsEncoderCache = Arc<parking_lot::Mutex<HashMap<(u8, u8), Arc<super::erasur
 /// clippy's argument-count threshold AND makes call sites hard
 /// to read.
 ///
-/// Construct via [`Self::all_supported`] for the
-/// single-cluster all-Phase-D case, or build the struct directly
-/// with custom probes for the cross-version rollout case.
+/// Construct via [`Self::new`] for the single-cluster all-Phase-D
+/// case, or build the struct directly with custom probes for the
+/// cross-version rollout case.
 #[derive(Debug)]
 pub struct DowngradeProbes<'a> {
     /// `BlobRef::Tree` capability probe — decides Tree vs

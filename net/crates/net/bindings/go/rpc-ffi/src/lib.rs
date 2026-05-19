@@ -2146,7 +2146,7 @@ pub extern "C" fn net_rpc_duplex_sink_call_id(handle: *const DuplexSinkHandleC) 
 }
 
 /// Free the sink half. Drop fires nothing (CANCEL only when the
-/// shared Arc<DuplexInner> refcount hits zero AND clean_close
+/// shared `Arc<DuplexInner>` refcount hits zero AND clean_close
 /// wasn't observed — see the SDK's `DuplexInner::Drop`).
 /// Idempotent on NULL.
 #[unsafe(no_mangle)]
