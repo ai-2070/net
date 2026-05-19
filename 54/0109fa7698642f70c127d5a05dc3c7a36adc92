@@ -1,0 +1,21 @@
+net/crates/net/tests/dataforts_blob_v3_composed_conformance.rs
+  s_1d50b1bfb9695d::t_e8727aab677e5d 1-272
+.github/workflows/ci.yml
+  s_1d50b1bfb9695d::t_d74f007e6e4f16 228
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "540109fa7698642f70c127d5a05dc3c7a36adc92",
+  "prompts": {},
+  "sessions": {
+    "s_1d50b1bfb9695d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9503e0d0-18d5-41d8-b49a-965f66c4843c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
