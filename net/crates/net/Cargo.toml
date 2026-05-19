@@ -208,6 +208,13 @@ fastcdc = { version = "~4.0", optional = true, default-features = false }
 # implementation already saturates ~3 GB/s on a single core for
 # (10, 4) on modern CPUs, plenty for the v0.3 throughput targets.
 reed-solomon-erasure = { version = "6", optional = true, default-features = false, features = ["std"] }
+# O(1) LRU cache for `super::dataforts::blob::blob_tree_cache::TreeNodeCache`.
+# Pre-fix the cache implemented its own VecDeque-of-keys MRU ordering, which
+# made every hit O(N) over the order vec (~13 K compares at the 64 MiB default
+# cap). The `lru` crate's doubly-linked-list implementation makes get / put /
+# remove all O(1). Pinned to the 0.16 line — same major as the version
+# already pulled transitively, no second copy in the resolver graph.
+lru = "0.16"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"], optional = true }
 # X25519 DH for the `IdentityEnvelope` sealed-box construction used
 # by daemon migration. We derive an ephemeral pubkey, DH against the

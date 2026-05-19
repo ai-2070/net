@@ -97,6 +97,7 @@ dependencies = [
  "igd-next",
  "libc",
  "loom",
+ "lru 0.16.4",
  "parking_lot 0.12.5",
  "postcard",
  "quanta",
