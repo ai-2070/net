@@ -138,6 +138,67 @@ async fn call_service_permissive_announcement_admits_any_caller() {
     assert_eq!(reply.body.as_ref(), b"permissive hello");
 }
 
+/// H1 regression — `serve_rpc` must auto-self-index a fresh
+/// announcement carrying the new `nrpc:<service>` tag so the
+/// callee-side gate has a real policy to consult from the very
+/// first inbound event. Pre-fix the bridge skipped permissively
+/// when no self-announcement existed, leaving servers that
+/// `serve_rpc` without ever calling `announce_capabilities` open
+/// to any caller.
+#[tokio::test]
+async fn serve_rpc_self_indexes_announcement_with_nrpc_tag() {
+    let node = build_node().await;
+    assert!(
+        node.capability_index_arc().get(node.node_id()).is_none(),
+        "no self-announcement before serve_rpc",
+    );
+    let _serve = node
+        .serve_rpc("echo", Arc::new(EchoHandler))
+        .expect("serve_rpc");
+    let self_caps = node
+        .capability_index_arc()
+        .get(node.node_id())
+        .expect("serve_rpc must auto-self-index");
+    assert!(
+        self_caps.has_tag("nrpc:echo"),
+        "auto-self-indexed announcement must carry nrpc:<service>",
+    );
+}
+
+/// H2 regression — `announce_capabilities` BEFORE `serve_rpc`
+/// used to leave the self-announcement without the `nrpc:<service>`
+/// tag, causing the callee-side gate to deny every inbound call
+/// to the service. Post-fix, `serve_rpc` emits a fresh
+/// announcement that merges every currently-registered service,
+/// so order doesn't matter to the caller.
+#[tokio::test]
+async fn serve_rpc_self_index_works_regardless_of_announce_order() {
+    let node = build_node().await;
+    node.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("pre-announce");
+    let pre = node
+        .capability_index_arc()
+        .get(node.node_id())
+        .expect("pre-serve_rpc self-ann present");
+    assert!(
+        !pre.has_tag("nrpc:echo"),
+        "pre-serve_rpc self-ann must not carry nrpc:echo",
+    );
+
+    let _serve = node
+        .serve_rpc("echo", Arc::new(EchoHandler))
+        .expect("serve_rpc");
+    let post = node
+        .capability_index_arc()
+        .get(node.node_id())
+        .expect("post-serve_rpc self-ann present");
+    assert!(
+        post.has_tag("nrpc:echo"),
+        "post-serve_rpc self-ann must carry the merged tag regardless of order",
+    );
+}
+
 /// A server that announces with `allowed_nodes = [some_other_node]`
 /// (caller not in the list, no subnet or group match) denies the
 /// caller. The caller-side gate inside `call_service` fires before

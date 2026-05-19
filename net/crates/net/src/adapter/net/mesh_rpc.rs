@@ -1603,6 +1603,19 @@ impl MeshNode {
             // here would spam.
             let _ = tx.try_send(ev);
         });
+        // Register the service in `rpc_local_services` and refresh
+        // the self-indexed announcement BEFORE installing the
+        // dispatcher so the callee-side gate (in the bridge below)
+        // sees a self-announcement carrying `nrpc:<service>` the
+        // moment the first inbound event lands. Without this, the
+        // gate was either silently permissive (no self-ann) or
+        // silently denying (self-ann from a prior
+        // `announce_capabilities` that pre-dated this service's
+        // registration). See `docs/misc/CODE_REVIEW_2026_05_19_CAPABILITY_AUTH.md`
+        // H1 + H2.
+        self.rpc_local_services_arc().insert(service.to_string());
+        self.index_self_with_local_services();
+
         if self
             .register_rpc_inbound(channel_hash, dispatcher)
             .is_some()
@@ -1620,25 +1633,22 @@ impl MeshNode {
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
-                // Defense-in-depth check. Skip the gate when
-                // either (a) the local capability index has no
-                // announcement for *self* yet — i.e. this node
-                // never called `announce_capabilities`, so it has
-                // no published policy to enforce — or (b) the
-                // wire session resolved no NodeId (`from_node ==
-                // 0` is the documented loopback / test sentinel
-                // per `RpcInboundEvent::from_node`). Both
-                // conditions fall through to permissive; once the
-                // node folds its own announcement and a real
-                // session resolves a caller, the gate fires
-                // normally. See `docs/plans/CAPABILITY_AUTH_PLAN.md`
-                // §3 / §"Cold-start behavior".
+                // Defense-in-depth check. Skip only when the wire
+                // session resolved no NodeId (`from_node == 0` is
+                // the loopback / test sentinel per
+                // `RpcInboundEvent::from_node` — production wire
+                // delivery drops events that fail NodeId
+                // resolution rather than passing 0). The cold-
+                // start "no self-ann" skip the original
+                // implementation carried was a permissive hole;
+                // `index_self_with_local_services` above
+                // guarantees a self-ann exists before the
+                // dispatcher is wired, so denying when the gate
+                // says no is now the safe failure mode.
                 let self_node = mesh_for_bridge.node_id();
                 let index = mesh_for_bridge.capability_index_arc();
-                let have_self_ann = index.get(self_node).is_some();
                 let from_node = inbound.from_node;
-                if have_self_ann
-                    && from_node != 0
+                if from_node != 0
                     && !index.may_execute(self_node, &tag, from_node)
                 {
                     // Decode the EventMeta so we can address the
@@ -1677,11 +1687,24 @@ impl MeshNode {
             }
         });
 
-        // Register in the local-services set so the next
-        // `announce_capabilities` call merges an `nrpc:<service>`
-        // tag onto the announced CapabilitySet, making this node
-        // discoverable via `Mesh::find_service_nodes(service)`.
-        self.rpc_local_services_arc().insert(service.to_string());
+        // Spawn an async re-announce so peers also learn about
+        // the new service without the operator having to call
+        // `announce_capabilities` manually. The local self-index
+        // already happened above; this is purely for peer
+        // visibility (the broadcast path also re-runs the
+        // self-index, which is a cheap version bump).
+        let mesh_for_announce = Arc::clone(self);
+        let service_for_log = service.to_string();
+        tokio::spawn(async move {
+            let baseline = mesh_for_announce.user_caps_snapshot();
+            if let Err(e) = mesh_for_announce.announce_capabilities(baseline).await {
+                tracing::warn!(
+                    error = %e,
+                    service = %service_for_log,
+                    "serve_rpc: auto re-announce failed",
+                );
+            }
+        });
 
         Ok(ServeHandle {
             channel_hash,
