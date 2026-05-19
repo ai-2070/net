@@ -57,7 +57,9 @@ use ::net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
 use ::net::adapter::net::mesh_rpc::{
-    CallOptions as InnerCallOptions, RpcError as InnerRpcError, RpcStream as InnerRpcStream,
+    CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
+    DuplexCallRaw as InnerDuplexCallRaw, DuplexSink as InnerDuplexSink,
+    DuplexStream as InnerDuplexStream, RpcError as InnerRpcError, RpcStream as InnerRpcStream,
     ServeHandle as InnerServeHandle,
 };
 use ::net::adapter::net::MeshNode;
@@ -296,6 +298,19 @@ fn call_options_from_dict(opts: Option<&Bound<'_, PyDict>>) -> PyResult<InnerCal
             pyo3::exceptions::PyTypeError::new_err(format!("{key} must be int: {e}"))
         })?;
         inner.stream_window_initial = Some(n);
+    }
+    // ABI 0x0002 — request-direction credit window for client-
+    // streaming + duplex. Same canonical / alias treatment as the
+    // response-side window key.
+    let request_window = match d.get_item("request_window_initial")? {
+        Some(v) => Some(("request_window_initial", v)),
+        None => d.get_item("request_window")?.map(|v| ("request_window", v)),
+    };
+    if let Some((key, v)) = request_window {
+        let n: u32 = v.extract().map_err(|e| {
+            pyo3::exceptions::PyTypeError::new_err(format!("{key} must be int: {e}"))
+        })?;
+        inner.request_window_initial = Some(n);
     }
     // Phase 9b: caller-supplied request headers. Accepts a
     // `List[Tuple[str, bytes]]` — each entry's name is a
@@ -608,6 +623,380 @@ impl PyRpcStream {
     }
 }
 
+// ============================================================================
+// ABI 0x0002 — Client-streaming caller-side (Phase B10-1).
+//
+// Same Arc<Mutex<Option<InnerClientStreamCallRaw>>> pattern as
+// PyRpcStream — take the inner across each block_on so close()
+// can race cleanly. finish() takes the inner permanently
+// (consumes the call); close() releases without REQUEST_END.
+// ============================================================================
+
+/// Open client-streaming call. Push chunks via ``send(bytes)``,
+/// then ``finish()`` to await the terminal response. ``close()``
+/// fires CANCEL via the SDK's Drop if finish wasn't reached.
+#[pyclass(name = "ClientStreamCall", module = "_net")]
+pub struct PyClientStreamCall {
+    inner: Arc<Mutex<Option<InnerClientStreamCallRaw>>>,
+    runtime: Arc<Runtime>,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+}
+
+#[pymethods]
+impl PyClientStreamCall {
+    /// Push one body chunk. Encodes as the initial REQUEST (first
+    /// call) or as a REQUEST_CHUNK (subsequent). Blocks until the
+    /// SDK accepts the chunk (under flow control, blocks for one
+    /// upload credit).
+    fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        py.detach(|| {
+            runtime.block_on(async move {
+                let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(c) => c,
+                    None => return Err(RpcError::new_err("client-stream call already closed")),
+                };
+                let result = call.send(body_bytes).await;
+                *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                result.map_err(rpc_error_to_pyerr)
+            })
+        })
+    }
+
+    /// Close the upload direction (emit REQUEST_END) and await
+    /// the server's terminal response. Consumes the call.
+    fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let result = py.detach(|| {
+            runtime.block_on(async move {
+                let call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(c) => c,
+                    None => return Err(RpcError::new_err("client-stream call already closed")),
+                };
+                call.finish().await.map_err(rpc_error_to_pyerr)
+            })
+        })?;
+        Ok(PyBytes::new(py, result.body.as_ref()))
+    }
+
+    /// Server-assigned `call_id` for diagnostics / trace
+    /// correlation.
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+
+    /// ``True`` if the call was opened with a non-``None``
+    /// ``request_window_initial``.
+    fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close without finishing. Fires CANCEL via the SDK's Drop
+    /// if the initial REQUEST has already flown. Idempotent.
+    fn close(&self) {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = guard.take();
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+    fn __exit__(
+        &self,
+        _exc_type: Option<Bound<'_, PyAny>>,
+        _exc_value: Option<Bound<'_, PyAny>>,
+        _traceback: Option<Bound<'_, PyAny>>,
+    ) -> bool {
+        self.close();
+        false
+    }
+}
+
+// ============================================================================
+// ABI 0x0002 — Duplex caller-side (Phase B10-1).
+// ============================================================================
+
+/// Open duplex call. Combined send + receive surface. Use
+/// ``into_split()`` to get independent ``DuplexSink`` +
+/// ``DuplexStream`` halves.
+#[pyclass(name = "DuplexCall", module = "_net")]
+pub struct PyDuplexCall {
+    inner: Arc<Mutex<Option<InnerDuplexCallRaw>>>,
+    runtime: Arc<Runtime>,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+}
+
+#[pymethods]
+impl PyDuplexCall {
+    /// Push one body chunk to the server.
+    fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        py.detach(|| {
+            runtime.block_on(async move {
+                let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(c) => c,
+                    None => return Err(RpcError::new_err("duplex call already closed")),
+                };
+                let result = call.send(body_bytes).await;
+                *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                result.map_err(rpc_error_to_pyerr)
+            })
+        })
+    }
+
+    /// Close the upload direction (emit REQUEST_END). Response
+    /// stream stays open for subsequent ``next()`` calls.
+    fn finish_sending(&self, py: Python<'_>) -> PyResult<()> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        py.detach(|| {
+            runtime.block_on(async move {
+                let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(c) => c,
+                    None => return Err(RpcError::new_err("duplex call already closed")),
+                };
+                let result = call.finish_sending().await;
+                *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                result.map_err(rpc_error_to_pyerr)
+            })
+        })
+    }
+
+    /// Pull the next response chunk. Returns ``bytes`` on success;
+    /// raises ``StopIteration`` on clean EOF; raises an
+    /// ``RpcError`` subclass on terminal non-Ok status.
+    ///
+    /// Python iter protocol — ``DuplexCall`` is iterable. Use it
+    /// either as ``for chunk in call:`` or via explicit
+    /// ``next(call)``.
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let result = py.detach(|| {
+            runtime.block_on(async move {
+                let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(c) => c,
+                    None => return Err(RpcError::new_err("duplex call already closed")),
+                };
+                let next = call.next().await;
+                match next {
+                    Some(Ok(bytes)) => {
+                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                        Ok::<Option<Bytes>, PyErr>(Some(bytes))
+                    }
+                    Some(Err(e)) => {
+                        drop(call);
+                        Err(rpc_error_to_pyerr(e))
+                    }
+                    None => {
+                        drop(call);
+                        Ok(None)
+                    }
+                }
+            })
+        })?;
+        match result {
+            Some(bytes) => Ok(PyBytes::new(py, &bytes)),
+            None => Err(pyo3::exceptions::PyStopIteration::new_err(())),
+        }
+    }
+
+    /// Split the call into independent send + receive halves.
+    /// Returns ``(sink, stream)``. After ``into_split``, the
+    /// original ``DuplexCall`` is "done" — subsequent ``send`` /
+    /// ``finish_sending`` / ``__next__`` raise ``RpcError``.
+    fn into_split(&self) -> PyResult<(PyDuplexSink, PyDuplexStream)> {
+        let call = self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .ok_or_else(|| RpcError::new_err("duplex call already closed"))?;
+        let call_id = call.call_id();
+        let flow_controlled = call.flow_controlled();
+        let (sink, stream) = call.into_split();
+        Ok((
+            PyDuplexSink {
+                inner: Arc::new(Mutex::new(Some(sink))),
+                runtime: self.runtime.clone(),
+                call_id_cached: call_id,
+                flow_controlled_cached: flow_controlled,
+            },
+            PyDuplexStream {
+                inner: Arc::new(Mutex::new(Some(stream))),
+                runtime: self.runtime.clone(),
+                call_id_cached: call_id,
+            },
+        ))
+    }
+
+    /// Server-assigned `call_id`.
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+
+    /// ``True`` if the call was opened with a non-``None``
+    /// ``request_window_initial``.
+    fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close the call. Fires CANCEL via the SDK's Drop.
+    /// Idempotent.
+    fn close(&self) {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = guard.take();
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+    fn __exit__(
+        &self,
+        _exc_type: Option<Bound<'_, PyAny>>,
+        _exc_value: Option<Bound<'_, PyAny>>,
+        _traceback: Option<Bound<'_, PyAny>>,
+    ) -> bool {
+        self.close();
+        false
+    }
+}
+
+/// Send-half of a ``DuplexCall`` after ``into_split``.
+#[pyclass(name = "DuplexSink", module = "_net")]
+pub struct PyDuplexSink {
+    inner: Arc<Mutex<Option<InnerDuplexSink>>>,
+    runtime: Arc<Runtime>,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+}
+
+#[pymethods]
+impl PyDuplexSink {
+    /// Push one body chunk to the server.
+    fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        py.detach(|| {
+            runtime.block_on(async move {
+                let mut sink = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(s) => s,
+                    None => return Err(RpcError::new_err("duplex sink already closed")),
+                };
+                let result = sink.send(body_bytes).await;
+                *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+                result.map_err(rpc_error_to_pyerr)
+            })
+        })
+    }
+
+    /// Close the upload direction (emit REQUEST_END). Consumes
+    /// the sink — subsequent ``send`` raises.
+    fn finish(&self, py: Python<'_>) -> PyResult<()> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        py.detach(|| {
+            runtime.block_on(async move {
+                let sink = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(s) => s,
+                    None => return Err(RpcError::new_err("duplex sink already closed")),
+                };
+                sink.finish_sending().await.map_err(rpc_error_to_pyerr)
+            })
+        })
+    }
+
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+    fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+    fn close(&self) {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = guard.take();
+    }
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+    fn __exit__(
+        &self,
+        _exc_type: Option<Bound<'_, PyAny>>,
+        _exc_value: Option<Bound<'_, PyAny>>,
+        _traceback: Option<Bound<'_, PyAny>>,
+    ) -> bool {
+        self.close();
+        false
+    }
+}
+
+/// Receive-half of a ``DuplexCall`` after ``into_split``.
+/// Python iterator over response chunks.
+#[pyclass(name = "DuplexStream", module = "_net")]
+pub struct PyDuplexStream {
+    inner: Arc<Mutex<Option<InnerDuplexStream>>>,
+    runtime: Arc<Runtime>,
+    call_id_cached: u64,
+}
+
+#[pymethods]
+impl PyDuplexStream {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let result = py.detach(|| {
+            runtime.block_on(async move {
+                let mut stream = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    Some(s) => s,
+                    None => return Err(RpcError::new_err("duplex stream already closed")),
+                };
+                use futures::StreamExt;
+                let next = stream.next().await;
+                match next {
+                    Some(Ok(bytes)) => {
+                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(stream);
+                        Ok::<Option<Bytes>, PyErr>(Some(bytes))
+                    }
+                    Some(Err(e)) => {
+                        drop(stream);
+                        Err(rpc_error_to_pyerr(e))
+                    }
+                    None => {
+                        drop(stream);
+                        Ok(None)
+                    }
+                }
+            })
+        })?;
+        match result {
+            Some(bytes) => Ok(PyBytes::new(py, &bytes)),
+            None => Err(pyo3::exceptions::PyStopIteration::new_err(())),
+        }
+    }
+
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+    fn close(&self) {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = guard.take();
+    }
+}
+
 /// Sentinel for the abort path of `block_until_cancellable`. The
 /// caller maps this to ``RpcCancelledError`` after re-acquiring
 /// the GIL.
@@ -833,6 +1222,71 @@ impl PyMeshRpc {
         Ok(PyRpcStream {
             inner: Arc::new(Mutex::new(Some(inner))),
             runtime: self.runtime.clone(),
+        })
+    }
+
+    /// Open a client-streaming call. Returns a
+    /// :class:`ClientStreamCall`; push chunks via ``call.send(bytes)``
+    /// then ``call.finish()`` to await the terminal response. The
+    /// initial REQUEST is published lazily on the first ``send``
+    /// (or on ``finish`` for the degenerate zero-send path).
+    #[pyo3(signature = (target_node_id, service, opts=None))]
+    fn call_client_stream(
+        &self,
+        py: Python<'_>,
+        target_node_id: u64,
+        service: String,
+        opts: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyClientStreamCall> {
+        let opts = call_options_from_dict(opts)?;
+        let runtime = self.runtime.clone();
+        let node = self.node.clone();
+        let inner = py.detach(|| {
+            runtime.block_on(async move {
+                node.call_client_stream(target_node_id, &service, opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)
+            })
+        })?;
+        let call_id = inner.call_id();
+        let flow_controlled = inner.flow_controlled();
+        Ok(PyClientStreamCall {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
+            call_id_cached: call_id,
+            flow_controlled_cached: flow_controlled,
+        })
+    }
+
+    /// Open a duplex call. Returns a :class:`DuplexCall` with both
+    /// send + receive surfaces. Pass
+    /// ``opts={'request_window_initial': N}`` / ``opts={'stream_window_initial': N}``
+    /// to enable per-direction flow control.
+    #[pyo3(signature = (target_node_id, service, opts=None))]
+    fn call_duplex(
+        &self,
+        py: Python<'_>,
+        target_node_id: u64,
+        service: String,
+        opts: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyDuplexCall> {
+        let opts = call_options_from_dict(opts)?;
+        let runtime = self.runtime.clone();
+        let node = self.node.clone();
+        let inner = py.detach(|| {
+            runtime.block_on(async move {
+                node.call_duplex(target_node_id, &service, opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)
+            })
+        })?;
+        let call_id = inner.call_id();
+        let flow_controlled = inner.flow_controlled();
+        Ok(PyDuplexCall {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
+            call_id_cached: call_id,
+            flow_controlled_cached: flow_controlled,
         })
     }
 
