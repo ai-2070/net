@@ -1,6 +1,6 @@
 [package]
 name = "net-deck-ffi"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "C ABI Deck operator-side SDK for the Go binding of Net"
@@ -24,7 +24,7 @@ default = []
 # `deck` feature pulls in `meshos` transitively; we list both
 # explicitly so the dep chain is self-documenting at the crate
 # boundary.
-net = { package = "ai2070-net", version = "0.18.0", path = "../../..", default-features = false, features = ["meshos"] }
+net = { package = "ai2070-net", version = "0.19.0", path = "../../..", default-features = false, features = ["meshos"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 futures = "0.3"
 serde_json = "1"

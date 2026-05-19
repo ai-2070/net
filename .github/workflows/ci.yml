@@ -562,7 +562,7 @@ jobs:
       # Its `tests/conftest.py` stubs the native `net` extension before
       # any SDK module loads, so the test run does not need maturin or
       # the Rust toolchain. `--no-deps` skips resolving the runtime
-      # `ai2070-net>=0.18.0` requirement against PyPI.
+      # `ai2070-net>=0.19.0` requirement against PyPI.
       - name: Install sdk-py (no deps) + test deps
         run: |
           pip install --upgrade pip
