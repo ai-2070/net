@@ -59,7 +59,9 @@ fn deterministic_bytes(seed: u8, len: usize) -> Vec<u8> {
 }
 
 fn stream_one(bytes: Vec<u8>) -> BlobByteStream {
-    Box::pin(futures::stream::once(async move { Ok::<_, BlobError>(Bytes::from(bytes)) }))
+    Box::pin(futures::stream::once(async move {
+        Ok::<_, BlobError>(Bytes::from(bytes))
+    }))
 }
 
 fn make_adapter() -> MeshBlobAdapter {
@@ -120,7 +122,10 @@ async fn tree_v0_3_phase_a_conformance_at_ci_scale() {
     assert!(matches!(blob_ref, BlobRef::Tree { .. }));
     assert_eq!(blob_ref.size(), CI_BLOB_BYTES as u64);
     let depth = blob_ref.tree_depth().expect("tree depth");
-    assert!((2..=MAX_TREE_DEPTH).contains(&depth), "depth {depth} out of expected range");
+    assert!(
+        (2..=MAX_TREE_DEPTH).contains(&depth),
+        "depth {depth} out of expected range"
+    );
 
     // ── 2. Determinism — a second store of the same content
     //       lands at the SAME root hash.
@@ -153,8 +158,8 @@ async fn tree_v0_3_phase_a_conformance_at_ci_scale() {
     //       because all the spanning manifest nodes land in the
     //       cache on first walk.
     let _ = adapter.tree_node_cache_stats(); // baseline
-    // First pass: prime the cache by reading every leaf-spanning
-    // range once.
+                                             // First pass: prime the cache by reading every leaf-spanning
+                                             // range once.
     for i in 0..16 {
         let start = (i * (CI_BLOB_BYTES / 16)) as u64;
         let end = start + 4096;

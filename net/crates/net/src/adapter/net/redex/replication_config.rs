@@ -248,10 +248,7 @@ impl ReplicationConfig {
     /// [`BandwidthClass`](super::bandwidth::BandwidthClass) the
     /// runtime stamps on emitted `SyncRequest` frames. v0.3 Phase
     /// D2 — defaults to `Foreground`.
-    pub fn with_default_bandwidth_class(
-        mut self,
-        class: super::bandwidth::BandwidthClass,
-    ) -> Self {
+    pub fn with_default_bandwidth_class(mut self, class: super::bandwidth::BandwidthClass) -> Self {
         self.default_bandwidth_class = class;
         self
     }

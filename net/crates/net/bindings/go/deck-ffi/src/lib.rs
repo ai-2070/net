@@ -45,9 +45,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::cell::RefCell;
-use std::ffi::{c_char, c_int, c_uint, CString};
 #[cfg(test)]
 use std::ffi::CStr;
+use std::ffi::{c_char, c_int, c_uint, CString};
 use std::panic::AssertUnwindSafe;
 use std::ptr;
 use std::sync::{Arc, OnceLock};
@@ -344,7 +344,6 @@ pub extern "C" fn net_deck_free_string(s: *mut c_char) {
         let _ = CString::from_raw(s);
     }
 }
-
 
 // =========================================================================
 // Client lifecycle

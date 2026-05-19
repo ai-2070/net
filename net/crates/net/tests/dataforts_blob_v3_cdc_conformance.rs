@@ -57,7 +57,9 @@ fn deterministic_bytes(seed: u8, len: usize) -> Vec<u8> {
 }
 
 fn stream_one(bytes: Vec<u8>) -> BlobByteStream {
-    Box::pin(futures::stream::once(async move { Ok::<_, BlobError>(Bytes::from(bytes)) }))
+    Box::pin(futures::stream::once(async move {
+        Ok::<_, BlobError>(Bytes::from(bytes))
+    }))
 }
 
 fn make_adapter() -> MeshBlobAdapter {
@@ -86,10 +88,7 @@ const CI_CDC_PARAMS: CdcParams = CdcParams {
 /// Walk a `BlobRef::Tree` and collect every reachable chunk hash.
 /// Used by the dedup-after-edit test to compare chunk-set
 /// intersections before and after the edit.
-async fn collect_chunk_hashes(
-    adapter: &MeshBlobAdapter,
-    blob_ref: &BlobRef,
-) -> HashSet<[u8; 32]> {
+async fn collect_chunk_hashes(adapter: &MeshBlobAdapter, blob_ref: &BlobRef) -> HashSet<[u8; 32]> {
     use net::adapter::net::dataforts::blob::blob_tree::TreeNode;
 
     let mut out: HashSet<[u8; 32]> = HashSet::new();
@@ -108,8 +107,8 @@ async fn collect_chunk_hashes(
             .fetch_chunk(&node_hash)
             .await
             .expect("tree node fetch must succeed");
-        let node: TreeNode = postcard::from_bytes(&bytes)
-            .expect("tree node must decode as TreeNode");
+        let node: TreeNode =
+            postcard::from_bytes(&bytes).expect("tree node must decode as TreeNode");
         match node {
             TreeNode::Internal { children } => {
                 for (child_hash, _subtree_size) in children {
@@ -303,19 +302,11 @@ async fn cdc_under_insert_edit_outperforms_fixed_reference() {
     payload_b.extend_from_slice(&payload_a[128 * 1024..]);
 
     let ref_a = adapter
-        .store_stream_tree_cdc_internal(
-            stream_one(payload_a),
-            Encoding::Replicated,
-            CI_CDC_PARAMS,
-        )
+        .store_stream_tree_cdc_internal(stream_one(payload_a), Encoding::Replicated, CI_CDC_PARAMS)
         .await
         .unwrap();
     let ref_b = adapter
-        .store_stream_tree_cdc_internal(
-            stream_one(payload_b),
-            Encoding::Replicated,
-            CI_CDC_PARAMS,
-        )
+        .store_stream_tree_cdc_internal(stream_one(payload_b), Encoding::Replicated, CI_CDC_PARAMS)
         .await
         .unwrap();
     let chunks_a = collect_chunk_hashes(&adapter, &ref_a).await;

@@ -102,7 +102,9 @@ impl BandwidthClass {
     /// responses. Default class.
     #[napi(factory, js_name = "foreground")]
     pub fn foreground() -> Self {
-        Self { kind: "foreground".to_owned() }
+        Self {
+            kind: "foreground".to_owned(),
+        }
     }
 
     /// Long-running TB-scale background work. Bounded to a
@@ -110,14 +112,18 @@ impl BandwidthClass {
     /// starve Foreground.
     #[napi(factory, js_name = "background")]
     pub fn background() -> Self {
-        Self { kind: "background".to_owned() }
+        Self {
+            kind: "background".to_owned(),
+        }
     }
 
     /// Operator-pinned. Bypasses per-class rate budget but
     /// still respects disk-pressure circuit-breakers.
     #[napi(factory, js_name = "realtime")]
     pub fn realtime() -> Self {
-        Self { kind: "realtime".to_owned() }
+        Self {
+            kind: "realtime".to_owned(),
+        }
     }
 }
 

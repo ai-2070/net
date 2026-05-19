@@ -1083,7 +1083,10 @@ mod tests {
         for _ in 0..8 {
             r.entry_mut(h_c, half, t_c).bump(t_c);
         }
-        assert!(r.get(&h_a).is_none(), "h_a must have been evicted (LRU by last_update)");
+        assert!(
+            r.get(&h_a).is_none(),
+            "h_a must have been evicted (LRU by last_update)"
+        );
 
         // Reintroduce h_a. The eviction-cleared in_flight
         // marker lets the new counter emit on next tick.

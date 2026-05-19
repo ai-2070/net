@@ -286,17 +286,23 @@ pub struct PyBandwidthClass {
 impl PyBandwidthClass {
     #[staticmethod]
     pub fn foreground() -> Self {
-        Self { kind: "foreground".to_owned() }
+        Self {
+            kind: "foreground".to_owned(),
+        }
     }
 
     #[staticmethod]
     pub fn background() -> Self {
-        Self { kind: "background".to_owned() }
+        Self {
+            kind: "background".to_owned(),
+        }
     }
 
     #[staticmethod]
     pub fn realtime() -> Self {
-        Self { kind: "realtime".to_owned() }
+        Self {
+            kind: "realtime".to_owned(),
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -447,10 +453,7 @@ impl PyChunkingStrategy {
 
     fn __repr__(&self) -> String {
         match self.kind.as_str() {
-            "fixed" => format!(
-                "ChunkingStrategy.fixed(size={})",
-                self.size.unwrap_or(0)
-            ),
+            "fixed" => format!("ChunkingStrategy.fixed(size={})", self.size.unwrap_or(0)),
             "cdc" => format!(
                 "ChunkingStrategy.cdc(min={}, avg={}, max={})",
                 self.min.unwrap_or(0),

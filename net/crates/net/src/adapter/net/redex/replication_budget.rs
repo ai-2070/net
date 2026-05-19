@@ -257,8 +257,7 @@ impl BandwidthBudget {
                 // Gate threshold: bucket must hold at least
                 // `(1 - background_fraction) * capacity` to
                 // satisfy the reservation against Foreground.
-                let reserve = (1.0 - background_fraction as f64).max(0.0)
-                    * self.capacity_bytes;
+                let reserve = (1.0 - background_fraction as f64).max(0.0) * self.capacity_bytes;
                 let gated_ok =
                     self.available_bytes >= cost && self.available_bytes - cost >= reserve;
                 if gated_ok {
@@ -580,25 +579,10 @@ mod class_tests {
     #[test]
     fn foreground_admits_up_to_capacity_then_rejects() {
         let (mut bb, base) = fresh(1000);
-        assert!(bb.try_consume_with_class(
-            600,
-            BandwidthClass::Foreground,
-            base,
-            0.3,
-        ));
-        assert!(bb.try_consume_with_class(
-            400,
-            BandwidthClass::Foreground,
-            base,
-            0.3,
-        ));
+        assert!(bb.try_consume_with_class(600, BandwidthClass::Foreground, base, 0.3,));
+        assert!(bb.try_consume_with_class(400, BandwidthClass::Foreground, base, 0.3,));
         // Bucket empty — next Foreground request fails.
-        assert!(!bb.try_consume_with_class(
-            1,
-            BandwidthClass::Foreground,
-            base,
-            0.3,
-        ));
+        assert!(!bb.try_consume_with_class(1, BandwidthClass::Foreground, base, 0.3,));
     }
 
     /// `Background` is gated at `(1 - fraction) * capacity` —
@@ -609,20 +593,10 @@ mod class_tests {
         let (mut bb, base) = fresh(1000);
         // Fresh bucket: available=1000. Background admitted
         // because 1000 - 200 = 800 >= reserve(700).
-        assert!(bb.try_consume_with_class(
-            200,
-            BandwidthClass::Background,
-            base,
-            0.3,
-        ));
+        assert!(bb.try_consume_with_class(200, BandwidthClass::Background, base, 0.3,));
         // available=800, request 200 → would leave 600 < reserve(700).
         // Denied (and the D4 starve timer hasn't tripped yet).
-        assert!(!bb.try_consume_with_class(
-            200,
-            BandwidthClass::Background,
-            at(base, 1),
-            0.3,
-        ));
+        assert!(!bb.try_consume_with_class(200, BandwidthClass::Background, at(base, 1), 0.3,));
     }
 
     /// `Background` with fraction 1.0 behaves like `Foreground`
@@ -632,18 +606,8 @@ mod class_tests {
     #[test]
     fn background_with_full_fraction_acts_like_foreground() {
         let (mut bb, base) = fresh(1000);
-        assert!(bb.try_consume_with_class(
-            900,
-            BandwidthClass::Background,
-            base,
-            1.0,
-        ));
-        assert!(bb.try_consume_with_class(
-            100,
-            BandwidthClass::Background,
-            base,
-            1.0,
-        ));
+        assert!(bb.try_consume_with_class(900, BandwidthClass::Background, base, 1.0,));
+        assert!(bb.try_consume_with_class(100, BandwidthClass::Background, base, 1.0,));
     }
 
     /// `Background` with fraction 0.0 means "Background gets no
@@ -656,12 +620,7 @@ mod class_tests {
         // Fresh bucket, fraction=0.0 → reserve = capacity =
         // 1000. Need `available - cost >= 1000`, but available
         // starts at 1000 and any cost takes it below. Denied.
-        assert!(!bb.try_consume_with_class(
-            1,
-            BandwidthClass::Background,
-            base,
-            0.0,
-        ));
+        assert!(!bb.try_consume_with_class(1, BandwidthClass::Background, base, 0.0,));
     }
 
     /// `Realtime` bypasses the failure path entirely. Drains
@@ -670,26 +629,11 @@ mod class_tests {
     fn realtime_bypasses_failure_path() {
         let (mut bb, base) = fresh(1000);
         // Drain the bucket.
-        assert!(bb.try_consume_with_class(
-            1000,
-            BandwidthClass::Foreground,
-            base,
-            0.3,
-        ));
+        assert!(bb.try_consume_with_class(1000, BandwidthClass::Foreground, base, 0.3,));
         // Foreground denied.
-        assert!(!bb.try_consume_with_class(
-            1,
-            BandwidthClass::Foreground,
-            base,
-            0.3,
-        ));
+        assert!(!bb.try_consume_with_class(1, BandwidthClass::Foreground, base, 0.3,));
         // Realtime admitted regardless.
-        assert!(bb.try_consume_with_class(
-            500,
-            BandwidthClass::Realtime,
-            base,
-            0.3,
-        ));
+        assert!(bb.try_consume_with_class(500, BandwidthClass::Realtime, base, 0.3,));
     }
 
     /// D4 anti-starvation hatch: a Background request denied
@@ -702,36 +646,16 @@ mod class_tests {
             .with_background_starve_window(Duration::from_millis(100));
         // Drain the bucket via Foreground so Background hits
         // the gate cleanly.
-        assert!(bb.try_consume_with_class(
-            1000,
-            BandwidthClass::Foreground,
-            base,
-            0.3,
-        ));
+        assert!(bb.try_consume_with_class(1000, BandwidthClass::Foreground, base, 0.3,));
         // First Background within the starve window: denied.
-        assert!(!bb.try_consume_with_class(
-            200,
-            BandwidthClass::Background,
-            at(base, 50),
-            0.3,
-        ));
+        assert!(!bb.try_consume_with_class(200, BandwidthClass::Background, at(base, 50), 0.3,));
         // Past the starve window: one-shot admitted.
-        assert!(bb.try_consume_with_class(
-            200,
-            BandwidthClass::Background,
-            at(base, 200),
-            0.3,
-        ));
+        assert!(bb.try_consume_with_class(200, BandwidthClass::Background, at(base, 200), 0.3,));
         // Next Background within the starve window after the
         // hatch firing: denied again (one-shot, not "open the
         // floodgates"). Use a tight gap so refill doesn't restore
         // the bucket past the reserve.
-        assert!(!bb.try_consume_with_class(
-            200,
-            BandwidthClass::Background,
-            at(base, 201),
-            0.3,
-        ));
+        assert!(!bb.try_consume_with_class(200, BandwidthClass::Background, at(base, 201), 0.3,));
     }
 
     /// D4 timer resets on every successful Background admission
@@ -744,27 +668,12 @@ mod class_tests {
         let mut bb = BandwidthBudget::new(1.0, 1000, base)
             .with_background_starve_window(Duration::from_millis(100));
         // Fresh bucket: Background admitted via gate.
-        assert!(bb.try_consume_with_class(
-            200,
-            BandwidthClass::Background,
-            base,
-            0.3,
-        ));
+        assert!(bb.try_consume_with_class(200, BandwidthClass::Background, base, 0.3,));
         // Drain via Foreground.
-        assert!(bb.try_consume_with_class(
-            800,
-            BandwidthClass::Foreground,
-            at(base, 1),
-            0.3,
-        ));
+        assert!(bb.try_consume_with_class(800, BandwidthClass::Foreground, at(base, 1), 0.3,));
         // 50 ms in (< 100 ms window): Background denied,
         // hatch doesn't fire (timer was just reset).
-        assert!(!bb.try_consume_with_class(
-            200,
-            BandwidthClass::Background,
-            at(base, 50),
-            0.3,
-        ));
+        assert!(!bb.try_consume_with_class(200, BandwidthClass::Background, at(base, 50), 0.3,));
     }
 
     /// Legacy `try_consume` still works identically — it routes

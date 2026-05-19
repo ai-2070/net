@@ -118,7 +118,10 @@ impl StripeMembershipIndex {
         if !self.fingerprints.insert(fingerprint) {
             return; // already registered.
         }
-        let record = StripeRecord { members: members.clone(), k };
+        let record = StripeRecord {
+            members: members.clone(),
+            k,
+        };
         for hash in &members {
             self.by_chunk.entry(*hash).or_default().push(record.clone());
         }
@@ -239,9 +242,7 @@ mod tests {
         idx.register_stripe(vec![h(0xAA), h(5), h(6), h(7)], 2);
         // Stripe 1 is healthy (all 4 present), stripe 2 is
         // degraded (only 0xAA present).
-        let presence = |hash: &[u8; 32]| {
-            matches!(hash[0], 0xAA | 2 | 3 | 4)
-        };
+        let presence = |hash: &[u8; 32]| matches!(hash[0], 0xAA | 2 | 3 | 4);
         assert!(
             idx.should_pin_against_gc(&h(0xAA), presence),
             "chunk in any degraded stripe must pin"

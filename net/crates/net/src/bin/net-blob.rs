@@ -63,10 +63,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
+use net::adapter::net::dataforts::blob::blob_tree::TreeNode;
 use net::adapter::net::dataforts::blob::{
     BlobAdapter, BlobRef, BlobStat, Encoding, MeshBlobAdapter, RefcountEntry, RepairReport,
 };
-use net::adapter::net::dataforts::blob::blob_tree::TreeNode;
 use net::adapter::net::redex::Redex;
 
 /// `net-blob` — operator CLI for dataforts blob storage.
@@ -305,9 +305,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Repair { hash, size, depth } => {
             cmd_repair(&adapter, &hash, size, depth, cli.format).await
         }
-        Cmd::Tree { hash, size, depth } => {
-            cmd_tree(&adapter, &hash, size, depth, cli.format).await
-        }
+        Cmd::Tree { hash, size, depth } => cmd_tree(&adapter, &hash, size, depth, cli.format).await,
         Cmd::Verify { hash, size, depth } => {
             cmd_verify(&adapter, &hash, size, depth, cli.format).await
         }
@@ -686,7 +684,11 @@ type RecursiveWalkFuture<'a> = std::pin::Pin<
 /// from the manifest itself, so the BlobRef-level encoding here
 /// only affects the repair report's `replicated_leaves_skipped`
 /// counter (and that path is robust to a mismatch).
-fn build_tree_ref(hash_hex: &str, size: u64, depth: u8) -> Result<BlobRef, Box<dyn std::error::Error>> {
+fn build_tree_ref(
+    hash_hex: &str,
+    size: u64,
+    depth: u8,
+) -> Result<BlobRef, Box<dyn std::error::Error>> {
     let hash = parse_hash(hash_hex)?;
     let uri = format!("mesh://{}", hex32(&hash));
     let blob_ref = BlobRef::tree(uri, Encoding::Replicated, hash, size, depth)
@@ -707,10 +709,16 @@ async fn cmd_repair(
         OutputFormat::Human => {
             println!("repair: {}", hash_hex);
             println!("  stripes_walked:              {}", report.stripes_walked);
-            println!("  stripes_already_healthy:     {}", report.stripes_already_healthy);
+            println!(
+                "  stripes_already_healthy:     {}",
+                report.stripes_already_healthy
+            );
             println!("  stripes_repaired:            {}", report.stripes_repaired);
             println!("  chunks_restored:             {}", report.chunks_restored);
-            println!("  stripes_unrecoverable:       {}", report.stripes_unrecoverable);
+            println!(
+                "  stripes_unrecoverable:       {}",
+                report.stripes_unrecoverable
+            );
             println!(
                 "  replicated_stripes_skipped:  {}",
                 report.replicated_stripes_skipped
@@ -805,60 +813,54 @@ fn walk_tree_print<'a>(
                     walk_tree_print(adapter, *child_hash, indent + 1, fmt, json_nodes).await?;
                 }
             }
-            TreeNode::Leaf { chunks } => {
-                match fmt {
-                    OutputFormat::Human => println!(
-                        "{}leaf[{}] {} ({} bytes covered)",
+            TreeNode::Leaf { chunks } => match fmt {
+                OutputFormat::Human => println!(
+                    "{}leaf[{}] {} ({} bytes covered)",
+                    pad,
+                    chunks.len(),
+                    hex32(&node_hash),
+                    node.covered_bytes()
+                ),
+                OutputFormat::Json => json_nodes.push(serde_json::json!({
+                    "hash": hex32(&node_hash),
+                    "kind": "leaf",
+                    "depth": indent,
+                    "chunks": chunks.len(),
+                    "covered_bytes": node.covered_bytes(),
+                })),
+            },
+            TreeNode::ErasureLeaf { stripes } => match fmt {
+                OutputFormat::Human => {
+                    println!(
+                        "{}erasure_leaf[{} stripes] {} ({} bytes covered)",
                         pad,
-                        chunks.len(),
+                        stripes.len(),
                         hex32(&node_hash),
                         node.covered_bytes()
-                    ),
-                    OutputFormat::Json => json_nodes.push(serde_json::json!({
-                        "hash": hex32(&node_hash),
-                        "kind": "leaf",
-                        "depth": indent,
-                        "chunks": chunks.len(),
-                        "covered_bytes": node.covered_bytes(),
-                    })),
-                }
-            }
-            TreeNode::ErasureLeaf { stripes } => {
-                match fmt {
-                    OutputFormat::Human => {
+                    );
+                    for (i, stripe) in stripes.iter().enumerate() {
+                        let pad2 = "  ".repeat(indent + 1);
+                        let data_count = stripe.chunks.iter().filter(|c| c.is_data()).count();
+                        let parity_count = stripe.chunks.iter().filter(|c| c.is_parity()).count();
                         println!(
-                            "{}erasure_leaf[{} stripes] {} ({} bytes covered)",
-                            pad,
-                            stripes.len(),
-                            hex32(&node_hash),
-                            node.covered_bytes()
+                            "{}stripe[{}] {:?}: {} data + {} parity ({} bytes)",
+                            pad2,
+                            i,
+                            stripe.encoding,
+                            data_count,
+                            parity_count,
+                            stripe.covered_bytes()
                         );
-                        for (i, stripe) in stripes.iter().enumerate() {
-                            let pad2 = "  ".repeat(indent + 1);
-                            let data_count =
-                                stripe.chunks.iter().filter(|c| c.is_data()).count();
-                            let parity_count =
-                                stripe.chunks.iter().filter(|c| c.is_parity()).count();
-                            println!(
-                                "{}stripe[{}] {:?}: {} data + {} parity ({} bytes)",
-                                pad2,
-                                i,
-                                stripe.encoding,
-                                data_count,
-                                parity_count,
-                                stripe.covered_bytes()
-                            );
-                        }
                     }
-                    OutputFormat::Json => json_nodes.push(serde_json::json!({
-                        "hash": hex32(&node_hash),
-                        "kind": "erasure_leaf",
-                        "depth": indent,
-                        "stripes": stripes.len(),
-                        "covered_bytes": node.covered_bytes(),
-                    })),
                 }
-            }
+                OutputFormat::Json => json_nodes.push(serde_json::json!({
+                    "hash": hex32(&node_hash),
+                    "kind": "erasure_leaf",
+                    "depth": indent,
+                    "stripes": stripes.len(),
+                    "covered_bytes": node.covered_bytes(),
+                })),
+            },
         }
         Ok(())
     })
@@ -876,7 +878,14 @@ async fn cmd_verify(
     let mut healthy = 0u64;
     let mut missing = 0u64;
     let mut corrupted = 0u64;
-    verify_walk(adapter, root_hash, &mut healthy, &mut missing, &mut corrupted).await?;
+    verify_walk(
+        adapter,
+        root_hash,
+        &mut healthy,
+        &mut missing,
+        &mut corrupted,
+    )
+    .await?;
     match fmt {
         OutputFormat::Human => {
             println!("verify: {}", hash_hex);
@@ -1144,7 +1153,10 @@ fn print_path_result(
             println!("  chunk_hash:     {}", result.chunk_hash);
             println!("  chunk_size:     {} bytes", result.chunk_size);
             println!("  chunk_role:     {}", result.chunk_role);
-            println!("  sub_offset:     {} (byte within the chunk)", result.sub_offset);
+            println!(
+                "  sub_offset:     {} (byte within the chunk)",
+                result.sub_offset
+            );
         }
         OutputFormat::Json => println!(
             "{}",

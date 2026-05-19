@@ -279,8 +279,7 @@ pub struct MeshBlobAdapter {
     /// Cache is content-addressed (keys are immutable BLAKE3
     /// hashes), so hits are always correct — no invalidation
     /// path is needed.
-    tree_node_cache:
-        Option<Arc<parking_lot::Mutex<super::blob_tree_cache::TreeNodeCache>>>,
+    tree_node_cache: Option<Arc<parking_lot::Mutex<super::blob_tree_cache::TreeNodeCache>>>,
     /// Per-adapter stripe-membership index for the v0.3 Phase C6
     /// GC pin. RS stripes written via
     /// [`Self::store_stream_tree_rs_internal`] register here;
@@ -922,9 +921,7 @@ impl MeshBlobAdapter {
             // through to the v0.2 sweep path unchanged.
             let pinned_by_stripe = {
                 let idx = self.stripe_index.lock();
-                idx.should_pin_against_gc(&hash, |h| {
-                    self.chunk_exists(h).unwrap_or(false)
-                })
+                idx.should_pin_against_gc(&hash, |h| self.chunk_exists(h).unwrap_or(false))
             };
             if pinned_by_stripe {
                 continue;
@@ -1069,7 +1066,8 @@ impl MeshBlobAdapter {
                         size, BLOB_CHUNK_SIZE_BYTES
                     )));
                 }
-                self.store_stream_tree_internal(stream, encoding, size).await
+                self.store_stream_tree_internal(stream, encoding, size)
+                    .await
             }
             ChunkingStrategy::Cdc { min, avg, max } => {
                 // CDC: only the production parameter triple
@@ -1084,13 +1082,16 @@ impl MeshBlobAdapter {
                          max: {} }} does not match the v0.3 production parameter triple \
                          (min={}, avg={}, max={}); arbitrary CDC params break cross-blob \
                          dedup on the cluster",
-                        min, avg, max,
+                        min,
+                        avg,
+                        max,
                         super::cdc::PRODUCTION_CDC_PARAMS.min,
                         super::cdc::PRODUCTION_CDC_PARAMS.avg,
                         super::cdc::PRODUCTION_CDC_PARAMS.max
                     )));
                 }
-                self.store_stream_tree_cdc_internal(stream, encoding, params).await
+                self.store_stream_tree_cdc_internal(stream, encoding, params)
+                    .await
             }
         }
     }
@@ -1133,10 +1134,10 @@ impl MeshBlobAdapter {
                 buffer.extend_from_slice(&remaining[..take]);
                 remaining = &remaining[take..];
                 if buffer.len() == chunk_size_usize {
-                    self.emit_tree_chunk(&mut builder, std::mem::replace(
-                        &mut buffer,
-                        Vec::with_capacity(chunk_size_usize),
-                    ))
+                    self.emit_tree_chunk(
+                        &mut builder,
+                        std::mem::replace(&mut buffer, Vec::with_capacity(chunk_size_usize)),
+                    )
                     .await?;
                 }
             }
@@ -1293,20 +1294,11 @@ impl MeshBlobAdapter {
             // Persist parity bytes (data chunks were already
             // persisted via emit_tree_chunk before being pushed
             // into the striper).
-            let parity_iter = closed
-                .block
-                .chunks
-                .iter()
-                .filter(|c| c.is_parity());
+            let parity_iter = closed.block.chunks.iter().filter(|c| c.is_parity());
             for (p_ref, p_bytes) in parity_iter.zip(closed.parity_bytes.iter()) {
                 adapter.store_chunk(&p_ref.hash, p_bytes).await?;
             }
-            let data_count = closed
-                .block
-                .chunks
-                .iter()
-                .filter(|c| c.is_data())
-                .count() as u64;
+            let data_count = closed.block.chunks.iter().filter(|c| c.is_data()).count() as u64;
             *data_chunk_count = data_chunk_count.saturating_add(data_count);
 
             // Register stripe membership for the v0.3 Phase C6
@@ -1314,8 +1306,7 @@ impl MeshBlobAdapter {
             // stripes have no parity dependency so the v0.2
             // refcount + retention model is sufficient.
             if let Encoding::ReedSolomon { k, .. } = closed.block.encoding {
-                let members: Vec<[u8; 32]> =
-                    closed.block.chunks.iter().map(|c| c.hash).collect();
+                let members: Vec<[u8; 32]> = closed.block.chunks.iter().map(|c| c.hash).collect();
                 adapter.stripe_index.lock().register_stripe(members, k);
             }
 
@@ -1332,9 +1323,8 @@ impl MeshBlobAdapter {
             // closures) are returned but the leaf bytes we
             // already persisted; internals get persisted in
             // finalize via output.trailing_nodes.
-            let emitted = builder.push_prebuilt_leaf(
-                leaf_hash, leaf_bytes, leaf_size, data_count,
-            )?;
+            let emitted =
+                builder.push_prebuilt_leaf(leaf_hash, leaf_bytes, leaf_size, data_count)?;
             // Persist every internal-level closure (the leaf
             // emission at level 0 is already stored; only the
             // level > 0 internals need separate persistence).
@@ -1374,10 +1364,8 @@ impl MeshBlobAdapter {
                             self.store_chunk(&chunk_hash, &chunk_bytes).await?;
                             let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
                             if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
-                                flush_stripe(
-                                    self, closed, &mut builder, &mut data_chunk_count,
-                                )
-                                .await?;
+                                flush_stripe(self, closed, &mut builder, &mut data_chunk_count)
+                                    .await?;
                             }
                         }
                     }
@@ -1388,10 +1376,7 @@ impl MeshBlobAdapter {
                     self.store_chunk(&chunk_hash, &chunk_bytes).await?;
                     let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
                     if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
-                        flush_stripe(
-                            self, closed, &mut builder, &mut data_chunk_count,
-                        )
-                        .await?;
+                        flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
                     }
                 }
             }
@@ -1407,10 +1392,7 @@ impl MeshBlobAdapter {
                         self.store_chunk(&chunk_hash, &chunk_bytes).await?;
                         let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
                         if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
-                            flush_stripe(
-                                self, closed, &mut builder, &mut data_chunk_count,
-                            )
-                            .await?;
+                            flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
                         }
                     }
                 }
@@ -1419,10 +1401,7 @@ impl MeshBlobAdapter {
                     self.store_chunk(&chunk_hash, &chunk_bytes).await?;
                     let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
                     if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
-                        flush_stripe(
-                            self, closed, &mut builder, &mut data_chunk_count,
-                        )
-                        .await?;
+                        flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
                     }
                 }
             }
@@ -1446,7 +1425,8 @@ impl MeshBlobAdapter {
         for node in &output.trailing_nodes {
             self.store_chunk(&node.hash, &node.bytes).await?;
         }
-        self.store_chunk(&output.root_hash, &output.root_bytes).await?;
+        self.store_chunk(&output.root_hash, &output.root_bytes)
+            .await?;
 
         BlobRef::tree(
             format!("mesh://{}", super::hex32(&output.root_hash)),
@@ -1659,9 +1639,7 @@ impl MeshBlobAdapter {
                         // Translate the global range into the
                         // child's local range.
                         let sub_start = range_start.saturating_sub(child_start);
-                        let sub_end = range_end
-                            .saturating_sub(child_start)
-                            .min(child_size);
+                        let sub_end = range_end.saturating_sub(child_start).min(child_size);
                         let child_bytes = self
                             .walk_tree_range(
                                 child_hash,
@@ -1688,9 +1666,7 @@ impl MeshBlobAdapter {
                             continue;
                         }
                         let sub_start = range_start.saturating_sub(chunk_start);
-                        let sub_end = range_end
-                            .saturating_sub(chunk_start)
-                            .min(chunk_size_u64);
+                        let sub_end = range_end.saturating_sub(chunk_start).min(chunk_size_u64);
                         let chunk_bytes = self.fetch_chunk(&chunk.hash).await?;
                         if (chunk_bytes.len() as u64) != chunk_size_u64 {
                             return Err(BlobError::ShortChunk {
@@ -1791,8 +1767,8 @@ impl MeshBlobAdapter {
         // whether a tree references it yet).
         self.store_chunk(&hash, &chunk_bytes).await?;
         drop(chunk_bytes); // release memory now that store has it.
-        // Push into the builder; persist any cascade-closed nodes
-        // before returning.
+                           // Push into the builder; persist any cascade-closed nodes
+                           // before returning.
         let closed = builder.push_chunk(ChunkRefV3::data(hash, chunk_size))?;
         for node in &closed {
             self.store_chunk(&node.hash, &node.bytes).await?;
@@ -1836,9 +1812,7 @@ impl MeshBlobAdapter {
                 // Try optimistic data-only fetch first. If that
                 // succeeds, return. Otherwise reconstruct.
                 match self
-                    .walk_stripe_data_only(
-                        stripe, stripe_start, range_start, range_end, touched,
-                    )
+                    .walk_stripe_data_only(stripe, stripe_start, range_start, range_end, touched)
                     .await
                 {
                     Ok(bytes) => Ok(bytes),
@@ -1934,7 +1908,10 @@ impl MeshBlobAdapter {
         if stripe.chunks.len() != total_shards {
             return Err(BlobError::Backend(format!(
                 "erasure: stripe shape mismatch — expected {} shards (k={} + m={}), got {}",
-                total_shards, k, m, stripe.chunks.len()
+                total_shards,
+                k,
+                m,
+                stripe.chunks.len()
             )));
         }
 
@@ -2074,14 +2051,14 @@ impl MeshBlobAdapter {
                     i
                 ))
             })?;
-            let slice = data_bytes
-                .get(sub_start as usize..sub_end as usize)
-                .ok_or(BlobError::ShortChunk {
+            let slice = data_bytes.get(sub_start as usize..sub_end as usize).ok_or(
+                BlobError::ShortChunk {
                     hash: chunk.hash,
                     requested_start: sub_start,
                     requested_end: sub_end,
                     actual_len: data_bytes.len() as u64,
-                })?;
+                },
+            )?;
             out.extend_from_slice(slice);
         }
         Ok(out)
@@ -2288,10 +2265,7 @@ impl MeshBlobAdapter {
     /// The repair sweep is iterative (no concurrency for v0.3
     /// Phase C7); a future commit may parallelise the per-stripe
     /// recovery across the BandwidthClass-aware send queue.
-    pub async fn repair_blob(
-        &self,
-        blob_ref: &BlobRef,
-    ) -> Result<RepairReport, BlobError> {
+    pub async fn repair_blob(&self, blob_ref: &BlobRef) -> Result<RepairReport, BlobError> {
         use super::blob_tree::TreeNode;
 
         let mut report = RepairReport::default();
@@ -2357,7 +2331,10 @@ impl MeshBlobAdapter {
         if stripe.chunks.len() != total {
             return Err(BlobError::Backend(format!(
                 "repair: stripe shape mismatch — expected {} shards (k={} + m={}), got {}",
-                total, k, m, stripe.chunks.len()
+                total,
+                k,
+                m,
+                stripe.chunks.len()
             )));
         }
 
@@ -2394,8 +2371,7 @@ impl MeshBlobAdapter {
 
         if missing_data_indices.is_empty() {
             // Healthy stripe — no data chunks missing.
-            report.stripes_already_healthy =
-                report.stripes_already_healthy.saturating_add(1);
+            report.stripes_already_healthy = report.stripes_already_healthy.saturating_add(1);
             return Ok(());
         }
 
@@ -2403,8 +2379,7 @@ impl MeshBlobAdapter {
             // Can't reconstruct. Record + continue (no error;
             // the operator decides what to do with
             // unrecoverable stripes).
-            report.stripes_unrecoverable =
-                report.stripes_unrecoverable.saturating_add(1);
+            report.stripes_unrecoverable = report.stripes_unrecoverable.saturating_add(1);
             return Ok(());
         }
 
@@ -2454,7 +2429,9 @@ impl MeshBlobAdapter {
             if bytes.len() < logical_len {
                 return Err(BlobError::Backend(format!(
                     "repair: reconstructed shard {} is {} bytes, expected at least {}",
-                    idx, bytes.len(), logical_len
+                    idx,
+                    bytes.len(),
+                    logical_len
                 )));
             }
             let logical_bytes = &bytes[..logical_len];
@@ -4327,9 +4304,7 @@ mod tests {
     // store_stream_tree (Phase A3)
     // ────────────────────────────────────────────────────────
 
-    use super::super::blob_tree::{
-        ChunkingStrategy, TreeNode, MAX_TREE_DEPTH, TREE_FANOUT,
-    };
+    use super::super::blob_tree::{ChunkingStrategy, TreeNode, MAX_TREE_DEPTH, TREE_FANOUT};
     use bytes::Bytes;
 
     /// Build a `BlobByteStream` from a single byte buffer. Helps
@@ -4344,10 +4319,8 @@ mod tests {
     /// exercise the buffering logic in `store_stream_tree` (where
     /// the producer doesn't align to the 4 MiB chunk boundary).
     fn stream_many(slices: Vec<Vec<u8>>) -> BlobByteStream {
-        let items: Vec<Result<Bytes, BlobError>> = slices
-            .into_iter()
-            .map(|s| Ok(Bytes::from(s)))
-            .collect();
+        let items: Vec<Result<Bytes, BlobError>> =
+            slices.into_iter().map(|s| Ok(Bytes::from(s))).collect();
         Box::pin(futures::stream::iter(items))
     }
 
@@ -4358,7 +4331,9 @@ mod tests {
         let mut state: u64 = seed as u64;
         (0..len)
             .map(|_| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (state >> 33) as u8
             })
             .collect()
@@ -4451,7 +4426,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("does not match the v0.3 production parameter triple"),
+            err.to_string()
+                .contains("does not match the v0.3 production parameter triple"),
             "got: {err}"
         );
     }
@@ -4483,7 +4459,10 @@ mod tests {
             .fetch_range(&blob_ref, 0..payload.len() as u64)
             .await
             .expect("RS fetch_range");
-        assert_eq!(fetched, payload, "RS happy-path round-trip must be byte-identical");
+        assert_eq!(
+            fetched, payload,
+            "RS happy-path round-trip must be byte-identical"
+        );
     }
 
     /// Killing up to `m` data chunks per stripe still allows the
@@ -4594,8 +4573,14 @@ mod tests {
         );
 
         // Repeated fetches don't bloat the index (dedup).
-        let _ = adapter2.fetch_range(&blob_ref, 0..payload.len() as u64).await.unwrap();
-        let _ = adapter2.fetch_range(&blob_ref, 0..payload.len() as u64).await.unwrap();
+        let _ = adapter2
+            .fetch_range(&blob_ref, 0..payload.len() as u64)
+            .await
+            .unwrap();
+        let _ = adapter2
+            .fetch_range(&blob_ref, 0..payload.len() as u64)
+            .await
+            .unwrap();
         assert_eq!(
             adapter2.stripe_index.lock().registered_count(),
             1,
@@ -4612,8 +4597,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_range_auto_repair_restores_missing_chunks_when_enabled() {
         let redex = Arc::new(Redex::new());
-        let adapter = MeshBlobAdapter::new("auto-repair-on", redex)
-            .with_auto_repair_on_fetch(true);
+        let adapter = MeshBlobAdapter::new("auto-repair-on", redex).with_auto_repair_on_fetch(true);
         let chunk_size: u32 = 4 * 1024;
         let payload = deterministic_bytes(0xAD, chunk_size as usize * 4);
         let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
@@ -4631,9 +4615,7 @@ mod tests {
         let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
         let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
             TreeNode::ErasureLeaf { .. } => root_bytes,
-            TreeNode::Internal { children } => {
-                adapter.fetch_chunk(&children[0].0).await.unwrap()
-            }
+            TreeNode::Internal { children } => adapter.fetch_chunk(&children[0].0).await.unwrap(),
             TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
         };
         let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
@@ -4695,9 +4677,7 @@ mod tests {
         let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
         let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
             TreeNode::ErasureLeaf { .. } => root_bytes,
-            TreeNode::Internal { children } => {
-                adapter.fetch_chunk(&children[0].0).await.unwrap()
-            }
+            TreeNode::Internal { children } => adapter.fetch_chunk(&children[0].0).await.unwrap(),
             TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
         };
         let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
@@ -4752,9 +4732,7 @@ mod tests {
         let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
         let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
             TreeNode::ErasureLeaf { .. } => root_bytes,
-            TreeNode::Internal { children } => {
-                adapter.fetch_chunk(&children[0].0).await.unwrap()
-            }
+            TreeNode::Internal { children } => adapter.fetch_chunk(&children[0].0).await.unwrap(),
             TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
         };
         let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
@@ -4856,9 +4834,7 @@ mod tests {
         let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
         let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
             TreeNode::ErasureLeaf { .. } => root_bytes,
-            TreeNode::Internal { children } => {
-                adapter.fetch_chunk(&children[0].0).await.unwrap()
-            }
+            TreeNode::Internal { children } => adapter.fetch_chunk(&children[0].0).await.unwrap(),
             TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
         };
         let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
@@ -4951,9 +4927,7 @@ mod tests {
         let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
         let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
             TreeNode::ErasureLeaf { .. } => root_bytes,
-            TreeNode::Internal { children } => {
-                adapter.fetch_chunk(&children[0].0).await.unwrap()
-            }
+            TreeNode::Internal { children } => adapter.fetch_chunk(&children[0].0).await.unwrap(),
             TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
         };
         let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
@@ -5008,9 +4982,7 @@ mod tests {
         let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
         let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
             TreeNode::ErasureLeaf { .. } => root_bytes,
-            TreeNode::Internal { children } => {
-                adapter.fetch_chunk(&children[0].0).await.unwrap()
-            }
+            TreeNode::Internal { children } => adapter.fetch_chunk(&children[0].0).await.unwrap(),
             TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
         };
         let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
@@ -5142,11 +5114,7 @@ mod tests {
             .await
             .unwrap();
         let r_b = adapter_b
-            .store_stream_tree_cdc_internal(
-                stream_one(payload),
-                Encoding::Replicated,
-                params,
-            )
+            .store_stream_tree_cdc_internal(stream_one(payload), Encoding::Replicated, params)
             .await
             .unwrap();
         assert_eq!(
@@ -5266,11 +5234,7 @@ mod tests {
         let len = small_chunk as usize * (TREE_FANOUT + 1);
         let payload = deterministic_bytes(0x88, len);
         let blob_ref = adapter
-            .store_stream_tree_internal(
-                stream_one(payload),
-                Encoding::Replicated,
-                small_chunk,
-            )
+            .store_stream_tree_internal(stream_one(payload), Encoding::Replicated, small_chunk)
             .await
             .unwrap();
         assert_eq!(blob_ref.tree_depth(), Some(2));
@@ -5457,14 +5421,8 @@ mod tests {
         // Construct a BlobRef::Tree referencing a hash no chunk
         // store has ever seen.
         let bogus_root = [0xDE; 32];
-        let blob_ref = BlobRef::tree(
-            "mesh://deadbeef",
-            Encoding::Replicated,
-            bogus_root,
-            1024,
-            1,
-        )
-        .unwrap();
+        let blob_ref =
+            BlobRef::tree("mesh://deadbeef", Encoding::Replicated, bogus_root, 1024, 1).unwrap();
         let err = adapter.fetch_range(&blob_ref, 0..512).await.unwrap_err();
         // Either NotFound or HashMismatch is acceptable here —
         // the chunk file doesn't exist, so the underlying fetch
@@ -5590,9 +5548,8 @@ mod tests {
         let adapter = make_adapter();
         let allow = StdArc::new(AtomicBool::new(false));
         let allow_for_probe = allow.clone();
-        let probe = TreeSupportProbe::Dynamic(Box::new(move || {
-            allow_for_probe.load(Ordering::Relaxed)
-        }));
+        let probe =
+            TreeSupportProbe::Dynamic(Box::new(move || allow_for_probe.load(Ordering::Relaxed)));
         // First call: probe says false → downgrade away from
         // Tree. Use a payload > BLOB_CHUNK_SIZE_BYTES so the
         // chunker actually returns a Manifest (not a Small).
@@ -5638,8 +5595,8 @@ mod tests {
     #[tokio::test]
     async fn fetch_range_tree_cache_hits_on_adjacent_reads() {
         let redex = Arc::new(Redex::new());
-        let adapter = MeshBlobAdapter::new("mesh-tree-cache", redex)
-            .with_tree_node_cache(64 * 1024 * 1024);
+        let adapter =
+            MeshBlobAdapter::new("mesh-tree-cache", redex).with_tree_node_cache(64 * 1024 * 1024);
         // Build a depth-2 tree so a walk fetches root + at
         // least one leaf — both cacheable.
         let small_chunk: u32 = 1024;
@@ -5706,8 +5663,8 @@ mod tests {
     #[tokio::test]
     async fn fetch_range_tree_cache_can_be_disabled() {
         let redex = Arc::new(Redex::new());
-        let adapter = MeshBlobAdapter::new("mesh-tree-cache-disabled", redex)
-            .with_tree_node_cache(0);
+        let adapter =
+            MeshBlobAdapter::new("mesh-tree-cache-disabled", redex).with_tree_node_cache(0);
         let len = BLOB_CHUNK_SIZE_BYTES as usize;
         let payload = deterministic_bytes(0xC3, len);
         let blob_ref = adapter

@@ -56,9 +56,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::cell::RefCell;
-use std::ffi::{c_char, c_int, CString};
 #[cfg(test)]
 use std::ffi::CStr;
+use std::ffi::{c_char, c_int, CString};
 use std::os::raw::c_float;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
@@ -1382,7 +1382,6 @@ fn cstr_to_string(ptr: *const c_char, len: usize) -> Option<String> {
     let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
     std::str::from_utf8(slice).ok().map(|s| s.to_string())
 }
-
 
 // =========================================================================
 // Tests — exercise the C ABI end-to-end from Rust. Since the Go

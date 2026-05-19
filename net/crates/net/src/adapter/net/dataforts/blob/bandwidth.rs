@@ -161,7 +161,8 @@ mod tests {
         use std::sync::Arc;
         let flag = Arc::new(AtomicBool::new(false));
         let f = flag.clone();
-        let probe = BandwidthClassSupportProbe::Dynamic(Box::new(move || f.load(Ordering::Relaxed)));
+        let probe =
+            BandwidthClassSupportProbe::Dynamic(Box::new(move || f.load(Ordering::Relaxed)));
         assert!(!probe.check());
         flag.store(true, Ordering::Relaxed);
         assert!(probe.check());

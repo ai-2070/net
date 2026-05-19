@@ -165,7 +165,6 @@ impl std::fmt::Debug for ErasureSupportProbe {
     }
 }
 
-
 /// Producer-side downgrade helper: if `encoding` is
 /// [`Encoding::ReedSolomon`] and `probe.check()` returns `false`,
 /// substitute [`Encoding::Replicated`]. Passes other encodings
@@ -354,15 +353,15 @@ impl RsEncoder {
     ///   [`reed_solomon_erasure::Error::TooFewShardsPresent`],
     ///   mapped to `BlobError::Backend`.
     /// - All present shards must have the same length.
-    pub fn reconstruct_data(
-        &self,
-        shards: &mut [Option<Vec<u8>>],
-    ) -> Result<(), BlobError> {
+    pub fn reconstruct_data(&self, shards: &mut [Option<Vec<u8>>]) -> Result<(), BlobError> {
         let expected = self.params.k as usize + self.params.m as usize;
         if shards.len() != expected {
             return Err(BlobError::Backend(format!(
                 "RS reconstruct_data: expected {} shard slots (k={} + m={}), got {}",
-                expected, self.params.k, self.params.m, shards.len()
+                expected,
+                self.params.k,
+                self.params.m,
+                shards.len()
             )));
         }
         self.rs
@@ -530,7 +529,12 @@ impl RsStriper {
             )));
         }
 
-        let max_len = in_flight.iter().map(|(b, _)| b.len()).max().unwrap_or(1).max(1);
+        let max_len = in_flight
+            .iter()
+            .map(|(b, _)| b.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
         let mut padded: Vec<Vec<u8>> = Vec::with_capacity(k);
         let mut data_refs: Vec<ChunkRefV3> = Vec::with_capacity(k);
         for (mut bytes, chunk_ref) in in_flight {
@@ -559,7 +563,10 @@ impl RsStriper {
         };
         block.validate()?;
         self.closed_count = self.closed_count.saturating_add(1);
-        Ok(ClosedStripe { block, parity_bytes })
+        Ok(ClosedStripe {
+            block,
+            parity_bytes,
+        })
     }
 
     /// Internal: close the in-flight stripe as the Replicated
@@ -630,8 +637,7 @@ mod tests {
     fn dropping_more_than_m_shards_fails_reconstruction() {
         let params = RsParams { k: 4, m: 2 };
         let encoder = RsEncoder::new(params).unwrap();
-        let data: Vec<Vec<u8>> =
-            (0..4u8).map(|i| vec![i; 512]).collect();
+        let data: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 512]).collect();
         let parity = encoder.encode(&data).unwrap();
         let mut shards: Vec<Option<Vec<u8>>> = data
             .iter()
@@ -936,9 +942,6 @@ mod tests {
         assert_eq!(DEFAULT_RS_M, 4);
         assert_eq!(RS_STRIPE_TARGET_BYTES, 40 * 1024 * 1024);
         assert_eq!(RS_STRIPE_MIN_BYTES, 8 * 1024 * 1024);
-        assert_eq!(
-            RsParams::default_production(),
-            RsParams { k: 10, m: 4 }
-        );
+        assert_eq!(RsParams::default_production(), RsParams { k: 10, m: 4 });
     }
 }

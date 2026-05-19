@@ -612,8 +612,8 @@ impl BlobRef {
                     total_size: *total_size,
                     depth: *depth,
                 };
-                let body_bytes = postcard::to_allocvec(&body)
-                    .expect("tree body postcard-encodes infallibly");
+                let body_bytes =
+                    postcard::to_allocvec(&body).expect("tree body postcard-encodes infallibly");
                 let mut buf = Vec::with_capacity(5 + body_bytes.len());
                 buf.extend_from_slice(&BLOB_REF_MAGIC);
                 buf.push(*version);
@@ -1711,14 +1711,7 @@ mod tests {
 
     #[test]
     fn tree_constructor_rejects_zero_total_size() {
-        let err = BlobRef::tree(
-            "mesh://aa",
-            Encoding::Replicated,
-            tree_root(),
-            0,
-            1,
-        )
-        .unwrap_err();
+        let err = BlobRef::tree("mesh://aa", Encoding::Replicated, tree_root(), 0, 1).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("must be > 0"), "got: {msg}");
     }
@@ -1739,14 +1732,8 @@ mod tests {
 
     #[test]
     fn tree_constructor_rejects_zero_depth() {
-        let err = BlobRef::tree(
-            "mesh://aa",
-            Encoding::Replicated,
-            tree_root(),
-            1024,
-            0,
-        )
-        .unwrap_err();
+        let err =
+            BlobRef::tree("mesh://aa", Encoding::Replicated, tree_root(), 1024, 0).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("depth"), "got: {msg}");
     }
@@ -1810,7 +1797,10 @@ mod tests {
         .unwrap();
         let bytes = original.encode();
         let decoded = BlobRef::decode(&bytes).unwrap().unwrap();
-        assert_eq!(decoded.encoding(), Some(Encoding::ReedSolomon { k: 10, m: 4 }));
+        assert_eq!(
+            decoded.encoding(),
+            Some(Encoding::ReedSolomon { k: 10, m: 4 })
+        );
     }
 
     #[test]
@@ -1835,14 +1825,8 @@ mod tests {
         // (first byte after magic+outer-version) to an unknown
         // value. Decoder must surface UnsupportedVersion for the
         // body, not silently accept.
-        let original = BlobRef::tree(
-            "mesh://aa",
-            Encoding::Replicated,
-            tree_root(),
-            1024,
-            1,
-        )
-        .unwrap();
+        let original =
+            BlobRef::tree("mesh://aa", Encoding::Replicated, tree_root(), 1024, 1).unwrap();
         let mut bytes = original.encode();
         // The postcard body starts at offset 5. The body's first
         // field is `body_version: u8`, which postcard emits as a
@@ -1916,14 +1900,7 @@ mod tests {
 
     #[test]
     fn verify_on_tree_returns_typed_error() {
-        let r = BlobRef::tree(
-            "mesh://aa",
-            Encoding::Replicated,
-            tree_root(),
-            1024,
-            1,
-        )
-        .unwrap();
+        let r = BlobRef::tree("mesh://aa", Encoding::Replicated, tree_root(), 1024, 1).unwrap();
         let err = r.verify(b"any bytes").unwrap_err();
         let msg = err.to_string();
         assert!(

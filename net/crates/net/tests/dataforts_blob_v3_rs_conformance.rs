@@ -32,9 +32,7 @@ use bytes::Bytes;
 use net::adapter::net::dataforts::blob::adapter::BlobByteStream;
 use net::adapter::net::dataforts::blob::blob_tree::{ChunkingStrategy, StripeBlock, TreeNode};
 use net::adapter::net::dataforts::blob::erasure::RsParams;
-use net::adapter::net::dataforts::{
-    BlobAdapter, BlobError, BlobRef, Encoding, MeshBlobAdapter,
-};
+use net::adapter::net::dataforts::{BlobAdapter, BlobError, BlobRef, Encoding, MeshBlobAdapter};
 use net::adapter::net::redex::Redex;
 
 fn deterministic_bytes(seed: u8, len: usize) -> Vec<u8> {
@@ -50,7 +48,9 @@ fn deterministic_bytes(seed: u8, len: usize) -> Vec<u8> {
 }
 
 fn stream_one(bytes: Vec<u8>) -> BlobByteStream {
-    Box::pin(futures::stream::once(async move { Ok::<_, BlobError>(Bytes::from(bytes)) }))
+    Box::pin(futures::stream::once(async move {
+        Ok::<_, BlobError>(Bytes::from(bytes))
+    }))
 }
 
 fn make_adapter() -> MeshBlobAdapter {
@@ -110,7 +110,9 @@ async fn rs_round_trip_with_all_chunks_present() {
     let blob_ref = adapter
         .store_stream_tree_rs_internal(
             stream_one(payload.clone()),
-            ChunkingStrategy::Fixed { size: CI_CHUNK_SIZE },
+            ChunkingStrategy::Fixed {
+                size: CI_CHUNK_SIZE,
+            },
             CI_RS_PARAMS,
         )
         .await
@@ -154,7 +156,9 @@ async fn rs_reconstruction_tolerates_m_losses_per_stripe() {
     let blob_ref = adapter
         .store_stream_tree_rs_internal(
             stream_one(payload.clone()),
-            ChunkingStrategy::Fixed { size: CI_CHUNK_SIZE },
+            ChunkingStrategy::Fixed {
+                size: CI_CHUNK_SIZE,
+            },
             CI_RS_PARAMS,
         )
         .await
@@ -192,10 +196,7 @@ async fn rs_reconstruction_tolerates_m_losses_per_stripe() {
         .fetch_range(&blob_ref, 0..payload.len() as u64)
         .await
         .expect("RS fetch must reconstruct after m-chunk loss per stripe");
-    assert_eq!(
-        fetched, payload,
-        "reconstructed bytes must match original"
-    );
+    assert_eq!(fetched, payload, "reconstructed bytes must match original");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -210,7 +211,9 @@ async fn rs_reconstruction_fails_cleanly_when_more_than_m_chunks_lost() {
     let blob_ref = adapter
         .store_stream_tree_rs_internal(
             stream_one(payload.clone()),
-            ChunkingStrategy::Fixed { size: CI_CHUNK_SIZE },
+            ChunkingStrategy::Fixed {
+                size: CI_CHUNK_SIZE,
+            },
             CI_RS_PARAMS,
         )
         .await
@@ -252,7 +255,9 @@ async fn rs_two_adapters_same_payload_agree_on_root() {
     let r_a = adapter_a
         .store_stream_tree_rs_internal(
             stream_one(payload.clone()),
-            ChunkingStrategy::Fixed { size: CI_CHUNK_SIZE },
+            ChunkingStrategy::Fixed {
+                size: CI_CHUNK_SIZE,
+            },
             CI_RS_PARAMS,
         )
         .await
@@ -260,7 +265,9 @@ async fn rs_two_adapters_same_payload_agree_on_root() {
     let r_b = adapter_b
         .store_stream_tree_rs_internal(
             stream_one(payload),
-            ChunkingStrategy::Fixed { size: CI_CHUNK_SIZE },
+            ChunkingStrategy::Fixed {
+                size: CI_CHUNK_SIZE,
+            },
             CI_RS_PARAMS,
         )
         .await
@@ -271,4 +278,3 @@ async fn rs_two_adapters_same_payload_agree_on_root() {
         "RS produces deterministic root across independent adapters"
     );
 }
-

@@ -118,7 +118,6 @@ impl std::fmt::Debug for TreeSupportProbe {
     }
 }
 
-
 /// Chunking strategy for `MeshBlobAdapter::store_stream_tree`.
 ///
 /// v0.3 Phase A ships [`ChunkingStrategy::Fixed`] only —
@@ -535,9 +534,9 @@ impl TreeNode {
                 }
                 let mut chunk_total: usize = 0;
                 for (i, stripe) in stripes.iter().enumerate() {
-                    stripe.validate().map_err(|e| {
-                        BlobError::Decode(format!("stripe {}: {}", i, e))
-                    })?;
+                    stripe
+                        .validate()
+                        .map_err(|e| BlobError::Decode(format!("stripe {}: {}", i, e)))?;
                     chunk_total = chunk_total.saturating_add(stripe.chunks.len());
                     for (j, chunk) in stripe.chunks.iter().enumerate() {
                         if chunk.size == 0 {
@@ -612,9 +611,7 @@ impl TreeNode {
             TreeNode::ErasureLeaf { stripes } => {
                 stripes.iter().map(|s| s.covered_bytes()).sum::<u64>()
             }
-            TreeNode::Internal { children } => {
-                children.iter().map(|(_, sz)| *sz).sum::<u64>()
-            }
+            TreeNode::Internal { children } => children.iter().map(|(_, sz)| *sz).sum::<u64>(),
             TreeNode::Leaf { chunks } => chunks.iter().map(|c| c.size as u64).sum::<u64>(),
         }
     }
@@ -625,9 +622,7 @@ impl TreeNode {
         match self {
             TreeNode::Internal { children } => children.len(),
             TreeNode::Leaf { chunks } => chunks.len(),
-            TreeNode::ErasureLeaf { stripes } => {
-                stripes.iter().map(|s| s.chunks.len()).sum()
-            }
+            TreeNode::ErasureLeaf { stripes } => stripes.iter().map(|s| s.chunks.len()).sum(),
         }
     }
 
@@ -824,10 +819,7 @@ impl TreeBuilder {
     /// the depth-1 internal builder. If that fills, cascade.
     /// Returns every [`ClosedNode`] emitted.
     fn close_leaf_and_cascade(&mut self) -> Result<Vec<ClosedNode>, BlobError> {
-        let leaf_chunks = std::mem::replace(
-            &mut self.leaf_chunks,
-            Vec::with_capacity(TREE_FANOUT),
-        );
+        let leaf_chunks = std::mem::replace(&mut self.leaf_chunks, Vec::with_capacity(TREE_FANOUT));
         if leaf_chunks.is_empty() {
             return Ok(Vec::new());
         }
@@ -868,10 +860,8 @@ impl TreeBuilder {
             return Ok(());
         }
         // Level filled. Close + cascade.
-        let entries = std::mem::replace(
-            &mut self.internals[level],
-            Vec::with_capacity(TREE_FANOUT),
-        );
+        let entries =
+            std::mem::replace(&mut self.internals[level], Vec::with_capacity(TREE_FANOUT));
         let node = TreeNode::internal(entries)?;
         let bytes = node.encode()?;
         let node_hash: [u8; 32] = blake3::hash(&bytes).into();
@@ -914,7 +904,12 @@ impl TreeBuilder {
         }
         let mut trailing: Vec<ClosedNode> = Vec::new();
         // Holds the "current" node being lifted up the cascade.
-        let mut current: Option<(/*hash*/ [u8; 32], /*size*/ u64, /*bytes*/ Vec<u8>, /*level*/ u8)> = None;
+        let mut current: Option<(
+            /*hash*/ [u8; 32],
+            /*size*/ u64,
+            /*bytes*/ Vec<u8>,
+            /*level*/ u8,
+        )> = None;
 
         // Step 1: close the leaf level if non-empty.
         if !self.leaf_chunks.is_empty() {
@@ -1106,15 +1101,14 @@ mod tests {
             .collect();
         let err = TreeNode::internal(too_many).unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("exceeds fanout cap"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("exceeds fanout cap"), "got: {msg}");
     }
 
     #[test]
     fn internal_accepts_at_fanout_cap() {
-        let exactly_cap: Vec<_> = (0..TREE_FANOUT as u8).map(|i| (h(i), 4 * 1024 * 1024u64)).collect();
+        let exactly_cap: Vec<_> = (0..TREE_FANOUT as u8)
+            .map(|i| (h(i), 4 * 1024 * 1024u64))
+            .collect();
         let node = TreeNode::internal(exactly_cap).expect("at-cap construction succeeds");
         assert_eq!(node.arity(), TREE_FANOUT);
     }
@@ -1142,8 +1136,11 @@ mod tests {
 
     #[test]
     fn leaf_accepts_fixed_chunk_size() {
-        let node = TreeNode::leaf(vec![ChunkRefV3::data(h(0x55), BLOB_CHUNK_SIZE_BYTES as u32)])
-            .expect("fixed-size chunk is valid");
+        let node = TreeNode::leaf(vec![ChunkRefV3::data(
+            h(0x55),
+            BLOB_CHUNK_SIZE_BYTES as u32,
+        )])
+        .expect("fixed-size chunk is valid");
         assert_eq!(node.arity(), 1);
         assert_eq!(node.covered_bytes(), BLOB_CHUNK_SIZE_BYTES);
     }
@@ -1269,16 +1266,15 @@ mod tests {
     fn decode_re_validates_invariants() {
         // Hand-construct an Internal { children: [] } bypassing the
         // constructor and serialize it. Decode must reject.
-        let bad = TreeNode::Internal { children: Vec::new() };
+        let bad = TreeNode::Internal {
+            children: Vec::new(),
+        };
         // Skip `encode`'s pre-check by going through postcard
         // directly.
         let bytes = postcard::to_allocvec(&bad).unwrap();
         let err = TreeNode::decode(&bytes).unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("must have at least one child"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("must have at least one child"), "got: {msg}");
     }
 
     // -----------------------------------------------------------
@@ -1287,12 +1283,7 @@ mod tests {
 
     #[test]
     fn covered_bytes_internal_sums_subtree_sizes() {
-        let node = TreeNode::internal(vec![
-            (h(0x01), 100),
-            (h(0x02), 200),
-            (h(0x03), 50),
-        ])
-        .unwrap();
+        let node = TreeNode::internal(vec![(h(0x01), 100), (h(0x02), 200), (h(0x03), 50)]).unwrap();
         assert_eq!(node.covered_bytes(), 350);
         assert_eq!(node.arity(), 3);
         assert!(node.is_internal());
@@ -1338,7 +1329,11 @@ mod tests {
         );
         // Per-depth sanity values pinned for the doc-comment claims.
         assert_eq!(leaf_bytes, 512u128 * 1024 * 1024, "leaf addresses 512 MiB");
-        assert_eq!(depth_1, 64u128 * 1024 * 1024 * 1024, "depth-1 addresses 64 GiB");
+        assert_eq!(
+            depth_1,
+            64u128 * 1024 * 1024 * 1024,
+            "depth-1 addresses 64 GiB"
+        );
         assert_eq!(depth_2, 8u128 * (1u128 << 40), "depth-2 addresses 8 TiB");
         assert_eq!(depth_3, 1u128 << 50, "depth-3 addresses 1 PiB");
     }
@@ -1383,9 +1378,7 @@ mod tests {
     #[test]
     fn builder_rejects_zero_size_chunk() {
         let mut b = TreeBuilder::new();
-        let err = b
-            .push_chunk(ChunkRefV3::data([0u8; 32], 0))
-            .unwrap_err();
+        let err = b.push_chunk(ChunkRefV3::data([0u8; 32], 0)).unwrap_err();
         assert!(err.to_string().contains("zero-size"), "got: {err}");
     }
 
@@ -1406,8 +1399,13 @@ mod tests {
     #[test]
     fn builder_single_chunk_root_is_leaf() {
         let mut b = TreeBuilder::new();
-        let emitted = b.push_chunk(n_chunks(1).into_iter().next().unwrap()).unwrap();
-        assert!(emitted.is_empty(), "single push below fanout emits no closed nodes");
+        let emitted = b
+            .push_chunk(n_chunks(1).into_iter().next().unwrap())
+            .unwrap();
+        assert!(
+            emitted.is_empty(),
+            "single push below fanout emits no closed nodes"
+        );
         let out = b.finalize().unwrap();
         assert_eq!(out.root_depth, 1);
         assert_eq!(out.total_bytes, BLOB_CHUNK_SIZE_BYTES);
@@ -1498,7 +1496,10 @@ mod tests {
         assert_eq!(leaf_closes, 2, "two full leaves close during streaming");
         let out = b.finalize().unwrap();
         assert_eq!(out.root_depth, 2);
-        assert_eq!(out.total_bytes, BLOB_CHUNK_SIZE_BYTES * (TREE_FANOUT * 2) as u64);
+        assert_eq!(
+            out.total_bytes,
+            BLOB_CHUNK_SIZE_BYTES * (TREE_FANOUT * 2) as u64
+        );
         let root = TreeNode::decode(&out.root_bytes).unwrap();
         assert!(root.is_internal());
         assert_eq!(root.arity(), 2);
@@ -1516,7 +1517,11 @@ mod tests {
         assert_eq!(out.root_depth, 2);
         let root = TreeNode::decode(&out.root_bytes).unwrap();
         assert!(root.is_internal());
-        assert_eq!(root.arity(), 2, "first leaf full, second leaf has one chunk");
+        assert_eq!(
+            root.arity(),
+            2,
+            "first leaf full, second leaf has one chunk"
+        );
     }
 
     /// FANOUT² + 1 chunks. Cascade trace:
@@ -1632,8 +1637,8 @@ mod tests {
         // Builder's internal vec sizes should never exceed
         // FANOUT × depth entries total at any moment. depth
         // bounded at MAX_TREE_DEPTH = 4.
-        let total_open_entries: usize = b.leaf_chunks.len()
-            + b.internals.iter().map(|v| v.len()).sum::<usize>();
+        let total_open_entries: usize =
+            b.leaf_chunks.len() + b.internals.iter().map(|v| v.len()).sum::<usize>();
         assert!(
             total_open_entries <= TREE_FANOUT * (MAX_TREE_DEPTH as usize),
             "builder has {} open entries; expected <= {} (fanout × MAX_DEPTH)",

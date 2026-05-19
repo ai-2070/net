@@ -121,7 +121,6 @@ impl std::fmt::Debug for CdcSupportProbe {
     }
 }
 
-
 /// Producer-side downgrade helper: if `chunking` is
 /// [`ChunkingStrategy::Cdc`] and `probe.check()` returns `false`,
 /// substitute the v0.2-compatible
@@ -145,10 +144,7 @@ impl std::fmt::Debug for CdcSupportProbe {
 /// Keeping the downgrade out of the adapter method preserves the
 /// existing v0.3 Phase A6 signature; callers who don't care
 /// about CDC downgrade simply don't call this helper.
-pub fn cdc_downgrade(
-    chunking: ChunkingStrategy,
-    probe: &CdcSupportProbe,
-) -> ChunkingStrategy {
+pub fn cdc_downgrade(chunking: ChunkingStrategy, probe: &CdcSupportProbe) -> ChunkingStrategy {
     match chunking {
         ChunkingStrategy::Cdc { .. } if !probe.check() => ChunkingStrategy::Fixed {
             size: super::blob_ref::BLOB_CHUNK_SIZE_BYTES as u32,
@@ -536,11 +532,29 @@ mod tests {
     #[test]
     fn validate_rejects_bad_params() {
         // min < MIN_MIN
-        assert!(CdcParams { min: 1, avg: 1024, max: 4096 }.validate().is_err());
+        assert!(CdcParams {
+            min: 1,
+            avg: 1024,
+            max: 4096
+        }
+        .validate()
+        .is_err());
         // avg > AVG_MAX
-        assert!(CdcParams { min: 1024, avg: 5_000_000, max: 16_000_000 }.validate().is_err());
+        assert!(CdcParams {
+            min: 1024,
+            avg: 5_000_000,
+            max: 16_000_000
+        }
+        .validate()
+        .is_err());
         // ordering violation
-        assert!(CdcParams { min: 4096, avg: 1024, max: 8192 }.validate().is_err());
+        assert!(CdcParams {
+            min: 4096,
+            avg: 1024,
+            max: 8192
+        }
+        .validate()
+        .is_err());
         // production defaults pass
         assert!(PRODUCTION_CDC_PARAMS.validate().is_ok());
     }
@@ -579,16 +593,23 @@ mod tests {
             avg: 4 * 1024 * 1024,
             max: 16 * 1024 * 1024,
         };
-        let fixed = ChunkingStrategy::Fixed { size: 4 * 1024 * 1024 };
+        let fixed = ChunkingStrategy::Fixed {
+            size: 4 * 1024 * 1024,
+        };
         // Probe accepts: pass through unchanged.
         assert_eq!(cdc_downgrade(cdc, &CdcSupportProbe::AlwaysSupported), cdc);
-        assert_eq!(cdc_downgrade(fixed, &CdcSupportProbe::AlwaysSupported), fixed);
+        assert_eq!(
+            cdc_downgrade(fixed, &CdcSupportProbe::AlwaysSupported),
+            fixed
+        );
         // Probe rejects: CDC → Fixed-at-BLOB_CHUNK_SIZE_BYTES,
         // Fixed → Fixed (unchanged).
         let downgraded = cdc_downgrade(cdc, &CdcSupportProbe::ForceFixed);
         assert_eq!(
             downgraded,
-            ChunkingStrategy::Fixed { size: super::super::blob_ref::BLOB_CHUNK_SIZE_BYTES as u32 }
+            ChunkingStrategy::Fixed {
+                size: super::super::blob_ref::BLOB_CHUNK_SIZE_BYTES as u32
+            }
         );
         assert_eq!(cdc_downgrade(fixed, &CdcSupportProbe::ForceFixed), fixed);
     }

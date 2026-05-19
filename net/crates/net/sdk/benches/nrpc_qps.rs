@@ -40,7 +40,9 @@ fn bench_qps(c: &mut Criterion) {
     group.sample_size(20);
 
     for &(label, size) in PAYLOADS {
-        let req = EchoReq { body: payload(size) };
+        let req = EchoReq {
+            body: payload(size),
+        };
 
         for &concurrency in CONCURRENCY {
             group.throughput(Throughput::Elements(concurrency as u64));

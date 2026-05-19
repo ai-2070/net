@@ -510,15 +510,16 @@ fn metrics_body_includes_overflow_counter_family() {
 /// Stable test hash — 64 hex chars, content-irrelevant. The
 /// subcommands construct a BlobRef::Tree from it; any chunk
 /// fetch on this hash will miss (the chunk store is empty).
-const DUMMY_HASH: &str =
-    "deadbeef00000000000000000000000000000000000000000000000000000000";
+const DUMMY_HASH: &str = "deadbeef00000000000000000000000000000000000000000000000000000000";
 
 #[test]
 fn path_subcommand_rejects_offset_at_or_past_size() {
     let tmp = TempDir::new("path-offset-oob");
     let out = run_net_blob(
         tmp.path(),
-        &["path", DUMMY_HASH, "--size", "1024", "--depth", "1", "--offset", "1024"],
+        &[
+            "path", DUMMY_HASH, "--size", "1024", "--depth", "1", "--offset", "1024",
+        ],
     );
     assert!(!out.status.success(), "offset == size must exit nonzero");
     let stderr = stderr_string(&out);
@@ -600,7 +601,11 @@ fn verify_subcommand_on_missing_root_reports_missing_count() {
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("verify --format json must emit valid JSON");
     let missing = parsed["missing"].as_u64().expect("missing field");
-    assert!(missing >= 1, "missing root must be counted; got: {}", stdout);
+    assert!(
+        missing >= 1,
+        "missing root must be counted; got: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -631,7 +636,9 @@ fn tree_repair_verify_path_rejects_malformed_hash() {
     // `path` takes the same parse_hash plus --offset.
     let out = run_net_blob(
         tmp.path(),
-        &["path", bogus, "--size", "1024", "--depth", "1", "--offset", "0"],
+        &[
+            "path", bogus, "--size", "1024", "--depth", "1", "--offset", "0",
+        ],
     );
     assert!(!out.status.success());
     let stderr = stderr_string(&out);

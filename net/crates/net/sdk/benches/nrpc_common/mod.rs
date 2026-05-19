@@ -315,12 +315,7 @@ pub async fn call_postcard_direct(pair: &Pair, req: &EchoReq) -> EchoResp {
 /// measures is genuine transport cost.
 pub async fn call_raw_direct(pair: &Pair, body: Bytes) -> Bytes {
     pair.caller
-        .call(
-            pair.server_node_id,
-            SVC_RAW,
-            body,
-            CallOptions::default(),
-        )
+        .call(pair.server_node_id, SVC_RAW, body, CallOptions::default())
         .await
         .expect("call raw")
         .body
