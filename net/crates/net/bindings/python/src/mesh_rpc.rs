@@ -1205,8 +1205,8 @@ impl RpcDuplexHandler for PyRpcDuplexHandler {
         let sink_inner = Arc::new(Mutex::new(Some(responses)));
         let result = tokio::time::timeout(
             self.timeout,
-            tokio::task::spawn_blocking(move || -> Result<(), String> {
-                Python::attach(|py| -> Result<(), String> {
+            tokio::task::spawn_blocking(move || -> Result<HandlerOutcome, String> {
+                Python::attach(|py| -> Result<HandlerOutcome, String> {
                     let stream_obj = Py::new(
                         py,
                         PyRequestStreamRecv {
@@ -1220,15 +1220,34 @@ impl RpcDuplexHandler for PyRpcDuplexHandler {
                     let args = PyTuple::new(py, [stream_obj.into_any(), sink_obj.into_any()])
                         .map_err(|e| format!("failed to build args: {e}"))?;
                     match callable.call1(py, args) {
-                        Ok(_) => Ok(()),
-                        Err(pyerr) => Err(format!("Python duplex handler raised: {pyerr}")),
+                        Ok(_) => Ok(HandlerOutcome::Ok(Vec::new())),
+                        Err(pyerr) => {
+                            // Same Application-error mapping the
+                            // client-streaming path uses — a Python
+                            // handler raising the typed Application
+                            // exception surfaces as
+                            // RpcStatus::Application(code) on the
+                            // caller side rather than collapsing to
+                            // Internal.
+                            if let Some((code, body)) = extract_app_error(py, &pyerr) {
+                                Ok(HandlerOutcome::AppError { code, body })
+                            } else {
+                                Err(format!("Python duplex handler raised: {pyerr}"))
+                            }
+                        }
                     }
                 })
             }),
         )
         .await;
         match result {
-            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Ok(HandlerOutcome::Ok(_)))) => Ok(()),
+            Ok(Ok(Ok(HandlerOutcome::AppError { code, body }))) => {
+                Err(RpcHandlerError::Application {
+                    code,
+                    message: String::from_utf8_lossy(&body).into_owned(),
+                })
+            }
             Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
             Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
                 "spawn_blocking task panicked: {join_err}"
