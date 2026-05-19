@@ -15,7 +15,7 @@ name: Release PyPI CLI
 # before the first run:
 #   - PyPI project name: net-mesh-cli
 #   - Owner: ai-2070
-#   - Repository: cyberdeck
+#   - Repository: net
 #   - Workflow: release-pypi-cli.yml
 #   - Environment: pypi
 
