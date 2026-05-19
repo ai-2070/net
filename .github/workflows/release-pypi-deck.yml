@@ -11,7 +11,7 @@ name: Release PyPI deck
 # `id-token: write`. Configure on PyPI under Account → Publishing:
 #   - PyPI project name: net-deck
 #   - Owner: ai-2070
-#   - Repository: cyberdeck
+#   - Repository: net
 #   - Workflow: release-pypi-deck.yml
 #   - Environment: pypi
 
