@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/behavior/subnet.rs
+  s_f95ee10350efa6::t_0695ace56a248c 50-51,55-59,65,71
+net/crates/net/src/adapter/net/behavior/group.rs
+  s_f95ee10350efa6::t_93270401c481b8 61-65,71,77
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "9251c28b8370a3eef6882cdc71a0c48475b82313",
+  "prompts": {},
+  "sessions": {
+    "s_f95ee10350efa6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "be955835-c5da-4fe8-a0f5-cb77f72dfda9",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
