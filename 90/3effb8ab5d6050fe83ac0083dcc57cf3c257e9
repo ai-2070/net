@@ -1,0 +1,22 @@
+net/crates/net/bindings/go/net/mesh_rpc.go
+  s_c46a4f2a71242f::t_623fd01d8b5333 1832-1835,1843
+  s_c46a4f2a71242f::t_63488d944a398f 1914-1918
+  s_c46a4f2a71242f::t_671e867c035e03 1788-1795,1801
+  s_c46a4f2a71242f::t_25e82160d19d6c 1967-1974
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "903effb8ab5d6050fe83ac0083dcc57cf3c257e9",
+  "prompts": {},
+  "sessions": {
+    "s_c46a4f2a71242f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c40a4b97-f9fb-4ca1-a55c-ca0f5316ac30",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
