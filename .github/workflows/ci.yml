@@ -304,7 +304,14 @@ jobs:
       # `cortex` / `testing` / `compute` / `nat-traversal` /
       # `port-mapping` compile to empty test binaries and the
       # contract goes silently unverified.
-      - name: Run Rust SDK tests (includes mesh_stream_backpressure)
+      # `cargo test` auto-discovers every `tests/*.rs` file under
+      # `sdk/tests/`; the step name calls out the load-bearing
+      # ones so a missing test binary is obvious in the CI log:
+      #   - mesh_stream_backpressure — substrate flow-control pin
+      #   - mesh_rpc_bidi_typed     — Phase E client-streaming +
+      #     duplex typed SDK surface (5 tests). Gated on
+      #     `feature = "net" + "cortex"`, both present here.
+      - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed)
         run: cargo test --features "net cortex testing compute nat-traversal port-mapping"
 
       # SDK doctests — `///` examples in `sdk/src/`. Same feature set

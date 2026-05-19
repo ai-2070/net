@@ -43,9 +43,9 @@ use napi_derive::napi;
 use tokio::task::AbortHandle;
 
 use ::net::adapter::net::cortex::{
-    RequestStream as InnerRequestStream, RpcClientStreamingHandler, RpcContext,
-    RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcResponsePayload,
-    RpcResponseSink as InnerRpcResponseSink, RpcStatus, RpcStreamingContext,
+    RequestStream as InnerRequestStream, RpcClientStreamingHandler, RpcContext, RpcDuplexHandler,
+    RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink,
+    RpcStatus, RpcStreamingContext,
 };
 use ::net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
@@ -726,7 +726,7 @@ impl DuplexCall {
     /// classes don't implement it. Tuples surface as JS arrays
     /// directly via napi-rs.
     #[napi(js_name = "intoSplit")]
-    pub async fn into_split(&self) -> Result<(DuplexSink, DuplexStream)> {
+    pub async fn split(&self) -> Result<(DuplexSink, DuplexStream)> {
         let mut guard = self.inner.lock().await;
         let call = guard
             .take()
@@ -953,10 +953,7 @@ impl JsResponseSink {
     /// raced with the substrate fold's terminal-frame emission).
     #[napi]
     pub fn send(&self, body: Buffer) -> bool {
-        let guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match guard.as_ref() {
             Some(sink) => {
                 sink.send(Bytes::copy_from_slice(body.as_ref()));
@@ -977,13 +974,8 @@ impl JsResponseSink {
 
 /// TSFN for client-streaming handlers. JS side:
 /// `(stream: JsRequestStream) => Promise<Buffer>`.
-type ClientStreamingHandlerTsfn = ThreadsafeFunction<
-    JsRequestStream,
-    Promise<Buffer>,
-    JsRequestStream,
-    napi::Status,
-    false,
->;
+type ClientStreamingHandlerTsfn =
+    ThreadsafeFunction<JsRequestStream, Promise<Buffer>, JsRequestStream, napi::Status, false>;
 
 /// Internal wrapper struct ferried through the duplex TSFN.
 /// napi(object) requires its fields to be FromNapiValue, which
@@ -1010,17 +1002,13 @@ impl ToNapiValue for DuplexHandlerArgs {
         let mut arr = env_wrapper.create_array(2)?;
         let stream_val = unsafe { JsRequestStream::to_napi_value(env, val.stream)? };
         let sink_val = unsafe { JsResponseSink::to_napi_value(env, val.sink)? };
-        let stream_unknown = unsafe {
-            napi::bindgen_prelude::Unknown::from_napi_value(env, stream_val)?
-        };
-        let sink_unknown = unsafe {
-            napi::bindgen_prelude::Unknown::from_napi_value(env, sink_val)?
-        };
+        let stream_unknown =
+            unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, stream_val)? };
+        let sink_unknown =
+            unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, sink_val)? };
         arr.set(0, stream_unknown)?;
         arr.set(1, sink_unknown)?;
-        unsafe {
-            napi::bindgen_prelude::Array::to_napi_value(env, arr)
-        }
+        unsafe { napi::bindgen_prelude::Array::to_napi_value(env, arr) }
     }
 }
 
@@ -1029,13 +1017,8 @@ impl ToNapiValue for DuplexHandlerArgs {
 /// JS code unpacks via `(args) => { const [stream, sink] = args; ... }`
 /// and returns `Buffer.alloc(0)` (or any Buffer — value is
 /// ignored; the Promise resolving is the "handler done" signal).
-type DuplexHandlerTsfn = ThreadsafeFunction<
-    DuplexHandlerArgs,
-    Promise<Buffer>,
-    DuplexHandlerArgs,
-    napi::Status,
-    false,
->;
+type DuplexHandlerTsfn =
+    ThreadsafeFunction<DuplexHandlerArgs, Promise<Buffer>, DuplexHandlerArgs, napi::Status, false>;
 
 /// `RpcClientStreamingHandler` impl bridging to JS via TSFN.
 struct NodeClientStreamingRpcHandler {
@@ -1131,8 +1114,7 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
                 inner: Arc::new(Mutex::new(Some(responses))),
             },
         };
-        let (tx, rx) =
-            tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
         let status = self.tsfn.call_with_return_value(
             args,
             ThreadsafeFunctionCallMode::NonBlocking,
@@ -1436,8 +1418,7 @@ impl MeshRpc {
         service: String,
         handler: Function<'_, JsRequestStream, Promise<Buffer>>,
     ) -> Result<ServeHandle> {
-        let tsfn: ClientStreamingHandlerTsfn =
-            handler.build_threadsafe_function().build()?;
+        let tsfn: ClientStreamingHandlerTsfn = handler.build_threadsafe_function().build()?;
         let inner_handler = Arc::new(NodeClientStreamingRpcHandler {
             tsfn,
             timeout: DEFAULT_HANDLER_TIMEOUT,
@@ -1470,8 +1451,7 @@ impl MeshRpc {
         service: String,
         handler: Function<'_, DuplexHandlerArgs, Promise<Buffer>>,
     ) -> Result<ServeHandle> {
-        let tsfn: DuplexHandlerTsfn =
-            handler.build_threadsafe_function().build()?;
+        let tsfn: DuplexHandlerTsfn = handler.build_threadsafe_function().build()?;
         let inner_handler = Arc::new(NodeDuplexRpcHandler {
             tsfn,
             timeout: DEFAULT_HANDLER_TIMEOUT,

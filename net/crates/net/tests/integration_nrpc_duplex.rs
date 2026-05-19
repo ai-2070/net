@@ -213,7 +213,9 @@ async fn duplex_interleaves_send_and_recv() {
     // sending 5 we should have collected ~5 responses (plus the
     // final "total:5" summary after our EOS).
     for i in 0..5u8 {
-        call.send(Bytes::copy_from_slice(&[b'a' + i])).await.expect("send");
+        call.send(Bytes::copy_from_slice(&[b'a' + i]))
+            .await
+            .expect("send");
     }
     call.finish_sending().await.expect("finish_sending");
 
@@ -240,10 +242,7 @@ async fn duplex_finish_sending_keeps_response_stream_open() {
     handshake_pair(&caller, &server).await;
 
     let _serve = server
-        .serve_rpc_duplex(
-            "emit_n",
-            Arc::new(EmitNThenWaitForEosHandler { n: 3 }),
-        )
+        .serve_rpc_duplex("emit_n", Arc::new(EmitNThenWaitForEosHandler { n: 3 }))
         .expect("serve_rpc_duplex");
 
     let mut call = caller
@@ -287,7 +286,9 @@ async fn duplex_server_terminates_first() {
     // Send one item so the initial REQUEST flies. The server
     // emits one response + terminates. Drain the response stream
     // until None.
-    call.send(Bytes::from_static(b"hello")).await.expect("send hello");
+    call.send(Bytes::from_static(b"hello"))
+        .await
+        .expect("send hello");
     let mut collected: Vec<Bytes> = Vec::new();
     while let Some(item) = call.next().await {
         match item {
@@ -373,8 +374,12 @@ async fn duplex_cancel_from_caller_closes_both_halves() {
         .call_duplex(server.node_id(), "forever", CallOptions::default())
         .await
         .expect("call_duplex");
-    call.send(Bytes::from_static(b"first")).await.expect("send 1");
-    call.send(Bytes::from_static(b"second")).await.expect("send 2");
+    call.send(Bytes::from_static(b"first"))
+        .await
+        .expect("send 1");
+    call.send(Bytes::from_static(b"second"))
+        .await
+        .expect("send 2");
     drop(call);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(3);

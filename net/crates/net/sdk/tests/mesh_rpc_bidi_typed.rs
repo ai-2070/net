@@ -78,24 +78,18 @@ async fn client_stream_typed_round_trips_n_items() {
     handshake(&caller, &server, addr_server).await;
 
     let _serve = server
-        .serve_rpc_client_stream_typed(
-            "aggregate",
-            Codec::Json,
-            |mut requests| async move {
-                let mut count = 0u32;
-                let mut last_label = String::new();
-                while let Some(item) = requests.next().await {
-                    let item: Item = item.map_err(|e| format!("decode: {e}"))?;
-                    count += 1;
-                    last_label = item.label;
-                }
-                Ok::<_, String>(Summary { count })
-                    .map(|s| {
-                        std::hint::black_box(last_label);
-                        s
-                    })
-            },
-        )
+        .serve_rpc_client_stream_typed("aggregate", Codec::Json, |mut requests| async move {
+            let mut count = 0u32;
+            let mut last_label = String::new();
+            while let Some(item) = requests.next().await {
+                let item: Item = item.map_err(|e| format!("decode: {e}"))?;
+                count += 1;
+                last_label = item.label;
+            }
+            Ok::<_, String>(Summary { count }).inspect(|_| {
+                std::hint::black_box(last_label);
+            })
+        })
         .expect("serve_rpc_client_stream_typed");
 
     let mut call = caller
@@ -133,7 +127,7 @@ async fn client_stream_typed_handler_err_round_trips() {
             "rejecter",
             Codec::Json,
             |mut requests: net_sdk::mesh_rpc::RequestStreamTyped<Item>| async move {
-                while let Some(_) = requests.next().await {}
+                while requests.next().await.is_some() {}
                 Err::<Summary, _>("application-level reject".to_string())
             },
         )

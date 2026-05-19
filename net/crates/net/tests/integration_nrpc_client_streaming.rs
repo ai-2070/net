@@ -206,7 +206,10 @@ async fn client_streaming_collects_all_chunks() {
 
     let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let _serve = server
-        .serve_rpc_client_stream("collect", Arc::new(CollectingHandler { seen: seen.clone() }))
+        .serve_rpc_client_stream(
+            "collect",
+            Arc::new(CollectingHandler { seen: seen.clone() }),
+        )
         .expect("serve_rpc_client_stream");
 
     let mut call = caller

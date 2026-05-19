@@ -2391,8 +2391,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
 /// The matching receiver lives inside the handler's
 /// [`RequestStream`]; dropping the sender (on REQUEST_END or
 /// CANCEL) closes the stream.
-type RequestChunkSenders =
-    Arc<Mutex<HashMap<(u64, u64), tokio::sync::mpsc::Sender<bytes::Bytes>>>>;
+type RequestChunkSenders = Arc<Mutex<HashMap<(u64, u64), tokio::sync::mpsc::Sender<bytes::Bytes>>>>;
 
 /// Server-side fold for client-streaming RPC. Parallel to
 /// [`RpcServerStreamingFold`] but consumes REQUEST_CHUNK on the
@@ -2570,9 +2569,8 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 // chunk (caller can re-send or, if flow-control is
                 // wired, will naturally not push past the credit
                 // window).
-                let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(
-                    STREAMING_REQUEST_PUMP_CAPACITY,
-                );
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<bytes::Bytes>(STREAMING_REQUEST_PUMP_CAPACITY);
                 // Terminator-semantics rule: an empty body
                 // combined with FLAG_REQUEST_END is a pure
                 // terminator — the caller's `finish()` emits it
@@ -2584,14 +2582,12 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 // closes in a single frame).
                 let end_on_initial = payload.flags & FLAG_RPC_REQUEST_END != 0;
                 let is_pure_terminator = end_on_initial && payload.body.is_empty();
-                if !is_pure_terminator {
-                    if tx.try_send(bytes::Bytes::from(payload.body)).is_err() {
-                        tracing::warn!(
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc client-streaming server fold: failed to push initial REQUEST body to fresh mpsc",
-                        );
-                    }
+                if !is_pure_terminator && tx.try_send(bytes::Bytes::from(payload.body)).is_err() {
+                    tracing::warn!(
+                        caller_origin = format!("{:#x}", meta.origin_hash),
+                        call_id = meta.seq_or_ts,
+                        "rpc client-streaming server fold: failed to push initial REQUEST body to fresh mpsc",
+                    );
                 }
                 // If the initial REQUEST also set FLAG_REQUEST_END,
                 // close the stream immediately — degenerate case of
@@ -2662,8 +2658,9 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                         RpcResponsePayload {
                             status: RpcStatus::Cancelled,
                             headers: vec![],
-                            body: b"server observed CANCEL during client-streaming handler execution"
-                                .to_vec(),
+                            body:
+                                b"server observed CANCEL during client-streaming handler execution"
+                                    .to_vec(),
                         }
                     } else {
                         match outcome {
@@ -2711,19 +2708,18 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 });
             }
             DISPATCH_RPC_REQUEST_CHUNK => {
-                let payload =
-                    match RpcRequestChunkPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                caller_origin = format!("{:#x}", meta.origin_hash),
-                                call_id = meta.seq_or_ts,
-                                "rpc client-streaming server fold: malformed REQUEST_CHUNK payload",
-                            );
-                            return Ok(());
-                        }
-                    };
+                let payload = match RpcRequestChunkPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc client-streaming server fold: malformed REQUEST_CHUNK payload",
+                        );
+                        return Ok(());
+                    }
+                };
                 // Sanity: payload.call_id should match
                 // EventMeta::seq_or_ts. If they disagree it's a
                 // wire-format mismatch we can't safely route;
@@ -2762,8 +2758,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 // is a regular (rare) item the application
                 // decides what to do with.
                 let is_pure_terminator = is_end && payload.body.is_empty();
-                if !is_pure_terminator
-                    && sender.try_send(bytes::Bytes::from(payload.body)).is_err()
+                if !is_pure_terminator && sender.try_send(bytes::Bytes::from(payload.body)).is_err()
                 {
                     tracing::debug!(
                         caller_origin = format!("{:#x}", meta.origin_hash),
@@ -2937,8 +2932,7 @@ impl RedexFold<()> for RpcDuplexFold {
                 // request chunks) AND the streaming-response flag
                 // (we'll emit response chunks). Missing flags →
                 // refuse cleanly.
-                let required =
-                    FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_STREAMING_RESPONSE;
+                let required = FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_STREAMING_RESPONSE;
                 if payload.flags & required != required {
                     tracing::warn!(
                         caller_origin = format!("{:#x}", meta.origin_hash),
@@ -2996,19 +2990,17 @@ impl RedexFold<()> for RpcDuplexFold {
 
                 // Build per-call request-side mpsc (Phase B
                 // pattern).
-                let (req_tx, req_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(
-                    STREAMING_REQUEST_PUMP_CAPACITY,
-                );
+                let (req_tx, req_rx) =
+                    tokio::sync::mpsc::channel::<bytes::Bytes>(STREAMING_REQUEST_PUMP_CAPACITY);
                 let end_on_initial = payload.flags & FLAG_RPC_REQUEST_END != 0;
                 let is_pure_terminator = end_on_initial && payload.body.is_empty();
-                if !is_pure_terminator {
-                    if req_tx.try_send(bytes::Bytes::from(payload.body)).is_err() {
-                        tracing::warn!(
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc duplex server fold: failed to push initial REQUEST body to fresh mpsc",
-                        );
-                    }
+                if !is_pure_terminator && req_tx.try_send(bytes::Bytes::from(payload.body)).is_err()
+                {
+                    tracing::warn!(
+                        caller_origin = format!("{:#x}", meta.origin_hash),
+                        call_id = meta.seq_or_ts,
+                        "rpc duplex server fold: failed to push initial REQUEST body to fresh mpsc",
+                    );
                 }
                 if !end_on_initial {
                     self.senders.lock().insert(key, req_tx);
@@ -3109,9 +3101,8 @@ impl RedexFold<()> for RpcDuplexFold {
                         RpcResponsePayload {
                             status: RpcStatus::Cancelled,
                             headers: vec![],
-                            body:
-                                b"server observed CANCEL during duplex handler execution"
-                                    .to_vec(),
+                            body: b"server observed CANCEL during duplex handler execution"
+                                .to_vec(),
                         }
                     } else {
                         match outcome {
@@ -3150,8 +3141,7 @@ impl RedexFold<()> for RpcDuplexFold {
                                 RpcResponsePayload {
                                     status: RpcStatus::Internal,
                                     headers: vec![],
-                                    body: format!("handler panicked: {panic_msg}")
-                                        .into_bytes(),
+                                    body: format!("handler panicked: {panic_msg}").into_bytes(),
                                 }
                             }
                         }
@@ -3166,19 +3156,18 @@ impl RedexFold<()> for RpcDuplexFold {
                 // the chunk body into the per-call request mpsc,
                 // close on FLAG_END (suppressing empty terminator
                 // bodies per the terminator-semantics rule).
-                let payload =
-                    match RpcRequestChunkPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                caller_origin = format!("{:#x}", meta.origin_hash),
-                                call_id = meta.seq_or_ts,
-                                "rpc duplex server fold: malformed REQUEST_CHUNK payload",
-                            );
-                            return Ok(());
-                        }
-                    };
+                let payload = match RpcRequestChunkPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc duplex server fold: malformed REQUEST_CHUNK payload",
+                        );
+                        return Ok(());
+                    }
+                };
                 if payload.call_id != meta.seq_or_ts {
                     tracing::warn!(
                         caller_origin = format!("{:#x}", meta.origin_hash),
@@ -3199,8 +3188,7 @@ impl RedexFold<()> for RpcDuplexFold {
                     return Ok(());
                 };
                 let is_pure_terminator = is_end && payload.body.is_empty();
-                if !is_pure_terminator
-                    && sender.try_send(bytes::Bytes::from(payload.body)).is_err()
+                if !is_pure_terminator && sender.try_send(bytes::Bytes::from(payload.body)).is_err()
                 {
                     tracing::debug!(
                         caller_origin = format!("{:#x}", meta.origin_hash),
@@ -3717,11 +3705,8 @@ impl RpcClientFold {
                         if grant.credits == 0 {
                             return;
                         }
-                        self.pending.deliver_grant(
-                            grant.call_id,
-                            ev.from_node,
-                            grant.credits,
-                        );
+                        self.pending
+                            .deliver_grant(grant.call_id, ev.from_node, grant.credits);
                     }
                     None => {
                         tracing::debug!(
@@ -3994,8 +3979,16 @@ mod tests {
             FLAG_RPC_CLIENT_STREAMING_REQUEST,
             FLAG_RPC_REQUEST_END,
         ] {
-            assert_eq!(flag & (1 << 0), 0, "flag {flag:#06x} collides with reserved bit 0");
-            assert_eq!(flag & (1 << 3), 0, "flag {flag:#06x} collides with reserved bit 3");
+            assert_eq!(
+                flag & (1 << 0),
+                0,
+                "flag {flag:#06x} collides with reserved bit 0"
+            );
+            assert_eq!(
+                flag & (1 << 3),
+                0,
+                "flag {flag:#06x} collides with reserved bit 3"
+            );
         }
     }
 
@@ -4010,10 +4003,7 @@ mod tests {
     fn request_chunk_roundtrip_with_headers_and_body() {
         let mut headers = Vec::new();
         for i in 0..10u8 {
-            headers.push(header(
-                &format!("x-chunk-meta-{i}"),
-                &[0xAA, 0xBB, i, !i],
-            ));
+            headers.push(header(&format!("x-chunk-meta-{i}"), &[0xAA, 0xBB, i, !i]));
         }
         let body: Vec<u8> = (0..1024u32).map(|n| (n & 0xFF) as u8).collect();
         let p = RpcRequestChunkPayload {
@@ -4050,11 +4040,7 @@ mod tests {
         for n in 0..full.len() {
             let prefix = &full[..n];
             let result = RpcRequestChunkPayload::decode(prefix);
-            assert!(
-                result.is_err(),
-                "n={n}: expected Err, got Ok({:?})",
-                result
-            );
+            assert!(result.is_err(), "n={n}: expected Err, got Ok({:?})", result);
         }
         // Full length must decode cleanly.
         assert!(RpcRequestChunkPayload::decode(&full).is_ok());
@@ -4074,8 +4060,8 @@ mod tests {
         buf.put_u32_le((MAX_RPC_BODY_LEN + 1) as u32);
         // (no body bytes follow — we want the decoder to reject at
         // the length check before it even tries to read body bytes)
-        let err = RpcRequestChunkPayload::decode(&buf)
-            .expect_err("oversized body length must reject");
+        let err =
+            RpcRequestChunkPayload::decode(&buf).expect_err("oversized body length must reject");
         match err {
             RpcCodecError::TooLarge {
                 field,
@@ -4099,8 +4085,8 @@ mod tests {
         buf.put_u64_le(0x42); // call_id
         buf.put_u16_le(0); // flags
         buf.put_u8((MAX_RPC_HEADERS + 1) as u8); // over the cap
-        let err = RpcRequestChunkPayload::decode(&buf)
-            .expect_err("oversized header count must reject");
+        let err =
+            RpcRequestChunkPayload::decode(&buf).expect_err("oversized header count must reject");
         match err {
             RpcCodecError::TooLarge {
                 field,
@@ -5355,13 +5341,8 @@ mod tests {
 
     /// Build a REQUEST_GRANT event for tests. Mirror of
     /// `rpc_stream_grant_event` for the request direction.
-    fn rpc_request_grant_event(
-        caller_origin: u64,
-        call_id: u64,
-        credits: u32,
-    ) -> RedexEvent {
-        let meta =
-            EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, caller_origin, call_id, 0);
+    fn rpc_request_grant_event(caller_origin: u64, call_id: u64, credits: u32) -> RedexEvent {
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, caller_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
         buf.extend_from_slice(&meta.to_bytes());
         buf.extend_from_slice(&encode_request_grant(call_id, credits));
@@ -5378,8 +5359,7 @@ mod tests {
     #[tokio::test]
     async fn client_pending_client_streaming_routes_terminal_and_grants() {
         let pending = Arc::new(RpcClientPending::new());
-        let (terminal_rx, mut grant_rx) =
-            pending.register_client_streaming(0xCAFE_F00D, 0);
+        let (terminal_rx, mut grant_rx) = pending.register_client_streaming(0xCAFE_F00D, 0);
         // Push two grants — both should land on the mpsc.
         pending.deliver_grant(0xCAFE_F00D, 0, 3);
         pending.deliver_grant(0xCAFE_F00D, 0, 7);
@@ -5411,23 +5391,20 @@ mod tests {
     #[tokio::test]
     async fn client_pending_grant_from_wrong_target_is_dropped() {
         let pending = Arc::new(RpcClientPending::new());
-        let (_terminal_rx, mut grant_rx) =
-            pending.register_client_streaming(0xCAFE_F00D, 0x42);
+        let (_terminal_rx, mut grant_rx) = pending.register_client_streaming(0xCAFE_F00D, 0x42);
         // Forged grant from a different session peer — must drop.
         pending.deliver_grant(0xCAFE_F00D, 0x99, 100);
-        let parked =
-            tokio::time::timeout(Duration::from_millis(50), grant_rx.recv()).await;
+        let parked = tokio::time::timeout(Duration::from_millis(50), grant_rx.recv()).await;
         assert!(
             parked.is_err(),
             "forged REQUEST_GRANT from wrong target must not inject credit"
         );
         // Legitimate grant from the recorded target lands.
         pending.deliver_grant(0xCAFE_F00D, 0x42, 5);
-        let delivered =
-            tokio::time::timeout(Duration::from_millis(50), grant_rx.recv())
-                .await
-                .expect("must complete")
-                .expect("must receive");
+        let delivered = tokio::time::timeout(Duration::from_millis(50), grant_rx.recv())
+            .await
+            .expect("must complete")
+            .expect("must receive");
         assert_eq!(delivered, 5);
     }
 
@@ -5463,15 +5440,13 @@ mod tests {
     async fn client_fold_routes_request_grant_to_registered_waiter() {
         let pending = Arc::new(RpcClientPending::new());
         let mut fold = RpcClientFold::new(pending.clone());
-        let (_terminal_rx, mut grant_rx) =
-            pending.register_client_streaming(0xC0DE, 0);
+        let (_terminal_rx, mut grant_rx) = pending.register_client_streaming(0xC0DE, 0);
         let ev = rpc_request_grant_event(0xCAFE, 0xC0DE, 9);
         fold.apply(&ev, &mut ()).unwrap();
-        let delivered =
-            tokio::time::timeout(Duration::from_millis(50), grant_rx.recv())
-                .await
-                .expect("must complete")
-                .expect("must receive");
+        let delivered = tokio::time::timeout(Duration::from_millis(50), grant_rx.recv())
+            .await
+            .expect("must complete")
+            .expect("must receive");
         assert_eq!(delivered, 9);
     }
 
@@ -5483,12 +5458,10 @@ mod tests {
     async fn client_fold_malformed_request_grant_is_logged_not_fatal() {
         let pending = Arc::new(RpcClientPending::new());
         let mut fold = RpcClientFold::new(pending.clone());
-        let (_terminal_rx, mut grant_rx) =
-            pending.register_client_streaming(0xC0DE, 0);
+        let (_terminal_rx, mut grant_rx) = pending.register_client_streaming(0xC0DE, 0);
         // Build a GRANT event whose payload is only 4 bytes
         // (truncated — codec needs 12).
-        let meta =
-            EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, 0xCAFE, 0xC0DE, 0);
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, 0xCAFE, 0xC0DE, 0);
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
         buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
@@ -5502,8 +5475,7 @@ mod tests {
             "malformed REQUEST_GRANT must NOT kill the fold"
         );
         // No credit landed on the mpsc.
-        let parked =
-            tokio::time::timeout(Duration::from_millis(30), grant_rx.recv()).await;
+        let parked = tokio::time::timeout(Duration::from_millis(30), grant_rx.recv()).await;
         assert!(
             parked.is_err(),
             "malformed REQUEST_GRANT must not inject credit"
@@ -6105,7 +6077,13 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].2.status, RpcStatus::Ok);
         assert_eq!(captured[0].2.body, 1u64.to_le_bytes());
-        assert_eq!(seen.lock().iter().map(|b| b.as_ref()).collect::<Vec<&[u8]>>(), vec![b"only" as &[u8]]);
+        assert_eq!(
+            seen.lock()
+                .iter()
+                .map(|b| b.as_ref())
+                .collect::<Vec<&[u8]>>(),
+            vec![b"only" as &[u8]]
+        );
         // Sender must NOT have been registered (initial-REQUEST-
         // with-END skips the map insert).
         assert!(fold.sender_keys().is_empty());
@@ -6188,7 +6166,7 @@ mod tests {
                 use futures::StreamExt;
                 // Drain so the stream's EOF doesn't race the
                 // error return.
-                while let Some(_) = requests.next().await {}
+                while requests.next().await.is_some() {}
                 Err(RpcHandlerError::Application {
                     code: 0xBEEF,
                     message: "bad input".to_string(),
@@ -6204,7 +6182,8 @@ mod tests {
             headers: vec![],
             body: vec![],
         };
-        fold.apply(&rpc_request_event(3, 100, req), &mut ()).unwrap();
+        fold.apply(&rpc_request_event(3, 100, req), &mut ())
+            .unwrap();
         assert!(
             wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
             "expected terminal RESPONSE"
@@ -6241,7 +6220,8 @@ mod tests {
             headers: vec![],
             body: vec![],
         };
-        fold.apply(&rpc_request_event(4, 200, req), &mut ()).unwrap();
+        fold.apply(&rpc_request_event(4, 200, req), &mut ())
+            .unwrap();
         assert!(
             wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
             "expected terminal RESPONSE"
@@ -6277,7 +6257,7 @@ mod tests {
                 // Slow handler to keep the call in-flight while
                 // the duplicate REQUEST arrives.
                 tokio::time::sleep(Duration::from_millis(80)).await;
-                while let Some(_) = requests.next().await {}
+                while requests.next().await.is_some() {}
                 Ok(RpcResponsePayload {
                     status: RpcStatus::Ok,
                     headers: vec![],

@@ -1412,7 +1412,8 @@ pub extern "C" fn net_rpc_call_client_stream(
     }
     let node = h.node.clone();
     let result = runtime().block_on(async move {
-        node.call_client_stream(target_node_id, &service, opts).await
+        node.call_client_stream(target_node_id, &service, opts)
+            .await
     });
     match result {
         Ok(call) => {
@@ -1553,9 +1554,7 @@ pub extern "C" fn net_rpc_client_stream_finish(
 /// Diagnostic accessor: server-assigned `call_id` for this call.
 /// Returns `0` on NULL handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_rpc_client_stream_call_id(
-    handle: *const ClientStreamCallHandleC,
-) -> u64 {
+pub extern "C" fn net_rpc_client_stream_call_id(handle: *const ClientStreamCallHandleC) -> u64 {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return 0;
     };
@@ -1678,9 +1677,8 @@ pub extern "C" fn net_rpc_call_duplex(
         opts.stream_window_initial = Some(stream_window);
     }
     let node = h.node.clone();
-    let result = runtime().block_on(async move {
-        node.call_duplex(target_node_id, &service, opts).await
-    });
+    let result =
+        runtime().block_on(async move { node.call_duplex(target_node_id, &service, opts).await });
     match result {
         Ok(call) => {
             let call_id = call.call_id();
@@ -2732,9 +2730,8 @@ impl RpcDuplexHandler for GoDuplexRpcHandler {
                 let stream_handle = stream_handle_addr as *mut RpcRequestStreamHandleC;
                 let sink_handle = sink_handle_addr as *mut RpcResponseSinkHandleC;
                 let mut err_ptr: *mut c_char = std::ptr::null_mut();
-                let code = unsafe {
-                    dispatcher(handler_id, stream_handle, sink_handle, &mut err_ptr)
-                };
+                let code =
+                    unsafe { dispatcher(handler_id, stream_handle, sink_handle, &mut err_ptr) };
                 // Free both per-call handles. Dropping the sink
                 // closes the response mpsc — the substrate fold's
                 // pump drains any final chunks then emits the
@@ -2851,7 +2848,8 @@ pub extern "C" fn net_rpc_serve_duplex(
     if DUPLEX_DISPATCHER.get().is_none() {
         write_err(
             out_err,
-            "net_rpc_set_duplex_handler_dispatcher must be called before net_rpc_serve_duplex".into(),
+            "net_rpc_set_duplex_handler_dispatcher must be called before net_rpc_serve_duplex"
+                .into(),
         );
         return std::ptr::null_mut();
     }
@@ -3102,12 +3100,10 @@ mod tests {
         }));
         let mut err_ptr: *mut c_char = std::ptr::null_mut();
         let body = b"x";
-        let code = unsafe {
-            net_rpc_client_stream_send(handle, body.as_ptr(), body.len(), &mut err_ptr)
-        };
+        let code = net_rpc_client_stream_send(handle, body.as_ptr(), body.len(), &mut err_ptr);
         assert_eq!(code, NET_RPC_ERR_STREAM_DONE);
         assert!(err_ptr.is_null());
-        unsafe { net_rpc_client_stream_free(handle) };
+        net_rpc_client_stream_free(handle);
     }
 
     // ----- B8-2 duplex null-safety pins. -----
@@ -3185,11 +3181,8 @@ mod tests {
     fn request_stream_next_on_null_is_safe() {
         let mut chunk_ptr: *mut u8 = std::ptr::null_mut();
         let mut chunk_len: usize = 0;
-        let code = net_rpc_request_stream_next(
-            std::ptr::null_mut(),
-            &mut chunk_ptr,
-            &mut chunk_len,
-        );
+        let code =
+            net_rpc_request_stream_next(std::ptr::null_mut(), &mut chunk_ptr, &mut chunk_len);
         assert_eq!(code, NET_RPC_ERR_NULL);
         assert!(chunk_ptr.is_null());
         assert_eq!(chunk_len, 0);
@@ -3198,11 +3191,7 @@ mod tests {
     #[test]
     fn response_sink_send_on_null_is_safe() {
         let body = b"x";
-        let code = net_rpc_response_sink_send(
-            std::ptr::null_mut(),
-            body.as_ptr(),
-            body.len(),
-        );
+        let code = net_rpc_response_sink_send(std::ptr::null_mut(), body.as_ptr(), body.len());
         assert_eq!(code, NET_RPC_ERR_NULL);
     }
 
@@ -3219,9 +3208,7 @@ mod tests {
         }));
         let mut chunk_ptr: *mut u8 = std::ptr::null_mut();
         let mut chunk_len: usize = 0;
-        let code = unsafe {
-            net_rpc_request_stream_next(handle, &mut chunk_ptr, &mut chunk_len)
-        };
+        let code = net_rpc_request_stream_next(handle, &mut chunk_ptr, &mut chunk_len);
         assert_eq!(code, NET_RPC_ERR_STREAM_DONE);
         assert!(chunk_ptr.is_null());
         assert_eq!(chunk_len, 0);
@@ -3239,9 +3226,7 @@ mod tests {
             inner: Mutex::new(None),
         }));
         let body = b"x";
-        let code = unsafe {
-            net_rpc_response_sink_send(handle, body.as_ptr(), body.len())
-        };
+        let code = net_rpc_response_sink_send(handle, body.as_ptr(), body.len());
         assert_eq!(code, NET_RPC_ERR_STREAM_DONE);
         unsafe { drop(Box::from_raw(handle)) };
     }

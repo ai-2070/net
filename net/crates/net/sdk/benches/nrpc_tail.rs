@@ -78,8 +78,8 @@ fn main() {
 async fn run_one(concurrency: usize, pair: Arc<Pair>, req: Arc<EchoReq>) -> Histogram<u64> {
     // 1 ns .. 60 s, 3 significant figures — covers every plausible
     // RPC latency this bench will see.
-    let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
-        .expect("hdrhistogram alloc");
+    let mut hist =
+        Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).expect("hdrhistogram alloc");
     let sem = Arc::new(Semaphore::new(concurrency));
     let mut handles = Vec::with_capacity(TOTAL_SAMPLES);
 

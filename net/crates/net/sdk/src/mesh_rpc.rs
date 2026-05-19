@@ -539,7 +539,9 @@ impl Mesh {
         service: &str,
         opts: CallOptions,
     ) -> std::result::Result<ClientStreamCallRaw, RpcError> {
-        self.node().call_client_stream(target_node_id, service, opts).await
+        self.node()
+            .call_client_stream(target_node_id, service, opts)
+            .await
     }
 
     /// Register a typed client-streaming handler. Mirror of
@@ -567,7 +569,8 @@ impl Mesh {
             _resp: std::marker::PhantomData::<Resp>,
         };
         self.auto_register_rpc_channels(service);
-        self.node().serve_rpc_client_stream(service, Arc::new(typed))
+        self.node()
+            .serve_rpc_client_stream(service, Arc::new(typed))
     }
 
     /// Direct-addressed typed client-streaming call. Returns a
@@ -582,7 +585,9 @@ impl Mesh {
         Req: Serialize,
         Resp: DeserializeOwned,
     {
-        let inner = self.call_client_stream(target_node_id, service, opts.raw).await?;
+        let inner = self
+            .call_client_stream(target_node_id, service, opts.raw)
+            .await?;
         Ok(ClientStreamCallTyped {
             inner,
             codec: opts.codec,
@@ -632,10 +637,7 @@ impl Mesh {
     where
         Req: DeserializeOwned + Send + Sync + Unpin + 'static,
         Resp: Serialize + Send + Sync + 'static,
-        F: Fn(RequestStreamTyped<Req>, ResponseSinkTyped<Resp>) -> Fut
-            + Send
-            + Sync
-            + 'static,
+        F: Fn(RequestStreamTyped<Req>, ResponseSinkTyped<Resp>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
     {
         let typed = TypedDuplexRpcHandler {
@@ -1280,12 +1282,13 @@ where
             done: false,
             _req: std::marker::PhantomData,
         };
-        let resp = (self.inner)(typed_requests)
-            .await
-            .map_err(|message| RpcHandlerError::Application {
-                code: NRPC_TYPED_HANDLER_ERROR,
-                message,
-            })?;
+        let resp =
+            (self.inner)(typed_requests)
+                .await
+                .map_err(|message| RpcHandlerError::Application {
+                    code: NRPC_TYPED_HANDLER_ERROR,
+                    message,
+                })?;
         let body = self
             .codec
             .encode(&resp)

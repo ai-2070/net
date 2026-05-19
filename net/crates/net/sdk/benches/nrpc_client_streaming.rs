@@ -43,7 +43,9 @@ fn bench_client_streaming(c: &mut Criterion) {
             // Per-call throughput in *messages* — headline
             // metric for client-streaming throughput.
             group.throughput(Throughput::Elements(count as u64));
-            let req = EchoReq { body: payload(size) };
+            let req = EchoReq {
+                body: payload(size),
+            };
             let id = BenchmarkId::new(format!("n{count}"), label);
             group.bench_with_input(id, &req, |b, req| {
                 b.to_async(&rt).iter(|| async {

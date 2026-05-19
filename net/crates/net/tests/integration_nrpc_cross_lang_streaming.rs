@@ -11,9 +11,11 @@
 //!     response per item plus a final `{echo: "summary", sum: N}`
 //!     frame.
 //!
-//! The same fixture is the source-of-truth for the Node + Python
-//! + Go binding compat tests (B9 / B10 / B11 ports — separate
-//! commits). The contract is documented in `golden_vectors_streaming.json`
+//! The same fixture is the source-of-truth for the Node, Python,
+//! and Go binding compat tests (B9 / B10 / B11 ports — separate
+//! commits).
+//!
+//! The contract is documented in `golden_vectors_streaming.json`
 //! itself; this file is the load-bearing Rust-side reference
 //! implementation that defines what "correct" looks like.
 //!
@@ -33,14 +35,12 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use net::adapter::net::cortex::{
-    classify_streaming_chunk, EventMeta, RequestStream, RpcAsyncResponseEmitter,
-    RpcClientFold, RpcClientPending, RpcClientStreamingHandler, RpcDuplexFold,
-    RpcDuplexHandler, RpcHandlerError, RpcRequestChunkPayload, RpcRequestPayload,
-    RpcResponseEmitter, RpcResponsePayload, RpcResponseSink, RpcStatus,
-    RpcStreamingContext, RpcStreamingRequestFold, StreamingChunkKind,
-    DISPATCH_RPC_REQUEST, DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_RESPONSE,
-    EVENT_META_SIZE, FLAG_RPC_CLIENT_STREAMING_REQUEST, FLAG_RPC_REQUEST_END,
-    FLAG_RPC_STREAMING_RESPONSE,
+    classify_streaming_chunk, EventMeta, RequestStream, RpcAsyncResponseEmitter, RpcClientFold,
+    RpcClientPending, RpcClientStreamingHandler, RpcDuplexFold, RpcDuplexHandler, RpcHandlerError,
+    RpcRequestChunkPayload, RpcRequestPayload, RpcResponseEmitter, RpcResponsePayload,
+    RpcResponseSink, RpcStatus, RpcStreamingContext, RpcStreamingRequestFold, StreamingChunkKind,
+    DISPATCH_RPC_REQUEST, DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_RESPONSE, EVENT_META_SIZE,
+    FLAG_RPC_CLIENT_STREAMING_REQUEST, FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE,
 };
 use net::adapter::net::redex::{RedexEntry, RedexEvent, RedexFold};
 use parking_lot::Mutex;
@@ -181,12 +181,7 @@ fn initial_request_event(
     make_event(meta, &payload.encode())
 }
 
-fn request_chunk_event(
-    caller_origin: u64,
-    call_id: u64,
-    flags: u16,
-    body: Vec<u8>,
-) -> RedexEvent {
+fn request_chunk_event(caller_origin: u64, call_id: u64, flags: u16, body: Vec<u8>) -> RedexEvent {
     let payload = RpcRequestChunkPayload {
         call_id,
         flags,
@@ -238,8 +233,7 @@ impl ClientStreamLoopback {
 
     async fn run(&self, items: &[StreamItem]) -> RpcResponsePayload {
         let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
-        let (terminal_rx, _grant_rx) =
-            self.pending.register_client_streaming(call_id, 0);
+        let (terminal_rx, _grant_rx) = self.pending.register_client_streaming(call_id, 0);
         // Initial REQUEST — empty body, FLAG_CLIENT_STREAMING set.
         // Empty body is the convention when the first send hasn't
         // happened yet; the streaming-request fold's terminator-
@@ -301,12 +295,8 @@ impl ClientStreamLoopback {
             // If items had only 1 entry, the initial REQUEST didn't
             // get FLAG_END; emit a trailing empty-body END chunk.
             if items.len() == 1 {
-                let ev = request_chunk_event(
-                    self.caller_origin,
-                    call_id,
-                    FLAG_RPC_REQUEST_END,
-                    vec![],
-                );
+                let ev =
+                    request_chunk_event(self.caller_origin, call_id, FLAG_RPC_REQUEST_END, vec![]);
                 self.server_fold
                     .lock()
                     .apply(&ev, &mut ())
@@ -362,10 +352,8 @@ impl DuplexLoopback {
     /// one Resp JSON body) — terminator absent from the return.
     async fn run(&self, items: &[StreamItem]) -> Vec<Vec<u8>> {
         let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
-        let (mut chunks_rx, _grant_rx) =
-            self.pending.register_duplex(call_id, 0);
-        let initial_flags =
-            FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_STREAMING_RESPONSE;
+        let (mut chunks_rx, _grant_rx) = self.pending.register_duplex(call_id, 0);
+        let initial_flags = FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_STREAMING_RESPONSE;
         if items.is_empty() {
             let ev = initial_request_event(
                 self.caller_origin,
@@ -413,12 +401,8 @@ impl DuplexLoopback {
                     .expect("server fold apply chunk");
             }
             if items.len() == 1 {
-                let ev = request_chunk_event(
-                    self.caller_origin,
-                    call_id,
-                    FLAG_RPC_REQUEST_END,
-                    vec![],
-                );
+                let ev =
+                    request_chunk_event(self.caller_origin, call_id, FLAG_RPC_REQUEST_END, vec![]);
                 self.server_fold
                     .lock()
                     .apply(&ev, &mut ())
@@ -542,8 +526,7 @@ async fn client_streaming_ok_cases_match_fixture() {
             "case {name}: expected Ok status, got {:?}",
             resp.status
         );
-        let got: JsonValue =
-            serde_json::from_slice(&resp.body).expect("response body is JSON");
+        let got: JsonValue = serde_json::from_slice(&resp.body).expect("response body is JSON");
         let expected = case
             .get("expected_response_json")
             .expect("case has expected_response_json");
@@ -581,12 +564,8 @@ async fn duplex_ok_cases_match_fixture() {
             bodies.len()
         );
         for (i, (got_bytes, expected)) in bodies.iter().zip(expected_items.iter()).enumerate() {
-            let got: JsonValue =
-                serde_json::from_slice(got_bytes).expect("response chunk is JSON");
-            assert_eq!(
-                &got, expected,
-                "case {name}: frame {i} mismatch"
-            );
+            let got: JsonValue = serde_json::from_slice(got_bytes).expect("response chunk is JSON");
+            assert_eq!(&got, expected, "case {name}: frame {i} mismatch");
         }
     }
 }

@@ -55,8 +55,8 @@ use tokio::task::AbortHandle;
 
 use ::net::adapter::net::cortex::{
     RequestStream as InnerRequestStream, RpcClientStreamingHandler, RpcContext, RpcDuplexHandler,
-    RpcHandler, RpcHandlerError, RpcResponsePayload,
-    RpcResponseSink as InnerRpcResponseSink, RpcStatus, RpcStreamingContext,
+    RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink,
+    RpcStatus, RpcStreamingContext,
 };
 use ::net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
@@ -817,7 +817,8 @@ impl PyDuplexCall {
     /// Returns ``(sink, stream)``. After ``into_split``, the
     /// original ``DuplexCall`` is "done" — subsequent ``send`` /
     /// ``finish_sending`` / ``__next__`` raise ``RpcError``.
-    fn into_split(&self) -> PyResult<(PyDuplexSink, PyDuplexStream)> {
+    #[pyo3(name = "into_split")]
+    fn split(&self) -> PyResult<(PyDuplexSink, PyDuplexStream)> {
         let call = self
             .inner
             .lock()

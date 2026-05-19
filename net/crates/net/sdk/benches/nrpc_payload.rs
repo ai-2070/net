@@ -10,7 +10,7 @@
 //!
 //! Axes:
 //! - Payload: 256 KiB / 1 MiB / 3 MiB (safely under 4 MiB even
-//!            after JSON envelope expansion)
+//!   after JSON envelope expansion)
 //! - Codec:   json / postcard / raw bytes
 //!
 //! `Throughput::Bytes(size)` makes Criterion report MB/s — the
@@ -32,7 +32,9 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 #[path = "nrpc_common/mod.rs"]
 mod nrpc_common;
 
-use nrpc_common::{call_json_direct, call_postcard_direct, call_raw_direct, payload, runtime, EchoReq, Pair};
+use nrpc_common::{
+    call_json_direct, call_postcard_direct, call_raw_direct, payload, runtime, EchoReq, Pair,
+};
 
 const SIZES: &[(&str, usize)] = &[
     ("256KiB", 256 * 1024),
@@ -56,7 +58,9 @@ fn bench_payload(c: &mut Criterion) {
     for &(label, size) in SIZES {
         group.throughput(Throughput::Bytes(size as u64));
 
-        let req = EchoReq { body: payload(size) };
+        let req = EchoReq {
+            body: payload(size),
+        };
         group.bench_with_input(BenchmarkId::new("json", label), &req, |b, req| {
             b.to_async(&rt).iter(|| async {
                 let resp = call_json_direct(&pair, req).await;
@@ -64,7 +68,9 @@ fn bench_payload(c: &mut Criterion) {
             });
         });
 
-        let req = EchoReq { body: payload(size) };
+        let req = EchoReq {
+            body: payload(size),
+        };
         group.bench_with_input(BenchmarkId::new("postcard", label), &req, |b, req| {
             b.to_async(&rt).iter(|| async {
                 let resp = call_postcard_direct(&pair, req).await;
