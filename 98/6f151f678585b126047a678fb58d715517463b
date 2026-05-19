@@ -1,0 +1,23 @@
+net/crates/net/tests/integration_nrpc_client_streaming.rs
+  s_906a82c67213dc::t_2d563afe2e589e 420-423,442-445
+  s_906a82c67213dc::t_7401c88dc7eb33 424-427,446-449
+net/crates/net/tests/integration_nrpc_duplex.rs
+  s_906a82c67213dc::t_d154d82d03cbdb 407-410
+  s_906a82c67213dc::t_dd8a54c4dd4390 403-406
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "986f151f678585b126047a678fb58d715517463b",
+  "prompts": {},
+  "sessions": {
+    "s_906a82c67213dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a83a8d29-a399-4785-986d-1bd45ba15ab6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
