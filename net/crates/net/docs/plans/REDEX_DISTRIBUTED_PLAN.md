@@ -419,7 +419,7 @@ Per-channel metrics on the existing `RpcMetricsRegistry` shape (recently extende
 - `MeshDaemon::snapshot()` for `ReplicationCoordinator` includes `tail_seq`, `last_sync_at`, `last_heartbeat_at`, current role (leader / replica).
 - A small `BEHAVIOR.md` section explains the replication model in operator-facing terms.
 - A `CONFIG_REPLICATION.md` operational doc explains tunables, expected resource cost, and rollback.
-- Feature flag: `dataforts-replication`. Off-by-default in `ai2070-net` and `ai2070-net-sdk`. Pilots opt in.
+- Feature flag: `dataforts-replication`. Off-by-default in `net-mesh` and `net-mesh-sdk`. Pilots opt in.
 - Rollback path: flipping the feature off must safely degrade to single-node behavior. Replicas withdraw their `causal:` tags; reads route to the leader; the leader behaves as a normal non-replicated channel. Tested.
 
 ---

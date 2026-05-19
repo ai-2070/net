@@ -1,10 +1,10 @@
-// Minimal sanity check for @ai2070/net-sdk.
+// Minimal sanity check for @net-mesh/sdk.
 // Run: npx tsx hello.ts
 //
 // What it proves: the SDK installs, a node starts, you can publish an event
 // to a named channel, a subscriber receives it, and shutdown is clean.
 
-import { NetNode } from '@ai2070/net-sdk';
+import { NetNode } from '@net-mesh/sdk';
 
 interface Hello { msg: string }
 

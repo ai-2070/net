@@ -1,7 +1,7 @@
 name: Release NPM
 
-# Publishes the napi binding `@ai2070/net` to npm. The
-# pure-TypeScript SDK `@ai2070/net-sdk` ships via
+# Publishes the napi binding `@net-mesh/core` to npm. The
+# pure-TypeScript SDK `@net-mesh/sdk` ships via
 # `release-npm-sdk.yml`.
 #
 # Tag schema: `node-v<semver>` (e.g. `node-v0.19.0`).

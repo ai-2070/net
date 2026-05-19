@@ -311,7 +311,7 @@ pub struct Stats {
 ///
 /// Example usage:
 /// ```typescript
-/// import { Net } from '@ai2070/net';
+/// import { Net } from '@net-mesh/core';
 ///
 /// const bus = await Net.create({ numShards: 4 });
 ///
@@ -1296,7 +1296,7 @@ mod mesh_bindings {
     /// UDP socket with automatic failure detection and rerouting.
     ///
     /// ```typescript
-    /// import { NetMesh } from '@ai2070/net';
+    /// import { NetMesh } from '@net-mesh/core';
     ///
     /// const node = await NetMesh.create({
     ///   bindAddr: '127.0.0.1:9000',

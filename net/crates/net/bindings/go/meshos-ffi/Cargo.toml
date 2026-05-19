@@ -23,7 +23,7 @@ default = []
 # Substrate-side MeshOS SDK + the daemon trait. Pulls in
 # `compute` for `MeshDaemon` and `meshos` for the supervisor runtime;
 # the latter implies `cortex` per the substrate's feature gating.
-net = { package = "ai2070-net", version = "0.19.0", path = "../../..", default-features = false, features = ["meshos"] }
+net = { package = "net-mesh", version = "0.19.0", path = "../../..", default-features = false, features = ["meshos"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 bytes = "1.11"
 serde_json = "1"

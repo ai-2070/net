@@ -14,7 +14,7 @@ members = [
 ]
 
 [package]
-name = "ai2070-net"
+name = "net-mesh"
 version = "0.19.0"
 edition = "2021"
 description = "High-performance, schema-agnostic, backend-agnostic event bus"
@@ -32,14 +32,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [lib]
 # Keep the crate name as `net` so internal `use net::...` paths and
-# every dependent that aliases via `net = { package = "ai2070-net", ... }`
+# every dependent that aliases via `net = { package = "net-mesh", ... }`
 # resolve without code changes. The published artifact is
-# `ai2070-net` on crates.io.
+# `net-mesh` on crates.io.
 name = "net"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [features]
-# Out-of-the-box `cargo add ai2070-net` ships the same stack the
+# Out-of-the-box `cargo add net-mesh` ships the same stack the
 # Python wheel and Node npm package ship by default — mesh transport
 # + NAT traversal + CortEX (folded state) + NetDb + RedEX disk +
 # MeshDB query layer + MeshOS daemon-authoring + Dataforts blob

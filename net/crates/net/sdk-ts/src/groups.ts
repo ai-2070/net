@@ -12,7 +12,7 @@
  *
  * @example
  * ```typescript
- * import { DaemonRuntime, Identity, ReplicaGroup } from '@ai2070/net-sdk';
+ * import { DaemonRuntime, Identity, ReplicaGroup } from '@net-mesh/sdk';
  *
  * // Register the factory the group will invoke for each member.
  * rt.registerFactory('counter', () => new CounterDaemon());
@@ -47,7 +47,7 @@ import {
   type ForkRecordJs,
   type RequestContextJs,
   StrategyJs,
-} from '@ai2070/net';
+} from '@net-mesh/core';
 
 import { getNapiRuntime } from './_internal.js';
 import { DaemonError } from './compute';

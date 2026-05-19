@@ -9,7 +9,7 @@
  *
  * @example
  * ```ts
- * import { MeshNode, DaemonRuntime } from '@ai2070/net-sdk';
+ * import { MeshNode, DaemonRuntime } from '@net-mesh/sdk';
  *
  * const mesh = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk: '...' });
  * const rt = DaemonRuntime.create(mesh);
@@ -32,7 +32,7 @@ import {
   DaemonRuntime as NapiDaemonRuntime,
   DaemonHandle as NapiDaemonHandle,
   MigrationHandle as NapiMigrationHandle,
-} from '@ai2070/net';
+} from '@net-mesh/core';
 
 import { getNapiMesh, setNapiRuntime } from './_internal.js';
 import { Identity } from './identity.js';

@@ -193,7 +193,7 @@ The existing fluent `state.query().where_*()` stays available. The filter struct
 ## TS API sketch
 
 ```ts
-import { NetDb, type Task, type Memory } from '@ai2070/net';
+import { NetDb, type Task, type Memory } from '@net-mesh/core';
 
 // Builder — mirrors Rust.
 const db = await NetDb.builder()

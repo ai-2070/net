@@ -1,14 +1,14 @@
 name: Release Rust crates
 
-# Publishes `ai2070-net` and `ai2070-net-sdk` to crates.io.
+# Publishes `net-mesh` and `net-mesh-sdk` to crates.io.
 #
 # Tag schema: `crates-v<semver>` (e.g. `crates-v0.19.0`). The two
-# crates publish in dependency order — `ai2070-net` first, then
-# `ai2070-net-sdk` once the index has caught up.
+# crates publish in dependency order — `net-mesh` first, then
+# `net-mesh-sdk` once the index has caught up.
 #
 # Required repository secret: `CARGO_REGISTRY_TOKEN`
 #   Generate at https://crates.io/me with the `publish-update`
-#   scope restricted to `ai2070-net*` after both crates exist on
+#   scope restricted to `net-mesh*` after both crates exist on
 #   crates.io. The first publish requires a wider scope (or a
 #   broader account-level token) because crates.io scopes can
 #   only be set on existing crates.
@@ -24,7 +24,7 @@ env:
 
 jobs:
   publish:
-    name: Publish ai2070-net + ai2070-net-sdk
+    name: Publish net-mesh + net-mesh-sdk
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -48,14 +48,14 @@ jobs:
       # etc.) fails fast before we touch the registry. The SDK
       # can't be dry-run independently — `cargo publish --dry-run`
       # tries to resolve every dep against crates.io, and the
-      # SDK's `ai2070-net` dep doesn't exist there until the step
+      # SDK's `net-mesh` dep doesn't exist there until the step
       # after this one publishes it. The actual SDK publish below
       # carries its own packaging check.
-      - name: cargo publish --dry-run (ai2070-net)
+      - name: cargo publish --dry-run (net-mesh)
         working-directory: net/crates/net
         run: cargo publish --dry-run
 
-      - name: Publish ai2070-net
+      - name: Publish net-mesh
         working-directory: net/crates/net
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -64,11 +64,11 @@ jobs:
       # The crates.io sparse index needs a moment to expose the new
       # version before a dependent crate's publish can resolve it.
       # 30 s is conservative; raise if the next step starts failing
-      # with "no matching package named `ai2070-net` found".
+      # with "no matching package named `net-mesh` found".
       - name: Wait for crates.io index
         run: sleep 30
 
-      - name: Publish ai2070-net-sdk
+      - name: Publish net-mesh-sdk
         working-directory: net/crates/net/sdk
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -2,28 +2,28 @@
 
 Ergonomic TypeScript SDK for the Net mesh network.
 
-Wraps the `@ai2070/net` NAPI bindings with streaming, typed channels, and a developer-friendly API.
+Wraps the `@net-mesh/core` NAPI bindings with streaming, typed channels, and a developer-friendly API.
 
 ## Install
 
 ```bash
-npm install @ai2070/net-sdk @ai2070/net
+npm install @net-mesh/sdk @net-mesh/core
 ```
 
 ## Cargo features (transitive)
 
-`@ai2070/net-sdk` is pure TypeScript; every wrapper class dispatches into the underlying `@ai2070/net` napi-rs binding. Published `.node` artifacts ship every feature enabled, but anyone building from source via `napi build` needs to pass them — symbols from a disabled feature are absent at runtime and the TypeScript wrapper's `import` will fail with `undefined`.
+`@net-mesh/sdk` is pure TypeScript; every wrapper class dispatches into the underlying `@net-mesh/core` napi-rs binding. Published `.node` artifacts ship every feature enabled, but anyone building from source via `napi build` needs to pass them — symbols from a disabled feature are absent at runtime and the TypeScript wrapper's `import` will fail with `undefined`.
 
 | Cargo feature | sdk-ts wrapper module | Surface |
 |---|---|---|
-| `cortex` | `@ai2070/net-sdk/cortex` (also re-exported top-level) | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, error types |
-| `meshdb` | `@ai2070/net-sdk/meshdb` | `MeshQuery`, `MeshQueryRunner`, `MeshQueryStream`, `QueryBuilder`, `InMemoryChainReader`, result + config types |
-| `meshos` | `@ai2070/net-sdk/meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `MeshOsDaemon` interface, `DaemonHealth`, `CapabilityAdvert` |
-| `compute` | `@ai2070/net-sdk/compute` | `DaemonRuntime`, `DaemonHandle`, `MigrationHandle`, daemon trait shapes |
-| `groups` | `@ai2070/net-sdk/groups` | `ReplicaGroup`, `ForkGroup`, `StandbyGroup`, group config types |
-| `deck` | `@ai2070/net-sdk/deck` | `DeckClient`, `OperatorIdentity`, admin / snapshot / status streams, ICE break-glass |
-| `redis` | `@ai2070/net-sdk` top-level | `RedisStreamDedup` |
-| `net` | `@ai2070/net-sdk/mesh` | `MeshNode`, `NetStream`, channel auth |
+| `cortex` | `@net-mesh/sdk/cortex` (also re-exported top-level) | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, error types |
+| `meshdb` | `@net-mesh/sdk/meshdb` | `MeshQuery`, `MeshQueryRunner`, `MeshQueryStream`, `QueryBuilder`, `InMemoryChainReader`, result + config types |
+| `meshos` | `@net-mesh/sdk/meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `MeshOsDaemon` interface, `DaemonHealth`, `CapabilityAdvert` |
+| `compute` | `@net-mesh/sdk/compute` | `DaemonRuntime`, `DaemonHandle`, `MigrationHandle`, daemon trait shapes |
+| `groups` | `@net-mesh/sdk/groups` | `ReplicaGroup`, `ForkGroup`, `StandbyGroup`, group config types |
+| `deck` | `@net-mesh/sdk/deck` | `DeckClient`, `OperatorIdentity`, admin / snapshot / status streams, ICE break-glass |
+| `redis` | `@net-mesh/sdk` top-level | `RedisStreamDedup` |
+| `net` | `@net-mesh/sdk/mesh` | `MeshNode`, `NetStream`, channel auth |
 
 The bus surface (`NetNode`, `EventStream`, capabilities, identity, predicates) is always present.
 
@@ -32,7 +32,7 @@ The `default` Cargo feature set enables every flag, so `npm install` users get f
 ## Quick Start
 
 ```typescript
-import { NetNode } from '@ai2070/net-sdk';
+import { NetNode } from '@net-mesh/sdk';
 
 const node = await NetNode.create({ shards: 4 });
 
@@ -159,11 +159,11 @@ Combined with `producerNoncePath` above, the id is stable across
 both retries and process restart, so the `MULTI/EXEC` timeout
 race becomes filterable consumer-side.
 
-`RedisStreamDedup` is exposed on the underlying `@ai2070/net`
+`RedisStreamDedup` is exposed on the underlying `@net-mesh/core`
 NAPI module:
 
 ```typescript
-import { RedisStreamDedup } from '@ai2070/net';
+import { RedisStreamDedup } from '@net-mesh/core';
 import { createClient } from 'redis';
 
 // Sizing: ~10k events/sec * 1 min dedup window → ~600,000.
@@ -218,10 +218,10 @@ per consumer worker.
 
 ## NAT Traversal (optimization, not correctness)
 
-Two NATed peers already reach each other through the mesh's routed-handshake path. NAT traversal opens a shorter direct path when the NAT shape allows it; it's never required for connectivity. The TS SDK doesn't yet wrap this surface — it's a planned follow-up. For now, construct a `NetMesh` from `@ai2070/net` directly to access the NAPI methods:
+Two NATed peers already reach each other through the mesh's routed-handshake path. NAT traversal opens a shorter direct path when the NAT shape allows it; it's never required for connectivity. The TS SDK doesn't yet wrap this surface — it's a planned follow-up. For now, construct a `NetMesh` from `@net-mesh/core` directly to access the NAPI methods:
 
 ```ts
-import { NetMesh } from '@ai2070/net';
+import { NetMesh } from '@net-mesh/core';
 
 const mesh = await NetMesh.create({
   bindAddr: '0.0.0.0:9000',
@@ -280,7 +280,7 @@ For direct peer-to-peer messaging — open a stream to a specific peer
 and react to back-pressure with first-class error classes:
 
 ```typescript
-import { MeshNode, BackpressureError, NotConnectedError } from '@ai2070/net-sdk';
+import { MeshNode, BackpressureError, NotConnectedError } from '@net-mesh/sdk';
 
 const node = await MeshNode.create({
   bindAddr: '127.0.0.1:9000',
@@ -334,7 +334,7 @@ and the TS SDK surfaces all of it through one type hierarchy.
 
 ```typescript
 import { randomBytes } from 'node:crypto';
-import { Identity, MeshNode } from '@ai2070/net-sdk';
+import { Identity, MeshNode } from '@net-mesh/sdk';
 
 // Load once from caller-owned storage (vault / KMS / env secret).
 // The persisted form IS the 32-byte seed; treat as secret material.
@@ -381,7 +381,7 @@ every directly-connected peer and self-indexes locally.
 this node's own id when self matches.
 
 ```typescript
-import { MeshNode } from '@ai2070/net-sdk';
+import { MeshNode } from '@net-mesh/sdk';
 
 const mesh = await MeshNode.create({
   bindAddr: '127.0.0.1:9002',
@@ -417,7 +417,7 @@ wire format and forwarders are untouched — enforcement is
 purely query-side.
 
 ```typescript
-import { withTenantScope } from '@ai2070/net-sdk';
+import { withTenantScope } from '@net-mesh/sdk';
 
 // GPU pool advertised to one tenant only.
 await mesh.announceCapabilities({
@@ -477,7 +477,7 @@ import {
   diffCapabilities,
   // Placement filters
   standardPlacement, placementFilterFromFn,
-} from '@ai2070/net-sdk';
+} from '@net-mesh/sdk';
 
 // Build a capability set in the wire shape `{ tags, metadata }`.
 let caps = emptyCapabilities();
@@ -545,7 +545,7 @@ every node in the mesh agrees on the geometry without a central
 directory.
 
 ```typescript
-import { MeshNode } from '@ai2070/net-sdk';
+import { MeshNode } from '@net-mesh/sdk';
 
 const policy = {
   rules: [
@@ -586,7 +586,7 @@ both the subscribe gate and the publish path:
   then runs `can_subscribe`.
 
 ```typescript
-import { Identity, MeshNode } from '@ai2070/net-sdk';
+import { Identity, MeshNode } from '@net-mesh/sdk';
 
 const pubIdentity = Identity.generate();
 const subIdentity = Identity.generate();
@@ -653,7 +653,7 @@ subscribe goes through a dedicated subprotocol with an Ack round-trip);
 `publish` fans one payload out to every current subscriber.
 
 ```typescript
-import { MeshNode, ChannelAuthError } from '@ai2070/net-sdk';
+import { MeshNode, ChannelAuthError } from '@net-mesh/sdk';
 
 const psk = '0'.repeat(64);
 
@@ -715,7 +715,7 @@ safely "paint what's there now, then react to changes" without losing
 updates that race during construction.
 
 ```typescript
-import { NetDb, TaskStatus, CortexError } from '@ai2070/net-sdk';
+import { NetDb, TaskStatus, CortexError } from '@net-mesh/sdk';
 
 const db = await NetDb.open({
   originHash: 0xABCDEF01,
@@ -765,7 +765,7 @@ If you only need one model, skip the `NetDb` facade and open the
 adapter directly against a `Redex`:
 
 ```typescript
-import { Redex, TasksAdapter } from '@ai2070/net-sdk';
+import { Redex, TasksAdapter } from '@net-mesh/sdk';
 
 const redex = new Redex({ persistentDir: '/var/lib/net/redex' });
 const tasks = await TasksAdapter.open(redex, 0xABCDEF01, { persistent: true });
@@ -779,7 +779,7 @@ tail iterator is the same `AsyncIterable` shape as the CortEX
 watches, so `for await` + `break` cleans up native resources.
 
 ```typescript
-import { Redex, RedexError } from '@ai2070/net-sdk';
+import { Redex, RedexError } from '@net-mesh/sdk';
 
 const redex = new Redex({ persistentDir: '/var/lib/net/events' });
 const file = redex.openFile('analytics/clicks', {
@@ -824,7 +824,7 @@ the single writer, replicas catch up via pull-based sync. Failover
 uses a deterministic nearest-RTT election with NodeId tie-break.
 
 ```typescript
-import { NetMesh, Redex } from '@ai2070/net';
+import { NetMesh, Redex } from '@net-mesh/core';
 
 const mesh = await NetMesh.create({
   bindAddr: '127.0.0.1:0',
@@ -890,7 +890,7 @@ CortEX-boundary errors are typed and catchable via `instanceof`:
 - `RedexError` — raw file errors (invalid channel name, bad config,
   append / tail / sync / close failures).
 
-All three are re-exported from `@ai2070/net-sdk`; you don't need a
+All three are re-exported from `@net-mesh/sdk`; you don't need a
 separate import path.
 
 ## Dataforts (greedy cache, gravity, blob refs, read-your-writes)
@@ -900,7 +900,7 @@ Dataforts is the compositional data plane on top of RedEX / CortEX
 greedy + gravity through `Redex` methods, blob registration through
 top-level helpers, and read-your-writes through `WriteToken` +
 `waitForToken` on `Tasks` / `Memories`. The underlying native module
-is built with the `dataforts` Cargo feature; pre-built `@ai2070/net`
+is built with the `dataforts` Cargo feature; pre-built `@net-mesh/core`
 release artifacts ship with the feature on.
 
 Four phases:
@@ -926,7 +926,7 @@ Four phases:
     each chunk as a content-addressed `RedexFile`, riding the
     existing replication runtime for cross-node placement.
     `MeshBlobAdapter` is now available as a TypeScript class
-    on the `@ai2070/net` Node binding (CRUD path: `store` /
+    on the `@net-mesh/core` Node binding (CRUD path: `store` /
     `fetch` / `fetchRange` / `exists` / `prometheusText`).
     The deeper integration points (`publish_with_blob`,
     `BlobRefcountTable`, `BlobMetrics`, `BlobAdapter::prefetch`)
@@ -962,7 +962,7 @@ Four phases:
 
 ```ts
 import { Redex, Tasks, BlobRef, registerFilesystemBlobAdapter,
-         blobPublish, blobResolve, MeshNode } from '@ai2070/net';
+         blobPublish, blobResolve, MeshNode } from '@net-mesh/core';
 
 const mesh = new MeshNode({ bindAddr: '0.0.0.0:7000', psk: '…' });
 const redex = new Redex({ persistentDir: '/var/lib/net/redex' });
@@ -987,7 +987,7 @@ const ref = await blobPublish('local', 'local://obj/payload', someBytes);
 const back = await blobResolve(ref);
 
 // Phase 3 v0.2 — substrate-owned `MeshBlobAdapter`.
-import { MeshBlobAdapter, BlobRef } from '@ai2070/net';
+import { MeshBlobAdapter, BlobRef } from '@net-mesh/core';
 const meshBlob = new MeshBlobAdapter(redex, 'mesh-app', {
   persistent: true,
 });
@@ -1047,16 +1047,16 @@ a typed RPC surface with deadlines, queue-group fan-out, response
 streaming, and end-to-end cancellation.
 
 The typed surface ships in the napi binding at
-`@ai2070/net/mesh_rpc` (the SDK's `MeshNode` wraps a `NetMesh`
+`@net-mesh/core/mesh_rpc` (the SDK's `MeshNode` wraps a `NetMesh`
 that nRPC consumes directly):
 
 ```typescript
-import { MeshNode } from '@ai2070/net-sdk'
+import { MeshNode } from '@net-mesh/sdk'
 import {
   classifyError,
   RpcCancelledError,
   RpcServerError,
-} from '@ai2070/net/errors'
+} from '@net-mesh/core/errors'
 import {
   appError,
   CircuitBreaker,
@@ -1064,7 +1064,7 @@ import {
   NRPC_TYPED_BAD_REQUEST,
   RetryPolicy,
   TypedMeshRpc,
-} from '@ai2070/net/mesh_rpc'
+} from '@net-mesh/core/mesh_rpc'
 
 const server = await MeshNode.create({ bindAddr: '127.0.0.1:9001', psk })
 const client = await MeshNode.create({ bindAddr: '127.0.0.1:9000', psk })
@@ -1222,7 +1222,7 @@ typed subclass at the catch site):
 
 `BreakerOpenError` is thrown directly by `CircuitBreaker.call`
 when the breaker is open — catch it via
-`instanceof BreakerOpenError` (imported from `@ai2070/net/mesh_rpc`).
+`instanceof BreakerOpenError` (imported from `@net-mesh/core/mesh_rpc`).
 It carries the `nrpc:breaker_open:` prefix for log filtering, but
 `classifyError` routes it through the base `RpcError` rather than
 its own subclass. Server-side `appError(code, body)` rejections
@@ -1235,7 +1235,7 @@ they classify as `RpcServerError` with `err.status === code`
 rejections — so top-level catch handlers reconstruct typed
 errors regardless of what the throw site emitted.
 
-Two stable status constants exposed by `@ai2070/net/mesh_rpc`:
+Two stable status constants exposed by `@net-mesh/core/mesh_rpc`:
 
 | Constant                       | Hex      | Meaning                                          |
 | ------------------------------ | -------- | ------------------------------------------------ |
@@ -1250,7 +1250,7 @@ compat test — lives in [`../README.md#nrpc`](../README.md#nrpc).
 
 MeshDB is the typed query layer above the RedEX / CortEX /
 capability-index substrate. The native binding builds with
-`--features meshdb`; MeshDB classes import from `@ai2070/net`.
+`--features meshdb`; MeshDB classes import from `@net-mesh/core`.
 Architectural overview:
 [`../README.md#meshdb`](../README.md#meshdb).
 
@@ -1261,7 +1261,7 @@ import {
   InMemoryChainReader,
   MeshQuery,
   MeshQueryRunner,
-} from '@ai2070/net';
+} from '@net-mesh/core';
 
 const reader = new InMemoryChainReader();
 reader.append(0xabn, 1n, Buffer.from('v1'));
@@ -1279,12 +1279,12 @@ console.log(rows[0].seq, Buffer.from(rows[0].payload).toString());
 
 `runner.execute(query)` returns a `Promise<MeshQueryStream>`;
 `.toArray()` drains the stream eagerly, `.next()` pulls one row
-at a time, and the `@ai2070/net/meshdb` re-export installs a
+at a time, and the `@net-mesh/core/meshdb` re-export installs a
 `Symbol.asyncIterator` shim so `for await` works directly:
 
 ```ts
-import '@ai2070/net/meshdb';  // installs the async-iterator shim
-import { MeshQuery, MeshQueryRunner } from '@ai2070/net';
+import '@net-mesh/core/meshdb';  // installs the async-iterator shim
+import { MeshQuery, MeshQueryRunner } from '@net-mesh/core';
 
 const stream = await runner.execute(MeshQuery.between(0xabn, 1n, 10n));
 for await (const row of stream as unknown as AsyncIterable<{ seq: bigint }>) {
@@ -1300,7 +1300,7 @@ import {
   predicateEquals,
   predicateAnd,
   predicateNumericAtLeast,
-} from '@ai2070/net';
+} from '@net-mesh/core';
 
 // Fluent builder (common-ops shortcut).
 const query = MeshQuery.builder()
@@ -1337,7 +1337,7 @@ rows carry postcard-encoded sentinel envelopes — decode via the
 module-level helpers:
 
 ```ts
-import { decodeAggregate, decodeJoined, decodeWindow } from '@ai2070/net';
+import { decodeAggregate, decodeJoined, decodeWindow } from '@net-mesh/core';
 
 const [aggRow] = await (
   await runner.execute(MeshQuery.count(MeshQuery.between(0xabn, 1n, 4n)))
@@ -1368,7 +1368,7 @@ import {
   cachePolicyPermanent,
   cachePolicyTimeBound,
   MeshQueryRunner,
-} from '@ai2070/net';
+} from '@net-mesh/core';
 
 const runner = new MeshQueryRunner(reader, /* enableCache */ true);
 
@@ -1390,7 +1390,7 @@ The SDK doesn't walk the `fork-of:` graph itself — callers supply
 pre-walked entries in walk order:
 
 ```ts
-import { MeshQuery } from '@ai2070/net';
+import { MeshQuery } from '@net-mesh/core';
 
 const query = MeshQuery.lineageEmit(
   0xaan,
@@ -1412,9 +1412,9 @@ executor / invalid argument). The native binding pre-validates
 the AST at construction time, so most errors surface at the
 factory call rather than at `execute`.
 
-> **Note.** The `@ai2070/net-sdk` wrapper doesn't yet re-export
-> the MeshDB surface — import directly from `@ai2070/net` /
-> `@ai2070/net/meshdb`.
+> **Note.** The `@net-mesh/sdk` wrapper doesn't yet re-export
+> the MeshDB surface — import directly from `@net-mesh/core` /
+> `@net-mesh/core/meshdb`.
 
 ## Compute (daemons + migration)
 
@@ -1426,9 +1426,9 @@ when inbound migrations may land. Daemons are plain JS objects
 output `Buffer`s — the runtime wraps each output in a causal link
 automatically.
 
-Build the `@ai2070/net` NAPI module with `--features compute`
+Build the `@net-mesh/core` NAPI module with `--features compute`
 (auto-enabled in the default `local` bundle) to expose the
-surface; everything below is re-exported from `@ai2070/net-sdk`.
+surface; everything below is re-exported from `@net-mesh/sdk`.
 Full design notes:
 [`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../docs/SDK_COMPUTE_SURFACE_PLAN.md).
 
@@ -1436,7 +1436,7 @@ Full design notes:
 import {
   DaemonRuntime, DaemonError, Identity, MeshNode,
   type CausalEvent, type MeshDaemon,
-} from '@ai2070/net-sdk';
+} from '@net-mesh/sdk';
 
 // 1. Build a mesh + runtime.
 const mesh = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk: '42'.repeat(32) });
@@ -1479,7 +1479,7 @@ target's factory for the same `kind` rebuilds the daemon, replays
 any events that arrived during transfer, then activates.
 
 ```typescript
-import { MigrationError } from '@ai2070/net-sdk';
+import { MigrationError } from '@net-mesh/sdk';
 
 try {
   const mig = await rtA.startMigration(handle.originHash, nodeA, nodeB);
@@ -1541,7 +1541,7 @@ crate with `--features groups` (implies `compute`) to expose
 ```typescript
 import {
   DaemonRuntime, ForkGroup, GroupError, ReplicaGroup, StandbyGroup,
-} from '@ai2070/net-sdk';
+} from '@net-mesh/sdk';
 
 const rt = await DaemonRuntime.create(mesh);
 rt.registerFactory('counter', () => new CounterDaemon());
@@ -1585,7 +1585,7 @@ a stable `kind` discriminator parsed from the Rust side's
 `daemon: group: <kind>[: detail]` prefix:
 
 ```typescript
-import { GroupError } from '@ai2070/net-sdk';
+import { GroupError } from '@net-mesh/sdk';
 
 try {
   await ReplicaGroup.spawn(rt, 'never-registered', cfg);
@@ -1655,9 +1655,9 @@ domains): [`../README.md#daemons`](../README.md#daemons).
 
 ## Cargo features
 
-`@ai2070/net-sdk` wraps `@ai2070/net` (the napi-rs binding), so its reachable surface matches whatever Cargo features the underlying `.node` artifact was built with. The five feature flags relevant to building from source:
+`@net-mesh/sdk` wraps `@net-mesh/core` (the napi-rs binding), so its reachable surface matches whatever Cargo features the underlying `.node` artifact was built with. The five feature flags relevant to building from source:
 
-| Feature | What it enables on the underlying `@ai2070/net` binding |
+| Feature | What it enables on the underlying `@net-mesh/core` binding |
 |---|---|
 | `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, `Task`, `Memory`, watch iterators, `RedexError`, `CortexError`, `NetDbError` |
 | `redex-disk` | Disk-backed RedEX persistence — the `persistentDir` ctor option and `persistent: true` on `openFile`. Without it the persistent path rejects with `RedexError`. |
@@ -1667,7 +1667,7 @@ domains): [`../README.md#daemons`](../README.md#daemons).
 
 A `.node` artifact built without a feature silently omits its symbols — there is no build warning. The TypeScript wrapper destructures the napi exports lazily, so a missing feature surfaces as `undefined` at the import site rather than a load-time error.
 
-Enable at build time (rebuild the underlying `@ai2070/net` artifact, then re-link / reinstall in the consumer):
+Enable at build time (rebuild the underlying `@net-mesh/core` artifact, then re-link / reinstall in the consumer):
 
 ```bash
 cd net/crates/net/bindings/node

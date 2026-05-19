@@ -44,7 +44,7 @@ use bytes::Bytes;
 // Error-class prefix contract
 // =========================================================================
 //
-// Stable prefixes the `@ai2070/net/errors` wrapper inspects to re-throw
+// Stable prefixes the `@net-mesh/core/errors` wrapper inspects to re-throw
 // typed `CortexError` / `NetDbError` instances. Keep these strings
 // byte-stable — they are part of the SDK's public contract.
 

@@ -57,7 +57,7 @@ use ::net::adapter::net::MeshNode;
 
 // ============================================================================
 // Stable error prefix — matches the convention in cortex.rs (cortex:,
-// netdb:, redex:). The JS-side wrapper at @ai2070/net/errors
+// netdb:, redex:). The JS-side wrapper at @net-mesh/core/errors
 // inspects this prefix to re-throw typed RpcError instances.
 // ============================================================================
 
@@ -1711,7 +1711,7 @@ mod tests {
 
     /// `nrpc_err_from_inner` produces the documented stable kind
     /// segment for each `RpcError` variant. Pinned because the
-    /// JS-side wrapper at `@ai2070/net/errors` matches on the
+    /// JS-side wrapper at `@net-mesh/core/errors` matches on the
     /// kind segment to throw typed exceptions — silently changing
     /// a kind name would break every TS consumer's catch block.
     #[test]

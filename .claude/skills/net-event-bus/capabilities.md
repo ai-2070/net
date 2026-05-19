@@ -171,7 +171,7 @@ if let Some(node_id) = node.find_best_node(&req) { /* unicast to node_id */ }
 ### TypeScript
 
 ```typescript
-import { MeshNode, normalizeGpuVendor } from '@ai2070/net-sdk';
+import { MeshNode, normalizeGpuVendor } from '@net-mesh/sdk';
 
 const node = await MeshNode.create({ bindAddr: '0.0.0.0:0', psk });
 await node.announceCapabilities({
@@ -303,7 +303,7 @@ To advertise as scoped, add the reserved tag on the announcing side. Rust: `Capa
 ## GPU vendor normalization
 
 ```typescript
-import { normalizeGpuVendor } from '@ai2070/net-sdk';
+import { normalizeGpuVendor } from '@net-mesh/sdk';
 normalizeGpuVendor('NVIDIA');   // 'nvidia'
 normalizeGpuVendor('  AMD  ');  // 'amd' (parser is to-lower; spacing handled at filter-build time)
 normalizeGpuVendor('rocm');     // 'unknown'

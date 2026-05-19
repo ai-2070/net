@@ -238,7 +238,7 @@ Dispatch via string prefix on the NAPI error message. The existing prefix contra
 
 ### Exit criteria
 
-- `@ai2070/net-sdk` exports `NetDb`, `TasksAdapter`, `MemoriesAdapter` with `snapshotAndWatch`.
+- `@net-mesh/sdk` exports `NetDb`, `TasksAdapter`, `MemoriesAdapter` with `snapshotAndWatch`.
 - Integration test: create task → `snapshotAndWatch` → mutate concurrently → assert stream delivers the mutation (the v2 regression test pattern ported to TS).
 - README update matching the Rust SDK's "CortEX / NetDb" section.
 

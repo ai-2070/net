@@ -116,7 +116,7 @@ if !dedup.is_duplicate(&entry.dedup_id) { process(entry); }
 ```
 ```typescript
 // TypeScript
-import { RedisStreamDedup } from '@ai2070/net-sdk';
+import { RedisStreamDedup } from '@net-mesh/sdk';
 const dedup = new RedisStreamDedup(600_000);
 if (!dedup.isDuplicate(entry.message.dedup_id)) await process(entry);
 ```

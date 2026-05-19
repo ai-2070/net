@@ -73,70 +73,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai2070-net"
-version = "0.19.0"
-dependencies = [
- "arc-swap",
- "async-nats",
- "async-trait",
- "base64 0.22.1",
- "blake2",
- "blake3",
- "bytes",
- "chacha20poly1305",
- "clap",
- "criterion",
- "crossbeam-queue",
- "crossbeam-utils",
- "dashmap",
- "ed25519-dalek",
- "fastcdc",
- "futures",
- "getrandom 0.4.2",
- "hex",
- "igd-next",
- "libc",
- "loom",
- "lru 0.18.0",
- "parking_lot 0.12.5",
- "postcard",
- "quanta",
- "rand 0.10.1",
- "redis",
- "reed-solomon-erasure",
- "regex",
- "serde",
- "serde_json",
- "snow",
- "socket2",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tracing",
- "x25519-dalek",
- "xxhash-rust",
-]
-
-[[package]]
-name = "ai2070-net-sdk"
-version = "0.19.0"
-dependencies = [
- "ai2070-net",
- "async-trait",
- "bytes",
- "criterion",
- "futures",
- "hdrhistogram",
- "pin-project-lite",
- "postcard",
- "rand 0.10.1",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
 name = "alloca"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1085,24 +1021,6 @@ name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
-
-[[package]]
-name = "deck"
-version = "0.19.0"
-dependencies = [
- "ai2070-net-sdk",
- "bytes",
- "chrono",
- "color-eyre",
- "crossterm",
- "dirs",
- "futures",
- "parking_lot 0.12.5",
- "ratatui",
- "serde",
- "tokio",
- "toml",
-]
 
 [[package]]
 name = "deltae"
@@ -2336,13 +2254,13 @@ dependencies = [
 name = "net-cli"
 version = "0.19.0"
 dependencies = [
- "ai2070-net-sdk",
  "assert_cmd",
  "clap",
  "comfy-table",
  "dirs",
  "futures",
  "hex",
+ "net-mesh-sdk",
  "predicates",
  "serde",
  "serde_json",
@@ -2360,33 +2278,115 @@ dependencies = [
 name = "net-compute-ffi"
 version = "0.19.0"
 dependencies = [
- "ai2070-net",
- "ai2070-net-sdk",
  "bytes",
  "dashmap",
  "libc",
+ "net-mesh",
+ "net-mesh-sdk",
  "parking_lot 0.12.5",
  "serde_json",
  "tokio",
 ]
 
 [[package]]
+name = "net-deck"
+version = "0.19.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "color-eyre",
+ "crossterm",
+ "dirs",
+ "futures",
+ "net-mesh-sdk",
+ "parking_lot 0.12.5",
+ "ratatui",
+ "serde",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "net-deck-ffi"
 version = "0.19.0"
 dependencies = [
- "ai2070-net",
  "futures",
+ "net-mesh",
  "serde_json",
  "tokio",
  "zeroize",
 ]
 
 [[package]]
+name = "net-mesh"
+version = "0.19.0"
+dependencies = [
+ "arc-swap",
+ "async-nats",
+ "async-trait",
+ "base64 0.22.1",
+ "blake2",
+ "blake3",
+ "bytes",
+ "chacha20poly1305",
+ "clap",
+ "criterion",
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "dashmap",
+ "ed25519-dalek",
+ "fastcdc",
+ "futures",
+ "getrandom 0.4.2",
+ "hex",
+ "igd-next",
+ "libc",
+ "loom",
+ "lru 0.18.0",
+ "parking_lot 0.12.5",
+ "postcard",
+ "quanta",
+ "rand 0.10.1",
+ "redis",
+ "reed-solomon-erasure",
+ "regex",
+ "serde",
+ "serde_json",
+ "snow",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "x25519-dalek",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "net-mesh-sdk"
+version = "0.19.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "criterion",
+ "futures",
+ "hdrhistogram",
+ "net-mesh",
+ "pin-project-lite",
+ "postcard",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "net-meshdb-ffi"
 version = "0.19.0"
 dependencies = [
- "ai2070-net",
  "futures",
+ "net-mesh",
  "postcard",
  "serde_json",
  "tokio",
@@ -2396,8 +2396,8 @@ dependencies = [
 name = "net-meshos-ffi"
 version = "0.19.0"
 dependencies = [
- "ai2070-net",
  "bytes",
+ "net-mesh",
  "serde_json",
  "tokio",
 ]
@@ -2406,8 +2406,6 @@ dependencies = [
 name = "net-node"
 version = "0.19.0"
 dependencies = [
- "ai2070-net",
- "ai2070-net-sdk",
  "arc-swap",
  "async-trait",
  "bytes",
@@ -2417,6 +2415,8 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "net-mesh",
+ "net-mesh-sdk",
  "postcard",
  "serde_json",
  "tokio",
@@ -2428,13 +2428,13 @@ dependencies = [
 name = "net-python"
 version = "0.19.0"
 dependencies = [
- "ai2070-net",
- "ai2070-net-sdk",
  "async-trait",
  "bytes",
  "dashmap",
  "futures",
  "hex",
+ "net-mesh",
+ "net-mesh-sdk",
  "postcard",
  "pyo3",
  "pyo3-build-config",
@@ -2447,11 +2447,11 @@ dependencies = [
 name = "net-rpc-ffi"
 version = "0.19.0"
 dependencies = [
- "ai2070-net",
  "async-trait",
  "bytes",
  "futures",
  "libc",
+ "net-mesh",
  "parking_lot 0.12.5",
  "tokio",
 ]

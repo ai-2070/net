@@ -1,10 +1,10 @@
 /**
  * MeshDB SDK wrapper.
  *
- * Re-exports the MeshDB query layer from `@ai2070/net` (the napi
- * binding) so `@ai2070/net-sdk` consumers can stay on the
+ * Re-exports the MeshDB query layer from `@net-mesh/core` (the napi
+ * binding) so `@net-mesh/sdk` consumers can stay on the
  * ergonomic SDK module instead of dropping into the napi package.
- * Also imports the AsyncIterable shim from `@ai2070/net/meshdb`
+ * Also imports the AsyncIterable shim from `@net-mesh/core/meshdb`
  * once, so `for await (const row of stream)` works without the
  * consumer having to remember the side-effect import.
  *
@@ -15,7 +15,7 @@
  *   MeshQuery,
  *   MeshQueryRunner,
  *   QueryBuilder,
- * } from '@ai2070/net-sdk/meshdb';
+ * } from '@net-mesh/sdk/meshdb';
  *
  * const reader = new InMemoryChainReader();
  * // …populate reader…
@@ -47,7 +47,7 @@ export interface ParsedMeshDbError {
  * envelope is absent (forward-compatibility — unknown error shapes
  * pass through unchanged).
  *
- * Mirrors the napi-side helper at `@ai2070/net/meshdb` so consumers
+ * Mirrors the napi-side helper at `@net-mesh/core/meshdb` so consumers
  * don't have to reach across packages for the parser.
  */
 export function parseMeshDbErrorKind(raw: string): ParsedMeshDbError | null {
@@ -63,14 +63,14 @@ export function parseMeshDbErrorKind(raw: string): ParsedMeshDbError | null {
 
 /**
  * Note on AsyncIterable: the napi-side `MeshQueryStream` ships with a
- * separate side-effect module (`@ai2070/net/meshdb`) that augments
+ * separate side-effect module (`@net-mesh/core/meshdb`) that augments
  * the prototype with `[Symbol.asyncIterator]`. To use
  * `for await (const row of stream)` syntax, import it once at
  * startup:
  *
  * ```typescript
- * import '@ai2070/net/meshdb';
- * import { MeshQueryRunner } from '@ai2070/net-sdk/meshdb';
+ * import '@net-mesh/core/meshdb';
+ * import { MeshQueryRunner } from '@net-mesh/sdk/meshdb';
  * ```
  *
  * Without the side-effect import the stream still works via the
@@ -85,7 +85,7 @@ export {
   MeshQueryRunner,
   MeshQueryStream,
   QueryBuilder,
-} from '@ai2070/net';
+} from '@net-mesh/core';
 
 // Interface / type re-exports — wire shapes the napi emits / consumes.
 // `Predicate` is re-exported as `MeshDbPredicate` to disambiguate from
@@ -100,7 +100,7 @@ export type {
   Predicate as MeshDbPredicate,
   ResultRow,
   WindowBoundary,
-} from '@ai2070/net';
+} from '@net-mesh/core';
 
 /**
  * Disposable-friendly wrapper around `MeshQueryRunner` for callers
@@ -120,10 +120,10 @@ export class DisposableMeshQueryRunner {
   // Lazily-typed because the napi runner has no exported instance shape
   // we can name without importing the value (and the value import is
   // already covered above).
-  readonly runner: import('@ai2070/net').MeshQueryRunner;
+  readonly runner: import('@net-mesh/core').MeshQueryRunner;
 
-  constructor(reader: import('@ai2070/net').InMemoryChainReader) {
-    const Runner = require('@ai2070/net').MeshQueryRunner;
+  constructor(reader: import('@net-mesh/core').InMemoryChainReader) {
+    const Runner = require('@net-mesh/core').MeshQueryRunner;
     this.runner = new Runner(reader);
   }
 

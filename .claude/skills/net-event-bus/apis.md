@@ -1,6 +1,6 @@
 # Net SDK API Reference
 
-Verified against `net-sdk` v0.19.0 (Rust) / `@ai2070/net-sdk` ≥ 0.19.0 peer (TS) / `net-sdk` Python (current `main`). Last full pass: 2026-04-25. SdkError variant set re-verified 2026-05-02 after the `bugfixes-8` `Sampled` / `Unrouted` additions.
+Verified against `net-sdk` v0.19.0 (Rust) / `@net-mesh/sdk` ≥ 0.19.0 peer (TS) / `net-sdk` Python (current `main`). Last full pass: 2026-04-25. SdkError variant set re-verified 2026-05-02 after the `bugfixes-8` `Sampled` / `Unrouted` additions.
 
 **Drift check before trusting these signatures:**
 ```bash
@@ -41,14 +41,14 @@ If the user wants request/response (typed call → typed reply): **stop reading 
 
 ---
 
-## TypeScript (`@ai2070/net-sdk`)
+## TypeScript (`@net-mesh/sdk`)
 
 ```bash
-npm install @ai2070/net-sdk @ai2070/net
+npm install @net-mesh/sdk @net-mesh/core
 ```
 
 ```typescript
-import { NetNode } from '@ai2070/net-sdk';
+import { NetNode } from '@net-mesh/sdk';
 
 interface TempReading { sensor_id: string; celsius: number }
 

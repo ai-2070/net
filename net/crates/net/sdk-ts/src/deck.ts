@@ -1,7 +1,7 @@
 /**
  * Deck SDK — operator-side TypeScript wrapper.
  *
- * Sits on top of the napi-rs binding at `@ai2070/net`. Adds:
+ * Sits on top of the napi-rs binding at `@net-mesh/core`. Adds:
  *
  * - {@link DeckSdkError} typed Error subclass that parses the
  *   substrate `<<deck-sdk-kind:KIND>>MSG` envelope.
@@ -16,8 +16,8 @@
  *
  * @example
  * ```ts
- * import { MeshOsDaemonSdk } from '@ai2070/net-sdk/meshos';
- * import { DeckClient, OperatorIdentity } from '@ai2070/net-sdk/deck';
+ * import { MeshOsDaemonSdk } from '@net-mesh/sdk/meshos';
+ * import { DeckClient, OperatorIdentity } from '@net-mesh/sdk/deck';
  *
  * const sdk = await MeshOsDaemonSdk.start();
  * const identity = OperatorIdentity.generate();
@@ -59,7 +59,7 @@ import {
   type MeshOsConfigJs,
   type OperatorSignatureJs,
   type StatusSummaryJs,
-} from '@ai2070/net';
+} from '@net-mesh/core';
 
 import { MeshOsDaemonSdk, type MeshOsConfig } from './meshos.js';
 

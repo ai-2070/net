@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// Top-level config file shape. The `default` table is the
 /// implicit profile when `--profile` is omitted; `profiles.*`
 /// adds named profiles selectable via `--profile` /
-/// `$NET_PROFILE`.
+/// `$NET_MESH_PROFILE`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
     #[serde(default)]
@@ -94,11 +94,11 @@ impl ConfigFile {
     }
 }
 
-/// `$XDG_CONFIG_HOME/net/config.toml` — used when `--config` is
-/// absent. Returns `None` if dirs can't resolve a config home
+/// `$XDG_CONFIG_HOME/net-mesh/config.toml` — used when `--config`
+/// is absent. Returns `None` if dirs can't resolve a config home
 /// (e.g. in restricted CI environments without `$HOME`).
 pub fn default_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("net").join("config.toml"))
+    dirs::config_dir().map(|d| d.join("net-mesh").join("config.toml"))
 }
 
 #[derive(Debug, thiserror::Error)]

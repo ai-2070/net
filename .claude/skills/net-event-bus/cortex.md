@@ -125,7 +125,7 @@ tasks.close()
 ## Node
 
 ```ts
-import { Redex, Tasks, TaskStatus } from '@ai2070/net';
+import { Redex, Tasks, TaskStatus } from '@net-mesh/core';
 
 const redex = new Redex({ persistentDir: '/var/lib/net/redex' });
 const tasks = await Tasks.open(redex, {
@@ -245,7 +245,7 @@ let db = NetDb::builder(Redex::new()).origin(origin_hash).with_tasks().with_memo
 - `NetDbBuilder::build` is failure-atomic: if the second adapter open fails after the first succeeded, the first is closed before the error propagates so no orphan fold task outlives the failed build.
 - `db.snapshot()` walks every enabled model under its own state lock (consistent **per-model**; no cross-model consistency guarantee — each model backs a separate RedEX file).
 - `NetDbSnapshot::encode()` produces a single postcard blob; `decode()` round-trips; `build_from_snapshot(&bundle)` restores every enabled model in one call. Models enabled via `with_*()` whose bundle entry is `None` are opened from scratch.
-- Same surface on Rust, Node (`@ai2070/net` napi), and Python (`net._net` PyO3). Postcard is stable across the FFI boundary.
+- Same surface on Rust, Node (`@net-mesh/core` napi), and Python (`net._net` PyO3). Postcard is stable across the FFI boundary.
 
 ---
 

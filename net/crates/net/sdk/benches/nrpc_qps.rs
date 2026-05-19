@@ -16,7 +16,7 @@
 //! transport hot path under saturation, not the capability index.
 //!
 //! Run with:
-//!   cargo bench --bench nrpc_qps --features net,cortex -p ai2070-net-sdk
+//!   cargo bench --bench nrpc_qps --features net,cortex -p net-mesh-sdk
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use futures::stream::{FuturesUnordered, StreamExt};

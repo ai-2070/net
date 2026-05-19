@@ -7,24 +7,24 @@ The core `net` crate is the engine. This SDK is what Rust developers import.
 ## Install
 
 ```bash
-cargo add ai2070-net-sdk
+cargo add net-mesh-sdk
 ```
 
 Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai2070-net-sdk = "0.19.0"
+net-mesh-sdk = "0.19.0"
 ```
 
-The crate publishes as `ai2070-net-sdk` on crates.io but imports as `use net_sdk::...` (the in-source crate name is preserved via package aliasing).
+The crate publishes as `net-mesh-sdk` on crates.io but imports as `use net_sdk::...` (the in-source crate name is preserved via package aliasing).
 
 Features: `redis`, `jetstream`, `net` (mesh transport), `nat-traversal` (classifier + `connect_direct`, opt-in), `port-mapping` (NAT-PMP + UPnP, opt-in), `cortex` (event-sourced tasks/memories + NetDb), `compute` (daemons + migration), `groups` (replica / fork / standby), `meshos` (cluster-behavior engine + daemon supervision SDK; implies `compute`), `deck` (operator command surface; implies `meshos`), `local` (bundles `net` + `cortex` + `compute` + `groups`), `full` (bundles `local` + `redis` + `jetstream` + `meshos` + `deck`). NAT features stay opt-in — they are *not* pulled in by `full`.
 
 ```bash
-cargo add ai2070-net-sdk --features full        # everything bundled
-cargo add ai2070-net-sdk --features local       # mesh + storage, no external transports
-cargo add ai2070-net-sdk --features net,redis   # mesh + Redis Streams adapter
+cargo add net-mesh-sdk --features full        # everything bundled
+cargo add net-mesh-sdk --features local       # mesh + storage, no external transports
+cargo add net-mesh-sdk --features net,redis   # mesh + Redis Streams adapter
 ```
 
 ## Quick Start
@@ -529,9 +529,9 @@ let _report = PredicateDebugReport::from_evaluations(&p, corpus);
 ```
 
 For host-side placement-filter callbacks, implement
-[`PlacementFilter`](https://docs.rs/ai2070-net-sdk/latest/net_sdk/capabilities/trait.PlacementFilter.html)
+[`PlacementFilter`](https://docs.rs/net-mesh-sdk/latest/net_sdk/capabilities/trait.PlacementFilter.html)
 directly and register the impl with
-[`global_placement_filter_registry()`](https://docs.rs/ai2070-net-sdk/latest/net_sdk/capabilities/fn.global_placement_filter_registry.html);
+[`global_placement_filter_registry()`](https://docs.rs/net-mesh-sdk/latest/net_sdk/capabilities/fn.global_placement_filter_registry.html);
 the TS / Python / Go bindings auto-wrap closures via
 `placement_filter_from_fn` for the same registry.
 
@@ -908,7 +908,7 @@ cadence; per-append work is unchanged.
 
 Dataforts is the compositional data plane on top of RedEX / CortEX /
 capability-index / proximity-graph. Enable the `dataforts` feature
-on the underlying `ai2070-net` crate (the SDK is a thin wrapper —
+on the underlying `net-mesh` crate (the SDK is a thin wrapper —
 Dataforts surfaces are consumed via `net::adapter::net::dataforts::*`
 and `Redex::enable_greedy_dataforts` / `Redex::enable_gravity_for_greedy`
 on the `Redex` handle). Four phases:
@@ -1225,7 +1225,7 @@ compat test — lives in [`../README.md#nrpc`](../README.md#nrpc).
 
 ## MeshDB (federated query layer)
 
-MeshDB is the typed query layer above the RedEX / CortEX / capability-index substrate. Enable the `meshdb` feature on `ai2070-net` and import the operators + executor directly from
+MeshDB is the typed query layer above the RedEX / CortEX / capability-index substrate. Enable the `meshdb` feature on `net-mesh` and import the operators + executor directly from
 `net::adapter::net::behavior::meshdb`. Architectural overview: [`../README.md#meshdb`](../README.md#meshdb).
 
 ### Local executor

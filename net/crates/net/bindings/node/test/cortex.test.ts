@@ -19,7 +19,7 @@ import {
 
 // Five-line helper turning the napi iterator into a JS async iterable.
 // Users can paste this into their own code, or we can publish it as
-// part of a companion `@ai2070/net-cortex` package later.
+// part of a companion `@net-mesh/core-cortex` package later.
 async function* toAsyncIterable<T>(
   iter: { next(): Promise<T[] | null> },
 ): AsyncGenerator<T[]> {

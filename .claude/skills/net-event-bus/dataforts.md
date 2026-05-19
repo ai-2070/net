@@ -200,7 +200,7 @@ payload = blob_resolve(blob_ref)
 ```
 
 ```ts
-import { registerFilesystemBlobAdapter, blobPublish, blobResolve } from '@ai2070/net';
+import { registerFilesystemBlobAdapter, blobPublish, blobResolve } from '@net-mesh/core';
 
 registerFilesystemBlobAdapter('local', '/var/blobs');
 const blobRef = await blobPublish('local', 'local://obj/payload-1', largePayload);

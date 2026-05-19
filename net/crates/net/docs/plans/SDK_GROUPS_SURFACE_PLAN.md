@@ -294,7 +294,7 @@ TS `GroupError extends DaemonError` with `kind: GroupErrorKind` + `detail?: stri
 ### Exit criteria (Stage 2)
 
 - All TS tests pass.
-- `GroupError`, `GroupHealth`, `MemberInfo`, `MemberRole`, `ForkRecord`, `RequestContext` exported from `@ai2070/net-sdk`.
+- `GroupError`, `GroupHealth`, `MemberInfo`, `MemberRole`, `ForkRecord`, `RequestContext` exported from `@net-mesh/sdk`.
 - Distribution test on ReplicaGroup confirms load-balanced routing.
 
 ---
@@ -404,7 +404,7 @@ int  net_compute_replica_group_scale_to(g, n, err_out);
 
 5. **Factory vs. explicit-instance spawn.** For `DaemonRuntime.Spawn`, we support both (`spawn` takes an instance; `spawn_with_daemon` is internal). Should groups? The argument for instance-based is type-symmetry with spawn; the argument for kind-based is that groups spawn N members, so "bring your own instance" only works for the first one. **Recommendation: kind-based only.** Groups need a factory by definition.
 
-6. **Shipping in release workflows.** Not blocking Stage 1–4, but open: eventually we'll want the publish workflows to build with `groups` + `compute` + `net` for at least one Linux target so downstream users can `pip install net` / `npm install @ai2070/net` and get the group surface. Right now only `redis` ships.
+6. **Shipping in release workflows.** Not blocking Stage 1–4, but open: eventually we'll want the publish workflows to build with `groups` + `compute` + `net` for at least one Linux target so downstream users can `pip install net` / `npm install @net-mesh/core` and get the group surface. Right now only `redis` ships.
 
 ---
 

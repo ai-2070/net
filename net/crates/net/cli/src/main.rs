@@ -41,11 +41,11 @@ use crate::output::OutputFormat;
 /// Global argv shape — applies to every subcommand.
 #[derive(Parser, Debug)]
 #[command(
-    name = "net",
-    bin_name = "net",
+    name = "net-mesh",
+    bin_name = "net-mesh",
     version,
     about = "Unified command-line interface for the Net mesh.",
-    long_about = "Net is the operational counterpart to Deck — \
+    long_about = "net-mesh is the operational counterpart to net-deck — \
                   a non-interactive command-line tool that wraps \
                   the Rust SDK for one-shot operator commands, CI \
                   scripting, daemon authoring, and ad-hoc cluster \
@@ -53,12 +53,17 @@ use crate::output::OutputFormat;
                   surface."
 )]
 struct Cli {
-    /// Profile file path. Defaults to `$XDG_CONFIG_HOME/net/config.toml`.
-    #[arg(long, global = true, env = "NET_CONFIG")]
+    /// Profile file path. Defaults to `$XDG_CONFIG_HOME/net-mesh/config.toml`.
+    #[arg(long, global = true, env = "NET_MESH_CONFIG")]
     config: Option<PathBuf>,
 
     /// Named profile within the config file.
-    #[arg(long, global = true, env = "NET_PROFILE", default_value = "default")]
+    #[arg(
+        long,
+        global = true,
+        env = "NET_MESH_PROFILE",
+        default_value = "default"
+    )]
     profile: String,
 
     /// Output format. Auto-detects `table`/`text` for TTY stdout
@@ -172,7 +177,7 @@ async fn main() -> ExitCode {
         Err(e) => {
             // Print the kind + message to stderr; the exit code
             // carries the discriminator for scripting consumers.
-            eprintln!("net: {}", e);
+            eprintln!("net-mesh: {}", e);
             ExitCode::from(e.code())
         }
     }
@@ -223,7 +228,7 @@ fn install_tracing(verbose: u8, quiet: bool) {
         }
     };
 
-    let filter = EnvFilter::try_from_env("NET_LOG")
+    let filter = EnvFilter::try_from_env("NET_MESH_LOG")
         .unwrap_or_else(|_| EnvFilter::new(format!("net={level},net_sdk={level}")));
 
     let _ = fmt()

@@ -1,8 +1,8 @@
 // CR-3: regression tests for the `RedisStreamDedup` re-export from
-// `@ai2070/net-sdk`. Pre-fix the class was registered in the NAPI
-// module (`@ai2070/net`) but `sdk-ts/src/index.ts` never re-exported
+// `@net-mesh/sdk`. Pre-fix the class was registered in the NAPI
+// module (`@net-mesh/core`) but `sdk-ts/src/index.ts` never re-exported
 // it, so users following the README's `import { RedisStreamDedup }
-// from '@ai2070/net-sdk'` pattern hit a runtime undefined.
+// from '@net-mesh/sdk'` pattern hit a runtime undefined.
 //
 // These tests are tiny smoke tests — the underlying LRU semantics
 // are pinned in the Rust unit tests (`adapter::redis_dedup::tests`)
@@ -15,7 +15,7 @@ import { describe, expect, it } from 'vitest';
 import { RedisStreamDedup } from '../src';
 
 describe('RedisStreamDedup re-export (CR-3)', () => {
-  it('is exported as a constructable class from @ai2070/net-sdk', () => {
+  it('is exported as a constructable class from @net-mesh/sdk', () => {
     expect(typeof RedisStreamDedup).toBe('function');
   });
 

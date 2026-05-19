@@ -10,7 +10,7 @@
  *
  * @example
  * ```ts
- * import { MeshNode } from '@ai2070/net-sdk';
+ * import { MeshNode } from '@net-mesh/sdk';
  *
  * await node.announceCapabilities({
  *   hardware: {
@@ -182,7 +182,7 @@ export interface CapabilityFilter {
 // ----------------------------------------------------------------------------
 // Conversion helpers — bridge TS interfaces ↔ NAPI POJOs. These are
 // exported so the mesh wrapper can consume them without TS having to
-// import from @ai2070/net directly.
+// import from @net-mesh/core directly.
 // ----------------------------------------------------------------------------
 
 interface NapiGpuInfo {

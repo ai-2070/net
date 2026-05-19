@@ -151,7 +151,7 @@ impl RpcStream {
 
 **Resilience helpers:** mirror the Rust `Mesh::call_with_retry` shape. Take `RetryPolicy` / `HedgePolicy` / `CircuitBreaker` as `#[napi(object)]` config objects.
 
-**Error throws:** `napi::Error::from_reason(format!("nrpc:{kind}: ..."))`. JS-side `@ai2070/net-sdk/errors` adds an `RpcError` class hierarchy that re-throws on the prefix (matches the existing pattern at `bindings/node/src/cortex.rs:47-64`).
+**Error throws:** `napi::Error::from_reason(format!("nrpc:{kind}: ..."))`. JS-side `@net-mesh/sdk/errors` adds an `RpcError` class hierarchy that re-throws on the prefix (matches the existing pattern at `bindings/node/src/cortex.rs:47-64`).
 
 **Estimated work:** ~800-1200 LoC binding + ~300 LoC TypeScript wrapper + tests.
 

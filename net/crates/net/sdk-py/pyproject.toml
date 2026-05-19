@@ -6,12 +6,12 @@ build-backend = "setuptools.build_meta"
 # PyPI distribution name. The runtime import path stays
 # `net_sdk` (the package directory under `src/` is unchanged) so
 # user code keeps `import net_sdk` working.
-name = "ai2070-net-sdk"
+name = "net-mesh-sdk"
 version = "0.19.0"
 description = "Ergonomic Python SDK for the Net mesh network"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
-dependencies = ["ai2070-net>=0.19.0"]
+dependencies = ["net-mesh>=0.19.0"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

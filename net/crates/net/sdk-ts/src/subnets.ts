@@ -10,7 +10,7 @@
  *
  * @example
  * ```ts
- * import { MeshNode } from '@ai2070/net-sdk';
+ * import { MeshNode } from '@net-mesh/sdk';
  *
  * const policy = {
  *   rules: [

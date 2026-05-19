@@ -280,7 +280,7 @@ export type Predicate =
  *
  * @example
  * ```ts
- * import { p, predicateToWire } from '@ai2070/net-sdk';
+ * import { p, predicateToWire } from '@net-mesh/sdk';
  *
  * const pred = p.and(
  *   p.exists({ axis: 'hardware', key: 'gpu' }),
@@ -583,7 +583,7 @@ export function predicateFromRpcHeader(value: string): Predicate {
  *
  * @example
  * ```ts
- * import { p, tagKey, whereHeader } from '@ai2070/net-sdk';
+ * import { p, tagKey, whereHeader } from '@net-mesh/sdk';
  * const pred = p.exists(tagKey('hardware', 'gpu'));
  * await rpc.call(targetNodeId, 'filter-svc', body, {
  *   requestHeaders: [whereHeader(pred)],

@@ -8,8 +8,8 @@
 //
 // Usage:
 //
-//   import "@ai2070/net/meshdb";  // augments MeshQueryStream
-//   import { MeshQuery, MeshQueryRunner } from "@ai2070/net";
+//   import "@net-mesh/core/meshdb";  // augments MeshQueryStream
+//   import { MeshQuery, MeshQueryRunner } from "@net-mesh/core";
 //
 //   const runner = new MeshQueryRunner(reader);
 //   const stream = await runner.execute(MeshQuery.latest(0xABn));
@@ -89,9 +89,9 @@ if (
 // the typed classes from here — going through `native as
 // Record<string, unknown>` would downgrade them to `unknown`,
 // silently weakening callers that imported them from
-// `@ai2070/net/meshdb` versus `@ai2070/net`. Use the typed
-// re-exports from `@ai2070/net` instead; this module only
-// needs `import "@ai2070/net/meshdb"` for the iterator shim.
+// `@net-mesh/core/meshdb` versus `@net-mesh/core`. Use the typed
+// re-exports from `@net-mesh/core` instead; this module only
+// needs `import "@net-mesh/core/meshdb"` for the iterator shim.
 
 /**
  * Result of {@link parseMeshDbErrorKind}: extracted structured

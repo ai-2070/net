@@ -135,7 +135,7 @@ let task = tokio::spawn(async move {
 
 ### TypeScript / Node
 
-The native binding (`@ai2070/net`) runs work on its own threadpool (napi-rs). The Node event loop is not blocked by `emit` or `subscribe`. Async iterators yield to the event loop normally between events.
+The native binding (`@net-mesh/core`) runs work on its own threadpool (napi-rs). The Node event loop is not blocked by `emit` or `subscribe`. Async iterators yield to the event loop normally between events.
 
 If you're inside a request handler (Express, Fastify, Hono), `emit` is sync and fast — call it directly. `subscribe` should be set up at app startup, not per-request, or you'll create one subscription per HTTP request.
 

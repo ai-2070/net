@@ -1,11 +1,11 @@
-# @ai2070/net
+# @net-mesh/core
 
 napi-rs binding to the `libnet` cdylib — the Node-facing surface for the Net mesh, RedEX, CortEX, NetDB, MeshDB, and MeshOS.
 
 ## Install
 
 ```bash
-npm install @ai2070/net
+npm install @net-mesh/core
 ```
 
 The package publishes pre-built `.node` artifacts for every platform listed in `package.json -> napi.targets`. Pulling the package from npm requires no Rust toolchain.

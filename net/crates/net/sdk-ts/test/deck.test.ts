@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const napi = require('@ai2070/net') as { DeckClient?: { new?: unknown } };
+const napi = require('@net-mesh/core') as { DeckClient?: { new?: unknown } };
 import { DeckClient } from '../src/deck';
 
 // The napi binding exposes `DeckClient.new` only when the

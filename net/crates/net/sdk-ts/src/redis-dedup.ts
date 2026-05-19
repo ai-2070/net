@@ -1,6 +1,6 @@
 /**
  * Redis Streams consumer-side dedup helper — re-export of the NAPI
- * class from `@ai2070/net`.
+ * class from `@net-mesh/core`.
  *
  * The Redis adapter writes a stable `dedup_id` field on every XADD
  * entry — see the producer-side contract in `sdk-ts/README.md`.
@@ -9,12 +9,12 @@
  * size to roughly `events_per_sec * dedup_window_seconds`.
  *
  * This shim re-exports the underlying NAPI class so users can
- * `import { RedisStreamDedup } from '@ai2070/net-sdk'` directly
- * instead of reaching into `@ai2070/net`.
+ * `import { RedisStreamDedup } from '@net-mesh/sdk'` directly
+ * instead of reaching into `@net-mesh/core`.
  *
  * @example
  * ```typescript
- * import { RedisStreamDedup } from '@ai2070/net-sdk';
+ * import { RedisStreamDedup } from '@net-mesh/sdk';
  * import { createClient } from 'redis';
  *
  * // Sizing: ~10k events/sec * 1 min dedup window → ~600,000.
@@ -46,4 +46,4 @@
  * @packageDocumentation
  */
 
-export { RedisStreamDedup } from '@ai2070/net';
+export { RedisStreamDedup } from '@net-mesh/core';

@@ -1,7 +1,7 @@
 name: Release Python SDK
 
-# Publishes `ai2070-net-sdk` (the pure-Python SDK at `sdk-py/`) to
-# PyPI. The PyO3 binding wheels for `ai2070-net` ship via
+# Publishes `net-mesh-sdk` (the pure-Python SDK at `sdk-py/`) to
+# PyPI. The PyO3 binding wheels for `net-mesh` ship via
 # `release-python.yml`; this is the higher-level setuptools
 # package on top.
 #
@@ -11,7 +11,7 @@ name: Release Python SDK
 # environment + `id-token: write` permission combination below.
 # Configure on PyPI under Account → Publishing → Add a new
 # pending publisher with:
-#   - PyPI project name: ai2070-net-sdk
+#   - PyPI project name: net-mesh-sdk
 #   - Owner: ai-2070
 #   - Repository: cyberdeck
 #   - Workflow: release-pypi-sdk.yml

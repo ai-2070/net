@@ -68,7 +68,7 @@ opt-in is a nested `replication` field on the channel config; the
 operator surface (`enable_replication`, `replication_prometheus_text`)
 is exposed as methods on the binding's `Redex` handle.
 
-- **Node** (`@ai2070/net`):
+- **Node** (`@net-mesh/core`):
   ```ts
   redex.enableReplication(mesh);
   await redex.openFile("my/channel", {

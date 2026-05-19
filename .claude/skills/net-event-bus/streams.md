@@ -69,7 +69,7 @@ let stream = mesh.open_stream(
 ### TypeScript
 
 ```typescript
-import { MeshNode } from '@ai2070/net-sdk';
+import { MeshNode } from '@net-mesh/sdk';
 
 const mesh = await MeshNode.create({ bindAddr: '0.0.0.0:9000', psk });
 await mesh.connect('203.0.113.10:9000', peerPubkey, peerNodeId);
@@ -147,7 +147,7 @@ mesh.send_blocking(&stream, &payloads).await?;
 ### TypeScript
 
 ```typescript
-import { BackpressureError, NotConnectedError } from '@ai2070/net-sdk';
+import { BackpressureError, NotConnectedError } from '@net-mesh/sdk';
 
 const payloads = [Buffer.from(jsonA), Buffer.from(jsonB)];
 try {
@@ -216,7 +216,7 @@ loop {
 
 ### TypeScript / Python — high-level SDK gap
 
-The high-level `MeshNode` wrappers in `@ai2070/net-sdk` and `net_sdk` (Python) **do not currently expose a per-shard receive API**. The TS SDK's `MeshNode` class (`sdk-ts/src/mesh.ts`) has no `recv` / `recvShard` method; the Python SDK's `MeshNode` class (`sdk-py/src/net_sdk/mesh.py`) has no `recv` / `poll` method.
+The high-level `MeshNode` wrappers in `@net-mesh/sdk` and `net_sdk` (Python) **do not currently expose a per-shard receive API**. The TS SDK's `MeshNode` class (`sdk-ts/src/mesh.ts`) has no `recv` / `recvShard` method; the Python SDK's `MeshNode` class (`sdk-py/src/net_sdk/mesh.py`) has no `recv` / `poll` method.
 
 If you need to receive on a stream from TS or Python today, drop to the underlying napi / PyO3 binding:
 

@@ -14,23 +14,23 @@ const INSTALL_CARDS: readonly InstallCard[] = [
   {
     lang: "Rust",
     ext: ".rs",
-    cmd: "$ cargo add ai2070-net-sdk",
-    copy: "cargo add ai2070-net-sdk",
-    meta: "crate: ai2070-net-sdk",
+    cmd: "$ cargo add net-mesh-sdk",
+    copy: "cargo add net-mesh-sdk",
+    meta: "crate: net-mesh-sdk",
   },
   {
     lang: "TypeScript",
     ext: ".ts",
-    cmd: "$ npm i @ai2070/net-sdk\n       @ai2070/net",
-    copy: "npm i @ai2070/net-sdk @ai2070/net",
+    cmd: "$ npm i @net-mesh/sdk\n       @net-mesh/core",
+    copy: "npm i @net-mesh/sdk @net-mesh/core",
     meta: "scope: @ai2070",
   },
   {
     lang: "Python",
     ext: ".py",
-    cmd: "$ pip install ai2070-net-sdk",
-    copy: "pip install ai2070-net-sdk",
-    meta: "dist: ai2070-net-sdk",
+    cmd: "$ pip install net-mesh-sdk",
+    copy: "pip install net-mesh-sdk",
+    meta: "dist: net-mesh-sdk",
   },
   {
     lang: "Go",
@@ -139,9 +139,9 @@ export function InstallSection() {
           ) : null}
         </span>
         . Lower-level bindings (skip SDK ergonomics, talk directly to the
-        engine): <span className="text-accent">ai2070-net</span>,{" "}
-        <span className="text-accent">@ai2070/net</span>,{" "}
-        <span className="text-accent">ai2070-net</span> (PyPI binding).
+        engine): <span className="text-accent">net-mesh</span>,{" "}
+        <span className="text-accent">@net-mesh/core</span>,{" "}
+        <span className="text-accent">net-mesh</span> (PyPI binding).
       </p>
     </section>
   );

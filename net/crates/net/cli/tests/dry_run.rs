@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::process::{Command, Stdio};
 
 fn json_stdout(args: &[&str]) -> Value {
-    let out = Command::cargo_bin("net")
+    let out = Command::cargo_bin("net-mesh")
         .unwrap()
         .args(args)
         .stdin(Stdio::null())

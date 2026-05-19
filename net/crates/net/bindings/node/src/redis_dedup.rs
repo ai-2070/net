@@ -7,15 +7,15 @@
 //! seen ids.
 //!
 //! Wire shape from the JS side. Users can import either from
-//! `@ai2070/net` (the NAPI module directly) or from
-//! `@ai2070/net-sdk` (which re-exports the same class via
+//! `@net-mesh/core` (the NAPI module directly) or from
+//! `@net-mesh/sdk` (which re-exports the same class via
 //! `sdk-ts/src/redis-dedup.ts`):
 //!
 //! ```js
 //! // From the NAPI module directly:
-//! const { RedisStreamDedup } = require('@ai2070/net');
+//! const { RedisStreamDedup } = require('@net-mesh/core');
 //! // Or via the TS SDK package:
-//! const { RedisStreamDedup } = require('@ai2070/net-sdk');
+//! const { RedisStreamDedup } = require('@net-mesh/sdk');
 //!
 //! // Default capacity (4096).
 //! const dedup = new RedisStreamDedup();

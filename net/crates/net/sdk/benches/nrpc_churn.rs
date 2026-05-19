@@ -25,7 +25,7 @@
 //! stays well under any reasonable ephemeral-port range.
 //!
 //! Run with:
-//!   cargo bench --bench nrpc_churn --features net,cortex -p ai2070-net-sdk
+//!   cargo bench --bench nrpc_churn --features net,cortex -p net-mesh-sdk
 
 use std::time::{Duration, Instant};
 
