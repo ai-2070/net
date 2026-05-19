@@ -1351,6 +1351,32 @@ impl StreamingObserverState {
     }
 }
 
+/// Per-call cap on in-flight request-direction credits. Tokio's
+/// `Semaphore::MAX_PERMITS` is `usize::MAX >> 3`; we cap the
+/// caller-side accumulator at this value so a misbehaving server
+/// can't make the caller hold an unbounded outstanding window.
+/// 1M credits is already orders of magnitude beyond any sane
+/// request burst — a caller sitting on 1M unconsumed credits is
+/// either misconfigured or under attack.
+const REQUEST_GRANT_PER_CALL_CAP: usize = 1_000_000;
+
+/// Add `credits` to a caller-side request-direction credit
+/// semaphore, capped so the accumulator never exceeds
+/// [`REQUEST_GRANT_PER_CALL_CAP`]. Per-frame cap of `usize::MAX >> 4`
+/// remains as a second line of defense against pathological frame
+/// values.
+fn add_request_grant_credits(sem: &tokio::sync::Semaphore, credits: u32) {
+    if credits == 0 {
+        return;
+    }
+    let current = sem.available_permits();
+    let remaining = REQUEST_GRANT_PER_CALL_CAP.saturating_sub(current);
+    let safe = (credits as usize).min(usize::MAX >> 4).min(remaining);
+    if safe > 0 {
+        sem.add_permits(safe);
+    }
+}
+
 /// Build a coalescing REQUEST_GRANT emitter.
 ///
 /// Naive emitters `tokio::spawn` one publish task per consumed
@@ -1885,16 +1911,7 @@ impl MeshNode {
             let sem = Arc::clone(sem);
             tokio::spawn(async move {
                 while let Some(credits) = grant_rx.recv().await {
-                    if credits == 0 {
-                        continue;
-                    }
-                    // Same defensive cap as the response-side
-                    // STREAM_GRANT handling: tokio's Semaphore caps
-                    // at MAX_PERMITS = usize::MAX >> 3; clamp
-                    // incoming grants to >>4 so a misbehaving
-                    // server can't saturate.
-                    let safe = (credits as usize).min(usize::MAX >> 4);
-                    sem.add_permits(safe);
+                    add_request_grant_credits(&sem, credits);
                 }
             })
         });
@@ -2106,11 +2123,7 @@ impl MeshNode {
             let sem = Arc::clone(sem);
             tokio::spawn(async move {
                 while let Some(credits) = grant_rx.recv().await {
-                    if credits == 0 {
-                        continue;
-                    }
-                    let safe = (credits as usize).min(usize::MAX >> 4);
-                    sem.add_permits(safe);
+                    add_request_grant_credits(&sem, credits);
                 }
             })
         });
