@@ -1,0 +1,19 @@
+net/crates/net/sdk/benches/nrpc_duplex.rs
+  s_906a82c67213dc::t_4aa74f8af653aa 74-78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "e4cf19c2c49a5a270647d48be3f60aee214bab96",
+  "prompts": {},
+  "sessions": {
+    "s_906a82c67213dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a83a8d29-a399-4785-986d-1bd45ba15ab6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
