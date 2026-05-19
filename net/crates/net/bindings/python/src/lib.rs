@@ -2299,12 +2299,17 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "dataforts")]
     {
         m.add_class::<blob::PyBlobRef>()?;
+        m.add_class::<blob::PyBandwidthClass>()?;
         m.add_class::<blob::PyChunkingStrategy>()?;
         m.add_class::<blob::PyEncoding>()?;
         m.add_class::<blob::PyMeshBlobAdapter>()?;
         m.add("DATAFORTS_BLOB_TREE_SUPPORTED", blob::DATAFORTS_BLOB_TREE_SUPPORTED)?;
         m.add("DATAFORTS_BLOB_CDC_SUPPORTED", blob::DATAFORTS_BLOB_CDC_SUPPORTED)?;
         m.add("DATAFORTS_BLOB_ERASURE_SUPPORTED", blob::DATAFORTS_BLOB_ERASURE_SUPPORTED)?;
+        m.add(
+            "DATAFORTS_BLOB_BANDWIDTH_CLASS_SUPPORTED",
+            blob::DATAFORTS_BLOB_BANDWIDTH_CLASS_SUPPORTED,
+        )?;
         m.add_function(wrap_pyfunction!(blob::register_filesystem_blob_adapter, m)?)?;
         m.add_function(wrap_pyfunction!(blob::register_blob_adapter, m)?)?;
         m.add_function(wrap_pyfunction!(blob::unregister_blob_adapter, m)?)?;

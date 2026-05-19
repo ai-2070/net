@@ -73,6 +73,54 @@ pub const DATAFORTS_BLOB_CDC_SUPPORTED: &str =
 pub const DATAFORTS_BLOB_ERASURE_SUPPORTED: &str =
     ::net::adapter::net::dataforts::blob::erasure::DATAFORTS_BLOB_ERASURE_SUPPORTED;
 
+/// Capability tag a node advertises when it accepts the v0.3
+/// Phase D per-stream `BandwidthClass` hint on store/fetch
+/// calls. A peer that doesn't advertise this tag silently
+/// drops the hint and serves every call uniformly (graceful
+/// degradation — no fetch/store ever fails for missing the
+/// capability).
+#[napi]
+pub const DATAFORTS_BLOB_BANDWIDTH_CLASS_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::bandwidth::DATAFORTS_BLOB_BANDWIDTH_CLASS_SUPPORTED;
+
+/// Per-stream bandwidth class hint for the v0.3 Phase D
+/// blob path. SDK consumers pass an instance into future
+/// chunking-aware store/fetch calls; the substrate uses it to
+/// pick admission priority + send-queue ordering when D2/D3
+/// land. Today it's accepted as a hint with no behavioral wiring.
+#[napi]
+#[derive(Clone)]
+pub struct BandwidthClass {
+    /// Discriminant: `"foreground"`, `"background"`, or
+    /// `"realtime"`.
+    pub kind: String,
+}
+
+#[napi]
+impl BandwidthClass {
+    /// Interactive workloads — user-driven fetches, normal RPC
+    /// responses. Default class.
+    #[napi(factory, js_name = "foreground")]
+    pub fn foreground() -> Self {
+        Self { kind: "foreground".to_owned() }
+    }
+
+    /// Long-running TB-scale background work. Bounded to a
+    /// configured fraction of per-channel rate so it can't
+    /// starve Foreground.
+    #[napi(factory, js_name = "background")]
+    pub fn background() -> Self {
+        Self { kind: "background".to_owned() }
+    }
+
+    /// Operator-pinned. Bypasses per-class rate budget but
+    /// still respects disk-pressure circuit-breakers.
+    #[napi(factory, js_name = "realtime")]
+    pub fn realtime() -> Self {
+        Self { kind: "realtime".to_owned() }
+    }
+}
+
 /// Producer-facing encoding-strategy value type. Mirrors the
 /// Rust `Encoding` enum (`Replicated` vs `ReedSolomon { k, m }`)
 /// as a flat napi class with a `kind` discriminant. Construct

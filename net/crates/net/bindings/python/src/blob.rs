@@ -262,6 +262,48 @@ pub const DATAFORTS_BLOB_CDC_SUPPORTED: &str =
 pub const DATAFORTS_BLOB_ERASURE_SUPPORTED: &str =
     ::net::adapter::net::dataforts::blob::erasure::DATAFORTS_BLOB_ERASURE_SUPPORTED;
 
+/// Capability tag a node advertises when it accepts the v0.3
+/// Phase D per-stream `BandwidthClass` hint. A peer that
+/// doesn't advertise it silently drops the hint and serves
+/// every call uniformly.
+pub const DATAFORTS_BLOB_BANDWIDTH_CLASS_SUPPORTED: &str =
+    ::net::adapter::net::dataforts::blob::bandwidth::DATAFORTS_BLOB_BANDWIDTH_CLASS_SUPPORTED;
+
+/// Per-stream bandwidth class hint for the v0.3 Phase D blob
+/// path. Construct via `foreground()` / `background()` /
+/// `realtime()` staticmethods; future chunking-aware binding
+/// store/fetch calls accept it as a hint.
+#[pyclass(name = "BandwidthClass", frozen, eq, from_py_object)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct PyBandwidthClass {
+    /// Discriminant: `"foreground"`, `"background"`, or
+    /// `"realtime"`.
+    #[pyo3(get)]
+    pub kind: String,
+}
+
+#[pymethods]
+impl PyBandwidthClass {
+    #[staticmethod]
+    pub fn foreground() -> Self {
+        Self { kind: "foreground".to_owned() }
+    }
+
+    #[staticmethod]
+    pub fn background() -> Self {
+        Self { kind: "background".to_owned() }
+    }
+
+    #[staticmethod]
+    pub fn realtime() -> Self {
+        Self { kind: "realtime".to_owned() }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("BandwidthClass.{}()", self.kind)
+    }
+}
+
 /// Producer-facing encoding-strategy value type. Mirrors the
 /// Rust `Encoding` enum (`Replicated` vs `ReedSolomon { k, m }`)
 /// as a Python class with a `kind` discriminant. Construct via
