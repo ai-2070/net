@@ -2461,13 +2461,20 @@ impl MeshBlobAdapter {
         let k_usize = k as usize;
         let total = k_usize + m as usize;
         if stripe.chunks.len() != total {
-            return Err(BlobError::Backend(format!(
-                "repair: stripe shape mismatch — expected {} shards (k={} + m={}), got {}",
-                total,
+            // Stripe shape disagrees with its encoding header. The
+            // stripe is structurally malformed — reconstruction
+            // cannot proceed, but one bad stripe must not abort
+            // the rest of the blob (per the contract documented on
+            // `repair_blob`). Record as unrecoverable and continue.
+            tracing::warn!(
                 k,
                 m,
-                stripe.chunks.len()
-            )));
+                expected_total = total,
+                actual_total = stripe.chunks.len(),
+                "repair: stripe shape mismatch — recording as unrecoverable",
+            );
+            report.stripes_unrecoverable = report.stripes_unrecoverable.saturating_add(1);
+            return Ok(());
         }
 
         // Probe every chunk: present (Some) vs missing (None).
@@ -2525,9 +2532,12 @@ impl MeshBlobAdapter {
             .max()
             .unwrap_or(0);
         if shard_len == 0 {
-            return Err(BlobError::Backend(
-                "repair: stripe has zero-length parity shards; unrecoverable".to_owned(),
-            ));
+            // No parity shard carries any bytes — the stripe is
+            // unrecoverable. Record + continue, same as the shape-
+            // mismatch path.
+            tracing::warn!("repair: stripe has zero-length parity shards; unrecoverable");
+            report.stripes_unrecoverable = report.stripes_unrecoverable.saturating_add(1);
+            return Ok(());
         }
         for slot in shards.iter_mut() {
             if let Some(bytes) = slot.as_mut() {
@@ -2537,8 +2547,30 @@ impl MeshBlobAdapter {
             }
         }
 
-        let encoder = super::erasure::RsEncoder::new(super::erasure::RsParams { k, m })?;
-        encoder.reconstruct_data(&mut shards)?;
+        // Encoder construction + reconstruction failures are
+        // structural problems with the stripe (e.g. RsParams the
+        // backend rejects, or reconstruct_data refusing because of
+        // a malformed shard set). Treat as unrecoverable so a
+        // single broken stripe doesn't abort the whole blob.
+        let encoder = match super::erasure::RsEncoder::new(super::erasure::RsParams { k, m }) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "repair: RsEncoder construction failed — recording stripe as unrecoverable",
+                );
+                report.stripes_unrecoverable = report.stripes_unrecoverable.saturating_add(1);
+                return Ok(());
+            }
+        };
+        if let Err(e) = encoder.reconstruct_data(&mut shards) {
+            tracing::warn!(
+                error = ?e,
+                "repair: reconstruct_data failed — recording stripe as unrecoverable",
+            );
+            report.stripes_unrecoverable = report.stripes_unrecoverable.saturating_add(1);
+            return Ok(());
+        }
 
         // Re-store every missing data shard under its original
         // content-addressed hash. The reconstructed bytes are
@@ -2548,23 +2580,29 @@ impl MeshBlobAdapter {
         let mut chunks_restored = 0u64;
         for &idx in &missing_data_indices {
             let chunk_ref = &stripe.chunks[idx];
-            let bytes = shards[idx].as_ref().ok_or_else(|| {
-                BlobError::Backend(format!(
-                    "repair: data shard {} still missing post-reconstruct (internal bug)",
-                    idx
-                ))
-            })?;
+            let Some(bytes) = shards[idx].as_ref() else {
+                tracing::warn!(
+                    idx,
+                    "repair: data shard still missing post-reconstruct — recording stripe as unrecoverable",
+                );
+                report.stripes_unrecoverable =
+                    report.stripes_unrecoverable.saturating_add(1);
+                return Ok(());
+            };
             // The reconstructed shard is shard_len bytes; the
             // original was chunk_ref.size bytes (zero-padded to
             // shard_len at store time). Slice the logical bytes.
             let logical_len = chunk_ref.size as usize;
             if bytes.len() < logical_len {
-                return Err(BlobError::Backend(format!(
-                    "repair: reconstructed shard {} is {} bytes, expected at least {}",
+                tracing::warn!(
                     idx,
-                    bytes.len(),
-                    logical_len
-                )));
+                    reconstructed_len = bytes.len(),
+                    logical_len,
+                    "repair: reconstructed shard short — recording stripe as unrecoverable",
+                );
+                report.stripes_unrecoverable =
+                    report.stripes_unrecoverable.saturating_add(1);
+                return Ok(());
             }
             let logical_bytes = &bytes[..logical_len];
             // Verify the reconstructed bytes hash back to the
@@ -2573,12 +2611,21 @@ impl MeshBlobAdapter {
             // chunk pool.
             let computed: [u8; 32] = blake3::hash(logical_bytes).into();
             if computed != chunk_ref.hash {
-                return Err(BlobError::Backend(format!(
-                    "repair: reconstructed shard {} hash mismatch — expected {:?}, \
-                     got {:?}; refusing to persist (encoder bug or stripe corruption)",
-                    idx, chunk_ref.hash, computed
-                )));
+                tracing::warn!(
+                    idx,
+                    expected = ?chunk_ref.hash,
+                    got = ?computed,
+                    "repair: reconstructed shard hash mismatch — recording stripe as \
+                     unrecoverable (encoder bug or stripe corruption); refusing to persist",
+                );
+                report.stripes_unrecoverable =
+                    report.stripes_unrecoverable.saturating_add(1);
+                return Ok(());
             }
+            // store_chunk failure remains a hard error — a
+            // partial-write across the chunk pool is an operator-
+            // visible persistence problem that should NOT be
+            // swallowed as "just one bad stripe."
             self.store_chunk(&chunk_ref.hash, logical_bytes).await?;
             chunks_restored += 1;
         }
