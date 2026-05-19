@@ -57,6 +57,15 @@ use super::error::BlobError;
 /// count) keeps the stripe predictable under CDC where chunks
 /// range `[1 MiB, 16 MiB]`; a stripe spans 4-12 CDC chunks
 /// depending on boundary distribution.
+///
+/// **Currently unused.** The v0.3 striper closes purely on chunk
+/// count (`in_flight.len() >= k`); the byte-targeted close logic
+/// the constant describes is documented as a future commit per
+/// the plan, but not yet wired through [`RsStriper::push_chunk`].
+/// Kept as a published constant for downstream operators reading
+/// the design surface; readers SHOULD treat the close behavior as
+/// chunk-count-based until a follow-up commit reintroduces the
+/// byte target.
 pub const RS_STRIPE_TARGET_BYTES: u64 = 40 * 1024 * 1024;
 
 /// Minimum accumulated *data bytes* a stripe needs to actually
@@ -67,6 +76,12 @@ pub const RS_STRIPE_TARGET_BYTES: u64 = 40 * 1024 * 1024;
 /// fallback, a 1 MiB blob stored under `(10, 4)` would carry 4 MiB
 /// of parity overhead (5× storage); the fallback skips parity for
 /// the small case.
+///
+/// **Currently unused.** Same status as
+/// [`RS_STRIPE_TARGET_BYTES`] — the small-stripe fallback in v0.3
+/// uses a chunk-count threshold internally, not this byte
+/// threshold. See [`RsStriper::push_chunk`] for the operative
+/// close rule.
 pub const RS_STRIPE_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Default data shards per stripe. `(10, 4)` is the v0.3 plan's
