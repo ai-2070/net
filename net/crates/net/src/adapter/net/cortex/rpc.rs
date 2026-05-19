@@ -2582,12 +2582,23 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 // closes in a single frame).
                 let end_on_initial = payload.flags & FLAG_RPC_REQUEST_END != 0;
                 let is_pure_terminator = end_on_initial && payload.body.is_empty();
-                if !is_pure_terminator && tx.try_send(bytes::Bytes::from(payload.body)).is_err() {
-                    tracing::warn!(
-                        caller_origin = format!("{:#x}", meta.origin_hash),
-                        call_id = meta.seq_or_ts,
-                        "rpc client-streaming server fold: failed to push initial REQUEST body to fresh mpsc",
-                    );
+                if !is_pure_terminator {
+                    // Fresh `mpsc::channel(STREAMING_REQUEST_PUMP_CAPACITY)`
+                    // with a live receiver — try_send cannot fail.
+                    // debug_assert surfaces the invariant break in
+                    // tests; release logs at error level rather than
+                    // silently swallowing the first request body.
+                    if tx.try_send(bytes::Bytes::from(payload.body)).is_err() {
+                        debug_assert!(
+                            false,
+                            "fresh client-streaming request mpsc rejected initial body"
+                        );
+                        tracing::error!(
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc client-streaming server fold: fresh mpsc rejected initial REQUEST body (invariant break)",
+                        );
+                    }
                 }
                 // If the initial REQUEST also set FLAG_REQUEST_END,
                 // close the stream immediately — degenerate case of
@@ -2994,13 +3005,21 @@ impl RedexFold<()> for RpcDuplexFold {
                     tokio::sync::mpsc::channel::<bytes::Bytes>(STREAMING_REQUEST_PUMP_CAPACITY);
                 let end_on_initial = payload.flags & FLAG_RPC_REQUEST_END != 0;
                 let is_pure_terminator = end_on_initial && payload.body.is_empty();
-                if !is_pure_terminator && req_tx.try_send(bytes::Bytes::from(payload.body)).is_err()
-                {
-                    tracing::warn!(
-                        caller_origin = format!("{:#x}", meta.origin_hash),
-                        call_id = meta.seq_or_ts,
-                        "rpc duplex server fold: failed to push initial REQUEST body to fresh mpsc",
-                    );
+                if !is_pure_terminator {
+                    // Same invariant as the client-streaming fold:
+                    // fresh bounded mpsc with a live receiver cannot
+                    // reject the first send.
+                    if req_tx.try_send(bytes::Bytes::from(payload.body)).is_err() {
+                        debug_assert!(
+                            false,
+                            "fresh duplex request mpsc rejected initial body"
+                        );
+                        tracing::error!(
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc duplex server fold: fresh mpsc rejected initial REQUEST body (invariant break)",
+                        );
+                    }
                 }
                 if !end_on_initial {
                     self.senders.lock().insert(key, req_tx);
