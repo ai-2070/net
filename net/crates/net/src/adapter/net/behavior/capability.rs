@@ -5486,32 +5486,24 @@ mod tests {
         assert_eq!(decoded.allowed_groups, ann.allowed_groups);
     }
 
-    /// A v0.4 signature over an unrestricted announcement is the
-    /// same byte-pattern a pre-v0.4 signer would produce — proven
-    /// by signing twice (one v0.4-shape with empty vecs, one
-    /// v0.x-shape constructed via direct JSON without the fields)
-    /// and confirming both signatures verify against the same
-    /// canonical payload. This pins backward compatibility with
-    /// in-flight pre-v0.4 peers during a rolling upgrade.
+    /// The canonical signed payload of an unrestricted
+    /// announcement must NOT carry the three allow-list keys at
+    /// all — that's what keeps the v0.4 signed byte-pattern
+    /// identical to the pre-v0.4 shape, so a pre-v0.4 verifier
+    /// validates a v0.4 unrestricted announcement and vice versa.
+    /// Distinct from `empty_allow_lists_omit_fields_from_wire`,
+    /// which checks the same invariant on the serialized wire
+    /// form (`to_bytes`); this one checks the canonical signed
+    /// payload (`signed_payload`, which also zeroes `hop_count`).
     #[test]
-    fn signature_byte_identity_with_pre_v04_unrestricted_announcement() {
+    fn signed_payload_omits_empty_allow_lists() {
         use super::super::super::identity::EntityKeypair;
         let keypair = EntityKeypair::generate();
         let ann =
             CapabilityAnnouncement::new(5, keypair.entity_id().clone(), 1, sample_capability_set());
-        // Build the canonical signed payload via the production
-        // `signed_payload()` helper.
-        let v04_canonical = ann.signed_payload();
-        // Now build what a hypothetical pre-v0.4 producer would
-        // emit: the same struct serialised through serde_json
-        // before the three Vec fields existed. We model that by
-        // deserialising the v0.4 bytes into a serde_json::Value,
-        // stripping any allow-list keys (none should be present
-        // when empty), and re-serialising. If our
-        // `skip_serializing_if = Vec::is_empty` is wired right,
-        // the two should be byte-identical.
-        let mut v: serde_json::Value = serde_json::from_slice(&v04_canonical).expect("parse");
-        let obj = v.as_object_mut().expect("object");
+        let canonical = ann.signed_payload();
+        let v: serde_json::Value = serde_json::from_slice(&canonical).expect("parse");
+        let obj = v.as_object().expect("object");
         assert!(
             !obj.contains_key("allowed_nodes"),
             "pre-v0.4 wire shape must not carry allowed_nodes when empty"
