@@ -1,10 +1,30 @@
 # Capability Announcement + Execution Auth Plan
 
-**Status:** Draft for review.
+**Status:** Shipped. Phases 1–3 landed on the `capability-auth` branch.
 **Scope:** add the smallest correct gate around announce + execute on
 the mesh-wide capability surface. Permissive by default, signed
 announcements as the only auth vector, allow-lists on `NodeId` /
 `SubnetId` / `GroupId`. Revocation is a new announcement.
+
+## Ship status
+
+- **Phase 1 — types + wire format.** `SubnetId` (16-byte) and
+  `GroupId` (32-byte) under `src/adapter/net/behavior/{subnet,group}.rs`.
+  Three additive Vec fields on `CapabilityAnnouncement`:
+  `allowed_nodes`, `allowed_subnets`, `allowed_groups`. All three
+  default-empty + `skip_serializing_if = Vec::is_empty`, so an
+  unrestricted announcement is byte-identical to the pre-v0.4
+  shape — the signed-byte-identity test pins it.
+- **Phase 2 — execute gate.** `CapabilityIndex::may_execute`
+  + `subnet_of` / `groups_of`. Caller-side gate wired into
+  `Mesh::call_service`; callee-side defense-in-depth wired into
+  `serve_rpc`'s bridge before `fold.apply`. `RpcStatus::CapabilityDenied`
+  (0x0008) + `RpcError::CapabilityDenied { target, capability }`.
+- **Phase 3 — CLI + conformance.** `net cap announce --tag X
+  --allow-node N1,N2 --allow-subnet S1 --allow-group G1 --key
+  <path>` builds a signed announcement and emits the JSON bytes
+  to stdout or `--out`. Six-scenario conformance file at
+  `tests/capability_auth_conformance.rs` pins the §7 contract.
 
 This is deliberately **not** an ACL engine, not a policy language,
 not a separate policy channel, not an operator-key subsystem. The
