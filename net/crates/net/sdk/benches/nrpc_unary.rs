@@ -4,7 +4,7 @@
 //! - Payload: 0 B (empty) / 32 B / 1 KiB
 //! - Codec:   json / postcard / raw bytes
 //! - Routing: direct (`call_typed` with known node id) /
-//!            discovery (`call_service_typed` via capability index)
+//!   discovery (`call_service_typed` via capability index)
 //!
 //! For each (payload, codec, routing) combo Criterion reports
 //! mean + std-dev + the percentile tail it samples (p50 / p90 /
@@ -28,8 +28,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 mod nrpc_common;
 
 use nrpc_common::{
-    call_json_direct, call_json_discovery, call_postcard_direct, call_raw_direct, payload,
-    runtime, EchoReq, Pair,
+    call_json_direct, call_json_discovery, call_postcard_direct, call_raw_direct, payload, runtime,
+    EchoReq, Pair,
 };
 
 const PAYLOADS: &[(&str, usize)] = &[("empty", 0), ("32B", 32), ("1KiB", 1024)];
@@ -45,7 +45,9 @@ fn bench_unary(c: &mut Criterion) {
         group.throughput(Throughput::Elements(1));
 
         // JSON via typed API.
-        let req = EchoReq { body: payload(size) };
+        let req = EchoReq {
+            body: payload(size),
+        };
         group.bench_with_input(BenchmarkId::new("json", label), &req, |b, req| {
             b.to_async(&rt).iter(|| async {
                 let resp = call_json_direct(&pair, req).await;
@@ -54,7 +56,9 @@ fn bench_unary(c: &mut Criterion) {
         });
 
         // Postcard via raw `serve_rpc` + manual encode.
-        let req = EchoReq { body: payload(size) };
+        let req = EchoReq {
+            body: payload(size),
+        };
         group.bench_with_input(BenchmarkId::new("postcard", label), &req, |b, req| {
             b.to_async(&rt).iter(|| async {
                 let resp = call_postcard_direct(&pair, req).await;
@@ -78,7 +82,9 @@ fn bench_unary(c: &mut Criterion) {
     group.sample_size(50);
     for &(label, size) in PAYLOADS {
         group.throughput(Throughput::Elements(1));
-        let req = EchoReq { body: payload(size) };
+        let req = EchoReq {
+            body: payload(size),
+        };
 
         group.bench_with_input(BenchmarkId::new("direct", label), &req, |b, req| {
             b.to_async(&rt).iter(|| async {

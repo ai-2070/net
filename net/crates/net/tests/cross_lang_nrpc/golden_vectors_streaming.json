@@ -1,0 +1,193 @@
+{
+  "abi_version_expected": 2,
+  "description": "Canonical cross-binding nRPC compatibility fixture for the client-streaming + duplex shapes shipped under NET_RPC_ABI_VERSION = 0x0002 (NRPC_BINDINGS_PLAN.md Phase 2). Two services, each with a documented contract and a fixed set of ok_cases. Every binding's wire-format compat test loads this file and asserts: encoding the request stream on each side, dispatching through the canonical handler, and decoding the response stream yields outputs that semantically match the fixture. Status codes, header names, and the JSON shapes are all part of the contract.",
+  "wire_snapshots": {
+    "description": "Byte-exact hex snapshots of canonical RPC payload encodings, taken at the wire level (after meta serialization). Bindings re-encoding the same logical inputs MUST produce the same bytes; drift on endianness, padding, header packing, or flag-bit layout is an inter-binding wire bug, not a semantic difference the JSON-only ok_cases would catch. The substrate-side test wire_snapshots_match_fixture exercises the Rust codec against these; per-binding ports run the same assertion against their native encoders.",
+    "request_payload_minimal_clientstream": {
+      "inputs": {
+        "service": "test",
+        "deadline_ns": 0,
+        "flags_hex": "0x0010",
+        "flags_named": ["FLAG_RPC_CLIENT_STREAMING_REQUEST"],
+        "headers": [],
+        "body_utf8": "hello"
+      },
+      "hex": "047465737400000000000000001000000500000068656c6c6f",
+      "byte_count": 25
+    },
+    "request_chunk_payload_with_end": {
+      "inputs": {
+        "call_id": 42,
+        "flags_hex": "0x0020",
+        "flags_named": ["FLAG_RPC_REQUEST_END"],
+        "headers": [],
+        "body_utf8": "bye"
+      },
+      "hex": "2a0000000000000020000003000000627965",
+      "byte_count": 18
+    },
+    "request_grant_payload": {
+      "inputs": {
+        "call_id": 42,
+        "credits": 8
+      },
+      "hex": "2a0000000000000000000008",
+      "byte_count": 12,
+      "endianness_note": "call_id is u64 little-endian; credits is u32 big-endian. The asymmetry mirrors encode_stream_grant from Phase 3 — bindings MUST preserve it."
+    }
+  },
+  "canonical_flag_end_placement": {
+    "rule": "FLAG_RPC_REQUEST_END is carried by the LAST chunk that contains user data, not a trailing empty-body terminator. Bindings emitting `request_items = [a, b, c]` MUST set FLAG_END on the chunk carrying `c` (not on a fourth empty chunk). For the 1-item case the FLAG_END rides on the ONE chunk that carries that item. For the empty-items case, the initial REQUEST itself carries FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_REQUEST_END with an empty body (the 'pure terminator' fast path).",
+    "rationale": "Trailing-empty-FLAG_END was tolerated by the Rust substrate's terminator-semantics rule (empty body + FLAG_END = pure terminator, suppressed from the handler's stream) but it costs an extra event per call. Pinning the data-bearing-FLAG_END as canonical keeps all bindings byte-identical on the wire and avoids the substrate's 'is_pure_terminator' branch.",
+    "examples": {
+      "zero_items": "REQUEST(flags = CLIENT_STREAMING_REQUEST | REQUEST_END, body = []). Zero REQUEST_CHUNKs.",
+      "one_item":  "REQUEST(flags = CLIENT_STREAMING_REQUEST | REQUEST_END, body = encode(item_0)). Zero REQUEST_CHUNKs.",
+      "n_items":   "REQUEST(flags = CLIENT_STREAMING_REQUEST, body = encode(item_0)). REQUEST_CHUNK(flags = 0, body = encode(item_1)) ... REQUEST_CHUNK(flags = REQUEST_END, body = encode(item_{N-1}))."
+    }
+  },
+  "error_cases": {
+    "description": "Cross-binding-pinned error paths. Bindings MUST surface the codes/status documented here for the given trigger; the cross_lang_streaming integration test exercises each via the same direct-fold-dispatch pattern as the ok_cases.",
+    "cases": [
+      {
+        "name": "client_stream_decode_failure",
+        "shape": "client_streaming",
+        "service": "cross_lang_client_stream_sum",
+        "trigger": "Caller emits a REQUEST_CHUNK whose body is not valid JSON for the request_item_shape (e.g., the raw bytes `not-json-shape`).",
+        "expected_status": "Application",
+        "expected_application_code": "0x8000",
+        "expected_application_code_constant": "NRPC_TYPED_BAD_REQUEST",
+        "diagnostic_substring": "typed streaming handler: bad request body"
+      },
+      {
+        "name": "client_stream_handler_application_error",
+        "shape": "client_streaming",
+        "service": "cross_lang_client_stream_sum",
+        "trigger": "Server-side handler returns Err(String) (typed) or raises the typed application exception (Node/Python).",
+        "expected_status": "Application",
+        "expected_application_code": "0x8001",
+        "expected_application_code_constant": "NRPC_TYPED_HANDLER_ERROR",
+        "diagnostic_substring": "(handler-supplied message, propagated verbatim)"
+      },
+      {
+        "name": "client_stream_cancel_mid_send",
+        "shape": "client_streaming",
+        "service": "cross_lang_client_stream_sum",
+        "trigger": "Caller drops the call handle after sending at least one chunk and before finish().",
+        "expected_status": "Cancelled",
+        "expected_application_code": null,
+        "diagnostic_substring": "server observed CANCEL"
+      },
+      {
+        "name": "duplex_cancel_from_caller",
+        "shape": "duplex",
+        "service": "cross_lang_duplex_echo",
+        "trigger": "Caller drops BOTH halves (or the combined DuplexCall) before clean close.",
+        "expected_status": "Cancelled",
+        "expected_application_code": null,
+        "diagnostic_substring": "server observed CANCEL during duplex handler execution"
+      },
+      {
+        "name": "duplex_decode_failure",
+        "shape": "duplex",
+        "service": "cross_lang_duplex_echo",
+        "trigger": "Server emits a RESPONSE chunk whose body is not valid JSON for response_shape.",
+        "expected_status": "ClientCodec",
+        "expected_application_code": null,
+        "diagnostic_substring": "typed stream decode"
+      }
+    ]
+  },
+  "services": [
+    {
+      "service": "cross_lang_client_stream_sum",
+      "shape": "client_streaming",
+      "description": "Drain a stream of {text, numbers} request items. Return a single response: { echo: concatenation of all text fields joined by ' ', total: sum of all numbers across all items, count: number of items consumed }.",
+      "request_item_shape": {
+        "text": "str",
+        "numbers": "List[i64]"
+      },
+      "response_shape": {
+        "echo": "str — items' text joined by ' '",
+        "total": "i64 — sum of all numbers across items",
+        "count": "u64 — number of items consumed"
+      },
+      "ok_cases": [
+        {
+          "name": "single_item",
+          "request_items": [
+            { "text": "hello", "numbers": [42] }
+          ],
+          "expected_response_json": { "echo": "hello", "total": 42, "count": 1 }
+        },
+        {
+          "name": "three_items",
+          "request_items": [
+            { "text": "alpha", "numbers": [1, 2] },
+            { "text": "beta", "numbers": [3] },
+            { "text": "gamma", "numbers": [4, 5, 6] }
+          ],
+          "expected_response_json": { "echo": "alpha beta gamma", "total": 21, "count": 3 }
+        },
+        {
+          "name": "empty_stream",
+          "request_items": [],
+          "expected_response_json": { "echo": "", "total": 0, "count": 0 }
+        },
+        {
+          "name": "unicode_and_negatives",
+          "request_items": [
+            { "text": "héllo", "numbers": [-1, 1] },
+            { "text": "世界", "numbers": [10, -5] }
+          ],
+          "expected_response_json": { "echo": "héllo 世界", "total": 5, "count": 2 }
+        }
+      ]
+    },
+    {
+      "service": "cross_lang_duplex_echo",
+      "shape": "duplex",
+      "description": "Drain a stream of {text, numbers} request items. Emit one response per request item: { echo: item.text, sum: sum of item.numbers }. After processing all items, emit one final summary response: { echo: 'summary', sum: count_of_items }. Handler returns Ok after EOF on the request stream.",
+      "request_item_shape": {
+        "text": "str",
+        "numbers": "List[i64]"
+      },
+      "response_shape": {
+        "echo": "str — item's text, or 'summary' for the final frame",
+        "sum": "i64 — item's numbers summed, or count_of_items for the summary"
+      },
+      "ok_cases": [
+        {
+          "name": "single_in_single_out",
+          "request_items": [
+            { "text": "ping", "numbers": [3, 4] }
+          ],
+          "expected_response_items": [
+            { "echo": "ping", "sum": 7 },
+            { "echo": "summary", "sum": 1 }
+          ]
+        },
+        {
+          "name": "three_in_three_plus_summary",
+          "request_items": [
+            { "text": "a", "numbers": [1] },
+            { "text": "b", "numbers": [2, 3] },
+            { "text": "c", "numbers": [] }
+          ],
+          "expected_response_items": [
+            { "echo": "a", "sum": 1 },
+            { "echo": "b", "sum": 5 },
+            { "echo": "c", "sum": 0 },
+            { "echo": "summary", "sum": 3 }
+          ]
+        },
+        {
+          "name": "empty_stream_summary_only",
+          "request_items": [],
+          "expected_response_items": [
+            { "echo": "summary", "sum": 0 }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -69,7 +69,7 @@ fn bench_streaming(c: &mut Criterion) {
                         std::hint::black_box(item.expect("stream item"));
                         received += 1;
                     }
-                    debug_assert_eq!(received, count);
+                    assert_eq!(received, count);
                 });
             });
         }

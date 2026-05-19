@@ -43,10 +43,14 @@ use napi_derive::napi;
 use tokio::task::AbortHandle;
 
 use ::net::adapter::net::cortex::{
-    RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+    RequestStream as InnerRequestStream, RpcClientStreamingHandler, RpcContext, RpcDuplexHandler,
+    RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink,
+    RpcStatus, RpcStreamingContext,
 };
 use ::net::adapter::net::mesh_rpc::{
-    CallOptions as InnerCallOptions, RoutingPolicy as InnerRoutingPolicy,
+    CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
+    DuplexCallRaw as InnerDuplexCallRaw, DuplexSink as InnerDuplexSink,
+    DuplexStream as InnerDuplexStream, RoutingPolicy as InnerRoutingPolicy,
     RpcError as InnerRpcError, RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
 };
 use ::net::adapter::net::MeshNode;
@@ -182,6 +186,14 @@ pub struct CallOptions {
     /// `RpcStream::grant`." `None` (the default) → unbounded.
     /// Ignored by non-streaming `call` / `callService`.
     pub stream_window_initial: Option<u32>,
+    /// Client-streaming / duplex only: initial credit window for
+    /// per-call request-direction flow control. Mirror of
+    /// [`stream_window_initial`] for the upload direction. The
+    /// SDK's `ClientStreamCallTyped::send` / `DuplexCallTyped::send`
+    /// gate on credit when this is set. Server refills via
+    /// `REQUEST_GRANT` after each consumed chunk. `None`
+    /// (the default) → unbounded.
+    pub request_window_initial: Option<u32>,
     /// Caller-side cancel token for AbortSignal integration. Mint
     /// via `MeshRpc.reserveCancelToken()`, pass here, then call
     /// `MeshRpc.cancelCall(token)` from your AbortSignal listener
@@ -227,6 +239,7 @@ impl CallOptions {
             opts.deadline = Some(Instant::now() + Duration::from_millis(ms as u64));
         }
         opts.stream_window_initial = self.stream_window_initial;
+        opts.request_window_initial = self.request_window_initial;
         opts.routing_policy = InnerRoutingPolicy::default();
         if let Some(headers) = self.request_headers {
             opts.request_headers = headers
@@ -284,6 +297,16 @@ const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
 const JS_APP_ERROR_PREFIX: &str = "nrpc:app_error:";
 
 /// Parse a JS-thrown `nrpc:app_error:0x<code>:<body>` message
+/// Convert an owned napi `Buffer` into `bytes::Bytes` without
+/// an extra copy. napi-rs 3.x backs `Buffer` with an `Arc<Vec<u8>>`
+/// internally; `Bytes::from_owner` takes ownership of the Buffer
+/// (preserving the Arc clone) so the resulting `Bytes` borrows the
+/// same allocation. Replaces the previous `Bytes::copy_from_slice`
+/// pattern that paid a per-chunk memcpy at the JS↔Rust boundary.
+fn napi_buffer_to_bytes(buf: Buffer) -> Bytes {
+    Bytes::from_owner(buf)
+}
+
 /// into the (code, body) pair the SDK expects for
 /// `RpcHandlerError::Application`. Returns `None` if the prefix
 /// is absent or the format is malformed (caller falls through to
@@ -555,6 +578,808 @@ impl RpcStream {
 }
 
 // ============================================================================
+// ABI 0x0002 — Client-streaming caller-side (Phase B9-1)
+//
+// Same Arc<TokioMutex<Option<...>>> pattern as `RpcStream`. send /
+// finish hold the lock across the await; finish takes the inner
+// permanently (consumes the call). close releases without
+// emitting REQUEST_END — used when callers want to cancel
+// without finishing.
+// ============================================================================
+
+/// Open client-streaming RPC call. Push chunks via `send`, then
+/// `finish` to await the terminal response. Drop / `close` fires
+/// CANCEL via the SDK's `ClientStreamCallRaw::Drop` if `finish`
+/// wasn't reached.
+#[napi]
+pub struct ClientStreamCall {
+    inner: Arc<tokio::sync::Mutex<Option<InnerClientStreamCallRaw>>>,
+    /// Captured at construction so `callId()` doesn't take the
+    /// mutex (which `send` / `finish` may be holding across an
+    /// await).
+    call_id_cached: u64,
+    /// Cached `flow_controlled` flag for the same reason.
+    flow_controlled_cached: bool,
+    /// Lets `close()` interrupt a pending `send()` that's
+    /// awaiting flow-control credit. send `select!`s on this; a
+    /// concurrent close fires it, the select picks the close arm,
+    /// the call is dropped (CANCEL fires from Drop), and the
+    /// pending send returns `stream_closed` instead of hanging
+    /// forever on credit that will never arrive.
+    close_notify: Arc<tokio::sync::Notify>,
+}
+
+#[napi]
+impl ClientStreamCall {
+    /// Push one body chunk to the server. Encodes as the initial
+    /// REQUEST (first call) or as a REQUEST_CHUNK (subsequent).
+    /// Awaits one credit when flow control was opted in.
+    ///
+    /// Concurrent `close()` interrupts the await: `send`
+    /// `select!`s on the close-notify, so the upload doesn't
+    /// queue behind credit that never arrives.
+    #[napi]
+    pub async fn send(&self, body: Buffer) -> Result<()> {
+        let body = napi_buffer_to_bytes(body);
+        // Take the inner out under a brief lock so the long-lived
+        // tokio mutex isn't held across the credit await; a
+        // racing `close()` can then acquire the lock cleanly to
+        // signal cancellation.
+        let mut call = {
+            let mut guard = self.inner.lock().await;
+            guard
+                .take()
+                .ok_or_else(|| nrpc_err("stream_closed", "client-stream call already closed"))?
+        };
+        let notify = self.close_notify.clone();
+        let result = tokio::select! {
+            r = call.send(body) => r,
+            _ = notify.notified() => {
+                // close() fired. Drop the call (which drops its
+                // credit semaphore + fires CANCEL via the SDK's
+                // Drop impl) and report stream_closed to JS.
+                drop(call);
+                return Err(nrpc_err("stream_closed", "send aborted by close()"));
+            }
+        };
+        let mut guard = self.inner.lock().await;
+        match result {
+            Ok(()) => {
+                *guard = Some(call);
+                Ok(())
+            }
+            Err(e) => {
+                drop(call);
+                Err(nrpc_err_from_inner(e))
+            }
+        }
+    }
+
+    /// Close the upload direction (emit REQUEST_END) and await
+    /// the server's terminal response. Consumes the call —
+    /// subsequent `send` / `finish` throw `stream_closed`.
+    #[napi]
+    pub async fn finish(&self) -> Result<Buffer> {
+        let mut guard = self.inner.lock().await;
+        let call = guard
+            .take()
+            .ok_or_else(|| nrpc_err("stream_closed", "client-stream call already closed"))?;
+        match call.finish().await {
+            Ok(reply) => Ok(Buffer::from(reply.body.as_ref())),
+            Err(e) => Err(nrpc_err_from_inner(e)),
+        }
+    }
+
+    /// Server-assigned `call_id` for diagnostics / trace
+    /// correlation.
+    #[napi]
+    pub async fn call_id(&self) -> BigInt {
+        BigInt::from(self.call_id_cached)
+    }
+
+    /// `true` if the call was opened with a non-`None`
+    /// `requestWindowInitial`.
+    #[napi]
+    pub async fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close without finishing. Fires CANCEL via the SDK's Drop
+    /// if the initial REQUEST has already flown. Idempotent.
+    ///
+    /// Concurrent in-flight `send()` calls awaiting credit are
+    /// interrupted via the close-notify — they observe
+    /// `stream_closed` instead of hanging.
+    #[napi]
+    pub async fn close(&self) {
+        // Wake any in-flight `send` waiting on credit. notify_one
+        // stores a permit so subsequent `notified()` consumes it
+        // immediately — fine even if send hasn't started yet.
+        self.close_notify.notify_one();
+        let _ = self.inner.lock().await.take();
+    }
+}
+
+// ============================================================================
+// ABI 0x0002 — Duplex caller-side (Phase B9-1)
+//
+// Three classes:
+//   - DuplexCall: combined send + receive surface.
+//   - DuplexSink + DuplexStream: independent halves after `intoSplit()`.
+//
+// All three share the same Arc<TokioMutex<Option<...>>> pattern.
+// CANCEL semantics are inherited from the SDK's Arc<DuplexInner>:
+// fires only when BOTH halves drop without the response stream's
+// terminal frame.
+// ============================================================================
+
+/// Open duplex RPC call. Combined send + receive surface. Use
+/// `intoSplit()` to get independent `DuplexSink` + `DuplexStream`
+/// halves for the encoder-task / decoder-task pattern.
+#[napi]
+pub struct DuplexCall {
+    inner: Arc<tokio::sync::Mutex<Option<InnerDuplexCallRaw>>>,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+    /// Same role as `ClientStreamCall::close_notify` — lets
+    /// `close()` interrupt a pending `send()` blocked on credit.
+    close_notify: Arc<tokio::sync::Notify>,
+}
+
+#[napi]
+impl DuplexCall {
+    /// Push one body chunk to the server.
+    ///
+    /// Concurrent `close()` interrupts the await via the
+    /// close-notify (same shape as `ClientStreamCall::send`),
+    /// so a stuck flow-control await doesn't pin the call.
+    #[napi]
+    pub async fn send(&self, body: Buffer) -> Result<()> {
+        let body = napi_buffer_to_bytes(body);
+        let mut call = {
+            let mut guard = self.inner.lock().await;
+            guard
+                .take()
+                .ok_or_else(|| nrpc_err("stream_closed", "duplex call already closed"))?
+        };
+        let notify = self.close_notify.clone();
+        let result = tokio::select! {
+            r = call.send(body) => r,
+            _ = notify.notified() => {
+                drop(call);
+                return Err(nrpc_err("stream_closed", "send aborted by close()"));
+            }
+        };
+        let mut guard = self.inner.lock().await;
+        match result {
+            Ok(()) => {
+                *guard = Some(call);
+                Ok(())
+            }
+            Err(e) => {
+                drop(call);
+                Err(nrpc_err_from_inner(e))
+            }
+        }
+    }
+
+    /// Close the upload direction (emit REQUEST_END). Does NOT
+    /// close the response stream — the caller drains it via
+    /// `next()` until terminal End.
+    #[napi(js_name = "finishSending")]
+    pub async fn finish_sending(&self) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let call = guard
+            .as_mut()
+            .ok_or_else(|| nrpc_err("stream_closed", "duplex call already closed"))?;
+        call.finish_sending().await.map_err(nrpc_err_from_inner)
+    }
+
+    /// Pull the next inbound response chunk. Returns `null` on
+    /// clean EOF. Throws on terminal non-Ok status.
+    #[napi]
+    pub async fn next(&self) -> Result<Option<Buffer>> {
+        let mut guard = self.inner.lock().await;
+        let call = guard
+            .as_mut()
+            .ok_or_else(|| nrpc_err("stream_closed", "duplex call already closed"))?;
+        match call.next().await {
+            Some(Ok(bytes)) => Ok(Some(Buffer::from(bytes.as_ref()))),
+            Some(Err(e)) => Err(nrpc_err_from_inner(e)),
+            None => {
+                let _ = guard.take();
+                Ok(None)
+            }
+        }
+    }
+
+    /// Split the call into independent send + receive halves.
+    /// Returns `[sink, stream]` — JS destructures as
+    /// `const [sink, stream] = await call.intoSplit()`.
+    ///
+    /// After `intoSplit` returns, this `DuplexCall` is "done" —
+    /// subsequent `send` / `finishSending` / `next` throw.
+    /// CANCEL fires only when BOTH split halves drop without
+    /// observing the response stream's terminal frame.
+    ///
+    /// Returned as a tuple because `#[napi(object)]` (the POD
+    /// wrapper) requires `FromNapiValue` fields, and `#[napi]`
+    /// classes don't implement it. Tuples surface as JS arrays
+    /// directly via napi-rs.
+    #[napi(js_name = "intoSplit")]
+    pub async fn split(&self) -> Result<(DuplexSink, DuplexStream)> {
+        let mut guard = self.inner.lock().await;
+        let call = guard
+            .take()
+            .ok_or_else(|| nrpc_err("stream_closed", "duplex call already closed"))?;
+        let call_id = call.call_id();
+        let flow_controlled = call.flow_controlled();
+        let (sink, stream) = call.into_split();
+        Ok((
+            DuplexSink {
+                inner: Arc::new(tokio::sync::Mutex::new(Some(sink))),
+                call_id_cached: call_id,
+                flow_controlled_cached: flow_controlled,
+                close_notify: Arc::new(tokio::sync::Notify::new()),
+            },
+            DuplexStream {
+                inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
+                call_id_cached: call_id,
+            },
+        ))
+    }
+
+    /// Server-assigned `call_id` for diagnostics.
+    #[napi]
+    pub async fn call_id(&self) -> BigInt {
+        BigInt::from(self.call_id_cached)
+    }
+
+    /// `true` if the call was opened with a non-`None`
+    /// `requestWindowInitial`. Reports the UPLOAD-direction
+    /// flow-control state.
+    #[napi]
+    pub async fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close without observing the response terminator. Fires
+    /// CANCEL via the SDK's Drop. Idempotent. Concurrent
+    /// in-flight `send()` waiting on credit is interrupted via
+    /// the close-notify.
+    #[napi]
+    pub async fn close(&self) {
+        self.close_notify.notify_one();
+        let _ = self.inner.lock().await.take();
+    }
+}
+
+/// Send-half of a `DuplexCall` after `intoSplit`.
+#[napi]
+pub struct DuplexSink {
+    inner: Arc<tokio::sync::Mutex<Option<InnerDuplexSink>>>,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+    /// Same role as `ClientStreamCall::close_notify` —
+    /// interrupts a pending `send()` blocked on credit.
+    close_notify: Arc<tokio::sync::Notify>,
+}
+
+#[napi]
+impl DuplexSink {
+    /// Push one body chunk to the server.
+    ///
+    /// Concurrent `close()` interrupts the await via the
+    /// close-notify (same shape as `DuplexCall::send`).
+    #[napi]
+    pub async fn send(&self, body: Buffer) -> Result<()> {
+        let body = napi_buffer_to_bytes(body);
+        let mut sink = {
+            let mut guard = self.inner.lock().await;
+            guard
+                .take()
+                .ok_or_else(|| nrpc_err("stream_closed", "duplex sink already closed"))?
+        };
+        let notify = self.close_notify.clone();
+        let result = tokio::select! {
+            r = sink.send(body) => r,
+            _ = notify.notified() => {
+                drop(sink);
+                return Err(nrpc_err("stream_closed", "send aborted by close()"));
+            }
+        };
+        let mut guard = self.inner.lock().await;
+        match result {
+            Ok(()) => {
+                *guard = Some(sink);
+                Ok(())
+            }
+            Err(e) => {
+                drop(sink);
+                Err(nrpc_err_from_inner(e))
+            }
+        }
+    }
+
+    /// Close the upload direction (emit REQUEST_END). Consumes
+    /// the sink — subsequent `send` throws.
+    #[napi]
+    pub async fn finish(&self) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let sink = guard
+            .take()
+            .ok_or_else(|| nrpc_err("stream_closed", "duplex sink already closed"))?;
+        sink.finish_sending().await.map_err(nrpc_err_from_inner)
+    }
+
+    /// Server-assigned `call_id`.
+    #[napi]
+    pub async fn call_id(&self) -> BigInt {
+        BigInt::from(self.call_id_cached)
+    }
+
+    /// `true` if the call was opened with a non-`None`
+    /// `requestWindowInitial`.
+    #[napi]
+    pub async fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close without emitting REQUEST_END. Idempotent. Concurrent
+    /// in-flight `send()` waiting on credit is interrupted via
+    /// the close-notify.
+    #[napi]
+    pub async fn close(&self) {
+        self.close_notify.notify_one();
+        let _ = self.inner.lock().await.take();
+    }
+}
+
+/// Receive-half of a `DuplexCall` after `intoSplit`.
+#[napi]
+pub struct DuplexStream {
+    inner: Arc<tokio::sync::Mutex<Option<InnerDuplexStream>>>,
+    call_id_cached: u64,
+}
+
+#[napi]
+impl DuplexStream {
+    /// Pull the next response chunk. Returns `null` on clean EOF.
+    /// Throws on terminal non-Ok status.
+    #[napi]
+    pub async fn next(&self) -> Result<Option<Buffer>> {
+        let mut guard = self.inner.lock().await;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| nrpc_err("stream_closed", "duplex stream already closed"))?;
+        use futures::StreamExt;
+        match stream.next().await {
+            Some(Ok(bytes)) => Ok(Some(Buffer::from(bytes.as_ref()))),
+            Some(Err(e)) => Err(nrpc_err_from_inner(e)),
+            None => {
+                let _ = guard.take();
+                Ok(None)
+            }
+        }
+    }
+
+    /// Server-assigned `call_id`.
+    #[napi]
+    pub async fn call_id(&self) -> BigInt {
+        BigInt::from(self.call_id_cached)
+    }
+
+    /// Close the stream. Idempotent.
+    #[napi]
+    pub async fn close(&self) {
+        let _ = self.inner.lock().await.take();
+    }
+}
+
+// ============================================================================
+// ABI 0x0002 — Server-side handler primitives (Phase B9-2)
+//
+// JsRequestStream wraps the SDK's RequestStream and is handed
+// to JS handlers as the inbound chunk source. JsResponseSink
+// wraps RpcResponseSink for duplex handlers' outbound side.
+// Both are napi classes whose JS instances live for the
+// duration of the handler callback.
+//
+// JS handler signatures (idiomatic patterns):
+//
+//   // Client-streaming
+//   await mesh.serveClientStream("svc", async (stream) => {
+//     let total = 0;
+//     while (true) {
+//       const chunk = await stream.next();
+//       if (chunk === null) break;
+//       total += chunk.length;
+//     }
+//     return Buffer.from([total]);
+//   });
+//
+//   // Duplex
+//   await mesh.serveDuplex("svc", async (stream, sink) => {
+//     while (true) {
+//       const chunk = await stream.next();
+//       if (chunk === null) break;
+//       sink.send(Buffer.concat([Buffer.from("echo:"), chunk]));
+//     }
+//   });
+//
+// A thin .d.ts/JS shim can add Symbol.asyncIterator on top so
+// `for await (const c of stream)` works — pure-JS layer, not
+// in scope here.
+// ============================================================================
+
+/// Inbound request-stream handle for client-streaming + duplex
+/// server handlers. Drain via `await stream.next()` until it
+/// returns `null` (REQUEST_END or CANCEL closed the stream).
+///
+/// Lifetime: bounded by the handler callback. The SDK's
+/// underlying `RequestStream` is taken into this wrapper at
+/// handler dispatch and dropped when the wrapper is dropped
+/// (which happens when JS releases its reference to the instance,
+/// typically right after the handler returns).
+#[napi]
+pub struct JsRequestStream {
+    inner: Arc<tokio::sync::Mutex<Option<InnerRequestStream>>>,
+    /// Caller's identity hash (peer origin). Surfaced to JS
+    /// via the `callerOrigin` getter; 0 on the loopback / no-peer
+    /// fast path.
+    caller_origin: u64,
+    /// Per-call id (mints from the substrate). JS handlers may
+    /// thread it into per-call logging / tracing.
+    call_id: u64,
+    /// Caller's declared deadline as a Unix-nanos absolute
+    /// timestamp. `0` means "no deadline declared".
+    deadline_ns: u64,
+    /// Initial-REQUEST headers, name/value pairs. Names are
+    /// lowercase per the substrate convention. Empty when the
+    /// REQUEST carried no application headers.
+    headers: Arc<Vec<(String, Vec<u8>)>>,
+}
+
+#[napi]
+impl JsRequestStream {
+    /// Caller's peer origin hash. Surfaced as a bigint to JS so
+    /// the full u64 round-trips. `0n` on the loopback fast path
+    /// where there's no remote peer.
+    #[napi(getter)]
+    pub fn caller_origin(&self) -> BigInt {
+        BigInt::from(self.caller_origin)
+    }
+
+    /// The call_id minted by the substrate for this call. Stable
+    /// across the call's lifetime; useful for handler-side logging
+    /// and trace correlation.
+    #[napi(getter)]
+    pub fn call_id(&self) -> BigInt {
+        BigInt::from(self.call_id)
+    }
+
+    /// Caller's declared deadline as a Unix-nanoseconds absolute
+    /// timestamp. `0n` means no deadline was declared; otherwise
+    /// the handler MAY use it to short-circuit slow processing
+    /// past the wire deadline.
+    #[napi(getter)]
+    pub fn deadline_ns(&self) -> BigInt {
+        BigInt::from(self.deadline_ns)
+    }
+
+    /// Initial-REQUEST headers carried by the caller. Each entry
+    /// is `[name, value]` with `name` lowercase and `value` as a
+    /// raw Buffer (per the substrate's bytes contract — values
+    /// are not required to be UTF-8). Empty array if the REQUEST
+    /// carried no headers.
+    #[napi(getter)]
+    pub fn headers(&self) -> Vec<(String, Buffer)> {
+        self.headers
+            .iter()
+            .map(|(n, v)| (n.clone(), Buffer::from(v.as_slice())))
+            .collect()
+    }
+
+    /// Pull the next inbound chunk. Returns `null` on EOF
+    /// (REQUEST_END / CANCEL). Multiple `next()` calls in
+    /// parallel from the same JS task serialize through the
+    /// inner mutex.
+    ///
+    /// **Ordering under `Promise.all`.** Issuing
+    /// `Promise.all([s.next(), s.next(), s.next()])` is legal
+    /// but the order in which the three promises resolve is
+    /// **nondeterministic** — they race on the inner mutex.
+    /// Use sequential `await` (e.g. `while ((b = await s.next()))`)
+    /// when chunk order matters. The common case (single
+    /// consumer awaiting one chunk at a time) is always in
+    /// order.
+    #[napi]
+    pub async fn next(&self) -> Result<Option<Buffer>> {
+        let mut guard = self.inner.lock().await;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| nrpc_err("stream_closed", "request stream already closed"))?;
+        use futures::StreamExt;
+        match stream.next().await {
+            Some(bytes) => Ok(Some(Buffer::from(bytes.as_ref()))),
+            None => {
+                let _ = guard.take();
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Outbound response sink for duplex server handlers. Emit
+/// chunks via `sink.send(buffer)`. Non-blocking (SDK try_send
+/// under the hood); drops the chunk on overflow rather than
+/// blocking the handler. Same lifetime contract as
+/// [`JsRequestStream`].
+#[napi]
+pub struct JsResponseSink {
+    inner: Arc<Mutex<Option<InnerRpcResponseSink>>>,
+}
+
+#[napi]
+impl JsResponseSink {
+    /// Emit one response chunk. Returns `true` on success.
+    /// Returns `false` if the sink has been closed (handler
+    /// raced with the substrate fold's terminal-frame emission).
+    ///
+    /// **Flow control.** This call is non-blocking — it `try_send`s
+    /// into a bounded 1024-chunk mpsc that feeds the response pump.
+    /// The pump itself awaits per-call credit before publishing to
+    /// the wire (the `stream_window_initial` opt-in). If the pump
+    /// stalls on credit, the mpsc fills, and excess chunks are
+    /// dropped (counted via `streaming_chunks_dropped_total`). To
+    /// honor flow control, JS handlers should pace their emits via
+    /// the protocol's REQUEST_GRANT cadence rather than burst-
+    /// pushing past the credit window. This mirrors the Rust SDK's
+    /// `ResponseSinkTyped::send` contract — both are non-async.
+    #[napi]
+    pub fn send(&self, body: Buffer) -> bool {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.as_ref() {
+            Some(sink) => {
+                sink.send(napi_buffer_to_bytes(body));
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+// ============================================================================
+// Server-side TSFN bridges (Phase B9-2).
+//
+// Two TSFNs — one per shape. Both pass the napi class instances
+// as the arg; napi-rs's ToNapiValue impl (generated by #[napi]
+// for the class) constructs the JS wrapper on the JS thread.
+// ============================================================================
+
+/// TSFN for client-streaming handlers. JS side:
+/// `(stream: JsRequestStream) => Promise<Buffer>`.
+type ClientStreamingHandlerTsfn =
+    ThreadsafeFunction<JsRequestStream, Promise<Buffer>, JsRequestStream, napi::Status, false>;
+
+/// Internal wrapper struct ferried through the duplex TSFN.
+/// napi(object) requires its fields to be FromNapiValue, which
+/// #[napi] classes don't directly implement — so we register a
+/// pair of helper impls below that construct a JS array
+/// `[stream, sink]` on the JS thread and the handler
+/// destructures `(stream, sink) => ...`.
+pub struct DuplexHandlerArgs {
+    stream: JsRequestStream,
+    sink: JsResponseSink,
+}
+
+impl ToNapiValue for DuplexHandlerArgs {
+    unsafe fn to_napi_value(
+        env: napi::sys::napi_env,
+        val: Self,
+    ) -> napi::Result<napi::sys::napi_value> {
+        // Build a JS array [stream, sink]. JS handler destructures
+        // via `(args) => { const [stream, sink] = args; ... }`.
+        // Manual array construction gives us full control over
+        // the per-element ToNapiValue invocation for the napi
+        // class instances.
+        let env_wrapper = napi::Env::from_raw(env);
+        let mut arr = env_wrapper.create_array(2)?;
+        let stream_val = unsafe { JsRequestStream::to_napi_value(env, val.stream)? };
+        let sink_val = unsafe { JsResponseSink::to_napi_value(env, val.sink)? };
+        let stream_unknown =
+            unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, stream_val)? };
+        let sink_unknown =
+            unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, sink_val)? };
+        arr.set(0, stream_unknown)?;
+        arr.set(1, sink_unknown)?;
+        unsafe { napi::bindgen_prelude::Array::to_napi_value(env, arr) }
+    }
+}
+
+/// TSFN for duplex handlers. JS side:
+/// `(args: [JsRequestStream, JsResponseSink]) => Promise<Buffer>`.
+/// JS code unpacks via `(args) => { const [stream, sink] = args; ... }`
+/// and returns `Buffer.alloc(0)` (or any Buffer — value is
+/// ignored; the Promise resolving is the "handler done" signal).
+type DuplexHandlerTsfn =
+    ThreadsafeFunction<DuplexHandlerArgs, Promise<Buffer>, DuplexHandlerArgs, napi::Status, false>;
+
+/// `RpcClientStreamingHandler` impl bridging to JS via TSFN.
+struct NodeClientStreamingRpcHandler {
+    tsfn: ClientStreamingHandlerTsfn,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl RpcClientStreamingHandler for NodeClientStreamingRpcHandler {
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        requests: InnerRequestStream,
+    ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
+        let stream_handle = JsRequestStream {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(requests))),
+            caller_origin: ctx.caller_origin,
+            call_id: ctx.call_id,
+            deadline_ns: ctx.deadline_ns,
+            headers: Arc::new(ctx.headers),
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
+        let status = self.tsfn.call_with_return_value(
+            stream_handle,
+            ThreadsafeFunctionCallMode::NonBlocking,
+            move |ret: napi::Result<Promise<Buffer>>, _env| {
+                let _ = tx.send(ret);
+                napi::Result::Ok(())
+            },
+        );
+        if status != napi::Status::Ok {
+            return Err(RpcHandlerError::Internal(format!(
+                "TSFN enqueue failed: {status:?}"
+            )));
+        }
+        // Single deadline spanning both phases: TSFN dispatch
+        // (rx.await yields the JS Promise object) AND promise
+        // resolution (`promise.await` yields the response buffer).
+        // Previously only the first phase was bounded — a hung JS
+        // handler that returned a Promise that never resolved
+        // would pin the Rust task for the full call lifetime.
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let promise = match tokio::time::timeout_at(deadline, rx).await {
+            Ok(Ok(Ok(p))) => p,
+            Ok(Ok(Err(e))) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "JS client-streaming handler threw synchronously: {e}"
+                )))
+            }
+            Ok(Err(_)) => {
+                return Err(RpcHandlerError::Internal(
+                    "JS client-streaming callback channel disconnected".into(),
+                ))
+            }
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "JS client-streaming handler did not dispatch within {} ms",
+                    self.timeout.as_millis()
+                )))
+            }
+        };
+        let resp_buf = match tokio::time::timeout_at(deadline, promise).await {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                if let Some((code, body)) = parse_js_app_error(&msg) {
+                    return Err(RpcHandlerError::Application {
+                        code,
+                        message: body,
+                    });
+                }
+                return Err(RpcHandlerError::Internal(format!(
+                    "JS client-streaming handler promise rejected: {e}"
+                )));
+            }
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "JS client-streaming handler did not resolve within {} ms",
+                    self.timeout.as_millis()
+                )))
+            }
+        };
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: resp_buf.to_vec(),
+        })
+    }
+}
+
+/// `RpcDuplexHandler` impl bridging to JS via TSFN.
+struct NodeDuplexRpcHandler {
+    tsfn: DuplexHandlerTsfn,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl RpcDuplexHandler for NodeDuplexRpcHandler {
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        requests: InnerRequestStream,
+        responses: InnerRpcResponseSink,
+    ) -> std::result::Result<(), RpcHandlerError> {
+        let args = DuplexHandlerArgs {
+            stream: JsRequestStream {
+                inner: Arc::new(tokio::sync::Mutex::new(Some(requests))),
+                caller_origin: ctx.caller_origin,
+                call_id: ctx.call_id,
+                deadline_ns: ctx.deadline_ns,
+                headers: Arc::new(ctx.headers),
+            },
+            sink: JsResponseSink {
+                inner: Arc::new(Mutex::new(Some(responses))),
+            },
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
+        let status = self.tsfn.call_with_return_value(
+            args,
+            ThreadsafeFunctionCallMode::NonBlocking,
+            move |ret: napi::Result<Promise<Buffer>>, _env| {
+                let _ = tx.send(ret);
+                napi::Result::Ok(())
+            },
+        );
+        if status != napi::Status::Ok {
+            return Err(RpcHandlerError::Internal(format!(
+                "TSFN enqueue failed: {status:?}"
+            )));
+        }
+        // Single deadline spans both TSFN dispatch and Promise
+        // resolution — see the equivalent comment in the
+        // client-streaming bridge.
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let promise = match tokio::time::timeout_at(deadline, rx).await {
+            Ok(Ok(Ok(p))) => p,
+            Ok(Ok(Err(e))) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "JS duplex handler threw synchronously: {e}"
+                )))
+            }
+            Ok(Err(_)) => {
+                return Err(RpcHandlerError::Internal(
+                    "JS duplex callback channel disconnected".into(),
+                ))
+            }
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "JS duplex handler did not dispatch within {} ms",
+                    self.timeout.as_millis()
+                )))
+            }
+        };
+        match tokio::time::timeout_at(deadline, promise).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => {
+                let msg: String = format!("{e}");
+                if let Some((code, body)) = parse_js_app_error(&msg) {
+                    return Err(RpcHandlerError::Application {
+                        code,
+                        message: body,
+                    });
+                }
+                Err(RpcHandlerError::Internal(format!(
+                    "JS duplex handler promise rejected: {msg}"
+                )))
+            }
+            Err(_) => Err(RpcHandlerError::Internal(format!(
+                "JS duplex handler did not resolve within {} ms",
+                self.timeout.as_millis()
+            ))),
+        }
+    }
+}
+
+// ============================================================================
 // MeshRpc — the public envelope class.
 //
 // Constructed via `MeshRpc.fromMesh(mesh)` (matches the compute
@@ -735,6 +1560,127 @@ impl MeshRpc {
         })
     }
 
+    // ---- ABI 0x0002 client-streaming + duplex callers (B9-1) ----
+
+    /// Open a client-streaming call. Push chunks via
+    /// `call.send(buf)`, then `call.finish()` to await the
+    /// terminal response. The initial REQUEST is published
+    /// lazily on the first `send` (or on `finish` for the
+    /// degenerate zero-send path).
+    #[napi(js_name = "callClientStream")]
+    pub async fn call_client_stream(
+        &self,
+        target_node_id: BigInt,
+        service: String,
+        opts: Option<CallOptions>,
+    ) -> Result<ClientStreamCall> {
+        let target = crate::common::bigint_u64(target_node_id)?;
+        let opts = opts.unwrap_or_default().into_inner();
+        let inner = self
+            .node
+            .call_client_stream(target, &service, opts)
+            .await
+            .map_err(nrpc_err_from_inner)?;
+        let call_id_cached = inner.call_id();
+        let flow_controlled_cached = inner.flow_controlled();
+        Ok(ClientStreamCall {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+            call_id_cached,
+            flow_controlled_cached,
+            close_notify: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    /// Open a duplex call. Both `requestWindowInitial` (upload
+    /// flow control) and `streamWindowInitial` (download flow
+    /// control) on `CallOptions` are independently opt-in.
+    #[napi(js_name = "callDuplex")]
+    pub async fn call_duplex(
+        &self,
+        target_node_id: BigInt,
+        service: String,
+        opts: Option<CallOptions>,
+    ) -> Result<DuplexCall> {
+        let target = crate::common::bigint_u64(target_node_id)?;
+        let opts = opts.unwrap_or_default().into_inner();
+        let inner = self
+            .node
+            .call_duplex(target, &service, opts)
+            .await
+            .map_err(nrpc_err_from_inner)?;
+        let call_id_cached = inner.call_id();
+        let flow_controlled_cached = inner.flow_controlled();
+        Ok(DuplexCall {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+            call_id_cached,
+            flow_controlled_cached,
+            close_notify: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    // ---- ABI 0x0002 server-side serves (B9-2) ----
+
+    /// Register a client-streaming handler. JS signature:
+    /// `(stream: JsRequestStream) => Promise<Buffer>`.
+    ///
+    /// Drain inbound chunks via `await stream.next()` (returns
+    /// `null` on EOF). Return the terminal response Buffer.
+    /// Throw `new Error("nrpc:app_error:0x<code>:<body>")` to
+    /// signal a typed Application status (same convention as
+    /// `serve`).
+    #[napi(js_name = "serveClientStream")]
+    pub fn serve_client_stream(
+        &self,
+        service: String,
+        handler: Function<'_, JsRequestStream, Promise<Buffer>>,
+    ) -> Result<ServeHandle> {
+        let tsfn: ClientStreamingHandlerTsfn = handler.build_threadsafe_function().build()?;
+        let inner_handler = Arc::new(NodeClientStreamingRpcHandler {
+            tsfn,
+            timeout: DEFAULT_HANDLER_TIMEOUT,
+        });
+        let inner = self
+            .node
+            .serve_rpc_client_stream(&service, inner_handler)
+            .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
+        Ok(ServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        })
+    }
+
+    /// Register a duplex handler. JS signature:
+    /// `(args: [JsRequestStream, JsResponseSink]) => Promise<void>`.
+    /// JS destructures the args:
+    ///
+    ///   ```js
+    ///   mesh.serveDuplex("svc", async ([stream, sink]) => {
+    ///     while (true) {
+    ///       const chunk = await stream.next();
+    ///       if (chunk === null) break;
+    ///       sink.send(Buffer.concat([Buffer.from("echo:"), chunk]));
+    ///     }
+    ///   });
+    ///   ```
+    #[napi(js_name = "serveDuplex")]
+    pub fn serve_duplex(
+        &self,
+        service: String,
+        handler: Function<'_, DuplexHandlerArgs, Promise<Buffer>>,
+    ) -> Result<ServeHandle> {
+        let tsfn: DuplexHandlerTsfn = handler.build_threadsafe_function().build()?;
+        let inner_handler = Arc::new(NodeDuplexRpcHandler {
+            tsfn,
+            timeout: DEFAULT_HANDLER_TIMEOUT,
+        });
+        let inner = self
+            .node
+            .serve_rpc_duplex(&service, inner_handler)
+            .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
+        Ok(ServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        })
+    }
+
     // ---- discovery ------------------------------------------------------
 
     /// All node ids currently advertising `nrpc:<service>` in the
@@ -830,6 +1776,7 @@ mod tests {
         let opts = CallOptions {
             deadline_ms: Some(500),
             stream_window_initial: Some(8),
+            request_window_initial: None,
             cancel_token: None,
             request_headers: None,
         };
@@ -859,6 +1806,7 @@ mod tests {
         let opts = CallOptions {
             deadline_ms: None,
             stream_window_initial: None,
+            request_window_initial: None,
             cancel_token: None,
             request_headers: Some(vec![
                 RpcRequestHeader {
@@ -932,5 +1880,41 @@ mod tests {
         assert!(parse_js_app_error("nrpc:app_error:0x10000:body").is_none());
         // Empty (just prefix).
         assert!(parse_js_app_error("nrpc:app_error:").is_none());
+    }
+
+    /// Regression: Rust-side codec error messages (the format
+    /// surfaced by the typed bad-request handler path,
+    /// `RpcError::Codec`'s Display, the various encode/decode
+    /// failure strings) MUST NOT accidentally match the
+    /// `nrpc:app_error:<code>:<body>` shape. If they did, a
+    /// codec failure on the JS side could be misrouted to the
+    /// Application-error arm with bogus code/body.
+    #[test]
+    fn parse_js_app_error_does_not_match_codec_diagnostics() {
+        // The diagnostic strings emitted by the typed wrappers
+        // and substrate codec on various failure paths. Every
+        // one MUST return None — otherwise a codec error would
+        // surface as an Application error on the JS side.
+        let codec_strings = [
+            "typed streaming handler: bad request body: invalid type: integer `1`, expected struct",
+            "typed sink encode: missing field `numbers`",
+            "rpc codec encode: invalid number",
+            "rpc codec decode: trailing data",
+            "decode failed: invalid utf-8 sequence",
+            "typed handler returned Err(String): something went wrong",
+            // Looks vaguely similar but no `nrpc:app_error:` prefix.
+            "Error: app_error 0x8000",
+            "0x8000:body",
+            // Has prefix but is short of the colon-code-colon shape.
+            "nrpc:app_error",
+            // Whitespace-prefixed variants — parser is strict.
+            " nrpc:app_error:0x8000:body",
+        ];
+        for s in codec_strings {
+            assert!(
+                parse_js_app_error(s).is_none(),
+                "codec/diagnostic string MUST NOT match app-error format: {s:?}",
+            );
+        }
     }
 }

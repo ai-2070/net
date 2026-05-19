@@ -237,3 +237,19 @@ required-features = ["net", "cortex"]
 name = "nrpc_payload"
 harness = false
 required-features = ["net", "cortex"]
+
+# Phase F — client-streaming throughput. Caller pushes N typed
+# requests; server collects all + returns one terminal Resp.
+# Measures msgs/sec across N=16/256 x 64B/1KiB payloads.
+[[bench]]
+name = "nrpc_client_streaming"
+harness = false
+required-features = ["net", "cortex"]
+
+# Phase F — duplex round-trip throughput. Caller streams N
+# requests, server emits one Resp per Req. into_split lets send
+# + recv run in independent tasks (the realistic shape).
+[[bench]]
+name = "nrpc_duplex"
+harness = false
+required-features = ["net", "cortex"]

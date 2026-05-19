@@ -73,6 +73,33 @@ pub const DISPATCH_RPC_DEADLINE_EXCEEDED: u8 = 0x13;
 /// Phase 3.
 pub const DISPATCH_RPC_STREAM_GRANT: u8 = 0x14;
 
+/// Caller → server. Continuation chunk of a client-streaming or
+/// duplex REQUEST. Carries an [`RpcRequestChunkPayload`] after the
+/// `EventMeta` prefix. `EventMeta::seq_or_ts` matches the initial
+/// REQUEST's `call_id`. Non-terminal chunks have
+/// `flags & FLAG_RPC_REQUEST_END == 0`; the terminal upload chunk
+/// sets [`FLAG_RPC_REQUEST_END`].
+///
+/// Only meaningful for calls whose initial REQUEST set
+/// [`FLAG_RPC_CLIENT_STREAMING_REQUEST`]; otherwise the server
+/// silently drops the chunk (caller bug; no observable effect).
+pub const DISPATCH_RPC_REQUEST_CHUNK: u8 = 0x15;
+
+/// Server → caller. Request-direction stream-credit grant. Mirror
+/// of [`DISPATCH_RPC_STREAM_GRANT`] for the upload direction.
+/// Carries an [`RpcRequestGrantPayload`] after `EventMeta`: a
+/// `call_id` plus a `u32` credit count. `EventMeta::seq_or_ts`
+/// matches the call's `call_id` (redundant with the payload, but
+/// kept symmetric with the rest of the dispatch family).
+///
+/// Only meaningful when the caller opted into request-direction
+/// flow control via the `nrpc-request-window-initial` header
+/// ([`HEADER_NRPC_REQUEST_WINDOW_INITIAL`]). Caller's sink
+/// awaits one credit per `REQUEST_CHUNK`; absent header →
+/// unbounded credit (sink emits as fast as the publish path can
+/// take it).
+pub const DISPATCH_RPC_REQUEST_GRANT: u8 = 0x16;
+
 // ============================================================================
 // `RpcRequestPayload::flags` bit assignments.
 // ============================================================================
@@ -97,7 +124,36 @@ pub const FLAG_RPC_STREAMING_RESPONSE: u16 = 1 << 1;
 /// span emission. Phase 3.
 pub const FLAG_RPC_PROPAGATE_TRACE: u16 = 1 << 2;
 
-// Bits `3..=15` reserved; producers MUST write zero, consumers MUST
+// Bit `1 << 3` reserved — symmetric to the reserved bit 0 above,
+// kept as breathing room for a future protocol-level flag without
+// pushing every existing live bit.
+
+/// Set on the initial REQUEST if the caller will follow up with
+/// one or more [`DISPATCH_RPC_REQUEST_CHUNK`] events. Distinguishes
+/// client-streaming / duplex calls from unary at the very first
+/// frame so the server's fold knows to open a request-side stream
+/// instead of treating the REQUEST as complete.
+///
+/// Combined with [`FLAG_RPC_STREAMING_RESPONSE`] on the same
+/// REQUEST: full duplex.
+///
+/// Bidi streaming plan (Phase A).
+pub const FLAG_RPC_CLIENT_STREAMING_REQUEST: u16 = 1 << 4;
+
+/// Set on a [`DISPATCH_RPC_REQUEST_CHUNK`] (or on the initial
+/// REQUEST itself) to signal the terminal upload frame for a
+/// client-streaming or duplex call. After receiving this, the
+/// server's request-side stream yields `None` and the handler
+/// proceeds to its terminal response.
+///
+/// Setting this on the initial REQUEST is the degenerate "client-
+/// streaming with exactly one item" path — saves a round-trip
+/// for the trivial case.
+///
+/// Bidi streaming plan (Phase A).
+pub const FLAG_RPC_REQUEST_END: u16 = 1 << 5;
+
+// Bits `6..=15` reserved; producers MUST write zero, consumers MUST
 // ignore unknown bits (forward-compat with future flags).
 
 // ============================================================================
@@ -247,6 +303,65 @@ pub struct RpcRequestPayload {
     /// Application-defined request body. Caller and server agree on
     /// the codec out-of-band; nRPC doesn't interpret these bytes.
     pub body: Vec<u8>,
+}
+
+/// Continuation chunk for a client-streaming or duplex REQUEST.
+/// Lives after the 24-byte `EventMeta` prefix in a
+/// [`DISPATCH_RPC_REQUEST_CHUNK`] event.
+///
+/// Unlike the initial [`RpcRequestPayload`] there is no
+/// `service` field (server already routed by service at the
+/// initial REQUEST) and no `deadline_ns` (the initial REQUEST's
+/// deadline applies to the whole call). The `call_id` field is
+/// redundant with `EventMeta::seq_or_ts` but kept on the
+/// payload so the codec is self-contained — a reader handed a
+/// chunk's bytes without the meta header can still recover its
+/// correlation id.
+///
+/// Bidi streaming plan (Phase A).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcRequestChunkPayload {
+    /// Matches `EventMeta::seq_or_ts` and the original REQUEST's
+    /// `call_id`. Kept on the payload so the codec round-trips
+    /// in isolation.
+    pub call_id: u64,
+    /// Bitfield of `FLAG_RPC_*` constants. The only flag that
+    /// makes sense on a chunk today is [`FLAG_RPC_REQUEST_END`];
+    /// other flags MUST be zero on the wire so future protocol
+    /// extensions can claim them without colliding with
+    /// existing chunks.
+    pub flags: u16,
+    /// Per-chunk metadata. Typically empty; reserved for
+    /// trace-span continuity across long uploads, content-type
+    /// changes mid-stream, or other rare per-chunk concerns.
+    /// Capped at `MAX_RPC_HEADERS` entries with the same
+    /// per-field caps as `RpcRequestPayload::headers`.
+    pub headers: Vec<RpcHeader>,
+    /// Application-defined chunk body. Cap is `MAX_RPC_BODY_LEN`
+    /// (4 MiB), same as the initial REQUEST body — clients that
+    /// need >4 MiB total payload chunk their upload across
+    /// multiple `REQUEST_CHUNK` events.
+    pub body: Vec<u8>,
+}
+
+/// Request-direction credit grant. Lives after the 24-byte
+/// `EventMeta` prefix in a [`DISPATCH_RPC_REQUEST_GRANT`] event.
+/// Mirror of the response-direction [`encode_stream_grant`] /
+/// [`decode_stream_grant`] pair, but with an explicit `call_id`
+/// in the payload (instead of relying solely on
+/// `EventMeta::seq_or_ts`) so the codec is self-contained — same
+/// rationale as [`RpcRequestChunkPayload::call_id`].
+///
+/// Bidi streaming plan (Phase A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcRequestGrantPayload {
+    /// Matches the call's `call_id`.
+    pub call_id: u64,
+    /// Additional REQUEST_CHUNK frames the server is willing to
+    /// admit beyond the current credit. Server's incoming-credit
+    /// counter is capped defensively (see PHASE-B server fold)
+    /// so a misbehaving grant can't overflow.
+    pub credits: u32,
 }
 
 /// nRPC response payload. Lives after the 24-byte `EventMeta`
@@ -425,6 +540,94 @@ impl RpcRequestPayload {
         Ok(Self {
             service,
             deadline_ns,
+            flags,
+            headers,
+            body,
+        })
+    }
+}
+
+impl RpcRequestChunkPayload {
+    /// Compute the encoded byte length WITHOUT actually encoding.
+    /// See [`RpcRequestPayload::encoded_len`] for the rationale.
+    pub fn encoded_len(&self) -> usize {
+        // call_id: u64
+        8
+            // flags: u16
+            + 2
+            // headers: u8 count + per-header (u8 name_len + name + u16 value_len + value)
+            + 1
+            + self
+                .headers
+                .iter()
+                .map(|(n, v)| 1 + n.len() + 2 + v.len())
+                .sum::<usize>()
+            // body: u32 length + bytes
+            + 4
+            + self.body.len()
+    }
+
+    /// Encode to the wire bytes that follow the 24-byte `EventMeta`
+    /// prefix in a [`DISPATCH_RPC_REQUEST_CHUNK`] event. Same
+    /// encoder-bounds policy as [`RpcRequestPayload::encode`]:
+    /// oversize fields panic in debug, the decoder enforces in
+    /// release.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + self.body.len());
+        // call_id
+        buf.put_u64_le(self.call_id);
+        // flags
+        buf.put_u16_le(self.flags);
+        // headers
+        encode_headers(&self.headers, &mut buf);
+        // body
+        debug_assert!(
+            self.body.len() <= MAX_RPC_BODY_LEN,
+            "body length {} exceeds MAX_RPC_BODY_LEN ({})",
+            self.body.len(),
+            MAX_RPC_BODY_LEN,
+        );
+        buf.put_u32_le(self.body.len() as u32);
+        buf.extend_from_slice(&self.body);
+        buf
+    }
+
+    /// Decode from the wire bytes following the `EventMeta` prefix.
+    /// Bounded by the same `MAX_RPC_*` caps as the initial REQUEST.
+    pub fn decode(data: &[u8]) -> Result<Self, RpcCodecError> {
+        let mut cur = std::io::Cursor::new(data);
+        // call_id
+        if cur.remaining() < 8 {
+            return Err(RpcCodecError::Truncated("call_id"));
+        }
+        let call_id = cur.get_u64_le();
+        // flags
+        if cur.remaining() < 2 {
+            return Err(RpcCodecError::Truncated("flags"));
+        }
+        let flags = cur.get_u16_le();
+        // headers
+        let headers = decode_headers(&mut cur, data)?;
+        // body
+        if cur.remaining() < 4 {
+            return Err(RpcCodecError::Truncated("body length"));
+        }
+        let body_len = cur.get_u32_le() as usize;
+        if body_len > MAX_RPC_BODY_LEN {
+            return Err(RpcCodecError::TooLarge {
+                field: "body",
+                actual: body_len,
+                limit: MAX_RPC_BODY_LEN,
+            });
+        }
+        if cur.remaining() < body_len {
+            return Err(RpcCodecError::Truncated("body bytes"));
+        }
+        let body_start = cur.position() as usize;
+        let body_end = body_start + body_len;
+        let body = data[body_start..body_end].to_vec();
+        Ok(Self {
+            call_id,
             flags,
             headers,
             body,
@@ -808,6 +1011,66 @@ pub fn decode_stream_grant(payload: &[u8]) -> Option<u32> {
 pub fn parse_stream_window_initial(headers: &[RpcHeader]) -> Option<u32> {
     for (name, value) in headers {
         if name.eq_ignore_ascii_case(HEADER_NRPC_STREAM_WINDOW_INITIAL) {
+            return std::str::from_utf8(value).ok()?.parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+/// Header on the initial REQUEST of a client-streaming or duplex
+/// call that opts the upload direction into flow control with the
+/// given initial credit window. Value is the ASCII decimal
+/// representation of a `u32`. When present, the server's
+/// streaming-request fold creates a per-call semaphore and the
+/// caller's sink awaits one credit per `REQUEST_CHUNK`. The server
+/// refills via [`DISPATCH_RPC_REQUEST_GRANT`] events.
+///
+/// Absent → unbounded credit (caller's sink emits as fast as the
+/// publish path can take it). Long client-streaming calls that
+/// could outpace a slow handler SHOULD opt into flow control —
+/// without it, the server's chunk mpsc grows unbounded under a
+/// stalled handler.
+///
+/// Bidi streaming plan (Phase A).
+pub const HEADER_NRPC_REQUEST_WINDOW_INITIAL: &str = "nrpc-request-window-initial";
+
+/// Encode a request-grant payload — `call_id` (u64 little-endian)
+/// followed by additional credit (u32 big-endian). Big-endian on
+/// the credit field matches [`encode_stream_grant`]; little-endian
+/// on `call_id` matches the rest of the RPC codec's u64 fields.
+///
+/// Pair with [`decode_request_grant`] on the caller side.
+pub fn encode_request_grant(call_id: u64, credits: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(12);
+    buf.put_u64_le(call_id);
+    buf.extend_from_slice(&credits.to_be_bytes());
+    buf
+}
+
+/// Decode a request-grant payload. Returns `None` if the slice is
+/// not exactly 12 bytes — defends the caller's fold against
+/// malformed grants without killing the cortex adapter.
+pub fn decode_request_grant(payload: &[u8]) -> Option<RpcRequestGrantPayload> {
+    if payload.len() != 12 {
+        return None;
+    }
+    let mut cid = [0u8; 8];
+    cid.copy_from_slice(&payload[..8]);
+    let call_id = u64::from_le_bytes(cid);
+    let mut credits = [0u8; 4];
+    credits.copy_from_slice(&payload[8..]);
+    Some(RpcRequestGrantPayload {
+        call_id,
+        credits: u32::from_be_bytes(credits),
+    })
+}
+
+/// Parse the `nrpc-request-window-initial` header from a request's
+/// header list. Same semantics as [`parse_stream_window_initial`]
+/// but for the upload direction.
+pub fn parse_request_window_initial(headers: &[RpcHeader]) -> Option<u32> {
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case(HEADER_NRPC_REQUEST_WINDOW_INITIAL) {
             return std::str::from_utf8(value).ok()?.parse::<u32>().ok();
         }
     }
@@ -1446,6 +1709,229 @@ impl RpcResponseSink {
 /// strict throttling.
 pub const STREAMING_PUMP_CAPACITY: usize = 1024;
 
+/// Bounded capacity for the client-streaming server fold's
+/// per-call request mpsc. Mirror of [`STREAMING_PUMP_CAPACITY`]
+/// for the upload direction. A runaway caller that emits
+/// REQUEST_CHUNKs faster than the handler can drain stops
+/// queueing past this many chunks — additional chunks are
+/// dropped (and counted via `streaming_request_chunks_dropped_total`
+/// when metrics are wired). Opt-in flow control via the
+/// `nrpc-request-window-initial` header is the right primitive
+/// for strict throttling on the upload side.
+///
+/// Bidi streaming plan (Phase B).
+pub const STREAMING_REQUEST_PUMP_CAPACITY: usize = 1024;
+
+// ============================================================================
+// Phase B — server-side primitives for client-streaming.
+// ============================================================================
+
+/// Context handed to an [`RpcClientStreamingHandler::call`]. Same
+/// shape as [`RpcContext`] minus the eager `payload` (the request
+/// stream delivers chunk bodies on the fly) and plus the
+/// per-call `deadline_ns` (which would otherwise have ridden on
+/// the eager payload).
+///
+/// Bidi streaming plan (Phase B).
+pub struct RpcStreamingContext {
+    /// AEAD-verified caller `origin_hash`. Same source as
+    /// [`RpcContext::caller_origin`].
+    pub caller_origin: u64,
+    /// Caller-generated correlation id. Matches the initial
+    /// REQUEST's `call_id` and every subsequent REQUEST_CHUNK /
+    /// CANCEL / REQUEST_GRANT for this call.
+    pub call_id: u64,
+    /// Absolute deadline (unix nanos) from the initial REQUEST.
+    /// `0` means no deadline; the fold does NOT auto-cancel on
+    /// deadline (handlers self-supervise via tokio timers, same
+    /// contract as the unary fold).
+    pub deadline_ns: u64,
+    /// Per-chunk metadata headers from the initial REQUEST.
+    /// Per-REQUEST_CHUNK headers are NOT surfaced at the substrate
+    /// layer — the typed SDK veneer (Phase E) is where header
+    /// inspection across chunks lives (if it lands at all; the
+    /// plan defers per-chunk-headers as opt-in raw-path access).
+    pub headers: Vec<RpcHeader>,
+    /// Cancellation signal. Flipped by the fold when a
+    /// `DISPATCH_RPC_CANCEL` arrives for this call's `call_id`.
+    /// Long-running handlers should `select!` on
+    /// `cancellation.cancelled()`; the request stream also
+    /// terminates on cancellation, but the token is the
+    /// authoritative signal (the stream's terminator is shared
+    /// with REQUEST_END).
+    pub cancellation: RpcCancellationToken,
+    /// W3C Trace Context propagated from the caller's initial
+    /// REQUEST. Same semantics as [`RpcContext::trace_context`].
+    pub trace_context: Option<TraceContext>,
+}
+
+/// Callback the fold invokes to publish a [`DISPATCH_RPC_REQUEST_GRANT`]
+/// event back to the caller. Wired up by the `Mesh` glue (Phase C)
+/// to publish on the caller's reply channel. Type-erased so the
+/// fold doesn't depend on the mesh layer directly.
+///
+/// Arguments: `(caller_origin, call_id, credits)`. Synchronous —
+/// the publish itself is non-blocking (the underlying transport
+/// has its own internal queueing); the fold fires-and-forgets
+/// every grant, so dropped grants are at worst a latency wobble,
+/// not a correctness issue (the caller's send sink will retry
+/// when its credit budget refills via the next grant or via the
+/// initial window).
+///
+/// Bidi streaming plan (Phase B).
+pub type RpcRequestGrantEmitter = Arc<dyn Fn(u64, u64, u32) + Send + Sync + 'static>;
+
+/// Server-side stream of inbound request chunk bodies for one
+/// client-streaming (or duplex) call. Yields one `Bytes` per
+/// `DISPATCH_RPC_REQUEST` / `DISPATCH_RPC_REQUEST_CHUNK` frame
+/// (including empty bodies — the semantics of "empty bytes" are
+/// the application's concern, not the substrate's). Closes on
+/// `FLAG_RPC_REQUEST_END` or on CANCEL.
+///
+/// **Stream item ordering convention**: the first item this
+/// stream yields corresponds to the initial REQUEST body; every
+/// subsequent item corresponds to a REQUEST_CHUNK body, in the
+/// order the chunks were received from the wire. The substrate
+/// does not tag items with their frame kind — the SDK veneer
+/// (Phase E) is responsible for the Init / Data classification
+/// via its `Chunk<T>` enum.
+///
+/// **Auto-grant behavior**: when the caller opted into
+/// request-direction flow control via
+/// [`HEADER_NRPC_REQUEST_WINDOW_INITIAL`], every successful
+/// `poll_next()` fires one credit back to the caller via the
+/// captured `grant_emitter`. This keeps the in-flight window
+/// at the caller's initial value as the handler drains the
+/// stream. When the caller did NOT opt in (no header), the
+/// `grant_emitter` is `None` and the auto-grant path is a no-op
+/// (caller is on the unbounded-credit fast path).
+///
+/// Bidi streaming plan (Phase B).
+pub struct RequestStream {
+    inner: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    grant_emitter: Option<RpcRequestGrantEmitter>,
+    caller_origin: u64,
+    call_id: u64,
+}
+
+impl RequestStream {
+    /// Visible to the fold (and only the fold) for constructing
+    /// a stream tied to a specific receiver + caller. The
+    /// `grant_emitter` is `None` when the caller didn't opt into
+    /// flow control; `Some(...)` when they did.
+    pub(crate) fn new(
+        inner: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        grant_emitter: Option<RpcRequestGrantEmitter>,
+        caller_origin: u64,
+        call_id: u64,
+    ) -> Self {
+        Self {
+            inner,
+            grant_emitter,
+            caller_origin,
+            call_id,
+        }
+    }
+}
+
+impl futures::Stream for RequestStream {
+    type Item = bytes::Bytes;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.inner.poll_recv(cx) {
+            std::task::Poll::Ready(Some(bytes)) => {
+                // Auto-grant fires on every successful pull when
+                // flow control was opted into. Cheap and
+                // fire-and-forget; missed grants are recovered
+                // by subsequent pulls.
+                if let Some(emit) = self.grant_emitter.as_ref() {
+                    emit(self.caller_origin, self.call_id, 1);
+                }
+                std::task::Poll::Ready(Some(bytes))
+            }
+            other => other,
+        }
+    }
+}
+
+/// User-supplied handler for a client-streaming RPC. Receives an
+/// [`RpcStreamingContext`] (caller identity, deadline, cancellation,
+/// trace context, initial REQUEST headers) plus a [`RequestStream`]
+/// of chunk bodies. Returns one terminal [`RpcResponsePayload`] —
+/// the fold publishes it as the call's single RESPONSE frame.
+///
+/// **Cancellation contract.** Long-running handlers should
+/// `select!` on `ctx.cancellation.cancelled()` so a caller-side
+/// drop / deadline correctly stops the handler. The request
+/// stream also terminates on cancellation (yields `None`), but
+/// the token is the authoritative signal — the stream's `None`
+/// is shared with the clean REQUEST_END path, so handlers can't
+/// distinguish "caller finished cleanly" from "caller cancelled"
+/// without consulting the token.
+///
+/// **Auto-grant.** When the caller opted into request-direction
+/// flow control via [`HEADER_NRPC_REQUEST_WINDOW_INITIAL`], every
+/// `stream.next().await` that yields `Some` fires one
+/// REQUEST_GRANT back to the caller, maintaining the in-flight
+/// window at the caller's initial value. Handlers don't need to
+/// think about credit management for the common case.
+///
+/// Bidi streaming plan (Phase B).
+#[async_trait::async_trait]
+pub trait RpcClientStreamingHandler: Send + Sync + 'static {
+    /// Process a client-streaming call. Drain the request stream,
+    /// produce one terminal response payload (or an
+    /// [`RpcHandlerError`] for failure mapping).
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        requests: RequestStream,
+    ) -> Result<RpcResponsePayload, RpcHandlerError>;
+}
+
+/// User-supplied handler for a duplex RPC — many requests in,
+/// many responses out, interleaved. Receives an [`RpcStreamingContext`]
+/// plus a [`RequestStream`] of chunk bodies plus an
+/// [`RpcResponseSink`] for emitting response chunks. The handler's
+/// return value is its terminal status, NOT a final payload:
+/// `Ok(())` closes the response stream cleanly with a terminal
+/// `Ok` frame, `Err(RpcHandlerError)` closes with the matching
+/// error status.
+///
+/// **Composition.** A duplex handler is a hybrid of an
+/// [`RpcClientStreamingHandler`] (drains request chunks) and an
+/// [`RpcStreamingHandler`] (emits response chunks). The two
+/// directions are independent — a handler can finish emitting
+/// responses before reading all requests, or vice versa. The
+/// server fold serializes RESPONSE chunk publishes per call_id
+/// so wire order matches handler order.
+///
+/// **Cancellation contract.** Identical to
+/// [`RpcClientStreamingHandler`]: long-running work should
+/// `select!` on `ctx.cancellation.cancelled()`.
+///
+/// **Auto-grant.** Identical to [`RpcClientStreamingHandler`]:
+/// every successful `requests.next().await` emits one
+/// REQUEST_GRANT back to the caller (when the caller opted in).
+///
+/// Bidi streaming plan (Phase D).
+#[async_trait::async_trait]
+pub trait RpcDuplexHandler: Send + Sync + 'static {
+    /// Process one duplex call. Drain inbound chunks via
+    /// `requests.next().await`; emit outbound chunks via
+    /// `responses.send(...)`. Return `Ok(())` for clean close,
+    /// `Err(RpcHandlerError)` for failure mapping.
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        requests: RequestStream,
+        responses: RpcResponseSink,
+    ) -> Result<(), RpcHandlerError>;
+}
+
 /// User-supplied streaming handler. Receives the same `RpcContext`
 /// as a unary handler plus a `RpcResponseSink` for emitting chunks.
 /// Returning `Ok(())` closes the stream cleanly with a terminal
@@ -1872,6 +2358,924 @@ impl RedexFold<()> for RpcServerStreamingFold {
 }
 
 // ============================================================================
+// Phase B — server-side fold for client-streaming.
+//
+// `RpcStreamingRequestFold` mirrors `RpcServerStreamingFold` but
+// flipped on the data-direction axis: the SERVER consumes a
+// stream of REQUEST_CHUNK events and the handler produces ONE
+// terminal RESPONSE (vs. the response-side fold where one REQUEST
+// drives many RESPONSE chunks).
+//
+// Wire shape it handles:
+//   DISPATCH_RPC_REQUEST       (FLAG_RPC_CLIENT_STREAMING_REQUEST)
+//   DISPATCH_RPC_REQUEST_CHUNK (zero or more)
+//   DISPATCH_RPC_REQUEST_CHUNK (FLAG_RPC_REQUEST_END)
+//   DISPATCH_RPC_CANCEL        (any time; flips token + closes stream)
+//
+// Wire shape it EMITS (via callbacks):
+//   DISPATCH_RPC_RESPONSE        (one terminal frame; via RpcResponseEmitter)
+//   DISPATCH_RPC_REQUEST_GRANT   (one per consumed chunk when flow
+//                                 control is opted in; via
+//                                 RpcRequestGrantEmitter)
+//
+// Each service binds to exactly one fold shape (unary, server-
+// streaming, or client-streaming) at `serve_rpc*` registration.
+// A REQUEST without FLAG_RPC_CLIENT_STREAMING_REQUEST that lands
+// on the client-streaming fold is a caller bug — the fold emits a
+// terminal `Internal` and drops the call.
+// ============================================================================
+
+/// Per-call request-direction sender map type. Keyed on
+/// `(caller_origin_hash, call_id)`; value is the bounded mpsc
+/// sender the fold's `apply()` pushes REQUEST_CHUNK bodies into.
+/// The matching receiver lives inside the handler's
+/// [`RequestStream`]; dropping the sender (on REQUEST_END or
+/// CANCEL) closes the stream.
+type RequestChunkSenders = Arc<Mutex<HashMap<(u64, u64), tokio::sync::mpsc::Sender<bytes::Bytes>>>>;
+
+/// Shared REQUEST_CHUNK handling used by both
+/// [`RpcStreamingRequestFold`] and [`RpcDuplexFold`]. Decodes the
+/// payload, validates the call_id agreement, looks up the per-call
+/// sender, pushes the body (skipping the empty-body FLAG_END
+/// terminator), and removes the sender on FLAG_END so the
+/// handler's stream observes EOF.
+///
+/// `diag_tag` selects the log prefix ("client-streaming" or
+/// "duplex") so the two call sites surface identically-shaped
+/// diagnostics with the correct fold name. The behavior is
+/// otherwise identical — both folds carry the same wire format
+/// and the same per-call mpsc + sender-map contract.
+fn apply_request_chunk_to_senders(
+    payload_bytes: &[u8],
+    meta: &EventMeta,
+    senders: &RequestChunkSenders,
+    diag_tag: &'static str,
+) {
+    let payload = match RpcRequestChunkPayload::decode(payload_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                caller_origin = format!("{:#x}", meta.origin_hash),
+                call_id = meta.seq_or_ts,
+                tag = diag_tag,
+                "rpc server fold: malformed REQUEST_CHUNK payload",
+            );
+            return;
+        }
+    };
+    if payload.call_id != meta.seq_or_ts {
+        tracing::warn!(
+            caller_origin = format!("{:#x}", meta.origin_hash),
+            meta_call_id = meta.seq_or_ts,
+            payload_call_id = payload.call_id,
+            tag = diag_tag,
+            "rpc server fold: REQUEST_CHUNK payload call_id does not match EventMeta",
+        );
+        return;
+    }
+    let key = (meta.origin_hash, meta.seq_or_ts);
+    let is_end = payload.flags & FLAG_RPC_REQUEST_END != 0;
+    let sender = senders.lock().get(&key).cloned();
+    let Some(sender) = sender else {
+        // Unknown call — either the initial REQUEST hasn't
+        // arrived yet (out-of-order delivery is possible on the
+        // bus) or the handler already completed and the entry is
+        // gone. Drop silently.
+        tracing::debug!(
+            caller_origin = format!("{:#x}", meta.origin_hash),
+            call_id = meta.seq_or_ts,
+            tag = diag_tag,
+            "rpc server fold: REQUEST_CHUNK for unknown call_id; dropping",
+        );
+        return;
+    };
+    let is_pure_terminator = is_end && payload.body.is_empty();
+    if !is_pure_terminator && sender.try_send(bytes::Bytes::from(payload.body)).is_err() {
+        tracing::debug!(
+            caller_origin = format!("{:#x}", meta.origin_hash),
+            call_id = meta.seq_or_ts,
+            tag = diag_tag,
+            "rpc server fold: request-chunk mpsc full or closed; dropping",
+        );
+    }
+    if is_end {
+        // Drop the sender from the map → its clone here goes out
+        // of scope at end of function → the receiver in the
+        // handler's RequestStream sees EOF on the next poll.
+        senders.lock().remove(&key);
+    }
+}
+
+/// Server-side fold for client-streaming RPC. Parallel to
+/// [`RpcServerStreamingFold`] but consumes REQUEST_CHUNK on the
+/// input side and produces one terminal RESPONSE on the output
+/// side (vs. one REQUEST in / many RESPONSE chunks out).
+///
+/// State `()` — like the other folds, application state lives in
+/// the handler's captured `Arc<Mutex<S>>`. The fold's own state
+/// (in-flight cancellation tokens + per-call request-chunk
+/// senders) lives on `&mut self` via `Arc<Mutex<...>>` so spawned
+/// handler tasks can self-clean on completion.
+///
+/// Bidi streaming plan (Phase B).
+pub struct RpcStreamingRequestFold {
+    handler: Arc<dyn RpcClientStreamingHandler>,
+    emit: RpcResponseEmitter,
+    /// Optional request-direction grant emitter. `Some(...)`
+    /// when the surrounding mesh glue is wired to publish
+    /// REQUEST_GRANT events; `None` in unit tests / contexts
+    /// without a real publish path. When `None`, the auto-grant
+    /// path on every `RequestStream::poll_next` becomes a no-op
+    /// (callers that opted into flow control will see no
+    /// refill and stall once their initial window is exhausted —
+    /// honest behavior for a fold not wired up for grants).
+    grant_emit: Option<RpcRequestGrantEmitter>,
+    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    senders: RequestChunkSenders,
+    /// Optional per-service metrics handle. Same shape as the
+    /// other folds. Reuses the response-side counters where they
+    /// apply (handler_invocations / handler_panics / etc.) and
+    /// would gain request-side counters (e.g.
+    /// `streaming_request_chunks_dropped_total`) in a follow-up.
+    metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
+}
+
+impl RpcStreamingRequestFold {
+    /// Construct a client-streaming server fold. `emit` publishes
+    /// the terminal RESPONSE on the caller's reply channel.
+    ///
+    /// Use the sync [`RpcResponseEmitter`] here — there's only
+    /// one RESPONSE per call (the terminal frame), so the
+    /// per-call serialization the async emitter buys for the
+    /// response-side fold is not needed here.
+    pub fn new(handler: Arc<dyn RpcClientStreamingHandler>, emit: RpcResponseEmitter) -> Self {
+        Self {
+            handler,
+            emit,
+            grant_emit: None,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            senders: Arc::new(Mutex::new(HashMap::new())),
+            metrics: None,
+        }
+    }
+
+    /// Attach the request-direction grant emitter. Hands every
+    /// `RequestStream::poll_next` a hook to fire one REQUEST_GRANT
+    /// back to the caller after a chunk is consumed. Optional —
+    /// folds constructed without it still work, callers that
+    /// opted into flow control just won't be refilled.
+    pub fn with_grant_emitter(mut self, grant_emit: RpcRequestGrantEmitter) -> Self {
+        self.grant_emit = Some(grant_emit);
+        self
+    }
+
+    /// Attach a per-service metrics handle. Hooks the spawned
+    /// handler task to bump `handler_invocations_total` /
+    /// `handler_in_flight` / `handler_panics_total` /
+    /// `handler_duration_*`. Symmetric with `RpcServerFold` and
+    /// `RpcServerStreamingFold`.
+    pub fn with_metrics(
+        mut self,
+        metrics: Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>,
+    ) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Test-only: snapshot of the in-flight call set.
+    #[cfg(test)]
+    pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
+        self.in_flight.lock().keys().copied().collect()
+    }
+
+    /// Test-only: snapshot of the in-flight per-call senders.
+    /// Useful for tests that need to assert a call's sender has
+    /// been dropped after REQUEST_END / CANCEL.
+    #[cfg(test)]
+    pub fn sender_keys(&self) -> Vec<(u64, u64)> {
+        self.senders.lock().keys().copied().collect()
+    }
+}
+
+impl RedexFold<()> for RpcStreamingRequestFold {
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
+            EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
+        } else {
+            None
+        }) else {
+            tracing::warn!(
+                payload_len = ev.payload.len(),
+                "rpc client-streaming server fold: event payload too short for EventMeta",
+            );
+            return Ok(());
+        };
+        let key = (meta.origin_hash, meta.seq_or_ts);
+        match meta.dispatch {
+            DISPATCH_RPC_REQUEST => {
+                let payload = match RpcRequestPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc client-streaming server fold: malformed request payload",
+                        );
+                        let resp = RpcResponsePayload {
+                            status: RpcStatus::UnknownVersion,
+                            headers: vec![],
+                            body: format!("malformed request: {e}").into_bytes(),
+                        };
+                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                        return Ok(());
+                    }
+                };
+                // A REQUEST without the client-streaming flag on
+                // this fold is a caller bug — the service was
+                // registered as client-streaming. Refuse cleanly.
+                if payload.flags & FLAG_RPC_CLIENT_STREAMING_REQUEST == 0 {
+                    tracing::warn!(
+                        caller_origin = format!("{:#x}", meta.origin_hash),
+                        call_id = meta.seq_or_ts,
+                        flags = format!("{:#06x}", payload.flags),
+                        "rpc client-streaming server fold: REQUEST missing FLAG_RPC_CLIENT_STREAMING_REQUEST",
+                    );
+                    let resp = RpcResponsePayload {
+                        status: RpcStatus::Internal,
+                        headers: vec![],
+                        body:
+                            b"REQUEST on a client-streaming service must set FLAG_RPC_CLIENT_STREAMING_REQUEST"
+                                .to_vec(),
+                    };
+                    (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                    return Ok(());
+                }
+                // Refuse a duplicate REQUEST with the same
+                // `(origin_hash, call_id)` — same rationale as
+                // the response-side fold: a retry that arrives
+                // while the first attempt is still in-flight
+                // would overwrite the prior sender and orphan the
+                // existing handler.
+                {
+                    let in_flight = self.in_flight.lock();
+                    if in_flight.contains_key(&key) {
+                        drop(in_flight);
+                        tracing::warn!(
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc client-streaming server fold: duplicate REQUEST for in-flight call_id; refusing",
+                        );
+                        let resp = RpcResponsePayload {
+                            status: RpcStatus::Internal,
+                            headers: vec![],
+                            body: b"duplicate REQUEST for already-in-flight call_id".to_vec(),
+                        };
+                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                        return Ok(());
+                    }
+                }
+                let cancellation = RpcCancellationToken::new();
+                self.in_flight.lock().insert(key, cancellation.clone());
+                // Build the per-call request-chunk mpsc. Bounded
+                // capacity — overflow on the sender side drops the
+                // chunk (caller can re-send or, if flow-control is
+                // wired, will naturally not push past the credit
+                // window).
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<bytes::Bytes>(STREAMING_REQUEST_PUMP_CAPACITY);
+                // Terminator-semantics rule: an empty body
+                // combined with FLAG_REQUEST_END is a pure
+                // terminator — the caller's `finish()` emits it
+                // to close the stream without yielding a phantom
+                // empty item to the handler. A non-empty body on
+                // a FLAG_END frame IS a final item (used by the
+                // "single-item degenerate path": initial REQUEST
+                // with FLAG_END + a real body sends one item +
+                // closes in a single frame).
+                let end_on_initial = payload.flags & FLAG_RPC_REQUEST_END != 0;
+                let is_pure_terminator = end_on_initial && payload.body.is_empty();
+                if !is_pure_terminator {
+                    // Fresh `mpsc::channel(STREAMING_REQUEST_PUMP_CAPACITY)`
+                    // with a live receiver — try_send cannot fail.
+                    // debug_assert surfaces the invariant break in
+                    // tests; release logs at error level rather than
+                    // silently swallowing the first request body.
+                    if tx.try_send(bytes::Bytes::from(payload.body)).is_err() {
+                        debug_assert!(
+                            false,
+                            "fresh client-streaming request mpsc rejected initial body"
+                        );
+                        tracing::error!(
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc client-streaming server fold: fresh mpsc rejected initial REQUEST body (invariant break)",
+                        );
+                    }
+                }
+                // If the initial REQUEST also set FLAG_REQUEST_END,
+                // close the stream immediately — degenerate case of
+                // "one-item upload" where the caller didn't bother
+                // with a trailing REQUEST_CHUNK. Don't even insert
+                // the sender into the map; just drop it here.
+                if !end_on_initial {
+                    self.senders.lock().insert(key, tx);
+                }
+                // Build the handler's context + stream. Auto-grant
+                // is opted into when the caller set the request
+                // window header AND the fold was wired with a
+                // grant emitter; both must be present for grants
+                // to actually fly.
+                let grant_emitter = if parse_request_window_initial(&payload.headers).is_some() {
+                    self.grant_emit.clone()
+                } else {
+                    None
+                };
+                let request_stream =
+                    RequestStream::new(rx, grant_emitter, meta.origin_hash, meta.seq_or_ts);
+                let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
+                    extract_trace_context(&payload.headers)
+                } else {
+                    None
+                };
+                let deadline_ns = payload.deadline_ns;
+                let ctx = RpcStreamingContext {
+                    caller_origin: meta.origin_hash,
+                    call_id: meta.seq_or_ts,
+                    deadline_ns,
+                    headers: payload.headers,
+                    cancellation: cancellation.clone(),
+                    trace_context,
+                };
+                let handler = self.handler.clone();
+                let emit = self.emit.clone();
+                let in_flight = self.in_flight.clone();
+                let senders = self.senders.clone();
+                let caller_origin = meta.origin_hash;
+                let call_id = meta.seq_or_ts;
+                let cancel_probe = cancellation.clone();
+                let cancel_for_deadline = cancellation.clone();
+                let metrics = self.metrics.clone();
+                tokio::spawn(async move {
+                    if let Some(m) = metrics.as_ref() {
+                        m.handler_invocations_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        m.handler_in_flight
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let handler_started = std::time::Instant::now();
+                    // Deadline guard: if the caller declared
+                    // `deadline_ns`, force-drop the handler future
+                    // after it elapses so an orphaned request stream
+                    // (caller-side network partition before
+                    // REQUEST_END arrives) can never hang the call
+                    // indefinitely. `deadline_ns = 0` means "no
+                    // deadline" — caller's responsibility.
+                    let call_fut = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                        handler.call(ctx, request_stream),
+                    ));
+                    let outcome = if deadline_ns > 0 {
+                        let now_ns = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0);
+                        let remaining = deadline_ns.saturating_sub(now_ns);
+                        if remaining == 0 {
+                            cancel_for_deadline.cancel();
+                            Ok(Err(RpcHandlerError::Internal(
+                                "handler deadline_ns already expired at spawn".to_string(),
+                            )))
+                        } else {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_nanos(remaining),
+                                call_fut,
+                            )
+                            .await
+                            {
+                                Ok(o) => o,
+                                Err(_) => {
+                                    cancel_for_deadline.cancel();
+                                    Ok(Err(RpcHandlerError::Internal(
+                                        "handler deadline_ns exceeded".to_string(),
+                                    )))
+                                }
+                            }
+                        }
+                    } else {
+                        call_fut.await
+                    };
+                    if let Some(m) = metrics.as_ref() {
+                        m.handler_in_flight
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        m.record_handler_duration(handler_started.elapsed());
+                        if outcome.is_err() {
+                            m.handler_panics_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    // CANCEL-wins ordering: if the cancellation
+                    // token fired during execution, override the
+                    // handler's terminal with Cancelled.
+                    let terminal = if cancel_probe.is_cancelled() {
+                        RpcResponsePayload {
+                            status: RpcStatus::Cancelled,
+                            headers: vec![],
+                            body:
+                                b"server observed CANCEL during client-streaming handler execution"
+                                    .to_vec(),
+                        }
+                    } else {
+                        match outcome {
+                            Ok(Ok(resp)) => resp,
+                            Ok(Err(RpcHandlerError::Application { code, message })) => {
+                                RpcResponsePayload {
+                                    status: RpcStatus::Application(code),
+                                    headers: vec![],
+                                    body: message.into_bytes(),
+                                }
+                            }
+                            Ok(Err(RpcHandlerError::Internal(message))) => RpcResponsePayload {
+                                status: RpcStatus::Internal,
+                                headers: vec![],
+                                body: message.into_bytes(),
+                            },
+                            Err(panic) => {
+                                let panic_msg = panic
+                                    .downcast_ref::<&'static str>()
+                                    .map(|s| s.to_string())
+                                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "<non-string panic>".into());
+                                tracing::error!(
+                                    caller_origin = format!("{:#x}", caller_origin),
+                                    call_id,
+                                    panic = %panic_msg,
+                                    "rpc client-streaming server handler panicked",
+                                );
+                                RpcResponsePayload {
+                                    status: RpcStatus::Internal,
+                                    headers: vec![],
+                                    body: format!("handler panicked: {panic_msg}").into_bytes(),
+                                }
+                            }
+                        }
+                    };
+                    in_flight.lock().remove(&key);
+                    // Drop the per-call request-chunk sender too
+                    // (idempotent — already gone if REQUEST_END
+                    // arrived; defensive otherwise so a handler
+                    // that returned without consuming all chunks
+                    // doesn't leak the entry).
+                    senders.lock().remove(&key);
+                    (emit)(caller_origin, call_id, terminal);
+                });
+            }
+            DISPATCH_RPC_REQUEST_CHUNK => {
+                apply_request_chunk_to_senders(
+                    &ev.payload[EVENT_META_SIZE..],
+                    &meta,
+                    &self.senders,
+                    "client-streaming",
+                );
+            }
+            DISPATCH_RPC_CANCEL => {
+                if let Some(token) = self.in_flight.lock().remove(&key) {
+                    token.cancel();
+                }
+                // Drop the per-call sender so the handler's
+                // RequestStream yields None on the next poll
+                // (handler observes cancel via the token OR via
+                // the stream's EOF; the cancel_probe in the
+                // spawned task ensures the terminal RESPONSE is
+                // Cancelled regardless of which the handler
+                // checks first).
+                self.senders.lock().remove(&key);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Phase D — server-side fold for full duplex.
+//
+// `RpcDuplexFold` is the hybrid of `RpcStreamingRequestFold`
+// (Phase B — request side) and `RpcServerStreamingFold` (existing
+// — response side). The handler trait takes BOTH a `RequestStream`
+// AND an `RpcResponseSink`; the fold spawns one handler task per
+// REQUEST and one pump task per call_id, then emits a terminal
+// RESPONSE on handler return.
+//
+// Wire shape it consumes:
+//   DISPATCH_RPC_REQUEST       (FLAG_CLIENT_STREAMING_REQUEST + FLAG_STREAMING_RESPONSE)
+//   DISPATCH_RPC_REQUEST_CHUNK (zero or more, with FLAG_REQUEST_END on the last)
+//   DISPATCH_RPC_CANCEL        (flips token + closes both directions)
+//
+// Wire shape it produces:
+//   DISPATCH_RPC_RESPONSE        (multi-fire; nrpc-streaming: continue / end)
+//   DISPATCH_RPC_REQUEST_GRANT   (one per consumed request-chunk when flow
+//                                 control is opted in)
+//
+// Bidi streaming plan (Phase D).
+// ============================================================================
+
+/// Server-side fold for duplex RPC. Composes Phase B's request
+/// stream + per-call request-chunk senders with the existing
+/// response-side pump + multi-fire RESPONSE emit.
+///
+/// State `()` — same as the sibling folds.
+///
+/// Bidi streaming plan (Phase D).
+pub struct RpcDuplexFold {
+    handler: Arc<dyn RpcDuplexHandler>,
+    /// Async emitter for response chunks (per-call ordering via
+    /// awaited emits — same rationale as `RpcServerStreamingFold`).
+    emit: RpcAsyncResponseEmitter,
+    /// Optional request-direction grant emitter.
+    grant_emit: Option<RpcRequestGrantEmitter>,
+    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    senders: RequestChunkSenders,
+    metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
+}
+
+impl RpcDuplexFold {
+    /// Construct a duplex server fold. `emit` publishes individual
+    /// response chunks AND the terminal frame on the caller's
+    /// reply channel (uses the async emitter for per-call
+    /// ordering, same as `RpcServerStreamingFold`).
+    pub fn new(handler: Arc<dyn RpcDuplexHandler>, emit: RpcAsyncResponseEmitter) -> Self {
+        Self {
+            handler,
+            emit,
+            grant_emit: None,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            senders: Arc::new(Mutex::new(HashMap::new())),
+            metrics: None,
+        }
+    }
+
+    /// Attach the request-direction grant emitter. See
+    /// [`RpcStreamingRequestFold::with_grant_emitter`] for the
+    /// auto-grant behavior. When unset, callers that opted into
+    /// flow control simply won't get refilled.
+    pub fn with_grant_emitter(mut self, grant_emit: RpcRequestGrantEmitter) -> Self {
+        self.grant_emit = Some(grant_emit);
+        self
+    }
+
+    /// Attach a per-service metrics handle. Bumps
+    /// handler_invocations / handler_in_flight / handler_panics /
+    /// handler_duration_* + the response pump's
+    /// streaming_chunks_emitted_total per emitted chunk.
+    pub fn with_metrics(
+        mut self,
+        metrics: Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>,
+    ) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Test-only: snapshot of the in-flight call set.
+    #[cfg(test)]
+    pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
+        self.in_flight.lock().keys().copied().collect()
+    }
+
+    /// Test-only: snapshot of the in-flight per-call senders.
+    #[cfg(test)]
+    pub fn sender_keys(&self) -> Vec<(u64, u64)> {
+        self.senders.lock().keys().copied().collect()
+    }
+}
+
+impl RedexFold<()> for RpcDuplexFold {
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
+            EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
+        } else {
+            None
+        }) else {
+            tracing::warn!(
+                payload_len = ev.payload.len(),
+                "rpc duplex server fold: event payload too short for EventMeta",
+            );
+            return Ok(());
+        };
+        let key = (meta.origin_hash, meta.seq_or_ts);
+        match meta.dispatch {
+            DISPATCH_RPC_REQUEST => {
+                let payload = match RpcRequestPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc duplex server fold: malformed request payload",
+                        );
+                        let resp = RpcResponsePayload {
+                            status: RpcStatus::UnknownVersion,
+                            headers: vec![(
+                                HEADER_NRPC_STREAMING.to_string(),
+                                HEADER_NRPC_STREAMING_END.to_vec(),
+                            )],
+                            body: format!("malformed request: {e}").into_bytes(),
+                        };
+                        let emit = self.emit.clone();
+                        let caller_origin = meta.origin_hash;
+                        let call_id = meta.seq_or_ts;
+                        tokio::spawn(async move {
+                            emit(caller_origin, call_id, resp).await;
+                        });
+                        return Ok(());
+                    }
+                };
+                // Caller-bug guard: a duplex REQUEST must set
+                // BOTH the client-streaming flag (we'll receive
+                // request chunks) AND the streaming-response flag
+                // (we'll emit response chunks). Missing flags →
+                // refuse cleanly.
+                let required = FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_STREAMING_RESPONSE;
+                if payload.flags & required != required {
+                    tracing::warn!(
+                        caller_origin = format!("{:#x}", meta.origin_hash),
+                        call_id = meta.seq_or_ts,
+                        flags = format!("{:#06x}", payload.flags),
+                        "rpc duplex server fold: REQUEST missing required flags",
+                    );
+                    let resp = RpcResponsePayload {
+                        status: RpcStatus::Internal,
+                        headers: vec![(
+                            HEADER_NRPC_STREAMING.to_string(),
+                            HEADER_NRPC_STREAMING_END.to_vec(),
+                        )],
+                        body:
+                            b"REQUEST on a duplex service must set FLAG_RPC_CLIENT_STREAMING_REQUEST and FLAG_RPC_STREAMING_RESPONSE"
+                                .to_vec(),
+                    };
+                    let emit = self.emit.clone();
+                    let caller_origin = meta.origin_hash;
+                    let call_id = meta.seq_or_ts;
+                    tokio::spawn(async move {
+                        emit(caller_origin, call_id, resp).await;
+                    });
+                    return Ok(());
+                }
+                // Duplicate-REQUEST refusal.
+                {
+                    let in_flight = self.in_flight.lock();
+                    if in_flight.contains_key(&key) {
+                        drop(in_flight);
+                        tracing::warn!(
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc duplex server fold: duplicate REQUEST for in-flight call_id; refusing",
+                        );
+                        let resp = RpcResponsePayload {
+                            status: RpcStatus::Internal,
+                            headers: vec![(
+                                HEADER_NRPC_STREAMING.to_string(),
+                                HEADER_NRPC_STREAMING_END.to_vec(),
+                            )],
+                            body: b"duplicate REQUEST for already-in-flight call_id".to_vec(),
+                        };
+                        let emit = self.emit.clone();
+                        let caller_origin = meta.origin_hash;
+                        let call_id = meta.seq_or_ts;
+                        tokio::spawn(async move {
+                            emit(caller_origin, call_id, resp).await;
+                        });
+                        return Ok(());
+                    }
+                }
+                let cancellation = RpcCancellationToken::new();
+                self.in_flight.lock().insert(key, cancellation.clone());
+
+                // Build per-call request-side mpsc (Phase B
+                // pattern).
+                let (req_tx, req_rx) =
+                    tokio::sync::mpsc::channel::<bytes::Bytes>(STREAMING_REQUEST_PUMP_CAPACITY);
+                let end_on_initial = payload.flags & FLAG_RPC_REQUEST_END != 0;
+                let is_pure_terminator = end_on_initial && payload.body.is_empty();
+                if !is_pure_terminator {
+                    // Same invariant as the client-streaming fold:
+                    // fresh bounded mpsc with a live receiver cannot
+                    // reject the first send.
+                    if req_tx.try_send(bytes::Bytes::from(payload.body)).is_err() {
+                        debug_assert!(false, "fresh duplex request mpsc rejected initial body");
+                        tracing::error!(
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc duplex server fold: fresh mpsc rejected initial REQUEST body (invariant break)",
+                        );
+                    }
+                }
+                if !end_on_initial {
+                    self.senders.lock().insert(key, req_tx);
+                }
+                // Hand the handler an auto-granting RequestStream
+                // when the caller opted into request-direction
+                // flow control AND the fold was wired with a
+                // grant emitter.
+                let grant_emitter = if parse_request_window_initial(&payload.headers).is_some() {
+                    self.grant_emit.clone()
+                } else {
+                    None
+                };
+                let request_stream =
+                    RequestStream::new(req_rx, grant_emitter, meta.origin_hash, meta.seq_or_ts);
+
+                // Build the per-call response-side mpsc (existing
+                // server-streaming-response pattern). The handler
+                // writes chunks to the sink; the pump task drains
+                // the receiver and publishes RESPONSE events.
+                let (resp_tx, mut resp_rx) =
+                    tokio::sync::mpsc::channel::<bytes::Bytes>(STREAMING_PUMP_CAPACITY);
+                let response_sink = RpcResponseSink {
+                    inner: resp_tx,
+                    metrics: self.metrics.clone(),
+                };
+
+                let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
+                    extract_trace_context(&payload.headers)
+                } else {
+                    None
+                };
+                let deadline_ns = payload.deadline_ns;
+                let ctx = RpcStreamingContext {
+                    caller_origin: meta.origin_hash,
+                    call_id: meta.seq_or_ts,
+                    deadline_ns,
+                    headers: payload.headers,
+                    cancellation: cancellation.clone(),
+                    trace_context,
+                };
+                let handler = self.handler.clone();
+                let emit = self.emit.clone();
+                let in_flight = self.in_flight.clone();
+                let senders = self.senders.clone();
+                let caller_origin = meta.origin_hash;
+                let call_id = meta.seq_or_ts;
+                let cancel_probe = cancellation.clone();
+                let cancel_for_deadline = cancellation.clone();
+                let metrics = self.metrics.clone();
+
+                // Pump: drains resp_rx, emits per-chunk RESPONSE
+                // events with `nrpc-streaming: continue`.
+                let pump_emit = emit.clone();
+                let pump_metrics = metrics.clone();
+                let pump = tokio::spawn(async move {
+                    while let Some(chunk) = resp_rx.recv().await {
+                        if let Some(m) = pump_metrics.as_ref() {
+                            m.streaming_chunks_emitted_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let resp = RpcResponsePayload {
+                            status: RpcStatus::Ok,
+                            headers: vec![(
+                                HEADER_NRPC_STREAMING.to_string(),
+                                HEADER_NRPC_STREAMING_CONTINUE.to_vec(),
+                            )],
+                            body: chunk.to_vec(),
+                        };
+                        pump_emit(caller_origin, call_id, resp).await;
+                    }
+                });
+
+                tokio::spawn(async move {
+                    if let Some(m) = metrics.as_ref() {
+                        m.handler_invocations_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        m.handler_in_flight
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let handler_started = std::time::Instant::now();
+                    // Same deadline guard as the client-streaming
+                    // fold: force-drop the handler future at
+                    // deadline_ns so an orphaned request stream
+                    // can't hang the call. `0` means no deadline.
+                    let call_fut = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                        handler.call(ctx, request_stream, response_sink),
+                    ));
+                    let outcome = if deadline_ns > 0 {
+                        let now_ns = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0);
+                        let remaining = deadline_ns.saturating_sub(now_ns);
+                        if remaining == 0 {
+                            cancel_for_deadline.cancel();
+                            Ok(Err(RpcHandlerError::Internal(
+                                "duplex handler deadline_ns already expired at spawn".to_string(),
+                            )))
+                        } else {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_nanos(remaining),
+                                call_fut,
+                            )
+                            .await
+                            {
+                                Ok(o) => o,
+                                Err(_) => {
+                                    cancel_for_deadline.cancel();
+                                    Ok(Err(RpcHandlerError::Internal(
+                                        "duplex handler deadline_ns exceeded".to_string(),
+                                    )))
+                                }
+                            }
+                        }
+                    } else {
+                        call_fut.await
+                    };
+                    // Handler dropped the sink — let the pump
+                    // drain any final in-flight chunks before we
+                    // emit the terminal frame.
+                    let _ = pump.await;
+                    if let Some(m) = metrics.as_ref() {
+                        m.handler_in_flight
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        m.record_handler_duration(handler_started.elapsed());
+                        if outcome.is_err() {
+                            m.handler_panics_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    let terminal = if cancel_probe.is_cancelled() {
+                        RpcResponsePayload {
+                            status: RpcStatus::Cancelled,
+                            headers: vec![],
+                            body: b"server observed CANCEL during duplex handler execution"
+                                .to_vec(),
+                        }
+                    } else {
+                        match outcome {
+                            Ok(Ok(())) => RpcResponsePayload {
+                                status: RpcStatus::Ok,
+                                headers: vec![(
+                                    HEADER_NRPC_STREAMING.to_string(),
+                                    HEADER_NRPC_STREAMING_END.to_vec(),
+                                )],
+                                body: vec![],
+                            },
+                            Ok(Err(RpcHandlerError::Application { code, message })) => {
+                                RpcResponsePayload {
+                                    status: RpcStatus::Application(code),
+                                    headers: vec![],
+                                    body: message.into_bytes(),
+                                }
+                            }
+                            Ok(Err(RpcHandlerError::Internal(message))) => RpcResponsePayload {
+                                status: RpcStatus::Internal,
+                                headers: vec![],
+                                body: message.into_bytes(),
+                            },
+                            Err(panic) => {
+                                let panic_msg = panic
+                                    .downcast_ref::<&'static str>()
+                                    .map(|s| s.to_string())
+                                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "<non-string panic>".into());
+                                tracing::error!(
+                                    caller_origin = format!("{:#x}", caller_origin),
+                                    call_id,
+                                    panic = %panic_msg,
+                                    "rpc duplex server handler panicked",
+                                );
+                                RpcResponsePayload {
+                                    status: RpcStatus::Internal,
+                                    headers: vec![],
+                                    body: format!("handler panicked: {panic_msg}").into_bytes(),
+                                }
+                            }
+                        }
+                    };
+                    in_flight.lock().remove(&key);
+                    senders.lock().remove(&key);
+                    emit(caller_origin, call_id, terminal).await;
+                });
+            }
+            DISPATCH_RPC_REQUEST_CHUNK => {
+                apply_request_chunk_to_senders(
+                    &ev.payload[EVENT_META_SIZE..],
+                    &meta,
+                    &self.senders,
+                    "duplex",
+                );
+            }
+            DISPATCH_RPC_CANCEL => {
+                if let Some(token) = self.in_flight.lock().remove(&key) {
+                    token.cancel();
+                }
+                self.senders.lock().remove(&key);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Client-side fold.
 //
 // `RpcClientFold` is the symmetric companion of `RpcServerFold`.
@@ -1887,20 +3291,61 @@ impl RedexFold<()> for RpcServerStreamingFold {
 // when the matching RESPONSE arrives.
 // ============================================================================
 
-/// One pending entry — either a unary oneshot or a streaming
-/// mpsc. The fold dispatches to the right variant based on
+/// One pending entry — unary oneshot, server-streaming mpsc, or
+/// client-streaming (one terminal oneshot + a separate grant
+/// mpsc). The fold dispatches to the right variant based on
 /// what's registered for the `call_id`.
 enum PendingEntry {
     /// Unary call — exactly one RESPONSE expected. Completes the
     /// oneshot with the decoded payload.
     Unary(tokio::sync::oneshot::Sender<RpcResponsePayload>),
-    /// Streaming call — multiple non-terminal `Continue` chunks
-    /// followed by one terminal frame. Each non-terminal chunk
-    /// pushes a `StreamItem::Chunk(body)` onto the mpsc; the
-    /// terminal frame pushes `StreamItem::End` (Ok) or
+    /// Server-streaming call — multiple non-terminal `Continue`
+    /// chunks followed by one terminal frame. Each non-terminal
+    /// chunk pushes a `StreamItem::Chunk(body)` onto the mpsc;
+    /// the terminal frame pushes `StreamItem::End` (Ok) or
     /// `StreamItem::Error(payload)` (non-Ok status) and the
     /// pending entry is removed.
     Streaming(tokio::sync::mpsc::UnboundedSender<StreamItem>),
+    /// Client-streaming or duplex call. Two sender halves:
+    ///
+    /// - `terminal_tx`: oneshot that completes when the server's
+    ///   single terminal RESPONSE arrives. Response shape and
+    ///   delivery semantics are identical to the unary variant —
+    ///   the caller awaits one payload, success or failure status.
+    /// - `grant_tx`: mpsc that ferries REQUEST_GRANT credit values
+    ///   from the client fold to the caller's send sink. Each
+    ///   `DISPATCH_RPC_REQUEST_GRANT` event for this call_id
+    ///   pushes one `u32` credit onto the mpsc; the caller's send
+    ///   sink consumes credits to gate `send(...).await`.
+    ///
+    /// Bidi streaming plan (Phase C). Used for pure client-
+    /// streaming (one terminal RESPONSE closes the call). Duplex
+    /// calls use the [`PendingEntry::Duplex`] variant instead,
+    /// since they receive many response chunks rather than one
+    /// terminal payload.
+    ClientStreaming {
+        terminal_tx: tokio::sync::oneshot::Sender<RpcResponsePayload>,
+        grant_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    },
+    /// Duplex call — many request chunks out, many response
+    /// chunks in. Two senders, same shape as `ClientStreaming`
+    /// except the terminal slot is an mpsc instead of a oneshot
+    /// because the response side is multi-chunk (terminator is
+    /// implicit in `StreamItem::End` / `StreamItem::Error` on
+    /// the chunks_tx mpsc, same as `PendingEntry::Streaming`).
+    ///
+    /// - `chunks_tx`: response-chunk mpsc — fed by `deliver`
+    ///   when RESPONSE events arrive on the reply channel.
+    ///   `StreamItem::Chunk` for non-terminal, `StreamItem::End`
+    ///   / `StreamItem::Error` terminates and removes the entry.
+    /// - `grant_tx`: request-direction credit mpsc — fed by
+    ///   `deliver_grant` when REQUEST_GRANT events arrive.
+    ///
+    /// Bidi streaming plan (Phase D).
+    Duplex {
+        chunks_tx: tokio::sync::mpsc::UnboundedSender<StreamItem>,
+        grant_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    },
 }
 
 /// One item delivered to a streaming caller. The caller's
@@ -1986,6 +3431,78 @@ impl RpcClientPending {
         rx
     }
 
+    /// Register a client-streaming (or duplex) entry for
+    /// `call_id`. Returns BOTH the terminal-response receiver
+    /// (the caller awaits on this for the single terminal
+    /// RESPONSE that ends the call) AND a grant receiver (the
+    /// caller's send sink consumes this to gate `send().await`
+    /// when the caller opted into request-direction flow
+    /// control).
+    ///
+    /// Same registration ordering rules as `register` /
+    /// `register_streaming` — publisher must call this BEFORE
+    /// publishing the REQUEST so a fast server's RESPONSE /
+    /// REQUEST_GRANT can't arrive while no pending entry exists.
+    ///
+    /// Bidi streaming plan (Phase C).
+    pub fn register_client_streaming(
+        &self,
+        call_id: u64,
+        target_node: super::super::behavior::placement::NodeId,
+    ) -> (
+        tokio::sync::oneshot::Receiver<RpcResponsePayload>,
+        tokio::sync::mpsc::UnboundedReceiver<u32>,
+    ) {
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let (grant_tx, grant_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.senders.insert(
+            call_id,
+            (
+                target_node,
+                PendingEntry::ClientStreaming {
+                    terminal_tx,
+                    grant_tx,
+                },
+            ),
+        );
+        (terminal_rx, grant_rx)
+    }
+
+    /// Register a duplex entry for `call_id`. Returns BOTH a
+    /// response-chunk receiver (yields `StreamItem` per inbound
+    /// RESPONSE chunk; terminator is `End` / `Error`) AND a
+    /// grant receiver (yields `u32` credits per inbound
+    /// REQUEST_GRANT).
+    ///
+    /// Same registration ordering rules as the other `register_*`
+    /// methods: publisher must call this BEFORE publishing the
+    /// REQUEST so the server's response chunks / grants can't
+    /// arrive while no pending entry exists.
+    ///
+    /// Bidi streaming plan (Phase D).
+    pub fn register_duplex(
+        &self,
+        call_id: u64,
+        target_node: super::super::behavior::placement::NodeId,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
+        tokio::sync::mpsc::UnboundedReceiver<u32>,
+    ) {
+        let (chunks_tx, chunks_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (grant_tx, grant_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.senders.insert(
+            call_id,
+            (
+                target_node,
+                PendingEntry::Duplex {
+                    chunks_tx,
+                    grant_tx,
+                },
+            ),
+        );
+        (chunks_rx, grant_rx)
+    }
+
     /// Drop the pending entry for `call_id`. Called by the
     /// caller-side cancellation path (e.g. `Mesh::call`'s future
     /// being dropped, the stream being dropped, or a deadline
@@ -2049,59 +3566,128 @@ impl RpcClientPending {
                     let _ = tx.send(resp);
                 }
             }
-            (_, PendingEntry::Streaming(tx)) => {
-                let kind = classify_streaming_chunk(&resp);
-                match kind {
-                    StreamingChunkKind::Continue => {
-                        // Non-terminal: push the chunk, keep the
-                        // entry for future RESPONSE events.
-                        let _ = tx.send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
-                    }
-                    StreamingChunkKind::Terminal => {
-                        // Terminal: classify Ok-end vs Error-end
-                        // and remove the entry.
-                        let item = if resp.status.is_ok() {
-                            // Ok terminal frame: emit a final
-                            // chunk if the body is non-empty,
-                            // then End.
-                            if !resp.body.is_empty() {
-                                let _ = tx.send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
-                            }
-                            StreamItem::End
-                        } else {
-                            StreamItem::Error(resp)
-                        };
-                        let _ = tx.send(item);
-                        drop(entry);
-                        self.senders.remove(&call_id);
-                    }
-                    StreamingChunkKind::Unary => {
-                        // Streaming entry but unary-shaped
-                        // response (no `nrpc-streaming` header,
-                        // status Ok). This usually indicates a
-                        // server-side bug — the caller opened a
-                        // streaming call but the server replied
-                        // through the unary path. Warn so
-                        // operators can see the mismatch in logs;
-                        // treat as terminal end with body as a
-                        // single chunk so the caller still gets
-                        // the data instead of hanging.
-                        tracing::warn!(
-                            call_id,
-                            body_len = resp.body.len(),
-                            "rpc client: streaming consumer received unary-shaped \
-                             response (no nrpc-streaming header); server may have \
-                             bridged a unary path. Bridging to single-chunk + EOF.",
-                        );
-                        if !resp.body.is_empty() {
-                            let _ = tx.send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
-                        }
-                        let _ = tx.send(StreamItem::End);
-                        drop(entry);
-                        self.senders.remove(&call_id);
-                    }
+            (_, PendingEntry::ClientStreaming { .. }) => {
+                // Terminal RESPONSE for a client-streaming /
+                // duplex call. Same delivery shape as Unary —
+                // complete the oneshot, remove the entry. The
+                // grant_tx half drops with the entry, which is
+                // fine (no more grants will arrive after the
+                // terminal frame).
+                drop(entry);
+                if let Some((
+                    _,
+                    (
+                        _,
+                        PendingEntry::ClientStreaming {
+                            terminal_tx,
+                            grant_tx: _,
+                        },
+                    ),
+                )) = self.senders.remove(&call_id)
+                {
+                    let _ = terminal_tx.send(resp);
                 }
             }
+            (_, PendingEntry::Streaming(tx)) => {
+                let tx = tx.clone();
+                drop(entry);
+                self.dispatch_streaming_chunk(&tx, resp, call_id);
+            }
+            (_, PendingEntry::Duplex { chunks_tx, .. }) => {
+                // Same dispatch logic as Streaming — duplex
+                // response side IS a multi-chunk stream.
+                let tx = chunks_tx.clone();
+                drop(entry);
+                self.dispatch_streaming_chunk(&tx, resp, call_id);
+            }
+        }
+    }
+
+    /// Shared response-chunk dispatch used by both
+    /// `PendingEntry::Streaming` and `PendingEntry::Duplex`. The
+    /// caller has already verified the target-binding gate and
+    /// dropped its `entry` ref; this helper does the classify-
+    /// and-push and removes the entry from the senders map on
+    /// terminal frames.
+    fn dispatch_streaming_chunk(
+        &self,
+        tx: &tokio::sync::mpsc::UnboundedSender<StreamItem>,
+        resp: RpcResponsePayload,
+        call_id: u64,
+    ) {
+        let kind = classify_streaming_chunk(&resp);
+        match kind {
+            StreamingChunkKind::Continue => {
+                let _ = tx.send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
+            }
+            StreamingChunkKind::Terminal => {
+                let item = if resp.status.is_ok() {
+                    if !resp.body.is_empty() {
+                        let _ = tx.send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
+                    }
+                    StreamItem::End
+                } else {
+                    StreamItem::Error(resp)
+                };
+                let _ = tx.send(item);
+                self.senders.remove(&call_id);
+            }
+            StreamingChunkKind::Unary => {
+                tracing::warn!(
+                    call_id,
+                    body_len = resp.body.len(),
+                    "rpc client: streaming / duplex consumer received unary-shaped \
+                     response (no nrpc-streaming header); server may have bridged a \
+                     unary path. Bridging to single-chunk + EOF.",
+                );
+                if !resp.body.is_empty() {
+                    let _ = tx.send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
+                }
+                let _ = tx.send(StreamItem::End);
+                self.senders.remove(&call_id);
+            }
+        }
+    }
+
+    /// Deliver a request-direction grant credit to the waiter
+    /// for `call_id`, if it's a client-streaming / duplex entry.
+    /// Silently no-op for unknown call_ids, for unary entries
+    /// (caller bug — grant for a unary call makes no sense),
+    /// and for server-streaming entries (grants apply only to
+    /// the upload direction).
+    ///
+    /// `from_node` is gated by the same target-binding check
+    /// as `deliver`: a grant from a non-target session peer is
+    /// dropped (a forged grant on a shared reply channel can't
+    /// inject credit into a victim's call).
+    ///
+    /// Bidi streaming plan (Phase C).
+    fn deliver_grant(
+        &self,
+        call_id: u64,
+        from_node: super::super::behavior::placement::NodeId,
+        credits: u32,
+    ) {
+        let entry = self.senders.get(&call_id);
+        let Some(entry) = entry else { return };
+        let (target_node, _entry_value) = entry.value();
+        if *target_node != 0 && *target_node != from_node {
+            tracing::trace!(
+                call_id,
+                from_node,
+                expected = *target_node,
+                "rpc client: dropping REQUEST_GRANT from non-target session peer"
+            );
+            return;
+        }
+        match entry.value() {
+            (_, PendingEntry::ClientStreaming { grant_tx, .. })
+            | (_, PendingEntry::Duplex { grant_tx, .. }) => {
+                let _ = grant_tx.send(credits);
+            }
+            // Unary / Streaming entries silently ignore — see
+            // method docs for the rationale.
+            _ => {}
         }
     }
 
@@ -2158,17 +3744,62 @@ impl RpcClientFold {
             );
             return;
         };
-        if meta.dispatch != DISPATCH_RPC_RESPONSE {
-            return;
-        }
-        match RpcResponsePayload::decode(&ev.payload[EVENT_META_SIZE..]) {
-            Ok(resp) => self.pending.deliver(meta.seq_or_ts, ev.from_node, resp),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    call_id = meta.seq_or_ts,
-                    "rpc client fold: malformed response payload",
-                );
+        match meta.dispatch {
+            DISPATCH_RPC_RESPONSE => {
+                match RpcResponsePayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                    Ok(resp) => self.pending.deliver(meta.seq_or_ts, ev.from_node, resp),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            call_id = meta.seq_or_ts,
+                            "rpc client fold: malformed response payload",
+                        );
+                    }
+                }
+            }
+            DISPATCH_RPC_REQUEST_GRANT => {
+                // Server granted upload credit for a
+                // client-streaming / duplex call. Route it to the
+                // matching pending entry's grant mpsc; non-client-
+                // streaming entries silently ignore (see
+                // RpcClientPending::deliver_grant docs).
+                match decode_request_grant(&ev.payload[EVENT_META_SIZE..]) {
+                    Some(grant) => {
+                        // The payload's `call_id` MUST agree with
+                        // the EventMeta's `seq_or_ts`: producer
+                        // encodes both to the same value (see
+                        // `RpcRequestGrantPayload::call_id` docs).
+                        // If they disagree, the frame is malformed
+                        // or forged — drop it. Otherwise a peer
+                        // could publish a GRANT whose meta names
+                        // one call but whose payload credits a
+                        // different in-flight call_id.
+                        if grant.call_id != meta.seq_or_ts {
+                            tracing::debug!(
+                                meta_call_id = meta.seq_or_ts,
+                                payload_call_id = grant.call_id,
+                                "rpc client fold: REQUEST_GRANT meta/payload call_id mismatch; dropping",
+                            );
+                            return;
+                        }
+                        if grant.credits == 0 {
+                            return;
+                        }
+                        self.pending
+                            .deliver_grant(grant.call_id, ev.from_node, grant.credits);
+                    }
+                    None => {
+                        tracing::debug!(
+                            call_id = meta.seq_or_ts,
+                            "rpc client fold: malformed REQUEST_GRANT payload"
+                        );
+                    }
+                }
+            }
+            _ => {
+                // Unknown / unexpected dispatch on the reply
+                // channel — ignore (a misconfigured publisher
+                // shouldn't take down the fold).
             }
         }
     }
@@ -2193,28 +3824,60 @@ impl RedexFold<()> for RpcClientFold {
             );
             return Ok(());
         };
-        // Only RESPONSE events are routed; the caller's reply
-        // channel shouldn't carry REQUEST/CANCEL traffic, but if a
-        // misconfigured publisher sent some, ignore them rather
-        // than killing the fold.
-        if meta.dispatch != DISPATCH_RPC_RESPONSE {
-            return Ok(());
-        }
-        match RpcResponsePayload::decode(&ev.payload[EVENT_META_SIZE..]) {
-            Ok(resp) => self.pending.deliver(meta.seq_or_ts, 0, resp),
-            Err(e) => {
-                // Malformed RESPONSE on the reply channel. We can't
-                // fabricate a synthetic response (the call_id might
-                // be valid; we just can't tell what it was supposed
-                // to mean). Log and leave the pending entry intact
-                // — the caller's deadline / cancellation path will
-                // eventually clean it up.
-                tracing::warn!(
-                    error = %e,
-                    call_id = meta.seq_or_ts,
-                    "rpc client fold: malformed response payload",
-                );
+        // Route RESPONSE and REQUEST_GRANT events; ignore other
+        // dispatches a misconfigured publisher might send. The
+        // loopback path uses `from_node = 0` which the pending
+        // registry treats as "no binding" — see the apply_inbound
+        // production-path counterpart above for the AEAD-verified
+        // peer routing.
+        match meta.dispatch {
+            DISPATCH_RPC_RESPONSE => {
+                match RpcResponsePayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                    Ok(resp) => self.pending.deliver(meta.seq_or_ts, 0, resp),
+                    Err(e) => {
+                        // Malformed RESPONSE on the reply channel.
+                        // We can't fabricate a synthetic response
+                        // (the call_id might be valid; we just
+                        // can't tell what it was supposed to
+                        // mean). Log and leave the pending entry
+                        // intact — the caller's deadline /
+                        // cancellation path will eventually clean
+                        // it up.
+                        tracing::warn!(
+                            error = %e,
+                            call_id = meta.seq_or_ts,
+                            "rpc client fold: malformed response payload",
+                        );
+                    }
+                }
             }
+            DISPATCH_RPC_REQUEST_GRANT => {
+                match decode_request_grant(&ev.payload[EVENT_META_SIZE..]) {
+                    Some(grant) => {
+                        // See `apply_inbound` REQUEST_GRANT arm for
+                        // the meta/payload call_id invariant.
+                        if grant.call_id != meta.seq_or_ts {
+                            tracing::debug!(
+                                meta_call_id = meta.seq_or_ts,
+                                payload_call_id = grant.call_id,
+                                "rpc client fold: REQUEST_GRANT meta/payload call_id mismatch; dropping",
+                            );
+                            return Ok(());
+                        }
+                        if grant.credits == 0 {
+                            return Ok(());
+                        }
+                        self.pending.deliver_grant(grant.call_id, 0, grant.credits);
+                    }
+                    None => {
+                        tracing::debug!(
+                            call_id = meta.seq_or_ts,
+                            "rpc client fold: malformed REQUEST_GRANT payload"
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -2290,6 +3953,9 @@ mod tests {
         assert_eq!(DISPATCH_RPC_RESPONSE, 0x11);
         assert_eq!(DISPATCH_RPC_CANCEL, 0x12);
         assert_eq!(DISPATCH_RPC_DEADLINE_EXCEEDED, 0x13);
+        assert_eq!(DISPATCH_RPC_STREAM_GRANT, 0x14);
+        assert_eq!(DISPATCH_RPC_REQUEST_CHUNK, 0x15);
+        assert_eq!(DISPATCH_RPC_REQUEST_GRANT, 0x16);
     }
 
     /// Regression: encoder bounds. Encoding a service name longer
@@ -2388,11 +4054,195 @@ mod tests {
     /// reuse it without breaking existing senders.
     #[test]
     fn flag_bit_assignments_leave_idempotent_slot_reserved() {
-        // Bit 0 (1 << 0) is reserved; the live flags occupy higher bits.
+        // Bit 0 (1 << 0) and bit 3 (1 << 3) are reserved; live flags
+        // occupy other bits. Pinning the exact assignments here so
+        // a renumber that collides with bit 0 (future `IDEMPOTENT`
+        // re-add) or bit 3 (held in reserve for a future protocol
+        // flag) surfaces in the test suite before it ships.
         assert_eq!(FLAG_RPC_STREAMING_RESPONSE, 1 << 1);
         assert_eq!(FLAG_RPC_PROPAGATE_TRACE, 1 << 2);
-        assert_eq!(FLAG_RPC_STREAMING_RESPONSE & 1, 0);
-        assert_eq!(FLAG_RPC_PROPAGATE_TRACE & 1, 0);
+        assert_eq!(FLAG_RPC_CLIENT_STREAMING_REQUEST, 1 << 4);
+        assert_eq!(FLAG_RPC_REQUEST_END, 1 << 5);
+        for flag in [
+            FLAG_RPC_STREAMING_RESPONSE,
+            FLAG_RPC_PROPAGATE_TRACE,
+            FLAG_RPC_CLIENT_STREAMING_REQUEST,
+            FLAG_RPC_REQUEST_END,
+        ] {
+            assert_eq!(
+                flag & (1 << 0),
+                0,
+                "flag {flag:#06x} collides with reserved bit 0"
+            );
+            assert_eq!(
+                flag & (1 << 3),
+                0,
+                "flag {flag:#06x} collides with reserved bit 3"
+            );
+        }
+    }
+
+    // --------------------------------------------------------------------
+    // Bidi streaming (Phase A) — RpcRequestChunkPayload and
+    // RpcRequestGrantPayload wire-stability tests.
+    // --------------------------------------------------------------------
+
+    /// 1/5 — RequestChunk round-trip with realistic header set and
+    /// 1 KiB body. Pins the encode/decode loop on the full shape.
+    #[test]
+    fn request_chunk_roundtrip_with_headers_and_body() {
+        let mut headers = Vec::new();
+        for i in 0..10u8 {
+            headers.push(header(&format!("x-chunk-meta-{i}"), &[0xAA, 0xBB, i, !i]));
+        }
+        let body: Vec<u8> = (0..1024u32).map(|n| (n & 0xFF) as u8).collect();
+        let p = RpcRequestChunkPayload {
+            call_id: 0xCAFE_F00D_DEAD_BEEF,
+            flags: FLAG_RPC_REQUEST_END | FLAG_RPC_PROPAGATE_TRACE,
+            headers,
+            body,
+        };
+        let bytes = p.encode();
+        assert_eq!(
+            p.encoded_len(),
+            bytes.len(),
+            "encoded_len must agree with encode().len()"
+        );
+        let decoded = RpcRequestChunkPayload::decode(&bytes).expect("decode");
+        assert_eq!(decoded, p);
+    }
+
+    /// 2/5 — truncation rejection at every field boundary. The
+    /// codec must error rather than panic / allocate-unbounded on
+    /// any short slice.
+    #[test]
+    fn request_chunk_decode_rejects_truncation_at_every_boundary() {
+        let p = RpcRequestChunkPayload {
+            call_id: 0x1234,
+            flags: 0,
+            headers: vec![header("x", b"y")],
+            body: b"hello".to_vec(),
+        };
+        let full = p.encode();
+        // Walk every prefix shorter than the full encoding; every
+        // one must produce a Truncated / TooLarge / InvalidUtf8
+        // error, not panic.
+        for n in 0..full.len() {
+            let prefix = &full[..n];
+            let result = RpcRequestChunkPayload::decode(prefix);
+            assert!(result.is_err(), "n={n}: expected Err, got Ok({:?})", result);
+        }
+        // Full length must decode cleanly.
+        assert!(RpcRequestChunkPayload::decode(&full).is_ok());
+    }
+
+    /// 3/5 — body length cap rejection. A wire-claimed body length
+    /// over `MAX_RPC_BODY_LEN` must error rather than try to
+    /// allocate 4+ MiB of garbage.
+    #[test]
+    fn request_chunk_decode_rejects_oversized_body_length() {
+        // Build a synthetic encoding by hand: small valid prefix
+        // up to body_len, then claim body_len = MAX_RPC_BODY_LEN + 1.
+        let mut buf = Vec::new();
+        buf.put_u64_le(0x42); // call_id
+        buf.put_u16_le(0); // flags
+        buf.put_u8(0); // headers count = 0
+        buf.put_u32_le((MAX_RPC_BODY_LEN + 1) as u32);
+        // (no body bytes follow — we want the decoder to reject at
+        // the length check before it even tries to read body bytes)
+        let err =
+            RpcRequestChunkPayload::decode(&buf).expect_err("oversized body length must reject");
+        match err {
+            RpcCodecError::TooLarge {
+                field,
+                actual,
+                limit,
+            } => {
+                assert_eq!(field, "body");
+                assert_eq!(actual, MAX_RPC_BODY_LEN + 1);
+                assert_eq!(limit, MAX_RPC_BODY_LEN);
+            }
+            other => panic!("expected TooLarge {{ field=body }}, got {other:?}"),
+        }
+    }
+
+    /// 4/5 — header count cap rejection. A header count over
+    /// `MAX_RPC_HEADERS` must error before the per-header decode
+    /// loop even starts.
+    #[test]
+    fn request_chunk_decode_rejects_oversized_header_count() {
+        let mut buf = Vec::new();
+        buf.put_u64_le(0x42); // call_id
+        buf.put_u16_le(0); // flags
+        buf.put_u8((MAX_RPC_HEADERS + 1) as u8); // over the cap
+        let err =
+            RpcRequestChunkPayload::decode(&buf).expect_err("oversized header count must reject");
+        match err {
+            RpcCodecError::TooLarge {
+                field,
+                actual,
+                limit,
+            } => {
+                // The shared `decode_headers` helper reports this
+                // field as "headers".
+                assert_eq!(field, "headers");
+                assert_eq!(actual, MAX_RPC_HEADERS + 1);
+                assert_eq!(limit, MAX_RPC_HEADERS);
+            }
+            other => panic!("expected TooLarge {{ field=headers }}, got {other:?}"),
+        }
+    }
+
+    /// 5/5 — RequestGrant round-trip + truncation rejection. The
+    /// payload is fixed-size (12 bytes), so the test surface is
+    /// "exactly 12 bytes decodes" + "any other length errors".
+    #[test]
+    fn request_grant_roundtrip_and_truncation_rejection() {
+        // Round-trip across the full u32 range corners + an
+        // arbitrary mid-value.
+        for (call_id, credits) in [
+            (0u64, 0u32),
+            (1, 1),
+            (0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF),
+            (0xCAFE_F00D, 0x10203040),
+        ] {
+            let bytes = encode_request_grant(call_id, credits);
+            assert_eq!(bytes.len(), 12, "request grant is always 12 bytes");
+            let decoded = decode_request_grant(&bytes).expect("decode");
+            assert_eq!(decoded.call_id, call_id);
+            assert_eq!(decoded.credits, credits);
+        }
+        // Wrong-length payloads must reject (return None), not
+        // panic. Empty, short, long, off-by-one each get covered.
+        assert!(decode_request_grant(&[]).is_none());
+        assert!(decode_request_grant(&[0u8; 11]).is_none());
+        assert!(decode_request_grant(&[0u8; 13]).is_none());
+    }
+
+    /// Bonus pin: `parse_request_window_initial` extracts a valid
+    /// u32 ASCII-decimal header and rejects everything else.
+    /// Same coverage shape as `parse_stream_window_initial`'s
+    /// implicit contract, made explicit here so the request-side
+    /// helper doesn't drift away from the response-side one.
+    #[test]
+    fn parse_request_window_initial_matches_response_side_semantics() {
+        // Happy path.
+        let headers = vec![header(HEADER_NRPC_REQUEST_WINDOW_INITIAL, b"32")];
+        assert_eq!(parse_request_window_initial(&headers), Some(32));
+        // Case-insensitive on header name.
+        let headers = vec![header("Nrpc-Request-Window-Initial", b"7")];
+        assert_eq!(parse_request_window_initial(&headers), Some(7));
+        // Absent.
+        assert_eq!(parse_request_window_initial(&[]), None);
+        // Malformed value (non-numeric).
+        let headers = vec![header(HEADER_NRPC_REQUEST_WINDOW_INITIAL, b"twelve")];
+        assert_eq!(parse_request_window_initial(&headers), None);
+        // Malformed value (non-utf8 bytes).
+        let headers = vec![header(HEADER_NRPC_REQUEST_WINDOW_INITIAL, &[0xFF, 0xFE])];
+        assert_eq!(parse_request_window_initial(&headers), None);
+        // Empty value.
+        let headers = vec![header(HEADER_NRPC_REQUEST_WINDOW_INITIAL, b"")];
+        assert_eq!(parse_request_window_initial(&headers), None);
     }
 
     // --------------------------------------------------------------------
@@ -3576,6 +5426,200 @@ mod tests {
     }
 
     // ====================================================================
+    // Phase C — RpcClientPending + RpcClientFold for client-streaming.
+    // ====================================================================
+
+    /// Build a REQUEST_GRANT event for tests. Mirror of
+    /// `rpc_stream_grant_event` for the request direction.
+    fn rpc_request_grant_event(caller_origin: u64, call_id: u64, credits: u32) -> RedexEvent {
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, caller_origin, call_id, 0);
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&encode_request_grant(call_id, credits));
+        RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        }
+    }
+
+    /// `register_client_streaming` returns two halves: a terminal
+    /// oneshot and a grant mpsc. A terminal RESPONSE resolves the
+    /// oneshot (same shape as unary delivery); a REQUEST_GRANT
+    /// for the same call_id pushes its credit onto the mpsc.
+    #[tokio::test]
+    async fn client_pending_client_streaming_routes_terminal_and_grants() {
+        let pending = Arc::new(RpcClientPending::new());
+        let (terminal_rx, mut grant_rx) = pending.register_client_streaming(0xCAFE_F00D, 0);
+        // Push two grants — both should land on the mpsc.
+        pending.deliver_grant(0xCAFE_F00D, 0, 3);
+        pending.deliver_grant(0xCAFE_F00D, 0, 7);
+        assert_eq!(grant_rx.recv().await, Some(3));
+        assert_eq!(grant_rx.recv().await, Some(7));
+        // Terminal RESPONSE resolves the oneshot and removes the
+        // entry. Grant mpsc closes too (its sender drops with
+        // the entry).
+        let resp = RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: b"done".to_vec(),
+        };
+        pending.deliver(0xCAFE_F00D, 0, resp.clone());
+        let delivered = tokio::time::timeout(Duration::from_millis(50), terminal_rx)
+            .await
+            .expect("terminal must complete")
+            .expect("terminal must receive");
+        assert_eq!(delivered.body, b"done");
+        // Grant mpsc now closed.
+        assert_eq!(grant_rx.recv().await, None);
+        assert_eq!(pending.pending_count(), 0);
+    }
+
+    /// REQUEST_GRANT from a non-target session peer is dropped
+    /// without injecting credit. Same S-4-style binding gate as
+    /// the RESPONSE delivery path — a forged grant on a shared
+    /// reply channel can't inflate a victim's credit budget.
+    #[tokio::test]
+    async fn client_pending_grant_from_wrong_target_is_dropped() {
+        let pending = Arc::new(RpcClientPending::new());
+        let (_terminal_rx, mut grant_rx) = pending.register_client_streaming(0xCAFE_F00D, 0x42);
+        // Forged grant from a different session peer — must drop.
+        pending.deliver_grant(0xCAFE_F00D, 0x99, 100);
+        let parked = tokio::time::timeout(Duration::from_millis(50), grant_rx.recv()).await;
+        assert!(
+            parked.is_err(),
+            "forged REQUEST_GRANT from wrong target must not inject credit"
+        );
+        // Legitimate grant from the recorded target lands.
+        pending.deliver_grant(0xCAFE_F00D, 0x42, 5);
+        let delivered = tokio::time::timeout(Duration::from_millis(50), grant_rx.recv())
+            .await
+            .expect("must complete")
+            .expect("must receive");
+        assert_eq!(delivered, 5);
+    }
+
+    /// `deliver_grant` for an unknown call_id is a silent no-op.
+    /// Same harmless-drop semantics as a STREAM_GRANT for an
+    /// unknown / non-flow-controlled call (CANCEL/GRANT race is
+    /// always possible).
+    #[tokio::test]
+    async fn client_pending_grant_for_unknown_call_id_is_no_op() {
+        let pending = Arc::new(RpcClientPending::new());
+        // No entry registered for this call_id.
+        pending.deliver_grant(0xDEAD, 0, 42);
+        // No panics, no entries created.
+        assert_eq!(pending.pending_count(), 0);
+    }
+
+    /// `deliver_grant` for a unary entry is silently dropped
+    /// (grants only apply to client-streaming / duplex calls).
+    #[tokio::test]
+    async fn client_pending_grant_for_unary_entry_is_no_op() {
+        let pending = Arc::new(RpcClientPending::new());
+        let _rx = pending.register(0xDEAD, 0);
+        pending.deliver_grant(0xDEAD, 0, 42);
+        // No state changes — entry still pending, no leak.
+        assert_eq!(pending.pending_count(), 1);
+    }
+
+    /// `RpcClientFold::apply` (legacy / loopback path) routes
+    /// DISPATCH_RPC_REQUEST_GRANT events through to the matching
+    /// ClientStreaming entry's grant mpsc. Pins the second
+    /// dispatch arm the fold gained for Phase C.
+    #[tokio::test]
+    async fn client_fold_routes_request_grant_to_registered_waiter() {
+        let pending = Arc::new(RpcClientPending::new());
+        let mut fold = RpcClientFold::new(pending.clone());
+        let (_terminal_rx, mut grant_rx) = pending.register_client_streaming(0xC0DE, 0);
+        let ev = rpc_request_grant_event(0xCAFE, 0xC0DE, 9);
+        fold.apply(&ev, &mut ()).unwrap();
+        let delivered = tokio::time::timeout(Duration::from_millis(50), grant_rx.recv())
+            .await
+            .expect("must complete")
+            .expect("must receive");
+        assert_eq!(delivered, 9);
+    }
+
+    /// `RpcClientFold::apply` ignores REQUEST_GRANT events whose
+    /// payload is malformed (wrong length): no panic, no entry
+    /// state change, fold returns Ok and keeps going. Mirror of
+    /// the response-side malformed-payload regression.
+    #[tokio::test]
+    async fn client_fold_malformed_request_grant_is_logged_not_fatal() {
+        let pending = Arc::new(RpcClientPending::new());
+        let mut fold = RpcClientFold::new(pending.clone());
+        let (_terminal_rx, mut grant_rx) = pending.register_client_streaming(0xC0DE, 0);
+        // Build a GRANT event whose payload is only 4 bytes
+        // (truncated — codec needs 12).
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, 0xCAFE, 0xC0DE, 0);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let ev = RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        };
+        let result = fold.apply(&ev, &mut ());
+        assert!(
+            result.is_ok(),
+            "malformed REQUEST_GRANT must NOT kill the fold"
+        );
+        // No credit landed on the mpsc.
+        let parked = tokio::time::timeout(Duration::from_millis(30), grant_rx.recv()).await;
+        assert!(
+            parked.is_err(),
+            "malformed REQUEST_GRANT must not inject credit"
+        );
+    }
+
+    /// REQUEST_GRANT frames where the payload `call_id` does NOT
+    /// agree with `EventMeta::seq_or_ts` must be dropped: the
+    /// producer is contracted to encode both fields to the same
+    /// value (see `RpcRequestGrantPayload::call_id` doc), so a
+    /// mismatch is either a malformed frame or an attempted
+    /// cross-call credit-injection. Without this check, a peer
+    /// could publish a GRANT whose meta names one call but whose
+    /// payload credits a different in-flight call_id.
+    ///
+    /// Regression: cubic-dev-ai bot P2 review comment on the
+    /// `nrpc-streaming` branch.
+    #[tokio::test]
+    async fn client_fold_drops_request_grant_with_mismatched_call_ids() {
+        let pending = Arc::new(RpcClientPending::new());
+        let mut fold = RpcClientFold::new(pending.clone());
+        let (_terminal_rx_victim, mut grant_rx_victim) =
+            pending.register_client_streaming(0xC0DE, 0);
+        let (_terminal_rx_other, mut grant_rx_other) = pending.register_client_streaming(0xBEEF, 0);
+
+        // Build a hand-rolled frame: meta names call 0xC0DE,
+        // payload encodes credit for call 0xBEEF. Either the
+        // producer is broken or this is a forged frame; the
+        // consumer must drop, not deliver.
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, 0xCAFE, 0xC0DE, 0);
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + 12);
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&encode_request_grant(0xBEEF, 5));
+        let ev = RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        };
+        fold.apply(&ev, &mut ()).unwrap();
+
+        let parked_victim =
+            tokio::time::timeout(Duration::from_millis(30), grant_rx_victim.recv()).await;
+        assert!(
+            parked_victim.is_err(),
+            "mismatched REQUEST_GRANT must not credit the call named in meta",
+        );
+        let parked_other =
+            tokio::time::timeout(Duration::from_millis(30), grant_rx_other.recv()).await;
+        assert!(
+            parked_other.is_err(),
+            "mismatched REQUEST_GRANT must not credit the call named in payload either",
+        );
+    }
+
+    // ====================================================================
     // RpcServerStreamingFold — coverage for the multi-fire emit path.
     //
     // The streaming fold is the most complex code in this file:
@@ -3997,5 +6041,414 @@ mod tests {
             .iter()
             .find(|(n, _)| n == HEADER_NRPC_STREAMING);
         assert!(hdr.is_some(), "malformed terminal must include end marker");
+    }
+
+    // ====================================================================
+    // Phase B — RpcStreamingRequestFold (server-side client-streaming)
+    // ====================================================================
+
+    /// Build a REQUEST_CHUNK event for tests. Mirrors
+    /// `rpc_request_event` / `rpc_stream_grant_event` shape.
+    fn rpc_request_chunk_event(
+        caller_origin: u64,
+        call_id: u64,
+        flags: u16,
+        body: Vec<u8>,
+    ) -> RedexEvent {
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST_CHUNK, 0, caller_origin, call_id, 0);
+        let payload = RpcRequestChunkPayload {
+            call_id,
+            flags,
+            headers: vec![],
+            body,
+        };
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta.to_bytes());
+        buf.extend_from_slice(&payload.encode());
+        RedexEvent {
+            entry: RedexEntry::new_heap(0, 0, buf.len() as u32, 0, 0),
+            payload: bytes::Bytes::from(buf),
+        }
+    }
+
+    /// Collecting client-streaming handler: drains the stream into
+    /// a Vec, returns an Ok response whose body is the count of
+    /// chunks seen (8-byte LE). Captured chunk bodies are exposed
+    /// via the `Arc<Mutex<Vec<Bytes>>>` so tests can assert
+    /// ordering and content.
+    struct CollectingClientStreamHandler {
+        seen: Arc<Mutex<Vec<bytes::Bytes>>>,
+        observed_cancel: Arc<AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl RpcClientStreamingHandler for CollectingClientStreamHandler {
+        async fn call(
+            &self,
+            ctx: RpcStreamingContext,
+            mut requests: RequestStream,
+        ) -> Result<RpcResponsePayload, RpcHandlerError> {
+            use futures::StreamExt;
+            while let Some(chunk) = requests.next().await {
+                self.seen.lock().push(chunk);
+            }
+            // Re-check cancellation after EOF so the test can
+            // distinguish "clean REQUEST_END" from "CANCEL closed
+            // the stream early".
+            if ctx.cancellation.is_cancelled() {
+                self.observed_cancel
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let count = self.seen.lock().len() as u64;
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: count.to_le_bytes().to_vec(),
+            })
+        }
+    }
+
+    /// 1/6 — happy path: REQUEST + 3 REQUEST_CHUNKs (last has
+    /// FLAG_END) delivers 4 bodies to the handler in order; the
+    /// fold emits exactly one terminal RESPONSE carrying the
+    /// handler's reply.
+    #[tokio::test]
+    async fn streaming_request_fold_collects_all_chunks_and_emits_terminal_response() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcStreamingRequestFold::new(
+            Arc::new(CollectingClientStreamHandler {
+                seen: seen.clone(),
+                observed_cancel: observed_cancel.clone(),
+            }),
+            emit,
+        );
+        // REQUEST with the client-streaming flag, body = "a".
+        let req = RpcRequestPayload {
+            service: "agg".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_CLIENT_STREAMING_REQUEST,
+            headers: vec![],
+            body: b"a".to_vec(),
+        };
+        fold.apply(&rpc_request_event(0xCAFE, 7, req), &mut ())
+            .unwrap();
+        // Wait until the sender is registered (handler task has
+        // picked up the request and the apply path completed).
+        assert!(
+            wait_until(
+                || fold.sender_keys().contains(&(0xCAFE, 7)),
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        // Three more chunks; last sets FLAG_REQUEST_END.
+        fold.apply(
+            &rpc_request_chunk_event(0xCAFE, 7, 0, b"b".to_vec()),
+            &mut (),
+        )
+        .unwrap();
+        fold.apply(
+            &rpc_request_chunk_event(0xCAFE, 7, 0, b"c".to_vec()),
+            &mut (),
+        )
+        .unwrap();
+        fold.apply(
+            &rpc_request_chunk_event(0xCAFE, 7, FLAG_RPC_REQUEST_END, b"d".to_vec()),
+            &mut (),
+        )
+        .unwrap();
+        // Handler should observe 4 bodies in order and emit one
+        // terminal RESPONSE whose body encodes the count.
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+            "expected terminal RESPONSE"
+        );
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1, "exactly one terminal RESPONSE");
+        let (origin, call_id, resp) = &captured[0];
+        assert_eq!(*origin, 0xCAFE);
+        assert_eq!(*call_id, 7);
+        assert_eq!(resp.status, RpcStatus::Ok);
+        assert_eq!(resp.body, 4u64.to_le_bytes());
+        // And the chunks landed in order.
+        let seen = seen.lock();
+        let collected: Vec<&[u8]> = seen.iter().map(|b| b.as_ref()).collect();
+        assert_eq!(collected, vec![b"a", b"b", b"c", b"d"]);
+        assert!(
+            !observed_cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "clean REQUEST_END must NOT register as a cancellation"
+        );
+    }
+
+    /// 2/6 — degenerate case: initial REQUEST with both the
+    /// client-streaming AND request-end flags set. Handler sees
+    /// exactly one body (the REQUEST's own body) and EOF — the
+    /// "one-item upload" fast path that saves a trailing CHUNK
+    /// event.
+    #[tokio::test]
+    async fn streaming_request_fold_initial_request_with_end_flag_yields_single_item() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcStreamingRequestFold::new(
+            Arc::new(CollectingClientStreamHandler {
+                seen: seen.clone(),
+                observed_cancel,
+            }),
+            emit,
+        );
+        let req = RpcRequestPayload {
+            service: "agg".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_REQUEST_END,
+            headers: vec![],
+            body: b"only".to_vec(),
+        };
+        fold.apply(&rpc_request_event(1, 42, req), &mut ()).unwrap();
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+            "expected terminal RESPONSE"
+        );
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].2.status, RpcStatus::Ok);
+        assert_eq!(captured[0].2.body, 1u64.to_le_bytes());
+        assert_eq!(
+            seen.lock()
+                .iter()
+                .map(|b| b.as_ref())
+                .collect::<Vec<&[u8]>>(),
+            vec![b"only" as &[u8]]
+        );
+        // Sender must NOT have been registered (initial-REQUEST-
+        // with-END skips the map insert).
+        assert!(fold.sender_keys().is_empty());
+    }
+
+    /// 3/6 — CANCEL closes the request stream early, flips the
+    /// cancellation token, and the spawned task overrides the
+    /// handler's terminal with `RpcStatus::Cancelled`.
+    #[tokio::test]
+    async fn streaming_request_fold_cancel_closes_stream_and_overrides_terminal() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcStreamingRequestFold::new(
+            Arc::new(CollectingClientStreamHandler {
+                seen: seen.clone(),
+                observed_cancel: observed_cancel.clone(),
+            }),
+            emit,
+        );
+        let req = RpcRequestPayload {
+            service: "agg".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_CLIENT_STREAMING_REQUEST,
+            headers: vec![],
+            body: b"first".to_vec(),
+        };
+        fold.apply(&rpc_request_event(2, 17, req), &mut ()).unwrap();
+        // Wait for the handler to register, then one in-flight
+        // CHUNK, then CANCEL before the handler ever finishes
+        // draining.
+        assert!(
+            wait_until(
+                || fold.sender_keys().contains(&(2, 17)),
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        fold.apply(
+            &rpc_request_chunk_event(2, 17, 0, b"second".to_vec()),
+            &mut (),
+        )
+        .unwrap();
+        fold.apply(&rpc_cancel_event(2, 17), &mut ()).unwrap();
+        // Terminal must arrive and must be Cancelled (CANCEL-wins
+        // ordering, same as the response-side fold).
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+            "expected terminal RESPONSE"
+        );
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].2.status,
+            RpcStatus::Cancelled,
+            "CANCEL must override terminal status"
+        );
+        assert!(
+            observed_cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "handler must observe cancellation token after stream EOF"
+        );
+        // Both maps must be clean post-cancel.
+        assert!(fold.in_flight_keys().is_empty());
+        assert!(fold.sender_keys().is_empty());
+    }
+
+    /// 4/6 — handler returns `Err(RpcHandlerError::Application)`
+    /// → terminal RESPONSE carries the application status code +
+    /// message body.
+    #[tokio::test]
+    async fn streaming_request_fold_application_error_round_trips() {
+        struct AppErrHandler;
+        #[async_trait::async_trait]
+        impl RpcClientStreamingHandler for AppErrHandler {
+            async fn call(
+                &self,
+                _ctx: RpcStreamingContext,
+                mut requests: RequestStream,
+            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+                use futures::StreamExt;
+                // Drain so the stream's EOF doesn't race the
+                // error return.
+                while requests.next().await.is_some() {}
+                Err(RpcHandlerError::Application {
+                    code: 0xBEEF,
+                    message: "bad input".to_string(),
+                })
+            }
+        }
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcStreamingRequestFold::new(Arc::new(AppErrHandler), emit);
+        let req = RpcRequestPayload {
+            service: "agg".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_REQUEST_END,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(3, 100, req), &mut ())
+            .unwrap();
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+            "expected terminal RESPONSE"
+        );
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].2.status, RpcStatus::Application(0xBEEF));
+        assert_eq!(captured[0].2.body, b"bad input");
+    }
+
+    /// 5/6 — handler panic is caught by `catch_unwind`; terminal
+    /// surfaces as `Internal` carrying the panic message. Same
+    /// contract as the existing folds — a misbehaving handler
+    /// can't take down the cortex adapter.
+    #[tokio::test]
+    async fn streaming_request_fold_handler_panic_surfaces_as_internal() {
+        struct PanickyHandler;
+        #[async_trait::async_trait]
+        impl RpcClientStreamingHandler for PanickyHandler {
+            async fn call(
+                &self,
+                _ctx: RpcStreamingContext,
+                _requests: RequestStream,
+            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+                panic!("intentional test panic");
+            }
+        }
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcStreamingRequestFold::new(Arc::new(PanickyHandler), emit);
+        let req = RpcRequestPayload {
+            service: "agg".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_REQUEST_END,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(4, 200, req), &mut ())
+            .unwrap();
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+            "expected terminal RESPONSE"
+        );
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].2.status, RpcStatus::Internal);
+        assert!(
+            String::from_utf8_lossy(&captured[0].2.body).contains("intentional test panic"),
+            "panic body should carry the panic message"
+        );
+    }
+
+    /// 6/6 — duplicate REQUEST with the same `(origin, call_id)`
+    /// is refused with a synthetic `Internal` terminal frame and
+    /// does NOT spawn a second handler. Mirror of the regression
+    /// pinned in the unary + response-streaming folds.
+    #[tokio::test]
+    async fn streaming_request_fold_duplicate_request_refuses_without_double_dispatch() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        struct CountingHandler {
+            invocations: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl RpcClientStreamingHandler for CountingHandler {
+            async fn call(
+                &self,
+                _ctx: RpcStreamingContext,
+                mut requests: RequestStream,
+            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+                use futures::StreamExt;
+                self.invocations.fetch_add(1, Ordering::SeqCst);
+                // Slow handler to keep the call in-flight while
+                // the duplicate REQUEST arrives.
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                while requests.next().await.is_some() {}
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: vec![],
+                })
+            }
+        }
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcStreamingRequestFold::new(
+            Arc::new(CountingHandler {
+                invocations: invocations.clone(),
+            }),
+            emit,
+        );
+        let req = RpcRequestPayload {
+            service: "agg".to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_CLIENT_STREAMING_REQUEST,
+            headers: vec![],
+            body: vec![],
+        };
+        fold.apply(&rpc_request_event(5, 99, req.clone()), &mut ())
+            .unwrap();
+        assert!(
+            wait_until(
+                || fold.in_flight_keys().contains(&(5, 99)),
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        // Duplicate REQUEST: synthetic Internal terminal emitted,
+        // handler invocation count must stay at 1.
+        fold.apply(&rpc_request_event(5, 99, req), &mut ()).unwrap();
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(1)).await,
+            "synthetic refusal terminal expected"
+        );
+        let refusal = captured.lock()[0].clone();
+        assert_eq!(refusal.2.status, RpcStatus::Internal);
+        assert!(String::from_utf8_lossy(&refusal.2.body).contains("duplicate"));
+        // Finish the first handler so its terminal lands too.
+        fold.apply(
+            &rpc_request_chunk_event(5, 99, FLAG_RPC_REQUEST_END, vec![]),
+            &mut (),
+        )
+        .unwrap();
+        assert!(
+            wait_until(|| captured.lock().len() >= 2, Duration::from_secs(2)).await,
+            "first handler should still complete normally"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "duplicate REQUEST must NOT spawn a second handler",
+        );
     }
 }
