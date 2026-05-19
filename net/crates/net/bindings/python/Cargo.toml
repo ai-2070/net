@@ -1,6 +1,6 @@
 [package]
 name = "net-python"
-version = "0.20.0"
+version = "0.20.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Python bindings for Net event bus"
@@ -103,8 +103,8 @@ meshos = ["compute", "cortex", "net/meshos", "net-sdk/meshos"]
 deck = ["meshos", "net/meshos", "net-sdk/deck"]
 
 [dependencies]
-net = { package = "net-mesh", version = "0.20.0", path = "../..", default-features = false }
-net-sdk = { package = "net-mesh-sdk", version = "0.20.0", path = "../../sdk", default-features = false, optional = true }
+net = { package = "net-mesh", version = "0.20.1", path = "../..", default-features = false }
+net-sdk = { package = "net-mesh-sdk", version = "0.20.1", path = "../../sdk", default-features = false, optional = true }
 dashmap = { version = "6", optional = true }
 pyo3 = { version = "0.28.0", features = ["extension-module"] }
 # Zeroizing wrapper for transient operator-seed copies in the
