@@ -305,7 +305,7 @@ async fn scenario_3_allow_by_subnet_admits_subnet_members() {
         .serve_rpc("echo", Arc::new(EchoHandler))
         .expect("serve_rpc");
 
-    let subnet = SubnetId([0x42; 16]);
+    let subnet = SubnetId::from_bytes([0x42; 16]);
     let target_ann = target_announcement(
         &target,
         200,
@@ -367,7 +367,7 @@ async fn scenario_4_allow_by_group_admits_group_claimants() {
         .serve_rpc("echo", Arc::new(EchoHandler))
         .expect("serve_rpc");
 
-    let group = GroupId([0x77; 32]);
+    let group = GroupId::from_bytes([0x77; 32]);
     let target_ann =
         target_announcement(&target, 300, "nrpc:echo", vec![], vec![], vec![group]);
     let claimant_ann = caller_announcement(&claimant, 1, None, &[group]);
@@ -577,8 +577,8 @@ async fn from_bytes_rejects_oversized_allow_list() {
 #[tokio::test]
 async fn membership_parse_returns_no_subnet_when_announcement_has_multiple_subnet_tags() {
     let node = build_node().await;
-    let s1 = SubnetId([0xAA; 16]);
-    let s2 = SubnetId([0xBB; 16]);
+    let s1 = SubnetId::from_bytes([0xAA; 16]);
+    let s2 = SubnetId::from_bytes([0xBB; 16]);
 
     // Hand-build an announcement carrying two distinct subnet
     // tags. `caller_announcement` only takes one Option<SubnetId>;

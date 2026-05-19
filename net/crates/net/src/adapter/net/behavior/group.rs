@@ -38,8 +38,13 @@ pub const GROUP_TAG_PREFIX: &str = "group:";
 /// 32-byte stable group identifier. Opaque to the substrate.
 /// Operators choose the value; values that double as secrets
 /// (random 32 bytes) prevent unauthorised membership claims.
+///
+/// The inner array is `pub(crate)` rather than `pub` — external
+/// callers go through [`Self::from_bytes`] / [`Self::as_bytes`]
+/// so the substrate keeps the option of changing the internal
+/// representation without breaking the public surface.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct GroupId(pub [u8; 32]);
+pub struct GroupId(pub(crate) [u8; 32]);
 
 impl GroupId {
     /// Construct from raw bytes.

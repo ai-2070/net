@@ -32,8 +32,14 @@ pub const SUBNET_TAG_PREFIX: &str = "subnet:";
 /// operators choose the value (random, blake2s-of-name, etc.).
 /// Pairs of nodes with the same `SubnetId` are treated as
 /// subnet-mates by the v0.4 capability-auth execute-gate.
+///
+/// The inner array is `pub(crate)` rather than `pub` — external
+/// callers go through [`Self::from_bytes`] / [`Self::as_bytes`]
+/// so the substrate keeps the option of changing the internal
+/// representation (e.g. a typed length tag) without breaking
+/// the public surface.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SubnetId(pub [u8; 16]);
+pub struct SubnetId(pub(crate) [u8; 16]);
 
 impl SubnetId {
     /// Construct from raw bytes.
