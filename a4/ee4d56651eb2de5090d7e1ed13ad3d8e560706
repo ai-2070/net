@@ -1,0 +1,84 @@
+net/crates/net/cli/npm/bin/net-mesh.js
+  s_418b910fc0e80b::t_361405a9b39d4b 1-63,67-119
+  s_418b910fc0e80b::t_3abeb481c1bd17 64-66
+net/crates/net/cli/npm/LICENSE
+  s_418b910fc0e80b::t_4ea6e0934bcdab 1-3
+.github/workflows/release-npm-cli.yml
+  s_418b910fc0e80b::t_c0a3955bcec7d1 1-110,118-279
+  s_418b910fc0e80b::t_c47ee611e1cf57 111-117
+net/crates/net/cli/src/commands/completion.rs
+  s_418b910fc0e80b::t_af18abcf745443 1-40
+net/crates/net/deck/npm/bin/net-deck.js
+  s_418b910fc0e80b::t_2e11d8bfe90d6d 1-42,46-94
+  s_418b910fc0e80b::t_b7018d9da7182a 43-45
+.github/workflows/release-binaries-cli.yml
+  s_418b910fc0e80b::t_3303d2adf94569 1-134,138-311
+  s_418b910fc0e80b::t_128e1644f081ab 135-137
+.github/workflows/release-npm-deck.yml
+  s_418b910fc0e80b::t_f334f0af9ae495 1-100,108-257
+  s_418b910fc0e80b::t_91a4e341122c8b 101-107
+.github/workflows/release-binaries-deck.yml
+  s_418b910fc0e80b::t_481cc2db7b9b52 88-90
+  s_418b910fc0e80b::t_6c6236990301cc 1-87,91-236
+.github/workflows/release-pypi-cli.yml
+  s_418b910fc0e80b::t_04c32bf38a70ac 1-122,131-136,138-189
+  s_418b910fc0e80b::t_f44aa3c5ad0efd 123-130,137
+net/crates/net/cli/src/main.rs
+  s_418b910fc0e80b::t_285e29de8ca30f 215-216
+  s_418b910fc0e80b::t_85008cec419a40 136-139
+net/crates/net/deck/npm/LICENSE
+  s_418b910fc0e80b::t_040a12d371dc8d 1-3
+net/crates/net/cli/python/pyproject.toml
+  s_418b910fc0e80b::t_d30cf634fc97dd 1-47
+net/crates/net/cli/Cargo.toml
+  s_418b910fc0e80b::t_a67b8721213371 28,30-35
+  s_418b910fc0e80b::t_2c8fc5e0cf142c 81-93
+net/crates/net/cli/python/README.md
+  s_418b910fc0e80b::t_8eae908952c6b4 1-17,19-31
+  s_418b910fc0e80b::t_3ae9e6d32dd57e 18
+net/crates/net/deck/python/README.md
+  s_418b910fc0e80b::t_a317b0ae3c246c 18
+  s_418b910fc0e80b::t_0a328d94fa4071 1-17,19-31
+net/crates/net/deck/npm/package.json
+  s_418b910fc0e80b::t_f009c811ff26e0 1-35,38-39
+  s_418b910fc0e80b::t_668cf4a0cbe5b6 36-37
+net/crates/net/deck/Cargo.toml
+  s_418b910fc0e80b::t_25d0b62d03fc13 53-64
+net/crates/net/docs/releases/RELEASE_STEPS.md
+  s_418b910fc0e80b::t_20e6f96366a0a6 31-40
+net/crates/net/cli/npm/package.json
+  s_418b910fc0e80b::t_f6621868c0cc35 1-35,38-39
+  s_418b910fc0e80b::t_0264b45a60ea73 36-37
+net/crates/net/cli/src/commands/man.rs
+  s_418b910fc0e80b::t_dad8aaad9101f8 1-21,23-28,30-31,33-34
+  s_418b910fc0e80b::t_8a9bd6f5bf49a6 22,29,32
+net/crates/net/cli/npm/README.md
+  s_418b910fc0e80b::t_b5f30dc85488e9 1-22,24-35
+  s_418b910fc0e80b::t_d1d14dee41710f 23
+net/crates/net/deck/python/pyproject.toml
+  s_418b910fc0e80b::t_808fde6ce2bbd0 1-36
+net/crates/net/cli/src/commands/mod.rs
+  s_418b910fc0e80b::t_7c1919bdf8ba8b 17,23
+.github/workflows/release-pypi-deck.yml
+  s_418b910fc0e80b::t_9b53be8519258b 1-116,125-130,132-183
+  s_418b910fc0e80b::t_1ea31a13f7fe18 117-124,131
+net/crates/net/deck/npm/README.md
+  s_418b910fc0e80b::t_42e8f5cb6d795f 21
+  s_418b910fc0e80b::t_f671b2d1843f00 1-20,22-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "a4ee4d56651eb2de5090d7e1ed13ad3d8e560706",
+  "prompts": {},
+  "sessions": {
+    "s_418b910fc0e80b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c203d89c-8611-4800-ad8f-a767549fb906",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
