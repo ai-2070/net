@@ -2393,6 +2393,80 @@ impl RedexFold<()> for RpcServerStreamingFold {
 /// CANCEL) closes the stream.
 type RequestChunkSenders = Arc<Mutex<HashMap<(u64, u64), tokio::sync::mpsc::Sender<bytes::Bytes>>>>;
 
+/// Shared REQUEST_CHUNK handling used by both
+/// [`RpcStreamingRequestFold`] and [`RpcDuplexFold`]. Decodes the
+/// payload, validates the call_id agreement, looks up the per-call
+/// sender, pushes the body (skipping the empty-body FLAG_END
+/// terminator), and removes the sender on FLAG_END so the
+/// handler's stream observes EOF.
+///
+/// `diag_tag` selects the log prefix ("client-streaming" or
+/// "duplex") so the two call sites surface identically-shaped
+/// diagnostics with the correct fold name. The behavior is
+/// otherwise identical — both folds carry the same wire format
+/// and the same per-call mpsc + sender-map contract.
+fn apply_request_chunk_to_senders(
+    payload_bytes: &[u8],
+    meta: &EventMeta,
+    senders: &RequestChunkSenders,
+    diag_tag: &'static str,
+) {
+    let payload = match RpcRequestChunkPayload::decode(payload_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                caller_origin = format!("{:#x}", meta.origin_hash),
+                call_id = meta.seq_or_ts,
+                tag = diag_tag,
+                "rpc server fold: malformed REQUEST_CHUNK payload",
+            );
+            return;
+        }
+    };
+    if payload.call_id != meta.seq_or_ts {
+        tracing::warn!(
+            caller_origin = format!("{:#x}", meta.origin_hash),
+            meta_call_id = meta.seq_or_ts,
+            payload_call_id = payload.call_id,
+            tag = diag_tag,
+            "rpc server fold: REQUEST_CHUNK payload call_id does not match EventMeta",
+        );
+        return;
+    }
+    let key = (meta.origin_hash, meta.seq_or_ts);
+    let is_end = payload.flags & FLAG_RPC_REQUEST_END != 0;
+    let sender = senders.lock().get(&key).cloned();
+    let Some(sender) = sender else {
+        // Unknown call — either the initial REQUEST hasn't
+        // arrived yet (out-of-order delivery is possible on the
+        // bus) or the handler already completed and the entry is
+        // gone. Drop silently.
+        tracing::debug!(
+            caller_origin = format!("{:#x}", meta.origin_hash),
+            call_id = meta.seq_or_ts,
+            tag = diag_tag,
+            "rpc server fold: REQUEST_CHUNK for unknown call_id; dropping",
+        );
+        return;
+    };
+    let is_pure_terminator = is_end && payload.body.is_empty();
+    if !is_pure_terminator && sender.try_send(bytes::Bytes::from(payload.body)).is_err() {
+        tracing::debug!(
+            caller_origin = format!("{:#x}", meta.origin_hash),
+            call_id = meta.seq_or_ts,
+            tag = diag_tag,
+            "rpc server fold: request-chunk mpsc full or closed; dropping",
+        );
+    }
+    if is_end {
+        // Drop the sender from the map → its clone here goes out
+        // of scope at end of function → the receiver in the
+        // handler's RequestStream sees EOF on the next poll.
+        senders.lock().remove(&key);
+    }
+}
+
 /// Server-side fold for client-streaming RPC. Parallel to
 /// [`RpcServerStreamingFold`] but consumes REQUEST_CHUNK on the
 /// input side and produces one terminal RESPONSE on the output
@@ -2757,71 +2831,12 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 });
             }
             DISPATCH_RPC_REQUEST_CHUNK => {
-                let payload = match RpcRequestChunkPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc client-streaming server fold: malformed REQUEST_CHUNK payload",
-                        );
-                        return Ok(());
-                    }
-                };
-                // Sanity: payload.call_id should match
-                // EventMeta::seq_or_ts. If they disagree it's a
-                // wire-format mismatch we can't safely route;
-                // drop and log.
-                if payload.call_id != meta.seq_or_ts {
-                    tracing::warn!(
-                        caller_origin = format!("{:#x}", meta.origin_hash),
-                        meta_call_id = meta.seq_or_ts,
-                        payload_call_id = payload.call_id,
-                        "rpc client-streaming server fold: REQUEST_CHUNK payload call_id does not match EventMeta",
-                    );
-                    return Ok(());
-                }
-                let is_end = payload.flags & FLAG_RPC_REQUEST_END != 0;
-                let sender = self.senders.lock().get(&key).cloned();
-                let Some(sender) = sender else {
-                    // Unknown call — either the initial REQUEST
-                    // hasn't arrived yet (out-of-order delivery
-                    // is possible on the bus) or the handler
-                    // already completed and the entry is gone.
-                    // Drop the chunk silently; the caller will
-                    // see no progress and either retry or give
-                    // up on its own.
-                    tracing::debug!(
-                        caller_origin = format!("{:#x}", meta.origin_hash),
-                        call_id = meta.seq_or_ts,
-                        "rpc client-streaming server fold: REQUEST_CHUNK for unknown call_id; dropping",
-                    );
-                    return Ok(());
-                };
-                // Terminator-semantics rule (mirror of the initial
-                // REQUEST handling above): empty body + FLAG_END
-                // is a pure terminator and is NOT yielded as a
-                // stream item. Non-empty body + FLAG_END is a
-                // valid final item. Empty body without FLAG_END
-                // is a regular (rare) item the application
-                // decides what to do with.
-                let is_pure_terminator = is_end && payload.body.is_empty();
-                if !is_pure_terminator && sender.try_send(bytes::Bytes::from(payload.body)).is_err()
-                {
-                    tracing::debug!(
-                        caller_origin = format!("{:#x}", meta.origin_hash),
-                        call_id = meta.seq_or_ts,
-                        "rpc client-streaming server fold: request-chunk mpsc full or closed; dropping",
-                    );
-                }
-                if is_end {
-                    // Drop the sender from the map → its clone
-                    // here goes out of scope at end of arm → the
-                    // receiver in the handler's RequestStream
-                    // sees EOF on the next poll.
-                    self.senders.lock().remove(&key);
-                }
+                apply_request_chunk_to_senders(
+                    &ev.payload[EVENT_META_SIZE..],
+                    &meta,
+                    &self.senders,
+                    "client-streaming",
+                );
             }
             DISPATCH_RPC_CANCEL => {
                 if let Some(token) = self.in_flight.lock().remove(&key) {
@@ -3249,53 +3264,12 @@ impl RedexFold<()> for RpcDuplexFold {
                 });
             }
             DISPATCH_RPC_REQUEST_CHUNK => {
-                // Same handling as RpcStreamingRequestFold — push
-                // the chunk body into the per-call request mpsc,
-                // close on FLAG_END (suppressing empty terminator
-                // bodies per the terminator-semantics rule).
-                let payload = match RpcRequestChunkPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc duplex server fold: malformed REQUEST_CHUNK payload",
-                        );
-                        return Ok(());
-                    }
-                };
-                if payload.call_id != meta.seq_or_ts {
-                    tracing::warn!(
-                        caller_origin = format!("{:#x}", meta.origin_hash),
-                        meta_call_id = meta.seq_or_ts,
-                        payload_call_id = payload.call_id,
-                        "rpc duplex server fold: REQUEST_CHUNK payload call_id does not match EventMeta",
-                    );
-                    return Ok(());
-                }
-                let is_end = payload.flags & FLAG_RPC_REQUEST_END != 0;
-                let sender = self.senders.lock().get(&key).cloned();
-                let Some(sender) = sender else {
-                    tracing::debug!(
-                        caller_origin = format!("{:#x}", meta.origin_hash),
-                        call_id = meta.seq_or_ts,
-                        "rpc duplex server fold: REQUEST_CHUNK for unknown call_id; dropping",
-                    );
-                    return Ok(());
-                };
-                let is_pure_terminator = is_end && payload.body.is_empty();
-                if !is_pure_terminator && sender.try_send(bytes::Bytes::from(payload.body)).is_err()
-                {
-                    tracing::debug!(
-                        caller_origin = format!("{:#x}", meta.origin_hash),
-                        call_id = meta.seq_or_ts,
-                        "rpc duplex server fold: request-chunk mpsc full or closed; dropping",
-                    );
-                }
-                if is_end {
-                    self.senders.lock().remove(&key);
-                }
+                apply_request_chunk_to_senders(
+                    &ev.payload[EVENT_META_SIZE..],
+                    &meta,
+                    &self.senders,
+                    "duplex",
+                );
             }
             DISPATCH_RPC_CANCEL => {
                 if let Some(token) = self.in_flight.lock().remove(&key) {
