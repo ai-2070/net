@@ -166,6 +166,48 @@ fn cap_announce_rejects_node_id_mismatch_with_signing_key() {
         .code(2);
 }
 
+/// M4 regression — pre-fix the duplicate-tag check relied on
+/// `caps.tags.len()` not growing across `add_tag`, which conflated
+/// "parser rejected the input" with "tag was already in the set".
+/// `--tag nrpc:echo --tag nrpc:echo` was a legal invocation that
+/// errored with the reserved-prefix message. Post-fix the parser
+/// result drives the decision: duplicates dedupe silently via
+/// the underlying HashSet<Tag>; only genuinely-invalid tags
+/// error out.
+#[test]
+fn cap_announce_accepts_duplicate_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = generate_identity(&dir);
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["cap", "announce"])
+        .arg("--key")
+        .arg(&key_path)
+        .args(["--tag", "nrpc:echo"])
+        .args(["--tag", "nrpc:echo"])
+        .assert()
+        .success();
+}
+
+/// Reserved-prefix tags (`scope:`, `causal:`, etc.) must STILL
+/// be rejected — the duplicate-tag fix uses the parser directly,
+/// not the length heuristic, so the rejection moves from a
+/// hand-rolled `caps.tags.len()` check to `Tag::parse_user`'s
+/// own `Err(CapabilityTagError::ReservedPrefix)`.
+#[test]
+fn cap_announce_rejects_reserved_prefix_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = generate_identity(&dir);
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["cap", "announce"])
+        .arg("--key")
+        .arg(&key_path)
+        .args(["--tag", "scope:tenant:foo"])
+        .assert()
+        .code(2);
+}
+
 /// `--node-id` matching the derived value should pass — the
 /// explicit confirmation form is supported, just not a mismatch.
 #[test]

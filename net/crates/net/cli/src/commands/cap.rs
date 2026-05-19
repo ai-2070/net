@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 use net_sdk::capabilities::{
     CapabilityAnnouncement, CapabilityGroupId as GroupId, CapabilitySet,
-    CapabilitySubnetId as SubnetId, MAX_ALLOW_LIST_LEN,
+    CapabilitySubnetId as SubnetId, Tag, MAX_ALLOW_LIST_LEN,
 };
 use serde::Serialize;
 
@@ -280,25 +280,25 @@ async fn run_announce(args: AnnounceArgs) -> Result<(), CliError> {
     };
 
     // 4. Build the CapabilitySet with the user-supplied tags.
-    //    `add_tag` parses each value via `Tag::parse_user`; the
-    //    builder silently drops reserved-prefix and malformed
-    //    inputs, so we count the survivors and surface a typed
-    //    error when a tag was rejected. Without this check an
-    //    operator who types `scope:tenant:foo` (a reserved tag,
-    //    not allowed via the user-facing builder) would get an
-    //    empty announcement with no warning.
+    //    Validate each tag via `Tag::parse_user` directly — the
+    //    pre-fix length-delta heuristic on `caps.tags.len()`
+    //    couldn't distinguish "parser rejected the tag" from
+    //    "tag was a duplicate already in the set", so a perfectly
+    //    legal `--tag nrpc:echo --tag nrpc:echo` invocation errored
+    //    out with the reserved-prefix message. Using the parser
+    //    result directly: invalid tags fail, duplicates dedupe
+    //    silently via the underlying `HashSet<Tag>`.
     let mut caps = CapabilitySet::new();
     for tag in &args.tags {
-        let before = caps.tags.len();
-        caps = caps.add_tag(tag.clone());
-        if caps.tags.len() == before {
+        if let Err(e) = Tag::parse_user(tag) {
             return Err(invalid_args(format!(
-                "tag {tag:?} could not be parsed — reserved-prefix tags \
+                "tag {tag:?} rejected: {e}. Reserved-prefix tags \
                  (`causal:` / `fork-of:` / `heat:` / `scope:`) are not \
-                 admissible via this subcommand. Use the dedicated \
+                 admissible via this subcommand — use the dedicated \
                  builders for those.",
             )));
         }
+        caps = caps.add_tag(tag.clone());
     }
 
     // 5. Build + sign.
