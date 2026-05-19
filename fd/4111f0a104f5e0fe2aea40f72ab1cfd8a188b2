@@ -1,0 +1,44 @@
+net/crates/net/cli/src/commands/cap.rs
+  s_2571835e05521c::t_42bec19b8ef21c 156
+  s_2571835e05521c::t_f8c35e178fb567 40-49
+  s_2571835e05521c::t_a34f105a2fe3fb 231-380
+  s_2571835e05521c::t_0b1165bac24689 1-3,5-13,16,25-26
+  s_2571835e05521c::t_f9f75018eaa596 19-22
+  s_2571835e05521c::t_5a7075c2c5c542 89-145
+net/crates/net/sdk/src/capabilities.rs
+  s_2571835e05521c::t_9d21a4a9f0772d 134,137-144
+net/crates/net/tests/capability_auth_conformance.rs
+  s_2571835e05521c::t_95eb138f4c2886 19
+  s_2571835e05521c::t_25304eeb7f0dd7 56-67,81-93
+  s_2571835e05521c::t_e419767c692727 260,330,379,425
+  s_2571835e05521c::t_c5229ec3ffadab 363
+  s_2571835e05521c::t_0a58c570dd29f9 23
+  s_2571835e05521c::t_c7a0da25df1aec 302
+  s_2571835e05521c::t_2c17a83841e5e7 1-18,20-22,24-55,68-80,94-236,238-259,261-301,303-329,331-362,364-378,380-424,426-540
+  s_2571835e05521c::t_e0bbae398678d9 237
+net/crates/net/cli/tests/cap_announce.rs
+  s_2571835e05521c::t_f4bfa6c5765937 90,104-113
+  s_2571835e05521c::t_2291b37b3451fc 1-89,91-103,114-144
+net/crates/net/docs/plans/CAPABILITY_AUTH_PLAN.md
+  s_2571835e05521c::t_14f5f275df407c 3,9-27
+net/crates/net/cli/src/context.rs
+  s_2571835e05521c::t_da497c8b8411f7 113
+net/crates/net/sdk/src/mesh_rpc_resilience.rs
+  s_2571835e05521c::t_4b1b173f03667d 142-147
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "fd4111f0a104f5e0fe2aea40f72ab1cfd8a188b2",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
