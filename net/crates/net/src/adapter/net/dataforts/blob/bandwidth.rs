@@ -120,6 +120,14 @@ impl std::fmt::Debug for BandwidthClassSupportProbe {
 /// [`super::erasure::erasure_downgrade`] helpers — callers
 /// consult Tree, CDC, RS, and bandwidth-class probes
 /// independently before invoking `store_stream_tree`/`fetch_range`.
+///
+/// **Observability note.** Silent downgrades hide degraded service
+/// from operators — a `Realtime`-pinned control-plane sweep that
+/// quietly executes as `Foreground` against legacy peers is
+/// observably slower without anything pointing at the cause. Wrap
+/// this call in your operator's metrics layer (or use the
+/// telemetry-aware variant below) so a counter bumps on every
+/// non-Foreground → Foreground demotion.
 pub fn bandwidth_class_downgrade(
     class: BandwidthClass,
     probe: &BandwidthClassSupportProbe,
@@ -129,6 +137,36 @@ pub fn bandwidth_class_downgrade(
     } else {
         BandwidthClass::Foreground
     }
+}
+
+/// Variant of [`bandwidth_class_downgrade`] that bumps two
+/// telemetry counters on demotion: one any-class counter and one
+/// Realtime-specific counter. Operators read the Realtime
+/// counter to detect when control-plane Realtime traffic is
+/// degraded against legacy peers (a worthy pager). The any-class
+/// counter is the broad "how often does the downgrade fire"
+/// signal.
+///
+/// Callers wire `&AtomicU64` from their existing metrics
+/// registry. Returns the (possibly-downgraded) class so the
+/// call site stays a one-liner.
+pub fn bandwidth_class_downgrade_with_telemetry(
+    class: BandwidthClass,
+    probe: &BandwidthClassSupportProbe,
+    downgrades_total: &std::sync::atomic::AtomicU64,
+    realtime_downgrades_total: &std::sync::atomic::AtomicU64,
+) -> BandwidthClass {
+    use std::sync::atomic::Ordering;
+    if probe.check() {
+        return class;
+    }
+    if class != BandwidthClass::Foreground {
+        downgrades_total.fetch_add(1, Ordering::Relaxed);
+        if class == BandwidthClass::Realtime {
+            realtime_downgrades_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    BandwidthClass::Foreground
 }
 
 #[cfg(test)]
@@ -166,6 +204,68 @@ mod tests {
         assert!(!probe.check());
         flag.store(true, Ordering::Relaxed);
         assert!(probe.check());
+    }
+
+    /// Telemetry variant bumps the broad downgrade counter on
+    /// every non-Foreground demotion AND the Realtime-specific
+    /// counter only on Realtime → Foreground. The split lets
+    /// operators page on Realtime drops while still graphing
+    /// overall downgrade volume.
+    #[test]
+    fn downgrade_with_telemetry_bumps_correct_counters() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let total = AtomicU64::new(0);
+        let rt = AtomicU64::new(0);
+        let probe_no = BandwidthClassSupportProbe::ForceForeground;
+        // Realtime → Foreground bumps both counters.
+        assert_eq!(
+            bandwidth_class_downgrade_with_telemetry(
+                BandwidthClass::Realtime,
+                &probe_no,
+                &total,
+                &rt,
+            ),
+            BandwidthClass::Foreground
+        );
+        assert_eq!(total.load(Ordering::Relaxed), 1);
+        assert_eq!(rt.load(Ordering::Relaxed), 1);
+        // Background → Foreground bumps only the total counter.
+        assert_eq!(
+            bandwidth_class_downgrade_with_telemetry(
+                BandwidthClass::Background,
+                &probe_no,
+                &total,
+                &rt,
+            ),
+            BandwidthClass::Foreground
+        );
+        assert_eq!(total.load(Ordering::Relaxed), 2);
+        assert_eq!(rt.load(Ordering::Relaxed), 1);
+        // Foreground pass-through bumps neither.
+        assert_eq!(
+            bandwidth_class_downgrade_with_telemetry(
+                BandwidthClass::Foreground,
+                &probe_no,
+                &total,
+                &rt,
+            ),
+            BandwidthClass::Foreground
+        );
+        assert_eq!(total.load(Ordering::Relaxed), 2);
+        assert_eq!(rt.load(Ordering::Relaxed), 1);
+        // Probe says supported → no counters bump regardless of class.
+        let probe_yes = BandwidthClassSupportProbe::AlwaysSupported;
+        assert_eq!(
+            bandwidth_class_downgrade_with_telemetry(
+                BandwidthClass::Realtime,
+                &probe_yes,
+                &total,
+                &rt,
+            ),
+            BandwidthClass::Realtime
+        );
+        assert_eq!(total.load(Ordering::Relaxed), 2);
+        assert_eq!(rt.load(Ordering::Relaxed), 1);
     }
 
     #[test]
