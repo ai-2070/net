@@ -1714,6 +1714,27 @@ impl MeshBlobAdapter {
                     Ok(out)
                 }
                 super::blob_tree::TreeNode::ErasureLeaf { stripes } => {
+                    // Lazy stripe-index population: every
+                    // ErasureLeaf decoded during a read registers
+                    // its RS stripes into the GC-pin index. This
+                    // closes the cold-start gap in the C6 in-
+                    // memory-only index — after a process
+                    // restart, fetches re-populate the index so
+                    // by the time GC runs, recently-read blobs
+                    // are protected against parity-sweep loss.
+                    // Deduplicated at the index level (canonical
+                    // fingerprint), so repeated reads of the
+                    // same blob don't bloat the index.
+                    {
+                        let mut idx = self.stripe_index.lock();
+                        for stripe in &stripes {
+                            if let Encoding::ReedSolomon { k, .. } = stripe.encoding {
+                                let members: Vec<[u8; 32]> =
+                                    stripe.chunks.iter().map(|c| c.hash).collect();
+                                idx.register_stripe(members, k);
+                            }
+                        }
+                    }
                     let mut out: Vec<u8> = Vec::new();
                     let mut offset: u64 = 0;
                     for stripe in &stripes {
@@ -4523,6 +4544,62 @@ mod tests {
             .await
             .expect("RS fetch must reconstruct from parity");
         assert_eq!(fetched, payload, "reconstructed bytes must match original");
+    }
+
+    /// Lazy stripe-index population: a fresh adapter doesn't
+    /// know about any stripes, but the first `fetch_range` that
+    /// walks an ErasureLeaf re-populates the index. Simulates
+    /// the cold-start path where an in-memory-only index would
+    /// otherwise leave previously-stored RS stripes unprotected
+    /// against parity-sweep loss until the next write touches
+    /// them.
+    #[tokio::test]
+    async fn fetch_range_lazily_populates_stripe_index() {
+        // Two adapters sharing the same Redex — simulates a
+        // process restart where the on-disk chunk store is
+        // preserved but the in-memory stripe index is reset.
+        let redex = Arc::new(Redex::new());
+        let chunk_size: u32 = 4 * 1024;
+        let payload = deterministic_bytes(0xAB, chunk_size as usize * 4);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+
+        // Adapter 1: writes the blob — its index has the stripe.
+        let adapter1 = MeshBlobAdapter::new("lazy-1", redex.clone());
+        let blob_ref = adapter1
+            .store_stream_tree_rs_internal(
+                stream_one(payload.clone()),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+        assert_eq!(adapter1.stripe_index.lock().registered_count(), 1);
+
+        // Adapter 2: fresh adapter on the same Redex (simulating
+        // restart). Index is empty.
+        let adapter2 = MeshBlobAdapter::new("lazy-2", redex);
+        assert_eq!(adapter2.stripe_index.lock().registered_count(), 0);
+
+        // First fetch on adapter 2 populates the index lazily.
+        let fetched = adapter2
+            .fetch_range(&blob_ref, 0..payload.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(fetched, payload);
+        assert_eq!(
+            adapter2.stripe_index.lock().registered_count(),
+            1,
+            "fetch must lazily register the stripe"
+        );
+
+        // Repeated fetches don't bloat the index (dedup).
+        let _ = adapter2.fetch_range(&blob_ref, 0..payload.len() as u64).await.unwrap();
+        let _ = adapter2.fetch_range(&blob_ref, 0..payload.len() as u64).await.unwrap();
+        assert_eq!(
+            adapter2.stripe_index.lock().registered_count(),
+            1,
+            "dedup must keep the count at 1 across repeated reads"
+        );
     }
 
     /// Opt-in fetch-path auto-repair: when the adapter is

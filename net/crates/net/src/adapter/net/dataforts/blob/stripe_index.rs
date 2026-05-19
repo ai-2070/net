@@ -64,16 +64,26 @@ pub struct StripeRecord {
 
 /// In-memory stripe-membership index. Operators wrap in a
 /// `parking_lot::Mutex` for shared access; per-call critical
-/// sections are short (one HashMap probe + one Vec append on
-/// register, one HashMap probe + iteration on pin check).
+/// sections are short (one HashSet probe on register, one
+/// HashMap probe + iteration on pin check).
 #[derive(Default, Debug)]
 pub struct StripeMembershipIndex {
     /// Maps a chunk hash to every stripe it's a member of. Most
     /// chunks belong to exactly one stripe; cross-blob dedup of
     /// identical data chunks may produce multi-stripe membership.
     by_chunk: HashMap<[u8; 32], Vec<StripeRecord>>,
+    /// Set of canonical stripe-fingerprints already registered.
+    /// Each entry is BLAKE3 of the concatenated member hashes —
+    /// deduplicates repeated registrations of the same stripe
+    /// (e.g. when the lazy read-side registration in
+    /// `MeshBlobAdapter::walk_tree_range` re-encounters the same
+    /// `ErasureLeaf` across many fetches of the same blob).
+    /// Without dedup the by_chunk vec would grow per-fetch and
+    /// degrade the pin-check cost.
+    fingerprints: std::collections::HashSet<[u8; 32]>,
     /// Running count of registered stripes — operator metric +
-    /// test assertion handle.
+    /// test assertion handle. Counts unique registrations
+    /// (deduplicated calls don't bump the counter).
     registered_count: u64,
 }
 
@@ -86,16 +96,27 @@ impl StripeMembershipIndex {
     }
 
     /// Register a stripe. Every chunk hash in `members` gets a
-    /// reference back to the supplied record. Idempotent at the
-    /// (members, k) tuple level: registering the same stripe
-    /// twice doesn't double-count the pin protection (the
-    /// deduplication runs at chunk-lookup time — the pin check
-    /// only needs to know "is the chunk in any degraded stripe"
-    /// regardless of how many copies of the same StripeRecord
-    /// land in the by_chunk vec).
+    /// reference back to the supplied record. Idempotent: a
+    /// stripe with the same canonical fingerprint (BLAKE3 of
+    /// concatenated member hashes) is registered exactly once
+    /// regardless of how many times this method is called.
     pub fn register_stripe(&mut self, members: Vec<[u8; 32]>, k: u8) {
         if members.is_empty() || k == 0 {
             return; // degenerate; nothing to pin.
+        }
+        // Canonical fingerprint: BLAKE3 of concatenated member
+        // hashes. Order matters — two stripes with the same
+        // members but different orders are treated as distinct
+        // (the position determines data-vs-parity role in
+        // reconstruction; the index doesn't reorder).
+        let mut hasher = blake3::Hasher::new();
+        for h in &members {
+            hasher.update(h);
+        }
+        hasher.update(&[k]);
+        let fingerprint: [u8; 32] = hasher.finalize().into();
+        if !self.fingerprints.insert(fingerprint) {
+            return; // already registered.
         }
         let record = StripeRecord { members: members.clone(), k };
         for hash in &members {
@@ -237,5 +258,34 @@ mod tests {
         idx.register_stripe(vec![], 1);
         idx.register_stripe(vec![h(1)], 0);
         assert_eq!(idx.registered_count(), 1, "degenerate registers are no-ops");
+    }
+
+    /// Repeated registration of the same (members, k) tuple is
+    /// deduplicated: by_chunk vec stays bounded; registered_count
+    /// counts unique stripes, not call count.
+    #[test]
+    fn dedup_repeated_registration_of_same_stripe() {
+        let mut idx = StripeMembershipIndex::new();
+        let members = vec![h(1), h(2), h(3), h(4)];
+        idx.register_stripe(members.clone(), 2);
+        idx.register_stripe(members.clone(), 2);
+        idx.register_stripe(members.clone(), 2);
+        assert_eq!(idx.registered_count(), 1);
+        // by_chunk vec for h(1) should have exactly one
+        // StripeRecord, not three.
+        let stripes = idx.by_chunk.get(&h(1)).unwrap();
+        assert_eq!(stripes.len(), 1);
+    }
+
+    /// Different `k` values for the same member set are treated
+    /// as distinct stripes (different RS configurations =
+    /// different fingerprint).
+    #[test]
+    fn different_k_for_same_members_are_distinct() {
+        let mut idx = StripeMembershipIndex::new();
+        let members = vec![h(1), h(2), h(3), h(4)];
+        idx.register_stripe(members.clone(), 2);
+        idx.register_stripe(members.clone(), 3);
+        assert_eq!(idx.registered_count(), 2);
     }
 }
