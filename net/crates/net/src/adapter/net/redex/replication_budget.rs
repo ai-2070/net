@@ -51,6 +51,25 @@ pub const BACKGROUND_STARVE_WINDOW_DEFAULT: Duration = Duration::from_secs(60);
 /// is targeting steady-state share, not per-hatch grant size).
 pub const BACKGROUND_HATCH_MAX_GRANT_FRACTION: f64 = 0.10;
 
+/// v0.3 Phase D2 `Realtime` admission cap, as a fraction of
+/// `capacity_bytes`. Realtime requests bypass the rate-limit
+/// failure path, but the `class` byte on each `SyncRequest` is
+/// untrusted from the wire (the request-binding token does not
+/// cover the trailing class byte). A hostile peer in the
+/// replica-set can stamp `Realtime` on every outbound request and
+/// would otherwise drain the bucket to zero on every call.
+///
+/// Cap Realtime grants at 50% of capacity per call: large enough
+/// to admit any honest interactive operation (Realtime is intended
+/// for control-plane sweeps with chunk_max bounded by
+/// `SYNC_REQUEST_CHUNK_MAX_DEFAULT`), small enough that an
+/// adversarial peer can't drain the bucket in one shot.
+/// Oversized Realtime requests are denied — a misbehaving peer
+/// has to send many small requests, each of which still drains
+/// the bucket per the existing semantic, but the per-shot floor
+/// is now bounded.
+pub const REALTIME_MAX_GRANT_FRACTION: f64 = 0.50;
+
 /// Inert `background_fraction` used by the legacy
 /// [`BandwidthBudget::try_consume`] path. Foreground admission
 /// doesn't consult the value, so it's effectively unused; named
@@ -248,10 +267,22 @@ impl BandwidthBudget {
 
         match class {
             BandwidthClass::Realtime => {
-                // Bypass the rate-limit failure path. Drain the
-                // bucket so the next non-Realtime request feels
-                // the load; if we have less credit than the
-                // request, floor to zero and admit anyway.
+                // Bypass the rate-limit failure path — but cap
+                // per-shot cost at `REALTIME_MAX_GRANT_FRACTION ×
+                // capacity` so an adversarial peer that stamps
+                // `Realtime` on a u32::MAX-byte SyncRequest can't
+                // drain the bucket to zero in one call. Hostile-
+                // peer caveat: the `class` byte on the wire isn't
+                // covered by the R-23 request-binding token, so
+                // any replica-set peer can forge `Realtime`.
+                // Higher layers (capability-tag advertisement of
+                // who may use Realtime) are the proper place for
+                // class-authz; this cap is the rate-limiter's
+                // defense-in-depth.
+                let realtime_cap = REALTIME_MAX_GRANT_FRACTION * self.capacity_bytes;
+                if cost > realtime_cap {
+                    return false;
+                }
                 self.available_bytes = (self.available_bytes - cost).max(0.0);
                 true
             }
@@ -653,7 +684,8 @@ mod class_tests {
     }
 
     /// `Realtime` bypasses the failure path entirely. Drains
-    /// the bucket but admits even when capacity is exhausted.
+    /// the bucket but admits even when capacity is exhausted —
+    /// up to the per-shot cap.
     #[test]
     fn realtime_bypasses_failure_path() {
         let (mut bb, base) = fresh(1000);
@@ -661,8 +693,29 @@ mod class_tests {
         assert!(bb.try_consume_with_class(1000, BandwidthClass::Foreground, base, 0.3,));
         // Foreground denied.
         assert!(!bb.try_consume_with_class(1, BandwidthClass::Foreground, base, 0.3,));
-        // Realtime admitted regardless.
+        // Realtime admitted regardless of empty bucket; 500 byte
+        // request is under the 50% cap (500 of 1000).
         assert!(bb.try_consume_with_class(500, BandwidthClass::Realtime, base, 0.3,));
+    }
+
+    /// `Realtime` per-shot cost is capped at
+    /// REALTIME_MAX_GRANT_FRACTION × capacity so an adversarial
+    /// peer can't drain the bucket to zero in one shot. The
+    /// class byte on the wire is unauthenticated, so any
+    /// replica-set peer can forge `Realtime`; this cap is the
+    /// rate-limiter's defense-in-depth.
+    #[test]
+    fn realtime_denies_oversized_request_to_prevent_drain_in_one_shot() {
+        let (mut bb, base) = fresh(1000);
+        // Realtime request larger than the 50% cap (= 500 bytes).
+        assert!(
+            !bb.try_consume_with_class(750, BandwidthClass::Realtime, base, 0.3),
+            "oversized Realtime request must be denied",
+        );
+        // Bucket untouched on denial.
+        assert_eq!(bb.available_bytes(), 1000);
+        // Right-sized Realtime request admits.
+        assert!(bb.try_consume_with_class(500, BandwidthClass::Realtime, base, 0.3));
     }
 
     /// D4 anti-starvation hatch: a Background request denied
