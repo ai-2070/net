@@ -1,0 +1,19 @@
+net/crates/net/sdk/benches/nrpc_streaming.rs
+  s_c46a4f2a71242f::t_26888206ba3220 72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "1339ba8250f454c071b9eee7e1d380dd8eb60b83",
+  "prompts": {},
+  "sessions": {
+    "s_c46a4f2a71242f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c40a4b97-f9fb-4ca1-a55c-ca0f5316ac30",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

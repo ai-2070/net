@@ -1,0 +1,21 @@
+net/crates/net/bindings/go/net/mesh_rpc.go
+  s_c46a4f2a71242f::t_bd050976a49323 1683-1685
+  s_c46a4f2a71242f::t_16c9eaea936d41 1591-1593,1602-1609
+  s_c46a4f2a71242f::t_c89870d172a7c0 1369-1373
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "ef87f4d3af1687bbae298c74451ecad10aacfe46",
+  "prompts": {},
+  "sessions": {
+    "s_c46a4f2a71242f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c40a4b97-f9fb-4ca1-a55c-ca0f5316ac30",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
