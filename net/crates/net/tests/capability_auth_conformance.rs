@@ -226,9 +226,11 @@ async fn scenario_1_permissive_baseline_admits_any_caller() {
 // Scenario 2 — Allow-by-node
 // ---------------------------------------------------------------------------
 
-/// A allows `[B]`; B can execute, C cannot. Pins the
-/// `allowed_nodes` axis as observed by the caller-side gate
-/// inside `call_service`.
+/// A allows `[B]`; B can execute end-to-end, C is denied at the
+/// gate. Strong-form: registers a real handler on A so the
+/// admitted call actually round-trips, distinguishing "gate
+/// admitted, RPC delivered" from "gate admitted, but call failed
+/// for an unrelated reason."
 #[tokio::test]
 async fn scenario_2_allow_by_node_admits_listed_only() {
     let target = build_node().await;
@@ -236,7 +238,12 @@ async fn scenario_2_allow_by_node_admits_listed_only() {
     let denied_caller = build_node().await;
     star(&target, &[&allowed_caller, &denied_caller]).await;
 
-    // Build a target announcement restricting to `allowed_caller`.
+    let _serve = target
+        .serve_rpc("echo", Arc::new(EchoHandler))
+        .expect("serve_rpc");
+    // Fold a restrictive policy at a high version so it
+    // supersedes the permissive announcement that serve_rpc
+    // auto-self-indexed (capability_version starts at 0).
     let ann = target_announcement(
         &target,
         100,
@@ -247,26 +254,19 @@ async fn scenario_2_allow_by_node_admits_listed_only() {
     );
     fold_announcement_everywhere(&[&target, &allowed_caller, &denied_caller], &ann);
 
-    // Allowed caller succeeds. The target hasn't called
-    // serve_rpc, so the call surfaces a ServerError — but the
-    // gate said yes, which is what this scenario pins.
-    // Distinguish the gate verdict from the missing-handler
-    // verdict by asserting the error variant.
-    let err = allowed_caller
+    // Allowed caller: full round-trip succeeds.
+    let reply = allowed_caller
         .call_service(
             "echo",
             Bytes::from_static(b"hi"),
             CallOptions {
-                deadline: Some(Instant::now() + Duration::from_millis(500)),
+                deadline: Some(Instant::now() + Duration::from_millis(1500)),
                 ..Default::default()
             },
         )
         .await
-        .expect_err("no handler is registered; expect non-Ok");
-    assert!(
-        !matches!(err, RpcError::CapabilityDenied { .. }),
-        "allowed caller must NOT see CapabilityDenied; got {err:?}",
-    );
+        .expect("allowed caller must complete the round-trip");
+    assert_eq!(reply.body.as_ref(), b"hi");
 
     // Denied caller hits the gate first.
     let err = denied_caller
@@ -301,6 +301,10 @@ async fn scenario_3_allow_by_subnet_admits_subnet_members() {
     let out_of_subnet = build_node().await;
     star(&target, &[&in_subnet, &out_of_subnet]).await;
 
+    let _serve = target
+        .serve_rpc("echo", Arc::new(EchoHandler))
+        .expect("serve_rpc");
+
     let subnet = SubnetId([0x42; 16]);
     let target_ann = target_announcement(
         &target,
@@ -322,21 +326,18 @@ async fn scenario_3_allow_by_subnet_admits_subnet_members() {
     fold_announcement_everywhere(&[&target, &in_subnet], &in_subnet_ann);
     fold_announcement_everywhere(&[&target, &out_of_subnet], &out_of_subnet_ann);
 
-    let err = in_subnet
+    let reply = in_subnet
         .call_service(
             "echo",
             Bytes::from_static(b"in-subnet"),
             CallOptions {
-                deadline: Some(Instant::now() + Duration::from_millis(500)),
+                deadline: Some(Instant::now() + Duration::from_millis(1500)),
                 ..Default::default()
             },
         )
         .await
-        .expect_err("no handler registered; expect non-Ok");
-    assert!(
-        !matches!(err, RpcError::CapabilityDenied { .. }),
-        "subnet member must NOT see CapabilityDenied; got {err:?}",
-    );
+        .expect("subnet member must complete the round-trip");
+    assert_eq!(reply.body.as_ref(), b"in-subnet");
 
     let err = out_of_subnet
         .call_service(
@@ -362,6 +363,10 @@ async fn scenario_4_allow_by_group_admits_group_claimants() {
     let non_claimant = build_node().await;
     star(&target, &[&claimant, &non_claimant]).await;
 
+    let _serve = target
+        .serve_rpc("echo", Arc::new(EchoHandler))
+        .expect("serve_rpc");
+
     let group = GroupId([0x77; 32]);
     let target_ann =
         target_announcement(&target, 300, "nrpc:echo", vec![], vec![], vec![group]);
@@ -371,21 +376,18 @@ async fn scenario_4_allow_by_group_admits_group_claimants() {
     fold_announcement_everywhere(&[&target, &claimant], &claimant_ann);
     fold_announcement_everywhere(&[&target, &non_claimant], &non_claimant_ann);
 
-    let err = claimant
+    let reply = claimant
         .call_service(
             "echo",
             Bytes::from_static(b"group-member"),
             CallOptions {
-                deadline: Some(Instant::now() + Duration::from_millis(500)),
+                deadline: Some(Instant::now() + Duration::from_millis(1500)),
                 ..Default::default()
             },
         )
         .await
-        .expect_err("no handler registered; expect non-Ok");
-    assert!(
-        !matches!(err, RpcError::CapabilityDenied { .. }),
-        "group claimant must NOT see CapabilityDenied; got {err:?}",
-    );
+        .expect("group claimant must complete the round-trip");
+    assert_eq!(reply.body.as_ref(), b"group-member");
 
     let err = non_claimant
         .call_service(
