@@ -82,9 +82,11 @@ pub const DATAFORTS_BLOB_CDC_SUPPORTED: &str = "dataforts:blob-cdc-supported";
 /// with [`ChunkingStrategy::Cdc`] — on `false`, they substitute
 /// [`ChunkingStrategy::Fixed`] at
 /// [`super::blob_ref::BLOB_CHUNK_SIZE_BYTES`].
+#[derive(Default)]
 pub enum CdcSupportProbe {
     /// All targets support CDC. Default for single-cluster
     /// all-Phase-B deployments.
+    #[default]
     AlwaysSupported,
     /// No target supports CDC. Forces every publish to use Fixed
     /// chunking. Useful during cluster-wide rollouts before
@@ -119,11 +121,6 @@ impl std::fmt::Debug for CdcSupportProbe {
     }
 }
 
-impl Default for CdcSupportProbe {
-    fn default() -> Self {
-        Self::AlwaysSupported
-    }
-}
 
 /// Producer-side downgrade helper: if `chunking` is
 /// [`ChunkingStrategy::Cdc`] and `probe.check()` returns `false`,

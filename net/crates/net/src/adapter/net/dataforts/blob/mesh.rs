@@ -1917,6 +1917,7 @@ impl MeshBlobAdapter {
     /// reconstructed data shards into the requested range. If
     /// fewer than `k` shards survive, return
     /// `BlobError::Backend("erasure: stripe unrecoverable …")`.
+    #[allow(clippy::too_many_arguments)]
     async fn walk_stripe_with_reconstruction(
         &self,
         stripe: &super::blob_tree::StripeBlock,
@@ -5740,7 +5741,7 @@ mod tests {
             .unwrap();
         let depth = blob_ref.tree_depth().unwrap();
         assert!(
-            depth >= 1 && depth <= MAX_TREE_DEPTH,
+            (1..=MAX_TREE_DEPTH).contains(&depth),
             "depth {} out of range 1..={}",
             depth,
             MAX_TREE_DEPTH,

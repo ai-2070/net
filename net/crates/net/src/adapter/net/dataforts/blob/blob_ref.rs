@@ -208,9 +208,9 @@ struct TreeBody {
     /// sum of leaf chunk sizes at the bottom of each descent.
     total_size: u64,
     /// Tree depth — `0` is a single-leaf tree (root IS the leaf,
-    /// degenerate), `1` is root + leaves, `2` is root + internals
-    /// + leaves, etc. Capped at [`super::blob_tree::MAX_TREE_DEPTH`]
-    /// (= 4).
+    /// degenerate), `1` is root + leaves, `2` is root + internals +
+    /// leaves, etc. Capped at [`super::blob_tree::MAX_TREE_DEPTH`]
+    /// (currently 4).
     depth: u8,
 }
 
@@ -1865,7 +1865,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&BLOB_REF_MAGIC);
         bytes.push(BLOB_REF_VERSION_V3_TREE);
-        bytes.extend(std::iter::repeat(0u8).take(BLOB_REF_TREE_BODY_MAX_BYTES + 1));
+        bytes.extend(std::iter::repeat_n(0u8, BLOB_REF_TREE_BODY_MAX_BYTES + 1));
         let err = BlobRef::decode(&bytes).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("exceeds cap"), "got: {msg}");

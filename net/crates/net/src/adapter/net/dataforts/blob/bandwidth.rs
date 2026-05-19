@@ -68,9 +68,11 @@ pub use crate::adapter::net::redex::BandwidthClass;
 /// Foreground; Realtime degrades to Foreground (preserves
 /// liveness; gives up the rate-bypass that the legacy peer can't
 /// honour anyway).
+#[derive(Default)]
 pub enum BandwidthClassSupportProbe {
     /// All targets support the class hint. Default for single-
     /// cluster all-Phase-D deployments.
+    #[default]
     AlwaysSupported,
     /// No target supports the class hint. Forces every call to
     /// `Foreground`. Useful during cluster-wide rollouts.
@@ -107,12 +109,6 @@ impl std::fmt::Debug for BandwidthClassSupportProbe {
                 f.write_str("BandwidthClassSupportProbe::Dynamic(..)")
             }
         }
-    }
-}
-
-impl Default for BandwidthClassSupportProbe {
-    fn default() -> Self {
-        Self::AlwaysSupported
     }
 }
 

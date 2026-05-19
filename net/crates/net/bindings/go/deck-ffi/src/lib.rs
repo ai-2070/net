@@ -45,7 +45,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::cell::RefCell;
-use std::ffi::{c_char, c_int, c_uint, CStr, CString};
+use std::ffi::{c_char, c_int, c_uint, CString};
+#[cfg(test)]
+use std::ffi::CStr;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
 use std::sync::{Arc, OnceLock};
@@ -343,10 +345,6 @@ pub extern "C" fn net_deck_free_string(s: *mut c_char) {
     }
 }
 
-/// Reference `CStr` so the import doesn't get flagged as unused.
-const _: fn() = || {
-    let _ = CStr::from_bytes_with_nul(b"\0");
-};
 
 // =========================================================================
 // Client lifecycle
@@ -765,10 +763,9 @@ pub extern "C" fn net_deck_snapshot_stream_next(
             if timeout_ms == 0 {
                 inner.next().await
             } else {
-                match tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next()).await {
-                    Ok(s) => s,
-                    Err(_) => None,
-                }
+                tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next())
+                    .await
+                    .unwrap_or_default()
             }
         });
         match snap {
@@ -882,10 +879,9 @@ pub extern "C" fn net_deck_status_summary_stream_next(
             if timeout_ms == 0 {
                 inner.next().await
             } else {
-                match tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next()).await {
-                    Ok(s) => s,
-                    Err(_) => None,
-                }
+                tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next())
+                    .await
+                    .unwrap_or_default()
             }
         });
         match item {
@@ -1209,10 +1205,9 @@ pub extern "C" fn net_deck_log_stream_next(
             if timeout_ms == 0 {
                 inner.next().await
             } else {
-                match tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next()).await {
-                    Ok(r) => r,
-                    Err(_) => None,
-                }
+                tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next())
+                    .await
+                    .unwrap_or_default()
             }
         });
         match item {
@@ -1309,10 +1304,9 @@ pub extern "C" fn net_deck_failure_stream_next(
             if timeout_ms == 0 {
                 inner.next().await
             } else {
-                match tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next()).await {
-                    Ok(r) => r,
-                    Err(_) => None,
-                }
+                tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next())
+                    .await
+                    .unwrap_or_default()
             }
         });
         match item {
@@ -1582,7 +1576,7 @@ pub extern "C" fn net_deck_audit_records_free(records: *mut *mut c_char, count: 
     if records.is_null() || count == 0 {
         if !records.is_null() {
             unsafe {
-                let _ = Box::from_raw(std::slice::from_raw_parts_mut(records, 0));
+                let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(records, 0));
             }
         }
         return;
@@ -1666,10 +1660,9 @@ pub extern "C" fn net_deck_audit_stream_next(
             if timeout_ms == 0 {
                 inner.next().await
             } else {
-                match tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next()).await {
-                    Ok(r) => r,
-                    Err(_) => None,
-                }
+                tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next())
+                    .await
+                    .unwrap_or_default()
             }
         });
         match item {
@@ -1792,15 +1785,6 @@ unsafe fn signatures_from_c(
     Ok(out)
 }
 
-/// Build a substrate `IceProposal` from a saved action. The
-/// substrate's factories pin a fresh `issued_at_ms` per call;
-/// the simulator is pure over the latest snapshot.
-///
-/// `IceActionProposal` is `#[non_exhaustive]` — an unknown
-/// variant returns `Err` rather than silently mapping to
-/// `ThawCluster` (the most destructive action). Callers
-/// translate the error into the standard last-error envelope
-/// with kind `"unknown_action"`.
 #[cfg(test)]
 thread_local! {
     /// Per-thread fault-injection switch. Set to `true` to force
@@ -1810,6 +1794,15 @@ thread_local! {
     static FAIL_NEXT_BUILD_CORE_PROPOSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Build a substrate `IceProposal` from a saved action. The
+/// substrate's factories pin a fresh `issued_at_ms` per call;
+/// the simulator is pure over the latest snapshot.
+///
+/// `IceActionProposal` is `#[non_exhaustive]` — an unknown
+/// variant returns `Err` rather than silently mapping to
+/// `ThawCluster` (the most destructive action). Callers
+/// translate the error into the standard last-error envelope
+/// with kind `"unknown_action"`.
 fn build_core_proposal<'a>(
     client: &'a CoreClient,
     action: net::adapter::net::behavior::meshos::IceActionProposal,
@@ -2632,14 +2625,9 @@ pub extern "C" fn net_deck_operator_registry_insert(
             std::ptr::copy_nonoverlapping(public_key, bytes.as_mut_ptr(), 32);
         }
         let entity_id = EntityId::from_bytes(bytes);
-        let mut g = r
-            .inner
-            .lock()
-            .map_err(|_| ())
-            .or_else(|_| -> Result<_, ()> {
-                set_last_error("registry_poisoned", "operator registry mutex poisoned");
-                Err(())
-            });
+        let mut g = r.inner.lock().map_err(|_| {
+            set_last_error("registry_poisoned", "operator registry mutex poisoned");
+        });
         let Ok(g) = g.as_deref_mut() else {
             return NET_DECK_ERR_CALL_FAILED;
         };

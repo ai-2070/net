@@ -6,10 +6,10 @@
 //!
 //! Axes:
 //! - Concurrency: 1 / 16 / 128 in-flight callers
-//! - Payload:     32 B / 1 KiB / 16 KiB
-//! - Codec:       json only — the codec axis is exercised in
-//!                `nrpc_unary.rs`. Pinning to JSON here keeps the
-//!                bench matrix to 9 bars (3 × 3) instead of 27.
+//! - Payload: 32 B / 1 KiB / 16 KiB
+//! - Codec: json only — the codec axis is exercised in
+//!   `nrpc_unary.rs`. Pinning to JSON here keeps the bench
+//!   matrix to 9 bars (3 × 3) instead of 27.
 //!
 //! Why direct routing (`call_typed`): the discovery axis lives in
 //! `nrpc_unary.rs`; throughput here is meant to measure the

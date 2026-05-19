@@ -670,6 +670,14 @@ fn cmd_overflow_status(
 // v0.3 Phase C/D subcommands: repair, tree, verify
 // ============================================================================
 
+/// Boxed pinned future the recursive `walk_tree_print` /
+/// `verify_walk` helpers return — async-recursion in stable
+/// Rust requires the boxed return type. Aliased here so the
+/// signature stays readable.
+type RecursiveWalkFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>,
+>;
+
 /// Construct a `BlobRef::Tree` from operator-supplied parts. The
 /// CLI takes (hash, size, depth) because the depth lives in the
 /// wire BlobRef envelope and isn't recoverable from the root
@@ -770,7 +778,7 @@ fn walk_tree_print<'a>(
     indent: usize,
     fmt: OutputFormat,
     json_nodes: &'a mut Vec<serde_json::Value>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>> {
+) -> RecursiveWalkFuture<'a> {
     Box::pin(async move {
         let bytes = adapter.fetch_chunk(&node_hash).await?;
         let node = TreeNode::decode(&bytes)?;
@@ -902,7 +910,7 @@ fn verify_walk<'a>(
     healthy: &'a mut u64,
     missing: &'a mut u64,
     corrupted: &'a mut u64,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>> {
+) -> RecursiveWalkFuture<'a> {
     Box::pin(async move {
         // First verify the manifest node itself.
         let bytes = match adapter.fetch_chunk(&node_hash).await {

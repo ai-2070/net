@@ -79,9 +79,11 @@ pub const DATAFORTS_BLOB_TREE_SUPPORTED: &str = "dataforts:blob-tree-supported";
 /// Producers consult the probe BEFORE calling
 /// `store_stream_tree` — on `false`, they fall back to
 /// `store_stream` + `BlobRef::Manifest` (capped at 16 GiB).
+#[derive(Default)]
 pub enum TreeSupportProbe {
     /// All targets support Tree. Default for single-cluster
     /// v0.3-only deployments.
+    #[default]
     AlwaysSupported,
     /// No target supports Tree. Forces every publish to
     /// downgrade to v0.2 Manifest. Useful during cluster-wide
@@ -116,11 +118,6 @@ impl std::fmt::Debug for TreeSupportProbe {
     }
 }
 
-impl Default for TreeSupportProbe {
-    fn default() -> Self {
-        Self::AlwaysSupported
-    }
-}
 
 /// Chunking strategy for `MeshBlobAdapter::store_stream_tree`.
 ///
@@ -219,9 +216,10 @@ pub const TREE_LEAF_CHUNK_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// v0.3a (Phase A) emits only `Data`. `Parity` lands in Phase C
 /// with the RS implementation; reserving the variant now keeps
 /// the wire format stable across the phase boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ChunkRole {
     /// Plain data chunk.
+    #[default]
     Data,
     /// Reed–Solomon parity chunk. `stripe_index` identifies which
     /// stripe within the leaf the chunk belongs to (multiple
@@ -231,12 +229,6 @@ pub enum ChunkRole {
         /// of stripes in the leaf).
         stripe_index: u8,
     },
-}
-
-impl Default for ChunkRole {
-    fn default() -> Self {
-        Self::Data
-    }
 }
 
 /// v0.3 chunk reference. Adds [`ChunkRole`] to v0.2's

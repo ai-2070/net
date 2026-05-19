@@ -122,9 +122,11 @@ pub const DATAFORTS_BLOB_ERASURE_SUPPORTED: &str = "dataforts:blob-erasure-suppo
 /// Producers consult the probe BEFORE passing
 /// [`Encoding::ReedSolomon`] to `store_stream_tree` — on `false`,
 /// they substitute [`Encoding::Replicated`].
+#[derive(Default)]
 pub enum ErasureSupportProbe {
     /// All targets support RS. Default for single-cluster
     /// all-Phase-C deployments.
+    #[default]
     AlwaysSupported,
     /// No target supports RS. Forces every publish to use
     /// Replicated encoding. Useful during cluster-wide rollouts
@@ -163,11 +165,6 @@ impl std::fmt::Debug for ErasureSupportProbe {
     }
 }
 
-impl Default for ErasureSupportProbe {
-    fn default() -> Self {
-        Self::AlwaysSupported
-    }
-}
 
 /// Producer-side downgrade helper: if `encoding` is
 /// [`Encoding::ReedSolomon`] and `probe.check()` returns `false`,

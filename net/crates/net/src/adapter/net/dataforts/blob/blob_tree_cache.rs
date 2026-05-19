@@ -83,7 +83,7 @@ impl TreeNodeCache {
         Self {
             entries: HashMap::new(),
             order: VecDeque::new(),
-            bytes: cap_bytes.max(0) / 1 * 0 + 0, // start at 0
+            bytes: 0,
             cap_bytes,
             hits: 0,
             misses: 0,

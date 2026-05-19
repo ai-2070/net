@@ -56,7 +56,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::cell::RefCell;
-use std::ffi::{c_char, c_int, CStr, CString};
+use std::ffi::{c_char, c_int, CString};
+#[cfg(test)]
+use std::ffi::CStr;
 use std::os::raw::c_float;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
@@ -1017,12 +1019,9 @@ pub extern "C" fn net_meshos_next_control(
                 if timeout_ms == 0 {
                     h.next_control().await
                 } else {
-                    match tokio::time::timeout(Duration::from_millis(timeout_ms), h.next_control())
+                    tokio::time::timeout(Duration::from_millis(timeout_ms), h.next_control())
                         .await
-                    {
-                        Ok(ev) => ev,
-                        Err(_) => None,
-                    }
+                        .unwrap_or_default()
                 }
             })
         };
@@ -1384,11 +1383,6 @@ fn cstr_to_string(ptr: *const c_char, len: usize) -> Option<String> {
     std::str::from_utf8(slice).ok().map(|s| s.to_string())
 }
 
-/// Silence the `unused` warning for `CStr` (kept available for
-/// future slices that need NUL-terminated strings).
-const _: fn() = || {
-    let _ = CStr::from_bytes_with_nul(b"\0");
-};
 
 // =========================================================================
 // Tests — exercise the C ABI end-to-end from Rust. Since the Go

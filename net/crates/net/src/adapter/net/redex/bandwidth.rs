@@ -30,21 +30,16 @@
 /// (still subject to disk-pressure circuit-breakers). Reserved
 /// for control-plane traffic and operator-triggered repair
 /// sweeps.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum BandwidthClass {
     /// Default class — interactive / user-driven work.
+    #[default]
     Foreground,
     /// TB-scale background work — backfills, migrations,
     /// cold-blob warming. Bounded by `background_fraction`.
     Background,
     /// Operator-pinned. Bypasses per-class rate budget.
     Realtime,
-}
-
-impl Default for BandwidthClass {
-    fn default() -> Self {
-        Self::Foreground
-    }
 }
 
 impl BandwidthClass {

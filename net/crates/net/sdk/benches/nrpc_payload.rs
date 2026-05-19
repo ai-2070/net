@@ -10,8 +10,8 @@
 //!
 //! Axes:
 //! - Payload: 256 KiB / 1 MiB / 3 MiB (safely under 4 MiB even
-//!            after JSON envelope expansion)
-//! - Codec:   json / postcard / raw bytes
+//!   after JSON envelope expansion)
+//! - Codec: json / postcard / raw bytes
 //!
 //! `Throughput::Bytes(size)` makes Criterion report MB/s — the
 //! headline metric for large payloads. Sample count is intentionally
