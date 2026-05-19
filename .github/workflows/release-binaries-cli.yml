@@ -262,23 +262,21 @@ jobs:
         shell: bash
         run: |
           cd dist
-          cat *.sha256 | sort > SHA256SUMS
+          # Namespaced filename so the cli + deck workflows can
+          # both attach to the same umbrella `v<version>` release
+          # without overwriting each other's checksums file.
+          cat *.sha256 | sort > SHA256SUMS-cli
           rm *.sha256
           ls -la
 
-      - name: Resolve tag
-        id: tag
-        shell: bash
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Attach archives to release
+      - name: Attach archives to umbrella release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
+          # The umbrella `v<version>` GitHub Release is created
+          # by the main `v*` tag in RELEASE_STEPS.md. This workflow
+          # is triggered by the `cli-v*` fan-out tag but attaches
+          # tarballs to the umbrella release so consumers find all
+          # platform binaries in one place.
+          tag_name: v${{ needs.shared-assets.outputs.version }}
           files: dist/*
           fail_on_unmatched_files: true
