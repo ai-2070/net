@@ -1061,7 +1061,14 @@ impl RpcClientStreamingHandler for NodeClientStreamingRpcHandler {
                 "TSFN enqueue failed: {status:?}"
             )));
         }
-        let promise = match tokio::time::timeout(self.timeout, rx).await {
+        // Single deadline spanning both phases: TSFN dispatch
+        // (rx.await yields the JS Promise object) AND promise
+        // resolution (`promise.await` yields the response buffer).
+        // Previously only the first phase was bounded — a hung JS
+        // handler that returned a Promise that never resolved
+        // would pin the Rust task for the full call lifetime.
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
             Ok(Ok(Err(e))) => {
                 return Err(RpcHandlerError::Internal(format!(
@@ -1075,14 +1082,14 @@ impl RpcClientStreamingHandler for NodeClientStreamingRpcHandler {
             }
             Err(_) => {
                 return Err(RpcHandlerError::Internal(format!(
-                    "JS client-streaming handler did not respond within {} ms",
+                    "JS client-streaming handler did not dispatch within {} ms",
                     self.timeout.as_millis()
                 )))
             }
         };
-        let resp_buf = match promise.await {
-            Ok(buf) => buf,
-            Err(e) => {
+        let resp_buf = match tokio::time::timeout_at(deadline, promise).await {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(e)) => {
                 let msg = e.to_string();
                 if let Some((code, body)) = parse_js_app_error(&msg) {
                     return Err(RpcHandlerError::Application {
@@ -1093,6 +1100,12 @@ impl RpcClientStreamingHandler for NodeClientStreamingRpcHandler {
                 return Err(RpcHandlerError::Internal(format!(
                     "JS client-streaming handler promise rejected: {e}"
                 )));
+            }
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "JS client-streaming handler did not resolve within {} ms",
+                    self.timeout.as_millis()
+                )))
             }
         };
         Ok(RpcResponsePayload {
@@ -1139,7 +1152,11 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
                 "TSFN enqueue failed: {status:?}"
             )));
         }
-        let promise = match tokio::time::timeout(self.timeout, rx).await {
+        // Single deadline spans both TSFN dispatch and Promise
+        // resolution — see the equivalent comment in the
+        // client-streaming bridge.
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
             Ok(Ok(Err(e))) => {
                 return Err(RpcHandlerError::Internal(format!(
@@ -1153,14 +1170,14 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
             }
             Err(_) => {
                 return Err(RpcHandlerError::Internal(format!(
-                    "JS duplex handler did not respond within {} ms",
+                    "JS duplex handler did not dispatch within {} ms",
                     self.timeout.as_millis()
                 )))
             }
         };
-        match promise.await {
-            Ok(_) => Ok(()),
-            Err(e) => {
+        match tokio::time::timeout_at(deadline, promise).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => {
                 let msg: String = format!("{e}");
                 if let Some((code, body)) = parse_js_app_error(&msg) {
                     return Err(RpcHandlerError::Application {
@@ -1172,6 +1189,10 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
                     "JS duplex handler promise rejected: {msg}"
                 )))
             }
+            Err(_) => Err(RpcHandlerError::Internal(format!(
+                "JS duplex handler did not resolve within {} ms",
+                self.timeout.as_millis()
+            ))),
         }
     }
 }
