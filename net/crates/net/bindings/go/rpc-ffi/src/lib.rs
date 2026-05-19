@@ -2723,6 +2723,22 @@ pub extern "C" fn net_rpc_response_sink_send(
 }
 
 /// `RpcClientStreamingHandler` impl that bridges to the Go side.
+///
+/// **spawn_blocking lifecycle on timeout.** When
+/// `tokio::time::timeout` elapses, the outer future is cancelled
+/// and an Internal error returns to the substrate fold. The
+/// substrate then drops the per-call request mpsc sender as part
+/// of `senders.lock().remove(&key)` in the fold's spawn closure
+/// — at which point the Go handler's next `Recv()` call sees the
+/// receiver closed and returns `ErrStreamDone`. A cooperative Go
+/// handler exits naturally and `spawn_blocking` completes.
+///
+/// `spawn_blocking` tasks are NOT abort-on-handle-drop (tokio
+/// runs them on the blocking pool until the closure returns), so
+/// a misbehaving Go handler that ignores `ErrStreamDone` and
+/// loops on `Recv()` cannot be force-stopped from the Rust side.
+/// That is a Go-handler-correctness issue, not a Rust bug —
+/// document and let the operator's monitoring catch a runaway.
 struct GoClientStreamingRpcHandler {
     handler_id: u64,
     timeout: Duration,
@@ -2824,7 +2840,12 @@ impl RpcClientStreamingHandler for GoClientStreamingRpcHandler {
     }
 }
 
-/// `RpcDuplexHandler` impl that bridges to the Go side.
+/// `RpcDuplexHandler` impl that bridges to the Go side. Same
+/// `spawn_blocking` lifecycle contract as
+/// [`GoClientStreamingRpcHandler`] — a cooperative Go handler
+/// that observes `ErrStreamDone` on its stream's `Recv()` exits
+/// naturally after Rust-side timeout; a non-cooperative one
+/// cannot be force-stopped.
 struct GoDuplexRpcHandler {
     handler_id: u64,
     timeout: Duration,
