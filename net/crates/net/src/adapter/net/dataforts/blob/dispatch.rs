@@ -130,12 +130,27 @@ fn verify_manifest_chunks(
         // so this branch is unreachable in production. Guard
         // anyway for forward-compat with new BlobRef variants.
         BlobRef::Small { .. } => return Ok(()),
-        // Tree blobs verify per-chunk during the tree walk
-        // (A4 `TreeWalker`); the flat-buffer verifier here
-        // doesn't apply. Return Ok so the caller's reassembly
-        // path is uniform; the tree walk is the authoritative
-        // verifier for Tree blobs.
-        BlobRef::Tree { .. } => return Ok(()),
+        // Tree blobs cannot be verified through the flat-buffer
+        // verifier — the integrity invariant for Tree is
+        // per-node BLAKE3 chain along the descent + per-chunk
+        // verification at each leaf, all driven by the
+        // tree-walker in `MeshBlobAdapter::walk_tree_range`. A
+        // generic `BlobAdapter::fetch` that returned a flat
+        // reassembled byte buffer for a Tree blob would bypass
+        // that chain entirely — adversarial / buggy third-party
+        // adapters could thus inject tampered bytes here without
+        // detection. Reject explicitly so the only path that can
+        // resolve a Tree blob is one that invokes the tree walk
+        // (e.g. `MeshBlobAdapter::fetch_range(0..total_size)`),
+        // which performs the per-chunk verification itself.
+        BlobRef::Tree { .. } => {
+            return Err(BlobError::Backend(
+                "resolve_payload: BlobRef::Tree cannot be resolved through a flat \
+                 fetch — route through a tree-walking fetch_range so per-chunk \
+                 verification runs along the descent"
+                    .to_owned(),
+            ));
+        }
     };
     let total: u64 = chunks.iter().map(|c| c.size as u64).sum();
     if total != fetched.len() as u64 {
@@ -560,6 +575,64 @@ mod tests {
         let err = resolve_payload(&encoded, &adapter).await.unwrap_err();
         assert!(matches!(err, BlobError::UnsupportedScheme(_)));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `BlobRef::Tree` cannot be resolved through `resolve_payload`
+    /// because the trait's `fetch` returns flat bytes that bypass
+    /// the per-node BLAKE3 chain along the tree descent. The fix
+    /// must reject Tree with a typed error rather than passing
+    /// adapter-supplied bytes through unverified.
+    #[tokio::test]
+    async fn resolve_rejects_tree_blob_to_force_tree_walking_fetch_range() {
+        use super::super::blob_ref::Encoding;
+        use async_trait::async_trait;
+        use std::ops::Range;
+
+        // Stub returns arbitrary bytes for any fetch — pre-fix
+        // these passed through `verify_manifest_chunks`'s Ok(()) for
+        // Tree branch unverified.
+        struct UnverifiedTreeAdapter(Vec<u8>);
+        #[async_trait]
+        impl BlobAdapter for UnverifiedTreeAdapter {
+            fn adapter_id(&self) -> &str {
+                "unverified-tree"
+            }
+            async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> {
+                Ok(())
+            }
+            async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
+                Ok(self.0.clone())
+            }
+            async fn fetch_range(
+                &self,
+                _: &BlobRef,
+                _range: Range<u64>,
+            ) -> Result<Vec<u8>, BlobError> {
+                Ok(self.0.clone())
+            }
+            async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> {
+                Ok(true)
+            }
+        }
+
+        // Plausible Tree BlobRef — the wire bytes are valid even
+        // though no chunk store carries the root.
+        let tree = BlobRef::tree(
+            "test://tree",
+            Encoding::Replicated,
+            [0xAB; 32],
+            64,
+            1,
+        )
+        .expect("tree ref");
+        let encoded = tree.encode();
+        let adapter = UnverifiedTreeAdapter(vec![0u8; 64]);
+        let err = resolve_payload(&encoded, &adapter).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("BlobRef::Tree cannot be resolved through a flat fetch"),
+            "expected Tree-rejected error; got: {msg}",
+        );
     }
 
     #[tokio::test]
