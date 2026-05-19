@@ -1298,8 +1298,11 @@ impl MeshBlobAdapter {
         params: super::cdc::CdcParams,
     ) -> Result<BlobRef, BlobError> {
         use futures::StreamExt;
+        // `CdcStreamChunker::new` validates internally; the
+        // explicit pre-validate is retained for the typed error
+        // path the public API stamps before any work runs.
         params.validate()?;
-        let mut chunker = super::cdc::CdcStreamChunker::new(params);
+        let mut chunker = super::cdc::CdcStreamChunker::new(params)?;
         let mut builder = TreeBuilder::new();
 
         while let Some(maybe) = stream.next().await {
@@ -1484,8 +1487,7 @@ impl MeshBlobAdapter {
             }
             ChunkingStrategy::Cdc { min, avg, max } => {
                 let params = super::cdc::CdcParams { min, avg, max };
-                params.validate()?;
-                let mut chunker = super::cdc::CdcStreamChunker::new(params);
+                let mut chunker = super::cdc::CdcStreamChunker::new(params)?;
                 while let Some(maybe) = stream.next().await {
                     let bytes = maybe?;
                     chunker.extend(bytes.as_ref());

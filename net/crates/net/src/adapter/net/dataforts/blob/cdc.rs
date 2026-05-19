@@ -284,12 +284,18 @@ pub struct CdcStreamChunker {
 
 impl CdcStreamChunker {
     /// Construct a new chunker with the supplied parameter triple.
-    pub fn new(params: CdcParams) -> Self {
-        Self {
+    /// Returns `BlobError::Backend` if `params.validate()` rejects
+    /// the triple — invalid params would otherwise reach
+    /// `FastCDC::with_level` and trigger an upstream `debug_assert`
+    /// that becomes a silent misbehaviour in release builds. The
+    /// constructor refuses to surface an invalid-state chunker.
+    pub fn new(params: CdcParams) -> Result<Self, BlobError> {
+        params.validate()?;
+        Ok(Self {
             buffer: BytesMut::with_capacity(params.max as usize),
             params,
             last_unsuccessful_scan_len: None,
-        }
+        })
     }
 
     /// Append `bytes` to the pending buffer. The caller drains
@@ -456,7 +462,7 @@ mod tests {
     #[test]
     fn single_extend_then_drain_round_trips() {
         let payload = deterministic_bytes(1, 64 * 1024);
-        let mut chunker = CdcStreamChunker::new(TEST_PARAMS);
+        let mut chunker = CdcStreamChunker::new(TEST_PARAMS).expect("TEST_PARAMS valid");
         chunker.extend(&payload);
         let mut chunks = Vec::new();
         while let Some(c) = chunker.try_next_chunk() {
@@ -495,7 +501,7 @@ mod tests {
         // mask, so every cut is a forced max-cap cut. That's the
         // worst case for the pre-fix scan-from-zero loop.
         let payload = vec![0u8; 256 * 1024];
-        let mut chunker = CdcStreamChunker::new(params);
+        let mut chunker = CdcStreamChunker::new(params).expect("test params valid");
         let mut emitted_total = 0usize;
         let start = std::time::Instant::now();
         for b in &payload {
@@ -528,7 +534,7 @@ mod tests {
     fn byte_at_a_time_matches_single_extend() {
         let payload = deterministic_bytes(2, 16 * 1024);
         // Reference: bulk-extend.
-        let mut bulk = CdcStreamChunker::new(TEST_PARAMS);
+        let mut bulk = CdcStreamChunker::new(TEST_PARAMS).expect("TEST_PARAMS valid");
         bulk.extend(&payload);
         let mut bulk_chunks = Vec::new();
         while let Some(c) = bulk.try_next_chunk() {
@@ -536,7 +542,7 @@ mod tests {
         }
         bulk_chunks.extend(bulk.finalize());
         // Byte-at-a-time.
-        let mut drip = CdcStreamChunker::new(TEST_PARAMS);
+        let mut drip = CdcStreamChunker::new(TEST_PARAMS).expect("TEST_PARAMS valid");
         let mut drip_chunks = Vec::new();
         for b in &payload {
             drip.extend(std::slice::from_ref(b));
@@ -554,7 +560,7 @@ mod tests {
     fn determinism_across_runs() {
         let payload = deterministic_bytes(3, 32 * 1024);
         let chunk_run = |params: CdcParams, data: &[u8]| -> Vec<Bytes> {
-            let mut c = CdcStreamChunker::new(params);
+            let mut c = CdcStreamChunker::new(params).expect("test params valid");
             c.extend(data);
             let mut out = Vec::new();
             while let Some(ch) = c.try_next_chunk() {
@@ -590,7 +596,8 @@ mod tests {
     fn cross_version_determinism_pinned_against_known_input() {
         // Input shorter than `min` → single chunk on finalize.
         let payload = deterministic_bytes(42, 256 * 1024);
-        let mut chunker = CdcStreamChunker::new(PRODUCTION_CDC_PARAMS);
+        let mut chunker =
+            CdcStreamChunker::new(PRODUCTION_CDC_PARAMS).expect("PRODUCTION_CDC_PARAMS valid");
         chunker.extend(&payload);
         // try_next_chunk returns None (under min, no cut).
         assert!(
@@ -631,7 +638,7 @@ mod tests {
         // Flip a byte at the rough midpoint.
         payload[64 * 1024] ^= 0xFF;
         let chunk_set = |data: &[u8]| -> std::collections::HashSet<Bytes> {
-            let mut c = CdcStreamChunker::new(TEST_PARAMS);
+            let mut c = CdcStreamChunker::new(TEST_PARAMS).expect("TEST_PARAMS valid");
             c.extend(data);
             let mut out = std::collections::HashSet::new();
             while let Some(ch) = c.try_next_chunk() {
@@ -664,7 +671,7 @@ mod tests {
     #[test]
     fn every_chunk_under_max() {
         let payload = deterministic_bytes(5, 64 * 1024);
-        let mut chunker = CdcStreamChunker::new(TEST_PARAMS);
+        let mut chunker = CdcStreamChunker::new(TEST_PARAMS).expect("TEST_PARAMS valid");
         chunker.extend(&payload);
         while let Some(c) = chunker.try_next_chunk() {
             assert!(
@@ -685,7 +692,7 @@ mod tests {
     #[test]
     fn all_zero_input_forces_max_cuts() {
         let payload = vec![0u8; 32 * 1024];
-        let mut chunker = CdcStreamChunker::new(TEST_PARAMS);
+        let mut chunker = CdcStreamChunker::new(TEST_PARAMS).expect("TEST_PARAMS valid");
         chunker.extend(&payload);
         let mut chunks = Vec::new();
         while let Some(c) = chunker.try_next_chunk() {
@@ -704,6 +711,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// CdcStreamChunker::new must reject invalid params at
+    /// construction rather than letting them reach
+    /// FastCDC::with_level (which triggers an upstream
+    /// debug_assert that silently misbehaves in release builds).
+    #[test]
+    fn new_rejects_invalid_params() {
+        // min == avg violates strict ordering.
+        let bad = CdcParams {
+            min: 1024,
+            avg: 1024,
+            max: 4096,
+        };
+        let res = CdcStreamChunker::new(bad);
+        assert!(
+            res.is_err(),
+            "CdcStreamChunker::new must reject min == avg",
+        );
+        // Out-of-range avg: AVG_MAX caps below this.
+        let bad = CdcParams {
+            min: 1024,
+            avg: 1_000_000_000,
+            max: 2_000_000_000,
+        };
+        assert!(CdcStreamChunker::new(bad).is_err());
+        // Production params are accepted.
+        assert!(CdcStreamChunker::new(PRODUCTION_CDC_PARAMS).is_ok());
     }
 
     /// `validate` rejects out-of-range params with a typed error.
@@ -815,7 +850,7 @@ mod tests {
     #[test]
     fn buffer_bound_holds() {
         let payload = deterministic_bytes(6, 100 * 1024);
-        let mut chunker = CdcStreamChunker::new(TEST_PARAMS);
+        let mut chunker = CdcStreamChunker::new(TEST_PARAMS).expect("TEST_PARAMS valid");
         for slice in payload.chunks(128) {
             chunker.extend(slice);
             // After every extend + drain, the buffer is at most
