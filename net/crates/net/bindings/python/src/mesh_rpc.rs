@@ -643,6 +643,11 @@ pub struct PyClientStreamCall {
     runtime: Arc<Runtime>,
     call_id_cached: u64,
     flow_controlled_cached: bool,
+    /// Lets ``close()`` interrupt a pending ``send()`` blocked on
+    /// flow-control credit. Same role as the Node binding's
+    /// ``close_notify`` — a Notify permit fires the select branch
+    /// in send and the call is dropped (CANCEL fires from Drop).
+    close_notify: Arc<tokio::sync::Notify>,
 }
 
 #[pymethods]
@@ -651,19 +656,40 @@ impl PyClientStreamCall {
     /// call) or as a REQUEST_CHUNK (subsequent). Blocks until the
     /// SDK accepts the chunk (under flow control, blocks for one
     /// upload credit).
+    ///
+    /// Concurrent ``close()`` interrupts the await — send returns
+    /// ``RpcError("send aborted by close()")`` instead of hanging
+    /// forever on a credit grant that will never arrive.
     fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        let notify = self.close_notify.clone();
         py.detach(|| {
             runtime.block_on(async move {
                 let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
                     Some(c) => c,
                     None => return Err(RpcError::new_err("client-stream call already closed")),
                 };
-                let result = call.send(body_bytes).await;
-                *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
-                result.map_err(rpc_error_to_pyerr)
+                let result = tokio::select! {
+                    r = call.send(body_bytes) => r,
+                    _ = notify.notified() => {
+                        // close() fired. Drop the call (which
+                        // fires CANCEL via SDK's Drop).
+                        drop(call);
+                        return Err(RpcError::new_err("send aborted by close()"));
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        drop(call);
+                        Err(rpc_error_to_pyerr(e))
+                    }
+                }
             })
         })
     }
@@ -699,7 +725,10 @@ impl PyClientStreamCall {
 
     /// Close without finishing. Fires CANCEL via the SDK's Drop
     /// if the initial REQUEST has already flown. Idempotent.
+    /// Concurrent in-flight ``send()`` waiting on credit is
+    /// interrupted via the close-notify.
     fn close(&self) {
+        self.close_notify.notify_one();
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let _ = guard.take();
     }
@@ -731,24 +760,46 @@ pub struct PyDuplexCall {
     runtime: Arc<Runtime>,
     call_id_cached: u64,
     flow_controlled_cached: bool,
+    /// Same role as ``PyClientStreamCall::close_notify`` — lets
+    /// ``close()`` interrupt a pending ``send()`` blocked on
+    /// flow-control credit.
+    close_notify: Arc<tokio::sync::Notify>,
 }
 
 #[pymethods]
 impl PyDuplexCall {
     /// Push one body chunk to the server.
+    ///
+    /// Concurrent ``close()`` interrupts the await via the
+    /// close-notify (same shape as ``ClientStreamCall.send``).
     fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        let notify = self.close_notify.clone();
         py.detach(|| {
             runtime.block_on(async move {
                 let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
                     Some(c) => c,
                     None => return Err(RpcError::new_err("duplex call already closed")),
                 };
-                let result = call.send(body_bytes).await;
-                *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
-                result.map_err(rpc_error_to_pyerr)
+                let result = tokio::select! {
+                    r = call.send(body_bytes) => r,
+                    _ = notify.notified() => {
+                        drop(call);
+                        return Err(RpcError::new_err("send aborted by close()"));
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        drop(call);
+                        Err(rpc_error_to_pyerr(e))
+                    }
+                }
             })
         })
     }
@@ -834,6 +885,7 @@ impl PyDuplexCall {
                 runtime: self.runtime.clone(),
                 call_id_cached: call_id,
                 flow_controlled_cached: flow_controlled,
+                close_notify: Arc::new(tokio::sync::Notify::new()),
             },
             PyDuplexStream {
                 inner: Arc::new(Mutex::new(Some(stream))),
@@ -855,8 +907,10 @@ impl PyDuplexCall {
     }
 
     /// Close the call. Fires CANCEL via the SDK's Drop.
-    /// Idempotent.
+    /// Idempotent. Concurrent in-flight ``send()`` waiting on
+    /// credit is interrupted via the close-notify.
     fn close(&self) {
+        self.close_notify.notify_one();
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let _ = guard.take();
     }
@@ -882,24 +936,43 @@ pub struct PyDuplexSink {
     runtime: Arc<Runtime>,
     call_id_cached: u64,
     flow_controlled_cached: bool,
+    /// Same role as ``PyClientStreamCall::close_notify``.
+    close_notify: Arc<tokio::sync::Notify>,
 }
 
 #[pymethods]
 impl PyDuplexSink {
-    /// Push one body chunk to the server.
+    /// Push one body chunk to the server. Concurrent ``close()``
+    /// interrupts the await via the close-notify (same shape as
+    /// ``DuplexCall.send``).
     fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        let notify = self.close_notify.clone();
         py.detach(|| {
             runtime.block_on(async move {
                 let mut sink = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
                     Some(s) => s,
                     None => return Err(RpcError::new_err("duplex sink already closed")),
                 };
-                let result = sink.send(body_bytes).await;
-                *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink);
-                result.map_err(rpc_error_to_pyerr)
+                let result = tokio::select! {
+                    r = sink.send(body_bytes) => r,
+                    _ = notify.notified() => {
+                        drop(sink);
+                        return Err(RpcError::new_err("send aborted by close()"));
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        drop(sink);
+                        Err(rpc_error_to_pyerr(e))
+                    }
+                }
             })
         })
     }
@@ -927,6 +1000,7 @@ impl PyDuplexSink {
         self.flow_controlled_cached
     }
     fn close(&self) {
+        self.close_notify.notify_one();
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let _ = guard.take();
     }
@@ -1595,6 +1669,7 @@ impl PyMeshRpc {
             runtime: self.runtime.clone(),
             call_id_cached: call_id,
             flow_controlled_cached: flow_controlled,
+            close_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -1627,6 +1702,7 @@ impl PyMeshRpc {
             runtime: self.runtime.clone(),
             call_id_cached: call_id,
             flow_controlled_cached: flow_controlled,
+            close_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
