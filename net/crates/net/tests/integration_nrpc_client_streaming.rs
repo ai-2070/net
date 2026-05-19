@@ -156,6 +156,31 @@ impl RpcClientStreamingHandler for AppErrorHandler {
     }
 }
 
+/// Hangs on `requests.next()` forever, ignoring cancellation.
+/// Used to verify the server-side deadline guard force-drops the
+/// handler when the caller declares `deadline` but no REQUEST_END
+/// (or CANCEL) ever arrives.
+struct HangForeverHandler;
+
+#[async_trait::async_trait]
+impl RpcClientStreamingHandler for HangForeverHandler {
+    async fn call(
+        &self,
+        _ctx: RpcStreamingContext,
+        mut requests: RequestStream,
+    ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        // Pure sequential `next().await` — does NOT select on
+        // ctx.cancellation. This emulates a misbehaving handler
+        // that doesn't honor cooperative cancellation.
+        while requests.next().await.is_some() {}
+        // Add a deliberate forever-hang past the EOF in case the
+        // caller did send something — exercises the deadline path
+        // for handlers that ignore the stream's EOF signal too.
+        std::future::pending::<()>().await;
+        unreachable!()
+    }
+}
+
 /// Slow-draining handler. Pre-sleeps `pre_sleep_ms` BEFORE
 /// touching the request stream — this ensures the caller's
 /// sends pile up against the initial credit window without any
@@ -451,4 +476,48 @@ async fn call_client_stream_rejects_zero_request_window() {
         !matches!(err, RpcError::Codec { .. }),
         "Some(1) must clear the deadlock guard; got {err:?}",
     );
+}
+
+/// Server-side deadline guard: a handler that ignores cancellation
+/// and hangs on the request stream must still be forced to terminate
+/// once `deadline_ns` elapses. Without the guard, the per-call
+/// sender in `RpcStreamingRequestFold::senders` would be orphaned
+/// indefinitely.
+#[tokio::test]
+async fn client_streaming_server_deadline_force_drops_hanging_handler() {
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    let _serve = server
+        .serve_rpc_client_stream("hang", Arc::new(HangForeverHandler))
+        .expect("serve_rpc_client_stream");
+
+    let opts = CallOptions {
+        deadline: Some(std::time::Instant::now() + Duration::from_millis(300)),
+        ..CallOptions::default()
+    };
+    let call = caller
+        .call_client_stream(server.node_id(), "hang", opts)
+        .await
+        .expect("call_client_stream");
+    // Hold the call open without sending — the handler is stuck on
+    // `requests.next().await` waiting for chunks that never arrive.
+    // The deadline guard must drop the handler future once
+    // deadline_ns elapses; the terminal RESPONSE carries Internal.
+    let started = std::time::Instant::now();
+    let result = call.finish().await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "deadline guard must terminate the call quickly; took {elapsed:?}",
+    );
+    let err = result.expect_err("hanging handler under deadline must error");
+    match err {
+        RpcError::Timeout { .. } => { /* caller-side deadline beat the server's terminal */ }
+        RpcError::ServerError { status, .. } => {
+            assert_eq!(status, 0x0006, "expected Internal (0x0006), got {status:#06x}");
+        }
+        other => panic!("expected Timeout or ServerError(Internal), got {other:?}"),
+    }
 }

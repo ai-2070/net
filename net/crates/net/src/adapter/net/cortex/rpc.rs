@@ -2625,10 +2625,11 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 } else {
                     None
                 };
+                let deadline_ns = payload.deadline_ns;
                 let ctx = RpcStreamingContext {
                     caller_origin: meta.origin_hash,
                     call_id: meta.seq_or_ts,
-                    deadline_ns: payload.deadline_ns,
+                    deadline_ns,
                     headers: payload.headers,
                     cancellation: cancellation.clone(),
                     trace_context,
@@ -2640,6 +2641,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 let caller_origin = meta.origin_hash;
                 let call_id = meta.seq_or_ts;
                 let cancel_probe = cancellation.clone();
+                let cancel_for_deadline = cancellation.clone();
                 let metrics = self.metrics.clone();
                 tokio::spawn(async move {
                     if let Some(m) = metrics.as_ref() {
@@ -2649,10 +2651,46 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     let handler_started = std::time::Instant::now();
-                    let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                        handler.call(ctx, request_stream),
-                    ))
-                    .await;
+                    // Deadline guard: if the caller declared
+                    // `deadline_ns`, force-drop the handler future
+                    // after it elapses so an orphaned request stream
+                    // (caller-side network partition before
+                    // REQUEST_END arrives) can never hang the call
+                    // indefinitely. `deadline_ns = 0` means "no
+                    // deadline" — caller's responsibility.
+                    let call_fut = futures::FutureExt::catch_unwind(
+                        std::panic::AssertUnwindSafe(handler.call(ctx, request_stream)),
+                    );
+                    let outcome = if deadline_ns > 0 {
+                        let now_ns = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0);
+                        let remaining = deadline_ns.saturating_sub(now_ns);
+                        if remaining == 0 {
+                            cancel_for_deadline.cancel();
+                            Ok(Err(RpcHandlerError::Internal(
+                                "handler deadline_ns already expired at spawn".to_string(),
+                            )))
+                        } else {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_nanos(remaining),
+                                call_fut,
+                            )
+                            .await
+                            {
+                                Ok(o) => o,
+                                Err(_) => {
+                                    cancel_for_deadline.cancel();
+                                    Ok(Err(RpcHandlerError::Internal(
+                                        "handler deadline_ns exceeded".to_string(),
+                                    )))
+                                }
+                            }
+                        }
+                    } else {
+                        call_fut.await
+                    };
                     if let Some(m) = metrics.as_ref() {
                         m.handler_in_flight
                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -3052,10 +3090,11 @@ impl RedexFold<()> for RpcDuplexFold {
                 } else {
                     None
                 };
+                let deadline_ns = payload.deadline_ns;
                 let ctx = RpcStreamingContext {
                     caller_origin: meta.origin_hash,
                     call_id: meta.seq_or_ts,
-                    deadline_ns: payload.deadline_ns,
+                    deadline_ns,
                     headers: payload.headers,
                     cancellation: cancellation.clone(),
                     trace_context,
@@ -3067,6 +3106,7 @@ impl RedexFold<()> for RpcDuplexFold {
                 let caller_origin = meta.origin_hash;
                 let call_id = meta.seq_or_ts;
                 let cancel_probe = cancellation.clone();
+                let cancel_for_deadline = cancellation.clone();
                 let metrics = self.metrics.clone();
 
                 // Pump: drains resp_rx, emits per-chunk RESPONSE
@@ -3099,10 +3139,48 @@ impl RedexFold<()> for RpcDuplexFold {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     let handler_started = std::time::Instant::now();
-                    let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                        handler.call(ctx, request_stream, response_sink),
-                    ))
-                    .await;
+                    // Same deadline guard as the client-streaming
+                    // fold: force-drop the handler future at
+                    // deadline_ns so an orphaned request stream
+                    // can't hang the call. `0` means no deadline.
+                    let call_fut = futures::FutureExt::catch_unwind(
+                        std::panic::AssertUnwindSafe(handler.call(
+                            ctx,
+                            request_stream,
+                            response_sink,
+                        )),
+                    );
+                    let outcome = if deadline_ns > 0 {
+                        let now_ns = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0);
+                        let remaining = deadline_ns.saturating_sub(now_ns);
+                        if remaining == 0 {
+                            cancel_for_deadline.cancel();
+                            Ok(Err(RpcHandlerError::Internal(
+                                "duplex handler deadline_ns already expired at spawn"
+                                    .to_string(),
+                            )))
+                        } else {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_nanos(remaining),
+                                call_fut,
+                            )
+                            .await
+                            {
+                                Ok(o) => o,
+                                Err(_) => {
+                                    cancel_for_deadline.cancel();
+                                    Ok(Err(RpcHandlerError::Internal(
+                                        "duplex handler deadline_ns exceeded".to_string(),
+                                    )))
+                                }
+                            }
+                        }
+                    } else {
+                        call_fut.await
+                    };
                     // Handler dropped the sink — let the pump
                     // drain any final in-flight chunks before we
                     // emit the terminal frame.
