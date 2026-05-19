@@ -1259,8 +1259,16 @@ impl MeshBlobAdapter {
         for node in &output.trailing_nodes {
             self.store_chunk(&node.hash, &node.bytes).await?;
         }
-        self.store_chunk(&output.root_hash, &output.root_bytes)
-            .await?;
+        // `root_bytes.is_empty()` signals "already in chunk
+        // store" — the streamed-child peel in TreeBuilder::finalize
+        // promotes a single-child root whose bytes were persisted
+        // during streaming. Skip the redundant store_chunk in
+        // that case; the chunk store already carries
+        // (root_hash → child bytes).
+        if !output.root_bytes.is_empty() {
+            self.store_chunk(&output.root_hash, &output.root_bytes)
+                .await?;
+        }
 
         BlobRef::tree(
             format!("mesh://{}", super::hex32(&output.root_hash)),
@@ -1332,8 +1340,16 @@ impl MeshBlobAdapter {
         for node in &output.trailing_nodes {
             self.store_chunk(&node.hash, &node.bytes).await?;
         }
-        self.store_chunk(&output.root_hash, &output.root_bytes)
-            .await?;
+        // `root_bytes.is_empty()` signals "already in chunk
+        // store" — the streamed-child peel in TreeBuilder::finalize
+        // promotes a single-child root whose bytes were persisted
+        // during streaming. Skip the redundant store_chunk in
+        // that case; the chunk store already carries
+        // (root_hash → child bytes).
+        if !output.root_bytes.is_empty() {
+            self.store_chunk(&output.root_hash, &output.root_bytes)
+                .await?;
+        }
 
         BlobRef::tree(
             format!("mesh://{}", super::hex32(&output.root_hash)),
@@ -1532,8 +1548,16 @@ impl MeshBlobAdapter {
         for node in &output.trailing_nodes {
             self.store_chunk(&node.hash, &node.bytes).await?;
         }
-        self.store_chunk(&output.root_hash, &output.root_bytes)
-            .await?;
+        // `root_bytes.is_empty()` signals "already in chunk
+        // store" — the streamed-child peel in TreeBuilder::finalize
+        // promotes a single-child root whose bytes were persisted
+        // during streaming. Skip the redundant store_chunk in
+        // that case; the chunk store already carries
+        // (root_hash → child bytes).
+        if !output.root_bytes.is_empty() {
+            self.store_chunk(&output.root_hash, &output.root_bytes)
+                .await?;
+        }
 
         BlobRef::tree(
             format!("mesh://{}", super::hex32(&output.root_hash)),

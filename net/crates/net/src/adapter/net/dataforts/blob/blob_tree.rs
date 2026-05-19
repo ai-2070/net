@@ -671,7 +671,15 @@ pub struct ClosedNode {
 pub struct TreeBuildOutput {
     /// BLAKE3 of the root [`TreeNode`].
     pub root_hash: [u8; 32],
-    /// Postcard-encoded root [`TreeNode`] bytes.
+    /// Postcard-encoded root [`TreeNode`] bytes. **Empty `Vec`
+    /// signals "already in chunk store; skip persist"** — used
+    /// by the finalize-time streamed-child peel when the root
+    /// was promoted from a streamed ClosedNode that the
+    /// streaming-store caller has already persisted. Callers
+    /// MUST check `root_bytes.is_empty()` before invoking
+    /// `store_chunk(&root_hash, &root_bytes)` and skip the
+    /// store when empty (the bytes are already content-addressed
+    /// at `root_hash` from streaming).
     pub root_bytes: Vec<u8>,
     /// Total tree depth — `1` for a single-leaf tree (root IS
     /// the leaf), increasing by one per additional internal
@@ -965,18 +973,33 @@ impl TreeBuilder {
         // partial-leaf finalize that lands in a previously-empty
         // internals[0] produces a 1-child internal root, etc.
         // Without the peel, a small-tail tree adds a needless
-        // fetch RTT to every range query.
+        // fetch RTT to every range query AND consumes the
+        // MAX_TREE_DEPTH budget one level early.
         //
-        // Best-effort: the peel only succeeds when the
-        // single-child's bytes are still in `trailing` (i.e. the
-        // child was closed during finalize, not during streaming
-        // push). Mid-stream cascade emits its closed nodes to
-        // the caller directly, so a single-child internal that
-        // wraps an already-emitted node stays in the tree (1
-        // extra fetch RTT vs the minimal depth, no correctness
-        // hazard). The streaming-store caller can collapse this
-        // path by re-encoding the child from its hash — outside
-        // the builder's scope.
+        // Two peel paths:
+        //
+        // 1. Trailing peel — the single child's bytes are in
+        //    `trailing` (closed during finalize, not during
+        //    streaming push). Swap root for child verbatim;
+        //    drop the wrap from trailing so the caller never
+        //    persists it.
+        //
+        // 2. Streamed peel — the single child was already
+        //    emitted as a ClosedNode during streaming and lives
+        //    in the chunk store. We can't recover its bytes
+        //    here, but we don't need them: the caller has
+        //    already persisted them. Emit the child as the
+        //    root with `root_bytes = Vec::new()` to signal
+        //    "this hash is already stored; skip persist."
+        //    `root_level` decrements so `root_depth` reflects
+        //    the true tree depth.
+        //
+        // The streamed peel can apply at most once per finalize
+        // — we can't decode the streamed child's body to look
+        // for further single-child wraps inside it. Trailing
+        // peel can iterate freely. We run trailing first
+        // (cheaper, no I/O constraint), then attempt one
+        // streamed peel at the end.
         loop {
             let decoded = TreeNode::decode(&root_bytes)?;
             let TreeNode::Internal { children } = &decoded else {
@@ -987,15 +1010,31 @@ impl TreeBuilder {
             }
             let (child_hash, child_size) = children[0];
             let Some(pos) = trailing.iter().position(|n| n.hash == child_hash) else {
-                // Child was emitted during streaming push; not in
-                // trailing. Accept the 1-extra-depth wart.
-                break;
+                break; // streamed-out — handled below
             };
             let child_node = trailing.remove(pos);
             root_hash = child_hash;
             root_total = child_size;
             root_bytes = child_node.bytes;
             root_level = child_node.level;
+        }
+        // One-shot streamed peel: if the (now-final) root is
+        // still a 1-child Internal whose child is NOT in
+        // trailing, the child is in the chunk store from
+        // streaming. Promote it; emit empty root_bytes as the
+        // skip-persist signal.
+        if !root_bytes.is_empty() {
+            if let Ok(TreeNode::Internal { children }) = TreeNode::decode(&root_bytes) {
+                if children.len() == 1 && root_level > 0 {
+                    let (child_hash, child_size) = children[0];
+                    if !trailing.iter().any(|n| n.hash == child_hash) {
+                        root_hash = child_hash;
+                        root_total = child_size;
+                        root_bytes = Vec::new();
+                        root_level -= 1;
+                    }
+                }
+            }
         }
 
         // `root_depth` = 1 for a single-leaf tree (root_level==0),
@@ -1428,7 +1467,7 @@ mod tests {
     /// over the streaming-emitted leaf) — the small inefficiency
     /// documented on finalize.
     #[test]
-    fn builder_one_full_leaf_emits_internal_root_over_streaming_leaf() {
+    fn builder_one_full_leaf_peels_to_streamed_leaf_root() {
         let mut b = TreeBuilder::new();
         let mut mid_closed = Vec::new();
         for c in n_chunks(TREE_FANOUT) {
@@ -1439,20 +1478,28 @@ mod tests {
         assert_eq!(mid_closed[0].level, 0);
         let leaf_hash = mid_closed[0].hash;
         let out = b.finalize().unwrap();
-        // Peel can't run because the leaf isn't in trailing.
+        // Post-fix the streamed peel promotes the leaf to root.
+        // Pre-fix the finalize cascade wrapped the streamed-out
+        // leaf in a 1-child internal root (depth=2), because the
+        // trailing-peel couldn't find the leaf bytes locally.
+        // The streamed peel now detects this case and emits the
+        // child hash as root with empty root_bytes — signaling
+        // "skip persist; bytes already in chunk store from
+        // streaming."
         assert_eq!(
-            out.root_depth, 2,
-            "FANOUT-chunk input produces a 1-child internal root over the \
-             streaming-emitted leaf — the peel skips because the leaf bytes \
-             aren't local"
+            out.root_depth, 1,
+            "FANOUT-chunk input peels to depth=1 (the streamed leaf \
+             becomes the root); pre-fix this was depth=2 with a 1-child \
+             internal wrapping the streamed leaf"
         );
-        let root = TreeNode::decode(&out.root_bytes).unwrap();
-        assert!(root.is_internal());
-        assert_eq!(root.arity(), 1);
-        // The internal's child IS the streaming-emitted leaf.
-        if let TreeNode::Internal { children } = &root {
-            assert_eq!(children[0].0, leaf_hash);
-        }
+        assert!(
+            out.root_bytes.is_empty(),
+            "streamed peel emits empty root_bytes as skip-persist signal"
+        );
+        assert_eq!(
+            out.root_hash, leaf_hash,
+            "root_hash promotes to the streamed leaf's hash"
+        );
         assert_eq!(out.total_bytes, BLOB_CHUNK_SIZE_BYTES * TREE_FANOUT as u64);
         assert_eq!(out.chunk_count, TREE_FANOUT as u64);
     }
@@ -1521,6 +1568,54 @@ mod tests {
             root.arity(),
             2,
             "first leaf full, second leaf has one chunk"
+        );
+    }
+
+    /// Streamed-child peel: exactly FANOUT² chunks fill
+    /// internals[0] FANOUT times (each emitting a level-1
+    /// internal into internals[1]), then internals[1] fills
+    /// once (emitting a level-2 internal into internals[2]).
+    /// All intermediate levels emit-and-empty during streaming.
+    /// At finalize:
+    /// - leaf_chunks is empty (clean boundary).
+    /// - internals[0] / internals[1] are empty.
+    /// - internals[2] has 1 streamed entry (the level-2 internal).
+    ///
+    /// Pre-fix the finalize cascade would wrap that single
+    /// streamed entry in a 1-child level-3 Internal — the root
+    /// is then a 1-child wrap whose child's bytes were
+    /// streamed-out and NOT in trailing. The original peel
+    /// logic only handled trailing-resident children, so this
+    /// case left the wart in place (depth=3 for a tree that
+    /// should be depth=2).
+    ///
+    /// Post-fix the streamed peel detects the case and promotes
+    /// the streamed child to root with `root_bytes = empty`
+    /// (signaling "already persisted") and `root_depth = 2`.
+    #[test]
+    fn builder_fanout_squared_clean_boundary_peels_streamed_child_to_depth_two() {
+        let chunk_count = TREE_FANOUT * TREE_FANOUT;
+        let mut b = TreeBuilder::new();
+        for i in 0..chunk_count {
+            let mut hash = [0u8; 32];
+            hash[0] = (i & 0xFF) as u8;
+            hash[1] = ((i >> 8) & 0xFF) as u8;
+            hash[2] = ((i >> 16) & 0xFF) as u8;
+            let _ = b.push_chunk(ChunkRefV3::data(hash, 1024)).unwrap();
+        }
+        let out = b.finalize().unwrap();
+        assert_eq!(
+            out.root_depth, 2,
+            "FANOUT² clean-boundary tree must peel to depth=2 \
+             (one level-2 internal wrapping FANOUT level-1 internals)"
+        );
+        assert_eq!(out.chunk_count, chunk_count as u64);
+        // root_bytes is empty — the streamed peel signals the
+        // caller to skip persist (the bytes are already in the
+        // chunk store from streaming).
+        assert!(
+            out.root_bytes.is_empty(),
+            "streamed peel emits empty root_bytes as skip-persist signal"
         );
     }
 
