@@ -1,0 +1,19 @@
+.github/workflows/release-pypi-sdk.yml
+  s_8697fa1d214abc::t_923a68757f400a 16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "02400b4b9a2abe45b2ed0cbeac0f627c757085b0",
+  "prompts": {},
+  "sessions": {
+    "s_8697fa1d214abc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6ced4740-56a4-48e6-b981-727d0b40a63a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
