@@ -1,0 +1,19 @@
+net/crates/net/docs/releases/RELEASE_v0.20_SMOKE_ON_THE_WATER.md
+  s_f95ee10350efa6::t_e370288c958ac5 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "950030a925e1e05608b7595101e8167bd97d04fe",
+  "prompts": {},
+  "sessions": {
+    "s_f95ee10350efa6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "be955835-c5da-4fe8-a0f5-cb77f72dfda9",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
