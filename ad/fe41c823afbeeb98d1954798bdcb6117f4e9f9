@@ -1,0 +1,22 @@
+net/crates/net/docs/plans/DATAFORTS_BLOB_STORAGE_PLAN_V2.md
+  s_2571835e05521c::t_dd247503ad9b8a 372-373,378-379,391-401,403-408
+  s_2571835e05521c::t_e83ed2ae603060 530-538,540-544,546
+  s_2571835e05521c::t_0134434f8e9e57 487-488
+  s_2571835e05521c::t_d67dbc6e9344a5 554-565
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "adfe41c823afbeeb98d1954798bdcb6117f4e9f9",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

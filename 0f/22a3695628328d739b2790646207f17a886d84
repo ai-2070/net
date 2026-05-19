@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_2571835e05521c::t_aa17d51dfc18ff 344,348-364
+  s_2571835e05521c::t_4c6b9a76d69579 4528-4651
+  s_2571835e05521c::t_3a07846d68612a 292-304
+  s_2571835e05521c::t_34d9bd5895a5e6 1934-1936,1939-1940,1952-1954,1967-1972,1991-2029
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "0f22a3695628328d739b2790646207f17a886d84",
+  "prompts": {},
+  "sessions": {
+    "s_2571835e05521c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "759a72b0-2557-40d7-91e7-70eff5be80f6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
