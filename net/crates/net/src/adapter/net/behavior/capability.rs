@@ -768,7 +768,7 @@ pub(crate) fn parse_membership_tags(
     // Deterministic group order so receivers agree on iteration
     // sequence regardless of local hash randomization. Lexicographic
     // by byte value is stable and cheap on the 32-byte payload.
-    groups.sort_by(|a, b| a.0.cmp(&b.0));
+    groups.sort_by_key(|g| g.0);
     (subnet, groups)
 }
 
@@ -2607,13 +2607,18 @@ pub struct IndexedNode {
     /// from [`CapabilityAnnouncement::allowed_groups`].
     pub allowed_groups: Vec<super::group::GroupId>,
     /// Self-declared subnet membership parsed from a `subnet:<hex32>`
-    /// tag on the announcement. The first valid tag wins (lookup
-    /// during index time); peers that declare zero or more than
-    /// one resolve to `None`.
+    /// tag on the announcement. Resolves to `Some(s)` only when the
+    /// announcement carries exactly one distinct subnet tag; zero
+    /// or two-or-more distinct subnet tags collapse to `None`
+    /// (out-of-model malformed input → no membership). The
+    /// collapse keeps the gate's subnet-axis verdict deterministic
+    /// across receivers — a previous "first valid wins" strategy
+    /// was hash-order-dependent against `HashSet<Tag>` iteration.
     pub subnet: Option<super::subnet::SubnetId>,
     /// Self-declared group memberships parsed from every
-    /// `group:<hex64>` tag on the announcement. Order matches the
-    /// announcement's set iteration order; duplicates are removed.
+    /// `group:<hex64>` tag on the announcement. Sorted by byte
+    /// value so iteration order is stable across receivers
+    /// regardless of local hash randomization; duplicates removed.
     pub groups: Vec<super::group::GroupId>,
 }
 
@@ -2894,11 +2899,15 @@ impl CapabilityIndex {
         // Parse subnet/group membership from the announcement's
         // own tags so the capability-auth gate (`may_execute`) can
         // resolve caller membership without re-walking the tag set
-        // on every check. First valid `subnet:<hex32>` tag wins —
-        // operators publishing multiple subnet tags are not in the
-        // model (the v0.4 gate treats them as opaque so picking
-        // the first one keeps lookups deterministic). All distinct
-        // `group:<hex64>` tags accumulate, deduplicated by Eq.
+        // on every check. Subnet membership is single-valued by
+        // design: exactly one distinct `subnet:<hex32>` tag →
+        // `Some(s)`; zero or multiple distinct tags collapse to
+        // `None` (treating multiples as out-of-model malformed
+        // input keeps the gate's verdict deterministic across
+        // receivers — `HashSet<Tag>` iteration order is unspecified
+        // so "first valid wins" would be hash-order-dependent).
+        // All distinct `group:<hex64>` tags accumulate, sorted by
+        // byte value, deduplicated by Eq.
         let (parsed_subnet, parsed_groups) = parse_membership_tags(&ann.capabilities.tags);
         let indexed = IndexedNode {
             node_id,
@@ -5648,6 +5657,7 @@ mod tests {
     /// Build an announcement carrying a single capability tag,
     /// optional `subnet:` / `group:` membership tags, and the three
     /// allow-lists. Helper used across the gate tests.
+    #[allow(clippy::too_many_arguments)]
     fn auth_ann(
         node_id: u64,
         version: u64,
@@ -5660,10 +5670,10 @@ mod tests {
     ) -> CapabilityAnnouncement {
         let mut caps = CapabilitySet::new().add_tag(capability_tag);
         if let Some(s) = membership_subnet {
-            caps = caps.add_tag(&s.to_tag());
+            caps = caps.add_tag(s.to_tag());
         }
         for g in membership_groups {
-            caps = caps.add_tag(&g.to_tag());
+            caps = caps.add_tag(g.to_tag());
         }
         let entity = super::super::super::identity::EntityId::from_bytes(
             [node_id as u8; 32],
@@ -5937,8 +5947,8 @@ mod tests {
         // tags. `auth_ann` only takes one Option<SubnetId>, so
         // bypass it.
         let caps = CapabilitySet::new()
-            .add_tag(&s1.to_tag())
-            .add_tag(&s2.to_tag())
+            .add_tag(s1.to_tag())
+            .add_tag(s2.to_tag())
             .add_tag("nrpc:echo");
         let entity = super::super::super::identity::EntityId::from_bytes([0xCD; 32]);
         let ann = CapabilityAnnouncement::new(5, entity, 1, caps);
@@ -5963,8 +5973,8 @@ mod tests {
         // that the dedup happens at the tag-set layer, not at
         // the parser.
         let caps = CapabilitySet::new()
-            .add_tag(&s1.to_tag())
-            .add_tag(&s1.to_tag())
+            .add_tag(s1.to_tag())
+            .add_tag(s1.to_tag())
             .add_tag("nrpc:echo");
         let entity = super::super::super::identity::EntityId::from_bytes([0xCE; 32]);
         let ann = CapabilityAnnouncement::new(6, entity, 1, caps);
