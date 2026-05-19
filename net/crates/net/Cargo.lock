@@ -2311,7 +2311,7 @@ dependencies = [
 
 [[package]]
 name = "net-deck"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "bytes",
  "chrono",
