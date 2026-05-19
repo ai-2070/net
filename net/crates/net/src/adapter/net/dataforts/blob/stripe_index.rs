@@ -78,6 +78,9 @@ pub struct StripeMembershipIndex {
 }
 
 impl StripeMembershipIndex {
+    /// Construct an empty index. Stripes register via
+    /// [`Self::register_stripe`]; the [`StripeMembershipIndex`]
+    /// is internally `HashMap` + counter, no I/O on construction.
     pub fn new() -> Self {
         Self::default()
     }

@@ -229,6 +229,25 @@ enum Cmd {
         #[arg(long)]
         depth: u8,
     },
+    /// Walk a v0.3 `BlobRef::Tree` to a specific byte offset and
+    /// print the chunk + sub-offset that byte lives in. Reports
+    /// the manifest-tree path (root → internal nodes → leaf) and
+    /// the resolved chunk's hash + offset-within-chunk. For RS-
+    /// encoded blobs, the stripe index + per-stripe encoding are
+    /// included so the operator can correlate a byte offset with
+    /// its parity-protected stripe.
+    Path {
+        /// 64-char lowercase hex of the BLAKE3-256 root hash.
+        hash: String,
+        #[arg(long)]
+        size: u64,
+        #[arg(long)]
+        depth: u8,
+        /// Byte offset within the logical blob to resolve.
+        /// `0..size`.
+        #[arg(long)]
+        offset: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -292,6 +311,12 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Verify { hash, size, depth } => {
             cmd_verify(&adapter, &hash, size, depth, cli.format).await
         }
+        Cmd::Path {
+            hash,
+            size,
+            depth,
+            offset,
+        } => cmd_path(&adapter, &hash, size, depth, offset, cli.format).await,
     }
 }
 
@@ -936,6 +961,200 @@ async fn verify_chunk(
         }
         Err(_) => *missing = missing.saturating_add(1),
     }
+}
+
+async fn cmd_path(
+    adapter: &MeshBlobAdapter,
+    hash_hex: &str,
+    size: u64,
+    depth: u8,
+    offset: u64,
+    fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    if offset >= size {
+        return Err(format!(
+            "path: offset {} is at or past the blob's logical size {}",
+            offset, size
+        )
+        .into());
+    }
+    let blob_ref = build_tree_ref(hash_hex, size, depth)?;
+    let root_hash = *blob_ref.tree_root_hash().expect("Tree built above");
+
+    // Descend through internal nodes, tracking the visited path
+    // hashes for the operator's report. The descent stops when
+    // we reach a leaf (Replicated or ErasureLeaf).
+    let mut path_hashes: Vec<String> = vec![hex32(&root_hash)];
+    let mut current_hash = root_hash;
+    let mut current_base: u64 = 0;
+    let mut current_size: u64 = size;
+    loop {
+        let bytes = adapter.fetch_chunk(&current_hash).await?;
+        let node = TreeNode::decode(&bytes)?;
+        match node {
+            TreeNode::Internal { children } => {
+                // Pick the child whose subtree contains the offset.
+                let mut child_offset: u64 = current_base;
+                let mut picked: Option<([u8; 32], u64, u64)> = None;
+                for (child_hash, child_size) in children {
+                    let child_end = child_offset.saturating_add(child_size);
+                    if offset >= child_offset && offset < child_end {
+                        picked = Some((child_hash, child_offset, child_size));
+                        break;
+                    }
+                    child_offset = child_end;
+                }
+                let (next_hash, next_base, next_size) = picked.ok_or_else(|| {
+                    format!(
+                        "path: internal node at {} has no child covering offset {} \
+                         (subtree spans [{}, {}))",
+                        hex32(&current_hash),
+                        offset,
+                        current_base,
+                        current_base.saturating_add(current_size)
+                    )
+                })?;
+                path_hashes.push(hex32(&next_hash));
+                current_hash = next_hash;
+                current_base = next_base;
+                current_size = next_size;
+            }
+            TreeNode::Leaf { chunks } => {
+                let mut chunk_offset = current_base;
+                for chunk in chunks {
+                    let chunk_size_u64 = chunk.size as u64;
+                    let chunk_end = chunk_offset.saturating_add(chunk_size_u64);
+                    if offset >= chunk_offset && offset < chunk_end {
+                        let sub_offset = offset - chunk_offset;
+                        return print_path_result(
+                            hash_hex,
+                            offset,
+                            &path_hashes,
+                            &PathResult {
+                                leaf_kind: "leaf",
+                                stripe_index: None,
+                                stripe_encoding: None,
+                                chunk_hash: hex32(&chunk.hash),
+                                chunk_size: chunk.size,
+                                chunk_role: "data".to_owned(),
+                                sub_offset,
+                            },
+                            fmt,
+                        );
+                    }
+                    chunk_offset = chunk_end;
+                }
+                return Err(format!(
+                    "path: leaf at {} had no chunk covering offset {} (offset \
+                     past last chunk)",
+                    hex32(&current_hash),
+                    offset
+                )
+                .into());
+            }
+            TreeNode::ErasureLeaf { stripes } => {
+                let mut stripe_offset = current_base;
+                for (i, stripe) in stripes.iter().enumerate() {
+                    let stripe_size = stripe.covered_bytes();
+                    let stripe_end = stripe_offset.saturating_add(stripe_size);
+                    if offset >= stripe_offset && offset < stripe_end {
+                        let mut chunk_offset = stripe_offset;
+                        for chunk in stripe.chunks.iter().filter(|c| c.is_data()) {
+                            let chunk_size_u64 = chunk.size as u64;
+                            let chunk_end = chunk_offset.saturating_add(chunk_size_u64);
+                            if offset >= chunk_offset && offset < chunk_end {
+                                let sub_offset = offset - chunk_offset;
+                                let enc_label = match stripe.encoding {
+                                    Encoding::Replicated => "Replicated".to_owned(),
+                                    Encoding::ReedSolomon { k, m } => {
+                                        format!("ReedSolomon(k={}, m={})", k, m)
+                                    }
+                                };
+                                return print_path_result(
+                                    hash_hex,
+                                    offset,
+                                    &path_hashes,
+                                    &PathResult {
+                                        leaf_kind: "erasure_leaf",
+                                        stripe_index: Some(i),
+                                        stripe_encoding: Some(enc_label),
+                                        chunk_hash: hex32(&chunk.hash),
+                                        chunk_size: chunk.size,
+                                        chunk_role: "data".to_owned(),
+                                        sub_offset,
+                                    },
+                                    fmt,
+                                );
+                            }
+                            chunk_offset = chunk_end;
+                        }
+                    }
+                    stripe_offset = stripe_end;
+                }
+                return Err(format!(
+                    "path: erasure leaf at {} had no stripe covering offset {}",
+                    hex32(&current_hash),
+                    offset
+                )
+                .into());
+            }
+        }
+    }
+}
+
+struct PathResult {
+    leaf_kind: &'static str,
+    stripe_index: Option<usize>,
+    stripe_encoding: Option<String>,
+    chunk_hash: String,
+    chunk_size: u32,
+    chunk_role: String,
+    sub_offset: u64,
+}
+
+fn print_path_result(
+    blob_hash_hex: &str,
+    offset: u64,
+    path_hashes: &[String],
+    result: &PathResult,
+    fmt: OutputFormat,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    match fmt {
+        OutputFormat::Human => {
+            println!("path: blob={} offset={}", blob_hash_hex, offset);
+            println!("  manifest path:");
+            for (depth, h) in path_hashes.iter().enumerate() {
+                println!("    [{}] {}", depth, h);
+            }
+            println!("  leaf_kind:      {}", result.leaf_kind);
+            if let Some(i) = result.stripe_index {
+                println!("  stripe_index:   {}", i);
+            }
+            if let Some(enc) = &result.stripe_encoding {
+                println!("  encoding:       {}", enc);
+            }
+            println!("  chunk_hash:     {}", result.chunk_hash);
+            println!("  chunk_size:     {} bytes", result.chunk_size);
+            println!("  chunk_role:     {}", result.chunk_role);
+            println!("  sub_offset:     {} (byte within the chunk)", result.sub_offset);
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "blob_hash": blob_hash_hex,
+                "offset": offset,
+                "manifest_path": path_hashes,
+                "leaf_kind": result.leaf_kind,
+                "stripe_index": result.stripe_index,
+                "stripe_encoding": result.stripe_encoding,
+                "chunk_hash": result.chunk_hash,
+                "chunk_size": result.chunk_size,
+                "chunk_role": result.chunk_role,
+                "sub_offset": result.sub_offset,
+            })
+        ),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 // ============================================================================
