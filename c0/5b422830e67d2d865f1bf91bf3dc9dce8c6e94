@@ -1,0 +1,20 @@
+.github/workflows/release-npm-cli.yml
+  s_8697fa1d214abc::t_bf4d8a6427c76c 259-261
+  s_8697fa1d214abc::t_5d7a8cd1ffddd7 53-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "c05b422830e67d2d865f1bf91bf3dc9dce8c6e94",
+  "prompts": {},
+  "sessions": {
+    "s_8697fa1d214abc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6ced4740-56a4-48e6-b981-727d0b40a63a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
