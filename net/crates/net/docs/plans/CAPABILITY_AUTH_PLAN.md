@@ -1,597 +1,345 @@
 # Capability Announcement + Execution Auth Plan
 
 **Status:** Draft for review.
-**Scope:** add operator-controlled gating around two operations on the
-mesh-wide capability surface: (1) who is allowed to **announce** a
-given capability, and (2) who is allowed to **execute** it. Permissive
-defaults preserve v0.x ergonomics; tightening lands as opt-in signed
-policy events stamped through `RedEX → CortEX` so every decision is
-auditable, replayable, and survives restart.
+**Scope:** add the smallest correct gate around announce + execute on
+the mesh-wide capability surface. Permissive by default, signed
+announcements as the only auth vector, allow-lists on `NodeId` /
+`SubnetId` / `GroupId`. Revocation is a new announcement.
 
-This plan is a *codified-policy* layer on top of the existing
-acceptance discipline in `mesh::handle_capability_announcement`
-(signature verification, TOFU `node_id ↔ entity_id` binding, hop-count
-+ dedup). It does NOT replace any of that — it adds a second pass
-that consults a folded policy view.
+This is deliberately **not** an ACL engine, not a policy language,
+not a separate policy channel, not an operator-key subsystem. The
+existing `CapabilityAnnouncement` IS the policy unit — the
+announcing entity decides who can use their capabilities, signs it,
+broadcasts it. Receivers honor it.
 
 ---
 
-## Goals
+## Model
 
-1. **Permissive by default.** A cluster with no policy events emitted
-   behaves identically to today: any signed peer may announce any
-   capability, any caller may invoke any capability they can resolve.
-2. **Gate-by-identity, three axes.** Allow / deny rules keyed on
-   `NodeId`, `SubnetId`, or `CapabilityGroupId`. Per-capability,
-   per-axis, independently configurable for announce-side and
-   execute-side.
-3. **Signed events end-to-end.** Policy itself is a signed event
-   (ed25519, mirroring `CapabilityAnnouncement::sign`), stamped to a
-   reserved RedEX channel so the audit log is the operational source
-   of truth.
-4. **CortEX-folded view.** Policy decisions read from a folded
-   in-memory view rebuilt by replaying the policy channel — same
-   pattern as the existing CortEX adapters. Hot-path lookups stay
-   O(1) under the fold.
-5. **Replayable.** A node that crashes and restarts re-folds the
-   policy channel from disk; no out-of-band config.
-6. **Layer-disambiguated.** Announce-side gate runs in
-   `handle_capability_announcement` *after* sig + TOFU. Execute-side
-   gate runs at the caller's resolution point (nRPC `call_service`,
-   blob `fetch_range` for tag-gated content, future per-cap surfaces)
-   *before* the wire op leaves the local node.
+```
+SIGNED announcement {
+    node_id, entity_id, capabilities, version, ttl, signature,    // existing
+    allowed_nodes:    Vec<NodeId>,         // new — empty = anyone
+    allowed_subnets:  Vec<SubnetId>,       // new — empty = anyone
+    allowed_groups:   Vec<GroupId>,        // new — empty = anyone
+}
 
-## Non-goals
+EXECUTE check, caller C invokes capability tag T on announcer A:
+    1. lookup A's latest accepted announcement (already in the index)
+    2. if it doesn't list T              → deny
+    3. if all three allow-lists empty    → allow   (permissive)
+    4. if C ∈ allowed_nodes              → allow
+    5. if C's subnet ∈ allowed_subnets   → allow
+    6. if C's group(s) ∩ allowed_groups  → allow
+    7. else                              → deny
 
-- **Not a general ACL system.** Scope is capability-announce +
-  capability-execute. Existing channel auth (`AuthGuard` /
-  `WriteToken`) stays as it is; tokens and bloom filters are
-  orthogonal and continue to gate channel pub/sub.
-- **Not encrypting capability announcements.** They're already on a
-  broadcast channel and operators rely on signatures + topology
-  filters for routing. Adding confidentiality is a separate plan.
-- **Not changing the existing wire format of `CapabilityAnnouncement`.**
-  New fields, if any, ride alongside as `#[serde(default)]` (same
-  pattern as `reflex_addr` and `hop_count`) — pre-this-plan peers
-  continue to round-trip cleanly.
-- **Not auto-revoking past announcements.** A new policy that denies
-  a capability does not retroactively delete the index entry; it just
-  prevents the *next* announcement from being accepted. Operators run
-  an explicit `purge` step (see §8) if they want immediate cleanup.
+REVOCATION:
+    A publishes a new announcement (version+1) with whatever allow-lists
+    it now wants. The existing dedup + version-monotonicity logic in
+    handle_capability_announcement makes the new announcement
+    immediately replace the prior one. Setting allow_nodes to a
+    1-element list `[only_me]` is the "deny everyone else" form.
+```
+
+That's it. No new channels, no operator keys, no rule precedence,
+no fold beyond the existing capability index.
 
 ---
 
-## Existing surface (what's already in place)
+## What ships
 
-The plan builds on these existing pieces (no churn to either):
+Three additive fields on `CapabilityAnnouncement`, two new identity
+types, one execute-side gate, one CLI helper, conformance test.
 
-- **`CapabilityAnnouncement`** (`src/adapter/net/behavior/capability.rs`):
-  signed envelope with `node_id`, `entity_id`, `version`,
-  `timestamp_ns`, `ttl_secs`, `capabilities: CapabilitySet`,
-  optional `signature: Signature64`, `hop_count: u8`,
-  optional `reflex_addr`.
-- **`handle_capability_announcement`** (`src/adapter/net/mesh.rs:5399`):
-  decode → enforce `node_id ↔ from_node` for direct peers →
-  origin self-check → dedup on `(node_id, version, is_direct)` →
-  optional `require_signed_capabilities` enforcement →
-  ed25519 verify → cryptographic TOFU bind
-  `EntityId::node_id() == ann.node_id` → fold into index.
-- **`TopologyScope`** (`src/adapter/net/behavior/dataforts_capabilities.rs`):
-  `Node | Zone | Region | Mesh` — the existing topology partition.
-- **`CapabilitySet` / `CapabilityFilter`**: the discovery surface
-  callers consult after the fold.
-- **RedEX** (`src/adapter/net/redex/`): durable append-only event
-  log per channel, with replication + retention. CortEX folds
-  RedEX-channel events into queryable state.
-- **`AuthGuard` / `WriteToken`**: the existing channel auth surface.
-  This plan does NOT touch them; the new policy channel uses the
-  same surface for its own publish discipline.
+### 1. New identity types
 
-## New surface (what this plan ships)
+- **`SubnetId([u8; 16])`** — `src/adapter/net/behavior/subnet.rs`.
+  Membership: peer self-declares via a `subnet:<hex16>` tag on its
+  own announcement. Receivers parse the tag at fold time and store
+  `NodeId → SubnetId` on the peer view. Self-declaration is fine
+  because the announcement is signed + TOFU-bound to the entity
+  key; a peer can only lie about itself.
+- **`GroupId([u8; 32])`** — `src/adapter/net/behavior/group.rs`.
+  Same self-declared pattern: `group:<hex32>` tag. A peer can claim
+  multiple group memberships by emitting multiple tags. Operators
+  pick the group ids out-of-band (a 32-byte random or a
+  blake2s-of-name); the substrate doesn't care, it just compares
+  bytes.
 
-1. **`SubnetId`** — 16-byte stable identifier for a topology
-   partition. Operators assign nodes to subnets via cluster config
-   (initial implementation reads from a `subnet:<id>` tag in
-   `CapabilityAnnouncement.capabilities`). The lookup direction is
-   `NodeId → SubnetId` and lives on the CortEX-folded peer view.
-2. **`CapabilityGroupId`** — 32-byte identifier for an operator-
-   defined named collection of `EntityId`s. Membership is itself a
-   signed event on the policy channel (`MemberAdd` / `MemberRemove`),
-   so a group's membership is replayable and auditable. Existing
-   compute-layer `replica_group` / `standby_group` are unaffected —
-   this is a separate, network-layer concept.
-3. **`CapabilityAuthPolicy`** — the declarative spec. Per
-   capability-tag, two rule sets (announce, execute), each a
-   priority-ordered list of `(matcher, verdict)` pairs:
-   - `matcher ∈ { Node(NodeId) | Subnet(SubnetId) | Group(CapabilityGroupId) | Any }`
-   - `verdict ∈ { Allow | Deny }`
-   - First-match-wins on the priority order (operator-controlled);
-     no match = the permissive default (`Allow`).
-4. **`CapabilityPolicyEvent`** — signed event ride on the new
-   `capability/auth/policy/v1` RedEX channel. Variants:
-   - `RuleSet { capability_tag, scope: Announce | Execute, rules: Vec<Rule>, version, signer, signature }`
-   - `RuleClear { capability_tag, scope, version, signer, signature }`
-   - `MemberAdd { group_id, member: EntityId, version, signer, signature }`
-   - `MemberRemove { group_id, member: EntityId, version, signer, signature }`
-   Every variant signed by an **operator key** (see §"Locked decisions"
-   for the trust model).
-5. **`CapabilityAuthView`** — CortEX-folded read view. Two methods
-   on the hot path:
-   - `may_announce(entity: &EntityId, node: NodeId, capability_tag: &str) -> AuthVerdict`
-   - `may_execute(target: &EntityId, target_node: NodeId, caller: &EntityId, capability_tag: &str) -> AuthVerdict`
-   Both O(1) HashMap probes + a short priority scan.
+Both types: `Debug + Display + Hash + Eq + Copy`, postcard round-
+trip, hex parse/format.
 
-## Trust model
+### 2. Three fields on `CapabilityAnnouncement`
 
-Three principals on the mesh:
+```rust
+#[serde(default, skip_serializing_if = "Vec::is_empty")]
+pub allowed_nodes: Vec<NodeId>,
+#[serde(default, skip_serializing_if = "Vec::is_empty")]
+pub allowed_subnets: Vec<SubnetId>,
+#[serde(default, skip_serializing_if = "Vec::is_empty")]
+pub allowed_groups: Vec<GroupId>,
+```
 
-| Principal | Key | Allowed actions |
-|---|---|---|
-| **Peer** | `EntityId` (ed25519 pubkey from `identity::EntityKeypair`) | Announce own capabilities, invoke capabilities they're permitted to execute. |
-| **Operator** | Operator ed25519 keypair (new) | Publish `CapabilityPolicyEvent`s. The operator key set is fixed at substrate construction via a new `MeshConfig::policy_signers: Vec<EntityId>` field. |
-| **Cluster** | (future) Threshold-signed cluster key | Out of scope for this plan; documented as forward-compat. |
+All three default empty + skip when empty, so the SIGNED byte form
+of an unrestricted announcement is byte-identical to today's. Pre-
+this-plan peers round-trip cleanly. Length caps: 64 entries per list
+(any restriction tighter than that should be a group, not an
+inline node list).
 
-Every policy event is signed by an operator key. Receivers reject
-policy events whose signer is not in the configured `policy_signers`
-set. The set itself is **not signed** — it's local config — so
-operator key rotation is a config redeploy, same trust model as
-existing daemon keypairs.
+The signature already covers these fields once they're inside the
+struct — `signed_payload()` reflects the post-add layout. Tests pin
+that a v0.x announcement still verifies against a post-plan reader
+(byte-identical when lists are empty).
 
----
+### 3. Execute-side gate
 
-## Phases
+One method on the capability index:
 
-Each phase ships independently, gated behind the `capability-auth`
-Cargo feature (off by default initially, on by default once Phase E
-lands). Phases keep wire compat with pre-this-plan peers throughout
-— legacy peers see the new policy events as opaque bytes on a channel
-they don't subscribe to.
+```rust
+pub fn may_execute(
+    &self,
+    target_node: NodeId,
+    capability_tag: &str,
+    caller: &EntityId,
+    caller_node: NodeId,
+) -> bool {
+    let Some(ann) = self.latest_announcement(target_node) else {
+        return false; // no announcement = can't address
+    };
+    if !ann.capabilities.has_tag(capability_tag) {
+        return false;
+    }
+    if ann.allowed_nodes.is_empty()
+        && ann.allowed_subnets.is_empty()
+        && ann.allowed_groups.is_empty()
+    {
+        return true; // permissive default
+    }
+    if ann.allowed_nodes.contains(&caller_node) {
+        return true;
+    }
+    if let Some(caller_subnet) = self.subnet_of(caller_node) {
+        if ann.allowed_subnets.contains(&caller_subnet) {
+            return true;
+        }
+    }
+    for group in self.groups_of(caller_node) {
+        if ann.allowed_groups.contains(&group) {
+            return true;
+        }
+    }
+    false
+}
+```
 
-### Phase A — primitives (no behavior change)
+O(1) `latest_announcement` lookup (already exists) + a handful of
+linear scans over short Vec<u8;16/32>'s. No new state machine, no
+fold beyond what the capability index already does.
 
-Adds the types + serialization with no enforcement wired:
+### 4. Wire points
 
-- `pub struct SubnetId(pub [u8; 16]);` in
-  `src/adapter/net/behavior/subnet.rs` with `from_tag(&str)`
-  parser, `as_bytes()`, `Debug + Display + Hash`.
-- `pub struct CapabilityGroupId(pub [u8; 32]);` in
-  `src/adapter/net/behavior/capability_group.rs`.
-- `pub struct CapabilityAuthPolicy`, `pub enum AuthMatcher`,
-  `pub enum AuthVerdict`, `pub enum PolicyScope` in
-  `src/adapter/net/behavior/capability_auth/policy.rs`.
-- Postcard + serde-JSON round-trip tests.
-- Operator-key + signer-set fields added to `MeshConfig` with
-  defaulted empty values (permissive: no signers → fully open).
+Two call sites consult `may_execute`:
 
-**Wire impact:** zero. New types not yet referenced from any hot
-path.
+- **nRPC** — `Mesh::call_service` resolves target + capability tag,
+  consults gate. Verdict false → return
+  `CallError::CapabilityDenied`. Defense in depth: callee also
+  consults `may_execute` with the inverted (caller, target) →
+  `RpcRejectError::CapabilityDenied` on mismatch.
+- **Future per-capability surfaces** (e.g. blob fetch with tag
+  gating) wire the same way. Not in v1; the gate exists for
+  callers to consult.
 
-### Phase B — signed policy event + RedEX channel
+### 5. Announce-side: no separate gate needed
 
-- Reserve channel name `capability/auth/policy/v1`. Add a
-  `RESERVED_CHANNELS` constant in `src/adapter/net/redex/mod.rs`.
-- Define `CapabilityPolicyEvent` enum + variant payload structs.
-- Signing: `CapabilityPolicyEvent::sign(&signing_key) ->
-  CapabilityPolicyEvent`. Mirrors `CapabilityAnnouncement::sign`
-  exactly — same canonical serialization helper, same Ed25519
-  curve, same 64-byte `Signature64` type re-exported.
-- Verification: `CapabilityPolicyEvent::verify(&allowed_signers:
-  &[EntityId]) -> Result<(), PolicyVerifyError>`. Rejects unknown
-  signers + bad signatures.
-- Publishing: operator-side helper
-  `Mesh::publish_capability_policy(event)` that bumps the local
-  `RedExFile` for the policy channel + cross-node-replicates via
-  the existing replication runtime.
-- 6+ unit tests including: forge-without-key fails, signer-not-
-  in-set fails, valid round-trip succeeds, malformed wire bytes
-  reject cleanly.
+The model is "the announcer's allow-lists *are* the policy."
+There's nothing to enforce at the receive side beyond what
+`handle_capability_announcement` already does (sig verify + TOFU
+bind + dedup). A peer publishing an announcement with itself in
+`allowed_nodes` is just publishing a stricter policy — receivers
+fold it and use it for the execute gate. No extra acceptance
+check needed.
 
-**Wire impact:** new RedEX channel. Legacy peers don't subscribe
-and never see the bytes. Subscribers ignore unknown event variants
-(serde `untagged` fallback).
+### 6. CLI helper
 
-### Phase C — CortEX fold builds the policy view
+One subcommand on the existing operator CLI:
 
-- New CortEX adapter `CapabilityAuthAdapter` in
-  `src/adapter/net/cortex/capability_auth.rs`. Subscribes to the
-  reserved policy channel; folds events into:
+- `net cap announce --tag X --allow-node N1,N2 --allow-subnet S1
+  --allow-group G1 --key <path>` — builds a signed announcement
+  with the supplied allow-lists and publishes it. Operators wrap
+  this in their own scripts.
 
-  ```rust
-  struct CapabilityAuthView {
-      // Per-capability rules: tag → (announce_rules, execute_rules).
-      // Each rule list is operator-priority-ordered.
-      rules: HashMap<String, (Vec<Rule>, Vec<Rule>)>,
-      // Group membership: group_id → EntityId set.
-      groups: HashMap<CapabilityGroupId, HashSet<EntityId>>,
-      // Last-seen version per (capability_tag, scope, group_id) so
-      // out-of-order delivery doesn't clobber a newer rule with an
-      // older one.
-      versions: HashMap<PolicyKey, u64>,
-  }
-  ```
-- Pure-function fold methods unit-tested in isolation against
-  hand-crafted event sequences (out-of-order, duplicate, version-
-  rollback rejected).
-- Snapshot accessor for diagnostics:
-  `Mesh::capability_auth_snapshot() -> CapabilityAuthSnapshot`.
+That's the only CLI addition. No `policy view`, no `purge`, no
+`group add` — group/subnet membership is just tags on
+announcements, set the same way other capability tags are set.
 
-**Wire impact:** none. Pure local fold.
-
-### Phase D — announce-side gate
-
-- Add `auth_view: Option<Arc<CapabilityAuthView>>` to
-  `DispatchCtx`. `None` = permissive (no policy substrate wired,
-  legacy behavior).
-- In `handle_capability_announcement`, immediately *after* the
-  existing `node_id ↔ entity_id` TOFU bind and *before* the index
-  fold, call:
-
-  ```rust
-  if let Some(view) = ctx.auth_view.as_ref() {
-      for tag in ann.capabilities.tags() {
-          if let AuthVerdict::Deny =
-              view.may_announce(&ann.entity_id, ann.node_id, tag)
-          {
-              tracing::trace!(
-                  entity = ?ann.entity_id,
-                  tag = %tag,
-                  "capability: announce denied by policy"
-              );
-              metrics.incr_announce_denied();
-              return;
-          }
-      }
-  }
-  ```
-- Bumps a new metric `capability_announce_denied_total{tag=...}`
-  surfaced via the existing CortEX adapter Prometheus emit.
-- Tests: an operator publishes a deny rule against `entity X` for
-  tag `Y` → entity X's subsequent announcement carrying tag Y is
-  dropped at the gate, log line emitted, metric incremented.
-  Other tags on the same announcement still admit.
-- Special case: an announcement that hits Deny on *some* tags but
-  Allow on others is rewritten — the offending tags stripped — and
-  the rewritten set folded. The rewrite is deterministic and
-  documented (announce-side filter, not all-or-nothing rejection,
-  so an operator can deny `kubernetes:cluster-admin` without
-  nuking every other capability the entity advertises). Open
-  question §1 below covers the alternative (all-or-nothing).
-
-**Wire impact:** still none — gate is local to the receiver.
-
-### Phase E — execute-side gate
-
-- New trait `CapabilityExecutionGate` in
-  `src/adapter/net/behavior/capability_auth/execute.rs`:
-
-  ```rust
-  pub trait CapabilityExecutionGate: Send + Sync {
-      fn may_execute(
-          &self,
-          target: &EntityId,
-          target_node: NodeId,
-          caller: &EntityId,
-          capability_tag: &str,
-      ) -> AuthVerdict;
-  }
-  ```
-- Default implementation `CortexExecutionGate` wraps the
-  `CapabilityAuthView` from Phase C and exposes `may_execute`
-  as-is.
-- Wire points for the first round of integration:
-  - **nRPC** — `Mesh::call_service` / `call_service_typed`:
-    before issuing the wire frame, the caller side resolves the
-    target's `EntityId` from `peer_entity_ids` and consults the
-    gate with the service's capability tag (e.g.
-    `nrpc:my-service`). Verdict `Deny` → return
-    `CallError::CapabilityDenied` with the offending tag.
-  - **Blob fetch** — `MeshBlobAdapter::fetch_range` (and the new
-    `fetch_chunk` doc-hidden helper). Gate consulted on
-    `dataforts:blob-*` tags when those tags identify content that
-    requires authorization. Default: no blob tags require it,
-    backwards-compatible.
-- Receiver-side enforcement (defense in depth): the service
-  callee independently consults the same view and rejects the
-  request. A misbehaving caller that bypasses the local gate is
-  still caught at the boundary. Reject is wire-typed
-  (`RpcRejectError::CapabilityDenied`).
-- Tests: cross-node integration covering both
-  caller-side-blocks-call and callee-side-rejects-call paths.
-
-**Wire impact:** one new error variant on the nRPC reject surface
-(backward-compat: unknown variants decode as `Other` on legacy
-clients).
-
-### Phase F — operator CLI surface
-
-New `net-blob` siblings under `net-policy`:
-
-- `net policy allow <capability> <scope> <matcher>` — emit a signed
-  `RuleSet` event.
-- `net policy deny <capability> <scope> <matcher>` — same, with
-  `Verdict::Deny`.
-- `net policy group create <name>` → assigns a fresh
-  `CapabilityGroupId`, prints it.
-- `net policy group add <group> <entity>` — emit `MemberAdd`.
-- `net policy group remove <group> <entity>` — emit `MemberRemove`.
-- `net policy view` — dump the current folded view as JSON.
-- `net policy verify <event-bytes>` — round-trip parse + verify.
-- `net policy purge --capability <tag>` — re-walk the capability
-  index and evict every entry that *would* be denied under the
-  current policy. Use to enforce a new deny rule retroactively.
-
-Each subcommand reads the operator key from
-`--operator-key <file>` or `$NET_OPERATOR_KEY`. CLI integration
-tests follow the existing `net_blob_cli` pattern (spawn the bin,
-assert exit + JSON output).
-
-### Phase G — bindings (Node + Python)
-
-Mirrors B3 / C8 pattern. Declarative surface only — the policy
-event types + capability gate enum are wrapped; the actual
-publish/lookup happens by passing built events through binding-
-facing helpers that round-trip into Rust.
-
-- Node: `AuthMatcher`, `AuthVerdict`, `CapabilityPolicyEvent`
-  classes with factory methods. Plus `publishCapabilityPolicy(event,
-  operatorKeyPath)`.
-- Python: `PyCapabilityPolicyEvent`, `PyAuthMatcher`,
-  `PyAuthVerdict` pyclasses. Plus
-  `publish_capability_policy(event, operator_key_path)`.
-- Capability tag constants for the announce + execute capability
-  surfaces exposed as binding-level strings.
-
-### Phase H — conformance integration test
+### 7. Conformance test
 
 `tests/capability_auth_conformance.rs`:
 
-1. **Permissive baseline:** no policy events emitted; every
-   announce + execute path admits (matches today's behavior).
-2. **Deny-by-node:** operator publishes a deny rule against
-   NodeId X for tag Y; X's announcements carrying Y get dropped;
-   X's executions against tag Y get
+1. **Permissive baseline** — A publishes an announcement with all
+   three allow-lists empty; B can execute.
+2. **Allow-by-node** — A allows `[B]`; B can execute, C cannot.
+3. **Allow-by-subnet** — A allows `[subnet S]`; nodes in S can
+   execute, nodes outside cannot.
+4. **Allow-by-group** — A allows `[group G]`; nodes claiming `G`
+   via tag can execute, others cannot.
+5. **Revocation** — A publishes v1 permissive, then v2 with
+   `allowed_nodes = [self]`; B's execute fails after the v2
+   announcement is folded.
+6. **Receiver-side defense** — caller bypasses the local gate (test
+   helper that skips it); callee independently rejects with
    `CapabilityDenied`.
-3. **Deny-by-subnet:** operator publishes deny rule against
-   `SubnetId(...)` for tag Y; every node in that subnet's
-   announcements / executions denied.
-4. **Allow-overrides-deny-by-priority:** rule list has Allow on
-   `Group(G)` ahead of Deny on `Subnet(S)`; node in both denied
-   except when member of G — the Allow wins.
-5. **Replay survives restart:** Node restart re-folds the policy
-   channel from RedEX; all rules + group memberships restored.
-6. **Operator-key rotation:** rotate the configured signer set →
-   pre-rotation events still verify (signed by old key still in
-   the set during overlap), post-rotation old-key events reject
-   after the operator removes that signer from config.
 
 ---
 
-## Locked decisions to confirm with operators before implementation
+## What this plan deliberately does NOT include
 
-These are the load-bearing design questions where the wrong answer
-becomes expensive to revisit. Each gets a default; flagged for
-operator sign-off.
+(All explicitly out of scope — these are the things Kyra flagged
+in the prior draft as IAM-creep:)
 
-1. **Announce-side rejection: per-tag rewrite vs all-or-nothing?**
-   Default: per-tag rewrite (drop the offending tags, fold the
-   remainder). Alternative: all-or-nothing (any deny → reject the
-   whole announcement). Rewrite is more useful day-to-day; all-or-
-   nothing is more obvious in audit logs. Going with rewrite.
+- A policy language, allow + deny + priority rule lists.
+- A separate policy channel.
+- Operator keys distinct from entity keys (the entity key signs
+  its own policy because the entity owns it).
+- Group membership signed by an operator (it's a self-claimed
+  tag).
+- Snapshots, purges, advisory modes, compaction, retention
+  strategies, audit-log browsers, fold-ready signals — none of it.
+- A new error class on the binding surface beyond the one
+  `CapabilityDenied` variant on the existing nRPC reject error.
+- Cluster keys or threshold signatures.
 
-2. **Conflict resolution: priority-list first-match-wins vs
-   explicit precedence (Deny-wins / Allow-wins)?**
-   Default: priority list, first-match-wins, operator-controlled.
-   Alternative ("Deny always wins") is simpler reasoning but loses
-   the ability to express "this specific entity is allowed inside
-   an otherwise-denied group." Going with priority list.
-
-3. **Fail-mode when the CortEX fold isn't ready (cold start before
-   replay completes)?**
-   Default: **permissive** (allow) until fold is ready. Tradeoff:
-   a deny rule isn't enforced until replay reaches that event. The
-   closed alternative (deny everything until ready) breaks startup
-   for any cluster with any policy — operators couldn't bootstrap.
-   Going with permissive + a `capability_auth_fold_ready` metric +
-   structured log line for ops visibility.
-
-4. **Operator-key source: single key vs threshold-set?**
-   Default: a set of N ed25519 keys, any one of which can sign.
-   Operators rotate by adding the new key, propagating, then
-   removing the old. Threshold signatures (M-of-N) are future
-   work and require a separate plan.
-
-5. **Subnet membership source: tag-on-announcement vs config-file?**
-   Default: `subnet:<id>` tag on the announcement, validated by
-   the existing TOFU + signature path. Means a peer self-declares
-   its subnet. Operators who don't trust peer self-declaration can
-   layer a policy rule `Allow Subnet(X) → Deny Node(Y)` to override.
-   Config-file alternative would require out-of-band membership
-   distribution and is heavier.
-
-6. **Group membership: signed events vs config-file?**
-   Default: signed events on the policy channel, replayable +
-   auditable like the rules themselves. Config-file alternative is
-   simpler but bypasses the audit log.
-
-7. **Hot-path cost budget:** at most one HashMap probe + one
-   priority-scan (≤ 8 rules typical) per announcement, per
-   execution. Measure in benchmarks; target < 1 μs per call.
-   Caching the verdict across repeated lookups for the same
-   `(entity, capability)` pair is allowed if the cache invalidates
-   on fold updates.
-
-8. **Retention on the policy channel:** unbounded (keep every
-   event forever) vs operator-tunable retention. Default:
-   unbounded for the v1 ship — the channel's natural throughput is
-   "operator publishes a rule" which is rare. Add tunable
-   retention as a follow-up if any cluster outgrows the default.
-
-9. **Per-capability vs per-service granularity:** the gate keys on
-   the capability tag string. A service that wants finer-grained
-   auth (e.g. "tag X, method Y") layers its own logic above this;
-   the gate provides the coarse boundary. Documented as a
-   non-goal.
-
-10. **Backward-compat with `require_signed_capabilities`:**
-    the existing flag stays. A node with
-    `require_signed_capabilities = false` AND
-    `capability-auth` feature off behaves exactly as today. A node
-    with the feature on but no policy events admitted folds an
-    empty view → permissive default → also identical to today.
+If a real operator-driven policy surface is wanted later, it lands
+as a separate plan on top of this one — but the substrate doesn't
+need it.
 
 ---
 
-## Wire format reference
+## Cold-start behavior
 
-### `CapabilityPolicyEvent::RuleSet` (postcard-encoded body)
+There is no cold-start problem. The existing capability index
+either has an announcement for peer X or it doesn't — `may_execute`
+returns `false` if there's no announcement (you can't address what
+you can't see). Once the announcement folds, the gate works the
+same as steady-state. No "fold ready" signal, no buffered events,
+no permissive-during-replay window distinct from the steady-state
+permissive default.
 
-```text
-+-------------------+----------+
-| field             | bytes    |
-+-------------------+----------+
-| event_kind        | u8 = 0x01|  // 0x01=RuleSet, 0x02=RuleClear, 0x03=MemberAdd, 0x04=MemberRemove
-| capability_tag    | len-prefixed UTF-8 (u16 LE len + bytes), ≤ 128 bytes
-| scope             | u8 (0=Announce, 1=Execute)
-| version           | u64 LE
-| rule_count        | u8 (≤ 16 rules per RuleSet — operator splits past that)
-| rules[N]          | per-rule struct: matcher (1+16/32 bytes) + verdict (u8)
-| signer            | EntityId (32 bytes)
-| signature         | Signature64 (64 bytes)
-+-------------------+----------+
-```
-
-Total bounded at ~700 bytes per event, well under the existing
-`SYNC_RESPONSE` per-event ceiling.
-
-### Reserved channel name
-
-`capability/auth/policy/v1` — the `/v1` suffix is the schema
-version. A v2 schema lands on `capability/auth/policy/v2` with
-parallel publishing during migration; CortEX folds both during
-overlap, then operators retire v1.
+The trade-off the prior draft was trying to solve (deny-until-fold-
+ready vs allow-until-fold-ready) doesn't exist in this model
+because the fold IS the announcement itself, and the announcement
+is the same one that gets you the address in the first place.
 
 ---
 
 ## Risks
 
-1. **Operator-key compromise.** A stolen operator key can publish
-   arbitrary `RuleSet` events including granting itself
-   `Allow Any` for sensitive capabilities. Mitigations: rotate by
-   removing the compromised key from the configured signer set
-   (immediate); replay the policy channel and `RuleClear` every
-   event signed by the compromised key (recovery). Documented in
-   the runbook.
+1. **Self-declared subnet/group membership lets a malicious peer
+   claim any group.** Mitigation: an announcement's allow-lists are
+   the *publisher's* assertion of who can call it. If A allows
+   `Group(G)` and B falsely claims `G`, B can call A — but A is the
+   one who declared the rule. The asymmetric trust is fine: A is
+   trusting the *tag* system, and the tag system is signed by the
+   claiming entity. Documented as a feature, not a bug. Operators
+   who want stricter group membership use a 32-byte random `GroupId`
+   that's hard to guess; the value-as-secret pattern is the
+   substrate's existing "shared secret" idiom (e.g. channel auth
+   tokens).
 
-2. **Fold-replay latency on cold-start clusters.** A 10K-event
-   policy channel takes wall time to replay. During replay, every
-   gate consult sees the permissive default → temporarily lax
-   behavior. Mitigations: the `capability_auth_fold_ready` metric +
-   structured log gate operators' "this node is policy-enforcing"
-   monitoring; the alternative (deny until replay) trades off
-   startup behavior for stricter behavior and is rejected per
-   §3 above.
+2. **A peer with no announcement is unreachable.** This is the same
+   condition as today: a peer that hasn't published a
+   capability announcement can't be `call_service`'d either, because
+   the index doesn't know it. No regression.
 
-3. **Self-deny lockout.** An operator publishes
-   `Deny Group(operators)` for the `net:policy-publish` capability →
-   no operator can publish further events. Mitigation: a hardcoded
-   reserved capability `net:policy-publish` whose acceptance gate
-   ignores deny rules. The lock-out failure mode would otherwise
-   require recovering the operator key + a fresh genesis policy
-   event from a config-only path. Documented in `purge` semantics.
+3. **Per-tag granularity not supported.** The allow-lists apply to
+   the whole announcement, not per-tag. An entity that wants
+   different policies per tag publishes multiple announcements — but
+   today's announcement model is one-per-entity, so this would
+   require either multi-announcement-per-entity or per-tag overrides
+   inside the announcement. Documented as a known limit; deferred
+   until a real workload asks for it.
 
-4. **Pre-this-plan announcement re-broadcast.** A legacy node that
-   doesn't enforce policy can forward an announcement that this
-   node would deny if it arrived directly. The forward arrives as
-   `hop_count > 0` and still hits the announce-side gate; the
-   verdict still applies. Verified by Phase H test case 4.
+4. **Allow-list size ≤ 64.** A single allow-list field bounded at 64
+   entries keeps the announcement under the existing wire-size
+   ceiling. Operators with > 64 nodes use a group.
 
-5. **Group membership churn.** Frequent `MemberAdd/Remove` events
-   bloat the channel. Mitigation: per-group event compaction at
-   `version` rollover (every 1000 events, the operator publishes a
-   `MemberSnapshot` event that supersedes prior membership; the
-   fold treats it as a reset). Compaction is operator-driven, not
-   automatic.
+5. **Revocation latency = announcement TTL + propagation.** A
+   revocation (new announcement with stricter lists) propagates at
+   the same rate as any other announcement (mesh broadcast +
+   pingwave forwarding). Operators who need < 1s revocation use
+   the existing channel-auth `WriteToken` revocation path, not
+   this; capability-auth is steady-state coarse, not crisis-grade
+   fast.
 
-6. **Sig-verification cost amplification.** Every policy event
-   requires an ed25519 verify. A flood of events could DoS the fold.
-   Mitigation: rate-limit fold ingestion at the CortEX adapter
-   layer (existing pattern); operator-key signers are expected to be
-   single-digit count, so the rate ceiling is low in practice.
+---
+
+## Phases
+
+Small enough to land as one branch, but breaks naturally into
+three commits:
+
+### Phase 1 — types + wire format
+
+Add `SubnetId`, `GroupId`, the three allow-list fields on
+`CapabilityAnnouncement`. Wire round-trip tests, signed round-trip
+tests proving byte-identity with v0.x when lists are empty.
+
+### Phase 2 — execute gate
+
+Implement `CapabilityIndex::may_execute`, wire into
+`Mesh::call_service` (caller side + callee side). Add the
+`CapabilityDenied` error variant. Unit tests on the gate function
+in isolation, integration test for the call path.
+
+### Phase 3 — CLI + conformance
+
+`net cap announce` subcommand. The 6-test conformance file. Plan
+doc updated to reflect ship status.
+
+Total: ~400 lines of code + tests. One short feature, not a
+subsystem.
 
 ---
 
 ## Test plan
 
-### Unit (per-phase)
-
-- Phase A: type round-trip, `SubnetId::from_tag` parses + rejects
-  bad input, `CapabilityAuthPolicy` round-trips through serde.
-- Phase B: signature verify + reject paths (wrong key, malformed
-  bytes, missing signer in configured set), reserved-channel name
-  pin.
-- Phase C: fold semantics — out-of-order delivery preserves
-  highest version, duplicate events idempotent, group
-  add-then-remove leaves empty set.
-- Phase D: announce-side gate denies, allows, per-tag rewrite,
-  metrics increment.
-- Phase E: execute-side gate caller + callee enforcement.
-
-### Integration
-
-- `tests/capability_auth_conformance.rs` per §Phase H above.
-- Cross-binding: Node + Python publish a policy event, Rust core
-  folds + enforces. Pins binding wire-format parity.
-
-### Performance
-
-- New criterion bench `auth_gate_throughput`: measures
-  `may_announce` + `may_execute` call rate under a populated view
-  (100 rules, 10 groups, 1K members). Target ≥ 5M calls/sec/core.
+- Unit: `may_execute` covered by ~10 cases (permissive / by-node /
+  by-subnet / by-group / no-tag / no-announcement / multiple
+  allow-lists overlap / revocation supersedes / hop > 0 forwarded
+  / per-axis empty-vs-nonempty).
+- Integration: the 6 conformance scenarios above.
+- Wire compat: signed-payload byte-identity test (v0.x ann round-
+  trips through v0.x reader after passing through a v0.4 writer
+  with empty allow-lists).
 
 ---
 
-## Out-of-scope (explicit non-deliverables)
+## Migration
 
-- Threshold signatures (M-of-N operator keys).
-- Time-bounded rules (`Allow until <timestamp>`). Defer; operators
-  use external scheduling to publish `RuleClear` at the right
-  moment.
-- Per-method nRPC granularity (Q9 above).
-- Encrypted policy channel (operators rely on signatures +
-  topology).
-- Auto-revocation of past index entries on new deny rule (operators
-  run `net policy purge` explicitly).
-- Cluster-key signed events (vs operator-key). Documented as
-  forward-compat header reserved in the wire format (signer field
-  is a generic `EntityId`).
+Pre-this-plan peers serialize and verify announcements unchanged
+(empty allow-lists serialize to nothing, byte form is identical).
+Post-this-plan peers reading a pre-this-plan announcement default
+the three Vecs to empty → permissive. No flag day, no rolling-
+upgrade ceremony.
 
 ---
 
-## Effort estimate
+## Open questions
 
-Roughly the same scope as the v0.3 Phase A work: ~3 weeks of
-incremental commits across A → H. Largest risks: getting the
-fold semantics right (Phase C) and the wire-format pinning
-(Phase B). Both are well-precedented by the existing capability +
-RedEX surfaces.
+1. **Should `may_execute` also check the *caller's* announcement
+   (the receiver's view of "is this caller real"), or just trust
+   the wire-level entity binding?** Default: trust the wire-level
+   binding (which `handle_capability_announcement` already
+   establishes via TOFU). The caller's announcement isn't needed
+   because the execute-gate doesn't care about the caller's
+   capabilities, just their identity + subnet/group membership.
 
----
+2. **Should the allow-list checks short-circuit on first match (per
+   the pseudocode above) or scan all three in case of operator
+   intent ambiguity?** Default: short-circuit. The three lists are
+   union-semantics, so any match suffices; there's no precedence
+   issue because there are no deny rules.
 
-## Open questions for the next review pass
-
-1. Should we surface a "policy advisory" mode where the gate logs
-   what it would deny without actually denying — for operators
-   staging a new rule before flipping it?
-2. Is `Mesh` the right home for `publish_capability_policy`, or
-   should it live on a separate `MeshOperator` handle that takes
-   the operator key at construction and isn't routinely held?
-   (Same question for the CLI — does the operator key live in the
-   running daemon's memory at all?)
-3. The "audit log" pitch implies the channel is read by ops
-   dashboards. Do we want a separate `NetDb` query view for
-   policy events, or is "subscribe to the channel" enough?
-4. Should we ship a default `Allow operators net:policy-publish`
-   policy event at substrate first-boot, or always-allow via the
-   reserved-capability mechanism in Risk §3?
-
-These don't block Phase A — they shape Phases F/G.
+3. **Do we need a `net cap revoke` CLI shortcut, or is `net cap
+   announce` with a tighter allow-list good enough?** Default:
+   no shortcut — `announce` is the only verb.
