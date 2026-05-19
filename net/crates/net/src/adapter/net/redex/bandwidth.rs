@@ -33,6 +33,17 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum BandwidthClass {
     /// Default class — interactive / user-driven work.
+    ///
+    /// **WARNING: v0.2-compat default — silently slips past D-phase
+    /// rate bounds.** This is `Default` so existing v0.2 callers
+    /// migrating to v0.3 preserve their pre-D2 latency
+    /// characteristics: every replication request keeps acting like
+    /// Foreground unless the caller explicitly tags Background or
+    /// Realtime. The trade-off is that a Phase-D-aware peer that
+    /// FORGETS to override the default also gets full Foreground
+    /// rate, undermining the budget bound. Code that emits or
+    /// constructs `SyncRequest` / `RuntimeInputs` SHOULD pick a
+    /// class explicitly per workload, not rely on `Default`.
     #[default]
     Foreground,
     /// TB-scale background work — backfills, migrations,
