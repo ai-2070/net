@@ -125,6 +125,16 @@ fn fold_announcement_everywhere(nodes: &[&Arc<MeshNode>], ann: &CapabilityAnnoun
 /// doesn't verify signatures (verification is the wire-side
 /// `handle_capability_announcement` job); tests that exercise
 /// the gate sidestep broadcast and fold directly.
+///
+/// **Version-space contract**: scenarios that call
+/// `serve_rpc` on the target pick `version` ≥ 100 to supersede
+/// the auto-self-index (v=1) and the spawned auto-re-announce
+/// (v=2) inside `serve_rpc`. The `CapabilityIndex::index` path
+/// rejects announcements with `version <= current`, so a fold
+/// at v=1/v=2 would silently no-op against the auto-generated
+/// permissive self-announcement and re-open the gate — pick
+/// per-scenario versions like 100 / 200 / 300 to leave the
+/// auto-version space (1, 2) free.
 fn target_announcement(
     target: &Arc<MeshNode>,
     version: u64,
@@ -157,10 +167,10 @@ fn caller_announcement(
 ) -> CapabilityAnnouncement {
     let mut caps = CapabilitySet::new();
     if let Some(s) = membership_subnet {
-        caps = caps.add_tag(&s.to_tag());
+        caps = caps.add_tag(s.to_tag());
     }
     for g in membership_groups {
-        caps = caps.add_tag(&g.to_tag());
+        caps = caps.add_tag(g.to_tag());
     }
     CapabilityAnnouncement::new(
         caller.node_id(),
@@ -584,8 +594,8 @@ async fn membership_parse_returns_no_subnet_when_announcement_has_multiple_subne
     // tags. `caller_announcement` only takes one Option<SubnetId>;
     // assemble the CapabilitySet directly.
     let caps = CapabilitySet::new()
-        .add_tag(&s1.to_tag())
-        .add_tag(&s2.to_tag())
+        .add_tag(s1.to_tag())
+        .add_tag(s2.to_tag())
         .add_tag("nrpc:probe");
     let ann = CapabilityAnnouncement::new(
         node.node_id(),

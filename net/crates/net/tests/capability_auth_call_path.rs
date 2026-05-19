@@ -358,3 +358,132 @@ async fn call_service_caller_side_gate_denies_when_not_in_allow_list() {
         other => panic!("expected CapabilityDenied, got {other:?}"),
     }
 }
+
+/// `serve_rpc` spawns an async re-announce so peers learn about
+/// the new service without the operator calling
+/// `announce_capabilities` manually. This pins that the spawn
+/// actually fires and the `nrpc:<service>` tag lands in a peer's
+/// capability index; a regression that dropped the spawn would
+/// keep `serve_rpc_self_indexes_announcement_with_nrpc_tag`
+/// passing (that one only checks the local index) but break this.
+#[tokio::test]
+async fn serve_rpc_spawned_reannounce_propagates_nrpc_tag_to_peers() {
+    use net::adapter::net::behavior::CapabilityFilter;
+
+    let server = build_node().await;
+    let peer = build_node().await;
+    handshake_pair(&peer, &server).await;
+
+    // Intentionally do NOT call `announce_capabilities` on either
+    // side. The only path that publishes the nrpc tag to `peer` is
+    // the spawned re-announce inside `serve_rpc`.
+    let _serve = server
+        .serve_rpc("echo", Arc::new(EchoHandler))
+        .expect("serve_rpc");
+
+    let filter = CapabilityFilter::default().require_tag("nrpc:echo".to_string());
+    let server_id = server.node_id();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if peer
+            .capability_index_arc()
+            .query(&filter)
+            .contains(&server_id)
+        {
+            return;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "spawned re-announce did not propagate `nrpc:echo` from server \
+                 {server_id:#x} to peer's capability index within 3s; either \
+                 the spawn was dropped or broadcast regressed",
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The callee-side bridge gate bumps the per-service
+/// `capability_denied_total` counter on rejection, even though the
+/// handler is never invoked. Without this bump a noisy
+/// unauthorized caller is invisible to operators watching
+/// `nrpc_handler_invocations_total`; the dashboard sees "0
+/// requests" while the caller sees `CapabilityDenied`. Pin the
+/// counter movement end-to-end via the metrics snapshot.
+#[tokio::test]
+async fn callee_bridge_denial_bumps_capability_denied_metric() {
+    use net::adapter::net::behavior::CapabilityAnnouncement;
+
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    let _serve = server
+        .serve_rpc("echo", Arc::new(EchoHandler))
+        .expect("serve_rpc");
+
+    // Caller's local index sees a permissive view (so the
+    // caller-side gate admits) — but the server's own index gets
+    // a restrictive policy folded directly, so the bridge rejects.
+    let caps_permissive = CapabilitySet::new().add_tag("nrpc:echo");
+    let permissive = CapabilityAnnouncement::new(
+        server.node_id(),
+        server.entity_id().clone(),
+        50,
+        caps_permissive,
+    );
+    caller.capability_index_arc().index(permissive);
+
+    let caps_restrictive = CapabilitySet::new().add_tag("nrpc:echo");
+    let mut restrictive = CapabilityAnnouncement::new(
+        server.node_id(),
+        server.entity_id().clone(),
+        100,
+        caps_restrictive,
+    );
+    restrictive.allowed_nodes = vec![0xDEAD_BEEF_BAAD_F00D];
+    server.capability_index_arc().index(restrictive);
+
+    // Use `call` (not `call_service`) so the caller-side gate
+    // doesn't fire — the rejection must come from the callee's
+    // bridge, which is where the counter bump lives.
+    let err = caller
+        .call(
+            server.node_id(),
+            "echo",
+            Bytes::from_static(b"bypass"),
+            CallOptions {
+                deadline: Some(
+                    std::time::Instant::now() + Duration::from_secs(2),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("callee-side gate must deny");
+    assert!(
+        matches!(err, RpcError::CapabilityDenied { .. }),
+        "expected CapabilityDenied, got {err:?}",
+    );
+
+    // The counter is bumped inside the bridge task; the response
+    // is also emitted asynchronously. By the time the caller's
+    // future resolves with `CapabilityDenied`, the bump has
+    // happened (the emit closure runs after the bump on the same
+    // path). Snapshot and assert.
+    let snap = server.rpc_metrics_snapshot();
+    let echo = snap
+        .services
+        .iter()
+        .find(|s| s.service == "echo")
+        .expect("echo service tracked in registry");
+    assert!(
+        echo.capability_denied_total >= 1,
+        "bridge denial must bump capability_denied_total; got snapshot {echo:?}",
+    );
+    assert_eq!(
+        echo.handler_invocations_total, 0,
+        "handler must not run on denied calls; got {} invocations",
+        echo.handler_invocations_total,
+    );
+}
