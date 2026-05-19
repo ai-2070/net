@@ -4,7 +4,7 @@ name: Release NPM
 # pure-TypeScript SDK `@net-mesh/sdk` ships via
 # `release-npm-sdk.yml`.
 #
-# Tag schema: `node-v<semver>` (e.g. `node-v0.19.0`).
+# Tag schema: `node-v<semver>`.
 #
 # Required repository secret: `NPM_TOKEN`
 #   `Automation` token type so 2FA doesn't block CI publishes.

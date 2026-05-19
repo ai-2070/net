@@ -1,7 +1,5 @@
 # Net SDK API Reference
 
-Verified against `net-sdk` v0.19.0 (Rust) / `@net-mesh/sdk` ≥ 0.19.0 peer (TS) / `net-sdk` Python (current `main`). Last full pass: 2026-04-25. SdkError variant set re-verified 2026-05-02 after the `bugfixes-8` `Sampled` / `Unrouted` additions.
-
 **Drift check before trusting these signatures:**
 ```bash
 # Rust: confirms emit/emit_raw/emit_str/emit_batch/emit_raw_batch are still exported (expect 5)

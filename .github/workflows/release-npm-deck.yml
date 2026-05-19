@@ -5,7 +5,7 @@ name: Release @net-mesh/deck
 # Sibling of `release-npm-cli.yml` — see that file's header for
 # the design notes (the two workflows are deliberately parallel).
 #
-# Tag schema: `deck-v<semver>` (e.g. `deck-v0.19.0`).
+# Tag schema: `deck-v<semver>`.
 #
 # Required repository secret: `NPM_TOKEN` (Automation token with
 # publish scope on the @net-mesh org).
@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g. deck-v0.19.0)"
+        description: "Tag to release"
         required: true
 
 env:
