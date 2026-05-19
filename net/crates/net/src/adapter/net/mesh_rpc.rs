@@ -1857,12 +1857,7 @@ impl MeshNode {
         // T1.3: per-service route cache (see PERF_AUDIT
         // 2026-05-19). One DashMap::get + Arc::clone instead of
         // 2 format! + 2 ChannelName::new + xxhash per call.
-        let route = self
-            .rpc_route_for_service(service)
-            .map_err(|reason| RpcError::NoRoute {
-                target: target_node_id,
-                reason,
-            })?;
+        let route = self.rpc_route_or_no_route(target_node_id, service)?;
         let self_origin = self.identity_origin_hash();
         self.ensure_reply_subscription(
             target_node_id,
@@ -2072,12 +2067,7 @@ impl MeshNode {
         // T1.3: per-service route cache (see PERF_AUDIT
         // 2026-05-19). One DashMap::get + Arc::clone instead of
         // 2 format! + 2 ChannelName::new + xxhash per call.
-        let route = self
-            .rpc_route_for_service(service)
-            .map_err(|reason| RpcError::NoRoute {
-                target: target_node_id,
-                reason,
-            })?;
+        let route = self.rpc_route_or_no_route(target_node_id, service)?;
         let self_origin = self.identity_origin_hash();
         self.ensure_reply_subscription(
             target_node_id,
@@ -2189,12 +2179,7 @@ impl MeshNode {
         // T1.3: per-service route cache. One DashMap::get + Arc::clone
         // on the hot path instead of 2 format! + 2 ChannelName::new +
         // xxhash per call.
-        let route = self
-            .rpc_route_for_service(service)
-            .map_err(|reason| RpcError::NoRoute {
-                target: target_node_id,
-                reason,
-            })?;
+        let route = self.rpc_route_or_no_route(target_node_id, service)?;
         let self_origin = self.identity_origin_hash();
         self.ensure_reply_subscription(
             target_node_id,
@@ -2465,12 +2450,7 @@ impl MeshNode {
         // `Arc::clone` on the hot path instead of 2 `format!` +
         // 2 `ChannelName::new` + xxhash per call (T1.3 perf audit
         // — `docs/misc/PERF_AUDIT_2026_05_19_NRPC.md`).
-        let route = self
-            .rpc_route_for_service(service)
-            .map_err(|reason| RpcError::NoRoute {
-                target: target_node_id,
-                reason,
-            })?;
+        let route = self.rpc_route_or_no_route(target_node_id, service)?;
         let self_origin = self.identity_origin_hash();
 
         // Caller-side metrics guard. Bumps `in_flight` immediately;
@@ -2867,6 +2847,23 @@ impl MeshNode {
     }
     fn identity_origin_hash(&self) -> u64 {
         self.public_key_origin_hash()
+    }
+
+    /// Caller-side helper that pairs `rpc_route_for_service` with
+    /// the `RpcError::NoRoute { target, reason }` mapping every
+    /// `Mesh::call*` entry point needs. Returning `Arc<RpcRoute>`
+    /// keeps the hot-path allocation profile of the cache intact
+    /// (one refcount bump per caller).
+    fn rpc_route_or_no_route(
+        &self,
+        target_node_id: u64,
+        service: &str,
+    ) -> Result<Arc<super::mesh::RpcRoute>, RpcError> {
+        self.rpc_route_for_service(service)
+            .map_err(|reason| RpcError::NoRoute {
+                target: target_node_id,
+                reason,
+            })
     }
 }
 

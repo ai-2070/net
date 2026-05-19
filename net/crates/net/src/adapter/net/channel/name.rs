@@ -20,6 +20,8 @@
 //!   wire-side collisions are benign (only affect filter precision, not
 //!   ACL or storage decisions, since those key on the canonical hash).
 
+use std::sync::Arc;
+
 use dashmap::DashMap;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -39,14 +41,25 @@ pub type ChannelHash = u64;
 /// Names are hierarchical with `/` separators. Valid characters are
 /// alphanumeric, `-`, `_`, `.`, and `/`. Names must not be empty,
 /// start or end with `/`, or contain `//`.
+///
+/// Backed by `Arc<str>` so `Clone` is a refcount bump rather than a
+/// heap allocation. `ChannelName` is cloned on every nRPC call (the
+/// per-service route cache hands the cached name to the caller
+/// guard), on every publish (the publisher's `ChannelId` is cloned
+/// into per-peer dispatch records), and on registry lookups; making
+/// `Clone` allocation-free removes a class of per-hot-call allocs
+/// without changing any caller code. The validated invariant is
+/// preserved by `::new`: there is no public field, no `From<String>`
+/// or `From<&str>` impl, and no mutator — once constructed, the
+/// `Arc<str>` is immutable and aliased copies are safe to share.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct ChannelName(String);
+pub struct ChannelName(Arc<str>);
 
 impl ChannelName {
     /// Create a new channel name, validating the format.
     pub fn new(name: &str) -> Result<Self, ChannelError> {
         Self::validate(name)?;
-        Ok(Self(name.to_string()))
+        Ok(Self(Arc::from(name)))
     }
 
     /// Get the name as a string slice.
@@ -86,7 +99,7 @@ impl ChannelName {
         if self.0.len() >= other.0.len() {
             return self.0 == other.0;
         }
-        other.0.starts_with(&self.0) && other.0.as_bytes()[self.0.len()] == b'/'
+        other.0.starts_with(&*self.0) && other.0.as_bytes()[self.0.len()] == b'/'
     }
 
     fn validate(name: &str) -> Result<(), ChannelError> {

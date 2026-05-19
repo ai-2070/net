@@ -177,6 +177,27 @@ Three cost categories dominate the per-call overhead:
 - **Where:** `mesh_rpc.rs:2461–2473` (the cold building), call-site
   refs at `:2487`, `:2560`, `:2615`, `:2775`.
 - **Difficulty:** low–medium.
+- **Status:** **landed** — `mesh.rs::RpcRoute` + `MeshNode::rpc_route_for_service`
+  cover the unary, streaming, client-stream, and duplex caller paths.
+  Cache is soft-capped at `RPC_ROUTE_CACHE_SOFT_CAP = 256` so callers
+  passing high-cardinality `service: &str` can't grow the map without
+  bound; insert path uses `entry().or_insert_with` so the build is
+  race-free. See `route_cache_tests` in `mesh.rs` for the pinned
+  invariants.
+- **Follow-up (landed alongside T1.3):** `ChannelName(String)` →
+  `ChannelName(Arc<str>)` (`channel/name.rs`). Pre-fix `Clone` was a
+  heap alloc + memcpy, so even with the route cache the guards
+  (`RpcStream` / `UnaryCallGuard` / `ClientStreamCallRaw` /
+  `DuplexInner`) still allocated each time they took ownership of a
+  cached `ChannelName`. With `Arc<str>` the per-call hand-off is a
+  refcount bump and the cached-hit path is allocation-free for both
+  the request and reply channel names. The change is contained in
+  `channel/name.rs` (one field-type swap + one `Pattern` deref nudge
+  in `is_prefix_of`); no public API or callsite changes were
+  required since all consumers use `as_str()` or operate on the
+  inner via `Deref<Target=str>`. Payoff is wider than nRPC since
+  `ChannelName` is also cloned by `ChannelId` propagation through
+  the pub/sub fan-out paths and `ChannelConfigMap` lookups.
 
 ### Tier 2 — medium refactors (target: ~5–10 µs)
 
