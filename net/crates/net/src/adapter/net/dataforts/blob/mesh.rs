@@ -1655,6 +1655,24 @@ impl MeshBlobAdapter {
                     Ok(out)
                 }
                 super::blob_tree::TreeNode::Leaf { chunks } => {
+                    if residual_depth != 1 {
+                        // BlobRef::Tree.depth claimed the leaves are
+                        // at depth N from the root; finding a Leaf
+                        // at any other residual depth means either
+                        // the tree is shallower (depth-shortening
+                        // attack — a peer substitutes a Leaf root
+                        // for a claim of depth > 1) or deeper (Leaf
+                        // at an intermediate position) than the
+                        // outer BlobRef::Tree.depth claims. Both
+                        // violate the "depth is rooted in the outer
+                        // BlobRef::Tree, not the wire node" wire-
+                        // trust invariant.
+                        return Err(BlobError::Decode(format!(
+                            "tree walk: Leaf at residual_depth={} — \
+                             actual tree depth disagrees with BlobRef::Tree.depth",
+                            residual_depth
+                        )));
+                    }
                     let mut out: Vec<u8> = Vec::new();
                     let mut offset: u64 = 0;
                     for chunk in chunks {
@@ -1690,6 +1708,18 @@ impl MeshBlobAdapter {
                     Ok(out)
                 }
                 super::blob_tree::TreeNode::ErasureLeaf { stripes } => {
+                    if residual_depth != 1 {
+                        // Same wire-trust invariant as the Leaf
+                        // case above: ErasureLeaf belongs at the
+                        // deepest level only, and the depth comes
+                        // from the outer BlobRef::Tree, not the
+                        // peer-supplied node body.
+                        return Err(BlobError::Decode(format!(
+                            "tree walk: ErasureLeaf at residual_depth={} — \
+                             actual tree depth disagrees with BlobRef::Tree.depth",
+                            residual_depth
+                        )));
+                    }
                     // Lazy stripe-index population: every
                     // ErasureLeaf decoded during a read registers
                     // its RS stripes into the GC-pin index. This
@@ -5429,6 +5459,60 @@ mod tests {
         // path surfaces a typed error. Pin that we DO surface an
         // error rather than returning empty bytes.
         let _ = err; // any error is fine; assert we got one
+    }
+
+    /// Tree depth-shortening attack: a peer-supplied root that
+    /// decodes as a `Leaf` against a `BlobRef::Tree` whose advertised
+    /// `depth > 1` must be rejected. Without the residual_depth
+    /// check, a hostile peer could substitute a Leaf root for any
+    /// blob whose `total_size <= TREE_FANOUT * TREE_LEAF_CHUNK_MAX_BYTES`
+    /// — the cross-check on covered_bytes alone admits the swap.
+    ///
+    /// Construction: store a legitimate depth=1 tree (Leaf root),
+    /// then build a BlobRef::Tree claiming depth=2 with the same
+    /// root_hash. The walker fetches the Leaf, sees covered_bytes ==
+    /// total_size (so the existing cross-check passes), enters the
+    /// Leaf arm, and rejects on residual_depth != 1.
+    #[tokio::test]
+    async fn fetch_range_tree_rejects_leaf_at_unexpected_residual_depth() {
+        let adapter = make_adapter();
+        let small_chunk: u32 = 1024;
+        let payload = deterministic_bytes(0xA7, small_chunk as usize);
+        // A depth=1 tree: root is a Leaf.
+        let blob_ref = adapter
+            .store_stream_tree_internal(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                small_chunk,
+            )
+            .await
+            .unwrap();
+        assert_eq!(blob_ref.tree_depth(), Some(1));
+        let (uri, root_hash, total_size) = match &blob_ref {
+            BlobRef::Tree {
+                uri,
+                root_hash,
+                total_size,
+                ..
+            } => (uri.clone(), *root_hash, *total_size),
+            _ => panic!("expected Tree"),
+        };
+        // Forged BlobRef::Tree claiming depth=2 against the depth=1
+        // root. Pre-fix the walker fetched the Leaf, found
+        // covered_bytes == total_size, and silently sliced bytes
+        // from a tree shallower than advertised.
+        let forged =
+            BlobRef::tree(&uri, Encoding::Replicated, root_hash, total_size, 2).unwrap();
+        let err = adapter
+            .fetch_range(&forged, 0..total_size)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Leaf at residual_depth=")
+                && msg.contains("disagrees with BlobRef::Tree.depth"),
+            "expected depth-disagreement decode error; got: {msg}",
+        );
     }
 
     // ────────────────────────────────────────────────────────
