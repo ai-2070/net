@@ -337,7 +337,7 @@ const mdxComponents = {
   // - H4: tiny accent uppercase — tag/label.
   h1: (props: { children?: ReactNode }) => (
     <h1
-      className={`font-display text-ink mt-1 mb-10 leading-[1.15] tracking-[0.01em] ${headingClasses.base}`}
+      className={`font-display lowercase text-ink mt-1 mb-10 leading-[1.15] tracking-[0.01em] ${headingClasses.base}`}
       style={{ fontSize: "clamp(24px, 2.8vw, 30px)" }}
       {...props}
     />
@@ -565,13 +565,7 @@ const mdxComponents = {
       {children}
     </Callout>
   ),
-  Demo: ({
-    title,
-    children,
-  }: {
-    title?: string;
-    children?: ReactNode;
-  }) => (
+  Demo: ({ title, children }: { title?: string; children?: ReactNode }) => (
     <div className="my-6 border border-line bg-bg-2 overflow-hidden">
       {title ? (
         <div className="border-b border-line px-4 py-2 text-[10px] tracking-[0.14em] text-ink-dim uppercase flex items-center gap-2">
