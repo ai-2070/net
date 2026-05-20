@@ -7,6 +7,7 @@
 //! - Adaptive load balancing based on real-time conditions
 
 use dashmap::DashMap;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -226,9 +227,9 @@ struct EndpointState {
     zone: Option<String>,
     priority: u32,
     /// Mutable health status
-    health: std::sync::RwLock<HealthStatus>,
+    health: RwLock<HealthStatus>,
     /// Mutable metrics
-    metrics: std::sync::RwLock<LoadMetrics>,
+    metrics: RwLock<LoadMetrics>,
     /// Whether endpoint is enabled
     enabled: std::sync::atomic::AtomicBool,
     /// Current connection count
@@ -238,13 +239,13 @@ struct EndpointState {
     /// Failed requests
     failed_requests: AtomicU64,
     /// Last selected time
-    last_selected: std::sync::Mutex<Instant>,
+    last_selected: Mutex<Instant>,
     /// Consecutive failures
     consecutive_failures: AtomicU32,
     /// Circuit breaker state
     circuit_open: std::sync::atomic::AtomicBool,
     /// Circuit open time
-    circuit_open_time: std::sync::Mutex<Option<Instant>>,
+    circuit_open_time: Mutex<Option<Instant>>,
     /// Whether a half-open probe request is currently in flight. Only one
     /// request is admitted per recovery cycle to test the endpoint.
     half_open_probe: std::sync::atomic::AtomicBool,
@@ -258,26 +259,26 @@ impl EndpointState {
             tags: endpoint.tags,
             zone: endpoint.zone,
             priority: endpoint.priority,
-            health: std::sync::RwLock::new(endpoint.health),
-            metrics: std::sync::RwLock::new(endpoint.metrics),
+            health: RwLock::new(endpoint.health),
+            metrics: RwLock::new(endpoint.metrics),
             enabled: std::sync::atomic::AtomicBool::new(endpoint.enabled),
             connections: AtomicU32::new(0),
             total_requests: AtomicU64::new(0),
             failed_requests: AtomicU64::new(0),
-            last_selected: std::sync::Mutex::new(Instant::now()),
+            last_selected: Mutex::new(Instant::now()),
             consecutive_failures: AtomicU32::new(0),
             circuit_open: std::sync::atomic::AtomicBool::new(false),
-            circuit_open_time: std::sync::Mutex::new(None),
+            circuit_open_time: Mutex::new(None),
             half_open_probe: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     fn health(&self) -> HealthStatus {
-        *self.health.read().unwrap()
+        *self.health.read()
     }
 
     fn metrics(&self) -> LoadMetrics {
-        self.metrics.read().unwrap().clone()
+        self.metrics.read().clone()
     }
 
     fn is_enabled(&self) -> bool {
@@ -314,7 +315,7 @@ impl EndpointState {
             .is_ok();
         if reserved {
             self.total_requests.fetch_add(1, Ordering::Relaxed);
-            *self.last_selected.lock().unwrap() = Instant::now();
+            *self.last_selected.lock() = Instant::now();
         }
         reserved
     }
@@ -343,12 +344,12 @@ impl EndpointState {
             if success {
                 self.circuit_open.store(false, Ordering::Release);
                 self.consecutive_failures.store(0, Ordering::Relaxed);
-                *self.circuit_open_time.lock().unwrap() = None;
+                *self.circuit_open_time.lock() = None;
             } else {
                 self.failed_requests.fetch_add(1, Ordering::Relaxed);
                 // Probe failed — restart the recovery timer so the next
                 // probe is delayed by another full recovery_time window.
-                *self.circuit_open_time.lock().unwrap() = Some(Instant::now());
+                *self.circuit_open_time.lock() = Some(Instant::now());
             }
             return;
         }
@@ -366,7 +367,7 @@ impl EndpointState {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
-                *self.circuit_open_time.lock().unwrap() = Some(Instant::now());
+                *self.circuit_open_time.lock() = Some(Instant::now());
             }
         }
     }
@@ -392,7 +393,7 @@ impl EndpointState {
         if !self.circuit_open.load(Ordering::Acquire) {
             return false;
         }
-        let open_time = match *self.circuit_open_time.lock().unwrap() {
+        let open_time = match *self.circuit_open_time.lock() {
             Some(t) => t,
             None => return true,
         };
@@ -723,14 +724,14 @@ impl LoadBalancer {
     /// Update endpoint health
     pub fn update_health(&self, node_id: &NodeId, health: HealthStatus) {
         if let Some(state) = self.endpoints.get(node_id) {
-            *state.health.write().unwrap() = health;
+            *state.health.write() = health;
         }
     }
 
     /// Update endpoint metrics
     pub fn update_metrics(&self, node_id: &NodeId, metrics: LoadMetrics) {
         if let Some(state) = self.endpoints.get(node_id) {
-            *state.metrics.write().unwrap() = metrics;
+            *state.metrics.write() = metrics;
         }
     }
 
@@ -1033,6 +1034,10 @@ impl LoadBalancer {
         }
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "caller (LoadBalancer::select) returns early on empty endpoints; min_by_key on a non-empty iter is infallible"
+    )]
     fn select_least_connections(&self, endpoints: &[Arc<EndpointState>]) -> Selection {
         let state = endpoints
             .iter()
@@ -1047,6 +1052,10 @@ impl LoadBalancer {
         }
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "caller (LoadBalancer::select) returns early on empty endpoints; min_by on a non-empty iter is infallible"
+    )]
     fn select_weighted_least_connections(&self, endpoints: &[Arc<EndpointState>]) -> Selection {
         // Score = connections / weight (lower is better).
         // The `.max(MIN_DIVISOR)` guard is a divide-by-zero protector
@@ -1164,6 +1173,10 @@ impl LoadBalancer {
         self.select_round_robin(endpoints)
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "caller (LoadBalancer::select) returns early on empty endpoints; min_by on a non-empty iter is infallible"
+    )]
     fn select_least_latency(&self, endpoints: &[Arc<EndpointState>]) -> Selection {
         let state = endpoints
             .iter()
@@ -1182,6 +1195,10 @@ impl LoadBalancer {
         }
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "caller (LoadBalancer::select) returns early on empty endpoints; min_by on a non-empty iter is infallible"
+    )]
     fn select_least_load(&self, endpoints: &[Arc<EndpointState>]) -> Selection {
         let state = endpoints
             .iter()

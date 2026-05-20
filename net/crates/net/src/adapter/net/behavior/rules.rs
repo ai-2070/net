@@ -310,6 +310,10 @@ impl ConditionExpr {
     }
 
     /// Combine with AND
+    #[expect(
+        clippy::unwrap_used,
+        reason = "len == 1 branch guarantees the iterator yields exactly one element"
+    )]
     pub fn and(conditions: Vec<ConditionExpr>) -> Self {
         if conditions.is_empty() {
             ConditionExpr::Always
@@ -321,6 +325,10 @@ impl ConditionExpr {
     }
 
     /// Combine with OR
+    #[expect(
+        clippy::unwrap_used,
+        reason = "len == 1 branch guarantees the iterator yields exactly one element"
+    )]
     pub fn or(conditions: Vec<ConditionExpr>) -> Self {
         if conditions.is_empty() {
             ConditionExpr::Never

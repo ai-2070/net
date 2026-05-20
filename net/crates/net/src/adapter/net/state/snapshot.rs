@@ -270,6 +270,10 @@ impl StateSnapshot {
     /// format — `head_payload` is a runtime-only field populated by
     /// the caller from the head event before invoking restore (see
     /// the field's doc).
+    #[expect(
+        clippy::expect_used,
+        reason = "documented contract — this is the infallible variant intended for tests / internal callers with bounded state; try_to_bytes is the fallible variant for production paths"
+    )]
     pub fn to_bytes(&self) -> Vec<u8> {
         // Tests and well-known internal callers know their state is
         // bounded; production callers (compute orchestrator, migration

@@ -2089,6 +2089,10 @@ fn durable_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Returns `(entries, truncated)` where `truncated` is true if the
 /// tail of the file was a partial record (torn write from a crash).
 /// Callers should `set_len` the file to `entries.len() * 20` if so.
+#[expect(
+    clippy::expect_used,
+    reason = "loop iterates 0..full_records where full_records = bytes.len() / REDEX_ENTRY_SIZE; each REDEX_ENTRY_SIZE-byte slice converts infallibly"
+)]
 fn read_index(path: &Path) -> Result<(Vec<RedexEntry>, bool), RedexError> {
     if !path.exists() {
         return Ok((Vec::new(), false));
@@ -2115,6 +2119,10 @@ fn read_index(path: &Path) -> Result<(Vec<RedexEntry>, bool), RedexError> {
 /// (missing file, partial last record, length disagreement with
 /// the index) returns `None` so the caller can fall back to
 /// `now()` and surface a warning.
+#[expect(
+    clippy::expect_used,
+    reason = "bytes.len() >= expected_entries * 8 checked above; each 8-byte slice converts infallibly"
+)]
 fn read_timestamps(path: &Path, expected_entries: usize) -> Result<Option<Vec<u64>>, RedexError> {
     if !path.exists() {
         return Ok(None);

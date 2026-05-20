@@ -220,6 +220,10 @@ impl HealthProbe for ProximityGraphHealthProbe {
 /// little-endian). Inlined here to avoid making the substrate
 /// helper public; the convention is the load-bearing piece, not
 /// the function location.
+#[expect(
+    clippy::unwrap_used,
+    reason = "input is &[u8; 32]; slicing [0..8] then .try_into::<[u8; 8]>() is statically infallible"
+)]
 fn graph_id_to_node_id(graph_id: &[u8; 32]) -> NodeId {
     u64::from_le_bytes(graph_id[0..8].try_into().unwrap())
 }

@@ -31,8 +31,9 @@
 //! NRPC_BINDINGS_PLAN.md — the JS-side wrapper layer matches on
 //! the prefix to re-throw typed errors.
 
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -118,21 +119,18 @@ static NEXT_CANCEL_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Process-global cancel-token registry. Populated when a call
 /// is dispatched with a non-zero token; queried by `cancel_call`.
-/// Uses `std::sync::Mutex` to avoid pulling parking_lot as a new
-/// dep — the lock is only taken briefly at call start / end /
-/// cancel, never across an await.
-fn cancel_registry() -> &'static std::sync::Mutex<std::collections::HashMap<u64, AbortHandle>> {
-    static REG: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, AbortHandle>>> =
-        OnceLock::new();
-    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+/// parking_lot::Mutex matches the workspace lock convention and
+/// has no poison concept — the previous std::sync recovery dance
+/// is gone with the migration.
+fn cancel_registry() -> &'static Mutex<std::collections::HashMap<u64, AbortHandle>> {
+    static REG: OnceLock<Mutex<std::collections::HashMap<u64, AbortHandle>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Lock the cancel registry, recovering from a poisoned mutex
-/// (a thread panicked while holding it). Registry entries are
-/// independent so partial state is fine.
+/// Lock the cancel registry. parking_lot guards are infallible.
 fn lock_cancel_registry(
-) -> std::sync::MutexGuard<'static, std::collections::HashMap<u64, AbortHandle>> {
-    cancel_registry().lock().unwrap_or_else(|p| p.into_inner())
+) -> parking_lot::MutexGuard<'static, std::collections::HashMap<u64, AbortHandle>> {
+    cancel_registry().lock()
 }
 
 /// Internal sentinel for "task aborted by `cancel_call`."
@@ -462,7 +460,7 @@ impl ServeHandle {
         // Recover from a poisoned mutex (a thread panicked while
         // holding it) — partial state is fine here, we just want
         // to drop the inner ServeHandle if it's still present.
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.lock();
         let _ = guard.take();
     }
 
@@ -470,7 +468,7 @@ impl ServeHandle {
     /// finalized the handle). Useful for tests / diagnostics.
     #[napi]
     pub fn is_closed(&self) -> bool {
-        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = self.inner.lock();
         guard.is_none()
     }
 }
@@ -1142,7 +1140,7 @@ impl JsResponseSink {
     /// `ResponseSinkTyped::send` contract — both are non-async.
     #[napi]
     pub fn send(&self, body: Buffer) -> bool {
-        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = self.inner.lock();
         match guard.as_ref() {
             Some(sink) => {
                 sink.send(napi_buffer_to_bytes(body));

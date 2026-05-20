@@ -485,13 +485,23 @@ async fn publish_skips_expired_subscriber_when_sweep_is_disabled() {
         .insert(pub_token)
         .expect("install publish token");
 
-    // Short-lived subscribe token — 1 second.
+    // Short-lived subscribe token. Picked 3 s rather than 1 s for
+    // the same second-resolution-clock reason captured in commit
+    // 1d905420 (token-cache evict-race test): `current_timestamp`
+    // is second-resolution, so a subscribe handshake + `wait_until`
+    // poll that lands in the 0.5-1.5 s range on a loaded CI runner
+    // already crosses the expiry of a 1 s token before the first
+    // publish runs, masking the fast-path-admit assertion this test
+    // is trying to pin. 3 s gives ~2 s of slack between subscribe
+    // and the first publish; the post-expiry sleep below is bumped
+    // proportionally so the second publish still reliably crosses
+    // expiry.
     let sub_token = PermissionToken::issue(
         &a.keypair,
         b.keypair.entity_id().clone(),
         TokenScope::SUBSCRIBE,
         channel.hash(),
-        1,
+        3,
         0,
     );
 
@@ -523,12 +533,12 @@ async fn publish_skips_expired_subscriber_when_sweep_is_disabled() {
     // Wait past the subscribe token's TTL. `PermissionToken` works
     // in 1-second granularity (unix seconds), and `is_valid`'s
     // strict `now > not_after` lets the boundary second still
-    // pass — so 2.5 s from issue reliably crosses the expiry even
-    // when the test harness wakes a little late. With the sweep
-    // disabled the AuthGuard entry + roster entry both persist
-    // across this sleep — pre-fix, the next publish would still
-    // fan out to B.
-    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    // pass — so 4.5 s from issue reliably crosses the 3 s expiry
+    // even when the test harness wakes a little late. With the
+    // sweep disabled the AuthGuard entry + roster entry both
+    // persist across this sleep — pre-fix, the next publish would
+    // still fan out to B.
+    tokio::time::sleep(Duration::from_millis(4_500)).await;
     assert!(
         a.mesh.auth_guard().is_authorized_full(b_origin, &channel),
         "sweep-disabled harness precondition: guard entry must persist past TTL",

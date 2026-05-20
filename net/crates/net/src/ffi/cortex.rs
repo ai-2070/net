@@ -13,6 +13,38 @@
 //! `0 = event delivered`, `1 = timeout`, `2 = stream ended cleanly`,
 //! or a negative `NetError`. The Go layer wraps the cursor in a
 //! goroutine that pumps into a channel, calling `close` on `ctx.Done()`.
+//!
+//! # Safety
+//!
+//! Every entry point in this module is `unsafe extern "C"` and shares
+//! the same caller-side contract:
+//!
+//! - Opaque handle pointers are valid, properly aligned, produced by
+//!   this crate's matching constructor (`Box::into_raw` inside the
+//!   FFI surface), and not used after their `_free` counterpart (or
+//!   `net_shutdown`) has returned. Foreign-allocated pointers will UB
+//!   when consumed by `Box::from_raw` in the corresponding `_free`.
+//! - String pointers are non-null, NUL-terminated, and point to valid
+//!   UTF-8 (or, where documented, to opaque bytes paired with an
+//!   explicit length argument).
+//! - Out-parameter pointers (`*mut T`) are non-null and writable for
+//!   the lifetime of the call.
+//! - Buffer / length pairs accurately describe the producer-allocated
+//!   memory the callee may read or write.
+//!
+//! These are the same invariants `include/net.h` documents for C
+//! callers. Per-call `# Safety` rustdoc is suppressed and per-block
+//! `// SAFETY:` comments are gated by the module-level `#![expect]`
+//! below — every `unsafe { }` in this file inherits the contract above.
+#![allow(clippy::missing_safety_doc)]
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "module-wide FFI safety contract documented in the # Safety preamble above"
+)]
+#![expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "FFI entry points routinely deref + write to multiple out-parameter fields under the same caller contract; splitting per-op would obscure the single boundary-cross"
+)]
 
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::mem::ManuallyDrop;
@@ -500,7 +532,7 @@ pub unsafe extern "C" fn net_redex_replication_prometheus_text(
     // path runs).
     match CString::new(text) {
         Ok(c) => c.into_raw(),
-        Err(_) => CString::new("").unwrap().into_raw(),
+        Err(_) => CString::default().into_raw(),
     }
 }
 
@@ -719,7 +751,7 @@ pub unsafe extern "C" fn net_redex_greedy_prometheus_text(
         .unwrap_or_default();
     match CString::new(text) {
         Ok(c) => c.into_raw(),
-        Err(_) => CString::new("").unwrap().into_raw(),
+        Err(_) => CString::default().into_raw(),
     }
 }
 

@@ -2314,6 +2314,10 @@ impl MeshBlobAdapter {
 
     /// Channel name for a given chunk hash. Pure function; safe to
     /// inline.
+    #[expect(
+        clippy::expect_used,
+        reason = "hex-formatted name under the reserved CHUNK_CHANNEL_PREFIX always satisfies ChannelName validation"
+    )]
     fn chunk_channel(hash: &[u8; 32]) -> ChannelName {
         let mut name = String::with_capacity(CHUNK_CHANNEL_PREFIX.len() + 64);
         name.push_str(CHUNK_CHANNEL_PREFIX);

@@ -125,6 +125,10 @@ jobs:
           --test cross_lang_capability_fixtures
           --test migration_integration
           --test migration_target_failure_mid_chunking
+          --test netsocket_production_defaults
+          --test parsed_packet_short_input
+          --test proxy_coverage_gaps
+          --test stream_config_and_error_display
 
       # === NAT traversal ==================================================
       - name: NAT traversal
@@ -184,7 +188,10 @@ jobs:
       # === NetDB ==========================================================
       - name: NetDB
         if: ${{ !cancelled() }}
-        run: cargo nextest run --no-fail-fast --features netdb --test integration_netdb
+        run: >
+          cargo nextest run --no-fail-fast --features netdb
+          --test integration_netdb
+          --test netdb_builder_and_accessors
 
       # === Dataforts (greedy + gravity) ===================================
       - name: Dataforts greedy + gravity
@@ -673,8 +680,34 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run clippy
-        run: cargo clippy --all-features --all-targets -- -D warnings
+      # Stage 4 of PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md: production
+      # code (lib + bins) is denied for the four panic-hygiene + unsafe
+      # lints declared in `Cargo.toml`'s `[lints.clippy]` table. This
+      # step has no `-A` overrides — any new `.unwrap()` /
+      # `.expect()` / undocumented `unsafe` block / multi-op unsafe
+      # block in lib / bin code fails CI here. `--all-targets`
+      # coverage for OTHER clippy lints lives in the next step.
+      - name: Run clippy (production code, strict)
+        run: cargo clippy --all-features --lib --bins -- -D warnings
+
+      # `--all-targets` adds clippy coverage for tests / benches /
+      # examples. Tests are allowed to `.unwrap()` / `.expect()` freely
+      # (~5000 sites across the test surface) and rarely contain
+      # `unsafe`. The four lints from `[lints.clippy]` are silenced
+      # here with `-A`. The `clippy::disallowed_methods` rule
+      # (driven by `clippy.toml`) is silenced inside each test module
+      # via inner `#![allow(clippy::disallowed_methods)]` attributes
+      # — Cargo's `[lints]`-table-vs-CLI precedence quirks make a
+      # blanket `-A` flag here unreliable. Every OTHER clippy lint
+      # still fails on warning across all targets via `-D warnings`.
+      - name: Run clippy (all targets, test surface allowed to panic)
+        run: >
+          cargo clippy --all-features --all-targets --
+          -D warnings
+          -A clippy::unwrap_used
+          -A clippy::expect_used
+          -A clippy::undocumented_unsafe_blocks
+          -A clippy::multiple_unsafe_ops_per_block
 
   # The `clippy` job above lints only the root `net` package — `cargo
   # clippy` without `--workspace` doesn't traverse workspace members,

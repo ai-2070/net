@@ -906,6 +906,10 @@ async fn cmd_repair(
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "build_tree_ref above constructs a Tree variant; tree_root_hash() returns Some on that variant"
+)]
 async fn cmd_tree(
     adapter: &MeshBlobAdapter,
     hash_hex: &str,
@@ -1020,6 +1024,10 @@ fn walk_tree_print<'a>(
     })
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "build_tree_ref above constructs a Tree variant; tree_root_hash() returns Some on that variant"
+)]
 async fn cmd_verify(
     adapter: &MeshBlobAdapter,
     hash_hex: &str,
@@ -1157,6 +1165,10 @@ async fn verify_chunk(
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "build_tree_ref above constructs a Tree variant; tree_root_hash() returns Some on that variant"
+)]
 async fn cmd_path(
     adapter: &MeshBlobAdapter,
     hash_hex: &str,

@@ -227,20 +227,19 @@ pub struct MeshDbIter {
 /// In-memory chain reader populated via `net_meshdb_reader_append`.
 #[derive(Default)]
 pub struct InMemoryStore {
-    chains: std::sync::Mutex<
+    chains: parking_lot::Mutex<
         std::collections::BTreeMap<u64, std::collections::BTreeMap<SeqNum, Vec<u8>>>,
     >,
 }
 
 impl ChainReader for InMemoryStore {
     fn read_one(&self, origin: u64, seq: SeqNum) -> Option<Vec<u8>> {
-        self.chains.lock().unwrap().get(&origin)?.get(&seq).cloned()
+        self.chains.lock().get(&origin)?.get(&seq).cloned()
     }
 
     fn read_range(&self, origin: u64, start: SeqNum, end: SeqNum) -> Vec<(SeqNum, Vec<u8>)> {
         self.chains
             .lock()
-            .unwrap()
             .get(&origin)
             .map(|chain| {
                 chain
@@ -252,13 +251,7 @@ impl ChainReader for InMemoryStore {
     }
 
     fn latest_seq(&self, origin: u64) -> Option<SeqNum> {
-        self.chains
-            .lock()
-            .unwrap()
-            .get(&origin)?
-            .keys()
-            .next_back()
-            .copied()
+        self.chains.lock().get(&origin)?.keys().next_back().copied()
     }
 }
 
@@ -348,7 +341,6 @@ pub unsafe extern "C" fn net_meshdb_reader_append(
             .store
             .chains
             .lock()
-            .unwrap()
             .entry(origin)
             .or_default()
             .insert(SeqNum(seq), payload_vec);

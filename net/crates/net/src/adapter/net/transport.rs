@@ -286,6 +286,10 @@ impl BatchedPacketReceiver {
     ///
     /// Spawns a dedicated OS thread that owns `BatchedTransport` and sends
     /// received packets over a bounded channel.
+    #[expect(
+        clippy::expect_used,
+        reason = "std::thread::Builder::spawn only fails on OS resource exhaustion (OOM, ulimit); aborting at startup is the documented behavior for that condition"
+    )]
     pub fn new(socket: Arc<UdpSocket>) -> Self {
         use std::os::unix::io::AsRawFd;
         use std::sync::atomic::Ordering;
@@ -607,4 +611,79 @@ mod tests {
              silently consumes a thread until shutdown."
         );
     }
+
+    /// Runtime smoke test (Linux only): construct the
+    /// `BatchedPacketReceiver`, drive a few packets through the
+    /// recvmmsg loop, and drop it. Exercises the constructor body,
+    /// the `Ok(packets)` happy branch, the `Ok([])` empty-batch
+    /// sleep branch (between sends, while the channel is empty),
+    /// and the `Drop::drop` shutdown handshake. Pairs with the
+    /// source-pin tripwire above — the tripwire catches a
+    /// "simplification" PR; this test catches an actual runtime
+    /// regression where the loop fails to deliver packets or
+    /// fails to shut down within the join.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batched_recv_delivers_and_shuts_down_cleanly() {
+        let recv_sock = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let recv_addr = recv_sock.local_addr();
+        let send_sock = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        let mut batched = BatchedPacketReceiver::new(recv_sock.socket_arc());
+
+        // Send a few packets. Three is enough to exercise the
+        // happy-path branch through the loop without depending on
+        // recvmmsg ever returning more than one at a time.
+        for i in 0..3u8 {
+            send_sock
+                .socket_arc()
+                .send_to(&[0xAA, i, 0xBB], recv_addr)
+                .await
+                .unwrap();
+        }
+
+        // Drain with a bounded deadline. The 1 ms sleep inside the
+        // empty-batch / WouldBlock branch means the thread re-checks
+        // shutdown promptly; 2 s is generous for loopback delivery.
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while got.len() < 3 && std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), batched.recv()).await
+            {
+                Ok(Ok((data, _addr))) => got.push(data),
+                Ok(Err(_)) | Err(_) => continue,
+            }
+        }
+        assert_eq!(
+            got.len(),
+            3,
+            "BatchedPacketReceiver did not deliver three loopback datagrams within 2 s"
+        );
+
+        // Dropping the receiver sets the shutdown AtomicBool and
+        // joins the thread. If the loop body doesn't notice the
+        // shutdown flag promptly, this hangs forever — the
+        // `tokio::time::timeout` around `spawn_blocking` bounds the
+        // join so a regression surfaces as a clean test failure
+        // rather than an indefinite hang.
+        let join = tokio::task::spawn_blocking(move || drop(batched));
+        tokio::time::timeout(std::time::Duration::from_secs(2), join)
+            .await
+            .expect("Drop::drop for BatchedPacketReceiver did not join within 2 s")
+            .expect("spawn_blocking join");
+    }
+
+    // The earlier `batched_recv_exits_on_hard_socket_error` runtime
+    // tripwire was deleted: rustc 1.95's IO-safety enforcement aborts
+    // the process the next time anyone closes an already-closed fd
+    // (`fatal runtime error: IO Safety violation: owned file
+    // descriptor already closed, aborting`), and `libc::close(fd)` on
+    // an fd still owned by `Arc<UdpSocket>` is exactly that case. The
+    // source-pin tripwire `batched_recv_loop_must_back_off_and_exit_on_hard_error`
+    // at the start of this module already catches the
+    // "simplification PR that removes the EBADF check" class of
+    // regression by textual matching on the source, and that's the
+    // cheapest tripwire available — runtime fault injection of EBADF
+    // isn't safely possible in modern Rust without leaking the
+    // socket.
 }

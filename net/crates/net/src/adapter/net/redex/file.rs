@@ -463,6 +463,10 @@ impl RedexFile {
     /// already implements the idempotent-reconcile recipe; ad-hoc
     /// subscribers (a future netdb-watcher persisting elsewhere)
     /// must mirror it.
+    #[expect(
+        clippy::expect_used,
+        reason = "segment capacity is pre-validated and offsets pre-checked above; segment.append cannot fail at this point"
+    )]
     pub fn append(&self, payload: &[u8]) -> Result<u64, RedexError> {
         self.check_not_closed()?;
         let cks = payload_checksum(payload);
@@ -599,6 +603,10 @@ impl RedexFile {
     ///   any in-memory commit — on disk failure the seq allocation
     ///   rolls back and neither memory nor subscribers observe the
     ///   batch.
+    #[expect(
+        clippy::expect_used,
+        reason = "segment capacity is pre-validated and offsets pre-checked above; offset_to_u32 and segment.append_many cannot fail at this point"
+    )]
     pub fn append_batch(&self, payloads: &[Bytes]) -> Result<Option<u64>, RedexError> {
         self.check_not_closed()?;
         if payloads.is_empty() {
@@ -712,6 +720,10 @@ impl RedexFile {
     ///
     /// Used by [`super::OrderedAppender`] for replay determinism.
     /// Same failure-atomicity contract as [`Self::append`].
+    #[expect(
+        clippy::expect_used,
+        reason = "segment capacity is pre-validated and offsets pre-checked above; segment.append cannot fail at this point"
+    )]
     pub fn append_ordered(&self, payload: &[u8]) -> Result<u64, RedexError> {
         self.check_not_closed()?;
         let cks = payload_checksum(payload);
@@ -805,6 +817,10 @@ impl RedexFile {
     ///
     /// Returns `Some(first_seq)` on a non-empty batch and `None`
     /// on empty input — same convention as `append_batch`.
+    #[expect(
+        clippy::expect_used,
+        reason = "segment capacity is pre-validated and offsets pre-checked above; offset_to_u32 and segment.append_many cannot fail at this point"
+    )]
     pub fn append_batch_ordered(&self, payloads: &[Bytes]) -> Result<Option<u64>, RedexError> {
         self.check_not_closed()?;
         if payloads.is_empty() {

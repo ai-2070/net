@@ -11,6 +11,25 @@
 //! The buffer uses a power-of-2 capacity for efficient modulo operations
 //! (bitwise AND instead of division). Head and tail pointers are cache-line
 //! padded to prevent false sharing between producer and consumer threads.
+//!
+//! # Safety
+//!
+//! Every `unsafe { }` block in this file accesses the `UnsafeCell<MaybeUninit<T>>`
+//! slots under the same SPSC contract documented near the `unsafe impl Send` /
+//! `unsafe impl Sync` block: the producer thread holds the head pointer and
+//! the consumer thread holds the tail pointer; a slot at index `i = head & mask`
+//! (producer side) or `i = tail & mask` (consumer side) is exclusively owned by
+//! the side holding that pointer between the load and the store. Debug builds
+//! verify SPSC discipline via `producer_in_progress` / `consumer_in_progress`
+//! `AtomicBool` thread guards (see `InProgressGuard`).
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "SPSC ring discipline documented in the # Safety section above"
+)]
+#![expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "ring slot read/write is a single semantic op (UnsafeCell::get deref + MaybeUninit::write or assume_init_read) under SPSC discipline"
+)]
 
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;

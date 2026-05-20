@@ -98,6 +98,10 @@ impl ChannelId {
 
     /// Internal helper so tests can hash literal strings without
     /// constructing a [`ChannelName`].
+    #[expect(
+        clippy::expect_used,
+        reason = "Blake2sMac::new_from_slice rejects only keys longer than 32 bytes; CHANNEL_ID_LABEL is a short compile-time-constant label"
+    )]
     fn from_str_internal(s: &str) -> Self {
         let mut mac = <Blake2sMac<U32> as KeyInit>::new_from_slice(CHANNEL_ID_LABEL)
             .expect("BLAKE2s accepts variable-length keys");

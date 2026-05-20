@@ -480,6 +480,10 @@ impl EventFrame {
     /// framed stream — a panic is far preferable to silent data
     /// corruption on a framing boundary.
     #[inline]
+    #[expect(
+        clippy::expect_used,
+        reason = "events larger than u32::MAX (~4 GiB) are an invariant violation upstream — a panic on encode is better than a silent length-prefix truncation that would corrupt the framed stream"
+    )]
     pub fn write_events(events: &[Bytes], buf: &mut BytesMut) -> usize {
         let start = buf.len();
         for event in events {

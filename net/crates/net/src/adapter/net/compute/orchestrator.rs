@@ -45,6 +45,10 @@ const SNAPSHOT_WIRE_MAGIC: &[u8; 4] = b"CDS1";
 /// at the orchestrator. Closes the asymmetry where single-chunk
 /// corruption caught at the orchestrator while multi-chunk
 /// corruption deferred entirely to the target.
+#[expect(
+    clippy::expect_used,
+    reason = "snapshot_bytes.len() >= 37 checked above; slicing [5..37] yields exactly 32 bytes"
+)]
 fn validate_chunk_header(
     chunk_index: u32,
     snapshot_bytes: &[u8],
@@ -1070,6 +1074,10 @@ impl SnapshotReassembler {
         // keys are all in 0..total_chunks. Reaching total_chunks entries
         // therefore means we have every distinct index exactly once.
         if state.chunks.len() == state.total_chunks as usize {
+            #[expect(
+                clippy::unwrap_used,
+                reason = "pending.entry(key).or_insert_with above guarantees the key is present"
+            )]
             let state = self.pending.remove(&key).unwrap();
             let mut full = Vec::with_capacity(state.chunks.values().map(|c| c.len()).sum());
             for (_idx, chunk) in state.chunks {

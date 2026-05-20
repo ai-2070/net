@@ -35,6 +35,10 @@ impl EntityId {
     /// `NetHeader::origin_hash` stays u32 (routing fast-path);
     /// callers there downcast `kp.origin_hash() as u32`.
     #[inline]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "blake2s_hash returns [u8; 32]; slicing [0..8].try_into::<[u8; 8]>() is statically infallible"
+    )]
     pub fn origin_hash(&self) -> u64 {
         let hash = self.blake2s_hash(b"net-origin-v1");
         u64::from_le_bytes(hash[0..8].try_into().unwrap())
@@ -45,6 +49,10 @@ impl EntityId {
     /// This replaces arbitrary u64 node IDs with cryptographically derived
     /// ones, binding node identity to the entity keypair.
     #[inline]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "blake2s_hash returns [u8; 32]; slicing [0..8].try_into::<[u8; 8]>() is statically infallible"
+    )]
     pub fn node_id(&self) -> u64 {
         let hash = self.blake2s_hash(b"net-node-id-v1");
         u64::from_le_bytes(hash[0..8].try_into().unwrap())
@@ -70,6 +78,10 @@ impl EntityId {
     }
 
     /// Compute BLAKE2s-MAC hash of the public key with a domain label.
+    #[expect(
+        clippy::expect_used,
+        reason = "Blake2sMac::new_from_slice rejects only keys longer than 32 bytes; domain labels are short compile-time-constant slices"
+    )]
     fn blake2s_hash(&self, label: &[u8]) -> [u8; 32] {
         let mut mac = <Blake2sMac<U32> as Mac>::new_from_slice(label)
             .expect("BLAKE2s accepts variable-length keys");
@@ -194,6 +206,9 @@ impl EntityKeypair {
         let signing_key = SigningKey::from_bytes(&rng_bytes);
         // Zeroize secret material — volatile write prevents optimizer elision
         for byte in rng_bytes.iter_mut() {
+            // SAFETY: `byte` is a valid mutable reference into `rng_bytes`
+            // for the lifetime of this loop iteration, which is all
+            // `ptr::write_volatile` requires.
             unsafe { std::ptr::write_volatile(byte, 0) };
         }
         Self::from_signing_key(signing_key)

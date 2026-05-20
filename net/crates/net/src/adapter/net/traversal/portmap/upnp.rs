@@ -46,8 +46,8 @@
 //! no way to infer it from the request envelope the way NAT-PMP
 //! does.
 
+use parking_lot::Mutex;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -103,15 +103,15 @@ impl UpnpMapper {
     /// Read the cached gateway, if any. Lock-free fast path for
     /// renewal / remove calls that follow a successful probe.
     fn cached_gateway(&self) -> Option<Gateway<Tokio>> {
-        self.gateway.lock().expect("mutex poisoned").clone()
+        self.gateway.lock().clone()
     }
 
     fn cache_gateway(&self, gw: Gateway<Tokio>) {
-        *self.gateway.lock().expect("mutex poisoned") = Some(gw);
+        *self.gateway.lock() = Some(gw);
     }
 
     fn invalidate_gateway(&self) {
-        *self.gateway.lock().expect("mutex poisoned") = None;
+        *self.gateway.lock() = None;
     }
 
     /// Discover (or re-use a cached) gateway. Bounded by

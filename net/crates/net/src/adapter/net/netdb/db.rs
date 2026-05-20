@@ -57,6 +57,10 @@ impl NetDb {
     /// Access the tasks model. Panics if `with_tasks()` wasn't
     /// called on the builder. Use [`Self::try_tasks`] for a checked
     /// accessor.
+    #[expect(
+        clippy::expect_used,
+        reason = "documented contract — callers must opt into tasks via builder; try_tasks is the checked accessor"
+    )]
     pub fn tasks(&self) -> &TasksAdapter {
         self.tasks
             .as_ref()
@@ -71,6 +75,10 @@ impl NetDb {
 
     /// Access the memories model. Panics if `with_memories()` wasn't
     /// called.
+    #[expect(
+        clippy::expect_used,
+        reason = "documented contract — callers must opt into memories via builder; try_memories is the checked accessor"
+    )]
     pub fn memories(&self) -> &MemoriesAdapter {
         self.memories
             .as_ref()

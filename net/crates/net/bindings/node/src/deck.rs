@@ -28,7 +28,8 @@
 //! `<<deck-sdk-kind:KIND>>MSG` discriminator verbatim. The TS
 //! wrapper parses the envelope into a typed `DeckSdkError`.
 
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use napi::bindgen_prelude::*;
@@ -1502,8 +1503,7 @@ impl OperatorRegistry {
     /// snapshot is detached — later mutations on the source
     /// registry don't propagate.
     fn snapshot(&self) -> std::sync::Arc<CoreOperatorRegistry> {
-        let g = self.inner.lock().expect("registry mutex poisoned");
-        std::sync::Arc::new(g.clone())
+        std::sync::Arc::new(self.inner.lock().clone())
     }
 }
 
@@ -1531,11 +1531,7 @@ impl OperatorRegistry {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(public_key.as_ref());
         let entity_id = EntityId::from_bytes(arr);
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
-        g.insert(op_id, entity_id);
+        self.inner.lock().insert(op_id, entity_id);
         Ok(())
     }
 
@@ -1543,11 +1539,7 @@ impl OperatorRegistry {
     /// derived operator id.
     #[napi]
     pub fn register(&self, identity: &OperatorIdentity) -> Result<()> {
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
-        g.register(identity.inner.keypair());
+        self.inner.lock().register(identity.inner.keypair());
         Ok(())
     }
 
@@ -1556,31 +1548,19 @@ impl OperatorRegistry {
     pub fn contains(&self, operator_id: BigInt) -> Result<bool> {
         let op_id = crate::common::bigint_u64(operator_id)
             .map_err(|e| deck_err("invalid_public_key", format!("operatorId: {}", e.reason)))?;
-        let g = self
-            .inner
-            .lock()
-            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
-        Ok(g.contains(op_id))
+        Ok(self.inner.lock().contains(op_id))
     }
 
     /// Number of registered operators.
     #[napi(getter, js_name = "size")]
     pub fn size(&self) -> Result<u32> {
-        let g = self
-            .inner
-            .lock()
-            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
-        Ok(g.len() as u32)
+        Ok(self.inner.lock().len() as u32)
     }
 
     /// `true` iff no operators are registered.
     #[napi]
     pub fn is_empty(&self) -> Result<bool> {
-        let g = self
-            .inner
-            .lock()
-            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
-        Ok(g.is_empty())
+        Ok(self.inner.lock().is_empty())
     }
 
     /// Verify a single signature over `payload`. Throws a
@@ -1589,11 +1569,10 @@ impl OperatorRegistry {
     #[napi]
     pub fn verify(&self, signature: OperatorSignatureJs, payload: Buffer) -> Result<()> {
         let sig = signature.into_core()?;
-        let g = self
-            .inner
+        self.inner
             .lock()
-            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
-        g.verify(&sig, payload.as_ref()).map_err(verify_error_to_js)
+            .verify(&sig, payload.as_ref())
+            .map_err(verify_error_to_js)
     }
 
     /// Verify every signature in the bundle and confirm at least
@@ -1610,11 +1589,9 @@ impl OperatorRegistry {
         for s in signatures {
             sigs.push(s.into_core()?);
         }
-        let g = self
-            .inner
+        self.inner
             .lock()
-            .map_err(|_| deck_err("registry_poisoned", "operator registry mutex poisoned"))?;
-        g.verify_bundle(&sigs, payload.as_ref(), threshold as usize)
+            .verify_bundle(&sigs, payload.as_ref(), threshold as usize)
             .map_err(verify_error_to_js)
     }
 }

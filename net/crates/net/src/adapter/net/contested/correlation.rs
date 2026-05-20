@@ -303,6 +303,10 @@ impl CorrelatedFailureDetector {
 
         match best_subnet {
             Some(subnet) => {
+                #[expect(
+                    clippy::unwrap_used,
+                    reason = "subnet was just yielded by iterating subnet_counts; the key is always present"
+                )]
                 let ratio = *subnet_counts.get(&subnet).unwrap() as f32 / with_subnet as f32;
                 FailureCause::SubnetFailure {
                     subnet,

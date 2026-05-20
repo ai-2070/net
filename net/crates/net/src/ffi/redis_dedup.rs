@@ -40,14 +40,33 @@
 //! no UB, but no parallelism either. The expected usage shape is
 //! one helper per consumer goroutine / thread (each with its own
 //! LRU).
+//!
+//! # Safety
+//!
+//! Every entry point is `unsafe extern "C"` and inherits the
+//! module-wide FFI safety contract (see `ffi/mod.rs` and
+//! `include/net.h`). In particular, `net_redis_dedup_t*` handles
+//! must have been produced by `net_redis_dedup_new` (i.e. by
+//! `Box::into_raw` inside this module) — foreign-allocated
+//! pointers, even if valid and aligned, will UB when consumed by
+//! `Box::from_raw` in `net_redis_dedup_free`.
 
+#![allow(clippy::missing_safety_doc)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "module-wide FFI safety contract documented in the # Safety preamble above"
+)]
+#![expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "FFI entry points deref input pointers together with out-parameter writes under the same caller contract"
+)]
 
+use parking_lot::Mutex;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::Mutex;
 
 use super::handle_guard::{HandleGuard, FFI_HANDLE_FREE_DEADLINE};
 
@@ -157,10 +176,7 @@ pub unsafe extern "C" fn net_redis_dedup_is_duplicate(
             Some(op) => op,
             None => return -1,
         };
-        let mut guard = h
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = h.inner.lock();
         if guard.is_duplicate(id_str) {
             1
         } else {
@@ -182,10 +198,7 @@ pub unsafe extern "C" fn net_redis_dedup_len(handle: *mut RedisStreamDedupHandle
             Some(op) => op,
             None => return 0,
         };
-        let guard = h
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = h.inner.lock();
         guard.len()
     })
 }
@@ -202,10 +215,7 @@ pub unsafe extern "C" fn net_redis_dedup_capacity(handle: *mut RedisStreamDedupH
             Some(op) => op,
             None => return 0,
         };
-        let guard = h
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = h.inner.lock();
         guard.capacity()
     })
 }
@@ -223,10 +233,7 @@ pub unsafe extern "C" fn net_redis_dedup_is_empty(handle: *mut RedisStreamDedupH
             Some(op) => op,
             None => return -1,
         };
-        let guard = h
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = h.inner.lock();
         if guard.is_empty() {
             1
         } else {
@@ -247,10 +254,7 @@ pub unsafe extern "C" fn net_redis_dedup_clear(handle: *mut RedisStreamDedupHand
             Some(op) => op,
             None => return,
         };
-        let mut guard = h
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = h.inner.lock();
         guard.clear();
     })
 }

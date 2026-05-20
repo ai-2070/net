@@ -44,9 +44,10 @@
 //! # }
 //! ```
 
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -272,12 +273,11 @@ pub(crate) struct ObserverHandle {
 impl Drop for ObserverHandle {
     fn drop(&mut self) {
         if let Some(inner) = self.runtime.upgrade() {
-            if let Ok(mut map) = inner.observers.lock() {
-                if let Some(v) = map.get_mut(&self.origin) {
-                    v.retain(|(id, _)| *id != self.id);
-                    if v.is_empty() {
-                        map.remove(&self.origin);
-                    }
+            let mut map = inner.observers.lock();
+            if let Some(v) = map.get_mut(&self.origin) {
+                v.retain(|(id, _)| *id != self.id);
+                if v.is_empty() {
+                    map.remove(&self.origin);
                 }
             }
         }
@@ -360,11 +360,7 @@ impl DaemonRuntime {
             .observer_id_counter
             .fetch_add(1, Ordering::Relaxed);
         {
-            let mut map = self
-                .inner
-                .observers
-                .lock()
-                .expect("DaemonRuntime observers mutex poisoned");
+            let mut map = self.inner.observers.lock();
             map.entry(origin).or_default().push((id, cb));
         }
         ObserverHandle {
@@ -422,7 +418,7 @@ impl DaemonRuntime {
         // for a future reviewer to wonder whether the check and
         // the insert can drift across two separately-acquired
         // guards.
-        let mut map = self.inner.factories.write().expect("factory map poisoned");
+        let mut map = self.inner.factories.write();
         match map.entry(kind.to_string()) {
             std::collections::hash_map::Entry::Occupied(_) => {
                 Err(DaemonError::FactoryAlreadyRegistered(kind.to_string()))
@@ -573,9 +569,10 @@ impl DaemonRuntime {
         let inner_for_failure = self.inner.clone();
         let failure: FailureCallback =
             Arc::new(move |origin_hash: u64, reason: MigrationFailureReason| {
-                if let Ok(mut map) = inner_for_failure.recent_failures.lock() {
-                    map.insert(origin_hash, reason);
-                }
+                inner_for_failure
+                    .recent_failures
+                    .lock()
+                    .insert(origin_hash, reason);
             });
         MigrationSubprotocolHandler::with_hooks(
             self.inner.orchestrator.clone(),
@@ -623,9 +620,7 @@ impl DaemonRuntime {
         // don't count against the process's memory footprint after
         // shutdown. The runtime is permanently non-functional at
         // this point, so no one will consume them.
-        if let Ok(mut map) = self.inner.recent_failures.lock() {
-            map.clear();
-        }
+        self.inner.recent_failures.lock().clear();
         // Uninstall the migration subprotocol handler. The
         // handler carries `Arc` clones into our `Inner` — leaving
         // it installed keeps the runtime's internals alive via
@@ -1051,11 +1046,7 @@ impl DaemonRuntime {
         // deliveries and rules out re-entrant-lock deadlocks if an
         // observer ever calls back into `deliver`.
         let to_fire: Vec<DeliverObserver> = {
-            let map = self
-                .inner
-                .observers
-                .lock()
-                .expect("DaemonRuntime observers mutex poisoned");
+            let map = self.inner.observers.lock();
             map.get(&origin_hash)
                 .map(|v| v.iter().map(|(_, cb)| cb.clone()).collect())
                 .unwrap_or_default()
@@ -1093,11 +1084,7 @@ impl DaemonRuntime {
     /// separate crate; not part of the stable surface.
     #[doc(hidden)]
     pub fn peek_migration_failure(&self, origin_hash: u64) -> Option<MigrationFailureReason> {
-        self.inner
-            .recent_failures
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&origin_hash).cloned())
+        self.inner.recent_failures.lock().get(&origin_hash).cloned()
     }
 
     /// **Test-only.** Inject a failure reason into the cache for
@@ -1110,9 +1097,10 @@ impl DaemonRuntime {
     /// the stable surface.
     #[doc(hidden)]
     pub fn inject_migration_failure(&self, origin_hash: u64, reason: MigrationFailureReason) {
-        if let Ok(mut m) = self.inner.recent_failures.lock() {
-            m.insert(origin_hash, reason);
-        }
+        self.inner
+            .recent_failures
+            .lock()
+            .insert(origin_hash, reason);
     }
 
     /// Snapshot the daemon's subscription ledger — a cloned view of
@@ -1364,9 +1352,7 @@ impl DaemonRuntime {
         // new migration would incorrectly surface the old reason
         // when `wait_one_attempt` hits its None-status branch and
         // pops `recent_failures`.
-        if let Ok(mut map) = self.inner.recent_failures.lock() {
-            map.remove(&origin_hash);
-        }
+        self.inner.recent_failures.lock().remove(&origin_hash);
         let msgs = self
             .inner
             .orchestrator
@@ -1627,7 +1613,6 @@ impl DaemonRuntime {
         self.inner
             .factories
             .read()
-            .expect("factory map poisoned")
             .get(kind)
             .cloned()
             .ok_or_else(|| DaemonError::FactoryNotFound(kind.to_string()))
@@ -1719,12 +1704,7 @@ impl DaemonHandle {
 
 impl std::fmt::Debug for DaemonRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let factory_count = self
-            .inner
-            .factories
-            .read()
-            .map(|m| m.len())
-            .unwrap_or_default();
+        let factory_count = self.inner.factories.read().len();
         f.debug_struct("DaemonRuntime")
             .field("state", &self.state())
             .field("factories", &factory_count)
@@ -2129,7 +2109,6 @@ impl MigrationHandle {
             .inner
             .recent_failures
             .lock()
-            .ok()?
             .remove(&self.origin_hash)
     }
 

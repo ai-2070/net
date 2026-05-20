@@ -28,8 +28,8 @@
 //! context; if you need cross-thread dedup, instantiate one
 //! helper per thread.
 
+use parking_lot::Mutex;
 use pyo3::prelude::*;
-use std::sync::Mutex;
 
 /// Consumer-side dedup helper for the Redis Streams adapter.
 ///
@@ -79,10 +79,7 @@ impl PyRedisStreamDedup {
     /// the GIL is released.
     fn is_duplicate(&self, py: Python<'_>, dedup_id: &str) -> bool {
         py.detach(|| {
-            let mut guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = self.inner.lock();
             guard.is_duplicate(dedup_id)
         })
     }
@@ -90,30 +87,21 @@ impl PyRedisStreamDedup {
     /// Number of distinct ids currently tracked.
     #[getter]
     fn len(&self) -> usize {
-        let guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = self.inner.lock();
         guard.len()
     }
 
     /// Configured maximum capacity.
     #[getter]
     fn capacity(&self) -> usize {
-        let guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = self.inner.lock();
         guard.capacity()
     }
 
     /// True if no ids are tracked yet.
     #[getter]
     fn is_empty(&self) -> bool {
-        let guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = self.inner.lock();
         guard.is_empty()
     }
 
@@ -127,19 +115,13 @@ impl PyRedisStreamDedup {
     /// reason to hold the GIL during that work.
     fn clear(&self, py: Python<'_>) {
         py.detach(|| {
-            let mut guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = self.inner.lock();
             guard.clear();
         })
     }
 
     fn __repr__(&self) -> String {
-        let guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = self.inner.lock();
         format!(
             "RedisStreamDedup(len={}, capacity={})",
             guard.len(),

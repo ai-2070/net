@@ -33,7 +33,7 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             local_id: 0,
-            bind_addr: "0.0.0.0:0".parse().unwrap(),
+            bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             max_packet_size: 65535,
             track_latency: true,
         }

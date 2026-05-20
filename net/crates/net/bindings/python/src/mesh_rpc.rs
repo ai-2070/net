@@ -42,7 +42,8 @@
 //! - [`RpcError`] — base class; `except RpcError` catches all of the
 //!   above.
 
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -231,10 +232,8 @@ impl PyCancellable {
     fn cancel(&self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
-        if let Ok(mut guard) = self.handle.lock() {
-            if let Some(h) = guard.take() {
-                h.abort();
-            }
+        if let Some(h) = self.handle.lock().take() {
+            h.abort();
         }
     }
 
@@ -252,9 +251,7 @@ impl PyCancellable {
             handle.abort();
             return;
         }
-        if let Ok(mut guard) = self.handle.lock() {
-            *guard = Some(handle);
-        }
+        *self.handle.lock() = Some(handle);
     }
 
     /// Internal: clear the abort handle on call completion. The
@@ -263,9 +260,7 @@ impl PyCancellable {
     /// otherwise abort whichever future got the recycled tokio
     /// task slot — pathological but cheap to defend).
     fn disarm(&self) {
-        if let Ok(mut guard) = self.handle.lock() {
-            let _ = guard.take();
-        }
+        let _ = self.handle.lock().take();
     }
 }
 
@@ -520,13 +515,13 @@ impl PyServeHandle {
     /// no-ops. After close, in-flight handlers continue to
     /// completion but no new requests will be dispatched.
     fn close(&self) {
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.lock();
         let _ = guard.take();
     }
 
     /// `True` once `close()` has been called.
     fn is_closed(&self) -> bool {
-        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = self.inner.lock();
         guard.is_none()
     }
 
@@ -584,7 +579,7 @@ impl PyRpcStream {
                 // concurrent `close()` that takes the inner first
                 // races us cleanly: we observe `None` and report
                 // "stream already closed."
-                let mut stream = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let mut stream = match inner.lock().take() {
                     Some(s) => s,
                     None => return Err(RpcError::new_err("stream already closed")),
                 };
@@ -593,7 +588,7 @@ impl PyRpcStream {
                     Some(Ok(bytes)) => {
                         // Put the stream back so subsequent __next__
                         // polls keep going.
-                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(stream);
+                        *inner.lock() = Some(stream);
                         Ok::<Option<Bytes>, PyErr>(Some(bytes))
                     }
                     Some(Err(e)) => {
@@ -621,7 +616,7 @@ impl PyRpcStream {
     /// Grant `n` additional flow-control credits to the server's
     /// pump. No-op if the call didn't set `stream_window_initial`.
     fn grant(&self, n: u32) {
-        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = self.inner.lock();
         if let Some(stream) = guard.as_ref() {
             stream.grant(n);
         }
@@ -629,14 +624,14 @@ impl PyRpcStream {
 
     /// `True` if the call set `stream_window_initial`.
     fn flow_controlled(&self) -> bool {
-        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = self.inner.lock();
         guard.as_ref().map(|s| s.flow_controlled()).unwrap_or(false)
     }
 
     /// Close the stream; emits CANCEL to the server (best-effort).
     /// Idempotent.
     fn close(&self) {
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.lock();
         let _ = guard.take();
     }
 }
@@ -683,7 +678,7 @@ impl PyClientStreamCall {
         let notify = self.close_notify.clone();
         py.detach(|| {
             runtime.block_on(async move {
-                let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let mut call = match inner.lock().take() {
                     Some(c) => c,
                     None => return Err(RpcError::new_err("client-stream call already closed")),
                 };
@@ -698,7 +693,7 @@ impl PyClientStreamCall {
                 };
                 match result {
                     Ok(()) => {
-                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                        *inner.lock() = Some(call);
                         Ok(())
                     }
                     Err(e) => {
@@ -717,7 +712,7 @@ impl PyClientStreamCall {
         let inner = self.inner.clone();
         let result = py.detach(|| {
             runtime.block_on(async move {
-                let call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let call = match inner.lock().take() {
                     Some(c) => c,
                     None => return Err(RpcError::new_err("client-stream call already closed")),
                 };
@@ -745,7 +740,7 @@ impl PyClientStreamCall {
     /// interrupted via the close-notify.
     fn close(&self) {
         self.close_notify.notify_one();
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.lock();
         let _ = guard.take();
     }
 
@@ -795,7 +790,7 @@ impl PyDuplexCall {
         let notify = self.close_notify.clone();
         py.detach(|| {
             runtime.block_on(async move {
-                let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let mut call = match inner.lock().take() {
                     Some(c) => c,
                     None => return Err(RpcError::new_err("duplex call already closed")),
                 };
@@ -808,7 +803,7 @@ impl PyDuplexCall {
                 };
                 match result {
                     Ok(()) => {
-                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                        *inner.lock() = Some(call);
                         Ok(())
                     }
                     Err(e) => {
@@ -827,12 +822,12 @@ impl PyDuplexCall {
         let inner = self.inner.clone();
         py.detach(|| {
             runtime.block_on(async move {
-                let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let mut call = match inner.lock().take() {
                     Some(c) => c,
                     None => return Err(RpcError::new_err("duplex call already closed")),
                 };
                 let result = call.finish_sending().await;
-                *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                *inner.lock() = Some(call);
                 result.map_err(rpc_error_to_pyerr)
             })
         })
@@ -853,14 +848,14 @@ impl PyDuplexCall {
         let inner = self.inner.clone();
         let result = py.detach(|| {
             runtime.block_on(async move {
-                let mut call = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let mut call = match inner.lock().take() {
                     Some(c) => c,
                     None => return Err(RpcError::new_err("duplex call already closed")),
                 };
                 let next = call.next().await;
                 match next {
                     Some(Ok(bytes)) => {
-                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(call);
+                        *inner.lock() = Some(call);
                         Ok::<Option<Bytes>, PyErr>(Some(bytes))
                     }
                     Some(Err(e)) => {
@@ -889,7 +884,6 @@ impl PyDuplexCall {
         let call = self
             .inner
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
             .take()
             .ok_or_else(|| RpcError::new_err("duplex call already closed"))?;
         let call_id = call.call_id();
@@ -927,7 +921,7 @@ impl PyDuplexCall {
     /// credit is interrupted via the close-notify.
     fn close(&self) {
         self.close_notify.notify_one();
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.lock();
         let _ = guard.take();
     }
 
@@ -968,7 +962,7 @@ impl PyDuplexSink {
         let notify = self.close_notify.clone();
         py.detach(|| {
             runtime.block_on(async move {
-                let mut sink = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let mut sink = match inner.lock().take() {
                     Some(s) => s,
                     None => return Err(RpcError::new_err("duplex sink already closed")),
                 };
@@ -981,7 +975,7 @@ impl PyDuplexSink {
                 };
                 match result {
                     Ok(()) => {
-                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+                        *inner.lock() = Some(sink);
                         Ok(())
                     }
                     Err(e) => {
@@ -1000,7 +994,7 @@ impl PyDuplexSink {
         let inner = self.inner.clone();
         py.detach(|| {
             runtime.block_on(async move {
-                let sink = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let sink = match inner.lock().take() {
                     Some(s) => s,
                     None => return Err(RpcError::new_err("duplex sink already closed")),
                 };
@@ -1017,7 +1011,7 @@ impl PyDuplexSink {
     }
     fn close(&self) {
         self.close_notify.notify_one();
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.lock();
         let _ = guard.take();
     }
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -1053,7 +1047,7 @@ impl PyDuplexStream {
         let inner = self.inner.clone();
         let result = py.detach(|| {
             runtime.block_on(async move {
-                let mut stream = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let mut stream = match inner.lock().take() {
                     Some(s) => s,
                     None => return Err(RpcError::new_err("duplex stream already closed")),
                 };
@@ -1061,7 +1055,7 @@ impl PyDuplexStream {
                 let next = stream.next().await;
                 match next {
                     Some(Ok(bytes)) => {
-                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(stream);
+                        *inner.lock() = Some(stream);
                         Ok::<Option<Bytes>, PyErr>(Some(bytes))
                     }
                     Some(Err(e)) => {
@@ -1085,7 +1079,7 @@ impl PyDuplexStream {
         self.call_id_cached
     }
     fn close(&self) {
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.lock();
         let _ = guard.take();
     }
 }
@@ -1200,7 +1194,7 @@ impl PyRequestStreamRecv {
         let inner = self.inner.clone();
         let result: Option<Bytes> = py.detach(|| {
             runtime.block_on(async move {
-                let mut stream = match inner.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let mut stream = match inner.lock().take() {
                     Some(s) => s,
                     None => return None,
                 };
@@ -1208,7 +1202,7 @@ impl PyRequestStreamRecv {
                 let next = stream.next().await;
                 match next {
                     Some(bytes) => {
-                        *inner.lock().unwrap_or_else(|p| p.into_inner()) = Some(stream);
+                        *inner.lock() = Some(stream);
                         Some(bytes)
                     }
                     None => {
@@ -1248,7 +1242,7 @@ impl PyResponseSinkSend {
     /// REQUEST_GRANT cadence rather than burst-pushing. Matches
     /// the Rust SDK's `ResponseSinkTyped::send` contract.
     fn send<'py>(&self, body: &Bound<'py, PyBytes>) -> bool {
-        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = self.inner.lock();
         match guard.as_ref() {
             Some(sink) => {
                 sink.send(Bytes::copy_from_slice(body.as_bytes()));

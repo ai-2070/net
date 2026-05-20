@@ -28,7 +28,8 @@
 //! and `.message` attached. Cross-binding parity with the MeshOS
 //! SDK's error format.
 
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use pyo3::exceptions::PyException;
@@ -1665,8 +1666,7 @@ impl PyOperatorRegistry {
     /// snapshot is detached — later mutations on the Python
     /// registry don't propagate.
     pub(crate) fn snapshot(&self) -> Arc<CoreOperatorRegistry> {
-        let g = self.inner.lock().expect("registry mutex poisoned");
-        Arc::new(g.clone())
+        Arc::new(self.inner.lock().clone())
     }
 }
 
@@ -1693,32 +1693,23 @@ impl PyOperatorRegistry {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(public_key);
         let entity_id = EntityId::from_bytes(arr);
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
-        g.insert(operator_id, entity_id);
+        let _ = py;
+        self.inner.lock().insert(operator_id, entity_id);
         Ok(())
     }
 
     /// Convenience — register `identity`'s public key under its
     /// derived operator id (the keypair's origin hash).
     fn register(&self, py: Python<'_>, identity: &PyOperatorIdentity) -> PyResult<()> {
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
-        g.register(identity.inner.keypair());
+        let _ = py;
+        self.inner.lock().register(identity.inner.keypair());
         Ok(())
     }
 
     /// `True` iff `operator_id` is registered.
     fn contains(&self, py: Python<'_>, operator_id: u64) -> PyResult<bool> {
-        let g = self
-            .inner
-            .lock()
-            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
-        Ok(g.contains(operator_id))
+        let _ = py;
+        Ok(self.inner.lock().contains(operator_id))
     }
 
     fn __contains__(&self, py: Python<'_>, operator_id: u64) -> PyResult<bool> {
@@ -1726,19 +1717,13 @@ impl PyOperatorRegistry {
     }
 
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
-        let g = self
-            .inner
-            .lock()
-            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
-        Ok(g.len())
+        let _ = py;
+        Ok(self.inner.lock().len())
     }
 
     fn is_empty(&self, py: Python<'_>) -> PyResult<bool> {
-        let g = self
-            .inner
-            .lock()
-            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
-        Ok(g.is_empty())
+        let _ = py;
+        Ok(self.inner.lock().is_empty())
     }
 
     /// Verify a single `OperatorSignature` dict over `payload`.
@@ -1752,11 +1737,9 @@ impl PyOperatorRegistry {
         payload: &[u8],
     ) -> PyResult<()> {
         let sig = operator_signature_from_dict(py, signature)?;
-        let g = self
-            .inner
+        self.inner
             .lock()
-            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
-        g.verify(&sig, payload)
+            .verify(&sig, payload)
             .map_err(|e| verify_error_to_py(py, e))
     }
 
@@ -1776,20 +1759,17 @@ impl PyOperatorRegistry {
         for d in signatures {
             sigs.push(operator_signature_from_dict(py, &d)?);
         }
-        let g = self
-            .inner
+        self.inner
             .lock()
-            .map_err(|_| deck_err(py, "registry_poisoned", "operator registry mutex poisoned"))?;
-        g.verify_bundle(&sigs, payload, threshold)
+            .verify_bundle(&sigs, payload, threshold)
             .map_err(|e| verify_error_to_py(py, e))
     }
 
     fn __repr__(&self) -> PyResult<String> {
-        let g = self
-            .inner
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("registry mutex poisoned"))?;
-        Ok(format!("OperatorRegistry(operators={})", g.len()))
+        Ok(format!(
+            "OperatorRegistry(operators={})",
+            self.inner.lock().len()
+        ))
     }
 }
 

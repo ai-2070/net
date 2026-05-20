@@ -76,8 +76,8 @@
 //! +--------------------------------+
 //! ```
 
+use parking_lot::Mutex;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -378,11 +378,11 @@ impl NatPmpMapper {
     /// Used by install + renew to fill in the `external` field
     /// on the returned `PortMapping`.
     fn cached_external(&self) -> Option<Ipv4Addr> {
-        *self.cached_external.lock().expect("mutex poisoned")
+        *self.cached_external.lock()
     }
 
     fn set_cached_external(&self, ip: Ipv4Addr) {
-        *self.cached_external.lock().expect("mutex poisoned") = Some(ip);
+        *self.cached_external.lock() = Some(ip);
     }
 
     /// Send a request to the gateway and wait for a response,

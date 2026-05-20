@@ -4,6 +4,40 @@
 //! - sendmmsg/recvmmsg for batched I/O
 //! - io_uring support (optional)
 //! - Socket configuration for high-throughput
+//!
+//! # Safety
+//!
+//! This module is a thin wrapper over libc syscalls (sendmmsg,
+//! recvmmsg, setsockopt) and POSIX socket-message primitives
+//! (mmsghdr, msghdr, sockaddr_in / sockaddr_in6). Every `unsafe`
+//! block in this file falls into one of two contracts:
+//!
+//! 1. `std::mem::zeroed::<T>()` for a libc message-header POD
+//!    (`mmsghdr`, `msghdr`, `sockaddr_in`, …). These structs are
+//!    plain-data and all-zero is a valid bit pattern; the
+//!    individual fields are populated by the caller before the
+//!    syscall consumes them. Matches the standard libc idiom used
+//!    by `nix`, `socket2`, and tokio's UDP wrappers.
+//!
+//! 2. `libc::{sendmmsg, recvmmsg, setsockopt}` calls with a
+//!    caller-owned `RawFd`, message-vector pointer + length pair,
+//!    and option pointer + length pair. The fd is borrowed from
+//!    the owning `UdpSocket`; message pointers point to vectors
+//!    whose lifetime outlives the call; lengths are exact element
+//!    counts; option pointers point at stack-allocated `i32`s
+//!    paired with `size_of::<i32>()`.
+//!
+//! Per-block `// SAFETY:` comments would repeat one of those two
+//! contracts ~15 times. The module-level `#![expect]` below
+//! covers both while keeping the lint enforced everywhere else.
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "module-wide libc-syscall + POD-zero-init contract documented in the # Safety section above"
+)]
+#![expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "Linux syscall wrappers compose pointer arithmetic + libc calls in single semantic operations (one batched sendmmsg / recvmmsg / configure_socket call)"
+)]
 
 use bytes::{Bytes, BytesMut};
 use std::io;
@@ -589,5 +623,127 @@ mod tests {
         // 0-count is the explicit no-op path before the guard.
         let zero = recv_transport.recv_batch(0).unwrap();
         assert!(zero.is_empty());
+    }
+
+    /// Empty-input fast path for `send_batch` (linux.rs:145-147).
+    /// Returns `Ok(0)` without touching the kernel; coverage saw
+    /// this branch as untested.
+    #[test]
+    fn send_batch_with_empty_input_returns_ok_zero() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut transport = BatchedTransport::new_send_only(socket.as_raw_fd());
+        // Any target — the empty-input check returns before the
+        // SocketAddr discriminant is read.
+        let target: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let sent = transport.send_batch(&[], target).unwrap();
+        assert_eq!(sent, 0, "empty input must short-circuit to Ok(0)");
+    }
+
+    /// IPv6 rejection (linux.rs:159-162). Pre-fix the IPv6 branch
+    /// silently treated the address as IPv4 + got EINVAL deep in
+    /// sendmmsg; the explicit `ErrorKind::Unsupported` surfaces
+    /// the missing-feature contract at the API boundary.
+    #[test]
+    fn send_batch_rejects_ipv6_target_with_unsupported_kind() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut transport = BatchedTransport::new_send_only(socket.as_raw_fd());
+        let target: SocketAddr = "[::1]:9999".parse().unwrap();
+        let packets = vec![Bytes::from_static(b"x")];
+        let err = transport
+            .send_batch(&packets, target)
+            .expect_err("IPv6 target must surface Unsupported");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// Chunking path in `send_batch` (linux.rs:166-189). With more
+    /// than `MAX_BATCH_SIZE` packets the helper splits the input
+    /// into `MAX_BATCH_SIZE`-element chunks and sums the sent
+    /// counts; pre-fix it silently truncated to the first 64.
+    /// Sending 65 packets must report sending all 65 — or, if the
+    /// kernel back-pressures, a count > 64 so the chunked second
+    /// pass is observable.
+    #[test]
+    fn send_batch_chunks_inputs_larger_than_max_batch_size() {
+        let socket1 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket2 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket1.set_nonblocking(true).unwrap();
+        socket2.set_nonblocking(true).unwrap();
+        let addr1 = socket1.local_addr().unwrap();
+
+        let mut transport2 = BatchedTransport::new_send_only(socket2.as_raw_fd());
+
+        // 65 packets = 1 + MAX_BATCH_SIZE → forces a second chunk
+        // through `send_batch_chunk`.
+        let total = MAX_BATCH_SIZE + 1;
+        let packets: Vec<Bytes> = (0..total)
+            .map(|i| Bytes::copy_from_slice(format!("chunk-{i:03}").as_bytes()))
+            .collect();
+        let sent = transport2
+            .send_batch(&packets, addr1)
+            .expect("chunked send_batch");
+        // Loopback can back-pressure on bursts; we don't assert
+        // exact equality with `total`, only that the chunked path
+        // delivered MORE than `MAX_BATCH_SIZE` — which is only
+        // possible if the second chunk ran.
+        assert!(
+            sent > MAX_BATCH_SIZE,
+            "send_batch with {total} packets reported only {sent}; \
+             chunking past MAX_BATCH_SIZE = {MAX_BATCH_SIZE} did not run"
+        );
+    }
+
+    /// `recv_batch_blocking` happy path (linux.rs:370-440). The
+    /// non-blocking `recv_batch` is exercised in
+    /// `test_send_recv_batch`; the blocking variant has its own
+    /// recvmmsg call (flags = 0 instead of MSG_DONTWAIT) and was
+    /// completely uncovered. Send a packet, then poll the
+    /// blocking recv with a small timeout via std-side
+    /// `set_read_timeout` so the test can't hang.
+    #[test]
+    fn recv_batch_blocking_delivers_loopback_packets() {
+        let recv_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let send_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+
+        // Hard-bound the blocking recvmmsg so a regression where
+        // it actually blocks forever surfaces as a test failure,
+        // not a hung CI job.
+        recv_sock
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+
+        let mut transport = BatchedTransport::new(recv_sock.as_raw_fd());
+
+        // Send three packets via the std socket first so the
+        // kernel buffer is already populated when recv_batch_blocking
+        // wakes up — keeps the test deterministic on loaded
+        // runners.
+        for i in 0u8..3 {
+            send_sock
+                .send_to(&[0xCC, i, 0xDD], recv_addr)
+                .expect("send loopback");
+        }
+
+        let received = transport
+            .recv_batch_blocking(8)
+            .expect("recv_batch_blocking");
+        // We expect 3 but accept anything >0 — recvmmsg may
+        // return packets in multiple syscalls under loopback
+        // and we only assert the path ran at least once.
+        assert!(
+            !received.is_empty(),
+            "recv_batch_blocking returned 0 packets after 3 loopback sends"
+        );
+    }
+
+    /// `enable_timestamps` (linux.rs:514-529). Setsockopt with
+    /// SO_TIMESTAMPNS on a fresh loopback UDP socket; should
+    /// succeed on any kernel >= 2.6.30 (i.e., every Linux runner
+    /// CI uses). The body is short but was 100% uncovered.
+    #[test]
+    fn enable_timestamps_succeeds_on_fresh_socket() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        enable_timestamps(socket.as_raw_fd())
+            .expect("SO_TIMESTAMPNS must accept on a fresh DGRAM socket");
     }
 }

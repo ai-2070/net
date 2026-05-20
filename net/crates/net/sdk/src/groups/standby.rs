@@ -26,7 +26,8 @@
 //! auto-hook into `DaemonRuntime::deliver`. See the plan doc's
 //! "Open questions" section for the rationale.
 
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use ::net::adapter::net::compute::DaemonHostConfig;
 use ::net::adapter::net::compute::{
@@ -92,9 +93,8 @@ fn make_buffer_observer(inner: &Arc<Mutex<CoreStandbyGroup>>) -> crate::compute:
     let weak = Arc::downgrade(inner);
     Arc::new(move |event: &CausalEvent| {
         if let Some(core) = weak.upgrade() {
-            if let Ok(mut guard) = core.lock() {
-                guard.on_event_delivered(event.clone());
-            }
+            let mut guard = core.lock();
+            guard.on_event_delivered(event.clone());
         }
     })
 }
@@ -124,10 +124,7 @@ impl StandbyGroup {
         // so every `DaemonRuntime::deliver` to the active
         // automatically feeds the buffer — no caller-side pairing
         // required.
-        let active_origin = inner
-            .lock()
-            .expect("StandbyGroup mutex poisoned")
-            .active_origin();
+        let active_origin = inner.lock().active_origin();
         let observer = make_buffer_observer(&inner);
         let handle = runtime.register_deliver_observer(active_origin, observer);
 
@@ -146,10 +143,7 @@ impl StandbyGroup {
         let new_handle = self.runtime.register_deliver_observer(new_origin, observer);
         // Swap in the new handle; the old one's `Drop` unregisters
         // its entry from the runtime's observer map.
-        let mut slot = self
-            .observer_handle
-            .lock()
-            .expect("StandbyGroup observer-handle mutex poisoned");
+        let mut slot = self.observer_handle.lock();
         *slot = Some(new_handle);
     }
 
@@ -161,10 +155,7 @@ impl StandbyGroup {
     /// `origin_hash` of the current active member. Events always
     /// go through the active; standbys don't process inputs.
     pub fn active_origin(&self) -> u64 {
-        self.inner
-            .lock()
-            .expect("StandbyGroup mutex poisoned")
-            .active_origin()
+        self.inner.lock().active_origin()
     }
 
     /// **Test-only.** Manually push an event into the replay
@@ -177,17 +168,14 @@ impl StandbyGroup {
     /// runtime, but it's not part of the stable public API.
     #[doc(hidden)]
     pub fn on_event_delivered(&self, event: CausalEvent) {
-        self.inner
-            .lock()
-            .expect("StandbyGroup mutex poisoned")
-            .on_event_delivered(event);
+        self.inner.lock().on_event_delivered(event);
     }
 
     /// Snapshot the active and push to every standby. Returns the
     /// sequence number through which the sync caught up.
     pub fn sync_standbys(&self) -> Result<u64, GroupError> {
         let registry = self.runtime.registry_arc();
-        let mut guard = self.inner.lock().expect("StandbyGroup mutex poisoned");
+        let mut guard = self.inner.lock();
         Ok(guard.sync_standbys(&registry)?)
     }
 
@@ -205,7 +193,7 @@ impl StandbyGroup {
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
         let new_origin = {
-            let mut guard = self.inner.lock().expect("StandbyGroup mutex poisoned");
+            let mut guard = self.inner.lock();
             guard.promote(move || (factory)(), &registry, &scheduler)?
         };
         // Re-point the post-delivery observer at the new active so
@@ -227,7 +215,7 @@ impl StandbyGroup {
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
         let result = {
-            let mut guard = self.inner.lock().expect("StandbyGroup mutex poisoned");
+            let mut guard = self.inner.lock();
             guard.on_node_failure(failed_node_id, move || (factory)(), &scheduler, &registry)?
         };
         // If the active was the one that failed, the core returns
@@ -241,85 +229,54 @@ impl StandbyGroup {
 
     pub fn on_node_recovery(&self, recovered_node_id: u64) {
         let registry = self.runtime.registry_arc();
-        let mut guard = self.inner.lock().expect("StandbyGroup mutex poisoned");
+        let mut guard = self.inner.lock();
         guard.on_node_recovery(recovered_node_id, &registry);
     }
 
     pub fn health(&self) -> GroupHealth {
-        self.inner
-            .lock()
-            .expect("StandbyGroup mutex poisoned")
-            .health()
+        self.inner.lock().health()
     }
 
     pub fn active_healthy(&self) -> bool {
-        self.inner
-            .lock()
-            .expect("StandbyGroup mutex poisoned")
-            .active_healthy()
+        self.inner.lock().active_healthy()
     }
 
     pub fn active_index(&self) -> u8 {
-        self.inner
-            .lock()
-            .expect("StandbyGroup mutex poisoned")
-            .active_index()
+        self.inner.lock().active_index()
     }
 
     pub fn member_role(&self, index: u8) -> Option<MemberRole> {
-        self.inner
-            .lock()
-            .expect("StandbyGroup mutex poisoned")
-            .member_role(index)
+        self.inner.lock().member_role(index)
     }
 
     pub fn synced_through(&self, index: u8) -> Option<u64> {
-        self.inner
-            .lock()
-            .expect("StandbyGroup mutex poisoned")
-            .synced_through(index)
+        self.inner.lock().synced_through(index)
     }
 
     pub fn buffered_event_count(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("StandbyGroup mutex poisoned")
-            .buffered_event_count()
+        self.inner.lock().buffered_event_count()
     }
 
     pub fn group_id(&self) -> u32 {
-        self.inner
-            .lock()
-            .expect("StandbyGroup mutex poisoned")
-            .group_id()
+        self.inner.lock().group_id()
     }
 
     pub fn members(&self) -> Vec<MemberInfo> {
-        self.inner
-            .lock()
-            .expect("StandbyGroup mutex poisoned")
-            .members()
-            .to_vec()
+        self.inner.lock().members().to_vec()
     }
 
     pub fn member_count(&self) -> u8 {
-        self.inner
-            .lock()
-            .expect("StandbyGroup mutex poisoned")
-            .member_count()
+        self.inner.lock().member_count()
     }
 
     pub fn standby_count(&self) -> u8 {
-        self.inner
-            .lock()
-            .expect("StandbyGroup mutex poisoned")
-            .standby_count()
+        self.inner.lock().standby_count()
     }
 }
 
 impl std::fmt::Debug for StandbyGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let guard = self.inner.lock().expect("StandbyGroup mutex poisoned");
+        let guard = self.inner.lock();
         f.debug_struct("StandbyGroup")
             .field("group_id", &format_args!("{:#x}", guard.group_id()))
             .field("active_index", &guard.active_index())

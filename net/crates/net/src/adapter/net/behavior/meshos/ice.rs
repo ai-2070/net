@@ -255,6 +255,10 @@ pub const SIMULATION_REQUIRED_SENTINEL: BlastRadiusHash = [0u8; BLAST_RADIUS_HAS
 /// [`SIMULATION_REQUIRED_SENTINEL`] only for the unreachable
 /// case of a postcard encoding failure (the enums are
 /// composed of types whose encoding is infallible).
+#[expect(
+    clippy::expect_used,
+    reason = "BlastRadius is composed of types whose postcard encoding is infallible (see module docs)"
+)]
 pub fn blast_radius_hash(blast: &BlastRadius) -> BlastRadiusHash {
     let bytes =
         postcard::to_allocvec(blast).expect("postcard encoding of BlastRadius is infallible");
@@ -274,6 +278,10 @@ pub fn blast_radius_hash(blast: &BlastRadius) -> BlastRadiusHash {
 /// follow-up slices) reproduces this exact byte sequence — the
 /// substrate verifier rebuilds it locally on every
 /// [`super::event::MeshOsEvent::SignedIceCommit`].
+#[expect(
+    clippy::expect_used,
+    reason = "IceActionProposal is composed of types whose postcard encoding is infallible"
+)]
 pub fn ice_proposal_signing_payload(
     proposal: &IceActionProposal,
     issued_at_ms: u64,
@@ -296,6 +304,10 @@ pub fn ice_proposal_signing_payload(
 /// [`ADMIN_SIGNING_DOMAIN`] and the postcard encoding of the
 /// inner [`AdminEvent`]. The distinct domain tag is what stops
 /// an ICE signature from cross-validating as an admin commit.
+#[expect(
+    clippy::expect_used,
+    reason = "AdminEvent is composed of types whose postcard encoding is infallible"
+)]
 pub fn admin_event_signing_payload(event: &AdminEvent, issued_at_ms: u64) -> Vec<u8> {
     let inner =
         postcard::to_allocvec(event).expect("postcard encoding of AdminEvent is infallible");
@@ -779,7 +791,7 @@ pub struct AdminVerifier {
     freshness_window: Duration,
     future_skew: Duration,
     ice_cooldown: Duration,
-    ice_state: std::sync::Arc<std::sync::Mutex<IceCooldownState>>,
+    ice_state: std::sync::Arc<parking_lot::Mutex<IceCooldownState>>,
 }
 
 impl AdminVerifier {
@@ -835,7 +847,7 @@ impl AdminVerifier {
             freshness_window,
             future_skew,
             ice_cooldown,
-            ice_state: std::sync::Arc::new(std::sync::Mutex::new(IceCooldownState::default())),
+            ice_state: std::sync::Arc::new(parking_lot::Mutex::new(IceCooldownState::default())),
         }
     }
 
@@ -908,15 +920,12 @@ impl AdminVerifier {
         targets: &CooldownTargets,
         now_ms: u64,
     ) -> Result<(), VerifyError> {
-        // Lock failures here mean a previous holder panicked
-        // mid-update — treat poison as "no active cooldown" so
-        // the verifier doesn't wedge after a panic; the
-        // recover-from-poison branch overwrites with fresh
-        // state on the next successful commit.
-        let state = match self.ice_state.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        // parking_lot::Mutex has no poison concept, so the prior
+        // Ok/Err(poisoned) recovery dance collapses to a single
+        // `.lock()` here. The migration was deliberate — the
+        // previous std::sync::Mutex path was treating poison as a
+        // recoverable signal already, so behavior is unchanged.
+        let state = self.ice_state.lock();
         match targets {
             CooldownTargets::ClusterWide => {
                 if let Some(expires_at_ms) = state.cluster_wide_until_ms {
@@ -948,10 +957,7 @@ impl AdminVerifier {
 
     fn record_ice_cooldown(&self, targets: &CooldownTargets, now_ms: u64) {
         let expires_at_ms = now_ms.saturating_add(self.ice_cooldown.as_millis() as u64);
-        let mut state = match self.ice_state.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut state = self.ice_state.lock();
         match targets {
             CooldownTargets::ClusterWide => {
                 state.cluster_wide_until_ms = Some(expires_at_ms);

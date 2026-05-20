@@ -106,6 +106,7 @@ deck = ["meshos", "net/meshos", "net-sdk/deck"]
 net = { package = "net-mesh", version = "0.20.1", path = "../..", default-features = false }
 net-sdk = { package = "net-mesh-sdk", version = "0.20.1", path = "../../sdk", default-features = false, optional = true }
 dashmap = { version = "6", optional = true }
+parking_lot = "0.12"
 pyo3 = { version = "0.28.0", features = ["extension-module"] }
 # Zeroizing wrapper for transient operator-seed copies in the
 # DeckClient / OperatorIdentity standalone constructors.

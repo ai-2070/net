@@ -79,6 +79,10 @@ impl SubprotocolManifest {
     /// Serialize to bytes.
     ///
     /// Wire format: `[count: u16][entries: count * 6 bytes]`
+    #[expect(
+        clippy::expect_used,
+        reason = "subprotocol count is bounded well below u16::MAX (65535) by the subprotocol registry; an overrun is an upstream invariant violation"
+    )]
     pub fn to_bytes(&self) -> Vec<u8> {
         let count = u16::try_from(self.entries.len()).expect("too many subprotocols");
         let mut buf = Vec::with_capacity(2 + self.entries.len() * MANIFEST_ENTRY_SIZE);

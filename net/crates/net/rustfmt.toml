@@ -1,0 +1,13 @@
+# Pin the formatting convention the codebase already follows so
+# `cargo fmt --all -- --check` in CI catches drift. Values shown
+# are stable rustfmt defaults — listed explicitly to document
+# intent rather than to override behavior. Adding any unstable
+# option here would silently no-op on stable rustfmt and quietly
+# diverge from intent; keep this file stable-only.
+
+edition = "2021"
+max_width = 100
+tab_spaces = 4
+hard_tabs = false
+newline_style = "Unix"
+use_small_heuristics = "Default"

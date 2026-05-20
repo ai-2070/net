@@ -75,6 +75,10 @@ impl DaemonBindings {
     ///   [token_len:        2 bytes (u16 le)]  (if token_flag == 1)
     ///   [token:            token_len bytes]   (if token_flag == 1)
     /// ```
+    #[expect(
+        clippy::expect_used,
+        reason = "subscription count is bounded well below u32::MAX in practice; channel names are validated to MAX_NAME_LEN = 255 < u16::MAX; token byte lengths are caller-controlled but the caller-bug branch is documented"
+    )]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         let count = u32::try_from(self.subscriptions.len())

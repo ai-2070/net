@@ -10,6 +10,10 @@
 //! explicit at the type level; the module-wide contract callers
 //! must uphold is:
 //! - Pointers are valid and properly aligned
+//! - Opaque handle pointers (`*mut T`) were produced by this crate's
+//!   matching constructor (`Box::into_raw` inside the FFI surface).
+//!   Foreign-allocated pointers, even if valid and aligned, will UB
+//!   when consumed by `Box::from_raw` in the corresponding `_free`.
 //! - String pointers point to valid UTF-8 data
 //! - Buffer sizes are accurate
 //! - Handles are not used after `net_shutdown`
@@ -26,6 +30,20 @@
 //! across threads.
 //!
 #![allow(clippy::missing_safety_doc)]
+// The cross-cutting C-side safety contract for every `unsafe` block in
+// this module is documented in the `# Safety` section above:
+// caller-validated pointer / length / lifetime / handle-not-after-shutdown
+// invariants documented in `include/net.h`. Inlining `// SAFETY:` on each
+// block would add ~200 identical "see module preamble" comments without
+// adding any signal beyond what the preamble already says.
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "module-wide FFI safety contract documented in the # Safety preamble above"
+)]
+#![expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "FFI entry points routinely deref + write to multiple out-parameter fields under the same caller contract; splitting per-op would obscure the single boundary-cross"
+)]
 
 //! # Tokio runtime restriction
 //!

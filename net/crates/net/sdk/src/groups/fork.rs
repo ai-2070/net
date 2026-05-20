@@ -5,7 +5,8 @@
 //! verifiable `ForkRecord` that documents lineage back to the
 //! parent.
 
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use ::net::adapter::net::behavior::loadbalance::Strategy;
 use ::net::adapter::net::compute::DaemonHostConfig;
@@ -93,11 +94,7 @@ impl ForkGroup {
     }
 
     pub fn route_event(&self, ctx: &RequestContext) -> Result<u64, GroupError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("ForkGroup mutex poisoned")
-            .route_event(ctx)?)
+        Ok(self.inner.lock().route_event(ctx)?)
     }
 
     pub fn scale_to(&self, n: u8) -> Result<(), GroupError> {
@@ -107,7 +104,7 @@ impl ForkGroup {
             .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
-        let mut guard = self.inner.lock().expect("ForkGroup mutex poisoned");
+        let mut guard = self.inner.lock();
         guard.scale_to(n, move || (factory)(), &scheduler, &registry)?;
         Ok(())
     }
@@ -119,35 +116,26 @@ impl ForkGroup {
             .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
-        let mut guard = self.inner.lock().expect("ForkGroup mutex poisoned");
+        let mut guard = self.inner.lock();
         Ok(guard.on_node_failure(failed_node_id, move || (factory)(), &scheduler, &registry)?)
     }
 
     pub fn on_node_recovery(&self, recovered_node_id: u64) {
         let registry = self.runtime.registry_arc();
-        let mut guard = self.inner.lock().expect("ForkGroup mutex poisoned");
+        let mut guard = self.inner.lock();
         guard.on_node_recovery(recovered_node_id, &registry);
     }
 
     pub fn health(&self) -> GroupHealth {
-        self.inner
-            .lock()
-            .expect("ForkGroup mutex poisoned")
-            .health()
+        self.inner.lock().health()
     }
 
     pub fn parent_origin(&self) -> u64 {
-        self.inner
-            .lock()
-            .expect("ForkGroup mutex poisoned")
-            .parent_origin()
+        self.inner.lock().parent_origin()
     }
 
     pub fn fork_seq(&self) -> u64 {
-        self.inner
-            .lock()
-            .expect("ForkGroup mutex poisoned")
-            .fork_seq()
+        self.inner.lock().fork_seq()
     }
 
     /// Owned clones of the lineage records for every fork. Cloned
@@ -155,7 +143,6 @@ impl ForkGroup {
     pub fn fork_records(&self) -> Vec<ForkRecord> {
         self.inner
             .lock()
-            .expect("ForkGroup mutex poisoned")
             .fork_records()
             .iter()
             .map(|r| (*r).clone())
@@ -165,38 +152,25 @@ impl ForkGroup {
     /// `true` iff every fork's `ForkRecord` verifies against its
     /// parent. Core performs the signature + sentinel checks.
     pub fn verify_lineage(&self) -> bool {
-        self.inner
-            .lock()
-            .expect("ForkGroup mutex poisoned")
-            .verify_lineage()
+        self.inner.lock().verify_lineage()
     }
 
     pub fn members(&self) -> Vec<MemberInfo> {
-        self.inner
-            .lock()
-            .expect("ForkGroup mutex poisoned")
-            .members()
-            .to_vec()
+        self.inner.lock().members().to_vec()
     }
 
     pub fn fork_count(&self) -> u8 {
-        self.inner
-            .lock()
-            .expect("ForkGroup mutex poisoned")
-            .fork_count()
+        self.inner.lock().fork_count()
     }
 
     pub fn healthy_count(&self) -> u8 {
-        self.inner
-            .lock()
-            .expect("ForkGroup mutex poisoned")
-            .healthy_count()
+        self.inner.lock().healthy_count()
     }
 }
 
 impl std::fmt::Debug for ForkGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let guard = self.inner.lock().expect("ForkGroup mutex poisoned");
+        let guard = self.inner.lock();
         f.debug_struct("ForkGroup")
             .field(
                 "parent_origin",

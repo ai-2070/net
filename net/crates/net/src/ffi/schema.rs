@@ -37,6 +37,17 @@
 //! `metadata_oversize` warning fires off the
 //! `METADATA_SOFT_CAP_BYTES` constant (4 KB) — bindings that want
 //! a tighter cap promote warnings to errors at their layer.
+//!
+//! # Safety
+//!
+//! Every entry point is `unsafe extern "C"` and inherits the
+//! module-wide FFI safety contract (see `ffi/mod.rs` and
+//! `include/net.h`).
+#![allow(clippy::missing_safety_doc)]
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "module-wide FFI safety contract documented in the # Safety preamble above"
+)]
 
 use std::ffi::c_char;
 use std::os::raw::c_int;

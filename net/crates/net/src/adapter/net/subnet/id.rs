@@ -40,6 +40,10 @@ impl SubnetId {
     /// # Panics
     /// Panics if more than 4 levels are provided. For untrusted
     /// input (config / FFI / JSON) prefer [`Self::try_new`].
+    #[expect(
+        clippy::expect_used,
+        reason = "documented panicking variant; try_new is the fallible alternative for untrusted input"
+    )]
     pub fn new(levels: &[u8]) -> Self {
         Self::try_new(levels).expect("SubnetId::new: too many levels (use try_new for fallible)")
     }

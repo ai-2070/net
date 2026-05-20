@@ -10,6 +10,10 @@
 //! counts) line up with the call shape.
 
 #![cfg(all(feature = "net", feature = "cortex"))]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code legitimately uses std::sync::Mutex for SUT setup; no real poison concern"
+)]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

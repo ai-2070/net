@@ -45,11 +45,11 @@ mod redis_dedup;
 #[cfg(feature = "net")]
 mod subnets;
 
+use parking_lot::RwLock;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::sync::Arc;
-use std::sync::RwLock;
 use tokio::runtime::Runtime;
 
 use net::{
@@ -598,10 +598,7 @@ impl Net {
     /// Returns:
     ///     IngestResult with shard_id and timestamp
     fn ingest_raw(&self, json: &str) -> PyResult<IngestResult> {
-        let bus_guard = self
-            .bus
-            .read()
-            .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?;
+        let bus_guard = self.bus.read();
         let bus = bus_guard
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))?;
@@ -641,10 +638,7 @@ impl Net {
     /// Returns:
     ///     Number of successfully ingested events
     fn ingest_raw_batch(&self, events: Vec<String>) -> PyResult<usize> {
-        let bus_guard = self
-            .bus
-            .read()
-            .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?;
+        let bus_guard = self.bus.read();
         let bus = bus_guard
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))?;
@@ -673,10 +667,7 @@ impl Net {
         filter: Option<&str>,
         ordering: Option<&str>,
     ) -> PyResult<PollResponse> {
-        let bus_guard = self
-            .bus
-            .read()
-            .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?;
+        let bus_guard = self.bus.read();
         let bus = bus_guard
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))?;
@@ -735,10 +726,7 @@ impl Net {
 
     /// Get the number of active shards.
     fn num_shards(&self) -> PyResult<u16> {
-        let bus_guard = self
-            .bus
-            .read()
-            .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?;
+        let bus_guard = self.bus.read();
         let bus = bus_guard
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))?;
@@ -748,10 +736,7 @@ impl Net {
 
     /// Get ingestion statistics.
     fn stats(&self) -> PyResult<Stats> {
-        let bus_guard = self
-            .bus
-            .read()
-            .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?;
+        let bus_guard = self.bus.read();
         let bus = bus_guard
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))?;
@@ -769,10 +754,7 @@ impl Net {
 
     /// Gracefully shutdown the event bus.
     fn shutdown(&self) -> PyResult<()> {
-        let mut bus_guard = self
-            .bus
-            .write()
-            .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?;
+        let mut bus_guard = self.bus.write();
         if let Some(bus) = bus_guard.take() {
             self.runtime
                 .block_on(bus.shutdown())
@@ -782,8 +764,7 @@ impl Net {
     }
 
     fn __repr__(&self) -> String {
-        let bus_guard = self.bus.read().ok();
-        if bus_guard.map(|g| g.is_some()).unwrap_or(false) {
+        if self.bus.read().is_some() {
             "Net(active)".to_string()
         } else {
             "Net(shutdown)".to_string()

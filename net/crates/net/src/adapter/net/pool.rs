@@ -501,6 +501,10 @@ pub struct PooledBuilder<'a> {
     builder: Option<PacketBuilder>,
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "self.builder is Some between construction and Drop::drop; calling these methods after drop is a caller-side use-after-free invariant violation, not a recoverable runtime condition"
+)]
 impl<'a> PooledBuilder<'a> {
     /// Build a packet from events
     #[inline]
@@ -845,6 +849,10 @@ pub struct ThreadLocalPooledBuilder<'a> {
     builder: Option<PacketBuilder>,
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "self.builder is Some between construction and Drop::drop; calling these methods after drop is a caller-side use-after-free invariant violation, not a recoverable runtime condition"
+)]
 impl<'a> ThreadLocalPooledBuilder<'a> {
     /// Build a packet from events
     #[inline]
@@ -969,6 +977,10 @@ impl ThreadLocalPool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "test code legitimately uses std::sync::{Mutex,RwLock} for SUT setup; tests have no real poison concern"
+    )]
     use super::*;
 
     #[test]
