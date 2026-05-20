@@ -1,0 +1,65 @@
+net/crates/net/src/adapter/redis_dedup.rs
+  s_e9432586a99852::t_39d956dbc69781 249-252
+net/crates/net/src/ffi/blob.rs
+  s_e9432586a99852::t_39d956dbc69781 1301-1304
+net/crates/net/tests/loom_models.rs
+  s_e9432586a99852::t_0e0e09162cf1af 42-45
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  s_e9432586a99852::t_39d956dbc69781 11
+net/crates/net/tests/three_node_integration.rs
+  s_e9432586a99852::t_6a3a4b6884d196 15-18
+net/crates/net/src/adapter/net/behavior/meshdb/cache.rs
+  s_e9432586a99852::t_39d956dbc69781 55
+net/crates/net/src/bin/net-blob.rs
+  s_e9432586a99852::t_560d359445204b 909-912
+  s_e9432586a99852::t_32e14bf004f291 1027-1030
+  s_e9432586a99852::t_4dd7fad5c9599f 1168-1171
+net/crates/net/src/adapter/net/dataforts/gravity/counter.rs
+  s_e9432586a99852::t_39d956dbc69781 591-594
+net/crates/net/src/shard/mapper.rs
+  s_e9432586a99852::t_39d956dbc69781 1318-1321
+net/crates/net/tests/meshdb_subprotocol_wire.rs
+  s_e9432586a99852::t_c671be45b87e98 14-17
+net/crates/net/src/consumer/merge.rs
+  s_e9432586a99852::t_39d956dbc69781 958-961
+.github/workflows/ci.yml
+  s_e9432586a99852::t_dcde5f3b63188c 688-695
+  s_e9432586a99852::t_63e5b2ebc4bd77 676-687,696
+net/crates/net/src/adapter/net/behavior/meshdb/executor.rs
+  s_e9432586a99852::t_39d956dbc69781 1146-1149
+net/crates/net/src/adapter/net/behavior/meshdb/transport.rs
+  s_e9432586a99852::t_39d956dbc69781 844-847
+net/crates/net/src/adapter/net/behavior/meshos/event_loop.rs
+  s_e9432586a99852::t_39d956dbc69781 1613-1616
+net/crates/net/src/ffi/redis_dedup.rs
+  s_e9432586a99852::t_39d956dbc69781 61
+net/crates/net/Cargo.toml
+  s_e9432586a99852::t_0fa04325e73f35 34,36
+  s_e9432586a99852::t_094f9efe24e8a1 35,37-50
+net/crates/net/src/adapter/net/pool.rs
+  s_e9432586a99852::t_39d956dbc69781 980-983
+net/crates/net/src/adapter/net/behavior/safety.rs
+  s_e9432586a99852::t_39d956dbc69781 13
+net/crates/net/src/adapter/net/crypto.rs
+  s_e9432586a99852::t_39d956dbc69781 14
+net/crates/net/src/adapter/net/behavior/meshdb/federated.rs
+  s_e9432586a99852::t_39d956dbc69781 1237-1240
+net/crates/net/src/adapter/net/failure.rs
+  s_e9432586a99852::t_39d956dbc69781 580
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "0ad6f37c1ba95ed48f984b86b481c3146eb3b08e",
+  "prompts": {},
+  "sessions": {
+    "s_e9432586a99852": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fbeaee78-6362-47f1-a432-288d813cb99f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
