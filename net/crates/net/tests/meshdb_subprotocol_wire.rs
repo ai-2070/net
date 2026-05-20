@@ -179,7 +179,14 @@ async fn federated_latest_query_over_real_wire() {
     assert_eq!(rows[0].seq, SeqNum(7));
     assert_eq!(rows[0].payload, b"hello-wire");
 
-    // Server-side bookkeeping is clean after the call drained.
+    // Server-side bookkeeping clears asynchronously after the
+    // client-side stream drains — the per-call server task still
+    // needs to finalize and decrement the counter. Poll with a
+    // bounded deadline (mirrors the cancel-leak tests below).
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while server.inflight_calls() != 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(server.inflight_calls(), 0);
 
     // Both nodes have the router installed.
@@ -331,6 +338,12 @@ async fn federated_between_query_over_wire_streams_multiple_batches() {
     let seqs: Vec<u64> = rows.iter().map(|r| r.seq.0).collect();
     let expected: Vec<u64> = (1..=total).collect();
     assert_eq!(seqs, expected, "rows must stay in seq order across batches");
+    // Server-side bookkeeping clears asynchronously after the
+    // client-side stream drains — poll with a bounded deadline.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while server.inflight_calls() != 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(server.inflight_calls(), 0);
 }
 
