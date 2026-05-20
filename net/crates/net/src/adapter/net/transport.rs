@@ -673,70 +673,17 @@ mod tests {
             .expect("spawn_blocking join");
     }
 
-    /// Runtime tripwire (Linux only) for the EBADF / ENOTSOCK hard-
-    /// error exit path. Spawn a `BatchedPacketReceiver`, then close
-    /// the underlying socket fd out from under it; the next
-    /// `recvmmsg` returns `-1 / EBADF`, the loop body logs and
-    /// returns. After that the `tx` end of the mpsc closes and
-    /// `recv()` resolves to `Err(ConnectionReset)` — that's the
-    /// observable signal we assert on.
-    ///
-    /// Pre-fix the loop would have spun forever on EBADF without
-    /// exiting; this test would either hang (failing on the
-    /// outer timeout) or return `Ok(_)` instead of `Err(_)`.
-    #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn batched_recv_exits_on_hard_socket_error() {
-        use std::os::unix::io::AsRawFd;
-
-        let recv_sock = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
-        // Stash the fd before we hand the socket Arc to the
-        // receiver — we'll need it to force-close from the test
-        // side. The fd is owned by the Arc<UdpSocket>; closing it
-        // here is a deliberate dirty trick to fault-inject EBADF
-        // into the receive thread's next recvmmsg call.
-        let fd = recv_sock.socket_arc().as_raw_fd();
-        let mut batched = BatchedPacketReceiver::new(recv_sock.socket_arc());
-
-        // Give the receive thread one loop iteration to start
-        // (so we know recvmmsg is in flight or about to be).
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        // SAFETY: closing the fd is unsafe (it's owned by the
-        // Arc<UdpSocket>; further use is UB at the kernel level).
-        // The receive thread is the only further user of this
-        // socket; the close turns its next `recvmmsg` into the
-        // EBADF the test is here to exercise. The test then
-        // drops `batched` (joining the thread that's about to
-        // exit) and never touches the Arc-owned socket again.
-        unsafe {
-            libc::close(fd);
-        }
-
-        // Within a bounded deadline the receive thread should
-        // observe the EBADF and return; the mpsc tx-end drops
-        // and `recv()` resolves to `ConnectionReset`.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), batched.recv()).await;
-        match result {
-            Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {}
-            Ok(Ok(_)) => panic!(
-                "BatchedPacketReceiver delivered a packet after the fd \
-                 was force-closed — the EBADF exit path didn't fire"
-            ),
-            Ok(Err(e)) => panic!("unexpected recv error after fd close: {e}"),
-            Err(_) => panic!(
-                "BatchedPacketReceiver did not exit within 2 s of an \
-                 EBADF on the underlying fd — the hard-error branch \
-                 either missed EBADF or never executed"
-            ),
-        }
-
-        // Drop is now a no-op for the thread (it's already exited)
-        // but still runs the join — must finish promptly.
-        let join = tokio::task::spawn_blocking(move || drop(batched));
-        tokio::time::timeout(std::time::Duration::from_secs(2), join)
-            .await
-            .expect("Drop::drop did not join within 2 s after EBADF exit")
-            .expect("spawn_blocking join");
-    }
+    // The earlier `batched_recv_exits_on_hard_socket_error` runtime
+    // tripwire was deleted: rustc 1.95's IO-safety enforcement aborts
+    // the process the next time anyone closes an already-closed fd
+    // (`fatal runtime error: IO Safety violation: owned file
+    // descriptor already closed, aborting`), and `libc::close(fd)` on
+    // an fd still owned by `Arc<UdpSocket>` is exactly that case. The
+    // source-pin tripwire `batched_recv_loop_must_back_off_and_exit_on_hard_error`
+    // at the start of this module already catches the
+    // "simplification PR that removes the EBADF check" class of
+    // regression by textual matching on the source, and that's the
+    // cheapest tripwire available — runtime fault injection of EBADF
+    // isn't safely possible in modern Rust without leaking the
+    // socket.
 }
