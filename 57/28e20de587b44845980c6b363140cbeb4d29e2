@@ -1,0 +1,19 @@
+net/crates/net/tests/proxy_coverage_gaps.rs
+  s_e9432586a99852::t_ac691ccba52861 1-275
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "5728e20de587b44845980c6b363140cbeb4d29e2",
+  "prompts": {},
+  "sessions": {
+    "s_e9432586a99852": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fbeaee78-6362-47f1-a432-288d813cb99f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
