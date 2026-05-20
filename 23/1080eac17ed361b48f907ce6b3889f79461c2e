@@ -1,0 +1,127 @@
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_e9432586a99852::t_032dd6a0fbc2fd 235-236
+  s_e9432586a99852::t_80bd4c9080c652 254
+  s_e9432586a99852::t_672e9a240b9dd0 263
+  s_e9432586a99852::t_f4d499e5c28905 518,524,582,591,619,627,634,681,696,715,743,793,806,825,830,851,858,924,965,978,997,1014,1050,1058,1082,1197,1205,1245
+  s_e9432586a99852::t_b5946860240dc6 45-46
+net/crates/net/bindings/node/src/mesh_rpc.rs
+  s_e9432586a99852::t_15c277fe3f48d8 463,471
+  s_e9432586a99852::t_a56e6bbad81ce4 34,36
+  s_e9432586a99852::t_49be6c9bb9d7e2 122-127,130,132-133
+  s_e9432586a99852::t_9c1d4495b43222 1143
+net/crates/net/deck/src/main.rs
+  s_e9432586a99852::t_36b586315b28bf 127
+net/crates/net/bindings/python/src/deck.rs
+  s_e9432586a99852::t_e1dbe52e31051a 31-32
+  s_e9432586a99852::t_c32d22149a1a97 1669
+  s_e9432586a99852::t_7182fff82a2fdb 1740,1742
+  s_e9432586a99852::t_9cbf8be9b25094 1704-1705
+  s_e9432586a99852::t_86067f5c2eba2e 1696-1697
+  s_e9432586a99852::t_be73032f41bc03 1762,1764,1769-1772
+  s_e9432586a99852::t_2138b28495136f 1711-1712
+  s_e9432586a99852::t_4742f4a849f6ec 1720-1721,1725-1726
+net/crates/net/bindings/node/src/deck.rs
+  s_e9432586a99852::t_cf7f064d1b8b92 1557,1563,1572,1574-1575
+  s_e9432586a99852::t_21c81eabb12fdb 1506
+  s_e9432586a99852::t_6136dd61248e7d 1592,1594
+  s_e9432586a99852::t_9e929497e25df6 31-32
+  s_e9432586a99852::t_8a5f9dc407f411 1534
+  s_e9432586a99852::t_92c11c091aafb8 1542
+  s_e9432586a99852::t_d62ea805a185a8 1551
+net/crates/net/bindings/node/Cargo.toml
+  s_e9432586a99852::t_770f1301e67277 127
+net/crates/net/bindings/go/deck-ffi/Cargo.toml
+  s_e9432586a99852::t_144f985e6fd329 28
+net/crates/net/sdk/tests/rpc_observer.rs
+  s_e9432586a99852::t_ca0e91e0d012c7 13-16
+net/crates/net/bindings/go/meshdb-ffi/Cargo.toml
+  s_e9432586a99852::t_a9de96998a9ddb 30
+net/crates/net/bindings/go/meshdb-ffi/src/lib.rs
+  s_e9432586a99852::t_5d76101ad0987b 230,237
+net/crates/net/sdk/src/groups/standby.rs
+  s_e9432586a99852::t_c7913b5b53dac8 146
+  s_e9432586a99852::t_bd11e1d392b150 178,196,218,232,237,241,245,249,253,257,261,265,269,273,279
+  s_e9432586a99852::t_74911356b0188c 29-30
+  s_e9432586a99852::t_ac6d113f4b2bf8 96-97
+net/crates/net/bindings/node/src/meshdb.rs
+  s_e9432586a99852::t_a0938d961af5ff 1198,1205
+net/crates/net/bindings/python/Cargo.toml
+  s_e9432586a99852::t_419068e8a69329 109
+net/crates/net/sdk/src/compute.rs
+  s_e9432586a99852::t_37ba4890854d22 1355
+  s_e9432586a99852::t_9550077235d177 572-575
+  s_e9432586a99852::t_934f47226a31f0 1087
+  s_e9432586a99852::t_46a0f1dd427f18 623
+  s_e9432586a99852::t_577fde8a42176e 1707
+  s_e9432586a99852::t_09af4cce80642c 276-280
+  s_e9432586a99852::t_af1f3e5d03f0b5 1100-1103
+  s_e9432586a99852::t_84d37ddf6a55fb 363
+  s_e9432586a99852::t_f0d6f711cd1ba8 47,50
+  s_e9432586a99852::t_d588b3089eea11 1049
+  s_e9432586a99852::t_1da8faa323f050 421
+net/crates/net/bindings/go/meshos-ffi/Cargo.toml
+  s_e9432586a99852::t_654fbe8a6a1b88 29
+net/crates/net/sdk/Cargo.toml
+  s_e9432586a99852::t_adc449b810aac5 30
+net/crates/net/bindings/python/src/meshdb.rs
+  s_e9432586a99852::t_d5452d0b961e50 53-54
+  s_e9432586a99852::t_d8c3ebee024214 1324
+  s_e9432586a99852::t_7b159c4dd9e079 1277
+net/crates/net/bindings/go/deck-ffi/src/lib.rs
+  s_e9432586a99852::t_bded9ae2dc1bae 2725
+  s_e9432586a99852::t_e5ef2d8c7e2c63 2778
+  s_e9432586a99852::t_65ee4e67c10540 2647
+  s_e9432586a99852::t_a1d40dc8d28cd3 2662
+  s_e9432586a99852::t_850d5ecb32c54b 79
+  s_e9432586a99852::t_93be3d9151ff30 2584
+  s_e9432586a99852::t_f41429d3486947 2675
+  s_e9432586a99852::t_72de8a5f8459e9 2626
+net/crates/net/bindings/node/src/redis_dedup.rs
+  s_e9432586a99852::t_0d2cafddba0cfe 56
+  s_e9432586a99852::t_928eda88e59605 109,119,126
+  s_e9432586a99852::t_645a92f9a29fe0 102,135
+net/crates/net/bindings/go/meshos-ffi/src/lib.rs
+  s_e9432586a99852::t_72006902b2afb4 723,779,879,966,1006,1072,1113,1246,1274,1327,1568,1674
+  s_e9432586a99852::t_0f45123045b1e3 607-609,611
+  s_e9432586a99852::t_2edeab25792577 697
+net/crates/net/sdk/src/groups/replica.rs
+  s_e9432586a99852::t_eba2543ded5da4 121,137,154,166,172,177,184,189,194,200
+  s_e9432586a99852::t_dbb3903ff05e57 17-18
+net/crates/net/sdk/src/groups/fork.rs
+  s_e9432586a99852::t_5d3c7c96232e07 8-9
+  s_e9432586a99852::t_43eaa81a46cbdd 107,119,125,130,134,138,155,159,163,167,173
+net/crates/net/bindings/python/src/redis_dedup.rs
+  s_e9432586a99852::t_101c8a17888d07 82,118
+  s_e9432586a99852::t_1953616e7945dd 31
+  s_e9432586a99852::t_298e1d16dd6603 90,97,104,124
+net/crates/net/sdk/src/mesh_rpc_resilience.rs
+  s_e9432586a99852::t_0cbb2836206a57 25
+  s_e9432586a99852::t_618795220c8927 790
+  s_e9432586a99852::t_a414a9f9c0ddee 811
+  s_e9432586a99852::t_3162b3d978c3a6 821-824
+net/crates/net/deck/src/app.rs
+  s_e9432586a99852::t_8c5318d6af2ec1 310
+  s_e9432586a99852::t_fe06aceebfbc25 2772-2774
+  s_e9432586a99852::t_b8880d69fe57ab 564
+  s_e9432586a99852::t_5e18136df30a84 574
+net/crates/net/bindings/python/src/lib.rs
+  s_e9432586a99852::t_e1cc327a083e67 601,641,670,729,739
+  s_e9432586a99852::t_e986aa8fd18f99 757
+  s_e9432586a99852::t_2de4af79006465 767
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "231080eac17ed361b48f907ce6b3889f79461c2e",
+  "prompts": {},
+  "sessions": {
+    "s_e9432586a99852": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fbeaee78-6362-47f1-a432-288d813cb99f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
