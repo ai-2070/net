@@ -1812,4 +1812,151 @@ mod tests {
             );
         }
     }
+
+    // ---------- Span builder / lifecycle coverage ----------
+
+    #[test]
+    fn span_with_parent_and_kind_set_fields() {
+        let parent = SpanId::generate();
+        let span = Span::new(TraceId::generate(), "child", test_node_id())
+            .with_parent(parent)
+            .with_kind(SpanKind::Server);
+        assert_eq!(span.parent_span_id, Some(parent));
+        assert_eq!(span.kind, SpanKind::Server);
+    }
+
+    #[test]
+    fn span_set_ok_and_set_error_update_status() {
+        let mut span = Span::new(TraceId::generate(), "op", test_node_id());
+        span.set_ok();
+        assert!(matches!(span.status, SpanStatus::Ok));
+
+        span.set_error("boom");
+        match &span.status {
+            SpanStatus::Error { message } => assert_eq!(message, "boom"),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn span_add_event_with_attributes_and_add_link_populate_collections() {
+        let mut span = Span::new(TraceId::generate(), "op", test_node_id());
+
+        let mut attrs = HashMap::new();
+        attrs.insert("k".into(), AttributeValue::from("v"));
+        span.add_event_with_attributes("evt", attrs);
+        assert_eq!(span.events.len(), 1);
+        assert_eq!(span.events[0].name, "evt");
+        assert!(span.events[0].attributes.contains_key("k"));
+
+        let other_trace = TraceId::generate();
+        let other_span = SpanId::generate();
+        span.add_link(other_trace, other_span);
+        assert_eq!(span.links.len(), 1);
+        assert_eq!(span.links[0].trace_id, other_trace);
+        assert_eq!(span.links[0].span_id, other_span);
+    }
+
+    // ---------- ContextError Display ----------
+
+    #[test]
+    fn context_error_display_covers_every_variant() {
+        assert_eq!(format!("{}", ContextError::Expired), "context has expired");
+        assert_eq!(
+            format!("{}", ContextError::MaxHopsExceeded),
+            "maximum hops exceeded"
+        );
+        assert_eq!(format!("{}", ContextError::NotFound), "context not found");
+        assert_eq!(
+            format!("{}", ContextError::InvalidTraceId),
+            "invalid trace ID"
+        );
+        assert_eq!(
+            format!("{}", ContextError::CapacityExceeded),
+            "storage capacity exceeded"
+        );
+    }
+
+    // ---------- percent_encode / percent_decode ----------
+
+    #[test]
+    fn percent_codec_roundtrips_ascii_and_unicode_and_punctuation() {
+        for input in [
+            "",
+            "plain",
+            "with space",
+            "weird/chars?&=",
+            "trailing space ",
+            "key=value;meta=other",
+            // Unicode bytes get encoded byte-by-byte.
+            "café",
+        ] {
+            let encoded = percent_encode(input);
+            // Unreserved chars survive; everything else is %HH.
+            assert!(!encoded.contains(' '));
+            let decoded =
+                percent_decode(&encoded).unwrap_or_else(|| panic!("decode failed: {}", encoded));
+            assert_eq!(decoded, input, "roundtrip mismatch for {input:?}");
+        }
+    }
+
+    #[test]
+    fn percent_decode_rejects_truncated_hex_escape() {
+        // `%4` is missing the second hex digit — the decoder must
+        // surface None rather than silently consuming a partial
+        // escape (which would corrupt baggage propagation).
+        assert_eq!(percent_decode("%4"), None);
+        // Non-hex characters after `%` also fail.
+        assert_eq!(percent_decode("%ZZ"), None);
+    }
+
+    // ---------- ContextScope RAII + explicit finish ----------
+
+    /// Build a store whose sampler is forced to AlwaysOn so
+    /// `create_context` deterministically inserts the trace.
+    /// The default sampler is `Ratio(0.1)` — most contexts go
+    /// unsampled (not stored), and `add_span` then returns
+    /// `NotFound` regardless of the scope's behavior. Inside
+    /// the tests mod we can swap the private `sampler` field.
+    fn store_with_always_on_sampler() -> ContextStore {
+        let mut store = ContextStore::new(64, 64, Duration::from_secs(60));
+        store.sampler = Sampler::new(SamplingStrategy::AlwaysOn);
+        store
+    }
+
+    #[test]
+    fn context_scope_drop_records_span_into_store() {
+        let store = store_with_always_on_sampler();
+        let ctx = store.create_context(test_node_id()).unwrap();
+        let trace_id = ctx.trace_id;
+
+        // Pre: no spans yet.
+        assert!(store.get_spans(&trace_id).is_empty());
+
+        // Drop the scope without calling finish — the Drop impl
+        // must end the span and push it to the store.
+        {
+            let _scope = ContextScope::new(&store, &ctx, "auto", test_node_id());
+        }
+        let spans = store.get_spans(&trace_id);
+        assert_eq!(spans.len(), 1, "Drop must push the span");
+        assert!(spans[0].end_time_us.is_some(), "Drop must end() the span");
+    }
+
+    #[test]
+    fn context_scope_finish_records_span_and_suppresses_drop() {
+        let store = store_with_always_on_sampler();
+        let ctx = store.create_context(test_node_id()).unwrap();
+        let trace_id = ctx.trace_id;
+
+        let mut scope = ContextScope::new(&store, &ctx, "explicit", test_node_id());
+        scope.set_ok();
+        scope.finish();
+
+        // Exactly one span — `finish` set finished=true so Drop
+        // didn't push a duplicate.
+        let spans = store.get_spans(&trace_id);
+        assert_eq!(spans.len(), 1);
+        assert!(matches!(spans[0].status, SpanStatus::Ok));
+    }
 }
