@@ -43,6 +43,18 @@ The numbers in the framing table above were collected with a Python script that 
 
 If the script needs to re-run for verification at any stage, it's the masking pass shown in this plan's PR description; not vendored as tooling.
 
+**Stage 1 verification baseline (authoritative for Stage 2).** After landing Stage 1, `cargo clippy --all-features --lib` reports the following library-only warning counts. These are the numbers Stage 2 must drive to zero — they supersede the Python-script estimates in the framing table above, which used a different masking heuristic.
+
+| Lint | Library warnings |
+|---|---:|
+| `clippy::unwrap_used` | 85 |
+| `clippy::expect_used` | 78 |
+| `clippy::undocumented_unsafe_blocks` | 323 |
+| `clippy::multiple_unsafe_ops_per_block` | 46 |
+| **Total** | **532** |
+
+`cargo clippy --all-features --all-targets` reports ~8,200 warnings (the difference is test/bench/example code, which is allowed to `.unwrap()` freely). Stage 2 fixes the lib subset only; Stage 4's CI invocation should scope to `--lib --bins` for the deny-level run, or thread a permanent `-A` for tests through `--all-targets` — picked in Stage 4.
+
 ---
 
 ## Stage 1 — Lint config + rustfmt baseline
