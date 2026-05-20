@@ -68,18 +68,24 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      # `--features` mirrors the unit-tests job (net + redex +
-      # cortex + netdb). `--lib` keeps the run scoped to the core
-      # crate's library target — the FFI shims, bindings,
-      # benchmarks, fuzz, and examples are explicitly ignored in
-      # codecov.yml. Workspace-wide coverage with --all-features
-      # would balloon CI runtime ~4x without adding signal for the
-      # substrate authors who are the primary audience.
+      # `--features` mirrors the clippy job's feature set —
+      # broad enough to compile every test in `tests/*.rs` that
+      # isn't gated on a service-container feature (redis,
+      # jetstream). Dropping `--lib` lets cargo-llvm-cov pick up
+      # both the in-source `#[cfg(test)]` units and the
+      # integration tests in `tests/`, which is where the bulk of
+      # the substrate's behavioral coverage actually lives
+      # (channel auth, three-node mesh, CortEX nRPC, NetDB,
+      # MeshOS / Deck pipelines, dataforts blob storage…).
+      # `--no-fail-fast` matches the main `integration-tests` job
+      # so a flake in one test doesn't drop coverage from the
+      # rest. FFI shims / bindings / benches / examples are
+      # excluded in codecov.yml.
       - name: Generate coverage (lcov)
         run: >
           cargo llvm-cov
-          --features "net redex cortex netdb"
-          --lib
+          --features "net redex cortex netdb meshos dataforts nat-traversal port-mapping"
+          --no-fail-fast
           --lcov
           --output-path coverage.lcov
 
