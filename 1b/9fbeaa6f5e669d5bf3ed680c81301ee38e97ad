@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/linux.rs
+  s_e9432586a99852::t_075a65dafb1d91 627-772
+net/crates/net/tests/stream_config_and_error_display.rs
+  s_e9432586a99852::t_89a72f6aa494c3 1-44,54-94
+  s_e9432586a99852::t_ab444587a02088 45-53
+net/crates/net/tests/netdb_builder_and_accessors.rs
+  s_e9432586a99852::t_438338e8a81d8b 1-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "1b9fbeaa6f5e669d5bf3ed680c81301ee38e97ad",
+  "prompts": {},
+  "sessions": {
+    "s_e9432586a99852": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fbeaee78-6362-47f1-a432-288d813cb99f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
