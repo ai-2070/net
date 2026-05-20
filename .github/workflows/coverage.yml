@@ -90,7 +90,7 @@ jobs:
           --output-path coverage.lcov
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           files: net/crates/net/coverage.lcov
           # `fail_ci_if_error: false` keeps the workflow advisory
