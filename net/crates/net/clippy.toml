@@ -7,7 +7,10 @@
 # disappear; this disallow stops it from regrowing.
 
 disallowed-methods = [
-    { path = "std::sync::Mutex::lock",   reason = "use parking_lot::Mutex — std lock-poisoning is not handled here" },
-    { path = "std::sync::RwLock::read",  reason = "use parking_lot::RwLock — std lock-poisoning is not handled here" },
-    { path = "std::sync::RwLock::write", reason = "use parking_lot::RwLock — std lock-poisoning is not handled here" },
+    { path = "std::sync::Mutex::lock",      reason = "use parking_lot::Mutex — std lock-poisoning is not handled here" },
+    { path = "std::sync::Mutex::try_lock",  reason = "use parking_lot::Mutex — std lock-poisoning is not handled here" },
+    { path = "std::sync::RwLock::read",     reason = "use parking_lot::RwLock — std lock-poisoning is not handled here" },
+    { path = "std::sync::RwLock::try_read", reason = "use parking_lot::RwLock — std lock-poisoning is not handled here" },
+    { path = "std::sync::RwLock::write",    reason = "use parking_lot::RwLock — std lock-poisoning is not handled here" },
+    { path = "std::sync::RwLock::try_write",reason = "use parking_lot::RwLock — std lock-poisoning is not handled here" },
 ]
