@@ -1,0 +1,19 @@
+net/crates/net/docs/releases/RELEASE_v0.20.2_SEARCH_AND_DESTROY.md
+  s_e9432586a99852::t_5a533319e31038 1,3,5,7,9,11,13,15,17,21,25,27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "01d25467619c2d201336127f3a758d7113123930",
+  "prompts": {},
+  "sessions": {
+    "s_e9432586a99852": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fbeaee78-6362-47f1-a432-288d813cb99f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
