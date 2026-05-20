@@ -59,6 +59,10 @@ pub struct ReplicaGroupConfig {
 ///
 /// Each replica index always produces the same keypair, making the group
 /// identity deterministic and reproducible.
+#[expect(
+    clippy::expect_used,
+    reason = "Blake2sMac::new_from_slice rejects only keys longer than 32 bytes; b\"net-replica-v1\" is a 16-byte compile-time-constant label"
+)]
 pub fn derive_replica_keypair(group_seed: &[u8; 32], index: u8) -> EntityKeypair {
     use blake2::{
         digest::{consts::U32, Mac},
@@ -259,6 +263,10 @@ impl ReplicaGroup {
         for index in affected {
             self.coord.mark_unhealthy(index);
 
+            #[expect(
+                clippy::unwrap_used,
+                reason = "index came from coord.members_on_node above; the matching member is guaranteed to exist"
+            )]
             let old_origin_hash = self
                 .coord
                 .members()

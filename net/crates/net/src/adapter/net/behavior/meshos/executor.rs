@@ -362,6 +362,10 @@ impl<D: ActionDispatcher> ActionExecutor<D> {
     /// Drive the executor until either the action receiver
     /// closes (the loop dropped its sender) or the inner
     /// dispatcher panics. Returns the accumulated stats.
+    #[expect(
+        clippy::expect_used,
+        reason = "tokio::select arm is gated on `next_deadline.is_some()` which means the prior `peek()` returned Some; pop() on the same heap must succeed"
+    )]
     pub async fn run(mut self) -> Arc<ExecutorStats> {
         // Periodic idle tick. The cluster-backpressure release
         // edge only fires inside `handle_one_retry`, so a queue

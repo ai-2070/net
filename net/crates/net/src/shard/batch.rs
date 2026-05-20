@@ -129,6 +129,10 @@ impl AdaptiveBatcher {
     }
 
     /// Calculate events per second based on recent samples.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "len >= 2 guard above; .front() / .back() on a non-empty VecDeque is infallible"
+    )]
     fn calculate_velocity(&self) -> f64 {
         if self.velocity_samples.len() < 2 {
             return 0.0;

@@ -11,8 +11,9 @@ use chacha20poly1305::{
     ChaCha20Poly1305,
 };
 use snow::{params::NoiseParams, Builder, HandshakeState};
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::protocol::{NONCE_SIZE, TAG_SIZE};
 
@@ -122,6 +123,10 @@ pub struct StaticKeypair {
 
 impl StaticKeypair {
     /// Generate a new random keypair
+    #[expect(
+        clippy::expect_used,
+        reason = "NOISE_PATTERN is a compile-time-constant string, parses infallibly; the Noise builder generates keypairs deterministically from valid patterns"
+    )]
     pub fn generate() -> Self {
         let builder = Builder::new(
             NOISE_PATTERN
@@ -327,6 +332,10 @@ impl NoiseHandshake {
             .map_err(|e| CryptoError::Handshake(format!("transport mode failed: {}", e)))?;
 
         // Derive session ID from handshake hash
+        #[expect(
+            clippy::unwrap_used,
+            reason = "handshake_hash typed as [u8; 32] above; [0..8].try_into::<[u8; 8]>() is infallible"
+        )]
         let session_id = u64::from_le_bytes(handshake_hash[0..8].try_into().unwrap());
 
         // Use HKDF to derive tx and rx keys from handshake hash
@@ -725,10 +734,7 @@ impl PacketCipher {
     /// concurrently.
     #[inline]
     pub fn update_rx_counter(&self, received: u64) -> bool {
-        let mut w = self
-            .rx_window
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut w = self.rx_window.lock();
         w.commit(received)
     }
 
@@ -737,10 +743,7 @@ impl PacketCipher {
     /// [`Self::update_rx_counter`], which returns `false` on replay.
     #[inline]
     pub fn is_valid_rx_counter(&self, received: u64) -> bool {
-        let w = self
-            .rx_window
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let w = self.rx_window.lock();
         w.is_valid(received)
     }
 }
@@ -765,6 +768,10 @@ impl std::fmt::Debug for PacketCipher {
 /// Derives a 32-byte key from input keying material and an info label.
 /// Uses keyed BLAKE2s (256-bit): PRK = BLAKE2s(key=ikm, data=b"net-kdf-v1"),
 /// then OKM = BLAKE2s(key=PRK, data=info).
+#[expect(
+    clippy::expect_used,
+    reason = "Blake2sMac::new_from_slice rejects only keys longer than 32 bytes; BLAKE2s output (32 bytes) and arbitrary IKM slices are both within the allowed length"
+)]
 fn derive_key(ikm: &[u8], info: &[u8], out: &mut [u8; 32]) {
     use blake2::{
         digest::{consts::U32, Mac},
@@ -1097,7 +1104,7 @@ mod tests {
         // test lives in the same `mod tests`, so we can reach
         // the field.
         {
-            let mut w = cipher.rx_window.lock().unwrap();
+            let mut w = cipher.rx_window.lock();
             // Set the window to "everything just before the
             // ceiling has already been seen": rx_counter sits
             // at u64::MAX - MAX_FORWARD so that `is_valid` would
@@ -1125,7 +1132,7 @@ mod tests {
 
         // Confirm rx_counter was not advanced to u64::MAX (the
         // poisoning state). It remains at the pre-test value.
-        let post = cipher.rx_window.lock().unwrap().rx_counter;
+        let post = cipher.rx_window.lock().rx_counter;
         assert_eq!(
             post,
             u64::MAX - ReplayWindow::MAX_FORWARD,
@@ -1271,7 +1278,7 @@ mod tests {
         // rx_counter must NOT have advanced — the rejection
         // happens before mutation. This is stronger than the
         // pre-fix saturating-at-u64::MAX guarantee.
-        let counter = cipher.rx_window.lock().unwrap().rx_counter;
+        let counter = cipher.rx_window.lock().rx_counter;
         assert_eq!(
             counter, 1001,
             "rx_counter must remain at the post-1000-commit value; \

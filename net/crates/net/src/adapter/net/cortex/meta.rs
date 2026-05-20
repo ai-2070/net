@@ -83,6 +83,10 @@ impl EventMeta {
 
     /// Decode from a 24-byte slice. Returns `None` if the slice is
     /// shorter than 24 bytes.
+    #[expect(
+        clippy::expect_used,
+        reason = "bytes.len() >= EVENT_META_SIZE (24) checked above; fixed-offset slices convert infallibly to fixed-size arrays"
+    )]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < EVENT_META_SIZE {
             return None;

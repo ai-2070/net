@@ -97,6 +97,10 @@ impl RedexEntry {
     }
 
     /// Build an inline entry from exactly 8 payload bytes.
+    #[expect(
+        clippy::expect_used,
+        reason = "input is &[u8; INLINE_PAYLOAD_SIZE]; fixed slice converts are statically infallible"
+    )]
     pub fn new_inline(seq: u64, payload: &[u8; INLINE_PAYLOAD_SIZE], checksum: u32) -> Self {
         let offset = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes"));
         let len = u32::from_le_bytes(payload[4..8].try_into().expect("4 bytes"));
@@ -148,6 +152,10 @@ impl RedexEntry {
     }
 
     /// Decode from the 20-byte little-endian wire format.
+    #[expect(
+        clippy::expect_used,
+        reason = "input is &[u8; REDEX_ENTRY_SIZE]; fixed slice converts are statically infallible"
+    )]
     pub fn from_bytes(bytes: &[u8; REDEX_ENTRY_SIZE]) -> Self {
         Self {
             seq: u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes")),

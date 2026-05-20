@@ -1034,6 +1034,10 @@ impl LoadBalancer {
         }
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "caller (LoadBalancer::select) returns early on empty endpoints; min_by_key on a non-empty iter is infallible"
+    )]
     fn select_least_connections(&self, endpoints: &[Arc<EndpointState>]) -> Selection {
         let state = endpoints
             .iter()
@@ -1048,6 +1052,10 @@ impl LoadBalancer {
         }
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "caller (LoadBalancer::select) returns early on empty endpoints; min_by on a non-empty iter is infallible"
+    )]
     fn select_weighted_least_connections(&self, endpoints: &[Arc<EndpointState>]) -> Selection {
         // Score = connections / weight (lower is better).
         // The `.max(MIN_DIVISOR)` guard is a divide-by-zero protector
@@ -1165,6 +1173,10 @@ impl LoadBalancer {
         self.select_round_robin(endpoints)
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "caller (LoadBalancer::select) returns early on empty endpoints; min_by on a non-empty iter is infallible"
+    )]
     fn select_least_latency(&self, endpoints: &[Arc<EndpointState>]) -> Selection {
         let state = endpoints
             .iter()
@@ -1183,6 +1195,10 @@ impl LoadBalancer {
         }
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "caller (LoadBalancer::select) returns early on empty endpoints; min_by on a non-empty iter is infallible"
+    )]
     fn select_least_load(&self, endpoints: &[Arc<EndpointState>]) -> Selection {
         let state = endpoints
             .iter()

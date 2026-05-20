@@ -95,6 +95,10 @@ impl ContinuityProof {
     /// Extract a proof from a local entity log.
     ///
     /// Returns `None` if the log is empty.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "events.is_empty() guard above; .last() on a non-empty slice is infallible"
+    )]
     pub fn from_log(log: &EntityLog) -> Option<Self> {
         if log.is_empty() {
             return None;
@@ -139,6 +143,10 @@ impl ContinuityProof {
     /// of the proof. The span cap also prevents a peer from
     /// forcing a multi-billion-event scan via reversed or wide
     /// bounds.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "events.is_empty() guard above; .last() on a non-empty slice is infallible"
+    )]
     pub fn verify_against(&self, log: &EntityLog) -> Result<(), ProofError> {
         if self.origin_hash != log.origin_hash() {
             return Err(ProofError::OriginMismatch);
@@ -237,6 +245,10 @@ impl ContinuityProof {
     /// [`CONTINUITY_PROOF_SIZE`] so trailing bytes aren't silently
     /// accepted (the old `< SIZE` guard let concatenated proofs or
     /// framing garbage parse as the first proof).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "data.len() == CONTINUITY_PROOF_SIZE checked above; fixed-offset slices into the buffer convert infallibly to fixed-size arrays"
+    )]
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() != CONTINUITY_PROOF_SIZE {
             return None;
@@ -292,6 +304,10 @@ impl ContinuityProof {
 /// genesis (no prior pruning); pass `Some(&snapshot)` when the log
 /// was restored from `snapshot` and should pick up at the next event
 /// after the snapshot's `through_seq`.
+#[expect(
+    clippy::unwrap_used,
+    reason = "events.is_empty() guard above; .last() on a non-empty slice is infallible"
+)]
 pub fn assess_continuity(log: &EntityLog, snapshot: Option<&StateSnapshot>) -> ContinuityStatus {
     let events = log.range(0, u64::MAX);
 

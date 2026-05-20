@@ -69,6 +69,10 @@ fn node_id_to_graph_id(node_id: u64) -> [u8; 32] {
 }
 
 /// Extract u64 node_id from a 32-byte graph NodeId.
+#[expect(
+    clippy::unwrap_used,
+    reason = "input is &[u8; 32]; slicing [0..8] then .try_into::<[u8; 8]>() is statically infallible"
+)]
 fn graph_id_to_node_id(id: &[u8; 32]) -> u64 {
     u64::from_le_bytes(id[0..8].try_into().unwrap())
 }

@@ -40,7 +40,7 @@ impl Default for RouterConfig {
     fn default() -> Self {
         Self {
             local_id: 0,
-            bind_addr: "0.0.0.0:0".parse().unwrap(),
+            bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             max_queue_depth: 1024,
             fair_quantum: 16,
             idle_timeout_ns: 30_000_000_000, // 30 seconds

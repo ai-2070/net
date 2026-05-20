@@ -500,7 +500,7 @@ pub unsafe extern "C" fn net_redex_replication_prometheus_text(
     // path runs).
     match CString::new(text) {
         Ok(c) => c.into_raw(),
-        Err(_) => CString::new("").unwrap().into_raw(),
+        Err(_) => CString::default().into_raw(),
     }
 }
 
@@ -719,7 +719,7 @@ pub unsafe extern "C" fn net_redex_greedy_prometheus_text(
         .unwrap_or_default();
     match CString::new(text) {
         Ok(c) => c.into_raw(),
-        Err(_) => CString::new("").unwrap().into_raw(),
+        Err(_) => CString::default().into_raw(),
     }
 }
 

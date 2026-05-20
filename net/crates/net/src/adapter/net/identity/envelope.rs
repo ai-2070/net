@@ -212,6 +212,10 @@ impl IdentityEnvelope {
     ///
     /// [`EnvelopeError::SourceReadOnly`] if `source_kp` is
     /// public-only — the attestation needs its signing half.
+    #[expect(
+        clippy::expect_used,
+        reason = "XChaCha20Poly1305 with a freshly-derived key+nonce cannot fail on a 32-byte msg, and try_sign on a full keypair (checked above via source_kp.try_sign requirement) cannot fail"
+    )]
     pub fn new(
         source_kp: &EntityKeypair,
         target_static_pub: [u8; 32],
@@ -365,6 +369,10 @@ impl IdentityEnvelope {
 
         // Step 3: seal_open.
         let (eph_pk_bytes, ct) = self.sealed_seed.split_at(EPH_PK_LEN);
+        #[expect(
+            clippy::unwrap_used,
+            reason = "split_at(EPH_PK_LEN) where EPH_PK_LEN == 32; <[u8; 32]>::try_from(&[u8] of length 32) is infallible"
+        )]
         let eph_pk = X25519Pub::from(<[u8; 32]>::try_from(eph_pk_bytes).unwrap());
         let shared = target_static_priv.diffie_hellman(&eph_pk);
         let mut key = derive_key(shared.as_bytes(), KDF_DOMAIN_KEY);
@@ -507,6 +515,10 @@ fn attestation_transcript(
 /// Domain-separated key derivation. We already use BLAKE2s-MAC
 /// elsewhere in the identity layer (for `origin_hash` / `node_id`);
 /// reusing it keeps the primitive surface minimal.
+#[expect(
+    clippy::expect_used,
+    reason = "Blake2sMac::new_from_slice rejects only keys longer than 32 bytes; label slices are always short labels"
+)]
 fn derive_key(shared: &[u8; 32], label: &[u8]) -> [u8; 32] {
     let mut mac = <Blake2sMac<U32> as Mac>::new_from_slice(label)
         .expect("BLAKE2s accepts variable-length keys");
@@ -538,6 +550,10 @@ fn volatile_zero(buf: &mut [u8]) {
 /// Deterministic nonce: BLAKE2s-MAC keyed with a domain label,
 /// input = `eph_pk || target_pk`. Truncated to 24 bytes for the
 /// XChaCha nonce.
+#[expect(
+    clippy::expect_used,
+    reason = "Blake2sMac::new_from_slice rejects only keys longer than 32 bytes; KDF_DOMAIN_NONCE is a short compile-time-constant label"
+)]
 fn derive_nonce(eph_pk: &[u8; 32], target_pk: &[u8; 32]) -> [u8; 24] {
     let mut mac = <Blake2sMac<U32> as Mac>::new_from_slice(KDF_DOMAIN_NONCE)
         .expect("BLAKE2s accepts variable-length keys");

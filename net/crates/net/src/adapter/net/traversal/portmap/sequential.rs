@@ -126,6 +126,10 @@ impl PortMapperClient for SequentialMapper {
         Ok(())
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "active is set to Some(Protocol::NatPmp) only after the constructor verifies a NatPmpMapper was provided AND its probe succeeded; nat_pmp is therefore Some here"
+    )]
     async fn install(
         &self,
         internal_port: u16,

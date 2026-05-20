@@ -116,6 +116,10 @@ fn node_id_to_graph_id(node_id: u64) -> [u8; 32] {
 /// bytes of a 32-byte proximity `NodeId`. Assumes the id was produced by
 /// `node_id_to_graph_id` (which is how every peer in this codebase is
 /// seeded into the graph).
+#[expect(
+    clippy::unwrap_used,
+    reason = "input is &[u8; 32]; slicing [0..8] then .try_into::<[u8; 8]>() is statically infallible"
+)]
 fn graph_id_to_node_id(graph_id: &[u8; 32]) -> u64 {
     u64::from_le_bytes(graph_id[0..8].try_into().unwrap())
 }
@@ -1645,7 +1649,7 @@ impl MeshNode {
             // Router binds to an ephemeral port for its send loop. It uses
             // this socket only for forwarding packets — the main socket
             // handles all receives.
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             max_queue_depth: config.max_queue_depth,
             fair_quantum: config.fair_quantum,
             ..Default::default()
@@ -3144,6 +3148,10 @@ impl MeshNode {
             );
             return;
         }
+        #[expect(
+            clippy::unwrap_used,
+            reason = "msg1_payload.len() >= 8 guard above; [..8].try_into::<[u8; 8]>() is infallible"
+        )]
         let peer_node_id = u64::from_le_bytes(msg1_payload[..8].try_into().unwrap());
         if routing_id(peer_node_id) != peer_routing_id {
             tracing::warn!(

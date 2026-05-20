@@ -1195,6 +1195,10 @@ impl MeshOsLoop {
     /// ring. Bounded by
     /// [`super::ice::DEFAULT_MAX_ADMIN_AUDIT_RECORDS`]; drops
     /// oldest FIFO when the cap is exceeded.
+    #[expect(
+        clippy::expect_used,
+        reason = "u64 admin_audit_seq overflow takes ~58 million years at 100 µs/event; the documented loud-panic strategy is preferable to silent saturation that collapses every subsequent record into a single ring entry"
+    )]
     fn record_admin_audit(
         &mut self,
         event: &super::event::AdminEvent,
@@ -1262,6 +1266,10 @@ impl MeshOsLoop {
     /// Stamp + push a `LogLine` onto the per-node log ring.
     /// Bounded by [`super::logs::DEFAULT_MAX_LOG_RING_RECORDS`];
     /// drops oldest FIFO when the cap is exceeded.
+    #[expect(
+        clippy::expect_used,
+        reason = "u64 log_seq overflow is astronomically distant; the documented loud-panic strategy is preferable to silent saturation"
+    )]
     fn record_log_line(&mut self, line: &super::logs::LogLine) {
         use std::time::{SystemTime, UNIX_EPOCH};
         let ts_ms = SystemTime::now()

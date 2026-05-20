@@ -181,6 +181,10 @@ impl FilterBuilder {
     }
 
     /// Build an AND filter from accumulated conditions.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "len == 1 branch guarantees the iterator yields exactly one element"
+    )]
     pub fn build_and(self) -> Filter {
         if self.filters.len() == 1 {
             self.filters.into_iter().next().unwrap()
@@ -190,6 +194,10 @@ impl FilterBuilder {
     }
 
     /// Build an OR filter from accumulated conditions.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "len == 1 branch guarantees the iterator yields exactly one element"
+    )]
     pub fn build_or(self) -> Filter {
         if self.filters.len() == 1 {
             self.filters.into_iter().next().unwrap()

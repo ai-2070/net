@@ -530,6 +530,10 @@ impl PermissionToken {
     /// and let malformed blobs parse as valid tokens. Callers
     /// framing tokens inside a larger message must slice to exactly
     /// `WIRE_SIZE` before calling this.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "data.len() == WIRE_SIZE checked above; fixed-offset slices into the buffer convert infallibly to fixed-size arrays"
+    )]
     pub fn from_bytes(data: &[u8]) -> Result<Self, TokenError> {
         if data.len() != Self::WIRE_SIZE {
             return Err(TokenError::InvalidFormat);

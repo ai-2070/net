@@ -1045,6 +1045,10 @@ where
     ///   truncating to the first match — the caller should
     ///   either tighten the predicate or wait for the
     ///   implicit-Union resolution path.
+    #[expect(
+        clippy::expect_used,
+        reason = "match arm `1` guarantees the iterator yields exactly one element"
+    )]
     fn resolve_origin(&self, origin: &ChainRef) -> Result<u64, MeshError> {
         match origin {
             ChainRef::OriginHash(h) => Ok(*h),

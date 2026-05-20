@@ -72,6 +72,10 @@ impl SubnetPolicy {
     /// Panics if the rule's level is >= 4. For untrusted input
     /// (config files, FFI, JSON) prefer [`Self::try_add_rule`],
     /// which returns a [`SubnetError`] instead of panicking.
+    #[expect(
+        clippy::expect_used,
+        reason = "documented panicking variant; try_add_rule is the fallible alternative for untrusted input"
+    )]
     pub fn add_rule(self, rule: SubnetRule) -> Self {
         self.try_add_rule(rule)
             .expect("SubnetPolicy::add_rule: invalid rule (use try_add_rule for fallible)")
@@ -142,6 +146,10 @@ impl SubnetRule {
     /// Panics if `level_value` is 0 (reserved for "unmatched /
     /// no restriction"). For untrusted input prefer
     /// [`Self::try_map`].
+    #[expect(
+        clippy::expect_used,
+        reason = "documented panicking variant; try_map is the fallible alternative for untrusted input"
+    )]
     pub fn map(self, tag_value: impl Into<String>, level_value: u8) -> Self {
         self.try_map(tag_value, level_value)
             .expect("SubnetRule::map: level_value 0 is reserved (use try_map for fallible)")

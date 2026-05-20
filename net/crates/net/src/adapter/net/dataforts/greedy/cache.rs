@@ -287,6 +287,10 @@ impl GreedyCacheRegistry {
     /// Bump `last_read` for `channel` to `now`. No-op if the
     /// channel isn't registered. Moves the channel to the head of
     /// the LRU queue (front == newest).
+    #[expect(
+        clippy::expect_used,
+        reason = "contains_key(channel) checked above before the get_mut call"
+    )]
     pub fn touch(&mut self, channel: &ChannelName, now: Instant) {
         if !self.entries.contains_key(channel) {
             return;

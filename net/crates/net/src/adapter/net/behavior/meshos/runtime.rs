@@ -775,6 +775,10 @@ impl MeshOsRuntime {
     }
 
     /// `shutdown` with an explicit timeout.
+    #[expect(
+        clippy::expect_used,
+        reason = "shutdown_with_timeout consumes self; loop_task / exec_task are Some on first call and cannot be taken twice"
+    )]
     pub async fn shutdown_with_timeout(
         mut self,
         timeout: Duration,

@@ -453,6 +453,10 @@ impl ShardManager {
         since = "0.10.0",
         note = "serializes the value just to hash it; prefer `RawEvent::from_value(v).hash()` + `select_shard_by_hash` to avoid the duplicate serialization"
     )]
+    #[expect(
+        clippy::expect_used,
+        reason = "serde_json::to_vec on a JsonValue (which round-tripped from JSON or was built via the type's own constructors) is infallible"
+    )]
     pub fn select_shard(&self, event: &JsonValue) -> u16 {
         // Use xxhash for fast, deterministic hashing. `to_vec` avoids the
         // extra UTF-8 validation that `to_string` performs on the serialized

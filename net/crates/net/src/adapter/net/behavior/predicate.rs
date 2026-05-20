@@ -446,6 +446,10 @@ impl Predicate {
     /// to the prior recursive implementation: post-order
     /// serialization, children at lower indices than their
     /// parents.
+    #[expect(
+        clippy::expect_used,
+        reason = "predicate tree-walk invariants: every FinishX step is preceded by a matching number of Begin steps that push children; the final pop yields the root that the walk always pushes"
+    )]
     fn append_to_wire(&self, nodes: &mut Vec<PredicateNodeWire>) -> u32 {
         enum Step<'a> {
             /// Visit a predicate. Leaves emit immediately;

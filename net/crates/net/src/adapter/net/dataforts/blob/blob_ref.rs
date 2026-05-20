@@ -553,6 +553,10 @@ impl BlobRef {
 
     /// Emit the wire form. See the module-level table for the
     /// byte layout per variant.
+    #[expect(
+        clippy::expect_used,
+        reason = "ManifestBody / TreeBody are composed of sized Serialize types; postcard alloc-encoding is infallible against them"
+    )]
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Self::Small {

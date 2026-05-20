@@ -235,6 +235,10 @@ impl NetSession {
         self.try_acquire_tx_credit_inner(stream_id, Some(expected_epoch), bytes)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "seq is set Some on every code path that reaches the Acquired branch; the if-admitted flow guarantees this"
+    )]
     fn try_acquire_tx_credit_inner(
         self: &Arc<Self>,
         stream_id: u64,

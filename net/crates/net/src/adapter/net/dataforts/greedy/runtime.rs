@@ -101,6 +101,10 @@ pub trait GreedyObserver: Send + Sync {
 /// Naming convention `dataforts/greedy/<hex>` reserves a
 /// channel-namespace prefix that won't collide with application
 /// channels (`/` separators + reserved-prefix discipline).
+#[expect(
+    clippy::expect_used,
+    reason = "hex-formatted name with the reserved dataforts/greedy/ prefix always satisfies ChannelName validation"
+)]
 pub fn synthesize_cache_channel_name(channel_hash: u16) -> ChannelName {
     ChannelName::new(&format!("dataforts/greedy/{:04x}", channel_hash))
         .expect("hex-formatted name with reserved prefix is always valid")

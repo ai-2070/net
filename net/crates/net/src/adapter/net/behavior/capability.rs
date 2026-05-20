@@ -2168,6 +2168,10 @@ impl CapabilityAnnouncement {
     /// error explicitly with a panic gives a loud diagnostic if a
     /// future refactor ever adds one — strictly better than silent
     /// signature-compromise.
+    #[expect(
+        clippy::expect_used,
+        reason = "no CapabilityAnnouncement field has a fallible Serialize impl today; panic is the documented loud-diagnostic strategy for a future refactor that introduces one"
+    )]
     fn signed_payload(&self) -> Vec<u8> {
         let mut canonical = self.clone();
         canonical.signature = None;

@@ -1,0 +1,13 @@
+# Block `std::sync::{Mutex,RwLock}::{lock,read,write}` so the
+# parking_lot migration Stage 2 of PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md
+# is permanent — new code must use parking_lot or motivate the std
+# choice via an explicit `#[allow]` with a comment. parking_lot's
+# guards aren't fallible, which lets the `.lock().unwrap()` /
+# `.read().unwrap()` / `.write().unwrap()` panic-on-poison surface
+# disappear; this disallow stops it from regrowing.
+
+disallowed-methods = [
+    { path = "std::sync::Mutex::lock",   reason = "use parking_lot::Mutex — std lock-poisoning is not handled here" },
+    { path = "std::sync::RwLock::read",  reason = "use parking_lot::RwLock — std lock-poisoning is not handled here" },
+    { path = "std::sync::RwLock::write", reason = "use parking_lot::RwLock — std lock-poisoning is not handled here" },
+]
