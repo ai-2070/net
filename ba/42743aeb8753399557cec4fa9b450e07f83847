@@ -1,0 +1,55 @@
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  s_e9432586a99852::t_b00619b2a13f07 10
+  s_e9432586a99852::t_617cd9c1766bde 277,281
+  s_e9432586a99852::t_9d64d962ac77c6 318,347,352,370,396
+  s_e9432586a99852::t_4bbaa2fa68fd77 242,248,268,271
+  s_e9432586a99852::t_2e8559348b5c48 230,232,262-263
+  s_e9432586a99852::t_c7c5f7108b8c99 727,734
+net/crates/net/src/adapter/net/behavior/context.rs
+  s_e9432586a99852::t_41cb188aa4f15a 719,728
+  s_e9432586a99852::t_b29519a4826b86 11
+  s_e9432586a99852::t_fd6b7a27ddb67f 739
+net/crates/net/src/adapter/net/traversal/portmap/natpmp.rs
+  s_e9432586a99852::t_e2863f3cfa71a6 381,385
+  s_e9432586a99852::t_f6fe69466540fc 79
+net/crates/net/src/adapter/net/failure.rs
+  s_e9432586a99852::t_54cf695160b505 572,602,630,678
+  s_e9432586a99852::t_8e28d1b1280bbd 520,541
+  s_e9432586a99852::t_acdf9bb8226c8a 557,662
+  s_e9432586a99852::t_89441807e7d38f 147,165,532,547,696,758,783
+  s_e9432586a99852::t_f2963b0d5384dd 10
+  s_e9432586a99852::t_b2e0d53258963a 304,702
+net/crates/net/src/adapter/net/behavior/meshdb/cache.rs
+  s_e9432586a99852::t_f85c87f107c389 257,271,317,327
+  s_e9432586a99852::t_ffbd5ce98f7113 57
+net/crates/net/src/adapter/net/behavior/safety.rs
+  s_e9432586a99852::t_233aa9f192fb07 609,859,989,1002,1118,1489-1490,1503-1504
+  s_e9432586a99852::t_c8405bfe25639b 604,854,997,1124,1168,1538,1549,1551
+  s_e9432586a99852::t_379ceabce48c2f 15,17
+net/crates/net/src/adapter/net/traversal/portmap/upnp.rs
+  s_e9432586a99852::t_499c73c0f8baf6 106,110,114
+  s_e9432586a99852::t_fdedad2991cc34 49
+net/crates/net/src/adapter/net/traversal/portmap/sequential.rs
+  s_e9432586a99852::t_d5bd0331535fc7 18
+  s_e9432586a99852::t_874712f198b0b9 105,109
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  s_e9432586a99852::t_8319a3d9e9126a 350,371,532
+  s_e9432586a99852::t_454e67183cb5d5 279,366,553
+  s_e9432586a99852::t_216d546a243675 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "ba42743aeb8753399557cec4fa9b450e07f83847",
+  "prompts": {},
+  "sessions": {
+    "s_e9432586a99852": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fbeaee78-6362-47f1-a432-288d813cb99f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
