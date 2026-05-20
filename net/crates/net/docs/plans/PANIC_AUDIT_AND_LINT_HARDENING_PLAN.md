@@ -60,13 +60,7 @@ If the script needs to re-run for verification at any stage, it's the masking pa
    ```
    Run `cargo fmt` once on a separate branch to see the diff against the current tree; if the diff is large, narrow `max_width` to whatever minimizes churn.
 
-2. `net/crates/net/clippy.toml` — block `std::sync::RwLock::{read,write}` so future poisoning unwraps can't reappear (Stage 2 migrates the existing ones to `parking_lot`):
-   ```toml
-   disallowed-methods = [
-     { path = "std::sync::RwLock::read",  reason = "use parking_lot::RwLock; std lock-poisoning is not handled" },
-     { path = "std::sync::RwLock::write", reason = "use parking_lot::RwLock; std lock-poisoning is not handled" },
-   ]
-   ```
+2. ~~`net/crates/net/clippy.toml`~~ — **deferred to Stage 2.** The original plan put a `disallowed-methods` block on `std::sync::RwLock::{read,write}` here, but local verification showed the block fires as an error against ~34 pre-existing call sites — it can only land *after* the parking_lot migration. The clippy.toml file is created in Stage 2 in the same commit that completes the swap, so the rule never sees an unmigrated call site.
 
 3. `Cargo.toml` — extend the `[lints]` table:
    ```toml
@@ -123,7 +117,23 @@ For each library site, pick exactly one resolution:
 
 **Acceptance.** `cargo clippy --workspace --all-features -- -D clippy::unwrap_used -D clippy::expect_used` passes against the library (the `#[cfg(test)]` blocks are excluded automatically when not running tests).
 
-**Risk.** The parking_lot swap in `safety.rs` is the only behavior-adjacent change in Stage 2. parking_lot guards don't propagate poison, so any code path that previously relied on poison-propagation as a failure signal would lose that signal. Inspecting `safety.rs` shows the unwraps are not poison-conditional — they were the standard "I don't expect this to be poisoned" idiom. Confirm by running the existing `safety.rs` test module under the swap before committing.
+**Risk.** The parking_lot swap is the only behavior-adjacent change in Stage 2. parking_lot guards don't propagate poison, so any code path that previously relied on poison-propagation as a failure signal would lose that signal. Two patterns exist in-tree and both migrate cleanly:
+
+- `safety.rs` uses the standard "I don't expect this to be poisoned" idiom — `read().unwrap()` / `write().unwrap()`. These drop the `.unwrap()` and become infallible under parking_lot.
+- `adapter/net/failure.rs` (lines 602, 630, 662, 678) uses the *poison-recovering* idiom — `read().unwrap_or_else(|p| p.into_inner())` — explicitly handling poison and continuing. Under parking_lot the `unwrap_or_else` becomes vestigial and the recovery branch is deleted.
+
+Other workspace files that touch `std::sync::RwLock` (`consumer/merge.rs:1523,1552`; survey the rest during Stage 2) follow one of the two patterns and migrate identically.
+
+Confirm by running each affected file's test module under the swap before committing.
+
+**Clippy guard (added in this stage).** Once the migration is complete, write `net/crates/net/clippy.toml` with:
+```toml
+disallowed-methods = [
+    { path = "std::sync::RwLock::read",  reason = "use parking_lot::RwLock — std lock-poisoning is not handled here" },
+    { path = "std::sync::RwLock::write", reason = "use parking_lot::RwLock — std lock-poisoning is not handled here" },
+]
+```
+This prevents the panic-on-poison or recover-from-poison patterns from reappearing in future PRs. Stage 1 deferred this file precisely because it would fire as an error against unmigrated call sites; landing it together with the last migration commit keeps the rule continuously satisfied.
 
 ---
 
