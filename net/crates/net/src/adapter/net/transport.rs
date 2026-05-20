@@ -611,4 +611,131 @@ mod tests {
              silently consumes a thread until shutdown."
         );
     }
+
+    /// Runtime smoke test (Linux only): construct the
+    /// `BatchedPacketReceiver`, drive a few packets through the
+    /// recvmmsg loop, and drop it. Exercises the constructor body,
+    /// the `Ok(packets)` happy branch, the `Ok([])` empty-batch
+    /// sleep branch (between sends, while the channel is empty),
+    /// and the `Drop::drop` shutdown handshake. Pairs with the
+    /// source-pin tripwire above — the tripwire catches a
+    /// "simplification" PR; this test catches an actual runtime
+    /// regression where the loop fails to deliver packets or
+    /// fails to shut down within the join.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batched_recv_delivers_and_shuts_down_cleanly() {
+        let recv_sock = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let recv_addr = recv_sock.local_addr();
+        let send_sock = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        let mut batched = BatchedPacketReceiver::new(recv_sock.socket_arc());
+
+        // Send a few packets. Three is enough to exercise the
+        // happy-path branch through the loop without depending on
+        // recvmmsg ever returning more than one at a time.
+        for i in 0..3u8 {
+            send_sock
+                .socket_arc()
+                .send_to(&[0xAA, i, 0xBB], recv_addr)
+                .await
+                .unwrap();
+        }
+
+        // Drain with a bounded deadline. The 1 ms sleep inside the
+        // empty-batch / WouldBlock branch means the thread re-checks
+        // shutdown promptly; 2 s is generous for loopback delivery.
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while got.len() < 3 && std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), batched.recv()).await {
+                Ok(Ok((data, _addr))) => got.push(data),
+                Ok(Err(_)) | Err(_) => continue,
+            }
+        }
+        assert_eq!(
+            got.len(),
+            3,
+            "BatchedPacketReceiver did not deliver three loopback datagrams within 2 s"
+        );
+
+        // Dropping the receiver sets the shutdown AtomicBool and
+        // joins the thread. If the loop body doesn't notice the
+        // shutdown flag promptly, this hangs forever — the
+        // `tokio::time::timeout` around `spawn_blocking` bounds the
+        // join so a regression surfaces as a clean test failure
+        // rather than an indefinite hang.
+        let join = tokio::task::spawn_blocking(move || drop(batched));
+        tokio::time::timeout(std::time::Duration::from_secs(2), join)
+            .await
+            .expect("Drop::drop for BatchedPacketReceiver did not join within 2 s")
+            .expect("spawn_blocking join");
+    }
+
+    /// Runtime tripwire (Linux only) for the EBADF / ENOTSOCK hard-
+    /// error exit path. Spawn a `BatchedPacketReceiver`, then close
+    /// the underlying socket fd out from under it; the next
+    /// `recvmmsg` returns `-1 / EBADF`, the loop body logs and
+    /// returns. After that the `tx` end of the mpsc closes and
+    /// `recv()` resolves to `Err(ConnectionReset)` — that's the
+    /// observable signal we assert on.
+    ///
+    /// Pre-fix the loop would have spun forever on EBADF without
+    /// exiting; this test would either hang (failing on the
+    /// outer timeout) or return `Ok(_)` instead of `Err(_)`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batched_recv_exits_on_hard_socket_error() {
+        use std::os::unix::io::AsRawFd;
+
+        let recv_sock = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        // Stash the fd before we hand the socket Arc to the
+        // receiver — we'll need it to force-close from the test
+        // side. The fd is owned by the Arc<UdpSocket>; closing it
+        // here is a deliberate dirty trick to fault-inject EBADF
+        // into the receive thread's next recvmmsg call.
+        let fd = recv_sock.socket_arc().as_raw_fd();
+        let mut batched = BatchedPacketReceiver::new(recv_sock.socket_arc());
+
+        // Give the receive thread one loop iteration to start
+        // (so we know recvmmsg is in flight or about to be).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // SAFETY: closing the fd is unsafe (it's owned by the
+        // Arc<UdpSocket>; further use is UB at the kernel level).
+        // The receive thread is the only further user of this
+        // socket; the close turns its next `recvmmsg` into the
+        // EBADF the test is here to exercise. The test then
+        // drops `batched` (joining the thread that's about to
+        // exit) and never touches the Arc-owned socket again.
+        unsafe {
+            libc::close(fd);
+        }
+
+        // Within a bounded deadline the receive thread should
+        // observe the EBADF and return; the mpsc tx-end drops
+        // and `recv()` resolves to `ConnectionReset`.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), batched.recv()).await;
+        match result {
+            Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            Ok(Ok(_)) => panic!(
+                "BatchedPacketReceiver delivered a packet after the fd \
+                 was force-closed — the EBADF exit path didn't fire"
+            ),
+            Ok(Err(e)) => panic!("unexpected recv error after fd close: {e}"),
+            Err(_) => panic!(
+                "BatchedPacketReceiver did not exit within 2 s of an \
+                 EBADF on the underlying fd — the hard-error branch \
+                 either missed EBADF or never executed"
+            ),
+        }
+
+        // Drop is now a no-op for the thread (it's already exited)
+        // but still runs the join — must finish promptly.
+        let join = tokio::task::spawn_blocking(move || drop(batched));
+        tokio::time::timeout(std::time::Duration::from_secs(2), join)
+            .await
+            .expect("Drop::drop did not join within 2 s after EBADF exit")
+            .expect("spawn_blocking join");
+    }
 }
