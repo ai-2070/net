@@ -55,12 +55,18 @@ fn hop_stats_avg_latency_returns_zero_with_no_samples() {
 
 #[test]
 fn display_proxy_error_packet_too_small() {
-    assert_eq!(format!("{}", ProxyError::PacketTooSmall), "packet too small");
+    assert_eq!(
+        format!("{}", ProxyError::PacketTooSmall),
+        "packet too small"
+    );
 }
 
 #[test]
 fn display_proxy_error_invalid_header() {
-    assert_eq!(format!("{}", ProxyError::InvalidHeader), "invalid routing header");
+    assert_eq!(
+        format!("{}", ProxyError::InvalidHeader),
+        "invalid routing header"
+    );
 }
 
 #[test]
@@ -70,7 +76,10 @@ fn display_proxy_error_ttl_expired() {
 
 #[test]
 fn display_proxy_error_no_route() {
-    assert_eq!(format!("{}", ProxyError::NoRoute), "no route to destination");
+    assert_eq!(
+        format!("{}", ProxyError::NoRoute),
+        "no route to destination"
+    );
 }
 
 #[test]
@@ -88,7 +97,10 @@ async fn proxy_local_addr_resolves_bound_port() {
     let addr = proxy
         .local_addr()
         .expect("local_addr must succeed on a freshly-bound proxy");
-    assert_eq!(addr.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    assert_eq!(
+        addr.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
     assert_ne!(addr.port(), 0, "ephemeral bind must resolve to a real port");
 }
 
@@ -239,7 +251,10 @@ async fn reset_stats_zeros_every_counter() {
     let _ = proxy.forward(Bytes::from_static(&[0u8])); // packet-too-small drop
 
     let stats_before = proxy.stats();
-    assert!(stats_before.packets_received > 0, "precondition: counters bumped");
+    assert!(
+        stats_before.packets_received > 0,
+        "precondition: counters bumped"
+    );
 
     proxy.reset_stats();
 
@@ -260,14 +275,20 @@ async fn debug_impl_includes_local_id_routes_and_packets_forwarded() {
     proxy.add_route(0x5678, "127.0.0.1:9001".parse().unwrap());
 
     let rendered = format!("{:?}", proxy);
-    assert!(rendered.contains("NetProxy"), "Debug must name the type: {rendered}");
+    assert!(
+        rendered.contains("NetProxy"),
+        "Debug must name the type: {rendered}"
+    );
     // The local_id field is hex-formatted with leading zeros to
     // 16 nibbles (proxy.rs:455).
     assert!(
         rendered.contains("0000000000001234"),
         "Debug must include the hex-formatted local_id: {rendered}"
     );
-    assert!(rendered.contains("routes"), "Debug must include the routes count: {rendered}");
+    assert!(
+        rendered.contains("routes"),
+        "Debug must include the routes count: {rendered}"
+    );
     assert!(
         rendered.contains("packets_forwarded"),
         "Debug must include packets_forwarded: {rendered}"

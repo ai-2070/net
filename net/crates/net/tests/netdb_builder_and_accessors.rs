@@ -68,8 +68,14 @@ async fn snapshot_omits_memories_when_only_tasks_enabled() {
         .unwrap();
 
     let snap = db.snapshot().expect("snapshot");
-    assert!(snap.tasks.is_some(), "tasks model was enabled — snapshot must capture it");
-    assert!(snap.memories.is_none(), "memories model was NOT enabled — snapshot's memories slot must stay None");
+    assert!(
+        snap.tasks.is_some(),
+        "tasks model was enabled — snapshot must capture it"
+    );
+    assert!(
+        snap.memories.is_none(),
+        "memories model was NOT enabled — snapshot's memories slot must stay None"
+    );
 }
 
 #[tokio::test]
@@ -83,8 +89,14 @@ async fn snapshot_omits_tasks_when_only_memories_enabled() {
         .unwrap();
 
     let snap = db.snapshot().expect("snapshot");
-    assert!(snap.tasks.is_none(), "tasks model was NOT enabled — snapshot's tasks slot must stay None");
-    assert!(snap.memories.is_some(), "memories model was enabled — snapshot must capture it");
+    assert!(
+        snap.tasks.is_none(),
+        "tasks model was NOT enabled — snapshot's tasks slot must stay None"
+    );
+    assert!(
+        snap.memories.is_some(),
+        "memories model was enabled — snapshot must capture it"
+    );
 }
 
 #[tokio::test]
@@ -122,8 +134,14 @@ async fn debug_impl_summarizes_enabled_models() {
     let rendered = format!("{:?}", db);
     // The Debug impl renders `tasks` / `memories` as the bools of
     // their `is_some()`. Both enabled => both appear as `true`.
-    assert!(rendered.contains("tasks: true"), "Debug missing `tasks: true`: {rendered}");
-    assert!(rendered.contains("memories: true"), "Debug missing `memories: true`: {rendered}");
+    assert!(
+        rendered.contains("tasks: true"),
+        "Debug missing `tasks: true`: {rendered}"
+    );
+    assert!(
+        rendered.contains("memories: true"),
+        "Debug missing `memories: true`: {rendered}"
+    );
 
     // And a tasks-only DB should render `memories: false`.
     let redex2 = Redex::new();
@@ -134,8 +152,14 @@ async fn debug_impl_summarizes_enabled_models() {
         .await
         .unwrap();
     let rendered = format!("{:?}", tasks_only);
-    assert!(rendered.contains("tasks: true"), "tasks-only Debug missing `tasks: true`: {rendered}");
-    assert!(rendered.contains("memories: false"), "tasks-only Debug missing `memories: false`: {rendered}");
+    assert!(
+        rendered.contains("tasks: true"),
+        "tasks-only Debug missing `tasks: true`: {rendered}"
+    );
+    assert!(
+        rendered.contains("memories: false"),
+        "tasks-only Debug missing `memories: false`: {rendered}"
+    );
 }
 
 #[tokio::test]

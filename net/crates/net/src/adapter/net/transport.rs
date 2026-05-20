@@ -648,7 +648,8 @@ mod tests {
         let mut got = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while got.len() < 3 && std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(200), batched.recv()).await {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), batched.recv()).await
+            {
                 Ok(Ok((data, _addr))) => got.push(data),
                 Ok(Err(_)) | Err(_) => continue,
             }

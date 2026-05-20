@@ -50,13 +50,13 @@ async fn netsocket_new_round_trips_a_loopback_datagram() {
     // Drain on B with a small timeout so the test fails loudly rather
     // than hanging if the kernel-side production-buffer setup is wrong.
     let mut buf = vec![0u8; 256];
-    let (len, peer) = tokio::time::timeout(
-        Duration::from_secs(2),
-        b.socket_arc().recv_from(&mut buf),
-    )
-    .await
-    .expect("recv timed out — production-default NetSocket is not delivering loopback traffic")
-    .expect("recv I/O");
+    let (len, peer) =
+        tokio::time::timeout(Duration::from_secs(2), b.socket_arc().recv_from(&mut buf))
+            .await
+            .expect(
+                "recv timed out — production-default NetSocket is not delivering loopback traffic",
+            )
+            .expect("recv I/O");
     assert_eq!(len, payload.len());
     assert_eq!(&buf[..len], payload);
     assert_eq!(peer, a_addr);
@@ -73,5 +73,9 @@ async fn netsocket_new_reports_bound_local_addr() {
 
     let resolved = sock.local_addr();
     assert_eq!(resolved.ip(), bind.ip(), "bound IP must match request");
-    assert_ne!(resolved.port(), 0, "ephemeral port must resolve to a real port");
+    assert_ne!(
+        resolved.port(),
+        0,
+        "ephemeral port must resolve to a real port"
+    );
 }
