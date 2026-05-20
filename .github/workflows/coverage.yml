@@ -1,0 +1,101 @@
+name: Coverage
+
+# Stage 2.5 of PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md — generate
+# source-based line / region coverage with cargo-llvm-cov and
+# upload to Codecov for the PR-comment + dashboard surface.
+#
+# Crucially this is an **information-only** workflow, not a gate.
+# `codecov.yml` at the repo root pins every Codecov status to
+# `informational: true` so a coverage drop never blocks a merge.
+# The plan and the project's existing TEST_COVERAGE_PLAN.md both
+# explicitly reject percentage targets ("reward testing trivial
+# getters"); the data is useful for spot-checking new code, not
+# for gating.
+#
+# Triggers:
+#   - push to master  -> updates the baseline Codecov tracks
+#   - pull_request    -> computes patch + project deltas for the PR
+#
+# The workflow caches the cargo build directory like the rest of
+# CI; the coverage instrumentation rebuilds with `-C
+# instrument-coverage` so the cache key is segregated to avoid
+# poisoning the main cargo cache.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: Coverage (cargo-llvm-cov)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v6
+
+      # The rust-toolchain.toml in net/crates/net pins
+      # `llvm-tools-preview` as a required component, which provides
+      # the `llvm-profdata` / `llvm-cov` binaries cargo-llvm-cov
+      # invokes. Using dtolnay/rust-toolchain@stable picks up
+      # whatever the toolchain file specifies, so no separate
+      # components arg here.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Separate cache key from the main CI clippy/test jobs so the
+      # coverage-instrumented build artifacts (which embed source-
+      # location maps from `-C instrument-coverage`) don't poison
+      # the cache the main jobs depend on.
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      # `--features` mirrors the unit-tests job (net + redex +
+      # cortex + netdb). `--lib` keeps the run scoped to the core
+      # crate's library target — the FFI shims, bindings,
+      # benchmarks, fuzz, and examples are explicitly ignored in
+      # codecov.yml. Workspace-wide coverage with --all-features
+      # would balloon CI runtime ~4x without adding signal for the
+      # substrate authors who are the primary audience.
+      - name: Generate coverage (lcov)
+        run: >
+          cargo llvm-cov
+          --features "net redex cortex netdb"
+          --lib
+          --lcov
+          --output-path coverage.lcov
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: net/crates/net/coverage.lcov
+          # `fail_ci_if_error: false` keeps the workflow advisory
+          # — a Codecov-side outage / token issue must never block
+          # a merge.
+          fail_ci_if_error: false
+          # `token: ${{ secrets.CODECOV_TOKEN }}` is required for
+          # private repos and recommended for public ones (tokenless
+          # uploads from forks fail intermittently in mid-2026).
+          # Configure the secret at:
+          #   Settings -> Secrets and variables -> Actions
+          #   -> New repository secret -> CODECOV_TOKEN
+          # The value comes from codecov.io/gh/<org>/<repo>/settings.
+          token: ${{ secrets.CODECOV_TOKEN }}

@@ -1,0 +1,63 @@
+# Codecov configuration — info-only, never a CI gate.
+#
+# Background: PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md Stage 2.5
+# (audit-site coverage check) added cargo-llvm-cov tooling but the
+# project's existing `TEST_COVERAGE_PLAN.md` / `TEST_COVERAGE_PLAN_2.md`
+# both explicitly reject line / branch coverage percentage targets
+# ("reward testing trivial getters at the expense of real
+# invariants"). Codecov's default behavior is to fail PR status
+# checks when coverage drops below a target; that contradicts the
+# project stance. The settings below make every status check
+# `informational: true` so the dashboard and PR comments still
+# surface the data but the check never blocks a merge.
+
+coverage:
+  # Round to whole percent in the dashboard. Sub-percent precision
+  # is noise — what matters is the per-PR delta visible in the
+  # commit comment.
+  round: nearest
+  precision: 0
+
+  status:
+    # Project-wide coverage delta on the PR. `target: auto` compares
+    # against the base commit; `informational: true` posts the
+    # number as a comment / status, never as a required check.
+    project:
+      default:
+        target: auto
+        threshold: 5%
+        informational: true
+        only_pulls: false
+
+    # Patch coverage = coverage of just the lines this PR touched.
+    # Useful signal ("did the change land with tests?") but also
+    # informational so it doesn't gate.
+    patch:
+      default:
+        target: auto
+        threshold: 5%
+        informational: true
+        only_pulls: true
+
+# Show one PR comment with the project + patch summary. The
+# `behavior: default` setting edits the existing comment instead
+# of posting a new one per push.
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default
+  require_changes: false
+  require_base: false
+  require_head: false
+
+# Skip generated / vendored / external-binding code. Coverage of
+# FFI shim crates doesn't reflect substrate quality (the language
+# bindings get their own dedicated CI tests; double-counting them
+# here just inflates the headline number).
+ignore:
+  - "net/crates/net/bindings/**"
+  - "net/crates/net/fuzz/**"
+  - "net/crates/net/benches/**"
+  - "net/crates/net/examples/**"
+  - "net/crates/net/target/**"
+  - "**/tests/**"
+  - "l0/**"

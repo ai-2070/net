@@ -1,4 +1,10 @@
 [toolchain]
 channel = "1.95.0"
-components = ["clippy", "rustfmt"]
+# `llvm-tools-preview` is required by `cargo-llvm-cov` (the coverage
+# tool wired up in `.github/workflows/coverage.yml`) — it provides
+# the `llvm-profdata` + `llvm-cov` binaries source-based coverage
+# instrumentation needs. Adding it here keeps every contributor /
+# CI runner on the same component set without a separate
+# `rustup component add` step.
+components = ["clippy", "rustfmt", "llvm-tools-preview"]
 profile = "minimal"

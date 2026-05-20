@@ -149,7 +149,26 @@ This prevents the panic-on-poison or recover-from-poison patterns from reappeari
 
 ---
 
-## Stage 2.5 — Audit-site coverage check
+## Stage 2.5 — Audit-site coverage check (landed)
+
+**Status:** scaffolding landed as a permanent info-only PR-comment
+surface rather than the originally-scoped one-shot audit. Files
+on the `code-quality` branch:
+
+- `net/crates/net/rust-toolchain.toml` adds `llvm-tools-preview`
+  so contributors / CI runners get `llvm-profdata` + `llvm-cov`
+  out of the box; no separate `rustup component add` step.
+- `.github/workflows/coverage.yml` runs `cargo llvm-cov` against
+  `--features "net redex cortex netdb" --lib` on every push to
+  master + every PR, emits an lcov report, uploads to Codecov.
+- `codecov.yml` at the repo root pins every status check to
+  `informational: true` so the percentage shows up as a PR
+  comment but **never** fails the merge gate. Project / patch
+  thresholds set to `auto` (compare against base commit).
+
+This expands the originally-planned one-shot audit into ongoing
+PR coverage visibility while still respecting the project's
+no-percentage-target stance documented in `TEST_COVERAGE_PLAN.md`.
 
 **Cost:** ¼ to ½ day (mostly tooling setup; the actual check is mechanical).
 **Output:** a one-off report proving every site Stage 2 converted to a propagated `Result` has at least one test that hits the new error branch. Any uncovered branch gets one targeted test, or the conversion is reverted to `.expect("invariant: …")` if the path is genuinely unreachable.
