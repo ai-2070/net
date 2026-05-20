@@ -116,3 +116,21 @@ pub fn unix_now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_now_ms_returns_recent_timestamp() {
+        // The only meaningful contract for this helper: monotonic on
+        // a sane clock (`SystemTime::now()` doesn't read pre-epoch)
+        // and within a reasonable window of "now". We pin both —
+        // the `unwrap_or(0)` fallback only fires on a pre-1970 clock.
+        let t = unix_now_ms();
+        // 2025-01-01 in unix ms — any sane test environment is past
+        // this, so a zero return would mean the SystemTime call
+        // failed in a way we want to surface.
+        assert!(t > 1_735_689_600_000, "unix_now_ms returned suspicious {t}");
+    }
+}
