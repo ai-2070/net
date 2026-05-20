@@ -673,8 +673,19 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
 
+      # Stage 1 of PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md introduces four
+      # panic-hygiene lints at `warn` level in `Cargo.toml`'s `[lints.clippy]`
+      # table. The existing `-D warnings` gate would promote them to errors
+      # before Stage 2 fixes the ~280 library-code sites, so allow them here
+      # until Stage 2 lands and Stage 4 removes these `-A` flags.
       - name: Run clippy
-        run: cargo clippy --all-features --all-targets -- -D warnings
+        run: >
+          cargo clippy --all-features --all-targets --
+          -D warnings
+          -A clippy::unwrap_used
+          -A clippy::expect_used
+          -A clippy::undocumented_unsafe_blocks
+          -A clippy::multiple_unsafe_ops_per_block
 
   # The `clippy` job above lints only the root `net` package — `cargo
   # clippy` without `--workspace` doesn't traverse workspace members,
