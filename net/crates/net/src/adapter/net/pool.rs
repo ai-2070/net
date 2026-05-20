@@ -997,6 +997,113 @@ mod tests {
         );
     }
 
+    // ---------- Constructor coverage ----------
+
+    #[test]
+    fn packet_builder_with_origin_records_session_and_origin() {
+        let key = [0x42u8; 32];
+        let session_id = 0xAA_BBCC_DDEE_FF11;
+        let origin_hash = 0xCAFEBABE_DEADBEEF;
+        let builder = PacketBuilder::with_origin(&key, session_id, origin_hash);
+        assert_eq!(builder.session_id, session_id);
+        assert_eq!(builder.origin_hash, origin_hash);
+    }
+
+    #[test]
+    fn packet_pool_new_and_get_round_trip() {
+        let key = [0x33u8; 32];
+        let session_id = 0xDEAD_FACE;
+        let pool = PacketPool::new(4, &key, session_id);
+        assert_eq!(pool.session_id, session_id);
+        // `get` returns a PooledBuilder; drop returns it to the
+        // pool, so the available count is restored.
+        {
+            let _b = pool.get();
+        }
+        // Pool length back at capacity after the guard drops.
+        assert_eq!(pool.builders.len(), 4);
+    }
+
+    #[test]
+    fn thread_local_pool_with_origin_constructs_with_default_local_capacity() {
+        let key = [0x55u8; 32];
+        let session_id = 0xFEED_FACE;
+        let origin_hash = 0x1234_5678;
+        let pool = ThreadLocalPool::with_origin(8, &key, session_id, origin_hash);
+        assert_eq!(pool.capacity(), 8);
+        assert_eq!(pool.session_id(), session_id);
+        assert_eq!(
+            pool.local_capacity(),
+            ThreadLocalPool::DEFAULT_LOCAL_CAPACITY
+        );
+    }
+
+    // ---------- Debug impl coverage ----------
+    //
+    // Each Debug impl formats a few load-bearing fields. Pin
+    // them so a future refactor that silently drops a field
+    // (and breaks operator dashboards reading the debug output)
+    // gets caught.
+
+    #[test]
+    fn packet_builder_debug_includes_session_id() {
+        let key = [0x42u8; 32];
+        let builder = PacketBuilder::new(&key, 0xAB_CDEF);
+        let s = format!("{:?}", builder);
+        assert!(s.contains("PacketBuilder"));
+        assert!(s.contains("0000000000abcdef"), "got: {s}");
+    }
+
+    #[test]
+    fn packet_pool_debug_includes_capacity_available_and_session() {
+        let key = [0x42u8; 32];
+        // 16-hex-digit session_id avoids the `{:016x}` padding
+        // mismatch (a 7-hex value would zero-pad to 9 leading
+        // zeros, not 10).
+        let pool = PacketPool::new(4, &key, 0x1234_5678_9ABC_DEF0);
+        let s = format!("{:?}", pool);
+        assert!(s.contains("PacketPool"));
+        assert!(s.contains("capacity: 4"));
+        assert!(s.contains("available"));
+        assert!(s.contains("123456789abcdef0"), "got: {s}");
+    }
+
+    #[test]
+    fn thread_local_pool_debug_includes_capacities_and_session() {
+        let key = [0x42u8; 32];
+        let pool = ThreadLocalPool::new(8, &key, 0xC0FFEE);
+        let s = format!("{:?}", pool);
+        assert!(s.contains("ThreadLocalPool"));
+        assert!(s.contains("capacity: 8"));
+        assert!(s.contains("shared_available"));
+        assert!(s.contains("local_capacity"));
+        assert!(s.contains("0000000000c0ffee"), "got: {s}");
+    }
+
+    // ---------- PooledBuilder delegation methods ----------
+
+    #[test]
+    fn pooled_builder_delegates_handshake_heartbeat_and_would_fit() {
+        let key = [0x42u8; 32];
+        let pool = PacketPool::new(2, &key, 0xABCD_1234);
+        let mut b = pool.get();
+
+        // build_handshake: returns a non-empty packet.
+        let hs = b.build_handshake(b"hello");
+        assert!(!hs.is_empty(), "handshake packet should not be empty");
+
+        // build_heartbeat: returns a non-empty AEAD-encrypted packet.
+        let hb = b.build_heartbeat();
+        assert!(!hb.is_empty(), "heartbeat packet should not be empty");
+
+        // would_fit: a single tiny event always fits.
+        assert!(b.would_fit(&[Bytes::from_static(b"x")]));
+
+        // would_fit returns false for an oversized event.
+        let big = Bytes::from(vec![0u8; MAX_PAYLOAD_SIZE + 1]);
+        assert!(!b.would_fit(&[big]));
+    }
+
     #[test]
     fn test_thread_local_pool_acquire_release() {
         let key = [0x42u8; 32];
