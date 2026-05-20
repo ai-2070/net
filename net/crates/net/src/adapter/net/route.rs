@@ -1036,20 +1036,28 @@ mod tests {
         table.add_route(0x2222, addr_a);
         table.add_route(0x3333, addr_b);
 
-        // Backdate 0x2222's entry so it looks stale.
+        // Backdate 0x2222's entry so it looks stale. `checked_sub`
+        // avoids the overflow panic that fires on hosts with
+        // system uptime < the subtracted duration (Windows
+        // Instant is bounded by boot). The 200ms / 50ms pair
+        // tests the same staleness invariant without hour-scale
+        // uptime requirements.
+        let stale_ts = Instant::now()
+            .checked_sub(Duration::from_millis(200))
+            .expect("test host uptime should exceed 200ms");
         {
             let mut e = table.routes.get_mut(&0x2222).unwrap();
-            e.updated_at = Instant::now() - Duration::from_secs(3600);
+            e.updated_at = stale_ts;
         }
 
         // With a small max-age, the backdated entry is stale but the
         // fresh one is still visible.
-        table.set_max_route_age(Duration::from_secs(60));
+        table.set_max_route_age(Duration::from_millis(50));
         assert_eq!(table.lookup(0x2222), None);
         assert_eq!(table.lookup(0x3333), Some(addr_b));
 
         // Sweep physically removes the stale entry.
-        let removed = table.sweep_stale(Duration::from_secs(60));
+        let removed = table.sweep_stale(Duration::from_millis(50));
         assert_eq!(removed, 1);
         assert!(table.routes.get(&0x2222).is_none());
         assert!(table.routes.get(&0x3333).is_some());
@@ -1120,11 +1128,17 @@ mod tests {
 
         table.add_route(0x4444, b);
         // Backdate the entry so `updated_at.elapsed() > max_route_age`.
+        // `checked_sub` avoids the overflow panic that fires on
+        // hosts with system uptime < the subtracted duration
+        // (Windows Instant is bounded by boot).
+        let stale_ts = Instant::now()
+            .checked_sub(Duration::from_millis(200))
+            .expect("test host uptime should exceed 200ms");
         {
             let mut e = table.routes.get_mut(&0x4444).unwrap();
-            e.updated_at = Instant::now() - Duration::from_secs(3600);
+            e.updated_at = stale_ts;
         }
-        table.set_max_route_age(Duration::from_secs(60));
+        table.set_max_route_age(Duration::from_millis(50));
 
         // Even though the next_hop isn't excluded, staleness drops it.
         assert!(table.lookup_alternate(0x4444, c).is_none());

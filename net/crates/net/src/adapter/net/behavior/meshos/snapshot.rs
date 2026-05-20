@@ -1072,14 +1072,26 @@ mod tests {
         // last `Started`. Otherwise the Deck reads "running,
         // X hours old" for a daemon that has actually been
         // dead the whole time.
+        //
+        // We use small `checked_sub` offsets here (not real
+        // hour-scale ones) because `Instant` is bounded by
+        // system boot on Windows — subtracting an hour
+        // panics if the system uptime is less than an hour
+        // (common in fresh VMs / CI). The test's invariant
+        // — that age_ms anchors on `last_exit`, not
+        // `last_started` — holds at any timescale; only the
+        // numbers in the assertion shift.
         let mut actual = MeshOsState::default();
         let now = Instant::now();
         actual.last_tick = Some(now);
         let d = dref("worker", 1);
         let mut status = DaemonStatus::default();
         status.lifecycle = DaemonLifecycle::Stopped;
-        status.last_started = Some(now - Duration::from_secs(3600));
-        status.last_exit = Some(now - Duration::from_secs(5));
+        status.last_started = now.checked_sub(Duration::from_secs(2));
+        status.last_exit = now.checked_sub(Duration::from_millis(500));
+        // Both must construct cleanly on a sane test host.
+        assert!(status.last_started.is_some());
+        assert!(status.last_exit.is_some());
         actual.daemons.insert(d, status);
         let snap = MeshOsSnapshot::from_state(
             &actual,
@@ -1092,10 +1104,20 @@ mod tests {
             0,
         );
         let daemon = snap.daemons.get(&1).expect("daemon present");
-        // ~5s window (allow a tick of jitter — the test pins
-        // "anchored on exit, not on started").
-        assert!(daemon.age_ms < 60_000, "got age_ms = {}", daemon.age_ms);
-        assert!(daemon.age_ms >= 5_000, "got age_ms = {}", daemon.age_ms);
+        // ~500ms window. If age_ms anchored on `last_started`
+        // it would be ~2000ms; if anchored on `last_exit` it
+        // is ~500ms. Allow generous jitter on both sides — the
+        // test pins the anchor, not the precise value.
+        assert!(
+            daemon.age_ms < 1500,
+            "age_ms anchored wrong (looks like last_started): got {}",
+            daemon.age_ms,
+        );
+        assert!(
+            daemon.age_ms >= 400,
+            "age_ms below last_exit floor: got {}",
+            daemon.age_ms,
+        );
     }
 
     #[test]
