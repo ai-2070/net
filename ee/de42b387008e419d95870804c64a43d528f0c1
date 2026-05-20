@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/behavior/context.rs
+  s_4f93eae8f45533::t_0a3f1f00dca28a 1815-1914,1927-1928,1930-1947,1949-1961
+  s_4f93eae8f45533::t_b622c196c1c660 1915-1926,1929,1948
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "eede42b387008e419d95870804c64a43d528f0c1",
+  "prompts": {},
+  "sessions": {
+    "s_4f93eae8f45533": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4eeaced2-d67f-413c-87c1-4b5954eae6be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
