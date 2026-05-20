@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/swarm.rs
+  s_4f93eae8f45533::t_d76663ae084e0b 1354-1469
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "7aad85a01e524f18d51065e3f61d72d02bda6d98",
+  "prompts": {},
+  "sessions": {
+    "s_4f93eae8f45533": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4eeaced2-d67f-413c-87c1-4b5954eae6be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
