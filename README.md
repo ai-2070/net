@@ -1,6 +1,20 @@
 # Net — [*Dataforts Out Now!*](#dataforts)
 
 [![codecov](https://codecov.io/gh/ai-2070/net/graph/badge.svg?token=AOBMOF6LE4)](https://codecov.io/gh/ai-2070/net)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
+[![crates.io: net-mesh-sdk](https://img.shields.io/crates/v/net-mesh-sdk.svg?label=crates.io%3A%20net-mesh-sdk)](https://crates.io/crates/net-mesh-sdk)
+[![crates.io: net-deck](https://img.shields.io/crates/v/net-deck.svg?label=crates.io%3A%20net-deck)](https://crates.io/crates/net-deck)
+[![crates.io: net-cli](https://img.shields.io/crates/v/net-cli.svg?label=crates.io%3A%20net-cli)](https://crates.io/crates/net-cli)
+[![docs.rs](https://img.shields.io/docsrs/net-mesh-sdk?label=docs.rs)](https://docs.rs/net-mesh-sdk)
+
+[![npm: @net-mesh/sdk](https://img.shields.io/npm/v/@net-mesh/sdk.svg?label=npm%3A%20%40net-mesh%2Fsdk)](https://www.npmjs.com/package/@net-mesh/sdk)
+[![npm: @net-mesh/core](https://img.shields.io/npm/v/@net-mesh/core.svg?label=npm%3A%20%40net-mesh%2Fcore)](https://www.npmjs.com/package/@net-mesh/core)
+[![npm: @net-mesh/deck](https://img.shields.io/npm/v/@net-mesh/deck.svg?label=npm%3A%20%40net-mesh%2Fdeck)](https://www.npmjs.com/package/@net-mesh/deck)
+[![npm: @net-mesh/cli](https://img.shields.io/npm/v/@net-mesh/cli.svg?label=npm%3A%20%40net-mesh%2Fcli)](https://www.npmjs.com/package/@net-mesh/cli)
+
+[![PyPI: net-mesh-cli](https://img.shields.io/pypi/v/net-mesh-cli.svg?label=PyPI%3A%20net-mesh-cli)](https://pypi.org/project/net-mesh-cli/)
+[![PyPI: net-deck](https://img.shields.io/pypi/v/net-deck.svg?label=PyPI%3A%20net-deck)](https://pypi.org/project/net-deck/)
 
 **Network Event Transport** — a latency-first encrypted mesh protocol.
 
