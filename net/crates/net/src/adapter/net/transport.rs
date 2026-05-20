@@ -286,6 +286,10 @@ impl BatchedPacketReceiver {
     ///
     /// Spawns a dedicated OS thread that owns `BatchedTransport` and sends
     /// received packets over a bounded channel.
+    #[expect(
+        clippy::expect_used,
+        reason = "std::thread::Builder::spawn only fails on OS resource exhaustion (OOM, ulimit); aborting at startup is the documented behavior for that condition"
+    )]
     pub fn new(socket: Arc<UdpSocket>) -> Self {
         use std::os::unix::io::AsRawFd;
         use std::sync::atomic::Ordering;

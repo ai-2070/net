@@ -4,6 +4,40 @@
 //! - sendmmsg/recvmmsg for batched I/O
 //! - io_uring support (optional)
 //! - Socket configuration for high-throughput
+//!
+//! # Safety
+//!
+//! This module is a thin wrapper over libc syscalls (sendmmsg,
+//! recvmmsg, setsockopt) and POSIX socket-message primitives
+//! (mmsghdr, msghdr, sockaddr_in / sockaddr_in6). Every `unsafe`
+//! block in this file falls into one of two contracts:
+//!
+//! 1. `std::mem::zeroed::<T>()` for a libc message-header POD
+//!    (`mmsghdr`, `msghdr`, `sockaddr_in`, …). These structs are
+//!    plain-data and all-zero is a valid bit pattern; the
+//!    individual fields are populated by the caller before the
+//!    syscall consumes them. Matches the standard libc idiom used
+//!    by `nix`, `socket2`, and tokio's UDP wrappers.
+//!
+//! 2. `libc::{sendmmsg, recvmmsg, setsockopt}` calls with a
+//!    caller-owned `RawFd`, message-vector pointer + length pair,
+//!    and option pointer + length pair. The fd is borrowed from
+//!    the owning `UdpSocket`; message pointers point to vectors
+//!    whose lifetime outlives the call; lengths are exact element
+//!    counts; option pointers point at stack-allocated `i32`s
+//!    paired with `size_of::<i32>()`.
+//!
+//! Per-block `// SAFETY:` comments would repeat one of those two
+//! contracts ~15 times. The module-level `#![expect]` below
+//! covers both while keeping the lint enforced everywhere else.
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "module-wide libc-syscall + POD-zero-init contract documented in the # Safety section above"
+)]
+#![expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "Linux syscall wrappers compose pointer arithmetic + libc calls in single semantic operations (one batched sendmmsg / recvmmsg / configure_socket call)"
+)]
 
 use bytes::{Bytes, BytesMut};
 use std::io;
