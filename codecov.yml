@@ -71,4 +71,6 @@ ignore:
   - "net/crates/net/examples/**"
   - "net/crates/net/target/**"
   - "**/tests/**"
-  - "l0/**"
+  - "go/**"
+  - "web/**"
+  - "crew/**"
