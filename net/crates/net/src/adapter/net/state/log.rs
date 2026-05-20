@@ -702,4 +702,116 @@ mod tests {
             "full prune updates base_link to the highest-seq pruned event",
         );
     }
+
+    // ---------- from_snapshot catchup constructor ----------
+
+    #[test]
+    fn from_snapshot_anchors_at_snapshot_seq_and_accepts_next_event() {
+        // Catchup path: a peer ships its snapshot at seq=5 with
+        // the head event's link; we initialize a log from that
+        // and then append event seq=6 that chains off it.
+        let (_, entity_id) = make_entity();
+        let origin_hash = entity_id.origin_hash();
+        let mut builder = CausalChainBuilder::new(origin_hash);
+
+        // Build a chain of 5 events to act as the "snapshot".
+        let mut last = None;
+        let mut last_payload = Bytes::new();
+        for i in 0..5 {
+            let payload = Bytes::from(format!("snap-{i}"));
+            let ev = builder.append(payload.clone(), 0).unwrap();
+            last = Some(ev.link.clone());
+            last_payload = payload;
+        }
+        let head_link = last.expect("five events appended");
+
+        // Construct the catchup log from the snapshot.
+        let mut log =
+            EntityLog::from_snapshot(entity_id, head_link.sequence, head_link, last_payload);
+        assert_eq!(log.snapshot_seq(), 5);
+        assert!(log.is_empty(), "catchup log starts with no in-memory events");
+
+        // The next event (seq=6) must chain cleanly off the
+        // snapshot's head.
+        let next = builder.append(Bytes::from_static(b"after"), 0).unwrap();
+        assert_eq!(next.link.sequence, 6);
+        log.append(next).expect("event past snapshot must validate");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.head_seq(), 6);
+    }
+
+    // ---------- LogIndex::remove ----------
+
+    #[test]
+    fn log_index_remove_returns_the_log_and_decrements_count() {
+        let index = LogIndex::new();
+        let (_, ent) = make_entity();
+        let h = ent.origin_hash();
+        {
+            let _ = index.get_or_create(ent.clone());
+        }
+        assert_eq!(index.entity_count(), 1);
+
+        let removed = index.remove(h).expect("entry present pre-remove");
+        assert_eq!(removed.origin_hash, h);
+        assert_eq!(index.entity_count(), 0);
+        assert!(index.get(h).is_none());
+
+        // Removing again returns None — no panic.
+        assert!(index.remove(h).is_none());
+    }
+
+    // ---------- Default impl + Debug ----------
+
+    #[test]
+    fn log_index_default_equals_new() {
+        let a: LogIndex = Default::default();
+        let b = LogIndex::new();
+        assert_eq!(a.entity_count(), b.entity_count());
+    }
+
+    #[test]
+    fn entity_log_debug_includes_id_and_counters() {
+        let (_, ent) = make_entity();
+        let log = EntityLog::new(ent);
+        let s = format!("{:?}", log);
+        assert!(s.contains("EntityLog"));
+        assert!(s.contains("events: 0"));
+        assert!(s.contains("head_seq"));
+        assert!(s.contains("snapshot_seq: 0"));
+    }
+
+    #[test]
+    fn log_index_debug_includes_entity_count() {
+        let index = LogIndex::new();
+        let s = format!("{:?}", index);
+        assert!(s.contains("LogIndex"));
+        assert!(s.contains("entities: 0"));
+
+        let (_, ent) = make_entity();
+        let _ = index.get_or_create(ent);
+        let s = format!("{:?}", index);
+        assert!(s.contains("entities: 1"));
+    }
+
+    // ---------- LogError Display ----------
+
+    #[test]
+    fn log_error_display_covers_both_variants() {
+        let dup = LogError::Duplicate(42);
+        assert_eq!(format!("{}", dup), "duplicate sequence: 42");
+
+        // Chain wraps a ChainError; we don't pin the inner
+        // message (it's owned by the chain module) — only the
+        // outer "chain error:" prefix produced here.
+        let (_, ent) = make_entity();
+        let mut log = EntityLog::new(ent);
+        let mut other_builder = CausalChainBuilder::new(0xDEAD_BEEF);
+        let bad = other_builder
+            .append(Bytes::from_static(b"wrong origin"), 0)
+            .unwrap();
+        let err = log.append(bad).unwrap_err();
+        let s = format!("{}", err);
+        assert!(s.starts_with("chain error:"), "got: {s}");
+    }
 }
