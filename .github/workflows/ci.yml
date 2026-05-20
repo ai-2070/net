@@ -125,6 +125,10 @@ jobs:
           --test cross_lang_capability_fixtures
           --test migration_integration
           --test migration_target_failure_mid_chunking
+          --test netsocket_production_defaults
+          --test parsed_packet_short_input
+          --test proxy_coverage_gaps
+          --test stream_config_and_error_display
 
       # === NAT traversal ==================================================
       - name: NAT traversal
@@ -184,7 +188,10 @@ jobs:
       # === NetDB ==========================================================
       - name: NetDB
         if: ${{ !cancelled() }}
-        run: cargo nextest run --no-fail-fast --features netdb --test integration_netdb
+        run: >
+          cargo nextest run --no-fail-fast --features netdb
+          --test integration_netdb
+          --test netdb_builder_and_accessors
 
       # === Dataforts (greedy + gravity) ===================================
       - name: Dataforts greedy + gravity
