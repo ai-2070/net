@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  s_4f93eae8f45533::t_b8af88c242a491 1473-1481,1483,1485
+net/crates/net/src/adapter/net/route.rs
+  s_4f93eae8f45533::t_66cf3f2f05171c 1039-1047,1050,1055,1060
+  s_4f93eae8f45533::t_97d7c416ee4357 1131-1136,1139,1141
+net/crates/net/src/shard/mapper.rs
+  s_4f93eae8f45533::t_0a0f2e5730ddb7 2132-2139,2143,2149-2155,2159-2161,2167-2169,2190
+net/crates/net/src/adapter/net/behavior/meshos/snapshot.rs
+  s_4f93eae8f45533::t_f758c82f27b637 1075-1083,1090-1094,1107-1120
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "fb167c6ce1ca8b5fbf6d3077517326c530883ac6",
+  "prompts": {},
+  "sessions": {
+    "s_4f93eae8f45533": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4eeaced2-d67f-413c-87c1-4b5954eae6be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
