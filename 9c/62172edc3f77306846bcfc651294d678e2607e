@@ -1,0 +1,23 @@
+net/crates/net/docs/plans/PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md
+  s_e9432586a99852::t_801a760aad0e91 32
+  s_e9432586a99852::t_d26e32f00dab19 229
+  s_e9432586a99852::t_80f3d922472afd 23
+  s_e9432586a99852::t_0ba1472c34666c 217,221
+  s_e9432586a99852::t_dbf8df5d34a630 130-171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "9c62172edc3f77306846bcfc651294d678e2607e",
+  "prompts": {},
+  "sessions": {
+    "s_e9432586a99852": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fbeaee78-6362-47f1-a432-288d813cb99f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
