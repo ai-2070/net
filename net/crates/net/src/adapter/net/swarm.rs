@@ -1351,4 +1351,120 @@ mod tests {
         let no_path = graph.path_to(0x9999);
         assert!(no_path.is_none());
     }
+
+    // ---------- Pingwave write_to/read_from buffer codec ----------
+    //
+    // Existing tests cover the `to_bytes`/`from_bytes` array
+    // path. `write_to`/`read_from` work on the bytes::BytesMut
+    // and Bytes types — same semantics, different consumers
+    // (the wire codec uses these). A regression in field order
+    // here would silently corrupt every pingwave on the wire.
+
+    #[test]
+    fn pingwave_write_to_and_read_from_roundtrip() {
+        let pw = Pingwave::new(0xDEADBEEF_CAFEBABE, 12345, 7);
+        let mut buf = BytesMut::new();
+        pw.write_to(&mut buf);
+        // PINGWAVE_SIZE is the fixed-size wire frame; the codec
+        // must write exactly that many bytes.
+        assert_eq!(buf.len(), PINGWAVE_SIZE);
+
+        let mut bytes = buf.freeze();
+        let parsed = Pingwave::read_from(&mut bytes).expect("roundtrip parse must succeed");
+        assert_eq!(parsed.origin_id, pw.origin_id);
+        assert_eq!(parsed.seq, pw.seq);
+        assert_eq!(parsed.ttl, pw.ttl);
+        assert_eq!(parsed.hop_count, pw.hop_count);
+        // The reader must consume exactly the frame — anything
+        // left behind is a length-bug that'd desync the codec.
+        assert_eq!(bytes.remaining(), 0);
+    }
+
+    #[test]
+    fn pingwave_read_from_returns_none_on_truncated_buffer() {
+        // A buffer shorter than PINGWAVE_SIZE must return None
+        // rather than reading past the end (UB) or panicking.
+        let mut buf = Bytes::from(vec![0u8; PINGWAVE_SIZE - 1]);
+        assert!(Pingwave::read_from(&mut buf).is_none());
+    }
+
+    // ---------- LocalGraph filter methods ----------
+
+    fn populate_graph_for_filter_tests() -> (LocalGraph, SocketAddr) {
+        let graph = LocalGraph::new(0x1111, 3);
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        // Three nodes at distinct hop distances with distinct tags.
+        graph.nodes.insert(0x2222, NodeInfo::new(0x2222, addr, 1));
+        graph.nodes.insert(0x3333, NodeInfo::new(0x3333, addr, 2));
+        graph.nodes.insert(0x4444, NodeInfo::new(0x4444, addr, 3));
+
+        let caps_gpu = Capabilities::new().with_gpu(true).with_tag("inference");
+        let caps_cpu = Capabilities::new().with_gpu(false).with_tag("training");
+        graph.on_capability(CapabilityAd::new(0x2222, 1, caps_gpu), addr);
+        graph.on_capability(CapabilityAd::new(0x3333, 1, caps_cpu), addr);
+        // 0x4444 has no capabilities advertised — must be
+        // excluded from tag/gpu searches but counted in hop searches.
+        (graph, addr)
+    }
+
+    #[test]
+    fn find_by_tag_returns_only_matching_nodes() {
+        let (graph, _) = populate_graph_for_filter_tests();
+        let inference = graph.find_by_tag("inference");
+        assert_eq!(inference.len(), 1);
+        assert_eq!(inference[0].node_id, 0x2222);
+
+        let training = graph.find_by_tag("training");
+        assert_eq!(training.len(), 1);
+        assert_eq!(training[0].node_id, 0x3333);
+
+        // Tag matched against a node without capabilities → empty.
+        assert!(graph.find_by_tag("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn nodes_within_hops_filters_by_hop_distance() {
+        let (graph, _) = populate_graph_for_filter_tests();
+        // hops: 0x2222 -> 1, 0x3333 -> 2, 0x4444 -> 3
+        let within_1 = graph.nodes_within_hops(1);
+        assert_eq!(within_1.len(), 1);
+        assert_eq!(within_1[0].node_id, 0x2222);
+
+        let within_2 = graph.nodes_within_hops(2);
+        assert_eq!(within_2.len(), 2);
+
+        let within_3 = graph.nodes_within_hops(3);
+        assert_eq!(within_3.len(), 3);
+
+        let within_0 = graph.nodes_within_hops(0);
+        assert!(within_0.is_empty());
+    }
+
+    // ---------- LocalGraph Debug ----------
+
+    #[test]
+    fn local_graph_debug_format_includes_id_radius_and_counts() {
+        let graph = LocalGraph::new(0xABCD_1234_5678_9000, 5);
+        let s = format!("{:?}", graph);
+        assert!(s.contains("LocalGraph"));
+        assert!(s.contains("radius: 5"));
+        assert!(s.contains("nodes: 0"));
+        assert!(s.contains("edges: 0"));
+        assert!(s.contains("abcd123456789000"), "got: {s}");
+    }
+
+    // ---------- EdgeInfo constructors ----------
+
+    #[test]
+    fn edge_info_new_and_with_latency_set_fields_correctly() {
+        let e = EdgeInfo::new(1, 2);
+        assert_eq!(e.from, 1);
+        assert_eq!(e.to, 2);
+        assert_eq!(e.latency_us, 0);
+
+        let e = EdgeInfo::with_latency(7, 9, 500);
+        assert_eq!(e.from, 7);
+        assert_eq!(e.to, 9);
+        assert_eq!(e.latency_us, 500);
+    }
 }
