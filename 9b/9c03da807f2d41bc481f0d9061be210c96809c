@@ -1,0 +1,28 @@
+net/crates/net/tests/parsed_packet_short_input.rs
+  s_e9432586a99852::t_4623087ab658bc 1-65
+net/crates/net/tests/netsocket_production_defaults.rs
+  s_e9432586a99852::t_6c555cc81d5d9d 1-77
+net/crates/net/src/adapter/net/transport.rs
+  s_e9432586a99852::t_eecc6d0210ffd6 718
+  s_e9432586a99852::t_99a7dc9663387d 651
+  s_e9432586a99852::t_296dbdbb0a52d8 649
+  s_e9432586a99852::t_80f881342e6022 702
+  s_e9432586a99852::t_bf4651470a84cc 614-648,650,652-668,670-701,703-717,719-735,737-740
+  s_e9432586a99852::t_cfe824e431fd91 669,736
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "9b9c03da807f2d41bc481f0d9061be210c96809c",
+  "prompts": {},
+  "sessions": {
+    "s_e9432586a99852": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fbeaee78-6362-47f1-a432-288d813cb99f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
