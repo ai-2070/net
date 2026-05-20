@@ -1,0 +1,25 @@
+net/crates/net/rust-toolchain.toml
+  s_e9432586a99852::t_7222fd87721868 3-9
+codecov.yml
+  s_e9432586a99852::t_c86a3d4b0db485 1-63
+.github/workflows/coverage.yml
+  s_e9432586a99852::t_d10b8a68389e10 1-101
+net/crates/net/docs/plans/PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md
+  s_e9432586a99852::t_0167199249bee2 152-171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "9a98d696a4d055a90d479e69c4ff67f1df595135",
+  "prompts": {},
+  "sessions": {
+    "s_e9432586a99852": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fbeaee78-6362-47f1-a432-288d813cb99f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
