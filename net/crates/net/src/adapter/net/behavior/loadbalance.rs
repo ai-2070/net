@@ -2433,4 +2433,155 @@ mod tests {
             );
         }
     }
+
+    // ---------- Untested strategy coverage ----------
+    //
+    // Existing tests cover RoundRobin, WeightedRoundRobin,
+    // LeastConnections, and WeightedLeastConnections. The
+    // remaining strategies — Random, WeightedRandom,
+    // ConsistentHash, PowerOfTwo, Adaptive — share the
+    // hot path and a regression in any of them would silently
+    // mis-route requests. Each test below pins the selection
+    // reason so a future refactor that swaps strategies under
+    // the same enum variant gets caught.
+
+    fn three_endpoint_lb(strategy: Strategy) -> LoadBalancer {
+        let lb = LoadBalancer::with_strategy(strategy);
+        lb.add_endpoint(Endpoint::new(make_node_id(1)));
+        lb.add_endpoint(Endpoint::new(make_node_id(2)));
+        lb.add_endpoint(Endpoint::new(make_node_id(3)));
+        lb
+    }
+
+    #[test]
+    fn random_strategy_selects_among_all_endpoints_with_random_reason() {
+        let lb = three_endpoint_lb(Strategy::Random);
+        let ctx = RequestContext::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let s = lb.select(&ctx).unwrap();
+            assert_eq!(s.reason, SelectionReason::Random);
+            seen.insert(s.node_id[0]);
+        }
+        // 200 draws across 3 endpoints — overwhelmingly likely to
+        // hit every endpoint at least once. (Birthday-style: P(any
+        // missing) ≈ 3 * (2/3)^200 ≈ 1e-35.)
+        assert_eq!(seen.len(), 3, "expected all 3 endpoints, saw {seen:?}");
+    }
+
+    #[test]
+    fn weighted_random_respects_relative_weights() {
+        let lb = LoadBalancer::with_strategy(Strategy::WeightedRandom);
+        lb.add_endpoint(Endpoint::new(make_node_id(1)).with_weight(10));
+        lb.add_endpoint(Endpoint::new(make_node_id(2)).with_weight(100));
+        let ctx = RequestContext::new();
+        let mut counts = std::collections::HashMap::new();
+        for _ in 0..400 {
+            let s = lb.select(&ctx).unwrap();
+            assert_eq!(s.reason, SelectionReason::Weighted);
+            *counts.entry(s.node_id[0]).or_insert(0) += 1;
+        }
+        // Heavy weight (100) must dominate the light weight (10).
+        // Allow a wide margin — we're not testing the RNG quality,
+        // just that the weight is read.
+        let light = *counts.get(&1).unwrap_or(&0);
+        let heavy = *counts.get(&2).unwrap_or(&0);
+        assert!(
+            heavy > light * 3,
+            "weighted-random ignored weights: light={light}, heavy={heavy}",
+        );
+    }
+
+    #[test]
+    fn weighted_random_with_zero_total_weight_falls_back_to_uniform_random() {
+        let lb = LoadBalancer::with_strategy(Strategy::WeightedRandom);
+        // Both endpoints with weight 0 — `total_weight <= 0.0`
+        // forces the fallback path inside select_weighted_random.
+        lb.add_endpoint(Endpoint::new(make_node_id(1)).with_weight(0));
+        lb.add_endpoint(Endpoint::new(make_node_id(2)).with_weight(0));
+        let ctx = RequestContext::new();
+
+        // Must not panic; must return a real selection. The reason
+        // is `Random` because the implementation delegates to
+        // `select_random` when total_weight is non-positive.
+        let s = lb.select(&ctx).unwrap();
+        assert_eq!(s.reason, SelectionReason::Random);
+    }
+
+    #[test]
+    fn consistent_hash_returns_same_endpoint_for_same_routing_key() {
+        let lb = three_endpoint_lb(Strategy::ConsistentHash);
+        let ctx = RequestContext::new().with_routing_key("user-42");
+
+        let s1 = lb.select(&ctx).unwrap();
+        for _ in 0..50 {
+            let s = lb.select(&ctx).unwrap();
+            assert_eq!(s.node_id, s1.node_id, "consistent-hash diverged");
+        }
+    }
+
+    #[test]
+    fn power_of_two_returns_powerof_two_reason() {
+        let lb = three_endpoint_lb(Strategy::PowerOfTwo);
+        let ctx = RequestContext::new();
+        let s = lb.select(&ctx).unwrap();
+        assert_eq!(s.reason, SelectionReason::PowerOfTwo);
+    }
+
+    #[test]
+    fn adaptive_strategy_selects_an_endpoint() {
+        // Adaptive picks between strategies based on average load;
+        // with default (no metrics) all endpoints score 0 so it
+        // takes the low-load branch. Pin that the strategy runs
+        // and returns a valid selection.
+        let lb = three_endpoint_lb(Strategy::Adaptive);
+        let ctx = RequestContext::new();
+        let s = lb.select(&ctx).unwrap();
+        assert!(matches!(s.node_id[0], 1 | 2 | 3));
+    }
+
+    // ---------- endpoints() snapshot ----------
+
+    #[test]
+    fn endpoints_snapshot_reflects_added_endpoints() {
+        let lb = LoadBalancer::with_strategy(Strategy::RoundRobin);
+        lb.add_endpoint(Endpoint::new(make_node_id(1)).with_weight(50));
+        lb.add_endpoint(Endpoint::new(make_node_id(2)).with_weight(75));
+
+        let snapshot = lb.endpoints();
+        assert_eq!(snapshot.len(), 2);
+        // Order isn't guaranteed (DashMap iteration) — assert
+        // by node_id membership rather than position.
+        let weights: std::collections::HashMap<u8, u32> = snapshot
+            .iter()
+            .map(|e| (e.node_id[0], e.weight))
+            .collect();
+        assert_eq!(weights.get(&1), Some(&50));
+        assert_eq!(weights.get(&2), Some(&75));
+    }
+
+    // ---------- LoadBalancerError Display ----------
+
+    #[test]
+    fn load_balancer_error_display_covers_every_variant() {
+        let id = make_node_id(7);
+        assert_eq!(
+            format!("{}", LoadBalancerError::NoEndpointsAvailable),
+            "no endpoints available"
+        );
+        assert_eq!(
+            format!("{}", LoadBalancerError::AllEndpointsUnhealthy),
+            "all endpoints unhealthy"
+        );
+        assert_eq!(
+            format!("{}", LoadBalancerError::NoMatchingEndpoints),
+            "no endpoints match required tags"
+        );
+        assert!(format!("{}", LoadBalancerError::EndpointNotFound(id))
+            .starts_with("endpoint not found:"));
+        assert!(format!("{}", LoadBalancerError::CircuitOpen(id))
+            .starts_with("circuit breaker open for:"));
+        assert!(format!("{}", LoadBalancerError::MaxConnectionsReached(id))
+            .starts_with("max connections reached for:"));
+    }
 }
