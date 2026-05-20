@@ -10,6 +10,10 @@
 //! explicit at the type level; the module-wide contract callers
 //! must uphold is:
 //! - Pointers are valid and properly aligned
+//! - Opaque handle pointers (`*mut T`) were produced by this crate's
+//!   matching constructor (`Box::into_raw` inside the FFI surface).
+//!   Foreign-allocated pointers, even if valid and aligned, will UB
+//!   when consumed by `Box::from_raw` in the corresponding `_free`.
 //! - String pointers point to valid UTF-8 data
 //! - Buffer sizes are accurate
 //! - Handles are not used after `net_shutdown`

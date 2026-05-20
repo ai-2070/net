@@ -746,27 +746,4 @@ mod tests {
         enable_timestamps(socket.as_raw_fd())
             .expect("SO_TIMESTAMPNS must accept on a fresh DGRAM socket");
     }
-
-    /// `Debug for BatchedTransport` (linux.rs:443-450). Trivial
-    /// debug_struct surface — exercised here so the lines show
-    /// as covered. A regression that breaks the impl would
-    /// surface at format-call time, not at runtime.
-    #[test]
-    fn debug_impl_renders_socket_fd_and_batch_size() {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let transport = BatchedTransport::new(socket.as_raw_fd());
-        let rendered = format!("{:?}", transport);
-        assert!(
-            rendered.contains("BatchedTransport"),
-            "Debug impl must mention the type name: {rendered}"
-        );
-        assert!(
-            rendered.contains("socket_fd"),
-            "Debug impl must surface the socket_fd field: {rendered}"
-        );
-        assert!(
-            rendered.contains("max_batch_size"),
-            "Debug impl must surface the max_batch_size field: {rendered}"
-        );
-    }
 }

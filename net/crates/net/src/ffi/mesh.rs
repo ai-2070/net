@@ -20,8 +20,11 @@
 //! Every entry point in this module is `unsafe extern "C"` and shares
 //! the same caller-side contract:
 //!
-//! - Opaque handle pointers are valid, properly aligned, and not used
-//!   after their `_free` counterpart (or `net_shutdown`) has returned.
+//! - Opaque handle pointers are valid, properly aligned, produced by
+//!   this crate's matching constructor (`Box::into_raw` inside the
+//!   FFI surface), and not used after their `_free` counterpart (or
+//!   `net_shutdown`) has returned. Foreign-allocated pointers will UB
+//!   when consumed by `Box::from_raw` in the corresponding `_free`.
 //! - String pointers are non-null, NUL-terminated, and point to valid
 //!   UTF-8 (or, where documented, to opaque bytes paired with an
 //!   explicit length argument).

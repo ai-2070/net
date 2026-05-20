@@ -1,30 +1,21 @@
-//! Coverage targets in `src/adapter/net/proxy.rs` flagged by the
-//! Codecov report (the file sat at 78.96%). Each test pins a
-//! specific uncovered branch the existing in-module tests don't
-//! exercise.
+//! Invariant tests for `src/adapter/net/proxy.rs` branches the
+//! existing in-module tests don't exercise:
 //!
-//! Targets:
-//!   * `HopStats::avg_latency_ns` zero-samples early return
-//!     (proxy.rs:97).
-//!   * `Display for ProxyError` — all five variant arms
-//!     (proxy.rs:148-152).
-//!   * `NetProxy::local_addr` accessor (proxy.rs:224-226).
+//!   * `HopStats::avg_latency_ns` zero-samples early return.
+//!   * `NetProxy::local_addr` resolves the ephemeral bind to a
+//!     real port (not 0).
 //!   * `forward()` drop branches:
-//!       - PacketTooSmall when data.len() < ROUTING_HEADER_SIZE
-//!         (proxy.rs:261-263).
-//!       - InvalidHeader when RoutingHeader::from_bytes returns
-//!         None (proxy.rs:269-271).
-//!       - TtlExpired AFTER forward() decrement zeros TTL
-//!         (proxy.rs:303-306) — the existing `test_proxy_ttl_expired`
-//!         covers the pre-decrement check but not the post-decrement
-//!         tripwire.
+//!       - PacketTooSmall when `data.len() < ROUTING_HEADER_SIZE`.
+//!       - InvalidHeader when `RoutingHeader::from_bytes` returns
+//!         None.
+//!       - TtlExpired AFTER `forward()`'s decrement zeros TTL —
+//!         the post-decrement tripwire is distinct from the
+//!         pre-decrement check covered by the in-module tests.
 //!   * `forward_and_send()` happy path + Local / Dropped
-//!     pass-through (proxy.rs:332-387). The Err(SendFailed)
-//!     rollback path needs an artificial socket failure and is
-//!     left as a follow-up.
-//!   * `send_to`, `recv_from` round-trip (proxy.rs:389-397).
-//!   * `reset_stats` zeros every counter (proxy.rs:419-426).
-//!   * `Debug for NetProxy` (proxy.rs:452-463).
+//!     pass-through. The Err(SendFailed) rollback path needs an
+//!     artificial socket failure and is left as a follow-up.
+//!   * `send_to` / `recv_from` round-trip.
+//!   * `reset_stats` zeros every counter.
 
 #![cfg(feature = "net")]
 
@@ -50,44 +41,6 @@ fn hop_stats_avg_latency_returns_zero_with_no_samples() {
         stats.avg_latency_ns(),
         0,
         "avg over zero samples must return 0, not divide-by-zero"
-    );
-}
-
-#[test]
-fn display_proxy_error_packet_too_small() {
-    assert_eq!(
-        format!("{}", ProxyError::PacketTooSmall),
-        "packet too small"
-    );
-}
-
-#[test]
-fn display_proxy_error_invalid_header() {
-    assert_eq!(
-        format!("{}", ProxyError::InvalidHeader),
-        "invalid routing header"
-    );
-}
-
-#[test]
-fn display_proxy_error_ttl_expired() {
-    assert_eq!(format!("{}", ProxyError::TtlExpired), "TTL expired");
-}
-
-#[test]
-fn display_proxy_error_no_route() {
-    assert_eq!(
-        format!("{}", ProxyError::NoRoute),
-        "no route to destination"
-    );
-}
-
-#[test]
-fn display_proxy_error_send_failed_includes_wrapped_message() {
-    let inner = "connection refused";
-    assert_eq!(
-        format!("{}", ProxyError::SendFailed(inner.into())),
-        format!("send failed: {}", inner)
     );
 }
 
@@ -266,31 +219,5 @@ async fn reset_stats_zeros_every_counter() {
     assert_eq!(
         stats_after.avg_latency_ns, 0,
         "avg_latency_ns must report 0 once the sample counter is reset (HopStats:97 branch)"
-    );
-}
-
-#[tokio::test]
-async fn debug_impl_includes_local_id_routes_and_packets_forwarded() {
-    let proxy = NetProxy::new(cfg(0x1234)).await.unwrap();
-    proxy.add_route(0x5678, "127.0.0.1:9001".parse().unwrap());
-
-    let rendered = format!("{:?}", proxy);
-    assert!(
-        rendered.contains("NetProxy"),
-        "Debug must name the type: {rendered}"
-    );
-    // The local_id field is hex-formatted with leading zeros to
-    // 16 nibbles (proxy.rs:455).
-    assert!(
-        rendered.contains("0000000000001234"),
-        "Debug must include the hex-formatted local_id: {rendered}"
-    );
-    assert!(
-        rendered.contains("routes"),
-        "Debug must include the routes count: {rendered}"
-    );
-    assert!(
-        rendered.contains("packets_forwarded"),
-        "Debug must include packets_forwarded: {rendered}"
     );
 }

@@ -45,7 +45,11 @@
 //!
 //! Every entry point is `unsafe extern "C"` and inherits the
 //! module-wide FFI safety contract (see `ffi/mod.rs` and
-//! `include/net.h`).
+//! `include/net.h`). In particular, `net_redis_dedup_t*` handles
+//! must have been produced by `net_redis_dedup_new` (i.e. by
+//! `Box::into_raw` inside this module) — foreign-allocated
+//! pointers, even if valid and aligned, will UB when consumed by
+//! `Box::from_raw` in `net_redis_dedup_free`.
 
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]

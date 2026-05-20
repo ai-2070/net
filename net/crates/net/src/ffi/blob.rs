@@ -21,6 +21,9 @@
 //! Every entry point is `unsafe extern "C"` and inherits the same
 //! caller-side contract as the rest of the FFI surface (see
 //! `ffi/mod.rs` and `include/net.h`): valid + aligned pointers,
+//! opaque handles produced by this crate's matching constructor
+//! (`Box::into_raw` inside the FFI surface — foreign-allocated
+//! pointers will UB when consumed by `Box::from_raw`),
 //! NUL-terminated UTF-8 strings, accurate buffer/length pairs,
 //! out-parameter pointers writable for the call's lifetime, and
 //! Rust-allocated buffers freed via `net_blob_free_buffer`.
