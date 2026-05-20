@@ -15,8 +15,8 @@
 //! cycle, once. Renewal reuses the cached protocol, so no
 //! repeated probe cost.
 
+use parking_lot::Mutex;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -102,11 +102,11 @@ impl SequentialMapper {
     /// stats-surface work that wants to expose the active
     /// protocol alongside `port_mapping_active`.
     pub fn active_protocol(&self) -> Option<Protocol> {
-        *self.active.lock().expect("mutex poisoned")
+        *self.active.lock()
     }
 
     fn set_active(&self, protocol: Option<Protocol>) {
-        *self.active.lock().expect("mutex poisoned") = protocol;
+        *self.active.lock() = protocol;
     }
 }
 

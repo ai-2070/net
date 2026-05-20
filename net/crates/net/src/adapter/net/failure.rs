@@ -7,6 +7,7 @@
 //! - `CircuitBreaker` - Prevent cascading failures
 
 use dashmap::DashMap;
+use parking_lot::{Mutex, RwLock};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -143,7 +144,7 @@ pub struct FailureDetector {
     /// Total recoveries
     total_recoveries: AtomicU64,
     /// Last cleanup time
-    last_cleanup: std::sync::Mutex<Instant>,
+    last_cleanup: Mutex<Instant>,
 }
 
 impl FailureDetector {
@@ -161,7 +162,7 @@ impl FailureDetector {
             on_recovery: None,
             total_failures: AtomicU64::new(0),
             total_recoveries: AtomicU64::new(0),
-            last_cleanup: std::sync::Mutex::new(Instant::now()),
+            last_cleanup: Mutex::new(Instant::now()),
         }
     }
 
@@ -300,7 +301,7 @@ impl FailureDetector {
         // takes the failure-detection loop down with it. Matches
         // the recovery pattern used elsewhere in the crate
         // (e.g. `crypto.rs::sliding_window`).
-        let mut last = self.last_cleanup.lock().unwrap_or_else(|p| p.into_inner());
+        let mut last = self.last_cleanup.lock();
         if last.elapsed() < self.config.cleanup_interval {
             return 0;
         }
@@ -516,7 +517,7 @@ pub enum CircuitState {
 /// Circuit breaker for preventing cascading failures.
 pub struct CircuitBreaker {
     /// Current state
-    state: std::sync::RwLock<CircuitState>,
+    state: RwLock<CircuitState>,
     /// Failure count in current window
     failure_count: AtomicU64,
     /// Success count in current window
@@ -528,7 +529,7 @@ pub struct CircuitBreaker {
     /// Time to wait before half-open
     reset_timeout: Duration,
     /// Last state change time
-    last_state_change: std::sync::Mutex<Instant>,
+    last_state_change: Mutex<Instant>,
     /// Total trips
     total_trips: AtomicU64,
 }
@@ -537,13 +538,13 @@ impl CircuitBreaker {
     /// Create a new circuit breaker
     pub fn new(failure_threshold: u64, success_threshold: u64, reset_timeout: Duration) -> Self {
         Self {
-            state: std::sync::RwLock::new(CircuitState::Closed),
+            state: RwLock::new(CircuitState::Closed),
             failure_count: AtomicU64::new(0),
             success_count: AtomicU64::new(0),
             failure_threshold,
             success_threshold,
             reset_timeout,
-            last_state_change: std::sync::Mutex::new(Instant::now()),
+            last_state_change: Mutex::new(Instant::now()),
             total_trips: AtomicU64::new(0),
         }
     }
@@ -553,7 +554,7 @@ impl CircuitBreaker {
         // Fast path: read lock for the common Closed/HalfOpen case so
         // typical allow() calls don't contend on the writer lock.
         {
-            let state = *self.state.read().unwrap_or_else(|p| p.into_inner());
+            let state = *self.state.read();
             match state {
                 CircuitState::Closed | CircuitState::HalfOpen => return true,
                 CircuitState::Open => {} // fall through to slow path
@@ -568,14 +569,13 @@ impl CircuitBreaker {
         // state. record_success/record_failure deliberately hold the
         // write lock throughout for the same reason; allow() was the
         // outlier.
-        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.write();
         match *state {
             CircuitState::Closed | CircuitState::HalfOpen => true,
             CircuitState::Open => {
                 let elapsed = self
                     .last_state_change
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner())
                     .elapsed();
                 if elapsed >= self.reset_timeout {
                     Self::transition_locked(
@@ -599,7 +599,7 @@ impl CircuitBreaker {
         // Hold write lock through the entire read-decide-transition path
         // to prevent TOCTOU races where concurrent threads undo each other's
         // state transitions.
-        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.write();
         match *state {
             CircuitState::Closed => {
                 // Reset failure count on success
@@ -627,7 +627,7 @@ impl CircuitBreaker {
         // Hold write lock through the entire read-decide-transition path
         // to prevent TOCTOU races where concurrent threads undo each other's
         // state transitions.
-        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.write();
         match *state {
             CircuitState::Closed => {
                 let count = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -659,7 +659,7 @@ impl CircuitBreaker {
 
     /// Get current state
     pub fn state(&self) -> CircuitState {
-        *self.state.read().unwrap_or_else(|p| p.into_inner())
+        *self.state.read()
     }
 
     /// Get total trip count
@@ -675,7 +675,7 @@ impl CircuitBreaker {
     }
 
     fn transition_to(&self, new_state: CircuitState) {
-        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.write();
         Self::transition_locked(
             &mut state,
             new_state,
@@ -693,13 +693,13 @@ impl CircuitBreaker {
         new_state: CircuitState,
         failure_count: &AtomicU64,
         success_count: &AtomicU64,
-        last_state_change: &std::sync::Mutex<Instant>,
+        last_state_change: &Mutex<Instant>,
         total_trips: &AtomicU64,
     ) {
         let old_state = *state;
         if old_state != new_state {
             *state = new_state;
-            *last_state_change.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+            *last_state_change.lock() = Instant::now();
 
             // Reset counters on transition
             failure_count.store(0, Ordering::Relaxed);
@@ -755,7 +755,7 @@ pub struct RecoveryManager {
     /// Failed nodes and their recovery state
     failed_nodes: DashMap<u64, FailedNodeState>,
     /// Pending recovery queue
-    recovery_queue: std::sync::Mutex<VecDeque<(u64, Instant)>>,
+    recovery_queue: Mutex<VecDeque<(u64, Instant)>>,
     /// Stats
     reroutes: AtomicU64,
     retries: AtomicU64,
@@ -780,7 +780,7 @@ impl RecoveryManager {
     pub fn new() -> Self {
         Self {
             failed_nodes: DashMap::new(),
-            recovery_queue: std::sync::Mutex::new(VecDeque::new()),
+            recovery_queue: Mutex::new(VecDeque::new()),
             reroutes: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
@@ -819,7 +819,6 @@ impl RecoveryManager {
             self.queued.fetch_add(1, Ordering::Relaxed);
             self.recovery_queue
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
                 .push_back((node_id, Instant::now()));
             RecoveryAction::Queue
         }

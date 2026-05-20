@@ -54,7 +54,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use super::planner::ExecutionPlan;
@@ -254,7 +254,7 @@ impl LruResultCache {
 
 impl ResultCache for LruResultCache {
     fn get(&self, key: &CacheKey) -> Option<CachedResult> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock();
         let idx = *g.by_key.get(key)?;
         if g.nodes[idx].value.is_expired() {
             // Lazy eviction: drop the entry and miss. Hot
@@ -268,7 +268,7 @@ impl ResultCache for LruResultCache {
     }
 
     fn insert(&self, key: CacheKey, result: CachedResult) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock();
         let bytes = result.approx_bytes();
         // Refuse oversized entries up-front. Without this, the
         // entry is inserted at head, then `evict_until_within_bounds`
@@ -314,7 +314,7 @@ impl ResultCache for LruResultCache {
     }
 
     fn invalidate_all(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock();
         g.by_key.clear();
         g.nodes.clear();
         g.head = None;
@@ -324,7 +324,7 @@ impl ResultCache for LruResultCache {
     }
 
     fn len(&self) -> usize {
-        self.inner.lock().unwrap().by_key.len()
+        self.inner.lock().by_key.len()
     }
 }
 

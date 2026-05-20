@@ -8,6 +8,7 @@
 //! - Sampling and rate limiting for tracing
 
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -715,7 +716,7 @@ impl Default for SamplingStrategy {
 pub struct Sampler {
     strategy: SamplingStrategy,
     count: AtomicU64,
-    last_reset: std::sync::Mutex<Instant>,
+    last_reset: Mutex<Instant>,
 }
 
 impl Sampler {
@@ -724,7 +725,7 @@ impl Sampler {
         Self {
             strategy,
             count: AtomicU64::new(0),
-            last_reset: std::sync::Mutex::new(Instant::now()),
+            last_reset: Mutex::new(Instant::now()),
         }
     }
 
@@ -735,7 +736,7 @@ impl Sampler {
             SamplingStrategy::AlwaysOff => false,
             SamplingStrategy::Ratio(ratio) => random_f64() < *ratio,
             SamplingStrategy::RateLimited { max_per_second } => {
-                let mut last_reset = self.last_reset.lock().unwrap();
+                let mut last_reset = self.last_reset.lock();
                 let now = Instant::now();
 
                 // Reset counter every second

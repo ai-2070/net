@@ -12,8 +12,9 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::metadata::NodeId;
@@ -600,12 +601,12 @@ impl RateLimiter {
 
     fn maybe_reset(&self) {
         let should_reset = {
-            let last = self.last_reset.read().unwrap();
+            let last = self.last_reset.read();
             last.elapsed() >= self.reset_interval
         };
 
         if should_reset {
-            let mut last = self.last_reset.write().unwrap();
+            let mut last = self.last_reset.write();
             if last.elapsed() >= self.reset_interval {
                 self.global_requests.store(0, Ordering::Relaxed);
                 self.global_tokens.store(0, Ordering::Relaxed);
@@ -850,12 +851,12 @@ impl AtomicResourceUsage {
 
     fn maybe_reset_hourly(&self) {
         let should_reset = {
-            let start = self.hour_start.read().unwrap();
+            let start = self.hour_start.read();
             start.elapsed() >= Duration::from_secs(3600)
         };
 
         if should_reset {
-            let mut start = self.hour_start.write().unwrap();
+            let mut start = self.hour_start.write();
             if start.elapsed() >= Duration::from_secs(3600) {
                 self.cost_cents_per_hour.store(0, Ordering::Relaxed);
                 *start = Instant::now();
@@ -985,7 +986,7 @@ impl AuditLog {
         }
 
         // Store in memory (O(1) eviction via VecDeque)
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = self.entries.write();
         if entries.len() >= self.config.max_entries {
             entries.pop_front();
         }
@@ -993,12 +994,12 @@ impl AuditLog {
     }
 
     fn get_entries(&self, limit: usize) -> Vec<AuditEntry> {
-        let entries = self.entries.read().unwrap();
+        let entries = self.entries.read();
         entries.iter().rev().take(limit).cloned().collect()
     }
 
     fn clear(&self) {
-        self.entries.write().unwrap().clear();
+        self.entries.write().clear();
     }
 }
 
@@ -1114,13 +1115,13 @@ impl SafetyEnforcer {
 
     /// Update the envelope
     pub fn update_envelope(&self, envelope: SafetyEnvelope) {
-        *self.envelope.write().unwrap() = envelope;
+        *self.envelope.write() = envelope;
         self.log_event(AuditEventType::EnvelopeUpdated, None, AuditOutcome::Success);
     }
 
     /// Check if a request is allowed (hot path)
     pub fn check(&self, req: &SafetyRequest) -> Result<(), SafetyViolation> {
-        let envelope = self.envelope.read().unwrap();
+        let envelope = self.envelope.read();
 
         // Fast path: disabled mode
         if envelope.mode == EnforcementMode::Disabled {
@@ -1164,7 +1165,7 @@ impl SafetyEnforcer {
         req: &SafetyRequest,
         claim: ResourceClaim,
     ) -> Result<ResourceGuard, SafetyViolation> {
-        let envelope = self.envelope.read().unwrap();
+        let envelope = self.envelope.read();
 
         // Fast path: disabled mode
         if envelope.mode == EnforcementMode::Disabled {
@@ -1485,8 +1486,8 @@ impl SafetyEnforcer {
     pub fn kill(&self, reason: impl Into<String>) {
         let reason = reason.into();
         self.kill_switch.store(true, Ordering::SeqCst);
-        *self.kill_switch_at.write().unwrap() = Some(Instant::now());
-        *self.kill_switch_reason.write().unwrap() = Some(reason.clone());
+        *self.kill_switch_at.write() = Some(Instant::now());
+        *self.kill_switch_reason.write() = Some(reason.clone());
 
         self.log_event_with_details(
             AuditEventType::KillSwitchTriggered,
@@ -1499,8 +1500,8 @@ impl SafetyEnforcer {
     /// Reset the kill switch
     pub fn reset(&self) {
         self.kill_switch.store(false, Ordering::SeqCst);
-        *self.kill_switch_at.write().unwrap() = None;
-        *self.kill_switch_reason.write().unwrap() = None;
+        *self.kill_switch_at.write() = None;
+        *self.kill_switch_reason.write() = None;
 
         self.log_event(AuditEventType::KillSwitchReset, None, AuditOutcome::Success);
     }
@@ -1534,7 +1535,7 @@ impl SafetyEnforcer {
 
     /// Get the current envelope
     pub fn envelope(&self) -> SafetyEnvelope {
-        self.envelope.read().unwrap().clone()
+        self.envelope.read().clone()
     }
 
     // Internal methods
@@ -1545,9 +1546,9 @@ impl SafetyEnforcer {
         }
 
         // Check auto-reset
-        let envelope = self.envelope.read().unwrap();
+        let envelope = self.envelope.read();
         if let Some(auto_reset_secs) = envelope.kill_switch.auto_reset_secs {
-            if let Some(killed_at) = *self.kill_switch_at.read().unwrap() {
+            if let Some(killed_at) = *self.kill_switch_at.read() {
                 if killed_at.elapsed() >= Duration::from_secs(auto_reset_secs as u64) {
                     drop(envelope);
                     self.reset();
@@ -1559,7 +1560,6 @@ impl SafetyEnforcer {
         let reason = self
             .kill_switch_reason
             .read()
-            .unwrap()
             .clone()
             .unwrap_or_else(|| "kill switch active".to_string());
 

@@ -10,8 +10,8 @@
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use super::capability::{CapabilityFilter, CapabilitySet};
@@ -276,7 +276,7 @@ impl Clone for ProximityNode {
             primary_caps: self.primary_caps,
             load_level: self.load_level,
             health: self.health,
-            full_capabilities: RwLock::new(self.full_capabilities.read().unwrap().clone()),
+            full_capabilities: RwLock::new(self.full_capabilities.read().clone()),
         }
     }
 }
@@ -347,7 +347,7 @@ impl ProximityNode {
             self.capability_version = pw.capability_version;
             self.primary_caps = pw.primary_caps;
             // Clear cached full capabilities
-            *self.full_capabilities.write().unwrap() = None;
+            *self.full_capabilities.write() = None;
         }
     }
 
@@ -363,12 +363,12 @@ impl ProximityNode {
 
     /// Get or fetch full capabilities
     pub fn get_capabilities(&self) -> Option<CapabilitySet> {
-        self.full_capabilities.read().unwrap().clone()
+        self.full_capabilities.read().clone()
     }
 
     /// Set full capabilities (after fetching)
     pub fn set_capabilities(&self, caps: CapabilitySet) {
-        *self.full_capabilities.write().unwrap() = Some(caps);
+        *self.full_capabilities.write() = Some(caps);
     }
 
     /// Calculate routing score (lower is better)
@@ -529,7 +529,7 @@ impl ProximityGraph {
         // concurrent set_local_capabilities callers, and uses
         // the fetch_add return value directly (no second store).
         let hash = hash_capabilities(&caps);
-        let mut guard = self.local_capabilities.write().unwrap();
+        let mut guard = self.local_capabilities.write();
         // fetch_add returns the prior value; the atomic is now
         // at `prior + 1`. Use that value directly - storing it
         // back is what introduced the lost-update race pre-fix.
@@ -550,7 +550,7 @@ impl ProximityGraph {
     /// Create a pingwave to broadcast
     pub fn create_pingwave(&self, health: HealthStatus) -> EnhancedPingwave {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let caps = self.local_capabilities.read().unwrap();
+        let caps = self.local_capabilities.read();
         let primary = caps
             .as_ref()
             .map(PrimaryCapabilities::from_capability_set)
