@@ -1,0 +1,153 @@
+net/crates/net/src/adapter/net/continuity/chain.rs
+  s_e9432586a99852::t_59d12e828e3599 307-310
+  s_e9432586a99852::t_3de02ac10fc02e 248-251
+  s_e9432586a99852::t_f73a369db03e54 146-149
+  s_e9432586a99852::t_07cca3a73034bb 98-101
+net/crates/net/src/adapter/net/identity/entity.rs
+  s_e9432586a99852::t_271aa835a00510 81-84
+  s_e9432586a99852::t_51314f00f489c9 38-41,52-55
+net/crates/net/src/adapter/net/pool.rs
+  s_e9432586a99852::t_aee8d1c5280ab8 504-507
+  s_e9432586a99852::t_3af053281a11c5 852-855
+net/crates/net/src/adapter/net/redex/file.rs
+  s_e9432586a99852::t_4f8b154d197fc2 723-726
+  s_e9432586a99852::t_3a5dc17edd6e2c 820-823
+  s_e9432586a99852::t_843be1a529de94 606-609
+  s_e9432586a99852::t_a00a70856cf996 466-469
+net/crates/net/src/adapter/net/behavior/meshos/ice.rs
+  s_e9432586a99852::t_ccf0517460fb21 923-928
+  s_e9432586a99852::t_0fca5cdc70cb73 960
+  s_e9432586a99852::t_92d7b005dcfede 307-310
+  s_e9432586a99852::t_e659be24cfdc23 850
+  s_e9432586a99852::t_eabbca847f638a 258-261
+  s_e9432586a99852::t_9d043fed209de4 281-284
+  s_e9432586a99852::t_580427e3890695 794
+net/crates/net/src/ffi/cortex.rs
+  s_e9432586a99852::t_a69fe1b7cc50b9 503,722
+net/crates/net/src/adapter/net/dataforts/blob/blob_ref.rs
+  s_e9432586a99852::t_5528508b2b0ea4 556-559
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_e9432586a99852::t_48fdbff154bb43 2317-2320
+net/crates/net/src/adapter/net/redex/replication.rs
+  s_e9432586a99852::t_0880c2246f1d56 101-104
+net/crates/net/src/adapter/net/behavior/meshos/event_loop.rs
+  s_e9432586a99852::t_f5d00c4053cb96 1198-1201
+  s_e9432586a99852::t_f8bcfc2c5b5f20 1269-1272
+net/crates/net/src/adapter/net/behavior/meshos/runtime.rs
+  s_e9432586a99852::t_5f3bccc13b974d 778-781
+net/crates/net/src/adapter/net/traversal/portmap/sequential.rs
+  s_e9432586a99852::t_583179af8f24f4 129-132
+net/crates/net/src/adapter/net/behavior/rules.rs
+  s_e9432586a99852::t_9c71233ca8a1b0 313-316,328-331
+net/crates/net/src/adapter/net/compute/bindings.rs
+  s_e9432586a99852::t_fbc42bc7828095 78-81
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_e9432586a99852::t_ff1047410907db 104-107
+net/crates/net/src/adapter/net/redex/disk.rs
+  s_e9432586a99852::t_322132c2a24e36 2092-2095
+  s_e9432586a99852::t_874df9de2df79a 2122-2125
+net/crates/net/src/adapter/net/behavior/meshdb/planner.rs
+  s_e9432586a99852::t_b61eca778580f1 1048-1051
+net/crates/net/src/adapter/net/cortex/meta.rs
+  s_e9432586a99852::t_f2a4f707852409 86-89
+net/crates/net/src/adapter/net/continuity/discontinuity.rs
+  s_e9432586a99852::t_c12f128fec4327 210-213
+net/crates/net/src/adapter/net/router.rs
+  s_e9432586a99852::t_48c1591b4136b8 43
+net/crates/net/src/adapter/net/reroute.rs
+  s_e9432586a99852::t_93e17679e27ca0 72-75
+net/crates/net/src/adapter/net/identity/envelope.rs
+  s_e9432586a99852::t_6ee8f553097cb4 553-556
+  s_e9432586a99852::t_5bb9c9edc34161 215-218
+  s_e9432586a99852::t_8ab04a3ca11959 518-521
+  s_e9432586a99852::t_a09711377014db 372-375
+net/crates/net/src/shard/batch.rs
+  s_e9432586a99852::t_ad92ca7269277c 132-135
+net/crates/net/src/adapter/net/crypto.rs
+  s_e9432586a99852::t_a030deb95a8fb2 335-338
+  s_e9432586a99852::t_f787cec3413760 771-774
+  s_e9432586a99852::t_4327ab29a7b966 737,746
+  s_e9432586a99852::t_ba837d624ec739 1107
+  s_e9432586a99852::t_dcaf8119a419ed 1135
+  s_e9432586a99852::t_7e83b289d8e22b 14,16
+  s_e9432586a99852::t_a588b284eeabf2 126-129
+  s_e9432586a99852::t_073bc89bca84bb 1281
+net/crates/net/src/adapter/net/proxy.rs
+  s_e9432586a99852::t_335512956703bb 36
+net/crates/net/src/adapter/net/state/snapshot.rs
+  s_e9432586a99852::t_723c1c4d60c008 273-276
+net/crates/net/src/shard/mod.rs
+  s_e9432586a99852::t_5638001a845be2 456-459
+net/crates/net/src/adapter/net/behavior/capability.rs
+  s_e9432586a99852::t_e06e5aaa50b761 2171-2174
+net/crates/net/src/adapter/net/behavior/meshos/probes.rs
+  s_e9432586a99852::t_eb0f571d68c797 223-226
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  s_e9432586a99852::t_4f7a641a1e284b 48-51
+  s_e9432586a99852::t_24df8a78e7fb96 1077-1080
+net/crates/net/src/adapter/net/identity/token.rs
+  s_e9432586a99852::t_69e0cc544e29fe 533-536
+net/crates/net/src/adapter/net/redex/entry.rs
+  s_e9432586a99852::t_0cd438b7a1abb6 100-103
+  s_e9432586a99852::t_cb9a682f1d85ff 155-158
+net/crates/net/src/adapter/net/subnet/id.rs
+  s_e9432586a99852::t_96a69c47392d7c 43-46
+net/crates/net/src/adapter/net/behavior/meshos/executor.rs
+  s_e9432586a99852::t_9d00d0539c9dbf 365-368
+net/crates/net/src/adapter/net/netdb/db.rs
+  s_e9432586a99852::t_950e979d732bc1 60-63
+  s_e9432586a99852::t_ee2e26b9a187e7 78-81
+net/crates/net/src/adapter/net/dataforts/greedy/cache.rs
+  s_e9432586a99852::t_5812ebddd69562 290-293
+net/crates/net/src/adapter/net/protocol.rs
+  s_e9432586a99852::t_f8028b12de57af 483-486
+net/crates/net/src/adapter/net/session.rs
+  s_e9432586a99852::t_75bf604d2f60a2 238-241
+net/crates/net/src/adapter/net/subprotocol/negotiation.rs
+  s_e9432586a99852::t_9f89ede5a9691a 82-85
+net/crates/net/src/adapter/net/failure.rs
+  s_e9432586a99852::t_4295cdf87b47cd 494-497,504
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  s_e9432586a99852::t_d9fad750e55d50 1176-1179
+  s_e9432586a99852::t_d7bf0404084918 1055-1058
+  s_e9432586a99852::t_eb8224edaeb552 1037-1040
+  s_e9432586a99852::t_2faa04743c9042 1198-1201
+net/crates/net/src/adapter/net/subnet/assignment.rs
+  s_e9432586a99852::t_70412353bdf401 75-78
+  s_e9432586a99852::t_1578dcbcf0c54e 149-152
+net/crates/net/src/adapter/net/behavior/predicate.rs
+  s_e9432586a99852::t_c34992c74c568b 449-452
+net/crates/net/src/ffi/redis_dedup.rs
+  s_e9432586a99852::t_6b7ff6a082f212 160,238
+  s_e9432586a99852::t_1ce527fdfc51aa 50
+  s_e9432586a99852::t_9a67114cd4d0a6 182,199,217
+net/crates/net/clippy.toml
+  s_e9432586a99852::t_72176c76e1046f 1-13
+net/crates/net/src/adapter/net/contested/correlation.rs
+  s_e9432586a99852::t_a419415c623be9 306-309
+net/crates/net/src/adapter/net/compute/replica_group.rs
+  s_e9432586a99852::t_8c901d59da8e78 266-269
+  s_e9432586a99852::t_efd6e0e75df954 62-65
+net/crates/net/src/adapter/net/mesh.rs
+  s_e9432586a99852::t_7366c17357311a 1652
+  s_e9432586a99852::t_ee4780417b335d 3151-3154
+  s_e9432586a99852::t_551224557fbddf 119-122
+net/crates/net/src/consumer/filter.rs
+  s_e9432586a99852::t_a7797244923f48 184-187,197-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10",
+  "base_commit_sha": "28e15e7a29f5f73c6ab51f46322606a509adfa61",
+  "prompts": {},
+  "sessions": {
+    "s_e9432586a99852": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fbeaee78-6362-47f1-a432-288d813cb99f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
