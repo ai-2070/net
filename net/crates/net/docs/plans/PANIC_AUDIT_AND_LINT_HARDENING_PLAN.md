@@ -20,6 +20,7 @@ Shrink `.unwrap()` / `.expect()` / undocumented `unsafe` in library code to zero
 - `clippy::unwrap_used`, `clippy::expect_used`, `clippy::undocumented_unsafe_blocks`, `clippy::multiple_unsafe_ops_per_block` warn in dev and **deny** in CI.
 - Every `unsafe` block in `src/` is covered by an inline `// SAFETY:` comment **or** by a module-level safety preamble that the inline comment links to.
 - `cargo fmt --check` is meaningful: `rustfmt.toml` pins the project's actual style so format drift fails CI.
+- For every site Stage 2 converts from `.unwrap()` / `.expect()` to a propagated `Result`, at least one existing or newly-added test executes the new error path (coverage > 0 on the new `Err`-producing line). This is **proof-of-audit coverage**, not a percentage target — see `TEST_COVERAGE_PLAN.md` non-goals for why the project rejects the latter.
 
 ## Non-goals
 
@@ -28,6 +29,7 @@ Shrink `.unwrap()` / `.expect()` / undocumented `unsafe` in library code to zero
 - **Behavior change.** This is documentation + lint + light refactor. Semantics of every call site stay identical except where a `Result` now propagates instead of panicking — and even then, the failure path was previously a process abort (`panic = "abort"` in release), so any caller previously surviving the unwrap is unaffected.
 - **`unsafe` soundness review.** Whether a given FFI signature is *exploitable by a safe caller* is a different investigation. This plan only makes the existing contracts visible inline.
 - **`unwrap_or` / `unwrap_or_else` silent-default audit.** Already covered as the pre-flight in `FAILURE_PATH_HARDENING_PLAN.md`; do not duplicate.
+- **Crate-wide line / branch coverage targets.** `TEST_COVERAGE_PLAN.md` and `TEST_COVERAGE_PLAN_2.md` both explicitly reject these on the grounds that they reward testing trivial getters at the expense of real invariants. This plan inherits that stance — coverage tooling is introduced (Stage 2.5) **only** to verify that audited error paths are exercised. No global percentage gate; no per-file threshold.
 
 ---
 
@@ -125,6 +127,48 @@ For each library site, pick exactly one resolution:
 
 ---
 
+## Stage 2.5 — Audit-site coverage check
+
+**Cost:** ¼ to ½ day (mostly tooling setup; the actual check is mechanical).
+**Output:** a one-off report proving every site Stage 2 converted to a propagated `Result` has at least one test that hits the new error branch. Any uncovered branch gets one targeted test, or the conversion is reverted to `.expect("invariant: …")` if the path is genuinely unreachable.
+
+**Why this exists.** Stage 2 converts some panics into propagated errors. If a converted site has zero tests hitting its `Err` branch, we've quietly moved the bug rather than fixed it — the panic is gone, but the failure mode is now an unobserved error return that could be silently ignored by callers. Coverage tooling is the cheapest way to flag that case across ~30 sites without re-reading every diff hunk.
+
+**Why not a CI gate.** Coverage as a percentage gate runs into the exact problem `TEST_COVERAGE_PLAN.md` flagged: contributors add trivial assertions on getter functions to clear the bar. Here, coverage is a *one-time audit instrument* — run it after Stage 2, act on the report, then put the tool away. It does not need to live in CI.
+
+**Tooling.**
+
+- `cargo-llvm-cov` (LLVM source-based coverage, the current standard for Rust). Install: `cargo install cargo-llvm-cov`. Requires `llvm-tools-preview` (`rustup component add llvm-tools-preview` — the rust-toolchain pin at 1.95.0 supports it).
+- No tarpaulin: it's slower and has known accuracy issues with `tokio` workloads.
+
+**Runbook.**
+
+```sh
+cd net/crates/net
+
+# Full coverage report (HTML + JSON). Takes ~5 minutes on a warm cache.
+cargo llvm-cov --workspace --all-features --html --output-dir coverage/
+cargo llvm-cov --workspace --all-features --json --output-path coverage/cov.json
+
+# Programmatic check: for each (file, line) the Stage 2 PR converted from
+# .unwrap() / .expect() to propagated error, assert llvm-cov reports count > 0.
+# A Python helper using the same masking script as the pre-flight will:
+#   1. Read the Stage 2 PR diff to enumerate converted sites.
+#   2. Parse coverage/cov.json (`segments` / `regions` arrays).
+#   3. For each site, find the enclosing region and assert `count > 0`.
+#   4. Print uncovered sites to stdout.
+```
+
+**Acceptance.** Either (a) the uncovered-site list is empty, or (b) each remaining uncovered site has a justification on the Stage 2 PR comment thread (e.g. "this `Err` branch fires only on a 32-bit `usize` overflow that isn't reachable in our test matrix"). The list is captured in the PR description and not re-tested in CI.
+
+**Out of scope here.**
+
+- **Crate-wide percentage targets.** Per the project's standing position; see Non-goals.
+- **Mutation testing** (`cargo-mutants`). Higher signal than coverage for "are these tests load-bearing?" but a much larger time investment; open a separate plan if pursued.
+- **Coverage of unchanged code paths.** This stage only audits sites Stage 2 touched.
+
+---
+
 ## Stage 3 — `unsafe` SAFETY-comment sweep
 
 **Cost:** ½ to 1 day, mostly mechanical writing.
@@ -170,10 +214,11 @@ Once Stages 1–3 are merged:
 |---|---|---|
 | 1 | one PR, two new files + one `Cargo.toml` edit + CI yaml | revert the PR |
 | 2 | one or two PRs (split: lock-poison swap; then everything else) | per-file revert |
+| 2.5 | report attached to the Stage 2 PR; targeted tests added inline if needed | drop the added tests |
 | 3 | one PR, docs-only | revert the PR |
 | 4 | one PR, 4-line config flip + 1-line CI change | downgrade `deny` → `warn` |
 
-Total budget: **2–3 person-days** across all four stages. Each stage is independently valuable: Stage 1 prevents new regressions even with no source changes; Stage 2 alone is the main hardening; Stages 3–4 are tightening.
+Total budget: **2½–3½ person-days** across all five stages. Each stage is independently valuable: Stage 1 prevents new regressions even with no source changes; Stage 2 is the main hardening; Stage 2.5 proves the hardening landed; Stages 3–4 are tightening.
 
 ---
 
@@ -181,6 +226,7 @@ Total budget: **2–3 person-days** across all four stages. Each stage is indepe
 
 - **`unwrap_or` / `unwrap_or_else` silent-default audit** — see `FAILURE_PATH_HARDENING_PLAN.md` Pre-flight.
 - **Wire-boundary fuzzing** — see `FAILURE_PATH_HARDENING_PLAN.md` Stage 1 (already partly landed).
+- **Crate-wide invariant gaps** — see `TEST_COVERAGE_PLAN.md` / `TEST_COVERAGE_PLAN_2.md`. The Stage 2.5 coverage check here is bounded to sites Stage 2 touched.
 - **Lock-poison resilience model beyond `parking_lot`** — out of scope; if cross-process poison or recovery is needed, open a separate plan.
 - **`unsafe` soundness audit** — comment-completeness only here; soundness is a future investigation.
 - **Workspace-wide lint propagation.** This plan targets the `net-mesh` crate only. If the bindings (`bindings/python`, `bindings/node`, `bindings/go/*`) want the same lints, copy the `[lints]` table per Cargo manifest; not in scope for this PR.
