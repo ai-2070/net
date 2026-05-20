@@ -203,6 +203,10 @@ impl PeerRegistrationGuard {
         // struct via `ptr::read` and forgetting the rest is the
         // standard cancel-Drop pattern.
         let me = std::mem::ManuallyDrop::new(self);
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "three ptr::read calls form a single semantic op (consume ManuallyDrop fields together so they drop normally)"
+        )]
         // SAFETY: `me` is `ManuallyDrop`, so its fields won't be
         // dropped automatically. We read them out and let them
         // drop normally, which decrements the Arc strong counts

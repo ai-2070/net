@@ -15,6 +15,24 @@
 //! as the rest of the FFI surface; the blob-specific extended
 //! codes are in the `-110..` range to stay below the cortex
 //! surface's `-100..-109` band.
+//!
+//! # Safety
+//!
+//! Every entry point is `unsafe extern "C"` and inherits the same
+//! caller-side contract as the rest of the FFI surface (see
+//! `ffi/mod.rs` and `include/net.h`): valid + aligned pointers,
+//! NUL-terminated UTF-8 strings, accurate buffer/length pairs,
+//! out-parameter pointers writable for the call's lifetime, and
+//! Rust-allocated buffers freed via `net_blob_free_buffer`.
+#![allow(clippy::missing_safety_doc)]
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "module-wide FFI safety contract documented in the # Safety preamble above"
+)]
+#![expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "FFI entry points routinely deref + write to multiple out-parameter fields under the same caller contract"
+)]
 
 use std::ffi::{c_char, c_int, CStr};
 use std::os::raw::c_void;

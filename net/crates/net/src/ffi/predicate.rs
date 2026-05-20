@@ -24,6 +24,21 @@
 //! triple produces identical booleans across every binding. Drift
 //! between the C surface and the substrate's evaluator surfaces
 //! as a fixture-driven CI failure on the offending side.
+//!
+//! # Safety
+//!
+//! Every entry point is `unsafe extern "C"` and inherits the
+//! module-wide FFI safety contract (see `ffi/mod.rs` and
+//! `include/net.h`).
+#![allow(clippy::missing_safety_doc)]
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "module-wide FFI safety contract documented in the # Safety preamble above"
+)]
+#![expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "FFI entry points deref input pointers together with out-parameter writes under the same caller contract"
+)]
 
 use std::collections::BTreeMap;
 use std::ffi::c_char;

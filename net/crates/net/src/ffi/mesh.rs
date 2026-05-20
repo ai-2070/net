@@ -14,6 +14,38 @@
 //! Handshake + per-peer sends are async on the core side; the FFI
 //! drives them via a shared `tokio::runtime::Runtime` (lazy OnceLock)
 //! identical to the one used by `ffi/cortex.rs`.
+//!
+//! # Safety
+//!
+//! Every entry point in this module is `unsafe extern "C"` and shares
+//! the same caller-side contract:
+//!
+//! - Opaque handle pointers are valid, properly aligned, and not used
+//!   after their `_free` counterpart (or `net_shutdown`) has returned.
+//! - String pointers are non-null, NUL-terminated, and point to valid
+//!   UTF-8 (or, where documented, to opaque bytes paired with an
+//!   explicit length argument).
+//! - Out-parameter pointers (`*mut T`) are non-null and writable for
+//!   the lifetime of the call.
+//! - Buffer / length pairs accurately describe the producer-allocated
+//!   memory the callee may read or write.
+//!
+//! These are the same invariants `include/net.h` documents for C
+//! callers. The per-call `# Safety` rustdoc is intentionally
+//! suppressed (`clippy::missing_safety_doc`) and per-block `// SAFETY:`
+//! comments are gated by the module-level `#![expect]` below — every
+//! `unsafe { }` in this file inherits the contract above, and inlining
+//! the same wording at each of the ~120 call sites adds noise without
+//! signal.
+#![allow(clippy::missing_safety_doc)]
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "module-wide FFI safety contract documented in the # Safety preamble above"
+)]
+#![expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "FFI entry points routinely deref + write to multiple out-parameter fields under the same caller contract; splitting per-op would obscure the single boundary-cross"
+)]
 
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::mem::ManuallyDrop;

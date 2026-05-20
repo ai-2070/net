@@ -25,6 +25,18 @@
 //!
 //! Wire shapes mirror the test renderers in
 //! `tests/cross_lang_capability_fixtures.rs`.
+//!
+//! # Safety
+//!
+//! Every entry point is `unsafe extern "C"` and inherits the
+//! module-wide FFI safety contract (see `ffi/mod.rs` and
+//! `include/net.h`): NUL-terminated UTF-8 JSON inputs, valid
+//! out-parameter pointers, caller-frees-Rust-allocated-strings.
+#![allow(clippy::missing_safety_doc)]
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "module-wide FFI safety contract documented in the # Safety preamble above"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_char;

@@ -26,6 +26,20 @@
 //! across threads.
 //!
 #![allow(clippy::missing_safety_doc)]
+// The cross-cutting C-side safety contract for every `unsafe` block in
+// this module is documented in the `# Safety` section above:
+// caller-validated pointer / length / lifetime / handle-not-after-shutdown
+// invariants documented in `include/net.h`. Inlining `// SAFETY:` on each
+// block would add ~200 identical "see module preamble" comments without
+// adding any signal beyond what the preamble already says.
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "module-wide FFI safety contract documented in the # Safety preamble above"
+)]
+#![expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "FFI entry points routinely deref + write to multiple out-parameter fields under the same caller contract; splitting per-op would obscure the single boundary-cross"
+)]
 
 //! # Tokio runtime restriction
 //!

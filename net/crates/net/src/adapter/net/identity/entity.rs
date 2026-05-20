@@ -206,6 +206,9 @@ impl EntityKeypair {
         let signing_key = SigningKey::from_bytes(&rng_bytes);
         // Zeroize secret material — volatile write prevents optimizer elision
         for byte in rng_bytes.iter_mut() {
+            // SAFETY: `byte` is a valid mutable reference into `rng_bytes`
+            // for the lifetime of this loop iteration, which is all
+            // `ptr::write_volatile` requires.
             unsafe { std::ptr::write_volatile(byte, 0) };
         }
         Self::from_signing_key(signing_key)
