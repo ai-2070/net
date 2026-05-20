@@ -50,7 +50,8 @@
 //! decision: Python sync-first; pyo3-asyncio support is a later
 //! slice when a consumer needs it.
 
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -1273,13 +1274,12 @@ struct InMemoryStore {
 
 impl ChainReader for InMemoryStore {
     fn read_one(&self, origin: u64, seq: SeqNum) -> Option<Vec<u8>> {
-        self.chains.lock().unwrap().get(&origin)?.get(&seq).cloned()
+        self.chains.lock().get(&origin)?.get(&seq).cloned()
     }
 
     fn read_range(&self, origin: u64, start: SeqNum, end: SeqNum) -> Vec<(SeqNum, Vec<u8>)> {
         self.chains
             .lock()
-            .unwrap()
             .get(&origin)
             .map(|chain| {
                 chain
@@ -1291,13 +1291,7 @@ impl ChainReader for InMemoryStore {
     }
 
     fn latest_seq(&self, origin: u64) -> Option<SeqNum> {
-        self.chains
-            .lock()
-            .unwrap()
-            .get(&origin)?
-            .keys()
-            .next_back()
-            .copied()
+        self.chains.lock().get(&origin)?.keys().next_back().copied()
     }
 }
 
@@ -1316,7 +1310,6 @@ impl PyInMemoryChainReader {
         self.inner
             .chains
             .lock()
-            .unwrap()
             .entry(origin)
             .or_default()
             .insert(SeqNum(seq), payload);
@@ -1328,7 +1321,7 @@ impl PyInMemoryChainReader {
     }
 
     fn __repr__(&self) -> String {
-        let chains = self.inner.chains.lock().unwrap().len();
+        let chains = self.inner.chains.lock().len();
         format!("InMemoryChainReader(chains={chains})")
     }
 }

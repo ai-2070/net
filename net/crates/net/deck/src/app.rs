@@ -307,7 +307,7 @@ pub struct App {
     /// pushes its `JoinHandle` here so the binary can await
     /// any still-running ones on shutdown (with a timeout)
     /// instead of cancelling them mid-RPC.
-    pub pending_admin: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    pub pending_admin: std::sync::Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -561,7 +561,7 @@ impl App {
             toast: None,
             toast_tx,
             toast_rx,
-            pending_admin: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            pending_admin: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
     }
 
@@ -571,7 +571,7 @@ impl App {
     /// Vec the App pushes into.
     pub fn pending_admin_handle(
         &self,
-    ) -> std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> {
+    ) -> std::sync::Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>> {
         std::sync::Arc::clone(&self.pending_admin)
     }
 
@@ -2769,10 +2769,9 @@ impl App {
         // Stash the handle so shutdown can await it. Also drop
         // any already-finished handles while we have the lock,
         // so a long session doesn't accumulate dead entries.
-        if let Ok(mut pending) = self.pending_admin.lock() {
-            pending.retain(|h| !h.is_finished());
-            pending.push(handle);
-        }
+        let mut pending = self.pending_admin.lock();
+        pending.retain(|h| !h.is_finished());
+        pending.push(handle);
     }
 
     /// Clamp the daemon cursor against the current snapshot's

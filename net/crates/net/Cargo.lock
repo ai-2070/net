@@ -2333,6 +2333,7 @@ version = "0.20.1"
 dependencies = [
  "futures",
  "net-mesh",
+ "parking_lot 0.12.5",
  "serde_json",
  "tokio",
  "zeroize",
@@ -2393,6 +2394,7 @@ dependencies = [
  "futures",
  "hdrhistogram",
  "net-mesh",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "postcard",
  "rand 0.10.1",
@@ -2408,6 +2410,7 @@ version = "0.20.1"
 dependencies = [
  "futures",
  "net-mesh",
+ "parking_lot 0.12.5",
  "postcard",
  "serde_json",
  "tokio",
@@ -2419,6 +2422,7 @@ version = "0.20.1"
 dependencies = [
  "bytes",
  "net-mesh",
+ "parking_lot 0.12.5",
  "serde_json",
  "tokio",
 ]
@@ -2438,6 +2442,7 @@ dependencies = [
  "napi-derive",
  "net-mesh",
  "net-mesh-sdk",
+ "parking_lot 0.12.5",
  "postcard",
  "serde_json",
  "tokio",
@@ -2456,6 +2461,7 @@ dependencies = [
  "hex",
  "net-mesh",
  "net-mesh-sdk",
+ "parking_lot 0.12.5",
  "postcard",
  "pyo3",
  "pyo3-build-config",

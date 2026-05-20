@@ -124,10 +124,7 @@ async fn main() -> color_eyre::Result<()> {
     // will still pick up post-app via the receiver hand-off).
     // 2 s per task is the budget; a stuck RPC doesn't block
     // shutdown forever.
-    let handles: Vec<_> = pending_admin
-        .lock()
-        .map(|mut g| std::mem::take(&mut *g))
-        .unwrap_or_default();
+    let handles: Vec<_> = std::mem::take(&mut *pending_admin.lock());
     for h in handles {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
     }

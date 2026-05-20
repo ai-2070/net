@@ -53,7 +53,7 @@
 #![allow(dead_code)]
 
 use napi_derive::napi;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 /// Consumer-side dedup helper for the Redis Streams adapter.
 ///
@@ -99,20 +99,14 @@ impl RedisStreamDedup {
         // panicked while holding the lock; in that case the
         // helper's state is unknown but the LRU semantics are
         // still safe to continue from. Recover the inner.
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self.inner.lock();
         guard.is_duplicate(&dedup_id)
     }
 
     /// Number of distinct ids currently tracked.
     #[napi(getter)]
     pub fn len(&self) -> u32 {
-        let guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = self.inner.lock();
         // `as u32` is fine: capacity is bounded by the constructor
         // argument which we accept as `u32`, so `len()` can never
         // exceed it.
@@ -122,20 +116,14 @@ impl RedisStreamDedup {
     /// Configured maximum capacity.
     #[napi(getter)]
     pub fn capacity(&self) -> u32 {
-        let guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = self.inner.lock();
         guard.capacity() as u32
     }
 
     /// True if no ids are tracked yet.
     #[napi(getter)]
     pub fn is_empty(&self) -> bool {
-        let guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = self.inner.lock();
         guard.is_empty()
     }
 
@@ -144,10 +132,7 @@ impl RedisStreamDedup {
     /// helper instance.
     #[napi]
     pub fn clear(&self) {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self.inner.lock();
         guard.clear();
     }
 }

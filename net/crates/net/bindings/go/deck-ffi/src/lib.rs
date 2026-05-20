@@ -76,7 +76,7 @@ use net::adapter::net::behavior::meshos::{
 };
 use net::adapter::net::identity::EntityId;
 use net::adapter::net::EntityKeypair;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 // =========================================================================
 // Status codes
@@ -2581,8 +2581,7 @@ pub struct NetDeckOperatorRegistry {
 
 impl NetDeckOperatorRegistry {
     fn snapshot_arc(&self) -> Arc<CoreOperatorRegistry> {
-        let g = self.inner.lock().expect("registry mutex poisoned");
-        Arc::new(g.clone())
+        Arc::new(self.inner.lock().clone())
     }
 }
 
@@ -2624,13 +2623,7 @@ pub extern "C" fn net_deck_operator_registry_insert(
             std::ptr::copy_nonoverlapping(public_key, bytes.as_mut_ptr(), 32);
         }
         let entity_id = EntityId::from_bytes(bytes);
-        let mut g = r.inner.lock().map_err(|_| {
-            set_last_error("registry_poisoned", "operator registry mutex poisoned");
-        });
-        let Ok(g) = g.as_deref_mut() else {
-            return NET_DECK_ERR_CALL_FAILED;
-        };
-        g.insert(operator_id, entity_id);
+        r.inner.lock().insert(operator_id, entity_id);
         NET_DECK_OK
     })
 }
@@ -2651,14 +2644,7 @@ pub extern "C" fn net_deck_operator_registry_register(
             set_last_error("invalid_argument", "identity pointer is NULL");
             return NET_DECK_ERR_INVALID_ARG;
         };
-        let mut g = match r.inner.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                set_last_error("registry_poisoned", "operator registry mutex poisoned");
-                return NET_DECK_ERR_CALL_FAILED;
-            }
-        };
-        g.register(i.inner.keypair());
+        r.inner.lock().register(i.inner.keypair());
         NET_DECK_OK
     })
 }
@@ -2673,10 +2659,7 @@ pub extern "C" fn net_deck_operator_registry_contains(
     let Some(r) = (unsafe { registry.as_ref() }) else {
         return NET_DECK_ERR_NULL;
     };
-    let Ok(g) = r.inner.lock() else {
-        return NET_DECK_ERR_CALL_FAILED;
-    };
-    if g.contains(operator_id) {
+    if r.inner.lock().contains(operator_id) {
         1
     } else {
         0
@@ -2689,7 +2672,7 @@ pub extern "C" fn net_deck_operator_registry_len(
     registry: *const NetDeckOperatorRegistry,
 ) -> usize {
     match unsafe { registry.as_ref() } {
-        Some(r) => r.inner.lock().map(|g| g.len()).unwrap_or(0),
+        Some(r) => r.inner.lock().len(),
         None => 0,
     }
 }
@@ -2739,14 +2722,7 @@ pub extern "C" fn net_deck_operator_registry_verify(
         } else {
             unsafe { std::slice::from_raw_parts(payload_ptr, payload_len) }
         };
-        let g = match r.inner.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                set_last_error("registry_poisoned", "operator registry mutex poisoned");
-                return NET_DECK_ERR_CALL_FAILED;
-            }
-        };
-        match g.verify(&core_sig, payload) {
+        match r.inner.lock().verify(&core_sig, payload) {
             Ok(()) => NET_DECK_OK,
             Err(e) => {
                 set_verify_error(e);
@@ -2799,14 +2775,7 @@ pub extern "C" fn net_deck_operator_registry_verify_bundle(
         } else {
             unsafe { std::slice::from_raw_parts(payload_ptr, payload_len) }
         };
-        let g = match r.inner.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                set_last_error("registry_poisoned", "operator registry mutex poisoned");
-                return NET_DECK_ERR_CALL_FAILED;
-            }
-        };
-        match g.verify_bundle(&core_sigs, payload, threshold) {
+        match r.inner.lock().verify_bundle(&core_sigs, payload, threshold) {
             Ok(()) => NET_DECK_OK,
             Err(e) => {
                 set_verify_error(e);

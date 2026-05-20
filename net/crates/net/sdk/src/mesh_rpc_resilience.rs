@@ -22,6 +22,7 @@
 //! pipeline. Use them when you need them; pay nothing when you
 //! don't.
 
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -786,7 +787,7 @@ impl BreakerError {
 /// ```
 pub struct CircuitBreaker {
     config: CircuitBreakerConfig,
-    inner: std::sync::Mutex<BreakerInner>,
+    inner: Mutex<BreakerInner>,
 }
 
 struct BreakerInner {
@@ -807,7 +808,7 @@ impl CircuitBreaker {
     pub fn new(config: CircuitBreakerConfig) -> Self {
         Self {
             config,
-            inner: std::sync::Mutex::new(BreakerInner {
+            inner: Mutex::new(BreakerInner {
                 state: BreakerState::Closed,
                 consecutive_failures: 0,
                 consecutive_successes: 0,
@@ -817,14 +818,10 @@ impl CircuitBreaker {
         }
     }
 
-    /// Lock the inner state, recovering from poison. The breaker's
-    /// state is monotonic counters; partial updates aren't safety-
-    /// critical, so a poisoned mutex (a thread panicked while
-    /// holding the lock — should never happen in practice since
-    /// the lock is never held across an await) is preferable to
-    /// a process-wide panic propagation that wedges every caller.
-    fn lock_inner(&self) -> std::sync::MutexGuard<'_, BreakerInner> {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    /// Lock the inner state. parking_lot::Mutex has no poison concept,
+    /// so the previous std::sync poison-recovery dance is unnecessary.
+    fn lock_inner(&self) -> parking_lot::MutexGuard<'_, BreakerInner> {
+        self.inner.lock()
     }
 
     /// Current operational state. Cheap snapshot — useful for

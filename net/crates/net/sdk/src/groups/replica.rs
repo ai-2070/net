@@ -14,7 +14,8 @@
 //!   `&self`; contention is negligible because group operations
 //!   happen on seconds-to-minutes timescales.
 
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use ::net::adapter::net::behavior::loadbalance::Strategy;
 use ::net::adapter::net::compute::DaemonHostConfig;
@@ -117,7 +118,7 @@ impl ReplicaGroup {
     /// [`DaemonRuntime::deliver`](crate::compute::DaemonRuntime::deliver)
     /// with the returned hash.
     pub fn route_event(&self, ctx: &RequestContext) -> Result<u64, GroupError> {
-        let guard = self.inner.lock().expect("ReplicaGroup mutex poisoned");
+        let guard = self.inner.lock();
         Ok(guard.route_event(ctx)?)
     }
 
@@ -133,7 +134,7 @@ impl ReplicaGroup {
             .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
-        let mut guard = self.inner.lock().expect("ReplicaGroup mutex poisoned");
+        let mut guard = self.inner.lock();
         guard.scale_to(n, move || (factory)(), &scheduler, &registry)?;
         Ok(())
     }
@@ -150,7 +151,7 @@ impl ReplicaGroup {
             .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
-        let mut guard = self.inner.lock().expect("ReplicaGroup mutex poisoned");
+        let mut guard = self.inner.lock();
         let replaced =
             guard.on_node_failure(failed_node_id, move || (factory)(), &scheduler, &registry)?;
         Ok(replaced)
@@ -162,57 +163,41 @@ impl ReplicaGroup {
     /// their new home.
     pub fn on_node_recovery(&self, recovered_node_id: u64) {
         let registry = self.runtime.registry_arc();
-        let mut guard = self.inner.lock().expect("ReplicaGroup mutex poisoned");
+        let mut guard = self.inner.lock();
         guard.on_node_recovery(recovered_node_id, &registry);
     }
 
     /// Aggregate health of the group.
     pub fn health(&self) -> GroupHealth {
-        self.inner
-            .lock()
-            .expect("ReplicaGroup mutex poisoned")
-            .health()
+        self.inner.lock().health()
     }
 
     /// Unique group identifier (hash of `group_seed`).
     pub fn group_id(&self) -> u32 {
-        self.inner
-            .lock()
-            .expect("ReplicaGroup mutex poisoned")
-            .group_id()
+        self.inner.lock().group_id()
     }
 
     /// Owned snapshot of the current member roster. Owned
     /// (cloned) rather than borrowed so the caller doesn't hold
     /// the lock across await points.
     pub fn replicas(&self) -> Vec<MemberInfo> {
-        self.inner
-            .lock()
-            .expect("ReplicaGroup mutex poisoned")
-            .replicas()
-            .to_vec()
+        self.inner.lock().replicas().to_vec()
     }
 
     /// Current replica count (both healthy and unhealthy).
     pub fn replica_count(&self) -> u8 {
-        self.inner
-            .lock()
-            .expect("ReplicaGroup mutex poisoned")
-            .replica_count()
+        self.inner.lock().replica_count()
     }
 
     /// Number of replicas currently healthy.
     pub fn healthy_count(&self) -> u8 {
-        self.inner
-            .lock()
-            .expect("ReplicaGroup mutex poisoned")
-            .healthy_count()
+        self.inner.lock().healthy_count()
     }
 }
 
 impl std::fmt::Debug for ReplicaGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let guard = self.inner.lock().expect("ReplicaGroup mutex poisoned");
+        let guard = self.inner.lock();
         f.debug_struct("ReplicaGroup")
             .field("group_id", &format_args!("{:#x}", guard.group_id()))
             .field("replica_count", &guard.replica_count())
