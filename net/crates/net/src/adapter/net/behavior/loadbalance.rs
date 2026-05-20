@@ -2552,10 +2552,8 @@ mod tests {
         assert_eq!(snapshot.len(), 2);
         // Order isn't guaranteed (DashMap iteration) — assert
         // by node_id membership rather than position.
-        let weights: std::collections::HashMap<u8, u32> = snapshot
-            .iter()
-            .map(|e| (e.node_id[0], e.weight))
-            .collect();
+        let weights: std::collections::HashMap<u8, u32> =
+            snapshot.iter().map(|e| (e.node_id[0], e.weight)).collect();
         assert_eq!(weights.get(&1), Some(&50));
         assert_eq!(weights.get(&2), Some(&75));
     }

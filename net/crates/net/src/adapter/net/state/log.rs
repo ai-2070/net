@@ -729,7 +729,10 @@ mod tests {
         let mut log =
             EntityLog::from_snapshot(entity_id, head_link.sequence, head_link, last_payload);
         assert_eq!(log.snapshot_seq(), 5);
-        assert!(log.is_empty(), "catchup log starts with no in-memory events");
+        assert!(
+            log.is_empty(),
+            "catchup log starts with no in-memory events"
+        );
 
         // The next event (seq=6) must chain cleanly off the
         // snapshot's head.

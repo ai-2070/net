@@ -1890,7 +1890,11 @@ mod tests {
             )
             .unwrap();
 
-        assert!(engine.evaluate_first(&RuleContext::new()).unwrap().action.is_some());
+        assert!(engine
+            .evaluate_first(&RuleContext::new())
+            .unwrap()
+            .action
+            .is_some());
         let r = engine.evaluate_first(&RuleContext::new()).unwrap();
         assert!(r.matched);
         assert!(

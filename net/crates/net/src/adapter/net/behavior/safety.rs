@@ -2672,7 +2672,10 @@ mod tests {
         // Global RPM counter must also be 1 (only the first
         // request committed), not 2 — proves global rollback fired.
         assert_eq!(
-            enforcer.rate_limiter.global_requests.load(Ordering::Relaxed),
+            enforcer
+                .rate_limiter
+                .global_requests
+                .load(Ordering::Relaxed),
             1
         );
     }
@@ -2717,7 +2720,10 @@ mod tests {
         assert_eq!(enforcer.usage().memory_gb, 0);
         assert_eq!(enforcer.usage().cost_cents_per_hour, 0);
         assert_eq!(
-            enforcer.rate_limiter.global_requests.load(Ordering::Relaxed),
+            enforcer
+                .rate_limiter
+                .global_requests
+                .load(Ordering::Relaxed),
             0
         );
     }

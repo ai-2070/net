@@ -2156,7 +2156,8 @@ mod tests {
         let new = caps_with_limits(ResourceLimits::new().with_max_concurrent(20));
         let ops = DiffEngine::diff(&old, &new);
         assert!(
-            ops.iter().any(|op| matches!(op, DiffOp::UpdateMaxConcurrent(20))),
+            ops.iter()
+                .any(|op| matches!(op, DiffOp::UpdateMaxConcurrent(20))),
             "expected UpdateMaxConcurrent(20), got {:?}",
             ops,
         );
@@ -2172,7 +2173,8 @@ mod tests {
         let new = caps_with_limits(ResourceLimits::new().with_rate_limit(120));
         let ops = DiffEngine::diff(&old, &new);
         assert!(
-            ops.iter().any(|op| matches!(op, DiffOp::UpdateRateLimit(120))),
+            ops.iter()
+                .any(|op| matches!(op, DiffOp::UpdateRateLimit(120))),
             "expected UpdateRateLimit(120), got {:?}",
             ops,
         );
@@ -2181,10 +2183,14 @@ mod tests {
     #[test]
     fn diff_limits_falls_through_to_full_replacement_when_multiple_fields_change() {
         let old = caps_with_limits(
-            ResourceLimits::new().with_max_concurrent(10).with_rate_limit(60),
+            ResourceLimits::new()
+                .with_max_concurrent(10)
+                .with_rate_limit(60),
         );
         let new = caps_with_limits(
-            ResourceLimits::new().with_max_concurrent(20).with_rate_limit(120),
+            ResourceLimits::new()
+                .with_max_concurrent(20)
+                .with_rate_limit(120),
         );
         let ops = DiffEngine::diff(&old, &new);
         assert!(
@@ -2231,7 +2237,12 @@ mod tests {
             }],
         );
         let after = DiffEngine::apply(&base, &diff, true).unwrap();
-        assert!(after.views().software().runtimes.iter().any(|(n, _)| n == "node"));
+        assert!(after
+            .views()
+            .software()
+            .runtimes
+            .iter()
+            .any(|(n, _)| n == "node"));
 
         let diff = CapabilityDiff::new(
             1,
@@ -2243,14 +2254,21 @@ mod tests {
             }],
         );
         let after = DiffEngine::apply(&base, &diff, true).unwrap();
-        assert!(after.views().software().frameworks.iter().any(|(n, _)| n == "jax"));
+        assert!(after
+            .views()
+            .software()
+            .frameworks
+            .iter()
+            .any(|(n, _)| n == "jax"));
     }
 
     #[test]
     fn apply_update_limits_and_shortcuts() {
         let base = sample_capability_set();
 
-        let new_limits = ResourceLimits::new().with_max_concurrent(99).with_rate_limit(50);
+        let new_limits = ResourceLimits::new()
+            .with_max_concurrent(99)
+            .with_rate_limit(50);
         let diff = CapabilityDiff::new(1, 1, 2, vec![DiffOp::UpdateLimits(new_limits)]);
         let after = DiffEngine::apply(&base, &diff, true).unwrap();
         assert_eq!(after.views().resource_limits().max_concurrent_requests, 99);
@@ -2269,12 +2287,7 @@ mod tests {
     #[test]
     fn remove_tool_missing_errors_in_strict_mode_noops_otherwise() {
         let base = sample_capability_set();
-        let diff = CapabilityDiff::new(
-            1,
-            1,
-            2,
-            vec![DiffOp::RemoveTool("nonexistent".into())],
-        );
+        let diff = CapabilityDiff::new(1, 1, 2, vec![DiffOp::RemoveTool("nonexistent".into())]);
         // strict=true: surface NotFound rather than silently ignoring.
         assert!(matches!(
             DiffEngine::apply(&base, &diff, true),
@@ -2288,12 +2301,7 @@ mod tests {
     #[test]
     fn remove_runtime_missing_errors_in_strict_mode_noops_otherwise() {
         let base = sample_capability_set();
-        let diff = CapabilityDiff::new(
-            1,
-            1,
-            2,
-            vec![DiffOp::RemoveRuntime("nonexistent".into())],
-        );
+        let diff = CapabilityDiff::new(1, 1, 2, vec![DiffOp::RemoveRuntime("nonexistent".into())]);
         assert!(matches!(
             DiffEngine::apply(&base, &diff, true),
             Err(DiffError::RuntimeNotFound(_))
@@ -2304,17 +2312,12 @@ mod tests {
     #[test]
     fn remove_framework_missing_errors_in_strict_mode_noops_otherwise() {
         let base = sample_capability_set();
-        let diff = CapabilityDiff::new(
-            1,
-            1,
-            2,
-            vec![DiffOp::RemoveFramework("nonexistent".into())],
-        );
+        let diff =
+            CapabilityDiff::new(1, 1, 2, vec![DiffOp::RemoveFramework("nonexistent".into())]);
         assert!(matches!(
             DiffEngine::apply(&base, &diff, true),
             Err(DiffError::FrameworkNotFound(_))
         ));
         assert!(DiffEngine::apply(&base, &diff, false).is_ok());
     }
-
 }

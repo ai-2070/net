@@ -2494,7 +2494,9 @@ mod tests {
         assert!(r.validate(&serde_json::json!(null)).is_ok());
 
         // Any matches anything.
-        assert!(SchemaType::Any.validate(&serde_json::json!({"x":1})).is_ok());
+        assert!(SchemaType::Any
+            .validate(&serde_json::json!({"x":1}))
+            .is_ok());
     }
 
     // ---------- ApiQuery negative-branch coverage ----------
@@ -2548,6 +2550,8 @@ mod tests {
         // Give the wall clock a moment to advance past `timestamp`.
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        assert!(registry.find_by_endpoint("/run", ApiMethod::Post).is_empty());
+        assert!(registry
+            .find_by_endpoint("/run", ApiMethod::Post)
+            .is_empty());
     }
 }
