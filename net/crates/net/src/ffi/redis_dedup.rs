@@ -58,11 +58,11 @@
     reason = "FFI entry points deref input pointers together with out-parameter writes under the same caller contract"
 )]
 
+use parking_lot::Mutex;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use parking_lot::Mutex;
 
 use super::handle_guard::{HandleGuard, FFI_HANDLE_FREE_DEADLINE};
 

@@ -10,8 +10,8 @@ use chacha20poly1305::{
     aead::{Aead, AeadInPlace, KeyInit},
     ChaCha20Poly1305,
 };
-use snow::{params::NoiseParams, Builder, HandshakeState};
 use parking_lot::Mutex;
+use snow::{params::NoiseParams, Builder, HandshakeState};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 

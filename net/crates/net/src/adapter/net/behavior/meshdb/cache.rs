@@ -52,9 +52,9 @@
 //! approximate byte size (default `LRU_MAX_BYTES`). Per a
 //! Phase F locked decision: 1024 entries / 256 MiB.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use super::planner::ExecutionPlan;

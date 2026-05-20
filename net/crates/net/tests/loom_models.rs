@@ -39,6 +39,10 @@
 //! production structs under loom directly.
 
 #![cfg(loom)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "loom test uses std::sync types; no real poison concern"
+)]
 
 use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use loom::sync::Arc;

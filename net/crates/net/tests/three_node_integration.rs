@@ -12,6 +12,10 @@
 //!   cargo test --features net --test three_node_integration
 
 #![cfg(feature = "net")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code legitimately uses std::sync::Mutex for SUT setup; no real poison concern"
+)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;

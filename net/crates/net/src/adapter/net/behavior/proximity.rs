@@ -8,9 +8,9 @@
 //! - Automatic capability index updates from pingwave data
 
 use dashmap::DashMap;
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 

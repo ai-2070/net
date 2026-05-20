@@ -11,6 +11,10 @@
 //! Run: `cargo test --features "net,meshdb" --test meshdb_subprotocol_wire`
 
 #![cfg(all(feature = "net", feature = "meshdb"))]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code legitimately uses std::sync::Mutex for SUT setup; no real poison concern"
+)]
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;

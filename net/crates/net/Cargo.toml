@@ -31,12 +31,23 @@ categories = ["asynchronous", "concurrency", "data-structures"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [lints.clippy]
-# Panic-hygiene lints — Stage 1 of PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md.
-# Held at "warn" while Stage 2 walks the ~280 library-code sites; Stage 4
-# promotes to "deny". The existing CI `clippy` job runs with `-D warnings`
-# and is patched to pass `-A` for these four lints until Stage 2 lands —
-# search for the matching `-A clippy::unwrap_used` in .github/workflows/ci.yml
-# to find the temporary allow.
+# Panic-hygiene + unsafe-documentation lints — closing-state per Stage 4
+# of PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md.
+#
+# Held at "warn" rather than "deny" because Cargo applies the `[lints]`
+# table AFTER command-line lint flags, which means a package-level
+# "deny" cannot be overridden by `-A` on `cargo clippy --all-targets`.
+# That matters for the test surface: ~5000 test-code unwraps would
+# block CI if the lint were forced to deny everywhere.
+#
+# Enforcement is split across two CI clippy steps in
+# `.github/workflows/ci.yml`:
+#   - `--lib --bins -- -D warnings`  -> production code, strict
+#   - `--all-targets -- -D warnings -A clippy::unwrap_used ...`
+#     -> tests / benches / examples, with allowed unwraps
+#
+# Devs running plain `cargo clippy` locally see these as warnings,
+# which is the right signal density during normal development.
 unwrap_used                   = "warn"
 expect_used                   = "warn"
 undocumented_unsafe_blocks    = "warn"

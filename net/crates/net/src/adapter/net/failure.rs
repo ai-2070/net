@@ -577,10 +577,7 @@ impl CircuitBreaker {
         match *state {
             CircuitState::Closed | CircuitState::HalfOpen => true,
             CircuitState::Open => {
-                let elapsed = self
-                    .last_state_change
-                    .lock()
-                    .elapsed();
+                let elapsed = self.last_state_change.lock().elapsed();
                 if elapsed >= self.reset_timeout {
                     Self::transition_locked(
                         &mut state,

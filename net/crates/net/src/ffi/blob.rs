@@ -1298,6 +1298,10 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_config(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "test code legitimately uses std::sync::{Mutex,RwLock} for SUT setup; tests have no real poison concern"
+    )]
     use super::*;
     use std::ffi::CString;
     use std::sync::atomic::{AtomicU64, Ordering};
