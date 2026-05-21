@@ -1514,7 +1514,10 @@ mod tests {
 
         // Wait past reset_timeout and probe — moves to HalfOpen.
         std::thread::sleep(Duration::from_millis(30));
-        assert!(cb.allow(), "expected allow() to admit a probe after reset_timeout");
+        assert!(
+            cb.allow(),
+            "expected allow() to admit a probe after reset_timeout"
+        );
         assert_eq!(cb.state(), CircuitState::HalfOpen);
 
         // Single failure in HalfOpen must trip back to Open.
