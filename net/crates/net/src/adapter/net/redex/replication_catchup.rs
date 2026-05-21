@@ -409,6 +409,7 @@ pub fn apply_sync_response(
         .iter()
         .map(|e| Bytes::from(e.payload.clone()))
         .collect();
+    let appended = payloads.len() as u64;
     file.append_batch(&payloads)
         .map_err(|e| ApplyError::AppendFailed(format!("{e:?}")))?;
     // Force a disk sync before returning the new tail so the
@@ -433,7 +434,16 @@ pub fn apply_sync_response(
         file.sync()
             .map_err(|e| ApplyError::AppendFailed(format!("durable-sync: {e:?}")))?;
     }
-    Ok(file.next_seq())
+    // Compute the new tail from the snapshot we already took
+    // rather than re-locking via `file.next_seq()`. Pre-fix
+    // [perf #72 in `docs/performance/net-perf-analysis.md`] this
+    // ran `file.next_seq()` after a successful append — a
+    // parking_lot lock + atomic load — even though we know the
+    // append bumped the counter by exactly `appended`. `next_seq()`
+    // would still be re-read implicitly on the empty-batch path
+    // above (which returns early), so this saves one lock+unlock
+    // per non-empty `apply_sync_response`.
+    Ok(local_next + appended)
 }
 
 #[cfg(test)]

@@ -262,8 +262,18 @@ impl NetSession {
         let (admitted, epoch, seq) = match self.streams.get(&stream_id) {
             None => return TxAdmit::StreamClosed,
             Some(state) => {
+                // Cache `epoch` once — pre-fix [perf #42 in
+                // `docs/performance/net-perf-analysis.md`] the field
+                // was read twice through the `Ref`, once for the
+                // epoch-mismatch check and once on the return tuple.
+                // Trivial field access today but the cache also makes
+                // it obvious that both checks observe the same
+                // snapshot (rather than reading mid-mutation between
+                // the two reads — a defensive read against a future
+                // change that makes `epoch` mutable under `&self`).
+                let current_epoch = state.epoch();
                 if let Some(expected) = expected_epoch {
-                    if state.epoch() != expected {
+                    if current_epoch != expected {
                         // The handle is stale: the stream was closed
                         // and reopened since the handle was issued.
                         // Surface this as StreamClosed so the caller
@@ -280,7 +290,7 @@ impl NetSession {
                 } else {
                     None
                 };
-                (admitted, state.epoch(), seq)
+                (admitted, current_epoch, seq)
             }
         };
         if !admitted {
