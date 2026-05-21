@@ -1,0 +1,33 @@
+net/crates/net/src/adapter/net/failure.rs
+  s_f930dae9b8bbc1::t_8518da2194a52d 1508-1517,1524
+net/crates/net/src/adapter/net/crypto.rs
+  s_f930dae9b8bbc1::t_5ff73bd7bd967a 1453-1463,1466-1467,1469-1470,1480-1481,1491,1493,1495,1500,1503
+net/crates/net/src/adapter/net/behavior/safety.rs
+  s_f930dae9b8bbc1::t_c3e065db512b8c 2716-2720
+  s_f930dae9b8bbc1::t_15823f686eb46e 2670-2672,2675-2677
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  s_f930dae9b8bbc1::t_7afd274a9cb958 2466-2475
+net/crates/net/src/adapter/net/behavior/api.rs
+  s_f930dae9b8bbc1::t_0eacb9b902e520 2546-2554
+net/crates/net/src/adapter/net/behavior/diff.rs
+  s_f930dae9b8bbc1::t_8f2414ebf97475 2060-2084,2089,2091-2095,2097-2101,2103-2104,2108,2110-2112,2116,2118-2127,2129-2130,2133-2147
+net/crates/net/src/adapter/net/behavior/context.rs
+  s_f930dae9b8bbc1::t_440558b781c44b 1927,1929-1930
+  s_f930dae9b8bbc1::t_1477ec196efbf9 851-858
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "fa8a02bdb1ee0f068ee9440fd6efa0034a521d1e",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
