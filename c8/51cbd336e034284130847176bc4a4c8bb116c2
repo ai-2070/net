@@ -1,0 +1,149 @@
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_f930dae9b8bbc1::t_88109d39190bf9 475,1320
+net/crates/net/sdk/benches/nrpc_common/mod.rs
+  s_f930dae9b8bbc1::t_fa70197d10c28b 241
+net/crates/net/tests/integration_nrpc_loopback.rs
+  s_f930dae9b8bbc1::t_e93991e837f236 400
+  s_f930dae9b8bbc1::t_bcb9338e92ead4 327
+  s_f930dae9b8bbc1::t_e92bd4f6c5f0b4 213
+  s_f930dae9b8bbc1::t_29cc7243a0e1d8 378
+  s_f930dae9b8bbc1::t_e590a52ae40035 220
+  s_f930dae9b8bbc1::t_d66efa13e795d7 311
+  s_f930dae9b8bbc1::t_3e60f4114f6877 277
+  s_f930dae9b8bbc1::t_c3bec960f11d0e 371
+  s_f930dae9b8bbc1::t_280ece95effc8f 240
+net/crates/net/tests/integration_nrpc_cross_lang_streaming.rs
+  s_f930dae9b8bbc1::t_e5158f275a89e2 211
+  s_f930dae9b8bbc1::t_d97da831974414 582
+  s_f930dae9b8bbc1::t_456e3c77afcda8 200
+  s_f930dae9b8bbc1::t_ada8518bc338c6 601
+  s_f930dae9b8bbc1::t_7732c403267c4b 132
+net/crates/net/bindings/node/src/mesh_rpc.rs
+  s_f930dae9b8bbc1::t_3ea3416973d399 349
+  s_f930dae9b8bbc1::t_824e7b7a27b695 424,1294
+net/crates/net/tests/integration_nrpc_cross_lang.rs
+  s_f930dae9b8bbc1::t_f53173c280161c 172
+  s_f930dae9b8bbc1::t_f47fc16bcee8fd 103
+  s_f930dae9b8bbc1::t_1cbcb7f0aea3df 85
+net/crates/net/sdk/tests/mesh_rpc_where.rs
+  s_f930dae9b8bbc1::t_391672d21173c8 171
+net/crates/net/docs/performance/net-perf-analysis.md
+  s_f930dae9b8bbc1::t_06dffa4209db96 21
+net/crates/net/tests/integration_nrpc_predicate_header.rs
+  s_f930dae9b8bbc1::t_236f1fbdef46df 175
+  s_f930dae9b8bbc1::t_f96a6b3c35114b 160
+net/crates/net/tests/integration_nrpc_client_streaming.rs
+  s_f930dae9b8bbc1::t_142c5e588cd785 136,214
+  s_f930dae9b8bbc1::t_755cb75ac541ad 107
+net/crates/net/tests/integration_nrpc_mesh.rs
+  s_f930dae9b8bbc1::t_db780a03f09735 358,431
+  s_f930dae9b8bbc1::t_b39c0921e36953 489
+  s_f930dae9b8bbc1::t_299df4243693f7 116
+net/crates/net/sdk/tests/mesh_rpc_hedge.rs
+  s_f930dae9b8bbc1::t_1f5eaf474c0a3e 228
+  s_f930dae9b8bbc1::t_f1a8a3bec35356 69
+  s_f930dae9b8bbc1::t_3c44fe0fb4a894 241
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_f930dae9b8bbc1::t_3927e69afe22cd 2345,2682
+  s_f930dae9b8bbc1::t_0a082217b2bfe9 2831
+  s_f930dae9b8bbc1::t_2b6a363b3fdaaf 676,686,963,974
+  s_f930dae9b8bbc1::t_3b270ee2cf43cf 787-792
+  s_f930dae9b8bbc1::t_ebba8485ad674b 719,728,1001,1011
+  s_f930dae9b8bbc1::t_6a7efff1bd351d 2839
+  s_f930dae9b8bbc1::t_bf398a3761c232 474,1129
+  s_f930dae9b8bbc1::t_c8c63e01a6106e 1681,1684
+  s_f930dae9b8bbc1::t_04ae37e64be1f4 806
+net/crates/net/src/adapter/net/dataforts/blob/overflow.rs
+  s_f930dae9b8bbc1::t_2e2b759c048da3 436
+net/crates/net/sdk/tests/mesh_rpc_retry.rs
+  s_f930dae9b8bbc1::t_87e915a5b2107c 295
+net/crates/net/sdk/tests/mesh_rpc_bidi_typed.rs
+  s_f930dae9b8bbc1::t_b972554ba9ddc9 184
+net/crates/net/sdk/src/mesh_rpc.rs
+  s_f930dae9b8bbc1::t_6a47fc58b2cbf8 822,1331
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_f930dae9b8bbc1::t_617f8bcc7ff6b3 3256-3258
+  s_f930dae9b8bbc1::t_7228550b760faf 5475
+  s_f930dae9b8bbc1::t_67d38749171c78 5815-5816
+  s_f930dae9b8bbc1::t_3bd9ba38632fd9 18
+  s_f930dae9b8bbc1::t_181646e748f298 2312,3268
+  s_f930dae9b8bbc1::t_145477e77850a5 6299
+  s_f930dae9b8bbc1::t_558b91fd96a8f3 3670,3675,3693
+  s_f930dae9b8bbc1::t_f027a43342b748 4204
+  s_f930dae9b8bbc1::t_5c271dcf6fb35a 4382
+  s_f930dae9b8bbc1::t_f4d4cdcd38cca2 4807
+  s_f930dae9b8bbc1::t_987b7bfb6a3882 3061-3063
+  s_f930dae9b8bbc1::t_fc023f2a112bd3 1671,2341,2866,3297
+  s_f930dae9b8bbc1::t_1da024f1ebbd7d 2502
+  s_f930dae9b8bbc1::t_7b302f531b0f7c 363-366
+  s_f930dae9b8bbc1::t_90b1dfb6dacfd7 4312,4330
+  s_f930dae9b8bbc1::t_25d252bcdc2998 4398
+  s_f930dae9b8bbc1::t_7947f6bc81f923 4885,5514
+  s_f930dae9b8bbc1::t_91e4bc2b7f4f81 4422
+  s_f930dae9b8bbc1::t_4b608d5c398445 2300-2302
+  s_f930dae9b8bbc1::t_34cd04992ebb46 3798,3884
+  s_f930dae9b8bbc1::t_a76920bb7f924e 1648,1654,2318,2324,2843,2849,3274,3280
+  s_f930dae9b8bbc1::t_d0d24efc1783eb 1553,2148,2681,3089
+  s_f930dae9b8bbc1::t_f8e6ac31dc13b7 4229
+  s_f930dae9b8bbc1::t_e6828881b06ec2 1639
+  s_f930dae9b8bbc1::t_097da2bca76a84 3309
+  s_f930dae9b8bbc1::t_2ce619bc40a372 4182
+  s_f930dae9b8bbc1::t_413f38e1c53e8d 1512,2108,2637,3031
+  s_f930dae9b8bbc1::t_22ad62c4c9b4ad 4073,4327
+  s_f930dae9b8bbc1::t_bfb7ba9bb3573d 1494,2089,2625,3016
+  s_f930dae9b8bbc1::t_a3ca81207e0f76 4432
+  s_f930dae9b8bbc1::t_160b734740793a 2656-2658
+  s_f930dae9b8bbc1::t_ef1f52c2139b80 4645
+  s_f930dae9b8bbc1::t_9a1e857ebae364 4026,4054,4090,4096,4309,4452,4465,4610,4638,4669,4700,4722,4754,4773,4825,4901,4972,5166,5196,5213,5224,5314,5339,5363,5747,5807,5849,5894,5957,6370,6408,6451,6467
+  s_f930dae9b8bbc1::t_62ed941e0736d4 6155
+  s_f930dae9b8bbc1::t_d77a9bf08f323d 4174,4567
+  s_f930dae9b8bbc1::t_929576a28d26c2 4961
+  s_f930dae9b8bbc1::t_d3af950d47f70b 3188
+  s_f930dae9b8bbc1::t_933bcb4c04dc8e 4413,4425
+  s_f930dae9b8bbc1::t_de6c9778d86a7a 4617
+  s_f930dae9b8bbc1::t_2b21dbff3cf098 4040
+  s_f930dae9b8bbc1::t_fe5a8aa2cbe963 4337,4350,4365
+  s_f930dae9b8bbc1::t_064ce8e9d28c2e 2832-2834
+  s_f930dae9b8bbc1::t_06a48739b5968a 627-629,641,659
+  s_f930dae9b8bbc1::t_dd5e621cd25923 2883
+  s_f930dae9b8bbc1::t_815c54128ce7aa 2259
+  s_f930dae9b8bbc1::t_d85a6aa287e993 5521
+  s_f930dae9b8bbc1::t_56b58586ef9e44 6182
+  s_f930dae9b8bbc1::t_3acfc4a22fc563 6113
+  s_f930dae9b8bbc1::t_d55508cbc2dc8b 1528
+  s_f930dae9b8bbc1::t_dca7fe5dadd62c 5289
+  s_f930dae9b8bbc1::t_0e95dea14aaa26 2713
+  s_f930dae9b8bbc1::t_b91c09004d3d4c 4583
+  s_f930dae9b8bbc1::t_2cc8f661350fdf 4389
+  s_f930dae9b8bbc1::t_489f4af05f4c7b 4410
+  s_f930dae9b8bbc1::t_b594f7d5b58ba8 4080,5468
+  s_f930dae9b8bbc1::t_b70845820320fd 6223
+  s_f930dae9b8bbc1::t_3ac3cbe96869dc 5451
+  s_f930dae9b8bbc1::t_034fc206e7537b 6266
+  s_f930dae9b8bbc1::t_efa5304e1d2c0b 2457
+  s_f930dae9b8bbc1::t_96c08317ec128b 707-709,714,731
+  s_f930dae9b8bbc1::t_30f85caaa2d496 4153,4161
+  s_f930dae9b8bbc1::t_88feba6c4d34ac 6256
+  s_f930dae9b8bbc1::t_fb03cd10e842d4 3113
+  s_f930dae9b8bbc1::t_d7287a9fb7a71a 509-514,550,568-569
+  s_f930dae9b8bbc1::t_64bf49619ae87e 6381
+  s_f930dae9b8bbc1::t_00a11f8caf0c47 4186
+  s_f930dae9b8bbc1::t_ba1f64188afdfa 403-406
+  s_f930dae9b8bbc1::t_29d87c133ac850 317-324
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "c851cbd336e034284130847176bc4a4c8bb116c2",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
