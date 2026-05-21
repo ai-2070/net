@@ -49,6 +49,8 @@ pub use self::jetstream::JetStreamAdapter;
 #[cfg(feature = "net")]
 pub use self::net::{NetAdapter, NetAdapterConfig};
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::error::AdapterError;
@@ -145,12 +147,21 @@ pub trait Adapter: Send + Sync {
     /// The adapter must persist all events in the batch atomically
     /// (all or nothing). Events must be stored in order within the batch.
     ///
+    /// `batch` is passed as `Arc<Batch>` so the dispatch retry loop
+    /// can clone cheaply (refcount bump) instead of deep-cloning the
+    /// events `Vec` on every attempt — the common path is `retries
+    /// == 0` so the prior `batch.clone()` was almost always wasted.
+    /// Implementations that only read events (the overwhelming
+    /// majority) pay nothing for the wrap; the one that genuinely
+    /// consumes can `Arc::try_unwrap` and fall back to clone on
+    /// contention.
+    ///
     /// # Errors
     ///
     /// - `AdapterError::Transient`: Temporary failure, retry is safe
     /// - `AdapterError::Fatal`: Unrecoverable error, adapter is broken
     /// - `AdapterError::Backpressure`: Backend overloaded, slow down
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError>;
+    async fn on_batch(&self, batch: Arc<Batch>) -> Result<(), AdapterError>;
 
     /// Force flush any buffered data.
     ///
@@ -199,7 +210,7 @@ impl Adapter for Box<dyn Adapter> {
         (**self).init().await
     }
 
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+    async fn on_batch(&self, batch: Arc<Batch>) -> Result<(), AdapterError> {
         (**self).on_batch(batch).await
     }
 
@@ -247,7 +258,7 @@ mod tests {
         ];
         let batch = Batch::new(0, events, 0);
 
-        adapter.on_batch(batch).await.unwrap();
+        adapter.on_batch(Arc::new(batch)).await.unwrap();
         adapter.flush().await.unwrap();
 
         // Noop adapter doesn't store anything
@@ -310,7 +321,7 @@ mod tests {
 
         let events = vec![InternalEvent::from_value(json!({"test": 1}), 1, 0)];
         let batch = Batch::new(0, events, 0);
-        adapter.on_batch(batch).await.unwrap();
+        adapter.on_batch(Arc::new(batch)).await.unwrap();
 
         adapter.flush().await.unwrap();
 
@@ -333,7 +344,7 @@ mod tests {
 
         let events = vec![InternalEvent::from_value(json!({"test": 1}), 1, 0)];
         let batch = Batch::new(0, events, 0);
-        adapter.on_batch(batch).await.unwrap();
+        adapter.on_batch(Arc::new(batch)).await.unwrap();
 
         adapter.flush().await.unwrap();
         adapter.shutdown().await.unwrap();

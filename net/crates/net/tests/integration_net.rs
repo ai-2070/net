@@ -157,7 +157,10 @@ async fn test_net_send_receive_fire_and_forget() {
             process_nonce: batch_process_nonce(),
         };
 
-        adapter.on_batch(batch).await.expect("send failed");
+        adapter
+            .on_batch(std::sync::Arc::new(batch))
+            .await
+            .expect("send failed");
 
         // Give time for events to arrive
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -237,7 +240,10 @@ async fn test_net_reliable_mode() {
             process_nonce: batch_process_nonce(),
         };
 
-        adapter.on_batch(batch).await.expect("send failed");
+        adapter
+            .on_batch(std::sync::Arc::new(batch))
+            .await
+            .expect("send failed");
         tokio::time::sleep(Duration::from_millis(300)).await;
         adapter.shutdown().await.expect("shutdown failed");
     });
@@ -306,12 +312,12 @@ async fn test_net_multiple_streams() {
             })
             .collect();
         adapter
-            .on_batch(Batch {
+            .on_batch(std::sync::Arc::new(Batch {
                 shard_id: 0,
                 events: events0,
                 sequence_start: 0,
                 process_nonce: batch_process_nonce(),
-            })
+            }))
             .await
             .expect("send to shard 0 failed");
 
@@ -322,12 +328,12 @@ async fn test_net_multiple_streams() {
             })
             .collect();
         adapter
-            .on_batch(Batch {
+            .on_batch(std::sync::Arc::new(Batch {
                 shard_id: 1,
                 events: events1,
                 sequence_start: 0,
                 process_nonce: batch_process_nonce(),
-            })
+            }))
             .await
             .expect("send to shard 1 failed");
 
@@ -469,7 +475,10 @@ async fn test_net_large_batch() {
             process_nonce: batch_process_nonce(),
         };
 
-        adapter.on_batch(batch).await.expect("send failed");
+        adapter
+            .on_batch(std::sync::Arc::new(batch))
+            .await
+            .expect("send failed");
         tokio::time::sleep(Duration::from_millis(500)).await;
         adapter.shutdown().await.expect("shutdown failed");
     });
@@ -594,12 +603,12 @@ async fn test_net_responder_to_initiator() {
             })
             .collect();
         adapter
-            .on_batch(Batch {
+            .on_batch(std::sync::Arc::new(Batch {
                 shard_id: 0,
                 events,
                 sequence_start: 0,
                 process_nonce: batch_process_nonce(),
-            })
+            }))
             .await
             .expect("responder send failed");
 

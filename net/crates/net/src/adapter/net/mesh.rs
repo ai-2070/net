@@ -4495,7 +4495,7 @@ impl MeshNode {
     pub async fn send_to_peer(
         &self,
         peer_addr: SocketAddr,
-        batch: Batch,
+        batch: &Batch,
     ) -> Result<(), AdapterError> {
         // Partition filter: silently drop sends to blocked peers
         if self.partition_filter.contains(&peer_addr) {
@@ -4587,7 +4587,11 @@ impl MeshNode {
     /// Requires:
     /// - A session with `dest_node_id` (for encryption)
     /// - A route to `dest_node_id` in the routing table (for next hop)
-    pub async fn send_routed(&self, dest_node_id: u64, batch: Batch) -> Result<(), AdapterError> {
+    pub async fn send_routed(
+        &self,
+        dest_node_id: u64,
+        batch: &Batch,
+    ) -> Result<(), AdapterError> {
         // Find the session for the destination (needed for encryption)
         let (dest_addr, session) = self
             .peers
@@ -9517,7 +9521,7 @@ impl Adapter for MeshNode {
         Ok(())
     }
 
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+    async fn on_batch(&self, batch: std::sync::Arc<Batch>) -> Result<(), AdapterError> {
         // Send to the first connected peer. For a real mesh, this should
         // use the routing table to pick the right peer based on the
         // event's destination. For now, round-robin or first-match.
@@ -9528,7 +9532,7 @@ impl Adapter for MeshNode {
             .map(|e| e.value().addr)
             .ok_or_else(|| AdapterError::Connection("no peers connected".into()))?;
 
-        self.send_to_peer(peer_addr, batch).await
+        self.send_to_peer(peer_addr, &batch).await
     }
 
     async fn flush(&self) -> Result<(), AdapterError> {

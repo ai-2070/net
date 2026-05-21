@@ -1535,7 +1535,7 @@ mod tests {
             Ok(())
         }
 
-        async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+        async fn on_batch(&self, _batch: Arc<Batch>) -> Result<(), AdapterError> {
             Ok(())
         }
 
@@ -1777,7 +1777,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, _b: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, _b: Arc<Batch>) -> Result<(), AdapterError> {
                 Ok(())
             }
             async fn flush(&self) -> Result<(), AdapterError> {
@@ -3006,7 +3006,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, _batch: Arc<Batch>) -> Result<(), AdapterError> {
                 Ok(())
             }
             async fn flush(&self) -> Result<(), AdapterError> {
@@ -3071,7 +3071,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, _batch: Arc<Batch>) -> Result<(), AdapterError> {
                 Ok(())
             }
             async fn flush(&self) -> Result<(), AdapterError> {
@@ -3154,7 +3154,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, _batch: Arc<Batch>) -> Result<(), AdapterError> {
                 Ok(())
             }
             async fn flush(&self) -> Result<(), AdapterError> {
@@ -3263,7 +3263,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, _batch: Arc<Batch>) -> Result<(), AdapterError> {
                 Ok(())
             }
             async fn flush(&self) -> Result<(), AdapterError> {

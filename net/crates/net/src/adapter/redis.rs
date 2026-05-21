@@ -393,7 +393,7 @@ impl Adapter for RedisAdapter {
         Ok(())
     }
 
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+    async fn on_batch(&self, batch: std::sync::Arc<Batch>) -> Result<(), AdapterError> {
         if batch.is_empty() {
             return Ok(());
         }

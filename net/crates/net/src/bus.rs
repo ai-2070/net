@@ -660,7 +660,7 @@ impl EventBus {
                 );
                 let dispatched = dispatch_batch(
                     &*self.adapter,
-                    batch,
+                    Arc::new(batch),
                     new_id,
                     self.config.adapter_timeout,
                     self.config.adapter_batch_retries,
@@ -843,7 +843,7 @@ impl EventBus {
             );
             let dispatched = dispatch_batch(
                 &*self.adapter,
-                batch,
+                Arc::new(batch),
                 shard_id,
                 self.config.adapter_timeout,
                 self.config.adapter_batch_retries,
@@ -2125,15 +2125,18 @@ fn retry_backoff(shard_id: u16, attempt: u32) -> Duration {
 
 async fn dispatch_batch(
     adapter: &dyn Adapter,
-    batch: Batch,
+    batch: Arc<Batch>,
     shard_id: u16,
     timeout: Duration,
     retries: u32,
 ) -> bool {
-    // Retry attempts clone the batch; the final attempt moves it, saving
-    // one clone per dispatch (the common path is retries == 0).
+    // Retry attempts clone the `Arc` (refcount bump only); the final
+    // attempt moves it. Pre-fix the batch was `Batch` and every retry
+    // deep-cloned the events `Vec` — at the common `retries == 0`
+    // path this was a wasted N×Bytes refcount bump + Vec alloc on
+    // every batch.
     for attempt in 0..retries {
-        match tokio::time::timeout(timeout, adapter.on_batch(batch.clone())).await {
+        match tokio::time::timeout(timeout, adapter.on_batch(Arc::clone(&batch))).await {
             Ok(Ok(())) => return true,
             Ok(Err(e)) => {
                 if !e.is_retryable() {
@@ -2261,7 +2264,7 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                         let batch_len = batch.len() as u64;
                         if dispatch_batch(
                             &*adapter,
-                            batch,
+                            Arc::new(batch),
                             shard_id,
                             adapter_timeout,
                             batch_retries,
@@ -2288,7 +2291,7 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                             let batch_len = batch.len() as u64;
                             if dispatch_batch(
                                 &*adapter,
-                                batch,
+                                Arc::new(batch),
                                 shard_id,
                                 adapter_timeout,
                                 batch_retries,
@@ -2312,7 +2315,7 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                         let batch_len = batch.len() as u64;
                         if dispatch_batch(
                             &*adapter,
-                            batch,
+                            Arc::new(batch),
                             shard_id,
                             adapter_timeout,
                             batch_retries,
@@ -2798,7 +2801,7 @@ mod tests {
         async fn init(&mut self) -> Result<(), AdapterError> {
             Ok(())
         }
-        async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+        async fn on_batch(&self, _batch: Arc<Batch>) -> Result<(), AdapterError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err((self.make_err)())
         }
@@ -2838,7 +2841,7 @@ mod tests {
         };
 
         let batch = Batch::new(0, vec![], 0);
-        let ok = dispatch_batch(&adapter, batch, 0, Duration::from_secs(1), 5).await;
+        let ok = dispatch_batch(&adapter, Arc::new(batch), 0, Duration::from_secs(1), 5).await;
 
         assert!(!ok, "non-retryable error must drop batch");
         assert_eq!(
@@ -2861,11 +2864,97 @@ mod tests {
         };
 
         let batch = Batch::new(0, vec![], 0);
-        let ok = dispatch_batch(&adapter, batch, 0, Duration::from_secs(1), 3).await;
+        let ok = dispatch_batch(&adapter, Arc::new(batch), 0, Duration::from_secs(1), 3).await;
 
         assert!(!ok);
         // 3 retries + 1 final attempt = 4 total calls.
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// Pin the perf contract behind the `Arc<Batch>` change.
+    ///
+    /// Pre-fix `dispatch_batch` deep-cloned the events `Vec` on every
+    /// retry attempt (and the comment in production code already
+    /// admitted this was wasted on the common `retries == 0` path).
+    /// Post-fix the dispatcher takes `Arc<Batch>` and each retry is a
+    /// refcount bump.
+    ///
+    /// We pin the contract observationally: an adapter that fails 3
+    /// times then succeeds receives the *same* `Arc<Batch>` pointer
+    /// on every call. A regression that ever rebuilt the Batch
+    /// (e.g. a future refactor that does `Arc::new(batch.as_ref().clone())`)
+    /// would surface here as distinct `Arc::as_ptr` values.
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_batch_retries_share_the_same_arc_allocation() {
+        // Identity-record `Arc::as_ptr(&batch)` per call via the
+        // batch's strong-count snapshot. We cast to `usize` so the
+        // adapter can stay `Send + Sync` without an unsafe impl —
+        // the value is just an opaque identity stamp.
+        struct PointerRecordingAdapter {
+            seen: Arc<parking_lot::Mutex<Vec<usize>>>,
+            fail_first_n: u32,
+            calls: Arc<std::sync::atomic::AtomicU32>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::adapter::Adapter for PointerRecordingAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, batch: Arc<Batch>) -> Result<(), AdapterError> {
+                self.seen.lock().push(Arc::as_ptr(&batch) as usize);
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < self.fail_first_n {
+                    Err(AdapterError::Transient("retry me".into()))
+                } else {
+                    Ok(())
+                }
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                _shard_id: u16,
+                _from_id: Option<&str>,
+                _limit: usize,
+            ) -> Result<crate::adapter::ShardPollResult, AdapterError> {
+                Ok(crate::adapter::ShardPollResult::empty())
+            }
+            fn name(&self) -> &'static str {
+                "pointer-recording"
+            }
+        }
+
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let adapter = PointerRecordingAdapter {
+            seen: Arc::clone(&seen),
+            fail_first_n: 3,
+            calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        };
+        let batch = Arc::new(Batch::new(0, vec![], 0));
+        let original_ptr = Arc::as_ptr(&batch) as usize;
+
+        let ok = dispatch_batch(&adapter, batch, 0, Duration::from_secs(1), 5).await;
+        assert!(ok, "adapter accepts on 4th try; dispatch must succeed");
+
+        let pointers = seen.lock().clone();
+        assert_eq!(
+            pointers.len(),
+            4,
+            "expected 3 failures + 1 success = 4 on_batch calls",
+        );
+        // Every call observed the SAME Arc target. A regression that
+        // deep-clones would have produced four distinct pointers.
+        for (i, p) in pointers.iter().enumerate() {
+            assert_eq!(
+                *p, original_ptr,
+                "attempt {i} saw a different Arc<Batch>; dispatch_batch deep-cloned",
+            );
+        }
     }
 
     /// Counting adapter that records the number of events delivered via
@@ -2879,7 +2968,7 @@ mod tests {
         async fn init(&mut self) -> Result<(), AdapterError> {
             Ok(())
         }
-        async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+        async fn on_batch(&self, batch: Arc<Batch>) -> Result<(), AdapterError> {
             self.received
                 .fetch_add(batch.events.len() as u64, AtomicOrdering::SeqCst);
             Ok(())
@@ -2992,7 +3081,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, _batch: Arc<Batch>) -> Result<(), AdapterError> {
                 self.on_batch_calls.fetch_add(1, AtomicOrdering::SeqCst);
                 Ok(())
             }
@@ -3096,7 +3185,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, _batch: Arc<Batch>) -> Result<(), AdapterError> {
                 Ok(())
             }
             async fn flush(&self) -> Result<(), AdapterError> {
@@ -3366,7 +3455,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, batch: Arc<Batch>) -> Result<(), AdapterError> {
                 *self.nonce.lock() = Some(batch.process_nonce);
                 Ok(())
             }
@@ -3467,7 +3556,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, batch: Arc<Batch>) -> Result<(), AdapterError> {
                 self.nonces.lock().push(batch.process_nonce);
                 Ok(())
             }
@@ -3576,7 +3665,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, batch: Arc<Batch>) -> Result<(), AdapterError> {
                 self.batches.lock().push((
                     batch.shard_id,
                     batch.sequence_start,
@@ -3707,7 +3796,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, batch: Arc<Batch>) -> Result<(), AdapterError> {
                 *self.nonce.lock() = Some(batch.process_nonce);
                 Ok(())
             }

@@ -452,7 +452,7 @@ impl Mesh {
             sequence_start: 0,
             process_nonce: net::event::batch_process_nonce(),
         };
-        self.node.send_to_peer(addr, batch).await?;
+        self.node.send_to_peer(addr, &batch).await?;
         Ok(())
     }
 
@@ -469,7 +469,7 @@ impl Mesh {
             sequence_start: 0,
             process_nonce: net::event::batch_process_nonce(),
         };
-        self.node.send_routed(dest_node_id, batch).await?;
+        self.node.send_routed(dest_node_id, &batch).await?;
         Ok(())
     }
 
@@ -488,7 +488,7 @@ impl Mesh {
             sequence_start: 0,
             process_nonce: net::event::batch_process_nonce(),
         };
-        self.node.send_to_peer(addr, batch).await?;
+        self.node.send_to_peer(addr, &batch).await?;
         Ok(())
     }
 

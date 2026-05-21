@@ -8,6 +8,14 @@ Findings ordered by expected impact within each section. Item numbers run contin
 
 ---
 
+## ✅ Fixed
+
+| # | Item | Subsystem | Notes |
+|---|------|-----------|-------|
+| 13 | `dispatch_batch` retry `batch.clone()` → `Arc<Batch>` | Core bus | `Adapter::on_batch` now takes `Arc<Batch>`; retries are a refcount bump instead of a deep `Vec` clone. Mesh `send_to_peer`/`send_routed` switched to `&Batch` (they never consumed). Pinned by `dispatch_batch_retries_share_the_same_arc_allocation`. |
+
+---
+
 ## TL;DR — Top 10 Wins (Combined Priority)
 
 | # | Item | Subsystem | Why it matters |

@@ -1520,7 +1520,7 @@ mod mesh_bindings {
                 process_nonce: net::event::batch_process_nonce(),
             };
 
-            node.send_to_peer(addr, batch)
+            node.send_to_peer(addr, &batch)
                 .await
                 .map_err(|e| Error::from_reason(format!("send failed: {}", e)))?;
             Ok(true)
