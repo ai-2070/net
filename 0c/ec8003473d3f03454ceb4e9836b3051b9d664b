@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/dataforts/blob/migration.rs
+  s_f930dae9b8bbc1::t_32895792bbd738 132-140,142,144-146
+  s_f930dae9b8bbc1::t_122e9491937970 91-104
+  s_f930dae9b8bbc1::t_a762a9b39299a9 738-789
+net/crates/net/docs/performance/net-dataforts-analysis.md
+  s_f930dae9b8bbc1::t_ff30ba488baa98 18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "0cec8003473d3f03454ceb4e9836b3051b9d664b",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
