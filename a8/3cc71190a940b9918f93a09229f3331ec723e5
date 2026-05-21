@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/failure.rs
+  s_4f93eae8f45533::t_e17c24eb39fee6 1496-1530
+net/crates/net/src/adapter/net/crypto.rs
+  s_4f93eae8f45533::t_999da10c481a35 1434-1482,1488-1537
+  s_4f93eae8f45533::t_2bcaeb2394ab7f 1483-1487
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "a83cc71190a940b9918f93a09229f3331ec723e5",
+  "prompts": {},
+  "sessions": {
+    "s_4f93eae8f45533": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4eeaced2-d67f-413c-87c1-4b5954eae6be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
