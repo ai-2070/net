@@ -2970,7 +2970,14 @@ impl BlobAdapter for MeshBlobAdapter {
                         recomputed_chunks.len()
                     )));
                 }
-                for (i, (recomputed_chunk, chunk_bytes)) in recomputed_chunks.iter().enumerate() {
+                // Verification prepass — pure CPU, no I/O. If any
+                // recomputed chunk's hash or size disagrees with the
+                // manifest entry, abort BEFORE issuing any store
+                // calls. This preserves the legacy "no chunks stored
+                // on caller-poisoned manifest" contract and lets the
+                // parallel store loop below skip per-chunk
+                // verification entirely.
+                for (i, (recomputed_chunk, _)) in recomputed_chunks.iter().enumerate() {
                     if recomputed_chunk.hash != chunks[i].hash {
                         return Err(BlobError::Backend(format!(
                             "mesh blob: chunk {} hash mismatch",
@@ -2983,8 +2990,87 @@ impl BlobAdapter for MeshBlobAdapter {
                             i,
                         )));
                     }
-                    self.store_chunk(&recomputed_chunk.hash, chunk_bytes)
-                        .await?;
+                }
+                // Parallel chunk store via `buffered(N)` per
+                // dataforts perf #173B (symmetric with #172 on the
+                // fetch side). Pre-fix the per-chunk
+                // `store_chunk(...).await?` loop was sequential —
+                // each store waited for the prior one's redex write
+                // to complete. `buffered` (order preserved, though
+                // store order doesn't matter for content-addressed
+                // chunks) drives up to `MANIFEST_STORE_CONCURRENCY`
+                // writes in flight simultaneously. On the same
+                // concurrency rationale as the fetch path: 16 keeps
+                // the credit-window pressure bounded.
+                //
+                // Error semantics: break on first `Err`. In-flight
+                // stores that already landed stay landed (chunks
+                // are content-addressed; redundant store is a
+                // safe no-op for retry). Matches the legacy loop's
+                // "stored chunks up to the failure point" behavior.
+                // Parallel chunk store with bounded concurrency
+                // per dataforts perf #173B (symmetric with #172
+                // on the fetch side). Pre-fix the per-chunk
+                // `store_chunk(...).await?` loop was sequential —
+                // each store waited for the prior one's redex
+                // write to complete.
+                //
+                // Order doesn't matter for stores: chunks are
+                // content-addressed so each write lands in its
+                // own slot. `buffer_unordered(N)` drives up to N
+                // writes in flight; first `Err` aborts the
+                // surrounding match. In-flight stores that have
+                // already landed stay landed — safe because
+                // re-stores of the same content-addressed slot
+                // are idempotent.
+                //
+                // Each store future captures an owned `Bytes`
+                // refcounted into a single `Bytes::copy_from_slice`
+                // of the input. We pay one memcpy of `bytes`
+                // up front, then each chunk's `.slice(off..)` is
+                // a zero-copy refcount bump. Pre-fix passed
+                // `&[u8]` slices borrowed from `bytes` directly,
+                // saving the upfront copy — but that shape can't
+                // be expressed across an async-buffered stream
+                // without tripping a higher-ranked lifetime
+                // check on the closure signature
+                // (`fn(([u8; 32], &'0 [u8])) -> impl Future`
+                // can't unify for arbitrary `'0`). The
+                // `Bytes`-owned shape sidesteps the HRTB issue
+                // by removing the borrow from the closure
+                // input. One memcpy on the upload path is a
+                // small price for the parallelism on a path
+                // that already memcpys (the legacy
+                // `store_chunk(&[u8])` call sequence copies
+                // each chunk into its redex segment internally).
+                use bytes::Bytes;
+                use futures::StreamExt;
+                const MANIFEST_STORE_CONCURRENCY: usize = 16;
+                let bytes_arc = Bytes::copy_from_slice(bytes);
+                let bytes_origin = bytes.as_ptr() as usize;
+                let store_items: Vec<([u8; 32], Bytes)> = recomputed_chunks
+                    .iter()
+                    .map(|(rc, chunk_bytes)| {
+                        // SAFETY-style invariant (sound under the
+                        // public chunk_payload contract): every
+                        // `chunk_bytes` slice points into `bytes`
+                        // because `chunk_payload(bytes)` produces
+                        // borrows into its own input. The offset
+                        // is therefore a valid index into
+                        // `bytes_arc`.
+                        let offset = chunk_bytes.as_ptr() as usize - bytes_origin;
+                        let end = offset + chunk_bytes.len();
+                        (rc.hash, bytes_arc.slice(offset..end))
+                    })
+                    .collect();
+                let mut futs = futures::stream::iter(store_items.into_iter().map(
+                    |(hash, chunk): ([u8; 32], Bytes)| async move {
+                        self.store_chunk(&hash, &chunk).await
+                    },
+                ))
+                .buffer_unordered(MANIFEST_STORE_CONCURRENCY);
+                while let Some(result) = futs.next().await {
+                    result?;
                 }
                 Ok(())
             }
