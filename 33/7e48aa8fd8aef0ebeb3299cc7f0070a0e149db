@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/redis.rs
+  s_f930dae9b8bbc1::t_aee775dbe77a20 669-673,675-688
+  s_f930dae9b8bbc1::t_d543590b9ffa10 664-668
+net/crates/net/docs/performance/net-perf-analysis.md
+  s_f930dae9b8bbc1::t_814c7ff3345ca8 25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "337e48aa8fd8aef0ebeb3299cc7f0070a0e149db",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
