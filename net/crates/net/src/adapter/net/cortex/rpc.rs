@@ -15,7 +15,7 @@
 //! types and the `Mesh::serve_rpc` / `Mesh::call` glue layer build
 //! on top.
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -314,7 +314,14 @@ pub struct RpcRequestPayload {
     pub headers: Vec<RpcHeader>,
     /// Application-defined request body. Caller and server agree on
     /// the codec out-of-band; nRPC doesn't interpret these bytes.
-    pub body: Vec<u8>,
+    ///
+    /// Held as [`Bytes`] so [`Self::decode`] can zero-copy `slice_ref`
+    /// the body out of the inbound event's `Bytes` payload — pre-fix
+    /// [perf #84 in `docs/performance/net-perf-analysis.md`] this was
+    /// `Vec<u8>` and every decode did a `data[body_start..body_end].to_vec()`
+    /// (a memcpy per frame). For high-RPS systems doing 100K+ RPCs/sec
+    /// with 1 KB+ bodies that was 100+ MB/sec of pure memcpy.
+    pub body: Bytes,
 }
 
 /// Continuation chunk for a client-streaming or duplex REQUEST.
@@ -353,7 +360,10 @@ pub struct RpcRequestChunkPayload {
     /// (4 MiB), same as the initial REQUEST body — clients that
     /// need >4 MiB total payload chunk their upload across
     /// multiple `REQUEST_CHUNK` events.
-    pub body: Vec<u8>,
+    ///
+    /// See [`RpcRequestPayload::body`] for the `Bytes`-vs-`Vec<u8>`
+    /// rationale.
+    pub body: Bytes,
 }
 
 /// Request-direction credit grant. Lives after the 24-byte
@@ -390,7 +400,10 @@ pub struct RpcResponsePayload {
     /// For non-`Ok` statuses: a UTF-8 diagnostic string (callers
     /// `String::from_utf8_lossy` for display; the bytes are not
     /// guaranteed to be valid UTF-8 against a malicious server).
-    pub body: Vec<u8>,
+    ///
+    /// See [`RpcRequestPayload::body`] for the `Bytes`-vs-`Vec<u8>`
+    /// rationale.
+    pub body: Bytes,
 }
 
 // ============================================================================
@@ -493,8 +506,12 @@ impl RpcRequestPayload {
     /// All length fields are bounded by the `MAX_RPC_*` constants;
     /// over-cap inputs error rather than allocate unbounded
     /// buffers.
-    pub fn decode(data: &[u8]) -> Result<Self, RpcCodecError> {
-        let mut cur = std::io::Cursor::new(data);
+    ///
+    /// Takes [`Bytes`] (not `&[u8]`) so the decoded `body` field
+    /// can be a zero-copy `data.slice(..)` instead of an owned
+    /// `to_vec` — see perf #84.
+    pub fn decode(data: Bytes) -> Result<Self, RpcCodecError> {
+        let mut cur = std::io::Cursor::new(data.as_ref());
         // service
         if cur.remaining() < 1 {
             return Err(RpcCodecError::Truncated("service length"));
@@ -530,7 +547,7 @@ impl RpcRequestPayload {
         }
         let flags = cur.get_u16_le();
         // headers
-        let headers = decode_headers(&mut cur, data)?;
+        let headers = decode_headers(&mut cur, &data)?;
         // body
         if cur.remaining() < 4 {
             return Err(RpcCodecError::Truncated("body length"));
@@ -548,7 +565,8 @@ impl RpcRequestPayload {
         }
         let body_start = cur.position() as usize;
         let body_end = body_start + body_len;
-        let body = data[body_start..body_end].to_vec();
+        // Zero-copy slice over the input — refcount bump only.
+        let body = data.slice(body_start..body_end);
         Ok(Self {
             service,
             deadline_ns,
@@ -606,8 +624,9 @@ impl RpcRequestChunkPayload {
 
     /// Decode from the wire bytes following the `EventMeta` prefix.
     /// Bounded by the same `MAX_RPC_*` caps as the initial REQUEST.
-    pub fn decode(data: &[u8]) -> Result<Self, RpcCodecError> {
-        let mut cur = std::io::Cursor::new(data);
+    /// Takes [`Bytes`] for zero-copy `body` slicing — see perf #84.
+    pub fn decode(data: Bytes) -> Result<Self, RpcCodecError> {
+        let mut cur = std::io::Cursor::new(data.as_ref());
         // call_id
         if cur.remaining() < 8 {
             return Err(RpcCodecError::Truncated("call_id"));
@@ -619,7 +638,7 @@ impl RpcRequestChunkPayload {
         }
         let flags = cur.get_u16_le();
         // headers
-        let headers = decode_headers(&mut cur, data)?;
+        let headers = decode_headers(&mut cur, &data)?;
         // body
         if cur.remaining() < 4 {
             return Err(RpcCodecError::Truncated("body length"));
@@ -637,7 +656,7 @@ impl RpcRequestChunkPayload {
         }
         let body_start = cur.position() as usize;
         let body_end = body_start + body_len;
-        let body = data[body_start..body_end].to_vec();
+        let body = data.slice(body_start..body_end);
         Ok(Self {
             call_id,
             flags,
@@ -685,13 +704,14 @@ impl RpcResponsePayload {
     }
 
     /// Decode from the wire bytes following the `EventMeta` prefix.
-    pub fn decode(data: &[u8]) -> Result<Self, RpcCodecError> {
-        let mut cur = std::io::Cursor::new(data);
+    /// Takes [`Bytes`] for zero-copy `body` slicing — see perf #84.
+    pub fn decode(data: Bytes) -> Result<Self, RpcCodecError> {
+        let mut cur = std::io::Cursor::new(data.as_ref());
         if cur.remaining() < 2 {
             return Err(RpcCodecError::Truncated("status"));
         }
         let status = RpcStatus::from_wire(cur.get_u16_le());
-        let headers = decode_headers(&mut cur, data)?;
+        let headers = decode_headers(&mut cur, &data)?;
         if cur.remaining() < 4 {
             return Err(RpcCodecError::Truncated("body length"));
         }
@@ -708,7 +728,7 @@ impl RpcResponsePayload {
         }
         let body_start = cur.position() as usize;
         let body_end = body_start + body_len;
-        let body = data[body_start..body_end].to_vec();
+        let body = data.slice(body_start..body_end);
         Ok(Self {
             status,
             headers,
@@ -1471,7 +1491,7 @@ impl RedexFold<()> for RpcServerFold {
         let key = (meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
-                let payload = match RpcRequestPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                let payload = match RpcRequestPayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
                     Ok(p) => p,
                     Err(e) => {
                         // Malformed request payload. Surface as
@@ -1489,7 +1509,7 @@ impl RedexFold<()> for RpcServerFold {
                         let resp = RpcResponsePayload {
                             status: RpcStatus::UnknownVersion,
                             headers: vec![],
-                            body: format!("malformed request: {e}").into_bytes(),
+                            body: Bytes::from(format!("malformed request: {e}")),
                         };
                         (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
                         return Ok(());
@@ -1505,7 +1525,7 @@ impl RedexFold<()> for RpcServerFold {
                     let resp = RpcResponsePayload {
                         status: RpcStatus::Timeout,
                         headers: vec![],
-                        body: b"deadline already passed when request landed".to_vec(),
+                        body: Bytes::from_static(b"deadline already passed when request landed"),
                     };
                     (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
                     return Ok(());
@@ -1530,7 +1550,7 @@ impl RedexFold<()> for RpcServerFold {
                         let resp = RpcResponsePayload {
                             status: RpcStatus::Internal,
                             headers: vec![],
-                            body: b"duplicate REQUEST for already-in-flight call_id".to_vec(),
+                            body: Bytes::from_static(b"duplicate REQUEST for already-in-flight call_id"),
                         };
                         (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
                         return Ok(());
@@ -1616,7 +1636,7 @@ impl RedexFold<()> for RpcServerFold {
                         RpcResponsePayload {
                             status: RpcStatus::Cancelled,
                             headers: vec![],
-                            body: b"server observed CANCEL during handler execution".to_vec(),
+                            body: Bytes::from_static(b"server observed CANCEL during handler execution"),
                         }
                     } else {
                         match outcome {
@@ -1625,13 +1645,13 @@ impl RedexFold<()> for RpcServerFold {
                                 RpcResponsePayload {
                                     status: RpcStatus::Application(code),
                                     headers: vec![],
-                                    body: message.into_bytes(),
+                                    body: Bytes::from(message),
                                 }
                             }
                             Ok(Err(RpcHandlerError::Internal(message))) => RpcResponsePayload {
                                 status: RpcStatus::Internal,
                                 headers: vec![],
-                                body: message.into_bytes(),
+                                body: Bytes::from(message),
                             },
                             Err(panic) => {
                                 let panic_msg = panic
@@ -1648,7 +1668,7 @@ impl RedexFold<()> for RpcServerFold {
                                 RpcResponsePayload {
                                     status: RpcStatus::Internal,
                                     headers: vec![],
-                                    body: format!("handler panicked: {panic_msg}").into_bytes(),
+                                    body: Bytes::from(format!("handler panicked: {panic_msg}")),
                                 }
                             }
                         }
@@ -2066,7 +2086,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
         let key = (meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
-                let payload = match RpcRequestPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                let payload = match RpcRequestPayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!(
@@ -2085,7 +2105,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                                 HEADER_NRPC_STREAMING.to_string(),
                                 HEADER_NRPC_STREAMING_END.to_vec(),
                             )],
-                            body: format!("malformed request: {e}").into_bytes(),
+                            body: Bytes::from(format!("malformed request: {e}")),
                         };
                         let emit = self.emit.clone();
                         let caller_origin = meta.origin_hash;
@@ -2125,7 +2145,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                                 HEADER_NRPC_STREAMING.to_string(),
                                 HEADER_NRPC_STREAMING_END.to_vec(),
                             )],
-                            body: b"duplicate REQUEST for already-in-flight call_id".to_vec(),
+                            body: Bytes::from_static(b"duplicate REQUEST for already-in-flight call_id"),
                         };
                         let emit = self.emit.clone();
                         let caller_origin = meta.origin_hash;
@@ -2236,7 +2256,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                                     HEADER_NRPC_STREAMING.to_string(),
                                     HEADER_NRPC_STREAMING_CONTINUE.to_vec(),
                                 )],
-                                body: chunk.to_vec(),
+                                body: chunk.clone(),
                             };
                             // Await per-chunk publish so chunks for
                             // one call_id reach the network in send
@@ -2277,8 +2297,9 @@ impl RedexFold<()> for RpcServerStreamingFold {
                         RpcResponsePayload {
                             status: RpcStatus::Cancelled,
                             headers: vec![],
-                            body: b"server observed CANCEL during streaming handler execution"
-                                .to_vec(),
+                            body: Bytes::from_static(
+                                b"server observed CANCEL during streaming handler execution",
+                            ),
                         }
                     } else {
                         match outcome {
@@ -2288,19 +2309,19 @@ impl RedexFold<()> for RpcServerStreamingFold {
                                     HEADER_NRPC_STREAMING.to_string(),
                                     HEADER_NRPC_STREAMING_END.to_vec(),
                                 )],
-                                body: vec![],
+                                body: Bytes::new(),
                             },
                             Ok(Err(RpcHandlerError::Application { code, message })) => {
                                 RpcResponsePayload {
                                     status: RpcStatus::Application(code),
                                     headers: vec![],
-                                    body: message.into_bytes(),
+                                    body: Bytes::from(message),
                                 }
                             }
                             Ok(Err(RpcHandlerError::Internal(message))) => RpcResponsePayload {
                                 status: RpcStatus::Internal,
                                 headers: vec![],
-                                body: message.into_bytes(),
+                                body: Bytes::from(message),
                             },
                             Err(panic) => {
                                 let panic_msg = panic
@@ -2317,7 +2338,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                                 RpcResponsePayload {
                                     status: RpcStatus::Internal,
                                     headers: vec![],
-                                    body: format!("handler panicked: {panic_msg}").into_bytes(),
+                                    body: Bytes::from(format!("handler panicked: {panic_msg}")),
                                 }
                             }
                         }
@@ -2433,7 +2454,7 @@ type RequestChunkSenders = Arc<Mutex<HashMap<(u64, u64), tokio::sync::mpsc::Send
 /// otherwise identical — both folds carry the same wire format
 /// and the same per-call mpsc + sender-map contract.
 fn apply_request_chunk_to_senders(
-    payload_bytes: &[u8],
+    payload_bytes: Bytes,
     meta: &EventMeta,
     senders: &RequestChunkSenders,
     diag_tag: &'static str,
@@ -2478,7 +2499,7 @@ fn apply_request_chunk_to_senders(
         return;
     };
     let is_pure_terminator = is_end && payload.body.is_empty();
-    if !is_pure_terminator && sender.try_send(bytes::Bytes::from(payload.body)).is_err() {
+    if !is_pure_terminator && sender.try_send(payload.body).is_err() {
         tracing::debug!(
             caller_origin = format!("{:#x}", meta.origin_hash),
             call_id = meta.seq_or_ts,
@@ -2601,7 +2622,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
         let key = (meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
-                let payload = match RpcRequestPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                let payload = match RpcRequestPayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!(
@@ -2613,7 +2634,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                         let resp = RpcResponsePayload {
                             status: RpcStatus::UnknownVersion,
                             headers: vec![],
-                            body: format!("malformed request: {e}").into_bytes(),
+                            body: Bytes::from(format!("malformed request: {e}")),
                         };
                         (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
                         return Ok(());
@@ -2632,9 +2653,9 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                     let resp = RpcResponsePayload {
                         status: RpcStatus::Internal,
                         headers: vec![],
-                        body:
-                            b"REQUEST on a client-streaming service must set FLAG_RPC_CLIENT_STREAMING_REQUEST"
-                                .to_vec(),
+                        body: Bytes::from_static(
+                            b"REQUEST on a client-streaming service must set FLAG_RPC_CLIENT_STREAMING_REQUEST",
+                        ),
                     };
                     (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
                     return Ok(());
@@ -2657,7 +2678,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                         let resp = RpcResponsePayload {
                             status: RpcStatus::Internal,
                             headers: vec![],
-                            body: b"duplicate REQUEST for already-in-flight call_id".to_vec(),
+                            body: Bytes::from_static(b"duplicate REQUEST for already-in-flight call_id"),
                         };
                         (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
                         return Ok(());
@@ -2689,7 +2710,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                     // debug_assert surfaces the invariant break in
                     // tests; release logs at error level rather than
                     // silently swallowing the first request body.
-                    if tx.try_send(bytes::Bytes::from(payload.body)).is_err() {
+                    if tx.try_send(payload.body).is_err() {
                         debug_assert!(
                             false,
                             "fresh client-streaming request mpsc rejected initial body"
@@ -2808,9 +2829,9 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                         RpcResponsePayload {
                             status: RpcStatus::Cancelled,
                             headers: vec![],
-                            body:
-                                b"server observed CANCEL during client-streaming handler execution"
-                                    .to_vec(),
+                            body: Bytes::from_static(
+                                b"server observed CANCEL during client-streaming handler execution",
+                            ),
                         }
                     } else {
                         match outcome {
@@ -2819,13 +2840,13 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                                 RpcResponsePayload {
                                     status: RpcStatus::Application(code),
                                     headers: vec![],
-                                    body: message.into_bytes(),
+                                    body: Bytes::from(message),
                                 }
                             }
                             Ok(Err(RpcHandlerError::Internal(message))) => RpcResponsePayload {
                                 status: RpcStatus::Internal,
                                 headers: vec![],
-                                body: message.into_bytes(),
+                                body: Bytes::from(message),
                             },
                             Err(panic) => {
                                 let panic_msg = panic
@@ -2842,7 +2863,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                                 RpcResponsePayload {
                                     status: RpcStatus::Internal,
                                     headers: vec![],
-                                    body: format!("handler panicked: {panic_msg}").into_bytes(),
+                                    body: Bytes::from(format!("handler panicked: {panic_msg}")),
                                 }
                             }
                         }
@@ -2859,7 +2880,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
             }
             DISPATCH_RPC_REQUEST_CHUNK => {
                 apply_request_chunk_to_senders(
-                    &ev.payload[EVENT_META_SIZE..],
+                    ev.payload.slice(EVENT_META_SIZE..),
                     &meta,
                     &self.senders,
                     "client-streaming",
@@ -2992,7 +3013,7 @@ impl RedexFold<()> for RpcDuplexFold {
         let key = (meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
-                let payload = match RpcRequestPayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                let payload = match RpcRequestPayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!(
@@ -3007,7 +3028,7 @@ impl RedexFold<()> for RpcDuplexFold {
                                 HEADER_NRPC_STREAMING.to_string(),
                                 HEADER_NRPC_STREAMING_END.to_vec(),
                             )],
-                            body: format!("malformed request: {e}").into_bytes(),
+                            body: Bytes::from(format!("malformed request: {e}")),
                         };
                         let emit = self.emit.clone();
                         let caller_origin = meta.origin_hash;
@@ -3037,9 +3058,9 @@ impl RedexFold<()> for RpcDuplexFold {
                             HEADER_NRPC_STREAMING.to_string(),
                             HEADER_NRPC_STREAMING_END.to_vec(),
                         )],
-                        body:
-                            b"REQUEST on a duplex service must set FLAG_RPC_CLIENT_STREAMING_REQUEST and FLAG_RPC_STREAMING_RESPONSE"
-                                .to_vec(),
+                        body: Bytes::from_static(
+                            b"REQUEST on a duplex service must set FLAG_RPC_CLIENT_STREAMING_REQUEST and FLAG_RPC_STREAMING_RESPONSE",
+                        ),
                     };
                     let emit = self.emit.clone();
                     let caller_origin = meta.origin_hash;
@@ -3065,7 +3086,7 @@ impl RedexFold<()> for RpcDuplexFold {
                                 HEADER_NRPC_STREAMING.to_string(),
                                 HEADER_NRPC_STREAMING_END.to_vec(),
                             )],
-                            body: b"duplicate REQUEST for already-in-flight call_id".to_vec(),
+                            body: Bytes::from_static(b"duplicate REQUEST for already-in-flight call_id"),
                         };
                         let emit = self.emit.clone();
                         let caller_origin = meta.origin_hash;
@@ -3089,7 +3110,7 @@ impl RedexFold<()> for RpcDuplexFold {
                     // Same invariant as the client-streaming fold:
                     // fresh bounded mpsc with a live receiver cannot
                     // reject the first send.
-                    if req_tx.try_send(bytes::Bytes::from(payload.body)).is_err() {
+                    if req_tx.try_send(payload.body).is_err() {
                         debug_assert!(false, "fresh duplex request mpsc rejected initial body");
                         tracing::error!(
                             caller_origin = format!("{:#x}", meta.origin_hash),
@@ -3164,7 +3185,7 @@ impl RedexFold<()> for RpcDuplexFold {
                                 HEADER_NRPC_STREAMING.to_string(),
                                 HEADER_NRPC_STREAMING_CONTINUE.to_vec(),
                             )],
-                            body: chunk.to_vec(),
+                            body: chunk.clone(),
                         };
                         pump_emit(caller_origin, call_id, resp).await;
                     }
@@ -3232,8 +3253,9 @@ impl RedexFold<()> for RpcDuplexFold {
                         RpcResponsePayload {
                             status: RpcStatus::Cancelled,
                             headers: vec![],
-                            body: b"server observed CANCEL during duplex handler execution"
-                                .to_vec(),
+                            body: Bytes::from_static(
+                                b"server observed CANCEL during duplex handler execution",
+                            ),
                         }
                     } else {
                         match outcome {
@@ -3243,19 +3265,19 @@ impl RedexFold<()> for RpcDuplexFold {
                                     HEADER_NRPC_STREAMING.to_string(),
                                     HEADER_NRPC_STREAMING_END.to_vec(),
                                 )],
-                                body: vec![],
+                                body: Bytes::new(),
                             },
                             Ok(Err(RpcHandlerError::Application { code, message })) => {
                                 RpcResponsePayload {
                                     status: RpcStatus::Application(code),
                                     headers: vec![],
-                                    body: message.into_bytes(),
+                                    body: Bytes::from(message),
                                 }
                             }
                             Ok(Err(RpcHandlerError::Internal(message))) => RpcResponsePayload {
                                 status: RpcStatus::Internal,
                                 headers: vec![],
-                                body: message.into_bytes(),
+                                body: Bytes::from(message),
                             },
                             Err(panic) => {
                                 let panic_msg = panic
@@ -3272,7 +3294,7 @@ impl RedexFold<()> for RpcDuplexFold {
                                 RpcResponsePayload {
                                     status: RpcStatus::Internal,
                                     headers: vec![],
-                                    body: format!("handler panicked: {panic_msg}").into_bytes(),
+                                    body: Bytes::from(format!("handler panicked: {panic_msg}")),
                                 }
                             }
                         }
@@ -3284,7 +3306,7 @@ impl RedexFold<()> for RpcDuplexFold {
             }
             DISPATCH_RPC_REQUEST_CHUNK => {
                 apply_request_chunk_to_senders(
-                    &ev.payload[EVENT_META_SIZE..],
+                    ev.payload.slice(EVENT_META_SIZE..),
                     &meta,
                     &self.senders,
                     "duplex",
@@ -3645,12 +3667,12 @@ impl RpcClientPending {
         let kind = classify_streaming_chunk(&resp);
         match kind {
             StreamingChunkKind::Continue => {
-                let _ = tx.send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
+                let _ = tx.send(StreamItem::Chunk(resp.body));
             }
             StreamingChunkKind::Terminal => {
                 let item = if resp.status.is_ok() {
                     if !resp.body.is_empty() {
-                        let _ = tx.send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
+                        let _ = tx.send(StreamItem::Chunk(resp.body));
                     }
                     StreamItem::End
                 } else {
@@ -3668,7 +3690,7 @@ impl RpcClientPending {
                      unary path. Bridging to single-chunk + EOF.",
                 );
                 if !resp.body.is_empty() {
-                    let _ = tx.send(StreamItem::Chunk(bytes::Bytes::from(resp.body)));
+                    let _ = tx.send(StreamItem::Chunk(resp.body));
                 }
                 let _ = tx.send(StreamItem::End);
                 self.senders.remove(&call_id);
@@ -3773,7 +3795,7 @@ impl RpcClientFold {
         };
         match meta.dispatch {
             DISPATCH_RPC_RESPONSE => {
-                match RpcResponsePayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                match RpcResponsePayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
                     Ok(resp) => self.pending.deliver(meta.seq_or_ts, ev.from_node, resp),
                     Err(e) => {
                         tracing::warn!(
@@ -3859,7 +3881,7 @@ impl RedexFold<()> for RpcClientFold {
         // peer routing.
         match meta.dispatch {
             DISPATCH_RPC_RESPONSE => {
-                match RpcResponsePayload::decode(&ev.payload[EVENT_META_SIZE..]) {
+                match RpcResponsePayload::decode(ev.payload.slice(EVENT_META_SIZE..)) {
                     Ok(resp) => self.pending.deliver(meta.seq_or_ts, 0, resp),
                     Err(e) => {
                         // Malformed RESPONSE on the reply channel.
@@ -4001,7 +4023,7 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         let _ = p.encode();
     }
@@ -4015,7 +4037,7 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: vec![0; MAX_RPC_BODY_LEN + 1],
+            body: Bytes::from(vec![0; MAX_RPC_BODY_LEN + 1]),
         };
         let _ = p.encode();
     }
@@ -4029,7 +4051,7 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![("a".repeat(MAX_RPC_HEADER_NAME_LEN + 1), vec![])],
-            body: vec![],
+            body: Bytes::new(),
         };
         let _ = p.encode();
     }
@@ -4048,14 +4070,14 @@ mod tests {
                 header("traceparent", b"00-aabb"),
                 header("idempotency-key", &7u64.to_le_bytes()),
             ],
-            body: b"{\"hello\":\"world\"}".to_vec(),
+            body: Bytes::from_static(b"{\"hello\":\"world\"}"),
         };
         assert_eq!(req.encoded_len(), req.encode().len());
 
         let resp = RpcResponsePayload {
             status: RpcStatus::Application(0x8001),
             headers: vec![header("content-type", b"application/json")],
-            body: b"ok".to_vec(),
+            body: Bytes::from_static(b"ok"),
         };
         assert_eq!(resp.encoded_len(), resp.encode().len());
 
@@ -4065,13 +4087,13 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         assert_eq!(empty_req.encoded_len(), empty_req.encode().len());
         let empty_resp = RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         assert_eq!(empty_resp.encoded_len(), empty_resp.encode().len());
     }
@@ -4128,7 +4150,7 @@ mod tests {
             call_id: 0xCAFE_F00D_DEAD_BEEF,
             flags: FLAG_RPC_REQUEST_END | FLAG_RPC_PROPAGATE_TRACE,
             headers,
-            body,
+            body: Bytes::from(body),
         };
         let bytes = p.encode();
         assert_eq!(
@@ -4136,7 +4158,7 @@ mod tests {
             bytes.len(),
             "encoded_len must agree with encode().len()"
         );
-        let decoded = RpcRequestChunkPayload::decode(&bytes).expect("decode");
+        let decoded = RpcRequestChunkPayload::decode(Bytes::from(bytes)).expect("decode");
         assert_eq!(decoded, p);
     }
 
@@ -4149,7 +4171,7 @@ mod tests {
             call_id: 0x1234,
             flags: 0,
             headers: vec![header("x", b"y")],
-            body: b"hello".to_vec(),
+            body: Bytes::from_static(b"hello"),
         };
         let full = p.encode();
         // Walk every prefix shorter than the full encoding; every
@@ -4157,11 +4179,11 @@ mod tests {
         // error, not panic.
         for n in 0..full.len() {
             let prefix = &full[..n];
-            let result = RpcRequestChunkPayload::decode(prefix);
+            let result = RpcRequestChunkPayload::decode(Bytes::copy_from_slice(prefix));
             assert!(result.is_err(), "n={n}: expected Err, got Ok({:?})", result);
         }
         // Full length must decode cleanly.
-        assert!(RpcRequestChunkPayload::decode(&full).is_ok());
+        assert!(RpcRequestChunkPayload::decode(Bytes::from(full)).is_ok());
     }
 
     /// 3/5 — body length cap rejection. A wire-claimed body length
@@ -4179,7 +4201,7 @@ mod tests {
         // (no body bytes follow — we want the decoder to reject at
         // the length check before it even tries to read body bytes)
         let err =
-            RpcRequestChunkPayload::decode(&buf).expect_err("oversized body length must reject");
+            RpcRequestChunkPayload::decode(Bytes::from(buf)).expect_err("oversized body length must reject");
         match err {
             RpcCodecError::TooLarge {
                 field,
@@ -4204,7 +4226,7 @@ mod tests {
         buf.put_u16_le(0); // flags
         buf.put_u8((MAX_RPC_HEADERS + 1) as u8); // over the cap
         let err =
-            RpcRequestChunkPayload::decode(&buf).expect_err("oversized header count must reject");
+            RpcRequestChunkPayload::decode(Bytes::from(buf)).expect_err("oversized header count must reject");
         match err {
             RpcCodecError::TooLarge {
                 field,
@@ -4284,10 +4306,10 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         let bytes = p.encode();
-        let decoded = RpcRequestPayload::decode(&bytes).unwrap();
+        let decoded = RpcRequestPayload::decode(Bytes::from(bytes)).unwrap();
         assert_eq!(decoded, p);
     }
 
@@ -4302,17 +4324,17 @@ mod tests {
                 header("idempotency-key", &7u64.to_le_bytes()),
                 header("content-type", b"application/json"),
             ],
-            body: b"{\"hello\":\"world\"}".to_vec(),
+            body: Bytes::from_static(b"{\"hello\":\"world\"}"),
         };
         let bytes = p.encode();
-        let decoded = RpcRequestPayload::decode(&bytes).unwrap();
+        let decoded = RpcRequestPayload::decode(Bytes::from(bytes)).unwrap();
         assert_eq!(decoded, p);
     }
 
     #[test]
     fn request_decode_rejects_empty_service() {
         let bytes = vec![0x00];
-        let err = RpcRequestPayload::decode(&bytes).unwrap_err();
+        let err = RpcRequestPayload::decode(Bytes::from(bytes)).unwrap_err();
         assert!(matches!(err, RpcCodecError::Truncated(_)));
     }
 
@@ -4325,7 +4347,7 @@ mod tests {
         bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
         bytes.push(0); // 0 headers
         bytes.extend_from_slice(&((MAX_RPC_BODY_LEN as u32) + 1).to_le_bytes());
-        let err = RpcRequestPayload::decode(&bytes).unwrap_err();
+        let err = RpcRequestPayload::decode(Bytes::from(bytes)).unwrap_err();
         assert!(
             matches!(err, RpcCodecError::TooLarge { field, .. } if field == "body"),
             "got {err:?}",
@@ -4340,7 +4362,7 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes.push((MAX_RPC_HEADERS as u8).wrapping_add(1));
-        let err = RpcRequestPayload::decode(&bytes).unwrap_err();
+        let err = RpcRequestPayload::decode(Bytes::from(bytes)).unwrap_err();
         assert!(
             matches!(err, RpcCodecError::TooLarge { field, .. } if field == "headers"),
             "got {err:?}",
@@ -4357,14 +4379,14 @@ mod tests {
             deadline_ns: 1,
             flags: 0,
             headers: vec![header("h", b"v")],
-            body: b"body".to_vec(),
+            body: Bytes::from_static(b"body"),
         };
         let bytes = p.encode();
         // Try each prefix length up to but not including the full
         // length — every one must be a decode error.
         for trim_to in 0..bytes.len() {
             let truncated = &bytes[..trim_to];
-            let result = RpcRequestPayload::decode(truncated);
+            let result = RpcRequestPayload::decode(Bytes::copy_from_slice(truncated));
             assert!(
                 result.is_err(),
                 "trim_to={trim_to} of {} must error, got {:?}",
@@ -4373,7 +4395,7 @@ mod tests {
             );
         }
         // Full length must succeed.
-        assert!(RpcRequestPayload::decode(&bytes).is_ok());
+        assert!(RpcRequestPayload::decode(Bytes::from(bytes)).is_ok());
     }
 
     // --------------------------------------------------------------------
@@ -4385,10 +4407,10 @@ mod tests {
         let p = RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![header("content-type", b"application/json")],
-            body: b"{\"answer\":42}".to_vec(),
+            body: Bytes::from_static(b"{\"answer\":42}"),
         };
         let bytes = p.encode();
-        let decoded = RpcResponsePayload::decode(&bytes).unwrap();
+        let decoded = RpcResponsePayload::decode(Bytes::from(bytes)).unwrap();
         assert_eq!(decoded, p);
     }
 
@@ -4397,17 +4419,17 @@ mod tests {
         let p = RpcResponsePayload {
             status: RpcStatus::Application(0xBEEF),
             headers: vec![],
-            body: b"app-specific diagnostic".to_vec(),
+            body: Bytes::from_static(b"app-specific diagnostic"),
         };
         let bytes = p.encode();
-        let decoded = RpcResponsePayload::decode(&bytes).unwrap();
+        let decoded = RpcResponsePayload::decode(Bytes::from(bytes)).unwrap();
         assert_eq!(decoded.status, RpcStatus::Application(0xBEEF));
         assert_eq!(decoded.body, p.body);
     }
 
     #[test]
     fn response_decode_rejects_empty_buffer() {
-        let err = RpcResponsePayload::decode(&[]).unwrap_err();
+        let err = RpcResponsePayload::decode(Bytes::new()).unwrap_err();
         assert!(matches!(err, RpcCodecError::Truncated(_)));
     }
 
@@ -4427,7 +4449,7 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         let size = p.encode().len();
         // 1 (svc len) + 1 (svc bytes) + 8 (deadline) + 2 (flags) + 1 (headers count) + 4 (body len) = 17
@@ -4440,7 +4462,7 @@ mod tests {
         let p = RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         let size = p.encode().len();
         // 2 (status) + 1 (headers count) + 4 (body len) = 7
@@ -4542,7 +4564,7 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: b"hello".to_vec(),
+            body: Bytes::from_static(b"hello"),
         };
         let ev = rpc_request_event(0xCAFE, 7, req);
         fold.apply(&ev, &mut ()).unwrap();
@@ -4558,7 +4580,7 @@ mod tests {
         assert_eq!(*origin, 0xCAFE);
         assert_eq!(*call_id, 7);
         assert_eq!(resp.status, RpcStatus::Ok);
-        assert_eq!(resp.body, b"hello");
+        assert_eq!(resp.body.as_ref(), b"hello");
         // In-flight set is cleaned up after the handler completes.
         assert!(fold.in_flight_keys().is_empty());
     }
@@ -4585,14 +4607,14 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
         assert!(wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await);
         let captured = captured.lock();
         let (_, _, resp) = &captured[0];
         assert_eq!(resp.status, RpcStatus::Application(0xBEEF));
-        assert_eq!(resp.body, b"bad input");
+        assert_eq!(resp.body.as_ref(), b"bad input");
     }
 
     /// Internal error: handler returns `RpcHandlerError::Internal`
@@ -4613,14 +4635,14 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
         assert!(wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await);
         let captured = captured.lock();
         let (_, _, resp) = &captured[0];
         assert_eq!(resp.status, RpcStatus::Internal);
-        assert_eq!(resp.body, b"db timeout");
+        assert_eq!(resp.body.as_ref(), b"db timeout");
     }
 
     /// Handler panic: caught by the fold's `catch_unwind`; surfaces
@@ -4644,7 +4666,7 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
         assert!(wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await);
@@ -4675,7 +4697,7 @@ mod tests {
                 Ok(RpcResponsePayload {
                     status: RpcStatus::Ok,
                     headers: vec![],
-                    body: vec![],
+                    body: Bytes::new(),
                 })
             }
         }
@@ -4697,7 +4719,7 @@ mod tests {
             deadline_ns: 1_000,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
         // Emit happens synchronously in the deadline-passed branch
@@ -4729,7 +4751,7 @@ mod tests {
                 Ok(RpcResponsePayload {
                     status: RpcStatus::Ok,
                     headers: vec![],
-                    body: vec![],
+                    body: Bytes::new(),
                 })
             }
         }
@@ -4748,7 +4770,7 @@ mod tests {
             deadline_ns: 95_000_000_000,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
         assert!(
@@ -4782,7 +4804,7 @@ mod tests {
                         Ok(RpcResponsePayload {
                             status: RpcStatus::Ok,
                             headers: vec![],
-                            body: b"slept the full window".to_vec(),
+                            body: Bytes::from_static(b"slept the full window"),
                         })
                     }
                 }
@@ -4800,7 +4822,7 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(1, 42, req), &mut ()).unwrap();
         // Wait until the handler's `select!` is parked; then send
@@ -4860,7 +4882,7 @@ mod tests {
                 Ok(RpcResponsePayload {
                     status: RpcStatus::Ok,
                     headers: vec![],
-                    body: b"done".to_vec(),
+                    body: Bytes::from_static(b"done"),
                 })
             }
         }
@@ -4876,7 +4898,7 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         // First REQUEST — handler spawns and parks in sleep.
         fold.apply(&rpc_request_event(1, 99, req.clone()), &mut ())
@@ -4936,7 +4958,7 @@ mod tests {
                 Ok(RpcResponsePayload {
                     status: RpcStatus::Ok,
                     headers: vec![],
-                    body: b"finished despite cancellation".to_vec(),
+                    body: Bytes::from_static(b"finished despite cancellation"),
                 })
             }
         }
@@ -4947,7 +4969,7 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(7, 11, req), &mut ()).unwrap();
         // Wait until the handler is parked, then send CANCEL well
@@ -5141,7 +5163,7 @@ mod tests {
                 Ok(RpcResponsePayload {
                     status: RpcStatus::Ok,
                     headers: vec![],
-                    body: vec![],
+                    body: Bytes::new(),
                 })
             }
         }
@@ -5171,7 +5193,7 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![("traceparent".to_string(), b"00-aa-bb-01".to_vec())],
-            body: vec![],
+            body: Bytes::new(),
         };
         assert!(
             run(req_no_flag).await.is_none(),
@@ -5188,7 +5210,7 @@ mod tests {
             deadline_ns: 0,
             flags: FLAG_RPC_PROPAGATE_TRACE,
             headers: build_trace_headers(&tc),
-            body: vec![],
+            body: Bytes::new(),
         };
         let observed = run(req_with_flag).await.expect("flag set → should be Some");
         assert_eq!(observed, tc);
@@ -5199,7 +5221,7 @@ mod tests {
             deadline_ns: 0,
             flags: FLAG_RPC_PROPAGATE_TRACE,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         assert!(
             run(req_flag_no_headers).await.is_none(),
@@ -5264,7 +5286,7 @@ mod tests {
         let resp = RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: b"hello back".to_vec(),
+            body: Bytes::from_static(b"hello back"),
         };
         fold.apply(&rpc_response_event(0xCAFE, 42, resp.clone()), &mut ())
             .unwrap();
@@ -5289,7 +5311,7 @@ mod tests {
         let resp = RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_response_event(1, 999, resp), &mut ())
             .unwrap();
@@ -5314,7 +5336,7 @@ mod tests {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(1, 7, req), &mut ()).unwrap();
         // Pending entry untouched.
@@ -5338,7 +5360,7 @@ mod tests {
         let resp = RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_response_event(1, 5, resp), &mut ())
             .unwrap();
@@ -5426,7 +5448,7 @@ mod tests {
         let resp = RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: Vec::new(),
-            body: b"forged".to_vec(),
+            body: Bytes::from_static(b"forged"),
         };
         // Forged from a different session peer — must drop.
         pending.deliver(0xDEAD_BEEF, 0x99, resp.clone());
@@ -5443,14 +5465,14 @@ mod tests {
         let ok_resp = RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: Vec::new(),
-            body: b"ok".to_vec(),
+            body: Bytes::from_static(b"ok"),
         };
         pending.deliver(0xCAFE, 0x42, ok_resp);
         let delivered = tokio::time::timeout(Duration::from_millis(50), rx2)
             .await
             .expect("must complete")
             .expect("must receive");
-        assert_eq!(delivered.body, b"ok");
+        assert_eq!(delivered.body.as_ref(), b"ok");
     }
 
     // ====================================================================
@@ -5489,14 +5511,14 @@ mod tests {
         let resp = RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: b"done".to_vec(),
+            body: Bytes::from_static(b"done"),
         };
         pending.deliver(0xCAFE_F00D, 0, resp.clone());
         let delivered = tokio::time::timeout(Duration::from_millis(50), terminal_rx)
             .await
             .expect("terminal must complete")
             .expect("terminal must receive");
-        assert_eq!(delivered.body, b"done");
+        assert_eq!(delivered.body.as_ref(), b"done");
         // Grant mpsc now closed.
         assert_eq!(grant_rx.recv().await, None);
         assert_eq!(pending.pending_count(), 0);
@@ -5722,7 +5744,7 @@ mod tests {
             deadline_ns: 0,
             flags: FLAG_RPC_STREAMING_RESPONSE,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(11, 22, req), &mut ())
             .unwrap();
@@ -5782,7 +5804,7 @@ mod tests {
             deadline_ns: 0,
             flags: FLAG_RPC_STREAMING_RESPONSE,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
         assert!(
@@ -5790,8 +5812,8 @@ mod tests {
             "expected 2 chunks + 1 terminal error",
         );
         let captured = captured.lock();
-        assert_eq!(captured[0].2.body, b"first");
-        assert_eq!(captured[1].2.body, b"second");
+        assert_eq!(captured[0].2.body.as_ref(), b"first");
+        assert_eq!(captured[1].2.body.as_ref(), b"second");
         let (_, _, term) = &captured[2];
         assert_eq!(term.status, RpcStatus::Internal);
         assert!(
@@ -5824,7 +5846,7 @@ mod tests {
             deadline_ns: 0,
             flags: FLAG_RPC_STREAMING_RESPONSE,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(1, 2, req), &mut ()).unwrap();
         assert!(
@@ -5869,7 +5891,7 @@ mod tests {
             deadline_ns: 0,
             flags: FLAG_RPC_STREAMING_RESPONSE,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(7, 13, req), &mut ()).unwrap();
         // Wait until at least the first chunk is captured AND the
@@ -5932,7 +5954,7 @@ mod tests {
             deadline_ns: 0,
             flags: FLAG_RPC_STREAMING_RESPONSE,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(1, 99, req.clone()), &mut ())
             .unwrap();
@@ -6088,7 +6110,7 @@ mod tests {
             call_id,
             flags,
             headers: vec![],
-            body,
+            body: body.into(),
         };
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta.to_bytes());
@@ -6130,7 +6152,7 @@ mod tests {
             Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],
-                body: count.to_le_bytes().to_vec(),
+                body: Bytes::copy_from_slice(&count.to_le_bytes()),
             })
         }
     }
@@ -6157,7 +6179,7 @@ mod tests {
             deadline_ns: 0,
             flags: FLAG_RPC_CLIENT_STREAMING_REQUEST,
             headers: vec![],
-            body: b"a".to_vec(),
+            body: Bytes::from_static(b"a"),
         };
         fold.apply(&rpc_request_event(0xCAFE, 7, req), &mut ())
             .unwrap();
@@ -6198,7 +6220,7 @@ mod tests {
         assert_eq!(*origin, 0xCAFE);
         assert_eq!(*call_id, 7);
         assert_eq!(resp.status, RpcStatus::Ok);
-        assert_eq!(resp.body, 4u64.to_le_bytes());
+        assert_eq!(resp.body.as_ref(), 4u64.to_le_bytes());
         // And the chunks landed in order.
         let seen = seen.lock();
         let collected: Vec<&[u8]> = seen.iter().map(|b| b.as_ref()).collect();
@@ -6231,7 +6253,7 @@ mod tests {
             deadline_ns: 0,
             flags: FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_REQUEST_END,
             headers: vec![],
-            body: b"only".to_vec(),
+            body: Bytes::from_static(b"only"),
         };
         fold.apply(&rpc_request_event(1, 42, req), &mut ()).unwrap();
         assert!(
@@ -6241,7 +6263,7 @@ mod tests {
         let captured = captured.lock();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].2.status, RpcStatus::Ok);
-        assert_eq!(captured[0].2.body, 1u64.to_le_bytes());
+        assert_eq!(captured[0].2.body.as_ref(), 1u64.to_le_bytes());
         assert_eq!(
             seen.lock()
                 .iter()
@@ -6274,7 +6296,7 @@ mod tests {
             deadline_ns: 0,
             flags: FLAG_RPC_CLIENT_STREAMING_REQUEST,
             headers: vec![],
-            body: b"first".to_vec(),
+            body: Bytes::from_static(b"first"),
         };
         fold.apply(&rpc_request_event(2, 17, req), &mut ()).unwrap();
         // Wait for the handler to register, then one in-flight
@@ -6345,7 +6367,7 @@ mod tests {
             deadline_ns: 0,
             flags: FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_REQUEST_END,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(3, 100, req), &mut ())
             .unwrap();
@@ -6356,7 +6378,7 @@ mod tests {
         let captured = captured.lock();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].2.status, RpcStatus::Application(0xBEEF));
-        assert_eq!(captured[0].2.body, b"bad input");
+        assert_eq!(captured[0].2.body.as_ref(), b"bad input");
     }
 
     /// 5/6 — handler panic is caught by `catch_unwind`; terminal
@@ -6383,7 +6405,7 @@ mod tests {
             deadline_ns: 0,
             flags: FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_REQUEST_END,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(4, 200, req), &mut ())
             .unwrap();
@@ -6426,7 +6448,7 @@ mod tests {
                 Ok(RpcResponsePayload {
                     status: RpcStatus::Ok,
                     headers: vec![],
-                    body: vec![],
+                    body: Bytes::new(),
                 })
             }
         }
@@ -6442,7 +6464,7 @@ mod tests {
             deadline_ns: 0,
             flags: FLAG_RPC_CLIENT_STREAMING_REQUEST,
             headers: vec![],
-            body: vec![],
+            body: Bytes::new(),
         };
         fold.apply(&rpc_request_event(5, 99, req.clone()), &mut ())
             .unwrap();

@@ -433,7 +433,7 @@ impl crate::adapter::net::cortex::RpcHandler for OverflowPushHandler {
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: Vec::new(),
-            body,
+            body: bytes::Bytes::from(body),
         })
     }
 }

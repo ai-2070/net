@@ -82,7 +82,7 @@ impl RpcHandler for EchoSumHandler {
                 return Ok(RpcResponsePayload {
                     status: RpcStatus::Application(NRPC_TYPED_BAD_REQUEST),
                     headers: vec![],
-                    body: serde_json::to_vec(&body).unwrap(),
+                    body: serde_json::to_vec(&body).unwrap().into(),
                 });
             }
         };
@@ -100,7 +100,7 @@ impl RpcHandler for EchoSumHandler {
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: serde_json::to_vec(&resp).unwrap(),
+            body: serde_json::to_vec(&resp).unwrap().into(),
         })
     }
 }
@@ -169,7 +169,7 @@ impl Loopback {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body,
+            body: body.into(),
         };
         let ev = request_event(self.caller_origin, call_id, &req);
         self.server_fold

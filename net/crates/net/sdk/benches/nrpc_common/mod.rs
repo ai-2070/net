@@ -238,7 +238,7 @@ impl RpcHandler for PostcardEchoHandler {
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: bytes,
+            body: bytes.into(),
         })
     }
 }

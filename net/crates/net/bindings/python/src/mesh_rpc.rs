@@ -472,7 +472,7 @@ impl RpcHandler for PyRpcHandler {
             Ok(Ok(Ok(HandlerOutcome::Ok(body)))) => Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],
-                body,
+                body: body.into(),
             }),
             Ok(Ok(Ok(HandlerOutcome::AppError { code, body }))) => {
                 Err(RpcHandlerError::Application {
@@ -1317,7 +1317,7 @@ impl RpcClientStreamingHandler for PyRpcClientStreamingHandler {
             Ok(Ok(Ok(HandlerOutcome::Ok(body)))) => Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],
-                body,
+                body: body.into(),
             }),
             Ok(Ok(Ok(HandlerOutcome::AppError { code, body }))) => {
                 Err(RpcHandlerError::Application {
