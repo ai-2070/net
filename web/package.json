@@ -85,7 +85,7 @@
     "nextjs-google-analytics": "2.3.7",
     "object-code": "2.0.0",
     "posthog-js": "1.374.3",
-    "posthog-node": "5.34.7",
+    "posthog-node": "5.34.8",
     "react": "19.2.6",
     "react-day-picker": "10.0.1",
     "react-dom": "19.2.6",
