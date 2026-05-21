@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/contested/partition.rs
+  s_4f93eae8f45533::t_6ffcbcf158e341 447-467,473-521
+  s_4f93eae8f45533::t_44c8c2a4d4f3a5 468-472
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "1582ff9c60c573e15f240908344e7fe9e32d15fe",
+  "prompts": {},
+  "sessions": {
+    "s_4f93eae8f45533": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4eeaced2-d67f-413c-87c1-4b5954eae6be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
