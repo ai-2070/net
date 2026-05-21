@@ -1,0 +1,28 @@
+web/src/content/docs/releases/RELEASE_v0.18_WELCOME_TO_THE_JUNGLE.md
+  s_e802155ff9ef32::t_c039df8529c1dc 1-277
+web/src/content/docs/releases/RELEASE_v0.19_PUSH_IT_TO_THE_LIMIT.md
+  s_e802155ff9ef32::t_c039df8529c1dc 1-244
+web/src/content/docs/releases/RELEASE_v0.20_SMOKE_ON_THE_WATER.md
+  s_e802155ff9ef32::t_c039df8529c1dc 1-207
+web/src/docs.order.ts
+  s_e802155ff9ef32::t_6803ac7b91db8e 126-129
+  s_e802155ff9ef32::t_28166a5f302e98 60-63
+web/src/content/docs/releases/RELEASE_v0.20.2.md
+  s_e802155ff9ef32::t_c039df8529c1dc 1-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "abd48ffa24c6ca5ee1e144e1458e3c17ccc4f11b",
+  "prompts": {},
+  "sessions": {
+    "s_e802155ff9ef32": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e7ed794-33fe-4781-8585-c1e89f2c852c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
