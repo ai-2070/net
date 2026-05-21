@@ -2537,7 +2537,7 @@ mod tests {
         let lb = three_endpoint_lb(Strategy::Adaptive);
         let ctx = RequestContext::new();
         let s = lb.select(&ctx).unwrap();
-        assert!(matches!(s.node_id[0], 1 | 2 | 3));
+        assert!(matches!(s.node_id[0], 1..=3));
     }
 
     // ---------- endpoints() snapshot ----------

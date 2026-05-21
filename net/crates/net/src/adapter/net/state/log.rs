@@ -720,7 +720,7 @@ mod tests {
         for i in 0..5 {
             let payload = Bytes::from(format!("snap-{i}"));
             let ev = builder.append(payload.clone(), 0).unwrap();
-            last = Some(ev.link.clone());
+            last = Some(ev.link);
             last_payload = payload;
         }
         let head_link = last.expect("five events appended");
