@@ -1493,4 +1493,39 @@ mod tests {
             other => panic!("unfailed-node branch must return Retry, got {:?}", other),
         }
     }
+
+    /// Circuit-breaker HalfOpen → Open on a single failure.
+    ///
+    /// The existing `test_circuit_breaker` covers Closed → Open
+    /// → HalfOpen → Closed, but never the HalfOpen → Open arm
+    /// at L646-L656. That arm is the "probe failed, snap back to
+    /// open" path. A regression here means a half-open probe
+    /// that fails would NOT trip back to open — a known-broken
+    /// backend would continue receiving probe traffic indefinitely
+    /// instead of waiting another reset_timeout cycle.
+    #[test]
+    fn circuit_breaker_half_open_failure_trips_back_to_open() {
+        let cb = CircuitBreaker::new(2, 2, Duration::from_millis(20));
+
+        // Open the breaker.
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Wait past reset_timeout and probe — moves to HalfOpen.
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(cb.allow(), "expected allow() to admit a probe after reset_timeout");
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // Single failure in HalfOpen must trip back to Open.
+        cb.record_failure();
+        assert_eq!(
+            cb.state(),
+            CircuitState::Open,
+            "HalfOpen + failure must snap back to Open; \
+             a regression here keeps probing a broken backend",
+        );
+        // And further requests must be rejected.
+        assert!(!cb.allow());
+    }
 }
