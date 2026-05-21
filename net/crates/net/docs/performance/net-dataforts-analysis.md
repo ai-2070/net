@@ -6,6 +6,14 @@ The frequency profile here is unusual: most code is per-blob-operation (cold rel
 
 ---
 
+## ✅ Fixed
+
+| # | Item | Notes |
+|---|------|-------|
+| 171 | `hex32` and `chunk_channel` `write!`-per-byte → lookup-table encoder | New `HEX_LOWER` table + `hex32_into(&[u8; 32], &mut [u8; 64])` zero-allocation form; `hex32` allocates one 64-byte `String` via `from_utf8` (validator is SIMD-fast on short ASCII). `chunk_channel` builds the bytes directly with `extend_from_slice + hex32_into` instead of looping through the `core::fmt::Arguments` formatter. The duplicate `hex32` in `error.rs` now delegates to the shared one. Pre-fix did 32 dispatches through `write!("{:02x}", b)` per call — roughly 10× slower for the same output. Pinned by `hex32_matches_write_macro_output_byte_for_byte` (byte-for-byte parity with legacy on four corner-case inputs) and `hex32_into_matches_hex32_output`. |
+
+---
+
 ## 🔴 High-impact
 
 ### 171. `hex32` and `chunk_channel` use `write!` per byte for hex encoding — called throughout the blob layer

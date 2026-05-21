@@ -131,14 +131,10 @@ impl fmt::Display for BlobError {
 
 impl std::error::Error for BlobError {}
 
-fn hex32(bytes: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{:02x}", b);
-    }
-    s
-}
+// Delegate to the shared lookup-table-based `hex32` in `mod.rs`
+// (see dataforts perf #171). The local definition used to be an
+// independent `write!("{:02x}", b)` loop — same output, ~10× slower.
+use super::hex32;
 
 #[cfg(test)]
 mod tests {

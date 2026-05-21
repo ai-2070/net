@@ -2314,17 +2314,29 @@ impl MeshBlobAdapter {
 
     /// Channel name for a given chunk hash. Pure function; safe to
     /// inline.
+    ///
+    /// Uses the lookup-table-based [`super::hex32_into`] to render
+    /// the hex into the trailing 64 bytes of the channel-name
+    /// buffer — see dataforts perf #171 for the rationale. Pre-fix
+    /// this looped `write!("{:02x}", b)` 32 times through the
+    /// `core::fmt::Arguments` machinery, which is ~10× slower
+    /// than the table form for the same output and runs once
+    /// per chunk on the bulk-fetch path.
     #[expect(
         clippy::expect_used,
         reason = "hex-formatted name under the reserved CHUNK_CHANNEL_PREFIX always satisfies ChannelName validation"
     )]
     fn chunk_channel(hash: &[u8; 32]) -> ChannelName {
-        let mut name = String::with_capacity(CHUNK_CHANNEL_PREFIX.len() + 64);
-        name.push_str(CHUNK_CHANNEL_PREFIX);
-        for b in hash {
-            use std::fmt::Write;
-            let _ = write!(name, "{:02x}", b);
-        }
+        // Build the bytes directly: `CHUNK_CHANNEL_PREFIX` (ASCII)
+        // followed by 64 hex bytes. Keeping the build at the byte
+        // level avoids the `write!` formatting dispatch.
+        let mut buf = Vec::with_capacity(CHUNK_CHANNEL_PREFIX.len() + 64);
+        buf.extend_from_slice(CHUNK_CHANNEL_PREFIX.as_bytes());
+        let mut hex_buf = [0u8; 64];
+        super::hex32_into(hash, &mut hex_buf);
+        buf.extend_from_slice(&hex_buf);
+        let name = String::from_utf8(buf)
+            .expect("prefix is ASCII and hex bytes are ASCII — UTF-8 by construction");
         ChannelName::new(&name).expect("hex-formatted name under reserved prefix is always valid")
     }
 
