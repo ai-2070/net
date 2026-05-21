@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/redex/replication_runtime.rs
+  s_f930dae9b8bbc1::t_e5d53f2aaf9c9e 819-832
+net/crates/net/src/adapter/net/redex/entry.rs
+  s_f930dae9b8bbc1::t_bcfa8bf798a39f 145-151,162-164,169
+net/crates/net/docs/performance/net-perf-analysis.md
+  s_f930dae9b8bbc1::t_47ab87a2032263 29-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "f73fcb37174ff9785465a212d228d48b856b6ffb",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
