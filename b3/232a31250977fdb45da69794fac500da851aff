@@ -1,0 +1,98 @@
+net/crates/net/tests/three_node_integration.rs
+  s_f930dae9b8bbc1::t_9442372858af5b 1283-1291
+  s_f930dae9b8bbc1::t_5fb79a1ae2b858 2096
+  s_f930dae9b8bbc1::t_0e766205458119 2092
+  s_f930dae9b8bbc1::t_10f19bfb0c5122 583
+  s_f930dae9b8bbc1::t_c016f71cf84a81 436
+  s_f930dae9b8bbc1::t_1981984be612be 502
+  s_f930dae9b8bbc1::t_db5a58d9f67954 381,647
+  s_f930dae9b8bbc1::t_ef20f1920a82af 648
+  s_f930dae9b8bbc1::t_97f3557055b927 2200
+  s_f930dae9b8bbc1::t_55dcbbf545f11d 443
+  s_f930dae9b8bbc1::t_262f29ab923c3d 2534,2629
+  s_f930dae9b8bbc1::t_96accad35264ee 3378
+  s_f930dae9b8bbc1::t_6283a2b68f3bf6 380,646
+  s_f930dae9b8bbc1::t_bf4fafb325d5c0 3732
+  s_f930dae9b8bbc1::t_bced3f26a6e7b6 3354
+  s_f930dae9b8bbc1::t_671f3e2a35552e 576
+  s_f930dae9b8bbc1::t_fa6686a07af2c6 570
+  s_f930dae9b8bbc1::t_54e6e0c0531e2b 2291,2358
+  s_f930dae9b8bbc1::t_0e7932025c1343 342,785
+  s_f930dae9b8bbc1::t_1227b7546dc728 2006,3061,3147,3260
+  s_f930dae9b8bbc1::t_5a57d52fc414da 493
+  s_f930dae9b8bbc1::t_7d0941bbda67c9 3636
+  s_f930dae9b8bbc1::t_bf9ff7e72bbb7b 2514,2619
+  s_f930dae9b8bbc1::t_98c7604c61be22 3239
+  s_f930dae9b8bbc1::t_1f4e7196ce8460 3728
+net/crates/net/bindings/python/src/lib.rs
+  s_f930dae9b8bbc1::t_20b881d541125a 1353
+net/crates/net/src/bus.rs
+  s_f930dae9b8bbc1::t_02e9b98fb72f68 2294
+  s_f930dae9b8bbc1::t_05632073e6253f 2867
+  s_f930dae9b8bbc1::t_aa7c25326b79ba 2889-2892,2894,2905
+  s_f930dae9b8bbc1::t_04217fa4d9d157 2932,2939,2944
+  s_f930dae9b8bbc1::t_5c8c60a73d61da 2804,3084,3188
+  s_f930dae9b8bbc1::t_8742bd47af7cc4 2971,3458,3559,3668,3799
+  s_f930dae9b8bbc1::t_a7cccf47047f2d 846
+  s_f930dae9b8bbc1::t_940146b3e13590 2874-2888,2893,2895-2904,2906-2931,2933-2938,2940-2943,2945-2959
+  s_f930dae9b8bbc1::t_8a16f53afa8ce0 2128,2133-2137,2139
+  s_f930dae9b8bbc1::t_c82598cf8cb9da 2267
+  s_f930dae9b8bbc1::t_0418cd90881355 2318
+  s_f930dae9b8bbc1::t_8e2420f543c49e 2844
+  s_f930dae9b8bbc1::t_178b48874f7c2c 663
+net/crates/net/tests/bus_shutdown_drain.rs
+  s_f930dae9b8bbc1::t_c6392ff5d3c95f 69,107,178
+net/crates/net/src/consumer/merge.rs
+  s_f930dae9b8bbc1::t_a10da2d7779b72 1780
+  s_f930dae9b8bbc1::t_223c1c957476c8 1538,3009,3074,3157,3266
+net/crates/net/tests/integration_net.rs
+  s_f930dae9b8bbc1::t_2cd73bcfef2933 315,320
+  s_f930dae9b8bbc1::t_c116d97ad134e2 160-163,243-246,478-481
+  s_f930dae9b8bbc1::t_1f24495d79335b 331,336
+  s_f930dae9b8bbc1::t_d94969bd7d4327 606,611
+net/crates/net/docs/performance/net-perf-analysis.md
+  s_f930dae9b8bbc1::t_3e95b19f982cbf 11-18
+net/crates/net/bindings/node/src/lib.rs
+  s_f930dae9b8bbc1::t_e933629b4353e5 1523
+net/crates/net/src/adapter/redis.rs
+  s_f930dae9b8bbc1::t_f7052ffdf4de09 396
+net/crates/net/src/adapter/mod.rs
+  s_f930dae9b8bbc1::t_e5df03886d48a8 261,324,347
+  s_f930dae9b8bbc1::t_48650f527f5930 150-158,164
+  s_f930dae9b8bbc1::t_95786a3677e650 213
+  s_f930dae9b8bbc1::t_9476632dd01980 52-53
+net/crates/net/src/adapter/noop.rs
+  s_f930dae9b8bbc1::t_501dc4807e253f 62
+  s_f930dae9b8bbc1::t_c29c2fb5b86d86 120
+net/crates/net/tests/bus_stranded_flush.rs
+  s_f930dae9b8bbc1::t_20e2083839ed41 93,366
+  s_f930dae9b8bbc1::t_f1407852022ce7 606
+net/crates/net/src/adapter/net/mesh.rs
+  s_f930dae9b8bbc1::t_c8d07d46720381 9524,9535
+  s_f930dae9b8bbc1::t_77db7220a34032 4498
+  s_f930dae9b8bbc1::t_6febe579ff81a8 4590-4594
+net/crates/net/sdk/src/mesh.rs
+  s_f930dae9b8bbc1::t_b068905ba79265 455
+  s_f930dae9b8bbc1::t_6e1b20ccd12843 472
+  s_f930dae9b8bbc1::t_94c0687a34547d 491
+net/crates/net/src/adapter/jetstream.rs
+  s_f930dae9b8bbc1::t_310e4bf3521f19 344
+net/crates/net/src/adapter/net/mod.rs
+  s_f930dae9b8bbc1::t_2de7bb5efb6fc9 984
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "b3232a31250977fdb45da69794fac500da851aff",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
