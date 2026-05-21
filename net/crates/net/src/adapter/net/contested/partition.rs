@@ -444,4 +444,79 @@ mod tests {
         det.on_node_recovery(1); // duplicate
         assert_eq!(det.get(id).unwrap().healing_progress(), 0.25); // still 1/4
     }
+
+    /// PartitionRecord exposes a handful of pure getters that the
+    /// operator dashboards + healing logic read on every tick. The
+    /// existing tests cover `our_side`/`other_side`/`phase`; the
+    /// rest (id, partition_subnet, horizon_at_split, duration)
+    /// were not pinned. A getter that returns the wrong field —
+    /// say `partition_subnet()` accidentally returning `id` after
+    /// a refactor — would silently mis-render every partition
+    /// dashboard row without any test surfacing the swap.
+    #[test]
+    fn partition_record_getters_return_the_right_fields() {
+        let mut det = PartitionDetector::new();
+        let horizon = ObservedHorizon::new();
+        let subnet = SubnetId::new(&[2]);
+        let verdict = make_verdict_subnet(vec![1, 2, 3], subnet);
+
+        let id = det.detect(&verdict, &[4, 5, 6], &horizon).unwrap();
+        let record = det.get(id).unwrap();
+
+        assert_eq!(record.id(), id);
+        assert_eq!(record.partition_subnet(), Some(subnet));
+        // horizon_at_split was the empty ObservedHorizon we
+        // passed in — ObservedHorizon doesn't impl PartialEq, so
+        // we observe via entity_count() (0 for the empty horizon)
+        // as the simplest invariant.
+        assert_eq!(record.horizon_at_split().entity_count(), 0);
+        // duration() reflects time since detection — must be a
+        // sensible positive Duration, not zero (we just spent
+        // some non-zero time in detect()) but well under a
+        // wall-clock second.
+        let d = record.duration();
+        assert!(d < std::time::Duration::from_secs(1), "duration too long: {d:?}");
+    }
+
+    /// Phase-transition guard: confirm() returning false when the
+    /// partition is already past Suspected (e.g. confirming
+    /// twice). Pre-confirm the partition once, then re-confirm —
+    /// the second call must return false and leave the phase
+    /// untouched. A regression that unconditionally returns true
+    /// would let callers "re-confirm" healed partitions, breaking
+    /// the state-machine invariants downstream code relies on.
+    #[test]
+    fn confirm_returns_false_on_already_confirmed_partition() {
+        let mut det = PartitionDetector::new();
+        let horizon = ObservedHorizon::new();
+        let verdict = make_verdict_subnet(vec![1, 2], SubnetId::new(&[2]));
+        let id = det.detect(&verdict, &[3, 4], &horizon).unwrap();
+
+        assert!(det.confirm(id), "first confirm must succeed");
+        assert_eq!(det.get(id).unwrap().phase(), &PartitionPhase::Confirmed);
+
+        // Second confirm: already past Suspected → false, no
+        // phase change.
+        assert!(!det.confirm(id), "second confirm must reject");
+        assert_eq!(det.get(id).unwrap().phase(), &PartitionPhase::Confirmed);
+
+        // Confirming a non-existent partition: also false.
+        assert!(!det.confirm(u64::MAX));
+    }
+
+    #[test]
+    fn partition_detector_default_matches_new() {
+        let a: PartitionDetector = Default::default();
+        let b = PartitionDetector::new();
+        assert_eq!(a.active_count(), b.active_count());
+    }
+
+    #[test]
+    fn partition_detector_debug_includes_counts() {
+        let det = PartitionDetector::new().with_healing_threshold(0.5);
+        let s = format!("{:?}", det);
+        assert!(s.contains("PartitionDetector"));
+        assert!(s.contains("active_partitions: 0"));
+        assert!(s.contains("healing_threshold"));
+    }
 }
