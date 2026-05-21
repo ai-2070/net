@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  s_4f93eae8f45533::t_af9d637bd99d0e 517-583
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  s_4f93eae8f45533::t_ee767cd6889491 474-527
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "9c03d574e5b3c3d810bf6362d69d47538a02a3be",
+  "prompts": {},
+  "sessions": {
+    "s_4f93eae8f45533": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4eeaced2-d67f-413c-87c1-4b5954eae6be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
