@@ -2053,4 +2053,282 @@ mod tests {
             to_bytes_lineno + 1
         );
     }
+
+    // ---------- DiffOp::estimated_size per-variant coverage ----------
+
+    #[test]
+    fn estimated_size_returns_a_sensible_value_for_every_variant() {
+        // `estimated_size` is a planner hint, not a wire-format
+        // guarantee — its exact constants are free to change for
+        // legitimate reasons (alignment, fixed overhead). The
+        // contract we need to pin is: every variant runs without
+        // panicking and returns a sensible non-zero number. A
+        // regression that hits a wildcard arm returning 0, or
+        // that overflows, gets caught.
+        fn check(label: &str, op: DiffOp) {
+            let s = op.estimated_size();
+            assert!(
+                s > 0 && s < 1_000_000,
+                "{label}.estimated_size() = {s} is out of range",
+            );
+        }
+
+        check("AddTag", DiffOp::AddTag("abc".into()));
+        check("RemoveTag", DiffOp::RemoveTag("abc".into()));
+        check(
+            "AddModel",
+            DiffOp::AddModel(ModelCapability::new("m1", "llama")),
+        );
+        check("RemoveModel", DiffOp::RemoveModel("m1".into()));
+        check(
+            "UpdateModel",
+            DiffOp::UpdateModel {
+                model_id: "m1".into(),
+                tokens_per_sec: Some(50),
+                loaded: None,
+            },
+        );
+        check("AddTool", DiffOp::AddTool(ToolCapability::new("t1", "T1")));
+        check("RemoveTool", DiffOp::RemoveTool("t1".into()));
+        check(
+            "UpdateHardware",
+            DiffOp::UpdateHardware(HardwareCapabilities::new()),
+        );
+        check("UpdateMemory", DiffOp::UpdateMemory(32));
+        check("UpdateNetwork", DiffOp::UpdateNetwork(10));
+        check(
+            "UpdateSoftware",
+            DiffOp::UpdateSoftware(SoftwareCapabilities::new()),
+        );
+        check(
+            "AddRuntime",
+            DiffOp::AddRuntime {
+                name: "py".into(),
+                version: "3.11".into(),
+            },
+        );
+        check("RemoveRuntime", DiffOp::RemoveRuntime("py".into()));
+        check(
+            "AddFramework",
+            DiffOp::AddFramework {
+                name: "pt".into(),
+                version: "2.1".into(),
+            },
+        );
+        check("RemoveFramework", DiffOp::RemoveFramework("pt".into()));
+        check("UpdateLimits", DiffOp::UpdateLimits(ResourceLimits::new()));
+        check("UpdateMaxConcurrent", DiffOp::UpdateMaxConcurrent(10));
+        check("UpdateRateLimit", DiffOp::UpdateRateLimit(60));
+        check(
+            "SetField",
+            DiffOp::SetField {
+                path: "custom.x".into(),
+                value: serde_json::json!(42),
+            },
+        );
+        check(
+            "UnsetField",
+            DiffOp::UnsetField {
+                path: "custom.x".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn estimated_size_scales_with_string_payload() {
+        // The one property worth pinning beyond "non-zero": variants
+        // that embed a string MUST size up with the string's length,
+        // otherwise the planner that uses this hint to batch ops
+        // would underestimate memory.
+        let small = DiffOp::AddTag("x".into()).estimated_size();
+        let large = DiffOp::AddTag("x".repeat(1000)).estimated_size();
+        assert!(
+            large > small,
+            "AddTag should scale with payload: small={small}, large={large}",
+        );
+    }
+
+    // ---------- diff_limits partial-update detection ----------
+    //
+    // When only one of `max_concurrent` / `rate_limit_rpm` changes
+    // and the rest of `ResourceLimits` is unchanged, `diff_limits`
+    // emits the targeted `UpdateMaxConcurrent` / `UpdateRateLimit`
+    // shortcut instead of the heavier `UpdateLimits` (full
+    // replacement). Existing tests only exercise the fallthrough
+    // path; these pin the shortcut branches.
+
+    fn caps_with_limits(l: ResourceLimits) -> CapabilitySet {
+        CapabilitySet::new().with_limits(l)
+    }
+
+    #[test]
+    fn diff_limits_emits_max_concurrent_shortcut_when_only_concurrent_changes() {
+        let old = caps_with_limits(ResourceLimits::new().with_max_concurrent(10));
+        let new = caps_with_limits(ResourceLimits::new().with_max_concurrent(20));
+        let ops = DiffEngine::diff(&old, &new);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, DiffOp::UpdateMaxConcurrent(20))),
+            "expected UpdateMaxConcurrent(20), got {:?}",
+            ops,
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, DiffOp::UpdateLimits(_))),
+            "shortcut path must not also emit UpdateLimits",
+        );
+    }
+
+    #[test]
+    fn diff_limits_emits_rate_limit_shortcut_when_only_rpm_changes() {
+        let old = caps_with_limits(ResourceLimits::new().with_rate_limit(60));
+        let new = caps_with_limits(ResourceLimits::new().with_rate_limit(120));
+        let ops = DiffEngine::diff(&old, &new);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, DiffOp::UpdateRateLimit(120))),
+            "expected UpdateRateLimit(120), got {:?}",
+            ops,
+        );
+    }
+
+    #[test]
+    fn diff_limits_falls_through_to_full_replacement_when_multiple_fields_change() {
+        let old = caps_with_limits(
+            ResourceLimits::new()
+                .with_max_concurrent(10)
+                .with_rate_limit(60),
+        );
+        let new = caps_with_limits(
+            ResourceLimits::new()
+                .with_max_concurrent(20)
+                .with_rate_limit(120),
+        );
+        let ops = DiffEngine::diff(&old, &new);
+        assert!(
+            ops.iter().any(|op| matches!(op, DiffOp::UpdateLimits(_))),
+            "multi-field change must take the UpdateLimits fallthrough",
+        );
+    }
+
+    // ---------- apply branches for non-Add/non-tag operations ----------
+
+    #[test]
+    fn apply_update_hardware_memory_network() {
+        let base = sample_capability_set();
+        let mut hw = base.views().hardware().clone();
+        hw.memory_gb = 128;
+        let diff = CapabilityDiff::new(1, 1, 2, vec![DiffOp::UpdateHardware(hw.clone())]);
+        let after = DiffEngine::apply(&base, &diff, true).unwrap();
+        assert_eq!(after.views().hardware().memory_gb, 128);
+
+        let diff = CapabilityDiff::new(1, 1, 2, vec![DiffOp::UpdateMemory(256)]);
+        let after = DiffEngine::apply(&base, &diff, true).unwrap();
+        assert_eq!(after.views().hardware().memory_gb, 256);
+
+        let diff = CapabilityDiff::new(1, 1, 2, vec![DiffOp::UpdateNetwork(25)]);
+        let after = DiffEngine::apply(&base, &diff, true).unwrap();
+        assert_eq!(after.views().hardware().network_gbps, 25);
+    }
+
+    #[test]
+    fn apply_update_software_and_runtime_framework() {
+        let base = sample_capability_set();
+        let new_sw = SoftwareCapabilities::new().with_os("linux", "6.5");
+        let diff = CapabilityDiff::new(1, 1, 2, vec![DiffOp::UpdateSoftware(new_sw)]);
+        let after = DiffEngine::apply(&base, &diff, true).unwrap();
+        assert_eq!(after.views().software().os_version, "6.5");
+
+        let diff = CapabilityDiff::new(
+            1,
+            1,
+            2,
+            vec![DiffOp::AddRuntime {
+                name: "node".into(),
+                version: "20".into(),
+            }],
+        );
+        let after = DiffEngine::apply(&base, &diff, true).unwrap();
+        assert!(after
+            .views()
+            .software()
+            .runtimes
+            .iter()
+            .any(|(n, _)| n == "node"));
+
+        let diff = CapabilityDiff::new(
+            1,
+            1,
+            2,
+            vec![DiffOp::AddFramework {
+                name: "jax".into(),
+                version: "0.4".into(),
+            }],
+        );
+        let after = DiffEngine::apply(&base, &diff, true).unwrap();
+        assert!(after
+            .views()
+            .software()
+            .frameworks
+            .iter()
+            .any(|(n, _)| n == "jax"));
+    }
+
+    #[test]
+    fn apply_update_limits_and_shortcuts() {
+        let base = sample_capability_set();
+
+        let new_limits = ResourceLimits::new()
+            .with_max_concurrent(99)
+            .with_rate_limit(50);
+        let diff = CapabilityDiff::new(1, 1, 2, vec![DiffOp::UpdateLimits(new_limits)]);
+        let after = DiffEngine::apply(&base, &diff, true).unwrap();
+        assert_eq!(after.views().resource_limits().max_concurrent_requests, 99);
+
+        let diff = CapabilityDiff::new(1, 1, 2, vec![DiffOp::UpdateMaxConcurrent(42)]);
+        let after = DiffEngine::apply(&base, &diff, true).unwrap();
+        assert_eq!(after.views().resource_limits().max_concurrent_requests, 42);
+
+        let diff = CapabilityDiff::new(1, 1, 2, vec![DiffOp::UpdateRateLimit(999)]);
+        let after = DiffEngine::apply(&base, &diff, true).unwrap();
+        assert_eq!(after.views().resource_limits().rate_limit_rpm, 999);
+    }
+
+    // ---------- Strict vs non-strict for Remove ops on missing items ----------
+
+    #[test]
+    fn remove_tool_missing_errors_in_strict_mode_noops_otherwise() {
+        let base = sample_capability_set();
+        let diff = CapabilityDiff::new(1, 1, 2, vec![DiffOp::RemoveTool("nonexistent".into())]);
+        // strict=true: surface NotFound rather than silently ignoring.
+        assert!(matches!(
+            DiffEngine::apply(&base, &diff, true),
+            Err(DiffError::ToolNotFound(_))
+        ));
+        // strict=false: best-effort no-op, returns the unchanged set.
+        let after = DiffEngine::apply(&base, &diff, false).unwrap();
+        assert_eq!(after.views().tools().len(), base.views().tools().len());
+    }
+
+    #[test]
+    fn remove_runtime_missing_errors_in_strict_mode_noops_otherwise() {
+        let base = sample_capability_set();
+        let diff = CapabilityDiff::new(1, 1, 2, vec![DiffOp::RemoveRuntime("nonexistent".into())]);
+        assert!(matches!(
+            DiffEngine::apply(&base, &diff, true),
+            Err(DiffError::RuntimeNotFound(_))
+        ));
+        assert!(DiffEngine::apply(&base, &diff, false).is_ok());
+    }
+
+    #[test]
+    fn remove_framework_missing_errors_in_strict_mode_noops_otherwise() {
+        let base = sample_capability_set();
+        let diff =
+            CapabilityDiff::new(1, 1, 2, vec![DiffOp::RemoveFramework("nonexistent".into())]);
+        assert!(matches!(
+            DiffEngine::apply(&base, &diff, true),
+            Err(DiffError::FrameworkNotFound(_))
+        ));
+        assert!(DiffEngine::apply(&base, &diff, false).is_ok());
+    }
 }

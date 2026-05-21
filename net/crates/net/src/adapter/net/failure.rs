@@ -1493,4 +1493,48 @@ mod tests {
             other => panic!("unfailed-node branch must return Retry, got {:?}", other),
         }
     }
+
+    /// Circuit-breaker HalfOpen → Open on a single failure.
+    ///
+    /// The existing `test_circuit_breaker` covers Closed → Open
+    /// → HalfOpen → Closed, but never the HalfOpen → Open arm
+    /// at L646-L656. That arm is the "probe failed, snap back to
+    /// open" path. A regression here means a half-open probe
+    /// that fails would NOT trip back to open — a known-broken
+    /// backend would continue receiving probe traffic indefinitely
+    /// instead of waiting another reset_timeout cycle.
+    #[test]
+    fn circuit_breaker_half_open_failure_trips_back_to_open() {
+        // `from_nanos(1)` lets `allow()` see the reset_timeout as
+        // already elapsed without a real-time sleep — same trick
+        // as `test_regression_allow_does_not_undo_reset`. The
+        // trade-off is that after the HalfOpen → Open snap-back,
+        // any further `allow()` call would also see the timeout
+        // elapsed and immediately transition back to HalfOpen.
+        // The decisive observable for this regression is the
+        // state right after `record_failure()`, not what `allow()`
+        // returns on the next call.
+        let cb = CircuitBreaker::new(2, 2, Duration::from_nanos(1));
+
+        // Open the breaker.
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Probe — moves to HalfOpen.
+        assert!(
+            cb.allow(),
+            "expected allow() to admit a probe after reset_timeout"
+        );
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // Single failure in HalfOpen must trip back to Open.
+        cb.record_failure();
+        assert_eq!(
+            cb.state(),
+            CircuitState::Open,
+            "HalfOpen + failure must snap back to Open; \
+             a regression here keeps probing a broken backend",
+        );
+    }
 }

@@ -2129,32 +2129,44 @@ mod tests {
     /// of activation.
     #[test]
     fn freshly_added_shard_skipped_from_evaluate_scaling_warmup() {
+        // Short cooldown so we can pin "outside warmup" with a
+        // small `checked_sub`-safe offset (200ms). Production
+        // stamps boot shards 1 hour in the past, but that
+        // subtraction falls back to `Instant::now()` on hosts
+        // with sub-1h uptime (Windows Instant is bounded by
+        // boot), making all shards land inside the warmup
+        // window. We override both boot shards explicitly so
+        // the test is independent of system uptime.
         let policy = ScalingPolicy {
             underutilized_threshold: 0.2,
             min_shards: 1,
-            // Long cooldown so the warmup window stays open
-            // throughout the test.
-            cooldown: Duration::from_secs(60),
+            cooldown: Duration::from_millis(100),
             ..Default::default()
         };
         let mapper = ShardMapper::new(3, 1024, policy).unwrap();
 
         // Direct manipulation of the shard list: pin two boot
-        // shards as underutilized (boot stamps put them outside
-        // the warmup window), and inject one freshly-activated
-        // shard with `activated_at = now()` whose placeholder
-        // metrics ALSO trigger the underutilized predicate.
-        // Without the warmup skip, the count would be 3 of 3
-        // shards underutilized → scale-down. WITH the warmup
-        // skip, only the 2 boot shards count, and 2 of 3 still
+        // shards as underutilized AND safely outside the warmup
+        // window, and inject one freshly-activated shard with
+        // `activated_at = now()` whose placeholder metrics ALSO
+        // trigger the underutilized predicate. Without the
+        // warmup skip, the count would be 3 of 3 shards
+        // underutilized → scale-down. WITH the warmup skip,
+        // only the 2 boot shards count, and 2 of 3 still
         // exceeds the 3/2 = 1 majority — scale-down still fires
         // (driven by the boot shards), but the decisive property
         // is that the fresh shard is correctly excluded.
+        let old_ts = Instant::now()
+            .checked_sub(Duration::from_millis(200))
+            .expect("test host uptime should exceed 200ms");
         {
             let mut shards = mapper.shards.write();
             for shard in shards.iter_mut() {
                 shard.last_metrics.fill_ratio = 0.05;
                 shard.last_metrics.event_rate = 0;
+                // Pin boot shards safely outside the cooldown,
+                // independent of production's 1-hour stamp.
+                shard.activated_at = old_ts;
             }
             // The third shard is "fresh": stamp activated_at to
             // now, simulating a just-activated shard.
@@ -2175,7 +2187,7 @@ mod tests {
             vec![2u16],
             "regression: only shard id 2 (just-stamped) should be \
              within the warmup window; boot shards are stamped \
-             1 hour in the past"
+             200ms in the past (well outside the 100ms cooldown)"
         );
 
         // And evaluate_scaling must still produce ScaleDown

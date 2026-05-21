@@ -74,30 +74,42 @@ async fn parallel_mesh_nodes_bind_to_distinct_ports() {
     // Spawn N_NODES concurrent construction tasks. Each binds to
     // `:0` independently; the OS allocates a distinct port per
     // socket.
+    //
+    // CRITICAL: each task returns the *node*, not just the port.
+    // If we returned only the port (dropping the node — and its
+    // UDP socket — at the end of the spawn closure), the OS would
+    // be free to hand that same port back to a later task. That
+    // is exactly the TOCTOU window this test claims to guard
+    // against, so reproducing it inside the test gave a duplicate-
+    // port flake (e.g. port 52605 reported twice across 32 nodes).
+    // Holding every node alive in `nodes` until after the
+    // distinct-port assertion forces the kernel to keep all 32
+    // ports allocated simultaneously.
     let handles: Vec<_> = (0..N_NODES)
         .map(|_| {
             tokio::spawn(async move {
                 let keypair = EntityKeypair::generate();
-                MeshNode::new(keypair, test_config())
-                    .await
-                    .map(|node| node.local_addr())
+                MeshNode::new(keypair, test_config()).await
             })
         })
         .collect();
 
-    let mut ports: Vec<u16> = Vec::with_capacity(N_NODES);
+    let mut nodes: Vec<MeshNode> = Vec::with_capacity(N_NODES);
     for (i, h) in handles.into_iter().enumerate() {
-        let addr = h
+        let node = h
             .await
             .expect("spawn task panicked")
             .unwrap_or_else(|e| panic!("node {i}: MeshNode::new failed: {e}"));
-        ports.push(addr.port());
+        nodes.push(node);
     }
+
+    let ports: Vec<u16> = nodes.iter().map(|n| n.local_addr().port()).collect();
 
     // Distinct-port property. A HashSet of the collected ports
     // must have exactly N_NODES entries — any collision means the
-    // OS handed us the same port twice, which shouldn't happen on
-    // any platform we support.
+    // OS handed us the same port twice while all 32 sockets are
+    // simultaneously bound, which shouldn't happen on any platform
+    // we support.
     let distinct: HashSet<u16> = ports.iter().copied().collect();
     assert_eq!(
         distinct.len(),
@@ -112,4 +124,7 @@ async fn parallel_mesh_nodes_bind_to_distinct_ports() {
     for (i, p) in ports.iter().enumerate() {
         assert_ne!(*p, 0, "node {i} got port 0; kernel didn't allocate");
     }
+
+    // `nodes` drops here, releasing every bound socket at once.
+    drop(nodes);
 }

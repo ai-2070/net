@@ -2557,4 +2557,248 @@ mod tests {
             PER_SOURCE_CAP,
         );
     }
+
+    // ---------- Acquire rollback paths ----------
+    //
+    // `acquire()` is a chain of independent CAS counters: concurrent
+    // → memory → cost → global RPM → per-source RPM → tokens. If
+    // step N+1 fails the implementation must roll back every counter
+    // it already committed in steps 1..N. A regression here leaks
+    // resources permanently (counters never released) and silently
+    // throttles the enforcer to zero capacity. These tests pin each
+    // rollback branch.
+
+    #[test]
+    fn memory_limit_failure_rolls_back_concurrent() {
+        let envelope = SafetyEnvelope {
+            resource_limits: ResourceEnvelope {
+                max_concurrent: 100,
+                max_memory_gb: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let enforcer = Arc::new(SafetyEnforcer::with_envelope(envelope));
+        let req = SafetyRequest::new();
+        let claim = ResourceClaim::new().with_concurrent(1).with_memory_gb(2);
+
+        // ResourceGuard isn't Debug, so we can't use unwrap_err here.
+        let err = match enforcer.acquire(&req, claim) {
+            Err(e) => e,
+            Ok(_) => panic!("expected memory limit failure"),
+        };
+        assert!(matches!(
+            err,
+            SafetyViolation::ResourceLimitExceeded {
+                resource: ResourceType::Memory,
+                ..
+            }
+        ));
+        // Concurrent must have been rolled back — leaking it would
+        // permanently consume a slot.
+        assert_eq!(enforcer.usage().concurrent, 0);
+        assert_eq!(enforcer.usage().memory_gb, 0);
+    }
+
+    #[test]
+    fn cost_limit_failure_rolls_back_concurrent_and_memory() {
+        let envelope = SafetyEnvelope {
+            resource_limits: ResourceEnvelope {
+                max_concurrent: 100,
+                max_memory_gb: 100,
+                max_cost_per_hour_cents: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let enforcer = Arc::new(SafetyEnforcer::with_envelope(envelope));
+        let req = SafetyRequest::new();
+        let claim = ResourceClaim::new()
+            .with_concurrent(1)
+            .with_memory_gb(1)
+            .with_cost_cents(100);
+
+        let err = match enforcer.acquire(&req, claim) {
+            Err(e) => e,
+            Ok(_) => panic!("expected cost limit failure"),
+        };
+        assert!(matches!(
+            err,
+            SafetyViolation::ResourceLimitExceeded {
+                resource: ResourceType::Cost,
+                ..
+            }
+        ));
+        assert_eq!(enforcer.usage().concurrent, 0);
+        assert_eq!(enforcer.usage().memory_gb, 0);
+        assert_eq!(enforcer.usage().cost_cents_per_hour, 0);
+    }
+
+    #[test]
+    fn per_source_rpm_failure_rolls_back_global_and_resources() {
+        let envelope = SafetyEnvelope {
+            rate_limits: RateEnvelope {
+                global_rpm: 100,
+                per_source_rpm: 1,
+                tokens_per_minute: 1_000_000,
+                burst_multiplier: 1.0,
+            },
+            ..Default::default()
+        };
+        let enforcer = Arc::new(SafetyEnforcer::with_envelope(envelope));
+        let source = make_node_id(11);
+        let req = SafetyRequest::new().with_source(source).with_tokens(10);
+        let claim = ResourceClaim::new().with_concurrent(1).with_memory_gb(1);
+
+        // First acquire from this source succeeds; second trips
+        // per-source RPM after global RPM has been committed.
+        let _guard = enforcer.acquire(&req, claim.clone()).unwrap();
+        let err = match enforcer.acquire(&req, claim) {
+            Err(e) => e,
+            Ok(_) => panic!("expected per-source RPM failure"),
+        };
+        assert!(matches!(
+            err,
+            SafetyViolation::RateLimitExceeded {
+                limit_type: RateLimitType::PerSourceRpm,
+                ..
+            }
+        ));
+
+        // The failed acquire must not leave resource counters
+        // bumped — only the guard from the FIRST acquire holds 1.
+        let usage = enforcer.usage();
+        assert_eq!(usage.concurrent, 1);
+        assert_eq!(usage.memory_gb, 1);
+        // Global RPM counter must also be 1 (only the first
+        // request committed), not 2 — proves global rollback fired.
+        // `requests_per_minute` is the public surface for the
+        // internal `rate_limiter.global_requests` counter.
+        assert_eq!(usage.requests_per_minute, 1);
+    }
+
+    #[test]
+    fn tokens_failure_rolls_back_source_and_global_and_resources() {
+        let envelope = SafetyEnvelope {
+            rate_limits: RateEnvelope {
+                global_rpm: 100,
+                per_source_rpm: 100,
+                tokens_per_minute: 10,
+                burst_multiplier: 1.0,
+            },
+            ..Default::default()
+        };
+        let enforcer = Arc::new(SafetyEnforcer::with_envelope(envelope));
+        let source = make_node_id(22);
+        let req = SafetyRequest::new().with_source(source);
+        // acquire() rate-checks `claim.tokens`, not `req.tokens`.
+        let claim = ResourceClaim::new()
+            .with_concurrent(1)
+            .with_memory_gb(1)
+            .with_tokens(100);
+
+        let err = match enforcer.acquire(&req, claim) {
+            Err(e) => e,
+            Ok(_) => panic!("expected tokens-per-minute failure"),
+        };
+        assert!(matches!(
+            err,
+            SafetyViolation::RateLimitExceeded {
+                limit_type: RateLimitType::TokensPerMinute,
+                ..
+            }
+        ));
+
+        // All five rollbacks must have fired: source RPM, global
+        // RPM, concurrent, memory, cost. We observe global +
+        // resource counters; the source bucket is internal but
+        // gets the same treatment.
+        let usage = enforcer.usage();
+        assert_eq!(usage.concurrent, 0);
+        assert_eq!(usage.memory_gb, 0);
+        assert_eq!(usage.cost_cents_per_hour, 0);
+        assert_eq!(usage.requests_per_minute, 0);
+    }
+
+    // ---------- Content-policy non-block actions ----------
+    //
+    // Block is well-covered. Warn / Log / Redact share a single
+    // outcome (log a Warning audit entry, don't reject) but each
+    // takes a distinct match arm in `check_content_policies` — a
+    // future refactor could collapse them, but until then we want
+    // the per-arm behavior pinned.
+
+    fn content_policy_envelope(action: PolicyAction) -> SafetyEnvelope {
+        SafetyEnvelope {
+            content_policies: vec![ContentPolicy {
+                id: "warn-on-bad".into(),
+                check: ContentCheck::BlockPatterns(vec!["bad".into()]),
+                action,
+                enabled: true,
+            }],
+            audit: AuditConfig {
+                enabled: true,
+                log_success: false,
+                log_blocked: true,
+                log_warnings: true,
+                max_entries: 100,
+                flush_interval_ms: 5000,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn content_policy_warn_logs_warning_without_blocking() {
+        let enforcer = SafetyEnforcer::with_envelope(content_policy_envelope(PolicyAction::Warn));
+        let req = SafetyRequest::new().with_content("this is bad");
+
+        assert!(enforcer.check(&req).is_ok(), "Warn must not block");
+        let warnings: Vec<_> = enforcer
+            .audit_entries(100)
+            .into_iter()
+            .filter(|e| {
+                e.event_type == AuditEventType::ContentPolicyViolation
+                    && e.outcome == AuditOutcome::Warning
+            })
+            .collect();
+        assert!(
+            !warnings.is_empty(),
+            "Warn action must log a Warning-outcome audit entry",
+        );
+    }
+
+    #[test]
+    fn content_policy_log_logs_warning_without_blocking() {
+        let enforcer = SafetyEnforcer::with_envelope(content_policy_envelope(PolicyAction::Log));
+        let req = SafetyRequest::new().with_content("this is bad");
+
+        assert!(enforcer.check(&req).is_ok(), "Log must not block");
+        let warnings: Vec<_> = enforcer
+            .audit_entries(100)
+            .into_iter()
+            .filter(|e| {
+                e.event_type == AuditEventType::ContentPolicyViolation
+                    && e.outcome == AuditOutcome::Warning
+            })
+            .collect();
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn content_policy_redact_logs_warning_without_blocking() {
+        let enforcer = SafetyEnforcer::with_envelope(content_policy_envelope(PolicyAction::Redact));
+        let req = SafetyRequest::new().with_content("this is bad");
+
+        assert!(enforcer.check(&req).is_ok(), "Redact must not block");
+        let warnings: Vec<_> = enforcer
+            .audit_entries(100)
+            .into_iter()
+            .filter(|e| {
+                e.event_type == AuditEventType::ContentPolicyViolation
+                    && e.outcome == AuditOutcome::Warning
+            })
+            .collect();
+        assert!(!warnings.is_empty());
+    }
 }

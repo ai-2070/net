@@ -1749,4 +1749,205 @@ mod tests {
 
         assert_eq!(action.action_count(), 3);
     }
+
+    // ---------- Cooldown and rate-limit gating ----------
+    //
+    // Existing tests cover the happy path: rule matches, action
+    // fires. None exercise the gating that prevents action
+    // execution when a rule is on cooldown or has spent its
+    // rate-limit budget. These branches are load-bearing for any
+    // production rule that throttles itself (alert fatigue, retry
+    // storms) — a regression would silently bypass the throttle.
+
+    #[test]
+    fn cooldown_blocks_action_on_second_match_within_window() {
+        let mut engine = RuleEngine::new();
+        engine
+            .add_rule(
+                Rule::new("cd", "Cooldown rule")
+                    .with_condition(ConditionExpr::Always)
+                    .with_action(Action::Noop)
+                    .with_cooldown(60_000), // 60s — won't elapse in-test
+            )
+            .unwrap();
+
+        // First evaluation executes the action.
+        let r1 = engine.evaluate(&RuleContext::new());
+        assert_eq!(r1.len(), 1);
+        assert!(r1[0].matched);
+        assert!(r1[0].action.is_some());
+
+        // Second evaluation matches but is on cooldown — action
+        // must be None. Pre-fix any regression in
+        // `check_execution_allowed` would let it fire again.
+        let r2 = engine.evaluate(&RuleContext::new());
+        assert_eq!(r2.len(), 1);
+        assert!(r2[0].matched, "rule must still match while gated");
+        assert!(
+            r2[0].action.is_none(),
+            "cooldown must suppress the action, got {:?}",
+            r2[0].action,
+        );
+    }
+
+    #[test]
+    fn rate_limit_blocks_action_after_max_executions() {
+        let mut engine = RuleEngine::new();
+        engine
+            .add_rule(
+                Rule::new("rl", "Rate-limited rule")
+                    .with_condition(ConditionExpr::Always)
+                    .with_action(Action::Noop)
+                    .with_rate_limit(2, 300), // 2 per 5min window
+            )
+            .unwrap();
+
+        // First two evaluations consume the budget.
+        assert!(engine.evaluate(&RuleContext::new())[0].action.is_some());
+        assert!(engine.evaluate(&RuleContext::new())[0].action.is_some());
+
+        // Third matches but rate limit fires.
+        let r3 = engine.evaluate(&RuleContext::new());
+        assert!(r3[0].matched);
+        assert!(
+            r3[0].action.is_none(),
+            "rate limit must suppress the action, got {:?}",
+            r3[0].action,
+        );
+    }
+
+    /// Regression pin for the rate-limit-state hot-reload bug
+    /// noted in `record_execution` (L1271-L1282): pre-fix the
+    /// `execution_count` was incremented for every rule on every
+    /// match, even rules without a rate_limit. Toggling a rule
+    /// from rate-limited → unlimited → rate-limited (same window)
+    /// would carry a stale count and silently block forever.
+    ///
+    /// We pin the fix by verifying that an unlimited rule's
+    /// repeated matches never increment any rate-limit count
+    /// (observable via continuing to fire actions).
+    #[test]
+    fn unlimited_rule_keeps_firing_across_many_evaluations() {
+        let mut engine = RuleEngine::new();
+        engine
+            .add_rule(
+                Rule::new("unl", "Unlimited rule")
+                    .with_condition(ConditionExpr::Always)
+                    .with_action(Action::Noop),
+            )
+            .unwrap();
+
+        for i in 0..50 {
+            let r = engine.evaluate(&RuleContext::new());
+            assert!(
+                r[0].action.is_some(),
+                "unlimited rule must keep firing; blocked at iteration {i}",
+            );
+        }
+    }
+
+    // ---------- evaluate_first vs evaluate ----------
+
+    #[test]
+    fn evaluate_first_returns_first_matching_rule_only() {
+        let mut engine = RuleEngine::new();
+        engine
+            .add_rule(
+                Rule::new("a", "A")
+                    .with_priority(Priority::High)
+                    .with_condition(ConditionExpr::Always)
+                    .with_action(Action::Noop),
+            )
+            .unwrap();
+        engine
+            .add_rule(
+                Rule::new("b", "B")
+                    .with_priority(Priority::Normal)
+                    .with_condition(ConditionExpr::Always)
+                    .with_action(Action::Noop),
+            )
+            .unwrap();
+
+        // Both match but evaluate_first returns one result —
+        // higher-priority rule wins under rules-sorted-by-priority
+        // semantics.
+        let r = engine.evaluate_first(&RuleContext::new());
+        assert!(r.is_some());
+        let r = r.unwrap();
+        assert_eq!(r.rule_id, "a", "highest-priority rule must win");
+        assert!(r.action.is_some());
+    }
+
+    #[test]
+    fn evaluate_first_action_is_none_when_rule_is_rate_limited() {
+        let mut engine = RuleEngine::new();
+        engine
+            .add_rule(
+                Rule::new("rl", "Rate-limited")
+                    .with_condition(ConditionExpr::Always)
+                    .with_action(Action::Noop)
+                    .with_rate_limit(1, 300),
+            )
+            .unwrap();
+
+        assert!(engine
+            .evaluate_first(&RuleContext::new())
+            .unwrap()
+            .action
+            .is_some());
+        let r = engine.evaluate_first(&RuleContext::new()).unwrap();
+        assert!(r.matched);
+        assert!(
+            r.action.is_none(),
+            "evaluate_first must respect rate-limit gating just like evaluate",
+        );
+    }
+
+    // ---------- Action constructor coverage ----------
+
+    #[test]
+    fn action_factory_methods_round_trip() {
+        match Action::set_context("k", serde_json::json!(1)) {
+            Action::SetContext { key, value } => {
+                assert_eq!(key, "k");
+                assert_eq!(value, serde_json::json!(1));
+            }
+            other => panic!("expected SetContext, got {:?}", other),
+        }
+
+        match Action::reject("policy denied", 403) {
+            Action::Reject { reason, code } => {
+                assert_eq!(reason, "policy denied");
+                assert_eq!(code, 403);
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+
+        match Action::redirect_to_tags(vec!["gpu".into(), "fast".into()]) {
+            Action::Redirect {
+                target_node,
+                target_tags,
+            } => {
+                assert!(target_node.is_none());
+                assert_eq!(target_tags, vec!["gpu".to_string(), "fast".to_string()]);
+            }
+            other => panic!("expected Redirect, got {:?}", other),
+        }
+    }
+
+    // ---------- RuleContext::from_value ----------
+
+    #[test]
+    fn rule_context_from_value_loads_object_keys() {
+        let ctx = RuleContext::from_value(serde_json::json!({
+            "user": "alice",
+            "count": 42,
+        }));
+        assert_eq!(ctx.get_field("user"), serde_json::json!("alice"));
+        assert_eq!(ctx.get_field("count"), serde_json::json!(42));
+
+        // Non-object inputs produce an empty context (no panic).
+        let ctx = RuleContext::from_value(serde_json::json!("not-an-object"));
+        assert_eq!(ctx.get_field("anything"), serde_json::json!(null));
+    }
 }

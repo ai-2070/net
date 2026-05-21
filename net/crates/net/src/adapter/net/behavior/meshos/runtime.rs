@@ -913,6 +913,74 @@ mod tests {
         }
     }
 
+    // ---------- MeshOsRuntimeBuilder coverage ----------
+    //
+    // Existing tests construct the runtime via the bare
+    // `MeshOsRuntime::start` API. The fluent builder
+    // (`MeshOsRuntimeBuilder`) wraps the same start path and
+    // adds opt-in extension points (probe / scheduler registries,
+    // shared daemon registry, control sink, admin verifier,
+    // audit / log / failure appenders, migration aborter /
+    // snapshot source). None of those wiring points were
+    // exercised — a regression that, say, dropped a passed-in
+    // daemon registry on the floor would slip through.
+
+    #[tokio::test]
+    async fn builder_new_and_build_and_start_run_the_loop() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let rt = MeshOsRuntimeBuilder::new(fast_cfg(), Arc::clone(&dispatcher)).build_and_start();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stats = rt.shutdown().await.expect("clean shutdown");
+        assert!(
+            stats.reconcile_passes >= 1,
+            "builder-started runtime must run the reconcile loop; \
+             got {} passes",
+            stats.reconcile_passes,
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_with_daemon_registry_shares_the_supplied_instance() {
+        // Wire a caller-owned DaemonRegistry through the builder
+        // and confirm the runtime didn't construct its own — the
+        // `Arc::strong_count` is the simplest observable that
+        // captures sharing. The runtime takes a clone (≥ 2 after
+        // start); construction of its own private registry would
+        // leave our caller-owned Arc at strong_count == 1.
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let registry = Arc::new(DaemonRegistry::new());
+        let pre_count = Arc::strong_count(&registry);
+
+        let rt = MeshOsRuntimeBuilder::new(fast_cfg(), Arc::clone(&dispatcher))
+            .with_daemon_registry(Arc::clone(&registry))
+            .build_and_start();
+
+        assert!(
+            Arc::strong_count(&registry) > pre_count,
+            "runtime should hold a clone of the supplied registry",
+        );
+
+        let _ = rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn builder_with_probe_and_scheduler_registries_run_the_loop() {
+        // Pass non-default registry instances through the builder
+        // and confirm the runtime accepts them and starts cleanly.
+        // We don't probe-the-probes here (separate tests in
+        // event_loop already pin probe behavior) — the test pins
+        // that the builder hands the registries to the runtime
+        // without panicking or rejecting them.
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let rt = MeshOsRuntimeBuilder::new(fast_cfg(), Arc::clone(&dispatcher))
+            .with_probe_registry(ProbeRegistry::new())
+            .with_scheduler_registry(SchedulerRegistry::new())
+            .build_and_start();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let stats = rt.shutdown().await.expect("clean shutdown");
+        assert!(stats.reconcile_passes >= 1);
+    }
+
     #[tokio::test]
     async fn dropping_runtime_without_shutdown_aborts_tasks() {
         // Regression for I5: dropping the runtime without

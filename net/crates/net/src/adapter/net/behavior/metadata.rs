@@ -2055,4 +2055,134 @@ mod tests {
         node.validate_bounds()
             .expect("at-boundary nested strings must validate");
     }
+
+    // ---------- Pure-function coverage ----------
+    //
+    // Existing tests construct nodes and run queries but never
+    // call these accessors. Each is a tiny pure function; the
+    // risk if they regress is silent (e.g., a routing scheduler
+    // suddenly preferring Draining over Online).
+
+    #[test]
+    fn region_zone_returns_inner_zone_for_every_variant() {
+        assert_eq!(Region::NorthAmerica("us-east".into()).zone(), "us-east");
+        assert_eq!(Region::SouthAmerica("br-sp".into()).zone(), "br-sp");
+        assert_eq!(Region::Europe("eu-west".into()).zone(), "eu-west");
+        assert_eq!(Region::AsiaPacific("ap-1".into()).zone(), "ap-1");
+        assert_eq!(Region::MiddleEast("me-1".into()).zone(), "me-1");
+        assert_eq!(Region::Africa("af-1".into()).zone(), "af-1");
+        assert_eq!(Region::Custom("custom-z".into()).zone(), "custom-z");
+    }
+
+    #[test]
+    fn node_status_routing_priority_orders_variants_correctly() {
+        // Online must outrank everything; Offline/ShuttingDown/
+        // Maintenance must be the lowest tier. A regression that
+        // swaps any pair here would silently mis-route traffic.
+        assert!(NodeStatus::Online.routing_priority() > NodeStatus::Degraded.routing_priority());
+        assert!(NodeStatus::Degraded.routing_priority() > NodeStatus::Starting.routing_priority());
+        assert!(NodeStatus::Starting.routing_priority() > NodeStatus::Draining.routing_priority());
+        assert_eq!(NodeStatus::Offline.routing_priority(), 0);
+        assert_eq!(NodeStatus::ShuttingDown.routing_priority(), 0);
+        assert_eq!(NodeStatus::Maintenance.routing_priority(), 0);
+        assert_eq!(NodeStatus::Online.routing_priority(), 5);
+    }
+
+    #[test]
+    fn average_latency_handles_empty_and_populated() {
+        let mut topo = TopologyHints::new(NetworkTier::Consumer);
+        assert!(topo.average_latency().is_none(), "empty must be None");
+
+        topo.update_latency(make_node_id(1), 100);
+        topo.update_latency(make_node_id(2), 200);
+        topo.update_latency(make_node_id(3), 300);
+        assert_eq!(topo.average_latency(), Some(200.0));
+    }
+
+    #[test]
+    fn touch_advances_version_and_updated_at() {
+        let mut node = NodeMetadata::new(make_node_id(1));
+        let v0 = node.version;
+        let t0 = node.updated_at;
+        // Tiny sleep so wall-clock ms tick — `updated_at` is ms-resolution.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        node.touch();
+        assert_eq!(node.version, v0 + 1);
+        assert!(
+            node.updated_at >= t0,
+            "updated_at must not go backward (got {} from {t0})",
+            node.updated_at,
+        );
+    }
+
+    #[test]
+    fn is_stale_compares_age_against_max_age() {
+        let mut node = NodeMetadata::new(make_node_id(1));
+        // Force updated_at into the past so age() reports a known
+        // gap regardless of wall-clock drift on the test host.
+        node.updated_at = node.updated_at.saturating_sub(60_000);
+        assert!(node.is_stale(Duration::from_secs(10)));
+        assert!(!node.is_stale(Duration::from_secs(3600)));
+    }
+
+    // ---------- validate_bounds error branches ----------
+
+    #[test]
+    fn validate_bounds_rejects_oversized_owner() {
+        let mut node = NodeMetadata::new(make_node_id(1));
+        node.owner = Some("o".repeat(MAX_METADATA_STRING_LEN + 1));
+        let err = node.validate_bounds().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("owner"), "error must name 'owner': {msg}");
+    }
+
+    #[test]
+    fn validate_bounds_rejects_too_many_tags() {
+        let mut node = NodeMetadata::new(make_node_id(1));
+        for i in 0..MAX_METADATA_TAGS + 1 {
+            node.tags.insert(format!("t{i}"));
+        }
+        assert!(matches!(
+            node.validate_bounds(),
+            Err(MetadataError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn validate_bounds_rejects_oversized_role() {
+        let mut node = NodeMetadata::new(make_node_id(1));
+        node.roles.insert("r".repeat(MAX_METADATA_STRING_LEN + 1));
+        let err = node.validate_bounds().unwrap_err();
+        assert!(format!("{}", err).contains("role"));
+    }
+
+    #[test]
+    fn validate_bounds_rejects_oversized_custom_map_entries() {
+        let mut node = NodeMetadata::new(make_node_id(1));
+
+        // Oversized key.
+        node.custom
+            .insert("k".repeat(MAX_METADATA_STRING_LEN + 1), "v".into());
+        let err = node.validate_bounds().unwrap_err();
+        assert!(format!("{}", err).contains("custom key"));
+
+        // Oversized value.
+        node.custom.clear();
+        node.custom
+            .insert("k".into(), "v".repeat(MAX_METADATA_STRING_LEN + 1));
+        let err = node.validate_bounds().unwrap_err();
+        assert!(format!("{}", err).contains("custom value"));
+    }
+
+    #[test]
+    fn validate_bounds_rejects_too_many_custom_entries() {
+        let mut node = NodeMetadata::new(make_node_id(1));
+        for i in 0..MAX_METADATA_CUSTOM_ENTRIES + 1 {
+            node.custom.insert(format!("k{i}"), "v".into());
+        }
+        assert!(matches!(
+            node.validate_bounds(),
+            Err(MetadataError::Invalid(_))
+        ));
+    }
 }

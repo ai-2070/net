@@ -2337,4 +2337,225 @@ mod tests {
             );
         }
     }
+
+    // ---------- Validation error-branch coverage ----------
+    //
+    // The existing happy-path tests cover the success arms of
+    // `SchemaType::validate`. These exercise the negative branches
+    // that codecov flagged as uncovered: `Number` min/max (distinct
+    // from `Integer`), every type-mismatch arm, string length /
+    // pattern errors, array length / uniqueness errors, object
+    // property errors, and the `Enum` / `AnyOf` / `Ref` arms.
+
+    #[test]
+    fn number_variant_range_and_type_errors() {
+        let schema = SchemaType::Number {
+            minimum: Some(0.0),
+            maximum: Some(1.0),
+        };
+        assert!(schema.validate(&serde_json::json!(0.5)).is_ok());
+        assert!(matches!(
+            schema.validate(&serde_json::json!(-0.1)),
+            Err(ValidationError::RangeError { .. })
+        ));
+        assert!(matches!(
+            schema.validate(&serde_json::json!(1.5)),
+            Err(ValidationError::RangeError { .. })
+        ));
+        assert!(matches!(
+            schema.validate(&serde_json::json!("nope")),
+            Err(ValidationError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn string_length_pattern_and_type_errors() {
+        let schema = SchemaType::String {
+            min_length: Some(2),
+            max_length: Some(5),
+            pattern: Some("ab".into()),
+            format: None,
+        };
+        assert!(schema.validate(&serde_json::json!("xab")).is_ok());
+        assert!(matches!(
+            schema.validate(&serde_json::json!("a")),
+            Err(ValidationError::LengthError { .. })
+        ));
+        assert!(matches!(
+            schema.validate(&serde_json::json!("abcdef")),
+            Err(ValidationError::LengthError { .. })
+        ));
+        assert!(matches!(
+            schema.validate(&serde_json::json!("xyz")),
+            Err(ValidationError::PatternMismatch { .. })
+        ));
+        assert!(matches!(
+            schema.validate(&serde_json::json!(42)),
+            Err(ValidationError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn array_length_uniqueness_and_type_errors() {
+        let schema = SchemaType::Array {
+            items: Box::new(SchemaType::integer()),
+            min_items: Some(2),
+            max_items: Some(3),
+            unique_items: true,
+        };
+        assert!(schema.validate(&serde_json::json!([1, 2])).is_ok());
+        assert!(matches!(
+            schema.validate(&serde_json::json!([1])),
+            Err(ValidationError::LengthError { .. })
+        ));
+        assert!(matches!(
+            schema.validate(&serde_json::json!([1, 2, 3, 4])),
+            Err(ValidationError::LengthError { .. })
+        ));
+        assert!(matches!(
+            schema.validate(&serde_json::json!([1, 1, 2])),
+            Err(ValidationError::DuplicateItems)
+        ));
+        assert!(matches!(
+            schema.validate(&serde_json::json!([1, "two", 3])),
+            Err(ValidationError::ArrayItemError { .. })
+        ));
+        assert!(matches!(
+            schema.validate(&serde_json::json!("not-an-array")),
+            Err(ValidationError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn object_property_unknown_and_type_errors() {
+        let schema = SchemaType::object()
+            .with_property("name", SchemaType::string())
+            .with_property("age", SchemaType::integer())
+            .with_required("name");
+
+        // PropertyError: known property fails its own schema.
+        let err = schema
+            .validate(&serde_json::json!({"name": "Alice", "age": "old"}))
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::PropertyError { .. }));
+
+        // UnknownProperty: requires additional_properties=false, which
+        // the `SchemaType::object()` builder doesn't expose — construct
+        // directly to flip it.
+        let strict = SchemaType::Object {
+            properties: {
+                let mut m = HashMap::new();
+                m.insert("name".into(), SchemaType::string());
+                m
+            },
+            required: vec!["name".into()],
+            additional_properties: false,
+        };
+        let err = strict
+            .validate(&serde_json::json!({"name": "Alice", "extra": 1}))
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::UnknownProperty { .. }));
+
+        // TypeMismatch: object schema receives non-object.
+        assert!(matches!(
+            schema.validate(&serde_json::json!([1, 2, 3])),
+            Err(ValidationError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn enum_anyof_and_ref_arms() {
+        // Enum miss.
+        let schema = SchemaType::Enum {
+            values: vec![serde_json::json!("a"), serde_json::json!("b")],
+        };
+        assert!(schema.validate(&serde_json::json!("a")).is_ok());
+        assert!(matches!(
+            schema.validate(&serde_json::json!("c")),
+            Err(ValidationError::EnumMismatch { .. })
+        ));
+
+        // AnyOf success on second arm + AnyOfFailed when all reject.
+        let any = SchemaType::AnyOf {
+            schemas: vec![SchemaType::integer(), SchemaType::string()],
+        };
+        assert!(any.validate(&serde_json::json!("ok")).is_ok());
+        assert!(any.validate(&serde_json::json!(42)).is_ok());
+        assert!(matches!(
+            any.validate(&serde_json::json!(true)),
+            Err(ValidationError::AnyOfFailed { .. })
+        ));
+
+        // Ref arm at validator level returns Ok — resolution
+        // is a registry-level concern (see L699-702).
+        let r = SchemaType::Ref {
+            schema_ref: "#/definitions/X".into(),
+        };
+        assert!(r.validate(&serde_json::json!(null)).is_ok());
+
+        // Any matches anything.
+        assert!(SchemaType::Any
+            .validate(&serde_json::json!({"x":1}))
+            .is_ok());
+    }
+
+    // ---------- ApiQuery negative-branch coverage ----------
+
+    #[test]
+    fn query_matches_returns_false_on_each_filter_miss() {
+        let schema = ApiSchema::new("svc", ApiVersion::new(1, 0, 0))
+            .with_tag("gpu")
+            .add_endpoint(ApiEndpoint::new("/run", ApiMethod::Post));
+        let ann = ApiAnnouncement::new(make_node_id(1), vec![schema]);
+
+        // Wrong api name.
+        let q = ApiQuery::new().with_api("other");
+        assert_eq!(registry_match_count(&ann, &q), 0);
+
+        // Wrong tag.
+        let q = ApiQuery::new().with_tag("cpu");
+        assert_eq!(registry_match_count(&ann, &q), 0);
+
+        // Wrong endpoint path.
+        let q = ApiQuery::new().with_endpoint("/missing");
+        assert_eq!(registry_match_count(&ann, &q), 0);
+
+        // Wrong method on existing path.
+        let q = ApiQuery::new()
+            .with_endpoint("/run")
+            .with_method(ApiMethod::Get);
+        assert_eq!(registry_match_count(&ann, &q), 0);
+    }
+
+    /// Helper: register an announcement and count matches against a query.
+    /// Keeps the test focused on the matcher, not registry plumbing.
+    fn registry_match_count(ann: &ApiAnnouncement, q: &ApiQuery) -> usize {
+        let r = ApiRegistry::new();
+        r.register(ann.clone()).unwrap();
+        r.query(q).len()
+    }
+
+    // ---------- Expired-entry filtering ----------
+
+    #[test]
+    fn find_by_endpoint_skips_expired_entries() {
+        let registry = ApiRegistry::new();
+        let schema = ApiSchema::new("svc", ApiVersion::new(1, 0, 0))
+            .add_endpoint(ApiEndpoint::new("/run", ApiMethod::Post));
+
+        // Stamp `timestamp` at the Unix epoch with a short ttl so
+        // `is_expired()` returns true regardless of wall-clock
+        // resolution. A previous version slept 5ms past a
+        // `with_ttl(0)` announcement — flaky on loaded CI boxes
+        // where the wall clock can read backward between
+        // `ApiAnnouncement::new`'s SystemTime call and the
+        // `is_expired()` check.
+        let mut ann = ApiAnnouncement::new(make_node_id(7), vec![schema]).with_ttl(1);
+        ann.timestamp = 0;
+        registry.register(ann).unwrap();
+
+        assert!(registry
+            .find_by_endpoint("/run", ApiMethod::Post)
+            .is_empty());
+    }
 }

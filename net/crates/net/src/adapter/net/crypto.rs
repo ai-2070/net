@@ -1431,4 +1431,100 @@ mod tests {
             "u64::MAX - 1 from rx_counter=0 must reject at is_valid (past MAX_FORWARD)"
         );
     }
+
+    // ---------- Debug redaction contract ----------
+    //
+    // The Debug impls on SessionKeys and StaticKeypair MUST omit
+    // the key material — a regression that drops the redaction
+    // leaks the long-lived static private key or per-session AEAD
+    // keys to any tracing line that debug-prints these structs
+    // (a common pattern: `tracing::debug!(?session, ...)`). The
+    // tests below pin the contract by constructing each struct
+    // with a recognizable byte pattern and asserting the Debug
+    // output does NOT contain that pattern's hex.
+
+    /// Hex-encode bytes the same way a naive default Debug impl
+    /// would surface them, so we can scan the formatted output
+    /// for accidental leaks.
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// Assert that `dbg_output` doesn't contain the hex encoding
+    /// of `secret`. Catches naive Debug derives that surface the
+    /// raw byte array.
+    fn assert_no_leak(dbg_output: &str, secret: &[u8], label: &str) {
+        let hex = hex_of(secret).to_lowercase();
+        assert!(
+            !dbg_output.to_lowercase().contains(&hex),
+            "{label} bytes leaked into Debug output: {dbg_output}",
+        );
+    }
+
+    #[test]
+    fn session_keys_debug_redacts_tx_and_rx_keys() {
+        let tx_secret = [0xAB; 32];
+        let rx_secret = [0xCD; 32];
+        let keys = SessionKeys {
+            tx_key: tx_secret,
+            rx_key: rx_secret,
+            session_id: 0x1234_5678_DEAD_BEEF,
+            remote_static_pub: [0x11; 32],
+        };
+        let s = format!("{:?}", keys);
+
+        assert!(
+            s.contains("[REDACTED]"),
+            "SessionKeys Debug must include [REDACTED]; got: {s}",
+        );
+        assert_no_leak(&s, &tx_secret, "tx_key");
+        assert_no_leak(&s, &rx_secret, "rx_key");
+        // Sanity: session_id (non-secret) is exposed in the
+        // Debug output. The exact decimal/hex format is the
+        // formatter's choice; we only assert that *some*
+        // session_id field appears in the struct dump.
+        assert!(s.contains("session_id"));
+    }
+
+    #[test]
+    fn static_keypair_debug_redacts_private_key() {
+        let private = [0x77; 32];
+        let public = [0x22; 32];
+        let kp = StaticKeypair { private, public };
+        let s = format!("{:?}", kp);
+
+        assert!(
+            s.contains("[REDACTED]"),
+            "StaticKeypair Debug must include [REDACTED]; got: {s}",
+        );
+        assert_no_leak(&s, &private, "private key");
+        // The public key is not secret and should be visible.
+        assert!(
+            s.to_lowercase().contains(&hex_of(&public).to_lowercase()),
+            "public key should be visible in Debug; got: {s}",
+        );
+    }
+
+    // ---------- CryptoError Display ----------
+
+    #[test]
+    fn crypto_error_display_covers_every_variant() {
+        assert_eq!(
+            format!("{}", CryptoError::Handshake("bad msg1".into())),
+            "handshake error: bad msg1"
+        );
+        assert_eq!(
+            format!("{}", CryptoError::Encryption("tag mismatch".into())),
+            "encryption error: tag mismatch"
+        );
+        assert_eq!(
+            format!("{}", CryptoError::Decryption("auth fail".into())),
+            "decryption error: auth fail"
+        );
+        assert_eq!(
+            format!("{}", CryptoError::InvalidKey("zero key".into())),
+            "invalid key: zero key"
+        );
+        assert_eq!(format!("{}", CryptoError::InvalidNonce), "invalid nonce");
+    }
 }

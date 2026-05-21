@@ -1470,10 +1470,19 @@ mod tests {
         assert!(graph.path_to(&y).is_some());
 
         // Backdate both edges so the sweep finds them stale.
+        // `checked_sub` avoids the overflow panic that fires on
+        // hosts with system uptime < the subtracted duration
+        // (Windows Instant is bounded by boot). Pair a short
+        // backdate (200ms) with a tighter sweep threshold (50ms)
+        // so the same invariant — "stale edges get swept" —
+        // holds without depending on hour-scale uptime.
+        let stale_ts = Instant::now()
+            .checked_sub(Duration::from_millis(200))
+            .expect("test host uptime should exceed 200ms");
         for mut entry in graph.edges.iter_mut() {
-            entry.last_updated = Instant::now() - Duration::from_secs(3600);
+            entry.last_updated = stale_ts;
         }
-        let removed = graph.sweep_stale_edges(Duration::from_secs(60));
+        let removed = graph.sweep_stale_edges(Duration::from_millis(50));
         assert_eq!(removed, 2, "both synthetic edges should be swept");
         assert!(graph.path_to(&y).is_none());
     }
