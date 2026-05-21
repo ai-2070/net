@@ -3814,6 +3814,190 @@ mod tests {
         );
     }
 
+    /// The lossy-shutdown reconciliation at L1615-L1635 has TWO
+    /// arms after the deadline-snapshot fires:
+    ///
+    ///   - `actual_drops > 0` → bump `events_dropped`
+    ///     (already exercised by the deadline path running with
+    ///     real producers that never recover)
+    ///   - `actual_drops == 0` → clear the eager
+    ///     `shutdown_was_lossy = true` because the drain caught
+    ///     up to every stranded ingest
+    ///
+    /// The second arm is the false-positive-alert fix: pre-fix,
+    /// the `was_lossy` flag stayed `true` against
+    /// `events_dropped == 0` for any deadline-triggered shutdown
+    /// whose final drain happened to catch up — operator
+    /// dashboards alerting on `was_lossy && dropped == 0` saw
+    /// false positives.
+    ///
+    /// We pin the clear-flag arm by:
+    ///   1. Manually staging `in_flight_ingests = 1` so the
+    ///      shutdown spin loop sees pending work.
+    ///   2. Using `tokio::time::advance(6s)` to force the
+    ///      hardcoded 5-second deadline (the comments at L1399
+    ///      and L1725 confirm the deadline uses
+    ///      `tokio::time::Instant` precisely so paused-time
+    ///      tests can virtualize it).
+    ///   3. Simulating the stranded producer completing AFTER
+    ///      the deadline snapshot: bump `events_ingested += 1`
+    ///      and drop the in-flight counter back to 0. The
+    ///      post-drain reconciliation reads
+    ///      `post_deadline_ingests = 1 - 0 = 1 >= stranded = 1`
+    ///      so `actual_drops == 0` and the arm clears
+    ///      `shutdown_was_lossy`.
+    #[tokio::test(start_paused = true)]
+    async fn lossy_shutdown_reconciliation_clears_was_lossy_when_drain_catches_up() {
+        let config = EventBusConfig::builder()
+            .num_shards(1)
+            .ring_buffer_capacity(1024)
+            .without_scaling()
+            .build()
+            .unwrap();
+        let bus = Arc::new(
+            EventBus::new_with_adapter(config, Box::new(crate::adapter::NoopAdapter::new()))
+                .await
+                .unwrap(),
+        );
+
+        // Stage one "stranded" in-flight ingest. Real producers
+        // would have incremented this via try_enter_ingest and
+        // be mid-call to `shard_manager.ingest`; we manually
+        // hold the counter at 1 for the duration of the
+        // deadline-window.
+        bus.in_flight_ingests
+            .fetch_add(1, AtomicOrdering::SeqCst);
+
+        // Spawn shutdown — it'll enter the in-flight spin loop
+        // and park on `tokio::time::sleep(1ms)` until time
+        // advances.
+        let bus_for_shutdown = Arc::clone(&bus);
+        let shutdown_task =
+            tokio::spawn(async move { bus_for_shutdown.shutdown_via_ref().await });
+
+        // Yield enough times for the shutdown task to enter the
+        // spin loop. With paused time, the spin's 1ms sleep
+        // blocks until we advance.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance past the 5s deadline. The next loop iteration
+        // observes the deadline, captures `(stranded=1,
+        // ingested=0, dispatched=0)`, sets `was_lossy = true`,
+        // and breaks.
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // The eager-set was_lossy flag is visible now.
+        assert!(
+            bus.stats
+                .shutdown_was_lossy
+                .load(AtomicOrdering::Acquire),
+            "deadline must have set was_lossy=true (eagerly)",
+        );
+
+        // Now simulate the "stranded" producer completing AFTER
+        // the deadline: bump events_ingested and release the
+        // in-flight counter. Order matters — events_ingested
+        // must visibly advance before the post-drain
+        // reconciliation reads it.
+        bus.stats
+            .events_ingested
+            .fetch_add(1, AtomicOrdering::Release);
+        bus.in_flight_ingests
+            .fetch_sub(1, AtomicOrdering::SeqCst);
+
+        // Let shutdown finish — its post-drain reconciliation
+        // now reads ingested_after=1, post_deadline_ingests=1,
+        // actual_drops=stranded(1)-1=0 → clears was_lossy.
+        let _ = shutdown_task.await.unwrap();
+
+        assert!(
+            !bus.stats
+                .shutdown_was_lossy
+                .load(AtomicOrdering::Acquire),
+            "reconciliation must clear was_lossy when drain catches up to every stranded ingest \
+             (post_deadline_ingests >= stranded → actual_drops == 0)",
+        );
+        // And events_dropped must NOT have been bumped — the
+        // whole point of the reconciliation arm is that no event
+        // was actually lost.
+        assert_eq!(
+            bus.stats.events_dropped.load(AtomicOrdering::Acquire),
+            0,
+            "no events were actually dropped — reconciliation must not bump events_dropped",
+        );
+    }
+
+    /// Companion to `lossy_shutdown_reconciliation_clears_was_lossy_*`:
+    /// pins the OTHER arm of the same if/else at L1615-L1619.
+    /// When drain does NOT catch up (post_deadline_ingests <
+    /// stranded), `actual_drops > 0` and `events_dropped` is
+    /// bumped. The `was_lossy = true` flag set eagerly before the
+    /// reconciliation stays true here — pre-fix the same code
+    /// path bumped events_dropped += stranded EAGERLY *and*
+    /// counted the same events as ingested, breaking the
+    /// `ingested == dispatched + dropped` invariant.
+    #[tokio::test(start_paused = true)]
+    async fn lossy_shutdown_reconciliation_bumps_events_dropped_when_drain_does_not_catch_up() {
+        let config = EventBusConfig::builder()
+            .num_shards(1)
+            .ring_buffer_capacity(1024)
+            .without_scaling()
+            .build()
+            .unwrap();
+        let bus = Arc::new(
+            EventBus::new_with_adapter(config, Box::new(crate::adapter::NoopAdapter::new()))
+                .await
+                .unwrap(),
+        );
+
+        // Stage two stranded ingests so the actual_drops count
+        // is meaningful (not just 0 vs 1).
+        bus.in_flight_ingests
+            .fetch_add(2, AtomicOrdering::SeqCst);
+
+        let bus_for_shutdown = Arc::clone(&bus);
+        let shutdown_task =
+            tokio::spawn(async move { bus_for_shutdown.shutdown_via_ref().await });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Drop the in-flight counter to 0 so subsequent shutdown
+        // bookkeeping doesn't see phantom in-flight work, but do
+        // NOT bump events_ingested — the producers never
+        // "completed," so the reconciliation must classify them
+        // as drops.
+        bus.in_flight_ingests
+            .fetch_sub(2, AtomicOrdering::SeqCst);
+
+        let _ = shutdown_task.await.unwrap();
+
+        assert!(
+            bus.stats
+                .shutdown_was_lossy
+                .load(AtomicOrdering::Acquire),
+            "was_lossy must stay true when drain did not catch up",
+        );
+        // stranded=2, post_deadline_ingests=0, actual_drops=2.
+        // We don't pin == 2 exactly because the "known under-count
+        // window" doc'd at L1595-L1614 acknowledges a ±1 bias
+        // under racy interleavings; the floor is what matters.
+        assert!(
+            bus.stats.events_dropped.load(AtomicOrdering::Acquire) >= 1,
+            "events_dropped must reflect at least one stranded ingest",
+        );
+    }
+
     /// `EventBus::new_with_adapter` must surface a `Fatal` error
     /// — naming the configured path — when `producer_nonce_path`
     /// points at a location the runtime can't read or create. The
