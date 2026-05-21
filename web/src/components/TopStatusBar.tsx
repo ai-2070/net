@@ -41,8 +41,8 @@ export function TopStatusBar({ version, codename, buildDate, sha }: RepoInfo) {
       <span className="hidden md:flex">
         EVT/SEC: <b className="text-ink font-semibold">{evt}</b>
       </span>
-      <span className="text-ink-faint mx-3">│</span>
-      <span>
+      <span className="hidden md:flex text-ink-faint mx-3">│</span>
+      <span className="hidden md:flex">
         P50: <b className="text-ink font-semibold">{p50}</b>
       </span>
       <div className="ml-auto hidden md:flex gap-4">
