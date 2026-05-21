@@ -1,0 +1,34 @@
+net/crates/net/docs/performance/net-crypto-session-reliability-analysis.md
+  s_f930dae9b8bbc1::t_772b0f4a2045fe 9-17
+net/crates/net/src/adapter/net/session.rs
+  s_f930dae9b8bbc1::t_b116b87b88773d 747-754
+net/crates/net/src/adapter/net/mod.rs
+  s_f930dae9b8bbc1::t_b81b4e5be88ead 655
+  s_f930dae9b8bbc1::t_38e6a6739e1e28 703-706,713-714,727
+net/crates/net/src/adapter/net/mesh.rs
+  s_f930dae9b8bbc1::t_cd8edc8a5fd270 3376
+  s_f930dae9b8bbc1::t_993526dd517e77 3387-3393,3400-3401
+  s_f930dae9b8bbc1::t_022a95c1444031 3440,3575,3625,3665,3692,3717,3757,3793,3884,4009
+  s_f930dae9b8bbc1::t_9401e14249cc85 2951
+  s_f930dae9b8bbc1::t_455a3ee785bb84 3057
+net/crates/net/src/adapter/net/crypto.rs
+  s_f930dae9b8bbc1::t_fb954984d9d66a 992-1091
+  s_f930dae9b8bbc1::t_4d5d49d0f55826 726-802
+  s_f930dae9b8bbc1::t_d45f8429a15364 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "4884818d3254c4951a0d0b23354860c720c564e7",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
