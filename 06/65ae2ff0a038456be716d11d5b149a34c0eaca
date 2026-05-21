@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/router.rs
+  s_f930dae9b8bbc1::t_426cb7e5e5c391 552-576,580
+net/crates/net/docs/performance/net-perf-analysis.md
+  s_f930dae9b8bbc1::t_c35df148ca4dc6 24
+net/crates/net/src/adapter/net/route.rs
+  s_f930dae9b8bbc1::t_960ee2cc096aea 225-254
+  s_f930dae9b8bbc1::t_017d925a730cf2 803-842
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "0665ae2ff0a038456be716d11d5b149a34c0eaca",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
