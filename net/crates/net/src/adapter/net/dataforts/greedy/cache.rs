@@ -123,6 +123,17 @@ pub struct GreedyCacheRegistry {
     /// LRU index. Leftmost = smallest `lru_pos` = least-recently
     /// touched channel.
     lru: BTreeMap<u64, ChannelName>,
+    /// Reverse index from `origin_hash` to the count of cached
+    /// entries claiming that origin. Per dataforts perf #176, the
+    /// colocation gate's per-event `contains_origin` lookup
+    /// collapses from O(N) `entries.values().any(...)` to a
+    /// single O(1) `origin_counts.contains_key(...)`. Maintained
+    /// in lockstep with the entry-side `origin_hash` field by
+    /// `set_origin_hash` (add new, remove old) and `evict`
+    /// (remove the evicted entry's contribution). Origin 0 is the
+    /// sentinel "no origin observed yet" — never indexed (the
+    /// public API already special-cases hash 0 to false).
+    origin_counts: HashMap<u64, usize>,
     /// Next LRU position to assign. Monotonic across upserts +
     /// touches; saturating to `u64::MAX` would mean ~`u64::MAX`
     /// touches, which is unreachable in any realistic deployment.
@@ -137,9 +148,38 @@ impl GreedyCacheRegistry {
         Self {
             entries: HashMap::new(),
             lru: BTreeMap::new(),
+            origin_counts: HashMap::new(),
             next_lru_pos: 0,
             total_bytes: 0,
             total_cap_bytes,
+        }
+    }
+
+    /// Bump the reverse-index entry for `hash`. No-op on the
+    /// sentinel `0` so `contains_origin(0)` stays consistent with
+    /// the public guard.
+    fn add_origin(&mut self, hash: u64) {
+        if hash == 0 {
+            return;
+        }
+        *self.origin_counts.entry(hash).or_insert(0) += 1;
+    }
+
+    /// Drop one reference to `hash` in the reverse index, removing
+    /// the key when the count hits zero so `contains_origin`'s
+    /// `contains_key` walk stays cheap. Safe to call with hashes
+    /// that aren't in the index — the `Occupied` arm short-circuits.
+    fn remove_origin(&mut self, hash: u64) {
+        if hash == 0 {
+            return;
+        }
+        use std::collections::hash_map::Entry;
+        if let Entry::Occupied(mut e) = self.origin_counts.entry(hash) {
+            let v = e.get_mut();
+            *v -= 1;
+            if *v == 0 {
+                e.remove();
+            }
         }
     }
 
@@ -200,14 +240,15 @@ impl GreedyCacheRegistry {
     /// True iff any cached entry records `origin_hash` as its
     /// chain identity. Used by the colocation gate to resolve
     /// `metadata.colocate-with[-strict]` hints against locally-held
-    /// chains. O(n) over cached channels — colocation hints are
-    /// expected to be sparse, but for very large caches a future
-    /// slice may want a reverse index.
+    /// chains. O(1) via the `origin_counts` reverse index per
+    /// dataforts perf #176 — pre-fix this was an
+    /// `entries.values().any(...)` linear scan, called on every
+    /// admission decision that carried a colocation hint.
     pub fn contains_origin(&self, origin_hash: u64) -> bool {
         if origin_hash == 0 {
             return false;
         }
-        self.entries.values().any(|e| e.origin_hash == origin_hash)
+        self.origin_counts.contains_key(&origin_hash)
     }
 
     /// Iterate over cached channel names.
@@ -280,7 +321,16 @@ impl GreedyCacheRegistry {
     /// No-op if the channel isn't registered.
     pub fn set_origin_hash(&mut self, channel: &ChannelName, origin_hash: u64) {
         if let Some(entry) = self.entries.get_mut(channel) {
+            let prev = entry.origin_hash;
             entry.origin_hash = origin_hash;
+            if prev != origin_hash {
+                // Keep the reverse index aligned with the entry
+                // field. Drop the old contribution before adding
+                // the new one so a `prev == new` path (filtered
+                // above) and a stale-bookkeeping path can't drift.
+                self.remove_origin(prev);
+                self.add_origin(origin_hash);
+            }
         }
     }
 
@@ -343,6 +393,12 @@ impl GreedyCacheRegistry {
         let entry = self.entries.remove(channel)?;
         self.lru.remove(&entry.lru_pos);
         self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+        // Drop the entry's reverse-index contribution per
+        // dataforts perf #176 — keeps `origin_counts` aligned
+        // with the live entry set so `contains_origin` doesn't
+        // return true for an origin whose last cached channel
+        // just left.
+        self.remove_origin(entry.origin_hash);
         Some(entry)
     }
 
@@ -686,5 +742,67 @@ mod tests {
         let sweep = reg.note_appended(&cn("b"), 600, base + Duration::from_secs(3));
         assert_eq!(sweep.len(), 1);
         assert_eq!(sweep.evicted[0].origin_hash, 0);
+    }
+
+    /// Pin dataforts perf #176: the `origin_counts` reverse
+    /// index must stay aligned with the entry-side `origin_hash`
+    /// field across every mutation that can change it. A
+    /// regression that forgets one of the bookkeeping calls
+    /// (forgetting to decrement on `evict`, or forgetting to
+    /// swap on `set_origin_hash`) would surface here as
+    /// `contains_origin` returning the wrong answer.
+    #[test]
+    fn contains_origin_uses_reverse_index_and_stays_aligned_across_mutations() {
+        let redex = Redex::new();
+        let mut reg = GreedyCacheRegistry::new(1_000_000);
+        let base = Instant::now();
+        // Sentinel: zero never indexes.
+        assert!(!reg.contains_origin(0));
+
+        // Register A and B with distinct origins.
+        reg.upsert(cn("a"), open_file(&redex, "a", 10_000), base);
+        reg.upsert(
+            cn("b"),
+            open_file(&redex, "b", 10_000),
+            base + Duration::from_secs(1),
+        );
+        reg.set_origin_hash(&cn("a"), 0xAAAA);
+        reg.set_origin_hash(&cn("b"), 0xBBBB);
+        assert!(reg.contains_origin(0xAAAA));
+        assert!(reg.contains_origin(0xBBBB));
+        assert!(!reg.contains_origin(0xCCCC));
+
+        // Set BOTH channels to the same origin so the count for
+        // 0xAAAA is 2. Re-set on A is a no-op (prev == new).
+        reg.set_origin_hash(&cn("b"), 0xAAAA);
+        assert!(reg.contains_origin(0xAAAA));
+        assert!(
+            !reg.contains_origin(0xBBBB),
+            "0xBBBB lost its last referer when B's origin was re-set to 0xAAAA"
+        );
+
+        // Evict A — 0xAAAA still has B referencing it.
+        reg.evict(&cn("a"));
+        assert!(
+            reg.contains_origin(0xAAAA),
+            "0xAAAA must remain held while B still claims it"
+        );
+
+        // Evict B — 0xAAAA loses its last referer.
+        reg.evict(&cn("b"));
+        assert!(
+            !reg.contains_origin(0xAAAA),
+            "0xAAAA must drop after every claiming entry is gone"
+        );
+
+        // Re-set to zero (clearing). The reverse index forgets
+        // the non-zero value; the entry survives so contains_origin
+        // on the sentinel still returns false.
+        reg.upsert(cn("c"), open_file(&redex, "c", 10_000), base);
+        reg.set_origin_hash(&cn("c"), 0xCCCC);
+        assert!(reg.contains_origin(0xCCCC));
+        reg.set_origin_hash(&cn("c"), 0);
+        assert!(!reg.contains_origin(0xCCCC));
+        assert!(!reg.contains_origin(0));
     }
 }
