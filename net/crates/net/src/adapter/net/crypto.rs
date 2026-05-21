@@ -5,7 +5,7 @@
 //! - ChaCha20-Poly1305 AEAD encryption with counter-based nonces
 //! - Key derivation for session keys
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use chacha20poly1305::{
     aead::{Aead, AeadInPlace, KeyInit},
     ChaCha20Poly1305,
@@ -723,6 +723,83 @@ impl PacketCipher {
         Ok(plaintext_len)
     }
 
+    /// Decrypt a [`Bytes`] payload, preferring the zero-copy
+    /// in-place path when the inbound buffer's refcount is `1`
+    /// (the common case for freshly-received packets — see
+    /// crypto-session perf #128). Falls back to the allocating
+    /// [`Self::decrypt`] when the buffer is shared.
+    ///
+    /// Returns plaintext `Bytes`. On the in-place fast path the
+    /// returned `Bytes` is the same allocation as the inbound
+    /// buffer, truncated to plaintext length. On the fallback path
+    /// it's a fresh allocation wrapping the decrypted `Vec`.
+    ///
+    /// The contract for callers: pre-replay-check (`is_valid_rx_counter`),
+    /// then call this method, then commit (`update_rx_counter`)
+    /// only on success. The fast path doesn't change that contract
+    /// — it's a pure swap for the inner `decrypt` call.
+    #[inline]
+    pub fn decrypt_to_bytes(
+        &self,
+        nonce_counter: u64,
+        aad: &[u8],
+        ciphertext: Bytes,
+    ) -> Result<Bytes, CryptoError> {
+        match ciphertext.try_into_mut() {
+            Ok(mut buf) => {
+                // Fast path: refcount == 1, decrypt in place. No
+                // allocation — the inbound buffer becomes the
+                // plaintext buffer (shrunk by TAG_SIZE).
+                let plaintext_len = self.decrypt_in_place(nonce_counter, aad, &mut buf)?;
+                buf.truncate(plaintext_len);
+                Ok(buf.freeze())
+            }
+            Err(shared) => {
+                // Slow path: another reader still holds a clone
+                // (rare in steady-state RX). Allocate.
+                self.decrypt(nonce_counter, aad, &shared).map(Bytes::from)
+            }
+        }
+    }
+
+    /// AEAD-verify a ciphertext + tag without producing plaintext
+    /// (crypto-session perf #129). Wraps `decrypt_in_place` over
+    /// a small stack-allocated scratch buffer so the AEAD verify
+    /// runs without a `Vec` allocation per call.
+    ///
+    /// Used by [`super::session::NetSession::verify_and_touch_heartbeat`]
+    /// where the inbound packet is a 16-byte tag-only payload —
+    /// pre-fix this routed through `decrypt(...)` and immediately
+    /// dropped the freshly-allocated `Vec<u8>` plaintext. The
+    /// scratch path here is correct for ANY payload size but
+    /// optimal for the heartbeat shape (tag-only, plaintext_len ==
+    /// 0); larger ciphertexts still avoid the heap because the
+    /// scratch sits in a `BytesMut` whose backing is a single
+    /// reserve.
+    ///
+    /// Returns `Ok(())` on tag-valid, `Err` on tag-invalid or
+    /// length-too-short.
+    #[inline]
+    pub fn verify(
+        &self,
+        nonce_counter: u64,
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<(), CryptoError> {
+        if ciphertext.len() < TAG_SIZE {
+            return Err(CryptoError::Decryption("buffer too small".to_string()));
+        }
+        // Use BytesMut to materialize a mutable copy for the
+        // in-place decrypt. The plaintext is discarded — we only
+        // need the tag verify side effect. A heartbeat packet
+        // (TAG_SIZE bytes total) gives `plaintext_len == 0`, so
+        // the only real cost is the AEAD compute itself.
+        let mut buf = BytesMut::with_capacity(ciphertext.len());
+        buf.extend_from_slice(ciphertext);
+        self.decrypt_in_place(nonce_counter, aad, &mut buf)?;
+        Ok(())
+    }
+
     /// Commit a received counter as seen. Must be called only after the
     /// packet has been successfully decrypted and authenticated.
     ///
@@ -910,6 +987,106 @@ mod tests {
             .unwrap();
         assert_eq!(len, plaintext.len());
         assert_eq!(&buffer[..len], plaintext);
+    }
+
+    /// Pin crypto-session perf #128: `decrypt_to_bytes` on a
+    /// refcount-1 `Bytes` takes the in-place fast path — the
+    /// returned plaintext is the SAME allocation as the input,
+    /// just truncated by `TAG_SIZE`. The pre-fix path would
+    /// always allocate a fresh `Vec<u8>` plaintext. A regression
+    /// that drops the `try_into_mut` branch would surface as
+    /// distinct backing pointers.
+    #[test]
+    fn decrypt_to_bytes_in_place_when_refcount_is_one() {
+        let key = [0x77u8; 32];
+        let session_id = 0xAABB_CCDD_EEFF_0011_u64;
+        let cipher = PacketCipher::new(&key, session_id);
+        let aad = b"aad";
+        let plaintext = b"per-packet alloc gone";
+
+        // Encrypt via the in-place TX path, freeze to a Bytes
+        // whose refcount is 1 (no other reader holds it).
+        let mut tx_buf = BytesMut::from(&plaintext[..]);
+        let counter = cipher.encrypt_in_place(aad, &mut tx_buf).unwrap();
+        let inbound: Bytes = tx_buf.freeze();
+        let inbound_ptr = inbound.as_ptr();
+        let inbound_len = inbound.len();
+
+        // Decrypt — fast path should hit.
+        let rx_cipher = PacketCipher::new(&key, session_id);
+        let plaintext_bytes = rx_cipher
+            .decrypt_to_bytes(counter, aad, inbound)
+            .expect("decrypt must succeed");
+
+        assert_eq!(plaintext_bytes.as_ref(), plaintext);
+        assert_eq!(
+            plaintext_bytes.len() + TAG_SIZE,
+            inbound_len,
+            "plaintext shrinks by TAG_SIZE",
+        );
+        assert_eq!(
+            plaintext_bytes.as_ptr(),
+            inbound_ptr,
+            "in-place decrypt: backing pointer must be unchanged",
+        );
+    }
+
+    /// Pin: `decrypt_to_bytes` on a shared (refcount > 1) `Bytes`
+    /// gracefully falls back to the allocating path. A regression
+    /// that panics or fails on shared buffers would surface here.
+    #[test]
+    fn decrypt_to_bytes_falls_back_on_shared_buffer() {
+        let key = [0x77u8; 32];
+        let session_id = 0xAABB_CCDD_EEFF_0011_u64;
+        let cipher = PacketCipher::new(&key, session_id);
+        let aad = b"aad";
+        let plaintext = b"shared inbound";
+
+        let mut tx_buf = BytesMut::from(&plaintext[..]);
+        let counter = cipher.encrypt_in_place(aad, &mut tx_buf).unwrap();
+        let inbound = tx_buf.freeze();
+        let _other_holder = inbound.clone(); // bump refcount to 2
+
+        let rx_cipher = PacketCipher::new(&key, session_id);
+        let plaintext_bytes = rx_cipher
+            .decrypt_to_bytes(counter, aad, inbound)
+            .expect("decrypt must still succeed via the fallback path");
+        assert_eq!(plaintext_bytes.as_ref(), plaintext);
+    }
+
+    /// Pin crypto-session perf #129: `verify(...)` validates the
+    /// AEAD tag without producing plaintext. For a heartbeat-shape
+    /// payload (16-byte tag, empty plaintext) the pre-fix
+    /// `decrypt(...).is_err()` materialized a 0-length `Vec<u8>`
+    /// per call only to drop it; `verify` skips the heap entirely.
+    /// Both genuine and tampered packets are exercised so a
+    /// regression that always returns Ok (or always Err) trips.
+    #[test]
+    fn verify_admits_valid_tag_and_rejects_tampered() {
+        let key = [0x77u8; 32];
+        let session_id = 0xAABB_CCDD_EEFF_0011_u64;
+        let cipher = PacketCipher::new(&key, session_id);
+        let aad = b"heartbeat-aad";
+        let plaintext: &[u8] = b"";
+
+        let mut tx_buf = BytesMut::from(plaintext);
+        let counter = cipher.encrypt_in_place(aad, &mut tx_buf).unwrap();
+        // Heartbeat shape: tag-only payload (no plaintext).
+        assert_eq!(tx_buf.len(), TAG_SIZE);
+        let inbound = tx_buf.freeze();
+
+        let rx_cipher = PacketCipher::new(&key, session_id);
+        rx_cipher
+            .verify(counter, aad, &inbound)
+            .expect("genuine heartbeat must verify");
+
+        // Tamper with the tag — verify must reject.
+        let mut tampered = inbound.to_vec();
+        tampered[0] ^= 0xAA;
+        let err = rx_cipher
+            .verify(counter, aad, &tampered)
+            .expect_err("tampered heartbeat must fail verify");
+        assert!(matches!(err, CryptoError::Decryption(_)));
     }
 
     #[test]

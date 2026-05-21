@@ -2948,7 +2948,7 @@ impl MeshNode {
                         .find(|e| e.value().session.session_id() == session_id)
                         .map(|e| e.value().session.clone());
                     if let Some(session) = matching_session {
-                        Self::process_local_packet(&parsed, &session, ctx);
+                        Self::process_local_packet(parsed, &session, ctx);
                         session.touch();
                     }
                 } else {
@@ -3054,7 +3054,7 @@ impl MeshNode {
             return;
         }
 
-        Self::process_local_packet(&parsed, &session, ctx);
+        Self::process_local_packet(parsed, &session, ctx);
         session.touch();
     }
 
@@ -3373,7 +3373,7 @@ impl MeshNode {
     ///
     /// This is the same logic as `NetAdapter::process_packet` but extracted
     /// to work with the multi-session dispatch.
-    fn process_local_packet(parsed: &ParsedPacket, session: &NetSession, ctx: &DispatchCtx) {
+    fn process_local_packet(mut parsed: ParsedPacket, session: &NetSession, ctx: &DispatchCtx) {
         let inbound = &ctx.inbound;
         let num_shards = ctx.num_shards;
         // Validate payload length
@@ -3384,14 +3384,21 @@ impl MeshNode {
             return;
         }
 
-        // Decrypt payload
+        // Decrypt payload. Per crypto-session perf #128, route
+        // through `decrypt_to_bytes` which prefers the in-place
+        // path when the inbound `Bytes` has refcount == 1 (the
+        // common case for freshly-received packets — the parser
+        // produces the only outstanding handle until decrypt
+        // lands). Falls back to the allocating `decrypt` when the
+        // buffer is shared.
         let aad = parsed.header.aad();
         let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
         let rx_cipher = session.rx_cipher();
         if !rx_cipher.is_valid_rx_counter(counter) {
             return;
         }
-        let decrypted = match rx_cipher.decrypt(counter, &aad, &parsed.payload) {
+        let payload = std::mem::take(&mut parsed.payload);
+        let decrypted = match rx_cipher.decrypt_to_bytes(counter, &aad, payload) {
             Ok(d) => {
                 // Commit-time replay check: closes the TOCTOU race where
                 // two threads decrypt the same replayed packet concurrently.
@@ -3430,7 +3437,7 @@ impl MeshNode {
                 // operators need to see the protocol violation
                 // rather than a silent stall.
                 let events =
-                    EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+                    EventFrame::read_events(decrypted, parsed.header.event_count);
                 if events.is_empty() {
                     return;
                 }
@@ -3565,7 +3572,7 @@ impl MeshNode {
             // migration packet (protocol violation, but possible
             // on the wire) gets one reply per request rather than
             // one for the first and silent drops for the rest.
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
                 if let Some(reply) = synthesize_compute_not_supported_reply(&payload) {
                     let dest_session = ctx
@@ -3615,7 +3622,7 @@ impl MeshNode {
         // (`apply_authoritative_grant` is monotonic so retransmits
         // eventually catch up — efficiency loss, not data loss).
         if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_WINDOW {
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
                 match StreamWindow::decode(&payload) {
                     Ok(grant) => {
@@ -3655,7 +3662,7 @@ impl MeshNode {
         // independent and idempotent on the receiver, so
         // iterating is structurally safe.
         if parsed.header.subprotocol_id == SUBPROTOCOL_CHANNEL_MEMBERSHIP {
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             if events.is_empty() {
                 return;
             }
@@ -3682,7 +3689,7 @@ impl MeshNode {
         // and version-skip safe on the index side, so iterating
         // is structurally safe.
         if parsed.header.subprotocol_id == SUBPROTOCOL_CAPABILITY_ANN {
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             if events.is_empty() {
                 return;
             }
@@ -3707,7 +3714,7 @@ impl MeshNode {
         // = no replicated channels on this node = drop.
         #[cfg(feature = "redex")]
         if parsed.header.subprotocol_id == super::redex::SUBPROTOCOL_REDEX {
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             if events.is_empty() {
                 return;
             }
@@ -3747,7 +3754,7 @@ impl MeshNode {
         // replication path's behaviour for unrouted channels).
         #[cfg(feature = "meshdb")]
         if parsed.header.subprotocol_id == super::behavior::meshdb::SUBPROTOCOL_MESHDB {
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             if events.is_empty() {
                 return;
             }
@@ -3783,7 +3790,7 @@ impl MeshNode {
         #[cfg(feature = "nat-traversal")]
         if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_REFLEX {
             use super::traversal::reflex;
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             if events.is_empty() {
                 return;
             }
@@ -3874,7 +3881,7 @@ impl MeshNode {
         #[cfg(feature = "nat-traversal")]
         if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_RENDEZVOUS {
             use super::traversal::rendezvous;
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             if events.is_empty() {
                 return;
             }
@@ -3999,7 +4006,7 @@ impl MeshNode {
         // symmetric — the sender debits the same quantity via
         // `wire_bytes_for_payload` on admission.
         let payload_bytes = (decrypted.len() + PACKET_WIRE_OVERHEAD) as u64;
-        let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+        let events = EventFrame::read_events(decrypted, parsed.header.event_count);
 
         let stream_id = parsed.header.stream_id;
         let shard_id = if num_shards > 0 {

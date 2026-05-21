@@ -652,7 +652,7 @@ impl NetAdapter {
         num_shards: u16,
     ) {
         // Parse packet
-        let parsed = match ParsedPacket::parse(data, source) {
+        let mut parsed = match ParsedPacket::parse(data, source) {
             Some(p) => p,
             None => return,
         };
@@ -700,14 +700,18 @@ impl NetAdapter {
             return;
         }
 
-        // Decrypt payload
+        // Decrypt payload. Per crypto-session perf #128, route
+        // through `decrypt_to_bytes` so the common case
+        // (refcount-1 inbound buffer) decrypts in place instead
+        // of allocating a fresh `Vec<u8>` plaintext per packet.
         let aad = parsed.header.aad();
         let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
         let rx_cipher = session.rx_cipher();
         if !rx_cipher.is_valid_rx_counter(counter) {
             return;
         }
-        let decrypted = match rx_cipher.decrypt(counter, &aad, &parsed.payload) {
+        let payload = std::mem::take(&mut parsed.payload);
+        let decrypted = match rx_cipher.decrypt_to_bytes(counter, &aad, payload) {
             Ok(d) => {
                 // Commit-time replay check: closes the TOCTOU race where
                 // two threads decrypt the same replayed packet concurrently.
@@ -720,7 +724,7 @@ impl NetAdapter {
         };
 
         // Parse events
-        let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+        let events = EventFrame::read_events(decrypted, parsed.header.event_count);
 
         // Update stream state
         let stream_id = parsed.header.stream_id;

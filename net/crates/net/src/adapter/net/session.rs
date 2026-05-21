@@ -744,11 +744,14 @@ impl NetSession {
         if !self.rx_cipher.is_valid_rx_counter(counter) {
             return false;
         }
-        if self
-            .rx_cipher
-            .decrypt(counter, &aad, &parsed.payload)
-            .is_err()
-        {
+        // Per crypto-session perf #129, route through the
+        // verify-only API: heartbeats encrypt an empty plaintext
+        // to a 16-byte Poly1305 tag, and the legacy
+        // `decrypt(...).is_err()` materialized that empty
+        // plaintext into a fresh `Vec<u8>` per call only to drop
+        // it. `verify` runs the AEAD tag check without producing
+        // a plaintext buffer.
+        if self.rx_cipher.verify(counter, &aad, &parsed.payload).is_err() {
             return false;
         }
         if !self.rx_cipher.update_rx_counter(counter) {

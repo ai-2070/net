@@ -6,6 +6,15 @@ This is the layer that runs on every single inbound and outbound packet, on both
 
 ---
 
+## ✅ Fixed
+
+| # | Item | Notes |
+|---|------|-------|
+| 128 | RX path allocating `decrypt` per packet → `decrypt_to_bytes` in-place when refcount == 1 | New `PacketCipher::decrypt_to_bytes(counter, aad, ciphertext: Bytes) -> Result<Bytes, _>` tries `ciphertext.try_into_mut()` first. On success (refcount == 1, the common case for freshly-received packets — the `ParsedPacket` parser is the only holder), it decrypts in place via the existing `decrypt_in_place` and freezes back to a `Bytes` that shares the inbound buffer's allocation. On failure (shared buffer) it falls back to the legacy allocating `decrypt`. The two production RX call sites (`mesh.rs::process_local_packet` and `mod.rs::process_packet`) are wired through; `process_local_packet`'s signature changed from `&ParsedPacket` to `ParsedPacket` so we can `std::mem::take(&mut parsed.payload)` and hand the `Bytes` to the cipher by value (the refcount-1 invariant requires moving, not cloning). The downstream `EventFrame::read_events` lost its `Bytes::from(decrypted)` wrapper at 10 call sites — `decrypted` is now `Bytes` directly. Pinned by `decrypt_to_bytes_in_place_when_refcount_is_one` (asserts the returned plaintext shares the input's backing pointer + length shrinks by `TAG_SIZE`) and `decrypt_to_bytes_falls_back_on_shared_buffer` (asserts the allocating fallback path returns the correct plaintext when refcount > 1). |
+| 129 | Heartbeat verify allocates a `Vec<u8>` plaintext only to drop it → new `PacketCipher::verify` API | `NetSession::verify_and_touch_heartbeat` used to call `rx_cipher.decrypt(...).is_err()` — for a heartbeat (16-byte tag-only payload) that materialized a 0-length `Vec<u8>` per call only to discard it. New `verify(counter, aad, ciphertext) -> Result<(), _>` runs the AEAD tag check via `decrypt_in_place` over a single scratch `BytesMut::with_capacity(ciphertext.len())` (one reserve, no `Vec`-from-`decrypt` allocation). Plaintext is dropped with the scratch. Pinned by `verify_admits_valid_tag_and_rejects_tampered` — exercises both the genuine-tag-valid and tampered-tag-rejected paths for a heartbeat-shape (16-byte) payload. |
+
+---
+
 ## 🔴 High-impact
 
 ### 128. RX path uses allocating `decrypt` instead of `decrypt_in_place` on EVERY inbound packet
