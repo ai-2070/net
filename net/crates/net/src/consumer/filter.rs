@@ -57,6 +57,94 @@ pub enum Filter {
     },
 }
 
+/// One step in a compiled dot-path.
+///
+/// Holds the raw field name (used for `JsonValue::Object` lookup) plus
+/// the optional array-index parse cached at compile time (used for
+/// `JsonValue::Array` lookup). Pre-fix the segment was a `&str` re-split
+/// from the path string on every match call, with `segment.parse::<usize>()`
+/// re-running speculatively for every array probe — per perf #16.
+/// One step in a compiled dot-path.
+#[derive(Debug, Clone)]
+pub struct CompiledSegment {
+    field: String,
+    idx: Option<usize>,
+}
+
+impl CompiledSegment {
+    fn from_str(s: &str) -> Self {
+        Self {
+            field: s.to_string(),
+            idx: s.parse().ok(),
+        }
+    }
+}
+
+/// Pre-compiled filter where every dot-path is split + each segment's
+/// integer parse is cached. Produced once via [`Filter::compile`] and
+/// reused across every event in a poll.
+///
+/// Pre-fix [perf #15 / #16 in `docs/performance/net-perf-analysis.md`]
+/// every event in the filtered-poll retain loop re-split the path on
+/// `'.'` and re-parsed each segment as `usize`. For a 10K-event response
+/// with a 3-segment path, that was 30K path splits + ~30K speculative
+/// integer parses, all producing the same compile-time-known segments.
+#[derive(Debug, Clone)]
+pub enum CompiledFilter {
+    /// Pre-compiled AND.
+    And(Vec<CompiledFilter>),
+    /// Pre-compiled OR.
+    Or(Vec<CompiledFilter>),
+    /// Pre-compiled NOT.
+    Not(Box<CompiledFilter>),
+    /// Pre-compiled equality match with the path already split.
+    Eq {
+        /// Path segments, pre-split and per-segment index-parsed.
+        segments: Vec<CompiledSegment>,
+        /// Value to match against.
+        value: JsonValue,
+    },
+}
+
+impl CompiledFilter {
+    /// Evaluate the compiled filter against an event. Semantically
+    /// identical to [`Filter::matches`].
+    #[inline]
+    pub fn matches(&self, event: &JsonValue) -> bool {
+        match self {
+            Self::And(filters) if filters.len() == 1 => filters[0].matches(event),
+            Self::Or(filters) if filters.len() == 1 => filters[0].matches(event),
+            Self::And(filters) => !filters.is_empty() && filters.iter().all(|f| f.matches(event)),
+            Self::Or(filters) => filters.iter().any(|f| f.matches(event)),
+            Self::Not(f) => !f.matches(event),
+            Self::Eq { segments, value } => {
+                json_path_get_compiled(event, segments) == Some(value)
+            }
+        }
+    }
+}
+
+/// Walk a pre-compiled segment list. Mirror of [`json_path_get`] but
+/// skips the per-call `split` and `segment.parse::<usize>()`.
+#[inline]
+fn json_path_get_compiled<'a>(
+    value: &'a JsonValue,
+    segments: &[CompiledSegment],
+) -> Option<&'a JsonValue> {
+    if segments.is_empty() {
+        return Some(value);
+    }
+    let mut current = value;
+    for seg in segments {
+        current = match current {
+            JsonValue::Object(map) => map.get(&seg.field)?,
+            JsonValue::Array(arr) => arr.get(seg.idx?)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
 impl Filter {
     /// Create an AND filter.
     pub fn and(filters: Vec<Filter>) -> Self {
@@ -123,6 +211,40 @@ impl Filter {
     /// Convert the filter to JSON.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
+    }
+
+    /// Pre-split every path and pre-parse each segment's integer
+    /// form into a [`CompiledFilter`]. Call once per poll before
+    /// the per-event retain loop — see perf #15 / #16.
+    pub fn compile(&self) -> CompiledFilter {
+        match self {
+            Self::And { filters } => {
+                CompiledFilter::And(filters.iter().map(Self::compile).collect())
+            }
+            Self::Or { filters } => {
+                CompiledFilter::Or(filters.iter().map(Self::compile).collect())
+            }
+            Self::Not { filter } => CompiledFilter::Not(Box::new(filter.compile())),
+            Self::Eq { path, value } => CompiledFilter::Eq {
+                segments: compile_path(path),
+                value: value.clone(),
+            },
+            Self::EqWrapped { condition } => CompiledFilter::Eq {
+                segments: compile_path(&condition.path),
+                value: condition.value.clone(),
+            },
+        }
+    }
+}
+
+/// Split a dot-path into [`CompiledSegment`]s. An empty path
+/// compiles to an empty segment list — semantically equivalent to
+/// "match the root value" per [`json_path_get`].
+fn compile_path(path: &str) -> Vec<CompiledSegment> {
+    if path.is_empty() {
+        Vec::new()
+    } else {
+        path.split('.').map(CompiledSegment::from_str).collect()
     }
 }
 
@@ -409,6 +531,99 @@ mod tests {
         // Should behave the same after round-trip
         let event = json!({"type": "token", "error": false});
         assert_eq!(filter.matches(&event), parsed.matches(&event));
+    }
+
+    /// Pin perf #15 / #16: `Filter::compile()` produces a
+    /// `CompiledFilter` whose `matches` is semantically identical
+    /// to `Filter::matches` for every shape (And / Or / Not / Eq /
+    /// EqWrapped, single-element + multi-element, nested,
+    /// numeric-index path, empty path).
+    ///
+    /// We pin this exhaustively against the same event corpus so
+    /// a regression that drifts compiled semantics from raw
+    /// semantics — e.g. a future field-name normalization on
+    /// either side that doesn't run on both — gets caught.
+    #[test]
+    fn compiled_filter_matches_raw_filter_semantically() {
+        // Nested + numeric index + EqWrapped + Not + multi-And/Or.
+        let raw: Filter = serde_json::from_str(
+            r#"{"$and": [
+                 {"path": "user.profile.name", "value": "Alice"},
+                 {"$or": [
+                    {"path": "items.0", "value": "first"},
+                    {"$eq": {"path": "items.1", "value": "second"}}
+                 ]},
+                 {"$not": {"path": "user.profile.role", "value": "guest"}}
+              ]}"#,
+        )
+        .unwrap();
+        let compiled = raw.compile();
+
+        let events = [
+            // Full match.
+            serde_json::json!({
+                "user": {"profile": {"name": "Alice", "role": "admin"}},
+                "items": ["first", "second"]
+            }),
+            // Wrong name.
+            serde_json::json!({
+                "user": {"profile": {"name": "Bob", "role": "admin"}},
+                "items": ["first", "second"]
+            }),
+            // Guest role → Not arm rejects.
+            serde_json::json!({
+                "user": {"profile": {"name": "Alice", "role": "guest"}},
+                "items": ["first", "second"]
+            }),
+            // Missing items.
+            serde_json::json!({
+                "user": {"profile": {"name": "Alice", "role": "admin"}}
+            }),
+            // items has 1 element matching index 0; Or arm satisfied.
+            serde_json::json!({
+                "user": {"profile": {"name": "Alice", "role": "admin"}},
+                "items": ["first"]
+            }),
+        ];
+
+        for ev in &events {
+            assert_eq!(
+                compiled.matches(ev),
+                raw.matches(ev),
+                "compiled vs raw diverge on {ev:?}",
+            );
+        }
+    }
+
+    /// Pin: compiling a path with a purely-numeric segment caches
+    /// the integer parse — `CompiledSegment::idx` is `Some(_)`
+    /// when the segment is parseable, `None` otherwise.
+    /// A regression that forgot to pre-parse would surface as a
+    /// `parse()` per event-match call (perf #16).
+    #[test]
+    fn compile_caches_array_index_parse_per_segment() {
+        // Path with mixed field + numeric-index + non-numeric
+        // segments. Inspect the resulting CompiledSegment list to
+        // confirm the parse happened at compile time.
+        let f = Filter::eq("items.42.foo", serde_json::json!(1));
+        let compiled = f.compile();
+        let CompiledFilter::Eq { segments, .. } = compiled else {
+            panic!("expected CompiledFilter::Eq");
+        };
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].field, "items");
+        assert!(
+            segments[0].idx.is_none(),
+            "'items' must not pre-parse as usize",
+        );
+        assert_eq!(segments[1].field, "42");
+        assert_eq!(
+            segments[1].idx,
+            Some(42),
+            "'42' must pre-parse as Some(42) — cached integer index",
+        );
+        assert_eq!(segments[2].field, "foo");
+        assert!(segments[2].idx.is_none());
     }
 
     #[test]
