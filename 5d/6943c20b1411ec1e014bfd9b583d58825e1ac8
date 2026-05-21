@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/transport.rs
+  s_f930dae9b8bbc1::t_2aa3c15401f98a 562-593
+  s_f930dae9b8bbc1::t_ca08c51f22530d 248-266,268-270
+net/crates/net/Cargo.toml
+  s_f930dae9b8bbc1::t_3ae66163e8049c 161
+net/crates/net/src/adapter/net/linux.rs
+  s_f930dae9b8bbc1::t_9e1c82400e4912 309-332,334-338,415-438,440-444
+  s_f930dae9b8bbc1::t_631bbf24938db2 591-628
+net/crates/net/docs/performance/net-crypto-session-reliability-analysis.md
+  s_f930dae9b8bbc1::t_97d771f7f62f55 14-15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "5d6943c20b1411ec1e014bfd9b583d58825e1ac8",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
