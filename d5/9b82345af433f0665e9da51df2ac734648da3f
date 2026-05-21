@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_f930dae9b8bbc1::t_fb43dc309c5ad6 4145-4160,4162-4172
+net/crates/net/src/adapter/net/session.rs
+  s_f930dae9b8bbc1::t_722244f93dee67 1626-1656
+  s_f930dae9b8bbc1::t_a016c450074585 154-179
+  s_f930dae9b8bbc1::t_350a7828e653f7 88-107
+net/crates/net/docs/performance/net-discovery-routing-analysis.md
+  s_f930dae9b8bbc1::t_624f74e324439a 9-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "d59b82345af433f0665e9da51df2ac734648da3f",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
