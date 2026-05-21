@@ -138,12 +138,45 @@ impl ChannelSubscribers {
     /// Per-publish dispatch view: every broadcaster, plus one
     /// selected member of each non-empty queue group. Per-publish
     /// queue-group selection is round-robin (see `QueueGroup::select`).
+    ///
+    /// Dedup uses linear scan on the small-`out` fast path and
+    /// promotes to a `HashSet` once the running set crosses the
+    /// `DEDUP_HASHSET_THRESHOLD` to keep the dispatch cost linear
+    /// in fan-out per discovery-routing perf #118. Pre-fix the
+    /// `out.contains(&picked)` was O(`out.len()`) per queue group,
+    /// so a fan-out of 50 broadcasters + 50 queue groups did up
+    /// to ~2500 u64 comparisons per publish. The structural
+    /// invariant from [`Self::add`] (a peer is either a
+    /// broadcaster OR a member of exactly one queue group, never
+    /// both / never two groups) means the dedup currently never
+    /// rejects — but the doc-grade defensive check stays so a
+    /// future invariant break doesn't silently fan-out duplicate
+    /// packets.
     fn dispatch_recipients(&self) -> Vec<u64> {
+        // Threshold matches the doc's cap-and-grow suggestion.
+        // Below this, the linear-scan loop is faster than the
+        // HashSet hash+probe due to cache locality on `out`.
+        const DEDUP_HASHSET_THRESHOLD: usize = 32;
+
         let mut out: Vec<u64> = self.broadcasters.iter().map(|e| *e).collect();
+        // Lazily-built dedup set; only allocated once `out` is
+        // large enough that the linear scan would dominate.
+        let mut seen: Option<std::collections::HashSet<u64>> = None;
         for grp in self.queue_groups.iter() {
-            if let Some(picked) = grp.value().select() {
-                if !out.contains(&picked) {
-                    out.push(picked);
+            let Some(picked) = grp.value().select() else { continue };
+            let duplicate = match &seen {
+                Some(set) => set.contains(&picked),
+                None => out.contains(&picked),
+            };
+            if !duplicate {
+                out.push(picked);
+                if let Some(set) = seen.as_mut() {
+                    set.insert(picked);
+                } else if out.len() >= DEDUP_HASHSET_THRESHOLD {
+                    // Promote: seed the HashSet from the current
+                    // `out`. Subsequent membership checks hit O(1)
+                    // and subsequent inserts mirror into both.
+                    seen = Some(out.iter().copied().collect());
                 }
             }
         }
@@ -927,6 +960,40 @@ mod tests {
         assert!(r.add_with_mode(c.clone(), 1, qg("group-a")));
         assert_eq!(r.channel_count(), 1);
         assert_eq!(r.dispatch_recipients(&c), vec![1]);
+    }
+
+    /// Pin discovery-routing perf #118: `dispatch_recipients`
+    /// stays correct across the linear-scan → `HashSet` dedup
+    /// promotion boundary. The internal threshold is 32, so 100
+    /// distinct subscribers exercise both paths within one
+    /// call. A regression that mis-mirrored a queue-group pick
+    /// into the `HashSet` (e.g. forgot to seed it from `out` at
+    /// promotion, or stopped checking `out` post-promotion)
+    /// would silently produce duplicates here.
+    #[test]
+    fn dispatch_recipients_dedup_holds_across_hashset_promotion() {
+        let r = SubscriberRoster::new();
+        let c = ch("svc/large");
+
+        // 50 broadcasters and 50 queue groups (each with one
+        // distinct member) — 100 total recipients, well past the
+        // 32-element promotion threshold.
+        for i in 0..50u64 {
+            r.add_with_mode(c.clone(), i, SubscriptionMode::Broadcast);
+        }
+        for i in 50..100u64 {
+            r.add_with_mode(c.clone(), i, qg(&format!("g{i}")));
+        }
+
+        let mut got = r.dispatch_recipients(&c);
+        got.sort_unstable();
+
+        let expected: Vec<u64> = (0..100u64).collect();
+        assert_eq!(
+            got, expected,
+            "all 100 distinct recipients must appear exactly once after \
+             the linear→HashSet dedup promotion",
+        );
     }
 
     /// `remove_peer` (failure-driven cleanup) clears the peer from
