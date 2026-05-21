@@ -661,17 +661,31 @@ fn is_transient_error(e: &RedisError) -> bool {
         // extension errors that surface only via the message
         // body. Includes `NOREPLICAS` (a wait-aof timeout) which
         // doesn't have a typed kind in this redis crate version.
+        //
+        // Pre-fix [perf #40 in `docs/performance/net-perf-analysis.md`]
+        // ran `e.to_string().to_uppercase()` and called `.contains`
+        // nine times — two `String` allocations per classified
+        // error, on a path that's hot in a degraded-broker state
+        // (BUSY / LOADING) where every command fails. Redis server
+        // errors are emitted uppercase by protocol and always
+        // start with the keyword; [`RedisError::detail`] returns
+        // the message body as `Option<&str>` without allocating,
+        // so a byte-level `starts_with` is enough.
         ErrorKind::Server(_) | ErrorKind::Extension => {
-            let msg = e.to_string().to_uppercase();
-            msg.contains("LOADING")
-                || msg.contains("BUSY")
-                || msg.contains("TRYAGAIN")
-                || msg.contains("MASTERDOWN")
-                || msg.contains("MOVED")
-                || msg.contains("ASK")
-                || msg.contains("READONLY")
-                || msg.contains("CLUSTERDOWN")
-                || msg.contains("NOREPLICAS")
+            const TRANSIENT_PREFIXES: &[&str] = &[
+                "LOADING",
+                "BUSY",
+                "TRYAGAIN",
+                "MASTERDOWN",
+                "MOVED",
+                "ASK",
+                "READONLY",
+                "CLUSTERDOWN",
+                "NOREPLICAS",
+            ];
+            e.detail()
+                .map(|d| TRANSIENT_PREFIXES.iter().any(|p| d.starts_with(p)))
+                .unwrap_or(false)
         }
         _ => false,
     }
