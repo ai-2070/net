@@ -1,10 +1,14 @@
 "use client";
 
+import { useMemo } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { entryVisibleIn, useLanguage } from "@/components/LanguageContext";
+import type { Language } from "@/lib/docs-language";
 import type {
   ClientDocFile,
   ClientDocFolder,
+  ClientDocNode,
   ClientDocTree,
 } from "@/lib/docs";
 
@@ -41,6 +45,41 @@ function countDocs(folder: ClientDocFolder): number {
     else n += countDocs(c);
   }
   return n;
+}
+
+// Drop entries that aren't visible under `lang`, then drop folders whose
+// whole subtree collapsed (no readme + no surviving children). The same
+// filter runs on the inline sidebar and the mobile drawer because both
+// share this component.
+function filterFolder(
+  folder: ClientDocFolder,
+  lang: Language,
+): ClientDocFolder | null {
+  if (!entryVisibleIn(folder, lang)) return null;
+  const children: ClientDocNode[] = [];
+  for (const child of folder.children) {
+    if (child.kind === "file") {
+      if (entryVisibleIn(child, lang)) children.push(child);
+    } else {
+      const kept = filterFolder(child, lang);
+      if (kept) children.push(kept);
+    }
+  }
+  if (!folder.hasReadme && children.length === 0) return null;
+  return { ...folder, children };
+}
+
+function filterTree(tree: ClientDocTree, lang: Language): ClientDocTree {
+  const folders: ClientDocFolder[] = [];
+  for (const f of tree.folders) {
+    const kept = filterFolder(f, lang);
+    if (kept) folders.push(kept);
+  }
+  return {
+    hasRootReadme: tree.hasRootReadme,
+    rootFiles: tree.rootFiles.filter((f) => entryVisibleIn(f, lang)),
+    folders,
+  };
 }
 
 // Stable 4-char hex hash per slug — fake inode tag for cyberpunk flavor.
@@ -288,15 +327,20 @@ export function DocsSidebar({
 }) {
   const pathname = usePathname() ?? "/docs";
   const active = activeFromPath(pathname);
+  const { language } = useLanguage();
+  const visibleTree = useMemo(
+    () => filterTree(tree, language),
+    [tree, language],
+  );
   const totalDocs =
-    tree.rootFiles.length +
-    tree.folders.reduce((sum, f) => sum + countDocs(f), 0) +
-    (tree.hasRootReadme ? 1 : 0);
+    visibleTree.rootFiles.length +
+    visibleTree.folders.reduce((sum, f) => sum + countDocs(f), 0) +
+    (visibleTree.hasRootReadme ? 1 : 0);
 
   if (!chrome) {
     return (
       <nav className="font-mono" aria-label="Docs navigation">
-        <SidebarBody tree={tree} active={active} />
+        <SidebarBody tree={visibleTree} active={active} />
       </nav>
     );
   }
@@ -327,7 +371,7 @@ export function DocsSidebar({
 
         {/* Body */}
         <div className="py-3">
-          <SidebarBody tree={tree} active={active} />
+          <SidebarBody tree={visibleTree} active={active} />
         </div>
 
         {/* Status footer — vim-like key hints + live + version */}

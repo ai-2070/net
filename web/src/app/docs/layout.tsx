@@ -1,6 +1,8 @@
 import { NavBar } from "@/components/NavBar";
 import { DocsSidebar } from "@/components/DocsSidebar";
 import { DocsDrawer } from "@/components/DocsDrawer";
+import { LanguageProvider } from "@/components/LanguageContext";
+import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { getClientDocTree } from "@/lib/docs";
 
 export const metadata = {
@@ -14,7 +16,7 @@ export default function DocsLayout({
 }) {
   const tree = getClientDocTree();
   return (
-    <>
+    <LanguageProvider>
       <NavBar />
       {/* Mobile/tablet nav: sticky toggle bar + slide-in drawer (hidden at lg+). */}
       <DocsDrawer tree={tree} />
@@ -23,6 +25,7 @@ export default function DocsLayout({
           {/* Inline sidebar — only at lg+. Hidden via display:none on
               smaller breakpoints so the grid collapses to a single column. */}
           <aside className="hidden lg:block lg:sticky lg:top-24 lg:self-start lg:max-h-[calc(100vh-7rem)] lg:overflow-y-auto pr-2">
+            <LanguageSwitcher className="mb-3" />
             <DocsSidebar tree={tree} />
           </aside>
           {/* Page renders <main>…</main> + <aside>TOC</aside>. At lg the
@@ -31,6 +34,6 @@ export default function DocsLayout({
           {children}
         </div>
       </div>
-    </>
+    </LanguageProvider>
   );
 }

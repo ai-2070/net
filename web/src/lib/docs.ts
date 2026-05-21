@@ -10,6 +10,17 @@ import { DOCS_ORDER } from "@/docs.order";
 const DOCS_ROOT = resolve(process.cwd(), "src", "content", "docs");
 const DOC_EXT_RE = /\.mdx?$/i;
 
+// Language taxonomy lives in its own client-safe module; re-export here
+// so server callers (this file's internals, `docs.order.ts` consumers via
+// the `DocsOrderConfig` type) have a single import surface.
+export {
+  LANGUAGES,
+  DEFAULT_LANGUAGE,
+  isLanguage,
+  type Language,
+} from "./docs-language";
+import type { Language } from "./docs-language";
+
 export type DocsOrderConfig = {
   /** Order of top-level folders (sections). Unlisted append alpha after. */
   sections?: string[];
@@ -22,6 +33,12 @@ export type DocsOrderConfig = {
   /** Custom display labels keyed by slug path. Overrides the auto-titleized
    * name in the sidebar, breadcrumbs, and page heading. */
   labels?: Record<string, string>;
+  /** Per-entry language gating, keyed by slug path. An entry whose key is
+   * absent (or whose value is an empty array) is universal — visible in
+   * every language. An entry with a non-empty list is only shown when the
+   * current language is in the list. Applies to both files and folders;
+   * gating a folder hides its whole subtree. */
+  languages?: Record<string, Language[]>;
 };
 
 // Reorders `items` by the slugs listed in `order`. Listed items come first
@@ -83,6 +100,20 @@ function customLabel(slug: string[]): string | undefined {
   return undefined;
 }
 
+function lookupLanguages(slug: string[]): Language[] | undefined {
+  const cfg = DOCS_ORDER.languages;
+  if (!cfg) return undefined;
+  const target = normalizeSlug(slug.join("/"));
+  for (const k of Object.keys(cfg)) {
+    if (normalizeSlug(k) === target) {
+      const langs = cfg[k];
+      if (!langs || langs.length === 0) return undefined;
+      return langs;
+    }
+  }
+  return undefined;
+}
+
 function resolveTitle(slug: string[], rawName: string): string {
   return customLabel(slug) ?? titleize(rawName);
 }
@@ -93,6 +124,9 @@ export type DocFile = {
   title: string;
   filePath: string;
   ext: "md" | "mdx";
+  /** Languages this doc is gated to, per `DocsOrderConfig.languages`.
+   * Absent = universal (visible in every language). */
+  languages?: Language[];
 };
 
 export type DocFolder = {
@@ -101,6 +135,10 @@ export type DocFolder = {
   title: string;
   readme: DocFile | null;
   children: DocNode[];
+  /** Languages this folder is gated to. Absent = universal. Gating a
+   * folder hides its whole subtree when the current language doesn't
+   * match. */
+  languages?: Language[];
 };
 
 export type DocNode = DocFile | DocFolder;
@@ -175,6 +213,7 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
         title: resolveTitle(childSlug, entry),
         filePath: entryPath,
         ext: extOf(entry),
+        languages: lookupLanguages(childSlug),
       };
       if (isReadme(entry)) readme = file;
       else files.push(file);
@@ -194,6 +233,7 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
     title: resolveTitle(slugChain, folderName),
     readme,
     children: orderedChildren,
+    languages: lookupLanguages(slugChain),
   };
 }
 
@@ -237,6 +277,7 @@ function buildDocTree(): DocTree {
         title: resolveTitle(childSlug, entry),
         filePath: entryPath,
         ext: extOf(entry),
+        languages: lookupLanguages(childSlug),
       };
       if (isReadme(entry)) rootReadme = file;
       else rootFiles.push(file);
@@ -459,6 +500,7 @@ export type ClientDocFile = {
   kind: "file";
   slug: string[];
   title: string;
+  languages?: Language[];
 };
 
 export type ClientDocFolder = {
@@ -467,6 +509,7 @@ export type ClientDocFolder = {
   title: string;
   hasReadme: boolean;
   children: ClientDocNode[];
+  languages?: Language[];
 };
 
 export type ClientDocNode = ClientDocFile | ClientDocFolder;
@@ -478,7 +521,7 @@ export type ClientDocTree = {
 };
 
 function toClientFile(f: DocFile): ClientDocFile {
-  return { kind: "file", slug: f.slug, title: f.title };
+  return { kind: "file", slug: f.slug, title: f.title, languages: f.languages };
 }
 
 function toClientFolder(f: DocFolder): ClientDocFolder {
@@ -490,6 +533,7 @@ function toClientFolder(f: DocFolder): ClientDocFolder {
     children: f.children.map((c) =>
       c.kind === "file" ? toClientFile(c) : toClientFolder(c),
     ),
+    languages: f.languages,
   };
 }
 

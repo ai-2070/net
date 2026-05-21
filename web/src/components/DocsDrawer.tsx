@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 import { DocsSidebar } from "@/components/DocsSidebar";
+import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import type { ClientDocTree } from "@/lib/docs";
 
 // Mobile + tablet docs nav. Renders a sticky toggle bar below the main
@@ -116,6 +117,7 @@ export function DocsDrawer({ tree }: { tree: ClientDocTree }) {
             </button>
           </div>
           <div className="overflow-y-auto px-5 py-5 grow">
+            <LanguageSwitcher className="mb-4" />
             <DocsSidebar tree={tree} chrome={false} />
           </div>
         </aside>
