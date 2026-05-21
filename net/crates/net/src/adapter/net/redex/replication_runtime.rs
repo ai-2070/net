@@ -816,8 +816,20 @@ fn clear_leader_belief_and_tokens(
     tracker: &Arc<Mutex<HeartbeatTracker>>,
     outstanding: &Arc<Mutex<OutstandingRequests>>,
 ) {
-    let prior = tracker.lock().believed_leader();
-    tracker.lock().clear_believed_leader();
+    // Read-then-clear under a single `tracker` lock. Pre-fix
+    // [perf #71 in `docs/performance/net-perf-analysis.md`] this
+    // took the tracker lock twice back-to-back — once to read
+    // `believed_leader()`, once to `clear_believed_leader()`.
+    // Coalescing is also defensively atomic with respect to a
+    // concurrent observer that races between the two calls (a
+    // future change that exposes the tracker more widely couldn't
+    // see the gap).
+    let prior = {
+        let mut t = tracker.lock();
+        let p = t.believed_leader();
+        t.clear_believed_leader();
+        p
+    };
     if let Some(prior) = prior {
         outstanding.lock().clear_leader(prior);
     }
