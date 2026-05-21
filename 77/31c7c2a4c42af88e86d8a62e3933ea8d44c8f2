@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/failure.rs
+  s_4f93eae8f45533::t_c8187cfc4f13d8 1540-1636
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "7731c7c2a4c42af88e86d8a62e3933ea8d44c8f2",
+  "prompts": {},
+  "sessions": {
+    "s_4f93eae8f45533": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4eeaced2-d67f-413c-87c1-4b5954eae6be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
