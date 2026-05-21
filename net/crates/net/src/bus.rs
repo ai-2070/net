@@ -2310,8 +2310,12 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                     break;
                 }
                 Err(_) => {
-                    // Timeout - check if we need to flush
-                    if let Some(batch) = worker.add_events(vec![]) {
+                    // Timeout - check if we need to flush.
+                    // Pre-fix [perf #38] called `worker.add_events(vec![])`
+                    // as the signal, allocating an empty `Vec` per
+                    // timeout tick. `check_timeout` is the direct
+                    // expression of intent — no alloc.
+                    if let Some(batch) = worker.check_timeout() {
                         let batch_len = batch.len() as u64;
                         if dispatch_batch(
                             &*adapter,

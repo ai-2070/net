@@ -325,7 +325,15 @@ impl BatchWorker {
     }
 
     /// Check if the batch should be flushed due to timeout.
-    fn check_timeout(&mut self) -> Option<Batch> {
+    ///
+    /// Pre-fix [perf #38 in `docs/performance/net-perf-analysis.md`]
+    /// this was private and the bus's timeout branch called
+    /// `add_events(vec![])` as the indirection — an empty `Vec`
+    /// allocation per timeout tick purely as a sentinel. The
+    /// method is now `pub` so callers can express the intent
+    /// directly without the alloc and without the documented
+    /// "empty `add_events` has a side effect" footgun.
+    pub fn check_timeout(&mut self) -> Option<Batch> {
         if self.current_batch.is_empty() {
             return None;
         }
@@ -478,6 +486,43 @@ mod tests {
              this is the contract bus.rs and BatchWorker's recv-timeout \
              arm rely on; making it a no-op silently loses events on \
              the activate-failure rollback path"
+        );
+        assert_eq!(flushed.unwrap().events.len(), 3);
+    }
+
+    /// Pin perf #38: the direct `check_timeout()` path produces
+    /// the same outcomes as the legacy `add_events(vec![])` shape.
+    /// `bus.rs`'s recv-timeout arm now calls `check_timeout`
+    /// directly to avoid the empty-`Vec` allocation; the public
+    /// contract on both shapes must agree so a future refactor
+    /// can't drift them apart.
+    #[test]
+    fn check_timeout_matches_add_events_empty_signal() {
+        let config = BatchConfig {
+            min_size: 10,
+            max_size: 1000,
+            max_delay: Duration::from_millis(1),
+            adaptive: false,
+            velocity_window: Duration::from_millis(100),
+        };
+
+        // Empty-batch case: both shapes return None.
+        let mut w = BatchWorker::new(0, config.clone(), fresh_published(), 0);
+        assert!(w.check_timeout().is_none(), "no pending → None");
+
+        // Pending but pre-deadline: both shapes return None.
+        let _ = w.add_events(make_events(3, 0));
+        assert!(
+            w.check_timeout().is_none(),
+            "pending below threshold + pre-deadline → None",
+        );
+
+        // Pending past deadline: both shapes flush.
+        std::thread::sleep(Duration::from_millis(5));
+        let flushed = w.check_timeout();
+        assert!(
+            flushed.is_some(),
+            "pending past max_delay → check_timeout must flush",
         );
         assert_eq!(flushed.unwrap().events.len(), 3);
     }
