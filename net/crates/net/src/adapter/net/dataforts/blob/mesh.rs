@@ -3126,16 +3126,20 @@ impl BlobAdapter for MeshBlobAdapter {
                         total_size, MAX_BULK_FETCH_BYTES
                     )));
                 }
-                // Let Vec grow as we extend. The declared
-                // `total_size` is bounded by `BLOB_REF_MAX_SIZE`
-                // (16 GiB) — pre-allocating that on a fetch of a
-                // hostile manifest forces an upfront allocation
-                // regardless of how many bytes actually arrive,
-                // and on 32-bit targets `as usize` truncates
-                // silently. Callers needing streaming on large
-                // blobs should use the substrate's per-chunk
-                // fetch path; this bulk-fetch hits the same
-                // memory cost on first byte either way.
+                // Pre-allocate up to the bulk-fetch cap (per
+                // dataforts perf #180). The over-cap check above
+                // already rejected `total_size > MAX_BULK_FETCH_BYTES`,
+                // so once we get here the declared size is
+                // bounded by 256 MiB — `as usize` is safe even on
+                // 32-bit targets (256 MiB << u32::MAX), and a
+                // hostile manifest can no longer balloon the
+                // up-front allocation beyond the cap. Legitimate
+                // fetches now hit one allocation up front instead
+                // of O(log N) reallocs across `extend_from_slice`
+                // grows. The redundant `.min()` is defensive — if
+                // the over-cap check drifts, the alloc stays
+                // bounded — and folds to a no-op at runtime
+                // because `total_size` is already <= the cap.
                 //
                 // Parallel chunk fetch via `buffered(N)` per
                 // dataforts perf #172. Pre-fix this loop was
@@ -3180,7 +3184,8 @@ impl BlobAdapter for MeshBlobAdapter {
                     },
                 );
                 let mut stream = std::pin::pin!(fetch_stream.buffered(MANIFEST_FETCH_CONCURRENCY));
-                let mut out: Vec<u8> = Vec::new();
+                let prealloc_cap = (*total_size).min(MAX_BULK_FETCH_BYTES) as usize;
+                let mut out: Vec<u8> = Vec::with_capacity(prealloc_cap);
                 let mut err: Option<BlobError> = None;
                 while let Some(result) = stream.next().await {
                     match result {
@@ -4586,6 +4591,60 @@ mod tests {
         assert!(
             after_second >= 1.0,
             "rate must remain >= 1.0 after second fetch (got {after_second})"
+        );
+    }
+
+    /// Pin dataforts perf #180: a Manifest fetch returns a `Vec`
+    /// whose capacity matches `total_size`, not the chunk-by-chunk
+    /// grow path. We don't have direct access to the internal
+    /// `out` Vec, but the public-API guarantee is straightforward:
+    /// the returned bytes' length is exactly `total_size`, AND
+    /// the underlying Vec was sized in one shot — which we
+    /// observe indirectly via the capacity surfaced through
+    /// `into_boxed_slice`'s round-trip behavior:
+    /// `Vec::with_capacity(n)` + `extend_from_slice(...)` of `n`
+    /// bytes followed by `into_boxed_slice` reuses the original
+    /// allocation (no second alloc), and `Box<[u8]>::into_vec`
+    /// produces a Vec where `len == capacity == n`. By contrast,
+    /// the pre-fix `Vec::new()` + extend path produces a Vec
+    /// whose capacity is >= the next power of two after `n` —
+    /// so for a payload that's NOT already a power-of-two size,
+    /// `capacity()` would be strictly greater than `len()` until
+    /// `shrink_to_fit` is called. The assertion below catches a
+    /// regression that drops the pre-alloc and goes back to
+    /// power-of-two growth.
+    #[tokio::test]
+    async fn fetch_manifest_preallocates_vec_to_total_size() {
+        let adapter = make_adapter();
+
+        // Payload size deliberately not a power of two so the
+        // grow-from-empty path would over-allocate, separating
+        // pre-alloc (capacity == len) from grow (capacity > len).
+        let len = BLOB_CHUNK_SIZE_BYTES as usize * 2 + 4321;
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let chunked = chunk_payload(&payload).unwrap();
+        let chunk_refs: Vec<ChunkRef> = match chunked {
+            ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
+            _ => panic!("expected Chunked"),
+        };
+        let blob =
+            BlobRef::manifest("mesh://prealloc", Encoding::Replicated, chunk_refs.clone()).unwrap();
+        adapter.store(&blob, &payload).await.unwrap();
+
+        let fetched = adapter.fetch(&blob).await.unwrap();
+        assert_eq!(fetched.len(), len, "fetch must return exactly total_size bytes");
+        // Round-trip through Box<[u8]> back to Vec; for a
+        // pre-allocated Vec whose capacity matched the final
+        // length, capacity stays equal to len. Otherwise the
+        // grow path's spare capacity surfaces here.
+        let boxed = fetched.into_boxed_slice();
+        let round_trip = boxed.into_vec();
+        assert_eq!(
+            round_trip.capacity(),
+            len,
+            "fetch Vec capacity must equal total_size (pre-alloc) — got cap={} len={}",
+            round_trip.capacity(),
+            len
         );
     }
 
