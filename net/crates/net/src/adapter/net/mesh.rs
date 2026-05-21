@@ -6669,9 +6669,21 @@ impl MeshNode {
             }
             OnFailure::BestEffort | OnFailure::Collect => {
                 let mut handles = Vec::with_capacity(subscribers.len());
+                // Hoist the events into an `Arc<[Bytes]>` once and
+                // clone the `Arc` per spawned task instead of
+                // calling `events.to_vec()` per peer. Pre-fix
+                // [discovery-routing perf #109 in
+                // `docs/performance/net-discovery-routing-analysis.md`]
+                // a 100-subscriber × 1000-event broadcast did 100
+                // Vec allocations + 100K `Bytes` refcount bumps;
+                // post-fix it's 1 Vec alloc + 1K `Bytes` bumps +
+                // 100 `Arc` bumps. The spawned task derefs the
+                // `Arc<[Bytes]>` to `&[Bytes]` at the
+                // `publish_to_peer` call site.
+                let events_shared: Arc<[Bytes]> = events.to_vec().into();
                 for peer_id in subscribers {
                     let permit = Arc::clone(&sem);
-                    let events_owned: Vec<Bytes> = events.to_vec();
+                    let events_for_task: Arc<[Bytes]> = Arc::clone(&events_shared);
                     let fut = async move {
                         let _permit = permit.acquire_owned().await.ok();
                         (
@@ -6681,7 +6693,7 @@ impl MeshNode {
                                 channel_hash,
                                 stream_id,
                                 reliable,
-                                &events_owned,
+                                &events_for_task,
                             )
                             .await,
                         )
