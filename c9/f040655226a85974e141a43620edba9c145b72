@@ -1,0 +1,22 @@
+net/crates/net/src/bus.rs
+  s_4f93eae8f45533::t_9f94b6ddae717d 3873-3877,3881
+  s_4f93eae8f45533::t_d2bb1915f2ae82 3816-3834,3836-3841,3846-3858,3861-3872,3878-3879,3882-3901,3903-3921
+  s_4f93eae8f45533::t_679ad8f610a149 3835,3880,3902
+  s_4f93eae8f45533::t_d7902359af062c 3842-3845,3859-3860
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "c9f040655226a85974e141a43620edba9c145b72",
+  "prompts": {},
+  "sessions": {
+    "s_4f93eae8f45533": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4eeaced2-d67f-413c-87c1-4b5954eae6be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
