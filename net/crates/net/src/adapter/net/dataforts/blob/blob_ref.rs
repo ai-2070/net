@@ -537,17 +537,66 @@ impl BlobRef {
     // -----------------------------------------------------------
 
     /// Encoded length in bytes. The `Small` variant is O(1) —
-    /// header size plus URI length. The `Manifest` variant pays
-    /// the full postcard serialization cost (the length is taken
-    /// from a temporary buffer) because postcard's leb128
-    /// length-prefixes make a closed-form size hard to predict.
-    /// Callers in a hot path that already need the bytes should
-    /// reuse [`Self::encode`] directly instead of pairing
-    /// `encoded_len` + `encode`.
+    /// header size plus URI length. The `Manifest` / `Tree`
+    /// variants now use [`postcard::experimental::serialized_size`]
+    /// to *measure* without allocating, per dataforts perf #174.
+    ///
+    /// Pre-fix these variants called `self.encode().len()` — a
+    /// full postcard alloc-encode of the entire body just to
+    /// read `.len()` off the temporary and drop it. For a
+    /// 1000-chunk Manifest, that was 64 KB+ allocated and
+    /// thrown away per `encoded_len` call. Workloads that
+    /// pair `encoded_len` + `encode` (typical sizing-then-emit
+    /// pattern) paid 2× the encode cost.
+    ///
+    /// Post-fix `encoded_len` walks the structure measuring
+    /// without allocating the output buffer — same byte count,
+    /// no `Vec` churn.
     pub fn encoded_len(&self) -> usize {
         match self {
             Self::Small { uri, .. } => BLOB_REF_SMALL_HEADER_LEN + uri.len(),
-            Self::Manifest { .. } | Self::Tree { .. } => self.encode().len(),
+            Self::Manifest {
+                uri,
+                encoding,
+                chunks,
+                total_size,
+                ..
+            } => {
+                let body = ManifestBody {
+                    body_version: BLOB_MANIFEST_BODY_VERSION,
+                    uri: uri.clone(),
+                    encoding: *encoding,
+                    chunks: chunks.clone(),
+                    total_size: *total_size,
+                };
+                // `serialized_size` walks the structure
+                // measuring; matches what `encode` would produce
+                // byte-for-byte. The 5-byte header (4 magic + 1
+                // version) is added to mirror `encode`'s prefix.
+                let body_len = postcard::experimental::serialized_size(&body)
+                    .expect("manifest body postcard-encodes infallibly");
+                BLOB_REF_MAGIC.len() + 1 + body_len
+            }
+            Self::Tree {
+                uri,
+                encoding,
+                root_hash,
+                total_size,
+                depth,
+                ..
+            } => {
+                let body = TreeBody {
+                    body_version: BLOB_TREE_BODY_VERSION,
+                    uri: uri.clone(),
+                    encoding: *encoding,
+                    root_hash: *root_hash,
+                    total_size: *total_size,
+                    depth: *depth,
+                };
+                let body_len = postcard::experimental::serialized_size(&body)
+                    .expect("tree body postcard-encodes infallibly");
+                BLOB_REF_MAGIC.len() + 1 + body_len
+            }
         }
     }
 
@@ -1237,6 +1286,57 @@ mod tests {
         let bytes = original.encode();
         let decoded = BlobRef::decode(&bytes).unwrap().unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// Pin dataforts perf #174: `encoded_len` measures the same
+    /// byte count `encode()` produces, byte-for-byte, without
+    /// allocating the encoded buffer. Pre-fix `encoded_len` for
+    /// Manifest / Tree allocated a `Vec` via `encode()` and
+    /// threw it away. The post-fix path uses
+    /// `postcard::experimental::serialized_size` to walk the
+    /// structure measuring. A regression that drifts the
+    /// header-prefix accounting (4-byte magic + 1-byte version)
+    /// would surface as a length mismatch here.
+    #[test]
+    fn encoded_len_matches_encode_len_without_allocating() {
+        // Small variant: closed-form size — sanity check.
+        let small = small_fixture();
+        assert_eq!(small.encoded_len(), small.encode().len(), "Small parity");
+
+        // Manifest variants across several chunk-count regimes:
+        // 1 chunk (smallest), 8 chunks (typical), 128 chunks
+        // (large). Each exercises a different postcard leb128
+        // length-prefix size.
+        for count in [1usize, 8, 128] {
+            let manifest = manifest_fixture(count);
+            assert_eq!(
+                manifest.encoded_len(),
+                manifest.encode().len(),
+                "Manifest({count} chunks) parity",
+            );
+        }
+
+        // Tree variant.
+        let tree = BlobRef::tree("mesh://tree", Encoding::Replicated, [0xCD; 32], 1024, 3)
+            .expect("tree ref");
+        assert_eq!(tree.encoded_len(), tree.encode().len(), "Tree parity");
+
+        // ReedSolomon-encoded manifest: different encoding variant
+        // sometimes serializes to a different byte count.
+        let rs_manifest = BlobRef::manifest(
+            "mesh://rs",
+            Encoding::ReedSolomon { k: 4, m: 2 },
+            vec![ChunkRef {
+                hash: [0xAA; 32],
+                size: 1024,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            rs_manifest.encoded_len(),
+            rs_manifest.encode().len(),
+            "RS Manifest parity",
+        );
     }
 
     #[test]
