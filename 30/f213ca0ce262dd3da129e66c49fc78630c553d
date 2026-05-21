@@ -1,0 +1,24 @@
+net/crates/net/src/bus.rs
+  s_f930dae9b8bbc1::t_4368ea1f467d3f 2313-2318
+net/crates/net/docs/performance/net-perf-analysis.md
+  s_f930dae9b8bbc1::t_af64d84edda5e0 28
+net/crates/net/src/shard/batch.rs
+  s_f930dae9b8bbc1::t_dd0c1ba120a042 493-529
+  s_f930dae9b8bbc1::t_bb7ae9875ab5c9 328-336
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "30f213ca0ce262dd3da129e66c49fc78630c553d",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
