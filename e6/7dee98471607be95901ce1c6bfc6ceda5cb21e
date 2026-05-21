@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/compute/host.rs
+  s_4f93eae8f45533::t_de6ddb008a4ca9 672-774
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "e67dee98471607be95901ce1c6bfc6ceda5cb21e",
+  "prompts": {},
+  "sessions": {
+    "s_4f93eae8f45533": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4eeaced2-d67f-413c-87c1-4b5954eae6be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
