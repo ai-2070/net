@@ -222,6 +222,36 @@ impl RoutingHeader {
         buf.put_u64_le(self.dest_id);
     }
 
+    /// Overwrite an existing 18-byte slice with this header, in place.
+    ///
+    /// Distinct from [`Self::write_to`] which appends to the tail of a
+    /// `BytesMut`: this targets the head of an existing buffer (an
+    /// inbound packet's routing-header prefix) so the forwarder can
+    /// flip TTL / increment hop_count without allocating a fresh
+    /// packet. Used by `Router::route_packet`'s `Bytes::try_into_mut`
+    /// fast path — perf #18.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dst.len() < ROUTING_HEADER_SIZE`. The caller is
+    /// expected to have already validated the slice length via the
+    /// same check that decoded the header.
+    pub fn write_at(&self, dst: &mut [u8]) {
+        assert!(
+            dst.len() >= ROUTING_HEADER_SIZE,
+            "write_at: dst is {} bytes, need {}",
+            dst.len(),
+            ROUTING_HEADER_SIZE,
+        );
+        dst[0..2].copy_from_slice(&ROUTING_MAGIC.to_le_bytes());
+        dst[2] = self.ttl;
+        dst[3] = self.hop_count;
+        dst[4] = self.flags.as_u8();
+        dst[5] = self._reserved;
+        dst[6..10].copy_from_slice(&self.src_id.to_le_bytes());
+        dst[10..18].copy_from_slice(&self.dest_id.to_le_bytes());
+    }
+
     /// Read from a buffer. Returns `None` on short input or wrong
     /// magic; fields are consumed only on successful parse.
     pub fn read_from(buf: &mut Bytes) -> Option<Self> {
@@ -768,6 +798,46 @@ mod tests {
         let bytes = header.to_bytes();
         let parsed = RoutingHeader::from_bytes(&bytes).unwrap();
         assert_eq!(header, parsed);
+    }
+
+    /// Pin perf #18: `write_at` writes the same 18 bytes as
+    /// `write_to`, byte-for-byte. The router's
+    /// `Bytes::try_into_mut` fast path uses `write_at` to overwrite
+    /// the inbound packet's header in place; if the two paths
+    /// diverged (e.g. one swapped two fields), forwarded packets
+    /// would carry a malformed header — observable only as a
+    /// silent receive-side drop on the next hop.
+    #[test]
+    fn write_at_matches_write_to_byte_for_byte() {
+        let header = RoutingHeader::new(0xABCD_EF01_2345_6789, 0xDEAD_BEEF, 7);
+
+        // Path A: write_to into a fresh BytesMut.
+        let mut via_write_to = BytesMut::with_capacity(ROUTING_HEADER_SIZE);
+        header.write_to(&mut via_write_to);
+
+        // Path B: write_at into an existing 18-byte slice. Pre-fill
+        // with a sentinel pattern so an under-write would surface.
+        let mut via_write_at = [0xCC; ROUTING_HEADER_SIZE];
+        header.write_at(&mut via_write_at);
+
+        assert_eq!(
+            &via_write_to[..],
+            &via_write_at[..],
+            "write_at must produce the same wire bytes as write_to; \
+             a divergence would silently malform every forwarded packet",
+        );
+    }
+
+    /// Pin: `write_at` panics rather than silently truncates when
+    /// the destination slice is too short. A regression that turned
+    /// the assert into a saturating-write would let the router
+    /// emit an underwritten header into the forward path.
+    #[test]
+    #[should_panic(expected = "write_at")]
+    fn write_at_panics_on_short_slice() {
+        let header = RoutingHeader::new(1, 2, 1);
+        let mut short = [0u8; ROUTING_HEADER_SIZE - 1];
+        header.write_at(&mut short);
     }
 
     #[test]
