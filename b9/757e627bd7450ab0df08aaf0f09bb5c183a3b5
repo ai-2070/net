@@ -1,0 +1,47 @@
+net/crates/net/src/adapter/net/compute/host.rs
+  s_f930dae9b8bbc1::t_c89f5f13b7cd79 703-711,713
+  s_f930dae9b8bbc1::t_5879e803c1c4fe 712
+net/crates/net/src/bus.rs
+  s_f930dae9b8bbc1::t_8e3a21501bce7f 3913-3916
+  s_f930dae9b8bbc1::t_aad88fb59072a9 4016
+  s_f930dae9b8bbc1::t_91b7b372c1a652 4161-4175,4196-4198,4200
+  s_f930dae9b8bbc1::t_b8612a3212d181 3947-3951
+  s_f930dae9b8bbc1::t_06adbf93f3b17c 3998
+  s_f930dae9b8bbc1::t_ffc2836fd147d3 4060-4068
+  s_f930dae9b8bbc1::t_5879e803c1c4fe 3922,3942,3959,4001,4021,4105
+  s_f930dae9b8bbc1::t_c8a8cb02dde6c6 4076-4088,4093-4103,4133-4148
+  s_f930dae9b8bbc1::t_70a6e93e9ef881 1943-1990
+  s_4f93eae8f45533::t_e15287a8060178 4034-4059,4069-4075,4089-4092,4104,4106-4132,4149-4150
+net/crates/net/src/adapter/net/compute/daemon.rs
+  s_f930dae9b8bbc1::t_5879e803c1c4fe 620-621
+net/crates/net/src/adapter/net/compute/migration.rs
+  s_f930dae9b8bbc1::t_5879e803c1c4fe 523-524,542-545,560
+net/crates/net/src/adapter/net/behavior/meshos/probes.rs
+  s_f930dae9b8bbc1::t_be322c831d2714 354-365,369,375-376,380-381
+net/crates/net/src/adapter/net/contested/partition.rs
+  s_f930dae9b8bbc1::t_8bbf5f63f50e7e 473-479,481-484
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "b9757e627bd7450ab0df08aaf0f09bb5c183a3b5",
+  "prompts": {},
+  "sessions": {
+    "s_4f93eae8f45533": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4eeaced2-d67f-413c-87c1-4b5954eae6be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
