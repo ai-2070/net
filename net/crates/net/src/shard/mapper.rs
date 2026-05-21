@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering as AtomicOrde
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 
 use crate::config::ScalingPolicy;
@@ -401,6 +402,24 @@ struct MappedShard {
 /// Callback type for shard lifecycle events.
 type ShardCallback = Box<dyn Fn(u16) + Send + Sync>;
 
+/// Pre-computed slice of shard ids that `select_shard` may return.
+///
+/// Holds the subset of currently-Active shards whose `last_metrics.weight`
+/// is within tolerance of the minimum. Empty when no active shards exist
+/// (in which case `select_shard` returns `u16::MAX`).
+///
+/// The table is rebuilt by [`ShardMapper::rebuild_selection_table_locked`]
+/// at every mutation that could change which shards are routable (state
+/// transitions, metric/weight refresh, scale-up/down). Hot-path readers
+/// (`select_shard`) snapshot it via `ArcSwap::load` — zero alloc, zero
+/// lock per call.
+struct SelectionTable {
+    /// Shard ids in priority order (within-tolerance of min weight).
+    /// `Box<[u16]>` rather than `Vec<u16>` because the slice is immutable
+    /// after construction; saves one word per snapshot.
+    candidates: Box<[u16]>,
+}
+
 /// Dynamic shard mapper that manages shard allocation and producer routing.
 ///
 /// This is the core component for dynamic scaling. It:
@@ -411,6 +430,16 @@ type ShardCallback = Box<dyn Fn(u16) + Send + Sync>;
 pub struct ShardMapper {
     /// Mapped shards (RwLock for concurrent reads, rare writes).
     shards: RwLock<Vec<MappedShard>>,
+    /// Pre-computed routable-shard snapshot. Updated whenever the shard
+    /// list or weights change; read lock-free by [`Self::select_shard`].
+    ///
+    /// Pre-fix [perf #2 in `docs/performance/net-perf-analysis.md`],
+    /// `select_shard` did this work on every event: two `Vec` allocs +
+    /// an `RwLock::read` + min-weight scan + tolerance filter. At 10M
+    /// ev/s that's 20M allocs/sec plus a parking_lot acquire each time.
+    /// The table is rebuilt at most once per metrics tick and once per
+    /// state transition.
+    selection_table: ArcSwap<SelectionTable>,
     /// Current active shard count.
     active_count: AtomicU16,
     /// Scaling policy.
@@ -495,8 +524,11 @@ impl ShardMapper {
             })
             .collect();
 
-        Ok(Self {
+        let mapper = Self {
             shards: RwLock::new(shards),
+            selection_table: ArcSwap::from_pointee(SelectionTable {
+                candidates: Box::new([]),
+            }),
             active_count: AtomicU16::new(initial_shards),
             policy,
             ring_buffer_capacity,
@@ -506,7 +538,62 @@ impl ShardMapper {
             // Initial shards occupy ids `[0, initial_shards)`, so the
             // first scale-up takes `initial_shards`.
             next_shard_id: AtomicU16::new(initial_shards),
-        })
+        };
+        // Seed the selection table with the boot shards.
+        mapper.rebuild_selection_table_locked(&mapper.shards.read());
+        Ok(mapper)
+    }
+
+    /// Rebuild the [`Self::selection_table`] from the current shards
+    /// slice. Must be called while holding the `shards` lock (read or
+    /// write) so the snapshot it captures is consistent with the
+    /// state visible to other callers.
+    ///
+    /// Filters to `Active` shards, finds the minimum weight, and
+    /// retains every active shard whose weight is within 0.1 of the
+    /// minimum. The tolerance pre-existed the perf fix (see the old
+    /// `select_shard` body) so the new table preserves the same
+    /// routing semantics.
+    ///
+    /// NaN-tolerance edge case: if every active shard has a NaN
+    /// weight the tolerance filter excludes all of them. To preserve
+    /// the pre-fix fallback (`active[0].id`), the table falls back
+    /// to *every* active id in that case.
+    fn rebuild_selection_table_locked(&self, shards: &[MappedShard]) {
+        let mut active_ids = Vec::with_capacity(shards.len());
+        for s in shards.iter() {
+            if s.state == ShardState::Active {
+                active_ids.push(s.id);
+            }
+        }
+        if active_ids.is_empty() {
+            self.selection_table.store(Arc::new(SelectionTable {
+                candidates: Box::new([]),
+            }));
+            return;
+        }
+        let min_weight = shards
+            .iter()
+            .filter(|s| s.state == ShardState::Active)
+            .map(|s| s.last_metrics.weight)
+            .fold(f64::MAX, f64::min);
+        let mut candidates: Vec<u16> = shards
+            .iter()
+            .filter(|s| {
+                s.state == ShardState::Active
+                    && (s.last_metrics.weight - min_weight).abs() < 0.1
+            })
+            .map(|s| s.id)
+            .collect();
+        if candidates.is_empty() {
+            // All-NaN fallback. Preserves the pre-fix `active[0].id`
+            // safety net; the random pick across all active shards
+            // is a strict superset of "first active."
+            candidates = active_ids;
+        }
+        self.selection_table.store(Arc::new(SelectionTable {
+            candidates: candidates.into_boxed_slice(),
+        }));
     }
 
     /// Set callback for shard creation.
@@ -546,81 +633,55 @@ impl ShardMapper {
 
     /// Select the best shard for a new event/producer.
     ///
-    /// This implements weighted shard selection:
+    /// Pre-fix this acquired `shards.read()` and allocated two `Vec`s
+    /// per call (active filter, candidate filter) — at 10M ev/s that
+    /// was 20M allocs/sec plus a parking_lot acquire per event.
+    /// Post-fix the routable subset is pre-computed in
+    /// [`Self::selection_table`] and updated only at state
+    /// transitions / metric refreshes; the hot path is a single
+    /// `ArcSwap::load` + Lemire-bias-free integer mapping.
+    ///
+    /// Semantics preserved:
     /// - Only considers active (non-draining) shards
     /// - Prefers shards with lower weight (less loaded)
-    /// - Falls back to round-robin if weights are equal
+    /// - Falls back to a random pick across all active shards if the
+    ///   tolerance filter excludes everything (NaN-weight edge case)
+    /// - Returns `u16::MAX` when no active shard exists, so callers
+    ///   that route via the routing table get a definite miss
     #[inline]
     pub fn select_shard(&self, event_hash: u64) -> u16 {
-        let shards = self.shards.read();
-
-        // Filter to active shards only
-        let active: Vec<_> = shards
-            .iter()
-            .filter(|s| s.state == ShardState::Active)
-            .collect();
-
-        if active.is_empty() {
-            // Previously fell back to `find(|s| s.state !=
-            // ShardState::Stopped)`, which silently routed to a
-            // `Draining` shard. Pushes to a draining shard increment
-            // `pushes_since_drain_start`, blocking finalization
-            // indefinitely.
-            //
-            // `Provisioning` shards aren't routable either — they
-            // exist in the mapper but the routing table doesn't have
-            // them yet, so any caller that tries to push lands
-            // in `resolve_idx → None` and surfaces as "unrouted" via
-            // the manager-level counter. That's the correct signal:
-            // the system has no destination for this event, the
-            // caller should back off and retry.
-            //
-            // Return `u16::MAX` (out-of-band sentinel) so callers
-            // that look up the id in the routing table get a
-            // definite miss, which the manager already accounts for.
+        let table = self.selection_table.load();
+        if table.candidates.is_empty() {
+            // No active shards. Pre-fix returned `u16::MAX` from the
+            // same arm — callers that look up the id in the routing
+            // table get a definite miss, which the manager already
+            // accounts for.
             return u16::MAX;
         }
-
-        // Find the shard with lowest weight
-        let min_weight = active
-            .iter()
-            .map(|s| s.last_metrics.weight)
-            .fold(f64::MAX, f64::min);
-
-        // Get all shards with the minimum weight (within tolerance)
-        let candidates: Vec<_> = active
-            .iter()
-            .filter(|s| (s.last_metrics.weight - min_weight).abs() < 0.1)
-            .collect();
-
-        // Use hash to pick among candidates for determinism
-        // Fallback to first active shard if tolerance filter excludes all (e.g. NaN weights)
-        if candidates.is_empty() {
-            return active[0].id;
-        }
-        // Pre-fix used `(event_hash as usize) % candidates.len()`,
-        // which biases low-bucket indices when `candidates.len()`
-        // is not a power of two. With u64 hashes the bias is small
-        // but non-zero and accumulates over time as a sustained
-        // skew toward shards at the low end of the candidate
-        // vector. Lemire's technique
-        // (https://lemire.me/blog/2016/06/30/fast-random-shuffling/)
-        // computes the index as `(hash * len) >> 64` — an unbiased
-        // integer mapping for any `len` that fits in u64.
-        let idx = ((event_hash as u128 * candidates.len() as u128) >> 64) as usize;
-        candidates[idx].id
+        // Lemire's bias-free index mapping for any `len` that fits
+        // in u64. Pre-fix used `(event_hash as usize) %
+        // candidates.len()`, which biases low-bucket indices when
+        // `candidates.len()` is not a power of two
+        // (https://lemire.me/blog/2016/06/30/fast-random-shuffling/).
+        let idx = ((event_hash as u128 * table.candidates.len() as u128) >> 64) as usize;
+        table.candidates[idx]
     }
 
     /// Collect metrics from all shards and update weights.
     pub fn collect_metrics(&self) -> Vec<ShardMetrics> {
         let mut shards = self.shards.write();
-        shards
+        let result: Vec<ShardMetrics> = shards
             .iter_mut()
             .map(|s| {
                 s.last_metrics = s.metrics.collect_and_reset();
                 s.last_metrics.clone()
             })
-            .collect()
+            .collect();
+        // Weights just changed — refresh the selection table so
+        // `select_shard` observes the new min-weight candidate set
+        // without re-scanning on every event.
+        self.rebuild_selection_table_locked(&shards);
+        result
     }
 
     /// Evaluate scaling based on current metrics.
@@ -856,6 +917,11 @@ impl ShardMapper {
         self.active_count.fetch_add(count, AtomicOrdering::Release);
         *self.last_scaling.write() = Some(Instant::now());
 
+        // New active shards are routable immediately. Refresh the
+        // selection table before dropping the lock so any concurrent
+        // `select_shard` observes the new ids in its very next call.
+        self.rebuild_selection_table_locked(&shards);
+
         // Drop the write lock before notifying callbacks — they
         // are user-supplied and may take arbitrary time.
         drop(shards);
@@ -1023,6 +1089,10 @@ impl ShardMapper {
                 )));
             }
         }
+        // The shard just became routable. Refresh the selection
+        // table before dropping the lock so the next `select_shard`
+        // observes it.
+        self.rebuild_selection_table_locked(&shards);
         drop(shards);
 
         if let Some(callback) = self.on_shard_created.read().as_ref() {
@@ -1068,6 +1138,9 @@ impl ShardMapper {
                 )));
             }
         }
+        // The drained shard is no longer routable. Refresh the
+        // selection table before dropping the lock.
+        self.rebuild_selection_table_locked(&shards);
         drop(shards);
         self.active_count.fetch_sub(1, AtomicOrdering::Release);
         // Bump `last_scaling` so a subsequent `scale_up` is gated
@@ -1156,6 +1229,10 @@ impl ShardMapper {
             .fetch_sub(to_drain, AtomicOrdering::Release);
         *self.last_scaling.write() = Some(Instant::now());
 
+        // Drained shards are no longer routable. Refresh the
+        // selection table while still holding the lock.
+        self.rebuild_selection_table_locked(&shards);
+
         Ok(drained_ids)
     }
 
@@ -1216,6 +1293,14 @@ impl ShardMapper {
             }
         }
 
+        // Draining → Stopped transitions: no impact on the routable
+        // set (Draining was already excluded), but rebuild for
+        // consistency in case `last_metrics.weight` was stale on a
+        // shard that just stopped. Cheap; bounded by shard count.
+        if !stopped.is_empty() {
+            self.rebuild_selection_table_locked(&shards);
+        }
+
         // Drop the write lock BEFORE notifying. The callback is
         // user-supplied and may re-enter the mapper (`shard_state`,
         // `select_shard`, `metrics_collector`, …), each of which
@@ -1247,7 +1332,14 @@ impl ShardMapper {
         let mut shards = self.shards.write();
         let before = shards.len();
         shards.retain(|s| !(s.id == shard_id && s.state == ShardState::Stopped));
-        shards.len() < before
+        let removed = shards.len() < before;
+        if removed {
+            // Stopped shards weren't routable, but the underlying
+            // slice changed length / order — rebuild so the table
+            // doesn't dangle a stale id.
+            self.rebuild_selection_table_locked(&shards);
+        }
+        removed
     }
 
     /// Remove stopped shards from the mapper.
@@ -1268,6 +1360,8 @@ impl ShardMapper {
                 remaining = shards.len(),
                 "Removed stopped shards"
             );
+            // Same reason as `remove_specific_stopped_shard`.
+            self.rebuild_selection_table_locked(&shards);
         }
 
         removed
@@ -1341,6 +1435,72 @@ mod tests {
 
         // With 4 shards, we should hit multiple
         assert!(!selected.is_empty());
+    }
+
+    /// Pin for perf #2: the selection table reflects the routable
+    /// subset *exactly*, and `select_shard` reads it lock-free.
+    /// A regression that, say, forgot to refresh after `drain_specific`
+    /// would let `select_shard` continue routing to the draining
+    /// shard — observable here as the drained id appearing in
+    /// `select_shard`'s output.
+    #[test]
+    fn selection_table_reflects_active_subset_after_state_transitions() {
+        // ScalingPolicy::validate rejects `min_shards == 0`; use 1
+        // and verify we can drain down to the floor via the
+        // official `drain_specific` API.
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 8,
+            cooldown: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let mapper = ShardMapper::new(3, 1024, policy).unwrap();
+
+        // Initial: all 3 shards routable.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..500u64 {
+            seen.insert(mapper.select_shard(i.wrapping_mul(0x9E3779B97F4A7C15)));
+        }
+        assert_eq!(seen, std::collections::HashSet::from([0, 1, 2]));
+
+        // Drain shard 1 → only 0 and 2 should be routable.
+        mapper.drain_specific(1).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..500u64 {
+            seen.insert(mapper.select_shard(i.wrapping_mul(0x9E3779B97F4A7C15)));
+        }
+        assert_eq!(
+            seen,
+            std::collections::HashSet::from([0, 2]),
+            "drained shard must vanish from select_shard output; \
+             a regression here would let select_shard route to a \
+             Draining shard (blocking finalization)",
+        );
+
+        // Drain shard 2 → only 0 left (at min_shards floor).
+        mapper.drain_specific(2).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..500u64 {
+            seen.insert(mapper.select_shard(i.wrapping_mul(0x9E3779B97F4A7C15)));
+        }
+        assert_eq!(seen, std::collections::HashSet::from([0]));
+    }
+
+    /// Pin: `select_shard` does NOT acquire `self.shards` (read or
+    /// write). The whole perf #2 fix is that the hot path is
+    /// `ArcSwap::load` only — no parking_lot. We pin this by
+    /// holding a write lock on `shards` and asserting
+    /// `select_shard` still returns immediately.
+    #[test]
+    fn select_shard_does_not_acquire_shards_lock() {
+        let mapper = ShardMapper::new(2, 1024, ScalingPolicy::default()).unwrap();
+
+        // Hold the write lock. If `select_shard` tried to acquire
+        // any flavor of `shards.{read,write}()` it would block
+        // forever — parking_lot is not recursive.
+        let _guard = mapper.shards.write();
+        let shard = mapper.select_shard(0xDEAD_BEEF);
+        assert!(shard < 2, "select_shard must return one of [0, 1]");
     }
 
     /// `select_shard`'s candidate-index computation must
@@ -2394,12 +2554,18 @@ mod tests {
         // `scale_down`'s min_shards floor by mutating the test-only
         // accessor; this models a state that can otherwise be
         // reached by `drain_specific` calls.
+        //
+        // Backdoor mutations don't trigger the `select_shard`
+        // selection-table rebuild that the public API does, so we
+        // call it explicitly here to model what `drain_specific`
+        // would have done.
         {
             let mut shards = mapper.shards.write();
             for s in shards.iter_mut() {
                 s.state = ShardState::Draining;
                 s.metrics.set_draining(true);
             }
+            mapper.rebuild_selection_table_locked(&shards);
         }
 
         // The fallback must return the OOB sentinel `u16::MAX` rather

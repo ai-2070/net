@@ -13,6 +13,7 @@ Findings ordered by expected impact within each section. Item numbers run contin
 | # | Item | Subsystem | Notes |
 |---|------|-----------|-------|
 | 13 | `dispatch_batch` retry `batch.clone()` → `Arc<Batch>` | Core bus | `Adapter::on_batch` now takes `Arc<Batch>`; retries are a refcount bump instead of a deep `Vec` clone. Mesh `send_to_peer`/`send_routed` switched to `&Batch` (they never consumed). Pinned by `dispatch_batch_retries_share_the_same_arc_allocation`. |
+| 2 | `Mapper::select_shard` per-event allocs → `ArcSwap<SelectionTable>` | Core bus | Hot path is now a single `ArcSwap::load` + Lemire mapping. Two `Vec` allocs and a parking_lot read lock per event are gone (at 10M ev/s that was 20M allocs/sec). Routable subset is pre-computed at every shard-state mutation (`collect_metrics`, `scale_up`, `activate`, `drain_specific`, `scale_down`, `finalize_draining`, `remove_*_stopped_shard`). Pinned by `selection_table_reflects_active_subset_after_state_transitions` and `select_shard_does_not_acquire_shards_lock`. |
 
 ---
 
