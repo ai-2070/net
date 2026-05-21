@@ -1,0 +1,121 @@
+net/crates/net/src/adapter/net/dataforts/blob/conformance.rs
+  s_f930dae9b8bbc1::t_ea9713af20812b 94
+net/crates/net/src/ffi/blob.rs
+  s_f930dae9b8bbc1::t_789ccc4e06c5ff 659,667,685,691-698,701,711,721,741,749
+  s_f930dae9b8bbc1::t_f27c6f1826ac8c 447
+net/crates/net/src/adapter/net/dataforts/blob/fs.rs
+  s_f930dae9b8bbc1::t_133676f2ee4bd9 378,390
+  s_f930dae9b8bbc1::t_3e41881372a992 854-855
+  s_f930dae9b8bbc1::t_68e819fdf368df 346
+  s_f930dae9b8bbc1::t_8d4ce1c74ba10d 324,334,337,355
+  s_f930dae9b8bbc1::t_b1bbc5dc5e89ec 600
+  s_f930dae9b8bbc1::t_872c32c3ad0578 638
+net/crates/net/src/adapter/net/redex/file.rs
+  s_f930dae9b8bbc1::t_2ca1b9188e3ab9 1156
+net/crates/net/src/adapter/net/dataforts/blob/adapter.rs
+  s_f930dae9b8bbc1::t_dafe9a8016b238 144
+  s_f930dae9b8bbc1::t_68e819fdf368df 119
+  s_f930dae9b8bbc1::t_61cf1f57685c26 102-110,117-118
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_f930dae9b8bbc1::t_973983deb21d03 4156
+  s_f930dae9b8bbc1::t_287ead885959c7 3311,3320-3324,3326
+  s_f930dae9b8bbc1::t_7c9c8657d3ba74 2473-2479,2481,2500
+  s_f930dae9b8bbc1::t_de6ac2509beaa9 50
+  s_f930dae9b8bbc1::t_c79baa2e87992f 4159-4196
+  s_f930dae9b8bbc1::t_c5c02e5023aab9 4713-4723
+  s_f930dae9b8bbc1::t_6c7a72e03a5b43 3124
+  s_f930dae9b8bbc1::t_0e23f9179e5eeb 3407
+  s_f930dae9b8bbc1::t_de497f8b9ca277 2188,2203-2210,2214-2215,2218
+  s_f930dae9b8bbc1::t_e81f2d568cffc0 3212-3219,3230
+  s_f930dae9b8bbc1::t_425c5f1a506445 2737-2741
+  s_f930dae9b8bbc1::t_8a6a2c9e1367ae 3380
+  s_f930dae9b8bbc1::t_4478fd159f96c8 4145
+  s_f930dae9b8bbc1::t_68e819fdf368df 4709,4711
+  s_f930dae9b8bbc1::t_744e5df1949a9e 6748
+  s_f930dae9b8bbc1::t_1e471759115177 3271,3280
+net/crates/net/src/adapter/net/dataforts/blob/migration.rs
+  s_f930dae9b8bbc1::t_3c64e583178361 892,899
+net/crates/net/bindings/node/src/blob.rs
+  s_f930dae9b8bbc1::t_fa269b5574f821 533
+  s_f930dae9b8bbc1::t_9faedf064366cc 1005,1012,1032
+  s_f930dae9b8bbc1::t_00cb5602408f0b 1324
+  s_f930dae9b8bbc1::t_6e0e61e54ef2b3 732-737,744,764
+  s_f930dae9b8bbc1::t_68e819fdf368df 715-718,988-991
+  s_f930dae9b8bbc1::t_563817fe755f1d 1345
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_f930dae9b8bbc1::t_fe4e6c77407c1e 2204,2211
+net/crates/net/src/adapter/net/dataforts/blob/blob_tree_cache.rs
+  s_f930dae9b8bbc1::t_2a1eeaa45b9f9e 154
+  s_f930dae9b8bbc1::t_c1e0aeb508d74a 66
+  s_f930dae9b8bbc1::t_ca341d8f5d5759 311
+  s_f930dae9b8bbc1::t_c893fd4b97aff0 114-118
+  s_f930dae9b8bbc1::t_00904e813cc985 279
+  s_f930dae9b8bbc1::t_b0fe652ce6abfc 361
+  s_f930dae9b8bbc1::t_aa3afe7c73a582 329
+  s_f930dae9b8bbc1::t_ec9dd86221bbfe 305
+  s_f930dae9b8bbc1::t_8f8e05a5f6b7bb 341-342
+  s_f930dae9b8bbc1::t_d40e33eb16f342 45
+  s_f930dae9b8bbc1::t_9edad41291c70e 352
+  s_f930dae9b8bbc1::t_1972affba12984 277,289,297
+  s_f930dae9b8bbc1::t_c22b22d67ccb01 306
+  s_f930dae9b8bbc1::t_17cf55baae6a78 320-321
+net/crates/net/src/adapter/net/dataforts/blob/dispatch.rs
+  s_f930dae9b8bbc1::t_19b6a846af375a 381
+  s_f930dae9b8bbc1::t_80b4413e91fc2e 22-23
+  s_f930dae9b8bbc1::t_742d1e56841e89 72,74
+  s_f930dae9b8bbc1::t_fc14fdbde0b595 662
+  s_f930dae9b8bbc1::t_2f5df548d4226c 716,722-723
+  s_f930dae9b8bbc1::t_ba0999a8c8c2be 411,477,553,624,715
+  s_f930dae9b8bbc1::t_a083f67c8bbe31 412,418-421
+  s_f930dae9b8bbc1::t_a0f20b8c83afa9 352
+  s_f930dae9b8bbc1::t_2cd66817536f0f 448
+  s_f930dae9b8bbc1::t_d27463b068b48d 554,560,562-564
+  s_f930dae9b8bbc1::t_e8eded678a291b 321
+  s_f930dae9b8bbc1::t_c709af659754bb 301
+  s_f930dae9b8bbc1::t_b365a678414d56 478,484-487
+  s_f930dae9b8bbc1::t_2a0a444b5c643d 767-768,774-775
+  s_f930dae9b8bbc1::t_b02e616cbb3fbc 625,631-634
+net/crates/net/bindings/python/src/blob.rs
+  s_f930dae9b8bbc1::t_f630a2836205ab 1131
+  s_f930dae9b8bbc1::t_cce532e80277dc 623
+  s_f930dae9b8bbc1::t_85f907345c92ba 817,820,831-836,847,852,863
+  s_f930dae9b8bbc1::t_0cf4741d9bf894 1107
+net/crates/net/src/adapter/net/dataforts/blob/publish_with_blob.rs
+  s_f930dae9b8bbc1::t_21994124d6a6fd 335-336
+net/crates/net/src/adapter/net/channel/roster.rs
+  s_f930dae9b8bbc1::t_68e819fdf368df 166-168
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_f930dae9b8bbc1::t_68e819fdf368df 1553-1555,1641-1643,2152-2154,2687-2689,3097-3099,4213-4214,4238-4239
+net/crates/net/src/consumer/filter.rs
+  s_f930dae9b8bbc1::t_68e819fdf368df 120,222
+net/crates/net/src/shard/mapper.rs
+  s_f930dae9b8bbc1::t_68e819fdf368df 583
+net/crates/net/tests/dataforts_blob_e2e.rs
+  s_f930dae9b8bbc1::t_f8356a3c2db333 278
+  s_f930dae9b8bbc1::t_68e819fdf368df 543-544,794-803
+net/crates/net/src/adapter/net/dataforts/blob/noop.rs
+  s_f930dae9b8bbc1::t_27a6aa0b978e00 13
+  s_f930dae9b8bbc1::t_70bcb529228af8 49,57
+net/crates/net/tests/integration_nrpc_predicate_header.rs
+  s_f930dae9b8bbc1::t_68e819fdf368df 160-162
+net/crates/net/docs/performance/net-dataforts-analysis.md
+  s_f930dae9b8bbc1::t_e22f8867f9b95d 18
+net/crates/net/src/adapter/net/mesh.rs
+  s_f930dae9b8bbc1::t_68e819fdf368df 4604
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "be201e3789f58aaf50a26ff71f2c9f50501229c3",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
