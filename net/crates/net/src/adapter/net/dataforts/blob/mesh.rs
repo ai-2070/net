@@ -753,12 +753,19 @@ impl MeshBlobAdapter {
     /// `Mutex` which does NOT poison on panic, so any panic
     /// inside another holder leaves the registry usable; we
     /// acquire unconditionally without any poison handling.
-    fn bump_heat(&self, hashes: &[[u8; 32]]) {
+    ///
+    /// Takes `IntoIterator<Item = [u8; 32]>` rather than `&[..]`
+    /// so callers can stream hashes straight from the underlying
+    /// source (`std::iter::once(hash)` for `Small`,
+    /// `chunks.iter().map(|c| c.hash)` for `Manifest`) without
+    /// materializing an intermediate `Vec` per fetch — see
+    /// dataforts perf #178.
+    fn bump_heat<I: IntoIterator<Item = [u8; 32]>>(&self, hashes: I) {
         if let Some(reg) = self.blob_heat.as_ref() {
             let now = std::time::Instant::now();
             let mut guard = reg.lock();
             for h in hashes {
-                guard.entry_mut(*h, self.blob_heat_half_life, now).bump(now);
+                guard.entry_mut(h, self.blob_heat_half_life, now).bump(now);
             }
         }
     }
@@ -3207,15 +3214,18 @@ impl BlobAdapter for MeshBlobAdapter {
             self.metrics.record_fetch();
             // PR-5j-b: bump blob heat for every chunk hash a
             // successful fetch resolved. No-op when no registry
-            // is wired.
+            // is wired. Streams the hash sequence directly into
+            // `bump_heat` per dataforts perf #178 — no
+            // intermediate `Vec` allocation.
             if self.blob_heat.is_some() {
-                let hashes: Vec<[u8; 32]> = match blob_ref {
-                    BlobRef::Small { hash, .. } => vec![*hash],
-                    BlobRef::Manifest { chunks, .. } => chunks.iter().map(|c| c.hash).collect(),
+                match blob_ref {
+                    BlobRef::Small { hash, .. } => self.bump_heat(std::iter::once(*hash)),
+                    BlobRef::Manifest { chunks, .. } => {
+                        self.bump_heat(chunks.iter().map(|c| c.hash));
+                    }
                     // Tree path errored above; unreachable here.
-                    BlobRef::Tree { .. } => Vec::new(),
-                };
-                self.bump_heat(&hashes);
+                    BlobRef::Tree { .. } => {}
+                }
             }
         }
         result
@@ -3362,7 +3372,7 @@ impl BlobAdapter for MeshBlobAdapter {
             }
         };
         if result.is_ok() && !touched.is_empty() {
-            self.bump_heat(&touched);
+            self.bump_heat(touched);
         }
         result
     }
@@ -4577,6 +4587,55 @@ mod tests {
             after_second >= 1.0,
             "rate must remain >= 1.0 after second fetch (got {after_second})"
         );
+    }
+
+    /// Pin dataforts perf #178: a successful Manifest fetch bumps
+    /// the heat counter for EVERY chunk hash in the manifest. The
+    /// fix replaced a `vec![*hash]` / `chunks.iter().map().collect()`
+    /// staging Vec with `self.bump_heat(chunks.iter().map(|c| c.hash))`
+    /// (streamed iterator into the new `IntoIterator<Item = [u8;32]>`
+    /// `bump_heat` signature). A regression that dropped chunks
+    /// from the streamed sequence — e.g. an off-by-one on the
+    /// iterator, or misrouting the `BlobRef::Manifest` arm back to
+    /// the `Tree`-style no-op — would surface here as missing heat
+    /// entries for the trailing chunks.
+    #[tokio::test]
+    async fn fetch_manifest_bumps_blob_heat_for_every_chunk_hash() {
+        use crate::adapter::net::dataforts::gravity::BlobHeatRegistry;
+        let redex = Arc::new(Redex::new());
+        let registry = Arc::new(parking_lot::Mutex::new(BlobHeatRegistry::new()));
+        let adapter = MeshBlobAdapter::new("mesh-heat-manifest", redex)
+            .with_blob_heat(registry.clone(), DEFAULT_BLOB_HEAT_HALF_LIFE);
+
+        // 3-chunk payload: well over 2×BLOB_CHUNK_SIZE_BYTES so
+        // we exercise the iterator over a chunk list bigger than
+        // any small-Vec optimization fast path could mask.
+        let payload: Vec<u8> = (0..(BLOB_CHUNK_SIZE_BYTES as usize * 2 + 1024))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let chunked = chunk_payload(&payload).unwrap();
+        let chunk_refs: Vec<ChunkRef> = match chunked {
+            ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
+            _ => panic!("expected Chunked"),
+        };
+        assert!(
+            chunk_refs.len() >= 3,
+            "fixture must produce ≥3 chunks (got {})",
+            chunk_refs.len()
+        );
+        let blob = BlobRef::manifest("mesh://heat-many", Encoding::Replicated, chunk_refs.clone())
+            .unwrap();
+        adapter.store(&blob, &payload).await.unwrap();
+
+        let _ = adapter.fetch(&blob).await.unwrap();
+
+        let guard = registry.lock();
+        for (i, c) in chunk_refs.iter().enumerate() {
+            assert!(
+                guard.get(&c.hash).is_some(),
+                "chunk {i} hash must have a heat entry after fetch"
+            );
+        }
     }
 
     #[tokio::test]
