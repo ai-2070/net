@@ -1537,4 +1537,101 @@ mod tests {
              a regression here keeps probing a broken backend",
         );
     }
+
+    /// Pin: the `Default` for `FailureDetectorConfig` is what
+    /// `FailureDetector::new()` installs, and downstream timing
+    /// (heartbeat windows, suspicion → failure escalation, the
+    /// 30s cleanup cadence that frees stale-node memory) depends
+    /// on the specific values. A refactor that bumps `timeout`
+    /// to 50s or drops `cleanup_interval` to 3s would silently
+    /// change failure-detection latency in every default-config
+    /// caller — pin the load-bearing values.
+    #[test]
+    fn failure_detector_config_default_values() {
+        let cfg = FailureDetectorConfig::default();
+        assert_eq!(cfg.timeout, Duration::from_secs(5));
+        assert_eq!(cfg.miss_threshold, 3);
+        assert_eq!(cfg.suspicion_threshold, 2);
+        assert_eq!(cfg.cleanup_interval, Duration::from_secs(30));
+    }
+
+    /// `suspected_nodes` / `healthy_nodes` filter the tracked
+    /// nodes by `NodeStatus`. A regression that swaps the two
+    /// (or aliases either to `failed_nodes`) would mis-route
+    /// every operator query — dashboards would render Suspected
+    /// nodes as Healthy or vice versa.
+    #[test]
+    fn suspected_and_healthy_nodes_filter_by_status() {
+        let detector = FailureDetector::new();
+        // Seed three nodes in distinct states by manipulating
+        // the internal `nodes` map directly (the same trick
+        // existing tests use to stage failure-detector state
+        // without sleeping out real timeouts).
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        detector.heartbeat(1, addr);
+        detector.heartbeat(2, addr);
+        detector.heartbeat(3, addr);
+        // Drop their statuses into known classes.
+        detector.nodes.get_mut(&2).unwrap().status = NodeStatus::Suspected;
+        detector.nodes.get_mut(&3).unwrap().status = NodeStatus::Failed;
+
+        let mut healthy = detector.healthy_nodes();
+        healthy.sort_unstable();
+        assert_eq!(healthy, vec![1]);
+
+        let suspected = detector.suspected_nodes();
+        assert_eq!(suspected, vec![2]);
+    }
+
+    /// `cleanup` is rate-limited by `cleanup_interval`. Two
+    /// calls within the interval must return early (no nodes
+    /// scanned, no removals) so a hot loop can't pin the mutex
+    /// or thrash DashMap iteration.
+    #[test]
+    fn cleanup_returns_zero_within_cleanup_interval() {
+        let detector = FailureDetector::with_config(FailureDetectorConfig {
+            cleanup_interval: Duration::from_secs(60),
+            ..Default::default()
+        });
+        // Force `last_cleanup` to "just now" so the rate-limit
+        // gate fires.
+        *detector.last_cleanup.lock() = Instant::now();
+        assert_eq!(
+            detector.cleanup(),
+            0,
+            "cleanup called inside the rate-limit window must return 0 without scanning",
+        );
+    }
+
+    /// `LossSimulator::effective_loss_rate` returns `0.0` on the
+    /// divide-by-zero guard (no packets observed) and a real
+    /// ratio once packets have flowed. Operator dashboards
+    /// reading this on a freshly-started simulator must see 0,
+    /// not `NaN` from `0/0`.
+    #[test]
+    fn loss_simulator_effective_loss_rate_handles_div_by_zero_and_ratio() {
+        let sim = LossSimulator::new(1.0); // drop everything
+        assert_eq!(sim.effective_loss_rate(), 0.0, "no packets → 0, not NaN");
+
+        // Drive 4 should_drop() calls — with prob 1.0 every
+        // packet is dropped, so the ratio reads 4/4 = 1.0.
+        for _ in 0..4 {
+            let _ = sim.should_drop();
+        }
+        let rate = sim.effective_loss_rate();
+        assert!(
+            (rate - 1.0).abs() < 1e-6,
+            "expected loss_rate ≈ 1.0 after 4 drops; got {rate}",
+        );
+
+        // reset() zeroes the counters AND the burst state. The
+        // post-reset rate is 0/0 → the div-by-zero guard fires
+        // again.
+        sim.reset();
+        assert_eq!(sim.total_packets.load(Ordering::Relaxed), 0);
+        assert_eq!(sim.total_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(sim.burst_remaining.load(Ordering::Relaxed), 0);
+        assert!(!sim.in_burst.load(Ordering::Relaxed));
+        assert_eq!(sim.effective_loss_rate(), 0.0);
+    }
 }
