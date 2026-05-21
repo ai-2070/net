@@ -197,13 +197,24 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
   };
 }
 
+// In production every doc path is enumerated at build time, so the tree is
+// safe to memoize once. In dev we always re-walk so additions / renames /
+// deletions show up on the next request — content files aren't ES modules,
+// so Next.js's HMR doesn't watch them, and a stale cache here is why
+// `npm run dev` looked like it had stopped picking up MDX changes.
+const IS_DEV = process.env.NODE_ENV !== "production";
 let cached: DocTree | null = null;
 
 export function getDocTree(): DocTree {
-  if (cached) return cached;
+  if (!IS_DEV && cached) return cached;
+  const tree = buildDocTree();
+  if (!IS_DEV) cached = tree;
+  return tree;
+}
+
+function buildDocTree(): DocTree {
   if (!existsSync(DOCS_ROOT)) {
-    cached = { rootReadme: null, rootFiles: [], folders: [] };
-    return cached;
+    return { rootReadme: null, rootFiles: [], folders: [] };
   }
   const entries = readdirSync(DOCS_ROOT).sort((a, b) => a.localeCompare(b));
   const folders: DocFolder[] = [];
@@ -238,8 +249,7 @@ export function getDocTree(): DocTree {
     (f) => f.slug[f.slug.length - 1] ?? "",
   );
 
-  cached = { rootReadme, rootFiles, folders: orderedFolders };
-  return cached;
+  return { rootReadme, rootFiles, folders: orderedFolders };
 }
 
 function lastSlug(n: DocNode): string {
@@ -384,9 +394,10 @@ function addFolder(
 
 let cachedLinear: LinearDoc[] | null = null;
 function getLinearDocs(): LinearDoc[] {
-  if (cachedLinear) return cachedLinear;
-  cachedLinear = flattenForLinearOrder(getDocTree());
-  return cachedLinear;
+  if (!IS_DEV && cachedLinear) return cachedLinear;
+  const linear = flattenForLinearOrder(getDocTree());
+  if (!IS_DEV) cachedLinear = linear;
+  return linear;
 }
 
 // Look up the previous + next page in the sidebar order for a given slug.
