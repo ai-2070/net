@@ -158,7 +158,7 @@ cli = ["dataforts", "redex-disk", "dep:clap"]
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 
 # JSON handling (schema-agnostic)
 serde = { version = "1", features = ["derive", "rc"] }

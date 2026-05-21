@@ -245,12 +245,29 @@ impl PacketReceiver {
         }
     }
 
-    /// Receive the next packet
+    /// Receive the next packet.
+    ///
+    /// Routes through tokio's `recv_buf_from(&mut BufMut)` per
+    /// crypto-session perf #130. The legacy
+    /// `resize(MAX_PACKET_SIZE, 0)` + `recv_from(&mut [u8])` shape
+    /// zero-filled ~1500 bytes per packet just for the kernel to
+    /// overwrite them on the next syscall — pure wasted memset
+    /// bandwidth at packet rate. `recv_buf_from` writes directly
+    /// into the `BytesMut`'s spare capacity using `BufMut::chunk_mut`,
+    /// so the kernel's bytes are the first writers and no
+    /// pre-init is needed.
+    ///
+    /// `clear()` + `reserve(MAX_PACKET_SIZE)` returns the buffer
+    /// to length 0 while keeping the existing allocation; the
+    /// `reserve` is a no-op once steady-state capacity is reached.
+    /// The `freeze()` at the end transfers ownership of the
+    /// initialized prefix to the returned `Bytes`; `split()`
+    /// leaves the underlying allocation behind for the next call
+    /// to reuse via `reserve`.
     pub async fn recv(&mut self) -> io::Result<(Bytes, SocketAddr)> {
-        self.recv_buf.resize(MAX_PACKET_SIZE, 0);
-        let (len, addr) = self.socket.recv_from(&mut self.recv_buf).await?;
-        self.recv_buf.truncate(len);
-
+        self.recv_buf.clear();
+        self.recv_buf.reserve(MAX_PACKET_SIZE);
+        let (_len, addr) = self.socket.recv_buf_from(&mut self.recv_buf).await?;
         Ok((self.recv_buf.split().freeze(), addr))
     }
 
@@ -540,6 +557,38 @@ mod tests {
         assert_eq!(parsed.header.stream_id, 0x5678);
         assert_eq!(parsed.header.sequence, 42);
         assert!(parsed.is_valid_length());
+    }
+
+    /// Source pin: crypto-session perf #130 — `PacketReceiver::recv`
+    /// MUST route through tokio's `recv_buf_from` (which appends
+    /// to a `BufMut`'s spare capacity) and MUST NOT `resize(N, 0)`
+    /// on the receive buffer. Pre-fix every packet paid a
+    /// `~1500 byte memset` to zero just for the kernel to
+    /// overwrite the same bytes immediately. A regression that
+    /// flips back to `resize(MAX_PACKET_SIZE, 0)` would silently
+    /// re-introduce gigabytes/sec of memset on high-pps
+    /// deployments — observable only as a microbenchmark
+    /// regression at runtime, so pin via source inspection.
+    #[test]
+    fn packet_receiver_recv_must_use_recv_buf_from_not_resize_zero() {
+        let src = include_str!("transport.rs");
+        let body_idx = src
+            .find("pub async fn recv(&mut self) -> io::Result<(Bytes, SocketAddr)>")
+            .expect("PacketReceiver::recv must exist");
+        // Look at the immediate body of the method (next ~400 chars).
+        let body = &src[body_idx..body_idx + 1200];
+        assert!(
+            body.contains("recv_buf_from"),
+            "regression: PacketReceiver::recv must route through `recv_buf_from` \
+             per crypto-session perf #130; falling back to `recv_from(&mut [u8])` \
+             requires pre-zeroing the buffer. Body: {body}"
+        );
+        assert!(
+            !body.contains("resize(MAX_PACKET_SIZE, 0)"),
+            "regression: PacketReceiver::recv must NOT pre-zero the receive buffer; \
+             pre-fix this memset ~1500 bytes per packet only for the kernel to \
+             overwrite them immediately. Body: {body}"
+        );
     }
 
     #[tokio::test]
