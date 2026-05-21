@@ -506,6 +506,144 @@ mod tests {
         );
     }
 
+    /// Pin: only `NotReady` is retriable. The rest are terminal.
+    /// A regression that marks `FactoryNotFound` (or any other
+    /// terminal reason) as retriable would cause the source to
+    /// retry forever, waiting for a daemon that will never be
+    /// registered — silent migration hang.
+    #[test]
+    fn migration_failure_reason_is_retriable_only_for_not_ready() {
+        assert!(MigrationFailureReason::NotReady.is_retriable());
+
+        // All other variants must be terminal.
+        assert!(!MigrationFailureReason::FactoryNotFound.is_retriable());
+        assert!(!MigrationFailureReason::ComputeNotSupported.is_retriable());
+        assert!(!MigrationFailureReason::StateFailed("x".into()).is_retriable());
+        assert!(!MigrationFailureReason::AlreadyMigrating.is_retriable());
+        assert!(
+            !MigrationFailureReason::IdentityTransportFailed("x".into()).is_retriable()
+        );
+        assert!(
+            !MigrationFailureReason::NotReadyTimeout { attempts: 5 }.is_retriable()
+        );
+    }
+
+    /// Pin: each variant has a distinct 16-bit wire code. A
+    /// collision (two variants returning the same code) would
+    /// silently mis-decode on the receiver — the dispatcher's
+    /// payload-length-by-tag logic depends on tag uniqueness.
+    /// Also pin the specific code values so a re-order of the
+    /// enum doesn't silently re-number them (which would break
+    /// every existing peer parsing the wire format).
+    #[test]
+    fn migration_failure_reason_code_is_stable_and_unique() {
+        let variants = [
+            (MigrationFailureReason::NotReady, 0u16),
+            (MigrationFailureReason::FactoryNotFound, 1),
+            (MigrationFailureReason::ComputeNotSupported, 2),
+            (MigrationFailureReason::StateFailed("x".into()), 3),
+            (MigrationFailureReason::AlreadyMigrating, 4),
+            (MigrationFailureReason::IdentityTransportFailed("y".into()), 5),
+            (MigrationFailureReason::NotReadyTimeout { attempts: 1 }, 6),
+        ];
+        for (reason, expected_code) in &variants {
+            assert_eq!(
+                reason.code(),
+                *expected_code,
+                "wire code drift for {reason:?}",
+            );
+        }
+        // Pairwise uniqueness.
+        let codes: Vec<u16> = variants.iter().map(|(r, _)| r.code()).collect();
+        let mut sorted = codes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            codes.len(),
+            sorted.len(),
+            "wire-code collision: {codes:?}",
+        );
+    }
+
+    /// Pin: every MigrationFailureReason Display message names the
+    /// failure class so operators can triage from a single log
+    /// line. A refactor that drops the variant name from the
+    /// message would force consumers to look at the wire code
+    /// instead.
+    #[test]
+    fn migration_failure_reason_display_covers_every_variant() {
+        assert_eq!(
+            format!("{}", MigrationFailureReason::NotReady),
+            "target runtime not ready yet"
+        );
+        assert_eq!(
+            format!("{}", MigrationFailureReason::FactoryNotFound),
+            "no factory registered on target for this daemon"
+        );
+        assert_eq!(
+            format!("{}", MigrationFailureReason::ComputeNotSupported),
+            "target does not run a compute runtime"
+        );
+        assert_eq!(
+            format!("{}", MigrationFailureReason::StateFailed("boom".into())),
+            "state failed: boom"
+        );
+        assert_eq!(
+            format!("{}", MigrationFailureReason::AlreadyMigrating),
+            "daemon is already migrating"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                MigrationFailureReason::IdentityTransportFailed("seal failed".into())
+            ),
+            "identity envelope transport failed: seal failed"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                MigrationFailureReason::NotReadyTimeout { attempts: 7 }
+            ),
+            "source gave up after 7 NotReady retries"
+        );
+    }
+
+    /// The existing `test_wrong_phase_error` pins `restore_complete`
+    /// rejecting Snapshot-state. The peer phase-advance methods
+    /// (`transfer_complete`, `replay_complete`, `cutover_complete`)
+    /// also gate on phase, but only restore_complete's reject
+    /// branch was exercised — the codecov gap at L226-L229 and
+    /// L239-L242 was the WrongPhase construction inside the other
+    /// methods. Pin them so a future refactor that loosens any
+    /// individual guard can't drop a phase silently.
+    #[test]
+    fn phase_advance_methods_reject_when_not_in_prerequisite_phase() {
+        let mut state = MigrationState::new(0xAAAA, 0x1111, 0x2222);
+
+        // Fresh state is in Snapshot — none of these may advance.
+        assert!(matches!(
+            state.transfer_complete(),
+            Err(MigrationError::WrongPhase {
+                expected: MigrationPhase::Transfer,
+                got: MigrationPhase::Snapshot
+            })
+        ));
+        assert!(matches!(
+            state.replay_complete(),
+            Err(MigrationError::WrongPhase {
+                expected: MigrationPhase::Replay,
+                got: MigrationPhase::Snapshot
+            })
+        ));
+        assert!(matches!(
+            state.cutover_complete(),
+            Err(MigrationError::WrongPhase {
+                expected: MigrationPhase::Cutover,
+                got: MigrationPhase::Snapshot
+            })
+        ));
+    }
+
     // ---- Regression tests for Cubic AI findings ----
 
     #[test]
