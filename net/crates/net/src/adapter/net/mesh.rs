@@ -6515,30 +6515,28 @@ impl MeshNode {
         // `docs/misc/NRPC_DESIGN.md` open-questions.
         let mut subscribers = self.roster.dispatch_recipients(publisher.channel());
 
-        // Subnet visibility filter. Look up the channel's
-        // configured visibility; if the channel has no registry
-        // entry, fall back to `config.default_visibility` (which
-        // itself defaults to `Visibility::Global` for back-compat
-        // with simple registry-less deployments). Fleet operators
-        // who want fail-closed behavior set
+        // Subnet visibility + AuthGuard filters folded into a single
+        // `retain` pass per discovery-routing perf #105. Pre-fix the
+        // publish hot path ran two sequential `retain` passes over
+        // the same `Vec<u64>` — each walked the whole Vec and shifted
+        // elements on a drop. Folded into one pass, each peer hits
+        // its subnet + auth DashMap lookups with cache locality (no
+        // round-trip through every peer twice), the Vec is walked
+        // once not twice, and the closure short-circuits on the
+        // first rejecting predicate.
+        //
+        // Visibility filter: look up the channel's configured
+        // visibility; if the channel has no registry entry, fall
+        // back to `config.default_visibility` (which itself defaults
+        // to `Visibility::Global` for back-compat with simple
+        // registry-less deployments). Fleet operators who want
+        // fail-closed behavior set
         // `with_default_visibility(Visibility::SubnetLocal)` so
         // a forgotten registry entry confines messages to the
         // local subnet rather than leaking them mesh-wide.
         // Filtered subscribers don't show up in `attempted` or
         // `errors` — they're policy decisions, not failures.
-        let visibility = cfg_snapshot
-            .as_ref()
-            .map(|c| c.visibility)
-            .unwrap_or(self.config.default_visibility);
-        subscribers.retain(|peer_id| {
-            let peer_subnet = self
-                .peer_subnets
-                .get(peer_id)
-                .map(|e| *e.value())
-                .unwrap_or(SubnetId::GLOBAL);
-            Self::subnet_visible(self.local_subnet, peer_subnet, visibility)
-        });
-
+        //
         // AuthGuard fast path. Populated by `authorize_subscribe`;
         // revoked on unsubscribe and by the expiry sweep. Consulted
         // on every publish so revocations take effect on the next
@@ -6579,6 +6577,10 @@ impl MeshNode {
         // token-gated channels (`require_token = false` skips the
         // branch entirely). An expired subscriber is revoked inline
         // so the next publish takes the `Denied` path.
+        let visibility = cfg_snapshot
+            .as_ref()
+            .map(|c| c.visibility)
+            .unwrap_or(self.config.default_visibility);
         let channel_name = publisher.channel().name().clone();
         let channel_hash = channel_name.hash();
         let auth_guard = self.auth_guard.clone();
@@ -6587,6 +6589,18 @@ impl MeshNode {
             .map(|c| c.require_token)
             .unwrap_or(false);
         subscribers.retain(|peer_id| {
+            // (1) Subnet visibility. Cheap check first — a peer in
+            // the wrong subnet should short-circuit before any
+            // auth-cache probing.
+            let peer_subnet = self
+                .peer_subnets
+                .get(peer_id)
+                .map(|e| *e.value())
+                .unwrap_or(SubnetId::GLOBAL);
+            if !Self::subnet_visible(self.local_subnet, peer_subnet, visibility) {
+                return false;
+            }
+            // (2) Auth guard (bloom + verified cache).
             let origin = subscriber_origin_hash(*peer_id);
             let admitted = match auth_guard.check_fast(origin, channel_hash) {
                 AuthVerdict::Allowed => auth_guard.is_authorized_full(origin, &channel_name),
@@ -6606,9 +6620,10 @@ impl MeshNode {
             if !require_token {
                 return true;
             }
-            // Token-gated branch: ensure the subscriber still has a
-            // valid token. If the cache answer is "no valid token
-            // authorizes SUBSCRIBE on this channel," revoke inline.
+            // (3) Token-gated branch: ensure the subscriber still
+            // has a valid token. If the cache answer is "no valid
+            // token authorizes SUBSCRIBE on this channel," revoke
+            // inline.
             let (Some(cache), Some(entity)) = (
                 self.token_cache.as_ref(),
                 self.peer_entity_ids.get(peer_id).map(|e| e.value().clone()),
