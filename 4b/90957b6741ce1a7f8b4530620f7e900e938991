@@ -1,0 +1,35 @@
+net/crates/net/src/shard/mapper.rs
+  s_f930dae9b8bbc1::t_d29caa4daa58bd 673,679-684
+  s_f930dae9b8bbc1::t_a78a181fd31490 1335-1342,1363-1364
+  s_f930dae9b8bbc1::t_483678be5da59f 1232-1235
+  s_f930dae9b8bbc1::t_acad026fb3cfdb 636-644,647-650,653-658,661-667
+  s_f930dae9b8bbc1::t_ed5995f9b343db 1440-1447,1453,1455-1479,1481,1485,1487-1505
+  s_f930dae9b8bbc1::t_aa230359eb9ab6 405-422,433-442
+  s_f930dae9b8bbc1::t_46b1bd496085af 920-924
+  s_f930dae9b8bbc1::t_5e66d7b99ce954 1448-1452,1480,1482-1484,1486
+  s_f930dae9b8bbc1::t_1a48499d6ff87a 1454
+  s_f930dae9b8bbc1::t_bff892f2a3b643 41
+  s_f930dae9b8bbc1::t_ca3d37726ac11b 1092-1095
+  s_f930dae9b8bbc1::t_c03cfcce9fdc2f 1141-1143
+  s_f930dae9b8bbc1::t_2149c774a0855d 527,529-531,541-596
+  s_f930dae9b8bbc1::t_8a198b8fdbabe6 1296-1303
+  s_f930dae9b8bbc1::t_6e9e09ede461bf 2557-2561,2568
+net/crates/net/docs/performance/net-perf-analysis.md
+  s_f930dae9b8bbc1::t_d08071d33a8fd2 16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "4b90957b6741ce1a7f8b4530620f7e900e938991",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
