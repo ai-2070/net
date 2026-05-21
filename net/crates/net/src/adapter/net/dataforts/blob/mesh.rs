@@ -3043,22 +3043,55 @@ impl BlobAdapter for MeshBlobAdapter {
                 // blobs should use the substrate's per-chunk
                 // fetch path; this bulk-fetch hits the same
                 // memory cost on first byte either way.
+                //
+                // Parallel chunk fetch via `buffered(N)` per
+                // dataforts perf #172. Pre-fix this loop was
+                // sequential — each chunk waited for the prior
+                // one's fetch to land before issuing its own.
+                // For a replicated manifest where chunks come
+                // from peers, sequential fetch serialized N
+                // network RTTs; `buffered` (not
+                // `buffer_unordered`) preserves chunk order so
+                // the result Vec is still byte-correct, while
+                // allowing up to `MANIFEST_FETCH_CONCURRENCY`
+                // requests in flight simultaneously. On a
+                // 1024-chunk replicated blob at 1 ms/chunk,
+                // sequential = ~1 s, buffered(16) = ~64 ms —
+                // 15× speedup per the doc's worked example.
+                //
+                // Concurrency cap kept small (16) so we don't
+                // overrun the substrate's per-channel credit
+                // window on partial-availability manifests.
+                // The decision to break-on-first-error matches
+                // the legacy loop; `buffered` keeps the
+                // already-in-flight futures running until the
+                // stream is dropped, but the surrounding `match`
+                // exits as soon as `Err` is observed so wasted
+                // work is bounded by the concurrency cap.
+                use futures::StreamExt;
+                const MANIFEST_FETCH_CONCURRENCY: usize = 16;
+                let fetch_stream = futures::stream::iter(chunks.iter().copied()).map(
+                    |chunk: ChunkRef| async move {
+                        match self.fetch_chunk(&chunk.hash).await {
+                            Ok(bytes) if bytes.len() as u64 != chunk.size as u64 => {
+                                Err(BlobError::Backend(format!(
+                                    "mesh blob: chunk {} fetched size {} != declared {}",
+                                    hex32(&chunk.hash),
+                                    bytes.len(),
+                                    chunk.size
+                                )))
+                            }
+                            Ok(bytes) => Ok(bytes),
+                            Err(e) => Err(e),
+                        }
+                    },
+                );
+                let mut stream = std::pin::pin!(fetch_stream.buffered(MANIFEST_FETCH_CONCURRENCY));
                 let mut out: Vec<u8> = Vec::new();
                 let mut err: Option<BlobError> = None;
-                for chunk in chunks {
-                    match self.fetch_chunk(&chunk.hash).await {
-                        Ok(chunk_bytes) if chunk_bytes.len() as u64 != chunk.size as u64 => {
-                            err = Some(BlobError::Backend(format!(
-                                "mesh blob: chunk {} fetched size {} != declared {}",
-                                hex32(&chunk.hash),
-                                chunk_bytes.len(),
-                                chunk.size
-                            )));
-                            break;
-                        }
-                        Ok(chunk_bytes) => {
-                            out.extend_from_slice(&chunk_bytes);
-                        }
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok(bytes) => out.extend_from_slice(&bytes),
                         Err(e) => {
                             err = Some(e);
                             break;
