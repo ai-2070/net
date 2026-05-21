@@ -1,0 +1,93 @@
+web/src/content/docs/reference/wire-format.md
+  s_e802155ff9ef32::t_822dd8d6636c3b 1-138
+web/src/docs.order.ts
+  s_e802155ff9ef32::t_603fff2aeb2616 20,22-57,73-121
+web/src/content/docs/start/quickstart.md
+  s_e802155ff9ef32::t_a493c06dfd4732 1-79
+web/src/content/docs/start/what-is-net.md
+  s_e802155ff9ef32::t_16d9faa8b75f61 1-50
+web/src/content/docs/concepts/channels.md
+  s_e802155ff9ef32::t_e44b47d802cca2 1-65
+web/src/content/docs/guides/netdb-queries.md
+  s_e802155ff9ef32::t_1bb559db7ca105 1-123
+web/src/content/docs/guides/nrpc.md
+  s_e802155ff9ef32::t_ed66950e2437f3 1-143
+web/src/content/docs/start/README.md
+  s_e802155ff9ef32::t_2a256c50886635 1-5
+web/src/content/docs/concepts/storage-stack.md
+  s_e802155ff9ef32::t_b8646b306df77b 1-63
+web/src/lib/docs.ts
+  s_e802155ff9ef32::t_556679bf4e3560 397-400
+  s_e802155ff9ef32::t_f5f2d883622fea 200-205,209-215,217,252
+web/src/content/docs/concepts/subnets.md
+  s_e802155ff9ef32::t_f8605807333ab6 1-57
+web/src/content/docs/guides/README.md
+  s_e802155ff9ef32::t_41be5afadb7fb5 1-7
+web/src/content/docs/reference/adapter-trait.md
+  s_e802155ff9ef32::t_cd3448c44aad91 1-174
+web/src/content/docs/tutorials/distributed-daemon.md
+  s_e802155ff9ef32::t_3f533baaaa5ac7 1-207
+web/src/content/docs/reference/capability-schema.md
+  s_e802155ff9ef32::t_9c7616839f6a6d 1-123
+web/src/content/docs/tutorials/fleet-telemetry.md
+  s_e802155ff9ef32::t_4e7abcc984454a 1-224
+web/src/content/docs/concepts/identity.md
+  s_e802155ff9ef32::t_5c3ceffb953116 1-46
+web/src/content/docs/start/install.md
+  s_e802155ff9ef32::t_dbcf116f22e360 1-131
+web/src/content/docs/guides/dataforts.md
+  s_e802155ff9ef32::t_0c29b009ece8f3 1-105
+web/src/content/docs/concepts/README.md
+  s_e802155ff9ef32::t_81debab9d628c5 1-7
+web/src/content/docs/guides/event-bus.md
+  s_e802155ff9ef32::t_87b51270bcb660 84,87-88,90-94,98,100
+  s_e802155ff9ef32::t_ff6610cf4600f5 1-83,85-86,89,95-97,99,101-166
+web/src/content/docs/reference/replication-config.md
+  s_e802155ff9ef32::t_e8601e8f8b47d5 1-192
+web/src/content/docs/reference/README.md
+  s_e802155ff9ef32::t_44485bdfb98ce8 1-7
+web/src/content/docs/reference/eventbus-api.md
+  s_e802155ff9ef32::t_3bc16e839a8f46 1-197
+web/src/content/docs/reference/filter-dsl.md
+  s_e802155ff9ef32::t_b9baada3659fdc 1-125
+web/src/content/docs/concepts/architecture.md
+  s_e802155ff9ef32::t_2020c81569b66c 1-50
+web/src/content/docs/tutorials/README.md
+  s_e802155ff9ef32::t_791c1d061ad1eb 1-11
+web/src/content/docs/tutorials/event-sourced-service.md
+  s_e802155ff9ef32::t_bfbb6b1652b43f 1-289
+web/src/content/docs/reference/error-codes.md
+  s_e802155ff9ef32::t_ae0a311db453cb 1-104
+web/src/content/docs/guides/daemons-and-placement.md
+  s_e802155ff9ef32::t_cbf4cb16c935f7 1-184
+web/src/content/docs/guides/continuity-and-migration.md
+  s_e802155ff9ef32::t_399684268b5f3f 1-164
+web/src/content/docs/guides/nat-and-traversal.md
+  s_e802155ff9ef32::t_94c0201a28847d 1-72
+web/src/content/docs/concepts/events-and-causality.md
+  s_e802155ff9ef32::t_f12b171da2b345 1-49
+web/src/content/docs/reference/subprotocol-ids.md
+  s_e802155ff9ef32::t_5233c1c1b8459b 1-105
+web/src/content/docs/guides/cortex-folds.md
+  s_e802155ff9ef32::t_9741356500f509 1-186
+web/src/content/docs/guides/durable-logs.md
+  s_e802155ff9ef32::t_d3f93a52a9b963 1-139
+web/src/content/docs/concepts/capabilities.md
+  s_e802155ff9ef32::t_7f526b957479dc 1-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "cbd5238ff7205fc7b7905e07b84ed6a5dbaa910e",
+  "prompts": {},
+  "sessions": {
+    "s_e802155ff9ef32": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e7ed794-33fe-4781-8585-c1e89f2c852c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
