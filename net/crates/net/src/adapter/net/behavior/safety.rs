@@ -2667,17 +2667,14 @@ mod tests {
 
         // The failed acquire must not leave resource counters
         // bumped — only the guard from the FIRST acquire holds 1.
-        assert_eq!(enforcer.usage().concurrent, 1);
-        assert_eq!(enforcer.usage().memory_gb, 1);
+        let usage = enforcer.usage();
+        assert_eq!(usage.concurrent, 1);
+        assert_eq!(usage.memory_gb, 1);
         // Global RPM counter must also be 1 (only the first
         // request committed), not 2 — proves global rollback fired.
-        assert_eq!(
-            enforcer
-                .rate_limiter
-                .global_requests
-                .load(Ordering::Relaxed),
-            1
-        );
+        // `requests_per_minute` is the public surface for the
+        // internal `rate_limiter.global_requests` counter.
+        assert_eq!(usage.requests_per_minute, 1);
     }
 
     #[test]
@@ -2716,16 +2713,11 @@ mod tests {
         // RPM, concurrent, memory, cost. We observe global +
         // resource counters; the source bucket is internal but
         // gets the same treatment.
-        assert_eq!(enforcer.usage().concurrent, 0);
-        assert_eq!(enforcer.usage().memory_gb, 0);
-        assert_eq!(enforcer.usage().cost_cents_per_hour, 0);
-        assert_eq!(
-            enforcer
-                .rate_limiter
-                .global_requests
-                .load(Ordering::Relaxed),
-            0
-        );
+        let usage = enforcer.usage();
+        assert_eq!(usage.concurrent, 0);
+        assert_eq!(usage.memory_gb, 0);
+        assert_eq!(usage.cost_cents_per_hour, 0);
+        assert_eq!(usage.requests_per_minute, 0);
     }
 
     // ---------- Content-policy non-block actions ----------

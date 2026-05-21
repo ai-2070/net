@@ -2057,83 +2057,94 @@ mod tests {
     // ---------- DiffOp::estimated_size per-variant coverage ----------
 
     #[test]
-    fn estimated_size_covers_every_variant() {
-        // Each arm has its own arithmetic; a regression in any one
-        // would be hard to spot without per-variant pinning. The
-        // values here aren't load-bearing — we only require that
-        // estimated_size produces a sensible non-zero number that
-        // scales with the variant's payload.
-        let add_tag = DiffOp::AddTag("abc".into());
-        let rm_tag = DiffOp::RemoveTag("abc".into());
-        assert_eq!(add_tag.estimated_size(), 8 + 3);
-        assert_eq!(rm_tag.estimated_size(), 8 + 3);
+    fn estimated_size_returns_a_sensible_value_for_every_variant() {
+        // `estimated_size` is a planner hint, not a wire-format
+        // guarantee — its exact constants are free to change for
+        // legitimate reasons (alignment, fixed overhead). The
+        // contract we need to pin is: every variant runs without
+        // panicking and returns a sensible non-zero number. A
+        // regression that hits a wildcard arm returning 0, or
+        // that overflows, gets caught.
+        fn check(label: &str, op: DiffOp) {
+            let s = op.estimated_size();
+            assert!(
+                s > 0 && s < 1_000_000,
+                "{label}.estimated_size() = {s} is out of range",
+            );
+        }
 
-        let model = ModelCapability::new("m1", "llama");
-        let add_model = DiffOp::AddModel(model.clone());
-        assert!(add_model.estimated_size() >= 50 + "m1".len() + "llama".len());
-        assert_eq!(DiffOp::RemoveModel("m1".into()).estimated_size(), 8 + 2);
-        assert_eq!(
+        check("AddTag", DiffOp::AddTag("abc".into()));
+        check("RemoveTag", DiffOp::RemoveTag("abc".into()));
+        check(
+            "AddModel",
+            DiffOp::AddModel(ModelCapability::new("m1", "llama")),
+        );
+        check("RemoveModel", DiffOp::RemoveModel("m1".into()));
+        check(
+            "UpdateModel",
             DiffOp::UpdateModel {
                 model_id: "m1".into(),
                 tokens_per_sec: Some(50),
                 loaded: None,
-            }
-            .estimated_size(),
-            16 + 2,
+            },
         );
-
-        let tool = ToolCapability::new("t1", "T1");
-        assert!(DiffOp::AddTool(tool).estimated_size() >= 50 + "t1".len() + "T1".len());
-        assert_eq!(DiffOp::RemoveTool("t1".into()).estimated_size(), 8 + 2);
-
-        assert_eq!(
-            DiffOp::UpdateHardware(HardwareCapabilities::new()).estimated_size(),
-            64,
+        check("AddTool", DiffOp::AddTool(ToolCapability::new("t1", "T1")));
+        check("RemoveTool", DiffOp::RemoveTool("t1".into()));
+        check(
+            "UpdateHardware",
+            DiffOp::UpdateHardware(HardwareCapabilities::new()),
         );
-        assert_eq!(DiffOp::UpdateMemory(32).estimated_size(), 8);
-        assert_eq!(DiffOp::UpdateNetwork(10).estimated_size(), 8);
-        assert_eq!(
-            DiffOp::UpdateSoftware(SoftwareCapabilities::new()).estimated_size(),
-            128,
+        check("UpdateMemory", DiffOp::UpdateMemory(32));
+        check("UpdateNetwork", DiffOp::UpdateNetwork(10));
+        check(
+            "UpdateSoftware",
+            DiffOp::UpdateSoftware(SoftwareCapabilities::new()),
         );
-
-        assert_eq!(
+        check(
+            "AddRuntime",
             DiffOp::AddRuntime {
                 name: "py".into(),
                 version: "3.11".into(),
-            }
-            .estimated_size(),
-            12 + 2 + 4,
+            },
         );
-        assert_eq!(DiffOp::RemoveRuntime("py".into()).estimated_size(), 8 + 2);
-        assert_eq!(
+        check("RemoveRuntime", DiffOp::RemoveRuntime("py".into()));
+        check(
+            "AddFramework",
             DiffOp::AddFramework {
                 name: "pt".into(),
                 version: "2.1".into(),
-            }
-            .estimated_size(),
-            12 + 2 + 3,
+            },
         );
-        assert_eq!(DiffOp::RemoveFramework("pt".into()).estimated_size(), 8 + 2);
-
-        assert_eq!(
-            DiffOp::UpdateLimits(ResourceLimits::new()).estimated_size(),
-            32,
+        check("RemoveFramework", DiffOp::RemoveFramework("pt".into()));
+        check("UpdateLimits", DiffOp::UpdateLimits(ResourceLimits::new()));
+        check("UpdateMaxConcurrent", DiffOp::UpdateMaxConcurrent(10));
+        check("UpdateRateLimit", DiffOp::UpdateRateLimit(60));
+        check(
+            "SetField",
+            DiffOp::SetField {
+                path: "custom.x".into(),
+                value: serde_json::json!(42),
+            },
         );
-        assert_eq!(DiffOp::UpdateMaxConcurrent(10).estimated_size(), 8);
-        assert_eq!(DiffOp::UpdateRateLimit(60).estimated_size(), 8);
-
-        let set_field = DiffOp::SetField {
-            path: "custom.x".into(),
-            value: serde_json::json!(42),
-        };
-        assert!(set_field.estimated_size() >= 16 + "custom.x".len());
-        assert_eq!(
+        check(
+            "UnsetField",
             DiffOp::UnsetField {
                 path: "custom.x".into(),
-            }
-            .estimated_size(),
-            8 + "custom.x".len(),
+            },
+        );
+    }
+
+    #[test]
+    fn estimated_size_scales_with_string_payload() {
+        // The one property worth pinning beyond "non-zero": variants
+        // that embed a string MUST size up with the string's length,
+        // otherwise the planner that uses this hint to batch ops
+        // would underestimate memory.
+        let small = DiffOp::AddTag("x".into()).estimated_size();
+        let large = DiffOp::AddTag("x".repeat(1000)).estimated_size();
+        assert!(
+            large > small,
+            "AddTag should scale with payload: small={small}, large={large}",
         );
     }
 

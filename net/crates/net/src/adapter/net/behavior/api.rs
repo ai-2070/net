@@ -2543,12 +2543,16 @@ mod tests {
         let schema = ApiSchema::new("svc", ApiVersion::new(1, 0, 0))
             .add_endpoint(ApiEndpoint::new("/run", ApiMethod::Post));
 
-        // ttl_secs = 0 → expires the instant `now > timestamp`.
-        let ann = ApiAnnouncement::new(make_node_id(7), vec![schema]).with_ttl(0);
+        // Stamp `timestamp` at the Unix epoch with a short ttl so
+        // `is_expired()` returns true regardless of wall-clock
+        // resolution. A previous version slept 5ms past a
+        // `with_ttl(0)` announcement — flaky on loaded CI boxes
+        // where the wall clock can read backward between
+        // `ApiAnnouncement::new`'s SystemTime call and the
+        // `is_expired()` check.
+        let mut ann = ApiAnnouncement::new(make_node_id(7), vec![schema]).with_ttl(1);
+        ann.timestamp = 0;
         registry.register(ann).unwrap();
-
-        // Give the wall clock a moment to advance past `timestamp`.
-        std::thread::sleep(std::time::Duration::from_millis(5));
 
         assert!(registry
             .find_by_endpoint("/run", ApiMethod::Post)

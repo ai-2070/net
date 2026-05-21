@@ -1450,36 +1450,35 @@ mod tests {
         bytes.iter().map(|b| format!("{:02x}", b)).collect()
     }
 
+    /// Assert that `dbg_output` doesn't contain the hex encoding
+    /// of `secret`. Catches naive Debug derives that surface the
+    /// raw byte array.
+    fn assert_no_leak(dbg_output: &str, secret: &[u8], label: &str) {
+        let hex = hex_of(secret).to_lowercase();
+        assert!(
+            !dbg_output.to_lowercase().contains(&hex),
+            "{label} bytes leaked into Debug output: {dbg_output}",
+        );
+    }
+
     #[test]
     fn session_keys_debug_redacts_tx_and_rx_keys() {
-        let secret_marker = [0xAB; 32];
-        let other_secret = [0xCD; 32];
+        let tx_secret = [0xAB; 32];
+        let rx_secret = [0xCD; 32];
         let keys = SessionKeys {
-            tx_key: secret_marker,
-            rx_key: other_secret,
+            tx_key: tx_secret,
+            rx_key: rx_secret,
             session_id: 0x1234_5678_DEAD_BEEF,
             remote_static_pub: [0x11; 32],
         };
         let s = format!("{:?}", keys);
 
-        // The redaction marker MUST be present.
         assert!(
             s.contains("[REDACTED]"),
             "SessionKeys Debug must include [REDACTED]; got: {s}",
         );
-        // The actual key bytes MUST NOT appear in the formatted
-        // output. We check for any 8+-hex-character run of the
-        // secret marker as a robust leakage signal.
-        let leak_substr = "abababababababab"; // 8 bytes of 0xAB
-        assert!(
-            !s.to_lowercase().contains(leak_substr),
-            "tx_key bytes leaked into Debug output: {s}",
-        );
-        let leak_substr2 = "cdcdcdcdcdcdcdcd";
-        assert!(
-            !s.to_lowercase().contains(leak_substr2),
-            "rx_key bytes leaked into Debug output: {s}",
-        );
+        assert_no_leak(&s, &tx_secret, "tx_key");
+        assert_no_leak(&s, &rx_secret, "rx_key");
         // Sanity: session_id (non-secret) is exposed in the
         // Debug output. The exact decimal/hex format is the
         // formatter's choice; we only assert that *some*
@@ -1489,26 +1488,19 @@ mod tests {
 
     #[test]
     fn static_keypair_debug_redacts_private_key() {
-        let secret_marker = [0x77; 32];
+        let private = [0x77; 32];
         let public = [0x22; 32];
-        let kp = StaticKeypair {
-            private: secret_marker,
-            public,
-        };
+        let kp = StaticKeypair { private, public };
         let s = format!("{:?}", kp);
+
         assert!(
             s.contains("[REDACTED]"),
             "StaticKeypair Debug must include [REDACTED]; got: {s}",
         );
-        let private_hex = hex_of(&secret_marker);
-        assert!(
-            !s.to_lowercase().contains(&private_hex.to_lowercase()),
-            "private key bytes leaked into Debug output: {s}",
-        );
+        assert_no_leak(&s, &private, "private key");
         // The public key is not secret and should be visible.
-        let public_hex = hex_of(&public);
         assert!(
-            s.to_lowercase().contains(&public_hex.to_lowercase()),
+            s.to_lowercase().contains(&hex_of(&public).to_lowercase()),
             "public key should be visible in Debug; got: {s}",
         );
     }

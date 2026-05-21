@@ -848,6 +848,14 @@ impl ContextStore {
         }
     }
 
+    /// Replace the default sampler. Useful when an operator wants
+    /// deterministic capture (e.g. `AlwaysOn` for diagnostics) or
+    /// a custom ratio different from the default.
+    pub fn with_sampler(mut self, sampler: Sampler) -> Self {
+        self.sampler = sampler;
+        self
+    }
+
     /// Atomically reserve a slot if `active_count < max_traces`.
     ///
     /// Returns an [`Option<SlotReservation<'_>>`]; the `Some` arm
@@ -1916,12 +1924,10 @@ mod tests {
     /// `create_context` deterministically inserts the trace.
     /// The default sampler is `Ratio(0.1)` — most contexts go
     /// unsampled (not stored), and `add_span` then returns
-    /// `NotFound` regardless of the scope's behavior. Inside
-    /// the tests mod we can swap the private `sampler` field.
+    /// `NotFound` regardless of the scope's behavior.
     fn store_with_always_on_sampler() -> ContextStore {
-        let mut store = ContextStore::new(64, 64, Duration::from_secs(60));
-        store.sampler = Sampler::new(SamplingStrategy::AlwaysOn);
-        store
+        ContextStore::new(64, 64, Duration::from_secs(60))
+            .with_sampler(Sampler::new(SamplingStrategy::AlwaysOn))
     }
 
     #[test]
