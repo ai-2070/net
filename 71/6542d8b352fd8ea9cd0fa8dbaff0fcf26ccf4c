@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/crypto.rs
+  s_f930dae9b8bbc1::t_c0965697a98b8d 627-631,636,641-643,646
+  s_f930dae9b8bbc1::t_6f63a9954e9e62 1011-1024,1026-1027,1030-1040,1042-1047
+  s_f930dae9b8bbc1::t_d65bd100088c62 1025,1028-1029,1041
+  s_f930dae9b8bbc1::t_f4abb5ea46f614 597,601,617,621
+  s_f930dae9b8bbc1::t_4d9f959da4474d 392-393,398-399
+  s_f930dae9b8bbc1::t_489b44abba375c 598,618
+  s_f930dae9b8bbc1::t_28a03ac0cbcca0 389-391,394-397,400
+net/crates/net/docs/performance/net-crypto-session-reliability-analysis.md
+  s_f930dae9b8bbc1::t_4390f6da0ab1ef 15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "716542d8b352fd8ea9cd0fa8dbaff0fcf26ccf4c",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
