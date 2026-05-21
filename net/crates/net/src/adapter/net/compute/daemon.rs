@@ -598,4 +598,45 @@ mod tests {
         // No state to assert — the contract is just "no panic,
         // no side effect."
     }
+
+    /// Default `MeshDaemon::restore` must refuse non-empty state
+    /// on a stateless daemon (`is_stateful() == false`). The
+    /// pre-fix behavior was a silent `Ok(())` — a daemon that
+    /// *should* have been stateful but forgot to override
+    /// `is_stateful` would have its migrated snapshot bytes
+    /// silently dropped, surfacing as "daemon lost state across
+    /// migration" with no diagnostic. Pin the rejection path AND
+    /// the genuine stateless-to-stateless case (empty bytes
+    /// accepted) so the guard doesn't over-reject either.
+    #[test]
+    fn default_restore_rejects_nonempty_state_on_stateless_daemon() {
+        let mut d = BareDaemon;
+        // Stateless by default.
+        assert!(!d.is_stateful());
+
+        // Empty bytes: stateless-to-stateless migration shape.
+        // Must succeed — otherwise we'd break every migration of
+        // a genuinely stateless daemon.
+        d.restore(Bytes::new()).expect("empty restore on stateless daemon must succeed");
+
+        // Non-empty bytes: misconfiguration signal. Default
+        // impl surfaces it as RestoreFailed with a message that
+        // names the byte count + the required override.
+        let err = d
+            .restore(Bytes::from_static(b"surprise-snapshot-bytes"))
+            .expect_err("non-empty restore on stateless daemon must fail");
+        match err {
+            DaemonError::RestoreFailed(msg) => {
+                assert!(
+                    msg.contains("stateless daemon"),
+                    "error must name the daemon class: {msg}",
+                );
+                assert!(
+                    msg.contains("23"),
+                    "error must include the byte count for triage: {msg}",
+                );
+            }
+            other => panic!("expected RestoreFailed, got {:?}", other),
+        }
+    }
 }

@@ -298,6 +298,36 @@ mod tests {
         assert!(reg.take(0xDEADBEEF).is_none());
     }
 
+    /// Debug shows the entry count — what operators see when
+    /// the registry is dumped into a trace line. Pin the field so
+    /// a future refactor that drops it (e.g. switching to default
+    /// `derive(Debug)` that prints internal DashMap layout) gets
+    /// caught.
+    #[test]
+    fn debug_format_includes_entry_count() {
+        let reg = DaemonFactoryRegistry::new();
+        let s = format!("{:?}", reg);
+        assert!(s.contains("DaemonFactoryRegistry"));
+        assert!(s.contains("entries: 0"));
+
+        let kp = EntityKeypair::generate();
+        reg.register(kp, DaemonHostConfig::default(), || Box::new(Stub))
+            .unwrap();
+        let s = format!("{:?}", reg);
+        assert!(s.contains("entries: 1"));
+    }
+
+    /// `empty()` is the canonical "registry-with-no-factories"
+    /// Arc handle — wiring uses it in bootstrap before any
+    /// daemon factories are registered. Confirm it matches the
+    /// invariant a freshly constructed `new()` registry has.
+    #[test]
+    fn empty_returns_arc_wrapped_empty_registry() {
+        let reg = DaemonFactoryRegistry::empty();
+        assert!(!reg.contains(0xDEADBEEF));
+        assert!(reg.take(0xDEADBEEF).is_none());
+    }
+
     /// Regression: `register` used to take a separate `origin_hash`
     /// parameter and only `debug_assert_eq!` it against the keypair.
     /// Release builds silently accepted a mismatched keypair, which would
