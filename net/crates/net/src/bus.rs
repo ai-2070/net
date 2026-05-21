@@ -3813,4 +3813,110 @@ mod tests {
              workers exit promptly"
         );
     }
+
+    /// `EventBus::new_with_adapter` must surface a `Fatal` error
+    /// — naming the configured path — when `producer_nonce_path`
+    /// points at a location the runtime can't read or create. The
+    /// path-load failure path at L292-L301 is the single signal
+    /// operators get that their persistent-nonce wiring is wrong;
+    /// silently falling back to the per-process nonce would
+    /// silently degrade the durability guarantee that path was
+    /// chosen to provide (at-most-once across restart).
+    #[tokio::test]
+    async fn new_with_adapter_surfaces_fatal_when_nonce_path_unreadable() {
+        // Point at a path whose parent directory doesn't exist —
+        // load_or_create has to mkdir-then-write, and Windows
+        // refuses to create the file under a missing parent.
+        let bogus_path = std::path::PathBuf::from(
+            "C:\\nonexistent-parent-for-net-coverage-test\\deeply\\nested\\nonce",
+        );
+        let config = EventBusConfig::builder()
+            .num_shards(1)
+            .ring_buffer_capacity(1024)
+            .producer_nonce_path(&bogus_path)
+            .build()
+            .unwrap();
+        let adapter: Box<dyn crate::adapter::Adapter> =
+            Box::new(crate::adapter::NoopAdapter::new());
+
+        // EventBus doesn't impl Debug, so we can't unwrap_err
+        // it directly — pattern-match instead.
+        let result = EventBus::new_with_adapter(config, adapter).await;
+        match result {
+            Err(AdapterError::Fatal(msg)) => {
+                assert!(
+                    msg.contains("producer-nonce") || msg.contains("nonce"),
+                    "error must name the failing subsystem: {msg}",
+                );
+                // The path must appear in the message so operators
+                // can grep their logs to the misconfigured config
+                // field without guessing.
+                assert!(
+                    msg.contains("nonexistent-parent-for-net-coverage-test"),
+                    "error must include the configured path: {msg}",
+                );
+            }
+            Err(other) => panic!("expected Fatal, got {other:?}"),
+            Ok(_) => panic!("expected Fatal, got Ok"),
+        }
+    }
+
+    /// `start_scaling_monitor` must be a no-op on a non-scaling
+    /// bus AND idempotent under repeated calls on a scaling bus.
+    /// A regression that drops the early-returns would spawn
+    /// shadow monitor tasks that hold a Weak<EventBus> until they
+    /// next observe shutdown — pure-overhead duplicate
+    /// metrics-tick wakeup rates that compete for the same
+    /// `evaluate_scaling` lock.
+    #[tokio::test]
+    async fn start_scaling_monitor_is_noop_without_scaling_and_idempotent_with_it() {
+        // Scaling explicitly disabled: start_scaling_monitor
+        // must return before touching the slot. (The builder
+        // default fills in a ScalingPolicy when scaling isn't
+        // mentioned — `without_scaling()` is the only way to
+        // force `config.scaling == None`.)
+        let config = EventBusConfig::builder()
+            .num_shards(1)
+            .ring_buffer_capacity(1024)
+            .without_scaling()
+            .build()
+            .unwrap();
+        let bus = EventBus::new(config).await.unwrap();
+        let bus = Arc::new(bus);
+        bus.start_scaling_monitor();
+        assert!(
+            bus.scaling_monitor.lock().is_none(),
+            "non-scaling bus must not install a monitor",
+        );
+
+        // Scaling enabled: first call installs, second is a no-op
+        // (the existing handle stays put — proves the early-return
+        // didn't overwrite the slot).
+        let policy = crate::shard::ScalingPolicy {
+            min_shards: 2,
+            max_shards: 4,
+            ..Default::default()
+        };
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .scaling(policy)
+            .build()
+            .unwrap();
+        let bus = Arc::new(EventBus::new(config).await.unwrap());
+        // EventBus::new doesn't auto-start the monitor — we start
+        // it explicitly so the test owns the lifecycle.
+        bus.start_scaling_monitor();
+        let handle_id_after_first = bus.scaling_monitor.lock().as_ref().map(|h| h.id());
+        assert!(handle_id_after_first.is_some(), "first start must install");
+
+        // Second call must NOT replace the handle. If the early-
+        // return is broken, the slot would carry a new handle id.
+        bus.start_scaling_monitor();
+        let handle_id_after_second = bus.scaling_monitor.lock().as_ref().map(|h| h.id());
+        assert_eq!(
+            handle_id_after_first, handle_id_after_second,
+            "second start_scaling_monitor must NOT replace the running handle",
+        );
+    }
 }
