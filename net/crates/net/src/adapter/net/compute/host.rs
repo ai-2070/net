@@ -669,4 +669,107 @@ mod tests {
             "from_snapshot must reject snapshot from a different entity"
         );
     }
+
+    /// Tampered or corrupt `bindings_bytes` on a snapshot must
+    /// abort the restore rather than silently produce an empty
+    /// subscription ledger. The check at L184-L195 is an
+    /// attacker-resistance guard: if a peer ships a snapshot
+    /// whose bindings_bytes don't decode, dropping silently would
+    /// let the daemon resume on the target with NO subscriptions
+    /// — observable as "daemon mysteriously stops receiving
+    /// events after a migration" with no diagnostic.
+    #[test]
+    fn from_snapshot_rejects_malformed_bindings_bytes() {
+        let kp = EntityKeypair::generate();
+        let entity_id = kp.entity_id().clone();
+        let origin = kp.origin_hash();
+        let mut snapshot = StateSnapshot::new(
+            entity_id,
+            CausalLink::genesis(origin, 0),
+            Bytes::new(),
+            crate::adapter::net::state::horizon::ObservedHorizon::new(),
+        );
+        // Random bytes that absolutely don't decode as DaemonBindings.
+        snapshot.bindings_bytes = vec![0xFF; 13];
+
+        let result = DaemonHost::from_snapshot(
+            Box::new(EchoDaemon),
+            kp,
+            &snapshot,
+            DaemonHostConfig::default(),
+        );
+        match result {
+            Err(DaemonError::RestoreFailed(msg)) => {
+                assert!(
+                    msg.contains("bindings") || msg.contains("tampered") || msg.contains("corrupt"),
+                    "error must name the failing surface: {msg}",
+                );
+            }
+            other => panic!("expected RestoreFailed, got {:?}", other.is_ok()),
+        }
+    }
+
+    /// Subscription-ledger surface: record / forget / count /
+    /// snapshot. Migration's re-bind replay reads from this
+    /// ledger, so a regression in any of these is observable as
+    /// "daemon dropped half its subscriptions across a
+    /// migration." Pin the per-method contract.
+    #[test]
+    fn subscription_ledger_record_forget_snapshot_count_round_trip() {
+        let kp = EntityKeypair::generate();
+        let host = DaemonHost::new(Box::new(EchoDaemon), kp, DaemonHostConfig::default());
+
+        let ch_a = ChannelName::new("test/alpha").unwrap();
+        let ch_b = ChannelName::new("test/beta").unwrap();
+        assert_eq!(host.subscription_count(), 0);
+
+        host.record_subscription(0x1111, ch_a.clone(), Some(vec![1, 2, 3]));
+        host.record_subscription(0x2222, ch_b.clone(), None);
+        assert_eq!(host.subscription_count(), 2);
+
+        // Re-recording the same (publisher, channel) pair must
+        // replace, not duplicate — the doc at L323 names this
+        // explicitly.
+        host.record_subscription(0x1111, ch_a.clone(), Some(vec![9, 9, 9]));
+        assert_eq!(
+            host.subscription_count(),
+            2,
+            "re-record must not create a duplicate entry",
+        );
+
+        // Snapshot contains both bindings (order is DashMap-dependent).
+        let snap = host.bindings_snapshot();
+        assert_eq!(snap.subscriptions.len(), 2);
+        let pubs: std::collections::HashSet<u64> =
+            snap.subscriptions.iter().map(|s| s.publisher).collect();
+        assert!(pubs.contains(&0x1111));
+        assert!(pubs.contains(&0x2222));
+
+        // Forget one — count drops, the other remains.
+        host.forget_subscription(0x1111, &ch_a);
+        assert_eq!(host.subscription_count(), 1);
+        let snap = host.bindings_snapshot();
+        assert_eq!(snap.subscriptions.len(), 1);
+        assert_eq!(snap.subscriptions[0].publisher, 0x2222);
+
+        // Forget is idempotent.
+        host.forget_subscription(0x1111, &ch_a);
+        assert_eq!(host.subscription_count(), 1);
+    }
+
+    /// Debug exposes the daemon name + origin_hash + sequence
+    /// counters. Operators read these in trace dumps; a refactor
+    /// that drops any of them would degrade triage.
+    #[test]
+    fn daemon_host_debug_format_includes_load_bearing_fields() {
+        let kp = EntityKeypair::generate();
+        let host = DaemonHost::new(Box::new(EchoDaemon), kp, DaemonHostConfig::default());
+        let s = format!("{:?}", host);
+        assert!(s.contains("DaemonHost"));
+        assert!(s.contains("name"));
+        assert!(s.contains("\"echo\""));
+        assert!(s.contains("origin_hash"));
+        assert!(s.contains("sequence"));
+        assert!(s.contains("stats"));
+    }
 }
