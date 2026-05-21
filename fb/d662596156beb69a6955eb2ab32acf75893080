@@ -1,0 +1,45 @@
+web/src/app/docs/layout.tsx
+  s_e802155ff9ef32::t_459a33e73218dc 4-5,19,28,37
+web/src/lib/docs-language.ts
+  s_e802155ff9ef32::t_1d764b944c42dc 1-17
+web/src/components/DocsDrawer.tsx
+  s_e802155ff9ef32::t_75872958993325 120
+  s_e802155ff9ef32::t_e4d36204049eb9 6
+web/src/components/LanguageSwitcher.tsx
+  s_e802155ff9ef32::t_37567085adbf0f 3
+  s_e802155ff9ef32::t_d51ce9b7b5f607 1-2,4-13,15-40,42-54
+web/src/components/LanguageContext.tsx
+  s_e802155ff9ef32::t_eaa2920ce9b6d8 4-8
+  s_e802155ff9ef32::t_ad5bf3db8c53ea 1-3,9-97
+web/src/components/DocsSidebar.tsx
+  s_e802155ff9ef32::t_db002bc6b8e6f0 50-84
+  s_e802155ff9ef32::t_fb6dc9619e3b07 3,6,11
+  s_e802155ff9ef32::t_67d3b915ea06d0 330-334,336-338,343
+  s_e802155ff9ef32::t_ad64b3a4786e66 374
+  s_e802155ff9ef32::t_2593c17f7cdd5d 7
+web/src/lib/docs.ts
+  s_e802155ff9ef32::t_364b15e9d0c913 503,512
+  s_e802155ff9ef32::t_ce072be3db5133 216,236
+  s_e802155ff9ef32::t_06fe09b5746e1d 524,536
+  s_e802155ff9ef32::t_516f338984913e 127-129,138-141
+  s_e802155ff9ef32::t_b722881de67ca7 280
+  s_e802155ff9ef32::t_b1b0650276f870 13-22
+  s_e802155ff9ef32::t_66295549b1ccde 103-116
+  s_e802155ff9ef32::t_70f36adc5e67e4 23,36-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.11",
+  "base_commit_sha": "fbd662596156beb69a6955eb2ab32acf75893080",
+  "prompts": {},
+  "sessions": {
+    "s_e802155ff9ef32": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e7ed794-33fe-4781-8585-c1e89f2c852c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
