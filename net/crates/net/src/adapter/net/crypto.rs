@@ -386,7 +386,18 @@ impl NoiseHandshake {
 /// reuse across concurrent builders.
 pub struct PacketCipher {
     cipher: ChaCha20Poly1305,
-    session_prefix: [u8; 4],
+    /// Pre-built nonce with the session prefix already filled into
+    /// the first 4 bytes (and the counter bytes left as zeros for
+    /// each per-packet overwrite). Per crypto-session perf #138,
+    /// `nonce_from_counter` starts from this template instead of
+    /// zero-initializing then copy-from-slicing the prefix on
+    /// every TX / RX packet. Saves the per-packet prefix memcpy
+    /// (4 bytes) and the zero-init (12 bytes) — small in absolute
+    /// terms but fires twice per packet (once on encrypt, once on
+    /// decrypt) at the highest frequency code path in the system.
+    /// The session prefix is the first 4 bytes; callers needing
+    /// it independently can read `nonce_template[0..4]`.
+    nonce_template: [u8; NONCE_SIZE],
     /// TX counter — owned or shared with other ciphers in a pool.
     tx_counter: Arc<AtomicU64>,
     /// Sliding-window replay state for received counters. A single counter
@@ -583,9 +594,11 @@ pub(crate) fn session_prefix_from_id(session_id: u64) -> [u8; 4] {
 impl PacketCipher {
     /// Create a new fast cipher from a 32-byte key and session ID
     pub fn new(key: &[u8; 32], session_id: u64) -> Self {
+        let mut nonce_template = [0u8; NONCE_SIZE];
+        nonce_template[0..4].copy_from_slice(&session_prefix_from_id(session_id));
         Self {
             cipher: ChaCha20Poly1305::new(key.into()),
-            session_prefix: session_prefix_from_id(session_id),
+            nonce_template,
             tx_counter: Arc::new(AtomicU64::new(0)),
             rx_window: Mutex::new(ReplayWindow::new()),
         }
@@ -601,30 +614,36 @@ impl PacketCipher {
         session_id: u64,
         tx_counter: Arc<AtomicU64>,
     ) -> Self {
+        let mut nonce_template = [0u8; NONCE_SIZE];
+        nonce_template[0..4].copy_from_slice(&session_prefix_from_id(session_id));
         Self {
             cipher: ChaCha20Poly1305::new(key.into()),
-            session_prefix: session_prefix_from_id(session_id),
+            nonce_template,
             tx_counter,
             rx_window: Mutex::new(ReplayWindow::new()),
         }
     }
 
-    /// Generate the next nonce for sending
+    /// Generate the next nonce for sending. Per crypto-session
+    /// perf #138, starts from the pre-built `nonce_template` (which
+    /// already has the session prefix in bytes 0..4) and only
+    /// overwrites the counter bytes 4..12 — eliminates the
+    /// per-call zero-init + prefix memcpy of the legacy form.
     #[inline]
     #[allow(dead_code)]
     fn next_tx_nonce(&self) -> [u8; NONCE_SIZE] {
         let counter = self.tx_counter.fetch_add(1, Ordering::Relaxed);
-        let mut nonce = [0u8; NONCE_SIZE];
-        nonce[0..4].copy_from_slice(&self.session_prefix);
+        let mut nonce = self.nonce_template;
         nonce[4..12].copy_from_slice(&counter.to_le_bytes());
         nonce
     }
 
-    /// Construct a nonce from received counter value
+    /// Construct a nonce from received counter value. Mirrors the
+    /// TX path (#138): start from the prefix-filled template,
+    /// overwrite only the counter bytes.
     #[inline]
     fn nonce_from_counter(&self, counter: u64) -> [u8; NONCE_SIZE] {
-        let mut nonce = [0u8; NONCE_SIZE];
-        nonce[0..4].copy_from_slice(&self.session_prefix);
+        let mut nonce = self.nonce_template;
         nonce[4..12].copy_from_slice(&counter.to_le_bytes());
         nonce
     }
@@ -987,6 +1006,43 @@ mod tests {
             .unwrap();
         assert_eq!(len, plaintext.len());
         assert_eq!(&buffer[..len], plaintext);
+    }
+
+    /// Pin crypto-session perf #138: `PacketCipher` carries a
+    /// pre-built `nonce_template` with the session prefix in
+    /// bytes [0..4] and zero counter bytes in [4..12]. A
+    /// regression that drops the template (or fills it
+    /// incorrectly) would silently produce wrong nonces — the
+    /// encrypt/decrypt round-trip would still work *within a
+    /// session* (both sides drift the same way) but cross-impl
+    /// compatibility would break. Assert the structural invariant
+    /// directly.
+    #[test]
+    fn nonce_template_carries_session_prefix_with_zero_counter() {
+        let key = [0x55u8; 32];
+        let session_id = 0x1234_5678_9ABC_DEF0_u64;
+        let cipher = PacketCipher::new(&key, session_id);
+        let expected_prefix = session_prefix_from_id(session_id);
+        assert_eq!(
+            &cipher.nonce_template[0..4],
+            &expected_prefix,
+            "template's prefix bytes must match `session_prefix_from_id`",
+        );
+        assert_eq!(
+            &cipher.nonce_template[4..12],
+            &[0u8; 8],
+            "template's counter bytes start at zero — each per-packet \
+             nonce overwrites them",
+        );
+        // And the runtime contract: a nonce built from counter N
+        // matches the template with N's little-endian bytes in
+        // the counter slot.
+        let nonce = cipher.nonce_from_counter(0xCAFE_BABE_DEAD_BEEF);
+        assert_eq!(&nonce[0..4], &expected_prefix);
+        assert_eq!(
+            &nonce[4..12],
+            &0xCAFE_BABE_DEAD_BEEF_u64.to_le_bytes(),
+        );
     }
 
     /// Pin crypto-session perf #128: `decrypt_to_bytes` on a
