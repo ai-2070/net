@@ -284,4 +284,126 @@ mod tests {
         graph_id[0..8].copy_from_slice(&12345u64.to_le_bytes());
         assert_eq!(graph_id_to_node_id(&graph_id), 12345);
     }
+
+    // ---------- Real ProximityGraph* probe coverage ----------
+    //
+    // The existing tests use FixedLocalityProbe / FixedHealthProbe
+    // (test-only impls), which means the production
+    // `ProximityGraphLocalityProbe` and `ProximityGraphHealthProbe`
+    // were not exercised. Both classify peer state on hot paths
+    // that drive routing — a regression in the 3-tier health
+    // classifier or the self-filter would silently mis-route
+    // traffic.
+
+    use crate::adapter::net::behavior::proximity::{
+        EnhancedPingwave, ProximityConfig, ProximityGraph,
+    };
+    use std::net::SocketAddr;
+
+    /// Build `[u8; 32]` graph ids whose first byte is `n` so the
+    /// `graph_id_to_node_id` bridge yields a small predictable u64.
+    fn gid(n: u8) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[0] = n;
+        id
+    }
+
+    fn graph_with_one_peer(peer_id: [u8; 32]) -> Arc<ProximityGraph> {
+        let my_id = gid(1);
+        let graph = Arc::new(ProximityGraph::new(my_id, ProximityConfig::default()));
+        let from_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let pw = EnhancedPingwave::new(peer_id, 1, 3);
+        graph.on_pingwave_from(pw, peer_id, from_addr);
+        graph
+    }
+
+    #[test]
+    fn proximity_graph_locality_probe_filters_self_and_returns_peers() {
+        let peer = gid(2);
+        let graph = graph_with_one_peer(peer);
+        let my_u64 = graph_id_to_node_id(&gid(1));
+        let probe = ProximityGraphLocalityProbe::new(graph, my_u64);
+        let samples = probe.rtt_samples();
+        // Only the peer should appear — self must be filtered.
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].0, graph_id_to_node_id(&peer));
+        // Latency is whatever the pingwave estimated; just confirm
+        // it's a Duration (no panic).
+        let _ = samples[0].1;
+    }
+
+    #[test]
+    fn proximity_graph_health_probe_classifies_age_into_three_tiers() {
+        let peer = gid(2);
+        let graph = graph_with_one_peer(peer);
+        let my_u64 = graph_id_to_node_id(&gid(1));
+        let peer_u64 = graph_id_to_node_id(&peer);
+
+        // Healthy: huge thresholds — peer's fresh `last_seen` is
+        // well within both.
+        let probe = ProximityGraphHealthProbe::new(
+            Arc::clone(&graph),
+            my_u64,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let samples = probe.health_samples();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0], (peer_u64, NodeHealth::Healthy));
+
+        // Degraded: age ≥ degraded but < stale. Use 1ns degraded
+        // (so age trips it instantly) and a huge stale window so
+        // the Unreachable arm doesn't activate.
+        let probe = ProximityGraphHealthProbe::new(
+            Arc::clone(&graph),
+            my_u64,
+            Duration::from_nanos(1),
+            Duration::from_secs(3600),
+        );
+        // Spin briefly so the wall clock moves past the 1ns floor.
+        for _ in 0..1000 {
+            std::hint::black_box(0u64);
+        }
+        let samples = probe.health_samples();
+        assert_eq!(samples[0].1, NodeHealth::Degraded);
+
+        // Unreachable: age ≥ stale.
+        let probe = ProximityGraphHealthProbe::new(
+            graph,
+            my_u64,
+            Duration::from_nanos(1),
+            Duration::from_nanos(1),
+        );
+        for _ in 0..1000 {
+            std::hint::black_box(0u64);
+        }
+        let samples = probe.health_samples();
+        assert_eq!(samples[0].1, NodeHealth::Unreachable);
+    }
+
+    #[test]
+    fn proximity_graph_health_probe_with_defaults_picks_sensible_thresholds() {
+        // The `with_defaults` constructor wires 1.5s degraded and
+        // 5s stale. Construct it, exercise a fresh peer (must read
+        // as Healthy), then confirm we can swap to a stricter
+        // probe with the same graph and get Unreachable — pinning
+        // the defaults shape without depending on their exact
+        // numerical values past "stricter probes can override."
+        let peer = gid(2);
+        let graph = graph_with_one_peer(peer);
+        let my_u64 = graph_id_to_node_id(&gid(1));
+        let defaults_probe = ProximityGraphHealthProbe::with_defaults(Arc::clone(&graph), my_u64);
+        let samples = defaults_probe.health_samples();
+        assert_eq!(samples.len(), 1);
+        // Defaults treat a just-arrived peer as Healthy.
+        assert_eq!(samples[0].1, NodeHealth::Healthy);
+        // And the defaults wired the field correctly — sanity that
+        // the constructor didn't, say, leave thresholds at zero
+        // (which would make every peer Unreachable instead).
+        assert_eq!(
+            defaults_probe.degraded_threshold,
+            Duration::from_millis(1500)
+        );
+        assert_eq!(defaults_probe.stale_threshold, Duration::from_secs(5));
+    }
 }

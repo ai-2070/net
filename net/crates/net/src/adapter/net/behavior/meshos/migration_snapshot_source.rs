@@ -168,4 +168,48 @@ mod tests {
         let s = OrchestratorMigrationSnapshotSource::new(orch);
         assert!(s.list().is_empty());
     }
+
+    /// Pin: dashboards rely on `phase_progress_pct` to render the
+    /// at-a-glance pipeline indicator alongside each phase. A
+    /// refactor that swaps two phase percentages (e.g., Replay
+    /// down to 30, Transfer up to 70) would silently mis-render
+    /// progress in every operator UI. Pin all six known variants.
+    #[test]
+    fn phase_progress_pct_returns_known_percentages_for_every_phase() {
+        assert_eq!(
+            phase_progress_pct(MigrationPhaseSnapshot::Snapshot),
+            Some(10)
+        );
+        assert_eq!(
+            phase_progress_pct(MigrationPhaseSnapshot::Transfer),
+            Some(30)
+        );
+        assert_eq!(
+            phase_progress_pct(MigrationPhaseSnapshot::Restore),
+            Some(50)
+        );
+        assert_eq!(phase_progress_pct(MigrationPhaseSnapshot::Replay), Some(70));
+        assert_eq!(
+            phase_progress_pct(MigrationPhaseSnapshot::Cutover),
+            Some(90)
+        );
+        assert_eq!(
+            phase_progress_pct(MigrationPhaseSnapshot::Complete),
+            Some(100)
+        );
+        // Strictly monotonic — every phase advances the indicator,
+        // never regresses. Catches a future variant insertion that
+        // accidentally lands lower than its predecessor.
+        let pcts = [
+            phase_progress_pct(MigrationPhaseSnapshot::Snapshot).unwrap(),
+            phase_progress_pct(MigrationPhaseSnapshot::Transfer).unwrap(),
+            phase_progress_pct(MigrationPhaseSnapshot::Restore).unwrap(),
+            phase_progress_pct(MigrationPhaseSnapshot::Replay).unwrap(),
+            phase_progress_pct(MigrationPhaseSnapshot::Cutover).unwrap(),
+            phase_progress_pct(MigrationPhaseSnapshot::Complete).unwrap(),
+        ];
+        for w in pcts.windows(2) {
+            assert!(w[0] < w[1], "phase progress regressed: {} ≥ {}", w[0], w[1]);
+        }
+    }
 }
