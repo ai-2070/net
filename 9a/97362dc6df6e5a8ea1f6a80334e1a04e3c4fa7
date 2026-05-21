@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/channel/roster.rs
+  s_f930dae9b8bbc1::t_d429103e2bd1eb 141-154,156-160,162-164,166-179
+  s_f930dae9b8bbc1::t_12db38c9f15c3a 965-998
+net/crates/net/docs/performance/net-discovery-routing-analysis.md
+  s_f930dae9b8bbc1::t_794555e39ffffe 16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "9a97362dc6df6e5a8ea1f6a80334e1a04e3c4fa7",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
