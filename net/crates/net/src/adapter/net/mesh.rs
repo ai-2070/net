@@ -4142,20 +4142,34 @@ impl MeshNode {
             // mismatch; the drop here closes the loopback hole
             // without affecting production routing.
             let session_id = session.session_id();
-            let from_node = ctx
-                .addr_to_node
-                .get(&session.peer_addr())
-                .and_then(|nid| {
-                    ctx.peers.get(&*nid).and_then(|p| {
-                        (p.value().session.session_id() == session_id).then_some(*nid)
+            // Per-packet session→NodeId resolution. Fast path is a
+            // single Relaxed atomic load against the per-session
+            // cache populated by the first successful resolution;
+            // see `NetSession::cached_node_id` for the rationale
+            // (discovery-routing perf #108). Cache miss runs the
+            // legacy chain (`addr_to_node` lookup + session_id
+            // verification, then full peer scan on stale addr) and
+            // publishes the result for subsequent packets.
+            let from_node = session.cached_node_id().or_else(|| {
+                let resolved = ctx
+                    .addr_to_node
+                    .get(&session.peer_addr())
+                    .and_then(|nid| {
+                        ctx.peers.get(&*nid).and_then(|p| {
+                            (p.value().session.session_id() == session_id).then_some(*nid)
+                        })
                     })
-                })
-                .or_else(|| {
-                    ctx.peers
-                        .iter()
-                        .find(|e| e.value().session.session_id() == session_id)
-                        .map(|e| e.value().node_id)
-                });
+                    .or_else(|| {
+                        ctx.peers
+                            .iter()
+                            .find(|e| e.value().session.session_id() == session_id)
+                            .map(|e| e.value().node_id)
+                    });
+                if let Some(nid) = resolved {
+                    session.cache_node_id(nid);
+                }
+                resolved
+            });
             let Some(from_node) = from_node else {
                 tracing::warn!(
                     target: "mesh.rpc",

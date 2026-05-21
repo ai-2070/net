@@ -6,6 +6,14 @@ This is the architectural-advantage area: optimizing here protects the substrate
 
 ---
 
+## ✅ Fixed
+
+| # | Item | Notes |
+|---|------|-------|
+| 108 | `dispatch_packet` per-packet session→NodeId resolution → per-session cache | New `cached_node_id: AtomicU64` on `NetSession` (sentinel `0` = unresolved). `dispatch_packet`'s RPC hook tries the cache first via `session.cached_node_id()` — single Relaxed atomic load. Miss runs the legacy chain (`addr_to_node` lookup + session_id verification, then full peer scan on stale addr) and calls `session.cache_node_id(nid)` to publish for subsequent packets. For high-RPC-rate workloads on persistent sessions, drops the per-packet cost from "2 DashMap lookups + comparison + possible O(N) scan" to one atomic load. Pinned by `cached_node_id_returns_none_until_published_then_caches` (covers the unresolved → cached transition and the `0` sentinel no-op). |
+
+---
+
 ## The hot paths in scope
 
 For a discovery-routed RPC from caller to callee, the per-call work that gRPC doesn't do:
