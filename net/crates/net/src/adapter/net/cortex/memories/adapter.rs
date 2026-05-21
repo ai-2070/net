@@ -471,3 +471,57 @@ impl std::fmt::Debug for MemoriesAdapter {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::net::redex::Redex;
+
+    /// Mirror of the TasksAdapter WrongOrigin test — same guard,
+    /// same contract, same dashboards counter. See the matching
+    /// docstring on TasksAdapter::poll_for_token for the security
+    /// rationale.
+    #[tokio::test]
+    async fn poll_and_wait_for_token_reject_mismatched_origin() {
+        const OUR_ORIGIN: u64 = 0x9999_AAAA_BBBB_CCCC;
+        const FOREIGN_ORIGIN: u64 = 0x5555_6666_7777_8888;
+        let redex = Redex::new();
+        let adapter = MemoriesAdapter::open(&redex, OUR_ORIGIN).await.unwrap();
+        assert_eq!(adapter.origin_hash(), OUR_ORIGIN);
+
+        assert_eq!(adapter.as_cortex().ryw_metrics().wrong_origin_total, 0);
+
+        let foreign_token = WriteToken::new(FOREIGN_ORIGIN, 0);
+
+        match adapter.poll_for_token(foreign_token) {
+            Err(WaitForTokenError::WrongOrigin {
+                token_origin,
+                adapter_origin,
+            }) => {
+                assert_eq!(token_origin, FOREIGN_ORIGIN);
+                assert_eq!(adapter_origin, OUR_ORIGIN);
+            }
+            other => panic!("expected WrongOrigin, got {:?}", other),
+        }
+        assert_eq!(adapter.as_cortex().ryw_metrics().wrong_origin_total, 1);
+
+        match adapter
+            .wait_for_token(foreign_token, Duration::from_millis(10))
+            .await
+        {
+            Err(WaitForTokenError::WrongOrigin { .. }) => {}
+            other => panic!("expected WrongOrigin, got {:?}", other),
+        }
+        assert_eq!(adapter.as_cortex().ryw_metrics().wrong_origin_total, 2);
+
+        // Sanity: matched-origin token does NOT bump the counter.
+        let our_token = WriteToken::new(OUR_ORIGIN, 999);
+        match adapter.poll_for_token(our_token) {
+            Err(WaitForTokenError::Timeout) => {}
+            other => panic!("expected Timeout for matched-origin token, got {:?}", other),
+        }
+        assert_eq!(adapter.as_cortex().ryw_metrics().wrong_origin_total, 2);
+
+        adapter.close().unwrap();
+    }
+}

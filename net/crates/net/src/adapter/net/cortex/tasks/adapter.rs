@@ -514,3 +514,70 @@ impl std::fmt::Debug for TasksAdapter {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::net::redex::Redex;
+
+    /// Cross-origin aliasing protection on the RYW surface. A
+    /// `WriteToken` is `(origin_hash, seq)`; if the adapter accepted
+    /// a token bound to a different origin, a wait would either
+    /// resolve against someone else's chain (silent RYW
+    /// violation) or block forever (the targeted seq never
+    /// arrives on this origin). The guard at both `wait_for_token`
+    /// and `poll_for_token` short-circuits with `WrongOrigin` and
+    /// bumps the `wrong_origin_total` RYW metric so operator
+    /// dashboards see the leak attempt.
+    #[tokio::test]
+    async fn poll_and_wait_for_token_reject_mismatched_origin() {
+        const OUR_ORIGIN: u64 = 0xAAAA_BBBB_CCCC_DDDD;
+        const FOREIGN_ORIGIN: u64 = 0x1111_2222_3333_4444;
+        let redex = Redex::new();
+        let adapter = TasksAdapter::open(&redex, OUR_ORIGIN).await.unwrap();
+        assert_eq!(adapter.origin_hash(), OUR_ORIGIN);
+
+        // Counter starts at 0.
+        assert_eq!(adapter.as_cortex().ryw_metrics().wrong_origin_total, 0);
+
+        let foreign_token = WriteToken::new(FOREIGN_ORIGIN, 0);
+
+        // Synchronous poll: must reject with WrongOrigin and
+        // bump the counter (proves the guard fired, not just that
+        // some unrelated branch returned Err).
+        match adapter.poll_for_token(foreign_token) {
+            Err(WaitForTokenError::WrongOrigin {
+                token_origin,
+                adapter_origin,
+            }) => {
+                assert_eq!(token_origin, FOREIGN_ORIGIN);
+                assert_eq!(adapter_origin, OUR_ORIGIN);
+            }
+            other => panic!("expected WrongOrigin, got {:?}", other),
+        }
+        assert_eq!(adapter.as_cortex().ryw_metrics().wrong_origin_total, 1);
+
+        // Async wait: same contract; counter increments again.
+        match adapter
+            .wait_for_token(foreign_token, Duration::from_millis(10))
+            .await
+        {
+            Err(WaitForTokenError::WrongOrigin { .. }) => {}
+            other => panic!("expected WrongOrigin, got {:?}", other),
+        }
+        assert_eq!(adapter.as_cortex().ryw_metrics().wrong_origin_total, 2);
+
+        // Sanity: a token with the right origin (even at a seq we
+        // haven't reached) returns Timeout, not WrongOrigin —
+        // proves the guard is keyed on origin, not on seq.
+        let our_token = WriteToken::new(OUR_ORIGIN, 999);
+        match adapter.poll_for_token(our_token) {
+            Err(WaitForTokenError::Timeout) => {}
+            other => panic!("expected Timeout for matched-origin token, got {:?}", other),
+        }
+        // wrong_origin_total must NOT have moved for the matched-origin call.
+        assert_eq!(adapter.as_cortex().ryw_metrics().wrong_origin_total, 2);
+
+        adapter.close().unwrap();
+    }
+}
