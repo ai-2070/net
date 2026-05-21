@@ -700,9 +700,17 @@ mod tests {
         );
         match result {
             Err(DaemonError::RestoreFailed(msg)) => {
-                assert!(
-                    msg.contains("bindings") || msg.contains("tampered") || msg.contains("corrupt"),
-                    "error must name the failing surface: {msg}",
+                // Pin the exact production message verbatim. A
+                // previous version used an OR-chain of substrings
+                // ("bindings" || "tampered" || "corrupt") which
+                // would silently keep passing if a future error
+                // message dropped the "tampered or corrupt"
+                // operator-readable suffix — defeating the
+                // attacker-resistance signal this test exists
+                // to guard.
+                assert_eq!(
+                    msg, "snapshot bindings_bytes failed to decode — tampered or corrupt snapshot",
+                    "production error message changed; update test pin alongside host.rs:184-190",
                 );
             }
             other => panic!("expected RestoreFailed, got {:?}", other.is_ok()),

@@ -520,12 +520,8 @@ mod tests {
         assert!(!MigrationFailureReason::ComputeNotSupported.is_retriable());
         assert!(!MigrationFailureReason::StateFailed("x".into()).is_retriable());
         assert!(!MigrationFailureReason::AlreadyMigrating.is_retriable());
-        assert!(
-            !MigrationFailureReason::IdentityTransportFailed("x".into()).is_retriable()
-        );
-        assert!(
-            !MigrationFailureReason::NotReadyTimeout { attempts: 5 }.is_retriable()
-        );
+        assert!(!MigrationFailureReason::IdentityTransportFailed("x".into()).is_retriable());
+        assert!(!MigrationFailureReason::NotReadyTimeout { attempts: 5 }.is_retriable());
     }
 
     /// Pin: each variant has a distinct 16-bit wire code. A
@@ -543,7 +539,10 @@ mod tests {
             (MigrationFailureReason::ComputeNotSupported, 2),
             (MigrationFailureReason::StateFailed("x".into()), 3),
             (MigrationFailureReason::AlreadyMigrating, 4),
-            (MigrationFailureReason::IdentityTransportFailed("y".into()), 5),
+            (
+                MigrationFailureReason::IdentityTransportFailed("y".into()),
+                5,
+            ),
             (MigrationFailureReason::NotReadyTimeout { attempts: 1 }, 6),
         ];
         for (reason, expected_code) in &variants {
@@ -558,11 +557,7 @@ mod tests {
         let mut sorted = codes.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(
-            codes.len(),
-            sorted.len(),
-            "wire-code collision: {codes:?}",
-        );
+        assert_eq!(codes.len(), sorted.len(), "wire-code collision: {codes:?}",);
     }
 
     /// Pin: every MigrationFailureReason Display message names the

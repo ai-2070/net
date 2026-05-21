@@ -617,7 +617,8 @@ mod tests {
         // Empty bytes: stateless-to-stateless migration shape.
         // Must succeed — otherwise we'd break every migration of
         // a genuinely stateless daemon.
-        d.restore(Bytes::new()).expect("empty restore on stateless daemon must succeed");
+        d.restore(Bytes::new())
+            .expect("empty restore on stateless daemon must succeed");
 
         // Non-empty bytes: misconfiguration signal. Default
         // impl surfaces it as RestoreFailed with a message that

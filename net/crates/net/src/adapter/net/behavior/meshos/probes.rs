@@ -351,32 +351,35 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0], (peer_u64, NodeHealth::Healthy));
 
-        // Degraded: age ≥ degraded but < stale. Use 1ns degraded
-        // (so age trips it instantly) and a huge stale window so
-        // the Unreachable arm doesn't activate.
+        // Advance the wall clock past every threshold the
+        // remaining cases will use. A real `thread::sleep` is
+        // deterministic across hosts; the previous version
+        // spun `for _ in 0..1000 { black_box }`, which on
+        // modern hardware completes in nanoseconds — whether
+        // the loop crossed the 1ns floor depended on
+        // `Instant::now()` resolution.
+        std::thread::sleep(Duration::from_millis(2));
+
+        // Degraded: age ≥ degraded but < stale. The 2ms sleep
+        // above is well past 1µs and well under 1h, so the
+        // peer falls into the middle tier.
         let probe = ProximityGraphHealthProbe::new(
             Arc::clone(&graph),
             my_u64,
-            Duration::from_nanos(1),
+            Duration::from_micros(1),
             Duration::from_secs(3600),
         );
-        // Spin briefly so the wall clock moves past the 1ns floor.
-        for _ in 0..1000 {
-            std::hint::black_box(0u64);
-        }
         let samples = probe.health_samples();
         assert_eq!(samples[0].1, NodeHealth::Degraded);
 
-        // Unreachable: age ≥ stale.
+        // Unreachable: age ≥ stale. Same anchor sleep; setting
+        // stale to 1µs forces the Unreachable arm.
         let probe = ProximityGraphHealthProbe::new(
             graph,
             my_u64,
-            Duration::from_nanos(1),
-            Duration::from_nanos(1),
+            Duration::from_micros(1),
+            Duration::from_micros(1),
         );
-        for _ in 0..1000 {
-            std::hint::black_box(0u64);
-        }
         let samples = probe.health_samples();
         assert_eq!(samples[0].1, NodeHealth::Unreachable);
     }

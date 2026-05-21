@@ -470,12 +470,18 @@ mod tests {
         // we observe via entity_count() (0 for the empty horizon)
         // as the simplest invariant.
         assert_eq!(record.horizon_at_split().entity_count(), 0);
-        // duration() reflects time since detection — must be a
-        // sensible positive Duration, not zero (we just spent
-        // some non-zero time in detect()) but well under a
-        // wall-clock second.
+        // duration() reflects time since detection. We only
+        // need a sanity ceiling — the contract is "returns a
+        // forward-going Duration relative to detect()," not a
+        // specific tight bound. A 60s ceiling tolerates loaded
+        // CI boxes while still catching a regression that
+        // returns `Duration::MAX` or an unrelated wall-clock
+        // value.
         let d = record.duration();
-        assert!(d < std::time::Duration::from_secs(1), "duration too long: {d:?}");
+        assert!(
+            d < std::time::Duration::from_secs(60),
+            "duration sanity ceiling exceeded: {d:?}",
+        );
     }
 
     /// Phase-transition guard: confirm() returning false when the

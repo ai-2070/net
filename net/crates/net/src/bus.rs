@@ -1940,6 +1940,54 @@ pub(crate) fn set_shutdown_via_ref_spin_deadline_for_test(ms: u64) {
     SHUTDOWN_VIA_REF_DEADLINE_OVERRIDE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(test)]
+impl EventBus {
+    /// Test-only: bump `in_flight_ingests` by `n` to simulate
+    /// stranded producers mid-call to `shard_manager.ingest`.
+    /// The shutdown spin loop reads `in_flight_ingests` to decide
+    /// whether work is still pending; the lossy-shutdown
+    /// reconciliation tests need to drive that counter without
+    /// the matching real `try_enter_ingest` / `ingest_complete`
+    /// machinery, which would also bump `events_ingested` and
+    /// confuse the (stranded, post_deadline_ingests) accounting.
+    ///
+    /// Tests own the lifecycle: every `stage_stranded_ingest(n)`
+    /// MUST be paired with `release_stranded_ingest(n)` before
+    /// the bus drops, otherwise the `Drop` impl's invariants
+    /// fire.
+    pub(crate) fn stage_stranded_ingest(&self, n: u64) {
+        self.in_flight_ingests
+            .fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: counterpart to [`stage_stranded_ingest`].
+    /// Decrements `in_flight_ingests` by `n` without bumping
+    /// `events_ingested`. Use when simulating producers that
+    /// were stranded by the shutdown deadline and never
+    /// completed (the drain reconciliation should classify them
+    /// as drops).
+    pub(crate) fn release_stranded_ingest(&self, n: u64) {
+        self.in_flight_ingests
+            .fetch_sub(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: simulate a previously-stranded producer
+    /// completing AFTER the shutdown deadline. Bumps
+    /// `events_ingested` first (Release ordering — the
+    /// post-drain reconciliation reads it with Acquire), then
+    /// releases the in-flight slot. The order matches what a
+    /// real producer's `ingest` call site does, so the
+    /// reconciliation's (ingested_after - ingested_at_deadline)
+    /// arithmetic reads the same way.
+    pub(crate) fn complete_stranded_ingest(&self, n: u64) {
+        self.stats
+            .events_ingested
+            .fetch_add(n, std::sync::atomic::Ordering::Release);
+        self.in_flight_ingests
+            .fetch_sub(n, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 async fn run_scaling_monitor_via_weak(weak: std::sync::Weak<EventBus>) {
     // Refresh `interval` from the policy on every tick. The previous
     // version cached it once at task start, so any future runtime
@@ -3862,18 +3910,16 @@ mod tests {
 
         // Stage one "stranded" in-flight ingest. Real producers
         // would have incremented this via try_enter_ingest and
-        // be mid-call to `shard_manager.ingest`; we manually
-        // hold the counter at 1 for the duration of the
-        // deadline-window.
-        bus.in_flight_ingests
-            .fetch_add(1, AtomicOrdering::SeqCst);
+        // be mid-call to `shard_manager.ingest`; the test helper
+        // (defined alongside `EventBus`) holds the counter at 1
+        // for the duration of the deadline-window.
+        bus.stage_stranded_ingest(1);
 
         // Spawn shutdown — it'll enter the in-flight spin loop
         // and park on `tokio::time::sleep(1ms)` until time
         // advances.
         let bus_for_shutdown = Arc::clone(&bus);
-        let shutdown_task =
-            tokio::spawn(async move { bus_for_shutdown.shutdown_via_ref().await });
+        let shutdown_task = tokio::spawn(async move { bus_for_shutdown.shutdown_via_ref().await });
 
         // Yield enough times for the shutdown task to enter the
         // spin loop. With paused time, the spin's 1ms sleep
@@ -3893,22 +3939,16 @@ mod tests {
 
         // The eager-set was_lossy flag is visible now.
         assert!(
-            bus.stats
-                .shutdown_was_lossy
-                .load(AtomicOrdering::Acquire),
+            bus.stats.shutdown_was_lossy.load(AtomicOrdering::Acquire),
             "deadline must have set was_lossy=true (eagerly)",
         );
 
         // Now simulate the "stranded" producer completing AFTER
-        // the deadline: bump events_ingested and release the
-        // in-flight counter. Order matters — events_ingested
-        // must visibly advance before the post-drain
-        // reconciliation reads it.
-        bus.stats
-            .events_ingested
-            .fetch_add(1, AtomicOrdering::Release);
-        bus.in_flight_ingests
-            .fetch_sub(1, AtomicOrdering::SeqCst);
+        // the deadline. The helper bumps events_ingested with
+        // Release ordering before releasing the in-flight slot
+        // — matching what a real `ingest` call site does, so
+        // the reconciliation reads the same arithmetic.
+        bus.complete_stranded_ingest(1);
 
         // Let shutdown finish — its post-drain reconciliation
         // now reads ingested_after=1, post_deadline_ingests=1,
@@ -3916,9 +3956,7 @@ mod tests {
         let _ = shutdown_task.await.unwrap();
 
         assert!(
-            !bus.stats
-                .shutdown_was_lossy
-                .load(AtomicOrdering::Acquire),
+            !bus.stats.shutdown_was_lossy.load(AtomicOrdering::Acquire),
             "reconciliation must clear was_lossy when drain catches up to every stranded ingest \
              (post_deadline_ingests >= stranded → actual_drops == 0)",
         );
@@ -3957,12 +3995,10 @@ mod tests {
 
         // Stage two stranded ingests so the actual_drops count
         // is meaningful (not just 0 vs 1).
-        bus.in_flight_ingests
-            .fetch_add(2, AtomicOrdering::SeqCst);
+        bus.stage_stranded_ingest(2);
 
         let bus_for_shutdown = Arc::clone(&bus);
-        let shutdown_task =
-            tokio::spawn(async move { bus_for_shutdown.shutdown_via_ref().await });
+        let shutdown_task = tokio::spawn(async move { bus_for_shutdown.shutdown_via_ref().await });
 
         for _ in 0..10 {
             tokio::task::yield_now().await;
@@ -3977,15 +4013,12 @@ mod tests {
         // NOT bump events_ingested — the producers never
         // "completed," so the reconciliation must classify them
         // as drops.
-        bus.in_flight_ingests
-            .fetch_sub(2, AtomicOrdering::SeqCst);
+        bus.release_stranded_ingest(2);
 
         let _ = shutdown_task.await.unwrap();
 
         assert!(
-            bus.stats
-                .shutdown_was_lossy
-                .load(AtomicOrdering::Acquire),
+            bus.stats.shutdown_was_lossy.load(AtomicOrdering::Acquire),
             "was_lossy must stay true when drain did not catch up",
         );
         // stranded=2, post_deadline_ingests=0, actual_drops=2.
@@ -3998,6 +4031,123 @@ mod tests {
         );
     }
 
+    /// `remove_shard_internal` at L832-L859 dispatches any
+    /// stranded ring-buffer events through the adapter as a
+    /// one-shot batch. The normal scale-down path drains the
+    /// ring via the drain worker before remove fires, so
+    /// `stranded.is_empty()` on the happy path and L832-L859
+    /// never runs — but a race window between drain completion
+    /// and remove (or a manual remove on a shard whose drain
+    /// worker is parked) leaves events stranded. Pre-fix any
+    /// stranded events would have been silently dropped; the
+    /// L832-L859 path now flushes them and bumps both
+    /// `batches_dispatched` (+1) and `events_dispatched` (+N).
+    ///
+    /// We force the stranded-events condition by:
+    ///   1. Pausing time so the drain worker can't pull from
+    ///      the ring (its polling sleeps don't tick).
+    ///   2. Pushing raw events directly into shard 0's ring via
+    ///      the `with_shard` API.
+    ///   3. Calling `remove_shard_internal(0)` — its inner
+    ///      `shard_manager.remove_shard` then returns the
+    ///      stranded vec, triggering the L832-L859 dispatch.
+    #[tokio::test(start_paused = true)]
+    async fn remove_shard_internal_dispatches_stranded_ring_buffer_events() {
+        let received = Arc::new(AtomicU64::new(0));
+        let adapter: Box<dyn crate::adapter::Adapter> = Box::new(CountingAdapter {
+            received: Arc::clone(&received),
+        });
+        // Keep the default scaling policy: `remove_shard_internal`
+        // routes through `shard_manager.remove_shard`, which
+        // requires the dynamic-scaling mapper. `without_scaling()`
+        // turns the mapper off and the remove fails with
+        // "Dynamic scaling not enabled". The scaling MONITOR
+        // task is a separate concern and isn't auto-started by
+        // `new_with_adapter` — see
+        // `start_scaling_monitor_is_noop_without_scaling_and_idempotent_with_it`
+        // for the lifecycle contract.
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .build()
+            .unwrap();
+        let bus = Arc::new(EventBus::new_with_adapter(config, adapter).await.unwrap());
+
+        // Yield enough times for the spawned drain workers to
+        // reach their first `tokio::time::sleep` and park. With
+        // `start_paused` they can't tick once parked; the gate
+        // is here so the worker on shard 0 has *already parked*
+        // before we push events into the ring. Without this, a
+        // worker that hadn't yet hit its first park could race
+        // the push and dispatch via the normal drain path
+        // instead of the L832-L859 stranded path the test exists
+        // to pin.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Stage 5 events directly in shard 0's ring. With paused
+        // time the drain worker can't pull them out — they sit
+        // there until remove fires.
+        let stranded_count = 5u64;
+        let pushed = bus.shard_manager.with_shard(0, |shard| {
+            for i in 0..stranded_count {
+                shard
+                    .try_push_raw(bytes::Bytes::from(format!("stranded-{i}")))
+                    .unwrap();
+            }
+        });
+        assert!(
+            pushed.is_some(),
+            "shard 0 must exist for try_push_raw to land",
+        );
+
+        let batches_before = bus.stats.batches_dispatched.load(AtomicOrdering::Acquire);
+        let events_before = bus.stats.events_dispatched.load(AtomicOrdering::Acquire);
+
+        // Directly invoke the internal — the production path
+        // routes through manual_scale_down + finalize_draining,
+        // but the L832-L859 dispatch arm is the same regardless
+        // of how we got here.
+        bus.remove_shard_internal(0)
+            .await
+            .expect("remove_shard_internal must succeed");
+
+        // The CountingAdapter saw the stranded batch.
+        assert_eq!(
+            received.load(AtomicOrdering::SeqCst),
+            stranded_count,
+            "stranded events must reach the adapter",
+        );
+        // Bus stats bumped by exactly the right amounts.
+        assert_eq!(
+            bus.stats.batches_dispatched.load(AtomicOrdering::Acquire),
+            batches_before + 1,
+            "exactly one stranded batch must increment batches_dispatched",
+        );
+        assert_eq!(
+            bus.stats.events_dispatched.load(AtomicOrdering::Acquire),
+            events_before + stranded_count,
+            "events_dispatched must reflect every stranded event",
+        );
+
+        // Clean shutdown so the remaining shard's drain worker
+        // exits cleanly rather than getting torn down by the
+        // bus's `Drop` impl (which silently loses any events
+        // still in the ring buffers / mpsc channels). Mirrors
+        // the lifecycle hygiene the other paused-time tests in
+        // this module follow.
+        //
+        // The remaining drain worker (shard 1) is parked on
+        // `tokio::time::sleep`; tokio's paused-time auto-advance
+        // wakes it once every task is parked on time, but we
+        // yield-loop here anyway so the JoinHandle await below
+        // doesn't depend on auto-advance heuristics.
+        bus.shutdown_via_ref()
+            .await
+            .expect("shutdown must succeed under paused time");
+    }
+
     /// `EventBus::new_with_adapter` must surface a `Fatal` error
     /// — naming the configured path — when `producer_nonce_path`
     /// points at a location the runtime can't read or create. The
@@ -4008,12 +4158,21 @@ mod tests {
     /// chosen to provide (at-most-once across restart).
     #[tokio::test]
     async fn new_with_adapter_surfaces_fatal_when_nonce_path_unreadable() {
-        // Point at a path whose parent directory doesn't exist —
-        // load_or_create has to mkdir-then-write, and Windows
-        // refuses to create the file under a missing parent.
-        let bogus_path = std::path::PathBuf::from(
-            "C:\\nonexistent-parent-for-net-coverage-test\\deeply\\nested\\nonce",
-        );
+        // Point at a path whose parent directory doesn't exist.
+        // `load_or_create` has to mkdir-then-write, so a missing
+        // parent fails on every platform. Anchoring under
+        // `std::env::temp_dir()` keeps the path well-formed on
+        // both Windows (`C:\Users\...\Temp\...`) and Linux/macOS
+        // (`/tmp/...`) — a hardcoded `C:\\…` literal looks like a
+        // valid filename on POSIX filesystems and the create
+        // happily succeeds, silently bypassing the failure-arm
+        // this test exists to pin.
+        let marker = "net-coverage-nonexistent-parent";
+        let bogus_path = std::env::temp_dir()
+            .join(marker)
+            .join("deeply")
+            .join("nested")
+            .join("nonce");
         let config = EventBusConfig::builder()
             .num_shards(1)
             .ring_buffer_capacity(1024)
@@ -4034,9 +4193,11 @@ mod tests {
                 );
                 // The path must appear in the message so operators
                 // can grep their logs to the misconfigured config
-                // field without guessing.
+                // field without guessing. The unique marker
+                // segment is portable across platforms (the temp
+                // root differs but the joined marker is the same).
                 assert!(
-                    msg.contains("nonexistent-parent-for-net-coverage-test"),
+                    msg.contains(marker),
                     "error must include the configured path: {msg}",
                 );
             }
