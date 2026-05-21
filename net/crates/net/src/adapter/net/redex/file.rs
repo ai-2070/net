@@ -1153,7 +1153,7 @@ impl RedexFile {
                 .ok_or_else(|| BlobError::AdapterNotRegistered(adapter_id.to_string()))?;
                 let fetched = adapter.fetch(&blob).await?;
                 blob.verify(&fetched)?;
-                Ok(Some(bytes::Bytes::from(fetched)))
+                Ok(Some(fetched))
             }
         }
     }

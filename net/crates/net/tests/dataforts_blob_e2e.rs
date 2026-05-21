@@ -275,7 +275,7 @@ async fn mesh_blob_prefetch_replicates_chunks_from_peer() {
 
     // Adapter-level read on B returns the original bytes.
     let fetched = adapter_b.fetch(&blob_ref).await.expect("B fetch");
-    assert_eq!(fetched, payload);
+    assert_eq!(fetched.as_ref(), payload.as_slice());
 }
 
 /// v0.3 Tree blobs traverse `drive_chunk_roles_for` without
@@ -540,7 +540,8 @@ async fn gravity_migration_controller_fetches_hot_blob() {
     }
     let fetched = adapter_b.fetch(&blob_ref).await.expect("B fetch");
     assert_eq!(
-        fetched, payload,
+        fetched.as_ref(),
+        payload.as_slice(),
         "B's adapter must serve the migrated blob bytes"
     );
 }
@@ -790,8 +791,16 @@ async fn three_node_parallel_migration_lands_blob_on_two_peers() {
         .fetch(&blob_ref)
         .await
         .expect("C fetch (after parallel migration)");
-    assert_eq!(fetched_b, payload, "B's migrated bytes must equal source");
-    assert_eq!(fetched_c, payload, "C's migrated bytes must equal source");
+    assert_eq!(
+        fetched_b.as_ref(),
+        payload.as_slice(),
+        "B's migrated bytes must equal source"
+    );
+    assert_eq!(
+        fetched_c.as_ref(),
+        payload.as_slice(),
+        "C's migrated bytes must equal source"
+    );
 }
 
 /// Pair-handshake without `start()` — used by the 3-node test

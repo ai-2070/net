@@ -117,9 +117,7 @@ impl CompiledFilter {
             Self::And(filters) => !filters.is_empty() && filters.iter().all(|f| f.matches(event)),
             Self::Or(filters) => filters.iter().any(|f| f.matches(event)),
             Self::Not(f) => !f.matches(event),
-            Self::Eq { segments, value } => {
-                json_path_get_compiled(event, segments) == Some(value)
-            }
+            Self::Eq { segments, value } => json_path_get_compiled(event, segments) == Some(value),
         }
     }
 }
@@ -221,9 +219,7 @@ impl Filter {
             Self::And { filters } => {
                 CompiledFilter::And(filters.iter().map(Self::compile).collect())
             }
-            Self::Or { filters } => {
-                CompiledFilter::Or(filters.iter().map(Self::compile).collect())
-            }
+            Self::Or { filters } => CompiledFilter::Or(filters.iter().map(Self::compile).collect()),
             Self::Not { filter } => CompiledFilter::Not(Box::new(filter.compile())),
             Self::Eq { path, value } => CompiledFilter::Eq {
                 segments: compile_path(path),

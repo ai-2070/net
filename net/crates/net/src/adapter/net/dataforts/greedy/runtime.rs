@@ -2201,14 +2201,14 @@ mod tests {
         async fn fetch(
             &self,
             _: &crate::adapter::net::dataforts::blob::BlobRef,
-        ) -> Result<Vec<u8>, crate::adapter::net::dataforts::blob::BlobError> {
+        ) -> Result<bytes::Bytes, crate::adapter::net::dataforts::blob::BlobError> {
             unreachable!()
         }
         async fn fetch_range(
             &self,
             _: &crate::adapter::net::dataforts::blob::BlobRef,
             _: std::ops::Range<u64>,
-        ) -> Result<Vec<u8>, crate::adapter::net::dataforts::blob::BlobError> {
+        ) -> Result<bytes::Bytes, crate::adapter::net::dataforts::blob::BlobError> {
             unreachable!()
         }
         async fn exists(

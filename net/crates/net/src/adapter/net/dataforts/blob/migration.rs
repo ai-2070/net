@@ -889,14 +889,14 @@ mod tests {
         async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> {
             unreachable!()
         }
-        async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
+        async fn fetch(&self, _: &BlobRef) -> Result<bytes::Bytes, BlobError> {
             unreachable!()
         }
         async fn fetch_range(
             &self,
             _: &BlobRef,
             _: std::ops::Range<u64>,
-        ) -> Result<Vec<u8>, BlobError> {
+        ) -> Result<bytes::Bytes, BlobError> {
             unreachable!()
         }
         async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> {

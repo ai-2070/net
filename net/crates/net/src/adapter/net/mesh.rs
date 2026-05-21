@@ -4601,11 +4601,7 @@ impl MeshNode {
     /// Requires:
     /// - A session with `dest_node_id` (for encryption)
     /// - A route to `dest_node_id` in the routing table (for next hop)
-    pub async fn send_routed(
-        &self,
-        dest_node_id: u64,
-        batch: &Batch,
-    ) -> Result<(), AdapterError> {
+    pub async fn send_routed(&self, dest_node_id: u64, batch: &Batch) -> Result<(), AdapterError> {
         // Find the session for the destination (needed for encryption)
         let (dest_addr, session) = self
             .peers

@@ -580,8 +580,7 @@ impl ShardMapper {
         let mut candidates: Vec<u16> = shards
             .iter()
             .filter(|s| {
-                s.state == ShardState::Active
-                    && (s.last_metrics.weight - min_weight).abs() < 0.1
+                s.state == ShardState::Active && (s.last_metrics.weight - min_weight).abs() < 0.1
             })
             .map(|s| s.id)
             .collect();

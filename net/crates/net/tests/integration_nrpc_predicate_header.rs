@@ -157,7 +157,9 @@ impl RpcHandler for WhereFilterHandler {
                 return Ok(RpcResponsePayload {
                     status: RpcStatus::Ok,
                     headers: vec![],
-                    body: serde_json::to_vec::<Vec<u32>>(&vec![]).expect("empty json").into(),
+                    body: serde_json::to_vec::<Vec<u32>>(&vec![])
+                        .expect("empty json")
+                        .into(),
                 });
             }
         };

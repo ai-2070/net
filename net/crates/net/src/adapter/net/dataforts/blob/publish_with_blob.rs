@@ -332,8 +332,8 @@ mod tests {
         adapter.sync_blob(&blob_ref).await.unwrap();
         // The full-blob fetch path concatenates every chunk —
         // success here pins per-chunk local reachability.
-        let fetched: Vec<u8> = adapter.fetch(&blob_ref).await.unwrap();
-        assert_eq!(fetched, payload);
+        let fetched = adapter.fetch(&blob_ref).await.unwrap();
+        assert_eq!(fetched.as_ref(), payload.as_slice());
     }
 
     /// `sync_blob` walks every chunk of a Manifest, not just the

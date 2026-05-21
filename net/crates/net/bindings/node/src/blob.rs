@@ -530,7 +530,7 @@ pub async fn blob_resolve(adapter_id: String, payload: Buffer) -> Result<Buffer>
     let bytes = resolve_payload(&payload, adapter.as_ref())
         .await
         .map_err(map_blob_err)?;
-    Ok(Buffer::from(bytes))
+    Ok(Buffer::from(bytes.to_vec()))
 }
 
 // =========================================================================
@@ -712,7 +712,10 @@ impl BlobAdapter for NodeBlobAdapter {
         .await
     }
 
-    async fn fetch(&self, blob_ref: &InnerBlobRef) -> std::result::Result<Vec<u8>, InnerBlobError> {
+    async fn fetch(
+        &self,
+        blob_ref: &InnerBlobRef,
+    ) -> std::result::Result<bytes::Bytes, InnerBlobError> {
         let (uri, hash, size) = js_blob_ref_parts(blob_ref);
         let args = JsBlobFetchArgs { uri, hash, size };
         let buf = await_tsfn::<Buffer, _>(self.timeout, "fetch", |cb| {
@@ -726,14 +729,19 @@ impl BlobAdapter for NodeBlobAdapter {
             )
         })
         .await?;
-        Ok(buf.to_vec())
+        // napi Buffer's backing storage isn't shareable with `Bytes`
+        // safely, so we materialize via `to_vec` then wrap. The FFI
+        // boundary keeps the copy that dataforts perf #184 lifted
+        // from the internal mesh paths — see the comment on
+        // `ffi::blob::fetch`.
+        Ok(bytes::Bytes::from(buf.to_vec()))
     }
 
     async fn fetch_range(
         &self,
         blob_ref: &InnerBlobRef,
         range: Range<u64>,
-    ) -> std::result::Result<Vec<u8>, InnerBlobError> {
+    ) -> std::result::Result<bytes::Bytes, InnerBlobError> {
         let (uri, hash, size) = js_blob_ref_parts(blob_ref);
         let args = JsBlobFetchRangeArgs {
             uri,
@@ -753,7 +761,7 @@ impl BlobAdapter for NodeBlobAdapter {
             )
         })
         .await?;
-        Ok(buf.to_vec())
+        Ok(bytes::Bytes::from(buf.to_vec()))
     }
 
     async fn exists(&self, blob_ref: &InnerBlobRef) -> std::result::Result<bool, InnerBlobError> {
@@ -977,7 +985,10 @@ impl BlobAdapter for NodeAsyncBlobAdapter {
         .await
     }
 
-    async fn fetch(&self, blob_ref: &InnerBlobRef) -> std::result::Result<Vec<u8>, InnerBlobError> {
+    async fn fetch(
+        &self,
+        blob_ref: &InnerBlobRef,
+    ) -> std::result::Result<bytes::Bytes, InnerBlobError> {
         let (uri, hash, size) = js_blob_ref_parts(blob_ref);
         let args = JsBlobFetchArgs { uri, hash, size };
         let buf = await_tsfn_promise::<Buffer, _>(self.timeout, "fetch", |cb| {
@@ -991,14 +1002,14 @@ impl BlobAdapter for NodeAsyncBlobAdapter {
             )
         })
         .await?;
-        Ok(buf.to_vec())
+        Ok(bytes::Bytes::from(buf.to_vec()))
     }
 
     async fn fetch_range(
         &self,
         blob_ref: &InnerBlobRef,
         range: Range<u64>,
-    ) -> std::result::Result<Vec<u8>, InnerBlobError> {
+    ) -> std::result::Result<bytes::Bytes, InnerBlobError> {
         let (uri, hash, size) = js_blob_ref_parts(blob_ref);
         let args = JsBlobFetchRangeArgs {
             uri,
@@ -1018,7 +1029,7 @@ impl BlobAdapter for NodeAsyncBlobAdapter {
             )
         })
         .await?;
-        Ok(buf.to_vec())
+        Ok(bytes::Bytes::from(buf.to_vec()))
     }
 
     async fn exists(&self, blob_ref: &InnerBlobRef) -> std::result::Result<bool, InnerBlobError> {
@@ -1310,7 +1321,7 @@ impl MeshBlobAdapter {
         let adapter = self.inner.clone();
         let blob = blob_ref.inner.clone();
         let bytes = adapter.fetch(&blob).await.map_err(map_blob_err)?;
-        Ok(Buffer::from(bytes))
+        Ok(Buffer::from(bytes.to_vec()))
     }
 
     /// Fetch a half-open `[start, end)` byte range. The
@@ -1331,7 +1342,7 @@ impl MeshBlobAdapter {
             .fetch_range(&blob, start_u..end_u)
             .await
             .map_err(map_blob_err)?;
-        Ok(Buffer::from(bytes))
+        Ok(Buffer::from(bytes.to_vec()))
     }
 
     /// Probe local presence. Returns `true` when every chunk of

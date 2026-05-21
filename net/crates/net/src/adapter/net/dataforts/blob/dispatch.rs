@@ -19,6 +19,8 @@
 //! [`resolve_payload`] takes the chosen adapter directly so callers
 //! can build their own routing on top.
 
+use bytes::Bytes;
+
 use super::adapter::BlobAdapter;
 use super::blob_ref::BlobRef;
 use super::error::BlobError;
@@ -67,9 +69,9 @@ pub fn classify_payload(bytes: &[u8]) -> Result<EventPayload<'_>, BlobError> {
 pub async fn resolve_payload<A: BlobAdapter + ?Sized>(
     bytes: &[u8],
     adapter: &A,
-) -> Result<Vec<u8>, BlobError> {
+) -> Result<Bytes, BlobError> {
     match classify_payload(bytes)? {
-        EventPayload::Inline(b) => Ok(b.to_vec()),
+        EventPayload::Inline(b) => Ok(Bytes::copy_from_slice(b)),
         EventPayload::Blob(blob) => {
             let accepted = adapter.accepted_schemes();
             if !accepted.is_empty() {
@@ -296,7 +298,7 @@ mod tests {
         let adapter = NoopAdapter::default();
         let bytes = b"inline goes straight through";
         let resolved = resolve_payload(bytes, &adapter).await.unwrap();
-        assert_eq!(resolved, bytes);
+        assert_eq!(resolved.as_ref(), bytes);
     }
 
     #[tokio::test]
@@ -316,7 +318,7 @@ mod tests {
 
         let encoded = blob.encode();
         let resolved = resolve_payload(&encoded, &adapter).await.unwrap();
-        assert_eq!(resolved, payload);
+        assert_eq!(resolved.as_ref(), payload);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -347,7 +349,7 @@ mod tests {
         // resolve_payload turns the encoded form back into the
         // original bytes via fetch + verify.
         let resolved = resolve_payload(&encoded, &adapter).await.unwrap();
-        assert_eq!(resolved, payload);
+        assert_eq!(resolved.as_ref(), payload);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -376,7 +378,7 @@ mod tests {
 
         // Stored content is fetchable + verifies.
         let fetched = adapter.fetch(&blob).await.unwrap();
-        assert_eq!(fetched, payload);
+        assert_eq!(fetched.as_ref(), payload);
         blob.verify(&fetched).unwrap();
 
         let _ = std::fs::remove_dir_all(&root);
@@ -406,15 +408,17 @@ mod tests {
             async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> {
                 Ok(())
             }
-            async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
-                Ok(self.0.clone())
+            async fn fetch(&self, _: &BlobRef) -> Result<Bytes, BlobError> {
+                Ok(Bytes::from(self.0.clone()))
             }
             async fn fetch_range(
                 &self,
                 _: &BlobRef,
                 range: std::ops::Range<u64>,
-            ) -> Result<Vec<u8>, BlobError> {
-                Ok(self.0[range.start as usize..range.end as usize].to_vec())
+            ) -> Result<Bytes, BlobError> {
+                Ok(Bytes::copy_from_slice(
+                    &self.0[range.start as usize..range.end as usize],
+                ))
             }
             async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> {
                 Ok(true)
@@ -441,7 +445,7 @@ mod tests {
         let resolved = resolve_payload(&encoded, &adapter)
             .await
             .expect("resolve must accept Manifest without top-level verify");
-        assert_eq!(resolved, payload);
+        assert_eq!(resolved.as_ref(), payload.as_slice());
     }
 
     /// Review P1 regression: a chunked Manifest fetched via
@@ -470,15 +474,17 @@ mod tests {
             async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> {
                 Ok(())
             }
-            async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
-                Ok(self.payload.clone())
+            async fn fetch(&self, _: &BlobRef) -> Result<Bytes, BlobError> {
+                Ok(Bytes::from(self.payload.clone()))
             }
             async fn fetch_range(
                 &self,
                 _: &BlobRef,
                 range: std::ops::Range<u64>,
-            ) -> Result<Vec<u8>, BlobError> {
-                Ok(self.payload[range.start as usize..range.end as usize].to_vec())
+            ) -> Result<Bytes, BlobError> {
+                Ok(Bytes::copy_from_slice(
+                    &self.payload[range.start as usize..range.end as usize],
+                ))
             }
             async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> {
                 Ok(true)
@@ -544,16 +550,18 @@ mod tests {
             async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> {
                 Ok(())
             }
-            async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
-                Ok(self.payload.clone())
+            async fn fetch(&self, _: &BlobRef) -> Result<Bytes, BlobError> {
+                Ok(Bytes::from(self.payload.clone()))
             }
             async fn fetch_range(
                 &self,
                 _: &BlobRef,
                 range: std::ops::Range<u64>,
-            ) -> Result<Vec<u8>, BlobError> {
+            ) -> Result<Bytes, BlobError> {
                 let end = (range.end as usize).min(self.payload.len());
-                Ok(self.payload[range.start as usize..end].to_vec())
+                Ok(Bytes::copy_from_slice(
+                    &self.payload[range.start as usize..end],
+                ))
             }
             async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> {
                 Ok(true)
@@ -613,15 +621,17 @@ mod tests {
             async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> {
                 Ok(())
             }
-            async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
-                Ok(self.0.clone())
+            async fn fetch(&self, _: &BlobRef) -> Result<Bytes, BlobError> {
+                Ok(Bytes::from(self.0.clone()))
             }
             async fn fetch_range(
                 &self,
                 _: &BlobRef,
                 range: std::ops::Range<u64>,
-            ) -> Result<Vec<u8>, BlobError> {
-                Ok(self.0[range.start as usize..range.end as usize].to_vec())
+            ) -> Result<Bytes, BlobError> {
+                Ok(Bytes::copy_from_slice(
+                    &self.0[range.start as usize..range.end as usize],
+                ))
             }
             async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> {
                 Ok(true)
@@ -649,7 +659,7 @@ mod tests {
         let resolved = resolve_payload(&encoded, &adapter)
             .await
             .expect("legitimate manifest must verify");
-        assert_eq!(resolved, full);
+        assert_eq!(resolved.as_ref(), full.as_slice());
     }
 
     #[tokio::test]
@@ -702,15 +712,15 @@ mod tests {
             async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> {
                 Ok(())
             }
-            async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
-                Ok(self.0.clone())
+            async fn fetch(&self, _: &BlobRef) -> Result<Bytes, BlobError> {
+                Ok(Bytes::from(self.0.clone()))
             }
             async fn fetch_range(
                 &self,
                 _: &BlobRef,
                 _range: Range<u64>,
-            ) -> Result<Vec<u8>, BlobError> {
-                Ok(self.0.clone())
+            ) -> Result<Bytes, BlobError> {
+                Ok(Bytes::from(self.0.clone()))
             }
             async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> {
                 Ok(true)
@@ -754,15 +764,15 @@ mod tests {
             async fn store(&self, _blob_ref: &BlobRef, _bytes: &[u8]) -> Result<(), BlobError> {
                 Ok(())
             }
-            async fn fetch(&self, _blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
-                Ok(self.bytes.clone())
+            async fn fetch(&self, _blob_ref: &BlobRef) -> Result<Bytes, BlobError> {
+                Ok(Bytes::from(self.bytes.clone()))
             }
             async fn fetch_range(
                 &self,
                 _blob_ref: &BlobRef,
                 _range: Range<u64>,
-            ) -> Result<Vec<u8>, BlobError> {
-                Ok(self.bytes.clone())
+            ) -> Result<Bytes, BlobError> {
+                Ok(Bytes::from(self.bytes.clone()))
             }
             async fn exists(&self, _blob_ref: &BlobRef) -> Result<bool, BlobError> {
                 Ok(true)

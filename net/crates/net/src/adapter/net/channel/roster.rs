@@ -163,7 +163,9 @@ impl ChannelSubscribers {
         // large enough that the linear scan would dominate.
         let mut seen: Option<std::collections::HashSet<u64>> = None;
         for grp in self.queue_groups.iter() {
-            let Some(picked) = grp.value().select() else { continue };
+            let Some(picked) = grp.value().select() else {
+                continue;
+            };
             let duplicate = match &seen {
                 Some(set) => set.contains(&picked),
                 None => out.contains(&picked),

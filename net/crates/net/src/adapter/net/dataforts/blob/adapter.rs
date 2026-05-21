@@ -99,18 +99,24 @@ pub trait BlobAdapter: Send + Sync + 'static {
     /// runs [`BlobRef::verify`] on the returned bytes; on a
     /// mismatch the call as a whole fails with
     /// [`BlobError::HashMismatch`].
-    async fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError>;
+    ///
+    /// Returns [`Bytes`] (not `Vec<u8>`) per dataforts perf #184
+    /// so adapters with a refcount-shareable backing buffer
+    /// (`Bytes::from(vec)`, mmap region) can hand it back without
+    /// a final copy, and downstream consumers that want sub-slices
+    /// can take cheap views into the same allocation. Callers
+    /// that genuinely need an owned `Vec<u8>` can call
+    /// `.to_vec()` — they pay the copy only when they need it.
+    async fn fetch(&self, blob_ref: &BlobRef) -> Result<Bytes, BlobError>;
 
     /// Fetch a byte range. `range.start <= range.end` and both
     /// bounded by `blob_ref.size`; out-of-range queries surface as
     /// [`BlobError::Backend`] from the adapter. The substrate does
     /// NOT verify partial fetches against the full-content hash;
     /// callers using range fetch are accepting that trade-off.
-    async fn fetch_range(
-        &self,
-        blob_ref: &BlobRef,
-        range: Range<u64>,
-    ) -> Result<Vec<u8>, BlobError>;
+    ///
+    /// Returns [`Bytes`] for the same reason as [`Self::fetch`].
+    async fn fetch_range(&self, blob_ref: &BlobRef, range: Range<u64>) -> Result<Bytes, BlobError>;
 
     /// Probe for existence without fetching. Adapters that cannot
     /// answer cheaply may emulate by `fetch` + drop; the trait
@@ -135,7 +141,7 @@ pub trait BlobAdapter: Send + Sync + 'static {
     /// preserved for short payloads and ergonomic callers.
     async fn fetch_stream(&self, blob_ref: &BlobRef) -> Result<BlobByteStream, BlobError> {
         let bytes = self.fetch(blob_ref).await?;
-        let stream = futures::stream::once(async move { Ok(Bytes::from(bytes)) });
+        let stream = futures::stream::once(async move { Ok(bytes) });
         Ok(Box::pin(stream))
     }
 

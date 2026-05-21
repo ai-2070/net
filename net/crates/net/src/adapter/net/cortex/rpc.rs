@@ -1550,7 +1550,9 @@ impl RedexFold<()> for RpcServerFold {
                         let resp = RpcResponsePayload {
                             status: RpcStatus::Internal,
                             headers: vec![],
-                            body: Bytes::from_static(b"duplicate REQUEST for already-in-flight call_id"),
+                            body: Bytes::from_static(
+                                b"duplicate REQUEST for already-in-flight call_id",
+                            ),
                         };
                         (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
                         return Ok(());
@@ -1636,7 +1638,9 @@ impl RedexFold<()> for RpcServerFold {
                         RpcResponsePayload {
                             status: RpcStatus::Cancelled,
                             headers: vec![],
-                            body: Bytes::from_static(b"server observed CANCEL during handler execution"),
+                            body: Bytes::from_static(
+                                b"server observed CANCEL during handler execution",
+                            ),
                         }
                     } else {
                         match outcome {
@@ -2145,7 +2149,9 @@ impl RedexFold<()> for RpcServerStreamingFold {
                                 HEADER_NRPC_STREAMING.to_string(),
                                 HEADER_NRPC_STREAMING_END.to_vec(),
                             )],
-                            body: Bytes::from_static(b"duplicate REQUEST for already-in-flight call_id"),
+                            body: Bytes::from_static(
+                                b"duplicate REQUEST for already-in-flight call_id",
+                            ),
                         };
                         let emit = self.emit.clone();
                         let caller_origin = meta.origin_hash;
@@ -2678,7 +2684,9 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                         let resp = RpcResponsePayload {
                             status: RpcStatus::Internal,
                             headers: vec![],
-                            body: Bytes::from_static(b"duplicate REQUEST for already-in-flight call_id"),
+                            body: Bytes::from_static(
+                                b"duplicate REQUEST for already-in-flight call_id",
+                            ),
                         };
                         (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
                         return Ok(());
@@ -3086,7 +3094,9 @@ impl RedexFold<()> for RpcDuplexFold {
                                 HEADER_NRPC_STREAMING.to_string(),
                                 HEADER_NRPC_STREAMING_END.to_vec(),
                             )],
-                            body: Bytes::from_static(b"duplicate REQUEST for already-in-flight call_id"),
+                            body: Bytes::from_static(
+                                b"duplicate REQUEST for already-in-flight call_id",
+                            ),
                         };
                         let emit = self.emit.clone();
                         let caller_origin = meta.origin_hash;
@@ -4200,8 +4210,8 @@ mod tests {
         buf.put_u32_le((MAX_RPC_BODY_LEN + 1) as u32);
         // (no body bytes follow — we want the decoder to reject at
         // the length check before it even tries to read body bytes)
-        let err =
-            RpcRequestChunkPayload::decode(Bytes::from(buf)).expect_err("oversized body length must reject");
+        let err = RpcRequestChunkPayload::decode(Bytes::from(buf))
+            .expect_err("oversized body length must reject");
         match err {
             RpcCodecError::TooLarge {
                 field,
@@ -4225,8 +4235,8 @@ mod tests {
         buf.put_u64_le(0x42); // call_id
         buf.put_u16_le(0); // flags
         buf.put_u8((MAX_RPC_HEADERS + 1) as u8); // over the cap
-        let err =
-            RpcRequestChunkPayload::decode(Bytes::from(buf)).expect_err("oversized header count must reject");
+        let err = RpcRequestChunkPayload::decode(Bytes::from(buf))
+            .expect_err("oversized header count must reject");
         match err {
             RpcCodecError::TooLarge {
                 field,
