@@ -152,17 +152,34 @@ fn verify_manifest_chunks(
             ));
         }
     };
-    let total: u64 = chunks.iter().map(|c| c.size as u64).sum();
-    if total != fetched.len() as u64 {
-        return Err(BlobError::Backend(format!(
-            "manifest reassembled length {} != sum of chunk sizes {}",
-            fetched.len(),
-            total
-        )));
-    }
+    // Single-pass walk per dataforts perf #177: validate the
+    // running offset stays in bounds (overrun → typed error) AND
+    // hash each chunk region in the same iteration. Pre-fix did
+    // a `chunks.iter().sum()` to validate the total first, then
+    // a second pass to hash — two passes over the same vec. The
+    // total-equality check survives as the final `offset !=
+    // fetched.len()` assertion: if every chunk fits without
+    // overrun and the running offset lands exactly at
+    // `fetched.len()`, the sums agree by construction. Same
+    // correctness on tampered inputs, one walk.
     let mut offset: usize = 0;
     for chunk in chunks.iter() {
-        let end = offset + chunk.size as usize;
+        // `checked_add` catches the wrap that `offset + chunk.size`
+        // would silently produce on a hostile manifest with
+        // `chunks` summing past `usize::MAX`; the bounds check
+        // catches the more common case where the fetched buffer
+        // is shorter than the declared chunk layout.
+        let end = match offset.checked_add(chunk.size as usize) {
+            Some(end) if end <= fetched.len() => end,
+            _ => {
+                return Err(BlobError::Backend(format!(
+                    "manifest chunk layout overruns fetched buffer: \
+                     offset {offset} + size {} > len {}",
+                    chunk.size,
+                    fetched.len()
+                )));
+            }
+        };
         let region = &fetched[offset..end];
         let computed: [u8; 32] = blake3::hash(region).into();
         if computed != chunk.hash {
@@ -172,6 +189,16 @@ fn verify_manifest_chunks(
             });
         }
         offset = end;
+    }
+    if offset != fetched.len() {
+        // All chunks consumed but bytes remain — declared layout
+        // is shorter than the fetched buffer. Surface the same
+        // error shape the legacy two-pass code used.
+        return Err(BlobError::Backend(format!(
+            "manifest reassembled length {} != sum of chunk sizes {}",
+            fetched.len(),
+            offset
+        )));
     }
     Ok(())
 }
@@ -489,6 +516,81 @@ mod tests {
             matches!(err, BlobError::HashMismatch { .. }),
             "expected HashMismatch on tampered chunk 2, got {:?}",
             err
+        );
+    }
+
+    /// Pin dataforts perf #177: the one-pass verifier rejects
+    /// a manifest whose declared chunk layout doesn't fit the
+    /// fetched buffer. Pre-fix this was caught by a separate
+    /// `chunks.iter().sum() != fetched.len()` pass; post-fix it
+    /// falls out of the per-chunk `checked_add` + bounds check.
+    /// A regression that drops the bounds check would let the
+    /// `&fetched[offset..end]` slice panic at runtime — this
+    /// test would surface as a panic instead of the typed error.
+    #[tokio::test]
+    async fn resolve_rejects_manifest_when_fetched_buffer_is_short() {
+        use super::super::adapter::BlobAdapter;
+        use super::super::blob_ref::{ChunkRef, Encoding, BLOB_CHUNK_SIZE_BYTES};
+
+        #[derive(Debug)]
+        struct ShortAdapter {
+            payload: Vec<u8>,
+        }
+        #[async_trait::async_trait]
+        impl BlobAdapter for ShortAdapter {
+            fn adapter_id(&self) -> &str {
+                "short"
+            }
+            async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> {
+                Ok(())
+            }
+            async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
+                Ok(self.payload.clone())
+            }
+            async fn fetch_range(
+                &self,
+                _: &BlobRef,
+                range: std::ops::Range<u64>,
+            ) -> Result<Vec<u8>, BlobError> {
+                let end = (range.end as usize).min(self.payload.len());
+                Ok(self.payload[range.start as usize..end].to_vec())
+            }
+            async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> {
+                Ok(true)
+            }
+        }
+
+        // Manifest declares two chunks totaling BLOB_CHUNK_SIZE_BYTES + 16 bytes.
+        let legit_chunk_1 = vec![0xAA; BLOB_CHUNK_SIZE_BYTES as usize];
+        let legit_chunk_2 = vec![0xBB; 16];
+        let chunks = vec![
+            ChunkRef {
+                hash: blake3::hash(&legit_chunk_1).into(),
+                size: BLOB_CHUNK_SIZE_BYTES as u32,
+            },
+            ChunkRef {
+                hash: blake3::hash(&legit_chunk_2).into(),
+                size: 16,
+            },
+        ];
+        let blob = BlobRef::manifest("mesh://short", Encoding::Replicated, chunks)
+            .expect("manifest construct");
+        let encoded = blob.encode();
+
+        // But the adapter returns only the first chunk's bytes
+        // (8 bytes short of the declared layout). The per-chunk
+        // bounds check must reject before any `&fetched[...]`
+        // index panic could fire.
+        let adapter = ShortAdapter {
+            payload: legit_chunk_1,
+        };
+        let err = resolve_payload(&encoded, &adapter)
+            .await
+            .expect_err("short buffer must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("overruns") || msg.contains("!="),
+            "expected layout-overrun / length-mismatch error; got: {msg}",
         );
     }
 
