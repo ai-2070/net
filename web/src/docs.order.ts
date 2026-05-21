@@ -57,6 +57,10 @@ export const DOCS_ORDER: DocsOrderConfig = {
     ],
     // Releases — newest first.
     releases: [
+      "release-v0.20.2",
+      "release-v0.20-smoke-on-the-water",
+      "release-v0.19-push-it-to-the-limit",
+      "release-v0.18-welcome-to-the-jungle",
       "release-v0.17-atomic-playboys",
       "release-v0.16-eye-of-the-tiger",
       "release-v0.15-rebel-yell",
@@ -119,6 +123,10 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "tutorials/event-sourced-service": "Event-Sourced Service",
 
     // Releases
+    "releases/release-v0.20.2": "v0.20.2",
+    "releases/release-v0.20-smoke-on-the-water": "v0.20 — Smoke on the Water",
+    "releases/release-v0.19-push-it-to-the-limit": "v0.19 — Push It to the Limit",
+    "releases/release-v0.18-welcome-to-the-jungle": "v0.18 — Welcome to the Jungle",
     "releases/release-v0.17-atomic-playboys": "v0.17 — Atomic Playboys",
     "releases/release-v0.16-eye-of-the-tiger": "v0.16 — Eye of the Tiger",
     "releases/release-v0.15-rebel-yell": "v0.15 — Rebel Yell",
