@@ -8875,8 +8875,42 @@ impl MeshNode {
 
     /// Rank peers for a scored requirement. Returns the best-
     /// scoring node's id, or `None` if no peer matches.
-    pub fn find_best_node(&self, req: &CapabilityRequirement) -> Option<u64> {
-        self.capability_index.find_best(req)
+    ///
+    /// Phase 3b note: scoring runs against a tag-only
+    /// [`CapabilitySet`](super::behavior::capability::CapabilitySet)
+    /// synthesized from the fold (the fold's
+    /// [`CapabilityMembership`](super::behavior::fold::CapabilityMembership)
+    /// doesn't carry the full legacy hardware/models projection).
+    /// Hardware- and model-based preference weights (memory,
+    /// vram, tokens/sec, loaded) read zero, so this method
+    /// degrades to "any matching candidate, lex-sorted by
+    /// node_id." That's the same shape as the cap-propagation-
+    /// race fallback; production has no rich-scoring caller per
+    /// the Phase 3b survey.
+    pub fn find_best_node(
+        &self,
+        req: &super::behavior::capability::CapabilityRequirement,
+    ) -> Option<u64> {
+        let mut candidates = super::behavior::fold::capability_bridge::find_nodes_matching(
+            &self.capability_fold,
+            &req.filter,
+        );
+        candidates.sort_unstable();
+        candidates.into_iter().max_by(|a, b| {
+            let caps_a =
+                super::behavior::fold::capability_bridge::synthesize_capability_set(
+                    &self.capability_fold,
+                    *a,
+                );
+            let caps_b =
+                super::behavior::fold::capability_bridge::synthesize_capability_set(
+                    &self.capability_fold,
+                    *b,
+                );
+            req.score(&caps_a)
+                .partial_cmp(&req.score(&caps_b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 
     /// Scoped variant of [`Self::find_best_node`]. See
