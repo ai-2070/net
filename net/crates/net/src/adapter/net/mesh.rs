@@ -49,8 +49,8 @@ use super::pool::PacketBuilder;
 
 use super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 use super::behavior::capability::{
-    CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilityRequirement,
-    CapabilitySet, ScopeFilter, MAX_CAPABILITY_HOPS,
+    CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilitySet, ScopeFilter,
+    MAX_CAPABILITY_HOPS,
 };
 use super::behavior::loadbalance::HealthStatus;
 use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
@@ -8917,27 +8917,35 @@ impl MeshNode {
     /// [`Self::find_nodes_by_filter_scoped`] for the scope
     /// resolution semantics; selection picks the highest-scoring
     /// candidate within the scoped set.
+    ///
+    /// Phase 3b note: same scoring caveat as
+    /// [`Self::find_best_node`] — the fold's
+    /// [`CapabilityMembership`](super::behavior::fold::CapabilityMembership)
+    /// doesn't carry the legacy hardware/models projection, so
+    /// scoring degrades to "any matching candidate, lex-sorted."
     pub fn find_best_node_scoped(
         &self,
-        req: &CapabilityRequirement,
+        req: &super::behavior::capability::CapabilityRequirement,
         scope: &ScopeFilter<'_>,
     ) -> Option<u64> {
-        let my_subnet = self.local_subnet;
-        let peer_subnets = self.peer_subnets.clone();
-        let local_node_id = self.node_id;
-        // Same warm-up rule as `find_nodes_by_filter_scoped` —
-        // see that doc-comment for the rationale.
-        let policy_installed = self.local_subnet_policy.is_some();
-        self.capability_index
-            .find_best_node_scoped(req, scope, |nid| {
-                if nid == local_node_id {
-                    return true;
-                }
-                match peer_subnets.get(&nid).map(|e| *e.value()) {
-                    Some(s) => s == my_subnet,
-                    None => policy_installed,
-                }
-            })
+        let candidates = self.find_nodes_by_filter_scoped(&req.filter, scope);
+        let mut sorted = candidates;
+        sorted.sort_unstable();
+        sorted.into_iter().max_by(|a, b| {
+            let caps_a =
+                super::behavior::fold::capability_bridge::synthesize_capability_set(
+                    &self.capability_fold,
+                    *a,
+                );
+            let caps_b =
+                super::behavior::fold::capability_bridge::synthesize_capability_set(
+                    &self.capability_fold,
+                    *b,
+                );
+            req.score(&caps_a)
+                .partial_cmp(&req.score(&caps_b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 
     /// Shared reference to the capability index. Use this for
