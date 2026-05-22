@@ -6969,6 +6969,80 @@ impl MeshNode {
         Ok(())
     }
 
+    /// Encode a [`SignedAnnouncement<P>`] and send it to one peer
+    /// as a [`super::behavior::fold::SUBPROTOCOL_FOLD`] frame.
+    ///
+    /// The publisher-side half of the multifold plan's Phase 2B
+    /// wire path: the receiver's mesh inbound arm (see
+    /// `dispatch_packet`'s `SUBPROTOCOL_FOLD` branch) decodes +
+    /// verifies + routes to the right typed
+    /// [`super::behavior::fold::Fold<K>`] via the installed
+    /// [`super::behavior::fold::FoldChannelRouter`]. Caller is
+    /// responsible for selecting `peer_addr` — `Fold` doesn't
+    /// own subscriber routing yet (deferred to Phase 3 where
+    /// concrete folds plug into the existing channel layer).
+    ///
+    /// Returns the encoded byte count for metrics / diagnostics.
+    pub async fn publish_fold_to_peer<P>(
+        &self,
+        peer_addr: SocketAddr,
+        ann: &super::behavior::fold::SignedAnnouncement<P>,
+    ) -> Result<usize, AdapterError>
+    where
+        P: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let bytes = ann.encode().map_err(|e| {
+            AdapterError::Connection(format!("fold: encode failed: {e}"))
+        })?;
+        let n = bytes.len();
+        self.send_subprotocol(peer_addr, super::behavior::fold::SUBPROTOCOL_FOLD, &bytes)
+            .await?;
+        Ok(n)
+    }
+
+    /// Best-effort fan-out of a fold announcement to every
+    /// currently-connected peer. Mirrors the
+    /// [`Self::announce_capabilities_with`] broadcast loop —
+    /// per-peer send failures are logged and skipped rather
+    /// than short-circuiting the rest of the fan-out.
+    ///
+    /// Phase 2C convenience: subscriber-aware publishing (using
+    /// the existing channel/roster layer with `SUBPROTOCOL_FOLD`
+    /// stamped on the outbound packet) is a Phase 3 follow-up
+    /// scoped with whichever concrete fold lights up first. For
+    /// now, broadcast-to-all is the right shape for the
+    /// CapabilityFold publish surface (every peer participates
+    /// in capability discovery).
+    ///
+    /// Returns the number of peers the announcement was
+    /// successfully shipped to.
+    pub async fn publish_fold_broadcast<P>(
+        &self,
+        ann: &super::behavior::fold::SignedAnnouncement<P>,
+    ) -> Result<usize, AdapterError>
+    where
+        P: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let bytes = ann.encode().map_err(|e| {
+            AdapterError::Connection(format!("fold: encode failed: {e}"))
+        })?;
+        let peer_addrs: Vec<SocketAddr> =
+            self.peers.iter().map(|e| e.value().addr).collect();
+        let mut sent = 0usize;
+        for addr in peer_addrs {
+            match self
+                .send_subprotocol(addr, super::behavior::fold::SUBPROTOCOL_FOLD, &bytes)
+                .await
+            {
+                Ok(()) => sent += 1,
+                Err(e) => {
+                    tracing::trace!(peer = %addr, error = %e, "fold: broadcast send failed");
+                }
+            }
+        }
+        Ok(sent)
+    }
+
     /// Send a raw subprotocol message to a peer.
     ///
     /// The payload is sent as a single event frame with the specified

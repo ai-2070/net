@@ -816,3 +816,105 @@ fn entity_id_is_what_the_router_trait_takes() {
     let registry = FoldRegistry::new();
     let _registered: Arc<dyn FoldChannelRouter> = Arc::new(registry);
 }
+
+// ---------------------------------------------------------------------
+// Phase 2C: publisher-side encode + simulated receive end-to-end.
+// We can't boot real mesh sockets here, but we CAN exercise the full
+// "publisher signs → encode → receive bytes → registry dispatch → fold
+// apply" pipeline in-process. The mesh-level
+// `publish_fold_to_peer` / `publish_fold_broadcast` helpers wrap
+// `ann.encode()` + `send_subprotocol(_, SUBPROTOCOL_FOLD, &bytes)` —
+// the encoding step is what this test pins, since the `send_subprotocol`
+// hop is already covered by the substrate's existing transport tests.
+// ---------------------------------------------------------------------
+
+#[test]
+fn publisher_to_receiver_full_pipeline_in_process() {
+    // 1. Publisher side: sign an announcement with the publisher's
+    //    keypair and produce the on-wire bytes.
+    let publisher_kp = EntityKeypair::generate();
+    let ann = sign_cap_ann(&publisher_kp, 0x42, 0x1000, 1, vec!["gpu", "h100"]);
+    let wire_bytes = ann.encode().expect("publisher: encode succeeds");
+
+    // 2. Receiver side: install a FoldRegistry as the channel
+    //    router. This is the same shape that
+    //    `mesh.set_fold_router(Some(Arc::new(registry)))` produces.
+    let registry = FoldRegistry::new();
+    let cap_fold: Arc<Fold<CapFold>> = Arc::new(Fold::new());
+    registry.register(cap_fold.clone());
+    let router: Arc<dyn FoldChannelRouter> = Arc::new(registry);
+
+    // 3. Receiver dispatch arm: hands the bytes + resolved
+    //    publisher EntityId to `router.try_route`. The mesh
+    //    `dispatch_packet` arm at `SUBPROTOCOL_FOLD` does
+    //    exactly this.
+    let outcome = router
+        .try_route(publisher_kp.entity_id(), &wire_bytes)
+        .expect("receiver: dispatch succeeds for valid envelope");
+    assert_eq!(outcome, ApplyOutcome::Inserted);
+
+    // 4. Query against the fold confirms the apply landed and
+    //    the secondary index was populated by the typed
+    //    `Fold<CapFold>::apply` path.
+    let hits = cap_fold.query(CapQuery {
+        class: 0x1000,
+        required_tag: Some("h100".into()),
+    });
+    assert_eq!(hits, vec![(0x1000, 0x42)]);
+    assert_eq!(cap_fold.metrics().applies_inserted(), 1);
+}
+
+#[test]
+fn publisher_encode_is_stable_across_calls() {
+    // The wire envelope is the load-bearing identity for
+    // signatures, replay-window bookkeeping, and operator
+    // diagnostics. A regression that introduces nondeterminism
+    // (e.g. a HashMap iterating in random order inside the
+    // payload encoder) would break every cross-node verify.
+    //
+    // We encode the same announcement twice and assert byte
+    // equality. `SignedAnnouncement::sign` is also deterministic
+    // for a given (keypair, payload) under Ed25519, so the
+    // wire bytes are deterministic end-to-end.
+    let kp = EntityKeypair::generate();
+    let ann1 = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu", "h100"]);
+    let ann2 = ann1.clone();
+    assert_eq!(
+        ann1.encode().expect("first encode"),
+        ann2.encode().expect("second encode"),
+        "wire encoding must be deterministic across repeated encode() calls"
+    );
+}
+
+#[test]
+fn receiver_rejects_envelope_signed_for_a_different_publisher() {
+    // The publisher → receiver pipeline must NOT credit an
+    // apply to fold state when the inbound `EntityId` (resolved
+    // by the mesh dispatch arm from `peer_entity_ids`) doesn't
+    // match the key that signed the envelope. Without this
+    // gate, a peer that hijacks a session_id could publish
+    // announcements claiming any other peer's identity.
+    let real_publisher = EntityKeypair::generate();
+    let session_owner = EntityKeypair::generate(); // resolved by mesh
+
+    let ann = sign_cap_ann(&real_publisher, 0x42, 0x1000, 1, vec!["gpu"]);
+    let wire_bytes = ann.encode().expect("encode");
+
+    let registry = FoldRegistry::new();
+    let cap_fold: Arc<Fold<CapFold>> = Arc::new(Fold::new());
+    registry.register(cap_fold.clone());
+    let router: Arc<dyn FoldChannelRouter> = Arc::new(registry);
+
+    // Receiver dispatches with the session owner's identity (the
+    // mesh arm resolves this from `peer_entity_ids`). The
+    // signature was made with a different key, so verify rejects.
+    match router.try_route(session_owner.entity_id(), &wire_bytes) {
+        Err(DispatchError::Wire(WireError::InvalidSignature)) => {}
+        other => panic!("expected InvalidSignature, got {other:?}"),
+    }
+    assert_eq!(
+        cap_fold.metrics().applies_inserted(),
+        0,
+        "no apply may be credited to the fold when verify fails"
+    );
+}
