@@ -51,11 +51,10 @@ pub use query::{
 pub use broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 
 pub use capability::{
-    AcceleratorInfo, AcceleratorType, CapabilityAnnouncement, CapabilityFilter, CapabilityIndex,
-    CapabilityIndexStats, CapabilityRequirement, CapabilitySet, CapabilitySetDiff, CapabilityViews,
-    CardinalityCache, CardinalityProvider, GpuInfo, GpuVendor, HardwareCapabilities, IndexedNode,
-    MetadataChange, Modality, ModelCapability, ResourceLimits, Signature64, SoftwareCapabilities,
-    ToolCapability,
+    AcceleratorInfo, AcceleratorType, CapabilityAnnouncement, CapabilityFilter,
+    CapabilityRequirement, CapabilitySet, CapabilitySetDiff, CapabilityViews, CardinalityProvider,
+    GpuInfo, GpuVendor, HardwareCapabilities, MetadataChange, Modality, ModelCapability,
+    ResourceLimits, Signature64, SoftwareCapabilities, ToolCapability,
 };
 
 pub use dataforts_capabilities::{

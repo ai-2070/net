@@ -1371,7 +1371,8 @@ impl Predicate {
     }
 
     /// Cardinality-aware cost estimate. Refines [`Self::static_cost`]
-    /// with per-key distinct-value counts from a `CapabilityIndex`.
+    /// with per-key distinct-value counts from a
+    /// [`CardinalityProvider`](crate::adapter::net::behavior::CardinalityProvider).
     ///
     /// Phase 4 follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`. A
     /// leaf clause keyed on a high-cardinality tag (many distinct
@@ -1390,8 +1391,8 @@ impl Predicate {
     ///   cardinality of zero (key not yet indexed) falls back to
     ///   raw `static_cost` — conservative.
     /// - Metadata leaves: `static_cost` unchanged. The
-    ///   `CapabilityIndex` doesn't track metadata cardinality
-    ///   (Phase D / E may add a metadata index; lands then).
+    ///   provider trait doesn't track metadata cardinality by
+    ///   default (Phase D / E may add a metadata index; lands then).
     /// - Composites: sum of child dynamic costs (saturating).
     /// - `Not`: passes through inner cost.
     fn dynamic_cost<P: crate::adapter::net::behavior::CardinalityProvider>(
@@ -2117,22 +2118,19 @@ pub fn __tag_key_from_str(s: &'static str) -> TagKey {
 mod tests {
     use super::*;
     use crate::adapter::net::behavior::tag::{Tag, TaxonomyAxis};
-
+    use crate::adapter::net::behavior::{CapabilitySet, GpuInfo, GpuVendor, HardwareCapabilities};
     fn ctx<'a>(tags: &'a [Tag], metadata: &'a BTreeMap<String, String>) -> EvalContext<'a> {
         EvalContext::new(tags, metadata)
     }
-
     fn empty_meta() -> BTreeMap<String, String> {
         BTreeMap::new()
     }
-
     fn axis_present(axis: TaxonomyAxis, key: &str) -> Tag {
         Tag::AxisPresent {
             axis,
             key: key.into(),
         }
     }
-
     fn axis_eq(axis: TaxonomyAxis, key: &str, value: &str) -> Tag {
         Tag::AxisValue {
             axis,
@@ -2141,7 +2139,6 @@ mod tests {
             separator: crate::adapter::net::behavior::tag::AxisSeparator::Eq,
         }
     }
-
     // ---- existence + equality ------------------------------------------
 
     #[test]
@@ -2151,7 +2148,6 @@ mod tests {
         let p = pred!(exists "hardware.gpu");
         assert!(p.evaluate(&ctx(&tags, &meta)));
     }
-
     #[test]
     fn exists_matches_axis_value_tag() {
         let tags = [axis_eq(TaxonomyAxis::Hardware, "gpu.vram_gb", "80")];
@@ -2159,7 +2155,6 @@ mod tests {
         let p = pred!(exists "hardware.gpu.vram_gb");
         assert!(p.evaluate(&ctx(&tags, &meta)));
     }
-
     #[test]
     fn exists_misses_when_axis_differs() {
         let tags = [axis_present(TaxonomyAxis::Software, "gpu")];
@@ -2167,7 +2162,6 @@ mod tests {
         let p = pred!(exists "hardware.gpu");
         assert!(!p.evaluate(&ctx(&tags, &meta)));
     }
-
     #[test]
     fn equals_matches_value_exactly() {
         let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "cuda-12.4")];
@@ -2175,7 +2169,6 @@ mod tests {
         assert!(pred!(equals "software.runtime", "cuda-12.4").evaluate(&ctx(&tags, &meta)));
         assert!(!pred!(equals "software.runtime", "cuda-11").evaluate(&ctx(&tags, &meta)));
     }
-
     // ---- numeric --------------------------------------------------------
 
     #[test]
@@ -2186,7 +2179,6 @@ mod tests {
         assert!(pred!(num_at_least "hardware.gpu.vram_gb", 80.0).evaluate(&ctx(&tags, &meta)));
         assert!(!pred!(num_at_least "hardware.gpu.vram_gb", 96.0).evaluate(&ctx(&tags, &meta)));
     }
-
     #[test]
     fn numeric_at_most_and_in_range() {
         let tags = [axis_eq(TaxonomyAxis::Hardware, "cpu_cores", "16")];
@@ -2196,7 +2188,6 @@ mod tests {
         assert!(pred!(num_in_range "hardware.cpu_cores", 8.0, 32.0).evaluate(&ctx(&tags, &meta)));
         assert!(!pred!(num_in_range "hardware.cpu_cores", 32.0, 64.0).evaluate(&ctx(&tags, &meta)));
     }
-
     #[test]
     fn numeric_unparseable_value_evaluates_to_false() {
         // Pinned: a tag whose value is not numeric must NOT panic
@@ -2207,7 +2198,6 @@ mod tests {
         let meta = empty_meta();
         assert!(!pred!(num_at_least "hardware.cpu_cores", 1.0).evaluate(&ctx(&tags, &meta)));
     }
-
     // ---- semver ---------------------------------------------------------
 
     #[test]
@@ -2218,7 +2208,6 @@ mod tests {
         assert!(pred!(semver_at_least "software.runtime", "12.4.0").evaluate(&ctx(&tags, &meta)));
         assert!(!pred!(semver_at_least "software.runtime", "13.0.0").evaluate(&ctx(&tags, &meta)));
     }
-
     #[test]
     fn semver_compatible_caret_rule() {
         // 1.x.y compatibility: same major.
@@ -2234,7 +2223,6 @@ mod tests {
         assert!(pred!(semver_compatible "software.runtime", "0.5.0").evaluate(&ctx(&tags, &meta)));
         assert!(!pred!(semver_compatible "software.runtime", "0.4.0").evaluate(&ctx(&tags, &meta)));
     }
-
     /// Regression: `0.0.x` is exact-only under cargo's caret rule.
     /// The pre-fix `rhs.0 == 0 → rhs.1 == lhs.1` branch ignored the
     /// patch component and admitted any `0.0.y >= 0.0.x` as
@@ -2260,7 +2248,6 @@ mod tests {
         let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "0.1.0")];
         assert!(!pred!(semver_compatible "software.runtime", "0.0.3").evaluate(&ctx(&tags, &meta)));
     }
-
     /// Q1: a non-zero major `lhs` is NOT compatible with a 0.x.y
     /// `rhs` — Cargo's caret rule treats 0.x.y as the band only
     /// when the major is also 0. Pre-fix, `rhs.1 == lhs.1` alone
@@ -2285,7 +2272,6 @@ mod tests {
         let tags = [axis_eq(TaxonomyAxis::Software, "runtime", "2.2.5")];
         assert!(!pred!(semver_compatible "software.runtime", "0.2.3").evaluate(&ctx(&tags, &meta)));
     }
-
     /// Regression: presence-only tags (`Tag::AxisPresent`) must not
     /// match value-bearing predicates. Pre-fix, `match_axis_tag` fed
     /// `""` through `value_pred`, which let `Equals(_, "")` /
@@ -2313,7 +2299,6 @@ mod tests {
         let tags = [axis_eq(TaxonomyAxis::Hardware, "gpu", "nvidia")];
         assert!(pred!(exists "hardware.gpu").evaluate(&ctx(&tags, &meta)));
     }
-
     #[test]
     fn semver_lenient_parser() {
         // Pinned: the inline parser accepts truncated versions
@@ -2329,7 +2314,6 @@ mod tests {
         assert_eq!(parse_semver("a.b.c"), None);
         assert_eq!(parse_semver(""), None);
     }
-
     // ---- string ---------------------------------------------------------
 
     #[test]
@@ -2341,7 +2325,6 @@ mod tests {
         assert!(pred!(matches "software.tool", "7.0").evaluate(&ctx(&tags, &meta)));
         assert!(!pred!(matches "software.tool", "8.0").evaluate(&ctx(&tags, &meta)));
     }
-
     // ---- metadata -------------------------------------------------------
 
     #[test]
@@ -2359,7 +2342,6 @@ mod tests {
         assert!(pred!(metadata_num_at_least "priority", 3.0).evaluate(&ctx(&tags, &meta)));
         assert!(!pred!(metadata_num_at_least "priority", 10.0).evaluate(&ctx(&tags, &meta)));
     }
-
     // ---- boolean composition --------------------------------------------
 
     #[test]
@@ -2397,7 +2379,6 @@ mod tests {
         let p = pred!(not pred!(exists "hardware.gpu"));
         assert!(!p.evaluate(&ctx(&tags, &meta)));
     }
-
     #[test]
     fn empty_and_is_vacuously_true() {
         // Standard math/logic convention: `forall` over empty set
@@ -2406,7 +2387,6 @@ mod tests {
         let meta = empty_meta();
         assert!(Predicate::and(vec![]).evaluate(&ctx(&tags, &meta)));
     }
-
     #[test]
     fn empty_or_is_vacuously_false() {
         // Dual convention: `exists` over empty set is `false`.
@@ -2414,7 +2394,6 @@ mod tests {
         let meta = empty_meta();
         assert!(!Predicate::or(vec![]).evaluate(&ctx(&tags, &meta)));
     }
-
     // ---- not predicate over unparseable value ---------------------------
 
     #[test]
@@ -2435,7 +2414,6 @@ mod tests {
         let p = pred!(not pred!(num_at_least "hardware.cpu_cores", 1.0));
         assert!(p.evaluate(&ctx(&tags, &meta)));
     }
-
     // ---- structural equality ------------------------------------------
     //
     // Serde wire format is deferred to Phase E (federated query
@@ -2457,7 +2435,6 @@ mod tests {
         let p2 = p.clone();
         assert_eq!(p, p2);
     }
-
     // ---- macro ----------------------------------------------------------
 
     #[test]
@@ -2465,13 +2442,11 @@ mod tests {
     fn pred_macro_panics_on_unknown_axis() {
         let _ = pred!(exists "bogus.foo");
     }
-
     #[test]
     #[should_panic(expected = "must be `<axis>.<key>`")]
     fn pred_macro_panics_on_missing_dot() {
         let _ = pred!(exists "hardware");
     }
-
     // ========================================================================
     // Query planner — Phase 4 of CAPABILITY_ENHANCEMENTS_PLAN.md.
     // ========================================================================
@@ -2482,7 +2457,6 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
     }
-
     /// Worst-case AST: high-selectivity metadata-equals clause buried
     /// LAST among 5 children. Unplanned eval pays for the four
     /// preceding clauses on every false case; planned eval runs the
@@ -2510,7 +2484,6 @@ mod tests {
             },
         ])
     }
-
     #[test]
     fn planner_reorders_and_children_cheap_first() {
         // Pin the planner's ordering on the worst-case AST.
@@ -2525,7 +2498,6 @@ mod tests {
             panic!("worst_case_and produced non-And");
         }
     }
-
     #[test]
     fn planner_preserves_semantics_on_short_circuit_false() {
         // Pin: planner-vs-unplanned equivalence on a clearly-false
@@ -2540,7 +2512,6 @@ mod tests {
         assert!(!ast.evaluate(&cx));
         assert!(!ast.evaluate_unplanned(&cx));
     }
-
     #[test]
     fn planner_preserves_semantics_on_full_match() {
         let tags: Vec<Tag> = vec![
@@ -2555,7 +2526,6 @@ mod tests {
         assert!(ast.evaluate(&cx));
         assert!(ast.evaluate_unplanned(&cx));
     }
-
     #[test]
     fn planner_preserves_or_short_circuit_semantics() {
         // Or with mixed costs: cheap clause that's true should win
@@ -2576,7 +2546,6 @@ mod tests {
         assert!(ast.evaluate(&cx));
         assert!(ast.evaluate_unplanned(&cx));
     }
-
     #[test]
     fn planner_static_cost_compositees_sum_children() {
         // And/Or cost = sum of children. Used to prefer shallow
@@ -2594,7 +2563,6 @@ mod tests {
         let negated = Predicate::Not(Box::new(expensive.clone()));
         assert_eq!(negated.static_cost(), expensive.static_cost());
     }
-
     #[test]
     fn planner_handles_empty_and_or_correctly() {
         // Empty And is vacuous true; empty Or is vacuous false.
@@ -2608,7 +2576,6 @@ mod tests {
         assert!(Predicate::And(vec![]).evaluate_unplanned(&cx));
         assert!(!Predicate::Or(vec![]).evaluate_unplanned(&cx));
     }
-
     /// Exhaustive small-input parity: enumerate a handful of small
     /// `(ast, ctx)` combinations and assert planned = unplanned.
     /// Phase 4 doesn't ship full property-based fuzzing
@@ -2711,7 +2678,6 @@ mod tests {
             }
         }
     }
-
     // ========================================================================
     // Predicate debug session — Phase 6 of CAPABILITY_ENHANCEMENTS_PLAN.md.
     // ========================================================================
@@ -2729,7 +2695,6 @@ mod tests {
         let (traced_result, _trace) = ast.evaluate_with_trace(&cx);
         assert_eq!(plain_result, traced_result);
     }
-
     #[test]
     fn evaluate_with_trace_short_circuits_drop_unevaluated_siblings() {
         // Pin: when an `And` short-circuits on a false child, the
@@ -2762,7 +2727,6 @@ mod tests {
         assert!(trace.children[0].label.starts_with("MetadataEquals"));
         assert!(!trace.children[0].result);
     }
-
     #[test]
     fn evaluate_with_trace_captures_full_evaluation_when_no_short_circuit() {
         // Pin: when no clause short-circuits (all true in an And,
@@ -2785,7 +2749,6 @@ mod tests {
             assert!(child.result, "all children must have matched: {child:?}");
         }
     }
-
     #[test]
     fn evaluate_with_trace_records_not_inversion() {
         // Pin: Not's trace child carries the inner result (pre-
@@ -2802,7 +2765,6 @@ mod tests {
         assert_eq!(trace.children.len(), 1);
         assert!(!trace.children[0].result, "inner Exists should be false");
     }
-
     #[test]
     fn debug_report_aggregates_match_counts() {
         // 3 candidates, 1 matches.
@@ -2827,7 +2789,6 @@ mod tests {
         assert_eq!(stats.evaluated, 3);
         assert_eq!(stats.matched, 1);
     }
-
     #[test]
     fn debug_report_separates_per_clause_stats_in_composite() {
         // For an And of two clauses, the report should carry stats
@@ -2887,7 +2848,6 @@ mod tests {
         );
         assert_eq!(exists_stats.matched, 1);
     }
-
     #[test]
     fn debug_report_render_includes_summary_and_clauses() {
         let pred = Predicate::Exists {
@@ -2903,7 +2863,6 @@ mod tests {
         assert!(rendered.contains("Per-clause stats"));
         assert!(rendered.contains("Exists(hardware.gpu)"));
     }
-
     #[test]
     fn debug_report_handles_empty_corpus() {
         let pred = Predicate::Exists {
@@ -2917,7 +2876,6 @@ mod tests {
         let rendered = report.render();
         assert!(rendered.contains("Total candidates: 0"));
     }
-
     // ========================================================================
     // PredicateWire (flat-tree IR) — Phase 5 of CAPABILITY_ENHANCEMENTS_PLAN.md.
     // ========================================================================
@@ -2950,7 +2908,6 @@ mod tests {
             },
         ])
     }
-
     #[test]
     fn wire_round_trip_preserves_complex_predicate() {
         // Pin: `Predicate → PredicateWire → Predicate` is identity.
@@ -2959,7 +2916,6 @@ mod tests {
         let rebuilt = wire.into_predicate().expect("rebuild");
         assert_eq!(original, rebuilt);
     }
-
     #[test]
     fn wire_round_trip_through_serde_json() {
         // Pin: the wire format serializes through serde_json
@@ -2971,7 +2927,6 @@ mod tests {
         let rebuilt = parsed.into_predicate().expect("rebuild");
         assert_eq!(original, rebuilt);
     }
-
     #[test]
     fn wire_root_is_at_highest_index_in_post_order_emission() {
         // Pin: `to_wire` emits children before parents, so the
@@ -2982,7 +2937,6 @@ mod tests {
         let wire = pred.to_wire();
         assert_eq!(wire.root_idx as usize, wire.nodes.len() - 1);
     }
-
     #[test]
     fn wire_round_trip_byte_stable_across_calls() {
         // Pin: two `to_wire()` calls on equal predicates produce
@@ -2996,7 +2950,6 @@ mod tests {
         let json_b = serde_json::to_string(&wire_b).unwrap();
         assert_eq!(json_a, json_b);
     }
-
     #[test]
     fn wire_round_trip_preserves_evaluation_semantics() {
         // Pin: a rebuilt predicate produces identical evaluation
@@ -3034,7 +2987,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn wire_from_empty_nodes_table_errors_gracefully() {
         let wire = PredicateWire {
@@ -3043,7 +2995,6 @@ mod tests {
         };
         assert_eq!(wire.into_predicate(), Err(PredicateWireError::Empty));
     }
-
     #[test]
     fn wire_from_out_of_bounds_root_errors_gracefully() {
         let wire = PredicateWire {
@@ -3060,7 +3011,6 @@ mod tests {
             }),
         );
     }
-
     #[test]
     fn wire_from_cycle_in_and_children_errors_gracefully() {
         // Malformed: the `And` at index 0 references child index
@@ -3082,7 +3032,6 @@ mod tests {
             "expected CycleDetected; got {err:?}",
         );
     }
-
     #[test]
     fn wire_from_self_referencing_not_errors_gracefully() {
         // `Not` referencing its own index is the simplest cycle.
@@ -3102,7 +3051,6 @@ mod tests {
             "expected CycleDetected; got {err:?}",
         );
     }
-
     #[test]
     fn wire_simple_leaf_round_trips() {
         // Smallest case: a single leaf predicate. nodes has one
@@ -3115,7 +3063,6 @@ mod tests {
         assert_eq!(wire.root_idx, 0);
         assert_eq!(wire.into_predicate().unwrap(), pred);
     }
-
     #[test]
     fn wire_rebuilt_predicate_matches_planner_evaluation() {
         // Pin: planner-aware evaluation continues to work after
@@ -3143,7 +3090,6 @@ mod tests {
         assert_eq!(rebuilt_planned, rebuilt_unplanned);
         assert_eq!(orig_planned, rebuilt_planned);
     }
-
     // ========================================================================
     // nRPC envelope helpers — Phase 5.B of CAPABILITY_ENHANCEMENTS_PLAN.md.
     // ========================================================================
@@ -3169,7 +3115,6 @@ mod tests {
             .expect("decode succeeds");
         assert_eq!(decoded, original);
     }
-
     #[test]
     fn rpc_header_missing_returns_none() {
         // Service that doesn't see a `net-where` header
@@ -3181,13 +3126,11 @@ mod tests {
         ];
         assert!(predicate_from_rpc_headers(&headers).is_none());
     }
-
     #[test]
     fn rpc_header_empty_returns_none() {
         let headers: Vec<(String, Vec<u8>)> = Vec::new();
         assert!(predicate_from_rpc_headers(&headers).is_none());
     }
-
     #[test]
     fn rpc_header_malformed_json_returns_decode_error() {
         // Service receiving a `net-where` header with garbage
@@ -3201,7 +3144,6 @@ mod tests {
             "expected JSON decode error; got {result:?}",
         );
     }
-
     #[test]
     fn rpc_header_oversize_payload_returns_decode_error() {
         // N-6 regression: decode path enforces the
@@ -3224,7 +3166,6 @@ mod tests {
             "expected Oversize decode error; got {result:?}",
         );
     }
-
     #[test]
     fn rpc_header_cycle_in_payload_returns_decode_error() {
         // Defensive: a wire payload with a child-index cycle
@@ -3246,7 +3187,6 @@ mod tests {
             "expected wire cycle error; got {result:?}",
         );
     }
-
     #[test]
     fn rpc_header_first_match_wins_on_duplicate_headers() {
         // Per the helper's documented contract: duplicate headers
@@ -3266,7 +3206,6 @@ mod tests {
         let decoded = predicate_from_rpc_headers(&headers).unwrap().unwrap();
         assert_eq!(decoded, pred_a);
     }
-
     #[test]
     fn rpc_header_oversize_predicate_rejected_at_encode() {
         // A predicate that would exceed the header-value cap is
@@ -3290,7 +3229,6 @@ mod tests {
             "expected TooLarge; got {result:?}",
         );
     }
-
     #[test]
     fn rpc_header_typical_predicate_fits_well_under_cap() {
         // Sanity bound: a representative predicate (5 leaves +
@@ -3306,7 +3244,6 @@ mod tests {
             header.1.len(),
         );
     }
-
     #[test]
     fn rpc_header_can_be_decoded_via_borrow_or_owned_tuple() {
         // Pin: the `AsRpcHeader` trait accepts both `&(String, Vec<u8>)`
@@ -3327,7 +3264,6 @@ mod tests {
         let decoded_borrow = predicate_from_rpc_headers(&by_ref).unwrap().unwrap();
         assert_eq!(decoded_borrow, pred);
     }
-
     #[test]
     fn rpc_header_json_format_is_human_readable() {
         // Pin the wire format as JSON (not postcard) so cross-
@@ -3350,105 +3286,6 @@ mod tests {
             "missing value: {json}",
         );
     }
-
-    // ========================================================================
-    // Cardinality-aware planner — Phase 4 follow-on of
-    // CAPABILITY_ENHANCEMENTS_PLAN.md.
-    // ========================================================================
-
-    use crate::adapter::net::behavior::{
-        CapabilityAnnouncement, CapabilityIndex, CapabilitySet, GpuInfo, GpuVendor,
-        HardwareCapabilities,
-    };
-    use crate::adapter::net::identity::EntityId;
-
-    fn entity() -> EntityId {
-        EntityId::from_bytes([0u8; 32])
-    }
-
-    /// Build a CapabilityIndex with `n` distinct memory_gb values.
-    /// Used to give `axis_cardinality(hardware.memory_gb)` a known
-    /// target value.
-    fn index_with_distinct_memory_values(n: u32) -> CapabilityIndex {
-        let index = CapabilityIndex::new();
-        for i in 0..n {
-            let caps =
-                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1 + i));
-            let ann = CapabilityAnnouncement::new(i as u64, entity(), 1, caps);
-            index.index(ann);
-        }
-        index
-    }
-
-    /// Build a CapabilityIndex with low-cardinality gpu.vendor
-    /// (only 2 distinct values across many nodes).
-    fn index_with_low_card_gpu_vendor() -> CapabilityIndex {
-        let index = CapabilityIndex::new();
-        let vendors = [GpuVendor::Nvidia, GpuVendor::Amd];
-        for i in 0..20u64 {
-            let caps = CapabilitySet::new().with_hardware(
-                HardwareCapabilities::new()
-                    .with_memory(1 + i as u32) // unique memory_gb
-                    .with_gpu(GpuInfo::new(vendors[i as usize % 2], "x", 1)),
-            );
-            let ann = CapabilityAnnouncement::new(i, entity(), 1, caps);
-            index.index(ann);
-        }
-        index
-    }
-
-    #[test]
-    fn dynamic_cost_lowers_for_high_cardinality_keys() {
-        // Pin the planner's intuition: a key with high cardinality
-        // (memory_gb across 100 distinct values) gets a much
-        // lower dynamic cost than a key with low cardinality
-        // (gpu.vendor with 2 values).
-        let index = index_with_low_card_gpu_vendor();
-
-        let high_card_clause = Predicate::Equals {
-            key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
-            value: "1".into(),
-        };
-        let low_card_clause = Predicate::Equals {
-            key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
-            value: "nvidia".into(),
-        };
-
-        let high_dynamic = high_card_clause.dynamic_cost(&index);
-        let low_dynamic = low_card_clause.dynamic_cost(&index);
-        // Both have the same static_cost (Equals → tier-2 cost),
-        // but high-cardinality divides by 20 while low-cardinality
-        // divides by 2 — high-cardinality clause should run first.
-        assert!(
-            high_dynamic < low_dynamic,
-            "expected high-card < low-card; got high={high_dynamic} low={low_dynamic}",
-        );
-    }
-
-    #[test]
-    fn dynamic_cost_falls_back_to_static_for_unknown_keys() {
-        let index = index_with_distinct_memory_values(10);
-        let unknown_clause = Predicate::Equals {
-            key: TagKey::new(TaxonomyAxis::Devices, "qpu"),
-            value: "rigetti-aspen".into(),
-        };
-        // Devices.qpu doesn't exist in the index → cardinality 0
-        // → fallback to static_cost. Equals is tier-2 cost = 21.
-        assert_eq!(
-            unknown_clause.dynamic_cost(&index),
-            unknown_clause.static_cost()
-        );
-    }
-
-    #[test]
-    fn dynamic_cost_falls_back_to_static_on_empty_index() {
-        let index = CapabilityIndex::new();
-        let pred = sample_complex_predicate();
-        // Every leaf hits cardinality=0 (empty index), so dynamic
-        // cost equals static cost recursively.
-        assert_eq!(pred.dynamic_cost(&index), pred.static_cost());
-    }
-
     /// N-9 regression: `dynamic_cost` and `dynamic_cost_or` must
     /// saturate `usize` cardinalities to `u32::MAX` rather than
     /// wrapping. Pre-fix the `(cardinality as u32)` cast wrapped
@@ -3498,395 +3335,6 @@ mod tests {
             "dynamic_cost_or must saturate to u32::MAX on huge cardinality",
         );
     }
-
-    #[test]
-    fn dynamic_cost_for_metadata_leaves_uses_static_cost_when_key_absent() {
-        // Metadata key not present in the index → planner falls
-        // back to static_cost. This is the path that fires when
-        // the index hasn't yet seen any node carrying that
-        // metadata key, e.g. on a fresh-spun mesh.
-        let index = index_with_distinct_memory_values(100);
-        let pred = Predicate::MetadataEquals {
-            key: "intent".into(),
-            value: "ml-training".into(),
-        };
-        assert_eq!(pred.dynamic_cost(&index), pred.static_cost());
-    }
-
-    /// Build an index with N distinct nodes carrying a metadata
-    /// key + 2 distinct metadata values for that key. Used to
-    /// pin metadata-cardinality-refined cost ordering.
-    fn index_with_metadata_intents() -> crate::adapter::net::behavior::CapabilityIndex {
-        let index = crate::adapter::net::behavior::CapabilityIndex::new();
-        let intents = ["ml-training", "embedding-cache"];
-        for i in 0..20u64 {
-            let caps = crate::adapter::net::behavior::CapabilitySet::new()
-                .with_metadata("intent", intents[i as usize % 2])
-                .with_metadata("owner", format!("alice-{}", i)); // 20 distinct owners
-            let ann =
-                crate::adapter::net::behavior::CapabilityAnnouncement::new(i, entity(), 1, caps);
-            index.index(ann);
-        }
-        index
-    }
-
-    #[test]
-    fn dynamic_cost_for_metadata_leaves_lowers_for_high_cardinality() {
-        // Index has 20 distinct `owner` values and 2 distinct
-        // `intent` values. A `MetadataEquals(owner, ...)` clause
-        // is more selective (rare-true) than `MetadataEquals(intent, ...)`,
-        // so its dynamic cost should be lower.
-        let index = index_with_metadata_intents();
-        assert_eq!(
-            index.metadata_value_cardinality("intent"),
-            2,
-            "fixture sanity"
-        );
-        assert_eq!(
-            index.metadata_value_cardinality("owner"),
-            20,
-            "fixture sanity"
-        );
-
-        let intent_clause = Predicate::MetadataEquals {
-            key: "intent".into(),
-            value: "ml-training".into(),
-        };
-        let owner_clause = Predicate::MetadataEquals {
-            key: "owner".into(),
-            value: "alice-5".into(),
-        };
-
-        let intent_cost = intent_clause.dynamic_cost(&index);
-        let owner_cost = owner_clause.dynamic_cost(&index);
-        assert!(
-            owner_cost < intent_cost,
-            "expected high-card owner < low-card intent; got owner={owner_cost}, intent={intent_cost}",
-        );
-    }
-
-    #[test]
-    fn dynamic_cost_metadata_exists_uses_cardinality_refinement() {
-        // `MetadataExists` also benefits from the metadata-cardinality
-        // refinement — same key, same cardinality, lower dynamic
-        // cost than static_cost when cardinality > 1.
-        let index = index_with_metadata_intents();
-        let pred = Predicate::MetadataExists {
-            key: "owner".into(),
-        };
-        let dynamic = pred.dynamic_cost(&index);
-        let static_c = pred.static_cost();
-        assert!(
-            dynamic < static_c,
-            "expected dynamic < static when cardinality > 1; got dynamic={dynamic}, static={static_c}",
-        );
-    }
-
-    // ========================================================================
-    // Or-vs-And ordering asymmetry — Phase 4 final close of
-    // CAPABILITY_ENHANCEMENTS_PLAN.md.
-    // ========================================================================
-
-    #[test]
-    fn dynamic_cost_or_inverts_cardinality_direction_for_axis_leaves() {
-        // Pin: a clause with low cardinality (often-true) gets a
-        // LOW Or-cost; high cardinality (rare-true) gets a HIGH
-        // Or-cost. Inverse of And-mode `dynamic_cost`.
-        let index = index_with_low_card_gpu_vendor();
-
-        // gpu.vendor has 2 distinct values, memory_gb has 20.
-        let high_card_clause = Predicate::Equals {
-            key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
-            value: "1".into(),
-        };
-        let low_card_clause = Predicate::Equals {
-            key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
-            value: "nvidia".into(),
-        };
-
-        // And-mode (existing): high-card runs first (rare-true).
-        assert!(high_card_clause.dynamic_cost(&index) < low_card_clause.dynamic_cost(&index));
-
-        // Or-mode (new): low-card runs first (often-true).
-        assert!(
-            low_card_clause.dynamic_cost_or(&index) < high_card_clause.dynamic_cost_or(&index),
-            "expected low-card < high-card in Or-mode; got low={}, high={}",
-            low_card_clause.dynamic_cost_or(&index),
-            high_card_clause.dynamic_cost_or(&index),
-        );
-    }
-
-    #[test]
-    fn dynamic_cost_or_inverts_cardinality_direction_for_metadata_leaves() {
-        // Same property, metadata side.
-        let index = index_with_metadata_intents();
-
-        let intent_clause = Predicate::MetadataEquals {
-            key: "intent".into(), // low-card (2 values)
-            value: "ml-training".into(),
-        };
-        let owner_clause = Predicate::MetadataEquals {
-            key: "owner".into(), // high-card (20 values)
-            value: "alice-5".into(),
-        };
-
-        // And-mode: high-card (owner) sorts first.
-        assert!(owner_clause.dynamic_cost(&index) < intent_clause.dynamic_cost(&index));
-
-        // Or-mode: low-card (intent) sorts first.
-        assert!(
-            intent_clause.dynamic_cost_or(&index) < owner_clause.dynamic_cost_or(&index),
-            "expected low-card < high-card in Or-mode; got intent={}, owner={}",
-            intent_clause.dynamic_cost_or(&index),
-            owner_clause.dynamic_cost_or(&index),
-        );
-    }
-
-    #[test]
-    fn dynamic_cost_or_falls_back_to_static_for_unknown_keys() {
-        let index = index_with_distinct_memory_values(10);
-        let unknown_clause = Predicate::Equals {
-            key: TagKey::new(TaxonomyAxis::Devices, "qpu"),
-            value: "rigetti-aspen".into(),
-        };
-        // Devices.qpu cardinality 0 → falls back to static_cost.
-        assert_eq!(
-            unknown_clause.dynamic_cost_or(&index),
-            unknown_clause.static_cost()
-        );
-    }
-
-    #[test]
-    fn dynamic_cost_or_falls_back_to_static_on_empty_index() {
-        let index = CapabilityIndex::new();
-        let pred = Predicate::Equals {
-            key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
-            value: "64".into(),
-        };
-        assert_eq!(pred.dynamic_cost_or(&index), pred.static_cost());
-    }
-
-    #[test]
-    fn evaluate_with_index_or_short_circuits_on_often_true_clause_first() {
-        // Build a context where one Or-child is true (the
-        // low-cardinality intent metadata clause) and the other
-        // would also be true on its own. The result is `true`
-        // either way. Pin: result is correct regardless of the
-        // Or planner's child order.
-        let index = index_with_metadata_intents();
-
-        let pred = Predicate::Or(vec![
-            // High-cost, high-cardinality clause; would normally
-            // sort first under And-mode planner.
-            Predicate::Equals {
-                key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
-                value: "999".into(), // doesn't match anything
-            },
-            // Low-cost, low-cardinality clause; should sort first
-            // under Or-mode planner.
-            Predicate::MetadataEquals {
-                key: "intent".into(),
-                value: "ml-training".into(),
-            },
-        ]);
-
-        let tags: Vec<Tag> = vec![]; // no memory_gb=999
-        let meta = meta_with(&[("intent", "ml-training")]);
-        let cx = ctx(&tags, &meta);
-
-        // Result should be true (intent matches).
-        assert!(pred.evaluate_with_index(&cx, &index));
-        // Equivalence vs unplanned holds.
-        assert_eq!(
-            pred.evaluate_with_index(&cx, &index),
-            pred.evaluate_unplanned(&cx),
-        );
-    }
-
-    #[test]
-    fn evaluate_with_index_or_planner_equivalence_on_canonical_inputs() {
-        // Pin: Or-mode planner produces the same result as
-        // unplanned eval for a corpus of (predicate, context)
-        // combinations. The reordering is a pure local
-        // optimization.
-        let index = index_with_low_card_gpu_vendor();
-
-        let predicates: Vec<Predicate> = vec![
-            // Pure Or with mixed cardinalities
-            Predicate::Or(vec![
-                Predicate::Equals {
-                    key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
-                    value: "nvidia".into(),
-                },
-                Predicate::Equals {
-                    key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
-                    value: "1".into(),
-                },
-            ]),
-            // Or wrapped in And (planner re-enters Or-mode at the
-            // inner Or)
-            Predicate::And(vec![
-                Predicate::Or(vec![
-                    Predicate::Exists {
-                        key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
-                    },
-                    Predicate::MetadataEquals {
-                        key: "intent".into(),
-                        value: "ml-training".into(),
-                    },
-                ]),
-                Predicate::Not(Box::new(Predicate::MetadataEquals {
-                    key: "decommissioning".into(),
-                    value: "true".into(),
-                })),
-            ]),
-        ];
-
-        let contexts: Vec<(Vec<Tag>, BTreeMap<String, String>)> = vec![
-            (vec![], BTreeMap::new()),
-            (
-                vec![axis_eq(TaxonomyAxis::Hardware, "gpu.vendor", "nvidia")],
-                BTreeMap::new(),
-            ),
-            (
-                vec![axis_present(TaxonomyAxis::Hardware, "gpu")],
-                meta_with(&[("intent", "ml-training")]),
-            ),
-            (
-                vec![axis_eq(TaxonomyAxis::Hardware, "memory_gb", "1")],
-                meta_with(&[("decommissioning", "true")]),
-            ),
-        ];
-
-        for (i, pred) in predicates.iter().enumerate() {
-            for (j, (tags, meta)) in contexts.iter().enumerate() {
-                let cx = ctx(tags, meta);
-                let with_index = pred.evaluate_with_index(&cx, &index);
-                let unplanned = pred.evaluate_unplanned(&cx);
-                assert_eq!(
-                    with_index, unplanned,
-                    "pred[{i}] ctx[{j}]: with_index={with_index} != unplanned={unplanned}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn metadata_cardinality_index_tracks_distinct_values() {
-        // Direct test of `CapabilityIndex::metadata_value_cardinality`.
-        let index = crate::adapter::net::behavior::CapabilityIndex::new();
-        // 5 nodes, 3 distinct intent values.
-        let intents = [
-            "ml-training",
-            "ml-training",
-            "embedding-cache",
-            "ml-training",
-            "scratchpad",
-        ];
-        for (i, intent) in intents.iter().enumerate() {
-            let caps = crate::adapter::net::behavior::CapabilitySet::new()
-                .with_metadata("intent", *intent);
-            let ann = crate::adapter::net::behavior::CapabilityAnnouncement::new(
-                i as u64,
-                entity(),
-                1,
-                caps,
-            );
-            index.index(ann);
-        }
-        assert_eq!(index.metadata_value_cardinality("intent"), 3);
-        // Unknown key → 0.
-        assert_eq!(index.metadata_value_cardinality("nonexistent"), 0);
-    }
-
-    #[test]
-    fn evaluate_with_index_matches_evaluate_unplanned_canonical_inputs() {
-        // Pin: cardinality-aware planner produces identical
-        // boolean results as unplanned eval. Reordering is a pure
-        // local optimization.
-        let index = index_with_low_card_gpu_vendor();
-
-        let predicates: Vec<Predicate> = vec![
-            // Single leaf
-            Predicate::Exists {
-                key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
-            },
-            // And of axis tag clauses with mixed cardinalities
-            Predicate::And(vec![
-                Predicate::Equals {
-                    key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
-                    value: "nvidia".into(),
-                },
-                Predicate::NumericAtLeast {
-                    key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
-                    threshold: 1024.0,
-                },
-            ]),
-            // Nested with Not
-            Predicate::And(vec![
-                Predicate::Or(vec![
-                    Predicate::Exists {
-                        key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
-                    },
-                    Predicate::MetadataEquals {
-                        key: "intent".into(),
-                        value: "ml-training".into(),
-                    },
-                ]),
-                Predicate::Not(Box::new(Predicate::Equals {
-                    key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
-                    value: "intel".into(),
-                })),
-            ]),
-        ];
-
-        let contexts: Vec<(Vec<Tag>, BTreeMap<String, String>)> = vec![
-            (vec![], BTreeMap::new()),
-            (
-                vec![
-                    axis_present(TaxonomyAxis::Hardware, "gpu"),
-                    axis_eq(TaxonomyAxis::Hardware, "gpu.vendor", "nvidia"),
-                    axis_eq(TaxonomyAxis::Hardware, "memory_gb", "64"),
-                ],
-                meta_with(&[("intent", "ml-training")]),
-            ),
-            (
-                vec![axis_eq(TaxonomyAxis::Hardware, "gpu.vendor", "amd")],
-                BTreeMap::new(),
-            ),
-        ];
-
-        for (i, pred) in predicates.iter().enumerate() {
-            for (j, (tags, meta)) in contexts.iter().enumerate() {
-                let cx = ctx(tags, meta);
-                let with_index = pred.evaluate_with_index(&cx, &index);
-                let unplanned = pred.evaluate_unplanned(&cx);
-                assert_eq!(
-                    with_index, unplanned,
-                    "pred[{i}] ctx[{j}]: with_index={with_index} != unplanned={unplanned}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn evaluate_with_index_empty_index_matches_static_planner() {
-        // Empty index → cardinality 0 for every key → fallback to
-        // static cost throughout. Result equals plain evaluate().
-        let index = CapabilityIndex::new();
-        let pred = sample_complex_predicate();
-
-        let tags: Vec<Tag> = vec![
-            axis_present(TaxonomyAxis::Hardware, "gpu"),
-            axis_eq(TaxonomyAxis::Hardware, "memory_gb", "128"),
-            axis_eq(TaxonomyAxis::Software, "runtime.python", "3.11.5"),
-        ];
-        let meta = meta_with(&[("intent", "ml-training")]);
-        let cx = ctx(&tags, &meta);
-
-        assert_eq!(pred.evaluate_with_index(&cx, &index), pred.evaluate(&cx));
-    }
-
     // ========================================================================
     // Service-side row filter ergonomics — Phase 5.B follow-on of
     // CAPABILITY_ENHANCEMENTS_PLAN.md.
@@ -3931,7 +3379,6 @@ mod tests {
         // Empty caps don't match.
         assert!(!pred.matches_capability_set(&CapabilitySet::default()));
     }
-
     /// Application row type used to exercise `RpcPredicateContext`
     /// and `filter_by_predicate`. Mirrors what a service
     /// handler's row would look like.
@@ -3940,7 +3387,6 @@ mod tests {
         tags: Vec<Tag>,
         metadata: BTreeMap<String, String>,
     }
-
     impl RpcPredicateContext for TestJob {
         fn rpc_predicate_tags(&self) -> &[Tag] {
             &self.tags
@@ -3949,7 +3395,6 @@ mod tests {
             &self.metadata
         }
     }
-
     #[test]
     fn filter_by_predicate_returns_all_rows_when_predicate_is_none() {
         // Pin: `pred = None` is the no-filter case (request didn't
@@ -3969,7 +3414,6 @@ mod tests {
         let filtered: Vec<u64> = filter_by_predicate(jobs, None).map(|j| j.id).collect();
         assert_eq!(filtered, vec![1, 2]);
     }
-
     #[test]
     fn filter_by_predicate_keeps_only_matching_rows() {
         // Pin: with a predicate set, only rows whose tags +
@@ -4008,7 +3452,6 @@ mod tests {
         // Only ids 2 and 4 have the gpu presence tag.
         assert_eq!(filtered, vec![2, 4]);
     }
-
     #[test]
     fn filter_by_predicate_combined_axis_and_metadata_clauses() {
         // Pin: predicates with both axis-tag AND metadata clauses
@@ -4046,7 +3489,6 @@ mod tests {
         // Only id 2 has both gpu AND intent=ml-training.
         assert_eq!(filtered, vec![2]);
     }
-
     #[test]
     fn filter_by_predicate_empty_input_yields_empty_iterator() {
         let pred = Predicate::Exists {
@@ -4058,7 +3500,6 @@ mod tests {
             .collect();
         assert!(filtered.is_empty());
     }
-
     #[test]
     fn end_to_end_predicate_pushdown_flow() {
         // Pin the canonical Phase 5.B usage: client builds a
@@ -4126,46 +3567,6 @@ mod tests {
             .collect();
         assert_eq!(matched, vec![2, 4]);
     }
-
-    #[test]
-    fn evaluate_with_index_handles_deeply_nested_correctly() {
-        // 3-level nest with cardinality data. Pin: result matches
-        // unplanned eval; the planner doesn't get confused by
-        // depth.
-        let index = index_with_low_card_gpu_vendor();
-        let pred = Predicate::And(vec![
-            Predicate::Or(vec![
-                Predicate::And(vec![
-                    Predicate::Equals {
-                        key: TagKey::new(TaxonomyAxis::Hardware, "gpu.vendor"),
-                        value: "nvidia".into(),
-                    },
-                    Predicate::NumericAtLeast {
-                        key: TagKey::new(TaxonomyAxis::Hardware, "memory_gb"),
-                        threshold: 1024.0,
-                    },
-                ]),
-                Predicate::Not(Box::new(Predicate::Exists {
-                    key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
-                })),
-            ]),
-            Predicate::MetadataExists {
-                key: "intent".into(),
-            },
-        ]);
-
-        let tags: Vec<Tag> = vec![
-            axis_eq(TaxonomyAxis::Hardware, "gpu.vendor", "nvidia"),
-            axis_eq(TaxonomyAxis::Hardware, "memory_gb", "2"),
-        ];
-        let meta = meta_with(&[("intent", "ml-training")]);
-        let cx = ctx(&tags, &meta);
-
-        let with_index = pred.evaluate_with_index(&cx, &index);
-        let unplanned = pred.evaluate_unplanned(&cx);
-        assert_eq!(with_index, unplanned);
-    }
-
     #[test]
     fn to_wire_handles_deep_nesting_without_stack_overflow() {
         // Regression: the prior recursive append_to_wire would
@@ -4193,7 +3594,6 @@ mod tests {
         let root = &wire.nodes[wire.root_idx as usize];
         assert!(matches!(root, PredicateNodeWire::Not { .. }));
     }
-
     #[test]
     fn to_wire_preserves_left_to_right_child_ordering() {
         // The iterative walk pushes children in reverse so the

@@ -43,7 +43,6 @@ use super::error::MeshError;
 use super::query::{AggregateFn, ChainRef, Expr, JoinKey, JoinKind, MeshQuery, QueryV1, SeqNum};
 use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use crate::adapter::net::behavior::predicate::PredicateWire;
-use crate::adapter::net::behavior::query::CapabilityQuery;
 use crate::adapter::net::behavior::tag::{Tag, TaxonomyAxis};
 
 /// A planned-but-not-yet-executed query tree. Each node is
@@ -1719,11 +1718,9 @@ fn group_by_mode(group_by: &[Expr]) -> Result<Option<JoinKeyMode>, MeshError> {
 // Silence unused-import warning under feature-conditional
 // configurations of the planner. `TaxonomyAxis` is held for
 // future reference by Phase B's discovery-time match_axis
-// path; `CapabilityQuery` is the trait the index implements.
+// path.
 #[allow(dead_code)]
 const _PLANNER_USES_TAXONOMY_AXIS: TaxonomyAxis = TaxonomyAxis::Dataforts;
-#[allow(dead_code)]
-fn _planner_uses_capability_query<Q: CapabilityQuery>(_q: &Q) {}
 
 #[cfg(test)]
 mod tests {
