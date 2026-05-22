@@ -217,14 +217,21 @@ impl FoldRegistry {
 
     /// Dispatch an inbound wire envelope to the right fold.
     ///
-    /// 1. Peek the leading two bytes (the wire `kind` field) to
-    ///    pick a fold. We use `peek_kind` rather than fully
-    ///    decoding here because postcard's wire-form-for-u16 is
-    ///    the first two little-endian bytes; we avoid running
-    ///    the full payload decoder twice (once to read `kind`,
-    ///    once inside the per-fold dispatch).
-    /// 2. Hand the bytes to the matched fold's adapter, which
-    ///    runs decode + verify + apply.
+    /// The dispatch is two-step:
+    /// 1. [`peek_kind`] reads the leading `kind: u16` varint to
+    ///    pick the right adapter. This is unavoidable: the per-
+    ///    fold adapter is typed on `K::Payload`, so we can't run
+    ///    the full envelope decode until we know `K`.
+    /// 2. The matched adapter runs the full
+    ///    [`SignedAnnouncement::decode_and_verify`] (which also
+    ///    re-reads the `kind` field as part of the struct
+    ///    decode) and then `Fold::apply`.
+    ///
+    /// The leading varint thus pays for itself twice — once for
+    /// routing, once during the typed decode — but the cost is
+    /// ~10 ns of postcard varint work next to a ~50 µs Ed25519
+    /// verify on the same envelope. Worth flagging here so
+    /// future readers don't chase it as a hot-path concern.
     pub fn dispatch(
         &self,
         bytes: &[u8],
@@ -323,21 +330,13 @@ pub enum DispatchError {
     Wire(#[from] WireError),
 }
 
-/// Read the wire `kind` field (a postcard varint-u16) from the
-/// head of an envelope buffer. Returns `None` for buffers
-/// that don't carry a complete varint at the head.
+/// Read the wire `kind: u16` varint from the head of an
+/// envelope buffer. Returns `None` for buffers that don't
+/// carry a complete varint at the head — the registry surfaces
+/// that as `DispatchError::Truncated`.
 ///
-/// Postcard's `SignedAnnouncement` serialization starts with
-/// `kind: u16`, which postcard encodes as a 1-3 byte varint —
-/// 7 bits of payload per byte, high bit signaling continuation
-/// (low-byte-first). For the reserved kind range
-/// (`0x0000..=0xFFFF`), worst-case the varint is 3 bytes; the
-/// dispatch path peeks ONLY the varint and rejects the buffer
-/// as `Truncated` if it can't read one.
-///
-/// We use `postcard::take_from_bytes` rather than rolling our
-/// own varint decoder so the format stays in lockstep with
-/// whatever postcard version the rest of the codec uses.
+/// Uses `postcard::take_from_bytes` so the varint shape stays in
+/// lockstep with whatever postcard version the codec uses.
 fn peek_kind(bytes: &[u8]) -> Option<u16> {
     let (kind, _rest) = postcard::take_from_bytes::<u16>(bytes).ok()?;
     Some(kind)
