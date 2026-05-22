@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/state/causal.rs
+  s_947eb728f006db::t_148abfae960289 588-590,592-594
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "7e58936da0885a06b6595c1e3f447b3a4a694b78",
+  "prompts": {},
+  "sessions": {
+    "s_947eb728f006db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fe2a7b6-f937-436c-8c36-6580a8be4344",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
