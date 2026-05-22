@@ -117,7 +117,7 @@ async fn setup_pair(a_caps: CapabilitySet, b_caps: CapabilitySet) -> (Node, Node
     // Wait until A sees B's entity via the capability index — same
     // dispatch populates peer_entity_ids.
     let b_id = b.mesh.node_id();
-    let learned = wait_until(|| a.mesh.capability_index().get(b_id).is_some()).await;
+    let learned = wait_until(|| a.mesh.test_capability_fold_has(b_id)).await;
     assert!(learned, "A never indexed B's capability announcement");
 
     (a, b)

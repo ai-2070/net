@@ -420,11 +420,7 @@ async fn gravity_migration_controller_fetches_hot_blob() {
     // announce that needs the prior version to have landed.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
-        let tags = node_b
-            .capability_index()
-            .get(a_id)
-            .map(|c| c.tags.len())
-            .unwrap_or(0);
+        let tags = node_b.test_capability_fold_get(a_id).tags.len();
         if tags >= 9 {
             // publisher_caps emits 9 dataforts.* tags (3 blob +
             // 3 greedy + 3 gravity).
@@ -459,14 +455,10 @@ async fn gravity_migration_controller_fetches_hot_blob() {
     // unauth-heat filter, so A's local view is the ground truth
     // for whether the tick wrote the tag at all.
     let a_has_blob_heat = node_a
-        .capability_index()
-        .get(a_id)
-        .map(|c| {
-            c.tags
-                .iter()
-                .any(|t| t.to_string().starts_with("heat:blob:"))
-        })
-        .unwrap_or(false);
+        .test_capability_fold_get(a_id)
+        .tags
+        .iter()
+        .any(|t| t.to_string().starts_with("heat:blob:"));
     assert!(
         a_has_blob_heat,
         "A's local capability_index must carry the heat:blob tag after tick"
@@ -479,7 +471,8 @@ async fn gravity_migration_controller_fetches_hot_blob() {
     let mut saw_blob_heat = false;
     let mut last_seen_tags: Vec<String> = Vec::new();
     while tokio::time::Instant::now() < deadline {
-        if let Some(caps) = node_b.capability_index().get(a_id) {
+        if node_b.test_capability_fold_has(a_id) {
+            let caps = node_b.test_capability_fold_get(a_id);
             last_seen_tags = caps.tags.iter().map(|t| t.to_string()).collect();
             saw_blob_heat = caps.tags.iter().any(|t| match t {
                 net::adapter::net::behavior::tag::Tag::Reserved { prefix, body } => {
@@ -628,16 +621,8 @@ async fn three_node_parallel_migration_lands_blob_on_two_peers() {
     // Wait for B AND C to learn A's caps before publishing.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
-        let b_tags = node_b
-            .capability_index()
-            .get(a_id)
-            .map(|c| c.tags.len())
-            .unwrap_or(0);
-        let c_tags = node_c
-            .capability_index()
-            .get(a_id)
-            .map(|c| c.tags.len())
-            .unwrap_or(0);
+        let b_tags = node_b.test_capability_fold_get(a_id).tags.len();
+        let c_tags = node_c.test_capability_fold_get(a_id).tags.len();
         if b_tags >= 9 && c_tags >= 9 {
             break;
         }
@@ -668,23 +653,22 @@ async fn three_node_parallel_migration_lands_blob_on_two_peers() {
     let mut b_saw = false;
     let mut c_saw = false;
     while tokio::time::Instant::now() < deadline {
-        let blob_heat_present = |idx: &net::adapter::net::behavior::capability::CapabilityIndex| {
-            idx.get(a_id)
-                .map(|c| {
-                    c.tags.iter().any(|t| match t {
-                        net::adapter::net::behavior::tag::Tag::Reserved { prefix, body } => {
-                            prefix == "heat:" && body.starts_with("blob:")
-                        }
-                        _ => false,
-                    })
+        let blob_heat_present = |node: &MeshNode| {
+            node.test_capability_fold_get(a_id)
+                .tags
+                .iter()
+                .any(|t| match t {
+                    net::adapter::net::behavior::tag::Tag::Reserved { prefix, body } => {
+                        prefix == "heat:" && body.starts_with("blob:")
+                    }
+                    _ => false,
                 })
-                .unwrap_or(false)
         };
         if !b_saw {
-            b_saw = blob_heat_present(node_b.capability_index().as_ref());
+            b_saw = blob_heat_present(node_b.as_ref());
         }
         if !c_saw {
-            c_saw = blob_heat_present(node_c.capability_index().as_ref());
+            c_saw = blob_heat_present(node_c.as_ref());
         }
         if b_saw && c_saw {
             break;
@@ -916,7 +900,7 @@ async fn overflow_push_nudge_round_trips_through_mesh_rpc() {
     // makes this fast; 500ms is generous.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     while tokio::time::Instant::now() < deadline {
-        let caps = node_b.capability_index_arc().get(a_id).unwrap_or_default();
+        let caps = node_b.test_capability_fold_get(a_id);
         let blob = BlobCapability::from_capability_set(&caps);
         if blob.overflow_enabled {
             break;
@@ -990,7 +974,7 @@ async fn overflow_push_rejected_when_receiver_not_participating() {
     let a_id = node_a.node_id();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     while tokio::time::Instant::now() < deadline {
-        let caps = node_b.capability_index_arc().get(a_id).unwrap_or_default();
+        let caps = node_b.test_capability_fold_get(a_id);
         let blob = BlobCapability::from_capability_set(&caps);
         if blob.overflow_enabled {
             break;
@@ -1049,7 +1033,7 @@ async fn announce_blob_overflow_state_syncs_local_caps_with_adapter_toggle() {
     node.announce_blob_overflow_state(&adapter)
         .await
         .expect("sync caps after on");
-    let live = node.capability_index_arc().get(node.node_id()).unwrap();
+    let live = node.test_capability_fold_get(node.node_id());
     assert!(
         BlobCapability::from_capability_set(&live).overflow_enabled,
         "after sync(on), local caps must carry the overflow tag"
@@ -1060,7 +1044,7 @@ async fn announce_blob_overflow_state_syncs_local_caps_with_adapter_toggle() {
     node.announce_blob_overflow_state(&adapter)
         .await
         .expect("sync caps after off");
-    let live = node.capability_index_arc().get(node.node_id()).unwrap();
+    let live = node.test_capability_fold_get(node.node_id());
     assert!(
         !BlobCapability::from_capability_set(&live).overflow_enabled,
         "after sync(off), local caps must NOT carry the overflow tag"

@@ -188,7 +188,7 @@ async fn peer_failure_clears_capability_index_via_harness() {
     await_condition(
         Duration::from_secs(2),
         "A indexes B's capability announcement",
-        || a.capability_index().get(b_id).is_some(),
+        || a.test_capability_fold_has(b_id),
     )
     .await;
 

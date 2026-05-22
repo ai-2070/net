@@ -8899,6 +8899,43 @@ impl MeshNode {
         &self.capability_fold
     }
 
+    /// Test-only helper — translate a legacy
+    /// [`CapabilityAnnouncement`] into the fold-shaped envelope
+    /// and apply it. Mirrors the inbound dispatch path's
+    /// behavior without going through the wire, so test fixtures
+    /// can prime a node's capability view in one line.
+    #[doc(hidden)]
+    pub fn test_inject_capability_announcement(
+        &self,
+        ann: super::behavior::capability::CapabilityAnnouncement,
+    ) {
+        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
+        let _ = self.capability_fold.apply(fold_ann);
+    }
+
+    /// Test-only helper — does the fold know about an entry
+    /// keyed on `node_id`? Mirrors the legacy
+    /// `CapabilityIndex::get(node_id).is_some()` check.
+    #[doc(hidden)]
+    pub fn test_capability_fold_has(&self, node_id: u64) -> bool {
+        self.capability_fold
+            .with_state(|state| state.by_node.contains_key(&node_id))
+    }
+
+    /// Test-only helper — synthesize a legacy `CapabilitySet`
+    /// for `node_id` from the fold's tag state. Mirrors the
+    /// legacy `CapabilityIndex::get(node_id).unwrap_or_default()`.
+    #[doc(hidden)]
+    pub fn test_capability_fold_get(
+        &self,
+        node_id: u64,
+    ) -> super::behavior::capability::CapabilitySet {
+        super::behavior::fold::capability_bridge::synthesize_capability_set(
+            &self.capability_fold,
+            node_id,
+        )
+    }
+
     /// Resolve a wire `origin_hash` to its publisher's `node_id`,
     /// or `None` when the slot is empty or claimed by multiple
     /// distinct nodes (truncation collision). Callers treat

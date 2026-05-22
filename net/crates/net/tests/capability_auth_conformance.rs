@@ -115,7 +115,7 @@ impl RpcHandler for EchoHandler {
 /// directly.
 fn fold_announcement_everywhere(nodes: &[&Arc<MeshNode>], ann: &CapabilityAnnouncement) {
     for n in nodes {
-        n.capability_index_arc().index(ann.clone());
+        n.test_inject_capability_announcement(ann.clone());
     }
 }
 
@@ -195,15 +195,12 @@ async fn scenario_1_permissive_baseline_admits_any_caller() {
         .expect("target announce");
 
     // Wait for the caller's index to fold the target's nrpc tag.
+    use net::adapter::net::behavior::fold::capability_bridge::find_nodes_matching;
     use net::adapter::net::behavior::CapabilityFilter;
     let filter = CapabilityFilter::default().require_tag("nrpc:echo".to_string());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
-        if caller
-            .capability_index_arc()
-            .query(&filter)
-            .contains(&target.node_id())
-        {
+        if find_nodes_matching(caller.capability_fold(), &filter).contains(&target.node_id()) {
             break;
         }
         if tokio::time::Instant::now() > deadline {
@@ -471,7 +468,7 @@ async fn scenario_6_callee_side_defense_in_depth_rejects() {
     // caller that skipped or never received the restrictive
     // version).
     let permissive = target_announcement(&target, 1, "nrpc:echo", vec![], vec![], vec![]);
-    caller.capability_index_arc().index(permissive);
+    caller.test_inject_capability_announcement(permissive);
 
     // Target's own index: restrictive — only a synthetic node id
     // distinct from the caller is admitted.
@@ -483,7 +480,7 @@ async fn scenario_6_callee_side_defense_in_depth_rejects() {
         vec![],
         vec![],
     );
-    target.capability_index_arc().index(restrictive);
+    target.test_inject_capability_announcement(restrictive);
 
     // Use direct `call` so the caller-side `call_service` gate
     // does not fire. The callee-side bridge gate must catch the
@@ -522,8 +519,8 @@ async fn helper_fold_announcement_lands_in_every_index() {
     let b = build_node().await;
     let ann = target_announcement(&a, 1, "nrpc:probe", vec![], vec![], vec![]);
     fold_announcement_everywhere(&[&a, &b], &ann);
-    assert!(a.capability_index_arc().get(a.node_id()).is_some());
-    assert!(b.capability_index_arc().get(a.node_id()).is_some());
+    assert!(a.test_capability_fold_has(a.node_id()));
+    assert!(b.test_capability_fold_has(a.node_id()));
 }
 
 /// M1 regression — `CapabilityAnnouncement::from_bytes` must
@@ -568,10 +565,30 @@ async fn membership_parse_returns_no_subnet_when_announcement_has_multiple_subne
         .add_tag(s2.to_tag())
         .add_tag("nrpc:probe");
     let ann = CapabilityAnnouncement::new(node.node_id(), node.entity_id().clone(), 1, caps);
-    node.capability_index_arc().index(ann);
+    node.test_inject_capability_announcement(ann);
+
+    // Derive a SubnetId from the node's own tag set the same way
+    // the legacy `subnet_of` did: collect distinct `subnet:<hex>`
+    // values from the synthesized `CapabilitySet`; exactly one
+    // distinct value → `Some(_)`, zero or multiple → `None`
+    // (multiple distinct subnet tags are out-of-model and the
+    // gate must produce a deterministic verdict across receivers).
+    let caps = node.test_capability_fold_get(node.node_id());
+    let mut distinct: Vec<SubnetId> = Vec::new();
+    for tag in &caps.tags {
+        if let Some(s) = SubnetId::from_tag(&tag.to_string()) {
+            if !distinct.contains(&s) {
+                distinct.push(s);
+            }
+        }
+    }
+    let subnet_of = if distinct.len() == 1 {
+        Some(distinct[0])
+    } else {
+        None
+    };
     assert_eq!(
-        node.capability_index_arc().subnet_of(node.node_id()),
-        None,
+        subnet_of, None,
         "two distinct subnet tags must collapse to no membership for deterministic gate verdicts",
     );
 }

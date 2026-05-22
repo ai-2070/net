@@ -85,12 +85,13 @@ impl RpcHandler for EchoHandler {
 /// the test surfaces the propagation failure rather than racing into
 /// a misleading deny.
 async fn wait_for_service_visibility(node: &Arc<MeshNode>, target: u64, service: &str) {
+    use net::adapter::net::behavior::fold::capability_bridge::find_nodes_matching;
     use net::adapter::net::behavior::CapabilityFilter;
     let tag = format!("nrpc:{service}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let filter = CapabilityFilter::default().require_tag(tag.clone());
     while tokio::time::Instant::now() < deadline {
-        let nodes = node.capability_index_arc().query(&filter);
+        let nodes = find_nodes_matching(node.capability_fold(), &filter);
         if nodes.contains(&target) {
             return;
         }
@@ -165,7 +166,7 @@ async fn call_service_filters_unauthorized_candidates_before_target_selection() 
         let mut ann =
             CapabilityAnnouncement::new(server.node_id(), server.entity_id().clone(), 100, caps);
         ann.allowed_nodes = allow;
-        caller.capability_index_arc().index(ann);
+        caller.test_inject_capability_announcement(ann);
     }
 
     // No RPC handlers are registered on either server; the gate
@@ -212,7 +213,7 @@ async fn call_service_denies_when_every_candidate_rejects_caller() {
         let mut ann =
             CapabilityAnnouncement::new(server.node_id(), server.entity_id().clone(), 100, caps);
         ann.allowed_nodes = vec![0xDEAD_BEEF_BAAD_F00D];
-        caller.capability_index_arc().index(ann);
+        caller.test_inject_capability_announcement(ann);
     }
 
     let err = caller
@@ -238,16 +239,17 @@ async fn call_service_denies_when_every_candidate_rejects_caller() {
 async fn serve_rpc_self_indexes_announcement_with_nrpc_tag() {
     let node = build_node().await;
     assert!(
-        node.capability_index_arc().get(node.node_id()).is_none(),
+        !node.test_capability_fold_has(node.node_id()),
         "no self-announcement before serve_rpc",
     );
     let _serve = node
         .serve_rpc("echo", Arc::new(EchoHandler))
         .expect("serve_rpc");
-    let self_caps = node
-        .capability_index_arc()
-        .get(node.node_id())
-        .expect("serve_rpc must auto-self-index");
+    assert!(
+        node.test_capability_fold_has(node.node_id()),
+        "serve_rpc must auto-self-index",
+    );
+    let self_caps = node.test_capability_fold_get(node.node_id());
     assert!(
         self_caps.has_tag("nrpc:echo"),
         "auto-self-indexed announcement must carry nrpc:<service>",
@@ -266,10 +268,11 @@ async fn serve_rpc_self_index_works_regardless_of_announce_order() {
     node.announce_capabilities(CapabilitySet::new())
         .await
         .expect("pre-announce");
-    let pre = node
-        .capability_index_arc()
-        .get(node.node_id())
-        .expect("pre-serve_rpc self-ann present");
+    assert!(
+        node.test_capability_fold_has(node.node_id()),
+        "pre-serve_rpc self-ann present",
+    );
+    let pre = node.test_capability_fold_get(node.node_id());
     assert!(
         !pre.has_tag("nrpc:echo"),
         "pre-serve_rpc self-ann must not carry nrpc:echo",
@@ -278,10 +281,11 @@ async fn serve_rpc_self_index_works_regardless_of_announce_order() {
     let _serve = node
         .serve_rpc("echo", Arc::new(EchoHandler))
         .expect("serve_rpc");
-    let post = node
-        .capability_index_arc()
-        .get(node.node_id())
-        .expect("post-serve_rpc self-ann present");
+    assert!(
+        node.test_capability_fold_has(node.node_id()),
+        "post-serve_rpc self-ann present",
+    );
+    let post = node.test_capability_fold_get(node.node_id());
     assert!(
         post.has_tag("nrpc:echo"),
         "post-serve_rpc self-ann must carry the merged tag regardless of order",
@@ -321,8 +325,8 @@ async fn call_service_caller_side_gate_denies_when_not_in_allow_list() {
     // `handle_capability_announcement` receiver-side gate, which
     // this test bypasses by folding directly into the local
     // capability index. Caller's index drives the gate decision.
-    caller.capability_index_arc().index(ann.clone());
-    server.capability_index_arc().index(ann);
+    caller.test_inject_capability_announcement(ann.clone());
+    server.test_inject_capability_announcement(ann);
 
     let err = caller
         .call_service(
@@ -350,6 +354,7 @@ async fn call_service_caller_side_gate_denies_when_not_in_allow_list() {
 /// passing (that one only checks the local index) but break this.
 #[tokio::test]
 async fn serve_rpc_spawned_reannounce_propagates_nrpc_tag_to_peers() {
+    use net::adapter::net::behavior::fold::capability_bridge::find_nodes_matching;
     use net::adapter::net::behavior::CapabilityFilter;
 
     let server = build_node().await;
@@ -367,11 +372,7 @@ async fn serve_rpc_spawned_reannounce_propagates_nrpc_tag_to_peers() {
     let server_id = server.node_id();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
-        if peer
-            .capability_index_arc()
-            .query(&filter)
-            .contains(&server_id)
-        {
+        if find_nodes_matching(peer.capability_fold(), &filter).contains(&server_id) {
             return;
         }
         if tokio::time::Instant::now() > deadline {
@@ -414,7 +415,7 @@ async fn callee_bridge_denial_bumps_capability_denied_metric() {
         50,
         caps_permissive,
     );
-    caller.capability_index_arc().index(permissive);
+    caller.test_inject_capability_announcement(permissive);
 
     let caps_restrictive = CapabilitySet::new().add_tag("nrpc:echo");
     let mut restrictive = CapabilityAnnouncement::new(
@@ -424,7 +425,7 @@ async fn callee_bridge_denial_bumps_capability_denied_metric() {
         caps_restrictive,
     );
     restrictive.allowed_nodes = vec![0xDEAD_BEEF_BAAD_F00D];
-    server.capability_index_arc().index(restrictive);
+    server.test_inject_capability_announcement(restrictive);
 
     // Use `call` (not `call_service`) so the caller-side gate
     // doesn't fire — the rejection must come from the callee's

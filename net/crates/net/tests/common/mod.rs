@@ -197,7 +197,7 @@ pub async fn await_capability_index_evicts(
     await_condition(
         limit,
         &format!("capability_index evicts {target_id:#x}"),
-        || observer.capability_index().get(target_id).is_none(),
+        || !observer.test_capability_fold_has(target_id),
     )
     .await;
 }

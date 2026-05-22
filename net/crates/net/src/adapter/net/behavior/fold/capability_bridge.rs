@@ -286,7 +286,7 @@ pub fn may_execute(
 /// Queries that don't constrain on class — which is every
 /// caller in this codebase per the prior survey — work
 /// transparently against this layout.
-pub(crate) fn translate_announcement(
+pub fn translate_announcement(
     ann: &CapabilityAnnouncement,
 ) -> SignedAnnouncement<CapabilityMembership> {
     let views = ann.capabilities.views();

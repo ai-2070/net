@@ -452,7 +452,7 @@ async fn set_reflex_override_resets_rate_limit_for_next_announce() {
     // Wait for B to index it.
     let a_id = a.node_id();
     for _ in 0..20 {
-        if b.capability_index().get(a_id).is_some() {
+        if b.test_capability_fold_has(a_id) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -475,12 +475,13 @@ async fn set_reflex_override_resets_rate_limit_for_next_announce() {
     // overridden reflex).
     let mut propagated = false;
     for _ in 0..40 {
-        if let Some(caps) = b.capability_index().get(a_id) {
+        if b.test_capability_fold_has(a_id) {
+            let caps = b.test_capability_fold_get(a_id);
             // Post-Phase-A.5.N.3: tags are typed; compare via
             // wire-string form. The synthetic announcement
             // injects "post" as a legacy tag.
             let has_post = caps.tags.iter().any(|t| t.to_string() == "post");
-            let reflex = b.capability_index().reflex_addr(a_id);
+            let reflex = b.peer_reflex_addr(a_id);
             if has_post && reflex == Some(external) {
                 propagated = true;
                 break;
