@@ -42,7 +42,9 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 pub mod announcement;
+pub mod audit;
 pub mod dispatch;
+pub mod expiry;
 pub mod metrics;
 pub mod snapshot;
 pub mod state;
@@ -52,10 +54,12 @@ pub mod wire;
 mod tests;
 
 pub use announcement::SignedAnnouncement;
+pub use audit::{AuditSink, NoopSink, VecAuditSink};
 pub use dispatch::{
     DispatchError, FoldChannelRouter, FoldDispatch, FoldDispatchAdapter, FoldRegistry,
     SUBPROTOCOL_FOLD,
 };
+pub use expiry::DEFAULT_SWEEP_INTERVAL;
 pub use metrics::FoldMetrics;
 pub use snapshot::{FoldSnapshot, FoldSnapshotEntry};
 pub use state::{
@@ -192,22 +196,87 @@ pub struct AuditEvent {
 /// path takes both write locks in the fixed order `state →
 /// index`; query takes both read locks in the same order.
 /// Mixing those orders would deadlock; the runtime never does.
+///
+/// Phase 1B additions: an optional [`AuditSink`] receives
+/// transition events emitted by [`FoldKind::audit_event`], and a
+/// background tokio task wakes every
+/// [`DEFAULT_SWEEP_INTERVAL`] (or the per-fold override) to
+/// evict entries past their TTL. The task holds `Weak`
+/// references to the shared state, so dropping the fold ends
+/// the task naturally — no explicit shutdown signal needed.
 pub struct Fold<K: FoldKind> {
     state: Arc<RwLock<FoldState<K>>>,
     index: Arc<RwLock<K::Index>>,
     metrics: Arc<FoldMetrics>,
+    /// Optional audit-event destination. Default install is
+    /// `None`; `K::audit_event` invocations whose returned
+    /// [`AuditEvent`] would have been recorded are then a no-op
+    /// at the call site. Installed via
+    /// [`Self::set_audit_sink`]; the `RwLock<Option<...>>`
+    /// shape mirrors the meshdb / replication router slots so
+    /// install / uninstall is hot-swappable without
+    /// reconstructing the fold.
+    audit_sink: Arc<RwLock<Option<Arc<dyn AuditSink>>>>,
+    /// Background-sweeper join handle. Aborted in
+    /// [`Self::drop`]; the weakly-referenced state inside the
+    /// task also lets the task exit on its own when the last
+    /// `Fold<K>` is dropped, but `JoinHandle::abort` shortens
+    /// the tail latency from "one sweep interval" to "next
+    /// `tick`-yield" so tests that construct + drop many folds
+    /// rapidly don't accumulate stale tasks.
+    sweep_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl<K: FoldKind> Fold<K> {
     /// Build a new fold instance with empty state and a fresh
-    /// index. Phase 2 will plumb channel subscriptions and the
-    /// audit sink into this constructor; Phase 1 keeps the
-    /// shape minimal.
+    /// index, spawning the background expiry sweeper at the
+    /// [`DEFAULT_SWEEP_INTERVAL`] cadence. For tighter cadences
+    /// (tests, latency-sensitive folds) use
+    /// [`Self::with_sweep_interval`].
     pub fn new() -> Self {
+        Self::with_sweep_interval(DEFAULT_SWEEP_INTERVAL)
+    }
+
+    /// Build a new fold instance with a custom sweep cadence.
+    /// `interval = Duration::ZERO` disables the background
+    /// sweeper entirely — callers that want explicit control
+    /// (e.g. tests that drive expiry via
+    /// [`Self::sweep_expired_now`]) opt out this way.
+    pub fn with_sweep_interval(interval: Duration) -> Self {
+        let state = Arc::new(RwLock::new(FoldState::new()));
+        let index = Arc::new(RwLock::new(K::build_index()));
+        let metrics = Arc::new(FoldMetrics::new());
+        let audit_sink: Arc<RwLock<Option<Arc<dyn AuditSink>>>> = Arc::new(RwLock::new(None));
+
+        // Spawn the background sweeper only if (a) the interval
+        // is non-zero AND (b) we're running on a tokio runtime.
+        // `Handle::try_current` returns `Err` outside a runtime
+        // — synchronous test paths construct folds without a
+        // runtime and drive expiry via `sweep_expired_now`. The
+        // Phase 2B receiver path always has a runtime because
+        // `dispatch_packet` is reached from a tokio-spawned
+        // task; the test-only no-runtime path is the only
+        // place this branch hits `None`.
+        let sweep_handle = if interval.is_zero()
+            || tokio::runtime::Handle::try_current().is_err()
+        {
+            None
+        } else {
+            Some(expiry::spawn_expiry_task::<K>(
+                Arc::downgrade(&state),
+                Arc::downgrade(&index),
+                Arc::downgrade(&metrics),
+                Arc::downgrade(&audit_sink),
+                interval,
+            ))
+        };
+
         Self {
-            state: Arc::new(RwLock::new(FoldState::new())),
-            index: Arc::new(RwLock::new(K::build_index())),
-            metrics: Arc::new(FoldMetrics::new()),
+            state,
+            index,
+            metrics,
+            audit_sink,
+            sweep_handle,
         }
     }
 
@@ -264,9 +333,9 @@ impl<K: FoldKind> Fold<K> {
                     key: &key,
                     new: &entry,
                 });
+                self.emit_audit(audit);
                 state.entries.insert(key, entry);
                 self.metrics.on_insert();
-                drop(audit); // Phase 1B routes this into the audit chain.
                 Ok(ApplyOutcome::Inserted)
             }
             MergeAction::Replace => {
@@ -308,9 +377,9 @@ impl<K: FoldKind> Fold<K> {
                     old: &old_entry,
                     new: &new_entry,
                 });
+                self.emit_audit(audit);
                 state.entries.insert(key, new_entry);
                 self.metrics.on_replace();
-                drop(audit);
                 Ok(ApplyOutcome::Replaced)
             }
             MergeAction::Reject => {
@@ -319,8 +388,8 @@ impl<K: FoldKind> Fold<K> {
                     existing,
                     incoming: &ann,
                 });
+                self.emit_audit(audit);
                 self.metrics.on_reject();
-                drop(audit);
                 Ok(ApplyOutcome::Rejected)
             }
         }
@@ -359,7 +428,7 @@ impl<K: FoldKind> Fold<K> {
                     old: &old_entry,
                     reason,
                 });
-                drop(audit);
+                self.emit_audit(audit);
                 self.metrics.on_evict();
             }
         }
@@ -449,11 +518,72 @@ impl<K: FoldKind> Fold<K> {
         let state = self.state.read();
         f(&state)
     }
+
+    /// Install (or uninstall) the audit sink. Idempotent;
+    /// re-installing replaces the prior sink. After
+    /// `set_audit_sink(Some(...))`, every
+    /// [`FoldKind::audit_event`] that returns `Some` is
+    /// forwarded to the sink's `record` method synchronously
+    /// from the path that emitted the transition (apply,
+    /// evict_node, sweep_expired). Phase 1B; see
+    /// [`AuditSink`] for the contract.
+    pub fn set_audit_sink(&self, sink: Option<Arc<dyn AuditSink>>) {
+        *self.audit_sink.write() = sink;
+    }
+
+    /// True iff an audit sink is currently installed.
+    pub fn has_audit_sink(&self) -> bool {
+        self.audit_sink.read().is_some()
+    }
+
+    /// Synchronous sweep: walk the primary store, evict entries
+    /// past their `expires_at`, return the count removed.
+    ///
+    /// Drives the background sweeper too — the spawned tokio
+    /// task calls into this primitive on every tick. Tests can
+    /// invoke it directly to make expiry deterministic without
+    /// relying on the runtime's scheduler.
+    pub fn sweep_expired_now(&self) -> usize {
+        let sink_holder = self.audit_sink.clone();
+        let sink_guard = sink_holder.read();
+        let sink_ref = sink_guard.as_ref();
+        expiry::sweep_expired::<K>(&self.state, &self.index, &self.metrics, sink_ref)
+    }
+
+    /// Internal: forward an [`AuditEvent`] returned by
+    /// [`FoldKind::audit_event`] to the installed sink (if any).
+    /// `event = None` means the impl chose not to emit; in
+    /// either case this is a single short read-lock acquisition
+    /// on the sink slot.
+    #[inline]
+    fn emit_audit(&self, event: Option<AuditEvent>) {
+        let Some(event) = event else {
+            return;
+        };
+        if let Some(sink) = self.audit_sink.read().as_ref() {
+            sink.record(event);
+        }
+    }
 }
 
 impl<K: FoldKind> Default for Fold<K> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<K: FoldKind> Drop for Fold<K> {
+    fn drop(&mut self) {
+        // Abort the background sweeper so dropped folds don't
+        // keep tasks alive on the runtime — the task's `Weak`
+        // upgrades would start failing on the next tick anyway,
+        // but `abort` shortens the tail latency to "next
+        // yield point" so test suites that churn through many
+        // folds don't accumulate stale tasks waiting on
+        // `tokio::time::interval::tick`.
+        if let Some(handle) = self.sweep_handle.take() {
+            handle.abort();
+        }
     }
 }
 

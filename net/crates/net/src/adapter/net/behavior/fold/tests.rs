@@ -918,3 +918,314 @@ fn receiver_rejects_envelope_signed_for_a_different_publisher() {
         "no apply may be credited to the fold when verify fails"
     );
 }
+
+// ---------------------------------------------------------------------
+// Phase 1B: TTL expiry sweep + audit sink routing
+// ---------------------------------------------------------------------
+
+use super::audit::{NoopSink, VecAuditSink};
+
+/// Build a cap-fold announcement with `ttl_secs = 0` so the
+/// computed `expires_at` is `now + 0s == now` — the next
+/// `sweep_expired_now` call evicts it. Phase 1B's TTL is at
+/// 1-second resolution on the wire envelope; tests that need
+/// finer control either drive `sweep_expired_now` synchronously
+/// or wait a beat under the background sweeper.
+fn sign_cap_ann_with_ttl(
+    keypair: &EntityKeypair,
+    node_id: NodeId,
+    class: u64,
+    generation: u64,
+    ttl_secs: u32,
+    tags: Vec<&str>,
+) -> SignedAnnouncement<CapPayload> {
+    SignedAnnouncement::sign(
+        keypair,
+        CapFold::KIND_ID,
+        class,
+        node_id,
+        generation,
+        0,
+        Some(ttl_secs),
+        0,
+        CapPayload {
+            class_hash: class,
+            tags: tags.into_iter().map(String::from).collect(),
+        },
+    )
+    .expect("sign succeeds")
+}
+
+#[test]
+fn sweep_expired_removes_entries_past_ttl() {
+    // Disable the background task so we drive expiry
+    // deterministically via `sweep_expired_now`.
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+
+    // Insert three entries: two with ttl=0 (already expired by
+    // the time `sweep_expired_now` runs) and one with ttl=300s
+    // (still valid). The cap-fold default ttl is 60s, which the
+    // ttl=0 override beats.
+    fold.apply(sign_cap_ann_with_ttl(&kp, 0xA, 0x100, 1, 0, vec!["a"]))
+        .expect("a accepted");
+    fold.apply(sign_cap_ann_with_ttl(&kp, 0xB, 0x100, 1, 0, vec!["b"]))
+        .expect("b accepted");
+    fold.apply(sign_cap_ann_with_ttl(&kp, 0xC, 0x100, 1, 300, vec!["c"]))
+        .expect("c accepted");
+    assert_eq!(fold.metrics().entries(), 3);
+    assert_eq!(fold.metrics().expiries(), 0);
+
+    // Allow a beat so `Instant::now()` advances past the
+    // `expires_at` stamped on the ttl=0 entries; the cmp inside
+    // sweep is `<=`, so even on identical Instant the sweep
+    // would catch them, but the explicit sleep makes the test
+    // robust against monotonic clock quirks.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    let evicted = fold.sweep_expired_now();
+    assert_eq!(evicted, 2, "two expired entries evicted, one remains");
+    assert_eq!(fold.metrics().entries(), 1);
+    assert_eq!(fold.metrics().expiries(), 2);
+
+    // Surviving entry is `0xC` (ttl=300s).
+    fold.with_state(|state| {
+        assert!(state.entries.contains_key(&(0x100, 0xC)));
+        assert!(!state.entries.contains_key(&(0x100, 0xA)));
+        assert!(!state.entries.contains_key(&(0x100, 0xB)));
+        // by_node reverse index cleaned up for the evicted nodes.
+        assert!(!state.by_node.contains_key(&0xA));
+        assert!(!state.by_node.contains_key(&0xB));
+        assert!(state.by_node.contains_key(&0xC));
+    });
+
+    // Index hooks ran — querying for evicted entries' tags
+    // returns nothing.
+    assert!(fold
+        .query(CapQuery {
+            class: 0x100,
+            required_tag: Some("a".into()),
+        })
+        .is_empty());
+    assert!(fold
+        .query(CapQuery {
+            class: 0x100,
+            required_tag: Some("b".into()),
+        })
+        .is_empty());
+    // Surviving tag still resolves.
+    assert_eq!(
+        fold.query(CapQuery {
+            class: 0x100,
+            required_tag: Some("c".into()),
+        }),
+        vec![(0x100, 0xC)]
+    );
+}
+
+#[test]
+fn sweep_with_no_expired_entries_is_a_no_op() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    fold.apply(sign_cap_ann_with_ttl(&kp, 0xA, 0x100, 1, 300, vec!["a"]))
+        .expect("a accepted");
+
+    let evicted = fold.sweep_expired_now();
+    assert_eq!(evicted, 0);
+    assert_eq!(fold.metrics().expiries(), 0);
+    assert_eq!(fold.metrics().entries(), 1);
+}
+
+/// Audit-emitting `FoldKind` shim: identical to `CapFold` but
+/// `audit_event` returns `Some(AuditEvent)` for every transition.
+/// Phase 1 + 1B keep audit emission opt-in via the trait so the
+/// hot path on folds that don't audit pays nothing.
+struct AuditingCapFold;
+
+impl FoldKind for AuditingCapFold {
+    const KIND_ID: u16 = 0x0F02;
+    const CHANNEL_PREFIX: &'static str = "test:audit-cap:";
+    const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    type Key = (u64, NodeId);
+    type Payload = CapPayload;
+    type Query = CapQuery;
+    type Result = Vec<(u64, NodeId)>;
+    type Index = NoIndex;
+
+    fn key_for(node_id: NodeId, payload: &CapPayload) -> Self::Key {
+        (payload.class_hash, node_id)
+    }
+
+    fn build_index() -> NoIndex {
+        NoIndex
+    }
+
+    fn query(state: &FoldState<Self>, _index: &NoIndex, q: CapQuery) -> Vec<(u64, NodeId)> {
+        state
+            .entries
+            .iter()
+            .filter(|((class, _), _)| *class == q.class)
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    fn audit_event(transition: super::EntryTransition<'_, Self>) -> Option<super::AuditEvent> {
+        let (kind, key_repr, detail) = match transition {
+            super::EntryTransition::Created { key, .. } => {
+                ("created", format!("{key:?}"), None)
+            }
+            super::EntryTransition::Replaced { key, old, new } => (
+                "replaced",
+                format!("{key:?}"),
+                Some(format!("gen {} → {}", old.generation, new.generation)),
+            ),
+            super::EntryTransition::Rejected { key, .. } => {
+                ("rejected", format!("{key:?}"), None)
+            }
+            super::EntryTransition::Evicted { key, reason, .. } => {
+                ("evicted", format!("{key:?}"), Some(reason.to_string()))
+            }
+            super::EntryTransition::Expired { key, .. } => {
+                ("expired", format!("{key:?}"), None)
+            }
+        };
+        Some(super::AuditEvent {
+            kind,
+            key_repr,
+            detail,
+        })
+    }
+}
+
+fn sign_audit_ann(
+    kp: &EntityKeypair,
+    node_id: NodeId,
+    class: u64,
+    generation: u64,
+    ttl_secs: u32,
+    tags: Vec<&str>,
+) -> SignedAnnouncement<CapPayload> {
+    SignedAnnouncement::sign(
+        kp,
+        AuditingCapFold::KIND_ID,
+        class,
+        node_id,
+        generation,
+        0,
+        Some(ttl_secs),
+        0,
+        CapPayload {
+            class_hash: class,
+            tags: tags.into_iter().map(String::from).collect(),
+        },
+    )
+    .expect("sign")
+}
+
+#[test]
+fn audit_sink_receives_create_replace_evict_and_expire_transitions() {
+    let fold: Fold<AuditingCapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let sink: Arc<VecAuditSink> = Arc::new(VecAuditSink::new());
+    fold.set_audit_sink(Some(sink.clone() as Arc<dyn super::AuditSink>));
+    assert!(fold.has_audit_sink());
+
+    let kp = EntityKeypair::generate();
+
+    // Create
+    fold.apply(sign_audit_ann(&kp, 0xA, 0x100, 1, 300, vec!["a"]))
+        .expect("create");
+    assert_eq!(sink.snapshot().len(), 1);
+    assert_eq!(sink.snapshot()[0].kind, "created");
+
+    // Replace
+    fold.apply(sign_audit_ann(&kp, 0xA, 0x100, 2, 300, vec!["a2"]))
+        .expect("replace");
+    assert_eq!(sink.snapshot().len(), 2);
+    assert_eq!(sink.snapshot()[1].kind, "replaced");
+    assert_eq!(
+        sink.snapshot()[1].detail.as_deref(),
+        Some("gen 1 → 2")
+    );
+
+    // Reject (stale generation)
+    fold.apply(sign_audit_ann(&kp, 0xA, 0x100, 2, 300, vec!["bogus"]))
+        .expect("reject");
+    assert_eq!(sink.snapshot().len(), 3);
+    assert_eq!(sink.snapshot()[2].kind, "rejected");
+
+    // Evict
+    fold.evict_node(0xA, "SWIM declared dead");
+    assert_eq!(sink.snapshot().len(), 4);
+    assert_eq!(sink.snapshot()[3].kind, "evicted");
+    assert_eq!(sink.snapshot()[3].detail.as_deref(), Some("SWIM declared dead"));
+
+    // Expire — insert a fresh entry with ttl=0 then sweep.
+    fold.apply(sign_audit_ann(&kp, 0xB, 0x100, 1, 0, vec!["b"]))
+        .expect("create-for-expire");
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let n = fold.sweep_expired_now();
+    assert_eq!(n, 1);
+    let trail = sink.snapshot();
+    assert_eq!(trail.last().expect("trail non-empty").kind, "expired");
+}
+
+#[test]
+fn audit_sink_can_be_uninstalled() {
+    let fold: Fold<AuditingCapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let sink: Arc<VecAuditSink> = Arc::new(VecAuditSink::new());
+    fold.set_audit_sink(Some(sink.clone() as Arc<dyn super::AuditSink>));
+
+    let kp = EntityKeypair::generate();
+    fold.apply(sign_audit_ann(&kp, 0xA, 0x100, 1, 300, vec!["a"]))
+        .expect("create");
+    assert_eq!(sink.len(), 1);
+
+    // Uninstall — subsequent events shouldn't reach the sink.
+    fold.set_audit_sink(None);
+    assert!(!fold.has_audit_sink());
+    fold.apply(sign_audit_ann(&kp, 0xB, 0x100, 1, 300, vec!["b"]))
+        .expect("create-2");
+    assert_eq!(sink.len(), 1, "post-uninstall events must not reach the sink");
+}
+
+#[test]
+fn noop_sink_swallows_events_without_storing() {
+    let fold: Fold<AuditingCapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    fold.set_audit_sink(Some(Arc::new(NoopSink) as Arc<dyn super::AuditSink>));
+    let kp = EntityKeypair::generate();
+    // Many applies, no panic, no allocation observed by the
+    // (non-instrumented) sink. Effectively a smoke test that
+    // NoopSink composes through the trait.
+    for i in 0..16 {
+        fold.apply(sign_audit_ann(&kp, i as u64, 0x100, 1, 300, vec!["t"]))
+            .expect("apply");
+    }
+    assert_eq!(fold.metrics().applies_inserted(), 16);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn background_sweeper_evicts_expired_entries_on_tick() {
+    // Construct a fold with a tight sweep interval. `start_paused`
+    // + `tokio::time::advance` lets us cross the tick boundary
+    // without actually sleeping — the sweeper task wakes when
+    // we advance time past its `tokio::time::interval::tick`.
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::from_millis(50));
+    let kp = EntityKeypair::generate();
+
+    // ttl=0 → expires_at == apply time. The next sweep evicts.
+    fold.apply(sign_cap_ann_with_ttl(&kp, 0xA, 0x100, 1, 0, vec!["a"]))
+        .expect("apply");
+    assert_eq!(fold.metrics().entries(), 1);
+    assert_eq!(fold.metrics().expiries(), 0);
+
+    // Skip the immediate first tick (the sweeper drops it
+    // deliberately) and the next scheduled tick. After the second
+    // tick fires the expired entry must be gone.
+    tokio::time::advance(std::time::Duration::from_millis(60)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_millis(60)).await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(fold.metrics().expiries(), 1);
+    assert_eq!(fold.metrics().entries(), 0);
+}

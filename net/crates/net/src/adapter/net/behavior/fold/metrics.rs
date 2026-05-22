@@ -99,6 +99,19 @@ impl FoldMetrics {
         self.entries.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Decrement the entry gauge and bump the expiries counter.
+    /// Called by the Phase 1B background sweep
+    /// ([`super::expiry::sweep_expired`]) once per expired
+    /// entry removed. Distinct from [`Self::on_evict`] because
+    /// expiries are TTL-driven and evictions are operator /
+    /// SWIM-driven — operators tuning TTL want to see the two
+    /// counters separately.
+    #[inline]
+    pub(super) fn on_expire(&self) {
+        self.expiries.fetch_add(1, Ordering::Relaxed);
+        self.entries.fetch_sub(1, Ordering::Relaxed);
+    }
+
     /// Bump the query counter. Called by
     /// [`super::Fold::query`].
     #[inline]
