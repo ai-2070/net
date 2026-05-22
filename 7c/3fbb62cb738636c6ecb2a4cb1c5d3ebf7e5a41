@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_d9dc521a887c3e::t_3aa0d5654f64db 177-205,208-209
+net/crates/net/src/adapter/net/behavior/fold/tests.rs
+  s_d9dc521a887c3e::t_d11abe1f1834ec 1378-1397
+  s_d9dc521a887c3e::t_8ed6c9fa52f39e 1364
+  s_d9dc521a887c3e::t_815ea07948d0b4 1073,1076,1079,1084,1086-1090,1092
+  s_d9dc521a887c3e::t_86d40a86a1e6d6 1141,1147,1157,1162,1172-1175
+  s_d9dc521a887c3e::t_4554d6f2945970 1402
+  s_d9dc521a887c3e::t_b55c779f04a906 1498
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "7c3fbb62cb738636c6ecb2a4cb1c5d3ebf7e5a41",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
