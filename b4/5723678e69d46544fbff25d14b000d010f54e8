@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/redex/replication_catchup.rs
+  s_f930dae9b8bbc1::t_98291e28f6bc63 767-818
+  s_f930dae9b8bbc1::t_1c66cda4288f2b 446-461
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "b45723678e69d46544fbff25d14b000d010f54e8",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
