@@ -1,0 +1,39 @@
+net/crates/net/src/adapter/net/cortex/tasks/query.rs
+  s_cd675bc73c3bfb::t_2b2c53e692e965 23
+net/crates/net/src/adapter/net/cortex/memories/query.rs
+  s_cd675bc73c3bfb::t_01438b3f08ac45 17
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  s_cd675bc73c3bfb::t_db86e3b2ecd703 14
+net/crates/net/src/consumer/filter.rs
+  s_cd675bc73c3bfb::t_e418dbcb498be4 64
+net/crates/net/src/adapter/net/behavior/meshdb/planner.rs
+  s_cd675bc73c3bfb::t_57d7f9ed4cc1b5 1454-1458
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_cd675bc73c3bfb::t_05a7ade42e5f76 476
+  s_cd675bc73c3bfb::t_b8b5521a074769 606
+  s_cd675bc73c3bfb::t_51dea4115512d2 692
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_cd675bc73c3bfb::t_1947fbdfd068bb 3330-3332,3337-3340
+  s_cd675bc73c3bfb::t_030d09452f8ccd 3021-3029
+  s_cd675bc73c3bfb::t_3692e4e87f9c55 3318-3329,3333-3336,3341-3344,3346-3350
+net/crates/net/src/adapter/net/cortex/mod.rs
+  s_cd675bc73c3bfb::t_ffee5d5994448f 25-26
+net/crates/net/src/adapter/net/cortex/needle.rs
+  s_cd675bc73c3bfb::t_8ba76c3c1246af 1-97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "ae14e2c9a2f08c377821e68643714be10cdbebe9",
+  "prompts": {},
+  "sessions": {
+    "s_cd675bc73c3bfb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a31a48d8-2195-4ee7-9c6a-7c856922d421",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
