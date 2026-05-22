@@ -36,9 +36,7 @@ use super::FoldKind;
 /// scheduler / market matcher filters on this when picking
 /// candidates: an `Idle` node is a candidate, a `Faulty` node
 /// is not.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeState {
     /// Node is idle and accepting work.
@@ -197,7 +195,10 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
             self.by_tag.entry(tag.clone()).or_default().insert(*key);
         }
         if let Some(region) = &payload.region {
-            self.by_region.entry(region.clone()).or_default().insert(*key);
+            self.by_region
+                .entry(region.clone())
+                .or_default()
+                .insert(*key);
         }
         self.by_state.entry(payload.state).or_default().insert(*key);
     }
@@ -275,12 +276,10 @@ impl FoldKind for CapabilityFold {
                 .filter(|((c, _), _)| *c == class)
                 .map(|(k, e)| (*k, e.payload.clone()))
                 .collect(),
-            CapabilityQuery::HasAllTags(tags) => {
-                resolve_keys_all_tags(index, &tags)
-                    .into_iter()
-                    .filter_map(|k| state.entries.get(&k).map(|e| (k, e.payload.clone())))
-                    .collect()
-            }
+            CapabilityQuery::HasAllTags(tags) => resolve_keys_all_tags(index, &tags)
+                .into_iter()
+                .filter_map(|k| state.entries.get(&k).map(|e| (k, e.payload.clone())))
+                .collect(),
             CapabilityQuery::HasAnyTag(tags) => {
                 let mut seen: HashSet<(u64, NodeId)> = HashSet::new();
                 for tag in &tags {
@@ -316,10 +315,7 @@ impl FoldKind for CapabilityFold {
 /// as the candidate set, then retain only candidates present
 /// in every subsequent bucket. Empty `tags` returns every key
 /// (matches the `tags_all = []` "no constraint" convention).
-fn resolve_keys_all_tags(
-    index: &CapabilityIndexInner,
-    tags: &[String],
-) -> HashSet<(u64, NodeId)> {
+fn resolve_keys_all_tags(index: &CapabilityIndexInner, tags: &[String]) -> HashSet<(u64, NodeId)> {
     if tags.is_empty() {
         // No tag constraint → every indexed key. Use the by_state
         // index as a proxy: every entry is indexed under exactly
@@ -449,10 +445,7 @@ type _NoIndexAlias = NoIndex;
 /// per class), typically tiny. Used by the dataforts greedy
 /// admission path to feed the scope gate after origin_hash →
 /// node_id resolution.
-pub fn capability_tags_for(
-    fold: &super::Fold<CapabilityFold>,
-    node_id: NodeId,
-) -> Vec<String> {
+pub fn capability_tags_for(fold: &super::Fold<CapabilityFold>, node_id: NodeId) -> Vec<String> {
     fold.with_state(|state| {
         let Some(keys) = state.by_node.get(&node_id) else {
             return Vec::new();
@@ -513,7 +506,9 @@ mod tests {
         state: NodeState,
         region: Option<&str>,
     ) -> SignedAnnouncement<CapabilityMembership> {
-        sign_cap_with_reflex(keypair, publisher, generation, class, tags, state, region, None)
+        sign_cap_with_reflex(
+            keypair, publisher, generation, class, tags, state, region, None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -577,9 +572,7 @@ mod tests {
         assert_eq!(hits[0].0, (0x100, 0xA));
 
         // by-tag indexed lookup finds it
-        let hits = fold.query(CapabilityQuery::HasAllTags(vec![
-            "hardware.gpu".into(),
-        ]));
+        let hits = fold.query(CapabilityQuery::HasAllTags(vec!["hardware.gpu".into()]));
         assert_eq!(hits.len(), 1);
 
         // by-state indexed lookup
@@ -684,7 +677,8 @@ mod tests {
             .query(CapabilityQuery::InRegion("us-east".into()))
             .is_empty());
         assert_eq!(
-            fold.query(CapabilityQuery::InRegion("us-west".into())).len(),
+            fold.query(CapabilityQuery::InRegion("us-west".into()))
+                .len(),
             1
         );
     }
@@ -992,11 +986,25 @@ mod tests {
         // reflex_addr. The lookup walks by_node and returns the
         // first Some across the class entries.
         fold.apply(sign_cap_with_reflex(
-            &kp, 0xAA, 1, 0x100, vec![], NodeState::Idle, None, None,
+            &kp,
+            0xAA,
+            1,
+            0x100,
+            vec![],
+            NodeState::Idle,
+            None,
+            None,
         ))
         .expect("class 0x100");
         fold.apply(sign_cap_with_reflex(
-            &kp, 0xAA, 1, 0x101, vec![], NodeState::Idle, None, Some(addr),
+            &kp,
+            0xAA,
+            1,
+            0x101,
+            vec![],
+            NodeState::Idle,
+            None,
+            Some(addr),
         ))
         .expect("class 0x101");
 
@@ -1074,9 +1082,7 @@ mod tests {
             Some("us-east"),
         );
         let bytes = ann.encode().expect("encode");
-        let outcome = registry
-            .dispatch(&bytes, kp.entity_id())
-            .expect("dispatch");
+        let outcome = registry.dispatch(&bytes, kp.entity_id()).expect("dispatch");
         assert_eq!(outcome, ApplyOutcome::Inserted);
         assert_eq!(fold.stats().entries, 1);
     }

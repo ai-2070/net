@@ -442,8 +442,8 @@ use std::sync::Arc;
 
 use crate::adapter::net::identity::EntityKeypair;
 
-use super::wire::placeholder_signature;
 use super::dispatch::{DispatchError, FoldRegistry};
+use super::wire::placeholder_signature;
 use super::wire::WireError;
 
 fn sign_cap_ann(
@@ -491,7 +491,8 @@ fn signed_announcement_round_trips_through_postcard_encode_decode() {
 fn signature_verifies_against_publisher_identity() {
     let kp = EntityKeypair::generate();
     let ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
-    ann.verify(kp.entity_id()).expect("verify must accept untampered envelope");
+    ann.verify(kp.entity_id())
+        .expect("verify must accept untampered envelope");
 }
 
 #[test]
@@ -673,9 +674,7 @@ fn registry_rejects_envelope_whose_kind_disagrees_with_routed_fold() {
     // wire kind matches the dispatcher but whose envelope kind
     // doesn't — which is only constructable via a manual
     // adapter call:
-    let adapter = registry
-        .get(CapFold::KIND_ID)
-        .expect("cap fold registered");
+    let adapter = registry.get(CapFold::KIND_ID).expect("cap fold registered");
     match adapter.dispatch(&bytes, kp.entity_id()) {
         Err(WireError::KindMismatch { got, expected }) => {
             assert_eq!(got, 0xFFFF);
@@ -1042,7 +1041,10 @@ fn sweep_evicts_across_multiple_chunks_when_count_exceeds_chunk_size() {
 
     std::thread::sleep(std::time::Duration::from_millis(10));
     let evicted = fold.sweep_expired_now();
-    assert_eq!(evicted, N as usize, "all expired entries evicted across chunks");
+    assert_eq!(
+        evicted, N as usize,
+        "all expired entries evicted across chunks"
+    );
     assert_eq!(fold.metrics().entries(), 0);
     assert_eq!(fold.metrics().expiries(), N);
 }
@@ -1157,10 +1159,7 @@ fn audit_sink_receives_create_replace_evict_and_expire_transitions() {
         .expect("replace");
     assert_eq!(sink.snapshot().len(), 2);
     assert_eq!(sink.snapshot()[1].kind, super::AuditKind::Replaced);
-    assert_eq!(
-        sink.snapshot()[1].detail.as_deref(),
-        Some("gen 1 → 2")
-    );
+    assert_eq!(sink.snapshot()[1].detail.as_deref(), Some("gen 1 → 2"));
 
     // Reject (stale generation)
     fold.apply(sign_audit_ann(&kp, 0xA, 0x100, 2, 300, vec!["bogus"]))
@@ -1172,7 +1171,10 @@ fn audit_sink_receives_create_replace_evict_and_expire_transitions() {
     fold.evict_node(0xA, "SWIM declared dead");
     assert_eq!(sink.snapshot().len(), 4);
     assert_eq!(sink.snapshot()[3].kind, super::AuditKind::Evicted);
-    assert_eq!(sink.snapshot()[3].detail.as_deref(), Some("SWIM declared dead"));
+    assert_eq!(
+        sink.snapshot()[3].detail.as_deref(),
+        Some("SWIM declared dead")
+    );
 
     // Expire — insert a fresh entry with ttl=0 then sweep.
     fold.apply(sign_audit_ann(&kp, 0xB, 0x100, 1, 0, vec!["b"]))
@@ -1203,7 +1205,11 @@ fn audit_sink_can_be_uninstalled() {
     assert!(!fold.has_audit_sink());
     fold.apply(sign_audit_ann(&kp, 0xB, 0x100, 1, 300, vec!["b"]))
         .expect("create-2");
-    assert_eq!(sink.len(), 1, "post-uninstall events must not reach the sink");
+    assert_eq!(
+        sink.len(),
+        1,
+        "post-uninstall events must not reach the sink"
+    );
 }
 
 #[test]
@@ -1269,7 +1275,7 @@ fn fold_stats_snapshot_reflects_live_counters() {
     let _ = fold
         .apply(cap_announcement(0x1, 0x100, 1, vec!["stale"]))
         .expect("reject"); // stale gen rejected
-    // Tag-filtered query bumps the query counter.
+                           // Tag-filtered query bumps the query counter.
     let _ = fold.query(CapQuery {
         class: 0x100,
         required_tag: Some("a2".into()),
@@ -1319,9 +1325,7 @@ fn fold_registry_stats_aggregates_across_kinds() {
         .unwrap();
     cap.apply(cap_announcement(0x43, 0x100, 1, vec!["gpu"]))
         .unwrap();
-    route
-        .apply(route_announcement(0xAA, 0x99, 50, 1))
-        .unwrap();
+    route.apply(route_announcement(0xAA, 0x99, 50, 1)).unwrap();
 
     let stats = registry.stats();
     assert_eq!(stats.len(), 2);
@@ -1428,7 +1432,8 @@ fn fold_channel_router_trait_object_exposes_stats() {
     // — so the `stats` method on the trait must route through
     // `FoldRegistry::stats` correctly.
     let registry = FoldRegistry::new();
-    let cap_fold: Arc<Fold<CapFold>> = Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
+    let cap_fold: Arc<Fold<CapFold>> =
+        Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
     let route_fold: Arc<Fold<RoutingTestFold>> =
         Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
     registry.register(cap_fold.clone());
@@ -1492,15 +1497,8 @@ fn ring_audit_sink_plugs_into_fold_and_captures_transitions() {
     let kp = EntityKeypair::generate();
     // 5 distinct events — the 1st is dropped (capacity 4).
     for i in 0..5 {
-        fold.apply(sign_audit_ann(
-            &kp,
-            0x10 + i,
-            0x100,
-            1,
-            300,
-            vec!["t"],
-        ))
-        .expect("apply");
+        fold.apply(sign_audit_ann(&kp, 0x10 + i, 0x100, 1, 300, vec!["t"]))
+            .expect("apply");
     }
     let snap = sink.snapshot();
     assert_eq!(snap.len(), 4);

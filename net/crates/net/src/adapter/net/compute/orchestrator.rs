@@ -2193,8 +2193,7 @@ mod tests {
         // Empty fold — no candidate nodes anywhere.
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
-        let scheduler =
-            super::super::Scheduler::new(fold, 0x1111, CapabilitySet::default());
+        let scheduler = super::super::Scheduler::new(fold, 0x1111, CapabilitySet::default());
 
         // A filter that nothing in the empty index can satisfy.
         let filter = CapabilityFilter::default();

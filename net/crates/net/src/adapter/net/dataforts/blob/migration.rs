@@ -21,10 +21,10 @@
 use std::sync::Arc;
 
 use crate::adapter::net::behavior::capability::CapabilitySet;
-use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use crate::adapter::net::behavior::dataforts_capabilities::{
     GravityCapability, GreedyCapability, TopologyScope,
 };
+use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use crate::adapter::net::behavior::tag::{AxisSeparator, Tag};
 use crate::adapter::net::behavior::TaxonomyAxis;
 
@@ -194,10 +194,7 @@ impl<'a> BlobMigrationController<'a> {
     /// Build a controller view over `local_caps` + the supplied
     /// capability fold. No state is captured; the walk happens
     /// inside `candidates`.
-    pub fn new(
-        local_caps: &'a CapabilitySet,
-        capability_fold: &'a Fold<CapabilityFold>,
-    ) -> Self {
+    pub fn new(local_caps: &'a CapabilitySet, capability_fold: &'a Fold<CapabilityFold>) -> Self {
         Self {
             local_caps,
             capability_fold,
@@ -258,8 +255,7 @@ impl<'a> BlobMigrationController<'a> {
             // Greedy projections all flow through tag inspection
             // that round-trips identically through
             // CapabilitySet::add_tag.
-            let caps =
-                capability_bridge::synthesize_capability_set(self.capability_fold, node_id);
+            let caps = capability_bridge::synthesize_capability_set(self.capability_fold, node_id);
             // Peer's typed scope claims (only valid when the
             // matching `enabled` flag is set; an unparticipating
             // peer makes no claim and is excluded from the floor).
@@ -953,7 +949,7 @@ mod tests {
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
-        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| Some(1024)).await;
+        let report = drive_blob_migration_tick(&local, &fold, &adapter, |_| Some(1024)).await;
         assert_eq!(report.admitted, 1);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(report.total_rejected(), 0);
@@ -971,7 +967,7 @@ mod tests {
             .add_tag("dataforts.gravity.proximity=128");
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
-        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| Some(1024)).await;
+        let report = drive_blob_migration_tick(&local, &fold, &adapter, |_| Some(1024)).await;
         assert_eq!(report.admitted, 0);
         assert_eq!(report.rejected_no_storage, 1);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -984,7 +980,7 @@ mod tests {
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
-        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| None).await;
+        let report = drive_blob_migration_tick(&local, &fold, &adapter, |_| None).await;
         assert_eq!(report.skipped_unknown_size, 1);
         assert_eq!(report.admitted, 0);
         assert_eq!(report.total_rejected(), 0);
@@ -998,7 +994,7 @@ mod tests {
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::failing();
         let calls = adapter.calls.clone();
-        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| Some(1024)).await;
+        let report = drive_blob_migration_tick(&local, &fold, &adapter, |_| Some(1024)).await;
         assert_eq!(report.admitted, 0);
         assert_eq!(report.prefetch_errors, 1);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -1181,7 +1177,7 @@ mod tests {
         let local = participating_local("mesh", 128, 1024);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
-        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| Some(1024)).await;
+        let report = drive_blob_migration_tick(&local, &fold, &adapter, |_| Some(1024)).await;
 
         assert_eq!(
             report.admitted as usize, DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK,
@@ -1246,7 +1242,7 @@ mod tests {
         );
         let local = participating_local("mesh", 128, 1024);
         let adapter = PrefetchRecorder::new();
-        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| Some(1024)).await;
+        let report = drive_blob_migration_tick(&local, &fold, &adapter, |_| Some(1024)).await;
 
         assert_eq!(
             report.admitted as usize,
@@ -1267,7 +1263,7 @@ mod tests {
         let local = participating_local("mesh", 128, 1);
         let adapter = PrefetchRecorder::new();
         let four_gib: u64 = 4 * (1 << 30);
-        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| Some(four_gib)).await;
+        let report = drive_blob_migration_tick(&local, &fold, &adapter, |_| Some(four_gib)).await;
         assert_eq!(report.admitted, 0);
         assert_eq!(report.rejected_insufficient_disk, 1);
     }

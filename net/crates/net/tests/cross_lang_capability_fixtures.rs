@@ -19,9 +19,9 @@ use std::collections::BTreeMap;
 use net::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use net::adapter::net::behavior::{
     global_placement_filter_registry, validate_capabilities, Artifact, CapabilityAnnouncement,
-    CapabilitySet, ClauseTrace, EvalContext, MetadataChange, PlacementFilter,
-    PlacementNodeId, Predicate, PredicateDebugReport, PredicateWire, SchemaError, ScopeLabel,
-    StandardPlacement, Tag, ValidationWarning, ValueType, RPC_WHERE_HEADER,
+    CapabilitySet, ClauseTrace, EvalContext, MetadataChange, PlacementFilter, PlacementNodeId,
+    Predicate, PredicateDebugReport, PredicateWire, SchemaError, ScopeLabel, StandardPlacement,
+    Tag, ValidationWarning, ValueType, RPC_WHERE_HEADER,
 };
 use net::adapter::net::identity::EntityId;
 use serde_json::Value;

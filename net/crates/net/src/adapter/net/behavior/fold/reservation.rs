@@ -288,11 +288,7 @@ impl FoldKind for ReservationFold {
 /// referring to a holder MUST name `publisher` (else the
 /// publisher is trying to claim someone else's slot via their
 /// own announcement, which is illegal).
-fn legal_same_publisher(
-    from: &ReservationState,
-    to: &ReservationState,
-    publisher: NodeId,
-) -> bool {
+fn legal_same_publisher(from: &ReservationState, to: &ReservationState, publisher: NodeId) -> bool {
     // Helper: does this state name `publisher` as holder (if it
     // has one)? `Free` has no holder and trivially passes.
     let same_holder = |s: &ReservationState| match s.holder() {
@@ -368,10 +364,7 @@ mod tests {
             node_id,
             generation,
             EnvelopeMeta::default(),
-            ReservationAnnouncement {
-                resource_id,
-                state,
-            },
+            ReservationAnnouncement { resource_id, state },
         )
         .expect("sign succeeds")
     }

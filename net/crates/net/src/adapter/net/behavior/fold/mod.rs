@@ -33,7 +33,6 @@ pub mod wire;
 #[cfg(test)]
 mod tests;
 
-pub use wire::{EnvelopeMeta, SignedAnnouncement, WireError};
 pub use audit::{FoldAuditSink, NoopSink, RingFoldAuditSink, VecFoldAuditSink};
 pub use capability::{
     capability_tags_for, reflex_addr_for, CapabilityFilter, CapabilityFold, CapabilityIndexInner,
@@ -55,6 +54,7 @@ pub use state::{
     ApplyOutcome, EntryTransition, FoldEntry, FoldError, FoldIndex, FoldState, MergeAction,
     NoIndex, NodeId,
 };
+pub use wire::{EnvelopeMeta, SignedAnnouncement, WireError};
 
 /// One typed fold definition. Each concrete fold (capability,
 /// routing, reservation, future kinds) is a unit type that
@@ -249,9 +249,7 @@ impl<K: FoldKind> Fold<K> {
         // (without a runtime) drive expiry via `sweep_expired_now`;
         // the inbound dispatch path always has a runtime, so
         // production never hits the `None` branch.
-        let sweep_handle = if interval.is_zero()
-            || tokio::runtime::Handle::try_current().is_err()
-        {
+        let sweep_handle = if interval.is_zero() || tokio::runtime::Handle::try_current().is_err() {
             None
         } else {
             Some(expiry::spawn_expiry_task::<K>(
@@ -287,10 +285,7 @@ impl<K: FoldKind> Fold<K> {
     /// Signature verification is the dispatch layer's job; this
     /// method trusts the caller. Tests bypass dispatch with
     /// [`SignedAnnouncement::placeholder`]-stamped envelopes.
-    pub fn apply(
-        &self,
-        ann: SignedAnnouncement<K::Payload>,
-    ) -> Result<ApplyOutcome, FoldError> {
+    pub fn apply(&self, ann: SignedAnnouncement<K::Payload>) -> Result<ApplyOutcome, FoldError> {
         if ann.generation == 0 {
             self.metrics.on_reject();
             return Err(FoldError::InvalidGeneration {

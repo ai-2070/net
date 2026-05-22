@@ -369,7 +369,10 @@ async fn stale_versions_are_ignored_by_index() {
     capability_bridge::apply_legacy_announcement(&fold, v1); // older — must be a no-op
 
     let v2_filter = CapabilityFilter::new().require_tag("v2");
-    assert_eq!(capability_bridge::find_nodes_matching(&fold, &v2_filter), vec![0xAA]);
+    assert_eq!(
+        capability_bridge::find_nodes_matching(&fold, &v2_filter),
+        vec![0xAA]
+    );
 
     let v1_filter = CapabilityFilter::new().require_tag("v1");
     assert!(

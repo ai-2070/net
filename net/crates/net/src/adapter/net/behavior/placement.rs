@@ -535,87 +535,84 @@ impl<'a> PlacementFilter for StandardPlacement<'a> {
         if !known {
             return None;
         }
-        let target_caps =
-            capability_bridge::synthesize_capability_set(self.fold, *target);
+        let target_caps = capability_bridge::synthesize_capability_set(self.fold, *target);
         (|target_caps: &CapabilitySet| -> Option<f32> {
-                // Hard-constraint check: artifact's `required` caps
-                // must be a subset of the target's tag set. `Chain`
-                // and `Replica` variants don't carry required caps
-                // directly; they pass through this check (slice 5
-                // may extend with per-variant checks).
-                if let Artifact::Daemon { required, .. } = artifact {
-                    if !required.tags.iter().all(|t| target_caps.tags.contains(t)) {
-                        return None;
-                    }
+            // Hard-constraint check: artifact's `required` caps
+            // must be a subset of the target's tag set. `Chain`
+            // and `Replica` variants don't carry required caps
+            // directly; they pass through this check (slice 5
+            // may extend with per-variant checks).
+            if let Artifact::Daemon { required, .. } = artifact {
+                if !required.tags.iter().all(|t| target_caps.tags.contains(t)) {
+                    return None;
                 }
+            }
 
-                // `Artifact::Blob` hard constraints (v0.2 PR-2b):
-                //
-                // 1. Target advertises `dataforts.blob.storage`.
-                // 2. Target does NOT carry the reserved
-                //    `dataforts:blob-storage-unhealthy` tag.
-                // 3. Target's `dataforts.blob.disk_free_gb` is at
-                //    least `ceil(size_bytes / 1 GiB)`.
-                //
-                // Compute / replica / chain artifacts pass through
-                // these checks (the `if let` short-circuits when
-                // the variant doesn't match). The remaining
-                // multi-axis composition (scope / proximity /
-                // intent / colocation / resource / anti-affinity)
-                // still applies — blobs participate in those axes
-                // the same way chains do.
-                if let Artifact::Blob { size_bytes, .. } = artifact {
-                    use super::dataforts_capabilities::{
-                        is_blob_storage_unhealthy, BlobCapability,
-                    };
-                    let blob_caps = BlobCapability::from_capability_set(target_caps);
-                    if !blob_caps.storage {
-                        return None;
-                    }
-                    if is_blob_storage_unhealthy(target_caps) {
-                        return None;
-                    }
-                    let required_gb = size_bytes.div_ceil(1 << 30);
-                    // `disk_free_gb` is the target's last-heartbeat-
-                    // observed free space. It is *eventually
-                    // consistent* — two independent schedulers may
-                    // see the same value and both decide to place
-                    // onto the same candidate. The hard-constraint
-                    // here keeps placements correct in the single-
-                    // scheduler case; deployments running multiple
-                    // schedulers against the same candidate set must
-                    // route the placement decision through a single
-                    // coordinator when `required_gb > disk_free_gb /
-                    // 2`, or accept that races can co-place blobs
-                    // whose combined size exceeds the candidate's
-                    // disk. Scope / proximity / intent axes above are
-                    // pure tag-set logic and deterministic across
-                    // schedulers — this is the only axis with this
-                    // caveat.
-                    if blob_caps.disk_free_gb < required_gb {
-                        return None;
-                    }
+            // `Artifact::Blob` hard constraints (v0.2 PR-2b):
+            //
+            // 1. Target advertises `dataforts.blob.storage`.
+            // 2. Target does NOT carry the reserved
+            //    `dataforts:blob-storage-unhealthy` tag.
+            // 3. Target's `dataforts.blob.disk_free_gb` is at
+            //    least `ceil(size_bytes / 1 GiB)`.
+            //
+            // Compute / replica / chain artifacts pass through
+            // these checks (the `if let` short-circuits when
+            // the variant doesn't match). The remaining
+            // multi-axis composition (scope / proximity /
+            // intent / colocation / resource / anti-affinity)
+            // still applies — blobs participate in those axes
+            // the same way chains do.
+            if let Artifact::Blob { size_bytes, .. } = artifact {
+                use super::dataforts_capabilities::{is_blob_storage_unhealthy, BlobCapability};
+                let blob_caps = BlobCapability::from_capability_set(target_caps);
+                if !blob_caps.storage {
+                    return None;
                 }
+                if is_blob_storage_unhealthy(target_caps) {
+                    return None;
+                }
+                let required_gb = size_bytes.div_ceil(1 << 30);
+                // `disk_free_gb` is the target's last-heartbeat-
+                // observed free space. It is *eventually
+                // consistent* — two independent schedulers may
+                // see the same value and both decide to place
+                // onto the same candidate. The hard-constraint
+                // here keeps placements correct in the single-
+                // scheduler case; deployments running multiple
+                // schedulers against the same candidate set must
+                // route the placement decision through a single
+                // coordinator when `required_gb > disk_free_gb /
+                // 2`, or accept that races can co-place blobs
+                // whose combined size exceeds the candidate's
+                // disk. Scope / proximity / intent axes above are
+                // pure tag-set logic and deterministic across
+                // schedulers — this is the only axis with this
+                // caveat.
+                if blob_caps.disk_free_gb < required_gb {
+                    return None;
+                }
+            }
 
-                // Per-axis scoring (slice 5 of Phase F filled these
-                // in). Each takes the borrowed `&CapabilitySet`.
-                let scope = self.score_scope_axis(target_caps);
-                let proximity = self.score_proximity_axis(target);
-                let intent = self.score_intent_axis(target_caps, artifact);
-                let colocation = self.score_colocation_axis(target_caps, artifact);
-                let resource = self.score_resource_axis(target_caps, artifact);
-                let anti_affinity = self.score_anti_affinity_axis(target);
+            // Per-axis scoring (slice 5 of Phase F filled these
+            // in). Each takes the borrowed `&CapabilitySet`.
+            let scope = self.score_scope_axis(target_caps);
+            let proximity = self.score_proximity_axis(target);
+            let intent = self.score_intent_axis(target_caps, artifact);
+            let colocation = self.score_colocation_axis(target_caps, artifact);
+            let resource = self.score_resource_axis(target_caps, artifact);
+            let anti_affinity = self.score_anti_affinity_axis(target);
 
-                Some(compose_axis_scores([
-                    scope,
-                    proximity,
-                    intent,
-                    colocation,
-                    resource,
-                    anti_affinity,
-                    custom,
-                ]))
-            })(&target_caps)
+            Some(compose_axis_scores([
+                scope,
+                proximity,
+                intent,
+                colocation,
+                resource,
+                anti_affinity,
+                custom,
+            ]))
+        })(&target_caps)
     }
 }
 
@@ -3443,9 +3440,7 @@ mod tests {
 
         let fold = index_with(&[(0x7777, empty_caps())]);
         let id = "pf-test-N4-reentrant";
-        let filter = Arc::new(ReentrantFilter {
-            fold: fold.clone(),
-        });
+        let filter = Arc::new(ReentrantFilter { fold: fold.clone() });
         with_registered_filter(id, filter, |id| {
             let placement = StandardPlacement::new(&fold).with_custom_filter_id(id);
             let req = empty_caps();

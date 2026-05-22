@@ -123,8 +123,7 @@ impl fmt::Display for TaxonomyAxis {
 /// these via privileged paths (e.g. `Mesh::announce_chain` for
 /// `causal:`, the fork-coordination layer for `fork-of:`, the
 /// existing scope helpers for `scope:`).
-pub const RESERVED_PREFIXES: &[&str] =
-    &["causal:", "dataforts:", "fork-of:", "heat:", "scope:"];
+pub const RESERVED_PREFIXES: &[&str] = &["causal:", "dataforts:", "fork-of:", "heat:", "scope:"];
 
 /// True if `s` starts with a reserved cross-axis prefix.
 fn starts_with_reserved_prefix(s: &str) -> Option<&'static str> {
@@ -711,13 +710,7 @@ mod tests {
         // `Tag::Reserved`. Promoting it makes `Tag::parse` round-
         // trip the canonical string form back into the Reserved
         // variant, which the fold-side synthesis path relies on.
-        let expected: &[&str] = &[
-            "causal:",
-            "dataforts:",
-            "fork-of:",
-            "heat:",
-            "scope:",
-        ];
+        let expected: &[&str] = &["causal:", "dataforts:", "fork-of:", "heat:", "scope:"];
         assert_eq!(RESERVED_PREFIXES, expected);
     }
 }

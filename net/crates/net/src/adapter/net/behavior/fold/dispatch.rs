@@ -20,9 +20,9 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use super::wire::SignedAnnouncement;
 use super::metrics::FoldStats;
 use super::state::ApplyOutcome;
+use super::wire::SignedAnnouncement;
 use super::wire::WireError;
 use super::{Fold, FoldKind};
 use crate::adapter::net::identity::EntityId;
@@ -148,12 +148,11 @@ impl FoldRegistry {
     /// replace a fold (e.g. swap a new index implementation in
     /// during operator-driven reconfiguration) can drop the
     /// old one cleanly.
-    pub fn register<K: FoldKind>(
-        &self,
-        fold: Arc<Fold<K>>,
-    ) -> Option<Arc<dyn FoldDispatch>> {
+    pub fn register<K: FoldKind>(&self, fold: Arc<Fold<K>>) -> Option<Arc<dyn FoldDispatch>> {
         let adapter = Arc::new(FoldDispatchAdapter::new(fold));
-        self.folds.write().insert(K::KIND_ID, adapter as Arc<dyn FoldDispatch>)
+        self.folds
+            .write()
+            .insert(K::KIND_ID, adapter as Arc<dyn FoldDispatch>)
     }
 
     /// Remove a fold by kind. Returns the dropped dispatcher if
@@ -215,9 +214,7 @@ impl FoldRegistry {
         publisher: &crate::adapter::net::identity::EntityId,
     ) -> Result<ApplyOutcome, DispatchError> {
         let kind = peek_kind(bytes).ok_or(DispatchError::Truncated)?;
-        let adapter = self
-            .get(kind)
-            .ok_or(DispatchError::UnknownKind(kind))?;
+        let adapter = self.get(kind).ok_or(DispatchError::UnknownKind(kind))?;
         adapter
             .dispatch(bytes, publisher)
             .map_err(DispatchError::Wire)
@@ -248,11 +245,7 @@ pub trait FoldChannelRouter: Send + Sync {
     /// the mesh never lets a router error escape into the rest
     /// of the inbound pipeline (single-packet failures must not
     /// take down the dispatch loop).
-    fn try_route(
-        &self,
-        publisher: &EntityId,
-        bytes: &[u8],
-    ) -> Result<ApplyOutcome, DispatchError>;
+    fn try_route(&self, publisher: &EntityId, bytes: &[u8]) -> Result<ApplyOutcome, DispatchError>;
 
     /// Aggregated [`FoldStats`] for every fold the router
     /// addresses. The operator surface (`net fold list`, the
@@ -264,11 +257,7 @@ pub trait FoldChannelRouter: Send + Sync {
 }
 
 impl FoldChannelRouter for FoldRegistry {
-    fn try_route(
-        &self,
-        publisher: &EntityId,
-        bytes: &[u8],
-    ) -> Result<ApplyOutcome, DispatchError> {
+    fn try_route(&self, publisher: &EntityId, bytes: &[u8]) -> Result<ApplyOutcome, DispatchError> {
         self.dispatch(bytes, publisher)
     }
 

@@ -240,5 +240,4 @@ impl FoldMetrics {
     pub fn snapshots_restored(&self) -> u64 {
         self.snapshots_restored.load(Ordering::Relaxed)
     }
-
 }

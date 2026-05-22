@@ -381,16 +381,12 @@ impl std::fmt::Debug for GroupCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::net::behavior::capability::{
-        CapabilityAnnouncement, CapabilitySet,
-    };
+    use crate::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
     use crate::adapter::net::behavior::placement::{NodeId as PlacementNodeId, ResourceAxis};
     use std::sync::Arc;
 
     fn make_scheduler(node_ids: &[u64]) -> Scheduler {
-        use crate::adapter::net::behavior::fold::{
-            capability_bridge, CapabilityFold, Fold,
-        };
+        use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);

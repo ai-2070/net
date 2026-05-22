@@ -125,9 +125,7 @@ pub fn membership_passes_post_filter(
 fn gpu_vendor_matches(canonical: &str, want: GpuVendor) -> bool {
     matches!(
         (canonical, want),
-        ("nvidia", GpuVendor::Nvidia)
-            | ("amd", GpuVendor::Amd)
-            | ("intel", GpuVendor::Intel)
+        ("nvidia", GpuVendor::Nvidia) | ("amd", GpuVendor::Amd) | ("intel", GpuVendor::Intel)
     )
 }
 
@@ -145,10 +143,7 @@ fn gpu_vendor_canonical(vendor: GpuVendor) -> &'static str {
 /// fixtures that need to prime a `Fold<CapabilityFold>` with
 /// the same legacy-shape announcement the production dispatch
 /// path would produce.
-pub fn apply_legacy_announcement(
-    fold: &Fold<CapabilityFold>,
-    ann: CapabilityAnnouncement,
-) {
+pub fn apply_legacy_announcement(fold: &Fold<CapabilityFold>, ann: CapabilityAnnouncement) {
     let fold_ann = translate_announcement(&ann);
     let _ = fold.apply(fold_ann);
 }
@@ -289,8 +284,8 @@ pub fn translate_announcement(
     let views = ann.capabilities.views();
     let hw_view = views.hardware();
     let primary_gpu = hw_view.gpu.as_ref();
-    let gpu_count = (primary_gpu.is_some() as u8)
-        .saturating_add(hw_view.additional_gpus.len() as u8);
+    let gpu_count =
+        (primary_gpu.is_some() as u8).saturating_add(hw_view.additional_gpus.len() as u8);
     let gpu_vendor = primary_gpu.map(|g| gpu_vendor_canonical(g.vendor).to_string());
     let vram_gb = {
         let mut total: u32 = 0;
@@ -314,7 +309,12 @@ pub fn translate_announcement(
         None
     };
 
-    let tags: Vec<String> = ann.capabilities.tags.iter().map(|t| t.to_string()).collect();
+    let tags: Vec<String> = ann
+        .capabilities
+        .tags
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
     let region = tags
         .iter()
         .find_map(|t| t.strip_prefix("scope:region:").map(String::from));
@@ -350,10 +350,7 @@ pub fn translate_announcement(
 /// post-filter for the range predicates. Dedupes across
 /// per-`(class, node)` entries that may match (a publisher in
 /// multiple classes counts once).
-pub fn find_nodes_matching(
-    fold: &Fold<CapabilityFold>,
-    legacy: &LegacyFilter,
-) -> Vec<NodeId> {
+pub fn find_nodes_matching(fold: &Fold<CapabilityFold>, legacy: &LegacyFilter) -> Vec<NodeId> {
     let fold_filter = translate_filter(legacy);
     let matches = fold.query(CapabilityQuery::Composite(fold_filter));
     let mut node_set: HashSet<NodeId> = HashSet::new();
@@ -427,8 +424,7 @@ pub fn filter_by_predicate(
     fold: &Fold<CapabilityFold>,
     predicate: &super::super::predicate::Predicate,
 ) -> Vec<(NodeId, super::super::capability::CapabilitySet)> {
-    let publishers: Vec<NodeId> = fold
-        .with_state(|state| state.by_node.keys().copied().collect());
+    let publishers: Vec<NodeId> = fold.with_state(|state| state.by_node.keys().copied().collect());
     let mut out = Vec::new();
     for node_id in publishers {
         let caps = synthesize_capability_set(fold, node_id);
@@ -597,8 +593,7 @@ mod tests {
         let global = scope_from_membership_tags(&["gpu".into(), "scope:global".into()]);
         assert!(matches!(global, CapabilityScope::Global));
 
-        let subnet_local =
-            scope_from_membership_tags(&["scope:subnet-local".into(), "gpu".into()]);
+        let subnet_local = scope_from_membership_tags(&["scope:subnet-local".into(), "gpu".into()]);
         assert!(matches!(subnet_local, CapabilityScope::SubnetLocal));
 
         let tenant = scope_from_membership_tags(&["scope:tenant:acme".into()]);
@@ -634,12 +629,7 @@ mod tests {
                     fp16_tflops_x10: 0,
                 }),
         );
-        let ann = CapabilityAnnouncement::new(
-            0xAA,
-            EntityId::from_bytes([0u8; 32]),
-            7,
-            caps,
-        );
+        let ann = CapabilityAnnouncement::new(0xAA, EntityId::from_bytes([0u8; 32]), 7, caps);
 
         let translated = translate_announcement(&ann);
         assert_eq!(translated.node_id, 0xAA);
@@ -693,12 +683,8 @@ mod tests {
 
         // SameSubnet lookup says BB is co-resident, AA isn't.
         let lookup = |nid: NodeId| nid == 0xBB;
-        let mut nodes = find_nodes_matching_scoped(
-            &fold,
-            &legacy,
-            &ScopeFilter::SameSubnet,
-            lookup,
-        );
+        let mut nodes =
+            find_nodes_matching_scoped(&fold, &legacy, &ScopeFilter::SameSubnet, lookup);
         nodes.sort();
         assert_eq!(nodes, vec![0xBB]);
     }

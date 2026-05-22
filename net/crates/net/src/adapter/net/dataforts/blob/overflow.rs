@@ -763,10 +763,7 @@ impl<'a> BlobOverflowController<'a> {
             // round-trip through CapabilitySet::add_tag, so
             // tag-based reads (storage / overflow / scope /
             // disk_total_gb / disk_free_gb) work identically.
-            let caps = capability_bridge::synthesize_capability_set(
-                self.capability_fold,
-                node_id,
-            );
+            let caps = capability_bridge::synthesize_capability_set(self.capability_fold, node_id);
             let peer_blob = BlobCapability::from_capability_set(&caps);
             if !peer_blob.storage || !peer_blob.overflow_enabled {
                 continue;
@@ -1211,7 +1208,7 @@ mod tests {
             max_pushes_per_tick: 16,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
 
         let cands = controller.candidates(now, |_| Some(1024));
         assert_eq!(cands.len(), 3);
@@ -1238,7 +1235,7 @@ mod tests {
             max_pushes_per_tick: 16,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
 
         let cands = controller.candidates(now, |_| Some(1024));
         // Pinned `a` skipped; only unpinned `b` surfaces.
@@ -1261,7 +1258,7 @@ mod tests {
             max_pushes_per_tick: 16,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         assert!(controller.candidates(now, |_| Some(1024)).is_empty());
     }
 
@@ -1283,7 +1280,7 @@ mod tests {
             max_pushes_per_tick: 16,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
 
         let cands = controller.candidates(now, |_| Some(1024));
         assert_eq!(cands.len(), 1);
@@ -1313,7 +1310,7 @@ mod tests {
             max_pushes_per_tick: 16,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         assert!(controller.candidates(now, |_| Some(1024)).is_empty());
     }
 
@@ -1333,7 +1330,7 @@ mod tests {
             max_pushes_per_tick: 16,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let four_gib: u64 = 4 * (1 << 30);
         assert!(controller.candidates(now, |_| Some(four_gib)).is_empty());
     }
@@ -1353,7 +1350,7 @@ mod tests {
             max_pushes_per_tick: 2,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let cands = controller.candidates(now, |_| Some(1024));
         assert_eq!(
             cands.len(),
@@ -1379,7 +1376,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1414,7 +1411,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1453,7 +1450,7 @@ mod tests {
             enabled: false, // master switch off
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1491,7 +1488,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
         sink.fail_count.store(1, Ordering::Relaxed);
@@ -1533,7 +1530,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1581,7 +1578,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1629,7 +1626,7 @@ mod tests {
             max_pushes_per_tick: 2,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1683,7 +1680,7 @@ mod tests {
             max_pushes_per_tick: 3,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1729,7 +1726,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &fold,&heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 

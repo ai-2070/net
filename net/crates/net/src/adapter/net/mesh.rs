@@ -49,8 +49,7 @@ use super::pool::PacketBuilder;
 
 use super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 use super::behavior::capability::{
-    CapabilityAnnouncement, CapabilityFilter, CapabilitySet, ScopeFilter,
-    MAX_CAPABILITY_HOPS,
+    CapabilityAnnouncement, CapabilityFilter, CapabilitySet, ScopeFilter, MAX_CAPABILITY_HOPS,
 };
 use super::behavior::loadbalance::HealthStatus;
 use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
@@ -570,8 +569,7 @@ struct DispatchCtx {
     /// Capability fold shared with `MeshNode`. Inbound
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets land here via the
     /// bridge's `translate_announcement`.
-    capability_fold:
-        Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
+    capability_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
     /// Dedup cache for multi-hop capability announcements, keyed by
     /// `(origin_node_id, version)`. Written by the dispatch handler
     /// before indexing + forwarding so a `(origin, version)` tuple
@@ -1578,8 +1576,7 @@ pub struct MeshNode {
     /// queries return us too. Registered with this node's
     /// internal [`super::behavior::fold::FoldRegistry`] (installed
     /// as the [`Self::fold_router`] router by default).
-    capability_fold:
-        Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
+    capability_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
     /// Dedup cache for multi-hop capability announcements. Keyed by
     /// `(origin_node_id, version)` — the same discriminator
     /// `CapabilityIndex` uses to skip stale announcements. Entries
@@ -1880,8 +1877,7 @@ impl MeshNode {
         // Reverse index keyed on the publisher's wire `origin_hash`.
         // Populated alongside `peer_entity_ids` at TOFU pin time;
         // cleared by the failure-detector callback below.
-        let origin_hash_to_node: Arc<DashMap<u64, OriginHashSlot>> =
-            Arc::new(DashMap::new());
+        let origin_hash_to_node: Arc<DashMap<u64, OriginHashSlot>> = Arc::new(DashMap::new());
 
         // Capability fold — hoisted out of the struct literal so
         // the failure-detector `on_failure` callback can hold a
@@ -1898,17 +1894,15 @@ impl MeshNode {
         // Test code that wants to override this can still call
         // set_fold_router(Some(other)) — the override replaces
         // the default registry whole.
-        let capability_fold: Arc<super::behavior::fold::Fold<
-            super::behavior::fold::CapabilityFold,
-        >> = Arc::new(super::behavior::fold::Fold::new());
+        let capability_fold: Arc<
+            super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>,
+        > = Arc::new(super::behavior::fold::Fold::new());
         let fold_registry = Arc::new(super::behavior::fold::FoldRegistry::new());
         fold_registry.register(capability_fold.clone());
         let fold_router: Arc<
-            parking_lot::RwLock<
-                Option<Arc<dyn super::behavior::fold::FoldChannelRouter>>,
-            >,
+            parking_lot::RwLock<Option<Arc<dyn super::behavior::fold::FoldChannelRouter>>>,
         > = Arc::new(parking_lot::RwLock::new(Some(
-            fold_registry.clone() as Arc<dyn super::behavior::fold::FoldChannelRouter>,
+            fold_registry.clone() as Arc<dyn super::behavior::fold::FoldChannelRouter>
         )));
 
         // Wire failure detector with reroute callbacks + roster eviction.
@@ -1951,14 +1945,11 @@ impl MeshNode {
             // Pull `entity_id` BEFORE removing it so we know which
             // origin_hash slot to demote / drop. A node disappearing
             // releases its claim on the wire hash.
-            let removed_entity_id = peer_entity_ids_failure
-                .remove(&node_id)
-                .map(|(_, eid)| eid);
+            let removed_entity_id = peer_entity_ids_failure.remove(&node_id).map(|(_, eid)| eid);
             if let Some(eid) = removed_entity_id {
                 let origin_hash = eid.origin_hash();
                 let mut drop_slot = false;
-                if let Some(mut slot) = origin_hash_to_node_failure.get_mut(&origin_hash)
-                {
+                if let Some(mut slot) = origin_hash_to_node_failure.get_mut(&origin_hash) {
                     drop_slot = slot.remove(node_id);
                 }
                 if drop_slot {
@@ -4030,10 +4021,7 @@ impl MeshNode {
                 // populates both maps together). Drop to be safe;
                 // an unauthenticated `try_route` would forge the
                 // publisher claim.
-                tracing::debug!(
-                    from_node,
-                    "fold: missing peer EntityId, drop frame"
-                );
+                tracing::debug!(from_node, "fold: missing peer EntityId, drop frame");
                 return;
             };
             for payload in events {
@@ -4555,14 +4543,12 @@ impl MeshNode {
                 None
             } else {
                 let tags = match publisher_node {
-                    Some(nid) => super::behavior::fold::capability_tags_for(
-                        &ctx.capability_fold,
-                        nid,
-                    ),
+                    Some(nid) => {
+                        super::behavior::fold::capability_tags_for(&ctx.capability_fold, nid)
+                    }
                     None => Vec::new(),
                 };
-                let mut caps =
-                    crate::adapter::net::behavior::capability::CapabilitySet::new();
+                let mut caps = crate::adapter::net::behavior::capability::CapabilitySet::new();
                 for tag in tags {
                     caps = caps.add_tag(tag);
                 }
@@ -7208,9 +7194,9 @@ impl MeshNode {
     where
         P: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let bytes = ann.encode().map_err(|e| {
-            AdapterError::Connection(format!("fold: encode failed: {e}"))
-        })?;
+        let bytes = ann
+            .encode()
+            .map_err(|e| AdapterError::Connection(format!("fold: encode failed: {e}")))?;
         let n = bytes.len();
         self.send_subprotocol(peer_addr, super::behavior::fold::SUBPROTOCOL_FOLD, &bytes)
             .await?;
@@ -7234,11 +7220,10 @@ impl MeshNode {
     where
         P: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let bytes = ann.encode().map_err(|e| {
-            AdapterError::Connection(format!("fold: encode failed: {e}"))
-        })?;
-        let peer_addrs: Vec<SocketAddr> =
-            self.peers.iter().map(|e| e.value().addr).collect();
+        let bytes = ann
+            .encode()
+            .map_err(|e| AdapterError::Connection(format!("fold: encode failed: {e}")))?;
+        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
         // Share the encoded bytes by reference; each send
         // borrows the same slice. send_subprotocol clones into
         // its own internal allocation, so concurrent sends don't
@@ -7366,10 +7351,7 @@ impl MeshNode {
         self.publish_fold::<super::behavior::fold::ReservationFold>(
             resource_id,
             0,
-            super::behavior::fold::ReservationAnnouncement {
-                resource_id,
-                state,
-            },
+            super::behavior::fold::ReservationAnnouncement { resource_id, state },
         )
         .await
     }
@@ -7477,8 +7459,7 @@ impl MeshNode {
         )
         .with_ttl(300);
         ann.sign(&self.identity);
-        let fold_ann =
-            super::behavior::fold::capability_bridge::translate_announcement(&ann);
+        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
         let _ = self.capability_fold.apply(fold_ann);
     }
 
@@ -7594,8 +7575,7 @@ impl MeshNode {
         // Self-index so local queries see our own caps. Always runs
         // regardless of rate limit — the self-index reflects the
         // latest intended announcement.
-        let fold_ann =
-            super::behavior::fold::capability_bridge::translate_announcement(&ann);
+        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
         let _ = self.capability_fold.apply(fold_ann);
 
         // Publish as the latest local announcement so future
@@ -8337,10 +8317,7 @@ impl MeshNode {
     /// post-query predicates (memory, vram, GPU) execute in-memory
     /// alongside the fold's tag-based intersection.
     pub fn find_nodes_by_filter(&self, filter: &CapabilityFilter) -> Vec<u64> {
-        super::behavior::fold::capability_bridge::find_nodes_matching(
-            &self.capability_fold,
-            filter,
-        )
+        super::behavior::fold::capability_bridge::find_nodes_matching(&self.capability_fold, filter)
     }
 
     /// Scoped variant of [`Self::find_nodes_by_filter`]. Filters
@@ -8418,23 +8395,22 @@ impl MeshNode {
     #[cfg(feature = "nat-traversal")]
     pub fn peer_nat_class(&self, peer_node_id: u64) -> super::traversal::classify::NatClass {
         use super::traversal::classify::NatClass;
-        self.capability_fold
-            .with_state(|state| {
-                let Some(keys) = state.by_node.get(&peer_node_id) else {
-                    return NatClass::Unknown;
+        self.capability_fold.with_state(|state| {
+            let Some(keys) = state.by_node.get(&peer_node_id) else {
+                return NatClass::Unknown;
+            };
+            for key in keys {
+                let Some(entry) = state.entries.get(key) else {
+                    continue;
                 };
-                for key in keys {
-                    let Some(entry) = state.entries.get(key) else {
-                        continue;
-                    };
-                    for tag in entry.payload.tags.iter() {
-                        if let Some(class) = NatClass::from_tag(tag) {
-                            return class;
-                        }
+                for tag in entry.payload.tags.iter() {
+                    if let Some(class) = NatClass::from_tag(tag) {
+                        return class;
                     }
                 }
-                NatClass::Unknown
-            })
+            }
+            NatClass::Unknown
+        })
     }
 
     /// Cumulative traversal counters — punch attempts, successes,
@@ -8838,16 +8814,14 @@ impl MeshNode {
         );
         candidates.sort_unstable();
         candidates.into_iter().max_by(|a, b| {
-            let caps_a =
-                super::behavior::fold::capability_bridge::synthesize_capability_set(
-                    &self.capability_fold,
-                    *a,
-                );
-            let caps_b =
-                super::behavior::fold::capability_bridge::synthesize_capability_set(
-                    &self.capability_fold,
-                    *b,
-                );
+            let caps_a = super::behavior::fold::capability_bridge::synthesize_capability_set(
+                &self.capability_fold,
+                *a,
+            );
+            let caps_b = super::behavior::fold::capability_bridge::synthesize_capability_set(
+                &self.capability_fold,
+                *b,
+            );
             req.score(&caps_a)
                 .partial_cmp(&req.score(&caps_b))
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -8873,16 +8847,14 @@ impl MeshNode {
         let mut sorted = candidates;
         sorted.sort_unstable();
         sorted.into_iter().max_by(|a, b| {
-            let caps_a =
-                super::behavior::fold::capability_bridge::synthesize_capability_set(
-                    &self.capability_fold,
-                    *a,
-                );
-            let caps_b =
-                super::behavior::fold::capability_bridge::synthesize_capability_set(
-                    &self.capability_fold,
-                    *b,
-                );
+            let caps_a = super::behavior::fold::capability_bridge::synthesize_capability_set(
+                &self.capability_fold,
+                *a,
+            );
+            let caps_b = super::behavior::fold::capability_bridge::synthesize_capability_set(
+                &self.capability_fold,
+                *b,
+            );
             req.score(&caps_a)
                 .partial_cmp(&req.score(&caps_b))
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -10712,20 +10684,18 @@ mod fold_publisher_helpers_tests {
         // failure. The relevant pin: the helper doesn't panic
         // and produces a result.
         let result = node
-            .publish_capability_membership(
-                super::super::behavior::fold::CapabilityMembership {
-                    class_hash: 0x1000,
-                    tags: vec!["gpu".into()],
-                    hardware: None,
-                    state: super::super::behavior::fold::NodeState::Idle,
-                    region: Some("us-east".into()),
-                    price_quote: None,
-                    reflex_addr: None,
-                    allowed_nodes: Vec::new(),
-                    allowed_subnets: Vec::new(),
-                    allowed_groups: Vec::new(),
-                },
-            )
+            .publish_capability_membership(super::super::behavior::fold::CapabilityMembership {
+                class_hash: 0x1000,
+                tags: vec!["gpu".into()],
+                hardware: None,
+                state: super::super::behavior::fold::NodeState::Idle,
+                region: Some("us-east".into()),
+                price_quote: None,
+                reflex_addr: None,
+                allowed_nodes: Vec::new(),
+                allowed_subnets: Vec::new(),
+                allowed_groups: Vec::new(),
+            })
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0, "no peers → 0 sent");
@@ -10737,7 +10707,10 @@ mod fold_publisher_helpers_tests {
             <super::super::behavior::fold::CapabilityFold as super::super::behavior::fold::FoldKind>::KIND_ID,
             0x1000,
         );
-        assert_eq!(next, 2, "first publish used gen=1, next_fold_generation returns gen=2");
+        assert_eq!(
+            next, 2,
+            "first publish used gen=1, next_fold_generation returns gen=2"
+        );
     }
 
     #[tokio::test]
@@ -10767,9 +10740,8 @@ mod fold_publisher_helpers_tests {
         // Run the same retain the background loop would on tick.
         let cutoff_us = crate::adapter::net::current_timestamp_micros()
             .saturating_sub(FOLD_GENERATION_GC_MAX_AGE.as_micros() as u64);
-        node.fold_generations.retain(|_, e| {
-            e.last_touched_us.load(Ordering::Relaxed) >= cutoff_us
-        });
+        node.fold_generations
+            .retain(|_, e| e.last_touched_us.load(Ordering::Relaxed) >= cutoff_us);
 
         assert!(
             !node.fold_generations.contains_key(&(kind, stale_class)),
@@ -10851,8 +10823,10 @@ mod fold_publisher_helpers_tests {
         // backs the router.
         let stats = node.fold_stats();
         assert!(
-            stats.iter().any(|s| s.kind == <super::super::behavior::fold::CapabilityFold
-                as super::super::behavior::fold::FoldKind>::KIND_ID),
+            stats.iter().any(|s| {
+                s.kind == <super::super::behavior::fold::CapabilityFold
+                as super::super::behavior::fold::FoldKind>::KIND_ID
+            }),
             "capability fold registered in default router"
         );
     }

@@ -136,4 +136,3 @@ impl FoldAuditSink for RingFoldAuditSink {
         self.ring.push(event);
     }
 }
-

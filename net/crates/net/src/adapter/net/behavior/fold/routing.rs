@@ -128,11 +128,7 @@ impl FoldKind for RoutingFold {
         }
     }
 
-    fn query(
-        state: &FoldState<Self>,
-        _index: &NoIndex,
-        query: RoutingQuery,
-    ) -> Vec<RouteRow> {
+    fn query(state: &FoldState<Self>, _index: &NoIndex, query: RoutingQuery) -> Vec<RouteRow> {
         match query {
             RoutingQuery::Lookup(dest) => state
                 .entries
@@ -316,10 +312,7 @@ mod tests {
             .apply(sign_route(&kp, 0xAA, 2, 0x42, addr(7000), 1, 0xAA))
             .expect("better");
         assert_eq!(outcome, ApplyOutcome::Replaced);
-        assert_eq!(
-            fold.query(RoutingQuery::Lookup(0x42))[0].1.metric,
-            1
-        );
+        assert_eq!(fold.query(RoutingQuery::Lookup(0x42))[0].1.metric, 1);
     }
 
     #[test]

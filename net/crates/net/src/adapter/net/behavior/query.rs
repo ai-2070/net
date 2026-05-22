@@ -332,7 +332,6 @@ pub trait CapabilityQuery {
     )>;
 }
 
-
 // =========================================================================
 // Helpers
 // =========================================================================
@@ -392,4 +391,3 @@ const _DOC_LINK: BTreeMap<String, String> = BTreeMap::new();
 fn _doc_link_tag_key(axis: TaxonomyAxis, k: &str) -> TagKey {
     TagKey::new(axis, k.to_string())
 }
-

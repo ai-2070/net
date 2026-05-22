@@ -144,12 +144,7 @@ fn daemon_artifact<'a>(
 fn registered_filter_selectively_admits_via_live_index() {
     let fold = Arc::new(populated_index());
     let id = "integ-pf-gpu-only";
-    let _guard = register_filter(
-        id,
-        Arc::new(GpuOnlyFilter {
-            fold: fold.clone(),
-        }),
-    );
+    let _guard = register_filter(id, Arc::new(GpuOnlyFilter { fold: fold.clone() }));
 
     let placement = StandardPlacement::new(&fold).with_custom_filter_id(id);
     let req = empty_caps();
@@ -186,12 +181,7 @@ fn registered_filter_selectively_admits_via_live_index() {
 fn unregistering_filter_collapses_to_hard_veto() {
     let fold = Arc::new(populated_index());
     let id = "integ-pf-unregister-mid-flight";
-    let guard = register_filter(
-        id,
-        Arc::new(GpuOnlyFilter {
-            fold: fold.clone(),
-        }),
-    );
+    let guard = register_filter(id, Arc::new(GpuOnlyFilter { fold: fold.clone() }));
 
     let placement = StandardPlacement::new(&fold).with_custom_filter_id(id);
     let req = empty_caps();

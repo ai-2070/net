@@ -732,9 +732,7 @@ mod tests {
     }
 
     fn make_scheduler() -> Scheduler {
-        use crate::adapter::net::behavior::fold::{
-            capability_bridge, CapabilityFold, Fold,
-        };
+        use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
@@ -971,9 +969,7 @@ mod tests {
         // Build a scheduler with exactly one node so the
         // exclude-the-failed-node candidate search returns nothing.
         fn single_node_scheduler() -> Scheduler {
-            use crate::adapter::net::behavior::fold::{
-                capability_bridge, CapabilityFold, Fold,
-            };
+            use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
             let fold: Arc<Fold<CapabilityFold>> =
                 Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
@@ -1038,9 +1034,7 @@ mod tests {
     use crate::adapter::net::behavior::placement::{NodeId as PlacementNodeId, ResourceAxis};
 
     fn make_scheduler_and_index(node_ids: &[u64]) -> Scheduler {
-        use crate::adapter::net::behavior::fold::{
-            capability_bridge, CapabilityFold, Fold,
-        };
+        use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);

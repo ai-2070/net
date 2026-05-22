@@ -327,14 +327,12 @@ impl<P: Serialize + DeserializeOwned> SignedAnnouncement<P> {
             &self.payload,
         )?;
 
-        publisher
-            .verify(&bytes, &sig)
-            .map_err(|e| match e {
-                crate::adapter::net::identity::EntityError::InvalidPublicKey => {
-                    WireError::InvalidPublicKey
-                }
-                _ => WireError::InvalidSignature,
-            })
+        publisher.verify(&bytes, &sig).map_err(|e| match e {
+            crate::adapter::net::identity::EntityError::InvalidPublicKey => {
+                WireError::InvalidPublicKey
+            }
+            _ => WireError::InvalidSignature,
+        })
     }
 
     /// Encode the full envelope to wire bytes via postcard.

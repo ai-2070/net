@@ -862,9 +862,7 @@ mod tests {
     }
 
     fn make_scheduler() -> Scheduler {
-        use crate::adapter::net::behavior::fold::{
-            capability_bridge, CapabilityFold, Fold,
-        };
+        use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
@@ -1120,9 +1118,7 @@ mod tests {
         // Regression: place_with_spread used to silently fall back to an
         // excluded node when all candidates were in the exclusion set,
         // defeating the spread constraint.
-        use crate::adapter::net::behavior::fold::{
-            capability_bridge, CapabilityFold, Fold,
-        };
+        use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         capability_bridge::apply_legacy_announcement(
@@ -1155,9 +1151,7 @@ mod tests {
     use crate::adapter::net::behavior::placement::{NodeId as PlacementNodeId, ResourceAxis};
 
     fn make_scheduler_and_index(node_ids: &[u64]) -> Scheduler {
-        use crate::adapter::net::behavior::fold::{
-            capability_bridge, CapabilityFold, Fold,
-        };
+        use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
