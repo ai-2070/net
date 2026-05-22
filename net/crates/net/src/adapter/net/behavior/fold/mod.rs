@@ -43,6 +43,7 @@ use serde::Serialize;
 
 pub mod announcement;
 pub mod audit;
+pub mod capability;
 pub mod dispatch;
 pub mod expiry;
 pub mod metrics;
@@ -57,6 +58,10 @@ mod tests;
 
 pub use announcement::SignedAnnouncement;
 pub use audit::{AuditSink, NoopSink, RingAuditSink, VecAuditSink};
+pub use capability::{
+    CapabilityFilter, CapabilityFold, CapabilityIndexInner, CapabilityMatch, CapabilityMembership,
+    CapabilityQuery, HardwareSummary, NodeState,
+};
 pub use dispatch::{
     DispatchError, FoldChannelRouter, FoldDispatch, FoldDispatchAdapter, FoldRegistry,
     SUBPROTOCOL_FOLD,
