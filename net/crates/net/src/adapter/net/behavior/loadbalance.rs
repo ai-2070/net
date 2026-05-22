@@ -11,8 +11,41 @@ use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Process-wide baseline `Instant` for [`EndpointState::last_selected`].
+///
+/// We need a monotonic reference point so `last_selected` can be stored
+/// as a `u64` nanosecond offset (atomic), rather than the legacy
+/// `Mutex<Instant>` that locked once per successful selection. `Instant`
+/// has no public `as_u64` representation — its internal layout is
+/// platform-specific — so we anchor every endpoint to the same lazily
+/// initialized baseline and store
+/// `Instant::now().saturating_duration_since(*BASELINE).as_nanos()`.
+/// First access materializes the baseline; subsequent calls are a
+/// single Acquire load. Per perf #155.
+static LB_INSTANT_BASELINE: OnceLock<Instant> = OnceLock::new();
+
+#[inline]
+fn lb_instant_baseline() -> Instant {
+    *LB_INSTANT_BASELINE.get_or_init(Instant::now)
+}
+
+/// Coarse `last_selected` stamp: nanos elapsed since
+/// [`lb_instant_baseline`], saturating at `u64::MAX`. `Instant::now()`
+/// is still consulted (same syscall cost as the legacy
+/// `*lock = Instant::now()` write) — the win is the elimination of the
+/// per-selection `parking_lot::Mutex` acquisition. Per perf #155.
+#[inline]
+fn lb_now_nanos_since_baseline() -> u64 {
+    u64::try_from(
+        Instant::now()
+            .saturating_duration_since(lb_instant_baseline())
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX)
+}
 
 use super::metadata::NodeId;
 
@@ -245,8 +278,23 @@ struct EndpointState {
     total_requests: AtomicU64,
     /// Failed requests
     failed_requests: AtomicU64,
-    /// Last selected time
-    last_selected: Mutex<Instant>,
+    /// Last-selected timestamp (nanos since the load-balancer's
+    /// process-lifetime baseline). Per perf #155 — pre-fix this was
+    /// `Mutex<Instant>` and a parking_lot lock + `Instant::now()`
+    /// fired on every successful selection. The field is purely
+    /// observational (never read inside this module today; surfaced
+    /// for operator inventory paths to compare per-endpoint last-use
+    /// against the LB's baseline) so the Mutex was being used as a
+    /// cell, not for mutual exclusion. Switched to `AtomicU64` of
+    /// nanos elapsed since `LoadBalancer::baseline` — atomic store
+    /// instead of lock+unlock, and the read is a single Relaxed load
+    /// rather than a Mutex acquire + clone. Pre-fix overhead at 100K
+    /// successful selections/sec was 100K parking_lot lock+unlock
+    /// pairs plus 100K `Instant::now()` reads; the lock is gone, and
+    /// `Instant::now()`-vs-baseline replaces the raw `Instant::now()`
+    /// (still one clock read, but stamped via a cheaper subtract
+    /// rather than a `Mutex<Instant>` clone-out).
+    last_selected: AtomicU64,
     /// Consecutive failures
     consecutive_failures: AtomicU32,
     /// Circuit breaker state
@@ -272,7 +320,7 @@ impl EndpointState {
             connections: AtomicU32::new(0),
             total_requests: AtomicU64::new(0),
             failed_requests: AtomicU64::new(0),
-            last_selected: Mutex::new(Instant::now()),
+            last_selected: AtomicU64::new(lb_now_nanos_since_baseline()),
             consecutive_failures: AtomicU32::new(0),
             circuit_open: std::sync::atomic::AtomicBool::new(false),
             circuit_open_time: Mutex::new(None),
@@ -336,7 +384,8 @@ impl EndpointState {
             .is_ok();
         if reserved {
             self.total_requests.fetch_add(1, Ordering::Relaxed);
-            *self.last_selected.lock() = Instant::now();
+            self.last_selected
+                .store(lb_now_nanos_since_baseline(), Ordering::Relaxed);
         }
         reserved
     }

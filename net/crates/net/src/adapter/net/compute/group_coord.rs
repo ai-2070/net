@@ -4,7 +4,7 @@
 //! can reuse the same load balancing, health tracking, member management,
 //! and scaling mechanics without duplication.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::adapter::net::behavior::capability::CapabilityFilter;
 use crate::adapter::net::behavior::loadbalance::{
@@ -102,6 +102,19 @@ impl From<DaemonError> for GroupError {
 pub struct GroupCoordinator {
     /// Per-member state, indexed by member index.
     pub members: Vec<MemberInfo>,
+    /// Reverse index: `entity_id_bytes -> origin_hash`.
+    ///
+    /// Pre-fix `origin_hash_for_entity_id` (called per routed event
+    /// after the load balancer picks an endpoint) ran a linear scan
+    /// over `members`, comparing 32-byte `NodeId`s. For a 100-member
+    /// group at 100K events/sec, that's 10M × 32-byte equality checks
+    /// per second just to translate an LB-returned entity id back
+    /// into the origin_hash the registry needs.
+    ///
+    /// Maintained alongside `members` on `add_member` / `remove_last`
+    /// / `update_member_placement` so the per-event lookup becomes a
+    /// single O(1) HashMap probe. Per perf #152.
+    origin_hash_by_entity_id: HashMap<NodeId, u64>,
     /// Load balancer for routing events to healthy members.
     pub lb: LoadBalancer,
 }
@@ -111,6 +124,7 @@ impl GroupCoordinator {
     pub fn new(strategy: Strategy) -> Self {
         Self {
             members: Vec::new(),
+            origin_hash_by_entity_id: HashMap::new(),
             lb: LoadBalancer::with_strategy(strategy),
         }
     }
@@ -118,6 +132,8 @@ impl GroupCoordinator {
     /// Add a member that has already been registered in the DaemonRegistry.
     pub fn add_member(&mut self, info: MemberInfo) {
         self.lb.add_endpoint(Endpoint::new(info.entity_id_bytes));
+        self.origin_hash_by_entity_id
+            .insert(info.entity_id_bytes, info.origin_hash);
         self.members.push(info);
     }
 
@@ -128,6 +144,7 @@ impl GroupCoordinator {
     pub fn remove_last(&mut self) -> Option<MemberInfo> {
         let info = self.members.pop()?;
         self.lb.remove_endpoint(&info.entity_id_bytes);
+        self.origin_hash_by_entity_id.remove(&info.entity_id_bytes);
         Some(info)
     }
 
@@ -146,19 +163,33 @@ impl GroupCoordinator {
 
     /// Mark a member unhealthy in the LoadBalancer.
     pub fn mark_unhealthy(&mut self, index: u8) {
-        if let Some(member) = self.members.iter_mut().find(|m| m.index == index) {
-            member.healthy = false;
-            self.lb
-                .update_health(&member.entity_id_bytes, HealthStatus::Unhealthy);
+        // Members are pushed in dense `0..n` order at construction
+        // and scale-up time, so `member.index` equals its position in
+        // `self.members`. Direct array access is O(1) instead of the
+        // legacy linear `find` over `member.index == index`. Per
+        // perf #158. The `index == idx` re-check guards a future
+        // change that violates the dense-index invariant — if the
+        // assumption ever breaks, the slow path of "do nothing" is
+        // strictly safer than acting on the wrong member.
+        if let Some(member) = self.members.get_mut(index as usize) {
+            if member.index == index {
+                member.healthy = false;
+                self.lb
+                    .update_health(&member.entity_id_bytes, HealthStatus::Unhealthy);
+            }
         }
     }
 
     /// Mark a member healthy in the LoadBalancer.
     pub fn mark_healthy(&mut self, index: u8) {
-        if let Some(member) = self.members.iter_mut().find(|m| m.index == index) {
-            member.healthy = true;
-            self.lb
-                .update_health(&member.entity_id_bytes, HealthStatus::Healthy);
+        // See `mark_unhealthy` for the dense-index invariant.
+        // Per perf #158.
+        if let Some(member) = self.members.get_mut(index as usize) {
+            if member.index == index {
+                member.healthy = true;
+                self.lb
+                    .update_health(&member.entity_id_bytes, HealthStatus::Healthy);
+            }
         }
     }
 
@@ -171,13 +202,25 @@ impl GroupCoordinator {
         new_node_id: u64,
         new_entity_id_bytes: NodeId,
     ) {
-        if let Some(member) = self.members.iter_mut().find(|m| m.index == index) {
+        // Same dense-index invariant as `mark_healthy`. Per perf #158.
+        if let Some(member) = self.members.get_mut(index as usize) {
+            if member.index != index {
+                return;
+            }
             // Remove old endpoint, add new one
             self.lb.remove_endpoint(&member.entity_id_bytes);
+            let old_entity_id = member.entity_id_bytes;
+            let origin_hash = member.origin_hash;
             member.node_id = new_node_id;
             member.entity_id_bytes = new_entity_id_bytes;
             member.healthy = true;
             self.lb.add_endpoint(Endpoint::new(new_entity_id_bytes));
+            // Keep `origin_hash_by_entity_id` consistent with the
+            // member's new `entity_id_bytes` so the perf #152 O(1)
+            // route_event lookup stays valid after recovery.
+            self.origin_hash_by_entity_id.remove(&old_entity_id);
+            self.origin_hash_by_entity_id
+                .insert(new_entity_id_bytes, origin_hash);
         }
     }
 
@@ -247,11 +290,12 @@ impl GroupCoordinator {
     }
 
     /// Look up origin_hash from a LoadBalancer entity ID.
+    ///
+    /// O(1) via `origin_hash_by_entity_id` instead of the legacy
+    /// linear scan over `members` (32-byte `NodeId` equality per
+    /// candidate). Per perf #152.
     fn origin_hash_for_entity_id(&self, entity_id: &NodeId) -> Option<u64> {
-        self.members
-            .iter()
-            .find(|m| m.entity_id_bytes == *entity_id)
-            .map(|m| m.origin_hash)
+        self.origin_hash_by_entity_id.get(entity_id).copied()
     }
 
     /// Place a daemon with best-effort spread across nodes.
@@ -606,5 +650,112 @@ mod tests {
         // Local node (first in list) preferred.
         assert_eq!(decision.node_id, 0x1111);
         assert_eq!(decision.reason, PlacementReason::LocalPreferred);
+    }
+
+    fn make_member(index: u8, origin_hash: u64) -> MemberInfo {
+        // `entity_id_bytes` is the routing key the LB returns; encode
+        // the index in the first byte so each member has a distinct
+        // 32-byte NodeId. `origin_hash` is what `origin_hash_for_entity_id`
+        // must round-trip back to.
+        let mut entity = [0u8; 32];
+        entity[0] = index;
+        MemberInfo {
+            index,
+            origin_hash,
+            node_id: 0xA000 | index as u64,
+            entity_id_bytes: entity,
+            healthy: true,
+        }
+    }
+
+    /// Pin #152: `origin_hash_for_entity_id` must resolve via the
+    /// O(1) reverse index and stay correct after `add_member` /
+    /// `remove_last` / `update_member_placement` mutations. Regression
+    /// guard against re-introducing the linear `members.iter().find()`
+    /// or letting the reverse index drift out of sync with `members`.
+    #[test]
+    fn origin_hash_lookup_uses_reverse_index_across_mutations() {
+        let mut coord = GroupCoordinator::new(Strategy::RoundRobin);
+        let m0 = make_member(0, 0xA1);
+        let m1 = make_member(1, 0xA2);
+        let m2 = make_member(2, 0xA3);
+        coord.add_member(m0.clone());
+        coord.add_member(m1.clone());
+        coord.add_member(m2.clone());
+
+        assert_eq!(
+            coord.origin_hash_for_entity_id(&m0.entity_id_bytes),
+            Some(0xA1)
+        );
+        assert_eq!(
+            coord.origin_hash_for_entity_id(&m1.entity_id_bytes),
+            Some(0xA2)
+        );
+        assert_eq!(
+            coord.origin_hash_for_entity_id(&m2.entity_id_bytes),
+            Some(0xA3)
+        );
+        // Unknown entity_id resolves to None.
+        let mut stranger = [0u8; 32];
+        stranger[0] = 0xFE;
+        assert_eq!(coord.origin_hash_for_entity_id(&stranger), None);
+
+        // Remove the tail, lookup for it must clear.
+        let removed = coord.remove_last().expect("pop returns the tail");
+        assert_eq!(removed.origin_hash, 0xA3);
+        assert_eq!(
+            coord.origin_hash_for_entity_id(&m2.entity_id_bytes),
+            None,
+            "remove_last must clear the reverse-index entry"
+        );
+
+        // Update the placement of member 0 to a fresh entity_id —
+        // the reverse index must drop the stale key AND insert the
+        // new one.
+        let mut new_entity = [0u8; 32];
+        new_entity[0] = 0xC0;
+        new_entity[1] = 0x01;
+        coord.update_member_placement(0, 0xBEEF, new_entity);
+        assert_eq!(
+            coord.origin_hash_for_entity_id(&m0.entity_id_bytes),
+            None,
+            "stale entity_id must be evicted from the reverse index"
+        );
+        assert_eq!(
+            coord.origin_hash_for_entity_id(&new_entity),
+            Some(0xA1),
+            "new entity_id must resolve to the same origin_hash"
+        );
+    }
+
+    /// Pin #158: `mark_healthy` / `mark_unhealthy` must reach the
+    /// member at `members[index]` (dense-index invariant from the
+    /// `0..n` construction loops in replica_group / fork_group /
+    /// standby_group) and ignore an `index` that lies past the end of
+    /// the vec rather than spinning over the legacy `find` linear scan.
+    /// Regression guard against a Vec reordering that breaks the
+    /// dense-index assumption.
+    #[test]
+    fn mark_health_resolves_via_direct_index() {
+        let mut coord = GroupCoordinator::new(Strategy::RoundRobin);
+        coord.add_member(make_member(0, 0xA1));
+        coord.add_member(make_member(1, 0xA2));
+        coord.add_member(make_member(2, 0xA3));
+
+        // All members start healthy.
+        assert!(coord.members[1].healthy);
+
+        coord.mark_unhealthy(1);
+        assert!(!coord.members[1].healthy);
+
+        coord.mark_healthy(1);
+        assert!(coord.members[1].healthy);
+
+        // Out-of-range index is a no-op (not a panic, not silently
+        // mutating member 0).
+        coord.mark_unhealthy(99);
+        assert!(coord.members[0].healthy);
+        assert!(coord.members[1].healthy);
+        assert!(coord.members[2].healthy);
     }
 }
