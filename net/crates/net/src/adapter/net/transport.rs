@@ -147,32 +147,42 @@ impl NetSocket {
         self.socket.send(packet).await
     }
 
-    /// Receive a packet, returning the data and source address
+    /// Receive a packet, returning the data and source address.
+    ///
+    /// Routes through tokio's `recv_buf_from(&mut BufMut)` for the same
+    /// reason as [`PacketReceiver::recv`] (crypto-session perf #130): the
+    /// legacy `resize(MAX_PACKET_SIZE, 0)` + `recv_from(&mut [u8])` shape
+    /// memset ~1500 bytes per packet only for the kernel to overwrite them
+    /// on the next syscall. `recv_buf_from` writes directly into the
+    /// `BytesMut`'s spare capacity, so the kernel's bytes are the first
+    /// writers and no pre-init is needed.
     pub async fn recv_from(&mut self) -> io::Result<(Bytes, SocketAddr)> {
-        self.recv_buf.resize(MAX_PACKET_SIZE, 0);
-        let (len, addr) = self.socket.recv_from(&mut self.recv_buf).await?;
-        self.recv_buf.truncate(len);
-
+        self.recv_buf.clear();
+        self.recv_buf.reserve(MAX_PACKET_SIZE);
+        let (_len, addr) = self.socket.recv_buf_from(&mut self.recv_buf).await?;
         Ok((self.recv_buf.split().freeze(), addr))
     }
 
-    /// Receive a packet from the connected address
+    /// Receive a packet from the connected address.
+    ///
+    /// Routes through tokio's `recv_buf(&mut BufMut)` for the same reason
+    /// as [`Self::recv_from`] — see that method's docs.
     pub async fn recv(&mut self) -> io::Result<Bytes> {
-        self.recv_buf.resize(MAX_PACKET_SIZE, 0);
-        let len = self.socket.recv(&mut self.recv_buf).await?;
-        self.recv_buf.truncate(len);
-
+        self.recv_buf.clear();
+        self.recv_buf.reserve(MAX_PACKET_SIZE);
+        let _len = self.socket.recv_buf(&mut self.recv_buf).await?;
         Ok(self.recv_buf.split().freeze())
     }
 
-    /// Try to receive a packet without blocking
+    /// Try to receive a packet without blocking.
+    ///
+    /// Routes through tokio's `try_recv_buf_from(&mut BufMut)` for the
+    /// same reason as [`Self::recv_from`] — see that method's docs.
     pub fn try_recv_from(&mut self) -> io::Result<Option<(Bytes, SocketAddr)>> {
-        self.recv_buf.resize(MAX_PACKET_SIZE, 0);
-        match self.socket.try_recv_from(&mut self.recv_buf) {
-            Ok((len, addr)) => {
-                self.recv_buf.truncate(len);
-                Ok(Some((self.recv_buf.split().freeze(), addr)))
-            }
+        self.recv_buf.clear();
+        self.recv_buf.reserve(MAX_PACKET_SIZE);
+        match self.socket.try_recv_buf_from(&mut self.recv_buf) {
+            Ok((_len, addr)) => Ok(Some((self.recv_buf.split().freeze(), addr))),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e),
         }
@@ -589,6 +599,131 @@ mod tests {
              pre-fix this memset ~1500 bytes per packet only for the kernel to \
              overwrite them immediately. Body: {body}"
         );
+    }
+
+    /// Source pin: the three `NetSocket` receive entry points
+    /// (`recv_from`, `recv`, `try_recv_from`) MUST route through
+    /// tokio's `*_buf*` family (which appends to a `BufMut`'s spare
+    /// capacity) and MUST NOT `resize(N, 0)` on the receive buffer.
+    /// Same rationale as the `PacketReceiver::recv` pin above
+    /// (crypto-session perf #130): pre-fix each call paid ~1500 bytes
+    /// of memset bandwidth per packet only for the kernel to overwrite
+    /// the same bytes immediately. These `NetSocket` methods were
+    /// sibling code in the same file and were missed by the original
+    /// fix; the pin guards against a "simplification" PR that flips
+    /// any of them back to the legacy shape.
+    ///
+    /// Per the same runtime-built-needle pattern as
+    /// `batched_recv_must_use_set_len_not_resize_zero` in `linux.rs`,
+    /// the bad needle is assembled at runtime from the template
+    /// `"resize({}, 0)"` and the identifier `"MAX_PACKET_SIZE"` so
+    /// this test's own assertion strings don't self-match in the
+    /// inspected source.
+    #[test]
+    fn net_socket_recv_methods_must_use_recv_buf_family_not_resize_zero() {
+        let src = include_str!("transport.rs");
+        let src_no_comments: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let impl_start = src_no_comments
+            .find("impl NetSocket {")
+            .expect("impl NetSocket block must exist");
+        let impl_rest = &src_no_comments[impl_start..];
+        let impl_end = impl_rest
+            .find("\nimpl ")
+            .map(|i| impl_start + 1 + i)
+            .unwrap_or(src_no_comments.len());
+        let impl_body = &src_no_comments[impl_start..impl_end];
+
+        let bad_needle = format!("resize({}, 0)", "MAX_PACKET_SIZE");
+        assert!(
+            !impl_body.contains(&bad_needle),
+            "regression: NetSocket receive methods must NOT pre-zero \
+             the recv buffer per crypto-session perf #130; pre-fix the \
+             memset of ~1500 bytes per packet only existed for the \
+             kernel to overwrite the same bytes immediately."
+        );
+
+        for needle in ["recv_buf_from", "recv_buf(", "try_recv_buf_from"] {
+            assert!(
+                impl_body.contains(needle),
+                "regression: NetSocket impl must route receive through \
+                 tokio's `{needle}` (BufMut spare-capacity API); falling \
+                 back to the `&mut [u8]` family requires pre-zeroing \
+                 the buffer."
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn net_socket_recv_from_round_trips_loopback_datagram() {
+        let mut a = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let a_addr = a.local_addr();
+
+        b.send_to(b"hello-recv_from", a_addr).await.unwrap();
+
+        let (data, from) = tokio::time::timeout(std::time::Duration::from_secs(2), a.recv_from())
+            .await
+            .expect("recv_from did not return within 2 s")
+            .expect("recv_from failed");
+
+        assert_eq!(&data[..], b"hello-recv_from");
+        assert_eq!(from, b.local_addr());
+    }
+
+    #[tokio::test]
+    async fn net_socket_recv_round_trips_loopback_datagram() {
+        let mut a = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let a_addr = a.local_addr();
+        let b_addr = b.local_addr();
+
+        a.connect(b_addr).await.unwrap();
+        b.send_to(b"hello-recv", a_addr).await.unwrap();
+
+        let data = tokio::time::timeout(std::time::Duration::from_secs(2), a.recv())
+            .await
+            .expect("recv did not return within 2 s")
+            .expect("recv failed");
+
+        assert_eq!(&data[..], b"hello-recv");
+    }
+
+    #[tokio::test]
+    async fn net_socket_try_recv_from_returns_none_when_empty_and_data_when_ready() {
+        let mut a = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let a_addr = a.local_addr();
+
+        assert!(
+            matches!(a.try_recv_from(), Ok(None)),
+            "try_recv_from on an empty socket must return Ok(None) \
+             (WouldBlock mapped to None)"
+        );
+
+        b.send_to(b"hello-try_recv_from", a_addr).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match a.try_recv_from() {
+                Ok(Some((data, from))) => {
+                    assert_eq!(&data[..], b"hello-try_recv_from");
+                    assert_eq!(from, b.local_addr());
+                    break;
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("try_recv_from did not observe loopback datagram within 2 s");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("try_recv_from errored: {e}"),
+            }
+        }
     }
 
     #[tokio::test]
