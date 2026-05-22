@@ -20,6 +20,7 @@ use serde::Serialize;
 
 pub mod audit;
 pub mod capability;
+pub mod capability_bridge;
 pub mod dispatch;
 pub mod expiry;
 pub mod metrics;

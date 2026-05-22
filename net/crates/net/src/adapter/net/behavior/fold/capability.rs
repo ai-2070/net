@@ -68,6 +68,10 @@ pub struct HardwareSummary {
     pub gpu_count: u8,
     /// System memory in gigabytes. `None` if unknown.
     pub memory_gb: Option<u32>,
+    /// Total GPU video memory in gigabytes (sum across all
+    /// installed GPUs). `None` if the node has no GPU or the
+    /// publisher didn't fill it.
+    pub vram_gb: Option<u32>,
 }
 
 /// Wire payload for one capability announcement. The publisher
