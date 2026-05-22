@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/behavior/fold/reservation.rs
+  s_947eb728f006db::t_b0dac951686f89 676-681,696,707
+  s_947eb728f006db::t_599e5e75bec334 1-675,682-695,697-706,708-1122
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_947eb728f006db::t_eabf920f50c003 49
+  s_947eb728f006db::t_1d48a2a372cfc6 65-68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "cc107b6ef3dc1d44adf1a68857bbec84105c9bd9",
+  "prompts": {},
+  "sessions": {
+    "s_947eb728f006db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fe2a7b6-f937-436c-8c36-6580a8be4344",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
