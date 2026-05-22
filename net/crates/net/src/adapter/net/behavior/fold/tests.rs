@@ -444,3 +444,273 @@ fn metrics_counts_track_apply_outcomes_and_query_count() {
     });
     assert_eq!(m.queries(), 1);
 }
+
+// ---------------------------------------------------------------------
+// Phase 2: wire codec + sign/verify + dispatch routing
+// ---------------------------------------------------------------------
+
+use std::sync::Arc;
+
+use crate::adapter::net::identity::EntityKeypair;
+
+use super::announcement::placeholder_signature;
+use super::dispatch::{DispatchError, FoldRegistry};
+use super::wire::WireError;
+
+fn sign_cap_ann(
+    keypair: &EntityKeypair,
+    node_id: NodeId,
+    class: u64,
+    generation: u64,
+    tags: Vec<&str>,
+) -> SignedAnnouncement<CapPayload> {
+    SignedAnnouncement::sign(
+        keypair,
+        CapFold::KIND_ID,
+        class,
+        node_id,
+        generation,
+        0,
+        None,
+        0,
+        CapPayload {
+            class_hash: class,
+            tags: tags.into_iter().map(String::from).collect(),
+        },
+    )
+    .expect("sign succeeds with valid payload")
+}
+
+#[test]
+fn signed_announcement_round_trips_through_postcard_encode_decode() {
+    let kp = EntityKeypair::generate();
+    let ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu", "h100"]);
+
+    let bytes = ann.encode().expect("encode");
+    let decoded = SignedAnnouncement::<CapPayload>::decode(&bytes).expect("decode");
+
+    assert_eq!(decoded.kind, ann.kind);
+    assert_eq!(decoded.class, ann.class);
+    assert_eq!(decoded.node_id, ann.node_id);
+    assert_eq!(decoded.generation, ann.generation);
+    assert_eq!(decoded.announced_at, ann.announced_at);
+    assert_eq!(decoded.ttl_secs, ann.ttl_secs);
+    assert_eq!(decoded.flags, ann.flags);
+    assert_eq!(decoded.payload, ann.payload);
+    assert_eq!(decoded.signature, ann.signature);
+}
+
+#[test]
+fn signature_verifies_against_publisher_identity() {
+    let kp = EntityKeypair::generate();
+    let ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    ann.verify(kp.entity_id()).expect("verify must accept untampered envelope");
+}
+
+#[test]
+fn verify_rejects_signature_from_a_different_keypair() {
+    let signer = EntityKeypair::generate();
+    let imposter = EntityKeypair::generate();
+    let ann = sign_cap_ann(&signer, 0x42, 0x1000, 1, vec!["gpu"]);
+    // Verifying against a DIFFERENT identity must fail —
+    // otherwise impersonation is trivial.
+    match ann.verify(imposter.entity_id()) {
+        Err(WireError::InvalidSignature) => {}
+        other => panic!("expected InvalidSignature, got {other:?}"),
+    }
+}
+
+#[test]
+fn verify_rejects_tampered_payload() {
+    let kp = EntityKeypair::generate();
+    let mut ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    // Tamper: swap a tag. The signing bytes change but the
+    // signature doesn't — verify must reject.
+    ann.payload.tags = vec!["malicious-tag".into()];
+    match ann.verify(kp.entity_id()) {
+        Err(WireError::InvalidSignature) => {}
+        other => panic!("expected InvalidSignature, got {other:?}"),
+    }
+}
+
+#[test]
+fn verify_rejects_placeholder_signature_sentinel() {
+    // The Phase-1 placeholder constructor stamps an all-zero
+    // signature. The Phase-2 verifier must catch this BEFORE
+    // running the Ed25519 algorithm so unsigned envelopes can't
+    // sneak through with a coincidentally-valid zero signature
+    // (vanishingly unlikely but explicitly guarded).
+    let kp = EntityKeypair::generate();
+    let ann = cap_announcement(0x42, 0x1000, 1, vec!["gpu"]);
+    assert_eq!(ann.signature, placeholder_signature());
+    match ann.verify(kp.entity_id()) {
+        Err(WireError::PlaceholderSignature) => {}
+        other => panic!("expected PlaceholderSignature, got {other:?}"),
+    }
+}
+
+#[test]
+fn verify_rejects_signature_of_wrong_length() {
+    let kp = EntityKeypair::generate();
+    let mut ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    // Truncate the signature.
+    ann.signature.pop();
+    match ann.verify(kp.entity_id()) {
+        Err(WireError::BadSignatureLength(len)) => assert_eq!(len, 63),
+        other => panic!("expected BadSignatureLength, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_and_verify_drives_the_dispatch_hot_path() {
+    let kp = EntityKeypair::generate();
+    let ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    let bytes = ann.encode().expect("encode");
+    let verified = SignedAnnouncement::<CapPayload>::decode_and_verify(&bytes, kp.entity_id())
+        .expect("decode + verify must succeed for a freshly-signed envelope");
+    assert_eq!(verified.node_id, 0x42);
+    assert_eq!(verified.payload.tags, vec!["gpu".to_string()]);
+}
+
+#[test]
+fn fold_registry_routes_envelope_to_correct_fold_by_kind() {
+    let registry = FoldRegistry::new();
+    let cap_fold: Arc<Fold<CapFold>> = Arc::new(Fold::new());
+    let route_fold: Arc<Fold<RoutingTestFold>> = Arc::new(Fold::new());
+    registry.register(cap_fold.clone());
+    registry.register(route_fold.clone());
+
+    assert_eq!(registry.len(), 2);
+    assert!(registry.get(CapFold::KIND_ID).is_some());
+    assert!(registry.get(RoutingTestFold::KIND_ID).is_some());
+    assert!(registry.get(0xBADD).is_none());
+
+    let kp = EntityKeypair::generate();
+    let cap_ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu", "h100"]);
+    let cap_bytes = cap_ann.encode().expect("encode");
+
+    let outcome = registry
+        .dispatch(&cap_bytes, kp.entity_id())
+        .expect("dispatch succeeds");
+    assert_eq!(outcome, ApplyOutcome::Inserted);
+
+    // The capability fold saw the apply; the routing fold did NOT.
+    assert_eq!(cap_fold.metrics().applies_inserted(), 1);
+    assert_eq!(route_fold.metrics().applies_inserted(), 0);
+
+    // Query against the cap fold confirms the dispatch reached
+    // the right typed apply path.
+    let hits = cap_fold.query(CapQuery {
+        class: 0x1000,
+        required_tag: Some("h100".into()),
+    });
+    assert_eq!(hits, vec![(0x1000, 0x42)]);
+}
+
+#[test]
+fn registry_rejects_envelope_for_unknown_kind() {
+    let registry = FoldRegistry::new();
+    let kp = EntityKeypair::generate();
+    let ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    let bytes = ann.encode().expect("encode");
+
+    // No fold registered → UnknownKind.
+    match registry.dispatch(&bytes, kp.entity_id()) {
+        Err(DispatchError::UnknownKind(k)) => assert_eq!(k, CapFold::KIND_ID),
+        other => panic!("expected UnknownKind, got {other:?}"),
+    }
+}
+
+#[test]
+fn registry_rejects_truncated_envelope() {
+    let registry = FoldRegistry::new();
+    let kp = EntityKeypair::generate();
+
+    // Empty buffer: no kind varint at all.
+    match registry.dispatch(b"", kp.entity_id()) {
+        Err(DispatchError::Truncated) => {}
+        other => panic!("empty: expected Truncated, got {other:?}"),
+    }
+
+    // `0x80` is a varint continuation byte (high bit set)
+    // promising at least one more byte that isn't there. postcard
+    // refuses to take a u16 from this — Truncated.
+    match registry.dispatch(b"\x80", kp.entity_id()) {
+        Err(DispatchError::Truncated) => {}
+        other => panic!("mid-varint: expected Truncated, got {other:?}"),
+    }
+}
+
+#[test]
+fn registry_rejects_envelope_whose_kind_disagrees_with_routed_fold() {
+    // Construct an envelope whose wire `kind` bytes route to
+    // the cap fold, but tamper the in-payload `kind` to claim a
+    // different fold. After verify-and-decode the dispatch
+    // adapter must catch the mismatch.
+    //
+    // We do this by signing two different kinds against the
+    // same payload and shipping the WRONG bytes:
+    //   - Envelope A: `kind = CapFold::KIND_ID`, payload tags
+    //   - Decode body claims `kind = 0xFFFF` (mismatched)
+    //
+    // To keep verify happy we need to actually sign the
+    // mismatched form. We do that by hand-constructing the
+    // envelope with mismatched kind and signing over THOSE
+    // bytes — then route via the cap-fold dispatcher by calling
+    // its dispatch directly.
+    let registry = FoldRegistry::new();
+    let cap_fold: Arc<Fold<CapFold>> = Arc::new(Fold::new());
+    registry.register(cap_fold.clone());
+
+    let kp = EntityKeypair::generate();
+    // Sign an envelope whose `kind` field is NOT CapFold::KIND_ID.
+    let foreign = SignedAnnouncement::sign(
+        &kp,
+        0xFFFF, // wrong kind
+        0x1000,
+        0x42,
+        1,
+        0,
+        None,
+        0,
+        CapPayload {
+            class_hash: 0x1000,
+            tags: vec!["gpu".into()],
+        },
+    )
+    .expect("sign");
+    let bytes = foreign.encode().expect("encode");
+
+    // The registry's lookup keys on the wire `kind` u16 — since
+    // the envelope claims 0xFFFF, the registry doesn't find a
+    // fold and returns UnknownKind. The KindMismatch path fires
+    // when the adapter is invoked directly with bytes whose
+    // wire kind matches the dispatcher but whose envelope kind
+    // doesn't — which is only constructable via a manual
+    // adapter call:
+    let adapter = registry
+        .get(CapFold::KIND_ID)
+        .expect("cap fold registered");
+    match adapter.dispatch(&bytes, kp.entity_id()) {
+        Err(WireError::KindMismatch { got, expected }) => {
+            assert_eq!(got, 0xFFFF);
+            assert_eq!(expected, CapFold::KIND_ID);
+        }
+        other => panic!("expected KindMismatch, got {other:?}"),
+    }
+    // The cap fold's apply was NOT called (the mismatch caught
+    // the envelope before handoff).
+    assert_eq!(cap_fold.metrics().applies_inserted(), 0);
+}
+
+#[test]
+fn registry_can_deregister_a_fold() {
+    let registry = FoldRegistry::new();
+    let cap_fold: Arc<Fold<CapFold>> = Arc::new(Fold::new());
+    registry.register(cap_fold);
+    assert_eq!(registry.len(), 1);
+
+    let removed = registry.deregister(CapFold::KIND_ID);
+    assert!(removed.is_some());
+    assert!(registry.is_empty());
+}

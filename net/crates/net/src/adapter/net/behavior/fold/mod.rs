@@ -42,20 +42,24 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 pub mod announcement;
+pub mod dispatch;
 pub mod metrics;
 pub mod snapshot;
 pub mod state;
+pub mod wire;
 
 #[cfg(test)]
 mod tests;
 
 pub use announcement::SignedAnnouncement;
+pub use dispatch::{DispatchError, FoldDispatch, FoldDispatchAdapter, FoldRegistry};
 pub use metrics::FoldMetrics;
 pub use snapshot::{FoldSnapshot, FoldSnapshotEntry};
 pub use state::{
     ApplyOutcome, EntryTransition, FoldEntry, FoldError, FoldIndex, FoldState, MergeAction,
     NoIndex, NodeId,
 };
+pub use wire::WireError;
 
 /// One typed fold definition. Each concrete fold (capability,
 /// routing, reservation, future kinds) is a unit type that
