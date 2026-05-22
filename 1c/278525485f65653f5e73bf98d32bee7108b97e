@@ -1,0 +1,33 @@
+net/crates/net/src/adapter/net/cortex/memories/watch.rs
+  s_947eb728f006db::t_ba1154aa07d999 67
+  s_947eb728f006db::t_3872b0deb11255 29
+net/crates/net/src/adapter/net/cortex/memories/query.rs
+  s_947eb728f006db::t_280d77fad00c47 138
+  s_947eb728f006db::t_ad781e4f160f11 37-105,112
+  s_947eb728f006db::t_0718cab981956a 502-558
+  s_947eb728f006db::t_99a246c3327146 251
+net/crates/net/src/adapter/net/cortex/tasks/query.rs
+  s_947eb728f006db::t_0585e7d176f7bb 230
+  s_947eb728f006db::t_5058e541df48e3 131
+  s_947eb728f006db::t_7d0bcd04a98660 472-503
+  s_947eb728f006db::t_95c21f8d904c39 26-71,84
+net/crates/net/src/adapter/net/cortex/tasks/watch.rs
+  s_947eb728f006db::t_b0a94f227cdd60 90
+  s_947eb728f006db::t_db50468889e872 29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "1c278525485f65653f5e73bf98d32bee7108b97e",
+  "prompts": {},
+  "sessions": {
+    "s_947eb728f006db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fe2a7b6-f937-436c-8c36-6580a8be4344",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
