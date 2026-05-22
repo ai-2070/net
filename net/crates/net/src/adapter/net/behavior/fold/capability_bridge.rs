@@ -156,6 +156,30 @@ pub fn dual_apply(
     index.index(ann);
 }
 
+/// Synthesize a legacy [`CapabilitySet`](super::super::capability::CapabilitySet)
+/// for `node_id` from the fold's tag set. Carries tags only;
+/// the fold's [`CapabilityMembership`] doesn't model the legacy
+/// `metadata` BTreeMap, so consumers that read metadata from
+/// the returned set will see it empty. Callers that need
+/// metadata access should keep the legacy `CapabilityIndex::get`
+/// path until the fold payload is extended.
+///
+/// Returns an empty `CapabilitySet` when the publisher has no
+/// fold entries — matches the legacy `.unwrap_or_default()`
+/// fallback for subscribe-before-announce / cap-propagation
+/// races.
+pub fn synthesize_capability_set(
+    fold: &Fold<CapabilityFold>,
+    node_id: NodeId,
+) -> super::super::capability::CapabilitySet {
+    let tags = super::capability::capability_tags_for(fold, node_id);
+    let mut caps = super::super::capability::CapabilitySet::new();
+    for tag in tags {
+        caps = caps.add_tag(tag);
+    }
+    caps
+}
+
 /// Translate a legacy [`CapabilityAnnouncement`] into a
 /// fold-shaped [`SignedAnnouncement<CapabilityMembership>`]
 /// suitable for [`Fold::apply`] dual-population during the

@@ -6177,7 +6177,9 @@ impl MeshNode {
         //    if A also announces it: the cache may be stale after
         //    a NAT rebind, and A's self-report is the freshest
         //    observation from A's own perspective.
-        let Some(b_reflex) = ctx.capability_index.reflex_addr(req.target) else {
+        let Some(b_reflex) =
+            super::behavior::fold::reflex_addr_for(&ctx.capability_fold, req.target)
+        else {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
                 target = format!("{:#x}", req.target),
@@ -6582,11 +6584,17 @@ impl MeshNode {
             return (true, None);
         }
 
-        // Peer caps default to empty — subscribe-before-announce
-        // races return `None` from the index; we treat that as an
-        // empty capability set, which makes `subscribe_caps` filters
-        // fail closed.
-        let peer_caps = ctx.capability_index.get(from_node).unwrap_or_default();
+        // Peer caps synthesized from the fold's tag set for
+        // `from_node`. Subscribe-before-announce races resolve
+        // to an empty CapabilitySet (the publisher has no fold
+        // entries yet), which makes `subscribe_caps` filters
+        // fail closed — matches the legacy
+        // `capability_index.get(from_node).unwrap_or_default()`
+        // shape.
+        let peer_caps = super::behavior::fold::capability_bridge::synthesize_capability_set(
+            &ctx.capability_fold,
+            from_node,
+        );
 
         // Peer entity — load-bearing for `require_token`. Without
         // it we can't validate the subject. Missing entity +
