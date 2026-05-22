@@ -589,6 +589,10 @@ impl BlobRef {
     /// Post-fix `encoded_len` walks the structure measuring
     /// without allocating the output buffer — same byte count,
     /// no `Vec` churn.
+    #[expect(
+        clippy::expect_used,
+        reason = "ManifestBodyRef / TreeBodyRef are composed of sized Serialize types — `postcard::experimental::serialized_size` is infallible against them; mirrors the existing `#[expect]` on `encode()`"
+    )]
     pub fn encoded_len(&self) -> usize {
         match self {
             Self::Small { uri, .. } => BLOB_REF_SMALL_HEADER_LEN + uri.len(),
