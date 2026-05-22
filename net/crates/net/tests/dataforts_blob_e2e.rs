@@ -513,7 +513,7 @@ async fn gravity_migration_controller_fetches_hot_blob() {
         });
     let report = drive_blob_migration_tick(
         &local_caps_b,
-        node_b.capability_index().as_ref(),
+        node_b.capability_fold().as_ref(),
         &adapter_b,
         |_h| Some(payload.len() as u64),
     )
@@ -708,14 +708,14 @@ async fn three_node_parallel_migration_lands_blob_on_two_peers() {
         });
     let report_b = drive_blob_migration_tick(
         &local_caps_for_migrator,
-        node_b.capability_index().as_ref(),
+        node_b.capability_fold().as_ref(),
         &adapter_b,
         |_| Some(payload.len() as u64),
     )
     .await;
     let report_c = drive_blob_migration_tick(
         &local_caps_for_migrator,
-        node_c.capability_index().as_ref(),
+        node_c.capability_fold().as_ref(),
         &adapter_c,
         |_| Some(payload.len() as u64),
     )

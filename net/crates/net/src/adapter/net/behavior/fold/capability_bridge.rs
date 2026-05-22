@@ -168,14 +168,24 @@ pub fn dual_apply(
 /// fold entries — matches the legacy `.unwrap_or_default()`
 /// fallback for subscribe-before-announce / cap-propagation
 /// races.
+///
+/// Routes the per-tag parse through [`super::super::tag::Tag::parse`]
+/// (not `parse_user`) so reserved-prefix tags (`causal:`,
+/// `heat:`, `fork-of:`, `scope:`) round-trip cleanly into the
+/// `Tag::Reserved` variant. `parse_user` rejects reserved
+/// prefixes by design; the fold-side synthesis is operating on
+/// values the substrate already accepted, so we want the
+/// permissive parse.
 pub fn synthesize_capability_set(
     fold: &Fold<CapabilityFold>,
     node_id: NodeId,
 ) -> super::super::capability::CapabilitySet {
     let tags = super::capability::capability_tags_for(fold, node_id);
     let mut caps = super::super::capability::CapabilitySet::new();
-    for tag in tags {
-        caps = caps.add_tag(tag);
+    for s in tags {
+        if let Ok(tag) = super::super::tag::Tag::parse(&s) {
+            caps.tags.insert(tag);
+        }
     }
     caps
 }

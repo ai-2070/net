@@ -20,7 +20,10 @@
 
 use std::sync::Arc;
 
-use crate::adapter::net::behavior::capability::{CapabilityIndex, CapabilitySet};
+#[cfg(test)]
+use crate::adapter::net::behavior::capability::CapabilityIndex;
+use crate::adapter::net::behavior::capability::CapabilitySet;
+use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use crate::adapter::net::behavior::dataforts_capabilities::{
     GravityCapability, GreedyCapability, TopologyScope,
 };
@@ -181,21 +184,25 @@ pub struct BlobMigrationController<'a> {
     /// This node's advertised caps — read by
     /// `should_migrate_blob_to` for the local-side gate.
     pub local_caps: &'a CapabilitySet,
-    /// The capability index this node maintains. Walked once per
+    /// The capability fold this node maintains. Walked once per
     /// `candidates` call; the call is O(n_peers × n_tags_per_peer)
     /// and meant to run at the gravity tick cadence (every
-    /// `DataGravityPolicy::emit_interval`, not per-event).
-    pub capability_index: &'a CapabilityIndex,
+    /// `DataGravityPolicy::emit_interval`, not per-event). Phase
+    /// 3b: migrated off the legacy CapabilityIndex.
+    pub capability_fold: &'a Fold<CapabilityFold>,
 }
 
 impl<'a> BlobMigrationController<'a> {
     /// Build a controller view over `local_caps` + the supplied
-    /// capability index. No state is captured; the walk happens
+    /// capability fold. No state is captured; the walk happens
     /// inside `candidates`.
-    pub fn new(local_caps: &'a CapabilitySet, capability_index: &'a CapabilityIndex) -> Self {
+    pub fn new(
+        local_caps: &'a CapabilitySet,
+        capability_fold: &'a Fold<CapabilityFold>,
+    ) -> Self {
         Self {
             local_caps,
-            capability_index,
+            capability_fold,
         }
     }
 
@@ -244,11 +251,17 @@ impl<'a> BlobMigrationController<'a> {
         let mut peer_caps_cache: std::collections::HashMap<u64, CapabilitySet> =
             std::collections::HashMap::new();
 
-        for node_id in self.capability_index.all_nodes() {
-            let caps = match self.capability_index.get(node_id) {
-                Some(c) => c,
-                None => continue,
-            };
+        let publishers: Vec<u64> = self
+            .capability_fold
+            .with_state(|state| state.by_node.keys().copied().collect());
+        for node_id in publishers {
+            // Synthesize a tag-only CapabilitySet from the fold;
+            // the legacy walker's heat-tag parse + Gravity /
+            // Greedy projections all flow through tag inspection
+            // that round-trips identically through
+            // CapabilitySet::add_tag.
+            let caps =
+                capability_bridge::synthesize_capability_set(self.capability_fold, node_id);
             // Peer's typed scope claims (only valid when the
             // matching `enabled` flag is set; an unparticipating
             // peer makes no claim and is excluded from the floor).
@@ -414,7 +427,7 @@ impl BlobMigrationTickReport {
 /// "greedy-style" semantics of the rest of the dataforts layer.
 pub async fn drive_blob_migration_tick<A, F>(
     local_caps: &CapabilitySet,
-    capability_index: &CapabilityIndex,
+    capability_fold: &Fold<CapabilityFold>,
     adapter: &A,
     size_for_hash: F,
 ) -> BlobMigrationTickReport
@@ -422,7 +435,7 @@ where
     A: BlobAdapter + ?Sized,
     F: Fn([u8; 32]) -> Option<u64>,
 {
-    let controller = BlobMigrationController::new(local_caps, capability_index);
+    let controller = BlobMigrationController::new(local_caps, capability_fold);
     let candidates = controller.candidates();
     let mut report = BlobMigrationTickReport::default();
     // Per-peer admit count for this tick. Capped at
@@ -483,14 +496,14 @@ where
 /// trait-object call shape used elsewhere in this module.
 pub async fn drive_blob_migration_tick_arc<F>(
     local_caps: &CapabilitySet,
-    capability_index: &CapabilityIndex,
+    capability_fold: &Fold<CapabilityFold>,
     adapter: Arc<dyn BlobAdapter>,
     size_for_hash: F,
 ) -> BlobMigrationTickReport
 where
     F: Fn([u8; 32]) -> Option<u64>,
 {
-    drive_blob_migration_tick(local_caps, capability_index, &*adapter, size_for_hash).await
+    drive_blob_migration_tick(local_caps, capability_fold, &*adapter, size_for_hash).await
 }
 
 /// Manifest sibling list returned by an operator-supplied
@@ -540,7 +553,7 @@ pub type ManifestSiblings = Vec<([u8; 32], u64)>;
 /// capability tag family — outside this primitive's scope.
 pub async fn drive_blob_migration_tick_with_manifest_resolver<A, F, M>(
     local_caps: &CapabilitySet,
-    capability_index: &CapabilityIndex,
+    capability_fold: &Fold<CapabilityFold>,
     adapter: &A,
     size_for_hash: F,
     manifest_resolver: M,
@@ -550,7 +563,7 @@ where
     F: Fn([u8; 32]) -> Option<u64>,
     M: Fn([u8; 32]) -> Option<ManifestSiblings>,
 {
-    let controller = BlobMigrationController::new(local_caps, capability_index);
+    let controller = BlobMigrationController::new(local_caps, capability_fold);
     let candidates = controller.candidates();
     let mut report = BlobMigrationTickReport::default();
     // Dedup across candidate + sibling expansions so a *successful*
@@ -803,14 +816,15 @@ mod tests {
         peer_id: u64,
         peer_caps: CapabilitySet,
         peer_seed: u8,
-    ) -> CapabilityIndex {
+    ) -> (Fold<CapabilityFold>, CapabilityIndex) {
         let index = CapabilityIndex::new();
+        let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
         let entity = EntityId::from_bytes([peer_seed; 32]);
         let ann = crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
             peer_id, entity, 1, peer_caps,
         );
-        index.index(ann);
-        index
+        capability_bridge::dual_apply(&fold, &index, ann);
+        (fold, index)
     }
 
     #[test]
@@ -826,9 +840,9 @@ mod tests {
             prefix: "heat:".to_string(),
             body: format!("blob:{}=0.30", hex2),
         });
-        let index = index_with_peer_heat(99, peer_caps, 0xAA);
+        let (fold, _index) = index_with_peer_heat(99, peer_caps, 0xAA);
         let local = CapabilitySet::default();
-        let controller = BlobMigrationController::new(&local, &index);
+        let controller = BlobMigrationController::new(&local, &fold);
         let candidates = controller.candidates();
         assert_eq!(candidates.len(), 2);
         assert!(candidates
@@ -853,9 +867,9 @@ mod tests {
             prefix: "heat:".to_string(),
             body: "deadbeefcafebabe=0.50".to_string(),
         });
-        let index = index_with_peer_heat(7, peer_caps, 0xBB);
+        let (fold, _index) = index_with_peer_heat(7, peer_caps, 0xBB);
         let local = CapabilitySet::default();
-        let candidates = BlobMigrationController::new(&local, &index).candidates();
+        let candidates = BlobMigrationController::new(&local, &fold).candidates();
         assert!(candidates.is_empty());
     }
 
@@ -938,11 +952,11 @@ mod tests {
     #[tokio::test]
     async fn drive_tick_admits_and_calls_prefetch_on_participating_local() {
         let publisher_caps = publisher_caps_with_heat(0x10, "mesh", "0.75");
-        let index = index_with_peer_heat(99, publisher_caps, 0xAA);
+        let (fold, _index) = index_with_peer_heat(99, publisher_caps, 0xAA);
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
-        let report = drive_blob_migration_tick(&local, &index, &adapter, |_| Some(1024)).await;
+        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| Some(1024)).await;
         assert_eq!(report.admitted, 1);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(report.total_rejected(), 0);
@@ -952,7 +966,7 @@ mod tests {
     #[tokio::test]
     async fn drive_tick_rejects_when_local_lacks_blob_storage() {
         let publisher_caps = publisher_caps_with_heat(0x20, "mesh", "0.50");
-        let index = index_with_peer_heat(50, publisher_caps, 0xBB);
+        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xBB);
         // Local: no `dataforts.blob.storage` tag → NoStorageCap.
         let local = CapabilitySet::new()
             .add_tag("dataforts.gravity.enabled")
@@ -960,7 +974,7 @@ mod tests {
             .add_tag("dataforts.gravity.proximity=128");
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
-        let report = drive_blob_migration_tick(&local, &index, &adapter, |_| Some(1024)).await;
+        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| Some(1024)).await;
         assert_eq!(report.admitted, 0);
         assert_eq!(report.rejected_no_storage, 1);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -969,11 +983,11 @@ mod tests {
     #[tokio::test]
     async fn drive_tick_skips_when_size_resolver_returns_none() {
         let publisher_caps = publisher_caps_with_heat(0x30, "mesh", "0.40");
-        let index = index_with_peer_heat(50, publisher_caps, 0xCC);
+        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xCC);
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
-        let report = drive_blob_migration_tick(&local, &index, &adapter, |_| None).await;
+        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| None).await;
         assert_eq!(report.skipped_unknown_size, 1);
         assert_eq!(report.admitted, 0);
         assert_eq!(report.total_rejected(), 0);
@@ -983,11 +997,11 @@ mod tests {
     #[tokio::test]
     async fn drive_tick_counts_prefetch_errors_without_propagating() {
         let publisher_caps = publisher_caps_with_heat(0x40, "mesh", "0.90");
-        let index = index_with_peer_heat(50, publisher_caps, 0xDD);
+        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xDD);
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::failing();
         let calls = adapter.calls.clone();
-        let report = drive_blob_migration_tick(&local, &index, &adapter, |_| Some(1024)).await;
+        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| Some(1024)).await;
         assert_eq!(report.admitted, 0);
         assert_eq!(report.prefetch_errors, 1);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -1036,7 +1050,10 @@ mod tests {
             body: format!("blob:{}=0.40", hex),
         });
         let index = CapabilityIndex::new();
-        index.index(
+        let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
+        capability_bridge::dual_apply(
+            &fold,
+            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 10,
                 EntityId::from_bytes([0xAA; 32]),
@@ -1044,7 +1061,9 @@ mod tests {
                 publisher,
             ),
         );
-        index.index(
+        capability_bridge::dual_apply(
+            &fold,
+            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 20,
                 EntityId::from_bytes([0xBB; 32]),
@@ -1054,7 +1073,7 @@ mod tests {
         );
 
         let local = CapabilitySet::default();
-        let controller = BlobMigrationController::new(&local, &index);
+        let controller = BlobMigrationController::new(&local, &fold);
         let candidates = controller.candidates();
         assert_eq!(candidates.len(), 2);
         for c in &candidates {
@@ -1108,7 +1127,10 @@ mod tests {
             body: format!("blob:{}=0.30", hex),
         });
         let index = CapabilityIndex::new();
-        index.index(
+        let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
+        capability_bridge::dual_apply(
+            &fold,
+            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 30,
                 EntityId::from_bytes([0xCC; 32]),
@@ -1116,7 +1138,9 @@ mod tests {
                 publisher,
             ),
         );
-        index.index(
+        capability_bridge::dual_apply(
+            &fold,
+            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 40,
                 EntityId::from_bytes([0xDD; 32]),
@@ -1126,7 +1150,7 @@ mod tests {
         );
 
         let local = CapabilitySet::default();
-        let controller = BlobMigrationController::new(&local, &index);
+        let controller = BlobMigrationController::new(&local, &fold);
         let candidates = controller.candidates();
         for c in &candidates {
             let gravity = GravityCapability::from_capability_set(&c.publisher_caps);
@@ -1162,11 +1186,11 @@ mod tests {
                 body: format!("blob:{}=0.50", hex),
             });
         }
-        let index = index_with_peer_heat(77, publisher_caps, 0x77);
+        let (fold, _index) = index_with_peer_heat(77, publisher_caps, 0x77);
         let local = participating_local("mesh", 128, 1024);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
-        let report = drive_blob_migration_tick(&local, &index, &adapter, |_| Some(1024)).await;
+        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| Some(1024)).await;
 
         assert_eq!(
             report.admitted as usize, DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK,
@@ -1209,9 +1233,12 @@ mod tests {
         };
         let flood = DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK + 4;
         let index = CapabilityIndex::new();
+        let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
         let entity_a = EntityId::from_bytes([0xA1; 32]);
         let entity_b = EntityId::from_bytes([0xB2; 32]);
-        index.index(
+        capability_bridge::dual_apply(
+            &fold,
+            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 111,
                 entity_a,
@@ -1219,7 +1246,9 @@ mod tests {
                 make_caps_with_heat("mesh", 0xA0, flood),
             ),
         );
-        index.index(
+        capability_bridge::dual_apply(
+            &fold,
+            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 222,
                 entity_b,
@@ -1229,7 +1258,7 @@ mod tests {
         );
         let local = participating_local("mesh", 128, 1024);
         let adapter = PrefetchRecorder::new();
-        let report = drive_blob_migration_tick(&local, &index, &adapter, |_| Some(1024)).await;
+        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| Some(1024)).await;
 
         assert_eq!(
             report.admitted as usize,
@@ -1245,12 +1274,12 @@ mod tests {
     #[tokio::test]
     async fn drive_tick_rejects_when_disk_free_insufficient() {
         let publisher_caps = publisher_caps_with_heat(0x50, "mesh", "0.50");
-        let index = index_with_peer_heat(50, publisher_caps, 0xEE);
+        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xEE);
         // Local has only 1 GiB free; we ask for a 4 GiB blob.
         let local = participating_local("mesh", 128, 1);
         let adapter = PrefetchRecorder::new();
         let four_gib: u64 = 4 * (1 << 30);
-        let report = drive_blob_migration_tick(&local, &index, &adapter, |_| Some(four_gib)).await;
+        let report = drive_blob_migration_tick(&local, &fold,&adapter, |_| Some(four_gib)).await;
         assert_eq!(report.admitted, 0);
         assert_eq!(report.rejected_insufficient_disk, 1);
     }
@@ -1263,7 +1292,7 @@ mod tests {
         // the resolver returns the full sibling list; the
         // controller prefetches every chunk.
         let publisher_caps = publisher_caps_with_heat(0x60, "mesh", "0.50");
-        let index = index_with_peer_heat(50, publisher_caps, 0xFF);
+        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xFF);
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
@@ -1276,7 +1305,7 @@ mod tests {
 
         let report = drive_blob_migration_tick_with_manifest_resolver(
             &local,
-            &index,
+            &fold,
             &adapter,
             |_h| Some(1024),
             |h| {
@@ -1312,7 +1341,7 @@ mod tests {
             prefix: "heat:".to_string(),
             body: format!("blob:{}=0.30", sibling_hex),
         });
-        let index = index_with_peer_heat(99, publisher, 0xAB);
+        let (fold, _index) = index_with_peer_heat(99, publisher, 0xAB);
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
@@ -1321,7 +1350,7 @@ mod tests {
         // advertised — the controller must not double-prefetch.
         let report = drive_blob_migration_tick_with_manifest_resolver(
             &local,
-            &index,
+            &fold,
             &adapter,
             |_h| Some(1024),
             move |h| {
@@ -1347,14 +1376,14 @@ mod tests {
         // Equivalent to plain drive_blob_migration_tick when the
         // resolver always returns None.
         let publisher_caps = publisher_caps_with_heat(0x80, "mesh", "0.50");
-        let index = index_with_peer_heat(50, publisher_caps, 0xCD);
+        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xCD);
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
 
         let report = drive_blob_migration_tick_with_manifest_resolver(
             &local,
-            &index,
+            &fold,
             &adapter,
             |_h| Some(1024),
             |_h| None,
@@ -1370,7 +1399,7 @@ mod tests {
         // free; the rejection counts against the same per-reason
         // bucket the single-chunk path uses.
         let publisher_caps = publisher_caps_with_heat(0x90, "mesh", "0.50");
-        let index = index_with_peer_heat(50, publisher_caps, 0xEF);
+        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xEF);
         let local = participating_local("mesh", 128, 1); // 1 GiB free
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
@@ -1381,7 +1410,7 @@ mod tests {
 
         let report = drive_blob_migration_tick_with_manifest_resolver(
             &local,
-            &index,
+            &fold,
             &adapter,
             move |h| {
                 if h == sibling_hash {
@@ -1449,14 +1478,19 @@ mod tests {
             body: format!("blob:{}=0.50", b_hex),
         });
         let index = CapabilityIndex::new();
+        let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
         let entity_a = EntityId::from_bytes([0x11; 32]);
         let entity_b = EntityId::from_bytes([0x22; 32]);
-        index.index(
+        capability_bridge::dual_apply(
+            &fold,
+            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 100, entity_a, 1, a_caps,
             ),
         );
-        index.index(
+        capability_bridge::dual_apply(
+            &fold,
+            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 200, entity_b, 1, b_caps,
             ),
@@ -1477,7 +1511,7 @@ mod tests {
         let calls = adapter.calls.clone();
         let report = drive_blob_migration_tick_with_manifest_resolver(
             &local,
-            &index,
+            &fold,
             &adapter,
             move |h| {
                 if h == shared_sibling_hash {
