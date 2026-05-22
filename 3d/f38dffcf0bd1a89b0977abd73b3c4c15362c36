@@ -1,0 +1,38 @@
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_947eb728f006db::t_b2c083b89f8fab 1-93,99,103-271,284-469
+  s_947eb728f006db::t_cd285aa1483dd8 272-283
+  s_947eb728f006db::t_02f636aff671db 94-98,100-102
+net/crates/net/src/adapter/net/behavior/fold/metrics.rs
+  s_947eb728f006db::t_531a56fd832cb8 1-177
+net/crates/net/src/adapter/net/behavior/mod.rs
+  s_947eb728f006db::t_baf85214d7d9c5 23
+net/crates/net/src/adapter/net/behavior/fold/announcement.rs
+  s_947eb728f006db::t_4f96af147ba5ae 109-115
+  s_947eb728f006db::t_6682cf775b17b0 1-16,24-29,33-79,86-92,102-104,116-134,136-138
+  s_947eb728f006db::t_242bbaf05a1f27 93-101,105-108,135
+  s_947eb728f006db::t_02ae961101a799 17-23,30-32
+  s_947eb728f006db::t_9e382013074da2 80-85
+net/crates/net/src/adapter/net/behavior/fold/tests.rs
+  s_947eb728f006db::t_f42c41b7367949 1-446
+net/crates/net/src/adapter/net/behavior/fold/snapshot.rs
+  s_947eb728f006db::t_fc7747d430a663 1-150
+net/crates/net/src/adapter/net/behavior/fold/state.rs
+  s_947eb728f006db::t_476fd70f583d38 170-175,180,182,184,191,193,195,202,204,206,213-218
+  s_947eb728f006db::t_47d3e412a99f6e 1-169,176-179,181,183,185-190,192,194,196-201,203,205,207-212,219-301
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "3df38dffcf0bd1a89b0977abd73b3c4c15362c36",
+  "prompts": {},
+  "sessions": {
+    "s_947eb728f006db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fe2a7b6-f937-436c-8c36-6580a8be4344",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
