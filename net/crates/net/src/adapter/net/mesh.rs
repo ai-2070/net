@@ -4557,14 +4557,47 @@ impl MeshNode {
             std::sync::Arc<crate::adapter::net::behavior::capability::CapabilitySet>,
         > = if greedy.is_some() {
             let origin_hash: u64 = parsed.header.origin_hash.into();
-            if ctx.capability_index.is_origin_hash_ambiguous(origin_hash) {
+            // Resolve origin_hash → publisher via the new MeshNode-
+            // hosted slot. Three cases:
+            // - Ambiguous slot: truncation collision (adversarial).
+            //   chain_caps = None so observe_event is skipped — the
+            //   admission gates can't be tricked into running
+            //   against either claimant's caps.
+            // - Vacant slot: cap-propagation race (publisher
+            //   hasn't announced yet). chain_caps = empty so scope-
+            //   gated chains fail closed; intent + colocation
+            //   gates pass by default. Matches the pre-cutover
+            //   `get_by_origin_hash().unwrap_or_default()` shape.
+            // - Unique slot: read the publisher's tags off the
+            //   fold and synthesize a CapabilitySet for the gate.
+            //   The fold doesn't carry the legacy `metadata` map,
+            //   so intent + colocation gates pass-through; scope
+            //   gating works against the publisher's actual tags.
+            let publisher_node = ctx
+                .origin_hash_to_node
+                .get(&origin_hash)
+                .and_then(|slot| slot.unique());
+            let ambiguous = ctx
+                .origin_hash_to_node
+                .get(&origin_hash)
+                .map(|slot| slot.unique().is_none())
+                .unwrap_or(false);
+            if ambiguous {
                 None
             } else {
-                let publisher_caps = ctx
-                    .capability_index
-                    .get_by_origin_hash(origin_hash)
-                    .unwrap_or_default();
-                Some(std::sync::Arc::new(publisher_caps))
+                let tags = match publisher_node {
+                    Some(nid) => super::behavior::fold::capability_tags_for(
+                        &ctx.capability_fold,
+                        nid,
+                    ),
+                    None => Vec::new(),
+                };
+                let mut caps =
+                    crate::adapter::net::behavior::capability::CapabilitySet::new();
+                for tag in tags {
+                    caps = caps.add_tag(tag);
+                }
+                Some(std::sync::Arc::new(caps))
             }
         } else {
             None

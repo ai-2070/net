@@ -429,6 +429,32 @@ fn composite_query(
 #[allow(dead_code)]
 type _NoIndexAlias = NoIndex;
 
+/// Return the union of every tag this publisher has advertised
+/// across its [`CapabilityMembership`] class entries. Walks the
+/// publisher's `by_node` reverse index; O(num classes * tags
+/// per class), typically tiny. Used by the dataforts greedy
+/// admission path to feed the scope gate after origin_hash →
+/// node_id resolution.
+pub fn capability_tags_for(
+    fold: &super::Fold<CapabilityFold>,
+    node_id: NodeId,
+) -> Vec<String> {
+    fold.with_state(|state| {
+        let Some(keys) = state.by_node.get(&node_id) else {
+            return Vec::new();
+        };
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for key in keys {
+            if let Some(entry) = state.entries.get(key) {
+                for tag in &entry.payload.tags {
+                    seen.insert(tag.clone());
+                }
+            }
+        }
+        seen.into_iter().collect()
+    })
+}
+
 /// Return `node_id`'s last-advertised reflex `SocketAddr`, or
 /// `None` if no entry from that publisher carries one. Walks the
 /// publisher's class entries via the `by_node` reverse index;
