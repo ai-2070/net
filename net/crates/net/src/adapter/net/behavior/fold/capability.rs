@@ -113,17 +113,14 @@ pub struct CapabilityMembership {
     /// = unrestricted (permissive default). Union semantics with
     /// `allowed_subnets` and `allowed_groups`; the caller is
     /// admitted if it matches at least one populated axis.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_nodes: Vec<u64>,
     /// v0.4 capability-auth allow-list — caller subnets authorized
     /// to invoke this publisher's tags. Same union semantics as
     /// `allowed_nodes`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_subnets: Vec<super::super::subnet::SubnetId>,
     /// v0.4 capability-auth allow-list — caller groups authorized
     /// to invoke this publisher's tags. Same union semantics as
     /// `allowed_nodes`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_groups: Vec<super::super::group::GroupId>,
 }
 
