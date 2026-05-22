@@ -14,6 +14,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+pub(super) use super::super::needle::AsciiInsensitiveNeedle as ContentNeedle;
 use super::state::MemoriesState;
 use super::types::{Memory, MemoryId};
 
@@ -32,75 +33,6 @@ pub enum OrderBy {
     UpdatedAsc,
     /// By `updated_ns`, descending.
     UpdatedDesc,
-}
-
-/// Case-insensitive content-substring needle paired with the ASCII
-/// classification of the lowercased form. Per perf #81 — pre-fix
-/// the per-memory matcher called `m.content.to_lowercase()`, which
-/// allocates a fresh `String` and Unicode-case-folds every byte of
-/// the haystack on every match attempt. For a state with 100K
-/// memories and 4 KiB avg content that's ~400 MB of allocations
-/// plus 400 MB of case-folding per content search.
-///
-/// The fast path here is "needle is pure ASCII": ASCII
-/// [`str::to_lowercase`] is `eq_ignore_ascii_case` byte-for-byte
-/// (no Turkic dotless-I edge cases), and bytes ≥ 0x80 in the
-/// haystack never `eq_ignore_ascii_case` to any ASCII byte, so a
-/// byte-windowed `eq_ignore_ascii_case` scan over the haystack
-/// produces the same verdict as the legacy
-/// `haystack.to_lowercase().contains(needle)` — without
-/// allocating, without Unicode folding. ASCII-ness is a property
-/// of the needle (post-lowercase) so we precompute it once at
-/// filter-construction; the matcher reads a `bool`.
-///
-/// Non-ASCII needles still flow through the legacy
-/// `to_lowercase().contains(...)` path because the Unicode
-/// case-folding tables are the only correct way to handle
-/// non-ASCII inputs — but those queries are rare in practice
-/// (filter strings are typically `"GROCERY"`, `"tag"`, an email
-/// fragment, etc.). Same fast-path treatment is applied to
-/// `cortex/tasks/query.rs` by the same rationale.
-#[derive(Debug, Clone)]
-pub(super) struct ContentNeedle {
-    /// Lowercased form of the user-provided needle.
-    lowercased: String,
-    /// `true` iff `lowercased.is_ascii()`. Read by [`Self::matches`]
-    /// to choose the zero-alloc byte-windowed path.
-    is_ascii: bool,
-}
-
-impl ContentNeedle {
-    pub(super) fn new(needle: impl Into<String>) -> Self {
-        let lowercased = needle.into().to_lowercase();
-        let is_ascii = lowercased.is_ascii();
-        Self {
-            lowercased,
-            is_ascii,
-        }
-    }
-
-    /// True if `haystack` contains the needle case-insensitively.
-    /// Fast-paths pure-ASCII needles via `eq_ignore_ascii_case`
-    /// over haystack byte windows (zero allocation, no Unicode
-    /// folding); falls back to the legacy
-    /// `to_lowercase().contains(...)` shape for non-ASCII needles.
-    pub(super) fn matches(&self, haystack: &str) -> bool {
-        if self.is_ascii {
-            let h = haystack.as_bytes();
-            let n = self.lowercased.as_bytes();
-            // Empty needle matches every haystack — preserves the
-            // legacy `"".to_lowercase().contains("")` shape.
-            if n.is_empty() {
-                return true;
-            }
-            if h.len() < n.len() {
-                return false;
-            }
-            h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
-        } else {
-            haystack.to_lowercase().contains(&self.lowercased)
-        }
-    }
 }
 
 /// Filter / order / limit configuration. Shared by [`MemoriesQuery`]
@@ -497,63 +429,6 @@ mod tests {
             .map(|m| m.id)
             .collect();
         assert_eq!(ids, vec![2]);
-    }
-
-    /// Pin perf #81: `ContentNeedle::matches` must produce the
-    /// SAME verdict as the legacy
-    /// `haystack.to_lowercase().contains(&needle.to_lowercase())`
-    /// shape for every (needle, haystack) pair, regardless of
-    /// which branch (`is_ascii` fast path vs Unicode-folding
-    /// fallback) the matcher takes. A regression that splits the
-    /// two paths' semantics would silently break the public
-    /// `content_contains` builder for a subset of inputs — these
-    /// adapters back operator-visible search surfaces (the
-    /// Prisma-ish `MemoriesFilter`), so behavior drift here is
-    /// observable as "search box stopped finding rows it used to."
-    #[test]
-    fn content_needle_matches_legacy_to_lowercase_contains() {
-        // (needle, haystack) cases covering both the ASCII fast
-        // path and the Unicode-folding fallback. Each pair is
-        // checked against the legacy shape inline as the
-        // reference. The Unicode cases are deliberately the ones
-        // where `to_lowercase` produces real case-folds (ASCII
-        // mapping for the haystack body + ASCII needle still
-        // exercises the fast path; non-ASCII NEEDLE exercises the
-        // fallback).
-        let cases: &[(&str, &str)] = &[
-            // ASCII fast-path cases — needle is pure ASCII so the
-            // byte-windowed eq_ignore_ascii_case scan runs.
-            ("GROCERY", "Grocery shopping list"),
-            ("grocery", "Grocery shopping list"),
-            ("Grocery", "grocery shopping list"),
-            ("xyz", "Grocery shopping list"),
-            ("", "anything"),
-            ("longer than haystack", "short"),
-            // Empty haystack with non-empty needle → no match.
-            ("a", ""),
-            // ASCII needle, non-ASCII haystack. Bytes >= 0x80 in
-            // the haystack never `eq_ignore_ascii_case` to ASCII
-            // bytes, so non-ASCII positions are naturally
-            // rejected — matches legacy.
-            ("hello", "héllo world"),
-            ("world", "héllo world"),
-            // Fallback (non-ASCII needle) cases — needle is
-            // Unicode-folded by the slow path.
-            ("CAFÉ", "let's grab café tonight"),
-            ("café", "let's grab CAFÉ tonight"),
-            ("naïve", "a NAÏVE approach"),
-            ("Ω", "math symbols: Ω ω"),
-        ];
-        for (needle, haystack) in cases {
-            let reference = haystack
-                .to_lowercase()
-                .contains(&needle.to_lowercase());
-            let actual = ContentNeedle::new(*needle).matches(haystack);
-            assert_eq!(
-                actual, reference,
-                "ContentNeedle({needle:?}).matches({haystack:?}) diverged from legacy",
-            );
-        }
     }
 
     #[test]

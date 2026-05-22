@@ -473,7 +473,7 @@ impl RpcRequestPayload {
     /// frame would be rejected by the receiver — but constructing
     /// one is always a caller bug).
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(64 + self.body.len());
+        let mut buf = Vec::with_capacity(self.encoded_len());
         // service
         let svc = self.service.as_bytes();
         debug_assert!(
@@ -603,7 +603,7 @@ impl RpcRequestChunkPayload {
     /// oversize fields panic in debug, the decoder enforces in
     /// release.
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(32 + self.body.len());
+        let mut buf = Vec::with_capacity(self.encoded_len());
         // call_id
         buf.put_u64_le(self.call_id);
         // flags
@@ -689,7 +689,7 @@ impl RpcResponsePayload {
     /// Same encoder-bounds policy as
     /// [`RpcRequestPayload::encode`] — see that method's doc.
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(16 + self.body.len());
+        let mut buf = Vec::with_capacity(self.encoded_len());
         buf.put_u16_le(self.status.to_wire());
         encode_headers(&self.headers, &mut buf);
         debug_assert!(

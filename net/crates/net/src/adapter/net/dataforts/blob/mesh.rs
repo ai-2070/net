@@ -3018,58 +3018,15 @@ impl BlobAdapter for MeshBlobAdapter {
                         )));
                     }
                 }
-                // Parallel chunk store via `buffered(N)` per
-                // dataforts perf #173B (symmetric with #172 on the
-                // fetch side). Pre-fix the per-chunk
-                // `store_chunk(...).await?` loop was sequential —
-                // each store waited for the prior one's redex write
-                // to complete. `buffered` (order preserved, though
-                // store order doesn't matter for content-addressed
-                // chunks) drives up to `MANIFEST_STORE_CONCURRENCY`
-                // writes in flight simultaneously. On the same
-                // concurrency rationale as the fetch path: 16 keeps
-                // the credit-window pressure bounded.
-                //
-                // Error semantics: break on first `Err`. In-flight
-                // stores that already landed stay landed (chunks
-                // are content-addressed; redundant store is a
-                // safe no-op for retry). Matches the legacy loop's
-                // "stored chunks up to the failure point" behavior.
-                // Parallel chunk store with bounded concurrency
-                // per dataforts perf #173B (symmetric with #172
-                // on the fetch side). Pre-fix the per-chunk
-                // `store_chunk(...).await?` loop was sequential —
-                // each store waited for the prior one's redex
-                // write to complete.
-                //
-                // Order doesn't matter for stores: chunks are
-                // content-addressed so each write lands in its
-                // own slot. `buffer_unordered(N)` drives up to N
-                // writes in flight; first `Err` aborts the
-                // surrounding match. In-flight stores that have
-                // already landed stay landed — safe because
-                // re-stores of the same content-addressed slot
-                // are idempotent.
-                //
-                // Each store future captures an owned `Bytes`
-                // refcounted into a single `Bytes::copy_from_slice`
-                // of the input. We pay one memcpy of `bytes`
-                // up front, then each chunk's `.slice(off..)` is
-                // a zero-copy refcount bump. Pre-fix passed
-                // `&[u8]` slices borrowed from `bytes` directly,
-                // saving the upfront copy — but that shape can't
-                // be expressed across an async-buffered stream
-                // without tripping a higher-ranked lifetime
-                // check on the closure signature
-                // (`fn(([u8; 32], &'0 [u8])) -> impl Future`
-                // can't unify for arbitrary `'0`). The
-                // `Bytes`-owned shape sidesteps the HRTB issue
-                // by removing the borrow from the closure
-                // input. One memcpy on the upload path is a
-                // small price for the parallelism on a path
-                // that already memcpys (the legacy
-                // `store_chunk(&[u8])` call sequence copies
-                // each chunk into its redex segment internally).
+                // Parallel chunk store with bounded concurrency. Chunks
+                // are content-addressed so order doesn't matter;
+                // `buffer_unordered(N)` drives up to N writes in flight,
+                // and the surrounding loop drains the stream fully (it
+                // does NOT short-circuit on first `Err` — see drain
+                // comment below). Closure captures owned `Bytes` slices
+                // refcounted from one `Bytes::copy_from_slice(bytes)`
+                // upload-side copy, because a borrowed `&[u8]` shape
+                // can't unify across `buffer_unordered`'s closure HRTB.
                 use bytes::Bytes;
                 use futures::StreamExt;
                 const MANIFEST_STORE_CONCURRENCY: usize = 16;
@@ -3358,39 +3315,39 @@ impl BlobAdapter for MeshBlobAdapter {
                 let mut out = Vec::with_capacity(len as usize);
                 let chunks = blob_ref.chunks();
                 let mut touched = Vec::with_capacity(requests.len());
+                // Parallel per-chunk fetch with order-preserving
+                // `buffered(N)`, symmetric with the bulk-`fetch`
+                // Manifest path. `ShortChunk` is the right error
+                // surface for a size disagreement (vs `HashMismatch`,
+                // which can collide with a truncated tail aligned to
+                // a block boundary).
+                use futures::StreamExt;
+                const FETCH_RANGE_CONCURRENCY: usize = 16;
+                let fetch_stream = futures::stream::iter(requests.iter().copied()).map(
+                    |req| async move {
+                        let chunk = &chunks[req.chunk_index];
+                        let chunk_bytes = self.fetch_chunk(&chunk.hash).await?;
+                        let end = req.end_in_chunk as usize;
+                        if end > chunk_bytes.len() {
+                            return Err(BlobError::ShortChunk {
+                                hash: chunk.hash,
+                                requested_start: req.start_in_chunk as u64,
+                                requested_end: req.end_in_chunk as u64,
+                                actual_len: chunk_bytes.len() as u64,
+                            });
+                        }
+                        let slice = chunk_bytes.slice(req.start_in_chunk as usize..end);
+                        Ok::<_, BlobError>((chunk.hash, slice))
+                    },
+                );
+                let mut stream =
+                    std::pin::pin!(fetch_stream.buffered(FETCH_RANGE_CONCURRENCY));
                 let mut err: Option<BlobError> = None;
-                for req in &requests {
-                    let chunk = &chunks[req.chunk_index];
-                    match self.fetch_chunk(&chunk.hash).await {
-                        Ok(chunk_bytes) => {
-                            // Defensive `get` rather than panicking
-                            // slice — the manifest is peer-supplied
-                            // and even with the decoder's chunk-size
-                            // validation the actually-fetched bytes
-                            // could in principle be shorter (e.g. a
-                            // future content-addressed-but-truncated
-                            // backend); panic across `.await` in the
-                            // adapter is worse than a typed error.
-                            //
-                            // `ShortChunk` is the right surface here:
-                            // the cause is a size disagreement, not
-                            // a content disagreement. Pre-fix this
-                            // returned `HashMismatch` where `actual`
-                            // could equal `expected` for a truncated
-                            // tail aligned to a block boundary —
-                            // retry logic that distinguishes
-                            // truncation from divergence couldn't
-                            // tell the cases apart.
-                            let slice = chunk_bytes
-                                .get(req.start_in_chunk as usize..req.end_in_chunk as usize)
-                                .ok_or(BlobError::ShortChunk {
-                                    hash: chunk.hash,
-                                    requested_start: req.start_in_chunk as u64,
-                                    requested_end: req.end_in_chunk as u64,
-                                    actual_len: chunk_bytes.len() as u64,
-                                })?;
-                            out.extend_from_slice(slice);
-                            touched.push(chunk.hash);
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok((hash, slice)) => {
+                            out.extend_from_slice(&slice);
+                            touched.push(hash);
                         }
                         Err(e) => {
                             err = Some(e);

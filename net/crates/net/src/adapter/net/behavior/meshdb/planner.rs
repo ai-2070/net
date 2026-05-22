@@ -1451,10 +1451,11 @@ fn chain_hex(origin_hash: u64) -> String {
     }
     // SAFETY: `HEX_NIBBLES` contains only ASCII hex digits, so
     // every byte written into `buf` is a valid UTF-8 byte and
-    // `buf` is a valid UTF-8 string by construction. The
-    // `from_utf8` route is the standard way to surface this to
-    // the type system without paying for a UTF-8 validity scan.
-    String::from_utf8(buf.to_vec()).expect("HEX_NIBBLES only writes ASCII hex digits")
+    // `buf` is a valid UTF-8 string by construction. Skipping
+    // the `from_utf8` validation walk is the whole point of the
+    // lookup-table fix — the validation would re-scan 16 bytes
+    // we already know are ASCII.
+    unsafe { String::from_utf8_unchecked(buf.to_vec()) }
 }
 
 /// Parse a `causal:<hex>*` reserved tag, matching on the

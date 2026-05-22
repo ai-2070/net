@@ -61,10 +61,7 @@ pub enum Filter {
 ///
 /// Holds the raw field name (used for `JsonValue::Object` lookup) plus
 /// the optional array-index parse cached at compile time (used for
-/// `JsonValue::Array` lookup). Pre-fix the segment was a `&str` re-split
-/// from the path string on every match call, with `segment.parse::<usize>()`
-/// re-running speculatively for every array probe — per perf #16.
-/// One step in a compiled dot-path.
+/// `JsonValue::Array` lookup).
 #[derive(Debug, Clone)]
 pub struct CompiledSegment {
     field: String,
