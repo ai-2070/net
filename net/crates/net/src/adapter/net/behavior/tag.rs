@@ -123,7 +123,8 @@ impl fmt::Display for TaxonomyAxis {
 /// these via privileged paths (e.g. `Mesh::announce_chain` for
 /// `causal:`, the fork-coordination layer for `fork-of:`, the
 /// existing scope helpers for `scope:`).
-pub const RESERVED_PREFIXES: &[&str] = &["causal:", "fork-of:", "heat:", "scope:"];
+pub const RESERVED_PREFIXES: &[&str] =
+    &["causal:", "dataforts:", "fork-of:", "heat:", "scope:"];
 
 /// True if `s` starts with a reserved cross-axis prefix.
 fn starts_with_reserved_prefix(s: &str) -> Option<&'static str> {
@@ -701,7 +702,22 @@ mod tests {
         // §2 is in RESERVED_PREFIXES. Adding a new prefix is a
         // schema-level decision; the test failing on a new prefix
         // forces the constant to be updated explicitly.
-        let expected: &[&str] = &["causal:", "fork-of:", "heat:", "scope:"];
+        //
+        // `dataforts:` was promoted to a reserved prefix as part
+        // of Phase 3b: the BLOB_STORAGE_UNHEALTHY_TAG
+        // (`dataforts:blob-storage-unhealthy`) is documented as a
+        // "cross-axis reserved tag" but was previously only
+        // honored when callers manually constructed
+        // `Tag::Reserved`. Promoting it makes `Tag::parse` round-
+        // trip the canonical string form back into the Reserved
+        // variant, which the fold-side synthesis path relies on.
+        let expected: &[&str] = &[
+            "causal:",
+            "dataforts:",
+            "fork-of:",
+            "heat:",
+            "scope:",
+        ];
         assert_eq!(RESERVED_PREFIXES, expected);
     }
 }

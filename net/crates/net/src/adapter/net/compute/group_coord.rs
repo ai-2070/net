@@ -404,7 +404,7 @@ mod tests {
         }
         // Local node id = first in list (or 0xFFFF if list is empty).
         let local = node_ids.first().copied().unwrap_or(0xFFFF);
-        let scheduler = Scheduler::new(fold, index.clone(), local, CapabilitySet::new());
+        let scheduler = Scheduler::new(fold, local, CapabilitySet::new());
         (scheduler, index)
     }
 
@@ -459,7 +459,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
         let exclude = HashSet::new();
@@ -495,7 +494,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -533,7 +531,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
         let mut exclude = HashSet::new();
@@ -588,7 +585,6 @@ mod tests {
 
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
         let exclude = HashSet::new();
@@ -623,7 +619,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
         let exclude = HashSet::new();

@@ -9,7 +9,9 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilityIndex, CapabilitySet};
+#[cfg(test)]
+use crate::adapter::net::behavior::capability::CapabilityIndex;
+use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use crate::adapter::net::behavior::placement::{
     tie_break_compare, Artifact, LegacyPlacement, PlacementFilter, ResourceAxis, TieBreakContext,
@@ -73,13 +75,9 @@ impl std::error::Error for SchedulerError {}
 /// keeps both indices semantically equivalent until the legacy
 /// placement bridge is migrated separately.
 pub struct Scheduler {
-    /// Reference to the shared capability fold (Phase 3b cutover).
+    /// Reference to the shared capability fold (Phase 3b cutover
+    /// target). All query paths route through this.
     capability_fold: Arc<Fold<CapabilityFold>>,
-    /// Reference to the shared legacy capability index — borrowed
-    /// by [`LegacyPlacement::permissive`] inside
-    /// `place_migration_v2`. Sub-step 3a-tail will migrate
-    /// LegacyPlacement to the fold and drop this field.
-    capability_index: Arc<CapabilityIndex>,
     /// This node's ID (for local preference).
     local_node_id: u64,
     /// This node's capabilities (for fast local check).
@@ -90,13 +88,11 @@ impl Scheduler {
     /// Create a new scheduler.
     pub fn new(
         capability_fold: Arc<Fold<CapabilityFold>>,
-        capability_index: Arc<CapabilityIndex>,
         local_node_id: u64,
         local_caps: CapabilitySet,
     ) -> Self {
         Self {
             capability_fold,
-            capability_index,
             local_node_id,
             local_caps,
         }
@@ -305,10 +301,9 @@ impl Scheduler {
         // the proper `PlacementReason` from whether the chosen node
         // is the local one — keeping the v1 telemetry distinction
         // alive.
-        let placement = LegacyPlacement::permissive(&self.capability_index);
+        let placement = LegacyPlacement::permissive(&self.capability_fold);
         let tie_break = TieBreakContext {
             rtt_lookup: None,
-            index: &self.capability_index,
             resource_axis: ResourceAxis::Compute,
         };
         // Empty required / optional caps: the migration artifact
@@ -572,7 +567,7 @@ mod tests {
     fn test_local_preferred() {
         let local_caps = caps_no_gpu();
         let (fold, index) = make_index_with_nodes(vec![]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, local_caps);
+        let scheduler = Scheduler::new(fold.clone(),0x1111, local_caps);
 
         // Empty filter = runs anywhere, including local
         let decision = scheduler.place(&CapabilityFilter::default()).unwrap();
@@ -585,7 +580,7 @@ mod tests {
         let local_caps = caps_no_gpu(); // no GPU
         let remote_caps = caps_with_gpu();
         let (fold, index) = make_index_with_nodes(vec![(0x2222, remote_caps)]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, local_caps);
+        let scheduler = Scheduler::new(fold.clone(),0x1111, local_caps);
 
         let filter = CapabilityFilter::new().require_gpu();
         let decision = scheduler.place(&filter).unwrap();
@@ -597,7 +592,7 @@ mod tests {
     fn test_no_candidate() {
         let local_caps = caps_no_gpu();
         let (fold, index) = make_index_with_nodes(vec![]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, local_caps);
+        let scheduler = Scheduler::new(fold.clone(),0x1111, local_caps);
 
         let filter = CapabilityFilter::new().require_gpu();
         assert_eq!(
@@ -609,7 +604,7 @@ mod tests {
     #[test]
     fn test_pin() {
         let (fold, index) = make_index_with_nodes(vec![]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0x1111, caps_no_gpu());
 
         let decision = scheduler.pin(0x9999);
         assert_eq!(decision.node_id, 0x9999);
@@ -620,7 +615,7 @@ mod tests {
     fn test_can_run_locally() {
         let local_caps = caps_with_gpu();
         let (fold, index) = make_index_with_nodes(vec![]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, local_caps);
+        let scheduler = Scheduler::new(fold.clone(),0x1111, local_caps);
 
         assert!(scheduler.can_run_locally(&CapabilityFilter::new().require_gpu()));
         assert!(scheduler.can_run_locally(&CapabilityFilter::default()));
@@ -634,7 +629,7 @@ mod tests {
     fn place_with_locality_skips_local_when_drained() {
         let (fold, index) =
             make_index_with_nodes(vec![(0x1111, caps_with_gpu()), (0x2222, caps_with_gpu())]);
-        let scheduler = Scheduler::new(fold.clone(), index, 0x1111, caps_with_gpu());
+        let scheduler = Scheduler::new(fold.clone(), 0x1111, caps_with_gpu());
         let filter = CapabilityFilter::new().require_gpu();
         let decision = scheduler.place_with_locality(&filter, true).unwrap();
         assert_ne!(
@@ -651,7 +646,7 @@ mod tests {
     fn place_with_locality_picks_local_when_not_drained() {
         let (fold, index) =
             make_index_with_nodes(vec![(0x1111, caps_with_gpu()), (0x2222, caps_with_gpu())]);
-        let scheduler = Scheduler::new(fold.clone(), index, 0x1111, caps_with_gpu());
+        let scheduler = Scheduler::new(fold.clone(), 0x1111, caps_with_gpu());
         let filter = CapabilityFilter::new().require_gpu();
         let decision = scheduler.place_with_locality(&filter, false).unwrap();
         assert_eq!(decision.node_id, 0x1111);
@@ -667,7 +662,7 @@ mod tests {
     #[test]
     fn place_with_locality_returns_no_candidate_when_drained_and_no_remote() {
         let (fold, index) = make_index_with_nodes(vec![]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, caps_with_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0x1111, caps_with_gpu());
         let filter = CapabilityFilter::new().require_gpu();
         let err = scheduler
             .place_with_locality(&filter, true)
@@ -686,7 +681,7 @@ mod tests {
             (0x3333, caps_with_migration_tag()),
             (0x4444, caps_no_gpu()), // no migration tag
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0x1111, caps_no_gpu());
 
         let targets = scheduler.find_migration_targets(&CapabilityFilter::default(), 0x1111);
         assert_eq!(targets.len(), 2);
@@ -700,7 +695,7 @@ mod tests {
             (0x1111, caps_with_migration_tag()), // source
             (0x2222, caps_with_migration_tag()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0x1111, caps_no_gpu());
 
         let targets = scheduler.find_migration_targets(&CapabilityFilter::default(), 0x1111);
         assert_eq!(targets.len(), 1);
@@ -710,7 +705,7 @@ mod tests {
     #[test]
     fn test_place_migration() {
         let (fold, index) = make_index_with_nodes(vec![(0x2222, caps_with_migration_tag())]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0x1111, caps_no_gpu());
 
         let decision = scheduler
             .place_migration(&CapabilityFilter::default(), 0x1111)
@@ -724,7 +719,7 @@ mod tests {
         let (fold, index) = make_index_with_nodes(vec![
             (0x2222, caps_no_gpu()), // no migration tag
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0x1111, caps_no_gpu());
 
         let err = scheduler
             .place_migration(&CapabilityFilter::default(), 0x1111)
@@ -739,7 +734,7 @@ mod tests {
             (0x1111, caps_with_migration_tag()),
             (0x2222, caps_with_migration_tag()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, local_caps);
+        let scheduler = Scheduler::new(fold.clone(),0x1111, local_caps);
 
         // Source is 0x3333, so local (0x1111) is a valid target
         let decision = scheduler
@@ -755,7 +750,7 @@ mod tests {
             (0x2222, CapabilitySet::new().add_tag("subprotocol:0x0400")),
             (0x3333, CapabilitySet::new().add_tag("subprotocol:0x0500")),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0x1111, caps_no_gpu());
 
         let causal_nodes = scheduler.find_subprotocol_nodes(0x0400);
         assert_eq!(causal_nodes.len(), 1);
@@ -819,14 +814,13 @@ mod tests {
     #[test]
     fn select_migration_target_returns_only_candidate() {
         let (fold, index) = make_index_with_nodes(vec![(0x2222, caps_with_migration_tag())]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0x1111, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0x1111, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
-        let placement = LegacyPlacement::permissive(&index);
+        let placement = LegacyPlacement::permissive(&fold);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -848,7 +842,7 @@ mod tests {
             (0x2222, caps_with_migration_tag()),
             (0x3333, caps_with_migration_tag()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -868,7 +862,6 @@ mod tests {
 
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -890,7 +883,7 @@ mod tests {
             (0x1111, caps_with_migration_tag()),
             (0x2222, caps_with_migration_tag()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -900,7 +893,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -923,7 +915,7 @@ mod tests {
             (0x2222, caps_with_migration_tag()),
             (0x3333, caps_with_migration_tag()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -933,7 +925,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -951,7 +942,7 @@ mod tests {
     #[test]
     fn select_migration_target_returns_none_for_empty_candidates() {
         let (fold, index) = make_index_with_nodes(vec![]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -961,7 +952,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -990,7 +980,7 @@ mod tests {
             (0x2222, caps_with_migration_tag()),
             (0x3333, caps_with_migration_tag()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0x1111, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0x1111, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -1013,7 +1003,6 @@ mod tests {
 
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1044,7 +1033,7 @@ mod tests {
             (0x2222, caps_with_migration_tag()),
             (0x3333, caps_with_migration_tag()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0x1111, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0x1111, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -1062,7 +1051,6 @@ mod tests {
 
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1090,7 +1078,7 @@ mod tests {
             (0x1111, caps_with_migration_tag()),
             (0x2222, caps_with_migration_tag()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -1100,7 +1088,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1124,7 +1111,7 @@ mod tests {
             (0x1111, caps_with_migration_tag().add_tag("hardware.gpu")),
             (0x2222, caps_with_migration_tag()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -1134,7 +1121,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1160,7 +1146,7 @@ mod tests {
             (0x1111, caps_no_gpu()),
             (0x2222, caps_no_gpu()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -1170,7 +1156,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
         let exclude = HashSet::new();
@@ -1196,7 +1181,7 @@ mod tests {
             (0x2222, caps_no_gpu()),
             (0x3333, caps_no_gpu()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -1206,7 +1191,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1230,7 +1214,7 @@ mod tests {
     #[test]
     fn select_member_node_returns_none_when_all_excluded() {
         let (fold, index) = make_index_with_nodes(vec![(0x1111, caps_no_gpu()), (0x2222, caps_no_gpu())]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -1240,7 +1224,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1267,7 +1250,7 @@ mod tests {
             (0x2222, caps_no_gpu()),
             (0x3333, caps_no_gpu()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -1278,7 +1261,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
         // Exclude 0x1111; with 0x2222 vetoed, only 0x3333 remains.
@@ -1300,7 +1282,7 @@ mod tests {
     #[test]
     fn select_promotion_target_picks_highest_scoring_standby() {
         let (fold, index) = make_index_with_nodes(vec![(0x1111, caps_no_gpu()), (0x2222, caps_no_gpu())]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -1318,7 +1300,6 @@ mod tests {
         }
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1331,7 +1312,7 @@ mod tests {
     #[test]
     fn select_promotion_target_empty_roster_returns_none() {
         let (fold, index) = make_index_with_nodes(vec![]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -1341,7 +1322,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1354,7 +1334,7 @@ mod tests {
     #[test]
     fn select_promotion_target_returns_none_when_all_vetoed() {
         let (fold, index) = make_index_with_nodes(vec![(0x1111, caps_no_gpu()), (0x2222, caps_no_gpu())]);
-        let scheduler = Scheduler::new(fold.clone(), index.clone(),0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
         let req = empty_caps_pf();
         let opt = empty_caps_pf();
         let artifact = daemon_artifact_pf(&req, &opt);
@@ -1364,7 +1344,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1404,7 +1383,7 @@ mod tests {
             (0x2222, caps_with_migration_tag()),
             (0x3333, caps_with_migration_tag()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0x1111, caps_no_gpu());
 
         let decision = scheduler
             .place_migration_v2(&CapabilityFilter::default(), 0x1111)
@@ -1424,7 +1403,7 @@ mod tests {
             (0x1111, caps_with_migration_tag()),
             (0x2222, caps_with_migration_tag()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index,0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
 
         // Source = 0x1111; v2 must pick 0x2222.
         let decision = scheduler
@@ -1441,7 +1420,7 @@ mod tests {
         let (fold, index) = make_index_with_nodes(vec![
             (0x2222, caps_no_gpu()), // no migration tag
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0x1111, caps_no_gpu());
 
         let err = scheduler
             .place_migration_v2(&CapabilityFilter::default(), 0x1111)
@@ -1469,7 +1448,7 @@ mod tests {
             (0x2222, caps_with_migration_tag()),
         ]);
         // Local node = 0x2222 (HIGHER than the remote 0x1111).
-        let scheduler = Scheduler::new(fold.clone(), index,0x2222, local_caps);
+        let scheduler = Scheduler::new(fold.clone(),0x2222, local_caps);
 
         // Source = 0x9999 (some other node), so local 0x2222
         // is eligible. Pre-CR-21: tie-break picked 0x1111
@@ -1491,7 +1470,7 @@ mod tests {
             (0x1111, caps_with_migration_tag().add_tag("hardware.gpu")),
             (0x2222, caps_with_migration_tag()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index,0xFFFF, caps_no_gpu());
+        let scheduler = Scheduler::new(fold.clone(),0xFFFF, caps_no_gpu());
 
         // Filter requires hardware.gpu — narrows candidate pool to
         // 0x1111. Source 0x9999 doesn't intersect either candidate.
@@ -1537,7 +1516,6 @@ mod tests {
         let index = CapabilityIndex::new();
         let tie_break = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1569,7 +1547,7 @@ mod tests {
             (0x1111, caps_with_migration_tag()),
             (0x2222, caps_with_migration_tag()),
         ]);
-        let scheduler = Scheduler::new(fold.clone(), index,0x1111, caps_with_migration_tag());
+        let scheduler = Scheduler::new(fold.clone(),0x1111, caps_with_migration_tag());
 
         // Source 0x3333; local 0x1111 is eligible → LocalPreferred.
         let decision = scheduler

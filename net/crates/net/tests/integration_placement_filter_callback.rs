@@ -25,6 +25,7 @@ use std::sync::Arc;
 use net::adapter::net::behavior::capability::{
     CapabilityAnnouncement, CapabilityIndex, CapabilitySet,
 };
+use net::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use net::adapter::net::behavior::placement::{
     Artifact, NodeId, PlacementFilter, StandardPlacement,
 };
@@ -42,25 +43,32 @@ fn caps_with_tag(tag: &str) -> CapabilitySet {
     CapabilitySet::new().add_tag(tag)
 }
 
-/// Insert a peer into the index under `node_id` with `caps`. Uses
-/// the same `CapabilityIndex::index` path the dispatch handler
-/// takes when a real announcement lands, so `find_nodes_by_filter`
-/// / placement scoring sees the entry.
-fn install_peer(index: &CapabilityIndex, node_id: NodeId, caps: CapabilitySet) {
+/// Insert a peer into both the legacy index AND the fold via
+/// the Phase 3b dual-apply path. The placement filter and
+/// scheduler routes read from the fold; the index lookup the
+/// test filter does (via `index.get`) reads the same data
+/// because dual-population.
+fn install_peer(
+    fold: &Fold<CapabilityFold>,
+    index: &CapabilityIndex,
+    node_id: NodeId,
+    caps: CapabilitySet,
+) {
     let kp = EntityKeypair::generate();
     let ann = CapabilityAnnouncement::new(node_id, kp.entity_id().clone(), 1, caps);
-    index.index(ann);
+    capability_bridge::dual_apply(fold, index, ann);
 }
 
 /// 4-peer fixture: GPU, TPU, CPU, untagged. The custom filter we
 /// install only admits GPU peers.
-fn populated_index() -> CapabilityIndex {
+fn populated_index() -> (Fold<CapabilityFold>, CapabilityIndex) {
     let index = CapabilityIndex::new();
-    install_peer(&index, 0xAAA1, caps_with_tag("hardware-class-gpu"));
-    install_peer(&index, 0xAAA2, caps_with_tag("hardware-class-tpu"));
-    install_peer(&index, 0xAAA3, caps_with_tag("hardware-class-cpu"));
-    install_peer(&index, 0xAAA4, CapabilitySet::new());
-    index
+    let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
+    install_peer(&fold, &index, 0xAAA1, caps_with_tag("hardware-class-gpu"));
+    install_peer(&fold, &index, 0xAAA2, caps_with_tag("hardware-class-tpu"));
+    install_peer(&fold, &index, 0xAAA3, caps_with_tag("hardware-class-cpu"));
+    install_peer(&fold, &index, 0xAAA4, CapabilitySet::new());
+    (fold, index)
 }
 
 // ============================================================================
@@ -142,7 +150,9 @@ fn daemon_artifact<'a>(
 /// resolves to the correct per-candidate caps.
 #[test]
 fn registered_filter_selectively_admits_via_live_index() {
-    let index = Arc::new(populated_index());
+    let (fold, raw_index) = populated_index();
+    let fold = Arc::new(fold);
+    let index = Arc::new(raw_index);
     let id = "integ-pf-gpu-only";
     let _guard = register_filter(
         id,
@@ -151,7 +161,7 @@ fn registered_filter_selectively_admits_via_live_index() {
         }),
     );
 
-    let placement = StandardPlacement::new(&index).with_custom_filter_id(id);
+    let placement = StandardPlacement::new(&fold).with_custom_filter_id(id);
     let req = empty_caps();
     let opt = empty_caps();
     let daemon_id = [0u8; 32];
@@ -184,7 +194,9 @@ fn registered_filter_selectively_admits_via_live_index() {
 /// registry, real scheduler scoring).
 #[test]
 fn unregistering_filter_collapses_to_hard_veto() {
-    let index = Arc::new(populated_index());
+    let (fold, raw_index) = populated_index();
+    let fold = Arc::new(fold);
+    let index = Arc::new(raw_index);
     let id = "integ-pf-unregister-mid-flight";
     let guard = register_filter(
         id,
@@ -193,7 +205,7 @@ fn unregistering_filter_collapses_to_hard_veto() {
         }),
     );
 
-    let placement = StandardPlacement::new(&index).with_custom_filter_id(id);
+    let placement = StandardPlacement::new(&fold).with_custom_filter_id(id);
     let req = empty_caps();
     let opt = empty_caps();
     let daemon_id = [0u8; 32];
@@ -223,7 +235,9 @@ fn unregistering_filter_collapses_to_hard_veto() {
 /// just the candidate's announced state.
 #[test]
 fn filter_receives_artifact_with_daemon_capabilities() {
-    let index = Arc::new(populated_index());
+    let (fold, raw_index) = populated_index();
+    let fold = Arc::new(fold);
+    let index = Arc::new(raw_index);
     let id = "integ-pf-artifact-passthrough";
 
     /// Filter that copies the daemon's required-tags into a
@@ -252,15 +266,18 @@ fn filter_receives_artifact_with_daemon_capabilities() {
     // anything. (That short-circuit is itself worth pinning, but
     // it's already covered by the substrate's unit suite.)
     let custom_index = CapabilityIndex::new();
+    let custom_fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
     install_peer(
+        &custom_fold,
         &custom_index,
         0xBBB1,
         CapabilitySet::new()
             .add_tag("required-marker-alpha")
             .add_tag("required-marker-beta"),
     );
-    let custom_index = Arc::new(custom_index);
-    let placement = StandardPlacement::new(&custom_index).with_custom_filter_id(id);
+    let _custom_index = Arc::new(custom_index);
+    let custom_fold = Arc::new(custom_fold);
+    let placement = StandardPlacement::new(&custom_fold).with_custom_filter_id(id);
     let req = CapabilitySet::new()
         .add_tag("required-marker-alpha")
         .add_tag("required-marker-beta");

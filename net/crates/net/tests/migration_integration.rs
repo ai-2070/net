@@ -342,7 +342,7 @@ fn test_start_migration_auto() {
     );
 
     let local_caps = CapabilitySet::new();
-    let scheduler = Scheduler::new(fold, index, 0x1111, local_caps);
+    let scheduler = Scheduler::new(fold, 0x1111, local_caps);
 
     let (target_node, msgs) = orch
         .start_migration_auto(origin, 0x1111, &scheduler, &CapabilityFilter::default())
@@ -370,7 +370,7 @@ fn test_start_migration_auto_no_targets() {
     let index = Arc::new(CapabilityIndex::new());
     let fold: Arc<Fold<CapabilityFold>> =
         Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
-    let scheduler = Scheduler::new(fold, index, 0x1111, CapabilitySet::new());
+    let scheduler = Scheduler::new(fold, 0x1111, CapabilitySet::new());
 
     let err = orch
         .start_migration_auto(origin, 0x1111, &scheduler, &CapabilityFilter::default())
@@ -1007,7 +1007,7 @@ fn test_enriched_capabilities_discoverable_by_scheduler() {
     );
 
     // Scheduler on node C should find A but not B
-    let scheduler = Scheduler::new(fold, index, 0xCCCC, CapabilitySet::new());
+    let scheduler = Scheduler::new(fold, 0xCCCC, CapabilitySet::new());
     let targets = scheduler.find_migration_targets(&CapabilityFilter::default(), 0xCCCC);
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0], 0xAAAA);
@@ -1703,7 +1703,7 @@ fn make_scheduler_for_groups() -> Scheduler {
             CapabilityAnnouncement::new(node_id, test_entity_id(), 1, CapabilitySet::new()),
         );
     }
-    Scheduler::new(fold, index, 0x1111, CapabilitySet::new())
+    Scheduler::new(fold, 0x1111, CapabilitySet::new())
 }
 
 /// Integration test 1: ReplicaGroup refactor — route_event returns an

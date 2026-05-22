@@ -2195,7 +2195,7 @@ mod tests {
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let scheduler =
-            super::super::Scheduler::new(fold, index, 0x1111, CapabilitySet::default());
+            super::super::Scheduler::new(fold, 0x1111, CapabilitySet::default());
 
         // A filter that nothing in the empty index can satisfy.
         let filter = CapabilityFilter::default();

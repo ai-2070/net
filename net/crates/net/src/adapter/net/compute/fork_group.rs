@@ -876,7 +876,7 @@ mod tests {
                 CapabilityAnnouncement::new(node_id, eid.clone(), 1, CapabilitySet::new()),
             );
         }
-        Scheduler::new(fold, index, 0x1111, CapabilitySet::new())
+        Scheduler::new(fold, 0x1111, CapabilitySet::new())
     }
 
     fn test_config(n: u8) -> ForkGroupConfig {
@@ -1138,7 +1138,7 @@ mod tests {
                 CapabilitySet::new(),
             ),
         );
-        let sched = Scheduler::new(fold, index, 0x1111, CapabilitySet::new());
+        let sched = Scheduler::new(fold, 0x1111, CapabilitySet::new());
 
         let mut exclude = HashSet::new();
         exclude.insert(0x1111); // exclude the only node
@@ -1174,7 +1174,7 @@ mod tests {
             );
         }
         let local = node_ids.first().copied().unwrap_or(0xFFFF);
-        let scheduler = Scheduler::new(fold, index.clone(), local, CapabilitySet::new());
+        let scheduler = Scheduler::new(fold, local, CapabilitySet::new());
         (scheduler, index)
     }
 
@@ -1194,7 +1194,6 @@ mod tests {
         let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1230,7 +1229,6 @@ mod tests {
         let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1264,7 +1262,6 @@ mod tests {
         let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1299,7 +1296,6 @@ mod tests {
         let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1337,7 +1333,6 @@ mod tests {
         let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1378,7 +1373,6 @@ mod tests {
         let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1429,7 +1423,6 @@ mod tests {
         let (sched, index) = make_scheduler_and_index(&[0x9999]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
