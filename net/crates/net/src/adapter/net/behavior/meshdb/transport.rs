@@ -64,6 +64,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use futures::stream::Stream;
 use futures::StreamExt;
 use parking_lot::RwLock;
@@ -250,7 +251,7 @@ struct InflightCaller {
 pub struct MeshDbWireDispatcher {
     sender: Arc<dyn MeshDbWireSender>,
     /// Caller-side: per-call_id mpsc senders for incoming responses.
-    inflight: Arc<RwLock<HashMap<u64, InflightCaller>>>,
+    inflight: Arc<DashMap<u64, InflightCaller>>,
     /// Optional server side. Cleared by default — pure caller-only
     /// dispatchers don't pay for the server's allocator pool.
     server: Arc<RwLock<Option<Arc<MeshDbServer>>>>,
@@ -263,7 +264,11 @@ impl MeshDbWireDispatcher {
     pub fn new(sender: Arc<dyn MeshDbWireSender>) -> Self {
         Self {
             sender,
-            inflight: Arc::new(RwLock::new(HashMap::new())),
+            // Per meshdb perf #198 — caller-side inflight is now
+            // `DashMap` so concurrent `send`s / response routes /
+            // stream drops don't serialize on a single `RwLock`.
+            // Different `call_id`s hit different DashMap shards.
+            inflight: Arc::new(DashMap::new()),
             server: Arc::new(RwLock::new(None)),
         }
     }
@@ -312,8 +317,12 @@ impl MeshDbInboundRouter for MeshDbWireDispatcher {
             }
             MeshDbFrame::Response(resp) => {
                 let call_id = response_call_id(&resp);
-                let guard = self.inflight.read();
-                let entry = guard
+                // Per perf #198 — `DashMap::get` returns a shard-scoped
+                // `Ref` rather than acquiring the whole-map read lock
+                // the legacy `RwLock<HashMap>` did. Concurrent routes
+                // for different `call_id`s hit different shards.
+                let entry = self
+                    .inflight
                     .get(&call_id)
                     .ok_or(MeshDbRouteError::UnknownCallId(call_id))?;
                 // Gate by sender: only the peer the request was
@@ -361,7 +370,7 @@ fn response_call_id(r: &MeshDbResponse) -> u64 {
 /// from the dispatcher's table.
 pub struct MeshDbWireTransport {
     sender: Arc<dyn MeshDbWireSender>,
-    inflight: Arc<RwLock<HashMap<u64, InflightCaller>>>,
+    inflight: Arc<DashMap<u64, InflightCaller>>,
 }
 
 #[async_trait]
@@ -377,7 +386,10 @@ impl MeshDbTransport for MeshDbWireTransport {
         // could ship msg back before our caller-table entry is
         // visible and the response would be dropped as
         // UnknownCallId.
-        let prev = self.inflight.write().insert(
+        // Per perf #198 — `DashMap::insert` is sharded, so concurrent
+        // `send`s with distinct `call_id`s no longer serialize on the
+        // whole-map write lock the legacy `RwLock<HashMap>` did.
+        let prev = self.inflight.insert(
             call_id,
             InflightCaller {
                 tx,
@@ -403,7 +415,7 @@ impl MeshDbTransport for MeshDbWireTransport {
             .send_frame(node, MeshDbFrame::Request(request))
             .await;
         if let Err(e) = send_result {
-            self.inflight.write().remove(&call_id);
+            self.inflight.remove(&call_id);
             return Err(e);
         }
         // Wrap the receiver in a stream that translates
@@ -437,13 +449,15 @@ fn request_call_id(r: &MeshDbRequest) -> u64 {
 struct ResponseStreamGuard {
     inner: ReceiverStream<MeshDbResponse>,
     call_id: u64,
-    inflight: Arc<RwLock<HashMap<u64, InflightCaller>>>,
+    inflight: Arc<DashMap<u64, InflightCaller>>,
     terminated: bool,
 }
 
 impl Drop for ResponseStreamGuard {
     fn drop(&mut self) {
-        self.inflight.write().remove(&self.call_id);
+        // Per perf #198 — DashMap::remove is sharded; per-stream
+        // drop no longer takes the whole-map write lock.
+        self.inflight.remove(&self.call_id);
     }
 }
 
@@ -1107,7 +1121,7 @@ mod tests {
         // outbound Error has somewhere to land.
         let call_id = 0xBEEFu64;
         let (tx, mut rx) = mpsc::channel(8);
-        dispatcher_a.inflight.write().insert(
+        dispatcher_a.inflight.insert(
             call_id,
             InflightCaller {
                 tx,
@@ -1256,7 +1270,7 @@ mod tests {
         // server side.
         let call_id = 0xC0FFEE_u64;
         let (tx, mut rx) = mpsc::channel(8);
-        dispatcher_a.inflight.write().insert(
+        dispatcher_a.inflight.insert(
             call_id,
             InflightCaller {
                 tx,

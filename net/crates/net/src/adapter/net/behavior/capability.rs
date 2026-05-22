@@ -3464,13 +3464,43 @@ impl CapabilityIndex {
         scope_filter: &ScopeFilter<'_>,
         mut same_subnet_lookup: impl FnMut(u64) -> bool,
     ) -> Vec<u64> {
-        let base = self.query(filter);
-        base.into_iter()
-            .filter(|&node_id| {
-                let Some(caps) = self.get(node_id) else {
-                    return false;
-                };
-                let scope = scope_from_tags(&caps.tags);
+        // Per discovery-routing perf #112 — pre-fix this method did
+        // two passes: `self.query(filter)` walked the index and
+        // re-validated each candidate via a `self.nodes.get(node_id)`
+        // shard-lock acquisition, then the result `Vec<u64>` was
+        // re-walked here with a SECOND `self.get(node_id)` per node
+        // (which itself clones the `CapabilitySet`). For a 1000-node
+        // query that's 2000 DashMap probes + 1000 `CapabilitySet`
+        // clones — the second pass exists only to read `caps.tags`,
+        // which the first pass already held under its shard guard.
+        //
+        // Fold scope resolution into one pass over the candidate set:
+        // resolve the `CapabilitySet` once (under the same shard
+        // guard that re-validates `filter.matches`) and read
+        // `caps.tags` directly from the borrowed entry instead of
+        // re-fetching. Saves N DashMap lookups + N `CapabilitySet`
+        // clones per scoped query (`CapabilitySet` contains `String`,
+        // `HashSet`, `Vec` fields — the clone is non-trivial on
+        // realistic announcements).
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+
+        let candidates = self
+            .build_candidate_set(filter)
+            .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
+
+        candidates
+            .into_iter()
+            .filter_map(|node_id| {
+                // Single shard-lock acquisition per candidate. The
+                // `filter.matches` re-check closes the stale-index
+                // window described on `query()`; the scope resolution
+                // reads from the same borrowed `node.capabilities`
+                // so the second lookup vanishes.
+                let node = self.nodes.get(&node_id)?;
+                if !filter.matches(&node.capabilities) {
+                    return None;
+                }
+                let scope = scope_from_tags(&node.capabilities.tags);
                 let needs_subnet = matches!(scope_filter, ScopeFilter::SameSubnet)
                     || matches!(scope, CapabilityScope::SubnetLocal);
                 let same_subnet = if needs_subnet {
@@ -3478,7 +3508,10 @@ impl CapabilityIndex {
                 } else {
                     false
                 };
-                matches_scope(&scope, scope_filter, same_subnet)
+                if !matches_scope(&scope, scope_filter, same_subnet) {
+                    return None;
+                }
+                Some(node_id)
             })
             .collect()
     }
@@ -7512,6 +7545,108 @@ mod tests {
             index.collision_count(),
             1,
             "collision counter records the ambiguity event for operator observability"
+        );
+    }
+
+    /// Pin discovery-routing perf #112: `find_nodes_scoped` must
+    /// produce the SAME node-set as the legacy two-pass form
+    /// (`self.query(filter)` followed by per-result
+    /// `self.get(node_id)` + scope check). A regression that drops
+    /// the inline `filter.matches` re-check or skips the scope
+    /// resolution would surface here by returning a different set.
+    /// Covers `Any` / `GlobalOnly` / `SameSubnet` so all three
+    /// branches of `matches_scope` get exercised in one go.
+    #[test]
+    fn find_nodes_scoped_single_pass_matches_legacy_two_pass() {
+        let index = CapabilityIndex::new();
+        // 5 nodes:
+        // - 0: global (no scope tag), tag=worker
+        // - 1: global, tag=worker
+        // - 2: subnet-local, tag=worker
+        // - 3: global, NO worker tag (filtered out by filter)
+        // - 4: subnet-local, tag=worker
+        for (i, (scope_tag, has_worker)) in [
+            (None, true),
+            (None, true),
+            (Some("scope:subnet-local"), true),
+            (None, false),
+            (Some("scope:subnet-local"), true),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut caps = CapabilitySet::default();
+            if *has_worker {
+                caps = caps.add_tag("worker");
+            }
+            if let Some(tag) = scope_tag {
+                caps = caps.add_tag(*tag);
+            }
+            index_with_node(&index, i as u64, caps);
+        }
+
+        let filter = CapabilityFilter::new().require_tag("worker");
+
+        // Reference shape: the legacy two-pass implementation that
+        // perf #112 collapsed. Build the same node-set inline so
+        // the assertion below catches any semantic drift in the
+        // refactored single-pass code.
+        let two_pass_reference = |scope_filter: &ScopeFilter<'_>,
+                                  same_subnet: bool|
+         -> std::collections::HashSet<u64> {
+            index
+                .query(&filter)
+                .into_iter()
+                .filter(|&node_id| {
+                    let Some(caps) = index.get(node_id) else {
+                        return false;
+                    };
+                    let scope = scope_from_tags(&caps.tags);
+                    let needs_subnet = matches!(scope_filter, ScopeFilter::SameSubnet)
+                        || matches!(scope, CapabilityScope::SubnetLocal);
+                    let ss = if needs_subnet { same_subnet } else { false };
+                    matches_scope(&scope, scope_filter, ss)
+                })
+                .collect()
+        };
+
+        let to_set = |v: Vec<u64>| v.into_iter().collect::<std::collections::HashSet<u64>>();
+
+        // ScopeFilter::Any with same-subnet=true: every worker
+        // (subnet-local + global), excluding the no-worker node 3.
+        let any_ss_true = to_set(index.find_nodes_scoped(&filter, &ScopeFilter::Any, |_| true));
+        assert_eq!(
+            any_ss_true,
+            two_pass_reference(&ScopeFilter::Any, true),
+            "ScopeFilter::Any (same-subnet=true) must match the two-pass reference"
+        );
+
+        // ScopeFilter::Any with same-subnet=false: SubnetLocal
+        // peers drop out (they require same-subnet), globals stay.
+        let any_ss_false = to_set(index.find_nodes_scoped(&filter, &ScopeFilter::Any, |_| false));
+        assert_eq!(
+            any_ss_false,
+            two_pass_reference(&ScopeFilter::Any, false),
+            "ScopeFilter::Any (same-subnet=false) must match the two-pass reference"
+        );
+
+        // ScopeFilter::GlobalOnly: only nodes with no scope tag.
+        let global_only =
+            to_set(index.find_nodes_scoped(&filter, &ScopeFilter::GlobalOnly, |_| true));
+        assert_eq!(
+            global_only,
+            two_pass_reference(&ScopeFilter::GlobalOnly, true),
+            "ScopeFilter::GlobalOnly must match the two-pass reference"
+        );
+
+        // ScopeFilter::SameSubnet, same-subnet=true: all workers
+        // (the same_subnet predicate admits everything).
+        let same_subnet =
+            to_set(index.find_nodes_scoped(&filter, &ScopeFilter::SameSubnet, |_| true));
+        assert_eq!(
+            same_subnet,
+            two_pass_reference(&ScopeFilter::SameSubnet, true),
+            "ScopeFilter::SameSubnet (predicate=true) must match the two-pass reference"
         );
     }
 }
