@@ -1501,6 +1501,13 @@ pub struct MeshNode {
     /// `announce_capabilities` path. Self-index so single-node
     /// queries return us too.
     capability_index: Arc<CapabilityIndex>,
+    /// Capability fold — the Phase 3b cutover target. Runs
+    /// alongside [`Self::capability_index`] during the cutover;
+    /// callers progressively migrate to it. Registered with this
+    /// node's internal [`super::behavior::fold::FoldRegistry`]
+    /// (installed as the [`Self::fold_router`] router by default).
+    capability_fold:
+        Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
     /// Dedup cache for multi-hop capability announcements. Keyed by
     /// `(origin_node_id, version)` — the same discriminator
     /// `CapabilityIndex` uses to skip stale announcements. Entries
@@ -1802,6 +1809,30 @@ impl MeshNode {
         // the capability index on peer-death).
         let capability_index: Arc<CapabilityIndex> = Arc::new(CapabilityIndex::new());
 
+        // Per the Phase 3b cutover plan: a CapabilityFold runs
+        // alongside the legacy CapabilityIndex. Both receive
+        // inbound capability announcements; callers progressively
+        // rewire from the index to the fold in sub-steps 3a/3b/3c,
+        // and the legacy index is deleted in sub-step 5.
+        //
+        // The fold is registered in a per-node FoldRegistry that
+        // we install as the channel router for SUBPROTOCOL_FOLD.
+        // Test code that wants to override this can still call
+        // set_fold_router(Some(other)) — the override replaces
+        // the default registry whole.
+        let capability_fold: Arc<super::behavior::fold::Fold<
+            super::behavior::fold::CapabilityFold,
+        >> = Arc::new(super::behavior::fold::Fold::new());
+        let fold_registry = Arc::new(super::behavior::fold::FoldRegistry::new());
+        fold_registry.register(capability_fold.clone());
+        let fold_router: Arc<
+            parking_lot::RwLock<
+                Option<Arc<dyn super::behavior::fold::FoldChannelRouter>>,
+            >,
+        > = Arc::new(parking_lot::RwLock::new(Some(
+            fold_registry.clone() as Arc<dyn super::behavior::fold::FoldChannelRouter>,
+        )));
+
         // Wire failure detector with reroute callbacks + roster eviction.
         //
         // Note: the `peers` / `addr_to_node` / `peer_addrs` maps are
@@ -1940,6 +1971,7 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             traversal_stats: Arc::new(super::traversal::TraversalStats::new()),
             capability_index,
+            capability_fold,
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
             local_announcement: Arc::new(ArcSwapOption::empty()),
@@ -1948,7 +1980,7 @@ impl MeshNode {
             replication_inbound_router: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "meshdb")]
             meshdb_inbound_router: Arc::new(parking_lot::RwLock::new(None)),
-            fold_router: Arc::new(parking_lot::RwLock::new(None)),
+            fold_router,
             fold_generations: Arc::new(DashMap::new()),
             #[cfg(feature = "dataforts")]
             greedy_observer: Arc::new(parking_lot::RwLock::new(None)),
@@ -8661,6 +8693,16 @@ impl MeshNode {
         &self.capability_index
     }
 
+    /// Shared reference to the capability fold (the Phase 3b
+    /// cutover target). New callers query the fold instead of
+    /// [`Self::capability_index`]; the legacy index is deleted
+    /// once every caller has been rewired.
+    pub fn capability_fold(
+        &self,
+    ) -> &Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>> {
+        &self.capability_fold
+    }
+
     /// Push the currently-stored local announcement (if any) to
     /// `peer_addr`. Called from the end of `connect` / `accept` so
     /// late joiners don't have to wait for a re-announce. No-op
@@ -10475,6 +10517,31 @@ mod fold_publisher_helpers_tests {
         assert!(
             node.fold_generations.contains_key(&(kind, fresh_class)),
             "fresh slot survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_fold_is_wired_at_construction() {
+        // Sub-step 3B-1 contract: every freshly-built MeshNode
+        // owns a CapabilityFold registered with the node's
+        // internal FoldRegistry, with the registry installed as
+        // the fold channel router. Pins the wiring so callers
+        // can rely on `mesh.capability_fold()` returning a
+        // queryable handle and the inbound dispatch arm
+        // routing SUBPROTOCOL_FOLD envelopes correctly.
+        let node = build_node_for_test().await;
+        // Fold handle is reachable, queries don't panic.
+        assert_eq!(node.capability_fold().stats().entries, 0);
+        // Channel router is installed by default.
+        assert!(node.has_fold_router());
+        // Router exposes the fold's stats — proves the
+        // capability fold is registered in the registry that
+        // backs the router.
+        let stats = node.fold_stats();
+        assert!(
+            stats.iter().any(|s| s.kind == <super::super::behavior::fold::CapabilityFold
+                as super::super::behavior::fold::FoldKind>::KIND_ID),
+            "capability fold registered in default router"
         );
     }
 }
