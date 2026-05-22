@@ -10463,6 +10463,7 @@ mod fold_publisher_helpers_tests {
                     state: super::super::behavior::fold::NodeState::Idle,
                     region: Some("us-east".into()),
                     price_quote: None,
+                    reflex_addr: None,
                 },
             )
             .await;

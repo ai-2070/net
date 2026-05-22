@@ -96,6 +96,14 @@ pub struct CapabilityMembership {
     /// workloads. Units intentionally opaque (operator
     /// decides — could be µ$/sec, µ$/job, µ$/GPU-hour).
     pub price_quote: Option<u64>,
+    /// Publisher's last-advertised public reflex `SocketAddr`.
+    /// Used by NAT-traversal rendezvous (stage 3) to look up
+    /// the punch target's public address. The publisher emits
+    /// this whenever it observes its own public side via a
+    /// reflex probe; receivers cache it across class entries
+    /// (one publisher tends to publish the same reflex across
+    /// every class it joins).
+    pub reflex_addr: Option<std::net::SocketAddr>,
 }
 
 /// Query shapes the [`CapabilityFold`] answers.
@@ -417,6 +425,30 @@ fn composite_query(
 #[allow(dead_code)]
 type _NoIndexAlias = NoIndex;
 
+/// Return `node_id`'s last-advertised reflex `SocketAddr`, or
+/// `None` if no entry from that publisher carries one. Walks the
+/// publisher's class entries via the `by_node` reverse index;
+/// O(num classes this publisher is in), typically 0-3. Used by
+/// NAT-traversal rendezvous (stage 3) — the punch coordinator
+/// looks up the target's public address before scheduling the
+/// punch fire.
+pub fn reflex_addr_for(
+    fold: &super::Fold<CapabilityFold>,
+    node_id: NodeId,
+) -> Option<std::net::SocketAddr> {
+    fold.with_state(|state| {
+        let keys = state.by_node.get(&node_id)?;
+        for key in keys {
+            if let Some(entry) = state.entries.get(key) {
+                if let Some(addr) = entry.payload.reflex_addr {
+                    return Some(addr);
+                }
+            }
+        }
+        None
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -437,6 +469,20 @@ mod tests {
         state: NodeState,
         region: Option<&str>,
     ) -> SignedAnnouncement<CapabilityMembership> {
+        sign_cap_with_reflex(keypair, publisher, generation, class, tags, state, region, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sign_cap_with_reflex(
+        keypair: &EntityKeypair,
+        publisher: NodeId,
+        generation: u64,
+        class: u64,
+        tags: Vec<&str>,
+        state: NodeState,
+        region: Option<&str>,
+        reflex_addr: Option<std::net::SocketAddr>,
+    ) -> SignedAnnouncement<CapabilityMembership> {
         SignedAnnouncement::sign(
             keypair,
             CapabilityFold::KIND_ID,
@@ -451,6 +497,7 @@ mod tests {
                 state,
                 region: region.map(String::from),
                 price_quote: None,
+                reflex_addr,
             },
         )
         .expect("sign succeeds")
@@ -888,6 +935,39 @@ mod tests {
     }
 
     #[test]
+    fn reflex_addr_for_returns_first_advertised_addr_across_publisher_classes() {
+        use std::net::SocketAddr;
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let addr: SocketAddr = "203.0.113.4:7000".parse().unwrap();
+
+        // Publisher 0xAA in two classes; only the second carries a
+        // reflex_addr. The lookup walks by_node and returns the
+        // first Some across the class entries.
+        fold.apply(sign_cap_with_reflex(
+            &kp, 0xAA, 1, 0x100, vec![], NodeState::Idle, None, None,
+        ))
+        .expect("class 0x100");
+        fold.apply(sign_cap_with_reflex(
+            &kp, 0xAA, 1, 0x101, vec![], NodeState::Idle, None, Some(addr),
+        ))
+        .expect("class 0x101");
+
+        assert_eq!(super::reflex_addr_for(&fold, 0xAA), Some(addr));
+        // Unknown node → None (not in by_node).
+        assert_eq!(super::reflex_addr_for(&fold, 0xBB), None);
+    }
+
+    #[test]
+    fn reflex_addr_for_returns_none_when_publisher_advertises_no_addr() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_cap(&kp, 0xAA, 1, 0x100, vec![], NodeState::Idle, None))
+            .expect("class 0x100");
+        assert_eq!(super::reflex_addr_for(&fold, 0xAA), None);
+    }
+
+    #[test]
     fn runtime_ttl_sweeps_stale_capability_entries() {
         let fold = new_fold();
         let kp = EntityKeypair::generate();
@@ -908,6 +988,7 @@ mod tests {
                 state: NodeState::Idle,
                 region: None,
                 price_quote: None,
+                reflex_addr: None,
             },
         )
         .unwrap();

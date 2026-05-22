@@ -35,8 +35,8 @@ mod tests;
 pub use wire::{EnvelopeMeta, SignedAnnouncement, WireError};
 pub use audit::{FoldAuditSink, NoopSink, RingFoldAuditSink, VecFoldAuditSink};
 pub use capability::{
-    CapabilityFilter, CapabilityFold, CapabilityIndexInner, CapabilityMatch, CapabilityMembership,
-    CapabilityQuery, HardwareSummary, NodeState,
+    reflex_addr_for, CapabilityFilter, CapabilityFold, CapabilityIndexInner, CapabilityMatch,
+    CapabilityMembership, CapabilityQuery, HardwareSummary, NodeState,
 };
 pub use dispatch::{
     DispatchError, FoldChannelRouter, FoldDispatch, FoldDispatchAdapter, FoldRegistry,
