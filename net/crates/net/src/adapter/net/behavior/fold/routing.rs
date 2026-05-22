@@ -1,43 +1,22 @@
-//! Phase 4a — `RoutingFold` (additive).
+//! `RoutingFold` — folded routing-table surface.
 //!
-//! The new fold-flavored routing surface: each destination
-//! ([`NodeId`]) carries one entry whose payload is the best
-//! known route to it. Multiple publishers can announce routes
-//! to the same destination; merge keeps the lowest-metric entry.
-//!
-//! ## Phase 4a vs 4b
-//!
-//! This commit ships the new fold as **pure-additive** —
-//! callers of the legacy [`RoutingTable`](super::super::super::route::RoutingTable)
-//! are NOT yet rewired and the legacy module is NOT deleted.
-//! That's Phase 4b (next session): the cutover spans ~50 call
-//! sites across `route.rs`, `router.rs`, `reroute.rs`,
-//! `mesh.rs`, and `mod.rs`, plus the pingwave packet repurpose
-//! into `SignedAnnouncement<RouteAnnouncement>` envelopes. Per
-//! the stripped plan, that's an atomic same-PR cutover and
-//! deserves a focused session.
-//!
-//! For now [`RoutingFold`] coexists with the legacy table —
-//! callers that want the new shape can wire it up via the
-//! framework's standard recipe (`Fold::new` → `registry.register` →
-//! `node.set_fold_router`). Nothing depends on it yet.
-//!
-//! ## Merge semantics
-//!
-//! Lower metric wins. Ties break on freshness (the incoming
+//! Each destination ([`NodeId`]) carries one entry whose payload
+//! is the best known route to it. Multiple publishers can
+//! announce routes to the same destination; merge keeps the
+//! lowest-metric entry, breaking ties on freshness (the incoming
 //! announcement displaces an equal-metric existing entry so a
-//! stale route doesn't pin a route slot forever). Generation
-//! is consulted only for SAME-publisher updates as the anti-
-//! reorder mechanism; cross-publisher routes compete strictly
-//! on metric.
+//! stale route doesn't pin the slot forever). Generation is
+//! consulted only for SAME-publisher updates as the anti-reorder
+//! mechanism; cross-publisher routes compete strictly on metric.
 //!
-//! ## TTL
+//! Coexists with the legacy
+//! [`RoutingTable`](super::super::super::route::RoutingTable);
+//! the cutover is tracked separately.
 //!
-//! `DEFAULT_TTL = 300s` matches the plan's recommendation —
-//! generous enough to absorb pingwave jitter, tight enough that
-//! a node that genuinely drops off the mesh times out of the
-//! routing table within five minutes. The fold runtime's
-//! background sweeper enforces this.
+//! `DEFAULT_TTL = 300s` is generous enough to absorb pingwave
+//! jitter, tight enough that a node that genuinely drops off the
+//! mesh times out of the routing table within five minutes. The
+//! fold runtime's background sweeper enforces this.
 
 use std::net::SocketAddr;
 use std::time::Duration;

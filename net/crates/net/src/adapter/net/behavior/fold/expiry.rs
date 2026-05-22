@@ -1,36 +1,20 @@
-//! Phase 1B background expiry sweeper.
+//! Background expiry sweeper.
 //!
-//! The Phase 1 [`Fold<K>`](super::Fold) runtime stamps an
-//! `expires_at: Instant` on every applied entry but doesn't
-//! actually remove anything when that instant passes — until a
-//! later apply at the same key, every entry lingers in the
-//! primary store and the [`FoldMetrics::entries`](super::FoldMetrics)
-//! gauge stays high. Phase 1B closes that gap with a per-fold
-//! background task that walks the state on a configurable cadence
-//! and evicts expired entries.
+//! [`Fold<K>`](super::Fold) stamps an `expires_at: Instant` on
+//! every applied entry; the background task spawned from
+//! [`Fold::new`](super::Fold::new) walks the state on a
+//! configurable cadence and evicts entries past that instant.
 //!
-//! ## Synchronous core: [`sweep_expired`]
+//! [`sweep_expired`] is a plain synchronous walk-and-remove so
+//! tests can drive expiry deterministically without spinning a
+//! tokio runtime; the background task is a thin loop on top of
+//! it. The task holds a [`Weak`] reference to the fold's inner
+//! state so it exits naturally when the last [`Fold<K>`] drops.
 //!
-//! The sweep is a plain synchronous walk-and-remove so tests can
-//! drive expiry deterministically without spinning a tokio
-//! runtime: construct the fold, apply an entry with a short TTL,
-//! sleep past it, call `fold.sweep_expired_now()`, observe the
-//! eviction. The background task is a thin loop on top of the
-//! same primitive.
-//!
-//! ## Background task: [`spawn_expiry_task`]
-//!
-//! Spawned from [`Fold::new`](super::Fold::new) onto the ambient
-//! tokio runtime. Holds a [`Weak`] reference to the fold's inner
-//! state so it exits naturally when the last [`Fold<K>`] drops —
-//! no shutdown signal needed, no race against `Drop`.
-//!
-//! Wake cadence defaults to [`DEFAULT_SWEEP_INTERVAL`] (500 ms),
-//! a compromise between "TTL boundary observable within a
-//! human-perceivable window" and "no per-second wakes when the
-//! fold is idle." The cadence is configurable per fold via
-//! [`super::Fold::with_sweep_interval`] for tests + workloads
-//! that want tighter expiry.
+//! [`DEFAULT_SWEEP_INTERVAL`] (500 ms) is a compromise between
+//! "TTL boundary observable within a human-perceivable window"
+//! and "no per-second wakes when the fold is idle."
+//! [`super::Fold::with_sweep_interval`] overrides per fold.
 
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};

@@ -1,24 +1,15 @@
-//! Fold-layer wire envelope.
-//!
-//! Phase 1 ships the in-memory shape only — signature verification
-//! and the wire codec land in Phase 2. The shape is held stable
-//! here so the runtime, the snapshot serializer, and (Phase 2)
-//! the dispatch layer agree on what an "announcement" looks like
-//! before any actual bytes flow.
-//!
-//! The plan's wire-format spec — see
-//! `docs/plans/SCALING_MULTIFOLD_PLAN.md` § Wire format — is the
-//! authority for field semantics and on-wire ordering.
+//! Fold-layer wire envelope. See
+//! `docs/plans/SCALING_MULTIFOLD_PLAN.md` § Wire format for the
+//! authoritative field semantics and on-wire ordering.
 
 use serde::{Deserialize, Serialize};
 
 use super::state::NodeId;
 
 /// Ed25519 signature size in bytes (64). The on-wire signature
-/// is a fixed-length slice; Phase 1 stores it as a `Vec<u8>` so
-/// the derived `Serialize`/`Deserialize` impls work without a
-/// `serde-big-array` dependency, and Phase 2 narrows it back to
-/// `[u8; SIGNATURE_LEN]` when the wire codec lands.
+/// is a fixed-length slice stored here as a `Vec<u8>` so the
+/// derived `Serialize`/`Deserialize` impls work without a
+/// `serde-big-array` dependency.
 pub const SIGNATURE_LEN: usize = 64;
 
 /// Per-envelope metadata grouped to keep the `sign` /
@@ -40,32 +31,28 @@ pub struct EnvelopeMeta {
     pub flags: u8,
 }
 
-/// Sentinel signature bytes used in Phase 1 tests and any
-/// dispatch path that hasn't been routed through Phase 2's
-/// signing pipeline yet. Phase 2's verifier rejects this value
-/// unconditionally; until then it carries the "envelope is
-/// well-formed, signature is a placeholder" marker through the
-/// in-memory shape.
+/// Sentinel signature bytes — all-zero, [`SIGNATURE_LEN`] wide.
+/// The verifier rejects this unconditionally; it carries the
+/// "envelope is well-formed, signature is a placeholder" marker
+/// through tests and synthetic in-process producers that don't
+/// have a keypair handy.
 pub fn placeholder_signature() -> Vec<u8> {
     vec![0u8; SIGNATURE_LEN]
 }
 
 /// One signed announcement on a fold channel. The `P` parameter
-/// is the per-fold payload type (`FoldKind::Payload`).
+/// is the per-fold payload type ([`super::FoldKind::Payload`]).
 ///
-/// On the wire (Phase 2): postcard-encoded with field-ordered
-/// structs; the signature is Ed25519 over the canonical encoding
-/// of every other field. The `subnet_id` is intentionally NOT a
-/// member of this struct — it lives on the underlying
-/// `NetHeader.subnet_id` per the plan's
-/// "Composition with the existing subnet system" section, which
-/// avoids dual-source-of-truth between the wire envelope and
-/// the header.
+/// Postcard-encoded with field-ordered structs; the signature is
+/// Ed25519 over the canonical encoding of every other field.
+/// `subnet_id` is intentionally NOT a member here — it lives on
+/// the underlying `NetHeader.subnet_id` so the wire envelope and
+/// the header don't carry duplicate scoping state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedAnnouncement<P> {
     /// Fold this announcement targets — [`super::FoldKind::KIND_ID`].
-    /// The dispatch layer (Phase 2) routes on this and rejects
-    /// announcements whose `kind` is unregistered.
+    /// The dispatch layer routes on this and rejects announcements
+    /// whose `kind` is unregistered.
     pub kind: u16,
     /// Class within the fold. For capability, this is the
     /// capability-class hash; for routing, a tier identifier;
@@ -109,14 +96,9 @@ pub struct SignedAnnouncement<P> {
     /// [`super::state::FoldEntry::payload`] field on accept.
     pub payload: P,
     /// Ed25519 signature over the canonical encoding of every
-    /// other field. Phase 1 holds this as a `Vec<u8>` of length
-    /// [`SIGNATURE_LEN`] so the derived serde impls work
-    /// without a fixed-array codec dependency; Phase 2 narrows
-    /// it to `[u8; SIGNATURE_LEN]` when the wire codec lands
-    /// and plumbs in the real verifier. Until then producers
-    /// stamp [`placeholder_signature`] and the (forthcoming)
-    /// dispatch layer rejects any signature whose bytes are
-    /// all-zero on the slow path.
+    /// other field. Stored as a `Vec<u8>` of length
+    /// [`SIGNATURE_LEN`] so the derived serde impls work without
+    /// a fixed-array codec dependency.
     pub signature: Vec<u8>,
 }
 

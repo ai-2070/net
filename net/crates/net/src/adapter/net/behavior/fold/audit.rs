@@ -1,19 +1,14 @@
-//! Phase 1B audit-event sink trait + plumbing.
+//! Audit-event sink trait + plumbing.
 //!
-//! Phase 1's [`FoldKind::audit_event`](super::FoldKind::audit_event)
-//! is called on every applied transition but the returned
-//! [`AuditEvent`](super::AuditEvent) is currently dropped at the
-//! call site (it has no destination). Phase 1B wires a sink
-//! trait so callers can install their own destination —
-//! `tracing` adapter, the project's signed-audit chain, a
-//! Prometheus counter exporter, an in-memory ring for tests.
-//!
-//! Default install: nothing. Folds constructed via
-//! [`super::Fold::new`] start with `audit_sink == None` so the
-//! `K::audit_event` calls remain effectively no-ops for any
-//! fold that didn't opt into audit emission. The sink can be
-//! installed at any time via
-//! [`super::Fold::set_audit_sink`].
+//! [`FoldKind::audit_event`](super::FoldKind::audit_event) is
+//! called on every applied transition; the returned
+//! [`AuditEvent`](super::AuditEvent) is forwarded to the
+//! installed [`FoldAuditSink`]. Default install is `None`, in
+//! which case audit emission is effectively a no-op; sinks can
+//! be installed at any time via
+//! [`super::Fold::set_audit_sink`] — `tracing` adapter, the
+//! project's signed-audit chain, a Prometheus counter exporter,
+//! an in-memory ring for tests, etc.
 
 use super::AuditEvent;
 
@@ -96,11 +91,11 @@ impl FoldAuditSink for VecFoldAuditSink {
 /// Bounded ring-buffer audit sink. Keeps the most recent
 /// `capacity` events; oldest are dropped first when full.
 ///
-/// Per Phase 6a of the multifold plan, this is the sink the
-/// Deck FOLDS panel's "recent transitions" view consumes: an
-/// operator wants the last N events for a fold, NOT a complete
-/// history. Bounded capacity also makes this safe to install
-/// on a high-throughput fold without unbounded memory growth.
+/// This is the sink the Deck FOLDS panel's "recent transitions"
+/// view consumes — operators want the last N events, not a
+/// complete history. Bounded capacity also makes this safe to
+/// install on a high-throughput fold without unbounded memory
+/// growth.
 ///
 /// Thread-safe — the inner `VecDeque` is wrapped in a
 /// `parking_lot::Mutex` so `record` is callable from concurrent

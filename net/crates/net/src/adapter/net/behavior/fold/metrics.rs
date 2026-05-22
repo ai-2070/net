@@ -1,25 +1,20 @@
 //! Per-fold metric counters.
 //!
-//! Phase 1 ships the counters that the apply / query / evict /
-//! snapshot paths bump synchronously. Histograms (apply duration,
-//! query duration, subscription lag) are recorded as raw counts
-//! here and surfaced by the Prometheus / Deck adapters when the
-//! observability layer plumbs the rest of Phase 6's pipework
-//! through.
+//! The apply / query / evict / snapshot paths bump these
+//! synchronously; the Prometheus / Deck adapters sample them
+//! through [`FoldStats`].
 //!
-//! All counters are lock-free atomics so the apply hot path never
-//! contends with metrics readers.
+//! All counters are lock-free atomics so the apply hot path
+//! never contends with metrics readers.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 /// Serializable per-fold snapshot of the live [`FoldMetrics`]
-/// counters + a small amount of static identity (`kind` u16 +
-/// channel prefix). Per Phase 6a of the multifold plan, this
-/// is the shape the operator-facing surface (the
-/// `net fold list` / `net fold stats <kind>` CLI commands, the
-/// Deck FOLDS panel, the Prometheus exporter) reads when it
+/// counters plus static identity (`kind` u16 + channel prefix).
+/// The operator-facing surface (`net fold list`, the Deck FOLDS
+/// panel, the Prometheus exporter) consumes this shape when it
 /// wants a coherent picture of one fold.
 ///
 /// Sampled via [`super::Fold::stats`] for the fold-side view, or
@@ -103,13 +98,12 @@ pub struct FoldMetrics {
     /// the merge contest, generation was out of order, etc.).
     applies_rejected: AtomicU64,
     /// Entries removed because the TTL sweeper found
-    /// `expires_at < now`. Phase 1B follow-up populates this.
+    /// `expires_at < now`.
     expiries: AtomicU64,
     /// Entries removed via [`super::Fold::evict_node`].
     /// Operator action / SWIM-declared-dead path bumps this.
     evictions: AtomicU64,
-    /// Total queries served. Read-only counter; the per-query
-    /// duration histogram is a Phase 1B follow-up.
+    /// Total queries served.
     queries: AtomicU64,
     /// Snapshots produced via [`super::Fold::snapshot`].
     snapshots_taken: AtomicU64,
@@ -161,9 +155,8 @@ impl FoldMetrics {
     }
 
     /// Decrement the entry gauge and bump the expiries counter.
-    /// Called by the Phase 1B background sweep
-    /// ([`super::expiry::sweep_expired`]) once per expired
-    /// entry removed. Distinct from [`Self::on_evict`] because
+    /// Called by [`super::expiry::sweep_expired`] once per
+    /// expired entry. Distinct from [`Self::on_evict`] because
     /// expiries are TTL-driven and evictions are operator /
     /// SWIM-driven — operators tuning TTL want to see the two
     /// counters separately.
@@ -223,8 +216,7 @@ impl FoldMetrics {
         self.applies_inserted() + self.applies_replaced() + self.applies_rejected()
     }
 
-    /// TTL-driven expiries since start. Phase 1B populates this
-    /// once the sweeper lands; Phase 1 always reports `0`.
+    /// TTL-driven expiries since start.
     pub fn expiries(&self) -> u64 {
         self.expiries.load(Ordering::Relaxed)
     }

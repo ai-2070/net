@@ -1,18 +1,17 @@
 //! Generic in-memory state for a [`Fold<K>`](super::Fold).
 //!
-//! Phase 1 deliverable per `docs/plans/SCALING_MULTIFOLD_PLAN.md`.
 //! The fold runtime is parameterized by a single `FoldKind` trait
 //! implementor (capability / routing / reservation / ...); this
 //! module hosts the runtime-shared data structures: the per-key
 //! entry record, the key→entry primary store, the node_id→keys
 //! reverse index used by [`super::Fold::evict_node`], the merge
-//! action enum that `FoldKind::merge` returns, the transition enum
-//! that drives audit emission, and the [`FoldIndex`] trait that
+//! action enum that `FoldKind::merge` returns, the transition
+//! enum that drives audit emission, and the [`FoldIndex`] trait
 //! domain-specific secondary indices implement.
 //!
 //! Nothing in this module knows anything about wire format,
 //! signature verification, channels, or audit chains — those
-//! belong to the dispatch layer (Phase 2) and the runtime layer
+//! belong to the dispatch layer and the runtime layer
 //! ([`super`]).
 
 use std::collections::{HashMap, HashSet};
@@ -62,10 +61,8 @@ pub struct FoldEntry<K: FoldKind> {
     /// Wall-clock instant at which this entry becomes stale.
     /// Computed at apply time as
     /// `received_at + ann.ttl_secs.unwrap_or(K::DEFAULT_TTL)`.
-    /// The expiry sweeper (Phase 1B follow-up) removes entries
-    /// past this time; until then, queries see the entry but
-    /// can compare against `Instant::now()` to filter stale
-    /// rows if they care.
+    /// The background expiry sweeper removes entries past this
+    /// time.
     pub expires_at: Instant,
 }
 
@@ -207,9 +204,7 @@ pub enum EntryTransition<'a, K: FoldKind> {
         reason: &'a str,
     },
     /// Entry was removed by the TTL sweeper because
-    /// `expires_at < now`. Phase 1B follow-up wires the sweeper;
-    /// this variant is exposed now so audit + metrics can carry
-    /// it from the start without an enum-shape revision later.
+    /// `expires_at < now`.
     Expired {
         /// Key whose entry expired.
         key: &'a K::Key,
@@ -275,10 +270,9 @@ pub enum ApplyOutcome {
 }
 
 /// Errors the runtime returns from the apply / snapshot path.
-/// Phase 1 surfaces only `InvalidGeneration` (a defensive guard
-/// against announcements whose generation is `0`, which would
-/// silently lose to the first real announcement); Phase 2 adds
-/// `BadSignature` / `UnknownKind` / etc. as dispatch lands.
+/// Dispatch-layer errors (bad signature, unknown kind) flow
+/// through [`super::WireError`] / [`super::DispatchError`]
+/// instead.
 #[derive(Debug, thiserror::Error)]
 pub enum FoldError {
     /// Apply rejected because the announcement's generation is

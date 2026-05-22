@@ -1546,32 +1546,27 @@ pub struct MeshNode {
         Arc<parking_lot::RwLock<Option<Arc<dyn super::behavior::meshdb::MeshDbInboundRouter>>>>,
     /// Optional fold-framework channel router. Installed via
     /// [`Self::set_fold_router`]; the inbound dispatch arm for
-    /// [`super::behavior::fold::SUBPROTOCOL_FOLD`] (per the
-    /// multifold plan's Phase 2B) routes every event in a fold
-    /// packet through this router after resolving the
-    /// publisher's [`EntityId`] from [`Self::peer_entity_ids`].
-    /// `None` = fold packets dropped silently.
+    /// [`super::behavior::fold::SUBPROTOCOL_FOLD`] routes every
+    /// event in a fold packet through this router after
+    /// resolving the publisher's [`EntityId`] from
+    /// [`Self::peer_entity_ids`]. `None` = fold packets dropped
+    /// silently.
     fold_router:
         Arc<parking_lot::RwLock<Option<Arc<dyn super::behavior::fold::FoldChannelRouter>>>>,
     /// Per-`(kind, class)` monotonic generation counter for fold
-    /// announcements emitted by this node. The publisher
-    /// helpers ([`Self::publish_capability_membership`],
-    /// [`Self::publish_route`], [`Self::publish_reservation`])
-    /// bump this on every send so the wire envelope carries
-    /// the next generation without callers needing to thread
-    /// the counter themselves. Sharded by `(kind, class)` so
-    /// concurrent publishes to different folds (or different
-    /// classes within a fold) don't contend.
+    /// announcements emitted by this node. The publisher helpers
+    /// bump this on every send so the wire envelope carries the
+    /// next generation without callers threading the counter
+    /// themselves. Sharded by `(kind, class)` so concurrent
+    /// publishes to different folds (or different classes within
+    /// a fold) don't contend.
     ///
-    /// Phase 2C / 6b-min note: this is the in-memory shape.
-    /// The plan's "Open question #2" recommends persisting per-
-    /// `(kind, class)` counters in a small file so they survive
-    /// restarts — the persistence layer can wrap this `DashMap`
-    /// later without changing the helper signatures. Until
-    /// then, restarts reset the counters; receivers re-accept
-    /// the first post-restart announcement at generation 1
-    /// because their stale entry is past the runtime TTL by
-    /// the time the publisher comes back.
+    /// In-memory only — restarts reset the counters; receivers
+    /// re-accept the first post-restart announcement at
+    /// generation 1 because the stale entry is past the runtime
+    /// TTL by the time the publisher comes back. A persistence
+    /// layer could wrap this `DashMap` later if a tighter restart
+    /// story is needed.
     fold_generations: Arc<DashMap<(u16, u64), AtomicU64>>,
     /// Optional greedy-LRU observer. `Redex` installs one of these
     /// via [`Self::set_greedy_observer`] when the operator calls
@@ -3825,13 +3820,13 @@ impl MeshNode {
         }
 
         // Fold framework: signed-announcement traffic on
-        // `SUBPROTOCOL_FOLD`. Per the multifold plan's Phase 2B,
-        // every event in the packet is one
+        // `SUBPROTOCOL_FOLD`. Every event in the packet is one
         // `SignedAnnouncement<P>` postcard envelope; the
-        // `FoldChannelRouter` (typically a `FoldRegistry`) decodes
-        // + verifies + dispatches each to its registered
-        // `Fold<K>` by the envelope's `kind` u16. `None` router =
-        // drop silently, mirroring meshdb / replication.
+        // installed `FoldChannelRouter` (typically a
+        // `FoldRegistry`) decodes + verifies + dispatches each
+        // to its registered `Fold<K>` by the envelope's `kind`
+        // u16. `None` router = drop silently, mirroring meshdb /
+        // replication.
         //
         // Publisher resolution: the inbound session's `node_id`
         // maps to an `EntityId` via the local `peer_entity_ids`
@@ -6992,16 +6987,10 @@ impl MeshNode {
 
     /// Encode a [`SignedAnnouncement<P>`] and send it to one peer
     /// as a [`super::behavior::fold::SUBPROTOCOL_FOLD`] frame.
-    ///
-    /// The publisher-side half of the multifold plan's Phase 2B
-    /// wire path: the receiver's mesh inbound arm (see
-    /// `dispatch_packet`'s `SUBPROTOCOL_FOLD` branch) decodes +
-    /// verifies + routes to the right typed
-    /// [`super::behavior::fold::Fold<K>`] via the installed
-    /// [`super::behavior::fold::FoldChannelRouter`]. Caller is
-    /// responsible for selecting `peer_addr` — `Fold` doesn't
-    /// own subscriber routing yet (deferred to Phase 3 where
-    /// concrete folds plug into the existing channel layer).
+    /// The receiver's `dispatch_packet` arm decodes + verifies +
+    /// routes to the right typed [`super::behavior::fold::Fold<K>`]
+    /// via the installed
+    /// [`super::behavior::fold::FoldChannelRouter`].
     ///
     /// Returns the encoded byte count for metrics / diagnostics.
     pub async fn publish_fold_to_peer<P>(
@@ -7026,14 +7015,6 @@ impl MeshNode {
     /// [`Self::announce_capabilities_with`] broadcast loop —
     /// per-peer send failures are logged and skipped rather
     /// than short-circuiting the rest of the fan-out.
-    ///
-    /// Phase 2C convenience: subscriber-aware publishing (using
-    /// the existing channel/roster layer with `SUBPROTOCOL_FOLD`
-    /// stamped on the outbound packet) is a Phase 3 follow-up
-    /// scoped with whichever concrete fold lights up first. For
-    /// now, broadcast-to-all is the right shape for the
-    /// CapabilityFold publish surface (every peer participates
-    /// in capability discovery).
     ///
     /// Returns the number of peers the announcement was
     /// successfully shipped to.
@@ -7065,27 +7046,12 @@ impl MeshNode {
     }
 
     /// Allocate the next monotonic generation for one
-    /// `(kind, class)` slot. Lazily inserts the counter on
-    /// first access; subsequent calls fetch-add. Pre-increment
-    /// semantic — returned value is `prior + 1`, so first call
-    /// returns `1` (the wire format reserves `0` as the
-    /// "uninitialized" sentinel that
+    /// `(kind, class)` slot. Pre-increment semantic — first call
+    /// returns `1`, since the wire format reserves `0` as the
+    /// "uninitialized" sentinel
     /// [`super::behavior::fold::FoldError::InvalidGeneration`]
-    /// rejects).
-    ///
-    /// `pub(crate)` so the multifold tests can pin the counter
-    /// behavior without going through the full publish path;
-    /// production callers reach this through the per-fold
-    /// publisher helpers ([`Self::publish_capability_membership`]
-    /// etc.) which manage the counter automatically.
+    /// rejects.
     pub(crate) fn next_fold_generation(&self, kind: u16, class: u64) -> u64 {
-        // `entry.or_insert_with` is lock-free per-shard in
-        // DashMap; the AtomicU64::fetch_add is Relaxed because
-        // a single publisher emits generations sequentially on
-        // its own send path — no observers race against the
-        // counter, only the wire envelope carries it. `+ 1`
-        // makes the first call return 1 (gen=0 is reserved as
-        // the wire sentinel for "uninitialized").
         self.fold_generations
             .entry((kind, class))
             .or_insert_with(|| AtomicU64::new(0))
@@ -8014,19 +7980,8 @@ impl MeshNode {
     }
 
     /// Install (or uninstall) the fold-framework channel router.
-    ///
-    /// Per the multifold plan's Phase 2B, the inbound dispatch
-    /// arm for [`super::behavior::fold::SUBPROTOCOL_FOLD`]
-    /// decodes each event in a fold packet, resolves the
-    /// publisher's [`EntityId`] from the inbound session's
-    /// `node_id` via the local `peer_entity_ids` map, and hands
-    /// the bytes off to `router.try_route(&publisher, &event)`.
-    /// Absent router = fold packets dropped silently (mirrors
-    /// the meshdb router's behaviour).
-    ///
-    /// Idempotent: re-installing replaces the previous handle.
-    /// Hot-path cost is one `parking_lot::RwLock` read per
-    /// inbound `SUBPROTOCOL_FOLD` frame.
+    /// Absent router = fold packets dropped silently.
+    /// Idempotent; re-installing replaces the previous handle.
     pub fn set_fold_router(
         &self,
         router: Option<Arc<dyn super::behavior::fold::FoldChannelRouter>>,
@@ -8042,18 +7997,10 @@ impl MeshNode {
     }
 
     /// Aggregated [`super::behavior::fold::FoldStats`] for every
-    /// fold the installed router addresses. Per Phase 6b — the
-    /// `net-mesh fold list` CLI subcommand and the Deck FOLDS
-    /// panel call into this once per scrape tick and render
-    /// one row per returned `FoldStats`.
-    ///
-    /// Returns an empty `Vec` when no router is installed (the
-    /// "no folds configured" case) AND when the installed
-    /// router is a stub that doesn't track stats (the test-
-    /// router case — see
-    /// [`super::behavior::fold::FoldChannelRouter::stats`]'s
-    /// default impl). The [`super::behavior::fold::FoldRegistry`]
-    /// override returns real aggregation.
+    /// fold the installed router addresses. The
+    /// `net-mesh fold list` CLI command and the Deck FOLDS panel
+    /// call this once per scrape tick. Returns an empty `Vec`
+    /// when no router is installed.
     pub fn fold_stats(&self) -> Vec<super::behavior::fold::FoldStats> {
         let guard = self.fold_router.read();
         let Some(router) = guard.as_ref() else {

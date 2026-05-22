@@ -1,37 +1,14 @@
-//! Multi-fold framework — Phase 1.
+//! Multi-fold framework.
 //!
 //! A generic state-aggregation runtime parameterized by the
 //! [`FoldKind`] trait. One implementation handles apply, query,
-//! snapshot, and node-eviction for every concrete fold; the
-//! concrete folds (capability, routing, reservation per the
-//! plan's Phase 3 / 4 / 5) plug in by implementing the trait.
+//! snapshot, audit emission, TTL expiry, and node eviction for
+//! every concrete fold. The three built-in folds —
+//! [`CapabilityFold`], [`RoutingFold`], [`ReservationFold`] —
+//! plug in by implementing the trait.
 //!
-//! Phase 1 scope (this commit):
-//!
-//! - [`FoldKind`] trait
-//! - [`Fold<K>`] runtime struct
-//! - [`Fold::apply`] / [`Fold::query`] / [`Fold::snapshot`] /
-//!   [`Fold::restore`] / [`Fold::evict_node`]
-//! - Per-fold metric counters via [`FoldMetrics`]
-//! - The wire-envelope shape ([`SignedAnnouncement`]) and the
-//!   in-memory state container ([`FoldState`]) that the apply
-//!   path operates on
-//!
-//! Deferred:
-//!
-//! - **Phase 1B** — background expiry sweeper, audit emission
-//!   wiring (`FoldKind::audit_event` is called but the audit
-//!   sink plumbing isn't connected to the project's audit chain
-//!   yet).
-//! - **Phase 2** — wire codec, signature verification, channel
-//!   dispatch via [`FoldRegistry`] (the registry itself lands in
-//!   Phase 2).
-//! - **Phase 3 / 4 / 5** — concrete `CapabilityFold` /
-//!   `RoutingFold` / `ReservationFold` impls, which also delete
-//!   the legacy `CapabilityIndex` / `RoutingTable` modules per
-//!   the stripped plan.
-//!
-//! See `docs/plans/SCALING_MULTIFOLD_PLAN.md` for the full design.
+//! See `docs/plans/SCALING_MULTIFOLD_PLAN.md` for the design
+//! rationale.
 
 use std::hash::Hash;
 use std::sync::Arc;
@@ -164,10 +141,8 @@ pub trait FoldKind: Send + Sync + Sized + 'static {
     /// [`FoldState`] + [`Self::Index`]. Read-only.
     fn query(state: &FoldState<Self>, index: &Self::Index, query: Self::Query) -> Self::Result;
 
-    /// Optional audit emission. Phase 1 calls this but the
-    /// returned `AuditEvent` isn't yet routed into the project's
-    /// audit chain — Phase 1B wires the sink. Default: emit
-    /// nothing.
+    /// Optional audit emission. Returned events flow to the
+    /// installed [`FoldAuditSink`]. Default: emit nothing.
     fn audit_event(transition: EntryTransition<'_, Self>) -> Option<AuditEvent> {
         let _ = transition;
         None
@@ -227,33 +202,25 @@ pub struct AuditEvent {
 /// index`; query takes both read locks in the same order.
 /// Mixing those orders would deadlock; the runtime never does.
 ///
-/// Phase 1B additions: an optional [`FoldAuditSink`] receives
-/// transition events emitted by [`FoldKind::audit_event`], and a
-/// background tokio task wakes every
-/// [`DEFAULT_SWEEP_INTERVAL`] (or the per-fold override) to
-/// evict entries past their TTL. The task holds `Weak`
-/// references to the shared state, so dropping the fold ends
-/// the task naturally — no explicit shutdown signal needed.
+/// An optional [`FoldAuditSink`] receives transition events
+/// emitted by [`FoldKind::audit_event`], and a background tokio
+/// task wakes every [`DEFAULT_SWEEP_INTERVAL`] (or the per-fold
+/// override) to evict entries past their TTL. The task holds
+/// `Weak` references to the shared state, so dropping the fold
+/// ends the task naturally — no explicit shutdown signal needed.
 pub struct Fold<K: FoldKind> {
     state: Arc<RwLock<FoldState<K>>>,
     index: Arc<RwLock<K::Index>>,
     metrics: Arc<FoldMetrics>,
-    /// Optional audit-event destination. Default install is
-    /// `None`; `K::audit_event` invocations whose returned
-    /// [`AuditEvent`] would have been recorded are then a no-op
-    /// at the call site. Installed via
-    /// [`Self::set_audit_sink`]; the `RwLock<Option<...>>`
-    /// shape mirrors the meshdb / replication router slots so
-    /// install / uninstall is hot-swappable without
-    /// reconstructing the fold.
+    /// Optional audit-event destination installed via
+    /// [`Self::set_audit_sink`]. Default `None`; `K::audit_event`
+    /// invocations are then no-ops at the call site.
     audit_sink: Arc<RwLock<Option<Arc<dyn FoldAuditSink>>>>,
-    /// Background-sweeper join handle. Aborted in
-    /// [`Self::drop`]; the weakly-referenced state inside the
-    /// task also lets the task exit on its own when the last
-    /// `Fold<K>` is dropped, but `JoinHandle::abort` shortens
-    /// the tail latency from "one sweep interval" to "next
-    /// `tick`-yield" so tests that construct + drop many folds
-    /// rapidly don't accumulate stale tasks.
+    /// Background-sweeper join handle. Aborted in [`Self::drop`]
+    /// so tests that construct + drop many folds rapidly don't
+    /// accumulate stale tasks (the weakly-referenced state
+    /// inside the task would let it exit on its own, but only
+    /// after one sweep-interval tick).
     sweep_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -278,15 +245,11 @@ impl<K: FoldKind> Fold<K> {
         let metrics = Arc::new(FoldMetrics::new());
         let audit_sink: Arc<RwLock<Option<Arc<dyn FoldAuditSink>>>> = Arc::new(RwLock::new(None));
 
-        // Spawn the background sweeper only if (a) the interval
-        // is non-zero AND (b) we're running on a tokio runtime.
-        // `Handle::try_current` returns `Err` outside a runtime
-        // — synchronous test paths construct folds without a
-        // runtime and drive expiry via `sweep_expired_now`. The
-        // Phase 2B receiver path always has a runtime because
-        // `dispatch_packet` is reached from a tokio-spawned
-        // task; the test-only no-runtime path is the only
-        // place this branch hits `None`.
+        // Spawn the background sweeper only on a non-zero interval
+        // AND from inside a tokio runtime. Synchronous test paths
+        // (without a runtime) drive expiry via `sweep_expired_now`;
+        // the inbound dispatch path always has a runtime, so
+        // production never hits the `None` branch.
         let sweep_handle = if interval.is_zero()
             || tokio::runtime::Handle::try_current().is_err()
         {
@@ -310,26 +273,21 @@ impl<K: FoldKind> Fold<K> {
         }
     }
 
-    /// Apply a signed announcement.
+    /// Apply a verified signed announcement to the fold.
     ///
-    /// The flow:
-    /// 1. Reject `generation == 0` (wire-format sentinel).
-    /// 2. Compute the key via [`FoldKind::key_for`].
-    /// 3. Acquire `state` then `index` write locks in fixed
-    ///    order.
-    /// 4. Consult [`FoldKind::merge`] against the existing entry.
-    /// 5. On Insert / Replace: update `entries`, `by_node`, the
-    ///    secondary index, and the metric counters.
-    /// 6. On Reject: bump the rejected-applies counter and
-    ///    return [`ApplyOutcome::Rejected`].
-    /// 7. Emit any [`FoldKind::audit_event`] result (Phase 1
-    ///    discards; Phase 1B will route into the audit chain).
+    /// Rejects the wire-format `generation == 0` sentinel, then
+    /// acquires `state` and `index` write locks (in that fixed
+    /// order) and consults [`FoldKind::merge`] against the
+    /// existing entry. Insert / Replace updates the primary
+    /// store, `by_node` reverse index, secondary index, and
+    /// metric counters; Reject bumps the rejected-applies
+    /// counter and returns [`ApplyOutcome::Rejected`]. Any
+    /// [`FoldKind::audit_event`] result is forwarded to the
+    /// installed [`FoldAuditSink`].
     ///
-    /// Signature verification is the dispatch layer's job
-    /// (Phase 2); this method assumes the caller already
-    /// validated the envelope's `signature`. Tests pass
-    /// [`SignedAnnouncement::placeholder`]-stamped envelopes
-    /// through directly.
+    /// Signature verification is the dispatch layer's job; this
+    /// method trusts the caller. Tests bypass dispatch with
+    /// [`SignedAnnouncement::placeholder`]-stamped envelopes.
     pub fn apply(
         &self,
         ann: SignedAnnouncement<K::Payload>,
@@ -484,24 +442,15 @@ impl<K: FoldKind> Fold<K> {
     /// the dump → restore boundary (see
     /// [`FoldSnapshot::rehydrate_entry`]).
     pub fn restore(&self, snap: FoldSnapshot<K>, force: bool) -> Result<(), FoldError> {
-        if snap.kind != K::KIND_ID {
-            // Caller fed a snapshot from a different fold kind;
-            // refuse explicitly. This is a configuration bug,
-            // not a runtime error — handle by returning a
-            // specific variant if Phase 2 wants finer error
-            // shaping. For Phase 1 we surface the wrong-kind
-            // case as a debug_assert (snapshots are produced by
-            // this codebase and the test suite catches mis-
-            // dispatch) and proceed; in production the dispatch
-            // layer should never hand a foreign-kind snapshot
-            // here.
-            debug_assert!(
-                snap.kind == K::KIND_ID,
-                "FoldSnapshot::kind={} does not match K::KIND_ID={}",
-                snap.kind,
-                K::KIND_ID,
-            );
-        }
+        // Snapshot kind ↔ fold kind is a configuration invariant:
+        // the dispatch layer routes by kind, so a foreign-kind
+        // snapshot here means caller mis-wired the restore.
+        debug_assert!(
+            snap.kind == K::KIND_ID,
+            "FoldSnapshot::kind={} does not match K::KIND_ID={}",
+            snap.kind,
+            K::KIND_ID,
+        );
 
         let mut state = self.state.write();
         let mut index = self.index.write();
@@ -577,8 +526,8 @@ impl<K: FoldKind> Fold<K> {
     /// [`FoldKind::audit_event`] that returns `Some` is
     /// forwarded to the sink's `record` method synchronously
     /// from the path that emitted the transition (apply,
-    /// evict_node, sweep_expired). Phase 1B; see
-    /// [`FoldAuditSink`] for the contract.
+    /// evict_node, sweep_expired). See [`FoldAuditSink`] for the
+    /// contract.
     pub fn set_audit_sink(&self, sink: Option<Arc<dyn FoldAuditSink>>) {
         *self.audit_sink.write() = sink;
     }

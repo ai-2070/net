@@ -1,17 +1,11 @@
-//! Phase 5 — `ReservationFold`.
+//! `ReservationFold` — resource reservation lifecycle.
 //!
-//! Tracks resource reservation lifecycle across a mesh: each
-//! resource (`u64` identifier) carries at most one entry whose
-//! payload is a state-machine variant — `Free`, `Reserved`, or
-//! `Active`. Holders advance their own resources through the
-//! state machine; foreign publishers can claim only resources
-//! that are `Free` or whose previous `Reserved` deadline has
-//! passed.
-//!
-//! Per the multifold plan's Phase 5 deliverable: this fold is
-//! pure-additive — there's no legacy module being deleted. New
-//! product features (compute marketplace, GPU reservation in
-//! the scheduler) light up on top of it.
+//! Tracks reservation state across the mesh: each resource
+//! (`u64` identifier) carries at most one entry whose payload
+//! is a state-machine variant — `Free`, `Reserved`, or `Active`.
+//! Holders advance their own resources through the state
+//! machine; foreign publishers can claim only resources that are
+//! `Free` or whose previous `Reserved` deadline has passed.
 //!
 //! ## State machine
 //!
@@ -370,7 +364,7 @@ mod tests {
         SignedAnnouncement::sign(
             keypair,
             ReservationFold::KIND_ID,
-            0, // class (pool) — unused for Phase 5
+            0, // class (pool) — currently unused; the wire field is reserved
             node_id,
             generation,
             EnvelopeMeta::default(),

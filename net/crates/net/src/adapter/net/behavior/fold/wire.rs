@@ -1,34 +1,24 @@
-//! Phase 2 wire codec for [`SignedAnnouncement<P>`].
+//! Wire codec for [`SignedAnnouncement<P>`].
 //!
 //! The on-wire form is postcard. The signing form — the bytes the
 //! Ed25519 signature commits to — is a separate postcard
 //! serialization of every field EXCEPT the signature itself, in
-//! the field-declared order. Keeping the two forms distinct lets
-//! the verifier reconstruct the signing bytes from a received
-//! envelope without re-encoding the signature into them.
+//! field-declared order. Keeping the two forms distinct lets the
+//! verifier reconstruct the signing bytes from a received envelope
+//! without re-encoding the signature into them.
 //!
-//! ## Why postcard
+//! Postcard is chosen because it's field-deterministic (struct
+//! `#[derive(Serialize)]` emits fields in declaration order, stable
+//! across builds), imposes no length-prefix tax on fixed-width
+//! fields, and is already a workspace dependency (meshdb,
+//! RedEX disk format).
 //!
-//! - **Field-deterministic.** The struct's `#[derive(Serialize)]`
-//!   emits fields in declaration order; the codec is stable across
-//!   builds as long as the struct field order doesn't change. The
-//!   plan locks the field order at v1 — see the
-//!   `SignedAnnouncement` struct doc.
-//! - **No length-prefix tax on the cold path.** Fixed-width
-//!   fields (u16, u64, NodeId, etc.) encode with no length prefix;
-//!   variable-width fields (`Option<u32>`, `Vec<u8>`, `payload: P`)
-//!   carry a one-byte (varint) length. The dispatch hot path
-//!   doesn't allocate beyond the payload itself.
-//! - **Already a workspace dependency.** Same codec the meshdb
-//!   plan-byte hashing and the RedEX disk format use.
-//!
-//! Phase 2's verifier rejects:
-//! - Signatures whose length is not [`super::announcement::SIGNATURE_LEN`].
-//! - The all-zero [`super::announcement::placeholder_signature`]
-//!   sentinel — that's the Phase-1 unsigned envelope, which has
-//!   no business reaching the dispatch path.
-//! - Tampered envelopes (the signature won't verify against the
-//!   recomputed signing bytes).
+//! The verifier rejects: signatures whose length is not
+//! [`SIGNATURE_LEN`]; the all-zero
+//! [`placeholder_signature`](super::announcement::placeholder_signature)
+//! sentinel (placeholder envelopes have no business reaching
+//! dispatch); and tampered envelopes (the signature won't verify
+//! against the recomputed signing bytes).
 
 use serde::{de::DeserializeOwned, Serialize};
 

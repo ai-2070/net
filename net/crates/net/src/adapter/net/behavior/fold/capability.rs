@@ -1,50 +1,28 @@
-//! Phase 3a — `CapabilityFold` (additive).
+//! `CapabilityFold` — per-publisher capability membership.
 //!
-//! Per-publisher capability membership: each `(class_hash,
-//! publisher_node_id)` pair carries at most one entry whose
-//! payload describes what the publisher claims about its own
-//! membership in that capability class — tags, hardware
-//! summary, current state, optional region + price quote.
+//! Each `(class_hash, publisher_node_id)` pair carries at most
+//! one entry whose payload describes what the publisher claims
+//! about its own membership in that capability class — tags,
+//! hardware summary, current state, optional region + price
+//! quote.
 //!
-//! ## Phase 3a vs 3b
+//! The legacy [`CapabilityIndex`](super::super::capability::CapabilityIndex)
+//! is still in service; cutting its ~20 call sites over to this
+//! fold is tracked separately
+//! (see `docs/plans/MULTIFOLD_PHASE_3B_CUTOVER.md`).
 //!
-//! This commit ships the new fold as **pure-additive** —
-//! callers of the legacy
-//! [`behavior::capability::CapabilityIndex`](super::super::capability::CapabilityIndex)
-//! are NOT yet rewired and the legacy module is NOT deleted.
-//! That cutover is Phase 3b (separate session): ~20 call sites
-//! across `Scheduler::place_*`, `ReplicaGroup` / `ForkGroup` /
-//! `StandbyGroup` placement, the FFI surface, and the Deck
-//! capability panel. Per the stripped plan it's an atomic
-//! same-PR change and deserves its own focused diff.
+//! Tags ship as canonical `String`s — the same form the legacy
+//! [`Tag`](super::super::tag::Tag) enum would emit when
+//! displayed — to keep the wire envelope parseable by operator
+//! tools regardless of the in-memory shape downstream.
 //!
-//! For now the two coexist; nothing in production depends on
-//! the new fold yet. The framework now hosts three concrete
-//! folds in parallel (`CapabilityFold` + `RoutingFold` +
-//! `ReservationFold`), matching the plan's "three concrete
-//! folds at launch" goal.
-//!
-//! ## Tag representation
-//!
-//! Tags ship as canonical `String`s — the same form
-//! [`behavior::tag::Tag::Display`](super::super::tag::Tag) would
-//! emit. This decouples the fold's wire shape from the legacy
-//! [`Tag`](super::super::tag::Tag) enum's serde story (which
-//! lacks derives today). Phase 3b's cutover is free to switch
-//! to a richer in-memory shape; the wire envelope stays
-//! parseable from operator tools.
-//!
-//! ## Key shape
-//!
-//! `(class_hash: u64, publisher_node_id: NodeId)`. The
-//! publisher's `node_id` IS the key component, so each
-//! publisher writes only its own entries — there's no
-//! cross-publisher override surface here (unlike
-//! [`RoutingFold`](super::routing) where multiple publishers
-//! compete for a shared destination key). That makes the
-//! security model trivial: signature verification at dispatch
-//! time gates the publisher claim; the key shape gates which
-//! entries that publisher may write.
+//! Key shape: `(class_hash, publisher_node_id)`. The publisher's
+//! `node_id` IS the key component, so each publisher writes only
+//! its own entries. Unlike [`RoutingFold`](super::routing) (where
+//! multiple publishers compete for a shared destination key),
+//! the security model here is trivial: signature verification at
+//! dispatch time gates the publisher claim; the key shape gates
+//! which entries that publisher may write.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -259,13 +237,6 @@ impl FoldKind for CapabilityFold {
         CapabilityIndexInner::default()
     }
 
-    // Default `merge` (last-write-wins by generation) is the
-    // right shape: each (class, publisher) key is owned by
-    // exactly one publisher (the publisher's node_id is part of
-    // the key), so cross-publisher overrides are impossible by
-    // construction. Anti-reorder is the only invariant that
-    // matters, which the default already enforces.
-
     fn query(
         state: &FoldState<Self>,
         index: &CapabilityIndexInner,
@@ -324,11 +295,10 @@ fn resolve_keys_all_tags(
     tags: &[String],
 ) -> HashSet<(u64, NodeId)> {
     if tags.is_empty() {
-        // No tag constraint → every indexed key (union across
-        // by_tag values). Phase 3a uses the by_state index as a
-        // proxy because every entry is indexed under exactly
-        // one state — gives us the full key set without
-        // walking by_tag.
+        // No tag constraint → every indexed key. Use the by_state
+        // index as a proxy: every entry is indexed under exactly
+        // one state, which gives the full key set without walking
+        // by_tag.
         return index
             .by_state
             .values()

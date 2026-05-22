@@ -1,18 +1,11 @@
-//! Phase 1 unit + property tests.
+//! Framework-level tests for the generic fold runtime.
 //!
-//! Each test exercises one runtime contract of the generic fold:
-//! - apply / query round-trip for a trivial `FoldKind`
-//! - generation ordering: stale apply is rejected
-//! - `merge` override path: routing-style lower-metric-wins
-//! - `evict_node` removes every entry attached to a node and
-//!   updates the secondary index
-//! - snapshot → restore round-trips the full state
-//! - restore over a live fold without `force` is refused
-//! - metric counters track outcomes
-//!
-//! Concrete folds (capability / routing / reservation) land in
-//! later phases — these tests use synthetic `TestFold` /
-//! `RoutingTestFold` shapes scoped to the test module.
+//! Concrete-fold tests live alongside the impls in
+//! `capability.rs` / `routing.rs` / `reservation.rs`; this module
+//! uses synthetic `CapFold` / `RoutingTestFold` shapes to pin the
+//! runtime contract (apply, query, merge, evict, snapshot,
+//! restore, metrics, wire codec, sign / verify, dispatch, audit,
+//! TTL sweep).
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -442,7 +435,7 @@ fn metrics_counts_track_apply_outcomes_and_query_count() {
 }
 
 // ---------------------------------------------------------------------
-// Phase 2: wire codec + sign/verify + dispatch routing
+// Wire codec + sign/verify + dispatch routing
 // ---------------------------------------------------------------------
 
 use std::sync::Arc;
@@ -708,9 +701,9 @@ fn registry_can_deregister_a_fold() {
 }
 
 // ---------------------------------------------------------------------
-// Phase 2B: channel-router trait wiring (in-process publisher → router
-// → registry → fold roundtrip). The mesh-level dispatch arm is exercised
-// by integration tests once the channel layer adopters land; here we
+// Channel-router trait wiring (in-process publisher → router →
+// registry → fold roundtrip). The mesh-level dispatch arm is
+// exercised by integration tests; here we
 // verify the router contract that arm is built against.
 // ---------------------------------------------------------------------
 
@@ -810,7 +803,7 @@ fn entity_id_is_what_the_router_trait_takes() {
 }
 
 // ---------------------------------------------------------------------
-// Phase 2C: publisher-side encode + simulated receive end-to-end.
+// Publisher-side encode + simulated receive end-to-end.
 // We can't boot real mesh sockets here, but we CAN exercise the full
 // "publisher signs → encode → receive bytes → registry dispatch → fold
 // apply" pipeline in-process. The mesh-level
@@ -912,17 +905,17 @@ fn receiver_rejects_envelope_signed_for_a_different_publisher() {
 }
 
 // ---------------------------------------------------------------------
-// Phase 1B: TTL expiry sweep + audit sink routing
+// TTL expiry sweep + audit sink routing
 // ---------------------------------------------------------------------
 
 use super::audit::{NoopSink, VecFoldAuditSink};
 
 /// Build a cap-fold announcement with `ttl_secs = 0` so the
 /// computed `expires_at` is `now + 0s == now` — the next
-/// `sweep_expired_now` call evicts it. Phase 1B's TTL is at
-/// 1-second resolution on the wire envelope; tests that need
-/// finer control either drive `sweep_expired_now` synchronously
-/// or wait a beat under the background sweeper.
+/// `sweep_expired_now` call evicts it. The wire envelope's TTL
+/// is at 1-second resolution; tests that need finer control
+/// either drive `sweep_expired_now` synchronously or wait a beat
+/// under the background sweeper.
 fn sign_cap_ann_with_ttl(
     keypair: &EntityKeypair,
     node_id: NodeId,
@@ -1031,8 +1024,8 @@ fn sweep_with_no_expired_entries_is_a_no_op() {
 
 /// Audit-emitting `FoldKind` shim: identical to `CapFold` but
 /// `audit_event` returns `Some(AuditEvent)` for every transition.
-/// Phase 1 + 1B keep audit emission opt-in via the trait so the
-/// hot path on folds that don't audit pays nothing.
+/// Audit emission is opt-in via the trait so folds that don't
+/// audit pay nothing on the hot path.
 struct AuditingCapFold;
 
 impl FoldKind for AuditingCapFold {
@@ -1231,7 +1224,7 @@ async fn background_sweeper_evicts_expired_entries_on_tick() {
 }
 
 // ---------------------------------------------------------------------
-// Phase 6a: FoldStats + FoldRegistry::stats + RingFoldAuditSink
+// FoldStats + FoldRegistry::stats + RingFoldAuditSink
 // ---------------------------------------------------------------------
 
 use super::audit::RingFoldAuditSink;
@@ -1404,11 +1397,11 @@ fn ring_audit_sink_with_zero_capacity_stores_nothing() {
 
 #[test]
 fn fold_channel_router_trait_object_exposes_stats() {
-    // Phase 6b: the mesh dispatch arm stores routers as
-    // `Arc<dyn FoldChannelRouter>`. The CLI / Deck path
-    // reads stats via the trait object — no concrete-type
-    // visibility — so the `stats` method on the trait must
-    // route through `FoldRegistry::stats` correctly.
+    // The mesh dispatch arm stores routers as
+    // `Arc<dyn FoldChannelRouter>`. The CLI / Deck path reads
+    // stats via the trait object — no concrete-type visibility
+    // — so the `stats` method on the trait must route through
+    // `FoldRegistry::stats` correctly.
     let registry = FoldRegistry::new();
     let cap_fold: Arc<Fold<CapFold>> = Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
     let route_fold: Arc<Fold<RoutingTestFold>> =

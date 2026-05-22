@@ -1,25 +1,19 @@
-//! Phase 2 dispatch — route incoming envelope bytes to the right
+//! Inbound dispatch — route envelope bytes to the right
 //! [`Fold<K>`] by `kind` u16, verify the signature, hand off to
 //! the typed apply path.
 //!
 //! The [`FoldRegistry`] is the type-erased entry point. Each
-//! [`Fold<K>`] is wrapped in an [`Arc`]-flavored
-//! [`FoldDispatchAdapter<K>`] that implements the non-generic
-//! [`FoldDispatch`] trait by:
-//!
-//! 1. Decoding the wire bytes as [`SignedAnnouncement<K::Payload>`]
-//!    via [`SignedAnnouncement::decode_and_verify`].
-//! 2. Cross-checking the decoded `kind` against the wrapped
-//!    fold's [`FoldKind::KIND_ID`] — protects against a
-//!    misregistered fold or a crossed channel publish.
-//! 3. Calling [`Fold::apply`] on the verified, owned envelope.
+//! [`Fold<K>`] is wrapped in a [`FoldDispatchAdapter<K>`] that
+//! implements the non-generic [`FoldDispatch`] trait by decoding
+//! + verifying the envelope, cross-checking the decoded `kind`
+//! against the adapter's [`FoldKind::KIND_ID`] (catches
+//! misregistered folds and crossed-channel publishes), and
+//! calling [`Fold::apply`] on the verified envelope.
 //!
 //! The registry holds an `Arc<dyn FoldDispatch>` per registered
-//! `kind`. Lookup is a single `HashMap` probe; both the lookup
-//! and the apply path are read-friendly (the apply path takes
-//! the fold's internal write lock, but the registry itself is
-//! `RwLock<HashMap>` and the dispatch hot path only takes a read
-//! lock on it).
+//! `kind`. The dispatch hot path takes one `RwLock<HashMap>` read
+//! lock for the lookup; the per-fold apply takes its own write
+//! lock internally.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,20 +27,11 @@ use super::wire::WireError;
 use super::{Fold, FoldKind};
 use crate::adapter::net::identity::EntityId;
 
-/// Wire subprotocol slot for fold-channel traffic.
-///
-/// Phase 2B reserves `0x1000` for every fold announcement
-/// regardless of `FoldKind`. The per-kind demux happens inside
-/// the [`FoldRegistry`] (routing on the envelope's `kind`
-/// u16), so a single subprotocol covers capability / routing /
-/// reservation / future folds. Reusing one subprotocol per
-/// substrate-level fan-out class keeps the
-/// `NetHeader::subprotocol_id` audit / observability surface
-/// small.
-///
-/// Available adjacent slots: `0x1001..=0x10FF` if a future
-/// design needs a parallel envelope shape (currently nothing
-/// proposes one).
+/// Wire subprotocol slot for fold-channel traffic. The per-kind
+/// demux happens inside the [`FoldRegistry`] (routing on the
+/// envelope's `kind` u16), so one subprotocol covers every
+/// `FoldKind`. Slots `0x1001..=0x10FF` are reserved for parallel
+/// fold envelope shapes if a future design needs one.
 pub const SUBPROTOCOL_FOLD: u16 = 0x1000;
 
 /// Type-erased view of a single [`Fold<K>`] instance, suitable
@@ -70,10 +55,10 @@ pub trait FoldDispatch: Send + Sync {
         publisher: &crate::adapter::net::identity::EntityId,
     ) -> Result<ApplyOutcome, WireError>;
 
-    /// Type-erased [`Fold::stats`]. Per Phase 6a, the operator
-    /// surface aggregates these across the registry via
-    /// [`FoldRegistry::stats`] so a single `net fold list`
-    /// call returns one row per registered fold.
+    /// Type-erased [`Fold::stats`]. The operator surface
+    /// aggregates these across the registry via
+    /// [`FoldRegistry::stats`] so a single `net fold list` call
+    /// returns one row per registered fold.
     fn stats(&self) -> FoldStats;
 }
 
@@ -140,16 +125,11 @@ impl<K: FoldKind> FoldDispatch for FoldDispatchAdapter<K> {
 }
 
 /// Registry of [`FoldDispatch`] adapters keyed by
-/// [`FoldKind::KIND_ID`]. The dispatch layer's central
-/// connection between an inbound channel message (raw bytes +
-/// publisher identity) and the right fold's apply path.
-///
-/// Construction order: build the typed [`Fold<K>`] instances,
-/// wrap each in a [`FoldDispatchAdapter<K>`], register them
-/// here. Phase 2 (this commit) ships the registry alone;
-/// integration with the channel layer (Phase 2B) wires inbound
-/// channel messages into [`FoldRegistry::dispatch`] and is
-/// scoped separately.
+/// [`FoldKind::KIND_ID`]. The central connection between an
+/// inbound channel message (raw bytes + publisher identity) and
+/// the right fold's apply path. Construct typed [`Fold<K>`]
+/// instances, wrap each in a [`FoldDispatchAdapter<K>`], and
+/// register them here.
 pub struct FoldRegistry {
     folds: RwLock<HashMap<u16, Arc<dyn FoldDispatch>>>,
 }
@@ -193,20 +173,17 @@ impl FoldRegistry {
     }
 
     /// Look up a registered dispatcher by kind. Used by tests
-    /// and by the (Phase 2B) channel-integration adapter; the
-    /// hot path uses [`Self::dispatch`] directly.
+    /// and by the channel-integration adapter; the hot path uses
+    /// [`Self::dispatch`] directly.
     pub fn get(&self, kind: u16) -> Option<Arc<dyn FoldDispatch>> {
         self.folds.read().get(&kind).cloned()
     }
 
     /// Aggregate [`FoldStats`] across every registered fold.
-    /// Per Phase 6a — the operator surface (the `net fold list`
-    /// CLI command, the Deck FOLDS panel) calls this once per
-    /// sample tick and renders one row per returned `FoldStats`.
-    ///
-    /// Returns in unspecified order; callers that want a
-    /// canonical sort (by `kind`, by `channel_prefix`) do it
-    /// themselves at the rendering layer.
+    /// The operator surface (`net fold list`, the Deck FOLDS
+    /// panel) calls this once per sample tick. Returns in
+    /// unspecified order; callers that want a canonical sort sort
+    /// themselves.
     pub fn stats(&self) -> Vec<FoldStats> {
         self.folds
             .read()
@@ -254,19 +231,16 @@ impl Default for FoldRegistry {
 }
 
 /// Hook the mesh's inbound channel-dispatch path uses to route
-/// fold announcements. Phase 2B's integration in
-/// `mesh.rs::dispatch_packet` installs an `Arc<dyn FoldChannelRouter>`
-/// (typically a [`FoldRegistry`]) and routes every event from a
-/// `SUBPROTOCOL_FOLD` packet through it.
+/// fold announcements. `mesh.rs::dispatch_packet` installs an
+/// `Arc<dyn FoldChannelRouter>` (typically a [`FoldRegistry`])
+/// and routes every event from a `SUBPROTOCOL_FOLD` packet
+/// through it.
 ///
-/// The trait abstracts the registry away from the mesh so the
-/// integration is `cfg`-feature-clean (no transitive feature
-/// requirement on the channel-layer crate) and so tests can
-/// stub the router with a counting / inspecting impl.
-///
+/// The trait abstracts the registry away from the mesh so tests
+/// can stub the router with a counting / inspecting impl.
 /// `publisher` is the [`EntityId`] resolved at dispatch time
 /// from the inbound session's `node_id` via the mesh's
-/// `peer_entity_ids` map. The router uses it to verify the
+/// `peer_entity_ids` map; the router uses it to verify the
 /// announcement's signature.
 pub trait FoldChannelRouter: Send + Sync {
     /// Route one wire envelope to the right fold. Errors are
