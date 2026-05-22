@@ -32,7 +32,7 @@
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use super::announcement::{placeholder_signature, SignedAnnouncement, SIGNATURE_LEN};
+use super::announcement::{placeholder_signature, EnvelopeMeta, SignedAnnouncement, SIGNATURE_LEN};
 use super::state::NodeId;
 use super::FoldError;
 
@@ -95,25 +95,22 @@ pub enum WireError {
 /// Canonical bytes the Ed25519 signature commits to.
 ///
 /// Postcard-encodes every field EXCEPT `signature` in the order
-/// they appear on [`SignedAnnouncement`]. Phase 2 locks this
-/// ordering: any future field addition appends to the end and
-/// bumps the `kind` reservation (a new `KIND_ID` means a new
-/// fold, which gets a fresh canonical ordering). Existing folds
-/// never reorder.
+/// they appear on [`SignedAnnouncement`]. Field order is wire-
+/// load-bearing: any future field addition appends to the end
+/// and bumps the `kind` reservation (a new `KIND_ID` means a
+/// new fold, which gets a fresh canonical ordering). Existing
+/// folds never reorder.
 ///
 /// The borrow on `payload` avoids cloning the (potentially large)
 /// per-fold payload — the canonical bytes are computed inside
 /// `sign` and `verify`, both of which can hold the reference for
 /// the duration of the postcard call.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn signing_bytes<P: Serialize>(
     kind: u16,
     class: u64,
     node_id: NodeId,
     generation: u64,
-    announced_at: u64,
-    ttl_secs: Option<u32>,
-    flags: u8,
+    meta: &EnvelopeMeta,
     payload: &P,
 ) -> Result<Vec<u8>, postcard::Error> {
     // A separate struct rather than a tuple so postcard's serde
@@ -136,55 +133,36 @@ pub(super) fn signing_bytes<P: Serialize>(
         class,
         node_id,
         generation,
-        announced_at,
-        ttl_secs,
-        flags,
+        announced_at: meta.announced_at,
+        ttl_secs: meta.ttl_secs,
+        flags: meta.flags,
         payload,
     })
 }
 
 impl<P: Serialize + DeserializeOwned> SignedAnnouncement<P> {
     /// Construct + sign an announcement with the supplied
-    /// keypair.
-    ///
-    /// The signature commits to every other field via
-    /// [`signing_bytes`]. Postcard encoding is infallible for
-    /// the in-memory shape under the current trait bounds —
-    /// `K::Payload: Serialize` — but we surface
-    /// [`WireError::Decode`] anyway so a future payload type
-    /// that introduces a fallible encode (e.g. a custom serde
-    /// impl) wouldn't require a signature change.
-    #[allow(clippy::too_many_arguments)]
+    /// keypair. The signature commits to every other field via
+    /// [`signing_bytes`].
     pub fn sign(
         keypair: &crate::adapter::net::identity::EntityKeypair,
         kind: u16,
         class: u64,
         node_id: NodeId,
         generation: u64,
-        announced_at: u64,
-        ttl_secs: Option<u32>,
-        flags: u8,
+        meta: EnvelopeMeta,
         payload: P,
     ) -> Result<Self, WireError> {
-        let bytes = signing_bytes(
-            kind,
-            class,
-            node_id,
-            generation,
-            announced_at,
-            ttl_secs,
-            flags,
-            &payload,
-        )?;
+        let bytes = signing_bytes(kind, class, node_id, generation, &meta, &payload)?;
         let sig = keypair.sign(&bytes);
         Ok(Self {
             kind,
             class,
             node_id,
             generation,
-            announced_at,
-            ttl_secs,
-            flags,
+            announced_at: meta.announced_at,
+            ttl_secs: meta.ttl_secs,
+            flags: meta.flags,
             payload,
             signature: sig.to_bytes().to_vec(),
         })
@@ -216,14 +194,17 @@ impl<P: Serialize + DeserializeOwned> SignedAnnouncement<P> {
         sig_bytes.copy_from_slice(&self.signature);
         let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
+        let meta = EnvelopeMeta {
+            announced_at: self.announced_at,
+            ttl_secs: self.ttl_secs,
+            flags: self.flags,
+        };
         let bytes = signing_bytes(
             self.kind,
             self.class,
             self.node_id,
             self.generation,
-            self.announced_at,
-            self.ttl_secs,
-            self.flags,
+            &meta,
             &self.payload,
         )?;
 

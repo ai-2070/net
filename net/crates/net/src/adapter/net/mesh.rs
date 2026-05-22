@@ -7110,15 +7110,17 @@ impl MeshNode {
         K: super::behavior::fold::FoldKind,
     {
         let gen = self.next_fold_generation(K::KIND_ID, counter_class);
+        let meta = super::behavior::fold::EnvelopeMeta {
+            announced_at: super::current_timestamp_micros(),
+            ..Default::default()
+        };
         let ann = super::behavior::fold::SignedAnnouncement::sign(
             &self.identity,
             K::KIND_ID,
             envelope_class,
             self.node_id,
             gen,
-            super::current_timestamp_micros(),
-            None,
-            0,
+            meta,
             payload,
         )
         .map_err(|e| AdapterError::Connection(format!("fold: sign failed: {e}")))?;

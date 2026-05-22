@@ -351,7 +351,7 @@ mod tests {
 
     use super::*;
     use crate::adapter::net::behavior::fold::{
-        ApplyOutcome, Fold, FoldRegistry, SignedAnnouncement,
+        ApplyOutcome, EnvelopeMeta, Fold, FoldRegistry, SignedAnnouncement,
     };
     use crate::adapter::net::identity::EntityKeypair;
 
@@ -373,9 +373,7 @@ mod tests {
             0, // class (pool) — unused for Phase 5
             node_id,
             generation,
-            0,
-            None,
-            0,
+            EnvelopeMeta::default(),
             ReservationAnnouncement {
                 resource_id,
                 state,
@@ -924,9 +922,10 @@ mod tests {
             0,
             0xA,
             1,
-            0,
-            Some(0),
-            0,
+            EnvelopeMeta {
+                ttl_secs: Some(0),
+                ..Default::default()
+            },
             ReservationAnnouncement {
                 resource_id: r,
                 state: ReservationState::Reserved {

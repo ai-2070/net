@@ -21,6 +21,25 @@ use super::state::NodeId;
 /// `[u8; SIGNATURE_LEN]` when the wire codec lands.
 pub const SIGNATURE_LEN: usize = 64;
 
+/// Per-envelope metadata grouped to keep the `sign` /
+/// `placeholder` constructor signatures narrow. All three fields
+/// are wire-envelope members; defaults match the most common
+/// publisher pattern (current wall-clock micros, default TTL
+/// via `FoldKind::DEFAULT_TTL`, no flag bits set).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EnvelopeMeta {
+    /// Publisher's wall-clock micros-since-epoch at emission.
+    /// Receivers use this for diagnostics, not for ordering —
+    /// `generation` is the load-bearing anti-reorder signal.
+    pub announced_at: u64,
+    /// Per-announcement TTL override. `None` falls through to
+    /// [`super::FoldKind::DEFAULT_TTL`].
+    pub ttl_secs: Option<u32>,
+    /// Bit flags. See [`SignedAnnouncement::flags`] for the
+    /// reserved layout.
+    pub flags: u8,
+}
+
 /// Sentinel signature bytes used in Phase 1 tests and any
 /// dispatch path that hasn't been routed through Phase 2's
 /// signing pipeline yet. Phase 2's verifier rejects this value
@@ -103,24 +122,16 @@ pub struct SignedAnnouncement<P> {
 
 impl<P> SignedAnnouncement<P> {
     /// Construct an announcement with the
-    /// [`placeholder_signature`] sentinel. Phase 1 callers
-    /// (tests, in-process producers) use this; Phase 2's signer
-    /// will provide a real `sign(...)` constructor.
-    ///
-    /// The arg list mirrors the wire envelope's fields in
-    /// declaration order. The wire format pins the field set,
-    /// so the constructor signature is wide by design;
-    /// clippy's `too_many_arguments` lint is suppressed here
-    /// because Phase 2's `sign(...)` will inherit the same shape.
-    #[allow(clippy::too_many_arguments)]
+    /// [`placeholder_signature`] sentinel. Tests and in-process
+    /// producers that don't have a keypair handy use this; the
+    /// dispatch layer rejects placeholder-stamped envelopes on
+    /// the slow path.
     pub fn placeholder(
         kind: u16,
         class: u64,
         node_id: NodeId,
         generation: u64,
-        announced_at: u64,
-        ttl_secs: Option<u32>,
-        flags: u8,
+        meta: EnvelopeMeta,
         payload: P,
     ) -> Self {
         Self {
@@ -128,9 +139,9 @@ impl<P> SignedAnnouncement<P> {
             class,
             node_id,
             generation,
-            announced_at,
-            ttl_secs,
-            flags,
+            announced_at: meta.announced_at,
+            ttl_secs: meta.ttl_secs,
+            flags: meta.flags,
             payload,
             signature: placeholder_signature(),
         }

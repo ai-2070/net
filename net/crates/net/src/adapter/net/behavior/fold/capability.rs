@@ -454,7 +454,7 @@ mod tests {
 
     use super::*;
     use crate::adapter::net::behavior::fold::{
-        ApplyOutcome, Fold, FoldRegistry, SignedAnnouncement,
+        ApplyOutcome, EnvelopeMeta, Fold, FoldRegistry, SignedAnnouncement,
     };
     use crate::adapter::net::identity::EntityKeypair;
 
@@ -473,9 +473,7 @@ mod tests {
             class,
             publisher,
             generation,
-            0,
-            None,
-            0,
+            EnvelopeMeta::default(),
             CapabilityMembership {
                 class_hash: class,
                 tags: tags.into_iter().map(String::from).collect(),
@@ -929,9 +927,10 @@ mod tests {
             0x100,
             0xA,
             1,
-            0,
-            Some(0),
-            0,
+            EnvelopeMeta {
+                ttl_secs: Some(0),
+                ..Default::default()
+            },
             CapabilityMembership {
                 class_hash: 0x100,
                 tags: vec!["gpu".into()],

@@ -56,7 +56,7 @@ pub mod wire;
 #[cfg(test)]
 mod tests;
 
-pub use announcement::SignedAnnouncement;
+pub use announcement::{EnvelopeMeta, SignedAnnouncement};
 pub use audit::{FoldAuditSink, NoopSink, RingFoldAuditSink, VecFoldAuditSink};
 pub use capability::{
     CapabilityFilter, CapabilityFold, CapabilityIndexInner, CapabilityMatch, CapabilityMembership,

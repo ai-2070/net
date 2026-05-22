@@ -121,9 +121,7 @@ fn cap_announcement(
         class,
         node_id,
         generation,
-        0,
-        None,
-        0,
+        EnvelopeMeta::default(),
         CapPayload {
             class_hash: class,
             tags: tags.into_iter().map(String::from).collect(),
@@ -381,9 +379,7 @@ fn route_announcement(
         0,
         publisher,
         generation,
-        0,
-        None,
-        0,
+        EnvelopeMeta::default(),
         RoutePayload {
             destination: dest,
             metric,
@@ -470,9 +466,7 @@ fn sign_cap_ann(
         class,
         node_id,
         generation,
-        0,
-        None,
-        0,
+        EnvelopeMeta::default(),
         CapPayload {
             class_hash: class,
             tags: tags.into_iter().map(String::from).collect(),
@@ -670,9 +664,7 @@ fn registry_rejects_envelope_whose_kind_disagrees_with_routed_fold() {
         0x1000,
         0x42,
         1,
-        0,
-        None,
-        0,
+        EnvelopeMeta::default(),
         CapPayload {
             class_hash: 0x1000,
             tags: vec!["gpu".into()],
@@ -945,9 +937,10 @@ fn sign_cap_ann_with_ttl(
         class,
         node_id,
         generation,
-        0,
-        Some(ttl_secs),
-        0,
+        EnvelopeMeta {
+            ttl_secs: Some(ttl_secs),
+            ..Default::default()
+        },
         CapPayload {
             class_hash: class,
             tags: tags.into_iter().map(String::from).collect(),
@@ -1114,9 +1107,10 @@ fn sign_audit_ann(
         class,
         node_id,
         generation,
-        0,
-        Some(ttl_secs),
-        0,
+        EnvelopeMeta {
+            ttl_secs: Some(ttl_secs),
+            ..Default::default()
+        },
         CapPayload {
             class_hash: class,
             tags: tags.into_iter().map(String::from).collect(),

@@ -183,7 +183,7 @@ mod tests {
 
     use super::*;
     use crate::adapter::net::behavior::fold::{
-        ApplyOutcome, Fold, FoldRegistry, SignedAnnouncement,
+        ApplyOutcome, EnvelopeMeta, Fold, FoldRegistry, SignedAnnouncement,
     };
     use crate::adapter::net::identity::EntityKeypair;
 
@@ -206,9 +206,7 @@ mod tests {
             0,
             publisher_node,
             generation,
-            0,
-            None,
-            0,
+            EnvelopeMeta::default(),
             RouteAnnouncement {
                 destination: dest,
                 next_hop,
@@ -412,9 +410,10 @@ mod tests {
             0,
             0xAA,
             1,
-            0,
-            Some(0),
-            0,
+            EnvelopeMeta {
+                ttl_secs: Some(0),
+                ..Default::default()
+            },
             RouteAnnouncement {
                 destination: 0x42,
                 next_hop: addr(7000),
