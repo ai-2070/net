@@ -32,20 +32,34 @@ use super::FoldMetrics;
 /// [`super::Fold::with_sweep_interval`].
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Synchronous core of the expiry sweep. Walks the primary
-/// store, finds entries whose `expires_at < now`, removes them
-/// from `entries` + `by_node`, calls
-/// `K::Index::on_remove` for each, bumps the
-/// [`FoldMetrics::expiries`] counter, and surfaces an
+/// Maximum number of entries evicted per write-lock acquisition.
+/// Larger batches amortize the lock-acquire cost; smaller batches
+/// shorten the worst-case window during which applies + queries
+/// block. 1024 is a compromise that on a 100k-entry fold caps
+/// each write-lock hold to sub-millisecond while still finishing
+/// a full sweep in ~100 read-then-write cycles.
+const SWEEP_CHUNK_SIZE: usize = 1024;
+
+/// Synchronous core of the expiry sweep. Walks the primary store
+/// in [`SWEEP_CHUNK_SIZE`]-bounded batches, evicting entries
+/// whose `expires_at <= now` from `entries` + `by_node`, calling
+/// `K::Index::on_remove` for each, bumping
+/// [`FoldMetrics::expiries`], and surfacing an
 /// `EntryTransition::Expired` to the audit sink.
 ///
-/// Returns the number of entries evicted. Used by both the
+/// Returns the total number of entries evicted. Used by both the
 /// background task (one call per wake) and tests (called
 /// directly via [`super::Fold::sweep_expired_now`]).
 ///
-/// Locking: takes the state + index write locks in the fixed
-/// `state → index` order that the apply path uses, so the
-/// sweeper composes safely with concurrent applies + queries.
+/// Locking: each chunk acquires the state + index write locks in
+/// the fixed `state → index` order (matching the apply path),
+/// then releases them before the next chunk's read-lock pass.
+/// Concurrent applies / queries see a series of short pauses
+/// rather than one full-state stall. Between the read-lock pass
+/// that picks the candidates and the write-lock pass that
+/// removes them, a concurrent apply may refresh an entry's TTL —
+/// the write-lock pass re-checks `expires_at <= now` per key and
+/// skips refreshed entries.
 pub(super) fn sweep_expired<K: FoldKind>(
     state_lock: &RwLock<FoldState<K>>,
     index_lock: &RwLock<K::Index>,
@@ -53,58 +67,66 @@ pub(super) fn sweep_expired<K: FoldKind>(
     audit_sink: Option<&Arc<dyn FoldAuditSink>>,
 ) -> usize {
     let now = Instant::now();
-    let mut state = state_lock.write();
-    let mut index = index_lock.write();
-
-    // Two-pass: collect keys whose expires_at is past before
-    // mutating. The mut-walk-and-remove pattern can't run inside
-    // a single `retain` here because we also need to update the
-    // `by_node` reverse index + the secondary index + emit audit
-    // events per evicted entry — all of which need ownership of
-    // the entry value, which HashMap::retain doesn't surrender.
-    let expired_keys: Vec<K::Key> = state
-        .entries
-        .iter()
-        .filter_map(|(k, e)| {
-            if e.expires_at <= now {
-                Some(k.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let evicted = expired_keys.len();
-    for key in expired_keys {
-        // `remove` after the prior `contains_key`-shaped filter
-        // succeeds is infallible by construction; let-else
-        // guards a future change that loses the invariant.
-        let Some(old_entry) = state.entries.remove(&key) else {
-            continue;
+    let mut total_evicted = 0usize;
+    loop {
+        // Phase 1: read-lock, collect a bounded batch of
+        // candidates whose expires_at is past `now`. Read lock is
+        // released at end of this scope before we take write
+        // locks below.
+        let candidates: Vec<K::Key> = {
+            let state = state_lock.read();
+            state
+                .entries
+                .iter()
+                .filter_map(|(k, e)| (e.expires_at <= now).then(|| k.clone()))
+                .take(SWEEP_CHUNK_SIZE)
+                .collect()
         };
-        // by_node reverse index cleanup — mirrors evict_node.
-        if let Some(keys) = state.by_node.get_mut(&old_entry.node_id) {
-            keys.remove(&key);
-            if keys.is_empty() {
-                state.by_node.remove(&old_entry.node_id);
-            }
+        if candidates.is_empty() {
+            return total_evicted;
         }
-        // Secondary index hook before the entry is fully dropped.
-        index.on_remove(&key, &old_entry.payload);
-        // Audit emission while we still hold a borrow on the entry.
-        if let Some(sink) = audit_sink {
-            let transition = EntryTransition::Expired {
-                key: &key,
-                old: &old_entry,
-            };
-            if let Some(event) = K::audit_event(transition) {
-                sink.record(event);
-            }
-        }
-        metrics.on_expire();
-    }
 
-    evicted
+        // Phase 2: write-lock, re-check + mutate. Re-check is
+        // load-bearing: between the read-lock release and write-
+        // lock acquire, a concurrent apply may have refreshed
+        // the entry's TTL (or evict_node may have removed it).
+        let mut state = state_lock.write();
+        let mut index = index_lock.write();
+        for key in candidates {
+            let still_expired = state
+                .entries
+                .get(&key)
+                .map(|e| e.expires_at <= now)
+                .unwrap_or(false);
+            if !still_expired {
+                continue;
+            }
+            let Some(old_entry) = state.entries.remove(&key) else {
+                continue;
+            };
+            if let Some(keys) = state.by_node.get_mut(&old_entry.node_id) {
+                keys.remove(&key);
+                if keys.is_empty() {
+                    state.by_node.remove(&old_entry.node_id);
+                }
+            }
+            index.on_remove(&key, &old_entry.payload);
+            if let Some(sink) = audit_sink {
+                let transition = EntryTransition::Expired {
+                    key: &key,
+                    old: &old_entry,
+                };
+                if let Some(event) = K::audit_event(transition) {
+                    sink.record(event);
+                }
+            }
+            metrics.on_expire();
+            total_evicted += 1;
+        }
+        // Locks drop here. The next loop iteration re-reads to
+        // pick up the next chunk; if the read pass finds nothing,
+        // we return.
+    }
 }
 
 /// Spawn the per-fold background sweep task onto the ambient

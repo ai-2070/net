@@ -1022,6 +1022,31 @@ fn sweep_with_no_expired_entries_is_a_no_op() {
     assert_eq!(fold.metrics().entries(), 1);
 }
 
+#[test]
+fn sweep_evicts_across_multiple_chunks_when_count_exceeds_chunk_size() {
+    // Pin the chunked-sweep behavior: insert >SWEEP_CHUNK_SIZE
+    // expired entries and confirm a single sweep call evicts all
+    // of them. Earlier full-state-lock implementation would also
+    // pass this; the chunked variant has to loop until the read
+    // pass returns empty, which this test exercises directly.
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    // 1500 > SWEEP_CHUNK_SIZE (1024) — guarantees at least two
+    // chunks plus a leftover batch.
+    const N: u64 = 1500;
+    for i in 0..N {
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 0, vec!["t"]))
+            .expect("apply");
+    }
+    assert_eq!(fold.metrics().entries(), N);
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let evicted = fold.sweep_expired_now();
+    assert_eq!(evicted, N as usize, "all expired entries evicted across chunks");
+    assert_eq!(fold.metrics().entries(), 0);
+    assert_eq!(fold.metrics().expiries(), N);
+}
+
 /// Audit-emitting `FoldKind` shim: identical to `CapFold` but
 /// `audit_event` returns `Some(AuditEvent)` for every transition.
 /// Audit emission is opt-in via the trait so folds that don't
