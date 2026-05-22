@@ -1209,8 +1209,7 @@ mod tests {
     #[test]
     fn select_shard_by_hash_uses_lemire_reduction_in_static_mode() {
         for &shard_count in &[1u16, 2, 3, 4, 7, 8, 16, 64] {
-            let manager =
-                ShardManager::new(shard_count, 1024, BackpressureMode::DropNewest);
+            let manager = ShardManager::new(shard_count, 1024, BackpressureMode::DropNewest);
 
             // `hash == 0` → `(0 * n) >> 64 == 0` regardless of `n`.
             // Locking down this boundary catches a regression where
@@ -1254,7 +1253,10 @@ mod tests {
             counts[manager.select_shard_by_hash(h) as usize] += 1;
         }
         for (i, &c) in counts.iter().enumerate() {
-            assert!(c > 0, "shard {i} got 0 events out of 10_000 (Lemire reduction must spread)");
+            assert!(
+                c > 0,
+                "shard {i} got 0 events out of 10_000 (Lemire reduction must spread)"
+            );
         }
     }
 

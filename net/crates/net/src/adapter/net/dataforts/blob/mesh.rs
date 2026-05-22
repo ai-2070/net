@@ -3323,8 +3323,8 @@ impl BlobAdapter for MeshBlobAdapter {
                 // a block boundary).
                 use futures::StreamExt;
                 const FETCH_RANGE_CONCURRENCY: usize = 16;
-                let fetch_stream = futures::stream::iter(requests.iter().copied()).map(
-                    |req| async move {
+                let fetch_stream =
+                    futures::stream::iter(requests.iter().copied()).map(|req| async move {
                         let chunk = &chunks[req.chunk_index];
                         let chunk_bytes = self.fetch_chunk(&chunk.hash).await?;
                         let end = req.end_in_chunk as usize;
@@ -3338,10 +3338,8 @@ impl BlobAdapter for MeshBlobAdapter {
                         }
                         let slice = chunk_bytes.slice(req.start_in_chunk as usize..end);
                         Ok::<_, BlobError>((chunk.hash, slice))
-                    },
-                );
-                let mut stream =
-                    std::pin::pin!(fetch_stream.buffered(FETCH_RANGE_CONCURRENCY));
+                    });
+                let mut stream = std::pin::pin!(fetch_stream.buffered(FETCH_RANGE_CONCURRENCY));
                 let mut err: Option<BlobError> = None;
                 while let Some(result) = stream.next().await {
                     match result {

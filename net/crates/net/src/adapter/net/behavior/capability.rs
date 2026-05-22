@@ -7591,24 +7591,23 @@ mod tests {
         // perf #112 collapsed. Build the same node-set inline so
         // the assertion below catches any semantic drift in the
         // refactored single-pass code.
-        let two_pass_reference = |scope_filter: &ScopeFilter<'_>,
-                                  same_subnet: bool|
-         -> std::collections::HashSet<u64> {
-            index
-                .query(&filter)
-                .into_iter()
-                .filter(|&node_id| {
-                    let Some(caps) = index.get(node_id) else {
-                        return false;
-                    };
-                    let scope = scope_from_tags(&caps.tags);
-                    let needs_subnet = matches!(scope_filter, ScopeFilter::SameSubnet)
-                        || matches!(scope, CapabilityScope::SubnetLocal);
-                    let ss = if needs_subnet { same_subnet } else { false };
-                    matches_scope(&scope, scope_filter, ss)
-                })
-                .collect()
-        };
+        let two_pass_reference =
+            |scope_filter: &ScopeFilter<'_>, same_subnet: bool| -> std::collections::HashSet<u64> {
+                index
+                    .query(&filter)
+                    .into_iter()
+                    .filter(|&node_id| {
+                        let Some(caps) = index.get(node_id) else {
+                            return false;
+                        };
+                        let scope = scope_from_tags(&caps.tags);
+                        let needs_subnet = matches!(scope_filter, ScopeFilter::SameSubnet)
+                            || matches!(scope, CapabilityScope::SubnetLocal);
+                        let ss = if needs_subnet { same_subnet } else { false };
+                        matches_scope(&scope, scope_filter, ss)
+                    })
+                    .collect()
+            };
 
         let to_set = |v: Vec<u64>| v.into_iter().collect::<std::collections::HashSet<u64>>();
 
