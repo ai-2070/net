@@ -1,0 +1,84 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_d9dc521a887c3e::t_4d5d279d0cb5ed 6990-6993
+  s_d9dc521a887c3e::t_e888763204f490 7049-7051,7053
+  s_d9dc521a887c3e::t_9394bfcab158e4 7983-7984
+  s_d9dc521a887c3e::t_d79cc6bf729c31 1549-1553
+  s_d9dc521a887c3e::t_f0c9511e329c52 8000-8003
+  s_d9dc521a887c3e::t_c9881e68891f3f 3823,3825-3829
+  s_d9dc521a887c3e::t_4640a5ad8ac933 1557-1562,1564-1569
+net/crates/net/src/adapter/net/behavior/fold/reservation.rs
+  s_d9dc521a887c3e::t_982f64a18550b5 367
+  s_d9dc521a887c3e::t_70ae356accb236 1,3-8
+net/crates/net/src/adapter/net/behavior/fold/dispatch.rs
+  s_d9dc521a887c3e::t_5cda827028f0e1 1,6-11,14-16
+  s_d9dc521a887c3e::t_fa21eede825eea 30-34
+  s_d9dc521a887c3e::t_7b3a7f7ec2e284 176-177,183-186
+  s_d9dc521a887c3e::t_98d342a60fff87 128-132
+  s_d9dc521a887c3e::t_4f1d817e1994e4 58-61
+  s_d9dc521a887c3e::t_c5daa892753710 234-237,239-240,243
+net/crates/net/src/adapter/net/behavior/fold/routing.rs
+  s_d9dc521a887c3e::t_0093ef4f684ecd 1,3-6,8-19
+net/crates/net/src/adapter/net/behavior/fold/audit.rs
+  s_d9dc521a887c3e::t_fbaca107effd6b 94-98
+  s_d9dc521a887c3e::t_0a58c867a53c4d 1,3-11
+net/crates/net/src/adapter/net/behavior/fold/expiry.rs
+  s_d9dc521a887c3e::t_ea379bdae302db 1,3-6,8-12,14-17
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_d9dc521a887c3e::t_4d03220a2fa000 144-145
+  s_d9dc521a887c3e::t_728720e89f1b43 276,278-286,288-290
+  s_d9dc521a887c3e::t_564ef844c83f3c 445-453
+  s_d9dc521a887c3e::t_4385c1192fba20 1,5-8,10-11
+  s_d9dc521a887c3e::t_2d429a4b7bd1a7 248-252
+  s_d9dc521a887c3e::t_e71ebb43fb82ef 205-210
+  s_d9dc521a887c3e::t_f1892029e121d4 529-530
+  s_d9dc521a887c3e::t_c4a631f8dc4ffb 215-217,219-223
+net/crates/net/src/adapter/net/behavior/fold/announcement.rs
+  s_d9dc521a887c3e::t_4b5c50ded87c48 44,46-50
+  s_d9dc521a887c3e::t_0eb258296b3c1d 1-3,10-12
+  s_d9dc521a887c3e::t_331d4c088ceabe 54-55
+  s_d9dc521a887c3e::t_decff8ffc201ae 34-38
+  s_d9dc521a887c3e::t_87379b1fd5d30b 99-101
+net/crates/net/src/adapter/net/behavior/fold/state.rs
+  s_d9dc521a887c3e::t_c9848f858d0bed 273-275
+  s_d9dc521a887c3e::t_c0aa7f2b54eda0 8-9,14
+  s_d9dc521a887c3e::t_63419797dfe383 207
+  s_d9dc521a887c3e::t_9b08f4d38f3c5d 64-65
+net/crates/net/src/adapter/net/behavior/fold/metrics.rs
+  s_d9dc521a887c3e::t_b4cb52590e5716 3-5,7-8
+  s_d9dc521a887c3e::t_9b146fbb39adda 15-17
+  s_d9dc521a887c3e::t_53d5549b88edec 106
+  s_d9dc521a887c3e::t_7a15dfb1ac5b7a 101
+  s_d9dc521a887c3e::t_68b4901159b4f8 158-159
+  s_d9dc521a887c3e::t_d1af9468ec4f8a 219
+net/crates/net/src/adapter/net/behavior/fold/tests.rs
+  s_d9dc521a887c3e::t_9108eba9a3a8bd 438
+  s_d9dc521a887c3e::t_0f2dca8448c5b1 915-918
+  s_d9dc521a887c3e::t_c6f09576a75e79 1227
+  s_d9dc521a887c3e::t_efd6530b57e814 1027-1028
+  s_d9dc521a887c3e::t_5b86e36627ed3b 1400-1404
+  s_d9dc521a887c3e::t_bc137335decca0 704-706
+  s_d9dc521a887c3e::t_b95a18a1513e6c 908
+  s_d9dc521a887c3e::t_a9d8426813bcd3 806
+  s_d9dc521a887c3e::t_6fee12d720058b 1,3-8
+net/crates/net/src/adapter/net/behavior/fold/wire.rs
+  s_d9dc521a887c3e::t_4a1fe79fa01158 1,6-8,10-14,16-21
+net/crates/net/src/adapter/net/behavior/fold/capability.rs
+  s_d9dc521a887c3e::t_161b235c503d32 298-301
+  s_d9dc521a887c3e::t_737775c930dfe4 1,3-7,9-12,14-17,19-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "d0f31cd043b3cd2f07c855725c7a95b73a085029",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
