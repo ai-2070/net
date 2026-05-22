@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use super::announcement::SignedAnnouncement;
+use super::wire::SignedAnnouncement;
 use super::metrics::FoldStats;
 use super::state::ApplyOutcome;
 use super::wire::WireError;

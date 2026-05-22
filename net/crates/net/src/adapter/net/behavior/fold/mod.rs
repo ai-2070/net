@@ -18,7 +18,6 @@ use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-pub mod announcement;
 pub mod audit;
 pub mod capability;
 pub mod dispatch;
@@ -33,7 +32,7 @@ pub mod wire;
 #[cfg(test)]
 mod tests;
 
-pub use announcement::{EnvelopeMeta, SignedAnnouncement};
+pub use wire::{EnvelopeMeta, SignedAnnouncement, WireError};
 pub use audit::{FoldAuditSink, NoopSink, RingFoldAuditSink, VecFoldAuditSink};
 pub use capability::{
     CapabilityFilter, CapabilityFold, CapabilityIndexInner, CapabilityMatch, CapabilityMembership,
@@ -55,7 +54,6 @@ pub use state::{
     ApplyOutcome, EntryTransition, FoldEntry, FoldError, FoldIndex, FoldState, MergeAction,
     NoIndex, NodeId,
 };
-pub use wire::WireError;
 
 /// One typed fold definition. Each concrete fold (capability,
 /// routing, reservation, future kinds) is a unit type that

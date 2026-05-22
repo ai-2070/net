@@ -442,7 +442,7 @@ use std::sync::Arc;
 
 use crate::adapter::net::identity::EntityKeypair;
 
-use super::announcement::placeholder_signature;
+use super::wire::placeholder_signature;
 use super::dispatch::{DispatchError, FoldRegistry};
 use super::wire::WireError;
 

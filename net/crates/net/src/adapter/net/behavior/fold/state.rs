@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use super::announcement::SignedAnnouncement;
+use super::wire::SignedAnnouncement;
 use super::FoldKind;
 
 /// Publisher's routing-layer identity, matching
@@ -26,8 +26,8 @@ use super::FoldKind;
 /// cryptographic [`behavior::metadata::NodeId`] because every
 /// query surface (capability, routing, reservation) addresses
 /// nodes by their routing id, and the wire envelope already
-/// commits a separate [`super::announcement::SignedAnnouncement::signature`]
-/// to the publisher's cryptographic identity.
+/// commits a separate [`SignedAnnouncement::signature`] to the
+/// publisher's cryptographic identity.
 pub type NodeId = u64;
 
 /// One entry in a fold: the payload most recently accepted for
