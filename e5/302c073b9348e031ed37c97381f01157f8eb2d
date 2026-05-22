@@ -1,0 +1,44 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_d9dc521a887c3e::t_2a2e7227b24fc7 1575,1577-1580
+  s_d9dc521a887c3e::t_efb4ce7e1731cc 1974,1976
+  s_d9dc521a887c3e::t_12066f5f2e42de 8892-8895
+  s_d9dc521a887c3e::t_3c6d56c936d79f 570-572
+  s_d9dc521a887c3e::t_f284ca1d8430e6 10687-10689
+  s_d9dc521a887c3e::t_30ae750cf42ee7 1886,1889,1894
+  s_d9dc521a887c3e::t_669fdc63346872 2761-2767
+  s_d9dc521a887c3e::t_9a93d104cdea78 1933
+  s_d9dc521a887c3e::t_a79e4a778c4193 52
+net/crates/net/src/adapter/net/dataforts/blob/overflow.rs
+  s_d9dc521a887c3e::t_5e61c160dd0de3 340,349,353-357
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_d9dc521a887c3e::t_6b4dfd1eb88e7a 2493,2496-2497
+  s_d9dc521a887c3e::t_a317c34a8ab4fd 2407,2410
+  s_d9dc521a887c3e::t_3006447116755e 1646
+  s_d9dc521a887c3e::t_1fa7ae454bd128 1662-1669
+net/crates/net/src/adapter/net/behavior/fold/capability.rs
+  s_d9dc521a887c3e::t_bc15ade82aa40b 111-127
+  s_d9dc521a887c3e::t_e0a128580b06c1 548-550
+  s_d9dc521a887c3e::t_e1b635eb34254c 1042-1044
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_d9dc521a887c3e::t_85a18bd4bd0a4f 555-557
+  s_d9dc521a887c3e::t_3e3c61de359930 250-254
+  s_d9dc521a887c3e::t_431f5fbc756f30 512-514
+  s_d9dc521a887c3e::t_5c7ffa00a94857 343-345
+  s_d9dc521a887c3e::t_7b895d8a962df8 193-249,255-272
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "e5302c073b9348e031ed37c97381f01157f8eb2d",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
