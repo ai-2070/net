@@ -1,0 +1,27 @@
+net/crates/net/docs/performance/net-crypto-session-reliability-analysis.md
+  s_947eb728f006db::t_ecf55dad50b70c 18-19
+net/crates/net/docs/performance/net-meshdb-analysis.md
+  s_947eb728f006db::t_efb5cd7d6c045d 11-19
+net/crates/net/docs/performance/net-perf-analysis.md
+  s_947eb728f006db::t_bc5da249684c5e 31
+net/crates/net/docs/performance/net-compute-analysis.md
+  s_947eb728f006db::t_1b1b43f1d93b55 14-19
+net/crates/net/docs/performance/net-discovery-routing-analysis.md
+  s_947eb728f006db::t_e22f1cd0afb1e9 18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "3315fb2b05994b7dde83e365024080e689c7e3c3",
+  "prompts": {},
+  "sessions": {
+    "s_947eb728f006db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fe2a7b6-f937-436c-8c36-6580a8be4344",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
