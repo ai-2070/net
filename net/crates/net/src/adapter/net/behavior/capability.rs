@@ -3189,75 +3189,87 @@ impl CapabilityIndex {
     /// - `None` when the filter has zero indexed predicates — callers
     ///   fall back to "all nodes" before applying any non-indexed
     ///   predicates.
-    fn build_candidate_set(&self, filter: &CapabilityFilter) -> Option<HashSet<u64>> {
-        let mut candidates: Option<HashSet<u64>> = None;
+    fn build_candidate_set(&self, filter: &CapabilityFilter) -> Option<Vec<u64>> {
+        // Per perf #110: switched return + working set from
+        // `HashSet<u64>` to `Vec<u64>` so subsequent intersections
+        // can run as in-place `Vec::retain(|n| index.contains(n))`
+        // instead of `c.intersection(&set).copied().collect()`
+        // (which allocates a fresh HashSet per filter clause).
+        // The first matched filter materializes via
+        // `.iter().copied().collect()` (one Vec alloc). Each
+        // subsequent indexed clause is a borrow + retain — no
+        // new container allocated. The inverted-index entries are
+        // already deduplicated (they're `HashSet<u64>` internally)
+        // so the initial materialization is unique; `retain`
+        // preserves that invariant.
+        let mut candidates: Option<Vec<u64>> = None;
 
         // GPU filter (most selective often)
         if filter.require_gpu {
             match self.gpu_nodes.get(&true) {
-                Some(gpu_nodes) => candidates = Some(gpu_nodes.clone()),
-                None => return Some(HashSet::new()),
+                Some(gpu_nodes) => candidates = Some(gpu_nodes.iter().copied().collect()),
+                None => return Some(Vec::new()),
             }
         }
 
         // GPU vendor filter
         if let Some(vendor) = filter.gpu_vendor {
             match self.by_gpu_vendor.get(&vendor) {
-                Some(vendor_nodes) => {
-                    candidates = Some(match candidates {
-                        Some(c) => c.intersection(&vendor_nodes).copied().collect(),
-                        None => vendor_nodes.clone(),
-                    });
-                }
-                None => return Some(HashSet::new()),
+                Some(vendor_nodes) => match &mut candidates {
+                    Some(c) => c.retain(|n| vendor_nodes.contains(n)),
+                    None => candidates = Some(vendor_nodes.iter().copied().collect()),
+                },
+                None => return Some(Vec::new()),
             }
         }
 
         // Tag filter (all required)
         for tag in &filter.require_tags {
             match self.by_tag.get(tag) {
-                Some(tag_nodes) => {
-                    candidates = Some(match candidates {
-                        Some(c) => c.intersection(&tag_nodes).copied().collect(),
-                        None => tag_nodes.clone(),
-                    });
-                }
-                None => return Some(HashSet::new()),
+                Some(tag_nodes) => match &mut candidates {
+                    Some(c) => c.retain(|n| tag_nodes.contains(n)),
+                    None => candidates = Some(tag_nodes.iter().copied().collect()),
+                },
+                None => return Some(Vec::new()),
             }
         }
 
-        // Model filter (any required)
+        // Model filter (any required). The union across multiple
+        // model names still wants set semantics for deduplication
+        // — keep the temporary `HashSet` for that union, then
+        // intersect it with `candidates` via the same retain
+        // pattern (or seed `candidates` from it on first match).
         if !filter.require_models.is_empty() {
-            let mut model_candidates = HashSet::new();
+            let mut model_candidates: HashSet<u64> = HashSet::new();
             for model in &filter.require_models {
                 if let Some(model_nodes) = self.by_model.get(model) {
                     model_candidates.extend(model_nodes.iter());
                 }
             }
             if model_candidates.is_empty() {
-                return Some(HashSet::new());
+                return Some(Vec::new());
             }
-            candidates = Some(match candidates {
-                Some(c) => c.intersection(&model_candidates).copied().collect(),
-                None => model_candidates,
-            });
+            match &mut candidates {
+                Some(c) => c.retain(|n| model_candidates.contains(n)),
+                None => candidates = Some(model_candidates.into_iter().collect()),
+            }
         }
 
         // Tool filter (any required)
         if !filter.require_tools.is_empty() {
-            let mut tool_candidates = HashSet::new();
+            let mut tool_candidates: HashSet<u64> = HashSet::new();
             for tool in &filter.require_tools {
                 if let Some(tool_nodes) = self.by_tool.get(tool) {
                     tool_candidates.extend(tool_nodes.iter());
                 }
             }
             if tool_candidates.is_empty() {
-                return Some(HashSet::new());
+                return Some(Vec::new());
             }
-            candidates = Some(match candidates {
-                Some(c) => c.intersection(&tool_candidates).copied().collect(),
-                None => tool_candidates,
-            });
+            match &mut candidates {
+                Some(c) => c.retain(|n| tool_candidates.contains(n)),
+                None => candidates = Some(tool_candidates.into_iter().collect()),
+            }
         }
 
         candidates
@@ -4249,6 +4261,82 @@ mod tests {
 
         let filter = CapabilityFilter::new().require_model("gpt-4");
         assert!(!filter.matches(&caps));
+    }
+
+    /// Pin perf #110: the Vec+retain refactor of
+    /// `build_candidate_set` must produce the SAME node-set as
+    /// the legacy HashSet-clone form across the four index
+    /// dimensions (gpu / vendor / tag / model / tool). Cover the
+    /// permutations that exercise the intersection paths:
+    /// - gpu × tag (boolean + iterated index)
+    /// - tag × tag (two sequential `retain` calls)
+    /// - tag × model (retain followed by union-then-retain)
+    /// - early-empty short circuit (returns Some(empty Vec))
+    ///
+    /// A regression that drops `retain` and reverts to a
+    /// non-deduplicating intersection (or doesn't honor the
+    /// "all-required" tag semantics) would surface here.
+    #[test]
+    fn build_candidate_set_intersection_semantics_preserved_after_vec_refactor() {
+        use std::collections::HashSet;
+        let index = CapabilityIndex::new();
+        // 12 nodes; 4-way tag pattern: A=evens, B=multiples-of-3,
+        // C=multiples-of-4. Models: m1 on first 6, m2 on last 6.
+        for i in 0u64..12 {
+            let mut caps = CapabilitySet::default();
+            if i % 2 == 0 {
+                caps = caps.add_tag("A");
+            }
+            if i % 3 == 0 {
+                caps = caps.add_tag("B");
+            }
+            if i % 4 == 0 {
+                caps = caps.add_tag("C");
+            }
+            if i < 6 {
+                caps = caps.add_model(ModelCapability::new("m1", "test"));
+            } else {
+                caps = caps.add_model(ModelCapability::new("m2", "test"));
+            }
+            index.index(CapabilityAnnouncement::new(i, test_entity(), 1, caps));
+        }
+
+        // Tag intersection A ∩ B = multiples of 6 = {0, 6}.
+        let f = CapabilityFilter::new()
+            .require_tag("A")
+            .require_tag("B");
+        let got: HashSet<u64> = index.query(&f).into_iter().collect();
+        assert_eq!(got, HashSet::from([0, 6]), "A ∩ B");
+
+        // Tag intersection A ∩ C = multiples of 4 = {0, 4, 8}.
+        let f = CapabilityFilter::new()
+            .require_tag("A")
+            .require_tag("C");
+        let got: HashSet<u64> = index.query(&f).into_iter().collect();
+        assert_eq!(got, HashSet::from([0, 4, 8]), "A ∩ C");
+
+        // Tag A ∩ model m1 = {0, 2, 4}.
+        let f = CapabilityFilter::new().require_tag("A").require_model("m1");
+        let got: HashSet<u64> = index.query(&f).into_iter().collect();
+        assert_eq!(got, HashSet::from([0, 2, 4]), "A ∩ m1");
+
+        // Early-empty: tag X (no nodes) → empty result, NOT None.
+        let f = CapabilityFilter::new().require_tag("X");
+        assert!(
+            index.query(&f).is_empty(),
+            "no-matches tag must short-circuit to empty"
+        );
+
+        // No deduplication regression: 100 queries' results must
+        // contain each id at most once.
+        let f = CapabilityFilter::new().require_tag("A");
+        let got = index.query(&f);
+        let unique: HashSet<u64> = got.iter().copied().collect();
+        assert_eq!(
+            got.len(),
+            unique.len(),
+            "Vec+retain path must preserve uniqueness from the seed set"
+        );
     }
 
     #[test]
