@@ -3046,14 +3046,19 @@ impl MeshNode {
                         Self::handle_routed_handshake(&parsed, &routing_header, source, ctx);
                         return;
                     }
-                    // Find the session that matches this packet's session_id
+                    // Find the session that matches this packet's
+                    // session_id. Capture the peer node_id alongside
+                    // the session so we can thread it through
+                    // `process_local_packet` and avoid the
+                    // per-subprotocol `peers.iter().find` on the
+                    // inbound hot path.
                     let session_id = parsed.header.session_id;
-                    let matching_session = peers
+                    let matched = peers
                         .iter()
                         .find(|e| e.value().session.session_id() == session_id)
-                        .map(|e| e.value().session.clone());
-                    if let Some(session) = matching_session {
-                        Self::process_local_packet(parsed, &session, ctx);
+                        .map(|e| (e.value().node_id, e.value().session.clone()));
+                    if let Some((peer_node_id, session)) = matched {
+                        Self::process_local_packet(parsed, peer_node_id, &session, ctx);
                         session.touch();
                     }
                 } else {
@@ -3159,7 +3164,7 @@ impl MeshNode {
             return;
         }
 
-        Self::process_local_packet(parsed, &session, ctx);
+        Self::process_local_packet(parsed, peer_node_id, &session, ctx);
         session.touch();
     }
 
@@ -3478,7 +3483,12 @@ impl MeshNode {
     ///
     /// This is the same logic as `NetAdapter::process_packet` but extracted
     /// to work with the multi-session dispatch.
-    fn process_local_packet(mut parsed: ParsedPacket, session: &NetSession, ctx: &DispatchCtx) {
+    fn process_local_packet(
+        mut parsed: ParsedPacket,
+        from_node: u64,
+        session: &NetSession,
+        ctx: &DispatchCtx,
+    ) {
         let inbound = &ctx.inbound;
         let num_shards = ctx.num_shards;
         // Validate payload length
@@ -3521,16 +3531,6 @@ impl MeshNode {
 
         // Check subprotocol — migration messages are sent as single event frames
         if parsed.header.subprotocol_id == SUBPROTOCOL_MIGRATION {
-            // Resolve sender up-front: both the handler-present and
-            // no-handler-default branches need it to route replies
-            // back over the inbound session.
-            let from_node = ctx
-                .peers
-                .iter()
-                .find(|e| e.value().session.session_id() == session.session_id())
-                .map(|e| e.value().node_id)
-                .unwrap_or(0);
-
             // `ArcSwapOption::load` — lock-free on the hot path.
             let handler_guard = ctx.migration_handler.load();
             if let Some(handler) = handler_guard.as_ref() {
@@ -3831,19 +3831,11 @@ impl MeshNode {
                 // No replicated channels — drop silently.
                 return;
             };
-            let from_node = ctx
-                .peers
-                .iter()
-                .find(|e| e.value().session.session_id() == session.session_id())
-                .map(|e| e.value().node_id)
-                .unwrap_or(0);
             // R-25: reject sentinel-zero from_node — `NodeId == 0`
             // is a valid id (MeshNodeConfig::new accepts the
-            // [0u8; 32] PSK), so an unknown sender that defaults
-            // to `0` would otherwise be indistinguishable from a
-            // legitimate node-0 peer. Mirrors the reflex
-            // handler's `if from_node == 0 { return; }` guard at
-            // line 3441 below.
+            // [0u8; 32] PSK), so a caller that defaulted to `0`
+            // because session resolution failed would otherwise be
+            // indistinguishable from a legitimate node-0 peer.
             if from_node == 0 {
                 return;
             }
@@ -3871,14 +3863,10 @@ impl MeshNode {
                 // No router → drop silently.
                 return;
             };
-            let from_node = ctx
-                .peers
-                .iter()
-                .find(|e| e.value().session.session_id() == session.session_id())
-                .map(|e| e.value().node_id)
-                .unwrap_or(0);
-            // Mirror the REDEX guard: NodeId == 0 from an
-            // unknown sender is rejected.
+            // Mirror the REDEX guard: NodeId == 0 is the sentinel
+            // for "session is up but the caller didn't pass a
+            // resolved node_id"; reject so an unauthenticated
+            // sender can't impersonate node-0.
             if from_node == 0 {
                 return;
             }
@@ -3914,12 +3902,6 @@ impl MeshNode {
             let Some(router) = router_guard.as_ref() else {
                 return;
             };
-            let from_node = ctx
-                .peers
-                .iter()
-                .find(|e| e.value().session.session_id() == session.session_id())
-                .map(|e| e.value().node_id)
-                .unwrap_or(0);
             if from_node == 0 {
                 return;
             }
