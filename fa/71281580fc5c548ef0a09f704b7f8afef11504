@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/behavior/meshdb/cache.rs
+  s_cd675bc73c3bfb::t_18a4b3cf893a8f 151-152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "fa71281580fc5c548ef0a09f704b7f8afef11504",
+  "prompts": {},
+  "sessions": {
+    "s_cd675bc73c3bfb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a31a48d8-2195-4ee7-9c6a-7c856922d421",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
