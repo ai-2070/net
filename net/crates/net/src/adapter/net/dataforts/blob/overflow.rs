@@ -337,7 +337,7 @@ impl OverflowPushHandler {
     /// tests can drive the admission path without
     /// constructing an [`crate::adapter::net::cortex::RpcContext`].
     ///
-    /// Reads live `user_caps_snapshot` + capability-index
+    /// Reads live `user_caps_snapshot` + capability-fold
     /// state on each call, so an operator toggling
     /// `overflow_enabled` on the local node is observed by
     /// the next inbound push.
@@ -346,15 +346,15 @@ impl OverflowPushHandler {
         use super::admission::{should_accept_overflow_from, OverflowVerdict};
         use super::blob_ref::BlobRef;
 
-        // Look up sender caps from the capability index.
+        // Synthesize sender caps from the capability fold.
         // Absent → use the empty default (which has
         // `overflow_enabled = false`); the admission gate
         // will then return `SenderNotOverflowing`.
-        let sender_caps = self
-            .mesh
-            .capability_index_arc()
-            .get(request.sender_node_id)
-            .unwrap_or_default();
+        let sender_caps =
+            super::super::super::behavior::fold::capability_bridge::synthesize_capability_set(
+                self.mesh.capability_fold(),
+                request.sender_node_id,
+            );
 
         // Snapshot local caps fresh per request so a
         // concurrent `set_overflow_enabled(false)` is

@@ -108,6 +108,23 @@ pub struct CapabilityMembership {
     /// (one publisher tends to publish the same reflex across
     /// every class it joins).
     pub reflex_addr: Option<std::net::SocketAddr>,
+    /// v0.4 capability-auth allow-list — peer `node_id`s
+    /// authorized to invoke any of this publisher's `tags`. Empty
+    /// = unrestricted (permissive default). Union semantics with
+    /// `allowed_subnets` and `allowed_groups`; the caller is
+    /// admitted if it matches at least one populated axis.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_nodes: Vec<u64>,
+    /// v0.4 capability-auth allow-list — caller subnets authorized
+    /// to invoke this publisher's tags. Same union semantics as
+    /// `allowed_nodes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_subnets: Vec<super::super::subnet::SubnetId>,
+    /// v0.4 capability-auth allow-list — caller groups authorized
+    /// to invoke this publisher's tags. Same union semantics as
+    /// `allowed_nodes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_groups: Vec<super::super::group::GroupId>,
 }
 
 /// Query shapes the [`CapabilityFold`] answers.
@@ -528,6 +545,9 @@ mod tests {
                 region: region.map(String::from),
                 price_quote: None,
                 reflex_addr,
+                allowed_nodes: Vec::new(),
+                allowed_subnets: Vec::new(),
+                allowed_groups: Vec::new(),
             },
         )
         .expect("sign succeeds")
@@ -1019,6 +1039,9 @@ mod tests {
                 region: None,
                 price_quote: None,
                 reflex_addr: None,
+                allowed_nodes: Vec::new(),
+                allowed_subnets: Vec::new(),
+                allowed_groups: Vec::new(),
             },
         )
         .unwrap();

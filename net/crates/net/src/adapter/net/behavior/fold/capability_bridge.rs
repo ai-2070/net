@@ -190,6 +190,86 @@ pub fn synthesize_capability_set(
     caps
 }
 
+/// `true` if `caller_node` is authorized to invoke `target_node`
+/// for `capability_tag`. Mirrors the legacy
+/// `CapabilityIndex::may_execute` semantics against the fold's
+/// state:
+///
+/// - `target` must have an entry carrying `capability_tag`.
+/// - If `target`'s allow-lists are all empty, the call is
+///   permitted (permissive default).
+/// - Otherwise the caller is admitted iff at least one populated
+///   axis (node / subnet / group) matches. Caller's subnet and
+///   groups are read from the caller's own fold entries via
+///   reserved `subnet:` / `group:` membership tags.
+pub fn may_execute(
+    fold: &Fold<CapabilityFold>,
+    target_node: NodeId,
+    capability_tag: &str,
+    caller_node: NodeId,
+) -> bool {
+    fold.with_state(|state| {
+        let Some(keys) = state.by_node.get(&target_node) else {
+            return false;
+        };
+        let mut target_carries_tag = false;
+        let mut allowed_nodes: Vec<u64> = Vec::new();
+        let mut allowed_subnets: Vec<super::super::subnet::SubnetId> = Vec::new();
+        let mut allowed_groups: Vec<super::super::group::GroupId> = Vec::new();
+        for k in keys {
+            let Some(entry) = state.entries.get(k) else {
+                continue;
+            };
+            if entry.payload.tags.iter().any(|t| t == capability_tag) {
+                target_carries_tag = true;
+            }
+            allowed_nodes.extend(entry.payload.allowed_nodes.iter().copied());
+            allowed_subnets.extend(entry.payload.allowed_subnets.iter().copied());
+            allowed_groups.extend(entry.payload.allowed_groups.iter().cloned());
+        }
+        if !target_carries_tag {
+            return false;
+        }
+        if allowed_nodes.is_empty() && allowed_subnets.is_empty() && allowed_groups.is_empty() {
+            return true;
+        }
+        if allowed_nodes.contains(&caller_node) {
+            return true;
+        }
+        if !allowed_subnets.is_empty() || !allowed_groups.is_empty() {
+            let Some(caller_keys) = state.by_node.get(&caller_node) else {
+                return false;
+            };
+            let mut caller_subnet: Option<super::super::subnet::SubnetId> = None;
+            let mut caller_groups: Vec<super::super::group::GroupId> = Vec::new();
+            for k in caller_keys {
+                let Some(entry) = state.entries.get(k) else {
+                    continue;
+                };
+                for raw in &entry.payload.tags {
+                    if let Some(subnet) = super::super::subnet::SubnetId::from_tag(raw) {
+                        caller_subnet = Some(subnet);
+                    }
+                    if let Some(group) = super::super::group::GroupId::from_tag(raw) {
+                        caller_groups.push(group);
+                    }
+                }
+            }
+            if let Some(subnet) = caller_subnet {
+                if allowed_subnets.contains(&subnet) {
+                    return true;
+                }
+            }
+            for g in &caller_groups {
+                if allowed_groups.contains(g) {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+}
+
 /// Translate a legacy [`CapabilityAnnouncement`] into a
 /// fold-shaped [`SignedAnnouncement<CapabilityMembership>`]
 /// suitable for [`Fold::apply`] dual-population during the
@@ -260,6 +340,9 @@ pub(crate) fn translate_announcement(
             region,
             price_quote: None,
             reflex_addr: ann.reflex_addr,
+            allowed_nodes: ann.allowed_nodes.clone(),
+            allowed_subnets: ann.allowed_subnets.clone(),
+            allowed_groups: ann.allowed_groups.clone(),
         },
     )
 }
@@ -426,6 +509,9 @@ mod tests {
                 region: None,
                 price_quote: None,
                 reflex_addr: None,
+                allowed_nodes: Vec::new(),
+                allowed_subnets: Vec::new(),
+                allowed_groups: Vec::new(),
             },
         )
         .expect("sign")
@@ -466,6 +552,9 @@ mod tests {
             region: None,
             price_quote: None,
             reflex_addr: None,
+            allowed_nodes: Vec::new(),
+            allowed_subnets: Vec::new(),
+            allowed_groups: Vec::new(),
         };
         assert!(membership_passes_post_filter(&ok, &legacy));
 

@@ -49,7 +49,7 @@ use super::pool::PacketBuilder;
 
 use super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 use super::behavior::capability::{
-    CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilitySet, ScopeFilter,
+    CapabilityAnnouncement, CapabilityFilter, CapabilitySet, ScopeFilter,
     MAX_CAPABILITY_HOPS,
 };
 use super::behavior::loadbalance::HealthStatus;
@@ -567,14 +567,9 @@ struct DispatchCtx {
     traversal_config: super::traversal::TraversalConfig,
     /// Max distinct channels a single peer may subscribe to.
     max_channels_per_peer: usize,
-    /// Capability index shared with `MeshNode`. Inbound
-    /// `SUBPROTOCOL_CAPABILITY_ANN` packets are indexed here.
-    capability_index: Arc<CapabilityIndex>,
-    /// Capability fold shared with `MeshNode`. Receives the
-    /// same inbound capability announcements via the bridge's
-    /// `translate_announcement`, so the new fold-backed
-    /// query path returns identical candidate sets while
-    /// callers progressively migrate off the legacy index.
+    /// Capability fold shared with `MeshNode`. Inbound
+    /// `SUBPROTOCOL_CAPABILITY_ANN` packets land here via the
+    /// bridge's `translate_announcement`.
     capability_fold:
         Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
     /// Dedup cache for multi-hop capability announcements, keyed by
@@ -1577,16 +1572,12 @@ pub struct MeshNode {
     /// this.
     #[cfg(feature = "nat-traversal")]
     traversal_stats: Arc<super::traversal::TraversalStats>,
-    /// Capability index populated by inbound
+    /// Capability fold populated by inbound
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets and the local
-    /// `announce_capabilities` path. Self-index so single-node
-    /// queries return us too.
-    capability_index: Arc<CapabilityIndex>,
-    /// Capability fold — the Phase 3b cutover target. Runs
-    /// alongside [`Self::capability_index`] during the cutover;
-    /// callers progressively migrate to it. Registered with this
-    /// node's internal [`super::behavior::fold::FoldRegistry`]
-    /// (installed as the [`Self::fold_router`] router by default).
+    /// `announce_capabilities` path. Self-applies so single-node
+    /// queries return us too. Registered with this node's
+    /// internal [`super::behavior::fold::FoldRegistry`] (installed
+    /// as the [`Self::fold_router`] router by default).
     capability_fold:
         Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
     /// Dedup cache for multi-hop capability announcements. Keyed by
@@ -1892,22 +1883,15 @@ impl MeshNode {
         let origin_hash_to_node: Arc<DashMap<u64, OriginHashSlot>> =
             Arc::new(DashMap::new());
 
-        // Capability index — hoisted out of the struct literal so
+        // Capability fold — hoisted out of the struct literal so
         // the failure-detector `on_failure` callback can hold a
         // clone. Without this eviction, a failed peer's advertised
-        // reflex would linger in the index and the rendezvous
+        // reflex would linger in the fold and the rendezvous
         // coordinator could hand it to a PunchRequest initiator
         // even though the peer is known dead (TEST_COVERAGE_PLAN
         // §P1-5 / TRANSPORT-adjacent bug: three-way agreement
         // between the failure detector, the routing table, and
-        // the capability index on peer-death).
-        let capability_index: Arc<CapabilityIndex> = Arc::new(CapabilityIndex::new());
-
-        // Per the Phase 3b cutover plan: a CapabilityFold runs
-        // alongside the legacy CapabilityIndex. Both receive
-        // inbound capability announcements; callers progressively
-        // rewire from the index to the fold in sub-steps 3a/3b/3c,
-        // and the legacy index is deleted in sub-step 5.
+        // capability state on peer-death).
         //
         // The fold is registered in a per-node FoldRegistry that
         // we install as the channel router for SUBPROTOCOL_FOLD.
@@ -1946,7 +1930,7 @@ impl MeshNode {
         let peer_subnets_failure = peer_subnets.clone();
         let peer_entity_ids_failure = peer_entity_ids.clone();
         let origin_hash_to_node_failure = origin_hash_to_node.clone();
-        let capability_index_failure = capability_index.clone();
+        let capability_fold_failure = capability_fold.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -1987,9 +1971,9 @@ impl MeshNode {
             // (stale) reflex, leading to wasted punch attempts
             // against a dead address. The three maps above
             // (routes, subnets, entity-ids) are all cleared on
-            // failure; the capability index is now consistent
+            // failure; the capability fold is now consistent
             // with them.
-            capability_index_failure.remove(node_id);
+            capability_fold_failure.evict_node(node_id, "failure-detector");
         })
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
@@ -2081,7 +2065,6 @@ impl MeshNode {
             traversal_config: super::traversal::TraversalConfig::default(),
             #[cfg(feature = "nat-traversal")]
             traversal_stats: Arc::new(super::traversal::TraversalStats::new()),
-            capability_index,
             capability_fold,
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
@@ -2775,44 +2758,31 @@ impl MeshNode {
     /// the multi-hop dedup cache. Interval from
     /// `config.capability_gc_interval` (default 60 s). Exits on
     /// `shutdown_notify`.
+    /// Spawn the seen-announcements dedup-cache GC loop. The
+    /// per-(node_id, version, is_direct) dedup map grows
+    /// monotonically as cap-anns arrive; without periodic eviction
+    /// it would retain every observation across the node's lifetime.
+    /// Eviction window is 2× the announcement TTL so a re-announce's
+    /// bumped version isn't confused with the previous one.
+    /// Interval from `config.capability_gc_interval` (default 60s).
     fn spawn_capability_gc_loop(&self) -> JoinHandle<()> {
-        let index = self.capability_index.clone();
         let seen = self.seen_announcements.clone();
         let interval = self.config.capability_gc_interval;
-        // Dedup retention = 2× the announcement's own TTL. Longer
-        // than one announcement lifetime so the re-announced bumped
-        // version isn't confused with the previous one; shorter than
-        // `index.gc` retention so the dedup set never outlives the
-        // index it guards.
         let dedup_retention =
             std::time::Duration::from_secs(2 * u64::from(CapabilityAnnouncement::DEFAULT_TTL_SECS));
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
 
         tokio::spawn(async move {
-            // `Duration::MAX` is the documented sentinel for
-            // "disable the loop". `tokio::time::interval(MAX)`
-            // panics under the hood (Instant + Duration::MAX
-            // overflows), so we skip the tick machinery entirely
-            // and just wait on shutdown.
             if interval == Duration::MAX {
                 let _ = shutdown_notify.notified().await;
                 return;
             }
-            // `tokio::time::interval` panics on a zero period — guard
-            // against a caller who set `capability_gc_interval` to
-            // `Duration::ZERO` in `MeshNodeConfig`. A zero interval
-            // isn't a sentinel for "disabled" (that's
-            // `Duration::MAX`, handled above); it's just pathological
-            // input; clamp to 1 s (see `nonzero_interval`).
             let mut tick = tokio::time::interval(nonzero_interval(interval));
-            // First tick fires immediately; skip it so we don't GC
-            // empty state before any announcements have landed.
             tick.tick().await;
             while !shutdown.load(Ordering::Acquire) {
                 tokio::select! {
                     _ = tick.tick() => {
-                        let _removed = index.gc();
                         seen.retain(|_, instant| instant.elapsed() < dedup_retention);
                     }
                     _ = shutdown_notify.notified() => break,
@@ -2970,7 +2940,6 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
-            capability_index: self.capability_index.clone(),
             capability_fold: self.capability_fold.clone(),
             seen_announcements: self.seen_announcements.clone(),
             require_signed_capabilities: self.config.require_signed_capabilities,
@@ -5326,22 +5295,6 @@ impl MeshNode {
         }
     }
 
-    /// Capability index — accessor for `mesh_rpc::Mesh::find_service_nodes`
-    /// to query nodes carrying the `nrpc:<service>` tag, plus
-    /// the dataforts-blob overflow handler (which reads sender
-    /// caps from this index on each inbound push) and operator
-    /// dashboards that want to inspect the live capability
-    /// view. The returned `Arc<CapabilityIndex>` exposes
-    /// read-only query methods (`get`, `query`, `all_nodes`);
-    /// the index is internally synchronized so concurrent reads
-    /// + the announce-driven writer don't tear.
-    #[cfg(feature = "cortex")]
-    pub fn capability_index_arc(
-        &self,
-    ) -> Arc<crate::adapter::net::behavior::capability::CapabilityIndex> {
-        self.capability_index.clone()
-    }
-
     /// Bridge from session-layer `node_id: u64` to entity-layer
     /// `[u8; 32]` (the ed25519 public key, used as the
     /// `ProximityGraph` key). `mesh_rpc`'s `LowestLatency` policy
@@ -6006,13 +5959,8 @@ impl MeshNode {
         if from_node != ctx.local_node_id {
             Self::filter_unauthorized_heat_tags(&mut ann.capabilities);
         }
-        // Phase 3b dual-population: dispatch the same
-        // announcement into the fold so the fold-backed query
-        // path returns identical candidate sets while callers
-        // progressively migrate off the legacy index.
         let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
         let _ = ctx.capability_fold.apply(fold_ann);
-        ctx.capability_index.index(ann);
     }
 
     /// Drop every `heat:<hex>=...` reserved tag from `caps` whose
@@ -7529,13 +7477,9 @@ impl MeshNode {
         )
         .with_ttl(300);
         ann.sign(&self.identity);
-        // Phase 3b dual-population: mirror the self-index into
-        // the fold so local queries find us through the new
-        // path too.
         let fold_ann =
             super::behavior::fold::capability_bridge::translate_announcement(&ann);
         let _ = self.capability_fold.apply(fold_ann);
-        self.capability_index.index(ann);
     }
 
     /// Announce this node's capabilities to every directly-connected
@@ -7650,12 +7594,9 @@ impl MeshNode {
         // Self-index so local queries see our own caps. Always runs
         // regardless of rate limit — the self-index reflects the
         // latest intended announcement.
-        // Phase 3b dual-population: same translation as the
-        // other self-index sites.
         let fold_ann =
             super::behavior::fold::capability_bridge::translate_announcement(&ann);
         let _ = self.capability_fold.apply(fold_ann);
-        self.capability_index.index(ann.clone());
 
         // Publish as the latest local announcement so future
         // session-opens push this version to new peers. Also always
@@ -8948,17 +8889,10 @@ impl MeshNode {
         })
     }
 
-    /// Shared reference to the capability index. Use this for
-    /// queries the two helpers above don't cover (listing all known
-    /// peers, reading stats, etc.).
-    pub fn capability_index(&self) -> &Arc<CapabilityIndex> {
-        &self.capability_index
-    }
-
-    /// Shared reference to the capability fold (the Phase 3b
-    /// cutover target). New callers query the fold instead of
-    /// [`Self::capability_index`]; the legacy index is deleted
-    /// once every caller has been rewired.
+    /// Shared reference to the capability fold — the canonical
+    /// capability-state surface. Used by operator dashboards,
+    /// the rendezvous coordinator (reflex lookup), and the
+    /// dataforts-blob overflow handler.
     pub fn capability_fold(
         &self,
     ) -> &Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>> {
@@ -10750,6 +10684,9 @@ mod fold_publisher_helpers_tests {
                     region: Some("us-east".into()),
                     price_quote: None,
                     reflex_addr: None,
+                    allowed_nodes: Vec::new(),
+                    allowed_subnets: Vec::new(),
+                    allowed_groups: Vec::new(),
                 },
             )
             .await;

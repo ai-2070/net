@@ -1643,6 +1643,7 @@ impl MeshNode {
         let service_for_bridge = service.to_string();
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
+            use crate::adapter::net::behavior::fold::capability_bridge;
             while let Some(inbound) = rx.recv().await {
                 // Defense-in-depth check. Skip only when the wire
                 // session resolved no NodeId (`from_node == 0` is
@@ -1657,9 +1658,15 @@ impl MeshNode {
                 // dispatcher is wired, so denying when the gate
                 // says no is now the safe failure mode.
                 let self_node = mesh_for_bridge.node_id();
-                let index = mesh_for_bridge.capability_index_arc();
                 let from_node = inbound.from_node;
-                if from_node != 0 && !index.may_execute(self_node, &tag, from_node) {
+                if from_node != 0
+                    && !capability_bridge::may_execute(
+                        mesh_for_bridge.capability_fold(),
+                        self_node,
+                        &tag,
+                        from_node,
+                    )
+                {
                     // Decode the EventMeta so we can address the
                     // caller's reply channel (keyed on
                     // `caller_origin`) and tag the response with
@@ -2397,9 +2404,10 @@ impl MeshNode {
     /// the user has the handler directly).
     pub fn find_service_nodes(&self, service: &str) -> Vec<u64> {
         use crate::adapter::net::behavior::capability::CapabilityFilter;
+        use crate::adapter::net::behavior::fold::capability_bridge;
         let tag = format!("nrpc:{service}");
         let filter = CapabilityFilter::default().require_tag(tag);
-        self.capability_index_arc().query(&filter)
+        capability_bridge::find_nodes_matching(self.capability_fold(), &filter)
     }
 
     /// Issue an RPC call to `service`, picking one node from
@@ -2482,10 +2490,11 @@ impl MeshNode {
         // an unmodified peer's announcement stays unrestricted.
         // See `docs/plans/CAPABILITY_AUTH_PLAN.md` §3.
         let tag = format!("nrpc:{service}");
-        let index = self.capability_index_arc();
+        use crate::adapter::net::behavior::fold::capability_bridge;
         let self_id = self.node_id();
         let any_candidate = candidates[0];
-        candidates.retain(|c| index.may_execute(*c, &tag, self_id));
+        let fold = self.capability_fold();
+        candidates.retain(|c| capability_bridge::may_execute(fold, *c, &tag, self_id));
         if candidates.is_empty() {
             return Err(RpcError::CapabilityDenied {
                 // No authorized target; surface one of the
