@@ -1,0 +1,67 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_d9dc521a887c3e::t_8427794141e348 52,572,1579,1880,1897-1899,1903,1905,1948,1952,4024,4546-4548,4551,7197-7199,7223-7226,7354,7462,7578,8320,8398-8404,8406-8408,8411-8413,8817-8824,8850-8857,10687-10698,10710-10713,10743-10744,10826-10829
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_d9dc521a887c3e::t_8427794141e348 128,146,287-288,312-317,353,427,596,632,686-687
+net/crates/net/src/adapter/net/compute/standby_group.rs
+  s_d9dc521a887c3e::t_8427794141e348 1085,1823
+net/crates/net/tests/cross_lang_capability_fixtures.rs
+  s_d9dc521a887c3e::t_8427794141e348 22-24
+net/crates/net/tests/integration_placement_filter_callback.rs
+  s_d9dc521a887c3e::t_8427794141e348 147,184
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_d9dc521a887c3e::t_8427794141e348 57,252,288
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  s_d9dc521a887c3e::t_8427794141e348 2196
+net/crates/net/src/adapter/net/compute/scheduler.rs
+  s_d9dc521a887c3e::t_8427794141e348 529,560,573,585,597,608,620-621,637-638,655,674,688,698,712,727,743,807,835,876,908,935,973,1026,1071,1104,1139,1174,1207,1243,1275,1305,1327,1376,1396,1413,1441,1463,1539
+net/crates/net/tests/subnet_enforcement.rs
+  s_d9dc521a887c3e::t_8427794141e348 165-166,254-256
+net/crates/net/src/adapter/net/compute/fork_group.rs
+  s_d9dc521a887c3e::t_8427794141e348 865,1121,1154
+net/crates/net/src/adapter/net/behavior/fold/capability.rs
+  s_d9dc521a887c3e::t_8427794141e348 39,198-201,279-282,318,448,509-511,575,680-681,989-996,1000-1007,1085
+net/crates/net/tests/dataforts_greedy_e2e.rs
+  s_d9dc521a887c3e::t_8427794141e348 197
+net/crates/net/src/adapter/net/behavior/fold/tests.rs
+  s_d9dc521a887c3e::t_8427794141e348 446,494-495,677,1044-1047,1162,1174-1177,1208-1212,1278,1328,1435-1436,1500-1501
+net/crates/net/src/adapter/net/behavior/meshdb/planner.rs
+  s_d9dc521a887c3e::t_8427794141e348 1069-1070,2033,2054,2066,2086,2108,2133,2155,2177,2199,2232,2263,2283,2310,2337,2358,2390,2415,2452,2481,2502,2526,2566,2606,2628,2650,2724,2769,2804,2835,2863,2893,2925,2953,2984,3018,3038,3064,3091,3119,3165,3195,3212,3234,3262,3294,3319,3336,3355,3374,3396,3425,3454,3480,3503,3523
+net/crates/net/src/adapter/net/behavior/tag.rs
+  s_d9dc521a887c3e::t_8427794141e348 126,713
+net/crates/net/src/adapter/net/compute/group_coord.rs
+  s_d9dc521a887c3e::t_8427794141e348 384,389
+net/crates/net/src/adapter/net/compute/replica_group.rs
+  s_d9dc521a887c3e::t_8427794141e348 735,972,1037
+net/crates/net/src/adapter/net/dataforts/blob/migration.rs
+  s_d9dc521a887c3e::t_8427794141e348 27,197,258,952,970,983,997,1180,1245,1266
+net/crates/net/tests/capability_broadcast.rs
+  s_d9dc521a887c3e::t_8427794141e348 372-375
+net/crates/net/src/adapter/net/behavior/placement.rs
+  s_d9dc521a887c3e::t_8427794141e348 538,540-547,549,551-570,572-595,597-615,3443
+net/crates/net/src/adapter/net/behavior/fold/routing.rs
+  s_d9dc521a887c3e::t_8427794141e348 131,315
+net/crates/net/src/adapter/net/behavior/fold/dispatch.rs
+  s_d9dc521a887c3e::t_8427794141e348 25,151,153-155,217,248,260
+net/crates/net/src/adapter/net/behavior/fold/wire.rs
+  s_d9dc521a887c3e::t_8427794141e348 330-335
+net/crates/net/src/adapter/net/behavior/fold/reservation.rs
+  s_d9dc521a887c3e::t_8427794141e348 291,367
+net/crates/net/src/adapter/net/dataforts/blob/overflow.rs
+  s_d9dc521a887c3e::t_8427794141e348 766,1211,1238,1261,1283,1313,1333,1353,1379,1414,1453,1491,1533,1581,1629,1683,1729
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "99f13ba81e7d65d3443572bb75ba47186aa5330d",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
