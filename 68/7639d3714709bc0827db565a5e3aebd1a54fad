@@ -1,0 +1,35 @@
+net/crates/net/src/adapter/net/behavior/fold/metrics.rs
+  s_947eb728f006db::t_8505c147109fc4 102-114
+net/crates/net/src/adapter/net/behavior/fold/tests.rs
+  s_947eb728f006db::t_de021ff03886d8 1053,1059-1060,1063
+  s_947eb728f006db::t_93fc5308e524f1 921-1052,1054-1058,1061-1062,1064-1231
+net/crates/net/src/adapter/net/behavior/fold/expiry.rs
+  s_947eb728f006db::t_a870ce000d5c03 41
+  s_947eb728f006db::t_6f82618192f11f 1-40,42-167
+net/crates/net/src/adapter/net/behavior/fold/audit.rs
+  s_947eb728f006db::t_bac4c79f26bf2b 1-95
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_947eb728f006db::t_bec8013c80058e 45,47,57,62
+  s_947eb728f006db::t_ddf95c892467f8 391
+  s_947eb728f006db::t_fdf3097b4d988c 521-566,575-586
+  s_947eb728f006db::t_d0f336642fb680 431
+  s_947eb728f006db::t_0de8ae72959c02 380
+  s_947eb728f006db::t_f142d831193d7f 199-206,211-227,232-235,237-273,275-279
+  s_947eb728f006db::t_500526ab37d7ae 336
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "687639d3714709bc0827db565a5e3aebd1a54fad",
+  "prompts": {},
+  "sessions": {
+    "s_947eb728f006db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fe2a7b6-f937-436c-8c36-6580a8be4344",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
