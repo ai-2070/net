@@ -397,15 +397,77 @@ mod tests {
         // `Bytes::copy_from_slice` would put `sub` in a fresh
         // allocation completely unrelated to `buf_ptr`.
         let sub = seg.read(4, 5).unwrap();
-        // Safety: both pointers are into the same allocation by
-        // construction; the test asserts that fact.
-        let sub_offset = unsafe { sub.as_ptr().offset_from(buf_ptr) };
+        // Compute the address delta via `usize::wrapping_sub`,
+        // not `<*const u8>::offset_from`. `offset_from` is
+        // documented UB when the two pointers are NOT from the
+        // same allocation — which is exactly the regression case
+        // this test is trying to detect (a re-introduced
+        // `Bytes::copy_from_slice` would place `sub` in a fresh
+        // allocation unrelated to `buf_ptr`). The integer-cast
+        // form is well-defined for any pointer values: in the
+        // zero-copy case it yields exactly 4; in the regression
+        // case it yields some large unrelated number that fails
+        // the equality assertion cleanly without invoking UB.
+        let sub_offset = (sub.as_ptr() as usize).wrapping_sub(buf_ptr as usize);
         assert_eq!(
             sub_offset, 4,
             "sub-range read must be a slice into the original buffer at offset 4; \
              got offset {sub_offset} (a regression here means read deep-copies)",
         );
         assert_eq!(sub.as_ref(), b"quick");
+    }
+
+    /// Companion to the zero-copy pin above: prove the
+    /// `wrapping_sub` comparison correctly detects the
+    /// regression-case shape (a `Bytes` from a fresh allocation
+    /// unrelated to the segment buffer). Pre-fix this test
+    /// would have used `<*const u8>::offset_from`, which is
+    /// documented UB across allocations — the very case the
+    /// regression test is meant to detect. The integer-cast
+    /// form (`(p as usize).wrapping_sub(q as usize)`) is
+    /// well-defined for any pointer pair.
+    ///
+    /// We construct what a deep-copy regression WOULD return:
+    /// a fresh `Bytes::copy_from_slice` of the bytes at offset
+    /// 4, holding the same content as the sub-slice but in a
+    /// new allocation. The wrapping_sub against the segment's
+    /// `buf_ptr` must yield some non-4 value (with overwhelming
+    /// probability — distinct heap allocations don't land at a
+    /// fixed offset of each other).
+    #[test]
+    fn read_zero_copy_pin_detects_deep_copy_via_wrapping_sub() {
+        let mut seg = HeapSegment::new();
+        let payload = b"the quick brown fox jumps over the lazy dog";
+        seg.append(payload).unwrap();
+        let buf_ptr = seg.buf.as_ptr();
+
+        // Simulate the regression: a fresh allocation carrying
+        // the same five bytes the zero-copy `read(4, 5)` would
+        // produce. `Bytes::copy_from_slice` allocates a brand
+        // new buffer; its data pointer is unrelated to
+        // `buf_ptr`.
+        let fake_deep_copy = bytes::Bytes::copy_from_slice(&payload[4..9]);
+        assert_eq!(fake_deep_copy.as_ref(), b"quick");
+        let fake_offset = (fake_deep_copy.as_ptr() as usize).wrapping_sub(buf_ptr as usize);
+        // The two addresses live in different allocations. The
+        // wrapping_sub is some arbitrary non-4 value — we can't
+        // predict it, but we can assert it isn't 4 (the rare
+        // collision case where the allocator happens to lay the
+        // fresh buffer exactly 4 bytes past the segment buffer
+        // is vanishingly improbable on any real allocator, and
+        // even a deliberate adversary couldn't arrange it
+        // through public API).
+        assert_ne!(
+            fake_offset, 4,
+            "wrapping_sub form must distinguish a fresh allocation \
+             from a same-allocation sub-slice — if these collide \
+             the zero-copy pin would no longer detect a deep-copy \
+             regression",
+        );
+
+        // And confirm the wrapping_sub form is non-UB by running
+        // it across the two unrelated pointers without exploding.
+        let _well_defined: usize = fake_offset;
     }
 
     #[test]
