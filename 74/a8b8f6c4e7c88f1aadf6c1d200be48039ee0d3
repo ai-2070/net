@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/MULTIFOLD_PHASE_3B_CUTOVER.md
+  s_947eb728f006db::t_c3c7ca5eaced00 1-226
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "74a8b8f6c4e7c88f1aadf6c1d200be48039ee0d3",
+  "prompts": {},
+  "sessions": {
+    "s_947eb728f006db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fe2a7b6-f937-436c-8c36-6580a8be4344",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
