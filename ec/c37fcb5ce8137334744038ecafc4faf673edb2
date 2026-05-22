@@ -1,0 +1,27 @@
+net/crates/net/docs/performance/net-compute-analysis.md
+  s_f930dae9b8bbc1::t_30cc42b7296912 9-16
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  s_f930dae9b8bbc1::t_a84ffd74e14f79 9
+  s_f930dae9b8bbc1::t_a296acf61e8947 232-239
+  s_f930dae9b8bbc1::t_5a19024867dadb 270
+  s_f930dae9b8bbc1::t_fa8aed9b66b8ab 287-291,293-297,299-302
+  s_f930dae9b8bbc1::t_0ded926fcb143e 298,985,1042,1053,1071,1104,1115,1136,1147,1186,1214,1236,1268,1342
+  s_f930dae9b8bbc1::t_6702bd7cc6f6a3 755
+  s_f930dae9b8bbc1::t_fb9f49f0d78374 1431-1480
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "ecc37fcb5ce8137334744038ecafc4faf673edb2",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
