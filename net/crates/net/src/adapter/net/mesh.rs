@@ -7899,6 +7899,27 @@ impl MeshNode {
         self.fold_router.read().is_some()
     }
 
+    /// Aggregated [`super::behavior::fold::FoldStats`] for every
+    /// fold the installed router addresses. Per Phase 6b — the
+    /// `net-mesh fold list` CLI subcommand and the Deck FOLDS
+    /// panel call into this once per scrape tick and render
+    /// one row per returned `FoldStats`.
+    ///
+    /// Returns an empty `Vec` when no router is installed (the
+    /// "no folds configured" case) AND when the installed
+    /// router is a stub that doesn't track stats (the test-
+    /// router case — see
+    /// [`super::behavior::fold::FoldChannelRouter::stats`]'s
+    /// default impl). The [`super::behavior::fold::FoldRegistry`]
+    /// override returns real aggregation.
+    pub fn fold_stats(&self) -> Vec<super::behavior::fold::FoldStats> {
+        let guard = self.fold_router.read();
+        let Some(router) = guard.as_ref() else {
+            return Vec::new();
+        };
+        router.stats()
+    }
+
     /// Install (or uninstall) the greedy-LRU observer. `Redex`
     /// calls this from
     /// [`Redex::enable_greedy_dataforts`](super::redex::Redex)

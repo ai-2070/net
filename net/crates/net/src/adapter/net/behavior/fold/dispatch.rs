@@ -272,6 +272,20 @@ pub trait FoldChannelRouter: Send + Sync {
         publisher: &EntityId,
         bytes: &[u8],
     ) -> Result<ApplyOutcome, DispatchError>;
+
+    /// Aggregated [`FoldStats`] for every fold the router
+    /// addresses. Per Phase 6b — the operator surface
+    /// (`net fold list`, the Deck FOLDS panel, the Prometheus
+    /// exporter) calls into the router-trait object to read
+    /// stats without knowing the underlying concrete type.
+    ///
+    /// Default impl returns an empty `Vec` so router
+    /// implementations that don't track per-fold stats (e.g.
+    /// test stubs) don't have to provide one. The
+    /// [`FoldRegistry`] override returns the real aggregation.
+    fn stats(&self) -> Vec<FoldStats> {
+        Vec::new()
+    }
 }
 
 impl FoldChannelRouter for FoldRegistry {
@@ -281,6 +295,10 @@ impl FoldChannelRouter for FoldRegistry {
         bytes: &[u8],
     ) -> Result<ApplyOutcome, DispatchError> {
         self.dispatch(bytes, publisher)
+    }
+
+    fn stats(&self) -> Vec<FoldStats> {
+        FoldRegistry::stats(self)
     }
 }
 

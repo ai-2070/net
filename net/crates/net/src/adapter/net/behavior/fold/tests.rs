@@ -1240,7 +1240,6 @@ use super::metrics::FoldStats;
 #[test]
 fn fold_stats_snapshot_reflects_live_counters() {
     let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
-    let kp = EntityKeypair::generate();
 
     // 2 inserts, 1 replace, 1 reject.
     fold.apply(cap_announcement(0x1, 0x100, 1, vec!["a"]))
@@ -1380,6 +1379,67 @@ fn ring_audit_sink_with_zero_capacity_stores_nothing() {
     assert!(sink.is_empty());
     assert_eq!(sink.len(), 0);
     assert!(sink.snapshot().is_empty());
+}
+
+#[test]
+fn fold_channel_router_trait_object_exposes_stats() {
+    // Phase 6b: the mesh dispatch arm stores routers as
+    // `Arc<dyn FoldChannelRouter>`. The CLI / Deck path
+    // reads stats via the trait object — no concrete-type
+    // visibility — so the `stats` method on the trait must
+    // route through `FoldRegistry::stats` correctly.
+    let registry = FoldRegistry::new();
+    let cap_fold: Arc<Fold<CapFold>> = Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
+    let route_fold: Arc<Fold<RoutingTestFold>> =
+        Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
+    registry.register(cap_fold.clone());
+    registry.register(route_fold.clone());
+
+    let kp = EntityKeypair::generate();
+    cap_fold
+        .apply(cap_announcement(0x42, 0x100, 1, vec!["gpu"]))
+        .unwrap();
+    route_fold
+        .apply(route_announcement(0xAA, 0x99, 50, 1))
+        .unwrap();
+    let _ = kp;
+
+    let router: Arc<dyn FoldChannelRouter> = Arc::new(registry);
+    let stats = router.stats();
+    assert_eq!(stats.len(), 2, "registry router reports both folds");
+
+    let cap_stats = stats
+        .iter()
+        .find(|s| s.kind == CapFold::KIND_ID)
+        .expect("cap stats present");
+    assert_eq!(cap_stats.entries, 1);
+
+    let route_stats = stats
+        .iter()
+        .find(|s| s.kind == RoutingTestFold::KIND_ID)
+        .expect("route stats present");
+    assert_eq!(route_stats.entries, 1);
+}
+
+#[test]
+fn fold_channel_router_default_stats_impl_returns_empty() {
+    // A custom router that doesn't override `stats` falls
+    // through to the default (empty Vec). Pins the contract
+    // that `MeshNode::fold_stats` callers can rely on for
+    // test-stub routers.
+    struct StubRouter;
+    impl FoldChannelRouter for StubRouter {
+        fn try_route(
+            &self,
+            _publisher: &EntityId,
+            _bytes: &[u8],
+        ) -> Result<ApplyOutcome, DispatchError> {
+            Ok(ApplyOutcome::Inserted)
+        }
+        // stats() left at the default impl
+    }
+    let stub: Arc<dyn FoldChannelRouter> = Arc::new(StubRouter);
+    assert!(stub.stats().is_empty());
 }
 
 #[test]
