@@ -1,0 +1,48 @@
+net/crates/net/docs/performance/net-perf-analysis.md
+  s_f930dae9b8bbc1::t_21bee6e54019df 1079-1081
+net/crates/net/src/adapter/net/cortex/memories/watch.rs
+  s_f930dae9b8bbc1::t_85f6cbaaef01cb 161
+net/crates/net/src/adapter/net/cortex/memories/state.rs
+  s_f930dae9b8bbc1::t_312a7f80e3eac7 73,78-81,86-89,99-103
+  s_f930dae9b8bbc1::t_997ea2c12dcf59 41-44,46-53
+  s_f930dae9b8bbc1::t_4b876e96f4ae65 5,14-24,28-29,32
+  s_f930dae9b8bbc1::t_4723a3c9ad045c 122-123,131
+net/crates/net/src/ffi/cortex.rs
+  s_f930dae9b8bbc1::t_4e9bdaf4ebae16 2203-2217
+  s_f930dae9b8bbc1::t_a4454805c10a3a 2578-2581
+  s_f930dae9b8bbc1::t_229bfa8c53b15e 2650-2655,2659
+net/crates/net/src/adapter/net/cortex/memories/query.rs
+  s_f930dae9b8bbc1::t_ce25f0ec3a2a06 465
+  s_f930dae9b8bbc1::t_5768ee605d8fca 15
+  s_f930dae9b8bbc1::t_ede071284e100b 246-248,257,261-263,270-273
+  s_f930dae9b8bbc1::t_fac9ad28bbc235 313
+  s_f930dae9b8bbc1::t_f7665451c34583 277
+  s_f930dae9b8bbc1::t_5d2da04543bdc7 127-134,137
+net/crates/net/bindings/python/src/cortex.rs
+  s_f930dae9b8bbc1::t_51058b84268ace 1875,1997,2011
+  s_f930dae9b8bbc1::t_a8f3c301b4741c 1551-1565
+net/crates/net/bindings/node/src/cortex.rs
+  s_f930dae9b8bbc1::t_2d1d7c2c95bd2f 1649,1944,1963
+  s_f930dae9b8bbc1::t_206831b59a19b3 1607-1621
+net/crates/net/src/adapter/net/cortex/memories/fold.rs
+  s_f930dae9b8bbc1::t_1295cd356754c7 77-81,83-87,92,100,107-108,116-117,125-126
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  s_f930dae9b8bbc1::t_e1ec88f10727e7 37-38,40
+  s_f930dae9b8bbc1::t_eb6d8fe0b15e3f 337-341
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "11da8ee8dc7d89ed4a802e4c0d868bd1302645a1",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
