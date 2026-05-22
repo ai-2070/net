@@ -100,6 +100,37 @@ use crate::event::{Batch, StoredEvent};
 /// Inbound event queues (same type as NetAdapter uses).
 type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 
+/// One slot in [`MeshNode::fold_generations`]: a monotonic
+/// counter plus the wall-clock micros at which it was last
+/// bumped. The background GC loop evicts slots whose
+/// `last_touched_us` is more than [`FOLD_GENERATION_GC_MAX_AGE`]
+/// behind `now`.
+struct FoldGenerationEntry {
+    counter: AtomicU64,
+    last_touched_us: AtomicU64,
+}
+
+impl FoldGenerationEntry {
+    fn new() -> Self {
+        Self {
+            counter: AtomicU64::new(0),
+            last_touched_us: AtomicU64::new(super::current_timestamp_micros()),
+        }
+    }
+}
+
+/// Cadence at which the fold-generation GC sweep runs.
+const FOLD_GENERATION_GC_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Maximum age of a `fold_generations` entry before the sweep
+/// evicts it. 1 hour is generous enough that a publisher that
+/// re-publishes against the same `(kind, class)` slot once per
+/// `DEFAULT_TTL` (30 s for reservations, 60 s for capability,
+/// 300 s for routing) never loses its counter; tight enough that
+/// a publisher that abandons a `class` (e.g. a one-shot
+/// `ResourceId`) reclaims its slot within a bounded window.
+const FOLD_GENERATION_GC_MAX_AGE: Duration = Duration::from_secs(3600);
+
 /// Convert a u64 node_id to a 32-byte graph NodeId.
 ///
 /// The proximity graph uses 32-byte ed25519 public keys as NodeId.
@@ -1561,13 +1592,19 @@ pub struct MeshNode {
     /// publishes to different folds (or different classes within
     /// a fold) don't contend.
     ///
+    /// Each entry carries a `last_touched_us` timestamp so the
+    /// background sweep
+    /// ([`Self::spawn_fold_generation_gc_loop`]) can evict
+    /// counters whose owning fold-entry has long since expired —
+    /// ReservationFold's per-`resource_id` shard space is
+    /// effectively unbounded, and without GC the counter map
+    /// would grow over a node's lifetime.
+    ///
     /// In-memory only — restarts reset the counters; receivers
     /// re-accept the first post-restart announcement at
     /// generation 1 because the stale entry is past the runtime
-    /// TTL by the time the publisher comes back. A persistence
-    /// layer could wrap this `DashMap` later if a tighter restart
-    /// story is needed.
-    fold_generations: Arc<DashMap<(u16, u64), AtomicU64>>,
+    /// TTL by the time the publisher comes back.
+    fold_generations: Arc<DashMap<(u16, u64), FoldGenerationEntry>>,
     /// Optional greedy-LRU observer. `Redex` installs one of these
     /// via [`Self::set_greedy_observer`] when the operator calls
     /// `Redex::enable_greedy_dataforts(mesh, cfg)`; subsequent
@@ -2384,6 +2421,7 @@ impl MeshNode {
             }
         };
         let capability_gc_handle = self.spawn_capability_gc_loop();
+        let fold_generation_gc_handle = self.spawn_fold_generation_gc_loop();
         let token_sweep_handle = self.spawn_token_sweep_loop();
         // Port-mapping task is opt-in — only spawned when the
         // operator set `try_port_mapping(true)`. Real client is
@@ -2451,6 +2489,7 @@ impl MeshNode {
             tasks.push(heartbeat_handle);
             tasks.push(router_handle);
             tasks.push(capability_gc_handle);
+            tasks.push(fold_generation_gc_handle);
             tasks.push(token_sweep_handle);
             #[cfg(feature = "port-mapping")]
             if let Some(h) = port_mapping_handle {
@@ -2631,6 +2670,38 @@ impl MeshNode {
                     _ = tick.tick() => {
                         let _removed = index.gc();
                         seen.retain(|_, instant| instant.elapsed() < dedup_retention);
+                    }
+                    _ = shutdown_notify.notified() => break,
+                }
+            }
+        })
+    }
+
+    /// Spawn the fold-generation GC loop. Walks
+    /// [`Self::fold_generations`] on a [`FOLD_GENERATION_GC_INTERVAL`]
+    /// cadence and evicts entries whose `last_touched_us` is
+    /// more than [`FOLD_GENERATION_GC_MAX_AGE`] behind `now`.
+    /// Bounds the counter map's memory for folds with
+    /// unbounded class space (e.g. `ReservationFold` keyed on
+    /// `resource_id`).
+    fn spawn_fold_generation_gc_loop(&self) -> JoinHandle<()> {
+        let generations = self.fold_generations.clone();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(FOLD_GENERATION_GC_INTERVAL);
+            // Skip the immediate first tick — sweeping an empty
+            // map is a no-op anyway, but the consistent shape
+            // mirrors the other GC loops.
+            tick.tick().await;
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let cutoff_us = super::current_timestamp_micros()
+                            .saturating_sub(FOLD_GENERATION_GC_MAX_AGE.as_micros() as u64);
+                        generations.retain(|_, e| {
+                            e.last_touched_us.load(Ordering::Relaxed) >= cutoff_us
+                        });
                     }
                     _ = shutdown_notify.notified() => break,
                 }
@@ -7050,13 +7121,18 @@ impl MeshNode {
     /// returns `1`, since the wire format reserves `0` as the
     /// "uninitialized" sentinel
     /// [`super::behavior::fold::FoldError::InvalidGeneration`]
-    /// rejects.
+    /// rejects. Also stamps `last_touched_us` so the
+    /// fold-generation GC keeps the slot live as long as the
+    /// publisher is actively using it.
     pub(crate) fn next_fold_generation(&self, kind: u16, class: u64) -> u64 {
-        self.fold_generations
+        let entry = self
+            .fold_generations
             .entry((kind, class))
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1
+            .or_insert_with(FoldGenerationEntry::new);
+        entry
+            .last_touched_us
+            .store(super::current_timestamp_micros(), Ordering::Relaxed);
+        entry.counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Sign + broadcast one fold announcement.
@@ -10366,6 +10442,47 @@ mod fold_publisher_helpers_tests {
             0x1000,
         );
         assert_eq!(next, 2, "first publish used gen=1, next_fold_generation returns gen=2");
+    }
+
+    #[tokio::test]
+    async fn fold_generation_gc_evicts_stale_slots_keeps_recent() {
+        // GC behavior: an entry whose last_touched_us is older
+        // than FOLD_GENERATION_GC_MAX_AGE is removed; recently-
+        // touched slots survive. We drive the sweep inline by
+        // calling the same retain closure the background task
+        // uses, so the test stays fast and deterministic without
+        // spinning the 5-minute interval.
+        let node = build_node_for_test().await;
+        let kind = 0x0F00u16;
+        let stale_class = 0xAAAA_u64;
+        let fresh_class = 0xBBBB_u64;
+
+        // Stale entry: stamp last_touched far in the past.
+        node.next_fold_generation(kind, stale_class);
+        node.fold_generations
+            .get(&(kind, stale_class))
+            .expect("stale entry exists")
+            .last_touched_us
+            .store(0, Ordering::Relaxed);
+
+        // Fresh entry: just stamped, last_touched ≈ now.
+        node.next_fold_generation(kind, fresh_class);
+
+        // Run the same retain the background loop would on tick.
+        let cutoff_us = crate::adapter::net::current_timestamp_micros()
+            .saturating_sub(FOLD_GENERATION_GC_MAX_AGE.as_micros() as u64);
+        node.fold_generations.retain(|_, e| {
+            e.last_touched_us.load(Ordering::Relaxed) >= cutoff_us
+        });
+
+        assert!(
+            !node.fold_generations.contains_key(&(kind, stale_class)),
+            "stale slot evicted"
+        );
+        assert!(
+            node.fold_generations.contains_key(&(kind, fresh_class)),
+            "fresh slot survives"
+        );
     }
 }
 
