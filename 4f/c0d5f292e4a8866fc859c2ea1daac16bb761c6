@@ -1,0 +1,54 @@
+net/crates/net/src/adapter/net/compute/replica_group.rs
+  s_d9dc521a887c3e::t_e96e654b398248 976-978,980-981,983-988
+  s_d9dc521a887c3e::t_b40d7c569f49a5 1045-1047,1049-1050,1053-1057,1060
+  s_d9dc521a887c3e::t_a4367810691665 735-737,739-740,742-749
+net/crates/net/src/adapter/net/compute/fork_group.rs
+  s_d9dc521a887c3e::t_0dcdc884a0976d 865-867,869-870,872-879
+  s_d9dc521a887c3e::t_e9de08a15fff08 1162-1164,1166-1167,1170-1174,1177
+  s_d9dc521a887c3e::t_bfc7086268dd8f 1125-1127,1129-1141
+net/crates/net/tests/migration_integration.rs
+  s_d9dc521a887c3e::t_2660ab282762ca 15
+  s_d9dc521a887c3e::t_daa4738226878e 332-333,335-336,338-342,345
+  s_d9dc521a887c3e::t_be55b60c75cf15 1697-1706
+  s_d9dc521a887c3e::t_f4d967b300581d 991,993-999,1003-1007,1010
+  s_d9dc521a887c3e::t_bc71b1f9a211cc 371-373
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  s_d9dc521a887c3e::t_30a7ce0e3976f6 2188,2195-2198
+net/crates/net/src/adapter/net/compute/standby_group.rs
+  s_d9dc521a887c3e::t_45d68c8f501a6c 1085-1087,1089-1090,1094-1101
+  s_d9dc521a887c3e::t_00fe977cdaf1e7 1827-1829,1831-1832,1835-1839,1843
+net/crates/net/src/adapter/net/compute/scheduler.rs
+  s_d9dc521a887c3e::t_b0b082c08b463c 183
+  s_d9dc521a887c3e::t_6015f01608f93a 67-68,76-77,92,98
+  s_d9dc521a887c3e::t_b3233d8391bee8 535-541,543-544,548-549,552
+  s_d9dc521a887c3e::t_1718cf9dbc672f 652,654
+  s_d9dc521a887c3e::t_dae6fadab4f74c 200
+  s_d9dc521a887c3e::t_e59d49753c5fc6 575,588,600,612,623,670,689,703,713,727,742,758,1407,1427,1444,1472,1494,1572
+  s_d9dc521a887c3e::t_80d5618bb254f7 822,851,893,926,954,993,1047,1093,1127,1163,1199,1233,1270,1303,1334,1357
+  s_d9dc521a887c3e::t_084f4fba570ed6 574,587,599,611,622,669,684,699,712,724,738,754,821,846,888,922,953,988,1042,1089,1123,1158,1194,1232,1265,1302,1333,1356,1403,1423,1441,1464,1490,1568
+  s_d9dc521a887c3e::t_56dbb699632582 69-74,78-81
+  s_d9dc521a887c3e::t_a2fe5569af7a03 155,160
+  s_d9dc521a887c3e::t_936edf3dd847ba 3-7,13
+  s_d9dc521a887c3e::t_3e9defa2e3fc1e 635,637
+  s_d9dc521a887c3e::t_b146ccb4d2fbf6 225
+net/crates/net/src/adapter/net/compute/group_coord.rs
+  s_d9dc521a887c3e::t_567fb877d8f9ee 391-393,395-396,399-403,407
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_d9dc521a887c3e::t_f5e29f3a05c933 143-158
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "4fc0d5f292e4a8866fc859c2ea1daac16bb761c6",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
