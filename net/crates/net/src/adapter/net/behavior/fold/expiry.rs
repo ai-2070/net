@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 
-use super::audit::AuditSink;
+use super::audit::FoldAuditSink;
 use super::state::{EntryTransition, FoldIndex, FoldState};
 use super::FoldKind;
 use super::FoldMetrics;
@@ -66,7 +66,7 @@ pub(super) fn sweep_expired<K: FoldKind>(
     state_lock: &RwLock<FoldState<K>>,
     index_lock: &RwLock<K::Index>,
     metrics: &FoldMetrics,
-    audit_sink: Option<&Arc<dyn AuditSink>>,
+    audit_sink: Option<&Arc<dyn FoldAuditSink>>,
 ) -> usize {
     let now = Instant::now();
     let mut state = state_lock.write();
@@ -135,7 +135,7 @@ pub(super) fn spawn_expiry_task<K: FoldKind>(
     state: Weak<RwLock<FoldState<K>>>,
     index: Weak<RwLock<K::Index>>,
     metrics: Weak<FoldMetrics>,
-    audit_sink: Weak<parking_lot::RwLock<Option<Arc<dyn AuditSink>>>>,
+    audit_sink: Weak<parking_lot::RwLock<Option<Arc<dyn FoldAuditSink>>>>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

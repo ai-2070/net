@@ -923,7 +923,7 @@ fn receiver_rejects_envelope_signed_for_a_different_publisher() {
 // Phase 1B: TTL expiry sweep + audit sink routing
 // ---------------------------------------------------------------------
 
-use super::audit::{NoopSink, VecAuditSink};
+use super::audit::{NoopSink, VecFoldAuditSink};
 
 /// Build a cap-fold announcement with `ttl_secs = 0` so the
 /// computed `expires_at` is `now + 0s == now` — the next
@@ -1125,8 +1125,8 @@ fn sign_audit_ann(
 #[test]
 fn audit_sink_receives_create_replace_evict_and_expire_transitions() {
     let fold: Fold<AuditingCapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
-    let sink: Arc<VecAuditSink> = Arc::new(VecAuditSink::new());
-    fold.set_audit_sink(Some(sink.clone() as Arc<dyn super::AuditSink>));
+    let sink: Arc<VecFoldAuditSink> = Arc::new(VecFoldAuditSink::new());
+    fold.set_audit_sink(Some(sink.clone() as Arc<dyn super::FoldAuditSink>));
     assert!(fold.has_audit_sink());
 
     let kp = EntityKeypair::generate();
@@ -1172,8 +1172,8 @@ fn audit_sink_receives_create_replace_evict_and_expire_transitions() {
 #[test]
 fn audit_sink_can_be_uninstalled() {
     let fold: Fold<AuditingCapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
-    let sink: Arc<VecAuditSink> = Arc::new(VecAuditSink::new());
-    fold.set_audit_sink(Some(sink.clone() as Arc<dyn super::AuditSink>));
+    let sink: Arc<VecFoldAuditSink> = Arc::new(VecFoldAuditSink::new());
+    fold.set_audit_sink(Some(sink.clone() as Arc<dyn super::FoldAuditSink>));
 
     let kp = EntityKeypair::generate();
     fold.apply(sign_audit_ann(&kp, 0xA, 0x100, 1, 300, vec!["a"]))
@@ -1191,7 +1191,7 @@ fn audit_sink_can_be_uninstalled() {
 #[test]
 fn noop_sink_swallows_events_without_storing() {
     let fold: Fold<AuditingCapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
-    fold.set_audit_sink(Some(Arc::new(NoopSink) as Arc<dyn super::AuditSink>));
+    fold.set_audit_sink(Some(Arc::new(NoopSink) as Arc<dyn super::FoldAuditSink>));
     let kp = EntityKeypair::generate();
     // Many applies, no panic, no allocation observed by the
     // (non-instrumented) sink. Effectively a smoke test that
@@ -1231,10 +1231,10 @@ async fn background_sweeper_evicts_expired_entries_on_tick() {
 }
 
 // ---------------------------------------------------------------------
-// Phase 6a: FoldStats + FoldRegistry::stats + RingAuditSink
+// Phase 6a: FoldStats + FoldRegistry::stats + RingFoldAuditSink
 // ---------------------------------------------------------------------
 
-use super::audit::RingAuditSink;
+use super::audit::RingFoldAuditSink;
 use super::metrics::FoldStats;
 
 #[test]
@@ -1279,7 +1279,7 @@ fn fold_stats_snapshot_reflects_live_counters() {
     let s2 = fold.snapshot();
     restored.restore(s2, false).expect("restore");
 
-    fold.set_audit_sink(Some(Arc::new(NoopSink) as Arc<dyn super::AuditSink>));
+    fold.set_audit_sink(Some(Arc::new(NoopSink) as Arc<dyn super::FoldAuditSink>));
     let snap = fold.stats();
     assert_eq!(snap.entries, 1, "after evict_node(0x2): only 0x1 remains");
     assert_eq!(snap.evictions, 1);
@@ -1352,7 +1352,7 @@ fn fold_stats_round_trips_through_serde_json() {
 
 #[test]
 fn ring_audit_sink_drops_oldest_when_capacity_exceeded() {
-    let sink = RingAuditSink::new(3);
+    let sink = RingFoldAuditSink::new(3);
     for i in 0..5 {
         sink.record(super::AuditEvent {
             kind: "created",
@@ -1370,7 +1370,7 @@ fn ring_audit_sink_drops_oldest_when_capacity_exceeded() {
 
 #[test]
 fn ring_audit_sink_with_zero_capacity_stores_nothing() {
-    let sink = RingAuditSink::new(0);
+    let sink = RingFoldAuditSink::new(0);
     sink.record(super::AuditEvent {
         kind: "created",
         key_repr: "x".into(),
@@ -1447,8 +1447,8 @@ fn fold_channel_router_stub_returns_its_own_empty_stats() {
 #[test]
 fn ring_audit_sink_plugs_into_fold_and_captures_transitions() {
     let fold: Fold<AuditingCapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
-    let sink = Arc::new(RingAuditSink::new(4));
-    fold.set_audit_sink(Some(sink.clone() as Arc<dyn super::AuditSink>));
+    let sink = Arc::new(RingFoldAuditSink::new(4));
+    fold.set_audit_sink(Some(sink.clone() as Arc<dyn super::FoldAuditSink>));
 
     let kp = EntityKeypair::generate();
     // 5 distinct events — the 1st is dropped (capacity 4).

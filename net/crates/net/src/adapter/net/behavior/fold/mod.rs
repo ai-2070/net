@@ -57,7 +57,7 @@ pub mod wire;
 mod tests;
 
 pub use announcement::SignedAnnouncement;
-pub use audit::{AuditSink, NoopSink, RingAuditSink, VecAuditSink};
+pub use audit::{FoldAuditSink, NoopSink, RingFoldAuditSink, VecFoldAuditSink};
 pub use capability::{
     CapabilityFilter, CapabilityFold, CapabilityIndexInner, CapabilityMatch, CapabilityMembership,
     CapabilityQuery, HardwareSummary, NodeState,
@@ -209,7 +209,7 @@ pub struct AuditEvent {
 /// index`; query takes both read locks in the same order.
 /// Mixing those orders would deadlock; the runtime never does.
 ///
-/// Phase 1B additions: an optional [`AuditSink`] receives
+/// Phase 1B additions: an optional [`FoldAuditSink`] receives
 /// transition events emitted by [`FoldKind::audit_event`], and a
 /// background tokio task wakes every
 /// [`DEFAULT_SWEEP_INTERVAL`] (or the per-fold override) to
@@ -228,7 +228,7 @@ pub struct Fold<K: FoldKind> {
     /// shape mirrors the meshdb / replication router slots so
     /// install / uninstall is hot-swappable without
     /// reconstructing the fold.
-    audit_sink: Arc<RwLock<Option<Arc<dyn AuditSink>>>>,
+    audit_sink: Arc<RwLock<Option<Arc<dyn FoldAuditSink>>>>,
     /// Background-sweeper join handle. Aborted in
     /// [`Self::drop`]; the weakly-referenced state inside the
     /// task also lets the task exit on its own when the last
@@ -258,7 +258,7 @@ impl<K: FoldKind> Fold<K> {
         let state = Arc::new(RwLock::new(FoldState::new()));
         let index = Arc::new(RwLock::new(K::build_index()));
         let metrics = Arc::new(FoldMetrics::new());
-        let audit_sink: Arc<RwLock<Option<Arc<dyn AuditSink>>>> = Arc::new(RwLock::new(None));
+        let audit_sink: Arc<RwLock<Option<Arc<dyn FoldAuditSink>>>> = Arc::new(RwLock::new(None));
 
         // Spawn the background sweeper only if (a) the interval
         // is non-zero AND (b) we're running on a tokio runtime.
@@ -547,8 +547,8 @@ impl<K: FoldKind> Fold<K> {
     /// forwarded to the sink's `record` method synchronously
     /// from the path that emitted the transition (apply,
     /// evict_node, sweep_expired). Phase 1B; see
-    /// [`AuditSink`] for the contract.
-    pub fn set_audit_sink(&self, sink: Option<Arc<dyn AuditSink>>) {
+    /// [`FoldAuditSink`] for the contract.
+    pub fn set_audit_sink(&self, sink: Option<Arc<dyn FoldAuditSink>>) {
         *self.audit_sink.write() = sink;
     }
 

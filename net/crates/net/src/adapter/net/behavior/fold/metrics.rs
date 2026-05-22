@@ -66,7 +66,7 @@ pub struct FoldStats {
     pub snapshots_taken: u64,
     /// Snapshots restored via [`super::Fold::restore`].
     pub snapshots_restored: u64,
-    /// Whether an [`super::AuditSink`] is currently installed
+    /// Whether an [`super::FoldAuditSink`] is currently installed
     /// on the fold. Diagnostic — operators trying to figure
     /// out why their audit trail is empty want a quick
     /// "nothing's listening" signal.

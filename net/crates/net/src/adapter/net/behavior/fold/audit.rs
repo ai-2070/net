@@ -24,7 +24,7 @@ use super::AuditEvent;
 /// - A `tracing` adapter that emits via `tracing::info!` /
 ///   `tracing::warn!` on the appropriate level.
 /// - A bridge to the project's existing signed-audit chain
-///   (writes to the same `AuditSink` interface used by the
+///   (writes to the same `FoldAuditSink` interface used by the
 ///   safety / replication layers).
 /// - A `Vec<AuditEvent>`-backed ring buffer for tests + Deck
 ///   panel "recent transitions" view.
@@ -33,7 +33,7 @@ use super::AuditEvent;
 /// sink slows the apply (or expiry) path because the call sites
 /// invoke `record` synchronously under the fold's locks. Real
 /// implementations push to a channel and drain in a worker.
-pub trait AuditSink: Send + Sync {
+pub trait FoldAuditSink: Send + Sync {
     /// Record one audit event. The implementor decides where
     /// the event goes; the fold runtime does not introspect
     /// the result.
@@ -47,7 +47,7 @@ pub trait AuditSink: Send + Sync {
 #[derive(Debug, Default)]
 pub struct NoopSink;
 
-impl AuditSink for NoopSink {
+impl FoldAuditSink for NoopSink {
     fn record(&self, _event: AuditEvent) {}
 }
 
@@ -60,11 +60,11 @@ impl AuditSink for NoopSink {
 /// fold operations. Use [`Self::snapshot`] to read the recorded
 /// events at any point.
 #[derive(Default)]
-pub struct VecAuditSink {
+pub struct VecFoldAuditSink {
     events: parking_lot::Mutex<Vec<AuditEvent>>,
 }
 
-impl VecAuditSink {
+impl VecFoldAuditSink {
     /// Construct an empty sink.
     pub fn new() -> Self {
         Self::default()
@@ -87,7 +87,7 @@ impl VecAuditSink {
     }
 }
 
-impl AuditSink for VecAuditSink {
+impl FoldAuditSink for VecFoldAuditSink {
     fn record(&self, event: AuditEvent) {
         self.events.lock().push(event);
     }
@@ -105,12 +105,12 @@ impl AuditSink for VecAuditSink {
 /// Thread-safe — the inner `VecDeque` is wrapped in a
 /// `parking_lot::Mutex` so `record` is callable from concurrent
 /// fold operations.
-pub struct RingAuditSink {
+pub struct RingFoldAuditSink {
     capacity: usize,
     events: parking_lot::Mutex<std::collections::VecDeque<AuditEvent>>,
 }
 
-impl RingAuditSink {
+impl RingFoldAuditSink {
     /// Construct a sink that retains the most recent `capacity`
     /// events. `capacity == 0` is accepted (and useful: an
     /// always-empty sink that still satisfies the trait
@@ -147,7 +147,7 @@ impl RingAuditSink {
     }
 }
 
-impl AuditSink for RingAuditSink {
+impl FoldAuditSink for RingFoldAuditSink {
     fn record(&self, event: AuditEvent) {
         let mut events = self.events.lock();
         // Edge case: capacity == 0 means "never store anything."
