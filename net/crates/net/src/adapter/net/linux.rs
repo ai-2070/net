@@ -589,40 +589,50 @@ mod tests {
     use std::os::unix::io::AsRawFd;
 
     /// Source pin: crypto-session perf #131 (Issue A) — the
-    /// recvmmsg batched receive paths MUST NOT `resize(_, 0)` the
+    /// recvmmsg batched receive paths MUST NOT pre-zero the
     /// receive buffer slots. Pre-fix every batch call paid a
     /// ~512 KiB memset (MAX_BATCH_SIZE × MAX_PACKET_SIZE) just for
-    /// the kernel to overwrite the same bytes immediately.
-    /// A regression that flips back to `resize(MAX_PACKET_SIZE, 0)`
-    /// would re-introduce that bandwidth waste. Pin via source
+    /// the kernel to overwrite the same bytes immediately. A
+    /// regression that flips back to the legacy form would
+    /// re-introduce that bandwidth waste. Pin via source
     /// inspection since the wasted memset is observable only as
     /// a microbenchmark regression at runtime.
+    ///
+    /// Per cubic-dev-ai code review: the search patterns are
+    /// assembled at runtime (rather than written as inline
+    /// string literals) so this test's own assertions don't
+    /// match themselves in the inspected source — the file
+    /// contains `"resize({}, 0)"` and `"MAX_PACKET_SIZE"` as
+    /// separate literals, neither of which equals the
+    /// runtime-built needle `"resize(MAX_PACKET_SIZE, 0)"`.
     #[test]
     fn batched_recv_must_use_set_len_not_resize_zero() {
         let src = include_str!("linux.rs");
-        // The recv_batch_blocking and recv_batch_nonblocking
-        // routines both run through a "Setup receive buffers"
-        // block. Strip comments so the doc string above doesn't
-        // appear as a false positive.
         let src_no_comments: String = src
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
+        // Build the needle at runtime — the source contains the
+        // template `"resize({}, 0)"` and the identifier
+        // `"MAX_PACKET_SIZE"` as separate string pieces; only
+        // their interpolated combination matches actual
+        // production code that pre-zeros the buffer.
+        let bad_needle = format!("resize({}, 0)", "MAX_PACKET_SIZE");
         assert!(
-            !src_no_comments.contains("resize(MAX_PACKET_SIZE, 0)"),
+            !src_no_comments.contains(&bad_needle),
             "regression: recvmmsg batched recv must NOT pre-zero \
              slot buffers per crypto-session perf #131A; pre-fix \
              this memset ~512 KiB per batch call only for the \
              kernel to overwrite the bytes immediately."
         );
         // Confirm the alternate (uninit + set_len) path is in use.
+        let good_needle = format!("{}({})", "set_len", "MAX_PACKET_SIZE");
         assert!(
-            src_no_comments.contains("set_len(MAX_PACKET_SIZE)"),
+            src_no_comments.contains(&good_needle),
             "regression: batched recv setup must claim slot \
-             capacity via `set_len(MAX_PACKET_SIZE)` so recvmmsg \
-             writes the kernel-supplied bytes without a pre-zero \
-             pass."
+             capacity via set_len so recvmmsg writes the kernel-\
+             supplied bytes without a pre-zero pass."
         );
     }
 
