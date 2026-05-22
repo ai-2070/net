@@ -12,6 +12,7 @@
 //!   in the given set (logical AND).
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use super::state::MemoriesState;
 use super::types::{Memory, MemoryId};
@@ -123,11 +124,17 @@ impl MemoriesFilterSpec {
         true
     }
 
-    pub(super) fn execute(&self, state: &MemoriesState) -> Vec<Memory> {
-        let mut out: Vec<Memory> = state
+    /// Execute and return matching memories as `Vec<Arc<Memory>>`.
+    /// Per perf #96 — each match is one atomic refcount bump
+    /// instead of the legacy deep `Memory` clone (which carries
+    /// three heap-allocated fields). The watcher path benefits
+    /// most because `tx.send(initial.clone())` becomes a Vec
+    /// clone of Arcs, not Memory deep-clones.
+    pub(super) fn execute(&self, state: &MemoriesState) -> Vec<Arc<Memory>> {
+        let mut out: Vec<Arc<Memory>> = state
             .memories
             .values()
-            .filter(|m| self.matches(m))
+            .filter(|a| self.matches(a.as_ref()))
             .cloned()
             .collect();
         if let Some(order) = self.order_by {
@@ -236,8 +243,9 @@ impl<'a> MemoriesQuery<'a> {
         self
     }
 
-    /// Execute and collect matching memories (cloned).
-    pub fn collect(self) -> Vec<Memory> {
+    /// Execute and collect matching memories. Per perf #96 each
+    /// result is `Arc<Memory>` — refcount bump, not deep clone.
+    pub fn collect(self) -> Vec<Arc<Memory>> {
         self.spec.execute(self.state)
     }
 
@@ -246,23 +254,27 @@ impl<'a> MemoriesQuery<'a> {
         self.state
             .memories
             .values()
-            .filter(|m| self.spec.matches(m))
+            .filter(|a| self.spec.matches(a.as_ref()))
             .count()
     }
 
-    /// Return the first match (after `order_by` if set).
-    pub fn first(mut self) -> Option<Memory> {
+    /// Return the first match (after `order_by` if set). Returns
+    /// `Arc<Memory>` per perf #96.
+    pub fn first(mut self) -> Option<Arc<Memory>> {
         self.spec.limit = Some(1);
         self.collect().into_iter().next()
     }
 
     /// True if any match exists. Short-circuits.
     pub fn exists(self) -> bool {
-        self.state.memories.values().any(|m| self.spec.matches(m))
+        self.state
+            .memories
+            .values()
+            .any(|a| self.spec.matches(a.as_ref()))
     }
 }
 
-fn sort_memories(memories: &mut [Memory], order: OrderBy) {
+fn sort_memories(memories: &mut [Arc<Memory>], order: OrderBy) {
     match order {
         OrderBy::IdAsc => memories.sort_by_key(|m| m.id),
         OrderBy::IdDesc => memories.sort_by_key(|m| std::cmp::Reverse(m.id)),
@@ -298,7 +310,7 @@ mod tests {
             mk(4, "Sprint plan", &["work", "planning"], false, 400),
             mk(5, "Birthday ideas", &["personal"], false, 500),
         ] {
-            s.memories.insert(m.id, m);
+            s.memories.insert(m.id, Arc::new(m));
         }
         s
     }
@@ -450,7 +462,7 @@ mod tests {
     #[test]
     fn test_where_source() {
         let mut s = sample();
-        s.memories.get_mut(&1).unwrap().source = "llm".into();
+        Arc::make_mut(s.memories.get_mut(&1).unwrap()).source = "llm".into();
         assert_eq!(s.query().where_source("llm").count(), 1);
         assert_eq!(s.query().where_source("test").count(), 4);
     }

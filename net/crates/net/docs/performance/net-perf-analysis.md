@@ -1076,7 +1076,9 @@ headers: vec![(
 
 **Fix:** Change header type to `Vec<(Cow<'static, str>, Cow<'static, [u8]>)>` or `Vec<RpcHeaderEntry>` with an enum variant for static-string headers.
 
-#### 96. `MemoriesState::memories.values().cloned()` deep-clones every matched Memory
+#### 96. `MemoriesState::memories.values().cloned()` deep-clones every matched Memory — ✅ Fixed
+
+`MemoriesState::memories` is now `HashMap<MemoryId, Arc<Memory>>`. `MemoriesQuery::execute` / `collect` / `first` and `MemoriesState::find_many` all return `Vec<Arc<Memory>>` — each match is one atomic refcount bump instead of a deep clone. The watcher path (`MemoriesWatcher::stream`) emits `Vec<Arc<Memory>>` too, so the per-tick `tx.send(initial.clone())` collapses from 1000-element × 3-allocs-per-element Memory deep-clone to 1000-element × 1-atomic-bump Arc clone. Fold mutations route through `Arc::make_mut` — unique Arcs (the common case under the serial write lock) mutate in place; shared Arcs (concurrent readers in flight) clone-on-write so the reader's snapshot stays intact. FFI / Python / Node bindings keep their `Vec<Memory>` external shape; new `From<Arc<Memory>> for {MemoryJson,PyMemory,Memory(napi)}` impls use `Arc::try_unwrap` (zero-cost on the typical refcount-1 path) and fall back to `(*arc).clone()` otherwise — same per-result cost at the binding boundary as pre-fix. Same pattern still pending for the tasks adapter (`Same in tasks` from the original note).
 
 `Memory` contains `String content`, `Vec<String> tags`, `String source`. 3+ allocations per matched memory. For a 1000-result query: 3000+ allocations.
 

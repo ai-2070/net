@@ -4302,16 +4302,12 @@ mod tests {
         }
 
         // Tag intersection A ∩ B = multiples of 6 = {0, 6}.
-        let f = CapabilityFilter::new()
-            .require_tag("A")
-            .require_tag("B");
+        let f = CapabilityFilter::new().require_tag("A").require_tag("B");
         let got: HashSet<u64> = index.query(&f).into_iter().collect();
         assert_eq!(got, HashSet::from([0, 6]), "A ∩ B");
 
         // Tag intersection A ∩ C = multiples of 4 = {0, 4, 8}.
-        let f = CapabilityFilter::new()
-            .require_tag("A")
-            .require_tag("C");
+        let f = CapabilityFilter::new().require_tag("A").require_tag("C");
         let got: HashSet<u64> = index.query(&f).into_iter().collect();
         assert_eq!(got, HashSet::from([0, 4, 8]), "A ∩ C");
 

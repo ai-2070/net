@@ -3436,8 +3436,7 @@ impl MeshNode {
                 // silently lose every message past the first;
                 // operators need to see the protocol violation
                 // rather than a silent stall.
-                let events =
-                    EventFrame::read_events(decrypted, parsed.header.event_count);
+                let events = EventFrame::read_events(decrypted, parsed.header.event_count);
                 if events.is_empty() {
                     return;
                 }

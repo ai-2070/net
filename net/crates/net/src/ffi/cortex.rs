@@ -2200,6 +2200,21 @@ impl From<Memory> for MemoryJson {
     }
 }
 
+impl From<std::sync::Arc<Memory>> for MemoryJson {
+    fn from(m: std::sync::Arc<Memory>) -> Self {
+        // FFI boundary: the C side requires owned String / Vec
+        // bytes, so we have to materialize an owned `Memory`
+        // here. `Arc::try_unwrap` succeeds when refcount is 1
+        // (the common case after a query terminates and we own
+        // the only handle) and avoids the deep clone; on a
+        // shared Arc (rare) we fall back to `(*m).clone()` which
+        // pays the legacy cost. Either way, the per-result cost
+        // is at most one Memory clone — same as pre-perf-#96.
+        let owned = std::sync::Arc::try_unwrap(m).unwrap_or_else(|arc| (*arc).clone());
+        owned.into()
+    }
+}
+
 #[derive(Deserialize)]
 struct MemoryStoreInput {
     id: u64,
@@ -2560,7 +2575,10 @@ fn build_memories_list_filter(filter_json: *const c_char) -> Result<MemoriesFilt
     Ok(out)
 }
 
-fn run_memories_list(mem: &InnerMemoriesAdapter, filter: &MemoriesFilter) -> Vec<Memory> {
+fn run_memories_list(
+    mem: &InnerMemoriesAdapter,
+    filter: &MemoriesFilter,
+) -> Vec<std::sync::Arc<Memory>> {
     let state = mem.state();
     let guard = state.read();
     let mut q = guard.query();
@@ -2629,10 +2647,16 @@ pub unsafe extern "C" fn net_memories_list(
     write_json_out(&items, out_json, out_len)
 }
 
+/// Inner stream type for the memories-watch cursor — factored out
+/// to keep the `MemoriesWatchHandle` struct readable + appease
+/// `clippy::type_complexity`. Each emission is a
+/// `Vec<Arc<Memory>>` per perf #96.
+type MemoryWatchStream = BoxStream<'static, Vec<std::sync::Arc<Memory>>>;
+
 /// FFI handle for a memories-watch cursor. Same `HandleGuard`
 /// recipe as `TasksWatchHandle`.
 pub struct MemoriesWatchHandle {
-    stream: ManuallyDrop<TokioMutex<Option<BoxStream<'static, Vec<Memory>>>>>,
+    stream: ManuallyDrop<TokioMutex<Option<MemoryWatchStream>>>,
     guard: HandleGuard,
 }
 

@@ -1039,10 +1039,7 @@ mod tests {
         // the counter slot.
         let nonce = cipher.nonce_from_counter(0xCAFE_BABE_DEAD_BEEF);
         assert_eq!(&nonce[0..4], &expected_prefix);
-        assert_eq!(
-            &nonce[4..12],
-            &0xCAFE_BABE_DEAD_BEEF_u64.to_le_bytes(),
-        );
+        assert_eq!(&nonce[4..12], &0xCAFE_BABE_DEAD_BEEF_u64.to_le_bytes(),);
     }
 
     /// Pin crypto-session perf #128: `decrypt_to_bytes` on a

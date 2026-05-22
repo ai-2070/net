@@ -751,7 +751,11 @@ impl NetSession {
         // plaintext into a fresh `Vec<u8>` per call only to drop
         // it. `verify` runs the AEAD tag check without producing
         // a plaintext buffer.
-        if self.rx_cipher.verify(counter, &aad, &parsed.payload).is_err() {
+        if self
+            .rx_cipher
+            .verify(counter, &aad, &parsed.payload)
+            .is_err()
+        {
             return false;
         }
         if !self.rx_cipher.update_rx_counter(counter) {

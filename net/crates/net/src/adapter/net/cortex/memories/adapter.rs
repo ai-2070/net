@@ -34,8 +34,10 @@ use super::watch::MemoriesWatcher;
 /// subsequent change (dedup'd, with the initial skipped so the
 /// caller doesn't double-render).
 pub type MemoriesSnapshotAndWatch = (
-    Vec<super::types::Memory>,
-    std::pin::Pin<Box<dyn futures::Stream<Item = Vec<super::types::Memory>> + Send + 'static>>,
+    Vec<std::sync::Arc<super::types::Memory>>,
+    std::pin::Pin<
+        Box<dyn futures::Stream<Item = Vec<std::sync::Arc<super::types::Memory>>> + Send + 'static>,
+    >,
 );
 
 use futures::StreamExt;
@@ -332,6 +334,11 @@ impl MemoriesAdapter {
             .stream()
             .enumerate()
             .filter(move |(i, current)| {
+                // `current` and `initial_for_stream` are both
+                // `Vec<Arc<Memory>>` per perf #96. Vec PartialEq
+                // delegates to element PartialEq, and Arc<T>
+                // forwards `==` to `(*a) == (*b)`, so the
+                // value-equality semantics are preserved.
                 let drop_first = *i == 0 && current == &initial_for_stream;
                 futures::future::ready(!drop_first)
             })

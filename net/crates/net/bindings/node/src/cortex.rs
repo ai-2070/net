@@ -1604,6 +1604,21 @@ impl From<InnerMemory> for Memory {
     }
 }
 
+impl From<std::sync::Arc<InnerMemory>> for Memory {
+    fn from(m: std::sync::Arc<InnerMemory>) -> Self {
+        // Per perf #96: post-Arc-query refactor, list/watch
+        // paths return `Vec<Arc<InnerMemory>>`. The napi
+        // `Memory` JS type needs owned String / Vec bytes;
+        // `Arc::try_unwrap` is zero-cost when refcount is 1
+        // (typical after a query terminates with us as the only
+        // holder) and falls back to a deep clone otherwise. Net
+        // per-result cost at the FFI boundary is at most one
+        // `InnerMemory` clone — same as pre-fix.
+        let owned = std::sync::Arc::try_unwrap(m).unwrap_or_else(|arc| (*arc).clone());
+        owned.into()
+    }
+}
+
 /// Filter for [`MemoriesAdapter::list_memories`] and
 /// [`MemoriesAdapter::watch_memories`]. Tag predicates:
 ///
@@ -1631,7 +1646,7 @@ pub struct MemoryFilter {
 // =========================================================================
 
 struct MemoryWatchIterInner {
-    stream: TokioMutex<Option<BoxStream<'static, Vec<InnerMemory>>>>,
+    stream: TokioMutex<Option<BoxStream<'static, Vec<std::sync::Arc<InnerMemory>>>>>,
     shutdown: Notify,
     is_shutdown: AtomicBool,
 }
@@ -1926,7 +1941,7 @@ impl MemoriesAdapter {
     #[napi]
     pub async fn watch_memories(&self, filter: Option<MemoryFilter>) -> Result<MemoryWatchIter> {
         let w = memory_watcher_with_filter(&self.inner, filter)?;
-        let stream: BoxStream<'static, Vec<InnerMemory>> = w.stream().boxed();
+        let stream: BoxStream<'static, Vec<std::sync::Arc<InnerMemory>>> = w.stream().boxed();
         Ok(MemoryWatchIter {
             inner: Arc::new(MemoryWatchIterInner {
                 stream: TokioMutex::new(Some(stream)),
@@ -1945,7 +1960,7 @@ impl MemoriesAdapter {
     ) -> Result<MemoriesSnapshotAndWatch> {
         let w = memory_watcher_with_filter(&self.inner, filter)?;
         let (snapshot, stream) = self.inner.snapshot_and_watch(w);
-        let stream: BoxStream<'static, Vec<InnerMemory>> = stream;
+        let stream: BoxStream<'static, Vec<std::sync::Arc<InnerMemory>>> = stream;
         Ok(MemoriesSnapshotAndWatch {
             snapshot: snapshot.into_iter().map(Memory::from).collect(),
             inner: Arc::new(MemoryWatchIterInner {

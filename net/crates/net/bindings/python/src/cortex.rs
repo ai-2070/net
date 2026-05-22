@@ -1548,6 +1548,21 @@ impl From<InnerMemory> for PyMemory {
     }
 }
 
+impl From<std::sync::Arc<InnerMemory>> for PyMemory {
+    fn from(m: std::sync::Arc<InnerMemory>) -> Self {
+        // Per perf #96: post-Arc-query refactor, the watcher /
+        // list paths hand back `Vec<Arc<InnerMemory>>`. The
+        // Python FFI surface needs owned `String` / `Vec` bytes,
+        // so try to unwrap the Arc (zero-cost when refcount is
+        // 1 — the common case after a query finishes and we own
+        // the only handle) and fall back to a deep clone
+        // otherwise. Net per-result cost at the FFI boundary is
+        // at most one `InnerMemory` clone — same as pre-fix.
+        let owned = std::sync::Arc::try_unwrap(m).unwrap_or_else(|arc| (*arc).clone());
+        owned.into()
+    }
+}
+
 #[pymethods]
 impl PyMemory {
     fn __repr__(&self) -> String {
@@ -1857,7 +1872,7 @@ impl PyMemoriesAdapter {
             limit,
         )?;
         let runtime = self.runtime.clone();
-        let stream: BoxStream<'static, Vec<InnerMemory>> =
+        let stream: BoxStream<'static, Vec<std::sync::Arc<InnerMemory>>> =
             py.detach(move || runtime.block_on(async move { w.stream().boxed() }));
         Ok(new_memory_watch_iter(stream, self.runtime.clone()))
     }
@@ -1979,7 +1994,7 @@ fn build_memory_watcher(
 }
 
 fn new_memory_watch_iter(
-    stream: BoxStream<'static, Vec<InnerMemory>>,
+    stream: BoxStream<'static, Vec<std::sync::Arc<InnerMemory>>>,
     runtime: Arc<Runtime>,
 ) -> PyMemoryWatchIter {
     PyMemoryWatchIter {
@@ -1993,7 +2008,7 @@ fn new_memory_watch_iter(
 }
 
 struct MemoryWatchIterInner {
-    stream: TokioMutex<Option<BoxStream<'static, Vec<InnerMemory>>>>,
+    stream: TokioMutex<Option<BoxStream<'static, Vec<std::sync::Arc<InnerMemory>>>>>,
     shutdown: Notify,
     is_shutdown: AtomicBool,
 }
