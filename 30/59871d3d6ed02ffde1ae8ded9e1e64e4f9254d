@@ -1,0 +1,30 @@
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_d9dc521a887c3e::t_81e1d92b4fb173 707
+net/crates/net/src/adapter/net/dataforts/blob/overflow.rs
+  s_d9dc521a887c3e::t_404e8fda713b81 36
+  s_d9dc521a887c3e::t_f6ba088955c425 34
+  s_d9dc521a887c3e::t_2ccd2a7dbc4243 585
+  s_d9dc521a887c3e::t_66d550eae516fc 818,820-822
+  s_d9dc521a887c3e::t_a94ca8c269c541 592
+  s_d9dc521a887c3e::t_275bdb57dd55dc 1213,1240,1263,1285,1315,1335,1355,1382,1417,1456,1494,1536,1579,1631,1685,1732
+  s_d9dc521a887c3e::t_960dfaaa38ccb6 1140-1142,1144,1147-1151,1153
+  s_d9dc521a887c3e::t_c7ca6ca297b968 556-559
+  s_d9dc521a887c3e::t_ea24a0fb4ba94e 1220,1247,1270,1292,1322,1342,1362,1388,1423,1462,1500,1542,1590,1638,1692,1738
+  s_d9dc521a887c3e::t_4d587f52609211 757-771
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "3059871d3d6ed02ffde1ae8ded9e1e64e4f9254d",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
