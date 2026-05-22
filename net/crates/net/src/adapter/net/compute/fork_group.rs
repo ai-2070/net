@@ -862,39 +862,21 @@ mod tests {
     }
 
     fn make_scheduler() -> Scheduler {
+        use crate::adapter::net::behavior::fold::{
+            capability_bridge, CapabilityFold, Fold,
+        };
         let index = Arc::new(CapabilityIndex::new());
+        let fold: Arc<Fold<CapabilityFold>> =
+            Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
-        index.index(CapabilityAnnouncement::new(
-            0x1111,
-            eid.clone(),
-            1,
-            CapabilitySet::new(),
-        ));
-        index.index(CapabilityAnnouncement::new(
-            0x2222,
-            eid.clone(),
-            1,
-            CapabilitySet::new(),
-        ));
-        index.index(CapabilityAnnouncement::new(
-            0x3333,
-            eid.clone(),
-            1,
-            CapabilitySet::new(),
-        ));
-        index.index(CapabilityAnnouncement::new(
-            0x4444,
-            eid.clone(),
-            1,
-            CapabilitySet::new(),
-        ));
-        index.index(CapabilityAnnouncement::new(
-            0x5555,
-            eid,
-            1,
-            CapabilitySet::new(),
-        ));
-        Scheduler::new(index, 0x1111, CapabilitySet::new())
+        for node_id in [0x1111u64, 0x2222, 0x3333, 0x4444, 0x5555] {
+            capability_bridge::dual_apply(
+                &fold,
+                &index,
+                CapabilityAnnouncement::new(node_id, eid.clone(), 1, CapabilitySet::new()),
+            );
+        }
+        Scheduler::new(fold, index, 0x1111, CapabilitySet::new())
     }
 
     fn test_config(n: u8) -> ForkGroupConfig {
@@ -1140,14 +1122,23 @@ mod tests {
         // Regression: place_with_spread used to silently fall back to an
         // excluded node when all candidates were in the exclusion set,
         // defeating the spread constraint.
+        use crate::adapter::net::behavior::fold::{
+            capability_bridge, CapabilityFold, Fold,
+        };
         let index = Arc::new(CapabilityIndex::new());
-        index.index(CapabilityAnnouncement::new(
-            0x1111,
-            crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]),
-            1,
-            CapabilitySet::new(),
-        ));
-        let sched = Scheduler::new(index, 0x1111, CapabilitySet::new());
+        let fold: Arc<Fold<CapabilityFold>> =
+            Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
+        capability_bridge::dual_apply(
+            &fold,
+            &index,
+            CapabilityAnnouncement::new(
+                0x1111,
+                crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]),
+                1,
+                CapabilitySet::new(),
+            ),
+        );
+        let sched = Scheduler::new(fold, index, 0x1111, CapabilitySet::new());
 
         let mut exclude = HashSet::new();
         exclude.insert(0x1111); // exclude the only node
@@ -1168,18 +1159,22 @@ mod tests {
     use crate::adapter::net::behavior::placement::{NodeId as PlacementNodeId, ResourceAxis};
 
     fn make_scheduler_and_index(node_ids: &[u64]) -> (Scheduler, Arc<CapabilityIndex>) {
+        use crate::adapter::net::behavior::fold::{
+            capability_bridge, CapabilityFold, Fold,
+        };
         let index = Arc::new(CapabilityIndex::new());
+        let fold: Arc<Fold<CapabilityFold>> =
+            Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
         for &id in node_ids {
-            index.index(CapabilityAnnouncement::new(
-                id,
-                eid.clone(),
-                1,
-                CapabilitySet::new(),
-            ));
+            capability_bridge::dual_apply(
+                &fold,
+                &index,
+                CapabilityAnnouncement::new(id, eid.clone(), 1, CapabilitySet::new()),
+            );
         }
         let local = node_ids.first().copied().unwrap_or(0xFFFF);
-        let scheduler = Scheduler::new(index.clone(), local, CapabilitySet::new());
+        let scheduler = Scheduler::new(fold, index.clone(), local, CapabilitySet::new());
         (scheduler, index)
     }
 

@@ -388,19 +388,23 @@ mod tests {
     use std::sync::Arc;
 
     fn make_scheduler(node_ids: &[u64]) -> (Scheduler, Arc<CapabilityIndex>) {
+        use crate::adapter::net::behavior::fold::{
+            capability_bridge, CapabilityFold, Fold,
+        };
         let index = Arc::new(CapabilityIndex::new());
+        let fold: Arc<Fold<CapabilityFold>> =
+            Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
         for &id in node_ids {
-            index.index(CapabilityAnnouncement::new(
-                id,
-                eid.clone(),
-                1,
-                CapabilitySet::new(),
-            ));
+            capability_bridge::dual_apply(
+                &fold,
+                &index,
+                CapabilityAnnouncement::new(id, eid.clone(), 1, CapabilitySet::new()),
+            );
         }
         // Local node id = first in list (or 0xFFFF if list is empty).
         let local = node_ids.first().copied().unwrap_or(0xFFFF);
-        let scheduler = Scheduler::new(index.clone(), local, CapabilitySet::new());
+        let scheduler = Scheduler::new(fold, index.clone(), local, CapabilitySet::new());
         (scheduler, index)
     }
 

@@ -1082,29 +1082,23 @@ mod tests {
     }
 
     fn make_scheduler() -> Scheduler {
+        use crate::adapter::net::behavior::fold::{
+            capability_bridge, CapabilityFold, Fold,
+        };
         let index = Arc::new(CapabilityIndex::new());
+        let fold: Arc<Fold<CapabilityFold>> =
+            Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         // Use a local_node_id NOT in the index so placement spreads
         // across indexed nodes instead of always picking local.
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
-        index.index(CapabilityAnnouncement::new(
-            0x1111,
-            eid.clone(),
-            1,
-            CapabilitySet::new(),
-        ));
-        index.index(CapabilityAnnouncement::new(
-            0x2222,
-            eid.clone(),
-            1,
-            CapabilitySet::new(),
-        ));
-        index.index(CapabilityAnnouncement::new(
-            0x3333,
-            eid,
-            1,
-            CapabilitySet::new(),
-        ));
-        Scheduler::new(index, 0xFFFF, CapabilitySet::new())
+        for node_id in [0x1111u64, 0x2222, 0x3333] {
+            capability_bridge::dual_apply(
+                &fold,
+                &index,
+                CapabilityAnnouncement::new(node_id, eid.clone(), 1, CapabilitySet::new()),
+            );
+        }
+        Scheduler::new(fold, index, 0xFFFF, CapabilitySet::new())
     }
 
     fn test_config(n: u8) -> StandbyGroupConfig {
@@ -1830,19 +1824,23 @@ mod tests {
     use crate::adapter::net::behavior::placement::{NodeId as PlacementNodeId, ResourceAxis};
 
     fn make_scheduler_and_index(node_ids: &[u64]) -> (Scheduler, Arc<CapabilityIndex>) {
+        use crate::adapter::net::behavior::fold::{
+            capability_bridge, CapabilityFold, Fold,
+        };
         let index = Arc::new(CapabilityIndex::new());
+        let fold: Arc<Fold<CapabilityFold>> =
+            Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
         for &id in node_ids {
-            index.index(CapabilityAnnouncement::new(
-                id,
-                eid.clone(),
-                1,
-                CapabilitySet::new(),
-            ));
+            capability_bridge::dual_apply(
+                &fold,
+                &index,
+                CapabilityAnnouncement::new(id, eid.clone(), 1, CapabilitySet::new()),
+            );
         }
         // Use a local_node_id NOT in the index so placement spreads
         // across indexed nodes instead of always picking local.
-        let scheduler = Scheduler::new(index.clone(), 0xFFFF, CapabilitySet::new());
+        let scheduler = Scheduler::new(fold, index.clone(), 0xFFFF, CapabilitySet::new());
         (scheduler, index)
     }
 
