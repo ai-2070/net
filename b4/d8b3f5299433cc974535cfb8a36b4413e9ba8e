@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/dataforts/blob/blob_ref.rs
+  s_f930dae9b8bbc1::t_fcbec89655de2d 602-611,613,615,630-632,634
+  s_f930dae9b8bbc1::t_edabd30dba03d1 1386-1466
+  s_f930dae9b8bbc1::t_b657dc57aeafe9 217-231
+  s_f930dae9b8bbc1::t_a020bd0081118e 255-276
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "b4d8b3f5299433cc974535cfb8a36b4413e9ba8e",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
