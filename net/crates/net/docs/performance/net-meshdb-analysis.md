@@ -8,6 +8,15 @@ That cuts two ways: (1) findings here matter less than for live subsystems, but 
 
 ---
 
+## ✅ Fixed
+
+| # | Item | Notes |
+|---|------|-------|
+| 195 | Federated hash-join left/right sub-fetches sequential → `tokio::try_join!` | Pre-fix the `FederatedMeshQueryExecutor` hash-join awaited `execute_uncached_with_handle(left)` and then `execute_uncached_with_handle(right)` back-to-back, serializing two independent network round-trips. For a remote-on-remote join with 50 ms RTT each: 100 ms wall vs 50 ms in parallel. Post-fix wraps both into one `tokio::try_join!` — both futures poll on the current task and the join resolves when both complete. `try_join!` short-circuits on the first error so the cancel-recheck between the legacy sequential awaits collapses naturally; the post-join `is_cancelled()` check still aborts before the local hash-join runs. All 189 meshdb feature-flagged tests continue to pass. |
+| 198 | `MeshDbWireDispatcher` caller-side `Arc<RwLock<HashMap<u64, InflightCaller>>>` → `Arc<DashMap<u64, InflightCaller>>` | Pre-fix every `send` took a write lock to register the `call_id → tx` entry, every response route took a read lock to look it up, every send-error path took another write lock to remove, and the `ResponseStreamGuard::drop` took yet another write lock to clean up. Concurrent calls to different `call_id`s serialized on the whole-map lock. Post-fix is `DashMap` — sharded by `call_id`, so distinct calls hit distinct shards. Insert / remove / `get` all go through DashMap's per-shard locks. The server-side `Arc<RwLock<HashMap<(u64, u64), ServerCallHandle>>>` is a separate map keyed on `(peer, call_id)` and is left alone (doc #207 flagged it but in low-impact; not bundled with this fix). The 8 existing meshdb transport tests pass through the new shape unchanged. |
+
+---
+
 ## 🔴 High-impact
 
 ### 192. `synthetic_row_view` JSON-parses + tag-explodes EVERY row in EVERY filter
