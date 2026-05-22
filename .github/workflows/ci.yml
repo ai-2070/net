@@ -510,7 +510,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -565,7 +565,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       # sdk-py is the pure-Python layer over the `net-mesh` bindings.
       # Its `tests/conftest.py` stubs the native `net` extension before
