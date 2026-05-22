@@ -329,6 +329,38 @@ pub(crate) fn scope_from_membership_tags(tags: &[String]) -> CapabilityScope {
     }
 }
 
+/// Run a [`Predicate`](super::super::predicate::Predicate)
+/// against every publisher in the fold and return the matching
+/// `(node_id, synthesized_caps)` pairs. Mirrors the legacy
+/// `CapabilityQuery::filter` impl on `CapabilityIndex` but
+/// walks the fold's by_node reverse index and builds the
+/// `EvalContext` from a synthesized [`CapabilitySet`].
+///
+/// Tag-based predicates work fully — reserved-prefix tags
+/// round-trip through `Tag::parse` inside
+/// [`synthesize_capability_set`]. Metadata-based predicates
+/// won't match anything because the fold's
+/// [`CapabilityMembership`] doesn't carry the legacy metadata
+/// BTreeMap; the synthesized CapabilitySet's `metadata` field
+/// is always empty.
+pub fn filter_by_predicate(
+    fold: &Fold<CapabilityFold>,
+    predicate: &super::super::predicate::Predicate,
+) -> Vec<(NodeId, super::super::capability::CapabilitySet)> {
+    let publishers: Vec<NodeId> = fold
+        .with_state(|state| state.by_node.keys().copied().collect());
+    let mut out = Vec::new();
+    for node_id in publishers {
+        let caps = synthesize_capability_set(fold, node_id);
+        let owned_tags: Vec<super::super::tag::Tag> = caps.tags.iter().cloned().collect();
+        let ctx = super::super::predicate::EvalContext::new(&owned_tags, &caps.metadata);
+        if predicate.evaluate_unplanned(&ctx) {
+            out.push((node_id, caps));
+        }
+    }
+    out
+}
+
 /// Scoped variant of [`find_nodes_matching`]. Filters
 /// candidates through `scope` (resolved from each
 /// publisher's `scope:*` tags) on top of the capability

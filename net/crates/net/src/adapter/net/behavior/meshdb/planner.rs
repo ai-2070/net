@@ -41,8 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use super::error::MeshError;
 use super::query::{AggregateFn, ChainRef, Expr, JoinKey, JoinKind, MeshQuery, QueryV1, SeqNum};
-use crate::adapter::net::behavior::capability::CapabilityIndex;
-use crate::adapter::net::behavior::fold::{CapabilityFold, Fold};
+use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use crate::adapter::net::behavior::predicate::PredicateWire;
 use crate::adapter::net::behavior::query::CapabilityQuery;
 use crate::adapter::net::behavior::tag::{Tag, TaxonomyAxis};
@@ -371,17 +370,10 @@ pub struct MeshQueryPlanner<'a, F>
 where
     F: Fn(u64) -> Option<Duration>,
 {
-    /// Capability index — used only for the
-    /// `Discovered` predicate-driven candidate walk (the
-    /// `Predicate` AST evaluator is bound to legacy
-    /// `&CapabilitySet` shapes). Tag-based walks have all
-    /// migrated to [`Self::capability_fold`]; the index field
-    /// stays during Phase 3b until the predicate evaluator
-    /// gains a fold-aware variant.
-    pub capability_index: &'a CapabilityIndex,
-    /// Capability fold — primary read path for tag-based
-    /// holder discovery (parent_of / children_of /
-    /// collect_coverage).
+    /// Capability fold — read path for all holder discovery
+    /// (parent_of / children_of / collect_coverage) and the
+    /// `Discovered`-ref predicate filter
+    /// ([`capability_bridge::filter_by_predicate`]).
     pub capability_fold: &'a Fold<CapabilityFold>,
     /// RTT lookup closure. Same shape as
     /// `CapabilityQuery::nearest`.
@@ -393,13 +385,8 @@ where
     F: Fn(u64) -> Option<Duration>,
 {
     /// Construct a planner. Doesn't allocate.
-    pub fn new(
-        capability_index: &'a CapabilityIndex,
-        capability_fold: &'a Fold<CapabilityFold>,
-        rtt_lookup: F,
-    ) -> Self {
+    pub fn new(capability_fold: &'a Fold<CapabilityFold>, rtt_lookup: F) -> Self {
         Self {
-            capability_index,
             capability_fold,
             rtt_lookup,
         }
@@ -1080,7 +1067,10 @@ where
                         .map_err(|e| MeshError::PlannerError {
                             detail: format!("Discovered predicate rebuild failed: {e:?}"),
                         })?;
-                let candidates = self.capability_index.filter(&predicate);
+                let candidates = capability_bridge::filter_by_predicate(
+                    self.capability_fold,
+                    &predicate,
+                );
                 // Walk every matched node's caps + extract
                 // origins from `causal:<hex>*` tags. Dedupe +
                 // sort lex for determinism (BTreeSet is
@@ -2056,8 +2046,8 @@ mod tests {
     #[test]
     fn plan_latest_returns_atomic_with_holder() {
         let origin = 0xABAB_ABAB_ABAB_ABAB_u64;
-        let (fold, index) = make_index_with_holder(42, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(42, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::OriginHash(origin),
@@ -2077,8 +2067,8 @@ mod tests {
         // failing — the executor surfaces
         // `HistoricalRangeUnavailable` against that empty
         // set. (Phase A semantics; preserved in Phase B.)
-        let (fold, index) = empty_index();
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = empty_index();
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::OriginHash(0),
@@ -2089,8 +2079,8 @@ mod tests {
 
     #[test]
     fn plan_between_rejects_inverted_range() {
-        let (fold, index) = empty_index();
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = empty_index();
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let err = planner
             .plan(&MeshQuery::V1(QueryV1::Between {
                 origin: ChainRef::OriginHash(0),
@@ -2109,8 +2099,8 @@ mod tests {
         // Holder advertises tip 1000 → covers [0, 1001). The
         // requested [0, 1000) fits.
         let origin = 0x4242_4242_4242_4242_u64;
-        let (fold, index) = index_with(vec![(7, caps_with_causal_tip(origin, 1000))]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = index_with(vec![(7, caps_with_causal_tip(origin, 1000))]);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Between {
                 origin: ChainRef::OriginHash(origin),
@@ -2131,8 +2121,8 @@ mod tests {
     #[test]
     fn plan_at_routes_to_holder() {
         let origin = 0xCCCC_CCCC_CCCC_CCCC_u64;
-        let (fold, index) = make_index_with_holder(99, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(99, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::At {
                 origin: ChainRef::OriginHash(origin),
@@ -2156,8 +2146,8 @@ mod tests {
         // order; planner sort restores lex.
         let origin = 0xEEEE_EEEE_EEEE_EEEE_u64;
         let caps = caps_with_causal_presence(origin);
-        let (fold, index) = index_with(vec![(200, caps.clone()), (50, caps.clone()), (100, caps)]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = index_with(vec![(200, caps.clone()), (50, caps.clone()), (100, caps)]);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::OriginHash(origin),
@@ -2175,11 +2165,11 @@ mod tests {
         // Two holders: one with tip 50, one with tip 200.
         // Query `At(100)` — only the tip-200 holder covers.
         let origin = 0x1111_2222_3333_4444_u64;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (50, caps_with_causal_tip(origin, 50)),
             (200, caps_with_causal_tip(origin, 200)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::At {
                 origin: ChainRef::OriginHash(origin),
@@ -2196,12 +2186,12 @@ mod tests {
         // - holder B: range [50..600] — covers
         // - holder C: tip 700 — covers (full prefix up to 700)
         let origin = 0xFEED_FACE_FEED_FACE_u64;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_with_causal_range(origin, 0, 400)),
             (2, caps_with_causal_range(origin, 50, 600)),
             (3, caps_with_causal_tip(origin, 700)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Between {
                 origin: ChainRef::OriginHash(origin),
@@ -2219,11 +2209,11 @@ mod tests {
         // surfaces `HistoricalRangeUnavailable` carrying the
         // available-range hints for caller renegotiation.
         let origin = 0xDEAD_DEAD_DEAD_DEAD_u64;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_with_causal_range(origin, 0, 100)),
             (2, caps_with_causal_tip(origin, 50)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let err = planner
             .plan(&MeshQuery::V1(QueryV1::Between {
                 origin: ChainRef::OriginHash(origin),
@@ -2255,8 +2245,8 @@ mod tests {
     fn at_surfaces_historical_range_unavailable_when_no_coverage() {
         // Holder advertises tip 50; query asks for seq 100.
         let origin = 0xBABE_BABE_BABE_BABE_u64;
-        let (fold, index) = index_with(vec![(1, caps_with_causal_tip(origin, 50))]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = index_with(vec![(1, caps_with_causal_tip(origin, 50))]);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let err = planner
             .plan(&MeshQuery::V1(QueryV1::At {
                 origin: ChainRef::OriginHash(origin),
@@ -2286,8 +2276,8 @@ mod tests {
         // HistoricalRangeUnavailable if the read actually
         // fails. Phase B planner trusts the presence claim.
         let origin = 0xFADE_FADE_FADE_FADE_u64;
-        let (fold, index) = index_with(vec![(1, caps_with_causal_presence(origin))]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = index_with(vec![(1, caps_with_causal_presence(origin))]);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::At {
                 origin: ChainRef::OriginHash(origin),
@@ -2302,12 +2292,12 @@ mod tests {
         // Three holders with tips 50, 500, 200. Latest picks
         // the holder with the highest tip first.
         let origin = 0xCAFE_CAFE_CAFE_CAFE_u64;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_with_causal_tip(origin, 50)),
             (2, caps_with_causal_tip(origin, 500)),
             (3, caps_with_causal_tip(origin, 200)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::OriginHash(origin),
@@ -2325,7 +2315,7 @@ mod tests {
         // proximity puts them in [50, 200, 100] order.
         let origin = 0x3030_3030_3030_3030_u64;
         let caps = caps_with_causal_presence(origin);
-        let (fold, index) = index_with(vec![(100, caps.clone()), (50, caps.clone()), (200, caps)]);
+        let (fold, _index) = index_with(vec![(100, caps.clone()), (50, caps.clone()), (200, caps)]);
         let rtt = |nid: u64| {
             Some(match nid {
                 50 => Duration::from_millis(10),
@@ -2334,7 +2324,7 @@ mod tests {
                 _ => return None::<Duration>,
             })
         };
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt);
+        let planner = MeshQueryPlanner::new(&fold,rtt);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::OriginHash(origin),
@@ -2350,7 +2340,7 @@ mod tests {
         // sort lex and land after every measured one.
         let origin = 0x7070_7070_7070_7070_u64;
         let caps = caps_with_causal_presence(origin);
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps.clone()),
             (2, caps.clone()),
             (3, caps.clone()),
@@ -2361,7 +2351,7 @@ mod tests {
             3 => Some(Duration::from_millis(15)),
             _ => None,
         };
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt);
+        let planner = MeshQueryPlanner::new(&fold,rtt);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::OriginHash(origin),
@@ -2381,8 +2371,8 @@ mod tests {
         let mut caps = CapabilitySet::new();
         caps.tags.insert(causal_tag(hex.clone())); // presence
         caps.tags.insert(causal_tag(format!("{hex}:100"))); // tip 100
-        let (fold, index) = index_with(vec![(7, caps)]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = index_with(vec![(7, caps)]);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         // Query At(150) — only presence would qualify
         // (permissive), but tip's `seq <= 100` rejects.
         let err = planner
@@ -2407,14 +2397,14 @@ mod tests {
         let hex = chain_hex(origin);
         let mut caps = CapabilitySet::new().add_tag("dataforts.blob.storage");
         caps.tags.insert(causal_tag(hex));
-        let (fold, index) = index_with(vec![(42, caps)]);
+        let (fold, _index) = index_with(vec![(42, caps)]);
         let pred = Predicate::Exists {
             key: TagKey {
                 axis: TaxonomyAxis::Dataforts,
                 key: "blob.storage".to_string(),
             },
         };
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::Discovered(pred.to_wire()),
@@ -2438,8 +2428,8 @@ mod tests {
                 key: "blob.storage".to_string(),
             },
         };
-        let (fold, index) = empty_index();
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = empty_index();
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let err = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::Discovered(pred.to_wire()),
@@ -2469,14 +2459,14 @@ mod tests {
         caps_a.tags.insert(causal_tag(chain_hex(origin_a)));
         let mut caps_b = CapabilitySet::new().add_tag("dataforts.blob.storage");
         caps_b.tags.insert(causal_tag(chain_hex(origin_b)));
-        let (fold, index) = index_with(vec![(1, caps_a), (2, caps_b)]);
+        let (fold, _index) = index_with(vec![(1, caps_a), (2, caps_b)]);
         let pred = Predicate::Exists {
             key: TagKey {
                 axis: TaxonomyAxis::Dataforts,
                 key: "blob.storage".to_string(),
             },
         };
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let err = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::Discovered(pred.to_wire()),
@@ -2498,14 +2488,14 @@ mod tests {
         use crate::adapter::net::behavior::tag::{TagKey, TaxonomyAxis};
 
         let caps = CapabilitySet::new().add_tag("dataforts.blob.storage");
-        let (fold, index) = index_with(vec![(7, caps)]);
+        let (fold, _index) = index_with(vec![(7, caps)]);
         let pred = Predicate::Exists {
             key: TagKey {
                 axis: TaxonomyAxis::Dataforts,
                 key: "blob.storage".to_string(),
             },
         };
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let err = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::Discovered(pred.to_wire()),
@@ -2525,8 +2515,8 @@ mod tests {
         // the canonical "wrapped sub-plan flows through
         // NotYetImplemented" test now that Aggregate Count ships.
         let origin = 0x9999_9999_9999_9999_u64;
-        let (fold, index) = make_index_with_holder(1, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let q = MeshQuery::V1(QueryV1::Project {
             inner: Box::new(MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::OriginHash(origin),
@@ -2549,8 +2539,8 @@ mod tests {
         // plan. Load-bearing for the locked-decision-#4
         // cache key.
         let origin = 0x5555_5555_5555_5555_u64;
-        let (fold, index) = make_index_with_holder(11, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(11, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let q = MeshQuery::V1(QueryV1::Latest {
             origin: ChainRef::OriginHash(origin),
         });
@@ -2581,7 +2571,7 @@ mod tests {
         caps.tags.insert(fork_tag(parent_c));
         // Root nodes for each candidate parent so the BFS
         // resolves a parent regardless of which one wins.
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps),
             (2, caps_chain_only(parent_a)),
             (3, caps_chain_only(parent_b)),
@@ -2590,7 +2580,7 @@ mod tests {
 
         let mut last_encoding: Option<Vec<u8>> = None;
         for _ in 0..32 {
-            let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+            let planner = MeshQueryPlanner::new(&fold,rtt_none);
             let plan = planner
                 .plan(&MeshQuery::V1(QueryV1::LineageBack {
                     origin: ChainRef::OriginHash(child),
@@ -2621,7 +2611,7 @@ mod tests {
         let parent_a = 0x0000_0000_0000_0001_u64;
         let parent_b = 0x0000_0000_0000_0002_u64;
         // Two replicas of `child`; each declares a different parent.
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_chain_forked_from(child, parent_a)),
             (2, caps_chain_forked_from(child, parent_b)),
             (3, caps_chain_only(parent_a)),
@@ -2630,7 +2620,7 @@ mod tests {
 
         let mut last_encoding: Option<Vec<u8>> = None;
         for _ in 0..32 {
-            let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+            let planner = MeshQueryPlanner::new(&fold,rtt_none);
             let plan = planner
                 .plan(&MeshQuery::V1(QueryV1::LineageBack {
                     origin: ChainRef::OriginHash(child),
@@ -2651,8 +2641,8 @@ mod tests {
     #[test]
     fn execution_plan_round_trips_through_postcard() {
         let origin = 0x1111_1111_1111_1111_u64;
-        let (fold, index) = make_index_with_holder(3, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(3, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let p = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::OriginHash(origin),
@@ -2666,7 +2656,7 @@ mod tests {
     #[test]
     fn cost_estimate_propagates_rtt() {
         let origin = 0x2222_2222_2222_2222_u64;
-        let (fold, index) = make_index_with_holder(5, origin);
+        let (fold, _index) = make_index_with_holder(5, origin);
         let rtt = |nid: u64| {
             if nid == 5 {
                 Some(Duration::from_millis(15))
@@ -2674,7 +2664,7 @@ mod tests {
                 None
             }
         };
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt);
+        let planner = MeshQueryPlanner::new(&fold,rtt);
         let p = planner
             .plan(&MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::OriginHash(origin),
@@ -2747,8 +2737,8 @@ mod tests {
     #[test]
     fn lineage_back_single_root_returns_only_start() {
         let root = 0x0000_0000_0000_0001_u64;
-        let (fold, index) = index_with(vec![(1, caps_chain_only(root))]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = index_with(vec![(1, caps_chain_only(root))]);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::LineageBack {
                 origin: ChainRef::OriginHash(root),
@@ -2792,8 +2782,8 @@ mod tests {
         for i in 1..N {
             holders.push((i + 1, caps_chain_forked_from(i + 1, i)));
         }
-        let (fold, index) = index_with(holders);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = index_with(holders);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::LineageBack {
                 origin: ChainRef::OriginHash(N),
@@ -2827,8 +2817,8 @@ mod tests {
             let child = 2 + i;
             holders.push((100 + i, caps_chain_forked_from(child, root)));
         }
-        let (fold, index) = index_with(holders);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = index_with(holders);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::LineageForward {
                 origin: ChainRef::OriginHash(root),
@@ -2854,12 +2844,12 @@ mod tests {
         let g = 0x0000_0000_0000_00AA_u64;
         let p = 0x0000_0000_0000_00BB_u64;
         let c = 0x0000_0000_0000_00CC_u64;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (10, caps_chain_only(g)),
             (20, caps_chain_forked_from(p, g)),
             (30, caps_chain_forked_from(c, p)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::LineageBack {
                 origin: ChainRef::OriginHash(c),
@@ -2883,11 +2873,11 @@ mod tests {
         // surfaces in the LineageEntry.
         let parent = 0xAA;
         let child = 0xBB;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_chain_tip_forked_from(parent, 99, 0)), // root: fork-of:0 ignored
             (2, caps_chain_tip_forked_from(child, 42, parent)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::LineageBack {
                 origin: ChainRef::OriginHash(child),
@@ -2913,11 +2903,11 @@ mod tests {
         // Pathological: A -> B -> A. Cycle should surface.
         let a = 0x000A;
         let b = 0x000B;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_chain_forked_from(a, b)),
             (2, caps_chain_forked_from(b, a)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let err = planner
             .plan(&MeshQuery::V1(QueryV1::LineageBack {
                 origin: ChainRef::OriginHash(a),
@@ -2943,13 +2933,13 @@ mod tests {
         let g1 = 0x11;
         let g2 = 0x12;
         let g3 = 0x13;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_chain_only(g0)),
             (2, caps_chain_forked_from(g1, g0)),
             (3, caps_chain_forked_from(g2, g1)),
             (4, caps_chain_forked_from(g3, g2)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let err = planner
             .plan(&MeshQuery::V1(QueryV1::LineageBack {
                 origin: ChainRef::OriginHash(g3),
@@ -2972,12 +2962,12 @@ mod tests {
         let g0 = 0x20;
         let g1 = 0x21;
         let g2 = 0x22;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_chain_only(g0)),
             (2, caps_chain_forked_from(g1, g0)),
             (3, caps_chain_forked_from(g2, g1)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::LineageBack {
                 origin: ChainRef::OriginHash(g2),
@@ -3002,13 +2992,13 @@ mod tests {
         let c1 = 0x110;
         let c2 = 0x120;
         let gc = 0x130;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_chain_only(root)),
             (2, caps_chain_forked_from(c1, root)),
             (3, caps_chain_forked_from(c2, root)),
             (4, caps_chain_forked_from(gc, c1)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::LineageForward {
                 origin: ChainRef::OriginHash(root),
@@ -3037,12 +3027,12 @@ mod tests {
         let root = 0x200;
         let c1 = 0x210;
         let gc = 0x220;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_chain_only(root)),
             (2, caps_chain_forked_from(c1, root)),
             (3, caps_chain_forked_from(gc, c1)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let err = planner
             .plan(&MeshQuery::V1(QueryV1::LineageForward {
                 origin: ChainRef::OriginHash(root),
@@ -3061,8 +3051,8 @@ mod tests {
     #[test]
     fn lineage_forward_with_no_descendants_returns_only_start() {
         let leaf = 0x300;
-        let (fold, index) = index_with(vec![(1, caps_chain_only(leaf))]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = index_with(vec![(1, caps_chain_only(leaf))]);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::LineageForward {
                 origin: ChainRef::OriginHash(leaf),
@@ -3084,11 +3074,11 @@ mod tests {
         // the caller explicitly asked for zero steps.
         let g0 = 0x40;
         let g1 = 0x41;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_chain_only(g0)),
             (2, caps_chain_forked_from(g1, g0)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::LineageBack {
                 origin: ChainRef::OriginHash(g1),
@@ -3111,11 +3101,11 @@ mod tests {
         // node has a descendant; max_depth=0 says "don't descend".
         let parent = 0x50;
         let child = 0x51;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_chain_only(parent)),
             (2, caps_chain_forked_from(child, parent)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::LineageForward {
                 origin: ChainRef::OriginHash(parent),
@@ -3139,11 +3129,11 @@ mod tests {
         // without surprises.
         let parent = 0xAA;
         let child = 0xBB;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_chain_only(parent)),
             (2, caps_chain_forked_from(child, parent)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&MeshQuery::V1(QueryV1::LineageBack {
                 origin: ChainRef::OriginHash(child),
@@ -3185,11 +3175,11 @@ mod tests {
     fn plan_join_on_origin_produces_hash_join_with_origin_key() {
         let l = 0x1111;
         let r = 0x2222;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_with_causal_presence(l)),
             (2, caps_with_causal_presence(r)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner.plan(&join_query("origin", "origin", l, r)).unwrap();
         match plan.root.operator {
             OperatorPlan::HashJoin {
@@ -3215,11 +3205,11 @@ mod tests {
     fn plan_join_on_seq_produces_seq_key_mode() {
         let l = 0x3333;
         let r = 0x4444;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_with_causal_presence(l)),
             (2, caps_with_causal_presence(r)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner.plan(&join_query("seq", "seq", l, r)).unwrap();
         if let OperatorPlan::HashJoin { key_mode, .. } = plan.root.operator {
             assert_eq!(key_mode, JoinKeyMode::Seq);
@@ -3232,11 +3222,11 @@ mod tests {
     fn plan_join_with_mismatched_field_names_surfaces_planner_error() {
         let l = 0x5555;
         let r = 0x6666;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_with_causal_presence(l)),
             (2, caps_with_causal_presence(r)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let err = planner
             .plan(&join_query("origin", "seq", l, r))
             .unwrap_err();
@@ -3254,11 +3244,11 @@ mod tests {
         // JoinKeyMode::Field(<path>), not a PlannerError.
         let l = 0x7777;
         let r = 0x8888;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_with_causal_presence(l)),
             (2, caps_with_causal_presence(r)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&join_query(
                 "payload.request_id",
@@ -3282,11 +3272,11 @@ mod tests {
     fn plan_join_with_non_field_expression_surfaces_planner_error() {
         let l = 0x9999;
         let r = 0xAAAA;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_with_causal_presence(l)),
             (2, caps_with_causal_presence(r)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let q = MeshQuery::V1(QueryV1::Join {
             left: Box::new(MeshQuery::V1(QueryV1::Latest {
                 origin: ChainRef::OriginHash(l),
@@ -3314,11 +3304,11 @@ mod tests {
     fn plan_join_round_trips_through_postcard() {
         let l = 0xCCCC;
         let r = 0xDDDD;
-        let (fold, index) = index_with(vec![
+        let (fold, _index) = index_with(vec![
             (1, caps_with_causal_presence(l)),
             (2, caps_with_causal_presence(r)),
         ]);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner.plan(&join_query("origin", "origin", l, r)).unwrap();
         let bytes = postcard::to_allocvec(&plan).unwrap();
         let decoded: ExecutionPlan = postcard::from_bytes(&bytes).unwrap();
@@ -3342,8 +3332,8 @@ mod tests {
     #[test]
     fn plan_aggregate_count_no_group_by() {
         let origin = 0x1111;
-        let (fold, index) = make_index_with_holder(1, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&aggregate_query(origin, vec![], AggregateFn::Count))
             .unwrap();
@@ -3359,8 +3349,8 @@ mod tests {
     #[test]
     fn plan_aggregate_count_group_by_origin() {
         let origin = 0x2222;
-        let (fold, index) = make_index_with_holder(1, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&aggregate_query(
                 origin,
@@ -3378,8 +3368,8 @@ mod tests {
     #[test]
     fn plan_aggregate_count_group_by_seq() {
         let origin = 0x3333;
-        let (fold, index) = make_index_with_holder(1, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&aggregate_query(
                 origin,
@@ -3397,8 +3387,8 @@ mod tests {
     #[test]
     fn plan_aggregate_count_group_by_origin_seq_composite() {
         let origin = 0x4444;
-        let (fold, index) = make_index_with_holder(1, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&aggregate_query(
                 origin,
@@ -3419,8 +3409,8 @@ mod tests {
     #[test]
     fn plan_aggregate_sum_produces_aggregate_numeric() {
         let origin = 0x5555;
-        let (fold, index) = make_index_with_holder(1, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&aggregate_query(
                 origin,
@@ -3448,8 +3438,8 @@ mod tests {
     #[test]
     fn plan_aggregate_avg_with_group_by_produces_aggregate_numeric() {
         let origin = 0x5556;
-        let (fold, index) = make_index_with_holder(1, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&aggregate_query(
                 origin,
@@ -3477,8 +3467,8 @@ mod tests {
     #[test]
     fn plan_aggregate_non_field_arg_surfaces_planner_error() {
         let origin = 0x5557;
-        let (fold, index) = make_index_with_holder(1, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let err = planner
             .plan(&aggregate_query(
                 origin,
@@ -3503,8 +3493,8 @@ mod tests {
         // them); exact equivalents ship via DistinctCountExact /
         // PercentileExact.
         let origin = 0x5558;
-        let (fold, index) = make_index_with_holder(1, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let err = planner
             .plan(&aggregate_query(
                 origin,
@@ -3526,8 +3516,8 @@ mod tests {
     #[test]
     fn plan_aggregate_group_by_payload_field_surfaces_planner_error() {
         let origin = 0x6666;
-        let (fold, index) = make_index_with_holder(1, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let err = planner
             .plan(&aggregate_query(
                 origin,
@@ -3546,8 +3536,8 @@ mod tests {
     #[test]
     fn plan_aggregate_round_trips_through_postcard() {
         let origin = 0x7777;
-        let (fold, index) = make_index_with_holder(1, origin);
-        let planner = MeshQueryPlanner::new(&index, &fold,rtt_none);
+        let (fold, _index) = make_index_with_holder(1, origin);
+        let planner = MeshQueryPlanner::new(&fold,rtt_none);
         let plan = planner
             .plan(&aggregate_query(
                 origin,
