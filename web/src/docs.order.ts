@@ -17,7 +17,14 @@ import type { DocsOrderConfig } from "@/lib/docs";
 // `"release_v0.17_atomic_playboys"` and `"release-v0.17-atomic-playboys"`
 // resolve to the same entry. Dashes are the canonical (URL) form.
 export const DOCS_ORDER: DocsOrderConfig = {
-  sections: ["start", "concepts", "guides", "reference", "tutorials", "releases"],
+  sections: [
+    "start",
+    "concepts",
+    "guides",
+    "reference",
+    "tutorials",
+    "releases",
+  ],
   folders: {
     start: ["what-is-net", "quickstart", "install"],
     concepts: [
@@ -57,6 +64,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     ],
     // Releases — newest first.
     releases: [
+      "RELEASE_v0.21_RADAR_LOVE",
       "release-v0.20.2",
       "release-v0.20-smoke-on-the-water",
       "release-v0.19-push-it-to-the-limit",
@@ -123,10 +131,13 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "tutorials/event-sourced-service": "Event-Sourced Service",
 
     // Releases
+    "RELEASE_v0.21_RADAR_LOVE": "v0.21 — Radar Love",
     "releases/release-v0.20.2": "v0.20.2",
     "releases/release-v0.20-smoke-on-the-water": "v0.20 — Smoke on the Water",
-    "releases/release-v0.19-push-it-to-the-limit": "v0.19 — Push It to the Limit",
-    "releases/release-v0.18-welcome-to-the-jungle": "v0.18 — Welcome to the Jungle",
+    "releases/release-v0.19-push-it-to-the-limit":
+      "v0.19 — Push It to the Limit",
+    "releases/release-v0.18-welcome-to-the-jungle":
+      "v0.18 — Welcome to the Jungle",
     "releases/release-v0.17-atomic-playboys": "v0.17 — Atomic Playboys",
     "releases/release-v0.16-eye-of-the-tiger": "v0.16 — Eye of the Tiger",
     "releases/release-v0.15-rebel-yell": "v0.15 — Rebel Yell",
