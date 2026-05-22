@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/behavior/fold/dispatch.rs
+  s_d9dc521a887c3e::t_b3a79b191ccaa1 333-336,338-339
+  s_d9dc521a887c3e::t_37558295c592a8 220-234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "95598b44873ea80a622483314e5f0fdfd23064bd",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
