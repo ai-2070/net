@@ -635,8 +635,8 @@ impl ShardMapper {
     /// Pre-fix this acquired `shards.read()` and allocated two `Vec`s
     /// per call (active filter, candidate filter) — at 10M ev/s that
     /// was 20M allocs/sec plus a parking_lot acquire per event.
-    /// Post-fix the routable subset is pre-computed in
-    /// [`Self::selection_table`] and updated only at state
+    /// Post-fix the routable subset is pre-computed in the private
+    /// `selection_table` field and updated only at state
     /// transitions / metric refreshes; the hot path is a single
     /// `ArcSwap::load` + Lemire-bias-free integer mapping.
     ///

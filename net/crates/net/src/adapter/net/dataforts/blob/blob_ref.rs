@@ -1432,10 +1432,8 @@ mod tests {
             "ManifestBodyRef must serialize byte-for-byte identically to ManifestBody",
         );
         // And the measured-only path agrees with the alloc'd path.
-        let measured_owned =
-            postcard::experimental::serialized_size(&owned).unwrap();
-        let measured_borrowed =
-            postcard::experimental::serialized_size(&borrowed).unwrap();
+        let measured_owned = postcard::experimental::serialized_size(&owned).unwrap();
+        let measured_borrowed = postcard::experimental::serialized_size(&borrowed).unwrap();
         assert_eq!(measured_owned, measured_borrowed);
         assert_eq!(measured_owned, owned_bytes.len());
     }

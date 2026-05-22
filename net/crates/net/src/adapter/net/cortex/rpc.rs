@@ -317,7 +317,7 @@ pub struct RpcRequestPayload {
     ///
     /// Held as [`Bytes`] so [`Self::decode`] can zero-copy `slice_ref`
     /// the body out of the inbound event's `Bytes` payload — pre-fix
-    /// [perf #84 in `docs/performance/net-perf-analysis.md`] this was
+    /// perf #84 in `docs/performance/net-perf-analysis.md` this was
     /// `Vec<u8>` and every decode did a `data[body_start..body_end].to_vec()`
     /// (a memcpy per frame). For high-RPS systems doing 100K+ RPCs/sec
     /// with 1 KB+ bodies that was 100+ MB/sec of pure memcpy.

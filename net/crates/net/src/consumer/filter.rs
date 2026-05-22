@@ -84,7 +84,7 @@ impl CompiledSegment {
 /// integer parse is cached. Produced once via [`Filter::compile`] and
 /// reused across every event in a poll.
 ///
-/// Pre-fix [perf #15 / #16 in `docs/performance/net-perf-analysis.md`]
+/// Pre-fix perf #15 / #16 in `docs/performance/net-perf-analysis.md`
 /// every event in the filtered-poll retain loop re-split the path on
 /// `'.'` and re-parsed each segment as `usize`. For a 10K-event response
 /// with a 3-segment path, that was 30K path splits + ~30K speculative

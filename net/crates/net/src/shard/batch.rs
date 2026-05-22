@@ -326,7 +326,7 @@ impl BatchWorker {
 
     /// Check if the batch should be flushed due to timeout.
     ///
-    /// Pre-fix [perf #38 in `docs/performance/net-perf-analysis.md`]
+    /// Pre-fix perf #38 in `docs/performance/net-perf-analysis.md`
     /// this was private and the bus's timeout branch called
     /// `add_events(vec![])` as the indirection — an empty `Vec`
     /// allocation per timeout tick purely as a sentinel. The
