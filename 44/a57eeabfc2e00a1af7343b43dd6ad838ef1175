@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/redex/segment.rs
+  s_f930dae9b8bbc1::t_c849da377945a1 420-472
+  s_f930dae9b8bbc1::t_ae8b0e1cc2a3c0 400-411
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "44a57eeabfc2e00a1af7343b43dd6ad838ef1175",
+  "prompts": {},
+  "sessions": {
+    "s_f930dae9b8bbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b51d476e-e344-459e-b206-1e3e4d8a7e49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
