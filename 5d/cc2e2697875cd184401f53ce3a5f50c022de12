@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/state/causal.rs
+  s_947eb728f006db::t_9e58308c9ee3cc 126-136,140-143
+  s_947eb728f006db::t_41504bc335e8a2 8
+  s_947eb728f006db::t_8c1ee984030d13 584-620
+net/crates/net/src/shard/mod.rs
+  s_947eb728f006db::t_cdcb86e5b847b8 478-494,500
+  s_947eb728f006db::t_ded52906e54d3b 1203-1260
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "5dcc2e2697875cd184401f53ce3a5f50c022de12",
+  "prompts": {},
+  "sessions": {
+    "s_947eb728f006db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fe2a7b6-f937-436c-8c36-6580a8be4344",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
