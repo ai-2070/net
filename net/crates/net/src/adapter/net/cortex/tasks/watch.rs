@@ -26,7 +26,7 @@ use parking_lot::RwLock;
 use tokio::sync::watch;
 use tokio_stream::wrappers::WatchStream;
 
-use super::query::{OrderBy, TasksFilterSpec};
+use super::query::{OrderBy, TasksFilterSpec, TitleNeedle};
 use super::state::TasksState;
 use super::types::{Task, TaskId, TaskStatus};
 
@@ -87,7 +87,7 @@ impl TasksWatcher {
 
     /// Restrict to tasks whose title contains `needle` (case-insensitive).
     pub fn title_contains(mut self, needle: impl Into<String>) -> Self {
-        self.spec.title_contains = Some(needle.into().to_lowercase());
+        self.spec.title_contains = Some(TitleNeedle::new(needle));
         self
     }
 

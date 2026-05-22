@@ -26,7 +26,7 @@ use parking_lot::RwLock;
 use tokio::sync::watch;
 use tokio_stream::wrappers::WatchStream;
 
-use super::query::{MemoriesFilterSpec, OrderBy};
+use super::query::{ContentNeedle, MemoriesFilterSpec, OrderBy};
 use super::state::MemoriesState;
 use super::types::{Memory, MemoryId};
 
@@ -64,7 +64,7 @@ impl MemoriesWatcher {
     /// Restrict to memories whose content contains `needle`
     /// (case-insensitive).
     pub fn content_contains(mut self, needle: impl Into<String>) -> Self {
-        self.spec.content_contains = Some(needle.into().to_lowercase());
+        self.spec.content_contains = Some(ContentNeedle::new(needle));
         self
     }
 

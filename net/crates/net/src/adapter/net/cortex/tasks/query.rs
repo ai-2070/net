@@ -23,6 +23,52 @@ use std::collections::HashSet;
 use super::state::TasksState;
 use super::types::{Task, TaskId, TaskStatus};
 
+/// Case-insensitive title-substring needle with precomputed
+/// ASCII classification. Per perf #81 — pre-fix the per-task
+/// matcher called `t.title.to_lowercase()`, allocating a fresh
+/// `String` per task per filter check. ASCII needles take a
+/// zero-alloc byte-windowed `eq_ignore_ascii_case` scan; non-
+/// ASCII needles fall back to the legacy Unicode-folding shape
+/// because that's the only correct way to handle them. ASCII-ness
+/// is precomputed once at filter-construction; the matcher reads
+/// a `bool`. See `cortex/memories/query.rs::ContentNeedle` for
+/// the full rationale and the byte-windowed correctness argument
+/// — both sides share the same fix because the doc's "#104 Tasks
+/// adapter mirrors all the memories adapter patterns" applies to
+/// the search path too.
+#[derive(Debug, Clone)]
+pub(super) struct TitleNeedle {
+    lowercased: String,
+    is_ascii: bool,
+}
+
+impl TitleNeedle {
+    pub(super) fn new(needle: impl Into<String>) -> Self {
+        let lowercased = needle.into().to_lowercase();
+        let is_ascii = lowercased.is_ascii();
+        Self {
+            lowercased,
+            is_ascii,
+        }
+    }
+
+    pub(super) fn matches(&self, haystack: &str) -> bool {
+        if self.is_ascii {
+            let h = haystack.as_bytes();
+            let n = self.lowercased.as_bytes();
+            if n.is_empty() {
+                return true;
+            }
+            if h.len() < n.len() {
+                return false;
+            }
+            h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+        } else {
+            haystack.to_lowercase().contains(&self.lowercased)
+        }
+    }
+}
+
 /// Filter / order / limit configuration. Shared by
 /// [`TasksQuery`] (immediate execution over a borrowed state snapshot)
 /// and [`super::watch::TasksWatcher`] (repeated execution driven by
@@ -35,7 +81,7 @@ pub(super) struct TasksFilterSpec {
     pub created_before_ns: Option<u64>,
     pub updated_after_ns: Option<u64>,
     pub updated_before_ns: Option<u64>,
-    pub title_contains: Option<String>,
+    pub title_contains: Option<TitleNeedle>,
     pub order_by: Option<OrderBy>,
     pub limit: Option<usize>,
 }
@@ -82,7 +128,7 @@ impl TasksFilterSpec {
             }
         }
         if let Some(needle) = &self.title_contains {
-            if !t.title.to_lowercase().contains(needle) {
+            if !needle.matches(&t.title) {
                 return false;
             }
         }
@@ -181,7 +227,7 @@ impl<'a> TasksQuery<'a> {
 
     /// Restrict to tasks whose title contains `needle` (case-insensitive).
     pub fn title_contains(mut self, needle: impl Into<String>) -> Self {
-        self.spec.title_contains = Some(needle.into().to_lowercase());
+        self.spec.title_contains = Some(TitleNeedle::new(needle));
         self
     }
 
@@ -421,6 +467,38 @@ mod tests {
         let ids_plural: Vec<_> = s.query().title_contains("e").collect();
         // All titles contain "e" (Write, adapter, Review, update, Deploy).
         assert_eq!(ids_plural.len(), 5);
+    }
+
+    /// Pin perf #81 (tasks side): `TitleNeedle::matches` must
+    /// agree with the legacy
+    /// `haystack.to_lowercase().contains(&needle.to_lowercase())`
+    /// shape across both the ASCII fast path and the Unicode
+    /// fallback. Mirrors the memories-side
+    /// `content_needle_matches_legacy_to_lowercase_contains` pin.
+    #[test]
+    fn title_needle_matches_legacy_to_lowercase_contains() {
+        let cases: &[(&str, &str)] = &[
+            ("DEPLOY", "Deploy to production"),
+            ("deploy", "Deploy to production"),
+            ("xyz", "Deploy to production"),
+            ("", "anything"),
+            ("longer than haystack", "short"),
+            ("a", ""),
+            ("hello", "héllo world"),
+            ("CAFÉ", "let's grab café tonight"),
+            ("café", "let's grab CAFÉ tonight"),
+            ("Ω", "math symbols: Ω ω"),
+        ];
+        for (needle, haystack) in cases {
+            let reference = haystack
+                .to_lowercase()
+                .contains(&needle.to_lowercase());
+            let actual = TitleNeedle::new(*needle).matches(haystack);
+            assert_eq!(
+                actual, reference,
+                "TitleNeedle({needle:?}).matches({haystack:?}) diverged from legacy",
+            );
+        }
     }
 
     #[test]
