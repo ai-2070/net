@@ -1,0 +1,21 @@
+net/crates/net/docs/performance/net-meshdb-analysis.md
+  s_947eb728f006db::t_da133b3824dafc 17-19
+net/crates/net/docs/performance/net-perf-analysis.md
+  s_947eb728f006db::t_06187c33999486 32-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "70ebfe42802ae493737c83c5b18fb15389fad28e",
+  "prompts": {},
+  "sessions": {
+    "s_947eb728f006db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fe2a7b6-f937-436c-8c36-6580a8be4344",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
