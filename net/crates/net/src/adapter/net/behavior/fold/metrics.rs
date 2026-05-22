@@ -12,6 +12,67 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::{Deserialize, Serialize};
+
+/// Serializable per-fold snapshot of the live [`FoldMetrics`]
+/// counters + a small amount of static identity (`kind` u16 +
+/// channel prefix). Per Phase 6a of the multifold plan, this
+/// is the shape the operator-facing surface (the
+/// `net fold list` / `net fold stats <kind>` CLI commands, the
+/// Deck FOLDS panel, the Prometheus exporter) reads when it
+/// wants a coherent picture of one fold.
+///
+/// Sampled via [`FoldMetrics::snapshot`] for the fold-side
+/// view, or aggregated across the registry via
+/// [`super::FoldRegistry::stats`] for the multi-fold view.
+///
+/// All counters are `u64` — the atomics behind them are also
+/// `u64`, so no narrowing happens at snapshot time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoldStats {
+    /// [`super::FoldKind::KIND_ID`] of the fold this snapshot
+    /// describes. Surfaces in JSON output so operators
+    /// piping `--output json | jq` can route on a stable
+    /// identifier rather than the channel-prefix string.
+    pub kind: u16,
+    /// [`super::FoldKind::CHANNEL_PREFIX`] — operator-friendly
+    /// human label for the fold (e.g. `"fold:cap:"`,
+    /// `"fold:route:"`, `"fold:res:"`). Owned `String` rather
+    /// than `&'static str` so the shape round-trips through
+    /// serde without lifetime gymnastics — operators piping
+    /// `--output json | jq` deserialize into the same type
+    /// the CLI emits.
+    pub channel_prefix: String,
+    /// Current entry count.
+    pub entries: u64,
+    /// Apply count: outcome = inserted.
+    pub applies_inserted: u64,
+    /// Apply count: outcome = replaced an older entry.
+    pub applies_replaced: u64,
+    /// Apply count: outcome = rejected (existing entry won
+    /// merge, generation out of order, etc.).
+    pub applies_rejected: u64,
+    /// Sum of inserted + replaced + rejected. Useful as the
+    /// denominator for outcome ratios.
+    pub applies_total: u64,
+    /// TTL-driven expiries since fold construction. Bumped by
+    /// the background sweeper.
+    pub expiries: u64,
+    /// Operator / SWIM-driven evictions since fold construction.
+    pub evictions: u64,
+    /// Query count.
+    pub queries: u64,
+    /// Snapshots taken via [`super::Fold::snapshot`].
+    pub snapshots_taken: u64,
+    /// Snapshots restored via [`super::Fold::restore`].
+    pub snapshots_restored: u64,
+    /// Whether an [`super::AuditSink`] is currently installed
+    /// on the fold. Diagnostic — operators trying to figure
+    /// out why their audit trail is empty want a quick
+    /// "nothing's listening" signal.
+    pub has_audit_sink: bool,
+}
+
 /// Metric counters for one [`super::Fold`] instance. Counters
 /// are independent atomics — readers (Prometheus scrape, the
 /// Deck FOLDS panel, the metrics CLI) take a per-counter
@@ -186,5 +247,34 @@ impl FoldMetrics {
     /// Snapshot-restored count since start.
     pub fn snapshots_restored(&self) -> u64 {
         self.snapshots_restored.load(Ordering::Relaxed)
+    }
+
+    /// Materialize a [`FoldStats`] snapshot of every counter
+    /// plus the supplied static identity (`kind` /
+    /// `channel_prefix`) and runtime flag (`has_audit_sink`).
+    /// Called by [`super::Fold::stats`] and by the
+    /// per-fold [`super::FoldDispatch::stats`] adapter — the
+    /// shape the operator surface consumes.
+    pub fn snapshot(
+        &self,
+        kind: u16,
+        channel_prefix: &'static str,
+        has_audit_sink: bool,
+    ) -> FoldStats {
+        FoldStats {
+            kind,
+            channel_prefix: channel_prefix.to_string(),
+            entries: self.entries(),
+            applies_inserted: self.applies_inserted(),
+            applies_replaced: self.applies_replaced(),
+            applies_rejected: self.applies_rejected(),
+            applies_total: self.applies_total(),
+            expiries: self.expiries(),
+            evictions: self.evictions(),
+            queries: self.queries(),
+            snapshots_taken: self.snapshots_taken(),
+            snapshots_restored: self.snapshots_restored(),
+            has_audit_sink,
+        }
     }
 }

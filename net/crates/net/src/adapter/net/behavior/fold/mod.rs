@@ -56,13 +56,13 @@ pub mod wire;
 mod tests;
 
 pub use announcement::SignedAnnouncement;
-pub use audit::{AuditSink, NoopSink, VecAuditSink};
+pub use audit::{AuditSink, NoopSink, RingAuditSink, VecAuditSink};
 pub use dispatch::{
     DispatchError, FoldChannelRouter, FoldDispatch, FoldDispatchAdapter, FoldRegistry,
     SUBPROTOCOL_FOLD,
 };
 pub use expiry::DEFAULT_SWEEP_INTERVAL;
-pub use metrics::FoldMetrics;
+pub use metrics::{FoldMetrics, FoldStats};
 pub use reservation::{
     JobId, ReservationAnnouncement, ReservationFold, ReservationQuery, ReservationRow,
     ReservationState, ResourceId,
@@ -514,6 +514,15 @@ impl<K: FoldKind> Fold<K> {
     /// Read-only handle to the metric counters.
     pub fn metrics(&self) -> &FoldMetrics {
         &self.metrics
+    }
+
+    /// Materialize a [`metrics::FoldStats`] snapshot of this
+    /// fold for the operator surface (CLI / Deck / Prometheus).
+    /// One atomic load per counter + one read lock on the
+    /// audit-sink slot; cheap enough to call per-tick.
+    pub fn stats(&self) -> metrics::FoldStats {
+        self.metrics
+            .snapshot(K::KIND_ID, K::CHANNEL_PREFIX, self.has_audit_sink())
     }
 
     /// Read-only access to the live state — held under the

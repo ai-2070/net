@@ -93,3 +93,72 @@ impl AuditSink for VecAuditSink {
     }
 }
 
+/// Bounded ring-buffer audit sink. Keeps the most recent
+/// `capacity` events; oldest are dropped first when full.
+///
+/// Per Phase 6a of the multifold plan, this is the sink the
+/// Deck FOLDS panel's "recent transitions" view consumes: an
+/// operator wants the last N events for a fold, NOT a complete
+/// history. Bounded capacity also makes this safe to install
+/// on a high-throughput fold without unbounded memory growth.
+///
+/// Thread-safe — the inner `VecDeque` is wrapped in a
+/// `parking_lot::Mutex` so `record` is callable from concurrent
+/// fold operations.
+pub struct RingAuditSink {
+    capacity: usize,
+    events: parking_lot::Mutex<std::collections::VecDeque<AuditEvent>>,
+}
+
+impl RingAuditSink {
+    /// Construct a sink that retains the most recent `capacity`
+    /// events. `capacity == 0` is accepted (and useful: an
+    /// always-empty sink that still satisfies the trait
+    /// without storing anything).
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            events: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
+                capacity,
+            )),
+        }
+    }
+
+    /// Capacity the sink was constructed with.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Current event count (always `<= capacity`).
+    pub fn len(&self) -> usize {
+        self.events.lock().len()
+    }
+
+    /// Whether the sink currently holds any events.
+    pub fn is_empty(&self) -> bool {
+        self.events.lock().is_empty()
+    }
+
+    /// Snapshot the retained events in insertion order
+    /// (oldest first → newest last). Returns a clone so the
+    /// caller can render without holding the sink's lock.
+    pub fn snapshot(&self) -> Vec<AuditEvent> {
+        self.events.lock().iter().cloned().collect()
+    }
+}
+
+impl AuditSink for RingAuditSink {
+    fn record(&self, event: AuditEvent) {
+        let mut events = self.events.lock();
+        // Edge case: capacity == 0 means "never store anything."
+        // Drop the event without growing the deque past 0.
+        if self.capacity == 0 {
+            return;
+        }
+        if events.len() >= self.capacity {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+}
+

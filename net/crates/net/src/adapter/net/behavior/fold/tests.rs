@@ -1229,3 +1229,183 @@ async fn background_sweeper_evicts_expired_entries_on_tick() {
     assert_eq!(fold.metrics().expiries(), 1);
     assert_eq!(fold.metrics().entries(), 0);
 }
+
+// ---------------------------------------------------------------------
+// Phase 6a: FoldStats + FoldRegistry::stats + RingAuditSink
+// ---------------------------------------------------------------------
+
+use super::audit::RingAuditSink;
+use super::metrics::FoldStats;
+
+#[test]
+fn fold_stats_snapshot_reflects_live_counters() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+
+    // 2 inserts, 1 replace, 1 reject.
+    fold.apply(cap_announcement(0x1, 0x100, 1, vec!["a"]))
+        .expect("ins-1");
+    fold.apply(cap_announcement(0x2, 0x100, 1, vec!["b"]))
+        .expect("ins-2");
+    fold.apply(cap_announcement(0x1, 0x100, 2, vec!["a2"]))
+        .expect("replace");
+    let _ = fold
+        .apply(cap_announcement(0x1, 0x100, 1, vec!["stale"]))
+        .expect("reject"); // stale gen rejected
+    // Tag-filtered query bumps the query counter.
+    let _ = fold.query(CapQuery {
+        class: 0x100,
+        required_tag: Some("a2".into()),
+    });
+
+    let snap = fold.stats();
+    assert_eq!(snap.kind, CapFold::KIND_ID);
+    assert_eq!(snap.channel_prefix, CapFold::CHANNEL_PREFIX);
+    assert_eq!(snap.entries, 2);
+    assert_eq!(snap.applies_inserted, 2);
+    assert_eq!(snap.applies_replaced, 1);
+    assert_eq!(snap.applies_rejected, 1);
+    assert_eq!(snap.applies_total, 4);
+    assert_eq!(snap.expiries, 0);
+    assert_eq!(snap.evictions, 0);
+    assert_eq!(snap.queries, 1);
+    assert_eq!(snap.snapshots_taken, 0);
+    assert_eq!(snap.snapshots_restored, 0);
+    assert!(!snap.has_audit_sink);
+
+    // Drive every counter and re-snapshot.
+    fold.evict_node(0x2, "test");
+    let _snap = fold.snapshot();
+    let restored: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let s2 = fold.snapshot();
+    restored.restore(s2, false).expect("restore");
+
+    fold.set_audit_sink(Some(Arc::new(NoopSink) as Arc<dyn super::AuditSink>));
+    let snap = fold.stats();
+    assert_eq!(snap.entries, 1, "after evict_node(0x2): only 0x1 remains");
+    assert_eq!(snap.evictions, 1);
+    assert_eq!(snap.snapshots_taken, 2);
+    assert!(snap.has_audit_sink);
+    assert_eq!(restored.stats().snapshots_restored, 1);
+}
+
+#[test]
+fn fold_registry_stats_aggregates_across_kinds() {
+    let registry = FoldRegistry::new();
+    let cap: Arc<Fold<CapFold>> = Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
+    let route: Arc<Fold<RoutingTestFold>> =
+        Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
+    registry.register(cap.clone());
+    registry.register(route.clone());
+
+    cap.apply(cap_announcement(0x42, 0x100, 1, vec!["gpu"]))
+        .unwrap();
+    cap.apply(cap_announcement(0x43, 0x100, 1, vec!["gpu"]))
+        .unwrap();
+    route
+        .apply(route_announcement(0xAA, 0x99, 50, 1))
+        .unwrap();
+
+    let stats = registry.stats();
+    assert_eq!(stats.len(), 2);
+
+    // Find each by kind — order is unspecified.
+    let cap_stats = stats
+        .iter()
+        .find(|s| s.kind == CapFold::KIND_ID)
+        .expect("cap stats present");
+    assert_eq!(cap_stats.entries, 2);
+    assert_eq!(cap_stats.channel_prefix, CapFold::CHANNEL_PREFIX);
+
+    let route_stats = stats
+        .iter()
+        .find(|s| s.kind == RoutingTestFold::KIND_ID)
+        .expect("route stats present");
+    assert_eq!(route_stats.entries, 1);
+    assert_eq!(route_stats.channel_prefix, RoutingTestFold::CHANNEL_PREFIX);
+}
+
+#[test]
+fn fold_stats_round_trips_through_serde_json() {
+    // The CLI surface (`net fold list --output json`) serializes
+    // this shape via `serde_json::to_string`. Pin the round-trip
+    // so a regression in field naming / order doesn't silently
+    // break operator tooling.
+    let stats = FoldStats {
+        kind: CapFold::KIND_ID,
+        channel_prefix: "test:cap:".to_string(),
+        entries: 12,
+        applies_inserted: 10,
+        applies_replaced: 3,
+        applies_rejected: 1,
+        applies_total: 14,
+        expiries: 2,
+        evictions: 0,
+        queries: 7,
+        snapshots_taken: 1,
+        snapshots_restored: 0,
+        has_audit_sink: true,
+    };
+    let json = serde_json::to_string(&stats).expect("serialize");
+    let parsed: FoldStats = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(parsed, stats);
+}
+
+#[test]
+fn ring_audit_sink_drops_oldest_when_capacity_exceeded() {
+    let sink = RingAuditSink::new(3);
+    for i in 0..5 {
+        sink.record(super::AuditEvent {
+            kind: "created",
+            key_repr: format!("{}", i),
+            detail: None,
+        });
+    }
+    let snap = sink.snapshot();
+    assert_eq!(snap.len(), 3);
+    // Oldest two (`0`, `1`) were dropped; survivors are `2..=4`
+    // in insertion order.
+    let keys: Vec<&str> = snap.iter().map(|e| e.key_repr.as_str()).collect();
+    assert_eq!(keys, vec!["2", "3", "4"]);
+}
+
+#[test]
+fn ring_audit_sink_with_zero_capacity_stores_nothing() {
+    let sink = RingAuditSink::new(0);
+    sink.record(super::AuditEvent {
+        kind: "created",
+        key_repr: "x".into(),
+        detail: None,
+    });
+    assert!(sink.is_empty());
+    assert_eq!(sink.len(), 0);
+    assert!(sink.snapshot().is_empty());
+}
+
+#[test]
+fn ring_audit_sink_plugs_into_fold_and_captures_transitions() {
+    let fold: Fold<AuditingCapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let sink = Arc::new(RingAuditSink::new(4));
+    fold.set_audit_sink(Some(sink.clone() as Arc<dyn super::AuditSink>));
+
+    let kp = EntityKeypair::generate();
+    // 5 distinct events — the 1st is dropped (capacity 4).
+    for i in 0..5 {
+        fold.apply(sign_audit_ann(
+            &kp,
+            0x10 + i,
+            0x100,
+            1,
+            300,
+            vec!["t"],
+        ))
+        .expect("apply");
+    }
+    let snap = sink.snapshot();
+    assert_eq!(snap.len(), 4);
+    // All 4 retained events are "created"; the oldest "created
+    // for 0x10" was dropped.
+    for e in &snap {
+        assert_eq!(e.kind, "created");
+    }
+}

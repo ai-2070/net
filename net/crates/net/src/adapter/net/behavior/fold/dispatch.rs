@@ -27,6 +27,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use super::announcement::SignedAnnouncement;
+use super::metrics::FoldStats;
 use super::state::ApplyOutcome;
 use super::wire::WireError;
 use super::{Fold, FoldKind};
@@ -68,6 +69,12 @@ pub trait FoldDispatch: Send + Sync {
         bytes: &[u8],
         publisher: &crate::adapter::net::identity::EntityId,
     ) -> Result<ApplyOutcome, WireError>;
+
+    /// Type-erased [`Fold::stats`]. Per Phase 6a, the operator
+    /// surface aggregates these across the registry via
+    /// [`FoldRegistry::stats`] so a single `net fold list`
+    /// call returns one row per registered fold.
+    fn stats(&self) -> FoldStats;
 }
 
 /// Adapter that lifts a typed [`Fold<K>`] into the non-generic
@@ -95,6 +102,10 @@ impl<K: FoldKind> FoldDispatchAdapter<K> {
 impl<K: FoldKind> FoldDispatch for FoldDispatchAdapter<K> {
     fn kind_id(&self) -> u16 {
         K::KIND_ID
+    }
+
+    fn stats(&self) -> FoldStats {
+        self.fold.stats()
     }
 
     fn dispatch(
@@ -186,6 +197,22 @@ impl FoldRegistry {
     /// hot path uses [`Self::dispatch`] directly.
     pub fn get(&self, kind: u16) -> Option<Arc<dyn FoldDispatch>> {
         self.folds.read().get(&kind).cloned()
+    }
+
+    /// Aggregate [`FoldStats`] across every registered fold.
+    /// Per Phase 6a — the operator surface (the `net fold list`
+    /// CLI command, the Deck FOLDS panel) calls this once per
+    /// sample tick and renders one row per returned `FoldStats`.
+    ///
+    /// Returns in unspecified order; callers that want a
+    /// canonical sort (by `kind`, by `channel_prefix`) do it
+    /// themselves at the rendering layer.
+    pub fn stats(&self) -> Vec<FoldStats> {
+        self.folds
+            .read()
+            .values()
+            .map(|adapter| adapter.stats())
+            .collect()
     }
 
     /// Dispatch an inbound wire envelope to the right fold.
