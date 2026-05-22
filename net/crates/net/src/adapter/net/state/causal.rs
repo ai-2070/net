@@ -585,13 +585,13 @@ mod tests {
     /// produce the SAME 64-bit digest as the legacy one-shot
     /// `xxh3_64(link ++ payload)`. The streaming path eliminates the
     /// per-output-event `Vec::with_capacity(...).extend.extend` alloc
-    /// + double-memcpy, but the on-the-wire `parent_hash` is part of
-    /// the chain-validation invariant — if the streaming digest
-    /// diverged from the concatenated digest, every replica /
+    /// and double-memcpy, but the on-the-wire `parent_hash` is part
+    /// of the chain-validation invariant — if the streaming digest
+    /// diverged from the concatenated digest, every replica or
     /// migration target would reject events from a node that hadn't
-    /// upgraded yet (and vice versa). This pin covers tiny, exact-block,
-    /// just-over-block, multi-block, and empty payloads against the
-    /// concatenate-then-hash reference.
+    /// upgraded yet (and vice versa). This pin covers tiny,
+    /// exact-block, just-over-block, multi-block, and empty payloads
+    /// against the concatenate-then-hash reference.
     #[test]
     fn compute_parent_hash_streaming_matches_concatenated_oneshot() {
         use xxhash_rust::xxh3::xxh3_64;
