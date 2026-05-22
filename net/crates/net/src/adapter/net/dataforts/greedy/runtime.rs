@@ -2400,9 +2400,19 @@ mod tests {
 
         // 1 s bound on a non-deadlocking interleave is generous;
         // the actual run is sub-millisecond on a healthy box.
+        //
+        // Per cubic-dev-ai code review: `JoinHandle::await` returns
+        // `Result<T, JoinError>` and a panic inside a spawned task
+        // surfaces as `Err(JoinError)`. The original `let _ = …`
+        // swallowed those errors, so a panicking writer/reader
+        // task would slip past the timeout and the post-loop
+        // pointer-identity assertion could spuriously pass (the
+        // last `set_local_caps` did land before the panic). The
+        // `.expect("…")` surfaces panics as a clean test failure
+        // pointing at which side broke.
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            let _ = writer.await;
-            let _ = reader.await;
+            writer.await.expect("writer task panicked");
+            reader.await.expect("reader task panicked");
         })
         .await
         .expect("concurrent set_local_caps + dispatch_event must not deadlock");
