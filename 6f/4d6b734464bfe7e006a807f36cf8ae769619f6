@@ -1,0 +1,73 @@
+net/crates/net/tests/capability_multihop.rs
+  s_d9dc521a887c3e::t_0b8b64d64720e1 540
+  s_d9dc521a887c3e::t_83d2ea8902e24a 450
+  s_d9dc521a887c3e::t_9e5fed4f1b122f 531
+net/crates/net/tests/dataforts_greedy_e2e.rs
+  s_d9dc521a887c3e::t_305d0e1a036049 661
+  s_d9dc521a887c3e::t_be6fb416f64ed5 198-200
+net/crates/net/tests/failure_detector_matrix.rs
+  s_d9dc521a887c3e::t_06bca0114152de 191
+net/crates/net/tests/common/mod.rs
+  s_d9dc521a887c3e::t_654b38e5253cc4 200
+net/crates/net/tests/capability_auth_conformance.rs
+  s_d9dc521a887c3e::t_397e0bc9f20fd6 118
+  s_d9dc521a887c3e::t_4d2cd7acebe002 522-523
+  s_d9dc521a887c3e::t_0c4cbc7786e8ec 471,483
+  s_d9dc521a887c3e::t_bb16569152db00 198,203
+  s_d9dc521a887c3e::t_d634b66d7f57d3 568-589,591
+net/crates/net/tests/capability_auth_call_path.rs
+  s_d9dc521a887c3e::t_6dd898df203f95 242,248-252
+  s_d9dc521a887c3e::t_719c91002fa969 272-275,284-288
+  s_d9dc521a887c3e::t_2cfb30aee04904 357,375
+  s_d9dc521a887c3e::t_b68cbc2de956e5 418,428
+  s_d9dc521a887c3e::t_2e8a7939cb0df1 88,94
+  s_d9dc521a887c3e::t_c21eb33e633ad7 216
+  s_d9dc521a887c3e::t_8a63b412f4b090 169
+net/crates/net/tests/reflex_override.rs
+  s_d9dc521a887c3e::t_738413f83f46b2 455
+  s_d9dc521a887c3e::t_ceffa96b3f2d9f 478-479,484
+net/crates/net/src/adapter/net/mesh.rs
+  s_d9dc521a887c3e::t_7c9a65e3dd5cd8 8902-8938
+net/crates/net/tests/dataforts_blob_e2e.rs
+  s_d9dc521a887c3e::t_653df2321a0872 1036,1047
+  s_d9dc521a887c3e::t_11e5ec15d807ad 624-625
+  s_d9dc521a887c3e::t_8b7dae47f778b4 423
+  s_d9dc521a887c3e::t_a2636acf09a17a 656-664,668,671
+  s_d9dc521a887c3e::t_d146ded2a6362f 903,977
+  s_d9dc521a887c3e::t_701683d0419b84 474-475
+  s_d9dc521a887c3e::t_537c5f031648b5 458-461
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_d9dc521a887c3e::t_338660311f97c2 289
+net/crates/net/tests/subnet_enforcement.rs
+  s_d9dc521a887c3e::t_434c5de8b28352 166
+  s_d9dc521a887c3e::t_4056b2cc4df1a4 257
+net/crates/net/tests/send_subprotocol_malformed.rs
+  s_d9dc521a887c3e::t_4bf8c82e4839dd 352,363
+  s_d9dc521a887c3e::t_84d622d57a75a1 302
+net/crates/net/tests/dataforts_gravity_e2e.rs
+  s_d9dc521a887c3e::t_16589a6e71acb9 185-192
+  s_d9dc521a887c3e::t_fc4f64c2eb1fb9 258-266
+net/crates/net/tests/channel_auth.rs
+  s_d9dc521a887c3e::t_bde620d080c57c 120
+net/crates/net/tests/channel_auth_hardening.rs
+  s_d9dc521a887c3e::t_9451c68a9f79d1 211,369,467,606
+net/crates/net/tests/peer_death_clears_capability_index.rs
+  s_d9dc521a887c3e::t_554e1926e4c981 162
+  s_d9dc521a887c3e::t_37e7a4f87be7dc 188,196-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "6f4d6b734464bfe7e006a807f36cf8ae769619f6",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
