@@ -1,0 +1,24 @@
+net/crates/net/docs/plans/SCALING_MULTIFOLD_PLAN.md
+  s_947eb728f006db::t_49a7fc32b0ea31 726,728,730,734
+  s_947eb728f006db::t_482db368c576c2 328
+  s_947eb728f006db::t_443c48e31034d4 5
+  s_947eb728f006db::t_c30b1dc7fab15c 439
+  s_947eb728f006db::t_de768277299813 661,663,666-668,673-674,676,678,681-682,687-688
+  s_947eb728f006db::t_899075fac78a6e 716
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "fc2eb82c97d7aa15b1efd6a18fa80bac5140664e",
+  "prompts": {},
+  "sessions": {
+    "s_947eb728f006db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fe2a7b6-f937-436c-8c36-6580a8be4344",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
