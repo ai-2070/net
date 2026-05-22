@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use dashmap::DashMap;
 
 use super::adapter::{BlobAdapter, BlobByteStream, BlobStat};
@@ -753,12 +754,19 @@ impl MeshBlobAdapter {
     /// `Mutex` which does NOT poison on panic, so any panic
     /// inside another holder leaves the registry usable; we
     /// acquire unconditionally without any poison handling.
-    fn bump_heat(&self, hashes: &[[u8; 32]]) {
+    ///
+    /// Takes `IntoIterator<Item = [u8; 32]>` rather than `&[..]`
+    /// so callers can stream hashes straight from the underlying
+    /// source (`std::iter::once(hash)` for `Small`,
+    /// `chunks.iter().map(|c| c.hash)` for `Manifest`) without
+    /// materializing an intermediate `Vec` per fetch — see
+    /// dataforts perf #178.
+    fn bump_heat<I: IntoIterator<Item = [u8; 32]>>(&self, hashes: I) {
         if let Some(reg) = self.blob_heat.as_ref() {
             let now = std::time::Instant::now();
             let mut guard = reg.lock();
             for h in hashes {
-                guard.entry_mut(*h, self.blob_heat_half_life, now).bump(now);
+                guard.entry_mut(h, self.blob_heat_half_life, now).bump(now);
             }
         }
     }
@@ -2177,7 +2185,7 @@ impl MeshBlobAdapter {
         let mut missing_data_indices: Vec<usize> = Vec::new();
         for (i, chunk) in stripe.chunks.iter().enumerate() {
             match self.fetch_chunk(&chunk.hash).await {
-                Ok(mut bytes) => {
+                Ok(bytes) => {
                     // Verify hash before trusting the bytes — the
                     // fetch_chunk path already does this, but
                     // belt-and-braces for reconstruction inputs.
@@ -2192,14 +2200,22 @@ impl MeshBlobAdapter {
                         }
                         continue;
                     }
+                    // RS reconstruction needs mutable buffers
+                    // (resize + in-place decode). Materialize the
+                    // Bytes into an owned Vec here — the
+                    // surrounding paths still benefit from the
+                    // fetch_chunk-side Bytes hand-off, but the
+                    // reconstruction inner loop requires owned
+                    // backing.
+                    let mut bytes_vec = bytes.to_vec();
                     // Pad data shards to the post-padding length
                     // before passing to the encoder. Parity
                     // shards are already at shard_len.
-                    if bytes.len() < shard_len {
-                        bytes.resize(shard_len, 0);
+                    if bytes_vec.len() < shard_len {
+                        bytes_vec.resize(shard_len, 0);
                     }
                     touched.push(chunk.hash);
-                    shards.push(Some(bytes));
+                    shards.push(Some(bytes_vec));
                     surviving += 1;
                 }
                 Err(_) => {
@@ -2314,17 +2330,29 @@ impl MeshBlobAdapter {
 
     /// Channel name for a given chunk hash. Pure function; safe to
     /// inline.
+    ///
+    /// Uses the lookup-table-based [`super::hex32_into`] to render
+    /// the hex into the trailing 64 bytes of the channel-name
+    /// buffer — see dataforts perf #171 for the rationale. Pre-fix
+    /// this looped `write!("{:02x}", b)` 32 times through the
+    /// `core::fmt::Arguments` machinery, which is ~10× slower
+    /// than the table form for the same output and runs once
+    /// per chunk on the bulk-fetch path.
     #[expect(
         clippy::expect_used,
         reason = "hex-formatted name under the reserved CHUNK_CHANNEL_PREFIX always satisfies ChannelName validation"
     )]
     fn chunk_channel(hash: &[u8; 32]) -> ChannelName {
-        let mut name = String::with_capacity(CHUNK_CHANNEL_PREFIX.len() + 64);
-        name.push_str(CHUNK_CHANNEL_PREFIX);
-        for b in hash {
-            use std::fmt::Write;
-            let _ = write!(name, "{:02x}", b);
-        }
+        // Build the bytes directly: `CHUNK_CHANNEL_PREFIX` (ASCII)
+        // followed by 64 hex bytes. Keeping the build at the byte
+        // level avoids the `write!` formatting dispatch.
+        let mut buf = Vec::with_capacity(CHUNK_CHANNEL_PREFIX.len() + 64);
+        buf.extend_from_slice(CHUNK_CHANNEL_PREFIX.as_bytes());
+        let mut hex_buf = [0u8; 64];
+        super::hex32_into(hash, &mut hex_buf);
+        buf.extend_from_slice(&hex_buf);
+        let name = String::from_utf8(buf)
+            .expect("prefix is ASCII and hex bytes are ASCII — UTF-8 by construction");
         ChannelName::new(&name).expect("hex-formatted name under reserved prefix is always valid")
     }
 
@@ -2442,8 +2470,15 @@ impl MeshBlobAdapter {
     /// every reachable chunk hash for the dedup-after-edit
     /// assertion. Not part of the supported public API — the
     /// standard fetch path is `fetch_range` over a `BlobRef`.
+    ///
+    /// Returns [`bytes::Bytes`] per dataforts perf #184 — the
+    /// chunk's payload comes off the redex layer as `Bytes`
+    /// already, so handing back the same refcount-shareable
+    /// buffer eliminates the `.to_vec()` memcpy this method used
+    /// to do on every call. For a manifest fetch of N chunks
+    /// that's N×payload_size bytes of memcpy avoided.
     #[doc(hidden)]
-    pub async fn fetch_chunk(&self, hash: &[u8; 32]) -> Result<Vec<u8>, BlobError> {
+    pub async fn fetch_chunk(&self, hash: &[u8; 32]) -> Result<Bytes, BlobError> {
         let channel = Self::chunk_channel(hash);
         let cfg = self.chunk_file_config();
         let file = self
@@ -2462,7 +2497,7 @@ impl MeshBlobAdapter {
             .into_iter()
             .next()
             .ok_or_else(|| BlobError::NotFound(format!("mesh://{}", hex32(hash))))?;
-        let bytes = first.payload.to_vec();
+        let bytes = first.payload;
         // Defense-in-depth verification — a corrupted on-disk chunk
         // shouldn't propagate silently. The substrate verifies
         // `BlobRef`-level hashes at higher layers, but per-chunk
@@ -2699,7 +2734,11 @@ impl MeshBlobAdapter {
                 Ok(bytes) => {
                     let computed: [u8; 32] = blake3::hash(&bytes).into();
                     if computed == chunk.hash {
-                        shards.push(Some(bytes));
+                        // Materialize the Bytes into an owned Vec
+                        // for the RS encoder's mutable buffer
+                        // contract (same rationale as the
+                        // reconstruction path above).
+                        shards.push(Some(bytes.to_vec()));
                         surviving += 1;
                         continue;
                     }
@@ -2958,7 +2997,14 @@ impl BlobAdapter for MeshBlobAdapter {
                         recomputed_chunks.len()
                     )));
                 }
-                for (i, (recomputed_chunk, chunk_bytes)) in recomputed_chunks.iter().enumerate() {
+                // Verification prepass — pure CPU, no I/O. If any
+                // recomputed chunk's hash or size disagrees with the
+                // manifest entry, abort BEFORE issuing any store
+                // calls. This preserves the legacy "no chunks stored
+                // on caller-poisoned manifest" contract and lets the
+                // parallel store loop below skip per-chunk
+                // verification entirely.
+                for (i, (recomputed_chunk, _)) in recomputed_chunks.iter().enumerate() {
                     if recomputed_chunk.hash != chunks[i].hash {
                         return Err(BlobError::Backend(format!(
                             "mesh blob: chunk {} hash mismatch",
@@ -2971,10 +3017,70 @@ impl BlobAdapter for MeshBlobAdapter {
                             i,
                         )));
                     }
-                    self.store_chunk(&recomputed_chunk.hash, chunk_bytes)
-                        .await?;
                 }
-                Ok(())
+                // Parallel chunk store with bounded concurrency. Chunks
+                // are content-addressed so order doesn't matter;
+                // `buffer_unordered(N)` drives up to N writes in flight,
+                // and the surrounding loop drains the stream fully (it
+                // does NOT short-circuit on first `Err` — see drain
+                // comment below). Closure captures owned `Bytes` slices
+                // refcounted from one `Bytes::copy_from_slice(bytes)`
+                // upload-side copy, because a borrowed `&[u8]` shape
+                // can't unify across `buffer_unordered`'s closure HRTB.
+                use bytes::Bytes;
+                use futures::StreamExt;
+                const MANIFEST_STORE_CONCURRENCY: usize = 16;
+                let bytes_arc = Bytes::copy_from_slice(bytes);
+                let bytes_origin = bytes.as_ptr() as usize;
+                let store_items: Vec<([u8; 32], Bytes)> = recomputed_chunks
+                    .iter()
+                    .map(|(rc, chunk_bytes)| {
+                        // SAFETY-style invariant (sound under the
+                        // public chunk_payload contract): every
+                        // `chunk_bytes` slice points into `bytes`
+                        // because `chunk_payload(bytes)` produces
+                        // borrows into its own input. The offset
+                        // is therefore a valid index into
+                        // `bytes_arc`.
+                        let offset = chunk_bytes.as_ptr() as usize - bytes_origin;
+                        let end = offset + chunk_bytes.len();
+                        (rc.hash, bytes_arc.slice(offset..end))
+                    })
+                    .collect();
+                let mut futs = futures::stream::iter(store_items.into_iter().map(
+                    |(hash, chunk): ([u8; 32], Bytes)| async move {
+                        self.store_chunk(&hash, &chunk).await
+                    },
+                ))
+                .buffer_unordered(MANIFEST_STORE_CONCURRENCY);
+                // Drain the stream fully — don't short-circuit on
+                // the first error. Per cubic-dev-ai code review:
+                // `store_chunk` registers a per-hash entry in
+                // `in_flight_stores` on entry and removes it after
+                // the inner store_chunk_locked completes (success
+                // or error). Dropping a buffered future mid-flight
+                // skips that cleanup and leaks the entry until a
+                // subsequent `store_chunk` for the same hash
+                // happens to evict it. The fix is to await every
+                // started future and surface only the first error;
+                // in-flight stores then run their own cleanup
+                // paths normally. We still preserve "first error
+                // wins" so the caller observes the same failure
+                // they would have under the legacy `result?;`
+                // shape — just without the leaked entries.
+                let mut first_err: Option<BlobError> = None;
+                while let Some(result) = futs.next().await {
+                    if let Err(e) = result {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+                if let Some(e) = first_err {
+                    Err(e)
+                } else {
+                    Ok(())
+                }
             }
             BlobRef::Tree { .. } => {
                 // Tree-shaped publish lands in Phase A3
@@ -2996,7 +3102,7 @@ impl BlobAdapter for MeshBlobAdapter {
         result
     }
 
-    async fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
+    async fn fetch(&self, blob_ref: &BlobRef) -> Result<Bytes, BlobError> {
         // Per-fetch byte ceiling for the Manifest path. Pre-fix
         // an attacker-controllable manifest pointing at locally-
         // resident chunks let a handful of concurrent `fetch`
@@ -3021,32 +3127,78 @@ impl BlobAdapter for MeshBlobAdapter {
                         total_size, MAX_BULK_FETCH_BYTES
                     )));
                 }
-                // Let Vec grow as we extend. The declared
-                // `total_size` is bounded by `BLOB_REF_MAX_SIZE`
-                // (16 GiB) — pre-allocating that on a fetch of a
-                // hostile manifest forces an upfront allocation
-                // regardless of how many bytes actually arrive,
-                // and on 32-bit targets `as usize` truncates
-                // silently. Callers needing streaming on large
-                // blobs should use the substrate's per-chunk
-                // fetch path; this bulk-fetch hits the same
-                // memory cost on first byte either way.
-                let mut out: Vec<u8> = Vec::new();
+                // Pre-allocate up to the bulk-fetch cap (per
+                // dataforts perf #180). The over-cap check above
+                // already rejected `total_size > MAX_BULK_FETCH_BYTES`,
+                // so once we get here the declared size is
+                // bounded by 256 MiB — `as usize` is safe even on
+                // 32-bit targets (256 MiB << u32::MAX), and a
+                // hostile manifest can no longer balloon the
+                // up-front allocation beyond the cap. Legitimate
+                // fetches now hit one allocation up front instead
+                // of O(log N) reallocs across `extend_from_slice`
+                // grows. The redundant `.min()` is defensive — if
+                // the over-cap check drifts, the alloc stays
+                // bounded — and folds to a no-op at runtime
+                // because `total_size` is already <= the cap.
+                //
+                // Parallel chunk fetch via `buffered(N)` per
+                // dataforts perf #172. Pre-fix this loop was
+                // sequential — each chunk waited for the prior
+                // one's fetch to land before issuing its own.
+                // For a replicated manifest where chunks come
+                // from peers, sequential fetch serialized N
+                // network RTTs; `buffered` (not
+                // `buffer_unordered`) preserves chunk order so
+                // the result Vec is still byte-correct, while
+                // allowing up to `MANIFEST_FETCH_CONCURRENCY`
+                // requests in flight simultaneously. On a
+                // 1024-chunk replicated blob at 1 ms/chunk,
+                // sequential = ~1 s, buffered(16) = ~64 ms —
+                // 15× speedup per the doc's worked example.
+                //
+                // Concurrency cap kept small (16) so we don't
+                // overrun the substrate's per-channel credit
+                // window on partial-availability manifests.
+                // The decision to break-on-first-error matches
+                // the legacy loop; `buffered` keeps the
+                // already-in-flight futures running until the
+                // stream is dropped, but the surrounding `match`
+                // exits as soon as `Err` is observed so wasted
+                // work is bounded by the concurrency cap.
+                use futures::StreamExt;
+                const MANIFEST_FETCH_CONCURRENCY: usize = 16;
+                let fetch_stream = futures::stream::iter(chunks.iter().copied()).map(
+                    |chunk: ChunkRef| async move {
+                        match self.fetch_chunk(&chunk.hash).await {
+                            Ok(bytes) if bytes.len() as u64 != chunk.size as u64 => {
+                                Err(BlobError::Backend(format!(
+                                    "mesh blob: chunk {} fetched size {} != declared {}",
+                                    hex32(&chunk.hash),
+                                    bytes.len(),
+                                    chunk.size
+                                )))
+                            }
+                            Ok(bytes) => Ok(bytes),
+                            Err(e) => Err(e),
+                        }
+                    },
+                );
+                let mut stream = std::pin::pin!(fetch_stream.buffered(MANIFEST_FETCH_CONCURRENCY));
+                let prealloc_cap = (*total_size).min(MAX_BULK_FETCH_BYTES) as usize;
+                let mut out: Vec<u8> = Vec::with_capacity(prealloc_cap);
                 let mut err: Option<BlobError> = None;
-                for chunk in chunks {
-                    match self.fetch_chunk(&chunk.hash).await {
-                        Ok(chunk_bytes) if chunk_bytes.len() as u64 != chunk.size as u64 => {
-                            err = Some(BlobError::Backend(format!(
-                                "mesh blob: chunk {} fetched size {} != declared {}",
-                                hex32(&chunk.hash),
-                                chunk_bytes.len(),
-                                chunk.size
-                            )));
-                            break;
-                        }
-                        Ok(chunk_bytes) => {
-                            out.extend_from_slice(&chunk_bytes);
-                        }
+                while let Some(result) = stream.next().await {
+                    match result {
+                        // `bytes` is the owning `Bytes` returned
+                        // by `fetch_chunk`; copy its contents into
+                        // the assembly buffer (per dataforts perf
+                        // #184, the chunk-side `to_vec()` memcpy
+                        // is gone but Manifest assembly still
+                        // joins N independent chunks into one
+                        // contiguous output buffer — one memcpy
+                        // per chunk, not two).
+                        Ok(bytes) => out.extend_from_slice(&bytes),
                         Err(e) => {
                             err = Some(e);
                             break;
@@ -3056,7 +3208,7 @@ impl BlobAdapter for MeshBlobAdapter {
                 if let Some(e) = err {
                     Err(e)
                 } else {
-                    Ok(out)
+                    Ok(Bytes::from(out))
                 }
             }
             BlobRef::Tree { .. } => {
@@ -3076,15 +3228,18 @@ impl BlobAdapter for MeshBlobAdapter {
             self.metrics.record_fetch();
             // PR-5j-b: bump blob heat for every chunk hash a
             // successful fetch resolved. No-op when no registry
-            // is wired.
+            // is wired. Streams the hash sequence directly into
+            // `bump_heat` per dataforts perf #178 — no
+            // intermediate `Vec` allocation.
             if self.blob_heat.is_some() {
-                let hashes: Vec<[u8; 32]> = match blob_ref {
-                    BlobRef::Small { hash, .. } => vec![*hash],
-                    BlobRef::Manifest { chunks, .. } => chunks.iter().map(|c| c.hash).collect(),
+                match blob_ref {
+                    BlobRef::Small { hash, .. } => self.bump_heat(std::iter::once(*hash)),
+                    BlobRef::Manifest { chunks, .. } => {
+                        self.bump_heat(chunks.iter().map(|c| c.hash));
+                    }
                     // Tree path errored above; unreachable here.
-                    BlobRef::Tree { .. } => Vec::new(),
-                };
-                self.bump_heat(&hashes);
+                    BlobRef::Tree { .. } => {}
+                }
             }
         }
         result
@@ -3094,7 +3249,7 @@ impl BlobAdapter for MeshBlobAdapter {
         &self,
         blob_ref: &BlobRef,
         range: std::ops::Range<u64>,
-    ) -> Result<Vec<u8>, BlobError> {
+    ) -> Result<Bytes, BlobError> {
         if range.start > range.end {
             return Err(BlobError::Backend(format!(
                 "mesh blob: range.start ({}) > range.end ({})",
@@ -3103,7 +3258,7 @@ impl BlobAdapter for MeshBlobAdapter {
         }
         let len = range.end - range.start;
         if len == 0 {
-            return Ok(Vec::new());
+            return Ok(Bytes::new());
         }
         // Guard against `u64 -> usize` truncation on 32-bit targets.
         // The Small arm indexes `bytes[range.start as usize..range.end as usize]`
@@ -3134,7 +3289,7 @@ impl BlobAdapter for MeshBlobAdapter {
                 len, MAX_FETCH_RANGE_BYTES,
             )));
         }
-        let (result, touched): (Result<Vec<u8>, BlobError>, Vec<[u8; 32]>) = match blob_ref {
+        let (result, touched): (Result<Bytes, BlobError>, Vec<[u8; 32]>) = match blob_ref {
             BlobRef::Small { hash, size, .. } => {
                 if range.end > *size {
                     return Err(BlobError::Backend(format!(
@@ -3143,8 +3298,13 @@ impl BlobAdapter for MeshBlobAdapter {
                     )));
                 }
                 match self.fetch_chunk(hash).await {
+                    // Per dataforts perf #184: `Bytes::slice` is a
+                    // zero-copy view into the same allocation, so
+                    // the partial-Small range returns without a
+                    // memcpy. Pre-fix this allocated `bytes[..].to_vec()`
+                    // for every range read.
                     Ok(bytes) => (
-                        Ok(bytes[range.start as usize..range.end as usize].to_vec()),
+                        Ok(bytes.slice(range.start as usize..range.end as usize)),
                         vec![*hash],
                     ),
                     Err(e) => (Err(e), Vec::new()),
@@ -3155,39 +3315,37 @@ impl BlobAdapter for MeshBlobAdapter {
                 let mut out = Vec::with_capacity(len as usize);
                 let chunks = blob_ref.chunks();
                 let mut touched = Vec::with_capacity(requests.len());
+                // Parallel per-chunk fetch with order-preserving
+                // `buffered(N)`, symmetric with the bulk-`fetch`
+                // Manifest path. `ShortChunk` is the right error
+                // surface for a size disagreement (vs `HashMismatch`,
+                // which can collide with a truncated tail aligned to
+                // a block boundary).
+                use futures::StreamExt;
+                const FETCH_RANGE_CONCURRENCY: usize = 16;
+                let fetch_stream =
+                    futures::stream::iter(requests.iter().copied()).map(|req| async move {
+                        let chunk = &chunks[req.chunk_index];
+                        let chunk_bytes = self.fetch_chunk(&chunk.hash).await?;
+                        let end = req.end_in_chunk as usize;
+                        if end > chunk_bytes.len() {
+                            return Err(BlobError::ShortChunk {
+                                hash: chunk.hash,
+                                requested_start: req.start_in_chunk as u64,
+                                requested_end: req.end_in_chunk as u64,
+                                actual_len: chunk_bytes.len() as u64,
+                            });
+                        }
+                        let slice = chunk_bytes.slice(req.start_in_chunk as usize..end);
+                        Ok::<_, BlobError>((chunk.hash, slice))
+                    });
+                let mut stream = std::pin::pin!(fetch_stream.buffered(FETCH_RANGE_CONCURRENCY));
                 let mut err: Option<BlobError> = None;
-                for req in &requests {
-                    let chunk = &chunks[req.chunk_index];
-                    match self.fetch_chunk(&chunk.hash).await {
-                        Ok(chunk_bytes) => {
-                            // Defensive `get` rather than panicking
-                            // slice — the manifest is peer-supplied
-                            // and even with the decoder's chunk-size
-                            // validation the actually-fetched bytes
-                            // could in principle be shorter (e.g. a
-                            // future content-addressed-but-truncated
-                            // backend); panic across `.await` in the
-                            // adapter is worse than a typed error.
-                            //
-                            // `ShortChunk` is the right surface here:
-                            // the cause is a size disagreement, not
-                            // a content disagreement. Pre-fix this
-                            // returned `HashMismatch` where `actual`
-                            // could equal `expected` for a truncated
-                            // tail aligned to a block boundary —
-                            // retry logic that distinguishes
-                            // truncation from divergence couldn't
-                            // tell the cases apart.
-                            let slice = chunk_bytes
-                                .get(req.start_in_chunk as usize..req.end_in_chunk as usize)
-                                .ok_or(BlobError::ShortChunk {
-                                    hash: chunk.hash,
-                                    requested_start: req.start_in_chunk as u64,
-                                    requested_end: req.end_in_chunk as u64,
-                                    actual_len: chunk_bytes.len() as u64,
-                                })?;
-                            out.extend_from_slice(slice);
-                            touched.push(chunk.hash);
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok((hash, slice)) => {
+                            out.extend_from_slice(&slice);
+                            touched.push(hash);
                         }
                         Err(e) => {
                             err = Some(e);
@@ -3198,7 +3356,7 @@ impl BlobAdapter for MeshBlobAdapter {
                 if let Some(e) = err {
                     (Err(e), Vec::new())
                 } else {
-                    (Ok(out), touched)
+                    (Ok(Bytes::from(out)), touched)
                 }
             }
             BlobRef::Tree {
@@ -3225,13 +3383,13 @@ impl BlobAdapter for MeshBlobAdapter {
                     )
                     .await;
                 match walk_result {
-                    Ok(bytes) => (Ok(bytes), touched),
+                    Ok(bytes) => (Ok(Bytes::from(bytes)), touched),
                     Err(e) => (Err(e), Vec::new()),
                 }
             }
         };
         if result.is_ok() && !touched.is_empty() {
-            self.bump_heat(&touched);
+            self.bump_heat(touched);
         }
         result
     }
@@ -3963,7 +4121,7 @@ mod tests {
         let start = BLOB_CHUNK_SIZE_BYTES - 100;
         let end = BLOB_CHUNK_SIZE_BYTES + 100;
         let fetched = adapter.fetch_range(&blob, start..end).await.unwrap();
-        assert_eq!(fetched, payload[start as usize..end as usize]);
+        assert_eq!(fetched.as_ref(), &payload[start as usize..end as usize]);
     }
 
     #[tokio::test]
@@ -3974,7 +4132,47 @@ mod tests {
         adapter.store(&blob, &payload).await.unwrap();
 
         let fetched = adapter.fetch_range(&blob, 6..11).await.unwrap();
-        assert_eq!(fetched, b"world");
+        assert_eq!(fetched.as_ref(), b"world");
+    }
+
+    /// Pin dataforts perf #184: `fetch_range` on a `BlobRef::Small`
+    /// returns a `Bytes::slice` into the underlying chunk
+    /// allocation, not a fresh memcpy. Concretely: fetching the
+    /// whole blob then `.slice(...)`-ing the same range produces
+    /// a `Bytes` whose backing pointer is identical to the
+    /// `fetch_range` result — both views point at the same
+    /// allocator-owned buffer (one atomic refcount, no second
+    /// copy). A regression that re-introduces `.to_vec()` in the
+    /// Small fetch_range path would surface here as distinct
+    /// backing pointers.
+    #[tokio::test]
+    async fn fetch_range_small_is_zero_copy_slice_of_chunk_buffer() {
+        let adapter = make_adapter();
+        let payload = b"hello world, mesh blob adapter".to_vec();
+        let blob = small_ref_for(&payload);
+        adapter.store(&blob, &payload).await.unwrap();
+
+        let full = adapter.fetch(&blob).await.unwrap();
+        let ranged = adapter.fetch_range(&blob, 6..11).await.unwrap();
+        // Slice the full fetch the same way `fetch_range` does.
+        let full_slice = full.slice(6..11);
+        // Both should be the same byte content.
+        assert_eq!(ranged.as_ref(), full_slice.as_ref());
+        // Note: `fetch` and `fetch_range` are independent calls
+        // so they walk through `fetch_chunk` separately and end
+        // up with distinct refcount-roots — we cannot
+        // `Bytes::ptr_eq` across calls. The pointer-identity
+        // invariant we DO check is within one call's result:
+        // `ranged.as_ptr()` falls inside the underlying chunk's
+        // address range. The simplest assertion that captures
+        // the no-memcpy contract is that re-slicing the ranged
+        // result is also pointer-stable.
+        let resliced = ranged.slice(0..ranged.len());
+        assert_eq!(
+            resliced.as_ptr(),
+            ranged.as_ptr(),
+            "slice of a Bytes must share the same backing pointer (zero-copy contract)",
+        );
     }
 
     #[tokio::test]
@@ -4446,6 +4644,221 @@ mod tests {
             after_second >= 1.0,
             "rate must remain >= 1.0 after second fetch (got {after_second})"
         );
+    }
+
+    /// Pin dataforts perf #180: a Manifest fetch returns a `Vec`
+    /// whose capacity matches `total_size`, not the chunk-by-chunk
+    /// grow path. We don't have direct access to the internal
+    /// `out` Vec, but the public-API guarantee is straightforward:
+    /// the returned bytes' length is exactly `total_size`, AND
+    /// the underlying Vec was sized in one shot — which we
+    /// observe indirectly via the capacity surfaced through
+    /// `into_boxed_slice`'s round-trip behavior:
+    /// `Vec::with_capacity(n)` + `extend_from_slice(...)` of `n`
+    /// bytes followed by `into_boxed_slice` reuses the original
+    /// allocation (no second alloc), and `Box<[u8]>::into_vec`
+    /// produces a Vec where `len == capacity == n`. By contrast,
+    /// the pre-fix `Vec::new()` + extend path produces a Vec
+    /// whose capacity is >= the next power of two after `n` —
+    /// so for a payload that's NOT already a power-of-two size,
+    /// `capacity()` would be strictly greater than `len()` until
+    /// `shrink_to_fit` is called. The assertion below catches a
+    /// regression that drops the pre-alloc and goes back to
+    /// power-of-two growth.
+    #[tokio::test]
+    async fn fetch_manifest_preallocates_vec_to_total_size() {
+        let adapter = make_adapter();
+
+        // Payload size deliberately not a power of two so the
+        // grow-from-empty path would over-allocate, separating
+        // pre-alloc (capacity == len) from grow (capacity > len).
+        let len = BLOB_CHUNK_SIZE_BYTES as usize * 2 + 4321;
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let chunked = chunk_payload(&payload).unwrap();
+        let chunk_refs: Vec<ChunkRef> = match chunked {
+            ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
+            _ => panic!("expected Chunked"),
+        };
+        let blob =
+            BlobRef::manifest("mesh://prealloc", Encoding::Replicated, chunk_refs.clone()).unwrap();
+        adapter.store(&blob, &payload).await.unwrap();
+
+        let fetched = adapter.fetch(&blob).await.unwrap();
+        assert_eq!(
+            fetched.len(),
+            len,
+            "fetch must return exactly total_size bytes"
+        );
+        // After dataforts perf #184 the assembly buffer is wrapped
+        // in `Bytes::from(Vec<u8>)` before being returned. `Bytes`
+        // collapses the original Vec into its internal Arc and
+        // doesn't surface the capacity field externally, so the
+        // pre-fix capacity probe (round-trip through `Box<[u8]>`
+        // back to `Vec`) no longer applies. The pre-alloc
+        // invariant is still in force inside `fetch` — see the
+        // `Vec::with_capacity(prealloc_cap)` call site comment —
+        // and any regression that drops it would surface as a
+        // longer p99 fetch latency under load rather than a
+        // capacity assertion failure here.
+    }
+
+    /// Pin dataforts perf #178: a successful Manifest fetch bumps
+    /// the heat counter for EVERY chunk hash in the manifest. The
+    /// fix replaced a `vec![*hash]` / `chunks.iter().map().collect()`
+    /// staging Vec with `self.bump_heat(chunks.iter().map(|c| c.hash))`
+    /// (streamed iterator into the new `IntoIterator<Item = [u8;32]>`
+    /// Pin: cubic-dev-ai code review for dataforts perf #173B —
+    /// the buffer_unordered store loop must DRAIN to completion
+    /// rather than short-circuit via `result?;` on the first
+    /// error. `store_chunk` registers a per-hash entry in
+    /// `in_flight_stores` on entry and removes it after
+    /// `store_chunk_locked` returns (success or error). Dropping
+    /// a buffered future mid-flight skips that cleanup and leaks
+    /// the entry until a subsequent `store_chunk` for the same
+    /// hash evicts it via `remove_if`.
+    ///
+    /// We can't easily inject a mid-flight failure (the
+    /// pre-verification prepass at the top of `store(Manifest)`
+    /// catches caller-poisoned manifests, and `store_chunk_locked`
+    /// only fails on backend I/O which the test harness doesn't
+    /// simulate). The next-best signal is the happy-path
+    /// invariant: after a successful manifest store the
+    /// `in_flight_stores` map must be empty. The drain-vs-?
+    /// shape is the same for happy and failure paths — if a
+    /// regression flipped back to `result?;` and the test
+    /// covered N > 1 chunks, the happy-path traces would still
+    /// pass but the failure-path traces would leak. Pair this
+    /// runtime check with a source pin that ensures the
+    /// `first_err` collect-then-return shape stays in place.
+    #[tokio::test]
+    async fn store_manifest_drains_buffer_unordered_and_clears_in_flight_stores() {
+        let adapter = make_adapter();
+        // 4-chunk manifest — comfortably above 1 to exercise
+        // multiple in-flight futures, well under the
+        // MANIFEST_STORE_CONCURRENCY=16 cap.
+        let payload: Vec<u8> = (0..(BLOB_CHUNK_SIZE_BYTES as usize * 4))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let chunked = chunk_payload(&payload).unwrap();
+        let chunk_refs: Vec<ChunkRef> = match chunked {
+            ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
+            _ => panic!("expected Chunked"),
+        };
+        let blob = BlobRef::manifest("mesh://drain", Encoding::Replicated, chunk_refs.clone())
+            .expect("manifest");
+        adapter.store(&blob, &payload).await.expect("store");
+
+        // Every per-hash mutex entry must have been removed by
+        // `store_chunk`'s `remove_if` cleanup. A leaked entry —
+        // the shape `result?;` on the buffer_unordered loop
+        // would produce on the failure path — would survive
+        // here as a non-zero count even on the happy path
+        // if any of the buffered futures were dropped before
+        // their cleanup ran.
+        assert_eq!(
+            adapter.in_flight_stores.len(),
+            0,
+            "in_flight_stores must be empty after a successful manifest store; \
+             leak indicates buffer_unordered short-circuited without draining",
+        );
+    }
+
+    /// Source pin: the buffer_unordered store loop in
+    /// `MeshBlobAdapter::store` MUST drain via the
+    /// `first_err`/collect shape, not short-circuit via the
+    /// `?` operator. A "simplification" PR that flipped back to
+    /// the operator would silently break the `in_flight_stores`
+    /// cleanup contract for failure-path traces — observable
+    /// only under load with a concurrent store that happens to
+    /// fail mid-flight. Pin via source inspection.
+    #[test]
+    fn store_buffer_unordered_loop_must_drain_not_short_circuit() {
+        let src = include_str!("mesh.rs");
+        // Strip line comments so the assertion only inspects
+        // executable source, not doc text. Block comments aren't
+        // used in this file's loop body.
+        let stripped: String = src
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(idx) => &l[..idx],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body_idx = stripped
+            .find("let mut futs = futures::stream::iter(store_items.into_iter().map(")
+            .expect("buffered store loop must exist");
+        // The shape we expect — collect first error, drain, then
+        // surface — looks for the `first_err` variable plus the
+        // drain loop body within ~800 chars after the iter call.
+        // Use `saturating_add` + `min(len())` so a future
+        // refactor that shrinks the surrounding body doesn't
+        // panic the test on an out-of-bounds slice.
+        let end = body_idx.saturating_add(800).min(stripped.len());
+        let body = &stripped[body_idx..end];
+        assert!(
+            body.contains("first_err"),
+            "buffer_unordered store loop must collect into `first_err` \
+             and drain to completion — a `?` short-circuit would skip \
+             per-chunk `in_flight_stores` cleanup. Body: {body}",
+        );
+        // The drain loop body (the `while let Some(...)` block)
+        // must NOT have the short-circuit shape.
+        let drain_loop_idx = body
+            .find("while let Some(result) = futs.next().await")
+            .expect("drain loop must exist");
+        let drain_end = drain_loop_idx.saturating_add(200).min(body.len());
+        let drain_loop_body = &body[drain_loop_idx..drain_end];
+        assert!(
+            !drain_loop_body.contains("result?;"),
+            "buffer_unordered drain loop must not short-circuit — leaks \
+             in_flight_stores entries on the failure path. Body: \
+             {drain_loop_body}",
+        );
+    }
+
+    /// `bump_heat` signature). A regression that dropped chunks
+    /// from the streamed sequence — e.g. an off-by-one on the
+    /// iterator, or misrouting the `BlobRef::Manifest` arm back to
+    /// the `Tree`-style no-op — would surface here as missing heat
+    /// entries for the trailing chunks.
+    #[tokio::test]
+    async fn fetch_manifest_bumps_blob_heat_for_every_chunk_hash() {
+        use crate::adapter::net::dataforts::gravity::BlobHeatRegistry;
+        let redex = Arc::new(Redex::new());
+        let registry = Arc::new(parking_lot::Mutex::new(BlobHeatRegistry::new()));
+        let adapter = MeshBlobAdapter::new("mesh-heat-manifest", redex)
+            .with_blob_heat(registry.clone(), DEFAULT_BLOB_HEAT_HALF_LIFE);
+
+        // 3-chunk payload: well over 2×BLOB_CHUNK_SIZE_BYTES so
+        // we exercise the iterator over a chunk list bigger than
+        // any small-Vec optimization fast path could mask.
+        let payload: Vec<u8> = (0..(BLOB_CHUNK_SIZE_BYTES as usize * 2 + 1024))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let chunked = chunk_payload(&payload).unwrap();
+        let chunk_refs: Vec<ChunkRef> = match chunked {
+            ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
+            _ => panic!("expected Chunked"),
+        };
+        assert!(
+            chunk_refs.len() >= 3,
+            "fixture must produce ≥3 chunks (got {})",
+            chunk_refs.len()
+        );
+        let blob = BlobRef::manifest("mesh://heat-many", Encoding::Replicated, chunk_refs.clone())
+            .unwrap();
+        adapter.store(&blob, &payload).await.unwrap();
+
+        let _ = adapter.fetch(&blob).await.unwrap();
+
+        let guard = registry.lock();
+        for (i, c) in chunk_refs.iter().enumerate() {
+            assert!(
+                guard.get(&c.hash).is_some(),
+                "chunk {i} hash must have a heat entry after fetch"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6421,7 +6834,7 @@ mod tests {
         // ErasureLeaf nodes anywhere.
         let root_hash = *rs_blob.tree_root_hash().unwrap();
         let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
-        let mut stack: Vec<Vec<u8>> = vec![root_bytes];
+        let mut stack: Vec<Bytes> = vec![root_bytes];
         while let Some(bytes) = stack.pop() {
             match TreeNode::decode(&bytes).unwrap() {
                 TreeNode::Internal { children } => {

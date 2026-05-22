@@ -471,27 +471,35 @@ impl Scheduler {
         // different winners. Treat NaN as a hard veto (drop the
         // candidate) so the contract is enforceable at the
         // boundary, matching the StandardPlacement clamp behavior.
-        let mut scored: Vec<(u64, f32)> = candidates
+        // Find the max instead of sorting and taking the first
+        // element — O(N) vs O(N log N) for the N=many-candidates case
+        // that shows up in placement decisions over a large
+        // capability index. Semantics match the previous sort: the
+        // comparator returns `Greater` when `(a, sa)` should win over
+        // `(b, sb)`, which is the contract `max_by` consumes.
+        //
+        // - Score: `sa.partial_cmp(sb)` so a's larger finite score is
+        //   `Greater` and `max_by` keeps a.
+        // - Tie-break: when scores are equal, `tie_break_compare(b,
+        //   a, tie_break)` is inverted relative to the legacy sort's
+        //   `tie_break_compare(a, b, tie_break)` because `max_by`'s
+        //   "greater means winner" is the opposite of `sort_by`'s
+        //   "less means earlier." NaN is no longer reachable here
+        //   (filtered above) so `partial_cmp.unwrap_or(Equal)` is a
+        //   safety belt only — a strict total order is in force.
+        //
+        // Pinned by `pick_best_candidate_drops_nan_scores` (tie-break
+        // direction) and the BestScore tests in this module.
+        candidates
             .into_iter()
             .filter_map(|n| placement.placement_score(&n, artifact).map(|s| (n, s)))
             .filter(|(_, s)| s.is_finite())
-            .collect();
-
-        if scored.is_empty() {
-            return None;
-        }
-
-        // Highest score first; ties broken via the locked
-        // three-step ordering. NaN is no longer reachable here
-        // (filtered above), so `partial_cmp.unwrap_or(Equal)` is
-        // a safety belt only — a strict total order is now in force.
-        scored.sort_by(|(a, sa), (b, sb)| {
-            sb.partial_cmp(sa)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| tie_break_compare(*a, *b, tie_break))
-        });
-
-        scored.first().map(|(n, _)| *n)
+            .max_by(|(a, sa), (b, sb)| {
+                sa.partial_cmp(sb)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| tie_break_compare(*b, *a, tie_break))
+            })
+            .map(|(n, _)| n)
     }
 }
 

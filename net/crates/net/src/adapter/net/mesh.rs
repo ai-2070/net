@@ -2948,7 +2948,7 @@ impl MeshNode {
                         .find(|e| e.value().session.session_id() == session_id)
                         .map(|e| e.value().session.clone());
                     if let Some(session) = matching_session {
-                        Self::process_local_packet(&parsed, &session, ctx);
+                        Self::process_local_packet(parsed, &session, ctx);
                         session.touch();
                     }
                 } else {
@@ -3054,7 +3054,7 @@ impl MeshNode {
             return;
         }
 
-        Self::process_local_packet(&parsed, &session, ctx);
+        Self::process_local_packet(parsed, &session, ctx);
         session.touch();
     }
 
@@ -3373,7 +3373,7 @@ impl MeshNode {
     ///
     /// This is the same logic as `NetAdapter::process_packet` but extracted
     /// to work with the multi-session dispatch.
-    fn process_local_packet(parsed: &ParsedPacket, session: &NetSession, ctx: &DispatchCtx) {
+    fn process_local_packet(mut parsed: ParsedPacket, session: &NetSession, ctx: &DispatchCtx) {
         let inbound = &ctx.inbound;
         let num_shards = ctx.num_shards;
         // Validate payload length
@@ -3384,18 +3384,29 @@ impl MeshNode {
             return;
         }
 
-        // Decrypt payload
+        // Decrypt payload. Per crypto-session perf #128, route
+        // through `decrypt_to_bytes` which prefers the in-place
+        // path when the inbound `Bytes` has refcount == 1 (the
+        // common case for freshly-received packets — the parser
+        // produces the only outstanding handle until decrypt
+        // lands). Falls back to the allocating `decrypt` when the
+        // buffer is shared.
         let aad = parsed.header.aad();
         let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
         let rx_cipher = session.rx_cipher();
-        if !rx_cipher.is_valid_rx_counter(counter) {
-            return;
-        }
-        let decrypted = match rx_cipher.decrypt(counter, &aad, &parsed.payload) {
+        let payload = std::mem::take(&mut parsed.payload);
+        // Per crypto-session perf #132: the legacy two-step (pre-
+        // decrypt `is_valid_rx_counter` + post-decrypt
+        // `update_rx_counter`) took two parking_lot Mutex acquisitions
+        // per inbound packet. `try_admit_rx_counter` validates and
+        // commits under a single lock; replays land at admit and are
+        // rejected there (paying AEAD on the rare replay is cheaper
+        // than a redundant lock on every non-replay). AEAD failure
+        // still drops the packet before we touch the window, so a
+        // tampered counter never advances `rx_counter`.
+        let decrypted = match rx_cipher.decrypt_to_bytes(counter, &aad, payload) {
             Ok(d) => {
-                // Commit-time replay check: closes the TOCTOU race where
-                // two threads decrypt the same replayed packet concurrently.
-                if !rx_cipher.update_rx_counter(counter) {
+                if !rx_cipher.try_admit_rx_counter(counter) {
                     return;
                 }
                 d
@@ -3429,8 +3440,7 @@ impl MeshNode {
                 // silently lose every message past the first;
                 // operators need to see the protocol violation
                 // rather than a silent stall.
-                let events =
-                    EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+                let events = EventFrame::read_events(decrypted, parsed.header.event_count);
                 if events.is_empty() {
                     return;
                 }
@@ -3565,7 +3575,7 @@ impl MeshNode {
             // migration packet (protocol violation, but possible
             // on the wire) gets one reply per request rather than
             // one for the first and silent drops for the rest.
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
                 if let Some(reply) = synthesize_compute_not_supported_reply(&payload) {
                     let dest_session = ctx
@@ -3615,7 +3625,7 @@ impl MeshNode {
         // (`apply_authoritative_grant` is monotonic so retransmits
         // eventually catch up — efficiency loss, not data loss).
         if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_WINDOW {
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
                 match StreamWindow::decode(&payload) {
                     Ok(grant) => {
@@ -3655,7 +3665,7 @@ impl MeshNode {
         // independent and idempotent on the receiver, so
         // iterating is structurally safe.
         if parsed.header.subprotocol_id == SUBPROTOCOL_CHANNEL_MEMBERSHIP {
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             if events.is_empty() {
                 return;
             }
@@ -3682,7 +3692,7 @@ impl MeshNode {
         // and version-skip safe on the index side, so iterating
         // is structurally safe.
         if parsed.header.subprotocol_id == SUBPROTOCOL_CAPABILITY_ANN {
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             if events.is_empty() {
                 return;
             }
@@ -3707,7 +3717,7 @@ impl MeshNode {
         // = no replicated channels on this node = drop.
         #[cfg(feature = "redex")]
         if parsed.header.subprotocol_id == super::redex::SUBPROTOCOL_REDEX {
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             if events.is_empty() {
                 return;
             }
@@ -3747,7 +3757,7 @@ impl MeshNode {
         // replication path's behaviour for unrouted channels).
         #[cfg(feature = "meshdb")]
         if parsed.header.subprotocol_id == super::behavior::meshdb::SUBPROTOCOL_MESHDB {
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             if events.is_empty() {
                 return;
             }
@@ -3783,7 +3793,7 @@ impl MeshNode {
         #[cfg(feature = "nat-traversal")]
         if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_REFLEX {
             use super::traversal::reflex;
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             if events.is_empty() {
                 return;
             }
@@ -3874,7 +3884,7 @@ impl MeshNode {
         #[cfg(feature = "nat-traversal")]
         if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_RENDEZVOUS {
             use super::traversal::rendezvous;
-            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             if events.is_empty() {
                 return;
             }
@@ -3999,7 +4009,7 @@ impl MeshNode {
         // symmetric — the sender debits the same quantity via
         // `wire_bytes_for_payload` on admission.
         let payload_bytes = (decrypted.len() + PACKET_WIRE_OVERHEAD) as u64;
-        let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+        let events = EventFrame::read_events(decrypted, parsed.header.event_count);
 
         let stream_id = parsed.header.stream_id;
         let shard_id = if num_shards > 0 {
@@ -4142,20 +4152,34 @@ impl MeshNode {
             // mismatch; the drop here closes the loopback hole
             // without affecting production routing.
             let session_id = session.session_id();
-            let from_node = ctx
-                .addr_to_node
-                .get(&session.peer_addr())
-                .and_then(|nid| {
-                    ctx.peers.get(&*nid).and_then(|p| {
-                        (p.value().session.session_id() == session_id).then_some(*nid)
+            // Per-packet session→NodeId resolution. Fast path is a
+            // single Relaxed atomic load against the per-session
+            // cache populated by the first successful resolution;
+            // see `NetSession::cached_node_id` for the rationale
+            // (discovery-routing perf #108). Cache miss runs the
+            // legacy chain (`addr_to_node` lookup + session_id
+            // verification, then full peer scan on stale addr) and
+            // publishes the result for subsequent packets.
+            let from_node = session.cached_node_id().or_else(|| {
+                let resolved = ctx
+                    .addr_to_node
+                    .get(&session.peer_addr())
+                    .and_then(|nid| {
+                        ctx.peers.get(&*nid).and_then(|p| {
+                            (p.value().session.session_id() == session_id).then_some(*nid)
+                        })
                     })
-                })
-                .or_else(|| {
-                    ctx.peers
-                        .iter()
-                        .find(|e| e.value().session.session_id() == session_id)
-                        .map(|e| e.value().node_id)
-                });
+                    .or_else(|| {
+                        ctx.peers
+                            .iter()
+                            .find(|e| e.value().session.session_id() == session_id)
+                            .map(|e| e.value().node_id)
+                    });
+                if let Some(nid) = resolved {
+                    session.cache_node_id(nid);
+                }
+                resolved
+            });
             let Some(from_node) = from_node else {
                 tracing::warn!(
                     target: "mesh.rpc",
@@ -4495,7 +4519,7 @@ impl MeshNode {
     pub async fn send_to_peer(
         &self,
         peer_addr: SocketAddr,
-        batch: Batch,
+        batch: &Batch,
     ) -> Result<(), AdapterError> {
         // Partition filter: silently drop sends to blocked peers
         if self.partition_filter.contains(&peer_addr) {
@@ -4587,7 +4611,7 @@ impl MeshNode {
     /// Requires:
     /// - A session with `dest_node_id` (for encryption)
     /// - A route to `dest_node_id` in the routing table (for next hop)
-    pub async fn send_routed(&self, dest_node_id: u64, batch: Batch) -> Result<(), AdapterError> {
+    pub async fn send_routed(&self, dest_node_id: u64, batch: &Batch) -> Result<(), AdapterError> {
         // Find the session for the destination (needed for encryption)
         let (dest_addr, session) = self
             .peers
@@ -6497,30 +6521,28 @@ impl MeshNode {
         // `docs/misc/NRPC_DESIGN.md` open-questions.
         let mut subscribers = self.roster.dispatch_recipients(publisher.channel());
 
-        // Subnet visibility filter. Look up the channel's
-        // configured visibility; if the channel has no registry
-        // entry, fall back to `config.default_visibility` (which
-        // itself defaults to `Visibility::Global` for back-compat
-        // with simple registry-less deployments). Fleet operators
-        // who want fail-closed behavior set
+        // Subnet visibility + AuthGuard filters folded into a single
+        // `retain` pass per discovery-routing perf #105. Pre-fix the
+        // publish hot path ran two sequential `retain` passes over
+        // the same `Vec<u64>` — each walked the whole Vec and shifted
+        // elements on a drop. Folded into one pass, each peer hits
+        // its subnet + auth DashMap lookups with cache locality (no
+        // round-trip through every peer twice), the Vec is walked
+        // once not twice, and the closure short-circuits on the
+        // first rejecting predicate.
+        //
+        // Visibility filter: look up the channel's configured
+        // visibility; if the channel has no registry entry, fall
+        // back to `config.default_visibility` (which itself defaults
+        // to `Visibility::Global` for back-compat with simple
+        // registry-less deployments). Fleet operators who want
+        // fail-closed behavior set
         // `with_default_visibility(Visibility::SubnetLocal)` so
         // a forgotten registry entry confines messages to the
         // local subnet rather than leaking them mesh-wide.
         // Filtered subscribers don't show up in `attempted` or
         // `errors` — they're policy decisions, not failures.
-        let visibility = cfg_snapshot
-            .as_ref()
-            .map(|c| c.visibility)
-            .unwrap_or(self.config.default_visibility);
-        subscribers.retain(|peer_id| {
-            let peer_subnet = self
-                .peer_subnets
-                .get(peer_id)
-                .map(|e| *e.value())
-                .unwrap_or(SubnetId::GLOBAL);
-            Self::subnet_visible(self.local_subnet, peer_subnet, visibility)
-        });
-
+        //
         // AuthGuard fast path. Populated by `authorize_subscribe`;
         // revoked on unsubscribe and by the expiry sweep. Consulted
         // on every publish so revocations take effect on the next
@@ -6561,6 +6583,10 @@ impl MeshNode {
         // token-gated channels (`require_token = false` skips the
         // branch entirely). An expired subscriber is revoked inline
         // so the next publish takes the `Denied` path.
+        let visibility = cfg_snapshot
+            .as_ref()
+            .map(|c| c.visibility)
+            .unwrap_or(self.config.default_visibility);
         let channel_name = publisher.channel().name().clone();
         let channel_hash = channel_name.hash();
         let auth_guard = self.auth_guard.clone();
@@ -6569,6 +6595,18 @@ impl MeshNode {
             .map(|c| c.require_token)
             .unwrap_or(false);
         subscribers.retain(|peer_id| {
+            // (1) Subnet visibility. Cheap check first — a peer in
+            // the wrong subnet should short-circuit before any
+            // auth-cache probing.
+            let peer_subnet = self
+                .peer_subnets
+                .get(peer_id)
+                .map(|e| *e.value())
+                .unwrap_or(SubnetId::GLOBAL);
+            if !Self::subnet_visible(self.local_subnet, peer_subnet, visibility) {
+                return false;
+            }
+            // (2) Auth guard (bloom + verified cache).
             let origin = subscriber_origin_hash(*peer_id);
             let admitted = match auth_guard.check_fast(origin, channel_hash) {
                 AuthVerdict::Allowed => auth_guard.is_authorized_full(origin, &channel_name),
@@ -6588,9 +6626,10 @@ impl MeshNode {
             if !require_token {
                 return true;
             }
-            // Token-gated branch: ensure the subscriber still has a
-            // valid token. If the cache answer is "no valid token
-            // authorizes SUBSCRIBE on this channel," revoke inline.
+            // (3) Token-gated branch: ensure the subscriber still
+            // has a valid token. If the cache answer is "no valid
+            // token authorizes SUBSCRIBE on this channel," revoke
+            // inline.
             let (Some(cache), Some(entity)) = (
                 self.token_cache.as_ref(),
                 self.peer_entity_ids.get(peer_id).map(|e| e.value().clone()),
@@ -6651,9 +6690,21 @@ impl MeshNode {
             }
             OnFailure::BestEffort | OnFailure::Collect => {
                 let mut handles = Vec::with_capacity(subscribers.len());
+                // Hoist the events into an `Arc<[Bytes]>` once and
+                // clone the `Arc` per spawned task instead of
+                // calling `events.to_vec()` per peer. Pre-fix
+                // [discovery-routing perf #109 in
+                // `docs/performance/net-discovery-routing-analysis.md`]
+                // a 100-subscriber × 1000-event broadcast did 100
+                // Vec allocations + 100K `Bytes` refcount bumps;
+                // post-fix it's 1 Vec alloc + 1K `Bytes` bumps +
+                // 100 `Arc` bumps. The spawned task derefs the
+                // `Arc<[Bytes]>` to `&[Bytes]` at the
+                // `publish_to_peer` call site.
+                let events_shared: Arc<[Bytes]> = events.to_vec().into();
                 for peer_id in subscribers {
                     let permit = Arc::clone(&sem);
-                    let events_owned: Vec<Bytes> = events.to_vec();
+                    let events_for_task: Arc<[Bytes]> = Arc::clone(&events_shared);
                     let fut = async move {
                         let _permit = permit.acquire_owned().await.ok();
                         (
@@ -6663,7 +6714,7 @@ impl MeshNode {
                                 channel_hash,
                                 stream_id,
                                 reliable,
-                                &events_owned,
+                                &events_for_task,
                             )
                             .await,
                         )
@@ -9517,7 +9568,7 @@ impl Adapter for MeshNode {
         Ok(())
     }
 
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+    async fn on_batch(&self, batch: std::sync::Arc<Batch>) -> Result<(), AdapterError> {
         // Send to the first connected peer. For a real mesh, this should
         // use the routing table to pick the right peer based on the
         // event's destination. For now, round-robin or first-match.
@@ -9528,7 +9579,7 @@ impl Adapter for MeshNode {
             .map(|e| e.value().addr)
             .ok_or_else(|| AdapterError::Connection("no peers connected".into()))?;
 
-        self.send_to_peer(peer_addr, batch).await
+        self.send_to_peer(peer_addr, &batch).await
     }
 
     async fn flush(&self) -> Result<(), AdapterError> {

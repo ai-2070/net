@@ -104,7 +104,7 @@ impl RpcClientStreamingHandler for CollectingHandler {
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: count.to_le_bytes().to_vec(),
+            body: bytes::Bytes::copy_from_slice(&count.to_le_bytes()),
         })
     }
 }
@@ -133,7 +133,7 @@ impl RpcClientStreamingHandler for ObserveCancelHandler {
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: vec![],
+            body: bytes::Bytes::new(),
         })
     }
 }
@@ -211,7 +211,7 @@ impl RpcClientStreamingHandler for SlowDrainHandler {
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: vec![],
+            body: bytes::Bytes::new(),
         })
     }
 }

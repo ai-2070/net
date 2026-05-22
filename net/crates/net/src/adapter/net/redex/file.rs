@@ -1066,19 +1066,22 @@ impl RedexFile {
     /// One-shot read of the half-open range `[start, end)` from the
     /// in-memory index. Returns only entries currently retained;
     /// silently skips any seqs that have been evicted.
+    ///
+    /// `state.index` is sorted by `seq` by construction, so the
+    /// lookup uses [`slice::partition_point`] — O(log N) — to
+    /// locate both range bounds. Pre-fix perf #52 in
+    /// `docs/performance/net-perf-analysis.md` this iterated the
+    /// whole index linearly to find `start`, then walked the tail
+    /// to find `end` — O(N) per read regardless of range size.
     pub fn read_range(&self, start: u64, end: u64) -> Vec<RedexEvent> {
         if end <= start {
             return Vec::new();
         }
         let state = self.inner.state.lock();
-        let mut out = Vec::new();
-        for entry in state.index.iter() {
-            if entry.seq < start {
-                continue;
-            }
-            if entry.seq >= end {
-                break;
-            }
+        let lo = state.index.partition_point(|e| e.seq < start);
+        let hi = state.index.partition_point(|e| e.seq < end);
+        let mut out = Vec::with_capacity(hi.saturating_sub(lo));
+        for entry in &state.index[lo..hi] {
             if let Some(ev) = materialize(entry, &state.segment) {
                 out.push(ev);
             }
@@ -1090,18 +1093,19 @@ impl RedexFile {
     /// has been evicted or was never appended. Convenience over
     /// [`Self::read_range(seq, seq + 1)`]; saves the `Vec`
     /// allocation when the caller only wants one event.
+    ///
+    /// O(log N) via [`slice::partition_point`] — pre-fix this was
+    /// O(N), scanning the entire index even for trivially-absent
+    /// seqs (perf #52).
     pub fn read_one(&self, seq: u64) -> Option<RedexEvent> {
         let state = self.inner.state.lock();
-        for entry in state.index.iter() {
-            if entry.seq < seq {
-                continue;
-            }
-            if entry.seq > seq {
-                break;
-            }
-            return materialize(entry, &state.segment);
+        let lo = state.index.partition_point(|e| e.seq < seq);
+        let entry = state.index.get(lo)?;
+        if entry.seq == seq {
+            materialize(entry, &state.segment)
+        } else {
+            None
         }
-        None
     }
 
     /// Read a single event and resolve its payload — inline events
@@ -1149,7 +1153,7 @@ impl RedexFile {
                 .ok_or_else(|| BlobError::AdapterNotRegistered(adapter_id.to_string()))?;
                 let fetched = adapter.fetch(&blob).await?;
                 blob.verify(&fetched)?;
-                Ok(Some(bytes::Bytes::from(fetched)))
+                Ok(Some(fetched))
             }
         }
     }
@@ -1889,6 +1893,67 @@ mod tests {
         f.append(b"x").unwrap();
         assert!(f.read_range(5, 5).is_empty());
         assert!(f.read_range(10, 3).is_empty());
+    }
+
+    /// Pin perf #52: `read_one` / `read_range` use binary search
+    /// over the sorted `index` instead of a linear scan. We
+    /// exercise the contracts that distinguish the two:
+    ///
+    /// - Trivially-absent `seq` past the high end: pre-fix
+    ///   walked the entire index before returning `None`; post-fix
+    ///   the partition point lands at `index.len()` and a `get`
+    ///   miss returns `None` immediately.
+    /// - `read_range` over a tight sub-range: pre-fix walked the
+    ///   prefix linearly; post-fix the lower partition point
+    ///   skips directly to the start.
+    /// - Empty range past the end: must return empty without
+    ///   materializing anything.
+    ///
+    /// The regression form a future linear-scan reintroduction
+    /// would take is "test passes but takes O(N) time" — we
+    /// can't easily benchmark that here, but we can pin the
+    /// correctness contracts that a binary-search implementation
+    /// has to satisfy.
+    #[test]
+    fn read_one_and_read_range_resolve_via_binary_search_semantics() {
+        let f = make_file("perf52");
+        // Append 1000 events; their seqs are 0..1000.
+        for i in 0..1000u64 {
+            f.append(format!("e{i}").as_bytes()).unwrap();
+        }
+
+        // read_one: existent
+        let ev = f.read_one(500).expect("seq 500 must exist");
+        assert_eq!(ev.entry.seq, 500);
+        assert_eq!(ev.payload.as_ref(), b"e500");
+
+        // read_one: absent past high end
+        assert!(f.read_one(99_999).is_none());
+
+        // read_one: absent in a gap — for this we'd need eviction;
+        // skipping (the basic "absent" branch is covered above).
+
+        // read_range: tight subrange in the middle.
+        let mid = f.read_range(495, 505);
+        assert_eq!(mid.len(), 10);
+        assert_eq!(mid.first().unwrap().entry.seq, 495);
+        assert_eq!(mid.last().unwrap().entry.seq, 504);
+
+        // read_range: range fully past the high end.
+        assert!(f.read_range(5000, 6000).is_empty());
+
+        // read_range: range starts before all entries.
+        let head = f.read_range(0, 3);
+        assert_eq!(head.len(), 3);
+        assert_eq!(
+            head.iter().map(|e| e.entry.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+        );
+
+        // Half-open semantics preserved: `end` is exclusive.
+        let last = f.read_range(998, 1000);
+        assert_eq!(last.len(), 2);
+        assert_eq!(last.last().unwrap().entry.seq, 999);
     }
 
     #[test]
@@ -3169,8 +3234,9 @@ mod tests {
             );
             // Flip the first byte of the payload.
             let off = entry.payload_offset as usize;
-            let old = state.segment.bytes_for_test_mut()[off];
-            state.segment.bytes_for_test_mut()[off] = old.wrapping_add(1);
+            state.segment.with_bytes_for_test_mut(|buf| {
+                buf[off] = buf[off].wrapping_add(1);
+            });
         }
 
         // The corrupted entry must be dropped on read; the other

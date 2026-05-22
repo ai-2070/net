@@ -66,7 +66,7 @@ impl Adapter for CountingAdapter {
     async fn init(&mut self) -> Result<(), AdapterError> {
         Ok(())
     }
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+    async fn on_batch(&self, batch: std::sync::Arc<Batch>) -> Result<(), AdapterError> {
         self.batches_seen.fetch_add(1, Ordering::Relaxed);
         self.events_seen
             .fetch_add(batch.len() as u64, Ordering::Relaxed);
@@ -104,7 +104,7 @@ impl Adapter for SlowCountingAdapter {
     async fn init(&mut self) -> Result<(), AdapterError> {
         self.inner.init().await
     }
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+    async fn on_batch(&self, batch: std::sync::Arc<Batch>) -> Result<(), AdapterError> {
         tokio::time::sleep(self.delay).await;
         self.inner.on_batch(batch).await
     }
@@ -175,7 +175,7 @@ impl Adapter for FlakyAdapter {
     async fn init(&mut self) -> Result<(), AdapterError> {
         Ok(())
     }
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+    async fn on_batch(&self, batch: std::sync::Arc<Batch>) -> Result<(), AdapterError> {
         self.attempts.fetch_add(1, Ordering::Relaxed);
         // Atomic check-and-decrement via fetch_update — a racy
         // `load > 0` + `fetch_sub(1)` pair lets two concurrent

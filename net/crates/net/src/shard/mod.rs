@@ -475,17 +475,29 @@ impl ShardManager {
             // Dynamic mode: use weighted selection
             mapper.select_shard(hash)
         } else {
-            // Static mode: simple modulo. Defensive guard against
-            // `num_shards == 0` — config validation rejects 0 at
-            // startup and `scale_down` requires `current > min_shards
-            // >= 1`, so this branch is unreachable today, but a stray
-            // 0 here would otherwise panic on the `%` below.
+            // Static mode: Lemire's bias-free multiply-shift mapping.
+            // Pre-fix this ran `hash % num_shards` per event — modulo
+            // by a non-constant `u64` is a `div` on every modern uarch
+            // (~20-25 cycles) and dwarfs the upstream xxh3 hash cost
+            // for the static-mode hot path. The multiply-shift form
+            // `((hash * n) >> 64)` is ~3 cycles and is the same
+            // unbiased reduction already used in `mapper.rs:660`. Per
+            // net-perf #7.
+            //
+            // The defensive guard against `num_shards == 0` stays —
+            // config validation rejects 0 at startup and `scale_down`
+            // requires `current > min_shards >= 1` so this branch is
+            // unreachable today, but a stray 0 here would otherwise
+            // make the multiply land at index 0 silently while the
+            // legacy modulo would have panicked. Returning 0
+            // explicitly preserves the legacy "any select returns
+            // shard 0" failure mode without the panic.
             let num_shards = self.num_shards.load(std::sync::atomic::Ordering::Acquire);
             debug_assert!(num_shards > 0, "num_shards must be > 0");
             if num_shards == 0 {
                 return 0;
             }
-            (hash % num_shards as u64) as u16
+            ((hash as u128 * num_shards as u128) >> 64) as u16
         }
     }
 
@@ -1184,6 +1196,66 @@ mod tests {
                 manager.select_shard(&v),
                 manager.select_shard_by_hash(raw.hash()),
                 "select_shard and select_shard_by_hash must agree (i={i})"
+            );
+        }
+    }
+
+    /// Pin net-perf #7: the static-mode `select_shard_by_hash` is now
+    /// Lemire's `(hash * n) >> 64` instead of `hash % n` (one `div`
+    /// per event eliminated). Lemire maps `[0, u64::MAX]` evenly into
+    /// `[0, n)` for any `n` that fits in u16: the output must always
+    /// land in range, and `hash == 0` must still resolve to shard 0
+    /// (the multiplication overflow-pattern boundary).
+    #[test]
+    fn select_shard_by_hash_uses_lemire_reduction_in_static_mode() {
+        for &shard_count in &[1u16, 2, 3, 4, 7, 8, 16, 64] {
+            let manager = ShardManager::new(shard_count, 1024, BackpressureMode::DropNewest);
+
+            // `hash == 0` → `(0 * n) >> 64 == 0` regardless of `n`.
+            // Locking down this boundary catches a regression where
+            // the multiplication is dropped or reordered.
+            assert_eq!(
+                manager.select_shard_by_hash(0),
+                0,
+                "hash 0 must resolve to shard 0 (n={shard_count})"
+            );
+
+            // Every output must be a valid shard index. A regression
+            // back to `hash % shard_count` would still land in range,
+            // but any wrong shift (e.g. `>> 32`) or sign-extension
+            // bug would push the result past `shard_count`.
+            for hash in [
+                1u64,
+                42,
+                u64::MAX,
+                u64::MAX - 1,
+                0x8000_0000_0000_0000,
+                0x7FFF_FFFF_FFFF_FFFF,
+                0xDEAD_BEEF_DEAD_BEEF,
+            ] {
+                let shard = manager.select_shard_by_hash(hash);
+                assert!(
+                    shard < shard_count,
+                    "shard {shard} out of range for n={shard_count}, hash={hash:#x}"
+                );
+            }
+        }
+
+        // Distribution sanity: across 10_000 successive hashes that
+        // mimic the input spread of `xxh3_64`, every shard sees at
+        // least one event. A regression to `>> 64` returning 0 always
+        // (e.g. `(hash as u64 * n as u64) >> 64`, which truncates the
+        // product) would put everything on shard 0.
+        let manager = ShardManager::new(8, 1024, BackpressureMode::DropNewest);
+        let mut counts = [0usize; 8];
+        for i in 0u64..10_000 {
+            let h = xxhash_rust::xxh3::xxh3_64(&i.to_le_bytes());
+            counts[manager.select_shard_by_hash(h) as usize] += 1;
+        }
+        for (i, &c) in counts.iter().enumerate() {
+            assert!(
+                c > 0,
+                "shard {i} got 0 events out of 10_000 (Lemire reduction must spread)"
             );
         }
     }

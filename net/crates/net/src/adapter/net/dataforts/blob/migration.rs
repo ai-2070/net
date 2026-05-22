@@ -88,6 +88,20 @@ fn narrow_scope_tags_in(
     });
 }
 
+/// Decode a single lowercase-hex ASCII byte into its nibble
+/// value (0..=15). Returns `None` for any byte outside
+/// `b'0'..=b'9'` or `b'a'..=b'f'`. Used by
+/// [`parse_blob_heat_tag`] in place of `u8::from_str_radix(_, 16)`
+/// per dataforts perf #185.
+#[inline]
+fn nibble_lowercase(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
+
 /// Parse a `heat:blob:<hex64>=<rate>` reserved tag into the
 /// `(hash, rate)` pair. Returns `None` when the tag isn't a
 /// blob-heat shape (chain-heat tags, unrelated reserved tags,
@@ -115,10 +129,21 @@ pub fn parse_blob_heat_tag(tag: &Tag) -> Option<([u8; 32], f64)> {
     if hex.bytes().any(|b| b.is_ascii_uppercase()) {
         return None;
     }
+    // Per dataforts perf #185: pre-fix this used
+    // `u8::from_str_radix(pair, 16)` per byte, which routes
+    // through the general-purpose radix parser (UTF-8 decode +
+    // range check + multiply-accumulate). The path here is
+    // already known-shape after the validations above (length =
+    // 64, lowercase). A two-nibble lookup is enough and skips the
+    // sub-slice + parser dispatch on every byte. Returns `None`
+    // on any non-hex character so the existing reject-bad-hex
+    // contract is preserved.
     let mut hash = [0u8; 32];
+    let bytes = hex.as_bytes();
     for (i, byte) in hash.iter_mut().enumerate() {
-        let pair = hex.get(i * 2..i * 2 + 2)?;
-        *byte = u8::from_str_radix(pair, 16).ok()?;
+        let hi = nibble_lowercase(bytes[2 * i])?;
+        let lo = nibble_lowercase(bytes[2 * i + 1])?;
+        *byte = (hi << 4) | lo;
     }
     let rate: f64 = rate_str.parse().ok()?;
     if !rate.is_finite() {
@@ -710,6 +735,58 @@ mod tests {
         assert!(parse_blob_heat_tag(&short).is_none());
     }
 
+    /// Pin dataforts perf #185: the table-lookup hex decode
+    /// inside `parse_blob_heat_tag` produces the same hash as
+    /// the legacy `u8::from_str_radix(pair, 16)` form for every
+    /// valid lowercase-hex shape. Exercise the full nibble range
+    /// (corner cases all-zero / all-`f` / ascending) so a
+    /// regression in the nibble table (off-by-one on `b - b'a'`,
+    /// missing the `0..=9` arm, or returning the wrong nibble
+    /// half for the high/low split) surfaces here.
+    #[test]
+    fn parse_blob_heat_tag_decode_matches_from_str_radix_byte_for_byte() {
+        let cases: [[u8; 32]; 4] = [
+            [0x00; 32],
+            [0xFF; 32],
+            {
+                let mut a = [0u8; 32];
+                for (i, b) in a.iter_mut().enumerate() {
+                    *b = i as u8;
+                }
+                a
+            },
+            [
+                0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0xf0, 0x0d, 0xfa, 0xce, 0x1b, 0xad,
+                0xd0, 0x0d, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0xfe, 0xdc, 0xba, 0x98,
+                0x76, 0x54, 0x32, 0x10,
+            ],
+        ];
+        for expected in &cases {
+            let mut hex = String::with_capacity(64);
+            for b in expected {
+                use std::fmt::Write as _;
+                write!(hex, "{:02x}", b).unwrap();
+            }
+            let tag = Tag::Reserved {
+                prefix: "heat:".to_string(),
+                body: format!("blob:{}=1.00", hex),
+            };
+            let (got, _rate) = parse_blob_heat_tag(&tag).expect("must parse");
+            assert_eq!(&got, expected, "table-lookup decode must match legacy");
+        }
+
+        // Negative case: a non-hex char (after the lowercase-only
+        // gate) must still be rejected — the new lookup returns
+        // `None`, mirroring `from_str_radix`'s error.
+        let bad = Tag::Reserved {
+            prefix: "heat:".to_string(),
+            // 'g' is past 'f' so the nibble table rejects it
+            // even though it survives the lowercase gate.
+            body: format!("blob:g{}=1.00", "0".repeat(63)),
+        };
+        assert!(parse_blob_heat_tag(&bad).is_none());
+    }
+
     #[test]
     fn parse_blob_heat_tag_rejects_non_finite_rate() {
         let (_h, hex) = hex64(0x01);
@@ -812,14 +889,14 @@ mod tests {
         async fn store(&self, _: &BlobRef, _: &[u8]) -> Result<(), BlobError> {
             unreachable!()
         }
-        async fn fetch(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
+        async fn fetch(&self, _: &BlobRef) -> Result<bytes::Bytes, BlobError> {
             unreachable!()
         }
         async fn fetch_range(
             &self,
             _: &BlobRef,
             _: std::ops::Range<u64>,
-        ) -> Result<Vec<u8>, BlobError> {
+        ) -> Result<bytes::Bytes, BlobError> {
             unreachable!()
         }
         async fn exists(&self, _: &BlobRef) -> Result<bool, BlobError> {

@@ -5,7 +5,7 @@
 //! via xxh3 hashing — tamper resistance comes from Net's AEAD encryption.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::Xxh3;
 
 /// Subprotocol ID for causal-framed events.
 pub const SUBPROTOCOL_CAUSAL: u16 = 0x0400;
@@ -123,15 +123,24 @@ impl CausalLink {
 ///
 /// Hash covers the previous link's bytes concatenated with the payload.
 /// Uses xxh3 (~50GB/s) — structural integrity, not cryptographic commitment.
+///
+/// Per perf #154 — pre-fix this fired a fresh
+/// `Vec::with_capacity(CAUSAL_LINK_SIZE + prev_payload.len())` per
+/// output event purely to concatenate the link and payload before
+/// hashing, then dropped the Vec. For daemons emitting 100K
+/// events/sec at 1 KiB payloads that's 100K allocs/sec plus 100 MB/sec
+/// of memcpy bandwidth just for parent-hash computation. The
+/// streaming `Xxh3::update` builder threads the same bytes through
+/// the hash with zero intermediate allocation — slightly higher
+/// per-call overhead for tiny inputs, more than offset by the
+/// removed Vec alloc + double extend.
 #[inline]
 pub fn compute_parent_hash(prev_link: &CausalLink, prev_payload: &[u8]) -> u64 {
     let link_bytes = prev_link.to_bytes();
-    // For short payloads, concatenate and hash in one shot.
-    // For large payloads, use xxh3's incremental API if needed (future optimization).
-    let mut combined = Vec::with_capacity(CAUSAL_LINK_SIZE + prev_payload.len());
-    combined.extend_from_slice(&link_bytes);
-    combined.extend_from_slice(prev_payload);
-    xxh3_64(&combined)
+    let mut hasher = Xxh3::new();
+    hasher.update(&link_bytes);
+    hasher.update(prev_payload);
+    hasher.digest()
 }
 
 /// A causal event: link + payload.
@@ -570,6 +579,43 @@ mod tests {
         let h1 = compute_parent_hash(&link, b"payload a");
         let h2 = compute_parent_hash(&link, b"payload b");
         assert_ne!(h1, h2);
+    }
+
+    /// Pin #154: streaming `Xxh3::update(link).update(payload)` must
+    /// produce the SAME 64-bit digest as the legacy one-shot
+    /// `xxh3_64(link ++ payload)`. The streaming path eliminates the
+    /// per-output-event `Vec::with_capacity(...).extend.extend` alloc
+    /// and double-memcpy, but the on-the-wire `parent_hash` is part
+    /// of the chain-validation invariant — if the streaming digest
+    /// diverged from the concatenated digest, every replica or
+    /// migration target would reject events from a node that hadn't
+    /// upgraded yet (and vice versa). This pin covers tiny,
+    /// exact-block, just-over-block, multi-block, and empty payloads
+    /// against the concatenate-then-hash reference.
+    #[test]
+    fn compute_parent_hash_streaming_matches_concatenated_oneshot() {
+        use xxhash_rust::xxh3::xxh3_64;
+
+        let link = CausalLink::genesis(0xDEAD_BEEF, 42);
+        let link_bytes = link.to_bytes();
+
+        for size in [0usize, 1, 31, 32, 33, 63, 64, 65, 1024, 8 * 1024] {
+            // Deterministic but non-trivial payload so the digest is
+            // a function of more than just length.
+            let payload: Vec<u8> = (0..size).map(|i| (i as u8).wrapping_mul(31)).collect();
+
+            let streaming = compute_parent_hash(&link, &payload);
+
+            let mut combined = Vec::with_capacity(CAUSAL_LINK_SIZE + payload.len());
+            combined.extend_from_slice(&link_bytes);
+            combined.extend_from_slice(&payload);
+            let oneshot = xxh3_64(&combined);
+
+            assert_eq!(
+                streaming, oneshot,
+                "streaming and one-shot xxh3 diverge at payload size {size}"
+            );
+        }
     }
 
     #[test]

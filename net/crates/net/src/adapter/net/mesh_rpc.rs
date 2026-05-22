@@ -471,7 +471,7 @@ impl futures::Stream for RpcStream {
             std::task::Poll::Ready(Some(StreamItem::Error(resp))) => {
                 self.done = true;
                 let status = resp.status.to_wire();
-                let message = String::from_utf8(resp.body).unwrap_or_else(|e| {
+                let message = String::from_utf8(resp.body.to_vec()).unwrap_or_else(|e| {
                     format!("<{} bytes of non-utf8 body>", e.into_bytes().len())
                 });
                 self.observer
@@ -673,7 +673,7 @@ impl ClientStreamCallRaw {
                     deadline_ns: self.deadline_ns,
                     flags: self.initial_flags,
                     headers: std::mem::take(&mut self.initial_headers),
-                    body: body.to_vec(),
+                    body: body.clone(),
                 };
                 self.publish_initial_request(&req).await?;
                 self.state = ClientStreamState::Sending;
@@ -683,7 +683,7 @@ impl ClientStreamCallRaw {
                     call_id: self.call_id,
                     flags: 0,
                     headers: vec![],
-                    body: body.to_vec(),
+                    body: body.clone(),
                 };
                 publish_request_chunk(
                     &self.mesh,
@@ -716,7 +716,7 @@ impl ClientStreamCallRaw {
                     deadline_ns: self.deadline_ns,
                     flags: self.initial_flags | FLAG_RPC_REQUEST_END,
                     headers: std::mem::take(&mut self.initial_headers),
-                    body: vec![],
+                    body: Bytes::new(),
                 };
                 self.publish_initial_request(&req).await?;
             }
@@ -725,7 +725,7 @@ impl ClientStreamCallRaw {
                     call_id: self.call_id,
                     flags: FLAG_RPC_REQUEST_END,
                     headers: vec![],
-                    body: vec![],
+                    body: Bytes::new(),
                 };
                 publish_request_chunk(
                     &self.mesh,
@@ -784,7 +784,12 @@ impl ClientStreamCallRaw {
         self.state = ClientStreamState::Done;
         self.observer.add_response_bytes(resp.body.len() as u32);
         if !resp.status.is_ok() {
-            let message = String::from_utf8(resp.body.clone())
+            // String::from_utf8 takes `Vec<u8>`. `Bytes::to_vec()`
+            // matches the prior `resp.body.clone()` semantics (full
+            // copy of the body for the error-formatting path);
+            // bulk-throughput improvement lives on the decode side,
+            // not here.
+            let message = String::from_utf8(resp.body.to_vec())
                 .unwrap_or_else(|e| format!("<{} bytes of non-utf8 body>", e.into_bytes().len()));
             self.observer.latch_error(format!(
                 "server returned status {:#06x}: {message}",
@@ -798,7 +803,7 @@ impl ClientStreamCallRaw {
         self.observer.latch_ok();
         let latency_ns = self.started.elapsed().as_nanos() as u64;
         Ok(RpcReply {
-            body: Bytes::from(resp.body),
+            body: resp.body,
             headers: resp.headers,
             latency_ns,
         })
@@ -955,7 +960,7 @@ impl DuplexSink {
                     deadline_ns: self.deadline_ns,
                     flags: self.initial_flags,
                     headers: std::mem::take(&mut self.initial_headers),
-                    body: body.to_vec(),
+                    body: body.clone(),
                 };
                 self.publish_initial_request(&req).await?;
                 self.inner.initial_sent.store(true, Ordering::SeqCst);
@@ -966,7 +971,7 @@ impl DuplexSink {
                     call_id: self.inner.call_id,
                     flags: 0,
                     headers: vec![],
-                    body: body.to_vec(),
+                    body: body.clone(),
                 };
                 publish_request_chunk(
                     &self.inner.mesh,
@@ -993,7 +998,7 @@ impl DuplexSink {
                     deadline_ns: self.deadline_ns,
                     flags: self.initial_flags | FLAG_RPC_REQUEST_END,
                     headers: std::mem::take(&mut self.initial_headers),
-                    body: vec![],
+                    body: Bytes::new(),
                 };
                 self.publish_initial_request(&req).await?;
                 self.inner.initial_sent.store(true, Ordering::SeqCst);
@@ -1003,7 +1008,7 @@ impl DuplexSink {
                     call_id: self.inner.call_id,
                     flags: FLAG_RPC_REQUEST_END,
                     headers: vec![],
-                    body: vec![],
+                    body: Bytes::new(),
                 };
                 publish_request_chunk(
                     &self.inner.mesh,
@@ -1121,7 +1126,7 @@ impl futures::Stream for DuplexStream {
                 self.done = true;
                 self.inner.clean_close.store(true, Ordering::SeqCst);
                 let status = resp.status.to_wire();
-                let message = String::from_utf8(resp.body).unwrap_or_else(|e| {
+                let message = String::from_utf8(resp.body.to_vec()).unwrap_or_else(|e| {
                     format!("<{} bytes of non-utf8 body>", e.into_bytes().len())
                 });
                 self.inner
@@ -1673,11 +1678,10 @@ impl MeshNode {
                     let resp = super::cortex::RpcResponsePayload {
                         status: RpcStatus::CapabilityDenied,
                         headers: vec![],
-                        body: format!(
+                        body: Bytes::from(format!(
                             "callee-side capability-auth gate denied nrpc:{}",
                             service_for_bridge
-                        )
-                        .into_bytes(),
+                        )),
                     };
                     // Server-side metrics: bump `capability_denied_total`
                     // on the per-service counter. The fold-side
@@ -2338,7 +2342,7 @@ impl MeshNode {
             deadline_ns: opts.deadline.map(instant_to_unix_nanos).unwrap_or(0),
             flags,
             headers,
-            body: payload.to_vec(),
+            body: payload.clone(),
         };
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.body.len() + 32);
@@ -2675,7 +2679,7 @@ impl MeshNode {
             deadline_ns: opts.deadline.map(instant_to_unix_nanos).unwrap_or(0),
             flags,
             headers,
-            body: payload.to_vec(),
+            body: payload.clone(),
         };
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.body.len() + 32);
@@ -2824,7 +2828,7 @@ impl MeshNode {
                 response_bytes_len,
             );
             Ok(RpcReply {
-                body: Bytes::from(resp.body),
+                body: resp.body,
                 headers: resp.headers,
                 latency_ns: started.elapsed().as_nanos() as u64,
             })
@@ -2832,7 +2836,7 @@ impl MeshNode {
             metrics_guard.record(CallOutcome::ServerError);
             let status = resp.status.to_wire();
             let response_bytes_len = resp.body.len() as u32;
-            let message = String::from_utf8(resp.body)
+            let message = String::from_utf8(resp.body.to_vec())
                 .unwrap_or_else(|e| format!("<{} bytes of non-utf8 body>", e.into_bytes().len()));
             self.fire_rpc_observer_outbound(
                 target_node_id,

@@ -652,7 +652,7 @@ impl NetAdapter {
         num_shards: u16,
     ) {
         // Parse packet
-        let parsed = match ParsedPacket::parse(data, source) {
+        let mut parsed = match ParsedPacket::parse(data, source) {
             Some(p) => p,
             None => return,
         };
@@ -700,18 +700,24 @@ impl NetAdapter {
             return;
         }
 
-        // Decrypt payload
+        // Decrypt payload. Per crypto-session perf #128, route
+        // through `decrypt_to_bytes` so the common case
+        // (refcount-1 inbound buffer) decrypts in place instead
+        // of allocating a fresh `Vec<u8>` plaintext per packet.
         let aad = parsed.header.aad();
         let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
         let rx_cipher = session.rx_cipher();
-        if !rx_cipher.is_valid_rx_counter(counter) {
-            return;
-        }
-        let decrypted = match rx_cipher.decrypt(counter, &aad, &parsed.payload) {
+        let payload = std::mem::take(&mut parsed.payload);
+        // Per crypto-session perf #132: collapsed the pre-decrypt
+        // `is_valid_rx_counter` + post-decrypt `update_rx_counter`
+        // two-step into one `try_admit_rx_counter` call. See
+        // `mesh.rs::process_local_packet` for the full rationale —
+        // the contract is identical (replays still rejected, TOCTOU
+        // still closed), and the redundant Mutex lock on every
+        // non-replay packet is gone.
+        let decrypted = match rx_cipher.decrypt_to_bytes(counter, &aad, payload) {
             Ok(d) => {
-                // Commit-time replay check: closes the TOCTOU race where
-                // two threads decrypt the same replayed packet concurrently.
-                if !rx_cipher.update_rx_counter(counter) {
+                if !rx_cipher.try_admit_rx_counter(counter) {
                     return;
                 }
                 d
@@ -720,7 +726,7 @@ impl NetAdapter {
         };
 
         // Parse events
-        let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+        let events = EventFrame::read_events(decrypted, parsed.header.event_count);
 
         // Update stream state
         let stream_id = parsed.header.stream_id;
@@ -981,7 +987,7 @@ impl Adapter for NetAdapter {
         Ok(())
     }
 
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+    async fn on_batch(&self, batch: std::sync::Arc<Batch>) -> Result<(), AdapterError> {
         let session = self
             .session
             .as_ref()
@@ -1046,12 +1052,16 @@ impl Adapter for NetAdapter {
                 // the retransmit driver call `builder.build` again
                 // with a fresh counter.
                 if reliable {
-                    let descriptor = reliability::RetransmitDescriptor {
+                    // Per perf #133 — Arc-wrap the descriptor before
+                    // handing it to the reliability mode. The
+                    // retransmit window then shares the inner
+                    // `Vec<Bytes>` rather than holding an owned copy.
+                    let descriptor = std::sync::Arc::new(reliability::RetransmitDescriptor {
                         seq,
                         stream_id,
                         events: current_batch.clone(),
                         flags,
-                    };
+                    });
                     let stream = session.get_or_create_stream(stream_id);
                     stream.with_reliability(|r| r.on_send(descriptor));
                 }
@@ -1086,12 +1096,13 @@ impl Adapter for NetAdapter {
                 .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
             if reliable {
-                let descriptor = reliability::RetransmitDescriptor {
+                // Per perf #133 — see the matching call site above.
+                let descriptor = std::sync::Arc::new(reliability::RetransmitDescriptor {
                     seq,
                     stream_id,
                     events: current_batch.clone(),
                     flags,
-                };
+                });
                 let stream = session.get_or_create_stream(stream_id);
                 stream.with_reliability(|r| r.on_send(descriptor));
             }

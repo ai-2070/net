@@ -10,6 +10,7 @@
 use std::ops::Range;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
 use super::adapter::BlobAdapter;
 use super::blob_ref::BlobRef;
@@ -45,7 +46,7 @@ impl BlobAdapter for NoopAdapter {
         Ok(())
     }
 
-    async fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
+    async fn fetch(&self, blob_ref: &BlobRef) -> Result<Bytes, BlobError> {
         Err(BlobError::NotFound(blob_ref.uri().to_owned()))
     }
 
@@ -53,7 +54,7 @@ impl BlobAdapter for NoopAdapter {
         &self,
         blob_ref: &BlobRef,
         _range: Range<u64>,
-    ) -> Result<Vec<u8>, BlobError> {
+    ) -> Result<Bytes, BlobError> {
         Err(BlobError::NotFound(blob_ref.uri().to_owned()))
     }
 

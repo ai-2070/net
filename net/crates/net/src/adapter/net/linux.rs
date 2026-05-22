@@ -306,9 +306,36 @@ impl BatchedTransport {
             ));
         }
 
-        // Setup receive buffers
+        // Setup receive buffers.
+        //
+        // Per crypto-session perf #131 (Issue A): the legacy
+        // `resize(MAX_PACKET_SIZE, 0)` memset every slot's bytes
+        // to zero before recvmmsg overwrote them immediately. For
+        // MAX_BATCH_SIZE=64 × MAX_PACKET_SIZE=8KB that's a
+        // ~512 KiB memset per batch call on a path running 10k+
+        // batches/sec. The `clear` + `reserve` + `set_len` triple
+        // below skips the memset: `reserve` ensures the
+        // allocation exists at capacity ≥ MAX_PACKET_SIZE (no-op
+        // once steady-state); `set_len` claims those bytes as
+        // initialized before recvmmsg writes them.
+        //
+        // SAFETY: We just reserved MAX_PACKET_SIZE bytes of
+        // capacity; the recvmmsg syscall below writes the
+        // kernel-supplied bytes into [0..msg_len) for each
+        // received slot. The result-collection loop further down
+        // truncates each slot to its actual `msg_len` BEFORE any
+        // rust code reads through the frozen `Bytes`, so the
+        // uninitialized tail past `msg_len` is never observed.
+        // Slots that don't receive a packet stay in this
+        // in-flight state until the next call, but we re-`set_len`
+        // them before the next recvmmsg — they're never read
+        // between calls.
         for i in 0..count {
-            self.recv_buffers[i].resize(MAX_PACKET_SIZE, 0);
+            self.recv_buffers[i].clear();
+            self.recv_buffers[i].reserve(MAX_PACKET_SIZE);
+            unsafe {
+                self.recv_buffers[i].set_len(MAX_PACKET_SIZE);
+            }
 
             self.iovecs[i] = libc::iovec {
                 iov_base: self.recv_buffers[i].as_mut_ptr() as *mut _,
@@ -385,9 +412,36 @@ impl BatchedTransport {
             ));
         }
 
-        // Setup receive buffers
+        // Setup receive buffers.
+        //
+        // Per crypto-session perf #131 (Issue A): the legacy
+        // `resize(MAX_PACKET_SIZE, 0)` memset every slot's bytes
+        // to zero before recvmmsg overwrote them immediately. For
+        // MAX_BATCH_SIZE=64 × MAX_PACKET_SIZE=8KB that's a
+        // ~512 KiB memset per batch call on a path running 10k+
+        // batches/sec. The `clear` + `reserve` + `set_len` triple
+        // below skips the memset: `reserve` ensures the
+        // allocation exists at capacity ≥ MAX_PACKET_SIZE (no-op
+        // once steady-state); `set_len` claims those bytes as
+        // initialized before recvmmsg writes them.
+        //
+        // SAFETY: We just reserved MAX_PACKET_SIZE bytes of
+        // capacity; the recvmmsg syscall below writes the
+        // kernel-supplied bytes into [0..msg_len) for each
+        // received slot. The result-collection loop further down
+        // truncates each slot to its actual `msg_len` BEFORE any
+        // rust code reads through the frozen `Bytes`, so the
+        // uninitialized tail past `msg_len` is never observed.
+        // Slots that don't receive a packet stay in this
+        // in-flight state until the next call, but we re-`set_len`
+        // them before the next recvmmsg — they're never read
+        // between calls.
         for i in 0..count {
-            self.recv_buffers[i].resize(MAX_PACKET_SIZE, 0);
+            self.recv_buffers[i].clear();
+            self.recv_buffers[i].reserve(MAX_PACKET_SIZE);
+            unsafe {
+                self.recv_buffers[i].set_len(MAX_PACKET_SIZE);
+            }
 
             self.iovecs[i] = libc::iovec {
                 iov_base: self.recv_buffers[i].as_mut_ptr() as *mut _,
@@ -533,6 +587,54 @@ mod tests {
     use super::*;
     use std::net::UdpSocket;
     use std::os::unix::io::AsRawFd;
+
+    /// Source pin: crypto-session perf #131 (Issue A) — the
+    /// recvmmsg batched receive paths MUST NOT pre-zero the
+    /// receive buffer slots. Pre-fix every batch call paid a
+    /// ~512 KiB memset (MAX_BATCH_SIZE × MAX_PACKET_SIZE) just for
+    /// the kernel to overwrite the same bytes immediately. A
+    /// regression that flips back to the legacy form would
+    /// re-introduce that bandwidth waste. Pin via source
+    /// inspection since the wasted memset is observable only as
+    /// a microbenchmark regression at runtime.
+    ///
+    /// Per cubic-dev-ai code review: the search patterns are
+    /// assembled at runtime (rather than written as inline
+    /// string literals) so this test's own assertions don't
+    /// match themselves in the inspected source — the file
+    /// contains `"resize({}, 0)"` and `"MAX_PACKET_SIZE"` as
+    /// separate literals, neither of which equals the
+    /// runtime-built needle `"resize(MAX_PACKET_SIZE, 0)"`.
+    #[test]
+    fn batched_recv_must_use_set_len_not_resize_zero() {
+        let src = include_str!("linux.rs");
+        let src_no_comments: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Build the needle at runtime — the source contains the
+        // template `"resize({}, 0)"` and the identifier
+        // `"MAX_PACKET_SIZE"` as separate string pieces; only
+        // their interpolated combination matches actual
+        // production code that pre-zeros the buffer.
+        let bad_needle = format!("resize({}, 0)", "MAX_PACKET_SIZE");
+        assert!(
+            !src_no_comments.contains(&bad_needle),
+            "regression: recvmmsg batched recv must NOT pre-zero \
+             slot buffers per crypto-session perf #131A; pre-fix \
+             this memset ~512 KiB per batch call only for the \
+             kernel to overwrite the bytes immediately."
+        );
+        // Confirm the alternate (uninit + set_len) path is in use.
+        let good_needle = format!("{}({})", "set_len", "MAX_PACKET_SIZE");
+        assert!(
+            src_no_comments.contains(&good_needle),
+            "regression: batched recv setup must claim slot \
+             capacity via set_len so recvmmsg writes the kernel-\
+             supplied bytes without a pre-zero pass."
+        );
+    }
 
     #[test]
     fn test_batched_transport_creation() {

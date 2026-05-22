@@ -819,7 +819,7 @@ where
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body,
+            body: body.into(),
         })
     }
 }
@@ -1328,7 +1328,7 @@ where
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body,
+            body: body.into(),
         })
     }
 }

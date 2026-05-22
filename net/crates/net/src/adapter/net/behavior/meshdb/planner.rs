@@ -1413,11 +1413,49 @@ fn sort_by_proximity(coverage: &mut [HolderCoverage]) {
     });
 }
 
+/// Lowercase hex digits keyed by nibble value `0..=15`. Per
+/// meshdb perf #211 — same lookup-table pattern as the
+/// dataforts #171 hex-decode fix, but applied to the encode
+/// side of the planner's `causal:<hex>` tag stem.
+const HEX_NIBBLES: &[u8; 16] = b"0123456789abcdef";
+
 /// Lowercase 16-char hex of a `u64` origin hash. Mirrors
 /// `MeshNode::chain_hex` (which is private); duplicated
 /// here so the planner doesn't depend on the mesh layer.
+///
+/// Per perf #211 — pre-fix `format!("{origin_hash:016x}")`
+/// routed through `core::fmt::Formatter`, which copies into a
+/// stack buffer and walks the format-string machinery before
+/// the `String` materializes. Post-fix is a direct 16-shift /
+/// nibble-lookup unroll into a fresh 16-byte buffer that's
+/// transmuted into `String` via `from_utf8(...).unwrap()` (the
+/// lookup table only emits ASCII hex digits, so the UTF-8
+/// validation is infallible by construction).
+///
+/// `collect_coverage` calls this exactly once per planning
+/// call (line 1104) and threads the result through every per-
+/// node tag scan; the speedup is sub-microsecond per planning
+/// call, but the change keeps the hex-formatting pattern
+/// consistent with dataforts #171 and removes a
+/// `core::fmt`-shaped allocation from the planner hot path.
 fn chain_hex(origin_hash: u64) -> String {
-    format!("{origin_hash:016x}")
+    let mut buf = [0u8; 16];
+    let mut h = origin_hash;
+    // Unrolled MSB-first nibble walk: byte 0 holds the most-
+    // significant nibble of `origin_hash`, byte 15 the least.
+    // Matches the `{:016x}` ordering byte-for-byte (pinned by
+    // `chain_hex_matches_format_macro_byte_for_byte`).
+    for i in (0..16).rev() {
+        buf[i] = HEX_NIBBLES[(h & 0xF) as usize];
+        h >>= 4;
+    }
+    // SAFETY: `HEX_NIBBLES` contains only ASCII hex digits, so
+    // every byte written into `buf` is a valid UTF-8 byte and
+    // `buf` is a valid UTF-8 string by construction. Skipping
+    // the `from_utf8` validation walk is the whole point of the
+    // lookup-table fix — the validation would re-scan 16 bytes
+    // we already know are ASCII.
+    unsafe { String::from_utf8_unchecked(buf.to_vec()) }
 }
 
 /// Parse a `causal:<hex>*` reserved tag, matching on the
@@ -1629,6 +1667,49 @@ mod tests {
         CapabilityAnnouncement, CapabilityIndex, CapabilitySet,
     };
     use crate::adapter::net::identity::EntityId;
+
+    /// Pin meshdb perf #211: the nibble-lookup `chain_hex` must
+    /// produce the SAME 16-char lowercase-hex string as the
+    /// legacy `format!("{origin_hash:016x}")` for every input.
+    /// `causal:<hex>` tag bodies are matched on by stem (see
+    /// `parse_causal_claim`), so a single-byte divergence
+    /// would silently break causal-claim discovery — every
+    /// announced `causal:<hex>` tag would fail to match the
+    /// planner's derived stem and the federated query layer
+    /// would behave as if no holders existed for that chain.
+    /// Exhaustive comparison across boundary, single-bit, and
+    /// arbitrary u64 inputs.
+    #[test]
+    fn chain_hex_matches_format_macro_byte_for_byte() {
+        let cases: &[u64] = &[
+            0,
+            1,
+            0xF,
+            0x10,
+            0xFF,
+            0x100,
+            0xDEAD_BEEF,
+            0x8000_0000_0000_0000,
+            0x7FFF_FFFF_FFFF_FFFF,
+            u64::MAX,
+            u64::MAX - 1,
+            // A bunch of arbitrary mid-range values to exercise
+            // each of the 16 nibble positions.
+            0x0123_4567_89AB_CDEF,
+            0xFEDC_BA98_7654_3210,
+            0xCAFE_BABE_DEAD_BEEF,
+            0x1234_5678_9ABC_DEF0,
+        ];
+        for &h in cases {
+            let reference = format!("{h:016x}");
+            let actual = chain_hex(h);
+            assert_eq!(
+                actual, reference,
+                "chain_hex({h:#x}) diverged from format!(\"{{:016x}}\")",
+            );
+            assert_eq!(actual.len(), 16, "chain_hex must always emit 16 chars");
+        }
+    }
 
     /// Build a single `causal:<body>` reserved tag from the
     /// supplied body string. The `add_tag` builder silently

@@ -1350,7 +1350,7 @@ mod mesh_bindings {
             };
 
             self.runtime
-                .block_on(node.send_to_peer(addr, batch))
+                .block_on(node.send_to_peer(addr, &batch))
                 .map_err(|e| PyRuntimeError::new_err(format!("send: {}", e)))?;
             Ok(true)
         }

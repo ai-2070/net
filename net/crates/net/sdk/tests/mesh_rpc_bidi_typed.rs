@@ -181,7 +181,7 @@ async fn client_stream_typed_caller_decode_failure_surfaces_codec_error() {
             Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],
-                body: b"not-json-shape".to_vec(),
+                body: bytes::Bytes::from_static(b"not-json-shape"),
             })
         }
     }

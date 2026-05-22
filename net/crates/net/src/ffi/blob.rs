@@ -444,6 +444,7 @@ fn _force_use() -> *mut c_void {
 use std::ops::Range;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
 /// `store` function pointer. Caller-allocates nothing; returns
 /// `0` on success or a negative `c_int` on failure.
@@ -655,7 +656,7 @@ impl BlobAdapter for CallbackBlobAdapter {
     async fn fetch(
         &self,
         blob_ref: &crate::adapter::net::dataforts::BlobRef,
-    ) -> std::result::Result<Vec<u8>, InnerBlobError> {
+    ) -> std::result::Result<Bytes, InnerBlobError> {
         let vtable = self.vtable;
         let ctx = self.ctx.clone();
         let (uri_str, hash, size) = expect_small_for_ffi(blob_ref)?;
@@ -663,7 +664,7 @@ impl BlobAdapter for CallbackBlobAdapter {
             Ok(c) => c,
             Err(e) => return Err(InnerBlobError::Backend(format!("uri NUL: {}", e))),
         };
-        tokio::task::spawn_blocking(move || -> std::result::Result<Vec<u8>, InnerBlobError> {
+        tokio::task::spawn_blocking(move || -> std::result::Result<Bytes, InnerBlobError> {
             let mut out_data: *mut u8 = ptr::null_mut();
             let mut out_len: usize = 0;
             let code = unsafe {
@@ -681,17 +682,23 @@ impl BlobAdapter for CallbackBlobAdapter {
             }
             if out_data.is_null() {
                 if out_len == 0 {
-                    return Ok(Vec::new());
+                    return Ok(Bytes::new());
                 }
                 return Err(InnerBlobError::Backend(
                     "fetch: caller returned null pointer with non-zero len".into(),
                 ));
             }
-            // Copy out before freeing — the caller owns the buffer
-            // and frees it via free_buffer.
+            // Copy out before freeing — the FFI caller owns the
+            // buffer and frees it via free_buffer. We can't hand
+            // the FFI-owned pointer to `Bytes` because rust would
+            // assume Vec-style allocator ownership, so the copy
+            // is unavoidable here (per dataforts perf #184 — the
+            // savings the Bytes signature unlocks are inside the
+            // mesh/fs/noop adapters; FFI callbacks pay the copy
+            // at the boundary in either direction).
             let buf = unsafe { std::slice::from_raw_parts(out_data, out_len).to_vec() };
             unsafe { (vtable.free_buffer)(ctx.get(), out_data, out_len) };
-            Ok(buf)
+            Ok(Bytes::from(buf))
         })
         .await
         .map_err(|e| InnerBlobError::Backend(format!("spawn_blocking join: {}", e)))?
@@ -701,7 +708,7 @@ impl BlobAdapter for CallbackBlobAdapter {
         &self,
         blob_ref: &crate::adapter::net::dataforts::BlobRef,
         range: Range<u64>,
-    ) -> std::result::Result<Vec<u8>, InnerBlobError> {
+    ) -> std::result::Result<Bytes, InnerBlobError> {
         let vtable = self.vtable;
         let ctx = self.ctx.clone();
         let (uri_str, hash, size) = expect_small_for_ffi(blob_ref)?;
@@ -711,7 +718,7 @@ impl BlobAdapter for CallbackBlobAdapter {
         };
         let start = range.start;
         let end = range.end;
-        tokio::task::spawn_blocking(move || -> std::result::Result<Vec<u8>, InnerBlobError> {
+        tokio::task::spawn_blocking(move || -> std::result::Result<Bytes, InnerBlobError> {
             let mut out_data: *mut u8 = ptr::null_mut();
             let mut out_len: usize = 0;
             let code = unsafe {
@@ -731,7 +738,7 @@ impl BlobAdapter for CallbackBlobAdapter {
             }
             if out_data.is_null() {
                 if out_len == 0 {
-                    return Ok(Vec::new());
+                    return Ok(Bytes::new());
                 }
                 return Err(InnerBlobError::Backend(
                     "fetch_range: caller returned null pointer with non-zero len".into(),
@@ -739,7 +746,7 @@ impl BlobAdapter for CallbackBlobAdapter {
             }
             let buf = unsafe { std::slice::from_raw_parts(out_data, out_len).to_vec() };
             unsafe { (vtable.free_buffer)(ctx.get(), out_data, out_len) };
-            Ok(buf)
+            Ok(Bytes::from(buf))
         })
         .await
         .map_err(|e| InnerBlobError::Backend(format!("spawn_blocking join: {}", e)))?

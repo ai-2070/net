@@ -22,6 +22,8 @@ mod config;
 mod envelope;
 mod error;
 mod meta;
+#[cfg(feature = "cortex")]
+mod needle;
 pub mod rpc;
 #[cfg(feature = "cortex")]
 pub mod rpc_observer;

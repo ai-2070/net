@@ -129,7 +129,7 @@ impl RpcClientStreamingHandler for ClientStreamSumHandler {
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body,
+            body: body.into(),
         })
     }
 }
@@ -197,7 +197,7 @@ fn initial_request_event(
         deadline_ns: 0,
         flags,
         headers: vec![],
-        body,
+        body: body.into(),
     };
     let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0);
     make_event(meta, &payload.encode())
@@ -208,7 +208,7 @@ fn request_chunk_event(caller_origin: u64, call_id: u64, flags: u16, body: Vec<u
         call_id,
         flags,
         headers: vec![],
-        body,
+        body: body.into(),
     };
     let meta = EventMeta::new(DISPATCH_RPC_REQUEST_CHUNK, 0, caller_origin, call_id, 0);
     make_event(meta, &payload.encode())
@@ -579,7 +579,7 @@ fn wire_snapshots_match_fixture() {
         deadline_ns: 0,
         flags: FLAG_RPC_CLIENT_STREAMING_REQUEST,
         headers: vec![],
-        body: b"hello".to_vec(),
+        body: bytes::Bytes::from_static(b"hello"),
     };
     let req_bytes = req.encode();
     let req_hex = hex_string(&req_bytes);
@@ -598,7 +598,7 @@ fn wire_snapshots_match_fixture() {
         call_id: 42,
         flags: FLAG_RPC_REQUEST_END,
         headers: vec![],
-        body: b"bye".to_vec(),
+        body: bytes::Bytes::from_static(b"bye"),
     };
     let chunk_bytes = chunk.encode();
     let chunk_hex = hex_string(&chunk_bytes);

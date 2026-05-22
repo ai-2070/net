@@ -168,7 +168,7 @@ impl RpcHandler for PredicateEchoHandler {
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body,
+            body: body.into(),
         })
     }
 }

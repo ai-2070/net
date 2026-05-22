@@ -129,9 +129,38 @@ pub struct CachedResult {
     pub inserted_at: Instant,
     /// The policy under which this entry was inserted.
     pub policy: CachePolicy,
+    /// Cached `approx_bytes` value, computed once at construction
+    /// time via [`Self::new`]. Per meshdb perf #209 — pre-fix the
+    /// `approx_bytes(&self)` method walked every row in the entry
+    /// on every call (one call per `insert` to update
+    /// `bytes_used`, plus the `evict_until_within_bounds` loop
+    /// hits each candidate entry once). For an entry with 10K
+    /// rows this was a 10K-element walk per LRU bookkeeping op.
+    /// `rows` is never mutated after construction (the LRU never
+    /// modifies a stored `CachedResult`, only inserts new ones
+    /// and removes old ones wholesale), so caching the result at
+    /// construction time is safe and `approx_bytes()` becomes a
+    /// single field load.
+    approx_bytes: u64,
 }
 
 impl CachedResult {
+    /// Construct a [`CachedResult`] and pre-compute its
+    /// `approx_bytes`. Per perf #209 — every production
+    /// construction site routes through this helper so the LRU
+    /// bookkeeping calls to `approx_bytes()` are cheap. See the
+    /// `approx_bytes` field doc for the rationale.
+    #[inline]
+    pub fn new(rows: Vec<ResultRow>, inserted_at: Instant, policy: CachePolicy) -> Self {
+        let approx_bytes = compute_approx_bytes(&rows);
+        Self {
+            rows,
+            inserted_at,
+            policy,
+            approx_bytes,
+        }
+    }
+
     /// Whether the entry has aged past its TTL. `Permanent`
     /// never expires by time.
     pub fn is_expired(&self) -> bool {
@@ -143,14 +172,22 @@ impl CachedResult {
 
     /// Approximate in-memory byte size: payload bytes + the
     /// per-row struct overhead (origin + seq + Vec header).
-    /// Used to enforce `LRU_MAX_BYTES`.
+    /// Used to enforce `LRU_MAX_BYTES`. Returns the value cached
+    /// at construction time — no per-call row walk. See [`Self::new`].
+    #[inline]
     fn approx_bytes(&self) -> u64 {
-        let row_overhead = std::mem::size_of::<ResultRow>() as u64;
-        self.rows
-            .iter()
-            .map(|r| r.payload.len() as u64 + row_overhead)
-            .sum::<u64>()
+        self.approx_bytes
     }
+}
+
+/// Walk a row set and compute its approximate in-memory byte
+/// size. Used by [`CachedResult::new`] to populate the
+/// `approx_bytes` cache once per insert. Per perf #209.
+fn compute_approx_bytes(rows: &[ResultRow]) -> u64 {
+    let row_overhead = std::mem::size_of::<ResultRow>() as u64;
+    rows.iter()
+        .map(|r| r.payload.len() as u64 + row_overhead)
+        .sum::<u64>()
 }
 
 /// Pluggable cache trait. The hot path is `get` / `insert`;
@@ -403,11 +440,7 @@ mod tests {
     }
 
     fn make_result(rows: Vec<ResultRow>, policy: CachePolicy) -> CachedResult {
-        CachedResult {
-            rows,
-            inserted_at: Instant::now(),
-            policy,
-        }
+        CachedResult::new(rows, Instant::now(), policy)
     }
 
     fn key(plan: u64, version: u64) -> CacheKey {
@@ -435,13 +468,13 @@ mod tests {
 
     #[test]
     fn timebound_entries_expire_after_ttl() {
-        let r = CachedResult {
-            rows: vec![],
-            inserted_at: Instant::now() - Duration::from_millis(50),
-            policy: CachePolicy::TimeBound {
+        let r = CachedResult::new(
+            vec![],
+            Instant::now() - Duration::from_millis(50),
+            CachePolicy::TimeBound {
                 ttl: Duration::from_millis(10),
             },
-        };
+        );
         assert!(r.is_expired());
     }
 
@@ -475,13 +508,13 @@ mod tests {
     fn lru_expired_entries_miss_and_are_dropped_lazily() {
         let cache = LruResultCache::default();
         let k = key(1, 0);
-        let stale = CachedResult {
-            rows: vec![],
-            inserted_at: Instant::now() - Duration::from_millis(50),
-            policy: CachePolicy::TimeBound {
+        let stale = CachedResult::new(
+            vec![],
+            Instant::now() - Duration::from_millis(50),
+            CachePolicy::TimeBound {
                 ttl: Duration::from_millis(10),
             },
-        };
+        );
         cache.insert(k, stale);
         assert!(cache.get(&k).is_none());
         assert_eq!(cache.len(), 0, "expired entry dropped on miss");

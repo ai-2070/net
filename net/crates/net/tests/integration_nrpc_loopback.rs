@@ -210,14 +210,14 @@ async fn nrpc_loopback_round_trip() {
         deadline_ns: 0,
         flags: 0,
         headers: vec![],
-        body: b"hello world".to_vec(),
+        body: bytes::Bytes::from_static(b"hello world"),
     };
     let resp = tokio::time::timeout(Duration::from_secs(2), loopback.call(req))
         .await
         .expect("call must complete within 2s")
         .expect("oneshot delivers");
     assert_eq!(resp.status, RpcStatus::Ok);
-    assert_eq!(resp.body, b"hello world");
+    assert_eq!(resp.body.as_ref(), b"hello world");
 }
 
 /// Multiple concurrent calls must each get their own correctly-
@@ -237,7 +237,7 @@ async fn nrpc_loopback_multiplexes_concurrent_calls() {
                 deadline_ns: 0,
                 flags: 0,
                 headers: vec![],
-                body: body.clone(),
+                body: body.clone().into(),
             };
             let resp = lb.call(req).await.expect("oneshot delivers");
             (body, resp.body)
@@ -274,7 +274,7 @@ async fn nrpc_loopback_each_call_invokes_handler_exactly_once() {
                 deadline_ns: 0,
                 flags: 0,
                 headers: vec![],
-                body: vec![],
+                body: bytes::Bytes::new(),
             };
             lb.call(req).await
         }));
@@ -308,7 +308,7 @@ async fn nrpc_loopback_cancellation_flows_to_handler() {
                     Ok(RpcResponsePayload {
                         status: RpcStatus::Ok,
                         headers: vec![],
-                        body: b"completed without cancel".to_vec(),
+                        body: bytes::Bytes::from_static(b"completed without cancel"),
                     })
                 }
             }
@@ -324,7 +324,7 @@ async fn nrpc_loopback_cancellation_flows_to_handler() {
             deadline_ns: 0,
             flags: 0,
             headers: vec![],
-            body: vec![],
+            body: bytes::Bytes::new(),
         };
         lb.call(req).await
     });
@@ -368,14 +368,14 @@ async fn nrpc_loopback_application_error_round_trips() {
         deadline_ns: 0,
         flags: 0,
         headers: vec![],
-        body: b"{}".to_vec(),
+        body: bytes::Bytes::from_static(b"{}"),
     };
     let resp = tokio::time::timeout(Duration::from_secs(2), loopback.call(req))
         .await
         .expect("call must complete within 2s")
         .expect("oneshot delivers");
     assert_eq!(resp.status, RpcStatus::Application(0xBEEF));
-    assert_eq!(resp.body, b"validation failed: missing field 'id'");
+    assert_eq!(resp.body.as_ref(), b"validation failed: missing field 'id'");
 }
 
 /// Server panic surfaces as `Internal` on the caller side rather
@@ -397,7 +397,7 @@ async fn nrpc_loopback_handler_panic_surfaces_as_internal() {
         deadline_ns: 0,
         flags: 0,
         headers: vec![],
-        body: vec![],
+        body: bytes::Bytes::new(),
     };
     let resp = tokio::time::timeout(Duration::from_secs(2), loopback.call(req))
         .await

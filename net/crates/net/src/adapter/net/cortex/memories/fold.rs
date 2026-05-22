@@ -74,16 +74,22 @@ impl RedexFold<MemoriesState> for MemoriesFold {
                 // flag and overwrite the original creation
                 // timestamp with no observable signal to the
                 // operator.
+                // Per perf #96: values are `Arc<Memory>`. Mutate
+                // through `Arc::make_mut` so the unique case
+                // (no outstanding readers) mutates in place and
+                // the shared case clones-on-write to preserve the
+                // reader's snapshot.
                 if let Some(existing) = state.memories.get_mut(&p.id) {
-                    existing.content = p.content;
-                    existing.tags = p.tags;
-                    existing.source = p.source;
-                    existing.updated_ns = p.now_ns;
+                    let m = std::sync::Arc::make_mut(existing);
+                    m.content = p.content;
+                    m.tags = p.tags;
+                    m.source = p.source;
+                    m.updated_ns = p.now_ns;
                     // pinned + created_ns intentionally preserved.
                 } else {
                     state.memories.insert(
                         p.id,
-                        Memory {
+                        std::sync::Arc::new(Memory {
                             id: p.id,
                             content: p.content,
                             tags: p.tags,
@@ -91,14 +97,15 @@ impl RedexFold<MemoriesState> for MemoriesFold {
                             created_ns: p.now_ns,
                             updated_ns: p.now_ns,
                             pinned: false,
-                        },
+                        }),
                     );
                 }
             }
             DISPATCH_MEMORY_RETAGGED => {
                 let p: MemoryRetaggedPayload =
                     postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
-                if let Some(m) = state.memories.get_mut(&p.id) {
+                if let Some(existing) = state.memories.get_mut(&p.id) {
+                    let m = std::sync::Arc::make_mut(existing);
                     m.tags = p.tags;
                     m.updated_ns = p.now_ns;
                 }
@@ -106,7 +113,8 @@ impl RedexFold<MemoriesState> for MemoriesFold {
             DISPATCH_MEMORY_PINNED => {
                 let p: MemoryPinTogglePayload =
                     postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
-                if let Some(m) = state.memories.get_mut(&p.id) {
+                if let Some(existing) = state.memories.get_mut(&p.id) {
+                    let m = std::sync::Arc::make_mut(existing);
                     m.pinned = true;
                     m.updated_ns = p.now_ns;
                 }
@@ -114,7 +122,8 @@ impl RedexFold<MemoriesState> for MemoriesFold {
             DISPATCH_MEMORY_UNPINNED => {
                 let p: MemoryPinTogglePayload =
                     postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
-                if let Some(m) = state.memories.get_mut(&p.id) {
+                if let Some(existing) = state.memories.get_mut(&p.id) {
+                    let m = std::sync::Arc::make_mut(existing);
                     m.pinned = false;
                     m.updated_ns = p.now_ns;
                 }

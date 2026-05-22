@@ -201,11 +201,11 @@ impl<T: MeshDbTransport + 'static> MeshQueryExecutor for FederatedMeshQueryExecu
                 }
                 cache.insert(
                     key,
-                    super::cache::CachedResult {
-                        rows: collected.clone(),
-                        inserted_at: std::time::Instant::now(),
-                        policy: options.cache_policy,
-                    },
+                    super::cache::CachedResult::new(
+                        collected.clone(),
+                        std::time::Instant::now(),
+                        options.cache_policy,
+                    ),
                 );
                 let rows = stream_results_cancellable(
                     collected.into_iter().map(Ok).collect(),
@@ -372,25 +372,34 @@ impl<T: MeshDbTransport + 'static> FederatedMeshQueryExecutor<T> {
         // shared handle is threaded into both sub-fetches so a
         // cancel on the outer handle aborts both before the
         // local hash-join runs.
-        let left_running = Box::pin(self.execute_uncached_with_handle(
-            ExecutionPlan {
-                root: *left,
-                total_cost: CostEstimate::default(),
-            },
-            handle.clone(),
-        ))
-        .await?;
-        if handle.is_cancelled() {
-            return Err(MeshError::QueryCancelled);
-        }
-        let right_running = Box::pin(self.execute_uncached_with_handle(
-            ExecutionPlan {
-                root: *right,
-                total_cost: CostEstimate::default(),
-            },
-            handle.clone(),
-        ))
-        .await?;
+        //
+        // Per meshdb perf #195 — pre-fix the two sub-fetches were
+        // awaited sequentially (left, then right), serializing two
+        // independent network round-trips. `tokio::try_join!` polls
+        // both futures on the current task and resolves when both
+        // complete, halving the wall-clock latency of every
+        // federated hash-join over remote-on-remote sources (e.g.
+        // 50 ms + 50 ms RTT → 50 ms wall). The cancel-recheck
+        // between the two sequential awaits collapses naturally:
+        // `try_join!` short-circuits on the first error from either
+        // side, and the post-join `is_cancelled()` check (below)
+        // still aborts before the local hash-join runs.
+        let (left_running, right_running) = tokio::try_join!(
+            Box::pin(self.execute_uncached_with_handle(
+                ExecutionPlan {
+                    root: *left,
+                    total_cost: CostEstimate::default(),
+                },
+                handle.clone(),
+            )),
+            Box::pin(self.execute_uncached_with_handle(
+                ExecutionPlan {
+                    root: *right,
+                    total_cost: CostEstimate::default(),
+                },
+                handle.clone(),
+            )),
+        )?;
         if handle.is_cancelled() {
             return Err(MeshError::QueryCancelled);
         }
@@ -977,7 +986,16 @@ fn approximate_row_bytes(row: &ResultRow) -> usize {
 /// Bounded by [`AGGREGATE_MAX_BYTES`] so a remote peer that
 /// returns millions of rows can't OOM the aggregator.
 async fn drain_rows(mut s: ResultStream) -> Result<Vec<ResultRow>, MeshError> {
-    let mut out = Vec::new();
+    // Per meshdb perf #206 — pre-size the result Vec to skip the
+    // first several `Vec::new() → push → grow-by-doubling`
+    // reallocations for the typical query-response size. The
+    // upper bound is `AGGREGATE_MAX_BYTES / 64 ≈ 4M rows` which is
+    // far too large to allocate eagerly (would burn ~32 MiB just
+    // on pointer slots); 128 is the right order of magnitude for
+    // the typical federated response and costs ~4 KiB upfront.
+    // Larger responses still grow on demand.
+    const DRAIN_INITIAL_CAPACITY: usize = 128;
+    let mut out = Vec::with_capacity(DRAIN_INITIAL_CAPACITY);
     let mut bytes: usize = 0;
     while let Some(item) = s.next().await {
         let row = item?;

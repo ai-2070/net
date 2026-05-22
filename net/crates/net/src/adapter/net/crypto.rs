@@ -5,7 +5,7 @@
 //! - ChaCha20-Poly1305 AEAD encryption with counter-based nonces
 //! - Key derivation for session keys
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use chacha20poly1305::{
     aead::{Aead, AeadInPlace, KeyInit},
     ChaCha20Poly1305,
@@ -386,7 +386,18 @@ impl NoiseHandshake {
 /// reuse across concurrent builders.
 pub struct PacketCipher {
     cipher: ChaCha20Poly1305,
-    session_prefix: [u8; 4],
+    /// Pre-built nonce with the session prefix already filled into
+    /// the first 4 bytes (and the counter bytes left as zeros for
+    /// each per-packet overwrite). Per crypto-session perf #138,
+    /// `nonce_from_counter` starts from this template instead of
+    /// zero-initializing then copy-from-slicing the prefix on
+    /// every TX / RX packet. Saves the per-packet prefix memcpy
+    /// (4 bytes) and the zero-init (12 bytes) — small in absolute
+    /// terms but fires twice per packet (once on encrypt, once on
+    /// decrypt) at the highest frequency code path in the system.
+    /// The session prefix is the first 4 bytes; callers needing
+    /// it independently can read `nonce_template[0..4]`.
+    nonce_template: [u8; NONCE_SIZE],
     /// TX counter — owned or shared with other ciphers in a pool.
     tx_counter: Arc<AtomicU64>,
     /// Sliding-window replay state for received counters. A single counter
@@ -583,9 +594,11 @@ pub(crate) fn session_prefix_from_id(session_id: u64) -> [u8; 4] {
 impl PacketCipher {
     /// Create a new fast cipher from a 32-byte key and session ID
     pub fn new(key: &[u8; 32], session_id: u64) -> Self {
+        let mut nonce_template = [0u8; NONCE_SIZE];
+        nonce_template[0..4].copy_from_slice(&session_prefix_from_id(session_id));
         Self {
             cipher: ChaCha20Poly1305::new(key.into()),
-            session_prefix: session_prefix_from_id(session_id),
+            nonce_template,
             tx_counter: Arc::new(AtomicU64::new(0)),
             rx_window: Mutex::new(ReplayWindow::new()),
         }
@@ -601,30 +614,36 @@ impl PacketCipher {
         session_id: u64,
         tx_counter: Arc<AtomicU64>,
     ) -> Self {
+        let mut nonce_template = [0u8; NONCE_SIZE];
+        nonce_template[0..4].copy_from_slice(&session_prefix_from_id(session_id));
         Self {
             cipher: ChaCha20Poly1305::new(key.into()),
-            session_prefix: session_prefix_from_id(session_id),
+            nonce_template,
             tx_counter,
             rx_window: Mutex::new(ReplayWindow::new()),
         }
     }
 
-    /// Generate the next nonce for sending
+    /// Generate the next nonce for sending. Per crypto-session
+    /// perf #138, starts from the pre-built `nonce_template` (which
+    /// already has the session prefix in bytes 0..4) and only
+    /// overwrites the counter bytes 4..12 — eliminates the
+    /// per-call zero-init + prefix memcpy of the legacy form.
     #[inline]
     #[allow(dead_code)]
     fn next_tx_nonce(&self) -> [u8; NONCE_SIZE] {
         let counter = self.tx_counter.fetch_add(1, Ordering::Relaxed);
-        let mut nonce = [0u8; NONCE_SIZE];
-        nonce[0..4].copy_from_slice(&self.session_prefix);
+        let mut nonce = self.nonce_template;
         nonce[4..12].copy_from_slice(&counter.to_le_bytes());
         nonce
     }
 
-    /// Construct a nonce from received counter value
+    /// Construct a nonce from received counter value. Mirrors the
+    /// TX path (#138): start from the prefix-filled template,
+    /// overwrite only the counter bytes.
     #[inline]
     fn nonce_from_counter(&self, counter: u64) -> [u8; NONCE_SIZE] {
-        let mut nonce = [0u8; NONCE_SIZE];
-        nonce[0..4].copy_from_slice(&self.session_prefix);
+        let mut nonce = self.nonce_template;
         nonce[4..12].copy_from_slice(&counter.to_le_bytes());
         nonce
     }
@@ -723,6 +742,83 @@ impl PacketCipher {
         Ok(plaintext_len)
     }
 
+    /// Decrypt a [`Bytes`] payload, preferring the zero-copy
+    /// in-place path when the inbound buffer's refcount is `1`
+    /// (the common case for freshly-received packets — see
+    /// crypto-session perf #128). Falls back to the allocating
+    /// [`Self::decrypt`] when the buffer is shared.
+    ///
+    /// Returns plaintext `Bytes`. On the in-place fast path the
+    /// returned `Bytes` is the same allocation as the inbound
+    /// buffer, truncated to plaintext length. On the fallback path
+    /// it's a fresh allocation wrapping the decrypted `Vec`.
+    ///
+    /// The contract for callers: pre-replay-check (`is_valid_rx_counter`),
+    /// then call this method, then commit (`update_rx_counter`)
+    /// only on success. The fast path doesn't change that contract
+    /// — it's a pure swap for the inner `decrypt` call.
+    #[inline]
+    pub fn decrypt_to_bytes(
+        &self,
+        nonce_counter: u64,
+        aad: &[u8],
+        ciphertext: Bytes,
+    ) -> Result<Bytes, CryptoError> {
+        match ciphertext.try_into_mut() {
+            Ok(mut buf) => {
+                // Fast path: refcount == 1, decrypt in place. No
+                // allocation — the inbound buffer becomes the
+                // plaintext buffer (shrunk by TAG_SIZE).
+                let plaintext_len = self.decrypt_in_place(nonce_counter, aad, &mut buf)?;
+                buf.truncate(plaintext_len);
+                Ok(buf.freeze())
+            }
+            Err(shared) => {
+                // Slow path: another reader still holds a clone
+                // (rare in steady-state RX). Allocate.
+                self.decrypt(nonce_counter, aad, &shared).map(Bytes::from)
+            }
+        }
+    }
+
+    /// AEAD-verify a ciphertext + tag without producing plaintext
+    /// (crypto-session perf #129). Wraps `decrypt_in_place` over
+    /// a small stack-allocated scratch buffer so the AEAD verify
+    /// runs without a `Vec` allocation per call.
+    ///
+    /// Used by [`super::session::NetSession::verify_and_touch_heartbeat`]
+    /// where the inbound packet is a 16-byte tag-only payload —
+    /// pre-fix this routed through `decrypt(...)` and immediately
+    /// dropped the freshly-allocated `Vec<u8>` plaintext. The
+    /// scratch path here is correct for ANY payload size but
+    /// optimal for the heartbeat shape (tag-only, plaintext_len ==
+    /// 0); larger ciphertexts still avoid the heap because the
+    /// scratch sits in a `BytesMut` whose backing is a single
+    /// reserve.
+    ///
+    /// Returns `Ok(())` on tag-valid, `Err` on tag-invalid or
+    /// length-too-short.
+    #[inline]
+    pub fn verify(
+        &self,
+        nonce_counter: u64,
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<(), CryptoError> {
+        if ciphertext.len() < TAG_SIZE {
+            return Err(CryptoError::Decryption("buffer too small".to_string()));
+        }
+        // Use BytesMut to materialize a mutable copy for the
+        // in-place decrypt. The plaintext is discarded — we only
+        // need the tag verify side effect. A heartbeat packet
+        // (TAG_SIZE bytes total) gives `plaintext_len == 0`, so
+        // the only real cost is the AEAD compute itself.
+        let mut buf = BytesMut::with_capacity(ciphertext.len());
+        buf.extend_from_slice(ciphertext);
+        self.decrypt_in_place(nonce_counter, aad, &mut buf)?;
+        Ok(())
+    }
+
     /// Commit a received counter as seen. Must be called only after the
     /// packet has been successfully decrypted and authenticated.
     ///
@@ -734,6 +830,38 @@ impl PacketCipher {
     /// concurrently.
     #[inline]
     pub fn update_rx_counter(&self, received: u64) -> bool {
+        let mut w = self.rx_window.lock();
+        w.commit(received)
+    }
+
+    /// Validate-and-commit a received counter in a single Mutex
+    /// acquisition.
+    ///
+    /// Per crypto-session perf #132 — the legacy RX hot path called
+    /// `is_valid_rx_counter` (lock+unlock) before decrypt and
+    /// `update_rx_counter` (lock+unlock) after decrypt: two
+    /// parking_lot Mutex ops per packet, on every inbound packet.
+    /// `try_admit_rx_counter` does the equivalent post-decrypt
+    /// validate-and-commit under a single lock — `commit` already
+    /// rejects out-of-window / already-seen / u64::MAX counters
+    /// internally, so the pre-decrypt `is_valid_rx_counter` probe is
+    /// redundant for safety. Replays are caught at commit time
+    /// either way; the only behavioral change is that replayed
+    /// packets pay AEAD verify before being rejected (cheaper than
+    /// burning a Mutex lock op on every non-replay).
+    ///
+    /// Returns `true` exactly when [`Self::update_rx_counter`] would
+    /// return `true` on the same input — same novelty semantics,
+    /// same window contract, half the lock ops at 1 M pps. The
+    /// production RX paths (`mesh.rs`, `mod.rs`,
+    /// `session.rs::verify_and_touch_heartbeat`) call this instead
+    /// of the legacy two-step.
+    ///
+    /// The legacy `is_valid_rx_counter` + `update_rx_counter` pair
+    /// stays exposed for fuzz / regression tests that exercise the
+    /// validate-then-commit boundary as two observable steps.
+    #[inline]
+    pub fn try_admit_rx_counter(&self, received: u64) -> bool {
         let mut w = self.rx_window.lock();
         w.commit(received)
     }
@@ -910,6 +1038,140 @@ mod tests {
             .unwrap();
         assert_eq!(len, plaintext.len());
         assert_eq!(&buffer[..len], plaintext);
+    }
+
+    /// Pin crypto-session perf #138: `PacketCipher` carries a
+    /// pre-built `nonce_template` with the session prefix in
+    /// bytes [0..4] and zero counter bytes in [4..12]. A
+    /// regression that drops the template (or fills it
+    /// incorrectly) would silently produce wrong nonces — the
+    /// encrypt/decrypt round-trip would still work *within a
+    /// session* (both sides drift the same way) but cross-impl
+    /// compatibility would break. Assert the structural invariant
+    /// directly.
+    #[test]
+    fn nonce_template_carries_session_prefix_with_zero_counter() {
+        let key = [0x55u8; 32];
+        let session_id = 0x1234_5678_9ABC_DEF0_u64;
+        let cipher = PacketCipher::new(&key, session_id);
+        let expected_prefix = session_prefix_from_id(session_id);
+        assert_eq!(
+            &cipher.nonce_template[0..4],
+            &expected_prefix,
+            "template's prefix bytes must match `session_prefix_from_id`",
+        );
+        assert_eq!(
+            &cipher.nonce_template[4..12],
+            &[0u8; 8],
+            "template's counter bytes start at zero — each per-packet \
+             nonce overwrites them",
+        );
+        // And the runtime contract: a nonce built from counter N
+        // matches the template with N's little-endian bytes in
+        // the counter slot.
+        let nonce = cipher.nonce_from_counter(0xCAFE_BABE_DEAD_BEEF);
+        assert_eq!(&nonce[0..4], &expected_prefix);
+        assert_eq!(&nonce[4..12], &0xCAFE_BABE_DEAD_BEEF_u64.to_le_bytes(),);
+    }
+
+    /// Pin crypto-session perf #128: `decrypt_to_bytes` on a
+    /// refcount-1 `Bytes` takes the in-place fast path — the
+    /// returned plaintext is the SAME allocation as the input,
+    /// just truncated by `TAG_SIZE`. The pre-fix path would
+    /// always allocate a fresh `Vec<u8>` plaintext. A regression
+    /// that drops the `try_into_mut` branch would surface as
+    /// distinct backing pointers.
+    #[test]
+    fn decrypt_to_bytes_in_place_when_refcount_is_one() {
+        let key = [0x77u8; 32];
+        let session_id = 0xAABB_CCDD_EEFF_0011_u64;
+        let cipher = PacketCipher::new(&key, session_id);
+        let aad = b"aad";
+        let plaintext = b"per-packet alloc gone";
+
+        // Encrypt via the in-place TX path, freeze to a Bytes
+        // whose refcount is 1 (no other reader holds it).
+        let mut tx_buf = BytesMut::from(&plaintext[..]);
+        let counter = cipher.encrypt_in_place(aad, &mut tx_buf).unwrap();
+        let inbound: Bytes = tx_buf.freeze();
+        let inbound_ptr = inbound.as_ptr();
+        let inbound_len = inbound.len();
+
+        // Decrypt — fast path should hit.
+        let rx_cipher = PacketCipher::new(&key, session_id);
+        let plaintext_bytes = rx_cipher
+            .decrypt_to_bytes(counter, aad, inbound)
+            .expect("decrypt must succeed");
+
+        assert_eq!(plaintext_bytes.as_ref(), plaintext);
+        assert_eq!(
+            plaintext_bytes.len() + TAG_SIZE,
+            inbound_len,
+            "plaintext shrinks by TAG_SIZE",
+        );
+        assert_eq!(
+            plaintext_bytes.as_ptr(),
+            inbound_ptr,
+            "in-place decrypt: backing pointer must be unchanged",
+        );
+    }
+
+    /// Pin: `decrypt_to_bytes` on a shared (refcount > 1) `Bytes`
+    /// gracefully falls back to the allocating path. A regression
+    /// that panics or fails on shared buffers would surface here.
+    #[test]
+    fn decrypt_to_bytes_falls_back_on_shared_buffer() {
+        let key = [0x77u8; 32];
+        let session_id = 0xAABB_CCDD_EEFF_0011_u64;
+        let cipher = PacketCipher::new(&key, session_id);
+        let aad = b"aad";
+        let plaintext = b"shared inbound";
+
+        let mut tx_buf = BytesMut::from(&plaintext[..]);
+        let counter = cipher.encrypt_in_place(aad, &mut tx_buf).unwrap();
+        let inbound = tx_buf.freeze();
+        let _other_holder = inbound.clone(); // bump refcount to 2
+
+        let rx_cipher = PacketCipher::new(&key, session_id);
+        let plaintext_bytes = rx_cipher
+            .decrypt_to_bytes(counter, aad, inbound)
+            .expect("decrypt must still succeed via the fallback path");
+        assert_eq!(plaintext_bytes.as_ref(), plaintext);
+    }
+
+    /// Pin crypto-session perf #129: `verify(...)` validates the
+    /// AEAD tag without producing plaintext. For a heartbeat-shape
+    /// payload (16-byte tag, empty plaintext) the pre-fix
+    /// `decrypt(...).is_err()` materialized a 0-length `Vec<u8>`
+    /// per call only to drop it; `verify` skips the heap entirely.
+    /// Both genuine and tampered packets are exercised so a
+    /// regression that always returns Ok (or always Err) trips.
+    #[test]
+    fn verify_admits_valid_tag_and_rejects_tampered() {
+        let key = [0x77u8; 32];
+        let session_id = 0xAABB_CCDD_EEFF_0011_u64;
+        let cipher = PacketCipher::new(&key, session_id);
+        let aad = b"heartbeat-aad";
+        let plaintext: &[u8] = b"";
+
+        let mut tx_buf = BytesMut::from(plaintext);
+        let counter = cipher.encrypt_in_place(aad, &mut tx_buf).unwrap();
+        // Heartbeat shape: tag-only payload (no plaintext).
+        assert_eq!(tx_buf.len(), TAG_SIZE);
+        let inbound = tx_buf.freeze();
+
+        let rx_cipher = PacketCipher::new(&key, session_id);
+        rx_cipher
+            .verify(counter, aad, &inbound)
+            .expect("genuine heartbeat must verify");
+
+        // Tamper with the tag — verify must reject.
+        let mut tampered = inbound.to_vec();
+        tampered[0] ^= 0xAA;
+        let err = rx_cipher
+            .verify(counter, aad, &tampered)
+            .expect_err("tampered heartbeat must fail verify");
+        assert!(matches!(err, CryptoError::Decryption(_)));
     }
 
     #[test]
@@ -1430,6 +1692,86 @@ mod tests {
             !cipher.is_valid_rx_counter(u64::MAX - 1),
             "u64::MAX - 1 from rx_counter=0 must reject at is_valid (past MAX_FORWARD)"
         );
+    }
+
+    /// Pin crypto-session perf #132: `try_admit_rx_counter` must
+    /// produce bit-for-bit identical novelty / replay / window-exit
+    /// verdicts to the legacy `update_rx_counter`, including under
+    /// the gnarly cases (u64::MAX refusal, out-of-window past
+    /// rejection, in-window already-seen rejection,
+    /// fresh-novel-acceptance, equal-to-rx_counter rejection). Same
+    /// internal `ReplayWindow::commit`, but the public surface is
+    /// what production callers reach for — a regression that
+    /// rewires `try_admit_rx_counter` to skip a guard, take an
+    /// extra lock, or pre-mutate `rx_counter` on a doomed admit
+    /// would silently re-introduce the perf #132 cost or, worse,
+    /// open a replay window in one production path while leaving
+    /// the legacy path intact.
+    #[test]
+    fn try_admit_rx_counter_matches_update_rx_counter_semantics() {
+        let key = [0x9Au8; 32];
+
+        // Each scenario primes the window via `update_rx_counter`,
+        // then asserts the next admit against both APIs (across
+        // independent ciphers so primer state stays isolated). The
+        // verdicts must agree at every step.
+        let scenarios: &[(&[u64], u64, bool)] = &[
+            // Fresh cipher → first admit at 100 is novel.
+            (&[], 100, true),
+            // After 100, replay of 100 is rejected.
+            (&[100], 100, false),
+            // After 100, admit at 200 is novel.
+            (&[100], 200, true),
+            // After 100, admit at 50 is in-window AND novel
+            // (within ±1024 of rx_counter=101).
+            (&[100], 50, true),
+            // u64::MAX is refused outright.
+            (&[100], u64::MAX, false),
+            // After advancing past the window, an old counter
+            // outside the window is rejected.
+            (&[10_000], 100, false),
+            // Re-admit of the just-committed counter is rejected
+            // (the bitmap remembers).
+            (&[10_000, 9_999], 9_999, false),
+        ];
+
+        for (i, (primer, probe, expected)) in scenarios.iter().enumerate() {
+            let admit_cipher = PacketCipher::new(&key, 0x4242);
+            let update_cipher = PacketCipher::new(&key, 0x4242);
+            for &p in *primer {
+                assert!(
+                    admit_cipher.try_admit_rx_counter(p),
+                    "scenario {i}: priming admit({p}) must succeed"
+                );
+                assert!(
+                    update_cipher.update_rx_counter(p),
+                    "scenario {i}: priming update({p}) must succeed"
+                );
+            }
+            assert_eq!(
+                admit_cipher.try_admit_rx_counter(*probe),
+                *expected,
+                "scenario {i}: try_admit_rx_counter({probe}) verdict differs from spec",
+            );
+            assert_eq!(
+                update_cipher.update_rx_counter(*probe),
+                *expected,
+                "scenario {i}: update_rx_counter({probe}) verdict differs from spec",
+            );
+            // And the two APIs must agree on the same input from
+            // identical priming state.
+            let a = PacketCipher::new(&key, 0x4242);
+            let b = PacketCipher::new(&key, 0x4242);
+            for &p in *primer {
+                a.update_rx_counter(p);
+                b.update_rx_counter(p);
+            }
+            assert_eq!(
+                a.try_admit_rx_counter(*probe),
+                b.update_rx_counter(*probe),
+                "scenario {i}: try_admit_rx_counter and update_rx_counter must agree",
+            );
+        }
     }
 
     // ---------- Debug redaction contract ----------

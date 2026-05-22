@@ -90,7 +90,7 @@ impl Adapter for RecordingAdapter {
     async fn init(&mut self) -> Result<(), AdapterError> {
         Ok(())
     }
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+    async fn on_batch(&self, batch: std::sync::Arc<Batch>) -> Result<(), AdapterError> {
         let shard_id = batch.shard_id;
         let sequence_start = batch.sequence_start;
         let len = batch.len();
@@ -363,7 +363,7 @@ impl Adapter for SlowRecordingAdapter {
     async fn init(&mut self) -> Result<(), AdapterError> {
         Ok(())
     }
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+    async fn on_batch(&self, batch: std::sync::Arc<Batch>) -> Result<(), AdapterError> {
         tokio::time::sleep(self.delay).await;
         self.inner.on_batch(batch).await
     }
@@ -603,7 +603,7 @@ impl Adapter for WedgedAdapter {
     async fn init(&mut self) -> Result<(), AdapterError> {
         Ok(())
     }
-    async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+    async fn on_batch(&self, _batch: std::sync::Arc<Batch>) -> Result<(), AdapterError> {
         std::future::pending::<()>().await;
         unreachable!()
     }

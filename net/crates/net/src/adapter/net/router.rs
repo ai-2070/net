@@ -532,7 +532,6 @@ impl NetRouter {
             .ok_or(RouterError::NoRoute)?;
 
         // Update header for forwarding
-        let mut new_data = BytesMut::with_capacity(data.len());
         let mut fwd_header = routing_header;
         fwd_header.forward();
         // Re-check expiry after `forward()` decrements the TTL: if
@@ -549,12 +548,36 @@ impl NetRouter {
         // successfully ingressed for the stream before queueing
         // the forward.
         self.routing_table.record_in(stream_id, len);
-        fwd_header.write_to(&mut new_data);
-        new_data.extend_from_slice(&data[ROUTING_HEADER_SIZE..]);
+
+        // Fast path (perf #18): if the inbound `data` is sole-
+        // owned (the typical case for UDP packets just received
+        // from the socket), `try_into_mut` returns the same
+        // allocation as a `BytesMut` in O(1). We overwrite the
+        // first ROUTING_HEADER_SIZE bytes in place — refcount
+        // bump only, no body copy. Pre-fix this allocated a
+        // fresh buffer the size of the entire packet and
+        // memcpy'd the body for every forward; for a relay node
+        // moving GB/s of packets, bandwidth-class waste.
+        //
+        // Slow path: an outstanding clone of `data` (e.g. some
+        // observer / mirror) forces the copy. We fall back to
+        // the prior allocation strategy.
+        let forwarded_data = match data.try_into_mut() {
+            Ok(mut mut_data) => {
+                fwd_header.write_at(&mut mut_data[..ROUTING_HEADER_SIZE]);
+                mut_data.freeze()
+            }
+            Err(orig_data) => {
+                let mut new_data = BytesMut::with_capacity(orig_data.len());
+                fwd_header.write_to(&mut new_data);
+                new_data.extend_from_slice(&orig_data[ROUTING_HEADER_SIZE..]);
+                new_data.freeze()
+            }
+        };
 
         // Queue for sending
         let packet = QueuedPacket {
-            data: new_data.freeze(),
+            data: forwarded_data,
             dest: next_hop,
             stream_id,
             priority: routing_header.flags.is_priority(),

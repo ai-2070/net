@@ -2,6 +2,7 @@
 //! `CortexAdapter<MemoriesState>`'s `RwLock`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -10,12 +11,25 @@ use super::types::{Memory, MemoryId};
 
 /// Materialized view over the memories log.
 ///
+/// Per perf #96, the value type is `Arc<Memory>` (not `Memory`).
+/// Query reads (`execute`, `find_many`, `MemoriesQuery::collect`)
+/// hand back `Vec<Arc<Memory>>` — each match is an atomic
+/// refcount bump instead of a deep `Memory` clone (which carries
+/// `String content`, `Vec<String> tags`, `String source` — 3+
+/// allocations per cloned entry). Mutations route through
+/// `Arc::make_mut` so a unique Arc mutates in place (the common
+/// case under the fold's serial write lock) and a shared Arc
+/// (outstanding reader) clones-on-write to preserve the reader's
+/// snapshot.
+///
 /// `Serialize` / `Deserialize` are derived so the state can be
 /// snapshotted via [`super::super::CortexAdapter::snapshot`] and
 /// restored via [`super::super::CortexAdapter::open_from_snapshot`].
+/// `Arc<Memory>` serializes transparently with serde's `rc`
+/// feature (already enabled in this crate's `serde` dep).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct MemoriesState {
-    pub(super) memories: HashMap<MemoryId, Memory>,
+    pub(super) memories: HashMap<MemoryId, Arc<Memory>>,
 }
 
 impl MemoriesState {
@@ -24,9 +38,19 @@ impl MemoriesState {
         Self::default()
     }
 
-    /// Look up a memory by id.
+    /// Look up a memory by id. Returns a borrow into the `Arc`
+    /// payload so the common single-read case doesn't pay a
+    /// refcount bump; callers that need an owned share can clone
+    /// the Arc themselves via [`Self::get_arc`].
     pub fn get(&self, id: MemoryId) -> Option<&Memory> {
-        self.memories.get(&id)
+        self.memories.get(&id).map(|a| a.as_ref())
+    }
+
+    /// Look up a memory by id and return an Arc share. Cheap
+    /// (atomic refcount bump) — use when the caller needs to hold
+    /// the memory past the borrow's lifetime.
+    pub fn get_arc(&self, id: MemoryId) -> Option<Arc<Memory>> {
+        self.memories.get(&id).cloned()
     }
 
     /// Total number of memories currently retained.
@@ -46,17 +70,23 @@ impl MemoriesState {
 
     /// Iterate over every retained memory.
     pub fn all(&self) -> impl Iterator<Item = &Memory> {
-        self.memories.values()
+        self.memories.values().map(|a| a.as_ref())
     }
 
     /// Iterate over currently-pinned memories.
     pub fn pinned(&self) -> impl Iterator<Item = &Memory> {
-        self.memories.values().filter(|m| m.pinned)
+        self.memories
+            .values()
+            .map(|a| a.as_ref())
+            .filter(|m| m.pinned)
     }
 
     /// Iterate over memories that are NOT pinned.
     pub fn unpinned(&self) -> impl Iterator<Item = &Memory> {
-        self.memories.values().filter(|m| !m.pinned)
+        self.memories
+            .values()
+            .map(|a| a.as_ref())
+            .filter(|m| !m.pinned)
     }
 
     // -- Prisma-ish convenience surface (NetDB layer) -------------------
@@ -66,8 +96,11 @@ impl MemoriesState {
         self.get(id)
     }
 
-    /// Collect all memories matching `filter`, respecting order + limit.
-    pub fn find_many(&self, filter: &MemoriesFilter) -> Vec<Memory> {
+    /// Collect all memories matching `filter`, respecting order +
+    /// limit. Returns `Vec<Arc<Memory>>` per perf #96 — each
+    /// match is one atomic refcount bump instead of the legacy
+    /// deep `Memory` clone.
+    pub fn find_many(&self, filter: &MemoriesFilter) -> Vec<Arc<Memory>> {
         filter.apply(self.query()).collect()
     }
 
@@ -86,8 +119,8 @@ impl MemoriesState {
 mod tests {
     use super::*;
 
-    fn mem(id: MemoryId, pinned: bool) -> Memory {
-        Memory {
+    fn mem(id: MemoryId, pinned: bool) -> Arc<Memory> {
+        Arc::new(Memory {
             id,
             content: format!("mem-{}", id),
             tags: Vec::new(),
@@ -95,7 +128,7 @@ mod tests {
             created_ns: 0,
             updated_ns: 0,
             pinned,
-        }
+        })
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //! entry offsets. v1 keeps that machinery inside `RedexFile`; this
 //! module just provides the primitive append+read surface.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use super::error::RedexError;
 
@@ -19,15 +19,31 @@ use super::error::RedexError;
 /// below to leave room for concurrent appends during a retention sweep.
 pub(super) const MAX_SEGMENT_BYTES: usize = 3 * 1024 * 1024 * 1024; // 3 GB
 
-/// In-memory payload segment backed by `Vec<u8>`.
+/// In-memory payload segment.
 ///
 /// Append-only from the caller's perspective. The retention sweep may
 /// rewrite the buffer and advance `base_offset` to drop evicted heads;
 /// all live offsets stored in `RedexEntry` records are absolute over
 /// the logical seq-space and translated through `base_offset` on read.
+///
+/// The buffer is held as a [`Bytes`] so `read` returns zero-copy
+/// `Bytes::slice` snapshots — refcount bumps only. Pre-fix
+/// [perf #51 in `docs/performance/net-perf-analysis.md`] `read`
+/// did a full `Bytes::copy_from_slice` on every call, costing one
+/// memcpy per materialized event on every `tail` / `read_range` /
+/// `read_one` / replication ship / watcher delivery path. For a
+/// 4KB-payload watcher at 100K ev/s that was 400 MB/s of pure
+/// memory bandwidth wasted on the copy.
+///
+/// Appends use [`Bytes::try_into_mut`] to extend in place when the
+/// segment is the sole owner (the common case — readers consume
+/// returned `Bytes` slices and drop them quickly). When outstanding
+/// reader slices exist, `try_into_mut` falls back to a single
+/// `BytesMut` allocation; existing slices keep their portion of
+/// the old `Bytes` alive via refcount and stay valid.
 #[derive(Debug)]
 pub struct HeapSegment {
-    buf: Vec<u8>,
+    buf: Bytes,
     /// The absolute offset of the first byte currently in `buf`.
     /// Starts at 0 and increases as eviction compacts the head.
     base_offset: u64,
@@ -37,15 +53,18 @@ impl HeapSegment {
     /// Create an empty segment.
     pub fn new() -> Self {
         Self {
-            buf: Vec::new(),
+            buf: Bytes::new(),
             base_offset: 0,
         }
     }
 
     /// Create an empty segment with `capacity` bytes reserved.
     pub fn with_capacity(capacity: usize) -> Self {
+        // BytesMut::with_capacity reserves; freezing immediately
+        // yields a Bytes whose capacity hint is carried into the
+        // first `try_into_mut` round-trip.
         Self {
-            buf: Vec::with_capacity(capacity),
+            buf: BytesMut::with_capacity(capacity).freeze(),
             base_offset: 0,
         }
     }
@@ -56,13 +75,33 @@ impl HeapSegment {
     #[cfg(feature = "redex-disk")]
     pub(super) fn from_existing(buf: Vec<u8>) -> Self {
         Self {
-            buf,
+            buf: Bytes::from(buf),
             base_offset: 0,
         }
     }
 
+    /// Acquire the underlying buffer as a mutable [`BytesMut`].
+    ///
+    /// Fast path: when no reader holds a `Bytes` slice into the
+    /// current buf, [`Bytes::try_into_mut`] returns the same
+    /// allocation as a `BytesMut` in O(1). Slow path: an outstanding
+    /// reader (typical only briefly during watcher delivery) forces
+    /// a single `BytesMut::extend_from_slice` copy of the live
+    /// region — the next `freeze` yields a fresh `Bytes` and the
+    /// reader's stale snapshot stays valid via its own refcount.
+    fn take_mut_or_copy(&mut self, additional: usize) -> BytesMut {
+        match std::mem::take(&mut self.buf).try_into_mut() {
+            Ok(m) => m,
+            Err(bytes) => {
+                let mut m = BytesMut::with_capacity(bytes.len() + additional);
+                m.extend_from_slice(&bytes);
+                m
+            }
+        }
+    }
+
     /// Append `payload` and return the absolute offset it was written
-    /// at (offset in the logical seq-space, not in the backing `Vec`).
+    /// at (offset in the logical seq-space, not in the backing buffer).
     pub fn append(&mut self, payload: &[u8]) -> Result<u64, RedexError> {
         if self.buf.len().saturating_add(payload.len()) > MAX_SEGMENT_BYTES {
             return Err(RedexError::PayloadTooLarge {
@@ -71,7 +110,9 @@ impl HeapSegment {
             });
         }
         let offset = self.base_offset + self.buf.len() as u64;
-        self.buf.extend_from_slice(payload);
+        let mut m = self.take_mut_or_copy(payload.len());
+        m.extend_from_slice(payload);
+        self.buf = m.freeze();
         Ok(offset)
     }
 
@@ -92,16 +133,21 @@ impl HeapSegment {
             });
         }
         let first = self.base_offset + self.buf.len() as u64;
-        self.buf.reserve(total);
+        let mut m = self.take_mut_or_copy(total);
+        m.reserve(total);
         for p in payloads {
-            self.buf.extend_from_slice(p);
+            m.extend_from_slice(p);
         }
+        self.buf = m.freeze();
         Ok(first)
     }
 
     /// Read `len` bytes starting at absolute `offset`. Returns `None`
     /// if the slice is not fully contained in the live region
     /// (evicted or past end).
+    ///
+    /// Zero-copy: returns a [`Bytes`] slice that shares the
+    /// underlying allocation with the segment (refcount bump only).
     pub fn read(&self, offset: u64, len: u32) -> Option<Bytes> {
         let len = len as usize;
         if offset < self.base_offset {
@@ -112,7 +158,7 @@ impl HeapSegment {
         if end > self.buf.len() {
             return None;
         }
-        Some(Bytes::copy_from_slice(&self.buf[rel..end]))
+        Some(self.buf.slice(rel..end))
     }
 
     /// Number of live bytes currently in the segment.
@@ -152,25 +198,48 @@ impl HeapSegment {
         self.base_offset = 0;
     }
 
-    /// Test-only: mutable access to the underlying byte buffer.
+    /// Test-only: mutate the underlying byte buffer in place.
     /// Used by checksum-on-read regression tests to simulate
     /// on-disk corruption without going through a real I/O path.
+    ///
+    /// Takes a closure rather than returning `&mut [u8]` because
+    /// the new `Bytes`-backed buffer needs a `try_into_mut` /
+    /// `freeze` round-trip to give the test a mutable view, and a
+    /// returned `&mut [u8]` would dangle past the temporary
+    /// `BytesMut`. The closure scopes the borrow correctly.
     #[cfg(test)]
-    pub(super) fn bytes_for_test_mut(&mut self) -> &mut [u8] {
-        &mut self.buf
+    pub(super) fn with_bytes_for_test_mut<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        let mut m = self.take_mut_or_copy(0);
+        f(&mut m);
+        self.buf = m.freeze();
     }
 
     /// Evict the prefix of the segment strictly below `new_base` in
     /// the absolute offset space.
     ///
-    /// Returns the number of bytes evicted.
+    /// Returns the number of bytes evicted. The retained tail
+    /// becomes a fresh `Bytes` slice — refcount bump only.
+    /// Existing reader slices into the evicted prefix stay valid
+    /// via their own refcounts to the prior allocation.
     pub fn evict_prefix_to(&mut self, new_base: u64) -> u64 {
         if new_base <= self.base_offset {
             return 0;
         }
         let delta = (new_base - self.base_offset) as usize;
         let delta = delta.min(self.buf.len());
-        self.buf.drain(..delta);
+        // `Bytes::slice` is zero-copy; the old buf is dropped as
+        // soon as the last outstanding reader releases its slice.
+        // Materialize the tail into a fresh BytesMut so subsequent
+        // appends can `try_into_mut` cheaply — otherwise the
+        // sub-Bytes returned by `slice` still references the
+        // original allocation and `try_into_mut` would have to
+        // copy on every append.
+        let mut m = BytesMut::with_capacity(self.buf.len() - delta);
+        m.extend_from_slice(&self.buf[delta..]);
+        self.buf = m.freeze();
         self.base_offset += delta as u64;
         delta as u64
     }
@@ -288,6 +357,117 @@ mod tests {
         ));
         // And the buffer state stayed clean — no partial extension.
         assert_eq!(seg.live_bytes(), MAX_SEGMENT_BYTES);
+    }
+
+    /// Pin perf #51: `read` returns a zero-copy `Bytes` slice
+    /// over the underlying buffer, not a copy. We observe this
+    /// by computing the buffer's allocation identity (the raw
+    /// pointer) and asserting `read` returns a slice into the
+    /// same allocation.
+    ///
+    /// `Bytes::as_ptr()` points into the buffer's data; for a
+    /// non-empty Bytes that's the address of byte 0. For a
+    /// slice produced by `Bytes::slice(r)` that's the address
+    /// of byte `r.start` IN THE SAME allocation — i.e., we can
+    /// compute `slice.as_ptr() - r.start` and it must equal the
+    /// original buffer's `as_ptr()`.
+    ///
+    /// A regression that re-introduces `Bytes::copy_from_slice`
+    /// allocates a fresh buffer; the pointer arithmetic above
+    /// would yield an unrelated address.
+    #[test]
+    fn read_returns_zero_copy_slice_of_underlying_buffer() {
+        let mut seg = HeapSegment::new();
+        let payload = b"the quick brown fox jumps over the lazy dog";
+        seg.append(payload).unwrap();
+        let buf_ptr = seg.buf.as_ptr();
+
+        let slice = seg.read(0, payload.len() as u32).unwrap();
+        // Full-range read returns a Bytes whose data pointer
+        // matches the buffer's data pointer exactly.
+        assert_eq!(
+            slice.as_ptr(),
+            buf_ptr,
+            "read(0, len) must return a zero-copy slice of the segment buffer",
+        );
+        assert_eq!(slice.as_ref(), payload);
+
+        // Sub-range read: data pointer is offset by the start of
+        // the range within the SAME allocation. Pre-fix
+        // `Bytes::copy_from_slice` would put `sub` in a fresh
+        // allocation completely unrelated to `buf_ptr`.
+        let sub = seg.read(4, 5).unwrap();
+        // Compute the address delta via `usize::wrapping_sub`,
+        // not `<*const u8>::offset_from`. `offset_from` is
+        // documented UB when the two pointers are NOT from the
+        // same allocation — which is exactly the regression case
+        // this test is trying to detect (a re-introduced
+        // `Bytes::copy_from_slice` would place `sub` in a fresh
+        // allocation unrelated to `buf_ptr`). The integer-cast
+        // form is well-defined for any pointer values: in the
+        // zero-copy case it yields exactly 4; in the regression
+        // case it yields some large unrelated number that fails
+        // the equality assertion cleanly without invoking UB.
+        let sub_offset = (sub.as_ptr() as usize).wrapping_sub(buf_ptr as usize);
+        assert_eq!(
+            sub_offset, 4,
+            "sub-range read must be a slice into the original buffer at offset 4; \
+             got offset {sub_offset} (a regression here means read deep-copies)",
+        );
+        assert_eq!(sub.as_ref(), b"quick");
+    }
+
+    /// Companion to the zero-copy pin above: prove the
+    /// `wrapping_sub` comparison correctly detects the
+    /// regression-case shape (a `Bytes` from a fresh allocation
+    /// unrelated to the segment buffer). Pre-fix this test
+    /// would have used `<*const u8>::offset_from`, which is
+    /// documented UB across allocations — the very case the
+    /// regression test is meant to detect. The integer-cast
+    /// form (`(p as usize).wrapping_sub(q as usize)`) is
+    /// well-defined for any pointer pair.
+    ///
+    /// We construct what a deep-copy regression WOULD return:
+    /// a fresh `Bytes::copy_from_slice` of the bytes at offset
+    /// 4, holding the same content as the sub-slice but in a
+    /// new allocation. The wrapping_sub against the segment's
+    /// `buf_ptr` must yield some non-4 value (with overwhelming
+    /// probability — distinct heap allocations don't land at a
+    /// fixed offset of each other).
+    #[test]
+    fn read_zero_copy_pin_detects_deep_copy_via_wrapping_sub() {
+        let mut seg = HeapSegment::new();
+        let payload = b"the quick brown fox jumps over the lazy dog";
+        seg.append(payload).unwrap();
+        let buf_ptr = seg.buf.as_ptr();
+
+        // Simulate the regression: a fresh allocation carrying
+        // the same five bytes the zero-copy `read(4, 5)` would
+        // produce. `Bytes::copy_from_slice` allocates a brand
+        // new buffer; its data pointer is unrelated to
+        // `buf_ptr`.
+        let fake_deep_copy = bytes::Bytes::copy_from_slice(&payload[4..9]);
+        assert_eq!(fake_deep_copy.as_ref(), b"quick");
+        let fake_offset = (fake_deep_copy.as_ptr() as usize).wrapping_sub(buf_ptr as usize);
+        // The two addresses live in different allocations. The
+        // wrapping_sub is some arbitrary non-4 value — we can't
+        // predict it, but we can assert it isn't 4 (the rare
+        // collision case where the allocator happens to lay the
+        // fresh buffer exactly 4 bytes past the segment buffer
+        // is vanishingly improbable on any real allocator, and
+        // even a deliberate adversary couldn't arrange it
+        // through public API).
+        assert_ne!(
+            fake_offset, 4,
+            "wrapping_sub form must distinguish a fresh allocation \
+             from a same-allocation sub-slice — if these collide \
+             the zero-copy pin would no longer detect a deep-copy \
+             regression",
+        );
+
+        // And confirm the wrapping_sub form is non-UB by running
+        // it across the two unrelated pointers without exploding.
+        let _well_defined: usize = fake_offset;
     }
 
     #[test]

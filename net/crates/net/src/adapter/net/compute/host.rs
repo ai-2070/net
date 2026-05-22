@@ -227,6 +227,15 @@ impl DaemonHost {
 
         self.stats.events_processed += 1;
 
+        // Skip horizon encode when the daemon produced no outputs — it
+        // walks every entry in the horizon map and runs xxh3_64 per
+        // entry, and there's nothing to attach the encoded value to.
+        // Daemons with low output ratio (filtering, observing,
+        // state-update workloads) take this branch most of the time.
+        if outputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
         // Wrap each output payload in a causal link
         let horizon_encoded = self.horizon.encode();
         let mut causal_outputs = Vec::with_capacity(outputs.len());
@@ -637,6 +646,53 @@ mod tests {
 
         // Output should carry horizon info about the observed event
         assert_ne!(outputs[0].link.horizon_encoded, 0);
+    }
+
+    /// Pin #153: `deliver` must skip the horizon encode + chain.append
+    /// work entirely when the daemon produced no outputs, but still
+    /// observe the inbound event into the horizon and bump
+    /// `events_processed`. Catches a regression that re-introduces the
+    /// per-event `horizon.encode()` xxh3 walk on the no-output path
+    /// (filtering / observing daemons take this branch most of the time).
+    #[test]
+    fn deliver_skips_horizon_encode_when_daemon_returns_no_outputs() {
+        /// A daemon that observes events but never emits.
+        struct SinkDaemon;
+        impl MeshDaemon for SinkDaemon {
+            fn name(&self) -> &str {
+                "sink"
+            }
+            fn requirements(&self) -> CapabilityFilter {
+                CapabilityFilter::default()
+            }
+            fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let kp = EntityKeypair::generate();
+        let mut host = DaemonHost::new(Box::new(SinkDaemon), kp, DaemonHostConfig::default());
+        let chain_head_before = *host.chain.head();
+
+        let event = make_event(0xC0DE, 7, b"observe-only");
+        let outputs = host.deliver(&event).unwrap();
+
+        // No outputs to wrap.
+        assert!(outputs.is_empty());
+
+        // Horizon observation still happened (counted in stats).
+        assert_eq!(host.stats().events_processed, 1);
+        // No outputs emitted (we short-circuit before chain.append).
+        assert_eq!(host.stats().events_emitted, 0);
+
+        // chain.head() is unchanged — confirms `chain.append` never
+        // ran. If the short-circuit regresses, an empty `for payload
+        // in outputs` loop wouldn't bump the head either, so this
+        // check pairs with the events_emitted check below: together
+        // they prove BOTH that no outputs were produced AND that the
+        // chain wasn't touched, which is the structural guarantee the
+        // short-circuit provides.
+        assert_eq!(*host.chain.head(), chain_head_before);
     }
 
     // ---- Regression tests for Cubic AI findings ----

@@ -214,6 +214,21 @@ struct TreeBody {
     depth: u8,
 }
 
+/// Borrow-only sibling of [`TreeBody`]. Same rationale as
+/// [`ManifestBodyRef`] — measure-only via postcard with no URI
+/// clone. (Tree bodies don't have a chunk vector, so the saving
+/// here is just the `String` clone, but the symmetry keeps the
+/// two encoded_len arms consistent.)
+#[derive(Serialize)]
+struct TreeBodyRef<'a> {
+    body_version: u8,
+    uri: &'a str,
+    encoding: Encoding,
+    root_hash: [u8; 32],
+    total_size: u64,
+    depth: u8,
+}
+
 /// Postcard-encoded manifest body. Lives inside the
 /// [`BlobRef::Manifest`] wire form after the four-byte magic +
 /// version discriminator.
@@ -234,6 +249,28 @@ struct ManifestBody {
     /// Sum of every chunk's `size`. Cached for cheap `BlobRef::size`
     /// without iterating the vector; validated on decode to match
     /// the iterated sum.
+    total_size: u64,
+}
+
+/// Borrow-only sibling of [`ManifestBody`]. Postcard's serializer
+/// walks fields in declaration order and encodes `String` /
+/// `Vec<T>` identically to `&str` / `&[T]` (same length-prefix +
+/// bytes shape), so this type's `Serialize` output is byte-for-
+/// byte identical to [`ManifestBody`]'s with the same field
+/// values. Used by [`BlobRef::encoded_len`] to *measure* without
+/// cloning the URI and chunk vector — cubic-dev-ai code review
+/// flagged the original `chunks.clone()` as a 36-bytes-per-chunk
+/// allocation per sizing call on large manifests.
+///
+/// Encoders that need to produce the wire bytes still use
+/// [`ManifestBody`] via `postcard::to_allocvec`; this type is
+/// measure-only.
+#[derive(Serialize)]
+struct ManifestBodyRef<'a> {
+    body_version: u8,
+    uri: &'a str,
+    encoding: Encoding,
+    chunks: &'a [ChunkRef],
     total_size: u64,
 }
 
@@ -537,17 +574,77 @@ impl BlobRef {
     // -----------------------------------------------------------
 
     /// Encoded length in bytes. The `Small` variant is O(1) —
-    /// header size plus URI length. The `Manifest` variant pays
-    /// the full postcard serialization cost (the length is taken
-    /// from a temporary buffer) because postcard's leb128
-    /// length-prefixes make a closed-form size hard to predict.
-    /// Callers in a hot path that already need the bytes should
-    /// reuse [`Self::encode`] directly instead of pairing
-    /// `encoded_len` + `encode`.
+    /// header size plus URI length. The `Manifest` / `Tree`
+    /// variants now use [`postcard::experimental::serialized_size`]
+    /// to *measure* without allocating, per dataforts perf #174.
+    ///
+    /// Pre-fix these variants called `self.encode().len()` — a
+    /// full postcard alloc-encode of the entire body just to
+    /// read `.len()` off the temporary and drop it. For a
+    /// 1000-chunk Manifest, that was 64 KB+ allocated and
+    /// thrown away per `encoded_len` call. Workloads that
+    /// pair `encoded_len` + `encode` (typical sizing-then-emit
+    /// pattern) paid 2× the encode cost.
+    ///
+    /// Post-fix `encoded_len` walks the structure measuring
+    /// without allocating the output buffer — same byte count,
+    /// no `Vec` churn.
+    #[expect(
+        clippy::expect_used,
+        reason = "ManifestBodyRef / TreeBodyRef are composed of sized Serialize types — `postcard::experimental::serialized_size` is infallible against them; mirrors the existing `#[expect]` on `encode()`"
+    )]
     pub fn encoded_len(&self) -> usize {
         match self {
             Self::Small { uri, .. } => BLOB_REF_SMALL_HEADER_LEN + uri.len(),
-            Self::Manifest { .. } | Self::Tree { .. } => self.encode().len(),
+            Self::Manifest {
+                uri,
+                encoding,
+                chunks,
+                total_size,
+                ..
+            } => {
+                // Per cubic-dev-ai code review: use the borrow-
+                // only [`ManifestBodyRef`] so the sizing walk
+                // doesn't `chunks.clone()` (36 bytes/chunk × N for
+                // a manifest of N chunks — kilobytes of pointless
+                // allocation per `encoded_len` call on large
+                // manifests) or `uri.clone()`. Postcard's
+                // serializer encodes `&str` and `&[T]` identically
+                // to `String` / `Vec<T>` so the walked byte count
+                // matches `encode()`'s output exactly.
+                let body = ManifestBodyRef {
+                    body_version: BLOB_MANIFEST_BODY_VERSION,
+                    uri: uri.as_str(),
+                    encoding: *encoding,
+                    chunks: chunks.as_slice(),
+                    total_size: *total_size,
+                };
+                let body_len = postcard::experimental::serialized_size(&body)
+                    .expect("manifest body postcard-encodes infallibly");
+                BLOB_REF_MAGIC.len() + 1 + body_len
+            }
+            Self::Tree {
+                uri,
+                encoding,
+                root_hash,
+                total_size,
+                depth,
+                ..
+            } => {
+                // Symmetric with the Manifest arm — borrow rather
+                // than clone the URI for the sizing walk.
+                let body = TreeBodyRef {
+                    body_version: BLOB_TREE_BODY_VERSION,
+                    uri: uri.as_str(),
+                    encoding: *encoding,
+                    root_hash: *root_hash,
+                    total_size: *total_size,
+                    depth: *depth,
+                };
+                let body_len = postcard::experimental::serialized_size(&body)
+                    .expect("tree body postcard-encodes infallibly");
+                BLOB_REF_MAGIC.len() + 1 + body_len
+            }
         }
     }
 
@@ -1237,6 +1334,136 @@ mod tests {
         let bytes = original.encode();
         let decoded = BlobRef::decode(&bytes).unwrap().unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// Pin dataforts perf #174: `encoded_len` measures the same
+    /// byte count `encode()` produces, byte-for-byte, without
+    /// allocating the encoded buffer. Pre-fix `encoded_len` for
+    /// Manifest / Tree allocated a `Vec` via `encode()` and
+    /// threw it away. The post-fix path uses
+    /// `postcard::experimental::serialized_size` to walk the
+    /// structure measuring. A regression that drifts the
+    /// header-prefix accounting (4-byte magic + 1-byte version)
+    /// would surface as a length mismatch here.
+    #[test]
+    fn encoded_len_matches_encode_len_without_allocating() {
+        // Small variant: closed-form size — sanity check.
+        let small = small_fixture();
+        assert_eq!(small.encoded_len(), small.encode().len(), "Small parity");
+
+        // Manifest variants across several chunk-count regimes:
+        // 1 chunk (smallest), 8 chunks (typical), 128 chunks
+        // (large). Each exercises a different postcard leb128
+        // length-prefix size.
+        for count in [1usize, 8, 128] {
+            let manifest = manifest_fixture(count);
+            assert_eq!(
+                manifest.encoded_len(),
+                manifest.encode().len(),
+                "Manifest({count} chunks) parity",
+            );
+        }
+
+        // Tree variant.
+        let tree = BlobRef::tree("mesh://tree", Encoding::Replicated, [0xCD; 32], 1024, 3)
+            .expect("tree ref");
+        assert_eq!(tree.encoded_len(), tree.encode().len(), "Tree parity");
+
+        // ReedSolomon-encoded manifest: different encoding variant
+        // sometimes serializes to a different byte count.
+        let rs_manifest = BlobRef::manifest(
+            "mesh://rs",
+            Encoding::ReedSolomon { k: 4, m: 2 },
+            vec![ChunkRef {
+                hash: [0xAA; 32],
+                size: 1024,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            rs_manifest.encoded_len(),
+            rs_manifest.encode().len(),
+            "RS Manifest parity",
+        );
+    }
+
+    /// Pin cubic-dev-ai code review for dataforts perf #174:
+    /// `ManifestBodyRef` and `TreeBodyRef` must serialize
+    /// byte-for-byte identically to the owned `ManifestBody` /
+    /// `TreeBody` they mirror. The `encoded_len` sizing path
+    /// uses the `Ref` form to avoid the per-chunk `.clone()` of
+    /// the chunk vector; the byte-for-byte serialization
+    /// equivalence is what makes the substitution safe.
+    ///
+    /// A future refactor that adds/reorders/renames a field in
+    /// one type but not the other would silently corrupt the
+    /// sizing path (post-corruption an `encoded_len` call would
+    /// disagree with `encode().len()`). The existing
+    /// `encoded_len_matches_encode_len_without_allocating` test
+    /// would also catch this — this companion narrows the
+    /// signal to specifically "ref form vs owned form" rather
+    /// than the broader "encoded_len vs encode round-trip".
+    #[test]
+    fn manifest_body_ref_serializes_identically_to_owned_form() {
+        let chunks: Vec<ChunkRef> = (0..32)
+            .map(|i| ChunkRef {
+                hash: [i as u8; 32],
+                size: 1024 + i as u32,
+            })
+            .collect();
+        let owned = ManifestBody {
+            body_version: BLOB_MANIFEST_BODY_VERSION,
+            uri: "mesh://parity-test".to_string(),
+            encoding: Encoding::ReedSolomon { k: 4, m: 2 },
+            chunks: chunks.clone(),
+            total_size: 99_999,
+        };
+        let borrowed = ManifestBodyRef {
+            body_version: BLOB_MANIFEST_BODY_VERSION,
+            uri: "mesh://parity-test",
+            encoding: Encoding::ReedSolomon { k: 4, m: 2 },
+            chunks: chunks.as_slice(),
+            total_size: 99_999,
+        };
+        let owned_bytes = postcard::to_allocvec(&owned).unwrap();
+        let borrowed_bytes = postcard::to_allocvec(&borrowed).unwrap();
+        assert_eq!(
+            owned_bytes, borrowed_bytes,
+            "ManifestBodyRef must serialize byte-for-byte identically to ManifestBody",
+        );
+        // And the measured-only path agrees with the alloc'd path.
+        let measured_owned = postcard::experimental::serialized_size(&owned).unwrap();
+        let measured_borrowed = postcard::experimental::serialized_size(&borrowed).unwrap();
+        assert_eq!(measured_owned, measured_borrowed);
+        assert_eq!(measured_owned, owned_bytes.len());
+    }
+
+    /// Sibling of the Manifest parity pin: same invariant for
+    /// `TreeBodyRef` against `TreeBody`.
+    #[test]
+    fn tree_body_ref_serializes_identically_to_owned_form() {
+        let owned = TreeBody {
+            body_version: BLOB_TREE_BODY_VERSION,
+            uri: "mesh://tree-parity".to_string(),
+            encoding: Encoding::Replicated,
+            root_hash: [0xCD; 32],
+            total_size: 1_234_567,
+            depth: 3,
+        };
+        let borrowed = TreeBodyRef {
+            body_version: BLOB_TREE_BODY_VERSION,
+            uri: "mesh://tree-parity",
+            encoding: Encoding::Replicated,
+            root_hash: [0xCD; 32],
+            total_size: 1_234_567,
+            depth: 3,
+        };
+        let owned_bytes = postcard::to_allocvec(&owned).unwrap();
+        let borrowed_bytes = postcard::to_allocvec(&borrowed).unwrap();
+        assert_eq!(
+            owned_bytes, borrowed_bytes,
+            "TreeBodyRef must serialize byte-for-byte identically to TreeBody",
+        );
     }
 
     #[test]

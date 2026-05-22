@@ -66,7 +66,7 @@ async fn hedge_backup_wins_when_primary_is_slow() {
             Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],
-                body: self.body.to_vec(),
+                body: bytes::Bytes::copy_from_slice(self.body),
             })
         }
     }
@@ -225,7 +225,7 @@ async fn hedge_loser_handler_observes_cancellation() {
                     Ok(RpcResponsePayload {
                         status: RpcStatus::Ok,
                         headers: vec![],
-                        body: b"slow-finished".to_vec(),
+                        body: bytes::Bytes::from_static(b"slow-finished"),
                     })
                 }
             }
@@ -238,7 +238,7 @@ async fn hedge_loser_handler_observes_cancellation() {
             Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],
-                body: b"fast".to_vec(),
+                body: bytes::Bytes::from_static(b"fast"),
             })
         }
     }

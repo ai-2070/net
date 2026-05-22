@@ -70,6 +70,17 @@ impl EventMeta {
     /// `_pad` bytes are always written as zero regardless of what the
     /// caller stuffed into them — the wire contract says "zero on
     /// write, ignored on read."
+    ///
+    /// `#[inline(always)]` per perf #100 — mirrors the perf #70 fix
+    /// on `RedexEntry::to_bytes`. The body is 4 `copy_from_slice`
+    /// calls on `u64`/`u32` little-endian bytes plus two byte
+    /// stores: small enough that the optimizer fuses the writes
+    /// (e.g. with the next byte that the caller is about to stream
+    /// into a frame buffer) once the call disappears. Called in the
+    /// inner loop of every CortEX RPC encode and every per-event
+    /// checksum re-derive (`for_checksum_bytes` below), so the
+    /// per-call overhead matters per-event.
+    #[inline(always)]
     pub fn to_bytes(&self) -> [u8; EVENT_META_SIZE] {
         let mut out = [0u8; EVENT_META_SIZE];
         out[0] = self.dispatch;
@@ -83,10 +94,16 @@ impl EventMeta {
 
     /// Decode from a 24-byte slice. Returns `None` if the slice is
     /// shorter than 24 bytes.
+    ///
+    /// `#[inline(always)]` per perf #100 — same rationale as
+    /// [`Self::to_bytes`]: small body (one length check + four
+    /// little-endian field decodes) that's called in the inner loop
+    /// of CortEX inbound RPC decode and replication apply.
     #[expect(
         clippy::expect_used,
         reason = "bytes.len() >= EVENT_META_SIZE (24) checked above; fixed-offset slices convert infallibly to fixed-size arrays"
     )]
+    #[inline(always)]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < EVENT_META_SIZE {
             return None;

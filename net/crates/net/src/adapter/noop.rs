@@ -59,7 +59,7 @@ impl Adapter for NoopAdapter {
         Ok(())
     }
 
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+    async fn on_batch(&self, batch: std::sync::Arc<Batch>) -> Result<(), AdapterError> {
         // Just count, don't store
         self.batches_received.fetch_add(1, Ordering::Relaxed);
         self.events_received
@@ -117,7 +117,7 @@ mod tests {
         ];
         let batch = Batch::new(0, events, 0);
 
-        adapter.on_batch(batch).await.unwrap();
+        adapter.on_batch(std::sync::Arc::new(batch)).await.unwrap();
 
         assert_eq!(adapter.batches_received(), 1);
         assert_eq!(adapter.events_received(), 3);

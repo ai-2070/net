@@ -113,7 +113,7 @@ impl RpcHandler for SlowHandler {
                 Ok(RpcResponsePayload {
                     status: RpcStatus::Ok,
                     headers: vec![],
-                    body: b"slept the full window".to_vec(),
+                    body: bytes::Bytes::from_static(b"slept the full window"),
                 })
             }
         }
@@ -355,7 +355,7 @@ async fn rpc_deadline_actually_emits_cancel_to_server_handler() {
                     Ok(RpcResponsePayload {
                         status: RpcStatus::Ok,
                         headers: vec![],
-                        body: vec![],
+                        body: bytes::Bytes::new(),
                     })
                 }
             }
@@ -428,7 +428,7 @@ async fn rpc_dropped_call_future_fires_cancel_to_server() {
                     Ok(RpcResponsePayload {
                         status: RpcStatus::Ok,
                         headers: vec![],
-                        body: vec![],
+                        body: bytes::Bytes::new(),
                     })
                 }
             }
@@ -486,7 +486,7 @@ async fn rpc_trace_context_propagates_to_server() {
             Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],
-                body: vec![],
+                body: bytes::Bytes::new(),
             })
         }
     }

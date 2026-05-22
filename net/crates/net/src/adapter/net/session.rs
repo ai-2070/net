@@ -85,6 +85,26 @@ pub struct NetSession {
     /// `SUBPROTOCOL_STREAM_WINDOW` constant) can't have their
     /// sequence space polluted by control packets.
     control_tx_seq: AtomicU64,
+    /// Per-session cache of the resolved peer `NodeId`.
+    ///
+    /// Pre-fix [discovery-routing perf #108 in
+    /// `docs/performance/net-discovery-routing-analysis.md`] the
+    /// inbound dispatcher's RPC hook ran the
+    /// `addr_to_node → peers.get → session_id-match → fallback
+    /// O(N) peer scan` resolution chain on **every** inbound RPC
+    /// packet. The session itself is stable — once we've resolved
+    /// `session → node_id` for an established session, that
+    /// mapping doesn't change.
+    ///
+    /// The cache uses `0` as the "unresolved" sentinel — real
+    /// `NodeId`s are non-zero in production (`0` is the test /
+    /// loopback sentinel that already gets rejected by the
+    /// dispatcher's `Some(from_node) else { drop }` guard).
+    /// `Relaxed` ordering is enough: a tear in the published
+    /// value would only manifest as a re-resolution on the next
+    /// packet (which then re-publishes the same value), and the
+    /// resolver itself is the source of truth.
+    cached_node_id: AtomicU64,
 }
 
 /// Sentinel `stream_id` used in the header of subprotocol control
@@ -131,6 +151,32 @@ impl NetSession {
             stream_epoch_counter: AtomicU64::new(1),
             recently_closed: DashMap::new(),
             control_tx_seq: AtomicU64::new(0),
+            cached_node_id: AtomicU64::new(0),
+        }
+    }
+
+    /// Read the cached peer `NodeId` resolution. Returns `None`
+    /// until the dispatcher's first resolution call publishes a
+    /// value via [`Self::cache_node_id`]. See the field doc for
+    /// the perf rationale.
+    #[inline]
+    pub fn cached_node_id(&self) -> Option<u64> {
+        match self.cached_node_id.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Publish the resolved peer `NodeId` for subsequent calls.
+    /// Idempotent — concurrent first-resolution callers all write
+    /// the same value (the resolver is deterministic for a given
+    /// `session_id`), so a `store` over an existing identical value
+    /// is correct. Callers should pass non-zero `node_id`; `0` is
+    /// the reserved "unresolved" sentinel and is a no-op.
+    #[inline]
+    pub fn cache_node_id(&self, node_id: u64) {
+        if node_id != 0 {
+            self.cached_node_id.store(node_id, Ordering::Relaxed);
         }
     }
 
@@ -262,8 +308,18 @@ impl NetSession {
         let (admitted, epoch, seq) = match self.streams.get(&stream_id) {
             None => return TxAdmit::StreamClosed,
             Some(state) => {
+                // Cache `epoch` once — pre-fix [perf #42 in
+                // `docs/performance/net-perf-analysis.md`] the field
+                // was read twice through the `Ref`, once for the
+                // epoch-mismatch check and once on the return tuple.
+                // Trivial field access today but the cache also makes
+                // it obvious that both checks observe the same
+                // snapshot (rather than reading mid-mutation between
+                // the two reads — a defensive read against a future
+                // change that makes `epoch` mutable under `&self`).
+                let current_epoch = state.epoch();
                 if let Some(expected) = expected_epoch {
-                    if state.epoch() != expected {
+                    if current_epoch != expected {
                         // The handle is stale: the stream was closed
                         // and reopened since the handle was issued.
                         // Surface this as StreamClosed so the caller
@@ -280,7 +336,7 @@ impl NetSession {
                 } else {
                     None
                 };
-                (admitted, state.epoch(), seq)
+                (admitted, current_epoch, seq)
             }
         };
         if !admitted {
@@ -685,17 +741,29 @@ impl NetSession {
         }
         let aad = parsed.header.aad();
         let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
-        if !self.rx_cipher.is_valid_rx_counter(counter) {
-            return false;
-        }
+        // Per crypto-session perf #129, route through the
+        // verify-only API: heartbeats encrypt an empty plaintext
+        // to a 16-byte Poly1305 tag, and the legacy
+        // `decrypt(...).is_err()` materialized that empty
+        // plaintext into a fresh `Vec<u8>` per call only to drop
+        // it. `verify` runs the AEAD tag check without producing
+        // a plaintext buffer.
         if self
             .rx_cipher
-            .decrypt(counter, &aad, &parsed.payload)
+            .verify(counter, &aad, &parsed.payload)
             .is_err()
         {
             return false;
         }
-        if !self.rx_cipher.update_rx_counter(counter) {
+        // Per crypto-session perf #132: single-lock admit replaces
+        // the legacy `is_valid_rx_counter` (pre-verify) +
+        // `update_rx_counter` (post-verify) two-step. Heartbeat
+        // replays now pay the AEAD verify before being rejected at
+        // admit, but the AEAD verify on a 16-byte heartbeat is the
+        // cheapest case of ChaCha20-Poly1305 and the saved Mutex
+        // op per non-replay heartbeat (which dominates the rate at
+        // healthy steady state) is the actual hot path.
+        if !self.rx_cipher.try_admit_rx_counter(counter) {
             return false;
         }
         self.touch();
@@ -1565,6 +1633,37 @@ mod tests {
         assert_eq!(session.peer_addr(), peer_addr);
         assert!(session.is_active());
         assert_eq!(session.stream_count(), 0);
+    }
+
+    /// Pin discovery-routing perf #108: the per-session NodeId
+    /// cache starts empty, accepts the first non-zero publish,
+    /// and ignores the `0` sentinel.
+    #[test]
+    fn cached_node_id_returns_none_until_published_then_caches() {
+        let keys = test_keys();
+        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        // Fresh session: no cached resolution.
+        assert_eq!(session.cached_node_id(), None);
+
+        // `0` is the "unresolved" sentinel — callers passing it
+        // should be a no-op so the cache stays empty.
+        session.cache_node_id(0);
+        assert_eq!(
+            session.cached_node_id(),
+            None,
+            "0 is the unresolved sentinel; caching it must be a no-op",
+        );
+
+        // First real publish lands.
+        session.cache_node_id(0xDEAD_BEEF_CAFE_F00D);
+        assert_eq!(session.cached_node_id(), Some(0xDEAD_BEEF_CAFE_F00D));
+
+        // Subsequent publish of the same value is a no-op (writes
+        // are idempotent for a stable session — see field doc).
+        session.cache_node_id(0xDEAD_BEEF_CAFE_F00D);
+        assert_eq!(session.cached_node_id(), Some(0xDEAD_BEEF_CAFE_F00D));
     }
 
     #[test]

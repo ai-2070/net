@@ -292,7 +292,7 @@ async fn codec_decode_failure_is_not_retried() {
             Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],
-                body: br#"{"unexpected":"string"}"#.to_vec(),
+                body: bytes::Bytes::from_static(br#"{"unexpected":"string"}"#),
             })
         }
     }

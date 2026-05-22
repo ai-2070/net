@@ -321,7 +321,7 @@ impl BlobAdapter for FileSystemAdapter {
         .map_err(|e| backend(format!("join error: {}", e)))?
     }
 
-    async fn fetch(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
+    async fn fetch(&self, blob_ref: &BlobRef) -> Result<Bytes, BlobError> {
         let (hash, uri) = expect_small(blob_ref)?;
         let path = self.path_for(&hash);
         let uri = sanitize_uri_for_error(uri);
@@ -331,10 +331,10 @@ impl BlobAdapter for FileSystemAdapter {
             .acquire_owned()
             .await
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
-        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, BlobError> {
+        tokio::task::spawn_blocking(move || -> Result<Bytes, BlobError> {
             let _permit = _permit;
             match std::fs::read(&path) {
-                Ok(bytes) => Ok(bytes),
+                Ok(bytes) => Ok(Bytes::from(bytes)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(BlobError::NotFound(uri)),
                 Err(e) => Err(backend(e)),
             }
@@ -343,11 +343,7 @@ impl BlobAdapter for FileSystemAdapter {
         .map_err(|e| backend(format!("join error: {}", e)))?
     }
 
-    async fn fetch_range(
-        &self,
-        blob_ref: &BlobRef,
-        range: Range<u64>,
-    ) -> Result<Vec<u8>, BlobError> {
+    async fn fetch_range(&self, blob_ref: &BlobRef, range: Range<u64>) -> Result<Bytes, BlobError> {
         if range.start > range.end {
             return Err(backend(format!(
                 "range.start ({}) > range.end ({})",
@@ -356,7 +352,7 @@ impl BlobAdapter for FileSystemAdapter {
         }
         let len = range.end.saturating_sub(range.start);
         if len == 0 {
-            return Ok(Vec::new());
+            return Ok(Bytes::new());
         }
         // Guard against `len as usize` truncation on 32-bit
         // targets and against OOM-by-design from a maliciously
@@ -379,7 +375,7 @@ impl BlobAdapter for FileSystemAdapter {
             .acquire_owned()
             .await
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
-        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, BlobError> {
+        tokio::task::spawn_blocking(move || -> Result<Bytes, BlobError> {
             let _permit = _permit;
             let mut f = match std::fs::File::open(&path) {
                 Ok(f) => f,
@@ -391,7 +387,7 @@ impl BlobAdapter for FileSystemAdapter {
             f.seek(SeekFrom::Start(start)).map_err(backend)?;
             let mut buf = vec![0u8; len as usize];
             f.read_exact(&mut buf).map_err(backend)?;
-            Ok(buf)
+            Ok(Bytes::from(buf))
         })
         .await
         .map_err(|e| backend(format!("join error: {}", e)))?
@@ -601,7 +597,7 @@ mod tests {
 
         adapter.store(&blob, payload).await.unwrap();
         let fetched = adapter.fetch(&blob).await.unwrap();
-        assert_eq!(fetched, payload);
+        assert_eq!(fetched.as_ref(), payload);
         blob.verify(&fetched).unwrap();
         cleanup(&root);
     }
@@ -639,7 +635,7 @@ mod tests {
         let blob = make_ref(payload, "file:///alphabet");
         adapter.store(&blob, payload).await.unwrap();
         let mid = adapter.fetch_range(&blob, 3..7).await.unwrap();
-        assert_eq!(mid, b"defg");
+        assert_eq!(mid.as_ref(), b"defg");
         cleanup(&root);
     }
 
@@ -855,8 +851,8 @@ mod tests {
         // for the second write.
         let blob_b = make_ref(p2, "file:///a");
         adapter.store(&blob_b, p2).await.unwrap();
-        assert_eq!(adapter.fetch(&blob_a).await.unwrap(), p1);
-        assert_eq!(adapter.fetch(&blob_b).await.unwrap(), p2);
+        assert_eq!(adapter.fetch(&blob_a).await.unwrap().as_ref(), p1);
+        assert_eq!(adapter.fetch(&blob_b).await.unwrap().as_ref(), p2);
         cleanup(&root);
     }
 }

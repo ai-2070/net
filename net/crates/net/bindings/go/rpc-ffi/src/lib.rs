@@ -471,7 +471,12 @@ impl RpcHandler for GoRpcHandler {
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body,
+            // Per perf #84: `RpcResponsePayload::body` is `Bytes`,
+            // not `Vec<u8>`. Go's FFI surface delivers the
+            // response payload as an owned `Vec<u8>` (we have to
+            // materialize it across the C ABI anyway), so wrap
+            // with `Bytes::from` at the boundary.
+            body: bytes::Bytes::from(body),
         })
     }
 }
@@ -2837,7 +2842,8 @@ impl RpcClientStreamingHandler for GoClientStreamingRpcHandler {
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body,
+            // Same perf #84 boundary as the unary path above.
+            body: bytes::Bytes::from(body),
         })
     }
 }

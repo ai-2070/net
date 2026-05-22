@@ -339,7 +339,7 @@ async fn test_data_flow_a_to_b() {
     triangle
         .link_ab
         .initiator
-        .on_batch(batch)
+        .on_batch(batch.into())
         .await
         .expect("A→B send failed");
 
@@ -377,8 +377,8 @@ async fn test_data_flow_a_to_b_and_c() {
     let batch_ac = make_batch(0, 10, "to_c");
 
     let (send_ab, send_ac) = tokio::join!(
-        triangle.link_ab.initiator.on_batch(batch_ab),
-        triangle.link_ac.initiator.on_batch(batch_ac),
+        triangle.link_ab.initiator.on_batch(batch_ab.into()),
+        triangle.link_ac.initiator.on_batch(batch_ac.into()),
     );
     send_ab.expect("A→B send failed");
     send_ac.expect("A→C send failed");
@@ -433,14 +433,14 @@ async fn test_bidirectional_simultaneous() {
     triangle
         .link_ab
         .initiator
-        .on_batch(batch_a_to_b)
+        .on_batch(batch_a_to_b.into())
         .await
         .expect("A→B send failed");
     tokio::time::sleep(Duration::from_millis(100)).await;
     triangle
         .link_ab
         .responder
-        .on_batch(batch_b_to_a)
+        .on_batch(batch_b_to_a.into())
         .await
         .expect("B→A send failed");
 
@@ -490,7 +490,7 @@ async fn test_independent_streams_no_interference() {
     triangle
         .link_ab
         .initiator
-        .on_batch(batch_s1)
+        .on_batch(batch_s1.into())
         .await
         .expect("S1 send failed");
 
@@ -499,7 +499,7 @@ async fn test_independent_streams_no_interference() {
     triangle
         .link_ac
         .initiator
-        .on_batch(batch_s2)
+        .on_batch(batch_s2.into())
         .await
         .expect("S2 send failed");
 
@@ -567,20 +567,20 @@ async fn test_full_ring_traffic() {
     triangle
         .link_ab
         .initiator
-        .on_batch(batch_ab)
+        .on_batch(batch_ab.into())
         .await
         .expect("A→B failed");
     triangle
         .link_bc
         .initiator
-        .on_batch(batch_bc)
+        .on_batch(batch_bc.into())
         .await
         .expect("B→C failed");
     // C→A: C is responder on link_ac
     triangle
         .link_ac
         .responder
-        .on_batch(batch_ca)
+        .on_batch(batch_ca.into())
         .await
         .expect("C→A failed");
 
@@ -643,9 +643,9 @@ async fn test_sustained_throughput_all_links() {
     let batch_bc = make_batch(0, 100, "bc");
 
     let (r1, r2, r3) = tokio::join!(
-        triangle.link_ab.initiator.on_batch(batch_ab),
-        triangle.link_ac.initiator.on_batch(batch_ac),
-        triangle.link_bc.initiator.on_batch(batch_bc),
+        triangle.link_ab.initiator.on_batch(batch_ab.into()),
+        triangle.link_ac.initiator.on_batch(batch_ac.into()),
+        triangle.link_bc.initiator.on_batch(batch_bc.into()),
     );
     r1.expect("A→B failed");
     r2.expect("A→C failed");
@@ -782,7 +782,7 @@ async fn test_data_flow_survives_node_death() {
     triangle
         .link_ac
         .initiator
-        .on_batch(batch)
+        .on_batch(batch.into())
         .await
         .expect("A→C send should work after B dies");
 
@@ -1280,12 +1280,15 @@ async fn test_eventbus_bidirectional_over_net() {
             .map(|i| InternalEvent::from_value(serde_json::json!({"from": "B", "i": i}), i, 0))
             .collect();
         adapter
-            .on_batch(Batch {
-                shard_id: 0,
-                events,
-                sequence_start: 0,
-                process_nonce: batch_process_nonce(),
-            })
+            .on_batch(
+                Batch {
+                    shard_id: 0,
+                    events,
+                    sequence_start: 0,
+                    process_nonce: batch_process_nonce(),
+                }
+                .into(),
+            )
             .await
             .expect("B send failed");
 
@@ -2000,7 +2003,7 @@ async fn test_mesh_node_two_node_data_exchange() {
     // A sends events to B
     tokio::time::sleep(Duration::from_millis(100)).await;
     let batch = make_batch(0, 20, "mesh_test");
-    node_a.send_to_peer(addr_b, batch).await.unwrap();
+    node_a.send_to_peer(addr_b, &batch).await.unwrap();
 
     // Wait for delivery
     tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -2086,11 +2089,11 @@ async fn test_mesh_node_triangle() {
     // A sends to B and C
     tokio::time::sleep(Duration::from_millis(100)).await;
     node_a
-        .send_to_peer(addr_b, make_batch(0, 10, "to_b"))
+        .send_to_peer(addr_b, &make_batch(0, 10, "to_b"))
         .await
         .unwrap();
     node_a
-        .send_to_peer(addr_c, make_batch(0, 10, "to_c"))
+        .send_to_peer(addr_c, &make_batch(0, 10, "to_c"))
         .await
         .unwrap();
 
@@ -2194,7 +2197,7 @@ async fn test_mesh_node_relay_through_middle() {
 
     // A sends to C via routing (encrypted for C, routed through B)
     let batch = make_batch(0, 10, "relayed_from_a");
-    node_a.send_routed(nid_c, batch).await.unwrap();
+    node_a.send_routed(nid_c, &batch).await.unwrap();
 
     // Wait for relay
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -2285,7 +2288,7 @@ async fn test_mesh_relay_preserves_payload_integrity() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let batch = make_batch(0, 100, "integrity_check");
-    a.send_routed(nid_c, batch).await.unwrap();
+    a.send_routed(nid_c, &batch).await.unwrap();
     tokio::time::sleep(Duration::from_millis(2000)).await;
 
     let result = c.poll_shard(0, None, 1000).await.unwrap();
@@ -2352,7 +2355,7 @@ async fn test_mesh_relay_tamper_detected() {
 
     // A sends a routed packet
     let batch = make_batch(0, 5, "tamper_test");
-    a.send_routed(nid_c, batch).await.unwrap();
+    a.send_routed(nid_c, &batch).await.unwrap();
 
     // B receives and tampers
     let mut buf = vec![0u8; 8192];
@@ -2508,7 +2511,7 @@ async fn test_mesh_node_reroute_on_failure() {
 
     // Phase 1: A sends to C via B — works
     let batch1 = make_batch(0, 5, "before_failure");
-    a.send_routed(nid_c, batch1).await.unwrap();
+    a.send_routed(nid_c, &batch1).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let c_before = c.poll_shard(0, None, 100).await.unwrap();
@@ -2528,7 +2531,7 @@ async fn test_mesh_node_reroute_on_failure() {
 
     // A sends again — should reach C directly now
     let batch2 = make_batch(0, 5, "after_reroute");
-    a.send_routed(nid_c, batch2).await.unwrap();
+    a.send_routed(nid_c, &batch2).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let c_after = c.poll_shard(0, None, 100).await.unwrap();
@@ -2613,7 +2616,7 @@ async fn test_mesh_node_reroute_no_data_loss() {
 
     // Send 10 events via relay
     let batch1 = make_batch(0, 10, "phase1_via_relay");
-    a.send_routed(nid_c, batch1).await.unwrap();
+    a.send_routed(nid_c, &batch1).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // Kill B, reroute direct
@@ -2623,7 +2626,7 @@ async fn test_mesh_node_reroute_no_data_loss() {
 
     // Send 10 more events directly
     let batch2 = make_batch(0, 10, "phase2_direct");
-    a.send_routed(nid_c, batch2).await.unwrap();
+    a.send_routed(nid_c, &batch2).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // Collect all events C received
@@ -3055,7 +3058,7 @@ async fn test_partition_detection_via_filter() {
 
     // Data should be silently dropped during partition
     let batch = make_batch(0, 5, "during_partition");
-    node_a.send_to_peer(addr_b, batch).await.unwrap(); // succeeds silently
+    node_a.send_to_peer(addr_b, &batch).await.unwrap(); // succeeds silently
     tokio::time::sleep(Duration::from_millis(500)).await;
     let b_events = node_b.poll_shard(0, None, 100).await.unwrap();
     // B might have events from before the partition but none tagged "during_partition"
@@ -3141,7 +3144,7 @@ async fn test_partition_healing() {
 
     // Data should flow again
     let batch = make_batch(0, 10, "after_healing");
-    node_a.send_to_peer(addr_b, batch).await.unwrap();
+    node_a.send_to_peer(addr_b, &batch).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let b_events = node_b.poll_shard(0, None, 100).await.unwrap();
@@ -3233,7 +3236,7 @@ async fn test_partition_asymmetric_three_node() {
 
     // B→C should still work (they're on the same side of the partition)
     let batch = make_batch(0, 10, "b_to_c_during_partition");
-    node_b.send_to_peer(addr_c, batch).await.unwrap();
+    node_b.send_to_peer(addr_c, &batch).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let c_events = node_c.poll_shard(0, None, 100).await.unwrap();
@@ -3254,7 +3257,7 @@ async fn test_partition_asymmetric_three_node() {
 
     // A→B should be blocked
     let batch = make_batch(0, 5, "a_to_b_blocked");
-    node_a.send_to_peer(addr_b, batch).await.unwrap();
+    node_a.send_to_peer(addr_b, &batch).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let b_events = node_b.poll_shard(0, None, 100).await.unwrap();
     let blocked_events: Vec<_> = b_events
@@ -3348,7 +3351,7 @@ async fn test_mesh_node_auto_reroute() {
 
     // Phase 1: send via B — works
     let batch1 = make_batch(0, 5, "before_auto_reroute");
-    node_a.send_routed(nid_c, batch1).await.unwrap();
+    node_a.send_routed(nid_c, &batch1).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let c_before = node_c.poll_shard(0, None, 100).await.unwrap();
@@ -3372,7 +3375,7 @@ async fn test_mesh_node_auto_reroute() {
     // Phase 3: send again — should reach C via auto-rerouted path (direct)
     // NO manual route update — the reroute policy did it automatically
     let batch2 = make_batch(0, 5, "after_auto_reroute");
-    node_a.send_routed(nid_c, batch2).await.unwrap();
+    node_a.send_routed(nid_c, &batch2).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let c_after = node_c.poll_shard(0, None, 100).await.unwrap();
@@ -3630,7 +3633,7 @@ async fn test_mesh_handshake_via_relay() {
     // A sends a batch to C over the newly established A↔C session, routed
     // through B.
     let batch = make_batch(0, 10, "via_relay_handshake");
-    a.send_routed(nid_c, batch)
+    a.send_routed(nid_c, &batch)
         .await
         .expect("A send_routed to C failed");
 
@@ -3722,11 +3725,11 @@ async fn test_mesh_handshake_relay_bidirectional() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // A → C
-    a.send_routed(nid_c, make_batch(0, 5, "a_to_c"))
+    a.send_routed(nid_c, &make_batch(0, 5, "a_to_c"))
         .await
         .unwrap();
     // C → A
-    c.send_routed(nid_a, make_batch(0, 5, "c_to_a"))
+    c.send_routed(nid_a, &make_batch(0, 5, "c_to_a"))
         .await
         .unwrap();
 

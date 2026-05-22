@@ -620,7 +620,7 @@ pub fn blob_resolve<'py>(
     // when the caller's buffer can be mutated by another thread.
     let payload_owned = payload.to_vec();
     let bytes = py
-        .detach(|| -> Result<Vec<u8>, InnerBlobError> {
+        .detach(|| -> Result<bytes::Bytes, InnerBlobError> {
             rt.block_on(async move { resolve_payload(&payload_owned, adapter.as_ref()).await })
         })
         .map_err(map_blob_err)?;
@@ -814,10 +814,10 @@ impl BlobAdapter for PyBlobAdapter {
         .map_err(|e| InnerBlobError::Backend(format!("spawn_blocking join: {}", e)))?
     }
 
-    async fn fetch(&self, blob_ref: &InnerBlobRef) -> Result<Vec<u8>, InnerBlobError> {
+    async fn fetch(&self, blob_ref: &InnerBlobRef) -> Result<bytes::Bytes, InnerBlobError> {
         let obj = self.py_obj.clone();
         let blob = blob_ref.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, InnerBlobError> {
+        tokio::task::spawn_blocking(move || -> Result<bytes::Bytes, InnerBlobError> {
             Python::attach(|py| {
                 let py_blob = PyBlobRef { inner: blob };
                 let ret = obj
@@ -828,7 +828,12 @@ impl BlobAdapter for PyBlobAdapter {
                 let bytes: Vec<u8> = resolved
                     .extract()
                     .map_err(|e| pyerr_to_backend("fetch return", e))?;
-                Ok(bytes)
+                // Python returns `bytes` which we already had to
+                // materialize into an owned Vec via `.extract()`;
+                // wrap in `Bytes::from` to satisfy the trait. The
+                // copy at the FFI boundary is unavoidable — see
+                // the parallel comment in `ffi::blob::fetch`.
+                Ok(bytes::Bytes::from(bytes))
             })
         })
         .await
@@ -839,12 +844,12 @@ impl BlobAdapter for PyBlobAdapter {
         &self,
         blob_ref: &InnerBlobRef,
         range: Range<u64>,
-    ) -> Result<Vec<u8>, InnerBlobError> {
+    ) -> Result<bytes::Bytes, InnerBlobError> {
         let obj = self.py_obj.clone();
         let blob = blob_ref.clone();
         let start = range.start;
         let end = range.end;
-        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, InnerBlobError> {
+        tokio::task::spawn_blocking(move || -> Result<bytes::Bytes, InnerBlobError> {
             Python::attach(|py| {
                 let py_blob = PyBlobRef { inner: blob };
                 let ret = obj
@@ -855,7 +860,7 @@ impl BlobAdapter for PyBlobAdapter {
                 let bytes: Vec<u8> = resolved
                     .extract()
                     .map_err(|e| pyerr_to_backend("fetch_range return", e))?;
-                Ok(bytes)
+                Ok(bytes::Bytes::from(bytes))
             })
         })
         .await
@@ -1099,7 +1104,7 @@ impl PyMeshBlobAdapter {
         let adapter = self.inner.clone();
         let blob = blob_ref.as_inner().clone();
         let bytes = py
-            .detach(|| -> Result<Vec<u8>, InnerBlobError> {
+            .detach(|| -> Result<bytes::Bytes, InnerBlobError> {
                 rt.block_on(async move { adapter.fetch(&blob).await })
             })
             .map_err(map_blob_err)?;
@@ -1123,7 +1128,7 @@ impl PyMeshBlobAdapter {
         let adapter = self.inner.clone();
         let blob = blob_ref.as_inner().clone();
         let bytes = py
-            .detach(|| -> Result<Vec<u8>, InnerBlobError> {
+            .detach(|| -> Result<bytes::Bytes, InnerBlobError> {
                 rt.block_on(async move { adapter.fetch_range(&blob, start..end).await })
             })
             .map_err(map_blob_err)?;

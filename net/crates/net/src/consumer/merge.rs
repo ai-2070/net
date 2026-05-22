@@ -20,7 +20,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::{Adapter, ShardPollResult};
-use crate::consumer::filter::Filter;
+use crate::consumer::filter::{CompiledFilter, Filter};
 use crate::error::{AdapterError, ConsumerError};
 use crate::event::StoredEvent;
 
@@ -474,7 +474,11 @@ pub const PER_SHARD_FETCH_CAP: usize = 10_000;
 /// adapters are observable from the filtered-poll path; without this,
 /// corrupt events were silently dropped from filtered results while the
 /// unfiltered path still returned them — a confusing inconsistency.
-fn event_matches_filter(event: &StoredEvent, filter: &Filter) -> bool {
+///
+/// Takes a [`CompiledFilter`] rather than a [`Filter`] so the dot-path
+/// split + per-segment integer parse happens once per poll, not once
+/// per event — see perf #15 / #16.
+fn event_matches_filter(event: &StoredEvent, filter: &CompiledFilter) -> bool {
     match event.parse() {
         Ok(value) => filter.matches(&value),
         Err(e) => {
@@ -709,7 +713,12 @@ impl PollMerger {
         // filter-matching is cheap and consistent semantics with the
         // sort path is worth more than parse-skip on over-fetches.
         if let Some(filter) = &request.filter {
-            all_events.retain(|e| event_matches_filter(e, filter));
+            // Compile once per poll — pre-splits every dot-path and
+            // pre-parses each segment's integer form. Pre-fix this
+            // work happened on every event in the retain loop
+            // (perf #15 / #16).
+            let compiled = filter.compile();
+            all_events.retain(|e| event_matches_filter(e, &compiled));
         }
 
         // Apply ordering
@@ -1535,7 +1544,7 @@ mod tests {
             Ok(())
         }
 
-        async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+        async fn on_batch(&self, _batch: Arc<Batch>) -> Result<(), AdapterError> {
             Ok(())
         }
 
@@ -1777,7 +1786,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, _b: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, _b: Arc<Batch>) -> Result<(), AdapterError> {
                 Ok(())
             }
             async fn flush(&self) -> Result<(), AdapterError> {
@@ -3006,7 +3015,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, _batch: Arc<Batch>) -> Result<(), AdapterError> {
                 Ok(())
             }
             async fn flush(&self) -> Result<(), AdapterError> {
@@ -3071,7 +3080,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, _batch: Arc<Batch>) -> Result<(), AdapterError> {
                 Ok(())
             }
             async fn flush(&self) -> Result<(), AdapterError> {
@@ -3154,7 +3163,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, _batch: Arc<Batch>) -> Result<(), AdapterError> {
                 Ok(())
             }
             async fn flush(&self) -> Result<(), AdapterError> {
@@ -3263,7 +3272,7 @@ mod tests {
             async fn init(&mut self) -> Result<(), AdapterError> {
                 Ok(())
             }
-            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+            async fn on_batch(&self, _batch: Arc<Batch>) -> Result<(), AdapterError> {
                 Ok(())
             }
             async fn flush(&self) -> Result<(), AdapterError> {

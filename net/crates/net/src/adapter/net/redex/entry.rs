@@ -142,6 +142,13 @@ impl RedexEntry {
     }
 
     /// Encode to the 20-byte little-endian wire format.
+    ///
+    /// `#[inline(always)]` per perf #70 — called in the inner loop
+    /// of disk read/write paths (`disk::read_index`, append).
+    /// The body is four `copy_from_slice` calls on `u64`/`u32`
+    /// le-bytes, which the optimizer fuses into a small fixed
+    /// sequence once inlined.
+    #[inline(always)]
     pub fn to_bytes(&self) -> [u8; REDEX_ENTRY_SIZE] {
         let mut out = [0u8; REDEX_ENTRY_SIZE];
         out[0..8].copy_from_slice(&self.seq.to_le_bytes());
@@ -152,10 +159,14 @@ impl RedexEntry {
     }
 
     /// Decode from the 20-byte little-endian wire format.
+    ///
+    /// `#[inline(always)]` per perf #70 — same justification as
+    /// [`Self::to_bytes`].
     #[expect(
         clippy::expect_used,
         reason = "input is &[u8; REDEX_ENTRY_SIZE]; fixed slice converts are statically infallible"
     )]
+    #[inline(always)]
     pub fn from_bytes(bytes: &[u8; REDEX_ENTRY_SIZE]) -> Self {
         Self {
             seq: u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes")),

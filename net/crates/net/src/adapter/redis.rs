@@ -134,16 +134,31 @@ impl RedisAdapter {
     /// Format: JSON with `raw` and `ts` fields.
     /// Since `event.raw` is already pre-serialized JSON bytes, we embed it directly
     /// using `RawValue` semantics to avoid double-serialization.
+    ///
+    /// Pre-fix [perf #30 in `docs/performance/net-perf-analysis.md`]
+    /// the `insertion_ts.to_string().as_bytes()` and
+    /// `shard_id.to_string().as_bytes()` patterns allocated a fresh
+    /// `String` per event purely to extract the decimal bytes — 2N
+    /// allocations on a 10K-event batch. `write!` via `std::io::Write`
+    /// formats directly into the existing `Vec<u8>`, which uses an
+    /// internal stack buffer for the digit conversion. Zero heap.
     fn serialize_event(event: &InternalEvent) -> Result<Vec<u8>, AdapterError> {
+        use std::io::Write as _;
         // Build JSON manually to avoid re-parsing/re-serializing the raw bytes
         // Format: {"r":<raw_json>,"t":<ts>,"s":<shard_id>}
         let mut buf = Vec::with_capacity(event.raw.len() + 32);
         buf.extend_from_slice(b"{\"r\":");
         buf.extend_from_slice(&event.raw); // Already valid JSON
         buf.extend_from_slice(b",\"t\":");
-        buf.extend_from_slice(event.insertion_ts.to_string().as_bytes());
+        // `write!` on a `Vec<u8>` via `std::io::Write` is infallible
+        // — it cannot return an error short of OOM, which would have
+        // panicked earlier on `Vec::push`. The unwrap is documented
+        // by the trait contract.
+        write!(&mut buf, "{}", event.insertion_ts)
+            .map_err(|e| AdapterError::Fatal(format!("serialize_event: {e}")))?;
         buf.extend_from_slice(b",\"s\":");
-        buf.extend_from_slice(event.shard_id.to_string().as_bytes());
+        write!(&mut buf, "{}", event.shard_id)
+            .map_err(|e| AdapterError::Fatal(format!("serialize_event: {e}")))?;
         buf.push(b'}');
         Ok(buf)
     }
@@ -217,9 +232,15 @@ impl RedisAdapter {
         };
 
         let mut events = Vec::with_capacity(limit);
-        let mut last_seen_id: Option<String> = None;
+        // Pre-fix [perf #31 in `docs/performance/net-perf-analysis.md`]
+        // tracked `last_seen_id: Option<String>` and ran
+        // `Some(id.to_string())` on every iteration — only the LAST
+        // value matters, so a 10K-entry response did 9999 wasted
+        // `String` allocations + drops. Track the index instead and
+        // materialize the id once after the loop.
+        let mut last_seen_idx: Option<usize> = None;
 
-        for entry in entries.iter().take(limit) {
+        for (idx, entry) in entries.iter().enumerate().take(limit) {
             let Value::Array(parts) = entry else { continue };
             if parts.len() < 2 {
                 continue;
@@ -234,7 +255,7 @@ impl RedisAdapter {
                 _ => continue,
             };
 
-            last_seen_id = Some(id.to_string());
+            last_seen_idx = Some(idx);
 
             let Value::Array(fields) = &parts[1] else {
                 continue;
@@ -296,11 +317,27 @@ impl RedisAdapter {
         }
 
         let has_more = entries.len() > limit;
-        // Always prefer the last *seen* id — `last_seen_id` is set on
-        // every iterated entry regardless of deserialize outcome, so it
-        // is a strict superset of `events.last().id`. Using
-        // `events.last()` here would leave the cursor stuck behind any
-        // *trailing* corrupt entries.
+        // Always prefer the last *seen* id — the saved `last_seen_idx`
+        // tracks every iterated entry regardless of deserialize outcome,
+        // so the id materialized from it is a strict superset of
+        // `events.last().id`. Using `events.last()` alone would leave
+        // the cursor stuck behind any *trailing* corrupt entries.
+        //
+        // The id is extracted once here (post-loop) rather than per
+        // iteration — see perf #31.
+        let last_seen_id: Option<String> = last_seen_idx.and_then(|i| {
+            let Value::Array(parts) = &entries[i] else {
+                return None;
+            };
+            if parts.is_empty() {
+                return None;
+            }
+            match &parts[0] {
+                Value::BulkString(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+                Value::SimpleString(s) => Some(s.clone()),
+                _ => None,
+            }
+        });
         let next_id = last_seen_id.or_else(|| events.last().map(|e| e.id.clone()));
 
         ShardPollResult {
@@ -393,7 +430,7 @@ impl Adapter for RedisAdapter {
         Ok(())
     }
 
-    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+    async fn on_batch(&self, batch: std::sync::Arc<Batch>) -> Result<(), AdapterError> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -624,17 +661,31 @@ fn is_transient_error(e: &RedisError) -> bool {
         // extension errors that surface only via the message
         // body. Includes `NOREPLICAS` (a wait-aof timeout) which
         // doesn't have a typed kind in this redis crate version.
+        //
+        // Pre-fix [perf #40 in `docs/performance/net-perf-analysis.md`]
+        // ran `e.to_string().to_uppercase()` and called `.contains`
+        // nine times — two `String` allocations per classified
+        // error, on a path that's hot in a degraded-broker state
+        // (BUSY / LOADING) where every command fails. Redis server
+        // errors are emitted uppercase by protocol and always
+        // start with the keyword; [`RedisError::detail`] returns
+        // the message body as `Option<&str>` without allocating,
+        // so a byte-level `starts_with` is enough.
         ErrorKind::Server(_) | ErrorKind::Extension => {
-            let msg = e.to_string().to_uppercase();
-            msg.contains("LOADING")
-                || msg.contains("BUSY")
-                || msg.contains("TRYAGAIN")
-                || msg.contains("MASTERDOWN")
-                || msg.contains("MOVED")
-                || msg.contains("ASK")
-                || msg.contains("READONLY")
-                || msg.contains("CLUSTERDOWN")
-                || msg.contains("NOREPLICAS")
+            const TRANSIENT_PREFIXES: &[&str] = &[
+                "LOADING",
+                "BUSY",
+                "TRYAGAIN",
+                "MASTERDOWN",
+                "MOVED",
+                "ASK",
+                "READONLY",
+                "CLUSTERDOWN",
+                "NOREPLICAS",
+            ];
+            e.detail()
+                .map(|d| TRANSIENT_PREFIXES.iter().any(|p| d.starts_with(p)))
+                .unwrap_or(false)
         }
         _ => false,
     }

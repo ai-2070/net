@@ -42,6 +42,7 @@
 //! with a doubly-linked list so promotion on hit is a constant-
 //! time pointer flip.
 
+use bytes::Bytes;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
@@ -62,7 +63,7 @@ pub struct TreeNodeCache {
     /// We allocate it with `usize::MAX` entry capacity and gate
     /// eviction by our own byte tally instead — the entry count
     /// is incidental for a byte-bounded cache.
-    entries: LruCache<[u8; 32], Vec<u8>>,
+    entries: LruCache<[u8; 32], Bytes>,
     /// Running total of cached byte payloads. Maintained on
     /// every insert / remove so the cap check stays O(1) per
     /// insert.
@@ -110,11 +111,11 @@ impl TreeNodeCache {
         }
     }
 
-    /// Look up `hash`. On hit, returns a clone of the cached
-    /// bytes (the caller decodes them as a [`super::blob_tree::TreeNode`]) and
-    /// promotes the entry to most-recently-used. On miss,
-    /// returns `None`.
-    pub fn get(&mut self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+    /// Look up `hash`. On hit, returns a [`Bytes`] clone of the
+    /// cached entry (`Bytes::clone` is one atomic refcount bump,
+    /// not a memcpy of the node payload) and promotes the entry
+    /// to most-recently-used. On miss, returns `None`.
+    pub fn get(&mut self, hash: &[u8; 32]) -> Option<Bytes> {
         if self.cap_bytes == 0 {
             self.misses = self.misses.saturating_add(1);
             return None;
@@ -150,7 +151,7 @@ impl TreeNodeCache {
     /// cache with a (hash, mismatched_bytes) pair. If a future
     /// commit needs to expose insert publicly, it MUST first hash-
     /// validate the bytes argument internally.
-    pub(crate) fn insert(&mut self, hash: [u8; 32], bytes: Vec<u8>) {
+    pub(crate) fn insert(&mut self, hash: [u8; 32], bytes: Bytes) {
         if self.cap_bytes == 0 || bytes.len() > self.cap_bytes {
             return;
         }
@@ -273,9 +274,9 @@ mod tests {
     #[test]
     fn insert_and_get_round_trip() {
         let mut c = TreeNodeCache::with_capacity_bytes(1024);
-        c.insert(h(1), vec![1, 2, 3]);
+        c.insert(h(1), Bytes::from(vec![1, 2, 3]));
         let got = c.get(&h(1)).unwrap();
-        assert_eq!(got, vec![1, 2, 3]);
+        assert_eq!(got.as_ref(), &[1u8, 2, 3]);
         assert_eq!(c.hits(), 1);
         assert_eq!(c.misses(), 0);
         assert_eq!(c.len(), 1);
@@ -285,7 +286,7 @@ mod tests {
     #[test]
     fn cap_zero_disables_cache() {
         let mut c = TreeNodeCache::with_capacity_bytes(0);
-        c.insert(h(1), vec![1, 2, 3]);
+        c.insert(h(1), Bytes::from(vec![1, 2, 3]));
         assert!(c.get(&h(1)).is_none());
         assert_eq!(c.len(), 0);
     }
@@ -293,7 +294,7 @@ mod tests {
     #[test]
     fn oversize_single_entry_rejected() {
         let mut c = TreeNodeCache::with_capacity_bytes(2);
-        c.insert(h(1), vec![1, 2, 3]); // 3 > cap=2 → rejected
+        c.insert(h(1), Bytes::from(vec![1, 2, 3])); // 3 > cap=2 → rejected
         assert!(c.get(&h(1)).is_none());
         assert_eq!(c.len(), 0);
     }
@@ -301,13 +302,13 @@ mod tests {
     #[test]
     fn lru_evicts_least_recently_used() {
         let mut c = TreeNodeCache::with_capacity_bytes(10);
-        c.insert(h(1), vec![0; 4]);
-        c.insert(h(2), vec![0; 4]);
+        c.insert(h(1), Bytes::from(vec![0; 4]));
+        c.insert(h(2), Bytes::from(vec![0; 4]));
         // Touch h(1) so it moves to MRU.
         let _ = c.get(&h(1));
         // Insert pushes us over the cap (4+4+4=12 > 10);
         // h(2) is LRU and should evict.
-        c.insert(h(3), vec![0; 4]);
+        c.insert(h(3), Bytes::from(vec![0; 4]));
         assert!(c.get(&h(1)).is_some(), "h(1) was touched, stays cached");
         assert!(c.get(&h(2)).is_none(), "h(2) was LRU, evicted");
         assert!(c.get(&h(3)).is_some());
@@ -316,8 +317,8 @@ mod tests {
     #[test]
     fn re_insert_replaces_value_without_double_counting() {
         let mut c = TreeNodeCache::with_capacity_bytes(100);
-        c.insert(h(1), vec![0; 10]);
-        c.insert(h(1), vec![0; 20]);
+        c.insert(h(1), Bytes::from(vec![0; 10]));
+        c.insert(h(1), Bytes::from(vec![0; 20]));
         assert_eq!(c.len(), 1);
         assert_eq!(c.bytes(), 20);
     }
@@ -325,7 +326,7 @@ mod tests {
     #[test]
     fn clear_resets_state() {
         let mut c = TreeNodeCache::with_capacity_bytes(100);
-        c.insert(h(1), vec![0; 10]);
+        c.insert(h(1), Bytes::from(vec![0; 10]));
         let _ = c.get(&h(1));
         c.clear();
         assert_eq!(c.len(), 0);
@@ -337,8 +338,8 @@ mod tests {
     #[test]
     fn remove_drops_one_entry_only() {
         let mut c = TreeNodeCache::with_capacity_bytes(100);
-        c.insert(h(1), vec![0; 10]);
-        c.insert(h(2), vec![0; 20]);
+        c.insert(h(1), Bytes::from(vec![0; 10]));
+        c.insert(h(2), Bytes::from(vec![0; 20]));
         c.remove(&h(1));
         assert!(c.get(&h(1)).is_none());
         assert!(c.get(&h(2)).is_some());
@@ -348,7 +349,7 @@ mod tests {
     #[test]
     fn remove_unknown_hash_is_noop() {
         let mut c = TreeNodeCache::with_capacity_bytes(100);
-        c.insert(h(1), vec![0; 10]);
+        c.insert(h(1), Bytes::from(vec![0; 10]));
         c.remove(&h(99));
         assert_eq!(c.len(), 1);
         assert_eq!(c.bytes(), 10);
@@ -357,7 +358,7 @@ mod tests {
     #[test]
     fn hit_ratio_reflects_ratio() {
         let mut c = TreeNodeCache::with_capacity_bytes(100);
-        c.insert(h(1), vec![0; 5]);
+        c.insert(h(1), Bytes::from(vec![0; 5]));
         let _ = c.get(&h(1)); // hit
         let _ = c.get(&h(2)); // miss
         let _ = c.get(&h(1)); // hit

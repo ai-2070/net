@@ -91,7 +91,7 @@ pub async fn run_conformance_suite<A: BlobAdapter + ?Sized>(
         .fetch_range(&blob, 5..10)
         .await
         .map_err(|_| "fetch_range mid failed")?;
-    if slice.as_slice() != &payload[5..10] {
+    if slice.as_ref() != &payload[5..10] {
         return Err("fetch_range mid returned wrong slice");
     }
 

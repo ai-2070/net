@@ -20,6 +20,7 @@
 
 use std::collections::HashSet;
 
+pub(super) use super::super::needle::AsciiInsensitiveNeedle as TitleNeedle;
 use super::state::TasksState;
 use super::types::{Task, TaskId, TaskStatus};
 
@@ -35,7 +36,7 @@ pub(super) struct TasksFilterSpec {
     pub created_before_ns: Option<u64>,
     pub updated_after_ns: Option<u64>,
     pub updated_before_ns: Option<u64>,
-    pub title_contains: Option<String>,
+    pub title_contains: Option<TitleNeedle>,
     pub order_by: Option<OrderBy>,
     pub limit: Option<usize>,
 }
@@ -82,7 +83,7 @@ impl TasksFilterSpec {
             }
         }
         if let Some(needle) = &self.title_contains {
-            if !t.title.to_lowercase().contains(needle) {
+            if !needle.matches(&t.title) {
                 return false;
             }
         }
@@ -181,7 +182,7 @@ impl<'a> TasksQuery<'a> {
 
     /// Restrict to tasks whose title contains `needle` (case-insensitive).
     pub fn title_contains(mut self, needle: impl Into<String>) -> Self {
-        self.spec.title_contains = Some(needle.into().to_lowercase());
+        self.spec.title_contains = Some(TitleNeedle::new(needle));
         self
     }
 

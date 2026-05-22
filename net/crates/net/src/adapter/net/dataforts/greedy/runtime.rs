@@ -29,6 +29,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
@@ -160,7 +161,16 @@ struct GreedyRuntimeInner {
     /// Local node's advertised capability set. Snapshotted at
     /// install time; refreshable via [`GreedyRuntime::set_local_caps`]
     /// when the node's caps change.
-    local_caps: Mutex<Arc<CapabilitySet>>,
+    ///
+    /// `ArcSwap<CapabilitySet>` so the per-event `dispatch_event`
+    /// read is one atomic Acquire load instead of a parking_lot
+    /// mutex acquire (dataforts perf #175). Writes — exclusively
+    /// from `set_local_caps`, which is operator-cadence — perform
+    /// an Arc swap; the previous Arc is dropped only after every
+    /// outstanding read guard releases. The contract matches the
+    /// pre-fix `Mutex<Arc<CapabilitySet>>`: callers always observe
+    /// an Arc snapshot, never a partial update.
+    local_caps: ArcSwap<CapabilitySet>,
     /// Optional data-gravity state (Phase 4). Interior-mutable
     /// so operators can flip gravity on / off after the greedy
     /// runtime is already shared via Arc clones (the Arc count
@@ -353,7 +363,7 @@ impl GreedyRuntime {
                 metrics: Arc::new(GreedyMetricsRegistry::new()),
                 intent_registry,
                 metadata_keys: PlacementMetadataKeys::default(),
-                local_caps: Mutex::new(local_caps),
+                local_caps: ArcSwap::new(local_caps),
                 #[cfg(feature = "dataforts")]
                 gravity: parking_lot::RwLock::new(None),
                 #[cfg(feature = "dataforts")]
@@ -505,7 +515,7 @@ impl GreedyRuntime {
     /// advertised caps change so subsequent admission decisions
     /// see the new shape.
     pub fn set_local_caps(&self, caps: Arc<CapabilitySet>) {
-        *self.inner.local_caps.lock() = caps;
+        self.inner.local_caps.store(caps);
     }
 
     /// Number of channels currently in the greedy cache.
@@ -709,7 +719,13 @@ impl GreedyRuntime {
         payload: &[u8],
     ) -> DispatchOutcome {
         let now = Instant::now();
-        let local_caps = self.inner.local_caps.lock().clone();
+        // Lock-free Arc snapshot per dataforts perf #175 — pre-fix
+        // this was `local_caps.lock().clone()` (parking_lot acquire
+        // + Arc clone); `ArcSwap::load_full` is one atomic Acquire
+        // load + Arc clone. Same observable contract — an Arc
+        // snapshot the rest of `dispatch_event` borrows from —
+        // without entering a critical section.
+        let local_caps = self.inner.local_caps.load_full();
 
         // Resolve the colocation hint against the local cache so
         // SoftPreference + StrictRequired both have something to
@@ -2185,14 +2201,14 @@ mod tests {
         async fn fetch(
             &self,
             _: &crate::adapter::net::dataforts::blob::BlobRef,
-        ) -> Result<Vec<u8>, crate::adapter::net::dataforts::blob::BlobError> {
+        ) -> Result<bytes::Bytes, crate::adapter::net::dataforts::blob::BlobError> {
             unreachable!()
         }
         async fn fetch_range(
             &self,
             _: &crate::adapter::net::dataforts::blob::BlobRef,
             _: std::ops::Range<u64>,
-        ) -> Result<Vec<u8>, crate::adapter::net::dataforts::blob::BlobError> {
+        ) -> Result<bytes::Bytes, crate::adapter::net::dataforts::blob::BlobError> {
             unreachable!()
         }
         async fn exists(
@@ -2321,6 +2337,96 @@ mod tests {
         let snap = rt.metrics().snapshot();
         assert_eq!(snap.cluster.blob_prefetches_err_total, 1);
         assert_eq!(snap.cluster.blob_prefetches_ok_total, 0);
+    }
+
+    /// Pin dataforts perf #175: `dispatch_event`'s read of
+    /// `local_caps` must NOT block concurrent writes (nor be
+    /// blocked by them). The fix swapped
+    /// `Mutex<Arc<CapabilitySet>>` → `ArcSwap<CapabilitySet>` so
+    /// readers observe the latest store via a lock-free Acquire
+    /// load. A regression that drops back to a mutex (or to
+    /// `RwLock<Arc>`) would surface here only as a perf hit, not
+    /// a correctness break — so this test instead asserts the
+    /// observable contract: after a flurry of concurrent
+    /// `set_local_caps` writes interleaved with `dispatch_event`
+    /// reads, every read observes some store's caps (no
+    /// torn / partial value), the run completes in milliseconds
+    /// (no deadlock or starvation), and the final post-flurry
+    /// snapshot matches the last-written caps Arc by pointer
+    /// identity — which is the property `ArcSwap` provides
+    /// across writers.
+    #[tokio::test]
+    async fn set_local_caps_concurrent_with_dispatch_does_not_deadlock_and_swap_is_visible() {
+        use crate::adapter::net::behavior::tag::{AxisSeparator, Tag, TaxonomyAxis};
+
+        let cfg =
+            GreedyConfig::default().with_intent_match(super::super::IntentMatchPolicy::Disabled);
+        let (rt, _sink) = build_runtime(cfg);
+
+        // Build N distinct cap Arcs to swap through, each
+        // identifiable by a unique cpu_cores value in its tag set.
+        const ROUNDS: usize = 64;
+        let cap_arcs: Vec<Arc<CapabilitySet>> = (0..ROUNDS)
+            .map(|i| {
+                let mut c = CapabilitySet::default();
+                c.tags.insert(Tag::AxisValue {
+                    axis: TaxonomyAxis::Hardware,
+                    key: "cpu_cores".to_string(),
+                    value: i.to_string(),
+                    separator: AxisSeparator::Eq,
+                });
+                Arc::new(c)
+            })
+            .collect();
+
+        let rt_w = rt.clone();
+        let cap_arcs_for_writer = cap_arcs.clone();
+        let writer = tokio::spawn(async move {
+            for cap in cap_arcs_for_writer {
+                rt_w.set_local_caps(cap);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let chain = chain_caps_with_scope("any");
+        let rt_r = rt.clone();
+        let reader = tokio::spawn(async move {
+            for i in 0..ROUNDS {
+                rt_r.dispatch_event(&cn(&format!("conc/{i}")), i as u64, &chain, b"x")
+                    .await;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // 1 s bound on a non-deadlocking interleave is generous;
+        // the actual run is sub-millisecond on a healthy box.
+        //
+        // Per cubic-dev-ai code review: `JoinHandle::await` returns
+        // `Result<T, JoinError>` and a panic inside a spawned task
+        // surfaces as `Err(JoinError)`. The original `let _ = …`
+        // swallowed those errors, so a panicking writer/reader
+        // task would slip past the timeout and the post-loop
+        // pointer-identity assertion could spuriously pass (the
+        // last `set_local_caps` did land before the panic). The
+        // `.expect("…")` surfaces panics as a clean test failure
+        // pointing at which side broke.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            writer.await.expect("writer task panicked");
+            reader.await.expect("reader task panicked");
+        })
+        .await
+        .expect("concurrent set_local_caps + dispatch_event must not deadlock");
+
+        // After the writer finished, the last `set_local_caps`
+        // must be the visible snapshot. With `ArcSwap`, the
+        // `Arc<CapabilitySet>` returned by `load_full` is the
+        // SAME allocation pointer the writer last stored.
+        let last_stored = cap_arcs.last().unwrap().clone();
+        let observed = rt.inner.local_caps.load_full();
+        assert!(
+            Arc::ptr_eq(&observed, &last_stored),
+            "final ArcSwap snapshot must be the writer's last stored Arc by pointer identity"
+        );
     }
 
     #[tokio::test]

@@ -607,6 +607,47 @@ thread_local! {
     /// instances exist (which may use different encryption keys).
     static LOCAL_BUILDERS: RefCell<std::collections::HashMap<u64, LocalBuildersEntry>> =
         RefCell::new(std::collections::HashMap::new());
+
+    /// Per-thread counter that gates the dead-entry reap walk on
+    /// `acquire`/`release`. Pre-fix [perf #17/#32 in
+    /// `docs/performance/net-perf-analysis.md`] every call ran a
+    /// `HashMap::retain` that called `Weak::strong_count()` (an
+    /// atomic load) on every entry — at packet rates this dominated
+    /// the TLS path's cost (82ns vs 38ns for the shared pool in
+    /// published benches). The reap is now amortized: we only walk
+    /// once every [`REAP_INTERVAL`] calls.
+    ///
+    /// `Cell<u32>` rather than `AtomicU32` because this is thread-
+    /// local — single-owner, no atomicity required.
+    static LOCAL_REAP_COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Reap dead `LOCAL_BUILDERS` entries every Nth call. 4096 is a
+/// trade-off: small enough that a churned-out pool's TLS slot is
+/// reclaimed quickly (~ms at packet rates), large enough that the
+/// atomic walk vanishes from the hot path. A bursty workload may
+/// briefly hold a few dead entries; each is one `Weak<()>` +
+/// `Vec<PacketBuilder>` slot capped at `local_capacity * 2`, so the
+/// peak hold-over is bounded by `live_pool_count` worth of
+/// slots — same order as the steady-state cache.
+const REAP_INTERVAL: u32 = 4096;
+
+/// Increment the per-thread reap counter and, on every Nth call,
+/// walk the TLS pool map dropping entries whose owning
+/// `ThreadLocalPool` has been deallocated (the `Weak<()>` fails
+/// to upgrade). The walk is O(live_pools + dead_pools); typical
+/// thread holds 1–2 entries so the work is small even when it
+/// fires — the win is moving it off the hot per-call path.
+#[inline]
+fn maybe_reap_dead_pools(pools: &mut std::collections::HashMap<u64, LocalBuildersEntry>) {
+    let should_reap = LOCAL_REAP_COUNTER.with(|c| {
+        let next = c.get().wrapping_add(1);
+        c.set(next);
+        next.is_multiple_of(REAP_INTERVAL)
+    });
+    if should_reap {
+        pools.retain(|_, (weak, _)| weak.strong_count() > 0);
+    }
 }
 
 /// Global counter for assigning unique IDs to each ThreadLocalPool instance.
@@ -721,11 +762,15 @@ impl ThreadLocalPool {
     pub fn acquire(&self) -> PacketBuilder {
         LOCAL_BUILDERS.with(|pools| {
             let mut pools = pools.borrow_mut();
-            // Reap any TLS entries whose owning pool has been
-            // dropped (Weak fails to upgrade). Cheap: typical
-            // entry count per thread is 1–2; the `retain` walk
-            // is amortized into every TLS access.
-            pools.retain(|_, (weak, _)| weak.strong_count() > 0);
+            // Amortized reap: walk every `REAP_INTERVAL`-th call
+            // rather than every call. Pre-fix every acquire ran a
+            // `HashMap::retain` + `Weak::strong_count` on every
+            // entry — at packet rates that was the dominant cost
+            // on the TLS path (perf #17/#32). The reap stays in the
+            // same module-level invariant: dropped pools' slots get
+            // reaped on the next access by any pool, just not
+            // necessarily *this* one.
+            maybe_reap_dead_pools(&mut pools);
             let entry = pools
                 .entry(self.pool_id)
                 .or_insert_with(|| (Arc::downgrade(&self.alive), Vec::new()));
@@ -787,11 +832,10 @@ impl ThreadLocalPool {
 
         LOCAL_BUILDERS.with(|pools| {
             let mut pools = pools.borrow_mut();
-            // Reap dead entries on the release path too — release
-            // may run on threads that haven't called acquire
-            // recently and would otherwise hold dead entries
-            // until their next acquire.
-            pools.retain(|_, (weak, _)| weak.strong_count() > 0);
+            // Amortized reap: same gate as the acquire path. Pre-
+            // fix every release ran a `HashMap::retain` —
+            // perf #32.
+            maybe_reap_dead_pools(&mut pools);
             let entry = pools
                 .entry(self.pool_id)
                 .or_insert_with(|| (Arc::downgrade(&self.alive), Vec::new()));
@@ -1384,22 +1428,19 @@ mod tests {
     }
 
     /// Pin: TLS entries for dropped `ThreadLocalPool` instances
-    /// are reaped on the next access. Pre-fix `LOCAL_BUILDERS`
+    /// are reaped eventually. Pre-fix `LOCAL_BUILDERS`
     /// kept the entry forever, leaking ~16 KB × `local_capacity`
     /// per dropped pool per thread that ever touched it. The
     /// bug surfaced as production OOM in proportion to
     /// peer-churn count on long-lived daemons.
+    ///
+    /// Perf #17/#32 moved the reap off the per-call hot path —
+    /// it now fires every [`REAP_INTERVAL`] calls. The leak-free
+    /// invariant is unchanged; only its timing is bounded by the
+    /// reap cadence instead of immediate.
     #[test]
-    fn dropped_thread_local_pool_evicts_tls_entry_on_next_access() {
-        // Build a pool, populate its TLS slot, then drop it.
-        // Construct another pool and call acquire to trigger
-        // the reap pass. Snapshot the TLS map size before and
-        // after to confirm the dead entry was removed.
+    fn dropped_thread_local_pool_evicts_tls_entry_within_reap_interval() {
         let key = [0x33u8; 32];
-
-        // Capture the TLS map's pre-state to isolate from
-        // unrelated entries left over from prior tests.
-        let pre_size = LOCAL_BUILDERS.with(|m| m.borrow().len());
 
         let pool_a = ThreadLocalPool::new(4, &key, 0xA);
         // Touch acquire to populate the TLS slot.
@@ -1415,35 +1456,65 @@ mod tests {
         // Drop the pool.
         drop(pool_a);
 
-        // Without doing any TLS access, the entry is still
-        // present (Drop on `ThreadLocalPool` doesn't walk every
-        // thread's TLS — that's not feasible from within a
-        // single thread's drop). The reap happens on the next
-        // access to `LOCAL_BUILDERS`, regardless of which pool
-        // triggered it.
-        //
-        // Trigger the reap by acquire-ing from a fresh pool.
+        // The reap fires once every REAP_INTERVAL calls. After
+        // that many cycles on a fresh pool, the dead entry MUST
+        // be gone — anything more permissive lets a production
+        // OOM leak through.
+        let pool_b = ThreadLocalPool::new(4, &key, 0xB);
+        for _ in 0..REAP_INTERVAL {
+            let b = pool_b.acquire();
+            pool_b.release(b);
+        }
+
+        let still_has_a = LOCAL_BUILDERS.with(|m| m.borrow().contains_key(&pool_a_id));
+        assert!(
+            !still_has_a,
+            "pool A's dead TLS entry must be reaped within REAP_INTERVAL \
+             accesses — pre-fix this leaked forever (production OOM under \
+             peer churn)"
+        );
+    }
+
+    /// Pin perf #17/#32: `acquire`/`release` no longer walk the
+    /// TLS pool map on every call. We pin the contract
+    /// observationally — the reap is gated by [`LOCAL_REAP_COUNTER`]
+    /// so a fresh pool whose owning `ThreadLocalPool` was dropped
+    /// is NOT reaped on the very next access; it lingers until the
+    /// counter rolls over.
+    ///
+    /// A regression that re-introduces the per-call walk would
+    /// surface here as the dead entry vanishing on the first
+    /// post-drop access.
+    #[test]
+    fn dead_tls_entry_lingers_until_amortized_reap() {
+        let key = [0x44u8; 32];
+
+        // Reset the per-thread counter so this test doesn't ride
+        // off whatever the previous test left in TLS. Counter is
+        // pre-incremented inside `maybe_reap_dead_pools`, so
+        // setting it to 0 means the next ~REAP_INTERVAL calls
+        // skip the reap.
+        LOCAL_REAP_COUNTER.with(|c| c.set(0));
+
+        let pool_a = ThreadLocalPool::new(4, &key, 0xA);
+        let b = pool_a.acquire();
+        pool_a.release(b);
+        let pool_a_id = pool_a.pool_id;
+        drop(pool_a);
+
+        // Single access on a fresh pool: pre-fix the dead entry
+        // got reaped immediately. Post-fix the reap is amortized,
+        // so the entry is still present (the reap has not fired
+        // since we just reset the counter).
         let pool_b = ThreadLocalPool::new(4, &key, 0xB);
         let b = pool_b.acquire();
         pool_b.release(b);
 
-        // After the reap, the dead pool's entry is gone and
-        // only pool B's entry remains (modulo any pre-existing
-        // entries from earlier tests).
-        let post_size = LOCAL_BUILDERS.with(|m| m.borrow().len());
         let still_has_a = LOCAL_BUILDERS.with(|m| m.borrow().contains_key(&pool_a_id));
         assert!(
-            !still_has_a,
-            "pool A's dead TLS entry must be reaped on next access — \
-             pre-fix this leaked forever (production OOM under peer churn)"
-        );
-        // The TLS map should not have grown: pool A's entry
-        // was removed and pool B's added, so size <= pre_size + 1.
-        assert!(
-            post_size <= pre_size + 1,
-            "TLS map size grew unexpectedly: pre={} post={}",
-            pre_size,
-            post_size
+            still_has_a,
+            "dead entry must linger until amortized reap fires; \
+             a regression here is the perf-degrading per-call retain returning"
         );
     }
 

@@ -346,7 +346,7 @@ impl RpcHandler for NodeRpcHandler {
         //    aliases to napi's `Result<T, napi::Status>`; the
         //    trait method must use `std::result::Result` so the
         //    error type stays `RpcHandlerError`.
-        let req_buf = Buffer::from(ctx.payload.body);
+        let req_buf = Buffer::from(ctx.payload.body.to_vec());
         let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
         let status = self.tsfn.call_with_return_value(
             req_buf,
@@ -421,7 +421,7 @@ impl RpcHandler for NodeRpcHandler {
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: resp_buf.to_vec(),
+            body: resp_buf.to_vec().into(),
         })
     }
 }
@@ -1291,7 +1291,7 @@ impl RpcClientStreamingHandler for NodeClientStreamingRpcHandler {
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: vec![],
-            body: resp_buf.to_vec(),
+            body: resp_buf.to_vec().into(),
         })
     }
 }
