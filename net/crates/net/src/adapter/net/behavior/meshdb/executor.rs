@@ -276,11 +276,11 @@ impl<R: ChainReader + 'static> MeshQueryExecutor for LocalMeshQueryExecutor<R> {
                 let rows = collect_operator_rows(&plan.root, self.reader.as_ref())?;
                 cache.insert(
                     key,
-                    super::cache::CachedResult {
-                        rows: rows.clone(),
-                        inserted_at: std::time::Instant::now(),
-                        policy: options.cache_policy,
-                    },
+                    super::cache::CachedResult::new(
+                        rows.clone(),
+                        std::time::Instant::now(),
+                        options.cache_policy,
+                    ),
                 );
                 let handle = QueryHandle::new(self.allocate_id());
                 let stream = stream_from_vec(rows, handle.clone());
