@@ -6,6 +6,14 @@ The compute path is hotter than it looks. Every event delivered to a daemon hits
 
 ---
 
+## ✅ Fixed
+
+| # | Item | Notes |
+|---|------|-------|
+| 149 | `EndpointState::metrics()` `RwLock<LoadMetrics>` read + clone per call → `ArcSwap<LoadMetrics>` + `load_score()` helper | Pre-fix every per-event select strategy (`select_least_load`, `select_power_of_two`, `select_adaptive`, etc.) called `state.metrics().load_score()` which acquired a parking_lot read lock, deep-cloned the 9-field `LoadMetrics` struct, then computed `load_score()` and dropped the clone. For 100 endpoints + LeastLatency = 100 RwLock acquires + 100 clones per event. Switched `metrics: RwLock<LoadMetrics>` → `ArcSwap<LoadMetrics>`; reads become one lock-free Acquire load. Added `EndpointState::load_score()` that runs `self.metrics.load().load_score()` — no clone, the ArcSwap guard holds a borrowed reference into the current Arc. The 13 internal call sites (every `state.metrics().load_score()`) switched to `state.load_score()`. The legacy `metrics()` accessor stays for `LoadBalancer::endpoints()` which materializes full `Endpoint` structs for operator inventory consumers — it does `(**self.metrics.load()).clone()` (one Arc deref + one struct clone, no lock). Updates (`update_metrics`, operator-cadence) call `metrics.store(Arc::new(metrics))`. Pinned by `endpoint_state_metrics_arc_swap_visibility_and_no_clone_on_read`: asserts `Arc::ptr_eq` across two consecutive reads with no intervening write (would fail under `RwLock<T>` or a swap-via-clone alternative), and that post-update `load_score()` reflects the new value. |
+
+---
+
 ## 🔴 High-impact
 
 ### 148. `LoadBalancer::get_available_endpoints` walks every endpoint and clones per match — per event

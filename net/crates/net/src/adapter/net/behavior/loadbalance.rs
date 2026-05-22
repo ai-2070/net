@@ -6,6 +6,7 @@
 //! - Load metrics collection and aggregation
 //! - Adaptive load balancing based on real-time conditions
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -228,8 +229,14 @@ struct EndpointState {
     priority: u32,
     /// Mutable health status
     health: RwLock<HealthStatus>,
-    /// Mutable metrics
-    metrics: RwLock<LoadMetrics>,
+    /// Mutable metrics.
+    ///
+    /// Per perf #149, switched `RwLock<LoadMetrics>` →
+    /// `ArcSwap<LoadMetrics>` so the per-event `load_score()` read
+    /// in every selection strategy is one lock-free Acquire load
+    /// instead of a parking_lot read + full struct clone. Updates
+    /// (operator-cadence) call `metrics.store(Arc::new(...))`.
+    metrics: ArcSwap<LoadMetrics>,
     /// Whether endpoint is enabled
     enabled: std::sync::atomic::AtomicBool,
     /// Current connection count
@@ -260,7 +267,7 @@ impl EndpointState {
             zone: endpoint.zone,
             priority: endpoint.priority,
             health: RwLock::new(endpoint.health),
-            metrics: RwLock::new(endpoint.metrics),
+            metrics: ArcSwap::new(Arc::new(endpoint.metrics)),
             enabled: std::sync::atomic::AtomicBool::new(endpoint.enabled),
             connections: AtomicU32::new(0),
             total_requests: AtomicU64::new(0),
@@ -277,8 +284,22 @@ impl EndpointState {
         *self.health.read()
     }
 
+    /// Materialize an owned snapshot of the current metrics. Used
+    /// by [`LoadBalancer::endpoints`] which builds full `Endpoint`
+    /// structs for operator/inventory consumers — that path
+    /// genuinely needs ownership. Per-select hot paths should call
+    /// [`Self::load_score`] which avoids the clone entirely.
     fn metrics(&self) -> LoadMetrics {
-        self.metrics.read().clone()
+        (**self.metrics.load()).clone()
+    }
+
+    /// Compute the composite load score from the current metrics
+    /// snapshot. Per perf #149 — pre-fix every per-event select
+    /// path called `state.load_score()` which
+    /// `RwLock::read + LoadMetrics::clone + score`. Now it's one
+    /// `ArcSwap::load + score` — no lock, no clone.
+    fn load_score(&self) -> f64 {
+        self.metrics.load().load_score()
     }
 
     fn is_enabled(&self) -> bool {
@@ -731,7 +752,7 @@ impl LoadBalancer {
     /// Update endpoint metrics
     pub fn update_metrics(&self, node_id: &NodeId, metrics: LoadMetrics) {
         if let Some(state) = self.endpoints.get(node_id) {
-            *state.metrics.write() = metrics;
+            state.metrics.store(Arc::new(metrics));
         }
     }
 
@@ -961,7 +982,7 @@ impl LoadBalancer {
         Selection {
             node_id: state.node_id,
             weight: state.weight,
-            load_score: state.metrics().load_score(),
+            load_score: state.load_score(),
             reason: SelectionReason::RoundRobin,
         }
     }
@@ -1018,7 +1039,7 @@ impl LoadBalancer {
                 return Selection {
                     node_id: state.node_id,
                     weight: state.weight,
-                    load_score: state.metrics().load_score(),
+                    load_score: state.load_score(),
                     reason: SelectionReason::Weighted,
                 };
             }
@@ -1029,7 +1050,7 @@ impl LoadBalancer {
         Selection {
             node_id: state.node_id,
             weight: state.weight,
-            load_score: state.metrics().load_score(),
+            load_score: state.load_score(),
             reason: SelectionReason::Weighted,
         }
     }
@@ -1047,7 +1068,7 @@ impl LoadBalancer {
         Selection {
             node_id: state.node_id,
             weight: state.weight,
-            load_score: state.metrics().load_score(),
+            load_score: state.load_score(),
             reason: SelectionReason::LeastConnections,
         }
     }
@@ -1080,7 +1101,7 @@ impl LoadBalancer {
         Selection {
             node_id: state.node_id,
             weight: state.weight,
-            load_score: state.metrics().load_score(),
+            load_score: state.load_score(),
             reason: SelectionReason::LeastConnections,
         }
     }
@@ -1091,7 +1112,7 @@ impl LoadBalancer {
         Selection {
             node_id: state.node_id,
             weight: state.weight,
-            load_score: state.metrics().load_score(),
+            load_score: state.load_score(),
             reason: SelectionReason::Random,
         }
     }
@@ -1112,7 +1133,7 @@ impl LoadBalancer {
                 return Selection {
                     node_id: state.node_id,
                     weight: state.weight,
-                    load_score: state.metrics().load_score(),
+                    load_score: state.load_score(),
                     reason: SelectionReason::Weighted,
                 };
             }
@@ -1123,7 +1144,7 @@ impl LoadBalancer {
         Selection {
             node_id: state.node_id,
             weight: state.weight,
-            load_score: state.metrics().load_score(),
+            load_score: state.load_score(),
             reason: SelectionReason::Weighted,
         }
     }
@@ -1162,7 +1183,7 @@ impl LoadBalancer {
                     return Selection {
                         node_id: state.node_id,
                         weight: state.weight,
-                        load_score: state.metrics().load_score(),
+                        load_score: state.load_score(),
                         reason: SelectionReason::ConsistentHash,
                     };
                 }
@@ -1190,7 +1211,7 @@ impl LoadBalancer {
         Selection {
             node_id: state.node_id,
             weight: state.weight,
-            load_score: state.metrics().load_score(),
+            load_score: state.load_score(),
             reason: SelectionReason::LeastLatency,
         }
     }
@@ -1212,7 +1233,7 @@ impl LoadBalancer {
         Selection {
             node_id: state.node_id,
             weight: state.weight,
-            load_score: state.metrics().load_score(),
+            load_score: state.load_score(),
             reason: SelectionReason::LeastLoad,
         }
     }
@@ -1244,7 +1265,7 @@ impl LoadBalancer {
         Selection {
             node_id: state.node_id,
             weight: state.weight,
-            load_score: state.metrics().load_score(),
+            load_score: state.load_score(),
             reason: SelectionReason::PowerOfTwo,
         }
     }
@@ -1318,7 +1339,7 @@ impl LoadBalancer {
                 healthy += 1;
             }
             total_connections += state.connections.load(Ordering::Relaxed) as u64;
-            total_load += state.metrics().load_score();
+            total_load += state.load_score();
         }
 
         let endpoint_count = self.endpoints.len() as u32;
@@ -1405,6 +1426,56 @@ mod tests {
         let mut id = [0u8; 32];
         id[0] = n;
         id
+    }
+
+    /// Pin perf #149: `update_metrics` followed by `load_score`
+    /// observes the new metrics value lock-free via ArcSwap. A
+    /// regression that reverts to `RwLock<LoadMetrics>` would
+    /// still pass this functional test but would re-introduce the
+    /// per-event lock-acquire + struct clone. The pointer-identity
+    /// check on `Arc::ptr_eq` distinguishes ArcSwap (writer's Arc
+    /// is the reader's Arc) from any swap-via-clone alternative.
+    #[test]
+    fn endpoint_state_metrics_arc_swap_visibility_and_no_clone_on_read() {
+        let lb = LoadBalancer::with_strategy(Strategy::LeastLoad);
+        let node = make_node_id(7);
+        lb.add_endpoint(Endpoint::new(node));
+
+        // Initial: defaulted LoadMetrics; score is small but
+        // computed lock-free.
+        {
+            let state_ref = lb.endpoints.get(&node).expect("endpoint registered");
+            let initial_load = state_ref.load_score();
+            assert!(
+                initial_load >= 0.0,
+                "load_score must compute from current ArcSwap snapshot"
+            );
+            // The internal Arc backing metrics — readers should
+            // observe the SAME Arc identity across two loads with
+            // no intervening write.
+            let arc1 = state_ref.metrics.load_full();
+            let arc2 = state_ref.metrics.load_full();
+            assert!(
+                Arc::ptr_eq(&arc1, &arc2),
+                "two reads with no writer in between must share the Arc — \
+                 confirms ArcSwap (not RwLock<T>) backing"
+            );
+        }
+
+        // Update to a heavily-loaded snapshot.
+        let busy = LoadMetrics {
+            cpu_usage: 0.95,
+            error_rate: 0.5,
+            ..Default::default()
+        };
+        let busy_score = busy.load_score();
+        lb.update_metrics(&node, busy);
+
+        let state_ref = lb.endpoints.get(&node).expect("endpoint still here");
+        assert!(
+            (state_ref.load_score() - busy_score).abs() < f64::EPSILON,
+            "post-update load_score must reflect the new snapshot"
+        );
     }
 
     #[test]
