@@ -1,0 +1,37 @@
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_947eb728f006db::t_c98ada10e84d5d 59
+  s_947eb728f006db::t_c02551c377a037 65
+  s_947eb728f006db::t_78a08bbacc41c1 519-527
+net/crates/net/src/adapter/net/behavior/fold/dispatch.rs
+  s_947eb728f006db::t_ce6245c4ebf23d 30
+  s_947eb728f006db::t_ec1d1201a56c37 72-77
+  s_947eb728f006db::t_b23387aaa5c1ed 107-110
+  s_947eb728f006db::t_d29bdd873f0da2 202-217
+net/crates/net/src/adapter/net/behavior/fold/tests.rs
+  s_947eb728f006db::t_4ccf0efa37f9d6 1336
+  s_947eb728f006db::t_34dc8ae7843e72 1233-1335,1337-1411
+  s_947eb728f006db::t_4d9b305ad74d33 1232
+net/crates/net/src/adapter/net/behavior/fold/metrics.rs
+  s_947eb728f006db::t_fac22467a57750 251-265,267-279
+  s_947eb728f006db::t_4b8abfb78602a2 15-39,46-75
+  s_947eb728f006db::t_63f827ad3a722d 266
+  s_947eb728f006db::t_be2210655a7527 40-45
+net/crates/net/src/adapter/net/behavior/fold/audit.rs
+  s_947eb728f006db::t_43fd53fe5b8089 96-164
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "433130ed811bb506d4bfd06be3f8d42e01dbfe1e",
+  "prompts": {},
+  "sessions": {
+    "s_947eb728f006db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fe2a7b6-f937-436c-8c36-6580a8be4344",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
