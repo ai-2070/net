@@ -570,6 +570,13 @@ struct DispatchCtx {
     /// Capability index shared with `MeshNode`. Inbound
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets are indexed here.
     capability_index: Arc<CapabilityIndex>,
+    /// Capability fold shared with `MeshNode`. Receives the
+    /// same inbound capability announcements via the bridge's
+    /// `translate_announcement`, so the new fold-backed
+    /// query path returns identical candidate sets while
+    /// callers progressively migrate off the legacy index.
+    capability_fold:
+        Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
     /// Dedup cache for multi-hop capability announcements, keyed by
     /// `(origin_node_id, version)`. Written by the dispatch handler
     /// before indexing + forwarding so a `(origin, version)` tuple
@@ -2964,6 +2971,7 @@ impl MeshNode {
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
             capability_index: self.capability_index.clone(),
+            capability_fold: self.capability_fold.clone(),
             seen_announcements: self.seen_announcements.clone(),
             require_signed_capabilities: self.config.require_signed_capabilities,
             local_subnet: self.local_subnet,
@@ -5965,6 +5973,12 @@ impl MeshNode {
         if from_node != ctx.local_node_id {
             Self::filter_unauthorized_heat_tags(&mut ann.capabilities);
         }
+        // Phase 3b dual-population: dispatch the same
+        // announcement into the fold so the fold-backed query
+        // path returns identical candidate sets while callers
+        // progressively migrate off the legacy index.
+        let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
+        let _ = ctx.capability_fold.apply(fold_ann);
         ctx.capability_index.index(ann);
     }
 
@@ -7474,6 +7488,12 @@ impl MeshNode {
         )
         .with_ttl(300);
         ann.sign(&self.identity);
+        // Phase 3b dual-population: mirror the self-index into
+        // the fold so local queries find us through the new
+        // path too.
+        let fold_ann =
+            super::behavior::fold::capability_bridge::translate_announcement(&ann);
+        let _ = self.capability_fold.apply(fold_ann);
         self.capability_index.index(ann);
     }
 
@@ -7589,6 +7609,11 @@ impl MeshNode {
         // Self-index so local queries see our own caps. Always runs
         // regardless of rate limit — the self-index reflects the
         // latest intended announcement.
+        // Phase 3b dual-population: same translation as the
+        // other self-index sites.
+        let fold_ann =
+            super::behavior::fold::capability_bridge::translate_announcement(&ann);
+        let _ = self.capability_fold.apply(fold_ann);
         self.capability_index.index(ann.clone());
 
         // Publish as the latest local announcement so future

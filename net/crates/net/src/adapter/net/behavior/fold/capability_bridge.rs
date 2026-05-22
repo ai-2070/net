@@ -29,12 +29,13 @@
 use std::collections::HashSet;
 
 use super::super::capability::{
-    matches_scope, CapabilityFilter as LegacyFilter, CapabilityScope, GpuVendor, ScopeFilter,
+    matches_scope, CapabilityAnnouncement, CapabilityFilter as LegacyFilter, CapabilityScope,
+    GpuVendor, ScopeFilter,
 };
 use super::capability::{
-    CapabilityFilter, CapabilityFold, CapabilityMembership, CapabilityQuery,
+    CapabilityFilter, CapabilityFold, CapabilityMembership, CapabilityQuery, HardwareSummary,
 };
-use super::{Fold, NodeId};
+use super::{EnvelopeMeta, Fold, FoldKind, NodeId, NodeState, SignedAnnouncement};
 
 /// Translate the legacy
 /// [`behavior::capability::CapabilityFilter`](super::super::capability::CapabilityFilter)
@@ -127,6 +128,89 @@ fn gpu_vendor_matches(canonical: &str, want: GpuVendor) -> bool {
         ("nvidia", GpuVendor::Nvidia)
             | ("amd", GpuVendor::Amd)
             | ("intel", GpuVendor::Intel)
+    )
+}
+
+fn gpu_vendor_canonical(vendor: GpuVendor) -> &'static str {
+    match vendor {
+        GpuVendor::Nvidia => "nvidia",
+        GpuVendor::Amd => "amd",
+        GpuVendor::Intel => "intel",
+        _ => "other",
+    }
+}
+
+/// Translate a legacy [`CapabilityAnnouncement`] into a
+/// fold-shaped [`SignedAnnouncement<CapabilityMembership>`]
+/// suitable for [`Fold::apply`] dual-population during the
+/// Phase 3b cutover. The fold-side envelope is stamped with
+/// the [`super::wire::placeholder_signature`] sentinel — apply
+/// trusts its input (the dispatch layer is the one that
+/// verifies), so the placeholder is fine here. The legacy
+/// announcement's own signature has already been verified by
+/// the cap-ann dispatch handler upstream.
+///
+/// `class_hash = 0` is a cutover sentinel: legacy announcements
+/// don't carry the fold's per-class sharding model, so every
+/// translated entry shares the same `(class=0, node_id)` key.
+/// Queries that don't constrain on class — which is every
+/// caller in this codebase per the prior survey — work
+/// transparently against this layout.
+pub(crate) fn translate_announcement(
+    ann: &CapabilityAnnouncement,
+) -> SignedAnnouncement<CapabilityMembership> {
+    let views = ann.capabilities.views();
+    let hw_view = views.hardware();
+    let primary_gpu = hw_view.gpu.as_ref();
+    let gpu_count = (primary_gpu.is_some() as u8)
+        .saturating_add(hw_view.additional_gpus.len() as u8);
+    let gpu_vendor = primary_gpu.map(|g| gpu_vendor_canonical(g.vendor).to_string());
+    let vram_gb = {
+        let mut total: u32 = 0;
+        if let Some(g) = primary_gpu {
+            total = total.saturating_add(g.vram_gb);
+        }
+        for g in &hw_view.additional_gpus {
+            total = total.saturating_add(g.vram_gb);
+        }
+        (gpu_count > 0).then_some(total)
+    };
+    let memory_gb = (hw_view.memory_gb > 0).then_some(hw_view.memory_gb);
+    let hardware = if primary_gpu.is_some() || memory_gb.is_some() {
+        Some(HardwareSummary {
+            gpu_vendor,
+            gpu_count,
+            memory_gb,
+            vram_gb,
+        })
+    } else {
+        None
+    };
+
+    let tags: Vec<String> = ann.capabilities.tags.iter().map(|t| t.to_string()).collect();
+    let region = tags
+        .iter()
+        .find_map(|t| t.strip_prefix("scope:region:").map(String::from));
+
+    SignedAnnouncement::placeholder(
+        CapabilityFold::KIND_ID,
+        0,
+        ann.node_id,
+        ann.version.max(1),
+        EnvelopeMeta {
+            announced_at: ann.timestamp_ns / 1_000,
+            ttl_secs: Some(ann.ttl_secs),
+            flags: 0,
+        },
+        CapabilityMembership {
+            class_hash: 0,
+            tags,
+            hardware,
+            state: NodeState::Idle,
+            region,
+            price_quote: None,
+            reflex_addr: ann.reflex_addr,
+        },
     )
 }
 
@@ -360,6 +444,62 @@ mod tests {
             CapabilityScope::Regions(rs) => assert_eq!(rs, vec!["us-east".to_string()]),
             other => panic!("expected Regions, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn translate_announcement_projects_legacy_hardware_into_summary() {
+        use crate::adapter::net::behavior::capability::{
+            CapabilityAnnouncement, CapabilitySet, GpuInfo, GpuVendor as LegacyGpuVendor,
+            HardwareCapabilities,
+        };
+        use crate::adapter::net::identity::EntityId;
+
+        let caps = CapabilitySet::new().with_hardware(
+            HardwareCapabilities::new()
+                .with_memory(128)
+                .with_gpu(GpuInfo {
+                    vendor: LegacyGpuVendor::Nvidia,
+                    model: "h100".into(),
+                    vram_gb: 80,
+                    compute_units: 0,
+                    tensor_cores: 0,
+                    fp16_tflops_x10: 0,
+                }),
+        );
+        let ann = CapabilityAnnouncement::new(
+            0xAA,
+            EntityId::from_bytes([0u8; 32]),
+            7,
+            caps,
+        );
+
+        let translated = translate_announcement(&ann);
+        assert_eq!(translated.node_id, 0xAA);
+        assert_eq!(translated.generation, 7);
+        let hw = translated.payload.hardware.expect("hardware summary set");
+        assert_eq!(hw.memory_gb, Some(128));
+        assert_eq!(hw.gpu_count, 1);
+        assert_eq!(hw.gpu_vendor.as_deref(), Some("nvidia"));
+        assert_eq!(hw.vram_gb, Some(80));
+    }
+
+    #[test]
+    fn translate_announcement_promotes_version_zero_to_generation_one() {
+        // The fold rejects generation == 0 (wire sentinel). The
+        // legacy CapabilityAnnouncement::new defaults version to
+        // whatever the caller passes; if a legacy caller used 0
+        // we must promote to 1 so the fold accepts the apply.
+        use crate::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+        use crate::adapter::net::identity::EntityId;
+
+        let ann = CapabilityAnnouncement::new(
+            0xAA,
+            EntityId::from_bytes([0u8; 32]),
+            0,
+            CapabilitySet::new(),
+        );
+        let translated = translate_announcement(&ann);
+        assert_eq!(translated.generation, 1);
     }
 
     #[test]
