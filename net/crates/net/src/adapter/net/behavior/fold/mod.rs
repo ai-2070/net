@@ -52,7 +52,10 @@ pub mod wire;
 mod tests;
 
 pub use announcement::SignedAnnouncement;
-pub use dispatch::{DispatchError, FoldDispatch, FoldDispatchAdapter, FoldRegistry};
+pub use dispatch::{
+    DispatchError, FoldChannelRouter, FoldDispatch, FoldDispatchAdapter, FoldRegistry,
+    SUBPROTOCOL_FOLD,
+};
 pub use metrics::FoldMetrics;
 pub use snapshot::{FoldSnapshot, FoldSnapshotEntry};
 pub use state::{

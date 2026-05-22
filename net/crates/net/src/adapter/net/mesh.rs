@@ -359,6 +359,13 @@ struct DispatchCtx {
     #[cfg(feature = "meshdb")]
     meshdb_inbound_router:
         Arc<parking_lot::RwLock<Option<Arc<dyn super::behavior::meshdb::MeshDbInboundRouter>>>>,
+    /// Optional fold-framework channel router. See the matching
+    /// field doc on `MeshNode`. One read lock per
+    /// `SUBPROTOCOL_FOLD` packet on the inbound path; absent
+    /// router means fold packets are dropped silently (mirrors
+    /// the meshdb router's behaviour).
+    fold_router:
+        Arc<parking_lot::RwLock<Option<Arc<dyn super::behavior::fold::FoldChannelRouter>>>>,
     /// Optional greedy-LRU observer. See the matching field doc on
     /// `MeshNode`. The hot path takes a single read lock on every
     /// standard-event packet; uncontended reads under
@@ -1537,6 +1544,15 @@ pub struct MeshNode {
     #[cfg(feature = "meshdb")]
     meshdb_inbound_router:
         Arc<parking_lot::RwLock<Option<Arc<dyn super::behavior::meshdb::MeshDbInboundRouter>>>>,
+    /// Optional fold-framework channel router. Installed via
+    /// [`Self::set_fold_router`]; the inbound dispatch arm for
+    /// [`super::behavior::fold::SUBPROTOCOL_FOLD`] (per the
+    /// multifold plan's Phase 2B) routes every event in a fold
+    /// packet through this router after resolving the
+    /// publisher's [`EntityId`] from [`Self::peer_entity_ids`].
+    /// `None` = fold packets dropped silently.
+    fold_router:
+        Arc<parking_lot::RwLock<Option<Arc<dyn super::behavior::fold::FoldChannelRouter>>>>,
     /// Optional greedy-LRU observer. `Redex` installs one of these
     /// via [`Self::set_greedy_observer`] when the operator calls
     /// `Redex::enable_greedy_dataforts(mesh, cfg)`; subsequent
@@ -1880,6 +1896,7 @@ impl MeshNode {
             replication_inbound_router: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "meshdb")]
             meshdb_inbound_router: Arc::new(parking_lot::RwLock::new(None)),
+            fold_router: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "dataforts")]
             greedy_observer: Arc::new(parking_lot::RwLock::new(None)),
             capability_version: Arc::new(AtomicU64::new(0)),
@@ -2695,6 +2712,7 @@ impl MeshNode {
             replication_inbound_router: self.replication_inbound_router.clone(),
             #[cfg(feature = "meshdb")]
             meshdb_inbound_router: self.meshdb_inbound_router.clone(),
+            fold_router: self.fold_router.clone(),
             #[cfg(feature = "dataforts")]
             greedy_observer: self.greedy_observer.clone(),
             pending_handshakes: self.pending_handshakes.clone(),
@@ -3780,6 +3798,63 @@ impl MeshNode {
             for payload in events {
                 if let Err(e) = router.try_route(from_node, &payload) {
                     tracing::debug!(error = %e, from_node, "meshdb: drop frame");
+                }
+            }
+            return;
+        }
+
+        // Fold framework: signed-announcement traffic on
+        // `SUBPROTOCOL_FOLD`. Per the multifold plan's Phase 2B,
+        // every event in the packet is one
+        // `SignedAnnouncement<P>` postcard envelope; the
+        // `FoldChannelRouter` (typically a `FoldRegistry`) decodes
+        // + verifies + dispatches each to its registered
+        // `Fold<K>` by the envelope's `kind` u16. `None` router =
+        // drop silently, mirroring meshdb / replication.
+        //
+        // Publisher resolution: the inbound session's `node_id`
+        // maps to an `EntityId` via the local `peer_entity_ids`
+        // DashMap. Without a known entity for the session we
+        // can't verify signatures — drop the frame and let
+        // operators notice the missing handshake via the usual
+        // peer-bring-up diagnostics.
+        if parsed.header.subprotocol_id == super::behavior::fold::SUBPROTOCOL_FOLD {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            if events.is_empty() {
+                return;
+            }
+            let router_guard = ctx.fold_router.read();
+            let Some(router) = router_guard.as_ref() else {
+                return;
+            };
+            let from_node = ctx
+                .peers
+                .iter()
+                .find(|e| e.value().session.session_id() == session.session_id())
+                .map(|e| e.value().node_id)
+                .unwrap_or(0);
+            if from_node == 0 {
+                return;
+            }
+            let Some(publisher) = ctx
+                .peer_entity_ids
+                .get(&from_node)
+                .map(|e| e.value().clone())
+            else {
+                // Session is up but no EntityId recorded — should
+                // be impossible in steady state (the handshake
+                // populates both maps together). Drop to be safe;
+                // an unauthenticated `try_route` would forge the
+                // publisher claim.
+                tracing::debug!(
+                    from_node,
+                    "fold: missing peer EntityId, drop frame"
+                );
+                return;
+            };
+            for payload in events {
+                if let Err(e) = router.try_route(&publisher, &payload) {
+                    tracing::debug!(error = %e, from_node, "fold: drop frame");
                 }
             }
             return;
@@ -7720,6 +7795,34 @@ impl MeshNode {
     #[cfg(feature = "meshdb")]
     pub fn has_meshdb_inbound_router(&self) -> bool {
         self.meshdb_inbound_router.read().is_some()
+    }
+
+    /// Install (or uninstall) the fold-framework channel router.
+    ///
+    /// Per the multifold plan's Phase 2B, the inbound dispatch
+    /// arm for [`super::behavior::fold::SUBPROTOCOL_FOLD`]
+    /// decodes each event in a fold packet, resolves the
+    /// publisher's [`EntityId`] from the inbound session's
+    /// `node_id` via the local `peer_entity_ids` map, and hands
+    /// the bytes off to `router.try_route(&publisher, &event)`.
+    /// Absent router = fold packets dropped silently (mirrors
+    /// the meshdb router's behaviour).
+    ///
+    /// Idempotent: re-installing replaces the previous handle.
+    /// Hot-path cost is one `parking_lot::RwLock` read per
+    /// inbound `SUBPROTOCOL_FOLD` frame.
+    pub fn set_fold_router(
+        &self,
+        router: Option<Arc<dyn super::behavior::fold::FoldChannelRouter>>,
+    ) {
+        *self.fold_router.write() = router;
+    }
+
+    /// True iff a fold-framework channel router is currently
+    /// installed. Useful for tests and the operator surface to
+    /// confirm the install landed.
+    pub fn has_fold_router(&self) -> bool {
+        self.fold_router.read().is_some()
     }
 
     /// Install (or uninstall) the greedy-LRU observer. `Redex`

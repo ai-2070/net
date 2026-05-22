@@ -30,6 +30,23 @@ use super::announcement::SignedAnnouncement;
 use super::state::ApplyOutcome;
 use super::wire::WireError;
 use super::{Fold, FoldKind};
+use crate::adapter::net::identity::EntityId;
+
+/// Wire subprotocol slot for fold-channel traffic.
+///
+/// Phase 2B reserves `0x1000` for every fold announcement
+/// regardless of `FoldKind`. The per-kind demux happens inside
+/// the [`FoldRegistry`] (routing on the envelope's `kind`
+/// u16), so a single subprotocol covers capability / routing /
+/// reservation / future folds. Reusing one subprotocol per
+/// substrate-level fan-out class keeps the
+/// `NetHeader::subprotocol_id` audit / observability surface
+/// small.
+///
+/// Available adjacent slots: `0x1001..=0x10FF` if a future
+/// design needs a parallel envelope shape (currently nothing
+/// proposes one).
+pub const SUBPROTOCOL_FOLD: u16 = 0x1000;
 
 /// Type-erased view of a single [`Fold<K>`] instance, suitable
 /// for storage in a `HashMap<u16, Arc<dyn FoldDispatch>>`.
@@ -199,6 +216,44 @@ impl FoldRegistry {
 impl Default for FoldRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Hook the mesh's inbound channel-dispatch path uses to route
+/// fold announcements. Phase 2B's integration in
+/// `mesh.rs::dispatch_packet` installs an `Arc<dyn FoldChannelRouter>`
+/// (typically a [`FoldRegistry`]) and routes every event from a
+/// `SUBPROTOCOL_FOLD` packet through it.
+///
+/// The trait abstracts the registry away from the mesh so the
+/// integration is `cfg`-feature-clean (no transitive feature
+/// requirement on the channel-layer crate) and so tests can
+/// stub the router with a counting / inspecting impl.
+///
+/// `publisher` is the [`EntityId`] resolved at dispatch time
+/// from the inbound session's `node_id` via the mesh's
+/// `peer_entity_ids` map. The router uses it to verify the
+/// announcement's signature.
+pub trait FoldChannelRouter: Send + Sync {
+    /// Route one wire envelope to the right fold. Errors are
+    /// surfaced so the mesh dispatch arm can log + bump metrics;
+    /// the mesh never lets a router error escape into the rest
+    /// of the inbound pipeline (single-packet failures must not
+    /// take down the dispatch loop).
+    fn try_route(
+        &self,
+        publisher: &EntityId,
+        bytes: &[u8],
+    ) -> Result<ApplyOutcome, DispatchError>;
+}
+
+impl FoldChannelRouter for FoldRegistry {
+    fn try_route(
+        &self,
+        publisher: &EntityId,
+        bytes: &[u8],
+    ) -> Result<ApplyOutcome, DispatchError> {
+        self.dispatch(bytes, publisher)
     }
 }
 

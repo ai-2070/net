@@ -714,3 +714,105 @@ fn registry_can_deregister_a_fold() {
     assert!(removed.is_some());
     assert!(registry.is_empty());
 }
+
+// ---------------------------------------------------------------------
+// Phase 2B: channel-router trait wiring (in-process publisher → router
+// → registry → fold roundtrip). The mesh-level dispatch arm is exercised
+// by integration tests once the channel layer adopters land; here we
+// verify the router contract that arm is built against.
+// ---------------------------------------------------------------------
+
+use super::dispatch::FoldChannelRouter;
+use crate::adapter::net::identity::EntityId;
+
+#[test]
+fn fold_registry_implements_channel_router_trait() {
+    // The mesh dispatch arm stores routers as
+    // `Arc<dyn FoldChannelRouter>`. Confirm `FoldRegistry`
+    // round-trips through the trait object — a regression that
+    // breaks the blanket impl would surface as a compile error
+    // here.
+    let registry = FoldRegistry::new();
+    let cap_fold: Arc<Fold<CapFold>> = Arc::new(Fold::new());
+    registry.register(cap_fold.clone());
+    let registry: Arc<dyn FoldChannelRouter> = Arc::new(registry);
+
+    let kp = EntityKeypair::generate();
+    let ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    let bytes = ann.encode().expect("encode");
+
+    let outcome = registry
+        .try_route(kp.entity_id(), &bytes)
+        .expect("router accepts signed envelope");
+    assert_eq!(outcome, ApplyOutcome::Inserted);
+    assert_eq!(cap_fold.metrics().applies_inserted(), 1);
+}
+
+#[test]
+fn channel_router_surface_propagates_signature_failure() {
+    // The router contract must NOT mask signature failures;
+    // the mesh dispatch arm relies on the `DispatchError::Wire`
+    // surface to log + drop tampered frames without crediting
+    // them to a fold.
+    let registry = FoldRegistry::new();
+    let cap_fold: Arc<Fold<CapFold>> = Arc::new(Fold::new());
+    registry.register(cap_fold.clone());
+    let router: Arc<dyn FoldChannelRouter> = Arc::new(registry);
+
+    let signer = EntityKeypair::generate();
+    let imposter = EntityKeypair::generate();
+    let ann = sign_cap_ann(&signer, 0x42, 0x1000, 1, vec!["gpu"]);
+    let bytes = ann.encode().expect("encode");
+
+    // Route claiming the imposter's identity → InvalidSignature.
+    match router.try_route(imposter.entity_id(), &bytes) {
+        Err(DispatchError::Wire(WireError::InvalidSignature)) => {}
+        other => panic!("expected InvalidSignature, got {other:?}"),
+    }
+    // No apply credited to the fold.
+    assert_eq!(cap_fold.metrics().applies_inserted(), 0);
+}
+
+#[test]
+fn channel_router_drops_envelope_for_unknown_kind() {
+    // The mesh dispatch arm relies on UnknownKind being a
+    // recoverable error (not a panic) so a stray fold publish
+    // for a kind this node doesn't host doesn't take down the
+    // dispatch loop.
+    let registry = FoldRegistry::new();
+    let router: Arc<dyn FoldChannelRouter> = Arc::new(registry);
+
+    let kp = EntityKeypair::generate();
+    let ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    let bytes = ann.encode().expect("encode");
+
+    match router.try_route(kp.entity_id(), &bytes) {
+        Err(DispatchError::UnknownKind(k)) => assert_eq!(k, CapFold::KIND_ID),
+        other => panic!("expected UnknownKind, got {other:?}"),
+    }
+}
+
+#[test]
+fn subprotocol_fold_id_is_stable() {
+    // Lock the wire-subprotocol byte. Operators trace fold
+    // traffic by this value; bumping it is a wire-compat break
+    // that needs an explicit migration. Catch any drift here.
+    assert_eq!(super::dispatch::SUBPROTOCOL_FOLD, 0x1000);
+}
+
+#[test]
+fn entity_id_is_what_the_router_trait_takes() {
+    // The dispatch arm in `mesh.rs` looks up `EntityId` from
+    // `peer_entity_ids`. Confirm the router accepts that exact
+    // type so the dispatch arm can pass `&entity_id` without
+    // adapter code.
+    fn _accepts_entity_id<R: FoldChannelRouter>(
+        r: &R,
+        e: &EntityId,
+        b: &[u8],
+    ) -> Result<ApplyOutcome, DispatchError> {
+        r.try_route(e, b)
+    }
+    let registry = FoldRegistry::new();
+    let _registered: Arc<dyn FoldChannelRouter> = Arc::new(registry);
+}
