@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/behavior/fold/expiry.rs
+  s_d9dc521a887c3e::t_9c06a0c59b16bb 35-47,50,54-62,70-83,85-86,88-105,107-111,113-124,126-128
+net/crates/net/src/adapter/net/behavior/fold/tests.rs
+  s_d9dc521a887c3e::t_8d664068e421ef 1025-1049
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "84f611b0e988189eb15561a13c55eb3a3f6ada14",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
