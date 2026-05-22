@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 /// Deck FOLDS panel, the Prometheus exporter) reads when it
 /// wants a coherent picture of one fold.
 ///
-/// Sampled via [`FoldMetrics::snapshot`] for the fold-side
-/// view, or aggregated across the registry via
+/// Sampled via [`super::Fold::stats`] for the fold-side view, or
+/// aggregated across the registry via
 /// [`super::FoldRegistry::stats`] for the multi-fold view.
 ///
 /// All counters are `u64` — the atomics behind them are also
@@ -249,32 +249,4 @@ impl FoldMetrics {
         self.snapshots_restored.load(Ordering::Relaxed)
     }
 
-    /// Materialize a [`FoldStats`] snapshot of every counter
-    /// plus the supplied static identity (`kind` /
-    /// `channel_prefix`) and runtime flag (`has_audit_sink`).
-    /// Called by [`super::Fold::stats`] and by the
-    /// per-fold [`super::FoldDispatch::stats`] adapter — the
-    /// shape the operator surface consumes.
-    pub fn snapshot(
-        &self,
-        kind: u16,
-        channel_prefix: &'static str,
-        has_audit_sink: bool,
-    ) -> FoldStats {
-        FoldStats {
-            kind,
-            channel_prefix: channel_prefix.to_string(),
-            entries: self.entries(),
-            applies_inserted: self.applies_inserted(),
-            applies_replaced: self.applies_replaced(),
-            applies_rejected: self.applies_rejected(),
-            applies_total: self.applies_total(),
-            expiries: self.expiries(),
-            evictions: self.evictions(),
-            queries: self.queries(),
-            snapshots_taken: self.snapshots_taken(),
-            snapshots_restored: self.snapshots_restored(),
-            has_audit_sink,
-        }
-    }
 }

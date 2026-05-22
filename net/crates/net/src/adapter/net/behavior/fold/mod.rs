@@ -544,8 +544,21 @@ impl<K: FoldKind> Fold<K> {
     /// One atomic load per counter + one read lock on the
     /// audit-sink slot; cheap enough to call per-tick.
     pub fn stats(&self) -> metrics::FoldStats {
-        self.metrics
-            .snapshot(K::KIND_ID, K::CHANNEL_PREFIX, self.has_audit_sink())
+        metrics::FoldStats {
+            kind: K::KIND_ID,
+            channel_prefix: K::CHANNEL_PREFIX.to_string(),
+            entries: self.metrics.entries(),
+            applies_inserted: self.metrics.applies_inserted(),
+            applies_replaced: self.metrics.applies_replaced(),
+            applies_rejected: self.metrics.applies_rejected(),
+            applies_total: self.metrics.applies_total(),
+            expiries: self.metrics.expiries(),
+            evictions: self.metrics.evictions(),
+            queries: self.metrics.queries(),
+            snapshots_taken: self.metrics.snapshots_taken(),
+            snapshots_restored: self.metrics.snapshots_restored(),
+            has_audit_sink: self.has_audit_sink(),
+        }
     }
 
     /// Read-only access to the live state — held under the
