@@ -3394,15 +3394,19 @@ impl MeshNode {
         let aad = parsed.header.aad();
         let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
         let rx_cipher = session.rx_cipher();
-        if !rx_cipher.is_valid_rx_counter(counter) {
-            return;
-        }
         let payload = std::mem::take(&mut parsed.payload);
+        // Per crypto-session perf #132: the legacy two-step (pre-
+        // decrypt `is_valid_rx_counter` + post-decrypt
+        // `update_rx_counter`) took two parking_lot Mutex acquisitions
+        // per inbound packet. `try_admit_rx_counter` validates and
+        // commits under a single lock; replays land at admit and are
+        // rejected there (paying AEAD on the rare replay is cheaper
+        // than a redundant lock on every non-replay). AEAD failure
+        // still drops the packet before we touch the window, so a
+        // tampered counter never advances `rx_counter`.
         let decrypted = match rx_cipher.decrypt_to_bytes(counter, &aad, payload) {
             Ok(d) => {
-                // Commit-time replay check: closes the TOCTOU race where
-                // two threads decrypt the same replayed packet concurrently.
-                if !rx_cipher.update_rx_counter(counter) {
+                if !rx_cipher.try_admit_rx_counter(counter) {
                     return;
                 }
                 d

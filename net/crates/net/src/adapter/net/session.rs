@@ -741,9 +741,6 @@ impl NetSession {
         }
         let aad = parsed.header.aad();
         let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
-        if !self.rx_cipher.is_valid_rx_counter(counter) {
-            return false;
-        }
         // Per crypto-session perf #129, route through the
         // verify-only API: heartbeats encrypt an empty plaintext
         // to a 16-byte Poly1305 tag, and the legacy
@@ -758,7 +755,15 @@ impl NetSession {
         {
             return false;
         }
-        if !self.rx_cipher.update_rx_counter(counter) {
+        // Per crypto-session perf #132: single-lock admit replaces
+        // the legacy `is_valid_rx_counter` (pre-verify) +
+        // `update_rx_counter` (post-verify) two-step. Heartbeat
+        // replays now pay the AEAD verify before being rejected at
+        // admit, but the AEAD verify on a 16-byte heartbeat is the
+        // cheapest case of ChaCha20-Poly1305 and the saved Mutex
+        // op per non-replay heartbeat (which dominates the rate at
+        // healthy steady state) is the actual hot path.
+        if !self.rx_cipher.try_admit_rx_counter(counter) {
             return false;
         }
         self.touch();

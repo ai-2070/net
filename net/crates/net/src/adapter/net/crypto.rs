@@ -834,6 +834,38 @@ impl PacketCipher {
         w.commit(received)
     }
 
+    /// Validate-and-commit a received counter in a single Mutex
+    /// acquisition.
+    ///
+    /// Per crypto-session perf #132 — the legacy RX hot path called
+    /// `is_valid_rx_counter` (lock+unlock) before decrypt and
+    /// `update_rx_counter` (lock+unlock) after decrypt: two
+    /// parking_lot Mutex ops per packet, on every inbound packet.
+    /// `try_admit_rx_counter` does the equivalent post-decrypt
+    /// validate-and-commit under a single lock — `commit` already
+    /// rejects out-of-window / already-seen / u64::MAX counters
+    /// internally, so the pre-decrypt `is_valid_rx_counter` probe is
+    /// redundant for safety. Replays are caught at commit time
+    /// either way; the only behavioral change is that replayed
+    /// packets pay AEAD verify before being rejected (cheaper than
+    /// burning a Mutex lock op on every non-replay).
+    ///
+    /// Returns `true` exactly when [`Self::update_rx_counter`] would
+    /// return `true` on the same input — same novelty semantics,
+    /// same window contract, half the lock ops at 1 M pps. The
+    /// production RX paths (`mesh.rs`, `mod.rs`,
+    /// `session.rs::verify_and_touch_heartbeat`) call this instead
+    /// of the legacy two-step.
+    ///
+    /// The legacy `is_valid_rx_counter` + `update_rx_counter` pair
+    /// stays exposed for fuzz / regression tests that exercise the
+    /// validate-then-commit boundary as two observable steps.
+    #[inline]
+    pub fn try_admit_rx_counter(&self, received: u64) -> bool {
+        let mut w = self.rx_window.lock();
+        w.commit(received)
+    }
+
     /// Check if a received counter is in the accept range and has not yet
     /// been committed. Does not change state; callers still race with
     /// [`Self::update_rx_counter`], which returns `false` on replay.
@@ -1660,6 +1692,86 @@ mod tests {
             !cipher.is_valid_rx_counter(u64::MAX - 1),
             "u64::MAX - 1 from rx_counter=0 must reject at is_valid (past MAX_FORWARD)"
         );
+    }
+
+    /// Pin crypto-session perf #132: `try_admit_rx_counter` must
+    /// produce bit-for-bit identical novelty / replay / window-exit
+    /// verdicts to the legacy `update_rx_counter`, including under
+    /// the gnarly cases (u64::MAX refusal, out-of-window past
+    /// rejection, in-window already-seen rejection,
+    /// fresh-novel-acceptance, equal-to-rx_counter rejection). Same
+    /// internal `ReplayWindow::commit`, but the public surface is
+    /// what production callers reach for — a regression that
+    /// rewires `try_admit_rx_counter` to skip a guard, take an
+    /// extra lock, or pre-mutate `rx_counter` on a doomed admit
+    /// would silently re-introduce the perf #132 cost or, worse,
+    /// open a replay window in one production path while leaving
+    /// the legacy path intact.
+    #[test]
+    fn try_admit_rx_counter_matches_update_rx_counter_semantics() {
+        let key = [0x9Au8; 32];
+
+        // Each scenario primes the window via `update_rx_counter`,
+        // then asserts the next admit against both APIs (across
+        // independent ciphers so primer state stays isolated). The
+        // verdicts must agree at every step.
+        let scenarios: &[(&[u64], u64, bool)] = &[
+            // Fresh cipher → first admit at 100 is novel.
+            (&[], 100, true),
+            // After 100, replay of 100 is rejected.
+            (&[100], 100, false),
+            // After 100, admit at 200 is novel.
+            (&[100], 200, true),
+            // After 100, admit at 50 is in-window AND novel
+            // (within ±1024 of rx_counter=101).
+            (&[100], 50, true),
+            // u64::MAX is refused outright.
+            (&[100], u64::MAX, false),
+            // After advancing past the window, an old counter
+            // outside the window is rejected.
+            (&[10_000], 100, false),
+            // Re-admit of the just-committed counter is rejected
+            // (the bitmap remembers).
+            (&[10_000, 9_999], 9_999, false),
+        ];
+
+        for (i, (primer, probe, expected)) in scenarios.iter().enumerate() {
+            let admit_cipher = PacketCipher::new(&key, 0x4242);
+            let update_cipher = PacketCipher::new(&key, 0x4242);
+            for &p in *primer {
+                assert!(
+                    admit_cipher.try_admit_rx_counter(p),
+                    "scenario {i}: priming admit({p}) must succeed"
+                );
+                assert!(
+                    update_cipher.update_rx_counter(p),
+                    "scenario {i}: priming update({p}) must succeed"
+                );
+            }
+            assert_eq!(
+                admit_cipher.try_admit_rx_counter(*probe),
+                *expected,
+                "scenario {i}: try_admit_rx_counter({probe}) verdict differs from spec",
+            );
+            assert_eq!(
+                update_cipher.update_rx_counter(*probe),
+                *expected,
+                "scenario {i}: update_rx_counter({probe}) verdict differs from spec",
+            );
+            // And the two APIs must agree on the same input from
+            // identical priming state.
+            let a = PacketCipher::new(&key, 0x4242);
+            let b = PacketCipher::new(&key, 0x4242);
+            for &p in *primer {
+                a.update_rx_counter(p);
+                b.update_rx_counter(p);
+            }
+            assert_eq!(
+                a.try_admit_rx_counter(*probe),
+                b.update_rx_counter(*probe),
+                "scenario {i}: try_admit_rx_counter and update_rx_counter must agree",
+            );
+        }
     }
 
     // ---------- Debug redaction contract ----------

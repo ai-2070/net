@@ -7,6 +7,7 @@
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::protocol::{NackPayload, PacketFlags};
@@ -36,12 +37,25 @@ pub struct RetransmitDescriptor {
     pub flags: PacketFlags,
 }
 
-/// Trait for reliability mode implementations
+/// Trait for reliability mode implementations.
+///
+/// Per crypto-session perf #133, the descriptor is exchanged as
+/// `Arc<RetransmitDescriptor>` across the trait boundary. The
+/// `RetransmitDescriptor` itself carries an inner
+/// `Vec<Bytes>` of pre-encryption event payloads — at `max_pending =
+/// 32` and ~10 events per packet that's ~320 `Bytes` refcounts
+/// dangling off the retransmit window at any given time. Pre-fix
+/// `on_send` moved the descriptor in by value (one Vec spine + one
+/// refcount bump per inner `Bytes`), and `on_nack` /
+/// `get_timed_out` deep-cloned the descriptor per retransmit (one
+/// Vec alloc + N `Bytes` refcount bumps per emission). Wrapping in
+/// `Arc` makes both paths one atomic refcount bump regardless of
+/// the inner Vec's length.
 pub trait ReliabilityMode: Send + Sync {
     /// Called when a packet is sent. The descriptor carries pre-
     /// encryption inputs so the retransmit path can rebuild a
     /// fresh-counter packet rather than replaying stale ciphertext.
-    fn on_send(&mut self, descriptor: RetransmitDescriptor);
+    fn on_send(&mut self, descriptor: Arc<RetransmitDescriptor>);
 
     /// Called when a packet is received. Returns true if accepted.
     fn on_receive(&mut self, seq: u64) -> bool;
@@ -53,11 +67,15 @@ pub trait ReliabilityMode: Send + Sync {
     fn build_nack(&self) -> Option<NackPayload>;
 
     /// Process a received NACK and return descriptors for the
-    /// caller to rebuild + dispatch.
-    fn on_nack(&mut self, nack: &NackPayload) -> Vec<RetransmitDescriptor>;
+    /// caller to rebuild + dispatch. The returned `Arc` clones
+    /// share the inner `RetransmitDescriptor` allocation; the
+    /// caller bumps the refcount instead of deep-cloning the
+    /// `Vec<Bytes>` of events.
+    fn on_nack(&mut self, nack: &NackPayload) -> Vec<Arc<RetransmitDescriptor>>;
 
-    /// Get descriptors that need retransmission due to timeout.
-    fn get_timed_out(&mut self) -> Vec<RetransmitDescriptor>;
+    /// Get descriptors that need retransmission due to timeout. See
+    /// [`Self::on_nack`] for the `Arc`-sharing contract.
+    fn get_timed_out(&mut self) -> Vec<Arc<RetransmitDescriptor>>;
 
     /// Check if there are unacknowledged packets
     fn has_pending(&self) -> bool;
@@ -89,7 +107,7 @@ impl FireAndForget {
 
 impl ReliabilityMode for FireAndForget {
     #[inline]
-    fn on_send(&mut self, _descriptor: RetransmitDescriptor) {
+    fn on_send(&mut self, _descriptor: Arc<RetransmitDescriptor>) {
         // Nothing to track
     }
 
@@ -111,12 +129,12 @@ impl ReliabilityMode for FireAndForget {
     }
 
     #[inline]
-    fn on_nack(&mut self, _nack: &NackPayload) -> Vec<RetransmitDescriptor> {
+    fn on_nack(&mut self, _nack: &NackPayload) -> Vec<Arc<RetransmitDescriptor>> {
         Vec::new()
     }
 
     #[inline]
-    fn get_timed_out(&mut self) -> Vec<RetransmitDescriptor> {
+    fn get_timed_out(&mut self) -> Vec<Arc<RetransmitDescriptor>> {
         Vec::new()
     }
 
@@ -137,7 +155,12 @@ struct UnackedPacket {
     /// Pre-encryption rebuild inputs. Stashing the descriptor (not
     /// the encrypted bytes) is what lets the retransmit path
     /// produce a fresh-counter packet on each NACK / timeout.
-    descriptor: RetransmitDescriptor,
+    ///
+    /// Per crypto-session perf #133, the descriptor is held behind
+    /// an `Arc` so that the retransmit emissions (`on_nack` /
+    /// `get_timed_out`) clone the refcount instead of deep-cloning
+    /// the inner `Vec<Bytes>` events list.
+    descriptor: Arc<RetransmitDescriptor>,
     /// Time when packet was sent
     sent_at: Instant,
     /// Number of retransmission attempts
@@ -330,7 +353,7 @@ impl Default for ReliableStream {
 }
 
 impl ReliabilityMode for ReliableStream {
-    fn on_send(&mut self, descriptor: RetransmitDescriptor) {
+    fn on_send(&mut self, descriptor: Arc<RetransmitDescriptor>) {
         // Evict oldest unacked packet if window is full so that the
         // newest packet is always tracked for retransmission.  Without
         // this, packets sent when the window is full are silently lost
@@ -437,18 +460,20 @@ impl ReliabilityMode for ReliableStream {
         }
     }
 
-    fn on_nack(&mut self, nack: &NackPayload) -> Vec<RetransmitDescriptor> {
+    fn on_nack(&mut self, nack: &NackPayload) -> Vec<Arc<RetransmitDescriptor>> {
         let mut retransmits = Vec::new();
 
         // Find packets to retransmit based on NACK. Return the
         // pre-encryption descriptors so the caller can rebuild
         // each packet with a fresh cipher counter — replaying the
         // stashed encrypted bytes would trip the receiver's replay
-        // window.
+        // window. Per perf #133 the descriptor is `Arc`-shared, so
+        // each emission is one atomic refcount bump rather than a
+        // deep `Vec<Bytes>` clone.
         for missing_seq in nack.missing_sequences() {
             for unacked in &mut self.pending {
                 if unacked.seq() == missing_seq && unacked.retries < self.max_retries {
-                    retransmits.push(unacked.descriptor.clone());
+                    retransmits.push(Arc::clone(&unacked.descriptor));
                     unacked.retries += 1;
                     unacked.sent_at = Instant::now();
                     break;
@@ -459,14 +484,17 @@ impl ReliabilityMode for ReliableStream {
         retransmits
     }
 
-    fn get_timed_out(&mut self) -> Vec<RetransmitDescriptor> {
+    fn get_timed_out(&mut self) -> Vec<Arc<RetransmitDescriptor>> {
         let now = Instant::now();
         let mut retransmits = Vec::new();
 
+        // Per perf #133 — `Arc::clone` bumps a refcount instead of
+        // deep-cloning the `Vec<Bytes>` events list per timed-out
+        // packet.
         for unacked in &mut self.pending {
             if now.duration_since(unacked.sent_at) > self.rto && unacked.retries < self.max_retries
             {
-                retransmits.push(unacked.descriptor.clone());
+                retransmits.push(Arc::clone(&unacked.descriptor));
                 unacked.retries += 1;
                 unacked.sent_at = now;
             }
@@ -513,14 +541,16 @@ mod tests {
     /// Test helper: build a `RetransmitDescriptor` from the legacy
     /// `(seq, packet_bytes)` shape these tests were written against.
     /// Wraps the bytes as a single-event payload so the in-memory
-    /// shape has something to round-trip through.
-    fn descriptor(seq: u64, packet: Bytes) -> RetransmitDescriptor {
-        RetransmitDescriptor {
+    /// shape has something to round-trip through. Returns an
+    /// `Arc<...>` per perf #133 — `on_send` consumes the shared
+    /// allocation.
+    fn descriptor(seq: u64, packet: Bytes) -> Arc<RetransmitDescriptor> {
+        Arc::new(RetransmitDescriptor {
             seq,
             stream_id: 0,
             events: vec![packet],
             flags: PacketFlags::RELIABLE,
-        }
+        })
     }
 
     #[test]
@@ -1146,24 +1176,24 @@ mod tests {
         let events_a = vec![Bytes::from_static(b"event-A-payload")];
         let events_b = vec![Bytes::from_static(b"event-B-payload")];
         let events_c = vec![Bytes::from_static(b"event-C-payload")];
-        mode.on_send(RetransmitDescriptor {
+        mode.on_send(Arc::new(RetransmitDescriptor {
             seq: 0,
             stream_id: 7,
             events: events_a.clone(),
             flags: PacketFlags::RELIABLE,
-        });
-        mode.on_send(RetransmitDescriptor {
+        }));
+        mode.on_send(Arc::new(RetransmitDescriptor {
             seq: 1,
             stream_id: 7,
             events: events_b.clone(),
             flags: PacketFlags::RELIABLE,
-        });
-        mode.on_send(RetransmitDescriptor {
+        }));
+        mode.on_send(Arc::new(RetransmitDescriptor {
             seq: 2,
             stream_id: 7,
             events: events_c.clone(),
             flags: PacketFlags::RELIABLE,
-        });
+        }));
 
         // NACK seq=1.
         let nack = NackPayload {
@@ -1198,5 +1228,54 @@ mod tests {
         assert_eq!(r2.events, r.events);
         assert_eq!(r2.flags, r.flags);
         assert_eq!(r2.stream_id, r.stream_id);
+    }
+
+    /// Pin crypto-session perf #133: `on_nack` and `get_timed_out`
+    /// must emit `Arc::clone`s of the descriptor already held in
+    /// the retransmit window, not deep copies. Compare backing
+    /// pointers via `Arc::as_ptr` — a regression that swaps back to
+    /// `descriptor.clone()` on the inner `RetransmitDescriptor`
+    /// would silently re-introduce the per-retransmit
+    /// `Vec<Bytes>` allocation + N `Bytes` refcount bumps.
+    #[test]
+    fn retransmits_share_descriptor_via_arc_refcount_not_deep_clone() {
+        let mut mode = ReliableStream::with_settings(Duration::from_millis(20), 32, 5);
+
+        let original = Arc::new(RetransmitDescriptor {
+            seq: 0,
+            stream_id: 7,
+            events: vec![Bytes::from_static(b"event-A")],
+            flags: PacketFlags::RELIABLE,
+        });
+        let original_ptr = Arc::as_ptr(&original);
+        mode.on_send(Arc::clone(&original));
+
+        // NACK path: emitted Arc points at the same allocation as
+        // the original we pushed (refcount bump, not a clone).
+        let nack = NackPayload {
+            next_expected: 0,
+            missing_bitmap: 1,
+        };
+        let from_nack = mode.on_nack(&nack);
+        assert_eq!(from_nack.len(), 1, "nack should produce one retransmit");
+        assert_eq!(
+            Arc::as_ptr(&from_nack[0]),
+            original_ptr,
+            "on_nack must clone the Arc, not deep-clone the descriptor"
+        );
+
+        // Timeout path: re-arm the timer, sleep, drain. Same
+        // pointer-identity assertion as the NACK path.
+        std::thread::sleep(Duration::from_millis(35));
+        let from_timeout = mode.get_timed_out();
+        assert!(
+            !from_timeout.is_empty(),
+            "expected at least one timed-out retransmit"
+        );
+        assert_eq!(
+            Arc::as_ptr(&from_timeout[0]),
+            original_ptr,
+            "get_timed_out must clone the Arc, not deep-clone the descriptor"
+        );
     }
 }
