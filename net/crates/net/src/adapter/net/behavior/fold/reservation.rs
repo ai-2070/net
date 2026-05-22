@@ -68,9 +68,11 @@
 //! caller can deliberately set the fold TTL larger than the
 //! reservation deadline so the Free state lingers for queries.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use crate::adapter::net::current_timestamp_micros;
 
 use super::state::{FoldEntry, FoldState, MergeAction, NoIndex, NodeId};
 use super::{FoldKind, SignedAnnouncement};
@@ -339,11 +341,7 @@ fn legal_same_publisher(
 /// Returns `true` if a foreign publisher is now allowed to take
 /// over the reservation.
 fn reservation_expired(until_unix_us: u64) -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0);
-    now >= until_unix_us
+    current_timestamp_micros() >= until_unix_us
 }
 
 #[cfg(test)]
@@ -394,21 +392,13 @@ mod tests {
     }
 
     fn fresh_deadline_us() -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
-        now + 60_000_000 // 60 seconds from now
+        current_timestamp_micros() + 60_000_000
     }
 
     fn expired_deadline_us() -> u64 {
-        // 60 seconds ago. SystemTime::now() may be near 0 in
-        // some sandboxed test environments, so saturate at 0.
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0)
-            .saturating_sub(60_000_000)
+        // SystemTime::now() may be near 0 in some sandboxed test
+        // environments, so saturate at 0.
+        current_timestamp_micros().saturating_sub(60_000_000)
     }
 
     // ----------------------------------------------------------

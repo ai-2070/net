@@ -106,21 +106,6 @@ type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 /// For nodes where we only have the derived u64 node_id, we zero-pad
 /// it to 32 bytes. This preserves uniqueness for topology tracking
 /// without requiring the full public key exchange.
-/// Current wall-clock in Unix microseconds, saturating at 0 on
-/// pre-epoch clocks (mirrors
-/// `adapter::net::current_timestamp`'s saturation policy). The
-/// per-fold publisher helpers ([`MeshNode::publish_capability_membership`]
-/// etc.) stamp this on the wire envelope's `announced_at`
-/// field — receivers use it for diagnostics, not for ordering
-/// (the `generation` field is the load-bearing anti-reorder
-/// signal).
-fn fold_publish_now_us() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
-}
-
 fn node_id_to_graph_id(node_id: u64) -> [u8; 32] {
     let mut id = [0u8; 32];
     id[0..8].copy_from_slice(&node_id.to_le_bytes());
@@ -7108,74 +7093,63 @@ impl MeshNode {
             + 1
     }
 
-    /// Publish a [`super::behavior::fold::CapabilityFold`]
-    /// membership announcement against this node's identity.
-    /// Stamps generation from the per-(class) monotonic
-    /// counter; signs with [`Self::identity`]; broadcasts via
-    /// [`Self::publish_fold_broadcast`].
+    /// Sign + broadcast one fold announcement.
     ///
-    /// The `class_hash` on the payload is what the fold uses
-    /// to bucket entries by class — callers pass the same hash
-    /// they'd use as the `CapabilityClass` identifier in the
-    /// scheduler / market matcher.
-    ///
-    /// Returns the count of peers the announcement was
-    /// successfully shipped to.
-    pub async fn publish_capability_membership(
+    /// `counter_class` shards the per-`(kind, class)` generation
+    /// counter; `envelope_class` is the wire envelope's `class`
+    /// field. The two are identical for most folds; reservation
+    /// passes `counter_class=resource_id` (per-resource counter)
+    /// but `envelope_class=0` (pool identifier unused).
+    async fn publish_fold<K>(
         &self,
-        membership: super::behavior::fold::CapabilityMembership,
-    ) -> Result<usize, AdapterError> {
-        let class = membership.class_hash;
-        let gen = self.next_fold_generation(
-            <super::behavior::fold::CapabilityFold as super::behavior::fold::FoldKind>::KIND_ID,
-            class,
-        );
+        counter_class: u64,
+        envelope_class: u64,
+        payload: K::Payload,
+    ) -> Result<usize, AdapterError>
+    where
+        K: super::behavior::fold::FoldKind,
+    {
+        let gen = self.next_fold_generation(K::KIND_ID, counter_class);
         let ann = super::behavior::fold::SignedAnnouncement::sign(
             &self.identity,
-            <super::behavior::fold::CapabilityFold as super::behavior::fold::FoldKind>::KIND_ID,
-            class,
+            K::KIND_ID,
+            envelope_class,
             self.node_id,
             gen,
-            fold_publish_now_us(),
+            super::current_timestamp_micros(),
             None,
             0,
-            membership,
+            payload,
         )
         .map_err(|e| AdapterError::Connection(format!("fold: sign failed: {e}")))?;
         self.publish_fold_broadcast(&ann).await
     }
 
+    /// Publish a [`super::behavior::fold::CapabilityFold`]
+    /// membership announcement against this node's identity.
+    /// The counter is sharded per-`class_hash` so concurrent
+    /// publishes to different classes don't contend.
+    pub async fn publish_capability_membership(
+        &self,
+        membership: super::behavior::fold::CapabilityMembership,
+    ) -> Result<usize, AdapterError> {
+        let class = membership.class_hash;
+        self.publish_fold::<super::behavior::fold::CapabilityFold>(class, class, membership)
+            .await
+    }
+
     /// Publish a [`super::behavior::fold::RoutingFold`] route
-    /// announcement. `class` is `0` for the route fold (it
-    /// doesn't shard by class — every destination shares one
-    /// envelope class), so the generation counter is per-fold
-    /// rather than per-(fold,class).
-    ///
-    /// `via` is auto-stamped to this node's `node_id` (the
-    /// publishing node observed the route). Callers that want
-    /// to attribute the route to a different relay populate
-    /// the `RouteAnnouncement` struct directly and use
-    /// [`Self::publish_fold_broadcast`].
-    ///
-    /// Returns the count of peers shipped to.
+    /// announcement. The fold doesn't shard by class, so both
+    /// the counter and the envelope use class `0`. `via` is
+    /// auto-stamped to this node's `node_id`.
     pub async fn publish_route(
         &self,
         destination: super::behavior::fold::NodeId,
         next_hop: SocketAddr,
         metric: u32,
     ) -> Result<usize, AdapterError> {
-        let gen = self.next_fold_generation(
-            <super::behavior::fold::RoutingFold as super::behavior::fold::FoldKind>::KIND_ID,
+        self.publish_fold::<super::behavior::fold::RoutingFold>(
             0,
-        );
-        let ann = super::behavior::fold::SignedAnnouncement::sign(
-            &self.identity,
-            <super::behavior::fold::RoutingFold as super::behavior::fold::FoldKind>::KIND_ID,
-            0,
-            self.node_id,
-            gen,
-            fold_publish_now_us(),
-            None,
             0,
             super::behavior::fold::RouteAnnouncement {
                 destination,
@@ -7184,48 +7158,29 @@ impl MeshNode {
                 via: self.node_id,
             },
         )
-        .map_err(|e| AdapterError::Connection(format!("fold: sign failed: {e}")))?;
-        self.publish_fold_broadcast(&ann).await
+        .await
     }
 
-    /// Publish a
-    /// [`super::behavior::fold::ReservationFold`] state
-    /// transition for `resource_id`. The state-machine
-    /// validation runs on the receive side via
-    /// [`super::behavior::fold::ReservationFold::merge`] —
-    /// publishers stamp whichever state they're claiming, and
-    /// receivers either accept (legal transition) or reject
-    /// (illegal).
-    ///
-    /// Generation is per-resource so concurrent transitions
-    /// against different resources don't contend.
-    ///
-    /// Returns the count of peers shipped to.
+    /// Publish a [`super::behavior::fold::ReservationFold`]
+    /// state transition for `resource_id`. Generation is
+    /// per-resource (counter sharded by `resource_id`) so
+    /// concurrent transitions against different resources don't
+    /// contend; the envelope's `class` field is unused for this
+    /// fold and stays `0`.
     pub async fn publish_reservation(
         &self,
         resource_id: super::behavior::fold::ResourceId,
         state: super::behavior::fold::ReservationState,
     ) -> Result<usize, AdapterError> {
-        let gen = self.next_fold_generation(
-            <super::behavior::fold::ReservationFold as super::behavior::fold::FoldKind>::KIND_ID,
+        self.publish_fold::<super::behavior::fold::ReservationFold>(
             resource_id,
-        );
-        let ann = super::behavior::fold::SignedAnnouncement::sign(
-            &self.identity,
-            <super::behavior::fold::ReservationFold as super::behavior::fold::FoldKind>::KIND_ID,
-            0,
-            self.node_id,
-            gen,
-            fold_publish_now_us(),
-            None,
             0,
             super::behavior::fold::ReservationAnnouncement {
                 resource_id,
                 state,
             },
         )
-        .map_err(|e| AdapterError::Connection(format!("fold: sign failed: {e}")))?;
-        self.publish_fold_broadcast(&ann).await
+        .await
     }
 
     /// Send a raw subprotocol message to a peer.

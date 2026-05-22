@@ -20,9 +20,11 @@
 //! `Instant::now()` so freshness semantics survive the dump /
 //! restore boundary.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+use crate::adapter::net::current_timestamp_micros as unix_micros_now;
 
 use super::state::{FoldEntry, FoldState, NodeId};
 use super::FoldKind;
@@ -137,14 +139,4 @@ impl<K: FoldKind> FoldSnapshot<K> {
             expires_at,
         }
     }
-}
-
-/// Current wall-clock as Unix microseconds. Saturates on the
-/// `SystemTime` epoch underflow case the same way the rest of
-/// the codebase does (see `adapter::net::mod::current_timestamp`).
-fn unix_micros_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
 }
