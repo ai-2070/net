@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/transport.rs
+  s_e7d956be1ad129::t_8e1d937f7f6c8a 604-668,670-728
+  s_e7d956be1ad129::t_202283c91604ce 150-158,160-162,166-169,171-173,177-180,182-185
+net/crates/net/docs/performance/net-crypto-session-reliability-analysis.md
+  s_e7d956be1ad129::t_dd3b4163c39968 14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "3e6ab66e54782c94b77e62d3510c4bd28d19c817",
+  "prompts": {},
+  "sessions": {
+    "s_e7d956be1ad129": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2bc6b943-358e-4f95-a34b-9b8bfe533397",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
