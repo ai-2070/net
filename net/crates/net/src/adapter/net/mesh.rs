@@ -7082,10 +7082,12 @@ impl MeshNode {
     }
 
     /// Best-effort fan-out of a fold announcement to every
-    /// currently-connected peer. Mirrors the
-    /// [`Self::announce_capabilities_with`] broadcast loop —
-    /// per-peer send failures are logged and skipped rather
-    /// than short-circuiting the rest of the fan-out.
+    /// currently-connected peer. Per-peer send failures are
+    /// logged and skipped rather than short-circuiting the rest
+    /// of the fan-out. The N peer sends run concurrently via
+    /// `futures::future::join_all` so a chatty publisher (e.g.
+    /// ReservationFold against a busy resource) doesn't block
+    /// its own task on serial encryption + UDP-send latency.
     ///
     /// Returns the number of peers the announcement was
     /// successfully shipped to.
@@ -7101,12 +7103,21 @@ impl MeshNode {
         })?;
         let peer_addrs: Vec<SocketAddr> =
             self.peers.iter().map(|e| e.value().addr).collect();
+        // Share the encoded bytes by reference; each send
+        // borrows the same slice. send_subprotocol clones into
+        // its own internal allocation, so concurrent sends don't
+        // contend on the buffer.
+        let bytes_ref = &bytes;
+        let sends = peer_addrs.into_iter().map(|addr| async move {
+            let result = self
+                .send_subprotocol(addr, super::behavior::fold::SUBPROTOCOL_FOLD, bytes_ref)
+                .await;
+            (addr, result)
+        });
+        let results = futures::future::join_all(sends).await;
         let mut sent = 0usize;
-        for addr in peer_addrs {
-            match self
-                .send_subprotocol(addr, super::behavior::fold::SUBPROTOCOL_FOLD, &bytes)
-                .await
-            {
+        for (addr, result) in results {
+            match result {
                 Ok(()) => sent += 1,
                 Err(e) => {
                     tracing::trace!(peer = %addr, error = %e, "fold: broadcast send failed");
