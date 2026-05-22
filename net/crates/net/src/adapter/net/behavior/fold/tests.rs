@@ -1422,11 +1422,11 @@ fn fold_channel_router_trait_object_exposes_stats() {
 }
 
 #[test]
-fn fold_channel_router_default_stats_impl_returns_empty() {
-    // A custom router that doesn't override `stats` falls
-    // through to the default (empty Vec). Pins the contract
-    // that `MeshNode::fold_stats` callers can rely on for
-    // test-stub routers.
+fn fold_channel_router_stub_returns_its_own_empty_stats() {
+    // Routers that don't track per-fold stats must return an
+    // empty Vec explicitly — the trait has no default impl, so
+    // "no stats" is a deliberate choice the implementer makes
+    // rather than something callers can silently inherit.
     struct StubRouter;
     impl FoldChannelRouter for StubRouter {
         fn try_route(
@@ -1436,7 +1436,9 @@ fn fold_channel_router_default_stats_impl_returns_empty() {
         ) -> Result<ApplyOutcome, DispatchError> {
             Ok(ApplyOutcome::Inserted)
         }
-        // stats() left at the default impl
+        fn stats(&self) -> Vec<FoldStats> {
+            Vec::new()
+        }
     }
     let stub: Arc<dyn FoldChannelRouter> = Arc::new(StubRouter);
     assert!(stub.stats().is_empty());
