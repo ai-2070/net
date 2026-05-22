@@ -172,13 +172,25 @@ pub fn synthesize_capability_set(
     fold: &Fold<CapabilityFold>,
     node_id: NodeId,
 ) -> super::super::capability::CapabilitySet {
-    let tags = super::capability::capability_tags_for(fold, node_id);
     let mut caps = super::super::capability::CapabilitySet::new();
-    for s in tags {
-        if let Ok(tag) = super::super::tag::Tag::parse(&s) {
-            caps.tags.insert(tag);
+    fold.with_state(|state| {
+        let Some(keys) = state.by_node.get(&node_id) else {
+            return;
+        };
+        for k in keys {
+            let Some(entry) = state.entries.get(k) else {
+                continue;
+            };
+            for s in &entry.payload.tags {
+                if let Ok(tag) = super::super::tag::Tag::parse(s) {
+                    caps.tags.insert(tag);
+                }
+            }
+            for (mk, mv) in &entry.payload.metadata {
+                caps.metadata.insert(mk.clone(), mv.clone());
+            }
         }
-    }
+    });
     caps
 }
 
@@ -340,6 +352,7 @@ pub fn translate_announcement(
             allowed_nodes: ann.allowed_nodes.clone(),
             allowed_subnets: ann.allowed_subnets.clone(),
             allowed_groups: ann.allowed_groups.clone(),
+            metadata: ann.capabilities.metadata.clone(),
         },
     )
 }
@@ -505,6 +518,7 @@ mod tests {
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
+                metadata: std::collections::BTreeMap::new(),
             },
         )
         .expect("sign")
@@ -548,6 +562,7 @@ mod tests {
             allowed_nodes: Vec::new(),
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
         };
         assert!(membership_passes_post_filter(&ok, &legacy));
 

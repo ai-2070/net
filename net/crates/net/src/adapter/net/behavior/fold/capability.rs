@@ -24,7 +24,7 @@
 //! dispatch time gates the publisher claim; the key shape gates
 //! which entries that publisher may write.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -120,6 +120,13 @@ pub struct CapabilityMembership {
     /// to invoke this publisher's tags. Same union semantics as
     /// `allowed_nodes`.
     pub allowed_groups: Vec<super::super::group::GroupId>,
+    /// Free-form per-publisher metadata. Carries the same opaque
+    /// key/value pairs the legacy
+    /// [`CapabilitySet::metadata`](super::super::capability::CapabilitySet)
+    /// exposes; predicates that test `metadata_exists`/
+    /// `metadata_equals` consult this map after `synthesize_capability_set`
+    /// hydrates the synthesized set from the fold.
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// Query shapes the [`CapabilityFold`] answers.
@@ -540,6 +547,7 @@ mod tests {
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
+                metadata: BTreeMap::new(),
             },
         )
         .expect("sign succeeds")
@@ -1047,6 +1055,7 @@ mod tests {
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
+                metadata: BTreeMap::new(),
             },
         )
         .unwrap();

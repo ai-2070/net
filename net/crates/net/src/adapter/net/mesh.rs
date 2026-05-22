@@ -10695,6 +10695,7 @@ mod fold_publisher_helpers_tests {
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
+                metadata: std::collections::BTreeMap::new(),
             })
             .await;
         assert!(result.is_ok());
