@@ -1028,7 +1028,7 @@ impl std::fmt::Debug for StandbyGroup {
 mod tests {
     use super::*;
     use crate::adapter::net::behavior::capability::{
-        CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilitySet,
+        CapabilityAnnouncement, CapabilityFilter, CapabilitySet,
     };
     use crate::adapter::net::compute::DaemonError;
     use crate::adapter::net::state::causal::CausalLink;
@@ -1085,16 +1085,14 @@ mod tests {
         use crate::adapter::net::behavior::fold::{
             capability_bridge, CapabilityFold, Fold,
         };
-        let index = Arc::new(CapabilityIndex::new());
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         // Use a local_node_id NOT in the index so placement spreads
         // across indexed nodes instead of always picking local.
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
         for node_id in [0x1111u64, 0x2222, 0x3333] {
-            capability_bridge::dual_apply(
+            capability_bridge::apply_legacy_announcement(
                 &fold,
-                &index,
                 CapabilityAnnouncement::new(node_id, eid.clone(), 1, CapabilitySet::new()),
             );
         }
@@ -1823,25 +1821,22 @@ mod tests {
 
     use crate::adapter::net::behavior::placement::{NodeId as PlacementNodeId, ResourceAxis};
 
-    fn make_scheduler_and_index(node_ids: &[u64]) -> (Scheduler, Arc<CapabilityIndex>) {
+    fn make_scheduler_and_index(node_ids: &[u64]) -> Scheduler {
         use crate::adapter::net::behavior::fold::{
             capability_bridge, CapabilityFold, Fold,
         };
-        let index = Arc::new(CapabilityIndex::new());
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
         for &id in node_ids {
-            capability_bridge::dual_apply(
+            capability_bridge::apply_legacy_announcement(
                 &fold,
-                &index,
                 CapabilityAnnouncement::new(id, eid.clone(), 1, CapabilitySet::new()),
             );
         }
         // Use a local_node_id NOT in the index so placement spreads
         // across indexed nodes instead of always picking local.
-        let scheduler = Scheduler::new(fold, 0xFFFF, CapabilitySet::new());
-        (scheduler, index)
+        Scheduler::new(fold, 0xFFFF, CapabilitySet::new())
     }
 
     /// Permissive placement filter — every candidate scores 1.0.
@@ -1857,7 +1852,7 @@ mod tests {
     #[test]
     fn spawn_with_placement_spreads_across_nodes() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
         let tb = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,
@@ -1889,7 +1884,7 @@ mod tests {
     #[test]
     fn spawn_with_placement_returns_placement_failed_when_all_vetoed() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222]);
         let tb = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,
@@ -1924,7 +1919,7 @@ mod tests {
     #[test]
     fn promote_with_placement_prefers_synced_standby_over_higher_score() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
         let tb = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,
@@ -1998,7 +1993,7 @@ mod tests {
     #[test]
     fn promote_with_placement_breaks_ties_by_score_among_equivalently_synced() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
         let tb = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,
@@ -2061,7 +2056,7 @@ mod tests {
     #[test]
     fn promote_with_placement_does_not_half_mutate_on_no_healthy_member() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
         let tb = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,
@@ -2118,7 +2113,7 @@ mod tests {
     #[test]
     fn on_node_failure_with_placement_promotes_active_and_replaces_standby() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
         let tb = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,

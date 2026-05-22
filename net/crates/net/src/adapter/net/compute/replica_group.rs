@@ -710,7 +710,7 @@ impl std::fmt::Debug for ReplicaGroup {
 mod tests {
     use super::*;
     use crate::adapter::net::behavior::capability::{
-        CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilitySet,
+        CapabilityAnnouncement, CapabilityFilter, CapabilitySet,
     };
     use crate::adapter::net::compute::DaemonError;
     use crate::adapter::net::state::causal::CausalEvent;
@@ -735,14 +735,12 @@ mod tests {
         use crate::adapter::net::behavior::fold::{
             capability_bridge, CapabilityFold, Fold,
         };
-        let index = Arc::new(CapabilityIndex::new());
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
         for node_id in [0x1111u64, 0x2222, 0x3333, 0x4444] {
-            capability_bridge::dual_apply(
+            capability_bridge::apply_legacy_announcement(
                 &fold,
-                &index,
                 CapabilityAnnouncement::new(node_id, eid.clone(), 1, CapabilitySet::new()),
             );
         }
@@ -976,13 +974,11 @@ mod tests {
             use crate::adapter::net::behavior::fold::{
                 capability_bridge, CapabilityFold, Fold,
             };
-            let index = Arc::new(CapabilityIndex::new());
             let fold: Arc<Fold<CapabilityFold>> =
                 Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
-            capability_bridge::dual_apply(
+            capability_bridge::apply_legacy_announcement(
                 &fold,
-                &index,
                 CapabilityAnnouncement::new(0x9999, eid, 1, CapabilitySet::new()),
             );
             Scheduler::new(fold, 0x9999, CapabilitySet::new())
@@ -1041,24 +1037,21 @@ mod tests {
 
     use crate::adapter::net::behavior::placement::{NodeId as PlacementNodeId, ResourceAxis};
 
-    fn make_scheduler_and_index(node_ids: &[u64]) -> (Scheduler, Arc<CapabilityIndex>) {
+    fn make_scheduler_and_index(node_ids: &[u64]) -> Scheduler {
         use crate::adapter::net::behavior::fold::{
             capability_bridge, CapabilityFold, Fold,
         };
-        let index = Arc::new(CapabilityIndex::new());
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
         for &id in node_ids {
-            capability_bridge::dual_apply(
+            capability_bridge::apply_legacy_announcement(
                 &fold,
-                &index,
                 CapabilityAnnouncement::new(id, eid.clone(), 1, CapabilitySet::new()),
             );
         }
         let local = node_ids.first().copied().unwrap_or(0xFFFF);
-        let scheduler = Scheduler::new(fold, local, CapabilitySet::new());
-        (scheduler, index)
+        Scheduler::new(fold, local, CapabilitySet::new())
     }
 
     /// Permissive placement filter — every candidate scores 1.0.
@@ -1075,7 +1068,7 @@ mod tests {
     #[test]
     fn spawn_with_placement_spreads_across_nodes() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
         let tb = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,
@@ -1109,7 +1102,7 @@ mod tests {
     #[test]
     fn spawn_with_placement_routes_first_replica_to_highest_scorer() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
         let tb = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,
@@ -1140,7 +1133,7 @@ mod tests {
     #[test]
     fn spawn_with_placement_returns_placement_failed_when_all_vetoed() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222]);
         let tb = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,
@@ -1174,7 +1167,7 @@ mod tests {
     #[test]
     fn scale_to_with_placement_spreads_new_replicas() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
         let tb = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,
@@ -1208,7 +1201,7 @@ mod tests {
     #[test]
     fn scale_to_with_placement_scale_down_does_not_invoke_filter() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
         let tb = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,
@@ -1248,7 +1241,7 @@ mod tests {
     #[test]
     fn on_node_failure_with_placement_replaces_member_on_spare_node() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
         let tb = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,
@@ -1300,7 +1293,7 @@ mod tests {
         let reg = DaemonRegistry::new();
         // Single-node mesh — failure leaves NO spare; placement
         // MUST fail and the slot MUST stay registered.
-        let (sched, index) = make_scheduler_and_index(&[0x9999]);
+        let sched = make_scheduler_and_index(&[0x9999]);
         let tb = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,

@@ -20,8 +20,6 @@
 
 use std::sync::Arc;
 
-#[cfg(test)]
-use crate::adapter::net::behavior::capability::CapabilityIndex;
 use crate::adapter::net::behavior::capability::CapabilitySet;
 use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use crate::adapter::net::behavior::dataforts_capabilities::{
@@ -816,15 +814,14 @@ mod tests {
         peer_id: u64,
         peer_caps: CapabilitySet,
         peer_seed: u8,
-    ) -> (Fold<CapabilityFold>, CapabilityIndex) {
-        let index = CapabilityIndex::new();
+    ) -> Fold<CapabilityFold> {
         let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
         let entity = EntityId::from_bytes([peer_seed; 32]);
         let ann = crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
             peer_id, entity, 1, peer_caps,
         );
-        capability_bridge::dual_apply(&fold, &index, ann);
-        (fold, index)
+        capability_bridge::apply_legacy_announcement(&fold, ann);
+        fold
     }
 
     #[test]
@@ -840,7 +837,7 @@ mod tests {
             prefix: "heat:".to_string(),
             body: format!("blob:{}=0.30", hex2),
         });
-        let (fold, _index) = index_with_peer_heat(99, peer_caps, 0xAA);
+        let fold = index_with_peer_heat(99, peer_caps, 0xAA);
         let local = CapabilitySet::default();
         let controller = BlobMigrationController::new(&local, &fold);
         let candidates = controller.candidates();
@@ -867,7 +864,7 @@ mod tests {
             prefix: "heat:".to_string(),
             body: "deadbeefcafebabe=0.50".to_string(),
         });
-        let (fold, _index) = index_with_peer_heat(7, peer_caps, 0xBB);
+        let fold = index_with_peer_heat(7, peer_caps, 0xBB);
         let local = CapabilitySet::default();
         let candidates = BlobMigrationController::new(&local, &fold).candidates();
         assert!(candidates.is_empty());
@@ -952,7 +949,7 @@ mod tests {
     #[tokio::test]
     async fn drive_tick_admits_and_calls_prefetch_on_participating_local() {
         let publisher_caps = publisher_caps_with_heat(0x10, "mesh", "0.75");
-        let (fold, _index) = index_with_peer_heat(99, publisher_caps, 0xAA);
+        let fold = index_with_peer_heat(99, publisher_caps, 0xAA);
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
@@ -966,7 +963,7 @@ mod tests {
     #[tokio::test]
     async fn drive_tick_rejects_when_local_lacks_blob_storage() {
         let publisher_caps = publisher_caps_with_heat(0x20, "mesh", "0.50");
-        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xBB);
+        let fold = index_with_peer_heat(50, publisher_caps, 0xBB);
         // Local: no `dataforts.blob.storage` tag → NoStorageCap.
         let local = CapabilitySet::new()
             .add_tag("dataforts.gravity.enabled")
@@ -983,7 +980,7 @@ mod tests {
     #[tokio::test]
     async fn drive_tick_skips_when_size_resolver_returns_none() {
         let publisher_caps = publisher_caps_with_heat(0x30, "mesh", "0.40");
-        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xCC);
+        let fold = index_with_peer_heat(50, publisher_caps, 0xCC);
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
@@ -997,7 +994,7 @@ mod tests {
     #[tokio::test]
     async fn drive_tick_counts_prefetch_errors_without_propagating() {
         let publisher_caps = publisher_caps_with_heat(0x40, "mesh", "0.90");
-        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xDD);
+        let fold = index_with_peer_heat(50, publisher_caps, 0xDD);
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::failing();
         let calls = adapter.calls.clone();
@@ -1049,11 +1046,9 @@ mod tests {
             prefix: "heat:".to_string(),
             body: format!("blob:{}=0.40", hex),
         });
-        let index = CapabilityIndex::new();
         let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
-        capability_bridge::dual_apply(
+        capability_bridge::apply_legacy_announcement(
             &fold,
-            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 10,
                 EntityId::from_bytes([0xAA; 32]),
@@ -1061,9 +1056,8 @@ mod tests {
                 publisher,
             ),
         );
-        capability_bridge::dual_apply(
+        capability_bridge::apply_legacy_announcement(
             &fold,
-            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 20,
                 EntityId::from_bytes([0xBB; 32]),
@@ -1126,11 +1120,9 @@ mod tests {
             prefix: "heat:".to_string(),
             body: format!("blob:{}=0.30", hex),
         });
-        let index = CapabilityIndex::new();
         let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
-        capability_bridge::dual_apply(
+        capability_bridge::apply_legacy_announcement(
             &fold,
-            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 30,
                 EntityId::from_bytes([0xCC; 32]),
@@ -1138,9 +1130,8 @@ mod tests {
                 publisher,
             ),
         );
-        capability_bridge::dual_apply(
+        capability_bridge::apply_legacy_announcement(
             &fold,
-            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 40,
                 EntityId::from_bytes([0xDD; 32]),
@@ -1186,7 +1177,7 @@ mod tests {
                 body: format!("blob:{}=0.50", hex),
             });
         }
-        let (fold, _index) = index_with_peer_heat(77, publisher_caps, 0x77);
+        let fold = index_with_peer_heat(77, publisher_caps, 0x77);
         let local = participating_local("mesh", 128, 1024);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
@@ -1232,13 +1223,11 @@ mod tests {
             caps
         };
         let flood = DEFAULT_MIGRATION_PER_PEER_BUDGET_PER_TICK + 4;
-        let index = CapabilityIndex::new();
         let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
         let entity_a = EntityId::from_bytes([0xA1; 32]);
         let entity_b = EntityId::from_bytes([0xB2; 32]);
-        capability_bridge::dual_apply(
+        capability_bridge::apply_legacy_announcement(
             &fold,
-            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 111,
                 entity_a,
@@ -1246,9 +1235,8 @@ mod tests {
                 make_caps_with_heat("mesh", 0xA0, flood),
             ),
         );
-        capability_bridge::dual_apply(
+        capability_bridge::apply_legacy_announcement(
             &fold,
-            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 222,
                 entity_b,
@@ -1274,7 +1262,7 @@ mod tests {
     #[tokio::test]
     async fn drive_tick_rejects_when_disk_free_insufficient() {
         let publisher_caps = publisher_caps_with_heat(0x50, "mesh", "0.50");
-        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xEE);
+        let fold = index_with_peer_heat(50, publisher_caps, 0xEE);
         // Local has only 1 GiB free; we ask for a 4 GiB blob.
         let local = participating_local("mesh", 128, 1);
         let adapter = PrefetchRecorder::new();
@@ -1292,7 +1280,7 @@ mod tests {
         // the resolver returns the full sibling list; the
         // controller prefetches every chunk.
         let publisher_caps = publisher_caps_with_heat(0x60, "mesh", "0.50");
-        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xFF);
+        let fold = index_with_peer_heat(50, publisher_caps, 0xFF);
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
@@ -1341,7 +1329,7 @@ mod tests {
             prefix: "heat:".to_string(),
             body: format!("blob:{}=0.30", sibling_hex),
         });
-        let (fold, _index) = index_with_peer_heat(99, publisher, 0xAB);
+        let fold = index_with_peer_heat(99, publisher, 0xAB);
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
@@ -1376,7 +1364,7 @@ mod tests {
         // Equivalent to plain drive_blob_migration_tick when the
         // resolver always returns None.
         let publisher_caps = publisher_caps_with_heat(0x80, "mesh", "0.50");
-        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xCD);
+        let fold = index_with_peer_heat(50, publisher_caps, 0xCD);
         let local = participating_local("mesh", 128, 50);
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
@@ -1399,7 +1387,7 @@ mod tests {
         // free; the rejection counts against the same per-reason
         // bucket the single-chunk path uses.
         let publisher_caps = publisher_caps_with_heat(0x90, "mesh", "0.50");
-        let (fold, _index) = index_with_peer_heat(50, publisher_caps, 0xEF);
+        let fold = index_with_peer_heat(50, publisher_caps, 0xEF);
         let local = participating_local("mesh", 128, 1); // 1 GiB free
         let adapter = PrefetchRecorder::new();
         let calls = adapter.calls.clone();
@@ -1477,20 +1465,17 @@ mod tests {
             prefix: "heat:".to_string(),
             body: format!("blob:{}=0.50", b_hex),
         });
-        let index = CapabilityIndex::new();
         let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
         let entity_a = EntityId::from_bytes([0x11; 32]);
         let entity_b = EntityId::from_bytes([0x22; 32]);
-        capability_bridge::dual_apply(
+        capability_bridge::apply_legacy_announcement(
             &fold,
-            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 100, entity_a, 1, a_caps,
             ),
         );
-        capability_bridge::dual_apply(
+        capability_bridge::apply_legacy_announcement(
             &fold,
-            &index,
             crate::adapter::net::behavior::capability::CapabilityAnnouncement::new(
                 200, entity_b, 1, b_caps,
             ),

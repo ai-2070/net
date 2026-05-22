@@ -2184,14 +2184,13 @@ mod tests {
     /// found nobody to attempt against.
     #[test]
     fn start_migration_auto_returns_no_target_available_when_scheduler_finds_nothing() {
-        use crate::adapter::net::behavior::capability::{CapabilityIndex, CapabilitySet};
+        use crate::adapter::net::behavior::capability::CapabilitySet;
         use crate::adapter::net::behavior::fold::{CapabilityFold, Fold};
 
         let (reg, origin) = setup_registry();
         let orch = MigrationOrchestrator::new(reg, 0x1111);
 
-        // Empty index — no candidate nodes anywhere.
-        let index = Arc::new(CapabilityIndex::new());
+        // Empty fold — no candidate nodes anywhere.
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let scheduler =

@@ -31,8 +31,6 @@ use super::admission::OverflowReject;
 use super::error::BlobError;
 use super::mesh::OverflowConfig;
 use super::refcount::BlobRefcountTable;
-#[cfg(test)]
-use crate::adapter::net::behavior::capability::CapabilityIndex;
 use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use crate::adapter::net::behavior::{
     is_blob_storage_unhealthy, BlobCapability, CapabilitySet, GravityCapability, TopologyScope,
@@ -1137,20 +1135,16 @@ mod tests {
         rc
     }
 
-    fn cap_index_with(
-        peers: &[(u64, [u8; 32], CapabilitySet)],
-    ) -> (Fold<CapabilityFold>, CapabilityIndex) {
-        let index = CapabilityIndex::new();
+    fn cap_index_with(peers: &[(u64, [u8; 32], CapabilitySet)]) -> Fold<CapabilityFold> {
         let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
         for (idx, (node_id, entity_bytes, caps)) in peers.iter().enumerate() {
             let entity = EntityId::from_bytes(*entity_bytes);
-            capability_bridge::dual_apply(
+            capability_bridge::apply_legacy_announcement(
                 &fold,
-                &index,
                 CapabilityAnnouncement::new(*node_id, entity, 1 + idx as u64, caps.clone()),
             );
         }
-        (fold, index)
+        fold
     }
 
     // ========================================================================
@@ -1210,7 +1204,7 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0), (b, 1.0), (c, 5.0)]);
         let refcount = refcount_with_zero(&[a, b, c], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
@@ -1237,7 +1231,7 @@ mod tests {
         refcount.pin(a, 1_000_000);
         refcount.store_observed(b, 0, 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
@@ -1260,7 +1254,7 @@ mod tests {
         let refcount = BlobRefcountTable::new();
         refcount.incr(a, 1_000_000); // refcount = 1, not droppable
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
@@ -1282,7 +1276,7 @@ mod tests {
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer_low = (99u64, [0x11; 32], overflow_peer_caps(40));
         let peer_high = (88u64, [0x22; 32], overflow_peer_caps(80));
-        let (fold, _index) = cap_index_with(&[peer_low, peer_high]);
+        let fold = cap_index_with(&[peer_low, peer_high]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
@@ -1312,7 +1306,7 @@ mod tests {
             .add_tag("dataforts.gravity.scope=mesh")
             .add_tag("dataforts.gravity.proximity=128");
         let peer = (99u64, [0x11; 32], no_overflow_peer_caps);
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
@@ -1332,7 +1326,7 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(1));
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
@@ -1352,7 +1346,7 @@ mod tests {
         let heat = heat_registry_with(now, &entries);
         let refcount = refcount_with_zero(&hashes, 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
@@ -1379,7 +1373,7 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
@@ -1414,7 +1408,7 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
@@ -1453,7 +1447,7 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: false, // master switch off
@@ -1491,7 +1485,7 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
@@ -1533,7 +1527,7 @@ mod tests {
             .add_tag("dataforts.gravity.enabled")
             .add_tag("dataforts.gravity.scope=mesh");
         let peer = (99u64, [0x11; 32], no_overflow_peer_caps);
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
@@ -1576,7 +1570,7 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         // Local caps WITHOUT `dataforts.blob.overflow` tag.
         let local = CapabilitySet::new()
             .add_tag("dataforts.blob.storage")
@@ -1628,7 +1622,7 @@ mod tests {
         let heat = heat_registry_with(now, &entries);
         let refcount = refcount_with_zero(&hashes, 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(80));
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
@@ -1682,7 +1676,7 @@ mod tests {
         );
         let refcount = refcount_with_zero(&[small1, big1, small2, big2], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(80));
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
@@ -1729,7 +1723,7 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let (fold, _index) = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,

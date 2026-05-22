@@ -347,33 +347,33 @@ async fn require_signed_capabilities_drops_unsigned_announcements() {
 #[tokio::test]
 async fn stale_versions_are_ignored_by_index() {
     // Dodges the mesh entirely — the version-skip invariant is a
-    // property of CapabilityIndex itself, not the subprotocol.
-    // Keeping the test here so the whole "capability pipeline" suite
-    // lives together and this regression catches anyone who alters
-    // index semantics.
-    use net::adapter::net::behavior::CapabilityIndex;
+    // property of the fold-backed capability state itself, not the
+    // subprotocol. Keeping the test here so the whole "capability
+    // pipeline" suite lives together and this regression catches
+    // anyone who alters fold-apply semantics.
+    use net::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
     use net::adapter::net::EntityId;
 
-    let index = CapabilityIndex::new();
+    let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
     let caps_v1 = CapabilitySet::new().add_tag("v1");
     let caps_v2 = CapabilitySet::new().add_tag("v2");
 
-    // Direct index test — no mesh, no signature verification.
+    // Direct fold test — no mesh, no signature verification.
     // A zero-byte EntityId is a valid data-structure input even
     // though it's not a valid ed25519 public key.
     let eid = EntityId::from_bytes([0u8; 32]);
     let v1 = CapabilityAnnouncement::new(/* node_id */ 0xAA, eid.clone(), 1, caps_v1);
     let v2 = CapabilityAnnouncement::new(0xAA, eid, 2, caps_v2);
 
-    index.index(v2);
-    index.index(v1); // older — must be a no-op
+    capability_bridge::apply_legacy_announcement(&fold, v2);
+    capability_bridge::apply_legacy_announcement(&fold, v1); // older — must be a no-op
 
     let v2_filter = CapabilityFilter::new().require_tag("v2");
-    assert_eq!(index.query(&v2_filter), vec![0xAA]);
+    assert_eq!(capability_bridge::find_nodes_matching(&fold, &v2_filter), vec![0xAA]);
 
     let v1_filter = CapabilityFilter::new().require_tag("v1");
     assert!(
-        index.query(&v1_filter).is_empty(),
+        capability_bridge::find_nodes_matching(&fold, &v1_filter).is_empty(),
         "older version overwrote the newer one"
     );
 }

@@ -25,8 +25,6 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-#[cfg(test)]
-use crate::adapter::net::behavior::capability::CapabilityIndex;
 use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use crate::adapter::net::behavior::predicate::Predicate;
@@ -1491,29 +1489,22 @@ mod tests {
     use crate::adapter::net::identity::EntityId;
     use std::sync::Arc;
 
-    /// Build a `(Arc<Fold<CapabilityFold>>, Arc<CapabilityIndex>)`
-    /// pair populated identically. Mirrors the Phase 3b dual-
-    /// population invariant the production mesh maintains; the
-    /// CapabilityIndex side is kept alive for the (test-only)
-    /// re-entrancy regression in
-    /// `standard_placement_custom_filter_can_query_index_without_deadlock`,
-    /// which exercises the legacy index's with_caps lock
-    /// semantics specifically.
-    fn index_with(
-        nodes: &[(NodeId, CapabilitySet)],
-    ) -> (Arc<Fold<CapabilityFold>>, Arc<CapabilityIndex>) {
-        let index = CapabilityIndex::new();
+    /// Build an `Arc<Fold<CapabilityFold>>` populated with the
+    /// supplied nodes via the legacy-announcement bridge. Mirrors
+    /// the production cap-ann path; tests that need a re-entrant
+    /// `CapabilityIndex` for legacy-lock regression coverage build
+    /// one alongside.
+    fn index_with(nodes: &[(NodeId, CapabilitySet)]) -> Arc<Fold<CapabilityFold>> {
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = EntityId::from_bytes([0u8; 32]);
         for (node_id, caps) in nodes {
-            capability_bridge::dual_apply(
+            capability_bridge::apply_legacy_announcement(
                 &fold,
-                &index,
                 CapabilityAnnouncement::new(*node_id, eid.clone(), 1, caps.clone()),
             );
         }
-        (fold, Arc::new(index))
+        fold
     }
 
     fn empty_caps() -> CapabilitySet {
@@ -1536,7 +1527,7 @@ mod tests {
     /// CapabilityFilter::default() is eligible" contract.
     #[test]
     fn legacy_permissive_scores_all_indexed_nodes() {
-        let (fold, index) = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
         let filter = LegacyPlacement::permissive(&fold);
         let req = empty_caps();
         let opt = empty_caps();
@@ -1552,7 +1543,7 @@ mod tests {
     /// here.
     #[test]
     fn legacy_returns_none_for_unindexed_candidate() {
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let filter = LegacyPlacement::permissive(&fold);
         let req = empty_caps();
         let opt = empty_caps();
@@ -1568,7 +1559,7 @@ mod tests {
     #[test]
     fn legacy_filter_vetoes_non_matching_candidates() {
         let caps_with_tag = empty_caps().add_tag("hardware.gpu");
-        let (fold, index) = index_with(&[(0x1111, caps_with_tag), (0x2222, empty_caps())]);
+        let fold = index_with(&[(0x1111, caps_with_tag), (0x2222, empty_caps())]);
 
         let required = CapabilityFilter::default().require_tag("hardware.gpu".to_string());
 
@@ -1591,7 +1582,7 @@ mod tests {
     /// the substrate.
     #[test]
     fn placement_filter_is_dyn_compatible() {
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let filter = LegacyPlacement::permissive(&fold);
         let dyn_filter: &dyn PlacementFilter = &filter;
         let req = empty_caps();
@@ -1658,7 +1649,7 @@ mod tests {
     /// no axes are configured.
     #[test]
     fn standard_default_config_matches_legacy_permissive() {
-        let (fold, index) = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
         let placement = StandardPlacement::new(&fold);
         let req = empty_caps();
         let opt = empty_caps();
@@ -1672,7 +1663,7 @@ mod tests {
     /// `LegacyPlacement`.
     #[test]
     fn standard_returns_none_for_unindexed_target() {
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let placement = StandardPlacement::new(&fold);
         let req = empty_caps();
         let opt = empty_caps();
@@ -1689,7 +1680,7 @@ mod tests {
     #[test]
     fn standard_vetoes_candidates_missing_required_caps() {
         let caps_with_gpu = empty_caps().add_tag("hardware.gpu");
-        let (fold, index) = index_with(&[(0x1111, caps_with_gpu), (0x2222, empty_caps())]);
+        let fold = index_with(&[(0x1111, caps_with_gpu), (0x2222, empty_caps())]);
         let placement = StandardPlacement::new(&fold);
 
         let required = empty_caps().add_tag("hardware.gpu");
@@ -1709,7 +1700,7 @@ mod tests {
     /// `StandardPlacement` requires updating every setter.
     #[test]
     fn standard_builder_setters_populate_fields() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold)
             .with_scope_filter(vec![ScopeLabel::new("scope:tenant:foo")])
             .with_proximity_max_rtt(Duration::from_millis(50))
@@ -1736,7 +1727,7 @@ mod tests {
     /// an axis-disabling 0.0.
     #[test]
     fn standard_default_axis_configs_disable_each_axis() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold);
         assert!(placement.scope_filter.is_none());
         assert!(placement.proximity_max_rtt.is_none());
@@ -1891,7 +1882,7 @@ mod tests {
     /// (i.e. better, sorts first).
     #[test]
     fn tie_break_step_1_rtt_lower_wins() {
-        let (fold, index) = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
+        let _fold = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
         let lookup = rtt_map(&[(0x1111, 5_000), (0x2222, 50_000)]);
         let ctx = TieBreakContext {
             rtt_lookup: Some(&lookup),
@@ -1906,7 +1897,7 @@ mod tests {
     /// fallback.
     #[test]
     fn tie_break_step_1_present_rtt_beats_missing() {
-        let (fold, index) = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
+        let _fold = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
         let lookup = rtt_map(&[(0x1111, 10_000)]);
         let ctx = TieBreakContext {
             rtt_lookup: Some(&lookup),
@@ -1924,7 +1915,7 @@ mod tests {
     /// (slice 4 stub) → step 3 (lex NodeId fallback).
     #[test]
     fn tie_break_falls_through_to_lex_node_id_when_no_rtt_lookup() {
-        let (fold, index) = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
+        let _fold = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
         let ctx = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,
@@ -1937,7 +1928,7 @@ mod tests {
     /// Identity: comparing a candidate to itself returns Equal.
     #[test]
     fn tie_break_self_compare_is_equal() {
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let _fold = index_with(&[(0x1111, empty_caps())]);
         let ctx = TieBreakContext {
             rtt_lookup: None,
             resource_axis: ResourceAxis::Compute,
@@ -1950,7 +1941,7 @@ mod tests {
     /// non-deterministic data (e.g. random sample) must snapshot.
     #[test]
     fn tie_break_is_deterministic_across_repeated_calls() {
-        let (fold, index) = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
+        let _fold = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
         let lookup = rtt_map(&[(0x1111, 5_000), (0x2222, 50_000)]);
         let ctx = TieBreakContext {
             rtt_lookup: Some(&lookup),
@@ -1967,7 +1958,7 @@ mod tests {
     /// reports identical RTT for two distinct candidates.
     #[test]
     fn tie_break_equal_rtt_falls_through_to_lex_node_id() {
-        let (fold, index) = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
+        let _fold = index_with(&[(0x1111, empty_caps()), (0x2222, empty_caps())]);
         let lookup = rtt_map(&[(0x1111, 10_000), (0x2222, 10_000)]);
         let ctx = TieBreakContext {
             rtt_lookup: Some(&lookup),
@@ -2060,7 +2051,7 @@ mod tests {
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
 
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let placement = StandardPlacement::new(&fold)
             .with_intent_match(IntentMatchPolicy::Disabled)
             .with_intent_registry(IntentRegistry::defaults());
@@ -2077,7 +2068,7 @@ mod tests {
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
 
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let placement = StandardPlacement::new(&fold)
             .with_intent_match(IntentMatchPolicy::Strict)
             .with_intent_registry(IntentRegistry::defaults());
@@ -2096,7 +2087,7 @@ mod tests {
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
 
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let placement = StandardPlacement::new(&fold)
             .with_intent_match(IntentMatchPolicy::Strict)
             .with_intent_registry(IntentRegistry::defaults());
@@ -2114,7 +2105,7 @@ mod tests {
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
 
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let placement = StandardPlacement::new(&fold)
             .with_intent_match(IntentMatchPolicy::Strict)
             .with_intent_registry(IntentRegistry::defaults());
@@ -2137,7 +2128,7 @@ mod tests {
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
 
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let placement = StandardPlacement::new(&fold)
             .with_intent_match(IntentMatchPolicy::Strict)
             .with_intent_registry(IntentRegistry::defaults());
@@ -2164,7 +2155,7 @@ mod tests {
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
 
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let placement = StandardPlacement::new(&fold)
             .with_intent_match(IntentMatchPolicy::AnyOfLocalCapabilities);
         // Default empty registry.
@@ -2186,7 +2177,7 @@ mod tests {
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
 
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let placement = StandardPlacement::new(&fold)
             .with_intent_match(IntentMatchPolicy::AnyOfLocalCapabilities)
             .with_intent_registry(IntentRegistry::defaults());
@@ -2208,7 +2199,7 @@ mod tests {
         let optional = empty_caps();
         let artifact = daemon_with_intent(&required, &optional);
 
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let placement = StandardPlacement::new(&fold)
             .with_intent_match(IntentMatchPolicy::AnyOfLocalCapabilities)
             .with_intent_registry(IntentRegistry::defaults());
@@ -2235,13 +2226,12 @@ mod tests {
 
         // Target lacks the GPU + VRAM requirements.
         let target_caps = empty_caps();
-        let (fold, _index) = {
-            let i = CapabilityIndex::new();
+        let fold = {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::dual_apply(&f, &i, ad);
-            (f, i)
+            capability_bridge::apply_legacy_announcement(&f, ad);
+            f
         };
         let placement = StandardPlacement::new(&fold)
             .with_intent_match(IntentMatchPolicy::Strict)
@@ -2267,7 +2257,7 @@ mod tests {
     /// Default config with no scope filter set.
     #[test]
     fn scope_axis_none_filter_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold);
         let target_caps = empty_caps().with_tenant_scope("foo");
         assert_eq!(placement.score_scope_axis(&target_caps), 1.0);
@@ -2276,7 +2266,7 @@ mod tests {
     /// `scope_filter: Some(empty)` → 1.0 (no-constraint case).
     #[test]
     fn scope_axis_empty_filter_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold).with_scope_filter(vec![]);
         let target_caps = empty_caps().with_tenant_scope("foo");
         assert_eq!(placement.score_scope_axis(&target_caps), 1.0);
@@ -2286,7 +2276,7 @@ mod tests {
     /// → 1.0 (any-of match).
     #[test]
     fn scope_axis_matches_full_form() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold)
             .with_scope_filter(vec![ScopeLabel::new("scope:tenant:foo")]);
         let target_caps = empty_caps().with_tenant_scope("foo");
@@ -2297,7 +2287,7 @@ mod tests {
     /// `scope:tenant:foo` target tag.
     #[test]
     fn scope_axis_matches_body_form() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement =
             StandardPlacement::new(&fold).with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
         let target_caps = empty_caps().with_tenant_scope("foo");
@@ -2312,7 +2302,7 @@ mod tests {
     /// (operator wanted scoped placement; target is unscoped).
     #[test]
     fn scope_axis_unscoped_target_returns_zero() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement =
             StandardPlacement::new(&fold).with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
         let target_caps = empty_caps().add_tag("hardware.gpu");
@@ -2322,7 +2312,7 @@ mod tests {
     /// Filter with multiple labels, target matches any-of → 1.0.
     #[test]
     fn scope_axis_matches_any_of_multiple_labels() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold).with_scope_filter(vec![
             ScopeLabel::new("tenant:bar"),
             ScopeLabel::new("region:us-east"),
@@ -2337,7 +2327,7 @@ mod tests {
     /// → 0.0.
     #[test]
     fn scope_axis_no_match_returns_zero() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement =
             StandardPlacement::new(&fold).with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
         // Target tagged with a different tenant.
@@ -2352,7 +2342,7 @@ mod tests {
     /// `proximity_max_rtt: None` → 1.0 (axis disabled). Default.
     #[test]
     fn proximity_axis_no_threshold_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold);
         assert_eq!(placement.score_proximity_axis(&0x1111), 1.0);
     }
@@ -2362,7 +2352,7 @@ mod tests {
     /// no data" contract.
     #[test]
     fn proximity_axis_threshold_without_lookup_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement =
             StandardPlacement::new(&fold).with_proximity_max_rtt(Duration::from_millis(50));
         assert_eq!(placement.score_proximity_axis(&0x1111), 1.0);
@@ -2374,7 +2364,7 @@ mod tests {
     /// missing data.
     #[test]
     fn proximity_axis_unmeasured_target_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let lookup = |_id: NodeId| -> Option<u64> { None };
         let placement = StandardPlacement::new(&fold)
             .with_proximity_max_rtt(Duration::from_millis(50))
@@ -2385,7 +2375,7 @@ mod tests {
     /// RTT under the threshold → 1.0.
     #[test]
     fn proximity_axis_rtt_under_threshold_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let lookup = |_id: NodeId| -> Option<u64> { Some(10_000) }; // 10 ms
         let placement = StandardPlacement::new(&fold)
             .with_proximity_max_rtt(Duration::from_millis(50))
@@ -2396,7 +2386,7 @@ mod tests {
     /// RTT exactly at the threshold → 1.0 (inclusive bound).
     #[test]
     fn proximity_axis_rtt_at_threshold_returns_one_inclusive() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let lookup = |_id: NodeId| -> Option<u64> { Some(50_000) }; // exactly 50 ms
         let placement = StandardPlacement::new(&fold)
             .with_proximity_max_rtt(Duration::from_millis(50))
@@ -2411,7 +2401,7 @@ mod tests {
     /// RTT over the threshold → 0.0 (hard veto).
     #[test]
     fn proximity_axis_rtt_over_threshold_returns_zero() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let lookup = |_id: NodeId| -> Option<u64> { Some(100_000) }; // 100 ms
         let placement = StandardPlacement::new(&fold)
             .with_proximity_max_rtt(Duration::from_millis(50))
@@ -2424,7 +2414,7 @@ mod tests {
     /// vetoes while an under-threshold one passes.
     #[test]
     fn proximity_axis_per_candidate_via_lookup() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let lookup = |id: NodeId| -> Option<u64> {
             match id {
                 0x1111 => Some(10_000), // 10 ms — under
@@ -2444,13 +2434,12 @@ mod tests {
     #[test]
     fn proximity_axis_zero_zeros_final_score() {
         let target_caps = empty_caps();
-        let (fold, _index) = {
-            let i = CapabilityIndex::new();
+        let fold = {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::dual_apply(&f, &i, ad);
-            (f, i)
+            capability_bridge::apply_legacy_announcement(&f, ad);
+            f
         };
         let lookup = |_id: NodeId| -> Option<u64> { Some(200_000) }; // 200 ms
         let placement = StandardPlacement::new(&fold)
@@ -2474,7 +2463,7 @@ mod tests {
     /// `ColocationPolicy::Ignore` → 1.0 regardless. Default.
     #[test]
     fn colocation_axis_ignore_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement =
             StandardPlacement::new(&fold).with_colocation_policy(ColocationPolicy::Ignore);
         let mut required = empty_caps();
@@ -2492,7 +2481,7 @@ mod tests {
     /// (no constraint).
     #[test]
     fn colocation_axis_soft_no_metadata_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement =
             StandardPlacement::new(&fold).with_colocation_policy(ColocationPolicy::SoftPreference);
         let required = empty_caps();
@@ -2508,7 +2497,7 @@ mod tests {
     /// SoftPreference + soft-key declared + target hosts → 1.0.
     #[test]
     fn colocation_axis_soft_target_hosts_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement =
             StandardPlacement::new(&fold).with_colocation_policy(ColocationPolicy::SoftPreference);
         let mut required = empty_caps();
@@ -2526,7 +2515,7 @@ mod tests {
     /// → 0.7 (soft penalty boost).
     #[test]
     fn colocation_axis_soft_target_misses_returns_penalty() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement =
             StandardPlacement::new(&fold).with_colocation_policy(ColocationPolicy::SoftPreference);
         let mut required = empty_caps();
@@ -2546,7 +2535,7 @@ mod tests {
     /// to hard veto.
     #[test]
     fn colocation_axis_strict_key_vetoes_under_soft_policy() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement =
             StandardPlacement::new(&fold).with_colocation_policy(ColocationPolicy::SoftPreference);
         let mut required = empty_caps();
@@ -2567,7 +2556,7 @@ mod tests {
     /// strict semantics.
     #[test]
     fn colocation_axis_strict_policy_upgrades_soft_key_to_veto() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement =
             StandardPlacement::new(&fold).with_colocation_policy(ColocationPolicy::StrictRequired);
         let mut required = empty_caps();
@@ -2584,7 +2573,7 @@ mod tests {
     /// StrictRequired + soft-key declared + target hosts → 1.0.
     #[test]
     fn colocation_axis_strict_policy_target_hosts_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement =
             StandardPlacement::new(&fold).with_colocation_policy(ColocationPolicy::StrictRequired);
         let mut required = empty_caps();
@@ -2602,7 +2591,7 @@ mod tests {
     /// axis — peer announcing a tip implicitly holds the chain.
     #[test]
     fn colocation_axis_tip_form_satisfies_match() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement =
             StandardPlacement::new(&fold).with_colocation_policy(ColocationPolicy::SoftPreference);
         let mut required = empty_caps();
@@ -2622,13 +2611,12 @@ mod tests {
     #[test]
     fn colocation_axis_zero_zeros_final_score() {
         let target_caps = empty_caps();
-        let (fold, _index) = {
-            let i = CapabilityIndex::new();
+        let fold = {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::dual_apply(&f, &i, ad);
-            (f, i)
+            capability_bridge::apply_legacy_announcement(&f, ad);
+            f
         };
         let placement =
             StandardPlacement::new(&fold).with_colocation_policy(ColocationPolicy::StrictRequired);
@@ -2654,7 +2642,7 @@ mod tests {
     /// the stub.
     #[test]
     fn resource_axis_compute_no_data_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold).with_resource_axis(ResourceAxis::Compute);
         let target_caps = empty_caps();
         let req = empty_caps();
@@ -2667,7 +2655,7 @@ mod tests {
     /// score 0.5 (saturating function half at the reference).
     #[test]
     fn resource_axis_compute_cpu_at_reference_scores_half() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold).with_resource_axis(ResourceAxis::Compute);
         let target_caps = empty_caps().add_tag("hardware.cpu_cores=8");
         let req = empty_caps();
@@ -2684,7 +2672,7 @@ mod tests {
     /// property the axis exists to provide.
     #[test]
     fn resource_axis_compute_monotonic_in_capacity() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold).with_resource_axis(ResourceAxis::Compute);
         let req = empty_caps();
         let opt = empty_caps();
@@ -2707,7 +2695,7 @@ mod tests {
     /// scores against just cpu.
     #[test]
     fn resource_axis_compute_averages_present_components() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold).with_resource_axis(ResourceAxis::Compute);
         let req = empty_caps();
         let opt = empty_caps();
@@ -2735,7 +2723,7 @@ mod tests {
     /// (1 TB) → 0.5.
     #[test]
     fn resource_axis_storage_at_reference_scores_half() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold).with_resource_axis(ResourceAxis::Storage);
         let target_caps = empty_caps().add_tag("dataforts.capacity_gb=1000");
         let req = empty_caps();
@@ -2752,7 +2740,7 @@ mod tests {
     /// (permissive when no data).
     #[test]
     fn resource_axis_storage_no_data_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold).with_resource_axis(ResourceAxis::Storage);
         let target_caps = empty_caps();
         let req = empty_caps();
@@ -2770,7 +2758,7 @@ mod tests {
     /// often-misconfigured lower-NodeId peers via the lex tie-break.
     #[test]
     fn resource_axis_both_uses_only_axes_with_data() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold).with_resource_axis(ResourceAxis::Both);
 
         // Compute has data (cpu_cores=8 → 0.5), storage does not.
@@ -2820,7 +2808,7 @@ mod tests {
     /// `None` (treated as "no data" by the score helper).
     #[test]
     fn resource_axis_overflow_value_treated_as_no_data() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold).with_resource_axis(ResourceAxis::Compute);
         // Absurd `hardware.cpu_cores=1e308`: a finite f64, but
         // saturates to f32::INFINITY when downcast. Treated as
@@ -2849,7 +2837,7 @@ mod tests {
     /// score with NaN.
     #[test]
     fn resource_axis_compute_malformed_value_treated_as_no_data() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold).with_resource_axis(ResourceAxis::Compute);
         let target_caps = empty_caps().add_tag("hardware.cpu_cores=lots");
         let req = empty_caps();
@@ -2867,7 +2855,7 @@ mod tests {
     /// `leadership_stats: None` → 1.0 (axis disabled). Default.
     #[test]
     fn anti_affinity_no_stats_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let placement = StandardPlacement::new(&fold);
         assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
     }
@@ -2876,7 +2864,7 @@ mod tests {
     /// missing data, parallel to proximity).
     #[test]
     fn anti_affinity_target_without_data_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let stats = |_id: NodeId| -> Option<f32> { None };
         let placement = StandardPlacement::new(&fold).with_leadership_stats(&stats);
         assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
@@ -2886,7 +2874,7 @@ mod tests {
     /// Default threshold is 0.30.
     #[test]
     fn anti_affinity_under_threshold_returns_one() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let stats = |_id: NodeId| -> Option<f32> { Some(0.20) };
         let placement = StandardPlacement::new(&fold).with_leadership_stats(&stats);
         assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
@@ -2895,7 +2883,7 @@ mod tests {
     /// Concentration exactly at the threshold → 1.0 (inclusive).
     #[test]
     fn anti_affinity_at_threshold_returns_one_inclusive() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let stats = |_id: NodeId| -> Option<f32> { Some(0.30) };
         let placement = StandardPlacement::new(&fold).with_leadership_stats(&stats);
         assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
@@ -2905,7 +2893,7 @@ mod tests {
     /// Default penalty is 0.4.
     #[test]
     fn anti_affinity_over_threshold_returns_penalty() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let stats = |_id: NodeId| -> Option<f32> { Some(0.50) };
         let placement = StandardPlacement::new(&fold).with_leadership_stats(&stats);
         let score = placement.score_anti_affinity_axis(&0x1111);
@@ -2920,7 +2908,7 @@ mod tests {
     /// threshold one is penalized.
     #[test]
     fn anti_affinity_per_candidate_via_stats() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let stats = |id: NodeId| -> Option<f32> {
             match id {
                 0x1111 => Some(0.10), // light leader
@@ -2940,7 +2928,7 @@ mod tests {
     /// asymmetric with the existing penalty-side NaN guard.
     #[test]
     fn anti_affinity_treats_nan_concentration_as_no_data() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let stats = |_id: NodeId| -> Option<f32> { Some(f32::NAN) };
         let placement = StandardPlacement::new(&fold).with_leadership_stats(&stats);
         assert_eq!(placement.score_anti_affinity_axis(&0x1111), 1.0);
@@ -2978,7 +2966,7 @@ mod tests {
     /// > 1.0) doesn't blow up the multiplicative composition.
     #[test]
     fn anti_affinity_defensive_clamps_misconfigured_penalty() {
-        let (fold, index) = index_with(&[]);
+        let fold = index_with(&[]);
         let stats = |_id: NodeId| -> Option<f32> { Some(0.50) };
 
         // NaN → 0.0.
@@ -3001,13 +2989,12 @@ mod tests {
     #[test]
     fn anti_affinity_penalty_multiplies_through_composition() {
         let target_caps = empty_caps();
-        let (fold, _index) = {
-            let i = CapabilityIndex::new();
+        let fold = {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::dual_apply(&f, &i, ad);
-            (f, i)
+            capability_bridge::apply_legacy_announcement(&f, ad);
+            f
         };
         let stats = |_id: NodeId| -> Option<f32> { Some(0.50) };
         let placement = StandardPlacement::new(&fold).with_leadership_stats(&stats);
@@ -3031,13 +3018,12 @@ mod tests {
     #[test]
     fn resource_axis_low_score_multiplies_through_composition() {
         let target_caps = empty_caps().add_tag("hardware.cpu_cores=2");
-        let (fold, _index) = {
-            let i = CapabilityIndex::new();
+        let fold = {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::dual_apply(&f, &i, ad);
-            (f, i)
+            capability_bridge::apply_legacy_announcement(&f, ad);
+            f
         };
         let placement = StandardPlacement::new(&fold).with_resource_axis(ResourceAxis::Compute);
 
@@ -3062,13 +3048,12 @@ mod tests {
     #[test]
     fn colocation_axis_soft_penalty_multiplies_through_composition() {
         let target_caps = empty_caps();
-        let (fold, _index) = {
-            let i = CapabilityIndex::new();
+        let fold = {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::dual_apply(&f, &i, ad);
-            (f, i)
+            capability_bridge::apply_legacy_announcement(&f, ad);
+            f
         };
         let placement =
             StandardPlacement::new(&fold).with_colocation_policy(ColocationPolicy::SoftPreference);
@@ -3092,13 +3077,12 @@ mod tests {
     #[test]
     fn scope_axis_zero_zeros_final_score() {
         let target_caps = empty_caps().add_tag("hardware.gpu");
-        let (fold, _index) = {
-            let i = CapabilityIndex::new();
+        let fold = {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::dual_apply(&f, &i, ad);
-            (f, i)
+            capability_bridge::apply_legacy_announcement(&f, ad);
+            f
         };
         let placement =
             StandardPlacement::new(&fold).with_scope_filter(vec![ScopeLabel::new("tenant:foo")]);
@@ -3119,7 +3103,7 @@ mod tests {
     /// extension, not silent.
     #[test]
     fn standard_chain_and_replica_artifacts_pass_through_today() {
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let placement = StandardPlacement::new(&fold);
         let chain_caps = empty_caps();
         let chain = Artifact::Chain {
@@ -3161,7 +3145,7 @@ mod tests {
     fn standard_blob_placement_rejects_node_without_blob_storage() {
         // Target node has no `dataforts.blob.storage` tag — placement
         // hard-vetoes.
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let placement = StandardPlacement::new(&fold);
         let blob = Artifact::Blob {
             blob_hash: [0xAA; 32],
@@ -3174,7 +3158,7 @@ mod tests {
     fn standard_blob_placement_admits_storage_participating_node() {
         // Target has `dataforts.blob.storage` + 100 GiB free; 1 KiB
         // blob fits easily.
-        let (fold, index) = index_with(&[(0x1111, caps_with_blob_storage(100))]);
+        let fold = index_with(&[(0x1111, caps_with_blob_storage(100))]);
         let placement = StandardPlacement::new(&fold);
         let blob = Artifact::Blob {
             blob_hash: [0xBB; 32],
@@ -3195,7 +3179,7 @@ mod tests {
     fn standard_blob_placement_rejects_insufficient_disk_free() {
         // Target has `dataforts.blob.storage` but only 2 GiB free;
         // 10 GiB blob can't fit. Hard veto.
-        let (fold, index) = index_with(&[(0x1111, caps_with_blob_storage(2))]);
+        let fold = index_with(&[(0x1111, caps_with_blob_storage(2))]);
         let placement = StandardPlacement::new(&fold);
         let blob = Artifact::Blob {
             blob_hash: [0xCC; 32],
@@ -3221,7 +3205,7 @@ mod tests {
                 prefix: "dataforts:".to_owned(),
                 body: "blob-storage-unhealthy".to_owned(),
             });
-        let (fold, index) = index_with(&[(0x1111, unhealthy_caps)]);
+        let fold = index_with(&[(0x1111, unhealthy_caps)]);
         let placement = StandardPlacement::new(&fold);
         let blob = Artifact::Blob {
             blob_hash: [0xDD; 32],
@@ -3238,7 +3222,7 @@ mod tests {
         let one_and_a_half_gib: u64 = (1 << 30) + (1 << 29);
 
         // 1 GiB free → too small, veto.
-        let (fold, index) = index_with(&[(0x2222, caps_with_blob_storage(1))]);
+        let fold = index_with(&[(0x2222, caps_with_blob_storage(1))]);
         let placement = StandardPlacement::new(&fold);
         let blob = Artifact::Blob {
             blob_hash: [0xEE; 32],
@@ -3247,7 +3231,7 @@ mod tests {
         assert_eq!(placement.placement_score(&0x2222, &blob), None);
 
         // 2 GiB free → fits, admit.
-        let (fold2, _index2) = index_with(&[(0x3333, caps_with_blob_storage(2))]);
+        let fold2 = index_with(&[(0x3333, caps_with_blob_storage(2))]);
         let placement2 = StandardPlacement::new(&fold2);
         assert!(placement2.placement_score(&0x3333, &blob).is_some());
     }
@@ -3315,7 +3299,7 @@ mod tests {
     /// no filter configured — pin the back-compat default.
     #[test]
     fn standard_placement_no_custom_filter_acts_as_identity_axis() {
-        let (fold, index) = index_with(&[(0x1111, empty_caps())]);
+        let fold = index_with(&[(0x1111, empty_caps())]);
         let placement = StandardPlacement::new(&fold);
         assert!(placement.custom_filter_id.is_none());
 
@@ -3331,7 +3315,7 @@ mod tests {
     /// stays 1.0.
     #[test]
     fn standard_placement_custom_filter_one_is_identity() {
-        let (fold, index) = index_with(&[(0x2222, empty_caps())]);
+        let fold = index_with(&[(0x2222, empty_caps())]);
         let id = "pf-test-slice5-identity";
         with_registered_filter(id, Arc::new(FixedScoreFilter(Some(1.0))), |id| {
             let placement = StandardPlacement::new(&fold).with_custom_filter_id(id);
@@ -3351,7 +3335,7 @@ mod tests {
     /// equals the custom score.
     #[test]
     fn standard_placement_custom_filter_score_composes_multiplicatively() {
-        let (fold, index) = index_with(&[(0x3333, empty_caps())]);
+        let fold = index_with(&[(0x3333, empty_caps())]);
         let id = "pf-test-slice5-multiply";
         with_registered_filter(id, Arc::new(FixedScoreFilter(Some(0.5))), |id| {
             let placement = StandardPlacement::new(&fold).with_custom_filter_id(id);
@@ -3368,7 +3352,7 @@ mod tests {
     /// candidate entirely — no other axis can rescue it.
     #[test]
     fn standard_placement_custom_filter_none_is_hard_veto() {
-        let (fold, index) = index_with(&[(0x4444, empty_caps())]);
+        let fold = index_with(&[(0x4444, empty_caps())]);
         let id = "pf-test-slice5-veto";
         with_registered_filter(id, Arc::new(FixedScoreFilter(None)), |id| {
             let placement = StandardPlacement::new(&fold).with_custom_filter_id(id);
@@ -3388,7 +3372,7 @@ mod tests {
     /// veto rather than silent permissive routing.
     #[test]
     fn standard_placement_unregistered_custom_filter_id_vetoes() {
-        let (fold, index) = index_with(&[(0x5555, empty_caps())]);
+        let fold = index_with(&[(0x5555, empty_caps())]);
         // Use a uniquely-prefixed id we never register so concurrent
         // test runs don't collide on the global singleton.
         let placement = StandardPlacement::new(&fold)
@@ -3409,7 +3393,7 @@ mod tests {
     /// invariant: a 0.0 from any axis (including the new one) wins.
     #[test]
     fn standard_placement_custom_filter_composes_with_in_tree_axes() {
-        let (fold, index) = index_with(&[(0x6666, empty_caps())]);
+        let fold = index_with(&[(0x6666, empty_caps())]);
         let id = "pf-test-slice5-compose";
         with_registered_filter(id, Arc::new(FixedScoreFilter(Some(1.0))), |id| {
             // Scope filter requires a specific tag; target has
@@ -3429,38 +3413,38 @@ mod tests {
     }
 
     /// N-4 regression: a custom `PlacementFilter` that re-enters the
-    /// `CapabilityIndex` (via `query` / `find_nodes_matching` /
-    /// `with_caps` on the same target) must NOT deadlock during
+    /// fold (via `find_nodes_matching` / state queries on the same
+    /// target) must NOT deadlock during
     /// `StandardPlacement::placement_score`. Pre-fix the custom-filter
-    /// axis was invoked inside the outer `with_caps` closure, which
-    /// holds a per-shard read lock — re-entrant index access under
-    /// a concurrent writer deadlocked per the `with_caps` doc warning.
+    /// axis was invoked inside the outer state-lock closure — re-entrant
+    /// fold access under a concurrent writer deadlocked.
     ///
-    /// The filter below queries the index from inside its
+    /// The filter below queries the fold from inside its
     /// `placement_score` callback. If the fix regresses, this test
     /// hangs (the harness will time it out).
     #[test]
     fn standard_placement_custom_filter_can_query_index_without_deadlock() {
         struct ReentrantFilter {
-            index: Arc<CapabilityIndex>,
+            fold: Arc<Fold<CapabilityFold>>,
         }
         impl PlacementFilter for ReentrantFilter {
             fn placement_score(&self, target: &NodeId, _artifact: &Artifact<'_>) -> Option<f32> {
-                // Touch the index from inside the callback. Pre-fix
-                // this was running under the outer `with_caps` shard
-                // read lock and would deadlock against a concurrent
-                // writer; post-fix the custom filter runs BEFORE
-                // `with_caps` so re-entry is safe.
-                let _ = self.index.query(&CapabilityFilter::default());
-                let _ = self.index.with_caps(*target, |caps| caps.tags.len());
+                // Touch the fold from inside the callback. Pre-fix
+                // this was running under the outer state-lock and
+                // would deadlock against a concurrent writer; post-fix
+                // the custom filter runs BEFORE the inner closure so
+                // re-entry is safe.
+                let legacy = crate::adapter::net::behavior::capability::CapabilityFilter::default();
+                let _ = capability_bridge::find_nodes_matching(&self.fold, &legacy);
+                let _ = capability_bridge::synthesize_capability_set(&self.fold, *target);
                 Some(0.75)
             }
         }
 
-        let (fold, index) = index_with(&[(0x7777, empty_caps())]);
+        let fold = index_with(&[(0x7777, empty_caps())]);
         let id = "pf-test-N4-reentrant";
         let filter = Arc::new(ReentrantFilter {
-            index: index.clone(),
+            fold: fold.clone(),
         });
         with_registered_filter(id, filter, |id| {
             let placement = StandardPlacement::new(&fold).with_custom_filter_id(id);

@@ -140,20 +140,17 @@ fn gpu_vendor_canonical(vendor: GpuVendor) -> &'static str {
     }
 }
 
-/// Apply `ann` to both the legacy [`CapabilityIndex`] (via
-/// `index.index(ann)`) and the fold (via
-/// `fold.apply(translate_announcement(&ann))`). Matches the
-/// dual-population invariant the production cap-ann dispatch
-/// handler maintains; intended primarily for test fixtures
-/// that need both indices populated identically.
-pub fn dual_apply(
+/// Apply a legacy [`CapabilityAnnouncement`] to the fold via
+/// [`translate_announcement`]. Intended primarily for test
+/// fixtures that need to prime a `Fold<CapabilityFold>` with
+/// the same legacy-shape announcement the production dispatch
+/// path would produce.
+pub fn apply_legacy_announcement(
     fold: &Fold<CapabilityFold>,
-    index: &super::super::capability::CapabilityIndex,
     ann: CapabilityAnnouncement,
 ) {
     let fold_ann = translate_announcement(&ann);
     let _ = fold.apply(fold_ann);
-    index.index(ann);
 }
 
 /// Synthesize a legacy [`CapabilitySet`](super::super::capability::CapabilitySet)
