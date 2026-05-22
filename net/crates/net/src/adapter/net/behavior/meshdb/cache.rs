@@ -148,8 +148,8 @@ impl CachedResult {
     /// Construct a [`CachedResult`] and pre-compute its
     /// `approx_bytes`. Per perf #209 — every production
     /// construction site routes through this helper so the LRU
-    /// bookkeeping calls to [`Self::approx_bytes`] are cheap. See
-    /// the `approx_bytes` field doc for the rationale.
+    /// bookkeeping calls to `approx_bytes()` are cheap. See the
+    /// `approx_bytes` field doc for the rationale.
     #[inline]
     pub fn new(rows: Vec<ResultRow>, inserted_at: Instant, policy: CachePolicy) -> Self {
         let approx_bytes = compute_approx_bytes(&rows);
