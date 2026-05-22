@@ -1,0 +1,30 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_d9dc521a887c3e::t_cab275d91ee6f7 605-610
+  s_d9dc521a887c3e::t_dceac937aa73e9 1726-1733
+  s_d9dc521a887c3e::t_713f86963ae0b7 1882-1886
+  s_d9dc521a887c3e::t_040268e5b0eb00 2973
+  s_d9dc521a887c3e::t_e78bdefa7ceed3 8825-8848
+  s_d9dc521a887c3e::t_4369a9ab1be32d 2096
+  s_d9dc521a887c3e::t_0d9a329f98b1dc 5843-5855
+  s_d9dc521a887c3e::t_f5d013bb045613 10668-10717
+  s_d9dc521a887c3e::t_6b125fb1f9155c 1941
+  s_d9dc521a887c3e::t_2042909c8aea7d 103-170
+  s_d9dc521a887c3e::t_44df3ed286611c 1968-1975
+  s_d9dc521a887c3e::t_ac6219be85def9 1960-1967,1976
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "e4411aa2947f053844feae3732ac39534e0a7d86",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
