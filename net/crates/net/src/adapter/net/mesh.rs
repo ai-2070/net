@@ -7686,26 +7686,41 @@ impl MeshNode {
     fn is_causal_for(tag: &Tag, hex: &str) -> bool {
         match tag {
             Tag::Reserved { prefix, body } if prefix.as_str() == "causal:" => {
-                // body shapes per CAPABILITY_SYSTEM_PLAN.md §2:
-                //   <hex>                — presence-form
-                //   <hex>:<tip_seq>      — tip-form
-                //   <hex>[<start>..<end>] — range-form
-                //
-                // All three share the `<hex>` prefix followed
-                // by `:` / `[` / end-of-body. Match exactly the
-                // hex prefix + that delimiter set so a longer
-                // hex that happens to start with our hex doesn't
-                // false-match.
-                if !body.starts_with(hex) {
-                    return false;
-                }
-                match body.as_bytes().get(hex.len()) {
-                    None => true,       // exact match (presence-form)
-                    Some(b':') => true, // tip-form
-                    Some(b'[') => true, // range-form
-                    _ => false,         // longer hex; not ours
-                }
+                Self::is_causal_body_for(body, hex)
             }
+            _ => false,
+        }
+    }
+
+    /// String-form of [`Self::is_causal_for`] for the fold's
+    /// canonical tag rendering. Same body-shape logic; takes
+    /// a `&str` shaped as `"causal:<hex>"` / `"causal:<hex>:..."` /
+    /// `"causal:<hex>[...]"`.
+    fn is_causal_for_str(tag: &str, hex: &str) -> bool {
+        let Some(body) = tag.strip_prefix("causal:") else {
+            return false;
+        };
+        Self::is_causal_body_for(body, hex)
+    }
+
+    /// Match a `causal:`-body against the hex digest.
+    ///
+    /// Body shapes per CAPABILITY_SYSTEM_PLAN.md §2:
+    /// - `<hex>` — presence-form
+    /// - `<hex>:<tip_seq>` — tip-form
+    /// - `<hex>[<start>..<end>]` — range-form
+    ///
+    /// All three share the `<hex>` prefix followed by `:` / `[`
+    /// / end-of-body. Match exactly so a longer hex that
+    /// happens to start with our hex doesn't false-match.
+    fn is_causal_body_for(body: &str, hex: &str) -> bool {
+        if !body.starts_with(hex) {
+            return false;
+        }
+        match body.as_bytes().get(hex.len()) {
+            None => true,
+            Some(b':') => true,
+            Some(b'[') => true,
             _ => false,
         }
     }
@@ -8283,21 +8298,26 @@ impl MeshNode {
     /// and unmeasured peers (no recent ping) at the back; among
     /// equally-measured peers, ties broken by ascending NodeId.
     ///
-    /// Reads the capability index directly; no broadcast.
+    /// Reads the capability fold directly; no broadcast.
     pub fn find_chain_holders(&self, origin_hash: u64) -> Vec<u64> {
         let hex = Self::chain_hex(origin_hash);
-        let mut holders: Vec<u64> = self
-            .capability_index
-            .all_nodes()
-            .into_iter()
-            .filter(|nid| {
-                self.capability_index
-                    .with_caps(*nid, |caps| {
-                        caps.tags.iter().any(|t| Self::is_causal_for(t, &hex))
-                    })
-                    .unwrap_or(false)
-            })
-            .collect();
+        let mut holders: Vec<u64> = self.capability_fold.with_state(|state| {
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for (_key, entry) in state.entries.iter() {
+                if seen.contains(&entry.node_id) {
+                    continue;
+                }
+                if entry
+                    .payload
+                    .tags
+                    .iter()
+                    .any(|t| Self::is_causal_for_str(t, &hex))
+                {
+                    seen.insert(entry.node_id);
+                }
+            }
+            seen.into_iter().collect::<Vec<u64>>()
+        });
 
         // Proximity sort: self first (RTT == 0), then peers with
         // measured RTT in ascending order, then unmeasured peers,
@@ -8329,10 +8349,16 @@ impl MeshNode {
         holders
     }
 
-    /// Query the capability index. Returns node ids (including our
+    /// Query the capability fold. Returns node ids (including our
     /// own `node_id`) whose latest announcement matches `filter`.
+    /// Routes through `capability_bridge::find_nodes_matching` so
+    /// post-query predicates (memory, vram, GPU) execute in-memory
+    /// alongside the fold's tag-based intersection.
     pub fn find_nodes_by_filter(&self, filter: &CapabilityFilter) -> Vec<u64> {
-        self.capability_index.query(filter)
+        super::behavior::fold::capability_bridge::find_nodes_matching(
+            &self.capability_fold,
+            filter,
+        )
     }
 
     /// Scoped variant of [`Self::find_nodes_by_filter`]. Filters
@@ -8363,17 +8389,20 @@ impl MeshNode {
         // See doc-comment: without a policy, an unresolvable
         // "unknown" cannot be admitted as same-subnet.
         let policy_installed = self.local_subnet_policy.is_some();
-        self.capability_index
-            .find_nodes_scoped(filter, scope, |nid| {
+        super::behavior::fold::capability_bridge::find_nodes_matching_scoped(
+            &self.capability_fold,
+            filter,
+            scope,
+            |nid| {
                 if nid == local_node_id {
-                    // Querying our own node: same subnet by definition.
                     return true;
                 }
                 match peer_subnets.get(&nid).map(|e| *e.value()) {
                     Some(s) => s == my_subnet,
                     None => policy_installed,
                 }
-            })
+            },
+        )
     }
 
     /// Read a peer's most recently advertised public reflex
@@ -8389,7 +8418,7 @@ impl MeshNode {
     /// Requires the `nat-traversal` cargo feature.
     #[cfg(feature = "nat-traversal")]
     pub fn peer_reflex_addr(&self, peer_node_id: u64) -> Option<std::net::SocketAddr> {
-        self.capability_index.reflex_addr(peer_node_id)
+        super::behavior::fold::reflex_addr_for(&self.capability_fold, peer_node_id)
     }
 
     /// Read a peer's most recently advertised NAT classification
@@ -8407,17 +8436,23 @@ impl MeshNode {
     #[cfg(feature = "nat-traversal")]
     pub fn peer_nat_class(&self, peer_node_id: u64) -> super::traversal::classify::NatClass {
         use super::traversal::classify::NatClass;
-        let Some(caps) = self.capability_index.get(peer_node_id) else {
-            return NatClass::Unknown;
-        };
-        for tag in caps.tags.iter() {
-            // Phase A.5.N.2: tags is HashSet<Tag>; render to wire
-            // form for the string-keyed NAT-class match.
-            if let Some(class) = NatClass::from_tag(&tag.to_string()) {
-                return class;
-            }
-        }
-        NatClass::Unknown
+        self.capability_fold
+            .with_state(|state| {
+                let Some(keys) = state.by_node.get(&peer_node_id) else {
+                    return NatClass::Unknown;
+                };
+                for key in keys {
+                    let Some(entry) = state.entries.get(key) else {
+                        continue;
+                    };
+                    for tag in entry.payload.tags.iter() {
+                        if let Some(class) = NatClass::from_tag(tag) {
+                            return class;
+                        }
+                    }
+                }
+                NatClass::Unknown
+            })
     }
 
     /// Cumulative traversal counters — punch attempts, successes,
