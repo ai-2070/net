@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod bloom;
+pub mod bounded_ring;
 pub mod broadcast;
 pub mod capability;
 pub mod context;

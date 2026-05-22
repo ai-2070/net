@@ -89,71 +89,51 @@ impl FoldAuditSink for VecFoldAuditSink {
 }
 
 /// Bounded ring-buffer audit sink. Keeps the most recent
-/// `capacity` events; oldest are dropped first when full.
-///
-/// This is the sink the Deck FOLDS panel's "recent transitions"
-/// view consumes — operators want the last N events, not a
-/// complete history. Bounded capacity also makes this safe to
-/// install on a high-throughput fold without unbounded memory
-/// growth.
-///
-/// Thread-safe — the inner `VecDeque` is wrapped in a
-/// `parking_lot::Mutex` so `record` is callable from concurrent
-/// fold operations.
+/// `capacity` events; oldest are dropped first when full. This
+/// is the sink the Deck FOLDS panel's "recent transitions" view
+/// consumes — operators want the last N events, not a complete
+/// history. Bounded capacity also makes this safe to install on
+/// a high-throughput fold without unbounded memory growth.
 pub struct RingFoldAuditSink {
-    capacity: usize,
-    events: parking_lot::Mutex<std::collections::VecDeque<AuditEvent>>,
+    ring: super::super::bounded_ring::BoundedRing<AuditEvent>,
 }
 
 impl RingFoldAuditSink {
     /// Construct a sink that retains the most recent `capacity`
     /// events. `capacity == 0` is accepted (and useful: an
-    /// always-empty sink that still satisfies the trait
-    /// without storing anything).
+    /// always-empty sink that still satisfies the trait without
+    /// storing anything).
     pub fn new(capacity: usize) -> Self {
         Self {
-            capacity,
-            events: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
-                capacity,
-            )),
+            ring: super::super::bounded_ring::BoundedRing::new(capacity),
         }
     }
 
     /// Capacity the sink was constructed with.
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.ring.capacity()
     }
 
     /// Current event count (always `<= capacity`).
     pub fn len(&self) -> usize {
-        self.events.lock().len()
+        self.ring.len()
     }
 
     /// Whether the sink currently holds any events.
     pub fn is_empty(&self) -> bool {
-        self.events.lock().is_empty()
+        self.ring.is_empty()
     }
 
     /// Snapshot the retained events in insertion order
-    /// (oldest first → newest last). Returns a clone so the
-    /// caller can render without holding the sink's lock.
+    /// (oldest first → newest last).
     pub fn snapshot(&self) -> Vec<AuditEvent> {
-        self.events.lock().iter().cloned().collect()
+        self.ring.snapshot()
     }
 }
 
 impl FoldAuditSink for RingFoldAuditSink {
     fn record(&self, event: AuditEvent) {
-        let mut events = self.events.lock();
-        // Edge case: capacity == 0 means "never store anything."
-        // Drop the event without growing the deque past 0.
-        if self.capacity == 0 {
-            return;
-        }
-        if events.len() >= self.capacity {
-            events.pop_front();
-        }
-        events.push_back(event);
+        self.ring.push(event);
     }
 }
 

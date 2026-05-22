@@ -73,9 +73,7 @@ pub const DEFAULT_LOG_BUFFERING_APPENDER_CAPACITY: usize = 16_384;
 /// oldest records drop FIFO and `dropped_count` increments.
 #[derive(Debug)]
 pub struct BufferingLogChainAppender {
-    records: parking_lot::Mutex<std::collections::VecDeque<LogRecord>>,
-    capacity: usize,
-    dropped: std::sync::atomic::AtomicU64,
+    records: super::super::bounded_ring::BoundedRing<LogRecord>,
 }
 
 impl Default for BufferingLogChainAppender {
@@ -85,38 +83,29 @@ impl Default for BufferingLogChainAppender {
 }
 
 impl BufferingLogChainAppender {
-    /// Build with the given capacity. `capacity = 0` is
-    /// clamped to `1`.
+    /// Build with the given capacity. `capacity = 0` is clamped
+    /// to `1` so the dropped-count metric stays meaningful.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            records: parking_lot::Mutex::new(std::collections::VecDeque::new()),
-            capacity: capacity.max(1),
-            dropped: std::sync::atomic::AtomicU64::new(0),
+            records: super::super::bounded_ring::BoundedRing::new(capacity.max(1)),
         }
     }
 
-    /// Snapshot the captured records. Cheap — one mutex lock
-    /// + a vec clone.
+    /// Snapshot the captured records (oldest → newest).
     pub fn captured(&self) -> Vec<LogRecord> {
-        self.records.lock().iter().cloned().collect()
+        self.records.snapshot()
     }
 
     /// Number of records dropped because the buffer was at
-    /// capacity. Strictly increasing.
+    /// capacity. Strictly non-decreasing.
     pub fn dropped_count(&self) -> u64 {
-        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+        self.records.dropped()
     }
 }
 
 impl LogChainAppender for BufferingLogChainAppender {
     fn append(&self, record: &LogRecord) -> Result<(), LogAppendError> {
-        let mut buf = self.records.lock();
-        if buf.len() >= self.capacity {
-            buf.pop_front();
-            self.dropped
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        buf.push_back(record.clone());
+        self.records.push(record.clone());
         Ok(())
     }
 }
