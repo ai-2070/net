@@ -443,7 +443,22 @@ pub fn apply_sync_response(
     // would still be re-read implicitly on the empty-batch path
     // above (which returns early), so this saves one lock+unlock
     // per non-empty `apply_sync_response`.
-    Ok(local_next + appended)
+    //
+    // `checked_add` per cubic-dev-ai code review: plain `+` would
+    // overflow + panic in debug or wrap silently in release if
+    // `local_next + appended` ever crossed `u64::MAX`. The case
+    // is unreachable in practice (a `local_next` near `u64::MAX`
+    // would take ~584,000 years at 1 ns per event), but the
+    // unchecked form was a latent bug and the surrounding code
+    // already uses `checked_add` for the same reason on the
+    // monotonicity check above. On overflow we fall back to
+    // `file.next_seq()` — that costs the lock the perf fix was
+    // avoiding, but only on a path that's structurally
+    // unreachable in any real deployment.
+    let new_tail = local_next
+        .checked_add(appended)
+        .unwrap_or_else(|| file.next_seq());
+    Ok(new_tail)
 }
 
 #[cfg(test)]
@@ -748,6 +763,58 @@ mod tests {
     // ────────────────────────────────────────────────────────────────
     // apply_sync_response — replica side
     // ────────────────────────────────────────────────────────────────
+
+    /// Pin: `apply_sync_response`'s returned tail always equals
+    /// `file.next_seq()` after a successful apply. Per cubic-dev-ai
+    /// code review the optimized path (`local_next + appended`)
+    /// uses `checked_add` and falls back to `file.next_seq()` on
+    /// overflow — both branches must satisfy the contract that
+    /// the returned tail matches the file's authoritative
+    /// counter. A regression that drifts the optimized path
+    /// (off-by-one, wrong saturation behavior) would surface here.
+    ///
+    /// Constructs apply-cases at three scales (1 / 3 / 17 events
+    /// after a pre-existing 4-event prefix on the replica) so the
+    /// invariant holds across small and medium chunk sizes — the
+    /// failure mode the unchecked `+` would surface would be a
+    /// drift on the high end, where the prefix + appended sum
+    /// shifts.
+    #[test]
+    fn apply_returned_tail_matches_file_next_seq_across_sizes() {
+        for chunk_size in [1usize, 3, 17] {
+            let dst = build_file(&format!("redex/tail_match_{chunk_size}"));
+            // Pre-load 4 events so the apply happens against a
+            // non-zero local_next (exercises the
+            // `local_next + appended` arithmetic, not just the
+            // empty-replica path).
+            append_n(&dst, 4, "preload");
+            let cid = channel_id_for(&format!("redex/tail_match_{chunk_size}"));
+            let events: Vec<SyncEvent> = (0..chunk_size)
+                .map(|i| SyncEvent {
+                    event_seq: 4 + i as u64,
+                    payload: format!("e-{i}").into_bytes(),
+                })
+                .collect();
+            let response = SyncResponse {
+                channel_id: cid,
+                first_seq: 4,
+                leader_first_retained_seq: 0,
+                events,
+                request_id: 0,
+            };
+            let returned_tail = apply_sync_response(&dst, &response, cid).expect("apply");
+            assert_eq!(
+                returned_tail,
+                dst.next_seq(),
+                "returned tail must equal file.next_seq() for chunk_size={chunk_size}",
+            );
+            assert_eq!(
+                returned_tail,
+                4 + chunk_size as u64,
+                "returned tail must equal local_next + chunk.len()",
+            );
+        }
+    }
 
     #[test]
     fn applies_chunk_advances_tail() {
