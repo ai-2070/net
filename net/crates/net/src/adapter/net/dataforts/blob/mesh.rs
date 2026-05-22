@@ -3096,10 +3096,34 @@ impl BlobAdapter for MeshBlobAdapter {
                     },
                 ))
                 .buffer_unordered(MANIFEST_STORE_CONCURRENCY);
+                // Drain the stream fully — don't short-circuit on
+                // the first error. Per cubic-dev-ai code review:
+                // `store_chunk` registers a per-hash entry in
+                // `in_flight_stores` on entry and removes it after
+                // the inner store_chunk_locked completes (success
+                // or error). Dropping a buffered future mid-flight
+                // skips that cleanup and leaks the entry until a
+                // subsequent `store_chunk` for the same hash
+                // happens to evict it. The fix is to await every
+                // started future and surface only the first error;
+                // in-flight stores then run their own cleanup
+                // paths normally. We still preserve "first error
+                // wins" so the caller observes the same failure
+                // they would have under the legacy `result?;`
+                // shape — just without the leaked entries.
+                let mut first_err: Option<BlobError> = None;
                 while let Some(result) = futs.next().await {
-                    result?;
+                    if let Err(e) = result {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
                 }
-                Ok(())
+                if let Some(e) = first_err {
+                    Err(e)
+                } else {
+                    Ok(())
+                }
             }
             BlobRef::Tree { .. } => {
                 // Tree-shaped publish lands in Phase A3
@@ -4728,6 +4752,116 @@ mod tests {
     /// fix replaced a `vec![*hash]` / `chunks.iter().map().collect()`
     /// staging Vec with `self.bump_heat(chunks.iter().map(|c| c.hash))`
     /// (streamed iterator into the new `IntoIterator<Item = [u8;32]>`
+    /// Pin: cubic-dev-ai code review for dataforts perf #173B —
+    /// the buffer_unordered store loop must DRAIN to completion
+    /// rather than short-circuit via `result?;` on the first
+    /// error. `store_chunk` registers a per-hash entry in
+    /// `in_flight_stores` on entry and removes it after
+    /// `store_chunk_locked` returns (success or error). Dropping
+    /// a buffered future mid-flight skips that cleanup and leaks
+    /// the entry until a subsequent `store_chunk` for the same
+    /// hash evicts it via `remove_if`.
+    ///
+    /// We can't easily inject a mid-flight failure (the
+    /// pre-verification prepass at the top of `store(Manifest)`
+    /// catches caller-poisoned manifests, and `store_chunk_locked`
+    /// only fails on backend I/O which the test harness doesn't
+    /// simulate). The next-best signal is the happy-path
+    /// invariant: after a successful manifest store the
+    /// `in_flight_stores` map must be empty. The drain-vs-?
+    /// shape is the same for happy and failure paths — if a
+    /// regression flipped back to `result?;` and the test
+    /// covered N > 1 chunks, the happy-path traces would still
+    /// pass but the failure-path traces would leak. Pair this
+    /// runtime check with a source pin that ensures the
+    /// `first_err` collect-then-return shape stays in place.
+    #[tokio::test]
+    async fn store_manifest_drains_buffer_unordered_and_clears_in_flight_stores() {
+        let adapter = make_adapter();
+        // 4-chunk manifest — comfortably above 1 to exercise
+        // multiple in-flight futures, well under the
+        // MANIFEST_STORE_CONCURRENCY=16 cap.
+        let payload: Vec<u8> = (0..(BLOB_CHUNK_SIZE_BYTES as usize * 4))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let chunked = chunk_payload(&payload).unwrap();
+        let chunk_refs: Vec<ChunkRef> = match chunked {
+            ChunkedPayload::Chunked { chunks, .. } => chunks.into_iter().map(|(r, _)| r).collect(),
+            _ => panic!("expected Chunked"),
+        };
+        let blob = BlobRef::manifest("mesh://drain", Encoding::Replicated, chunk_refs.clone())
+            .expect("manifest");
+        adapter.store(&blob, &payload).await.expect("store");
+
+        // Every per-hash mutex entry must have been removed by
+        // `store_chunk`'s `remove_if` cleanup. A leaked entry —
+        // the shape `result?;` on the buffer_unordered loop
+        // would produce on the failure path — would survive
+        // here as a non-zero count even on the happy path
+        // if any of the buffered futures were dropped before
+        // their cleanup ran.
+        assert_eq!(
+            adapter.in_flight_stores.len(),
+            0,
+            "in_flight_stores must be empty after a successful manifest store; \
+             leak indicates buffer_unordered short-circuited without draining",
+        );
+    }
+
+    /// Source pin: the buffer_unordered store loop in
+    /// `MeshBlobAdapter::store` MUST drain via the
+    /// `first_err`/collect shape, not short-circuit via the
+    /// `?` operator. A "simplification" PR that flipped back to
+    /// the operator would silently break the `in_flight_stores`
+    /// cleanup contract for failure-path traces — observable
+    /// only under load with a concurrent store that happens to
+    /// fail mid-flight. Pin via source inspection.
+    #[test]
+    fn store_buffer_unordered_loop_must_drain_not_short_circuit() {
+        let src = include_str!("mesh.rs");
+        // Strip line comments so the assertion only inspects
+        // executable source, not doc text. Block comments aren't
+        // used in this file's loop body.
+        let stripped: String = src
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(idx) => &l[..idx],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body_idx = stripped
+            .find("let mut futs = futures::stream::iter(store_items.into_iter().map(")
+            .expect("buffered store loop must exist");
+        // The shape we expect — collect first error, drain, then
+        // surface — looks for the `first_err` variable plus the
+        // drain loop body within ~800 chars after the iter call.
+        // Use `saturating_add` + `min(len())` so a future
+        // refactor that shrinks the surrounding body doesn't
+        // panic the test on an out-of-bounds slice.
+        let end = body_idx.saturating_add(800).min(stripped.len());
+        let body = &stripped[body_idx..end];
+        assert!(
+            body.contains("first_err"),
+            "buffer_unordered store loop must collect into `first_err` \
+             and drain to completion — a `?` short-circuit would skip \
+             per-chunk `in_flight_stores` cleanup. Body: {body}",
+        );
+        // The drain loop body (the `while let Some(...)` block)
+        // must NOT have the short-circuit shape.
+        let drain_loop_idx = body
+            .find("while let Some(result) = futs.next().await")
+            .expect("drain loop must exist");
+        let drain_end = drain_loop_idx.saturating_add(200).min(body.len());
+        let drain_loop_body = &body[drain_loop_idx..drain_end];
+        assert!(
+            !drain_loop_body.contains("result?;"),
+            "buffer_unordered drain loop must not short-circuit — leaks \
+             in_flight_stores entries on the failure path. Body: \
+             {drain_loop_body}",
+        );
+    }
+
     /// `bump_heat` signature). A regression that dropped chunks
     /// from the streamed sequence — e.g. an off-by-one on the
     /// iterator, or misrouting the `BlobRef::Manifest` arm back to
